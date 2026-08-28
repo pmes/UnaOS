@@ -257,6 +257,11 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("cp", Avail::Always), ("copy", Avail::Always), ("mv", Avail::Always),
     ("move", Avail::Always), ("ren", Avail::Always), ("rename", Avail::Always),
     ("sync", Avail::Always), ("write", Avail::Always),
+    // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. Always — the VERB is one
+    // word on every UnaOS (the ONE-OS law `reboot` is registered under), and the per-platform panel
+    // decides what it can capture, never whether the word exists. The ring arm refuses honestly and
+    // by name when there is no panel, no writable volume, or no free index.
+    ("screenshot", Avail::Always),
     // native unafs — aarch64 only
     ("uls", Avail::Aarch64), ("ucat", Avail::Aarch64), ("utouch", Avail::Aarch64),
     ("uwrite", Avail::Aarch64), ("umkdir", Avail::Aarch64), ("urm", Avail::Aarch64),
@@ -270,9 +275,21 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("connect", Avail::Always), ("udpsend", Avail::Always), ("get", Avail::Always),
     // apps + scheduler + power + witnesses
     ("vug", Avail::VugDemo), ("pulse", Avail::VugDemo), ("v3d", Avail::V3d),
+    // hw-jetson (2026-08-18 sync): the Orin bench verbs — SCHED-BAL burst + the per-core
+    // load animator. Registered here so MIDDEN-M1's single interpreter routes them as
+    // Plan::Host instead of refusing them before the kernel's service arms can fire.
+    ("burst", Avail::Aarch64), ("simmer", Avail::Aarch64),
     ("tste", Avail::Always), ("selftest", Avail::Always), ("sched", Avail::Always),
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
     ("bootlog", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
+    // ORIN-REBOOT (baton orin-6 §5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
+    // WARM-REBOOT verb (`shutdown`/`off`, its cold sibling, was already registered above and
+    // its ring arm now powers off for real). Registered here so MIDDEN-M1's single
+    // interpreter routes it as Plan::Host to the ring's service arm (kernel `power::reboot` —
+    // aarch64: PSCI SYSTEM_RESET via SMC; unwired platforms refuse with an honest witness).
+    // Always: the VERB is one word on every UnaOS (ONE-OS law); the per-platform mechanism
+    // decides what it does, never whether the word exists.
+    ("reboot", Avail::Always),
     // processes
     ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
@@ -526,6 +543,10 @@ pub fn help(facts: &Facts) -> String {
     say!("TREE:     find [root] <pattern>  (recursive glob search), du [dir]  (recursive size tally)");
     say!("          uptime  (seconds since boot; shows the wall clock when set)");
     say!("INSPECT:  stat <path>  (full on-disk detail), xd <path> [off] [len]  (bounded hexdump)");
+    // PRTSCR: advertised unconditionally, like the verb itself — the word exists on every UnaOS
+    // and the ring arm says honestly what this panel and this volume could not do.
+    say!("CAPTURE:  screenshot  (panel -> SCREEN<n>.PNG at the volume root; n = first free 0-99)");
+    say!("          the Print Screen key does the same thing (x86)");
     if facts.aarch64 {
         say!("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
         say!("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
@@ -574,7 +595,8 @@ pub fn help(facts: &Facts) -> String {
             facts.proc_rows
         ));
     }
-    say!("POWER:    batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
+    say!("POWER:    reboot (warm reboot), shutdown|off (power off, cold-boot-ready) — via the platform firmware");
+    say!("          batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
     say!("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
     say!("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
     say!("NETWORK:  netinfo, ping <ip> [count], arp <ip>");

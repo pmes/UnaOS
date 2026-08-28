@@ -3195,7 +3195,7 @@ fn sys_sleep_ms(ms: u64) -> i64 {
 // =============================================================================================
 // WINX-1 — the WINDOW SURFACE/VERB SEAM. The x86 twin of the aarch64 WC-B block, wired to the SAME
 // arch-neutral compositor (`video::wm`), which has always been arch-neutral and until this seam had
-// no x86 caller other than `video/wcx.rs`'s activation. (That activation's own windows were the
+// no x86 caller other than `video/desktop_uefi.rs`'s activation. (That activation's own windows were the
 // console and a kernel-drawn demo window; since the kernel-apps eviction only the console remains,
 // and the desktop's second window comes through THESE verbs like any other program's.)
 //
@@ -3353,7 +3353,7 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 /// `sys_win_create` gives input focus to any process that opens a window while `USER_INPUT_ACTIVE`
 /// is 0 — the minimum viable policy that makes a `bg`'d interactive app reachable at all, and it is
 /// right for every launch an OPERATOR asks for. The kernel-apps eviction introduced the first launch
-/// nobody asks for: `wcx::desktop_app_service` starts `STAT.ELF` at boot, as the compositor's
+/// nobody asks for: `desktop_uefi::desktop_app_service` starts `STAT.ELF` at boot, as the compositor's
 /// furniture, and its window opens at a moment when the shell is by definition idle. Unqualified,
 /// that grant would fire on it — and `STAT.ELF` never calls `SYS_INPUT_POLL` (it is a paint loop with
 /// no input path at all), so the boot would end with the keyboard published to a program that cannot
@@ -3377,7 +3377,7 @@ static SLOT_DETACHED: [AtomicBool; crate::arch::memory::USER_SLOTS] =
 ///
 /// ### `wc`-gated, and what that does and does not buy
 ///
-/// The exemption exists for `video::wcx`'s desktop app, which does not exist without `UNAOS_WC=1`.
+/// The exemption exists for `video::desktop_uefi`'s desktop app, which does not exist without `UNAOS_WC=1`.
 /// The flag, both of its readers ([`slot_is_focus_exempt`] and [`owner_is_focus_exempt`]) and the
 /// spawn entry point are all gated, so a plain x86 kernel carries no static, no branch on the
 /// `SYS_WIN_CREATE` path, no arm in the click router and neither witness string — no feature code at
@@ -3671,13 +3671,49 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // undone: publishing focus and then taking it back would be a real transition the whole ledger
     // would have to account for, and there is nothing here to take back. `slot_is_focus_exempt` is
     // a `const false` on a non-`wc` build, so this reads as the unqualified original there.
-    if !slot_is_focus_exempt(slot)
-        && USER_INPUT_ACTIVE
-            .compare_exchange(0, (slot as u64) + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    //
+    // SPAWN-FOCUS — and it is no longer the ONLY rule. The weak grant below is kept verbatim for
+    // every window that opened on its own; a window the OPERATOR asked for is decided one branch
+    // above it, against `wm`'s spawn token, and is unconditional. See `wm::SPAWN_FOCUS` for the
+    // policy and for the two metal defects it closes. The order matters: the token is consumed
+    // FIRST, so an explicit spawn never falls through to a rule that would decline it merely
+    // because some other app happens to hold the keyboard.
+    let owner = (slot as u64) + 1;
+    let granted = if slot_is_focus_exempt(slot) {
+        false
+    } else if crate::video::wm::spawn_focus_take(owner) {
+        // The operator named this launch and this is its first window: TAKE the focus, wherever it
+        // currently is. A plain store rather than a CAS — there is no losing race to lose here, the
+        // whole point being that an incumbent holder does not veto the grant.
+        USER_INPUT_ACTIVE.store(owner, Ordering::Release);
+        clear_input_row(slot);
+        serial_println!(
+            ":: wc-x86: input focus -> slot {} (SPAWN-FOCUS: operator-launched, first window) ::",
+            slot
+        );
+        true
+    } else if USER_INPUT_ACTIVE
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
     {
         clear_input_row(slot); // a fresh focus starts clean, exactly as `user_input_set_active` does
         serial_println!(":: wc-x86: input focus -> slot {} (first window, shell was idle) ::", slot);
+        true
+    } else {
+        false
+    };
+    // SPAWN-FOCUS — **the VISIBLE half, which this seam never did.** Both halves or neither: a grant
+    // that moves `USER_INPUT_ACTIVE` and stops there leaves `FOCUS_ASID` naming the shell, the new
+    // row unraised and its chrome in the resting colours — focus that reads as granted and looks
+    // withheld, which is what the bench saw. `focus_changed` is the seam every other focus owner in
+    // the kernel calls immediately after `user_input_set_active` (`dock::restore`, the TAB cycle, the
+    // click router), in this order, and this is now the fourth caller rather than the one exception.
+    //
+    // Called with the window table (`WINDOWS`) already RELEASED — `drop(t)` above — so the compositor's
+    // own table is taken beneath nothing, preserving `WINDOWS`-outermost exactly as `sys_win_present`
+    // documents. `focus_changed` is idempotent and cheap when it raises nothing.
+    if granted {
+        crate::video::wm::focus_changed(owner);
     }
     serial_println!(
         ":: wc-x86: SYS_WIN_CREATE slot={} win={} rslot={} {}x{} pages={} wm_id={} ::",
@@ -5124,7 +5160,7 @@ pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
 /// helper's own contract already claims to return and what it actually returns only on aarch64.
 ///
 /// `focus_ring` filters `used && !compat && owner_asid != 0`. On aarch64 that IS the app set: every
-/// row belongs to an EL0 ASID. On x86 it is not — `fbcon::panel_console_window_open` and `wcx`'s
+/// row belongs to an EL0 ASID. On x86 it is not — `fbcon::panel_console_window_open` and `desktop_uefi`'s
 /// desktop demo create rows owned by `wm::KERNEL_OWNER_CONSOLE` / `KERNEL_OWNER_DESKTOP`, values
 /// far above `USER_SLOTS` that pass the `!= 0` test. Left in, the cycle would step onto one of them
 /// and `user_input_set_active` would REFUSE it (`slot >= USER_SLOTS`, an early return that publishes
@@ -5326,7 +5362,7 @@ pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // console is a window row". It is, and that row is not the console the operator types into. On
     // the bench path `fbcon::detach()` runs at the SCHED-X86 handoff, `_print` returns at its first
     // test from that store on, and fbcon's `KERNEL_OWNER_CONSOLE` row — opened earlier by
-    // `wcx::activate` — is a FROZEN BOOT-LOG SNAPSHOT for the rest of the boot. The live prompt is
+    // `desktop_uefi::activate` — is a FROZEN BOOT-LOG SNAPSHOT for the rest of the boot. The live prompt is
     // `console::Console` drawn through `TargetPal`/`Screen` inside `x86_render_service`: the DESKTOP
     // layer, which is the layer `SHELL_Z` is. So `focus_changed(0)` is the correct call on this arch
     // for the same reason it is on the other, and only its arm does the three things this gesture
@@ -5594,12 +5630,23 @@ pub fn user_input_depth(active: u64) -> u32 {
 // focus when the hand moved; what a delivered click MEANS is the app's decision, made in the app.
 // =============================================================================================
 
-/// CLICK-X86: the pointer-button bitmask as the ROUTER last saw it, so this layer can tell a PRESS
-/// edge (a bit going 0->1) from a RELEASE edge (1->0) from an unchanged held state. Its own tracker,
-/// not shared with any drain: routing decisions are made upstream of every consumer, on events some
-/// consumers never see.
-static CLICK_PREV_MASK: AtomicU32 = AtomicU32::new(0);
-
+// ARC D M1 — **`CLICK_PREV_MASK` IS GONE, AND WITH IT THE ROUTER'S SECOND OPINION.**
+//
+// This layer used to keep its own copy of the button mask so it could re-derive edges (`mask & !prev`
+// for a press, `prev & !mask` for a release) and, when that copy went stale, recover a press from
+// `mask == prev`. Both halves were compensation for a PRODUCER that could emit two presses inside one
+// physical gesture. It no longer can: `ehci::note_buttons` now discriminates a drifting hold from a
+// re-landed finger by the report's own motion, and when it does recover a press it synthesises the
+// missing release first, so the events reaching this seam satisfy
+//
+//   **one press edge per gesture, always preceded by a release.**
+//
+// With that invariant at the producer, the router's rule needs no state at all — primary bit set is a
+// press, primary bit clear is a release — and a stateless rule cannot go stale. What went with the
+// static: the `mask == prev` recovery arm, the `[clickrepress]` witness and its budget, and the 22
+// `CLICK_PREV_MASK.store(0)` resets the selftests had to sprinkle around every leg to keep the
+// tracker from poisoning the next one.
+//
 /// CLICK-X86 sentinel: the outstanding press was NOT delivered to any ring, so its release must not be
 /// either. `u64::MAX` is not a valid biased slot (`USER_SLOTS` is single digits) and sits far above
 /// `wm::KERNEL_OWNER_BASE`, so it cannot collide with either population.
@@ -5617,18 +5664,6 @@ static CLICK_PRESS_TARGET: AtomicU64 = AtomicU64::new(CLICK_TARGET_DROP);
 /// CLICK-X86 accounting, for the rollup: press edges seen, and press edges DELIVERED into some ring.
 static CLICK_PRESSES: AtomicU64 = AtomicU64::new(0);
 static CLICK_DELIVERED: AtomicU64 = AtomicU64::new(0);
-
-/// CLICK-REPRESS: stationary re-presses this router RECOVERED — a `Button(1)` whose primary bit was
-/// already set in [`CLICK_PREV_MASK`] because a RELEASE was polled-over and never reached this seam.
-/// Every one of these was a click SILENTLY DROPPED before this arc (Boot C: "clicks won't keep
-/// flowing — I have to move the mouse then click again"). Read the `[clickrepress]` witness below.
-static CLICK_REPRESS_X86: AtomicU64 = AtomicU64::new(0);
-
-/// CLICK-REPRESS: witness-line budget. A recovered re-press is a hand gesture and so human-rate by
-/// construction, but the cap is stated rather than assumed — a button that re-reports "down" after
-/// every quiet gap must not be able to bury the wire, exactly as [`CLOSE_LOG_MAX_X86`] guards the
-/// close line. The recovery itself is uncapped; only the serial line is.
-const CLICK_REPRESS_LOG_MAX_X86: u64 = 128;
 
 /// CLICK-BAND (GR27 Boot B): `[clickroute]` lines emitted for presses the FURNITURE bands consumed
 /// (`band=menu` / `band=dock`), against [`CLICK_BAND_LOG_MAX_X86`]. Before this, a press the crystal
@@ -5685,8 +5720,6 @@ fn clickband_selftest() {
     };
     let saved_bar = crate::video::menubar::enabled();
     crate::video::menubar::set_enabled(true);
-    // A clean edge for the first press — the precedent every routing fixture above follows.
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
 
     let press = |x: i32, y: i32| -> bool {
         let hit = wc_click_route_at(crate::pal::Event::Button(1), x, y);
@@ -5729,7 +5762,6 @@ fn clickband_selftest() {
     };
 
     crate::video::menubar::set_enabled(saved_bar);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
 
     let owed = CLICK_BAND_LOG_X86.load(Ordering::Relaxed) - n0;
@@ -6058,7 +6090,46 @@ pub fn wc_drag_motion() {
         }
         let waited = if held == 0 { 0 } else { now.wrapping_sub(held) };
         let pend = crate::pal::release_edge_pending();
-        if pend != 0 && waited < RELEASE_EDGE_GRACE_MS {
+        // GHOST-DRAG — **AND THE FIFO ARGUMENT MUST STILL HOLD WHEN IT IS MADE.**
+        //
+        // Metal (boot 6): drag, drop, let the hand go STILL, then move again — and the window trails
+        // the pointer for a moment before settling. The branch below is where it trails. Its licence
+        // to steer with the button level reading UP is a FIFO argument and nothing else: "a release
+        // edge is still queued BEHIND me, therefore I was pushed before it, therefore I am hand
+        // travel with the button physically down." `pend` is not that argument. `pend` counts an edge
+        // from its push until a ROUTER routes it, and between the POP and the route the edge is out
+        // of the ring while still counted — the two-drain interleave written up on `DRAG_LAST_LEAD`,
+        // where one drain pops the edge and the other routes the motion behind it first. The motion
+        // behind a popped edge was pushed AFTER it: post-release travel, and steering with it is the
+        // trail.
+        //
+        // The lost release is what makes that gap reachable by a HAND rather than by microseconds.
+        // If the release report is polled over at the EHCI ring (boot C: 43 down-edges vs 29
+        // releases), the pad goes silent with the level still down and the drag stays armed
+        // invisibly for as long as the hand rests. The edge is finally emitted LATE, by the first
+        // report of the NEXT movement — `note_buttons` sees `!down && prev & 0x01` and pairs it with
+        // that report's motion — so the motions queued around it are separated from the actual
+        // release by the whole pause. Under the old test those motions could steer, and the settle
+        // rule went with them: within `LEAD_TRUST_MS` they also moved `DRAG_DOWN_*`, so the window
+        // did not merely trail, it came to REST at the new pointer position instead of where the
+        // hand let go.
+        //
+        // `release_edge_in_ring()` is the census the argument actually needs, taken on the ring
+        // primitives. In CONJUNCTION with `pend`, never in place of it: `pend` remains the strict
+        // primary-transition accounting and the only thing that ends the gesture, and this only ever
+        // withdraws the licence to STEER from a motion that cannot prove it came first.
+        //
+        // What this does NOT change, because leg 10 asserts it: an ordinary release still queues its
+        // backlog AHEAD of the edge, those motions are popped while the edge is still in the ring,
+        // and they steer exactly as DRAGGLIDE made them. The glide stays fixed.
+        //
+        // And the LOST-RELEASE SETTLE RULE, stated: a motion that fails this test skips the steer AND
+        // skips the `DRAG_DOWN_*` record, then falls through to the belt below, which ends the
+        // gesture at `drag_settle_point()` — the last position recorded with the button DOWN, i.e.
+        // the drag's last steered position. The window settles where the hand let go. It never leaps
+        // to the new motion's position, whether the edge arrives late, is eaten, or never comes.
+        let edge_in_ring = crate::pal::release_edge_in_ring() != 0;
+        if pend != 0 && edge_in_ring && waited < RELEASE_EDGE_GRACE_MS {
             // DRAGGLIDE — a LEAD motion: produced before the release edge that is still queued behind
             // it, so it is hand travel with the button physically down. Steer with it and record it.
             //
@@ -6316,6 +6387,14 @@ fn drag_settle_apply(x: i32, y: i32) {
 ///    fix; it is a regression sentinel, and `-> DIRTY` is its alarm, not the arc's verdict.
 ///  * `pend=` / `wait=` — release edges queued but undrained at end time, and how long the belt had
 ///    been holding for one.
+///  * `ring=` (GHOST-DRAG) — release `Button` entries still PHYSICALLY IN the ring at end time (see
+///    `pal::release_edge_in_ring`). Read against `pend=`, and the pair is the interleave detector:
+///    `pend=1 ring=0` on a `level-late` ending says the edge had already been POPPED by the other
+///    x86 drain and was about to be routed by it — the gap this arc closed, and the state in which a
+///    level-up motion is no longer allowed to steer. `pend=1 ring=1` is an edge genuinely still
+///    queued. `pend=0 ring=0` is the ordinary ending. `ring=` persistently nonzero across gestures
+///    would mean release entries are being taken out of the ring by a path that is not
+///    `EventQueue::pop` — the census is maintained on the primitive, so that should be unreachable.
 ///
 /// **What refutes what — and it is `end=` and `stale=` that carry it, not `post=`.**
 ///  * `end=edge` on the ordinary gestures, with the window resting at `settle=`, is the fix working.
@@ -6358,7 +6437,7 @@ fn dragrel_witness(how: &str, sx: i32, sy: i32, pend: u32) {
     // Latched before the disarm that follows every call site, so a fixture can read it afterwards.
     DRAG_LAST_LEAD.store(lead, Ordering::Relaxed);
     serial_println!(
-        "[dragrel] win={} end={} settle=({},{}) release=({},{}) stale=({},{}) lead={} swap={} post={} pend={} wait={}ms -> {}",
+        "[dragrel] win={} end={} settle=({},{}) release=({},{}) stale=({},{}) lead={} swap={} post={} pend={} ring={} wait={}ms -> {}",
         crate::video::wm::drag_active(),
         how,
         sx,
@@ -6371,6 +6450,7 @@ fn dragrel_witness(how: &str, sx: i32, sy: i32, pend: u32) {
         u8::from(crate::pal::release_edge_reordered()),
         post,
         pend,
+        crate::pal::release_edge_in_ring(),
         waited,
         if post == 0 { "CLEAN" } else { "DIRTY" }
     );
@@ -6382,6 +6462,256 @@ fn drag_settle_disarm() {
     DRAG_LEVEL_UP_MS.store(0, Ordering::Relaxed);
     DRAG_POST_MOTIONS.store(0, Ordering::Relaxed);
     DRAG_LEAD_MOTIONS.store(0, Ordering::Relaxed);
+}
+
+/// PTRDEAD — **the post-drop DEAD ZONE: a relative-motion BACKLOG must reach the arrow as one move,
+/// not as a queue the drain walks.**
+///
+/// ### The defect, measured rather than argued
+/// Boot 10 (rMBP, 2026-08-19): after a drag-and-drop the cursor is dead for roughly the first fifth
+/// of the trackpad's width. The `USB-DEBUG: MOUSE` trace in that capture is the pointer's own
+/// heartbeat — one line per motion event ROUTED — and its cadence is 8 ms flat while the hand moves.
+/// Around every gesture end it opens a hole, and the hole's length is the console's byte count and
+/// nothing else: across 40+ samples spanning 50 to 4000 characters, `gap ≈ chars / 11.5 ms` with a
+/// median residual of 3.6 ms (115200 baud, one line per character-time). A drop emits the largest
+/// burst on the pointer path — `[dragrel]`, `[wm-act] drag-end`, `[drag]`, `[drag-occ]`, `[dropwake]`,
+/// ~1 kB, and up to 3.5 kB when a five-second `[cursor*]`/`[wcn]` rollup lands beside it — so the
+/// drop is where the hole is biggest: 80 ms to 350 ms.
+///
+/// The pad does not stop during that hole and it does not accumulate across it either: the deltas on
+/// the far side are the same magnitude as the near side (13 per report, not summed), so the backlog
+/// is REAL EVENTS, queued. When the drain returns it replays them one at a time — and on a build with
+/// the pointer trace on, each replayed event costs another line, so the queue drains barely faster
+/// than it fills. The arrow walks a path the hand left a fifth of a trackpad ago. That is the dead
+/// zone: not lost travel, a queue being walked.
+///
+/// ### What this leg asserts, and what is RED without the fold
+/// `pal::push_pointer_report(Some(Mouse), None)` — the motion-only shape, which is every report
+/// between the edges of a gesture — now FOLDS into a queued relative motion instead of taking a ring
+/// slot (`pal::EventQueue::coalesce_relative_motion`). Three legs, each a different failure
+/// direction:
+///
+///  * **`whole`** — `QUEUE_SIZE * 3` motion reports pushed with nothing draining arrive as ONE entry
+///    carrying the EXACT total. **Red pre-fix in two independent ways**: the ring holds 63, so the
+///    entry count reads 63 rather than 1, and the other 129 reports are DROPPED (`EVQ_DROP_PTR`),
+///    so the summed travel is short by more than two thirds. That drop is the one way relative
+///    travel can be lost outright, and it is what a long stall does today. **Load-bearing.**
+///  * **`nodrop`** — and the drop counter did not move at all. Stated separately from the sum
+///    because a producer that folded but still charged a drop would be lying in the ledger the
+///    `[uvug10] evq` conservation law is read from.
+///  * **`order`** — a `Button` between two motions BLOCKS the fold: `[M1][B][M1][M1]` comes back as
+///    exactly `[M1][B][M2]`, in that order. This is what says the fold can never carry an event
+///    across another one — the property every consumer downstream of this ring relies on, and the
+///    one a naive "sum all queued motion" would break. **Red on any fold that ignores the entry
+///    type.**
+///
+/// Headless by construction: it drives `pal` alone — no panel, no window table, no pointer — so the
+/// QEMU gate exercises it exactly as metal does.
+///
+/// Self-cleaning: it empties the ring before it starts (witnessed, because on metal that discards
+/// whatever the hand was doing at boot), drains everything it pushed, and puts the producer's button
+/// mask and the release-edge count back where it found them.
+/// SELFTEST-QUIESCE — **experiment scaffolding for the intermittent x86 selftest family
+/// (`exec-r7-selftest`, 2026-08-27). Not a shipping seam; the control build has it OFF.**
+///
+/// The falsification this arc runs asks whether `[ptrdead] order` and `[wm-act] settle`/`lead` fail
+/// because the CODE UNDER TEST is wrong or because the ASSERTIONS are racy. The mechanism under
+/// suspicion is named and local: on the SCHED-X86 split, the fixture ladder runs inside
+/// `x86_usb_pump` (main.rs) and `x86_input_service` runs as a preemptible peer AT THE SAME PRIORITY
+/// ON THE SAME CORE (`svc_cpu` — both `spawn`ed there in main.rs), and that peer's job is to drain
+/// `pal::EVENT_QUEUE` **to exhaustion** every pass. A timer preemption anywhere inside a fixture's
+/// push→pop window therefore hands the fixture's own queued events to the input service, which
+/// forwards them down `GUI_CHANNEL_X86` and out of the fixture's reach.
+///
+/// So the quiesce is a LOCAL interrupt mask, and it is sound only because of that placement: the
+/// competing drain is on THIS core, so masking `IF` here is enough to serialise the window. The
+/// global ms-clock is advanced by the BSP (see `apic::ticks`), so the bounded `ticks()` waits inside
+/// the legs still terminate with the mask held.
+///
+/// Flipped by hand between the two builds of the experiment (control = `false`).
+///
+/// SAFE AGAINST THE OBVIOUS DEADLOCK, checked rather than assumed: the danger of masking around a
+/// span that takes a lock is a holder on THIS core that was preempted mid-critical-section and can
+/// no longer be rescheduled. `pal::push_event` / `pal::pop_event` both take `EVENT_QUEUE` INSIDE
+/// `arch::without_interrupts`, and `video::wm`'s table guard is an `arch::IrqMask`, so neither lock
+/// can be held across a preemption in the first place.
+#[cfg(feature = "witness")]
+const SFQ_QUIESCE: bool = false;
+
+/// SELFTEST-QUIESCE — run `f` with this core's interrupts masked on the quiesced build, and
+/// unchanged on the control build.
+#[cfg(feature = "witness")]
+#[inline]
+fn sfq<R>(f: impl FnOnce() -> R) -> R {
+    if SFQ_QUIESCE {
+        crate::arch::without_interrupts(f)
+    } else {
+        f()
+    }
+}
+
+/// SELFTEST-QUIESCE — total SUCCESSFUL pops from `pal::EVENT_QUEUE` since boot (the 5th field of
+/// `pal::event_queue_stats`). A fixture that knows how many pops it made itself can subtract, and
+/// the remainder is the number of its own events some OTHER drain took — the direct evidence the
+/// hypothesis needs, rather than an inference from a failed predicate.
+#[cfg(feature = "witness")]
+#[inline]
+fn evq_pops() -> u64 {
+    crate::pal::event_queue_stats().4
+}
+
+/// SELFTEST-QUIESCE — total pushes into `pal::EVENT_QUEUE` since boot (pointer + key).
+#[cfg(feature = "witness")]
+#[inline]
+fn evq_pushes() -> u64 {
+    let s = crate::pal::event_queue_stats();
+    s.0 + s.1
+}
+
+/// SELFTEST-QUIESCE — this core's index and its LOCAL tick count, as one sample.
+///
+/// The local tick is the leak detector for the quiesce. `percpu::note_tick` is called from this
+/// core's own APIC timer ISR, so a span that believes it is masked and comes back with a nonzero
+/// tick delta was NOT masked for the whole span — either something inside re-enabled `IF`, or the
+/// task yielded and the mask was restored to whatever the next task's `RFLAGS` carried. The cpu
+/// index catches the other way the quiesce can be void: the fixture and the competing drain ending
+/// up on DIFFERENT cores, where a local mask means nothing at all.
+#[cfg(feature = "witness")]
+#[inline]
+fn sfq_cpu_tick() -> (u32, u64) {
+    let p = crate::arch::percpu::this_cpu();
+    (p.cpu_index, p.ticks.load(Ordering::Relaxed))
+}
+
+#[cfg(feature = "witness")]
+pub fn ptrdead_selftest() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    sfq(ptrdead_selftest_body);
+}
+
+#[cfg(feature = "witness")]
+fn ptrdead_selftest_body() {
+    use crate::pal::Event;
+    // Empty the ring, bounded by its own capacity, and say so: this fixture asserts an EXACT entry
+    // count, so anything a boot selftest or a real HID report left standing would be counted as part
+    // of the run. On metal the discard eats real operator input, which is worth a line.
+    let mut discarded = 0u32;
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+        discarded += 1;
+    }
+    if discarded != 0 {
+        serial_println!("[ptrdead] leg-drain discarded={} queued event(s)", discarded);
+    }
+
+    // Leg 1/2 — the BACKLOG. Three ring-fulls of motion-only reports, nothing draining.
+    let n = crate::pal::QUEUE_SIZE_PUB * 3;
+    let (_, _, drop0, _, _) = crate::pal::event_queue_stats();
+    let fold0 = crate::pal::pointer_motion_coalesced();
+    // SELFTEST-QUIESCE instrumentation: the ledger's own pop counter, sampled either side of the
+    // window this leg believes it owns. Anything it counts beyond this leg's OWN successful pops
+    // was taken by a different drain.
+    let pop0 = evq_pops();
+    for _ in 0..n {
+        crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
+    }
+    let (mut sx, mut sy, mut entries) = (0i32, 0i32, 0u32);
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        match crate::pal::next_event() {
+            Some(Event::Mouse { x, y }) => {
+                sx += x;
+                sy += y;
+                entries += 1;
+            }
+            Some(_) => entries += 1,
+            None => break,
+        }
+    }
+    let (_, _, drop1, _, _) = crate::pal::event_queue_stats();
+    let foreign12 = (evq_pops() - pop0) as i64 - entries as i64;
+    let whole = entries == 1 && sx == n as i32 && sy == -(n as i32);
+    let nodrop = drop1 == drop0;
+
+    // Leg 3 — the fold may not cross a `Button`. Pushed through the same producer seams a decoded
+    // report uses: motion-only folds, a bare button does not, and the motion after the button starts
+    // a new entry because the newest entry is no longer a motion.
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+    }
+    // SELFTEST-QUIESCE instrumentation: the four pops are taken UNCONDITIONALLY and judged
+    // afterwards, where the original `&&` chain short-circuited. Two reasons, neither of them a
+    // change to what `order` MEANS: a short-circuited run leaves the events it never popped in the
+    // ring for the next fixture, and — the point here — the observed shape cannot be reported if it
+    // was never read. `order` is the same conjunction over the same four observations.
+    let pop2 = evq_pops();
+    let push2 = evq_pushes();
+    crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
+    crate::pal::push_pointer_report(None, Some(Event::Button(1)));
+    crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
+    crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: 0 }), None);
+    let g = [
+        crate::pal::next_event(),
+        crate::pal::next_event(),
+        crate::pal::next_event(),
+        crate::pal::next_event(),
+    ];
+    let own3 = g.iter().filter(|e| e.is_some()).count() as u64;
+    let foreign3 = (evq_pops() - pop2) as i64 - own3 as i64;
+    // This leg pushes four reports, each carrying exactly one event, so four is its own push count.
+    let fpush3 = (evq_pushes() - push2) as i64 - 4;
+    let order = matches!(g[0], Some(Event::Mouse { x: 1, y: 0 }))
+        && matches!(g[1], Some(Event::Button(1)))
+        && matches!(g[2], Some(Event::Mouse { x: 2, y: 0 }))
+        && g[3].is_none();
+    if !order {
+        serial_println!(
+            "[ptrdead] order detail: got={:?} fpop={} fpush={} quiesced={}",
+            g,
+            foreign3,
+            fpush3,
+            SFQ_QUIESCE
+        );
+    }
+
+    // Put the producer back: a `Button(0)` closes the mask this leg opened (the producer tracks the
+    // primary transition, so leaving it SET would make the next real release a 1 -> 0 this fixture
+    // manufactured), and the edge it counts is drained here rather than left for the drag belt.
+    crate::pal::push_pointer_report(None, Some(Event::Button(0)));
+    for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+        if crate::pal::next_event().is_none() {
+            break;
+        }
+    }
+    for _ in 0..8 {
+        if crate::pal::release_edge_pending() == 0 {
+            break;
+        }
+        crate::pal::note_release_edge_drained();
+    }
+
+    serial_println!(
+        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} fpop12={} fpop3={} quiesced={} -> {}",
+        whole,
+        nodrop,
+        order,
+        n,
+        entries,
+        sx,
+        sy,
+        crate::pal::pointer_motion_coalesced() - fold0,
+        drop1 - drop0,
+        foreign12,
+        foreign3,
+        SFQ_QUIESCE,
+        if whole && nodrop && order { "PASS" } else { "FAIL" }
+    );
 }
 
 /// WMDIRECT — **THE X86 EVENT-ROUTING CHAIN, AS ONE FUNCTION.** Both x86 drains (the BSP GUI loop
@@ -6518,47 +6848,39 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     let crate::pal::Event::Button(mask) = ev else {
         return false;
     };
-    let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
-    // CLICK-REPRESS — **a stationary re-press the level latch would otherwise swallow** (Boot C, the
-    // operator: "clicks won't keep flowing — I have to move the mouse then click again").
+    // ARC D M1 — **THE RULE, AND IT IS THE WHOLE RULE: PRIMARY BIT SET IS A PRESS, CLEAR IS A
+    // RELEASE.** No latch, no edge re-derivation, no recovery arm.
     //
-    // `prev` is this router's own level latch, and it goes STALE the same way the HID `prev_buttons`
-    // latch did before CLICK-3. The trackpad is serviced at frame rate — orders of magnitude slower
-    // than its report interval — so a RELEASE that lands in the gap between two service passes is
-    // superseded by the pad's next level report and never reaches this seam. `prev` then stays
-    // primary-down for good, every subsequent stationary press fails the `mask & !prev` edge test
-    // below, and the click is dropped HERE, silently, with no `[clickroute]` line at all. Boot C's
-    // capture is the proof: 43 HID down-edges, 29 releases (14 polled-over), 31 routed presses.
+    // What this replaced was a second opinion about edges, taken against a copy of the mask this
+    // layer kept for itself — plus a `mask == prev` arm to recover from that copy going stale. Both
+    // existed because the PRODUCER could emit two presses inside one physical gesture (EHCI's
+    // quiet-gap arm manufacturing a press out of a drifting hold: boot 3, `recovered` 2 -> 19 across
+    // one spell of dragging). The producer is now the one place that decides, and it guarantees one
+    // press edge per gesture with a release always in front of it — synthesising that release when
+    // the wire lost it. A `Button` arriving here is therefore an EDGE already; re-deriving it could
+    // only ever disagree with the truth, and a stateless rule cannot go stale in the first place.
     //
-    // A wiggle "fixes" it only as a side effect: a motion report carries the button UP, which is what
-    // finally lets the HID release arm emit the missed `Button(0)` and clear this latch. That is the
-    // whole of the "move then click" workaround, and it is the symptom, not a second mechanism.
+    // A `Button` is pushed by a producer ONLY on a transition, so this is not "route every report":
+    // an unchanged held state produces no event to route.
     //
-    // The recovery is CLICK-3's, one layer up and on the identical contract: every pointer producer
-    // emits a `Button` ONLY on a genuine edge and de-dups a hold (EHCI's 120 ms quiet gate in
-    // `note_buttons`; xHCI on the down edge alone), so an identical PRIMARY-DOWN mask RE-REPORTED to
-    // this seam is a NEW press, never a hold. It is routed through the same press body — and
-    // `CLICK_PREV_MASK` is already `mask` from the swap above, so no consumer downstream ever sees the
-    // stale latch. A first press (`prev` primary-clear) still takes the ordinary edge test, and a
-    // multi-button change always moves the mask, so `mask == prev` isolates exactly the re-press.
-    let repress = mask & 0x01 != 0 && mask == prev;
-    if repress {
-        let n = CLICK_REPRESS_X86.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= CLICK_REPRESS_LOG_MAX_X86 {
-            serial_println!(
-                "[clickrepress] recovered stationary re-press mask={:#04x} at ({},{}) total={} == witness ::",
-                mask, x, y, n
-            );
-        }
-    }
-    if mask & !prev != 0 || repress {
-        // PRESS edge (or a recovered stationary re-press — see CLICK-REPRESS above).
+    // **A NARROWING, STATED RATHER THAN DISCOVERED.** EHCI keys its `Button` on the PRIMARY bit, so
+    // for the rMBP trackpad this reads exactly as before. `drivers/xhci` emits on ANY bit changing,
+    // so a SECONDARY-only press (mask `0x02`) used to satisfy `mask & !prev != 0` and take the press
+    // body — hit-tested, raising and focusing a window. It now takes the release arm. Deliberate:
+    // this router's whole vocabulary is the primary gesture (`CLICK_PRESS_TARGET` holds ONE
+    // outstanding press, the drag belt reads ONE level), and a secondary press was never a gesture
+    // it could describe. Nothing in-tree acts on a secondary button, and the release arm still
+    // DELIVERS the event to the focused ring when that is where the press went — what is withheld
+    // is only the raise/focus, which a right-click arguably should not have had.
+    if mask & 0x01 != 0 {
+        // PRESS.
         CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
         // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
         // open, is a modal dropdown composited on top of everything, so its press must be tested
-        // before any layer beneath it; when closed, the only point it claims is the crystal box in
-        // the menu bar, which the bar owns anyway (the bar composites above the windows). It declines
+        // before any layer beneath it; when closed, the only points it claims lie in the bar's
+        // upper-left corner cell (FITTS-CORNER, `menubar::crystal_corner_abs`), which the bar owns
+        // anyway (the bar composites above the windows). It declines
         // every other point (`false`), so the dock and window arms are not starved. Consumed with the
         // target set to DROP so the matching RELEASE is dropped rather than delivered into whatever
         // holds focus — the rule the dock, close and chrome arms below already follow.
@@ -6574,7 +6896,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // DOCK — **judged before EVERY window arm, because the dock is composited on top of them.**
         //
         // Neither side can be starved. The crystal declines every point but the open dropdown and the
-        // crystal box in the bar (which the bar owns anyway); the dock declines every point outside
+        // bar's corner cell (which the bar owns anyway); the dock declines every point outside
         // its own strip (`Layout::contains`, the same accessor its painter draws from, corners
         // included). So there is no point at which both this arm and a window arm answer "mine"; and
         // the strip is auto-sized to its tiles and drawn only when there is at least one, so a bare
@@ -6810,7 +7132,9 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 }
             }
         }
-    } else if prev & !mask != 0 {
+    } else {
+        // RELEASE (primary bit clear — see the rule at the top of this function).
+        //
         // WMDIRECT — a live drag ENDS on the release, and its FINAL position is applied here,
         // unthrottled. `wc_drag_motion`'s ~60 Hz admission is what keeps a trackpad sweep from
         // queueing more composites than the panel can retire, and its cost is that the last few
@@ -6846,9 +7170,6 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // received the press, not to whatever the pointer has since been dragged over.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
         target == CLICK_TARGET_DROP || target != cur
-    } else {
-        // Unchanged mask (a re-report of a held button, or an idempotent second call): no edge.
-        false
     }
 }
 
@@ -7000,7 +7321,6 @@ pub fn clickroute_selftest() {
     // Leg 2/3 — focus on A, press over B. Delivered, not swallowed; the pair lands whole in B's ring.
     user_input_set_active(OWNER_A);
     wm::focus_changed(OWNER_A);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     let press_consumed = wc_click_route_at(Event::Button(1), bpx, bpy);
     let raised_ok = user_input_active() == OWNER_B;
     let deliver_ok = !press_consumed && raised_ok && user_input_enqueue(Event::Button(1));
@@ -7060,7 +7380,6 @@ pub fn clickroute_selftest() {
     wm::close(wb);
     wm::close(wk);
     user_input_set_active(saved_focus);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
 }
@@ -7105,16 +7424,23 @@ static WMD_SURF: WmdSurf = WmdSurf([0x0030_70A0; crate::video::wm::FIX_W * crate
 /// assert what no competing consumer can change: the latch `pal` set at PUSH time, and the state the
 /// window system is left in once the events have been routed — by whoever routed them.
 #[cfg(all(feature = "witness", feature = "wc"))]
-fn drain_and_route(max: usize) {
+///
+/// SELFTEST-QUIESCE instrumentation: returns how many events it actually took, so a leg can subtract
+/// its own pops from `pal`'s ledger and report the remainder — the events a COMPETING drain took.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drain_and_route(max: usize) -> u64 {
+    let mut took = 0u64;
     for _ in 0..max {
         match crate::pal::next_event() {
             Some(e) => {
+                took += 1;
                 let _ = wc_route_event(e);
                 wc_route_tail(e);
             }
             None => break,
         }
     }
+    took
 }
 
 /// WMDIRECT — drain until the live gesture is over, bounded by a DEADLINE rather than a spin count.
@@ -7139,17 +7465,26 @@ fn drain_and_route(max: usize) {
 /// of its own, routed the lift as if it were the edge, and then reset `CLICK_PREV_MASK` on the way
 /// out — so when the live drain finally reached the real `Button(0)` it saw no 1 -> 0 transition
 /// against that zeroed mask, took no release arm, and neither drained the pending count nor ended the
-/// gesture. A stranded drag then poisons whatever leg runs next.
+/// gesture. A stranded drag then poisons whatever leg runs next. (Historical: ARC D M1 removed that
+/// latch outright — the router now reads the primary bit and keeps no mask of its own — so this
+/// particular way of stranding a drag no longer exists. The wait is still needed, for the reason
+/// above it.)
 #[cfg(all(feature = "witness", feature = "wc"))]
-fn drain_until_drag_ends() {
+///
+/// SELFTEST-QUIESCE instrumentation: returns how many events this leg's own drain took. `ticks()` is
+/// advanced by the BSP (`apic::ticks`), so the deadline still expires with this core's interrupts
+/// masked — which is what makes the quiesced variant safe to wrap around this wait.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn drain_until_drag_ends() -> u64 {
     let start = crate::arch::ticks();
+    let mut took = 0u64;
     loop {
-        drain_and_route(8);
+        took += drain_and_route(8);
         if crate::video::wm::drag_active() == crate::video::wm::WIN_NONE {
-            return;
+            return took;
         }
         if crate::arch::ticks().wrapping_sub(start) >= WMD_DRAIN_MS {
-            return;
+            return took;
         }
         core::hint::spin_loop();
     }
@@ -7290,7 +7625,6 @@ pub fn wmdirect_selftest() {
     // Leg 2 — the grab. Focus parked on the OTHER window, so this press must MOVE it.
     user_input_set_active(OWNER_O);
     wm::focus_changed(OWNER_O);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     // DRAGREL — the fixture must publish the pointer LEVEL a real press publishes, or leg 3's motion
     // would reach a tail that reads "button up" and end the drag through the new belt instead of
     // through the release EVENT it exists to test. Two legs, two paths, each driven honestly.
@@ -7337,7 +7671,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y + 1) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let consumed = wc_click_route_at(Event::Button(1), px, py);
             wc_click_route_at(Event::Button(0), px, py);
             !consumed && wm::drag_active() == wm::WIN_NONE
@@ -7358,7 +7691,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // The press publishes the level the same way a real pad does; the grab itself is the
             // ordinary chrome arm.
             crate::pal::cursor::set_button_level(true);
@@ -7373,9 +7705,9 @@ pub fn wmdirect_selftest() {
             wc_route_tail(raw);
             let _ = routed;
             let ended = wm::drag_active() == wm::WIN_NONE;
-            // Leave the router's press tracker as it was found — the press above is still
-            // outstanding, and a phantom press would make the NEXT leg's release drop.
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            // ARC D M1 — the leg used to have to zero the router's own mask latch here, because
+            // the press above is still outstanding and a stale latch would make the NEXT leg's
+            // release drop. The router keeps no latch any more, so there is nothing to restore.
             grabbed && ended
         }
         None => false,
@@ -7388,7 +7720,6 @@ pub fn wmdirect_selftest() {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             crate::pal::cursor::set_button_level(true);
             let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
             let consumed = wc_focus_key(Event::Key(b'\t'));
@@ -7396,7 +7727,6 @@ pub fn wmdirect_selftest() {
             // Swallow the TAB's release edge, then unwind this leg's own fixture state.
             let _ = wc_focus_key(Event::KeyUp(b'\t'));
             crate::pal::cursor::set_button_level(false);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             grabbed && consumed && ended
         }
         None => false,
@@ -7430,8 +7760,10 @@ pub fn wmdirect_selftest() {
     //  * `ended` — the gesture is over once the queue has been drained out (`drain_until_drag_ends`).
     //    Not independent (the belt would have ended it too, only later and elsewhere); it is `rest`
     //    that says WHERE. It does catch one real shape, and that shape has been seen: a release edge
-    //    left in the ring with `CLICK_PREV_MASK` already zeroed strands the drag for the rest of the
-    //    boot, which is how the pre-DRAGGLIDE leg flaked at trunk.
+    //    left in the ring with the router's own mask latch already zeroed strands the drag for the
+    //    rest of the boot, which is how the pre-DRAGGLIDE leg flaked at trunk. (ARC D M1 deleted that
+    //    latch; the conjunct is kept because a stranded drag is worth asserting against however it
+    //    comes about.)
     let settle_ok = match {
         // Re-place the row at the setup origin: eight legs have moved it, and this leg asserts an
         // EXACT resting coordinate, so it must start from a placement the panel is known to accept
@@ -7439,11 +7771,10 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => {
+        Some(i) => sfq(|| {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // No edge in flight to begin with: the counter is global and a previous leg's routed
             // `Button(0)` (leg 3's, leg 4's) never went through `push_event`, so it could only be
             // left standing by a real HID release earlier in the boot. Cleared explicitly rather
@@ -7476,6 +7807,13 @@ pub fn wmdirect_selftest() {
                     discarded
                 );
             }
+            // SELFTEST-QUIESCE instrumentation: the ledger either side of the gesture window. This
+            // leg pushes 3 events (the press, then the lift+edge pair) and pops them through
+            // `next_event` once plus `drain_until_drag_ends`; anything the ledger counts beyond that
+            // was taken by a competing drain, and any push beyond 3 was injected by one.
+            let pop0 = evq_pops();
+            let push0 = evq_pushes();
+            let (cpu0, tick0) = sfq_cpu_tick();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
@@ -7496,11 +7834,12 @@ pub fn wmdirect_selftest() {
             // So: take the press if it is still there, and if no drag is live afterwards — whoever
             // popped it, however it rounded — re-assert with the EXACT pixel. The claim is that a
             // title-strip press leaves a live drag on `w`, and it must not turn on who won a race.
-            if matches!(crate::pal::next_event(), Some(Event::Button(1))) {
+            let press_ev = crate::pal::next_event();
+            let mut own_pops = u64::from(press_ev.is_some());
+            if matches!(press_ev, Some(Event::Button(1))) {
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             if wm::drag_active() != w {
-                CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             let grabbed = wm::drag_active() == w;
@@ -7529,10 +7868,13 @@ pub fn wmdirect_selftest() {
                 Some(Event::Button(0)),
             );
             let swap_ok = crate::pal::release_edge_reordered();
-            drain_until_drag_ends();
+            own_pops += drain_until_drag_ends();
             let ended = wm::drag_active() == wm::WIN_NONE;
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
+            let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
+            let fpush = (evq_pushes() - push0) as i64 - 3;
+            let (cpu1, tick1) = sfq_cpu_tick();
+            let masked = crate::arch::irqs_masked();
             // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
             // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
             // the lift was routed while the edge was still counted as queued, i.e. two routers
@@ -7543,14 +7885,42 @@ pub fn wmdirect_selftest() {
             // unexpected lead count evidence of the router interleave rather than of the fix.
             if swap_ok && drag_last_lead() != 0 {
                 serial_println!(
-                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none)",
-                    drag_last_lead()
+                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
+                    drag_last_lead(),
+                    fpop,
+                    fpush,
+                    SFQ_QUIESCE,
+                    cpu0,
+                    cpu1,
+                    tick1 - tick0
                 );
                 None
             } else {
-                Some(grabbed && swap_ok && ended && rest)
+                let verdict = grabbed && swap_ok && ended && rest;
+                if !verdict {
+                    serial_println!(
+                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
+                        grabbed,
+                        swap_ok,
+                        ended,
+                        rest,
+                        wm::info(w).map(|r| (r.x, r.y)),
+                        i.x + 24,
+                        i.y + 24,
+                        drag_last_lead(),
+                        fpop,
+                        fpush,
+                        SFQ_QUIESCE,
+                        cpu0,
+                        cpu1,
+                        tick1 - tick0,
+                        masked,
+                        crate::arch::smp::service_cpu()
+                    );
+                }
+                Some(verdict)
             }
-        }
+        }),
         None => Some(false),
     };
 
@@ -7584,11 +7954,10 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => {
+        Some(i) => sfq(|| {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             for _ in 0..8 {
                 if crate::pal::release_edge_pending() == 0 {
                     break;
@@ -7617,15 +7986,21 @@ pub fn wmdirect_selftest() {
                     discarded
                 );
             }
+            // SELFTEST-QUIESCE instrumentation — see leg 9. This leg pushes 4 events (press, the
+            // +12 motion, then the lift+edge pair).
+            let pop0 = evq_pops();
+            let push0 = evq_pushes();
+            let (cpu0, tick0) = sfq_cpu_tick();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             crate::pal::push_event(Event::Button(1));
             // Best-effort pop, then re-assert with the exact pixel if no drag came of it (see leg 9).
-            if matches!(crate::pal::next_event(), Some(Event::Button(1))) {
+            let press_ev = crate::pal::next_event();
+            let mut own_pops = u64::from(press_ev.is_some());
+            if matches!(press_ev, Some(Event::Button(1))) {
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             if wm::drag_active() != w {
-                CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                 let _ = wc_click_route_at(Event::Button(1), px, py);
             }
             let grabbed = wm::drag_active() == w;
@@ -7647,11 +8022,14 @@ pub fn wmdirect_selftest() {
                 Some(Event::Button(0)),
             );
             let swap_ok = crate::pal::release_edge_reordered();
-            drain_until_drag_ends();
+            own_pops += drain_until_drag_ends();
             let ended = wm::drag_active() == wm::WIN_NONE;
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
+            let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
+            let fpush = (evq_pushes() - push0) as i64 - 4;
+            let (cpu1, tick1) = sfq_cpu_tick();
+            let masked = crate::arch::irqs_masked();
             crate::pal::cursor::set_button_level(false);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
             // behind the edge. Two means the lift was routed as a lead as well — the two-router
             // interleave described on `DRAG_LAST_LEAD` — and the run cannot judge the kernel.
@@ -7660,14 +8038,42 @@ pub fn wmdirect_selftest() {
             // a lead motion as well, and skipping on that would hide the producer half's failure.
             if swap_ok && drag_last_lead() > 1 {
                 serial_println!(
-                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture)",
-                    drag_last_lead()
+                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
+                    drag_last_lead(),
+                    fpop,
+                    fpush,
+                    SFQ_QUIESCE,
+                    cpu0,
+                    cpu1,
+                    tick1 - tick0
                 );
                 None
             } else {
-                Some(grabbed && swap_ok && ended && rest)
+                let verdict = grabbed && swap_ok && ended && rest;
+                if !verdict {
+                    serial_println!(
+                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
+                        grabbed,
+                        swap_ok,
+                        ended,
+                        rest,
+                        wm::info(w).map(|r| (r.x, r.y)),
+                        i.x + 12,
+                        i.y + 12,
+                        drag_last_lead(),
+                        fpop,
+                        fpush,
+                        SFQ_QUIESCE,
+                        cpu0,
+                        cpu1,
+                        tick1 - tick0,
+                        masked,
+                        crate::arch::smp::service_cpu()
+                    );
+                }
+                Some(verdict)
             }
-        }
+        }),
         None => Some(false),
     };
 
@@ -7719,7 +8125,6 @@ pub fn wmdirect_selftest() {
             let (zx, zy) = disc_centre(b);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let c1 = wc_click_route_at(Event::Button(1), zx, zy);
             match (wm::info(w), wm::control_disc_rect(w, wm::Ctrl::Zoom)) {
                 (Some(g1), Some(b2)) => {
@@ -7731,7 +8136,6 @@ pub fn wmdirect_selftest() {
                     if wm::hit_test(zx2, zy2).map(|(id, _, _)| id) != Some(w) {
                         Some(false)
                     } else {
-                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                         let c2 = wc_click_route_at(Event::Button(1), zx2, zy2);
                         let back = wm::info(w)
                             .map(|g2| (g2.x, g2.y, g2.scale) == (g0.x, g0.y, g0.scale))
@@ -7757,7 +8161,6 @@ pub fn wmdirect_selftest() {
             let (mx, my) = disc_centre(b);
             user_input_set_active(OWNER_D);
             wm::focus_changed(OWNER_D);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let consumed = wc_click_route_at(Event::Button(1), mx, my);
             let alive = wm::info(w).is_some();
             let parked = wm::info(w).map(|g| g.z <= wm::shell_z()).unwrap_or(false);
@@ -7778,7 +8181,6 @@ pub fn wmdirect_selftest() {
     let dragdead_ok = match wm::info(w) {
         Some(i) => {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
-            CLICK_PREV_MASK.store(0, Ordering::Relaxed);
             let grabbed = wc_click_route_at(Event::Button(1), px, py) && wm::drag_active() == w;
             wm::close(w);
             grabbed && wm::drag_active() == wm::WIN_NONE
@@ -7816,7 +8218,6 @@ pub fn wmdirect_selftest() {
                     } else {
                         user_input_set_active(OWNER_O);
                         wm::focus_changed(OWNER_O);
-                        CLICK_PREV_MASK.store(0, Ordering::Relaxed);
                         let consumed = wc_click_route_at(Event::Button(1), px, py);
                         Some(
                             consumed
@@ -7878,7 +8279,6 @@ pub fn wmdirect_selftest() {
     wm::close(wc);
     wm::close(wo);
     user_input_set_active(saved_focus);
-    CLICK_PREV_MASK.store(0, Ordering::Relaxed);
     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
     wm::focus_reset();
 }
@@ -13436,7 +13836,7 @@ struct Proc {
 ///     request table, so there is no aarch64-style `MAX_KILL_REQS` coupling to assert here.
 ///
 /// HEADROOM (Boot AL, rMBP) — raised 6 -> 10, x86 only (aarch64 keeps PROCS-6). The number the
-/// operator meets is not this one: `video::wcx::desktop_app_service` launches `STAT.ELF` at boot and
+/// operator meets is not this one: `video::desktop_uefi::desktop_app_service` launches `STAT.ELF` at boot and
 /// it never exits, so at 6 a `storm` fleet capped at **5**. The target is a fleet of 8 vugs with the
 /// desktop app still resident and a foreground `run` still possible — 8 + 1 = 9 rows in use, so 10.
 ///
@@ -13966,6 +14366,11 @@ pub fn clear_handle_row(slot: usize) {
     // clicks consumed as furniture. Both readers of the flag depend on this clear.
     #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[slot].store(false, Ordering::Release);
+    // SPAWN-FOCUS: drop any UNCONSUMED token, per TENANT and for the identical reason. A program the
+    // operator launched by name that exited before it ever opened a window would otherwise leave a
+    // live token on this owner value, and the slot's NEXT tenant — which nobody asked for — would
+    // consume it and take the keyboard. See `wm::spawn_focus_forget`.
+    crate::video::wm::spawn_focus_forget((slot as u64) + 1);
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind),
         // then the rights and kind — so no intermediate state is ever a live handle with stale rights/kind.
@@ -15821,6 +16226,11 @@ pub fn run_user_image(
 ) -> Result<(RunOutcome, u64), &'static str> {
     let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
     let (mapped, pi) = load_program_common(bytes)?;
+    // SPAWN-FOCUS: a foreground `run` is an operator-typed launch by construction — this entry point
+    // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
+    // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
+    // before its spawn: the task can reach `SYS_WIN_CREATE` the instant it is runnable.
+    crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1);
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: a foreground `run` is load-balanced, not stuck on the caller's core. The caller is
     // `x86_render_service` (the shell runs there since SCHED-X86), so `meter_current_cpu()` put every
@@ -15899,7 +16309,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
 }
 
 /// DESKTOP-APP: [`spawn_user_image_bg`] for a launch NOBODY ASKED FOR — the compositor's own desktop
-/// app, started at boot by `video::wcx::desktop_app_service`.
+/// app, started at boot by `video::desktop_uefi::desktop_app_service`.
 ///
 /// Identical in every respect but one: the slot is marked [`SLOT_NO_AUTOFOCUS`] before the task can
 /// run, so the program's first `SYS_WIN_CREATE` does not take the keyboard off an idle shell. That
@@ -15934,6 +16344,19 @@ fn spawn_user_image_bg_inner(
     // flag has to be true before the task exists, not before it gets around to opening a window.
     #[cfg(feature = "wc")]
     SLOT_NO_AUTOFOCUS[mapped.slot].store(no_autofocus, Ordering::Release);
+    // SPAWN-FOCUS: and the operator's focus token, in the same pre-spawn window and under the same
+    // rule — the task is runnable the instant it is spawned, so a token armed after this call is a
+    // race the operator loses whenever the program is quick to open its window.
+    //
+    // `!no_autofocus` IS the operator predicate and not a convenient proxy for one: this function's
+    // two public wrappers are exactly "the launch the operator asked for" (`spawn_user_image_bg` —
+    // `bg`, and the bare-name launch) and "the launch NOBODY asked for" (`..._no_autofocus`, whose
+    // one caller is `desktop_uefi::desktop_app_service`). The desktop app is therefore excluded HERE, at the
+    // arming, as well as at the grant — it never holds a token to consume, so its exemption does not
+    // depend on `slot_is_focus_exempt` alone.
+    if !no_autofocus {
+        crate::video::wm::spawn_focus_arm((mapped.slot as u64) + 1);
+    }
     let kill = alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new());
     // SMPBAL-X86: load-balanced placement. See `bg_place_cpu`.
     let cpu = bg_place_cpu();
@@ -16443,8 +16866,25 @@ fn winx_launcher(demo_cpu: usize) {
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can
     // inherit a pinned fixture or a re-tiled panel.
+    // PTRDEAD — the pointer BACKLOG leg, and it goes immediately ahead of `wmdirect_selftest`
+    // deliberately. It mints no row, touches no window table and needs no panel — it drives `pal`
+    // alone — so it is the least disruptive fixture in this ladder and could sit almost anywhere;
+    // what it DOES do is empty `EVENT_QUEUE`, exactly as `wmdirect_selftest`'s own legs 9 and 10 do
+    // for the same reason. Putting the two adjacent means one stretch of the boot owns that
+    // discard instead of two, and no fixture between them can lose an event to it.
+    #[cfg(feature = "witness")]
+    ptrdead_selftest();
     #[cfg(all(feature = "witness", feature = "wc"))]
     wmdirect_selftest();
+    // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
+    // two overlapping groups, banded seeds driven with the REAL sprite parked on the three-way
+    // stack: the boot-8 wedge class (banded drags + cursor-repaint storm under overlap) is only
+    // reachable with the pointer ON the stack, so the fixture parks it there itself, on
+    // `wmdirect_selftest`'s own `set_abs` idiom. Last for two reasons: every row it mints is
+    // pinned (no later fixture may inherit a re-tiled panel — moot here, but the rule is the
+    // rule), and it MOVES the real pointer, which no earlier fixture may inherit either.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    crate::video::wm::dmgovlp_selftest();
 }
 
 // =============================================================================================
@@ -16587,7 +17027,7 @@ fn winx2_launcher(_demo_cpu: usize) {
     // REVIEW C3 — THE FREE BUCKET ALONE CANNOT BE ATTRIBUTED, and the first cut of this check claimed it
     // could ("this witness's own program is the only thing that retires between the two reads; nothing
     // else in the launcher chain spawns here"). That was a false invariant with a live counterexample in
-    // this same tree: `video::wcx::desktop_app_service` (wcx.rs:514) runs on the DEVICE-SERVICE task and
+    // this same tree: `video::desktop_uefi::desktop_app_service` (desktop_uefi.rs:514) runs on the DEVICE-SERVICE task and
     // is gated on the same storage-enumeration event this launcher's `fat::mount()` is, so on a
     // `UNAOS_WC` metal boot it can `proc_reserve` a row INSIDE `bg_kill`'s up-to-`KILL_CONFIRM_MS`
     // confirm window. Kill frees one, launch takes one, net delta zero — and an `== free_before + 1`
@@ -16746,6 +17186,23 @@ fn winx3_launcher(_demo_cpu: usize) {
     let mut wx = img.clone();
     wx[64 + 4..64 + 8].copy_from_slice(&7u32.to_le_bytes()); // PF_R|PF_W|PF_X
     let rejects_wx = super::elf::validate_elf(&wx, user_window_size()).is_err();
+    // And the WINX-8 defence-in-depth refusal, BOTH polarities (validate-only — the mapper never
+    // sees these images, so the text/data vaddr overlap the stretch creates is immaterial).
+    // BROKEN shape: the text p_memsz stretched so the RX span crosses into the FINAL window page —
+    // the page the loader's own `sp = window top` makes the first stack page of every program. Must
+    // be refused at load time (`:: elf: REFUSED rx-crosses-final-window-page … ::`), not loaded to
+    // die on the program's first frame push.
+    let mut rx_cross = img.clone();
+    let cross = (user_window_size() - 0x1000 + 1) as u64; // one byte INTO the final page
+    rx_cross[64 + 40..64 + 48].copy_from_slice(&cross.to_le_bytes()); // text p_memsz
+    let rejects_rx_cross = super::elf::validate_elf(&rx_cross, user_window_size()).is_err();
+    // FIXED shape: the RX span ending exactly AT the final-page boundary owns no byte of the final
+    // page and MUST load — the refusal is `end > boundary`, not `>=`. This is the boundary the
+    // repaired VUG-X86.ELF layout sits under (its RX memsz 0x1fe5 ends well below it).
+    let mut rx_edge = img.clone();
+    let edge = (user_window_size() - 0x1000) as u64;
+    rx_edge[64 + 40..64 + 48].copy_from_slice(&edge.to_le_bytes()); // text p_memsz
+    let loads_rx_edge = super::elf::validate_elf(&rx_edge, user_window_size()).is_ok();
 
     serial_println!(
         ":: WINX-3: ELF loader — a synthesized two-segment ELF64 ({} bytes) through spawn_user_image_bg, the same path `bg` takes ::",
@@ -16792,6 +17249,8 @@ fn winx3_launcher(_demo_cpu: usize) {
     let ok = plan_ok
         && rejects_wrong_arch
         && rejects_wx
+        && rejects_rx_cross
+        && loads_rx_edge
         && status == WINX_WITNESS_ALL as i32
         && windowed
         && presents >= 2
@@ -16799,14 +17258,14 @@ fn winx3_launcher(_demo_cpu: usize) {
         && cleared;
     if ok {
         serial_println!(
-            ":: WINX-3: ELF loader — 2 PT_LOADs mapped W^X, entry {:#x}, ring-3 witness {:#x} through the ELF path, {} presents, wrong-arch + W+X images refused, reap clean -> PASS ::",
+            ":: WINX-3: ELF loader — 2 PT_LOADs mapped W^X, entry {:#x}, ring-3 witness {:#x} through the ELF path, {} presents, wrong-arch + W+X + rx-crosses-final-window-page images refused (edge loads), reap clean -> PASS ::",
             entry, status, presents
         );
     } else {
         serial_println!(
-            ":: WINX-3: ELF loader FAIL — plan={} rej_arch={} rej_wx={} status={:#x} windowed={} presents={} gone={} cleared={} (want true/true/true/{:#x}/true/>=2/true/true) ::",
-            plan_ok, rejects_wrong_arch, rejects_wx, status, windowed, presents, gone, cleared,
-            WINX_WITNESS_ALL
+            ":: WINX-3: ELF loader FAIL — plan={} rej_arch={} rej_wx={} rej_rxcross={} edge_loads={} status={:#x} windowed={} presents={} gone={} cleared={} (want true/true/true/true/true/{:#x}/true/>=2/true/true) ::",
+            plan_ok, rejects_wrong_arch, rejects_wx, rejects_rx_cross, loads_rx_edge, status,
+            windowed, presents, gone, cleared, WINX_WITNESS_ALL
         );
     }
 }
@@ -17552,7 +18011,13 @@ const DMG_MAGIC: u64 = 0x444D_4752; // 'DMGR'
 /// clear of the stack which starts at +0x4000-16 and never descends 4 KiB).
 ///   `+0x00` magic  ·  `+0x08` the owner's window id  ·  `+0x10` a provably-FREE window id
 ///   `+0x18` (written BACK by the prober) its first window id  ·  `+0x20` its second window id
+///   `+0x28` (written BACK by the prober) SWEPT — "all 19 probes fired, my two windows are STILL live
+///           and I am parked": the launcher's ground-truth re-read happens strictly inside this park
+///   `+0x30` the prober's release word, written by the launcher once that re-read is taken
 const DMG_PARAM_OFF: usize = 0x3000;
+/// DMG-REFUSE: the prober's SWEPT flag and its release word, as offsets from `DMG_PARAM_OFF`.
+const DMG_SWEPT_OFF: usize = 0x28;
+const DMG_PROBE_GO_OFF: usize = 0x30;
 /// DMG-REFUSE: the owner's release word, at ITS data page +0x3000. The owner exits only when this goes
 /// nonzero, which the launcher does strictly AFTER the prober has finished — so the owner's window is
 /// provably live for the whole probe sweep.
@@ -17763,6 +18228,23 @@ unaos_user_dmg_probe:
     jmp  70b
 
 78: add  rsp, 48
+    // (5) SWEPT + PARK. `SYS_EXIT` below tears this slot down synchronously — `sched::exit` ->
+    //     `user_space_release` -> `free_user_space_by_cr3` -> `win_close_slot` — so our two window
+    //     rows vanish microseconds after the exit status is published. The launcher's ground-truth
+    //     re-read must happen while they are still in the table, so we publish SWEPT and park here
+    //     until it releases us. Bounded: 3000 * 20 ms = 60 s, far past the launcher's own deadline.
+    //     Only the FULL-sweep path parks; every early abort still jumps straight to 79 and exits with
+    //     a witness the launcher grades as FAIL, so a broken prober cannot hide inside this park.
+    mov  qword ptr [rbx + 40], 1              // +0x28 = SWEPT
+    mov  r13, 3000
+80: mov  rax, [rbx + 48]                      // +0x30 = the launcher's release word
+    test rax, rax
+    jnz  79f
+    mov  rax, 5                               // SYS_SLEEP_MS
+    mov  rdi, 20
+    syscall
+    dec  r13
+    jnz  80b
 79: mov  rax, 2                               // SYS_EXIT(witness)
     mov  rdi, r12
     syscall
@@ -17880,7 +18362,7 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 ///      tell its own race from a kernel bug is worse than no fixture.
 ///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
 ///
-/// SETTLE FLAG: `video::wcx::desktop_app_service` holds the desktop-app launch (bounded, out loud)
+/// SETTLE FLAG: `video::desktop_uefi::desktop_app_service` holds the desktop-app launch (bounded, out loud)
 /// until this witness has had its empty-table entry — Boot AL's launch at 13.257s beat the witness to
 /// row 1 (DMG entry 13.859s) and it printed NOT RUN for the first time in the capture. The flag is
 /// published on EVERY exit (the wrapper stores it after the body returns, NOT RUN paths included).
@@ -17974,42 +18456,91 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     }
     crate::arch::sched::spawn_user_in_space("dmg-probe", probe.entry, probe.sp, demo_cpu, probe.cr3);
 
+    // 3b. Wait for SWEPT — the prober's "19 probes fired, both my windows are still live, I am
+    //     parked". This handshake is what makes step 4 a measurement rather than a race: the prober's
+    //     `SYS_EXIT` retires its window rows SYNCHRONOUSLY (`sched::exit` -> `user_space_release` ->
+    //     `free_user_space_by_cr3` -> `win_close_slot`), and `DMG_DONE` is published by the SYS_EXIT
+    //     arm BEFORE that teardown runs — so a re-read gated on `DMG_DONE` alone is a footrace between
+    //     this launcher's next `yield_now` round and the prober's teardown on another core. Under host
+    //     load that round is a whole quantum and the race is lost roughly 2 runs in 5, which printed
+    //     `recheck=0x01` and NOT RUN with nothing actually wrong.
+    //     `DMG_DONE` still terminates the wait: a prober that aborted early (no magic, no window) never
+    //     writes SWEPT and must be graded, not waited on.
+    let sdeadline = crate::arch::ticks() + 10_000;
+    while dmg_probe_swept(probe.slot) == 0
+        && DMG_DONE.load(Ordering::Acquire) < 1
+        && crate::arch::ticks() < sdeadline
+    {
+        crate::arch::sched::yield_now();
+    }
+    if dmg_probe_swept(probe.slot) == 0 {
+        // Distinct from "the table moved": the prober never reached its post-sweep park at all. That is
+        // a fixture failure with a witness to show for it, so it grades FAIL rather than NOT RUN.
+        serial_println!(
+            ":: DMG-REFUSE FAIL — the prober never published SWEPT within 10000ms (probes={:#018x} done={} killed={} id_a={} id_free={} entry={:#04x}) ::",
+            DMG_PROBE_WITNESS.load(Ordering::Acquire),
+            DMG_DONE.load(Ordering::Acquire),
+            DMG_KILLED.load(Ordering::Acquire),
+            id_a,
+            id_free,
+            occ_a
+        );
+        dmg_release_probe_go(probe.slot);
+        dmg_release_go(owner.slot);
+        return;
+    }
+
+    // The ids the prober says it was given, read back out of its own param block — while it is parked,
+    // so this reads a LIVE slot rather than one that may already have been freed and recycled.
+    let (rep_b0, rep_b1) = unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *const u64;
+        (core::ptr::read_volatile(p.add(3)), core::ptr::read_volatile(p.add(4)))
+    };
+
+    // 4. GROUND TRUTH RE-READ, with the prober parked and every window — owner's and prober's — live.
+    let (occ_re, own_re) = dmg_win_masks(owner.slot);
+    let (_, own_probe) = dmg_win_masks(probe.slot);
+    // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
+    // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
+    let ids_ok = rep_b0 < WIN_MAX as u64
+        && rep_b1 < WIN_MAX as u64
+        && rep_b0 != id_a
+        && rep_b1 != id_a
+        && rep_b0 != rep_b1;
+    // THE PROBER'S OWN ROWS, reported by ring 3 and confirmed kernel-side against the slot that owns
+    // them. Separate from the "moved" test below: this is about the prober's report agreeing with the
+    // table, not about the ground truth the probes were graded against shifting.
+    let rows_ok = ids_ok && own_probe == ((1 << rep_b0) | (1 << rep_b1));
+    // THE GROUND TRUTH the expectations were built from: the owner still owns exactly `id_a`, and
+    // `id_free` is still free. This is the only condition that means "the table moved under the probe".
+    let table_ok = own_re == (1 << id_a) && occ_re & (1 << id_free) == 0;
+    if !ids_ok || !rows_ok {
+        serial_println!(
+            ":: DMG-REFUSE: the prober's own window rows do not match the table (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} probe_owned={:#04x}) — refusal witness NOT RUN ::",
+            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_probe
+        );
+        dmg_release_probe_go(probe.slot);
+        dmg_release_go(owner.slot);
+        return;
+    }
+    if !table_ok {
+        serial_println!(
+            ":: DMG-REFUSE: the window table moved under the probe (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
+            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_re
+        );
+        dmg_release_probe_go(probe.slot);
+        dmg_release_go(owner.slot);
+        return;
+    }
+
+    // 5. Release the prober's park, then the owner, and collect both exits + the teardown proof.
+    dmg_release_probe_go(probe.slot);
     let pdeadline = crate::arch::ticks() + 10_000;
     while DMG_DONE.load(Ordering::Acquire) < 1 && crate::arch::ticks() < pdeadline {
         crate::arch::sched::yield_now();
     }
     let witness = DMG_PROBE_WITNESS.load(Ordering::Acquire);
     let presents = fb_present_count() - presents_before;
-
-    // The ids the prober says it was given, read back out of its own param block.
-    let (rep_b0, rep_b1) = unsafe {
-        let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *const u64;
-        (core::ptr::read_volatile(p.add(3)), core::ptr::read_volatile(p.add(4)))
-    };
-
-    // 4. GROUND TRUTH RE-READ, before the owner is released and while every window is still live.
-    let (occ_re, own_re) = dmg_win_masks(owner.slot);
-    // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
-    // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
-    let ground_ok = rep_b0 < WIN_MAX as u64
-        && rep_b1 < WIN_MAX as u64
-        && own_re == (1 << id_a)
-        && occ_re & (1 << id_free) == 0
-        && occ_re & (1 << rep_b0) != 0
-        && occ_re & (1 << rep_b1) != 0
-        && rep_b0 != id_a
-        && rep_b1 != id_a
-        && rep_b0 != rep_b1;
-    if !ground_ok {
-        serial_println!(
-            ":: DMG-REFUSE: the window table moved under the probe (id_a={} id_free={} b0={} b1={} entry={:#04x} recheck={:#04x} owned={:#04x}) — refusal witness NOT RUN ::",
-            id_a, id_free, rep_b0, rep_b1, occ_a, occ_re, own_re
-        );
-        dmg_release_go(owner.slot);
-        return;
-    }
-
-    // 5. Release the owner and collect both exits + the teardown proof.
     dmg_release_go(owner.slot);
     let vdeadline = crate::arch::ticks() + 8000;
     while DMG_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < vdeadline {
@@ -18082,6 +18613,27 @@ fn dmg_refuse_witness(demo_cpu: usize) {
             occ_a,
             occ_re
         );
+    }
+}
+
+/// DMG-REFUSE: the prober's SWEPT flag, read through its slot's identity backing. Nonzero means the
+/// prober fired all 19 probes and is parked with BOTH its windows still in the table.
+fn dmg_probe_swept(slot: usize) -> u64 {
+    unsafe {
+        let p = crate::arch::memory::slot_backing_ptr(slot).add(DMG_PARAM_OFF + DMG_SWEPT_OFF)
+            as *const u64;
+        core::ptr::read_volatile(p)
+    }
+}
+
+/// DMG-REFUSE: release the prober's post-sweep park — the `dmg_release_go` idiom, sound for the same
+/// reason (x86-TSO: the parked fixture's next aliased load after its 20 ms sleep observes the store).
+/// Called on EVERY path that has spawned the prober, so it can never be left parked holding a slot.
+fn dmg_release_probe_go(slot: usize) {
+    unsafe {
+        let go = crate::arch::memory::slot_backing_ptr(slot).add(DMG_PARAM_OFF + DMG_PROBE_GO_OFF)
+            as *mut u64;
+        core::ptr::write_volatile(go, 1);
     }
 }
 
@@ -19043,22 +19595,43 @@ fn sock4_build(entry_sym: *const u8) -> Option<U7xFix> {
 ///       deposit itself lands (handle-level rights are all `sys_xfer` checks), but the migration at C's
 ///       RECV is REFUSED (the sender A no longer owns the socket): C's received handle is dead and B's
 ///       ownership is undisturbed — a second transfer can never yank a moved socket back.
-///   5. THE GEN-REBIND FENCE: B frees the socket (gen bumps), then a fresh socket REUSES the same slot at
-///      the NEW generation — B's old handle (old gen) stays `-EACCES`, provably no rebind to the new tenant.
+///   5. THE GEN-REBIND FENCE: B frees the socket (gen bumps), then a fresh socket is opened — and the fence
+///      is staged on WHATEVER registry slot that open returned, using THAT slot's own generation arithmetic:
+///      the live tenant resolves under its owner at the CURRENT gen, the same slot + same owner at the
+///      PRECEDING gen is `-EACCES` (only the packed generation differs, so only the gen check can reject),
+///      and B's old handle stays `-EACCES` throughout — provably no rebind to a new tenant.
 ///   6. LEDGER HYGIENE: after dropping every planted handle/Proc entry, the handle rows, inboxes, transfer
 ///      records AND the derivation ledger are all fully clear.
+///
+/// FLAKE INSTRUMENT (class 1b, `cleared=true kernel=false`): `step` is an out-parameter naming the FIRST
+/// term that read false — every early-return acquisition individually, and for the `ok &=` chain the tag
+/// captured at its first failure. It is written on every path and read only on the launcher's FAIL path;
+/// the check's semantics are unchanged (each term is still evaluated exactly as before, in the same order).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-fn sock4_kernel_check() -> bool {
+fn sock4_kernel_check(step: &mut &'static str) -> bool {
     const A: usize = 5; // scratch grantor row
     const B: usize = 6; // scratch grantee row
     const PIDB: u64 = 0xE4; // planted grantee pid (never collides: PROCS holds only planted entries now)
     let mut ok = true;
+    *step = "none";
+
+    // Latch the FIRST false term. `cond` is computed by the caller exactly as the old `ok &= <expr>` did, so
+    // every side effect still happens, in the same order — this records, it does not gate.
+    #[inline(always)]
+    fn note(ok: &mut bool, step: &mut &'static str, cond: bool, tag: &'static str) {
+        if !cond && *ok {
+            *step = tag;
+        }
+        *ok &= cond;
+    }
 
     if !crate::smolnet::init() {
+        *step = "smolnet_init";
         return false; // no NIC / stack — the demo already skipped, so this never runs then
     }
     // Plant B's Proc entry (the pid->slot map `sys_xfer` resolves through; `proc_reserve` marks it RUNNING).
     let Some(pb) = proc_reserve() else {
+        *step = "proc_reserve_b";
         return false;
     };
     PROCS[pb].slot.store(B + 1, Ordering::Release); // +1-biased, like sys_spawn's pid->slot map
@@ -19067,6 +19640,7 @@ fn sock4_kernel_check() -> bool {
     // 1. A mints a UDP socket owned by row A, carrying the full CAP_READ|CAP_WRITE|CAP_GRANT (the sys_socket
     //    mint), and holds a Child handle naming B for the transfer.
     let Some(sid) = crate::smolnet::stack_open(A) else {
+        *step = "stack_open";
         proc_free(pb);
         return false;
     };
@@ -19074,18 +19648,33 @@ fn sock4_kernel_check() -> bool {
     let val = ((gen0 as u64) << 32) | ((sid as u64) + 1); // the sock_id_pack value word
     install_cap(A, 2, KIND_SOCKET, val, CAP_READ | CAP_WRITE | CAP_GRANT);
     install_cap(A, 3, KIND_CHILD, PIDB, CAP_READ);
-    ok &= socket_id_of(A, 2, CAP_WRITE) == Ok(sid); // A owns + resolves its socket
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 2, CAP_WRITE) == Ok(sid),
+        "a_resolves",
+    ); // A owns + resolves its socket
 
     // 2. Transfer to B (attenuate to CAP_READ|CAP_WRITE); B RECVs -> ownership migrates to B.
     let t = sys_xfer_from(A, 3, 2, (CAP_READ | CAP_WRITE) as u64);
-    ok &= t > 0;
+    note(&mut ok, step, t > 0, "xfer_a_to_b");
     let hb = sys_recv_for(B);
-    ok &= hb >= 0;
+    note(&mut ok, step, hb >= 0, "recv_b");
 
     // 3. THE MOVED CAP WORKS: B resolves the socket now (owner-matched under B after migration).
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid);
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid),
+        "b_resolves_moved",
+    );
     // 4. A's original handle is DEAD: its owner is now B, so the cross-row handle is -EACCES.
-    ok &= socket_id_of(A, 2, CAP_WRITE) == Err(EACCES);
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 2, CAP_WRITE) == Err(EACCES),
+        "a_stale_eacces",
+    );
 
     // 4b. THE STEAL FENCE (review fix): A's handle still carries CAP_GRANT (rights are handle-local), so a
     //     SECOND deposit — to C — lands; but `xfer_socket_migrate` at C's RECV demands the sender still OWN
@@ -19094,6 +19683,7 @@ fn sock4_kernel_check() -> bool {
     const C: usize = 7; // scratch second-grantee row (< USER_SLOTS; clear like A/B — see the doc comment)
     const PIDC: u64 = 0xE5; // planted second-grantee pid (same never-collides argument as PIDB)
     let Some(pc) = proc_reserve() else {
+        *step = "proc_reserve_c";
         if hb >= 0 {
             handle_clear(B, hb as usize);
         }
@@ -19107,24 +19697,53 @@ fn sock4_kernel_check() -> bool {
     PROCS[pc].pid.store(PIDC, Ordering::Release);
     install_cap(A, 4, KIND_CHILD, PIDC, CAP_READ);
     let t2 = sys_xfer_from(A, 4, 2, (CAP_READ | CAP_WRITE) as u64);
-    ok &= t2 > 0; // the deposit lands — sys_xfer's checks are handle-level by design
+    note(&mut ok, step, t2 > 0, "xfer_a_to_c"); // the deposit lands — sys_xfer's checks are handle-level
     let hc = sys_recv_for(C);
-    ok &= hc >= 0; // the cap is delivered ...
-    ok &= hc >= 0 && socket_id_of(C, hc as u64, CAP_WRITE) == Err(EACCES); // ... but DEAD: migration refused
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid); // B undisturbed — still the owner
+    note(&mut ok, step, hc >= 0, "recv_c"); // the cap is delivered ...
+    note(
+        &mut ok,
+        step,
+        hc >= 0 && socket_id_of(C, hc as u64, CAP_WRITE) == Err(EACCES),
+        "c_dead_steal_fence",
+    ); // ... but DEAD: migration refused
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Ok(sid),
+        "b_undisturbed",
+    ); // B undisturbed — still the owner
     if hc >= 0 {
         handle_clear(C, hc as usize); // frees the second transfer's record + node before the gen-fence step
     }
     handle_clear(A, 4);
     proc_free(pc);
 
-    // 5. THE GEN-REBIND FENCE. B frees the socket (gen bumps) — then a fresh socket first-fit-REUSES the same
-    //    slot at the NEW gen. B's old handle carries (sid, gen0), so it must stay -EACCES against BOTH the
-    //    freed slot and the new tenant — no rebind (the U11x fd discipline, socket edition).
+    // 5. THE GEN-REBIND FENCE. B frees the socket (gen bumps) — then a fresh socket is opened for A and the
+    //    fence is staged on THAT socket's slot, whatever it is.
+    //
+    //    FLAKE FIX (class 1b variant 2): this step used to assert `sid2 == sid` — that the reopen first-fit
+    //    BACK onto the freed slot — to get a live tenant under B's stale (sid, gen0) handle. That is not a
+    //    kernel invariant: `stack_open` takes the lowest free `reg` index of the GLOBAL smolnet table, so any
+    //    other user of that table (the SMOLNET DNS leg, the SOCK-6/7 listeners) freeing a lower slot inside
+    //    this window sends the reopen elsewhere and the fence reads false with nothing wrong. The property
+    //    being proven never needed that slot to be `sid`: it needs a LIVE tenant and a packed id for the same
+    //    slot at a generation the tenant does not hold. Both are available on `sid2` directly, so the staging
+    //    no longer depends on any other user of the table.
     crate::smolnet::stack_close(sid);
-    ok &= crate::smolnet::sock_gen(sid) != gen0; // the generation advanced on free
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES); // stale against the freed slot
+    note(
+        &mut ok,
+        step,
+        crate::smolnet::sock_gen(sid) != gen0,
+        "gen_advanced",
+    ); // the generation advanced on free
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES),
+        "b_stale_vs_freed",
+    ); // stale against the freed slot
     let Some(sid2) = crate::smolnet::stack_open(A) else {
+        *step = "stack_open_reuse";
         // cleanup on the unlikely alloc failure, then fail
         if hb >= 0 {
             handle_clear(B, hb as usize);
@@ -19134,8 +19753,49 @@ fn sock4_kernel_check() -> bool {
         proc_free(pb);
         return false;
     };
-    ok &= sid2 == sid; // first-fit reused the freed slot — the rebind hazard is now live
-    ok &= hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES); // still -EACCES vs the NEW tenant
+    let gen2 = crate::smolnet::sock_gen(sid2);
+    // POSITIVE CONTROL: the live tenant of `sid2`, packed at its CURRENT generation, resolves under its
+    // OWNER (row A). Without it the negative below could pass for the boring reason (a dead/free slot).
+    install_cap(
+        A,
+        5,
+        KIND_SOCKET,
+        ((gen2 as u64) << 32) | ((sid2 as u64) + 1),
+        CAP_READ | CAP_WRITE,
+    );
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 5, CAP_WRITE) == Ok(sid2),
+        "new_tenant_live",
+    );
+    // THE FENCE: same slot, same owner, same rights — the ONLY term that differs from the control is the
+    // packed generation, one behind the live tenant's, so only the generation check can reject it. A slot
+    // can only become free (and so be handed out by this open) by having been closed, and closing bumps the
+    // generation, so `gen2 - 1` is the generation of that slot's PREVIOUS tenant; in the degenerate case of
+    // a never-closed slot it wraps to a generation the slot has never held. Either way it is not the live
+    // tenant's, which is exactly the stale packed id the U11x fd discipline (socket edition) must reject.
+    install_cap(
+        A,
+        6,
+        KIND_SOCKET,
+        ((gen2.wrapping_sub(1) as u64) << 32) | ((sid2 as u64) + 1),
+        CAP_READ | CAP_WRITE,
+    );
+    note(
+        &mut ok,
+        step,
+        socket_id_of(A, 6, CAP_WRITE) == Err(EACCES),
+        "stale_gen_vs_tenant",
+    );
+    handle_clear(A, 5);
+    handle_clear(A, 6);
+    note(
+        &mut ok,
+        step,
+        hb >= 0 && socket_id_of(B, hb as u64, CAP_WRITE) == Err(EACCES),
+        "b_stale_vs_new_tenant",
+    ); // B's own stale handle stays dead with a fresh socket live (whichever slot took it)
     crate::smolnet::stack_close(sid2);
 
     // 6. Drop everything planted, then demand every ledger fully clear (no record/node/slot leaked).
@@ -19145,9 +19805,24 @@ fn sock4_kernel_check() -> bool {
     handle_clear(A, 2); // drops the transfer source's derivation root node
     handle_clear(A, 3);
     proc_free(pb);
-    ok &= handle_row_is_clear(A) && handle_row_is_clear(B) && handle_row_is_clear(C);
-    ok &= xfer_row_is_clear(A) && xfer_row_is_clear(B) && xfer_row_is_clear(C);
-    ok &= xfer_recs_all_free() && deriv_all_free();
+    note(
+        &mut ok,
+        step,
+        handle_row_is_clear(A) && handle_row_is_clear(B) && handle_row_is_clear(C),
+        "handle_rows_clear",
+    );
+    note(
+        &mut ok,
+        step,
+        xfer_row_is_clear(A) && xfer_row_is_clear(B) && xfer_row_is_clear(C),
+        "xfer_rows_clear",
+    );
+    note(
+        &mut ok,
+        step,
+        xfer_recs_all_free() && deriv_all_free(),
+        "ledgers_free",
+    );
     ok
 }
 
@@ -19278,11 +19953,20 @@ fn sock4_launcher(demo_cpu: usize) {
     while !all_clear(grantor.slot, grantee.slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
     }
-    let cleared = all_clear(grantor.slot, grantee.slot);
+    // FLAKE INSTRUMENT (class 1b): take the five terms individually at the same instant, so a FAIL can name
+    // WHICH one read false. Every term is a pure read, so splitting the `&&` chain changes no behaviour —
+    // `cleared` is the identical conjunction the closure computes.
+    let tc_gh = handle_row_is_clear(grantor.slot);
+    let tc_eh = handle_row_is_clear(grantee.slot);
+    let tc_gx = xfer_row_is_clear(grantor.slot);
+    let tc_ex = xfer_row_is_clear(grantee.slot);
+    let tc_rf = xfer_recs_all_free();
+    let cleared = tc_gh && tc_eh && tc_gx && tc_ex && tc_rf;
     proc_free(pi); // the planted pid->slot entry (the fixtures exited by name, never through the Proc path)
 
     // 5c. The M1 kernel-side gen-rebind proof (needs the drained ledgers the wait above establishes).
-    let kernel_ok = cleared && sock4_kernel_check();
+    let mut kstep: &'static str = "not-run"; // stays "not-run" when `cleared` short-circuits the check away
+    let kernel_ok = cleared && sock4_kernel_check(&mut kstep);
 
     if gw == SOCK4_GRANTOR_WITNESS_ALL
         && ew == SOCK4_GRANTEE_WITNESS_ALL
@@ -19308,6 +19992,17 @@ fn sock4_launcher(demo_cpu: usize) {
             SOCK4_DONE.load(Ordering::Acquire),
             SOCK4_GRANTOR_WITNESS_ALL,
             SOCK4_GRANTEE_WITNESS_ALL
+        );
+        // FLAKE INSTRUMENT (FIXTURE_FLAKES.md class 1b) — failure path ONLY, adjacent to the FAIL line the
+        // specs match on: which all_clear term read false, and which sock4_kernel_check step failed.
+        serial_println!(
+            ":: SOCK-4 BREAKDOWN: all_clear grantor_row={} grantee_row={} xfer_grantor={} xfer_grantee={} recs_free={} | kernel_check step={} ::",
+            tc_gh,
+            tc_eh,
+            tc_gx,
+            tc_ex,
+            tc_rf,
+            kstep
         );
     }
 }

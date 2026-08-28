@@ -12,15 +12,17 @@ spinner can then take no timer IRQ, so that core dies silently — no panic. The
 anywhere in this family; lock-ordering discipline fixes none of it.
 
 F3's instance: `XHCI_CONTROLLER` was held straight across `pump_until_bot_done`, whose wall-clock
-budget is `hw_wait_budget() * 3` ≈ 8.3 s on the Pi (450 M CNTVCT ticks at 54 MHz) against a 12 ms
+budget is `hw_wait_budget() * 3` — 8.33 s on the Pi (450 M CNTVCT ticks at 54 MHz; 14.4 s on the
+Orin, 6 s on x86 — `usb_xhci.md` §32 derives all of them) — against a 12 ms
 scheduler quantum — mid-hold preemption was a certainty, not a race. Holders: `pump_usb_into_gui`
 (the ~4 ms input-service pass, whose `service_storage` runs the whole SCSI bring-up), and the block
 layer's per-sector BOT calls. Masked acquirer: EL0 `SYS_WRITE` → `fat.rs` `without_interrupts`
 (FAT/dir RMW) → `drivers/block.rs`. The spinner holds `FAT_MUTATION` throughout, so the filesystem
-dies with the core. At 8.3 s the hold also sits just under `[spin1]`'s 10 s threshold, so a single
+dies with the core. At the Pi's 8.33 s the hold also sits just under `[spin1]`'s 10 s threshold
+(the Orin's 14.4 s would exceed it and leave a witness), so on the Pi a single
 BOT timeout left no witness.
 
-Note the distinction the fix preserves: the *masked 8.3 s WFI inside a FAT RMW on the `Usb` source*
+Note the distinction the fix preserves: the *masked stage-wait WFI (8.33 s Pi / 14.4 s Orin) inside a FAT RMW on the `Usb` source*
 is a bounded stall, not a deadlock (WFI wakes on a pending IRQ even masked; the CNTVCT deadline
 retires it). The deadlock was the *unmasked holder* path. They are different problems; only the
 second one is fixed here, and the first is unchanged and still documented on `with_fat_lock`.
@@ -28,7 +30,7 @@ second one is fixed here, and the first is unchanged and still documented on `wi
 ## The fix — both halves
 
 F1's fix (WEDGE-7) masked TABLE's critical sections, affordable because they are bounded row scans.
-An 8.3 s BOT pump can never be masked, so WEDGE-8 applies the same discipline to the **lock**, not
+A multi-second BOT pump (8.33 s Pi / 14.4 s Orin) can never be masked, so WEDGE-8 applies the same discipline to the **lock**, not
 the **work**:
 
 **Holder half — claim/loan.** `XHCI_CONTROLLER` is now a *private*
@@ -67,10 +69,19 @@ never hang.
 
 ## What a `Busy` costs in practice
 
-The loan is held for the duration of one service pass (µs–ms), one healthy BOT transaction (ms), or
-— worst case — one *failing* transfer's full deadline ladder (8.3 s per stage). The unmasked
-bounded waits (~2.8 s aarch64 / ~2 s x86) cover the first two entirely; only the pathological third
-surfaces `Busy`/`-EAGAIN` to callers, which is precisely the case that used to deadlock a core.
+The loan is held for the duration of one service pass (µs–ms), one healthy BOT transaction
+(typically ms, but *allowed* up to one first-attempt stage wait — `hw_wait_budget() × 3`: 8.33 s
+Pi 4, 14.4 s Orin, 6 s x86), or — worst case — one *failing* transfer's full deadline ladder (one
+stage wait per stage). The unmasked bounded waits are one base budget (2.78 s Pi 4 / 4.8 s Orin /
+2 s x86 — `usb_xhci.md` §32): they cover a service pass and a fast healthy transaction, **and
+nothing longer — corrected 2026-08-25.** This section previously claimed they cover a healthy
+transaction "entirely"; that was true only of transactions completing in milliseconds. Because the
+claimant's cap and the transaction's budget are the same base at multipliers 1 and 3, a healthy
+device exercising its legitimate 1–4 s stall allowance can outlast every claimant on every platform
+(the BOT-vs-block-claim inversion, recorded with its provenance in `usb_xhci.md` §32.3). So
+`Busy`/`-EAGAIN` surfaces in two cases: the pathological failing-transfer hold — precisely the case
+that used to deadlock a core — and the slower tail of *healthy* transfers; callers must treat it as
+retryable, not as a wedge verdict.
 
 ## The family and its two idioms
 

@@ -342,6 +342,151 @@ fn spread2_note(self_cpu: usize, helpers: &[usize], jobs: &[BandJob]) {
 /// render task's own next present consumes it, on its own thread, under its own ownership.
 static FULL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// STAGE-PHYS (witness) — the virtual span of the panel `Screen`'s back store, published so the
+/// compositor's one-shot physical-contiguity witness (`wm::physwit_once`) can walk it.
+///
+/// WHY A STATIC AND NOT AN ACCESSOR. Exactly the reason [`FULL_PRESENT`] is a flag: the `Screen` is
+/// OWNED by the render task and there is no global handle another core could reach it through. The
+/// witness needs the *address range* of the allocation, not the `Screen`, and that range is fixed
+/// for the life of the screen — `back_store` is allocated once at its final size in [`Screen::new`]
+/// and never grown or shrunk (see the `back` field's SAFETY note), so the heap buffer never moves.
+/// Publishing the span once at construction is therefore exact, not a snapshot.
+///
+/// Written only by [`Screen::new`], and only for a double-buffered screen (a SHELLWIN-OOM `direct`
+/// screen has an EMPTY `back_store` and publishes nothing). Zero length = "no panel back store
+/// observed yet", which is what the witness reports rather than guessing.
+///
+/// Off by default: `witness`-gated on both the definition and its single writer, so a non-witness
+/// build has neither the statics nor the two relaxed stores.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub static BACK_STORE_PTR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub static BACK_STORE_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+// ═══ ORIN-VPAR — THE aarch64 PARITY WITNESSES FOR THIS FILE'S THREE x86-ONLY ITEMS ═══════════════
+//
+// A parity survey of `video/` flagged four `all(feature = "witness", target_arch = "x86_64")` gates
+// in this file as PORT — the two [`BACK_STORE_PTR`]/[`BACK_STORE_LEN`] definitions above, their
+// single writer in [`Screen::new`], and the `wm::DeskWriteGuard` bracket in
+// [`Screen::present_background`] — plus [`Screen::paint_desktop_scene`]'s bare
+// `#[cfg(target_arch = "x86_64")]`. Three distinct items, and reading the code they depend on gives
+// three DIFFERENT answers. Each gets its own verdict token on the wire so a capture states which,
+// rather than leaving an aarch64 reader to infer it from silence.
+//
+// ── STAGEPAR — STAGE-PHYS. **DECLINED, and the blocker is an absent ARCH PRIMITIVE.** ────────────
+//
+// The consumer of the two statics above is `wm::physwit_once`, which walks the published span page
+// by page through `wm::physwit_walk`, and that walk's whole content is
+// `crate::arch::memory::translate(va)` — VA→PA through the live page tables. `pub fn translate`
+// exists in `arch/x86_64/memory.rs` and NOWHERE ELSE in the tree: `arch/aarch64/memory.rs` has no
+// counterpart, and neither does any other aarch64 module. So the walk cannot be made to compile on
+// this arch by widening a gate; something must first write an aarch64 AT S1E1R/PAR_EL1 translation
+// (or a software table walk), in `arch/aarch64/`, which is a different lane again.
+//
+// PUBLISHING THE SPAN ANYWAY WOULD BE THE DEFECT, NOT THE FIX. Ungating the two statics here would
+// give aarch64 a pair of counters with no reader — the exact shape this arc was sent to remove. So
+// they stay x86, and the aarch64 line below reports the span it WOULD have published together with
+// the name of the symbol that is missing, which is the actionable half.
+//
+// ── DESKPAR — WCD-TEARDOWN's `desk=` epoch. **PORTED, in the countable half.** ───────────────────
+//
+// `wm::DeskWriteGuard` brackets the loop that copies background spans to glass and bumps
+// `wm::PANEL_DESK_EPOCH`/`PANEL_DESK_ACTIVE`; it is `all(witness, x86_64)`, so on aarch64 the loop
+// runs completely uninstrumented — a desktop present that lands on a window's pixels leaves no trace
+// at all. The COUNTING half of that needs nothing from `wm`: the bracket is in THIS function, and an
+// epoch, a live depth and a byte total can be kept and drained here. That is what [`DeskParGuard`]
+// below is, and the `:: DESKPAR:` line drains every counter it defines.
+//
+// WHAT IS **NOT** PORTED, stated so the line is not read as full parity: `[wc-d]`'s panel-write
+// INTERLOCK consults `PANEL_DESK_ACTIVE` from the COMPOSITOR side, and a `screen.rs`-local static
+// cannot serve that — `wm` would have to read it, which is a `wm.rs` edit and another seat's lane.
+// So aarch64 gains "the desktop write loop ran N times and moved B bytes" and does not gain "the
+// compositor declined to tear down while it was running". `interlock=absent` on the line says so.
+//
+// ── SCENEPAR — `paint_desktop_scene`. **EQUIVALENT — declined for a STRUCTURAL reason.** ─────────
+//
+// This one is not drift at all, and porting it would be the wrong call. The method is
+// `back.fill_screen(DESKTOP_BG)` + `mark_full()`; on aarch64 the render service reaches the SAME
+// pair through `pal.clear_screen(wm::DESKTOP_BG)`, because `TargetPal::clear_screen` is
+// `surface.fill_screen`. `main.rs`'s own comment at that call site records why the NAMED method
+// cannot be reached from there — `pal` holds the `&mut Screen` for that task's life, so there is no
+// second mutable borrow to call it through — and concludes "which is also why `screen.rs` needs no
+// edit on this arc". An ownership fact, not a hardware one, and not "it was written on x86 first".
+//
+// THE RESIDUAL IS REAL AND IS NAMED RATHER THAN FIXED HERE: when the approved lake scene replaces
+// the flat fill inside this method, x86 picks it up and the aarch64 `clear_screen` call site does
+// not. The fix is one `TargetPal` passthrough at that call site (in `main.rs`), not a change to this
+// file, so `seam=main.rs:pal.clear_screen` is on the line for whoever takes that arc.
+
+/// ORIN-VPAR/DESKPAR — desktop write loops ENTERED since boot. The aarch64 port of
+/// `wm::PANEL_DESK_EPOCH`: it counts LOOPS, not rows written, so a fully-occluded present bumps it
+/// and copies nothing — the same reading rule the x86 term carries.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-VPAR/DESKPAR — desktop write loops LIVE right now, the aarch64 port of
+/// `wm::PANEL_DESK_ACTIVE`'s depth. Only the depth: the interlock that consumes it on x86 lives in
+/// `wm`, which this arc may not touch (see the module note above).
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_ACTIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// ORIN-VPAR/DESKPAR — the high-water mark of [`DESKPAR_ACTIVE`]. `>1` means two cores were inside
+/// the desktop write loop at once, which is the state `[wc-d]`'s interlock exists to reason about
+/// and which nothing on this arch could previously observe.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_ACTIVE_MAX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// ORIN-VPAR/DESKPAR — bytes the bracketed loop copied to glass, summed over every loop counted by
+/// [`DESKPAR_EPOCH`]. Distinguishes "N loops ran and wrote nothing" from "N loops moved the panel".
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static DESKPAR_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-VPAR — latch for the one-shot `:: STAGEPAR:` / `:: SCENEPAR:` declines. Those two state
+/// source-code facts that do not change across a boot, so they print once, from the first present,
+/// and never again.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+static VPAR_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// ORIN-VPAR/DESKPAR — how many bracketed loops between `:: DESKPAR:` lines.
+///
+/// A per-present serial line would cost more than the thing it measures on a polled UART, and a
+/// one-shot would throw away the accumulation that makes the epoch worth keeping. A power of two so
+/// the test is a mask; 256 presents is seconds of an active desktop and never fires on an idle one.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+const DESKPAR_EMIT_EVERY: u64 = 256;
+
+/// ORIN-VPAR/DESKPAR — the aarch64 counterpart of `wm::DeskWriteGuard`, kept HERE rather than in
+/// `wm` for one reason: `wm::DeskWriteGuard` is `all(witness, x86_64)` and `video/wm.rs` is another
+/// seat's lane on this arc. The bracket it needs to wrap is in this file, and the counters it feeds
+/// are drained in this file, so nothing about the countable half requires crossing that line.
+///
+/// Same shape and same reading rule as the x86 guard: `enter()` bumps the epoch and the live depth,
+/// `Drop` releases the depth, and the epoch counts loops ENTERED — never rows written.
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+struct DeskParGuard;
+
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+impl DeskParGuard {
+    fn enter() -> Self {
+        use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+        DESKPAR_EPOCH.fetch_add(1, Relaxed);
+        // `fetch_add` returns the PREVIOUS depth, so the depth this entry establishes is `+ 1`.
+        let depth = DESKPAR_ACTIVE.fetch_add(1, AcqRel).saturating_add(1);
+        DESKPAR_ACTIVE_MAX.fetch_max(depth, Relaxed);
+        DeskParGuard
+    }
+}
+
+#[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+impl Drop for DeskParGuard {
+    fn drop(&mut self) {
+        DESKPAR_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// FOCUS-VIS — ask the desktop layer to repaint the whole panel on its next present. Idempotent; the
 /// request is consumed by the first [`Screen::flush`] that follows.
 ///
@@ -392,6 +537,215 @@ const MAX_PRESENT_RECTS: usize = 8;
 /// crosses as data and the render task applies it against its own damage set.
 static PRESENT_RECTS: Mutex<([(usize, usize, usize, usize); MAX_PRESENT_RECTS], usize)> =
     Mutex::new(([(0, 0, 0, 0); MAX_PRESENT_RECTS], 0));
+
+/// BRACKETQ — brackets this arm RESCUED: a queued rect met the sprite box on a present whose
+/// `FULL_PRESENT` flag was clear and whose `damage` set was disjoint from the arrow. Every one of
+/// these is a bracket the pre-BRACKETQ `bracket_needed` would have SKIPPED, and therefore a desktop
+/// blit that would have landed on the arrow with no handback and no repair. Zero on a boot that
+/// never moved a window or closed one; nonzero is the fix working, not a fault.
+#[cfg(feature = "witness")]
+static BRACKETQ_MET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// BRACKETQ — peeks that found the queue locked and took the conservative answer. A spurious
+/// bracket costs one restore/save/draw; a missed one costs the arrow. Expected to be ~0 (see the
+/// contention analysis on [`present_rects_meet`]); a large reading would mean the peek is racing the
+/// request site far more than the lock's own hold time can explain.
+#[cfg(feature = "witness")]
+static BRACKETQ_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BRACKETQ — **does the rect queue owe this present a repaint that lands on the sprite?**
+///
+/// ### The hole this closes
+///
+/// [`Screen::flush`] decides the CURSOR-13 bracket with [`Screen::bracket_needed`] and then calls
+/// [`Screen::present_background`] on the very next line — and `present_background` is where
+/// [`PRESENT_RECTS`] is drained into `self.damage`. So the damage set `bracket_needed` scans is the
+/// set as it stood BEFORE the queue was applied, and the queue was the one input it could not see.
+///
+/// DRAG-PI M1 opened that gap by introducing this queue without teaching the bracket about it, and
+/// while the only writer was `move_to_inner` it stayed narrow: a move is a drag, the pointer is
+/// moving, and the mover's own `repaint` re-established the arrow. DRAGWIDE moved the ENTIRE
+/// deferred-erase drain onto the same queue (`wm::drain_deferred` asks per box instead of arming
+/// `request_full_present`), which is what made the gap reachable with a STATIONARY pointer: the
+/// drain's boxes are close, hide, park, zoom-restore and reclaim, none of which move the cursor.
+/// The old code took the bracket on those presents for an incidental reason — `request_full_present`
+/// armed `FULL_PRESENT`, and `bracket_needed`'s documented "`FULL_PRESENT` pending" arm fired. Take
+/// the flag away and the arm goes with it.
+///
+/// Uncovered, the failure is silent: `cursor::note_desktop_over_sprite` counts a desktop blit that
+/// lands on a live arrow but arms no repair (unlike `note_present_over_sprite`, which sets
+/// `PRESENT_DIRTY`), so the arrow simply carries a desktop-coloured bite until something else
+/// disturbs it.
+///
+/// ### Why `try_lock`, and why `true` on contention
+///
+/// `try_lock`, not `lock`, and the reason is a rule rather than a measurement: this is a PEEK on a
+/// decision path, and a peek must never be able to block the present it is deciding for. The lock
+/// order question is answered the same way — `try_lock` cannot participate in a cycle, so there is
+/// no order to reason about. (For the record there is no cycle to avoid either: `PRESENT_RECTS` is
+/// taken by exactly two writers, [`request_present_rect`] and `present_background`'s drain block,
+/// neither of which calls `flush`, and `present_background` runs strictly AFTER this. A `spin::Mutex`
+/// is not reentrant, so had this been `lock()` an ISR-borne `request_present_rect` interrupting a
+/// holder would have been a hard hang; `try_lock` makes that unreachable by construction.)
+///
+/// `true` on contention is the conservative answer in the only direction that matters: a spurious
+/// bracket costs one restore/save/draw of a 12x20 sprite, a missed one costs the arrow. It also
+/// cannot livelock — there is no retry, no loop and no wait; the peek answers immediately and the
+/// caller proceeds to bounded work (`cursor::undraw` … `cursor::repaint`, both of which take their
+/// own locks and neither of which re-enters this function).
+///
+/// ### Why this does not undo FLICKER-3
+///
+/// FLICKER-3 exists to stop the STATUS STRIP's once-a-second band from bracketing an arrow it can
+/// never touch (P80, "the core idle bars cause mouse to flicker"). The strip's damage arrives
+/// through `Screen::mark`, i.e. through `self.damage`, which `bracket_needed` already scanned and
+/// which this function does not touch. Nothing reaches [`PRESENT_RECTS`] except a window MOVE
+/// (`move_to_inner`) or a deferred ERASE (`drain_deferred`) — both of which genuinely paint desktop
+/// over the region they queue. So the new arm fires only where a bracket was always owed, and P80's
+/// population is untouched.
+///
+/// The rect is clipped exactly as [`Screen::mark`] will clip it when `present_background` applies it
+/// — `min` against the panel's width/height, empty rects dropped — so the peek answers about the
+/// rect the present will actually publish rather than about the request as written.
+fn present_rects_meet(sx: usize, sy: usize, sw: usize, sh: usize, pw: usize, ph: usize) -> bool {
+    let Some(q) = PRESENT_RECTS.try_lock() else {
+        #[cfg(feature = "witness")]
+        BRACKETQ_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return true;
+    };
+    let n = q.1;
+    let met = (0..n).any(|i| {
+        let (x, y, w, h) = q.0[i];
+        // `Screen::mark`'s clamp, verbatim: `x1`/`y1` against the panel, and an empty rect is
+        // dropped rather than marked. Overlap is then the same half-open test the damage scan
+        // above makes against the same sprite box.
+        let x1 = x.saturating_add(w).min(pw);
+        let y1 = y.saturating_add(h).min(ph);
+        x < x1 && y < y1 && x < sx + sw && sx < x1 && y < sy + sh && sy < y1
+    });
+    drop(q);
+    #[cfg(feature = "witness")]
+    if met {
+        BRACKETQ_MET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    met
+}
+
+// ---- DRAGWIDE: the desktop present's amplification census --------------------------------------
+//
+// DRAG-PI M1 narrowed `move_to_inner` from a whole-panel present to the old box and the new one, and
+// `[dragperf] mode=rects px_per_move=` measures that narrowing at the REQUEST site. What no
+// instrument measured was whether the present the desktop then took honoured it — and it did not:
+// the drain at the head of the very `composite()` a move ends with re-armed `FULL_PRESENT`, so the
+// panel was republished anyway and `[dragperf]` reported the speedup regardless. An instrument that
+// cannot see the defect it sits next to is the shape of witness the laws forbid, so the presented
+// side is now counted beside the requested one.
+//
+// Monotone totals, drained by `desk_present_take` exactly as `move_present_take` drains the request
+// side, so the two halves of the ratio are taken over the same window of presents.
+#[cfg(feature = "witness")]
+static DESK_REQ_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DESK_PRES_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DESK_FULL_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAGWIDE — charge one desktop present: what its queue asked for, what its damage set published,
+/// and whether the whole-panel flag replaced the former with the latter.
+#[cfg(feature = "witness")]
+fn desk_present_note(req_px: u64, pres_px: u64, full: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    DESK_REQ_PX.fetch_add(req_px, Relaxed);
+    DESK_PRES_PX.fetch_add(pres_px, Relaxed);
+    DESK_N.fetch_add(1, Relaxed);
+    if full {
+        DESK_FULL_N.fetch_add(1, Relaxed);
+    }
+}
+
+/// DRAGWIDE — the desktop present census as a SNAPSHOT: `(requested_px, presented_px, full_presents,
+/// presents)`. Non-destructive, on `wcg::stage_rollup`'s rule — every quantity here is a monotone
+/// total incremented once per present at record time, so re-reading one cannot double-count and two
+/// readers cannot rob each other. A caller wanting a delta (the `[dragperf]` sweep) takes a snapshot
+/// either side and subtracts.
+#[cfg(feature = "witness")]
+pub(super) fn desk_present_snapshot() -> (u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        DESK_REQ_PX.load(Relaxed),
+        DESK_PRES_PX.load(Relaxed),
+        DESK_FULL_N.load(Relaxed),
+        DESK_N.load(Relaxed),
+    )
+}
+
+/// DRAGWIDE — `presented / requested` in hundredths, so the wire carries two decimals without a
+/// float. No request (`req == 0`) answers 0 rather than dividing: a present nobody asked for has no
+/// amplification, and 0 cannot be confused with `100`.
+#[cfg(feature = "witness")]
+#[inline]
+fn desk_amp_x100(req: u64, pres: u64) -> u64 {
+    if req == 0 {
+        0
+    } else {
+        pres.saturating_mul(100) / req
+    }
+}
+
+/// DRAGWIDE — the x86 READER. Without it these counters would be a census nobody prints, which is
+/// the `COMP_REVENANTS` failure exactly: `[dragperf]` is the only other reader and it is driven from
+/// `arch/aarch64`, so on this track the numbers would have existed and never reached a wire.
+///
+/// Rate-gated to one line a second and emitted from [`Screen::flush`]'s tail, after the blit, so a
+/// desktop presenting at frame rate costs one compare per present and never a serial write inside
+/// the copy it would otherwise be timing.
+///
+/// **How to read it.** `amp=1.00x` means the desktop published about what its queue asked for.
+/// `full_presents=` is the discriminator beside it: a whole-panel escalation throws the queue away,
+/// so a non-zero count on a drag is the DRAGWIDE defect back. The ratio alone is not enough — the
+/// damage set also carries console text and strip damage this queue never asked for, so a ratio a
+/// little over 1 is ordinary traffic and a ratio of several is the panel being republished.
+#[cfg(feature = "witness")]
+fn desk_amp_flush() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let last = DESK_LASTROLL.load(Relaxed);
+    let now = crate::arch::now_cycles();
+    if super::wcg::cycles_to_us(now.saturating_sub(last)) < 1_000_000 {
+        return;
+    }
+    if DESK_LASTROLL
+        .compare_exchange(last, now, core::sync::atomic::Ordering::AcqRel, Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let (req, pres, full, n) = desk_present_snapshot();
+    if n == 0 {
+        return;
+    }
+    let a = desk_amp_x100(req, pres);
+    // BRACKETQ — the rescued-bracket pair rides THIS line rather than `[flick2]`'s, for two
+    // reasons. It belongs to DRAGWIDE's arc (the queue this census already reports on is the queue
+    // the peek reads), and `[flick2]` lives in `cursor`, which is read-only to this change.
+    // Monotone totals, not drained: the question they answer is "did this arm ever fire on this
+    // boot", and a per-interval reading would make a rare event look like an absent one.
+    serial_println!(
+        "[wc-w] rollup presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} bracketq_met={} bracketq_busy={} -> {}",
+        n,
+        req,
+        pres,
+        a / 100,
+        a % 100,
+        full,
+        BRACKETQ_MET.load(Relaxed),
+        BRACKETQ_BUSY.load(Relaxed),
+        if full > 0 { "WIDENED" } else { "HONOURED" }
+    );
+}
+
+#[cfg(feature = "witness")]
+static DESK_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DESK_LASTROLL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// DRAG-PI M1 — **ask the desktop layer to repaint exactly this box on its next present.**
 ///
@@ -483,9 +837,9 @@ pub fn request_present_rect(x: usize, y: usize, w: usize, h: usize) {
 /// report it and the `+ 1` cannot come from `STRIP_MAX`. It is stated here, at the one array that
 /// has to hold it, rather than by promoting the menu to a tenant — which would spend a permanent
 /// occlusion slot on a surface that is absent for all but a few seconds of a boot.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = super::strip::STRIP_MAX + 1;
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
 const DESK_STRIP_MAX: usize = 0;
 
 /// SHELLDESK — the desktop present's occluder capacity: every window box ([`super::wm::occluders`]
@@ -502,7 +856,7 @@ const SEED_NONE: u32 = 0xFFFF_FFFF;
 
 /// WC-BBSYNC — the colour a newly-built [`Screen`]'s BACK buffer is born holding, once the window
 /// compositor has taken the panel. [`SEED_NONE`] means unarmed, which is every aarch64 build, every
-/// default x86 build, and every `wc` boot up to the instant `video::wcx::activate` clears the glass.
+/// default x86 build, and every `wc` boot up to the instant `video::desktop_uefi::activate` clears the glass.
 ///
 /// ### Why a latch, and why it is consumed HERE rather than set here
 ///
@@ -530,7 +884,7 @@ static DESKTOP_BG_SEED: core::sync::atomic::AtomicU32 =
 /// [`Screen`] built from here on starts its back buffer in agreement with it. Idempotent; the caller
 /// owns the colour (this module invents none).
 ///
-/// Armed only by `video::wcx`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
+/// Armed only by `video::desktop_uefi`, which is `cfg(all(target_arch = "x86_64", feature = "wc"))`. On
 /// aarch64 and on every non-`wc` x86 build there is no caller, the latch stays [`SEED_NONE`], and
 /// [`Screen::new`] pays exactly one relaxed-cost atomic load.
 pub fn adopt_desktop_bg(color: u32) {
@@ -638,6 +992,18 @@ impl Screen {
             );
         }
         let mut back_store = vec![0u8; len];
+        // STAGE-PHYS — publish the back store's span for the compositor's one-shot contiguity
+        // witness. Taken here rather than after the move because the `Vec` HEADER moves into `Self`
+        // while its heap buffer does not, so this address is the one that stays valid. Two relaxed
+        // stores on a path that runs once per screen; absent entirely without `witness`.
+        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        if len > 0 {
+            BACK_STORE_PTR.store(
+                back_store.as_ptr() as usize,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            BACK_STORE_LEN.store(len, core::sync::atomic::Ordering::Relaxed);
+        }
         let mut back = FrameBuffer::new();
         back.init(back_store.as_mut_ptr() as usize, len, info);
         // WC-BBSYNC — adopt the desktop colour the compositor put on the glass, if one was recorded
@@ -714,6 +1080,15 @@ impl Screen {
         }
     }
 
+    /// VUGRAS: the back buffer's `[lo, hi)` byte span in cached heap RAM — the surface a vug/console
+    /// frame dirties every present. Named in the RAS localizer's decode table so a fault ADDR landing
+    /// inside it is attributable to the double-buffer store, not a generic heap allocation.
+    #[inline]
+    pub fn back_span(&self) -> (usize, usize) {
+        let lo = self.back_store.as_ptr() as usize;
+        (lo, lo + self.back_store.len())
+    }
+
     #[inline]
     pub fn width(&self) -> usize {
         self.info.width
@@ -776,7 +1151,7 @@ impl Screen {
     /// backdrop.
     ///
     /// The scene today is the flat [`super::wm::DESKTOP_BG`] fill — the same colour the compositor put
-    /// on the glass at `wcx::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
+    /// on the glass at `desktop_uefi::activate` and the same one [`adopt_desktop_bg`] seeds a fresh `Screen`
     /// with, so this agrees with both by construction. It is the SEAM the approved lake scene
     /// (white-board A1) renders through later: a scene richer than a fill replaces the body of this
     /// method and every caller keeps working, because the contract is "own the backdrop", not "fill
@@ -1030,6 +1405,10 @@ impl Screen {
         } else {
             super::wm::service_damage();
         }
+        // DRAGWIDE — the desktop amplification rollup, at the tail of the flush and after the blit,
+        // so the once-a-second serial write is never charged to the copy it reports on.
+        #[cfg(feature = "witness")]
+        desk_amp_flush();
     }
 
     /// FLICKER-3 — does this present owe the sprite the CURSOR-13 bracket?
@@ -1048,6 +1427,15 @@ impl Screen {
     /// * **`FULL_PRESENT` pending** — the present's paint set is the whole panel; every sprite
     ///   pixel is in it. Read with `load`, not `swap`: consuming the flag is `present_background`'s
     ///   job and it must still see it.
+    /// * **BRACKETQ — a queued PRESENT RECT meets the sprite.** The paint set of this present is
+    ///   `self.damage` PLUS whatever [`present_background`] is about to drain out of
+    ///   [`PRESENT_RECTS`] one line below, and until now this function scanned only the first half.
+    ///   That was sound while `request_full_present` was what a deferred erase armed — the flag's
+    ///   arm above covered it — and stopped being sound when DRAGWIDE moved the drain onto the rect
+    ///   queue. `present_rects_meet` peeks the queue (never consumes it: draining is
+    ///   `present_background`'s job, exactly as the flag's `load`-not-`swap` above) and is the
+    ///   authority on why. Read LAST of the three, so the two lock-free tests short-circuit it
+    ///   whenever the bracket is already owed.
     ///
     /// Only the live-sprite decision is counted (`[flick2] flush_undraw=`/`flush_skip=`): the
     /// legacy classes cannot blink an arrow the operator can see, and counting them would bury the
@@ -1070,7 +1458,12 @@ impl Screen {
                     && sx < x1
                     && d.y0 < sy + sh
                     && sy < y1
-            });
+            })
+            // BRACKETQ — the OTHER half of this present's paint set. Last in the chain so it is
+            // reached only when the flag is clear and the damage set is disjoint, which makes
+            // `BRACKETQ_MET` exactly "brackets this arm rescued" rather than "presents that had a
+            // rect queued".
+            || present_rects_meet(sx, sy, sw, sh, self.info.width, self.info.height);
         super::cursor::note_flush_bracket(taken);
         taken
     }
@@ -1102,12 +1495,19 @@ impl Screen {
             q.1 = 0;
             (q.0, n)
         };
-        // DRAGWIDE — whether THIS present was widened to the whole panel, recorded at the one point
-        // where the escalation becomes irreversible. Bound before the publish-count below so a
-        // present that early-returns (nothing to do / front not ready) charges nothing.
+        // DRAGWIDE — what this present was ASKED for, read from the queue it just drained and BEFORE
+        // the full flag can replace it. Post-merge, so two overlapping drag boxes count as the one
+        // rect the queue actually holds rather than twice over.
         #[cfg(feature = "witness")]
-        let dw_full = FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire);
-        if FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        let req_px: u64 = owed.0[..owed.1]
+            .iter()
+            .map(|&(_, _, w, h)| (w as u64).saturating_mul(h as u64))
+            .sum();
+        #[cfg(feature = "witness")]
+        let full = FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(feature = "witness"))]
+        let full = FULL_PRESENT.swap(false, core::sync::atomic::Ordering::AcqRel);
+        if full {
             self.mark_full();
         } else {
             for &(x, y, w, h) in owed.0.iter().take(owed.1) {
@@ -1115,6 +1515,23 @@ impl Screen {
             }
         }
         let n = self.damage.len;
+        // DRAGWIDE — and what it is about to PUBLISH, taken from the damage set at the same instant
+        // and from a different source than `req_px`. The pair is the amplification: a present that
+        // honoured its request reads `1.00x`, and one that threw the queue away for `mark_full`
+        // reads the panel over the box. `full_presents=` is the discriminator beside the ratio —
+        // the damage set can also carry console text and strip damage this queue never asked for, so
+        // a ratio slightly over 1 is ordinary and a full-panel escalation is not.
+        #[cfg(feature = "witness")]
+        {
+            let pres_px: u64 = self.damage.rects[..n]
+                .iter()
+                .map(|d| {
+                    (d.x1.saturating_sub(d.x0) as u64)
+                        .saturating_mul(d.y1.saturating_sub(d.y0) as u64)
+                })
+                .sum();
+            desk_present_note(req_px, pres_px, full);
+        }
         self.damage.clear();
         self.last_flush_bytes = 0;
         self.last_flush_bands = 1;
@@ -1165,11 +1582,11 @@ impl Screen {
         //
         // SHELLDESK REVIEW — the interval is bounded because the ENABLER COMPOSITES, and that had to
         // be made true rather than assumed. The original note here claimed the enable at
-        // `wcx::activate` was "immediately followed by the console window's own `create`, which
+        // `desktop_uefi::activate` was "immediately followed by the console window's own `create`, which
         // composites"; the order is the reverse — `panel_console_window_open` runs ABOVE the enable —
         // and the row it mints is fbcon's frozen boot-log snapshot, which never damages again. With
         // `wm::service_damage` declining to composite while no row is dirty, nothing was guaranteed to
-        // paint the withheld rows on a boot with no desktop app and no mouse. `wcx::activate` now
+        // paint the withheld rows on a boot with no desktop app and no mouse. `desktop_uefi::activate` now
         // composites at the enable seam, which is the bound this paragraph asserts.
         //
         // x86 + `wc` only — `video::strip` is not compiled on aarch64, where this is the WC-I array
@@ -1186,7 +1603,7 @@ impl Screen {
         // unchanged and `Console::page_rows` identical at 0x78 — i.e. the whole delta was here.
         // Written as two cfg arms, so the platform with no furniture fills `occ` in place exactly as
         // it always did and the promise is kept by construction rather than by assertion.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `occluders` writes exactly `MAX_WINDOWS` slots; the furniture tail is appended after.
             let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
@@ -1218,7 +1635,7 @@ impl Screen {
             }
             (n, nw)
         };
-        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
             // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
             // WC-I call on the WC-I array, unchanged.
@@ -1405,6 +1822,14 @@ impl Screen {
         // `[wc-d]` prints this term rather than aborting on it.
         #[cfg(all(feature = "witness", target_arch = "x86_64"))]
         let _desk = super::wm::DeskWriteGuard::enter();
+        // ORIN-VPAR/DESKPAR — the SAME bracket, around the SAME loop, on aarch64. `wm::DeskWriteGuard`
+        // is `all(witness, x86_64)`, so without this the loop below is entirely uninstrumented on this
+        // arch: `desk=` has no aarch64 field, and a desktop present that walks over a window's pixels
+        // leaves nothing behind for a capture to convict it with. See the ORIN-VPAR block above the
+        // statics for what this does and does NOT recover (the epoch/depth/bytes, not `[wc-d]`'s
+        // compositor-side interlock, which would need a `wm` reader this arc may not add).
+        #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+        let _deskpar = DeskParGuard::enter();
         for idx in 0..n {
             let d = self.damage.rects[idx];
             let x1 = d.x1.min(self.info.width);
@@ -1472,6 +1897,61 @@ impl Screen {
             self.front.flush_range(span_start, span_end - span_start);
         }
         self.last_flush_bytes = flushed;
+        // ORIN-VPAR — the three aarch64 parity verdicts, drained here because this is the one site in
+        // this file that is guaranteed reachable on every arch that presents at all (`Screen::new` is
+        // NOT: the Pi/Orin desktop path builds `direct` screens deliberately, so a witness hung off
+        // the constructor would be silent on exactly the boots it is for).
+        //
+        // BOTH OUTCOMES ARE ON THE WIRE. `DESKPAR` reports a counter set that FIRED; `STAGEPAR` and
+        // `SCENEPAR` report DECLINED with the blocking symbol named. A decline that printed nothing
+        // would be indistinguishable from a leg that never ran, which is the defect this whole knob
+        // exists to remove.
+        #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            DESKPAR_BYTES.fetch_add(flushed, Relaxed);
+            // The two source-code facts, once per boot, from the first present that gets here.
+            if !VPAR_ONCE.swap(true, Relaxed) {
+                // STAGE-PHYS. The span this screen WOULD publish is stated so the line is not merely
+                // an apology: it is the byte range `wm::physwit_walk` would have been handed. Read
+                // from `back_store` itself, not computed from `info` — a SHELLWIN-OOM `direct` screen
+                // has an EMPTY back store, and stating `stride*h*bpp` for one would be this witness
+                // inventing an allocation that is not there. `direct=` carries which kind it is.
+                serial_println!(
+                    ":: STAGEPAR: arch=aarch64 item=STAGE-PHYS direct={} back_bytes={} published=no \
+                     blocked_on=arch::memory::translate present_in=arch/x86_64/memory.rs \
+                     absent_in=arch/aarch64 consumer=wm::physwit_walk consumer_gate=witness+x86_64 \
+                     would_publish=BACK_STORE_PTR,BACK_STORE_LEN :: DECLINED ::",
+                    self.direct,
+                    self.back_store.len()
+                );
+                // paint_desktop_scene. NOT drift: the arm reaches the identical
+                // `fill_screen(DESKTOP_BG)` + `mark_full()` pair through `TargetPal::clear_screen`.
+                serial_println!(
+                    ":: SCENEPAR: arch=aarch64 item=paint_desktop_scene method=absent \
+                     behaviour=present via=TargetPal::clear_screen(wm::DESKTOP_BG) \
+                     reason=render_task_holds_&mut_Screen_for_its_life \
+                     residual=richer_scene_lands_in_method_only seam=main.rs:pal.clear_screen \
+                     :: EQUIVALENT ::"
+                );
+            }
+            // WCD-TEARDOWN's epoch, rate-limited. Every counter this arc defined is drained on this
+            // one line — there is no aarch64 parity static without a reader.
+            // `epoch == 1` as well as the modulus: waiting 256 presents for the FIRST line would put
+            // a short capture back in the silent state this knob exists to end.
+            let epoch = DESKPAR_EPOCH.load(Relaxed);
+            if epoch == 1 || epoch % DESKPAR_EMIT_EVERY == 0 {
+                serial_println!(
+                    ":: DESKPAR: arch=aarch64 item=WCD-TEARDOWN desk={} active={} active_max={} \
+                     bytes={} interlock=absent blocked_on=wm::PANEL_DESK_ACTIVE \
+                     blocker_gate=witness+x86_64 :: PORTED ::",
+                    epoch,
+                    DESKPAR_ACTIVE.load(Relaxed),
+                    DESKPAR_ACTIVE_MAX.load(Relaxed),
+                    DESKPAR_BYTES.load(Relaxed)
+                );
+            }
+        }
         #[cfg(feature = "witness")]
         if over_sprite {
             super::cursor::note_desktop_over_sprite();

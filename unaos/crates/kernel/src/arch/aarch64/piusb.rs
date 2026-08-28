@@ -2432,7 +2432,7 @@ impl PortscWitness {
 /// driver's polled-attach machinery verbatim (the JB2b pattern, `xusb_tegra::jb2b_attach`) with ZERO
 /// xhci-core edits: `xhci::init` (halt+HCRST+CNR — this is OUR freshly-reset controller, so the plain
 /// reset path, NOT the inherited-controller no-HCRST/CRCR takeover), then rings/DCBAA/interrupter via
-/// `XhciController::new` + `COMMAND_RING`/`EVENT_RING`/`ERST_TABLE` + `init_interrupter`/`init_pointers`,
+/// `XhciController::new` + `COMMAND_RING`/`EVENT_RING` (+ heap ERST) + `init_interrupter`/`init_pointers`,
 /// `start()` (RS=1), then a bounded polled-enumeration pump. Stops at keyboard-ARMED (or the bounded
 /// window), dumping per-device identity lines. Heap-free paths only outside the rings.
 ///
@@ -2500,14 +2500,14 @@ pub fn enumerate() {
                 cmd_ring_guard.as_mut().unwrap().get_ptr(),
             )
         };
-        let erst_table_phys = &raw mut xhci::ERST_TABLE as u64;
-        // XHCI-COHERENCE: the shared `drivers/xhci` driver is now SELF-COHERENT — it cleans the ERST
+        // ERST is heap-allocated inside init_interrupter (JETSON-XCARVE: no xHC DMA structure in .bss).
+        // XHCI-COHERENCE: the shared `drivers/xhci` driver is SELF-COHERENT — it cleans the ERST
         // (init_interrupter), the zeroed event ring (init_interrupter clean+invalidate), and every
         // ring's zeroed handoff (TransferRing::new) via its internal `dma_coherency` seam. PIUSB-8's
         // external pre-RS flush of these same structures is therefore redundant and has been removed;
         // maintaining it here would double-apply the same `dc c*vac` for no effect.
         serial_println!("{}   programming interrupter + rings (runtime regs), then RS=1 ::", P);
-        x.init_interrupter(event_ring_phys, erst_table_phys);
+        x.init_interrupter(event_ring_phys);
         x.init_pointers(command_ring_phys);
         x.start();
         xhci::install(x);

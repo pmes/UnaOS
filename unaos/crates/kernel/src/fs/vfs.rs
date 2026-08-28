@@ -508,7 +508,6 @@ impl FatBackend {
     /// free to drift, on a target where the `Default` arm is the difference between a write that
     /// lands and a write that fails closed several sectors in. `BlockSource::write_veto` is the
     /// single definition; the VFS reports its presence as a boolean and the shell prints its text.
-    #[cfg(target_arch = "aarch64")]
     fn read_only(&self) -> bool {
         self.source.write_veto().is_some()
     }
@@ -516,7 +515,6 @@ impl FatBackend {
     /// Resolve a volume-relative path to its FAT directory entry by walking the
     /// directory tree from the root through the public `FatFs` surface. Returns
     /// the entry, or `None` for the volume root (which has no entry of its own).
-    #[cfg(target_arch = "aarch64")]
     fn resolve_entry(
         fs: &crate::fs::fat::FatFs,
         rel: &str,
@@ -553,7 +551,6 @@ impl FatBackend {
     /// parent that is a file is [`VfsError::NotADirectory`]; an absent parent is
     /// [`VfsError::NoSuchPath`]. The leaf itself need NOT exist (it is what the
     /// caller creates/locates).
-    #[cfg(target_arch = "aarch64")]
     fn resolve_parent(
         fs: &crate::fs::fat::FatFs,
         rel: &str,
@@ -582,7 +579,6 @@ impl FatBackend {
 }
 
 /// Map a FAT error into the VFS error space.
-#[cfg(target_arch = "aarch64")]
 fn fat_err(e: crate::fs::fat::FatError) -> VfsError {
     use crate::fs::fat::FatError;
     match e {
@@ -596,7 +592,6 @@ fn fat_err(e: crate::fs::fat::FatError) -> VfsError {
 /// not a representable 8.3 short name — VFAT LFN write is out of scope this arc
 /// (documented bound), so it surfaces as [`VfsError::Unsupported`] rather than
 /// an opaque backend string. Everything else maps as [`fat_err`].
-#[cfg(target_arch = "aarch64")]
 fn fat_create_err(e: crate::fs::fat::FatError) -> VfsError {
     match e {
         crate::fs::fat::FatError::Unsupported => VfsError::Unsupported,
@@ -604,7 +599,33 @@ fn fat_create_err(e: crate::fs::fat::FatError) -> VfsError {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+/// VFSX86 (2026-08-21): this impl was `#[cfg(target_arch = "aarch64")]` from VFS-1/VFS-2. The gate
+/// recorded WHERE THE WORK WAS DONE (the Pi came first), not a hardware constraint — there is no
+/// arch-specific line in the body. Every primitive it calls is compiled unconditionally on x86_64
+/// today and always was: `fat::mount_source` (fat.rs — arch-neutral, and its `match` even carries an
+/// x86-only `Sdhc` arm), `read_root`/`read_dir`/`read_at`, and the whole write half —
+/// `locate_in_dir`, `create_in_dir`, `create_dir`, `write_grow`, `delete_located`. The one genuinely
+/// gated dependency was `fat::fat_reason`, itself gated only by its first caller; it is now
+/// arch-neutral too (see its note). aarch64 behaviour is unchanged by construction: no arm of this
+/// impl, and no callee, was edited — the gate was deleted, nothing else.
+///
+/// ⚠ WHAT THIS DOES **NOT** DO. Widening the seam does not enroll anyone in the x86 write
+/// discipline. x86 has no in-`fat.rs` FAT/directory mutation lock — `fat::with_fat_lock` and
+/// `with_dir_lock` are `#[inline(always)]` passthroughs there, and consistency is held CALLER-SIDE
+/// by the "X86 FAT-MUTATOR ROSTER" documented on `fat::with_fat_lock`. This impl is a seam, not a
+/// caller: on x86 it has ZERO callers as landed, so it mutates nothing and joins no row. The roster
+/// rule binds whoever calls it — an x86 consumer migrating onto these verbs must either submit
+/// through the storage-service task or run in program order on the BSP main loop ahead of the
+/// launchers, and must add itself to that roster. Migrating the three existing direct callers
+/// (`shell.rs`, `fs/flight_recorder.rs`, the Holocron bond store) is deliberately NOT part of this
+/// change.
+///
+/// The write verbs' ACL is unchanged and is what the direct callers today do NOT have: each verb
+/// calls `authorize_write` FIRST, which refuses a read-only volume (`Unsupported`, via
+/// `FatBackend::read_only` -> `BlockSource::write_veto`) and then enforces the volume-principal ACL
+/// (`principal == self.principal || principal == KERNEL_PRINCIPAL`; the `world_readable` posture is
+/// deliberately not consulted for writes). The direct callers reproduce the first check and not the
+/// second.
 impl VfsBackend for FatBackend {
     fn volume_name(&self) -> &str {
         &self.volume

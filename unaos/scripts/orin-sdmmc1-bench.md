@@ -152,15 +152,19 @@ only on a card you are willing to erase. Do **not** run it on a card whose conte
 :: SDMMC:   gates: [1] sdmmc census OK · [2] sdmmc_arm write path armed · [3] install_target destructive-confirm — all satisfied ::
 :: SDMMC:   ABOUT TO DESTROY: microSD sector-0 = <class> · capacity <N> blocks (<M> MiB) — the entire card is about to be repartitioned ::
 :: SDMMC:   M2: CID manufacturer(MID)=… product(PNM)='…' serial(PSN)=… date=…/… ::
+:: SDMMC:   INSTALL: UNAFS SIZING-GATE-1 (pre-GPT whole-card upper bound) => OK — cap 131072 blk (512 MiB), planned 131072 blk, refmap 1048576 B = 2.0% of the 50331648 B heap (limit 25% = 12582900 B) ::
 :: SDMMC:   INSTALL: GPT written + parse-back verified — ESP LBA 2048..… , data LBA …..… of <N> sectors ::
 :: SDMMC:   INSTALL: zeroed <K> ESP metadata sectors (reserved + both FATs) to re-establish the blank-precondition ::
 :: SDMMC:   INSTALL: ESP formatted FAT32 — fat_sz=…sec clusters=… data@vol+… ::
+:: SDMMC:   INSTALL: UNAFS SIZING-GATE-2 (p2 UNAOS-DATA span) => OK — cap 131072 blk (512 MiB), planned 131072 blk, refmap 1048576 B = 2.0% of the 50331648 B heap (limit 25% = 12582900 B) ::
+:: SDMMC:   INSTALL: UNAFS formatting p2 UNAOS-DATA — LBA 133120..62333918 = 62200799 sectors = 7775099 blk; volume CAPPED to 131072 blk (512 MiB), refmap 1048576 B ::
+:: SDMMC:   INSTALL: UNAFS p2 volume MOUNTED BACK off the card — v5 magic ok, 131072 blk (512 MiB) at LBA 133120, refmap 1048576 B (2.0% of the 50331648 B heap) rebuilt from 128 leaf blk + 1 index blk (single-level), root gen 1, 130933 free blk, root dir lists 0 entries => UNAFS-VERIFIED ::
 :: SDMMC:   INSTALL: mounted USB boot stick — <fs describe> ::
 :: SDMMC:   INSTALL: cloned <F> files (<C> data clusters) from the boot tree ::
 :: SDMMC:   INSTALL: kernel.elf (<B> B, <E> extents) sha256=<64-hex> => VERIFIED ::
 :: SDMMC:   INSTALL: EFI/BOOT/BOOTAA64.EFI (<B> B, <E> extents) sha256=<64-hex> => VERIFIED ::
 :: SDMMC:   INSTALL: all <F> cloned files re-read off the card + sha-verified => PASS ::
-:: SDMMC: ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(<F> files) verify => PASS ::
+:: SDMMC: ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone(<F> files)+unafs verify => PASS — p1 UNAOS-ESP = FAT32 (<F> files sha-verified) · p2 UNAOS-DATA = UnaFS v5 (131072 blk / 512 MiB, mounted back off the card) ::
 ```
 
 The final `=> PASS` line is the only success; any engine/read error is a single `ORIN-INSTALL-2 SD install =>
@@ -174,6 +178,31 @@ self to clone)`.
 **Note (payload):** INSTALL-2 clones the RUNNING system's real boot payload read off the USB stick's ESP
 (`fs::fat::mount()` over the JB2b-enumerated block device), each file sha-extent-verified on the card. This
 replaces INSTALL-1's generated `UNAOS.IMG` marker. Verify-by-content is the per-file SD extent sha-verify.
+
+**Note (p2 native volume — TEGRA-UNAFS-FMT):** the flow no longer leaves `UNAOS-DATA` raw. Partition 2 is
+**formatted as a native UnaFS volume and then MOUNTED back off the card** before the verdict, so the numbers
+above are all measured, not derived from what was held in RAM. Three things to read at the bench:
+
+- The two **`SIZING-GATE-n`** lines are the heap bound, and each carries its own token so they are never
+  confused: gate 1 runs on the whole-card capacity **before the first byte of the GPT is written** (a refusal
+  there leaves the card exactly as it was found), gate 2 runs on the real p2 span. A refusal reads
+  `UNAFS SIZING-GATE-n (…) => REFUSED — … NOTHING was written to the card ::`. Note what these gates do NOT
+  prove: they compare against the heap's **total** `HEAP_SIZE`, never its free bytes, so a format can still
+  fail on heap pressure later — that failure is fail-closed and named where it lands.
+- The volume is **capped at 512 MiB (131,072 blocks)** inside the much larger partition, so `CAPPED to` is the
+  expected word on the bench card. On a card whose data partition is smaller than the cap the same line reads
+  `volume UNCAPPED at the full <N> blk` instead — both are normal. The cap keeps the volume single-level
+  (128 refmap leaves) and keeps the every-boot rung-4 probe-mount at ~1,000 polled CMD17 reads rather than
+  ~8,200.
+- **`=> UNAFS-VERIFIED ::`** is a distinct terminator from the per-file `=> VERIFIED ::` above it — grep for
+  `UNAFS-VERIFIED` to address the volume proof alone. `root gen 1` is the format commit; `root dir lists 0
+  entries` is correct for a freshly formatted volume (nothing has written to it yet).
+
+**Honest p2 SKIP shape** (not a failure — the install continues and still ends `=> PASS`):
+`INSTALL: UNAFS p2 SKIPPED — the GPT layout's UNAOS-DATA span is <S> sectors = <B> blk, under the 12 blk floor
+a UnaFS format needs; p2 left raw, the install continues ::`. That line is reachable on a card of ~65 MiB,
+where the GPT's 1 MiB alignment can leave the data partition a single sector; the verdict then ends
+`· p2 UNAOS-DATA = NO NATIVE VOLUME (span absent or below the format floor) ::`.
 
 **Virt witness** (no metal — `UNAOS_INSTALL_TARGET_SD=1 UNAOS_GICV3=1 ./arroyo test-arm`), after the two SDMMC
 witness lines:

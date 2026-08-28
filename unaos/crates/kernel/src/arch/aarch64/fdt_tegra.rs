@@ -31,7 +31,7 @@ const MAX_TOKENS: usize = 400_000;
 /// Depth cap for the node-name stack (real trees are < 10 deep).
 const MAX_DEPTH: usize = 16;
 /// Longest node-name path we keep (bytes, '/'-joined).
-const MAX_PATH: usize = 160;
+pub const MAX_PATH: usize = 160;
 /// Most raw u32 words we capture from one property (the XUSB `clocks` list is 9 [phandle, id]
 /// pairs = 18 words — keep headroom above that).
 const MAX_WORDS: usize = 20;
@@ -255,20 +255,28 @@ pub struct BpmpGeom {
     pub db_master: u32,
 }
 
-/// Resolve the JB1b geometry silently (the JB1a dump is the human-readable twin). `None` = any
-/// piece missing or shaped unexpectedly — the caller prints and stops rather than guessing.
+/// Resolve the JB1b geometry (the JB1a dump is the human-readable twin). `None` = any piece missing
+/// or shaped unexpectedly — the caller prints its generic SKIP, so EVERY rung here names itself on
+/// serial first (the SDID lesson: a ladder that gives up through a bare `?` leaves a capture unable
+/// to say which rung died). The success path stays silent — `jb1b_ping` prints the geometry it got.
 pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<BpmpGeom> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return geom_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return geom_stop("DTB GiB unmapped (lo..hi vs RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return geom_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
 
     let mut bpmp_path = [0u8; MAX_PATH];
     let mut bpmp_len = 0usize;
@@ -280,46 +288,73 @@ pub fn bpmp_geometry(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Optio
         }
     });
     if bpmp_len == 0 {
-        return None;
+        return geom_stop("no top-level /bpmp* node in the tree", 0, 0);
     }
     let bp = &bpmp_path[..bpmp_len];
     let mboxes = fdt.prop_at(bp, b"mboxes");
     let shmem = fdt.prop_at(bp, b"shmem");
     if mboxes.n < 3 || shmem.n < 2 {
-        return None;
+        return geom_stop(
+            "/bpmp mboxes/shmem too short (need >=3 / >=2 cells); got mboxes.n / shmem.n",
+            mboxes.n as u64,
+            shmem.n as u64,
+        );
     }
 
     // A shmem phandle target: child reg [offset, size] + parent reg [hi lo hi lo] -> absolute PA.
-    let resolve_shmem = |ph: u32| -> Option<u64> {
+    let resolve_shmem = |ph: u32, which: &str| -> Option<u64> {
         let mut buf = [0u8; MAX_PATH];
         let n = fdt.path_of_phandle(ph, &mut buf);
         if n == 0 {
+            serial_println!(
+                ":: tegra: JB1b-GEOM STOP — shmem {} phandle {:#x} resolves to no node; BPMP channel unresolvable ::",
+                which, ph
+            );
             return None;
         }
         let node = &buf[..n];
         let reg = fdt.prop_at(node, b"reg");
         let preg = fdt.prop_at(parent(node), b"reg");
         if reg.n < 1 || preg.n < 2 {
+            serial_println!(
+                ":: tegra: JB1b-GEOM STOP — shmem {} node {} reg.n={} / parent reg.n={} (need >=1 / >=2); cannot form the absolute PA ::",
+                which,
+                core::str::from_utf8(node).unwrap_or("?"),
+                reg.n,
+                preg.n,
+            );
             return None;
         }
         let parent_base = ((preg.words[0] as u64) << 32) | preg.words[1] as u64;
         Some(parent_base + reg.words[0] as u64)
     };
-    let shmem_tx = resolve_shmem(shmem.words[0])?;
-    let shmem_rx = resolve_shmem(shmem.words[1])?;
+    let shmem_tx = resolve_shmem(shmem.words[0], "TX")?;
+    let shmem_rx = resolve_shmem(shmem.words[1], "RX")?;
 
     // The HSP node behind mboxes[0]: reg [hi lo hi lo] -> base.
     let mut hbuf = [0u8; MAX_PATH];
     let hn = fdt.path_of_phandle(mboxes.words[0], &mut hbuf);
     if hn == 0 {
-        return None;
+        return geom_stop(
+            "HSP phandle (mboxes[0]) resolves to no node; doorbell base unknown — phandle",
+            mboxes.words[0] as u64,
+            0,
+        );
     }
     let hreg = fdt.prop_at(&hbuf[..hn], b"reg");
     if hreg.n < 2 {
-        return None;
+        return geom_stop("HSP node reg.n too short (need >=2 cells for the base); reg.n", hreg.n as u64, 0);
     }
     let hsp_base = ((hreg.words[0] as u64) << 32) | hreg.words[1] as u64;
     Some(BpmpGeom { shmem_tx, shmem_rx, hsp_base, db_master: mboxes.words[2] })
+}
+
+/// One named JB1b-GEOM abandon witness + the `None` the rung returns, so a rung stays a single
+/// `return geom_stop(..)` line and no call-site line numbers shift (the tail-helper convention).
+#[inline(never)]
+fn geom_stop(why: &str, a: u64, b: u64) -> Option<BpmpGeom> {
+    serial_println!(":: tegra: JB1b-GEOM STOP — {} = {:#x} / {:#x}; BPMP geometry unresolved ::", why, a, b);
+    None
 }
 
 /// JB1c: the XUSB host node's BPMP resource IDs, read off the firmware DTB (never a header
@@ -336,18 +371,28 @@ pub struct XusbIds {
 }
 
 /// Find the node whose name contains "usb@3610000" and read its BPMP resource id lists.
-pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> {
+///
+/// Every abandon rung names itself on serial (`JB1c-IDS STOP`): the caller's line is the generic
+/// "no usb@3610000 ids in DTB; SKIP", which cannot say whether the DTB was absent, unmapped,
+/// malformed, node-less, or merely id-less — and without ids the whole XUSB ungate is skipped.
+pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<XusbIds> { #[cfg(feature = "jd1dc")] if let Some(ids) = node_ids(dtb_addr, dtb_size, ram_gib_mask, b"usb@3610000") { return Some(ids); } // JD1-DC: on an ARMED build these ids come from the GENERALISED reader at this file's tail — the same walk with the node name lifted into a parameter, which is what lets the nvdisplay probe's MRQ_PG guard read `display@13800000`'s power-domains with this code instead of a second copy of it. APPENDED to this line, never a new one, so every `core::panic::Location` below keeps its line number and the disarmed image is untouched. FALL-THROUGH, not replacement: `None` drops into the original body below, so a bug in the generic reader can cost an armed flight one extra STOP line and never its keyboard.
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return ids_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return ids_stop("DTB GiB unmapped (lo vs RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return ids_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
     let mut path = [0u8; MAX_PATH];
     let mut plen = 0usize;
     fdt.for_each_prop(|e| {
@@ -358,7 +403,7 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
         }
     });
     if plen == 0 {
-        return None;
+        return ids_stop("no node whose path contains usb@3610000", 0, 0);
     }
     let node = &path[..plen];
     // [phandle, id] pairs -> collect the odd-index words.
@@ -385,9 +430,21 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
     pick(&resets, &mut ids.resets, &mut ids.n_resets);
     pick(&pds, &mut ids.pds, &mut ids.n_pds);
     if ids.n_clocks == 0 && ids.n_resets == 0 {
-        return None;
+        return ids_stop(
+            "usb@3610000 found but carries NO clocks and NO resets (raw prop cell counts clocks.n / resets.n)",
+            clocks.n as u64,
+            resets.n as u64,
+        );
     }
     Some(ids)
+}
+
+/// One named JB1c-IDS abandon witness + the `None` the rung returns (tail-helper convention: the
+/// rung stays one line, so no call-site `Location` shifts).
+#[inline(never)]
+fn ids_stop(why: &str, a: u64, b: u64) -> Option<XusbIds> {
+    serial_println!(":: tegra: JB1c-IDS STOP — {} = {:#x} / {:#x}; XUSB resource ids unresolved ::", why, a, b);
+    None
 }
 
 /// JB2b: does the firmware DTB mark the XUSB host node `dma-coherent`? A DT boolean is presence
@@ -397,17 +454,22 @@ pub fn xusb_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<Xus
 /// still proceeds, and a stale-ring enumeration stall becomes the diagnosis); `None` = the node or
 /// the DTB itself was unresolvable. Same node match as `xusb_ids`.
 pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<bool> {
+    // `None` here is NOT the same as `Some(false)` — it means the question was never asked, and the
+    // attach then runs its cache-maintenance choice on an unresolved answer. The consumer lives in
+    // `xusb_tegra`, so the naming has to happen here.
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return xusb_prop_stop("dma-coherent: no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return xusb_prop_stop("dma-coherent: DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return xusb_prop_stop("dma-coherent: bad DTB header at Fdt::new (addr / size)", dtb_addr, dtb_size as u64);
+    };
     let mut path = [0u8; MAX_PATH];
     let mut plen = 0usize;
     fdt.for_each_prop(|e| {
@@ -418,9 +480,18 @@ pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> O
         }
     });
     if plen == 0 {
-        return None;
+        return xusb_prop_stop("dma-coherent: no node whose path contains usb@3610000", 0, 0);
     }
     Some(fdt.prop_at(&path[..plen], b"dma-coherent").found)
+}
+
+/// One named witness for the two `usb@3610000`/`padctl@3520000` property lookups whose `None` is
+/// consumed inside `xusb_tegra` (a lane this arc does not touch) — so the abandon still lands on the
+/// wire. `Option<T>`-generic so both the `bool` and `u64` resolvers can use it.
+#[inline(never)]
+fn xusb_prop_stop<T>(why: &str, a: u64, b: u64) -> Option<T> {
+    serial_println!(":: tegra: JB-DTBPROP STOP — {} = {:#x} / {:#x}; property unresolved ::", why, a, b);
+    None
 }
 
 /// JB9: the XUSB padctl AO aperture base — reg region 1 of the `padctl@3520000` node. The JB8
@@ -431,16 +502,18 @@ pub fn xusb_dma_coherent(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> O
 /// (addr:2, size:2) cells, so region 1's base is words[4..6]. None = node/region absent.
 pub fn xusb_padctl_ao(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<u64> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return xusb_prop_stop("padctl AO: no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return xusb_prop_stop("padctl AO: DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return xusb_prop_stop("padctl AO: bad DTB header at Fdt::new (addr / size)", dtb_addr, dtb_size as u64);
+    };
     let mut path = [0u8; MAX_PATH];
     let mut plen = 0usize;
     fdt.for_each_prop(|e| {
@@ -451,15 +524,15 @@ pub fn xusb_padctl_ao(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
         }
     });
     if plen == 0 {
-        return None;
+        return xusb_prop_stop("padctl AO: no node whose path contains padctl@3520000", 0, 0);
     }
     let reg = fdt.prop_at(&path[..plen], b"reg");
     if reg.n < 8 {
-        return None;
+        return xusb_prop_stop("padctl AO: reg.n < 8 — no region-1 (AO) aperture in the node; reg.n", reg.n as u64, 0);
     }
     let base = ((reg.words[4] as u64) << 32) | reg.words[5] as u64;
     if base == 0 {
-        return None;
+        return xusb_prop_stop("padctl AO: region-1 base decoded as 0 (reg words[4]/[5])", reg.words[4] as u64, reg.words[5] as u64);
     }
     Some(base)
 }
@@ -588,6 +661,185 @@ pub fn jb1a_dump(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     if printed == 0 {
         serial_println!(":: tegra: JB1a — no bpmp/shmem reserved-memory children ::");
     }
+}
+
+/// ORIN-VUG-RAS — enumerate the firmware's DRAM carveouts from the DTB `/reserved-memory` children
+/// as (base, size) byte ranges. On Tegra234 several carveouts (TZ, BPMP, DCE, ...) are protected by
+/// the SNOC memory firewall AND are reported as ordinary Conventional (Usable) DRAM in the UEFI map,
+/// so the kernel heap must exclude them explicitly: a cached store into one succeeds into the
+/// D-cache and then faults on writeback with an SNOC RAS Uncorrectable "Carveout" abort that powers
+/// the cores off (the vug lockup — a heap store into a carveout page, evicted a few frames later).
+/// `/reserved-memory` on Tegra uses 2 address + 2 size cells (root #address-cells/#size-cells = 2).
+/// Only children carrying a concrete `reg` are returned; dynamically-placed carveouts (declared with
+/// `size` + `alloc-ranges` and no static base) can't be excluded from here — the caller notes that
+/// the heap-guard witness line prints the final range so a bench sitting can cross-check the RAS PA.
+/// Read-only RAM walk (the dtb is Normal-WB-mapped by the time `memory::init` runs). Returns the
+/// number of ranges written into `out`.
+pub fn reserved_carveouts(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
+        return 0;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else { return 0 };
+    let mut n = 0usize;
+    fdt.for_each_prop(|e| {
+        // /reserved-memory/<child> `reg` arrives at depth 3 (root=1, reserved-memory=2, child=3).
+        if n >= out.len() || e.name != b"reg" || e.depth != 3 {
+            return;
+        }
+        let p = e.path;
+        if !(p.len() > 16 && &p[..16] == b"/reserved-memory") {
+            return;
+        }
+        let words = PropWords::capture(blob, e.val_off, e.val_len);
+        // Each reg entry is [base_hi, base_lo, size_hi, size_lo]; a node may carry several. Skip
+        // zero-size entries.
+        let mut i = 0usize;
+        while i + 4 <= words.n && n < out.len() {
+            let base = ((words.words[i] as u64) << 32) | words.words[i + 1] as u64;
+            let size = ((words.words[i + 2] as u64) << 32) | words.words[i + 3] as u64;
+            if size != 0 {
+                out[n] = (base, size);
+                n += 1;
+            }
+            i += 4;
+        }
+    });
+    n
+}
+
+/// ORIN-DMA-WINDOW — derive the PCIe controller's INBOUND-DMA window(s) from the DTB `dma-ranges`.
+///
+/// The RAS-2 class (heap seated below the inbound-DMA window ⇒ the fabric translated the NIC's ring
+/// writebacks to ~0x0..0x200 ⇒ SNOC/IOB RAS Uncorrectable, cores off) was patched with a HEURISTIC
+/// (`select_heap_region` prefers the highest clean window). The real boundary is DERIVABLE, not
+/// folklore: a DesignWare/Tegra234 PCIe root complex declares its inbound bus→CPU windows in
+/// `dma-ranges`. Each row on THIS hardware (child #address-cells=3, parent #address-cells=2,
+/// #size-cells=2 ⇒ 3+2+2 = 7 cells = 28 bytes — the same stride the node's `ranges` uses, walked
+/// identically in `rtl8168_tegra::resolve_atu_and_window`) maps an incoming PCIe address to a PARENT
+/// (CPU/DRAM) address for `size` bytes; the parent side `[cpu_base, cpu_base+size)` is the window a
+/// bus-master write must land in to reach DRAM — below it is the RAS-2 fabric-error class. Writes each
+/// `(cpu_base, size)` into `out` and returns the count. READ-ONLY (the dtb is Normal-WB-mapped by the
+/// time `memory::init`/the NIC bring-up run).
+///
+/// Gated to the first firmware-`okay` Tegra DesignWare RC node (`tegra234/194-pcie` / `snps,dw-pcie`)
+/// — the SAME gate `resolve_ecam_base`/`resolve_atu_and_window` apply — so a QEMU-virt DTB (a generic
+/// `pcie@` that is not Tegra-compatible) yields 0 windows and the caller degrades to the highest-clean
+/// heuristic with a witness. A missing node, an absent `dma-ranges`, or a foreign DTB all return 0.
+/// (`nvidia,dma-*` props observed on Tegra234 are booleans — e.g. `dma-coherent` — not address
+/// windows; `dma-ranges` is the sole inbound-window source, so this parses exactly that.)
+pub fn pcie_dma_windows(dtb_addr: u64, dtb_size: usize, out: &mut [(u64, u64)]) -> usize {
+    if dtb_addr == 0 || dtb_size == 0 || dtb_size > 4 * 1024 * 1024 || out.is_empty() {
+        return dmaw_stop("DTB absent or implausibly sized (addr / size)", dtb_addr, dtb_size as u64);
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        return dmaw_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
+
+    // First `pcie@` node's path (mirrors resolve_atu_and_window's walk).
+    let mut path0 = [0u8; MAX_PATH];
+    let mut plen0 = 0usize;
+    let mut found = false;
+    fdt.for_each_prop(|e| {
+        if found {
+            return;
+        }
+        let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &e.path[i + 1..],
+            None => e.path,
+        };
+        if leaf.starts_with(b"pcie@") {
+            let l = e.path.len().min(MAX_PATH);
+            path0[..l].copy_from_slice(&e.path[..l]);
+            plen0 = l;
+            found = true;
+        }
+    });
+    if !found {
+        return dmaw_stop("no pcie@ node in the tree", 0, 0);
+    }
+    let path = &path0[..plen0];
+
+    // compatible / status / dma-ranges of that node.
+    let mut compatible: Option<&[u8]> = None;
+    let mut status: Option<&[u8]> = None;
+    let mut dma_ranges: Option<&[u8]> = None;
+    fdt.for_each_prop(|e| {
+        if e.path != path {
+            return;
+        }
+        let val = &blob[e.val_off..e.val_off + e.val_len];
+        match e.name {
+            b"compatible" => compatible = Some(val),
+            b"status" => status = Some(val),
+            b"dma-ranges" => dma_ranges = Some(val),
+            _ => {}
+        }
+    });
+
+    // Tegra DesignWare RC + firmware-enabled? (same gate as resolve_atu_and_window / resolve_ecam_base.)
+    let is_tegra_rc = compatible
+        .map(|c| {
+            let has = |n: &[u8]| c.windows(n.len()).any(|w| w == n);
+            has(b"tegra234-pcie") || has(b"tegra194-pcie") || has(b"snps,dw-pcie")
+        })
+        .unwrap_or(false);
+    if !is_tegra_rc {
+        return dmaw_stop(
+            "first pcie@ node is not a Tegra/DesignWare RC (compatible present?/len) — foreign or QEMU-virt DTB",
+            compatible.is_some() as u64,
+            compatible.map(|c| c.len() as u64).unwrap_or(0),
+        );
+    }
+    let okay = match status {
+        None => true,
+        Some(s) => s.split(|&b| b == 0).any(|item| item == b"okay" || item == b"ok"),
+    };
+    if !okay {
+        return dmaw_stop("Tegra RC node status is NOT okay (firmware-disabled controller); status len", status.map(|s| s.len() as u64).unwrap_or(0), 0);
+    }
+
+    let Some(dma_ranges) = dma_ranges else {
+        return dmaw_stop("Tegra RC node is okay but carries NO dma-ranges property", 0, 0);
+    };
+    let cell = |b: &[u8], i: usize| -> u64 {
+        u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]) as u64
+    };
+    let mut n = 0usize;
+    let mut off = 0usize;
+    while off + 28 <= dma_ranges.len() && n < out.len() {
+        let row = &dma_ranges[off..off + 28];
+        // child 3 cells (0=phys.hi/space, 1/2=PCI addr — inbound, identity on Tegra); parent 2 cells
+        // (3/4 = CPU/DRAM base); size 2 cells (5/6). The parent side is the inbound-DMA window.
+        let cpu_base = (cell(row, 3) << 32) | cell(row, 4);
+        let size = (cell(row, 5) << 32) | cell(row, 6);
+        if size != 0 {
+            out[n] = (cpu_base, size);
+            n += 1;
+        }
+        off += 28;
+    }
+    if n == 0 {
+        return dmaw_stop("dma-ranges present but yielded 0 usable rows (byte length / 28-byte row stride)", dma_ranges.len() as u64, 28);
+    }
+    n
+}
+
+/// One named DMA-WINDOW abandon witness + the `0` the rung returns. `select_heap_region`'s degrade
+/// line only says "NO PCIe dma-ranges in DTB"; that is true of FIVE different failures, and the
+/// difference decides whether the RAS-2 heap boundary is derivable at all on this board.
+#[inline(never)]
+fn dmaw_stop(why: &str, a: u64, b: u64) -> usize {
+    serial_println!(
+        ":: tegra: DMA-WINDOW STOP — {} = {:#x} / {:#x}; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::",
+        why, a, b
+    );
+    0
 }
 
 /// JB3 boot-6: census of EVERY smmu/iommu node the firmware DTB knows — name, compatible,
@@ -777,6 +1029,130 @@ pub fn xusb_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<X
     Some(out)
 }
 
+/// NET-4i: PCIe controller-0's SMMU binding, resolved off the LIVE firmware DTB — the SMMU
+/// instance base(s) plus the stream id that controller-0's DMA emits. Parallel to [`xusb_iommu`],
+/// but a PCIe root complex declares its stream via `iommu-map` (an RID→streamid map:
+/// `<rid-base &smmu sid-base length>` 4-tuples) rather than the point-to-point `iommus` XUSB uses.
+/// A downstream single-function device (bus1:dev0:fn0, the NET-4 RTL8168) has RID 0, so the FIRST
+/// tuple's `sid-base` is the stream id it presents to the SMMU. Falls back to a plain `iommus`
+/// binding if the node uses that form. Same first-`pcie@`-node selection as `resolve_ecam_base`
+/// (controller-0 = `/bus@0/pcie@140a0000`). READ-ONLY RAM walk; `None` on any uncooperative tree.
+pub struct PcieIommu {
+    pub sid: u32,
+    pub bases: [u64; 2],
+    pub n_bases: usize,
+}
+
+pub fn pcie_iommu(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<PcieIommu> {
+    if dtb_addr == 0 || dtb_size == 0 {
+        return None;
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return None;
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let fdt = Fdt::new(blob)?;
+
+    // First `pcie@` node (controller-0), the same node `resolve_ecam_base` drives.
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen != 0 {
+            return;
+        }
+        let leaf = match e.path.iter().rposition(|&b| b == b'/') {
+            Some(i) => &e.path[i + 1..],
+            None => e.path,
+        };
+        if leaf.starts_with(b"pcie@") {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        serial_println!(":: tegra: [net4i] no pcie@ node in DTB — cannot resolve PCIe SMMU stream ::");
+        return None;
+    }
+
+    // `iommu-map` (RID→streamid) preferred; RID 0's tuple is [rid-base, phandle, sid-base, length].
+    // Some node revisions carry a plain `iommus = <&smmu sid>`; accept that too.
+    let map = fdt.prop_at(&path[..plen], b"iommu-map");
+    let (ph, sid, form) = if map.found && map.n >= 3 {
+        (map.words[1], map.words[2], "iommu-map")
+    } else {
+        let it = fdt.prop_at(&path[..plen], b"iommus");
+        if it.found && it.n >= 2 {
+            (it.words[0], it.words[1], "iommus")
+        } else {
+            serial_println!(
+                ":: tegra: [net4i] {} has no iommu-map/iommus prop — PCIe SMMU stream unknown ::",
+                core::str::from_utf8(&path[..plen]).unwrap_or("pcie@")
+            );
+            return None;
+        }
+    };
+
+    let mut spath = [0u8; MAX_PATH];
+    let slen = fdt.path_of_phandle(ph, &mut spath);
+    if slen == 0 {
+        serial_println!(
+            ":: tegra: [net4i] SMMU phandle {:#x} unresolved (sid={:#x}, via {}) ::",
+            ph, sid, form
+        );
+        return None;
+    }
+    let snode = &spath[..slen];
+    // Dual MMU-500: #address-cells=2/#size-cells=2, so reg is [addr-hi addr-lo size-hi size-lo]
+    // per mirrored instance (same shape xusb_iommu decodes).
+    let reg = fdt.prop_at(snode, b"reg");
+    let mut out = PcieIommu {
+        sid,
+        bases: [0; 2],
+        n_bases: 0,
+    };
+    let mut w = 0usize;
+    while w + 3 < reg.n && out.n_bases < 2 {
+        out.bases[out.n_bases] = ((reg.words[w] as u64) << 32) | reg.words[w + 1] as u64;
+        out.n_bases += 1;
+        w += 4;
+    }
+    let compat = fdt.prop_at(snode, b"compatible");
+    let mut cbuf = [b' '; 44];
+    let mut cl = 0usize;
+    'fill: for wi in 0..compat.n {
+        for b in compat.words[wi].to_be_bytes() {
+            if cl >= cbuf.len() {
+                break 'fill;
+            }
+            cbuf[cl] = match b {
+                0 => b'|',
+                b if b.is_ascii_graphic() => b,
+                _ => b'?',
+            };
+            cl += 1;
+        }
+    }
+    serial_println!(
+        ":: tegra: [net4i] DTB: {} sid={:#x} (via {}) -> {} reg0={:#010x} reg1={:#010x} ({} inst) compat='{}' ::",
+        core::str::from_utf8(&path[..plen]).unwrap_or("pcie@"),
+        sid,
+        form,
+        core::str::from_utf8(snode).unwrap_or("?"),
+        out.bases[0],
+        out.bases[1],
+        out.n_bases,
+        core::str::from_utf8(&cbuf[..cl]).unwrap_or("?")
+    );
+    if out.n_bases == 0 {
+        return None;
+    }
+    Some(out)
+}
+
 /// JD1 (video): the firmware's live scanout framebuffer, taken from the DTB `simple-framebuffer`
 /// handoff — the SIMPLEFB display-handoff the JetPack UEFI uses (edk2-nvidia
 /// `DisplayDeviceTreeHelperLib`). The GOP is `BltOnly` precisely *because* the firmware hands the
@@ -812,16 +1188,22 @@ const MAX_FB_NODES: usize = 4;
 /// handed, or the DTB is unmapped/malformed) — the caller then prints and skips the blit.
 pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<SimpleFb> {
     if dtb_addr == 0 || dtb_size == 0 {
-        return None;
+        return sfb_stop("no DTB handed off", dtb_addr, dtb_size as u64);
     }
     let g_lo = dtb_addr >> 30;
     let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
     let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
     if !mapped(g_lo) || !mapped(g_hi) {
-        return None;
+        return sfb_stop("DTB GiB unmapped (lo vs RAM-GiB-mask)", g_lo, ram_gib_mask);
     }
     let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
-    let fdt = Fdt::new(blob)?;
+    let Some(fdt) = Fdt::new(blob) else {
+        return sfb_stop(
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
 
     // Pass 1: collect every node whose `compatible` names "simple-framebuffer" (the firmware writes
     // one per active head under /chosen). Bounded.
@@ -862,6 +1244,7 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
                 }
             }
             if sl >= 8 && &sb[..8] == b"disabled" {
+                sfb_reject(node, "status = \"disabled\" (firmware marks this head inactive)", 0, 0);
                 continue;
             }
         }
@@ -879,10 +1262,12 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
             let mut rbuf = [0u8; MAX_PATH];
             let rn = fdt.path_of_phandle(memregion.words[0], &mut rbuf);
             if rn == 0 {
+                sfb_reject(node, "memory-region phandle resolves to no node", memregion.words[0] as u64, 0);
                 continue;
             }
             let rr = fdt.prop_at(&rbuf[..rn], b"reg");
             if rr.n < 4 {
+                sfb_reject(node, "memory-region node reg.n < 4 (need base_hi/lo + size_hi/lo); reg.n", rr.n as u64, 0);
                 continue;
             }
             (
@@ -897,11 +1282,13 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
                 false,
             )
         } else {
+            sfb_reject(node, "no memory-region phandle and node reg.n < 4; no physical base; reg.n", node_reg.n as u64, 0);
             continue;
         };
         // Require a DRAM base (>= 0x8000_0000) here too — so a bad-but-resolvable first node does not
         // mask a valid later one (the full geometry/size sanity lives in display_tegra::jd1_survey).
         if base < 0x8000_0000 || width.n == 0 || height.n == 0 {
+            sfb_reject(node, "base below DRAM (<0x80000000) or width/height absent; base / (width.n<<8|height.n)", base, ((width.n as u64) << 8) | height.n as u64);
             continue;
         }
         let mut fmt = [0u8; 16];
@@ -926,7 +1313,36 @@ pub fn nvdisplay_simplefb(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> 
             via_memregion,
         });
     }
+    sfb_stop(
+        "no simple-framebuffer node survived resolution (candidate node count / all rejected above)",
+        n as u64,
+        0,
+    )
+}
+
+/// One named JD1-SFB abandon witness + the `None` the rung returns. Without it the resolver's
+/// failure is a bare `None` and the boot goes headless with no line saying WHY — the exact
+/// ambiguity the `jd1_dump` (which lists the nodes it *found*) cannot resolve on its own.
+#[inline(never)]
+fn sfb_stop(why: &str, a: u64, b: u64) -> Option<SimpleFb> {
+    serial_println!(
+        ":: tegra: JD1-SFB STOP — {} = {:#x} / {:#x}; no scanout inherited (headless) ::",
+        why, a, b
+    );
     None
+}
+
+/// One named per-node rejection witness for the pass-2 `continue` rungs — so a DTB that publishes a
+/// simple-framebuffer node the strict resolver then discards says which test the node failed.
+#[inline(never)]
+fn sfb_reject(node: &[u8], why: &str, a: u64, b: u64) {
+    serial_println!(
+        ":: tegra: JD1-SFB reject — node {}: {} = {:#x} / {:#x} ::",
+        core::str::from_utf8(node).unwrap_or("?"),
+        why,
+        a,
+        b
+    );
 }
 
 /// JD1 (video): human-readable dump of the DTB display handoff — the twin of `nvdisplay_simplefb`.
@@ -1061,7 +1477,7 @@ pub fn nvdisplay_base(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Opti
     if plen == 0 {
         return None;
     }
-    let reg = fdt.prop_at(&path[..plen], b"reg");
+    let reg = fdt.prop_at(&path[..plen], b"reg"); #[cfg(feature = "jd1dc")] nvdisplay_reg_census(&fdt, &path[..plen], &reg); // JD1-DC-REG: `reg` on this node is MULTI-ENTRY (the DRIVE OS T234 binding declares four — nvdisplay, dpaux0, hdacodec, mipical) and the two lines below take entry[0] and never say so, while `total_len` — the property's TRUE byte length, captured at `PropWords::capture` and the one datum that would reveal it — is discarded silently. This gated call prints total_len, the entry count it implies, every captured (addr,size) pair and the `reg-names` byte list, so a capture PROVES entry[0] is `nvdisplay` instead of assuming it. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves.
     if reg.n < 4 {
         return None;
     }
@@ -1143,4 +1559,298 @@ pub fn cpu_affinities(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, out: &m
         n += 1;
     });
     n
+}
+
+// =================================================================================================
+// JD1-DC — the DTB resource-id reader, GENERALISED off its one node name. `jd1dc`, DEFAULT OFF.
+// =================================================================================================
+//
+// WHAT THIS IS. `xusb_ids` above is a perfectly good `clocks`/`resets`/`power-domains` reader that
+// happens to have ONE thing hardcoded to XUSB: the node-name literal `b"usb@3610000"` it matches on.
+// The JD1-DC nvdisplay probe needs exactly the same three lists off a DIFFERENT node
+// (`display@13800000`), because its MRQ_PG guard cannot prove a power domain is ON without the
+// domain's id, and the id lives in the firmware's own tree (verify-don't-assume — never a header
+// guess, the JB1c rule). So the reader is parameterised by node name here, and `xusb_ids` routes
+// THROUGH it on an armed build.
+//
+// WHY IT IS AN APPENDED, FEATURE-GATED COPY OF THE WALK RATHER THAN AN IN-PLACE EDIT OF `xusb_ids`.
+// The arc's hard constraint is that the DISARMED jetson image is byte-identical to baseline, and
+// that constraint is stronger than it first looks: ANY edit to source the disarmed build compiles
+// changes the image. Not just code — the two `ids_stop` message literals in `xusb_ids` say
+// "usb@3610000", and a generalised reader must not print that when it was asked for a display node,
+// so an in-place parameterisation necessarily rewrites .rodata. Worse, inserting or deleting a
+// LINE anywhere above an existing panic site in this file shifts that site's `core::panic::Location`
+// (file/line/col is baked into the image), which moves bytes for free. Hence the shape below: the
+// generic walk is `#[cfg(feature = "jd1dc")]` and lives at the file TAIL where it shifts nothing,
+// and the single edit to `xusb_ids` is a `#[cfg]`-erased statement APPENDED to its existing opening
+// line. Knob off => not one byte of this block, and not one moved line, reaches the image.
+//
+// THE ONE DELIBERATE BEHAVIOURAL DIFFERENCE from `xusb_ids`: the "found the node but it carries
+// nothing" abandon also requires `n_pds == 0`. `xusb_ids` abandons on `n_clocks == 0 && n_resets == 0`
+// because for XUSB a node with no clocks and no resets cannot be ungated — but a display node whose
+// only BPMP resource in this firmware's tree is `power-domains` is EXACTLY the node the guard wants,
+// and abandoning it would refuse the probe for the wrong reason. For `usb@3610000` the two
+// conditions cannot disagree (that node carries nine clocks — JB5, metal-proven), which is why
+// routing `xusb_ids` through here is safe.
+//
+// FALL-THROUGH, NOT REPLACEMENT. `xusb_ids`'s armed-build delegation returns only on `Some`: if this
+// reader ever answered `None` where the original body would have answered `Some`, the original body
+// still runs and the XUSB ungate is unharmed. An armed JD1-DC flight therefore cannot lose its
+// keyboard to a bug in this function — the worst case is one extra STOP line on the wire. That
+// fall-through is also the self-test: on an armed boot the `JB1c — XUSB ids from DTB: 9 clocks,
+// 4 resets, 1 power-domains` line is produced BY this reader, against a node whose answer is known.
+
+/// JD1-DC: `xusb_ids`'s walk with the node name lifted into a parameter — read one DTB node's
+/// `clocks` / `resets` / `power-domains` id lists (the odd-index word of each [phandle, id] pair).
+///
+/// `node_name` is matched as a SUBSTRING of the node path, identically to `xusb_ids` and to
+/// `nvdisplay_base` — so passing `b"display@"` here resolves the SAME node `nvdisplay_base` resolves
+/// (same predicate, same `for_each_prop` order, first match wins). That identity is load-bearing for
+/// the probe: the power domain the guard proves ON must be the domain that owns the aperture the
+/// sweep reads, and matching on the same string is what makes that true by construction rather than
+/// by assumption.
+///
+/// Read-only RAM walk — no MMIO, no allocation. Every abandon names itself on the wire
+/// (`JD1-DC-IDS STOP`) with the node it was asked for.
+#[cfg(feature = "jd1dc")]
+pub fn node_ids(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64, node_name: &[u8]) -> Option<XusbIds> {
+    if node_name.is_empty() || node_name.len() > MAX_PATH {
+        // `windows(0)` panics and a name longer than a path can never match; refuse both up front.
+        return node_ids_stop(node_name, "node name length out of range (len / MAX_PATH)", node_name.len() as u64, MAX_PATH as u64);
+    }
+    if dtb_addr == 0 || dtb_size == 0 {
+        return node_ids_stop(node_name, "no DTB handed off (addr / size)", dtb_addr, dtb_size as u64);
+    }
+    let g_lo = dtb_addr >> 30;
+    let g_hi = (dtb_addr + dtb_size as u64 - 1) >> 30;
+    let mapped = |g: u64| g == 0 || (g < 64 && (ram_gib_mask >> g) & 1 != 0);
+    if !mapped(g_lo) || !mapped(g_hi) {
+        return node_ids_stop(node_name, "DTB GiB unmapped (GiB lo / RAM-GiB-mask)", g_lo, ram_gib_mask);
+    }
+    let blob = unsafe { core::slice::from_raw_parts(dtb_addr as *const u8, dtb_size) };
+    let Some(fdt) = Fdt::new(blob) else {
+        return node_ids_stop(
+            node_name,
+            "bad DTB header (magic/bounds) at Fdt::new; first two words",
+            be32(blob, 0).unwrap_or(0) as u64,
+            be32(blob, 4).unwrap_or(0) as u64,
+        );
+    };
+    let mut path = [0u8; MAX_PATH];
+    let mut plen = 0usize;
+    fdt.for_each_prop(|e| {
+        if plen == 0 && e.path.windows(node_name.len()).any(|w| w == node_name) {
+            let l = e.path.len().min(MAX_PATH);
+            path[..l].copy_from_slice(&e.path[..l]);
+            plen = l;
+        }
+    });
+    if plen == 0 {
+        return node_ids_stop(node_name, "no node whose path contains this name", 0, 0);
+    }
+    let node = &path[..plen];
+    // [phandle, id] pairs -> collect the odd-index words. Verbatim from `xusb_ids`.
+    let pick = |p: &PropWords, out: &mut [u32], n: &mut usize| {
+        let mut i = 1;
+        while i < p.n && *n < out.len() {
+            out[*n] = p.words[i];
+            *n += 1;
+            i += 2;
+        }
+    };
+    let mut ids = XusbIds { clocks: [0; 9], n_clocks: 0, resets: [0; 4], n_resets: 0, pds: [0; 4], n_pds: 0 };
+    let clocks = fdt.prop_at(node, b"clocks");
+    let resets = fdt.prop_at(node, b"resets");
+    let pds = fdt.prop_at(node, b"power-domains");
+    pick(&clocks, &mut ids.clocks, &mut ids.n_clocks);
+    pick(&resets, &mut ids.resets, &mut ids.n_resets);
+    pick(&pds, &mut ids.pds, &mut ids.n_pds);
+    // JD1-DC — TRUNCATION IS LOUD, AND FOR power-domains IT IS FATAL TO THE FLIGHT.
+    //
+    // `pick` above drops silently at TWO caps and neither is visible in its output: `PropWords`
+    // stops capturing at `MAX_WORDS` (= 20 words = 10 [phandle,id] pairs, whatever the property),
+    // and the loop stops again at `out.len()` (9 clocks / 4 resets / 4 power-domains). Only
+    // `p.total_len` — the property's TRUE byte length, kept by `PropWords::capture` — knows how many
+    // entries the DTB actually declared. This project has already been bitten by exactly this class
+    // in exactly this function: the `XusbIds.clocks` comment above records the JB5 finding, where an
+    // 8-slot cap dropped `usb@3610000`'s ninth clock without a word on the wire.
+    //
+    // The two properties are NOT treated alike, and the asymmetry is the point. A truncated
+    // `clocks`/`resets` list costs this rung NOTHING — JD1-DC never enables a clock and never
+    // deasserts a reset; it reads MMIO. A truncated `power-domains` list, by contrast, destroys the
+    // ONE claim the guard exists to make: "every domain this node lists answered ON". With entries
+    // dropped, `jd1_dc_probe` would print `GUARD PASSED: all 4 display@ power domain(s) ON` and read
+    // a block whose 5th domain was never asked about — a read of a gated Tegra block is EL3-FATAL
+    // (JX1). So clocks/resets get a loud line and the walk continues; power-domains gets the loud
+    // line and then `None`, which the caller already renders as `VERDICT=REFUSED reason=no-ids` and
+    // NOT ONE nvdisplay register is read.
+    //
+    // `total_len % 8 != 0` is checked separately and is a DIFFERENT defect: it means the property is
+    // not a whole number of [phandle,id] pairs at all — a provider with `#power-domain-cells = <0>`
+    // yields 1-word entries, and `pick`'s odd-index extraction would then harvest phandles as ids.
+    // That is silent corruption rather than silent loss, so it is named as its own reason.
+    let trunc = |what: &str, p: &PropWords, taken: usize, cap: usize| -> bool {
+        if !p.found {
+            return false; // absent is not truncated — `n_* == 0` already says so on the census line.
+        }
+        let declared = p.total_len / 8; // [phandle, id] pairs the DTB declares, from the TRUE length
+        let ragged = p.total_len % 8 != 0;
+        if !ragged && declared <= taken {
+            return false;
+        }
+        serial_println!(
+            ":: tegra: JD1-DC-IDS TRUNCATED — '{}' on this node: total_len={} B => {} [phandle,id] pair(s) declared{}, but this reader kept {} id(s). Caps: PropWords MAX_WORDS={} words = {} pairs (captured n={}), destination array = {} ids. {} ::",
+            what,
+            p.total_len,
+            declared,
+            if ragged { " (RAGGED — total_len is not a multiple of 8, so this property is NOT a list of [phandle,id] pairs and the odd-index extraction below is reading the WRONG cells)" } else { "" },
+            taken,
+            MAX_WORDS,
+            MAX_WORDS / 2,
+            p.n,
+            cap,
+            if what == "power-domains" {
+                "The guard's 'all domains ON' claim cannot be made over a list this reader did not fully see, so the ids are REFUSED (None) and JD1-DC will read no nvdisplay register this boot"
+            } else {
+                "JD1-DC enables no clock and deasserts no reset, so the walk CONTINUES — this line exists so the capture records what was dropped, not to stop the flight"
+            },
+        );
+        true
+    };
+    let pds_trunc = trunc("power-domains", &pds, ids.n_pds, ids.pds.len());
+    let _ = trunc("clocks", &clocks, ids.n_clocks, ids.clocks.len());
+    let _ = trunc("resets", &resets, ids.n_resets, ids.resets.len());
+    if pds_trunc {
+        return node_ids_stop(
+            node_name,
+            "power-domains TRUNCATED or RAGGED (see the JD1-DC-IDS TRUNCATED line above); the guard cannot prove every listed domain is ON, and a read of a gated block is EL3-fatal — declared pair count / ids kept",
+            (pds.total_len / 8) as u64,
+            ids.n_pds as u64,
+        );
+    }
+    if ids.n_clocks == 0 && ids.n_resets == 0 && ids.n_pds == 0 {
+        return node_ids_stop(
+            node_name,
+            "node found but carries NO clocks, NO resets and NO power-domains (raw prop cell counts clocks.n / resets.n)",
+            clocks.n as u64,
+            resets.n as u64,
+        );
+    }
+    // Two lines rather than one with conditional fragments: a format that splices "" and 0 together
+    // when there are no power-domains reads as `...0 power-domains0 ::` on the wire, and a capture a
+    // decision rests on may not contain a number that means nothing.
+    serial_println!(
+        ":: tegra: JD1-DC-IDS — node '{}' (path '{}'): {} clocks, {} resets, {} power-domains ::",
+        core::str::from_utf8(node_name).unwrap_or("?"),
+        core::str::from_utf8(node).unwrap_or("?"),
+        ids.n_clocks,
+        ids.n_resets,
+        ids.n_pds,
+    );
+    for i in 0..ids.n_pds {
+        serial_println!(":: tegra: JD1-DC-IDS —   power-domain[{}] id = {} ({:#x}) ::", i, ids.pds[i], ids.pds[i]);
+    }
+    Some(ids)
+}
+
+/// One named JD1-DC-IDS abandon witness + the `None` the rung returns (tail-helper convention: each
+/// abandon stays a single `return` line, so no call-site `Location` moves). Names the node it was
+/// asked for — the whole reason the generalised reader could not reuse `ids_stop`, whose two
+/// messages say "usb@3610000" and whose text may not change without moving the disarmed image.
+#[cfg(feature = "jd1dc")]
+#[inline(never)]
+fn node_ids_stop(node_name: &[u8], why: &str, a: u64, b: u64) -> Option<XusbIds> {
+    serial_println!(
+        ":: tegra: JD1-DC-IDS STOP — node '{}': {} = {:#x} / {:#x}; resource ids unresolved ::",
+        core::str::from_utf8(node_name).unwrap_or("?"),
+        why,
+        a,
+        b,
+    );
+    None
+}
+
+/// JD1-DC-REG — say out loud what `nvdisplay_base` silently assumes about the `display@` node's
+/// `reg`, so a capture can CHECK the assumption instead of inheriting it.
+///
+/// The assumption: `nvdisplay_base` takes `reg.words[0..4]` — entry[0] — as the nvdisplay aperture.
+/// The DRIVE OS Tegra234 binding declares FOUR entries on this node, `reg-names =
+/// "nvdisplay", "dpaux0", "hdacodec", "mipical"`, and entry[0] IS the nvdisplay one — so the reader
+/// is right, but right by luck of ordering rather than by design, and nothing on the wire has ever
+/// said which entry was taken or how many there were. **Whether the L4T DTB this board actually
+/// hands us matches that binding — same order, same names — is UNMEASURED.** This is the instrument
+/// that would measure it.
+///
+/// Read-only RAM walk; prints, decides nothing, returns nothing. Every value here is a DTB datum —
+/// no MMIO is touched by this function and none may be: it runs long before the BPMP power guard.
+#[cfg(feature = "jd1dc")]
+fn nvdisplay_reg_census(fdt: &Fdt<'_>, node: &[u8], reg: &PropWords) {
+    // `reg` on this wrapper is (addr:2, size:2) cells = 16 bytes per entry. `total_len` is the
+    // property's TRUE byte length; `n` is how many words `PropWords` managed to capture (cap
+    // MAX_WORDS = 20 words = 5 entries). The two disagreeing is itself a finding.
+    let entries = reg.total_len / 16;
+    let ragged = reg.total_len % 16 != 0;
+    let captured = reg.n / 4;
+    serial_println!(
+        ":: tegra: JD1-DC-REG — node '{}': reg total_len={} B => {} entry/entries of (addr:2,size:2) cells{}; PropWords captured n={} words = {} whole entry/entries (cap MAX_WORDS={}). nvdisplay_base USES ENTRY[0] AND ONLY ENTRY[0]{} ::",
+        core::str::from_utf8(node).unwrap_or("?"),
+        reg.total_len,
+        entries,
+        if ragged { " (RAGGED — total_len is not a multiple of 16, so this is NOT a clean (addr:2,size:2) list and the decode below is unreliable)" } else { "" },
+        reg.n,
+        captured,
+        MAX_WORDS,
+        if entries > captured {
+            " — and MORE ENTRIES EXIST THAN WERE CAPTURED, so the list below is incomplete"
+        } else if entries > 1 {
+            " — the other entries are NOT dpaux/hdacodec/mipical by proof, only by the vendor binding; check reg-names below"
+        } else {
+            ""
+        },
+    );
+    // Every captured entry, so a reader can see for themselves which one is 0x13800000-shaped.
+    let mut e = 0usize;
+    while e < captured {
+        let a = ((reg.words[e * 4] as u64) << 32) | reg.words[e * 4 + 1] as u64;
+        let s = ((reg.words[e * 4 + 2] as u64) << 32) | reg.words[e * 4 + 3] as u64;
+        serial_println!(
+            ":: tegra: JD1-DC-REG —   entry[{}] addr={:#x} size={:#x}{} ::",
+            e,
+            a,
+            s,
+            if e == 0 { "  <== THIS is the aperture JD1-DC reads" } else { "" },
+        );
+        e += 1;
+    }
+    // `reg-names` is a NUL-separated string list, not cells. `PropWords` holds it as big-endian
+    // words, so rebuild the bytes and print them with NUL shown as '|' — this is what turns
+    // "entry[0] is nvdisplay" from an assumption into a wire fact. A missing `reg-names` is itself
+    // reported, because then the ordering claim has NO evidence on this board at all.
+    let names = fdt.prop_at(node, b"reg-names");
+    if !names.found {
+        serial_println!(
+            ":: tegra: JD1-DC-REG —   reg-names ABSENT on this node: nothing on this board identifies entry[0] as the nvdisplay aperture. The identification rests ENTIRELY on the vendor binding and on entry[0] being 0x13800000-shaped ::"
+        );
+        return;
+    }
+    let mut buf = [b'?'; MAX_WORDS * 4];
+    let mut w = 0usize;
+    while w < names.n && w * 4 < buf.len() {
+        let b = names.words[w].to_be_bytes();
+        let mut k = 0usize;
+        while k < 4 {
+            let c = b[k];
+            buf[w * 4 + k] = if c == 0 { b'|' } else if (0x20..0x7f).contains(&c) { c } else { b'.' };
+            k += 1;
+        }
+        w += 1;
+    }
+    let shown = (names.total_len).min(w * 4);
+    serial_println!(
+        ":: tegra: JD1-DC-REG —   reg-names total_len={} B, showing {} B ('|' = NUL): '{}'{} ::",
+        names.total_len,
+        shown,
+        core::str::from_utf8(&buf[..shown]).unwrap_or("<non-utf8>"),
+        if names.total_len > w * 4 { " (TRUNCATED by the PropWords word cap — more names exist)" } else { "" },
+    );
 }

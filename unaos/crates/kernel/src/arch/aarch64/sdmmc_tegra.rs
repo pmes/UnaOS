@@ -34,11 +34,19 @@
 // ## The Tegra vendor-quirk assumptions this READ-ONLY recon relies on (documented; metal-pending)
 //
 //  1. The firmware/BPMP has already ENABLED the sdmmc1 module clock + pad power and left the slot's
-//     rails up (the bootloader read the card to boot). We do NOT program the CAR/BPMP clock or the
-//     Tegra vendor pad-control registers (>= 0x100) — we drive ONLY the standard SDHCI internal-clock
-//     divider (CONTROL1) off whatever base clock the controller already has running. If metal shows the
-//     internal clock never stabilises (CLK_STABLE never sets), the diagnosis is "the input clock is
-//     gated" and the fix (a BPMP clock MRQ) is a later arc — surfaced, never worked around.
+//     rails up (the bootloader read the card to boot). We do NOT program the CAR/BPMP clock, and we
+//     AUTHOR no Tegra vendor pad-control value (>= 0x100) — we drive ONLY the standard SDHCI
+//     internal-clock divider (CONTROL1) off whatever base clock the controller already has running. If
+//     metal shows the internal clock never stabilises (CLK_STABLE never sets), the diagnosis is "the
+//     input clock is gated" and the fix (a BPMP clock MRQ) is a later arc — surfaced, never worked
+//     around.
+//     M2b AMENDMENT (post boot 3): "author none" is not the same as "never write". SRST_ALL returns the
+//     vendor block to power-on defaults, which DISCARDS the tap/trim/drive-strength/auto-cal the
+//     bootloader calibrated for this board — the ladder then runs on pads the firmware never intended.
+//     So the recon now SNAPSHOTS that block before its own reset and writes the FIRMWARE'S OWN values
+//     back afterwards (`vendor_snapshot`/`vendor_restore`), re-running pad auto-calibration only if the
+//     firmware had it enabled. Every value written there came from the controller one instruction
+//     earlier; assumption 1 stands, with its scope stated precisely.
 //  2. The CAPABILITIES base-clock field: if it reads 0 (some Tegra SKUs report base clock via the DT
 //     `clock-frequency` / assigned-clock-rates instead of CAPS[15:8]), we assume a documented 200 MHz
 //     and log it. Identification runs at 400 kHz then 25 MHz default-speed, so an inexact base only
@@ -47,14 +55,17 @@
 //     negotiation (ACMD6 / CMD6) is deferred — it is not needed to census the card and keeps this rung
 //     minimal. The reported width/speed is "1-bit, default-speed (25 MHz)".
 //
-// ## Read-only-by-construction
+// ## Read-only-by-construction (scope updated 2026-08-19 — the original absolute claim went stale)
 //
-// This module issues ONLY the identification ladder + CMD17 single-block READ: CMD0, CMD8, CMD55/ACMD41,
-// CMD2, CMD3, CMD9, CMD7, CMD16, CMD17. There is NO CMD24/WRITE_SINGLE_BLOCK, no CMD25, no ACMD6
-// bus-width write, no erase, no CMD6 switch. The controller-register writes it does make (SRST, clock,
-// power, command issue) are the SDHCI machinery every read needs; NONE of them are a WRITE to the card's
-// storage. `grep` the diff for `cmd(24)` / `write_block` / `WRITE` and find nothing that targets card
-// storage — read-only by construction (see review/unaos-orin-sdmmc1-LANDING.md).
+// The RECON/IDENTIFY path issues ONLY the identification ladder + CMD17 single-block READ: CMD0,
+// CMD8, CMD55/ACMD41, CMD2, CMD3, CMD9, CMD7, CMD16, CMD17 — no erase (CMD32–38) exists anywhere in
+// this file, and no recon-path code can reach a write. Since ORIN-SDMMC-2/INSTALL-1 the file ALSO
+// carries an explicit write path — `write_block_at` (CMD24, `sdmmc_arm`) and `write_blocks_at`
+// (CMD25, `install_target`) — DOUBLE-GATED behind features the recon build does not carry, with no
+// caller in the identify/census code. The controller-register writes recon makes (SRST, clock,
+// power, command issue) are SDHCI machinery, not card-storage writes. An earlier version of this
+// header claimed "grep for cmd(24) and find nothing" — that was true when written and is now false;
+// the reachable-from-recon invariant is the one that holds (see review/unaos-orin-sdmmc1-LANDING.md).
 
 #![cfg(feature = "sdmmc")]
 
@@ -106,6 +117,13 @@ pub use metal::sdmmc_census;
 #[cfg(all(feature = "tegra", feature = "install_target"))]
 pub use metal::sdmmc_install_from_usb;
 
+// TEGRA-SDBLK (orin-unafs-root.md §3 item 1): the READ surface `drivers::block` consumes once the census
+// has published the card as a block backend. Three functions, no more: the card's sector count, one
+// single-sector read, and its counted loop. Nothing here can write — the write path stays exclusively
+// behind the `sdmmc_arm` ladder further down this file, untouched by this seam.
+#[cfg(feature = "tegra")]
+pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512};
+
 #[cfg(feature = "tegra")]
 mod metal {
     use super::PS;
@@ -127,7 +145,39 @@ mod metal {
     const IRPT_MASK: u64 = 0x34; // status-ENABLE (bits latch into INTERRUPT only if set here)
     const IRPT_EN: u64 = 0x38; // signal-enable (kept 0 — polled)
     const CAPABILITIES: u64 = 0x40;
+    const HOST_CTRL2: u64 = 0x3c; // [15:0] Auto-CMD error, [31:16] Host Control 2 (UHS mode / 1.8V sig)
     const HOST_VERSION: u64 = 0xfc; // [31:16] = Host Controller Version register (0xFE)
+
+    // ── M2b: the Tegra vendor register block (>= 0x100), stacked above the standard SDHCI window (the
+    //    controller window is 0x20000 long, so every offset here is in range). We do NOT author values
+    //    for these — see `vendor_snapshot`/`vendor_restore`: SRST_ALL returns them to power-on defaults
+    //    and thereby DISCARDS the pad tap/trim/drive-strength the bootloader calibrated for this exact
+    //    card and board, which is the leading suspect for a ladder that dies with no card response after
+    //    a reset that "succeeded". We preserve the firmware's values across our own reset; we never
+    //    invent one. (Same register set Linux's sdhci-tegra re-applies in `tegra_sdhci_reset`.) ──
+    const V_CLOCK_CTRL: u64 = 0x100; // tap/trim + PADPIPE/SPI clock-enable overrides
+    const V_SYS_SW_CTRL: u64 = 0x104;
+    const V_CAP_OVERRIDES: u64 = 0x10c;
+    const V_MISC_CTRL: u64 = 0x120; // SDR50/DDR50/SDR104 capability enables
+    const V_IO_TRIM_CTRL: u64 = 0x1ac;
+    const V_DLLCAL_CFG: u64 = 0x1b0;
+    const V_SDMEM_COMP_PADCTRL: u64 = 0x1e0; // pad comp / drive strength
+    const V_AUTO_CAL_CONFIG: u64 = 0x1e4;
+    const V_AUTO_CAL_STATUS: u64 = 0x1ec;
+    /// The vendor registers preserved across SRST_ALL, in write order.
+    const VENDOR_REGS: [u64; 8] = [
+        V_CLOCK_CTRL,
+        V_SYS_SW_CTRL,
+        V_CAP_OVERRIDES,
+        V_MISC_CTRL,
+        V_IO_TRIM_CTRL,
+        V_DLLCAL_CFG,
+        V_SDMEM_COMP_PADCTRL,
+        V_AUTO_CAL_CONFIG,
+    ];
+    const AUTO_CAL_START: u32 = 1 << 31;
+    const AUTO_CAL_ENABLE: u32 = 1 << 29;
+    const AUTO_CAL_ACTIVE: u32 = 1 << 31; // in V_AUTO_CAL_STATUS
 
     // ── Present State (0x24) bits. ──
     const ST_CMD_INHIBIT: u32 = 1 << 0;
@@ -139,6 +189,8 @@ mod metal {
     const C1_CLK_STABLE: u32 = 1 << 1;
     const C1_CLK_EN: u32 = 1 << 2;
     const C1_SRST_HC: u32 = 1 << 24; // Software Reset For All (reg 0x2F bit 0)
+    const C1_SRST_CMD: u32 = 1 << 25; // Software Reset For CMD line
+    const C1_SRST_DAT: u32 = 1 << 26; // Software Reset For DAT line
 
     // ── INTERRUPT (0x30) bits (W1C). ──
     const INT_CMD_DONE: u32 = 1 << 0;
@@ -233,20 +285,26 @@ mod metal {
     /// Issue one command and wait for completion. Returns Ok on CMD_DONE with no error; Err on a command
     /// timeout / CRC / index error, or our own bounded timeout. Mirrors `emmc2::send_command` (incl. the
     /// unconditional DAT_INHIBIT wait, load-bearing on metal after an R1b command leaves DAT0 busy).
-    fn send_command(base: u64, cmdtm: u32, arg: u32) -> Result<(), ()> {
+    ///
+    /// M2b: the `Err` payload is the INTERRUPT register AS READ AT THE FAILURE — a command that dies
+    /// silently is a command that cannot be diagnosed from a boot capture (boot 3 stopped inside this
+    /// ladder with no evidence whatsoever). Every caller that cares routes it through `cmd_step`, which
+    /// names the command and prints the payload beside the Present State. The two `.is_err()` callers
+    /// (the read/write primitives) ignore the payload exactly as before.
+    fn send_command(base: u64, cmdtm: u32, arg: u32) -> Result<(), u32> {
         if !wait_clear(base, STATUS, ST_CMD_INHIBIT | ST_DAT_INHIBIT, CMD_TIMEOUT_MS) {
-            return Err(());
+            return Err(read32(base, INTERRUPT));
         }
         write32(base, INTERRUPT, 0xffff_ffff); // clear any stale status
         write32(base, ARG1, arg);
         write32(base, CMDTM, cmdtm); // issues the command
         if !wait_set(base, INTERRUPT, INT_CMD_DONE | INT_ERR_ANY, CMD_TIMEOUT_MS) {
-            return Err(());
+            return Err(read32(base, INTERRUPT));
         }
         let int = read32(base, INTERRUPT);
         if int & INT_ERR_ANY != 0 {
             write32(base, INTERRUPT, int); // W1C what we saw
-            return Err(());
+            return Err(int);
         }
         write32(base, INTERRUPT, INT_CMD_DONE);
         Ok(())
@@ -340,7 +398,30 @@ mod metal {
     /// CSD-derived capacity, and RCA. Prints the CID (manufacturer/OEM/product/serial) and capacity.
     /// Returns the identified card, or None on any absent-card / timeout / decode failure (the caller
     /// prints the honest cause). NO card write anywhere in this ladder.
-    fn identify(base: u64) -> Option<Card> {
+    fn identify(base: u64, vendor_ok: bool) -> Option<Card> {
+        // 0. M2b: snapshot the bootloader's Tegra vendor pad/tap configuration BEFORE the reset that
+        //    would discard it, and report the pre-reset signalling voltage (a card the firmware left in
+        //    1.8 V UHS signalling cannot answer a 3.3 V ladder — that diagnosis needs a PMIC/vqmmc arc,
+        //    so we surface it rather than work around it).
+        //    CLKPROOF gate (boot 4e): the HC2 read and the vendor block (base+0x100..0x1e4) run ONLY
+        //    when the census proved the core clock enabled over BPMP — the 4e SError raised in this
+        //    exact window. Unproven => the ladder runs pre-SDID-shaped (no vendor touch), which boot 3
+        //    proved SError-free on this silicon; the skip is witnessed, never silent.
+        let vendor = if vendor_ok {
+            let hc2 = (read32(base, HOST_CTRL2) >> 16) & 0xffff;
+            serial_println!(
+                "{}   M2: pre-reset Host Control 2 = {:#06x} (1.8V-signalling={}, UHS mode {:#x}) ::",
+                PS, hc2, (hc2 >> 3) & 1, hc2 & 0x7
+            );
+            Some(vendor_snapshot(base))
+        } else {
+            serial_println!(
+                "{}   M2: vendor snapshot SKIPPED — core clock not proven (CLKPROOF); ladder runs without pad snapshot/restore ::",
+                PS
+            );
+            None
+        };
+
         // 1. Full-controller software reset; wait for it to self-clear.
         serial_println!("{}   M2: SRST_ALL (controller software reset) ::", PS);
         write32(base, CONTROL1, read32(base, CONTROL1) | C1_SRST_HC);
@@ -348,13 +429,29 @@ mod metal {
             serial_println!("{}   M2: SRST did not self-clear (controller not responding) — STOP ::", PS);
             return None;
         }
+        // 1b. M2b: put the firmware's vendor pad configuration BACK (SRST_ALL reset it to power-on
+        //     defaults) and re-run pad auto-calibration if the firmware had it enabled. Skipped (with
+        //     the M2 witness above) when CLKPROOF could not prove the clock.
+        if let Some(v) = &vendor {
+            vendor_restore(base, v);
+        }
         // 2. Enable status latching (must be set or STATUS bits never appear in INTERRUPT); keep signals
         //    off (polled); clear any stale status.
         write32(base, IRPT_MASK, 0xffff_ffff);
         write32(base, IRPT_EN, 0);
         write32(base, INTERRUPT, 0xffff_ffff);
-        // 3. Bus power: 3.3 V select + bus power on (CONTROL0 bits[11:8] = 0xF).
-        write32(base, CONTROL0, (read32(base, CONTROL0) & !(0xf << 8)) | (0xf << 8));
+        // 3. Bus power, in the two writes the SDHCI spec prescribes (§3.3): FIRST select the bus voltage
+        //    with power still off, THEN set SD Bus Power. A single fused write of bits[11:8] is what the
+        //    recon did through boot 3, and a controller that latches the voltage only on a power-off
+        //    write comes up unpowered from it — a silent way to reach CMD0 with a dead bus.
+        let c0 = read32(base, CONTROL0) & !(0xf << 8);
+        write32(base, CONTROL0, c0 | (0x7 << 9)); // 3.3 V select, SD Bus Power still 0
+        write32(base, CONTROL0, c0 | (0xf << 8)); // ... then power on
+        delay_ms(2); // rails settle before the first clock edge
+        serial_println!(
+            "{}   M2: bus power 3.3 V applied (CONTROL0={:#010x}) ::",
+            PS, read32(base, CONTROL0)
+        );
 
         // 4. Card-detect: with power + reset settled, is a card seated? (Present State bit 16.)
         let present = read32(base, STATUS);
@@ -377,45 +474,87 @@ mod metal {
             return None;
         }
 
+        serial_println!(
+            "{}   M2: 400 kHz identification clock running (CONTROL1={:#010x}, base {} MHz) ::",
+            PS, read32(base, CONTROL1), base_hz / 1_000_000
+        );
+        // 5b. The SD spec's power-up ramp: the card needs >= 1 ms and 74 SDCLK cycles (185 us at
+        //     400 kHz) of clock before it will accept the first command. Boot 3 issued CMD0 in the
+        //     instruction after CLK_STABLE — inside that window a card is not obliged to answer anything.
+        delay_ms(2);
+
         // 6. CMD0 GO_IDLE (no response).
-        send_command(base, cmd(0) | CMD_RESP_NONE, 0).ok()?;
-        // 7. CMD8 SEND_IF_COND (R7): 0x1AA = 2.7-3.6 V + check pattern 0xAA. The echo is the discriminator.
-        send_command(base, cmd(8) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0x1aa).ok()?;
-        let sdhc_capable = read32(base, RESP0) & 0xfff == 0x1aa;
-        if !sdhc_capable {
-            serial_println!("{}   M2: CMD8 echo mismatch — legacy/SDSC card (or no v2 support) ::", PS);
-        }
+        cmd_step(base, "CMD0 GO_IDLE", cmd(0) | CMD_RESP_NONE, 0)?;
+        delay_ms(2); // the card enters idle; give it the spec's settle before interrogating it
+        // 7. CMD8 SEND_IF_COND (R7): 0x1AA = 2.7-3.6 V + check pattern 0xAA. The echo is the
+        //    discriminator — and a NO-ANSWER is itself an answer: SD v1.x cards do not implement CMD8 at
+        //    all, so the command TIMES OUT on them. Boot 3's ladder treated that timeout as fatal and
+        //    abandoned identification; per SD Physical Layer §4.2.2 it means "not a v2 card, continue
+        //    with ACMD41 and no HCS". The CMD line is reset after the timeout before we go on.
+        let sdhc_capable = match send_command(base, cmd(8) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0x1aa) {
+            Ok(()) => {
+                let echo = read32(base, RESP0) & 0xfff;
+                serial_println!("{}   M2: CMD8 SEND_IF_COND ok (R7 echo {:#05x}) ::", PS, echo);
+                if echo != 0x1aa {
+                    serial_println!("{}   M2: CMD8 echo mismatch — legacy/SDSC card (or no v2 support) ::", PS);
+                }
+                echo == 0x1aa
+            }
+            Err(int) => {
+                serial_println!(
+                    "{}   M2: CMD8 no response (INTERRUPT={:#010x}) — SD v1.x card or no v2 support; continuing without HCS ::",
+                    PS, int
+                );
+                reset_cmd_dat(base);
+                false
+            }
+        };
         // 8. ACMD41 loop (bounded ~1 s): CMD55 (APP_CMD) then ACMD41 (SD_SEND_OP_COND) with HCS + the
         //    3.3 V window, until power-up-busy (RESP0[31]) clears. ccs = RESP0[30].
+        //    HCS (bit 30) is asserted ONLY when CMD8 was answered — a v1.x card must not be told the host
+        //    supports high capacity. The loop paces itself (the card is allowed to stay busy for up to a
+        //    second; hammering it back-to-back is not required and upsets some cards) and counts its
+        //    rounds so the witness says how long power-up actually took.
+        let acmd41_arg = if sdhc_capable { 0x40ff_8000 } else { 0x00ff_8000 };
         let acmd41_deadline = deadline_ms(ACMD41_TIMEOUT_MS);
         let mut ocr;
+        let mut rounds = 0u32;
         loop {
-            send_command(base, cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0).ok()?;
-            send_command(base, cmd(41) | CMD_RESP_48, 0x40ff_8000).ok()?;
+            rounds += 1;
+            let first = rounds == 1; // one witness for the first round; the rest are summarised below
+            cmd_step_at(base, "CMD55 APP_CMD (before ACMD41)", cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0, first)?;
+            cmd_step_at(base, "ACMD41 SD_SEND_OP_COND", cmd(41) | CMD_RESP_48, acmd41_arg, first)?;
             ocr = read32(base, RESP0);
             if ocr & (1 << 31) != 0 {
                 break;
             }
             if expired(acmd41_deadline) {
-                serial_println!("{}   M2: ACMD41 power-up timed out (card never left busy) — STOP ::", PS);
+                serial_println!(
+                    "{}   M2: ACMD41 power-up timed out after {} rounds (card never left busy, last OCR {:#010x}) — STOP ::",
+                    PS, rounds, ocr
+                );
                 return None;
             }
-            core::hint::spin_loop();
+            delay_ms(5);
         }
         let block_addressing = ocr & (1 << 30) != 0; // ccs
+        serial_println!(
+            "{}   M2: ACMD41 power-up complete in {} round(s) — OCR {:#010x} (CCS={}) ::",
+            PS, rounds, ocr, block_addressing as u8
+        );
 
         // 9. CMD2 ALL_SEND_CID (R2) -> identification state. Decode + print the CID.
-        send_command(base, cmd(2) | CMD_RESP_136 | CMD_CRCCHK, 0).ok()?;
+        cmd_step(base, "CMD2 ALL_SEND_CID", cmd(2) | CMD_RESP_136 | CMD_CRCCHK, 0)?;
         let cid = read_resp(base);
         print_cid(&cid);
 
         // 10. CMD3 SEND_RELATIVE_ADDR (R6) -> rca in RESP0[31:16].
-        send_command(base, cmd(3) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0).ok()?;
+        cmd_step(base, "CMD3 SEND_RELATIVE_ADDR", cmd(3) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0)?;
         let rca = read32(base, RESP0) >> 16;
         let rca_arg = rca << 16;
 
         // 11. CMD9 SEND_CSD (R2) — card must be in stand-by (post-CMD3, pre-CMD7). Parse capacity.
-        send_command(base, cmd(9) | CMD_RESP_136 | CMD_CRCCHK, rca_arg).ok()?;
+        cmd_step(base, "CMD9 SEND_CSD", cmd(9) | CMD_RESP_136 | CMD_CRCCHK, rca_arg)?;
         let csd = read_resp(base);
         let csd_structure = r2_bits(&csd, 127, 126);
         let (num_blocks, csd_version) = if csd_structure == 1 {
@@ -444,9 +583,9 @@ mod metal {
         );
 
         // 12. CMD7 SELECT_CARD (R1b) -> transfer state.
-        send_command(base, cmd(7) | CMD_RESP_48_BUSY | CMD_CRCCHK | CMD_IXCHK, rca_arg).ok()?;
+        cmd_step(base, "CMD7 SELECT_CARD", cmd(7) | CMD_RESP_48_BUSY | CMD_CRCCHK | CMD_IXCHK, rca_arg)?;
         // 13. CMD16 SET_BLOCKLEN 512 (R1; SDSC semantics, harmless on SDHC where 512 is fixed).
-        send_command(base, cmd(16) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 512).ok()?;
+        cmd_step(base, "CMD16 SET_BLOCKLEN 512", cmd(16) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 512)?;
         // 14. Raise to default transfer clock (<= 25 MHz). 1-bit bus (4-bit/HS deferred — quirk note).
         if !set_clock(base, base_hz, 25_000_000) {
             serial_println!("{}   M2: could not raise to 25 MHz transfer clock — STOP ::", PS);
@@ -567,6 +706,178 @@ mod metal {
             return "FAT boot sector (jump + FAT type string; no 0x55AA)";
         }
         "unknown (no recognised signature)"
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // TEGRA-SDBLK — the READ surface the block layer consumes (orin-unafs-root.md §3 item 1)
+    //
+    // Until this section the recon was a closed loop: it identified the card, read sector 0, printed what
+    // it saw, and told nobody. `drivers::block` could not reach the card at all — every SD arm in it is
+    // `cfg(all(target_arch = "aarch64", feature = "baremetal"))`, i.e. the Pi's emmc2 — so on the Orin
+    // `block::read_block` has always meant the USB stick and nothing else, and `unafs`'s
+    // `SdSectorDevice::open()` could only answer `NoStorage`. This section is the seam that ends that,
+    // and it is deliberately the SMALLEST one that can: a latched identity, a sector count, and a read.
+    //
+    // ### READ ONLY, and structurally so
+    // Nothing below issues anything but CMD17. The write path (CMD24/CMD25) exists in this file only
+    // behind the `sdmmc_arm` ladder and the `install_target` gate above it, and this section neither
+    // calls into that ladder nor is callable from it. The block layer's own `write_*_tegra_sd` entry
+    // points REFUSE unconditionally, in every cfg — so publishing the card as a block backend cannot,
+    // by construction, add a writer to the Orin's card.
+    //
+    // ### Why a private CMD17 here instead of reusing `read_block_at`
+    // `read_block_at` (the generalised single-block read) lives INSIDE the `sdmmc_arm` region and is
+    // gated on it, because rung 2 deliberately kept the rung-1 read path untouched. Un-gating it would
+    // edit the armed ladder for the convenience of an unarmed consumer, which is exactly the direction
+    // that section's law forbids. `read_block_ro` below is therefore its unarmed twin: same command,
+    // same bounded waits, same W1C discipline, reached only from this section. The duplication is the
+    // price of leaving the ladder alone, and it is named rather than hidden.
+
+    /// The published card identity — everything a sector read needs, as plain Copy data so it does not
+    /// depend on `Card`'s `install_target`-gated derives. `None` until the census publishes (see
+    /// `publish_block_backend`), which it only does after M1/M2/M3 have all succeeded.
+    #[derive(Clone, Copy)]
+    struct SdBlk {
+        base: u64,
+        block_addressing: bool,
+        num_blocks: u64,
+    }
+
+    /// The one published card. The lock is held ACROSS each transfer, not merely to snapshot the
+    /// identity: the SDHCI register file is a single shared resource, so two overlapping readers would
+    /// interleave BLKSIZECNT/CMDTM/INTERRUPT writes on the same controller. Serialising here means the
+    /// block layer above needs no rule of its own. Nothing in this file locks it re-entrantly.
+    static SD_BLK: spin::Mutex<Option<SdBlk>> = spin::Mutex::new(None);
+
+    /// Read one arbitrary block `lba` via polled single-block CMD17 into `buf` (512 bytes). READ-ONLY —
+    /// the only card command it can issue is CMD17. Returns whether the block was read. The unarmed twin
+    /// of `read_block_at` (see the section header for why it is not that function).
+    fn read_block_ro(base: u64, block_addressing: bool, lba: u64, buf: &mut [u8; 512]) -> bool {
+        // SDSC (byte addressing) can only express a 32-bit byte offset, so it tops out at 4 GiB; the
+        // multiply is checked rather than wrapped, and an out-of-range LBA is a refusal, not a read of
+        // some other sector.
+        let arg = if block_addressing {
+            if lba > u32::MAX as u64 {
+                return false;
+            }
+            lba as u32
+        } else {
+            match lba.checked_mul(512) {
+                Some(b) if b <= u32::MAX as u64 => b as u32,
+                _ => return false,
+            }
+        };
+
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512); // one block, 512 bytes
+        if send_command(
+            base,
+            cmd(17) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA | CMD_DAT_DIR_READ,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   SDBLK: CMD17 (READ LBA {}) failed at the link layer ::", PS, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   SDBLK: CMD17 LBA {} R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        if !wait_set(base, INTERRUPT, INT_READ_RDY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: LBA {} read buffer never became ready (READ_RDY timeout) ::", PS, lba);
+            return false;
+        }
+        write32(base, INTERRUPT, INT_READ_RDY); // W1C
+        for i in 0..128usize {
+            let word = read32(base, DATA);
+            let off = i * 4;
+            buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: LBA {} transfer-complete timeout after buffer read ::", PS, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int); // W1C everything we saw
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   SDBLK: LBA {} data-transfer error status {:#010x} ::", PS, lba, int);
+            return false;
+        }
+        true
+    }
+
+    /// The card's sector count as published to the block layer, or 0 if no card was published this boot.
+    /// 0 is the honest "there is nothing here" answer — the block layer refuses to register a zero-sector
+    /// device, and `unafs`'s size preference reads this the same way.
+    pub fn tegra_sd_card_blocks() -> u64 {
+        SD_BLK.lock().map(|c| c.num_blocks).unwrap_or(0)
+    }
+
+    /// Read one 512-byte sector into `buf` — the primitive `drivers::block::read_block_tegra_sd` calls.
+    /// Bounds are re-checked HERE against the card's own capacity as well as at the block layer, because
+    /// this function is what actually names an LBA to the card and must not depend on a caller's care.
+    pub fn tegra_sd_read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, crate::drivers::block::BlockError> {
+        use crate::drivers::block::BlockError;
+        if buf.len() < 512 {
+            return Err(BlockError::Io);
+        }
+        let guard = SD_BLK.lock();
+        let card = guard.ok_or(BlockError::NotReady)?;
+        if lba >= card.num_blocks {
+            return Err(BlockError::BadLba);
+        }
+        let mut sec = [0u8; 512];
+        if !read_block_ro(card.base, card.block_addressing, lba, &mut sec) {
+            return Err(BlockError::Io);
+        }
+        buf[..512].copy_from_slice(&sec);
+        Ok(512)
+    }
+
+    /// Read `count` consecutive sectors. This rung has no unarmed multi-block (CMD18) primitive — the
+    /// counted read in this file is `install_target`-gated — so it LOOPS the proven CMD17, producing
+    /// byte-for-byte the card traffic a per-sector caller would, in the same order. A CMD18 path can
+    /// replace the body later with no change above the seam. A short read is an error, never a silent
+    /// prefix: the one failure mode a filesystem above has no way to notice.
+    pub fn tegra_sd_read_blocks_512(
+        lba: u64,
+        count: usize,
+        buf: &mut [u8],
+    ) -> Result<usize, crate::drivers::block::BlockError> {
+        use crate::drivers::block::BlockError;
+        if buf.len() < count * 512 {
+            return Err(BlockError::Io);
+        }
+        for i in 0..count {
+            let off = i * 512;
+            tegra_sd_read_block_512(lba + i as u64, &mut buf[off..off + 512])?;
+        }
+        Ok(count * 512)
+    }
+
+    /// Publish the censused card to `drivers::block` as its own handle-less backend slot, and latch the
+    /// identity the read functions above use.
+    ///
+    /// Called from exactly one place — the END of `sdmmc_census`, after M1 (window mapped, live SDHCI),
+    /// M2 (card identified: CID/CSD/RCA, capacity decoded) and M3 (sector 0 actually read) have ALL
+    /// succeeded. That ordering is the whole trust argument, and it is the same one SDHC-4b makes on
+    /// x86: registration is the statement "a filesystem may trust this device", so it is only ever made
+    /// about a card whose read path this boot has already exercised and reported on. Card-detect is not
+    /// guessed at here — `identify` refuses an absent card, and M3 refuses one that cannot serve a read,
+    /// so reaching this line IS the card-present proof.
+    fn publish_block_backend(base: u64, card: &Card) {
+        *SD_BLK.lock() = Some(SdBlk {
+            base,
+            block_addressing: card.block_addressing,
+            num_blocks: card.num_blocks,
+        });
+        if !crate::drivers::block::register_tegra_sd(card.num_blocks, card.block_addressing) {
+            // The block layer refused (zero sectors). Retract the latch rather than leave a read surface
+            // pointing at a device the registry does not admit exists.
+            *SD_BLK.lock() = None;
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1123,6 +1434,526 @@ mod metal {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // TEGRA-UNAFS-FMT (M4.2 / M4.3 / M4.4) — the NATIVE volume on partition 2.
+    //
+    // The installer wrote two GPT partitions from its first rung and only ever populated the first
+    // (`UNAOS-ESP`, FAT32). `UNAOS-DATA` was carved and then left raw. This section closes that gap:
+    // a `unafs::storage::BlockDevice` over the SAME armed CMD24/CMD25 primitives the rest of the
+    // installer writes through, a sizing policy that keeps the volume's in-RAM refcount map inside
+    // the kernel heap, and a pre-write refusal that fires BEFORE the GPT is committed.
+    //
+    // ## Why this bridge does NOT go through `drivers::block`
+    //
+    // `drivers::block::write_block_tegra_sd` refuses in EVERY cfg by design — registering the card as
+    // a block backend must not open a fourth door past the `sdmmc` → `sdmmc_arm` → `install_target`
+    // ladder, and that refusal propagates into `fs::unafs`'s `handle_write(TegraSd)` arm and into
+    // `fs::fat`. Nothing here weakens it: this device is a PRIVATE adapter over `SdInstallTarget`,
+    // constructed only inside `install_flow`, never registered as a block backend, and compiled out
+    // entirely without `install_target`. The card's only write door is still the three-gate ladder.
+    //
+    // ## The sizing constraint (M4.3), derived
+    //
+    // `RefMap::try_new(block_count)` holds TWO `Vec<u32>` views (current + frozen) = **8 bytes per
+    // 4096 B volume block**, and `UnaFS::mount` re-derives that size from the SUPERBLOCK's
+    // `block_count`, not from the partition span — which is exactly what makes a capped volume inside
+    // a larger partition mount correctly later.
+    //
+    // On the bench card (62,333,952 sectors) the GPT above yields `UNAOS-DATA` = LBA 133,120 ..
+    // 62,333,918 = 62,200,799 sectors = 7,775,099 whole blocks. A full-span volume would therefore
+    // need 62,200,792 B ≈ **59.3 MiB** of refmap against an aarch64 `allocator::HEAP_SIZE` of 48 MiB
+    // (50,331,648 B) — **1.24× the entire heap**. Format and mount would BOTH fail.
+    //
+    // So the volume is capped at [`UNAFS_CAP_BLOCKS`] = 512 MiB = 131,072 blocks → 1,048,576 B =
+    // 1 MiB of refmap = 2.0 % of the heap. The cap is applied AT THE ADAPTER (`block_count` on the
+    // device below), not by carving a third GPT entry — `install/gpt.rs` is a shared file.
+    //
+    // ### Why 512 MiB and not something larger
+    //
+    // The cap is not only a heap budget — it sets the RECURRING cost of the volume on every later
+    // boot, and it picks which refcount-map SHAPE the card carries:
+    //
+    // * **Boot-path read cost.** `main.rs`'s ORIN-UNAFS-ROOT rung-4 probe-mount is gated on the
+    //   `sdmmc` feature, NOT on `install_target`, so it mounts this volume on EVERY sdmmc boot.
+    //   `UnaFS::mount` → `load_committed` reads the refmap index plus every refmap LEAF, and that
+    //   path runs through `unafs::adapter::BlockAdapter`, whose `read_block` issues EIGHT separate
+    //   512 B `read_sector` calls per 4096 B block (it has no multi-block door — unlike
+    //   [`SdUnafsDevice`] below, which sits on `SdInstallTarget`'s CMD18/CMD25 path). Leaves scale
+    //   as `block_count / 1024`: at 512 MiB that is 128 leaves + 1 index ≈ 1,032 polled CMD17
+    //   transfers at EL2 per boot; at 4 GiB it would be 1,024 leaves + 1 index + 2 mid blocks
+    //   ≈ 8,216. An 8× standing tax on every boot for capacity nothing uses yet.
+    // * **Refcount-map shape.** 131,072 ≤ `superblock::MAX_BLOCK_COUNT_ONE_LEVEL` (524,288), so the
+    //   volume is SINGLE-LEVEL: one index block of leaf pointers, the shape v3/v4 always had and the
+    //   shape every existing volume in the tree uses. A 4 GiB cap crosses that line and would put the
+    //   two-level index-of-indexes path (v5, host-tested only) on metal for the first time, on the
+    //   boot path, on the same landing that first writes the volume at all. The const assertion under
+    //   [`UNAFS_CAP_BLOCKS`] holds the single-level property structurally rather than by comment.
+    //
+    // 512 MiB is far more space than the native volume has any consumer for today, and the cap is a
+    // POLICY number in one place: raising it is a one-line change once a consumer and a multi-block
+    // read path exist.
+    //
+    // `UnaFS::format` does refuse a too-large volume cleanly (`StorageError::AllocRefused` out of
+    // `RefMap::try_new`), but it would do so AFTER the GPT and the FAT32 ESP had already been
+    // written — a half-installed card. [`unafs_sizing_guard`] therefore runs the same arithmetic
+    // BEFORE the first byte of the GPT, on a whole-card upper bound, and refuses with a named witness
+    // line while the card is still untouched. What that gives is an ORDERING guarantee (the refusal
+    // lands before the first write), NOT a proof that the later format cannot fail — see the guard's
+    // own docblock for exactly what it does and does not establish.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// 512 B sectors per 4096 B UnaFS block (8) — the crate's own constant, bound locally so the
+    /// arithmetic in this section reads without a jump.
+    #[cfg(feature = "install_target")]
+    const UNAFS_SECTORS_PER_BLOCK: u64 = ::unafs::adapter::SECTORS_PER_BLOCK;
+
+    /// M4.3 — the volume SIZING CAP in 4096 B blocks: 512 MiB (131,072 blocks). See the section
+    /// header for the full derivation; the short form is three numbers. The in-RAM refcount map costs
+    /// [`UNAFS_REFMAP_BYTES_PER_BLOCK`] per volume block against a 48 MiB aarch64 heap, so a
+    /// full-span volume on the bench card would need 1.24× the whole heap (at the cap the map is
+    /// 1 MiB = 2.0 %). The rung-4 probe-mount re-reads every refmap leaf on EVERY sdmmc boot through
+    /// a single-sector adapter, so leaf count is a per-boot cost (128 leaves here, 1,024 at 4 GiB).
+    /// And 131,072 keeps the volume inside `MAX_BLOCK_COUNT_ONE_LEVEL`, i.e. single-level.
+    ///
+    /// A card whose data partition is SMALLER than the cap gets the whole partition.
+    #[cfg(feature = "install_target")]
+    const UNAFS_CAP_BLOCKS: u64 = 512 * 1024 * 1024 / ::unafs::storage::BLOCK_SIZE;
+
+    /// The cap in MiB — printed by the witness lines, so the number an operator reads and the number
+    /// the code enforces are the same expression.
+    #[cfg(feature = "install_target")]
+    const UNAFS_CAP_MIB: u64 = UNAFS_CAP_BLOCKS * ::unafs::storage::BLOCK_SIZE / (1024 * 1024);
+
+    /// The SINGLE-LEVEL property, held structurally. A volume at or under
+    /// `superblock::MAX_BLOCK_COUNT_ONE_LEVEL` (524,288 blocks = 2 GiB) uses one refmap index block
+    /// of leaf pointers; past it the map becomes a two-level index-of-indexes (v5). Raising
+    /// [`UNAFS_CAP_BLOCKS`] past that line is a real decision — it puts a code path this platform has
+    /// never run on the boot path — so it must break the build rather than pass silently.
+    #[cfg(feature = "install_target")]
+    const _: () = assert!(
+        UNAFS_CAP_BLOCKS <= ::unafs::superblock::MAX_BLOCK_COUNT_ONE_LEVEL,
+        "UNAFS_CAP_BLOCKS past MAX_BLOCK_COUNT_ONE_LEVEL would make the p2 volume two-level"
+    );
+
+    /// In-RAM refcount-map cost per volume block: TWO `Vec<u32>` views (`current` + `frozen`) in
+    /// `unafs::refmap::RefMap`, i.e. 4 + 4 bytes. This is the number the whole sizing policy turns on.
+    #[cfg(feature = "install_target")]
+    const UNAFS_REFMAP_BYTES_PER_BLOCK: u64 = 8;
+
+    /// The share of `allocator::HEAP_SIZE` the refcount map is allowed to claim. The map is a
+    /// permanent resident of a mounted volume and the heap serves everything else too, so a quarter
+    /// is the stated ceiling; at the 512 MiB cap the map takes 2.0 %, far inside it.
+    #[cfg(feature = "install_target")]
+    const UNAFS_REFMAP_HEAP_PERCENT: u64 = 25;
+
+    /// The smallest volume `UnaFS::format` can actually build, in 4096 B blocks — MEASURED against
+    /// this build of the crate, not guessed: a host harness formatted every size from 1 upward and
+    /// 12 is the first that both formats and mounts back. 1–2 blocks fail
+    /// `Superblock::validate` ("volume too small", its own floor is 3) and 3–11 blocks fail the
+    /// format commit itself with `NoSpace` — the format writes 12 blocks before it can commit
+    /// generation 1 (superblock, root area, 4 reserved inodes, 2 system-object data blocks, imap
+    /// index + leaf, refmap index + leaf).
+    ///
+    /// This is a SKIP threshold, not a refusal: below it the card simply gets no native volume, and
+    /// the install continues. `install/gpt.rs` really can emit a data partition this small —
+    /// a card of exactly 133,154 sectors yields `data_first == data_last == 133,120`, one sector,
+    /// zero blocks — and before this floor existed that card installed fine until this rung turned
+    /// its 0-block volume into `Superblock::new(0).validate()` and failed the whole install.
+    #[cfg(feature = "install_target")]
+    const UNAFS_MIN_VOLUME_BLOCKS: u64 = 12;
+
+    /// The `unafs_sizing_guard` gate tags. Each witness line carries a UNIQUE token so a boot-spec
+    /// REQUIRE pattern can name exactly one of the two calls; the parenthesised prose is for the
+    /// operator, the `SIZING-GATE-n` token is for the matcher.
+    #[cfg(feature = "install_target")]
+    const UNAFS_GATE_PRE_GPT: &str = "SIZING-GATE-1 (pre-GPT whole-card upper bound)";
+    #[cfg(feature = "install_target")]
+    const UNAFS_GATE_P2: &str = "SIZING-GATE-2 (p2 UNAOS-DATA span)";
+
+    /// `n/d` as (whole percent, tenths digit) — integer-only, for witness lines that must print a
+    /// percentage a comment can quote EXACTLY. Plain `n * 100 / d` truncates (the 512 MiB cap's
+    /// 2.083 % printed as "2", which no comment saying "~2 %" would match character for character);
+    /// one decimal place makes the printed value and the documented value the same string.
+    #[cfg(feature = "install_target")]
+    fn unafs_pct_tenths(n: u64, d: u64) -> (u64, u64) {
+        if d == 0 {
+            return (0, 0);
+        }
+        let tenths = n.saturating_mul(1000) / d;
+        (tenths / 10, tenths % 10)
+    }
+
+    /// M4.3 — the PRE-WRITE sizing bound, and the one place the policy arithmetic lives.
+    ///
+    /// Returns the block count a UnaFS volume would be given for a span of `span_sectors`:
+    /// `min(span_sectors / 8, UNAFS_CAP_BLOCKS)`. Refuses — with a named witness line and WITHOUT
+    /// touching the card — when the resulting refcount map would exceed
+    /// [`UNAFS_REFMAP_HEAP_PERCENT`] of the kernel heap.
+    ///
+    /// Called TWICE on purpose. First from the top of [`install_flow`] with the whole-card capacity,
+    /// which is an UPPER BOUND on any partition inside it, so the refusal lands before the GPT write
+    /// rather than on a half-installed card. Second at the real partition span, where the number it
+    /// returns is the volume's actual `block_count`. `gate` names which call is speaking, and each
+    /// tag is unique so a spec pattern can address one call and not the other.
+    ///
+    /// ## What this guard does NOT prove
+    ///
+    /// Passing the first call does **not** prove the later format cannot fail for heap reasons, and
+    /// no wording here should suggest it does. Two independent reasons:
+    ///
+    /// * The comparison is against `allocator::HEAP_SIZE` — the heap's TOTAL size, a compile-time
+    ///   constant — never against the heap's FREE bytes at the moment of the format. Everything the
+    ///   boot already allocated is invisible to it.
+    /// * The allocator is a `linked_list_allocator::Heap`. `RefMap::try_new` needs TWO CONTIGUOUS
+    ///   multi-MiB runs (`current` and `frozen`), and fragmentation can refuse a 1 MiB contiguous
+    ///   request with far more than 1 MiB free.
+    ///
+    /// What it DOES give is an ordering guarantee and a static bound: an over-large geometry is
+    /// rejected while the card is still exactly as it was found, and the cap keeps the request small
+    /// relative to the heap. A heap-pressure failure at format time remains possible and is handled
+    /// where it lands — `UnaFS::format` returns `AllocRefused` and [`format_unafs_volume`] fails the
+    /// install with a named line, fail-closed.
+    ///
+    /// With [`UNAFS_CAP_BLOCKS`] at 131,072 the refusal branch is currently UNREACHABLE by
+    /// arithmetic: `planned ≤ 131,072` ⇒ `refmap ≤ 1,048,576 B` against a limit of 12,582,900 B, so
+    /// it can only fire if `allocator::HEAP_SIZE` ever drops below ~4,194,400 B. It is kept as the
+    /// future-proofing bound it is — the cap and the heap size are independent knobs, and this is
+    /// what makes raising either one fail loudly instead of silently over-committing RAM.
+    ///
+    /// `InstallError::NoSpace` is the refusal code: this file's lane cannot add a variant to the
+    /// shared `install::InstallError`, and "no space for the request" is the closest true statement —
+    /// the space that is missing is the heap's, not the card's, and the witness line says so.
+    #[cfg(feature = "install_target")]
+    fn unafs_sizing_guard(span_sectors: u64, gate: &str) -> Result<u64, crate::install::InstallError> {
+        let planned = core::cmp::min(span_sectors / UNAFS_SECTORS_PER_BLOCK, UNAFS_CAP_BLOCKS);
+        let refmap = planned.saturating_mul(UNAFS_REFMAP_BYTES_PER_BLOCK);
+        let heap = crate::allocator::HEAP_SIZE as u64;
+        let limit = heap / 100 * UNAFS_REFMAP_HEAP_PERCENT;
+        let (pct, tenth) = unafs_pct_tenths(refmap, heap);
+        if refmap > limit {
+            serial_println!(
+                "{}   INSTALL: UNAFS {} => REFUSED — {} blk would need {} B of in-RAM refmap ({} B/blk) = {}.{}% of the {} B kernel heap, over the {} B limit ({}%); NOTHING was written to the card ::",
+                PS, gate, planned, refmap, UNAFS_REFMAP_BYTES_PER_BLOCK, pct, tenth, heap,
+                limit, UNAFS_REFMAP_HEAP_PERCENT
+            );
+            return Err(crate::install::InstallError::NoSpace);
+        }
+        serial_println!(
+            "{}   INSTALL: UNAFS {} => OK — cap {} blk ({} MiB), planned {} blk, refmap {} B = {}.{}% of the {} B heap (limit {}% = {} B) ::",
+            PS, gate, UNAFS_CAP_BLOCKS, UNAFS_CAP_MIB, planned, refmap, pct, tenth, heap,
+            UNAFS_REFMAP_HEAP_PERCENT, limit
+        );
+        Ok(planned)
+    }
+
+    /// M4.2 — a `unafs::storage::BlockDevice` over the armed Tegra SD write path.
+    ///
+    /// One 4096 B UnaFS block is the eight contiguous 512 B sectors at `base_lba + id * 8`, exactly
+    /// as `unafs::adapter::BlockAdapter` maps them; `block_count` bounds the exposed volume and is
+    /// the CAPPED figure (see the section header), so the volume is smaller than the partition that
+    /// holds it by construction. All of the offset arithmetic is `checked_*`, so a hostile or corrupt
+    /// span can never wrap into an in-bounds sector.
+    ///
+    /// The I/O goes through [`SdInstallTarget`]'s `InstallTarget` methods, which means a whole-block
+    /// access is ONE 8-block CMD25/CMD18 multi-block transfer and a 512 B access is ONE CMD24/CMD17
+    /// single-block command. Nothing here is registered as a `drivers::block` backend.
+    #[cfg(feature = "install_target")]
+    struct SdUnafsDevice<'t, 'c> {
+        t: &'t mut SdInstallTarget<'c>,
+        /// The partition's first LBA — every block id is relative to this.
+        base_lba: u64,
+        /// The volume's block count (the CAPPED figure, not the partition's).
+        block_count: u64,
+    }
+
+    #[cfg(feature = "install_target")]
+    impl SdUnafsDevice<'_, '_> {
+        /// Absolute LBA of `sector` within block `id`, fully bound-checked.
+        fn lba_for(&self, id: u64, sector: u64) -> Result<u64, ::unafs::storage::Error> {
+            if id >= self.block_count {
+                return Err(::unafs::storage::Error::OutOfBounds(id));
+            }
+            id.checked_mul(UNAFS_SECTORS_PER_BLOCK)
+                .and_then(|s| s.checked_add(sector))
+                .and_then(|s| self.base_lba.checked_add(s))
+                .ok_or(::unafs::storage::Error::OutOfBounds(id))
+        }
+
+        fn dev_read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), crate::install::InstallError> {
+            use crate::install::InstallTarget;
+            self.t.read_sectors(lba, buf)
+        }
+
+        fn dev_write(&mut self, lba: u64, buf: &[u8]) -> Result<(), crate::install::InstallError> {
+            use crate::install::InstallTarget;
+            self.t.write_sectors(lba, buf)
+        }
+    }
+
+    #[cfg(feature = "install_target")]
+    impl ::unafs::storage::BlockDevice for SdUnafsDevice<'_, '_> {
+        fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), ::unafs::storage::Error> {
+            if buf.len() as u64 != ::unafs::storage::BLOCK_SIZE {
+                return Err(::unafs::storage::Error::BadBlockSize(
+                    buf.len(),
+                    ::unafs::storage::BLOCK_SIZE,
+                ));
+            }
+            let lba = self.lba_for(id, 0)?;
+            self.dev_read(lba, buf).map_err(|e| {
+                ::unafs::storage::Error::Io(alloc::format!("tegra sd read blk {} @LBA {}: {:?}", id, lba, e))
+            })
+        }
+
+        fn write_block(&mut self, id: u64, buf: &[u8]) -> Result<(), ::unafs::storage::Error> {
+            if buf.len() as u64 != ::unafs::storage::BLOCK_SIZE {
+                return Err(::unafs::storage::Error::BadBlockSize(
+                    buf.len(),
+                    ::unafs::storage::BLOCK_SIZE,
+                ));
+            }
+            let lba = self.lba_for(id, 0)?;
+            self.dev_write(lba, buf).map_err(|e| {
+                ::unafs::storage::Error::Io(alloc::format!("tegra sd write blk {} @LBA {}: {:?}", id, lba, e))
+            })
+        }
+
+        fn block_count(&self) -> u64 {
+            self.block_count
+        }
+
+        /// LOAD-BEARING NO-OP, for the same reason `fs::unafs`'s `SdSectorDevice::flush` is one:
+        /// every write below is SYNCHRONOUS-TO-MEDIUM. Both `write_block_at` (CMD24) and
+        /// `write_blocks_at` (CMD25) wait for `ST_DAT_INHIBIT` to clear — the card releasing DAT0
+        /// after its internal programming — before returning, so by the time the crate calls this as
+        /// its pre-root-flip barrier every fresh block is already on the card. The copy-on-write
+        /// guarantee ("the old tree or the new one, never a hybrid") rests on exactly that. If the
+        /// Tegra write path ever gains DMA-deferred completion or a write cache, this MUST become a
+        /// real drain.
+        fn flush(&mut self) -> Result<(), ::unafs::storage::Error> {
+            Ok(())
+        }
+
+        /// The K8a ROOT-FLIP primitive: ONE real 512 B sector write to the medium.
+        ///
+        /// The trait's default is a read-modify-write of the whole 4096 B block, which would be a
+        /// CORRECTNESS BUG here — the commit's atomic point must be a single-sector write, and an
+        /// RMW would put the other seven sectors of the root block back on the card alongside it.
+        /// The single-block CMD24 path serves this natively (a 512 B `write_sectors` call takes the
+        /// `n == 1` arm of [`SdInstallTarget::write_sectors`]), so the override is exact rather than
+        /// emulated — the same property `BlockAdapter::write_sector_in_block` provides on the pi.
+        fn write_sector_in_block(
+            &mut self,
+            id: u64,
+            sector: usize,
+            buf: &[u8],
+        ) -> Result<(), ::unafs::storage::Error> {
+            if buf.len() as u64 != ::unafs::adapter::SECTOR_SIZE {
+                return Err(::unafs::storage::Error::BadBlockSize(
+                    buf.len(),
+                    ::unafs::adapter::SECTOR_SIZE,
+                ));
+            }
+            if sector as u64 >= UNAFS_SECTORS_PER_BLOCK {
+                return Err(::unafs::storage::Error::OutOfBounds(id));
+            }
+            let lba = self.lba_for(id, sector as u64)?;
+            self.dev_write(lba, buf).map_err(|e| {
+                ::unafs::storage::Error::Io(alloc::format!(
+                    "tegra sd root-flip blk {} sec {} @LBA {}: {:?}", id, sector, lba, e
+                ))
+            })
+        }
+    }
+
+    /// M4.4 — format partition 2 (`UNAOS-DATA`) as a native UnaFS volume, then PROVE it off the card
+    /// by MOUNTING it.
+    ///
+    /// Returns the volume's block count, or 0 when the GPT layout carried no usable data partition
+    /// (see [`UNAFS_MIN_VOLUME_BLOCKS`] — a span too small for a volume is an honest skip, never an
+    /// install failure).
+    ///
+    /// ## The proof is a mount
+    ///
+    /// The static superblock is re-read first, for a precise diagnostic (magic / parse /
+    /// `block_count`) at the cost of one block. But the guarantee this step claims is that the
+    /// volume WORKS, and re-reading two of the ~139 blocks the format wrote cannot carry that claim:
+    /// it never touches the inode map, the refcount-map index, or any of its leaves. So the step
+    /// then calls `UnaFS::mount` on a fresh handle over the same span. That reads and bound-validates
+    /// the root record, the imap index and every imap leaf, the refmap index and every refmap leaf,
+    /// and rebuilds the refcount map from what is actually on the card — and `ls(ROOT_INODE_ID)`
+    /// afterwards walks the root directory through that reconstructed state. A volume that mounts
+    /// and lists is proven; a volume whose superblock parses is not.
+    ///
+    /// The mount is READ-ONLY here by construction: `UnaFS::mount` writes only via `reclaim_drain`,
+    /// which returns early on an empty reclaim queue, and a freshly formatted volume's queue is empty
+    /// by definition. It costs the ~1 MiB of heap the refcount map takes at the cap — the same 1 MiB
+    /// `drop(fs)` released one statement earlier, and the same 1 MiB [`unafs_sizing_guard`] licensed.
+    ///
+    /// The whole verification runs THROUGH THE SAME TARGET the format wrote through, so what is
+    /// checked is what is on the medium, not what is in RAM.
+    #[cfg(feature = "install_target")]
+    fn format_unafs_volume(
+        t: &mut SdInstallTarget,
+        layout: &crate::install::gpt::GptLayout,
+    ) -> Result<u64, crate::install::InstallError> {
+        use ::unafs::storage::BlockDevice as _;
+        use crate::install::InstallError;
+
+        // ONE skip clause, on the BLOCK COUNT rather than on `data_first_lba` alone. `install/gpt.rs`
+        // can carve a data partition of a single sector — a card of exactly 133,154 sectors puts
+        // `data_first == data_last == 133,120`, since the ESP takes its full 64 MiB and the 1 MiB
+        // alignment lands the data start on the last usable LBA — and 1 sector is 0 whole blocks.
+        // Testing only `data_first_lba == 0` let that card through to a 0-block volume, where
+        // `UnaFS::format` falls back to `size_mb` (also 0) and `Superblock::new(0).validate()` fails
+        // "volume too small": a card that installed cleanly before this rung existed would fail its
+        // whole install because of it. Everything under the floor is skipped, and the install goes on.
+        let part_sectors = if layout.data_first_lba == 0 || layout.data_last_lba < layout.data_first_lba
+        {
+            0
+        } else {
+            layout.data_last_lba - layout.data_first_lba + 1
+        };
+        let part_blocks = part_sectors / UNAFS_SECTORS_PER_BLOCK;
+        if part_blocks < UNAFS_MIN_VOLUME_BLOCKS {
+            serial_println!(
+                "{}   INSTALL: UNAFS p2 SKIPPED — the GPT layout's UNAOS-DATA span is {} sectors = {} blk, under the {} blk floor a UnaFS format needs; p2 left raw, the install continues ::",
+                PS, part_sectors, part_blocks, UNAFS_MIN_VOLUME_BLOCKS
+            );
+            return Ok(0);
+        }
+
+        // The cap is applied HERE, at the adapter's block_count — not by carving a third GPT entry
+        // (`install/gpt.rs` is a shared file). The partition keeps its full span; the volume inside
+        // it is smaller, and `UnaFS::mount` sizes its refmap from the SUPERBLOCK, so that is sound.
+        let blocks = unafs_sizing_guard(part_sectors, UNAFS_GATE_P2)?;
+        let refmap_bytes = blocks * UNAFS_REFMAP_BYTES_PER_BLOCK;
+        let volume_mib = blocks * ::unafs::storage::BLOCK_SIZE / (1024 * 1024);
+        // Say "CAPPED" only when the cap actually bit: on a card whose data partition is smaller than
+        // [`UNAFS_CAP_BLOCKS`] the volume spans the whole partition and nothing was capped.
+        if blocks < part_blocks {
+            serial_println!(
+                "{}   INSTALL: UNAFS formatting p2 UNAOS-DATA — LBA {}..{} = {} sectors = {} blk; volume CAPPED to {} blk ({} MiB), refmap {} B ::",
+                PS, layout.data_first_lba, layout.data_last_lba, part_sectors, part_blocks,
+                blocks, volume_mib, refmap_bytes
+            );
+        } else {
+            serial_println!(
+                "{}   INSTALL: UNAFS formatting p2 UNAOS-DATA — LBA {}..{} = {} sectors = {} blk; volume UNCAPPED at the full {} blk ({} MiB), refmap {} B ::",
+                PS, layout.data_first_lba, layout.data_last_lba, part_sectors, part_blocks,
+                blocks, volume_mib, refmap_bytes
+            );
+        }
+
+        // The format itself. Scoped so the mount is dropped (and its device borrow released) before
+        // the verification re-opens the same span on a fresh handle.
+        {
+            let dev = SdUnafsDevice {
+                t: &mut *t,
+                base_lba: layout.data_first_lba,
+                block_count: blocks,
+            };
+            // `size_mb` is only consulted when the device reports 0 blocks. Ours cannot: the
+            // [`UNAFS_MIN_VOLUME_BLOCKS`] floor above already returned for anything under 12, so
+            // `block_count` here is >= 12 by construction. (It is exactly the fallback this file used
+            // to walk into — a 1-sector data partition gave 0 blocks AND `size_mb` 0, and
+            // `Superblock::new(0).validate()` failed the install.) Passed as the true figure so the
+            // call site does not read as a lie even though it is never consulted.
+            let size_mb = blocks * ::unafs::storage::BLOCK_SIZE / (1024 * 1024);
+            match ::unafs::UnaFS::format(dev, size_mb) {
+                Ok(fs) => drop(fs),
+                Err(e) => {
+                    serial_println!("{}   INSTALL: UNAFS format of p2 => FAIL ({:?}) ::", PS, e);
+                    return Err(InstallError::Io);
+                }
+            }
+        }
+
+        // ── Step 1: the static superblock, for a precise diagnostic ──
+        // One block. `UnaFS::mount` below re-does all of this, but it collapses every shape of
+        // failure into one `FileSystemError`; these three checks name which one it was.
+        let sb = {
+            let mut dev = SdUnafsDevice {
+                t: &mut *t,
+                base_lba: layout.data_first_lba,
+                block_count: blocks,
+            };
+            let mut blk0 = alloc::vec![0u8; ::unafs::storage::BLOCK_SIZE as usize];
+            if let Err(e) = dev.read_block(0, &mut blk0) {
+                serial_println!("{}   INSTALL: UNAFS superblock re-read => FAIL ({:?}) ::", PS, e);
+                return Err(InstallError::Io);
+            }
+            if blk0[..::unafs::superblock::MAGIC.len()] != ::unafs::superblock::MAGIC {
+                serial_println!(
+                    "{}   INSTALL: UNAFS superblock magic ABSENT at p2 block 0 => FAIL ::",
+                    PS
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+            let sb = match ::unafs::superblock::Superblock::from_bytes(&blk0) {
+                Ok(sb) => sb,
+                Err(e) => {
+                    serial_println!("{}   INSTALL: UNAFS superblock parse => FAIL ({:?}) ::", PS, e);
+                    return Err(InstallError::VerifyFailed);
+                }
+            };
+            if sb.block_count != blocks {
+                serial_println!(
+                    "{}   INSTALL: UNAFS superblock block_count {} != the {} blk formatted => FAIL ::",
+                    PS, sb.block_count, blocks
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+            sb
+        };
+
+        // ── Step 2: THE PROOF — mount the volume off the card ──
+        // Everything the format wrote that matters is read back here: the A/B root record (its
+        // checksum and its non-zero generation are `RootRecord::from_sector`'s own preconditions, so
+        // a mount that succeeds cannot be holding an uncommitted root — there is no separate
+        // generation check to make), the imap index and leaves, the refmap index and every refmap
+        // leaf, each bound-validated against the superblock's own `block_count`. `ls` then walks the
+        // root directory through the state that reconstruction produced.
+        let mut fs = match ::unafs::UnaFS::mount(SdUnafsDevice {
+            t: &mut *t,
+            base_lba: layout.data_first_lba,
+            block_count: blocks,
+        }) {
+            Ok(fs) => fs,
+            Err(e) => {
+                serial_println!(
+                    "{}   INSTALL: UNAFS p2 volume MOUNT-BACK => FAIL ({:?}) — the superblock parsed but the volume does not mount ::",
+                    PS, e
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+        };
+        let entries = match fs.ls(::unafs::superblock::ROOT_INODE_ID) {
+            Ok(v) => v.len(),
+            Err(e) => {
+                serial_println!(
+                    "{}   INSTALL: UNAFS p2 root directory listing => FAIL ({:?}) — the volume mounted but its root inode does not read ::",
+                    PS, e
+                );
+                return Err(InstallError::VerifyFailed);
+            }
+        };
+        let generation = fs.root_generation();
+        let free = fs.free_blocks();
+        // One mount at a time on this span, and the device borrow of `t` ends here.
+        drop(fs);
+
+        let heap = crate::allocator::HEAP_SIZE as u64;
+        let (pct, tenth) = unafs_pct_tenths(refmap_bytes, heap);
+        let refmap_leaves = blocks.div_ceil(::unafs::refmap::REFS_PER_LEAF);
+        serial_println!(
+            "{}   INSTALL: UNAFS p2 volume MOUNTED BACK off the card — v{} magic ok, {} blk ({} MiB) at LBA {}, refmap {} B ({}.{}% of the {} B heap) rebuilt from {} leaf blk + 1 index blk (single-level), root gen {}, {} free blk, root dir lists {} entries => UNAFS-VERIFIED ::",
+            PS, sb.version, sb.block_count, volume_mib, layout.data_first_lba,
+            refmap_bytes, pct, tenth, heap, refmap_leaves, generation, free, entries
+        );
+        Ok(blocks)
+    }
+
     /// The DEFERRED install entry point (ORIN-INSTALL-2). Called from the boot sequence AFTER the JB2b
     /// pump window has enumerated the USB boot stick as a block device — the position where the running
     /// system's real boot payload is readable (`drivers::block::info()` is Some). Consumes the card
@@ -1180,10 +2011,27 @@ mod metal {
 
         let mut t = SdInstallTarget { base, card };
         match install_flow(&mut t) {
-            Ok(n) => serial_println!(
-                "{} ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone({} files) verify => PASS ::",
-                PS, n
-            ),
+            Ok((n, unafs_blocks)) => {
+                // M4.4: the verdict names BOTH volumes — the ESP the clone populated and the native
+                // UnaFS volume on partition 2. A card whose data span is absent or below the format
+                // floor says so rather than reporting a zero-block volume as if it existed.
+                let p2 = if unafs_blocks == 0 {
+                    alloc::string::String::from(
+                        "p2 UNAOS-DATA = NO NATIVE VOLUME (span absent or below the format floor)",
+                    )
+                } else {
+                    alloc::format!(
+                        "p2 UNAOS-DATA = UnaFS v{} ({} blk / {} MiB, mounted back off the card)",
+                        ::unafs::superblock::VERSION,
+                        unafs_blocks,
+                        unafs_blocks * ::unafs::storage::BLOCK_SIZE / (1024 * 1024)
+                    )
+                };
+                serial_println!(
+                    "{} ORIN-INSTALL-2 SD install — gpt+zero+fat32+clone({} files)+unafs verify => PASS — p1 UNAOS-ESP = FAT32 ({} files sha-verified) · {} ::",
+                    PS, n, n, p2
+                );
+            }
             Err(e) => serial_println!("{} ORIN-INSTALL-2 SD install => FAIL ({:?}) ::", PS, e),
         }
     }
@@ -1198,12 +2046,23 @@ mod metal {
         size: usize,
     }
 
-    /// The engine driver: returns the number of files cloned (so `?` early-returns land on the single
-    /// FAIL line above). Mounts the USB boot stick and mirrors its ESP tree onto the freshly-formatted
-    /// microSD ESP, sha-extent-verifying every copied file.
+    /// The engine driver: returns `(files cloned, UnaFS block count)` — so `?` early-returns land on
+    /// the single FAIL line above, and the verdict can name both volumes. Mounts the USB boot stick
+    /// and mirrors its ESP tree onto the freshly-formatted microSD ESP, sha-extent-verifying every
+    /// copied file, then formats partition 2 as a native UnaFS volume.
     #[cfg(feature = "install_target")]
-    fn install_flow(t: &mut SdInstallTarget) -> Result<usize, crate::install::InstallError> {
+    fn install_flow(t: &mut SdInstallTarget) -> Result<(usize, u64), crate::install::InstallError> {
         use crate::install::{fat32, gpt, verify_extents, InstallError, InstallTarget};
+
+        // 0) M4.3 — THE SIZING BOUND, BEFORE THE FIRST BYTE. The card capacity is an upper bound on
+        //    any partition the GPT below can carve, so an over-large geometry is rejected here, while
+        //    the card is still exactly as it was found. ORDERING is the whole point: `UnaFS::format`
+        //    would refuse cleanly on its own (`AllocRefused`), but only AFTER the GPT and the ESP had
+        //    been written, leaving a half-installed card. This is NOT a proof that the later format
+        //    cannot fail for heap reasons — the guard compares against total `HEAP_SIZE`, never free
+        //    heap, and the format still needs two contiguous runs out of a linked-list allocator. See
+        //    `unafs_sizing_guard`'s docblock; a format-time heap failure fails the install, closed.
+        unafs_sizing_guard(t.capacity_sectors(), UNAFS_GATE_PRE_GPT)?;
 
         // 1) GPT: protective MBR + primary/backup + ESP + data, with the engine's own parse-back verify.
         let layout = gpt::write_gpt(t)?;
@@ -1234,6 +2093,12 @@ mod metal {
             PS, geom.fat_sz, geom.count_of_clusters, geom.data_start
         );
 
+        // 3b) THE NATIVE VOLUME (M4.2/M4.3/M4.4): format partition 2 (UNAOS-DATA) as UnaFS over the
+        //     same armed CMD24/CMD25 primitives, then re-read its superblock + root record off the
+        //     card. Runs BEFORE the self-clone so a card that cannot carry the native volume fails
+        //     before the long file-by-file copy, not after it.
+        let unafs_blocks = format_unafs_volume(t, &layout)?;
+
         // 4) THE SELF-CLONE: mount the USB boot stick's own ESP through the in-tree FAT reader and mirror
         //    its whole boot tree onto the microSD ESP. `fs::fat::mount()` reads `drivers::block` — the USB
         //    path — which the JB2b pump populated before this deferred site ran.
@@ -1243,7 +2108,23 @@ mod metal {
         let mut recs: alloc::vec::Vec<FileRec> = alloc::vec::Vec::new();
         {
             let mut w = fat32::TreeWriter::new(t, geom);
-            let root_entries = src.read_root().map_err(|_| InstallError::Io)?;
+            let root_raw = src.read_root().map_err(|_| InstallError::Io)?;
+            // INSTALL-FILTER: drop host-OS litter trees at the ROOT level BEFORE sizing or cloning, so the
+            // clone carries only the real boot payload and the verdict file count is honest. Only root
+            // entries are filtered — nested payload dirs (EFI/BOOT/…) are copied exactly as before. One
+            // witness line per skipped tree.
+            let mut root_entries: alloc::vec::Vec<crate::fs::fat::DirEntry> = alloc::vec::Vec::new();
+            for e in &root_raw {
+                let name = e.name();
+                if let Some(reason) = host_os_litter_reason(name) {
+                    serial_println!(
+                        "{}   INSTALL: skipped host-OS litter tree {} ({}) ::",
+                        PS, name, reason
+                    );
+                    continue;
+                }
+                root_entries.push(*e);
+            }
             // Size the root directory to its entry count (multi-cluster if >16 entries) and reserve its
             // cluster chain BEFORE any file/subdir allocation (so cluster 2's chain stays contiguous).
             let root_slots = count_nondot(&root_entries);
@@ -1281,7 +2162,7 @@ mod metal {
         // NOTE: the in-tree `fs::fat::mount()` interop self-check the x86 engine witness runs on ITS target
         // is not run on the SD here — `mount()` reads `drivers::block` (the USB source), not this armed SD
         // target. The per-file SD content-verify above IS the by-content proof.
-        Ok(recs.len())
+        Ok((recs.len(), unafs_blocks))
     }
 
     /// Depth-first mirror of a source directory onto the SD `TreeWriter`. Builds THIS directory's cluster
@@ -1292,6 +2173,44 @@ mod metal {
     /// `..` points at cluster 0 (the FAT convention for a subdirectory of the root).
     /// Count the entries in a source directory that are neither `.` nor `..` (the slots a mirrored copy of
     /// it must hold beyond its own `.`/`..`). Used to size a directory's cluster chain up front.
+    /// INSTALL-FILTER: classify a ROOT directory entry as host-OS litter (a metadata/index tree the
+    /// desktop OS drops on removable media — not part of the boot payload). Returns `Some(reason)` to
+    /// SKIP the tree, `None` to clone it exactly as before.
+    ///
+    /// The in-tree FAT reader skips LFN slots (see `fs::fat`), so `name` is only ever the on-disk 8.3
+    /// SHORT name (uppercase). We therefore match the 8.3 aliases the desktop OS's own FAT driver
+    /// generates for these long names; the full long-name forms are listed too so intent is legible and
+    /// the filter stays correct if the reader ever grows LFN awareness. Conservative by construction:
+    /// only the exact known-litter names (plus the AppleDouble `._*`/`_~N` alias class) match — every
+    /// other entry, including any real EFI/BOOT/KERNEL payload, is copied unchanged.
+    #[cfg(feature = "install_target")]
+    fn host_os_litter_reason(name: &str) -> Option<&'static str> {
+        let eq = |a: &str| name.eq_ignore_ascii_case(a);
+        // AppleDouble sidecars (`._<name>`): on 8.3 the alias collapses to the `_~N` class (e.g.
+        // `_~8.TXT` seen on bench cards). Match the alias, and the literal `._` prefix for LFN-awareness.
+        let up = name.as_bytes();
+        let starts = |p: &[u8]| up.len() >= p.len() && up[..p.len()].eq_ignore_ascii_case(p);
+        if starts(b"._") || starts(b"_~") {
+            return Some("AppleDouble metadata sidecar (._* / 8.3 _~N alias)");
+        }
+        if eq("SPOTLI~1") || eq("SPOTLIGHT-V100") || eq(".SPOTLIGHT-V100") {
+            return Some("macOS Spotlight index (Spotlight-V100)");
+        }
+        if eq("FSEVEN~1") || eq(".FSEVENTSD") {
+            return Some("macOS FSEvents journal (.fseventsd)");
+        }
+        if eq("TRASHE~1") || eq(".TRASHES") {
+            return Some("macOS trash (.Trashes)");
+        }
+        if eq("TEMPOR~1") || eq(".TEMPORARYITEMS") {
+            return Some("macOS temporary items (.TemporaryItems)");
+        }
+        if eq("SYSTEM~1") || eq("SYSTEM VOLUME INFORMATION") {
+            return Some("Windows System Volume Information");
+        }
+        None
+    }
+
     #[cfg(feature = "install_target")]
     fn count_nondot(entries: &[crate::fs::fat::DirEntry]) -> usize {
         entries
@@ -1499,7 +2418,7 @@ mod metal {
     /// M1: walk the DTB for every SDMMC-compatible node, log each candidate, and pick the enabled
     /// removable (microSD-slot) instance. Returns its (base, size), or None (with a printed reason).
     /// READ-ONLY RAM walk — no MMIO.
-    fn resolve_microsd(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<(u64, u64)> {
+    fn resolve_microsd(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<(u64, u64, [u32; 4], usize)> {
         if dtb_addr == 0 || dtb_size == 0 {
             serial_println!("{}   M1: no DTB handed off — cannot resolve the SDMMC controller ::", PS);
             return None;
@@ -1602,7 +2521,17 @@ mod metal {
 
         // Prefer the enabled removable slot (the microSD). Fall back to the first enabled instance
         // (documented — e.g. a DT that doesn't mark the slot removable), else refuse.
-        let pick = best.or(first_enabled)?;
+        // The last rung of the M1 ladder, and the one that used to give up through a bare `?`: every
+        // candidate above was logged, then a `None` here produced only the caller's generic
+        // "no resolvable microSD-slot SDMMC controller" — with no line saying that candidates WERE
+        // found and every one of them was status=disabled or reg-less. Name it (the SDID lesson).
+        let Some(pick) = best.or(first_enabled) else {
+            serial_println!(
+                "{}   M1: {} SDMMC candidate(s) found but NONE is usable (need status=okay and a non-zero reg base; removable preferred) — STOP ::",
+                PS, n
+            );
+            return None;
+        };
         let _ = (pick.enabled, pick.removable); // (all fields consumed for logging clarity)
         let node = &pick.path[..pick.plen];
         serial_println!(
@@ -1611,7 +2540,19 @@ mod metal {
             core::str::from_utf8(node).unwrap_or("?"),
             pick.base, pick.size
         );
-        Some((pick.base, pick.size))
+        // TEGRA-SD CLKPROOF: the picked node's `clocks` [phandle, id] pairs — the ids the BPMP
+        // proof rung queries before the vendor block is touched. Read here because only this fn
+        // holds the picked node path; odd-index words per the fdt pick convention.
+        let clocks = fdt.prop_at(node, b"clocks");
+        let mut clk_ids = [0u32; 4];
+        let mut n_clks = 0usize;
+        let mut ci = 1usize;
+        while ci < clocks.n && n_clks < clk_ids.len() {
+            clk_ids[n_clks] = clocks.words[ci];
+            n_clks += 1;
+            ci += 2;
+        }
+        Some((pick.base, pick.size, clk_ids, n_clks))
     }
 
     /// ORIN-SDMMC-1 entry point (metal): FDT census (M1) -> map + poison-honest CAPS probe -> SDHCI
@@ -1624,7 +2565,7 @@ mod metal {
         );
 
         // ── M1: resolve the microSD-slot controller from the live DTB ──
-        let Some((base, size)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
+        let Some((base, size, clk_ids, n_clks)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
             serial_println!("{}   recon SKIPPED (no resolvable microSD-slot SDMMC controller) ::", PS);
             return;
         };
@@ -1670,8 +2611,79 @@ mod metal {
             match hcver { 0 => "1.0", 1 => "2.0", 2 => "3.0", 3 => "4.0", _ => "?" }
         );
 
+        // ── TEGRA-SD CLKPROOF: prove the SDMMC core clock live over BPMP BEFORE identify() touches
+        //    the vendor register block (base+0x100..0x1e4). Boot 4e died in an EL3 SError (async CBB
+        //    abort, esr_el3=0xbe000011) inside vendor_snapshot's 8 reads — the first accesses this
+        //    driver ever made beyond the standard SDHCI window, on an unproven clock/firewall domain.
+        //    Pure MRQ query first (the JB7 precedent); CMD_CLK_ENABLE only if a clock reads off;
+        //    every outcome named. If the proof cannot be completed the vendor block is SKIPPED with a
+        //    witness (pre-SDID ladder behavior, metal-proven safe on boot 3) — never risked. ──
+        let vendor_ok = 'proof: {
+            if n_clks == 0 {
+                serial_println!("{}   CLKPROOF: node carries no clocks property — vendor block will be SKIPPED ::", PS);
+                break 'proof false;
+            }
+            let Some(geom) = crate::arch::aarch64::fdt_tegra::bpmp_geometry(dtb_addr, dtb_size, ram_gib_mask) else {
+                serial_println!("{}   CLKPROOF: no BPMP geometry from DTB — vendor block will be SKIPPED ::", PS);
+                break 'proof false;
+            };
+            let Some(chan) = crate::arch::aarch64::bpmp_tegra::jb1b_ping(&geom) else {
+                serial_println!("{}   CLKPROOF: BPMP ping failed — vendor block will be SKIPPED ::", PS);
+                break 'proof false;
+            };
+            let mut all_on = true;
+            for i in 0..n_clks {
+                let id = clk_ids[i];
+                match crate::arch::aarch64::bpmp_tegra::clk_is_enabled(&chan, id) {
+                    Some((0, state)) => {
+                        serial_println!("{}   CLKPROOF: CLK {} IS_ENABLED = {} ::", PS, id, state);
+                        if state == 0 {
+                            match crate::arch::aarch64::bpmp_tegra::clk_enable(&chan, id) {
+                                Some(0) => match crate::arch::aarch64::bpmp_tegra::clk_is_enabled(&chan, id) {
+                                    Some((0, 1)) => {
+                                        serial_println!("{}   CLKPROOF: CLK {} ENABLED + re-verified = 1 ::", PS, id)
+                                    }
+                                    other => {
+                                        serial_println!("{}   CLKPROOF: CLK {} enable ack'd but re-query = {:?} — NOT proven ::", PS, id, other);
+                                        all_on = false;
+                                    }
+                                },
+                                other => {
+                                    serial_println!("{}   CLKPROOF: CLK {} ENABLE -> {:?} — NOT proven ::", PS, id, other);
+                                    all_on = false;
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        serial_println!("{}   CLKPROOF: CLK {} IS_ENABLED -> {:?} — NOT proven ::", PS, id, other);
+                        all_on = false;
+                    }
+                }
+            }
+            if all_on {
+                serial_println!("{}   CLKPROOF: all {} node clock(s) proven enabled ::", PS, n_clks);
+            } else {
+                serial_println!("{}   CLKPROOF: clock state NOT fully proven ::", PS);
+            }
+            // FWALL CONVICTION (metal, boots 4e + 5, 2026-08-21): the vendor range base+0x100..0x1e4
+            // raises an async EL3 SError on this firmware EVEN WITH both DTB clocks proven enabled
+            // (boot 5: CLK 120 = 1, CLK 219 = 1, then the identical esr_el3=0xbe000011 park at the
+            // same rung). Clock gating is REFUTED; the surviving suspect is a firmware firewall/SCR
+            // restriction on the vendor/pad-cal window. The block is therefore DISABLED outright —
+            // pre-SDID shape, which boot 3 proved SError-free end-to-end — until a firmware-side
+            // answer exists. CLKPROOF stays: read-only MRQ queries, and its lines are the standing
+            // evidence that discriminates this conviction from clock gating on every future boot.
+            serial_println!(
+                "{}   FWALL: vendor block DISABLED — metal conviction: SError with clocks proven on (boots 4e+5); ladder runs without pad snapshot/restore ::",
+                PS
+            );
+            let _ = all_on;
+            false
+        };
+
         // ── M2: SDHCI identification ladder (READ-ONLY) ──
-        let Some(card) = identify(base) else {
+        let Some(card) = identify(base, vendor_ok) else {
             serial_println!("{} ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop) ::", PS);
             return;
         };
@@ -1695,6 +2707,12 @@ mod metal {
             PS, card.num_blocks, card.num_blocks * 512 / (1024 * 1024), card.csd_version, class
         );
 
+        // ── TEGRA-SDBLK: the card is now a block backend. LAST thing after every read witness (M1/M2/M3
+        //    all passed above), and BEFORE the armed ladder / installer below — those two restore or
+        //    rewrite CONTENT, never capacity, so the geometry published here is theirs as well, and a
+        //    publish that waited for them would be a publish that never happened on an unarmed build. ──
+        publish_block_backend(base, &card);
+
         // ── ORIN-SDMMC-2: the paranoia write ladder (only with UNAOS_SDMMC_ARM=1; compiled out otherwise, so
         //    a plain UNAOS_SDMMC=1 build ends exactly here, byte-identical to the merged recon). ──
         #[cfg(feature = "sdmmc_arm")]
@@ -1717,5 +2735,139 @@ mod metal {
                 PS
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // M2b — what boot 3 was missing. The identification ladder above was complete as SD-spec prose, and
+    // it still ended at `recon done at M2 (no identified card / honest stop)` with NOTHING between the
+    // card-detect line and the stop. Three defects, in the order they bite:
+    //
+    //  1. NO EVIDENCE. Every rung was `send_command(..).ok()?` — a failure returned `None` through the
+    //     `?` without a single serial line, so a capture could not say which command died, nor with
+    //     which error bits. `cmd_step` below is the fix: it names the command and prints the INTERRUPT
+    //     payload beside the Present State, then resets the CMD/DAT lines so the controller is not left
+    //     inhibited for whatever runs next.
+    //  2. NO SETTLE TIME. CMD0 was issued in the instruction after CLK_STABLE, and CMD8 in the one after
+    //     CMD0. The SD power-up ramp requires >= 1 ms plus 74 SDCLK cycles of clock before the card
+    //     accepts anything (`delay_ms` + the two 2 ms waits in the ladder).
+    //  3. NO VENDOR PRESERVATION. SRST_ALL returns the Tegra vendor block (>= 0x100) to power-on
+    //     defaults, discarding the tap/trim/drive-strength/auto-cal the bootloader calibrated for this
+    //     board — after which the pads may not sustain a command the card will answer. `vendor_snapshot`
+    //     / `vendor_restore` put the FIRMWARE'S OWN values back; they author none.
+    //
+    // Plus the one outright spec bug: CMD8 timing out is how an SD v1.x card says "I am not v2", and the
+    // old ladder took it as fatal. That is handled inline at rung 7, not here.
+    //
+    // Read-only is untouched: nothing in this section issues any card command at all.
+
+    /// Bounded busy-wait of `ms` milliseconds on the monotonic counter (same discipline as `deadline_ms`;
+    /// there is no sleeping scheduler at this point in boot).
+    fn delay_ms(ms: u64) {
+        let dl = deadline_ms(ms);
+        while !expired(dl) {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Reset just the CMD and DAT lines (NOT SRST_ALL — that would discard the vendor configuration and
+    /// the bus power we set up). This is what the SDHCI spec prescribes after a command timeout, and it
+    /// is what lets the ladder continue past a CMD8 that no v1.x card will ever answer.
+    fn reset_cmd_dat(base: u64) {
+        write32(base, CONTROL1, read32(base, CONTROL1) | C1_SRST_CMD | C1_SRST_DAT);
+        if !wait_clear(base, CONTROL1, C1_SRST_CMD | C1_SRST_DAT, RESET_TIMEOUT_MS) {
+            serial_println!("{}   M2: CMD/DAT line reset did not self-clear (controller wedged) ::", PS);
+        }
+        write32(base, INTERRUPT, 0xffff_ffff);
+    }
+
+    /// Issue one NAMED identification command, witnessing both outcomes. `None` (which `?` turns into the
+    /// ladder's honest stop) is only ever returned AFTER a line saying exactly which command failed and
+    /// what the controller had latched — the thing boot 3 could not tell us.
+    fn cmd_step(base: u64, name: &str, cmdtm: u32, arg: u32) -> Option<()> {
+        cmd_step_at(base, name, cmdtm, arg, true)
+    }
+
+    /// `cmd_step` with the success line suppressed — for the ACMD41 poll, whose rounds are summarised
+    /// once by the loop instead of one line per round.
+    fn cmd_step_at(base: u64, name: &str, cmdtm: u32, arg: u32, verbose: bool) -> Option<()> {
+        match send_command(base, cmdtm, arg) {
+            Ok(()) => {
+                if verbose {
+                    serial_println!("{}   M2: {} ok ::", PS, name);
+                }
+                Some(())
+            }
+            Err(int) => {
+                serial_println!(
+                    "{}   M2: {} FAILED — INTERRUPT={:#010x} PresentState={:#010x} CONTROL0={:#010x} CONTROL1={:#010x} — STOP ::",
+                    PS, name, int,
+                    read32(base, STATUS), read32(base, CONTROL0), read32(base, CONTROL1)
+                );
+                reset_cmd_dat(base);
+                None
+            }
+        }
+    }
+
+    /// Snapshot the Tegra vendor register block so SRST_ALL cannot lose the bootloader's calibration.
+    /// Purely a read; logged so a capture records what the firmware had configured.
+    fn vendor_snapshot(base: u64) -> [u32; VENDOR_REGS.len()] {
+        let mut vals = [0u32; VENDOR_REGS.len()];
+        for (i, off) in VENDOR_REGS.iter().enumerate() {
+            vals[i] = read32(base, *off);
+        }
+        serial_println!(
+            "{}   M2: vendor block pre-reset — CLOCK_CTRL={:#010x} SYS_SW={:#010x} CAP_OVR={:#010x} MISC={:#010x} IO_TRIM={:#010x} DLLCAL={:#010x} COMP_PAD={:#010x} AUTO_CAL={:#010x} ::",
+            PS, vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]
+        );
+        vals
+    }
+
+    /// Put the snapshot back after SRST_ALL, then re-run pad auto-calibration IF the firmware had it
+    /// enabled (calibration results do not survive the reset either). Bounded wait on AUTO_CAL_ACTIVE;
+    /// a calibration that never finishes is reported, never waited on forever, and never fatal — the
+    /// ladder proceeds and the command witnesses will say whether the bus works.
+    fn vendor_restore(base: u64, vals: &[u32; VENDOR_REGS.len()]) {
+        let poisoned = vals.iter().all(|v| is_poison(*v));
+        if poisoned {
+            serial_println!(
+                "{}   M2: vendor block read back all-poison — NOT restoring (the window would not be a live vendor block) ::",
+                PS
+            );
+            return;
+        }
+        let mut skipped = 0u32; // per-register guard: a PARTIAL poison read must not author 0xffffffff into tap/trim (delta-review hardening)
+        for (i, off) in VENDOR_REGS.iter().enumerate() {
+            if is_poison(vals[i]) {
+                skipped += 1;
+                continue;
+            }
+            write32(base, *off, vals[i]);
+        }
+        if skipped > 0 {
+            serial_println!(
+                "{}   M2: vendor block restored across SRST_ALL — {} poison register(s) SKIPPED (left at reset defaults, none authored) ::",
+                PS, skipped
+            );
+        } else {
+        serial_println!("{}   M2: vendor block restored across SRST_ALL (firmware values, none authored) ::", PS);
+        }
+
+        if is_poison(vals[7]) || vals[7] & AUTO_CAL_ENABLE == 0 {
+            serial_println!("{}   M2: pad auto-calibration was disabled by firmware — not started ::", PS);
+            return;
+        }
+        write32(base, V_AUTO_CAL_CONFIG, vals[7] | AUTO_CAL_ENABLE | AUTO_CAL_START);
+        if !wait_clear(base, V_AUTO_CAL_STATUS, AUTO_CAL_ACTIVE, RESET_TIMEOUT_MS) {
+            serial_println!(
+                "{}   M2: pad auto-calibration still ACTIVE after {} ms (status {:#010x}) — continuing with the restored values ::",
+                PS, RESET_TIMEOUT_MS, read32(base, V_AUTO_CAL_STATUS)
+            );
+            return;
+        }
+        serial_println!(
+            "{}   M2: pad auto-calibration complete (AUTO_CAL_CONFIG={:#010x}, status={:#010x}) ::",
+            PS, read32(base, V_AUTO_CAL_CONFIG), read32(base, V_AUTO_CAL_STATUS)
+        );
     }
 }

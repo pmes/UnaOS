@@ -114,7 +114,7 @@ Two structural notes for whoever picks up §4.4:
   (`wm.rs:15667`, `15770-15772`). Auditing the launcher's `#[cfg]` list alone misses them.
   `menubar::selftest` is nested inside `dock::selftest` (`video/dock.rs:953-971`) for the same
   reason, with an in-tree `⚠ FOR THE INTEGRATOR` note already asking for it to be re-seated.
-* **On the Pi there is no non-fixture window source.** `video/pidesk.rs:54-56` states it outright:
+* **On the Pi there is no non-fixture window source.** `video/desktop_firmware.rs:54-56` states it outright:
   the Pi's window population comes from the `u11` fixture cascade and the ring-3 vug loader. There is
   no `DESKTOP_APP_ARMED` equivalent. So on a `pidesk` + `witness` boot every window on the glass
   except the console is fixture-minted, and a leak is indistinguishable from normal furniture by

@@ -34,10 +34,16 @@
 // task cde963a7). This is also the first code to walk a *non-first* redistributor frame on Orin, i.e.
 // the first metal exercise of JM4's VLPIS-derived stride.
 //
-// The scheduler is NOT part of this arc (it is `baremetal`-gated + EL1-coupled, while this path runs at
-// EL2 — see JC2/JC3). So the secondaries do their per-core GICv3 bring-up and **park in a WFI loop with
-// IRQs unmasked** — able to receive SGIs, nothing more. The verdict is cross-core SGI (BSP → each AP,
-// and each AP → BSP), not CAPSTONE.
+// The secondaries do their per-core GICv3 bring-up, prove cross-core SGI (BSP → each AP, and each AP →
+// BSP), then — ORIN-SMP-RUN — run their one-shot cooperative pass (`run_secondary_work`), arm their OWN
+// per-core generic-timer tick (JC3, `timer::arm_this_core_ap`), and enter the preemptive scheduler
+// `run()` loop via `sched::secondary_run`, becoming SCHED-BAL participants (they set `ONLINE` and the
+// balancer may place/steal work onto them). This path runs the scheduler at EL2 (the primitives are
+// EL-neutral). JC3 promotes the JC2-deferred AP timer: each AP's tick is LOCAL-ONLY (it advances only
+// that core's `percpu.ticks`, never the shared `TICKS`/`ms()` wall-clock — the double-count that held
+// it back), so `run()` now idles on WFI woken by the AP's OWN tick as well as the reschedule SGI —
+// self-driven re-poll every ~4 ms rather than SGI-only. Work still also arrives with an `IPI_RESCHED`
+// poke; the tick is the belt-and-braces wake for when a cross-core poke is slow/lost (boot-11 metal).
 //
 // The whole module is `#[cfg(not(feature = "pi"))]` (baremetal implies pi, so it is compiled out of
 // every Pi image). The `virt` kick-off in `main.rs` is additionally runtime-gated on `gic::is_v3()`, so
@@ -61,7 +67,8 @@ const MAX_CORES: usize = 8;
 const MAX_CORES: usize = 4;
 
 /// SGI 0 — the inter-processor channel used for the cross-core delivery proof (the same INTID the Pi
-/// path reserves as `smp::IPI_RESCHED`; there is no scheduler here, so it is only ever a proof ping).
+/// path reserves as `smp::IPI_RESCHED`; it serves both as the cross-core proof ping AND, once the
+/// secondaries enter `run()` (ORIN-SMP-RUN), as the balancer's reschedule poke that breaks their idle WFI).
 /// Per-AP distinct SGI INTIDs (attributable AP→BSP delivery, delta-list item) are deferred to a
 /// follow-up — the BSP→AP direction is already per-core attributable via each AP's own IPI counter.
 const IPI_SGI: u32 = 0;
@@ -246,7 +253,7 @@ unsafe fn enable_mmu_virt() {
 extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // MMU on FIRST (replaying the BSP's EL2 regime), before any lock/atomic/FP. `serial_println!` below
     // takes a spinlock, so nothing may print before this. (HCR_EL2/CPTR_EL2 were replayed in the stub.)
-    unsafe { enable_mmu_virt() };
+    unsafe { enable_mmu_virt() }; #[cfg(feature = "smpmark")] serial_print!(":A:"); // SMPMARK :A: (tail block)
     // Re-derive this core's linear index from MPIDR affinity with the MMU ON — the structural fix for the
     // CORE3-class stale-line hazard. `this_affinity()` reads MPIDR_EL1 live (at EL2 it returns the
     // physical affinity — VMPIDR only redirects EL1 reads), so this and every use of the derived index
@@ -309,19 +316,85 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // before. The spin-for-release inside waits with IRQ unmasked, so the BSP→AP ping still lands.
     sched::run_secondary_work(core);
 
-    // Honest idle heartbeat (VUG-1 M3b): this core is online but parks WITHOUT running the scheduler,
-    // so it never calls `dispatch_next` and its CPU-pulse counters would stay (0,0) — a pinned/undefined
-    // meter bar for a demonstrably-online-idle core. Register it as idle so the bar reads honest 0% busy.
-    // Bump once at park entry AND on every WFI wake — the wake bump is the load-bearing one (the BSP's
-    // witness reads busy+idle>0, which each re-park guarantees; the entry bump just seeds it). IRQs are
-    // already unmasked, so the BSP→AP ping is itself such a wake. Introspection-only, lock-free relaxed
-    // — no scheduling-path effect.
-    sched::note_core_idle(core);
-    // Park: IRQs unmasked, so a BSP → AP SGI wakes this WFI, is serviced (handle_irq_v3 counts it), and
-    // the core re-parks. No scheduler on this path (see the module header).
-    loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
-        sched::note_core_idle(core);
+    // JC3 — arm THIS secondary's OWN periodic generic-timer tick (its redistributor PPI 30) before it
+    // enters `run()`. This is the promotion of the JC2-deferred "AP timer PPI stretch": a tickless AP's
+    // only idle wake was the reschedule SGI, and on Orin metal (boot-11) that wake did not reliably
+    // land, so placed burst work stranded on a parked AP. With its own tick this core re-polls its run
+    // queue / attempts a steal every ~4 ms — a self-driven scheduler participant, no longer
+    // SGI-dependent. `arm_this_core_ap` registers the core LOCAL-ONLY, so its tick advances only its
+    // per-CPU `percpu.ticks` and never the shared `TICKS`/`ms()` wall-clock (the double-count that held
+    // this back). The tick does not preempt here (the `virt`/tegra `run()` path leaves `SCHED_ACTIVE`
+    // false and `handle_irq_v3` calls only `on_tick`) — it just breaks the idle WFI so the loop re-polls.
+    //
+    // ORIN-EL1AP (baton orin-8 item 1, Candidate C) — the EL2 -> EL1 drop for ONE AP goes HERE, in the
+    // window between "this core is fully brought up at EL2" and "this core arms its tick and enters
+    // `run()` forever", and the boundaries of that window are what fix the position:
+    //
+    //   * AFTER `gic::init_secondary_v3()`, because `init_cpu_interface_v3` programs ICC_SRE_EL2 and
+    //     is guarded on `current_el() >= 2` — run it after the drop and the CPU interface is never
+    //     set up. The redistributor/PMR/CTLR/IGRPEN1 state it leaves is per-core banked and survives
+    //     the drop, so EL1 inherits a live Group-1 interface.
+    //   * BEFORE `timer::arm_this_core_ap()`, because the drop's asm ends the physical timer
+    //     (`msr cntp_ctl_el0, xzr`) — correct for the BSP's cooperative CAPSTONE, fatal for an AP
+    //     that idles in WFI. Arming AFTER re-enables CNTP from EL1, which CNTHCTL_EL2.EL1PCEN|EL1PCTEN
+    //     (set by the same drop) is what makes legal.
+    //   * BEFORE `sched::secondary_run(core)`, which never returns.
+    //
+    // Knob-off this whole block does not exist and the AP path is the untouched EL2 one.
+    #[cfg(feature = "orinel1ap")]
+    if unsafe { super::boot_tegra::drop_ap_to_el1(core) } {
+        // At EL1 now, DAIF masked, TPIDR_EL1 UNKNOWN, VBAR_EL1 unset. These four statements are the
+        // BSP's own post-drop terminus (`main.rs`), for the same reasons and in the same order.
+        percpu::init(core); // re-seed: the pre-drop init seeded TPIDR_EL2
+        exceptions::install(); // VBAR_EL1 (at EL1 this arm touches no HCR_EL2 — the drop already set it)
+        // EL0-EL1CORE — stamp. Sound on an AP precisely because `core` came from the MPIDR-affinity
+        // re-derivation above, not from a literal: `mark_el1_core` re-measures `CurrentEL` itself and
+        // stamps NOTHING if it is not EL1, so a broken drop leaves the mask (and the refusal) as-is.
+        let stamped = sched::mark_el1_core();
+        // The drop landed with DAIF masked. An AP that stays masked would idle in `run()` with its
+        // tick and the reschedule SGI both undeliverable — WFI would still wake on a pending IRQ, but
+        // the IRQ would never be TAKEN, so `on_tick` would never re-arm and EOI would never issue.
+        exceptions::enable_irq();
+        serial_println!(
+            ":: AARCH64 SMP: [el1ap] cpu={} LANDED at EL{} — stamped={} el1cores={:#x} irq=unmasked (EL0-EL1CORE) ::",
+            core,
+            exceptions::current_el(),
+            stamped,
+            sched::el1_core_mask()
+        );
+    }
+    timer::arm_this_core_ap();
+
+    // ORIN-SMP-RUN: enter the preemptive scheduler `run()` loop instead of the old `note_core_idle`
+    // + WFI park. `secondary_run` sets `ONLINE[core]` first thing, so this formerly-parked secondary
+    // becomes a SCHED-BAL participant — the balancer can place woken/spawned migratable work here and
+    // this core steals when idle (the metal witness: a non-zero `steals`/`busy` on a previously-parked
+    // Orin core). The honest-idle heartbeat the removed `note_core_idle` park fed is subsumed by
+    // `run()`'s idle path, which bumps `CPU_IDLE` on every empty dispatch, so the BSP's `busy+idle>0`
+    // pulse witness still holds (the cooperative pass above already seeded `busy>0`/`idle>0`).
+    //
+    // IRQs are unmasked, so a BSP → AP reschedule SGI still lands and is serviced (handle_irq_v3
+    // counts it): inside `run()` it breaks the idle WFI so newly-placed/stealable work is picked up.
+    // With JC3 the AP's own tick is now a SECOND, self-driven wake (belt and braces with the poke),
+    // so work is picked up within a tick even if a cross-core poke is slow/lost. Never returns.
+    sched::secondary_run(core)
+}
+
+/// JC3 (SGI audit) — translate a LINEAR core index into the `gic::send_sgi` target for the GICv3 path:
+/// the core's packed MPIDR affinity {Aff3,Aff2,Aff1,Aff0} as published in `AFF_BY_INDEX`. On the v3 CPU
+/// interface `send_sgi` routes by affinity via `ICC_SGI1R_EL1` — NOT by a linear/CPU-interface index —
+/// so a caller holding only a linear index (the scheduler's `poke_cpu`) must map it here first. On QEMU
+/// `virt` affinity == index (single cluster, Aff0 = index), so this is the identity there; on
+/// multi-cluster Tegra234 the cluster is in Aff2/Aff1 and Aff0 is always 0, so the linear index is NOT a
+/// valid SGI target — passing it unmapped is the boot-11 defect where a reschedule poke never woke the
+/// AP. Falls back to the index itself if it is not a published core (out of range / table not yet
+/// published), which preserves the pre-JC3 QEMU-virt behaviour. `pub` for `sched::poke_cpu`.
+pub fn sgi_target_for_index(idx: usize) -> usize {
+    let n = N_CORES_PUB.load(Ordering::Acquire) as usize;
+    if idx < n && idx < MAX_CORES {
+        AFF_BY_INDEX[idx].load(Ordering::Relaxed) as usize
+    } else {
+        idx
     }
 }
 
@@ -832,10 +905,10 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
     // Start each `/cpus`-named secondary. Target = its real MPIDR affinity; context id = its linear
     // index (advisory past the MMU turn-on). Entry PA = the identity-mapped stub. A CPU_ON error is
     // logged + skipped, never a hang. NO AFFINITY_INFO gate — the DTB already IS the presence gate.
-    let entry = _secondary_start_virt as *const () as usize as u64;
+    let entry = _secondary_start_virt as *const () as usize as u64; #[cfg(feature = "smpmark")] serial_print!(":P:"); // SMPMARK :P: (tail block)
     for idx in 1..n_cores {
         let aff = aff_by_index[idx];
-        let ret = psci_cpu_on(affinity_to_mpidr(aff), entry, idx as u64);
+        let ret = psci_cpu_on(affinity_to_mpidr(aff), entry, idx as u64); #[cfg(feature = "smpmark")] serial_print!(":R{}:", idx); // SMPMARK :R<idx>: (tail block)
         if ret == 0 {
             serial_println!(
                 ":: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP {} (aff={:#010x}) -> SUCCESS (entry={:#x}) ::",
@@ -959,3 +1032,86 @@ pub fn probe_publish_real_path(aff_by_index: &[u32]) -> u64 {
 pub fn probe_core_online(idx: usize) -> bool {
     idx < MAX_CORES && CORE_READY[idx].load(Ordering::Acquire)
 }
+
+// ── SMPMARK (orin 3) — the one-flight discriminator for the intermittent ORIN-SMP-3 park ─────────
+//
+// THE PARK. On roughly 30% of SMP-armed Orin boots the board dies during secondary bring-up. The
+// code and the load addresses are NOT the variable: boot5c flights #1 (park) and #2 (clean) shared
+// `VBAR_EL2 = 0x25b115800` and `TTBR0 = 0x25b26a000` — same binary, same physical base, minutes
+// apart, opposite outcomes. So an image-layout theory cannot explain it and a timing/attribute
+// theory must.
+//
+// THE UNREAD EVIDENCE. ATF prints `Exception reason=1 syndrome=0x82000010`, which decodes as
+// EC = 0x20 (INSTRUCTION Abort from a LOWER EL), IL = 1, IFSC = 0x10 (synchronous external abort,
+// NOT on a translation-table walk). An instruction-FETCH external abort — not a data abort, not a
+// translation fault.
+//
+// H1, the leading hypothesis this instrument exists to test. A PSCI-woken AP resets with
+// `SCTLR_EL2.M = 0` and `SCTLR_EL2.I = 0`. Per ARM ARM D5.2.9, with stage-1 translation disabled,
+// data accesses are Device-nGnRnE and INSTRUCTION accesses are Device-nGnRnE while
+// `SCTLR_ELx.I == 0`. So the AP's ~40 instructions between its PSCI reset and the `msr SCTLR_EL2`
+// inside `enable_mmu_virt` are Device-nGnRnE instruction fetches — one fabric transaction each,
+// spread over two pages ~28 KiB apart — plus ~10 Device loads and 1 Device store: ≈51 I/O-routed
+// transactions per woken core. That is the ONLY Device-typed instruction fetch anywhere in the
+// boot, and it is the only construct in the boot that matches EC = 0x20.
+//
+// WHY MARKS AND NOT MORE LOGGING. The existing per-core `CPU_ON -> SUCCESS` line is ~95 chars ≈
+// 8.2 ms of UART at 115200 8N1. The AP powers up and (under H1) faults well inside that window, so
+// a capture that ends mid-line cannot distinguish "the SMC never returned" from "the SMC returned
+// and the AP killed the box while the BSP was still printing". Three short tags, emitted with
+// `serial_print!` (no newline, minimal format work, minimal lock hold) collapse that ambiguity:
+//
+//   `:A:`      AP crossed MMU-off -> MMU-on (`__secondary_rust_virt`, immediately post-`enable_mmu_virt`)
+//   `:P:`      BSP finished the publication block (ctx capture + `SEC_CTX` clean + stack `DC CIVAC` sweep)
+//   `:R<idx>:` the `CPU_ON` SMC RETURNED to the BSP for linear index <idx>
+//
+// PLACEMENT — the Location-shift convention, and it is LOAD-BEARING here. All three marks are appended
+// to a PRE-EXISTING line rather than given lines of their own, and all the prose lives in this tail
+// block. Written the natural way (each mark on its own `#[cfg]` + statement pair with a comment above
+// it) the disarmed tegra build is NOT byte-identical to baseline: MEASURED, the loadable image differed
+// in exactly 8 bytes, every one of them a panic `Location` line-number constant belonging to code
+// FURTHER DOWN this file, shifted by the inserted lines. Same defect the DARKWIN-GUARD tail mod in
+// `serial.rs` and the VUGFIX one-liner in `sched.rs` are written the way they are to avoid. Appending
+// to the existing line adds no line and changes no existing column, so the disarmed image is byte-clean
+// — MEASURED at 0 differing bytes, `llvm-objcopy -O binary` + `cmp`, baseline worktree vs this tree.
+// If you edit a mark, keep it on its host line.
+//
+// HONEST CAVEAT on `:A:`, deliberately preserved: it runs BEFORE `exceptions::install()`, so the AP's
+// `VBAR_EL2` is still the FIRMWARE's. An abort taken between the PSCI reset and that point — including
+// one taken by `serial_print!` itself — is reported by ATF/UEFI, not by us. That is exactly the
+// ORIN-SMP-3 park's own signature, and it is why the mark is a presence/absence oracle and not a
+// handler. It sits at the first instruction where a spinlock is legal at all (the MMU is on; `ldxr`/
+// `stxr` with the MMU off is CONSTRAINED UNPREDICTABLE), i.e. the earliest an AP can say anything.
+//
+// READING A PARKED CAPTURE — what each possible tail proves:
+//
+//   … enumerated core 5 …   then RAS   The publication block itself died. Nothing to do with an AP:
+//                                      no `CPU_ON` was ever issued. Suspect the `DC CIVAC` sweep over
+//                                      `SECONDARY_STACKS` or `capture_secondary_ctx`. REFUTES H1.
+//   `:P:`                   then RAS   Publication survived; the very first `CPU_ON` SMC did not
+//                                      return. The fault is inside PSCI/ATF or in the SMC path, on
+//                                      the BSP. NOT our AP entry code. REFUTES H1.
+//   `:P::R1:`               then RAS,  The SMC returned cleanly AND the AP never reached the far side
+//   with no `:A:`                      of `enable_mmu_virt`. The AP died in its MMU-OFF window — the
+//                                      ~51 Device-nGnRnE transactions of the entry stub. This is the
+//                                      CONVICTION for H1, and it also localises the fault to the
+//                                      stub + `enable_mmu_virt`, ~40 instructions of known text.
+//   `:P::R1::A:`            then RAS   The AP got the MMU on and died AFTER. H1 is REFUTED as the
+//                                      cause of the park (the Device-fetch window was survived);
+//                                      look downstream — `exceptions::install`, `percpu::init`,
+//                                      `gic::init_secondary_v3` (the first non-BSP redistributor
+//                                      touch), or the AP's first cacheable access.
+//
+// A CLEAN flight is expected to read `:P::R1::A::R2::A:…` with the tags interleaved: the ordering of
+// `:R<n>:` against `:A:` from an earlier core is a race by construction (two cores, one UART lock)
+// and carries no meaning. Only the PRESENCE and the LAST tag before the park are evidence.
+//
+// GATING. Every mark is `#[cfg(feature = "smpmark")]`, armed by `UNAOS_SMPMARK=1` (see `arroyo`).
+// Default OFF => the marks vanish and the tegra image is byte-identical to baseline. The ARMED
+// configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CFG_MATRIX`, per the
+// standing law that a cfg widen's gates must compile the configuration the widen turns ON.
+//
+// DARKWIN. Both BSP-side marks run inside `start_secondaries_tegra`, which `tegra_early_stop` calls
+// (main.rs:2494) long after it arms the UARTC latch (main.rs:1906, immediately on `mmu_tegra::init`
+// returning), and the AP-side `:A:` runs later still. No mark can be dropped or counted by
+// `serial::tegra_guard`, and none can touch UARTC before the device window is mapped.

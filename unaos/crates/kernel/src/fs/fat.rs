@@ -612,6 +612,21 @@ pub enum BlockSource {
     /// SDHC-4b (x86, `sdhcblk` knob): the internal SD card, READ-ONLY. See the note above.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     Sdhc,
+    /// TEGRA-SDBLK (aarch64, `tegra` + `sdmmc`): the Orin devkit's microSD card, READ-ONLY.
+    ///
+    /// The aarch64 twin of `Sdhc`, and it exists for one reason: `BlockSource` is total over
+    /// `crate::drivers::block::BlockHandle`, and that enum gained `TegraSd`. The gate is the same
+    /// triple the block layer puts on the handle and on its four entry points, so on x86 and on the
+    /// Pi this variant does not exist and this file is byte-identical to its pre-variant self.
+    ///
+    /// Read-only is not a policy stated here, it is the block layer's: `write_block_tegra_sd` refuses
+    /// in every cfg (the card's only writer is the armed `sdmmc_arm` ladder in `sdmmc_tegra.rs`), so
+    /// the write arms below cannot reach the medium even if [`BlockSource::write_veto`] were wrong.
+    /// Nothing constructs this source today — `block::program_source` never returns the handle — so
+    /// it routes a mount that only `mount_source` could ask for; binding one is
+    /// `docs/dev/OS/10_INSTALL/orin-unafs-root.md` §3 item 4's job, behind its own knob.
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    TegraSd,
 }
 
 impl BlockSource {
@@ -624,6 +639,10 @@ impl BlockSource {
             BlockSource::Usb => "usb",
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => "sdhc",
+            // Spelled exactly as `mbr_census` spells the same handle, for the same one-vocabulary
+            // reason the `sdhc` arm above gives.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => "tegra-sd",
         }
     }
 
@@ -682,9 +701,20 @@ impl BlockSource {
                 "the internal SD reader is mounted READ-ONLY \u{2014} only the reserved \
                  flight-recorder extent admits a write (SDHC-4c), and no file verb can name it",
             ),
+            // TEGRA-SDBLK: a flat NO, and unlike the `Sdhc` arm there is no reserved extent to carve
+            // an exception for — the block layer's `write_block_tegra_sd` refuses in EVERY cfg. This
+            // arm is a forward to that standing answer, not a second policy.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => Some(TEGRA_SD_VETO),
         }
     }
 }
+
+/// TEGRA-SDBLK: the Orin microSD's standing write refusal, as [`BlockSource::write_veto`] reports it.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+const TEGRA_SD_VETO: &str = "the Orin microSD is mounted READ-ONLY \u{2014} the block layer refuses \
+                             every write to it, and the card's only writer is the armed sdmmc_arm \
+                             ladder in sdmmc_tegra.rs (TEGRA-SDBLK)";
 
 // FATVERB: the `Default` refusal names the guard that ACTUALLY refuses on this target, because
 // there are two of them and they refuse for different reasons. Naming the wrong one in an operator-
@@ -733,6 +763,8 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
         BlockSource::Usb => crate::drivers::block::read_block_usb(lba, buf),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::read_block_tegra_sd(lba, buf),
     };
     match r {
         Ok(n) if n >= SECTOR_SIZE => { #[cfg(all(feature = "fatperf", target_arch = "aarch64"))] crate::fs::fatperf::note_sectors(1); Ok(()) } // FATFIX M2: read funnel #1
@@ -766,6 +798,11 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
         // guard above returned otherwise.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::write_block_sdhc(lba, buf),
+        // TEGRA-SDBLK: `write_block_tegra_sd` IS the refusal (one-shot witness + `NotReady`), so this
+        // arm cannot write. It is a forward to that refusal rather than a local `Err`, so there is
+        // exactly one place in the tree that decides the Orin card's write answer.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::write_block_tegra_sd(lba, buf),
     };
     r.map_err(|e| match e {
         // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
@@ -827,6 +864,8 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
             BlockSource::Usb => crate::drivers::block::read_blocks_usb(at, chunk),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => crate::drivers::block::read_blocks_tegra_sd(at, chunk),
         };
         match r {
             Ok(n) if n == take => { #[cfg(all(feature = "fatperf", target_arch = "aarch64"))] crate::fs::fatperf::note_sectors((take / SECTOR_SIZE) as u64); } // FATFIX M2: read funnel #2
@@ -874,6 +913,9 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
             // Reachable ONLY with the permit armed and this chunk inside the reserved extent.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::write_blocks_sdhc(at, chunk),
+            // TEGRA-SDBLK: refuses, as the single-sector twin does. See `write_sector`.
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            BlockSource::TegraSd => crate::drivers::block::write_blocks_tegra_sd(at, chunk),
         };
         r.map_err(|_| FatError::Io)?;
         off += take;
@@ -953,7 +995,7 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// Non-aarch64 (x86): the FAT-mutation lock is inert — see [`FAT_MUTATION`] for why masking IRQs across the
 /// x86 `hlt`-driven xHCI FAT path would hang. Byte-identical to the pre-F2 behaviour (a zero-cost passthrough).
 ///
-/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26; ROSTER AUDITED 2026-07-27 — see the block below).
+/// ⚠ THE X86 INVARIANT, STATED HONESTLY (2026-07-26; ROSTER AUDITED 2026-07-27; row 9 added 2026-08-21 — see the block below).
 /// Because this is a passthrough, x86 has NO in-`fat.rs` serialization of FAT/directory mutation. What keeps
 /// the volume consistent is a discipline held ABOVE `fat.rs`, by its callers. That discipline is now written
 /// down as a ROSTER, because it is caller-side and therefore only as good as the next caller added to it.
@@ -971,7 +1013,9 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// | 5 | demo-chain drains — `u10_drain_{grow,create_grow,create_grow_delete,delete}`, `flush_drain_one` | same launcher task | `witness` | ditto — reached only after the launcher has observed its fixture's teardown (`cleared`). |
 /// | 6 | `openf_release` / `u11m2_phase` — `submit_grow` / `submit_delete` | launcher task / fixture teardown | `irqstorage` | routed through row 3 (they are submitters, not mutators). |
 /// | 7 | **`shell::dispatch_command`** — `create_in_dir`, `create_dir`, `write_grow`, `delete_located`, `remove_dir`, `rename_entry`, `move_entry`, and a raw `write <lba> <byte>` | **BSP GUI main loop, INLINE** (`main.rs`'s `handle_key`), NOT a scheduled task | **NONE — compiled unconditionally** | **NOTHING.** See the rule below. |
-/// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | BSP main loop | `installdemo` | PROGRAM ORDER on the BSP loop; its blank-scratch-disk configuration leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve. |
+/// | 8 | `install::write_sectors` — raw GPT/FAT32 format writes | **ONE of two mutually exclusive contexts** — `kernel_main`'s inline GUI loop on the BSP (`main.rs:1755`) OR the `x86_usb_pump` service task on `svc_cpu` (`main.rs:5633`). NEVER both: see SPLIT-EXCLUSIVITY below | `installdemo` | PROGRAM ORDER **within whichever context is live** — not "on the BSP loop", which is only half true. Its blank-scratch-disk configuration independently leaves `HELLO_STAGED` false (rows 4/5 skip) and permanently fails row 1's reserve, and THAT clause is what carries this row's safety in both contexts. |
+/// | 9 | **`holocron::flush_if_dirty`** — `create_in_dir` + `write_grow` + `delete_located` + `rename_entry` (the bond store's publish/swap) | **TWO contexts, on the same SPLIT-EXCLUSIVITY as row 8.** Its three storage-ready passes are NOT one context: `main.rs:1182` (BSP, *before* the split divergence and before any task is spawned), `main.rs:1651` (BSP inline GUI loop — split-declined only), and `main.rs:5559` (**`x86_usb_pump` on `svc_cpu`** — split-live only) | `holocron` | PROGRAM ORDER against rows 1/2/8 **because the live context is shared with them, whichever one it is** — pass `1651` sits in the same inline BSP loop as row 8's `1755`, and pass `5559` sits in the same `x86_usb_pump` body as row 8's `5633`. Pass `1182` precedes every spawn, so no other mutator exists yet. **NOT serialized against rows 3/4/5**, which run on APs — so an armed `holocron` build that ALSO carries `witness`/`irqstorage` has the same second-writer window row 7 documents, for the same reason (mutation concurrent with AP-side mutation, nothing between them). Default-quiet media leaves `witness` OFF and `holocron` OFF, so neither exists in a shipping boot. Note the store additionally DEFERS its flush while `EHCI_HID` is busy — that is a re-entrancy guard against the HID service pass, NOT serialization against rows 3/4/5, and must not be read as one. |
+/// | 10 | `selfup_tegra::selfup_service` — `create_in_dir` + `write_grow` + `rename_entry` + `delete_located` (ORIN-SELFUP's whole-ESP stage-beside → flip) | **tegra boot core, inside `tegra_early_stop`, PRE-SCHEDULER** — the first non-x86 row, kept on this table because its subject is "what else can be mutating at the same time" for these SHARED verbs, and this arc gave them a new BOOT-TIME context (previously shell/syscall runtime only) | `tegra` **and** `selfup` — no x86 configuration compiles this context, so x86 timing is untouched | PROGRAM ORDER, single-threaded PROVEN not asserted: the one call site (`main.rs:2479`, appended to the ORIN-INSTALL-2 statement) runs BEFORE `start_secondaries_tegra` (`main.rs:2583`) issues the first PSCI `CPU_ON` and BEFORE the EL1 drop (`main.rs:2644`) — at that point exactly one core in the machine executes kernel code and no scheduler is running (it has not yet been entered — tasks can be enqueued, not dispatched). The invariant, stated exactly (rmbp's row-check correction 2026-08-25): before any spawned task is DISPATCHED — the JD2 console task is already spawned at `main.rs:2457`, but its own margin note (`main.rs:2492`) records it is not dispatched until `run_capstone_boot_core` — and before any second core is powered. NOT row 9's "precedes every spawn"; "before any dispatch" is the clause that catches a future scheduler-entry move, "before any spawn" was already false and would have stayed silently false. Anchors are the CONSTRUCTS (the ORIN-INSTALL-2 line / `start_secondaries_tegra` / `boot_tegra::drop_to_el1`); the line numbers were re-verified in the commit that added this row (2026-08-25) and drift with edits — re-verify before citing them onward. |
 ///
 /// VERDICT: rows 1–6 and 8 are genuinely sequenced. Row 7 is NOT — the shell mutates the volume from the BSP
 /// main loop with nothing between it and rows 3/4/5, which run on APs. It is unreachable in the QEMU
@@ -981,6 +1025,35 @@ fn with_fat_lock<R>(f: impl FnOnce() -> R) -> R {
 /// window in exactly one configuration: an attended GUI boot built WITH `witness` (and/or `irqstorage`),
 /// where a keystroke dispatched while the launcher chain is mid-`write_grow` interleaves two unsynchronized
 /// cluster-chain mutations. Do not "fix" that here — see the rule.
+///
+/// SPLIT-EXCLUSIVITY — WHY ROWS 8 AND 9 ARE SEQUENCED WITHOUT EITHER OF THEM OWNING THE BSP LOOP.
+///
+/// Rows 8 and 9 each have TWO x86 call sites, and the roster used to describe both rows as "BSP main
+/// loop". That was wrong for one site of each, and the row's stale line numbers hid it. The two sites
+/// are mutually exclusive, and the mechanism is `run_bsp`'s divergence:
+///
+/// * `main.rs` decides the render/service split from `smp::online_aps()` — TWO DISTINCT CORES OR
+///   NOTHING. On the taken branch it spawns `x86_render_service` and `x86_usb_pump` and the BSP then
+///   calls `sched::run_bsp(0)`, whose signature is `-> !` and whose call site says so outright:
+///   "Diverges — nothing below this line runs on this path." Everything later in `kernel_main` —
+///   row 9's pass at `main.rs:1651` and row 8's site at `main.rs:1755` — is therefore UNREACHABLE
+///   whenever the split is live.
+/// * On the declined branch (`":: SCHED-X86: … the render/service split needs 2 distinct cores; GUI
+///   stays inline on the BSP ::"`) `x86_usb_pump` is NEVER SPAWNED, so row 9's pass at `main.rs:5559`
+///   and row 8's site at `main.rs:5633` — both inside that task's body — cannot run at all.
+///
+/// So exactly one context is live per boot, and in EITHER of them rows 8 and 9 are adjacent
+/// statements in one loop body: `1651`/`1755` in the inline BSP loop, or `5559`/`5633` in
+/// `x86_usb_pump`. Program order holds — but it holds because the CONFIGURATIONS ARE EXCLUSIVE, not
+/// because either row runs on the BSP. A future reader who "fixes" row 8 by moving it onto the BSP
+/// loop for consistency would break the exclusivity that is doing the work.
+///
+/// WHAT THIS DOES NOT BUY. In the split-live configuration rows 8 and 9 run on `svc_cpu`, a
+/// PREEMPTIBLE scheduled task — so their mutual serialization is program order within one task body,
+/// and nothing more. It is still no defence against rows 3/4/5 on other APs, exactly as row 9 says.
+///
+/// (Found by orin 3 in review of the row-9 addition, extended here: orin caught row 8's site, and
+/// checking the claim turned up that row 9's own third pass is in `x86_usb_pump` too.)
 ///
 /// THE RULE FOR A NEW X86 FAT WRITER: join one of the schemes above (submit through the storage service task,
 /// or run in program order on the BSP main loop ahead of the launchers), and add yourself to this roster.
@@ -1516,6 +1589,11 @@ fn source_of(handle: crate::drivers::block::BlockHandle) -> BlockSource {
         crate::drivers::block::BlockHandle::Usb => BlockSource::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         crate::drivers::block::BlockHandle::Sdhc => BlockSource::Sdhc,
+        // TEGRA-SDBLK: mapped for totality only, exactly as `Usb` is — `program_source` never
+        // returns this handle (the Orin's program volume is the global slot; see the block layer's
+        // TEGRA-SDBLK section on why the card is not a program-source rung).
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        crate::drivers::block::BlockHandle::TegraSd => BlockSource::TegraSd,
     }
 }
 
@@ -1529,6 +1607,8 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
         BlockSource::Usb => crate::drivers::block::usb_info(),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
     }
     .ok_or(FatError::NoDisk)?;
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -1599,6 +1679,8 @@ fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
         BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::BlockHandle::Sdhc,
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::BlockHandle::TegraSd,
     }
 }
 
@@ -1681,6 +1763,8 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
         BlockSource::Usb => crate::drivers::block::usb_info(),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
     };
     let Some(dev) = dev else { return out };
     if dev.block_size != SECTOR_SIZE as u32 {
@@ -4293,7 +4377,25 @@ impl FatFs {
 }
 
 /// PIUSB-27: map a [`FatError`] to a short human reason for the mount witness line.
-#[cfg(target_arch = "aarch64")]
+///
+/// VFSX86: was `#[cfg(target_arch = "aarch64")]`. The gate recorded its first CALLER (the Pi's
+/// USB mount witness), not a property of this function — the body is a total `match` over a
+/// plain enum with no register, MMIO, block-layer or arch dependency of any kind. `fs::vfs`'s
+/// `fat_err` needs it to name a backend failure on BOTH arches, so it is now arch-neutral.
+/// aarch64 is byte-inert, and that is MEASURED, not argued (rmbp 5, 2026-08-22, at orin 3's
+/// request in review — this repo's standing law is that byte-identity is measured, because a
+/// build script's mere presence once moved every artifact). The counterfactual holds all 70
+/// commits of the arc constant and toggles only the gates: re-add `#[cfg(target_arch =
+/// "aarch64")]` to this function and to `fs::vfs`'s six un-gated items, rebuild, compare.
+/// `./arroyo kernel8` -> `target/pi_baremetal/kernel8.img` is `sha256
+/// 5c29fae5785669b6d89f63ba7c543fe1a1f0aec850c7c11464902da452d0f31f` (1341928 bytes) BOTH WAYS;
+/// `cmp` reports no difference.
+///
+/// READ THE RIGHT ARTIFACT IF YOU REPEAT THIS. The outer `UnaOS-pi4-baremetal.img` sha DOES
+/// differ between the two runs, and it is not evidence of anything: that image embeds `SRC.TGZ`,
+/// a tarball of the working tree, so editing the source to build the counterfactual necessarily
+/// changes it. `kernel8.img` is the kernel; the 64 MiB image is the kernel plus a copy of its own
+/// source. Comparing the wrong one turns a clean negative result into a false positive.
 pub fn fat_reason(e: FatError) -> &'static str {
     match e {
         FatError::NoDisk => "no USB block device",

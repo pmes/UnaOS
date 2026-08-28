@@ -1,7 +1,7 @@
 # PROPOSAL: WCX Readback Cut and Phase Ledger Clock Fix
 
 ## Goal
-Reduce the ~190 ms uncached readback cost inside `wcx::activate()` without blinding the compositor's witness instrumentation, and fix the `phase!` macro's 13 ms APIC tick deficit against the TSC wall clock.
+Reduce the ~190 ms uncached readback cost inside `desktop_uefi::activate()` without blinding the compositor's witness instrumentation, and fix the `phase!` macro's 13 ms APIC tick deficit against the TSC wall clock.
 
 ## 1. Phase Ledger Clock Fix
 **Issue:** `crate::arch::ms()` reads the APIC tick counter, which loses ticks when interrupts are masked (e.g., during the 14 ms `fill_screen`). This causes a systematic ~13 ms under-reporting of the `kdisp_takeover` span on both boots.
@@ -26,4 +26,4 @@ Every uncached BAR0 read of the panel costs ~1.7–2.3 µs. Deletion is not on t
 - **Predicted Saving:** 4,096 probes drops to 256 probes (at `lattice4`). Cost drops to ~0.5 ms. **Saving: ~7.5 ms.**
 
 ## Total Predicted Savings
-By tuning these three knobs, the `wcx::activate()` readback cost will drop from **~190 ms** to **~16 ms**, predicting a net saving of **~174 ms** on the `kdisp_takeover` span without blinding the compositor.
+By tuning these three knobs, the `desktop_uefi::activate()` readback cost will drop from **~190 ms** to **~16 ms**, predicting a net saving of **~174 ms** on the `kdisp_takeover` span without blinding the compositor.

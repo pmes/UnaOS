@@ -93,16 +93,47 @@ fn main() {
     // UNAOS_BOTCBWIOC is DELETED (2026-07-30): the CBW is awaited as its own stage in every build,
     // unconditionally, and no media can be produced with it off (usb_xhci.md §17).
     if std::env::var("UNAOS_BOTRING64").is_ok() { feats.push("botring64"); }
+    // BOT-PARK: UNAOS_BOTWEDGE=1 injects a SYNTHETIC transport wedge on the storage slot once its
+    // first 24 transactions have completed — every later BOT attempt fails `Timeout` with nothing
+    // put on the wire. It exists because QEMU's usb-storage cannot wedge, so the retry ladder's
+    // global floor (escalating back-off, the per-device retry budget, the park) is otherwise
+    // walkable only on metal. Under it a boot reaches `:: BOT: PARKED … ::` and STOPS retrying,
+    // which is the arc's whole claim. MAPPED HERE AS WELL AS IN `arroyo` for the reason BOTRING64
+    // gives two knobs above, and it is not academic here: `arroyo test` compiles the booted x86
+    // kernel THROUGH this builder, so while this line was missing `UNAOS_BOTWEDGE=1` armed nothing
+    // and no run could reach the PARKED line the knob exists to produce.
+    // TEST ONLY, never on media: it makes storage permanently unusable by design. Default OFF =>
+    // fully cfg-compiled out and the artifact is byte-identical.
+    if std::env::var("UNAOS_BOTWEDGE").is_ok() { feats.push("botwedge"); }
     // GR17 pay-as-you-go wc-g battery (video/wcg.rs): lattice-sampled first pass + deferred full
     // passes, x86-only paths, default OFF => byte-identical. Mapped here as well as in `arroyo`
     // for the same reason as BOTRING64 above: a knob arroyo alone sets never reaches boot media.
     if std::env::var("UNAOS_WCG_PAYGO").is_ok() { feats.push("wcg-paygo"); }
+    // WCD-VALVE (boot-9 discriminator): suppress WC-D read-back admission under high composite
+    // utilisation (video/wm.rs §WCD-VALVE). Mapped here as well as in `arroyo` for the reason the
+    // knobs above state: a knob wired into arroyo alone never reaches the ESP media the metal boot
+    // actually runs. Requires witness to reach anything; default OFF => byte-identical.
+    if std::env::var("UNAOS_WCDVALVE").is_ok() { feats.push("wcdvalve"); }
+    // LIVECON / QUARRY: the x86 desktop's live console window and file manager. Both were mapped
+    // in `arroyo` alone — the two-place trap the KNOB→BUILDER check in arroyo now polices: a knob
+    // this map does not read banners in the check while the boot media carries nothing. Default
+    // OFF => byte-identical either way.
+    if std::env::var("UNAOS_LIVECON").is_ok() { feats.push("livecon"); }
+    if std::env::var("UNAOS_QUARRY").is_ok() { feats.push("quarry"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
     // RAST-1: software-rasterizer spinning-cube demo through the x86/virt panel path. x86_64-only
     // knob; default OFF => byte-identical media (the `rast` dep + demo module are unlinked).
     if std::env::var("UNAOS_RAST").is_ok() { feats.push("rast"); }
+    // RASTPORT: the x86 MULTI-CORE rung (`rast_demo::run_mc`). Implies `rast` in Cargo, so this
+    // alone arms both. MUST be listed here and not only in `arroyo`: this list is the one the x86
+    // kernel that actually BOOTS is built from — `arroyo`'s `$KERNEL_FEATURES` does not reach it,
+    // and a knob added there alone shows up in the banner while being absent from the image (which
+    // is exactly how this was found: `rastmc` printed in the feature banner, `strings` on the ELF
+    // had no `RAST-MC` in it, and the boot took the SCHED-X86 handoff that `rast` is supposed to
+    // compile out). x86_64-only knob; default OFF => byte-identical media.
+    if std::env::var("UNAOS_RASTMC").is_ok() { feats.push("rastmc"); }
     // PORTSW-1: the Panther Point EHCI->xHCI port switchover runs BY DEFAULT (metal-gated policy
     // 2026-07-16: the no-routing boot dropped ALL external USB on the 2012 rMBP). UNAOS_NOPORTSW=1
     // OPTS OUT (never-run no-routing experiment) => zero config-space writes, byte-identical no-routing
@@ -249,6 +280,35 @@ fn main() {
     // that would not answer. Default OFF => module unlinked, media byte-identical to the arc-1 build.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WIFI2").is_ok() { feats.push("wifi2"); }
+    // WVAL-REPLAY: UNAOS_WIFIVAL=1 arms the census-ABSENT REPLAY leg — the QEMU-reachable half of
+    // arc 2. QEMU models no BCM4331, so the census refuses at S_START and the module parks, which
+    // left the FAT search, the bounds checks, `classify_header`'s container verdict and arc 2's
+    // set-validation dry-run with exactly one gate: a bench round. Under this knob the ABSENT branch
+    // prints a REPLAY-armed witness, proceeds to the storage wait, stages the set off the media, and
+    // runs `bringup::validate_replay()` — the completeness gate, `validate_set()`, one park line, and
+    // no PCI access, no BAR map, no window-selector move and no core walk anywhere in its call graph.
+    // Implies `wifi2`. THIS list is what reaches the kernel binary for MEDIA builds — the builder
+    // re-derives the x86 feature set from ITS OWN env — so a knob wired into arroyo alone would ship
+    // the replay leg DISABLED while the `⚡ kernel features:` banner claims it is on (the s42/INSTGUI
+    // and WXN-M3b failure), and the failure mode here is the nastiest shape of it: the spec gate
+    // would go red on a kernel that never contained the code, and read as a classifier regression.
+    // Default OFF => the ABSENT branch parks exactly as before, media byte-identical. Kept in sync
+    // with arroyo's mapping.
+    if std::env::var("UNAOS_WIFIVAL").is_ok() { feats.push("wifival"); }
+    // WIFI-3: UNAOS_WIFI3=1 arms arc 3's UPLOAD rung — the bcm4331 microcode upload
+    // (`upload_ucode` in src/wifi/bringup.rs). W5 pinned the SHM routing gate 3 refused on
+    // (0x0300 = microcode memory, control word 0x03000000; the b43 open specification,
+    // bcm-specs.sipsolutions.net — see bcm4331.md §S4-W5), so the default refusal now says
+    // reason=wifi3-not-armed. DESTRUCTIVE on metal: the prologue's core reset destroys the
+    // resident microcode (bcm4331.md §5 risk 4); only a successful upload + handshake
+    // restores a working state. Implies `wifi2`. THIS list is what reaches the kernel binary
+    // for MEDIA builds — the builder re-derives the x86 feature set from ITS OWN env — so a
+    // knob wired into arroyo alone would ship the upload DISABLED while the banner claims it
+    // is on (the s42/INSTGUI and WXN-M3b failure), and on THIS feature that shape is the
+    // worst one available: a boot that made the destructive prologue impossible while the
+    // operator believed the upload was armed. Default OFF => module unlinked, media
+    // byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI3").is_ok() { feats.push("wifi3"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the
@@ -274,6 +334,45 @@ fn main() {
     // and WXN-M3b failure). Default OFF => the page code and its constants unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_BTC").is_ok() { feats.push("btc"); }
+    // BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST — after the outbound page stage has printed its
+    // tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 so the peer can page THIS host, hold one
+    // 6400 ms page window, report whether a Connection Request (event 0x04) arrived, then write
+    // 0x00 back and read it back. Its own knob, and NOT part of UNAOS_BTC, because the outbound
+    // train is this arc's CONTROL: a controller with page scan enabled time-slices between inbound
+    // scan windows and any outbound train, so a `btc` build must stay byte-identical to the builds
+    // the control was measured on. It is also a distinct air-side posture — the machine is
+    // DISCOVERABLE AND CONNECTABLE for the length of that window. `btdir` implies `btc` in
+    // Cargo.toml, so pushing `btdir` alone arms the page and the whole BT stack. THIS list is what
+    // reaches the kernel binary for MEDIA builds, so a knob wired into arroyo alone would ship the
+    // direction test DISABLED while the banner claims it is on (the s42/INSTGUI and WXN-M3b
+    // failure), which for this arc would mean recording a silence produced by absent code as a
+    // silence produced by the radio. Default OFF => bt_dir_probe, its constants and its call site
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_BTDIR").is_ok() { feats.push("btdir"); }
+    // BT-BOND M1 / HOLOCRON: UNAOS_HOLOCRON=1 arms the kernel-side classed-record store
+    // (`src/fs/holocron.rs`) and its first client, the bond record codec + table
+    // (`src/drivers/ehci/btbond.rs`). THIS list is what reaches the kernel binary for MEDIA builds
+    // and for every QEMU run that goes through the builder, so a knob wired into arroyo alone would
+    // put `holocron` in the `⚡ kernel features:` banner over a kernel with both modules compiled
+    // OUT — the s42/INSTGUI and WXN-M3b failure, and the exact reason this arc's gate proves the
+    // witness family with `strings` against the builder-path artifact rather than trusting the
+    // banner. M1 issues no HCI command and touches no radio. Default OFF => modules and call sites
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_HOLOCRON").is_ok() { feats.push("holocron"); }
+    // BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests
+    // (`holocron::selftest_once`, `btbond::selftest_once`). Its own knob and NOT part of
+    // UNAOS_HOLOCRON, by the same rule that gives `sdw` a knob apart from `sdhcblk`: a boot that did
+    // not ask to WRITE the boot medium must be incapable of doing so. Implies `holocron` in
+    // Cargo.toml, so pushing this alone arms both. THIS list is what reaches the kernel binary for
+    // MEDIA builds and for every QEMU run that goes through the builder, so a knob wired into arroyo
+    // alone would put `hcronst` in the `⚡ kernel features:` banner over a kernel with the selftests
+    // compiled OUT (the s42/INSTGUI and WXN-M3b failure). Default OFF => both selftests and their
+    // call sites unlinked. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_HCRONST").is_ok() { feats.push("hcronst"); }
+    // PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — see the knob's
+    // note in arroyo. Mapped here as well as there, because a knob mapped in only one of the two
+    // ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+    if std::env::var("UNAOS_PRTSCRST").is_ok() { feats.push("prtscrst"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
@@ -292,17 +391,30 @@ fn main() {
     // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
     if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
     if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
-    // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/wcx.rs) — activated
+    // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/desktop_uefi.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    // PCIH: UNAOS_NOASPM=1 clears ASPM (LNKCTL[1:0]) on the Kepler link at init — the boot-8
+    // endpoint-hang discriminator. DEFAULT OFF => feature unlinked => byte-identical media.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOASPM").is_ok() { feats.push("noaspm"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,
     // byte-inert. This list reaches the KERNEL build for MEDIA, so a metal boot can arm the ruler.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_RTWIT").is_ok() { feats.push("rtwit"); }
+    // DEADMAN: UNAOS_DEADMAN=1 arms the timer-ISR witness that survives a wedged render-service
+    // pass — one unconditional `[deadman]` line per second, so silence is distinguishable from
+    // idleness. Kept in sync with arroyo.
+    if std::env::var("UNAOS_DEADMAN").is_ok() { feats.push("deadman"); }
+    // WEDGEINJ: UNAOS_WEDGEINJ=1 arms the injected phase-33 park — at 30 s the published render core
+    // clears IF and spins forever from inside the present blit, reproducing the metal wedge so
+    // WCSER-STEAL and WCSER-REHOME can be gated by execution instead of by compilation. TEST-ONLY;
+    // costs one AP for the rest of the run. Never arm on bench media. Kept in sync with arroyo.
+    if std::env::var("UNAOS_WEDGEINJ").is_ok() { feats.push("wedgeinj"); }
     // R1 / RTPI: UNAOS_RTPI=1 arms PRIORITY INHERITANCE on the x86 sleeping `Mutex` plus its `[rtpi]`
     // witness. Unlike RTWIT, this CHANGES scheduling — the holder of a contended `Mutex` inherits a
     // blocked higher-priority task's priority (transitively) until release. x86_64-only in effect;
@@ -362,6 +474,10 @@ fn main() {
     // aarch64; the numeric value selects the experiment via option_env). Mapped here for parity with
     // arroyo's feature list, though this x86_64 builder never produces the aarch64 tegra media.
     if std::env::var("UNAOS_SMPPROBE").is_ok() { feats.push("smpprobe"); }
+    // SMPMARK (ORIN-SMP-3): UNAOS_SMPMARK=1 arms the three secondary-bring-up marks in
+    // arch/aarch64/smp_virt.rs (`:P:` / `:R<idx>:` / `:A:`). aarch64-only in effect; mapped here for
+    // parity with arroyo's feature list, though this x86_64 builder never produces aarch64 media.
+    if std::env::var("UNAOS_SMPMARK").is_ok() { feats.push("smpmark"); }
     // ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off is DEFAULT-ON for tegra builds (opt out with
     // UNAOS_NOTEGRASMP=1). `tegrasmp` implies the aarch64 `tegra` board feature; this x86_64 builder
     // never produces aarch64 tegra media (arroyo's esp-jetson does, where the default-on lives), so this
@@ -462,6 +578,10 @@ fn main() {
         ("VUG-X86.ELF", "VUG.ELF"),
         ("VUGC-X86.ELF", "VUGC.ELF"),
         ("VUGX-X86.ELF", "VUGX.ELF"),
+        // KVUG: the fourth image — the IN-KERNEL vug (crates/kernel/src/vug.rs) carried into EL0, whose
+        // `m` key cycles its three historical screens. Same reasoning as the pins: no argv, so the only
+        // channel a mode set can travel down is a distinct image with a distinct 8.3 name.
+        ("VUGK-X86.ELF", "VUGK.ELF"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -528,6 +648,9 @@ fn main() {
         // and a benchmark that cannot be launched from the volume the kernel actually reads is no pin.
         (target_dir.join("VUGC-X86.ELF"), "VUGC.ELF"),
         (target_dir.join("VUGX-X86.ELF"), "VUGX.ELF"),
+        // KVUG: the kernel-vug image rides the data volume for the same reason the pins do — `bg
+        // /fat/VUGK.ELF` must reach the volume the kernel actually reads.
+        (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {
         if src.exists() {

@@ -265,10 +265,107 @@ FAT grow keeps the OLD (smaller) size (size is published last); a failed native 
 to the last committed root (CoW). The witnesses (§9) abort with a `FAIL` line rather than commit a
 half-write.
 
+### 8.1 VFSX86 — `FatBackend` is arch-neutral (2026-08-21)
+
+From VFS-1/VFS-2 until this change, `impl VfsBackend for FatBackend` — and its helpers
+`read_only`, `resolve_entry`, `resolve_parent`, `fat_err`, `fat_create_err` — were
+`#[cfg(target_arch = "aarch64")]`. On x86_64 `FatBackend` was therefore a struct with no backend
+impl: it could not be coerced to `Box<dyn VfsBackend>`, so it could not be mounted into a
+`MountTable` at all, and every x86 consumer that needed to write a file routed around the VFS and
+called `fs::fat`'s directory primitives directly.
+
+**The gate had no hardware reason.** It recorded where the work was done — the Pi came first — not
+a property of the code. The impl body contains no arch-specific line, and every primitive it calls
+is compiled unconditionally on x86_64 and always was: `fat::mount_source` (whose own `match` even
+carries an x86-only `Sdhc` arm), `read_root` / `read_dir` / `read_at`, and the entire write half
+(`locate_in_dir`, `create_in_dir`, `create_dir`, `write_grow`, `delete_located`). The single
+genuinely gated dependency was `fat::fat_reason`, itself gated only by its first caller (the Pi's
+USB mount witness) despite being a total `match` over a plain enum; it is now arch-neutral too.
+
+The gate is therefore **removed**, and the VFS is a real seam on both chips. `NativeBackend` keeps
+its gate, which does have a stated reason: the kernel `unafs` module is itself aarch64-only.
+
+**What this does NOT do.** Widening the seam does not enroll anyone in the x86 write discipline.
+x86 has no in-`fat.rs` FAT/directory mutation lock — `with_fat_lock` / `with_dir_lock` are
+`#[inline(always)]` passthroughs there, and volume consistency is held caller-side by the **X86
+FAT-MUTATOR ROSTER** documented on `fat::with_fat_lock`. This impl is a seam, not a caller: as
+landed it has **zero x86 callers**, so it mutates nothing and joins no roster row. The roster rule
+binds whoever calls it — an x86 consumer migrating onto these verbs must either submit through the
+storage-service task or run in program order on the BSP main loop ahead of the launchers, and must
+add itself to that roster.
+
+**Consumer migration is deliberately not part of this change.** The three existing direct callers
+(`shell.rs`, `flight_recorder.rs`, and the Holocron bond store) still call `fs::fat` directly. What
+they gain by migrating is the half of the check they do not reproduce today: each write verb calls
+`authorize_write` FIRST, which refuses a read-only volume (`Unsupported`, via `FatBackend::read_only`
+→ `BlockSource::write_veto`) and *then* enforces the volume-principal ACL (`principal ==
+self.principal || principal == KERNEL_PRINCIPAL`; the `world_readable` posture is deliberately not
+consulted for writes). The direct callers reproduce the read-only refusal and **not** the ACL.
+
+Known blockers a migration arc must clear first (none of which this change is blocked on):
+
+* **No x86 mount registration exists.** Every `MountTable` in the tree is built per-call, and every
+  registration site is aarch64-gated. x86 has no mount table to present a principal to yet.
+* **`FatBackend`'s source is fixed by its constructor** (`new` → `Default`, `new_usb` → `Usb`).
+  There is no constructor for `mount_program_source()` / `BlockSource::Sdhc`, which is what
+  `shell.rs` actually resolves to on x86.
+* **Missing verbs.** The trait has no `remove_dir` / `rename_entry` / `move_entry`, so the shell's
+  `rmdir`, `mv`, and recursive-copy tree half cannot migrate without extending it.
+* **`flight_recorder::write_log` is roster row 2 precisely because it is NOT a mutator** (bounded
+  `write_at` over an already-reserved chain, writing no FAT entry and no directory sector). Routing
+  it through `VfsBackend::write` (→ `write_grow`) would convert it into a directory-sector RMW on
+  the unsynchronized x86 path — a regression against the roster, not a refactor. It also needs a
+  `first_cluster` back from reservation, which `create`/`truncate` do not surface.
+* **Holocron's write must stay deferred past the `EHCI_HID` lock.** The Bluetooth bonding chain
+  that produces the record runs under `drivers::ehci::EHCI_HID`, inside which a store call must be
+  a memcpy and nothing else; a FAT write there would contend the xHCI storage loan from inside the
+  EHCI service pass and hold keyboard and trackpad hostage for its duration. The deferral is a
+  `flush_if_dirty` guard *above* `write_store_file`, so swapping in `MountTable` calls does not by
+  itself break it — but the check sits per-call-site rather than on the seam. A migration arc should
+  decide whether a "no driver lock held" assertion belongs on the trait's write verbs.
+
+**Verification status — the runtime proof is owed at metal.** This change is gated on
+`./arroyo check` (green, both arches, all 12 cfg-gated legs including `x86-all` and the seven x86
+feature mixes) plus the static call-path trace below. It carries **no QEMU or hardware run**: the
+witnesses that would drive it (`vfs2_fat_write_witness`) are invoked only from
+`arch/aarch64/syscall.rs`, so an x86 runtime proof needs a call site in `arch/x86_64/syscall.rs` —
+outside the VFS lane. Landing the seam unconsumed is what makes that acceptable: nothing executes
+this code on x86 until a consumer or a witness is wired to it, and wiring either is a separate arc
+that must bring its own runtime evidence.
+
+The static path an x86 `VfsBackend::write` takes to the medium, and where the two checks sit:
+
+| Step | Location |
+|---|---|
+| `FatBackend::write` — calls `authorize_write` FIRST | `fs/vfs.rs:712` |
+| `authorize_write` — **read-only refusal** (`VfsError::Unsupported`) | `fs/vfs.rs:664` → `read_only` `fs/vfs.rs:479` → `BlockSource::write_veto` `fs/fat.rs:648` |
+| `authorize_write` — **principal ACL** (`VfsError::Denied`) | `fs/vfs.rs:664` |
+| mount the volume from the backend's source | `fat::mount_source` `fs/fat.rs:1509` |
+| resolve parent dir, locate the leaf | `resolve_parent` `fs/vfs.rs:524` → `locate_in_dir` `fs/fat.rs:3029` |
+| grow/overwrite, publishing size LAST | `write_grow` `fs/fat.rs:2910` |
+| data write → sector run | `write_span` `fs/fat.rs:2623` → `wr_sector` / `wr_sectors` `fs/fat.rs:1887` / `1902` |
+| extent-checked dispatch to the block layer | `write_sector` `fs/fat.rs:736` |
+| the medium | `block::write_block` (Default) / **`block::write_block_usb`** (Usb) / `block::write_block_sdhc` (x86+`sdhcblk`) — `fs/fat.rs:746` / `747` / `751` |
+
+**Metal watch item — the lines a future boot must show.** When a consumer or an x86 witness is
+wired to this seam, that arc must produce, on an x86 boot with a writable FAT volume:
+
+1. a create → write → read-back → checksum round-trip through a `MountTable`, i.e. the
+   `:: VFS2: write test — created <path>, wrote <n>, readback OK :: PASS ::` line §9 defines, with
+   the scratch file unlinked afterwards; and
+2. the **refusal** arm on the same boot: a write attempted against a volume whose `write_veto()` is
+   `Some` must return `VfsError::Unsupported` **before** any sector is touched, and a write
+   presenting a principal that is neither the volume principal nor `KERNEL_PRINCIPAL` must return
+   `VfsError::Denied`. A green round-trip without both refusals is not the proof.
+
 ## 9. The VFS-2 write witnesses
 
 Two on-card, self-cleaning witnesses prove a `create` → `write` → read-back → checksum round-trip
-through the mount table to each real backend (aarch64-only; honest skip when the volume is absent):
+through the mount table to each real backend (aarch64-only; honest skip when the volume is absent).
+Since VFSX86 (§8.1) the *FAT backend* is arch-neutral, so `vfs2_fat_write_witness`'s aarch64-only
+reach is now a property of its **call site** (`arch/aarch64/syscall.rs`), not of `FatBackend`; an
+x86 equivalent needs a call site in `arch/x86_64/syscall.rs`, which is outside the VFS lane.
+`vfs2_native_write_witness` stays aarch64-only for the backend reason (`unafs` is aarch64-gated):
 
 * `vfs::vfs2_fat_write_witness()` — FAT volume mounted at `/`;
 * `vfs::vfs2_native_write_witness()` — native UnaFS volume mounted at `/`.

@@ -132,13 +132,15 @@ pub struct SdSectorDevice {
 /// Exhaustive on purpose (see [`SdSectorDevice`]): every handle the block layer defines contributes
 /// exactly one arm, and the arm names the same registry slot its read/write arms below route to.
 ///
-/// ### MERGE NOTE — the `TegraSd` arms this seam is waiting for
+/// ### MERGE NOTE — the `TegraSd` arms, WRITTEN AT THE TRUNK LANDING
 /// `BlockHandle::TegraSd` and its entry points (`tegra_sd_info`, `read_block_tegra_sd`,
-/// `write_block_tegra_sd`) land in `drivers/block.rs` with the orin track's TEGRASD commit; they do
-/// not exist on this branch, and `drivers/block.rs` is not this arc's lane, so the arms cannot be
-/// written here yet. They are not guesswork either — the totality of these matches makes the merge
-/// report each missing arm as an E0004, and each one is a single line under the TEGRASD cfg triple
-/// `#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]`:
+/// `write_block_tegra_sd`) live in `drivers/block.rs` and arrived with the orin track's TEGRASD
+/// commit; they did not exist on the pi branch, and `drivers/block.rs` was not that arc's lane, so
+/// the arms could not be written there. They were not guesswork either — the totality of these
+/// matches made the merge report each missing arm as an E0004, and each is the single line named
+/// below under the TEGRASD cfg triple
+/// `#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]`. All four are now
+/// applied verbatim, exactly as written here:
 ///
 /// * [`handle_info`] — `BlockHandle::TegraSd => block::tegra_sd_info(),`
 /// * [`handle_read`] — `BlockHandle::TegraSd => block::read_block_tegra_sd(lba, buf),`
@@ -158,6 +160,8 @@ fn handle_info(handle: block::BlockHandle) -> Option<block::BlockDeviceInfo> {
         block::BlockHandle::Usb => block::usb_info(),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => block::tegra_sd_info(),
     }
 }
 
@@ -177,6 +181,8 @@ fn handle_read(
         block::BlockHandle::Usb => block::read_block_usb(lba, buf),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => block::read_block_tegra_sd(lba, buf),
     }
 }
 
@@ -189,6 +195,8 @@ fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), 
         block::BlockHandle::Usb => block::write_block_usb(lba, buf),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => block::write_block_tegra_sd(lba, buf),
     }
 }
 
@@ -244,6 +252,8 @@ impl SdSectorDevice {
             block::BlockHandle::Usb => dev.num_blocks,
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             block::BlockHandle::Sdhc => dev.num_blocks,
+            #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+            block::BlockHandle::TegraSd => dev.num_blocks,
         };
         Ok(Self { handle, sectors })
     }
@@ -541,6 +551,10 @@ fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
         block::BlockHandle::Usb => true,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => true,
+        // TEGRASD merge arm — prescribed by the MERGE NOTE above: the orin's unafs volume rides
+        // the card's dedicated handle while `Global` is the USB stick; admit the probe.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => true,
     }
 }
 
@@ -554,6 +568,8 @@ fn bind_probe_candidates() -> impl Iterator<Item = block::BlockHandle> {
         block::BlockHandle::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc,
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd,
     ]
     .into_iter()
 }
@@ -567,6 +583,8 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
         block::BlockHandle::Usb => "usb",
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        block::BlockHandle::TegraSd => "tegra-sd",
     }
 }
 

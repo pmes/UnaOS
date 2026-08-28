@@ -16,7 +16,15 @@
 //! async schedule with ONE reusable control QH for synchronous enumeration, a periodic frame
 //! list with one interrupt QH per HID endpoint, and a main-loop `service_ehci_hid()` poll that
 //! feeds boot reports through the same decode idiom (and scancode table) as the xHCI HID path.
-//! No interrupts: no USBINTR write, no IDT vector, no MSI.
+//! ISRARM (2026-08-22) — **that poll is no longer the only thing that re-arms an endpoint, and this
+//! line used to say the opposite.** It read *"No interrupts: no USBINTR write, no IDT vector, no
+//! MSI"*, and all three are now false by design: `USBINTR.USBINT` is unmasked, IDT vector
+//! `EHCI_MSI_VECTOR` is registered, and each controller's MSI is routed to the local APIC. The
+//! driver still takes no OTHER interrupt — error, port-change and frame-rollover causes stay masked
+//! and are handled by the poll exactly as before. The polled pass remains the LOAD-BEARING path and
+//! the sole fallback: on a controller with no MSI capability, or a boot where the vector is never
+//! delivered, nothing about this driver's behaviour changes and an `ISRARM IRQ DEAD` line says so.
+//! See the ISRARM block for the defect, the measurement, and why a deeper qTD ring was refused.
 //!
 //! Topology fork (the M1 evidence gate): the first GET_DESCRIPTOR on the root-port device
 //! decides on a serial line whether it is the integrated Rate-Matching Hub (bDeviceClass 0x09 →
@@ -41,8 +49,23 @@ pub mod qh;
 /// that proves them. Split out of this file so the decode can be exercised WITHOUT a radio —
 /// by `bt_name_fixture` on any boot, and by `tools/btname_harness.rs`, which `include!`s the
 /// same source rather than a copy of it. See that file's header for why Boot AR forced this.
-#[cfg(feature = "bt")]
+///
+/// BT-BOND M1 widened this gate to `any(bt, holocron)`. The bond store's witnesses render a stored
+/// BD_ADDR, and the wire-order-vs-display-order of an address is precisely the thing this tree has
+/// already been bitten by — so `btbond.rs` shares `bt_addr_render_msb` / `bt_addr_eq` from here
+/// rather than carrying a second copy of that decision. On a `holocron`-without-`bt` build the rest
+/// of this module genuinely has no consumer, hence the scoped `allow(dead_code)`: the alternative
+/// is a duplicate renderer, which is the failure mode the file exists to prevent.
+#[cfg(any(feature = "bt", feature = "holocron"))]
+#[cfg_attr(not(feature = "bt"), allow(dead_code))]
 mod bt_name;
+
+/// BT-BOND M1 — the bond record schema, its codec, the table rules (replace-not-append, LRU
+/// eviction, lookup by either identity form) and the fixture that proves all three with no radio.
+/// Pure functions over slices; the SSP wiring that will call into it is M2. `holocron` knob.
+#[cfg(feature = "holocron")]
+pub mod btbond;
+
 #[cfg(feature = "bt")]
 use bt_name::{
     bt_addr_case_passes, bt_addr_eq, bt_addr_matches, bt_addr_order_holds, bt_addr_render_msb,
@@ -58,6 +81,10 @@ use super::ehci_scout::{
 };
 use crate::arch::pci::{read_config_16, read_config_32, write_config_32};
 use alloc::vec::Vec;
+// ISRARM: the completion-interrupt path's whole state is atomics — see the ISRARM block. Imported
+// rather than spelled out per use because the ISR touches a dozen of them and the full paths would
+// bury the ordering annotations, which are the part a reader has to check.
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use qh::*;
 use spin::Mutex;
 
@@ -111,17 +138,32 @@ struct Target {
     hub_port: u8,
 }
 
-/// One armed HID interrupt-IN endpoint: its periodic QH, single re-armed qTD, report buffer,
-/// and the software-tracked data toggle (QH runs DTC=1 so the toggle is explicit here, never
-/// hidden controller state).
+/// One armed HID interrupt-IN endpoint: its periodic QH, single re-armed qTD and report buffer.
+///
+/// ⚠ **"Single re-armed qTD" is a statement about the ENDPOINT'S DEPTH, not an invitation to make it
+/// deeper.** A chained ring of qTDs is unbuildable on this silicon — `Controller::overlay_mode` is
+/// true on both of the rMBP's EHCI functions, the controller HSEs on the qTD fetch, and in that mode
+/// the qTD below is not even visible to it. The dark window this shape produces is closed by
+/// re-arming from the completion INTERRUPT instead; see the ISRARM block for the measurement, the
+/// refusal and the design.
+///
+/// The data toggle is NOT here. It lives in `ISR_EPS[isr_slot].toggle`, because the ISR and the
+/// polled pass both re-arm and a toggle with two owners is a toggle with none.
 struct IntEp {
     qh: *mut Qh,
     qtd: *mut Qtd,
-    qtd_phys: u64,
     buf: *mut u8,
-    buf_phys: u64,
     mps: u16,
-    toggle: bool,
+    // ISRARM: `qtd_phys` and `buf_phys` are GONE from here. They were only ever read by the re-arm,
+    // and the re-arm now lives in `isr_rearm` off `ISR_EPS[isr_slot]` — where the ISR can reach it
+    // without the `EHCI_HID` lock. Two copies of a DMA address that must agree with what the
+    // controller was programmed with is exactly the kind of second truth this driver keeps
+    // eliminating; the registry is the one that the hardware path reads, so it is the one that
+    // survives. (`qh`, `qtd` and `buf` stay: the decoders and the KBDWIT probe read them directly.)
+    /// ISRARM: this endpoint's index into `ISR_EPS` / `ISR_RINGS`. DERIVED at arm time as
+    /// `idx * MAX_INT_EPS + int_next`, so it is unique by construction and cannot fail to be
+    /// allocated — see `ISR_MAX_EPS`.
+    isr_slot: usize,
     is_kbd: bool,
     is_rel_mouse: bool,
     /// EHCI-4 M2: Some for a report-protocol pointer (the trackpad path) — the field map parsed
@@ -130,6 +172,14 @@ struct IntEp {
     layout: Option<ReportLayout>,
     reports: u32,
     dead: bool,
+    /// KBDFLAP: how many `ClearFeature(ENDPOINT_HALT)` recoveries this endpoint has spent, capped
+    /// at [`HALT_CLEARS_MAX`]. Per ENDPOINT, not per controller, for the same reason KBDWIT's
+    /// silence clock is: on the boot this exists for, the trackpad on the SAME device was streaming
+    /// while the keyboard was stalled, so any shared budget would have been spendable by an
+    /// endpoint that never needed it. Counts ATTEMPTS, incremented when the clear is queued rather
+    /// than when it succeeds, so a device that refuses the request cannot buy an unbounded number
+    /// of refusals.
+    halt_clears: u8,
     /// CLICK-1: previous report's button bitmask, for button-DOWN edge detection (one
     /// `pal::Event::Button` per press, nothing on release/hold).
     prev_buttons: u8,
@@ -183,6 +233,45 @@ struct IntEp {
     /// button, or idle keep-alive). The re-press recovery below reads the SILENCE between reports,
     /// so it must be stamped by every report, not only by button ones. 0 = no report yet.
     last_report_ms: u64,
+    /// EHCIDARK — the SMALLEST service-pass gap ever observed to end in a completion on this
+    /// endpoint, i.e. the device's own report cadence, self-calibrated on the passes that kept up.
+    /// `u32::MAX` until the first completion.
+    ///
+    /// Measured rather than read off `bInterval` deliberately, and the reason is that `bInterval` is
+    /// the wrong number twice over here. The QH is armed with S-mask `0x01` — one start-split per
+    /// frame — so the HOST offers this endpoint a transaction every 1 ms regardless of what the
+    /// descriptor asked for; and what the census needs is not how often the host asks but how often
+    /// the DEVICE has something to say, which for a change-only trackpad is a property of the hand,
+    /// not of the descriptor. The floor of the observed gaps is that rate: on boot 10 of
+    /// `rmbp2-boot8` the pad's routed cadence is 8 ms flat with a p50 gap of exactly 8.
+    dark_cad_ms: u32,
+    /// EHCIDARK — service passes that found a report waiting after a gap long enough for the device
+    /// to have generated MORE than the one report the endpoint can hold. One window = one stretch of
+    /// darkness the operator paid for.
+    dark_windows: u32,
+    /// EHCIDARK — total milliseconds inside those windows. The hard number: an upper bound on the
+    /// time this endpoint spent holding a retired qTD with nothing armed behind it.
+    dark_ms: u64,
+    /// EHCIDARK — the worst single such window.
+    dark_max_ms: u32,
+    /// EHCIDARK — **the answer to "how many reports were missed", stated as the BOUND it is.**
+    ///
+    /// Σ over dark windows of `gap / cadence - 1`. It is an upper bound and not an exact count
+    /// because the wire is invisible from here: the driver knows when it re-armed and it knows the
+    /// device's cadence, but a completion observed at time `t` after a pass gap of `g` only proves
+    /// the report landed somewhere in `(t - g, t]` — so the dark stretch is at most `g` and the
+    /// reports the device could have generated inside it at most `g / cadence`, one of which is the
+    /// one we got. Under-arming cannot make it read low and idleness cannot make it read high: a
+    /// pass that finds the qTD still ACTIVE contributes nothing, so a still hand costs zero.
+    dark_missed: u64,
+    /// EHCIDARK — `arch::ms()` of the last `EHCIDARK` line emitted for this endpoint, rate-limiting
+    /// it to one per [`EHCIDARK_ROLLUP_MS`]. Per ENDPOINT so a chatty pointer cannot mask a
+    /// keyboard's own darkness, and paired with [`IntEp::dark_missed_logged`] so a healthy endpoint
+    /// prints NOTHING at all — this instrument exists to shorten a burst, not to add to one.
+    dark_log_ms: u64,
+    /// EHCIDARK — the `dark_missed` value the last emitted line carried. A pass whose census has not
+    /// moved has nothing new to say and stays off the wire.
+    dark_missed_logged: u64,
     /// KBDWIT — `arch::ms()` when this endpoint was ARMED. The silence clock's origin for an
     /// endpoint that has never completed anything (the s58 keyboard's exact state). Deliberately
     /// separate from `last_report_ms`, which only the POINTER paths stamp (`note_buttons`) and so
@@ -246,6 +335,19 @@ struct IntEp {
     /// KBDWIT-2 — the `SILENCE-BROKE` one-shot. At most one such line per endpoint per boot.
     #[cfg(feature = "kbdwit")]
     kbdwit_broke: bool,
+    /// KBDWIT-LATCH — the `SILENCE-CUT-BY-HALT` one-shot: a halt that arrived BEFORE this endpoint
+    /// ever reached its silence deadline. At most one such line per endpoint per boot.
+    ///
+    /// Deliberately a SEPARATE latch from [`IntEp::kbdwit_broke`] rather than a third user of it.
+    /// The two describe different instants and a single endpoint can legitimately reach both: with
+    /// KBDFLAP's bounded `ClearFeature(ENDPOINT_HALT)` recovery in the path, an endpoint may be cut
+    /// short by a stall at 2.4 s, be cleared and re-armed, go quiet, fire the deadline dump, and
+    /// only then break its silence. Sharing one latch would have made those mutually exclusive and
+    /// silently dropped whichever came second — reintroducing, one layer down, the exact failure
+    /// this arc is closing. Two latches means at most two KBDWIT lines per endpoint per boot, which
+    /// is still a constant, and the pair reads as the sequence it was.
+    #[cfg(feature = "kbdwit")]
+    kbdwit_cut: bool,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -287,6 +389,43 @@ struct IntEp {
 // long quiet gap — but a *new press after a missed release* always is. So: a report that still reads
 // "primary down" after ≥ `CLICK_REPRESS_QUIET_MS` of endpoint silence is a NEW press. No protection
 // is weakened and no held-button case gains a spurious repeat.
+//
+// ARC D M1 — **THE LAST SENTENCE ABOVE WAS FALSE ON THIS PAD, AND METAL SAID SO.** Boot 3
+// (2026-08-19, `UNAOS_USBDEBUG=1`): quiet clicking held `recovered=` at 0-1 across ~7 minutes, and
+// then, the moment the hand started HOLDING AND DRAGGING, `recovered` climbed 2 -> 19 tracking
+// `delivered` one-for-one — roughly ONE MANUFACTURED PRESS PER 300 ms OF DRIFTING HOLD. The premise
+// "neither case can produce a pressed report separated from the previous report by a long quiet
+// gap" ignores the third case this pad actually produces: a change-only pad is SILENT through a
+// still hold, so the first finger DRIFT after the gap re-reports "still down" and reads exactly like
+// a new press. The arm fires at scale in ordinary drag use; the rescue it was built for is rare
+// (≤1 ambiguous firing in 7 minutes of clicking).
+//
+// THE DISCRIMINATOR IS MOTION, and it is free at every call site. On a change-only pad a DRIFT
+// report always carries dx/dy != 0 — the drift is the whole reason the report exists. A finger that
+// genuinely RE-LANDED after a missed release arrives MOTIONLESS: it is a fresh contact, and its
+// first report is the button change. So the quiet-gap arm additionally requires `!moved`. That kills
+// the phantom storm without giving up the ring-loss rescue (Boot C: 43 down-edges vs 29 releases —
+// a report lost AT THE RING is real, and the re-landed press that follows it carries no motion).
+//
+// AND WHEN IT FIRES IT OPENS A NEW GESTURE INSTEAD OF INJECTING A SECOND PRESS INTO THE LIVE ONE.
+// The arm's entire claim is that a RELEASE went missing — so it SYNTHESISES that release first:
+// `set_button_level(false)` (which is what bumps the release generation, the boundary every
+// consumer's notion of "a new gesture" is built on) plus a queued `Button(0)`, before republishing
+// the level as down and returning the press. That turns the producer's contract into an INVARIANT
+// rather than a hope:
+//
+//   **ONE PRESS EDGE PER GESTURE. A press is always preceded by the release that ended the previous
+//   one — synthesised here when the wire lost it.**
+//
+// Which is why the consumer-side duplicate guards this arc removes (`wc_click_route_at`'s
+// stale-latch arm, `video::crystal`'s CLICK-HOLD generation guard) are not merely unnecessary but
+// UNREACHABLE: nothing downstream has to tell a duplicate press from a real one any more, because
+// the producer no longer emits one. The router can go back to the only rule that needs no hidden
+// state — primary bit set is a press, clear is a release.
+//
+// METAL FALSIFIER (QEMU cannot exercise this belt — it delivers no pointer at all): drag the pad and
+// `recovered=` must not increment ONCE; and one physical click must produce exactly one press edge
+// at every consumer, most visibly the SHARD menu, which opens and stays open.
 // ======================================================================================
 
 /// CLICK-3 — endpoint silence (ms) after which a still-pressed report counts as a NEW press rather
@@ -310,16 +449,22 @@ impl IntEp {
     /// parsed report-pointer, boot mouse). Stamps the report clock, decides whether this report is a
     /// primary-button PRESS, and updates `prev_buttons`.
     ///
-    /// DRAGREL — returns `(press, release)`: `press` is the CLICK-1/CLICK-3 verdict, bit-for-bit the
-    /// predicate this function has always returned (down edge, or a still-down report after
-    /// `CLICK_REPRESS_QUIET_MS` of endpoint silence), and `release` is the newly added primary
-    /// 1 -> 0 edge. The caller owes one `pal::Event::Button(buttons)` for EITHER — the press event's
-    /// mask has the primary bit set, the release event's has it clear, which is how every consumer
-    /// tells them apart.
+    /// DRAGREL — returns `(press, release)`: `press` is the CLICK-1/CLICK-3 verdict (down edge, or
+    /// a still-down MOTIONLESS report after `CLICK_REPRESS_QUIET_MS` of endpoint silence), and
+    /// `release` is the primary 1 -> 0 edge. The caller owes one `pal::Event::Button(buttons)` for
+    /// EITHER — the press event's mask has the primary bit set, the release event's has it clear,
+    /// which is how every consumer tells them apart.
     ///
-    /// **The press semantics are unchanged and must stay unchanged.** A release edge is a new
-    /// OBSERVATION, not a new definition of a press: `prev_buttons`, the quiet-gap recovery and the
-    /// `usbdebug` press ledger below all behave exactly as before.
+    /// ARC D M1 — `moved` is THIS REPORT'S OWN MOTION (`dx/dy != 0`), and it is what separates a
+    /// drifting hold from a genuinely re-landed finger; see the section header above for the boot-3
+    /// measurement that made it necessary. It is passed rather than derived because only the decode
+    /// site knows a report's motion — this function is deliberately given no view of the report
+    /// bytes, and the trackpad's 0x02 byte decode is not touched by this arc.
+    ///
+    /// ARC D M1 — and when the quiet-gap arm DOES fire, this function first synthesises the release
+    /// the wire lost (level down, `Button(0)` queued, release generation bumped) and then republishes
+    /// the level as down, so the recovered press OPENS A NEW GESTURE. The invariant every consumer
+    /// may now rely on: **one press edge per gesture, always preceded by a release.**
     ///
     /// It also PUBLISHES the current level to `pal::cursor::set_button_level` on every report, edge
     /// or not. That is the half a missed report cannot destroy: this endpoint is armed for one
@@ -330,7 +475,7 @@ impl IntEp {
     /// `Event::Button` on the DOWN edge only and publishes no level. That path is not the rMBP
     /// trackpad's, so it is not the drag defect this arc closes; it wants the same two lines and is
     /// a follow-up.
-    fn note_buttons(&mut self, buttons: u8, idx: usize) -> (bool, bool) {
+    fn note_buttons(&mut self, buttons: u8, moved: bool, idx: usize) -> (bool, bool) {
         let now = crate::arch::ms();
         let prev = self.prev_buttons;
         // Silence since the PREVIOUS report on this endpoint (before this one is stamped). `== 0`
@@ -346,8 +491,24 @@ impl IntEp {
         // DRAGREL — the primary RELEASE edge. Orthogonal to the press arms: it cannot be true in the
         // same report as `edge` or `repress` (both require `down`).
         let release = !down && prev & 0x01 != 0;
-        // The recovery arm: still down, was down, and the endpoint was silent across the gap.
-        let repress = down && prev & 0x01 != 0 && quiet;
+        // The recovery arm: still down, was down, the endpoint was silent across the gap — and this
+        // report carries NO MOTION OF ITS OWN. ARC D M1: the last clause is the whole redesign. A
+        // drifting hold is the case that made this arm manufacture ~1 press per 300 ms on metal, and
+        // a drift report is a MOTION report by construction; a finger that re-landed after a lost
+        // release is a fresh contact and arrives motionless.
+        let repress = down && prev & 0x01 != 0 && quiet && !moved;
+        if repress {
+            // ARC D M1 — SYNTHESISE THE MISSING RELEASE, then re-open. The arm's claim is precisely
+            // that a release was lost; making that claim explicit is what keeps the recovered press
+            // from landing INSIDE the live gesture as a second press. `set_button_level(false)` is
+            // the seam that bumps the release generation (`pal::cursor`), and the queued `Button(0)`
+            // is the edge every consumer that watches edges needs. Pushed with no motion — this
+            // report has none, which is what `repress` just asserted — so the pairing hint is
+            // honest. The caller then pushes the PRESS for the same report, in that order.
+            crate::pal::cursor::set_button_level(false);
+            crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0)));
+            crate::pal::cursor::set_button_level(true);
+        }
         #[cfg(feature = "usbdebug")]
         {
             use core::sync::atomic::Ordering::Relaxed;
@@ -365,7 +526,7 @@ impl IntEp {
                     PTR_PRESS_SEEN.load(Relaxed),
                     PTR_PRESS_DELIVERED.load(Relaxed),
                     PTR_PRESS_RECOVERED.load(Relaxed),
-                    if repress { "re-press after quiet gap" } else { "down edge" },
+                    if repress { "motionless re-press after quiet gap (release synthesised)" } else { "down edge" },
                 );
             }
         }
@@ -968,6 +1129,56 @@ const BT_HCI_DISCONNECT: u16 = 0x0406;
 /// will surface to its own user as a clean teardown rather than a supervision-timeout loss.
 #[cfg(feature = "bt")]
 const BT_HCI_REASON_REMOTE_USER_TERM: u8 = 0x13;
+/// BT-L3/RELEASE-2 — the SECOND reason, and it exists to isolate one byte.
+///
+/// `HCI_Disconnect` carries exactly two parameters: the handle and the reason. Boot 11 was
+/// answered Command Status **0x12 (Invalid HCI Command Parameters)** on
+/// `handle=0x0040 reason=0x13`, which says one of those two bytes was judged illegal and does not
+/// say which. `HCI_Read_RSSI` settles the handle (see `BT_HCI_READ_RSSI`); this settles the
+/// reason. 0x05 = Authentication Failure is on the SAME short list the Core spec allows a host to
+/// send (0x05, 0x13-0x15, 0x1A, 0x29, 0x3B), so a controller that accepts 0x05 where it refused
+/// 0x13 has told us, in one round trip, that its parameter check disagrees with the spec about the
+/// reason byte — and, more to the point, the link is down either way. It is retried ONLY after the
+/// probe has said the handle is live, so it is never a shot in the dark at a handle that no longer
+/// exists.
+#[cfg(feature = "bt")]
+const BT_HCI_REASON_AUTH_FAILURE: u8 = 0x05;
+/// BT-L3/RELEASE-2 — `HCI_Read_RSSI`: OGF 0x05 (Status) / OCF 0x0005 => opcode 0x1405. Two
+/// parameter bytes, Connection_Handle(2, LE); returns a **Command Complete** whose return
+/// parameters are Status(1) Connection_Handle(2) RSSI(1).
+///
+/// THE HANDLE PROBE, and it is chosen precisely because it TRANSMITS NOTHING. Vol 4 Part E §7.5.4
+/// makes it a read of the controller's own record of the last packet received on that handle: no
+/// LMP, no LL, no air time, no state change on either side. It is therefore admissible under this
+/// arc's standing rule that no radio operation may happen that was not asked for, and it answers
+/// the one question a refused disconnect leaves open — does the controller still HAVE this handle?
+/// A controller that does not answers `0x02` (Unknown Connection Identifier), which is the same
+/// answer for a handle that never existed and for one whose link has already gone; either way
+/// nothing is held and the arc is not leaking a link. `0x00` proves the opposite: the link is
+/// live, the handle is valid, and the refusal was about the OTHER parameter.
+///
+/// Boot 11's `HCI_Read_Local_Supported_Commands` reply carries `cmds[15]=0xfe`, and Read_RSSI is
+/// octet 15 bit 3, so this controller advertises it. The code does NOT rely on that: an
+/// `0x01` (Unknown HCI Command) status is handled as "the probe is unavailable here" and the
+/// reason retry runs anyway.
+#[cfg(feature = "bt")]
+const BT_HCI_READ_RSSI: u16 = 0x1405;
+/// BT-L3/RELEASE-2 — the two controller error codes this teardown reasons about by name.
+/// `0x02` Unknown Connection Identifier, `0x12` Invalid HCI Command Parameters.
+#[cfg(feature = "bt")]
+const BT_ERR_UNKNOWN_CONN_ID: u8 = 0x02;
+#[cfg(feature = "bt")]
+const BT_ERR_INVALID_PARAMS: u8 = 0x12;
+/// BT-L3/RELEASE-2 — how many walked-past event codes the teardown records, to print on a refusal.
+///
+/// Boot 11's tally said `events_read=5`: one Command Status for the create, one LE Connection
+/// Complete, and THREE during the teardown — of which only the last, the refusal itself, was ever
+/// named. The other two were walked past by `bt_l3_await` and left no trace, and one of them may
+/// well have been the `Disconnection Complete` that explains the whole refusal. Eight codes is
+/// more than the teardown can legitimately produce and costs eight bytes of state; the counter
+/// saturates past it so a chatty controller cannot make the line unbounded.
+#[cfg(feature = "bt")]
+const BT_L3_TRAIL_MAX: usize = 8;
 /// BT-L3 — HCI event codes: Command Status, and Disconnection Complete.
 #[cfg(feature = "bt")]
 const BT_EVT_CMD_STATUS: u8 = 0x0F;
@@ -1460,6 +1671,15 @@ const BT_C1_PAGE_TIMEOUT: u16 = 0x2000;
 /// power-cycled into pairing mode is also servicing inquiry scan and (for a speaker) reconnection
 /// attempts to hosts it remembers. A second train samples a different phase of that schedule.
 ///
+/// THAT WAS AN ASSUMPTION UNTIL BOOT 3 MEASURED IT, AND IT WAS FALSE. BT-C1-DISCRIM's phase
+/// witness put the retry gap at 5125 ms against R2's 2560 ms scan interval — 5 ms from two whole
+/// cycles — so the second train sampled the SAME phase, on a parameter block built before the
+/// first train and re-sent unchanged. Two timeouts were one observation. The retry therefore no
+/// longer takes whatever gap the page timeout leaves it: it REBUILDS its parameter block from the
+/// freshest inquiry state (`bt_c1_page_fields`) and is DELAYED so its start sits about half a scan
+/// interval off a whole multiple (`bt_c1_phase_step_ms`). Both intentions are printed against what
+/// the clock measured, so a retry that still tests nothing says so on its own line.
+///
 /// THE BOUND, counted properly rather than quoted as the paging time alone: 2 attempts x 5.12 s is
 /// ~10.3 s of PAGING, but the stage also spends 2 x `BT_C1_CONN_MS` (5600 ms) of host window — the
 /// controller's Page Timeout normally lands first, so these overlap the paging rather than adding
@@ -1467,7 +1687,9 @@ const BT_C1_PAGE_TIMEOUT: u16 = 0x2000;
 /// one `hw_wait_budget()` (~1.1 s) if `HCI_Write_Page_Timeout` itself goes unanswered — and, as of
 /// the inquiry arc, the inquiry in front of it: `BT_C1_INQUIRY_MS` (5600 ms) plus two
 /// `BT_L3_CMD_MS` round trips, ~6.2 s, and only on a boot where the target never answers it. **The
-/// bounded worst case for the whole classic stage is therefore ~18.6 s**, not the ~12.4 s this
+/// bounded worst case for the whole classic stage is therefore ~18.6 s** — plus the retry's phase
+/// step, at most half a scan interval and so **<= 1.28 s** on the worst mode (R2), 0 on R0 and 0
+/// on a first train — not the ~12.4 s this
 /// comment quoted before the inquiry existed and not the ~10.2 s an earlier draft quoted; with the
 /// LE stage's repeat scan in front of it the worst boot is ~21 s. THE GOOD CASE IS MUCH SHORTER
 /// AND IS THE POINT: an inquiry that hears the target exits early, and the page it then makes is
@@ -1561,6 +1783,137 @@ const BT_C1_LINK_TYPE_ACL: u8 = 0x01;
 const BT_C1_CONN_MS: u64 = 5600;
 
 // ---------------------------------------------------------------------------------------------
+// BT-DIR — THE DIRECTION TEST. Everything above this line pages OUTWARD; this asks the other way.
+//
+// WHAT IS SETTLED AND IS NOT RE-LITIGATED HERE (BTREGRESS, merged f8210a6a). There is no
+// regression: BR/EDR never reliably worked, the two 2026-08-11 links were 2 of 12 blind page
+// trains on one day, and the RSSI readings once cited as evidence were `bt-l2 evt=ADV_IND` — the
+// LE scan, not the classic inquiry, which reported `responses=0 target_found=false` in those same
+// boots. The peer is settled: `88:c6:26:cc:2d:3c`, `class_of_device=0x240418` = Audio/Video,
+// Audio + Rendering — an audio sink, confirmed 2026-08-22. And the failure STAGE is unambiguous:
+// the page goes out, the controller certifies the full train (`observed=5123ms` against a
+// `5120ms` deadline it read back to us), and the answer is `Connection Complete status=0x04`
+// PAGE TIMEOUT — both attempts, every boot.
+//
+// THE ONE SURVIVING HYPOTHESIS, and why it needs a different instrument. Answering an inquiry
+// proves the peer is INQUIRY-scanning. Page scan is a SEPARATE enable (Vol 4 Part E §7.3.18), and
+// "discoverable but not connectable" is the ordinary resting state of a speaker already bonded
+// somewhere else. Every attempt this project has ever made tested ONE direction: us paging it.
+// If the peer can page US, the RF path works both ways and the fault is in our train (clock
+// offset, page-scan repetition mode) rather than in the peer's radio. If it cannot, no host-side
+// page change will ever fix it and this line of work should stop.
+//
+// SO THE TEST IS: enable page scan on THIS host, hold one page window, and report what arrives.
+//
+// TWO PHASES, NEVER CONCURRENT, AND THAT IS THE WHOLE DESIGN. A controller with page scan enabled
+// time-slices between its inbound scan windows and any outbound page train it is running. Doing
+// both at once would degrade the very train this arc has spent four boots measuring and hand back
+// a confounded result. So:
+//   * PHASE 1 is the existing outbound page train with scan DISABLED — byte-identical in
+//     behaviour to a `btc` boot, because every line of this section is `btdir`-gated and sits
+//     strictly AFTER `bt_c1_tally` has already printed phase 1's verdict. Phase 1 remains the
+//     CONTROL and this arc must not perturb it.
+//   * PHASE 2 writes `Scan_Enable = 0x03`, holds `BT_DIR_WINDOW_MS`, and logs what came.
+//   * PHASE 3 writes `Scan_Enable = 0x00` back and READS IT BACK. Not for safety — for experiment
+//     hygiene: a machine left in a different radio state than the one the next boot's control
+//     assumes is a contaminated control.
+//
+// NO ACCEPT PATH IS ADDED, and that is scope, not caution. The reading this arc needs is the
+// `Connection Request` EVENT arriving. Accepting it is a different feature (`Accept_Connection_
+// Request` 0x0409 does not exist anywhere in this tree, and neither does SDP, RFCOMM, a local
+// name, or a written Class of Device) and is not what is being measured.
+//
+// HOW TO READ THE RESULT — all four exits are printed by `bt_dir_probe`'s own result line, on
+// every path, so no source dive is needed at the bench:
+//   * REQUEST   — a `Connection Request` (0x04) arrived. RF works in BOTH directions and the peer
+//                 CAN page. The fault is our page train or the peer's page-scan enable being off
+//                 in the outbound direction only.
+//   * NEGATIVE  — nothing arrived, and the SAME boot's inquiry DID hear the target. The peer is
+//                 not connectable in either direction; no host-side page change fixes that.
+//   * VOID      — nothing arrived AND the inquiry did not hear the target either. The peer was
+//                 absent or off for this boot. THE TEST DID NOT RUN AGAINST ANYTHING. This is the
+//                 MOST LIKELY outcome — recent boots report `responses=0` — and a void run
+//                 misread as a negative is exactly how a wrong conclusion gets recorded, which is
+//                 why the word VOID is printed rather than left to be inferred.
+//   * SCAN NOT ENABLED — the controller refused the `Write_Scan_Enable`, or the readback says a
+//                 different value is in force. NOTHING about the peer is learned. Without this
+//                 exit a machine that never enabled scan would print a silence indistinguishable
+//                 from NEGATIVE, which is the "instrument that cannot fire in the state it exists
+//                 for" failure this repo has hit four times in one week.
+// ---------------------------------------------------------------------------------------------
+
+/// BT-DIR — `HCI_Write_Scan_Enable`: OGF 0x03 (Controller & Baseband) / OCF 0x001A => opcode
+/// 0x0C1A. One parameter byte (Scan_Enable); returns status(1) in a **Command Complete**. Vol 4
+/// Part E §7.3.18.
+#[cfg(feature = "btdir")]
+const BT_HCI_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
+/// BT-DIR — `HCI_Read_Scan_Enable`: OGF 0x03 / OCF 0x0019 => opcode 0x0C19. No parameters; returns
+/// status(1) Scan_Enable(1). Vol 4 Part E §7.3.17.
+///
+/// IT IS NOT DECORATION. `Write_Scan_Enable` answering status=0x00 says ACCEPTED; it does not say
+/// IN FORCE. The whole phase-2 reading is "the host was page-scannable and nothing paged it", and
+/// that sentence is worthless if the first clause was never true. Same discipline BT-C1/AGE
+/// already applies to `Read_Page_Timeout`, and for the same reason.
+#[cfg(feature = "btdir")]
+const BT_HCI_READ_SCAN_ENABLE: u16 = 0x0C19;
+/// BT-DIR — `HCI_Read_Page_Scan_Activity`: OGF 0x03 / OCF 0x001B => opcode 0x0C1B. No parameters;
+/// returns status(1) Page_Scan_Interval(2) Page_Scan_Window(2), both in 0.625 ms slots. Vol 4
+/// Part E §7.3.19.
+///
+/// Read-only, and it is what makes `BT_DIR_WINDOW_MS` a MEASURED bound rather than an assumed one:
+/// the window must span several of THIS controller's page-scan intervals, and the interval is the
+/// controller's parameter, not ours. A boot where this read fails still runs the window — it just
+/// says on its own line that the interval it was sized against is unread.
+#[cfg(feature = "btdir")]
+const BT_HCI_READ_PAGE_SCAN_ACTIVITY: u16 = 0x0C1B;
+/// BT-DIR — `Scan_Enable` = **0x03**: bit 0 inquiry scan + bit 1 page scan (Vol 4 Part E §7.3.18).
+///
+/// BOTH BITS, not page scan alone. A BR/EDR peer that has never bonded with this host has no
+/// reason to page an address it has not discovered, and inquiry scan is what makes the host
+/// answerable at all; enabling only bit 1 would test "can the peer page a host it cannot see",
+/// which is a question nobody asked. It also costs nothing extra — the two scans share the same
+/// idle-mode slots.
+#[cfg(feature = "btdir")]
+const BT_DIR_SCAN_BOTH: u8 = 0x03;
+/// BT-DIR — `Scan_Enable` = **0x00**: no inquiry scan, no page scan. The controller's own reset
+/// default, and the value phase 3 writes back. It is a named constant and not an inline `0x00`
+/// because the restoration line PRINTS it: "restored" must be a value the reader can check, not a
+/// claim the code makes about itself.
+#[cfg(feature = "btdir")]
+const BT_DIR_SCAN_OFF: u8 = 0x00;
+/// BT-DIR — HCI event code 0x04 = `Connection Request` (classic). Ten parameters:
+/// BD_ADDR(6) Class_of_Device(3) Link_Type(1) => 12 bytes on the wire. Vol 4 Part E §7.7.4.
+///
+/// IT IS ALREADY UNMASKED. Bit 3 of the event mask is set in the reset default that BT-L1 writes
+/// and BT-C1 extends, so this arc writes no mask — exactly as BT-C1 writes none for
+/// `Connection Complete`. That matters: a masked event would produce a silence identical to a peer
+/// that never paged, and this arc would have printed VOID over a controller that was gagged.
+#[cfg(feature = "btdir")]
+const BT_EVT_CONN_REQUEST: u8 = 0x04;
+/// BT-DIR — how long phase 2 holds the page-scan window, in ms: **6400**.
+///
+/// FIVE PAGE-SCAN INTERVALS at the controller's reset default (0x0800 slots x 0.625 ms = 1.28 s,
+/// Vol 4 Part E §7.3.19) — and the actual interval is READ, not assumed, by
+/// `BT_HCI_READ_PAGE_SCAN_ACTIVITY` above, with the ratio printed so a controller running a longer
+/// interval makes the shortfall visible instead of silent. Five is chosen against the OTHER side
+/// of the exchange: a peer paging us runs its own page train under its own page timeout, commonly
+/// the 5.12 s spec default, and a window shorter than that could close while the peer was still
+/// mid-train — manufacturing precisely the FALSE NEGATIVE this arc exists to avoid. It is spent
+/// only on a boot that set `UNAOS_BTDIR=1`, once, after the page stage has already finished.
+#[cfg(feature = "btdir")]
+const BT_DIR_WINDOW_MS: u64 = 6400;
+/// BT-DIR — how many times phase 2 may re-enter `bt_l3_await` before giving up on the window.
+///
+/// `bt_l3_await` carries a STRUCTURAL cap of `BT_L3_EVT_MAX` (16) events per call, and a busy room
+/// can spend that cap on traffic that is not a `Connection Request` — at which point the call
+/// returns `Timeout` with most of the wall clock still unspent. Re-entering is what keeps the
+/// window a WALL-CLOCK window rather than an event-count one; without it a noisy bench would end
+/// phase 2 in milliseconds and print a silence that was never listened for. The wall clock is
+/// still the real bound: every re-entry is given only what remains of `BT_DIR_WINDOW_MS`.
+#[cfg(feature = "btdir")]
+const BT_DIR_AWAIT_REENTRIES: u32 = 64;
+
+// ---------------------------------------------------------------------------------------------
 // BT-C1/INQUIRY — the step Boot D proved was missing.
 //
 // BOOT D IS THE GROUND FACT THIS EXISTS FOR. Peter confirmed the MEGABOOM was in PAIRING MODE for
@@ -1631,8 +1984,28 @@ const BT_C1_INQUIRY_LAP: [u8; 3] = [0x33, 0x8B, 0x9E];
 /// because this stage EXITS EARLY the instant the target answers (see `bt_c1_inquiry`) — the full
 /// 5.12 s is paid only on a boot that does not hear it, which is precisely the boot where the
 /// listening time has to be defensible.
+///
+/// **BTRX (gr28) RAISES THIS TO 0x08 = 10.24 s, AND THE PARAGRAPH ABOVE IS WHY IT WAS WRONG.**
+/// It reasoned about the listening time as a budget to be justified. The correct frame is the
+/// inquiry hop sequence. The 32 inquiry frequencies are split into two trains, A and B, of 16
+/// each (Core Vol 2 Part B §8.4.3 "inquiry substate"). The inquiring device transmits ONE train
+/// repeatedly for Ninquiry = 256 repetitions — 2.56 s — before switching to the other, and a peer
+/// whose inquiry-scan window happens to sit on the other train's frequencies CANNOT be heard until
+/// that switch. 5.12 s buys exactly one A-then-B pass with no margin: if the peer's scan window
+/// and our train miss each other on the single pass each train gets, the result is not "fewer
+/// responses", it is ZERO responses, deterministically, on every boot. That is the exact signature
+/// three gr27 boots produced — responses=0, read_to_term=true, Inquiry Complete on schedule.
+/// 10.24 s is four train periods (A B A B): every train gets a SECOND pass at a different phase of
+/// the peer's scan cycle, which is what turns a coin-flip into a measurement. It is also the
+/// conventional figure the paragraph above already named and then declined to spend.
+///
+/// THE COST IS BOUNDED BY THE SAME EARLY EXIT AS BEFORE: the stage returns the instant the target
+/// answers, so the extra 5.12 s is spent only on the boot that hears nothing — and a boot that
+/// hears nothing after a FULL two-pass sweep of both trains is worth vastly more than one that
+/// heard nothing after a single pass, because only the first excludes train misalignment. This is
+/// still air time in Peter's room and still spent only under `UNAOS_BTC=1`.
 #[cfg(feature = "btc")]
-const BT_C1_INQUIRY_LEN: u8 = 0x04;
+const BT_C1_INQUIRY_LEN: u8 = 0x08;
 /// BT-C1 — `Num_Responses` = **0x00 = unlimited**. Capping it would end the inquiry at the first
 /// device to answer, and the first device to answer is very unlikely to be the target: the whole
 /// diagnostic value of this stage is the FULL list of what is on the air on classic. The stage's
@@ -1641,12 +2014,22 @@ const BT_C1_INQUIRY_LEN: u8 = 0x04;
 #[cfg(feature = "btc")]
 const BT_C1_INQUIRY_MAX_RESP: u8 = 0x00;
 /// BT-C1 — bounded host window, in ms, for the inquiry to end. Sized to sit just past
-/// `BT_C1_INQUIRY_LEN` x 1280 ms (5120 ms => 5600 ms here), for the same reason `BT_C1_CONN_MS`
-/// sits past the page timeout: the controller sends `Inquiry Complete` of its own accord when the
-/// inquiry length expires, and a window that closed FIRST would report "no answer" on a boot where
-/// the controller was about to say exactly what it heard. THE TWO MOVE TOGETHER.
+/// `BT_C1_INQUIRY_LEN` x 1280 ms, for the same reason `BT_C1_CONN_MS` sits past the page timeout:
+/// the controller sends `Inquiry Complete` of its own accord when the inquiry length expires, and
+/// a window that closed FIRST would report "no answer" on a boot where the controller was about to
+/// say exactly what it heard. THE TWO MOVE TOGETHER — and BTRX moved them together: with
+/// `BT_C1_INQUIRY_LEN` now 0x08 (10240 ms) this is 10740 ms, preserving the same 480 ms of slack
+/// the 5120/5600 pair carried. Leaving this at 5600 while the length doubled would have
+/// manufactured a `NO Inquiry Complete` timeout on EVERY boot and destroyed the very measurement
+/// the longer inquiry buys, so the pairing is asserted at COMPILE TIME just below rather than left
+/// to whoever edits one of the two next.
 #[cfg(feature = "btc")]
-const BT_C1_INQUIRY_MS: u64 = 5600;
+const BT_C1_INQUIRY_MS: u64 = 10740;
+/// BTRX — the host window MUST outlast the inquiry length; see both constants above. Checked at
+/// COMPILE TIME so a future edit that moves one and not the other fails the build rather than
+/// producing a capture nobody can re-fly.
+#[cfg(feature = "btc")]
+const _: () = assert!(BT_C1_INQUIRY_MS > BT_C1_INQUIRY_LEN as u64 * 1280);
 /// BT-C1 — HCI event code 0x01 = `Inquiry Complete`. One parameter, Status(1) => 3 bytes on the
 /// wire. Enabled by bit 0 of the event mask L1 already wrote.
 #[cfg(feature = "btc")]
@@ -1989,6 +2372,160 @@ const BT_HCI_REMOTE_OOB_NEG_REPLY: u16 = 0x0433;
 /// traffic to narrow away, and the provenance note on `BT_EVENT_MASK_LE` applies here unchanged.
 #[cfg(feature = "btc")]
 const BT_EVENT_MASK_SSP: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x3F, 0x20];
+/// BT-C1 — the event mask the INQUIRY needs, and why bit 46 is not optional. The mask in force
+/// when C1 runs is `BT_EVENT_MASK_LE`, whose octet 5 is 0x1F — bits 40..44. `Extended Inquiry
+/// Result` (event 0x2F) is bit **46**, and it is CLEAR there. A controller whose Inquiry_Mode is
+/// 0x02 delivers EVERY response as 0x2F, so with bit 46 clear an inquiry runs its full length,
+/// emits its `Inquiry Complete` (bit 0, set) and reports NOTHING — a clean, silent, entirely
+/// wrong "the room is empty", which is exactly the shape gr27 flew (responses=0,
+/// read_to_term=true, events_read accounting to the command statuses alone). Octet 5 becomes
+/// 0x1F | 0x40 = 0x5F; bit 61 (LE Meta, octet 7 = 0x20) is carried from L2 unchanged so nothing
+/// L2 opened is narrowed. Nothing else moves.
+#[cfg(feature = "btc")]
+const BT_EVENT_MASK_C1: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0x00, 0x20];
+/// BT-C1 — `HCI_Read_Inquiry_Mode`: OGF 0x03 / OCF 0x0044 => opcode 0x0C44. No parameters;
+/// returns Status(1) Inquiry_Mode(1). READ-ONLY, and it is the single byte the inquiry-deafness
+/// investigation lacks: 0x00 standard (results as 0x02), 0x01 with RSSI (0x22), 0x02 RSSI+EIR
+/// (0x2F — the shape bit 46 was masking). This arc has never measured this Broadcom ROM's
+/// power-on mode; the spec's reset default (0x00) was an assumption, not a reading.
+#[cfg(feature = "btc")]
+const BT_HCI_READ_INQUIRY_MODE: u16 = 0x0C44;
+/// BTRX — `HCI_Write_Inquiry_Mode`: OGF 0x03 / OCF 0x0045 => opcode 0x0C45. One parameter,
+/// Inquiry_Mode(1); returns Status(1). Vol 4 Part E §7.3.50.
+///
+/// WHY THE MODE IS NOW WRITTEN AND NOT MERELY READ. gr27 read the mode (0x00, STANDARD) and left
+/// it — a defensible choice while the mode was the suspect. It is the wrong choice now that it is
+/// not: an UNWRITTEN mode is whatever the chip's own firmware left in the register, and this arc
+/// has no control over that value across resets, firmware states or a future patchram. Writing it
+/// makes the inquiry's result shape a property of THIS HOST rather than an inheritance, which is
+/// what lets a responses=0 verdict mean the same thing on every boot.
+#[cfg(feature = "btc")]
+const BT_HCI_WRITE_INQUIRY_MODE: u16 = 0x0C45;
+/// BTRX — the Inquiry_Mode this host WRITES: **0x01, "Inquiry Result with RSSI"**.
+///
+/// NOT 0x00, and the reason is this arc's whole question. Standard mode (0x00) delivers
+/// `Inquiry Result` (0x02), which carries BD_ADDR, PSRM, Class and Clock_Offset — everything the
+/// page needs and NOTHING about signal strength. Mode 0x01 delivers `Inquiry Result with RSSI`
+/// (0x22): the same fields plus one signed byte of RSSI. That byte is the instrument the classic
+/// side has never had. The LE side already prints `rssi=-87dBm` for this speaker, so a classic
+/// response arriving at a comparable level would say the two receivers hear the same room, and one
+/// arriving at the noise floor would say they do not. Bit 33 is already open in
+/// `BT_EVENT_MASK_C1` and the 0x22 shape is already decoded, so this costs one command and no new
+/// decode.
+///
+/// NOT 0x02 (RSSI + EIR) either, deliberately. 0x02 makes EVERY response a 258-byte Extended
+/// Inquiry Result that this event endpoint (mps=16) must reassemble from seventeen packets inside
+/// a window that is also listening — a reassembly path no real response has ever exercised here.
+/// 0x01 keeps every response inside a single 17-byte, two-packet event. The richer shape is not
+/// worth buying with the one path most likely to drop the very answer being hunted.
+#[cfg(feature = "btc")]
+const BT_C1_INQUIRY_MODE_WANTED: u8 = 0x01;
+/// BTRX — `HCI_Read_Inquiry_Response_Transmit_Power_Level`: OGF 0x03 / OCF 0x0058 => opcode
+/// 0x0C58. No parameters; returns Status(1) TX_Power(1, SIGNED, dBm, spec range -70..=+20).
+/// Vol 4 Part E §7.3.61. READ-ONLY.
+///
+/// WHAT IT DOES AND DOES NOT ANSWER, stated before the reading is taken so the capture cannot be
+/// over-read. This is the level the controller uses for the FHS and EIR packets it sends when it
+/// ANSWERS somebody else's inquiry — it is NOT the level of the inquiry ID packets this host
+/// transmits while inquiring, for which the spec exposes a write (0x0C59) and no read at all.
+/// It is taken anyway because it is the only power figure this radio hands back without a
+/// connection handle, and because it is a cheap sanity read on the RF configuration as a whole: a
+/// part whose RF tables never came up is likelier to report a nonsense or clamped power here than
+/// a correctly configured one. A plausible value proves NOTHING on its own; an out-of-range one,
+/// or an UNKNOWN-CMD refusal, is a finding. The witness says exactly that much and no more.
+#[cfg(feature = "btc")]
+const BT_HCI_READ_INQ_RSP_TX_POWER: u16 = 0x0C58;
+/// BT-C1/AGE — `HCI_Read_Page_Timeout`: OGF 0x03 / OCF 0x0017 => opcode 0x0C17. No parameters;
+/// returns Status(1) Page_Timeout(2). READ-ONLY, and it exists to close the one hole the WRITE
+/// cannot: `HCI_Write_Page_Timeout` answering status 0x00 says the command was ACCEPTED, not that
+/// the value was LATCHED. A controller that clamps, rounds or silently ignores the value pages on
+/// something other than what this host wrote, and every "the window we waited was longer than the
+/// timeout we set" inference downstream is then built on a number that was never in force. This
+/// read is what turns that inference into a measurement — see `bt_c1_page` step 1a.
+#[cfg(feature = "btc")]
+const BT_HCI_READ_PAGE_TIMEOUT: u16 = 0x0C17;
+/// BT-C1/AGE — the `Clock_Offset` field's LSB in MICROSECONDS. The offset carries bits 16..2 of
+/// (CLKslave - CLKmaster), and the Bluetooth native clock ticks every 312.5 us (half a 625 us
+/// slot), so one unit of this field is 4 ticks = **1250 us**. Everything the ageing witness says
+/// about drift is measured against this granularity: a harvested offset has stopped being exact
+/// the moment accumulated drift exceeds one unit.
+#[cfg(feature = "btc")]
+const BT_C1_CLK_LSB_US: u64 = 1250;
+/// BT-C1/AGE — the `Clock_Offset` field's WRAP PERIOD in milliseconds: 2^15 units of
+/// `BT_C1_CLK_LSB_US` = 40960 ms. Past this age a harvested offset is not merely stale, it is
+/// AMBIGUOUS — the true offset has wrapped through the field's whole range at least once and the
+/// stored value names a phase it no longer identifies. This is the hard ceiling the ageing witness
+/// reports the age as a fraction of.
+#[cfg(feature = "btc")]
+const BT_C1_CLK_WRAP_MS: u64 = 40960;
+/// BT-C1/AGE — worst-case RELATIVE clock drift between the two parts, in parts-per-million. Vol 2
+/// Part B allows +/-250 ppm for a device in standby/scan (the state a speaker awaiting a page is
+/// in), and both clocks are free-running until the link exists, so the offset between them may
+/// drift at up to the SUM: 500 ppm. This is a bound, not a measurement — the real drift may be far
+/// smaller — and the witness says so. It is the right bound to publish because it is the one that
+/// makes the ageing candidate FALSIFIABLE: if even 500 ppm over the measured age cannot move the
+/// offset by a single unit, ageing did not break this page and the remaining candidates carry it.
+#[cfg(feature = "btc")]
+const BT_C1_CLK_DRIFT_PPM: u64 = 500;
+/// BT-C1/PHASE — the peer's page-scan INTERVAL ceiling implied by `Page_Scan_Repetition_Mode`, in
+/// milliseconds: R0 continuous, R1 <= 1.28 s, R2 <= 2.56 s (Vol 2 Part B, page scan substates).
+/// The phase witness reports each retry's gap MODULO this number, because that residue — not the
+/// gap itself — is what says whether a second train sampled a different part of the peer's scan
+/// cycle or landed back on the same one.
+#[cfg(feature = "btc")]
+fn bt_c1_scan_interval_ms(psrm: u8) -> u64 {
+    match psrm {
+        0x00 => 0, // R0 — the peer scans continuously; there is no interval to be out of phase with
+        0x01 => 1280,
+        _ => 2560,
+    }
+}
+
+/// BT-C1/PHASE-STEP — the residue a retry train DELIBERATELY aims for inside the peer's scan
+/// cycle: half the interval `psrm` implies. R0 is 0 because a continuously scanning peer has no
+/// cycle to step within, and delaying a train against it would cost time for nothing.
+///
+/// HALF, not a quarter or a third, because half is the residue FURTHEST from a whole multiple in
+/// both directions: whatever the first train's phase was, a second train landing half an interval
+/// away is maximally distant from repeating it and equally distant from the next multiple. It is a
+/// choice about the EXPERIMENT, not a claim about the peer — this host cannot see the peer's scan
+/// schedule, only the gaps between its own trains, and the most it can do is guarantee that gap is
+/// not a whole number of the peer's cycles.
+///
+/// BOOT 3 IS WHY THIS EXISTS. Its CANDIDATE-2 line measured the retry gap at 5125 ms against the
+/// 2560 ms interval R2 implies — 5 ms from exactly two whole cycles — and printed, correctly, that
+/// the retry had re-run the first experiment rather than testing anything new.
+#[cfg(feature = "btc")]
+fn bt_c1_phase_step_ms(psrm: u8) -> u64 {
+    bt_c1_scan_interval_ms(psrm) / 2
+}
+
+/// BT-C1/REHARVEST — the page's two air-derived parameters, selected from the inquiry state AS IT
+/// STANDS AT THE MOMENT OF THE CALL. Returns `(psrm, clock_offset, from_inquiry, psrm_harvested)`.
+///
+/// THIS IS A FUNCTION AND NOT A ONE-TIME BINDING, because the parameter block is rebuilt for every
+/// page attempt. `BtL3State` is shared by the inquiry and the page, and the inquiry-result branch
+/// that stores `inq_clock_offset` latches `inq_clk_at` in the same breath — so if a fresher
+/// response for this address is decoded at any point before a retry's block is built, calling this
+/// again picks it up, and the CANDIDATE-1 age line then reports the NEW harvest's age instead of
+/// carrying the original's forward.
+///
+/// The `psrm` substitution is the one `bt_c1_inquiry` witnesses on its own line: an out-of-range
+/// Page_Scan_Repetition_Mode would be answered CommandStatus 0x12 and no train would go out at
+/// all, so `BT_C1_PSRM` is paged instead and the clock offset is left untouched.
+#[cfg(feature = "btc")]
+fn bt_c1_page_fields(st: &BtL3State) -> (u8, u16, bool, bool) {
+    if st.inq_found {
+        (
+            if st.inq_psrm_ok { st.inq_psrm } else { BT_C1_PSRM },
+            st.inq_clock_offset | BT_C1_CLOCK_OFFSET_VALID,
+            true,
+            st.inq_psrm_ok,
+        )
+    } else {
+        (BT_C1_PSRM, BT_C1_CLOCK_OFFSET, false, false)
+    }
+}
 /// BT-SSP — IO_Capability 0x03 = NoInputNoOutput (Vol 4 Part E §7.1.29). The truth about this
 /// machine DURING BOOT: the compositor may exist but no consent UI does, so claiming a display
 /// or a yes/no button would promise an interaction this stage cannot deliver. NoInputNoOutput on
@@ -2413,6 +2950,29 @@ enum BtL3Await {
     Stop,
 }
 
+/// BT-L3/RELEASE-2 — outcome of ONE `HCI_Disconnect` attempt.
+///
+/// It exists so that the second lever can be a DECISION taken on the first attempt's answer
+/// rather than a second copy of the send-and-wait. `bt_l3_disconnect`'s old body collapsed all
+/// five of these into one `bool`, which is why boot 11's capture could say "REFUSED" and then had
+/// nowhere to go: a refusal, a silent controller and a halted endpoint are three different facts
+/// and only one of them is worth another command.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtL3DiscOut {
+    /// A `Disconnection Complete` with status 0x00 and THIS handle was read. The link is down.
+    Confirmed,
+    /// The Command Status carried a nonzero status: the controller would not take the command.
+    Refused(u8),
+    /// The command went out and was not refused, but no matching `Disconnection Complete` was
+    /// read — an accepted-then-silent controller, a short event, or a handle mismatch.
+    Unconfirmed,
+    /// The EP0 control-OUT failed. Nothing reached the radio.
+    NotSent,
+    /// The event endpoint is no longer readable. The command may have landed; nothing can say.
+    Unreadable,
+}
+
 /// BT-L3 — the facts a wait learns that its CALLER did not ask for, carried across every wait of
 /// one L3 run. Three separate defects live here, and they are one structure because they are one
 /// problem: `bt_l3_await` walks past every event that is not the `want`, and some of those events
@@ -2443,6 +3003,35 @@ enum BtL3Await {
 ///   a fresh `QTD_ACTIVE` overlay — which clears the QH's Halted bit while the DEVICE's STALL
 ///   condition is untouched. The teardown COMMANDS still go out (they ride EP0, which `Stop` says
 ///   nothing about); only the reads are refused, and the witnesses say so.
+/// BT-L3/RELEASE-2 — what the teardown ended up being able to say about the link.
+///
+/// `bt_l3_disconnect` keeps its `bool` return, which has always meant exactly one thing and still
+/// does: a `Disconnection Complete` with status 0x00 for THIS handle was observed. That bool is
+/// what feeds `disconnections_confirmed=`, and widening it would have made the counter mean two
+/// different things. The verdict below is the extra fact the second lever learns, carried on
+/// `BtL3State` because that structure is already threaded through every wait and every caller.
+///
+/// `HandleGone` is the one that changes an outcome: the controller answered the handle probe with
+/// Unknown Connection Identifier, so there is NO LINK to leak. That is not a confirmed release —
+/// nobody watched it end — but it is a proof that the must-not-appear condition does not hold, and
+/// the tally has to be able to say so instead of reporting a live connection that does not exist.
+#[cfg(feature = "bt")]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BtL3Release {
+    /// No second lever ran (the disconnect was accepted, or was never sent).
+    #[default]
+    NotProbed,
+    /// A `Disconnection Complete` status 0x00 for this handle was observed — by this teardown's
+    /// own wait, or by an earlier wait that walked past it and latched it.
+    Confirmed,
+    /// The controller does not know this handle: the link is already gone. Nothing is held.
+    HandleGone,
+    /// The probe says the link IS live and this arc could not release it. The real leak.
+    StillLive,
+    /// The probe could not be run or could not be read. Neither reading is supported.
+    Inconclusive,
+}
+
 #[cfg(feature = "bt")]
 #[derive(Clone, Copy, Default)]
 struct BtL3State {
@@ -2450,6 +3039,31 @@ struct BtL3State {
     resolved_nonzero: bool,
     blind: bool,
     stopped: bool,
+    /// BT-L3/RELEASE-2 — a `Disconnection Complete` (0x05) with status 0x00 that a wait WALKED
+    /// PAST, as `(handle, reason)`. The exact sibling of `live_handle`, for the other end of the
+    /// link's life, and it closes the same class of hole.
+    ///
+    /// Every wait in L3 discards what it did not ask for. A link that the PEER terminates — or one
+    /// the controller drops on its supervision timeout — announces itself with this event, and it
+    /// arrives whenever the peer decides, not when a wait happens to be asking for it. Boot 11 sat
+    /// for 600 ms inside BT-L4 with the event endpoint unread while an ACL response never came;
+    /// anything the controller emitted in that window was queued, and the next wait (the
+    /// teardown's Command Status) walked past two events to reach its answer without naming
+    /// either. If one of them was this event, then the `HCI_Disconnect` that followed was aimed at
+    /// a handle the controller had already retired — and the arc reported a live connection it did
+    /// not hold. Latched here, the same event becomes the confirmation the tally was missing.
+    ///
+    /// Only status 0x00 is latched: a nonzero Disconnection Complete means the teardown FAILED and
+    /// the link is still up, which is the opposite of what this field is read as.
+    disc_seen: Option<(u16, u8)>,
+    /// BT-L3/RELEASE-2 — the event codes this teardown walked past, oldest first, and how many
+    /// there were in total. Reset at the top of `bt_l3_disconnect` so the trail describes the
+    /// TEARDOWN and not the whole run (the inquiry window alone can walk past 128 events).
+    /// See `BT_L3_TRAIL_MAX` for why it exists at all.
+    trail: [u8; BT_L3_TRAIL_MAX],
+    trail_n: u32,
+    /// BT-L3/RELEASE-2 — the second lever's verdict. See `BtL3Release`.
+    release: BtL3Release,
     /// BT-C1 — the CLASSIC analogue of `live_handle`, and it exists for exactly the reason that one
     /// does. A `Connection Complete` (event 0x03) with status 0x00 carries the only handle by which
     /// a BR/EDR link can ever be released, and the cancel race has the same likelier-than-obvious
@@ -2481,6 +3095,23 @@ struct BtL3State {
     /// print what the air actually said.
     #[cfg(feature = "btc")]
     inq_clock_offset: u16,
+    /// BT-C1/AGE — the `now_cycles()` reading at the INSTANT the target's clock offset came off the
+    /// air, latched in the same branch that stores the offset itself so the two can never disagree.
+    ///
+    /// A clock offset is a statement about a phase at a moment. Everything downstream of the
+    /// inquiry — the remaining inquiry length, the `Inquiry_Cancel` round trip, the page-timeout
+    /// write and its read-back, then a first page train of up to 5.12 s and a second one after it —
+    /// happens AFTER that moment. This timestamp is the only thing that makes the elapsed distance
+    /// measurable rather than assumed, and the ageing candidate stands or falls on it. Meaningful
+    /// only when `inq_found`; 0 otherwise, and the witness gates on the flag rather than the value.
+    ///
+    /// IT IS ALSO THE RE-HARVEST'S IDENTITY. Every page attempt rebuilds its parameter block from
+    /// this state (`bt_c1_page_fields`) and remembers the `inq_clk_at` it built from; a retry whose
+    /// reading differs is one that picked up a response that arrived after the previous train, and
+    /// the RE-HARVEST witness says so. Comparing the instants rather than the offsets is what makes
+    /// a re-harvest to a numerically IDENTICAL offset still count as fresh evidence.
+    #[cfg(feature = "btc")]
+    inq_clk_at: u64,
     /// BT-C1/INQUIRY — total responses decoded across every inquiry-result event of the run. This
     /// is what separates "the room is silent on classic" from "the room is busy and the target is
     /// not in it", which the pre-inquiry capture could not distinguish at all.
@@ -2499,6 +3130,68 @@ struct BtL3State {
     /// BT-C1/INQUIRY — how many responses have been printed, against `BT_C1_INQ_PRINT_MAX`.
     #[cfg(feature = "btc")]
     inq_printed: u32,
+}
+
+/// BT-C1/COD — the Class of Device, decoded rather than printed raw.
+///
+/// WHY THIS EXISTS. `class_of_device=240418` sat in two captures — `gr26-bootC` (2026-08-11) and
+/// `rmbp1-boot1` boot 1 (2026-08-18), seven days apart, the only two boots whose BR/EDR inquiry
+/// ever heard the target — and nobody decoded it, so for eleven days the arc's own doc
+/// (`usb_xhci.md` §30) carried a "blunter answer" saying this BD_ADDR was a Logitech M196 mouse
+/// and that "this stack never once addressed the speaker". It is 0x240418: Major Device Class
+/// 0x04 = **Audio/Video**, with the **Audio** (bit 21) and **Rendering** (bit 18) major service
+/// bits set. That is an audio sink, on the air, in band, twice — and it is a CLASSIC inquiry
+/// response, so it also settles the sibling theory that a dual-mode device pages under a
+/// different BD_ADDR than it advertises: the address that answered the inquiry IS the address
+/// the page is aimed at. Peter's 2026-08-22 ruling says the same thing; this is the wire agreeing
+/// with him, and it cost a boot to not have.
+///
+/// Bit layout, Bluetooth Assigned Numbers "Baseband / Class of Device": bits 0..1 format type
+/// (00), bits 2..7 minor device class, bits 8..12 major device class, bits 13..23 major service
+/// classes. `cod` arrives LSB-first exactly as it sits on the wire.
+#[cfg(feature = "btc")]
+fn bt_c1_cod_decode(cod: [u8; 3]) -> (&'static str, &'static str, bool) {
+    let v = (cod[0] as u32) | ((cod[1] as u32) << 8) | ((cod[2] as u32) << 16);
+    let major = ((v >> 8) & 0x1F) as u8;
+    let minor = ((v >> 2) & 0x3F) as u8;
+    let services = (v >> 13) & 0x7FF;
+    // Bit 21 "Audio" and bit 18 "Rendering" are bits 8 and 5 of the shifted service field.
+    let audio_service = (services & (1 << 8)) != 0;
+    let major_name = match major {
+        0x00 => "Miscellaneous",
+        0x01 => "Computer",
+        0x02 => "Phone",
+        0x03 => "LAN/Network Access Point",
+        0x04 => "AUDIO/VIDEO",
+        0x05 => "Peripheral (mouse/keyboard/pointing)",
+        0x06 => "Imaging",
+        0x07 => "Wearable",
+        0x08 => "Toy",
+        0x09 => "Health",
+        0x1F => "Uncategorized",
+        _ => "reserved",
+    };
+    // Only the Audio/Video minors are named: they are the ones that decide the question this
+    // witness exists for, and naming every minor of every major would be prose without a reader.
+    let minor_name = if major == 0x04 {
+        match minor {
+            0x01 => "Wearable Headset",
+            0x02 => "Hands-free",
+            0x04 => "Microphone",
+            0x05 => "Loudspeaker",
+            0x06 => "Headphones",
+            0x07 => "Portable Audio",
+            0x08 => "Car Audio",
+            0x0A => "HiFi Audio",
+            _ => "other A/V minor",
+        }
+    } else {
+        "(minor named only for Audio/Video)"
+    };
+    // An audio SINK is the major class plus the Audio service bit. Either alone is weaker: a
+    // phone sets the Audio bit too, and a major class with no service bits is a device that
+    // declined to say what it does.
+    (major_name, minor_name, major == 0x04 && audio_service)
 }
 
 /// BT-C1/INQUIRY — decode ONE event, and if it is an inquiry result, harvest every response in it.
@@ -2603,6 +3296,10 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
             // valid flag this host sets itself.
             st.inq_psrm_ok = psrm <= BT_C1_PSRM_MAX;
             st.inq_clock_offset = clk;
+            // BT-C1/AGE — the offset's timestamp is taken HERE, in the same branch that stores the
+            // offset, so no path can produce one without the other. This is the reading every
+            // ageing number downstream is measured from.
+            st.inq_clk_at = crate::arch::now_cycles();
         }
         if same_oui {
             st.inq_oui_seen = true;
@@ -2616,8 +3313,12 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
         // The line is emitted in three pieces because the RSSI is OPTIONAL and this kernel has no
         // float formatting: an `Inquiry Result` (0x02) carries no RSSI at all, and printing a
         // placeholder for it would put a number in the capture that the air never supplied.
+        // BT-C1/COD — decoded here and not left as three hex bytes for a reader to look up. This
+        // is the ONLY place a BR/EDR responder says what it is, and it fires on exactly the boots
+        // that need it: the ones where the inquiry heard something.
+        let (cod_major, cod_minor, cod_audio_sink) = bt_c1_cod_decode(cod);
         serial_print!(
-            ":: bt-c1: [{}] inquiry result — addr={} psrm={:#04x}({}) clock_offset={:#06x} class_of_device={:02x}{:02x}{:02x}",
+            ":: bt-c1: [{}] inquiry result — addr={} psrm={:#04x}({}) clock_offset={:#06x} class_of_device={:02x}{:02x}{:02x}(major={} minor={} audio_sink={})",
             idx,
             core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
             psrm,
@@ -2630,7 +3331,10 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
             clk,
             cod[2],
             cod[1],
-            cod[0]
+            cod[0],
+            cod_major,
+            cod_minor,
+            cod_audio_sink
         );
         if let Some(d) = rssi_db {
             if d < 0 {
@@ -2643,8 +3347,10 @@ fn bt_c1_inquiry_harvest(idx: usize, pkt: &[u8], st: &mut BtL3State) {
             " event={:#04x}({}) -> {} == witness ::",
             pkt[0],
             if rssi { "with RSSI" } else { "standard" },
-            if ours {
-                "THIS IS THE TARGET. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page below carries them, so the page is no longer built on guesses"
+            if ours && cod_audio_sink {
+                "THIS IS THE TARGET, AND ITS OWN CLASS OF DEVICE SAYS IT IS AN AUDIO SINK. Two things are settled by this one line and neither needs another boot: (1) the identity — an Audio/Video major class with the Audio service bit is not a mouse, so the 'wrong peer address' reading is REFUTED in band, by the peer, on CLASSIC; (2) the sibling theory that a dual-mode device pages under a different BD_ADDR than it advertises — this response came from the BR/EDR controller at the address the page below is aimed at. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page carries them, so the page is no longer built on guesses. A Page Timeout after THIS line is not an addressing fault and must not be read as one"
+            } else if ours {
+                "THIS IS THE TARGET. Its Page_Scan_Repetition_Mode and Clock_Offset are harvested and the page below carries them, so the page is no longer built on guesses. Its Class of Device is NOT an audio sink — read the decoded major/minor above before assuming which device answered"
             } else if same_oui {
                 "SAME VENDOR OUI AS THE TARGET, DIFFERENT ADDRESS. The target address was read off an LE advertisement, and a dual-mode device need not page under the address it advertises — this is the shape that would produce. It is NOT paged (the address rule is Peter's, and this arc does not widen it); it is reported so the next arc has the evidence"
             } else {
@@ -5050,10 +5756,19 @@ impl Controller {
             serial_println!(
                 ":: bt-retry: [{}] src={} STALE LINK handle={:#06x} — best-effort teardown before re-paging -> {}; the latch is CLEARED either way, so this is a reboot-FREE escape and the chain re-pages below == witness ::",
                 self.idx, source, h,
+                // RELEASE-2 — "likely dead" was a guess, and the handle probe now settles it for
+                // one round trip and no air time. `HandleGone` is the controller saying it has no
+                // such handle; `StillLive` is the case that used to be reported the same way and
+                // is the one that actually matters, because re-paging a peer this host is still
+                // linked to is a different and worse situation.
                 if ok {
                     "disconnect CONFIRMED (the link was still live and is now released — no double-connect)"
                 } else {
-                    "NOT confirmed (the handle is likely dead — the speaker was powered off ungracefully; re-paging is exactly right)"
+                    match st.release {
+                        BtL3Release::HandleGone => "NOT NEEDED — the handle probe (HCI_Read_RSSI, which transmits nothing) answered Unknown Connection Identifier, so the controller retired this handle already; the speaker was powered off or walked away, and re-paging is exactly right",
+                        BtL3Release::StillLive => "NOT confirmed AND THE PROBE SAYS THE LINK IS STILL LIVE — the latch is cleared and the chain re-pages anyway, which is the escape hatch working as designed, but this host may now hold a link to the peer it is about to page",
+                        _ => "NOT confirmed and NOT settled (the probe could not run or could not be read); re-paging is still the right move, but the handle's fate is unknown",
+                    }
                 }
             );
             self.bt_quiesce_events(&e);
@@ -5762,6 +6477,31 @@ impl Controller {
                     st.blind = true;
                 }
             }
+            // ---- RELEASE-2: THE TRAIL, AND THE OTHER END OF THE LINK'S LIFE -------------------
+            // Bounded record of what this wait stepped over, so a refusal can print the company
+            // its answer arrived in. `trail_n` saturates; only the first `BT_L3_TRAIL_MAX` codes
+            // are kept, and the count says how many there really were.
+            if (st.trail_n as usize) < BT_L3_TRAIL_MAX {
+                st.trail[st.trail_n as usize] = pkt[0];
+            }
+            st.trail_n = st.trail_n.saturating_add(1);
+            // `Disconnection Complete` (0x05): EventCode(1) Param_Total_Length(1)=4 Status(1)
+            // Connection_Handle(2, LE) Reason(1) => 6 bytes on the wire. Latched for the same
+            // reason `live_handle` is: a wait that did not ask for it would otherwise throw away
+            // the only evidence that the link ALREADY ENDED, and the teardown below would then
+            // report a live connection the controller has no record of. See `disc_seen`.
+            if pkt[0] == BT_EVT_DISCONN_COMPLETE {
+                if len >= 6 {
+                    if pkt[2] == 0x00 && st.disc_seen.is_none() {
+                        st.disc_seen = Some((
+                            ((pkt[3] as u16) | ((pkt[4] as u16) << 8)) & 0x0FFF,
+                            pkt[5],
+                        ));
+                    }
+                } else {
+                    st.blind = true;
+                }
+            }
             if pkt[0] == BT_EVT_LE_META && len >= 3 && pkt[2] == BT_LE_SUBEVT_CONN_COMPLETE {
                 if len >= 21 {
                     if pkt[3] == 0x00 {
@@ -5898,7 +6638,7 @@ impl Controller {
             );
             self.bt_l3_tally(
                 t0, seen, attempted, completed, disconnected, cancels, live, outstanding,
-                st3.live_handle,
+                st3.live_handle, false,
             );
             return;
         }
@@ -6233,18 +6973,27 @@ impl Controller {
         }
 
         // ---- 4b. MANDATORY TEARDOWN: release a live connection ---------------------------------
+        // RELEASE-2 — `HandleGone` is the second way `live` can legitimately become false. The
+        // teardown's `bool` still means only "a Disconnection Complete was OBSERVED", so it alone
+        // feeds `disconnections_confirmed`; a handle the controller has retired is not a release
+        // this arc performed, but it is a proof that no link is held, and the tally must be able
+        // to say that instead of reporting a live connection that does not exist.
+        let mut gone = false;
         if live {
             if self.bt_l3_disconnect(
                 t, intf, e, toggle, armed, handle, &mut seen, &mut st3, &mut asm,
             ) {
                 disconnected += 1;
                 live = false;
+            } else if st3.release == BtL3Release::HandleGone {
+                live = false;
+                gone = true;
             }
         }
 
         self.bt_l3_tally(
             t0, seen, attempted, completed, disconnected, cancels, live, outstanding,
-            st3.live_handle,
+            st3.live_handle, gone,
         );
     }
 
@@ -6269,6 +7018,33 @@ impl Controller {
     ///
     /// `HCI_Disconnect` answers with a Command Status; the link is not down until the
     /// `Disconnection Complete` event (0x05) arrives. Both are bounded.
+    ///
+    /// RELEASE-2 — WHAT BOOT 11 FORCED, and what this function now does about it. On 2026-08-21
+    /// the metal answered `HCI_Disconnect handle=0x0040 reason=0x13` with Command Status
+    /// **0x12 (Invalid HCI Command Parameters)**, and the arc's own witness line ended with "this
+    /// arc has no second lever for it" — after which a link to a peer was held for the remaining
+    /// ~180 s of the boot with nothing else able to touch it. `HCI_Disconnect` has exactly two
+    /// parameters and 0x12 does not say which one it means, so the lever is a two-step
+    /// discrimination and neither step guesses:
+    ///
+    ///   1. **The latch, consulted first and before anything is sent.** A link that the PEER ended
+    ///      announces itself with a `Disconnection Complete`, on the controller's schedule and not
+    ///      on a wait's. `st.disc_seen` catches one that any wait walked past. If the link already
+    ///      ended, the right answer is to say so — not to send a disconnect for a handle the
+    ///      controller retired, which is itself a plausible reading of 0x12.
+    ///   2. **`HCI_Read_RSSI`, which transmits nothing** (`BT_HCI_READ_RSSI`), on the same handle.
+    ///      `0x02` = the controller has no such handle => nothing is held, and the tally must stop
+    ///      reporting a live connection that does not exist. `0x00` => the link IS live, so the
+    ///      handle was legal and the refusal was about the REASON byte — and the retry below
+    ///      changes exactly that byte and nothing else.
+    ///   3. **One retry with `BT_HCI_REASON_AUTH_FAILURE`**, run only when the probe found the link
+    ///      live. It is the same mandated teardown with the one remaining suspect parameter
+    ///      varied; if it is accepted, the link is released AND the cause is named in one line.
+    ///
+    /// THE ADDED COST is paid only by a boot whose first disconnect was refused or went
+    /// unconfirmed — which is exactly the boot that currently leaks a link for the rest of its
+    /// life: at most `BT_L3_CMD_MS` for the probe, plus `BT_L3_CMD_MS` + `BT_L3_DISC_MS` for the
+    /// retry = **+1.2 s**, and 0 on every boot that lets go the first time.
     #[cfg(feature = "bt")]
     #[allow(clippy::too_many_arguments)]
     unsafe fn bt_l3_disconnect(
@@ -6283,18 +7059,332 @@ impl Controller {
         st: &mut BtL3State,
         asm: &mut [u8],
     ) -> bool {
+        // The trail describes THE TEARDOWN. Reset here rather than at the top of the run, because
+        // under `btc` the inquiry window alone walks past up to `BT_C1_INQUIRY_EVT_MAX` events and
+        // the first eight of those say nothing about a disconnect.
+        st.trail = [0u8; BT_L3_TRAIL_MAX];
+        st.trail_n = 0;
+        st.release = BtL3Release::NotProbed;
+        // ---- STEP 1: THE LATCH, BEFORE ANYTHING IS SENT ---------------------------------------
+        if let Some((h, reason)) = st.disc_seen {
+            if h == handle {
+                serial_println!(
+                    ":: bt-l3: [{}] LINK ALREADY RELEASED — a Disconnection Complete status=0x00 handle={:#06x} reason={:#04x} was WALKED PAST by an earlier wait (it was not the event that wait asked for). The peer, or the controller's supervision timeout, ended this link before the teardown ran. NO HCI_Disconnect is sent: the handle is retired, and issuing one on a retired handle is precisely how a controller comes to answer Invalid HCI Command Parameters. The release IS confirmed — this arc read the event that confirms it == witness ::",
+                    self.idx, h, reason
+                );
+                st.release = BtL3Release::Confirmed;
+                return true;
+            }
+        }
+        // ---- STEP 2: THE MANDATED TEARDOWN, ATTEMPT ONE ---------------------------------------
+        match self.bt_l3_disc_once(
+            t, intf, e, toggle, armed, handle, BT_HCI_REASON_REMOTE_USER_TERM, seen, st, asm,
+        ) {
+            BtL3DiscOut::Confirmed => {
+                st.release = BtL3Release::Confirmed;
+                true
+            }
+            BtL3DiscOut::NotSent | BtL3DiscOut::Unreadable => {
+                // Nothing was learned about the link, and the probe cannot learn anything either:
+                // a `NotSent` never reached the radio, and an `Unreadable` endpoint cannot carry
+                // the probe's Command Complete back. Saying so is the honest end.
+                st.release = BtL3Release::Inconclusive;
+                false
+            }
+            BtL3DiscOut::Refused(status) => {
+                self.bt_l3_trail_witness(st, "the refused HCI_Disconnect");
+                serial_println!(
+                    ":: bt-l3: [{}] HCI_Disconnect handle={:#06x} reason={:#04x} REFUSED with status={:#04x}{} — HCI_Disconnect carries exactly TWO parameters and this status names neither, so the SECOND LEVER runs below: a handle probe that transmits nothing, then at most one retry with the other legal reason == witness ::",
+                    self.idx, handle, BT_HCI_REASON_REMOTE_USER_TERM, status,
+                    if status == BT_ERR_INVALID_PARAMS {
+                        " (Invalid HCI Command Parameters)"
+                    } else {
+                        ""
+                    }
+                );
+                // The first reason was REFUSED, so the retry varies it: that is the whole point of
+                // the discrimination.
+                self.bt_l3_release_probe(
+                    t, intf, e, toggle, armed, handle, BT_HCI_REASON_AUTH_FAILURE, seen, st, asm,
+                )
+            }
+            BtL3DiscOut::Unconfirmed => {
+                // Accepted (or unanswered) but no matching `Disconnection Complete`. The probe
+                // answers the only question that matters — is the link still there? — for one
+                // bounded round trip and no air time, instead of leaving the run to guess.
+                //
+                // THE RETRY KEEPS THE SAME REASON HERE, and the distinction is not cosmetic:
+                // 0x13 was not refused on this path, so varying it would discriminate nothing and
+                // would make the retry's own witness line claim a verdict about the reason byte
+                // that this path has no evidence for. What is owed here is a RE-ISSUE of the
+                // teardown on a link the probe has just found still live, not an experiment.
+                self.bt_l3_trail_witness(st, "the unconfirmed HCI_Disconnect");
+                self.bt_l3_release_probe(
+                    t, intf, e, toggle, armed, handle, BT_HCI_REASON_REMOTE_USER_TERM, seen, st,
+                    asm,
+                )
+            }
+        }
+    }
+
+    /// BT-L3 — print the bounded record of events this teardown WALKED PAST. See `BT_L3_TRAIL_MAX`.
+    ///
+    /// Boot 11's tally read `events_read=5` and named three of them; the two the teardown stepped
+    /// over were the two that could have explained the refusal, and they left no trace at all. One
+    /// line, bounded, printed only on a teardown that did not go cleanly.
+    #[cfg(feature = "bt")]
+    fn bt_l3_trail_witness(&self, st: &BtL3State, at: &str) {
+        let n = (st.trail_n as usize).min(BT_L3_TRAIL_MAX);
+        serial_print!(
+            ":: bt-l3: [{}] teardown event trail — {} event(s) walked past by {}, codes=[",
+            self.idx, st.trail_n, at
+        );
+        for i in 0..n {
+            if i > 0 {
+                serial_print!(" ");
+            }
+            serial_print!("{:02x}", st.trail[i]);
+        }
+        serial_println!(
+            "]{} — 0x05 is Disconnection Complete, 0x13 is Number Of Completed Packets, 0x0F/0x0E are Command Status/Complete for commands already answered. An empty list means the answer arrived alone == witness ::",
+            if st.trail_n as usize > BT_L3_TRAIL_MAX {
+                " (truncated to the first 8)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    /// BT-L3/RELEASE-2 — the second lever: find out whether the link is actually there, then use
+    /// the one remaining legal reason on it.
+    ///
+    /// Returns the same thing `bt_l3_disconnect` returns — whether a `Disconnection Complete` with
+    /// status 0x00 for this handle was OBSERVED — and records the richer verdict on `st.release`,
+    /// which is what lets the tally distinguish "a link is held" from "there is no link to hold".
+    ///
+    /// NOTHING HERE GOES ON THE AIR THAT WAS NOT ALREADY OWED. `HCI_Read_RSSI` is a read of the
+    /// controller's own record (Vol 4 Part E §7.5.4) and generates no LMP or LL traffic; the retry
+    /// is the teardown this arc already promised to perform, with one parameter byte varied.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_l3_release_probe(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        handle: u16,
+        // The reason the retry will carry, decided by the CALLER from what the first attempt did.
+        // A refusal earns a different reason (the discrimination); an accepted-but-unconfirmed
+        // attempt earns the same one (a re-issue). See the call sites.
+        retry_reason: u8,
+        seen: &mut u32,
+        st: &mut BtL3State,
+        asm: &mut [u8],
+    ) -> bool {
+        // The teardown's own waits may have walked past the event that ends this. Cheapest check
+        // there is, and it runs before a single byte is sent.
+        if let Some((h, reason)) = st.disc_seen {
+            if h == handle {
+                serial_println!(
+                    ":: bt-l3: [{}] SECOND LEVER NOT NEEDED — a Disconnection Complete status=0x00 handle={:#06x} reason={:#04x} was walked past by this teardown's own waits. The link ended on the peer's schedule, which is why the command that tried to end it was answered the way it was. RELEASE CONFIRMED == witness ::",
+                    self.idx, h, reason
+                );
+                st.release = BtL3Release::Confirmed;
+                return true;
+            }
+        }
+        if st.stopped {
+            serial_println!(
+                ":: bt-l3: [{}] SECOND LEVER CANNOT RUN — the event endpoint is not readable, so neither the handle probe's Command Complete nor a retry's Disconnection Complete could be observed. HCI_Read_RSSI is not sent blind: it changes nothing and an unread answer proves nothing. The link state is UNKNOWN == witness ::",
+                self.idx
+            );
+            st.release = BtL3Release::Inconclusive;
+            return false;
+        }
+        // ---- THE HANDLE PROBE -----------------------------------------------------------------
+        // Connection_Handle(2, LE). Command Complete (0x0E) return parameters are
+        // Status(1) Connection_Handle(2) RSSI(1), so on the wire:
+        //   [0]=0x0E [1]=plen [2]=Num_HCI_Command_Packets [3..5]=opcode echo
+        //   [5]=Status [6..8]=Connection_Handle [8]=RSSI  => 9 bytes.
+        let pp: [u8; 2] = [handle as u8, (handle >> 8) as u8];
+        let mut live = false;
+        if !self.bt_hci_send(t, intf, BT_HCI_READ_RSSI, &pp) {
+            serial_println!(
+                ":: bt-l3: [{}] HCI_Read_RSSI (0x1405) handle={:#06x} NOT SENT — the EP0 control-OUT failed (its own line is above). The handle cannot be probed and the link state is UNKNOWN == witness ::",
+                self.idx, handle
+            );
+            st.release = BtL3Release::Inconclusive;
+            return false;
+        }
+        serial_println!(
+            ":: bt-l3: [{}] HCI_Read_RSSI (0x1405) SENT — handle={:#06x} params=[{:02x} {:02x}] = Connection_Handle(2,LE). THIS TRANSMITS NOTHING: it reads the controller's own record of the last packet received on the handle, so it cannot disturb the peer, the link, or the radio. It is here to answer ONE question — does this controller still have this handle == witness ::",
+            self.idx, handle, pp[0], pp[1]
+        );
+        match self.bt_l3_await(
+            e, toggle, armed,
+            BtL3Want::CmdComplete(BT_HCI_READ_RSSI),
+            Self::bt_l3_budget(BT_L3_CMD_MS),
+            seen, st, asm,
+        ) {
+            BtL3Await::Got(len) if len >= 6 => {
+                let status = asm[5];
+                let h = if len >= 8 {
+                    ((asm[6] as u16) | ((asm[7] as u16) << 8)) & 0x0FFF
+                } else {
+                    handle
+                };
+                let rssi = if len >= 9 { asm[8] as i8 } else { 0 };
+                if status == BT_ERR_UNKNOWN_CONN_ID {
+                    serial_println!(
+                        ":: bt-l3: [{}] HANDLE PROBE -> status={:#04x} (UNKNOWN CONNECTION IDENTIFIER) — THE CONTROLLER HAS NO SUCH HANDLE. handle={:#06x} is retired: the link ended before the teardown ran, and the refused HCI_Disconnect was a command aimed at a connection that no longer existed. THERE IS NO LIVE LINK AND NOTHING IS LEAKED. This is not a confirmed release — no Disconnection Complete was read — but it is a proof that the must-not-appear condition does not hold == witness ::",
+                        self.idx, status, handle
+                    );
+                    st.release = BtL3Release::HandleGone;
+                    return false;
+                } else if status == 0x00 {
+                    live = true;
+                    serial_println!(
+                        ":: bt-l3: [{}] HANDLE PROBE -> status=0x00 handle_echo={:#06x} rssi={}dBm — THE LINK IS LIVE. The handle is valid and the controller is still tracking it, so the refused HCI_Disconnect was NOT refused for its handle: the only other parameter is the reason byte, and the retry below varies exactly that == witness ::",
+                        self.idx, h, rssi
+                    );
+                } else {
+                    serial_println!(
+                        ":: bt-l3: [{}] HANDLE PROBE -> status={:#04x} — neither 0x00 (live) nor 0x02 (unknown handle){}. The probe did not settle the handle, so the retry below is run anyway: it is the teardown this arc already owes, and a link that is not there costs one refused command == witness ::",
+                        self.idx, status,
+                        if status == 0x01 {
+                            " — 0x01 is Unknown HCI Command, i.e. this controller does not implement HCI_Read_RSSI at all"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            BtL3Await::Got(len) => {
+                serial_println!(
+                    ":: bt-l3: [{}] HANDLE PROBE -> Command Complete SHORT-EVENT ({} bytes, 6 required for a status) -> MALFORMED; the handle is not settled == witness ::",
+                    self.idx, len
+                );
+            }
+            BtL3Await::Timeout => serial_println!(
+                ":: bt-l3: [{}] HANDLE PROBE -> NO Command Complete within {}ms. HCI_Read_RSSI is answered entirely by the controller with no air time involved, so a controller that has not answered in that window is not busy; the handle is not settled == witness ::",
+                self.idx, BT_L3_CMD_MS
+            ),
+            BtL3Await::Stop => {
+                serial_println!(
+                    ":: bt-l3: [{}] HANDLE PROBE -> the event endpoint became UNREADABLE. Nothing further can be observed and no retry is issued == witness ::",
+                    self.idx
+                );
+                st.release = BtL3Release::Inconclusive;
+                return false;
+            }
+        }
+        // ---- THE RETRY ------------------------------------------------------------------------
+        match self.bt_l3_disc_once(
+            t, intf, e, toggle, armed, handle, retry_reason, seen, st, asm,
+        ) {
+            BtL3DiscOut::Confirmed => {
+                if retry_reason == BT_HCI_REASON_REMOTE_USER_TERM {
+                    serial_println!(
+                        ":: bt-l3: [{}] SECOND LEVER WORKED — a RE-ISSUE of the same teardown (reason={:#04x}, unchanged) drew the Disconnection Complete the first one did not, on a link the handle probe had just found live. The link is released. This says nothing about the reason byte and does not claim to: the first attempt was never refused == witness ::",
+                        self.idx, retry_reason
+                    );
+                } else {
+                    serial_println!(
+                        ":: bt-l3: [{}] SECOND LEVER WORKED — the same handle that was refused with reason={:#04x} was ACCEPTED with reason={:#04x}, and the link is released. THE INVALID PARAMETER WAS THE REASON BYTE, not the handle: the probe proved the handle live, both values are on the Core spec's permitted list for HCI_Disconnect, and this controller's parameter check disagrees with the spec about 0x13 == witness ::",
+                        self.idx, BT_HCI_REASON_REMOTE_USER_TERM, retry_reason
+                    );
+                }
+                st.release = BtL3Release::Confirmed;
+                true
+            }
+            other => {
+                if let Some((h, reason)) = st.disc_seen {
+                    if h == handle {
+                        serial_println!(
+                            ":: bt-l3: [{}] RELEASE CONFIRMED BY THE LATCH — a Disconnection Complete status=0x00 handle={:#06x} reason={:#04x} was walked past while the retry was in flight. The link is down == witness ::",
+                            self.idx, h, reason
+                        );
+                        st.release = BtL3Release::Confirmed;
+                        return true;
+                    }
+                }
+                self.bt_l3_trail_witness(st, "the second lever");
+                st.release = if live {
+                    BtL3Release::StillLive
+                } else {
+                    BtL3Release::Inconclusive
+                };
+                serial_println!(
+                    ":: bt-l3: [{}] SECOND LEVER EXHAUSTED — {} (retry_reason={:#04x} retry_status={:#04x}), on a handle the probe called {}. {} NOTHING FURTHER IS SENT FROM HERE == witness ::",
+                    self.idx,
+                    match other {
+                        BtL3DiscOut::Refused(_) => "the retry was REFUSED too",
+                        BtL3DiscOut::Unconfirmed => "the retry drew no Disconnection Complete",
+                        BtL3DiscOut::NotSent => "the retry could not be sent on EP0",
+                        BtL3DiscOut::Unreadable => "the event endpoint went unreadable",
+                        BtL3DiscOut::Confirmed => "unreachable",
+                    },
+                    retry_reason,
+                    match other {
+                        BtL3DiscOut::Refused(s2) => s2,
+                        _ => 0u8,
+                    },
+                    if live { "LIVE" } else { "unsettled" },
+                    if retry_reason != BT_HCI_REASON_REMOTE_USER_TERM
+                        && matches!(other, BtL3DiscOut::Refused(_))
+                    {
+                        "THE NEXT DISCRIMINATOR IS NAMED RATHER THAN GUESSED AT: BOTH reasons this arc can legally send were refused and the handle was probed, so the parameter VALUES are exonerated and what is left is the command PACKET — the parameter_total_length byte, or the EP0 data stage that carries it. Settling that needs a controller-side read of what it actually received, which is a different arc's command."
+                    } else {
+                        "THE NEXT DISCRIMINATOR: this path did not exhaust the reason byte (the first attempt was not refused, or the retry was not refused but unanswered), so the open question is whether the controller ACCEPTS the teardown and never completes it. The handle probe's verdict above is the fact to carry forward."
+                    }
+                );
+                false
+            }
+        }
+    }
+
+    /// BT-L3 — ONE `HCI_Disconnect` attempt: send, read its Command Status, and if that was an
+    /// acceptance, wait out the `Disconnection Complete`. Every path is bounded and every path
+    /// witnesses itself; the caller decides what to do with the outcome.
+    #[cfg(feature = "bt")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_l3_disc_once(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        handle: u16,
+        reason: u8,
+        seen: &mut u32,
+        st: &mut BtL3State,
+        asm: &mut [u8],
+    ) -> BtL3DiscOut {
         // Connection_Handle(2, LE) Reason(1).
-        let dp: [u8; 3] = [handle as u8, (handle >> 8) as u8, BT_HCI_REASON_REMOTE_USER_TERM];
+        let dp: [u8; 3] = [handle as u8, (handle >> 8) as u8, reason];
         if !self.bt_hci_send(t, intf, BT_HCI_DISCONNECT, &dp) {
             serial_println!(
                 ":: bt-l3: [{}] HCI_Disconnect (0x0406) handle={:#06x} NOT SENT — the EP0 control-OUT failed (its own line is above). THE CONNECTION IS STILL LIVE == witness ::",
                 self.idx, handle
             );
-            return false;
+            return BtL3DiscOut::NotSent;
         }
+        // THE BYTES, PRINTED. A status that says "invalid parameters" is unreadable without them:
+        // boot 11 could not distinguish a wrong handle, a wrong byte order and a wrong reason from
+        // each other, because the capture carried the values this host INTENDED and not the block
+        // it actually staged. Three bytes cost one line and settle byte order for good.
         serial_println!(
-            ":: bt-l3: [{}] HCI_Disconnect (0x0406) SENT — handle={:#06x} reason={:#04x} (REMOTE-USER-TERMINATED) == witness ::",
-            self.idx, handle, BT_HCI_REASON_REMOTE_USER_TERM
+            ":: bt-l3: [{}] HCI_Disconnect (0x0406) SENT — handle={:#06x} reason={:#04x} ({}) params=[{:02x} {:02x} {:02x}] = Connection_Handle(2,LE) Reason(1), parameter_total_length=3 == witness ::",
+            self.idx, handle, reason,
+            match reason {
+                BT_HCI_REASON_REMOTE_USER_TERM => "REMOTE-USER-TERMINATED",
+                BT_HCI_REASON_AUTH_FAILURE => "AUTHENTICATION-FAILURE, the retry reason",
+                _ => "?",
+            },
+            dp[0], dp[1], dp[2]
         );
         let r = self.bt_l3_await(
             e, toggle, armed,
@@ -6309,10 +7399,10 @@ impl Controller {
             ),
             BtL3Await::Got(_) => {
                 serial_println!(
-                    ":: bt-l3: [{}] HCI_Disconnect -> CommandStatus status={:#04x} -> REFUSED. THE CONNECTION IS STILL LIVE and this arc has no second lever for it == witness ::",
+                    ":: bt-l3: [{}] HCI_Disconnect -> CommandStatus status={:#04x} -> REFUSED. The opcode echoed back in this very event is 0x0406, so the command's first two staged bytes reached the controller intact and the refusal is about the THREE PARAMETER BYTES above, nothing else == witness ::",
                     self.idx, asm[2]
                 );
-                return false;
+                return BtL3DiscOut::Refused(asm[2]);
             }
             BtL3Await::Timeout => serial_println!(
                 ":: bt-l3: [{}] HCI_Disconnect -> NO CommandStatus within {}ms; the EP0 write went out, so the teardown may still be in flight — the Disconnection Complete wait below is the decider == witness ::",
@@ -6323,7 +7413,7 @@ impl Controller {
                     ":: bt-l3: [{}] HCI_Disconnect SENT UNREAD — the event endpoint is not readable, so neither its CommandStatus nor its Disconnection Complete can be observed. The EP0 write, which is what tears the link down, went out; this arc CANNOT CONFIRM it == witness ::",
                     self.idx
                 );
-                return false;
+                return BtL3DiscOut::Unreadable;
             }
         }
         // Disconnection Complete: 0x05, Param_Total_Length(1)=4, Status(1), Connection_Handle(2),
@@ -6336,28 +7426,32 @@ impl Controller {
         );
         match r {
             BtL3Await::Got(len) if len >= 6 => {
-                let st = asm[2];
+                let status = asm[2];
                 let h = ((asm[3] as u16) | ((asm[4] as u16) << 8)) & 0x0FFF;
-                let ok = st == 0x00 && h == handle;
+                let ok = status == 0x00 && h == handle;
                 serial_println!(
                     ":: bt-l3: [{}] Disconnection Complete — status={:#04x} handle={:#06x} reason={:#04x} -> {} == witness ::",
-                    self.idx, st, h, asm[5],
+                    self.idx, status, h, asm[5],
                     if ok {
                         "DISCONNECTED (the link is released)"
-                    } else if st == 0x00 {
+                    } else if status == 0x00 {
                         "HANDLE MISMATCH — a different connection was released; ours is STILL LIVE"
                     } else {
                         "NONZERO-STATUS — the link is NOT released"
                     }
                 );
-                ok
+                if ok {
+                    BtL3DiscOut::Confirmed
+                } else {
+                    BtL3DiscOut::Unconfirmed
+                }
             }
             BtL3Await::Got(len) => {
                 serial_println!(
                     ":: bt-l3: [{}] Disconnection Complete SHORT-EVENT ({} bytes, 6 required) -> MALFORMED; the release is NOT confirmed == witness ::",
                     self.idx, len
                 );
-                false
+                BtL3DiscOut::Unconfirmed
             }
             BtL3Await::Timeout => {
                 // REVIEW CONDITION 6 — the supervision-timeout figure is the value BT-L3 asked for
@@ -6372,14 +7466,14 @@ impl Controller {
                     ":: bt-l3: [{}] NO Disconnection Complete within {}ms — the disconnect was accepted but the release is NOT confirmed. The link will in any case drop on its own supervision timeout; on an LE link that is the {}ms this arc negotiated, and ON A CLASSIC (BT-C1) HANDLE IT IS NOT — a BR/EDR link uses the controller's own link supervision timeout, which this arc neither writes nor reads == witness ::",
                     self.idx, BT_L3_DISC_MS, BT_L3_SUPERVISION_TIMEOUT as u32 * 10
                 );
-                false
+                BtL3DiscOut::Unconfirmed
             }
             BtL3Await::Stop => {
                 serial_println!(
                     ":: bt-l3: [{}] event endpoint became UNREADABLE before Disconnection Complete — the release is NOT confirmed == witness ::",
                     self.idx
                 );
-                false
+                BtL3DiscOut::Unreadable
             }
         }
     }
@@ -6401,6 +7495,10 @@ impl Controller {
         live: bool,
         outstanding: bool,
         stray: Option<u16>,
+        // RELEASE-2 — the handle probe said the controller has no such handle. `live` is already
+        // false when this is true; it is carried separately so the line can say WHY the link is
+        // not held, which is a different fact from a confirmed release and must not read like one.
+        gone: bool,
     ) {
         // FINDING 5: `unwrap_or(0)` printed `elapsed=0ms` on exactly the run this doc-comment said
         // could not masquerade — the UNCALIBRATED one, where `epace_ms` returns None. A fabricated
@@ -6424,10 +7522,14 @@ impl Controller {
             // is never set again after the create. Rather than leave a dead arm asserting a
             // condition the code cannot reach, `live` is matched first and swallows both: if a link
             // is held, that is the headline whatever `outstanding` says.
-            match (live, outstanding) {
-                (false, false) => "none",
-                (true, _) => "A LIVE CONNECTION — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
-                (false, true) => "AN UNRESOLVED HCI_LE_Create_Connection — the controller may still be INITIATING and will refuse later LE commands. THIS IS THE MUST-NOT-APPEAR CONDITION",
+            match (live, outstanding, gone) {
+                (false, false, false) => "none",
+                // RELEASE-2 — nothing is held, and the reason is worth a clause: the handle probe
+                // found the controller had already retired the handle, so the link ended before
+                // the teardown could end it. Not a confirmed release, but not a leak either.
+                (false, false, true) => "none — THE HANDLE WAS ALREADY RETIRED: HCI_Read_RSSI answered Unknown Connection Identifier, so no link is held. The release was not CONFIRMED (no Disconnection Complete was read), and it was not NEEDED",
+                (true, _, _) => "A LIVE CONNECTION — the teardown was not confirmed. THIS IS THE MUST-NOT-APPEAR CONDITION",
+                (false, true, _) => "AN UNRESOLVED HCI_LE_Create_Connection — the controller may still be INITIATING and will refuse later LE commands. THIS IS THE MUST-NOT-APPEAR CONDITION",
             }
         );
     }
@@ -6951,6 +8053,145 @@ impl Controller {
             core::str::from_utf8(&bt_addr_render_msb(&BT_L3_PEER_ADDR_BYTES))
                 .unwrap_or("??:??:??:??:??:??")
         );
+        // ---- 0a. the mode this controller is actually in — READ, never assumed -----------------
+        // BT-C1-MASK: both commands run BEFORE HCI_Inquiry, so no cancel obligation exists on any
+        // failure arm; `bt_hci_command_ex` is the same helper the SSP stage's mask write uses, so
+        // the `armed`/`toggle` invariants hold by construction. The harvest needs no change — 0x2F
+        // is already decoded (defensively, its own note says, because no mask enabled it — that
+        // defensive decode is what this write turns live).
+        let mut rp = [0u8; 8];
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_READ_INQUIRY_MODE, &[], &mut rp, armed,
+        ) {
+            Some(n) if n >= 2 && rp[0] == 0x00 => serial_println!(
+                ":: bt-c1: [{}] HCI_Read_Inquiry_Mode (0x0C44) status=0x00 inquiry_mode={:#04x} ({}) — this is the controller's OWN state, not the spec default this arc used to assume == witness ::",
+                self.idx, rp[1],
+                match rp[1] {
+                    0x00 => "STANDARD: responses arrive as Inquiry Result (0x02), event-mask bit 1",
+                    0x01 => "WITH RSSI: responses arrive as 0x22, event-mask bit 33",
+                    0x02 => "WITH RSSI + EIR: responses arrive as Extended Inquiry Result (0x2F), event-mask bit 46 — the bit this arc left CLEAR until now",
+                    _ => "RESERVED — out of the spec's 0x00..=0x02 range",
+                }
+            ),
+            other => serial_println!(
+                ":: bt-c1: [{}] HCI_Read_Inquiry_Mode (0x0C44) -> {} — the mode stays UNKNOWN; the mask written below carries bits 1, 33 and 46 so all three shapes are heard regardless == witness ::",
+                self.idx,
+                if other.is_some() { "MALFORMED/NONZERO-STATUS" } else { "NO CmdComplete" }
+            ),
+        }
+        // ---- 0b. widen the mask to carry Extended Inquiry Result (bit 46) ----------------------
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_SET_EVENT_MASK, &BT_EVENT_MASK_C1, &mut rp, armed,
+        ) {
+            Some(n) if n >= 1 && rp[0] == 0x00 => serial_println!(
+                ":: bt-c1: [{}] stage=event-mask — HCI_Set_Event_Mask status=0x00 mask=0x2000_5FFF_FFFF_FFFF (reset default + Extended Inquiry Result bit 46 + LE Meta bit 61 carried from L2); all THREE inquiry-result shapes (0x02 bit 1, 0x22 bit 33, 0x2F bit 46) can now reach this host == witness ::",
+                self.idx
+            ),
+            _ => serial_println!(
+                ":: bt-c1: [{}] stage=event-mask — HCI_Set_Event_Mask for bit 46 NOT CONFIRMED; the inquiry below still runs, but a controller in Inquiry_Mode 0x02 would report NOTHING and the responses=0 verdict must not be read as silence on the air == witness ::",
+                self.idx
+            ),
+        }
+        // ---- 0c. BTRX-MODE — WRITE the mode, then READ IT BACK ---------------------------------
+        // The read at 0a says what the chip's firmware left behind; this says what THIS HOST asked
+        // for, and the read-back says which of the two is in force. A write that answers status
+        // 0x00 has been ACCEPTED, not LATCHED — the same distinction `HCI_Read_Page_Timeout` exists
+        // to close for the page, closed here for the same money. Everything below runs regardless
+        // of how this goes: a refused mode write is a fact to record, never a reason to skip the
+        // inquiry, because the mask above carries all three result shapes and the stage can decode
+        // whichever one arrives.
+        let mut mode_in_force: Option<u8> = None;
+        let mut wm = [0u8; 8];
+        let mode_written = matches!(
+            self.bt_hci_command_ex(
+                t, intf, e, toggle, BT_HCI_WRITE_INQUIRY_MODE,
+                &[BT_C1_INQUIRY_MODE_WANTED], &mut wm, armed,
+            ),
+            Some(n) if n >= 1 && wm[0] == 0x00
+        );
+        if mode_written {
+            serial_println!(
+                ":: bt-c1: [{}] BTRX-MODE — HCI_Write_Inquiry_Mode (0x0C45) mode={:#04x} status=0x00 -> ACCEPTED. Responses should now arrive as Inquiry Result with RSSI (0x22), which is the first classic reading of SIGNAL STRENGTH this project has ever asked for; the LE side already prints rssi=-87dBm for this speaker, so a classic response near that level and one at the noise floor are different findings == witness ::",
+                self.idx, BT_C1_INQUIRY_MODE_WANTED
+            );
+        } else {
+            serial_println!(
+                ":: bt-c1: [{}] BTRX-MODE — HCI_Write_Inquiry_Mode (0x0C45) mode={:#04x} -> REFUSED or UNCONFIRMED (status={:#04x}; 0x01 there means this controller's firmware has no Write_Inquiry_Mode at all). NOTHING IS SKIPPED: the mask carries all three result shapes and the inquiry below decodes whichever arrives — what is lost is only the RSSI reading, so a responses=0 verdict on this boot still stands and a responses>0 one will simply carry no dBm == witness ::",
+                self.idx, BT_C1_INQUIRY_MODE_WANTED, wm[0]
+            );
+        }
+        let mut rb = [0u8; 8];
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_READ_INQUIRY_MODE, &[], &mut rb, armed,
+        ) {
+            Some(n) if n >= 2 && rb[0] == 0x00 => {
+                mode_in_force = Some(rb[1]);
+                serial_println!(
+                    ":: bt-c1: [{}] BTRX-MODE read-back — HCI_Read_Inquiry_Mode (0x0C44) status=0x00 inquiry_mode={:#04x} wanted={:#04x} -> {} == witness ::",
+                    self.idx, rb[1], BT_C1_INQUIRY_MODE_WANTED,
+                    if rb[1] == BT_C1_INQUIRY_MODE_WANTED {
+                        "LATCHED — the mode the responses below arrive in is the mode this host chose, not the one the chip's firmware left"
+                    } else {
+                        "NOT LATCHED — the controller is running a mode this host did not ask for; read every result shape below against THIS byte and not against the write above"
+                    }
+                );
+            }
+            _ => serial_println!(
+                ":: bt-c1: [{}] BTRX-MODE read-back — HCI_Read_Inquiry_Mode (0x0C44) gave no well-formed reply; the mode in force is UNKNOWN for the rest of this stage and no result shape below may be predicted from the write == witness ::",
+                self.idx
+            ),
+        }
+        // ---- 0d. BTRX-TXPWR — one read-only power figure, honestly scoped ----------------------
+        // See `BT_HCI_READ_INQ_RSP_TX_POWER`: this is the RESPONSE power, not the power of the
+        // inquiry ID packets this host is about to transmit. It is taken because it is the only
+        // power the radio yields without a connection handle, and an out-of-range value on a part
+        // whose RF tables never came up would be a real finding. A plausible value proves nothing.
+        let mut tp = [0u8; 8];
+        match self.bt_hci_command_ex(
+            t, intf, e, toggle, BT_HCI_READ_INQ_RSP_TX_POWER, &[], &mut tp, armed,
+        ) {
+            Some(n) if n >= 2 && tp[0] == 0x00 => {
+                let dbm = tp[1] as i8;
+                serial_println!(
+                    ":: bt-c1: [{}] BTRX-TXPWR — HCI_Read_Inquiry_Response_Transmit_Power_Level (0x0C58) status=0x00 tx_power={}dBm -> {}. SCOPE: this is the level used for the FHS/EIR packets this radio sends when ANSWERING an inquiry, NOT the level of the inquiry ID packets it sends while inquiring (the spec exposes no read for those). It is a sanity read on the RF configuration and nothing more == witness ::",
+                    self.idx, dbm,
+                    if (-70..=20).contains(&(dbm as i32)) {
+                        "IN SPEC RANGE (-70..=+20 dBm) — no RF-configuration finding here; this does NOT establish that the transmit path is healthy"
+                    } else {
+                        "OUT OF THE SPEC RANGE (-70..=+20 dBm) — a genuine finding: this radio is reporting a power it is not allowed to report, which is what a part whose RF tables never came up looks like"
+                    }
+                );
+            }
+            other => serial_println!(
+                ":: bt-c1: [{}] BTRX-TXPWR — HCI_Read_Inquiry_Response_Transmit_Power_Level (0x0C58) -> {} (status={:#04x}) — no power reading is claimed for this boot; the inquiry below is unaffected == witness ::",
+                self.idx,
+                if other.is_some() { "MALFORMED/NONZERO-STATUS" } else { "NO CmdComplete" },
+                tp[0]
+            ),
+        }
+        // ---- 0e. BTRX-PATCHRAM — the question this stage CANNOT answer, named before it runs ---
+        // THE HYPOTHESIS. Broadcom combo parts boot a ROM image and take a vendor patch (`.hcd`)
+        // from the host; the patch carries RF/baseband configuration as well as bug fixes. A part
+        // running unpatched can present a complete HCI command set and a complete LMP feature mask
+        // — both are ROM tables — while its BR/EDR receive path is degraded or dead, and LE, a
+        // later and more self-contained block, still works. That is the exact asymmetry this arc
+        // is chasing, so the hypothesis must be NAMED on every boot even though this boot cannot
+        // test it.
+        //
+        // WHY IT IS NOT TESTED HERE, and this is a policy refusal and not an oversight. Resolving
+        // it needs a Broadcom VENDOR opcode (OGF 0x3F) whose meaning is published in no
+        // specification this project may read: the only sources that carry it are vendor driver
+        // source, which CLEAN_ROOM_POLICY.md §2 puts off-limits to an implementer. This tree has
+        // made exactly this refusal before, at a NAMED UNKNOWN, for the B43_SHM_UCODE routing
+        // selector (see `arroyo`, WIFI-2) — the same refusal is made here rather than inventing an
+        // opcode or guessing one. And the patch BLOB itself is a proprietary asset: unaOS ships
+        // none (CLEAN_ROOM_POLICY.md §4), so if a patch is ever uploaded it must be a
+        // USER-SUPPLIED file found at runtime, riding the path the WIFI-1 loader already
+        // established — the program-source FAT volume, searched in /, /B43/ and /FIRMWARE/.
+        serial_println!(
+            ":: bt-c1: [{}] BTRX-PATCHRAM — NO VENDOR FIRMWARE PATCH WAS UPLOADED, and none was attempted. This boot issued ZERO vendor (OGF 0x3F) commands: the radio is running whatever image it powered on with, and its identity as read at bt-l0 (manufacturer/hci_rev/lmp_subver) is the only evidence of which image that is. THE UNPATCHED-ROM HYPOTHESIS FOR THIS DEAFNESS IS THEREFORE OPEN, NOT EXCLUDED, whatever the inquiry below reports. It is not tested here on purpose: the vendor opcodes are a NAMED UNKNOWN under CLEAN_ROOM_POLICY.md §2 (no readable specification carries them), and the patch blob is a proprietary asset unaOS does not ship under §4 — a user-supplied .hcd would ride the WIFI-1 path (program-source FAT volume, /, /B43/, /FIRMWARE/) and no such file is staged == witness ::",
+            self.idx
+        );
         if !self.bt_hci_send(t, intf, BT_HCI_INQUIRY, &params) {
             serial_println!(
                 ":: bt-c1: [{}] HCI_Inquiry (0x0401) NOT SENT — the EP0 control-OUT failed (its own line is above). No inquiry is running and no cancel is owed; the page below falls back to psrm={:#04x}(R2) clock_offset={:#06x}(NOT valid) and is a WEAKER experiment for it == witness ::",
@@ -7122,21 +8363,12 @@ impl Controller {
         // Read this BEFORE any page verdict below. It is what separates the four cases the old
         // capture collapsed into one: the target answered; the room is busy and the target is not
         // in it; the room is silent; or the inquiry never ran to term and establishes nothing.
-        let (psrm, clk, found) = if st.inq_found {
-            (
-                // REVIEW FIX — an out-of-range mode is REFUSED, not paged. `BT_C1_PSRM_MAX` says
-                // what passing it through would have cost; the line below names the substitution.
-                if st.inq_psrm_ok {
-                    st.inq_psrm
-                } else {
-                    BT_C1_PSRM
-                },
-                st.inq_clock_offset | BT_C1_CLOCK_OFFSET_VALID,
-                true,
-            )
-        } else {
-            fallback
-        };
+        // REVIEW FIX — an out-of-range mode is REFUSED, not paged. `BT_C1_PSRM_MAX` says what
+        // passing it through would have cost; the line below names the substitution. The selection
+        // itself lives in `bt_c1_page_fields` because THE PAGE RE-RUNS IT for every attempt: one
+        // definition, so a re-harvested block can never be assembled by different rules than the
+        // first one was.
+        let (psrm, clk, found, _) = bt_c1_page_fields(st);
         if st.inq_found && !st.inq_psrm_ok {
             serial_println!(
                 ":: bt-c1: [{}] inquiry psrm REJECTED — the response for this BD_ADDR reported Page_Scan_Repetition_Mode={:#04x}, which is Reserved for Future Use (legal range 0x00..={:#04x}). Paging with it would have been answered CommandStatus 0x12 (Invalid HCI Command Parameters) and NO train would have gone out, so {:#04x}(R2) is substituted. THE CLOCK OFFSET IS UNAFFECTED and is still the peer's own — this page is aligned but not mode-sized. An inquiry response is unauthenticated: any device may answer under any BD_ADDR, so a byte out of range here is either a broken peer or a spoofed one == witness ::",
@@ -7155,9 +8387,41 @@ impl Controller {
             } else if st.inq_responses > 0 {
                 "THE TARGET DID NOT ANSWER, AND THE ROOM IS NOT SILENT. This inquiry heard other devices, so the radio, the antenna and the receive path are all working; what is unproven is that this BD_ADDR is on the air on CLASSIC at all"
             } else {
-                "THE INQUIRY HEARD NOTHING AT ALL. No device in the room answered a GIAC inquiry, which is a statement about THIS HOST's receive path at least as much as about the room — a working controller in a populated room normally hears something"
+                "THE INQUIRY HEARD NOTHING AT ALL — and the event mask above carried bits 1, 33 AND 46, so all three inquiry-result shapes were enabled and a masked-away result is EXCLUDED. Read the HCI_Read_Inquiry_Mode line above with this one: with the mode known and the mask open, silence here is the air or the BR/EDR receiver, no longer this host's event plumbing"
             }
         );
+        // ---- BTRX-ROOM — the one reading a zero cannot make on its own -------------------------
+        // THE CONFOUND, stated plainly because three boots have now been read past it. `responses=0`
+        // is consistent with TWO different worlds and this stage cannot tell them apart from inside:
+        //   (1) this host's BR/EDR receiver is deaf, or its inquiry ID packets never reach the air;
+        //   (2) the receiver is fine and NO DEVICE IN RANGE WAS INQUIRY-SCANNING during the window.
+        // World (2) is not exotic. A phone, a laptop or a headset that is merely PAIRED and idle is
+        // not discoverable — modern devices inquiry-scan only while a pairing screen is open — so a
+        // room can be full of classic radios and answer an inquiry with silence, correctly. The LE
+        // scan hearing this speaker does NOT close the gap either: it proves the peer is powered and
+        // in range, not that it is inquiry-scanning on classic.
+        //
+        // THE INSTRUMENT THAT DOES SEPARATE THEM is a second, KNOWN-DISCOVERABLE device — a phone
+        // held on its Bluetooth settings screen for the whole window. It is an operator step, not a
+        // code change, which is why this stage's contribution is to NAME it in the capture rather
+        // than to claim a verdict it has not earned. The line is printed only on the zero path; a
+        // boot that heard anything at all has already answered the question it asks.
+        if st.inq_responses == 0 && !st.blind {
+            serial_println!(
+                ":: bt-c1: [{}] BTRX-ROOM — THIS ZERO IS NOT YET A VERDICT ON THE RECEIVER. inquiry_mode_in_force={} inquiry_length={}ms(both trains, two passes each). responses=0 is equally consistent with (a) a deaf BR/EDR receiver and (b) a room in which nothing was inquiry-scanning — an idle paired device is NOT discoverable, and the LE scan hearing this speaker proves it is powered and in range, NOT that it is inquiry-scanning on classic. THE DECIDING CONTROL IS AN OPERATOR STEP: re-fly with a phone held on its Bluetooth settings screen for the whole window. Phone heard, speaker not => this receiver WORKS and the speaker is not inquiry-scanning. NEITHER heard => the receiver is deaf and BTRX-PATCHRAM above is the surviving hypothesis == witness ::",
+                self.idx,
+                match mode_in_force {
+                    Some(m) => match m {
+                        0x00 => "0x00 STANDARD(0x02)",
+                        0x01 => "0x01 WITH-RSSI(0x22)",
+                        0x02 => "0x02 RSSI+EIR(0x2F)",
+                        _ => "RESERVED-OUT-OF-RANGE",
+                    },
+                    None => "UNKNOWN (the read-back gave no well-formed reply)",
+                },
+                BT_C1_INQUIRY_LEN as u32 * 1280
+            );
+        }
         serial_println!(
             ":: bt-c1: [{}] page fields — psrm={:#04x}({}) clock_offset={:#06x}(bit15 {}) source={} == witness ::",
             self.idx, psrm,
@@ -7220,12 +8484,21 @@ impl Controller {
         // purpose: one `events_read` count for the whole stage, one `blind`/`stopped` verdict, and
         // an inbound `Connection Complete` arriving during the inquiry is latched by the same
         // latch that would catch it during the page.
-        let (psrm, clock_offset, from_inquiry) =
+        let (mut psrm, mut clock_offset, mut from_inquiry) =
             self.bt_c1_inquiry(t, intf, e, toggle, armed, &mut st, &mut seen, &mut asm);
         // REVIEW FIX — latched here because `st.inq_psrm_ok` is about to be shared with the page's
         // own waits, and the page-parameters line below must not call a substituted mode
         // "HARVESTED". See `BT_C1_PSRM_MAX`.
-        let psrm_harvested = st.inq_psrm_ok;
+        //
+        // BT-C1-REPAGE — all four are `mut` because every attempt RE-DERIVES them from `st`
+        // (`bt_c1_page_fields`) instead of carrying the inquiry's one reading through the whole
+        // stage. The values here are the FIRST attempt's; a retry may replace them.
+        let mut psrm_harvested = st.inq_psrm_ok;
+        // BT-C1-REPAGE — the harvest instant the parameter block currently in hand was built from.
+        // A retry that finds `st.inq_clk_at` changed has picked up a response that arrived after
+        // the previous train, and that — not a difference in the offset VALUE — is what makes the
+        // re-harvest fresh evidence.
+        let mut built_from_clk_at = st.inq_clk_at;
 
         // ---- 1. bound what a dead speaker costs the boot ---------------------------------------
         // Vol 4 Part E §7.3.16. Written BEFORE the page, because it is the page's own deadline.
@@ -7250,10 +8523,193 @@ impl Controller {
             ),
         }
 
+        // ---- 1a. BT-C1/AGE — READ THE TIMEOUT BACK ----------------------------------------------
+        // CANDIDATE 3 (controller paging parameters), first half. The write above answering
+        // status=0x00 says ACCEPTED; it does not say LATCHED. Every downstream inference of the
+        // form "the window we waited exceeded the timeout we set, so the controller owed us a Page
+        // Timeout" is built on the written value, and if this part clamps or ignores it that
+        // inference is built on a number that was never in force. Read-only, and it runs before any
+        // page is outstanding, so no failure arm here can owe a cancel.
+        let mut rpt = [0u8; 8];
+        let readback = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_READ_PAGE_TIMEOUT, &[], &mut rpt, armed,
+        ) {
+            Some(n) if n >= 3 && rpt[0] == 0x00 => {
+                let got = (rpt[1] as u16) | ((rpt[2] as u16) << 8);
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Read_Page_Timeout (0x0C17) status=0x00 in_force={:#06x}(={}ms) written={:#06x}(={}ms) -> {} == witness ::",
+                    self.idx, got, (got as u32 * 625) / 1000,
+                    BT_C1_PAGE_TIMEOUT, (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000,
+                    if got == BT_C1_PAGE_TIMEOUT {
+                        "LATCHED — the value this host wrote is the value the controller will page on, so a train that ends early ended early for a reason other than its deadline"
+                    } else {
+                        "NOT LATCHED — the controller is paging on a DIFFERENT deadline than this host wrote. CANDIDATE 3 IS LIVE ON THIS LINE ALONE: every Page Timeout below must be read against in_force, not against written, and any earlier capture that compared an observed timeout to the written value was comparing against a number the radio never held"
+                    }
+                );
+                Some(got)
+            }
+            other => {
+                serial_println!(
+                    ":: bt-c1: [{}] HCI_Read_Page_Timeout (0x0C17) -> {} — the deadline actually in force is UNKNOWN. The page below still runs, but a Page Timeout whose measured latency differs from the written {}ms can NOT be read as an indictment of the controller here: an unread parameter is not a wrong one == witness ::",
+                    self.idx,
+                    if other.is_some() { "MALFORMED/NONZERO-STATUS" } else { "NO CmdComplete" },
+                    (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
+                );
+                None
+            }
+        };
+        // The deadline every observed page latency below is measured against: what the controller
+        // says is in force when it answered, and only the written value when it did not answer.
+        let deadline_ms = (readback.unwrap_or(BT_C1_PAGE_TIMEOUT) as u64 * 625) / 1000;
+
         // ---- 2. HCI_Create_Connection ----------------------------------------------------------
         // Thirteen parameter bytes: BD_ADDR(6) Packet_Type(2) Page_Scan_Repetition_Mode(1)
         // Reserved(1) Clock_Offset(2) Allow_Role_Switch(1). Every value is justified at its
         // constant. The Reserved octet is 0x00 by the spec's own instruction, not by choice.
+        //
+        // THE BLOCK IS BUILT INSIDE THE LOOP, once per attempt, and BT-C1-DISCRIM's own witness is
+        // why: it recorded that the block was built once and re-sent unchanged, so a retry
+        // re-transmitted a clock offset that had aged by the whole of the first train. See the
+        // RE-HARVEST witness at the top of each attempt.
+        // ---- THE PAGE ATTEMPT LOOP -------------------------------------------------------------
+        // At most `BT_C1_PAGE_ATTEMPTS` trains, and a second one is spent on exactly one answer:
+        // `Connection Complete` status=0x04 (PAGE TIMEOUT) for the address we paged. See the
+        // constant for why every other outcome — link, refusal, local-side failure, or an
+        // OUTSTANDING page — ends the stage on the attempt that produced it. `outstanding` is the
+        // hard interlock: the loop never begins a second page while the first is unresolved,
+        // because an unresolved page is what the mandatory cancel below exists for.
+        let mut pages = 0u32; // page trains actually put on the air (Command Status ACCEPTED or unknown)
+        let mut page_timeouts = 0u32; // attempts that ended in an explicit status=0x04 for OUR address
+        let mut attempts_run = 0u32;
+        // BT-C1/PHASE — the previous train's start, so a retry can measure the GAP it opened. None
+        // until a train has actually gone out.
+        let mut prev_train: Option<u64> = None;
+        // BT-C1/AGE + BT-C1/PHASE — carried out of the loop so the page summary can restate the
+        // three discriminators in one line without re-deriving them.
+        let mut last_age_cy = 0u64;
+        let mut last_obs_cy = 0u64;
+        let mut obs_measured = false;
+        let mut same_phase_retry = false;
+        // BT-C1-REPAGE — did the last retry's measured phase offset actually land where the step
+        // aimed it? Carried to the closing verdict.
+        let mut phase_step_hit = false;
+        // BT-C1-REPAGE — did any retry rebuild its block from a HARVEST INSTANT later than the one
+        // the previous train's block was built from? Carried to the closing verdict.
+        let mut reharvested_fresh = false;
+        for attempt in 1..=BT_C1_PAGE_ATTEMPTS {
+        attempts_run = attempt;
+        // ---- 2a'. BT-C1-REPAGE/PHASE-STEP — put this train somewhere the last one was not -------
+        // BOOT 3 MEASURED THE DEFECT THIS BLOCK FIXES: the retry gap came out at 5125 ms against
+        // R2's 2560 ms interval, i.e. within 5 ms of two whole cycles, so the second train sampled
+        // the same part of the peer's scan cycle as the first and the witness printed "THE RETRY
+        // DID NOT TEST CANDIDATE 2". The gap was never chosen — it was whatever the page timeout
+        // plus this host's overhead happened to add up to, and it landed on a multiple by accident.
+        //
+        // It is chosen now. The delay is computed from the gap ALREADY elapsed since the previous
+        // train, so the total gap lands at `scan/2` past a whole multiple rather than on one; that
+        // is why it is not a fixed sleep. NOTHING IS SENT OR READ during it — a pure spin, so the
+        // `armed` invariant is untouched and no event can be consumed unwitnessed.
+        //
+        // THE ATTEMPT BUDGET AND THE PAGE TIMEOUT ARE UNCHANGED. This spends at most half a scan
+        // interval (<= 1280 ms) of wall clock and buys the one thing two identical trains cannot:
+        // a second, independent sample of the peer's cycle.
+        //
+        // BOTH STAY 0 on a first train (no previous phase to step away from), on R0 (no cycle to
+        // step within) and on an uncalibrated clock (no honest way to time a delay). The CANDIDATE-2
+        // line prints the intended value beside the measured one, which is what makes this
+        // mechanism falsifiable on the wire rather than merely asserted here.
+        let mut phase_intended = 0u64;
+        let mut phase_delay = 0u64;
+        //
+        // THE PLAN USES THE psrm IN FORCE AT PLAN TIME — the previous train's, since the
+        // re-harvest below runs after this and could in principle replace it. On the one boot in
+        // which a peer re-reports a different mode between two trains, the intended residue would
+        // have been computed against the old interval and CANDIDATE-2's would be printed against
+        // the new one; both numbers are on that line, so the discrepancy is visible rather than
+        // silent. Stepping first is deliberate: the harvest is then read as late as possible, so
+        // the offset the block carries is the freshest thing this host has when it goes out.
+        if attempt > 1 {
+            let scan_plan = bt_c1_scan_interval_ms(psrm);
+            let step = bt_c1_phase_step_ms(psrm);
+            match (prev_train, scan_plan) {
+                (Some(pt), s) if s != 0 => {
+                    match epace_ms(crate::arch::now_cycles().wrapping_sub(pt)) {
+                        Some(el_ms) => {
+                            // How far past a whole multiple the gap already stands, and what must
+                            // be added to move it to the half-interval residue. Modular, so the
+                            // answer is always inside one interval.
+                            let cur = el_ms % s;
+                            let need = (step + s - cur) % s;
+                            phase_intended = step;
+                            phase_delay = need;
+                            serial_println!(
+                                ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} elapsed_since_previous_train={}ms peer_scan_interval={}ms(psrm {}) current_residue={}ms intended_residue={}ms delay_applied={}ms -> the retry is deliberately offset by HALF the peer's scan interval instead of landing where the page timeout happened to put it. Boot 3's retry gap was 5125ms against a 2560ms interval (5ms from two whole cycles) and tested nothing; the CANDIDATE-2 line below prints the intended offset beside the MEASURED one, so this mechanism is falsifiable on the wire and not merely claimed here. No Scan_Enable and no change to the attempt budget or the page timeout == witness ::",
+                                self.idx, attempt, BT_C1_PAGE_ATTEMPTS, el_ms, s,
+                                match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
+                                cur, step, need
+                            );
+                            if need > 0 {
+                                let start = crate::arch::now_cycles();
+                                let budget = Self::bt_l3_budget(need);
+                                while crate::arch::now_cycles().wrapping_sub(start) < budget {
+                                    core::hint::spin_loop();
+                                }
+                            }
+                        }
+                        None => serial_println!(
+                            ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} NOT APPLIED: the TSC is uncalibrated, so the gap since the previous train is unmeasurable and a delay computed from it would be a fabricated number of milliseconds. The retry goes out on whatever phase the page timeout leaves it, exactly as before, and the CANDIDATE-2 line below claims no phase relation == witness ::",
+                            self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+                        ),
+                    }
+                }
+                (Some(_), _) => serial_println!(
+                    ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} NOT APPLIED: psrm=R0, so the peer scans CONTINUOUSLY and there is no cycle for a train to be stepped within. Delaying this train would cost time and change no phase == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+                ),
+                (None, _) => serial_println!(
+                    ":: bt-c1: [{}] PHASE-STEP — attempt={}/{} NOT APPLIED: no previous train went out, so there is no phase to step away from == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+                ),
+            }
+        }
+        // ---- 2a''. BT-C1-REPAGE/RE-HARVEST — rebuild the block from the FRESHEST inquiry data ---
+        // The other half of Boot 3's finding: the 13 bytes were assembled once, before the first
+        // train, and the retry re-sent them unchanged — so attempt 2 paged on a clock offset that
+        // had aged by the whole first train (5.12 s of page timeout) plus this host's overhead, and
+        // the CANDIDATE-1 line was measuring the ageing of a value nothing could refresh.
+        //
+        // `st` is shared with the inquiry and with every event wait this stage runs, so an inquiry
+        // result for this address decoded at ANY point before this line is visible here. Re-reading
+        // it costs nothing and can only improve the block. The comparison that decides whether a
+        // re-harvest happened is on the HARVEST INSTANT, not on the offset value: a peer that
+        // answered again with a numerically identical offset has still told us it is there NOW, and
+        // the age the CANDIDATE-1 line prints below is the new harvest's.
+        if attempt > 1 {
+            let (p2, c2, f2, h2) = bt_c1_page_fields(&st);
+            let fresh = st.inq_clk_at != built_from_clk_at;
+            let changed = (p2, c2, f2) != (psrm, clock_offset, from_inquiry);
+            serial_println!(
+                ":: bt-c1: [{}] RE-HARVEST — attempt={}/{} previous_block(psrm={:#04x} clock_offset={:#06x} from_inquiry={}) rebuilt_block(psrm={:#04x} clock_offset={:#06x} from_inquiry={}) newer_response={} bytes_changed={} -> {} == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
+                psrm, clock_offset, from_inquiry, p2, c2, f2, fresh, changed,
+                if fresh {
+                    "A NEWER INQUIRY RESPONSE FOR THIS ADDRESS ARRIVED since the previous train's block was built, and this attempt pages on it. The CANDIDATE-1 age line below is measured from the NEW harvest instant, so a fresh age under a stale-looking first attempt is this line's doing and not a clock glitch"
+                } else if from_inquiry {
+                    "NO NEWER RESPONSE ARRIVED, so the rebuilt block carries the same harvest as the previous train and the CANDIDATE-1 age below has grown by the whole of that train. THE BLOCK IS STILL REBUILT rather than re-sent: what is stale here is the AIR's last word about this peer, not this host's bookkeeping, and no inquiry is re-run because re-entering the Inquiry state would have the controller answer the page with Command Status 0x0C"
+                } else {
+                    "NOTHING TO RE-HARVEST — no inquiry response for this address was ever decoded, so this block carries the same fallback mode and invalid clock offset the first one did. Ageing is not a candidate for a value that was never read"
+                }
+            );
+            if fresh {
+                reharvested_fresh = true;
+            }
+            psrm = p2;
+            clock_offset = c2;
+            from_inquiry = f2;
+            psrm_harvested = h2;
+            built_from_clk_at = st.inq_clk_at;
+        }
+        // The 13 bytes this attempt will put on EP0, assembled from the values immediately above.
         let cp: [u8; 13] = [
             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
             BT_C1_PACKET_TYPE as u8,
@@ -7266,18 +8722,6 @@ impl Controller {
             (clock_offset >> 8) as u8,
             BT_C1_ALLOW_ROLE_SWITCH,
         ];
-        // ---- THE PAGE ATTEMPT LOOP -------------------------------------------------------------
-        // At most `BT_C1_PAGE_ATTEMPTS` trains, and a second one is spent on exactly one answer:
-        // `Connection Complete` status=0x04 (PAGE TIMEOUT) for the address we paged. See the
-        // constant for why every other outcome — link, refusal, local-side failure, or an
-        // OUTSTANDING page — ends the stage on the attempt that produced it. `outstanding` is the
-        // hard interlock: the loop never begins a second page while the first is unresolved,
-        // because an unresolved page is what the mandatory cancel below exists for.
-        let mut pages = 0u32; // page trains actually put on the air (Command Status ACCEPTED or unknown)
-        let mut page_timeouts = 0u32; // attempts that ended in an explicit status=0x04 for OUR address
-        let mut attempts_run = 0u32;
-        for attempt in 1..=BT_C1_PAGE_ATTEMPTS {
-        attempts_run = attempt;
         serial_println!(
             ":: bt-c1: [{}] page parameters — attempt={}/{} peer={} packet_type={:#06x}(DM1|DH1, basic rate, one slot) psrm={:#04x}({}, {}) clock_offset={:#06x}(bit15 {}) allow_role_switch={:#04x}(the peer may take the link) reserved=0x00 page_timeout={}ms(written above) conn_window={}ms; NO Write_Scan_Enable is issued — Vol 4 Part E §7.3.18 governs INBOUND inquiry/page scan and paging out needs none of it, while enabling it would make this machine discoverable == witness ::",
             self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
@@ -7301,6 +8745,126 @@ impl Controller {
             BT_C1_ALLOW_ROLE_SWITCH,
             (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000, BT_C1_CONN_MS
         );
+        // ---- 2a. BT-C1/AGE — THE EXACT BYTES, then the three discriminators --------------------
+        // The line above DECODES the parameters; this one is the parameter block itself, as the 13
+        // bytes that will be on EP0. They are printed because every decoded field above is this
+        // host's own reading of its own array, and a field in the wrong octet — a byte-order slip
+        // in the clock offset, a psrm written into the Reserved octet — would print correctly above
+        // and still page wrong. This is the only line in the stage that can falsify the one above.
+        serial_println!(
+            ":: bt-c1: [{}] page bytes — attempt={}/{} HCI_Create_Connection(0x0405) params=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}][{:02x} {:02x}][{:02x}][{:02x}][{:02x} {:02x}][{:02x}] = BD_ADDR(6,wire/LSB-first) Packet_Type(2,LE) PSRM(1) Reserved(1) Clock_Offset(2,LE) Allow_Role_Switch(1); THE BLOCK IS REBUILT FOR EVERY ATTEMPT from the inquiry state as it stands at that moment (BT-C1-DISCRIM witnessed the old behaviour: built once, re-sent unchanged). A retry printing DIFFERENT octets here is a re-harvest and the RE-HARVEST line above says so; identical octets mean no newer response arrived, not that the block was cached == witness ::",
+            self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
+            cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
+            cp[8], cp[9], cp[10], cp[11], cp[12]
+        );
+        // ---- CANDIDATE 1: HAS THE HARVESTED CLOCK OFFSET AGED OUT? -----------------------------
+        // The offset in `cp` above is a statement about the peer's clock phase AT THE MOMENT the
+        // inquiry response arrived. This measures how long ago that moment was, and converts the
+        // distance into the offset's OWN units, which is the only form in which "stale" means
+        // anything: an offset is exact while accumulated drift is under one unit, approximate while
+        // it is a few, and meaningless once the field has wrapped.
+        //
+        // THE NUMBER IS FALSIFIABLE IN BOTH DIRECTIONS, and that is the point of printing the bound
+        // rather than a verdict: a small age with a sub-unit drift bound EXCLUDES ageing and hands
+        // the failure to candidates 2 and 3, and it is as useful as a large one.
+        if from_inquiry {
+            let age_cy = crate::arch::now_cycles().wrapping_sub(st.inq_clk_at);
+            last_age_cy = age_cy;
+            let (age, age_u) = epace_fmt(age_cy);
+            match epace_ms(age_cy) {
+                Some(age_ms) => {
+                    // Worst-case drift over the elapsed age, in microseconds, then in units of the
+                    // offset's own LSB and in 625 us slots. Integer maths throughout: ppm * ms is
+                    // already microseconds-scaled (1 ppm over 1 ms = 1 ns, so ppm*ms = ns), hence
+                    // the /1000 into us.
+                    let drift_us = age_ms.saturating_mul(BT_C1_CLK_DRIFT_PPM) / 1000;
+                    let drift_lsb = drift_us / BT_C1_CLK_LSB_US;
+                    let drift_slots = drift_us / 625;
+                    serial_println!(
+                        ":: bt-c1: [{}] CANDIDATE-1 clock-offset AGE — attempt={}/{} harvested_offset={:#06x} age={}ms wrap_period={}ms ({}% of wrap) drift_bound={}us at {}ppm = {} offset-units({}us each) = {} slots(625us) -> {} == witness ::",
+                        self.idx, attempt, BT_C1_PAGE_ATTEMPTS, st.inq_clock_offset,
+                        age_ms, BT_C1_CLK_WRAP_MS,
+                        age_ms.saturating_mul(100) / BT_C1_CLK_WRAP_MS,
+                        drift_us, BT_C1_CLK_DRIFT_PPM, drift_lsb, BT_C1_CLK_LSB_US, drift_slots,
+                        if age_ms >= BT_C1_CLK_WRAP_MS {
+                            "AMBIGUOUS — the age EXCEEDS the field's wrap period, so the true offset has run through the field's whole range since it was read and this value no longer identifies a phase at all. CANDIDATE 1 IS SUFFICIENT ON ITS OWN: nothing else need be wrong for this page to miss"
+                        } else if drift_slots >= 1 {
+                            "STALE BEYOND A SLOT — worst-case drift alone can move the peer's clock by a full 625us slot or more since the harvest, so the controller may be starting its train on a phase the peer left. CANDIDATE 1 IS SUFFICIENT to explain this page, though it is a BOUND and not a measurement: a peer with a better crystal may still have been where this offset said"
+                        } else if drift_lsb >= 1 {
+                            "NO LONGER EXACT — drift can exceed one offset unit, so the value is approximate, but it is still inside a slot and a page train that missed by less than a slot did not miss because of this. CANDIDATE 1 IS WEAK HERE"
+                        } else {
+                            "STILL EXACT — even at the worst drift this spec allows, the harvested offset cannot have moved by one unit of its own field. CANDIDATE 1 IS EXCLUDED for this attempt, and a Page Timeout below belongs to candidate 2 (train/scan phase) or candidate 3 (the controller)"
+                        }
+                    );
+                }
+                None => serial_println!(
+                    ":: bt-c1: [{}] CANDIDATE-1 clock-offset AGE — attempt={}/{} harvested_offset={:#06x} age={}{} — THE TSC IS UNCALIBRATED, so the age is raw cycles and no drift bound is computed from it. NOTHING IS CONCLUDED ABOUT AGEING on this attempt; converting these cycles at an assumed rate is the fabrication this driver's epace rule exists to forbid == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, st.inq_clock_offset, age, age_u
+                ),
+            }
+        } else {
+            serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-1 clock-offset AGE — attempt={}/{} NOT APPLICABLE: no offset was harvested for this address, so the page carries {:#06x} with bit 15 CLEAR and the controller is sweeping for the phase rather than starting on one. Ageing cannot be the fault of a value that was never read; the sweep is the cost being paid instead == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS, BT_C1_CLOCK_OFFSET
+            );
+        }
+        // ---- CANDIDATE 2: DID THIS TRAIN SAMPLE A DIFFERENT SCAN PHASE? ------------------------
+        // A page train and the peer's page-scan schedule are independent clocks. The retry's whole
+        // justification (see the retry witness below) is that a second train samples a DIFFERENT
+        // phase of the peer's scan cycle — but that is an assumption about the gap, and the gap is
+        // whatever the first attempt's timeout plus this host's own overhead happened to make it.
+        // If the gap is close to a whole multiple of the peer's scan interval, the second train
+        // started at nearly the same point in the peer's cycle as the first, and the retry did not
+        // test candidate 2 at all: it re-ran the same experiment. That is the finding this line
+        // exists to make visible, and it is invisible in every capture taken so far.
+        let scan_ms = bt_c1_scan_interval_ms(psrm);
+        match (prev_train, epace_ms(crate::arch::now_cycles().wrapping_sub(prev_train.unwrap_or(0)))) {
+            (Some(_), Some(gap_ms)) if scan_ms != 0 => {
+                let resid = gap_ms % scan_ms;
+                // Distance to the NEAREST multiple, i.e. how far this train's phase sits from the
+                // previous train's — going the short way round the cycle.
+                let phase_off = core::cmp::min(resid, scan_ms - resid);
+                same_phase_retry = phase_off <= 100;
+                // THE STEP EITHER LANDED OR IT DID NOT, and this is the test. `phase_intended` is
+                // what the PHASE-STEP block above aimed at BEFORE the train went out; `phase_off`
+                // is what the clock says it got. A 150 ms tolerance covers the command's own EP0
+                // round trip and the spin's granularity without covering a miss.
+                let aimed = phase_intended != 0;
+                let hit = aimed && phase_off.abs_diff(phase_intended) <= 150;
+                phase_step_hit = hit;
+                serial_println!(
+                    ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} gap_since_previous_train={}ms peer_scan_interval={}ms(psrm {}) residue={}ms phase_offset_from_previous={}ms intended_offset={}ms(delay_applied={}ms) -> {} == witness ::",
+                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, gap_ms, scan_ms,
+                    match psrm { 0x00 => "R0", 0x01 => "R1", 0x02 => "R2", _ => "RESERVED" },
+                    resid, phase_off, phase_intended, phase_delay,
+                    if phase_off <= 100 {
+                        if aimed {
+                            "SAME PHASE, AND THE STEP FAILED TO MOVE IT — the gap is still within 100ms of a whole multiple of the peer's scan interval even though a delay was applied to put it half an interval away. THE RETRY DID NOT TEST CANDIDATE 2, and the intended/measured pair on this line says the fault is in the STEP (the elapsed reading, the delay, or the clock behind both), not in the retry's design. This is the line that falsifies this arc's own mechanism"
+                        } else {
+                            "SAME PHASE, AND NO STEP WAS APPLIED — the PHASE-STEP line above says why (first train, R0, or an uncalibrated clock). The gap is within 100ms of a whole multiple, so this train started at essentially the point in the peer's scan cycle the previous one did: THE RETRY DID NOT TEST CANDIDATE 2, two timeouts under this line are ONE observation, and the phase hypothesis remains untested rather than refuted"
+                        }
+                    } else if hit {
+                        "DIFFERENT PHASE, AND BY CONSTRUCTION — the measured offset from the previous train's phase agrees with the offset the PHASE-STEP above deliberately aimed at, so this train sampled a part of the peer's scan cycle the previous one did not, on purpose rather than by luck. THE MECHANISM IS CONFIRMED ON THE WIRE by these two numbers agreeing. If this attempt also times out, CANDIDATE 2 IS GENUINELY WEAKENED: two independent phases were sampled and neither was heard"
+                    } else if aimed {
+                        "DIFFERENT PHASE, BUT NOT THE ONE INTENDED — the train did land materially away from the previous one's phase, so candidate 2 WAS varied, but it did not land where the step aimed. The step's accounting is off by the difference between the two numbers on this line (the elapsed reading and the delay are the only inputs to it); the phase result below still stands, the mechanism's precision does not"
+                    } else {
+                        "DIFFERENT PHASE, BY ACCIDENT — no step was applied (see the PHASE-STEP line) and the gap still fell away from a whole multiple. Candidate 2 was varied, but nothing here chose to vary it, so the next boot may just as easily land back on the same phase"
+                    }
+                );
+            }
+            (Some(_), _) if scan_ms == 0 => serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} psrm=R0, which means the peer scans CONTINUOUSLY. There is no scan interval for a train to be out of phase with, so CANDIDATE 2 IS EXCLUDED by the peer's own reported mode: a train that goes out at all overlaps a scan window by construction == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+            ),
+            (Some(_), _) => serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} the gap since the previous train is unmeasurable (uncalibrated TSC), so no phase relation is claimed == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+            ),
+            (None, _) => serial_println!(
+                ":: bt-c1: [{}] CANDIDATE-2 train PHASE — attempt={}/{} FIRST TRAIN, so there is no previous train to be in or out of phase with. Its phase relative to the peer's scan cycle is UNKNOWABLE from this host: nothing here can see the peer's scan schedule, only the gap between our own trains. This line exists so the retry's line below has a baseline == witness ::",
+                self.idx, attempt, BT_C1_PAGE_ATTEMPTS
+            ),
+        }
         if !self.bt_hci_send(t, intf, BT_HCI_CREATE_CONN, &cp) {
             serial_println!(
                 ":: bt-c1: [{}] HCI_Create_Connection (0x0405) attempt={}/{} NOT SENT — the EP0 control-OUT failed (its own line is above). The command never reached the radio, so no page is outstanding and no cancel is owed. NO further attempt is made: an EP0 that refused the write is a fact about this host's transport, and repeating it measures nothing about the air == witness ::",
@@ -7320,6 +8884,13 @@ impl Controller {
         // genuinely UNKNOWN (no Command Status, or an endpoint that stopped being readable) —
         // the same two states `outstanding` already treats as "the controller MAY be paging".
         outstanding = true;
+        // BT-C1/PHASE + BT-C1/CTRL — the instant the command left EP0, which is the closest this
+        // host can stand to the instant the train went on the air. It is BOTH the phase baseline
+        // the next attempt measures its gap from AND the zero the Page Timeout latency below is
+        // measured against, and it is deliberately one reading serving both so the two numbers can
+        // never disagree about when this attempt started.
+        let train_at = crate::arch::now_cycles();
+        prev_train = Some(train_at);
         // THIS attempt's answer, not the running total — the retry decision below must not be able
         // to fire on an earlier attempt's Page Timeout.
         let mut this_page_timed_out = false;
@@ -7426,6 +8997,44 @@ impl Controller {
                         if s == 0x04 && ours {
                             page_timeouts += 1;
                             this_page_timed_out = true;
+                            // ---- CANDIDATE 3: DID THE CONTROLLER PAGE FOR THE DEADLINE IN FORCE?
+                            // The controller left the paging state to send this event, so the time
+                            // from the Create_Connection leaving EP0 to this event arriving is the
+                            // duration it actually paged, plus a transport delay of well under a
+                            // millisecond. Compared against `deadline_ms` — READ BACK from the
+                            // controller in step 1a, not merely written to it — this is the one
+                            // measurement that separates "the controller paged for its full
+                            // deadline and heard nothing" from "the controller gave up early".
+                            //
+                            // A SHORT TRAIN IS NOT A PEER PROBLEM. If this reports materially less
+                            // than the deadline, no statement about the speaker follows from this
+                            // attempt at all: the train that was supposed to be listening was not
+                            // on the air for the time the parameters claimed.
+                            let obs_cy =
+                                crate::arch::now_cycles().wrapping_sub(train_at);
+                            last_obs_cy = obs_cy;
+                            obs_measured = true;
+                            match epace_ms(obs_cy) {
+                                Some(obs_ms) => serial_println!(
+                                    ":: bt-c1: [{}] CANDIDATE-3 page-timeout LATENCY — attempt={}/{} observed={}ms deadline_in_force={}ms ({}% of it) source={} -> {} == witness ::",
+                                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, obs_ms, deadline_ms,
+                                    if deadline_ms == 0 { 0 } else { obs_ms.saturating_mul(100) / deadline_ms },
+                                    if readback.is_some() { "READ BACK from the controller" } else { "the WRITTEN value; the read-back failed and its own line says so" },
+                                    if deadline_ms == 0 {
+                                        "NO DEADLINE IS KNOWN, so this latency indicts nothing"
+                                    } else if obs_ms.saturating_mul(100) / deadline_ms < 80 {
+                                        "SHORT — the controller stopped paging well before the deadline in force. CANDIDATE 3 IS LIVE, and it is the strongest of the three on this evidence: a train cut short is not a peer that failed to answer, and NOTHING about the speaker may be concluded from this attempt"
+                                    } else if obs_ms.saturating_mul(100) / deadline_ms > 130 {
+                                        "LONG — the event arrived materially AFTER the deadline in force. The controller paged past its own timeout, or this host's event read is lagging the controller; either way the latency is not a clean measure of the train and candidate 3 is live in its second form"
+                                    } else {
+                                        "FULL — the controller paged for the deadline in force and reported the timeout on schedule. CANDIDATE 3 IS EXCLUDED in its 'train cut short' form for this attempt: the radio did the paging it was asked for, and the failure is upstream of it (offset ageing) or in the air (scan phase)"
+                                    }
+                                ),
+                                None => serial_println!(
+                                    ":: bt-c1: [{}] CANDIDATE-3 page-timeout LATENCY — attempt={}/{} UNMEASURABLE (uncalibrated TSC); the observed train duration is raw cycles and is NOT compared to the {}ms deadline. Candidate 3 is neither supported nor excluded here == witness ::",
+                                    self.idx, attempt, BT_C1_PAGE_ATTEMPTS, deadline_ms
+                                ),
+                            }
                         }
                         serial_println!(
                             ":: bt-c1: [{}] Connection Complete (0x03) — attempt={}/{} status={:#04x} -> NOT CONNECTED{}. The page RESOLVED (the controller left the paging state to send this), so no cancel is owed == witness ::",
@@ -7441,8 +9050,8 @@ impl Controller {
                                 // first thing a reader saw. Our-side causes now carry equal
                                 // weight, and the inquiry summary above is what decides between
                                 // them rather than the reader's prior.
-                                0x04 if from_inquiry => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE PEER-SIDE READINGS ARE EXCLUDED — the inquiry above heard this exact BD_ADDR, so it is powered, in range and scanning. What remains is OURS: the harvested clock offset may have aged out of the controller's tolerance between the inquiry and the page, the page train may not have overlapped a scan window, or this controller's paging is at fault)",
-                                0x04 => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE READINGS ARE OF EQUAL WEIGHT AND THIS LINE RANKS NONE OF THEM. Ours: this page carried NO harvested clock offset and a guessed page-scan repetition mode, so the controller had to sweep for the peer's clock phase rather than start on it — the same configuration reached this speaker on gr25-bootA only on its SECOND train, which is what an unaligned page looks like. Also ours: the BD_ADDR paged here was read off an LE advertisement and need not be the address this device pages under. Theirs: it is off, out of range, already connected to another host, or past its pairing window. Read the inquiry summary above before choosing — it is what tells these apart)",
+                                0x04 if from_inquiry => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. TWO peer-side readings are excluded and one is NOT. The inquiry above heard this exact BD_ADDR, so the peer is powered and in range — those two are dead. IT IS INQUIRY-SCANNING; THAT IS NOT THE SAME AS PAGE-SCANNING. Inquiry scan and page scan are separate enables on the peer, so 'answered the inquiry, ignored the page' is a coherent peer state and stays on the table alongside ours: the harvested clock offset may have aged out of the controller's tolerance between the inquiry and the page, the page train may not have overlapped a scan window, or this controller's paging is at fault. The candidate verdict below ranks the OUR-side three; nothing here ranks them against the peer's scan state, which no outbound page can measure)",
+                                0x04 => " (PAGE TIMEOUT: the peer did not answer the train inside the timeout written above. THE READINGS ARE OF EQUAL WEIGHT AND THIS LINE RANKS NONE OF THEM. Ours: this page carried NO harvested clock offset and a guessed page-scan repetition mode, so the controller had to sweep for the peer's clock phase rather than start on it — the same configuration reached this speaker on gr25-bootA only on its SECOND train, which is what an unaligned page looks like. Theirs: it is off, out of range, already connected to another host, not page-scanning, or past its pairing window. Read the inquiry summary above before choosing — it is what tells these apart. NOT a live reading: 'the BD_ADDR was read off an LE advertisement and need not be the one this device pages under' — a CLASSIC inquiry has answered at this address, with an Audio/Video Class of Device, and Peter settled the identity 2026-08-22)",
                                 0x05 => " (AUTHENTICATION FAILURE)",
                                 0x08 => " (CONNECTION TIMEOUT)",
                                 0x0D | 0x0E | 0x0F => " (CONNECTION REJECTED: the peer refused — limited resources, security, or an unacceptable BD_ADDR. A speaker bonded to another host commonly answers this)",
@@ -7500,7 +9109,7 @@ impl Controller {
             && attempt < BT_C1_PAGE_ATTEMPTS;
         if retry {
             serial_println!(
-                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air. The reason to spend a second train is OURS: a train and the peer's page-scan schedule are independent clocks, this train's phase and its page-scan-repetition-mode/clock-offset alignment need not have overlapped the peer's scan window, and the next train samples a different phase. If it too times out the readings are co-equal — an unaligned page on our side, or a peer not scanning on theirs — and this costs one more {}ms to tell them apart == witness ::",
+                ":: bt-c1: [{}] PAGE TIMEOUT on attempt={}/{} -> RETRYING, AND THE RETRY IS A DIFFERENT EXPERIMENT. Nothing is outstanding (the controller resolved the page itself) and no link is held, so one more page train goes on the air — but not the same one. Boot 3 showed the old retry re-sending a block built before the first train and landing within 5ms of two whole scan cycles, i.e. re-running the first experiment; the next attempt therefore (1) REBUILDS its 13 bytes from the freshest inquiry state, and (2) is deliberately DELAYED so its start sits about half the peer's scan interval away from a whole multiple of it. The RE-HARVEST, PHASE-STEP and CANDIDATE-2 lines of that attempt print both intentions against what the clock measured, so a retry that once again tests nothing will say so. The budget and the {}ms page timeout are unchanged == witness ::",
                 self.idx, attempt, BT_C1_PAGE_ATTEMPTS,
                 (BT_C1_PAGE_TIMEOUT as u32 * 625) / 1000
             );
@@ -7529,13 +9138,54 @@ impl Controller {
                 // page under btc at all on the flight that connected — the connection there was an
                 // LE link. The honest contrast case is gr25-bootA, where THESE parameters reached
                 // this speaker on the second train.
-                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN — but read the inquiry summary above before reading that as the speaker's fault. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so no page was cut short by this host. THE READINGS ARE OF EQUAL WEIGHT. Ours: no inquiry response for this address was harvested, so both trains ran with a GUESSED page-scan repetition mode and NO clock offset, and the controller had to sweep for the peer's clock phase — this same configuration reached this speaker on gr25-bootA only on its second train, so an unaligned page failing twice is an expected outcome and not a discovery. Ours: the address paged was read off an LE advertisement and a dual-mode device need not page under the address it advertises. Theirs: off, out of range, already connected to another host, or past its pairing window"
+                "NOT REACHED, AND THE PEER NEVER ANSWERED ANY TRAIN — but read the inquiry summary above before reading that as the speaker's fault. Every attempt in the budget ended in an explicit Page Timeout for this BD_ADDR, each one a full-length train, so no page was cut short by this host. THE READINGS ARE OF EQUAL WEIGHT. Ours: no inquiry response for this address was harvested, so both trains ran with a GUESSED page-scan repetition mode and NO clock offset, and the controller had to sweep for the peer's clock phase — this same configuration reached this speaker on gr25-bootA only on its second train, so an unaligned page failing twice is an expected outcome and not a discovery. Theirs: off, out of range, already connected to another host, NOT PAGE-SCANNING, or past its pairing window. TWO READINGS ARE DEAD AND MUST NOT BE REVIVED HERE. (1) 'the address was read off an LE advertisement and may be the wrong one' — a CLASSIC inquiry has answered at this address with an Audio/Video Class of Device (gr26-bootC 2026-08-11, rmbp1-boot1 2026-08-18), and Peter settled the identity 2026-08-22. (2) 'the bt-l2 line above shows a strong RSSI, so range and power are excluded' — that RSSI is an LE ADV_IND measurement. It proves the peer's LE radio is alive and it says NOTHING about BR/EDR inquiry scan or page scan, which are a different radio state on the same chip. The only in-band evidence about BR/EDR is the inquiry summary above"
             } else if page_timeouts > 0 {
                 "NOT REACHED — a Page Timeout was seen, and the sequence stopped before the budget was spent. The attempt line that ended it says why (a link, a refusal, or a local-side failure); read that line, not this count"
             } else {
                 "NOT REACHED, AND NOT FOR WANT OF LISTENING TIME — no attempt ended in a Page Timeout at all. The answer came from this host's own side or from a peer that responded with something else; the attempt lines above carry it, and no amount of extra page time would change it"
             }
         );
+
+        // ---- 4b''. BT-C1/VERDICT — the three candidates, ranked by THIS boot's own numbers ------
+        // The per-attempt CANDIDATE-1/2/3 lines each answer one question about one train. This is
+        // the line a capture is read FOR: it restates all three against the last attempt's
+        // measurements so the next arc knows which candidate to spend itself on, and it ranks
+        // NOTHING that this boot did not measure. Every arm below is reachable only from numbers
+        // the controller or the clock supplied.
+        if page_timeouts > 0 && from_inquiry {
+            let age_ms = epace_ms(last_age_cy);
+            let obs_ms = if obs_measured { epace_ms(last_obs_cy) } else { None };
+            let drift_slots = age_ms.map(|a| a.saturating_mul(BT_C1_CLK_DRIFT_PPM) / 1000 / 625);
+            let short_train = match (obs_ms, deadline_ms) {
+                (Some(o), d) if d != 0 => o.saturating_mul(100) / d < 80,
+                _ => false,
+            };
+            serial_println!(
+                ":: bt-c1: [{}] CANDIDATE VERDICT — offset_age_at_last_page={}ms(drift_bound={} slots) last_train_observed={}ms deadline_in_force={}ms(readback={}) retry_phase={} phase_step={} reharvest_newer_response={} -> {} == witness ::",
+                self.idx,
+                match age_ms { Some(a) => a, None => 0 },
+                match drift_slots { Some(d) => d, None => 0 },
+                match obs_ms { Some(o) => o, None => 0 },
+                deadline_ms,
+                readback.is_some(),
+                if same_phase_retry { "SAME(untested)" } else { "DIFFERENT(tested)" },
+                if phase_step_hit { "LANDED(intended==measured)" } else { "not confirmed — see the CANDIDATE-2 line" },
+                reharvested_fresh,
+                if short_train {
+                    "CANDIDATE 3 (controller) LEADS — the last train ran materially short of the deadline the controller itself reported in force. Spend the next arc on the controller's paging, not on the offset or the phase: an offset cannot be blamed for a train that was not on the air, and a phase cannot be sampled by one that stopped early"
+                } else if age_ms.is_none() || obs_ms.is_none() {
+                    "NOTHING IS RANKED — the TSC was uncalibrated for at least one of the two measurements this verdict needs, so the numbers above are placeholders and not readings. The per-attempt lines say which. A boot that ranks these candidates must be one where tsc_calibrated=true"
+                } else if drift_slots.unwrap_or(0) >= 1 && same_phase_retry {
+                    "CANDIDATES 1 AND 2 ARE BOTH LIVE AND THIS BOOT CANNOT SEPARATE THEM — the offset had aged past a slot AND the retry re-sampled the same scan phase. THIS ARC APPLIED BOTH FIXES, so a boot still printing this line is reporting that they did not take: the RE-HARVEST line says whether any newer response existed to rebuild from (if none did, the age is the AIR's silence and not this host's caching), and the PHASE-STEP/CANDIDATE-2 pair says whether the delay landed where it aimed. Read those two lines before reading this one as a repeat of Boot 3"
+                } else if drift_slots.unwrap_or(0) >= 1 {
+                    "CANDIDATE 1 (offset ageing) LEADS — the controller paged for its full deadline and two different scan phases were sampled, but the offset it started from had aged past a full slot. The block IS rebuilt per attempt now, so this age is the distance to the peer's last word on the air, not to a cached array: if the RE-HARVEST line reports no newer response, the remaining lever is the inquiry-to-page distance itself"
+                } else if same_phase_retry {
+                    "CANDIDATE 2 (scan phase) IS UNTESTED AND LEADS BY ELIMINATION — the offset was still exact and the controller paged for its full deadline, so neither 1 nor 3 explains this; and the retry re-sampled the same phase DESPITE the step that was applied to prevent exactly that. The CANDIDATE-2 line's intended/measured pair is where this boot's next question is: the step is the thing that failed here, not the hypothesis"
+                } else {
+                    "ALL THREE CANDIDATES ARE WEAKENED — the offset was still exact at page time, the controller paged for its full deadline, and two different scan phases were sampled, and the peer still never answered. If this boot's inquiry summary above also says the target ANSWERED, then the failure is in none of the three places this arc has been looking, and the next hypothesis must come from outside them. IT IS NOT THE BD_ADDR: that question is CLOSED — Peter's 2026-08-22 ruling, and independently the Class of Device on the inquiry-result line above, an Audio/Video major class answering on CLASSIC at this very address. What is left is the peer's SCAN STATE: a device that answers an inquiry is inquiry-scanning, which says nothing about whether it is page-scanning, and on the peer those are separate enables. The discriminator is a DIRECTION test — let the peer page US — not another outbound train against the same address"
+                }
+            );
+        }
 
         // ---- 4b. reconcile the latch before any cancel is considered -----------------------------
         if !live {
@@ -7712,6 +9362,12 @@ impl Controller {
             ) {
                 disconnected += 1;
                 live = false;
+            } else if st.release == BtL3Release::HandleGone {
+                // RELEASE-2 — the handle probe says the controller retired this handle, so there
+                // is no BR/EDR link to leave behind. Clearing `live` here is what keeps
+                // `bt_left_link` from latching a dead handle and making every later re-trigger
+                // spend its escape hatch on a link that does not exist.
+                live = false;
             }
         }
 
@@ -7732,6 +9388,537 @@ impl Controller {
         // correct path this writes `None`, so a later re-trigger re-pages as normal; when it writes
         // `Some`, the re-trigger reports "already connected" and refuses to page a link still held.
         self.bt_left_link = if live { Some(handle) } else { None };
+
+        // ---- 7. BT-DIR — THE OTHER DIRECTION, AND ONLY NOW -------------------------------------
+        // LAST STATEMENT OF THE STAGE, AND THE PLACEMENT IS THE EXPERIMENT. Phase 1 above — the
+        // outbound page train — is this arc's CONTROL, and a controller with page scan enabled
+        // time-slices its idle mode between inbound scan windows and any outbound train it is
+        // running. Arming the scan anywhere earlier would degrade the very train four boots have
+        // been measuring and hand back a confounded number. So every byte of BT-DIR sits after
+        // `bt_c1_tally` has printed phase 1's verdict, after the teardown, and after the retry
+        // latch is written: nothing above this line can observe it, and on a build without
+        // `btdir` the line does not exist at all — which is what makes a `btc` boot byte-identical
+        // to the boots the control was taken from.
+        //
+        // `!live && !outstanding` is the gate, and it is not tidiness. Both are phase 1's
+        // MUST-NOT-APPEAR conditions: `live` means a BR/EDR link the teardown did not confirm
+        // released, `outstanding` means the controller may STILL BE PAGING. Enabling page scan on
+        // top of either is precisely the concurrency this arc is built to avoid, so the probe
+        // refuses — and says so on its own result line rather than skipping silently.
+        #[cfg(feature = "btdir")]
+        self.bt_dir_probe(
+            t, intf, e, toggle, armed, &mut st, &mut seen, &mut asm, !live && !outstanding,
+        );
+    }
+
+    /// BT-DIR — PHASE 2 AND PHASE 3: make this host page-scannable, hold one window, report what
+    /// arrived, and put the radio back the way phase 1's control assumes it.
+    ///
+    /// WHAT THIS MEASURES, IN ONE SENTENCE: every BR/EDR attempt this project has ever made tested
+    /// one direction — us paging the peer — and all of them ended at `Connection Complete
+    /// status=0x04` PAGE TIMEOUT. Answering an inquiry proves the peer is INQUIRY-scanning; page
+    /// scan is a separate enable, and "discoverable but not connectable" is the ordinary resting
+    /// state of a speaker already bonded elsewhere. If the peer can page US, the RF path works
+    /// both ways and the fault is in our train. If it cannot, no host-side page change fixes it.
+    ///
+    /// IT ADDS NO ACCEPT PATH, and that is scope rather than caution: the reading wanted is the
+    /// `Connection Request` EVENT arriving. `HCI_Accept_Connection_Request` (0x0409) exists
+    /// nowhere in this tree, and neither does a reject, an event filter, SDP, RFCOMM, a written
+    /// local name or a written Class of Device — so an inbound request is witnessed and then left
+    /// to the controller's own connection-accept timeout, which is the whole of what is being
+    /// measured. A request arriving and going unanswered is the RESULT, not a bug.
+    ///
+    /// THE WINDOW IS ONLY SPENT WHEN THE INSTRUMENT EXISTS. `bt_hci_command`'s Command Complete
+    /// status is checked before the wait runs: a controller that REFUSED `Write_Scan_Enable` gets
+    /// no 6.4-second silence recorded against the peer, because that silence would be
+    /// indistinguishable from a peer that never paged — the "an instrument that cannot fire in the
+    /// state it exists for is an ABSENT instrument, not a cheaper one" failure this repo has hit
+    /// five times in one week, `COMP_REVENANTS` most recently. The one asymmetry is deliberate: an
+    /// ACCEPTED write whose READBACK could not be obtained still spends the window, because a
+    /// `Connection Request` arriving is SELF-CERTIFYING — nothing can page a host whose page scan
+    /// is off — while a silence under an unconfirmed readback is reported as `SCAN-UNCONFIRMED`
+    /// and is not evidence about the peer.
+    ///
+    /// THE FIVE EXITS, all printed by the one `BT-DIR RESULT` line so no source dive is needed at
+    /// the bench:
+    /// * `REQUEST`            — a `Connection Request` (0x04) arrived. RF works in BOTH directions
+    ///   and the peer CAN page. The fault is our page train (clock offset / page-scan repetition
+    ///   mode) or the peer's page-scan enable in the outbound direction only.
+    /// * `NEGATIVE`           — nothing arrived, and THIS SAME BOOT's inquiry did hear the target.
+    ///   The peer is not connectable in either direction; no host-side page change fixes that and
+    ///   this line of work should stop.
+    /// * `VOID`               — nothing arrived AND the inquiry heard nothing either. The peer was
+    ///   absent or off and THE TEST DID NOT RUN AGAINST ANYTHING. This is the MOST LIKELY outcome
+    ///   — recent boots report `responses=0` — and a void run misread as a negative is exactly how
+    ///   a wrong conclusion gets recorded, which is why the word is printed rather than inferred.
+    /// * `SCAN-NOT-ENABLED`   — the controller refused the write. Nothing about the peer is learned.
+    /// * `SCAN-UNCONFIRMED`   — accepted but the readback did not come back saying 0x03.
+    /// * `SKIPPED-PHASE1-UNCLEAN` — phase 1 left a link or an unresolved page; see the call site.
+    ///
+    /// PHASE 3 IS NOT SAFETY, IT IS HYGIENE. A machine left page-scannable is a machine in a
+    /// different radio state than the one the NEXT boot's control assumes, which is a contaminated
+    /// control. The restoration writes `BT_DIR_SCAN_OFF`, READS IT BACK, and prints both — the
+    /// same discipline BT-C1/AGE applies to `Read_Page_Timeout`, and for the same reason: a write
+    /// answering 0x00 says ACCEPTED, not IN FORCE.
+    #[cfg(feature = "btdir")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bt_dir_probe(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        e: &BtEvtEp,
+        toggle: &mut bool,
+        armed: &mut bool,
+        // Phase 1's state, READ ONLY for the verdict — `inq_found` is what separates NEGATIVE from
+        // VOID — and passed by `&mut` because `bt_l3_await` requires it and latches into it.
+        st: &mut BtL3State,
+        seen: &mut u32,
+        asm: &mut [u8],
+        phase1_clean: bool,
+    ) {
+        let t0 = crate::arch::now_cycles();
+
+        // ---- 0. THE GATE ----------------------------------------------------------------------
+        // It prints. A skip that says nothing is the same silence as a window that heard nothing,
+        // and the whole point of this stage is that those two must never be confusable.
+        if !phase1_clean {
+            serial_println!(
+                ":: bt-dir: [{}] BT-DIR RESULT — result=SKIPPED-PHASE1-UNCLEAN scan_enable_written=none window_held_ms=0 connection_requests=0 -> phase 1 ended holding a live link or an unresolved page, so enabling page scan would have overlapped an outbound train. NOTHING was written to the radio and NOTHING about the peer is learned == witness ::",
+                self.idx
+            );
+            return;
+        }
+
+        // ---- 1. SIZE THE WINDOW AGAINST THE CONTROLLER'S OWN INTERVAL --------------------------
+        // `BT_DIR_WINDOW_MS` is meant to span several page-scan intervals, and the interval is the
+        // CONTROLLER's parameter, not ours. Read it so the ratio is a measurement; a read that
+        // fails does not stop the window, it just says on this line that the number the window was
+        // sized against is unread.
+        let mut rp = [0u8; 8];
+        let (psi, psw, act_ok, act_status) = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_READ_PAGE_SCAN_ACTIVITY, &[], &mut rp, armed,
+        ) {
+            // `rp` is a ZEROED local, so a no-response command would leave `rp[0]` reading 0x00 —
+            // a SUCCESS status the wire never supplied. Every status below is therefore carried as
+            // an `Option` and printed as `none` when absent; the same trap is why the readbacks in
+            // steps 3 and 5 do the same. This is the exact placeholder the inquiry-result line's
+            // three-piece emission was written to avoid.
+            Some(n) if n >= 5 => (
+                (rp[1] as u16) | ((rp[2] as u16) << 8),
+                (rp[3] as u16) | ((rp[4] as u16) << 8),
+                rp[0] == 0x00,
+                Some(rp[0]),
+            ),
+            Some(n) if n >= 1 => (0u16, 0u16, false, Some(rp[0])),
+            _ => (0u16, 0u16, false, None),
+        };
+        // 0.625 ms per slot, Vol 4 Part E §7.3.19.
+        let psi_ms = (psi as u64 * 625) / 1000;
+        let psw_ms = (psw as u64 * 625) / 1000;
+        serial_print!(
+            ":: bt-dir: [{}] HCI_Read_Page_Scan_Activity (0x0C1B) status=",
+            self.idx
+        );
+        match act_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " interval={:#06x}(={}ms) window={:#06x}(={}ms) -> {} == witness ::",
+            psi, psi_ms, psw, psw_ms,
+            if !act_ok {
+                "UNREAD — the hold below still runs its full BT_DIR_WINDOW_MS, but the claim that it spans several scan intervals is UNVERIFIED this boot"
+            } else if psi_ms != 0 && BT_DIR_WINDOW_MS / psi_ms >= 3 {
+                "the hold below spans at least 3 of this controller's page-scan intervals"
+            } else {
+                "SHORT — the hold below spans fewer than 3 of this controller's page-scan intervals, so a silence is WEAKER evidence than the constant's rationale assumes"
+            }
+        );
+
+        // ---- 2. PHASE 2a: MAKE THIS HOST ANSWERABLE --------------------------------------------
+        // `HCI_Write_Scan_Enable` (Vol 4 Part E §7.3.18) answers with a COMMAND COMPLETE carrying
+        // one status byte — not a Command Status — so `bt_hci_command`'s return IS the completion
+        // status and there is no deferred event to chase.
+        let mut wr = [0u8; 8];
+        let (wr_status, write_accepted) = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_WRITE_SCAN_ENABLE, &[BT_DIR_SCAN_BOTH], &mut wr, armed,
+        ) {
+            Some(n) if n >= 1 => (Some(wr[0]), wr[0] == 0x00),
+            Some(_) => (None, false),
+            None => (None, false),
+        };
+        // Emitted in pieces because the status is OPTIONAL — the same reason the inquiry-result
+        // line is. A controller that answered nothing must print `none` here, not a placeholder
+        // number the wire never supplied.
+        serial_print!(
+            ":: bt-dir: [{}] PHASE 2 HCI_Write_Scan_Enable (0x0C1A) scan_enable={:#04x} (bit0 inquiry scan + bit1 page scan) status=",
+            self.idx, BT_DIR_SCAN_BOTH
+        );
+        match wr_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " -> {} == witness ::",
+            match wr_status {
+                Some(0x00) => "ACCEPTED — this host is now page-scannable",
+                Some(_) => "REFUSED — the window below is NOT spent and NOTHING about the peer can be concluded",
+                None => "UNREAD — the command went out on EP0 but no Command Complete came back, so whether this host is page-scannable RIGHT NOW is UNKNOWN. The window below is NOT spent",
+            }
+        );
+
+        // ---- 3. PHASE 2b: HOLD THE WINDOW ------------------------------------------------------
+        // THE READBACK IS DELIBERATELY NOT HERE. It used to sit between the write and this loop,
+        // and REVIEW FOUND THAT IT ATE THE MEASUREMENT: `bt_hci_command_ex`'s drain has none of
+        // `bt_l3_await`'s latching — it `continue`s past every event that is not the Command
+        // Complete it asked for — so a `Connection Request` arriving in the readback's drain would
+        // have been logged as a skipped `bt-l0` event and never reached `conn_reqs`, and the boot
+        // could print NEGATIVE over a request that DID arrive. The readback runs AFTER the window
+        // instead, where it is at least as probative: `Scan_Enable` still reading 0x03 on the far
+        // side proves the scan was in force ACROSS the window rather than merely at its start.
+        //
+        // Re-entered because `bt_l3_await` carries a STRUCTURAL cap of `BT_L3_EVT_MAX` events per
+        // Re-entered because `bt_l3_await` carries a STRUCTURAL cap of `BT_L3_EVT_MAX` events per
+        // call: a busy room can spend that cap on traffic that is not a `Connection Request` and
+        // return `Timeout` with most of the wall clock unspent. Re-entering is what keeps this a
+        // WALL-CLOCK window; every re-entry is handed only what remains of it, so the total is
+        // still bounded by `BT_DIR_WINDOW_MS` and not by `BT_DIR_AWAIT_REENTRIES`.
+        let blind_at_entry = st.blind;
+        let seen_at_entry = *seen;
+        let win_cy = Self::bt_l3_budget(BT_DIR_WINDOW_MS);
+        let w0 = crate::arch::now_cycles();
+        // TWO COUNTERS, AND THE SPLIT IS THE WHOLE VERDICT. `Scan_Enable = 0x03` makes this host
+        // answerable to EVERY device in the room and no `Set_Event_Filter` exists in this tree, so
+        // "a Connection Request arrived" and "THE PEER paged us" are different facts. Counting them
+        // together would let a neighbour's phone print the one conclusion that redirects this whole
+        // project. This file already settled the rule for the same event family: `bt_l3_await`'s
+        // classic latch refuses to adopt a `Connection Complete` whose BD_ADDR is not
+        // `BT_L3_PEER_ADDR_BYTES`, on the reasoning that an inbound connection from some other
+        // device "is exactly the event shape being matched here". BT-DIR is the case that comment
+        // anticipated.
+        let mut conn_reqs = 0u32;
+        let mut conn_reqs_peer = 0u32;
+        let mut reentries = 0u32;
+        let mut ep_stopped = false;
+        if write_accepted {
+            while reentries < BT_DIR_AWAIT_REENTRIES {
+                let el = crate::arch::now_cycles().wrapping_sub(w0);
+                if el >= win_cy {
+                    break;
+                }
+                reentries += 1;
+                match self.bt_l3_await(
+                    e, toggle, armed,
+                    BtL3Want::Evt(BT_EVT_CONN_REQUEST),
+                    win_cy - el, seen, st, asm,
+                ) {
+                    BtL3Await::Got(len) => {
+                        conn_reqs += 1;
+                        // `Connection Request` (Vol 4 Part E §7.7.4): EventCode(1)
+                        // Parameter_Total_Length(1) BD_ADDR(6) Class_of_Device(3) Link_Type(1)
+                        // => 12 bytes on the wire. Bounds-checked before ANY field is read: this
+                        // arrived off the air and nothing authenticated it.
+                        if len >= 12 {
+                            let a = [asm[2], asm[3], asm[4], asm[5], asm[6], asm[7]];
+                            let text = bt_addr_render_msb(&a);
+                            let (major, minor, sink) =
+                                bt_c1_cod_decode([asm[8], asm[9], asm[10]]);
+                            let ours = bt_addr_eq(&a, &BT_L3_PEER_ADDR_BYTES);
+                            if ours {
+                                conn_reqs_peer += 1;
+                            }
+                            serial_println!(
+                                ":: bt-dir: [{}] INBOUND Connection Request (0x04) — addr={} is_our_peer={} class_of_device={:02x}{:02x}{:02x}(major={} minor={} audio_sink={}) link_type={:#04x}({}) -> {}. It is NOT answered: no Accept/Reject exists in this tree and adding one is out of this arc's scope; the controller's own connection-accept timeout resolves it == witness ::",
+                                self.idx,
+                                core::str::from_utf8(&text).unwrap_or("??:??:??:??:??:??"),
+                                ours,
+                                asm[10], asm[9], asm[8], major, minor, sink,
+                                asm[11],
+                                match asm[11] {
+                                    0x00 => "SCO",
+                                    0x01 => "ACL",
+                                    0x02 => "eSCO",
+                                    _ => "reserved",
+                                },
+                                if ours {
+                                    "THE PEER PAGED THIS HOST — this is the arc's REQUEST outcome"
+                                } else {
+                                    "A DIFFERENT DEVICE paged this host. It does NOT answer this arc's question, but it is not nothing either: it proves this host's page scan is genuinely live. The window keeps running"
+                                }
+                            );
+                            // Only OUR peer ends the window. Breaking on a stranger would spend the
+                            // measurement on a device nobody asked about and make the peer
+                            // unhearable for the rest of the hold.
+                            if ours {
+                                break;
+                            }
+                            continue;
+                        }
+                        // A request too short to carry an address cannot be attributed. It counts
+                        // toward `conn_reqs` (something paged us) and NOT toward `conn_reqs_peer`,
+                        // and it does not end the window — the peer may still be about to page.
+                        st.blind = true;
+                        serial_println!(
+                            ":: bt-dir: [{}] INBOUND Connection Request (0x04) arrived but carries {} bytes, short of the 12 the layout requires — the address and class are NOT decoded, so it CANNOT be attributed to the peer. The ARRIVAL still stands: something paged this host, which proves this host's page scan is live. The window keeps running == witness ::",
+                            self.idx, len
+                        );
+                        continue;
+                    }
+                    BtL3Await::Timeout => continue,
+                    BtL3Await::Stop => {
+                        ep_stopped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // `epace_ms` returns None when the TSC rate is unknown, and the rule this file states on it
+        // is "the caller then prints raw cycles rather than a fabricated millisecond (the
+        // `[vugfps]` lesson)". `.unwrap_or(0)` would have printed `window_held_ms=0` — and worse,
+        // an uncalibrated TSC ALSO makes `bt_l3_budget` fall back to `hw_wait_budget() / 4`, which
+        // is roughly 0.27 s, so the window really would have been ~24x shorter than the constant
+        // the line prints. Unknown is carried as `None` and reaches the VERDICT below, where it
+        // blocks NEGATIVE and VOID, rather than being flattened into a number.
+        let held = epace_ms(crate::arch::now_cycles().wrapping_sub(w0));
+        let (held_v, held_u) = epace_fmt(crate::arch::now_cycles().wrapping_sub(w0));
+
+        // ---- 4. PHASE 2c: READ THE SCAN ENABLE BACK, ON THE FAR SIDE OF THE WINDOW --------------
+        // NOT DECORATION. The whole phase-2 reading is "the host was page-scannable and nothing
+        // paged it", and that sentence is worthless if its first clause was never true. Placed
+        // after the hold rather than before it — see the note at the top of step 3 for why putting
+        // a full command drain between the write and the wait discarded the very event being
+        // measured. Reading 0x03 here proves the scan was in force ACROSS the window, which is a
+        // stronger statement than reading it at the start.
+        let mut rb = [0u8; 8];
+        let (rb_val, rb_status, readback_confirms) = match self.bt_hci_command(
+            t, intf, e, toggle, BT_HCI_READ_SCAN_ENABLE, &[], &mut rb, armed,
+        ) {
+            // Return parameters: Status(1) Scan_Enable(1). The VALUE is offered only when the
+            // status says the read succeeded — a Scan_Enable byte under a nonzero status is not a
+            // reading, and offering it would let `scan_enable_in_force=0x03` print off a failed
+            // command, which is the one number this whole stage rests on.
+            Some(n) if n >= 2 => (
+                if rb[0] == 0x00 { Some(rb[1]) } else { None },
+                Some(rb[0]),
+                rb[0] == 0x00 && rb[1] == BT_DIR_SCAN_BOTH,
+            ),
+            Some(n) if n >= 1 => (None, Some(rb[0]), false),
+            _ => (None, None, false),
+        };
+        serial_print!(
+            ":: bt-dir: [{}] PHASE 2 HCI_Read_Scan_Enable (0x0C19) status=",
+            self.idx
+        );
+        match rb_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_print!(" scan_enable_in_force=");
+        match rb_val {
+            Some(v) => { serial_print!("{:#04x}", v); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " -> {} == witness ::",
+            if readback_confirms {
+                "CONFIRMED IN FORCE ACROSS THE WINDOW — a silence above is evidence about the peer"
+            } else if write_accepted {
+                "NOT CONFIRMED — the write was accepted but the controller did not read back 0x03 afterwards; a silence above is NOT evidence about the peer, though an arriving request still would be"
+            } else {
+                "NOT IN FORCE — as expected from the refused or unread write above"
+            }
+        );
+
+        // ---- 5. PHASE 3: PUT THE RADIO BACK ----------------------------------------------------
+        // Unconditional once phase 2a was attempted — including after a REFUSED write, because
+        // "the write was refused so scan must still be off" is an inference and this stage does
+        // not trade in those. The value written and the value read back are both PRINTED.
+        //
+        // BUT IT MUST NOT READ THROUGH A HALT. `BtL3State::stopped`'s docblock makes this a rule
+        // and not a preference: once latched, a later `bt_read_full_event` sees `armed == false`
+        // after the halt cleared it, re-arms, and writes a fresh `QTD_ACTIVE` overlay — which
+        // clears the QH's Halted bit while the DEVICE's STALL is untouched. `bt_read_full_event`
+        // has no self-guard; the guard lives in the callers, and the two that already exist
+        // (`bt_l3_disconnect`'s early return, and the C1 cancel path) do exactly what this does.
+        // EP0 is NOT affected by an event-endpoint halt, so the restore still goes out — it is
+        // sent with `bt_hci_send`, whose reply is deliberately unread, and the line says so rather
+        // than reporting the missing confirmation as "NOT RESTORED".
+        let ep_dead = st.stopped || ep_stopped;
+        let mut r3 = [0u8; 8];
+        let (r3_status, restore_accepted, restore_sent) = if ep_dead {
+            let sent = self.bt_hci_send(t, intf, BT_HCI_WRITE_SCAN_ENABLE, &[BT_DIR_SCAN_OFF]);
+            (None, false, sent)
+        } else {
+            match self.bt_hci_command(
+                t, intf, e, toggle, BT_HCI_WRITE_SCAN_ENABLE, &[BT_DIR_SCAN_OFF], &mut r3, armed,
+            ) {
+                Some(n) if n >= 1 => (Some(r3[0]), r3[0] == 0x00, true),
+                _ => (None, false, true),
+            }
+        };
+        let mut r4 = [0u8; 8];
+        let (r4_val, r4_status, restore_confirms) = if ep_dead {
+            (None, None, false)
+        } else {
+            match self.bt_hci_command(
+                t, intf, e, toggle, BT_HCI_READ_SCAN_ENABLE, &[], &mut r4, armed,
+            ) {
+                Some(n) if n >= 2 => (
+                    if r4[0] == 0x00 { Some(r4[1]) } else { None },
+                    Some(r4[0]),
+                    r4[0] == 0x00 && r4[1] == BT_DIR_SCAN_OFF,
+                ),
+                Some(n) if n >= 1 => (None, Some(r4[0]), false),
+                _ => (None, None, false),
+            }
+        };
+        serial_print!(
+            ":: bt-dir: [{}] PHASE 3 POSTURE RESTORED — wrote scan_enable={:#04x} status=",
+            self.idx, BT_DIR_SCAN_OFF
+        );
+        match r3_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        // The readback's OWN status, separately from its value: `readback=none` under a silent
+        // controller and `readback=none` under a controller that answered with a nonzero status
+        // are different facts, and "the posture is restored" is exactly the claim that must not be
+        // allowed to rest on the two being printed identically.
+        serial_print!(" readback_status=");
+        match r4_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_print!(" readback=");
+        match r4_val {
+            Some(v) => { serial_print!("{:#04x}", v); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " -> {} == witness ::",
+            if restore_accepted && restore_confirms {
+                "RESTORED AND CONFIRMED — the radio is back in the posture the next boot's control assumes"
+            } else if restore_accepted {
+                "ACCEPTED BUT UNCONFIRMED — the readback did not come back 0x00; the NEXT boot's control may be contaminated and its result must be read with that in mind"
+            } else if ep_dead && restore_sent {
+                "SENT BUT UNVERIFIABLE — the event endpoint was no longer readable, so the restore went out on EP0 (which a halt does not touch) with its reply deliberately UNREAD. It very probably took; this stage cannot say so, and will not claim it"
+            } else if ep_dead {
+                "NOT SENT — the event endpoint was dead AND the EP0 write failed. THE NEXT BOOT'S CONTROL IS CONTAMINATED unless the radio is power-cycled"
+            } else {
+                "NOT RESTORED — the controller would not take the restore write. THE NEXT BOOT'S CONTROL IS CONTAMINATED unless the radio is power-cycled"
+            }
+        );
+
+        // ---- 6. THE ONE RESULT LINE, ON EVERY PATH ---------------------------------------------
+        // Every exit prints here, including "nothing arrived". A line that only fired on success
+        // could not tell "no request" from "this code never ran", which is the exact defect the
+        // brief names and the exact defect `COMP_REVENANTS` shipped.
+        //
+        // THE ORDER IS THE STANDING LAW "an absence is only evidence if the thing that would have
+        // produced it was actually attempted", applied three times before the peer is ever blamed.
+        // A `Connection Request` cannot be READ off an event endpoint that is no longer readable,
+        // and it cannot arrive in a window that closed early — so both of those states have to be
+        // eliminated before a silence is allowed to mean `VOID` or `NEGATIVE`, exactly as a refused
+        // `Write_Scan_Enable` does. `bt_hci_command` rides EP0, which a halted EVENT endpoint does
+        // not touch, so `write_accepted` can be true on a boot where nothing could ever be heard:
+        // that is not a corner, it is the specific way this stage would otherwise lie.
+        let window_truncated = reentries >= BT_DIR_AWAIT_REENTRIES;
+        // A hold that is unmeasurable, or that came in under three quarters of the constant the
+        // line prints, is not the window this stage's rationale is written about. Both collapse to
+        // "not held", because both make a silence unciteable for the same reason.
+        let window_short = held.map_or(true, |h| h * 4 < BT_DIR_WINDOW_MS * 3);
+        // Reads that went incomplete DURING the window — a truncated event, or one the structural
+        // cap stepped over. Snapshotted at entry so phase 1's own blindness is not charged here.
+        let reads_incomplete = st.blind && !blind_at_entry;
+        let result = if conn_reqs_peer > 0 {
+            "REQUEST"
+        } else if conn_reqs > 0 && !write_accepted {
+            // Cannot happen (the loop only runs when the write was accepted), but ordering the
+            // ladder so that an arrival can never be overwritten by an instrument complaint is
+            // cheaper than reasoning about it every time this code is edited.
+            "REQUEST-OTHER"
+        } else if wr_status.is_none() {
+            "SCAN-UNREAD"
+        } else if !write_accepted {
+            "SCAN-NOT-ENABLED"
+        } else if conn_reqs > 0 {
+            // Something paged this host, but not the peer — or not identifiably the peer. It does
+            // not answer the arc's question and must never be printed as if it did; it is still a
+            // real finding, because it proves this host's page scan was genuinely live.
+            "REQUEST-OTHER"
+        } else if ep_stopped || st.stopped {
+            "EVENT-ENDPOINT-DEAF"
+        } else if window_truncated {
+            // The loop tests the wall clock BEFORE it tests the cap, so exhausting the cap means
+            // the clock had NOT expired: the window was cut short by re-entries, not by time. No
+            // timing arithmetic is involved in this reading and none can go stale.
+            "WINDOW-TRUNCATED"
+        } else if window_short {
+            "WINDOW-SHORT"
+        } else if reads_incomplete {
+            "READS-INCOMPLETE"
+        } else if !readback_confirms {
+            "SCAN-UNCONFIRMED"
+        } else if st.inq_found {
+            "NEGATIVE"
+        } else {
+            "VOID"
+        };
+        let (elapsed, unit) = epace_fmt(crate::arch::now_cycles().wrapping_sub(t0));
+        serial_print!(
+            ":: bt-dir: [{}] BT-DIR RESULT — result={} elapsed={}{} scan_enable_written={:#04x} scan_enable_status=",
+            self.idx, result, elapsed, unit, BT_DIR_SCAN_BOTH
+        );
+        match wr_status {
+            Some(s) => { serial_print!("{:#04x}", s); }
+            None => { serial_print!("none"); }
+        }
+        serial_print!(" scan_enable_readback=");
+        match rb_val {
+            Some(v) => { serial_print!("{:#04x}", v); }
+            None => { serial_print!("none"); }
+        }
+        serial_println!(
+            " window_ms={} window_held={}{} page_scan_interval_ms={} intervals_covered={} await_reentries={} connection_requests={} connection_requests_from_peer={} events_read={} endpoint_readable={} reads_complete={} inquiry_responses={} inquiry_target_found={} restored={:#04x} restore_confirmed={} == witness ::",
+            BT_DIR_WINDOW_MS, held_v, held_u,
+            if act_ok { psi_ms } else { 0 },
+            // Both the interval and the hold must be KNOWN for a ratio to mean anything; an
+            // uncalibrated TSC makes `held` None and this prints 0, which `window_held=...cy`
+            // on the same line explains.
+            match (act_ok, held) {
+                (true, Some(h)) if psi_ms != 0 => h / psi_ms,
+                _ => 0,
+            },
+            reentries, conn_reqs, conn_reqs_peer, seen.saturating_sub(seen_at_entry),
+            !ep_stopped && !st.stopped,
+            !reads_incomplete,
+            st.inq_responses, st.inq_found,
+            BT_DIR_SCAN_OFF, restore_accepted && restore_confirms,
+        );
+        // The reading, spelled out on its own line so the bench does not have to carry the mapping
+        // in its head. Deliberately a SECOND line: the one above is the numbers, this one is the
+        // conclusion they license — and the conclusions differ enough that compressing them into a
+        // suffix would make the important one (VOID) the easiest to skim past.
+        serial_println!(
+            ":: bt-dir: [{}] BT-DIR READING — {} == witness ::",
+            self.idx,
+            match result {
+                "REQUEST" => "the peer CAN page this host, so the RF path works in BOTH directions and the fault is our page train (clock offset / page-scan repetition mode) or the peer's page-scan enable in the outbound direction only",
+                "NEGATIVE" => "nothing paged this host while THIS SAME BOOT's inquiry DID hear the target: the peer is not connectable in either direction, and no host-side page change will fix that",
+                "VOID" => "VOID, NOT NEGATIVE. Nothing paged this host AND the inquiry heard nothing either, so the peer was absent or off and THE TEST DID NOT RUN AGAINST ANYTHING. Do not record this as evidence about the peer",
+                "SCAN-UNCONFIRMED" => "the scan enable was accepted but never confirmed in force, so the silence during it says NOTHING about the peer — re-run and read the 0x0C19 line, printed above on the far side of the window",
+                "REQUEST-OTHER" => "SOME device paged this host, but NOT the peer (or not identifiably: a request too short to carry an address cannot be attributed). This does NOT answer the arc's question — but it is not nothing, because it proves this host's page scan was genuinely live, which upgrades every other verdict this boot could have printed",
+                "SCAN-UNREAD" => "the Write_Scan_Enable went out on EP0 but no Command Complete came back, so whether page scan is in force is UNKNOWN — NOT known to be off. Nothing about the peer is learned, and the PHASE 3 posture line above is the one to read next",
+                "EVENT-ENDPOINT-DEAF" => "page scan WAS enabled, but the HCI event endpoint stopped being readable, so a Connection Request could not have been observed even if the peer sent one. This says NOTHING about the peer: the deafness is this host's",
+                "WINDOW-TRUNCATED" => "page scan WAS enabled, but the listening window was ended by the re-entry cap rather than by the clock — the room was busy enough to spend every re-entry on other traffic. The window was NOT held to term and this says NOTHING about the peer; raise BT_DIR_AWAIT_REENTRIES and re-run",
+                "WINDOW-SHORT" => "page scan WAS enabled, but the window actually held is far under BT_DIR_WINDOW_MS or could not be measured at all — an uncalibrated TSC also shrinks bt_l3_budget's fallback to a fraction of the intended hold. The window this stage's rationale describes did not happen, so this says NOTHING about the peer",
+                "READS-INCOMPLETE" => "page scan WAS enabled and the window ran, but an event went past that could not be read in full — and it MIGHT have been the Connection Request. A silence that was not read to term is not a silence; this says nothing about the peer",
+                "SCAN-NOT-ENABLED" => "the controller REFUSED the write, so page scan was never enabled and this boot learned NOTHING about the peer. The silence is the instrument's, not the radio's",
+                // Not a catch-all for convenience: every token above is spelled out, so a token
+                // added without a reading announces itself instead of borrowing someone else's.
+                _ => "NO READING IS DEFINED FOR THIS RESULT TOKEN — that is a defect in bt_dir_probe, not a fact about the radio. Do not interpret this boot",
+            }
+        );
     }
 
     /// BT-C1 — the end-of-stage tally, in the shape BT-L3's is: `left_outstanding=` reads `none` on
@@ -10991,6 +13178,11 @@ impl Controller {
             return false;
         };
         self.int_next += 1;
+        // ISRARM: this endpoint's registry index, DERIVED rather than allocated. `int_next` was just
+        // bounds-checked against `MAX_INT_EPS` above and `idx` against `MAX_CONTROLLERS` at
+        // construction, so this is unique and in range by construction — which is what lets the
+        // publish below have no failure path for the ISR to carry.
+        let isr_slot = self.idx * MAX_INT_EPS + (self.int_next - 1);
 
         // MT-INVESTIGATION (IVY) — how many bytes ONE armed transfer may accept.
         //
@@ -11075,19 +13267,30 @@ impl Controller {
         // per endpoint on the arming path; `None` is carried honestly rather than defaulted to 0.
         #[cfg(feature = "kbdwit")]
         let kbdwit_fr0 = mmio_read32(self.op + KBDWIT_OP_FRINDEX);
+        // ISRARM: publish HERE — after the QH is linked, after PSE is on, after the first transfer
+        // is armed. That order is load-bearing in one direction only: the ISR may not see this
+        // endpoint before the controller is already executing it, because the very first thing it
+        // would do is read a token that does not yet describe a real transfer. (`USBINTR` is still
+        // masked at this point regardless — `isr_arm_controller` runs at the end of `init` — so the
+        // publish cannot be raced by an interrupt during enumeration at all. Both guards are kept:
+        // one is about this function, the other about the boot sequence, and they fail differently.)
+        let now_armed_ms = crate::arch::ms();
+        isr_publish_ep(
+            isr_slot, qh, qtd, qtd_phys, buf, buf_phys, rx_total, self.overlay_mode, now_armed_ms,
+        );
         self.int_eps.push(IntEp {
             qh,
             qtd,
-            qtd_phys,
             buf,
-            buf_phys,
             mps,
-            toggle: false,
+            isr_slot,
             is_kbd,
             is_rel_mouse: is_rel,
             layout,
             reports: 0,
             dead: false,
+            // KBDFLAP: a freshly armed endpoint has spent no recovery budget.
+            halt_clears: 0,
             prev_buttons: 0,
             kbd_prev_keys: [0; 6],
             kbd_prev_mods: 0,
@@ -11098,6 +13301,21 @@ impl Controller {
             kbd_intf: intf,
             kbd_led_ok: true,
             last_report_ms: 0,
+            // EHCIDARK — the census clock starts at the moment the endpoint becomes armed, for the
+            // same reason KBDWIT's silence clock does: the interval it measures is "armed and
+            // expected to complete", never "still being set up". ISRARM moved that clock itself into
+            // `ISR_EPS[isr_slot].seen_ms` (seeded by `isr_publish_ep` from the same `now_armed_ms`),
+            // because with two re-armers the gap that matters is "since ANYONE last looked". The
+            // cadence still starts UNKNOWN (`u32::MAX`) so the first completion cannot manufacture a
+            // window out of the arm-to-first-report gap, which is a property of the operator's hand
+            // and not of any stall.
+            dark_cad_ms: u32::MAX,
+            dark_windows: 0,
+            dark_ms: 0,
+            dark_max_ms: 0,
+            dark_missed: 0,
+            dark_log_ms: 0,
+            dark_missed_logged: 0,
             // KBDWIT: stamp the silence clock's origin at the moment the endpoint becomes armed —
             // i.e. after the QH is linked and PSE is on, so the interval this witness measures is
             // genuinely "armed and expected to complete", never "still being set up".
@@ -11128,6 +13346,8 @@ impl Controller {
             kbdwit_split_or: 0,
             #[cfg(feature = "kbdwit")]
             kbdwit_broke: false,
+            #[cfg(feature = "kbdwit")]
+            kbdwit_cut: false,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -11140,6 +13360,50 @@ impl Controller {
     /// The controller's static DMA pool (index-bound checked at construction).
     fn pool(&self) -> *mut qh::DmaPool {
         unsafe { &mut DMA_POOLS[self.idx] as *mut qh::DmaPool }
+    }
+
+    /// KBDFLAP — re-arm an interrupt endpoint whose device-side stall has JUST been cleared.
+    ///
+    /// Called from one place only: the post-walk clear stage in [`Self::service`], and only after
+    /// `ClearFeature(ENDPOINT_HALT)` was accepted. Calling it without that clear would be the
+    /// precise error `BtL3State::stopped` warns about — writing a fresh `QTD_ACTIVE` overlay clears
+    /// the QH's *Halted* bit while the DEVICE's stall condition survives, so the host would poll a
+    /// wedged endpoint forever and every witness would read healthy.
+    ///
+    /// TOGGLE IS THE OTHER HALF OF §9.4.5, and it is why this is not just the service loop's
+    /// ordinary re-arm with a different caller. The ordinary re-arm FLIPS `e.toggle` because it is
+    /// continuing a stream; ClearFeature(ENDPOINT_HALT) resets the DEVICE's toggle to DATA0, so the
+    /// host must start from DATA0 too or the first post-recovery packet is discarded as a
+    /// retransmission and the endpoint reads silent for a second time — the same failure wearing a
+    /// different mask.
+    ///
+    /// Everything else — the transfer total, the buffer, the overlay-vs-qTD split — is the arming
+    /// path's, unchanged; the QH is still linked into the frame list and PSE is still on, so
+    /// nothing about the schedule needs touching.
+    unsafe fn rearm_after_halt_clear(&mut self, ep_i: usize) {
+        let slot = self.int_eps[ep_i].isr_slot;
+        // ISRARM: take the claim. The ISR refuses a halted token outright, so it is not competing
+        // for this endpoint right now — but the instant the token below goes Active it will be, and
+        // the claim is what makes the transition atomic against it rather than nearly so. Try-only,
+        // like every other claim in this driver: if the ISR somehow holds it, skip the re-arm and
+        // let the next service pass find the endpoint still halted and retire it, which is the
+        // pre-KBDFLAP behaviour and not a new failure mode.
+        if !isr_claim_poll(slot) {
+            POLL_CONTENDED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Re-arm DATA0 on the SHARED toggle. `ClearFeature(ENDPOINT_HALT)` resets the DEVICE-side
+        // toggle to DATA0 (USB 2.0 §9.4.5), so both re-armers have to agree on it here or the very
+        // first packet after the recovery is discarded by the device — silently, which is the same
+        // "armed and silent" reading this whole endpoint path has been burned by before.
+        //
+        // Seeded to DATA1 because `isr_rearm` FLIPS before it arms: one flip from 1 lands on DATA0.
+        // Going through it rather than open-coding the arm is deliberate — the overlay-direct /
+        // qTD-chain fork exists once in this driver, and a private copy here is exactly how the
+        // toggle came to have two owners in the first place.
+        ISR_EPS[slot].toggle.store(1, Ordering::Relaxed);
+        isr_rearm(&ISR_EPS[slot]);
+        isr_release_poll(slot);
     }
 
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
@@ -11167,317 +13431,581 @@ impl Controller {
         // `Copy`, so the array is plain stack scratch and costs nothing when nothing toggles.
         let mut led_pushes: [Option<(usize, Target, u8, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
         let mut n_led = 0usize;
+        // KBDFLAP: stalled endpoints discovered during the walk, deferred for the same reason and
+        // in the same shape as `led_pushes` above — `ClearFeature(ENDPOINT_HALT)` is a control
+        // transfer and needs `&mut self`. Entries are `(index into int_eps, the device's EP0
+        // addressing tuple, the endpoint number)`; the endpoint number is decoded from the QH's own
+        // `ep_chars` at the halt, so the wIndex the clear addresses is the one the controller was
+        // actually executing. Sized `MAX_INT_EPS` so a pass in which every armed endpoint stalls
+        // still records each one.
+        let mut clear_halts: [Option<(usize, Target, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
+        let mut n_clr = 0usize;
         #[cfg(feature = "mtraw")]
         let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
+        // EHCIDARK — ONE clock read for the whole pass, shared by every endpoint. The census is about
+        // the pass's own period, so a per-endpoint read would only add jitter to the quantity being
+        // measured (and cost an MMIO/TSC read per armed endpoint on a ~1 kHz loop).
+        let now_ms = crate::arch::ms();
+        // ISRARM: the pass's landing buffer for a hand-off report. One per PASS, not one per
+        // endpoint — the ring is drained to exhaustion before the loop moves on, so a single
+        // scratch is reused and never holds two live reports at once. On the stack and 64 bytes, so
+        // it costs the pass nothing and, unlike the endpoint's own DMA buffer, the controller
+        // cannot write to it while the decoders below are reading it. That property is the reason
+        // the ISR can re-arm before the pass has decoded anything.
+        let mut isr_scratch = [0u8; ISR_SLOT_LEN];
         for (ep_i, e) in self.int_eps.iter_mut().enumerate() {
             if e.dead {
+                // KBDWIT-LATCH: a retired endpoint is no longer SERVICED, but it must still be able
+                // to reach the instrument that reports on it. Before this, the bare `continue` here
+                // was the second half of the boot-10 blind spot: the internal keyboard was retired
+                // at 2444 ms, this branch swallowed it on every pass thereafter, and the dump that
+                // ran at 15219 ms listed the three endpoints that were still alive and simply did
+                // not mention the one that had died. Absence from a dump is evidence only if
+                // presence was possible; here it was not, so "retired at 2444 ms" and "never armed
+                // at all" produced byte-identical media.
+                //
+                // Retirement does NOT unlink the QH from the periodic list and does not free the
+                // qTD — `dead` only stops this loop from consuming completions — so every word the
+                // probe reads is still the controller's own live state, and reading it stays
+                // read-only exactly as on the live path.
+                //
+                // Gated on `kbdwit_fired` HERE and not only inside the probe: after the single dump
+                // this endpoint will ever emit, a retired endpoint must cost one predictable bool
+                // test per pass, not a volatile read of the overlay for the rest of the boot.
+                #[cfg(feature = "kbdwit")]
+                if !e.kbdwit_fired {
+                    let tok = if om {
+                        core::ptr::read_volatile(&(*e.qh).overlay[2])
+                    } else {
+                        core::ptr::read_volatile(&(*e.qtd).token)
+                    };
+                    kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
+                }
                 continue;
             }
-            let tok = if om {
-                core::ptr::read_volatile(&(*e.qh).overlay[2])
-            } else {
-                core::ptr::read_volatile(&(*e.qtd).token)
-            };
-            if tok & QTD_ACTIVE != 0 {
-                // KBDWIT-2: is the CONTROLLER actually walking to this queue head? Two volatile
-                // reads of words only it writes (split progress — see `IntEp::kbdwit_walks`),
-                // compared against the previous poll. This runs on every pass, before and after the
-                // deadline dump, because the dump's `sched=` verdict and the `SILENCE-BROKE` line's
-                // rate both read it. Read-only: nothing here writes a controller-visible word.
+            // ══════════════════════════════════════════════════════════════════════════════════
+            // ISRARM — a pass now has TWO sources for a report, and the order between them is the
+            // correctness of the whole arc.
+            //
+            //   1. The hand-off ring, drained OLDEST FIRST. These are completions the ISR already
+            //      lifted out of the endpoint and re-armed behind.
+            //   2. The endpoint itself, exactly as before this arc — the fallback, and the only
+            //      source that exists at all on a boot where the vector never fires.
+            //
+            // Ring first is not a preference. Everything in the ring is strictly older than
+            // anything still sitting in the endpoint, so draining it first is what keeps a delta
+            // stream monotonic across two producers. Trackpad reports are deltas; delivering them
+            // out of order is worse than dropping them.
+            //
+            // The endpoint yields at most one report per pass — it holds exactly one — so the loop
+            // terminates on the pass arm whatever the ring did.
+            // ══════════════════════════════════════════════════════════════════════════════════
+            // ISRARM: the drain is BOUNDED, and the bound is not decoration. The hand-off ring has
+            // a producer that runs at interrupt priority on a core the pass does not control, so
+            // "drain until empty" is a loop whose exit condition another agent can keep pushing
+            // away. In practice it cannot — the ISR only produces on a real completion, a few per
+            // millisecond at most, and the pass empties a slot in microseconds — but "in practice"
+            // is not a termination proof, and this loop runs under the `EHCI_HID` mutex that the
+            // whole input path waits on.
+            //
+            // THE PROOF, explicitly: every iteration takes exactly one of two arms.
+            //   * The hand-off arm runs only while `drained < ISR_RING` and increments `drained`
+            //     every time it runs, so it can be taken at most `ISR_RING` (8) times — and the
+            //     counter is local to this endpoint's loop, so the ISR cannot reset or slow it
+            //     however fast it produces.
+            //   * The pass arm ends in `break` on EVERY path through it (claim lost, still ACTIVE,
+            //     halted-recoverable, halted-retire, and the normal re-arm at the foot), so it is
+            //     taken at most once.
+            // The loop therefore executes at most ISR_RING + 1 = 9 iterations per endpoint per
+            // pass, with no dependence on the producer's rate. That is the bound.
+            //
+            // Anything beyond it is not lost: it stays in the ring and the next pass, ~1 ms later,
+            // takes it, which is also exactly the state `depth_max=` and `ringfull=` report on.
+            let mut drained = 0usize;
+            loop {
+                // THE BOUND, in one statement so it cannot be missed: once `drained` reaches
+                // `ISR_RING` the hand-off ring stops being consulted AT ALL, whatever it still
+                // holds. Hoisted out of the `if let` scrutinee below rather than nested inside it
+                // because the termination argument is the thing a reader has to check, and it
+                // should not have to be recovered from a parenthesised expression.
+                let handoff = if drained < ISR_RING {
+                    isr_take(e.isr_slot, &mut isr_scratch)
+                } else {
+                    None
+                };
+                // `_at_ms` carries the leading underscore because KBDWIT is its only consumer and
+                // KBDWIT is knob-gated: on a default build the binding is genuinely unused, and a name
+                // that says so is better than an `#[allow]` that would also hide a real one later.
+                let (rpt_ptr, len, dark_gap_ms, _at_ms, from_isr) =
+                    if let Some((n, slot_ms, gap)) = handoff {
+                        drained += 1;
+                        (isr_scratch.as_ptr(), n, gap, slot_ms, true)
+                    } else {
+                        // ISRARM: claim the endpoint against the ISR for the direct read. Try-only — a pass
+                        // that loses does NOT wait: the ISR is inside this endpoint right now, and whatever it
+                        // finds lands in the hand-off ring for the next pass. The cost of losing is one pass of
+                        // latency on one endpoint; the cost of waiting would be an unbounded hold of `EHCI_HID`
+                        // taken from a path that already holds it across a `hw_wait_budget()` control transfer.
+                        if !isr_claim_poll(e.isr_slot) {
+                            POLL_CONTENDED.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        // EHCIDARK — the gap for THIS endpoint, taken before anything else can leave the loop.
+                        // The stamp lives in `ISR_EPS[..].seen_ms` and is written by BOTH re-armers, so the gap
+                        // is "time since anyone last looked" rather than "time since the last pass" — which is
+                        // the only reading that stays honest once completions are being consumed off the
+                        // interrupt. Every exit below has already stamped, so the next gap is measured against a
+                        // real visit rather than against the last visit that happened to find a report.
+                        let dark_gap_ms = isr_mark_seen(e.isr_slot, now_ms);
+                        let tok = if om {
+                            core::ptr::read_volatile(&(*e.qh).overlay[2])
+                        } else {
+                            core::ptr::read_volatile(&(*e.qtd).token)
+                        };
+                        if tok & QTD_ACTIVE != 0 {
+                            isr_release_poll(e.isr_slot);
+                            // KBDWIT-2: is the CONTROLLER actually walking to this queue head? Two volatile
+                            // reads of words only it writes (split progress — see `IntEp::kbdwit_walks`),
+                            // compared against the previous poll. This runs on every pass, before and after the
+                            // deadline dump, because the dump's `sched=` verdict and the `SILENCE-BROKE` line's
+                            // rate both read it. Read-only: nothing here writes a controller-visible word.
+                            #[cfg(feature = "kbdwit")]
+                            {
+                                let split = ((core::ptr::read_volatile(&(*e.qh).overlay[4]) as u64) << 32)
+                                    | core::ptr::read_volatile(&(*e.qh).overlay[5]) as u64;
+                                e.kbdwit_polls = e.kbdwit_polls.saturating_add(1);
+                                e.kbdwit_split_or |= split;
+                                if split != e.kbdwit_split_prev {
+                                    e.kbdwit_walks = e.kbdwit_walks.saturating_add(1);
+                                    e.kbdwit_split_prev = split;
+                                }
+                            }
+                            // KBDWIT: still armed, nothing came back this pass — the only state from which the
+                            // s58 silence is observable. The probe self-bounds (one dump per endpoint per boot)
+                            // and returns after a single bool test once it has fired or before its deadline.
+                            #[cfg(feature = "kbdwit")]
+                            kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
+                            break;
+                        }
+                        if tok & QTD_ERR_MASK != 0 {
+                            // ISRARM: the claim is released BEFORE the halt is handled. Everything below this
+                            // point — the STOP-NOTE, `flush_held_releases`, the deferred `ClearFeature` — is
+                            // long, prints, and is the pass's exclusive business anyway: the ISR refuses a
+                            // halted token outright and will never touch this endpoint again on its own.
+                            isr_release_poll(e.isr_slot);
+                            // KBDWIT-2: the silence ended, but it ended in a HALT — see
+                            // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
+                            // sharing `SILENCE-BROKE` with the clean one below.
+                            //
+                            // KBDWIT-LATCH: routed through `kbdwit_note_halt` rather than straight at
+                            // `kbdwit_note_silence_end`, because that function's first act is to return when
+                            // the deadline dump has not fired — and on boot 10 it had not, and could not have:
+                            // the halt landed at 2444 ms and the earliest service pass that could have reached
+                            // the deadline was 15219 ms. A halt that BEATS the deadline is precisely the case
+                            // KBDWIT exists to catch, and it was the one case KBDWIT could not say a word
+                            // about. `kbdwit_note_halt` keeps the post-deadline exit byte-identical and adds
+                            // the pre-deadline one.
+                            #[cfg(feature = "kbdwit")]
+                            kbdwit_note_halt(e, idx, tok);
+                            // KBDFLAP: WHICH endpoint, decided from the QH's OWN `ep_chars` — the word the
+                            // controller is executing — rather than from a software copy, for the same reason
+                            // KBDWIT decodes its identity that way. Boot 10's version of this line carried a
+                            // bare token and was therefore indistinguishable from the two BT-proxy halts that
+                            // print on every boot; see the KBDFLAP section comment for the full derivation.
+                            let h_chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                            let (h_addr, h_ep) = (h_chars & 0x7F, (h_chars >> 8) & 0xF);
+                            let (h_class, h_recoverable) = halt_class(tok);
+                            // Recover only the class §9.4.5 actually answers, only while budget remains, and
+                            // only if the deferred-clear array has room. `n_clr` can reach `MAX_INT_EPS` only
+                            // if every armed endpoint stalls in the SAME pass, in which case the last one is
+                            // retired rather than dropped in silence — the `-> retire` word says which.
+                            let h_clear = h_recoverable
+                                && e.halt_clears < HALT_CLEARS_MAX
+                                && n_clr < clear_halts.len();
+                            serial_println!(
+                                ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted addr={} ep=IN{} kind={} mps={} class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} reports={} clears={}/{} -> {} == witness ::",
+                                idx, h_addr, h_ep, int_ep_kind(e), e.mps, h_class, tok,
+                                (tok >> 10) & 0x3,
+                                (tok >> 6) & 1, (tok >> 3) & 1, (tok >> 4) & 1,
+                                (tok >> 5) & 1, (tok >> 2) & 1, tok & 1,
+                                e.reports, e.halt_clears, HALT_CLEARS_MAX,
+                                if h_clear { "clear-halt" } else { "retire" }
+                            );
+                            if h_clear {
+                                // Deferred, not sent here: the control transfer needs `&mut self` and this loop
+                                // holds an exclusive borrow of `int_eps`. The endpoint is deliberately NOT
+                                // marked dead and its held keys are NOT flushed — `flush_held_releases` also
+                                // bumps `pal::note_keyboard_detached()`, and this keyboard is not detached. If
+                                // the clear fails, the post-loop stage does both, so nothing is skipped, only
+                                // deferred by one pass of the ~1 kHz poll.
+                                clear_halts[n_clr] = Some((ep_i, e.kbd_target, h_ep as u8));
+                                n_clr += 1;
+                                e.halt_clears += 1;
+                                break;
+                            }
+                            e.dead = true;
+                            // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
+                            // `continue`s past a `dead` entry forever after — so any key down at this instant
+                            // would NEVER receive its release. Flush them. See `flush_held_releases` for why
+                            // this is the one asymmetric case the poll-gap argument does not cover, and why
+                            // ring 3 cannot recover from it on its own.
+                            flush_held_releases(e, idx);
+                            break;
+                        }
+                        // KBDWIT-2: a clean retirement — the endpoint answered. THE decision-table entry. This
+                        // stays on the POLL arm alone because it needs the live `tok` to render its verdict, and
+                        // because it only ever speaks after the deadline dump has fired — which, now that
+                        // `kbdwit_last_ms` is stamped for ISR-consumed completions too (below), an endpoint the
+                        // interrupt is servicing can no longer reach.
+                        #[cfg(feature = "kbdwit")]
+                        kbdwit_note_silence_end(e, idx, "SILENCE-BROKE", tok);
+                        // MT-INVESTIGATION (IVY): bytes actually received = armed total minus the residue the
+                        // controller left in Total Bytes To Transfer. Knob-off the armed total IS `e.mps`, so
+                        // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
+                        // buffer size and the difference is the true length of a multi-packet raw frame.
+                        #[cfg(not(feature = "mtraw"))]
+                        let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+                        #[cfg(feature = "mtraw")]
+                        let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+                        // ISRARM: the poll arm's tuple. The buffer pointer is `e.buf` — the endpoint's own DMA
+                        // buffer, read in place exactly as before this arc — and the claim taken above is still
+                        // held, which is what stops the ISR re-arming underneath the decode below. It is
+                        // released after the re-arm at the foot of the loop.
+                        (e.buf as *const u8, len, dark_gap_ms, now_ms, false)
+                    };
+                // ISRARM: from here down the two sources are indistinguishable — one body, one decoder,
+                // one census. Everything below reads `rpt_ptr` / `len` / `dark_gap_ms` / `at_ms` and
+                // never the token again.
+                //
+                // KBDWIT: the completion stamp. `at_ms` rather than a fresh clock read, because for a
+                // hand-off report that is the instant the ISR took it OFF the endpoint — the true
+                // completion time — and stamping "now" would make an endpoint the interrupt is serving
+                // perfectly look like one whose reports arrive late. Getting this wrong in the other
+                // direction is worse than cosmetic: KBDWIT's deadline dump fires on the ABSENCE of this
+                // stamp, so a version that only counted poll-consumed completions would declare a
+                // healthy, ISR-serviced endpoint silent.
                 #[cfg(feature = "kbdwit")]
                 {
-                    let split = ((core::ptr::read_volatile(&(*e.qh).overlay[4]) as u64) << 32)
-                        | core::ptr::read_volatile(&(*e.qh).overlay[5]) as u64;
-                    e.kbdwit_polls = e.kbdwit_polls.saturating_add(1);
-                    e.kbdwit_split_or |= split;
-                    if split != e.kbdwit_split_prev {
-                        e.kbdwit_walks = e.kbdwit_walks.saturating_add(1);
-                        e.kbdwit_split_prev = split;
-                    }
+                    e.kbdwit_last_ms = _at_ms;
                 }
-                // KBDWIT: still armed, nothing came back this pass — the only state from which the
-                // s58 silence is observable. The probe self-bounds (one dump per endpoint per boot)
-                // and returns after a single bool test once it has fired or before its deadline.
-                #[cfg(feature = "kbdwit")]
-                kbdwit_probe(e, idx, om, kw_op, kw_fl, tok);
-                continue;
-            }
-            // KBDWIT: the qTD retired — a COMPLETION, whether or not it carried report bytes.
-            // Stamped here, above every decoder, so no report layout, length gate or `dead` path
-            // can influence whether this endpoint counts as alive.
-            #[cfg(feature = "kbdwit")]
-            {
-                e.kbdwit_last_ms = crate::arch::ms();
-            }
-            if tok & QTD_ERR_MASK != 0 {
-                // KBDWIT-2: the silence ended, but it ended in a HALT — see
-                // `kbdwit_note_silence_end` for why this exit gets its own verdict word instead of
-                // sharing `SILENCE-BROKE` with the clean one below.
-                #[cfg(feature = "kbdwit")]
-                kbdwit_note_silence_end(e, idx, "SILENCE-ENDED-HALTED", tok);
-                serial_println!(
-                    ":: EHCI-HID: [{}] STOP-NOTE interrupt endpoint halted (token {:#010x}) — endpoint retired, not forced ::",
-                    idx, tok
-                );
-                e.dead = true;
-                // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
-                // `continue`s past a `dead` entry forever after — so any key down at this instant
-                // would NEVER receive its release. Flush them. See `flush_held_releases` for why
-                // this is the one asymmetric case the poll-gap argument does not cover, and why
-                // ring 3 cannot recover from it on its own.
-                flush_held_releases(e, idx);
-                continue;
-            }
-            // KBDWIT-2: a clean retirement — the endpoint answered. THE decision-table entry.
-            #[cfg(feature = "kbdwit")]
-            kbdwit_note_silence_end(e, idx, "SILENCE-BROKE", tok);
-            // MT-INVESTIGATION (IVY): bytes actually received = armed total minus the residue the
-            // controller left in Total Bytes To Transfer. Knob-off the armed total IS `e.mps`, so
-            // the expression is unchanged; knob-on, on the vendor-multitouch endpoint, it is the
-            // buffer size and the difference is the true length of a multi-packet raw frame.
-            // (Written as a `#[cfg]` PAIR rather than one hoisted local because hoisting would
-            // keep the value live across the decode block and cost 16 bytes of `.text` knob-off —
-            // this arc's default media must stay byte-identical.)
-            #[cfg(not(feature = "mtraw"))]
-            let len = (e.mps as u32).saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
-            #[cfg(feature = "mtraw")]
-            let len = e.rx_total.saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
-            if len > 0 {
-                // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
-                // buffer is 64 B), so cap by kind.
-                // MT-INVESTIGATION: knob-on the layout cap becomes the (grown) buffer length —
-                // still a hard cap, never larger than the allocation, so the slice below can
-                // never run off the buffer even if the controller reported nonsense residue.
-                #[cfg(not(feature = "mtraw"))]
-                let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
-                #[cfg(feature = "mtraw")]
-                let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
-                let report = core::slice::from_raw_parts(e.buf, cap);
-                e.reports = e.reports.wrapping_add(1);
-                if let Some(l) = e.layout {
-                    if l.vendor_mt {
-                        // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
-                        // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
-                        // hard — usbdebug builds only, first 4 reports total per device — so it can
-                        // never flood the framebuffer console (~100+ heap-allocating lines/sec under
-                        // touch, the "machine appears hung" defect). Its `String` alloc is off the
-                        // default hot path ENTIRELY: on a GUI/default build this whole `#[cfg]` block
-                        // (and `dump_vendor_report`) is compiled out — zero dumps, zero allocation.
-                        #[cfg(feature = "usbdebug")]
-                        if e.reports <= 4 {
-                            dump_vendor_report(idx, e.reports, report);
+                // DEADMAN — `[deadman] hid=`. Charged above every decoder, length gate and `dead` path,
+                // and before any `pal::EVENT_QUEUE` push, so no report layout can influence whether a
+                // completion counts.
+                //
+                // ⚠ THE IRQ-SIDE COUNTER THIS FIELD'S BRIEF ASKED FOR NOW EXISTS. The comment that used
+                // to stand here said the site did not — "this driver takes no interrupts at all" — and
+                // that is no longer true: see ISRARM. `hid=` still counts RETIREMENTS rather than
+                // interrupts, deliberately, because a retirement is what a report actually is; the
+                // interrupt's own count is `irq=` on the `ISRARM` line, and the two are meant to be
+                // read together. Pairing with `pmp=` (poll passes) is unchanged.
+                crate::deadman::note_hid_completion();
+                if len > 0 {
+                    // ══════════════════════════════════════════════════════════════════════════════
+                    // EHCIDARK — **the reports this endpoint could not accept, counted.**
+                    //
+                    // The endpoint holds exactly ONE report and cannot hold more on this silicon: `mps`
+                    // is 64 against 8-byte Report ID 0x02 reports, so every report is a SHORT packet and
+                    // retires the qTD. (That is also why the multi-packet arming the `mtraw` path uses is
+                    // unavailable here — the controller stops at the first short packet whatever `total`
+                    // says.) From that instant until a service pass rewrites the overlay the endpoint is
+                    // DARK, and everything the pad sends is dropped ON THE WIRE. Nothing downstream can
+                    // see it: `EVQ_DROP_PTR` counts a full ring, `pointer_motion_coalesced` counts a slow
+                    // drain, and both of those are about reports that at least reached memory. Until this
+                    // block there was no term anywhere in the driver for the ones that never did — which
+                    // is the difference between "the pointer feels bad" and a number.
+                    //
+                    // The arithmetic is deliberately conservative in the only direction that could
+                    // mislead. `dark_gap_ms` is this endpoint's whole service-pass gap, and the report we
+                    // are holding landed SOMEWHERE inside it — so the dark stretch is AT MOST that gap
+                    // and the reports the device could have generated within it at most `gap / cadence`,
+                    // of which we got one. A pass that finds the qTD still ACTIVE contributes nothing at
+                    // all, so a still hand — the ordinary case, a change-only pad reporting nothing —
+                    // can never inflate this.
+                    //
+                    // `dark_cad_ms` is learned from the passes that KEPT UP (the running minimum gap),
+                    // so the estimate calibrates itself against this device on this boot instead of
+                    // trusting a `bInterval` that describes neither the host's poll rate nor the hand's.
+                    // It is updated AFTER the window test so a pass cannot be judged against a cadence
+                    // it is itself establishing.
+                    if e.dark_cad_ms != u32::MAX && e.dark_cad_ms > 0 {
+                        let slots = (dark_gap_ms / e.dark_cad_ms as u64) as u32;
+                        if slots > 1 {
+                            e.dark_windows = e.dark_windows.saturating_add(1);
+                            e.dark_ms = e.dark_ms.saturating_add(dark_gap_ms);
+                            e.dark_max_ms = e.dark_max_ms.max(dark_gap_ms.min(u32::MAX as u64) as u32);
+                            e.dark_missed = e.dark_missed.saturating_add((slots - 1) as u64);
                         }
-                        // MT-INVESTIGATION (IVY, `mtraw` only): the capture window. Hex-dump at
-                        // most `MT_RAW_DUMP_MAX` reports of at most `MT_RAW_DUMP_BYTES` bytes each
-                        // — bounded twice over, because the FTDI console is a 64 KiB drop-oldest
-                        // ring and an unbounded dump evicts the boot log that gives it context.
-                        // The pointer decode below still runs on these reports: if the raw mode
-                        // never engaged they are ordinary 0x02 relative reports and the cursor
-                        // keeps moving; if it DID engage, `decode_trackpad_rel`'s length + ID gate
-                        // rejects them and nothing is pushed. Either way no clamp is weakened.
-                        #[cfg(feature = "mtraw")]
-                        if let Some(n) = mt_dumped.as_mut() {
-                            if *n < MT_RAW_DUMP_MAX {
-                                *n += 1;
-                                dump_raw_report(idx, *n, &report[..report.len().min(MT_RAW_DUMP_BYTES)]);
-                                // MT-INVESTIGATION (IVY, decode prep): run the TYPE2 decoder on
-                                // the SAME bounded first-N frames and print one witness line. The
-                                // decoder is total — a non-raw (HID-mode) report simply fails its
-                                // length gate and the line says so — so this cannot misread the
-                                // 8-byte 0x02 stream as finger data.
-                                dump_type2_frame(idx, e.mps, report);
+                    }
+                    // Saturate rather than cast: a gap past `u32::MAX` ms is unreachable in a boot, but a
+                    // TRUNCATING cast is the one way it could turn into a small number and drive the
+                    // cadence — and therefore every later `missed<=` — from a value that never happened.
+                    let gap_u32 = dark_gap_ms.min(u32::MAX as u64) as u32;
+                    if gap_u32 > 0 && gap_u32 < e.dark_cad_ms {
+                        e.dark_cad_ms = gap_u32;
+                    }
+                    // The rollup. Silent on a healthy endpoint by construction — it needs the census to
+                    // have MOVED since the last line — and rate-limited to one line per
+                    // `EHCIDARK_ROLLUP_MS` when it has, because an instrument built to shorten a witness
+                    // burst must not become one. Identity is decoded from the QH's own `ep_chars`, the
+                    // word the controller is executing, for the reason KBDFLAP's STOP-NOTE line decodes
+                    // it that way: a census that named the wrong endpoint would be worse than none.
+                    if e.dark_missed != e.dark_missed_logged
+                        && now_ms.wrapping_sub(e.dark_log_ms) >= EHCIDARK_ROLLUP_MS
+                    {
+                        e.dark_log_ms = now_ms;
+                        e.dark_missed_logged = e.dark_missed;
+                        let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                        serial_println!(
+                            ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} == witness ::",
+                            idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
+                            e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
+                            e.dark_ms, e.dark_max_ms, e.dark_missed
+                        );
+                    }
+                    // ══════════════════════════════════════════════════════════════════════════════
+                    // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
+                    // buffer is 64 B), so cap by kind.
+                    // MT-INVESTIGATION: knob-on the layout cap becomes the (grown) buffer length —
+                    // still a hard cap, never larger than the allocation, so the slice below can
+                    // never run off the buffer even if the controller reported nonsense residue.
+                    #[cfg(not(feature = "mtraw"))]
+                    let cap = if e.layout.is_some() { len.min(64) } else { len.min(8) };
+                    #[cfg(feature = "mtraw")]
+                    let cap = if e.layout.is_some() { len.min(INT_BUF_LEN) } else { len.min(8) };
+                    // ISRARM: `rpt_ptr` is `e.buf` on the poll arm (read in place, as before) and the
+                    // pass's own stack scratch on the hand-off arm. `cap` bounds it either way, and on
+                    // the hand-off arm `len` is additionally bounded by `ISR_SLOT_LEN` at the producer,
+                    // so the slice can never run off either allocation.
+                    let report = core::slice::from_raw_parts(rpt_ptr, cap);
+                    e.reports = e.reports.wrapping_add(1);
+                    if let Some(l) = e.layout {
+                        if l.vendor_mt {
+                            // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
+                            // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
+                            // hard — usbdebug builds only, first 4 reports total per device — so it can
+                            // never flood the framebuffer console (~100+ heap-allocating lines/sec under
+                            // touch, the "machine appears hung" defect). Its `String` alloc is off the
+                            // default hot path ENTIRELY: on a GUI/default build this whole `#[cfg]` block
+                            // (and `dump_vendor_report`) is compiled out — zero dumps, zero allocation.
+                            #[cfg(feature = "usbdebug")]
+                            if e.reports <= 4 {
+                                dump_vendor_report(idx, e.reports, report);
                             }
-                        }
-                        // MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY, default OFF): turn
-                        // the first finger's ABSOLUTE position into pointer deltas. Deliberately
-                        // gated behind a second knob: the pointer path stays 0x02-driven until
-                        // metal proves raw mode is stable, so the default `mtraw` build DECODES
-                        // and WITNESSES without ever touching the event queue.
-                        #[cfg(feature = "mtraw_inject")]
-                        mt_inject_first_finger(report, &mut e.mt_prev);
-                        // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
-                        // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
-                        // frame — that hypothesis is REFUTED on this device path (the decode it drove,
-                        // `decode_vendor_first_finger` + `VMT_FINGER_*`, is KEPT below as documented
-                        // history + self-test, never as the live path). Ground truth from silicon: it
-                        // streams 8-byte Report ID 0x02 reports — [0]=id, [1]=buttons (0x00 up /
-                        // 0x01 down), [2]=dx i8, [3]=dy i8, [4..8] zero/unknown. Decode those straight
-                        // into the RELATIVE pointer path (the same `pal::Event::Mouse` seam the
-                        // boot-mouse path uses). Length-checked + ID-gated inside `decode_trackpad_rel`:
-                        // a short or non-0x02 report yields None → no event, no state change.
-                        if let Some((buttons, dx, dy)) = decode_trackpad_rel(report) {
-                            // Bounded one-line format witness on the first decoded report.
-                            if e.reports == 1 {
-                                serial_println!(
-                                    ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
-                                    idx, buttons, dx, dy
+                            // MT-INVESTIGATION (IVY, `mtraw` only): the capture window. Hex-dump at
+                            // most `MT_RAW_DUMP_MAX` reports of at most `MT_RAW_DUMP_BYTES` bytes each
+                            // — bounded twice over, because the FTDI console is a 64 KiB drop-oldest
+                            // ring and an unbounded dump evicts the boot log that gives it context.
+                            // The pointer decode below still runs on these reports: if the raw mode
+                            // never engaged they are ordinary 0x02 relative reports and the cursor
+                            // keeps moving; if it DID engage, `decode_trackpad_rel`'s length + ID gate
+                            // rejects them and nothing is pushed. Either way no clamp is weakened.
+                            #[cfg(feature = "mtraw")]
+                            if let Some(n) = mt_dumped.as_mut() {
+                                if *n < MT_RAW_DUMP_MAX {
+                                    *n += 1;
+                                    dump_raw_report(idx, *n, &report[..report.len().min(MT_RAW_DUMP_BYTES)]);
+                                    // MT-INVESTIGATION (IVY, decode prep): run the TYPE2 decoder on
+                                    // the SAME bounded first-N frames and print one witness line. The
+                                    // decoder is total — a non-raw (HID-mode) report simply fails its
+                                    // length gate and the line says so — so this cannot misread the
+                                    // 8-byte 0x02 stream as finger data.
+                                    dump_type2_frame(idx, e.mps, report);
+                                }
+                            }
+                            // MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY, default OFF): turn
+                            // the first finger's ABSOLUTE position into pointer deltas. Deliberately
+                            // gated behind a second knob: the pointer path stays 0x02-driven until
+                            // metal proves raw mode is stable, so the default `mtraw` build DECODES
+                            // and WITNESSES without ever touching the event queue.
+                            #[cfg(feature = "mtraw_inject")]
+                            mt_inject_first_finger(report, &mut e.mt_prev);
+                            // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
+                            // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
+                            // frame — that hypothesis is REFUTED on this device path (the decode it drove,
+                            // `decode_vendor_first_finger` + `VMT_FINGER_*`, is KEPT below as documented
+                            // history + self-test, never as the live path). Ground truth from silicon: it
+                            // streams 8-byte Report ID 0x02 reports — [0]=id, [1]=buttons (0x00 up /
+                            // 0x01 down), [2]=dx i8, [3]=dy i8, [4..8] zero/unknown. Decode those straight
+                            // into the RELATIVE pointer path (the same `pal::Event::Mouse` seam the
+                            // boot-mouse path uses). Length-checked + ID-gated inside `decode_trackpad_rel`:
+                            // a short or non-0x02 report yields None → no event, no state change.
+                            if let Some((buttons, dx, dy)) = decode_trackpad_rel(report) {
+                                // Bounded one-line format witness on the first decoded report.
+                                if e.reports == 1 {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
+                                        idx, buttons, dx, dy
+                                    );
+                                }
+                                // CLICK-1 (metal verdict): emit ONE `Event::Button` per button-DOWN
+                                // edge (0x00 -> 0x01 on this pad) — the click observable: a click
+                                // while vug/pulse runs exits the demo like a keystroke. Release
+                                // emits nothing. Serial line per press (human-rate, bounded).
+                                // CLICK-3: the edge test plus re-press recovery (see `note_buttons`) —
+                                // this is the path the rMBP internal trackpad takes, and the one where
+                                // the stale latch swallowed every stationary second click.
+                                // DRAGREL: and ONE more on the release edge (buttons == 0x00 here), so a
+                                // gesture whose end matters — a title-bar drag — has an event that says
+                                // so. The press half above is untouched.
+                                //
+                                // DRAGGLIDE: this report's motion and its button edge go in as ONE
+                                // thing (`push_pointer_report`), so the reorder that puts a release
+                                // edge ahead of its own lift KNOWS which lift is its own instead of
+                                // inferring it. THIS pad is half of why: it and an xHCI mouse are
+                                // concurrent producers, and a foreign motion landing between two
+                                // separate pushes would send the swap at the wrong entry.
+                                //
+                                // ARC D M1: `dx != 0 || dy != 0` is the motion discriminator, taken
+                                // from the ALREADY-DECODED deltas (the 0x02 byte decode is untouched)
+                                // and identical to the predicate this same call decides to emit a
+                                // `Mouse` event on. This is THE path the boot-3 phantom storm was
+                                // measured on.
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                                crate::pal::push_pointer_report(
+                                    if dx != 0 || dy != 0 {
+                                        Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                                    } else {
+                                        None
+                                    },
+                                    if press || release {
+                                        Some(crate::pal::Event::Button(buttons))
+                                    } else {
+                                        None
+                                    },
                                 );
+                                if press {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
+                                        idx, buttons
+                                    );
+                                } else if release {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
+                                        idx, buttons
+                                    );
+                                }
                             }
-                            // CLICK-1 (metal verdict): emit ONE `Event::Button` per button-DOWN
-                            // edge (0x00 -> 0x01 on this pad) — the click observable: a click
-                            // while vug/pulse runs exits the demo like a keystroke. Release
-                            // emits nothing. Serial line per press (human-rate, bounded).
-                            // CLICK-3: the edge test plus re-press recovery (see `note_buttons`) —
-                            // this is the path the rMBP internal trackpad takes, and the one where
-                            // the stale latch swallowed every stationary second click.
-                            // DRAGREL: and ONE more on the release edge (buttons == 0x00 here), so a
-                            // gesture whose end matters — a title-bar drag — has an event that says
-                            // so. The press half above is untouched.
-                            //
-                            // DRAGGLIDE: this report's motion and its button edge go in as ONE
-                            // thing (`push_pointer_report`), so the reorder that puts a release
-                            // edge ahead of its own lift KNOWS which lift is its own instead of
-                            // inferring it. THIS pad is half of why: it and an xHCI mouse are
-                            // concurrent producers, and a foreign motion landing between two
-                            // separate pushes would send the swap at the wrong entry.
-                            let (press, release) = e.note_buttons(buttons, idx);
+                        } else {
+                            // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
+                            // Relative axes (a mouse) → pal::Event::Mouse; absolute (tablet / trackpad)
+                            // → MouseAbsolute — the SAME pointer-event path the xHCI HID stack delivers.
+                            let (x, y, buttons, fingers) = decode_report_pointer(report, &l);
+                            // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
+                            // the trackpad path above).
+                            // DRAGREL: plus the release edge, same semantic as the trackpad path above.
+                            // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad
+                            // path above).
+                            let btn = (buttons & 0xFF) as u8;
+                            // ARC D M1 — the motion discriminator, on the SAME predicate this site
+                            // already uses to decide whether the report carries motion at all (below).
+                            // For a RELATIVE layout that is exactly "dx/dy != 0". For an ABSOLUTE one it
+                            // reads "not at the panel origin", which is the in-tree convention at this
+                            // site and errs in the SAFE direction: a stationary absolute hold reports
+                            // `moved = true` and so the quiet-gap arm simply never fires for it — no
+                            // phantom presses, only the (rare) rescue foregone. The rMBP trackpad this
+                            // arc is about takes the relative 0x02 path above, not this one.
+                            let (press, release) = e.note_buttons(btn, x != 0 || y != 0, idx);
+                            let motion = if x == 0 && y == 0 {
+                                None
+                            } else if l.relative {
+                                Some(crate::pal::Event::Mouse { x, y })
+                            } else {
+                                Some(crate::pal::Event::MouseAbsolute { x, y })
+                            };
                             crate::pal::push_pointer_report(
-                                if dx != 0 || dy != 0 {
-                                    Some(crate::pal::Event::Mouse { x: dx, y: dy })
-                                } else {
-                                    None
-                                },
+                                motion,
                                 if press || release {
-                                    Some(crate::pal::Event::Button(buttons))
+                                    Some(crate::pal::Event::Button(btn))
                                 } else {
                                     None
                                 },
                             );
-                            if press {
+                            if e.reports == 1 || e.reports % 32 == 0 {
                                 serial_println!(
-                                    ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
-                                    idx, buttons
-                                );
-                            } else if release {
-                                serial_println!(
-                                    ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
-                                    idx, buttons
+                                    ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
+                                    idx, e.reports,
+                                    if l.relative { "rel" } else { "abs" },
+                                    x, y, buttons, fingers
                                 );
                             }
                         }
-                    } else {
-                        // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
-                        // Relative axes (a mouse) → pal::Event::Mouse; absolute (tablet / trackpad)
-                        // → MouseAbsolute — the SAME pointer-event path the xHCI HID stack delivers.
-                        let (x, y, buttons, fingers) = decode_report_pointer(report, &l);
-                        // CLICK-1: primary-button DOWN edge → one Button event (same semantic as
-                        // the trackpad path above).
-                        // DRAGREL: plus the release edge, same semantic as the trackpad path above.
-                        // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad
-                        // path above).
-                        let btn = (buttons & 0xFF) as u8;
-                        let (press, release) = e.note_buttons(btn, idx);
-                        let motion = if x == 0 && y == 0 {
-                            None
-                        } else if l.relative {
-                            Some(crate::pal::Event::Mouse { x, y })
-                        } else {
-                            Some(crate::pal::Event::MouseAbsolute { x, y })
-                        };
+                    } else if e.is_kbd {
+                        // EHCI-KEYUP: the decoder now carries the previous report's keycodes so it can
+                        // emit release edges. `report` is built from `e.buf` through `from_raw_parts`, a
+                        // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
+                        // alongside it is not an aliasing violation — the buffer and the diff state are
+                        // disjoint memory.
+                        // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
+                        // whether this report toggled one; the SET_REPORT that lights the key is queued
+                        // for after the loop, where `self` is borrowable again.
+                        if decode_boot_keyboard(
+                            report,
+                            &mut e.kbd_prev_keys,
+                            &mut e.kbd_prev_mods,
+                            &mut e.kbd_leds,
+                        ) && e.kbd_led_ok
+                            && n_led < led_pushes.len()
+                        {
+                            led_pushes[n_led] = Some((ep_i, e.kbd_target, e.kbd_intf, e.kbd_leds));
+                            n_led += 1;
+                        }
+                        if e.reports == 1 || e.reports % 32 == 0 {
+                            serial_println!(
+                                ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
+                                idx, e.reports, report[0], report.get(2).copied().unwrap_or(0)
+                            );
+                        }
+                    } else if e.is_rel_mouse && len >= 3 {
+                        let (dx, dy) = (report[1] as i8 as i32, report[2] as i8 as i32);
+                        // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
+                        // DRAGREL: and the primary UP edge, same as the other two pointer paths.
+                        // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad path
+                        // above).
+                        // ARC D M1 — the motion discriminator; a boot mouse is relative, so this is
+                        // literally "this report moved".
+                        let (press, release) = e.note_buttons(report[0], dx != 0 || dy != 0, idx);
                         crate::pal::push_pointer_report(
-                            motion,
+                            if dx != 0 || dy != 0 {
+                                Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                            } else {
+                                None
+                            },
                             if press || release {
-                                Some(crate::pal::Event::Button(btn))
+                                Some(crate::pal::Event::Button(report[0]))
                             } else {
                                 None
                             },
                         );
                         if e.reports == 1 || e.reports % 32 == 0 {
                             serial_println!(
-                                ":: EHCI-HID: [{}] report-pointer {} reports, last {} x={} y={} buttons={:#04x} fingers={} == witness ::",
-                                idx, e.reports,
-                                if l.relative { "rel" } else { "abs" },
-                                x, y, buttons, fingers
+                                ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
+                                idx, e.reports, dx, dy, report[0]
                             );
                         }
                     }
-                } else if e.is_kbd {
-                    // EHCI-KEYUP: the decoder now carries the previous report's keycodes so it can
-                    // emit release edges. `report` is built from `e.buf` through `from_raw_parts`, a
-                    // raw pointer with no borrow of `e`, so handing the decoder `&mut e.kbd_prev_keys`
-                    // alongside it is not an aliasing violation — the buffer and the diff state are
-                    // disjoint memory.
-                    // ALLKEYS P1: the decoder also owns the lock-key state now. It reports back
-                    // whether this report toggled one; the SET_REPORT that lights the key is queued
-                    // for after the loop, where `self` is borrowable again.
-                    if decode_boot_keyboard(
-                        report,
-                        &mut e.kbd_prev_keys,
-                        &mut e.kbd_prev_mods,
-                        &mut e.kbd_leds,
-                    ) && e.kbd_led_ok
-                        && n_led < led_pushes.len()
-                    {
-                        led_pushes[n_led] = Some((ep_i, e.kbd_target, e.kbd_intf, e.kbd_leds));
-                        n_led += 1;
-                    }
-                    if e.reports == 1 || e.reports % 32 == 0 {
-                        serial_println!(
-                            ":: EHCI-HID: [{}] kbd {} reports, last {:02x} {:02x} .. == witness ::",
-                            idx, e.reports, report[0], report.get(2).copied().unwrap_or(0)
-                        );
-                    }
-                } else if e.is_rel_mouse && len >= 3 {
-                    let (dx, dy) = (report[1] as i8 as i32, report[2] as i8 as i32);
-                    // CLICK-1: boot-mouse buttons live in report[0]; primary DOWN edge → Button.
-                    // DRAGREL: and the primary UP edge, same as the other two pointer paths.
-                    // DRAGGLIDE: motion + edge enter the ring as ONE report (see the trackpad path
-                    // above).
-                    let (press, release) = e.note_buttons(report[0], idx);
-                    crate::pal::push_pointer_report(
-                        if dx != 0 || dy != 0 {
-                            Some(crate::pal::Event::Mouse { x: dx, y: dy })
-                        } else {
-                            None
-                        },
-                        if press || release {
-                            Some(crate::pal::Event::Button(report[0]))
-                        } else {
-                            None
-                        },
-                    );
-                    if e.reports == 1 || e.reports % 32 == 0 {
-                        serial_println!(
-                            ":: EHCI-HID: [{}] mouse {} reports, last dx={} dy={} buttons={:#04x} == witness ::",
-                            idx, e.reports, dx, dy, report[0]
-                        );
-                    }
                 }
-            }
-            // Re-arm in the controller's transfer mode: flip the software toggle (QH_DTC —
-            // the toggle lives here), then either rewrite the overlay in place
-            // (overlay-direct; no qTD fetch — this metal) or refresh + point at the qTD.
-            e.toggle = !e.toggle;
-            let dt = if e.toggle { QTD_DT } else { 0 };
-            // MT-INVESTIGATION (IVY): re-arm for the SAME total the endpoint was armed with. Each
-            // statement is a `#[cfg]` PAIR whose knob-off member is the ORIGINAL expression,
-            // verbatim and in place. Every less repetitive shape tried here (one hoisted local, or
-            // a local inside each branch) changes `service_ehci_hid`'s register allocation — same
-            // instruction count, same symbol size, but NOT byte-identical, which this arc's default
-            // media must be. The duplication is the price of that guarantee.
-            if om {
-                (*e.qh).overlay[0] = PTR_TERMINATE;
-                (*e.qh).overlay[1] = PTR_TERMINATE;
-                (*e.qh).overlay[3] = e.buf_phys as u32;
-                (*e.qh).overlay[4] = 0;
-                #[cfg(not(feature = "mtraw"))]
-                core::ptr::write_volatile(
-                    &mut (*e.qh).overlay[2],
-                    QTD_ACTIVE | QTD_CERR3 | ((e.mps as u32) << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
-                );
-                #[cfg(feature = "mtraw")]
-                core::ptr::write_volatile(
-                    &mut (*e.qh).overlay[2],
-                    QTD_ACTIVE | QTD_CERR3 | (e.rx_total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
-                );
-            } else {
-                #[cfg(not(feature = "mtraw"))]
-                write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.mps as u32, e.buf_phys);
-                #[cfg(feature = "mtraw")]
-                write_qtd(e.qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, e.rx_total, e.buf_phys);
-                (*e.qh).overlay[1] = PTR_TERMINATE;
-                core::ptr::write_volatile(&mut (*e.qh).overlay[2], 0);
-                core::ptr::write_volatile(&mut (*e.qh).overlay[0], e.qtd_phys as u32);
+                // ISRARM — the foot of the two-source loop.
+                //
+                // A hand-off report was ALREADY re-armed behind, by the ISR, at the instant it was
+                // taken off the endpoint; re-arming again here would arm an endpoint that is already
+                // live and advance the shared data toggle a second time, which on a `QH_DTC` queue head
+                // makes the device silently discard every following packet. So the hand-off arm loops
+                // straight back for the next queued report instead.
+                if from_isr {
+                    continue;
+                }
+                // The poll arm's re-arm, still under the claim taken at the top. It goes through
+                // `isr_rearm` — the SINGLE re-arm implementation, shared with the ISR — so the
+                // overlay-direct / qTD-chain fork and the data toggle each exist exactly once in this
+                // driver. (That is what retired the `#[cfg]`-paired duplication that used to live here:
+                // `IsrEp::rx_total` already carries `mps` knob-off and the `mtraw` total knob-on, so
+                // there is one expression rather than two.)
+                isr_rearm(&ISR_EPS[e.isr_slot]);
+                POLL_REARMS.fetch_add(1, Ordering::Relaxed);
+                isr_release_poll(e.isr_slot);
+                // The endpoint holds exactly one report and it has just been taken, so there is nothing
+                // further to drain on this pass. This is the loop's only unconditional exit.
+                break;
             }
         }
         // ALLKEYS P1: the endpoint borrow is released here, so EP0 is usable again — light (or
@@ -11494,6 +14022,41 @@ impl Controller {
                 }
             }
         }
+        // KBDFLAP: the endpoint borrow is released here, so EP0 is usable — clear the device-side
+        // stall on every endpoint the walk classified `stall`, then re-arm it. ORDER IS LOAD-
+        // BEARING and is the whole point of doing this here rather than in the walk: the clear
+        // must reach the DEVICE before the overlay is rewritten, because a fresh `QTD_ACTIVE`
+        // clears the QH's Halted bit and would otherwise leave the host believing the endpoint is
+        // healthy while the device is still stalling (the trap `BtL3State::stopped` documents).
+        for slot in clear_halts.iter().take(n_clr) {
+            if let Some((ep_i, t, ep)) = *slot {
+                // ClearFeature(ENDPOINT_HALT): bmRequestType 0x02 (host->device | standard |
+                // ENDPOINT recipient), bRequest 0x01, wValue 0x0000 (ENDPOINT_HALT), wIndex = the
+                // endpoint ADDRESS including its direction bit, no data stage. Byte-for-byte the
+                // request `bt_retry`'s toggle resync sends (mod.rs:5166); these are interrupt-IN
+                // endpoints, hence the `| 0x80`.
+                let ok = self
+                    .control(&t, 0x02, 0x01, 0x0000, (ep as u16) | 0x0080, 0, false)
+                    .is_ok();
+                serial_println!(
+                    ":: EHCI-HID: [{}] KBDFLAP HALT-CLEAR addr={} ep=IN{} kind={} attempt={}/{} ClearFeature(ENDPOINT_HALT) -> {} == witness ::",
+                    self.idx, t.addr, ep, int_ep_kind(&self.int_eps[ep_i]),
+                    self.int_eps[ep_i].halt_clears, HALT_CLEARS_MAX,
+                    if ok { "ok — re-armed DATA0" } else { "REFUSED — endpoint retired" }
+                );
+                if ok {
+                    self.rearm_after_halt_clear(ep_i);
+                } else {
+                    // The device would not take §9.4.5's own recovery. There is nothing further
+                    // this driver can do to the endpoint, so it lands exactly where an
+                    // unrecoverable halt has always landed — retired, with its held keys flushed.
+                    let ctl = self.idx;
+                    let e = &mut self.int_eps[ep_i];
+                    e.dead = true;
+                    flush_held_releases(e, ctl);
+                }
+            }
+        }
         // MT-INVESTIGATION (IVY): the endpoint borrow is released here, so the EP0 restore is safe
         // to run. Close the capture window as soon as it is full — the pad goes back to the mode
         // the landed pointer path decodes, and the probe never fires again this boot.
@@ -11506,6 +14069,962 @@ impl Controller {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// KBDFLAP — the interrupt-endpoint HALT: name it, then recover from the one class that is
+// recoverable.
+//
+// THE OBSERVATION (metal, 2012 rMBP, boot 10 of `rmbp2-boot8`, 2026-08-19). The internal keyboard
+// delivered ZERO key events for a 4-minute boot while the trackpad — the OTHER interface of the
+// SAME device, addr 8 — streamed the whole time. It read as "armed and silent", the s58 class
+// KBDWIT was built for. It was not. One line in that capture decides it:
+//
+//   [   2444ms] :: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted (token 0x000a8d42)
+//               — endpoint retired, not forced ::
+//
+// `0x000a8d42` decodes (EHCI 1.0 §3.5.3) to Total-Bytes 10, PID IN, IOC 1, **CERR 3**, status
+// `0x42` = Halted + SplitXState(DoComplete). Total-Bytes 10 is `mps=10`, and the only 10-byte
+// endpoint armed in that boot is `addr=8 ep=IN3` — the internal keyboard. Its non-status half
+// (`0x000a8d..`) is byte-identical to the live token KBDWIT printed for that same endpoint on the
+// neighbouring boot 9 (`seen=0x000a8d80`), so the identity is not an inference. The keyboard was
+// retired 621 ms after arming, which is also why it never appeared in boot 10's KBDWIT dump at
+// all: `service` skips a `dead` entry before the probe can run, so the instrument built for this
+// symptom was structurally silent on the boot that showed it.
+//
+// WHY THE LINE COULD NOT SAY THAT. It carried a raw token and nothing else — no address, no
+// endpoint number, no kind. Every boot in the corpus prints two of these (below), so the reader's
+// prior is "the usual two", and the one boot where a THIRD line named the real keyboard read
+// exactly like the other two.
+//
+// THE HALT IS ROUTINE — FOR OTHER ENDPOINTS. On the same bench, gr23/gr25/gr26/gr27, rmbp1-boot1
+// and boot 9 of this very capture all print, at the first service pass after arming:
+//
+//   STOP-NOTE interrupt endpoint halted (token 0x00088141)   <- 05ac:820a, the BT HID proxy kbd
+//   STOP-NOTE interrupt endpoint halted (token 0x00048141)   <- 05ac:820b, the BT HID proxy mouse
+//
+// `0x...8141` decodes to **CERR 0** and status `0x41` = Halted + ERR — three consecutive
+// transaction errors, the TT answering ERR. Neither endpoint has produced a report in ANY capture
+// in the corpus; retiring them is correct, and this arc leaves that outcome untouched.
+//
+// SO THE TWO HALTS ARE DIFFERENT FAULTS AND THE TOKEN ALREADY SAID SO. CERR unburned with no error
+// bit set is the signature of a STALL handshake: the controller stopped because the DEVICE said
+// stop, not because the wire failed. USB 2.0 §9.4.5 defines exactly one recovery for that —
+// `ClearFeature(ENDPOINT_HALT)`, which also resets the device-side data toggle to DATA0 — and this
+// driver did not have it on the interrupt path. `BtL3State::stopped`'s doc note (mod.rs:2622)
+// already spells out the trap that ordering closes: re-arming with a fresh `QTD_ACTIVE` overlay
+// "clears the QH's Halted bit while the DEVICE's STALL condition is untouched". The clear comes
+// first, or the re-arm is a lie told to the host side only.
+//
+// WHAT IS AND IS NOT CONVICTED. That a STALL retired the endpoint permanently, and anonymously, is
+// OURS, and it is what this changes. WHY the device stalled is NOT decided by that capture, and
+// the intake's ordering hypothesis is refuted by the corpus rather than confirmed: boot 9 and
+// `gr23-bootAR`'s second run both arm the same two keyboards 80 ms apart in the same order, and
+// neither stalls. `class=stall` on the next recurrence, followed by `HALT-CLEAR ... -> ok` and
+// traffic, is what turns a 4-minute dead keyboard into a logged hiccup — and if the clear is
+// REFUSED, that is the new datum, convicting the device side without another sitting.
+//
+// BOUNDS. At most `HALT_CLEARS_MAX` clears per endpoint per boot, one control transfer each,
+// issued only for `class=stall`, and only after the endpoint borrow is released (the same deferred
+// shape ALLKEYS P1's `led_pushes` uses — a control transfer needs `&mut self`). A refused clear
+// retires the endpoint exactly as before, held-key flush included. Exhausting the budget retires
+// it too. No loop, no wait, no allocation.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// KBDFLAP — how many `ClearFeature(ENDPOINT_HALT)` recoveries one interrupt endpoint may spend in
+/// a boot before it is retired for good.
+///
+/// Two, not one and not unbounded. One would be indistinguishable from "retry once and hope": a
+/// device that stalls, is cleared, and stalls again on the very next transfer is saying something
+/// the clear cannot fix, and the second attempt is what makes that observable instead of assumed.
+/// Unbounded is a livelock on the service path — a permanently stalling endpoint would buy a
+/// control transfer on every pass of the ~1 kHz main loop for the rest of the boot.
+const HALT_CLEARS_MAX: u8 = 2;
+
+/// EHCIDARK — minimum spacing between two `EHCIDARK` census lines for the SAME endpoint.
+///
+/// Five seconds, the cadence every other rollup in this tree settles on (`[schedx86] depth`,
+/// `[rtwit]`, `[piusb26]`), and for the reason that matters here more than anywhere: this instrument
+/// exists because a witness burst was starving the pointer. A census that printed per dark window
+/// would print hardest exactly when the console is already the problem — it would be the defect
+/// wearing the shape of its own diagnosis. Paired with the "only when the count MOVED" gate at the
+/// call site, a healthy boot emits this line ZERO times.
+const EHCIDARK_ROLLUP_MS: u64 = 5000;
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// ISRARM — THE COMPLETION INTERRUPT THIS CONTROLLER WAS ALREADY RAISING, FINALLY CONSUMED.
+//
+// ## The defect, in the units EHCIDARK measured it in
+// An armed HID interrupt-IN endpoint holds exactly ONE report. From the instant the controller
+// retires it until a service pass rewrites the overlay the endpoint is DARK and everything the pad
+// sends is dropped ON THE WIRE. The census above counts it; the metal corpus says how much:
+//
+//   EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=132 cad=1ms windows=57 dark=400ms  max=55ms missed<=343
+//   EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=291 cad=1ms windows=89 dark=2666ms max=80ms missed<=2390
+//   EHCIDARK addr=8 ep=IN3 kind=kbd       reports=13  cad=1ms windows=4  dark=144ms  max=96ms missed<=140
+//
+// `dark_gap_ms` is a SERVICE-PASS GAP (`now_ms - seen_ms`). The dark window is therefore the PASS
+// PERIOD, not a property of the endpoint's depth — which is why the fix is to stop waiting for the
+// pass, not to make the endpoint deeper.
+//
+// ## Why depth was refused
+// The obvious alternative — a chained ring of qTDs behind the same QH — CANNOT BE BUILT ON THIS
+// SILICON, and the refusal is recorded here rather than in a session log because the next reader of
+// `IntEp`'s "single re-armed qTD" doc-comment will otherwise reach for it. See
+// `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §33b ("The ring that cannot be built") for the full
+// argument; the short form is `Controller::overlay_mode`. Both EHCI functions on the 2012 rMBP run
+// OVERLAY-DIRECT — the controller master-aborts (HSE) on the qTD fetch, which is what probe-14
+// found and what every metal boot re-witnesses:
+//
+//   :: EHCI-HID: [0] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::
+//   :: EHCI-HID: [1] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT for this port walk ::
+//
+// In that mode `arm_interrupt_ep` writes the transfer straight into the QH overlay, pins
+// `overlay[0]`/`overlay[1]` to `PTR_TERMINATE` and explicitly discards the descriptor
+// (`let _ = (qtd, qtd_phys); // slot storage retained; the controller never sees it`). There is no
+// qTD in the controller's world to chain, and giving it one means taking the fetch path that wedges
+// it — an HSE'd controller does not recover from RS alone, so the failure mode is "no trackpad AND
+// no keyboard", strictly worse than the defect. Controller [1], the one the internal trackpad is
+// on, inherits the verdict without measuring it, so it is never even probed in chain mode.
+//
+// ## The shape that DOES work in both modes
+// `QTD_IOC` is already set on every arm — including the overlay-direct one — so the controller has
+// been raising `USBSTS.USBINT` on every single completion all along. Nothing listened: the module
+// header still said *"No interrupts: no USBINTR write, no IDT vector, no MSI"*, and `deadman`'s own
+// residual note observes that `QTD_IOC` sets `USBINT` even with `USBINTR` masked. This block writes
+// `USBINTR`, routes the function's MSI to the local APIC, and re-arms the endpoint FROM THE
+// COMPLETION ITSELF. The dark window stops being the pass period and becomes interrupt latency.
+// It needs no qTD, so it is indifferent to `overlay_mode` — the property the ring could never have.
+//
+// ## THE POLLED PATH IS STILL THE LOAD-BEARING ONE
+// This is the whole risk posture and it is deliberate. `service()` is unchanged in what it can do:
+// it still reads the token, still decodes, still re-arms, still retires a halted endpoint. The ISR
+// is a LATENCY LAYER on top — it gets there first when it is alive, and when it is not alive (no
+// MSI capability, MSI programmed but never delivered, a chipset that routes it somewhere we are
+// not) the pass finds the completion exactly where it always did and the boot is indistinguishable
+// from today except in the counters below. There is no state in which a dead interrupt produces a
+// dead trackpad.
+//
+// ## Why nothing here can wedge the machine
+//   * **No lock the ISR can wait on.** `EHCI_HID` is a `Mutex` the service pass holds across the
+//     whole walk — including `set_hid_leds`, which can spend a `hw_wait_budget()` (~2 s) inside one
+//     control transfer. Taking it here would self-deadlock exactly as the xHCI MSI handler's comment
+//     warns. So the ISR does not touch `Controller` at all: `arm_interrupt_ep` PUBLISHES the four
+//     pointers and two scalars an endpoint needs into `ISR_EPS`, plain atomics, and the ISR reads
+//     only those.
+//   * **The per-endpoint claim is `try` on BOTH sides and spins on neither.** The pass may run on a
+//     different core than the MSI target, so "just mask interrupts" is not a mutual exclusion. A
+//     `compare_exchange` decides; the loser walks away. The ISR losing costs one pass period — i.e.
+//     today's behaviour. The pass losing costs nothing: the report is in the hand-off ring.
+//   * **No allocation, no `Vec`, no `String`, no formatting.** The registry, the ring and the
+//     counters are `static`. The ISR never prints — every line this block produces is emitted by
+//     the polled pass, which can afford `serial_println!`.
+//   * **Bounded work.** `ISR_MAX_EPS` (12) iterations, each a handful of volatile reads and at most
+//     an `ISR_SLOT_LEN`-byte copy. No loop here can fail to terminate.
+//   * **Halts are NOT the ISR's business.** A token with `QTD_ERR_MASK` set is left exactly where it
+//     is; the pass retires the endpoint, flushes held key releases and prints the STOP-NOTE, none of
+//     which belongs in interrupt context.
+//
+// ## Why the ISR copies instead of just re-arming
+// Re-arming hands the buffer back to the controller, which may fill it again before the pass looks.
+// So the report is lifted into a per-endpoint hand-off ring FIRST and the pass decodes from there.
+// Reports leave the ring oldest-first and the pass drains the ring BEFORE reading the endpoint
+// directly, so a delta stream stays in order across both producers — trackpad reports are deltas,
+// and delivering them out of order is worse than dropping them.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// EHCI operational-register offset of USBINTR (EHCI 1.0 §2.3.3). Not in `ehci_scout`'s list
+/// because until this block nothing in the tree ever wrote it.
+const OP_USBINTR: u64 = 0x08;
+/// USBINTR bit 0 — USB Interrupt Enable: a qTD carrying `QTD_IOC` retired. This is the only cause
+/// this driver arms. Error / port-change / frame-rollover stay masked: every one of them is already
+/// handled by the polled pass, and an interrupt this handler would only acknowledge is an interrupt
+/// worth not taking.
+const INTR_USBINT: u32 = 1 << 0;
+/// USBSTS bit 0 — the completion status bit `INTR_USBINT` unmasks, and **the ONLY bit the ISR is
+/// allowed to write back.**
+///
+/// This is not tidiness, it is a bug that was written and then removed before it shipped. The
+/// obvious ack is the same blind `STS_RW1C` (0x3F) that `service()` uses at the head of every pass —
+/// but that mask includes `STS_HSE`, and `STS_HSE` is READ post-init by four separate sites on the
+/// control-transfer path (the chain-mode HSE check at `chain_txn`, the latched re-check after it,
+/// and the quiesce test) to decide whether this silicon has wedged. An ISR that cleared it would
+/// make an HSE'd controller look healthy to the very code whose job is to notice — a race the
+/// polled pass cannot lose today because it is the only writer. Since `USBINTR` unmasks bit 0 and
+/// nothing else, bit 0 is also the only bit that can be asserting the interrupt, so acking exactly
+/// it is both sufficient to let the controller raise again and incapable of eating anyone's
+/// evidence.
+const STS_USBINT: u32 = 1 << 0;
+
+/// Every endpoint slot the ISR can serve: one per `int_slots` entry per controller. The bound is
+/// exact rather than generous — `arm_interrupt_ep` refuses past `MAX_INT_EPS` and `init` past
+/// `MAX_CONTROLLERS`, so `idx * MAX_INT_EPS + int_next` can never collide and can never overflow.
+/// That is what lets an endpoint's slot index be DERIVED instead of allocated, which in turn keeps
+/// the publish path free of a failure mode the ISR would otherwise have to carry.
+const ISR_MAX_EPS: usize = MAX_CONTROLLERS * MAX_INT_EPS;
+/// Hand-off ring depth per endpoint. This is NOT hardware depth and must not be read as the qTD ring
+/// this arc refused: the endpoint still holds exactly one report. It is how many completions the ISR
+/// may lift out and hold for a pass that is late. Eight is the same number the refused ring wanted,
+/// for the same arithmetic (8 report periods), except that here it costs 8 x 64 B of kernel image
+/// per endpoint and no controller behaviour whatsoever.
+const ISR_RING: usize = 8;
+/// Bytes of one hand-off slot. `INT_BUF_LEN` knob-off is exactly 64, so on default media no
+/// completion can ever exceed it. Knob-on (`mtraw`, 1024) the vendor-multitouch endpoint's frames
+/// can, and those are DECLINED by the ISR (`ISR_OVERSIZE`) and left for the pass — a bounded,
+/// counted, knob-only degradation to today's behaviour rather than a 96 KiB static.
+const ISR_SLOT_LEN: usize = 64;
+
+/// One hand-off slot: the report bytes plus the two clock facts the EHCIDARK census needs, taken at
+/// the moment of CONSUMPTION rather than at decode time. Without `gap_ms` the census would measure
+/// "how late was the pass that decoded this", which under a live ISR is not the dark window and
+/// would make the instrument report a defect this block had already removed.
+#[repr(C)]
+struct IsrRingSlot {
+    len: u32,
+    gap_ms: u32,
+    at_ms: u64,
+    data: [u8; ISR_SLOT_LEN],
+}
+
+/// The ISR's whole view of one armed endpoint. Everything the re-arm needs, republished as atomics
+/// so no `Controller` field — and therefore no `EHCI_HID` lock — is on the interrupt path.
+struct IsrEp {
+    /// Published (1) by `arm_interrupt_ep` AFTER every other field is written and the QH is linked.
+    /// Read with `Acquire` so the ISR can never observe a half-built slot.
+    live: AtomicU32,
+    /// 0 free / 1 held. Try-only on both sides; see the block comment.
+    claim: AtomicU32,
+    qh: AtomicU64,
+    qtd: AtomicU64,
+    qtd_phys: AtomicU64,
+    buf: AtomicU64,
+    buf_phys: AtomicU64,
+    /// Bytes this endpoint is armed for — `mps` knob-off, the `mtraw` total knob-on. One field for
+    /// both, so the re-arm has a single source of truth for the arming size.
+    rx_total: AtomicU32,
+    /// `Controller::overlay_mode` at arm time, mirrored here because the ISR cannot reach the
+    /// controller. It is latched for the controller's lifetime, so a mirror cannot go stale.
+    om: AtomicU32,
+    /// THE DATA TOGGLE, and the single authority for it. It moved out of `IntEp` because two
+    /// re-armers cannot each own half a toggle: a QH running `QH_DTC` takes DT from the token the
+    /// re-arm writes, so a toggle the ISR advanced and the pass did not would make the device
+    /// silently discard every following packet.
+    toggle: AtomicU32,
+    /// `arch::ms()` at the last EXAMINATION of this endpoint by either path — the EHCIDARK clock.
+    /// Shared for the same reason the toggle is: the census's conservatism depends on the gap being
+    /// "time since anyone last looked", and a pass-only clock would keep reporting windows the ISR
+    /// had already closed.
+    seen_ms: AtomicU64,
+    /// Hand-off ring cursors. Single producer (the ISR; MSI targets exactly one APIC id, so there is
+    /// never more than one), single consumer (the pass, under `EHCI_HID`). Free-running counters —
+    /// occupancy is `tail - head`, which is wrap-safe.
+    head: AtomicU32,
+    tail: AtomicU32,
+}
+
+impl IsrEp {
+    const fn new() -> Self {
+        Self {
+            live: AtomicU32::new(0),
+            claim: AtomicU32::new(0),
+            qh: AtomicU64::new(0),
+            qtd: AtomicU64::new(0),
+            qtd_phys: AtomicU64::new(0),
+            buf: AtomicU64::new(0),
+            buf_phys: AtomicU64::new(0),
+            rx_total: AtomicU32::new(0),
+            om: AtomicU32::new(0),
+            toggle: AtomicU32::new(0),
+            seen_ms: AtomicU64::new(0),
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+        }
+    }
+}
+
+static ISR_EPS: [IsrEp; ISR_MAX_EPS] = [const { IsrEp::new() }; ISR_MAX_EPS];
+
+/// The hand-off payloads. `static mut` + `addr_of_mut!` rather than a lock, because the ISR is the
+/// only writer of a slot it has claimed and the pass is the only reader of a slot the producer has
+/// published; the `Release`/`Acquire` pair on `tail` is what orders the bytes against the cursor.
+static mut ISR_RINGS: [[IsrRingSlot; ISR_RING]; ISR_MAX_EPS] = unsafe { core::mem::zeroed() };
+
+/// Cached operational-register base per controller, for the ISR's USBSTS acknowledge. 0 = no
+/// controller in this index. Published by `isr_arm_controller` after the controller is fully up.
+static ISR_OP: [AtomicU64; MAX_CONTROLLERS] = [const { AtomicU64::new(0) }; MAX_CONTROLLERS];
+
+// ── The counters. Every one of these is read by the polled pass and printed by `isr_rollup`. ────
+/// ISR invocations. **The falsifier.** Zero here after the arming line printed means the vector is
+/// not being delivered, and `isr_rollup` says so in words.
+static ISR_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// Endpoints re-armed FROM THE INTERRUPT. This is the number that is the fix: under the old code it
+/// was structurally impossible for it to be anything but zero, because the site did not exist.
+static ISR_REARMS: AtomicU64 = AtomicU64::new(0);
+/// Endpoints re-armed from the polled pass — today's path, kept and counted so the two are legible
+/// side by side. `isr_rearm=0 poll_rearm=N` is the honest picture of a boot where the interrupt
+/// never arrived.
+static POLL_REARMS: AtomicU64 = AtomicU64::new(0);
+/// Claims the ISR lost to a pass already inside the endpoint. Not an error: the pass finishes the
+/// job. A large number means the two are fighting over the same endpoint, which is worth seeing.
+static ISR_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Claims the PASS lost to an ISR already inside the endpoint. Also not an error, and it is the
+/// half that cannot cost a report: whatever the ISR is doing in there ends in the hand-off ring.
+static POLL_CONTENDED: AtomicU64 = AtomicU64::new(0);
+/// Completions the ISR found with a full hand-off ring — it declined and left them for the pass.
+/// **This is the residual defect**: the pass was >= 8 reports late even with the interrupt live.
+static ISR_RING_FULL: AtomicU64 = AtomicU64::new(0);
+/// Completions longer than one hand-off slot (`mtraw` only), declined and left for the pass.
+static ISR_OVERSIZE: AtomicU64 = AtomicU64::new(0);
+/// Deepest hand-off occupancy ever observed, across all endpoints. 1 means the pass was never more
+/// than one report behind; `ISR_RING` means it hit the ceiling and `ISR_RING_FULL` should be nonzero.
+static ISR_DEPTH_MAX: AtomicU32 = AtomicU32::new(0);
+/// Controllers on which MSI + USBINTR were successfully armed.
+static ISR_ARMED: AtomicU32 = AtomicU32::new(0);
+/// Controllers whose MSI could not be armed (no capability, or the enable did not stick).
+static ISR_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `arch::ms()` of the last `ISRARM` rollup line, and the `ISR_REARMS` value it carried.
+static ISR_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static ISR_LOG_REARMS: AtomicU64 = AtomicU64::new(0);
+/// One-shot latch for the "the interrupt never arrived" verdict, so it is stated ONCE and loudly
+/// rather than every rollup for the rest of the boot.
+static ISR_DEAD_SAID: AtomicU32 = AtomicU32::new(0);
+
+/// Minimum spacing between `ISRARM` rollup lines. The same five seconds as `EHCIDARK_ROLLUP_MS`,
+/// for the same reason: this arc sits downstream of a witness burst that was starving the pointer,
+/// and an instrument for it must not become one.
+const ISRARM_ROLLUP_MS: u64 = 5000;
+/// How long after boot the ISR may stay silent before the pass declares the vector dead. Five
+/// seconds is comfortably past enumeration on the slowest metal boot in the corpus, so a verdict
+/// here is about DELIVERY and not about a device nobody has touched yet.
+const ISRARM_DEAD_MS: u64 = 5000;
+
+/// Publish one armed endpoint into the ISR's registry. Called from `arm_interrupt_ep` AFTER the QH
+/// is linked and the first transfer is armed, so the ISR can only ever see an endpoint the
+/// controller is already executing.
+#[allow(clippy::too_many_arguments)]
+unsafe fn isr_publish_ep(
+    slot: usize,
+    qh: *mut Qh,
+    qtd: *mut Qtd,
+    qtd_phys: u64,
+    buf: *mut u8,
+    buf_phys: u64,
+    rx_total: u32,
+    om: bool,
+    now_ms: u64,
+) {
+    let ep = &ISR_EPS[slot];
+    ep.qh.store(qh as u64, Ordering::Relaxed);
+    ep.qtd.store(qtd as u64, Ordering::Relaxed);
+    ep.qtd_phys.store(qtd_phys, Ordering::Relaxed);
+    ep.buf.store(buf as u64, Ordering::Relaxed);
+    ep.buf_phys.store(buf_phys, Ordering::Relaxed);
+    ep.rx_total.store(rx_total, Ordering::Relaxed);
+    ep.om.store(om as u32, Ordering::Relaxed);
+    // DATA0 is what `arm_interrupt_ep` just armed, so the shared toggle starts where the hardware
+    // is — not at whatever a previous endpoint left in this slot.
+    ep.toggle.store(0, Ordering::Relaxed);
+    ep.seen_ms.store(now_ms, Ordering::Relaxed);
+    ep.head.store(0, Ordering::Relaxed);
+    ep.tail.store(0, Ordering::Relaxed);
+    // LAST, and with `Release`: everything above must be visible to any core that observes `live`.
+    ep.live.store(1, Ordering::Release);
+}
+
+/// Re-arm one endpoint for another IN transfer. **The single re-arm implementation** — the ISR and
+/// the polled pass both come here, so the overlay-direct / qTD-chain fork and the data toggle each
+/// exist exactly once. Writes only this endpoint's own QH/qTD; takes nothing, allocates nothing,
+/// cannot block.
+unsafe fn isr_rearm(ep: &IsrEp) {
+    // Flip first, then use the NEW value: `fetch_xor` returns the old one.
+    let toggle = ep.toggle.fetch_xor(1, Ordering::Relaxed) ^ 1;
+    let dt = if toggle & 1 != 0 { QTD_DT } else { 0 };
+    let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
+    let total = ep.rx_total.load(Ordering::Relaxed);
+    let buf_phys = ep.buf_phys.load(Ordering::Relaxed);
+    if ep.om.load(Ordering::Relaxed) != 0 {
+        (*qh).overlay[0] = PTR_TERMINATE;
+        (*qh).overlay[1] = PTR_TERMINATE;
+        (*qh).overlay[3] = buf_phys as u32;
+        (*qh).overlay[4] = 0;
+        // Token written LAST (volatile), the discipline `write_qtd` states: the controller must
+        // never see a half-built descriptor.
+        core::ptr::write_volatile(
+            &mut (*qh).overlay[2],
+            QTD_ACTIVE | QTD_CERR3 | (total << QTD_TOTAL_SHIFT) | QTD_PID_IN | QTD_IOC | dt,
+        );
+    } else {
+        let qtd = ep.qtd.load(Ordering::Relaxed) as *mut Qtd;
+        write_qtd(qtd, PTR_TERMINATE, QTD_PID_IN | QTD_IOC | dt, total, buf_phys);
+        (*qh).overlay[1] = PTR_TERMINATE;
+        core::ptr::write_volatile(&mut (*qh).overlay[2], 0);
+        core::ptr::write_volatile(
+            &mut (*qh).overlay[0],
+            ep.qtd_phys.load(Ordering::Relaxed) as u32,
+        );
+    }
+}
+
+/// Take the oldest hand-off report for `slot` into `out`, returning `(len, at_ms, gap_ms)`.
+/// Consumer side of the SPSC ring; called ONLY from the polled pass, under `EHCI_HID`.
+unsafe fn isr_take(slot: usize, out: &mut [u8; ISR_SLOT_LEN]) -> Option<(usize, u64, u64)> {
+    let ep = &ISR_EPS[slot];
+    let head = ep.head.load(Ordering::Relaxed);
+    // `Acquire`: pairs with the producer's `Release` store, which is what makes the slot bytes
+    // written before it visible here.
+    if head == ep.tail.load(Ordering::Acquire) {
+        return None;
+    }
+    let s = &(*core::ptr::addr_of_mut!(ISR_RINGS))[slot][(head as usize) % ISR_RING];
+    let len = (s.len as usize).min(ISR_SLOT_LEN);
+    out[..len].copy_from_slice(&s.data[..len]);
+    let r = (len, s.at_ms, s.gap_ms as u64);
+    ep.head.store(head.wrapping_add(1), Ordering::Release);
+    Some(r)
+}
+
+/// Claim one endpoint for the POLLED pass. Blocking is not allowed here either — the ISR may hold
+/// the claim for the length of a 64-byte copy and nothing longer, so a pass that loses simply skips
+/// the endpoint this round and takes the report out of the hand-off ring next time. Returns false
+/// if the claim was not taken.
+fn isr_claim_poll(slot: usize) -> bool {
+    ISR_EPS[slot]
+        .claim
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn isr_release_poll(slot: usize) {
+    ISR_EPS[slot].claim.store(0, Ordering::Release);
+}
+
+/// The data toggle currently armed on `e`'s endpoint, for the instruments that print it. It lives
+/// in the shared registry now (see `IsrEp::toggle`), so this is the one place that translates.
+#[cfg(feature = "kbdwit")]
+fn isr_toggle_of(e: &IntEp) -> bool {
+    ISR_EPS[e.isr_slot].toggle.load(Ordering::Relaxed) & 1 != 0
+}
+
+/// Stamp an examination of `slot` at `now_ms` and return the gap since the previous one — the
+/// EHCIDARK clock, shared between the two paths (see `IsrEp::seen_ms`).
+fn isr_mark_seen(slot: usize, now_ms: u64) -> u64 {
+    now_ms.wrapping_sub(ISR_EPS[slot].seen_ms.swap(now_ms, Ordering::Relaxed))
+}
+
+/// Service one endpoint from interrupt context. Every early return leaves the endpoint EXACTLY as
+/// the polled pass would find it today, which is what makes each of them a degradation to the old
+/// behaviour rather than a loss.
+unsafe fn isr_service_ep(slot: usize, now_ms: u64) {
+    let ep = &ISR_EPS[slot];
+    if ep.live.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    // Try-claim. NEVER spin — losing means a pass owns this endpoint right now and will do
+    // precisely what the driver did before this block existed.
+    if ep
+        .claim
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        ISR_CONTENDED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let qh = ep.qh.load(Ordering::Relaxed) as *mut Qh;
+    let tok = if ep.om.load(Ordering::Relaxed) != 0 {
+        core::ptr::read_volatile(&(*qh).overlay[2])
+    } else {
+        core::ptr::read_volatile(&(*(ep.qtd.load(Ordering::Relaxed) as *mut Qtd)).token)
+    };
+    // Still running, or halted. A halt is the pass's business — it retires the endpoint, flushes
+    // held key releases and prints — and none of that belongs on an interrupt stack.
+    if tok & (QTD_ACTIVE | QTD_ERR_MASK) != 0 {
+        ep.claim.store(0, Ordering::Release);
+        return;
+    }
+    let len = ep
+        .rx_total
+        .load(Ordering::Relaxed)
+        .saturating_sub((tok >> QTD_TOTAL_SHIFT) & 0x7FFF) as usize;
+    if len > ISR_SLOT_LEN {
+        ISR_OVERSIZE.fetch_add(1, Ordering::Relaxed);
+        ep.claim.store(0, Ordering::Release);
+        return;
+    }
+    let head = ep.head.load(Ordering::Acquire);
+    let tail = ep.tail.load(Ordering::Relaxed);
+    let depth = tail.wrapping_sub(head);
+    if depth as usize >= ISR_RING {
+        // The pass is more than a ring behind. Decline: the report stays in the endpoint buffer and
+        // the endpoint stays un-re-armed — i.e. exactly today's state — and the pass takes it.
+        ISR_RING_FULL.fetch_add(1, Ordering::Relaxed);
+        ep.claim.store(0, Ordering::Release);
+        return;
+    }
+    // The census's gap, taken HERE — at the consumption — not where the report is later decoded.
+    let gap = now_ms.wrapping_sub(ep.seen_ms.swap(now_ms, Ordering::Relaxed));
+    let s = &mut (*core::ptr::addr_of_mut!(ISR_RINGS))[slot][(tail as usize) % ISR_RING];
+    core::ptr::copy_nonoverlapping(
+        ep.buf.load(Ordering::Relaxed) as *const u8,
+        s.data.as_mut_ptr(),
+        len,
+    );
+    s.len = len as u32;
+    s.at_ms = now_ms;
+    s.gap_ms = gap.min(u32::MAX as u64) as u32;
+    // The report is safely out of the buffer, so the endpoint goes back on the wire BEFORE the
+    // cursor is published. This ordering is the entire point of the arc: it is the shortest path
+    // from "the controller retired the transfer" to "the controller is listening again".
+    isr_rearm(ep);
+    ISR_REARMS.fetch_add(1, Ordering::Relaxed);
+    // `Release`: publishes the slot bytes above to the consumer's `Acquire` load of `tail`.
+    ep.tail.store(tail.wrapping_add(1), Ordering::Release);
+    ISR_DEPTH_MAX.fetch_max(depth + 1, Ordering::Relaxed);
+    ep.claim.store(0, Ordering::Release);
+}
+
+/// The EHCI MSI handler's driver half (IDT vector `EHCI_MSI_VECTOR`). Acknowledge every armed
+/// controller's status register so it can raise again, then lift and re-arm every endpoint that
+/// completed. Lock-free, allocation-free, print-free, and bounded at `ISR_MAX_EPS` endpoints.
+///
+/// The acknowledge is `STS_USBINT` ONLY — never the blind `STS_RW1C` the polled pass uses; see that
+/// constant for the HSE-eating race that shape would have introduced. It is applied to every armed
+/// controller because MSI carries no cause and the ISR cannot tell which function raised; acking one
+/// that did not raise writes back a bit that was already clear, which is a no-op by RW1C's own
+/// definition.
+pub fn interrupt_ack() {
+    ISR_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        for op in ISR_OP.iter() {
+            let base = op.load(Ordering::Relaxed);
+            if base == 0 {
+                continue;
+            }
+            if let Some(sts) = mmio_read32(base + OP_USBSTS) {
+                if sts & STS_USBINT != 0 {
+                    let _ = mmio_write32(base + OP_USBSTS, STS_USBINT);
+                }
+            }
+        }
+        let now_ms = crate::arch::ms();
+        for slot in 0..ISR_MAX_EPS {
+            isr_service_ep(slot, now_ms);
+        }
+    }
+}
+
+/// Arm the completion interrupt on one controller: route its MSI to the local APIC, then unmask
+/// `USBINTR.USBINT`. Called once per controller at the very END of `init`, after every endpoint is
+/// armed and published — so the first interrupt this function makes possible can only ever find a
+/// registry that is already complete.
+///
+/// **Every failure here is a REFUSAL, not an error.** No MSI capability, an enable bit that does not
+/// stick, an unmapped operational base: each one leaves the controller exactly as it was, prints why,
+/// and the driver goes on polling. That is the same posture `bt_acl_txn` takes when it refuses chain
+/// mode rather than invent an unexercised path, and for the same reason.
+///
+/// **INTx is not a fallback and is deliberately not attempted.** This kernel is a pure local-APIC
+/// system with no IOAPIC redirection programming anywhere in the tree (`arch/x86_64/apic.rs` has no
+/// redirection-entry writer), so a legacy INTA# assertion has nowhere to be delivered. Enabling MSI
+/// masks INTx per PCI spec, which is the correct end state either way; a controller without MSI
+/// simply stays polled.
+unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
+    // Cache the operational base FIRST: the ISR needs it to acknowledge USBSTS, and an interrupt
+    // that arrives before the base is published would leave the status bit set and the controller
+    // unable to raise again.
+    if idx < MAX_CONTROLLERS {
+        ISR_OP[idx].store(op, Ordering::Relaxed);
+    }
+    let msg_addr = 0xFEE0_0000u32 | ((crate::arch::x86_64::apic::apic_id() as u32) << 12);
+    if !crate::drivers::pci::PciScanner::enable_msi(
+        bus,
+        dev,
+        func,
+        msg_addr,
+        crate::arch::interrupts::EHCI_MSI_VECTOR as u32,
+    ) {
+        ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        if idx < MAX_CONTROLLERS {
+            ISR_OP[idx].store(0, Ordering::Relaxed);
+        }
+        serial_println!(
+            ":: EHCI-HID: [{}] ISRARM REFUSED — this function offers no usable MSI capability, and there is no IOAPIC in this kernel to route INTx to. The endpoint stays on the POLLED re-arm path, which is unchanged; the dark window EHCIDARK measures is unchanged with it == witness ::",
+            idx
+        );
+        return;
+    }
+    // Unmask ONLY the IOC completion cause. Read-modify-write so a bit firmware left set is not
+    // silently cleared, and read back so "enabled" is a MEASUREMENT rather than a write we hope
+    // landed — a masked USBINTR is exactly the state that would make the ISR silently absent.
+    let prev = mmio_read32(op + OP_USBINTR).unwrap_or(0);
+    let _ = mmio_write32(op + OP_USBINTR, prev | INTR_USBINT);
+    let now = mmio_read32(op + OP_USBINTR).unwrap_or(0);
+    if now & INTR_USBINT == 0 {
+        ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        ISR_OP[idx].store(0, Ordering::Relaxed);
+        serial_println!(
+            ":: EHCI-HID: [{}] ISRARM REFUSED — USBINTR write did not stick ({:#010x} -> {:#010x}); the completion cause is still masked, so the vector could never fire. Staying on the POLLED re-arm path == witness ::",
+            idx, prev, now
+        );
+        return;
+    }
+    ISR_ARMED.fetch_add(1, Ordering::Relaxed);
+    serial_println!(
+        ":: EHCI-HID: [{}] ISRARM armed — MSI vector {:#04x} -> apic {:#x}, USBINTR {:#010x} -> {:#010x} (USBINT unmasked). The polled pass REMAINS the fallback: if this vector never fires, an `ISRARM IRQ DEAD` line follows and nothing else changes == witness ::",
+        idx,
+        crate::arch::interrupts::EHCI_MSI_VECTOR,
+        msg_addr,
+        prev,
+        now
+    );
+}
+
+/// ISRARM — the completion-interrupt fixture, run once at `init` before any endpoint is armed.
+///
+/// **Why it exists.** The interrupt cannot fire in QEMU: `hcd-ehci` advertises no PCI capability
+/// list, so `isr_arm_controller` refuses MSI and every automated gate in this repo would run with
+/// `isr_service_ep`, the hand-off ring and the shared re-arm as unexecuted code. This drives them
+/// for real — a hand-built completion token, the actual ISR entry point, the actual consumer — so a
+/// regression in the interrupt path fails a QEMU boot instead of waiting for a bench sitting.
+///
+/// **Why it is safe to run here.** It borrows `DMA_POOLS[0].int_slots[0]` and `ISR_EPS[0]` at a
+/// moment when both are provably unowned: no controller has been constructed, no endpoint has been
+/// armed, `USBINTR` is masked on every function and no MSI is routed, so nothing else in the machine
+/// can be looking at either. `arm_interrupt_ep` rewrites both from scratch when the slot is really
+/// used, and the fixture puts `live`, the cursors and the counters back before it returns — the
+/// operational numbers on the `ISRARM` line start from zero, not from the fixture's tally.
+///
+/// It runs in BOTH transfer modes on purpose. The metal takes the overlay-direct fork and QEMU takes
+/// the qTD-chain one, so a fixture that tested only the mode it happens to be booting on would be
+/// blind to exactly the half this arc's own risk lives in.
+unsafe fn isr_selftest() {
+    let pool = &mut DMA_POOLS[0] as *mut qh::DmaPool;
+    let slot0 = &mut (*pool).int_slots[0];
+    let (qh, qtd, buf) = (
+        &mut slot0.qh as *mut Qh,
+        &mut slot0.qtd as *mut Qtd,
+        slot0.buf.0.as_mut_ptr(),
+    );
+    let (Some(qh_phys), Some(qtd_phys), Some(buf_phys)) =
+        (phys_of(qh, 32), phys_of(qtd, 32), phys_of(buf, INT_BUF_ALIGN))
+    else {
+        serial_println!(
+            ":: EHCI-HID: ISRARM self-test SKIPPED — the static pool failed the phys/alignment contract, which is the same refusal `arm_interrupt_ep` would make. Nothing was exercised; treat the ISR path as UNTESTED on this boot == witness ::"
+        );
+        return;
+    };
+    let _ = qh_phys;
+    // Snapshot the operational counters: the fixture drives the real ISR, so it necessarily moves
+    // them, and a boot's `ISRARM` line must count the machine's work rather than the test's.
+    let saved = (
+        ISR_REARMS.load(Ordering::Relaxed),
+        ISR_RING_FULL.load(Ordering::Relaxed),
+        ISR_CONTENDED.load(Ordering::Relaxed),
+        ISR_DEPTH_MAX.load(Ordering::Relaxed),
+    );
+    const RX: u32 = 8;
+    let mut order_ok = true;
+    let mut payload_ok = true;
+    let mut rearm_ok = true;
+    let mut toggle_ok = true;
+    let mut full_ok = true;
+    let mut modes = 0u32;
+    for om in [false, true] {
+        isr_publish_ep(0, qh, qtd, qtd_phys, buf, buf_phys, RX, om, 0);
+        // Push ISR_RING + 1 completions. The first `ISR_RING` must land; the last must be REFUSED
+        // with the endpoint left un-re-armed — that refusal is the residual-defect path
+        // (`ISR_RING_FULL`) and the one branch a live machine hits only when it is already late.
+        let full_before = ISR_RING_FULL.load(Ordering::Relaxed);
+        for k in 1..=(ISR_RING + 1) {
+            // Stand in for the controller: land a payload and retire the transfer. Active clear,
+            // no error bits, zero residue => the ISR should read exactly RX bytes.
+            core::ptr::write_volatile(buf, k as u8);
+            core::ptr::write_volatile(buf.add(1), 0xA5);
+            let done = QTD_CERR3 | QTD_PID_IN;
+            if om {
+                core::ptr::write_volatile(&mut (*qh).overlay[2], done);
+            } else {
+                core::ptr::write_volatile(&mut (*qtd).token, done);
+            }
+            isr_service_ep(0, k as u64);
+            // The endpoint must be back on the wire after every accepted completion, and must NOT
+            // be after the refused one — that is the whole contract the pass depends on.
+            let tok = if om {
+                core::ptr::read_volatile(&(*qh).overlay[2])
+            } else {
+                core::ptr::read_volatile(&(*qtd).token)
+            };
+            let armed = tok & QTD_ACTIVE != 0;
+            let expect_armed = k <= ISR_RING;
+            if armed != expect_armed {
+                rearm_ok = false;
+            }
+            // The data toggle, read off the token the re-arm actually wrote rather than off the
+            // atomic, so this checks the wire contract and not the bookkeeping that produced it.
+            //
+            // The FIRST re-arm is DATA1, not DATA0, and that ordering is the whole point of
+            // checking it: `arm_interrupt_ep` puts DATA0 on the wire itself when it arms the
+            // endpoint, so re-arm #1 is the SECOND transfer of the pipe. (The fixture asserted
+            // DATA0 here on its first run and this line failed the gate — which is the fixture
+            // doing its job: it is genuinely executing `isr_rearm`, not agreeing with it.)
+            if expect_armed {
+                let want_dt = if k % 2 == 1 { QTD_DT } else { 0 };
+                if tok & QTD_DT != want_dt {
+                    toggle_ok = false;
+                }
+            }
+        }
+        if ISR_RING_FULL.load(Ordering::Relaxed) != full_before + 1 {
+            full_ok = false;
+        }
+        // Drain. FIFO across the wrap, payload intact, and the ring empty afterwards.
+        let mut out = [0u8; ISR_SLOT_LEN];
+        for k in 1..=ISR_RING {
+            match isr_take(0, &mut out) {
+                Some((n, at_ms, _gap)) => {
+                    if n != RX as usize || at_ms != k as u64 {
+                        order_ok = false;
+                    }
+                    if out[0] != k as u8 || out[1] != 0xA5 {
+                        payload_ok = false;
+                    }
+                }
+                None => order_ok = false,
+            }
+        }
+        if isr_take(0, &mut out).is_some() {
+            order_ok = false;
+        }
+        modes += 1;
+    }
+    // Put the slot and the counters back. `live = 0` is the important one: until a real endpoint is
+    // published here, the ISR must not treat this slot as anything.
+    ISR_EPS[0].live.store(0, Ordering::Release);
+    ISR_EPS[0].head.store(0, Ordering::Relaxed);
+    ISR_EPS[0].tail.store(0, Ordering::Relaxed);
+    ISR_EPS[0].claim.store(0, Ordering::Release);
+    core::ptr::write_bytes(&mut (*qh) as *mut Qh as *mut u8, 0, core::mem::size_of::<Qh>());
+    core::ptr::write_bytes(&mut (*qtd) as *mut Qtd as *mut u8, 0, core::mem::size_of::<Qtd>());
+    core::ptr::write_bytes(buf, 0, INT_BUF_LEN);
+    ISR_REARMS.store(saved.0, Ordering::Relaxed);
+    ISR_RING_FULL.store(saved.1, Ordering::Relaxed);
+    ISR_CONTENDED.store(saved.2, Ordering::Relaxed);
+    ISR_DEPTH_MAX.store(saved.3, Ordering::Relaxed);
+    let ok = order_ok && payload_ok && rearm_ok && toggle_ok && full_ok && modes == 2;
+    serial_println!(
+        ":: EHCI-HID: ISRARM self-test: modes={} (overlay-direct + qTD-chain) depth={} fifo={} payload={} rearm={} toggle={} ringfull-refuses={} -> {} == witness ::",
+        modes, ISR_RING, order_ok, payload_ok, rearm_ok, toggle_ok, full_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// The `ISRARM` rollup, emitted from the POLLED pass (never from the ISR). Two jobs, and the second
+/// is the one that matters: it makes a DEAD vector a printed statement rather than an absence.
+///
+/// Rate-limited to `ISRARM_ROLLUP_MS` and gated on `ISR_REARMS` having MOVED, so a boot in which the
+/// interrupt is doing its job emits one line per five seconds of actual pointer activity and nothing
+/// at all while the machine is idle. The dead verdict does NOT share that gate — it fires precisely
+/// because the counter is not moving.
+fn isr_rollup(now_ms: u64) {
+    let armed = ISR_ARMED.load(Ordering::Relaxed);
+    if armed == 0 && ISR_REFUSED.load(Ordering::Relaxed) == 0 {
+        return; // nothing was ever attempted — nothing to report
+    }
+    let entries = ISR_ENTRIES.load(Ordering::Relaxed);
+    let rearms = ISR_REARMS.load(Ordering::Relaxed);
+    // ── THE NEGATIVE CASE, SAID OUT LOUD, ONCE. ────────────────────────────────────────────────
+    // An instrument that cannot fire in the state it exists for is not a cheaper guard, it is an
+    // absent one — so "we armed the vector and it has never been delivered" gets its own sentence
+    // in the capture instead of being inferred from a line that is missing.
+    if armed > 0
+        && entries == 0
+        && now_ms >= ISRARM_DEAD_MS
+        && ISR_DEAD_SAID
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        // The counts ride along on THIS line, not only on the rollup below. The rollup is gated on
+        // `ISR_REARMS` having MOVED, and in precisely this state it never will — so a dead-vector
+        // boot would otherwise carry the verdict without a single number behind it, and an operator
+        // would have to take "everything still polled" on the driver's word. `poll_rearm=` is that
+        // word's evidence: nonzero here means the fallback is not merely nominated but working.
+        serial_println!(
+            ":: EHCI-HID: ISRARM IRQ DEAD — MSI armed on {} controller(s) and USBINTR enabled, but the vector has NOT been delivered once in {} ms (irq={} isr_rearm={} poll_rearm={}). Every endpoint is being re-armed by the POLLED pass, exactly as before this arc; the dark window is unchanged and EHCIDARK still measures it. This is the fallback working, not a crash == witness ::",
+            armed, now_ms, entries, rearms, POLL_REARMS.load(Ordering::Relaxed)
+        );
+    }
+    if rearms == ISR_LOG_REARMS.load(Ordering::Relaxed)
+        || now_ms.wrapping_sub(ISR_LOG_MS.load(Ordering::Relaxed)) < ISRARM_ROLLUP_MS
+    {
+        return;
+    }
+    ISR_LOG_MS.store(now_ms, Ordering::Relaxed);
+    ISR_LOG_REARMS.store(rearms, Ordering::Relaxed);
+    serial_println!(
+        ":: EHCI-HID: ISRARM armed={} refused={} irq={} isr_rearm={} poll_rearm={} depth_max={} ringfull={} cont_isr={} cont_poll={} oversize={} == witness ::",
+        armed,
+        ISR_REFUSED.load(Ordering::Relaxed),
+        entries,
+        rearms,
+        POLL_REARMS.load(Ordering::Relaxed),
+        ISR_DEPTH_MAX.load(Ordering::Relaxed),
+        ISR_RING_FULL.load(Ordering::Relaxed),
+        ISR_CONTENDED.load(Ordering::Relaxed),
+        POLL_CONTENDED.load(Ordering::Relaxed),
+        ISR_OVERSIZE.load(Ordering::Relaxed),
+    );
+}
+
+/// KBDFLAP — the software name for what an armed interrupt endpoint is, shared by the halt
+/// STOP-NOTE and the KBDWIT dump so the two lines can be joined by eye. It is the DRIVER'S belief;
+/// both call sites print the controller's own decoded address and endpoint number beside it, so a
+/// disagreement between driver and controller shows up in the capture rather than hiding in it.
+fn int_ep_kind(e: &IntEp) -> &'static str {
+    match e.layout {
+        Some(l) if l.vendor_mt => "vendor-mt",
+        Some(l) if l.relative => "rptr-rel",
+        Some(_) => "rptr-abs",
+        None if e.is_kbd => "kbd",
+        None if e.is_rel_mouse => "boot-mouse",
+        None => "unknown",
+    }
+}
+
+/// KBDFLAP — classify a halted interrupt qTD token, and say whether
+/// `ClearFeature(ENDPOINT_HALT)` is the right answer to it.
+///
+/// Returns `(class, recoverable)`. The class word goes on the STOP-NOTE; `recoverable` gates the
+/// one recovery this driver has. The point is that the two halts this bench actually produces are
+/// DIFFERENT FAULTS which the pre-KBDFLAP code treated as one:
+///
+/// | metal token  | CERR | status | class           | recoverable |
+/// |--------------|------|--------|-----------------|-------------|
+/// | `0x000a8d42` |  3   | `0x42` | `stall`         | yes         |
+/// | `0x00088141` |  0   | `0x41` | `xact-err-burn` | no          |
+/// | `0x00048141` |  0   | `0x41` | `xact-err-burn` | no          |
+///
+/// ORDER IS THE SEMANTICS, so it is written down rather than left to be re-derived:
+///
+///   * babble, data-buffer error and missed-microframe are tested FIRST because each is a
+///     host/bus fault that can coexist with the Halted bit, and none of them is answered by
+///     clearing a device-side stall condition. A token carrying babble AND an intact CERR must
+///     never be read as a stall merely because it is also halted.
+///   * the transaction-error arm then absorbs both of its shapes: `XactErr` set, the split `ERR`
+///     handshake in bit 0, and `CERR == 0` — the error counter having burned all the way down IS
+///     the halt in that case, whether or not the last error also left its own bit set. This is the
+///     arm the two BT-proxy endpoints take on every boot, and it must keep taking it.
+///   * only what is left — Halted, error counter intact, no error bit anywhere — is a STALL
+///     handshake. That is a device saying "no", and USB 2.0 §9.4.5 is the answer to it.
+///
+/// `no-halt-bit` is unreachable from `service`'s call site (entry there requires `QTD_ERR_MASK`,
+/// i.e. one of bits 6..2, and every one of those except Halted is claimed by an arm above), but
+/// this is a total function over `u32` and that arm is a real answer for a caller handing it an
+/// arbitrary token — which is exactly what the host-side proof harness for this arc does.
+fn halt_class(tok: u32) -> (&'static str, bool) {
+    // Status bits, EHCI 1.0 §3.5.3. `QTD_HALTED` is bit 6 and already named in `qh.rs`; the rest
+    // are spelled out here because this is the driver's first reader of them individually.
+    const ST_DBUF: u32 = 1 << 5;
+    const ST_BABBLE: u32 = 1 << 4;
+    const ST_XACT: u32 = 1 << 3;
+    const ST_MISSED: u32 = 1 << 2;
+    // Bit 0 is Ping State on a high-speed OUT and **ERR** on a split transaction ("the TT returned
+    // an ERR handshake"). Every endpoint this function judges is full/low speed behind a TT — that
+    // is what a HID device on this bench is — so ERR is the reading that applies.
+    const ST_SPLIT_ERR: u32 = 1 << 0;
+    let cerr = (tok >> 10) & 0x3;
+    if tok & ST_BABBLE != 0 {
+        return ("babble", false);
+    }
+    if tok & ST_DBUF != 0 {
+        return ("data-buffer", false);
+    }
+    if tok & ST_MISSED != 0 {
+        return ("missed-uframe", false);
+    }
+    if tok & (ST_XACT | ST_SPLIT_ERR) != 0 || cerr == 0 {
+        return ("xact-err-burn", false);
+    }
+    if tok & QTD_HALTED != 0 {
+        return ("stall", true);
+    }
+    ("no-halt-bit", false)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// BTPROXY (2026-08-21) — the two endpoints that have never carried a byte, and why they STAY
+// ARMED. A finding, not a change. Recorded here so the next reader does not re-derive it.
+//
+// `05ac:820a` and `05ac:820b` are armed on every rMBP boot as `keyboard`/`boot-mouse` and have
+// produced ZERO reports in the entire bench corpus. The question put to this arc was whether the
+// arm should be skipped, deferred, or left alone. The answer is LEFT ALONE, and the evidence runs
+// against the premise rather than merely failing to support a change.
+//
+// WHAT THE CORPUS SAYS (204 MB, 418 files, 40 boots that enumerate the pair):
+//
+//   * `reports=0` in every KBDWIT block that names them — four blocks in four different captures,
+//     each `class=never-completed last_ms=0`. There is no `keyboard raw report` or `boot-mouse raw
+//     report` line anywhere in the corpus; every report-payload line belongs to the internal
+//     trackpad or the internal keyboard.
+//   * 37 halt pairs are recorded across the corpus — `0x00088141` + `0x00048141`, CERR burned to
+//     0 with the TT answering ERR, i.e. the `xact-err-burn` arm above — against 4 boots that leave
+//     them sitting Active forever at `0x00088d80` / `0x00048d80`, never granted a complete-split.
+//     (37 + 4 covers the 40 enumerating boots plus one truncated capture that shows only the
+//     halt.) Both states are "no data", reached by two different routes.
+//   * No boot has ever re-armed or recovered one: no `HALT-CLEAR`, no `ClearFeature`, and no token
+//     appearing twice in a boot.
+//
+// WHAT THEY ARE. Ports 1, 2 and 3 of the Broadcom hub `0a5c:4500` hold `05ac:820a`, `05ac:820b`
+// and `05ac:8286` — and that third one is the Bluetooth controller itself (bt-l0's census reads
+// `neps=3 eps=[IN1/int/16 IN2/blk/64 OUT2/blk/64]`, the canonical USB-BT event/ACL endpoint
+// layout). Two boot-protocol HID functions sitting beside an HCI function on one card is the
+// standard Bluetooth HID PROXY arrangement: card firmware presents a bonded BT keyboard/mouse as
+// a plain USB boot device so it works before any BT stack exists. Caveat, stated because it is
+// load-bearing and unproven: the corpus never dumps an interface descriptor for either, so the
+// classification rests on the topology, `class=0x00` + boot-protocol interfaces, and mps 8/4.
+//
+// SO `reports=0` IS NOT A FAULT. A HID proxy with nothing bonded to proxy is CORRECT when it
+// reports nothing, forever. The premise "these endpoints are broken and should not be armed"
+// is not established by the silence; the silence is what a working proxy with no peer looks like.
+//
+// THE THREE COSTS, PRICED:
+//
+//   * TT bandwidth — REFUTED BY THE TOPOLOGY. The proxies sit on `tt=(hub 3 port 1)`; the internal
+//     keyboard and trackpad sit on `tt=(hub 3 port 2)`. Different ports of a multi-TT hub means
+//     different transaction translators, so these endpoints take no bandwidth from the input path
+//     that matters. This cost does not exist.
+//   * An endpoint slot — real but not scarce: `MAX_INT_EPS` is 6 and this bench arms four.
+//   * Two halt lines per boot — real, and it WAS the genuine harm, because the old anonymous
+//     `STOP-NOTE (token ...)` made a third halt naming the real keyboard read as "the usual two".
+//     KBDFLAP already paid that off: every halt now carries `addr=`, `ep=`, `kind=` and `class=`,
+//     so the proxies' `class=xact-err-burn` is distinguishable at a glance from a `class=stall` on
+//     the internal keyboard. `halt_class` also marks the burn unrecoverable, so not one of the
+//     bounded `ClearFeature(ENDPOINT_HALT)` budget is ever spent on them.
+//
+// WHY NOT SKIP OR DEFER ANYWAY. Two readings of the future are both live and this arc cannot
+// settle either from inside the EHCI driver:
+//
+//   (a) A bonded BT keyboard arrives ON THIS PATH, and an unconditional skip silently deletes it.
+//   (b) UnaOS drives the card through raw HCI — the corpus shows exactly that, `HCI_RESET` x189,
+//       L2CAP and ATT toward a speaker — in which case the stack owns the link, the card firmware
+//       never populates its proxy, and the proxy can never produce a report no matter what is
+//       bonded. The TT answering ERR on every boot is consistent with (b), but consistent is not
+//       convicted.
+//
+// The asymmetry decides it. Under (b) the cost of leaving the arm in place is two identified log
+// lines and one of six slots. Under (a) the cost of removing it is a keyboard that never works,
+// with the arm gone and therefore no witness to say why. A cheap, reversible, fully instrumented
+// wrong answer beats an expensive silent one.
+//
+// A gate on "does a bonded HID peer exist" is the shape that would actually be right, and it is
+// NOT AVAILABLE HERE: it needs a seam between the BT stack and this arm path, which is outside
+// this file's lane and squarely inside the BT bond-persistence arc's. The experiment that settles
+// (a) vs (b) belongs to that arc too — bond a real BT keyboard, then read whether the keystrokes
+// surface on `05ac:820a` or on HCI. Until that runs, nothing here changes.
+//
+// THE WITNESS. No new code was needed for it: KBDWIT-LATCH gives these two endpoints a record in
+// both of their observed states, which is precisely what was missing. On the 37 boots they burn
+// out they now emit `SILENCE-CUT-BY-HALT ... class=xact-err-burn` plus a `dead=1` roster dump; on
+// the 3 boots they sit Active they already emitted the ordinary dump. Either way `reports_prior=0`
+// is on the line, and this comment says what that zero means.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // KBDWIT — the one-shot, per-endpoint EHCI interrupt-silence witness.
@@ -11587,9 +15106,13 @@ impl Controller {
 // event but two, and they mean opposite things:
 //   * A CLEAN retirement (`tok & QTD_ERR_MASK == 0`) prints `SILENCE-BROKE`. The endpoint answered.
 //   * A HALT (transaction error, babble, data-buffer error — the classes `QTD_ERR_MASK` covers)
-//     prints `SILENCE-ENDED-HALTED`, from inside the same block that emits `STOP-NOTE` and retires
-//     the endpoint. The silence ended, but it ended in a fault, and that is NOT the healthy row of
-//     the table below.
+//     prints `SILENCE-ENDED-HALTED`, from inside the same block that emits `STOP-NOTE`. The
+//     silence ended, but it ended in a fault, and that is NOT the healthy row of the table below.
+//     KBDFLAP note: that block no longer always retires the endpoint — a `class=stall` halt inside
+//     its clear budget is recovered and the endpoint keeps running — so read the STOP-NOTE's own
+//     `-> clear-halt`/`-> retire` verdict, and the `HALT-CLEAR` line beside it, for which happened.
+//     `SILENCE-ENDED-HALTED` still latches either way: it reports how the silence ended, not what
+//     the driver did about it.
 // They share one latch and sit on opposite sides of the error test, so exactly one of them can ever
 // print for a given endpoint. The split is not cosmetic: emitted from a single site above that test
 // — as the first cut of this was — a halt would have printed `SILENCE-BROKE` and read as "the
@@ -11641,6 +15164,43 @@ impl Controller {
 //     `walks=` then says whether the controller had been transacting right up to the halt. This
 //     row does NOT belong to the healthy case above and must never be counted as one.
 //
+// ── KBDWIT-LATCH (2026-08-21): THE TWO ROWS THAT COULD NOT PRINT ──────────────────────────────
+//
+// Every row above assumes the instrument gets to run. Boot 10 is the boot where it did not, and
+// the table had no row for what actually happened because the code had no path to it:
+//
+//   [   1823ms] M2 armed keyboard addr=8 ep=IN3 mps=10 interval=8 (boot protocol)
+//   [   2444ms] STOP-NOTE interrupt endpoint halted (token 0x000a8d42)
+//   [  15219ms] dump: addr=5 kbd, addr=6 boot-mouse, addr=8 vendor-mt.  <- three. Not the keyboard.
+//
+// Two independent gates, both failing closed, both on the fault path:
+//
+//   1. `kbdwit_note_silence_end` opens `if !e.kbdwit_fired { return; }`, and on boot 10 the latch
+//      had not fired: the deadline is `KBDWIT_QUIET_MS` of silence but it is only OBSERVABLE on a
+//      service pass, and the early main loop was sparse enough that the surviving endpoints read
+//      `polls=8` at 15219 ms. The halt beat the dump by 12.8 s, so the halt exit printed nothing.
+//   2. `service()` skipped `dead` entries before the probe could run, so once retired the endpoint
+//      left KBDWIT's record entirely, and its absence was byte-identical to never having been
+//      armed. The dump's `dead={}` field had been on line 1 since KBDWIT-1 and could not once,
+//      on any boot, have printed a `1`.
+//
+// The instrument built for "armed and silent" was therefore structurally silent on the only boot
+// that showed the symptom, and its silence read as an acquittal. An instrument's silence is
+// evidence ONLY if the instrument can execute in the state it reports on.
+//
+//   * `SILENCE-CUT-BY-HALT` — the endpoint halted BEFORE it ever reached its silence deadline, so
+//     there is no dump to pair with and there never will be. `short_by_ms` is how much of the
+//     deadline it never got to serve (boot 10: quiet 621 ms of a 4000 ms deadline, short by 3379).
+//     `polls=`/`walks=` are raw and there is deliberately no `sched=` word — see
+//     `kbdwit_note_halt` for why a verdict off a handful of samples would be a claim, not evidence.
+//     Pairs with the `STOP-NOTE` immediately below it by `class=` and `tok=`, not just timestamp.
+//   * dump with `dead=1` — a retired endpoint, dumped at its deadline anyway from the `dead` arm
+//     of the loop, so the roster is complete. `last_ms=` is when it died; `sched=` describes its
+//     ARMED lifetime, because the sampler stops at retirement, and reads `NOT-SAMPLED` if it never
+//     survived a single ACTIVE poll. This row is not a fault by itself — the two BT-proxy
+//     endpoints reach it on the boots where they burn out — it is the roster entry whose ABSENCE
+//     was the defect.
+//
 // WHY PER-ENDPOINT, NOT PER-CONTROLLER. During the failure the trackpad is streaming on the SAME
 // controller, so any controller-level "is anything completing?" test reads HEALTHY on the exact
 // boot that motivated this instrument. The silence clock lives on `IntEp` and is stamped only by
@@ -11649,9 +15209,17 @@ impl Controller {
 // BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
 // most `MAX_INT_EPS` (6) per controller for a whole boot. `kbdwit_broke` latches the same way, so
 // KBDWIT-2 adds at most one further line per endpoint per boot — eight lines, once, per endpoint,
-// for the entire boot. No loop, no retry, no wait, no allocation, no register write — every access
+// for the entire boot. KBDWIT-LATCH adds `kbdwit_cut`, a THIRD independent one-shot, for a ceiling
+// of nine; it is a separate latch and not a third user of `kbdwit_broke` because with KBDFLAP's
+// bounded halt recovery in the path one endpoint can legitimately be cut short, be cleared,
+// re-armed, go quiet, dump, and only then break its silence — sharing a latch would drop whichever
+// of those came second, which is the same failure mode this arc exists to close. Making the probe
+// reachable from the `dead` arm raises no ceiling at all: it is the SAME `kbdwit_fired` one-shot,
+// merely no longer unreachable for endpoints that die before their deadline.
+// No loop, no retry, no wait, no allocation, no register write — every access
 // below is a read. Cost on the service path is one bool test plus one `ms()` read before the
-// deadline, and one bool test after it fires; KBDWIT-2's sampler adds two volatile reads of
+// deadline, and one bool test after it fires; a retired endpoint costs one bool test per pass and
+// stops reading its overlay entirely once dumped. KBDWIT-2's sampler adds two volatile reads of
 // already-mapped DRAM plus a compare per endpoint per pass, on the ~1 kHz poll, and its counters
 // saturate rather than wrap. Note the
 // path this rides is `service()`, the POST-boot main-loop poll — NOT the `init()` bring-up block
@@ -11736,6 +15304,116 @@ fn kbdwit_pid(tok: u32) -> &'static str {
     }
 }
 
+/// KBDWIT-LATCH — the halt exit, both sides of the deadline. The service loop's `QTD_ERR_MASK`
+/// block calls THIS, never `kbdwit_note_silence_end` directly.
+///
+/// ### The gap this closes
+///
+/// `kbdwit_note_silence_end` opens with `if !e.kbdwit_fired { return; }`, and that guard is
+/// correct for what it guards: `SILENCE-BROKE` means *"the endpoint the deadline dump declared
+/// silent has now answered"*, so with no dump there is no silence to break, and a keyboard that
+/// simply works must not print a line on its first report. But the halt exit was routed through
+/// the same guard, and a halt is not a report. The result was an instrument that went silent in
+/// exactly the state it was built to describe:
+///
+/// ```text
+///   [   1823ms] M2 armed keyboard addr=8 ep=IN3 mps=10          <- the internal keyboard
+///   [   2444ms] STOP-NOTE interrupt endpoint halted (0x000a8d42) <- retired, 621 ms later
+///   [  15219ms] KBDWIT dump: addr=5, addr=6, addr=8/vendor-mt    <- three endpoints. Not this one.
+/// ```
+///
+/// The deadline is `KBDWIT_QUIET_MS` of silence, but it can only be OBSERVED on a service pass,
+/// and on boot 10 the early main loop was sparse enough that the three surviving endpoints show
+/// `polls=8` at 15219 ms. So the halt beat the dump by 12.8 s, `kbdwit_fired` was false, and the
+/// halt exit returned without printing. Every word about that keyboard's death came from
+/// `STOP-NOTE` — which at the time carried a bare token and named no endpoint at all.
+///
+/// ### What it prints, and why not simply reuse `SILENCE-BROKE`'s line
+///
+/// Post-deadline the call is forwarded verbatim, so `SILENCE-ENDED-HALTED` keeps its exact text,
+/// its exact field list and its exact meaning; captures already in the corpus stay comparable.
+/// Pre-deadline gets a NEW verdict word, `SILENCE-CUT-BY-HALT`, on its own line, for two reasons:
+///
+///   * The facts differ. There is no dump to pair with, and the quantity the reader wants is not
+///     "how long was it silent" alone but "how much of the deadline it never got to serve" —
+///     `deadline_ms` and `short_by_ms`, which have no place on the post-deadline line because
+///     there they are zero by construction.
+///   * `polls=`/`walks=` are printed RAW and NO `sched=` verdict word is emitted. On this path the
+///     sample is short by construction — boot 10's keyboard lived 621 ms across a loop that
+///     managed 8 polls in 13.5 s — and `WALKED`/`NOT-WALKED` off a handful of samples would be the
+///     unfalsifiable-conviction failure the probe's own section comment argues against. The counts
+///     are evidence; the word would have been a claim.
+///
+/// `class=` repeats `halt_class`'s verdict so this line and its `STOP-NOTE` can be paired by more
+/// than a timestamp, and `tok=` is raw beside the decoded bits so the class is re-derivable
+/// without trusting either line.
+///
+/// ### What `quiet_ms` and `short_by_ms` are NOT
+///
+/// `now_ms` is the service pass that OBSERVED the halt, not the microframe the controller halted
+/// in. This driver has no interrupt on the path — the halt is discovered by polling — so both
+/// derived spans are upper bounds on the endpoint's true survival time, and the slack is however
+/// long the main loop took to come back round. The corpus makes that gap visible rather than
+/// theoretical: the two BT-proxy endpoints halt at essentially the same instant on every boot, yet
+/// their `STOP-NOTE` timestamps range from 2778 ms to 23244 ms across the captures, tracking how
+/// long each build took to reach its run loop and nothing about the endpoints at all. The bound
+/// still convicts in the direction that matters here — an endpoint reported as cut short WAS cut
+/// short — but no arithmetic on these two fields may be presented as a latency measurement.
+#[cfg(feature = "kbdwit")]
+unsafe fn kbdwit_note_halt(e: &mut IntEp, idx: usize, tok: u32) {
+    if e.kbdwit_fired {
+        kbdwit_note_silence_end(e, idx, "SILENCE-ENDED-HALTED", tok);
+        return;
+    }
+    if e.kbdwit_cut {
+        return;
+    }
+    e.kbdwit_cut = true;
+    let now = crate::arch::ms();
+    let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+    // `quiet_ms` is measured from ARMED, not from `kbdwit_last_ms`, and that is forced rather than
+    // chosen: the service loop stamps `kbdwit_last_ms = ms()` unconditionally on any retired qTD,
+    // ABOVE the `QTD_ERR_MASK` test that reaches this function, so by the time we are called it
+    // already holds THIS halt's own timestamp and a `now - last` would print 0 on every line. The
+    // previous activity instant is simply not recoverable at this call site. `armed_ms` is the
+    // only honest origin left, and it is the same origin `kbdwit_note_silence_end` prints
+    // `quiet_ms` from, so the two lines stay directly comparable. On the endpoint this was built
+    // for the two agree anyway — boot 10's keyboard had completed nothing at all, so armed IS the
+    // last activity: 2444 - 1823 = 621 ms, and `reports_prior=0` on the line says as much.
+    let quiet = now.wrapping_sub(e.kbdwit_armed_ms);
+    let (class, _) = halt_class(tok);
+    serial_println!(
+        ":: KBDWIT: [{}] ep=IN{} addr={} kind={} SILENCE-CUT-BY-HALT class={} tok={:#010x} cerr={} halted={} xact={} babble={} dbuf={} missed={} err={} rem={} armed_ms={} now_ms={} quiet_ms={} deadline_ms={} short_by_ms={} polls={} walks={} split_or={:#018x} reports_prior={} toggle={} == witness ::",
+        idx,
+        (chars >> 8) & 0xF,
+        chars & 0x7F,
+        int_ep_kind(e),
+        class,
+        tok,
+        (tok >> 10) & 0x3,
+        (tok >> 6) & 1,
+        (tok >> 3) & 1,
+        (tok >> 4) & 1,
+        (tok >> 5) & 1,
+        (tok >> 2) & 1,
+        tok & 1,
+        (tok >> 16) & 0x7FFF,
+        e.kbdwit_armed_ms,
+        now,
+        quiet,
+        KBDWIT_QUIET_MS,
+        KBDWIT_QUIET_MS.saturating_sub(quiet),
+        e.kbdwit_polls,
+        e.kbdwit_walks,
+        e.kbdwit_split_or,
+        e.reports,
+        // ISRARM: the toggle moved to the shared registry — see `IsrEp::toggle`. Read here rather
+        // than dropped, because a dump whose fields quietly stopped covering the endpoint's state
+        // would be a worse instrument than one that never had the field.
+        isr_toggle_of(e) as u8,
+    );
+}
+
 /// KBDWIT — decode a QH's endpoint-speed field (`ep_chars` bits 13:12, EHCI 1.0 §3.6.2).
 #[cfg(feature = "kbdwit")]
 fn kbdwit_eps(chars: u32) -> &'static str {
@@ -11807,13 +15485,41 @@ unsafe fn kbdwit_note_silence_end(e: &mut IntEp, idx: usize, verdict: &str, tok:
         e.kbdwit_walks,
         e.kbdwit_split_or,
         e.reports,
-        e.toggle as u8,
+        // ISRARM: the toggle moved to the shared registry — see `IsrEp::toggle`. Read here rather
+        // than dropped, because a dump whose fields quietly stopped covering the endpoint's state
+        // would be a worse instrument than one that never had the field.
+        isr_toggle_of(e) as u8,
     );
 }
 
-/// KBDWIT — the probe. Called from the service loop for an endpoint whose qTD is STILL ACTIVE
-/// (nothing completed this pass); dumps once and latches. See the section comment above for the
-/// observation this exists for, its bounds, and the honesty argument for each field.
+/// KBDWIT — the probe. Dumps once per endpoint per boot and latches. See the section comment above
+/// for the observation this exists for, its bounds, and the honesty argument for each field.
+///
+/// ### Two callers, and why the second one is the whole of KBDWIT-LATCH
+///
+/// 1. The service loop's ACTIVE arm — an endpoint whose qTD has not completed this pass. The
+///    original and only caller.
+/// 2. The service loop's `dead` arm — an endpoint that was armed and has since been RETIRED.
+///
+/// The `dead` case is not an extension, it is a repair. The dump's own line 1 has always carried a
+/// `dead={}` field, which is a written admission that the state exists and matters; but the loop
+/// skipped `dead` entries before ever reaching this function, so `dead=1` was unprintable and that
+/// field could only ever emit `0`. It was decoration of exactly the kind the `sched=` note below
+/// refuses to keep. Worse than decoration: it made the dump's ROSTER lie by omission. On boot 10
+/// the dump listed the three endpoints that were still alive at 15219 ms, and the internal
+/// keyboard — armed at 1823 ms, retired at 2444 ms — was simply not in it, indistinguishable in
+/// the media from a keyboard that was never armed at all.
+///
+/// Everything this function reads stays valid on a retired endpoint: `dead` stops the loop
+/// consuming completions, it does not unlink the QH from the periodic list, free the qTD, or touch
+/// the buffers. So the QH words, the frame-list linkage check and the FRINDEX samples all still
+/// describe the controller's real state — the state the endpoint died in.
+///
+/// What the `dead` path does NOT preserve is the sampler. `kbdwit_polls`/`kbdwit_walks` are only
+/// incremented on the ACTIVE arm, so on a retired endpoint they are frozen at the moment of
+/// retirement and describe its armed lifetime, not the instant of the dump. That is honest but it
+/// is not obvious, and it is why `sched=` gains a `NOT-SAMPLED` arm below; `polls=` on the line is
+/// what keeps a short sample from reading as a long one.
 #[cfg(feature = "kbdwit")]
 unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const u32, seen: u32) {
     // One-shot, cheapest test first: after the single dump this endpoint will ever emit, the whole
@@ -11882,14 +15588,10 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     let live = if om { ovl2 } else { qtok };
     let addr = chars & 0x7F;
     let epn = (chars >> 8) & 0xF;
-    let kind = match e.layout {
-        Some(l) if l.vendor_mt => "vendor-mt",
-        Some(l) if l.relative => "rptr-rel",
-        Some(_) => "rptr-abs",
-        None if e.is_kbd => "kbd",
-        None if e.is_rel_mouse => "boot-mouse",
-        None => "unknown",
-    };
+    // KBDFLAP: this match moved to `int_ep_kind` so the halt STOP-NOTE and this dump cannot drift
+    // apart in their vocabulary — a reader joining `kind=kbd` across the two lines is joining the
+    // same function's output, not two copies of it. Strings are unchanged.
+    let kind = int_ep_kind(e);
 
     // 1/7 — the header. NO VERDICT WORD: `NO-COMPLETIONS` is a fact, and `class=` distinguishes
     // "never completed anything" from "completed, then stopped" WITHOUT asserting which of those
@@ -11916,23 +15618,41 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
     //   sched=NOT-WALKED thousands of polls and the controller never touched the QH's split
     //                    progress. A host-side fault, convicted without anyone pressing a key.
     //
-    // There is deliberately NO third arm for "not sampled yet". The obvious safety valve — a
-    // `polls == 0` case, so a missing measurement could never masquerade as a conviction — was
-    // written, and a `strings` pass over the built rlib showed the compiler had deleted it: the
-    // sampler runs on the SAME service pass, immediately above the call to this probe, so
-    // `polls >= 1` holds by construction at every reachable entry (and `saturating_add` means it
-    // can never return to zero). A branch that cannot print is a branch a reader will one day trust
-    // as coverage, so it is gone rather than left as decoration. `polls=` is on the line regardless,
-    // which is what actually guards against reading a small sample as a verdict.
+    // KBDWIT-LATCH RESTORES THE THIRD ARM, because this arc made it reachable. It was written
+    // once, and deleted with a reason recorded here: a `strings` pass over the built rlib showed
+    // the compiler had folded it away, since the sampler ran on the SAME service pass immediately
+    // above the only call to this probe, so `polls >= 1` held by construction at every reachable
+    // entry. That argument was sound and is now void. This probe has a SECOND caller — the `dead`
+    // branch of the service loop — and it reaches an endpoint that is no longer sampled at all,
+    // whose `kbdwit_polls` froze at whatever it had when the endpoint was retired. Boot 10 makes
+    // the hazard concrete rather than theoretical: the internal keyboard was armed at 1823 ms and
+    // halted at 2444 ms, across an early main loop that managed 8 polls in 13.5 s, so its frozen
+    // count is plausibly zero — and `sched=NOT-WALKED` off zero samples is a host-side conviction
+    // drawn from no evidence, in the one dump a reader would take most seriously.
+    //
+    //   sched=NOT-SAMPLED no ACTIVE poll was ever taken on this endpoint. Says nothing about the
+    //                     controller, which is the point: it is the refusal to convict.
+    //
+    // `WALKED`/`NOT-WALKED` keep their exact meanings and their exact trigger conditions, so a
+    // live endpoint's dump is byte-identical to what it was and old captures stay comparable —
+    // `polls == 0` simply cannot arise on that path. `polls=` remains on the line regardless,
+    // which is what guards against reading a SMALL sample (the dead path's other, unavoidable
+    // weakness) as a verdict.
     serial_println!(
         ":: KBDWIT: [{}] ep=IN{} addr={} kind={} NO-COMPLETIONS class={} sched={} polls={} walks={} split_or={:#018x} quiet={}ms armed_ms={} last_ms={} now_ms={} reports={} toggle={} dead={} == witness ::",
         idx, epn, addr, kind,
         if e.kbdwit_last_ms == 0 { "never-completed" } else { "went-quiet" },
-        if e.kbdwit_walks > 0 { "WALKED" } else { "NOT-WALKED" },
+        if e.kbdwit_polls == 0 {
+            "NOT-SAMPLED"
+        } else if e.kbdwit_walks > 0 {
+            "WALKED"
+        } else {
+            "NOT-WALKED"
+        },
         e.kbdwit_polls, e.kbdwit_walks, e.kbdwit_split_or,
         now.wrapping_sub(since),
         e.kbdwit_armed_ms, e.kbdwit_last_ms, now,
-        e.reports, e.toggle as u8, e.dead as u8,
+        e.reports, isr_toggle_of(e) as u8, e.dead as u8,
     );
     // 2/7 — the token, raw, from all three vantage points (see the honesty note on `seen=`).
     // `qtd_driven=0` marks `qtd_tok` as NOT DRIVEN: on the overlay-direct path the controller is
@@ -11972,7 +15692,14 @@ unsafe fn kbdwit_probe(e: &mut IntEp, idx: usize, om: bool, op: u64, fl: *const 
         (chars >> 16) & 0x7FF, kbdwit_eps(chars), (chars >> 14) & 1,
         caps & 0xFF, (caps >> 8) & 0xFF, (caps >> 16) & 0x7F, (caps >> 23) & 0x7F,
         (caps >> 30) & 3,
-        e.buf_phys, e.qtd_phys, fl0,
+        // ISRARM: read out of the registry rather than a per-endpoint copy — the registry holds the
+        // addresses the re-arm actually programs, and this dump exists to be compared against what
+        // the controller is executing. A stale second copy here would make the probe agree with
+        // itself while disagreeing with the hardware, which is the one failure a witness must not
+        // have.
+        ISR_EPS[e.isr_slot].buf_phys.load(Ordering::Relaxed),
+        ISR_EPS[e.isr_slot].qtd_phys.load(Ordering::Relaxed),
+        fl0,
     );
     // 6/7 — controller state. `ok=0` means the MMIO read itself failed and the hex is a
     // placeholder, NOT a set of clear status bits.
@@ -12456,6 +16183,20 @@ unsafe fn decode_boot_keyboard(
         }
     }
 
+    // PRTSCR: the Print Screen press edge — the SAME shared predicate the xHCI decoder asks, for the
+    // same reason the lock keys share a table: a key is a key whichever controller carried it. This
+    // is the path that matters on the bench, because the rMBP's INTERNAL keyboard is on EHCI.
+    //
+    // Asked here, BEFORE `*prev_keys = cur_keys` below, so the diff is against the previous report.
+    // We are inside `service()` holding `EHCI_HID`, so this does exactly one thing — set a flag. The
+    // capture runs on the device-service pass; a filesystem write from in here would contend the
+    // xHCI storage loan from inside the EHCI pass and hold the keyboard and trackpad hostage for
+    // seconds, which is the argument `holocron`'s deferred write already makes at its call site.
+    if super::xhci::hid_print_screen_edge(&cur_keys, prev_keys) {
+        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::");
+        crate::video::prtscr::request();
+    }
+
     *prev_keys = cur_keys;
     // ALLKEYS: remember this accepted report's modifier byte, so a later endpoint-death flush can
     // resolve each stranded key to the same shifted ascii its press produced. Updated ONLY here —
@@ -12470,9 +16211,17 @@ unsafe fn decode_boot_keyboard(
 /// THE ONE ASYMMETRIC LOSS. [`decode_boot_keyboard`]'s poll-gap argument is sound and covers every
 /// case where reports keep flowing: a release the driver did not fetch is re-read from the next
 /// report's level. It says nothing about the endpoint being RETIRED. `service_ehci_hid` sets
-/// `e.dead = true` on `tok & QTD_ERR_MASK` (the `STOP-NOTE interrupt endpoint halted` line) and
-/// thereafter skips that entry for the rest of the boot — there is no next report, so a key held at
-/// that instant is stranded in ring 3 forever.
+/// `e.dead = true` on a halt it cannot recover from (the `STOP-NOTE interrupt endpoint halted`
+/// line, `-> retire`) and thereafter skips that entry for the rest of the boot — there is no next
+/// report, so a key held at that instant is stranded in ring 3 forever.
+///
+/// KBDFLAP narrowed which halts reach here, and deliberately did NOT widen what this function is
+/// called for. A `class=stall` halt inside its clear budget is answered by
+/// `ClearFeature(ENDPOINT_HALT)` and a re-arm, so reports keep flowing and the poll-gap argument
+/// above covers the gap on its own; calling this there would be wrong twice over, because it also
+/// bumps `pal::note_keyboard_detached()` and that keyboard is not detached. Only the two outcomes
+/// that really do end the endpoint — an unrecoverable class, and a clear the device REFUSED —
+/// call it, so its contract is unchanged: every invocation is still an endpoint death.
 ///
 /// AND RING 3 CANNOT SAVE ITSELF FROM IT. `user-vug`'s `H_SAW_KEYUP` belt is deliberately ONE-WAY:
 /// once any release has been seen the pause-retire stops firing for the life of the process. So a
@@ -13468,12 +17217,22 @@ unsafe fn pci_evidence(bus: u8, dev: u8, func: u8, idx: usize) {
 /// flip / xhci::init (the internal HID sit on non-switchable EHCI-only ports, so the two
 /// stacks' port sets are disjoint by hardware — PORTSW-1 §7f).
 pub fn init() {
-    serial_println!(":: EHCI-HID: begin (EHCI-3 driver, polling model, knob-gated) ::");
+    serial_println!(
+        ":: EHCI-HID: begin (EHCI-3 driver, polled model + ISRARM completion interrupt, knob-gated) ::"
+    );
     // EPACE: the module's own entry→exit span — the self-check target for the per-phase split.
     let init_t0 = crate::arch::now_cycles();
     // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
     // report-parser is bounded against a hostile Report Count before we enumerate anything.
     unsafe { parser_selftest() };
+    // ISRARM: and the completion-interrupt half, for a blunter reason — on QEMU the interrupt CANNOT
+    // fire. QEMU's `hcd-ehci` exposes no PCI capability list at all, so `isr_arm_controller` refuses
+    // MSI and the entire ISR body would otherwise be dead code in every automated gate this repo
+    // runs. An instrument that cannot fire in the state it exists for is not a cheaper guard, it is
+    // an absent one, and the same is true of the mechanism under it. This fixture drives the real
+    // `isr_service_ep` against a hand-built completion so the ISR path is exercised on every boot,
+    // QEMU included. See `isr_selftest`.
+    unsafe { isr_selftest() };
     let selftest_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
     let mut ctrls: Vec<Controller> = Vec::new();
     // BUY-1 (GR18): the port walk moved out of this loop into a second pass, so each woken
@@ -14037,6 +17796,17 @@ pub fn init() {
 
     let n = ctrls.len();
     let armed: usize = ctrls.iter().map(|c| c.int_eps.len()).sum();
+    // ISRARM — arm the completion interrupt, LAST, and only on controllers that actually armed a
+    // HID endpoint. Last because everything the ISR reads must already exist: every endpoint is
+    // published into `ISR_EPS`, every QH is linked, PSE is on. A controller with no armed endpoint
+    // gets nothing — there would be no completion to serve and the vector would only cost the
+    // machine interrupts to acknowledge.
+    for c in ctrls.iter() {
+        if c.int_eps.is_empty() {
+            continue;
+        }
+        unsafe { isr_arm_controller(c.idx, c.bus, c.dev, c.func, c.op) };
+    }
     *EHCI_HID.lock() = Some(ctrls);
     serial_println!(
         ":: EHCI-HID: end ({} controllers, {} HID endpoints armed) ::",
@@ -14067,11 +17837,22 @@ fn bt_request_retrigger(source: u32) {
 /// Main-loop service hook (the EHCI analogue of `service_hubs`): poll every armed HID endpoint,
 /// decode + deliver completed reports, re-arm. Cheap when nothing completed.
 pub fn service_ehci_hid() {
+    // DEADMAN — `[deadman] pmp=`. Stamped at ENTRY, above the `EHCI_HID.lock()` and above the
+    // `is_none()` early return, because the question it answers is "did anything call the poll",
+    // not "did the poll find a controller". This is the term that stops `hid=0` from being misread
+    // as "the input hardware went dead" when what actually happened is that the `x86_usb_pump` task
+    // stopped running — the difference between a bad bug and a much worse one.
+    crate::deadman::note_hid_poll();
     let mut g = EHCI_HID.lock();
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() };
     }
+    // ISRARM: the completion interrupt's own rollup, and its DEAD verdict. Emitted from here — the
+    // polled pass — and never from the ISR, which does not print at all. Placed after the walk so a
+    // line reports the state the pass just left the endpoints in, and outside it so it is charged
+    // once per pass rather than once per controller.
+    isr_rollup(crate::arch::ms());
     // BT-RETRY: drain a pending re-trigger AFTER the service pass, still under the `EHCI_HID` lock,
     // so the chain runs serialized against every controller's service exactly as the boot chain did.
     // One chain per pass; the first controller that claimed a radio owns it.

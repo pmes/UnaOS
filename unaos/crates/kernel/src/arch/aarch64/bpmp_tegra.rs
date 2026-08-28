@@ -513,6 +513,20 @@ pub fn jb5_pg_on(chan: &Chan, ids: &super::fdt_tegra::XusbIds) -> bool {
 /// an otherwise-powered partition shows as `=0`. If every clock reads `=1` while CPUCTL stays
 /// 0xffffffff, clock-gating is RULED OUT — the Falcon core is held in reset, not unclocked. Runs at
 /// raw handoff (before jb1c re-enables anything) so it reports the state UEFI actually left.
+/// TEGRA-SD CLKPROOF: the two MRQ_CLK verbs the SDMMC clock-proof rung needs, public so
+/// `sdmmc_tegra` can prove the core clock live before touching the vendor register block
+/// (the boot-4e EL3 SError window: 8 reads at base+0x100..0x1e4 with the clock state unproven).
+/// Same wire shapes as jb1c's ENABLE and jb7's IS_ENABLED — nothing new on the bus.
+pub fn clk_is_enabled(chan: &Chan, id: u32) -> Option<(i32, u32)> {
+    chan.transfer(MRQ_CLK, &[(CMD_CLK_IS_ENABLED << 24) | (id & 0x00ff_ffff)])
+        .map(|(err, out)| (err, out[0]))
+}
+
+/// TEGRA-SD CLKPROOF: MRQ_CLK CMD_CLK_ENABLE for one id; Some(err) on an answer, None on timeout.
+pub fn clk_enable(chan: &Chan, id: u32) -> Option<i32> {
+    chan.transfer(MRQ_CLK, &[(CMD_CLK_ENABLE << 24) | (id & 0x00ff_ffff)]).map(|(err, _)| err)
+}
+
 pub fn jb7_clocks_query(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
     let query = |id: u32, tag: &str| {
         match chan.transfer(MRQ_CLK, &[(CMD_CLK_IS_ENABLED << 24) | (id & 0x00ff_ffff)]) {
@@ -535,3 +549,24 @@ pub fn jb7_clocks_query(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
     }
 }
 
+/// JD1-DC (`jd1dc`, default OFF): the read-only power-state query the nvdisplay probe's guard is
+/// built on — MRQ_PG `CMD_PG_GET_STATE` for ONE domain id, returning `Some((err, state))` with
+/// `state == PG_STATE_ON (1)` meaning the partition is powered. A pure query: zero mutation, the
+/// same wire shape `jb5_pg_on` already proves on metal, just per-id so the caller can name the
+/// domain that refused.
+///
+/// This exists because a read of a POWER-GATED Tegra block is EL3-FATAL (the JX1 event: SError
+/// `ESR 0xbe000011`, EC=0x2F, NVIDIA's BL31 printing "Unhandled Exception in EL3") — so the display
+/// aperture may not be touched at all until the CCPLEX has been told, by the only authority that
+/// knows, that the domain is ON. There is no CAR/clock register path the CPU could ask instead:
+/// on Tegra234 the DISP domain, its ~60 clocks and its 4 resets are BPMP's alone, over HSP+IVC.
+/// That makes this query not belt-and-braces but the ONLY way to earn the first read.
+///
+/// The counterpart `CMD_PG_SET_STATE` is deliberately NOT wrapped here. Powering the display domain
+/// on (or worse, cycling it) would tear down the live scanout UEFI handed us — the one thing the
+/// whole JD1 inheritance is built on — and is unrecoverable for that boot. The probe reads or
+/// refuses; it never powers anything.
+#[cfg(feature = "jd1dc")]
+pub fn pg_get_state(chan: &Chan, id: u32) -> Option<(i32, u32)> {
+    chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]).map(|(err, out)| (err, out[0]))
+}

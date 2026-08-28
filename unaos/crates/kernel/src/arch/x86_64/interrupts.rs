@@ -41,6 +41,11 @@ pub const NIC_MSI_VECTOR: u8 = 0x41;
 /// Inter-processor interrupt vector (reschedule/wake; scheduler foundation). 0x41 is reserved
 /// for the NIC, so IPIs use 0x42.
 pub const IPI_VECTOR: u8 = 0x42;
+/// EHCI HID completion interrupt (ISRARM). 0x40-0x42 are taken by the xHCI, the NIC and IPIs, so
+/// the EHCI functions share 0x43 — both of them, deliberately: MSI carries no cause, the handler
+/// acknowledges every armed controller's USBSTS anyway, and a second vector would buy nothing but
+/// another IDT entry. See `drivers::ehci`'s ISRARM block.
+pub const EHCI_MSI_VECTOR: u8 = 0x43;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
 lazy_static! {
@@ -97,6 +102,11 @@ lazy_static! {
         idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
         idt[NIC_MSI_VECTOR].set_handler_fn(nic_msi_handler);
+        // ISRARM: the EHCI HID completion vector. Gated on the same feature as the driver that
+        // arms it, so a build without `ehcihid` carries neither the entry nor the handler — and
+        // therefore cannot be handed an interrupt it has no driver to service.
+        #[cfg(feature = "ehcihid")]
+        idt[EHCI_MSI_VECTOR].set_handler_fn(ehci_msi_handler);
         idt[IPI_VECTOR].set_handler_fn(ipi_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
         idt
@@ -414,6 +424,45 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     // EOI BEFORE any context switch: otherwise the in-service bit would block this CPU's
     // subsequent timer ticks for the whole descheduled lifetime of a preempted task.
     crate::arch::apic::eoi();
+    // DEADMAN — the once-per-second witness that survives a wedged render-service pass.
+    //
+    // POSITION IS LOAD-BEARING, both ends. AFTER `eoi()`: the emit is the longest thing this handler
+    // can do, and holding the in-service bit across it would block this core's own subsequent timer
+    // ticks — the instrument would suppress the very heartbeat it rides. BEFORE `timer_preempt()`:
+    // that call can switch away and not return for the descheduled lifetime of the task, so anything
+    // after it is not on the timer's clock at all, which is the entire property this witness exists
+    // to have.
+    //
+    // Steady-state cost on 999 of every 1000 ticks, on every core, is one relaxed load of the
+    // per-CPU index, one relaxed load of the deadline and one compare. `tick()` returns immediately
+    // on every core but the BSP (the only core that advances `APIC_TICKS`, hence the only one whose
+    // clock reading is the wall clock). A no-op inline shim when the knob is off.
+    crate::deadman::tick();
+    // WCSER-ISR (boot 13, 2026-08-22) — DRIVE THE OVERDUE PROBE FROM HERE, BESIDE DEADMAN, BECAUSE
+    // ITS OWN LOOP IS A WEDGE VICTIM.
+    //
+    // The probe's home was the head of `x86_input_service`'s loop, deliberately AHEAD of the event
+    // pump — boot 8B had shown the pump blocking into a wedged GUI and taking the probe's 5 s
+    // repeats with it. Boot 13 shows that was not far enough forward: the probe printed
+    // `PASS OVERDUE holder=c1 ... win=8 phase=33 row=792` exactly ONCE, at the crossing, and never
+    // again through 78 further seconds of hold, while `[wcser]`'s own rollup kept printing
+    // `held_ms=` from a different path. The whole input-service loop is a gate victim, not just its
+    // pump, so a probe anywhere inside it dies with the wedge it exists to report.
+    //
+    // This path demonstrably survives: DEADMAN emitted 111 consecutive lines through the same hold.
+    // What that buys is the one field the single boot-13 sample could not give — whether `row=`
+    // ADVANCES. A frozen row is one MMIO write that never returned; a crawling row is the same loop
+    // running at microscopic speed. Those have different causes and the wire could not tell them
+    // apart.
+    //
+    // Cost on 999 of every 1000 ticks is what `wcser_overdue_probe` already charges at its head:
+    // BSP check, then one relaxed load of the holder and an early return while the gate is free.
+    // `serial_println!` is safe from an IRQ-masked context here for exactly the reasons
+    // `deadman::emit` documents above — `_print` is `try_lock`-only and cannot wait on anything.
+    #[cfg(feature = "witness")]
+    if crate::arch::percpu::this_cpu().cpu_index == 0 {
+        crate::video::wm::wcser_overdue_probe();
+    }
     // Preemption point. No-op unless a scheduled task is running on THIS cpu and its quantum
     // expired; runs with IF=0 (interrupt gate) and the preempted task's `iretq` restores its IF.
     crate::arch::sched::timer_preempt();
@@ -499,6 +548,28 @@ extern "x86-interrupt" fn xhci_msi_handler(_stack_frame: InterruptStackFrame) {
 /// deadlock. The interrupt's purpose is to wake the CPU from `hlt` so RX is serviced promptly.
 extern "x86-interrupt" fn nic_msi_handler(_stack_frame: InterruptStackFrame) {
     crate::drivers::e1000::interrupt_ack();
+    crate::arch::apic::eoi();
+}
+
+/// EHCI HID completion handler (ISRARM, IDT vector 0x43). **This one does real work, and that is
+/// the difference between it and the two handlers above** — the xHCI and NIC handlers exist only to
+/// wake the CPU from `hlt` and leave the ring to the polled context. Here the polled context IS the
+/// defect: an armed HID interrupt-IN endpoint holds exactly one report, so between the completion
+/// and the next service pass the endpoint is dark and the trackpad's reports are lost on the wire —
+/// up to 2390 of them in one metal boot, measured by EHCIDARK. Re-arming from the completion itself
+/// is the only place that window can be closed, so `interrupt_ack` lifts the report out and re-arms.
+///
+/// It is still bounded and still lock-free: no allocation, no printing, no `EHCI_HID` (the pass
+/// holds that `Mutex` across a `hw_wait_budget()` control transfer, so taking it here would
+/// self-deadlock exactly as the xHCI handler's comment warns), at most `ISR_MAX_EPS` endpoints, and
+/// a per-endpoint claim that is TRY-only in both directions and spins in neither. The full safety
+/// argument, field by field, is the ISRARM block in `drivers/ehci/mod.rs`.
+///
+/// EOI last, mirroring the other MSI handlers: the driver half must complete before the in-service
+/// bit is cleared, or a second completion could re-enter it on the same core mid-walk.
+#[cfg(feature = "ehcihid")]
+extern "x86-interrupt" fn ehci_msi_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::ehci::interrupt_ack();
     crate::arch::apic::eoi();
 }
 

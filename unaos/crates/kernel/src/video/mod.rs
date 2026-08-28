@@ -81,37 +81,37 @@ pub mod vperf;
 // `arch/x86_64/syscall.rs` plus symbol-string-table length. Measured, not assumed; see the `wc` knob
 // comment in `arroyo` for the hashes and the byte counts.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-pub mod wcx;
+pub mod desktop_uefi;
 // DOCK: the bottom strip — one tile per live window, INCLUDING the ones that are not on the panel,
 // and a press that raises and un-hides the window it names. Peter's ruling, white board Q10
 // (2026-08-09): "mac has had the dock forever so we should have a doc and all macos like
 // experience". A window switcher, not an app launcher — there is no app grid here and no second
 // launch path.
 //
-// PI-DESK — the gate is no longer `wcx`'s alone. It is **the x86 panel path (`UNAOS_WC=1`) OR the Pi
+// PI-DESK — the gate is no longer `desktop_uefi`'s alone. It is **the x86 panel path (`UNAOS_WC=1`) OR the Pi
 // panel path (`UNAOS_PIDESK=1`)**, and the two halves are independent: a knob-off aarch64 build
 // compiles nothing here and its `kernel8.img` stays BYTE-IDENTICAL, and x86 keeps exactly the `wc`
 // term it always had. Nothing in this module became arch-neutral by being compiled on a second arch
 // — it already was, bar one reach into `arch::x86_64::syscall` for focus, which is seamed at its own
-// call site the way `wm` seams `wcx`. The same gate is on `strip`, `menubar` and `crystal` below.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+// call site the way `wm` seams `desktop_uefi`. The same gate is on `strip`, `menubar` and `crystal` below.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod dock;
 // STRIPFACTOR: the furniture-strip PRIMITIVE — edge-anchored geometry with floors, the staged
 // row-run painter, the vacated-pixel erase, the damage slot, the cost ledger, and the TENANT
 // REGISTRY `wm::erase_clip` walks for occlusion citizenship. Peter's direction 2026-08-11: UnaOS is
 // a spatial game-engine OS and the desktop is one shell on it — "we will not always have a menu
 // bar" — so the kernel's contribution is the mechanism, not any particular strip. `dock` is tenant
-// #1 and `menubar` is tenant #2. Same gate as `dock` (PI-DESK: x86+`wc` OR aarch64+`pidesk`).
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+// #1 and `menubar` is tenant #2. Same gate as `dock` (PI-DESK: x86+`wc` OR aarch64+`desktop_firmware`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod strip;
 // MENUBAR: the top strip — tenant #2 of `strip`, and DEFAULT OFF. Inert chrome plus the focused
 // window's caption and a UTC clock; a press falls through, because opening menus belongs to the
 // renderer-agnostic menu PROTOCOL whose design ledger is at the foot of that file. Deleting it costs
 // one registry entry, one line of `strip::compose_all`, and this declaration. Same gate as `dock`
-// (PI-DESK: x86+`wc` OR aarch64+`pidesk`) — and DEFAULT OFF stays default off on the Pi too: Peter's
+// (PI-DESK: x86+`wc` OR aarch64+`desktop_firmware`) — and DEFAULT OFF stays default off on the Pi too: Peter's
 // "we will not always have a menu bar" is a runtime statement, and compiling the tenant does not
 // enable it.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod menubar;
 // CRYSTAL: the SHARD menu — UnaOS's first LIVE menu, hung off the brand crystal in the menu bar. A
 // kernel-owned SYSTEM menu (About This Shard · Sleep · Restart · Shut Down), not the renderer-agnostic
@@ -120,8 +120,8 @@ pub mod menubar;
 // arm lives in `arch/x86_64/syscall.rs::wc_click_route_at` — and, since PI-DESK, in
 // `arch/aarch64/syscall.rs::wc_click_route`, both through the ONE shared router
 // [`strip::press_route`] rather than two copies of the ordering rule. Same gate as
-// `dock`/`strip`/`menubar` (x86+`wc` OR aarch64+`pidesk`).
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+// `dock`/`strip`/`menubar` (x86+`wc` OR aarch64+`desktop_firmware`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod crystal;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
@@ -152,6 +152,14 @@ pub mod knurl;
 // on BOTH `wc` (it is a compositor client) and `instgui` (`UNAOS_INSTGUI=1`).
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
 pub mod instgui;
+
+// PRTSCR — the screen capture. `png` is the pure, kernel-dependency-free stored-deflate encoder (so
+// it is testable as a function on the host); `prtscr` is the panel read, the free-name search, the
+// FAT write, and the Print Screen key's deferred-work flag. Both are arch-neutral and ungated: the
+// capture and the `screenshot` verb work wherever there is a panel and a writable FAT volume, with
+// or without the compositor. Only the KEY hook is x86 today — see `prtscr`'s module note.
+pub mod png;
+pub mod prtscr;
 
 pub use framebuffer::FrameBuffer;
 pub use screen::Screen;
@@ -404,40 +412,40 @@ pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
 }
 
 // ── CONSWIN-PI / MENUBAR-PI ─────────────────────────────────────────────────────────────────────
-// The Pi's DESKTOP-READY seam — the aarch64 counterpart of `wcx`'s activation, and the module that
+// The Pi's DESKTOP-READY seam — the aarch64 counterpart of `desktop_uefi`'s activation, and the module that
 // finally claims `menubar`'s tenancy on this arch. Declared at the FILE TAIL, not beside its sibling
 // tenants above, for the reason this track has proved twice over: a `mod` line inserted higher up
 // renumbers every panic `Location` recorded below it in this file, and those records live in the
 // loadable image whose knob-off byte-identity is the Pi track's standing proof. Nothing is below
-// this, so nothing moves. `pidesk` off is a compile-time absence and the image never contains it.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
-pub mod pidesk;
+// this, so nothing moves. `desktop_firmware` off is a compile-time absence and the image never contains it.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+pub mod desktop_firmware;
 
 // ── PULSEWIN ────────────────────────────────────────────────────────────────────────────────────
 // The core-load instrument in a compositor WINDOW, whose menu switches between the Pi's LED lamp
-// face and the x86 app's ten-segment face. Gated like the furniture family — `wc` on x86, `pidesk`
+// face and the x86 app's ten-segment face. Gated like the furniture family — `wc` on x86, `desktop_firmware`
 // on the Pi — and deliberately NOT on an arch: it is experience-layer code with no hardware in it,
-// so it builds once and runs on every chip. Appended below `pidesk` for `pidesk`'s own reason, five
+// so it builds once and runs on every chip. Appended below `desktop_firmware` for `desktop_firmware`'s own reason, five
 // lines up: nothing is below this either, so nothing moves.
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
-    all(target_arch = "aarch64", feature = "pidesk")
+    all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 pub mod pulsewin;
 // ── QUARRY ──────────────────────────────────────────────────────────────────────────────────────
 // UnaOS's FILE MANAGER (Peter, 2026-08-17: "Tree on left and start with detailed list view on
 // right"). A kernel-owned compositor window over the VFS mount table — tree of the mounted volumes on
 // the left, name/size/modified list on the right, and the first scrolling anything in this tree has
-// had. Same gate as the furniture family above (x86 `wc` OR aarch64 `pidesk`) so BOTH arches
+// had. Same gate as the furniture family above (x86 `wc` OR aarch64 `desktop_firmware`) so BOTH arches
 // type-check it, with the implementation armed separately by `UNAOS_QUARRY=1`; see `quarry.rs` for
 // why the knob lives inside the module rather than on this line, and
 // `docs/dev/OS/05_USER_EXPERIENCE/quarry.md` for the design of record — including why it is a kernel
 // window today and exactly what the ring-3 port is waiting on.
 //
-// Declared BELOW `pidesk` for `pidesk`'s own reason, restated because it is the trap: a `mod` line
+// Declared BELOW `desktop_firmware` for `desktop_firmware`'s own reason, restated because it is the trap: a `mod` line
 // inserted higher up renumbers every panic `Location` recorded below it in this file. Nothing is
 // below this, so nothing moves, and a knob-off `kernel8.img` is byte-identical.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod quarry;
 
 // ── REALDESK — THE DESKTOP SCENE'S TENANCY OF THE BACKDROP ──────────────────────────────────────
@@ -450,7 +458,7 @@ pub mod quarry;
 // `ui_status` at all. So they were an aarch64-ONLY desktop, which is exactly what the ONE OS law
 // ("arch gates in the experience layer are defects") forbids, and they are what Peter is looking at.
 //
-// This latch is the retirement, and it is a RUNTIME one for the reason `pidesk::armed` is: the
+// This latch is the retirement, and it is a RUNTIME one for the reason `desktop_firmware::armed` is: the
 // tenants may only leave when something else has taken the glass. It is armed by `main.rs`'s render
 // service in the SAME statement as the backdrop hand-off (`pal.clear_screen(DESKTOP_BG)`), i.e. only
 // on the pass where `open_shell_window` actually returned a window. On a panel where that decline
@@ -467,7 +475,7 @@ pub mod quarry;
 // MEASURED rather than reasoned, as §5.3 requires: knob-off `kernel8.img` is
 // `2d9f9ab347106102ce2b4a26eca71c0e54970e875f5600de38b0e7264c81557d` with this arc applied and with
 // it reverted — same tree, same host, minutes apart, and stable across three consecutive rebuilds.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static DESKTOP_SCENE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// REALDESK — **the desktop scene has taken the backdrop; the legacy chrome tenants retire.**
@@ -480,7 +488,7 @@ static DESKTOP_SCENE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// capture can read the tiler's new bottom budget without inferring it — `bottom_reserved=104->64`
 /// on the 1920x1200 bench panel is the instrument band (92) plus the status line (12) giving way to
 /// the dock's own rows (`strip::PAD + dock::STRIP_H`), which is what still has to be kept clear.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn retire_desktop_chrome(pw: usize, ph: usize) {
     let before = crate::ui_status::chrome_h(ph);
     let was = DESKTOP_SCENE.swap(true, core::sync::atomic::Ordering::Release);
@@ -504,7 +512,7 @@ pub fn retire_desktop_chrome(pw: usize, ph: usize) {
 ///
 /// `Acquire` pairs with the setter's `Release` so a reader that sees `true` also sees the
 /// whole-panel `DESKTOP_BG` fill the same statement published.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn desktop_scene_owns_backdrop() -> bool {
     DESKTOP_SCENE.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -523,7 +531,7 @@ pub fn desktop_scene_owns_backdrop() -> bool {
 /// Stated as the dock's own two constants rather than as a number, and height-only because
 /// `chrome_h` is: the dock is unconditionally PRESENT (it is the console's only way back), so there
 /// is no arm in which the panel has a desktop and no dock to keep clear.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn dock_reserve_h() -> usize {
     strip::PAD + dock::STRIP_H
 }

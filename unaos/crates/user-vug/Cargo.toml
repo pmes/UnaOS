@@ -59,3 +59,16 @@ una-abi = { path = "../una-abi" }
 [features]
 pinlo = []
 pinhi = []
+
+# KVUG: Peter's ruling — the in-kernel software vug (unaos/crates/kernel/src/vug.rs) survives on this
+# branch only, and its CONTENT belongs in VUG.ELF: "for those with super extremely slow machines / for
+# history — it's a thing for fun and work". `kvug` compiles the kernel's painter's-algorithm faceted
+# crystal (`Mode::Solid`) and its BeBox tribute (`run_bebox_mode`) into this program as two extra modes
+# the `m` key cycles to; `arroyo` links it as a FOURTH image, VUGK.ELF / VUGK-X86.ELF.
+#
+# WHY A SEPARATE IMAGE AND NOT A FOURTH MODE OF VUG.ELF. `.text` here is capped at 0x2000 by a page cliff
+# (see the SIZE note in main.rs): one byte past it and `.bss` moves a page, the file grows 4096 bytes in
+# one step, and `arroyo` rejects it against the 16 KiB EL0 user window. The shipped x86 image measures
+# 0x1f57 — 169 bytes of headroom — which is a fraction of what a second renderer costs. Composable with
+# `pinlo`/`pinhi`, which pin the mode-0 ladder and leave the kernel modes alone.
+kvug = []

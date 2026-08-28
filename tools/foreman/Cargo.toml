@@ -1,0 +1,25 @@
+[package]
+name = "foreman"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "SH-4 smart installer, thin loop: replay a finished serial capture against a witness spec, assemble a bounded diagnostic context, take one provider round-trip to a printed diagnosis."
+
+[[bin]]
+name = "foreman"
+path = "src/main.rs"
+
+[lib]
+name = "foreman"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1.0"
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Provider transport. The Claude connector owns its own runtime so the provider
+# TRAIT can stay synchronous and object-safe (see src/advisor/provider.rs).
+reqwest = { version = "0.13", features = ["json"] }
+tokio = { version = "1.53", features = ["rt-multi-thread"] }

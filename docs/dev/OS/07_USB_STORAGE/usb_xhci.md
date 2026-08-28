@@ -91,7 +91,8 @@ every coherency and ring hypothesis. The root cause, witnessed on metal:
   internal firmware**, so the Pi silently dropped every register write — the entire
   enable-slot saga was writes into a not-ready controller.
 
-  The fix adds `wait_for_cnr_clear()`: a bounded (`hw_wait_budget`, ~2.5 s) poll of
+  The fix adds `wait_for_cnr_clear()`: a bounded (`hw_wait_budget` — 150 M CNTVCT ticks off-tegra,
+  2.78 s at the Pi 4's 54 MHz CNTFRQ; per-platform derivation in §32) poll of
   `USBSTS.CNR` at the *top* of `init_interrupter` — the first register programming
   after `HCRST`, immediately before ERST/CRCR/DCBAAP/CONFIG/RS. Only the pre-CNR
   halt + `HCRST` reset writes precede the wait (spec-correct). On success it emits
@@ -936,9 +937,9 @@ counter — always live, no init, no interrupt dependency) and emits exactly one
 | `m3-attach-xhci` | whole M3 | sum of the three below |
 | `m3-cap-probe` | CAP[0] ladder at the assigned BAR | see ladder cap below |
 | `m3-notify` | pre-HCRST NOTIFY + decode re-assert | mailbox + ~10 ms |
-| `m3-xhci-handoff` | `xhci::init` — halt, HCRST, CNR | **3 × `hw_wait_budget()` ≈ 8.3 s worst** |
+| `m3-xhci-handoff` | `xhci::init` — halt, HCRST, CNR | **3 × `hw_wait_budget()` = 450 M CNTVCT ticks ≈ 8.33 s worst at the Pi 4's 54 MHz (§32)** |
 | `enum-notify` / `enum-xhci-handoff` | the deferred half's reload + second handoff | as above |
-| `enum-rings-rs1` | rings, interrupter, RS=1 | CNR wait ≈ 2.8 s worst |
+| `enum-rings-rs1` | rings, interrupter, RS=1 | CNR wait = 150 M ticks ≈ 2.78 s worst at 54 MHz |
 | `enum-pump` | the bounded polled enumeration walk | 30 s backstop, early exit on armed/ready |
 | `bringup-total` / `enum-total` | the two halves end to end | — |
 
@@ -1005,9 +1006,10 @@ report for the first time. That residual is on the metal watch-list below, not c
   device-ready window and by Linux `brcm_pcie_start_link`; PIUSB-17 exists precisely because
   skipping it produced the CNR wall. Bracketed only, so the log accounts for it honestly.
 - The **100 ms PCIe config-request window** in M2 and the SCB/CNR settles from PIUSB-16/17/18.
-- The **`xhci::init` timeouts** (`m3-xhci-handoff`, ~8.3 s worst on a firmwareless controller, paid
+- The **`xhci::init` timeouts** (`m3-xhci-handoff`, ≈ 8.33 s worst on a firmwareless controller, paid
   **twice** — once early, once in the deferred half). These come from `hw_wait_budget()`
-  (150e6 CNTVCT ticks ≈ 2.8 s at the Pi's 54 MHz) in `drivers/xhci` and `arch/aarch64/mod.rs` —
+  (`HW_WAIT_BUDGET` = 150e6 CNTVCT ticks, `arch/aarch64/mod.rs:339` — ≈ 2.78 s at the Pi's 54 MHz)
+  in `drivers/xhci` and `arch/aarch64/mod.rs` —
   **shared kernel-core, outside the Pi track's lane**. This arc measures the stage instead of
   re-cutting it, so the owning lane gets evidence before a shared timeout is touched.
 
@@ -2517,6 +2519,69 @@ still prints unchanged beside it.
 (`check` both arches, knob-on and knob-off; `./arroyo test` — QEMU HID pointer still enumerates and
 moves). The click behaviour remains a metal-only verdict.
 
+#### 10f-bis-1. Reading the `PTR:` line cold — the three fields do not count the same thing
+
+Boot 3 (2026-08-19) printed lines of the shape `seen=104 delivered=6 recovered=0`, and read naively that
+looks like 98 lost clicks. It is not: **`seen` is counted per REPORT, `delivered` and `recovered` per
+EDGE.** Written out (all three live in `IntEp::note_buttons`, `drivers/ehci/mod.rs`, and all three are
+`usbdebug`-only statics):
+
+| Field | Counter | Incremented when | Unit |
+| --- | --- | --- | --- |
+| `seen` | `PTR_PRESS_SEEN` | every report whose primary bit is set (`buttons & 0x01 != 0`) — no edge test at all | one per **report** |
+| `delivered` | `PTR_PRESS_DELIVERED` | the report is judged a NEW press: a down edge (`down && !prev`) **or** the §10f-bis re-press recovery (`down && prev && quiet ≥ 120 ms`) | one per **press**, and one `pal::Event::Button` is owed for each |
+| `recovered` | `PTR_PRESS_RECOVERED` | the recovery arm specifically fired — i.e. this delivery only happened because of the quiet-gap rule | one per **press**, a strict **subset of `delivered`** |
+
+Three consequences that make a line readable cold:
+
+- **`seen` ≫ `delivered` is the healthy state, not a loss.** A HID report is a *level*: while a finger
+  rests on the pad the endpoint keeps re-reporting "primary down", and each of those reports bumps `seen`
+  while none of them is a new press. `seen / delivered` is therefore roughly *reports per hold* — Boot 3's
+  104/6 is ~17 reports across 6 presses, which for a ~1 kHz endpoint drained by a frame-rate service loop
+  is an ordinary set of human-length clicks. The ratio measures **poll rate × hold duration**, and nothing
+  about correctness. `seen == delivered` would be the *suspicious* reading (every press seen exactly once
+  means the loop is missing nearly every report of every hold).
+- **`recovered` is the only defect signal on the line.** `recovered = 0` means every press this boot
+  arrived as a clean down edge. `recovered > 0` means that many presses would have been **silently
+  dropped** before §10f-bis — each one is a release report that the one-report-per-service-pass endpoint
+  missed, leaving `prev_buttons` latched at `0x01`. So `recovered` counts *repairs*, and a rising
+  `recovered` is evidence about the polling rate, not about the pad.
+- **The line prints only on a delivery.** It sits inside the `edge || repress` branch, so every `PTR:`
+  line is emitted *at* a press and the numbers are running totals as of that press. `delivered` therefore
+  increases by exactly 1 between consecutive lines from the same endpoint; `seen` jumps by however many
+  down-reports the previous hold produced. `[i]` is the interrupt-endpoint index, so a boot with a
+  trackpad and an external mouse interleaves two independent ledgers.
+
+Nothing here is derivable from a single line in isolation except `recovered`: to say anything about lost
+input you compare `recovered` against zero, never `seen` against `delivered`.
+
+**And `delivered` measures the BELT, not the outcome — Boot 5 (2026-08-19) is the worked example.** That
+card's clicks did nothing on screen while `delivered=` climbed once per physical click. Both readings
+were correct, and they are about different layers: `delivered` counts what `IntEp::note_buttons` handed
+to `pal`'s event queue, and it says *nothing* about what the drain that pops the queue does with the
+event. On Boot 5 the answer was "discards it" — the `usbdebug` drain had no router call at all, so every
+`Event::Button` fell into its catch-all arm (fixed by USBDBG-ROUTE; see `08_VIDEO/engine.md`). So when
+clicks are reported dead, read the two witnesses as a **pair**, in this order:
+
+1. `PTR: ... delivered=` rising per click ⇒ the pad, the endpoint and the edge logic are fine, and the
+   defect is at or above the drain. Stop looking at USB.
+2. no `PTR:` movement ⇒ the defect is on the belt, and `recovered` says whether polling is the cause.
+
+The instrument on the far side is `[clickroute]`, emitted by the router itself: `delivered` rising with
+**no** `[clickroute]` line for the same click is the exact signature of a drain that never routes.
+
+**Pairing note, updated for USBDBG-INVERT (2026-08-19).** The *reading* above is unchanged, but the
+"which drain?" half of it has simplified: on an `x86_64` + `wc` build there is no longer a second drain
+to be in. The `usbdebug` terminal loop is compiled out on that combination and the card runs the
+ordinary desktop path (`08_VIDEO/engine.md` §USBDBG-INVERT), so *every* x86 desktop build — knob on or
+off — pops its events in `x86_render_service` and routes them through `wc_route_event`. Step 1's
+conclusion is therefore now "the defect is at or above the drain, and the drain is the render service's"
+rather than "…and which drain you are in depends on the knob". The `USB-DEBUG:` print lines survive on
+that path (they moved ahead of the router, printing the RAW report), so a capture can still show
+`PTR: ... delivered=` rising, the matching `USB-DEBUG: BUTTON` line, and the `[clickroute]` disposition
+for one physical click — the three layers of the same press, in order, on one wire. A build WITHOUT
+`wc` still has the terminal loop, and there step 1's original wording applies verbatim.
+
 ### 10g. IVY MT-INVESTIGATION — where does true multitouch actually live? (`UNAOS_MTRAW`)
 
 §10e refuted the "descriptor-advertised 0x44 / 511-byte frame streams as-is" model: 736+ observed
@@ -2765,7 +2830,9 @@ the hub, over 2691 pump waits across the whole storage chain:
 ```
 
 The worst single wait used **32.7 M cycles against a 14.4 G budget — ~440x
-headroom**, with the direct-attach run peaking at 35.2 M against the same budget.
+headroom** (the printed `budget=14396988690` is this QEMU x86 run's TSC ≈ 2.4 GHz ×
+`HW_WAIT_SECONDS` 2 (`arch/x86_64/mod.rs:137`) × scale 3 = 6.0 s of wall clock), with the
+direct-attach run peaking at 35.2 M against the same budget.
 Hub routing moved the worst case by *noise*, not by orders of magnitude. A budget
 with 440x headroom is not the thing that timed out on metal.
 
@@ -3115,7 +3182,8 @@ hypothesis, so this section is a read of OUR write path, in code, with the arith
 * QEMU: green, fast, every knob.
 
 TSC calibrated at ≈2.6938 GHz, so `used=1275711592` = **0.474 s** for ONE stage wait, and
-`budget=16163799966` = **6.000 s** (`hw_wait_budget()` 2 s × 3, `mod.rs` `pump_until_bot_done`).
+`budget=16163799966` = **6.000 s** (`hw_wait_budget()` = tsc_hz × `HW_WAIT_SECONDS` 2 =
+5.388 G cycles, `arch/x86_64/mod.rs:137,150–156`, × scale 3 in `mod.rs` `pump_until_bot_done`).
 The QEMU comparator from §11 is `peak=32724164` over `n=2691` — 0.012 s. Metal's *first* wait
 is 39× QEMU's *worst*.
 
@@ -3576,13 +3644,14 @@ flash controller in an erase/wear-levelling window is the usual suspect for a `W
 Deriving the dwell times from `hw_wait_budget()` would silently rescale every USB timing constant
 the day the timeout policy changed; VBUS de-energise and `bPwrOn2PwrGood` are not policy.
 
-**Budgets.** The **first** attempt keeps its ~6 s (`hw_wait_budget() × 3`, unchanged) — a real device
-can legitimately stall 1–4 s on a write, and shortening this would fail slow-but-healthy sticks.
-**Escalation retries** use ~2 s (`× 1`): by then the device has burned two full ladders without
-answering, the only question left is "did the heavy reset revive it", and a revived device answers
-in milliseconds. The extra 4 s buys no information and is paid in frozen desktop. The multiplier
-lives in `bot_budget_scale`, which is the historical `3` at all times except inside an escalation
-retry.
+**Budgets.** The **first** attempt keeps its full `hw_wait_budget() × 3` (unchanged; 2 s × 3 = 6 s
+on this capture's x86 metal, 8.33 s on the Pi 4, 14.4 s on the Orin — per-platform derivation in
+§32) — a real device can legitimately stall 1–4 s on a write, and shortening this would fail
+slow-but-healthy sticks. **Escalation retries** use the base budget (`× 1`; 2 s here): by then the
+device has burned two full ladders without answering, the only question left is "did the heavy
+reset revive it", and a revived device answers in milliseconds. The extra 2× buys no information
+and is paid in frozen desktop. The multiplier lives in `bot_budget_scale`, which is the historical
+`3` at all times except inside an escalation retry.
 
 **Rung (a) — the honest limit, recorded because the witness will show it.** Reset Device returns the
 xHC's internal slot state to the post-Address condition without touching the Root Hub Port Number or
@@ -5301,7 +5370,8 @@ to pre-USBFALL. The rule is about substitution on a platform that has a canonica
 across block I/O with "the aarch64 I/O is polled, so the span is a couple of bounded polled sector
 transfers". That premise is source-blind. On `BlockSource::Usb` the same RMW runs
 `write_block_usb → storage_write10 → scsi_write10 → bot_transfer → pump_until_bot_done`, whose deadline is
-`hw_wait_budget() * 3` = 450 M CNTVCT ticks (~8 s at 54 MHz) and whose pump body executes `wfi` under the
+`hw_wait_budget() * 3` = 450 M CNTVCT ticks (8.33 s at the Pi 4's 54 MHz; 14.4 s on the Orin — §32)
+and whose pump body executes `wfi` under the
 `PSTATE.I` this very hold masked. It is bounded and it is not a deadlock — WFI wakes on a pending physical
 interrupt with I set — but a failing transfer means a multi-second non-preemptible hold (×`num_fats`) with
 the scheduler stopped. The LOCK SPAN paragraph now states `Default` and `Usb` separately, and every `FatFs`
@@ -7022,7 +7092,8 @@ a verdict that **outlives a slot id**:
   end that ladder — it handed it its allowance back.
 
 Measured cost: a core at 99% for the whole sitting, `timeouts=` still climbing when the device was
-pulled, at ~8.3 s of pump budget (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST`) per attempt.
+pulled, at 8.33 s of pump budget per attempt (`hw_wait_budget() * BOT_BUDGET_SCALE_FIRST` =
+450 M CNTVCT ticks at this Pi 4 capture's 54 MHz; §32).
 
 ### The fix: an account keyed to the device, not the slot
 
@@ -7050,8 +7121,9 @@ surrender is untouched underneath it. Four mechanisms, in the order they bite:
      account (a healthy boot's *entire* BOT time is ~5 s, half this bound);
    * `BOT_PARK_DEAD_STREAK` (2) consecutive timeouts with a *provably idle* ring (no events, no
      foreign events, no doorbells — the [piusb40] signature) cut this device's pump budget by
-     `BOT_PARK_DEAD_DIV` (8), so the steady state after a proven wedge is ~350 ms per attempt rather
-     than ~8.3 s. Applied with `min`: it can only shorten a wait, and a healthy device never earns
+     `BOT_PARK_DEAD_DIV` (8), so the steady state after a proven wedge is ~350 ms per attempt
+     (the cut divides the *base* budget: 150 M / 8 = 18.75 M ticks ≈ 347 ms at 54 MHz) rather
+     than 8.33 s. Applied with `min`: it can only shorten a wait, and a healthy device never earns
      it.
 4. **Guaranteed teardown on disconnect, and the unpark rule.** `bot_park_note_disconnect` runs
    *before* `bot_rescue_clear` on both disposal paths. If the disposed slot is the one under the
@@ -7172,7 +7244,9 @@ back-off decline attempts. The injection now charges the wait it stands in for
 (`hw_wait_budget() * bot_budget_scale`, classified `dead` — the injected wedge IS the `[piusb40]`
 signature), and credits the same fictional span against the back-off deadline, because the ledger
 must not accrue on one clock while the gate refuses on another. Both credits are `cfg`-gated to the
-feature; on metal a real ~7.2 s wait outlasts `BOT_PARK_BACKOFF_MAX_MS` on its own.
+feature; on metal a real first-attempt wait (8.33 s on the Pi 4, 14.4 s on the Orin — the "~7.2 s"
+this line used to claim for metal is the QEMU-virt figure, 450 M ticks at 62.5 MHz, a rate no metal
+in the fleet runs at; §32) outlasts `BOT_PARK_BACKOFF_MAX_MS` (4 s) on its own.
 
 Measured, `UNAOS_BOTWEDGE=1 ./arroyo test-arm`:
 
@@ -7316,7 +7390,811 @@ deferred-write path that turns this session bond into a persistent one.
 
 ---
 
-## 28. BOTSEQ — the mount runs before the probe matrices (2026-08-21)
+## 28. BT-BOND — the Holocron seam and the bond store (`UNAOS_HOLOCRON=1` / `UNAOS_HCRONST=1`, 2026-08-21)
+
+> **HCR1 (2026-08-21)** — an adversarial review of M1 returned four SHOULD-FIX findings, all four
+> fixed in the commit this note rides. §28.1a corrects what the flush guard can assert and bounds its
+> witness; §28.2a splits the boot-time-write selftests behind `hcronst`; §28.3a replaces the live-leaf
+> overwrite with a stage-verify-swap and quarantines a refused image; §28.7 item 1 closes the aarch64
+> cfg-coverage hole. Where an M1 statement is now wrong it is corrected in place and the correction
+> says what it used to say — the old text is the evidence for why the fix exists.
+
+§27.3 names the gap this section closes: the link key SSP produces lives in
+`Controller::bt_ssp_key`, in RAM, for one session. A real bond survives power-off. The obstacle was
+never the filesystem — it was **where the key arrives**. This section is the store, the seam it sits
+on, and the deferral that makes writing it possible at all.
+
+**Milestone status.** M1 (this section as written) landed the seam, the record schema, the codec, the
+table rules and the proofs. It adds **no HCI command and no radio access whatsoever**: nothing in
+`bt_ssp_pair` calls into the store yet, so §27.3's gap paragraph is still accurate and is
+deliberately left standing. **M2** wires the Link Key Notification and Link Key Request arms to the
+store and rewrites §27.3 accordingly; **M3** proves eviction end to end and finishes the LE-identity
+population rule. Reading §27.3 and §28 together today: the mechanism exists and is proven; the
+driver has not yet been pointed at it.
+
+### 28.1 The re-entrancy wall (why this is not just a file write)
+
+The whole BT chain runs inside one `service_ehci_hid()` pass holding the `EHCI_HID` mutex
+(`drivers/ehci/mod.rs`). The writable FAT volume rides USB mass storage whose I/O goes through
+`drivers/block.rs` → `xhci::claim()` + `storage_read10`/`write10`. A filesystem write issued from
+inside the BT chain would therefore
+
+* contend the xHCI storage loan **from inside** the EHCI service pass, and
+* hold the internal keyboard and trackpad hostage for the write's duration — on top of the 8 s
+  worst case §27.1's operator note already describes.
+
+So the store is split in two, and the split is the whole design:
+
+| Phase | Where it runs | What it costs |
+| --- | --- | --- |
+| `holocron::put` / `remove` (and `btbond::stage_store` / `stage_remove` above them) | anywhere, lock held or not | a `memcpy` into a fixed table and a `bool`. No I/O, no allocation, no wait. |
+| `holocron::flush_if_dirty` | the main loop, storage-gated, no driver lock held | one whole-file rewrite through the FAT write path. |
+
+`flush_if_dirty` **checks that invariant rather than asserting it in a comment**: on x86 with the HID
+path built it consults `EHCI_HID.is_locked()` before issuing any block I/O. What that check can
+actually assert is the subject of the next subsection, because M1 overstated it.
+
+### 28.1a What the flush guard can and cannot say (HCR1, 2026-08-21 — corrected)
+
+M1 shipped the guard documented as *"is the EHCI HID mutex held **on this core** right now?"*, and the
+witness it fed asserted *"…and this call site is inside it"*. Both claims were wrong.
+`spin::Mutex::is_locked` is a **global** predicate: it reports that the lock is taken and never by
+whom. It cannot distinguish
+
+* **this call stack is inside a `service_ehci_hid()` pass** — the bug the seam exists to prevent — from
+* **another task is mid-pass** — benign, and expected. `main.rs` spawns `usb-pump` (which calls
+  `holocron::service()`) and `input` (which reaches `service_ehci_hid()` at roughly 1 kHz through
+  `pal::pump_and_poll`) as two preemptible tasks on the same `svc_cpu`. An interleaving that finds the
+  lock taken is an ordinary scheduling outcome on a **correct** build.
+
+Two consequences, both real:
+
+1. the printed line stated as fact something the evidence could not support;
+2. the refusal `return`ed **before** `flush_fails`/`gave_up`, so it never consumed the
+   `HCRON_FLUSH_ATTEMPTS` budget. The module's own stated law — *a volume that vetoes writes must not
+   be able to make the main loop print forever* — was enforced on the I/O-failure path and not on this
+   one. While the store was dirty and the lock contended it printed **once per main-loop pass,
+   unbounded**. And because the same commit gave `x86-fat.spec` a hard `FORBID [hcron] flush REFUSED`,
+   a benign scheduler interleaving on an armed run could red a spec three tracks share.
+
+**What it is now.** The predicate is renamed `ehci_hid_busy()` and read only in the direction it is
+sound in:
+
+| reading | what it proves | action |
+| --- | --- | --- |
+| not held | nobody holds it, so **this stack does not**. A proof. | write |
+| held | **UNKNOWN** — both readings say the same thing about this instant. | defer |
+
+A `true` is therefore a **deferral**, never a verdict about the caller. Retries stay unbounded:
+deferral is not a failure, it costs one atomic load per pass, and a legitimately long service pass (an
+SSP chain runs for seconds, and it is precisely that chain which makes the store dirty) must not cost
+the boot its persistence. What is bounded **by construction** is the witness — `HCRON_DEFER_NOTES = 2`
+lines per boot, counted where the print happens so the counter counts output rather than intent. The
+first line explains the reading; the second, at `HCRON_DEFER_STUCK = 4096` consecutive deferrals,
+states both interpretations and stops. Deferral touches neither `flush_fails` nor `gave_up`, which
+count I/O that was *attempted* and refused by the volume.
+
+**The bound is proven by an executed fixture, not by this paragraph.** `defer_bound_fixture_once()`
+takes `EHCI_HID` for real — `try_lock`, never `lock`, so it can never hold the keyboard and trackpad
+hostage; a pass that cannot take the lock instantly is simply not its pass — drives `flush_if_dirty`
+4160 times, and checks that every pass reached and took the deferral return, that **zero** writes were
+issued (`seq` unmoved, the dirty flag it set still set), and that the witness emitted no more than the
+cap. It restores the dirty flag and the deferral accounting afterwards, so a boot's real budget is not
+spent by a test, and it writes nothing at all — which is why it rides `holocron` rather than the
+`hcronst` write knob.
+
+```
+:: [hcron] deferral bound: EHCI_HID HELD, flush_if_dirty driven 4160 times (past the 4096-pass
+   escalation and 64 further) — every pass deferred, ZERO writes issued (seq unmoved at 0, still
+   dirty), and the witness emitted 2 line(s) against a cap of 2 -> PASS ::
+```
+
+Go-red, measured rather than argued: with the cap removed from `note_defer` (i.e. the pre-HCR1
+behaviour restored) the same boot printed **4160** deferral lines and the fixture reported
+`… 4160 deferred passes emitted 255 witness lines against a cap of 2 … -> FAIL ::`, which the
+`arroyo test` verdict caught on its own, before any spec replay.
+
+**A sharper predicate is possible and is deliberately not in this file.** Recording an owner — a
+marker set and cleared around the body of `service_ehci_hid`, compared against
+`sched::current_task_id` — would answer the question M1's doc comment claimed to answer. It belongs on
+the EHCI side of the seam, in `drivers/ehci/mod.rs`, where the pass is bracketed; the store can only
+sample a lock it does not own. Until that exists, the honest statement is the one above: the guard
+proves the safe case and defers the ambiguous one. (The three `main.rs` call-site comments still say
+"it refuses while `EHCI_HID` is held"; that file was outside this arc's lane and the wording is stale
+there.)
+
+### 28.2 Where the code lives
+
+| File | Contents | Gate |
+| --- | --- | --- |
+| `src/fs/holocron.rs` | the seam: framing, CRC, class registry, in-RAM table, `load_once` / `publish_store_file` / `flush_if_dirty`, the framing fixture, the deferral-bound fixture | `holocron` |
+| `src/drivers/ehci/btbond.rs` | the first client: bond record schema v1, codec, table rules, either-form lookup, the codec KAT | `holocron` (inside the x86-gated `drivers/ehci/`) |
+| the two store round-trip selftests, in those same two files | boot-time WRITES to the medium — see §28.2a | `hcronst` (implies `holocron`) |
+
+#### 28.2a Two knobs, because one of them writes the user's medium (HCR1)
+
+`holocron` arms the **store**. `hcronst` arms the two **selftests** — `holocron::selftest_once`, which
+writes and unlinks `/HCRON/HCRNTEST.DAT`, and `btbond::selftest_once`, which stages a fixture bond
+through the real flush and so creates `/HCRON/BTBOND.DAT` and leaves it behind as an empty store.
+
+Both check `write_veto()` first and both self-clean, so neither is reckless. The split is not about
+recklessness; it is this repo's standing convention for a destructive write, the same one that gives
+`sdw` a knob apart from `sdhcblk` so a build can carry the SD block backend without carrying the
+card-write. Arming a **mechanism** must not be the same act as arming a **test that writes**: as M1
+shipped it, M2's real consumer could not have the store without two boot-time writes to the user's
+boot medium. The store itself touches the medium only when a record is actually staged.
+
+The deferral-bound fixture is deliberately *not* behind `hcronst`: it writes nothing, so arming the
+store arms its own bound-proof. `hcronst` is mapped in **both** `arroyo` (`UNAOS_HCRONST=1`) and
+`builder/src/main.rs`, by the same s42/INSTGUI rule that applies to `holocron`.
+
+`handlers/holocron/` remains a ring-3 design-stage stub — no crate, no entry point, no code. This is
+therefore **not** an RPC to a handler that does not exist: it is the minimal kernel-side vault the
+future userspace Holocron adopts. The seam is arch-neutral (it drives only `fs::fat` and
+`crate::hash`), so an armed aarch64 build gets the store and its framing fixture and nothing
+Bluetooth-shaped; the bond client sits inside `drivers/ehci/`, which is
+`all(target_arch = "x86_64", feature = "ehcihid")`-gated.
+
+**Named-path divergence, recorded because it is real.** The BT-BOND design specifies the rewrite
+"through the VFS/FAT write path (`fs/vfs.rs` `create`/`write`)". In this tree
+`impl VfsBackend for FatBackend` — with `resolve_parent`, `fat_err` and `fat_create_err` — is
+`#[cfg(target_arch = "aarch64")]`. On x86_64, the platform this arc is for, `FatBackend` is a struct
+with no backend impl and cannot be mounted into a `MountTable` at all. The store therefore calls
+`fs::fat`'s dir-aware twins directly (`locate_in_dir` / `create_dir` / `create_in_dir` /
+`delete_located` / `write_grow`) — the exact primitives the aarch64 `FatBackend` adapter wraps,
+reached the way the arch-neutral `shell.rs` file verbs and `flight_recorder.rs` already reach them,
+landing on the same `block::write_block_usb` BOT WRITE(10) path. Adding an x86 arm to `fs/vfs.rs` is
+the alternative and is out of this arc's lane.
+
+### 28.3 On-disk format (v1) — `/HCRON/BTBOND.DAT`
+
+```text
+header:  magic "HCRN" | ver u8 = 1 | count u8 | seq u32 (LE) | hdr_crc32 (LE)     -- 14 bytes
+record:  class u8 | len u8 | body[len] | crc32(class, len, body) (LE)             -- 6 + len bytes
+```
+
+`hdr_crc32` covers the ten bytes before it. Each record's CRC covers its **framing bytes as well as
+its body**, so a flipped `class` or `len` is caught by the same check that catches a flipped body
+byte. CRC-32/ISO-HDLC comes from the arch-neutral `src/hash.rs` — the same variant the GPT writer and
+the gzip trailer check already use — so an image the kernel wrote is checkable by host tools without
+new code. `seq` is a monotonic write counter, bumped on every successful flush; there is no RTC on
+this machine, so `seq` is the only clock the store has.
+
+The directory and leaf are 8.3-clean by construction (`HCRON`, `BTBOND.DAT`); the store creates
+`/HCRON` on first use. The write is a **whole-file rewrite** because the record count can shrink and
+an in-place overwrite would leave a tail of the previous image behind — but *which file* is rewritten
+is the point of the next paragraph.
+
+#### 28.3a The update is a SWAP, not an overwrite (HCR1, 2026-08-21)
+
+M1 wrote the live leaf directly: `delete_located(BTBOND.DAT)` → `create_in_dir` → `write_grow`. The
+CRC catches a torn **record**; it is no help against a torn **update**. That sequence leaves a window,
+as wide as the whole grow, in which the previous generation is already gone and the new one is not yet
+whole — and a failure or a pull anywhere inside it leaves **no store at all** rather than a
+stale-but-valid one. It composed badly with the load path, too: a refused image triggers `clear()`,
+which marks the table dirty, so the next flush overwrote the refused file. One medium bit-flip
+therefore discarded the user's bonds permanently, with nothing left to recover them from.
+
+Both are closed. `publish_store_file` is now a four-step swap:
+
+1. **Stage** — whole-file rewrite of `/HCRON/BTBOND.NEW`. The live leaf is untouched, so a failure
+   here costs nothing and the next pass retries.
+2. **Prove** — read the temp back off the medium and `parse_image` it. The old generation is not
+   allowed to die on the strength of a `write_grow` return code; it dies only once the bytes that will
+   replace it have been read back through the same path a future boot will read them through, and have
+   parsed. This is also a torn-write check on the write that just happened.
+3. **Drop** the live leaf (`mark_dir_deleted` + free chain).
+4. **Rename** the temp over it — `rename_entry` rewrites the name field of the temp's directory entry
+   in place, one directory-sector RMW, the smallest window `fs::fat` can offer.
+
+Nothing here is atomic in the hardware sense; FAT cannot be. What it is, is **recoverable at every
+point**. The window between 3 and 4 is one sector write wide and the data is intact under the temp
+name throughout it, so `load_once` covers it directly: if the live leaf is **absent** and
+`/HCRON/BTBOND.NEW` **parses**, that image is adopted and the table is marked dirty so the next flush
+finishes the swap the crash interrupted. The live leaf is always tried first, and a live leaf that
+merely fails to parse never falls back to the temp — that is a finding about the medium, not a reason
+to reach for a file whose own provenance is a crash.
+
+**And a refused image is quarantined, not overwritten.** Before `clear()` marks the table dirty,
+`load_once` renames the refused bytes to `/HCRON/BTBOND.BAD` (one generation kept; a second refusal
+replaces it). The witness says which way it went, because "kept" and "lost" must never be
+indistinguishable on the wire:
+
+```
+:: [hcron] load: bad record crc (BTBOND.DAT) -> store starts EMPTY, fail-closed (nothing partially
+   adopted); refused bytes KEPT as /HCRON/BTBOND.BAD (one generation; recoverable off the medium)
+   == witness ::
+```
+
+The store's own paths never delete a leaf outright any more — they swap over it. `unlink_store_file`
+survives only for the selftest's scratch leaf and rides `hcronst` with it.
+
+**Fail-closed, with no partial adoption.** Bad magic, an unknown version, a bad header CRC, a bad
+record CRC, a truncated body, an over-long body, more records than the table holds, or trailing bytes
+past the last record — every one refuses the **whole** image and the store starts empty, witnessed
+with which refusal fired. A store that adopted the records it managed to read before the damage would
+be a store whose contents depend on where the corruption happened to land. On a refused load the
+table is marked dirty, so the next flush **replaces** the bad image rather than leaving a file every
+future boot will refuse identically — and since HCR1 the refused bytes are **moved aside first**, to
+`/HCRON/BTBOND.BAD`, so "replaces" no longer means "destroys the only copy". See §28.3a.
+
+**Keys.** The framing carries no key field: the key is a span *inside* the body, declared per class
+by `class_key_span`. `put` takes the caller's key explicitly and refuses a key that does not equal
+that span, so a class codec and the store cannot drift apart about what a record's identity is. Class
+registry, v1: `HCRON_CLASS_BTBOND = 0x01`, key = `bd_addr`, six bytes at body offset 2.
+
+### 28.4 Bond record schema v1 (class 0x01 body)
+
+```text
+ver           u8   = 1
+flags         u8    bit0: LE identity present; bits 1..7 reserved = 0
+bd_addr       [6]   BR/EDR page address, WIRE order (LSB first)
+bd_addr_type  u8    0x00 public — mirrors the HCI address-type vocabulary
+link_key      [16]
+key_type      u8    verbatim from Link Key Notification (0x04..0x08)
+le_addr       [6]   LE identity/advertise address, wire order (zeros when flags bit0 is clear)
+le_addr_type  u8    0x00 public / 0x01 random (meaningful only when flags bit0 is set)
+seq_used      u32   the holocron write counter at last successful use — the LRU clock
+```
+
+**37 bytes.** (The BT-BOND design document tallies this same field list as "31 bytes"; that is an
+arithmetic slip in the prose, not a different layout. The field list is normative.)
+
+**Both identity forms from day one.** Today the only address this tree knows is the LE advertise
+address (`bt_name.rs`'s `BT_L3_PEER_ADDR_BYTES`, `88:c6:26:cc:2d:3c`); the BR/EDR page address is
+whatever `Connection Complete` binds a handle to, and §26's page trains to the advertised address
+still time out — the live hypothesis being that a dual-mode device pages under a different BR/EDR
+address. Carrying both forms means that when the address question resolves, a bond written by the
+pairing path already records the address it authenticated on **and** the address the peer was first
+seen under, so a lookup by either form hits the same record and no schema bump is needed.
+
+**Lookup rule.** `bd_addr` first (the primary key, one indexed hit); on a miss, a record whose
+`le_addr` equals the query address and whose presence flag is set. The witness names which form
+answered — that line is evidence about the address hypothesis, for free.
+
+**Table rules.** `BTBOND_MAX = 4`. `bd_addr` is the primary key, so a re-pair of a known address
+**replaces** its record rather than appending — §27.3's "one bond entry per boot" accumulation cannot
+happen. When the class is full and a new address arrives, the record with the smallest `seq_used` is
+evicted, witnessed. LRU by write counter, because there is no clock.
+
+### 28.5 At-rest posture (what is claimed, and what is not)
+
+The FAT volume is plaintext and this machine has no protected key storage — no TPM, no SEP path.
+v1 stores the link key **plaintext-on-media, CRC'd, and says so**. The CRC is torn-write detection,
+**not** authentication: it stops a half-written record from being adopted; it stops nobody who can
+write the file. A kernel-embedded cipher key would be theatre — recoverable from the image by anyone
+holding the medium — and is explicitly not claimed.
+
+What v1 does enforce is process hygiene: key bytes are never printed to serial (the standing
+`bt-ssp` law, extended — every `[btbond]` witness carries addresses, key *types*, counts and
+sequence numbers, never key material), staging buffers are zeroized on every exit path including the
+fixtures', and a vacated table slot is wiped rather than merely unlinked.
+
+Threat scope, stated plainly: the asset is a BR/EDR unauthenticated combination key for a
+loudspeaker. Exposure of the file to someone holding the physical medium enables impersonating this
+host *to the speaker*, or eavesdropping that link. It does not open the machine. Vault encryption
+(hardware-backed or passphrase-derived) is Holocron-proper's job and the format's `ver` byte is the
+migration hook. The ledger entry is in [`SECURITY.md`](../../../SECURITY.md).
+
+### 28.6 Boot ordering, stated rather than engineered around
+
+`service_ehci_hid()` — where the boot-time BT chain runs — is polled from the very first main-loop
+passes, while the FAT mount is a later storage-ready one-shot. So on a boot that arms the radio, the
+first BT chain **can** run before the store is loadable. That window is real and this design accepts
+it rather than reordering boot: `holocron::is_loaded()` exists precisely so a miss taken inside the
+window is witnessed as *"store not loaded yet"* rather than as *"no such bond"*. The paths that
+matter for reconnection — the `Ctrl+Alt+B` re-trigger (§25) and any future auto-reconnect — run long
+after storage is up.
+
+The store's whole main-loop presence is one call, `fs::holocron::service()`, placed beside
+`fs::fat::probe_once()` at all three storage-ready passes `main.rs` carries (which pass a given build
+reaches depends on its knobs; the one-shots inside make it speak exactly once). Order inside is the
+argument in miniature: pure fixtures → `load_once` → the class clients → `flush_if_dirty` **last**,
+so a record staged this pass reaches the medium this pass — deferred past the driver's lock, not
+deferred by a whole extra loop iteration.
+
+### 28.7 What QEMU proves, and what only metal can
+
+QEMU models no BT controller — the internal hub and radio are bench hardware — so every HCI leg is
+metal-only. What a QEMU boot *can* prove, and does:
+
+1. **Compile + reachability.** `./arroyo check` green on both arches, armed and unarmed; `strings` on
+   a `UNAOS_HOLOCRON=1` builder-path kernel shows the `[hcron]` and `[btbond]` witness families, and
+   a default build shows none (the §27.4 discipline, extended). Both knobs are mapped in **both**
+   `arroyo` and `builder/src/main.rs` — mapped in one alone would put `holocron`/`hcronst` in the
+   `⚡ kernel features:` banner over a kernel with the modules compiled out.
+
+   **The aarch64 leg (HCR1).** `holocron` and `hcronst` are deliberately not stripped by
+   `arm_features`, on the grounds that the seam emits real aarch64 code and stripping would silently
+   *disarm* the knob there rather than preserve a byte-identity that does not apply. Until HCR1 that
+   argument was untested by the standing gate: `holocron` appeared in no aarch64 cfg leg at all, so an
+   aarch64 regression in the very file the decision exists to protect would not have been caught. Both
+   knobs are now appended to `arroyo`'s `arm-pi` leg — **and to `x86-all`**, which is not optional:
+   `x86_cfg_universe` computes "aarch64-only" as *named by an arm-\* leg and by no x86-\* leg* and
+   subtracts that set from the pairwise-mix universe, so naming them on `arm-pi` alone would have
+   traded the aarch64 hole for an x86 one. Named on both, the universe is unchanged (still 8 mix legs,
+   12 in total) and both arches type-check the seam. These are type-check legs: `arm_features`, which
+   is what media builds go through, is untouched, and `kernel8` builds from its own curated
+   `K8_FEATS` — so no Pi or Jetson media hash moves.
+2. **The framing fixture** (`:: [hcron] framing fixture … -> PASS ::`) — pure, no hardware. Eight
+   legs: a clean serialize→parse round-trip, then every refusal **made to fire** (body CRC, header
+   CRC, truncation, trailing bytes, magic, version), then the untouched copy still parsing, so seven
+   refusals cannot be a parser that refuses everything.
+3. **The codec KAT** (`:: [btbond] codec fixture … -> PASS ::`) — pure. A synthetic Link Key
+   Notification (the 25-byte assembly the SSP arm parses) → record → encode → decode field-identical;
+   short and wrong-version refusals; the class registry's key span agreeing with the schema's
+   `bd_addr`; the either-form lookup rule discriminating; and record → holocron framing → parse →
+   decode with a one-byte corruption refused in between.
+4. **The deferral bound** (`:: [hcron] deferral bound … -> PASS ::`) — needs a block device and
+   nothing else, writes nothing, rides `holocron`. See §28.1a for what it drives and why an argument
+   would not have been enough.
+
+5. **The store round-trip through real FAT** — two witnesses, both self-cleaning, both behind
+   `hcronst` because both write the medium (§28.2a):
+   `:: [hcron] store round-trip … -> PASS ::` writes an image to a scratch leaf, reads it back
+   byte-identical, then flips one byte **on the medium** and proves the load refuses it; and
+   `:: [btbond] store round-trip … -> PASS ::` stages a fixture bond on `aa:bb:cc:dd:ee:ff` through
+   the real table, flushes it, looks it up by **both** identity forms, then evicts and re-flushes so
+   the medium is left as it was found. Its two `flush -> … ok` lines are also what proves the publish
+   swap of §28.3a completed: `ok` means the temp was staged, read back, parsed, and renamed over the
+   live leaf — not merely that a write returned.
+
+   Gate: `UNAOS_HOLOCRON=1 UNAOS_HCRONST=1 ./arroyo test-fat sf 150`, asserted by
+   `scripts/specs/x86-holocron.spec` (REQUIREs) and `scripts/specs/x86-fat.spec` (OPTIONAL/FORBID, so
+   the default gate stays green). A `UNAOS_HOLOCRON=1`-only capture satisfies the holocron spec's §1–§3
+   and is short on §4/§5 — the honest outcome of the knob split, not a regression.
+
+**What the specs forbid, restated (HCR1).** `x86-fat.spec` used to carry
+`FORBID [hcron] flush REFUSED`, firing knob-on or knob-off. Per §28.1a that line could fire on a
+correct build, so a benign scheduler interleaving on an armed run could red a spec three tracks share.
+It is gone from both specs. What gates instead is the deferral-bound fixture's `-> FAIL ::` variant —
+reachable on **every** armed run rather than only on the schedule that happens to contend the lock —
+together with the standing `FORBID [hcron] flush -> … GIVING UP`.
+
+Mock *HCI event* injection into `bt_ssp_pair` is deliberately not attempted: that dispatch loop is
+welded to the EP0/interrupt-EP transport, and a mock seam there would be invasive scaffolding for
+little proof. The parse arm is covered by the codec KAT instead.
+
+**The metal falsifier, which is not this milestone's job:** pair → power-cycle → the Link Key Request
+answered from a persisted bond → `Authentication Complete` status 0x00 with **no SSP exchange**. It
+needs M2's wiring. Known risk, stated: §26's page trains to the speaker still time out, so the metal
+proof may need the discoverable-inquiry discriminator to land first. The QEMU-provable store is
+correct independently of it.
+
+### 28.8 Standing holds, respected by construction
+
+* **Scan_Enable hold.** This path adds **zero** HCI commands. M1 touches no HCI surface at all;
+  M2 will touch `Link_Key_Request_Reply`, which §27 already sends. No `HCI_Write_Scan_Enable`
+  (0x0C1A) call site exists anywhere in the tree and this work introduces none — reconnection stays
+  outgoing-page-shaped. The hold needs no exception and none is designed around.
+* **Key bytes never on serial.** Every `[btbond]` and `[hcron]` witness carries addresses, key types,
+  counts and sequence numbers. Never key material.
+* **Default OFF.** With the knobs unset both modules and every call site vanish and both arches are
+  byte-identical. Unlike `bt`/`btc`, `holocron` and `hcronst` are **not** stripped by `arm_features`:
+  the seam emits real aarch64 code, so stripping would silently disarm the knobs rather than preserve
+  a byte-identity that does not apply. That claim is now under type-check on both arches — see §28.7
+  item 1.
+* **No boot-time write without asking for one (HCR1).** `holocron` alone touches the medium only when
+  a record is actually staged; the two selftests that write at boot are behind `hcronst`, by the same
+  convention that gives `sdw` a knob apart from `sdhcblk` (§28.2a).
+* **Never fewer than one valid generation on the medium (HCR1).** The flush stages, verifies and swaps
+  rather than overwriting; a refused image is quarantined rather than destroyed (§28.3a).
+
+---
+
+## 29. KBDFLAP — a stalled interrupt endpoint was retired for the boot, anonymously (2026-08-21)
+
+
+### The observation
+
+rMBP metal boot 10 (capture `rmbp2-boot8`, 2026-08-19). The internal keyboard delivered zero key
+events across a four-minute boot while the trackpad — the other interface of the **same device**,
+addr 8 — streamed the whole time. It read as the "armed and silent" class §10's KBDWIT probe exists
+to adjudicate. It was not that class. One line in the capture decides it:
+
+```
+[   2444ms] :: EHCI-HID: [1] STOP-NOTE interrupt endpoint halted (token 0x000a8d42)
+            — endpoint retired, not forced ::
+```
+
+`0x000a8d42` decodes (EHCI 1.0 §3.5.3) to Total-Bytes 10, PID IN, IOC 1, **CERR 3**, status `0x42`
+= Halted + SplitXState. Total-Bytes 10 is `mps=10`, and the only 10-byte endpoint armed in that
+boot is `addr=8 ep=IN3` — the internal keyboard. Its non-status half is byte-identical to the live
+token KBDWIT printed for the same endpoint on the neighbouring boot 9 (`seen=0x000a8d80`), so the
+identity is measured, not inferred. The keyboard was retired 621 ms after arming.
+
+That retirement is also why the endpoint was **absent** from boot 10's KBDWIT dump while three
+healthy endpoints appeared: `service()` skips a `dead` entry before the probe can run. The
+instrument built for this symptom was structurally silent on the boot that showed it.
+
+### Why the line could not say so
+
+It carried a raw token and nothing else — no address, no endpoint number, no kind. Every rMBP boot
+in the corpus prints two such halts:
+
+```
+STOP-NOTE interrupt endpoint halted (token 0x00088141)   <- 05ac:820a, the BT HID proxy keyboard
+STOP-NOTE interrupt endpoint halted (token 0x00048141)   <- 05ac:820b, the BT HID proxy mouse
+```
+
+`0x...8141` is **CERR 0**, status `0x41` = Halted + ERR: three consecutive transaction errors, the
+TT answering ERR. Neither of those endpoints has produced a report in any capture in the corpus, so
+retiring them is correct and is unchanged. Because two of them print every boot, the reader's prior
+is "the usual two", and the one boot where a third named the real keyboard read exactly like them.
+
+### The two halts are different faults, and the token already said which
+
+CERR unburned with no error bit set is the signature of a **STALL handshake**: the controller
+stopped because the device said stop, not because the wire failed. USB 2.0 §9.4.5 defines exactly
+one recovery for that — `ClearFeature(ENDPOINT_HALT)`, which also resets the device-side data
+toggle to DATA0 — and the interrupt path did not have it.
+
+| metal token  | CERR | status | class           | recoverable |
+|--------------|------|--------|-----------------|-------------|
+| `0x000a8d42` |  3   | `0x42` | `stall`         | yes         |
+| `0x00088141` |  0   | `0x41` | `xact-err-burn` | no          |
+| `0x00048141` |  0   | `0x41` | `xact-err-burn` | no          |
+
+Classification order is the semantics: babble, data-buffer error and missed-microframe are tested
+first — each is a host/bus fault that can coexist with the Halted bit and none is answered by
+clearing a device-side stall; the transaction-error arm then absorbs XactErr, the split ERR
+handshake, and `CERR == 0`; only Halted with the counter intact and no error bit anywhere is a
+stall.
+
+### What landed
+
+Three things, all inside `drivers/ehci`:
+
+1. `halt_class()` — classify the halted token and say whether §9.4.5 is the answer to it.
+2. The STOP-NOTE now names addr, endpoint, kind, mps, class, every decoded status bit, the report
+   count, the clear budget and its own verdict word. The `STOP-NOTE interrupt endpoint halted`
+   prefix is preserved so existing `awk` filters still match; the anonymous `(token …)` form is
+   gone from the media.
+3. Bounded recovery for `class=stall` only: at most `HALT_CLEARS_MAX` (2) clears per endpoint per
+   boot, `ClearFeature(ENDPOINT_HALT)` followed by re-arm at **DATA0**.
+
+**Ordering is load-bearing.** The clear is deferred past the `int_eps` borrow (a control transfer
+needs `&mut self`, the same shape ALLKEYS P1's `led_pushes` uses) and must reach the *device*
+before the overlay is rewritten: a fresh `QTD_ACTIVE` clears the QH's Halted bit while the device's
+stall condition survives, which is the trap `BtL3State::stopped` already documents. The re-arm
+starts at DATA0 because the clear reset the device's toggle; continuing the stream's toggle would
+have the first post-recovery packet discarded as a retransmission, and the endpoint would read
+silent a second time.
+
+A refused clear, or an exhausted budget, retires the endpoint exactly as before, held-key flush
+included. Two clears, not one and not unbounded: one is indistinguishable from "retry once and
+hope", and unbounded buys a control transfer on every pass of the ~1 kHz service loop for the rest
+of the boot.
+
+### What is not convicted
+
+**Why the device stalled is not decided by this capture, and no claim is made.** The intake
+hypothesis — a single keyboard slot the two armed keyboards collide over — is refuted:
+`MAX_INT_EPS` is 6, four endpoints were armed, both keyboards took distinct slots, and boot 10's
+own KBDWIT dump shows the QH chain intact. The ordering story is refuted too: boot 9 and
+`gr23-bootAR`'s second run both arm the same two keyboards 80 ms apart in the same order without
+stalling.
+
+What is convicted, and fixed, is that a transient stall became a dead keyboard for a whole boot,
+under a line that could not name which endpoint had died.
+
+### Reading the next boot
+
+`class=stall` followed by `HALT-CLEAR … -> ok — re-armed DATA0` and subsequent traffic means the
+hiccup was recovered. `-> REFUSED — endpoint retired` convicts the device side without another
+sitting. `class=xact-err-burn` on `05ac:820a` / `05ac:820b` is the routine per-boot pair and is not
+a fault to chase.
+
+---
+
+## 30. BT-RELEASE2 — the refused teardown, and the lever the stack did not have (`UNAOS_BT=1`, 2026-08-21)
+
+### The observation
+
+rMBP metal boot 11 (capture `rmbp3-boot11`). BT-L3 opened an LE link and could not close it:
+
+```
+[ 2350ms] bt-l3: LE Connection Complete — status=0x00 handle=0x0040 role=MASTER(initiator)
+          peer=88:c6:26:cc:2d:3c/public interval=0x0027 supervision_timeout=1000ms -> CONNECTED
+[ 2350ms] bt-l4: ACL OUT2 SENT 15/15 bytes  (ATT_READ_BY_TYPE_REQ, Battery Level)
+[ 2950ms] bt-l4: L4 tally — acl_packets_with_data=0 ... answered=false
+[ 2950ms] bt-l3: HCI_Disconnect (0x0406) SENT — handle=0x0040 reason=0x13
+[ 2953ms] bt-l3: HCI_Disconnect -> CommandStatus status=0x12 -> REFUSED. THE CONNECTION IS STILL
+          LIVE and this arc has no second lever for it
+[ 2953ms] bt-l3: L3 tally — events_read=5 ... disconnections_confirmed=0
+          left_outstanding=A LIVE CONNECTION — THIS IS THE MUST-NOT-APPEAR CONDITION
+```
+
+`0x12` is Invalid HCI Command Parameters. The link was then held for the remaining ~180 s of the
+boot, with the whole classic stage (§26, §27) running on top of it.
+
+### What the capture refutes, byte for byte
+
+The five candidates, and what boot 11's own bytes do to them:
+
+- **DMA corruption of the staged command block — REFUTED.** `bt_acl_txn` leaves its bulk-IN qTD
+  ACTIVE on the `nodata` path with `overlay[3] = data_buf_phys`, and that is the *same* EP0 data
+  buffer `bt_hci_send` stages `HCI_Disconnect` into; the ASS handshake in `bt_acl_txn` exists for
+  exactly this race. It did not fire here, and it could not have: an ACL-IN DMA fills `data_buf`
+  **from offset 0**, so it would clobber the two opcode bytes first — and the Command Status this
+  host matched on required `pkt[4..6] == 0x0406`. The opcode echoed back intact. Whatever the
+  controller disliked, it was in the three parameter bytes, not in the packet's head.
+- **Handle byte order or width — REFUTED.** `[handle as u8, (handle >> 8) as u8]` on `0x0040` is
+  `[40 00]`, correct little-endian; the same convention produced the 25-byte `Create_Connection`
+  block the controller *accepted* three seconds earlier, and BT-C1's `page bytes` line shows the
+  arc rendering LSB-first correctly on the same boot. `0x0040` is inside the Core range
+  `0x0000..0x0EFF`.
+- **Latched from the wrong field — REFUTED.** The Connection Complete decoder and the
+  `bt_l3_await` latch both read `pkt[4..6]` of a 21-byte LE meta event, and both printed
+  `handle=0x0040`; the disconnect printed the same value back.
+- **Sent before the controller finished setting up — REFUTED.** 600 ms and a completed ACL-OUT
+  separate the Connection Complete from the disconnect.
+- **The reason byte `0x13`, or a handle the controller had already retired — NOT SETTLED, and the
+  capture cannot settle them.** Both are on the table and the boot carried no evidence either way,
+  because `events_read=5` names three events and the teardown's waits **walked past two more
+  without recording them**. One of those two may well have been the `Disconnection Complete` for
+  handle `0x0040`: BT-L4 sat for 600 ms with the event endpoint unread while an ATT response never
+  came, and anything the controller emitted in that window queued up behind it.
+
+That is the finding. The arc had no way to distinguish "the reason byte was rejected" from "the
+handle was already gone", and no lever to try either.
+
+### The mechanism, and the fix (`drivers/ehci/mod.rs`)
+
+`HCI_Disconnect` carries exactly two parameters. The teardown is now a discrimination over them,
+and no step guesses:
+
+1. **`BtL3State::disc_seen` — the latch for the other end of the link's life.** The exact sibling
+   of `live_handle` (§22): any `Disconnection Complete` (0x05) with status 0x00 that *any* wait
+   walks past is latched with its handle and reason. It is consulted **before a single byte is
+   sent**. A link the peer ended is a link that is down, and issuing a disconnect on a retired
+   handle is itself a plausible reading of `0x12`.
+2. **`HCI_Read_RSSI` (0x1405) as a handle probe.** Two parameter bytes, one Command Complete, and
+   — the reason it is admissible under the arc's standing "no unrequested radio operation" rule —
+   **it transmits nothing**: Vol 4 Part E §7.5.4 makes it a read of the controller's own record of
+   the last packet received on that handle. Status `0x02` (Unknown Connection Identifier) means the
+   controller has no such handle, so **no link is held**; status `0x00` proves the opposite, and
+   with it that the refused disconnect's handle was legal. Boot 11's
+   `HCI_Read_Local_Supported_Commands` reply carries `cmds[15]=0xfe` and Read_RSSI is octet 15
+   bit 3, so this controller advertises it — the code does not rely on that, and treats `0x01`
+   (Unknown HCI Command) as "the probe is unavailable here".
+3. **One retry with reason `0x05` (Authentication Failure)**, run only when the probe found the
+   link live. `0x05` is on the same short list the Core spec permits a host to send
+   (0x05, 0x13-0x15, 0x1A, 0x29, 0x3B), so the retry varies **exactly one byte** against a control
+   that has already been established. Accepted where `0x13` was refused ⇒ the reason byte was the
+   invalid parameter, and the link is released in the same round trip.
+4. **The teardown event trail.** A bounded record (`BT_L3_TRAIL_MAX` = 8 codes, saturating count)
+   of what the teardown's waits stepped over, printed on any teardown that did not go cleanly. It
+   is what boot 11 was missing.
+
+`bt_l3_disconnect` keeps its `bool` return, and it still means only one thing — *a
+`Disconnection Complete` with status 0x00 for this handle was observed* — so
+`disconnections_confirmed=` cannot start meaning two things. The richer verdict rides on
+`BtL3State::release` (`Confirmed` / `HandleGone` / `StillLive` / `Inconclusive`), and `HandleGone`
+is the one that changes an outcome: it clears `live` on both the LE (§22) and classic (§26) paths,
+so the tally stops reporting a live connection the controller does not have, and `bt_left_link`
+(§25) stops latching a dead handle.
+
+**Cost:** `0` on any boot that lets go the first time. At most `BT_L3_CMD_MS` (probe) +
+`BT_L3_CMD_MS` + `BT_L3_DISC_MS` (retry) = **+1.2 s**, paid only by the boot that is currently
+leaking a link for its entire life.
+
+### Does the held link explain the speaker never pairing?
+
+**On this host's side, no — and the capture is unambiguous about it.** With the LE link believed
+live the whole time, the controller *accepted and ran to completion* both classic operations:
+
+```
+[ 2956ms] bt-c1: HCI_Inquiry (0x0401) -> CommandStatus status=0x00 -> ACCEPTED
+[ 8079ms] bt-c1: Inquiry Complete (0x01) status=0x00 — the controller ran the full 5120ms
+[ 8082ms] bt-c1: HCI_Create_Connection (0x0405) -> CommandStatus status=0x00 -> ACCEPTED
+[13206ms] bt-c1: observed=5124ms deadline_in_force=5120ms (100% of it) ... status=0x04 PAGE TIMEOUT
+```
+
+A controller blocked by a live LE link answers `0x0C` (Command Disallowed) or returns early. This
+one inquired and paged for 100 % of both deadlines. **The held LE link does not block inquiry or
+page on the BCM20702.**
+
+**On the peer's side it is the leading suspect, and the capture cannot rule it out.** Two facts
+push against the working assumption that `88:c6:26:cc:2d:3c` is an LE-only mouse and therefore an
+irrelevant bystander:
+
+- its advertisement's **Flags byte is `0x1A`** — `02 01 1a` in the raw AD — and bit 2
+  (*BR/EDR Not Supported*) is **clear**, with bits 3 and 4 (*Simultaneous LE and BR/EDR*, controller
+  and host) both **set**. That is a dual-mode device advertising itself as one. An LE-only mouse
+  advertises `0x06`.
+- `03 03 61 fe` is a Complete 16-bit Service UUID list containing **0xFE61 = Logitech**, and
+  Ultimate Ears is a Logitech brand — so the UUID is consistent with the MEGABOOM as well as with
+  a Logitech mouse.
+
+So the ordering the arc runs is wrong-shaped for a dual-mode target: BT-L3 takes an LE link to the
+target at 2.35 s and **never lets go**, and BT-C1 then spends 5.1 s inquiring for it and 10.2 s
+paging it while that link is held. A dual-mode peer with an active LE link from this host is under
+no obligation to keep inquiry-scanning or page-scanning for it — and the inquiry heard **zero
+responses of any kind** in 5120 ms with all three result shapes unmasked (bits 1, 33 and 46),
+which is a silence worth explaining.
+
+The fix is also the experiment. There are exactly two readings and one boot separates them:
+
+- **The leak was the cause.** With the teardown confirmed, BT-C1's inquiry runs with no LE link
+  held; the target answers the inquiry, the page is clock-aligned, and a link forms.
+- **The leak was a bystander.** The inquiry still returns `inquiry_responses=0` and both trains
+  still time out — in which case the remaining suspect is receive sensitivity, which the LE side
+  already hints at (one device, 5 reports, `-88dBm` across a 500 ms window), and the address
+  constant should be re-derived from a classic inquiry rather than from an LE advertisement.
+
+`BTNAME=0` across the whole boot is a consequence of the above, not an independent fault: no
+classic link ever formed, so nothing was ever there to name.
+
+**And there is a blunter answer that sits in front of all of it.** The operator identifies
+`88:c6:26:cc:2d:3c` as a Logitech M196 — *not* the speaker. `BT_L3_PEER_ADDR` is that constant, it
+`DECIDES ALONE` (§22), and BT-C1 pages whatever BT-L3 selected: boot 11's `page bytes` line reads
+`params=[3c 2d cc 26 c6 88]`, twice. If that address is the mouse, then **across a 200 s boot with
+a speaker powered on and in pairing mode two metres away, this stack never once addressed the
+speaker** — and no amount of teardown correctness will pair a device that is never paged. The
+teardown leak is real, is fixed here, and is *not* the reason the speaker did not pair on boot 11;
+the target constant is. That is a peer-selection question, not a teardown question, and it belongs
+to a different arc. The Flags/UUID evidence above is recorded because it does not sit comfortably
+with the identification — an M196 should advertise `BR/EDR Not Supported` set, and this advertiser
+does not — and settling *which device that address is* is the first thing the next sitting should
+do, before any conclusion is drawn from another page timeout against it.
+
+### Reading the next boot — the metal watch list
+
+Confirmations, in the order they can appear:
+
+- `bt-l3: HCI_Disconnect (0x0406) SENT — handle=… reason=0x13 (REMOTE-USER-TERMINATED)
+  params=[.. .. 13] = Connection_Handle(2,LE) Reason(1), parameter_total_length=3` — the staged
+  block is now in the capture. Byte order is settled from the line itself, with no inference.
+- **The clean case:** `Disconnection Complete — status=0x00 handle=… -> DISCONNECTED` followed by
+  `L3 tally — … disconnections_confirmed=1 … left_outstanding=none`. That is the fix working.
+- **The peer-terminated case:** `LINK ALREADY RELEASED — a Disconnection Complete status=0x00 …
+  was WALKED PAST by an earlier wait`, then `disconnections_confirmed=1` with **no HCI_Disconnect
+  sent at all**. This convicts the boot-11 refusal as a command aimed at a retired handle.
+- **The stale-handle case:** `HANDLE PROBE -> status=0x02 (UNKNOWN CONNECTION IDENTIFIER) — THE
+  CONTROLLER HAS NO SUCH HANDLE`, and the tally reading `left_outstanding=none — THE HANDLE WAS
+  ALREADY RETIRED`. Same conviction, reached by the probe instead of the latch;
+  `disconnections_confirmed` stays `0` **and that is correct** — nothing was released, because
+  nothing was there.
+- **The reason-byte case:** `HANDLE PROBE -> status=0x00 … THE LINK IS LIVE`, then
+  `SECOND LEVER WORKED — the same handle that was refused with reason=0x13 was ACCEPTED with
+  reason=0x05`, and `disconnections_confirmed=1`. This convicts the controller's parameter check.
+
+Refutation — what says the fix did not settle it:
+
+- `SECOND LEVER EXHAUSTED — the retry was REFUSED too (retry_status=0x12), on a handle the probe
+  called LIVE` plus `left_outstanding=A LIVE CONNECTION`. Both permitted reasons refused on a
+  handle proven live exonerates the parameter *values*, and the next discriminator is then the
+  command **packet** — the `parameter_total_length` byte or the EP0 data stage that carries it —
+  which needs a controller-side read of what it received and is a different arc.
+- `teardown event trail — N event(s) walked past …, codes=[…]` is the line to read in either
+  direction. `05` in that list means a `Disconnection Complete` went by; `13` is
+  Number Of Completed Packets from BT-L4's ACL OUT and is expected.
+
+Gates: `./arroyo check` green both arches (12 cfg legs, `x86-all` carries `bt,btc`) and green again
+with `UNAOS_BT=1 UNAOS_BTC=1`. No QEMU leg — QEMU has no Bluetooth controller and could never have
+judged this. Reachability was proven with `strings` on the armed builder-path `kernel.elf`.
+
+### The verdicts, flown (BTREGRESS, 2026-08-22) — read this before anything above it
+
+§30 above proposed two experiments and asserted one "blunter answer". **All three are now settled
+from captures already on disk. Two of §30's positions are refuted. Nothing above this subsection
+should be quoted without it.**
+
+#### 1. "The leak was the cause" — REFUTED. The leak was a bystander.
+
+BT-RELEASE2 shipped in `f66b1480` and flew on `rmbp4-boot13` (2026-08-22, four boots). The teardown
+now works exactly as §30's "peer-terminated case" predicted, and the page failed anyway:
+
+```
+[ 2958ms] bt-l3: SECOND LEVER NOT NEEDED — a Disconnection Complete status=0x00 handle=0x0040
+          reason=0x3e was walked past by this teardown's own waits ... RELEASE CONFIRMED
+[ 2958ms] bt-l3: L3 tally — ... disconnections_confirmed=1 ... left_outstanding=none
+[ 8085ms] bt-c1: inquiry summary — responses=0 target_found=false ... THE INQUIRY HEARD NOTHING
+[19613ms] bt-c1: page summary — attempts_run=2/2 pages_on_air=2 page_timeouts=2 -> NOT REACHED
+```
+
+No LE link is held when BT-C1 runs, the inquiry still hears nothing, both trains still time out.
+This is §30's own second reading, and it is the one that happened. **The teardown fix is correct
+and is not the pairing fix.** The `left_outstanding=A LIVE CONNECTION` condition is closed.
+
+#### 2. "The blunter answer" — that this BD_ADDR is a Logitech M196 mouse — REFUTED, in band, twice.
+
+§30 argued the stack "never once addressed the speaker". The refutation was already sitting in two
+captures, printed as three undecoded hex bytes:
+
+```
+gr26-bootC  2026-08-11  bt-c1: inquiry result — addr=88:c6:26:cc:2d:3c psrm=0x01(R1)
+                              clock_offset=0xac50 class_of_device=240418 event=0x02(standard)
+rmbp1-boot1 2026-08-18  bt-c1: inquiry result — addr=88:c6:26:cc:2d:3c psrm=0x01(R1)
+                              clock_offset=0x3800 class_of_device=240418 event=0x02(standard)
+```
+
+`class_of_device` is printed MSB-first hex with no prefix, so this is **0x240418**: Major Device
+Class `0x04` = **Audio/Video**, Major Service Classes with **Audio** (bit 21) and **Rendering**
+(bit 18) set. An audio sink. A mouse is Major Device Class `0x05` (Peripheral). These are *classic
+inquiry responses* — they came from the BR/EDR controller at the address the page is aimed at, so
+they also kill the sibling theory that a dual-mode device pages under an address other than the one
+it advertises. Peter's 2026-08-22 ruling says the same; this is the wire agreeing with him seven
+days before it was asked. `bt_c1_cod_decode` now decodes this field on the line itself so the next
+reader does not have to.
+
+#### 3. The RSSI premise is misattributed — it is an LE measurement, not a BR/EDR one.
+
+The `-86 dBm`/`-88 dBm` readings used to exclude "off" and "out of range" come from `bt-l2`, which
+is the **LE scan**, reporting `evt=ADV_IND` on the LE PHY. They prove the peer's LE radio is alive.
+They say nothing about BR/EDR inquiry scan or page scan. In the same boots the peer's *BR/EDR*
+inquiry response count is `0`. The two are different radio states on the same chip, hundreds of log
+lines apart, and reading one as evidence about the other is what kept "range/power" alive as a
+refuted-but-repeated claim. The page-summary prose now states this scope explicitly.
+
+#### 4. There is no regression commit. The bisect window is clean and it convicts nothing.
+
+Links were established on exactly two boots, both 2026-08-11: `gr25-bootA` (attempt 2/2) and
+`gr26-bootD` boot 2 (attempt 2/2). Diffing the HCI command traces, the entire on-air difference
+between the era that linked and the era that has not is **one command**: `HCI_Inquiry` (0x0401),
+added by the `bt-page` arc (`1cf20d47`, merge `12529544`, 2026-08-11), together with the two
+read-backs `HCI_Read_Inquiry_Mode` (0x0C44) and `HCI_Read_Page_Timeout` (0x0C17), neither of which
+transmits. `bt-ssp` (`d8216d1b`, 2026-08-12) is exonerated outright: it issues nothing before a
+link exists, and no link has existed since.
+
+**`bt-page` is exonerated too, by same-day controls.** On 2026-08-11, with no inquiry stage in the
+image, `gr25-bootB` (two boots), `gr25-bootC` and `gr26-bootD` boot 1 produced **8 page trains and
+0 links**. The successes are 2 of 12 blind trains on a single day, not a working baseline. And on
+2026-08-18 `rmbp1-boot1` boot 1 ran an inquiry that *heard the target*, paged it with the peer's own
+`psrm=R1` and a valid harvested clock offset — and both trains timed out. An inquiry that helps the
+page cannot be the thing that broke it.
+
+What did change with the era, on both transports at once: the peer stopped answering. `bt-l4`'s ATT
+Battery-Level read reports `answered=true` on 2 of 5 boots on 2026-08-11 and `answered=false` on
+**every** boot since (14+). A defect in the BR/EDR page path cannot stop an LE ATT read from being
+answered. The BR/EDR page timeout is the controller's own verdict about the air, delivered on the
+event endpoint, on a full-length train (`observed=5123ms deadline_in_force=5120ms ... FULL`).
+
+#### 5. What is actually left, and the one boot that settles it
+
+Every candidate this arc has chased is now weakened or dead: peer identity (dead), peer address
+(dead), held LE link (dead), power/range (dead — but only by the *inquiry*, not by the LE RSSI),
+clock-offset ageing, train phase, and controller train length (all three measured and excluded on
+`rmbp4-boot13`'s `CANDIDATE-3 ... FULL` lines).
+
+The survivor is the one thing no outbound page can measure: **the peer's page-scan enable.** A
+device that answers an inquiry is *inquiry*-scanning. Inquiry scan and page scan are separate
+enables, and "discoverable but not connectable" is an ordinary state for a speaker that is already
+bonded or connected elsewhere. Every attempt so far has tested the same direction.
+
+**The experiment is a direction test, and it is one boot.** Make this host page-scannable and let
+the speaker connect *inbound*: issue `HCI_Write_Scan_Enable` (0x0C1A) with `0x03` (inquiry scan +
+page scan) before BT-C1's outbound attempts, put the speaker into pairing mode, and wait one page
+window. The two outcomes are exclusive and neither needs a follow-up question:
+
+- **A `Connection Request` (0x04) event arrives** ⇒ the RF path works in both directions and the
+  peer's BR/EDR radio will initiate; the fault is our outbound page train or the peer's page-scan
+  enable, and the arc moves to `HCI_Write_Page_Scan_Activity`/train-length work.
+- **Nothing arrives, while the same boot's inquiry still hears the target** ⇒ the peer is
+  discoverable and not connectable in either direction; the fault is the peer's connectable state
+  (bonded/connected elsewhere, or past its pairing window) and no host-side page change will fix it.
+
+⚠ **This needs Peter's explicit go before it is built.** `Write_Scan_Enable` makes the machine
+discoverable and page-scannable, which is precisely what BT-C1's existing witness prose says the
+arc deliberately does *not* do ("paging out needs none of it, while enabling it would make this
+machine discoverable"). It is a new posture, not a tweak, and it belongs behind its own knob.
+
+> **Built as §34 (BT-DIR, 2026-08-25), behind its own `UNAOS_BTDIR=1` knob.** Two of this
+> subsection's details did not survive contact and §34 records why: the write goes **after** the
+> outbound page train, not before it (before would time-slice the controller against the very train
+> this section's evidence is drawn from, destroying the control), and the two outcomes above are
+> **three** — a boot whose inquiry heard nothing is `VOID`, not `NEGATIVE`, and recent boots report
+> `responses=0`, so VOID is the likely one.
+
+---
+
+<!-- SYNC-FOLD 2026-08-22: trunk added this section as §28 while the rmbp track added §§28-30
+     (BT-BOND / KBDFLAP / BT-RELEASE2). Both are EOF appends; the section number is the only
+     collision. Trunk's BOTSEQ is renumbered 28 -> 31 because docs/SECURITY.md cites §28.5
+     (BT-BOND at-rest posture) and no reference anywhere cites BOTSEQ by number. Body verbatim. -->
+
+## 31. BOTSEQ — the mount runs before the probe matrices (2026-08-21)
 
 The behavioural follow-up BOTCLAIM (e3c466f3) deferred to its own arc.
 
@@ -7356,7 +8234,454 @@ and THEN the wedge inside the matrices convicts the probes' command mix (read12/
 induced-stall), not sequence depth — and the desktop line gets its filesystem before the reader
 dies. A mount that still times out ahead of any matrix reopens the position/depth theory.
 
+## 32. WAITBUDGET — the wait-budget figures, derived and cited (2026-08-25)
+
+Four incompatible clock figures for the same waits had accumulated in this file and in the
+`drivers/xhci/mod.rs` doc comments — "~6 s / ~2 s", "≈ 8.3 s", "~7.2 s on Pi 4", "~7.2 s at
+62.5 MHz" (the last two naming the *same* wait), plus a "~2.5 s" for the base budget that no
+platform in the fleet actually produces. The root cause is recorded at
+`arch/aarch64/mod.rs:420–460` (the HWBUDGET tail block, folded 2026-08-25, commit `0c7cdeb6`):
+`HW_WAIT_BUDGET` is a CYCLE count that was repeatedly read as a DURATION, and a fixed cycle count
+is a different duration on every timebase. This section is the normative derivation. Every
+clock/time figure elsewhere in this file is either platform-qualified in place or points here.
+Code citations are file:line under `unaos/crates/kernel/src/` at `ca4fa538`.
+
+### 32.1 The base budget, `hw_wait_budget()`
+
+| platform | timebase and rate | derivation | base budget |
+|---|---|---|---|
+| x86, calibrated | TSC, measured (bench metal ≈ 2.6938 GHz, §12) | `tsc_hz × HW_WAIT_SECONDS`, `HW_WAIT_SECONDS = 2` (`arch/x86_64/mod.rs:137,150–156`) | **2.0 s** |
+| x86, calibration failed | TSC, unknown | fixed `HW_WAIT_BUDGET = 2_500_000_000` cycles (`arch/x86_64/mod.rs:144`) | 2.5 G cycles — a duration only once a rate is assumed |
+| Pi 4 (aarch64 off-tegra) | CNTVCT at CNTFRQ = 54 MHz (boot diag; BOTBOUND boot 11 measured `spent_ms=2779` against 150e6/54e6 = 2777.8 ms) | fixed `HW_WAIT_BUDGET = 150_000_000` ticks (`arch/aarch64/mod.rs:339,479–480`) | **150e6 / 54e6 = 2.78 s** |
+| QEMU virt (aarch64 off-tegra) | CNTVCT at CNTFRQ = 62.5 MHz | same 150e6-tick constant | **150e6 / 62.5e6 = 2.4 s** |
+| Jetson Orin (`tegra`) | CNTVCT at CNTFRQ = 31.25 MHz (capture-proven, `arch_arm64.md` JM3) | `cntfrq × HW_WAIT_MS / 1000`, `HW_WAIT_MS = 4800` (`arch/aarch64/mod.rs:461,467–472`) | **4.8 s** (31.25e6 × 4.8 = 150e6 ticks exactly) |
+| tegra with CNTFRQ_EL0 = 0 | CNTVCT, rate unprogrammed | falls back to the 150e6-tick constant (`arch/aarch64/mod.rs:467–472`) | 150e6 ticks — duration unknowable, same cycle count as shipped |
+
+The Orin's 4.8 s is **kept deliberately**, not an accident of the derivation: 31_250_000 × 4800 /
+1000 = 150_000_000 reproduces the pre-derivation cycle count to the cycle, and the 60 s xusb
+enumeration window (`arch/aarch64/xusb_tegra.rs:1791–1801`) is metal-tuned against exactly that
+pace — a 20 s window lost the keyboard on metal. Retired figures: **"~2.5 s"** for the aarch64 base
+budget (it assumed a ~60 MHz generic timer; no part in this tree runs at 60 MHz) and **19.2 MHz**
+for the Pi's CNTFRQ (that is the Pi 3 crystal; the code reads CNTFRQ_EL0 and the Pi 4 reports
+54 MHz — though Tegra silicon *has* shipped 19.2 MHz parts, which is one reason tegra derives from
+the register instead of trusting a constant).
+
+### 32.2 The derived per-wait figures
+
+All rows are `base × k` or `base / k` — nothing else in the BOT/claim paths sets its own clock.
+
+| wait | scale on base (citation) | x86 | Pi 4 | QEMU virt | Orin |
+|---|---|---|---|---|---|
+| BOT first-attempt stage wait (`pump_until_bot_done`) | × `BOT_BUDGET_SCALE_FIRST` = 3 (`drivers/xhci/mod.rs:1076`) | 6.0 s | 8.33 s | 7.2 s | **14.4 s** |
+| BOT escalation-retry stage wait | × `BOT_BUDGET_SCALE_ESCALATION` = 1 (`drivers/xhci/mod.rs:1077`) | 2.0 s | 2.78 s | 2.4 s | 4.8 s |
+| dead-ring cut budget (BOT-PARK) | ÷ `BOT_PARK_DEAD_DIV` = 8 (`drivers/xhci/mod.rs:1157,10520`) | 0.25 s | 0.35 s | 0.30 s | 0.60 s |
+| block-layer claim wait, unmasked (`claim_xhci_for_io`) | × 1 (`drivers/block.rs:63–77`) | 2.0 s | 2.78 s | 2.4 s | 4.8 s |
+| FAT/dir RMW retry wall-clock cap (WEDGE-8) | × 1, AND ≤ `RMW_BUSY_ATTEMPTS` = 64 attempts (`fs/fat.rs:1215,1263–1288`) | 2.0 s | 2.78 s | 2.4 s | 4.8 s |
+
+Reading the retired contradictions against this table: **"6 s / 2 s"** are the x86 column of rows
+1–2; **"8.3 s"** is the Pi 4 column of row 1; **"~7.2 s"** is the QEMU-virt column of row 1 and was
+never a metal figure on any platform — the places that attributed it to "Pi 4" or to "metal" have
+been corrected in place.
+
+### 32.2a The quarter budget, `hw_wait_budget() / 4` — 500 ms and ~0.27 s reconciled (2026-08-25)
+
+Three code sites still divide the base by 4 — and none of them is the pre-CCS-scan settle any
+more (that has been `settle_ms × cycles_per_ms()`, 150/100 ms nominal, since BOOTPACE M4 / CCSTRIM
+— §2d): the `usbdebug`-gated ENABLE_SLOT response diagnostic (`drivers/xhci/mod.rs`, the
+`hw_wait_budget() / 4` wait after "Failed to send Enable Slot" handling), and the two BT
+uncalibrated-TSC fallbacks (`drivers/ehci/mod.rs`, `bt_l3_budget` and the L2 scan-window fallback
+— both taken **only** when `tsc_hz() == 0`). Per platform and calibration state, `base / 4` is:
+
+| platform (base — §32.1) | quarter |
+|---|---|
+| x86, calibrated (2.0 s) | **0.50 s** (`tsc_hz × HW_WAIT_SECONDS` / 4 = 2 s / 4) |
+| x86, calibration failed (2.5e9 cycles) | **625e6 cycles** — a duration only once a rate is assumed: ≈ 0.27 s at the bench part's 2.3 GHz nominal, ≈ 0.23 s at its measured 2.6938 GHz (§12), ≈ 0.13 s at 5 GHz, ≈ 0.63 s at 1 GHz |
+| Pi 4 (150e6 ticks @ 54 MHz = 2.78 s) | 37.5e6 ticks = **0.69 s** |
+| QEMU virt (150e6 ticks @ 62.5 MHz = 2.4 s) | 37.5e6 ticks = **0.60 s** |
+| Jetson Orin, `tegra` (150e6 ticks @ 31.25 MHz = 4.8 s) | 37.5e6 ticks = **1.2 s** |
+
+**Reconciliation.** Two standing figures for this one expression — `bootpace.md`'s "≈ 500 ms"
+(the M4-era settle) and the "~0.27 s" quoted beside the BT fallbacks (`drivers/ehci/mod.rs` doc
+comments; the same figure rides the WINDOW-SHORT ledger row in §34 below, now platform-qualified) —
+sit 1.85× apart because they are DIFFERENT ROWS of this table, not because either is wrong:
+500 ms is the **calibrated-x86** quarter (2 s / 4), and ~0.27 s is the **calibration-failed x86**
+quarter (625e6 cycles read at the 2.3 GHz nominal rate — the only state in which the BT fallbacks
+take `/ 4` at all). Neither figure is portable off x86, and the uncalibrated one is not a duration
+at all until a rate is assumed. Any site quoting `hw_wait_budget()/4` states its row — platform
+AND calibration state — or cites this table.
+
+### 32.3 The BOT-vs-block-claim inversion — known, dated, deliberate
+
+**Recorded 2026-08-25.** Provenance: surfaced by the HWBUDGET derivation arc (commit `0c7cdeb6`,
+which made the Orin's 4.8 s base visible as a duration), confirmed by the rmbp seat's independent
+review of this file's figures the same day.
+
+A **healthy** BOT transaction may hold the controller loan for up to one first-attempt stage wait —
+`hw_wait_budget() × 3` (`drivers/xhci/mod.rs:1076`): **14.4 s on the Orin**, 8.33 s on the Pi 4,
+6 s on x86. Every unmasked claimant of the same controller waits at most `hw_wait_budget() × 1`:
+`claim_xhci_for_io` bounds its `hlt` retry loop by one base budget (`drivers/block.rs:63–77`), and
+the FAT/dir RMW retry carries the same wall-clock cap (**4.8 s on the Orin**, 2.78 s Pi 4, 2 s
+x86). The transaction budget therefore exceeds the claimant's wait by a factor of 3 **on every
+platform, by construction** — the two figures are the same base times different multipliers, so no
+CNTFRQ, calibration, or platform choice can un-invert them. Concretely: a device exercising its
+legitimate stall allowance (1–4 s per write is *inside* a healthy first attempt, kept precisely so
+slow-but-healthy sticks are not failed) can hold the loan longer than any claimant will wait, and
+the claimant then surfaces `BlockError::Busy` / `-EAGAIN` with nothing wrong on the wire.
+
+This is a documented fact, not a scheduled fix, because both sides of the ratio are held on
+purpose: the 3× transaction budget is metal-earned (shortening it fails slow-but-healthy sticks —
+`drivers/xhci/mod.rs:1070–1075`; on the Orin the 60 s enumeration window is tuned against the 4.8 s
+base), and the 1× claim wait is what keeps the masked-side FAT RMW retry cost bounded, which is the
+point of WEDGE-8. The consequence callers must own: `Busy`/`-EAGAIN` during a healthy-but-slow
+transfer is a normal, retryable outcome, not evidence of a wedge. Two standing texts contradicted
+this before today; both are now corrected: `xhci_concurrency.md` §"What a `Busy` costs in practice"
+claimed the bounded waits "cover" a healthy transaction (corrected 2026-08-25 — true only of
+transactions that complete in milliseconds, not of what a healthy transaction is *allowed*), and
+the `claim_xhci_for_io` doc comment (`drivers/block.rs:58–62`) said one base budget is "long
+enough for any healthy service pass or BOT transaction" — corrected 2026-08-25 (this arc, same
+lines, line-count-neutral): it now states the 1× wait covers a healthy SERVICE PASS, that a
+healthy BOT transaction (budgeted 3×) can outlast it, and that `Busy` is then a normal, retryable
+outcome, cross-referencing this section.
+
+## 33. ISRARM — the HID endpoint is re-armed from the completion interrupt (2026-08-22)
+
+### 33a. The defect, and the number it costs
+
+An armed HID interrupt-IN endpoint on the EHCI-3 driver holds **exactly one report**. From the
+instant the controller retires the transfer until a service pass rewrites the overlay, the endpoint
+is DARK: the device has nowhere to land a report, so what it sends is dropped **on the wire**. No
+downstream instrument can see it — `EVQ_DROP_PTR` counts a full event ring and
+`pointer_motion_coalesced` counts a slow drain, and both are about reports that at least reached
+memory.
+
+EHCIDARK (§ the `[EHCIDARK]` census, `drivers/ehci/mod.rs`) put numbers on it. From the bench corpus:
+
+```
+EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=132 cad=1ms windows=57 dark=400ms  max=55ms missed<=343
+EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=232 cad=1ms windows=64 dark=1853ms max=80ms missed<=1602
+EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=291 cad=1ms windows=89 dark=2666ms max=80ms missed<=2390
+EHCIDARK addr=8 ep=IN3 kind=kbd       reports=13  cad=1ms windows=4  dark=144ms  max=96ms missed<=140
+```
+
+This is the operator-facing defect described as *"quite a bit of sliding to wake up the pointer"*.
+The worst single dark window in the corpus is **96 ms**, not the 55 ms a single boot suggested, and
+the census's own self-calibrated cadence reads **1 ms and 5 ms — never 8 ms**. Any design sized
+against "8 ms cadence, 55 ms worst case" is sized against numbers the corpus does not support.
+
+### 33b. THE RING THAT CANNOT BE BUILT — read this before reaching for depth
+
+The natural fix is depth: convert the single re-armed qTD into a chained ring of qTDs so the
+endpoint can hold 8 reports instead of 1. **It cannot be built on this silicon, and attempting it
+does not degrade — it wedges the controller.** This section exists because `IntEp`'s doc-comment
+says "single re-armed qTD" and the next reader will otherwise reach for exactly this.
+
+The blocker is `Controller::overlay_mode` (§10). Both EHCI functions on the 2012 rMBP run
+**overlay-direct**, and every metal boot in the corpus (14 of 14 that reach HID arming) re-witnesses
+it:
+
+```
+:: EHCI-HID: [0] qTD-fetch HSE — OVERLAY-DIRECT mode + full HCRESET re-init (probe-14 silicon finding) ::
+:: EHCI-HID: [1] chain-HSE verdict CARRIED from an earlier controller — OVERLAY-DIRECT for this port walk ::
+```
+
+Controller **[1]** is the one carrying the internal trackpad (`addr=8 ep=IN1 kind=vendor-mt`). It
+does not even run the probe — it inherits the verdict through `CHAIN_HSE_SEEN`.
+
+In overlay-direct mode `arm_interrupt_ep` writes the transfer straight into the QH overlay, pins
+both `overlay[0]` (Next qTD Pointer) and `overlay[1]` (Alternate Next) to `PTR_TERMINATE`, and
+discards the descriptor outright:
+
+```rust
+let _ = (qtd, qtd_phys); // slot storage retained; the controller never sees it
+```
+
+So:
+
+1. **There is no qTD in the controller's world to chain.** A ring is a chain of Next qTD Pointers;
+   this controller is never given one.
+2. **Giving it one means taking the fetch path that master-aborts.** That is what probe-14 measured
+   and what `overlay_mode` exists to avoid. An HSE'd controller is wedged — the driver's own note
+   records that `RS` alone does not recover it, only a full `HCRESET` re-init — so the failure mode
+   is *no trackpad and no keyboard for the boot*, strictly worse than the reports being dropped.
+3. **Even in chain mode the naive ring is wrong.** Every trackpad report is a SHORT packet (8-byte
+   Report ID 0x02 against `mps=64`), and EHCI 1.0 §4.10.2 advances a queue retired by a short IN
+   through the **Alternate Next qTD Pointer** — which `write_qtd` hardcodes to `PTR_TERMINATE`. A
+   ring chained only on `next` would go idle after member 0, reproducing the defect. Both pointers
+   would have to chain.
+4. **And depth 8 would not have been enough anyway.** 8 × 8 ms = 64 ms does not cover the corpus's
+   80 ms and 96 ms windows, and at the census's own measured `cad=1ms` the depth required for a
+   55 ms window is ~55.
+
+A depth-8 chain of **QHs** (rather than qTDs) for the same endpoint would sidestep (1) and (2), since
+it uses only overlay-direct arming and periodic-list traversal — both already proven on this metal.
+It is **parked, not rejected**: it needs a software toggle sequenced across 8 queue heads, it burns
+8 static slots per endpoint, and it issues several INs per frame to one interrupt endpoint. It has
+never been tried on this silicon and must not be shipped to the daily-driver machine unmeasured.
+
+### 33c. The shape that works in both modes
+
+`QTD_IOC` is set on every arm — **including the overlay-direct one** — so the controller has been
+raising `USBSTS.USBINT` on every completion since the driver was written. Nothing listened: the
+module header used to read *"No interrupts: no USBINTR write, no IDT vector, no MSI"*, and
+`deadman`'s residual note had already observed that `QTD_IOC` sets `USBINT` even with `USBINTR`
+masked.
+
+ISRARM consumes it. `USBINTR.USBINT` is unmasked, the function's MSI is routed to the local APIC on
+IDT vector `EHCI_MSI_VECTOR` (0x43), and the endpoint is re-armed **from the completion itself**. The
+dark window stops being the service-pass period and becomes interrupt latency. It needs no qTD, so
+it is indifferent to `overlay_mode` — the property the ring could never have.
+
+### 33d. The polled path is still the load-bearing one
+
+This is the risk posture, and it is deliberate.
+
+`service()` is unchanged in what it *can* do: it still reads the token, decodes, re-arms, and retires
+a halted endpoint. The ISR is a **latency layer on top**. On a controller with no MSI capability, or
+a boot where the vector is never delivered, the pass finds the completion exactly where it always did
+and the boot is indistinguishable from before this arc except in the counters. **There is no state in
+which a dead interrupt produces a dead trackpad.**
+
+INTx is not a fallback and is not attempted: this kernel is a pure local-APIC system with no IOAPIC
+redirection programming anywhere in the tree, so a legacy INTA# assertion has nowhere to be
+delivered. A controller without MSI simply stays polled, and says so.
+
+### 33e. The mechanism
+
+| piece | what it is |
+|---|---|
+| `ISR_EPS[12]` | the ISR's whole view of an armed endpoint — QH/qTD/buffer pointers, transfer total, `overlay_mode`, the data toggle, the EHCIDARK clock, ring cursors. Plain atomics, published by `arm_interrupt_ep`. The ISR never touches `Controller` and therefore never the `EHCI_HID` mutex. |
+| slot index | DERIVED as `idx * MAX_INT_EPS + int_next`, so it is unique by construction and the publish path has no failure mode for the ISR to carry. |
+| hand-off ring | 8 slots × 64 B per endpoint. **Not hardware depth** — the endpoint still holds one report. It is where the ISR puts a report so it can re-arm before the pass has decoded anything. SPSC: the ISR produces (MSI targets one APIC id), the pass consumes under `EHCI_HID`. |
+| per-endpoint claim | one `AtomicU32`, `compare_exchange` **try-only on both sides, spinning on neither**. The pass may run on a different core than the MSI target, so masking interrupts is not mutual exclusion. The ISR losing costs one pass period — today's behaviour. The pass losing costs nothing: the report is in the ring. |
+| `isr_rearm` | the **single** re-arm implementation. The overlay-direct/qTD-chain fork and the data toggle each exist exactly once; `IntEp::toggle`, `IntEp::qtd_phys` and `IntEp::buf_phys` were removed because a second copy of either is a second truth. |
+| `STS_USBINT` ack | the ISR writes back **bit 0 only**, never the blind `STS_RW1C` (0x3F) the pass uses. That mask includes `STS_HSE`, which four control-transfer sites READ post-init to decide whether the silicon has wedged; an ISR clearing it would make an HSE'd controller look healthy to the code whose job is to notice. `USBINTR` unmasks bit 0 and nothing else, so bit 0 is the only bit that can be asserting the interrupt. |
+
+**Ordering is the correctness of the whole arc.** A pass drains the hand-off ring **before** it reads
+the endpoint directly. Everything in the ring is strictly older than anything still in the endpoint,
+so ring-first is what keeps a delta stream monotonic across two producers — trackpad reports are
+deltas, and delivering them out of order is worse than dropping them. Both sources then feed **one**
+body: one decoder, one census, one set of `pal` pushes, differing only in the pointer they read from.
+
+**Nothing on the interrupt path can wedge the machine.** No lock it can wait on (`EHCI_HID` is held
+by the pass across a `hw_wait_budget()` control transfer — taking it there would self-deadlock
+exactly as the xHCI MSI handler's comment warns). No allocation, no formatting, no printing — every
+ISRARM line is emitted by the polled pass. Work bounded at 12 endpoints × (a few volatile reads + a
+≤64-byte copy). Halts are refused outright and left to the pass, which owns the STOP-NOTE, the
+`ClearFeature` recovery and `flush_held_releases`.
+
+### 33f. What to read in a capture
+
+```
+:: EHCI-HID: ISRARM self-test: modes=2 (overlay-direct + qTD-chain) depth=8 fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+:: EHCI-HID: [1] ISRARM armed — MSI vector 0x43 -> apic 0xfee00000, USBINTR 0x00000000 -> 0x00000001 (USBINT unmasked) ... == witness ::
+:: EHCI-HID: ISRARM armed=2 refused=0 irq=8412 isr_rearm=8390 poll_rearm=19 depth_max=2 ringfull=0 cont_isr=3 cont_poll=0 oversize=0 == witness ::
+```
+
+| field | meaning |
+|---|---|
+| `irq=` | ISR invocations. **The falsifier.** Zero after an `armed` line means the vector is not being delivered. |
+| `isr_rearm=` | endpoints re-armed FROM THE INTERRUPT — **the number that is the fix.** Before this arc the site did not exist, so it was structurally zero. |
+| `poll_rearm=` | re-arms from the polled pass. `isr_rearm=0 poll_rearm=N` is the honest picture of a boot where the interrupt never arrived. |
+| `depth_max=` | deepest hand-off occupancy. 1 = the pass was never more than one report behind. |
+| `ringfull=` | **the residual defect** — the pass was ≥ 8 reports late even with the interrupt live. |
+| `cont_isr=` / `cont_poll=` | claims lost in each direction. Neither is an error. |
+| `oversize=` | `mtraw`-only: a frame larger than one hand-off slot, declined and left for the pass. |
+
+Two negative cases are **printed statements, not absences**, because an instrument that cannot fire
+in the state it exists for is an absent one:
+
+- `ISRARM REFUSED` — no usable MSI capability, or the `USBINTR` write did not stick. Read back and
+  verified, never assumed.
+- `ISRARM IRQ DEAD` — armed, and the vector has not been delivered once in 5 s. One-shot. It
+  carries `irq=`/`isr_rearm=`/`poll_rearm=` itself, because the rollup below is gated on
+  `isr_rearm` having moved and in this exact state it never does: without the counts on this line
+  a dead-vector boot would state "everything still polled" with no number behind it. A nonzero
+  `poll_rearm=` here is the fallback proving it is working, not merely nominated.
+
+**The proof the fix worked is `max=` on the EHCIDARK census collapsing** from the 80–96 ms in §33a
+toward interrupt latency, on the same instrument and the same 5 s cadence. The census's clock moved
+into `IsrEp::seen_ms` and is stamped by BOTH re-armers, so the gap it reports is "time since anyone
+last looked" — the only reading that stays honest once completions are consumed off the interrupt.
+
+### 33g. What QEMU can and cannot gate
+
+**QEMU cannot run the interrupt at all.** `hcd-ehci` exposes no PCI capability list
+(`[MSI] 0:3.0 has no capability list.`), so `isr_arm_controller` refuses and the boot stays fully
+polled. A green QEMU run is therefore **not** evidence that the ISR works on the rMBP: QEMU is also
+chain-mode (`overlay_mode == false`), the opposite fork from the metal.
+
+That gap is why `isr_selftest` exists. It runs at `init` before any endpoint is armed, borrows
+`DMA_POOLS[0].int_slots[0]` and `ISR_EPS[0]` at a moment when both are provably unowned, and drives
+the **real** `isr_service_ep` against a hand-built completion token — in **both** transfer modes,
+checking FIFO order across the ring wrap, payload fidelity, that the endpoint is genuinely re-armed
+after each accepted completion and genuinely *not* after a refused one, that the data toggle
+alternates from DATA1 (re-arm #1 is the pipe's second transfer), and that occupancy 8 refuses. It
+restores the slot and the operational counters before returning, so a boot's `ISRARM` line counts the
+machine's work and not the fixture's.
+
+Metal falsifiers, in order: (1) `ISRARM armed` on both functions rather than `ISRARM REFUSED`;
+(2) `irq=` and `isr_rearm=` rising; (3) EHCIDARK's `max=` collapsing, or the census going silent
+altogether because `dark_missed` stops moving; (4) `ringfull=` — nonzero means a residual window
+remains and depth is worth revisiting, with §33b's parked QH-chain on the table.
+
+## 34. BT-DIR — the direction test: let the peer page **us** (`UNAOS_BTDIR=1`, 2026-08-25)
+
+§30.5 named the one surviving hypothesis and the one boot that settles it. This is that boot's
+instrument. Everything §30.5's five subsections established is taken as settled here and is not
+re-argued: there is no regression, the peer is `88:c6:26:cc:2d:3c` with `class_of_device=0x240418`
+(Audio/Video, Audio + Rendering — an audio sink), the RSSI premise was an LE measurement
+misattributed to BR/EDR, and the failure stage is unambiguous — the controller certifies a full
+page train (`observed=5123ms` against a `5120ms` deadline it reads back to us) and answers
+`Connection Complete status=0x04` PAGE TIMEOUT, both attempts, every boot.
+
+**The question, and why no outbound page can ask it.** Answering an inquiry proves the peer is
+*inquiry*-scanning. Page scan is a separate enable (Core Vol 4 Part E §7.3.18), and "discoverable
+but not connectable" is the ordinary resting state of a speaker already bonded elsewhere. Every
+attempt this project has ever made tested one direction. So: make **this host** page-scannable, hold
+one page window, and report what arrives.
+
+### The phase structure is the experiment
+
+A controller with page scan enabled time-slices its idle mode between inbound scan windows and any
+outbound page train it is running. Running both at once would degrade the very train four boots have
+been measuring and hand back a confounded number — which is why §30.5's "before BT-C1's outbound
+attempts" is the one part of that sketch this section overrides.
+
+| Phase | What runs | Scan state |
+|---|---|---|
+| 1 | The existing `btc` outbound page train, through `bt_c1_tally` and the teardown | **disabled** — behaviourally identical to a plain `btc` boot |
+| 2 | `Write_Scan_Enable = 0x03`, read back, hold `BT_DIR_WINDOW_MS` (6400 ms) | enabled (inquiry scan + page scan) |
+| 3 | `Write_Scan_Enable = 0x00`, read back, print both | disabled again |
+
+**Phase 1 is proven unperturbed by construction, not by care.** `bt_dir_probe` is the *last
+statement* of `bt_c1_page` — after the tally has printed, after the teardown, after the BT-RETRY
+latch is written — and every line of it, including its constants and its call site, is
+`#[cfg(feature = "btdir")]`. A build without the knob does not contain it, so a `btc` boot is
+byte-identical to the boots this arc's control was measured on. That is also the arc's `strings`
+control: the `UNAOS_BTC=1` artifact carries 74 `:: bt-c1: [` strings and **zero** `:: bt-dir: [`
+strings; the `UNAOS_BTDIR=1` artifact carries nine.
+
+Phase 2 additionally refuses to run at all when phase 1 ended holding a live link or an unresolved
+page (`live || outstanding` — both are phase 1's own MUST-NOT-APPEAR conditions), because enabling
+page scan on top of either is exactly the overlap being avoided. **The refusal prints**
+(`result=SKIPPED-PHASE1-UNCLEAN`): a skip that says nothing is the same silence as a window that
+heard nothing, and those two must never be confusable.
+
+### No accept path, and that is scope
+
+The reading wanted is the `Connection Request` **event** arriving. `HCI_Accept_Connection_Request`
+(0x0409), `Reject_Connection_Request` (0x040A), `Set_Event_Filter`, SDP, RFCOMM, A2DP, a written
+local name and a written Class of Device exist nowhere in this tree, so nothing would meet an
+inbound connection anyway. A request arriving and going unanswered — resolved by the controller's
+own connection-accept timeout — **is the result, not a bug**.
+
+### The exits, all printed by one line
+
+`bt_dir_probe` emits `BT-DIR RESULT` (the numbers) and `BT-DIR READING` (the conclusion they
+license) on **every** path including "nothing arrived". A line that fired only on success could not
+tell "no request" from "the code never ran" — the `COMP_REVENANTS` defect, which this repo has now
+shipped five times in a week.
+
+| `result=` | Meaning |
+|---|---|
+| `REQUEST` | A `Connection Request` (0x04) arrived **from `88:c6:26:cc:2d:3c`**. RF works **both** ways and the peer CAN page. The fault is our train (clock offset / page-scan repetition mode) or the peer's page-scan enable in the outbound direction only. The arc moves to `Write_Page_Scan_Activity`/train-length work. |
+| `REQUEST-OTHER` | A request arrived from some *other* device, or from one whose event was too short to carry an attributable address. `Scan_Enable = 0x03` makes this host answerable to the whole room and there is no `Set_Event_Filter` in this tree, so this is an ordinary outcome — and it must never print as `REQUEST`, which is the one verdict that redirects the project. It is still a real finding: it proves this host's page scan was genuinely live, which strengthens every other verdict the boot could have reached. A stranger's request does **not** end the window; only the peer's does. |
+| `NEGATIVE` | Nothing arrived **and this same boot's inquiry heard the target**. The peer is not connectable in either direction; no host-side page change fixes it and this line of work should stop. |
+| `VOID` | Nothing arrived **and the inquiry heard nothing either**. The peer was absent or off: *the test did not run against anything*. **This is the most likely outcome** — recent boots report `responses=0` — and a void run misread as a negative is exactly how a wrong conclusion gets recorded, which is why the word is printed rather than inferred. |
+| `SCAN-NOT-ENABLED` | The controller **refused** `Write_Scan_Enable` (nonzero status). Nothing about the peer is learned; the silence is the instrument's, not the radio's. |
+| `SCAN-UNREAD` | The write went out on EP0 but no Command Complete came back. Distinct from `SCAN-NOT-ENABLED` because the posture differs: the radio may be page-scannable *right now*. "The write was unread so scan must be off" is exactly the inference this stage refuses to make. |
+| `EVENT-ENDPOINT-DEAF` | Page scan was enabled, but the HCI event endpoint stopped being readable, so a request could not have been *observed* even if one was sent. `bt_hci_command` rides EP0, which a halted event endpoint does not touch — so the write can succeed on a boot where nothing could ever be heard. The deafness is this host's. |
+| `WINDOW-TRUNCATED` | Page scan was enabled, but the window ended on the re-entry cap rather than the clock: the room was busy enough to spend all 64 re-entries on other traffic. The window was not held to term. |
+| `WINDOW-SHORT` | The measured hold came in under three quarters of `BT_DIR_WINDOW_MS`, or could not be measured at all. The uncalibrated-TSC case is the one that matters: `epace_ms` returns `None` **and** `bt_l3_budget` falls back to `hw_wait_budget() / 4` -- on x86 with calibration FAILED that is 625e6 cycles, ~0.27 s at the bench part's 2.3 GHz nominal (the only state in which this fallback is taken; full per-platform/per-calibration table in §32.2a) -- so the window really is ~24x shorter than the constant on the same line. |
+| `READS-INCOMPLETE` | The window ran, but an event went past that could not be read in full (`st.blind` set during the window, snapshotted at entry so phase 1's blindness is not charged here) — and it might have been the request. A silence not read to term is not a silence. |
+| `SCAN-UNCONFIRMED` | Accepted, but `Read_Scan_Enable` did not come back `0x03`. A silence under it is not evidence — though an arriving request still would be, since nothing can page a host whose page scan is off. |
+| `SKIPPED-PHASE1-UNCLEAN` | Phase 1 left a live link or an unresolved page. Nothing was written to the radio. |
+
+### The witness discipline, in three specifics
+
+1. **The window is only spent when the instrument exists.** The Command Complete status of
+   `Write_Scan_Enable` is checked *before* the wait runs, so a refused write never records a
+   6.4-second silence against the peer. The one deliberate asymmetry: an **accepted** write whose
+   readback could not be obtained still spends the window, because an arriving request is
+   self-certifying.
+2. **The write is not assumed to have taken.** `HCI_Read_Scan_Enable` (0x0C19) reads it back and the
+   value is printed — the same discipline BT-C1/AGE applies to `Read_Page_Timeout`, for the same
+   reason: status `0x00` says ACCEPTED, not IN FORCE. Both the status byte and the readback print
+   `none` rather than a placeholder when the wire supplied nothing.
+
+   The readback runs on the **far side** of the window, not between the write and the wait. Review
+   caught the original ordering eating the measurement: `bt_hci_command_ex`'s drain has none of
+   `bt_l3_await`'s latching — it `continue`s past every event that is not the Command Complete it
+   asked for — so a `Connection Request` landing in the readback's drain would have been logged only
+   as a skipped `bt-l0` event and the boot could have printed `NEGATIVE` over a request that did
+   arrive. Reading `0x03` after the hold is also the stronger statement: the scan was in force
+   *across* the window, not merely at its start.
+3. **The window is a wall clock, not an event count.** `bt_l3_await` caps at `BT_L3_EVT_MAX` (16)
+   events per call, so a busy room can burn the cap on unrelated traffic and return with most of the
+   window unspent. Phase 2 re-enters it (up to `BT_DIR_AWAIT_REENTRIES` = 64), each time handing it
+   only what remains, so the total is bounded by `BT_DIR_WINDOW_MS` and not by the re-entry count.
+   `window_held_ms` on the result line is the measured hold, not the constant. And if the re-entry
+   cap *is* what ended the loop, that is `WINDOW-TRUNCATED`, not a silence — the loop tests the
+   clock before it tests the cap, so exhausting the cap proves the clock had not expired, and the
+   reading needs no timing arithmetic that could go stale.
+
+4. **Phase 3 does not read through a halt.** `BtL3State::stopped` makes this a rule, not a
+   preference: once latched, a later `bt_read_full_event` re-arms and writes a fresh `QTD_ACTIVE`
+   overlay, clearing the QH's Halted bit while the *device's* STALL is untouched. `bt_read_full_event`
+   has no self-guard — the guard lives in the callers, as it does in `bt_l3_disconnect` and the C1
+   cancel path. So when the event endpoint is dead the restore goes out with `bt_hci_send` (EP0,
+   which a halt does not touch) and its reply is deliberately unread; the line reports
+   `SENT BUT UNVERIFIABLE` rather than claiming a confirmation it cannot have — or claiming
+   `NOT RESTORED` about a write that almost certainly took.
+
+The ordering of the verdict chain is the standing law *an absence is only evidence if the thing that
+would have produced it was actually attempted*, applied **six** times before the peer is ever blamed:
+a refused write, an unread write, a request from the wrong device, a deaf event endpoint, a
+truncated or short window, and reads that did not complete are each eliminated ahead of `VOID` and
+`NEGATIVE`. Five of those six rungs came out of the arc's adversarial review, which is the honest
+record: the first draft would have printed `REQUEST` for a neighbour's phone and `NEGATIVE` after a
+window that listened for zero milliseconds.
+
+`BT_DIR_WINDOW_MS` = 6400 ms is five page-scan intervals at the controller's reset default (0x0800
+slots x 0.625 ms = 1.28 s), and the actual interval is **read** by `HCI_Read_Page_Scan_Activity`
+(0x0C1B) with `intervals_covered=` printed, so a controller running a longer interval makes the
+shortfall visible instead of silent. Five is sized against the *other* side: a peer paging us runs
+its own train under its own page timeout, commonly the 5.12 s default, and a shorter window could
+close mid-train — manufacturing the exact false negative this arc exists to avoid.
+
+### Posture restoration is hygiene, not safety
+
+Phase 3 is unconditional once phase 2 was attempted — **including after a refused write**, because
+"the write was refused so scan must still be off" is an inference and this stage does not trade in
+those. It writes `BT_DIR_SCAN_OFF` (0x00), reads it back, and prints both values:
+
+```
+:: bt-dir: [N] PHASE 3 POSTURE RESTORED — wrote scan_enable=0x00 status=0x00 readback_status=0x00
+   readback=0x00 -> RESTORED AND CONFIRMED — the radio is back in the posture the next boot's
+   control assumes
+```
+
+`readback_status` is printed apart from `readback` because "the controller answered with a nonzero
+status" and "the controller answered nothing" are different facts that would otherwise both render
+as `readback=none` — and "the posture is restored" is precisely the claim that must not rest on two
+different failures printing identically. Every status field on every `bt-dir` line follows this
+rule: the buffers are zeroed locals, so a silent command would otherwise read back a `0x00` success
+the wire never supplied.
+
+The reason is not the radio's safety. A machine left in a different radio state than the one the
+*next* boot's control assumes is a contaminated control, so a restore that is accepted but
+unconfirmed, or refused outright, says so in those words on its own line and the result line carries
+`restore_confirmed=`.
+
+### What QEMU proves, and what it does not
+
+**QEMU has no Bluetooth radio.** `UNAOS_WC=1 ./arroyo test` proves the build and the boot are intact
+and **nothing** about the link: the test artifact carries zero `bt-c1`, zero `bt-dir` and zero
+`bt-l0` strings, because the test path arms neither knob. This section's exits can only be read off
+a bench boot with `UNAOS_BTDIR=1`, the speaker in pairing mode, and the peer in the room.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
-- `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10) and the EHCI-1/2 scout + shared wake (§9/§9a).
+- `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).
+- `unaos/crates/kernel/src/arch/x86_64/interrupts.rs` — `EHCI_MSI_VECTOR` (0x43) and `ehci_msi_handler`, the only ISRARM code outside `drivers/ehci/`.
 - [`scheduler.md`](../02_KERNEL_CORE/scheduler.md) — why the lock-free MSI handler and the main-loop service split matter under a live scheduler.

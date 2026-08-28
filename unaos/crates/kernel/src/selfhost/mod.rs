@@ -172,9 +172,18 @@ fn parse_stamp(text: &str) -> Option<SrcStamp> {
     Some(SrcStamp { sha, commit, describe })
 }
 
-/// A short human reason for a [`FatError`]. `fs::fat::fat_reason` says the same things but is
-/// `#[cfg(target_arch = "aarch64")]` (it was written for the PIUSB-27 mount witness), and this module
-/// is arch-neutral — so it carries its own rather than widening that one's gate from outside its lane.
+/// A short human reason for a [`FatError`]. A local twin of `fs::fat::fat_reason` (written for the
+/// PIUSB-27 mount witness).
+///
+/// The justification this comment used to carry — that `fat_reason` is `#[cfg(target_arch =
+/// "aarch64")]`, so an arch-neutral module could not call it — is FALSE and has been struck
+/// (2026-08-27): VFSX86 (`fs/vfs.rs`, 2026-08-21) un-gated it, and `fat_reason` is arch-neutral
+/// today. Availability is not why the twin exists. OUTPUT is: `fat_reason` says "no USB block
+/// device" for `NoDisk` where this says "no block device" (this module reads whatever volume
+/// `fs::fat` mounted, which is not necessarily the USB stick), and its catchall is
+/// `_ => "mount failed"` where this one is `_ => "unreadable"` — these lines report a failed READ of
+/// a packaged source fixture, not a failed mount. Collapsing the two would silently change both
+/// strings in the witness, so the twin stays until someone reconciles the wording deliberately.
 fn fat_reason(e: FatError) -> &'static str {
     match e {
         FatError::NoDisk => "no block device",

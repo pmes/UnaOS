@@ -5,19 +5,19 @@
 //!
 //! ## What this module is
 //!
-//! [`super::wcx::activate`] is x86's answer to one question: *at which single point in the boot does
+//! [`super::desktop_uefi::activate`] is x86's answer to one question: *at which single point in the boot does
 //! the machine stop being a kernel with a framebuffer and start being a desktop?* Everything the
 //! crispy desktop needs to be true at once — the console is a window, the menu bar is on, the
 //! compositor owns the glass — is decided there, in order, with a DECLINE arm for every way it can
 //! fail and a witness line for every decision.
 //!
-//! The Pi had no such point. `pidesk` compiled the furniture (`strip`, `dock`, `menubar`, `crystal`)
+//! The Pi had no such point. `desktop_firmware` compiled the furniture (`strip`, `dock`, `menubar`, `crystal`)
 //! and routed presses to it (`arch::aarch64::syscall`'s furniture arm), but nothing ever *turned the
 //! desktop on*: `menubar::ENABLED` starts `false` and every `set_enabled(true)` in the tree was a
 //! `witness` fixture that restored the flag before returning — so the bar was compiled, composed
 //! (three relaxed atomics per pass) and permanently invisible. The console had no window at all.
 //!
-//! This is that point, for the Pi. It is deliberately NOT a port of `wcx::activate`'s body: the
+//! This is that point, for the Pi. It is deliberately NOT a port of `desktop_uefi::activate`'s body: the
 //! Kepler takeover, the backbuffer resync, the ARGB origin latch and the deferred desktop-app launch
 //! are all x86 display-driver concerns with no Pi counterpart. What is shared is the DECISION
 //! SEQUENCE and its order, and where the two arches do the same thing they call the same function —
@@ -29,14 +29,14 @@
 //! 1. **The panel must exist.** Geometry off `video::WRITER`, live, never assumed: QEMU raspi4b is
 //!    640x480 and the bench Pi is 1920x1200, and every floor below is evaluated against whichever
 //!    one this boot actually has.
-//! 1b. **The panel is CLEARED to the desktop colour** — `wcx`'s WC-X DESKTOP-CLEAR, on this arch for
+//! 1b. **The panel is CLEARED to the desktop colour** — `desktop_uefi`'s WC-X DESKTOP-CLEAR, on this arch for
 //!    the first time. Everything painted before the desktop existed (`video::init_panel`'s
 //!    `PANEL_BG` fill, the direct-painted fbcon boot log) sits outside every damage box the
 //!    compositor has, so nothing else in the system will ever repaint it. It goes above step 2
 //!    because it is the last instant at which the window table is empty and a direct front-buffer
 //!    write therefore collides with no compositor-owned pixel. See the call site for the full
 //!    argument, and for why the WC-BBSYNC half of x86's pairing is deliberately not armed here.
-//! 2. **The dock must be able to host a full strip** — `wcx`'s CONSOLEWIN law, unchanged and for the
+//! 2. **The dock must be able to host a full strip** — `desktop_uefi`'s CONSOLEWIN law, unchanged and for the
 //!    unchanged reason. The console window carries a minimise disc, the only route back from that
 //!    park is the dock, and `dock::Layout::for_panel` returns `None` when the strip will not fit at
 //!    `MAX_WINDOWS` rows. A control that hides a window with no way back is worse than no control, so
@@ -47,7 +47,7 @@
 //!    `fbcon::detach()` exists to keep two cores off the panel, a routed console does not touch the
 //!    panel, and so the caller skips the detach when this step succeeded.
 //! 4. **The bar is enabled** — the tenancy claimed, by the seam that is the Pi's shell coming up.
-//!    After every decline above, on `wcx`'s ownership argument: turning the bar on is a SHELL's
+//!    After every decline above, on `desktop_uefi`'s ownership argument: turning the bar on is a SHELL's
 //!    decision and this is where the Pi's spatial shell is brought up.
 //! 5. **One composite** — load-bearing, not a flourish. From the instant the bar is enabled,
 //!    `Screen::present_background` subtracts its rect (this arc widened that subtraction to aarch64),
@@ -98,7 +98,7 @@ pub fn activate() -> bool {
     }
 
     // 1b. PIDESK DESKTOP-CLEAR — **paint the whole panel to the desktop colour ONCE, here.** The
-    //    aarch64 counterpart of `wcx`'s WC-X DESKTOP-CLEAR, and the gap `wcf::chrome_truth` was
+    //    aarch64 counterpart of `desktop_uefi`'s WC-X DESKTOP-CLEAR, and the gap `wcf::chrome_truth` was
     //    built to name: its desktop probe read `(pw-2, ph-2)` on the bench panel and printed
     //    `want=0x2d2b55 got=0x1e1e1e -> NOCLEAR` — `video::PANEL_BG`, the fill `video::init_panel`
     //    puts down at FB attach, still on the glass at desktop-ready.
@@ -151,7 +151,7 @@ pub fn activate() -> bool {
     //    `[wc-x] console-window DECLINE reason=install-contended` (a printing core holding
     //    `FBCON` at the instant the route is installed).
     //
-    //    x86 has had the right behaviour all along — `wcx`'s desktop never mirrors — so this is a
+    //    x86 has had the right behaviour all along — `desktop_uefi`'s desktop never mirrors — so this is a
     //    ONE OS defect on the same reading REALDESK gave the two retired bands, and the fix is the
     //    same shape: the Pi stops doing the aarch64-only thing. Nothing is lost that this kernel
     //    keeps evidence in — every line is still on the serial wire, and from the route install
@@ -197,11 +197,11 @@ pub fn activate() -> bool {
     }
 
     // 2-3. CONSOLEWIN — the dock must be able to host the worst-case strip, or the console gets no
-    //    window (and therefore no minimise disc, and therefore nothing to strand). `wcx`'s law,
+    //    window (and therefore no minimise disc, and therefore nothing to strand). `desktop_uefi`'s law,
     //    unchanged in substance and NARROWED in scope, which is the one place the Pi's sequence
     //    deliberately differs from x86's.
     //
-    //    On x86 this check is a TOTAL decline: `wcx::activate` returns, and the menu bar — enabled
+    //    On x86 this check is a TOTAL decline: `desktop_uefi::activate` returns, and the menu bar — enabled
     //    thirty lines further down — never happens. That is sound there because on x86 the console
     //    window is a precondition of the desktop being built around it (the desktop app is armed only
     //    on a fully successful activation; the shell window is minted against the same panel).
@@ -212,7 +212,7 @@ pub fn activate() -> bool {
     //    the console window is part of neither; its floors (`menubar::FLOOR_W`/`FLOOR_H`) are
     //    `const`-asserted to fit 640x480 precisely so no gate declines it. Under the x86 ordering the
     //    first `UNAOS_PIDESK=1 kernel8-test` run of this arc printed
-    //    `[pidesk] activate DECLINE reason=dock-cannot-host-full-strip panel=640x480 rows=12` and
+    //    `[desktop_firmware] activate DECLINE reason=dock-cannot-host-full-strip panel=640x480 rows=12` and
     //    stopped — QEMU raspi4b's 640x480 cannot host a twelve-tile dock — so the menu bar half of the
     //    arc would have been unwitnessed on the only surface the DONE gate runs, and invisible to any
     //    operator on a small panel, for a reason that has nothing to do with menu bars.
@@ -246,10 +246,10 @@ pub fn activate() -> bool {
         // in the window's surface instead of on the panel. It is NOT a claim that lines keep coming:
         // the handoff's `fbcon::detach()` follows this seam and stops them, so the window holds the
         // desktop-bringup tail and then freezes. See the live-console ledger at the tail of this
-        // function for why the detach stays, and `wcx.rs` for x86 doing the identical thing.
+        // function for why the detach stays, and `desktop_uefi.rs` for x86 doing the identical thing.
         // ⚠ THE WIRE WORD BELOW IS THE KNOB-OFF TRUTH and is left exactly as written because the
         // regression specs anchor on it. With LIVECON armed the window does NOT freeze, and the
-        // correction is stated in its own `[pidesk] livecon ARMED` line at the tail rather than by
+        // correction is stated in its own `[desktop_firmware] livecon ARMED` line at the tail rather than by
         // rewording a string a passing spec matches on.
         serial_println!("[pidesk] activate panel={}x{} console_win={} routed={} (the window freezes at the handoff detach that follows — x86's desktop lane does the same)", pw, ph, cwin, routed);
     }
@@ -327,8 +327,9 @@ pub fn activate() -> bool {
     );
 
     // The SHARD menu is reachable from this instant: `crystal::press_at` hit-tests
-    // `menubar::crystal_box_abs`, and the aarch64 click router's furniture arm
-    // (`arch::aarch64::syscall::wc_click_route`, `feature = "pidesk"`) already calls
+    // `menubar::crystal_corner_abs` (FITTS-CORNER — the bar's whole upper-left corner cell, not just
+    // the glyph), and the aarch64 click router's furniture arm
+    // (`arch::aarch64::syscall::wc_click_route`, `feature = "desktop_firmware"`) already calls
     // `strip::press_route` ahead of every window arm. Stated on the wire because "the bar is painted"
     // and "the bar is live" are two claims and a capture should not have to infer the second.
     serial_println!(
@@ -375,7 +376,7 @@ pub fn activate() -> bool {
         super::pulsewin::view().label()
     );
     // 6. QUARRY — the file manager, when `UNAOS_QUARRY=1` armed it. This is the Pi's answer to the
-    //    question `wcx`'s `DESKTOP_APP_ARMED` answers on x86: what does the desktop OPEN once it is
+    //    question `desktop_uefi`'s `DESKTOP_APP_ARMED` answers on x86: what does the desktop OPEN once it is
     //    up? The module header above says this seam deliberately mints no second launcher, and it
     //    still does not — `open()` is not a launch, it is the same kind of kernel-furniture window
     //    `panel_console_window_open` mints thirty lines above, over a surface this module never
@@ -429,7 +430,7 @@ pub fn activate() -> bool {
     //
     // **And this is why x86's desktop lane freezes its console too.** The live routed console exists
     // on x86 only on the `usbdebug` bench lane — a lane with no render service, no witness battery and
-    // effectively one service loop — while the lane an operator actually boots (`wcx::activate` →
+    // effectively one service loop — while the lane an operator actually boots (`desktop_uefi::activate` →
     // `main.rs`'s handoff) detaches unconditionally and calls the result "a FROZEN BOOT-LOG SNAPSHOT
     // for the rest of the boot". That was not documented as a hazard anywhere; this arc rediscovered
     // it from the other end, on the other arch, and the note above is the first place either tree
@@ -496,7 +497,7 @@ pub fn activate() -> bool {
 // ── SHELLWIN-PI — the CASCADE latch, and why it is a SECOND question ────────────────────────────
 //
 // [`activate`] above answers *"is the Pi a desktop yet?"* — the bar is on, the console has a window,
-// the compositor owns the glass. That is the question `wcx::activate` answers on x86, and it is asked
+// the compositor owns the glass. That is the question `desktop_uefi::activate` answers on x86, and it is asked
 // at the SAME place: the GUI handoff in `kernel_main`.
 //
 // It is not the question the shell window has to ask. The boot WITNESS CASCADE is still running when
@@ -506,7 +507,7 @@ pub fn activate() -> bool {
 // needs a clear probe strip, `[clickroute]` needs to know which row is topmost. Furniture that is on
 // the glass while they read is furniture INSIDE THEIR ANSWER.
 //
-// The first cut of SHELLWIN-PI argued the Pi needs no such latch at all — `pidesk` is compile-time, so
+// The first cut of SHELLWIN-PI argued the Pi needs no such latch at all — `desktop_firmware` is compile-time, so
 // `desktop_owns_backdrop()` returned a constant `true` and the window was minted at the head of the
 // render service. `UNAOS_PIDESK=1 ./arroyo kernel8-test` refuted it, in the fixtures' own words:
 //
@@ -529,7 +530,7 @@ pub fn activate() -> bool {
 // `wc-c`/`wc-d`/`wc-j` fixtures (`first=(307,158) got=0x2d2b55 want=0xc3c3c3`, `bad_cache=0`), a
 // standing conflict left for the integrator. The shell window declines to repeat it.
 //
-// Deliberately NOT a `wcx` twin: there is no origin to record, no panel to re-describe and nothing to
+// Deliberately NOT a `desktop_uefi` twin: there is no origin to record, no panel to re-describe and nothing to
 // deactivate. A boolean is the whole of what is known, so a boolean is the whole of what is stored.
 
 use core::sync::atomic::{AtomicBool, Ordering};

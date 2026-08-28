@@ -1993,7 +1993,7 @@ of the z-order:
 1. **Nothing ever claimed the tenancy.** `video::menubar` is a default-off tenant of `video::strip`
    ("we will not always have a menu bar"), and `set_enabled(true)` had exactly one caller in the
    tree — the fixture, which turned it off again. A bar nothing enables is a bar the operator cannot
-   see, however correct its geometry. `wcx::activate` now enables it as the last step of bringing the
+   see, however correct its geometry. `desktop_uefi::activate` now enables it as the last step of bringing the
    crispy desktop up, and says so on the wire: `[wc-x] menubar ENABLED panel= rect= was=`. This is a
    SHELL's decision by construction — a spatial shell that never runs that seam never gets a bar,
    which is the whole point of the tenancy — and every DECLINE arm in `activate` returns before it,
@@ -2058,7 +2058,7 @@ Four defects were fixed on this branch. Two were in the arc's own code:
   fbcon's frozen boot-log snapshot, which never damages again. With `service_damage` declining to
   composite while no row is dirty, a boot whose desktop app does not land and whose operator does not
   move the mouse would have held the bar enabled, its rows withheld from the desktop, and the bar
-  never painted. `wcx::activate` now composites at the enable seam (`[wc-x] menubar PAINTED`).
+  never painted. `desktop_uefi::activate` now composites at the enable seam (`[wc-x] menubar PAINTED`).
 
 * **aarch64 was NOT "the WC-I loop, byte for byte", as the code claimed.** To append the furniture
   tail the occluder walk staged `wm::occluders` into its own array and `copy_from_slice`'d it into the
@@ -2185,6 +2185,13 @@ clobbered it back a frame later — "menubar menu gets overwritten". Two changes
   the furniture array" the deferral asked for. `erase_clip` does not carry the menu (its worst case is
   unchanged); the DESKTOP present already subtracted it (`present_background`), so the two clip paths
   now cover the menu on both sides of the compositor.
+  <br>⚠ **That last sentence was overtaken by CRYSTAL-DISMISS (metal boot 8) and is kept only as the
+  record of what was believed.** "The DESKTOP present already subtracted it" named the wrong painter:
+  the deferred desktop FILL is neither the desktop present nor a window blit, and it was the one
+  front-buffer painter left that could publish `DESKTOP_BG` over an open dropdown. `erase_clip` pushes
+  `crystal::open_rect` too from that arc on, so its worst case is NOT unchanged — it is
+  `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX`, which is `OCC_MAX` exactly. See the MGL1 section at
+  the end of this document for why that exact fit stays exact, and what had to become loud instead.
 * **Dismissal repaints by the owners.** `crystal::repaint_vacated`, called from `compose`'s two erase
   branches right after `strip::erase_rect`, gives the vacated rect the `damage_intersecting` +
   `request_full_present` pair `wm::reclaim` gives a vacated window box: every window overlapping the
@@ -2286,18 +2293,18 @@ all of aarch64) nothing changes: the shell is still the desktop and draws exactl
 **What landed — the shell/scene wiring, not the compose mechanism.** Three seams, all outside
 `composite_inner` and the present gate (the concurrent `flicker` arc's lane), all `x86_64`-scoped:
 
-* **`video::wcx::is_active()`** — a plain load of the `ACTIVATED` latch, `true` from the instant
+* **`video::desktop_uefi::is_active()`** — a plain load of the `ACTIVATED` latch, `true` from the instant
   `activate_on` claims the compositor to end of boot. It is the render service's signal that the
   crispy desktop owns the backdrop. (Not a second flag like `DESKTOP_APP_ARMED`: the backdrop
   question wants exactly what the latch says now — a compositor that disowned the panel leaves the
   shell as the desktop, correctly.)
 * **`video::screen::Screen::paint_desktop_scene()`** — fills the desktop layer with the crispy scene
-  (today the flat `wm::DESKTOP_BG`, the same colour `wcx::activate` put on the glass and
+  (today the flat `wm::DESKTOP_BG`, the same colour `desktop_uefi::activate` put on the glass and
   `adopt_desktop_bg` seeds a fresh `Screen` with, so the three agree by construction) and arms a
   full-panel present. It is the SEAM the approved lake scene (white-board A1) renders through later:
   the contract is *own the backdrop*, not *fill one colour*, so a richer scene replaces the body and
   every caller keeps working. `#[cfg(target_arch = "x86_64")]` — aarch64 never sees it.
-* **`x86_render_service`** captures `desktop_owns_backdrop()` once at task start (`wcx::activate` runs
+* **`x86_render_service`** captures `desktop_owns_backdrop()` once at task start (`desktop_uefi::activate` runs
   during PCI enumeration, long before this task is spawned, so the answer is stable). When the crispy
   desktop is up it paints the scene instead of `console.draw`, and it drops the shell's key path
   (`handle_key`) — a keystroke that reached that arm was not consumed by the installer dialog and not
@@ -2513,8 +2520,8 @@ widened and **not one line of its body changed**, and `Screen::direct`, `Console
   surface there is 960x580x4 = 2.2 MB. `try_reserve_exact` + `direct` are not belt-and-braces on
   this arch; they are the whole margin. Never crash the machine to deliver a feature.
 * **The CASCADE latch — the one place the arches differ in kind, and the one claim this arc got
-  wrong before the gate corrected it (`video/pidesk.rs`).** The first cut argued the Pi needs no
-  runtime latch: x86 has `wcx::is_active()` only because its desktop arrives with a Kepler TAKEOVER,
+  wrong before the gate corrected it (`video/desktop_firmware.rs`).** The first cut argued the Pi needs no
+  runtime latch: x86 has `desktop_uefi::is_active()` only because its desktop arrives with a Kepler TAKEOVER,
   while `pidesk` is compile-time and the furniture composites the moment the panel is up — so
   `desktop_owns_backdrop()` returned a constant `true` and the window was minted at the head of the
   render service. **`UNAOS_PIDESK=1 ./arroyo kernel8-test` answered `MBENCH FAIL — 104/108`,** and
@@ -2534,7 +2541,7 @@ widened and **not one line of its body changed**, and `Screen::direct`, `Console
   x86 never met this because its latch already encodes the ordering — the takeover happens after the
   cascade, so there *"is the desktop up?"* and *"has the cascade released the panel?"* are
   accidentally the same question. **On the Pi they are two questions, and the second one needed
-  asking.** `video::pidesk::arm()` is called from the CALLER of the last panel-reading fixture —
+  asking.** `video::desktop_firmware::arm()` is called from the CALLER of the last panel-reading fixture —
   `arch::aarch64::syscall::u7_launcher`, on the line after `wcb_launcher` returns — and at the caller
   rather than inside that fn's tail on purpose: it has three early SKIP returns, and arming from
   inside would let a skipped fixture leave the Pi with no shell window and no line saying why. The
@@ -2545,7 +2552,7 @@ widened and **not one line of its body changed**, and `Screen::direct`, `Console
 
   It is deliberately NOT a `wcx` twin (no origin, no panel re-description, nothing to deactivate — a
   boolean is the whole of what is known). **It also is not a second question about the same thing as
-  `pidesk::activate`, and the merge with CONSWIN-PI is where that becomes visible.** `activate` — the
+  `desktop_firmware::activate`, and the merge with CONSWIN-PI is where that becomes visible.** `activate` — the
   Pi's DESKTOP-READY seam, called from the GUI handoff — answers *"is the Pi a desktop yet?"*: the bar
   is on, the console has a window, the compositor owns the glass. `arm` answers *"has the boot witness
   cascade let go of the panel?"*, and when `activate` returns, the answer is still no — `kernel_main`'s
@@ -2614,7 +2621,7 @@ supposed to mean.
 "a line in the Pi render service", which is this arc's file, so it is worth being exact about why it is
 still not one line. Three things, in order:
 
-1. **`pidesk::activate` must return `routed` instead of `false`** — the handoff then skips
+1. **`desktop_firmware::activate` must return `routed` instead of `false`** — the handoff then skips
    `fbcon::detach()` and the window stays live. One word, and it is the word that was measured at
    `97/108` with 37 forbidden hits, `wc-g -> RACE-BLIT`, `wc-d -> FAIL` and a synchronous exception.
 2. **`_print` must stop presenting.** The measured failure is not pacing — it is that
@@ -2639,7 +2646,7 @@ released the panel, furniture may land ::` at the hand-off.
 
 **The standing rule this arc adds, stated once.** *A desktop that appears before the boot witness
 cascade has released the panel is not early, it is wrong.* Any future Pi furniture — dock, menu bar,
-a second window — takes `video::pidesk::armed()` for the same reason the shell window does. The
+a second window — takes `video::desktop_firmware::armed()` for the same reason the shell window does. The
 fixtures read the panel back; furniture that is on the glass while they read is furniture inside
 their answer. **CONSWIN-PI's console window is the counter-example that proves the rule rather than an
 exception to it**: it is minted at the GUI handoff, ahead of the cascade, and M2 measured exactly what
@@ -2668,7 +2675,7 @@ name the **same four missing REQUIREs** — `[wc-c] side-by-side … drawn=2`, `
 four are CONSWIN-PI M2's standing conflict, unchanged: the console window's box occludes the fixtures,
 and `[clickroute]`'s CLICK-SHELL leg reports `shell=skip` because `clickshell_leg` returns `None` when
 the parked cursor is over a window, which at 1920x1200 it is. The shell window adds nothing to that
-list — it is minted after `pidesk::armed()`, which is the whole point of the latch.
+list — it is minted after `desktop_firmware::armed()`, which is the whole point of the latch.
 
 The numeric differences are confined to the present-TIMING counters — `[wc-h] … -> AT-RISK` (20 / 9 / 14
 across the three runs) and `[wc-g]`'s `slow=yes` classification — and they track host load rather than
@@ -2692,14 +2699,14 @@ not against a remembered number. (The `27d782b5…` recorded by the two arcs bef
 VUG-PARITY, ONECARD-PI and DRAG-PI all changed knob-off code between then and now. The baseline is the
 CURRENT tip's image, always built, never quoted.) This arc touches exactly ONE file that is compiled
 knob-off — `arch/aarch64/syscall.rs`,
-edited **line-NEUTRALLY 4/4**: the furniture arm and the `pidesk::arm()` call are one dense line each,
+edited **line-NEUTRALLY 4/4**: the furniture arm and the `desktop_firmware::arm()` call are one dense line each,
 each paid for by one comment line merged nearby (panic `Location` records embed line numbers, so an
 added line anywhere in that file renumbers every record below it). The other three are free by
 construction: `video/mod.rs` is **not touched** (CONSWIN-PI already declares `pidesk`, so the cascade
 latch costs its parent zero lines — the earlier cut's "a new module costs one line" argument is now
 moot, and the module lands for nothing); `screen.rs` is **not touched** either, because the backdrop
 claim goes through `TargetPal::clear_screen` rather than widening `paint_desktop_scene`'s gate; and
-`pidesk.rs` itself only exists under the knob. `main.rs` was **measured** rather than assumed — a probe
+`desktop_firmware.rs` itself only exists under the knob. `main.rs` was **measured** rather than assumed — a probe
 line inserted mid-`render_service`, rebuilt, left the image byte-identical — so its additions are
 written for legibility instead of packed.
 
@@ -2814,6 +2821,84 @@ nothing on a gate with no pointer, exactly as CURSOR-1 promised.
 visibly front → the cursor is visible throughout. The raise, the shell raise and the cursor's survival of
 a window create are all gate-checkable; the *legibility* of the console under the full present, and the
 sprite itself (QEMU has no pointer), remain bench-only.
+
+### SPAWN-FOCUS — the window a person asked for takes the keyboard
+
+rMBP boot 2 (bench, metal): the operator typed a launch command at the shell, `pulse`'s window
+appeared, **and the keyboard stayed with the shell.** One symptom, two distinct failures at the same
+seam — `sys_win_create`'s first-window grant, which was the *only* rule deciding whether a freshly
+created window gets focus.
+
+1. **The grant was half a grant.** It published `USER_INPUT_ACTIVE` and stopped. It never called
+   `wm::focus_changed`, so `FOCUS_ASID` still named the shell, the new row was never raised, and its
+   chrome drew in the resting colours. The routing half said the new window had the keyboard; the
+   visible half said the shell did. This is exactly the failure FOCUS-VIS was written against, and
+   `clickshell_windowless_leg` already states the rule it broke — *a fix that did only the first would
+   read as focused and look unfocused*. Every other focus owner in the kernel (`dock::restore`, the
+   TAB cycle, the click router) calls `user_input_set_active` and then `focus_changed`, in that order;
+   this was the one site that did not.
+2. **The grant was too weak to fire at all** once anything else held focus. Its condition was "take
+   focus only if *nobody* has it" — deliberately the weakest rule that could never *steal*. That is
+   right for a window that opened on its own and wrong for the one the operator just named: launch a
+   second vessel from the shell while the first is focused and the new window opens behind the
+   keyboard.
+
+#### The policy
+
+> **A window created by an explicit user action takes focus on creation. A window created by anything
+> else never steals it.**
+
+The two are indistinguishable at `wm::create` — a window create looks identical either way — so the
+distinction is carried from the only place that knows it: **the launch**. `wm::SPAWN_FOCUS` is a small
+table of owners an operator explicitly launched, each awaiting its first window.
+
+| | takes focus on creation? | how |
+|---|---|---|
+| `run <path>`, `bg <path>`, bare-name launch | **yes, unconditionally** | the spawn arms a one-shot token; the first window consumes it |
+| an app's **second** and later windows | no | the token is a one-shot — already spent |
+| the compositor's desktop app (`desktop_uefi::desktop_app_service`) | no | never armed, *and* `SLOT_NO_AUTOFOCUS` at the grant |
+| the compat row, kernel furniture, selftest fixtures | no | never armed |
+| any of the above, when nothing holds focus | yes | the pre-existing weak rule, unchanged |
+
+The weak "shell was idle" rule is **kept, not replaced**. It is what makes a window reachable at all
+when nobody is using the keyboard; SPAWN-FOCUS sits in front of it and is consulted first, so an
+explicit spawn never falls through to a rule that would decline it merely because some other app
+happens to hold focus.
+
+The one-shot is the whole safety property. It makes "the operator asked for this window" a claim about
+a *single* window rather than a standing licence — a program cannot re-take the keyboard by re-creating
+a window in a loop.
+
+#### Mechanism, and why the token is armed at the spawn
+
+The token is armed **inside** the spawn, before the task can run — not by the launcher afterwards. The
+task is runnable the instant it is spawned and can reach `SYS_WIN_CREATE` before the launcher's next
+instruction, so "afterwards" is a race the operator would lose intermittently, which is the worst
+possible failure mode for a focus policy. `SLOT_DETACHED` and `SLOT_NO_AUTOFOCUS` are both set in that
+same pre-spawn window for the same reason; this is the third flag under that rule.
+
+It is dropped at slot teardown (`spawn_focus_forget`), per **tenant** rather than per slot, for the
+reason every other flag on this path is: owners are recycled slot aliases. A program launched by name
+that exited before ever opening a window would otherwise leave a live token, and the slot's next tenant
+— which nobody asked for — would consume it and take the keyboard.
+
+#### Arch-neutrality
+
+The **policy** lives in `video/wm.rs`, ungated and free of `target_arch`: the Pi runs this same
+compositor and inherits the rule the moment its syscall layer arms and consumes the token. What stays
+per-arch is only the **wiring**, and for a structural reason rather than a hardware one — the routing
+half of focus (`USER_INPUT_ACTIVE`) is an arch-local static in each `arch::*::syscall`, and `wm` may
+not call into the syscall layer at all (the layering invariant `sys_win_present` states: nothing under
+`wm` calls back into a window verb). So `wm` owns the decision, and the arch seam — the one place
+*both* halves of focus are reachable — performs it. x86 is wired; aarch64 needs no change in `wm` to
+adopt it.
+
+#### Witness
+
+`:: wc-x86: input focus -> slot N (SPAWN-FOCUS: operator-launched, first window) ::` for the strong
+arm, and the pre-existing `(first window, shell was idle)` for the weak one. Quoting them together is
+what distinguishes the two rules in a capture — the x86 fat gate run shows both, four of the former
+(including a slot recycled across tenants, each new tenant arming afresh) and three of the latter.
 
 ### FOCUS-HL — the focused window's chrome says so
 
@@ -5654,6 +5739,201 @@ from the router and the coalesced path is never taken; the gate proves no-regres
 `[cursor8] flush_kb=` is the bench instrument: against an unchanged motion profile it should fall by
 roughly the panel-width-to-sprite-width ratio.
 
+### USBDBG-CURSOR — the debug loop learns to draw the cursor (Boot 3, 2026-08-19)
+
+**Observed.** A card built with BOTH `UNAOS_USBDEBUG=1` and the desktop knobs (`UNAOS_WC=1` + the
+kepler knobs) booted a *working* desktop — the compositor ignites from the Kepler takeover, which runs
+inside PCI enumeration — with **no mouse cursor at all**. The operator could see windows and select
+nothing. The combination had never been flown before: usbdebug cards predate the desktop.
+
+**Mechanism — a missing call, not a broken one.** `main.rs`'s usbdebug loop (`#[cfg(feature =
+"usbdebug")]`, before the GUI takeover, `loop`s forever) drains `pal::next_event()` and *prints* each
+pointer report. It never moved `pal::cursor`. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so
+`move_rel`/`set_abs` are what tail into `video::cursor::repaint()` — the whole front-buffer paint hangs
+off the position update. Every other drain in the kernel does it (the console loop's `Mouse` arms, the
+render service's, the aarch64 router's FOCUS-VIS keep-alive); this one printed the report and dropped
+it. So the sprite was never armed, `[cursor] armed` never printed, and zero cursor pixels were written
+for the entire boot.
+
+**The fix (`usbdebug_cursor_service`, main.rs).** In the usbdebug drain, gated on
+`video::desktop_uefi::is_active()` — the compositor's own runtime latch, not a build `cfg`, because a `wc` card
+whose activation DECLINED has no desktop and should keep the old behaviour — move `pal::cursor` and take
+the idempotent `ensure_drawn()` tail, exactly as the console loop's arms do. The hide edge is mirrored
+too: `visible()` going false calls `video::cursor::undraw()` once (this loop owns no `GneissPal`, so it
+cannot spell that as `pal::cursor::restore`). Panel bounds come from `video::WRITER` — the same surface
+`video::cursor` paints into — read into a copy with the guard **dropped before** `move_rel`, since
+`repaint`→`refresh_locked` takes `WRITER` itself.
+
+**No new painter.** Nothing here writes the framebuffer directly; the front-buffer contract
+(undraw-then-draw under one exclusive claim, sprite off the panel while another painter reads those
+pixels) is entirely `video::cursor`'s and is unchanged.
+
+**Heap.** None of this allocates, and the combination costs no heap either: `fbcon::attach_shadow`'s
+QUIET-PANEL early-return already declines the ~28 MiB shadow on any `usbdebug`/`witness` build without
+`bootlog`, and the usbdebug loop never reaches the GUI takeover, so no `Screen` back buffer is
+constructed on this path at all. The x86 heap is 256 MiB since GR26 in any case (`allocator.rs`; the
+48 MiB figure is aarch64's, whose heap region is hand-placed at 32 MiB / 64 MiB long).
+
+**Witness.** One line, once, on the first serviced pointer report:
+
+```
+:: USBDBG-CURSOR: debug-loop cursor service ARMED wc=active panel=WxH == witness ::
+```
+
+so the next diagnosis card proves the arming on the wire rather than from a photograph. `[cursor] armed
+x= y=` from `video::cursor` follows it immediately.
+
+**QEMU cannot witness this.** The whole path needs a real HID pointer *and* a live Kepler takeover;
+QEMU has neither. The gates prove non-regression (`check` both arches, knobs on and off; the x86-fat
+gate with knobs off) and the artifact carries the witness string. The metal falsifier is exactly the
+Boot 3 card: a `usbdebug` + `wc` card now shows the cursor.
+
+> **POSTSCRIPT (USBDBG-INVERT, 2026-08-19).** `usbdebug_cursor_service` and its auto-hide edge are
+> **gone**. They were compiled only under `x86_64` + `usbdebug` + `wc` — exactly the regime the
+> inversion below moved onto the real desktop, where `x86_render_service`'s own pointer arms have
+> always moved the sprite. The DIAGNOSIS above stands unchanged and is the first of the three
+> incidents that argued for the inversion; only the fix is superseded. The heap paragraph's two
+> claims were re-verified on the inverted path and both hold — see USBDBG-INVERT.
+
+### USBDBG-ROUTE — the debug loop learns to ROUTE the event (Boot 5, 2026-08-19)
+
+**Observed.** Boot 5 flew the first card carrying USBDBG-CURSOR. The cursor MOVED — that fix is
+confirmed on metal — and **clicks did nothing**: no window raised, the SHARD crystal did not open, no
+`[clickroute]` line printed for any physical click (the only ones on the log came from the boot-time
+`wmdirect_selftest`). The pointer was live and the desktop was inert under it.
+
+**Mechanism — the same shape as USBDBG-CURSOR, one layer up.** The input was *arriving*: the EHCI
+`PTR:` witness incremented `delivered=` once per physical click, so press edges reached `pal`'s queue.
+The usbdebug drain popped every `Event::Button` into its `_ => {}` catch-all and dropped it — it has no
+`Button` arm and, more to the point, **no router call at all**. Click routing on x86 lives in exactly
+one place, `wc_route_event` ahead of the GUI loop's match (`main.rs`), and a `usbdebug` build never
+reaches the GUI takeover. So clicks have **never** routed on a usbdebug desktop card; USBDBG-CURSOR's
+working arrow only made the hole visible.
+
+**The fix (`usbdebug_route` + `usbdebug_route_tail`, main.rs).** The debug drain now runs the SAME chain
+the GUI loop runs, in the same order, by *calling* `wc_route_event` rather than transcribing a second
+routing policy for this build. Its invariants come along unchanged: Escape dismisses an open SHARD menu
+and `<TAB>` is judged by the window system before either router; a pointer BUTTON is addressed BY
+POSITION (the window under the cursor) before anything is delivered BY FOCUS; and a consumed event
+returns `Event::Unknown` and **never** `Event::None`, which matters here for the same reason it matters
+in the GUI loop — `None` is this `while let Some(..)` drain's end-of-queue sentinel, so returning it
+would strand everything queued behind the first routed click.
+
+Gated on `video::desktop_uefi::is_active()`, the compositor's own runtime latch, exactly as the cursor service
+is: with no live desktop there is no window to address a click to, and the card's reason to exist on
+pre-GUI bring-up is the raw print-only view, which is preserved bit-for-bit on that path.
+
+**Two orderings are load-bearing:**
+
+- **The cursor service is fed the ROUTED event, not the raw one.** `Event::Mouse`/`MouseAbsolute` are
+  packable, so on the consumed branch `user_input_route` → `pal::cursor::track_routed` has already
+  applied the delta (CURSOR-VUG) and the event handed on is `Unknown`. Fed the raw report instead, a
+  consumed relative report would move the arrow **twice**. This is the same reason the GUI loop keys its
+  pointer arms on `ev`. (On a card with no ring-3 app focused nothing is packable-consumed and the two
+  spellings coincide — which is precisely why keying it wrong would pass every gate and fail the first
+  boot that launched a window.)
+- **The drag tick is keyed on the RAW report and runs after the match.** See below.
+
+**The drag-tick decision — it is NOT optional here.** The question was whether the debug loop also needs
+the GUI loop's `wc_route_tail`. The answer is forced by where a title-bar drag's three phases live:
+
+| Phase | Reached from |
+| --- | --- |
+| ARM | the chrome arm of `wc_click_route_at` — i.e. the routing call now added |
+| STEER | `wc_drag_motion`, reached from the drain TAIL and nowhere else |
+| END | the release arm of `wc_click_route_at` — the routing call again |
+
+Routing alone therefore buys a card that *arms* and *ends* drags perfectly while moving no window a
+single pixel: the grab looks accepted and is inert. That is the Boot 5 incident recreated one sitting
+later, so the tail ships with the routing rather than after it. It is keyed on the raw report for
+`wc_route_tail`'s own documented reason — a title-bar grab *guarantees* the consumed branch, because the
+chrome arm focuses the dragged window's owner, so keying on the routed outcome would make the drag dead
+for exactly the windows that can be dragged — and placed after the match so the cursor position
+`wc_drag_motion` reads is fresh on both branches (one tick per report either way).
+
+**Not touched:** `wc_route_event`, `wc_click_route_at` and the EHCI belt. The routing redesign at
+`4b9432bc` is aboard and unproven on metal; this change is *delivery* of the debug loop to that policy,
+not a change of policy.
+
+**Witness**, once, on the first event routed with the compositor live:
+
+```
+:: USBDBG-ROUTE: debug-loop click routing ARMED wc=active == witness ::
+```
+
+**QEMU cannot witness this** (no real HID pointer, no Kepler takeover). The gates prove non-regression —
+`check` both arches, knobs on and off; the x86-fat gate with knobs off — and the packaged `kernel.elf`
+carries the witness string, so the path is reachable and not merely compiled. **Metal falsifier:** on a
+`usbdebug` + `wc` card, one physical click on the SHARD crystal opens the menu and prints a
+`[clickroute] ... band=menu` line, and a title-bar drag moves the window.
+
+> **POSTSCRIPT (USBDBG-INVERT, 2026-08-19).** `usbdebug_route` and `usbdebug_route_tail` are **gone**
+> too, for the reason this section's own argument makes irresistible: it ends by *calling the GUI
+> loop's chain* rather than transcribing it, which is the admission that the debug loop wanted to be
+> the GUI loop. Metal boot 6 then found the next missing piece — the dock's `-> shell-reopen` routed
+> (this fix working) onto a shell window that sat greyed and dead, because the console SERVICE lives
+> in the GUI loop as well. Rather than port a fourth piece, the arc below inverts the build. The
+> routing table above is still the correct account of where a drag's three phases live; on the
+> inverted path all three are reached from `x86_render_service`, which had them all along.
+
+### USBDBG-INVERT — the diagnosis card becomes the real desktop (2026-08-19)
+
+**Peter's ruling.** *"This is serious debug time not play time."* A diagnosis card must be **the real
+desktop plus instruments**, never a parallel half-desktop. The two sections above are the evidence: a
+usbdebug card lost its cursor (patched), then its clicks (patched), then its shell — and the shell was
+never going to be the last one, because the list of things the terminal loop lacks is simply *the whole
+of `x86_render_service`*.
+
+**The inversion.** On `x86_64` + `wc` the `#[cfg(feature = "usbdebug")]` block in `main.rs` is compiled
+out entirely, and the boot runs the ORDINARY path: the SCHED-X86 handoff, the console service, the
+shell window, the compositor — with the debug capabilities riding inside it behind the knob. The gate
+is the BUILD (`all(target_arch = "x86_64", feature = "wc")`) and deliberately not `desktop_uefi::is_active()`:
+that latch has exactly one setter (the Kepler takeover), so a runtime gate would send QEMU — where no
+Kepler exists — back into the terminal loop, and the inversion's own falsifier is a headless
+`UNAOS_USBDEBUG=1 UNAOS_WC=1` run reaching the GUI selftests.
+
+**What still compiles the terminal loop:** `usbdebug` WITHOUT `wc`, and every aarch64 usbdebug build.
+That is the knob's original purpose — pre-GUI bring-up on a card with no compositor at all — and its
+body is otherwise untouched, minus the three superseded call sites, which were runtime no-ops there
+(`desktop_uefi::is_active()` is false with no takeover).
+
+**Where each debug-only service went.**
+
+| Debug-loop service | Inverted home |
+| --- | --- |
+| xHCI `poll_events` + `service_ftdi`/`storage`/`hubs`/`hid_setproto`/`slot_disposal`/`enum` | `x86_usb_pump`, same calls in the same order |
+| EHCI HID poll, `x86_typematic_pump`, SMC battery, `irqstorage` pair | `x86_usb_pump` (the BATMON-1 note there already called the usbdebug site unreachable on a GUI boot) |
+| `fat::probe_once`, `selfhost`, `sdhc_probe_once`, `fatverb_storage_witness`, `wifi::service` | `x86_usb_pump` — the third of the three storage-ready passes; every one of these already sat at all three |
+| `bootpace::service_dump`, `flight_recorder::service`, `log_summary_once`, `fbcon::console_service`, `console_pace_census_once`, the U2..U6bx ladder | `x86_usb_pump`, already present |
+| `bootlog::service_serial_dump` (**the one gap**) | its gate widened from `witness` to `any(witness, usbdebug)` at both remaining pass sites |
+| `USB-DEBUG:` event prints | `usbdebug_event_print`, called from `x86_render_service` and the inline BSP drain, on the RAW report, **before** `wc_route_event` — print AND route |
+| `PTR:` press witnesses | never this loop's: they print from inside the EHCI HID service, which every x86 path polls |
+| VPERF `scenario_tick` (`videobench`) | stays with the preserved regime — it is a scripted **fbcon console** scroll, and the inverted path detaches fbcon |
+| `e1000::service_net` (deliberately absent from the debug loop) | present on the inverted path, like every other desktop build |
+
+**Heap arithmetic for the combined regime** (both claims re-verified): the x86 heap is **256 MiB**
+(`allocator::HEAP_SIZE`, GR26; the 48 MiB figure is aarch64's), and `fbcon::attach_shadow` early-returns
+under `any(usbdebug, witness)` without `bootlog`, so a diagnosis card allocates **no** shadow at all.
+Even if one existed, the shadow and the render service's back buffer are both `stride x height x 4` =
+4096 x 1800 x 4 = 28.1 MiB on the bench panel, so the worst case is 56.3 MiB of 256 MiB (22%) — the
+"a second ~28 MiB shadow would OOM the heap" hazard the old comment named was a 48 MiB-heap fact and no
+longer binds. The inverted path takes neither the late attach (compiled out with the block) nor the
+EARLY one at the post-heap seam (QUIET-PANEL declines it), so the measured cost is zero.
+
+**Witness**, once, at the GUI takeover, from both x86 takeover seams (scheduled and inline):
+
+```
+:: USBDBG-INVERT: debug instruments riding the real desktop == witness ::
+```
+
+**QEMU DOES witness this one**, which is the point: `UNAOS_FATIMG=sf UNAOS_USBDEBUG=1 UNAOS_WC=1
+./arroyo test 150` is the first usbdebug+wc run in this tree's history to reach the GUI selftests at
+all, and it passes the full x86-fat witness set — **MBENCH PASS 31/31**, `[wm-act] direct ... -> PASS`
+with every leg true — beside the `USBDBG-INVERT` line and the relocated `USB-DEBUG:` prints. The
+packaged `kernel.elf` carries the witness string (and no longer carries the two retired ones).
+**Metal falsifier:** a usbdebug+wc card boots to the real desktop — the shell types, the cursor moves,
+clicks route, and the `PTR:` lines still print.
+
 ### WEDGE-1 — P66's mechanism is UNKNOWN; this arc hardens and instruments
 
 **Verdict first: this arc did not root-cause P66.** It landed two safe-direction changes and two
@@ -6981,6 +7261,10 @@ Rides `[wcn]`'s cadence and span, directly under the per-window `comp_rate=` lin
 [wcser] scope=live entered=N declined=M reruns=R declined_pct=P span=Sms -> SERIAL|SOLO
 ```
 
+> Superseded 2026-08-19 by WCSER-H: the line now carries `holder=`, `held_ms=`, and `exbusy=`
+> before `span=`, and a `WEDGED` verdict outranks `SERIAL`. See the WCSER-H section below for
+> the current signature and fields.
+
 `declined` is the reading: the number of composite passes that would previously have been
 interleaving their blits with another core's. `SOLO` (`declined=0`) is **not** a failure — it is a
 period in which one core did all the compositing — but it *is* a falsifier for any claim that this
@@ -7394,6 +7678,21 @@ Post-fix, with the pointer over a window:
 [cursor11] compose-through scope=… passes=P bracketed=B px_deferred=D>0 px_installed=I px_redrawn=R
 ```
 
+MENU-UNDER (2026-08-18) qualifies the `reserved=` reading: the field also counts the
+sprite-over-furniture overlay declines (open SHARD dropdown, and the dock when a dragged window
+sits under it). `reserved=0` is the expected idle-desktop reading; `reserved>0` while the
+operator has the menu open under the pointer, or is dragging a window through the dock with the
+pointer on the strip, is the mechanism WORKING, not a deviation.
+
+SINCE THE TRUNK LANDING (2026-08-19) THE TWO SOURCES ARE NO LONGER STRUCTURALLY EXCLUSIVE PER
+ARCH. MENU-UNDER's three cfg sites were widened from `all(x86_64, wc)` to
+`any(all(x86_64, wc), all(aarch64, pidesk))`, so on an aarch64 `pidesk` build `reserved=` can be
+armed by EITHER source: the WC-F probe (witness+baremetal) or MENU-UNDER's furniture decline. A
+non-zero `reserved=` on aarch64 therefore no longer identifies which of the two fired — read it
+as "the pass took CURSOR-3's whole-sprite bracket deliberately", and use the operator's state
+(menu open / window dragged under the dock) to attribute it. On x86 the field is MENU-UNDER's
+alone, as before.
+
 `nosprite` must fall to the passes where the pointer is *genuinely* hidden — before the first report
 of the boot, and after CURSOR-HIDE's ~1.5 s idle expiry. `nosprite ≈ passes` with a pointer moving on
 the panel means the fix did not take. With the pointer over the desktop the honest answer is
@@ -7457,7 +7756,7 @@ to be a policy about.** The audit is recorded here in full so it is not re-run.
    syscall-numbering note says so directly: 27 (`INPUT_POLL`) is reserved for x86's "later arcs".
    CLICK-PLAIN's central claim — that a focus-changing press is *delivered whole* into the raised
    owner's ring — has no addressee on x86.
-5. **Every window x86 puts on the panel is owned by ASID 0.** `video/wcx.rs` creates the demo and
+5. **Every window x86 puts on the panel is owned by ASID 0.** `video/desktop_uefi.rs` creates the demo and
    probe rows with owner 0, and `video/fbcon.rs`'s console window likewise; `hit_test` skips
    `owner_asid == 0` by design (a compat/kernel row names nobody as a focus target). So even if the
    press path existed and called `hit_test` today, it would resolve `None` for every persistent x86
@@ -7701,7 +8000,7 @@ the operator can click them — and that invariant died with the change. The sib
 table, reporting `skip` when the panel leaves none; the hit-test witness predates it and kept its
 constant. That is the whole of the difference between the two.
 
-Why QEMU never saw it: `wcx::activate` runs only from the Kepler display takeover, so on the QEMU x86
+Why QEMU never saw it: `desktop_uefi::activate` runs only from the Kepler display takeover, so on the QEMU x86
 gate neither the console window nor the desktop demo row exists at all. The gate panel is bare, every
 derived point is unowned, and the leg passes for a reason that has nothing to do with the leg. (The
 CLICK-X86 r2 note above says the x86 gate line was taken "with the console window live in the table";
@@ -7871,7 +8170,7 @@ instrument was simply unable to say so.
 | 3 | `fbcon::route_present_rows` → `wm::present_rows` → `present_banded` → `composite` | **one present per frame period** (FBCON-PACE, ab1f59dc) — routed-line damage merges in FBCON-DMG's `PEND` ledger and flushes when `pace_due()` (60 Hz off `tsc_hz`, degrade-to-present on hz=0), on urgency (route install, `clear()`, INSTGUI resume, `console_flush()` from `detach()`), and unconditionally under `PANIC_MIRROR` | **UP**, and this is the volume path when the console is not suspended | The print path takes no cursor bracket of its own. Suspended entirely while an INSTGUI dialog is open. Boot-7 replay: 799 presents → ~57; `[wc-h] span=` is now the merged union since the last present, not one line's damage. |
 | 4 | `arch::x86_64::syscall` window-present verb → `wm::present` | EL0 `SYS_WIN_PRESENT` | **UP** | Syscall context; no bracket anywhere above it. |
 | 5 | `instgui::repaint` → `wm::present` | dialog state change / keypress only | **UP** | Ordinary `wm::present`. **No special path** — see below. |
-| 6 | `wcx::activate` → `wm::present` / `create_at` | once, from PCI enumeration | DOWN, harmlessly | `wcx.rs:193` undraws before its one-shot `fill_screen`. Runs before the sprite has ever existed, so the undraw is a no-op. |
+| 6 | `desktop_uefi::activate` → `wm::present` / `create_at` | once, from PCI enumeration | DOWN, harmlessly | `desktop_uefi.rs:193` undraws before its one-shot `fill_screen`. Runs before the sprite has ever existed, so the undraw is a no-op. |
 | 7 | `wm::create_at` / `create_inner` → `composite` | window creation | **UP** | No caller-side bracket. |
 | 8 | `wm::focus_changed` → `composite` | focus raise | **UP** | No caller-side bracket. |
 | 9 | `wm::move_to` → `erase` → `composite` | window move | **was DOWN** | `erase` undraws; the composite ran inside that bracket. **Fixed this arc.** |
@@ -8772,7 +9071,7 @@ existing FORBIDs mean on a line they already guard.
   byte-identical to the pre-change baseline. That also proves the two FBCON-DMG-substrate
   `#[expect(dead_code)]` markers came off correctly: `damage_rows` and `damaged_box` both gained
   callers, and neither an unfulfilled-expectation nor a dead-code warning appears.
-* **No QEMU verdict, and none is possible.** `wcx::activate()` — the compositor's only x86 ignition —
+* **No QEMU verdict, and none is possible.** `desktop_uefi::activate()` — the compositor's only x86 ignition —
   has exactly one caller, `drivers/gpu/kepler_display.rs`, inside the Kepler takeover, for which QEMU
   has no part. A QEMU run of this path would be vacuous. **Metal is the only verdict.**
 
@@ -8905,11 +9204,11 @@ armed.** What discriminates:
 |---|---|---|
 | `[wc-x]` | 22 | 1 |
 | `kepler` | 102 | 1 |
-| symbol `video::wcx::activate` | present, 4181 B | **absent** |
+| symbol `video::desktop_uefi::activate` | present, 4181 B | **absent** |
 | symbol `kepler_display::takeover_display` | present, 7517 B | **absent** |
 
 The **symbol pair is the better witness**, for two reasons. It is exactly the ignition chain this
-subsystem's ground rules name: `takeover_display` is the ONE caller of `wcx::activate`
+subsystem's ground rules name: `takeover_display` is the ONE caller of `desktop_uefi::activate`
 (`drivers/gpu/kepler_display.rs:454`, the tree's only occurrence), so both symbols present means the
 chain is in the image and either absent means it cannot start. And it is a clean binary — where the
 two string counts fall to `1`, not to `0`, because a knob-independent literal survives in each case.
@@ -9110,10 +9409,10 @@ Neither is a video finding; both are recorded here because they are hit while re
 
 #### The window-id map — read this before attributing any `[wc-x]` or `[wc-h]` line
 
-Ids are table-slot order, assigned as `(slot + 1)` in `wm::create_inner`, and `wcx::activate()`
+Ids are table-slot order, assigned as `(slot + 1)` in `wm::create_inner`, and `desktop_uefi::activate()`
 creates in a fixed order: console, then probe.
 
-> ⚠ **CHANGED BY THE KERNEL-APPS EVICTION (move #1).** `wcx::activate()` no longer creates a demo
+> ⚠ **CHANGED BY THE KERNEL-APPS EVICTION (move #1).** `desktop_uefi::activate()` no longer creates a demo
 > window. Every capture taken before that arc maps `win=2` to the kernel-drawn 96x64 calibration
 > window (`[wc-x] demo win=2 surf=96x64 at (2103,1117) scale=8x z=2` → `[wc-x] present win=2
 > rows=1104..1630 ok=true`, outer box 770x526) and `win=3` to the MOVE-VACATE probe. **Read historical
@@ -9125,7 +9424,7 @@ creates in a fixed order: console, then probe.
 |----|------------|---------|-----------|-----------|
 | `win=1` | **the panel console** — fbcon routed into a window; the subject of this arc | 1312x736 | 1314x750 | `[wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) …`, and `[wc-x] activate … console_win=1` |
 | `win=2` | the MOVE-VACATE probe — witness builds only, one-shot, opened and closed in a clear corner. It was `win=3` while the demo window still existed | 8x8 @ 8x | 66x78 | `[wc-x] move-vacate win=2 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true … -> PASS` |
-| first free slot | **the desktop app** — `STAT.ELF`, launched by `wcx::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands — and on a witness build that is now *after* the DMG-REFUSE hold releases, so its id follows the witness ladder's teardown state rather than racing it (Boot AL, pre-hold, saw it land in row 1 mid-ladder and void the refusal witness) | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
+| first free slot | **the desktop app** — `STAT.ELF`, launched by `desktop_uefi::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands — and on a witness build that is now *after* the DMG-REFUSE hold releases, so its id follows the witness ladder's teardown state rather than racing it (Boot AL, pre-hold, saw it land in row 1 mid-ladder and void the refusal witness) | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
 
 The box arithmetic corroborates the wire independently, through `TITLE_H = 12` and `BORDER = 1`:
 8·8 + 2 = 66 and 8·8 + 12 + 2 = 78 for the probe. (The retired demo window's 96·8 + 2 = 770 and
@@ -9279,7 +9578,7 @@ lines below are what it CAN read.
 * **Before blaming the boot, confirm the image was armed — and do not confirm it with `[wc-h]`.**
   Every `[wc-h]` literal this arc added is present with `UNAOS_WITNESS=1` alone, identically in an
   image built with the compositor knobs OFF, so finding them on a stick proves nothing about the
-  compositor. The witnesses that discriminate are the symbols `video::wcx::activate` and
+  compositor. The witnesses that discriminate are the symbols `video::desktop_uefi::activate` and
   `kepler_display::takeover_display` — present together, or the ignition chain is not in the image at
   all. Note also that `strings`/`nm` are **not** on this host: an empty probe result is a broken
   instrument until proven otherwise. Full counts and method under *ARTIFACT-AUDIT* above.
@@ -9331,6 +9630,59 @@ lines below are what it CAN read.
   fields are invariants rather than measurements — `band=no` on every line, `span=` always equal to
   the box height, `banded=0` with `minspan=0 minspan_bytes=0`, and never a `scope=window-band`
   rollup. A band-carrying field with any other value on aarch64 is itself the finding.
+
+### CHROMEBAND — the chrome painter walked the box once per band (x86 `wc`, 2026-08-25)
+
+Reported by the pi track as "chrome repainted once per band, 3x at 1920-wide". The count is real —
+`stage_window` calls `paint_window` once per band and always did — but the cost is x86's, and the
+reason is not in `wm.rs` at all.
+
+`FrameBuffer::fill_rect` has two arms. The aarch64 arm clamps `y1` to the surface height and then
+walks; **the x86_64 arm is the per-pixel loop with no height pre-clip**, so every row past the
+destination's last was still walked and every pixel of it still paid a call and four bounds checks
+to be rejected. `fill_rect_v` clipped only the TOP edge (WC-M's concern), and `fill_rect_ceramic`
+clipped neither — it is an explicit row loop that paid a `ceramic::shade` (a table lookup, three
+multiplies, a clamp per channel) to produce a colour for a row the destination then threw away. The
+side-border rects are the content's full height, so a five-band present walked them five times over.
+
+`clip_rows` now states the arithmetic once and both callers use it. **The pixel set does not move**:
+for `y >= 0` the old call filled `[y, min(y + h, dh))` after `put_pixel`'s rejections, and for
+`y < 0` it filled `[0, min(h - skip, dh))` — exactly what `clip_rows` returns. `shade` is a pure
+function of the box-local row, which the clip does not move, so the grain still anchors to the
+window and still runs continuously across a band seam.
+
+**Measured, on both paths, at bench geometry:**
+
+```
+before  [wc-b] fixture geom=2880x1800 chunk_rows=364 bands=5 chrome_rows=10280 chrome_rows_used=2056 amp=5.00x -> AMPLIFIED
+after   [wc-b] fixture geom=2880x1800 chunk_rows=364 bands=5 chrome_rows=2056  chrome_rows_used=2056 amp=1.00x -> CLEAN
+```
+
+`chrome_rows=` counts loop iterations executed; `chrome_rows_used=` is an INDEPENDENT test of each
+iteration's row against the destination's own height. Neither is derived from the other, so `1.00x`
+is a measurement and not a tautology, and a regression that widens the walk separates them again.
+
+#### The gate cannot reach this path, and that is why the fixture exists
+
+Banding needs `bw * span > 1 048 576` px (`MAX_STAGE_BYTES / 4`). Measured on this track:
+
+| panel | largest box the gate builds | banded? |
+|---|---|---|
+| 1280x800 (QEMU default) | the whole panel is 1 024 000 px — **24 576 short** | never, in principle |
+| 1920x1200 (forced) | 522x556 = 290 232 px | never |
+
+Both runs printed `banded=0 maxbands=1` over every present. **`UNAOS_FBW`/`UNAOS_FBH` do not help:
+they are read with `option_env!` by `arch/aarch64/mailbox.rs` and have no effect on x86** — the x86
+panel comes from the bootloader's GOP mode selection, which takes EDID or the firmware's current
+mode. (`UNAOS_QEMU_EXTRA="-vga none -device VGA,edid=on,xres=…,yres=…"` does move it, and is how the
+1920x1200 row above was taken.) Even at bench width the gate has no full-panel-width window: the
+banded present on the bench is the console-as-a-window, which this gate does not route.
+
+So a green gate over the shipped path would have certified nothing about banding. `chromeband_fixture`
+drives the band loop's own `paint_window` call at 2880x1800 against a one-band scratch buffer — never
+touching the panel, so it cannot disturb `[wc-d]`'s read-back — and puts `bands=5` on the wire of
+every x86 witness boot. It is labelled `fixture` on that wire, and reads `-> NOT-BANDED` if the
+geometry ever stops exercising the defect.
 
 ## CURSOR-VUG — a focused app was swallowing the pointer, and the arrow with it (2026-08-08)
 
@@ -10011,9 +10363,9 @@ the edge — it was standing in front of it, and the lift it applied is the ~1 p
    lift's cost, which is what the operator sees). A grab-and-let-go with no motion between the edges
    settles at its own grab point.
 
-**The witness.** `[dragrel] win= end= settle= release= stale= lead= swap= post= pend= wait= ->
+**The witness.** `[dragrel] win= end= settle= release= stale= lead= swap= post= pend= ring= wait= ->
 CLEAN|DIRTY`, one line per gesture end, from both end paths, immediately before the `wm` call that
-clears the gesture. (`lead=` and `swap=` were added by DRAGGLIDE below.)
+clears the gesture. (`lead=` and `swap=` were added by DRAGGLIDE below; `ring=` by GHOST-DRAG.)
 `end=` names the path (`edge` = the delivered release; `level` = the belt with no edge queued;
 `level-late` = the belt firing past the deadline). `stale=` is `release - settle`: **the motion that
 arrived after the button read up**, i.e. exactly what the old code applied to the window and this
@@ -10186,7 +10538,10 @@ nothing to get in front of. The same gap exists on hardware between two concurre
 so the fix went to the decode sites rather than to the fixture; see *Which lift, decided by the
 decode site* above.
 
-### OPEN — two routers can interleave a gesture's routing, and the lift can still be steered
+### CLOSED by GHOST-DRAG — two routers can interleave a gesture's routing, and the lift can still be steered
+
+**Kept verbatim, because GHOST-DRAG is this exact mechanism reaching the operator's hand instead of a
+fixture's.** Read this statement of the defect, then *GHOST-DRAG* below for what closed it.
 
 **Not a fixture artifact, and it is written here rather than patched in a review pass.** Both x86
 drains — `main.rs`'s BSP GUI loop (`:1672`/`:1796`) and the SCHED-X86 render service (`:4393`/`:4458`)
@@ -10229,6 +10584,410 @@ in a *hardware* capture would be a real finding.
 gesture where the drain was running behind the hand; `stale=` at or near `(0,0)`. A recurring
 `swap=0` on gestures that also show `lead=` nonzero is the one combination that means the ~1 px is
 back.
+
+## GHOST-DRAG — a dropped window must not trail the next movement (2026-08-18)
+
+**Peter's report, boot 6 on the rMBP.** Drag a window, drop it, let the hand go **still**, then move
+again — and the window briefly **TRAILS** the pointer before settling. The drop looked finished and
+was not.
+
+**The mechanism, and it is the interleave above with a hand-sized gap opened in it.** Two facts
+compose:
+
+1. **The release edge can be emitted LATE.** If the release report is polled over at the EHCI ring
+   (boot C measured 43 down-edges against 29 releases — ring loss is real on this pad), the level is
+   never republished and the drag stays armed, invisibly, for as long as the hand rests. `wc_drag_motion`
+   states that residue and calls it harmless *because an unsteered drag moves no window*. The edge is
+   finally emitted by the FIRST report of the next movement: `note_buttons` sees `!down && prev & 0x01`
+   and pairs the late edge with that report's motion, and the DRAGGLIDE reorder duly puts it in front
+   of its own lift.
+2. **`pend` does not mean what the lead branch needs it to mean.** `RELEASE_EDGES_PENDING` counts an
+   edge from its push until a ROUTER routes it. Between the POP and the route the edge is out of the
+   ring while still counted — the window the section above describes. The lead branch's licence to
+   steer with the button level reading UP is a FIFO argument and nothing else: *"an edge is still
+   queued behind me, so I was pushed before it, so I am hand travel with the button down."* A motion
+   behind a POPPED edge was pushed AFTER it.
+
+Ordinarily (2) costs a lift's worth of pixels, which is what the section above measured. With (1) the
+motions on the far side of the popped edge are separated from the true release by the whole pause, so
+they are not a lift — they are wherever the hand has since gone. And within `LEAD_TRUST_MS` they also
+moved `DRAG_DOWN_*`, so the window did not merely trail: it came to **rest** at the new pointer
+position instead of at the drop point.
+
+**The fix, which is the one this ledger asked for and priced.** The section above names the clean
+repair — make the count mean *"still in the ring"* — and rejects doing it by moving
+`RELEASE_EDGES_PENDING`'s decrement to the pop, because that costs `end=level-late` its meaning: an
+edge eaten by another consumer would become indistinguishable from an edge that never arrived. It
+asks instead for *"its own accounting for popped but not yet routed, and its own arc"*. That is what
+landed.
+
+`pal::release_edge_in_ring()` is a SECOND, independent census of release `Button` entries physically
+present in the ring, maintained on `EventQueue::push` / `EventQueue::pop` — **the ring primitives
+themselves**, so the re-circulation peek (`peek_event_uncounted` / `requeue_event`, which bypasses
+`push_locked` entirely and runs ~250×/s while a full-screen app owns the panel) balances
+automatically and cannot drift the guard to zero. The drag tail takes it **in conjunction** with
+`pend`, never in place of it:
+
+```rust
+let edge_in_ring = crate::pal::release_edge_in_ring() != 0;
+if pend != 0 && edge_in_ring && waited < RELEASE_EDGE_GRACE_MS {
+```
+
+`pend` therefore keeps its route-time semantics and remains the only thing that ENDS a gesture, so
+`end=level` / `end=level-late` keep meaning exactly what they meant. The census is deliberately
+**coarser** than `pend` — it counts any `Button` whose primary bit is clear, because a ring primitive
+has no mask history to consult — and coarser is the safe direction under a conjunction: it can only
+ever leave the existing test in charge, never overrule it.
+
+**What did NOT change, and it is the constraint that shaped the fix.** A gate on the raw button level
+alone — *"a motion arriving with the level up must not steer"* — is the obvious repair and it is
+wrong: it reverts DRAGGLIDE outright. An ordinary release queues its backlog AHEAD of its edge, and
+every one of those motions is routed with the level already up; refusing them the steer is precisely
+the glide Peter reported off Boot A. **Leg 10 asserts this in the tree** — it drives one lead motion
+and requires the row to rest at `+12`, noting that *zero lead motions IS the glide and is a real
+failure*. Under the in-ring test those motions are popped while the edge is still queued and steer
+exactly as before; only a motion that cannot prove it came first loses the licence.
+
+**The lost-release settle rule, stated.** A motion that fails the test skips the steer AND skips the
+`DRAG_DOWN_*` record, then falls through to the belt, which ends the gesture at `drag_settle_point()`
+— the last position recorded with the button DOWN, i.e. the drag's last steered position. **The
+window settles where the hand let go, and never leaps to the new motion's position**, whether the
+edge arrives late, is eaten, or never comes at all.
+
+**The witness.** `ring=` joins the `[dragrel]` line, beside `pend=`, and the PAIR is the interleave
+detector:
+
+```
+[dragrel] win=1 end=edge settle=(439,295) release=(439,295) stale=(0,0) lead=1 swap=1 post=0 pend=0 ring=0 wait=3ms -> CLEAN
+```
+
+* `pend=1 ring=0` on a `level-late` ending — the edge had already been POPPED by the other drain and
+  was about to be routed by it. This is the state the arc closed, and the one in which a level-up
+  motion is no longer allowed to steer.
+* `pend=1 ring=1` — an edge genuinely still queued; the lead branch is licensed.
+* `pend=0 ring=0` — the ordinary ending.
+* `ring=` persistently nonzero across gestures would mean release entries are leaving the ring by
+  some path that is not `EventQueue::pop`. The census is maintained on the primitive, so that should
+  be unreachable; seeing it is a real finding.
+
+**QEMU cannot exercise this.** The gate is headless and delivers no HID pointer, and the fork this
+arc closes needs a lost release plus a hand that stops and starts. **The metal falsifier is the whole
+verdict: drag, drop, stop, move — the window stays put; no trail.**
+
+## PTRDEAD — the post-drop dead zone is a queue being walked, not travel being lost (2026-08-21)
+
+**Peter's report, boot 10 on the rMBP.** GHOST-DRAG's trail is **gone** — and in its place, after a
+drop, the **cursor** is dead for roughly the first fifth of the trackpad's width. The glass is
+exonerated (`dropwake` 6/6 CLEAN, `rel->glass=0`), so this is input-side.
+
+### The GHOST-DRAG discriminator is REFUTED as the cause, and the capture says so
+
+The standing hypothesis was that `wc_drag_motion`'s post-release branch swallows the motion. It
+cannot, for two reasons that are both on the wire:
+
+* **The branch never ran.** Every gesture in the boot-10 slice ends
+  `[dragrel] … end=edge lead=0 pend=0 ring=0 wait=0ms`. `wait=0ms` means `DRAG_LEVEL_UP_MS` was never
+  set — the tail never once saw a motion with the button level up while a drag was live.
+* **It could not reach the cursor even if it had.** `wc_drag_motion` returns on its first line once
+  `wm::drag_active() == WIN_NONE`, and it never touches `pal::cursor` at all: the position is applied
+  by the drain's `Mouse` arm or by `cursor::track_routed` **before** `wc_route_tail` runs.
+
+### The mechanism, measured
+
+`USB-DEBUG: MOUSE` is one line per motion event ROUTED — the pointer's own heartbeat. In the boot-10
+slice its cadence is **8 ms flat** while the hand moves, and around every gesture end it opens a hole
+whose length is the console's byte count and nothing else. Across 40+ samples spanning 50 to 4000
+characters: **`gap ≈ chars / 11.5 ms`**, median residual 3.6 ms — 115200 baud, one line per
+character-time. Representative pairs: `chars=681 → 60 ms`, `chars=724 → 71 ms`, `chars=3076 →
+257 ms`, `chars=3489 → 310 ms`.
+
+The drop is where the hole is biggest because it emits the largest burst on the pointer path —
+`[dragrel]`, `[wm-act] drag-end`, `[drag]`, `[drag-occ]`, `[dropwake]`, ~1 kB, and up to 3.5 kB when a
+five-second `[cursor*]`/`[wcn]` rollup lands beside it. Measured post-release holes: 76, 79, 85, 85,
+86 ms, and 262/352 ms where a rollup coincided.
+
+The pad neither stops nor accumulates across the hole: the deltas on the far side are the same
+magnitude as the near side (13 per report, not summed). So the hole is **real events, queued** —
+`x86_usb_pump` keeps pushing at the pad's ~125 Hz while the render service is inside the burst. When
+that core returns it **replays the backlog one event at a time**, each replayed motion costing another
+`wc_route_event` + witness line + `wc_route_tail`; with the pointer trace armed each costs ~4.3 ms of
+the 8 ms interval, so the queue drains barely faster than it fills. The arrow walks a path the hand
+left a fifth of a trackpad ago. **The dead zone is latency, not loss** — and where the backlog does
+overflow a ring, it becomes loss as well.
+
+Note the shape of it: **ghost-drop's cure built the dead zone.** The witnesses added to chase the
+trail (`[dropwake]`, `[drag-occ]`) are a large part of the burst that now starves the pointer.
+
+### The fix — fold the backlog at the producer
+
+`pal::EventQueue::coalesce_relative_motion`. Relative deltas are **additive**: the only consumer of
+either is `cursor::move_rel`, which adds. So `push_pointer_report(Some(Mouse), None)` — the motion-only
+shape, i.e. every report between the edges of a gesture — now **folds into the ring's newest entry when
+that entry is also a relative motion**, instead of taking a slot. The catch-up becomes one `move_rel`
+to where the hand actually is.
+
+Three things the fold deliberately does **not** do:
+
+* **It never crosses another event.** Only the newest entry, and only `Event::Mouse`; a `Button`, a
+  key or an absolute report in front of it blocks the fold. Order out is order in.
+* **It never folds a release report's own LIFT.** `push_pointer_report(Some(m), Some(b))` passes
+  `coalesce: false`, because DRAGGLIDE is about to put the edge in front of exactly that motion —
+  folded into earlier travel, the hoist would carry pre-release hand travel behind the edge and end
+  the drag short. **This is what keeps ghost-drag dead**, and `[wm-act] direct` legs 9 (`settle`) and
+  10 (`lead`) are the assertion.
+* **It never folds `MouseAbsolute`**, and `push_event` never folds at all — so every fixture that
+  asserts an exact resting coordinate, and every synthesiser, keeps the shape it had.
+
+`EVQ_COALESCE_PTR` is its own ledger term rather than a push, so `push - drop - pop` still reads as
+live ring occupancy; `pal::pointer_motion_coalesced()` is the accessor.
+
+### The leg, and it bites
+
+`[ptrdead]` in `arch/x86_64/syscall.rs`, headless (it drives `pal` alone), in the witness battery
+immediately ahead of `wmdirect_selftest`:
+
+```text
+GREEN: [ptrdead] backlog whole=true  nodrop=true  order=true  pushed=192 entries=1  travel=(192,-192) folded=192 dropped=0   -> PASS
+RED:   [ptrdead] backlog whole=false nodrop=false order=false pushed=192 entries=63 travel=(63,-63)   folded=0   dropped=129 -> FAIL
+```
+
+The RED calibration is the fold disabled and nothing else. `whole` is load-bearing twice over — entry
+count and exact total travel; `nodrop` says the ledger was not lied to; `order` drives
+`[M1][B][M1][M1]` and requires exactly `[M1][B][M2]`, which is what forbids a fold that ignores the
+entry type.
+
+### What is NOT closed, and it is out of this lane
+
+> **All four items below are CLOSED by the section that follows this one** (PTRWIT / PTBURST /
+> EHCIDARK / PTRCH, 2026-08-21). The list is kept verbatim because it is the ledger the next arc was
+> handed, and because each entry names the evidence that arc had to answer.
+
+The fold caps the damage at the ring. The burst itself, and two seams that amplify it, are untouched:
+
+* `main.rs` `x86_usb_pump` runs `xhci.service_ftdi()` **ahead of** `ehci::service_ehci_hid()` in the
+  same single-threaded pass, and `drain_ftdi` is documented as draining "until the ring is empty".
+  Every console character therefore delays the next pointer service.
+* The EHCI interrupt endpoint holds **exactly one report** and cannot be made to hold more on this
+  silicon: the pad's mps is 64 while its 0x02 reports are 8 bytes, so every report is a SHORT packet
+  and retires the qTD — the multi-packet arming the `mtraw` path uses is unavailable here. Reports
+  generated while the endpoint is dark are dropped on the wire, **uncounted** — there is no census for
+  them anywhere in the driver.
+* `usbdebug_event_print` (main.rs) costs ~49 characters — about 4.3 ms — **per pointer report** on the
+  build Peter flies. The pointer path spends more than half its budget printing itself.
+* `GUI_CHANNEL_X86` (64 slots, blocking `send`) carries the backlog on the SCHED-X86 split and has no
+  fold of its own; the ring-side fold only fires once the channel has backed the input service up.
+
+**The metal falsifier for what DID land:** drag, drop, then move immediately. The arrow should arrive
+where the hand is rather than crawling there — and `pal::pointer_motion_coalesced()` reading nonzero
+is the proof the drain fell behind and the fold caught it.
+
+## PTRWIT / PTBURST / EHCIDARK / PTRCH — the four amplifiers behind the dead zone (2026-08-21)
+
+PTRDEAD capped the damage at the ring. It did **not** remove the burst. This is the burst: the four
+seams its closing ledger named, taken in the order they cost the pointer.
+
+Read this section with the one above it. PTRDEAD established the mechanism — a relative-motion
+backlog walked one event at a time while a core is inside a console burst — and everything here is
+either an amplifier of that burst or an instrument for what the burst destroys.
+
+### PTRWIT — the pointer witness was the largest thing on the wire
+
+**The measurement, boot 10 of `rmbp2-boot8` (the `UNAOS_USBDEBUG=1` desktop Peter actually flies):**
+
+| | |
+|---|---|
+| `USB-DEBUG: MOUSE relative …` lines | **2456** |
+| bytes they cost | **121 164 — 20.8 % of the ENTIRE boot's serial output** |
+| rank among all producers in that capture | **1st**, ahead of `[wc-h] rollup` (98 kB) |
+| mean line length (with the `logts` prefix and the newline) | **49.33 B** |
+| line time at 115200 | **4.28 ms per pointer report** |
+| the pad's own routed cadence in the same slice | **8 ms flat** (p50 gap = 8) |
+
+So **more than half of every pointer interval was spent printing the pointer**, and the instrument
+could not keep up with the thing it existed to observe: 6.2 kB/s of pointer text against an 11.5 kB/s
+cable, before any other subsystem printed a byte. That is not an instrument observing a system, it is
+an instrument loading it — and the standing ruling that a diagnosis card runs the REAL desktop makes
+the witness's cost part of the desktop's behaviour.
+
+**What replaced it** (`usbdebug_event_print`, `main.rs`), and what it still answers:
+
+* the **first 16 relative reports of the boot print in the OLD FORMAT, byte for byte**. That is the
+  bring-up question — *did a real report arrive, and what did it say* — and it is asked once per boot,
+  not 125 times a second. Every `awk` written against `USB-DEBUG: MOUSE relative dx=` keeps matching;
+* after that, motion **folds into a rollup**, `USB-DEBUG: MOUSE rel n=… dx=… dy=… span=…ms`, emitted
+  at most every 250 ms and **flushed immediately ahead of any non-motion event**, so the wire stays
+  chronological: a drag reads `MOUSE rel n=…` then `BUTTON mask=0x00`, in that order. `n` and `span`
+  are the two facts the steady state is read for — they are the cadence, and a dead zone is a cadence
+  defect;
+* the 250 ms rollup period **is** `X86_GUI_PULSE_MS`. The input service already posts an
+  `Event::Timer` at that rate and that Timer flushes the rollup, so the tail of a gesture reaches the
+  wire while the hand is still, and a second, different period would only produce a ragged line rate;
+* **KEY, BUTTON and absolute-motion lines are untouched and stay per-event.** They are human-rate,
+  they were never the amplifier, and they are what a bring-up card is read for.
+
+**The proof, replayed through boot 10's own pointer stream** (same 2456 reports, both formats):
+
+| | bytes | per report | line time @115200 | cable time over the boot |
+|---|---|---|---|---|
+| before | 121 164 | 49.33 B | **4.28 ms** | 10.52 s |
+| after | 6 918 | 2.82 B | **0.24 ms** | 0.60 s |
+
+**17.5×**, and 114 kB removed from the boot. Against the pad's 8 ms interval the pointer path's own
+share of the wire falls from **53.5 % to 3.0 %**. (16 verbatim lines + 98 rollups replace 2456.)
+
+### PTBURST — the console drain, bounded to a slice the trackpad can live inside
+
+`drain_ftdi` (`drivers/xhci/mod.rs`) is called from `x86_usb_pump`, the single-threaded x86
+device-service pass, and `ehci::service_ehci_hid()` — the internal keyboard and trackpad — runs later
+in the **same pass**. It used to drain *"until the ring is empty"* in 512-byte **awaited** transfers.
+
+`ftdi_tx_stage` waits for its completion, and the FT232 completes a bulk-OUT only once its ~128-byte
+TX FIFO has room — which on a console running flat out means at the 115200 line rate of 11.52 B/ms. A
+512-byte transfer into a saturated FIFO therefore parks the whole service pass for **~33 ms**, and a
+~1 kB witness burst (a drag release: `[dragrel]` + `[wm-act]` + `[drag]` + `[drag-occ]` +
+`[dropwake]`) for **~87 ms** — which is the measured post-release hole, to the millisecond.
+
+Two bounds, both stated in the units of the defect:
+
+* **`FTDI_TX_CHUNK = 64`** — the FT232's full-speed bulk max packet size. One wire packet per
+  transfer, so a single transfer can never cost more than one packet's line time: **≤5.6 ms**.
+* **`FTDI_DRAIN_SLICE_MS = 4`** — the most wall clock one pass may spend in the drain. Chosen against
+  what it protects: the pad reports every 8 ms, so a pass that returns within 4 ms re-arms the
+  interrupt endpoint at least once per report period even with the console at full line rate.
+
+**The trade is nothing, and that is the point.** Throughput is unchanged because the *wire*, not the
+transfer count, is the bottleneck — the same bytes leave in the same milliseconds, in more and
+smaller pieces. When the FIFO has room a 64-byte transfer completes in microseconds, so a boot
+replaying tens of kilobytes still moves thousands of bytes per pass and stays cable-limited exactly as
+before. The slice only binds once the FIFO is full, and at that point the ring drains at 11.52 B/ms
+however long this function is allowed to sit there.
+
+`FTDI_SLICE_YIELDS` is the falsifiable half, carried as `yields=` on the existing
+`:: FTDI: tx pump … result=OK ::` line: zero over a whole boot means the bound never bound; a rising
+count means it did, and each increment is one device-service pass — one EHCI HID re-arm — that
+happened when it would otherwise have been deferred behind the rest of a burst.
+
+**The ORDER was deliberately NOT inverted.** `service_ftdi` still runs ahead of `service_ehci_hid`;
+BOOTPACE M2's console-first rule stands. Inverting them buys the report already sitting in the
+endpoint at most one drain slice of delivery latency — **4 ms once the bound is in place, half a
+report period** — and costs putting the console behind a call that can spend a whole
+`hw_wait_budget()` (~2 s) inside one control transfer on a stalled EP0 (the KBDFLAP `ClearFeature`
+and lock-LED `SET_REPORT` paths). Two seconds of console blackout at the exact moment an attended
+sitting needs the log is not worth 4 ms of pointer latency. **The darkness itself is indifferent to
+the order either way:** the endpoint is re-armed once per pass wherever in the pass that happens, so
+it is the pass PERIOD that sets the dark window — which is precisely what the slice shortens.
+
+### EHCIDARK — the reports lost on the wire, counted
+
+The EHCI interrupt endpoint holds **exactly one report and cannot hold more on this silicon**: `mps`
+is 64 against 8-byte Report ID 0x02 reports, so every report is a SHORT packet and retires the qTD.
+(That is also why the multi-packet arming the `mtraw` path uses is unavailable here — the controller
+stops at the first short packet whatever `total` says.) From that instant until a service pass
+rewrites the overlay the endpoint is **dark**, and everything the pad sends is dropped **on the
+wire**. Nothing downstream could see it: `EVQ_DROP_PTR` counts a full ring and
+`pointer_motion_coalesced` counts a slow drain, and both are about reports that at least reached
+memory. There was no term anywhere in the driver for the ones that never did.
+
+Per armed interrupt endpoint (`IntEp`, `drivers/ehci/mod.rs`):
+
+| field | what it is |
+|---|---|
+| `dark_poll_ms` | ms at the last service pass that examined this endpoint — the denominator; a re-arm can happen nowhere else but a pass |
+| `dark_cad_ms` | the smallest pass gap ever to end in a completion: the device's own cadence, **self-calibrated on the passes that kept up** |
+| `dark_windows` | passes that found a report waiting after a gap long enough for the device to have generated more than one |
+| `dark_ms` / `dark_max_ms` | total / worst milliseconds inside those windows |
+| `dark_missed` | **Σ `gap / cadence − 1` — the answer, stated as the bound it is** |
+
+The arithmetic is conservative in the only direction that could mislead. A completion observed at `t`
+after a pass gap of `g` proves only that the report landed somewhere in `(t − g, t]`, so the dark
+stretch is **at most** `g` and the reports the device could have generated inside it at most
+`g / cadence`, one of which is the one we got — hence `missed<=`. **A pass that finds the qTD still
+ACTIVE contributes nothing at all**, so a still hand — the ordinary case for a change-only pad —
+cannot inflate it.
+
+The cadence is measured rather than read off `bInterval`, and `bInterval` is the wrong number twice
+over: the QH is armed with S-mask `0x01`, one start-split per frame, so the **host** offers this
+endpoint a transaction every 1 ms whatever the descriptor asked; and what the census needs is not how
+often the host asks but how often the **device** has something to say, which for a change-only
+trackpad is a property of the hand. The floor of the observed gaps is that rate — boot 10's pad reads
+8 ms flat.
+
+```
+:: EHCI-HID: [0] EHCIDARK addr=8 ep=IN4 kind=trackpad reports=… cad=8ms windows=… dark=…ms max=…ms missed<=… == witness ::
+```
+
+Rate-limited to one line per endpoint per 5 s **and** gated on the count having moved, so a healthy
+boot emits it **zero times**. An instrument built to shorten a witness burst must not become one.
+
+### PTRCH — the channel's own fold, and why the ring's was not enough
+
+PTRDEAD folds the backlog in `pal::EVENT_QUEUE`. On the SCHED-X86 split **the backlog does not sit
+there.** `x86_input_service` runs on its own core and drains `pal::next_event()` to exhaustion every
+~1 ms, so the ring is essentially always empty and there is nothing to fold *into*; what the input
+service does with each event is `gui_send_x86` it into the 64-slot `GUI_CHANNEL_X86`, one slot per
+report. A render core stalled inside a witness burst therefore accumulates the whole gesture **there**,
+as 64 separate entries, then walks them one at a time — each costing a `wc_route_event`, a witness
+line and a `wc_route_tail`. Same defect, one pipe stage downstream, invisible to the ring's fold.
+
+The fold is PTRDEAD's, in PTRDEAD's shape, at the head of the render service's drain loop: a run of
+consecutive `Event::Mouse` taken off the channel is summed into one dispatch. Relative deltas are
+additive (`cursor::move_rel` adds; `wc_drag_motion` reads the resulting **absolute** position, so a
+folded run steers a live drag to exactly the same place), so it changes neither the cursor's
+destination nor any window's.
+
+Three properties it shares with the ring's, each load-bearing:
+
+* **it never crosses another event.** The run stops at the first non-`Mouse` the channel hands back,
+  and that event becomes `pending` — dispatched next, in order. A `Button` can never end up behind
+  motion that arrived after it, which is the ordering GHOST-DRAG's cure is built on. In particular the
+  release edge DRAGGLIDE hoisted ahead of its own lift arrives here **already** ahead of it, and this
+  fold cannot move it back: it stops AT the edge;
+* **`MouseAbsolute` is never folded** — absolute positions are not additive, and the QEMU tablet
+  fixtures that assert an exact resting coordinate drive that variant;
+* **the ledger stays exact.** `GUI_RECV_X86` is charged inside the new `gui_try_recv_x86` /
+  `gui_recv_blocking_x86` choke points, so a folded event is counted the moment it leaves the channel
+  and `sent − recv` still reads as live occupancy. The fold gets its own term, `GUI_FOLD_X86`,
+  appended to the depth line as `fold=` — which is what separates a channel that is empty because
+  nothing was queued from one that is empty because the consumer summed a whole gesture into one
+  dispatch:
+
+```
+[schedx86] depth sent=541 recv=541 inflight=0 (render core 1) fold=0
+```
+
+`usbdebug_event_print` moved with the recv, from the dispatch site into those choke points. That is
+the honest seam once the fold exists: printing after the fold would show one line for a run of reports
+the hardware genuinely sent, and the operator would read a pad that had gone quiet off a capture in
+which it was streaming. Raw is what the hardware sent; the fold is the drain's business, not the
+witness's.
+
+### Gates
+
+`./arroyo check` green both arches, default **and** `UNAOS_WC=1 UNAOS_USBDEBUG=1`
+(`⚡ kernel features: usbdebug,ehcihid,kbdwit,sdhcblk,smolnet,wc`) · `UNAOS_FATIMG=sf ./arroyo test
+150` + x86-fat.spec **31/31**, 0 forbidden · `UNAOS_WC=1 ./arroyo test 150` + x86-wc.spec **3/3**,
+0 forbidden · `UNAOS_FATIMG=sf UNAOS_WC=1 ./arroyo test 150` → **59 `-> PASS`, 0 FAIL/PANIC**.
+
+Ghost-drag guards intact on that run:
+
+```
+[ptrdead] backlog whole=true nodrop=true order=true pushed=192 entries=1 travel=(192,-192) folded=192 dropped=0 -> PASS
+[wm-act] direct partition=true grab=true route=true content=true level=true tabcancel=true settle=true lead=true close=true dragdead=true ctrlgeom=true zoom=true minimise=true from=(426,305) to=(450,329) -> PASS
+```
+
+plus five `[dragrel] … -> CLEAN` drag tails, `end=edge` and `end=level` both represented.
+
+**What QEMU cannot gate.** PTBURST's bound is on an FTDI console QEMU does not have (`ftdi::is_live()`
+is false there, so `drain_ftdi` returns on its first line), and EHCIDARK needs a real HID interrupt
+endpoint. Both are metal-only by construction; the QEMU battery proves they cost the deterministic
+paths nothing, and the bench proves they work. **The metal falsifiers, in order:**
+
+1. `USB-DEBUG: MOUSE rel n=… span=…ms` lines instead of a per-report flood, after 16 verbatim ones;
+2. `EHCIDARK … missed<=N` — **the number this whole arc exists to produce.** A boot where it never
+   prints is a boot where the endpoint was never dark;
+3. `yields=` on the FTDI pump line, rising, with the post-drop `USB-DEBUG` hole shorter than the
+   76–86 ms PTRDEAD measured;
+4. `fold=` on `[schedx86] depth`, nonzero exactly when the render core fell behind the pad.
 
 ## PAPER — the kit's content-surface texture, ported to integer Q16 (2026-08-09)
 
@@ -10731,7 +11490,7 @@ The ruling separates them, and both halves are now law:
   owner 0), shellwin-a's `PARKED_Z` term in `above_shell` is intact on trunk, and
   `dock_scan` still enumerates kernel-owned rows. The dock is the *only* way back
   — `focus_ring_apps` filters the reserved band out of the `<TAB>` rotation — and
-  `wcx::activate` still declines the console window outright on a panel too
+  `desktop_uefi::activate` still declines the console window outright on a panel too
   narrow to host a `MAX_WINDOWS` dock strip, so the disc cannot strand the row.
   Pinned by `dock::selftest`'s furniture-park leg and by x86-witness.spec's
   `furniture park=parked/true` rule, both unchanged.
@@ -10775,7 +11534,7 @@ console itself.**
 
 The console close is permanent for the boot: `panel_console_window_open` is
 idempotent behind `CONSOLE_WIN` and is reached from one one-shot latch in
-`wcx::activate`, so nothing re-mints the row once it is closed. Clearing
+`desktop_uefi::activate`, so nothing re-mints the row once it is closed. Clearing
 `CONSOLE_WIN` leaves that re-open *possible* — the function would build a fresh
 surface and row — but no caller invokes it. A normal app's reopen route is the
 launcher, and the console has none; building one is the Console APP arc's lane
@@ -10855,7 +11614,7 @@ recorded here rather than half-applied:
   two land together.
 
 The eventual end state is not minting the console as a `wm` row at all
-(`fbcon::panel_console_window_open` / `wcx::activate`): the boot console renders
+(`fbcon::panel_console_window_open` / `desktop_uefi::activate`): the boot console renders
 to the fbcon panel handle, and once the desktop is up the boot log lives only in
 serial + `TERM_RING`, which the Console APP (a sibling arc) subscribes to. That
 is sequenced after the two pieces above and after the Console APP.
@@ -12072,7 +12831,7 @@ interactive paths — "window dragging performance is shot" (operator, on glass)
 out ~60 of those frames a second; the other ~390 composites/s bought pixels no eye could see, at the
 direct cost of the composites an operator was waiting on.
 
-### The mechanism (`wm.rs`: `pace_admit` / `pace_service`; drain hook in `wcx.rs`)
+### The mechanism (`wm.rs`: `pace_admit` / `pace_service`; drain hook in `desktop_uefi.rs`)
 
 A present is **coalesced, never slept**. In `present_banded`, after the row is marked damaged and
 `presented` (unchanged), the pacer asks one question: has this window already composited inside the
@@ -12087,7 +12846,7 @@ current panel frame (16 667 µs, measured in rdtsc cycles as `tsc_hz / 60`)?
   atomics. A pending bit (`PACE_PENDING`, one u32 bitmask over `MAX_WINDOWS`) is raised before the
   return.
 * **The tail** — a stream that stops mid-frame still reaches glass within one frame:
-  `wm::pace_service`, called from `wcx::desktop_app_service` on `x86_usb_pump`'s ~1 kHz
+  `wm::pace_service`, called from `desktop_uefi::desktop_app_service` on `x86_usb_pump`'s ~1 kHz
   device-service pass (the PAYGO-TERM taker's lane, same unmasked main-loop context `composite`
   already runs in), drains any pending window whose frame has ended. Idle cost is one relaxed load
   per pass. Worst-case time-to-glass for a deferred present: one frame plus one service tick.
@@ -12265,7 +13024,7 @@ blocker is architectural rather than mechanical:
   / `win_fb` fields and their `FbCon::new` inits, `draw_fb`'s routed branch, `flush`'s band
   hand-back, the `route_present*` family, `PANIC_MIRROR`) is tedious but not deep.
 * **Architecturally it has no consumer on the Pi, and that is the stopper.** On x86 the caller is
-  `wcx::activate`, the Kepler-takeover seam; the Pi has no `wcx` and no twin of it. Worse, the Pi
+  `desktop_uefi::activate`, the Kepler-takeover seam; the Pi has no `wcx` and no twin of it. Worse, the Pi
   boot **detaches fbcon** at GUI handoff (`main.rs`, the `fbcon::detach()` on the PI-RAST line) and
   the shell/midden console then paints through its own `Screen` over the front framebuffer, via
   `screen::present_surface`'s compat row — *not through fbcon at all*. So opening a console window
@@ -12658,7 +13417,7 @@ run read `0x1b1a3a` where the theme says `0x2d2b55`, at a corner the probe had p
 A witness that called that a `MISS` would be convicting the chrome for a contract the arch never
 made, so it prints `NOCLEAR` — outside the verdict's arithmetic, and a distinct token a spec rule can
 be written against **once the aarch64 desktop-clear exists to be required**. That clear is NAMED
-here, not written: it is an aarch64 twin of `wcx::DESKTOP-CLEAR` plus its `screen::adopt_desktop_bg`
+here, not written: it is an aarch64 twin of `desktop_uefi::DESKTOP-CLEAR` plus its `screen::adopt_desktop_bg`
 seam, which is a new panel-wide writer on the Pi's compose path and belongs to its own arc with its
 own WC-BBSYNC argument — not to a witness arc.
 
@@ -12838,6 +13597,67 @@ the usual discipline regardless: `arch/aarch64/syscall.rs` and `main.rs` are bot
 **line-neutral** (22504 and 5032 lines, unchanged), each added line paid for by a line of prose
 compressed in the same file, so the gated arm cannot shift a panic `Location` in the knob-off build.
 
+### DRAGWIDE — M1's narrowing was undone in the same breath it was taken (x86 `wc`, 2026-08-25)
+
+Convicted independently on both tracks, at the same site. M1 narrowed `move_to_inner` from
+`request_full_present()` to the old box and the new one. But `move_to_inner` ends in `composite()`,
+`composite_inner` opens by calling `drain_deferred`, and `drain_deferred` ended with
+
+```rust
+if painted { super::screen::request_full_present(); }
+```
+
+so on every move whose vacated sliver was non-empty — every drag step — `FULL_PRESENT` was re-armed
+**after** M1's two rect requests. `present_background` then took the `mark_full()` branch, threw the
+queue away, and republished the panel. The narrowing was defeated on precisely the path it was
+written for.
+
+**The widening was deliberate in purpose and wrong in extent**, so the guard was scoped, not removed.
+WC-J's duty is real: only the desktop can put its own content (console text, status strip) back under
+a departed window, since the erase can only paint `DESKTOP_BG`. But the content needing restoration
+is the content the erase just covered — this box, and nothing outside it. That is M1's own argument,
+applied where M1 stopped. Overflow is safe: `request_present_rect` merges into the least-growth slot
+when the queue is full and disjoint, so the result is always a superset of what was owed. No rect is
+dropped; the failure mode is a slower present, not a wrong one.
+
+**Measured on x86 (gate panel 1280x800):**
+
+```
+before  [wc-w] rollup presents=49 requested_px=430548  presented_px=4096000 amp=9.51x full_presents=3 -> WIDENED
+after   [wc-w] rollup presents=57 requested_px=1086744 presented_px=3072000 amp=2.82x full_presents=2 -> WIDENED
+```
+
+Exactly one whole panel (1 024 000 px) leaves the present budget and the drain's escalation is gone.
+`requested_px` RISES because the drain's boxes now appear as honest requests instead of being
+replaced. The two surviving full presents are `focus_changed` and the menu's `repaint_vacated`, which
+are not this path's — the line still reads `WIDENED` because that verdict is about the panel-escalation
+count, not about this arc, and suppressing it would be the instrument lying about traffic it can see.
+
+#### Why no instrument caught it, and what does now
+
+`[dragperf] px_per_move=` is charged at the REQUEST site, in `move_to_inner`. It therefore reported
+M1's `extent_speedup` faithfully while the drain behind it republished the panel — a witness sitting
+directly beside the defect it could not see. The presented side is now counted in
+`present_background`, from the damage set, at the same instant the requested side is read from the
+queue it drained. `[wc-w] rollup` is the **x86** reader: without it these counters would be a census
+nobody prints, since `[dragperf]` is driven only from `arch/aarch64`.
+
+#### The general shape: motion rate vs event rate
+
+The class this belongs to is *"an always-on maintenance path escalating to full-surface at MOTION
+rate rather than EVENT rate."* Audited on x86 after the fix, the surviving `request_full_present()`
+callers are `focus_changed` (asid 0), `minimise`, `zoom`, `reclaim`, and `crystal::repaint_vacated` —
+**all event rate**, one per user action. `drain_deferred` was the only motion-rate member, and it is
+gone. The cursor bracket and the deferred erase were already off this path (FLICKER-2 removed the
+bracket from the drain, FLICKER-3 from `Screen::flush`, and WC-K2 made `erase` queue rather than
+paint). `screen.rs`'s other `mark_full` callers — `fill_screen`, `paint_desktop_scene`, `scroll_up` —
+are startup or event rate likewise.
+
+The two defects on this arc do compound in the stated direction — an inflated publish is what pushes
+`span` past `chunk_rows` — but they are not one cause: DRAGWIDE inflates the DESKTOP's damage set,
+while banding is a function of a WINDOW's own box, and the gate's windows are two orders of magnitude
+short of the threshold either way.
+
 ## CONSWIN-PI / MENUBAR-PI — the console gets a window and the bar gets turned on (aarch64 `pidesk`, 2026-08-13)
 
 Two pieces of the desktop-parity campaign, both of which were x86-gated in the EXPERIENCE layer
@@ -12852,7 +13672,7 @@ DEFAULT OFF, on the Pi too… compiling a tenant is not enabling it."* That is s
 What was missing is the other half of it — **something has to ask.**
 
 On x86 something does. SHELLDESK (`ca6094a2`, driven by Peter's metal Boot A: *"i cannot see the menu
-because a shell is still posing as the desktop"*) made `wcx::activate` the asker, and it is the ONLY
+because a shell is still posing as the desktop"*) made `desktop_uefi::activate` the asker, and it is the ONLY
 live `set_enabled(true)` in the tree. The other three are `witness` fixtures — `menubar::selftest`'s
 legs 3-4, its MENUBAR-OCC probe, `crystal::selftest` — and every one of them restores the flag before
 it returns. On the Pi there was no asker at all, so the bar was compiled, composed (three relaxed
@@ -12878,7 +13698,7 @@ PI-DESK M4 stopped here and named the blocker:
 > writes to after handoff: a correct window containing a frozen log.
 
 **The premise is exactly right and the inference does not hold, because x86 ships that window.** On
-x86's desktop lane the same row is, in `wcx.rs`'s own words, *"a FROZEN BOOT-LOG SNAPSHOT for the rest
+x86's desktop lane the same row is, in `desktop_uefi.rs`'s own words, *"a FROZEN BOOT-LOG SNAPSHOT for the rest
 of the boot"* — the desktop's boot-log pane, and one of the two kernel windows an x86 desktop carries
 (the other being `main.rs`'s `open_shell_window`, a DIFFERENT window on a different path). A frozen
 boot-log console window is not a failure mode on either arch; it is the feature.
@@ -12892,8 +13712,8 @@ means PRESENT, so a board whose rate cannot be read paces per line exactly as be
 No second implementation of anything: one `route_present_banded`, one `Pending`, one
 `panel_console_window_open`, two arches running the same bytes.
 
-The seam that calls it is `video/pidesk.rs` — the Pi's DESKTOP-READY point, the counterpart of
-`wcx::activate` and deliberately not a port of its body (the Kepler takeover, the backbuffer resync
+The seam that calls it is `video/desktop_firmware.rs` — the Pi's DESKTOP-READY point, the counterpart of
+`desktop_uefi::activate` and deliberately not a port of its body (the Kepler takeover, the backbuffer resync
 and the deferred desktop-app launch are x86 display-driver concerns with no Pi twin). What is shared
 is the decision SEQUENCE: panel, dock-hostability, console window, bar enable, composite.
 
@@ -12927,7 +13747,7 @@ it; a routed console does not write the panel (`draw_fb` hands back the window s
 kernel RAM no scan-out reads, and the pixels reach glass only through `wm`'s staged present). So the
 detach's reason is discharged by the routing, and the handoff can skip it.
 
-It was implemented — `pidesk::activate` returned `routed`, `main.rs`'s handoff line became
+It was implemented — `desktop_firmware::activate` returned `routed`, `main.rs`'s handoff line became
 `if !pidesk_activate_maybe() { fbcon::detach(); }` — and then measured, and **the argument is
 incomplete**. Discharging *who writes the panel* does not discharge *who drives the COMPOSITOR*. A
 routed console presents from PRINT context, on whatever core printed, and after the handoff the Pi
@@ -12949,7 +13769,7 @@ A synchronous exception is not a pacing problem and would not have been fixed by
 `usbdebug` bench lane — no render service, no witness battery, effectively one service loop — while
 the lane an operator actually boots detaches unconditionally. That was not documented as a hazard
 anywhere. This arc rediscovered it from the other end, on the other arch, and the ledger in
-`pidesk.rs` is the first place either tree says WHY.
+`desktop_firmware.rs` is the first place either tree says WHY.
 
 So the real blocker is one layer below the one M4 named, and it applies to BOTH arches: **a console
 that presents from arbitrary print context is an unsynchronised compositor client.** The Pi ships the
@@ -12998,7 +13818,7 @@ code. `fbcon.rs` is **52 added / 52 removed** with every widening done in place,
 statement (`draw_fb`'s aarch64 routed branch) is written on the line it shares with `&self.fb`.
 `ui_status.rs` is 2/2, `screen.rs` 4/4. Everything genuinely new lives where nothing is below it:
 appended to `fbcon.rs`'s tail, appended to `video/mod.rs`'s tail, appended to `main.rs`'s tail, or in
-`video/pidesk.rs`, which is a new file and moves nothing. `main.rs`'s call site rides the existing
+`video/desktop_firmware.rs`, which is a new file and moves nothing. `main.rs`'s call site rides the existing
 `fbcon::detach()` line on the discipline PI-RAST established, and folds to the bare `detach()` when the
 knob is off because `pidesk_activate_maybe` is then `#[inline(always)] false`.
 
@@ -13045,7 +13865,7 @@ Line-neutrality of every file compiled into the knob-off image, from `git show -
 126 54 video/fbcon.rs               (52/52 in place + 74 appended at the tail)
 36 1   main.rs                      (1/1 at the call site + 35 appended at the tail)
 10 0   video/mod.rs                 (appended at the tail)
-226 0  video/pidesk.rs              (new file)
+226 0  video/desktop_firmware.rs              (new file)
 ```
 
 And the bar and the console on the bench panel path:
@@ -13268,19 +14088,19 @@ boxes; `wm::erase` paints boxes windows have VACATED (that half has always been 
 is ungated, so close/move exposure on the Pi was already repainted `DESKTOP_BG`, and this arc found
 nothing owed there). Neither has any claim on panel pixels the window layer has never owned. Every
 pre-desktop pixel — `init_panel`'s fill, the direct-painted fbcon boot log, whatever a demo left — is
-outside every damage box in the system. x86 solved this in 2026-07 with `wcx::activate`'s WC-X
-DESKTOP-CLEAR; the Pi had no such point until `pidesk::activate` existed, and then had the point but
+outside every damage box in the system. x86 solved this in 2026-07 with `desktop_uefi::activate`'s WC-X
+DESKTOP-CLEAR; the Pi had no such point until `desktop_firmware::activate` existed, and then had the point but
 not the step.
 
 ### The change
 
-One block, in `video/pidesk.rs`, between step 1 (panel geometry) and step 2-3 (the console window):
+One block, in `video/desktop_firmware.rs`, between step 1 (panel geometry) and step 2-3 (the console window):
 `cursor::undraw()`, a direct `WRITER` `fill_screen(wm::DESKTOP_BG)` + `flush_all()`, and a witness
 line. Fifty-five added lines in one file, forty-eight of them the argument.
 
 **Why a direct front-buffer write is sound here, PROVEN on this arch rather than inherited.** The
 no-direct-writes law protects COMPOSITOR-OWNED pixels from a second writer. x86 argues there are none
-at `wcx::activate` because it runs from inside PCI enumeration. That argument does not transfer — the
+at `desktop_uefi::activate` because it runs from inside PCI enumeration. That argument does not transfer — the
 Pi's seam runs from the GUI handoff, with the whole M6b..U7 fixture cascade already spawned on the APs
 — so it was checked against the capture instead of asserted: in the armed bench log the FIRST
 `[wc-a] create` of the boot is `win=1`, the console window minted by `panel_console_window_open`
@@ -13455,12 +14275,12 @@ a second anyway. The cost is that a pick appears on the next tick rather than in
 for the furniture family's reason: this is EXPERIENCE-layer code with no hardware in it, so it builds
 once and runs on every chip. `./arroyo check`'s `x86-all` leg carries `wc` and its `arm-pi` leg carries
 `pidesk`, so both compilations are covered by the standing gate rather than by assertion. Only
-`pidesk::activate` opens the window today; on x86 the module compiles and is unreferenced, which is what
+`desktop_firmware::activate` opens the window today; on x86 the module compiles and is unreferenced, which is what
 keeps the port from rotting.
 
 ### The window is ARMED by the desktop seam and OPENED by the render pass
 
-`pidesk::activate` calls `pulsewin::arm()`; `pulsewin::service()` performs the open, on the first render
+`desktop_firmware::activate` calls `pulsewin::arm()`; `pulsewin::service()` performs the open, on the first render
 pass where `ui_status::loads` reports a live instrument. That split was not a design preference — the
 gate convicted the direct call, and the readback is worth keeping:
 
@@ -13810,6 +14630,1097 @@ bytes of a declared-finished frame, so RACE-PRESENT verdicts on paced vug window
 from the capture, and the HUD digits should hold steady on glass. Either lying on the next metal
 boot falsifies the design, not the instrument.
 
+## STAGE-PHYS — the blit sources' physical contiguity, measured (x86 `witness`, 2026-08-18)
+
+*Why this number exists.* Every GPU-offload sketch for this compositor — the Gen7 blitter, the
+Kepler copy engine — reads its source out of RAM by **physical** address, and the shape of that read
+(one descriptor, a scatter list, or a bounce buffer plus a second full copy of every frame) is
+decided entirely by whether the compositor's blit sources are physically contiguous. Both GPU ladder
+drafts carried that as an explicit UNKNOWN. `STAGE-PHYS` closes it with a measurement instead of an
+assumption, at zero GPU risk: it touches no device, maps nothing, and writes nothing.
+
+*What it measures.* Once per boot, at the end of the first `composite_once` that finds a staged
+buffer (`wm::physwit_once`; deadline `PHYSWIT_DEADLINE_PASSES = 32` passes so a never-staging boot
+still reports), it walks each blit source page by page through `arch::memory::translate` — the
+read-only live-CR3 walker `gen7` R4 already relies on — and reduces the walk to a run-length reading:
+total pages, number of maximal physically-contiguous runs, unmapped pages, min/median/max run length,
+and the page offset at which the longest run begins. The sources are the eight per-core `STAGE`
+scratch buffers (`wm.rs`, `MAX_STAGE_BYTES` = 4 MiB cap each, grown lazily per core) and the
+desktop's `Screen::back_store` (`screen.rs`, panel-sized), whose span the screen publishes at
+construction — it is allocated once at final size and never moved, so the published span is exact,
+not a snapshot. Each `STAGE` entry's `(ptr, capacity)` is captured under `try_lock` and the guard is
+dropped *before* the walk, so the witness never blocks a compositing core; `capacity`, not `len`,
+because the allocation is what a source descriptor would have to cover. A median rather than a mean:
+one long run plus a tail of singletons has a flattering mean and a damning median, and the tail is
+exactly the shape a scatter list has to survive.
+
+*Cost, and where it is stated.* Bounded by (4 MiB x 8 + back store) / 4 KiB ≈ 15 k four-level walks,
+once, and in practice far fewer because a `STAGE` entry only carries the largest box its own core
+ever staged. The reading is never a claim about its own price — every line carries `cost_cyc=` for
+its own walk. Steady state after the one-shot spends itself is a single relaxed load per pass.
+
+*First reading (QEMU, `UNAOS_FATIMG=sf UNAOS_WC=1 UNAOS_WITNESS=1 ./arroyo test 150`).* One core
+staged (`cpu=2`, 319 200 B = 78 pages) and the back store was the QEMU panel's 4 096 000 B = 1000
+pages; **both came back `runs=1`, `unmapped=0`** — fully contiguous, `run_min = run_med = run_max =
+pages`, `largest_off=0`, at 712 460 and 115 940 cycles respectively. On this evidence the offload's
+source addressing wants a **single descriptor** with a scatter list only as a fallback, not the other
+way round. The caveat is stated plainly: QEMU's allocator is not the bench's, and 78 and 1000 pages
+are not the bench's 4 MiB stage and ~28 MiB 1920x1200 back store. What the QEMU run proves is that
+the witness executes end to end; the number that decides the DMA design is the one this same witness
+prints on metal.
+
+*Off by default.* Definition, statics, the screen-side span publication and the call site are all
+`#[cfg(all(feature = "witness", target_arch = "x86_64"))]`. A knob-off build has neither the code nor
+a load of its state, and its serial is byte-identical.
+
+## STALL-SPREAD x86 RE-PRICE — the `[wc-h]` stall guard's threshold, and the stall-shaped assertion that had to ship with it (x86, 2026-08-19)
+
+`STALL_SPREAD` (`video/wcg.rs`) is the `[wc-h]` tear test's stall guard: when a present outran the
+beam (`present_us > rectscan_us`), a per-4-KiB rate more than `STALL_SPREAD`× this window's own
+earned floor **diverts** the event from `torn=` into `stalls=`. The diversion is the whole mechanism
+— it never invents a count, and the verdict still reads `torn=` alone, so a stall cannot manufacture
+`-> AT-RISK`.
+
+It shipped at **8**, priced from the pi's population. This arc re-prices it for x86 from *this*
+tree's metal, and — per the pi seat's caveat, adopted here as a design rule — ships the raise
+together with a replacement assertion rather than as a quiet threshold change.
+
+### The x86 population (`~/unaos-bench/capture/rmbp1-boot1/ttyUSB0.log`)
+
+Seven boots, isolated by timestamp restart; **8133 `[wc-h] rollup` lines, every single one
+`torn=0 stalls=0 -> TEAR-FREE`.** The entire population below is therefore *healthy* by the tree's
+own verdict — nothing here is an at-risk sample.
+
+`presspread=` histogram (value : rollups):
+
+| 1 | 2 | 3 | 4 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 22 | 27 | 29 | 30 | 33 |
+|---|---|---|---|---|---|---|----|----|----|----|----|----|----|----|----|----|
+|4646|591|511|434|109|143|119|44|100|13|293|394|249|1|17|9|179|
+
+| 36 | 44 | 45 | 46 | 51 | 53 | 63 | 73 | 74 | 75 | 88 | 91 | 94 | 111 | 112 | 118 |
+|----|----|----|----|----|----|----|----|----|----|----|----|----|-----|-----|-----|
+|1|2|1|78|16|1|1|1|9|23|9|16|14|4|11|94|
+
+Per-boot, by window population:
+
+| boot | rollups | `presspread` range | notable |
+|------|---------|--------------------|---------|
+| 0 | 39 | 1–8 | the banded console (`win=1 banded=7 lines=7`) at a steady **8** |
+| 1 | 1809 | 1–91 | `win=1` banded console 4–91; `win=2` to 22 |
+| 2 | 236 | 1–9 | short boot |
+| 3 | 4021 | 1–112 | `win=1` banded console to 112; `win=2` to 15; `win=6` to 14 |
+| 4 | 132 | 1–2 | console geometry churn (`banded=` climbing), spread flat |
+| 5 | 1804 | 1–118 | `win=10` to 118, `win=9` to 51, `win=3` to 46 |
+| 6 | 92 | 1 | wire boot |
+
+**Three readings, and they decide the pin.**
+
+1. **There is no bimodal gap on x86.** The pi's population is 1–7 sustained with an empty 7..32 band
+   before its `{32, 33, 84, 136}` outliers — a clean separation, which is what made 8 the lowest
+   defensible pi threshold. Here the occupied values run continuously from 1 to 118 with no interior
+   gap wider than 94..111, and **20.9 % of healthy rollups (1699 of 8133) sit above 8.**
+2. **The x86 tail is the WRONG END of the ratio.** Every rollup with `presspread > 8` has a
+   `minpresent_us` of 23–726 µs — an anomalously *fast* present pulling the floor down — while its
+   `maxpresent_us` stays inside the same 1723–7276 µs band as the rest of the population. The pi's
+   outliers are the opposite and are the real stall shape: one present of ~218876 µs beside a normal
+   2594 µs floor. A ratio cannot tell these apart; it blows out from either end.
+3. **The honest x86 population OVERLAPS the desched population the guard was priced against**
+   (healthy to 118, desched'd QEMU 58–407 per the GR27 discriminator ledger). On this machine
+   `presspread` is therefore not a discriminator at all.
+
+This tree's hard-won honest metal `presspread=8` (boot 0/boot 2, `win=1`, banded console mixing
+geometries) is not re-litigated here — it is confirmed and shown to be unexceptional: the same
+console geometry also produces 36, 63, 91 and 112.
+
+### The pin: x86 = 256, aarch64 = 8, per-tree, unioned at merge
+
+`STALL_SPREAD` was a single shared constant; it is now arch-conditional. **Arch-conditional is the
+stated exception to arch-neutrality here because the number is a hardware-population fact** — a
+threshold on a measured distribution, where the two trees measure different machines. Pinning one
+value either disarms the guard on one tree or convicts honest presents on the other. Per-tree exact
+pins, unioned at merge: the WMCTRL ruling. Both pins are cited to their own capture in the
+constant's doc comment.
+
+Since x86 shows no gap to read the pin off, it is read off **which error is affordable**. The guard
+only ever diverts `torn=` → `stalls=`, so:
+
+* a **false conviction suppresses a tear** and disarms the `-> AT-RISK` FORBID — silent, and the
+  exact failure the FORBID exists to prevent;
+* a **false acquittal** merely lets a QEMU desched print as a tear — loud, in QEMU, read by a human.
+
+At 8, any honest x86 present in that 20.9 % tail that also outran the beam would be silently
+convicted. **256** clears the entire observed honest population (ceiling 118) by 2.2×, while still
+sitting inside the 58–407 desched band, so the guard keeps teeth against the worst of the shape it
+was built for. 128 was rejected: an 8 % margin over a ceiling measured on one machine across seven
+boots is not a margin.
+
+### The stall-shaped replacement assertion — `longpres=` / `-> STALL`
+
+A raised threshold must not leave the tree with less assertion than it had. The replacement is
+deliberately **not a ratio**, because the ratio is what failed here:
+
+```
+[wc-h] win=<id> present_us=<n> bound_us=33334 minpresent_us=<n> -> STALL
+[wc-h] rollup … torn=<n> stalls=<n> longpres=<n> … pop=constant frame_us=16667 stallbound_us=33334 -> <verdict>
+```
+
+* `STALL_PRESENT_US = 2 × FRAME_US = 33334 µs` — an **absolute** bound on a single present's
+  wall-clock duration. Priced two-sided from both trees' metal: the largest `maxpresent_us` ever
+  recorded on x86 is 7276 µs (p50 2384 µs), so the bound sits **4.6× above every healthy present
+  either machine has been observed to make**, and **6.5× below the smallest stall-shaped present
+  ever captured** (the pi's ~218876 µs). That is the wide separation `presspread` has on the pi and
+  has lost on x86, recovered in a quantity that does not depend on a floor.
+* `longpres=` is a **census, not a diversion**. It has no `present_us > rectscan_us` precondition and
+  no earned-floor precondition — both are the point of the quantity — and it takes nothing away from
+  `torn=`. A present can be counted torn *and* long. It therefore cannot weaken any existing verdict.
+* **The `-> STALL` token is on its own line, not on the rollup's terminal.** `-> TEAR-FREE` /
+  `-> AT-RISK` / `-> UNSTAGED` and their precedence are matched by two tracks' regression specs; a
+  fourth terminal arm would change what a line those specs already guard is claiming. A new line is
+  an insertion in the same sense a new field is. `longpres=` (inside `pop=all-presents`) and
+  `stallbound_us=` (after `pop=constant`, beside `frame_us=`) follow the existing insertion rule.
+* One naming line per window (`H_LONGSAID`), so a wedged machine names its first offender and then
+  stops paying UART; the count keeps the rest. `minpresent_us=` is printed beside it because that is
+  what makes the reading a *shape*: one absurd present beside a normal floor is a stall, whereas a
+  window whose floor is up there with it is uniformly slow — a different fault.
+* Printed from `stage_flush`, not from the recorder, via a pending hand-off (`H_LONGUS`). A
+  `serial_println!` in `stage_note` runs inside WC-G's clock and would charge the witness to the
+  measurement it reports — the same deferral, for the same reason, that `emit_sample` exists for.
+  All three new per-id cells are reset in `wch_recycle`; the latch especially, or a new tenant would
+  inherit a spent naming line.
+
+### No spec token, deliberately — the metal playbook carries it
+
+The pi seat's note is that QEMU vCPU-compression floods `presspread`. **`maxpresent_us` is exposed to
+the same compression**, and necessarily so: `presspread`'s numerator *is* the present measurement
+`maxpresent_us` maximises, so a desched that multiplies a present by the ledgered 58–407× would take
+a healthy ~1937 µs QEMU present to 112–790 ms — far past the 33334 µs bound.
+
+Three `UNAOS_WC=1 ./arroyo test-fat sf 150` boots on an unloaded host measured `maxpresent_us` at
+65–1937 µs with `presspread` 1–2 and `longpres=0` throughout — tight, and ~17× inside the bound. But
+that shows only that *this host was not descheduled*, not that the quantity is immune, and a spec
+FORBID on `longpres=` would go flaky-red on a loaded host for a reason that is not a video defect.
+**The witness therefore ships without a spec line**; the assertion is carried by the metal playbook.
+
+`x86-witness.spec`'s existing WCH-STALL self-consistency FORBID
+(`stalls=≥2 … presspread=[0-7]`) is unaffected and remains sound — with the pin at 256 a conviction
+now implies `presspread ≥ 256`, so the forbidden arithmetic is impossible by a wider margin than
+when it was written. Its prose is updated to name the per-arch pin rather than a bare `8`.
+
+### The metal falsifier
+
+On the next attended boot: healthy console geometries produce `stalls=0` — including the banded
+console that honestly reads `presspread=8`, 36, 91 or 112, none of which can now buy a suppression —
+while the `-> STALL` line names any present exceeding 33334 µs **with its measured µs beside its
+window's floor**. A boot that prints `stalls>0` on a healthy geometry, or that stalls visibly with
+`longpres=0`, falsifies the pin or the bound respectively.
+
+The verdict flows to `PARITY §6.13`'s x86 column via the pi seat.
+
+### Gates
+
+`./arroyo check` both arches green · `UNAOS_WC=1 ./arroyo check` green · `./arroyo test-fat sf 150` +
+mbench vs `x86-fat.spec` **31/31** knob-off and **31/31** under `UNAOS_WC=1` (`wc` in the
+`⚡ kernel features:` banner) · `longpres=`, `stallbound_us=`, `bound_us=` and `-> STALL` all
+`strings`-proven present in the WC `target/x86_64_esp/kernel.elf`.
+
+## DMG-DISJOINT — the damage set stops rounding every neighbour up to a whole box (x86 `wc`, 2026-08-18; reverted after boot 7; re-landed 2026-08-19)
+
+**The diagnosis was an equality.** The boot-4 sitting capture (six 128x128 vugs upscaled to
+768x768 on the 2880x1800 panel) read `[comp2] … dmg_px_pp=5190533 box_px_pp=5190533` — not
+approximately equal, EQUAL, and the exactness is the diagnosis. There is no union accumulator to
+degenerate: `dmg_px` is what `draw_window` painted and `box_px` is what the same call would have
+painted whole, so the two can only differ when some window in the pass carries a BAND. Two lines in
+`composite_inner`'s upward occlusion closure guaranteed none ever would:
+
+```rust
+dirty[j] = true;
+bands[j] = None;
+```
+
+Every higher-z window whose outer box merely GRAZED a damaged one was promoted to a whole-box
+repaint. With no routed console in the pass the only other band producer is `present_rows`, so on a
+vug desktop `dmg == box` was a tautology of the mechanism, not a measurement of it.
+`damage_intersecting` did the same to the erase drains, the cursor repair and the menu close — the
+WC-K3 ledger (`wm.rs`) had already named the cost in its own words: a five-pixel exposure at the
+edge of a neighbour cost that neighbour a whole-box repaint.
+
+### The mechanism — bands reach the chrome, and `None` still means whole box
+
+Damage stays per-window and banded; nothing unions across the panel.
+
+* **`damaged_box` — the band's extremes now reach the chrome.** `sy0 == 0` means the top of the
+  OUTER box, `sy1 >= r.h` the bottom. The old source-row mapping addressed content rows only, so no
+  band could say "from the top of this box down to row k" — which is *why* both call sites had to
+  whole-box. Both changes are widenings, so no caller can lose a pixel.
+* **`band_for_rows`** is `damaged_box`'s inverse: rounds outward, clipped to the window's own box.
+  `None` means "whole box" to every consumer — the pre-arc behaviour, and the fail-safe for
+  everything not expressible as a band.
+* **The closure damages `j` over the rows `i`'s blit will actually cross**, unioned with the band
+  `j` already had, instead of over `j`'s whole box. `damage_intersecting` does the same per rect;
+  its old `continue` on `damaged` also tested the wrong thing — a row carrying a band was skipped
+  entirely, so rows the rect exposed *outside* that band were never repainted. It now tests what it
+  always meant (a whole-box repaint is already owed) and widens banded rows.
+
+### The closure is one sweep, and the ordering is the termination proof
+
+The upward closure became a **single sweep in ascending z**. Its drag edge requires `z[j] > z[i]`
+STRICTLY, so the relation is a DAG over z, and the existing back-to-front `order` (hoisted above
+the closure) is a topological sort of that DAG: every contribution to `bands[i]` is applied before
+`bands[i]` is read, so **one pass IS the fixed point**. The old slot-order walk paid up to
+`MAX_WINDOWS`³ overlap tests per composite for what the ordering now gives for free — and it
+*removes*, rather than answers, the question of how many rounds a widening band needs to settle.
+
+The witnesses keep their meanings exactly, which is the point: `dmg_px_pp`/`box_px_pp` were pinned
+together by construction and are now free to differ. `[wcn] dkpx=` is charged the pixels the
+closure ADDED, not `j`'s whole box — a whole-box charge would report a cost the pass no longer pays
+and would hide the saving. A drag that cannot be narrowed still bills the whole box, because
+`damaged_box(_, None)` IS the outer box.
+
+### Boot 7 — the wedge, the revert, and what survived the audit
+
+The QEMU gate cannot witness this change and says so itself: `place` tiles the fixture's windows
+disjointly, the closure never fires, and `[comp2]` correctly still reads `dmg_px_pp == box_px_pp`
+there. The first metal sitting (boot 7) is therefore where the change met overlap — and it wedged:
+`pass_us` 42 ms → 86 ms, `declined_pct` 8 → 93 → 98 across two rollups, then one pass that entered
+at ~116 s and never returned — `[wcser] entered=0` for 87 consecutive rollups, the holder spinning
+c1 at 100 %, `[comp2]` silent, five of six vugs composited and the topmost never reached, a 440+ s
+hold ended only by power. Reverted on metal the same night (`94c81767`).
+
+**The banding itself was never refuted.** The line-level audit that followed cleared the band
+arithmetic, the chrome-extreme round trip, the whole-box encoding and the ascending-z one-pass
+fixed point, and `OccClip`'s prepare/spans/buries carry termination proofs under the wedge
+geometry. What the arc *did* break was steady-state cursor adoption — and what that fed is the
+storm that preceded the wedge. That amplifier is CURSTICK, below; the re-land (`660ef270`) is the
+same mechanism with the amplifier fixed and the pass named (`comp_mark`, under WCSER-H below).
+
+Honest residual, recorded: boot 7's terminal hold is instrumented, not root-caused to a line — the
+ABBA candidates audited do not close (`present_banded` drops `TABLE` before its blocking shadow
+acquire; `pace_shadow_source` is try-lock; `table()` holders are IRQ-masked and short). If any
+residue survives the amplifier fix, the boot-8 tripwire names its exact rung — and boot 8 did
+exactly that (wedge ledger entry below).
+
+### Boot 8 — the falsifier's first pass on real geometry
+
+The metal falsifier shipped with the original land: a six-vug idle composite must print
+`dmg_px_pp` well under `box_px_pp`; equal, or equal to the panel, and the change did not take.
+Boot 8 is the first reading on real overlapping geometry, and it passes in both regimes:
+
+| regime | `dmg_px_pp` | `box_px_pp` |
+|---|---|---|
+| idle desktop | **817617** | 984425 |
+| six-vug storm | **4099648** | 6075393 |
+
+The two witnesses differ, in the right direction, at both load points — the first time they have
+ever been observed apart, because before this arc they were equal by construction.
+
+### Gates (re-land)
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green · x86-fat knob-off battery
+**31/31**, 0 forbidden · x86-fat `UNAOS_WC=1` leg **31/31**, 0 forbidden. The overlap-forcing QEMU
+leg (DMGOVLP, designed) precedes any trunk landing — QEMU's disjoint tiling structurally cannot
+witness this class.
+
+## CURSTICK — the banded drag un-adopted the sprite, and the storm it fed (x86 `wc`, 2026-08-19)
+
+**The interaction.** The overlay offer is made per staged band: `compose_into` declines the offer
+unless the sprite's box sits **wholly inside the band's rows**. Pre-arc, that predicate was
+satisfied by accident of the defect DMG-DISJOINT fixed — every dragged-in window was whole-boxed,
+so the topmost window under the pointer always contained the sprite, and the pass tail was `Adopt`:
+session closed, nothing repainted, nothing re-damaged.
+
+**The amplifier.** The banded drag broke that silently: a sliver band almost never covers the
+sprite, so no window took the overlay and every pass's tail became `Repaint` — whose `repair()`
+re-damages the pointer-stack windows through `damage_intersecting` AFTER the pass snapshot cleared
+them. A self-feeding composite storm: each pass re-arms the next, and the holder burns its full
+`COMP_RERUN_MAX` budget per call. This is the storm boot 7 rode into its wedge.
+
+**The fix is a widening in the direction the arc already owns.** Any dirty banded window whose
+outer box wholly contains the sprite's box has the sprite's rows UNIONED into its band, so the
+offer lands exactly where it landed pre-arc. Cost: sprite-height rows on the window under the
+pointer — against the whole boxes the arc exists to stop paying.
+
+**Boot-8 verdict: `Adopt` 1326/1326, `settle=0`.** Every sprite-touching tail in the sitting
+adopted; none fell through to a repaint or a deferred settle. The adoption economy is back to its
+pre-arc shape on top of banded damage.
+
+## WCSER-H — the gate names its holder, and an overdue pass trips a wire the wedge cannot cut (x86 `wc`, 2026-08-19)
+
+Boot 7 held `COMP_GATE` for 440+ seconds and the serial said almost nothing. `[wcser]` could print
+`WEDGED` but knew no holder core and no pass age. The `[wedge1]` dwell family watches the DRAIN
+BARRIER — and the storm workload (presents only, zero teardown) had taken that barrier's traffic to
+zero, so its rollup self-silenced before the hold and stayed silent through the entire event: an
+instrument–subject mismatch, not a failure. The schedx86 heartbeat rides the render core, so it
+died WITH the holder. **Every witness that could have named the wedge was pumped by the thing that
+wedged.** WCSER-H is the vantage fix.
+
+### The holder identity
+
+`COMP_GATE` gains a holder identity: **core** (`usize::MAX` = free) and **pass birth-time `t0`**,
+stamped t0-first by every CAS winner — the main acquire and the lost-wakeup re-acquire — and
+cleared before every release, so a set core always carries a current age. Gauges, never drained: a
+wedged holder leaves them standing, which is the point.
+
+### The overdue tripwire — a vantage the wedge cannot reach
+
+`wcser_overdue_probe()` rides `x86_input_service`'s ~1 kHz loop: a core the compositor never runs
+on, and the one lane boot 7 PROVED survives the wedge (trackpad witnesses kept arriving while c1
+spun). It is deliberately **not** pumped by `wcn_tick` — that pump is the presenting tasks, and a
+wedge with no surviving presenters silences it, which is exactly the blindness this closes. Boot 8
+added the ordering law: the probe runs FIRST in the service loop, ahead of the event pump, because
+the pump can block into a wedged GUI — the probe must not die of the wedge it reports.
+
+The bound is **1 s = 3× the worst honest pass on record** (the 302 ms masked reopen). At the
+crossing, one loud line (a **once-per-epoch latch**); while the pass stays held, one standing
+repeat per 5 s; the latch re-arms at release, so the NEXT wedge names itself too. Known residual,
+recorded: `arch::ms()` advances only on the BSP, so a wedge OF the BSP freezes the age — a bound
+crossed before the freeze still prints.
+
+### The wire
+
+The `[wcser]` rollup gains `holder=` (as isize; `-1` = free), `held_ms=`, and `exbusy=` (next
+section), appended after the existing anchors per the `gap=` rule — no witness signature moves.
+The tripwire prints the holder, the age, and the breadcrumb pair `win= phase=` (plus `row=` where
+the phase carries one), once at the crossing and on each 5 s repeat.
+
+### `comp_mark` — the pass is named
+
+Two relaxed stores per stamp; gauges, so a wedge leaves the last stamp standing. The blit loop
+stamps which window and which phase it is on: **1** clip/shadow, **2** wcg-begin, **3** draw,
+**4** post-draw witnesses. Boot 8's two wedges both landed in the phase-3/4 window — exactly one
+`draw_window` call and its post-draw witnesses — so phase 3 is now split into sub-phases, with a
+row gauge (`comp_mark_row`) on the flush loop and the direct paint path:
+
+| stamp | where the pass is | lead candidate if frozen here |
+|---|---|---|
+| 30 | stage entry | the heap-grow lock |
+| 31 | band compose (RAM layer) | — |
+| 32 | sprite offer | the overlay micro-mutex |
+| 33 | span flush (`row=` live) | posted-write stall mid-blit into BAR1 |
+| 34 | direct fallback (`row=` live) | posted-write stall mid-blit into BAR1 |
+| 35 | uncover tail | the overlay micro-mutex |
+| 4 | post-draw witnesses | non-posted read-back stall |
+
+The decode column is the boot-8 interior audit reduced to one line of serial: what took a session
+of forensics to rank ("hung between win8 and win9", boot 7) now costs one tripwire line.
+
+### `occluders_above` — refuse, don't wait
+
+The excuse snapshot ran INSIDE the blit loop, per drawn window, and took `table()`: a blocking
+IRQ-masked spin, for a WITNESS — the only blocking primitive in the whole pass, sitting exactly in
+the window where boot 7's pass went silent. **An instrument must never be able to block the pass
+it instruments.** It now try-locks; on contention the sample is **pardoned whole** — one
+full-coverage box, so `covers()` answers yes everywhere, no pixel can be charged, and no FAIL can
+be manufactured — and the refusal is counted on the `[wcser]` rollup as `exbusy=`. Fail-safe
+direction: witness coverage lost for one window for one pass, said on the wire.
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green · x86-fat knob-off battery
+**31/31**, 0 forbidden. The boot-8 refinements (sub-phases, probe-before-pump) ride the boot-9
+staging per the once-per-staged-image rule.
+
+## The boot-8 wedge ledger entry (x86 metal, 2026-08-19)
+
+Two wedges in one sitting — **2-for-2 under the six-vug storm** — and both were named by the
+boot's own tripwire, which is WCSER-H doing on its first metal outing what it was built for:
+
+* wedge 1: **phase 3** — the write path, mid-`draw_window`;
+* wedge 2 (on the re-run): **phase 4** — the post-draw read-back.
+
+Both holds sat on **bottom-row vugs on the `clip.n == 0` fast path** — windows with nothing above
+them, taking the simplest blit the pass owns. That placement matters: the fast path holds no clip
+machinery, which thins the suspect list toward the endpoint.
+
+**The precursor, and it is ~17 s of warning.** `declined_pct` climbs **69 → 98** over roughly 17
+seconds before each hold, driven by `wcd_us` ≈ **4.0 M per 5 s rollup** — four seconds of every
+five spent in the write-combine drain. The storm shape is the panel path slowing first, the gate
+absorbing the slowdown as declines, then one pass never coming back.
+
+**Lead theory: an endpoint hang, not a kernel loop.** The interior audit exonerated every loop and
+lock in the phase-3/4 window with line-level proofs. What remains is the Kepler endpoint: a
+posted-write stall into BAR1 in phase 3, a non-posted read-back stall in phase 4 — the same two
+rows of the `comp_mark` decode table, read from the device side.
+
+**Next discriminators (boot 9):**
+
+1. **the PCIe root-port sampler** — read the root port's own state while the hold stands, from the
+   probe's surviving core: link-level distress is visible there or it is not;
+2. **NOASPM** — rule link power-state transitions in or out as the trigger;
+3. **the WCD valve** — take the write-combine drain's 4-in-5 duty out of the equation and see
+   whether the precursor, and the wedge behind it, go with it.
+
+## MGL1 — the CRYSTAL-DISMISS livelock claim, refuted; and the `erase_clip` overflow report, un-gated (x86 `wc`, 2026-08-21)
+
+A review of CRYSTAL-DISMISS (`bf527fc8`) raised two findings. The first does not survive
+verification; it is recorded here with its disproof so the next reader does not re-derive it. The
+second does, and it was worse than the review framed it.
+
+### Finding 1 — "erase-then-clear can livelock the compositor" — NOT REACHABLE
+
+The claim: `crystal::compose`'s two erase arms now KEEP the slot when `strip::erase_rect` declines
+(`if !strip::erase_rect(r) { return false; }`), so a PERMANENT decline pins `crystal::paint_owed()`
+true forever; the `service_damage` term the same commit added —
+`if menu_paint_owed() { composite(); return; }` — then composites on every idle pass, permanently,
+and its early `return` starves the window-damage check below it. The nominated permanent decline was
+`erase_rect`'s `x >= info.width || y >= info.height` evaluated against a slot rect captured before a
+panel-geometry change, "and this machine changes panel geometry at the Kepler takeover".
+
+Three independent links have to hold. None of them does.
+
+**1. The slot rect carries no geometry to be stale about.** `crystal::menu_rect` anchors the dropdown
+under the crystal, and the crystal hangs off a `strip::Edge::Top` bar, so `menubar::strip_rect` is
+`(0, 0, pw, BAR_H)`, `crystal_box` adds `strip::PAD` in x, and `my = by + bh`. The stored rect is
+therefore always
+
+```
+(min(strip::PAD, pw - MENU_W), TITLE_HEIGHT, MENU_W, MENU_H)  =  (<=12, 34, 154, 105)
+```
+
+— x at most `theme::GAP` = 12 and y exactly `theme::TITLE_HEIGHT` = 34, both compile-time constants
+on every panel. Tripping `x >= info.width` needs a panel 12 px wide; `y >= info.height` needs one
+34 px tall. `menubar::geometry` refuses anything below `FLOOR_W` = 112 / `FLOOR_H` = 110 long before
+that, and the smallest panel in the tree is 640x480. A geometry change cannot strand a rect whose
+origin is not a function of the geometry.
+
+**2. The x86 panel geometry does not change.** `video::WRITER` is attached on x86 from the `BootInfo`
+framebuffer triple at `kernel_main` step 0a and re-attached at step 3 from the same triple —
+idempotent by construction, as the step-0a comment already states. `drivers/gpu/kepler_display.rs`
+contains **zero** references to `WRITER`: the takeover programs the display pipe to the geometry it
+INHERITED (`expected_width = gop_info.width`, `expected_pitch = expected_width * 4`); it does not
+publish a new one. `UNAOS_FBW`/`UNAOS_FBH`, the only panel override in the tree, lives in
+`arch/aarch64/mailbox.rs` and has no x86 effect. Nothing mutates `WRITER`'s width or height after
+boot on this machine, so the premise the finding rests on is not a property of this hardware.
+
+**3. The early `return` starves nothing.** Both arms of `service_damage` call the SAME `composite()`.
+The `return` skips the `any(used && damaged)` PREDICATE — which exists only to decide whether
+`composite()` is worth calling, and `composite()` has just been called unconditionally one line
+above. `composite_once` composites every damaged row either way. The claim would hold only if the
+menu arm ran something narrower than a full pass; it runs the identical call.
+
+**What IS true, and is deliberately left alone.** `paint_owed()` can be pinned true on the PAINT side
+rather than the erase side: `crystal::open` sets `OPEN` unconditionally and prints `menu=0x0+0+0` when
+the rect is unplaceable, so a panel that can host the BAR but not the MENU — `pw` in `[112, 154)` or
+`ph` in `[110, 139)` — leaves `OPEN` true with an empty slot and no arm able to fill it. Same
+busy-composite shape, and it PREDATES the erase-then-clear change (it is a `menu_rect() == None`
+state, not a declined erase). It is bounded by the same arithmetic: no panel this kernel drives lands
+in either band, and the next press outside the invisible menu dismisses it through `press_at`'s
+`menu_rect`-is-`None` fall-through. Recorded, not guarded — a guard on a state no panel can enter is
+a claim that the bug is there.
+
+### Finding 2 — the `erase_clip` overflow report was compiled out of the artifact that ships
+
+CRYSTAL-DISMISS pushed `crystal::open_rect` into `erase_clip`, which took that clip's worst case to
+`MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX` — `OCC_MAX` **exactly**, with no spare box left, where
+`occ_clip` still keeps one. The commit said so and rested the capacity argument on `push`'s bound
+check plus the `dropped` report standing behind it. The report was `#[cfg(feature = "witness")]`.
+
+The boot and media builds (`x86`, `esp-*`) leave `witness` OFF — `Cargo.toml` says so in as many
+words — so on the metal image the box was dropped with **nothing said**. That is the identical
+silence the `FURNITURE_MAX` ledger convicts one screen up in the same file ("the overflow report is
+`witness`-gated, so on the metal image — the only artifact that matters — an occluder would have been
+dropped with nothing said"), re-entered by the arc that quoted it. And a dropped occluder is not a
+cosmetic loss: it is a region the deferred erase publishes `DESKTOP_BG` over, which is MENU-GHOST
+itself.
+
+**The array stays exactly sized; the report becomes real.** Restoring a spare box was the other
+option and it is the wrong one, for the reason `OCC_CLIP_MAX`'s own ⚠ paragraph gives: WCK5 shipped a
+bound with "a whole box of slack" and it "stopped guarding exactly when a SECOND strip made the guard
+relevant". Slack is not headroom, it is room to be wrong in quietly. The tightest true statement about
+the population is the right size for the array.
+
+What actually needed fixing is that two of the three terms fail the BUILD if they outgrow the array
+and the third cannot. `FURNITURE_MAX` is `const`-asserted equal to `strip::STRIP_MAX`; `occ_clip`'s
+population is bound by `OCC_CLIP_MAX`'s assert. But `MENU_OCC_MAX` is a **hand count** of the
+transient surfaces `erase_clip` pushes, with no registry behind it to assert against — so a second
+transient added beside `crystal::open_rect` compiles clean and starts dropping a box at run time.
+The `dropped` report is the only backstop that direction has.
+
+So it is un-gated, and **latched** on `strip::paint`'s `not-word4` precedent: a clip that overflows
+once overflows every pass, and an unlatched line would flood a 115200-baud wire from the compositor's
+own drain — a witness that becomes a second defect. Said once per boot; the condition is a property
+of the BUILD, not of the pass that noticed it. The line now also carries the worst-case terms so a
+capture reads WHICH term grew:
+
+```
+[wck4] erase clip OVERFLOW dropped=N cap=15 worst=12+2+1 — the erase may publish over live pixels
+```
+
+Cost on every panel this kernel drives: one `usize` compare per drain against a value that is zero.
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green both arches ·
+`UNAOS_WC=1 ./arroyo fat-img` · `UNAOS_WC=1 UNAOS_FATIMG=sf ./arroyo test 150` · mbench
+`x86-fat.spec` and `x86-wc.spec`. The targeted proof is a `strings` differential on the
+builder-path artifact built with `UNAOS_WC=1` plus the kepler knobs: the `[wck4] erase clip
+OVERFLOW` literal is ABSENT from that image before this change and PRESENT after — which is the
+whole of the finding, restated as an artifact fact.
+
+## TILEFIT — the tiler's last-resort clamp was idempotent, and two windows shared one box (x86 `wc`, 2026-08-22)
+
+Peter, from the boot-11 metal sitting: *"storm usually should fire up 6 but only managed 5 windows."*
+
+All six launched. All six loaded, got a pid, created a window, took a focus raise, passed `[wc-d]`
+and reported `live=yes` for the rest of the boot. The operator still counted five, and he was right:
+**two of the seven live windows were given the same outer box, to the pixel.**
+
+### The mapping, first — because the join key is a trap
+
+`BGRUN`'s `asid=` is **not** the compositor's asid. `spawn_user_image_bg` returns
+`Ok((pid, mapped.slot as u64, entry))`, so the shell prints the user SLOT, while the window layer is
+armed with `spawn_focus_arm(slot + 1)`. The whole boot-11 storm therefore joins as:
+
+| vug | pid | `BGRUN asid=` (slot) | wm asid | win | content origin |
+|-----|-----|----------------------|---------|-----|----------------|
+| 1 | 38 | 1 | `0x2` | 4 | (807, 85) |
+| 2 | 39 | 2 | `0x3` | 5 | (1597, 85) |
+| 3 | 42 | 3 | `0x4` | 6 | **(17, 826)** |
+| 4 | 47 | 4 | `0x5` | 7 | (807, 826) |
+| 5 | 48 | 5 | `0x6` | 8 | (1597, 826) |
+| 6 | 49 | 6 | `0x7` | 9 | **(17, 826)** |
+
+Six vugs, **five distinct rectangles**. That is the operator's count, on the wire:
+
+```
+[wc-a] create win=6 asid=0x4 surf=128x128 stride=512 scale=6x at (17,826) z=77
+[wc-a] create win=9 asid=0x7 surf=128x128 stride=512 scale=6x at (17,826) z=83
+```
+
+### The mechanism — the clamp saturates, and a new row restarts `cx`
+
+`place` is a greedy left-to-right flow. PULSE-2's last-resort clamp pulls a row back up when `cy`
+walks past the work area:
+
+```rust
+r.y = cy.min(wtop.saturating_add(usable_h.saturating_sub(bh)));
+```
+
+That clamp is **idempotent**. Once the flow overflows, every subsequent row is pinned to the same
+`y` — and because each new row restarts `cx` at `GAP`, the first box of each overflow row comes out
+byte-identical to the first box of the last row that fit.
+
+Boot 11's arithmetic, exactly: panel 2880x1800, `wtop=34` (menu bar), `chrome_h=162`,
+`usable_h=1604`; 128x128 surfaces at `scale=6` give `bw=778`, `bh=812` (`GAP=12`, `BORDER=5`,
+`TITLE_H=34`), so three columns fit. Row 1 sits at `y=85`. Row 2 wants `85+812+12 = 909`, is clamped
+to `34+1604-812 = 826`. Row 3 wants `909+812+12 = 1733`, is clamped to **826 again**, with `cx` back
+at `GAP` — so win 9 landed on win 6 at (17, 826), `778x812`, both.
+
+Seven live tiled windows (the six vugs plus the console-adjacent window already at (17, 85)) in a
+grid with room for six. The seventh had nowhere to go and the clamp gave it somebody else's seat.
+
+The clamp's own note argued that overlap is *"a legibility problem the operator can fix by closing
+one"*. True of PARTIAL overlap. False of an exact alias: `wc_click_route_at` answers with the top
+row, so the covered window cannot be focused, dragged or closed by pointer, and nothing on the panel
+says it is there. This is **"the operator cannot see it"**, not "it does not exist".
+
+### A refuted alternative, recorded because it looks convincing
+
+A parallel reading held that `win=9 asid=0x7` *"was never raised"*, on the strength of `above=no` in
+its `[wcn]` rollups at 110.961 s and 121.482 s. It does not survive the log:
+
+* **win 9 was raised, three times** — `[wc-fv] focus raise asid=0x7 ... top_win=9` at 105.102 s
+  (`z=84`), 111.689 s (`z=92`) and 114.756 s (`z=100`).
+* **`above=` is not "was raised"** — it is `above_shell()`, i.e. `r.z > shell_z`. It answers "is this
+  window above the SHELL right now", which every window fails as soon as the operator clicks the
+  console.
+* **The premise that only win 9 carries it is false** — at 110.961 s win 8 (`asid=0x6`) also reads
+  `above=no`; at 116.430 s wins 5, 6, 7, 8 *and* 9 all read `above=no`.
+* **The timing is wrong** — at 105.102 s, when the operator was counting, win 9 was `z=84` against
+  `shell_z=0`: freshly raised, focused, and the topmost window in the set. A raise-path defect cannot
+  explain a symptom observed while the window is on top.
+
+At that instant it was win 6 (`asid=0x4`, pid 42) that the operator could not see, underneath win 9.
+Later focus churn swaps which of the pair is visible; the defect is the shared box, and it costs
+exactly one visible rectangle for the whole life of the layout. (`wins=9` holds to the end of the
+capture and no `[wc-a] create` fires after 105.102 s, so the alias was permanent.)
+
+### The fix — ask the capacity question, then guarantee uniqueness
+
+Two arms, in `place`:
+
+1. **The capacity search.** `place_scale` is a function of ONE window and the panel; the flow that
+   consumes it is a function of the whole LIVE SET, and nothing asked the second question.
+   `fit_cap` now finds the largest scale cap whose flow fits, by the same predicate the clamp uses
+   (`flow_fits`), and `place` lays out under it. On boot 11's inputs this takes the storm from
+   `scale=6` (3 columns, 3 rows, overflow) to `scale=5` (`bw=650`, `bh=684`, 4 columns, 2 rows,
+   `1380 <= 1604`) — **all seven windows fully visible, none clamped.**
+2. **The cascade.** The floor (`min_width_scale`, WMMINW) may refuse to shrink, so capacity alone
+   cannot be a guarantee. When the clamp does bite, the row now walks UP into the work area — never
+   down, so PULSE-2's reservation is untouched — taking the first candidate whose outer box is not
+   already spoken for this pass. `step` divides the available span by `MAX_WINDOWS`, so enough
+   distinct candidates exist on any real panel and there are at most `MAX_WINDOWS - 1` boxes to
+   avoid.
+
+`fit_cap` returns `usize::MAX` — `scale_in`'s identity cap — whenever the natural layout already
+fits, so **every panel and window count that worked before this arc is byte-identical after it.**
+The search runs only from a create or a close, and only on a layout that was already going to alias.
+
+### The witness — `[wm] tile-fit`
+
+The gap boot 11 exposed is that nothing on the wire said the two boxes were the SAME box; the fact
+was recoverable only by reading six `at (x,y)` fields out of scattered lines and noticing that two
+matched. The verdict now asks that question where the whole layout is visible at once, and names the
+pair. Change-triggered on `[wm] tile-top`'s pattern, emitted with the table released:
+
+```
+[wm] tile-fit n=7 panel=2880x1800 work=34+1604 scale=5 rows=2 shrunk=yes clamped=0 alias=none -> DISTINCT
+```
+
+and, if a layout ever aliases again:
+
+```
+[wm] tile-fit n=7 panel=2880x1800 work=34+1604 scale=6 rows=3 shrunk=no clamped=2 alias=win=6(asid=0x4)/win=9(asid=0x7) at (17,787) 778x812 -> ALIASED
+```
+
+`-> ALIASED` is the red. It is derived from the same `placed` array the cascade consults, so the
+verdict cannot silently disagree with the fix it reports on. **A pre-fix kernel replaying boot 11's
+inputs prints `-> ALIASED` naming win 6 and win 9; this kernel prints `-> DISTINCT`.**
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green both arches. No QEMU leg (the
+symptom is metal-only: it needs seven live tiled windows on a 2880x1800 panel). The targeted proof is
+a `strings` reachability check on the builder-path artifact built with `UNAOS_WC=1 UNAOS_WITNESS=1`:
+both `[wm] tile-fit` format strings and the `-> DISTINCT` / `ALIASED` tails are present in
+`target/x86_64_esp/kernel.elf`, and `nm` shows `video::wm::place::LAST_SIG` allocated beside the
+pre-existing `place::LAST_TOP` — the witness's own latch, inside the function boot 11 already proves
+runs on metal (`[wc-a] create` is emitted by `place`'s caller immediately after it returns).
+
+## PAYGOBAND / NOATT — the 4 Hz whole-box repaint nobody attached to (x86 `wc` + `wcg-paygo`, 2026-08-22)
+
+The operator sat through metal boot 11 and said "nothing ran right the whole time it was booted". One
+of the four mechanisms that decomposes into is this one, and it is the one that raised **no failing
+verdict at all**: `[wcn]` reported a healthy `-> LIVE` throughout, so every other investigation
+walked past it.
+
+### The reading
+
+`~/unaos-bench/capture/rmbp3-boot11/ttyUSB0.log`, 40.8–105.0 s — three windows, the operator "just
+using it". The screen is provably static: the `[wcn]` rollups at 55.8 / 60.9 / 65.9 / 70.9 s are
+byte-identical at `att=97 comp=151 passes=115`. Yet `[comp2]` reads
+
+```
+[comp2] rollup passes=115 pass_us=4942 ... blit_us=4932 ... dmg_px_pp=817617 box_px_pp=984425 wcd_us=194081 util_pct=11
+```
+
+against a genuinely idle desktop's
+
+```
+[comp2] rollup passes=99  pass_us=2033 ... blit_us=2024 ... dmg_px_pp=631736 box_px_pp=631736 wcd_us=0     util_pct=3
+```
+
+— 2.4x the pass, 3.7x the utilisation. The per-window census names the payer:
+
+```
+[wcn] win=1 asid=0xffffff01 ... att=0 comp=18 ... z=1  pre=18 drg=0  dout=18 dkpx=13302 drly=0
+[wcn] win=2 asid=0xffffff02 ... att=0 comp=18 ... z=3  pre=0  drg=18 dout=0  dkpx=0     drly=18
+[wcn] win=3 asid=0x1        ... att=97 comp=115 ... z=71 pre=97 drg=18 dout=0 dkpx=0    drly=0
+```
+
+`win=1` is fbcon's console window (`KERNEL_OWNER_CONSOLE`, `surf=1232x688` at (819,453)). `att=0` —
+its owner presented **nothing** — beside eighteen composites of its **own** damage (`pre=18`, so it
+was in the seed set, not dragged in). Its damage then drags the shell in (`dout=18 dkpx=13302`, i.e.
+739 kilopixels per event) and the shell relays to the vug (`drly=18`). Three windows repainted, 18
+times per 5 s, on a screen that did not move. `[wcser]` reads `declined_pct=7..11` across the whole
+stretch: **this is not contention, it is work nothing asked for.**
+
+18 per 5.02 s is 3.58 Hz, which is `PAYGO_SVC_PERIOD_US` (250 ms). `[comp2] wcd_us=194081` names what
+those passes bought.
+
+### The mechanism — `paygo_service_pass`, `video/wm.rs`
+
+The WC-D / WC-G pay-as-you-go battery has a service taker (PAYGO-TERM): past `defer_ms`, an owed
+sample is taken whether or not anyone is drawing. It takes it by marking one row damaged and running
+a composite, and the mark was the **whole box**:
+
+```rust
+r.damaged = true;
+r.dmg_y0 = 0;
+r.dmg_y1 = 0;
+```
+
+The read-back it enables is **chunked**. `verify_window` resumes at `WCD_CUR[i]` and walks at most
+`WCD_CHUNK_ROWS_MAX` (64) source rows, and on the metal the `WCD_CHUNK_US` (2 ms) time stop cuts it
+far shorter than that. The terminal lines say by exactly how much:
+
+```
+[wc-d] paygo win=1 state=complete ... -> PAID chunks=345   (surf 1232x688 — 688 rows)
+[wc-d] paygo win=2 state=complete ... -> PAID chunks=444   (surf 1440x883 — 883 rows)
+```
+
+688/345 = 1.99 and 883/444 = 1.99: **~2 source rows of verdict per whole-box repaint of the window**,
+~345 times, at 4 Hz. That is 86 s of panel-scale blitting per window to close one battery, and 2 s of
+it lands inside every 5 s `[comp2]` span while it runs.
+
+### Boots 9 and 10 are not the control they looked like
+
+The comparison that made boot 11 look unique — boot 9 and boot 10 idling at `comp/att = 1.00`, with
+`win=1` and `win=2` emitting nothing at all — was taken from stretches **after** those boots'
+batteries terminated:
+
+| boot | leak live | how it ended | first clean `[comp2]` |
+|---|---|---|---|
+| 9  | ~42 s → 111 s | `paygo-taker STOP-NOTE win=1` @111 532 ms, `win=2` @115 662 ms (cap of `PAYGO_SVC_MAX`) | 112 510 ms, `pass_us=2058 wcd_us=0` |
+| 10 | ~17 s → 188 s | `[wc-d] paygo win=1 -> PAID` @111 831 ms, `win=2 -> PAID` @188 371 ms | 193 596 ms, `pass_us=2033 wcd_us=0` |
+| 11 | ~42 s → 122 s | `paygo-taker STOP-NOTE win=1` @122 000 ms, `win=2` @126 016 ms | (the operator's session ended at ~105 s) |
+
+Over the **comparable** window (~40–105 s uptime) all three boots carry the identical leak at the
+identical rate — boot 9 at 47 209 ms reads `win=1 att=0 comp=16 dout=16 dkpx=11824`, boot 10 at
+29 258 ms reads `win=1 att=0 comp=20 dout=20 dkpx=14780`. Boot 10's `win=2 -> PAID` at 188 371 ms is
+followed by the very next `[comp2]` falling to `pass_us=2033 wcd_us=0`: the battery closing is what
+ends it.
+
+**No delta in the boot-11 image caused this.** KBDFLAP, KBDWIT-LATCH, PTRDEAD, RX-FINALPAGE and
+DMGOVLP-BITE are all innocent of it. PTRDEAD was checked first, and honestly, because it touched the
+pointer event path and because the taker *does* read pointer state — `paygo_service_pass` returns
+early on `drag_active() != WIN_NONE`, so anything that changed drag liveness could in principle have
+changed how often the taker runs. Three facts close it:
+
+* the taker's rate is **identical in all three boots** — 16–21 marks per 5 s, i.e.
+  `PAYGO_SVC_PERIOD_US` — so nothing moved the gate;
+* `drag_active()` is a *suppressor*: a delta that made drags less live could only let the taker run
+  more, and it is already running at its floor in boots 9 and 10;
+* the commit that carried PTRDEAD's four sources (`2f78e68a`, PTRWIT/PTBURST/EHCIDARK/PTRCH) touches
+  no `video/` file at all.
+
+The mechanism predates all five deltas and is on the wire, unchanged, in both comparison boots.
+
+What boot 11 *did* change is the **price** of each take: boot 10's late layout had the shell at
+(1302,777), so the drag billed `dkpx=1558` for 19 events (~82 kpx each); boot 11's storm-era layout
+overlaps the console and the shell heavily, so the same 18 events bill `dkpx=13302` (~739 kpx each),
+and the chain reaches a third window. The geometry is the amplifier; the taker is the source.
+
+### The fix — mark the chunk, not the box
+
+`verify_reference` clips the band to `[cur, min(row1, cur + WCD_CHUNK_ROWS_MAX))` itself, so a mark of
+exactly `[cur, cur + WCD_CHUNK_ROWS_MAX)` hands it the same rows it was going to walk. The ledger line
+this replaces read *"a banded mark would hand `verify_reference` a band to narrow the very verdict this
+taker exists to complete"* — true of an arbitrary band, false of the chunk's own extent.
+
+The guard is `!wcg_ripe && wcd_ripe && cur > 0 && cur + WCD_CHUNK_ROWS_MAX < visible`, where `visible`
+is `verify_reference`'s own `rows` expression evaluated from the same four row fields and a panel
+height read before the table lock. Under it, that function derives `row0 == cur`, `row1 == r1 == cur +
+64`, `banded` already true via its own `cur > 0` term, and `cksum_pre` unchanged — **the walk and every
+printed field are identical to the whole-box mark's; only the repaint shrinks.** Everything outside the
+guard keeps the whole box, deliberately:
+
+* `cur == 0` — stage 1 has no cursor (`WCD_CUR` is stage-2 only) and its lattice verdict *is* "the band
+  this present offered, once", so banding there would genuinely narrow it. One pass in ~345.
+* `wcg_ripe` — `wcg::begin` has no band test and samples the whole surface.
+* `cur + 64 >= visible` — includes `cur >= visible`, the SHRUNK-box close arm, which needs `row1 == rows`
+  and is reachable only from a whole-box mark.
+
+`damage_rows` unions rather than assigns, so a band a real present already owes is never dropped.
+
+One race, stated: another core can bank a chunk between the mark and the composite, leaving `cur` ahead
+of the marked band; `verify_reference` unwinds and the take is wasted. `PAYGO_SVC_BUSY` excludes a
+second taker, so it needs an ordinary present in the gap — and a present that banks a chunk calls
+`paygo_svc_progress`, which clears the row's try count. Cost: one 250 ms cycle, liveness bound intact.
+
+### The discriminator — `[noatt]`
+
+`[wcn]` can say a window composited more often than it presented (`comp_rate` above `att_rate`) and
+WCN-CAUSE can say whether the excess was the occlusion closure (`drg`) or the window's own damage
+(`pre`). It cannot say whether there was an **attach behind that damage at all**, because `pre` is
+counted per blit and `att` per present and the two are never joined inside a pass. That join is the
+new instrument. Per composite pass, over the SEED set only:
+
+```
+[noatt] scope=live passes=115 seeds=115 noatt=18 noatt_kpx=13300 rate=3.5/s taker=18 span=5024ms -> TAKER
+```
+
+`noatt` counts seed rows whose per-id attach sequence has not moved since the previous pass;
+`noatt_kpx` bills them at `damaged_box` area in the same unit `[wcn] dkpx=` uses; `taker` counts marks
+made by `paygo_service_pass`, at the one site that makes them. `-> TAKER` when `taker >= noatt`,
+`-> TAKER+` when something else is also marking, `-> UNATTRIBUTED` when nothing here can explain it
+(which sends the reader to `cursor::repair`'s `damage_intersecting`, `focus_changed`, `repaint`, or
+the erase drain). Self-silencing on `noatt == 0`, so a healthy desktop is as quiet as before and the
+line's presence is itself the finding. x86 only, like `[wcser]`, under which it sits.
+
+### The metal watch lines
+
+A **healthy** pass reads, together:
+
+```
+[comp2] rollup passes=99 pass_us~2033 ... dmg_px_pp == box_px_pp ... wcd_us=0 util_pct=3
+[wcn]   win=N ... att=K comp=K ... pre=K drg=0 dout=0 dkpx=0
+(no [noatt] line at all)
+```
+
+The **leak** reads:
+
+```
+[comp2] rollup ... pass_us 2.4x the idle figure ... wcd_us in the 10^5 per 5 s span
+[wcn]   win=1 asid=0xffffff01 att=0 comp=18 ... pre=18 dout=18 dkpx=13302
+[noatt] ... noatt≈18 taker≈18 rate≈3.5/s -> TAKER
+[wc-d]  paygo win=1 state=waiting ... clock=drag taken=1 budget=2 -> DEFERRED   (the battery still owed)
+```
+
+`att=0` beside a non-zero `comp` is the whole tell, and `wcd_us` is the corroborator: it is the only
+`[comp2]` account the read-back charges, so `wcd_us=0` on a busy span exonerates this mechanism
+outright. With PAYGOBAND landed the same battery still runs — the take count is set by the time stop,
+not by the mark — but `[noatt] noatt_kpx` falls ~11x for the console and ~14x for the shell, and
+`[comp2] pass_us` should track it down.
+
+### Gates
+
+`./arroyo check` green both arches · `UNAOS_WC=1 ./arroyo check` green both arches ·
+`UNAOS_WITNESS=1 UNAOS_WCG_PAYGO=1 UNAOS_WC=1 ./arroyo check` green both arches (without the last one
+the gate is **vacuous**: `wcg-paygo` is off by default, so neither the taker nor this arc's edit is
+compiled at all). Per-feature legs checked directly: `{}`, `witness`, `wc`, `wcg-paygo`,
+`witness,wc`, `witness,wcg-paygo,wc` on x86; `{}` and `witness` on aarch64. No QEMU leg — the symptom
+is metal-only (it needs a matured battery on a panel-scale window, which QEMU's RAM-fast probes close
+in a dozen chunks rather than 345).
+
+Targeted proofs, both non-QEMU:
+
+1. **Host-compiled decision extraction.** `paygo_service_pass`'s extent decision and
+   `verify_reference`'s `rows` / band clip / `WCD_ST_FULL_RUN` cursor arm lifted verbatim to the host
+   and swept over 5 660 928 `(panel_h, scale, h, y, stride, surf_len, cur, wcg_ripe, wcd_ripe)`
+   combinations. Every one of the 20 474 banded decisions derives a tuple `(row0, row1, r1, banded,
+   cksum_pre)` **identical** to the whole-box mark's; every declined decision is the pre-arc behaviour
+   bit for bit, including the SHRUNK close; the repaint is `<= 64` rows in every banded case, never
+   larger than the whole-box one, and 10.8x / 13.8x smaller on boot 11's actual `win=1` / `win=2`
+   geometry.
+2. **`strings` / `nm` reachability on the release-linked kernel ELF** built with
+   `--features witness,wcg-paygo,wc`: `[noatt] scope=`, ` noatt=` and ` noatt_kpx=` are present in
+   `target/x86_64-unaos/release/unaos-kernel`, all seven `video::wm::NOATT_*` statics are allocated,
+   and `objdump -d` of `unaos_kernel::video::wm::paygo_service` (with `paygo_service_pass` inlined)
+   shows both new paths in the emitted code — a second `lea ... WCD_CUR` beside the pre-existing one,
+   and `lock incq ... NOATT_TAKER`.
+
+## DEADMAN — the instrument the wedge cannot erase (x86, `deadman` knob, 2026-08-22)
+
+### The defect
+
+Metal boot 11 wedged at **117.668 s**. The glass stayed frozen for the last **91 seconds** — 43 % of
+the operator's session — and **there is no data for that stretch at all**. `spread`, `rtwit`,
+`schedx86`, `dock` and `menubar` did not fail one after another; they went silent in **one event**.
+
+That is structural, not bad luck. Every one of those instruments is emitted **by the render-service
+pass**. When the pass stopped, so did the evidence of it stopping. *The wedge erases the evidence of
+itself.*
+
+The gap was already written down. `shell.rs` (the `storm` verb) says it in as many words:
+
+> …on x86 there is NO instrument that survives a starved shell (the `[schedx86] load` heartbeat runs
+> on the same render-service task as this dispatch; on aarch64 the timer-driven `:: SCHED: load ::` /
+> `[pulse5]` / `[spin1]` train does survive). A silent x86 tail is settled only by the next boot's
+> slice, honestly.
+
+`[deadman]` is the x86 half of that train.
+
+### The shape
+
+Driven from the **APIC timer ISR** (`arch/x86_64/interrupts.rs`, `timer_interrupt_handler`), not from
+any service pass. **One line per second, unconditionally — including when every counter is zero.**
+
+That unconditional emission is the whole design, not a convenience. An all-zero `[deadman]` line says
+*"the machine is alive and nothing is happening."* **No `[deadman]` line at all** says *"the timer ISR
+or the console transport is gone"* — a different and much larger claim. Boot 11 could produce neither
+reading, because an instrument that only speaks when there is something to report cannot distinguish
+its own death from quiet.
+
+The hook sits **after `apic::eoi()`** — holding the in-service bit across the emit would block this
+core's own subsequent timer ticks, i.e. the instrument would suppress the heartbeat it rides — and
+**before `sched::timer_preempt()`**, which can switch away and not return for the descheduled lifetime
+of a task. Anything after that call is not on the timer's clock at all, which is the entire property
+this witness exists to have.
+
+### The line
+
+```text
+[deadman] up=117 hid=42 pmp=998 hq=3 hid_ms=118 comp_ms=91234 gate=2/8891 dec=00200000 dmg=3/3
+```
+
+| field | meaning |
+|---|---|
+| `up=` | seconds since boot (`APIC_TICKS / 1000`) — the anchor a capture is read against |
+| `hid=` | HID IN-token completions in the last second (see **the HID-IN gap** below) |
+| `pmp=` | `service_ehci_hid()` passes in the last second — the poll's own liveness |
+| `hq=` | input event-queue depth |
+| `hid_ms=` | age of the most recent HID report; `-` if none ever |
+| `comp_ms=` | age of the last **completed** composite pass; `-` if none ever |
+| `gate=` | `COMP_GATE` holder core `/` hold age in ms; `-` when free |
+| `dec=` | per-core composite **declines** in the last second, one hex nibble per core, saturating at `f` |
+| `dmg=` | rows currently marked damaged `/` of those, rows with **no attach since the last pass** |
+
+~95 bytes. Deliberately: `USB-DEBUG: MOUSE` was measured at 49 bytes per report and was **20.8 % of
+all serial output** before it was removed. One 95-byte line per second is ~0.8 % of a 115200-baud wire.
+
+Sentinels are never `0`. A field that never populated reads `-`; a damage sample that could not be
+taken reads `?`. `0` always means a real measured zero.
+
+### THE SAFETY ARGUMENT, PER FIELD
+
+The property that matters most: **an instrument that can block on what it instruments is the bug, not
+the tool.** This runs in the timer ISR with `IF=0`, so any wait is a wait the machine cannot break.
+Field by field:
+
+| field | how it is read | why it cannot block |
+|---|---|---|
+| `up=` | `APIC_TICKS.load(Relaxed)` | one relaxed load of an `AtomicU64`. Wait-free; no lock, no MMIO, no `cli`. |
+| `hid=` | `HID_IN.swap(0, Relaxed)` | single relaxed RMW on a module-private atomic. Nothing else can hold it. |
+| `pmp=` | `HID_POLL.swap(0, Relaxed)` | as above. |
+| `hq=` | `pal::event_queue_stats()` — five relaxed loads, then `push − drop − pop` | **`pal::event_queue_depth()` is deliberately NOT used.** That accessor is `without_interrupts(\|\| EVENT_QUEUE.lock().len())` — a `cli` plus a blocking spin-lock acquire against a mutex the main loop holds across `push_locked`/`pop_event`. The conservation-law read touches no lock at all. Cost: the counter bump and the head/tail move are not one atomic step, so a concurrent push can skew the sum by ±1. For a gauge that is irrelevant, and it is stated rather than hidden. |
+| `hid_ms=` | `HID_LAST_MS.load(Relaxed)` | module-private atomic, stamped at the EHCI completion point. |
+| `comp_ms=` | `COMP_LAST_MS.load(Relaxed)` | module-private atomic, stamped at the *tail* of `composite_once`. |
+| `gate=` | `wm::deadman_gate_sample()` — `COMP_HOLDER_CORE` + `COMP_HOLD_T0_MS`, two relaxed loads | **`COMP_GATE` itself is never touched** — no CAS, no acquire, no retry. These two are gauges `wm` already maintains and documents as "loaded, never drained", and reading them is the same pattern `wcser_emit`/`wcser_overdue_probe` already use. A torn pair (holder released between the two loads) costs one line reporting a stale age for a gate that just went free; `saturating_sub` keeps it non-negative. |
+| `dec=` | `DEC[core].swap(0, Relaxed)` per core | **single-writer per core** — core *i* is the only writer of slot *i*, so the slots never contend. |
+| `dmg=` | `wm::deadman_damage_sample()` — `TABLE.try_lock()`, then a bounded 12-row walk | **`wm::table()` is deliberately NOT used**: it is `IrqMask::new()` + a blocking `TABLE.lock()` spin and would deadlock outright if the ISR landed on a core already holding it. `try_lock` returns immediately either way and reports `?/?` on contention — the pardon-on-busy discipline `occluders_above`/`OCC_EXCUSE_BUSY` established in `wm.rs`, for the reason recorded there: *"An instrument must never be able to wedge the thing it instruments."* The critical section is 12 iterations of two `bool`s and one relaxed load, with no print, no allocation and no nested lock. |
+
+**The emit itself.** `serial_println!` is safe from an ISR, and that is a property of
+`arch::serial::_print`, not an assumption: it takes `SERIAL1` with **`try_lock` only, never `lock`**,
+and on the rMBP — which has no 16550 at `0x3F8` — the `UART_STATE == 2` arm breaks out immediately
+without even entering the back-pressure loop. Its four downstream taps (`fbcon`, the FTDI console
+ring, the `tste` ring, the flight recorder) are each documented `try_lock`-only, alloc-free and safe
+from an IRQ-masked context. Formatting goes into a bounded 160-byte stack buffer — no allocation.
+
+`[deadman]` is added to `fbcon`'s `PANEL_MUTE_TAGS`. It is periodic telemetry with no on-glass reader
+(like `[wcn]`/`[schedx86]`), but its case is the strongest of the six: routing it to the panel would
+push a console present, and therefore compositor-adjacent work, **inside an interrupt handler** once a
+second. The wire keeps every byte — the mute governs the glass only.
+
+### ⚠ THE TRANSPORT IS NOT PART OF THE GUARANTEE
+
+Stated plainly so nobody over-reads the instrument. On the rMBP there is no 16550; the console is the
+**FTDI bulk-OUT**, drained by `Controller::service_ftdi()` from the **`x86_usb_pump` task**.
+
+What this design buys is that `x86_usb_pump` is a **different task from the render-service task** that
+carries `spread`/`rtwit`/`comp2`/`schedx86`. So a compositor wedge no longer takes the instrument with
+it: the sample is taken and staged lock-free from the ISR regardless, and the line reaches the cable
+as long as the usb-pump task still runs. Boot 11's silence was **one** pass dying. `[deadman]` goes
+silent only if a **second, independent** pass also dies — and that silence is itself now a reading,
+because the line is unconditional.
+
+### ⚠ THE HID-IN GAP — named, not papered over
+
+The brief this was built to asked for `hid_in` incremented **inside the EHCI IRQ handler, before any
+queue or lock**. **That site does not exist on this machine.** `drivers/ehci/mod.rs:19` is explicit:
+
+> No interrupts: no USBINTR write, no IDT vector, no MSI.
+
+The rMBP's internal keyboard and trackpad are serviced by `service_ehci_hid()`, **polled** from
+`x86_usb_pump`. `USBINTR` is never written, `arch/x86_64/interrupts.rs` has no EHCI vector, and so no
+EHCI interrupt is ever delivered. There is no IRQ-side counter to keep.
+
+Rather than weaken the requirement by calling a polled call site an ISR, the field is **split** so the
+gap is visible in the reading itself:
+
+* `hid=` is stamped at the **earliest honest point** — the qTD retirement (`ehci/mod.rs`, the same
+  spot as the KBDWIT stamp), above every decoder, length gate and `dead` path, and before any
+  `pal::EVENT_QUEUE` push, so no report layout can influence whether a completion counts.
+* `pmp=` is stamped at `service_ehci_hid()` **entry** — above the lock and above the `is_none()` early
+  return, because the question is "did anything call the poll", not "did the poll find a controller".
+
+**The residual, stated:** when `pmp = 0` this instrument cannot see HID hardware liveness at all.
+Closing it needs a read-only sample of `USBSTS.USBINT` (which `QTD_IOC` still sets even with `USBINTR`
+masked) taken from the timer ISR off a base cached at init. That is a separate rung and is
+**deliberately not built here** — it puts an MMIO read of a device BAR inside the timer ISR, which
+needs its own power-state and mapping argument.
+
+### ⚠ `ser_wait[0..7]` — DROPPED, and why
+
+The brief asked for a per-core count of threads **blocked on** the compositor's serialization lock.
+**No such set exists, because `COMP_GATE` is not a lock.** It is an `AtomicBool` gate (`wm.rs`) taken
+with `compare_exchange`; on failure the caller **declines** — publishes `COMP_PENDING` and returns
+immediately. Nothing ever blocks on it.
+
+A "threads blocked" field would therefore be structurally always zero, and would read *"nobody was
+waiting"* during precisely the wedge it was built to explain. That is worse than no field.
+
+`dec=` is the honest analogue with the same job: a per-core count of composite passes **turned away**
+by the gate. It answers what was actually asked — it converts "nothing ran right" into an enumerated
+list of which cores tried and were refused — while naming the real mechanism. During a leaked hold,
+`dec=` is the roster of cores that kept arriving and kept being sent away, and `gate=` names the core
+that never let go. (`WCSER_DECLINED` is a single global total drained by a rollup that rides the
+render-service pass, so it says nothing during the wedge it would be most useful for.)
+
+### THE EXACT METAL WATCH LINES
+
+Watch with `awk '/\[deadman\]/' <log>` — not `grep`; control bytes in the logs break it.
+
+**1 — healthy boot, desktop idle.** The screen is up, nobody is touching it.
+
+```text
+[deadman] up=42 hid=0 pmp=997 hq=0 hid_ms=8112 comp_ms=1043 gate=- dec=00000000 dmg=0/0
+```
+
+Read it as: the poll is running (`pmp≈1000`, once per pump pass); nothing arrived (`hid=0`) and the
+last report was 8 s ago; the compositor last **finished** a pass 1 s ago and the gate is **free**; no
+core was turned away; nothing is damaged. **An all-zero-ish line is the healthy idle reading** — and
+it is emitted, which is the point.
+
+**2 — healthy boot, operator typing and dragging.**
+
+```text
+[deadman] up=44 hid=126 pmp=996 hq=2 hid_ms=4 comp_ms=12 gate=3/1 dec=00010000 dmg=2/0
+```
+
+Input arriving, queue shallow, composites recent, the gate briefly held by core 3, one decline on core
+3, two rows damaged and **`dmg=2/0` — every damaged row has an attach behind it.** This is what
+correct damage tracking looks like.
+
+**3 — DURING A WEDGE (the boot-11 shape).**
+
+```text
+[deadman] up=140 hid=31 pmp=998 hq=64 hid_ms=6 comp_ms=22412 gate=5/22409 dec=0000f000 dmg=7/7
+[deadman] up=141 hid=28 pmp=997 hq=64 hid_ms=11 comp_ms=23415 gate=5/23412 dec=0000f000 dmg=7/7
+```
+
+`comp_ms` and the gate hold age **grow together, second by second, without bound**; core 5 took the
+gate and never released it; core 4 is hammering it and being refused every time; the input queue is
+**full at 64** because nothing is draining it.
+
+#### Which reading answers which question
+
+**(a) Was input actually dead, or did the operator stop trying?** → **`hid=` and `pmp=` read
+together, against `comp_ms=`.** Neither decides it alone:
+
+* `pmp > 0`, `hid > 0`, `comp_ms` growing without bound ⇒ **input is alive and arriving; only the
+  glass is dead.** The operator was still typing into a frozen screen. (This is what example 3 shows.)
+* `pmp > 0`, `hid = 0`, `comp_ms` growing ⇒ the poll is alive and the hardware genuinely reported
+  nothing. The input path still runs; the operator stopped trying — or the device went quiet.
+* `pmp = 0` ⇒ **the leaked hold took the input path with it.** The EHCI poll itself stopped, so
+  nothing can be said about the hardware — only that the pass which would have harvested it is gone.
+  **This is the materially worse bug**, and it is now nameable instead of invisible.
+
+The capture from boot 11 showed zero HID lines after 117.759 s and **could not tell these apart**.
+
+**(b) Are the phantom composites a damage-tracking leak?** → **`dmg=N/S`, the second term.**
+
+In the 40.8–105 s stretch the screen was provably static yet the compositor did **1.56 composites per
+attach**, where boots 9/10 do exactly **1.00**.
+
+* `S > 0` on a static screen ⇒ **a leak is proven**, and `S` quantifies it: that many rows are being
+  carried into a pass with no attach behind them.
+* `dmg=N/0` ⇒ the extra passes are **not** a damage leak, and the 1.56 must be explained elsewhere.
+
+The test is strict by construction: a row counts as static iff its attach sequence is **unchanged**
+since the snapshot taken at the last **completed** composite pass, and any `present()` naming the row
+breaks it. No threshold, no decay, no smoothing on either term. **A sibling arc owns fixing that
+defect; this instrument only adjudicates it, and it was built to the definition rather than toward a
+hoped-for answer.**
+
+### Gating
+
+`deadman` (`UNAOS_DEADMAN=1`), **default OFF**, `target_arch = "x86_64"` for the real impl; aarch64
+gets an empty `#[inline(always)]` shim so the hooks in `arch/x86_64/interrupts.rs`,
+`drivers/ehci/mod.rs` and `video/wm.rs` stay `#[cfg]`-free.
+
+Named on **both** the `x86-all` and `arm-pi` type-check legs — the `wm.rs` hooks (`note_attach`,
+`note_composite_done`) are **arch-neutral call sites**, so the shim half must compile armed on aarch64
+or the seam is covered on neither arch. **Stripped by `arm_features`** so aarch64 *media* stay
+byte-identical: the real instrument emits not one byte of aarch64 code, but an enabled feature is
+hashed into cargo's `-Cmetadata`, so leaving it in would shift every Pi/Jetson image hash for zero
+observable change.
+
+With the knob off, an unarmed image contains **no `[deadman]` string, no counter and no symbol** —
+including the `PANEL_MUTE_TAGS` entry, which is itself knob-gated so that claim is exact.
+
+<!-- SYNC-FOLD 2026-08-22 (trunk fold, hw-rmbp@f66b1480 x main@b4e23c7e): both sides appended
+     whole sections at EOF and no heading collided. rmbp's run (STAGE-PHYS .. DEADMAN) is kept
+     first, trunk's (CHROMESPEC .. WCC-FURN) follows verbatim. Nothing was reordered or edited. -->
 ---
 
 ## CHROMESPEC — the armed Pi gate's witnesses, made honest against permanent furniture (2026-08-17)
@@ -13817,7 +15728,7 @@ boot falsifies the design, not the instrument.
 `UNAOS_PIDESK=1 UNAOS_QUARRY=1 ./arroyo kernel8-test 300` was red on the merged trunk: **106/111
 required witnesses**, and *not one* of the five missing ones was about the thing it convicted. The
 whole family had one cause with two faces — a Pi desktop that puts **permanent furniture on the
-glass before the boot witness cascade has finished reading it** — and `video/pidesk.rs` had already
+glass before the boot witness cascade has finished reading it** — and `video/desktop_firmware.rs` had already
 written the rule down and named the exception:
 
 > *A desktop that appears before the boot witness cascade has released the panel is not early, it is
@@ -13866,7 +15777,7 @@ from an ordinary armed run — the flake caught and cured in the same boot:
 
 ### Face 2 — FURNITURE-OCC: `old_desktop=` was asking the wrong question
 
-`pidesk::activate` mints `[wc-x] console-window win=1 … box=570x396 at (35,4)` — **89 % by 82 % of a
+`desktop_firmware::activate` mints `[wc-x] console-window win=1 … box=570x396 at (35,4)` — **89 % by 82 % of a
 640x480 panel** — and the cascade then places its probe windows *inside* it. The vacate legs asserted
 `== DESKTOP_BG` byte-for-byte at eleven points and read `(0/5)`, `(0/3)`, `(0/3)`: eleven correct
 repaints reported as eleven failures, because the compositor was doing the right thing — erase, then
@@ -14279,46 +16190,842 @@ arithmetically-forced `[dragperf] admitted=7` — nothing in the WC-C family, at
 `VUGSPREAD: floor test — tasks=2 cores-used=1`, a scheduler-spread witness the host's 23-deep run
 queue can starve. Re-run on the same image: 117/117, 0 forbidden.
 
-## CHROMEBAND — chrome row fills clip to the band, like content (aarch64 + x86 `wm`, 2026-08-25)
+---
 
-**The defect is geometry-gated, which is why no QEMU-default gate ever saw it.** A staged present
-whose box exceeds `MAX_STAGE_BYTES` (4 MiB) is banded: `chunk_rows = MAX_STAGE_BYTES / row_bytes`
-whole rows per band (WC-M). At 640x480 (`row_bytes` = 2560) `chunk_rows` = 1638 covers any box —
-one band always, the banded path never entered. At 1920x1200 (`row_bytes` = 7680, pinned by
-`[wc-e] fb-geometry ... pitch=7680B`) `chunk_rows` = 546, so a full-height window is three bands.
+## OCC62-PARDON — the excuse the fold gave aarch64, and the reader it did not have (both arches, `witness`, 2026-08-22)
 
-`paint_window` runs once per band. The CONTENT loop clips to the band — `dy0 >= dh` breaks, a
-negative `dy0` skips — but the CHROME did not: `fill_rect_ceramic` walked `for j in 0..h` over the
-WHOLE box height on every call, and the out-of-band rows were discarded only at the bottom of the
-call chain (`fill_rect_v` for rows above the band, `fill_rect`'s height clamp below it), after each
-had paid a ceramic `shade` (table lookup + three channel multiplies), an `encode4`, a call and its
-bounds work. Three bands times the box's chrome rows ≈ 2,400 wasted per-row fills per composite on
-a full-height bench window, all inside `[comp2]`'s `compose_us` term. No pixel was ever wrong —
-the waste was pure cost, which is exactly why only a counter could see it.
+This section documents a hazard that **existed in neither parent of the trunk fold** and was created
+by reconciling them. It is written here rather than in a commit message because the merged tree ships
+a new line on the wire.
 
-**The fix is the content loop's own discipline applied to the chrome:** `fill_rect_ceramic` clamps
-its row walk to `dst` itself — `j0 = max(0, -y)`, `j1 = min(h, dst.height - y)` — before it runs.
-The pixel set cannot change, only shrink to its landing subset: every removed row is precisely a
-row the call chain would have written no byte of. Single-band behaviour is `0..h` verbatim (the
-clamp binds only when `dst` is shorter than the box, i.e. only on a banded stage), and the x86
-direct path — where `dst` is the front framebuffer — loses only rows `fill_rect` was about to clip
-against the same `info.height`.
+### The two shapes that met
 
-**The wire and the gate.** `[chromeband] rollup rows_pp= waste= span=` prints on `[comp2]`'s
-cadence (witness builds; a separate line, so no positional harvest of `[comp2]` moves): `rows_pp`
-is the per-pass chrome row count, `waste=` the span's rows issued outside the destination — zero BY
-CONSTRUCTION after the clamp, at every geometry, with the increment kept live as a tripwire.
-`pi4-regression.spec` REQUIREs the `waste=0` form and FORBIDs `waste=[1-9]` (§4a-band).
+On `hw-rmbp`, `occluders_above` carried CURSTICK's **try-lock** body — on contention the occluder
+sample is pardoned whole (one full-coverage box, so `covers()` answers yes everywhere and no pixel can
+be charged) and the refusal is counted into `OCC_EXCUSE_BUSY`. Both the counter and the function were
+`#[cfg(all(feature = "witness", target_arch = "x86_64"))]`, and x86 **reads** the counter: `exbusy=`
+on the `[wcser]` rollup. Pardon, reader, no silence.
 
-Measured, QEMU raspi4b, `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` (this battery
-bands one console present per rollup span — `[wc-h] rollup win=1 ... banded=1 minspan=44`):
+On `main`, OCC62 had widened `occluders_above` to plain `witness` — arch-neutral — but its body still
+took the **blocking** `TABLE` lock. `OCC_EXCUSE_BUSY` did not exist there at all. No pardon, nothing
+to be silent about.
 
-* pre-fix (counters armed, clamp off): `[chromeband] rollup rows_pp=590 waste=980 span=2878ms`,
-  and the new spec leg reds on exactly that line — 118/118 required, **1 forbidden**.
-* post-fix, same battery: the matching span reads `rows_pp=590 waste=0`, every other span
-  `waste=0` at both geometries — 118/118, 0 forbidden at 640x480 AND at 1920x1200, with the
-  `[wc-d]` verify checksums green throughout, which is the pixel-identity witness.
+### Why the merge is where the defect is born
 
-Hardware verification at the next arc boundary: on the bench the desktop windows are full-height
-class, so the expected reading is `waste=0` with `rows_pp` well below a pre-fix boot's, inside a
-`compose_us` that P83's ledger can compare across boots.
+The merged tree needs both: trunk's witness-wide cfg (its `OccSnap`, `impl OccSnap` and `occ_excuse`
+had already widened, so leaving the function x86-only leaves the module internally inconsistent) and
+the track's try-lock body (an instrument must never be able to wedge the thing it instruments — that
+is what boot 7 paid for). Taken together, **aarch64 inherits a full-coverage pardon whose only reader
+is `wcser_emit`, which is `#[cfg(all(target_arch = "x86_64", feature = "witness"))]`.**
+
+An aarch64 pardon would therefore suppress a `[wc-d]` or `[wc-g]` verdict for that window for that
+pass with **nothing whatsoever on the wire**, and no dead-code warning would fire, because the static
+IS written — just never read on that arch. Measured on the merged artifacts:
+
+    aarch64  target/pi_baremetal/kernel8.img     `exbusy` -> 0 hits
+    x86_64   target/x86_64_esp/kernel.elf        `exbusy=` -> 1 hit
+
+### What the fold carries
+
+* `OCC_EXCUSE_BUSY` is written **arch-neutrally** (`#[cfg(feature = "witness")]`).
+* `exbusy=` on x86's `[wcser]` rollup is **untouched** — same key, same position, same wire.
+* One line at the `try_lock() == None` arm, gated on plain `witness` with **no `UNAOS_WC`
+  dependency** (the compositor knob is x86's; the arm that needed a reader is aarch64's):
+
+```
+[occ62] pardon win=<id> cause=contended suppressed=wc-d/wc-g coverage=whole
+```
+
+Two properties of that line are deliberate, and both are about not becoming the defect it reports:
+
+* **Rate-bounded** at `OCC62_PARDON_BUDGET = 4` per boot. The site runs per drawn window per
+  composite pass; an unbounded print is a UART storm inside the loop CURSTICK stopped blocking.
+  Four is the figure `wcg`'s per-window witnesses budget, for the same reason.
+* **Printed with interrupts restored.** The `IrqMask` guard is dropped before the write. This arm
+  does not hold the table lock — that is the whole point of the arm — so the mask has nothing left
+  to protect, and paying for a UART write inside the composite loop's masked window is exactly what
+  CURSTICK forbade.
+
+### Reading the next boot
+
+A pardon is now visible on both arches. `[occ62] pardon` beside a `-> PASS` carrying `occluded>0` is
+the mechanism working: coverage was lost for one window for one pass, and the wire says so. `[occ62]
+pardon` climbing to its budget on every boot is not — that is sustained contention on `TABLE` from
+outside the compositor, and the pardon is masking whatever `[wc-d]` would otherwise have convicted.
+
+**What no QEMU leg gates.** The positive control is a contended one: two overlapped windows with the
+table contended from a second core, asserting the pardon line beside a `-> PASS` carrying
+`occluded>0`. Reachability is proven (`strings`, both builder-path artifacts above), but a witness
+that compiles and never fires is the dead instrument this line exists to prevent. Until that control
+runs, treat the line as armed-but-unfired.
+
+
+## WCSER-ISR / WCSER-STEAL — the wedge is one store, and stealing the gate buys the desktop back at a stated price (x86 `wc`, 2026-08-22)
+
+Four attended metal boots and two days of a wrong theory produced one sentence: **the compositor
+wedge is a single MMIO store into the Kepler BAR1 that never returns.** This section records how
+that was measured, what it refuted, the two instrument fixes it forced, the mitigation that
+followed, and — the part that had not been written down anywhere — what the mitigation actually
+bought when it flew.
+
+Landed in `fb275007` (WCSER-ISR) and `8e91b952` (WCSER-STEAL). Both build on §WCSER-H above, which
+gave the gate a holder identity and the pass a breadcrumb; this is what the breadcrumb said.
+
+### The signature: one shape, five boots
+
+All five readings come from `[wcser] PASS OVERDUE`, whose fields are the gate's own gauges — holder
+core, hold age, and the `comp_mark`/`comp_mark_row` breadcrumb pair.
+
+| boot | image / kernel | hold t0 | holder | `win=` | `row=` | `phase=` | samples |
+|---|---|---|---|---|---|---|---|
+| 11 | `rmbp3boot11`, `5e4b9689` | 117.7 s | c1 | 5 | **704**, twice, 5 s apart | 33 | 2 |
+| 13 | `rmbp4boot13`, `d97446bd` | 33.8 s | c1 | 8 | 792 | 33 | 1 |
+| 14 | `rmbp3probe`, `09153a2b` | 54.3 s | c1 | 7 | 877 | 33 | 1 |
+| 15 | `rmbp4boot14`, `3b4abe22` | 38.8 s | c1 | 9 | **897, ninety-nine 1 s samples, never moved** | 33 | 99 |
+| 16 | `rmbp4boot16`, `19ce87ef` | 83.8 s | c1 | 9 | **946, four samples, never moved** | 33 | 4 |
+
+Boots 13–16 share one capture file, `~/unaos-bench/capture/rmbp4-boot13/ttyUSB0.log`; the byte
+splits are in `BOOT-OFFSETS.md` beside it. Boot 11's lines are quoted in
+[`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1 and predate the phase-33 diagnosis — it is included
+here because it is the same signature, recorded before anyone was looking for it.
+
+Everything varies except the two things that matter. The window differs, the row differs, the boot
+time differs, the image differs (boot 14 was flown off a card that still carried a three-image-old
+tree, which is its own lesson). **`phase=33` and `holder=c1` do not vary.**
+
+`holder=c1` is not luck: every one of these boots printed
+`:: SCHED-X86: RENDER on core 1 + INPUT/usb-pump on core 7 ::`. c1 is the render service's core,
+and the render service is the caller that runs whole-panel present blits. The wedge is not "a core";
+it is *the core doing the most BAR1 writing*.
+
+### Why the row gauge makes this exact rather than inferred
+
+`phase=33` decodes, via WCSER-H's table, to `stage_window`'s span-flush loop. In the source
+(`video/wm.rs`) `comp_mark(r.id, 33)` sits on the line immediately above:
+
+```rust
+comp_mark(r.id, 33);
+for y in 0..rows {
+    let src = y * row_bytes;
+    let py = by + band + y;
+    comp_mark_row(py);
+    if clip.n == 0 {
+        fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+```
+
+That is the bulk row copy **into** the write-combined Kepler BAR1 aperture — the panel write, not
+the scan-out read-back. `comp_mark_row(py)` is stamped *before* the blit, so a frozen `row=N` names
+the row whose copy did not complete.
+
+**And that single field is the whole discriminator.** A loop running at microscopic speed and a
+loop stopped dead are indistinguishable from a hold age; they are trivially distinguishable from a
+row gauge, because **a stalled loop advances `row` and a stalled store does not**. Boot 15 sampled
+`row=` ninety-nine times, one per second, across ninety-nine seconds of hold, and read 897 every
+time. Boot 16 sampled four times and read 946 every time. The pass is not slow. It is stopped, on
+one instruction, and nothing in software can un-park it.
+
+Boot 16 adds an independent confirmation of the same fact from the other end of the system. After
+the steal (below), `[deadman]`'s per-core decline roster reads `dec=f0ffffff` — core 0 and cores
+2–7 saturating the gate with declines — and **core 1's nibble is `0` in all 494 samples over the
+remaining 510 seconds.** A core that is merely slow still arrives at the gate and is still turned
+away. c1 never arrives again, because c1 never executes again.
+
+### The read-back theory, held for two days, and what refuted it
+
+This arc spent two days indicting the **WC-D read-back** — the scan-out-side read the compositor
+performs off the same aperture — and built real machinery against it: WCDVALVE, which throttles
+admissions when read-back duty is high. That theory is dead, and it is recorded rather than quietly
+dropped because the refutation carries information the next reader needs.
+
+**The row trace refuted it structurally.** `phase=33` is on the **write** side of the bus; the
+post-draw read-back is `phase=4` in the same decode table. Boot 8, before the sub-phase split
+existed, saw one hold in each — coarse phase 3 (write) and coarse phase 4 (read-back) — which is
+why the read-back was a live suspect at all. **Every hold recorded since the row gauge existed has
+been phase 33**, five for five.
+
+**And boot 16 refuted it experimentally, which is stronger.** WCDVALVE — the suppressor built
+*against* the read-back hypothesis — engaged on this boot and its wire settles the question
+outright:
+
+```
+[  77546ms] [wc-d] valve CLOSED util~7% wcd~29% suspended=1        (no OPEN after this, ever)
+[  82889ms] [wc-d] valve READ util~98% wcd~0% span=50ms close_at=util12%/wcd8% state=CLOSED
+   ... hold t0 ~83823ms ...
+[  87914ms] [wc-d] valve READ util~79% wcd~0% span=50ms close_at=util12%/wcd8% state=CLOSED
+```
+
+The valve was **closed continuously from 77.5 s to the end of the session**, and read-back duty
+measured **`wcd~0%`** in the epoch that straddles the hold. The read-back was suppressed, was
+measurably not running, and **the machine wedged anyway.** Boot 13 could not deliver this verdict
+because its threshold was unreachable (below); boot 16 delivered it, and it is the answer the
+WCDVALVE experiment was built to get.
+
+> **Correction to this paragraph's FOOTING, not to its conclusion (WCDVALVE-LOOP, 2026-08-25).**
+> The `wcd~0%` above is not independent evidence and never was: closing the valve is precisely what
+> stops `verify_window` from running, and `verify_window`'s drop guard is the only writer of
+> `C2_WCD_CYC`, so `wcd` reads 0 *because* the valve is shut. The refutation rests entirely on
+> `state=CLOSED` and `suspended=` — the suppression itself — which is sound, and on those terms it
+> stands. The field now prints `wcd~?` while closed for exactly this reason. See §WCDVALVE-LOOP.
+
+**What the refutation rules out, and what it does not.** It rules out the read-back as the *site* of
+the hang and as its *trigger*. It does not exonerate write-combine pressure generally — a saturated
+drain remains the measured precursor to these holds (`declined_pct` climbing 69 → 98 over ~17 s,
+recorded in the boot-8 ledger above), and boot 16's `[comp2]` utilisation reads `util~98%` in the
+very epoch that wedges. WCDVALVE therefore stays: it was built against the wrong hypothesis and is
+still the cleanest instrument the compositor has for read-back duty. What must not survive is the
+*claim*.
+
+### WCSER-ISR — an instrument that cannot fire in the state it exists for is not a cheaper guard, it is an ABSENT one
+
+Boot 13 named its holder exactly once, at the crossing, and then said nothing for the next 78
+seconds of hold — while `[wcser]`'s 5-second rollup, driven from a different path, kept printing
+`WEDGED` the whole time.
+
+The cause is structural and it was already half-known. `wcser_overdue_probe()` rode the head of
+`x86_input_service`'s ~1 kHz loop, placed **ahead** of the event pump precisely because boot 8B had
+shown the pump blocking into a wedged GUI. Boot 13 proved that was not far enough forward: it is not
+the pump that is the gate's victim, it is **the whole loop**. `x86_input_service` blocks in
+`gui_send_x86` once the 64-slot GUI channel fills behind a render task parked on the gate — the
+mechanism [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1.2 had already established from boot 11 —
+so a probe anywhere inside that loop dies with the wedge it exists to report.
+
+The fix moves the probe to the **APIC timer ISR**, beside `deadman::tick`, BSP-only, and drops the
+standing repeat from 5 s to 1 s. That path is not chosen by argument but by demonstration: DEADMAN
+emitted 111 consecutive lines through the very same hold. What the move bought is the one field a
+single sample could never give — whether `row=` advances — which is the entire paragraph above.
+
+The same commit fixed a second instrument of the same class. **WCDVALVE's threshold was never
+reachable, and its silence was unreadable.** It armed and printed nothing on boot 13, whose own
+`[comp2] util_pct` read 0, 11 and 16 against a close threshold of 60. The 60 came from this module's
+header — "boot 8: `wcd_us` ~80% duty" — which is *read-back* duty, while the valve was wired to
+`C2_INSPAN_CYC`, which is *composite-pass* duty. A threshold sized against one signal and applied to
+another. It was re-priced off the measured peak (close at `util >= 12` OR `wcd >= 8`, reopen below
+8/5, with `C2_WCD_CYC` added as the second signal because it is the one the design was actually
+sized against), and it gained a `[wc-d] valve READ …` line every `[comp2]` epoch **even when the
+valve stays open** — because on boot 13 "the threshold was never crossed" and "the valve never ran"
+were indistinguishable on the wire, and *a discriminator that cannot report a null result
+discriminates nothing.*
+
+**The general law, which is what this section is really for.** *An instrument that cannot fire in
+the state it exists for is not a cheaper guard, it is an ABSENT one.* Four instances of it were
+found in a single day across two tracks: this probe; the trunk fold silently dropping the
+`[occ62] pardon` print past a conflict region where four green `check` legs saw nothing; orin's EL0
+placement witness gated `#[cfg(feature = "pi")]` at both spawn sites on a board that is not `pi`;
+and orin's EL0-refusal counter being link-dead on the only platform that refuses. The operational
+consequence is standing: **after any merge, and after any change touching a witness, `strings` the
+artifact and confirm each instrument line is a one-hit grep.** Compiling is not firing.
+
+### WCSER-STEAL — the mitigation, and where its safety argument actually lives
+
+Nothing in software un-parks a core stopped inside an MMIO store. What software *was* doing wrong
+was letting that core keep the panel. Boot 13 printed **15 consecutive** `[wcser] … entered=0
+declined_pct=100 holder=1 … -> WEDGED` rollups to the end of its capture; boot 15 printed **19**,
+the last reading `held_ms=96804`. Meanwhile `[deadman]` on boot 15 read `pmp` averaging **894 polls
+per second** through the hold, and ring-3 vessels kept presenting into a gate that refused every one
+of them. **The frozen glass is the refusal, not the stuck store.**
+
+So a holder in-pass past `COMP_GATE_STEAL_MS` is declared dead and its gate is taken. The bound is
+**4 s = 4× the overdue tripwire's bound, itself 3× the worst honest pass this compositor has ever
+measured (302 ms)** — 13× that pass in total, so no legal pass can reach it. It is a **liveness**
+bound, not a performance one, and that distinction is licensed by the row trace: the thing it fires
+on has been measured five times and is stopped.
+
+**The revenant hazard is closed at the release, not at the steal, and that identity check IS the
+safety argument.** "Not coming back" is a claim about a device, and a device may yet answer. If the
+store ever completes, the parked core's loop finishes writing pixels into a framebuffer — harmless —
+and then walks into a release for a gate a *live* core now owns. Both release sites previously stored
+`false` unconditionally, a shape this module's own DOUBLE-RELEASE note had already flagged. So:
+
+```rust
+fn comp_gate_release() {
+    let me = crate::arch::sched::meter_current_cpu();
+    if COMP_HOLDER_CORE.load(Relaxed) != me {
+        // Stolen from under us while we were in-pass. Not ours to release, and not ours to clear.
+        COMP_REVENANTS.fetch_add(1, Relaxed);
+        return;
+    }
+    …
+}
+```
+
+A revenant declines and returns to its own loop. A core that was never stolen from always matches
+and takes the byte-identical old path. Without this, a steal would be a licence to run two
+compositors on one panel — the exact defect WCSER exists to prevent — and the mitigation would have
+traded a wedge for a tear.
+
+`COMP_REVENANTS` counts those declines. A nonzero reading would be real news about the device
+rather than about us: it would mean a stuck BAR store *does* eventually retire.
+
+> **`COMP_REVENANTS` and `COMP_STEALS` have no reader.** Both are declared and incremented in
+> `video/wm.rs` and appear on no serial line anywhere in the tree — `grep` for them returns the
+> declaration and the `fetch_add`, and nothing else. So "boot 16 saw no revenant" is supported only
+> by the *absence of a second `GATE STOLEN` line* and by the counters not being contradicted, which
+> is weaker than a reading. This is a **fifth** instance of the law one subsection up, found while
+> writing this section: appending both to the `[wcser]` rollup — the standing tail-insertion rule,
+> no existing key moves — is one line each and is owed.
+>
+> **PAID 2026-08-25 (WCSER-READER, `acf5d175`).** The rollup now carries `steals=` and `revenants=`
+> ahead of `span=`, loaded and never swapped, and printing a zero rather than omitting one. The
+> statement above stands as the record of what boot 16's claim actually rested on. See
+> §WCSER-READER below, which also records the residual the fix could not close from `wm.rs`.
+
+**What this does NOT do, stated here as it is stated in the commit rather than left to be
+discovered:** the parked core is not recovered, its window is not recovered, and the non-returning
+store is not fixed. **One core and one window are traded for the session.**
+
+### Boot 16 — what the steal actually bought, and what it did not
+
+Boot 16 is `rmbp4boot16`, kernel `19ce87ef`, the same source tree as boots 13–15. Its capture begins
+at byte `1148954` of the shared file.
+
+**The gate came back.** The wedge began at 83.8 s, the tripwire named it four times, and:
+
+```
+[  87829ms] :: [wcser] GATE STOLEN from c1 by c7 after 4006ms — the holder was in phase 33 row 946
+             and had not moved; desktop resumes on this core, the dead core is not recovered ==
+             tripwire ::
+```
+
+The session then ran to **598 seconds** — 510 further seconds of live desktop. Boots 13, 14 and 15
+wedged at 33.8 s, 54.3 s and 38.8 s and never recovered. **`WEDGED` never appears once in boot 16's
+capture**, against 15 and 19 occurrences on the two boots before it. The compositor was not merely alive but fast: over those 510 seconds `[deadman] comp_ms`
+(the age of the last *completed* pass) reads p50 **5 ms**, p90 **9 ms**, max 21 ms, and `[wcser]`
+`held_ms` never exceeds 11 ms. Passes enter and finish. The `[wcser]` rollups read `-> SERIAL` with
+`entered` averaging **261 per 5 s window** (218–366) at `declined_pct` averaging **80 %** (71–84);
+the last ~130 s settle into a lighter regime, ~320 entered at ~73 %.
+
+That is the mitigation delivering exactly what it promised. The rest of this section is what it did
+not promise and did not deliver.
+
+**The input service starved.** Two readings in the same `[deadman]` line say it:
+
+* `hq=` — the `pal::EVENT_QUEUE` depth — **pins at exactly 25 from 101.6 s and never reads anything
+  else again**, for all 481 remaining samples.
+* `hid_ms=` — the age of the most recent HID report — climbs monotonically from 76 ms at 150.4 s to
+  **433 076** at the end of the capture. The last HID report of the session arrived at ~150.3 s.
+  The pad and the keyboard were dead for the final **~7.5 minutes**.
+
+`hq` pinned rather than climbing is itself informative: EVENT_QUEUE's PTRDEAD fold means a relative
+motion report merges into the ring's newest entry when that entry is also relative motion, taking no
+slot. So 79 HID completions in the second at 150.4 s moved `hq` not at all. Twenty-five events are
+stranded in the ring and nothing pops them.
+
+**Why, and it is the design, not a bug in the steal.** `GUI_CHANNEL_X86` has **exactly one
+consumer** — the render service's drain, `gui_try_recv_x86`/`gui_recv_blocking_x86`, both of which
+live inside `x86_render_service`'s loop — and that task was pinned to c1, the core that died. Nothing
+drains the channel again. `x86_input_service` fills the 64 slots, blocks forever in
+`Channel::send`'s `slots.wait()`, and therefore stops calling `pal::next_event()`. EVENT_QUEUE stops
+draining, and `hq=25` is what that looks like from the ISR.
+
+The USB poll underneath keeps running, but it is NOT untouched, and the distinction matters. Its
+rate steps down at the steal and stays down:
+
+| window | samples | median `pmp` | min | max |
+|---|---|---|---|---|
+| pre-wedge steady, `up=20..76` | 57 | **818** | 0 | 1008 |
+| post-steal, `up=88..579` | 492 | **140** | 48 | 396 |
+
+A ~5.8x sustained step, taken at the steal and held for 492 consecutive samples.
+
+**The mechanism is settled and it is NOT scheduler oversubscription** — see *Finding 1 — the `pmp`
+collapse is the pump core becoming the compositor*, below, which supersedes the oversubscription
+guess this paragraph originally carried. In short: `x86_usb_pump`'s own loop body composites on the
+calling core, so once the steal made the gate acquirable, the pump core started running full passes
+instead of being refused at the CAS in nanoseconds. `gate=` names **c7 in 383 of the 492 post-steal
+samples** (88% of those naming any core), and a core inside a pass for 88% of wall-clock runs its
+pump loop at roughly 12% of its rate: 818 x 0.12 is about 98, against a measured median of 140.
+The step is the compositor's cost, charged to the device core.
+
+**What does NOT follow from the step, and is the actual point:** the poll is degraded, not dead. It
+runs at ~140 passes/s for the remaining 510 seconds, which is two orders of magnitude more than
+enough to carry a trackpad at its 1–5 ms report cadence. **The hardware is being asked and is
+answering; the service that carries the answers to the desktop is gone.** A reader who sees the
+5.8x step and concludes "the USB stack fell over" has the wrong defect: at 140 polls/s the pad
+would still work if anything downstream were draining.
+
+> **A number on the shared board was wrong in both directions, and both corrections are recorded
+> here so neither survives.** The original claim was "`pmp` collapses ~990 → ~110" — endpoints
+> picked from extremes rather than from the distribution. The correction offered to it was "the USB
+> poll did not collapse", drawn from whole-window averages that straddle a dip at `up=77..82` and
+> so washed the step out. Both are wrong. The measured answer is the table above: a real step, of
+> 5.8x rather than 9x, that leaves the poll far above the rate the defect would require.
+
+> **A caveat stated rather than buried.** The blocked-in-`send` step is an inference, not a direct
+> reading, because the one instrument that would have shown the channel filling — `[schedx86] depth
+> sent=… recv=… inflight=…` — is emitted **from the consumer side, inside the render loop**, and
+> therefore died with the render task. Its last line in boot 16 is at 82.8 s, before the wedge. That
+> is a **sixth** instance of the absent-instrument law, found while writing this section. The inference
+> rests on three things that *are* on the wire — `hq` pinned with a live `pmp`, the single-consumer
+> structure of the channel, and the same mechanism independently established for boot 11 in
+> [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1.2 — and it should be closed by moving the depth
+> witness off the consumer.
+
+**The general form, which is the most valuable paragraph here.** The framing is orin 3's, carried
+across because it is better than ours and is on the shared board for exactly this reason:
+
+> **A gate steal is a liveness fix that REALLOCATES a starvation rather than removing it.**
+
+It turned *everything dead* into *everything contending*, and the input service is what lost the
+contention. The operator's report on the boot was precise: **"PARTIAL WEDGE INPUT AND ONE VUG WENT
+DEAD."** The dead vug is the designed trade, priced and stated in the commit. The dead input is not —
+it is a second-order effect of taking the gate without re-homing the roles the dead core held alone.
+**Any seat reaching for a gate steal as a remedy should read this section before writing it**, and
+should ask the question this boot answers by counterexample: *which singleton roles live on the core
+I am about to declare dead, and who takes them?*
+
+**Status of the remedy: IN FLIGHT, not landed.** A parallel arc owns un-gating input from the
+compositor and re-homing the dead core's singleton roles. The defect and the diagnosis above are
+settled and measured; the fix is not described here because it does not exist yet.
+
+### The root cause is OPEN, and the discriminator is built and held
+
+**Why does a store into the WC-mapped Kepler BAR1 never retire?** Unanswered. What is known bounds
+it usefully:
+
+* **It is one core, not the bus.** The root port reads clean at every wedge, on every boot:
+  `[pcih] rp-at-wedge lnksta=d081 devsta=0000 secsta=2000 aer=n`. `secsta=2000` is not a new fault —
+  it matches the same boot's `[pcih] rp-boot` latch, which is why that boot-time line exists
+  (§1.3 of [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md)). No AER, no device-status error bits.
+* **The machine stays alive underneath it.** `pmp` keeps ticking, ring-3 vessels keep presenting,
+  serial keeps talking, and — after the steal — seven cores keep compositing at 5 ms a pass.
+* **PRAMIN is excluded.** Those writes go through BAR0; this one is BAR1.
+* **Link training and ASPM are already exonerated** by boots 9 and 11 (see the boot-8 ledger and
+  [`PCIE-RP-RECOVERY.md`](PCIE-RP-RECOVERY.md) §1).
+
+**The next experiment is built, staged and unflown.** `~/unaos-bench/scratch/rmbp4-b17-held/`,
+kernel.elf sha256 `6cef0148…`. It is the *same source tree* as boot 16 — both trees' `SRC.TGZ`
+hash to the identical `a0c44bf6…`, both stamp commit `f66b1480` — with `UNAOS_KEPLER_FIFO` and
+`UNAOS_KEPLER_CE` dropped and nothing else changed. Verified on the bytes, not on the build log:
+the boot-16 kernel carries the feature string `kepler+takeover+fifo+wc+cy` plus one hit each for
+`kepler_ce.rs` and `Starting PFIFO initialization`; the b17 kernel carries `kepler+takeover+wc+cy`
+and **zero** hits for either, while still carrying `GATE STOLEN`.
+
+Its two exits, so whoever flies it knows what each outcome means before booting:
+
+* **It wedges anyway** ⇒ the Kepler engines are exonerated. PFIFO/PBDMA and the copy-engine
+  reconnaissance touch nothing that matters, and the defect is **the bare write-combined store into
+  BAR1**. That is the harder answer and it points at the aperture, the WC drain, or the endpoint's
+  host interface.
+* **It does not wedge** ⇒ found it. Engine initialisation left the GK107 in a state where a BAR1
+  write can be swallowed, and the next rung is bisecting FIFO against CE.
+
+Note what the experiment does *not* settle either way: a non-wedge across one sitting is weak
+evidence against a defect whose onset ranged 33.8–117.7 s across five boots. Fly it to the duration
+of the longest previous survival, not to the first minute.
+
+### The unanswerable-store class — a SHAPE claim, and explicitly not a common-cause claim
+
+Named jointly by the x86 and Jetson tracks, 2026-08-22, and recorded on the shared cross-track
+board:
+
+> **A store into a device aperture that the fabric never completes, with no timeout, no recovery,
+> and — on Orin — no fault. x86 parks forever; Orin RAS'd and powered off. Different fabrics,
+> different endings, same unanswerable store.**
+
+The x86 half is this section. The Orin half is the boot-5c `bg` kill: a wild store that lands in the
+GiB-0 Device-nGnRE identity window, so it does not fault, reaches the fabric, the slave errors, and
+BL31 powers the core off.
+
+**The asymmetry is recorded with the class, not omitted from it.** Orin's store is downstream of a
+**convicted wrong-EL `eret`** — an AP running at EL2 consuming `ELR_EL2` — so its ORIGIN is known
+and ours is not. Same fate, different provenance.
+
+**These two must not be collapsed into one bug.** The value of the class is that it names a failure
+*mode* the tree had no vocabulary for — a store with no completion, no timeout and no fault is
+invisible to every guard we own, on both architectures — and that value evaporates the moment
+someone treats a shared shape as a shared cause and goes looking for one fix. If a common cause is
+ever found, it will be found by evidence, and this line will be the thing it overturns.
+
+## WCSER-STEAL / INPUT-UNGATE / WCSER-REHOME — the steal recovered the panel and abandoned the keyboard (x86, 2026-08-22)
+
+Boots 13–16 (`~/unaos-bench/capture/rmbp4-boot13/`, split by the byte offsets in that directory's
+`BOOT-OFFSETS.md`) wedged the same way four times: core 1 enters `stage_window`'s present blit and
+stops inside ONE store into the Kepler BAR1. Boot 15's ISR-driven row trace is what makes that exact
+rather than inferred — 99 consecutive one-second samples reading `win=9 phase=33 row=897`, the row
+never once advancing. A crawling loop moves; this does not.
+
+WCSER-STEAL (`8e91b952`) declared such a holder dead and took `COMP_GATE` from it. It worked, and
+boot 16 proves it worked: 510 further seconds of live desktop, zero `WEDGED` rollups, `comp_ms` p50
+5 ms. **And boot 16 also proves it was only half a recovery.**
+
+### What boot 16 measured
+
+| t | reading |
+|---|---|
+| 83.8 s | c1 parks in phase 33 (`win=9 row=946`). The render task lives on c1 and dies with it. |
+| 83.8–87.8 s | gate held by the corpse; every composite call is declined instantly. `pmp≈985`. |
+| 87.829 s | `[wcser] GATE STOLEN from c1 by c7 after 4006ms`. |
+| 87.8 s onward | `pmp` steps down and never recovers — median **140** over 492 samples (min 48, max 396), against a pre-wedge median of 818. See the distribution table above; "~110" was an early reading off the extremes. |
+| 97 s | the operator touches the pad; HID flows again. |
+| 97 → 101.6 s | `hq` climbs 2 → 9 → 14 → 24 → **25**. |
+| 101.6–598 s | `hq` pinned at 25, unmoving, for **497 seconds**. `hid_ms` climbs to 433076. |
+
+### Finding 1 — the `pmp` collapse is the pump core becoming the compositor
+
+`pmp` counts `service_ehci_hid()` entries per second, i.e. the `x86_usb_pump` loop's own rate. The
+pump and the input service both run on the SERVICE core (c7); the render task ran on c1.
+
+The pump's loop body calls `wcx::desktop_app_service()` → `wm::pace_service()` and
+`fbcon::console_service()` → `route_present_banded()`, and **both of those composite on the calling
+core**. Before the steal every one of those calls was refused at the `COMP_GATE` compare-exchange in
+nanoseconds, because the corpse held the gate — so the pump free-ran at ~985 passes/s. After the
+steal the gate became acquirable and those same calls started running FULL passes on the device core.
+
+The deadman line settles it without inference. `gate=` is an ISR-sampled reading of who holds the
+gate, and across the 494 post-steal samples it names **c7 in 437 of them (88 %)**; only 6 name any
+other core. `[wcser]` reports `entered≈332` per 5 s (~66 real passes/s) at `held_ms` 0–9. A core
+inside a composite pass 88 % of wall-clock runs its pump loop at ~12 % of its former rate:
+985 × 0.12 ≈ 118, against a measured post-steal mean of 154.
+
+**So it is not scheduler oversubscription. The steal re-homed the compositor onto the one core the
+SCHED-X86 placement rules exist to keep composite work off.** Stated as the general lesson: a steal
+that hands a resource to whoever asks next will hand it to the busiest core in the system, because
+the busiest core asks most often.
+
+### Finding 2 — input was gated behind the compositor by construction
+
+`GUI_CHANNEL_X86` is a 64-slot `Channel` whose **only** consumer is the render task. `Channel::send`
+blocks while full. When the render task died the channel acquired no consumer ever again;
+`x86_input_service` filled the 64 slots and parked in `send` permanently. Because that task is also
+the sole drain of `pal::EVENT_QUEUE`, the ring stopped draining — which is the `hq=25` pinned for 497
+seconds. The desktop repainted the whole time. The keyboard and trackpad were gone the whole time.
+
+Blocking is correct backpressure against a consumer that is SLOW and catastrophic against one that is
+DEAD, and nothing in the compositor's repair addresses it.
+
+### The two-part cure
+
+**INPUT-UNGATE (`arch/x86_64/sched.rs`, `main.rs`).** `Channel::try_send` mirrors `try_recv`'s
+discipline (non-parking `try_wait`, permit taken only on success, `Err(value)` hands the value back
+rather than dropping it). `x86_input_service` never parks on the channel, and decides what to do with
+a refusal per class, because the classes are not equally recoverable:
+
+* **relative `Event::Mouse` — COALESCED, never dropped.** Deltas are additive, so a summed run steers
+  the arrow and any live drag to the identical place. This is `GUI_FOLD_X86`'s consumer-side fold
+  moved to the producer, and it inherits that ledger's conservation rule: a coalesced report is
+  counted in its own term and never netted out of `GUI_SENT_X86`.
+* **`Key` / `KeyUp` / `Button` / `Wheel` / `MouseAbsolute` — MUST SURVIVE.** A refused one is held in
+  one slot and the task **stops taking from `pal::EVENT_QUEUE`**, returning to the top of the loop
+  rather than parking. The ring is the backpressure; it is bounded and its overflow is already
+  counted. Dropping here would trade a visible hang for invisible loss, which looks healthy.
+* **`Event::Timer` — dropped freely.** Loss-tolerant filler by contract; counted anyway.
+
+Order is preserved: owed items retire before anything new is taken, folded motion ahead of the held
+event, and a heartbeat never jumps the queue.
+
+**WCSER-REHOME (`video/wm.rs`, `main.rs`).** `try_send` alone would convert a hang into permanent
+silent input loss, because a non-parking producer facing a channel with no consumer just coalesces
+forever. So the steal now publishes the identity of the core it declared dead (`COMP_DEAD_CORE`, a
+latched mailbox claimed once by `comp_dead_core_take`), and `x86_usb_pump`'s service pass re-spawns
+the render service on a live core. The general statement, which is the fix:
+
+> A core declared dead by the steal has its singleton roles reassigned, and any role that is NOT
+> reassigned is named explicitly as a known-abandoned trade.
+
+For this kernel: **re-homed** — the render service (the `GUI_CHANNEL_X86` drain, the dispatch, the
+present). **Abandoned, and accepted** — the dead core, and the ring-3 window whose present was in
+flight. **Not at risk** — the pump and input service, which share the service core, not the render
+core.
+
+The rescue core comes from `smp::xhci_worker_cpu`, which already excludes both the render and the
+service core — co-locating the render role with the pump is the `XHCI_CONTROLLER` deadlock SCHED-X86
+rule 1 forbids, so a machine with no eligible core DECLINES out loud rather than trading a dead
+channel for a dead machine. A rescue instance skips `open_shell_window`: the dead instance's row is
+still registered and its surface still mapped, so that window composites its last contents and
+nothing types into it — named here rather than left to be discovered.
+
+### Three hazards a naive re-home walks into, and where each is closed
+
+Raised by the aarch64 seat, which hit this class twice; each verified against the x86 tree rather
+than ported.
+
+**1. The corpse never releases its locks.** `arch::x86_64::sched::Mutex` is `{ sem, data }` — a bare
+semaphore permit with **no owner record** — and nothing in task teardown walks a dying task's held
+locks (`reap_killed` handles an explicit `kill`; a core parked on an instruction is never reaped at
+all). A replacement that takes a lock the corpse still holds parks forever: a second freeze, quieter
+than the first, with nothing on the wire. So the census is done before the spawn, not after. At the
+phase-33 blit the corpse holds `COMP_GATE` (stolen, with an identity-checked release) and
+`STAGE[stage_pool_index()]` — which is `meter_current_cpu()`, i.e. **per-core**, so the replacement
+composes into a structurally disjoint entry. It does **not** hold `TABLE`: `composite_inner` takes it
+in a scoped block that yields the row snapshot and drops the guard well before the draw loop, and
+boot 16 confirms it independently — ~66 passes/s completed for the 510 s after the steal, and every
+one of them takes `TABLE`. Nor `WRITER` (copied and dropped on one line), nor the heap lock (the row
+loop allocates nothing). *Known residual:* the corpse's `BlitGuard` is never dropped, so its
+`BLIT_ACTIVE` registration stands for the boot. Nothing waits on that count reaching zero — a raised
+`DRAIN_PENDING` makes a pass SKIP, not block — so it costs a leaked count, not a hang. It predates
+this arc and boot 16 ran 510 s with it standing.
+
+**2. A full channel is not evidence of a dead consumer.** `x86_input_service`'s `SCREEN_APP_ACTIVE`
+arm exists precisely because a full-screen command legitimately owns the panel while the render task
+cannot drain. Inferring death from `sent - recv` depth would fire during ordinary full-screen use and
+give the machine two channel consumers and two present owners — the split-brain `fbcon::detach()`
+exists to prevent. The trigger here is the **steal's own positive declaration about a specific core**
+(`COMP_DEAD_CORE`, claimed once), never a depth inference.
+
+**3. A revenant must retire itself.** `RENDER_ROLE_EPOCH_X86` is bumped once per re-home, ahead of
+the spawn; each instance captures it at entry and re-checks it at the top of every pass. This is
+`comp_gate_release`'s identity check generalised from a *resource* to a *role*. "The dead core never
+comes back" is an observation — boot 16's `dec=` nibble at 0 across 494 samples is evidence, not a
+guarantee that a stuck BAR store cannot eventually retire — and `COMP_REVENANTS` exists because this
+tree already declined to build on it once. A superseded instance **retires rather than returns**:
+`wm` rows hold raw pointers into the render function's locals, so the frame must stay on the stack
+forever; it sleeps out of the way holding nothing.
+
+Related, and verified rather than assumed: `smp::ONLINE_APS` is written once at `start_aps` and
+**never has a core removed**, so a dead core stays a placement candidate forever. Placement is
+therefore explicit — ask `xhci_worker_cpu`, then reject any answer `DEAD_CORES_X86` knows to be a
+corpse. Without that guard the "recovery" could spawn onto the core that just died, silently.
+
+This is deliberately the **one-off fix for the render drain**, the instance actually measured — not a
+general role-migration framework. A general mechanism needs per-role owner epochs, positive liveness
+proof, a way to retire a core from the online set, and an answer for the corpse's locks; that is a
+programme, not this arc.
+
+### The witness, and where it lives
+
+`[deadman]` gains `in=coalesced/declined/timerdrop` and `rh=`. That placement is the point: every
+other x86 instrument is emitted by the render-service pass, so `[schedx86] depth` — the existing
+`GUI_SENT_X86`/`GUI_RECV_X86` ledger — printed nothing at all for the 497 seconds this arc is about.
+The timer ISR is the only emitter proven to survive the wedge.
+
+* `in=0/0/0` — the channel took everything offered. The normal desktop.
+* `in=N/M/T` with `hq` FALLING — the render task is behind but alive; the designed degradation.
+* `in=N/M/T` with `hq` PINNED and `rh=0` — the consumer is GONE and was not re-homed. Boot 16.
+* `rh>0` with `hq` returning to 0 — the recovery completed.
+
+`in=` is drained per second (a rate); `rh=` is standing (a count), so a one-second burst of declines
+cannot be mistaken for a permanent one. `in=`'s middle field counts ATTEMPTS refused, not events
+lost — one owed event is re-offered every ~1 ms pass, so a channel full for a whole second reads near
+the producer's pass rate rather than near the number of events behind it.
+
+### WEDGEINJ — the fault, on demand
+
+The wedge has been observed four times on one machine and never once in QEMU, so both recovery paths
+would otherwise be gated by compilation rather than by execution — which this tree does not accept.
+`UNAOS_WEDGEINJ=1` (feature `wedgeinj`, default off, x86-only, stripped from aarch64 media) arms an
+injected park: at 30 s the render task, on the core `smp::render_cpu()` names, takes `COMP_GATE` the
+way a pass takes it, stamps boot 15's own `phase=33 row=897` gauges, clears IF and spins forever.
+
+**Why it synthesises the held state instead of riding a real pass.** The first version hooked the
+phase-33 blit itself, one call per row — maximum fidelity, and useless, because **the x86 QEMU gate
+composites almost nothing**. Measured on the 60 s leg: `[wcser] scope=live entered=3 … span=12846ms`,
+all three inside the ring-3 window fixtures, and once those tear down at ~14 s the desktop is static
+— `comp_ms` climbs by exactly 1000 every second for the rest of the run, the deadman saying no pass
+has COMPLETED since. There is no window, no damage and no pass at 30 s, so a park that can only fire
+from inside a pass never fires, and the recovery stays as unproven as before the injector existed.
+
+Taking the gate directly reproduces the two properties — and they are the only two — the recovery is
+a function of: the core carrying the render role stops executing permanently, and it is holding
+`COMP_GATE` with `COMP_HOLDER_CORE`/`COMP_HOLD_T0_MS` set, so the steal fires on its own unmodified
+timer. What is NOT reproduced, stated rather than assumed: the stuck store, the half-written window,
+and whatever cache/BAR state the real fault leaves behind. Those are properties of the DEVICE, and
+the recovery reads none of them — it reads the gate, the holder and the clock.
+
+It weakens no protection, adds no path to an unarmed build (the call site is an empty inline shim),
+and costs one AP for the rest of the run by design. **Never arm it on bench media.**
+
+### WCSER-PICK — the steal handed the gate to the worst possible core, and it did so by design
+
+WCSER-STEAL declared a dead holder's gate free and let **the next core to ask** win it. Boot 16
+measured the consequence: `[deadman] gate=` names **c7 in 383 of the 492 post-steal samples** — 88 %
+of those naming any core — and c7 is the **device-service core**, carrying `x86_usb_pump` and
+`x86_input_service`. *Finding 1* above establishes the mechanism; what was never stated is that this
+outcome is **structural, not luck**, and therefore fixable at the acquisition site.
+
+`x86_usb_pump`'s loop body composites on the calling core (`wcx::desktop_app_service` →
+`wm::pace_service`, `fbcon::console_service` → `route_present_banded`). Before the steal every one of
+those calls was refused at the `COMP_GATE` compare-exchange in nanoseconds, because the corpse held
+the gate. After the steal they ran full passes on the device core. The whole 5.8x `pmp` step is the
+compositor's cost, charged to the one core the SCHED-X86 placement rules exist to keep it off.
+
+> **A steal that hands a resource to WHOEVER ASKS NEXT hands it to the BUSIEST core, because the
+> busiest core asks most often.** A free-for-all acquisition is not neutral with respect to
+> placement; it is biased against it, in proportion to exactly the property placement exists to
+> protect.
+
+`main.rs` already published the right answer. `smp::publish_sched_split(render, service)` exists to
+keep composite work off the service core, and `smp` exposes `render_cpu()`/`service_cpu()` so callers
+**ask** rather than re-derive. The steal was the one acquisition site in the compositor that never
+asked. It asks now (`1d04b3df`), and no `smp` or `main.rs` change was needed to make it ask.
+
+**The acquirer cannot literally be chosen, and the shape follows from that.** `composite()` runs *on*
+the acquirer and the acquirer then runs the pass, so the only lever available inside `wm` is whether
+*this* caller is admitted to steal. The preference is therefore a **time-staged admission**, and it
+must be bounded: a preferred core that never calls `composite()` would otherwise hold the desktop
+dead forever.
+
+| rung | admits | from | why it exists |
+|---|---|---|---|
+| `unpublished` | the first asker | the 4 s bound | No split published, so no preference exists and there is nothing to wait for. Mirrors `smp::worker_cpu`'s `PlaceTier::Unpublished`. |
+| `render` | `me == render_cpu()` | the 4 s bound | The placement answer. Composite work belongs on the core the split named for it, and the render service's own channel drain lives there. |
+| `pool` | any core that is neither the corpse nor `service_cpu()` | +1 grace | **The rung that fires on the measured fault.** |
+| `any` | anyone, including the service core | +2 graces | The floor. A desktop on the wrong core still beats a dead desktop — WCSER-STEAL's trade, not reversed — and `pick=any` says so on the wire. |
+
+Two details carry most of the value:
+
+* **Rung `render` is skipped, not waited out, when the corpse IS the render core.** That is not an
+  edge case, it is the only case ever measured: `holder=c1` on boots 11, 13, 14, 15 and 16, against
+  `:: SCHED-X86: RENDER on core 1 … ::` on every one of them. An unsatisfiable rung is answered, not
+  slept on — the same discipline `xhci_worker_cpu` applies when it returns `None` instead of
+  degrading. So the measured fault pays one grace, not two.
+* **Liveness of the acquirer needs no test.** It is `meter_current_cpu()`, so "is the chosen core
+  alive?" is answered by the fact that it is asking. The pre-existing `dead != me` term is the whole
+  of it.
+
+`COMP_STEAL_GRACE_MS` is **250 ms**, sized off a measurement rather than guessed: boot 16's
+`dec=f0ffffff` roster saturates its per-core nibble at `f`, so every core but the corpse arrived at
+the gate at least 15 times a second, and 250 ms is at least three arrivals per candidate *at that
+floor*. Worst case the two graces add 500 ms to a 4 s recovery bound — 12.5 % more frozen glass on a
+panel frozen for four seconds.
+
+**What the QEMU gate can and cannot show.** With `UNAOS_WC=1 UNAOS_DEADMAN=1 UNAOS_WEDGEINJ=1`:
+
+```
+:: [wcser] GATE STOLEN from c1 by c5 after 4251ms — the holder was in phase 33 row 897 and had
+   not moved. The acquirer was CHOSEN, not next in line: pick=any render=1 svc=5; desktop resumes
+   on this core, c1 is DEAD and its singleton roles are owed a re-home == tripwire ::
+```
+
+Read that honestly: `pick=any` is **the fallback firing**, because the x86 QEMU gate composites
+almost nothing and the service core is the only core that asks — the same property WEDGEINJ's own
+ledger records. The picker withheld the gate from the pump for the full 250 ms grace and then handed
+it over rather than leaving the desktop dead, which is correct, and the `4251ms` against
+WCSER-STEAL's `4006ms` is the stated cost appearing on the wire. **QEMU cannot demonstrate the `pool`
+rung; metal can, and boot 16's decline roster says it would have.** That is the reading a metal boot
+should be checked against: `pick=pool` with `pmp` holding near its pre-wedge median is the win this
+arc is claiming.
+
+### WCSER-READER — the two counters that had no reader
+
+`COMP_REVENANTS` and `COMP_STEALS` were incremented from the moment WCSER-STEAL landed and appeared
+on **no serial line anywhere in the tree**. The grep is the whole finding: two declarations, two
+`fetch_add`s, two prose mentions in comments, no reader. Boot 16's operator playbook asked Peter to
+watch `COMP_REVENANTS`, and **he could not have seen it however hard he looked.**
+
+`revenants` is not decoration. It counts cores that came back from the dead and correctly declined to
+release a gate a live core now owns, so a nonzero reading is **news about the device, not about us**:
+a stuck BAR1 store eventually *completed*. WCSER-STEAL's safety argument rests on "the parked core
+never comes back" being an **observation** rather than an invariant, and this field is the only thing
+in the tree that could ever contradict it.
+
+Both are now on the `[wcser]` rollup ahead of `span=`, where `exbusy=` went in and for the same
+reason (`acf5d175`):
+
+```
+[wcser] scope=live entered=3 declined=0 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0
+        steals=0 revenants=0 span=11597ms -> SOLO
+```
+
+**Loaded, never swapped — and not merely because they are boot-cumulative gauges.** `wcser_emit`
+*self-silences* on a period with no compositing. A drained steal counter would therefore be destroyed
+by any silent period following a steal: the steal counted, the rollup declining to print, and the
+swap that never ran leaving the evidence nowhere. Cumulative reading makes the self-silencing
+harmless. The one thing it gives up — which 5 s window a steal fell in — is already carried, with its
+own timestamp, by the `GATE STOLEN == tripwire ::` line.
+
+**A zero is printed, not omitted.** A counter that appears only when nonzero cannot distinguish *"no
+revenants"* from *"the reader is dead"*.
+
+> **The residual, named rather than left to be discovered — and it is a SEVENTH instance of the
+> absent-instrument law.** `[wcser]`'s rollup is paced by **presents, not by passes**: `wcn_tick()`
+> is called only from `present()`, so a desktop that composites without any window presenting emits
+> no rollup at all. The `wedgeinj` gate shows it — one `[wcn] rollup` at 11.7 s and never again,
+> while `[deadman] comp_ms` reads 62–100 ms at `up=41..57`, i.e. passes completing at 10+/s for the
+> whole post-steal half of the run, reported by nothing. So in QEMU the new fields can be shown
+> printing a measured **zero** but not a measured **one**. On metal the reader works — boot 16
+> printed `[wcser] -> SERIAL` rollups continuously for 510 s after its steal at `entered` averaging
+> 261 per 5 s window — so this is QEMU-gate blindness rather than a metal defect. **The
+> structurally stronger home for both counters is the `[deadman]` timer-ISR line**, the one emitter
+> this section has already established survives the wedge; `deadman.rs` was held by a concurrent
+> executor during this arc and the move is owed.
+
+### WCDVALVE-LOOP — the valve measures a quantity that only exists while it is open
+
+Boot 16 flapped the WC-D valve on a ~5.2 s period for the whole pre-wedge session:
+
+```
+[ 40630ms] [wc-d] valve READ util~0% wcd~0% span=51ms close_at=util12%/wcd8% state=CLOSED
+[ 40630ms] [wc-d] valve OPEN resumed suspended=380
+[ 40699ms] [wc-d] valve CLOSED util~7% wcd~12% suspended=1
+```
+
+repeating with `suspended=` 380, 235, 234, 471, 233, 477 — each cycle releasing hundreds of suspended
+admissions and reclosing 43–69 ms later. **The thresholds are not the defect and re-pricing them
+cannot fix it.** Traced through the source rather than inferred from the wire:
+
+1. `wcdvalve_closed() == true` makes `verify_reference` return `None`.
+2. `None` means `wcd_ref` is `None`, so the composite loop's `if let Some(vr)` never calls
+   `verify_window`.
+3. `verify_window`'s `WcdClock` drop guard is the **one and only** `fetch_add` on `C2_WCD_CYC` in the
+   module.
+
+So `wcd` is not measured-zero while CLOSED, it is **unmeasurable**. It is an observable of the
+valve's own open state, not of the load.
+
+**The sharpest statement, and why no threshold fixes it.** Close is `util >= 12 OR wcd >= 8`; reopen
+is `util < 8 AND wcd < 5`. Every closure boot 16 recorded was taken on the `wcd` term alone — `wcd`
+9–29 % while `util` sat at 7–9 %, *below its own 12*. Such a closure has, at the instant it is taken,
+a reopen predicate **already satisfied on every term that remains measurable**, because `util < 8` is
+precisely the condition under which the `util` term declined to close it.
+
+> **A `wcd`-driven closure is self-cancelling by construction.** No pair of numbers changes that: 0
+> is below every positive reopen threshold.
+
+**A second, independent defect set the observed period.** `comp2_emit` swaps both `C2_INSPAN_CYC` and
+`C2_WCD_CYC` to zero and restamps `C2_EPOCH_CYC` every ~5 s; `WCDVALVE_MIN_SPAN_US` then admits a
+judgement 50 ms later — **1 % of the epoch, immediately after a drain that zeroed both numerators.**
+That is why every `valve READ` in the flapping epochs reads `util~0% wcd~0%` at `span=51ms` while the
+same boot's `[comp2]` reports real duty. The reopen was being decided by the rollup drain, which is
+also why the period was the *rollup's* and not the valve's.
+
+**The fix is not to stop the cycle.** A valve that suppresses the very quantity it closes on cannot be
+a level-triggered gate — it can never learn the pressure went away without opening to look. It must
+be a **duty-cycled sampler**: shut for a stated dwell, then a bounded trial open to re-measure. Boot
+16's valve was already doing exactly that, one ~60 ms trial per ~5.2 s, but *by accident*. So the
+cycle is made deliberate rather than removed (`a4e7cd9c`):
+
+* **`wcd` while CLOSED is UNKNOWN.** Dropped from the reopen predicate, where it was a tautology, and
+  printed `wcd~?`, where it was a lie on the wire.
+* **`WCDVALVE_DWELL_US` = 2 s** — the minimum closed dwell, and the load-bearing constant. 30–45x the
+  measured 43–69 ms reclose, and deliberately *not* a divisor or multiple of the ~5 s rollup epoch:
+  the aliasing is what made the old behaviour read as a mysterious 5.2 s cycle, so the two cadences
+  are now tellable apart.
+* **`WCDVALVE_REOPEN_SPAN_US` = 1 s** — a reopen may only be judged on a span old enough to *be* a
+  sample.
+* **`WCDVALVE_WCD_OPEN_PCT` = 5 is deleted**, not kept. A reopen threshold on a quantity that is
+  structurally 0 whenever the valve is shut is not a conservative setting; it is a term that is
+  unconditionally true. It never governed anything and read on the wire as if it did.
+* **The close path is untouched.** Same 50 ms floor, same `util >= 12 OR wcd >= 8`. Both floors err
+  the same way — toward the valve being **shut** — because a shut valve defers a verdict and never
+  drops one.
+
+**The control this must not break, and why it does not.** After ~77.5 s boot 16's valve stayed closed
+through the wedge, which is the experimental refutation of the read-back theory, and a future boot
+must still be able to demonstrate that. It can: that boot read `util~98%` and `util~79%` across the
+wedge, an order of magnitude above `WCDVALVE_OPEN_PCT`, so the reopen fails on the `util` term with
+or without this change, and a dwell can only ever **extend** a closure. The QEMU gate demonstrates
+the same shape directly — `util~68%`, valve closes at 175 ms, never reopens.
+
+**What it costs.** The valve can now reopen *mid-epoch* where before it could only reopen at an epoch
+top. That is the entire cost, bounded by construction: at most one trial per dwell, so the trial rate
+goes from ~1 per 5.2 s to ~1 per ~2.06 s and admitted read-back duty roughly 2.4x, ~1.2 % of wall
+clock to ~2.9 %. Episodes get shorter, so `suspended=` per episode falls below boot 16's 233–477
+range; a harvest keyed to those magnitudes reads differently and is meant to.
+
+**What QEMU cannot show, stated so no one reads the green as more than it is.** QEMU cannot reproduce
+the oscillation: it needs `util` in the 7–9 % band that only a metal desktop produces, and QEMU's
+composite duty is ~68 %. It also cannot print `wcd~?`, because the `[comp2]` epoch only advances from
+the `[wcn]` pump, which needs a window to present — the same blindness §WCSER-READER records. Both new
+witnesses were confirmed present in the artifact by `strings` instead.
+
+> **A standing red on the `wcdvalve` knob, established by A/B and NOT caused by this arc.**
+> `UNAOS_WC=1 UNAOS_WCDVALVE=1 ./arroyo test` fails `[dmgovlp] … adopt_stretch=0/4 -> FAIL`; the
+> same run without the knob reads `adopt_stretch=4/4 -> PASS`. It reproduces identically at the arc
+> baseline `f8210a6a` (diff snapshotted, `git apply -R`, re-run, re-applied — never stashed), so it
+> predates WCDVALVE-LOOP. Mechanism, partially known: arming the valve suppresses `verify_window`
+> from 175 ms onward and the CURSTICK stretch stops carrying, but `CUR3_TAKEN` moves in
+> `note_cursor_overlay` from `stage_window`, so the coupling is **indirect** and is its own arc. Two
+> acceptable outcomes there: the fixture is legitimately incompatible with a suppressed read-back
+> and should SKIP with a stated reason rather than FAIL, or the valve is suppressing something the
+> compositor's correctness depends on — which would be far more interesting. Decide by evidence, not
+> by relaxing the threshold.

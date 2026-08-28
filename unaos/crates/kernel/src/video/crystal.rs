@@ -289,6 +289,17 @@ const OUT_OPEN: u8 = 1;
 const OUT_PICK: u8 = 2;
 const OUT_KEPT: u8 = 3;
 const OUT_DISMISS: u8 = 4;
+// ARC D M1 — **THE CLICK-HOLD DUPLICATE GUARD IS GONE FROM THIS FILE.** `ACTED_GEN`, `OUT_DUP` and
+// the `dup-hold` outcome word existed because the input path could deliver TWO press edges for one
+// physical click: `ehci::note_buttons`'s quiet-gap arm manufactured a press out of a drifting hold,
+// and the x86 router's stale-latch arm routed it. This menu was the only press target where that was
+// visible — every other one is idempotent, while a TOGGLE opened and immediately closed, "1 click to
+// activate and 1 to open" (bench, 2026-08-18).
+//
+// The producer now guarantees one press edge per gesture (motion discriminates a drift from a
+// re-landed finger, and a recovered press synthesises its own missing release first), so a second
+// edge inside one hold cannot be produced and this guard could never fire again. A guard that cannot
+// fire is not protection, it is a claim that the bug is still there — so it comes out with the bug.
 
 /// CLOBBER-REPAIR (PA41) — passes in which a window the compositor painted had intersected the rows
 /// the OPEN dropdown last painted. The bar's and the dock's counter, on the same terms; `clob=` on the
@@ -458,15 +469,25 @@ fn menu_contains(r: strip::Rect, px: usize, py: usize) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Open the menu. Idempotent: opening an open menu is a no-op that neither re-counts nor repaints.
+/// Fixture-direct callers come through here; the live press arm calls [`open_via`] so the witness
+/// names WHERE in the press cell the click landed.
 fn open(pw: usize, ph: usize) {
+    open_via(pw, ph, "fixture-direct");
+}
+
+/// [`open`], with the press's provenance on the wire. FITTS-CORNER: the open line's `via=` word says
+/// whether the consumed press hit the painted glyph itself (`crystal-glyph`), the widened corner
+/// cell around it (`corner-zone` — the new pixels this arc claims, so a capture can tell a flick
+/// into the corner from an aimed click), or no press at all (`fixture-direct`).
+fn open_via(pw: usize, ph: usize, via: &str) {
     if OPEN.swap(true, Ordering::AcqRel) {
         return;
     }
     OPENS.fetch_add(1, Ordering::Relaxed);
     let (mw, mh, mx, my) = menu_rect(pw, ph).map(|(x, y, w, h)| (w, h, x, y)).unwrap_or((0, 0, 0, 0));
     serial_println!(
-        ":: SHARD-MENU: crystal_press=open menu={}x{}+{}+{} items={} ::",
-        mw, mh, mx, my, ITEM_COUNT
+        ":: SHARD-MENU: crystal_press=open via={} menu={}x{}+{}+{} items={} ::",
+        via, mw, mh, mx, my, ITEM_COUNT
     );
     // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
     // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
@@ -603,12 +624,13 @@ fn fire(verb: Verb) {
 ///  * **menu OPEN, press on an item** — pick it: fire the action and dismiss. Consumed.
 ///  * **menu OPEN, press inside on a separator/border/padding** — consumed, menu stays open.
 ///  * **menu OPEN, press outside** — dismiss (a first click outside a menu closes it). Consumed.
-///  * **menu CLOSED, press on the crystal box** — open. Consumed.
+///  * **menu CLOSED, press in the corner cell** — open. Consumed. FITTS-CORNER: the cell is the
+///    bar's whole upper-left corner ([`menubar::crystal_corner_abs`]), not just the painted glyph.
 ///  * **menu CLOSED, press elsewhere** — not ours; `false`, so the dock and window arms get their say.
 ///
 /// Judged before the dock and window arms because an open dropdown is a modal surface composited on
-/// top of everything; when closed, the only point it claims is the crystal box in the bar, which the
-/// bar owns anyway (the bar composites above the windows).
+/// top of everything; when closed, the only points it claims lie inside the bar's corner cell, which
+/// the bar owns anyway (the bar composites above the windows).
 pub fn press_at(x: i32, y: i32) -> bool {
     if x < 0 || y < 0 {
         return false;
@@ -622,6 +644,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
         (fb.width(), fb.height())
     };
 
+    // ARC D M1 — every press that reaches this function is a press. The duplicate guard that used
+    // to stand here (a release-generation comparison against the live hold) is gone: the input
+    // producer no longer emits two edges for one click. See the section above the constants.
     if OPEN.load(Ordering::Acquire) {
         if let Some(r) = menu_rect(pw, ph) {
             if menu_contains(r, px, py) {
@@ -654,11 +679,20 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true;
     }
 
-    // Closed: the only press we own is one on the crystal box itself.
-    if let Some((cx, cy, cw, ch)) = menubar::crystal_box_abs(pw, ph) {
-        if px >= cx && px < cx + cw && py >= cy && py < cy + ch {
+    // Closed: the press cell we own is the bar's whole upper-left corner — FITTS-CORNER
+    // ([`menubar::crystal_corner_abs`]): the crystal's full left slot (glyph plus both PAD margins)
+    // by the bar's full height, anchored at the bar's origin so panel pixel (0,0) opens the menu
+    // with zero aim. Every pixel of the cell is bar chrome composited above the windows, so this
+    // claims nothing a window's own chrome could own; the DROPDOWN still anchors to
+    // `crystal_box_abs`, the painted glyph, unchanged.
+    if let Some((zx, zy, zw, zh)) = menubar::crystal_corner_abs(pw, ph) {
+        if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
+            // The witness's `via=` word: on the painted glyph itself, or in the widened cell.
+            let on_glyph = menubar::crystal_box_abs(pw, ph)
+                .map(|(cx, cy, cw, ch)| px >= cx && px < cx + cw && py >= cy && py < cy + ch)
+                .unwrap_or(false);
             PRESS_OUTCOME.store(OUT_OPEN, Ordering::Relaxed);
-            open(pw, ph);
+            open_via(pw, ph, if on_glyph { "crystal-glyph" } else { "corner-zone" });
             return true;
         }
     }
@@ -724,12 +758,23 @@ fn repaint_vacated(r: strip::Rect) {
 pub fn compose() -> bool {
     if !OPEN.load(Ordering::Relaxed) {
         // Closed. Owe the pixels of a menu just dismissed, once — and hand them back to their OWNERS.
+        //
+        // CRYSTAL-DISMISS (metal boot 8 review) — the ERASE lands before the slot is cleared, not
+        // after. `strip::erase_rect` can DECLINE (a contended scratch under storm load, a surface
+        // that is not ready), and clearing first turned that decline into a silent loss: the slot
+        // read empty, [`paint_owed`] answered "nothing owed", and the dismissed dropdown's pixels
+        // stood on the glass with no pass ever coming back for them — the state machine right and
+        // the glass wrong, the mirror image of the boot-8 leak. Keeping the slot until the erase
+        // has PAINTED keeps the debt visible: `paint_owed` stays true, and the gate holder's re-run
+        // loop / the next composite retries the erase.
         if SLOT.packed() != 0 {
             let r = SLOT.rect();
+            if !strip::erase_rect(r) {
+                return false; // erase declined: still owed, still in the slot — the next pass retries
+            }
             SLOT.clear();
-            let painted = strip::erase_rect(r);
             repaint_vacated(r);
-            return painted;
+            return true;
         }
         return false;
     }
@@ -757,13 +802,17 @@ pub fn compose() -> bool {
     );
 
     // The menu cannot be placed on this panel (too small) — erase anything we owed and stand down.
+    // CRYSTAL-DISMISS — erase-then-clear, as on the dismissed path above and for the same reason: a
+    // declined erase must stay owed, not be silently forgotten with its pixels still on the glass.
     let Some(r) = rect else {
         if SLOT.packed() != 0 {
             let old = SLOT.rect();
+            if !strip::erase_rect(old) {
+                return false;
+            }
             SLOT.clear();
-            let painted = strip::erase_rect(old);
             repaint_vacated(old);
-            return painted;
+            return true;
         }
         return false;
     };
@@ -809,6 +858,12 @@ pub fn compose() -> bool {
 /// integer compares rather than a scan over every label at every pixel.
 fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
     let (_mx, _my, w, h) = r;
+    // MENU-UNDER load-bearing palette fact (review, 2026-08-18): no colour this function emits may
+    // be pure white 0x00FF_FFFF — that is the sprite's FILL, and `cursor::undraw_locked`'s colour
+    // guard is what stops a stale save-under from stamping over a menu that opened mid-pass
+    // (the open-direction residual the MENU-UNDER decline cannot see). CHROME_FACE, FRAME_LINE and
+    // the blended label text all differ from FILL today; a future theme edit that puts 0xFFFFFF in
+    // the dropdown (BEVEL_LIGHT / GLOSS_HIGHLIGHT are both pure white) re-opens a one-pixel stamp.
 
     // The whole-row base: keyline on the top and bottom border rows, menu face elsewhere.
     let base = if j < BORDER || j + 1 > h - BORDER {
@@ -888,7 +943,8 @@ pub fn rollup(scope: &str) {
 ///
 /// 1. **closed by default** — `OPEN` is observed `false` before the fixture touches it.
 /// 2. **a crystal press OPENS** — with the bar enabled, a press at the crystal box centre opens the
-///    menu and [`menu_rect`] is placeable.
+///    menu and [`menu_rect`] is placeable. And FITTS-CORNER: a press at panel pixel `(0,0)` — the
+///    zero-aim corner flick, a MISS before the corner cell existed — opens it too.
 /// 3. **every item resolves to its verb** — [`item_at`] at each item row's centre answers About,
 ///    Sleep, Restart, Shut Down in tree order. This is the leg that proves Shut Down is REACHABLE as
 ///    a pick, and it does so WITHOUT firing it — the whole guard.
@@ -931,6 +987,13 @@ pub fn selftest() {
         }
         None => false,
     };
+    // Leg 2b — FITTS-CORNER: panel pixel (0,0), the zero-aim flick target, opens too. This is the
+    // corner principle asserted at its extreme point, not a sample inside the glyph: (0,0) was a MISS
+    // before the corner cell existed. Dismiss first so the press is judged by the CLOSED arm; the
+    // reopened menu is exactly the state leg 3 wants.
+    dismiss("corner-leg");
+    let corner_ok = press_at(0, 0) && OPEN.load(Ordering::Acquire);
+
     let mr = menu_rect(pw, ph);
     let placed = mr.is_some();
 
@@ -1025,6 +1088,7 @@ pub fn selftest() {
     let (rw, rh, rx, ry) = mr.map(|(x, y, w, h)| (w, h, x, y)).unwrap_or((0, 0, 0, 0));
     let ok = start_closed
         && opened
+        && corner_ok
         && placed
         && resolve_ok
         && pick_ok
@@ -1033,9 +1097,9 @@ pub fn selftest() {
         && menu_occ_ok;
     serial_println!(
         ":: CRYSTAL-MENU: menu={}x{}+{}+{} panel={}x{} items={} start_closed={} opened={} \
-         placed={} resolve={} pick={} outside={} escape={} menu_occ={} :: {} ::",
+         corner={} placed={} resolve={} pick={} outside={} escape={} menu_occ={} :: {} ::",
         rw, rh, rx, ry, pw, ph, ITEM_COUNT,
-        start_closed, opened, placed, resolve_ok, pick_ok, outside_ok, esc_ok, menu_occ_ok,
+        start_closed, opened, corner_ok, placed, resolve_ok, pick_ok, outside_ok, esc_ok, menu_occ_ok,
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");

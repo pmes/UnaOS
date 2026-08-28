@@ -29,8 +29,19 @@ pub enum Event {
     KeyUp(u8),
     Mouse { x: i32, y: i32 },
     MouseAbsolute { x: i32, y: i32 },
-    /// CLICK-1: a pointer button-DOWN edge (payload = the report's button bitmask, bit 0 = primary).
-    /// Emitted once per press by the HID decoders (edge-detected there); release emits nothing.
+    /// CLICK-1 / GUI-CLICK-2 / HID-KEYS: a pointer button EDGE — BOTH directions. Payload is the report's CURRENT
+    /// button bitmask (bit 0 = primary), so a press carries the newly-set bit and the matching
+    /// release carries the mask with that bit cleared, usually 0.
+    ///
+    /// The HID decoders (xhci, ehci) edge-detect against the previous report's mask and emit on any
+    /// CHANGE; an unchanged mask — a held button — does not re-fire. HID-KEYS added the release edge
+    /// the press-only decode used to swallow, so the doc that said "release emits nothing" no longer
+    /// describes any path.
+    ///
+    /// Press-only consumers stay correct without a change: they test the mask (`m & 0x01 != 0`) and
+    /// fall through on the release. Held-state and drag consumers pair the two edges — see
+    /// `pal::cursor`'s drag seam and `CLICK1_PREV_MASK`, which does its OWN press-edge filtering on
+    /// the consumer side precisely because this event is now both edges.
     Button(u8),
     /// WHEEL: one scroll-wheel report, carrying the HID boot-mouse wheel byte as a SIGNED delta —
     /// POSITIVE is scroll-up / away from the user, negative is scroll-down. This is a DELTA, not an
@@ -319,6 +330,13 @@ pub mod cursor {
 
     /// DRAGREL — publish the primary button's CURRENT level. Called from every pointer report,
     /// pressed or not, edge or no edge.
+    // ARC D M1 — **THE RELEASE GENERATION IS GONE.** `BUTTON_UP_GEN` counted down -> up transitions
+    // so a consumer could tell "a new press" from "the same press, re-reported" — a question only
+    // worth asking because the input path could re-report one. It cannot any more: the quiet-gap
+    // recovery in `ehci::note_buttons` fires only on a MOTIONLESS report and synthesises the missing
+    // release before it re-opens, and the x86 router's stale-latch arm is deleted. Its one consumer
+    // (`video::crystal`'s CLICK-HOLD guard) went with it. The LEVEL below stays — the drag belt
+    // reads it, and that is a different question.
     pub fn set_button_level(down: bool) {
         BUTTON_DOWN.store(down, Ordering::Relaxed);
     }
@@ -398,6 +416,16 @@ pub mod cursor {
 
     static SAVED: Mutex<Saved> =
         Mutex::new(Saved { valid: false, x: 0, y: 0, w: 0, h: 0, px: [0; SAVE_SPAN * SAVE_SPAN] });
+
+    /// VUGRAS: the `[lo, hi)` byte span of the cursor save-under pixel stash (`SAVED.px`, a static in
+    /// kernel .bss — NOT heap). The RAS localizer names it in the decode table so a fault ADDR inside
+    /// it is attributable to the cursor stash write rather than a heap store. The lock is taken only to
+    /// read the buffer's address; the address itself is stable for the life of the kernel.
+    pub fn saved_pa() -> (usize, usize) {
+        let s = SAVED.lock();
+        let lo = s.px.as_ptr() as usize;
+        (lo, lo + core::mem::size_of_val(&s.px))
+    }
 
     /// Restore the pixels stashed under the sprite (the trail-free replacement for the old
     /// flat-color `erase`). No-op when nothing is stashed. Call before moving the position and
@@ -763,6 +791,15 @@ impl EventQueue {
         if next != self.tail {
             self.buffer[self.head] = event;
             self.head = next;
+            // GHOST-DRAG — the IN-RING release census, maintained on the ring PRIMITIVES (see
+            // [`RELEASE_EDGE_IN_RING`]). Here rather than in `push_locked` so it is symmetric with
+            // `pop` by construction: the re-circulation seam (`peek_event_uncounted` /
+            // `requeue_event`) bypasses `push_locked` entirely, and a census that missed its
+            // re-pushes would drift to zero under a full-screen app's ~250/s peek loop and silently
+            // disarm the guard.
+            if matches!(event, Event::Button(m) if m & 0x01 == 0) {
+                RELEASE_EDGE_IN_RING.fetch_add(1, core::sync::atomic::Ordering::Release);
+            }
             true
         } else {
             false
@@ -774,6 +811,16 @@ impl EventQueue {
         } else {
             let event = self.buffer[self.tail];
             self.tail = (self.tail + 1) % QUEUE_SIZE;
+            // GHOST-DRAG — the edge has LEFT the ring. Saturating for the same reason
+            // `note_release_edge_drained` is: the census must never be able to wrap under a
+            // consumer that took an entry by some path this ring did not hand out.
+            if matches!(event, Event::Button(m) if m & 0x01 == 0) {
+                let _ = RELEASE_EDGE_IN_RING.fetch_update(
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Acquire,
+                    |n| Some(n.saturating_sub(1)),
+                );
+            }
             Some(event)
         }
     }
@@ -781,6 +828,51 @@ impl EventQueue {
     /// because 2^bits ≡ 0 (mod QUEUE_SIZE) makes the wrapping subtraction agree with the true difference.
     fn len(&self) -> usize {
         self.head.wrapping_sub(self.tail) % QUEUE_SIZE
+    }
+
+    /// PTRDEAD — **fold a RELATIVE motion into the ring's newest entry when that entry is also a
+    /// relative motion.** Returns `true` when it was folded (no slot taken).
+    ///
+    /// Relative pointer deltas are ADDITIVE: `Mouse{a}` then `Mouse{b}` moves the cursor exactly as
+    /// far as one `Mouse{a+b}`, because the only consumer of either is `cursor::move_rel`, which
+    /// adds. So a BACKLOG of relative motion is compressible without losing a pixel — and it is the
+    /// backlog, not the report rate, that the operator feels.
+    ///
+    /// **Why it exists — metal, boot 10, the post-drop dead zone.** The x86 pointer pipeline is
+    /// EHCI -> this ring -> `GUI_CHANNEL_X86` -> the render service, and the render service is where
+    /// every queued motion is charged a full `wc_route_event` + witness line + `wc_route_tail`. At a
+    /// drop that core stalls for the length of the drop's own witness burst (`[dragrel]` + `[drag]` +
+    /// `[drag-occ]` + `[dropwake]`, and a five-second `[cursor*]` rollup if one lands there); the pad
+    /// keeps reporting at ~125 Hz; and when the core comes back it REPLAYS the backlog one event at a
+    /// time, each costing another line on the wire. The arrow then crawls along a path the hand left
+    /// long ago — which is what "the cursor is frozen for the first fifth of the pad" is: not lost
+    /// travel, a queue being walked. Folding the backlog into ONE entry makes the catch-up a single
+    /// `move_rel` to where the hand actually is.
+    ///
+    /// It also removes the only way relative travel can be LOST outright: a ring that fills
+    /// (`EVQ_DROP_PTR`) throws away deltas nothing can reconstruct. Motion that folds cannot fill it.
+    ///
+    /// **Only the NEWEST entry, and only `Event::Mouse`.** Anything else in front of it (a `Button`,
+    /// a key, an absolute report) blocks the fold, so no event ever crosses another and the order the
+    /// ring hands back is the order it took in. `MouseAbsolute` is deliberately NOT folded: absolute
+    /// positions are not additive, and the QEMU fixtures that assert exact resting coordinates drive
+    /// that variant.
+    ///
+    /// `saturating_add` because the fold is unbounded in principle — a long enough stall could sum
+    /// past `i32`, and a wrapped delta would throw the arrow across the panel.
+    fn coalesce_relative_motion(&mut self, dx: i32, dy: i32) -> bool {
+        if self.head == self.tail {
+            return false; // empty ring: nothing to fold into
+        }
+        let last = (self.head + QUEUE_SIZE - 1) % QUEUE_SIZE;
+        if let Event::Mouse { x, y } = self.buffer[last] {
+            self.buffer[last] = Event::Mouse {
+                x: x.saturating_add(dx),
+                y: y.saturating_add(dy),
+            };
+            return true;
+        }
+        false
     }
 
     /// DRAGGLIDE — put the just-pushed release BUTTON ahead of the MOTION immediately behind it.
@@ -866,6 +958,22 @@ static EVQ_DROP_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 static EVQ_DROP_KEY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Events successfully popped by ANY consumer (the router drain, a user focus discard, `pump_and_poll`, …).
 static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// PTRDEAD — relative-motion reports FOLDED into the ring's newest entry rather than given a slot
+/// of their own (see [`EventQueue::coalesce_relative_motion`]).
+///
+/// Deliberately NOT counted in `EVQ_PUSH_PTR`, and the reason is the conservation law: `push - drop
+/// - pop` is read as the live ring OCCUPANCY, and a folded report never becomes an entry, so
+/// counting it as a push would drift that reading permanently high — exactly the hole
+/// `note_uncounted_discard` exists to keep out of the ledger. It gets its own term instead, which is
+/// also the one that answers the operator's question: a nonzero reading means the drain fell behind
+/// the pad and the arrow was handed the whole backlog at once instead of walking it.
+static EVQ_COALESCE_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRDEAD — relative-motion reports folded into a queued motion instead of taking a ring slot
+/// (see [`EVQ_COALESCE_PTR`]). Monotonic; 0 on a boot where the drain never fell behind the pad.
+pub fn pointer_motion_coalesced() -> u64 {
+    EVQ_COALESCE_PTR.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// UVUG-10 — `(push_ptr, push_key, drop_ptr, drop_key, pop)`. Read by the router's `[uvug10] evq` witness.
 pub fn event_queue_stats() -> (u64, u64, u64, u64, u64) {
@@ -908,6 +1016,9 @@ static RELEASE_EDGES_PENDING: core::sync::atomic::AtomicU32 = core::sync::atomic
 /// grace and ending it `level-late`. Tracking the primary transition here, in the producer, makes
 /// the count and the consumption the same event by construction.
 static PREV_BTN_MASK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// GHOST-DRAG — release `Button` entries currently in the ring (see [`release_edge_in_ring`]).
+static RELEASE_EDGE_IN_RING: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// DRAGGLIDE — **the lift motion must not be drained BEFORE the release edge it belongs to.**
 ///
@@ -978,6 +1089,38 @@ pub fn release_edge_pending() -> u32 {
     RELEASE_EDGES_PENDING.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// GHOST-DRAG — **release `Button` entries physically PRESENT IN THE RING right now.**
+///
+/// [`RELEASE_EDGES_PENDING`] counts an edge from its push until a ROUTER routes it
+/// (`note_release_edge_drained`, called from `wc_click_route_at`'s release arm). Between the POP and
+/// that route the edge is out of the ring but still counted — and that gap is not theoretical on this
+/// arch. Both x86 drains (the BSP GUI loop and the SCHED-X86 render service) pop from this one ring
+/// and popping is serialised while ROUTING is not, exactly as [`RELEASE_EDGE_REORDERED`]'s
+/// `DRAG_LAST_LEAD` note in `syscall.rs` describes: consumer A pops the release edge, consumer B pops
+/// the motion BEHIND it, and B routes its motion first — reading `pend != 0` and concluding, wrongly,
+/// that its motion was produced before the release.
+///
+/// That wrong conclusion is GHOST-DRAG. The drag tail's lead-motion branch steers with a motion whose
+/// button level reads UP on the strength of `pend`, and the strength of `pend` is a FIFO argument:
+/// "the edge is still queued behind me, so I was pushed before it." The argument is sound only while
+/// the edge is still IN THE RING. Once it has been popped, a motion popped after it was pushed after
+/// it — post-release hand travel — and steering with it drags the window along behind the pointer
+/// after the hand let go.
+///
+/// So this is the census the FIFO argument actually needs, and the drag tail takes it in conjunction
+/// with `pend` rather than in place of it: `pend` still says an edge is unaccounted for, and this
+/// says the edge is still ahead of nothing that has been popped. Maintained on `EventQueue::push` /
+/// `EventQueue::pop` — the ring primitives themselves — so the re-circulation peek balances
+/// automatically and no producer or consumer can be added that forgets it.
+///
+/// Deliberately COARSER than `RELEASE_EDGES_PENDING`: it counts any `Button` whose primary bit is
+/// clear, not only a primary 1 -> 0 transition, because the ring primitive has no mask history to
+/// consult. Coarser is the safe direction under a conjunction — it can only ever leave the existing
+/// `pend` test in charge, never overrule it.
+pub fn release_edge_in_ring() -> u32 {
+    RELEASE_EDGE_IN_RING.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// DRAGGLIDE — whether the LIVE gesture's release edge was reordered ahead of its own lift motion
 /// (see [`RELEASE_EDGE_REORDERED`]). Cleared by the next primary PRESS, so it reads per gesture.
 pub fn release_edge_reordered() -> bool {
@@ -1022,13 +1165,38 @@ enum LiftHint {
 ///
 /// DRAGGLIDE — the REORDER joins them, and it must: it reads the two newest ring entries and the
 /// push-adjacency record, both of which a concurrent producer would move under it.
-fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint) -> bool {
+///
+/// PTRDEAD — `coalesce` says this push MAY be folded into a queued relative motion (see
+/// [`EventQueue::coalesce_relative_motion`]). It is a parameter and not a property of the event
+/// because the decision belongs to the CALLER's shape, not to the event's type: only a motion-ONLY
+/// pointer report may fold. A motion pushed as half of a paired report must keep its own slot, or
+/// the DRAGGLIDE reorder would hoist the release edge over travel from EARLIER reports as well as
+/// over its own lift and end the drag short; and `push_event`'s callers (the boot selftests, the
+/// typematic injector, any synthesiser) keep the exact shape they had before this arc.
+fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let is_ptr = matches!(
         event,
         Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_) | Event::Wheel(_)
     );
     let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
+    // PTRDEAD — the fold, taken BEFORE the push accounting so a folded report is never counted as an
+    // entry that exists (see [`EVQ_COALESCE_PTR`] for the conservation argument). The adjacency
+    // record is still advanced: the newest ring entry is still a motion, and it is still the one an
+    // `Unknown`-hinted `Button` pushed next would have to get in front of, so the sequence and the
+    // stamp must describe THIS push or the heuristic would judge against a stale one.
+    if coalesce {
+        if let Event::Mouse { x, y } = event {
+            if q.coalesce_relative_motion(x, y) {
+                EVQ_COALESCE_PTR.fetch_add(1, Relaxed);
+                let seq = PUSH_SEQ.fetch_add(1, Relaxed);
+                MOTION_SEQ.store(seq, Relaxed);
+                MOTION_MS.store(crate::arch::ms(), Relaxed);
+                crate::rtwit::note_input_enqueued();
+                return true;
+            }
+        }
+    }
     if is_ptr {
         EVQ_PUSH_PTR.fetch_add(1, Relaxed);
     } else if is_key {
@@ -1116,7 +1284,10 @@ pub fn push_event(event: Event) {
         // release), timing the acquire→release critical section (the push plus the DRAGGLIDE reorder
         // under `push_locked`). No-op inline shim when `rtwit` is off; no change to lock semantics.
         let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
-        push_locked(&mut q, event, LiftHint::Unknown);
+        // PTRDEAD — `coalesce: false`. This is the generic seam (selftests, synthesisers, any
+        // producer that is not a decoded pointer report); it keeps the exact one-event-one-slot shape
+        // it had before the fold existed, so no fixture's event count moves.
+        push_locked(&mut q, event, LiftHint::Unknown, false);
     });
 }
 
@@ -1144,24 +1315,39 @@ pub fn push_event(event: Event) {
 pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
     match (motion, button) {
         (None, None) => {}
-        (Some(m), None) => push_event(m),
+        // PTRDEAD — a motion-ONLY report is the one shape that may FOLD into a queued relative
+        // motion. Nothing is behind it that a later edge has to be told apart from it, so summing it
+        // into the entry in front changes neither order nor total travel — and it is the shape the
+        // pad emits between the edges of a gesture, i.e. the whole backlog.
+        (Some(m), None) => crate::arch::without_interrupts(|| {
+            let mut q = EVENT_QUEUE.lock();
+            // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
+            let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+            push_locked(&mut q, m, LiftHint::Unknown, true);
+        }),
         (None, Some(b)) => crate::arch::without_interrupts(|| {
             let mut q = EVENT_QUEUE.lock();
             // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
             let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
-            push_locked(&mut q, b, LiftHint::NoLift);
+            push_locked(&mut q, b, LiftHint::NoLift, false);
         }),
         (Some(m), Some(b)) => crate::arch::without_interrupts(|| {
             let mut q = EVENT_QUEUE.lock();
             // R0 / rtwit — EVENT_QUEUE max-hold (see `push_event`).
             let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
             // A lift the ring DROPPED is not behind the edge, so the pairing claim dies with it.
-            let hint = if push_locked(&mut q, m, LiftHint::Unknown) {
+            //
+            // PTRDEAD — `coalesce: false`, and it is load-bearing. This motion is the release
+            // report's own LIFT, and the reorder below is about to put the edge in FRONT of it
+            // precisely so the lift cannot steer. Folded into an earlier motion the two would be one
+            // entry, and hoisting the edge over it would carry pre-release hand travel behind the
+            // edge as well — the drag would end short, which is the glide DRAGGLIDE removed.
+            let hint = if push_locked(&mut q, m, LiftHint::Unknown, false) {
                 LiftHint::Paired
             } else {
                 LiftHint::NoLift
             };
-            push_locked(&mut q, b, hint);
+            push_locked(&mut q, b, hint, false);
         }),
     }
 }
@@ -1183,7 +1369,7 @@ pub fn push_pointer_report(motion: Option<Event>, button: Option<Event>) {
 // These three counters separate those cases at a glance. They are plain relaxed atomics on a path
 // that already does MMIO and DMA, bumped only when a wheel is actually in play (`note_decoded` is
 // called for nonzero deltas only), so an idle boot and a boot with no wheel at all pay nothing. The
-// PRINTING is knob-gated at the call site (`pidesk`); the COUNTING is unconditional, so a metal
+// PRINTING is knob-gated at the call site (`desktop_firmware`); the COUNTING is unconditional, so a metal
 // capture can read the census from any build that can reach a witness.
 
 /// Nonzero wheel deltas decoded out of HID pointer reports since boot.
@@ -1974,15 +2160,43 @@ impl<'a> GneissPal for TargetPal<'a> {
     ///
     /// Nothing is left unbracketed. `self.surface` is a [`crate::video::screen::Screen`] for every
     /// construction of this type on every target, so `flush` is always the CURSOR-13 body; and that
-    /// body closes UNCONDITIONALLY with a cursor draw, before the composite, so a present that
+    /// body closed UNCONDITIONALLY with a cursor draw, before the composite, so a present that
     /// composites nothing at all (`wm::service_damage` early-returns on an undamaged table) still
     /// leaves the arrow on glass. The function is now arch-neutral in shape as well as in effect.
+    /// (FLICKER-3, below, made that close CONDITIONAL. The conclusion is unchanged and the argument
+    /// for it is not; read the next section before relying on the word "unconditionally" here.)
     ///
-    /// FLICKER-3 — the closing verb is `repaint()` when the bracket was taken and `ensure_drawn()`
-    /// when it was skipped, because the bracket itself is now gated on the present's damage
-    /// actually meeting the sprite. The guarantee this paragraph asserts is unchanged — both verbs
-    /// leave the arrow on glass — and `ensure_drawn` is the cheaper of the two precisely on the
-    /// path where nothing disturbed the sprite. See `Screen::flush`.
+    /// FLICKER-3 — the bracket is now GATED on the present's damage actually meeting the sprite
+    /// ([`crate::video::screen::Screen::flush`] asks `bracket_needed` first), so `flush` does NOT
+    /// close with a cursor verb on every path: it calls `repaint()` when the bracket was taken and
+    /// nothing at all when it was skipped. The guarantee the paragraph above asserts survives that,
+    /// but it is now carried by the GATE rather than by a closing verb. `bracket_needed` returns
+    /// `true` for every class in which the arrow could be off the panel — `cursor::sprite_box()`
+    /// answers `None` unless `sp.drawn`, and a lapsed `pal::cursor::visible()` is its own arm — so
+    /// the skip is reachable only for a sprite that is already drawn and visible with every damage
+    /// rect (and, since BRACKETQ, every queued present rect) disjoint from its box. A skipped
+    /// bracket leaves an arrow that was never taken down.
+    ///
+    /// An `ensure_drawn()` on that skip path would be dead code rather than insurance, and it is
+    /// worth writing down why, because the absence looks like an omission. `ensure_drawn` returns
+    /// immediately while `sp.drawn` holds — which is precisely the state the skip is conditioned on
+    /// — and `drawn` stays true even through the one race the gate can lose: a desktop blit that
+    /// lands on a sprite which moved into the damage after the decision overwrites the arrow's
+    /// pixels without clearing the flag. That race is a MISSED BRACKET, repaired by widening the
+    /// predicate, not by adding a tail; see BRACKETQ (`80b9aab0`), which taught `bracket_needed` to
+    /// peek `PRESENT_RECTS`, and `cursor::note_desktop_over_sprite`, which counts the residue and
+    /// deliberately arms no repair. `wm`'s composite tail keeps its `ensure_drawn` on the false
+    /// branch for the opposite reason: `wm::erase` clears `drawn` there, so that branch really can
+    /// owe a draw.
+    ///
+    /// The history, because this paragraph used to claim the opposite and a reader is owed the
+    /// reason. Two FLICKER-3 implementations existed. The x86 lift (`46f8f37e`) gated on
+    /// `Screen::damage_meets`, treated `sprite_box() == None` as "no bracket owed", and therefore
+    /// did need an `else { ensure_drawn() }` — that is the code this text was written against, in
+    /// the same commit. The Pi implementation (`cb837f69`) put the recovery classes inside the
+    /// predicate instead and needed no tail. The trunk unification merge (`47f955a3`, "pi video
+    /// stack as baseline") kept the Pi shape and dropped `damage_meets` with it; `pal.rs` was not
+    /// part of that resolution, so this text outlived its subject. See `Screen::flush`.
     fn render(&mut self) {
         self.surface.flush();
     }

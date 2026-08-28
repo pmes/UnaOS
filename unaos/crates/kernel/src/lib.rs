@@ -69,6 +69,14 @@ pub mod allocator;
 pub mod shell;
 pub mod selftest;
 
+// ORIN-REBOOT (baton orin-6 §5.1 + the cold-boot ruling 2026-08-25): the arch-neutral POWER
+// VERBS — `reboot` (warm) and `shutdown` (power off, cold-boot-ready). One word each on
+// every UnaOS; the per-platform mechanisms (aarch64: PSCI SYSTEM_RESET / SYSTEM_OFF via SMC
+// — invoke ATF/the firmware, never build power logic; x86 shutdown: the real ACPI S5;
+// unwired slots: honest witnesses) live behind them. Witness families `[orinreboot]` /
+// `[orinshutoff]`. See power.rs.
+pub mod power;
+
 // INSTALL-CORE: the storage-agnostic installer engine (GPT writer + FAT32 formatter + extent
 // content-verify) over the arch-neutral `InstallTarget` trait. The engine is arch-neutral and
 // compiles on both arches under `installdemo` (UNAOS_INSTALLDEMO=1); its witness `run_demo` is invoked
@@ -88,11 +96,16 @@ pub mod install;
 // SELFHOST-2 needed the same primitives without dragging the installer engine in behind
 // `installdemo`; `install` re-exports it, so every `crate::install::hash::…` call site is unchanged.
 // Compiled only for the features that consume it — no consumer, no code.
+// BT-BOND M1 joined this list: `fs/holocron.rs` stamps a CRC-32/ISO-HDLC over its header and over
+// every record, and it uses THIS implementation rather than a private copy so that an image the
+// kernel wrote is checkable by the same host tools (and the same `crc32fast` variant) the GPT writer
+// and the gzip trailer check already agree with.
 #[cfg(any(
     feature = "installdemo",
     feature = "install_target",
     feature = "piinstall",
-    feature = "selfhost"
+    feature = "selfhost",
+    feature = "holocron", feature = "selfup" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file
 ))]
 pub mod hash;
 
@@ -168,6 +181,9 @@ pub mod logts;
 pub mod console;
 pub mod user;
 pub mod splash;
+// VUGRAS (hw-jetson): the RAS localizer instrument riding the vug frame loop. Declared
+// unconditionally (its public surface is knob-inert); the sweep call sites are tegra-lane.
+pub mod vugras;
 pub mod gui_watchdog;
 // WEDGE-2: the last-words breadcrumb instrument for the TAB->focus-raise chain. ALWAYS declared (its
 // public surface degrades to empty `#[inline(always)]` shims when the `wedge2` feature is off), so the
@@ -190,6 +206,15 @@ pub mod termring;
 // so the hooks in `pal.rs`, `video/wm.rs`, `arch/x86_64/{syscall,mod}.rs` stay `#[cfg]`-free. Pure
 // measurement: changes no scheduling/locking/present behaviour. Knob: `UNAOS_RTWIT=1`.
 pub mod rtwit;
+// DEADMAN: the instrument that survives the wedge — `[deadman]`, one line per second driven from the
+// APIC timer ISR, emitted UNCONDITIONALLY (including all-zero) so silence is distinguishable from
+// idleness. Every other x86 instrument is emitted BY the render-service pass, so when that pass
+// stopped in metal boot 11 the evidence of it stopping stopped with it. ALWAYS declared; its public
+// surface degrades to empty `#[inline(always)]` shims when the `deadman` feature is off (or off-arch),
+// so the hooks in `arch/x86_64/interrupts.rs`, `drivers/ehci/mod.rs` and `video/wm.rs` stay
+// `#[cfg]`-free. Reads only atomics plus one `try_lock`; never takes a lock the compositor can hold.
+// Knob: `UNAOS_DEADMAN=1`.
+pub mod deadman;
 // R1 / rtpi: the PRIORITY-INHERITANCE witness — `[rtpi]` (donation events, max priority jump,
 // transitive-chain depth, live leak gauge). Unlike `rtwit` (a pure ruler declared unconditionally),
 // the mechanism this witnesses CHANGES scheduling and every one of its call sites is

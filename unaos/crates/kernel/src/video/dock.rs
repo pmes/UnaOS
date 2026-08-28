@@ -44,7 +44,7 @@
 //! # Two panels now, and gated on each (PI-DESK)
 //!
 //! `#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature =
-//! "pidesk")))]` at the `mod` declaration in [`super`]. The composite seam in `wm::composite_once`
+//! "desktop_firmware")))]` at the `mod` declaration in [`super`]. The composite seam in `wm::composite_once`
 //! and the press seam in each arch's `syscall.rs` carry the same gate, so a knob-off build of EITHER
 //! arch has neither — and a knob-off `kernel8.img` is byte-identical to the pre-arc image, measured.
 //!
@@ -188,20 +188,59 @@ use super::{ceramic, strip, theme, wm};
 // line of this file is arithmetic over `wm` and the materials, and is arch-neutral by construction;
 // these two functions are the whole of what is not. They are seamed HERE, at the one call site each,
 // rather than by inventing a `crate::arch::user_input_*` re-export — the same shape `wm` uses for its
-// `wcx` reach, and it keeps the fact that the two arches have separate input tables visible instead of
+// `desktop_uefi` reach, and it keeps the fact that the two arches have separate input tables visible instead of
 // papering over it.
 //
 // The contract is identical on both sides: `0` means the SHELL (a kernel-owned row has no input ring,
 // so the router's furniture rule hands the keyboard to the shell rather than to a program that cannot
 // read it), and any other value is an owning ASID.
+//
+// ⚠ **THERE ARE THREE STATES HERE, NOT TWO — and writing only two is what broke the build (SMALLS3).**
+// The seam was written as an exhaustive `x86_64` / `aarch64` pair on the unstated premise that every
+// build of one of those arches HAS a `syscall` module. On aarch64 that is false: `arch/aarch64/mod.rs`
+// gates `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the input rings
+// belong to the EL0 layer, and a build without it has no ring table to designate into. So this module's
+// own gate (`desktop_firmware`) armed with NEITHER of those two features named the module path in a
+// build where the module does not exist, and both functions failed E0433. No coverage leg reached the
+// combination (`arm-pi` always carries `baremetal`, `arm-tegra-desk` always carries `tegra_el0`), which
+// is how it shipped.
+//
+// The third arm is a NO-OP, and that is the correct semantics rather than a placeholder: with no input
+// ring table there is no keyboard destination to move, and the read side's `0` is not a stand-in — `0`
+// IS the contract's value for "the shell has it", which is exactly true when no program can be handed
+// a keystroke. The same shape and the same reasoning are already in `wm::vugmin_publish` (per-arch
+// dispatch arms, each naming the feature that owns that arch's info page, plus a fall-through that
+// consumes the argument) and in `wm::repaint`'s `focused` (`0` where the router is not compiled), so
+// this follows the file next door instead of inventing a third convention.
+//
+// The two live arms are UNCHANGED in every configuration that compiled before: the conjunct added here
+// is the module's own gate, verbatim, so the emitted code on `arm-pi`, `arm-tegra-desk` and every x86
+// build is byte-identical.
+
+// The conjunct is spelled out twice below rather than aliased — `cfg` attributes cannot be given a
+// name — so keep the two copies identical to `arch/aarch64/mod.rs`'s gate on `pub mod syscall;`. A
+// narrower copy silently stops designating focus on a board that has a ring table; a wider one is the
+// E0433 above, back again.
 
 /// Designate `asid` as the keyboard's destination (`0` = the shell).
 #[inline]
 fn focus_set(asid: u64) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall::user_input_set_active(asid);
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(feature = "baremetal", feature = "tegra_el0")
+    ))]
     crate::arch::aarch64::syscall::user_input_set_active(asid);
+    // No ring table in this build: nothing to designate into, and the argument still has to be consumed.
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(
+            target_arch = "aarch64",
+            any(feature = "baremetal", feature = "tegra_el0")
+        )
+    )))]
+    let _ = asid;
 }
 
 /// The ASID the keyboard is currently designated to (`0` = the shell) — the read side of
@@ -213,9 +252,25 @@ fn focus_get() -> u64 {
     {
         crate::arch::x86_64::syscall::user_input_active()
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(feature = "baremetal", feature = "tegra_el0")
+    ))]
     {
         crate::arch::aarch64::syscall::user_input_active()
+    }
+    // No ring table in this build: `0` is the contract's own value for "the shell holds it", which is
+    // what "no program can be handed a keystroke" means. The save/restore the fixture does around this
+    // is then a well-typed round trip of the shell designation, not a lie about a table that is absent.
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(
+            target_arch = "aarch64",
+            any(feature = "baremetal", feature = "tegra_el0")
+        )
+    )))]
+    {
+        0
     }
 }
 
@@ -1145,7 +1200,7 @@ pub fn selftest() {
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
     // SHELLPIN — the fixture routes over the PINNED model, because the router does (the module's
     // founding law: painter and router share the accessor, and this fixture is what asserts it).
-    // On a witness gate no KERNEL_OWNER_DESKTOP row exists (wcx never activates without a Kepler),
+    // On a witness gate no KERNEL_OWNER_DESKTOP row exists (desktop_uefi never activates without a Kepler),
     // so the raw count is one tile short of the strip press_at lays out: every boundary shifts, the
     // probe centre lands off its tile — and can land ON the pin tile, latching a spurious reopen.
     let n = pin_shell(&mut rows, n);

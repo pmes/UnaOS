@@ -3590,7 +3590,7 @@ const _: () = {
     // `run` and the launcher fixtures' scratch tenancies can still get an address space with every
     // background row occupied. `< USER_SLOTS` alone would have permitted 7, which satisfies the letter
     // of "leaves slots free" while starving exactly the two callers that need one.
-    assert!(MAX_PROCS <= super::boot::USER_SLOTS - 2, "MAX_PROCS must leave 2 EL0 slots free");
+    assert!(MAX_PROCS <= super::uslots::USER_SLOTS - 2, "MAX_PROCS must leave 2 EL0 slots free");
     assert!(MAX_PROCS <= crate::video::wm::MAX_WINDOWS, "every bg program must be able to own a window");
     // The KILL table, which is coupled to this one in the FAILURE direction: a row that can be killed
     // needs a slot to be killed through, or `bg_kill` arms nothing, falls back to PORPHANED and parks
@@ -4223,8 +4223,8 @@ const NHANDLE: usize = 8; // handle slots per process (small, static — like MA
 /// (0 = Empty would let a re-scan re-claim it; a real pid is never `u64::MAX`). Overwritten with the pid
 /// once the child is spawned, or cleared if the load fails — never observed by any other task (single-writer).
 const HANDLE_RESERVING: u64 = u64::MAX;
-static HANDLES: [[AtomicU64; NHANDLE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NHANDLE] }; super::boot::USER_SLOTS + 1];
+static HANDLES: [[AtomicU64; NHANDLE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
 
 // ---------------------------------------------------------------------------------------------
 // U5 — handles as CAPABILITIES: rights, a resource target beyond "child pid", the enforcement CHECK
@@ -4279,8 +4279,8 @@ const CONSOLE_FD: usize = 1;
 /// `0`/`RESERVING` sentinel semantics and the rights ride alongside. Written with Release beside the value
 /// store (rights published BEFORE the value that makes a handle live, so a resolver that observes the value
 /// also observes the rights), cleared in `handle_clear` / `clear_handle_row`. `0` rights == an inert handle.
-static HANDLE_RIGHTS: [[AtomicU32; NHANDLE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::boot::USER_SLOTS + 1];
+static HANDLE_RIGHTS: [[AtomicU32; NHANDLE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
 
 // ---------------------------------------------------------------------------------------------
 // U6 — the general OBJECT descriptor: a handle is (kind, target, rights), first-free allocated for ALL kinds
@@ -4309,8 +4309,8 @@ const KIND_SOCKET: u8 = 4; // U6 scaffold: a socket object (value word = an opaq
 /// object id) and keeps U4/U5's `0`=Empty / `u64::MAX`=RESERVING sentinels intact. Written with Release BEFORE
 /// the value store that makes a handle live (so a resolver observing the live value also observes the kind),
 /// cleared in `handle_clear` / `clear_handle_row`. `KIND_EMPTY` (0) == an inert/absent slot (the const-init).
-static HANDLE_KIND: [[AtomicU8; NHANDLE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE] }; super::boot::USER_SLOTS + 1];
+static HANDLE_KIND: [[AtomicU8; NHANDLE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU8::new(KIND_EMPTY) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
 
 /// `-EACCES`: a capability check failed — no such handle / wrong kind / missing right / an attenuation
 /// violation (a grant that would amplify rights). The single errno U5's CHECK returns to EL0.
@@ -4555,7 +4555,7 @@ pub fn clear_handle_row(asid: u64) {
     // and for the same reason: a window row outliving its owner would name a surface inside a backing
     // frame the slot's NEXT tenant gets, so the next program's private memory would be composited to the
     // panel. Unmaps the surfaces too, so the reused ASID starts with the reserved EL1-only leaves.
-    win_close_asid(asid);
+    win_close_asid(asid); #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_reap_done(asid); // ORIN-TENANT: the exit-path reap's wire witness — WINDOWS released by now; silent when the dying ASID owned no windows. Line-NEUTRAL.
     // WC-INT: the COMPOSITOR-side teardown, after WC-B's table teardown above and never before it. Order is
     // load-bearing in both directions:
     //   * WC-B first — `win_close_asid` unmaps the surfaces and frees the rows while holding `WINDOWS`, then
@@ -4685,28 +4685,28 @@ const NFILE: usize = 4; // open files per process (small, static — a demo open
 /// Per-descriptor presence flag: `true` == this `[asid][idx]` slot holds a live open file. Claimed
 /// (`false`->`true`) in `files_alloc`, cleared in `files_free`/`clear_files_row`. The single source of truth
 /// for "is this file-id valid" — `sys_read` re-checks it after decoding a handle's file-id (defense in depth).
-static FILE_USED: [[AtomicBool; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicBool::new(false) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_USED: [[AtomicBool; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicBool::new(false) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 /// The open file's first data cluster (chain head for a `read_at` walk). Meaningful only where `FILE_USED`.
-static FILE_CLUSTER: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_CLUSTER: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 /// The open file's total byte size (the EOF bound `sys_read` clamps against). Meaningful only where `FILE_USED`.
-static FILE_SIZE: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_SIZE: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 /// The descriptor's byte offset — advanced by the count each `sys_read`/File `sys_write` delivers, and set
 /// absolutely by `SYS_SEEK` (U9). Meaningful only where `FILE_USED`. Always kept `<= FILE_SIZE`: reads/writes
 /// clamp to the bytes remaining, and `sys_seek` rejects an offset past `size` with `-EINVAL`.
-static FILE_OFFSET: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_OFFSET: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 /// U10: the on-disk LOCATION of this file's directory entry — the absolute LBA of its directory sector and
 /// (in `FILE_DIR_OFF`) the byte offset of its 32-byte slot within that sector, both captured at `sys_open`
 /// (from `fat::find_located`). A GROW republishes the file's `size`/`first_cluster` into that slot, so the
 /// on-disk directory stays the reader's source of truth. Meaningful only where `FILE_USED`; unused (both `0`)
 /// for descriptors that never grow (the U6b no-cap negative, the U9 revoke check).
-static FILE_DIR_LBA: [[AtomicU64; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
-static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_DIR_LBA: [[AtomicU64; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
+static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 /// U11: per-descriptor GENERATION counter. A `File` handle's value word packs `(gen << 32) | (idx + 1)`, and
 /// `file_desc_validate` rejects a handle whose packed gen != the slot's CURRENT gen — so a stale sibling handle
 /// to a slot that was freed and then FIRST-FIT-REUSED by a different file is `-EACCES` (a gen mismatch), never a
@@ -4715,8 +4715,8 @@ static FILE_DIR_OFF: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
 /// through or mirror) so the very next reuse of the slot lands on a fresh generation. Const-init `0`; monotone
 /// within a boot (a u32 wrap is ~4 billion frees away — unreachable for the demo). Acquire/Release-paired with
 /// `FILE_USED` (published last on alloc, cleared on free) so a validator that sees a live slot sees its gen.
-static FILE_GEN: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_GEN: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 
 /// U11-M2: per-descriptor pointer to the GLOBAL open-file refcount row this descriptor increments (`OPEN_FILES`
 /// index, or `OPENROW_NONE` for a scaffold/free slot). Recorded by `sys_open` right after `files_alloc` (the row
@@ -4725,8 +4725,8 @@ static FILE_GEN: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
 /// `(dir_lba, dir_off)` identifies a slot, not a file, so a new file created in an unlinked-but-still-open file's
 /// recycled `0xE5` slot would collide on the key; keying the decrement/mark on the row INDEX the descriptor
 /// actually claimed keeps each file's refcount + deferred-free strictly its own. Const-init `OPENROW_NONE`.
-static FILE_OPENROW: [[AtomicU32; NFILE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(OPENROW_NONE) }; NFILE] }; super::boot::USER_SLOTS + 1];
+static FILE_OPENROW: [[AtomicU32; NFILE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(OPENROW_NONE) }; NFILE] }; super::uslots::USER_SLOTS + 1];
 
 /// U11-M2: the `FILE_OPENROW` sentinel for "this descriptor increments no open-file row" (a scaffold with no file
 /// identity, or a free slot). `u32::MAX` is unreachable as a real `OPEN_FILES` index (`NOPENFILE` is tiny).
@@ -6112,7 +6112,7 @@ pub struct El0Demo {
 /// `.text`) goes at offset 0 — the kernel enters it at the base — and the inline fault fixtures
 /// (`__fault_blob_*`) go right after it. Both must fit in `USER_CODE_SIZE`.
 pub fn setup() -> El0Demo {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let hello_len = USER_BLOB.len();
     // 16-align the fixtures' start so their first instruction is 4-aligned (an eret/exec into a
     // misaligned entry is EC 0x22) and the icache maintenance below covers whole cache lines.
@@ -6124,7 +6124,7 @@ pub fn setup() -> El0Demo {
     // Everything must fit in the CODE page — the only page protect_user_code makes EL0-executable; a
     // program straddling into the data pages would abort mid-run.
     assert!(
-        total <= super::boot::USER_CODE_SIZE,
+        total <= super::uslots::USER_CODE_SIZE,
         "user code (hello blob + fault fixtures) does not fit in the code page"
     );
     unsafe {
@@ -6184,7 +6184,7 @@ pub fn setup() -> El0Demo {
 /// silently — QEMU can't test the TLBI at all (it re-walks), so the warm-up is what makes the METAL
 /// run the real detector.
 pub fn tlb_warm(_: usize) {
-    let (base, _) = super::boot::user_region();
+    let (base, _) = super::uslots::user_region();
     // M6d: warm THIS core's TLB with the SHARED (ASID-0/boot-context) code-page mapping — the mapping the
     // M6b EL0 tasks (which run on the boot root) use. Since M6d a per-slot task may have left a slot root
     // live on this core; the shared user VA maps to a DIFFERENT (slot) frame under a slot root, so walking
@@ -6196,7 +6196,7 @@ pub fn tlb_warm(_: usize) {
             "msr daifset, #2",
             "msr TTBR0_EL1, {boot}",
             "isb",
-            boot = in(reg) super::boot::boot_ttbr0(),
+            boot = in(reg) super::uslots::boot_ttbr0(),
             options(nostack, preserves_flags),
         );
         core::ptr::read_volatile(base as *const u8);
@@ -6210,9 +6210,9 @@ pub fn tlb_warm(_: usize) {
 /// after the demo core's TLB warm-up. A clean probe is best-effort evidence (AT may re-walk rather
 /// than consult the TLB); a bad probe is always a real, loud failure.
 pub fn protect() {
-    let (base, _) = super::boot::user_region();
+    let (base, _) = super::uslots::user_region();
     let (el0_read_ok, el1_write_denied) =
-        unsafe { super::boot::protect_user_code(base, super::boot::USER_CODE_SIZE) };
+        unsafe { super::uslots::protect_user_code(base, super::uslots::USER_CODE_SIZE) };
     if el0_read_ok && el1_write_denied {
         serial_println!(
             ":: M6b: user code page EL0-RX/EL1-RO (AT probe: EL0-read OK, EL1-write denied) ::"
@@ -6395,8 +6395,8 @@ pub fn record_el0_kill(name: &str, ec: u64, far: u64, far_valid: bool) {
             return;
         }
     }
-    let (base, size) = super::boot::user_region();
-    let code = super::boot::USER_CODE_SIZE as u64;
+    let (base, size) = super::uslots::user_region();
+    let code = super::uslots::USER_CODE_SIZE as u64;
     let expected = far_valid
         && match name {
             // an EL0 write to PA 0x0 (EL1-only RAM): data abort, FAR in page 0 of the PA space
@@ -6589,7 +6589,7 @@ pub struct M6dDemo {
 /// nG detector. Emits the M6d setup line and returns the per-task entries + slot roots. Called once on the
 /// BSP (which runs on the boot root) after the M6b/M6e demo. `None` if a slot allocation fails.
 pub fn m6d_setup() -> Option<M6dDemo> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // shared initial SP_EL0 (top of the window, 16-aligned)
     let sent_off = size as u64 - 0x100; // the sentinel VA offset: EL0 reads [sp, #-0x100]
 
@@ -6597,7 +6597,7 @@ pub fn m6d_setup() -> Option<M6dDemo> {
     let bstart = &raw const __m6d_blob_start as usize;
     let bend = &raw const __m6d_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "M6d blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "M6d blob does not fit in a code page");
     let entry = |label: *const u8| -> u64 {
         let off = label as usize - bstart;
         let va = base + off as u64;
@@ -6609,7 +6609,7 @@ pub fn m6d_setup() -> Option<M6dDemo> {
     // calls leaked earlier-claimed slots when a later one failed. `alloc_user_slots` releases what it got and
     // returns false on exhaustion, so a failed M6d setup frees the whole request.
     let mut slots = [0usize; 4];
-    if !super::boot::alloc_user_slots(&mut slots) {
+    if !super::uslots::alloc_user_slots(&mut slots) {
         return None;
     }
     let [slot_a, slot_b, slot_c, slot_d] = slots;
@@ -6617,26 +6617,26 @@ pub fn m6d_setup() -> Option<M6dDemo> {
     // Copy the blob into each slot's code page (identity VA) + I-cache sync (DC CVAU/IC IVAU by the
     // identity VA; A72 caches are PIPT, so the code is fetchable at the aliased EL0 window VA).
     for &s in &slots {
-        let backing = super::boot::slot_backing_ptr(s);
+        let backing = super::uslots::slot_backing_ptr(s);
         unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
         super::cache::icache_sync_range(backing as usize, blen);
     }
     // Plant the readers' slot-private sentinels (page 3, [top-0x100]) via the identity VA. Pure data on a
     // PIPT D-cache — coherent with the EL0/probe read of the same frame at the window VA, no maintenance.
     unsafe {
-        *(super::boot::slot_backing_ptr(slot_a).add(sent_off as usize) as *mut u64) = M6D_SENTINEL_A;
-        *(super::boot::slot_backing_ptr(slot_b).add(sent_off as usize) as *mut u64) = M6D_SENTINEL_B;
-        *(super::boot::slot_backing_ptr(slot_d).add(sent_off as usize) as *mut u64) = M6D_SENTINEL_SP;
+        *(super::uslots::slot_backing_ptr(slot_a).add(sent_off as usize) as *mut u64) = M6D_SENTINEL_A;
+        *(super::uslots::slot_backing_ptr(slot_b).add(sent_off as usize) as *mut u64) = M6D_SENTINEL_B;
+        *(super::uslots::slot_backing_ptr(slot_d).add(sent_off as usize) as *mut u64) = M6D_SENTINEL_SP;
     }
     // Protect every slot's code page (EL0-RX/EL1-RO). After this the code page is no longer EL1-writable.
     for &s in &slots {
-        unsafe { super::boot::protect_user_slot_code(s, super::boot::USER_CODE_SIZE) };
+        unsafe { super::uslots::protect_user_slot_code(s, super::uslots::USER_CODE_SIZE) };
     }
     // Deterministic on-metal nG detector (the arc's #1 metal risk): swap TTBR0 between slot A and B roots
     // reading the SAME VA — a global (nG=0) user leaf would resolve both to slot A's frame. QEMU re-walks
     // -> always PASS; metal caches -> a broken nG is caught. Folded into the same-VA PASS below.
     let probe_ok = unsafe {
-        super::boot::probe_slot_isolation(slot_a, slot_b, sent_off, M6D_SENTINEL_A, M6D_SENTINEL_B)
+        super::uslots::probe_slot_isolation(slot_a, slot_b, sent_off, M6D_SENTINEL_A, M6D_SENTINEL_B)
     };
     M6D_PROBE_OK.store(probe_ok, Ordering::Release);
 
@@ -6649,10 +6649,10 @@ pub fn m6d_setup() -> Option<M6dDemo> {
         same_va: entry(&raw const __m6d_prog_same_va),
         stack_write: entry(&raw const __m6d_prog_stack_write),
         sp_sentinel: entry(&raw const __m6d_prog_sp_sentinel),
-        ttbr0_a: super::boot::slot_ttbr0(slot_a),
-        ttbr0_b: super::boot::slot_ttbr0(slot_b),
-        ttbr0_stack: super::boot::slot_ttbr0(slot_c),
-        ttbr0_sp: super::boot::slot_ttbr0(slot_d),
+        ttbr0_a: super::uslots::slot_ttbr0(slot_a),
+        ttbr0_b: super::uslots::slot_ttbr0(slot_b),
+        ttbr0_stack: super::uslots::slot_ttbr0(slot_c),
+        ttbr0_sp: super::uslots::slot_ttbr0(slot_d),
     })
 }
 
@@ -6718,13 +6718,13 @@ pub struct M6fDemo {
 /// Called once on the BSP after the M6d demo. `None` if slot allocation fails (the whole request is
 /// released, not leaked). Plants no sentinel — the getinfo fixture writes its own struct via copy_to_user.
 pub fn m6f_setup() -> Option<M6fDemo> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // shared initial SP_EL0 (16-aligned top of the window)
 
     let bstart = &raw const __m6f_blob_start as usize;
     let bend = &raw const __m6f_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "M6f blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "M6f blob does not fit in a code page");
     let entry = |label: *const u8| -> u64 {
         let off = label as usize - bstart;
         let va = base + off as u64;
@@ -6733,24 +6733,24 @@ pub fn m6f_setup() -> Option<M6fDemo> {
     };
 
     let mut slots = [0usize; 4];
-    if !super::boot::alloc_user_slots(&mut slots) {
+    if !super::uslots::alloc_user_slots(&mut slots) {
         return None;
     }
     // Copy the blob into each slot's code page (identity VA) + I-cache sync (DC CVAU/IC IVAU by the identity
     // VA; A72 caches are PIPT, so the code is fetchable at the aliased EL0 window VA), then protect it.
     for &s in &slots {
-        let backing = super::boot::slot_backing_ptr(s);
+        let backing = super::uslots::slot_backing_ptr(s);
         unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
         super::cache::icache_sync_range(backing as usize, blen);
     }
     for &s in &slots {
-        unsafe { super::boot::protect_user_slot_code(s, super::boot::USER_CODE_SIZE) };
+        unsafe { super::uslots::protect_user_slot_code(s, super::uslots::USER_CODE_SIZE) };
     }
     // U5: endow each M6f slot with a console write-capability. The hostile fixture `sys_write(fd 1)`s with
     // BAD pointers expecting -EFAULT: it must hold the cap so the resolve passes and the pointer range check
     // (still unchanged) is what refuses it. The other three fixtures don't write; the endowment is harmless.
     for &s in &slots {
-        install_console_cap(super::boot::slot_ttbr0(s) >> 48);
+        install_console_cap(super::uslots::slot_ttbr0(s) >> 48);
     }
 
     serial_println!(
@@ -6763,10 +6763,10 @@ pub fn m6f_setup() -> Option<M6fDemo> {
         hostile: entry(&raw const __m6f_prog_hostile),
         yield_prog: entry(&raw const __m6f_prog_yield),
         sleep_prog: entry(&raw const __m6f_prog_sleep),
-        ttbr0_getinfo: super::boot::slot_ttbr0(slots[0]),
-        ttbr0_hostile: super::boot::slot_ttbr0(slots[1]),
-        ttbr0_yield: super::boot::slot_ttbr0(slots[2]),
-        ttbr0_sleep: super::boot::slot_ttbr0(slots[3]),
+        ttbr0_getinfo: super::uslots::slot_ttbr0(slots[0]),
+        ttbr0_hostile: super::uslots::slot_ttbr0(slots[1]),
+        ttbr0_yield: super::uslots::slot_ttbr0(slots[2]),
+        ttbr0_sleep: super::uslots::slot_ttbr0(slots[3]),
     })
 }
 
@@ -7216,11 +7216,11 @@ const EFAULT: i64 = -14;
 /// this window can only reach that task's OWN frames — validation + that guarantee is the PAN-less software
 /// discipline (A72 is Armv8.0, no FEAT_PAN; on a PAN-capable port this must become an LDTR/unprivileged copy).
 fn user_range_ok(user_va: u64, len: usize, writable: bool) -> bool {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let Some(end) = user_va.checked_add(len as u64) else {
         return false; // length wraps the address space
     };
-    let lo = if writable { base + super::boot::USER_CODE_SIZE as u64 } else { base };
+    let lo = if writable { base + super::uslots::USER_CODE_SIZE as u64 } else { base };
     user_va >= lo && end <= base + size as u64
 }
 
@@ -7655,7 +7655,7 @@ fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
     // page, so a small static ELF's headers + segments fit; the FLAT path re-bounds to one code page below,
     // and the ELF path bounds each SEGMENT to the window. The image is hashed WHOLE for the principal, so the
     // cap must admit the whole file (a >window image is `BadSize`, never a truncated hash).
-    let cap = super::boot::USER_REGION_SIZE;
+    let cap = super::uslots::USER_REGION_SIZE;
     if de.size == 0 || de.size as u64 > cap as u64 {
         return Err(SpawnErr::BadSize(kind, de.size));
     }
@@ -7720,20 +7720,20 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
     if bytes.is_empty() {
         return Err(MapErr::Empty);
     }
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let elf_plan = if is_elf_image(bytes) {
         Some(validate_elf(bytes, size).map_err(MapErr::BadElf)?)
     } else {
         // FLAT path: the historical model — one code page, entered at offset 0, position-independent. Keep
         // the exact `USER_CODE_SIZE` bound (a larger flat blob is `BadSize`, byte-identical to before).
-        if bytes.len() > super::boot::USER_CODE_SIZE {
+        if bytes.len() > super::uslots::USER_CODE_SIZE {
             return Err(MapErr::BadSize(bytes.len() as u32));
         }
         None
     };
 
-    let slot = super::boot::alloc_user_slot().ok_or(MapErr::NoSlot)?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot().ok_or(MapErr::NoSlot)?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     let (entry, nsegs, is_elf) = match &elf_plan {
         Some(plan) => {
             // Map each PT_LOAD: zero [dst, dst+memsz) (the .bss tail — p_memsz>p_filesz), copy p_filesz
@@ -7753,7 +7753,7 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
                 if s.flags & PF_X != 0 {
                     let dst_off = (s.vaddr - plan.min_vaddr) as usize;
                     super::cache::icache_sync_range(backing as usize + dst_off, s.memsz);
-                    unsafe { super::boot::protect_user_slot_code_range(slot, dst_off, s.memsz) };
+                    unsafe { super::uslots::protect_user_slot_code_range(slot, dst_off, s.memsz) };
                 }
             }
             let entry = base + (plan.entry - plan.min_vaddr);
@@ -7763,11 +7763,11 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
             // FLAT: copy to the code page at the window base, I-cache sync, protect page 0.
             unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), backing, bytes.len()) };
             super::cache::icache_sync_range(backing as usize, bytes.len());
-            unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
+            unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
             (base, 1, false)
         }
     };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     // IMAGE_SHA256 (code-signing): stamp this slot's persistent principal from the loaded IMAGE bytes, not
     // any 8.3 name — the SOLE mint path, kernel-derived from the untrusted image, never EL0-set. Two
     // byte-identical images share a principal; two different images do not. Hashed over the WHOLE file image
@@ -7807,6 +7807,26 @@ const EXEC_KILLED_STATUS: i32 = i32::MIN;
 /// with a real exit code for the same reason the kill sentinel does not.
 const EXEC_CLOSED_STATUS: i32 = i32::MIN + 1;
 
+/// EL0STACK — the `run` task's KERNEL stack size, and the measurement the U7STK law demands with it.
+///
+/// This is the stack the program's SYSCALL CHAINS run on, and those chains carry the largest frames in
+/// the kernel (`wm::composite` 6640 B; the `fbcon::__print -> composite` subtree 5520 B on its own) on
+/// behalf of whatever the EL0 program asks for. The blanket 16 KiB was measured EXHAUSTED on the very
+/// first armed reading (kernel8-test QEMU raspi4b, 2026-08-25, the EXEC-UVUG 300-frame vug run):
+///
+///   [el0stkhw] task=114:shell-run len=16384 hw=16384 headroom=0 loguard=1
+///   [redzone] cpu=2 LOW-REDZONE entered task=114:shell-run — … ABSORBED … grow this task's stack
+///
+/// `hw=16384` is SATURATING (a lower bound, never a depth) and `loguard=1` says the dip went past the
+/// floor into the 1024 B absorber — transiently: the run exited 0 and SPIN-6 saw nothing, which is
+/// exactly pi's finding (a parked task's ctx_sp is always in range; the dip happens between parks).
+/// The rest of the GUI-app class reads within a few hundred bytes of the same floor on the same boot
+/// (el0-fb headroom=1408, el0-wcb 344, el0-midden 344, one bg-user 344), and the U7STK conviction
+/// showed metal adds ~5.5 KiB of xHCI/fbcon subtree under chains QEMU never takes. 2x the blanket
+/// clears the measured (saturated) 16.4+ KiB with metal margin — the same figure the u7-launch and
+/// input tasks were sized to from their own converging lower bounds.
+const RUN_IMAGE_KSTACK_SIZE: usize = 32 * 1024;
+
 /// EXEC-1: load an already-read program IMAGE (flat or ELF64) into a fresh EL0 slot, run it to completion
 /// on THIS core, and return its exit status. The synchronous shell `run <path>` entry: the EL1/ASID-0 panel
 /// shell reads the bytes off the VFS and hands them here. We map (via the shared `map_image_into_slot`),
@@ -7824,8 +7844,17 @@ pub fn run_user_image(
 ) -> Result<(RunOutcome, u64), &'static str> {
     // Fail-closed backstop (the caller also bounds): the whole image must fit the slot window. The mapper
     // re-bounds the flat path to one code page and each ELF segment to the window.
-    if bytes.len() > super::boot::USER_REGION_SIZE {
+    if bytes.len() > super::uslots::USER_REGION_SIZE {
         return Err("image larger than the 16 KiB user window");
+    }
+    // EL0-EL1CORE — the same pre-check `spawn_user_image_bg` makes, asked about the core THIS launcher
+    // pins to (`this_cpu()`, the sys_spawn co-location invariant) rather than about `CPU_AUTO`. On the
+    // Orin that core is the BSP, which JM6 drops to EL1, so `run` passes the filter verbatim and is
+    // unaffected — which is the whole reason the fix filters instead of clamping. The check is here so
+    // that if `run` is ever reached from a task running on an EL2 AP, the operator is told so on the
+    // console instead of being handed a pid of 0 and a program that never ran.
+    if !super::sched::el0_placement_possible(super::percpu::this_cpu().cpu_index as usize) {
+        return Err("this core is not at EL1; an EL0 program cannot be dispatched here (EL0-EL1CORE)");
     }
     // Claim the Proc entry FIRST so a failed map frees nothing but the entry (no slot is allocated on any
     // map-failure path), and so the pid slot exists before the co-located task can be dispatched.
@@ -7887,7 +7916,14 @@ pub fn run_user_image(
     // wide with no UART write inside, which is why only this launcher ever failed on metal. See
     // `proc_find_unpublished` for the full accounting of which publishers can match and why.
     PROCS[pi].asid.store(asid, Ordering::Release);
-    let pid = super::sched::spawn_user_slot(name, mapped.base, mapped.sp, mapped.ttbr0, cpu);
+    let pid = super::sched::spawn_user_slot_stack(
+        name,
+        mapped.base,
+        mapped.sp,
+        mapped.ttbr0,
+        cpu,
+        RUN_IMAGE_KSTACK_SIZE,
+    );
     // Publish the pid. The row may ALREADY be `PEXITED` by now (the late-publish rescue fired inside the
     // window); storing the pid onto a reaped-but-not-yet-freed row is harmless — the row is not recycled
     // until `proc_free`, and the wait loop below observes `PEXITED` on its very first pass.
@@ -7907,6 +7943,12 @@ pub fn run_user_image(
     // Timeout path (task still alive, no teardown yet). Setting a focus RESETS the ring, so a fresh program
     // starts with an empty input queue.
     user_input_set_active(asid);
+    // ORIN-INPUT: zero the per-run input counters so the rollup below reports THIS tenant's input rather
+    // than the boot's running total. See `xusb_tegra`'s ORIN-INPUT block for why the tegra path needs a
+    // pump of its own: no `baremetal` => no `usb_pump` task and no `route_input_to_active_el0`, and the
+    // Orin's only HID pump (`jd2_console_pump`) is parked in this very call stack for the whole run.
+    #[cfg(feature = "orininput")]
+    super::xusb_tegra::oi_reset();
     // Deadline-bounded cooperative wait: yield so the co-located task runs; its SYS_EXIT (or the fault-kill
     // path) marks PROCS[pi] EXITED and records the status via the GENERIC child-reap short-circuit.
     //
@@ -8033,6 +8075,14 @@ pub fn run_user_image(
         if run_deadline_timed_out(in_takeover, now, budget_start, deadline_ticks) {
             break;
         }
+        // ORIN-INPUT: the tegra input pump. This wait loop is the ONE context that runs for exactly as
+        // long as the tenant does — the shell task is parked here, so on the Orin nothing else is polling
+        // the controller (`jd2_console_pump`, the board's only pump, is blocked further down this same
+        // call stack, which is also why its `[orinclick]`/`[orintenant]` censuses cannot emit during a
+        // run). Harvest xHCI, then route through the shared `user_input_enqueue` seam. Placed AFTER the
+        // deadline check and BEFORE the yield so a run about to end does not take a fresh claim.
+        #[cfg(feature = "orininput")]
+        super::xusb_tegra::oi_pump();
         super::sched::yield_now();
     }
     let outcome = if PROCS[pi].state.load(Ordering::Acquire) == PEXITED {
@@ -8044,6 +8094,12 @@ pub fn run_user_image(
     } else {
         RunOutcome::Timeout
     };
+    // ORIN-INPUT: the per-run input rollup, emitted UNCONDITIONALLY — a run that delivered nothing must
+    // say so with a named verdict, because a silent hop is indistinguishable from a hop that never ran.
+    // Printed BEFORE the focus clear just below so its `focus=` field still shows the ASID this run
+    // actually held, not the 0 the clear is about to install.
+    #[cfg(feature = "orininput")]
+    super::xusb_tegra::oi_rollup("final");
     // INPUT-WIRE: drop input focus so the shell regains the keyboard the instant this program returns.
     // Belt-and-suspenders with `clear_handle_row`'s teardown clear (which fired already if the program
     // exited/was killed and its slot was torn down) — and the SOLE clear on the Timeout path, where the
@@ -8259,8 +8315,25 @@ pub enum BgPoll {
 /// `run_user_image`'s front half exactly — same bounds, same console-cap endowment, same EXEC1-M
 /// publish order — and diverges only where the contract block above says it does.
 pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str> {
-    if bytes.len() > super::boot::USER_REGION_SIZE {
+    if bytes.len() > super::uslots::USER_REGION_SIZE {
         return Err("image larger than the 16 KiB user window");
+    }
+    // EL0-EL1CORE — REFUSE BEFORE ANYTHING IS CLAIMED. `sched::spawn_user_slot` filters the EL0
+    // candidate set down to cores that are at EL1 and REFUSES (returns task id 0) when that set is
+    // empty; on the Orin today it always is, because `ONLINE_MASK[0]` is false and cores 1-5 all
+    // replay the BSP's EL2 regime, so EVERY `bg` is refused. Asking here — before `proc_reserve`,
+    // before the image is mapped into a slot — means the refusal costs no unwinding, and (the point)
+    // it takes the `Err` arm, which `shell.rs`'s `bg_program` already prints to the CONSOLE. Without
+    // it the shell would report `bg: /fat/vug.elf started — pid 0` and read as a win: task id 0 is a
+    // sentinel nobody at a bench knows, and a refusal that reports success is worse than the board
+    // kill it replaces, which was at least unambiguous.
+    //
+    // Placed on the `CPU_AUTO` request this launcher actually makes, so it answers the same question
+    // the spawn will. It is advisory only — the spawn re-checks and refuses on its own — and it can
+    // only ever be stale in the safe direction: `mark_online` is one-way, so a core can join the
+    // candidate set between the two points but never leave it.
+    if !super::sched::el0_placement_possible(super::sched::CPU_AUTO) {
+        return Err("no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)");
     }
     let Some(pi) = proc_reserve() else {
         return Err(proc_table_full_reason());
@@ -8643,7 +8716,7 @@ fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> {
 fn image_principal_of_file(name: &str) -> Option<PrincipalRecord> {
     let fs = crate::fs::fat::mount().ok()?;
     let de = fs.find_in_root(name).ok()?;
-    let cap = super::boot::USER_REGION_SIZE;
+    let cap = super::uslots::USER_REGION_SIZE;
     if de.size == 0 || de.size as u64 > cap as u64 {
         return None;
     }
@@ -9539,20 +9612,20 @@ const MAX_XFERS: usize = 8;
 const XFER_REVOKED_BIT: u64 = 1 << 63;
 
 /// The inbox slot's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, else = the transfer id (live).
-static XFER_SLOT_TX: [[AtomicU64; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_TX: [[AtomicU64; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 /// The pending descriptor: what kind of object the transferred cap names. Meaningful only where TX is live.
-static XFER_SLOT_KIND: [[AtomicU8; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU8::new(KIND_EMPTY) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_KIND: [[AtomicU8; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU8::new(KIND_EMPTY) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 /// The pending descriptor's target payload (the value word the received handle will carry).
-static XFER_SLOT_TARGET: [[AtomicU64; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_TARGET: [[AtomicU64; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 /// The pending descriptor's (already attenuated) rights.
-static XFER_SLOT_RIGHTS: [[AtomicU32; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_RIGHTS: [[AtomicU32; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 /// The record index + 1 backing this pending transfer (0 = none — a kernel bug on a live slot).
-static XFER_SLOT_REC: [[AtomicU32; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_REC: [[AtomicU32; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 
 /// A record's STATE word: 0 = free, `HANDLE_RESERVING` = mid-claim, `txid` = the live transfer it
 /// ledgers, `txid | XFER_REVOKED_BIT` = that transfer, revoked (read by `handle_resolve` — the received
@@ -9569,8 +9642,8 @@ static XFER_NEXT_TX: AtomicU64 = AtomicU64::new(1);
 /// revocation hook `handle_resolve` reads. Keyed `[asid][idx]` like the other handle sidecars, and — the
 /// point — written ONLY by the row's own task (`sys_recv`) or its teardown: the sender reaches a received
 /// cap exclusively through the record, never through this row.
-static HANDLE_XFER_REC: [[AtomicU32; NHANDLE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::boot::USER_SLOTS + 1];
+static HANDLE_XFER_REC: [[AtomicU32; NHANDLE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
 
 /// Claim a free transfer record and mint its transfer id: CAS the state word 0 -> RESERVING, publish the
 /// sender (Release), then the tx LAST (live-last, the handle_install discipline; the revoked flag needs no
@@ -9963,17 +10036,17 @@ static DERIV_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Which derivation node (index + 1; 0 = a root with no node yet) a handle's capability is. Keyed
 /// `[asid][idx]` like every handle sidecar; written only by the row's own task (mid-SVC) or its teardown.
-static HANDLE_DERIV: [[AtomicU32; NHANDLE]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::boot::USER_SLOTS + 1];
+static HANDLE_DERIV: [[AtomicU32; NHANDLE]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NHANDLE] }; super::uslots::USER_SLOTS + 1];
 
 /// The derivation node riding a PENDING deposit (index + 1) — ownership passes inbox-slot -> received handle
 /// at RECV; every discard path (revoked-pending, generation-stale, retract, teardown sweep) drops it instead.
-static XFER_SLOT_DERIV: [[AtomicU32; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU32::new(0) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_DERIV: [[AtomicU32; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU32::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 /// The recipient GENERATION stamped into a pending deposit — RECV delivers only on an exact match with the
 /// recipient's CURRENT generation (see `ASID_GEN`).
-static XFER_SLOT_GEN: [[AtomicU64; NXFER]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; NXFER] }; super::boot::USER_SLOTS + 1];
+static XFER_SLOT_GEN: [[AtomicU64; NXFER]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; NXFER] }; super::uslots::USER_SLOTS + 1];
 
 /// The transfer record's derivation node (index + 1) + that node's ID at publish time — what
 /// `sys_cap_xrevoke` marks so the revoke reaches everything DERIVED from the transferred cap (re-grants,
@@ -9986,8 +10059,8 @@ static XFER_REC_DERIV_ID: [AtomicU64; MAX_XFERS] = [const { AtomicU64::new(0) };
 /// Per-ASID inbox GENERATION: bumped (AcqRel) at the TOP of `clear_handle_row` — i.e. strictly before the
 /// teardown's inbox sweep — so any deposit stamped with the old generation is dead-on-arrival for the ASID's
 /// next tenant even if it lands after the sweep passed its slot. ASID 0 (the shared window) never tears down.
-static ASID_GEN: [AtomicU64; super::boot::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; super::boot::USER_SLOTS + 1];
+static ASID_GEN: [AtomicU64; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; super::uslots::USER_SLOTS + 1];
 
 /// Claim a free derivation node under `parent_ref` (a node index + 1, or 0 for a root): CAS the ID word
 /// 0 -> RESERVING, publish the edge + zeroed counters, bump the parent's KIDS (the parent is pinned — the
@@ -10218,7 +10291,7 @@ fn m6g_loader_run(_: usize) {
             serial_println!(
                 ":: M6g: HELLO.BIN bad size {} bytes (must be 1..={}) — loader skipped ::",
                 sz,
-                super::boot::USER_CODE_SIZE
+                super::uslots::USER_CODE_SIZE
             );
             return;
         }
@@ -10360,11 +10433,11 @@ fn elf1_launcher(_demo_cpu: usize) {
     // ELF path, mapped 2 PT_LOAD segments, and the two segments landed on DISTINCT pages with the right
     // permissions — page 0 (the R+X text segment) is a CODE leaf (RO-both + EL0-executable), page 1 (the
     // R+W data segment carrying the witness message) is a DATA leaf (EL0+EL1-RW, never executable).
-    let (base, _size) = super::boot::user_region();
+    let (base, _size) = super::uslots::user_region();
     let took_elf = loaded.is_elf;
     let two_segs = loaded.nsegs == 2;
-    let code_ok = super::boot::slot_page_is_code(loaded.slot, base);
-    let data_ok = super::boot::slot_page_is_data(loaded.slot, base + 0x1000);
+    let code_ok = super::uslots::slot_page_is_code(loaded.slot, base);
+    let data_ok = super::uslots::slot_page_is_data(loaded.slot, base + 0x1000);
     let entry_at_base = loaded.base == base; // fixture links at vaddr 0 -> bias == base -> entry == base
 
     // Endow the slot with a console write-cap so its SYS_WRITE(fd 1) reaches the console, then drop it to
@@ -10558,7 +10631,7 @@ fn bgrun_witness(_demo_cpu: usize) {
         serial_println!(
             ":: BGRUN-ST: process table capacity = {} rows (bg programs alive at once; EL0 slots {}) ::",
             MAX_PROCS,
-            super::boot::USER_SLOTS
+            super::uslots::USER_SLOTS
         );
         let mut spawned = 0usize;
         let mut failed_at = usize::MAX;
@@ -10720,7 +10793,7 @@ fn killbound_witness() {
     let bstart = &raw const __killbound_blob_start as usize;
     let bend = &raw const __killbound_blob_end as usize;
     let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
-    if blob.len() > super::boot::USER_CODE_SIZE {
+    if blob.len() > super::uslots::USER_CODE_SIZE {
         serial_println!(":: KILLBOUND: blob {} B > code page — skipped ::", blob.len());
         return;
     }
@@ -10918,7 +10991,7 @@ fn current_ttbr0() -> u64 {
 /// caller's core, 1 = a sibling online core (genuine cross-core parallelism). Returns the thread handle, or a
 /// negative errno (`-EFAULT` bad entry/sp, `-EINVAL` from the shared ASID-0 context, `-EAGAIN` table full).
 fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let win_end = base + size as u64;
     // entry: 4-aligned and inside the window (exec enforcement is left to the page permissions).
     if entry & 3 != 0 || entry < base || entry >= win_end {
@@ -10936,6 +11009,25 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
     }
     let caller = super::percpu::this_cpu().cpu_index as usize;
     let cpu = if place == 1 { super::sched::other_online_cpu(caller) } else { caller };
+    // EL0-EL1CORE — REFUSE BEFORE THE RETAIN. `spawn_user_thread` filters the EL0 candidate set to
+    // cores at EL1 and refuses when it is empty, returning a `JoinHandle` with id 0; the retain below
+    // is taken BEFORE that call and its balancing release is the new thread's own `exit()`, so a
+    // refusal discovered after the retain would leak a slot reference permanently. Asking here costs
+    // nothing and keeps the failure a defined syscall return the EL0 program can read.
+    //
+    // `other_online_cpu` already applies the same filter to the `place == 1` sibling HINT and falls
+    // back to `caller` when no EL1 sibling qualifies, so on the Orin a threaded program keeps working
+    // — co-placed with its parent rather than refused. This arm therefore fires only if the CALLER's
+    // own core is not at EL1, which for a live EL0 task is impossible by construction (nothing could
+    // have placed it there). It is the fail-closed backstop for that "impossible".
+    //
+    // EAGAIN is reused rather than given a code of its own, and that is a KNOWN CONFLATION worth
+    // naming: it already means "the thread table is full, try later", which is transient, while this
+    // condition is a standing platform limitation until the secondaries drop to EL1. The serial line
+    // `spawn_user_thread` emits is what distinguishes them today.
+    if !super::sched::el0_placement_possible(cpu) {
+        return EAGAIN;
+    }
     // Claim a tracking slot, retain the shared address space for the new thread, then spawn it. The retain
     // precedes the spawn so the slot cannot be torn down between here and the thread's first dispatch; the
     // thread's own exit balances it (`teardown_user_slot`). The lock spans the spawn (a brief critical
@@ -10987,7 +11079,7 @@ fn sys_thread_spawn(entry: u64, sp: u64, arg: u64, place: u64) -> i64 {
             freed
         }
     };
-    super::boot::slot_thread_retain(asid);
+    super::uslots::slot_thread_retain(asid);
     let join = super::sched::spawn_user_thread("el0-thread-w", entry, sp, arg, ttbr0, cpu);
     let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
     tab[idx] = Some(ThreadRec { owner: asid, agen, join });
@@ -11382,7 +11474,7 @@ fn spinhunt_witness() {
     let bstart = &raw const __spinhunt_blob_start as usize;
     let bend = &raw const __spinhunt_blob_end as usize;
     let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
-    if blob.len() > super::boot::USER_CODE_SIZE {
+    if blob.len() > super::uslots::USER_CODE_SIZE {
         serial_println!(":: SPINHUNT: blob {} B > code page — skipped ::", blob.len());
         return;
     }
@@ -11542,7 +11634,7 @@ fn bgspread_witness() {
     let bstart = &raw const __bgspread_blob_start as usize;
     let bend = &raw const __bgspread_blob_end as usize;
     let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
-    if blob.len() > super::boot::USER_CODE_SIZE {
+    if blob.len() > super::uslots::USER_CODE_SIZE {
         serial_println!(":: BGSPREAD: blob {} B > code page — skipped ::", blob.len());
         return;
     }
@@ -11627,21 +11719,21 @@ fn threads_launcher(_demo_cpu: usize) {
     let bstart = &raw const __threads_blob_start as usize;
     let bend = &raw const __threads_blob_end as usize;
     let blen = bend - bstart;
-    if blen > super::boot::USER_CODE_SIZE {
+    if blen > super::uslots::USER_CODE_SIZE {
         serial_println!(":: EL0: threads test — blob {} B > code page, SKIP ::", blen);
         return;
     }
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = the parent's initial SP_EL0
-    let Some(slot) = super::boot::alloc_user_slot() else {
+    let Some(slot) = super::uslots::alloc_user_slot() else {
         serial_println!(":: EL0: threads test — no free address-space slot, SKIP ::");
         return;
     };
-    let backing = super::boot::slot_backing_ptr(slot);
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     install_console_cap(ttbr0 >> 48);
     let entry = base + (&raw const __threads_prog_parent as usize - bstart) as u64;
     let run_cpu = super::percpu::this_cpu().cpu_index as usize;
@@ -11751,10 +11843,10 @@ fn sys_fb_map() -> i64 {
     // contract is "a mapped surface", and the surface is the process's OWN backing either way; only the
     // compositor-visible window is missed, which is exactly the fail-closed direction (nothing extra is
     // exposed to EL0).
-    unsafe { super::boot::map_slot_fb(slot) };
+    unsafe { super::uslots::map_slot_fb(slot) };
     let _ = win_bind_compat(asid, slot);
     fb_info_write_legacy(slot);
-    super::boot::fb_surface_va() as i64
+    super::uslots::fb_surface_va() as i64
 }
 
 /// WC-B: write the LEGACY info-page header — the ELF-3 field layout, byte-for-byte, describing region
@@ -11796,7 +11888,7 @@ fn set_detached(asid: u64, on: bool) {
 /// VUG-BG — clear ASID `asid`'s detached bit. Called from `boot::teardown_user_slot`'s FINAL-release arm
 /// (beside `clear_handle_row`, and before `SLOT_USED` is released for the same ordering reason), so every
 /// address space starts its life not-detached regardless of which launcher created it.
-#[cfg(feature = "baremetal")]
+#[cfg(feature = "aarch64_el0")]
 pub fn clear_detached(asid: u64) {
     set_detached(asid, false);
 }
@@ -11865,8 +11957,8 @@ pub fn set_hidden(asid: u64, on: bool) {
     // kernel backing that exists for the slot's whole life, teardown zeroes it, and `clear_hidden` at the
     // teardown funnel means a dead slot's word cannot outlive its owner.
     let slot = (asid - 1) as usize;
-    if slot < super::boot::USER_SLOTS {
-        let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    if slot < super::uslots::USER_SLOTS {
+        let info = super::uslots::slot_fb_info_ptr(slot) as *mut u32;
         // SAFETY: `slot < USER_SLOTS` is the bound `slot_fb_info_ptr` itself asserts, and `FB_INFO_FLAGS`
         // is inside the info page — the same pointer and index the two info-page writers use.
         unsafe { info.add(FB_INFO_FLAGS).write_volatile(fb_info_flags(slot)) };
@@ -11893,7 +11985,7 @@ pub fn set_hidden(asid: u64, on: bool) {
 /// bit to the next tenant — which would come up already idling, having never been hidden at all. That is
 /// the worse of the two failure directions (a window that draws nothing), so it is the one closed here
 /// at the funnel rather than at each launcher.
-#[cfg(feature = "baremetal")]
+#[cfg(feature = "aarch64_el0")]
 pub fn clear_hidden(asid: u64) {
     set_hidden(asid, false);
 }
@@ -11936,19 +12028,19 @@ fn fb_info_flags(slot: usize) -> u32 {
 }
 
 fn fb_info_write_legacy(slot: usize) {
-    let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    let info = super::uslots::slot_fb_info_ptr(slot) as *mut u32;
     // VUG-BG: the process-flags word rides along with every legacy-header publication, so it is present
     // by the time any window verb has returned a mapped surface to the caller.
     let flags = fb_info_flags(slot);
     unsafe {
         info.add(FB_INFO_FLAGS).write_volatile(flags);
         info.add(0).write_volatile(FB_MAGIC);
-        info.add(1).write_volatile(super::boot::FB_SURFACE_W);
-        info.add(2).write_volatile(super::boot::FB_SURFACE_H);
-        info.add(3).write_volatile(super::boot::FB_SURFACE_STRIDE);
+        info.add(1).write_volatile(super::uslots::FB_SURFACE_W);
+        info.add(2).write_volatile(super::uslots::FB_SURFACE_H);
+        info.add(3).write_volatile(super::uslots::FB_SURFACE_STRIDE);
         info.add(4).write_volatile(FB_FORMAT_ARGB8888);
-        info.add(5).write_volatile(super::boot::FB_SURFACE_SIZE as u32);
-        info.add(6).write_volatile(super::boot::FB_INFO_SIZE as u32); // surface offset from the info base
+        info.add(5).write_volatile(super::uslots::FB_SURFACE_SIZE as u32);
+        info.add(6).write_volatile(super::uslots::FB_INFO_SIZE as u32); // surface offset from the info base
     }
 }
 
@@ -11975,7 +12067,7 @@ fn sys_fb_present() -> i64 {
     let slot = (asid - 1) as usize;
     // M3: the compat surface's pointer and size are slot-derived constants — nothing here needs the
     // window table — so the checksum runs before the mask is ever taken.
-    let sum = fb_checksum(super::boot::slot_fb_surface_ptr(slot), super::boot::FB_SURFACE_SIZE);
+    let sum = fb_checksum(super::uslots::slot_fb_surface_ptr(slot), super::uslots::FB_SURFACE_SIZE);
     // WC-B: the compat wrapper presents the caller's REGION SLOT 0 surface at the legacy 32×32 geometry,
     // with the legacy witness accounting, whether or not a window entry was ever bound (a window entry
     // only adds the compositor-visible damage mark). Deliberately independent of the window table so this
@@ -11997,11 +12089,11 @@ fn sys_fb_present() -> i64 {
     let _ = win;
     present_surface_common(
         asid,
-        super::boot::slot_fb_surface_ptr(slot),
-        super::boot::FB_SURFACE_W,
-        super::boot::FB_SURFACE_H,
-        super::boot::FB_SURFACE_STRIDE,
-        super::boot::FB_SURFACE_SIZE,
+        super::uslots::slot_fb_surface_ptr(slot),
+        super::uslots::FB_SURFACE_W,
+        super::uslots::FB_SURFACE_H,
+        super::uslots::FB_SURFACE_STRIDE,
+        super::uslots::FB_SURFACE_SIZE,
         crate::video::wm::WIN_NONE,
         sum,
         None,
@@ -12121,11 +12213,11 @@ fn present_surface_common(
 /// asserts it: a region slot is indexed per address space and a window id is global, so a region
 /// slot index must never be able to exceed the global table.
 const WIN_MAX: usize = 8;
-const _: () = assert!(super::boot::FB_WIN_SLOTS <= WIN_MAX);
+const _: () = assert!(super::uslots::FB_WIN_SLOTS <= WIN_MAX);
 /// WC-B: a `FB_WIN_MAX_W` × `FB_WIN_MAX_H` ARGB8888 surface must fit a window's VA slot exactly.
 const _: () = assert!(
-    (super::boot::FB_WIN_MAX_W * super::boot::FB_WIN_MAX_H * 4) as usize
-        == super::boot::FB_WIN_SLOT_SIZE
+    (super::uslots::FB_WIN_MAX_W * super::uslots::FB_WIN_MAX_H * 4) as usize
+        == super::uslots::FB_WIN_SLOT_SIZE
 );
 
 /// WC-B: one window table row. `owner == 0` means FREE (ASID 0 is the shared/boot context, which can
@@ -12175,7 +12267,7 @@ static WINDOWS: SpinMutex<[WinEntry; WIN_MAX]> = SpinMutex::new([WinEntry::FREE;
 /// identical so no existing caller sees a new errno.
 fn win_caller_slot() -> Result<u64, i64> {
     let asid = current_asid();
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return Err(EINVAL);
     }
     Ok(asid)
@@ -12184,7 +12276,7 @@ fn win_caller_slot() -> Result<u64, i64> {
 /// WC-B: pages needed for a `w`×`h` ARGB8888 surface — the negotiated PAGE-MULTIPLE size. `None` if the
 /// geometry is out of range (0, or beyond `FB_WIN_MAX_W/H`), so every caller is fail-closed by shape.
 fn win_pages_for(w: u32, h: u32) -> Option<usize> {
-    if w == 0 || h == 0 || w > super::boot::FB_WIN_MAX_W || h > super::boot::FB_WIN_MAX_H {
+    if w == 0 || h == 0 || w > super::uslots::FB_WIN_MAX_W || h > super::uslots::FB_WIN_MAX_H {
         return None;
     }
     let bytes = (w as usize) * 4 * (h as usize);
@@ -12213,9 +12305,9 @@ fn win_bind_compat(asid: u64, _slot: usize) -> Option<usize> {
     t[id] = WinEntry {
         owner: asid,
         rslot: 0,
-        pages: (super::boot::FB_SURFACE_SIZE / 0x1000) as u8,
-        w: super::boot::FB_SURFACE_W as u16,
-        h: super::boot::FB_SURFACE_H as u16,
+        pages: (super::uslots::FB_SURFACE_SIZE / 0x1000) as u8,
+        w: super::uslots::FB_SURFACE_W as u16,
+        h: super::uslots::FB_SURFACE_H as u16,
         x: 0,
         y: 0,
         // WC-INT: see the doc comment — the compat window belongs to `wm::compat_present`, not to us.
@@ -12254,9 +12346,9 @@ fn win_resolve(asid: u64, win: u64) -> Result<(usize, WinEntry), i64> {
 ///   [0x40 + r*0x20] per region slot `r`: magic, win_id, w, h, stride, size, surface_offset-from-info-base.
 /// A region slot with no live window keeps a zeroed entry (magic 0), so EL0 can tell live from stale.
 fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
-    let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    let info = super::uslots::slot_fb_info_ptr(slot) as *mut u32;
     let stride = e.w as u32 * 4;
-    let off = super::boot::FB_INFO_SIZE + (e.rslot as usize) * super::boot::FB_WIN_SLOT_SIZE;
+    let off = super::uslots::FB_INFO_SIZE + (e.rslot as usize) * super::uslots::FB_WIN_SLOT_SIZE;
     // VUG-BG: publish the process-flags word here too. The legacy header (which also writes it) is only
     // refreshed for region slot 0, so a process whose FIRST window landed on a higher slot would
     // otherwise read a zeroed — i.e. wrongly "not detached" — flags word.
@@ -12277,7 +12369,7 @@ fn fb_info_write_win(slot: usize, id: usize, e: &WinEntry) {
 /// WC-B: zero window `id`'s per-window info entry on close, so EL0 cannot mistake a closed window's
 /// stale geometry for a live one (the info page outlives the window; only teardown zeroes the backing).
 fn fb_info_clear_win(slot: usize, rslot: usize) {
-    let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+    let info = super::uslots::slot_fb_info_ptr(slot) as *mut u32;
     unsafe {
         let p = info.add(0x40 / 4 + rslot * (0x20 / 4));
         for k in 0..(0x20 / 4) {
@@ -12298,8 +12390,8 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     let (w32, h32) = (w as u32, h as u32);
     // Reject BEFORE any truncation could hide an out-of-range request (a 64-bit arg cast to u32 could
     // otherwise wrap a huge value into a legal one).
-    if w > super::boot::FB_WIN_MAX_W as u64 || h > super::boot::FB_WIN_MAX_H as u64 {
-        return EINVAL;
+    if w > super::uslots::FB_WIN_MAX_W as u64 || h > super::uslots::FB_WIN_MAX_H as u64 {
+        { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_refuse(w, h); return EINVAL; } // ORIN-TENANT: name the over-cap refusal on the wire (unheld — no lock is taken yet). Line-NEUTRAL per this file's PANIC-Location rule.
     }
     let pages = match win_pages_for(w32, h32) {
         Some(p) => p,
@@ -12317,7 +12409,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // `map_slot_fb_win` would map 81 pages past the end of the FB region, into the NEXT slot's
     // backing store. The x86 twin took the same correction when its caps diverged; the fifth window
     // now gets the honest `-EMFILE` this verb already documents.
-    let rslot = match (0..super::boot::FB_WIN_SLOTS)
+    let rslot = match (0..super::uslots::FB_WIN_SLOTS)
         .find(|&r| !(0..WIN_MAX).any(|i| t[i].owner == asid && t[i].rslot as usize == r))
     {
         Some(r) => r,
@@ -12340,8 +12432,8 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // Map the info page (idempotent) and exactly the negotiated pages of this window's surface slot.
     // Under the table lock, so no concurrent close on another core can break-before-make the same leaves.
     unsafe {
-        super::boot::map_slot_fb_info(slot);
-        super::boot::map_slot_fb_win(slot, rslot, pages);
+        super::uslots::map_slot_fb_info(slot);
+        super::uslots::map_slot_fb_win(slot, rslot, pages);
     }
     // WC-INT: bind the compositor window BEFORE publishing the row, so the row is never visible to another
     // core with a stale `wm_id`. The surface pointer is the kernel's identity-mapped view of the leaves
@@ -12351,7 +12443,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     // that bounds every source read the compositor performs.
     e.wm_id = wc_shim::create(
         asid,
-        super::boot::slot_fb_win_surface_ptr(slot, rslot) as usize,
+        super::uslots::slot_fb_win_surface_ptr(slot, rslot) as usize,
         pages * 0x1000,
         w32,
         h32,
@@ -12362,7 +12454,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
     if rslot == 0 {
         // Region slot 0 is what the LEGACY header describes; keep it truthful for this geometry.
         fb_info_write_legacy(slot);
-        let info = super::boot::slot_fb_info_ptr(slot) as *mut u32;
+        let info = super::uslots::slot_fb_info_ptr(slot) as *mut u32;
         unsafe {
             info.add(1).write_volatile(w32);
             info.add(2).write_volatile(h32);
@@ -12371,7 +12463,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         }
     }
     fb_info_write_win(slot, id, &e);
-    id as i64
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_create(asid, id as u64, w32, h32, e.wm_id != crate::video::wm::WIN_NONE); id as i64 } // ORIN-TENANT: the create's wire witness. Printed UNDER the WINDOWS hold deliberately — global order WINDOWS ⊃ wm::TABLE ⊃ WRITER, a routed console's println descends exactly that way, and a create is program-rate (the same masked-hold class sys_win_present takes per frame). Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// SYS_WIN_PRESENT(win): damage-mark + composite the caller's window. Ownership-gated (`-EBADF`/`-EACCES`).
@@ -12429,7 +12521,7 @@ fn sys_win_present(win: u64) -> i64 {
     let e = t[id];
     drop(t);
     drop(_irq);
-    let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let surf = super::uslots::slot_fb_win_surface_ptr(slot, e.rslot as usize);
     let sum = fb_checksum(surf, e.pages as usize * 0x1000);
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
@@ -12521,7 +12613,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     let e = t[id];
     drop(t);
     drop(_irq);
-    let surf = super::boot::slot_fb_win_surface_ptr(slot, e.rslot as usize);
+    let surf = super::uslots::slot_fb_win_surface_ptr(slot, e.rslot as usize);
     let sum = fb_checksum(surf, e.pages as usize * 0x1000);
     let _irq = IrqGuard::mask_save();
     let t = WINDOWS.lock();
@@ -12605,7 +12697,7 @@ fn sys_win_close(win: u64) -> i64 {
             return EBADF; // freed under us by a racing teardown — already closed, nothing to do
         }
         let e = t[id];
-        unsafe { super::boot::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
+        unsafe { super::uslots::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
         fb_info_clear_win(slot, e.rslot as usize);
         t[id] = WinEntry::FREE;
         e.wm_id
@@ -12614,7 +12706,7 @@ fn sys_win_close(win: u64) -> i64 {
     // that spins until in-flight composites finish, and the surface it is draining has just been unmapped
     // above, so the drain must not be nested inside the lock a racing presenter may be waiting on.
     wc_shim::destroy(wm_id);
-    0
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_close(asid, win); 0 } // ORIN-TENANT: the owner-close wire witness, after the WINDOWS release and the wm drain above. Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// WC-B: close every window still owned by `asid` — the teardown half, called from `clear_handle_row`
@@ -12623,7 +12715,7 @@ fn sys_win_close(win: u64) -> i64 {
 /// program's private memory would be composited to the panel under the dead program's window. Unmaps
 /// first, exactly as `SYS_WIN_CLOSE` does, so a REUSED ASID starts with the reserved (EL1-only) leaves.
 pub fn win_close_asid(asid: u64) {
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return;
     }
     let slot = (asid - 1) as usize;
@@ -12636,10 +12728,10 @@ pub fn win_close_asid(asid: u64) {
                 continue;
             }
             let e = t[id];
-            unsafe { super::boot::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
+            unsafe { super::uslots::unmap_slot_fb_win(slot, e.rslot as usize, e.pages as usize) };
             fb_info_clear_win(slot, e.rslot as usize);
             t[id] = WinEntry::FREE;
-            closed[id] = e.wm_id;
+            closed[id] = e.wm_id; #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_reap_row(asid); // ORIN-TENANT: bump only — inside the WINDOWS hold a print would be a gratuitous hold extension; note_reap_done prints the total past the lock. Line-NEUTRAL.
         }
     }
     // WC-INT: outside the `WINDOWS` hold, for the drain-barrier reason spelled out in `sys_win_close`.
@@ -12799,14 +12891,14 @@ const INPUT_RING_CAP: usize = 32;
 
 /// The per-process input rings, keyed by ASID (0 = the shared/boot context, never a delivery target). One
 /// producer (the router) + one consumer (the EL0 task) per ring => a lock-free SPSC ring.
-static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::boot::USER_SLOTS + 1] =
-    [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; super::boot::USER_SLOTS + 1];
+static USER_INPUT_BUF: [[AtomicU64; INPUT_RING_CAP]; super::uslots::USER_SLOTS + 1] =
+    [const { [const { AtomicU64::new(0) }; INPUT_RING_CAP] }; super::uslots::USER_SLOTS + 1];
 /// Consumer index (free-running; advanced by SYS_INPUT_POLL). Real slot = `head & (CAP-1)`.
-static USER_INPUT_HEAD: [AtomicU32; super::boot::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
+static USER_INPUT_HEAD: [AtomicU32; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; super::uslots::USER_SLOTS + 1];
 /// Producer index (free-running; advanced by `user_input_enqueue`). Occupancy = `tail - head`.
-static USER_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; super::boot::USER_SLOTS + 1];
+static USER_INPUT_TAIL: [AtomicU32; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; super::uslots::USER_SLOTS + 1];
 
 /// VUGPAUSE-2: per-slot "this ASID has a task parked in `SYS_INPUT_WAIT`" flag. Set immediately before the
 /// futex park, cleared immediately after it returns — and ALSO cleared on slot teardown by
@@ -12830,8 +12922,8 @@ static USER_INPUT_TAIL: [AtomicU32; super::boot::USER_SLOTS + 1] =
 /// key with no waiters; a stale-clear flag costs a task that never runs again, so the two are traded
 /// against each other in that direction on purpose. The backstop no longer reads it at all
 /// (`user_input_wake_backstop`), which caps the whole failure class at one backstop period.
-static USER_INPUT_PARKED: [AtomicBool; super::boot::USER_SLOTS + 1] =
-    [const { AtomicBool::new(false) }; super::boot::USER_SLOTS + 1];
+static USER_INPUT_PARKED: [AtomicBool; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicBool::new(false) }; super::uslots::USER_SLOTS + 1];
 
 /// VUGPAUSE-2: how many times a task has PARKED in `SYS_INPUT_WAIT`, and how many waiters the wake seam
 /// has released. Both are cumulative for the boot and drive the `[vugpause2]` witness.
@@ -12850,13 +12942,13 @@ static USER_INPUT_WAKE_EDGES: AtomicU64 = AtomicU64::new(0);
 /// reports is `USER_INPUT_WAKES` above and is unaffected by anything here. Per-ASID rather than global
 /// because the question the line answers ("did THIS vug resume, or is it stranded?") is per-ASID: a
 /// global cadence would let a busy vug's traffic silence a newly launched one's first resume.
-static USER_INPUT_RESUMES: [AtomicU64; super::boot::USER_SLOTS + 1] =
-    [const { AtomicU64::new(0) }; super::boot::USER_SLOTS + 1];
+static USER_INPUT_RESUMES: [AtomicU64; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; super::uslots::USER_SLOTS + 1];
 
 /// VUGMIN-C: drop `asid`'s resume-print pacing count. Called from slot teardown ONLY — the count paces a
 /// witness line across a whole tenancy, so nothing on the running path may reset it.
 fn clear_input_resumes(asid: u64) {
-    if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
+    if asid != 0 && asid as usize <= super::uslots::USER_SLOTS {
         USER_INPUT_RESUMES[asid as usize].store(0, Ordering::Relaxed);
     }
 }
@@ -12910,7 +13002,7 @@ fn user_input_wake(asid: u64) -> usize {
 /// lines and know how many were elided. The first two resumes of every ASID print, which is what the
 /// "was this vug stranded or resumed?" read actually needs; a flood is what it does not.
 fn user_input_wake_edge(asid: u64, edge: &str) -> usize {
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return 0;
     }
     // CLICK-SWALLOW: count the NAMED edges — the focus arrival and the unhide, i.e. exactly the two
@@ -12964,7 +13056,7 @@ fn user_input_wake_edge(asid: u64, edge: &str) -> usize {
 /// measured idle win, and it is the price of the failure class being bounded at one period rather than
 /// unbounded. Any future stale-clear of the hint now costs an idle vug ~256 ms of latency, once.
 pub fn user_input_wake_backstop() {
-    for asid in 1..=super::boot::USER_SLOTS as u64 {
+    for asid in 1..=super::uslots::USER_SLOTS as u64 {
         let n = super::sched::futex_wake(input_futex_key(asid), usize::MAX);
         if n != 0 {
             USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
@@ -13091,7 +13183,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     //
     // Reserved only while there is somewhere to go: with fewer than two windows in the focus ring the key
     // falls through and is delivered as an ordinary TAB, so a single-window app keeps a normal keyboard.
-    #[cfg(feature = "pidesk")] if crate::video::crystal::key_escape(ev) || crate::video::quarry::key_route(ev) { return true; } if wc_focus_key(ev) { // MENUBAR-PI: <Esc> dismisses an OPEN SHARD menu, asked FIRST — x86 asks the identical question in the identical position (`wc_route_event`, ahead of `wc_focus_key`), because a modal surface must get the key before the focus ring does or Escape would TAB the desktop out from under an open menu. `key_escape` consumes ESC only while the menu is open, so every other boot is byte-alike. ⚠ ONE LINE, folded onto the `if` below: a line ADDED to this file renumbers every panic `Location` under it and breaks the knob-off `kernel8.img` byte-identity proof (PI-DESK's rule, and this file is named in it).
+    #[cfg(feature = "desktop_firmware")] if crate::video::crystal::key_escape(ev) || crate::video::quarry::key_route(ev) { return true; } if wc_focus_key(ev) { // MENUBAR-PI: <Esc> dismisses an OPEN SHARD menu, asked FIRST — x86 asks the identical question in the identical position (`wc_route_event`, ahead of `wc_focus_key`), because a modal surface must get the key before the focus ring does or Escape would TAB the desktop out from under an open menu. `key_escape` consumes ESC only while the menu is open, so every other boot is byte-alike. ⚠ ONE LINE, folded onto the `if` below: a line ADDED to this file renumbers every panic `Location` under it and breaks the knob-off `kernel8.img` byte-identity proof (PI-DESK's rule, and this file is named in it).
         return true;
     }
     // CLICK-ROUTE: the pointer's twin of the line above, and in the same place for the same reason —
@@ -13104,7 +13196,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
         return false; // consumed, not queued — `[el0in] routed` must stay truthful
     }
     let asid = USER_INPUT_ACTIVE.load(Ordering::Acquire);
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return false;
     }
     let Some(packed) = pack_input(ev) else {
@@ -13274,7 +13366,7 @@ pub fn user_input_set_active(asid: u64) {
     // BEFORE the app existed were never meant for it. Bounded by the queue's own 64-slot cap, so this
     // terminates even against a live producer. Only on a real focus (asid != 0); clearing focus leaves the
     // queue alone, since from then on those events legitimately belong to the shell/GUI channel.
-    if asid != 0 && (asid as usize) <= super::boot::USER_SLOTS {
+    if asid != 0 && (asid as usize) <= super::uslots::USER_SLOTS {
         clear_input_row(asid); // fresh focus starts clean
         let mut drained = 0u32;
         while drained < 64 && crate::pal::next_event().is_some() {
@@ -13491,7 +13583,7 @@ fn wc_close_click(owner: u64) -> &'static str {
     if crate::video::wm::focus_asid() == owner {
         crate::video::wm::focus_changed(0);
     }
-    if owner == 0 || owner as usize > super::boot::USER_SLOTS {
+    if owner == 0 || owner as usize > super::uslots::USER_SLOTS {
         // CLOSE-FIX: synthetic owner — no process CAN be behind it, the row close was the whole
         // effect, and the tag says so distinguishably (see the doc block's discriminator note).
         return "noproc-selftest";
@@ -13728,7 +13820,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
-        #[cfg(feature = "pidesk")] if crate::video::strip::press_route(x, y) { crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } else if crate::video::pulsewin::press_route(x, y) || crate::video::quarry::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header. Order: the strips first (they composite on top); on a strip-consumed press quarry::service() drains the dock tile's reopen latch HERE (a router does no disk I/O; this input-drain context is where the shell's own ls reads volumes). PULSEWIN and QUARRY then claim ONLY their own window's discs/menus, each re-asking wm::hit_test so an occluding window keeps every press; everything else falls to the arms below (keeps both draggable/parkable). ⚠ folded IN PLACE, never added lines: knob-off line numbers are load-bearing — PARITY.md §5.3.
+        #[cfg(feature = "desktop_firmware")] if crate::video::strip::press_route(x, y) { crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } else if crate::video::pulsewin::press_route(x, y) || crate::video::quarry::press_route(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // PI-DESK: furniture before every window arm — see this fn's header. Order: the strips first (they composite on top); on a strip-consumed press quarry::service() drains the dock tile's reopen latch HERE (a router does no disk I/O; this input-drain context is where the shell's own ls reads volumes). PULSEWIN and QUARRY then claim ONLY their own window's discs/menus, each re-asking wm::hit_test so an occluding window keeps every press; everything else falls to the arms below (keeps both draggable/parkable). ⚠ folded IN PLACE, never added lines: knob-off line numbers are load-bearing — PARITY.md §5.3.
         match crate::video::wm::hit_test(x, y) {
             // CLOSE-BOX (P79) — checked FIRST, so the close box beats select. This is the ONE
             // point in the click grammar where a click ACTS: the box is explicit window FURNITURE
@@ -13823,8 +13915,8 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 true
             }
             // DRAG-PI M3 — CHROME (title strip / border) is judged AFTER the three controls and BEFORE every app arm, exactly as the x86 twin orders it: a press on kernel-drawn chrome is an instruction to the WINDOW SYSTEM and is consumed here, a press on content is the app's input and falls through. Neither starves the other — `chrome_hit` is `outer_box` MINUS `content_box`, a region the app's surface does not cover a pixel of, and it declines COMPAT rows so a full-screen app keeps its whole panel. FURNITURE follows x86's rule rather than inventing a Pi one: a kernel-band row (the console) IS draggable — its title bar is a grip like any other — but the KEYBOARD goes to the shell, because there is no ring behind a kernel owner to hand it to. `drag_begin` self-guards on `title_bar_hit`, so a press on a BORDER raises and consumes without minting a grab the geometry does not support; the gesture is steered by `wm::drag_route_tail` from the two drains and ended by the release edge below. The click grammar is untouched: this arm SELECTS and grabs, it stops nothing and starts nothing. ⚠ ONE-LINE shape and long prose are not style — this file is compiled into the knob-off `kernel8.img` and a line ADDED anywhere in it breaks that image's byte-identity proof (panic `Location` records embed line numbers), so this arm is 2 lines paid for by 2 removed below; the diff is line-NEUTRAL and must stay so.
-            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
-            #[cfg(feature = "pidesk")] Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => { serial_println!("[clickroute] press hit furniture asid={} win={} (was {}) consume -> shell focus", owner, win, cur); user_input_set_active(0); crate::video::wm::focus_changed(owner); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true } // SHELLWIN-PI: KERNEL FURNITURE, on its CONTENT — raise it, hand the keyboard to the SHELL (asid 0), consume the press. Exact parity with the x86 arm of the same name (`arch/x86_64/syscall.rs`, "KERNEL FURNITURE — raise it, hand the keyboard to the shell"), including its POSITION: there the chrome block answers a furniture press on the title strip/border and this `hit_test` arm answers one on the content, and DRAG-PI's chrome arm directly above is that same first half on this arch. Without this second half the shell window is a trap — a press on its TEXT (chrome_hit is `outer_box` MINUS `content_box`, so the text is not chrome) would fall to the `owner != cur` arm below and `user_input_set_active(KERNEL_OWNER_DESKTOP)`, an "ASID" with no ring: clicking your own shell would take the keyboard AWAY from it, the SHELLWIN defect re-entered through the pointer. Below the close/minimise/zoom arms rather than above them as on x86, deliberately: those arms are where PA38's refused-close ruling lives on this arch, and this arc rides that path instead of diverting it. ⚠ ONE LINE, paid for by one line merged in this fn's header — panic `Location` records embed line numbers, so the knob-off `kernel8.img` byte-identity proof requires this diff to stay line-NEUTRAL.
+            #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::chrome_hit(win, x, y) => { if crate::video::wm::is_kernel_owner(owner) { user_input_set_active(0); } else if owner != cur { user_input_set_active(owner); } crate::video::wm::focus_changed(owner); let how = if crate::video::wm::drag_begin(win, x, y) { "drag" } else { "chrome" }; if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[clickroute] press chrome win={} owner={} at ({},{}) -> {}", win, owner, x, y, how); } CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true }
+            #[cfg(feature = "desktop_firmware")] Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => { serial_println!("[clickroute] press hit furniture asid={} win={} (was {}) consume -> shell focus", owner, win, cur); user_input_set_active(0); crate::video::wm::focus_changed(owner); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); true } // SHELLWIN-PI: KERNEL FURNITURE, on its CONTENT — raise it, hand the keyboard to the SHELL (asid 0), consume the press. Exact parity with the x86 arm of the same name (`arch/x86_64/syscall.rs`, "KERNEL FURNITURE — raise it, hand the keyboard to the shell"), including its POSITION: there the chrome block answers a furniture press on the title strip/border and this `hit_test` arm answers one on the content, and DRAG-PI's chrome arm directly above is that same first half on this arch. Without this second half the shell window is a trap — a press on its TEXT (chrome_hit is `outer_box` MINUS `content_box`, so the text is not chrome) would fall to the `owner != cur` arm below and `user_input_set_active(KERNEL_OWNER_DESKTOP)`, an "ASID" with no ring: clicking your own shell would take the keyboard AWAY from it, the SHELLWIN defect re-entered through the pointer. Below the close/minimise/zoom arms rather than above them as on x86, deliberately: those arms are where PA38's refused-close ruling lives on this arch, and this arc rides that path instead of diverting it. ⚠ ONE LINE, paid for by one line merged in this fn's header — panic `Location` records embed line numbers, so the knob-off `kernel8.img` byte-identity proof requires this diff to stay line-NEUTRAL.
             Some((win, owner, _z)) if owner != cur => {
                 // The ONLY line this arc adds to serial, and only on the arm that changes behaviour:
                 // a click that MOVED focus. Human-rate by construction (one line per click that lands
@@ -13873,7 +13965,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
     } else if prev & !mask != 0 {
         // RELEASE edge — follow the press, or drop. Never hit-tested: the release belongs to whoever
         // received the press, not to whatever the pointer has since been dragged over.
-        #[cfg(feature = "pidesk")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_end(); } // DRAG-PI M3 — the button coming up ENDS the grab, and this is the primary end: it carries the delivered edge, so the window rests where the operator let go and `[drag]`/`[wm-act] drag-end` name the gesture's cost and outcome on the wire exactly as they do on x86. No belt against a LOST release here (x86's `release-level` tail exists for an EHCI endpoint that can supersede a report before it is read); the Pi's xHCI drain has not shown that loss, and inventing a second ending for a failure this arch has not demonstrated would be machinery with no evidence behind it. `drag_forget` still cancels on close, so a grab cannot outlive its window.
+        #[cfg(feature = "desktop_firmware")] if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_end(); } // DRAG-PI M3 — the button coming up ENDS the grab, and this is the primary end: it carries the delivered edge, so the window rests where the operator let go and `[drag]`/`[wm-act] drag-end` name the gesture's cost and outcome on the wire exactly as they do on x86. No belt against a LOST release here (x86's `release-level` tail exists for an EHCI endpoint that can supersede a report before it is read); the Pi's xHCI drain has not shown that loss, and inventing a second ending for a failure this arch has not demonstrated would be machinery with no evidence behind it. `drag_forget` still cancels on close, so a grab cannot outlive its window.
         let target = CLICK_PRESS_TARGET.load(Ordering::Acquire);
         target == CLICK_TARGET_DROP || target != cur
     } else {
@@ -13896,7 +13988,7 @@ pub fn user_input_active() -> u64 {
 /// (`user_input_push`) and the consumer (`sys_input_poll`) are the only writers, and neither runs while
 /// the selftest drives a synthetic edge, so the difference across one press is exactly the delivery.
 pub fn user_input_depth(asid: u64) -> u32 {
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return 0;
     }
     let a = asid as usize;
@@ -13970,7 +14062,7 @@ fn clear_input_row(asid: u64) {
 /// event that proves the parker is gone — its slot being torn down, which is also the path where the
 /// parker `exit()`s out of `sched::futex_wait`'s pre-park kill boundary and never reaches its own clear.
 fn clear_input_parked(asid: u64) {
-    if asid != 0 && asid as usize <= super::boot::USER_SLOTS {
+    if asid != 0 && asid as usize <= super::uslots::USER_SLOTS {
         USER_INPUT_PARKED[asid as usize].store(false, Ordering::Release);
     }
 }
@@ -13995,7 +14087,7 @@ fn sys_input_poll() -> i64 {
     // LATER app of that boot, and it is the one part of the P54b orphan residue that outlives the run. Only the
     // app that actually OWNS INPUT can be making screen progress, which is exactly this predicate.
     let asid = current_asid();
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return EAGAIN;
     }
     //
@@ -14050,7 +14142,7 @@ fn sys_input_poll() -> i64 {
 ///     polling a few times a second — see there for the full argument.
 fn sys_input_wait() -> i64 {
     let asid = current_asid();
-    if asid == 0 || asid as usize > super::boot::USER_SLOTS {
+    if asid == 0 || asid as usize > super::uslots::USER_SLOTS {
         return EINVAL;
     }
     // The same two liveness stamps `sys_input_poll` makes, under the same focus predicate and for the
@@ -14220,21 +14312,21 @@ fn input_launcher(_demo_cpu: usize) {
     let bstart = &raw const __input_blob_start as usize;
     let bend = &raw const __input_blob_end as usize;
     let blen = bend - bstart;
-    if blen > super::boot::USER_CODE_SIZE {
+    if blen > super::uslots::USER_CODE_SIZE {
         serial_println!(":: EL0: input test — blob {} B > code page, SKIP ::", blen);
         return;
     }
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = the program's initial SP_EL0
-    let Some(slot) = super::boot::alloc_user_slot() else {
+    let Some(slot) = super::uslots::alloc_user_slot() else {
         serial_println!(":: EL0: input test — no free address-space slot, SKIP ::");
         return;
     };
-    let backing = super::boot::slot_backing_ptr(slot);
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     let asid = ttbr0 >> 48;
     install_console_cap(asid);
     // ELF-5: register this process as the active input target BEFORE it runs, so `user_input_enqueue` routes
@@ -14310,9 +14402,9 @@ fn fb_report(value: u64) {
 /// BOTTOM half with 0xB2 bytes (see the blob). The witness PASSes only if the presented surface matches.
 fn fb_expected_checksum() -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let half = super::boot::FB_SURFACE_SIZE / 2;
+    let half = super::uslots::FB_SURFACE_SIZE / 2;
     let mut i = 0usize;
-    while i < super::boot::FB_SURFACE_SIZE {
+    while i < super::uslots::FB_SURFACE_SIZE {
         let b: u8 = if i < half { 0xA1 } else { 0xB2 };
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -14462,22 +14554,22 @@ fn fb_launcher(_demo_cpu: usize) {
     let bstart = &raw const __fb_blob_start as usize;
     let bend = &raw const __fb_blob_end as usize;
     let blen = bend - bstart;
-    if blen > super::boot::USER_CODE_SIZE {
+    if blen > super::uslots::USER_CODE_SIZE {
         serial_println!(":: EL0: fb test — blob {} B > code page, SKIP ::", blen);
         return;
     }
     super::sched::futex_init();
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = the parent's initial SP_EL0
-    let Some(slot) = super::boot::alloc_user_slot() else {
+    let Some(slot) = super::uslots::alloc_user_slot() else {
         serial_println!(":: EL0: fb test — no free address-space slot, SKIP ::");
         return;
     };
-    let backing = super::boot::slot_backing_ptr(slot);
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     install_console_cap(ttbr0 >> 48);
     let entry = base + (&raw const __fb_prog_parent as usize - bstart) as u64;
     let run_cpu = super::percpu::this_cpu().cpu_index as usize;
@@ -14492,7 +14584,7 @@ fn fb_launcher(_demo_cpu: usize) {
     let w = (geom >> 16) as u32;
     let h = (geom & 0xFFFF) as u32;
     let expect = fb_expected_checksum();
-    let geom_ok = w == super::boot::FB_SURFACE_W && h == super::boot::FB_SURFACE_H;
+    let geom_ok = w == super::uslots::FB_SURFACE_W && h == super::uslots::FB_SURFACE_H;
     if done && present == 1 && geom_ok && checksum == expect {
         serial_println!(
             ":: EL0: fb test — mapped={}x{} threads=2 present={} checksum={:#x} :: PASS ::",
@@ -14502,7 +14594,7 @@ fn fb_launcher(_demo_cpu: usize) {
         serial_println!(
             ":: EL0: fb test — mapped={}x{} threads=2 present={} checksum={:#x} (want {}x{}/1/{:#x} done={}) :: FAIL ::",
             w, h, present, checksum,
-            super::boot::FB_SURFACE_W, super::boot::FB_SURFACE_H, expect, done
+            super::uslots::FB_SURFACE_W, super::uslots::FB_SURFACE_H, expect, done
         );
     }
 }
@@ -14824,21 +14916,21 @@ fn wcb_launcher(_demo_cpu: usize) {
     let bstart = &raw const __wcb_blob_start as usize;
     let bend = &raw const __wcb_blob_end as usize;
     let blen = bend - bstart;
-    if blen > super::boot::USER_CODE_SIZE {
+    if blen > super::uslots::USER_CODE_SIZE {
         serial_println!(":: EL0: window verbs — blob {} B > code page, SKIP ::", blen);
         return;
     }
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = the fixture's initial SP_EL0
-    let Some(slot) = super::boot::alloc_user_slot() else {
+    let Some(slot) = super::uslots::alloc_user_slot() else {
         serial_println!(":: EL0: window verbs — no free address-space slot, SKIP ::");
         return;
     };
-    let backing = super::boot::slot_backing_ptr(slot);
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     install_console_cap(ttbr0 >> 48);
     let entry = base + (&raw const __wcb_prog as usize - bstart) as u64;
     let run_cpu = super::percpu::this_cpu().cpu_index as usize;
@@ -14886,10 +14978,10 @@ fn wcb_launcher(_demo_cpu: usize) {
     crate::video::wm::ctrldecline_selftest();
     // DRAG-PI M4: the drag COST witness, after the control battery for the same reason it sits after
     // the hit-test one — it mints a row, drives it edge to edge twice and reaps it, so it must not run while another fixture's one-shots are still owed. It restores nothing because it takes nothing: `move_to` on its own row, and a grab it cancels itself.
-    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
     crate::video::wm::dragperf_selftest();
     // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
-    #[cfg(all(feature = "witness", feature = "pidesk"))]
+    #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
     crate::video::wm::dragwedge_selftest();
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
@@ -14944,12 +15036,12 @@ fn u4_setup() -> Option<U4Demo> {
     for p in &PROCS {
         p.done.init();
     }
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = shared initial SP_EL0
     let bstart = &raw const __u4_blob_start as usize;
     let bend = &raw const __u4_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U4 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U4 blob does not fit in a code page");
     // Entry VAs = base + each fixture's offset within the blob (an eret to a misaligned entry is EC 0x22).
     let entry = |label: *const u8| -> u64 {
         let va = base + (label as usize - bstart) as u64;
@@ -14961,18 +15053,18 @@ fn u4_setup() -> Option<U4Demo> {
 
     // Two slots, released together on partial failure (the M6d/M6f unwind). slots[0] = parent, [1] = orphan.
     let mut slots = [0usize; 2];
-    if !super::boot::alloc_user_slots(&mut slots) {
+    if !super::uslots::alloc_user_slots(&mut slots) {
         return None;
     }
     // Copy the whole blob into each slot's code page (identity backing VA) + I-cache sync (DC CVAU/IC IVAU;
     // PIPT L1 caches make it fetchable at the aliased EL0 window VA), then protect each EL0-RX/EL1-RO.
     for &s in &slots {
-        let backing = super::boot::slot_backing_ptr(s);
+        let backing = super::uslots::slot_backing_ptr(s);
         unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
         super::cache::icache_sync_range(backing as usize, blen);
     }
     for &s in &slots {
-        unsafe { super::boot::protect_user_slot_code(s, super::boot::USER_CODE_SIZE) };
+        unsafe { super::uslots::protect_user_slot_code(s, super::uslots::USER_CODE_SIZE) };
     }
 
     serial_println!(
@@ -14982,8 +15074,8 @@ fn u4_setup() -> Option<U4Demo> {
         parent,
         orphan,
         sp,
-        ttbr0_parent: super::boot::slot_ttbr0(slots[0]),
-        ttbr0_orphan: super::boot::slot_ttbr0(slots[1]),
+        ttbr0_parent: super::uslots::slot_ttbr0(slots[0]),
+        ttbr0_orphan: super::uslots::slot_ttbr0(slots[1]),
     })
 }
 
@@ -15077,23 +15169,23 @@ struct U5Demo {
 /// `u5_launcher`, after the U4 gate — so a slot is free and no task runs under the fixture's ASID yet (the
 /// endowment stores can't race a resolver). Register-only fixture (writes no user stack), so one slot suffices.
 fn u5_setup() -> Option<U5Demo> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = initial SP_EL0
     let bstart = &raw const __u5_blob_start as usize;
     let bend = &raw const __u5_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U5 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U5 blob does not fit in a code page");
     let cap = {
         let va = base + (&raw const __u5_prog_cap as usize - bstart) as u64;
         assert!(va & 3 == 0, "U5 fixture entry misaligned"); // an eret to a misaligned entry is EC 0x22
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     let asid = ttbr0 >> 48;
     // Pre-endow the fixture's table (before it is dispatched — no concurrent resolver). Two console caps: a
     // full one (write + grant) at index 1, and a write-LESS one at index 2 for the negative.
@@ -15193,23 +15285,23 @@ struct U6Demo {
 /// task runs under the fixture's ASID yet (the checks/endowment can't race a resolver). Register-only fixture
 /// (writes no user stack), so one slot suffices.
 fn u6_setup() -> Option<U6Demo> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = initial SP_EL0
     let bstart = &raw const __u6_blob_start as usize;
     let bend = &raw const __u6_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U6 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U6 blob does not fit in a code page");
     let spawn = {
         let va = base + (&raw const __u6_prog_spawn as usize - bstart) as u64;
         assert!(va & 3 == 0, "U6 fixture entry misaligned"); // an eret to a misaligned entry is EC 0x22
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     let asid = ttbr0 >> 48;
     serial_println!(
         ":: U6: general object table — (kind, target, rights) descriptors, first-free alloc skips the reserved console index ::"
@@ -15343,23 +15435,23 @@ struct U6bDemo {
 /// slot is free and no task runs under the fixture's ASID yet. Register-only fixture (writes no user stack; its
 /// only writable target is a kernel-filled data page), so one slot suffices.
 fn u6b_setup() -> Option<U6bDemo> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF; // 16-aligned window top = initial SP_EL0
     let bstart = &raw const __u6b_blob_start as usize;
     let bend = &raw const __u6b_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U6b blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U6b blob does not fit in a code page");
     let file = {
         let va = base + (&raw const __u6b_prog_file as usize - bstart) as u64;
         assert!(va & 3 == 0, "U6b fixture entry misaligned"); // an eret to a misaligned entry is EC 0x22
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe { core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen) };
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     let asid = ttbr0 >> 48;
     serial_println!(
         ":: U6b: real File handles — SYS_OPEN/SYS_READ routed through the object table (File + CAP_READ) ::"
@@ -15447,7 +15539,7 @@ pub fn u6b_launcher(demo_cpu: usize) {
     //     this PIPT A72); `dsb ish` completes/publishes it to the fixture's core before dispatch.
     let plant_len = core::cmp::min(16, USER_BLOB.len());
     unsafe {
-        let dst = super::boot::slot_backing_ptr(u6b.slot).add(0x3000);
+        let dst = super::uslots::slot_backing_ptr(u6b.slot).add(0x3000);
         core::ptr::copy_nonoverlapping(USER_BLOB.as_ptr(), dst, plant_len);
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -15502,19 +15594,19 @@ struct U7Fix {
 /// I-cache-sync, protect EL0-RX/EL1-RO, and return the run params for the requested entry symbol. Does
 /// NOT pre-endow (the launcher does, per fixture, before dispatch). `None` if slot allocation fails.
 fn u7_build(entry_sym: *const u8) -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u7_blob_start as usize;
     let bend = &raw const __u7_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U7 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U7 blob does not fit in a code page");
     let entry = {
         let va = base + (entry_sym as usize - bstart) as u64;
         assert!(va & 3 == 0, "U7 fixture entry misaligned"); // an eret to a misaligned entry is EC 0x22
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         // Scrub the WHOLE window before the copy (the x86 U2.5 residue discipline, review-confirmed as
         // load-bearing here): slot backings are zeroed only at first boot and a prior tenant's data
@@ -15525,8 +15617,8 @@ fn u7_build(entry_sym: *const u8) -> Option<U7Fix> {
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -15535,7 +15627,7 @@ fn u7_build(entry_sym: *const u8) -> Option<U7Fix> {
 /// aliased VA on this PIPT A72), published with `dsb ish` before the spinning fixture's next look.
 fn u7_release_go(slot: usize) {
     unsafe {
-        let go = super::boot::slot_backing_ptr(slot).add(0x3000) as *mut u64;
+        let go = super::uslots::slot_backing_ptr(slot).add(0x3000) as *mut u64;
         core::ptr::write_volatile(go, 1);
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -15568,7 +15660,7 @@ fn u7_release_go(slot: usize) {
 // U7STK (PARITY §6.1b) — THE CONVICTED FRAME, and why the fix is `#[inline(never)]`.
 //
 // THE DEFECT. On Pi metal `u7-launch` is dropped between `wcb_launcher` and
-// `video::pidesk::arm()` by the SPIN-6 refusal in `arch/aarch64/sched.rs`:
+// `video::desktop_firmware::arm()` by the SPIN-6 refusal in `arch/aarch64/sched.rs`:
 //
 //   [spin6] cpu=2 REFUSING corrupt switch-in: task=70:u7-launch ctx_sp=0x20c9e70
 //   outside its stack [0x20ca000,0x20ce000) — the parked frame was OVERWRITTEN
@@ -15756,7 +15848,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // uncounted `:: EL0: window verbs — … ::` line.
     wcb_launcher(demo_cpu);
     u7stk!("after:wcb");
-    #[cfg(feature = "pidesk")] crate::video::pidesk::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `pidesk::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
+    #[cfg(feature = "desktop_firmware")] crate::video::desktop_firmware::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `desktop_firmware::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
     u7stk!("after:pidesk_arm");
     // BGRUN-ST: the background-run contract, headless — bg spawn -> exit -> reap (ELFHELLO), then a
     // kill mid-run (UVUG) proving the confirmed-kill arm reaps the row in place. Placed AFTER the UVUG
@@ -16431,13 +16523,13 @@ fn grantee_from_grant_key(key: &[u8]) -> Option<PrincipalRecord> {
 // load name, or a torn-down slot) is ANONYMOUS = public-only: it may still own files at RUNTIME via (asid,gen)
 // [U6 unchanged], but its ownership does not PERSIST across reboot. Its own SpinMutex, taken IRQ-masked via
 // IrqGuard (stamped in syscall/boot context, cleared in the IRQ-masked teardown path — the OWNED_FILES idiom).
-static SLOT_PPID: SpinMutex<[PrincipalRecord; super::boot::USER_SLOTS + 1]> =
-    SpinMutex::new([PrincipalRecord::NONE; super::boot::USER_SLOTS + 1]);
+static SLOT_PPID: SpinMutex<[PrincipalRecord; super::uslots::USER_SLOTS + 1]> =
+    SpinMutex::new([PrincipalRecord::NONE; super::uslots::USER_SLOTS + 1]);
 
 /// M2.1: stamp `asid`'s persistent principal at spawn (called from `load_program_into_slot` with the
 /// loader-resolved name). ASID 0 (boot/shared) is never a spawned program — ignored defensively.
 fn slot_ppid_stamp(asid: u64, rec: PrincipalRecord) {
-    if asid == 0 || asid as usize >= super::boot::USER_SLOTS + 1 {
+    if asid == 0 || asid as usize >= super::uslots::USER_SLOTS + 1 {
         return;
     }
     let _irq = IrqGuard::mask_save();
@@ -16447,7 +16539,7 @@ fn slot_ppid_stamp(asid: u64, rec: PrincipalRecord) {
 /// M2.1: clear `asid`'s stamp at teardown (the slot's next tenant is a DIFFERENT program). Called from
 /// `clear_handle_row`, alongside `owned_clear_owner_asid`.
 fn slot_ppid_clear(asid: u64) {
-    if asid as usize >= super::boot::USER_SLOTS + 1 {
+    if asid as usize >= super::uslots::USER_SLOTS + 1 {
         return;
     }
     let _irq = IrqGuard::mask_save();
@@ -16459,7 +16551,7 @@ fn slot_ppid_clear(asid: u64) {
 /// under the IRQ-masked SLOT_PPID lock; the caller must NOT already hold OWNED_FILES/NAMESPACE (SLOT_PPID is an
 /// inner lock, captured before those — never nested under them).
 fn slot_ppid_of(asid: u64) -> PrincipalRecord {
-    if asid as usize >= super::boot::USER_SLOTS + 1 {
+    if asid as usize >= super::uslots::USER_SLOTS + 1 {
         return PrincipalRecord::NONE;
     }
     let _irq = IrqGuard::mask_save();
@@ -19829,26 +19921,26 @@ fn u7_run(demo_cpu: usize) {
 /// I-cache-sync, protect, return run params). The scrub keeps the same U7 discipline: a prior tenant's
 /// bytes survive teardown and must never leak into a fresh fixture window.
 fn u8_build() -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u8_blob_start as usize;
     let bend = &raw const __u8_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U8 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U8 blob does not fit in a code page");
     let entry = {
         let va = base + (&raw const __u8_prog_tree as usize - bstart) as u64;
         assert!(va & 3 == 0, "U8 fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -20031,26 +20123,26 @@ fn u8_launcher(demo_cpu: usize) {
 /// protect, return run params). The scrub keeps the U7/U8 discipline: a prior tenant's bytes survive teardown
 /// and must never leak into a fresh fixture window (the fixture's read-back buffer lives at +0x2000).
 fn u9_build() -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u9_blob_start as usize;
     let bend = &raw const __u9_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U9 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U9 blob does not fit in a code page");
     let entry = {
         let va = base + (&raw const __u9_prog_write as usize - bstart) as u64;
         assert!(va & 3 == 0, "U9 fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -20231,26 +20323,26 @@ fn u9_launcher(demo_cpu: usize) {
 /// protect, return run params). The scrub keeps the U7/U8/U9 discipline: a prior tenant's bytes must never leak
 /// into a fresh fixture window (the fixture's read-back buffer lives at +0x2000).
 fn u10_build() -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u10_blob_start as usize;
     let bend = &raw const __u10_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U10 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U10 blob does not fit in a code page");
     let entry = {
         let va = base + (&raw const __u10_prog_grow as usize - bstart) as u64;
         assert!(va & 3 == 0, "U10 fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -20394,26 +20486,26 @@ fn u10_launcher(demo_cpu: usize) {
 
 /// Build the U10-create fixture slot — the `u10_build` shape for the U10-create blob.
 fn u10c_build() -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u10c_blob_start as usize;
     let bend = &raw const __u10c_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U10-create blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U10-create blob does not fit in a code page");
     let entry = {
         let va = base + (&raw const __u10c_prog_create as usize - bstart) as u64;
         assert!(va & 3 == 0, "U10-create fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -20523,26 +20615,26 @@ fn u10c_launcher(demo_cpu: usize) {
 
 /// Build the U10-delete fixture slot — the `u10_build` shape for the U10-delete blob.
 fn u10d_build() -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u10d_blob_start as usize;
     let bend = &raw const __u10d_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U10-delete blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U10-delete blob does not fit in a code page");
     let entry = {
         let va = base + (&raw const __u10d_prog_delete as usize - bstart) as u64;
         assert!(va & 3 == 0, "U10-delete fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -20641,26 +20733,26 @@ fn u10d_launcher(demo_cpu: usize) {
 
 /// Build the U11 open-file-lifecycle fixture slot — the `u10d_build` shape for the U11 blob.
 fn u11_build() -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u11_blob_start as usize;
     let bend = &raw const __u11_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U11 blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U11 blob does not fit in a code page");
     let entry = {
         let va = base + (&raw const __u11_prog_close as usize - bstart) as u64;
         assert!(va & 3 == 0, "U11 fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -20792,7 +20884,7 @@ fn u11_launcher(demo_cpu: usize) {
 /// their own word). The whole window is scrubbed at build (`u11defer_build`), so no stale GO releases a step early.
 fn u11defer_release_go(slot: usize, off: usize) {
     unsafe {
-        let go = super::boot::slot_backing_ptr(slot).add(off) as *mut u64;
+        let go = super::uslots::slot_backing_ptr(slot).add(off) as *mut u64;
         core::ptr::write_volatile(go, 1);
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -20802,26 +20894,26 @@ fn u11defer_release_go(slot: usize, off: usize) {
 /// whole window, copy the blob, I-cache-sync, protect the code page EL0-RX/EL1-RO). `entry_sym` selects program A
 /// or B. `None` if slot allocation fails.
 fn u11defer_build(entry_sym: *const u8) -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u11defer_blob_start as usize;
     let bend = &raw const __u11defer_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U11-defer blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U11-defer blob does not fit in a code page");
     let entry = {
         let va = base + (entry_sym as usize - bstart) as u64;
         assert!(va & 3 == 0, "U11-defer fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -21232,26 +21324,26 @@ fn u11reuse_run() {
 /// scrub the whole window, copy the blob, I-cache-sync, protect the code page EL0-RX/EL1-RO). `entry_sym`
 /// selects program A or B. `None` if slot allocation fails.
 fn u11reap_build(entry_sym: *const u8) -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __u11reap_blob_start as usize;
     let bend = &raw const __u11reap_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U11-reap blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U11-reap blob does not fit in a code page");
     let entry = {
         let va = base + (entry_sym as usize - bstart) as u64;
         assert!(va & 3 == 0, "U11-reap fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -21540,7 +21632,7 @@ fn u11reap_run(demo_cpu: usize) {
 /// window at `off`, with a `dsb ish` so the EL0 poller on the other core sees it.
 fn uowner_release_go(slot: usize, off: usize) {
     unsafe {
-        let go = super::boot::slot_backing_ptr(slot).add(off) as *mut u64;
+        let go = super::uslots::slot_backing_ptr(slot).add(off) as *mut u64;
         core::ptr::write_volatile(go, 1);
         core::arch::asm!("dsb ish", options(nostack, preserves_flags));
     }
@@ -21549,26 +21641,26 @@ fn uowner_release_go(slot: usize, off: usize) {
 /// U6 (owner/grants): build ONE fixture slot for the shared two-entry owner/grants blob (`u11defer_build` shape).
 /// `entry_sym` selects program A or B. `None` if slot allocation fails.
 fn uowner_build(entry_sym: *const u8) -> Option<U7Fix> {
-    let (base, size) = super::boot::user_region();
+    let (base, size) = super::uslots::user_region();
     let sp = (base + size as u64) & !0xF;
     let bstart = &raw const __uowner_blob_start as usize;
     let bend = &raw const __uowner_blob_end as usize;
     let blen = bend - bstart;
-    assert!(blen <= super::boot::USER_CODE_SIZE, "U6 owner/grants blob does not fit in a code page");
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "U6 owner/grants blob does not fit in a code page");
     let entry = {
         let va = base + (entry_sym as usize - bstart) as u64;
         assert!(va & 3 == 0, "U6 owner/grants fixture entry misaligned");
         va
     };
-    let slot = super::boot::alloc_user_slot()?;
-    let backing = super::boot::slot_backing_ptr(slot);
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
     unsafe {
         core::ptr::write_bytes(backing, 0, size);
         core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
     }
     super::cache::icache_sync_range(backing as usize, blen);
-    unsafe { super::boot::protect_user_slot_code(slot, super::boot::USER_CODE_SIZE) };
-    let ttbr0 = super::boot::slot_ttbr0(slot);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
     Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
 }
 
@@ -21873,14 +21965,14 @@ impl BusMbox {
 
 /// Per-ASID reply mailboxes (row = ASID, like HANDLES). Static table of Options — the frames
 /// themselves are heap boxes, so the static footprint is pointers only.
-static BUS_MBOX: [SpinMutex<BusMbox>; super::boot::USER_SLOTS + 1] =
-    [const { SpinMutex::new(BusMbox::EMPTY) }; super::boot::USER_SLOTS + 1];
+static BUS_MBOX: [SpinMutex<BusMbox>; super::uslots::USER_SLOTS + 1] =
+    [const { SpinMutex::new(BusMbox::EMPTY) }; super::uslots::USER_SLOTS + 1];
 
 /// Per-ASID "replies pending" semaphores — the MRECV blocking primitive (the sys_wait idiom:
 /// Semaphore::wait parks the task; every enqueue posts). Lazily init()'d once (waiter-capacity
 /// reservation) before first use.
-static BUS_SEM: [super::sched::Semaphore; super::boot::USER_SLOTS + 1] =
-    [const { super::sched::Semaphore::new(0) }; super::boot::USER_SLOTS + 1];
+static BUS_SEM: [super::sched::Semaphore; super::uslots::USER_SLOTS + 1] =
+    [const { super::sched::Semaphore::new(0) }; super::uslots::USER_SLOTS + 1];
 static BUS_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initializing, 2 = ready
 
 /// One-shot waiter-capacity reservation for BUS_SEM (Semaphore::init's contract: reserve before
@@ -23143,4 +23235,74 @@ fn bandy_rt_launcher(demo_cpu: usize) {
     } else {
         serial_println!(":: BANDY-ACL: FAIL — foreign owner row / residue check failed ::");
     }
+}
+
+/// JETSON-EL0 (M1b) verdict task: the Orin's FIRST RUNG only — one EL0 task (`el0-hello`) that does a
+/// `SYS_WRITE` and exits 0. The Pi's `verdict` above cannot be reused: it demands the full M6b split
+/// (`exited=1 killed=3`), and the tegra bring-up deliberately spawns no fault fixtures — the fault
+/// fixtures re-prove EL0 *fault isolation*, which is a later Orin rung, and asserting a kill count of 3
+/// on a boot that spawns nothing to kill would report FAIL on a correct machine.
+///
+/// So this asserts the round trip and NOTHING else: EL0 was entered, the `SVC` came back through
+/// `VBAR_EL1` into the kernel, the write reached the console, and the task exited with status 0 —
+/// `ok == 1` with every other counter still at zero. The three zero terms are load-bearing, not
+/// decoration: a hello that faulted and was killed, or that exited nonzero, must read FAIL rather than
+/// pass on "something terminated".
+///
+/// Bounded by CNTPCT, which free-runs regardless of `timer::set_not_live()` (that call disarmed the
+/// timer INTERRUPT at the JM6 drop, not the counter) — so a wedged EL0 task yields a timeout FAIL line
+/// with its counts instead of hanging the boot dark before the shell terminus.
+///
+/// `tegra_el0`-gated: knob off, this function does not exist and the jetson media is unchanged.
+#[cfg(feature = "tegra_el0")]
+pub fn tegra_el0_verdict(_: usize) {
+    // ~5 s; the single round trip completes in well under 1 s.
+    let _ = wait_while_secs(5, || {
+        EL0_EXITED_OK.load(Ordering::Acquire)
+            + EL0_EXITED_ERR.load(Ordering::Acquire)
+            + EL0_KILLED_EXPECTED.load(Ordering::Acquire)
+            + EL0_KILLED_UNEXPECTED.load(Ordering::Acquire)
+            < 1
+    });
+    let ok = EL0_EXITED_OK.load(Ordering::Acquire);
+    let err = EL0_EXITED_ERR.load(Ordering::Acquire);
+    let exp = EL0_KILLED_EXPECTED.load(Ordering::Acquire);
+    let unexp = EL0_KILLED_UNEXPECTED.load(Ordering::Acquire);
+    if ok == 1 && err == 0 && exp == 0 && unexp == 0 {
+        serial_println!(":: TEGRA-EL0: el0-hello round-trip -> PASS ::");
+    } else {
+        serial_println!(
+            ":: TEGRA-EL0: el0-hello round-trip -> FAIL — exited_ok={} exited_err={} killed_expected={} killed_unexpected={} (want 1/0/0/0) ::",
+            ok,
+            err,
+            exp,
+            unexp
+        );
+    }
+}
+
+/// ORIN-TENANT (rung 6) — the census's read of the WC-B window table, for
+/// `display_tegra::orin_tenant_census`. Returns `(live_rows, wm_bound_rows, presents)`: rows a real
+/// EL0 ASID owns right now, how many of those hold a compositor row (`wm_id != WIN_NONE` — the
+/// difference is the HEADLESS shape the census names), and the lifetime `FB_PRESENT_COUNT` (bumped
+/// by the ONE shared present body all three present verbs run, so it counts tenant frames without
+/// this rung touching any present path). A masked micro-hold — count and fold only, the same class
+/// as `sys_win_move`'s re-check hold; called ~1/10 s from the pump's sweep, never nested inside any
+/// other lock. FILE-TAIL on purpose: `syscall.rs` compiles into the knob-off Pi `kernel8.img`, and
+/// this file's standing PANIC-Location rule means new lines may land only at the tail (or inside
+/// existing lines) — `#[cfg(orintenant)]` keeps even that out of every non-tenant build.
+#[cfg(feature = "orintenant")]
+pub fn orin_tenant_win_stats() -> (u32, u32, u64) {
+    let _irq = IrqGuard::mask_save();
+    let t = WINDOWS.lock();
+    let (mut rows, mut bound) = (0u32, 0u32);
+    for e in t.iter() {
+        if e.owner != 0 {
+            rows += 1;
+            if e.wm_id != crate::video::wm::WIN_NONE {
+                bound += 1;
+            }
+        }
+    }
+    (rows, bound, FB_PRESENT_COUNT.load(Ordering::Acquire))
 }

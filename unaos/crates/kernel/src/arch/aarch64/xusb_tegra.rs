@@ -65,17 +65,8 @@ fn cntfrq() -> u64 {
     if v == 0 { 62_500_000 } else { v }
 }
 
-/// A keyboard whose interrupt-IN read is ARMED: `keyboard_state == 3` is set exactly when the
-/// device-level SET_CONFIGURATION completed and `queue_keyboard_read` pushed the first Normal TRB
-/// (drivers/xhci/mod.rs, the HID SET_CONFIGURATION COMPLETE branch). Returns (slot, root port).
-fn keyboard_armed(x: &xhci::XhciController) -> Option<(u8, u8)> {
-    for (i, s) in x.slots.iter().enumerate() {
-        if s.active && s.is_keyboard && s.keyboard_state == 3 {
-            return Some((i as u8, s.port_id));
-        }
-    }
-    None
-}
+/// USB-HID-MULTI: the armed-keyboard witness is now `XhciController::armed_keyboards` (returns ALL
+/// armed HID keyboards, not just the first), driven from the pump loop below. See drivers/xhci/mod.rs.
 
 #[inline]
 fn dsb() {
@@ -316,6 +307,304 @@ pub fn jb6_csb_sweep() {
         );
     }
     w(0x9c, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// JB11 — the Falcon FIRMWARE-HEADER CENSUS: a blob-free identity readout that doubles as a
+// CRCR-wall witness. Always-on in the tegra build; read-only but for one documented IOCTL write.
+//
+// WHY THIS EXISTS. XUSBFW (the reload scaffold below) is permanently STOPped on the blob route:
+// the only T234 XUSB firmware NVIDIA ships is a signed nested container (NVGI -> RFFS -> RFRD)
+// we will not reverse-engineer, and NO raw-format image exists for this SoC — mainline's
+// xhci-tegra requests `nvidia/tegra{124,186,194,210}/xusb.bin` and has no tegra234 entry at all,
+// because `tegra234_soc` carries no `.firmware` member. What mainline does instead on t234 is
+// exactly what this census does: `tegra_xusb_init_ifr_firmware()` waits for USBSTS.CNR to clear
+// and then READS THE RUNNING FALCON'S OWN HEADER over BAR2. MB2/UEFI loads the Falcon from the
+// xusb-fw partition and Linux merely inherits it — as do we. So the firmware's identity is
+// reachable with zero blob, zero reverse engineering, and zero risky write.
+//
+// MECHANISM (public GPL, from drivers/usb/host/xhci-tegra.c — free to reimplement):
+//   write (FW_IOCTL_CFGTBL_READ << FW_IOCTL_TYPE_SHIFT) | byte_off -> BAR2 + XUSB_BAR2_ARU_FW_SCRATCH
+//   read                                                              BAR2 + XUSB_BAR2_ARU_SMI_ARU_FW_SCRATCH_DATA0
+// The header is 256 bytes; valid offsets 0x00..=0xFC. The field offsets below are the public
+// `struct tegra_xusb_fw_header` order.
+//
+// WHY THE ONE WRITE CANNOT DISTURB INHERITED CONTROLLER STATE (the no-HCRST / JB9d-GUARD law).
+// It targets XUSB_BAR2_ARU_FW_SCRATCH — the firmware's own IOCTL *request* register inside the ARU
+// window at XUSB_BAR2 (0x0365_0000). That is not an xHCI register: CRCR, USBCMD, USBSTS, DCBAAP,
+// ERSTBA/ERDP and the doorbell array all live in the SEPARATE host aperture at XUSB_HOST
+// (0x0361_0000), which this function only ever READS (the CNR poll). There is therefore no path by
+// which the scratch write can move the controller's run state, its command-ring pointer, or ring a
+// doorbell — "never write CRCR at RS=1" is not merely obeyed here, it is unreachable. Production
+// Linux issues this exact write on every t234 boot against a live inherited Falcon. It is also NOT
+// the CSB (page-select 0x9c -> window 0x2000, the JB6 aperture) and NOT the FPCI/CFG CSB
+// (EL3-FATAL on this block — JB7); it is the first-page ARU range JB6/JB8 proved decodes cleanly.
+//
+// ALL-ONES IS A RESULT, NOT A FAILURE. If the reads come back 0xffffffff the Falcon is in exactly
+// the state JB9d-GUARD already gates on, and this census converts that into a positive
+// experimental verdict — obtained with zero risky writes — instead of an absence of evidence.
+//
+// GATING: DEFAULT-ON in the tegra build, deliberately NOT behind the `xusbfw` feature, with one
+// negative escape knob (`UNAOS_NOJB11=1`, see JB11-ESCAPE below).
+//   * `xusbfw` is the wrong home. That feature exists to arm a DESTRUCTIVE path (STEP 0 is a BPMP
+//     Falcon reset) and it is mutually exclusive with the shipped JB9G_NO_HCRST inherit recipe —
+//     `reload_entry` returns `InheritActive` and bails BEFORE it ever reaches the aperture. A
+//     census parked there would therefore never run on any boot we actually ship. It also needs a
+//     bench-only blob path to be interesting at all, while this census needs nothing.
+//   * The precedent is JB5/JB6: this block is already censused unconditionally on every tegra boot
+//     (`jb5_witness` reads USBSTS + CPUCTL, `jb6_csb_sweep` sweeps the ARU/CSB) and JB9-A's
+//     header half is the same ioctl — only fossilised behind `JB9_PROBE = false`. JB11 is that
+//     half promoted to default-on and made decisive.
+//   * The cost is bounded and small: one CNR poll bounded at ~200 ms (expected to exit on the
+//     first read on the inherit path, where the controller is cleanly halted and never reset), plus
+//     11 header dwords = 22 MMIO accesses (each `jb11_hdr_dword` is one ioctl write + one result
+//     read; the eleven calls are the block at the `// The header.` comment below — ten `H_*` field
+//     offsets, `H_MAGIC` read twice for the 8-byte magic). No allocation, no DMA, no wait that can
+//     outlive its deadline. NOTE the JB11 commit message (abcc1edb) claims "14 header dwords = 28
+//     MMIO accesses" and this comment carried the same number: BOTH ARE WRONG, and the message is
+//     immutable mid-stack history so it is not rewritten. Count the `jb11_hdr_dword` calls.
+//   * The value is per-boot: every Orin boot now answers "is the inherited Falcon answering?"
+//     with a machine-checkable verdict line, which is the standing question behind the whole
+//     JB9/JETSON-XCARVE wall investigation.
+// Non-tegra builds are untouched: the whole module is `#[cfg(feature = "tegra")]`.
+//
+// JB11-ESCAPE (`UNAOS_NOJB11=1`) — the control-boot knob, spelled per the tree's negative-knob
+// convention (`UNAOS_NOTEGRASMP`, `UNAOS_NOSDHCBLK`, `UNAOS_NOKBDWIT`: `UNAOS_NO` + the thing,
+// no separating underscore, presence-is-truth). Default UNSET = census runs; that is the point of
+// JB11 and nothing about the default changes.
+//
+// WHY IT IS A RUNTIME BRANCH AND NOT A `#[cfg]`. The JB11 commit carries a WATCH ITEM: arming the
+// census grew the image ~118 KB through codegen-unit RE-PARTITIONING (not its own ~1.9 KB — proven
+// against a size-matched inert control), and the JETSON-XCARVE wall is IMAGE-LAYOUT-CORRELATED
+// (§JETSON-XCARVE: same code, different link layout, 4/4 vs 0/19). So the control boot has to
+// separate two suspects — "the census's own BAR2 traffic moved the wall" from "the relink moved the
+// wall" — and a compile-time gate cannot: cfg-ing the census out removes the traffic AND relinks,
+// confounding the two again. A runtime branch holds the layout FIXED and removes only the traffic:
+//   * armed vs suppressed are the same source, same functions, same strings, same codegen units,
+//     same panic `Location`s. MEASURED on this arc (`llvm-objcopy -O binary` of both kernel.elf,
+//     `cmp -l`): the loadable image differs in EXACTLY ONE BYTE — this flag, at `JB11_SUPPRESS`
+//     (00 -> 01) — and every symbol address is identical. The two ELF FILES additionally differ by
+//     32 bytes of `.strtab`, which is not loaded: LLVM's internal-symbol `.llvm.<hash>` suffixes
+//     change length with the module hash. Compare the binary image, not the .elf sha256;
+//   * so a wall that behaves identically under `UNAOS_NOJB11=1` exonerates JB11's 22 accesses and
+//     leaves the ~118 KB relink as the live suspect, while a wall that changes implicates the
+//     accesses. Neither inference is available from a cfg'd-out build.
+// The flag is a `#[used]` static read with `read_volatile`, NOT a bare `if option_env!(..).is_some()`
+// (which is a compile-time constant LLVM would const-fold, DCE-ing the whole census body and
+// relinking the image — reintroducing the very confound). `option_env!` is the same compile-time
+// embedding `UNAOS_SMPPROBE`/`UNAOS_FBW`/`UNAOS_V3D_FIRSTKICK` use; cargo's dep-info env tracking
+// rebuilds when the knob changes, so no feature flag is needed and none is added.
+// Suppression is never silent: the function prints one `census SUPPRESSED` line and returns before
+// the first touch, so the wire always states which of the two boots this was.
+// ---------------------------------------------------------------------------------------------
+
+/// JB11-ESCAPE: `UNAOS_NOJB11=1` at build time => 1, unset => 0. See JB11-ESCAPE above for why this
+/// is a `#[used]` static read volatilely rather than a `cfg`/const branch: the census body must stay
+/// linked in BOTH builds so that the suppressed control boot differs from the armed one by this word
+/// alone and by no relink.
+#[used]
+static JB11_SUPPRESS: u32 = match option_env!("UNAOS_NOJB11") {
+    Some(_) => 1,
+    None => 0,
+};
+
+/// BAR2 offset of the firmware IOCTL request register (`XUSB_BAR2_ARU_FW_SCRATCH`).
+const JB11_ARU_FW_SCRATCH: u64 = 0x1000;
+/// BAR2 offset of the firmware IOCTL result register (`XUSB_BAR2_ARU_SMI_ARU_FW_SCRATCH_DATA0`).
+const JB11_ARU_FW_SCRATCH_DATA0: u64 = 0x01c;
+/// `FW_IOCTL_TYPE_SHIFT` / `FW_IOCTL_CFGTBL_READ` — the config-table read opcode.
+const JB11_IOCTL_TYPE_SHIFT: u32 = 24;
+const JB11_IOCTL_CFGTBL_READ: u32 = 17;
+
+/// One header dword by byte offset (`0x00..=0xFC`). Write the ioctl request, read the result.
+/// Device-nGnRE ordering on the BAR2 aperture is non-reordering, so the read cannot pass the
+/// write; this is the same two-access sequence JB8 proved answers on this silicon.
+fn jb11_hdr_dword(off: u32) -> u32 {
+    unsafe {
+        core::ptr::write_volatile(
+            (XUSB_BAR2 + JB11_ARU_FW_SCRATCH) as *mut u32,
+            (JB11_IOCTL_CFGTBL_READ << JB11_IOCTL_TYPE_SHIFT) | (off & 0xff),
+        );
+        core::ptr::read_volatile((XUSB_BAR2 + JB11_ARU_FW_SCRATCH_DATA0) as *const u32)
+    }
+}
+
+/// Decode a 32-bit UNIX epoch to (y, m, d, hh, mm, ss) UTC. Howard Hinnant's `civil_from_days`,
+/// integer-only and positive-only (a u32 epoch is always >= 1970-01-01), so it is a handful of
+/// divisions — cheap enough to run inline in a boot census.
+fn jb11_utc(epoch: u32) -> (u64, u64, u64, u64, u64, u64) {
+    let (days, rem) = (epoch as u64 / 86_400, epoch as u64 % 86_400);
+    let z = days + 719_468; // days from 0000-03-01 to 1970-01-01
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    (y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// JB11: read the resident Falcon's firmware header over BAR2 and witness what it says — or
+/// witness that it says nothing, which is the CRCR-wall confirmation. See the block comment above
+/// for the mechanism, the write-safety argument, and the default-on gating decision.
+///
+/// Build with `UNAOS_NOJB11=1` to suppress the census for a control boot (one wire line, zero
+/// accesses, same image layout) — JB11-ESCAPE above.
+///
+/// Preconditions are physical and self-checked: the XUSB partition must be ON (the call site is
+/// inside `jb5_pg_on`'s proof — the JX1 gated-block rule) and BAR2 must be routed (`jb5_bar2_route`;
+/// re-checked here via `jb9_bar2_routed`). Everything else is a bounded read.
+pub fn jb11_fw_header_census(tag: &str) {
+    // Public `struct tegra_xusb_fw_header` byte offsets.
+    const H_BOOT_CODETAG: u32 = 0x08;
+    const H_BOOT_CODESIZE: u32 = 0x0c;
+    const H_RODATA_IMG_OFFSET: u32 = 0x18;
+    const H_FWIMG_CKSUM: u32 = 0x28;
+    const H_FWIMG_CREATED_TIME: u32 = 0x2c;
+    const H_L2_IMEM_START: u32 = 0x40;
+    const H_L2_IMEM_END: u32 = 0x44;
+    const H_VERSION_ID: u32 = 0x48;
+    const H_FWIMG_LEN: u32 = 0x64;
+    const H_MAGIC: u32 = 0x68;
+
+    // JB11-ESCAPE: the control boot. Volatile load so the branch survives optimization and the
+    // census below stays linked in — see the JB11-ESCAPE block above. This is the FIRST statement of
+    // the function: a suppressed boot performs zero BAR2 accesses, zero host-aperture reads and zero
+    // CNR polling, and says so in one line rather than vanishing silently.
+    if unsafe { core::ptr::read_volatile(&raw const JB11_SUPPRESS) } != 0 {
+        serial_println!(
+            ":: tegra: JB11 [{}] — census SUPPRESSED (UNAOS_NOJB11=1) — control boot: no BAR2 ioctl, no CNR poll, no header read; the census code is still linked, so this loadable image differs from the armed one by ONE byte (this flag) and by no relink ::",
+            tag
+        );
+        return;
+    }
+
+    // JX1 discipline: name the access class BEFORE the first touch, so a boot that dies here has a
+    // last serial line that names the killer aperture.
+    serial_println!(
+        ":: tegra: JB11 [{}] — Falcon fw-header census: BAR2+{:#05x} (IOCTL_CFGTBL_READ) -> BAR2+{:#05x}; no xHCI operational register is written ::",
+        tag, JB11_ARU_FW_SCRATCH, JB11_ARU_FW_SCRATCH_DATA0
+    );
+    if !jb9_bar2_routed() {
+        serial_println!(":: tegra: JB11 [{}] — BAR2 unrouted; census SKIPPED (guard) ::", tag);
+        return;
+    }
+    let cap0 = unsafe { core::ptr::read_volatile(XUSB_HOST as *const u32) };
+    if cap0 == 0 || cap0 == 0xFFFF_FFFF {
+        serial_println!(
+            ":: tegra: JB11 [{}] — cap0={:#010x} (host block not alive); census SKIPPED ::",
+            tag, cap0
+        );
+        return;
+    }
+
+    // Mirror mainline: wait for USBSTS.CNR (bit 11) to clear before trusting header reads. No CNR
+    // wait exists at this point in our boot order — the shared driver's `wait_for_cnr_clear` runs
+    // inside `xhci::init`/`init_interrupter`, far downstream, and on the JB9G_NO_HCRST inherit path
+    // `xhci::init` is never called at all — so this is the bounded one mainline's IFR path uses
+    // (~200 ms). Pure reads of the host aperture; expected to exit on the first poll on an inherit
+    // boot (the controller is cleanly halted by UEFI, never reset).
+    let usbsts_a = XUSB_HOST + (cap0 & 0xff) as u64 + 0x04;
+    let t0 = cntpct();
+    let deadline = t0.wrapping_add(cntfrq() / 5);
+    let mut usbsts = unsafe { core::ptr::read_volatile(usbsts_a as *const u32) };
+    let mut polls = 1u32;
+    while (usbsts >> 11) & 1 == 1 {
+        if cntpct().wrapping_sub(deadline) < (1u64 << 63) {
+            break; // deadline passed (wrap-safe)
+        }
+        core::hint::spin_loop();
+        usbsts = unsafe { core::ptr::read_volatile(usbsts_a as *const u32) };
+        polls += 1;
+    }
+    let cnr = (usbsts >> 11) & 1;
+    let waited_us = cntpct().wrapping_sub(t0).saturating_mul(1_000_000) / cntfrq();
+    serial_println!(
+        ":: tegra: JB11 [{}] — CNR gate: USBSTS={:#010x} CNR={} after {} poll(s) / ~{} us — {} ::",
+        tag, usbsts, cnr, polls, waited_us,
+        if cnr == 0 {
+            "READY (mainline waits for exactly this before reading the header)"
+        } else {
+            "STILL SET at the ~200 ms bound — the reads below are UNTRUSTED, witnessed anyway"
+        }
+    );
+
+    // The header. ELEVEN dwords, one ioctl round trip (write + read) each = 22 MMIO accesses — ten
+    // `H_*` field offsets plus the second half of the 8-byte magic. (Not 14/28: the JB11 commit
+    // message abcc1edb says 14 and is wrong; it is immutable history and is left as it stands.)
+    let codetag = jb11_hdr_dword(H_BOOT_CODETAG);
+    let codesize = jb11_hdr_dword(H_BOOT_CODESIZE);
+    let rodata_off = jb11_hdr_dword(H_RODATA_IMG_OFFSET);
+    let cksum = jb11_hdr_dword(H_FWIMG_CKSUM);
+    let created = jb11_hdr_dword(H_FWIMG_CREATED_TIME);
+    let imem_start = jb11_hdr_dword(H_L2_IMEM_START);
+    let imem_end = jb11_hdr_dword(H_L2_IMEM_END);
+    let version_id = jb11_hdr_dword(H_VERSION_ID);
+    let fwimg_len = jb11_hdr_dword(H_FWIMG_LEN);
+    let magic0 = jb11_hdr_dword(H_MAGIC);
+    let magic1 = jb11_hdr_dword(H_MAGIC + 4);
+
+    // The wall signature: EVERY anchor dword all-ones. That is the JB9d-GUARD state, and naming it
+    // from the header path is a genuine verdict, not a failed read.
+    let walled = [codetag, codesize, version_id, magic0, magic1]
+        .iter()
+        .all(|&v| v == 0xFFFF_FFFF);
+    // The JB8 liveness anchor: a served header has a sane boot_codesize.
+    let served = codesize != 0 && codesize != 0xFFFF_FFFF;
+
+    if walled {
+        serial_println!(
+            ":: tegra: JB11 [{}] — raw: codetag={:#010x} codesize={:#010x} version_id={:#010x} magic={:#010x}{:08x} ::",
+            tag, codetag, codesize, version_id, magic1, magic0
+        );
+        serial_println!(
+            ":: tegra: JB11 [{}] — verdict: Falcon not answering — inherited-state wall CONFIRMED from the header path (all-ones on every anchor dword; obtained with zero risky writes) ::",
+            tag
+        );
+        return;
+    }
+    if !served {
+        serial_println!(
+            ":: tegra: JB11 [{}] — raw: codetag={:#010x} codesize={:#010x} version_id={:#010x} created={:#010x} magic={:#010x}{:08x} ::",
+            tag, codetag, codesize, version_id, created, magic1, magic0
+        );
+        serial_println!(
+            ":: tegra: JB11 [{}] — verdict: header UNSERVED but NOT all-ones — the ARU aperture decodes and the Falcon returns no config table; INCONCLUSIVE (not the wall signature) ::",
+            tag
+        );
+        return;
+    }
+
+    // A live Falcon. Decode what it reports.
+    let mb = [
+        magic0 as u8, (magic0 >> 8) as u8, (magic0 >> 16) as u8, (magic0 >> 24) as u8,
+        magic1 as u8, (magic1 >> 8) as u8, (magic1 >> 16) as u8, (magic1 >> 24) as u8,
+    ];
+    let pr = |b: u8| if (0x20..=0x7e).contains(&b) { b as char } else { '.' };
+    let (yy, mo, dd, hh, mi, ss) = jb11_utc(created);
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw ident: magic=\"{}{}{}{}{}{}{}{}\" ({:#010x}{:08x}) version_id={:#010x} (Version: {:2x}.{:02x}) ::",
+        tag, pr(mb[0]), pr(mb[1]), pr(mb[2]), pr(mb[3]), pr(mb[4]), pr(mb[5]), pr(mb[6]), pr(mb[7]),
+        magic1, magic0, version_id, (version_id >> 24) & 0xff, (version_id >> 16) & 0xff
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw built: created={} (epoch) = {}-{:02}-{:02}T{:02}:{:02}:{:02}Z UTC ::",
+        tag, created, yy, mo, dd, hh, mi, ss
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw image: boot_codetag={:#010x} boot_codesize={} B rodata_img_offset={:#010x} fwimg_len={} B cksum={:#010x} ::",
+        tag, codetag, codesize, rodata_off, fwimg_len, cksum
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — fw L2 IMEM: start={:#010x} end={:#010x} (span={} B) ::",
+        tag, imem_start, imem_end, imem_end.wrapping_sub(imem_start)
+    );
+    serial_println!(
+        ":: tegra: JB11 [{}] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::",
+        tag
+    );
 }
 
 // JB7 (arc A) — RETIRED: the alternate FPCI/CFG CSB cross-read is EL3-FATAL on the inherited halted
@@ -1175,6 +1464,158 @@ pub fn jbxc_crcrq_quiesce(cap0: u32, our_cmd_ring: u64) {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// XUSBFW: the Tegra234 XUSB Falcon firmware-RELOAD scaffold (feature `xusbfw`, UNAOS_XUSBFW=1).
+//
+// This is a DESIGN SCAFFOLD, not a working reload. The signed NVGI firmware container is bench-only
+// and never enters the tree, so the IMEM/DMEM byte layout is unknown (see the design note) and this
+// path STOPs, witnessed, at the load boundary rather than streaming bytes it cannot place. Every
+// law's guard is wired even though the destructive steps are stubbed:
+//   * BAR2 CSB ONLY — the FPCI/CFG CSB aperture (FPCI+0x41c/+0x800) is EL3-FATAL (JB7); never here.
+//   * JB9d-GUARD reconciliation — a Falcon whose CSB reads all-ones cannot be halted/loaded via the
+//     CSB (JB6: writes don't stick). Reload's STEP 0 (a host-side BPMP MRQ_RESET, out-of-CSB) must
+//     clear that FIRST; this scaffold reuses jb6_csb_sweep's page-select-STICKS test as the gate and
+//     emits a witnessed SKIP — the guard's own honest-SKIP philosophy — if the aperture won't answer.
+//   * NEVER write CRCR at RS=1 — the scaffold touches no xHCI operational register at all.
+//   * Announce every new MMIO class before the first touch (JX1 discipline).
+//   * Mutually exclusive with the JB9G_NO_HCRST inherit recipe (STEP 0 wipes inherited state — the
+//     whole point). Enforced at RUNTIME here so the scaffold compiles; ARMING the real reset requires
+//     BOTH `JB9G_NO_HCRST = false` AND upgrading this to a compile-time assert (the JB4/JB5 pattern).
+//
+// See ~/.claude/plans/unaos/review/xusb-fw-reload-DESIGN.md.
+// ---------------------------------------------------------------------------------------------
+#[cfg(feature = "xusbfw")]
+pub mod xusbfw {
+    use super::{cntpct, jb9_bar2_routed, JB9G_NO_HCRST, XUSB_BAR2};
+
+    // Build-time firmware injection: `pub const XUSB_FW: Option<&[u8]>`, from the OPTIONAL
+    // `unaos-xusb-fw` crate — `Some(include_bytes!("<abs path>"))` ONLY when UNAOS_XUSB_FW_PATH is
+    // set (read directly from the bunker, never copied into the tree), else `None`. It lives in its
+    // own crate rather than a kernel build.rs because a build script's mere PRESENCE changes cargo's
+    // -C metadata, which re-lays-out every artifact on every arch even with the knob off (measured:
+    // 12b0993c moved knob-off x86 and Pi media, and deleting build.rs restored them byte-for-byte).
+    // As an optional dep it is absent from the knob-off build graph entirely, so the default build
+    // is both blob-free AND byte-identical to its pre-XUSBFW baseline.
+    pub use unaos_xusb_fw::XUSB_FW;
+
+    /// The signed NVIDIA container magic ('NVGI') — the one byte-level fact we assert on the blob.
+    /// The container is nested (NVGI -> RFFS -> RFRD -> ... -> tegra_xusb_fw_header + IMEM/DMEM) and
+    /// its internal segment layout is NOT reverse-engineered (design note §4) — read-only only.
+    const NVGI_MAGIC: [u8; 4] = *b"NVGI";
+
+    /// One witnessed outcome per reload attempt. The scaffold can only ever reach `LoadUnresolved`
+    /// (the honest STOP) or one of the earlier skips — never a real start — until the container
+    /// layout is resolved and STEP 0 (the BPMP Falcon reset) is implemented.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum ReloadOutcome {
+        /// Feature on but UNAOS_XUSB_FW_PATH unset — build.rs emitted `None`. Witnessed no-op.
+        NoFirmware,
+        /// The blob is present but not an NVGI container — refuse to touch the Falcon.
+        BadContainer,
+        /// The inherit recipe (JB9G_NO_HCRST) is armed; reload would fight it. Runtime mutual-excl.
+        InheritActive,
+        /// The BAR2 CSB aperture won't answer (all-ones / page-select won't stick). Guard-aligned
+        /// SKIP — STEP 0 (out-of-CSB Falcon reset) is required first and is not yet implemented.
+        CsbSilent,
+        /// Reached the IMEM/DMEM load boundary: container layout unresolved, so we STOP here rather
+        /// than stream bytes we cannot place. This is the scaffold's terminal state by design.
+        LoadUnresolved,
+    }
+
+    /// Does the BAR2 CSB page-select register (ARU_C11_CSBRANGE @0x9c) accept + read back a write?
+    /// This is the exact STICKS test jb6_csb_sweep runs — the discriminator between "the aperture
+    /// answers" and "the block reads all-ones / writes don't land". Strictly the same non-destructive
+    /// page-select write jb3_falcon already performs (no resets, no power/clock changes).
+    fn csb_page_select_sticks() -> bool {
+        let r = |off: u64| unsafe { core::ptr::read_volatile((XUSB_BAR2 + off) as *const u32) };
+        let w = |off: u64, v: u32| unsafe {
+            core::ptr::write_volatile((XUSB_BAR2 + off) as *mut u32, v)
+        };
+        let pre = r(0x9c);
+        w(0x9c, 0x1234);
+        let rb = r(0x9c);
+        w(0x9c, pre); // restore
+        rb == 0x1234
+    }
+
+    /// The reload entry point, wired at the top of `jb2b_attach` (before the takeover decision).
+    /// SCAFFOLD: performs every guard it can without threading new args, then STOPs witnessed at the
+    /// load boundary. Returns the outcome so the caller can (in a future armed build) branch to the
+    /// clean reset-path init instead of the no-HCRST inherit takeover.
+    pub fn reload_entry(cap0: u32) -> ReloadOutcome {
+        // 1. Witnessed no-op when no firmware path was supplied at build time (build.rs -> None).
+        let Some(fw) = XUSB_FW else {
+            serial_println!("XUSBFW: no firmware path set — reload skipped");
+            return ReloadOutcome::NoFirmware;
+        };
+
+        // 2. Cheap container sanity: the signed NVGI magic. We do NOT parse the container further
+        //    (design note §4: the NVGI/RFFS/RFRD layout is deliberately NOT reverse-engineered).
+        if fw.len() < 4 || fw[0..4] != NVGI_MAGIC {
+            serial_println!(
+                "XUSBFW: firmware present ({} B) but not an NVGI container (magic={:#04x}{:02x}{:02x}{:02x}) — refusing to touch the Falcon",
+                fw.len(),
+                fw.first().copied().unwrap_or(0),
+                fw.get(1).copied().unwrap_or(0),
+                fw.get(2).copied().unwrap_or(0),
+                fw.get(3).copied().unwrap_or(0),
+            );
+            return ReloadOutcome::BadContainer;
+        }
+        serial_println!(
+            "XUSBFW: NVGI firmware container present ({} B) — reload scaffold engaged (cap0={:#010x})",
+            fw.len(),
+            cap0
+        );
+
+        // 3. Mutual exclusion with the inherit recipe. STEP 0 of a real reload RESETS the Falcon and
+        //    wipes the inherited controller state that JB9G_NO_HCRST exists to preserve — the two can
+        //    never run on one boot. Enforced at RUNTIME so this scaffold compiles; ARMING the real
+        //    reset requires setting JB9G_NO_HCRST=false AND upgrading this to a compile-time
+        //    `const _: () = assert!(!(cfg!(feature="xusbfw") && JB9G_NO_HCRST));` (the JB4/JB5 class).
+        if JB9G_NO_HCRST {
+            serial_println!(
+                "XUSBFW: JB9G_NO_HCRST is armed — a Falcon reset would wipe the inherited state the \
+                 no-HCRST recipe preserves; reload is mutually exclusive with inherit and is SKIPPED \
+                 (set JB9G_NO_HCRST=false to arm reload — design note §5)"
+            );
+            return ReloadOutcome::InheritActive;
+        }
+
+        // 4. JB9d-GUARD reconciliation. Before ANY CSB write, prove the aperture answers. On the
+        //    inherited-halted block CPUCTL reads all-ones and JB6 proved even the 0x9c page-select
+        //    won't stick — a firmware stream into that aperture is a poke into a dead block, the exact
+        //    class JB9d-GUARD forbids. STEP 0 (a host-side BPMP MRQ_RESET of the Falcon/host reset id,
+        //    NEVER padctl) must clear the all-ones state from OUTSIDE the CSB first — that reset, and
+        //    the MRQ_PG GET_STATE partition-on proof it must be preceded by (bpmp_tegra::jb5_pg_on
+        //    style), are NOT implemented in this scaffold (they need the bpmp channel threaded in).
+        if !jb9_bar2_routed() {
+            serial_println!("XUSBFW: BAR2 unrouted — cannot reach the CSB; reload SKIPPED (guard)");
+            return ReloadOutcome::CsbSilent;
+        }
+        if !csb_page_select_sticks() {
+            serial_println!(
+                "XUSBFW: CSB page-select won't stick (Falcon all-ones / not answering) — reload SKIPPED. \
+                 A host-side BPMP Falcon reset (STEP 0, out-of-CSB) is required first and is not yet \
+                 implemented (JB9d-GUARD-aligned; design note §3)"
+            );
+            return ReloadOutcome::CsbSilent;
+        }
+
+        // 5. The load boundary. With the CSB answering we COULD now halt the Falcon (CPUCTL.HALT),
+        //    stream IMEM/DMEM, set BOOTVEC and STARTCPU (design note §1). But the NVGI container's
+        //    IMEM/DMEM segment offsets/sizes and boot vector are unknown (NOT reverse-engineered),
+        //    so we STOP here rather than stream bytes we cannot place. This is the scaffold's
+        //    terminal state — the declared reason the path is not end-to-end in-tree.
+        let _ = cntpct; // (bounded-wait helper the armed start()-poll will use)
+        serial_println!(
+            "XUSBFW: CSB answers — at the IMEM/DMEM load boundary. Container layout unresolved \
+             (NVGI/RFFS/RFRD not reverse-engineered); STOP before streaming firmware (design note §4)"
+        );
+        ReloadOutcome::LoadUnresolved
+    }
+}
+
 /// `jb9_smmu` = (NISO1 SMMU instance bases, XUSB SID) — threaded in by the caller so the JB9-B
 /// forensic captures below can dump the stream binding at enable-slot-pending time.
 pub fn jb2b_attach(
@@ -1205,6 +1646,14 @@ pub fn jb2b_attach(
         ":: tegra: JB2b — attaching the shared xHCI driver @{:#x} (platform, polled, no PCIe) ::",
         XUSB_HOST
     );
+
+    // XUSBFW: the Falcon firmware-RELOAD scaffold, run BEFORE the takeover decision (a reload
+    // replaces the inherit path — design note §2). SCAFFOLD: witnesses its guards and STOPs at the
+    // load boundary; it performs nothing destructive, so it is safe to wire ahead of the inherit
+    // takeover. Knob-off (`xusbfw` feature absent) this call + the whole module vanish
+    // (byte-identical, blob-free — build.rs emits no firmware bytes without the feature+path).
+    #[cfg(feature = "xusbfw")]
+    let _ = xusbfw::reload_entry(cap0);
 
     // JETSON-XCARVE M2: snapshot every inherited xHCI pointer BEFORE the no-HCRST takeover below
     // reprograms DCBAAP/CRCR/ERST — the diagnosis probe for the carveout wall (fault ADDR
@@ -1266,13 +1715,18 @@ pub fn jb2b_attach(
         };
         jb9_evt_phys = event_ring_phys;
         jb9_cmd_phys = command_ring_phys;
-        let erst_table_phys = &raw mut xhci::ERST_TABLE as u64;
+        // ERST is heap-allocated inside init_interrupter (JETSON-XCARVE: no xHC DMA structure lives in
+        // kernel-image .bss; the event ring + ERST now share the HEAP-GUARD-vetted firewall-clean window).
         // One line before the first RUNTIME-register / doorbell-array touch (new offsets within
         // the ungated block — the JX1 discipline: a dead boot's last line names the killer).
         serial_println!(":: tegra: JB2b — programming interrupter + rings (runtime regs) ::");
-        x.init_interrupter(event_ring_phys, erst_table_phys);
+        // ORIN-X200-1: stamp the xHCI DMA-arming window so the next metal boot can temporally
+        // separate the two 0x200-RAS candidates (xHCI vs RTL8168 — see rtl8168_tegra's twin stamp).
+        serial_println!(":: X200: xhci pointer-programming begins t={} (cntpct) ::", cntpct());
+        x.init_interrupter(event_ring_phys);
         x.init_pointers(command_ring_phys);
         x.start();
+        serial_println!(":: X200: xhci RS=1 (controller may DMA from here) t={} (cntpct) ::", cntpct());
         xhci::install(x);
     }
 
@@ -1353,6 +1807,12 @@ pub fn jb2b_attach(
     let storage_settle = cntfrq().saturating_mul(8);
     let mut armed: Option<(u8, u8)> = None;
     let mut armed_at: u64 = 0;
+    // USB-HID-MULTI: witness EVERY armed HID keyboard, not just the first. `witnessed` is a
+    // slot-id bitmask (slots are 1..=few) so a newly-armed second composite keyboard prints its
+    // own ARMED line the pass it comes up. The FIRST armed keyboard still drives `armed` (the
+    // storage-settle timer + the return value), and its line keeps the exact spec text.
+    let mut witnessed: u64 = 0;
+    let mut armed_ptr_count: usize = 0;
     // JB9-B capture marks: t≈200 ms (mid the FIRST port's first enable-slot attempt — the JB8
     // log shows ~340 ms per watchdog attempt, so the command is in flight) and t≈5 s (a later
     // port's attempt — same question after several rounds of recovery). Fired OUTSIDE the
@@ -1373,7 +1833,7 @@ pub fn jb2b_attach(
                 }
             }
         }
-        let (armed_now, storage_slot, storage_ready) = {
+        let (armed_kbds, ptr_count, storage_slot, storage_ready) = {
             // WEDGE-8 (F3): claim the loan per pass — service_storage's BOT waits must never run
             // under a held lock. Busy cannot occur in this single-threaded pre-drop window, but
             // the claim is fallible by contract; skip the pass if it ever is.
@@ -1395,22 +1855,34 @@ pub fn jb2b_attach(
             // waits ride `crate::hlt()`, which the timerless EL1 core cannot wake (the JD2/JB2b
             // rule). A no-op until a device is pending, so keyboard-only boots are unaffected.
             x.service_storage();
-            (keyboard_armed(x), x.storage_slot, x.storage_slot != 0 && x.storage_note == "ready")
+            (x.armed_keyboards(), x.armed_pointer_count(), x.storage_slot, x.storage_slot != 0 && x.storage_note == "ready")
         };
-        // Capture the keyboard the first time it arms, but keep pumping so a hubbed MSC can settle.
-        if armed.is_none() {
-            if let Some((slot, port)) = armed_now {
-                serial_println!(
-                    ":: tegra: JB2b — keyboard ARMED (slot {}, root port {}) -> PASS ::",
-                    slot,
-                    port
-                );
+        armed_ptr_count = ptr_count;
+        // USB-HID-MULTI: witness each armed keyboard as it comes up (not only the first), so a boot
+        // where two composite keyboards enumerate records BOTH — every one has its interrupt-IN read
+        // polled and its keys merged into the shared pal queue. The first still drives the settle
+        // timer + the returned handle; its line keeps the exact `-> PASS` spec text.
+        for (slot, port) in armed_kbds.iter().copied() {
+            if witnessed & (1u64 << slot) != 0 {
+                continue;
+            }
+            witnessed |= 1u64 << slot;
+            serial_println!(
+                ":: tegra: JB2b — keyboard ARMED (slot {}, root port {}) -> PASS ::",
+                slot,
+                port
+            );
+            if armed.is_none() {
                 armed = Some((slot, port));
                 armed_at = cntpct();
             }
         }
         if let Some(k) = armed {
             if storage_ready {
+                serial_println!(
+                    ":: tegra: JB2b — HID: {} keyboard(s), {} pointer(s) armed ::",
+                    (witnessed.count_ones()) as usize, armed_ptr_count
+                );
                 serial_println!(
                     ":: tegra: JD3 — mass storage ready (slot {}); panel shell ls/cat live ::",
                     storage_slot
@@ -1419,6 +1891,10 @@ pub fn jb2b_attach(
             }
             // Keyboard up but no disk yet: give the hubbed MSC a bounded settle window, then drop.
             if cntpct().wrapping_sub(armed_at) >= storage_settle {
+                serial_println!(
+                    ":: tegra: JB2b — HID: {} keyboard(s), {} pointer(s) armed ::",
+                    (witnessed.count_ones()) as usize, armed_ptr_count
+                );
                 serial_println!(
                     ":: tegra: JD3 — no mass storage within the settle window; proceeding (shell ls/cat report no disk) ::"
                 );
@@ -1472,4 +1948,213 @@ pub fn kbd_pump_body(_arg: usize) {
         }
         super::sched::yield_now();
     }
+}
+
+// ── ORIN-INPUT ──────────────────────────────────────────────────────────────────────────────────
+// INPUT INTO AN EL0 TENANT, ON THE TEGRA PATH — the pump the Orin never had.
+//
+// THE DEFECT. On a `tegra_el0` image the whole ELF-5 EL0 input chain EXISTS: the per-process ring
+// (`syscall.rs`, the ELF-5 block), the `user_input_enqueue` router seam, `user_input_set_active`, and
+// `SYS_INPUT_POLL` dispatched from the SVC table. `run_user_image` registers the launched program as the
+// active input target before its wait loop. Every hop is compiled in. And yet a tenant that polls
+// `SYS_INPUT_POLL` every frame receives nothing, because TWO hops between the controller and that seam
+// are missing on tegra — both of them Pi-only code:
+//
+//   1. NOTHING PUMPS THE CONTROLLER WHILE A TENANT RUNS. The Pi drains xHCI from a dedicated `usb_pump`
+//      task at ~4 ms (`main.rs`, `cfg(all(target_arch = "aarch64", feature = "baremetal"))`). The tegra
+//      image has no `baremetal`, so that task does not exist. The Orin's ONLY HID pump is the drain
+//      inside `main.rs::jd2_console_pump` — and that task is PARKED inside `handle_key` ->
+//      `dispatch_command` -> `run_user_image` for the tenant's entire life. `run_user_image`'s wait loop
+//      is `super::sched::yield_now()` and nothing else. So across a whole run, ZERO `poll_events()`
+//      calls happen: no HID report is harvested and `pal::EVENT_QUEUE` stays empty.
+//   2. NOTHING ROUTES KEYSTROKES. `main.rs::route_input_to_active_el0` and its sole caller
+//      `pump_usb_into_gui` are `cfg(all(target_arch = "aarch64", feature = "baremetal"))` too. On tegra
+//      `jd2_console_pump` feeds every `Event::Key` straight through `handle_key` REGARDLESS OF FOCUS —
+//      `display_tegra.rs` says so in its own words beside `orin_click`, having verified it rather than
+//      assumed it. So even a harvested keystroke goes to the shell, never to the tenant's ring.
+//
+// WHY THE BENCH'S `focus=0x0` IS A SYMPTOM, NOT THE CAUSE. `run_user_image` does grant focus
+// (`user_input_set_active(asid)`), so focus is non-zero for the whole run. But the `[orinclick]` and
+// `[orintenant]` censuses are emitted FROM `jd2_console_pump`'s own sweep — the same task that is parked
+// for the duration — so no census line can be emitted WHILE a tenant holds focus. A capture in which
+// almost every census line reads `focus=0x0` is therefore exactly what defect 1 predicts: the census
+// only ever samples the intervals when no tenant is running. It corroborates the parked pump; it is not
+// an independent focus bug.
+//
+// WHAT THIS ADDS. One pump pass driven from `run_user_image`'s wait loop — the one context that runs for
+// exactly as long as the tenant does. Claim the controller, `poll_events()` to harvest and re-arm the HID
+// rings, then drain `pal::EVENT_QUEUE` through the SAME `user_input_enqueue` seam the Pi router uses. No
+// second seam and no bypass, so the compositor's TAB interception and click routing, the ring's
+// drop-newest contract, and the `[uvug8]` takeover heartbeat all behave exactly as they do on the Pi.
+//
+// WHAT IT DELIBERATELY DOES NOT FIX. Defect 2 above is only NEUTRALISED FOR THE DURATION OF A `run`,
+// because the thief (`jd2_console_pump`) is parked exactly then. A `bg`-launched windowed tenant that
+// holds focus while the shell runs is still robbed of its keystrokes, and the honest fix there is NOT to
+// gate `jd2_console_pump` on `user_input_active() != 0`: with `pidesk` OFF, `USER_INPUT_ACTIVE` can hold
+// the `wm::KERNEL_OWNER_DESKTOP` pseudo-ASID (see `display_tegra.rs`'s note beside `orin_click`), and
+// routing keys into a pseudo-ASID ring would lock the operator out of the shell with no way back. That
+// belongs with the `pidesk` rung that owns the pseudo-ASID question, not here.
+//
+// WITNESS. Every hop counts, and the rollup is emitted at the END of EVERY `run_user_image` on this path,
+// so a run that delivered nothing SAYS so with a named verdict instead of printing nothing. `passes` is
+// the load-bearing field: it separates "the pump ran and the wire was quiet" from "the pump never ran",
+// which is precisely the ambiguity the bench capture could not resolve.
+//
+// KNOB. `orininput` (UNAOS_ORININPUT=1), implying `tegra_el0`. DEFAULT OFF => every item below and its
+// three call sites in `run_user_image` vanish; the jetson media and the Pi `kernel8.img` are both
+// byte-identical to baseline. Gated rather than shipped-on because it changes WHERE a keystroke goes
+// during a `run` (tenant ring instead of nowhere) and adds xHCI MMIO from a call site that never touched
+// the controller before.
+//
+// NOTHING BELOW HAS BEEN ON HARDWARE.
+
+/// ORIN-INPUT: pump passes inside the current `run_user_image`. `0` in the rollup means the wait loop
+/// never called us — which is NOT the same reading as "the wire was quiet".
+#[cfg(feature = "orininput")]
+static OI_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Passes on which no EL0 program held input focus, so the queue was left for the console's own drain.
+#[cfg(feature = "orininput")]
+static OI_NOFOCUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Events drained off `pal::EVENT_QUEUE` by this pump — HID edges that reached the kernel queue.
+#[cfg(feature = "orininput")]
+static OI_DECODED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Of those, the ones that carry something for EL0 (Key/KeyUp/Mouse/MouseAbsolute/Button). Timer/None/
+/// Unknown count in `decoded` but their non-arrival is not a delivery failure.
+#[cfg(feature = "orininput")]
+static OI_DELIVERABLE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Events `user_input_enqueue` actually queued into the focused tenant's ring.
+#[cfg(feature = "orininput")]
+static OI_ROUTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Deliverable events the seam refused: ring full (drop-newest), focus moved between the load and the
+/// push, or consumed by the compositor (TAB / a click addressed to the desktop).
+#[cfg(feature = "orininput")]
+static OI_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// CNTPCT tick of the last in-flight rollup, rate-limiting it to ~2 Hz. A held key or a moving mouse must
+/// not flood the bench transcript.
+#[cfg(feature = "orininput")]
+static OI_LAST_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-INPUT: zero the per-run counters. Called by `run_user_image` immediately before its wait loop so
+/// the rollup reports THIS tenant's input rather than the boot's accumulated total.
+#[cfg(feature = "orininput")]
+pub fn oi_reset() {
+    use core::sync::atomic::Ordering;
+    OI_PASSES.store(0, Ordering::Relaxed);
+    OI_NOFOCUS.store(0, Ordering::Relaxed);
+    OI_DECODED.store(0, Ordering::Relaxed);
+    OI_DELIVERABLE.store(0, Ordering::Relaxed);
+    OI_ROUTED.store(0, Ordering::Relaxed);
+    OI_DROPPED.store(0, Ordering::Relaxed);
+    OI_LAST_TICK.store(0, Ordering::Relaxed);
+}
+
+/// ORIN-INPUT: one pump pass — harvest the controller, then route to the focused tenant's ring.
+///
+/// Called once per `run_user_image` wait-loop pass, from the parked shell task, at EL1, on the boot core.
+/// `claim`, not `lock`: a Busy claim means a BOT transaction is in flight elsewhere, and skipping the
+/// pass is correct — the next pass is microseconds away. `jd2_console_pump` and `kbd_pump_body` take the
+/// same claim on the same controller, and only one of the three is ever runnable at a time.
+///
+/// `poll_events` ONLY — never the `service_*` pumps, whose bounded waits ride `hlt()` and would park this
+/// core forever post-drop with the EL2 timer off (the JB2b rule stated above `kbd_pump_body`).
+#[cfg(feature = "orininput")]
+pub fn oi_pump() {
+    use core::sync::atomic::Ordering;
+    OI_PASSES.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut x) = xhci::claim() {
+        x.poll_events();
+    }
+    // No EL0 owner: harvest only, drain nothing. The events belong to the console's drain, and
+    // `user_input_enqueue` would refuse every one of them WITHOUT consuming — so draining here would
+    // destroy the operator's keystrokes instead of delivering them. This is the tegra twin of the Pi
+    // router's "leave the events for the app's own drain" rule.
+    if super::syscall::user_input_active() == 0 {
+        OI_NOFOCUS.fetch_add(1, Ordering::Relaxed);
+        oi_rollup_maybe();
+        return;
+    }
+    while let Some(ev) = crate::pal::next_event() {
+        OI_DECODED.fetch_add(1, Ordering::Relaxed);
+        let deliverable = !matches!(
+            ev,
+            crate::pal::Event::Timer | crate::pal::Event::None | crate::pal::Event::Unknown
+        );
+        if deliverable {
+            OI_DELIVERABLE.fetch_add(1, Ordering::Relaxed);
+        }
+        if super::syscall::user_input_enqueue(ev) {
+            OI_ROUTED.fetch_add(1, Ordering::Relaxed);
+        } else if deliverable {
+            OI_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    oi_rollup_maybe();
+}
+
+/// ORIN-INPUT: the in-flight rollup, rate-limited to ~2 Hz on CNTPCT (free-running and EL-independent —
+/// the post-drop EL1 core has no timer IRQ, the JD3 mechanism). The first pass of a run always prints, so
+/// the transcript shows the pump alive before any HID edge has had a chance to arrive.
+#[cfg(feature = "orininput")]
+fn oi_rollup_maybe() {
+    use core::sync::atomic::Ordering;
+    let now = cntpct();
+    let last = OI_LAST_TICK.load(Ordering::Relaxed);
+    if last != 0 && now.wrapping_sub(last) < cntfrq() / 2 {
+        return;
+    }
+    OI_LAST_TICK.store(now.max(1), Ordering::Relaxed);
+    oi_rollup("live");
+}
+
+/// ORIN-INPUT: name what every hop saw, with a verdict that separates the ways a run can end with an
+/// empty tenant ring. Emitted unconditionally at the end of every `run_user_image` on this path — zero
+/// MUST say zero, and `passes=0` MUST be distinguishable from `decoded=0`.
+///
+/// Verdicts:
+///   * `DELIVERED`   — events reached the tenant's ring; the wire works end to end.
+///   * `ROUTER-DROP` — HID edges reached `pal::EVENT_QUEUE` but the seam refused every one. A large
+///                     `dropped` means the tenant is not draining its ring; otherwise the compositor
+///                     consumed them (TAB / a desktop click) or focus moved mid-pass.
+///   * `QUEUE-INERT` — only Timer/None/Unknown reached the queue. Pump and router are live; the HID
+///                     decode produced nothing a tenant can use.
+///   * `NO-HID`      — the pump ran WITH focus held and the controller produced no event at all. The
+///                     break is upstream of `pal::EVENT_QUEUE`: enumeration, the interrupt-IN re-arm, or
+///                     SMMU-dropped DMA. Trustworthy only because `passes` proves the pump ran.
+///   * `NO-FOCUS`    — the pump ran but no tenant ever held focus, so nothing was routed BY DESIGN.
+///                     Not an input defect; a focus one.
+///   * `NEVER-RAN`   — `passes=0`. The wait loop made no pump pass; every other number is meaningless.
+#[cfg(feature = "orininput")]
+pub fn oi_rollup(tag: &str) {
+    use core::sync::atomic::Ordering;
+    let passes = OI_PASSES.load(Ordering::Relaxed);
+    let nofocus = OI_NOFOCUS.load(Ordering::Relaxed);
+    let decoded = OI_DECODED.load(Ordering::Relaxed);
+    let deliverable = OI_DELIVERABLE.load(Ordering::Relaxed);
+    let routed = OI_ROUTED.load(Ordering::Relaxed);
+    let dropped = OI_DROPPED.load(Ordering::Relaxed);
+    let verdict = if passes == 0 {
+        "NEVER-RAN — the run_user_image wait loop made no pump pass"
+    } else if routed != 0 {
+        "DELIVERED"
+    } else if dropped != 0 {
+        "ROUTER-DROP — HID reached EVENT_QUEUE, the enqueue seam refused every event"
+    } else if decoded != 0 {
+        "QUEUE-INERT — only Timer/None/Unknown reached EVENT_QUEUE"
+    } else if passes != nofocus {
+        "NO-HID — pump ran with focus held, controller produced no event (break is upstream of EVENT_QUEUE)"
+    } else {
+        "NO-FOCUS — pump ran, no EL0 tenant ever held input focus"
+    };
+    serial_println!(
+        "[orininput] {} rollup passes={} nofocus={} decoded={} deliverable={} routed={} dropped={} focus={:#x} :: {} ::",
+        tag,
+        passes,
+        nofocus,
+        decoded,
+        deliverable,
+        routed,
+        dropped,
+        super::syscall::user_input_active(),
+        verdict
+    );
 }

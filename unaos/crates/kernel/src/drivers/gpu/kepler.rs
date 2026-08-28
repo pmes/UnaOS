@@ -1309,6 +1309,12 @@ pub fn init(gpu: &GpuInfo) {
     // 1. Enable Bus Master and Memory Space
     PciScanner::enable_bus_master(gpu.bus, gpu.slot, gpu.func);
 
+    // PCIH — boot-time PCIe link census (one `[pcih] ep` + one `[pcih] rp` line) and the
+    // arming of the wedge-time root-port sampler. Config-space reads only (plus, under the
+    // `noaspm` feature, the LNKCTL[1:0] clear); rides every kepler boot unconditionally so
+    // the link/ASPM ground truth is on the wire BEFORE any BAR is touched.
+    crate::drivers::gpu::pcihealth::census(gpu.bus, gpu.slot, gpu.func);
+
     let bar0 = gpu.bar0_phys as usize;
 
     let mut bar0_size = 0;

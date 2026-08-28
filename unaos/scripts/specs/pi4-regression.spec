@@ -125,11 +125,11 @@ COMPLETE :: BANDY-RT:
 # THE RESIDUE, and what each line is:
 #   * `[wc-g] win=1 ... -> COHER / RACE-BLIT / RACE-PRESENT / BLIT` (own=yes and own=no, seq 0-2).
 #     Present on BOTH untouched baselines. `win=1` on the armed gate is the CONSOLE WINDOW, and
-#     `video/pidesk.rs` documents at length what it is: until `panel_console_window_open` RETURNS,
+#     `video/desktop_firmware.rs` documents at length what it is: until `panel_console_window_open` RETURNS,
 #     the glyph route is not installed and fbcon is still painting the PANEL directly from every
 #     core that prints, over the same coordinates the compositor is blitting the console window's
 #     surface into. `fbbad=` counts exactly those pixels (5083 / 9218 / 11757 / 28524 across the
-#     captures — a different number every boot). pidesk.rs names the fix and its owner in as many
+#     captures — a different number every boot). desktop_firmware.rs names the fix and its owner in as many
 #     words ("move the console's presents off print context entirely and onto the RENDER core ...
 #     it needs a line in the Pi render service — `main.rs`'s render task, which is
 #     `exec-shellport`'s lane"). It is the same contested-panel window CHROME-TRUTH's deferral
@@ -142,7 +142,7 @@ COMPLETE :: BANDY-RT:
 #   * `[wc-c] side-by-side windows=2 drawn=1` — **OPEN, and NOT attributed. Both DONE-gate captures
 #     read `drawn=2`**, so it is not systematic; it is recorded because it was seen three times. The one-shot latches
 #     on the FIRST composite pass that has two real rows, so which pass wins is a timing race, and
-#     `pidesk.rs` already records this exact line as a symptom of console-window contention at bench
+#     `desktop_firmware.rs` already records this exact line as a symptom of console-window contention at bench
 #     geometry. The honest reading of the counts this arc took: baseline 2/2 captures `drawn=2`,
 #     knob-off 2/2 `drawn=2`, armed-with-this-arc 3 of 7 `drawn=1`. That is not significant at these
 #     sample sizes and there is no mechanism in this arc's diff that reaches `drawn` — every change
@@ -593,8 +593,22 @@ FORBID \[wc-d\] verify .*-> FAIL
 # ---    composite); post-fix the same span reads `waste=0`, and this leg replayed against the
 # ---    pre-fix capture reds on exactly the FORBID below (118/118, 1 forbidden).
 # ---    Ledger: docs/dev/OS/08_VIDEO/engine.md §CHROMEBAND.
-REQUIRE \[chromeband\] rollup rows_pp=[0-9]+ waste=0
-FORBID \[chromeband\] rollup rows_pp=[0-9]+ waste=[1-9]
+# ---    RE-ANCHORED AT THE 0ed6fee2 FOLD: trunk landed its own band clamp (6eba58f7) carrying the
+# ---    `[wc-b]` witness family, and pi's `[chromeband]` emitter was retired with pi's parallel
+# ---    implementation — the counters it read no longer exist, so the old pair below would have
+# ---    passed VACUOUSLY (rows_pp=0 waste=0) if it compiled at all. The same quantity is now
+# ---    `chrome_rows` vs `chrome_rows_used`: waste=0 IS amp=1.00x. Metal reference (rmbp
+# ---    flight-3, x86): rollup chrome_rows=101049239 chrome_rows_used=101049239 amp=1.00x CLEAN
+# ---    across 87,140 presents. ⚠ THE FORBID BELOW IS NOT YET FALSIFIED ON THIS BENCH — the
+# ---    `[wc-b] fixture` line deliberately exercises banding geometry, so if the fixture emits an
+# ---    AMPLIFIED reading BY DESIGN this FORBID reds honestly and must be narrowed to the rollup.
+# ---    First battery run after the fold IS the falsification; do not call this leg proven before it.
+REQUIRE \[wc-b\] rollup presents=[0-9]+ banded=[0-9]+ maxbands=[0-9]+ chrome_rows=[0-9]+ chrome_rows_used=[0-9]+ amp=1\.00x -> CLEAN
+# ---    NOTE the FORBID is written look-around-free per the PORTABILITY RULE at the head of this
+# ---    file: `foreman` (Rust regex) refuses look-around and its preflight is all-or-nothing, so a
+# ---    single `(?!…)` here would make that evaluator reject the WHOLE spec and check nothing.
+# ---    Chain below is the documented prefix-factored form of "not followed by 1.00x".
+FORBID \[wc-b\] rollup .* amp=(?:$|[^1]|1(?:$|[^.]|\.(?:$|[^0]|0(?:$|[^0]|0(?:$|[^x])))))
 
 # --- 4a-bis. DRAINSTALL (PA38 metal, 2026-08-12): the drain barrier's wait is BOUNDED, and reaching
 # ---    the bound is a FAULT, not a mode. `DrainBarrier::drain` abandons at DRAIN_ABANDON_SPINS and
@@ -755,7 +769,7 @@ FORBID \[wc-e\] fb-geometry query FAILED
 # ---    disjoint rectangles at opposite ends of the bottom strip: the twins hard right
 # ---    ((480,400,144x64) at 640x480) and the slope marker hard left ((16,208,264x256)). The caller
 # ---    used to answer "is the region clear?" for their UNION, so any window over EITHER vetoed BOTH.
-# ---    `pidesk::activate`'s console window — `[wc-x] console-window win=1 ... box=570x396 at (35,4)`,
+# ---    `desktop_firmware::activate`'s console window — `[wc-x] console-window win=1 ... box=570x396 at (35,4)`,
 # ---    i.e. x 35..605 y 4..400 — clears the TWIN box by exactly one row and overlaps the RAMP box
 # ---    across a third of its height, so every armed boot printed the one-shot DEFER and the verdict
 # ---    REQUIREd below never arrived. Per box, the twins run and the marker defers, which is the
@@ -1010,6 +1024,14 @@ REQUIRE \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
 # ---    discriminator was added to EXCUSE. WCH-STALL cannot divert a window's first present either:
 # ---    there is no earned floor yet to divert it against.
 # ---
+# ---    WCH-STALL SENSITIVITY SIGN-OFF (owed at the trunk landing, 2026-08-19). `STALL_SPREAD = 8`
+# ---    in `wcg.rs` is SIGNED OFF for the pi against the PARITY.md §6.13 metal baseline: healthy
+# ---    `TEAR-FREE` metal spreads there are 1–7 (one cold-first-present outlier at 181) and every
+# ---    captured `AT-RISK` spread is 32/33/84/136, so 8 is the lowest defensible pin — above the
+# ---    sustained healthy ceiling, a factor of 4 under the smallest captured stall, with 8–32 the
+# ---    supported band. It moves nothing this pattern reads: `stalls=` is published beside `torn=`
+# ---    and the verdict stays `torn=`-only, so no pin value here can make or unmake a FORBID.
+# ---
 # ---    THE FIX IS IN THE EMITTER, NOT IN THIS PATTERN'S BAND. Widening the band to exempt
 # ---    `presspread=1` would also exempt the REAL single-digit conviction on a POPULATED window — and
 # ---    `presspread=1` on a populated window is the s69 metal reading almost exactly (1.0002). So
@@ -1128,13 +1150,13 @@ REQUIRE \[cursor6\] rollup scope=.* present_over=.* masked=.* desktop_over=.* mi
 # ---        [wc-j] vacate  close_painted=true close_desktop=false (0/5) owner_desktop=false (0/5) -> FAIL
 # ---        [wc-j] retile  survivor=5 moved=true painted=true live=true old_desktop=false (0/3)   -> FAIL
 # ---        [wc-j] move-once ... old_desktop=false (0/3) ... overlap_px=27600                     -> FAIL
-# ---    Eleven probe points, eleven CORRECT repaints reported as eleven failures. `pidesk::activate`
+# ---    Eleven probe points, eleven CORRECT repaints reported as eleven failures. `desktop_firmware::activate`
 # ---    mints the console window at the GUI handoff — `box=570x396 at (35,4)` — which on the 640x480
 # ---    gate panel covers 89 % by 82 % of the glass, and the boot witness cascade then places its
 # ---    probe windows INSIDE it. The compositor reclaims those boxes exactly as it should: it erases
 # ---    to desktop and re-composites the row UNDERNEATH, so the points come back as the console
 # ---    window. The legs could only recognise DESKTOP_BG, so they convicted the correct answer.
-# ---    `video/pidesk.rs` records the collision as a standing one in its own words ("a standing
+# ---    `video/desktop_firmware.rs` records the collision as a standing one in its own words ("a standing
 # ---    conflict left for the integrator"); this is that conflict discharged at the WITNESS.
 # ---
 # ---    THE RULE, per point, in `wm::vacated_points`:
@@ -1567,7 +1589,7 @@ FORBID SPINHUNT: .*-> FAIL
 # ---    it was invisible to this spec: the line carries no `FAIL`, so no default FORBID caught it,
 # ---    and every witness the dropped task would have printed is ABSENCE-shaped, which this grammar
 # ---    cannot convict. Three Pi arcs gated GREEN on captures in which `u7-launch` died between
-# ---    `wcb_launcher` and `video::pidesk::arm()`, i.e. on QEMU runs of a path metal never took, and
+# ---    `wcb_launcher` and `video::desktop_firmware::arm()`, i.e. on QEMU runs of a path metal never took, and
 # ---    the missing PASS lines were read as "not armed on this build" rather than "the task is gone".
 # ---    The wire, from ~/unaos-bench/capture/pi4-pi1-b1/ttyACM0.log:
 # ---
@@ -1696,7 +1718,7 @@ FORBID \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
 # FURNITURE-OCC (CHROMESPEC, 2026-08-17) — legs 5 and 7 were asking questions the ARMED desktop
 # answers differently, and both were fixture preconditions rather than policy.
 #   * leg 5 `hidden=` asked `hit_test(probe).is_none()` after the shell raise buried the probe rows.
-#     With `pidesk`'s console window under the probe origin the point correctly resolves to that
+#     With `desktop_firmware`'s console window under the probe origin the point correctly resolves to that
 #     FURNITURE — which the shell raise has no business burying — so the leg convicted the compositor
 #     for being right. It now asks what it is about: neither PROBE ROW answers at that point. The
 #     owner it did resolve to is published as `hidden_owner=` at the line's end, REQUIREd below, so a
@@ -2101,7 +2123,7 @@ REQUIRE :: WMCTRL: controls-declined — floor=151 .* furniture close=true minzo
 FORBID :: WMCTRL: .* :: FAIL ::
 
 # --- DRAG-PI M4 — the drag COST witness (`[dragperf]`, wm::dragperf_selftest).
-# --- FORBID and not REQUIRE, deliberately. The fixture is `pidesk`-gated, so its line is present on
+# --- FORBID and not REQUIRE, deliberately. The fixture is `desktop_firmware`-gated, so its line is present on
 # --- the armed battery and absent from the knob-off one; a REQUIRE would assert the desktop knob's
 # --- output against a build that does not carry the knob and would red the knob-off gate for doing
 # --- exactly what it is supposed to do. A FORBID on the FAIL direction costs nothing when the line is
@@ -2126,7 +2148,7 @@ FORBID \[dragperf\] .* -> FAIL
 # --- (`[click2] depth gui_chan=65 (sent=794 recv=729)` pinned, ZERO `[clickroute]` lines, c1 at 99%)
 # --- and the machine stopped answering entirely.
 # ---
-# --- FORBID and not REQUIRE, on exactly the `[dragperf]` argument above: the fixture is `pidesk`-gated,
+# --- FORBID and not REQUIRE, on exactly the `[dragperf]` argument above: the fixture is `desktop_firmware`-gated,
 # --- so its line is present on the armed battery and absent from the knob-off one, and a REQUIRE would
 # --- red the knob-off gate for doing what it is supposed to do. The REQUIRED count stays 108.
 # ---
@@ -2149,7 +2171,7 @@ FORBID \[dragwedge\] .* -> FAIL
 # --- arm: a `BlitGuard` live on the drain's core with IRQs masked, where yielding is illegal and the
 # --- wait is structurally non-terminating. Pre-arc that call paid `DRAIN_ABANDON_SPINS` (2^30, ~27 s
 # --- on this gate); the leg asserts it now costs under 400 ms. FORBID rather than REQUIRE on
-# --- `[dragperf]`'s precedent immediately above: the fixture is `pidesk`-gated and its line is absent
+# --- `[dragperf]`'s precedent immediately above: the fixture is `desktop_firmware`-gated and its line is absent
 # --- from the knob-off battery, so a REQUIRE would red a build for not carrying a knob it was never
 # --- given. The `-> FAIL` forbid above would also catch this; this one names the cause.
 # --- `arm_yield=` is deliberately NOT forbidden either way — see the fixture's own note: whether legs
@@ -2163,7 +2185,7 @@ FORBID \[dragwedge\] .* arm_skip=false
 # --- and a SECOND release lowered nothing (the `exit()`-and-reaper double-fire the idempotence claim is
 # --- about). Unlike `arm_yield=` it depends on nothing about where the battery is driven from — it
 # --- stages its own scene against a synthetic task id — so a `rescue=false` is the mechanism and can
-# --- only be the mechanism. FORBID rather than REQUIRE for leg 6's reason: the fixture is `pidesk`-gated
+# --- only be the mechanism. FORBID rather than REQUIRE for leg 6's reason: the fixture is `desktop_firmware`-gated
 # --- and absent from the knob-off battery. Stubbing `drain_release_dead` to a no-op reds this line.
 FORBID \[dragwedge\] .* rescue=false
 
@@ -2182,7 +2204,7 @@ FORBID \[dragwedge\] .* rescue=false
 # --- one directive that was already reading that line.
 # --- SHARD-PRESS (PA41) — the crystal menu REACHES THE GLASS on the Pi (`crystal::routed_selftest`).
 # --- FORBID and not REQUIRE, on `[dragperf]`'s precedent immediately above and for its reason: the
-# --- fixture is `pidesk`-gated and its line is absent from the knob-off battery this gate runs, so a
+# --- fixture is `desktop_firmware`-gated and its line is absent from the knob-off battery this gate runs, so a
 # --- REQUIRE would red a build for not carrying a knob it was never given. A FORBID costs nothing
 # --- when the line is absent (0 hits) and still reds the armed battery on a regression.
 # ---
@@ -2225,7 +2247,7 @@ FORBID \[menubar\] .* press=inert
 FORBID \[serfocus\] split .* :: FAIL ::
 
 # --- QUARRY — the file manager's arithmetic fixture (`video/quarry/live.rs::selftest`, invoked from
-# --- `video/pidesk.rs`'s DESKTOP-READY seam). M1 shipped this fixture UNGUARDED: it printed
+# --- `video/desktop_firmware.rs`'s DESKTOP-READY seam). M1 shipped this fixture UNGUARDED: it printed
 # --- `:: QUARRY: … :: FAIL ::` into a log nobody grepped, so a regression in it was invisible to both
 # --- batteries. This closes that.
 # ---

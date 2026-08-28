@@ -20,9 +20,9 @@
 // log (or a red panic screen) stays up.
 
 use crate::video::FrameBuffer;
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 use crate::video::wm;
-#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "pidesk")))] // CONSWIN-PI: the routed console's surface store is a `Vec` on the Pi too
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // CONSWIN-PI: the routed console's surface store is a `Vec` on the Pi too
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
@@ -41,7 +41,7 @@ static GUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// `bootlog::record`) until the handoff. This flag is the panic override: `panic_screen` sets it
 /// so the panic text that `serial_println!` emits next still lands on the red backdrop on
 /// serial-less metal, whatever the build.
-#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "pidesk")))] // CONSWIN-PI: the PANIC PATH LAW's belt (see `draw_fb`) needs this flag on the Pi's routed console too
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] // CONSWIN-PI: the PANIC PATH LAW's belt (see `draw_fb`) needs this flag on the Pi's routed console too
 static PANIC_MIRROR: AtomicBool = AtomicBool::new(false);
 
 /// PANEL-CONSOLE (x86, kepler-takeover lane only): the QUIET-PANEL override. When set, `_print`
@@ -60,7 +60,7 @@ static PANEL_CONSOLE: AtomicBool = AtomicBool::new(false);
 /// Kept OUTSIDE the `FBCON` mutex on purpose. The damage declaration that follows a paint
 /// ([`route_present`]) runs with the lock released and interrupts enabled — a composite must never
 /// execute under the console lock — so the id it needs has to be readable without that lock.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static CONSOLE_WIN: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
 
@@ -73,11 +73,11 @@ static CONSOLE_WIN: core::sync::atomic::AtomicU32 =
 /// is [`PEND`]: the band is merged into the pending set BEFORE this guard is tested, so a declined
 /// present owes those rows to the next one instead of dropping them. Nothing else about the guard
 /// changed, and the re-entrant print is still a no-op.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static ROUTE_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// CONSOLE-WINDOW — has the first routed paint been announced yet? One-shot witness latch.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static ROUTE_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Base font cell (font8x8). The live cell is `FbCon::cell_w/cell_h` = this times the scale.
@@ -236,12 +236,12 @@ struct FbCon {
     /// SAFETY/INVARIANT: allocated once at its final size in [`panel_console_window_open`] and never
     /// grown or shrunk, so the heap buffer never moves and the raw address `wm` holds stays valid —
     /// the same idiom `shadow_store` and the `Screen` back store use.
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     win_store: Option<Vec<u8>>,
     /// A surface handle over `win_store`. Its layout is `Bgr`/4 bytes, which makes `put_pixel` store
     /// the little-endian word `0x00RRGGBB` — precisely the ARGB8888 pixel `wm::draw_window` reads
     /// back. Nothing converts between the two representations; they are the same bytes.
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     win_fb: FrameBuffer,
     cols: usize,
     rows: usize,
@@ -278,9 +278,9 @@ impl FbCon {
             shadow_store: None,
             #[cfg(target_arch = "x86_64")]
             shadow: FrameBuffer::new(),
-            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
             win_store: None,
-            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
             win_fb: FrameBuffer::new(),
             cols: 0,
             rows: 0,
@@ -334,7 +334,7 @@ impl FbCon {
     #[cfg(not(target_arch = "x86_64"))]
     #[inline]
     fn draw_fb(&self) -> &FrameBuffer {
-        #[cfg(all(target_arch = "aarch64", feature = "pidesk"))] if self.win_store.is_some() && !PANIC_MIRROR.load(Ordering::Relaxed) { return &self.win_fb; } &self.fb // CONSWIN-PI — the aarch64 half of the routed branch above, on the IDENTICAL PANIC PATH LAW (the route's existence AND `PANIC_MIRROR`, two independent guards). ⚠ ONE LINE, deliberately: a line ADDED to this file renumbers every panic `Location` below it, and this file is compiled into the knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof. Line-NEUTRAL, and must stay so.
+        #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] if self.win_store.is_some() && !PANIC_MIRROR.load(Ordering::Relaxed) { return &self.win_fb; } &self.fb // CONSWIN-PI — the aarch64 half of the routed branch above, on the IDENTICAL PANIC PATH LAW (the route's existence AND `PANIC_MIRROR`, two independent guards). ⚠ ONE LINE, deliberately: a line ADDED to this file renumbers every panic `Location` below it, and this file is compiled into the knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof. Line-NEUTRAL, and must stay so.
     }
 
     /// Grow the dirty band to include pixel rows `[y0, y1)`.
@@ -366,7 +366,7 @@ impl FbCon {
         // the console's per-line damage was being discarded — it was computed correctly by
         // `mark_rows`, reset here, and the present that followed then repainted all 750 rows of the
         // box because it had nothing narrower to go on.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         if self.win_store.is_some() {
             let band = (self.dirty_y0, self.dirty_y1);
             self.dirty_y0 = 0;
@@ -446,12 +446,12 @@ impl FbCon {
     fn write_byte(&mut self, b: u8) {
         let mut ops = OpList::<OPS_PER_BYTE>::new();
         self.plan_byte(b, &mut ops);
-        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale, self.aa); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))] if self.win_store.is_some() && !PANIC_MIRROR.load(Ordering::Relaxed) { super::wcg::seam_glyph_note(true, CONSOLE_WIN.load(Ordering::Relaxed)); } // WCGSEAM — charge the routed glyph write (locked path). Atomics only, and ⚠ ONE LINE for the same reason as `draw_fb`'s aarch64 branch: panic `Location`s below must not renumber.
+        paint_ops(self.draw_fb(), ops.as_slice(), self.fg, self.bg, self.scale, self.aa); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] if self.win_store.is_some() && !PANIC_MIRROR.load(Ordering::Relaxed) { super::wcg::seam_glyph_note(true, CONSOLE_WIN.load(Ordering::Relaxed)); } // WCGSEAM — charge the routed glyph write (locked path). Atomics only, and ⚠ ONE LINE for the same reason as `draw_fb`'s aarch64 branch: panic `Location`s below must not renumber.
     }
 
     /// Take the accumulated dirty band and reset it, for a caller that will flush it itself
     /// (the deferred panel path flushes outside the lock). `(y0, y1)`, empty when `y0 >= y1`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — the aarch64 arm of PANEL-DEFER needs the same take; the body is arch-neutral and unchanged. ⚠ SAME-LINE attribute widening, per `draw_fb`'s standing note.
     fn take_dirty(&mut self) -> (usize, usize) {
         let band = (self.dirty_y0, self.dirty_y1);
         self.dirty_y0 = 0;
@@ -505,11 +505,11 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
     // CONSOLE-WINDOW: a re-init re-homes the console on the raw panel at scale 1, so any routing is
     // stale by construction — the window's grid no longer describes this console. Drop the route
     // (the window row, if any, is left to `wm`; nothing here can composite).
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     CONSOLE_WIN.store(wm::WIN_NONE, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         let mut c = FBCON.lock();
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
         {
             c.win_store = None;
             c.win_fb = FrameBuffer::new();
@@ -544,7 +544,7 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
         c.ready = true;
         c.full_fb().fill_screen(BG_DEFAULT);
         c.full_fb().flush_all();
-    });
+    }); #[cfg(all(target_arch = "aarch64", feature = "orinface"))] orin_face_arm(); // ORIN-FACE — THE SEAM. Here and not the terminus line, because `init` is what RESETS the cell to font8x8 (`c.aa = false; c.cell_w = CELL_W;` twelve lines up) and everything an Orin operator reads is printed AFTER it: arming at the terminus would leave the whole boot log at ~0.8 mm. OUTSIDE the mask and OUTSIDE the lock the block above just released, because `panel_console_face_arm` takes `FBCON.try_lock()` itself and this wrapper prints its verdict (which mirrors back through `_print`). ⚠ SAME-LINE append to an existing statement's closing line: knob-off it is cfg-erased, no line moves, and no panic `Location` below renumbers.
 
     // VPERF-WC (x86, ALL builds — GUI blits benefit too): mark the framebuffer mapping
     // Write-Combining now that its range is known. The M3 shadow already made VRAM traffic
@@ -577,8 +577,24 @@ pub fn init(fb_addr: u64, fb_len: usize, info: FrameBufferInfo) {
 /// WHAT IS DELIBERATELY NOT EXCLUDED: `[wc-x]` — the console's own route / first-paint / decline
 /// announcements, which are exactly what a bench reader is looking FOR; `[fbcon]` and `[mirror]`,
 /// which announce mirror loss; boot milestones; every untagged line; and PANIC text.
-#[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
+///
+/// `[deadman]` joins the list for BOTH reasons at once, and its case is the strongest of the six. It
+/// is periodic telemetry with no on-glass reader (like `[wcn]`/`[schedx86]`) — but it is also emitted
+/// from the APIC TIMER ISR, and routing it to the panel would push a console present, and therefore
+/// compositor-adjacent work, inside an interrupt handler once a second. The wire keeps every byte of
+/// it: this policy governs the GLASS only, and the FTDI ring, `UNAOS.LOG` and the `tste` ring all tap
+/// upstream in `arch::serial::_print`.
+///
+/// The `[deadman]` entry is itself knob-gated. With `deadman` off no line can ever begin with that
+/// tag, so carrying it would put nine bytes of `.rodata` and one extra `starts_with` per
+/// panel-routed line into an image that can never use them — and would make "an unarmed kernel
+/// carries no `[deadman]` string" false by exactly one string. The pair below keeps that claim exact.
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog"), not(feature = "deadman")))]
 const PANEL_MUTE_TAGS: [&[u8]; 5] = [b"[wc-g]", b"[wc-h]", b"[wc-d]", b"[wcn]", b"[schedx86]"];
+
+#[cfg(all(target_arch = "x86_64", not(feature = "bootlog"), feature = "deadman"))]
+const PANEL_MUTE_TAGS: [&[u8]; 6] =
+    [b"[wc-g]", b"[wc-h]", b"[wc-d]", b"[wcn]", b"[schedx86]", b"[deadman]"];
 
 /// Bytes of a line's head the sniff needs in order to decide — the longest [`PANEL_MUTE_TAGS`] entry.
 #[cfg(all(target_arch = "x86_64", not(feature = "bootlog")))]
@@ -642,7 +658,7 @@ pub fn _print(args: core::fmt::Arguments) {
     let tap = &crate::serial_ring::TAP_FBCON;
     tap.submit();
     // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
-    if GUI_ACTIVE.load(Ordering::Relaxed) || panel_mirror_held() { // DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `pidesk::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+pidesk. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
+    if GUI_ACTIVE.load(Ordering::Relaxed) || panel_mirror_held() { // DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `desktop_firmware::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+desktop_firmware. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
         tap.suppress();
         return;
     }
@@ -681,25 +697,25 @@ pub fn _print(args: core::fmt::Arguments) {
             return;
         }
     }
-    // PANEL-DEFER (x86): mirror through the split layout/paint path when the draw target is VRAM
-    // (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror` for the invariant.
-    #[cfg(target_arch = "x86_64")]
-    if !PANIC_MIRROR.load(Ordering::Relaxed) {
+    // PANEL-DEFER (x86; aarch64 under ORIN-DEFER): mirror through the split layout/paint path when the
+    // draw target is VRAM (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror`.
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — THE PORT. This is the one gate that kept the whole split layout/paint path x86-only; every callee below already compiled on aarch64. See the `orindefer` note in Cargo.toml. ⚠ SAME-LINE attribute widening.
+    if defer_route_open() { defer_note_seen(); // ORIN-DEFER — the panic gate, arch-split at the file tail. On x86 this IS `!PANIC_MIRROR.load(Relaxed)`, unchanged byte for byte. It could NOT be that on aarch64: `PANIC_MIRROR`'s only `store` is `#[cfg(target_arch = "x86_64")]` (`panic_screen`), so on this arch the flag is permanently `false` and reading it would route PANIC output through the split path — the one case the x86 design excludes by name. The aarch64 arm reads `serial_ring::in_panic_mode()` instead, which the `#[panic_handler]` sets BEFORE `panic_screen()` and before its first `serial_println!`. Then: one charge per line reaching the armed route, taken BEFORE it decides, so `seen` is the denominator every other counter is read against and the census fires even on a boot where the split path never once won. The census latch is set before its print, so the nested `_print` that print causes cannot re-enter it. ⚠ SAME-LINE fold.
         let mut sink = PanelSink::new();
         let _ = core::fmt::Write::write_fmt(&mut sink, args);
         if sink.finish() {
             // The split path owned this line, or there was nothing to paint at all.
             if sink.split {
-                tap.absorb();
+                tap.absorb(); defer_note_split(); // ORIN-DEFER — the split path OWNED this line: layout masked, pixels unmasked. ⚠ SAME-LINE fold.
             } else {
-                tap.suppress();
+                tap.suppress(); defer_note_empty(); // ORIN-DEFER — nothing to paint at all (control-only line). ⚠ SAME-LINE fold.
             }
             return;
         }
         // The route was decided against the split path on the FIRST flush — before any pixel was
         // painted — so the line is still untouched and the classic path can render all of it.
     }
-    print_masked(args);
+    defer_note_classic(); print_masked(args); // ORIN-DEFER — the line fell back to the fully-masked classic route (console not ready, shadow attached, or `FBCON` contended on the FIRST chunk, before any pixel was painted). Self-guarded on the same `defer_route_open()` the block above tests, so panic lines are not counted and the ledger identity `split + empty + classic <= seen` holds by construction. ⚠ SAME-LINE fold.
 }
 
 /// CONSOLE-WINDOW — declare the console window damaged so the compositor presents the glyphs that
@@ -716,12 +732,12 @@ pub fn _print(args: core::fmt::Arguments) {
 /// keeps printing must not repaint a 1 MPx window behind the dialog on every line. (`wm`'s
 /// dirty set closes upward over occlusion, so each console line was repainting the dialog
 /// too: that is the flicker Peter saw on s43.) Suspension is presentation-only.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static CONSOLE_PRESENT_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 /// INSTGUI seam: suspend/resume the console window's presents (see the static above).
 /// Resuming forces one present so the console shows everything it accumulated.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn console_present_suspend(on: bool) {
     CONSOLE_PRESENT_SUSPENDED.store(on, Ordering::Relaxed);
     if !on {
@@ -744,14 +760,14 @@ pub fn console_present_suspend(on: bool) {
 /// the whole window" — lives beside this in [`PEND_FULL`] rather than in the struct, because it is
 /// precisely the state that has to be recordable when the ledger itself cannot be taken. Every
 /// degradation here is towards painting MORE, never less.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[derive(Clone, Copy)]
 struct Pending {
     y0: usize,
     y1: usize,
 }
 
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 impl Pending {
     const EMPTY: Pending = Pending { y0: 0, y1: 0 };
     fn merge(&mut self, y0: usize, y1: usize) {
@@ -776,11 +792,11 @@ impl Pending {
 /// IRQ-context printer can land on the same core mid-critical-section; a blocking acquire there would
 /// deadlock the machine over a repaint. Contention is instead answered with `full` — a whole-box
 /// present, i.e. exactly the behaviour this arc replaces, for one line.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PEND: Mutex<Pending> = Mutex::new(Pending::EMPTY);
 
 /// FBCON-DMG — record `[y0, y1)` as owed. Never presents; see [`route_present_rows`].
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn pend_merge(y0: usize, y1: usize) {
     match PEND.try_lock() {
         Some(mut p) => p.merge(y0, y1),
@@ -798,7 +814,7 @@ fn pend_merge(y0: usize, y1: usize) {
 /// arrive with a clean ledger — a whole-box repaint on behalf of a surface that did not change is
 /// 750 rows of work for no pixel. The distinction is made HERE because this is the only place that
 /// can still see it; after the swap-and-take, it is gone.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn pend_take() -> Owed {
     let full = PEND_FULL.swap(false, Ordering::AcqRel);
     match PEND.try_lock() {
@@ -822,7 +838,7 @@ fn pend_take() -> Owed {
 }
 
 /// Companion to [`PEND`] for the contended case — see [`pend_merge`].
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PEND_FULL: AtomicBool = AtomicBool::new(false);
 
 /// FBCON-PACE — what a routed call owes the compositor.
@@ -831,7 +847,7 @@ static PEND_FULL: AtomicBool = AtomicBool::new(false);
 /// already owed" are three different statements and only the first two used to be expressible. The
 /// third is what a sync point ([`console_flush`]) and a line that painted nothing both want: add
 /// nothing to the ledger, and do not invent a whole-box repaint for a surface that did not change.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[derive(Clone, Copy)]
 enum Owed {
     /// The whole surface changed, or the caller does not know what changed.
@@ -846,7 +862,7 @@ enum Owed {
 /// panel can show a change at all; anything faster is work whose result is overwritten before it
 /// is scanned out. `wm`'s own `[wc-h]` rollup already prints `frame_us=16667` for the same reason,
 /// and this is that number expressed as the rate it is derived from.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 const PACE_HZ: u64 = 60;
 
 /// FBCON-PACE — `now_cycles()` at the END of the last present this seam issued; 0 = none yet.
@@ -858,36 +874,36 @@ const PACE_HZ: u64 = 60;
 ///
 /// A stale stamp (a re-init, a route torn down and rebuilt) degrades toward a LARGE delta, i.e.
 /// toward presenting — the same direction every other degradation in this module takes.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PACE_LAST: AtomicU64 = AtomicU64::new(0);
 
 /// FBCON-PACE census — presents this seam ISSUED (any urgency).
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PACE_RAN: AtomicU64 = AtomicU64::new(0);
 
 /// FBCON-PACE census — presents the pacing gate HELD, counting ONLY calls that had rows of their own
 /// to defer ([`Owed::Band`] / [`Owed::Whole`]). That is the count of coalesced LINES, which is what
 /// the name is read as; a service-hook pass that added nothing and was not yet due is `idle`, not
 /// held. See [`console_pace_census_once`] for the identity the four counters close.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PACE_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// FBCON-PACE census — presents the [`ROUTE_BUSY`] re-entry guard declined. Counted for the first
 /// time here: it was the one decline in this file with no counter behind it, and a pacing gate that
 /// reports its own declines while a neighbouring one does not would be an invitation to misread the
 /// difference between the two.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PACE_BUSY: AtomicU64 = AtomicU64::new(0);
 
 /// FBCON-PACE census — calls that owed nothing and presented nothing: a [`console_service`] pass on
 /// a clean or not-yet-due ledger, and a control-only print. Without it the identity does not close —
 /// the arm that wins the re-entry guard and finds [`Owed::Nothing`] was landing in no bucket at all,
 /// and it is the COMMON shape of the service hook.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PACE_IDLE: AtomicU64 = AtomicU64::new(0);
 
 /// FBCON-PACE — one-shot latch for [`console_pace_census_once`].
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 static PACE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
 
 /// FBCON-PACE — is a present DUE, i.e. has a frame period elapsed since the last one finished?
@@ -912,7 +928,7 @@ static PACE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
 ///   → due.
 /// * [`PANIC_MIRROR`] armed → due, unconditionally. See the PANIC PATH LAW note on
 ///   [`route_present_banded`].
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn pace_due(now: u64) -> bool {
     if PANIC_MIRROR.load(Ordering::Relaxed) {
         return true;
@@ -928,7 +944,7 @@ fn pace_due(now: u64) -> bool {
     now.wrapping_sub(last) >= hz / PACE_HZ
 }
 
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn route_present() {
     if present_deferred() { PEND_FULL.store(true, Ordering::Release); return; } route_present_banded(Owed::Whole, false) // LIVECON — the whole box goes on the ledger and the RENDER core takes it; see `present_deferred` at the file tail (PANIC_MIRROR disarms the deferral, so the panic path composites inline exactly as before). LINE-NEUTRAL fold, PARITY §5.3.
 }
@@ -938,7 +954,7 @@ fn route_present() {
 /// The one call fbcon makes on the hot path, and the one that is PACED (see
 /// [`route_present_banded`]). Same contract as [`route_present`] in every other respect: **call with
 /// the `FBCON` lock RELEASED and interrupts ENABLED.**
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn route_present_rows(band: (usize, usize)) {
     if present_deferred() { pend_merge(band.0, band.1); return; } route_present_banded(Owed::Band(band.0, band.1), true) // LIVECON — THE HOT PATH. The rows are recorded exactly as a HELD present records them and the take is `console_service`'s, one per render pass; nothing is dropped, only deferred. See `present_deferred`. LINE-NEUTRAL fold, PARITY §5.3.
 }
@@ -946,7 +962,7 @@ fn route_present_rows(band: (usize, usize)) {
 /// FBCON-PACE — a print that changed NOTHING on the surface. Owes no rows; still gives the pacing
 /// gate a chance to retire rows an earlier line left owed. Previously this case forced a whole-box
 /// present, which repainted 750 rows on behalf of a line that moved no pixel.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn route_present_pending() {
     if present_deferred() { return; } route_present_banded(Owed::Nothing, true) // LIVECON — this caller owes NOTHING, so a deferred pass has nothing to record and nothing to present; the rows an earlier line left owed are the render pass's to retire. See `present_deferred`. LINE-NEUTRAL fold, PARITY §5.3.
 }
@@ -975,7 +991,7 @@ fn route_present_pending() {
 /// going to happen in, so the predicted present count is unchanged.
 ///
 /// Silent, and free on a clean ledger: `pend_take` answers `Owed::Nothing` and nothing is composited.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn console_service() {
     route_present_banded(Owed::Nothing, true)
 }
@@ -988,7 +1004,7 @@ pub fn console_service() {
 /// flush that is called once per service pass must not print once per service pass.
 ///
 /// No-op unless the console is routed, and free on a clean ledger.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn console_flush() {
     route_present_banded(Owed::Nothing, false)
 }
@@ -1009,7 +1025,7 @@ pub fn console_flush() {
 ///   * `idle` — the call added nothing and presented nothing: a service-hook pass on a clean or
 ///     not-yet-due ledger, or a control-only print. Kept OUT of `held` deliberately — charging it
 ///     there would inflate "lines coalesced" with calls that carried no line at all.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn console_pace_census_once() {
     if CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE {
         return;
@@ -1102,7 +1118,7 @@ pub fn console_pace_census_once() {
 /// The `[wc-d]` reference discipline is untouched: WCD-PRE takes its reference from the composite
 /// loop before the blit, and the print hazard it exists for is a print that MERGES and DECLINES —
 /// which is what a held present does, and what the re-entry guard already did.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn route_present_banded(owed_now: Owed, coalesce: bool) {
     let id = CONSOLE_WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
@@ -1195,41 +1211,41 @@ fn route_present_banded(owed_now: Owed, coalesce: bool) {
     ROUTE_BUSY.store(false, Ordering::Release);
 }
 
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 fn route_present() {}
 
 /// No-op off the routed x86 path: `flush_dirty` returns `None` there, so this is never reached with
 /// a real band. Defined so the shared print paths need no `cfg` of their own.
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 fn route_present_rows(_band: (usize, usize)) {}
 
 /// No-op off the routed x86 path (see the x86 definition). There is no pacing gate to give a chance
 /// to, because there is no present.
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 fn route_present_pending() {}
 
 /// No-op off the routed x86 path (see the x86 definition). `detach` calls this on every arch; off
 /// the routed path there is nothing owed and nothing printed.
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 pub fn console_flush() {}
 
 /// No-op off the routed x86 path (see the x86 definition). The `usbdebug` service loop calls this
 /// on every arch and every build; off the routed path there is no ledger to service.
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 pub fn console_service() {}
 
 /// No-op off the routed x86 path (see the x86 definition). There is no pacing gate to report on.
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 pub fn console_pace_census_once() {}
 
 /// No-op off the wc path (see the x86 definition).
-#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline]
 pub fn console_present_suspend(_on: bool) {}
 
@@ -1298,7 +1314,7 @@ static PANEL_UNANNOUNCED: AtomicU64 = AtomicU64::new(0);
 /// Bytes buffered before one layout/paint round-trip. Bounds the stack cost of the op buffer
 /// (`CHUNK * OPS_PER_BYTE` ops), which matters because an IRQ-context printer can nest inside the
 /// paint pass — see the invariant below.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — see the knob note in Cargo.toml. ⚠ SAME-LINE attribute widening.
 const CHUNK: usize = 16;
 
 /// PANEL-DEFER sink (finding: scale²-amplified VRAM pokes ran with IRQs masked).
@@ -1336,7 +1352,7 @@ const CHUNK: usize = 16;
 /// So the paint half still runs per chunk (it is cheap — cached RAM, no lock, no mask) and the
 /// PRESENT is deferred to [`PanelSink::finish`], over the union of every chunk's band. The two
 /// savings compose: one present per line instead of ~five, and a few rows per present instead of 750.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — the type is arch-neutral; every field and every callee it names already compiles on aarch64. ⚠ SAME-LINE attribute widening.
 struct PanelSink {
     buf: [u8; CHUNK],
     n: usize,
@@ -1352,7 +1368,7 @@ struct PanelSink {
     routed: bool,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER. ⚠ SAME-LINE attribute widening.
 impl PanelSink {
     fn new() -> Self {
         PanelSink {
@@ -1393,7 +1409,7 @@ impl PanelSink {
                 Some(c) => c,
                 None => return None,
             };
-            if !c.ready || c.shadow_store.is_some() {
+            if !c.ready || c.shadowed() { // ORIN-DEFER — `shadow_store` is an x86-only FIELD (the cached-RAM shadow the 2012 rMBP's uncached GOP reads need); `shadowed()` is its arch-split accessor at the file tail, `false` on aarch64 where the field does not exist. Same predicate on x86, byte for byte. ⚠ SAME-LINE fold.
                 return None;
             }
             let mut ops = OpList::<{ CHUNK * OPS_PER_BYTE }>::new();
@@ -1403,9 +1419,9 @@ impl PanelSink {
             // CONSOLE-WINDOW: `draw_fb` has already chosen the window surface if the console is
             // routed; the flag only tells the paint half how the result reaches the panel — a
             // compositor present instead of a cache clean of the panel's own rows.
-            #[cfg(feature = "wc")]
+            #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // ORIN-DEFER — the SAME predicate `win_store`/`win_fb` are declared under, so the routed branch is reachable on an aarch64 build that has a console window and the field reference cannot outlive the field. Unchanged on x86 (`wc` is x86-only in effect). ⚠ SAME-LINE attribute widening.
             let routed = c.win_store.is_some();
-            #[cfg(not(feature = "wc"))]
+            #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // ORIN-DEFER — the complement of the line above. ⚠ SAME-LINE attribute widening.
             let routed = false;
             let band = c.take_dirty();
             Some((*c.draw_fb(), c.fg, c.bg, c.scale, c.aa, ops, band, routed))
@@ -1423,7 +1439,7 @@ impl PanelSink {
                 //
                 // So the tail is legitimately lost, and — like every other loss in this arc — it is
                 // counted and announced rather than left to look like a short line.
-                crate::serial_ring::TAP_FBCON.tear();
+                crate::serial_ring::TAP_FBCON.tear(); defer_note_tear(); // ORIN-DEFER — charge the mid-line tear to this arc's OWN ledger as well as the tap's, so the `[orindefer] census` can report it beside the split/classic split it is drawn from. No-op (an `#[inline(always)]` empty fn) knob-off and on x86. ⚠ SAME-LINE fold.
                 PANEL_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -1441,7 +1457,7 @@ impl PanelSink {
             // deferring it: the glyphs are in cached RAM that only the compositor reads, `finish` runs
             // before `_print` returns, and the band accumulated here is exactly what the compositor
             // is then told.
-            self.routed = true; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
+            self.routed = true; #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] super::wcg::seam_glyph_note(false, CONSOLE_WIN.load(Ordering::Relaxed)); // WCGSEAM — charge the routed glyph write (unlocked split path). PARFB: `all(witness, x86_64, wc)` was never a legitimate pair, and ORIN-DEFER turned that from cosmetic into a LIVE UNDERCOUNT. The sibling charge in `write_byte` (the LOCKED path) already carries the widened predicate, and so does the `routed` test twelve lines up — so on a `witness` + `desktop_firmware` + `orindefer` build the console reaches THIS branch, paints, and charges nothing, while the classic path it no longer takes still charges. The gate is now the same predicate as the `routed` flag it sits under. ⚠ ONE LINE, line-NEUTRAL, per `draw_fb`'s standing note.
             self.note(band);
             return;
         }
@@ -1484,7 +1500,7 @@ impl PanelSink {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER. ⚠ SAME-LINE attribute widening.
 impl core::fmt::Write for PanelSink {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
@@ -1587,7 +1603,7 @@ pub fn clear() {
                 // CONSOLE-WINDOW: "clear the console" means clear the CONSOLE, and while the console
                 // is a window that is its surface — not the panel, which now belongs to the
                 // compositor and holds other windows' pixels. Presented after the lock drops.
-                #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+                #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
                 if c.win_store.is_some() {
                     c.win_fb.fill_screen(BG_DEFAULT);
                     return;
@@ -1629,7 +1645,7 @@ pub fn clear() {
 /// blank store, so screen and shadow are coherent from the first byte. GUI builds never call
 /// this (they `detach()` fbcon; the `Screen` back buffer owns the heap budget) and a
 /// belt-and-braces GUI_ACTIVE check keeps it a no-op even if one did. Idempotent.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")] // PARFB KEPT — HARDWARE, and the reason is a MEMORY-TYPE fact. The shadow exists to remove uncached VRAM *reads* on the rMBP's PCIe-scanned GOP surface. The Pi/Orin scanout is mapped Normal-WB CACHEABLE, so the read cost this spends ~28 MiB of heap to avoid DOES NOT EXIST there; porting it would buy them nothing and take the heap. (This gate's own doc adds that even on x86 the shadow's original reason retired with the wrap-around scroll.) ⚠ The prose deliberately avoids the other arch's literal spelling: the drift tool pairs on that literal within 25 lines, and a KEPT gate must stay VISIBLE in its count rather than be argued out of it by a comment.
 pub fn attach_shadow() {
     // QUIET-PANEL: headless/test builds never paint the boot log any more, so don't spend
     // ~28 MiB of heap on a shadow nothing draws to. (And with wrap-around rendering the console
@@ -1698,12 +1714,12 @@ pub fn attach_shadow() {
 ///
 /// Steps 1 and 3 above write `c.full_fb()` — the PANEL handle — unconditionally. Once the console is
 /// a compositor window its glyphs belong in `c.win_fb`, and a second resume would clear the glass and
-/// re-home the grid underneath a live compositor. The `wcx` activation latch cannot reach that: it
+/// re-home the grid underneath a live compositor. The `desktop_uefi` activation latch cannot reach that: it
 /// refuses the second ACTIVATION, and this function runs BEFORE the activation, from its own call
 /// site. So the skip lives here. On the Kepler path `CONSOLE_WIN` is still `wm::WIN_NONE` when this
 /// runs (resume, then activate — that is the seam's ordering law), so this guard cannot fire on any
 /// boot that exists today and the Kepler wire is unchanged.
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")] // PARFB KEPT — HARDWARE, but only after SPLITTING the item, and the split is why this gate is honest rather than lazy. Steps (1) and (3) undo the KEPLER TAKEOVER's calibration draw and drop the x86-only cached-RAM shadow; neither has an analogue on the other chip, whose display engine this kernel does not drive at all. Step (2) — the FACE ARMING — is platform-agnostic and is NOT kept: it is `panel_console_face_arm` at the file tail, which ORIN-FACE already ported and armed. The duplication between the two bodies is deliberate for now: folding step (2) into a call would take the `FBCON` lock TWICE on the Kepler seam, and a contended second `try_lock` there lands on this function's ABORT arm — a real regression risk on the one seam that puts console text back on the metal panel.
 pub fn panel_console_resume() -> usize {
     #[cfg(feature = "wc")]
     if CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
@@ -1782,7 +1798,7 @@ pub fn panel_console_resume() -> usize {
 /// `MAX_STAGE_BYTES / 4` restated in pixels; it is duplicated here because it is `wm`-private and
 /// `wm` is not this arc's to change. If `wm` ever raises its cap, this constant follows it — the
 /// console simply gets more generous, and nothing breaks in the meantime.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 
 /// CONSOLE-WINDOW — pick the console window's CONTENT extent for a `pw x ph` panel.
@@ -1802,7 +1818,7 @@ const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 /// bench panel it settles near 1200x760; on the rMBP's 2880x1800 near 1280x800. The window is
 /// therefore "as much of the panel as the compositor can present cheaply", which is what the
 /// generous default actually means once the present path is priced.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (usize, usize) {
     // MENUFIT — the work area's HEIGHT: panel less the top furniture, less the bottom instrument.
     let avail_h = ph
@@ -1841,7 +1857,7 @@ fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (us
 /// The console stops writing the panel here. Its pixels go to cached kernel RAM and reach glass only
 /// through `wm`'s staged present. That is the point of the routing, and it is why the panic path is
 /// arranged the way it is: see [`panic_screen`] and [`FbCon::draw_fb`].
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn panel_console_window_open() -> wm::WinId {
     let existing = CONSOLE_WIN.load(Ordering::Relaxed);
     if existing != wm::WIN_NONE {
@@ -2007,7 +2023,7 @@ pub fn panel_console_window_open() -> wm::WinId {
 /// Idempotent and id-checked: returns `true` only if `id` was in fact the routed console window, so
 /// a stale or foreign id cannot silently unroute the live console. The panic path clears the same
 /// cell independently ([`panic_screen`]) and is unaffected either way.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn panel_console_window_closed(id: wm::WinId) -> bool {
     if id == wm::WIN_NONE {
         return false;
@@ -2031,7 +2047,7 @@ pub fn panic_screen() {
     // for a composite; the route's surface is then dropped below and `draw_fb` falls back to the
     // panel handle, which is the pre-window path verbatim. Nothing about panic output depends on
     // `wm` having a live window, on its locks being takeable, or on the compositor running at all.
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     CONSOLE_WIN.store(wm::WIN_NONE, Ordering::Relaxed);
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
@@ -2049,7 +2065,7 @@ pub fn panic_screen() {
                 // already be held by whatever is panicking. The grid is re-derived from the PANEL,
                 // since the window's smaller `cols`/`rows` no longer describe the surface the panic
                 // text is about to land on.
-                #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+                #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
                 {
                     if let Some(s) = c.win_store.take() {
                         core::mem::forget(s);
@@ -2077,7 +2093,7 @@ pub fn panic_screen() {
 // ── CONSWIN-PI ──────────────────────────────────────────────────────────────────────────────────
 // The Pi 4 half of CONSOLE-WINDOW / FBCON-DMG / FBCON-PACE. Everything above this line is the x86
 // code UNCHANGED: this arc widened 49 `cfg` attributes in place — `all(x86_64, wc)` became
-// `any(all(x86_64, wc), all(aarch64, pidesk))` — and added exactly ONE statement to a function body
+// `any(all(x86_64, wc), all(aarch64, desktop_firmware))` — and added exactly ONE statement to a function body
 // (`draw_fb`'s aarch64 arm), written on the line it shares so the file's line numbering is untouched.
 // That is not style. `wm.rs` proved this track that panic `Location` RECORDS EMBED LINE NUMBERS, so a
 // line added to any file in the knob-off `kernel8.img` breaks its byte-identity proof; this file is
@@ -2103,7 +2119,7 @@ pub fn panic_screen() {
 /// 54 MHz and is readable from the first instruction of the kernel (it is architectural state the
 /// firmware programmes, not a calibration this kernel performs), so the degraded arm is a belt on
 /// aarch64 rather than a boot-early window the way it is on x86.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk")))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[inline]
 fn pace_clock_hz() -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -2118,7 +2134,7 @@ fn pace_clock_hz() -> u64 {
 
 /// CONSWIN-PI — **is the console ROUTED into a compositor window right now?**
 ///
-/// The one question the Pi's activation seam ([`super::pidesk::activate`]) has to ask that x86 never
+/// The one question the Pi's activation seam ([`super::desktop_firmware::activate`]) has to ask that x86 never
 /// needed to, and the reason is a real difference between the two boots rather than a port detail.
 ///
 /// On x86 the routed console lives on the `usbdebug` bench lane, which never calls [`detach`] at all.
@@ -2126,7 +2142,7 @@ fn pace_clock_hz() -> u64 {
 /// which [`_print`] returns at its first test and not one further kernel line reaches the console by
 /// any path. A console window opened before that detach would hold the boot log and then never change
 /// again: the frozen snapshot the PI-DESK M4 assessment predicted, and — worth saying plainly —
-/// exactly what x86's own desktop lane ships today (`wcx.rs` calls its row "a FROZEN BOOT-LOG
+/// exactly what x86's own desktop lane ships today (`desktop_uefi.rs` calls its row "a FROZEN BOOT-LOG
 /// SNAPSHOT for the rest of the boot").
 ///
 /// The Pi does not have to inherit that, because the REASON for the detach is discharged by the route
@@ -2139,9 +2155,14 @@ fn pace_clock_hz() -> u64 {
 ///
 /// Fail-closed by construction: this answers `false` for every decline arm the open path has (console
 /// not ready, allocation refused, geometry unavailable, create failed, install contended), and the
-/// caller then detaches exactly as it always did. `pidesk` off is a compile-time absence, so the
+/// caller then detaches exactly as it always did. `desktop_firmware` off is a compile-time absence, so the
 /// knob-off image never contains this at all.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+///
+/// PARFB — widened from `all(aarch64, desktop_firmware)` to the ROUTE's OWN condition on both arches.
+/// "Is the console routed right now?" is not a Pi question; it is the routed console's question, and
+/// x86's `wc` desktop has the same route and reads it from the same `CONSOLE_WIN` cell. The gate now
+/// names exactly where a route can exist, which is the only honest gate for a query about the route.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PARFB
 pub fn console_is_routed() -> bool {
     CONSOLE_WIN.load(Ordering::Relaxed) != wm::WIN_NONE
 }
@@ -2160,7 +2181,7 @@ pub fn console_is_routed() -> bool {
 /// `#[cfg(target_arch = "x86_64")]` and reached only from the Kepler takeover. Its own doc said the
 /// arrangement was intentional — *"early boot and aarch64 keep the raw 8x8 path unchanged"* — and for
 /// early boot it still is. For aarch64 it was not a decision so much as the absence of one: there was
-/// no aarch64 seam to put the arming in when that arc was written. [`super::pidesk::activate`] is now
+/// no aarch64 seam to put the arming in when that arc was written. [`super::desktop_firmware::activate`] is now
 /// that seam, and this is the Pi's half of what `panel_console_resume` does on x86.
 ///
 /// So a Pi desktop boot no longer carries two faces side by side: the captions, the bar, the crystal
@@ -2185,7 +2206,7 @@ pub fn console_is_routed() -> bool {
 /// more there, not less. Idempotent: re-arming sets the same three fields to the same values.
 ///
 /// Returns the armed `(cell_w, cell_h)`, or `None` if the console was not ready to be re-homed.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+#[cfg(all(target_arch = "aarch64", any(feature = "desktop_firmware", feature = "orinface")))] // ORIN-FACE — the `pidesk` gate was INCIDENTAL, not load-bearing: this body names `FBCON`, four `FbCon` fields and `video::font::CELL_W`/`CELL_H`, and `video::font` is declared unconditionally on both arches (`video/mod.rs`). Nothing in it reaches `pidesk`, `dock`, `wm` or the compositor — the gate recorded where the code was WRITTEN (the Pi's desktop seam), not what it needs. Widened, never moved: every `pidesk` build sees exactly the function it saw before. ⚠ SAME-LINE attribute widening, per `draw_fb`'s standing note.
 pub fn panel_console_face_arm() -> Option<(usize, usize)> {
     let mut armed = None;
     crate::arch::without_interrupts(|| {
@@ -2225,7 +2246,7 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
 /// so a `wc` desktop NEVER has fbcon as a second writer on compositor-owned pixels. aarch64 has no
 /// such gate — `_print` mirrors the whole serial stream onto the panel, from every core, until
 /// `GUI_ACTIVE`. That was harmless while the Pi's glass WAS the console. It stopped being harmless
-/// the moment `pidesk::activate` cleared the panel to `DESKTOP_BG` and started compositing windows
+/// the moment `desktop_firmware::activate` cleared the panel to `DESKTOP_BG` and started compositing windows
 /// onto it, because from that line until [`panel_console_window_open`] installs the glyph route
 /// there are two writers on the same pixels, and the compositor is not the loud one:
 ///
@@ -2249,7 +2270,7 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
 ///
 /// Held, `_print` charges the tap `suppressed` and returns before it touches the console lock at all.
 /// SERIAL IS UNTOUCHED — every line is on the wire, which is where this kernel's evidence lives; what
-/// stops is the second writer on pixels the compositor owns. It is armed once, by `pidesk::activate`
+/// stops is the second writer on pixels the compositor owns. It is armed once, by `desktop_firmware::activate`
 /// at the DESKTOP-CLEAR that takes the glass, and it covers exactly the gap between that line and the
 /// route install below it: from the route onwards the console's way to glass is its WINDOW, exactly
 /// as on x86. On the decline path there is no window, so the hold stands for the boot and the log is
@@ -2259,11 +2280,24 @@ pub fn panel_console_face_arm() -> Option<(usize, usize)> {
 /// THE PANIC OVERRIDE IS EXPLICIT: a held mirror is ignored while `PANIC_MIRROR` is set, so
 /// `panic_screen`'s red backdrop and its text reach the panel whatever the desktop had claimed. That
 /// is the same belt-and-braces `_print`'s x86 mute gate keeps, for the same reason.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+///
+/// PARFB — BOTH GATE TERMS WERE INCIDENTAL, on ORIN-FACE's own argument. The `feature` term is the
+/// one that costs: `desktop_firmware` was never the only desk. The Orin comes up through `orindesk`,
+/// and the two-writer window this closes — a desk clears the glass, and `_print` keeps painting on it
+/// until the glyph route installs — is that desk's window too, verbatim. With the knob term in place
+/// the mechanism could not be armed there at all, because it did not exist to arm. The `target_arch`
+/// term went with it: this body names `FBCON` and one `AtomicBool`, and x86 has both. On x86 the
+/// QUIET-PANEL gate still makes the hold redundant on every path that exists today, so the widening
+/// buys x86 an ARMABLE mechanism and changes no x86 boot — nothing calls `panel_mirror_hold`, so the
+/// flag reads false forever and `_print`'s test short-circuits on its first relaxed load.
+///
+/// ⚠ ARMING IT IS A CALL SITE, AND THE CALL SITE IS NOT IN THIS FILE. See the report's out-of-lane
+/// coordinates for the `orindesk` DESKTOP-CLEAR seam that has to call `panel_mirror_hold(true)`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB
 static PANEL_MIRROR_HOLD: AtomicBool = AtomicBool::new(false);
 
-/// DESKHOLD — arm the hold described above. Called by `pidesk::activate`'s DESKTOP-CLEAR.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+/// DESKHOLD — arm the hold described above. Called by `desktop_firmware::activate`'s DESKTOP-CLEAR.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB
 pub fn panel_mirror_hold(on: bool) {
     PANEL_MIRROR_HOLD.store(on, Ordering::Relaxed);
 }
@@ -2277,15 +2311,15 @@ pub fn panel_mirror_hold(on: bool) {
 /// WINDOW blank for the rest of the boot, which is the one outcome worse than the defect. The hold
 /// therefore lifts exactly when the route makes it redundant, and stays armed forever on the decline
 /// path, where there is no window and the panel is the only thing a print could reach.
-#[cfg(all(target_arch = "aarch64", feature = "pidesk"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // PARFB — see the static's note.
 fn panel_mirror_held() -> bool {
-    PANEL_MIRROR_HOLD.load(Ordering::Relaxed)
-        && !PANIC_MIRROR.load(Ordering::Relaxed)
-        && CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE
+    #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] let overridden = PANIC_MIRROR.load(Ordering::Relaxed); #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware"))))] let overridden = false; // PARFB — `PANIC_MIRROR`'s OWN predicate, quoted rather than assumed. Where the flag does not exist there is no panic mirror that could override the hold, so the term is a compile-time `false`. ⚠ SAME-LINE fold, line-NEUTRAL.
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let unrouted = CONSOLE_WIN.load(Ordering::Relaxed) == wm::WIN_NONE; #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] let unrouted = true; // PARFB — `CONSOLE_WIN`'s own predicate. A build with no glyph ROUTE has no window for the hold to become redundant against, so the third term is a compile-time `true` there rather than a missing static. ⚠ SAME-LINE fold, line-NEUTRAL.
+    PANEL_MIRROR_HOLD.load(Ordering::Relaxed) && !overridden && unrouted
 }
 
-/// DESKHOLD — the absent-feature arm. See the sibling above.
-#[cfg(not(all(target_arch = "aarch64", feature = "pidesk")))]
+/// DESKHOLD — the arm for an arch this kernel does not build. See the sibling above.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn panel_mirror_held() -> bool {
     false
 }
@@ -2298,7 +2332,7 @@ fn panel_mirror_held() -> bool {
 /// of two things that do. The route itself already discharges the detach's reason
 /// ([`console_is_routed`] carries that argument in full), and the previous arc duly implemented the
 /// skip — and then MEASURED it, at bench geometry, and reverted it. The measurement is quoted in
-/// `super::pidesk::activate`'s live-console ledger and the verdict is one sentence: *discharging "who
+/// `super::desktop_firmware::activate`'s live-console ledger and the verdict is one sentence: *discharging "who
 /// writes the PANEL" does not discharge "who drives the COMPOSITOR"*. A routed console presents from
 /// PRINT context, on whatever core printed, and after the handoff the Pi prints from every core it
 /// has — so the console became an unsynchronised compositor client, `[wc-g] … slow=yes -> RACE-BLIT`,
@@ -2335,19 +2369,19 @@ fn panel_mirror_held() -> bool {
 ///   `route_present_banded` call they have always been.
 ///
 /// Arch-neutral on purpose: the gate is `feature = "livecon"` and nothing else, so the x86 wire-in is
-/// a `console_present_defer(true)` at `wcx::activate` whenever that arc wants it.
+/// a `console_present_defer(true)` at `desktop_uefi::activate` whenever that arc wants it.
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 static PRESENT_DEFERRED: AtomicBool = AtomicBool::new(false);
 
-/// LIVECON — arm/disarm the deferral described above. Called by `super::pidesk::activate` once the
+/// LIVECON — arm/disarm the deferral described above. Called by `super::desktop_firmware::activate` once the
 /// desktop is up and the route is installed, i.e. at the last instant the boot is still single-core
 /// through this seam; everything `activate` itself printed has already reached the window inline.
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 pub fn console_present_defer(on: bool) {
     PRESENT_DEFERRED.store(on, Ordering::Relaxed);
@@ -2356,7 +2390,7 @@ pub fn console_present_defer(on: bool) {
 /// LIVECON — the test the three print-context entries fold in. See [`PRESENT_DEFERRED`].
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 #[inline]
 fn present_deferred() -> bool {
@@ -2368,14 +2402,14 @@ fn present_deferred() -> bool {
 /// because there is no caller: `detach` has stopped every print and the window never changes again.
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 static LIVE_PRESENTS: AtomicU64 = AtomicU64::new(0);
 
 /// LIVECON — one-shot latch for the census line below.
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 static LIVE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -2387,7 +2421,7 @@ static LIVE_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
 /// repeatedly, after the point at which the frozen boot stops forever.
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 const LIVE_CENSUS_AT: u64 = 8;
 
@@ -2397,7 +2431,7 @@ const LIVE_CENSUS_AT: u64 = 8;
 /// paced, still free on a clean ledger, still a no-op when the console is not routed. What the
 /// bracket adds is a READBACK — it watches [`PACE_RAN`] across the call, so it counts presents that
 /// actually happened rather than passes that asked for one, which is the same "read it back, do not
-/// infer it from having called it" discipline `super::pidesk::activate` applies to its own composite.
+/// infer it from having called it" discipline `super::desktop_firmware::activate` applies to its own composite.
 ///
 /// The census it emits is the arc's evidence, in terms the ledger already keeps:
 ///
@@ -2413,7 +2447,7 @@ const LIVE_CENSUS_AT: u64 = 8;
 /// Silent until the count is reached, and silent forever after: one line per boot.
 #[cfg(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 pub fn console_live_service() {
     if !PRESENT_DEFERRED.load(Ordering::Relaxed) {
@@ -2441,10 +2475,356 @@ pub fn console_live_service() {
 /// LIVECON — the absent-knob arm. Compile-time `false`, so the deferral folds out entirely.
 #[cfg(not(all(
     feature = "livecon",
-    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 )))]
 #[allow(dead_code)]
 #[inline(always)]
 fn present_deferred() -> bool {
     false
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// FBCONPAR — the two aarch64 halves of a `video/` parity survey (orin 8, 2026-08-26). Both live HERE,
+// in the APPEND-ONLY TAIL, for the reason stated at the tail marker above: a line ADDED anywhere else
+// in this file renumbers every panic `Location` below it, and this file is compiled into the knob-off
+// `kernel8.img` whose byte-identity is the Pi track's standing proof. Every wire-in above is a
+// SAME-LINE fold or a SAME-LINE attribute widening; nothing in this arc moved a line.
+//
+// NOTHING HERE HAS BEEN ON HARDWARE. Both knobs are default OFF and UNFLOWN.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ORIN-DEFER — is the cached-RAM shadow attached?
+///
+/// `FbCon::shadow_store` is an x86-ONLY field (the 2012 rMBP's uncached-GOP shadow), so
+/// [`PanelSink::flush`]'s own decline test could not survive the widening as a bare field read. This
+/// is that test, arch-split: the identical predicate on x86, a compile-time `false` on aarch64 where
+/// the field does not exist and the cost it exists to avoid does not either.
+impl FbCon {
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn shadowed(&self) -> bool {
+        self.shadow_store.is_some()
+    }
+    /// The absent-field arm. See the sibling above.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn shadowed(&self) -> bool {
+        false
+    }
+}
+
+// ─── ITEM 1 · ORIN-FACE ────────────────────────────────────────────────────────────────────────────
+
+/// ORIN-FACE — **arm the anti-aliased console face on an ordinary Orin boot.**
+///
+/// ### The parity gap, with both sides named
+///
+/// x86 arms the face in [`panel_console_resume`] (`#[cfg(target_arch = "x86_64")]`, this file), from
+/// the end of `drivers/gpu/kepler_display.rs::takeover_display`: `c.scale = 1; c.aa = true;
+/// c.cell_w = font::CELL_W; c.cell_h = font::CELL_H;` and a regrid. aarch64's counterpart
+/// [`panel_console_face_arm`] performs exactly those four writes and the same regrid — and was gated
+/// `all(target_arch = "aarch64", feature = "desktop_firmware")`, with two callers, NEITHER of which an ordinary
+/// Orin boot reaches:
+///
+///   * `video/pidesk.rs::activate` — its `pidesk` + `baremetal` gate is UNSATISFIABLE on this board
+///     (`baremetal = ["pi"]`, and `pi` + `tegra` is a hard `compile_error!` in
+///     `arch/aarch64/serial.rs`); and
+///   * `arch/aarch64/display_tegra.rs::orin_conwin` — which DECLINES with
+///     `reason=ordering-rule` unless `orindesk` AND `orinclick` are armed too (the §6.1 rule), and
+///     which in any case only exists on an image built with `UNAOS_ORINCONWIN=1`.
+///
+/// So the cure was present, compiled, type-checked and unreachable, and the Orin console kept the raw
+/// font8x8 cell at scale 1 — ~0.8 mm on the 1920x1200 bench panel, the size metal sitting #30
+/// recorded as simply not visible. That is the one item in this survey an operator can SEE.
+///
+/// ### Why a new knob rather than widening `pidesk`
+///
+/// `pidesk` on this board pulls in the whole desktop cascade — `dock::focus_set` reaches
+/// `arch::aarch64::syscall`, gated `aarch64_el0` (the named EL0 capability) — and §5.2's stop-line stands over it
+/// (a 16 KiB stack overflow on two consecutive Pi metal boots that no QEMU gate in this tree can
+/// reproduce). Arming a FONT must not require crossing that. `orinface` is standalone, mirroring
+/// `orindesk`/`orinclick`'s spelling: no window, no `wm` lock, no `dock`, no syscall surface. The
+/// `pidesk` gate on `panel_console_face_arm` was INCIDENTAL — it recorded where the code was written,
+/// not what it needs — so it is WIDENED (`any(feature = "desktop_firmware", feature = "orinface")`) and every
+/// `pidesk` build, Pi included, sees exactly the function it saw before.
+///
+/// ### The seam, and why it is `init` and not the terminus line
+///
+/// [`init`] is what RESETS the cell to font8x8 (`c.aa = false; c.cell_w = CELL_W;`), and everything an
+/// Orin operator reads is printed after it. Arming at `tegra_early_stop`'s terminus would leave the
+/// entire boot log at 0.8 mm and fix only what prints afterwards. This runs on `init`'s closing line,
+/// OUTSIDE the interrupt mask and OUTSIDE the `FBCON` lock that block just released — required, since
+/// [`panel_console_face_arm`] takes `FBCON.try_lock()` itself and this wrapper then prints.
+///
+/// Idempotent, and composes with rung 4: with `orinconwin` also armed, `orin_conwin` re-arms the same
+/// four fields to the same values before it sizes the console window, exactly as it does today.
+///
+/// ### THE VERDICT, AND THE FALSE PASS IT MAKES IMPOSSIBLE
+///
+/// A wrapper that printed `ARMED` because it CALLED the arming function would be the same defect this
+/// whole item is about: a claim standing in for a fact. So the line is derived from a READBACK — the
+/// console state is re-taken after the arm and the fields are read out of it — and the verdict
+/// crosses that readback against `video::font`'s own constants:
+///
+///   * `[orinface] ARMED …` — read back `aa=1` and the cell equal to `font::CELL_W`x`CELL_H`.
+///   * `[orinface] MISMATCH …` — the arm returned a cell but the readback disagrees with it or with
+///     the face. This is the state that used to be indistinguishable from a pass.
+///   * `[orinface] DECLINE reason=console-not-ready …` — `panel_console_face_arm` answered `None`
+///     (`!c.ready`, or `FBCON` contended). The console keeps font8x8; the boot is otherwise unchanged.
+///   * `[orinface] DECLINE reason=readback-contended …` — the arm reported a cell but the lock could
+///     not be retaken to prove it. Reported as a decline, never as a pass.
+///
+/// One line per call, on every polarity, so a silent decline can never look like "never ran".
+#[cfg(all(target_arch = "aarch64", feature = "orinface"))]
+static ORINFACE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-FACE — runs whose READBACK confirmed the face. Drained by the `serial_println!` in
+/// [`orin_face_arm`], which is the only reader and ships in the same commit.
+#[cfg(all(target_arch = "aarch64", feature = "orinface"))]
+static ORINFACE_ARMED: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-FACE — the seam. See [`ORINFACE_RUNS`] for the whole argument.
+#[cfg(all(target_arch = "aarch64", feature = "orinface"))]
+pub fn orin_face_arm() {
+    let runs = ORINFACE_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+    let asked = panel_console_face_arm();
+    // THE READBACK. Re-take the console and read the fields out of it, rather than trusting the
+    // values we asked for — `orin_conwin`'s standing "read it back, do not infer it from having
+    // called it" discipline. `try_lock`, so a contended readback is reported as one.
+    let mut seen: Option<(bool, usize, usize, usize, usize, usize, usize)> = None;
+    crate::arch::without_interrupts(|| {
+        if let Some(c) = FBCON.try_lock() {
+            let info = c.fb.info();
+            seen = Some((c.aa, c.cell_w, c.cell_h, c.cols, c.rows, info.width, info.height));
+        }
+    });
+    let want = (crate::video::font::CELL_W, crate::video::font::CELL_H);
+    match (asked, seen) {
+        (None, _) => serial_println!(
+            "[orinface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
+            runs,
+            ORINFACE_ARMED.load(Ordering::Relaxed),
+            want.0,
+            want.1
+        ),
+        (Some((aw, ah)), None) => serial_println!(
+            "[orinface] DECLINE reason=readback-contended runs={} armed={} asked={}x{} want={}x{} (the arm reported a cell but FBCON could not be retaken to prove it — reported as a decline, never as a pass)",
+            runs,
+            ORINFACE_ARMED.load(Ordering::Relaxed),
+            aw,
+            ah,
+            want.0,
+            want.1
+        ),
+        (Some((aw, ah)), Some((aa, cw, ch, cols, rows, pw, ph))) => {
+            if aa && cw == want.0 && ch == want.1 && (cw, ch) == (aw, ah) {
+                let armed = ORINFACE_ARMED.fetch_add(1, Ordering::Relaxed) + 1;
+                serial_println!(
+                    "[orinface] ARMED runs={} armed={} panel={}x{} cell={}x{} grid={}x{} aa=1 face=noto16-aa (READ BACK from the console after the arm, not asserted from the call: the aarch64 counterpart of x86's panel_console_resume now runs on an ordinary Orin boot, at fbcon::init, with no desktop and no compositor window involved) -> ARMED",
+                    runs, armed, pw, ph, cw, ch, cols, rows
+                );
+            } else {
+                serial_println!(
+                    "[orinface] MISMATCH runs={} armed={} panel={}x{} asked={}x{} readback={}x{} aa={} grid={}x{} want={}x{} (the arm returned but the console does not hold the face — this is the state that used to be indistinguishable from a pass) -> MISMATCH",
+                    runs,
+                    ORINFACE_ARMED.load(Ordering::Relaxed),
+                    pw, ph, aw, ah, cw, ch, aa as u8, cols, rows, want.0, want.1
+                );
+            }
+        }
+    }
+}
+
+// ─── ITEM 2 · ORIN-DEFER ───────────────────────────────────────────────────────────────────────────
+
+/// ORIN-DEFER — **is the split layout/paint route open for this line?**
+///
+/// The panic gate, arch-split because it could not be shared. On x86 this is
+/// `!PANIC_MIRROR.load(Relaxed)` — the exact expression [`_print`] carried before this arc, unchanged
+/// byte for byte. On aarch64 it could NOT be: `PANIC_MIRROR`'s only `store` is
+/// `#[cfg(target_arch = "x86_64")]` (see [`panic_screen`]), so on this arch the flag is permanently
+/// `false` and reading it would send PANIC output down the split path — precisely the case the x86
+/// design excludes by name ("a panic must never find the `FBCON` lock held by a preempted paint").
+/// The aarch64 arm reads [`crate::serial_ring::in_panic_mode`], which the `#[panic_handler]` sets
+/// BEFORE `panic_screen()` and before its first `serial_println!`, and which is arch-neutral.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn defer_route_open() -> bool {
+    !PANIC_MIRROR.load(Ordering::Relaxed)
+}
+
+/// ORIN-DEFER — the aarch64 arm. See the sibling above for why it is not `PANIC_MIRROR`.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline(always)]
+fn defer_route_open() -> bool {
+    !crate::serial_ring::in_panic_mode()
+}
+
+/// ORIN-DEFER — the absent-knob arm: no split route exists, so it is never open.
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer"))))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_route_open() -> bool {
+    false
+}
+
+/// ORIN-DEFER — **lines that reached the armed split route.** The denominator.
+///
+/// ### The ledger, and the false PASS it makes impossible
+///
+/// The defect this whole survey is about is a feature that is compiled, banner-visible and never
+/// actually reached. Porting PANEL-DEFER to aarch64 could reproduce it exactly: `orindefer` in the
+/// `⚡ kernel features:` banner, `PanelSink` linked into the image, and every line still falling to
+/// `print_masked` because the console was never ready, a shadow was attached, or `FBCON` lost its
+/// first chunk every time — with nothing on the wire to say so.
+///
+/// So the census fires on [`DEFER_SEEN`], never on [`DEFER_SPLIT`], and its verdict is DERIVED from
+/// the split count rather than from the feature being on:
+///
+///   * `-> DEFERRED` — `split > 0`. Lines were laid out masked and PAINTED UNMASKED. The claim.
+///   * `-> CLASSIC-ONLY` — `split == 0`. The route was armed, reached, and never once taken. This is
+///     the polarity that used to be silent, and it is now a named verdict on the wire.
+///   * `-> LEDGER-MISMATCH` — `split + empty + classic > seen`, which the wire-in makes impossible by
+///     construction (every charge is taken inside the same `defer_route_open()` test as `seen`).
+///     Recordable so that it cannot become unrecordable.
+///
+/// `unaccounted = seen - (split + empty + classic)` is the lines in flight on other cores at the
+/// instant of the read; it is expected to be small and non-negative, never zero-by-law.
+///
+/// One line per boot, at [`DEFER_CENSUS_AT`] lines. The latch is taken with `swap` BEFORE the print,
+/// so the nested `_print` the census line itself causes is bounded at depth one and cannot recurse.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — lines the split path OWNED: layout masked + locked, pixels unmasked + unlocked.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_SPLIT: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — lines the route accepted that painted nothing (control-only: `\r`, ignored bytes).
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — lines that fell back to the fully-masked classic route, untouched and whole.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_CLASSIC: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — mid-line tears: the first chunk won `FBCON` and painted, a later one lost it. The
+/// tail is legitimately lost (see [`PanelSink::flush`]); this arc's own count of it, beside the tap's.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_TEAR: AtomicU64 = AtomicU64::new(0);
+
+/// ORIN-DEFER — one-shot latch for the census.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+static DEFER_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// ORIN-DEFER — lines seen before the census speaks.
+///
+/// Not 1, and not 8. One line proves the wire-in compiled. This threshold has to be past the point
+/// where the console is unambiguously up and printing steadily, so that a `split == 0` reading is a
+/// real `CLASSIC-ONLY` verdict about a working console and not an artefact of counting the handful of
+/// lines that legitimately precede `fbcon::init`'s completion.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+const DEFER_CENSUS_AT: u64 = 64;
+
+/// ORIN-DEFER — charge one line reaching the armed route, and emit the census when it comes due.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_seen() {
+    let n = DEFER_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n < DEFER_CENSUS_AT || DEFER_CENSUS_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let split = DEFER_SPLIT.load(Ordering::Relaxed);
+    let empty = DEFER_EMPTY.load(Ordering::Relaxed);
+    let classic = DEFER_CLASSIC.load(Ordering::Relaxed);
+    let accounted = split + empty + classic;
+    let verdict = if accounted > n {
+        "LEDGER-MISMATCH"
+    } else if split > 0 {
+        "DEFERRED"
+    } else {
+        "CLASSIC-ONLY"
+    };
+    serial_println!(
+        "[orindefer] census seen={} split={} empty={} classic={} tear={} unaccounted={} chunk={} -> {} (DEFERRED means aarch64 console lines were laid out under the interrupt mask and PAINTED OUTSIDE it, which is x86's PANEL-DEFER shape reached on this arch; CLASSIC-ONLY means the route was armed and reached and never once taken — the compiled-but-unreachable polarity this arc exists to make speakable)",
+        n,
+        split,
+        empty,
+        classic,
+        DEFER_TEAR.load(Ordering::Relaxed),
+        n.saturating_sub(accounted),
+        CHUNK,
+        verdict
+    );
+}
+
+/// ORIN-DEFER — charge a line the split path owned.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_split() {
+    DEFER_SPLIT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ORIN-DEFER — charge a line the route accepted that painted nothing.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_empty() {
+    DEFER_EMPTY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ORIN-DEFER — charge a line that fell back to the classic fully-masked route. Guarded by the same
+/// [`defer_route_open`] test the block above uses, so panic lines are never counted and
+/// `split + empty + classic <= seen` holds by construction.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_classic() {
+    if defer_route_open() {
+        DEFER_CLASSIC.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// ORIN-DEFER — charge a mid-line tear.
+#[cfg(all(target_arch = "aarch64", feature = "orindefer"))]
+#[inline]
+fn defer_note_tear() {
+    DEFER_TEAR.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ORIN-DEFER — the absent-knob arms. Every wire-in above folds to nothing on x86 and on any aarch64
+/// build without the knob, so those images are byte-identical to baseline.
+///
+/// `#[allow(dead_code)]` on four of the five, and it is load-bearing rather than cosmetic: three of
+/// these (`seen`, `split`, `empty`) are called ONLY from inside `_print`'s PANEL-DEFER block, which is
+/// itself `#[cfg]`'d away on an aarch64 build without the knob — so on the knob-off `arm-tegra` /
+/// `arm-pi` polarity they have no caller at all and would each raise a `dead_code` warning in the
+/// exact image whose byte-identity is the Pi track's standing proof. `classic` is the one that does
+/// NOT need it: its call site sits outside the block and is compiled on every arch and every build.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_seen() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_split() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_empty() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above. No `allow` here: this one's call site is
+/// outside the cfg'd block, so it is used on every arch and every build.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[inline(always)]
+fn defer_note_classic() {}
+
+/// ORIN-DEFER — absent-knob arm. See the sibling above.
+#[cfg(not(all(target_arch = "aarch64", feature = "orindefer")))]
+#[allow(dead_code)]
+#[inline(always)]
+fn defer_note_tear() {}

@@ -2494,9 +2494,9 @@ fn midden_facts() -> midden_core::Facts {
     // `arch::syscall` itself is `baremetal`-gated on aarch64, so the cap must be read under the
     // SAME condition that decides whether the verbs exist — a build with no process table has no
     // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
-    #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+    #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
     let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
-    #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
+    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     let (proc_verbs, proc_rows) = (false, 0usize);
     midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
@@ -2584,13 +2584,13 @@ impl midden_core::Volume for FatVolume {
     ///
     /// No [`EXEC_BIND`] stamp: that instrument and its `fatverb_storage_witness` reader are x86-only
     /// (they compare FAT *handles*, and this arch binds a mount table, not a handle).
-    #[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+    #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
     fn is_file(&mut self, name: &str) -> bool {
         exec_resolve(name).is_some()
     }
     // No process table, no loader, so `Facts::exec` is false and the core never calls this.
     // Answering `false` keeps the promise: no behaviour change on a build that cannot launch.
-    #[cfg(not(any(target_arch = "x86_64", all(feature = "baremetal", target_arch = "aarch64"))))]
+    #[cfg(not(any(target_arch = "x86_64", all(feature = "aarch64_el0", target_arch = "aarch64"))))]
     fn is_file(&mut self, _name: &str) -> bool {
         false
     }
@@ -2702,7 +2702,7 @@ static WITNESS_WAIT_SINCE_MS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// FATVERB: how long to wait for a block device before witnessing an empty census anyway. Same
-/// value and same reasoning as `video::wcx::STORAGE_WAIT_MS` — generous against the deferred SCSI
+/// value and same reasoning as `video::desktop_uefi::STORAGE_WAIT_MS` — generous against the deferred SCSI
 /// bring-up on this bench, and the number matters far less than the wait terminating in a line.
 #[cfg(target_arch = "x86_64")]
 const STORAGE_WAIT_MS: u64 = 30_000;
@@ -2756,7 +2756,7 @@ pub fn fatverb_storage_witness() {
     // first pass, and the `test-fat sf` shape had nothing at all, so the two differ and neither can
     // be assumed.
     //
-    // The shape is `wcx::desktop_app_service`'s, deliberately — including its law that the wait
+    // The shape is `desktop_uefi::desktop_app_service`'s, deliberately — including its law that the wait
     // TERMINATES IN A LINE rather than in silence. A boot that genuinely never gets a block device
     // must still emit these legs (a read verb with no volume is Boot AR's own symptom, and a spec
     // REQUIRE must not go red because the machine had no card in it), so the deadline expires into
@@ -2924,13 +2924,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             return false;
         }
         midden_core::Plan::Exec { typed, name } => {
-            #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+            #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
             bare_exec(console, &typed, &name);
             // BARENAME (§6.6a): the day a loader arrived on aarch64 the compiler pointed here, as
             // this comment used to promise. What is left is the build with no process table at all,
             // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
             // the match is total.
-            #[cfg(not(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64")))]
+            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
             {
                 let _ = (&typed, &name);
                 console.println("Unknown command. Type 'help' for assistance.");
@@ -3464,7 +3464,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // foreign volume-level path from the same surface. `vfs <op> <path>`.
             vfs_cmd(console, &args);
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
             // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
@@ -3532,6 +3532,32 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // (USB) / polled CMD24 (SD) that completes before the command returns, so there is no
             // write-back cache to flush. `sync` is the honest confirmation of that (a no-op by design).
             console.println("sync: write-through storage — every write is already durable on the card");
+        },
+        "screenshot" => {
+            // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. The whole mechanism
+            // lives in `video::prtscr` because the Print Screen KEY reaches the same function from
+            // the device-service pass — a verb that reimplemented any of it would be a second
+            // capture path to keep in step, which is exactly what MIDDEN-M1 removed from this file.
+            //
+            // Two sinks, two lengths, one verdict word — FATVERB's rule. The operator gets a
+            // sentence; the capture gets the census line `Refusal::report` writes to serial. Both
+            // are emitted for a refusal, and the OK line is emitted here for the same reason: a
+            // headless `test-fat` boot must be able to prove the write from the log alone.
+            match crate::video::prtscr::capture() {
+                Ok(shot) => {
+                    serial_println!(
+                        ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
+                        shot.name, shot.width, shot.height, shot.bytes
+                    );
+                    console.println(&alloc::format!(
+                        "wrote {} ({}x{}, {} bytes)", shot.name, shot.width, shot.height, shot.bytes
+                    ));
+                }
+                Err(why) => {
+                    why.report();
+                    console.println(&why.sentence());
+                }
+            }
         },
         "diskinfo" => {
             // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
@@ -3906,29 +3932,88 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::selftest::run(console, pal);
         },
         "sched" | "ps" => {
+            // SCHEDPAR: one table body for both arches. `current_task_id`/`run_queue_len` are
+            // signature-matched twins (the aarch64 pair authored by the orin seat, folded under
+            // the 2026-08-27 cross-lane grant); only the core census and the demo line stay
+            // per-arch. The aarch64 census walks the full percpu range rather than
+            // `online_cpu_count()` — the online set is a MASK and may be sparse (metal has
+            // brought up 3 of 4), and a count-bounded loop would silently drop the highest core.
             #[cfg(target_arch = "x86_64")]
-            {
-                let count = core::cmp::min(
-                    crate::arch::acpi::cpu_count().max(1),
-                    crate::arch::gdt::MAX_CPUS,
-                );
-                console.println("CPU  role  current  run-queue");
-                for cpu in 0..count {
-                    let role = if cpu == 0 { "bsp" } else { "ap " };
-                    let cur = match crate::arch::sched::current_task_id(cpu) {
-                        Some(id) => alloc::format!("tid {}", id),
-                        None => "-".into(),
-                    };
-                    console.println(&alloc::format!(
-                        "{:>3}  {}   {:<8} {}",
-                        cpu, role, cur, crate::arch::sched::run_queue_len(cpu)
-                    ));
-                }
+            let count = core::cmp::min(
+                crate::arch::acpi::cpu_count().max(1),
+                crate::arch::gdt::MAX_CPUS,
+            );
+            #[cfg(target_arch = "aarch64")]
+            let count = crate::arch::percpu::NUM_CPUS;
+            console.println("CPU  role  current  run-queue");
+            for cpu in 0..count {
+                let role = if cpu == 0 { "bsp" } else { "ap " };
+                let cur = match crate::arch::sched::current_task_id(cpu) {
+                    Some(id) => alloc::format!("tid {}", id),
+                    None => "-".into(),
+                };
                 console.println(&alloc::format!(
-                    "demo tasks finished: {}", crate::arch::sched::demo_done()));
+                    "{:>3}  {}   {:<8} {}",
+                    cpu, role, cur, crate::arch::sched::run_queue_len(cpu)
+                ));
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            console.println("sched: x86_64 only");
+            #[cfg(target_arch = "x86_64")]
+            console.println(&alloc::format!(
+                "demo tasks finished: {}", crate::arch::sched::demo_done()));
+            // Not an apology: the aarch64 demo paths are the wrong shape for a counter. The
+            // cooperative demo completes synchronously before preemption enables and before this
+            // shell exists (a count here would read the same constant forever), and the
+            // `sched_demo` burst is a balancer exercise with its own serial witness.
+            #[cfg(target_arch = "aarch64")]
+            console.println(
+                "demo tasks: n/a — the cooperative demo completes before this shell exists; \
+                 the sched_demo burst reports on serial as ':: AARCH64 SCHED-BAL:'");
+        },
+        "burst" => {
+            // ORIN-BURST: fire the SCHED-BAL multi-hot-thread burst live from the tegra shell so the
+            // operator can watch vug/pulse light every Orin core, and repeat it at will. Runs inside the
+            // jd2_console_pump task (pinned to the boot core), so it drives the burst from core 0: the
+            // balancer PLACES the migratable PRIO_LOW busy tasks across the online cores and idle cores
+            // steal the residual. PRIO_LOW keeps it below the console/render, so the shell stays live. The
+            // descriptive per-core witness goes to serial (":: AARCH64 SCHED-BAL: ...") — the verb does
+            // NOT take the screen, so `vug`/`pulse` can be watched in parallel and `burst` re-fired.
+            #[cfg(target_arch = "aarch64")]
+            {
+                console.println("burst: staging 8 migratable busy tasks across the online cores...");
+                crate::arch::sched::run_burst(0);
+                console.println("burst: done (per-core witness on serial: ':: AARCH64 SCHED-BAL: ...')");
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            console.println("burst: SCHED-BAL burst is aarch64 only");
+        },
+        "simmer" => {
+            // SIMMER (R23s1): a per-core load animator. Stage one PINNED PRIO_LOW duty-cycling task on
+            // every online core EXCEPT this (boot/console) core, each breathing on its own id-seeded
+            // rhythm, so the vug per-core meter shows the cores rising and falling independently — "like
+            // a moderately busy computer." Runs inside jd2_console_pump (the boot core); the animators
+            // live on the secondary cores, which run the preemptive scheduler (so their sleeps cycle).
+            // Toggle: bare `simmer` flips it on/off; `simmer off` stops it explicitly. The verb does NOT
+            // take the screen, so start `simmer` then `vug` to watch the bars wander. Start/stop witness
+            // on serial only (":: SIMMER: ... ::") — the visual is the product, so no per-cycle spam.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let off = args
+                    .first()
+                    .map(|a| *a == "off" || *a == "stop")
+                    .unwrap_or(false);
+                if off {
+                    crate::arch::sched::simmer_stop();
+                    console.println("simmer: stopped.");
+                } else if crate::arch::sched::simmer_active() {
+                    crate::arch::sched::simmer_stop();
+                    console.println("simmer: stopped (toggle). Type 'simmer' to start it again.");
+                } else {
+                    crate::arch::sched::simmer_start(0);
+                    console.println("simmer: per-core animators staged. Now type 'vug' to watch the cores breathe.");
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            console.println("simmer: per-core load animator is aarch64 only");
         },
         "top" => {
             // SCHED-2: per-core scheduler load table (aarch64). Recent busy% (rolling window),
@@ -3983,13 +4068,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
+        // ORIN-REBOOT (baton orin-6 §5.1 + Peter's cold-boot ruling 2026-08-25): the arch-neutral
+        // POWER VERBS' service arms — thin hooks only. The mechanisms live in `power::reboot` /
+        // `power::shutdown` (aarch64: PSCI SYSTEM_RESET / SYSTEM_OFF via SMC — the firmware owns
+        // the machine; x86 shutdown routes to the real ACPI S5; unwired platform slots refuse with
+        // honest witnesses + hlt park). This retires the old `shutdown` TODO stub, which "shut
+        // down" by double-parking in `hlt` — a machine that idles when asked to power off is
+        // neither cold-boot-ready nor honest. The console line goes out BEFORE each call because a
+        // successful reset/off kills the machine mid-instruction — same last-line discipline as
+        // `acpi_power::poweroff`.
         "shutdown" | "off" => {
-             // TODO: Create arch::shutdown()
-             serial_println!("Shutdown requested");
-             crate::hlt_loop();
-             crate::hlt_loop();
+            console.println("shutting down: invoking the platform firmware mechanism...");
+            crate::power::shutdown();
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        "reboot" => {
+            console.println("rebooting: invoking the platform firmware mechanism...");
+            crate::power::reboot();
+        },
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "bg" => {
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
@@ -4009,7 +4105,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // The gate now matches its neighbours exactly. `all(baremetal, aarch64)` is not a narrowing:
         // `baremetal` is only ever set by the Pi legs (see `arroyo`), so the aarch64 build selects
         // the identical arm it always did.
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))] // NOT widened to `tegra_el0` with its neighbours, DELIBERATELY — the one process verb that is not. `storm` is the only arm reaching past the process table into board hardware: it reads `storm_slots` (= `arch::boot`, the BCM2711 slot pool; `arch::uslots` is the facade an Orin port would use) and spawns `storm_fat_writer`, which drives `BlockSource::Usb` and is `#[cfg(feature = "baremetal")]` with no arch arm at all. Whether the Orin gets a FAT-writer leg under storm is a HW-JETSON question about that board's storage, not a gate typo — left to that seat rather than guessed at here. Folded onto this line to stay line-neutral (PARITY.md 5.3).
         "storm" => {
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
             // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
@@ -4077,9 +4173,23 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let rows = crate::arch::syscall::proc_table_rows();
             let (rows_free, rows_running, rows_exited, rows_orphaned) =
                 crate::arch::syscall::proc_table_headroom();
-            let (jobs_free, jobs_rows) = {
+            // BGREAP-CLOSE: `dead` counts occupied rows whose pid the kernel no longer knows — the
+            // close-box residue. It is the term that made the metal reading unreadable: `job rows
+            // free=4/12` next to `proc rows free=9 of 10` looked like a leak with no name, and the
+            // count says how much of the shortfall the next launch will reclaim by itself.
+            let (jobs_free, jobs_rows, jobs_dead) = {
                 let j = BG_JOBS.lock();
-                (j.iter().filter(|s| s.is_none()).count(), j.len())
+                let dead = j
+                    .iter()
+                    .flatten()
+                    .filter(|job| {
+                        matches!(
+                            crate::arch::syscall::bg_poll(job.pid, false),
+                            crate::arch::syscall::BgPoll::Gone
+                        )
+                    })
+                    .count();
+                (j.iter().filter(|s| s.is_none()).count(), j.len(), dead)
             };
             let slots_free = storm_slots::user_slots_free();
             console.println(&alloc::format!(
@@ -4088,9 +4198,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 slots_free, storm_slots::USER_SLOTS
             ));
             serial_println!(
-                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} | user slots free={}/{} ::",
+                ":: STORM: begin n={} | proc rows free={} running={} exited={} porphaned={} of {} | job rows free={}/{} dead={} | user slots free={}/{} ::",
                 n, rows_free, rows_running, rows_exited, rows_orphaned, rows,
-                jobs_free, jobs_rows, slots_free, storm_slots::USER_SLOTS
+                jobs_free, jobs_rows, jobs_dead, slots_free, storm_slots::USER_SLOTS
             );
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
@@ -4160,13 +4270,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 serial_println!(":: STORM: fatw REFUSED — aarch64/baremetal-only provocation, not ported to x86 ::");
             }
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "jobs" => {
             // BGRUN-1: list background programs and REAP the exited ones (this verb is the reaper — a
             // PEXITED row stays claimed until it is polled here, and the table is bounded). `jobs`.
             bg_jobs(console);
         },
-        #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+        #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "kill" => {
             // BGRUN-1: kill a background program by pid (SKILL-1 underneath — ASID-scoped, so ELF-2
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
@@ -4334,12 +4444,12 @@ fn parse_num(s: &str) -> Option<u64> {
 /// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
 ///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
 ///   either way — this pre-check only sharpens the operator's error text.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
     // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
     // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
-    const CAP: u64 = crate::arch::aarch64::boot::USER_REGION_SIZE as u64;
+    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
     // VFS-1 (adoption): through the seam, so `run`/`bg` resolve a relative name against the cwd like
     // every other verb (they used the raw argument before) and report an unbound volume as the
     // VOLUME being absent rather than as a bare -ENOENT off the native root — the VFS-4 guard the
@@ -4550,7 +4660,7 @@ fn cyc_to_us(dt: u64) -> u64 {
     dt.saturating_mul(1_000_000) / hz
 }
 
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
@@ -4614,7 +4724,7 @@ fn run_program(console: &mut Console, path: &str) {
 
 /// BGRUN-1: one shell-side background job. The PATH is copied (bounded) so `jobs` can name it — the
 /// kernel row carries only the fixed task name. The pid is the durable key; asid rides for `kill`.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct BgJob {
     pid: u64,
@@ -4638,7 +4748,7 @@ struct BgJob {
 ///   * **aarch64** — 6 bg jobs with no foreground `run` (5 with one), unchanged by this arc.
 ///
 /// ⚠ KERNEL-APPS EVICTION — **on a `wc` x86 boot the ceiling is one lower than a bare reading of
-/// `MAX_PROCS` says.** `video::wcx::desktop_app_service` launches the desktop app (`STAT.ELF`) at
+/// `MAX_PROCS` says.** `video::desktop_uefi::desktop_app_service` launches the desktop app (`STAT.ELF`) at
 /// boot and it never exits, so it permanently holds one Proc row, one user slot, one `wm` window and
 /// one row of THIS table. With `MAX_PROCS = 10` the operator's budget on such a boot is therefore
 /// **9** bg jobs with no foreground `run` (8 with one) — which is exactly the fleet HEADROOM was
@@ -4653,8 +4763,87 @@ struct BgJob {
 /// progresses — the SCHED-X86 deadlock rule is about two preemptible takers on ONE core. But note
 /// that `bg_jobs` holds this lock across `console.println`, which on a `wc` build routes through the
 /// compositor: a future second cross-core caller could spin for the length of a repaint.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 static BG_JOBS: spin::Mutex<[Option<BgJob>; 12]> = spin::Mutex::new([None; 12]);
+
+/// BGREAP-CLOSE: claim a row in [`BG_JOBS`], reclaiming provably-finished rows when the table is
+/// full. **Every insert into that table must come through here** — `jobs` is the only path that
+/// drops an entry, and there are launches whose job never reaches a `jobs` sweep.
+///
+/// ### The defect this closes
+/// The kernel `Proc` row has a scavenger (`proc_reserve`'s BGRUN-SCAV) and the thread table has one
+/// (WINX-7's `sys_thread_spawn` sweep). The SHELL's table had neither, and a close-box press is
+/// exactly the event that needs one: `wc_close_click` -> `bg_kill` reaps the Proc row IN PLACE
+/// (PROCREAP) without ever touching `BG_JOBS`, because it runs from the input pump and cannot take
+/// the shell's lock across a compositor repaint. So every window the operator closes retires a Proc
+/// row and a user slot while leaving a `BG_JOBS` row pointing at a pid that no longer exists.
+/// Metal, 2026-08-18: `proc rows free=9 of 10 | job rows free=4/12 | user slots free=11/12` — the
+/// job table was the only census that did not recover, and it is a hard ceiling on the next storm.
+///
+/// ### Shape: lazy reclaim, not eager free
+/// The WINX-7 idiom, for the same reason: the eager site (`wc_close_click`) runs on the input pump
+/// and taking this lock there would put a compositor repaint inside the shell's critical section.
+/// Under pressure the lock is already held by the one caller that needs the row.
+///
+/// Two tiers, so job history stays readable for as long as it can be:
+///  * **Gone** — the kernel does not know the pid. Killed by the close box, or scavenged by
+///    BGRUN-SCAV. The exit status is ALREADY unrecoverable, so reclaiming loses nothing.
+///  * **finished** — exited/faulted/closed and never reaped. Reclaimed only when tier 1 freed
+///    nothing, and the witness PRINTS THE OUTCOME, so the status the operator would have seen from
+///    `jobs` is on the wire rather than dropped (the BGRUN-SCAV "never silent" rule).
+///
+/// A `Running` row is never touched: a full table of live jobs is a genuine refusal, and the caller
+/// still kills the pid it just spawned rather than leave it untrackable.
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
+fn bg_jobs_claim(jobs: &mut [Option<BgJob>; 12]) -> Option<usize> {
+    use crate::arch::syscall::BgPoll;
+    if let Some(i) = jobs.iter().position(|s| s.is_none()) {
+        return Some(i);
+    }
+    let mut freed: Option<usize> = None;
+    // Tier 1 — rows the kernel has already forgotten. Lossless.
+    for i in 0..jobs.len() {
+        let Some(job) = jobs[i] else { continue };
+        if matches!(crate::arch::syscall::bg_poll(job.pid, false), BgPoll::Gone) {
+            jobs[i] = None;
+            serial_println!(
+                ":: BGREAP: job table full — reclaimed row {} from dead pid {} ({}) (the kernel row is already gone: closed, killed or scavenged) ::",
+                i,
+                job.pid,
+                core::str::from_utf8(&job.name[..job.nlen as usize]).unwrap_or("?")
+            );
+            if freed.is_none() {
+                freed = Some(i);
+            }
+        }
+    }
+    if freed.is_some() {
+        return freed;
+    }
+    // Tier 2 — finished but unreaped. `bg_poll(reap = true)` is safe under this lock for the same
+    // reason `bg_jobs` relies on (a PEXITED row's `done` permit is posted before the state is
+    // published, and the reap arm uses `try_wait`); a `Running` row is unaffected by the flag.
+    for i in 0..jobs.len() {
+        let Some(job) = jobs[i] else { continue };
+        let verdict = crate::arch::syscall::bg_poll(job.pid, true);
+        if matches!(verdict, BgPoll::Running) {
+            continue;
+        }
+        match verdict {
+            BgPoll::Exited(code) => serial_println!(
+                ":: BGREAP: job table full — reclaimed row {} from pid {} (exit={} DISCARDED; `jobs` never read it) ::",
+                i, job.pid, code
+            ),
+            _ => serial_println!(
+                ":: BGREAP: job table full — reclaimed row {} from finished pid {} (no exit status to report; `jobs` never read it) ::",
+                i, job.pid
+            ),
+        }
+        jobs[i] = None;
+        return Some(i);
+    }
+    None
+}
 
 /// STORM-FATW: the bounded USB-traffic writer `storm [n] fat` arms — the driver-claim half of the
 /// WEDGE-8/F3 metal provocation (the vug fleet is the preemption half). Two legs, decided once at
@@ -4803,7 +4992,7 @@ fn storm_fat_writer(_: usize) {
 
 /// BGRUN-1: `bg <path>` — read the image, spawn it detached, record the job. The shell prompt is
 /// back the moment this returns; the program (and its window, if it creates one) keeps running.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
@@ -4812,7 +5001,10 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, asid, entry)) => {
             let mut jobs = BG_JOBS.lock();
-            let Some(slot) = jobs.iter_mut().find(|s| s.is_none()) else {
+            // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
+            // reports the table full — a close-box press retires the kernel row without telling this
+            // table, and `jobs` is the only other path that drops an entry.
+            let Some(idx) = bg_jobs_claim(&mut jobs) else {
                 // The kernel row exists but the shell can no longer track it; kill it rather than
                 // leak an untrackable job (`jobs` could never reap what it never recorded).
                 drop(jobs);
@@ -4826,10 +5018,10 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
             let mut name = [0u8; 32];
             let nlen = path.len().min(32);
             name[..nlen].copy_from_slice(&path.as_bytes()[..nlen]);
-            *slot = Some(BgJob { pid, asid, name, nlen: nlen as u8 });
+            jobs[idx] = Some(BgJob { pid, asid, name, nlen: nlen as u8 });
             console.println(&alloc::format!("bg: {} started — pid {} (see `jobs`)", path, pid));
             serial_println!(
-                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} asid={} DETACHED ::",
+                ":: BGRUN: bg {} — loaded {} bytes, entry {:#x}, pid={} slot={} (window layer arms asid=slot+1) DETACHED ::",
                 path, n, entry, pid, asid
             );
             true
@@ -4844,7 +5036,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
 
 /// BGRUN-1: `jobs` — list background jobs and reap the exited ones. This is the SOLE reaper for
 /// bg rows: an exited job's kernel row stays claimed (PEXITED) until it is polled here.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_jobs(console: &mut Console) {
     use crate::arch::syscall::BgPoll;
     let mut jobs = BG_JOBS.lock();
@@ -4921,7 +5113,7 @@ fn bg_jobs(console: &mut Console) {
 /// already free, and the operator's record of the outcome is THIS line rather than an uninformative
 /// `gone` from a later `jobs`. The witness carries the table accounting so a boot PROVES the transition
 /// instead of implying it.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bg_kill_cmd(console: &mut Console, pid: u64) {
     let jobs = BG_JOBS.lock();
     let Some(job) = jobs.iter().flatten().find(|j| j.pid == pid).copied() else {
@@ -4970,20 +5162,21 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
 /// NAME for it comes from here.
 ///
 /// `pub(crate)` since the kernel-apps eviction, for ONE second caller:
-/// [`crate::video::wcx::desktop_app_service`], which launches the desktop app at boot with nobody at
+/// [`crate::video::desktop_uefi::desktop_app_service`], which launches the desktop app at boot with nobody at
 /// the prompt to type `bg`. Registering it here is what keeps `jobs` and `kill` TRUTHFUL —
 /// `bg_kill_cmd` resolves a pid through this table and REFUSES one it cannot find, so an
 /// unregistered launch would be a running ring-3 program the operator can neither list nor stop.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     let mut jobs = BG_JOBS.lock();
-    let Some(free) = jobs.iter_mut().find(|s| s.is_none()) else {
+    // BGREAP-CLOSE: same claim as `bg_program`'s — see `bg_jobs_claim`.
+    let Some(idx) = bg_jobs_claim(&mut jobs) else {
         return false;
     };
     let mut buf = [0u8; 32];
     let nlen = name.len().min(32);
     buf[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
-    *free = Some(BgJob { pid, asid: slot, name: buf, nlen: nlen as u8 });
+    jobs[idx] = Some(BgJob { pid, asid: slot, name: buf, nlen: nlen as u8 });
     true
 }
 
@@ -4996,7 +5189,7 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
 /// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/fat`. This constant is
 /// that half of the x86 sentence, named rather than inlined.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 const EXEC_ROOT: &str = "/fat";
 
 /// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
@@ -5016,7 +5209,7 @@ const EXEC_ROOT: &str = "/fat";
 ///    /fat/VUG.ELF` still the only way in — so it is the step that makes the port a port.
 ///
 /// A directory never resolves: a bare name launches a program.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn exec_resolve(name: &str) -> Option<String> {
     use crate::fs::vfs::NodeKind;
     let mt = vfs_mount_table();
@@ -5047,7 +5240,7 @@ fn exec_resolve(name: &str) -> Option<String> {
 /// name at all, so the spelling is recovered the only honest way available: list the parent and
 /// take the entry that matches case-insensitively. A miss (or an unreadable parent) falls back to
 /// the resolved path unchanged — a display name is never worth a refusal.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn exec_canon(path: &str) -> String {
     let (dir, leaf) = match path.rfind('/') {
         Some(0) => ("/", &path[1..]),
@@ -5098,7 +5291,7 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 /// BARENAME (PARITY §6.6a): the aarch64 twin — [`exec_resolve`] again (the same walk the probe
 /// made, one command ago, closing the same race x86's re-mount closes) plus [`exec_canon`] for the
 /// display spelling. Same two message shapes, so a Pi capture and an rMBP capture read alike.
-#[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
+#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
 fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
     let Some(path) = exec_resolve(name) else {
         console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
@@ -5168,7 +5361,7 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 /// The loader is untouched: the bytes go to `spawn_user_image_bg` exactly as `bg` sends them, so the
 /// per-segment W^X mapping, the ring-3 window bound and the fault-kill net are the same ones CFU-2's
 /// write gate is built on. This adds a way to CALL the loader, never a way to relax it.
-#[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))]
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // --- re-resolve the core's answer over the live volume ---------------------------------------
     // The core probed a moment ago; re-resolving costs one walk and closes the window where the

@@ -148,9 +148,91 @@ FORBID :: WXN-FBWC: .*-> SKIPPED ::
 # --- SCOPE: `witness` only. They need no FAT image and no `sdhcblk` — the summary line's census
 # --- reads `sdhc=unbuilt` on this spec's build and the legs still carry content, because the
 # --- handle-agreement and counter halves are independent of which handles exist. The wait is
-# --- BOUNDED (30 s, wcx's threshold): a boot that never gets a block device still emits all three
+# --- BOUNDED (30 s, desktop_uefi's threshold): a boot that never gets a block device still emits all three
 # --- lines with an empty census, so these REQUIREs cannot go red for want of a card.
 # --- MINIMUM BUILD GENERATION — the FATVERB commit (2026-08-09); older images cannot print them.
 REQUIRE :: TSTE: fatverb\.readvol -> PASS ::
 REQUIRE :: TSTE: fatverb\.writegate -> PASS ::
 REQUIRE :: \[fatverb\] storage witness: exec=[a-z-]+ read=[a-z-]+ gate=[a-z-]+ waited=[0-9]+ms handles=global=(present|absent) sdhc=(present|absent|unbuilt) ::
+# SOCK-4 (added 2026-08-19): the transferable-sockets fixture flaked 6x visible only by eye —
+# the spec never gated it (FIXTURE_FLAKES.md §1b). The gen-rebind fence fix (53c630eb) closed
+# the slot_reused variant; this REQUIRE makes any recurrence a red gate, not a scrollback find.
+REQUIRE :: SOCK-4: transferable sockets — grantee received \+ round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::
+
+# --- BT-BOND M1 / HOLOCRON (added 2026-08-21): the classed-record store's witnesses --------------
+# --- HCR1 (2026-08-21): two knobs now, not one. `holocron` arms the STORE; `hcronst` (implies
+# --- `holocron`) arms the two selftests that WRITE the boot medium at boot — the `store round-trip`
+# --- pair below. So on a `UNAOS_HOLOCRON=1`-only capture the two fixture lines and the deferral
+# --- bound appear and the two round-trips do not; every directive here is OPTIONAL/FORBID, so both
+# --- arming levels and the knob-off default all stay green.
+# --- SCOPE, and why these are OPTIONAL here rather than REQUIRE. This file's contract, stated at
+# --- the top, is that BOTH the default (knob-off) and the knob-on builds pass it. `holocron` is
+# --- DEFAULT OFF, so a REQUIRE would red the default `UNAOS_FATIMG=sf ./arroyo test 150` gate on
+# --- every run — the exact failure the STOR-1 block above documents for its own knob-gated lines.
+# --- So this file uses the idiom that block established: OPTIONAL presence (so a knob-on run's
+# --- witnesses are recognised and a knob-off run stays silent and green) PLUS an explicit per-
+# --- witness FORBID on the FAIL variant, which is what actually gates. The hard REQUIREs for the
+# --- armed configuration live in `x86-holocron.spec`, whose whole scope is a
+# --- `UNAOS_HOLOCRON=1 ./arroyo test-fat sf 150` capture.
+# --- The BT-BOND design asks for a REQUIRE in THIS file; that is the one place the design and this
+# --- tree could not both be satisfied, and the split above is the resolution — see usb_xhci.md §28.
+# --- All four use the `-> PASS ::` idiom, so they DO add to the COUNT above on a knob-on run;
+# --- harmless, because mbench COUNT is `>= n`, never `== n`.
+# --- MINIMUM BUILD GENERATION — the BT-BOND M1 commit (2026-08-21). Older images cannot print them.
+# --- VERIFICATION PROVENANCE: all six directives were replayed against a real capture from THIS
+# --- host — `UNAOS_HOLOCRON=1 ./arroyo test-fat sf 150`, kept as
+# --- `~/unaos-bench/scratch/qemu-x86-btbond-m1.log` because `unaos/target/serial.log` is overwritten
+# --- by the next run — and against a knob-OFF capture of the same gate, where all four stay silent.
+OPTIONAL :: \[hcron\] framing fixture: [0-9]+/[0-9]+ legs .*-> PASS ::
+OPTIONAL :: \[btbond\] codec fixture: [0-9]+/[0-9]+ legs .*-> PASS ::
+OPTIONAL :: \[hcron\] store round-trip: .*-> PASS ::
+OPTIONAL :: \[btbond\] store round-trip: .*-> PASS ::
+FORBID \[hcron\] framing fixture: .*-> FAIL ::
+FORBID \[btbond\] codec fixture: .*-> FAIL ::
+FORBID \[hcron\] store round-trip: .*-> FAIL ::
+FORBID \[btbond\] store round-trip: .*-> FAIL ::
+# --- THE FLUSH GUARD, restated for what it can actually assert (HCR1, 2026-08-21).
+# --- This block used to read `FORBID \[hcron\] flush REFUSED`, and that line was unsound in both
+# --- directions. The witness it forbade claimed "EHCI_HID is held … and this call site is inside
+# --- it", but `EHCI_HID.is_locked()` is a GLOBAL predicate on a spin::Mutex: it reports that the
+# --- lock is taken and never by whom. It therefore could not tell a flush issued from INSIDE
+# --- `service_ehci_hid()` — the bug the seam exists to prevent — from an ordinary interleaving in
+# --- which the `input` task held the lock while `usb-pump` sampled it. main.rs spawns both on the
+# --- same svc_cpu and they are preemptible, so that interleaving is a scheduling outcome on a
+# --- CORRECT build. A hard FORBID on it meant a benign schedule could red a spec three tracks share.
+# --- Worse, the refusal returned before `flush_fails`/`gave_up`, so it never consumed the flush
+# --- budget: while the store was dirty and the lock contended it printed once per main-loop pass,
+# --- without bound. The guard now DEFERS instead of accusing, and caps its own witness at
+# --- HCRON_DEFER_NOTES lines per boot.
+# --- WHAT IS ACTUALLY FORBIDDEN, and is asserted instead:
+# ---   * the deferral BOUND failing. The fixture takes EHCI_HID for real, drives `flush_if_dirty`
+# ---     past the escalation point (4096 + 64 passes), and proves every pass deferred, ZERO writes
+# ---     were issued, and the witness went quiet at the cap. Its FAIL variant is exactly what a
+# ---     regression to the unbounded print looks like, and it is reachable on every armed run rather
+# ---     than only on the schedule that happens to contend the lock.
+# ---   * the store giving up on its writes over a volume this gate believes is writable.
+# --- What is NOT forbidden: the deferral witness itself. It is the guard working, on a reading that
+# --- cannot name a culprit, and a line that can fire on a correct build must never gate a shared spec.
+OPTIONAL :: \[hcron\] deferral bound: .*-> PASS ::
+FORBID \[hcron\] deferral bound: .*-> FAIL ::
+FORBID \[hcron\] flush -> .* GIVING UP
+
+# --- SYNC-FOLD (trunk fold, 2026-08-22) — MUST-CARRY 2. NEITHER SIDE OF THE MERGE TOUCHES THESE
+# --- TWO FACTS, so the fold produces no signal about them and the battery was measurably blind:
+# --- fold-v2's pure merge replayed `MBENCH PASS — 31/31 required witnesses, 0 forbidden hit(s)`
+# --- over a boot whose serial carried `WINX-8 ... FAIL — windowed=true presents=0` and two
+# --- ring-3 kills. `442f1cfa` (pi's WINX-8 fix) is now IN trunk, so the fault it convicted is
+# --- gone — but the SPEC that could not see it is still the spec, and that is what these lines fix.
+# ---
+# --- `threads` is pinned at 2 on purpose: worker A dying while B lives prints 1, which is exactly
+# --- the half-failure the old spec could not distinguish from health. `presents` is left `[0-9]+`
+# --- because the emitter already refuses PASS below `WINX8_MIN_PRESENTS`, so a second floor here
+# --- would only be able to disagree with it.
+REQUIRE :: WINX-8: VUG\.ELF end-to-end — loaded \(entry 0x[0-9a-fA-F]+\) \+ windowed \+ [0-9]+ presents with 2 ring-3 thread\(s\), killed \+ row reaped by the kill \(free [0-9]+->[0-9]+/[0-9]+, exited [0-9]+->[0-9]+\), teardown clean -> PASS ::
+# --- And the narrow FORBID on ring-3 kills. U1b's three DELIBERATE fault-isolation tasks
+# --- (`u1b-wild-write`, `u1b-code-write`, `u1b-stack-exec`) are the only legitimate emitters in a
+# --- green run — measured 3/3, no others, on both x86 legs — so they are excluded by name prefix
+# --- and everything else convicts. RX-FINALPAGE's refused clone faults at LOAD time
+# --- (`:: elf: REFUSED rx-crosses-final-window-page ... ::`), never in ring 3, so it contributes
+# --- nothing here. Kept narrow deliberately: a blanket FORBID would red the fixture every boot.
+FORBID :: RING-3 FAULT: task '(?!u1b-)[^']*' KILLED

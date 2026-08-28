@@ -78,13 +78,15 @@ impl FrameBuffer {
     }
 
     #[inline]
-    pub fn base(&self) -> usize {
-        self.base
-    }
-
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// VUGRAS: the framebuffer's base address (identity-mapped scanout PA on the metal targets). A
+    /// candidate range for the RAS localizer's post-mortem decode table. `0` before `init`.
+    #[inline]
+    pub fn base(&self) -> usize {
+        self.base
     }
 
     #[inline]
@@ -529,15 +531,15 @@ impl FrameBuffer {
         // Rows whose full span fits the mapped length (a firmware-short buffer trims the tail,
         // the same clamp `flush_range` applies at its end).
         let rows = (((self.len - off - row_len) / stride_b) + 1).min(y1 - y);
-        // aarch64: the strided clean with ONE trailing `DSB` (see cache::clean_rows). Elsewhere the
-        // drain is range-independent (x86's SFENCE), so the rect collapses to the range call.
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::cache::clean_rows(self.base + off, row_len, rows, stride_b);
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let _ = rows;
-            crate::arch::flush_framebuffer_range(self.base + off, row_len);
-        }
+        // The strided clean, through `arch::flush_framebuffer_rows` — the facade this method's doc
+        // comment has named since it was written, and which until now did not exist. aarch64 answers
+        // with `cache::clean_rows` (a per-row `DC CVAC` sweep, ONE trailing `DSB` for the whole
+        // rect); x86 answers with the same range-independent `SFENCE` its range call makes, ignoring
+        // the geometry. Both answers were already here, open-coded as a `#[cfg]` pair — but the
+        // question at this seam is "is this scan-out non-coherent", a CAPABILITY, and `video/mod.rs`
+        // calls an arch gate in the experience layer a defect. Kept at nine lines: this file rides
+        // the knob-off kernel8.img whose byte-identity is a standing proof (PARITY.md 5.3).
+        crate::arch::flush_framebuffer_rows(self.base + off, row_len, rows, stride_b);
     }
 
     /// Flush the whole framebuffer to RAM. Used by the boot console (`fbcon`), which pokes scattered

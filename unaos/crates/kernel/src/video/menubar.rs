@@ -50,8 +50,10 @@
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
-//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal box through the ONE shared
-//! furniture router [`strip::press_route`], which both arch routers call ahead of every window arm.
+//! router itself; the SHARD menu ([`super::crystal`]) claims the crystal's corner cell
+//! ([`crystal_corner_abs`] — FITTS-CORNER, the bar's whole upper-left corner, not just the glyph)
+//! through the ONE shared furniture router [`strip::press_route`], which both arch routers call
+//! ahead of every window arm.
 //! Every other point on the bar falls through to whatever is behind it. The witness line says so
 //! (`press=crystal`). It read `press=inert` from the arc when the bar had no press seam at all, and
 //! that stale word survived onto the Pi, where PA41's operator read it off a metal capture as "press
@@ -63,9 +65,43 @@
 //! **CLOBBER-REPAIR (PA41).** The bar asks [`wm::dock_scan`] a second question beside the model — *did
 //! a window the compositor just painted intersect the rows I last painted?* — and repaints when the
 //! answer is yes even though its signature is unchanged. That is [`super::dock`]'s WCK5 condition,
-//! generalised to tenant #2, and on aarch64 it is not a belt: `wm::occ_clip` is `x86_64`-only, so a
-//! window blit crossing the top strip is NOT withheld there and the bar's pixels are destroyed with
-//! nothing in its own damage test able to notice. `clob=` on the ledger line is the falsifier.
+//! generalised to tenant #2, and it is a BELT on both arches. `clob=` on the ledger line is the
+//! falsifier, and `CLOBBERS` is ungated, so that field is on the wire from a Pi/Orin capture too.
+//!
+//! ⚠ **The braces-and-belt claim that stood here was WRONG, and correcting it is why this paragraph
+//! is long.** It read: *"on aarch64 it is not a belt: `wm::occ_clip` is `x86_64`-only, so a window
+//! blit crossing the top strip is NOT withheld there"*. Neither half survives reading the code it
+//! cites. `wm::occ_clip` carries NO arch gate at all (`video/wm.rs`, the `fn occ_clip` definition —
+//! `#[allow(unused_variables, unused_mut)]` and nothing else), and its FURNITURE arm — the one that
+//! pushes THIS bar's rect into every window's clip — rides
+//! `any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "pidesk"))`,
+//! which is the same dual gate this module's own declaration rides in `video/mod.rs`. So on a
+//! `pidesk` aarch64 boot the bar IS in the clip and a crossing blit's columns ARE withheld, on the
+//! identical `boxes_overlap` + `OccClip::push` + `span_occ` path x86 takes. `wm.rs`'s own ledger says
+//! so twice — *"`occ_clip`'s WINDOW half-space runs on aarch64"* — and the arm's comment names the
+//! Pi explicitly.
+//!
+//! **What IS x86-only is the PROOF, not the protection**, and that distinction is the entire content
+//! of the correction: `OB_BOX`/`OB_N` — the statics behind `occclip_bar=`/`occclip_bar_px=` on
+//! `[drag-occ]` — are `all(feature = "witness", target_arch = "x86_64")`. A Pi/Orin capture's silence
+//! in those fields is therefore an ABSENT INSTRUMENT, never a zero, and an aarch64 regression in this
+//! clip would read GREEN because there is no field left to fall. That is what the
+//! `:: MENUBAR-OCC-PAR:` line exists to say out loud; the leg is [`occpar_once`], on the COMPOSE path.
+//!
+//! **PAR-MENUBAR (rmbp arc 7) corrects two things this paragraph itself got wrong.** It said the
+//! `MENUBAR-OCC` probe at the foot of [`selftest`] is x86-gated — it was, by a bare
+//! `#[cfg(target_arch = "x86_64")]` that has since been replaced by the [`occ_bar_reading`] dispatch;
+//! what keeps that leg x86 now is REACHABILITY (`selftest` has no aarch64 caller), which is a
+//! different claim with a different fix. And it pointed at [`selftest`] for the parity leg, which
+//! never lived there — the whole reason ORIN-VPAR put it on the compose path is that `selftest`
+//! cannot run on the Pi. The `orinvpar` knob is no longer part of it either: gating the aarch64 half
+//! of a proof behind a DEFAULT-OFF knob left the green-reading regression intact on every default
+//! boot, so the leg rides `witness` alone now, exactly as its x86 counterpart does.
+//!
+//! The stale sentence is recorded rather than silently deleted because of what it would have COST:
+//! a reader taking it at face value would have concluded the aarch64 blit path has no clip term and
+//! gated their own work off that — manufacturing the very drift the citation described. A drifted
+//! citation is worse than the drift, because it is read as current.
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
@@ -96,7 +132,7 @@
 //!
 //! # PI-DESK — compiled on the Pi, and STILL DEFAULT OFF there
 //!
-//! The `mod` gate is now `any(all(x86_64, wc), all(aarch64, pidesk))`, so this tenant exists on the
+//! The `mod` gate is now `any(all(x86_64, wc), all(aarch64, desktop_firmware))`, so this tenant exists on the
 //! BCM2711 panel too. Nothing about its POLICY moved with it. Peter's direction — *"we will not
 //! always have a menu bar"* — is a runtime statement, and `ENABLED` still starts `false` on both
 //! arches: a Pi boot with `UNAOS_PIDESK=1` gets the dock strip and the SHARD menu machinery and NO
@@ -208,6 +244,10 @@ const _: () = {
     // The title, shifted past the crystal, must still leave room for at least one glyph before the
     // clock on the floor panel.
     assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    // FITTS-CORNER: the press cell (`crystal_corner_abs`, TITLE_X0 wide by the bar's height) must
+    // CONTAIN the painted glyph box, or a press on the visible mark could miss its own menu. The
+    // horizontal half is the load-bearing one; vertical containment is the bevel assert above.
+    assert!(strip::PAD + CRYSTAL_W <= TITLE_X0);
 };
 
 // ---------------------------------------------------------------------------
@@ -247,11 +287,244 @@ static OFF_PASSES: AtomicU64 = AtomicU64::new(0);
 /// is a function of the model and the rect, and a clobber changes neither.
 static CLOBBERS: AtomicU64 = AtomicU64::new(0);
 
+// ═══ ORIN-VPAR / MENUBAR-OCC-PAR — THE aarch64 HALF OF THIS BAR'S OCCLUSION PROOF ════════════════
+//
+// THE GAP, stated exactly, because it is a PROOF gap and not a PROTECTION gap and the two are
+// constantly confused (this module's own header asserted the wrong one until this arc; see the
+// correction there). `wm::occ_clip`'s furniture arm — the one that pushes THIS bar's rect into every
+// window's clip — rides `any(all(x86_64, wc), all(aarch64, pidesk))`, which is this module's own
+// declaration gate. So on a `pidesk` aarch64 boot the bar IS in the clip and a crossing blit's
+// columns ARE withheld, by the same `boxes_overlap` + `OccClip::push` + `span_occ` path x86 takes.
+//
+// What does NOT exist on this arch is every way of SEEING that: `OB_N`/`OB_BOX` — the statics behind
+// `occclip_bar=`/`occclip_bar_px=` — and `wm::occ_bar_probe` are `all(witness, x86_64)`. An aarch64
+// regression in that clip therefore reads GREEN, because there is no field left to fall.
+//
+// ⚠ **WHY THIS DECLINES INSTEAD OF PORTING.** Closing it properly means widening ONE gate in
+// `video/wm.rs` (`occ_bar_probe`'s, and with it `OB_N`/`OB_BOX` and the `[drag-occ]` fields that read
+// them). `wm.rs` is another seat's lane on this arc, so this code does not reach for it — and it does
+// NOT re-derive the span walk locally either: `OccClip::push`/`prepare`, `OccRows::spans` and
+// `span_occ` are private to `wm`, and a second local definition of "occluded" is exactly the drift
+// `wm::occ_menu_probe` was written to delegate AWAY from. It would yield a number that agrees with
+// the present only by coincidence. A wrong port costs a flight; a named decline costs a line.
+//
+// ⚠ **WHY IT LIVES ON THE COMPOSE PATH AND NOT IN [`selftest`].** [`selftest`] is UNREACHABLE on
+// aarch64: its only caller chain is `arch/x86_64/syscall.rs` → `dock::selftest` → `menubar::selftest`,
+// so an aarch64 image contains no `:: MENUBAR:` string at all (checked against the built artifact,
+// not inferred). `video/pidesk.rs` — which runs `crystal::routed_selftest` for exactly this reason,
+// and whose comment records that this whole fixture family is x86-invoked — is another seat's file on
+// this arc, so the reachable in-lane site is [`compose`], which `strip::compose_all` drives every
+// pass. Being on the compose path also makes this STRICTLY better than a fixture would have been: it
+// touches [`ENABLED`] not at all, where the x86 `MENUBAR-OCC` leg must toggle and restore it.
+//
+// BOTH OUTCOMES REACH THE WIRE, which is the point: [`occpar_once`] answers when the bar is live, and
+// [`occpar_never_enabled`] answers when it never turns on — a bar that is off all boot would
+// otherwise leave the question unasked, and an unasked question looks exactly like a passing one.
+//
+// ═══ PAR-MENUBAR (rmbp arc 7) — THE LEG ABOVE WAS ITSELF ARCH-DRIFTED, AND IS NOT ANY MORE ═══════
+//
+// ORIN-VPAR landed this family as `all(target_arch = "aarch64", feature = "witness", feature =
+// "orinvpar")`. That closed the READING gap by naming it — and opened a new one measuring it: the
+// drift detector (`parity-arch-gates.sh`) scores drift in BOTH directions, and menubar.rs went from
+// ONE unpaired x86-only gate to THREE (one x86-only at [`selftest`]'s foot, two aarch64-only here).
+// An instrument that exists on one chip and not the other IS the defect this instrument reports, and
+// it does not stop being that defect because it is pointing the other way.
+//
+// Two things changed, and both are the same change:
+//
+// 1. **The arch term is gone.** These items ride `feature = "witness"` alone, exactly as the x86
+//    `MENUBAR-OCC` leg does, so the line is emitted from BOTH chips and a capture from either is read
+//    the same way. The one place the arch genuinely differs — whether `wm::occ_bar_probe` resolves —
+//    is now a two-arm per-arch DISPATCH, [`occ_bar_reading`], which is what a real hardware
+//    difference is supposed to look like. `arch=` on the line says which chip answered.
+//
+// 2. **The `orinvpar` term is gone too**, which matters more than it looks. `orinvpar` is DEFAULT
+//    OFF, so on every default Pi/Orin witness boot the parity line was not in the image at all and an
+//    aarch64 regression in this clip still read GREEN — the exact condition the leg was written to
+//    end, surviving one knob further down. Its x86 counterpart needs no knob; neither does this. The
+//    knob itself is untouched and still has consumers in `video/screen.rs`.
+//
+// What is still owed, and is NOT in this file: `wm::occ_bar_probe` and `OB_N`/`OB_PX`/`OB_BOX` are
+// `all(feature = "witness", target_arch = "x86_64")`, and `video/wm.rs` is another executor's lane on
+// this arc. Widening that one gate is the whole remaining port, and the diff is handed to the seat
+// rather than applied here. When it lands, [`occ_bar_reading`]'s aarch64 arm is deleted and the arm
+// above it loses its `target_arch` term — nothing else in this file moves.
+
+/// MENUBAR-OCC-PAR — the chip that answered, for the wire. `cfg!` rather than a `#[cfg]` attribute
+/// pair: this is one string, and per-arch attributes here would be arch drift inside the instrument
+/// that exists to report arch drift.
+#[cfg(feature = "witness")]
+const PAR_ARCH: &str = if cfg!(target_arch = "x86_64") {
+    "x86_64"
+} else if cfg!(target_arch = "aarch64") {
+    "aarch64"
+} else {
+    "other"
+};
+
+/// MENUBAR-OCC-PAR — one-shot latch for the `:: MENUBAR-OCC-PAR:` line. Steady state after it has
+/// spent itself is one relaxed load per composite.
+#[cfg(feature = "witness")]
+static OCCPAR_DONE: AtomicBool = AtomicBool::new(false);
+
+/// MENUBAR-OCC-PAR — off-passes to wait before declaring the bar never-enabled. A composite-rate
+/// counter, so this is a few seconds of a live panel: long enough that a shell enabling the bar during
+/// startup wins the race and gets the informative line, short enough that a capture never has to
+/// wonder.
+#[cfg(feature = "witness")]
+const OCCPAR_DEADLINE_OFF_PASSES: u64 = 600;
+
+/// MENUBAR-OCC-PAR — **the READING, one body.** Delegates to [`wm::occ_bar_probe`] — the present's
+/// own span walk, never a copy of it — on BOTH arches since the probe's gate was widened to
+/// "witness plus the menubar exists" (OCC-BAR-PAR, the fold that closed this file's own ledger
+/// note about the pending two-arm dispatch). The `Option` stays: a future arch without the
+/// instrument answers `None` here rather than growing a new cfg at every caller.
+#[cfg(feature = "witness")]
+fn occ_bar_reading(bar: strip::Rect, win: strip::Rect) -> Option<(u64, u64, u64, u64)> {
+    let p = wm::occ_bar_probe(bar, win);
+    Some((p.pop_prot, p.px_prot, p.pop_fault, p.px_fault))
+}
+
+/// MENUBAR-OCC-PAR — **the clip's PRECONDITION, measured, from this file alone, on both arches.**
+///
+/// Returns `(bar, win, crossed, at_risk_px)`. `win` is the x86 `MENUBAR-OCC` leg's synthetic window
+/// box VERBATIM — at the top edge, four bar-heights tall (a real dragged window is taller than the
+/// strip), half the panel wide and inset so it fits the smallest suite panel (640x480) as well as the
+/// bench's — so both arches ask about the same geometry. `crossed` is the half-open overlap test on
+/// both axes, i.e. `wm::boxes_overlap` inlined because that helper is private to `wm` and this is one
+/// comparison, not a second definition of anything.
+///
+/// **It is ONE function called from BOTH legs** — [`occpar_once`] on the compose path and the
+/// `MENUBAR-OCC` leg at the foot of [`selftest`] — where before it was the same arithmetic written
+/// twice. Two copies of "the box that crosses the bar" is two things that can drift, and a parity
+/// witness whose geometry has drifted from the fixture it claims parity with is worse than none.
+///
+/// `at_risk_px` is deliberately NOT named `occclip_bar_px`. It is the intersection's area: an upper
+/// bound on what the clip withholds, computed HERE, and not the present's own arithmetic. Keeping the
+/// names apart is what stops a later reader folding it into the x86 field and declaring a parity that
+/// does not exist. (That distinction is ORIN-VPAR's and is kept verbatim.)
+#[cfg(feature = "witness")]
+fn occ_precondition(
+    pw: usize,
+    ph: usize,
+    rect: Option<strip::Rect>,
+) -> (strip::Rect, strip::Rect, bool, u64) {
+    // `strip::Rect` IS `(x, y, w, h)`.
+    let bar = rect.unwrap_or((0, 0, 0, 0));
+    let win = (pw / 4, 0usize, pw / 2, (BAR_H * 4).min(ph));
+    let crossed = bar.2 != 0
+        && bar.3 != 0
+        && win.2 != 0
+        && bar.0 < win.0 + win.2
+        && win.0 < bar.0 + bar.2
+        && bar.1 < win.1 + win.3
+        && win.1 < bar.1 + bar.3;
+    // Saturating throughout: an instrument may not be the thing that overflows.
+    let at_risk_px: u64 = if crossed {
+        let w = (bar.0 + bar.2).min(win.0 + win.2).saturating_sub(bar.0.max(win.0));
+        let h = (bar.1 + bar.3).min(win.1 + win.3).saturating_sub(bar.1.max(win.1));
+        (w as u64).saturating_mul(h as u64)
+    } else {
+        0
+    };
+    (bar, win, crossed, at_risk_px)
+}
+
+/// MENUBAR-OCC-PAR — the answer when the bar IS live: the clip's precondition, measured, plus the
+/// reading where one exists.
+///
+/// Everything upstream of the span walk is in this file and is checked here — the bar is enabled,
+/// [`geometry`] answers a real rect on this panel, a realistic dragged-window box CROSSES it, and the
+/// bar pixels AT RISK on that crossing are counted from the intersection. So `crossed=true
+/// at_risk_px>0` establishes that the clip's precondition is live on this chip and that anything
+/// missing is the READING — not the geometry and not the arming.
+///
+/// The verdict follows what the chip could answer. Where [`occ_bar_reading`] returns a reading it is
+/// the probe's own verdict — `pop>0 && px_prot>0` fired, and `pop_fault>0 && px_fault==0` reproduces
+/// the degenerate `x86-witness.spec`'s `occclip_bar=N>0 occclip_bar_px=0` FORBID trips on. Where it
+/// returns none the verdict is `DECLINED` even though every precondition holds, because the leg cannot
+/// answer the question it exists to ask; `pre_ok=` carries the half that IS proven, so the decline is
+/// not information-free.
+#[cfg(feature = "witness")]
+fn occpar_once(pw: usize, ph: usize, rect: Option<strip::Rect>) {
+    if OCCPAR_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    // No geometry yet — try again next pass rather than report a zero rect as a finding.
+    if rect.is_none() {
+        return;
+    }
+    if OCCPAR_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (bar, win, crossed, at_risk_px) = occ_precondition(pw, ph, rect);
+    let pre_ok = crossed && at_risk_px > 0;
+    let clob = CLOBBERS.load(Ordering::Relaxed);
+    match occ_bar_reading(bar, win) {
+        Some((pop, px_prot, pop_fault, px_fault)) => {
+            let ok = pre_ok && pop > 0 && px_prot > 0 && pop_fault > 0 && px_fault == 0;
+            serial_println!(
+                ":: MENUBAR-OCC-PAR: arch={} bar_enabled=true clip_arm=present \
+                 clip_gate=x86+wc|aarch64+desktop_firmware probe=present blocked_on=none \
+                 occclip_bar={} occclip_bar_px={} forbid_bar={} forbid_bar_px={} \
+                 bar={}x{}+{}+{} panel={}x{} win={}x{}+{}+{} crossed={} at_risk_px={} clob={} \
+                 pre_ok={} :: {} ::",
+                PAR_ARCH,
+                pop, px_prot, pop_fault, px_fault,
+                bar.2, bar.3, bar.0, bar.1,
+                pw, ph,
+                win.2, win.3, win.0, win.1,
+                crossed, at_risk_px, clob, pre_ok,
+                if ok { "PASS" } else { "FAIL" }
+            );
+        }
+        // The aarch64 outcome. The blocking symbol and its exact gate go ON THE WIRE, so a Pi/Orin
+        // capture says "this instrument is absent, and here is what would restore it" rather than
+        // going quiet — the difference between a blind instrument and a reported one.
+        None => {
+            serial_println!(
+                ":: MENUBAR-OCC-PAR: arch={} bar_enabled=true clip_arm=present \
+                 clip_gate=x86+wc|aarch64+desktop_firmware probe=absent \
+                 blocked_on=wm::occ_bar_probe blocker_gate=witness+x86_64 occclip_bar=absent \
+                 occclip_bar_px=absent forbid_bar=absent forbid_bar_px=absent \
+                 bar={}x{}+{}+{} panel={}x{} win={}x{}+{}+{} crossed={} at_risk_px={} clob={} \
+                 pre_ok={} :: DECLINED ::",
+                PAR_ARCH,
+                bar.2, bar.3, bar.0, bar.1,
+                pw, ph,
+                win.2, win.3, win.0, win.1,
+                crossed, at_risk_px, clob, pre_ok
+            );
+        }
+    }
+}
+
+/// MENUBAR-OCC-PAR — the answer when the bar never turns on. Latches the same one-shot, so a shell
+/// that enables the bar later gets silence here rather than a contradicting second line.
+///
+/// Without it a bar that is off for the whole boot leaves the question unasked, and an unasked
+/// question looks exactly like a passing one on a capture.
+#[cfg(feature = "witness")]
+fn occpar_never_enabled(off_passes: u64) {
+    if OCCPAR_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    serial_println!(
+        ":: MENUBAR-OCC-PAR: arch={} bar_enabled=false clip_arm=present \
+         clip_gate=x86+wc|aarch64+desktop_firmware probe={} occclip_bar=unasked \
+         occclip_bar_px=unasked bar=none off_passes={} reason=bar_never_enabled_this_boot \
+         :: DECLINED ::",
+        PAR_ARCH,
+        if cfg!(target_arch = "x86_64") { "present" } else { "absent" },
+        off_passes
+    );
+}
+
 /// SHELLDESK — **the COMPILED default, latched at the first mutation.**
 ///
 /// [`selftest`]'s leg 1 ("absent by default") read [`ENABLED`] live, and its own comment named the
 /// condition that would break it: *"if a future shell enables the bar before the battery runs, this
-/// leg reds"*. The desktop shell now DOES enable the bar at desktop-ready (`wcx::activate`), so a
+/// leg reds"*. The desktop shell now DOES enable the bar at desktop-ready (`desktop_uefi::activate`), so a
 /// live read would report the shell's decision instead of the build's default and the leg would
 /// answer a question nobody asked.
 ///
@@ -318,7 +591,7 @@ pub fn enabled() -> bool {
 /// bar is enabled `screen::present_background` subtracts its rect, so those rows stop being desktop
 /// pixels and only a composite can fill them — and a composite whose [`strip::paint`] declined
 /// (contended scratch, a surface not yet `word4`) leaves the bar enabled, its rows withheld, and
-/// nothing on the glass. `super::pidesk::activate` reads this back after its enable-seam composite
+/// nothing on the glass. `super::desktop_firmware::activate` reads this back after its enable-seam composite
 /// instead of assuming the composite painted, on the same "read the fact, do not infer it from your
 /// own control flow" rule that seam already applies to `fbcon::console_is_routed`.
 #[inline]
@@ -469,7 +742,18 @@ fn clock_hhmm() -> Option<[u8; CLOCK_GLYPHS]> {
 /// one erase, once, and then reads `0` too.)
 pub fn compose() -> bool {
     if !ENABLED.load(Ordering::Relaxed) {
-        OFF_PASSES.fetch_add(1, Ordering::Relaxed);
+        let off = OFF_PASSES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        // MENUBAR-OCC-PAR — the NEVER-ENABLED outcome. See [`occpar_once`]: a bar that is off all
+        // boot would otherwise leave the parity question unanswered, and an unanswered question and a
+        // passing one look identical on a capture. PAR-MENUBAR: no arch term — the x86 leg of this
+        // proof carries no knob and no arch gate either, and an instrument present on one chip only
+        // is the defect this instrument reports.
+        #[cfg(feature = "witness")]
+        if off == OCCPAR_DEADLINE_OFF_PASSES {
+            occpar_never_enabled(off);
+        }
+        #[cfg(not(feature = "witness"))]
+        let _ = off;
         // A bar that was turned OFF still owes the pixels it owned. One packed load answers it, and
         // the erase runs exactly once — the slot is cleared by it.
         if SLOT.packed() != 0 {
@@ -489,6 +773,18 @@ pub fn compose() -> bool {
         (fb.width(), fb.height())
     };
     let rect = geometry(pw, ph);
+    // MENUBAR-OCC-PAR — the FIRED-precondition outcome, one-shot, on the only site of this path that
+    // has BOTH the panel and a settled rect. Here rather than in [`selftest`] because on aarch64
+    // [`selftest`] is UNREACHABLE: its only caller chain is `arch/x86_64/syscall.rs` →
+    // `dock::selftest` → there, so an aarch64 image carries no `:: MENUBAR:` string at all (verified
+    // on the built artifact, not assumed). A parity witness placed in a fixture that cannot run would
+    // have been the very defect this arc was sent to remove.
+    //
+    // PAR-MENUBAR: it runs on x86 too, and that is the point. The x86 pass carries the READING and
+    // the aarch64 pass carries `probe=absent blocked_on=`, so the two captures differ by one field
+    // instead of by a missing paragraph, and the missing field NAMES what would restore it.
+    #[cfg(feature = "witness")]
+    occpar_once(pw, ph, rect);
     // CLOBBER-REPAIR (PA41) — the model AND the damage question, from the ONE table scan `dock_scan`
     // already ran for the caption. The rect asked about is what the bar last PAINTED, never what it is
     // about to paint: the question is whether those pixels survived.
@@ -565,6 +861,31 @@ fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
 /// alone, so the box the menu opens from is the box the painter drew.
 pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     strip_rect(pw, ph).map(crystal_box)
+}
+
+/// FITTS-CORNER — **the crystal's PRESS cell: the bar's whole upper-left corner, or `None`.**
+///
+/// Peter, at the Orin bench (2026-08-25): *"the crystal menu took too much exact aim to open — the
+/// ENTIRE upper left corner where it lives should open the menu, not clicking directly on the
+/// crystal."* The glyph box is 16x22 with a [`strip::PAD`] inset on every side — a Fitts target that
+/// demands aim at exactly the place aim should be free: a screen corner is the one target a flick
+/// reaches with none, because the edges stop the pointer. So the PRESS target and the PAINT box part
+/// ways here: [`crystal_box_abs`] stays the painter's and the dropdown-anchor's truth, and this cell
+/// is what the click router hits against.
+///
+/// Derived, not hardcoded: anchored at the bar rect's own origin (the true panel corner — the bar is
+/// `frame_flush(Top)`, so `(0,0)` is inside by construction), spanning the crystal's whole left slot
+/// — [`TITLE_X0`] wide (`PAD + CRYSTAL_W + PAD`, everything left of the title's inset, i.e. the glyph
+/// cell with both of its margins) by the bar's full height. Every pixel of the cell is a pixel the
+/// BAR paints and composites above the windows, so widening the press target to it steals nothing: a
+/// window dragged under the corner is under the bar there, and a press on visible bar chrome routing
+/// to bar furniture is the fixed-furniture rule, not an exception to it.
+///
+/// `None` exactly when [`crystal_box_abs`] is `None` (bar disabled, or the panel cannot host it), so
+/// a press with no bar still falls through to the arms below.
+pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
+    let (bx, by, _bw, bh) = strip_rect(pw, ph)?;
+    Some((bx, by, TITLE_X0, bh))
 }
 
 /// Half the crystal's silhouette width at box-relative row `v`, in px.
@@ -759,7 +1080,7 @@ pub fn selftest() {
     // a reader sees what was observed rather than trusting that claim — if a future shell enables the
     // bar before the battery runs, this leg reds and the line says why.
     // SHELLDESK — the default is read from the LATCH, not from the live flag. The desktop shell
-    // enables the bar at desktop-ready (`wcx::activate`), which on a Kepler boot happens long before
+    // enables the bar at desktop-ready (`desktop_uefi::activate`), which on a Kepler boot happens long before
     // this battery runs; a live read would then report the SHELL's decision and call the artifact's
     // default a defect. `initial=` on the line is still the live flag, so a reader sees both facts.
     // The fault injection the original leg was hardened by still reds this: `ENABLED` initialised to
@@ -850,29 +1171,24 @@ pub fn selftest() {
     // Its own enable→probe→restore cycle: the bar is turned ON here (the main fixture already restored
     // it to `saved` above) and put back to `saved` at the end, so the standing state — DEFAULT OFF on
     // a gate boot, ON once the desktop shell has asked for it — is exactly what it was on entry.
-    #[cfg(target_arch = "x86_64")]
+    // ⚠ **PAR-MENUBAR: THE BARE `#[cfg(target_arch = "x86_64")]` THAT STOOD HERE IS GONE**, and what
+    // it was actually protecting is worth naming, because it was read as the opposite of what it said.
+    // The block is arch-neutral except for ONE symbol — `wm::occ_bar_probe`, which is
+    // `all(feature = "witness", target_arch = "x86_64")`. The gate existed to stop an aarch64 build
+    // failing to RESOLVE that name; written as a bare arch gate it made the PROTECTION look x86-only
+    // when only the READING is, which is the exact confusion this module's header correction was about.
+    // It is now the per-arch dispatch [`occ_bar_reading`], and the geometry comes from
+    // [`occ_precondition`] — the SAME function [`occpar_once`] uses — so the synthetic window box and
+    // the crossing test have one definition in this file instead of two that could drift apart.
+    //
+    // This leg still only RUNS on x86, and that is a REACHABILITY fact, not an arch gate: [`selftest`]'s
+    // only caller chain is `arch/x86_64/syscall.rs` → `dock::selftest` → here. That is why the aarch64
+    // half of this proof lives on the compose path in [`occpar_once`] rather than in an arm added here.
     {
         set_enabled(true);
-        let bar = strip_rect(pw, ph);
-        // A window box that CROSSES the top strip: y = 0, spanning well past BAR_H so it is not buried
-        // by the bar (a realistic dragged window is taller than the strip), and half the panel wide,
-        // inset so it sits inside the smallest suite panel (640x480) as well as the bench's.
-        let win = (pw / 4, 0usize, pw / 2, (BAR_H * 4).min(ph));
-        // Half-open overlap on both axes — the same test `wm::boxes_overlap` makes, inlined because
-        // that helper is private to `wm` and this is one comparison.
-        let crossed = match bar {
-            Some(b) => {
-                b.2 != 0
-                    && b.3 != 0
-                    && win.2 != 0
-                    && b.0 < win.0 + win.2
-                    && win.0 < b.0 + b.2
-                    && b.1 < win.1 + win.3
-                    && win.1 < b.1 + b.3
-            }
-            None => false,
-        };
-        let p = wm::occ_bar_probe(bar.unwrap_or((0, 0, 0, 0)), win);
+        let bar_rect = strip_rect(pw, ph);
+        let (bar, win, crossed, _at_risk_px) = occ_precondition(pw, ph, bar_rect);
+        let reading = occ_bar_reading(bar, win);
         // Restore THE STATE THE BOOT ARRIVED IN before the verdict, so `restored` reads the standing
         // state the rest of the boot depends on rather than the probe's transient enable.
         //
@@ -885,15 +1201,32 @@ pub fn selftest() {
         set_enabled(saved);
         let restored = enabled() == saved;
 
-        let fired = p.pop_prot > 0 && p.px_prot > 0;
-        let forbid_trips = p.pop_fault > 0 && p.px_fault == 0;
-        let occ_ok = crossed && fired && forbid_trips && restored;
-        serial_println!(
-            ":: MENUBAR-OCC: bar_enabled=true crossed={} occclip_bar={} occclip_bar_px={} \
-             forbid_bar={} forbid_bar_px={} forbid_trips_when_removed={} restored={} :: {} ::",
-            crossed, p.pop_prot, p.px_prot, p.pop_fault, p.px_fault, forbid_trips, restored,
-            if occ_ok { "PASS" } else { "FAIL" }
-        );
+        match reading {
+            Some((pop, px_prot, pop_fault, px_fault)) => {
+                let fired = pop > 0 && px_prot > 0;
+                let forbid_trips = pop_fault > 0 && px_fault == 0;
+                let occ_ok = crossed && fired && forbid_trips && restored;
+                serial_println!(
+                    ":: MENUBAR-OCC: bar_enabled=true crossed={} occclip_bar={} occclip_bar_px={} \
+                     forbid_bar={} forbid_bar_px={} forbid_trips_when_removed={} restored={} :: {} ::",
+                    crossed, pop, px_prot, pop_fault, px_fault, forbid_trips, restored,
+                    if occ_ok { "PASS" } else { "FAIL" }
+                );
+            }
+            // Unreachable today — [`selftest`] has no aarch64 caller — but it is the honest shape
+            // rather than a `0` a capture could not tell from a pass, and it is what this leg becomes
+            // the moment a caller exists on that arch. The compose-path `:: MENUBAR-OCC-PAR:` line is
+            // the reading a Pi/Orin boot actually gets today.
+            None => {
+                serial_println!(
+                    ":: MENUBAR-OCC: bar_enabled=true crossed={} occclip_bar=absent \
+                     occclip_bar_px=absent forbid_bar=absent forbid_bar_px=absent \
+                     forbid_trips_when_removed=absent restored={} \
+                     blocked_on=wm::occ_bar_probe :: DECLINED ::",
+                    crossed, restored
+                );
+            }
+        }
     }
 
     rollup("selftest");

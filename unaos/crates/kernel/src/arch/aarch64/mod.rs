@@ -39,11 +39,16 @@ pub mod boot_tegra;
     all(target_arch = "aarch64", feature = "tegra")
 ))]
 pub mod sched;
-#[cfg(feature = "baremetal")]
+// JETSON-EL0 (M1b): widened from `baremetal` to also cover `tegra_el0`. The module body is unchanged
+// except for the `uslots` facade (below) it now names instead of `super::boot` — the Pi keeps the
+// BCM2711 slot system in `boot.rs`, the Orin gets the tegra port in `mmu_tegra_el0.rs`, and syscall.rs
+// compiles against whichever one the active feature selects.
+#[cfg(feature = "aarch64_el0")]
 pub mod syscall;
 // BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — v1 subset codec (wire layer of the
-// SYS_MSEND/SYS_MRECV transport in syscall.rs). Baremetal-gated like syscall.rs (Pi 4 lane).
-#[cfg(feature = "baremetal")]
+// SYS_MSEND/SYS_MRECV transport in syscall.rs). Gated like syscall.rs — JETSON-EL0 (M1b) widened both
+// from `baremetal` to `any(baremetal, tegra_el0)` together, since the bus IS syscall.rs's wire layer.
+#[cfg(feature = "aarch64_el0")]
 pub mod bus;
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
@@ -51,6 +56,29 @@ pub mod bus;
 // `map_mmio_window` reach ceiling there; on virt the L1 statics are inert, not the active regime.)
 #[cfg(any(feature = "tegra", feature = "pcie3"))]
 pub mod mmu_tegra;
+// JETSON-EL0 (M1b): the EL0 user address-space machinery for the tegra EL1 regime — the M6d slot system
+// (`boot.rs`) re-implemented against `mmu_tegra`'s `L1_EL1` instead of the Pi's BCM2711 identity map.
+// See the module header for the three places it necessarily diverges from `boot.rs`.
+#[cfg(feature = "tegra_el0")]
+pub mod mmu_tegra_el0;
+
+// JETSON-EL0 (M1b): THE FACADE. `syscall.rs` and `sched.rs` consume one user-address-space API — the
+// slot pool, the user window VA, the W^X leaf flips, the FB surface hole, ASID teardown. Two modules
+// implement it: `boot.rs` for the Pi (BCM2711, `baremetal`) and `mmu_tegra_el0.rs` for the Orin
+// (Tegra234, `tegra_el0`). Routing the consumers through this one re-export is what let the EL0 chain
+// reach the Orin WITHOUT editing a single line of logic in either consumer — `syscall.rs`'s 308 call
+// sites changed module path only (`super::boot::` -> `super::uslots::`), and `sched.rs`'s five changed
+// the same way. The two features are mutually exclusive in practice (`baremetal` implies `pi`,
+// `tegra_el0` implies `tegra`, and `pi`/`tegra` are mutually exclusive), but `baremetal` is written to
+// win the arm explicitly so a nonsensical both-on build picks one deterministically instead of
+// colliding on a duplicate glob import.
+#[cfg(feature = "aarch64_el0")]
+pub mod uslots {
+    #[cfg(feature = "baremetal")]
+    pub use super::boot::*;
+    #[cfg(all(feature = "tegra_el0", not(feature = "baremetal")))]
+    pub use super::mmu_tegra_el0::*;
+}
 // JB1a: bounded read-only FDT walker — prints the BPMP IPC geometry (shmem/mboxes/reserved-memory)
 // from the firmware DTB, the verified starting line for the BPMP IVC arc (JB1).
 // (ORIN-NET-1/-2 also reuse this walker's `Fdt`/`for_each_prop` for their read-only PCIe census, so it
@@ -79,7 +107,13 @@ pub mod display_tegra;
 // Tegra-only AND `smpprobe`-gated, so it is compiled out of every default image (the `smpprobe`-off
 // tegra binary stays byte-identical to baseline). Wired into `tegra_early_stop` after JM4.
 #[cfg(all(feature = "tegra", feature = "smpprobe"))]
-pub mod smpprobe;
+pub mod smpprobe; #[cfg(all(feature = "tegra", feature = "selfup"))] pub mod selfup_tegra; #[cfg(all(feature = "tegra", feature = "ga10bprobe1"))] pub mod ga10b_probe; // ORIN-SELFUP: the self-update core (staged whole-ESP payload -> sha256 verify -> proven FAT write -> warm-reboot hook), wired into tegra_early_stop after ORIN-INSTALL-2; appended to THIS line for knob-off byte-identity (inline fns with Location-bearing ops live below). GA10B-PROBE1: the first read-only GA10B iGPU probe rung (BPMP rail gate -> risk-ordered announce-first BAR0 reads -> SYSTEM_OFF), its own gated pub mod also appended to THIS line for knob-off byte-identity (its Location-bearing ops live in the module).
+// ORIN-REBOOT (watchdog half): the `UNAOS_ORINWDT=1` Tegra234 TKE boot watchdog — a wedged
+// Orin boot self-resets (POR on the 5th WDT0 expiration) instead of sitting dark for bench
+// hands. Tegra-only AND `orinwdt`-gated (`orinwdt` implies `tegra`), so it is compiled out
+// of every default image. Armed early in `tegra_early_stop`, disarmed on the EL1 terminus.
+#[cfg(all(feature = "tegra", feature = "orinwdt"))]
+pub mod wdt_tegra;
 
 // PI-V3D-1: the VideoCore VI (V3D 4.2) GPU foundation — firmware power/clock, MMIO probe, the
 // V3D-private MMU, and a minimal GPU buffer-clear. Pi bare-metal AND `v3d`-gated, so it is compiled
@@ -240,7 +274,12 @@ pub fn hlt() {
     // an untested GIC path where the PPI never reaches the CPU — WFI would have no wake source and
     // sleep forever, freezing the polled main loop; fall back to a light poll-spin so input keeps
     // being serviced (the pre-interrupt behavior, trading idle power for liveness).
-    if timer::is_live() {
+    //
+    // HID-REGRESS-B12: `is_live()` tracks the BOOT CORE's timer, which the Jetson JM6 EL2->EL1 drop
+    // disables (`set_not_live`). A GICv3 SECONDARY that armed its OWN local tick (JC3) still has a live
+    // per-core wake source, so it too may WFI (bounded to one ~4 ms tick) — otherwise it busy-spins its
+    // `run()` steal loop post-drop and the shared-lock churn starves the boot core's xHCI HID poll.
+    if timer::is_live() || timer::this_core_has_local_tick() {
         unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) };
     } else {
         core::hint::spin_loop();
@@ -302,15 +341,15 @@ pub fn now_cycles() -> u64 {
     v
 }
 
-/// Busy-wait budget in `now_cycles()` (CNTVCT) units. **2.78 s on Pi 4**, not the ~2.5 s at ~60 MHz this line claimed until 2026-08-22: the part reports `CNTFRQ=54000000 Hz` on its own boot diag, and 150e6/54e6 = 2.7778 s is exactly the `spent_ms=2779` the BOT pump printed when it blew a 2000 ms budget — the agreement to the millisecond is what makes this a measurement rather than arithmetic. ⚠ ONE LINE: this file is compiled knob-off and panic `Location` records embed line numbers.
+/// Fixed FALLBACK busy-wait budget in `now_cycles()` (CNTVCT) units, and the whole budget off-tegra. NOT "~2.5 s at a ~60 MHz generic-timer rate", as this line claimed until 2026-08-25: no part in this tree runs at 60 MHz, and a fixed CYCLE count is a different DURATION on every one of them — 2.78 s on the Pi 4 (CNTFRQ=54000000 Hz on its own boot diag; BOTBOUND's boot 11 blew a 2000 ms budget printing `spent_ms=2779` against 150e6/54e6 = 2777.8 ms, agreement to the millisecond), 2.4 s on QEMU virt (62.5 MHz), and 4.8 s on the Jetson Orin (CNTFRQ=31250000 Hz, capture-proven over three boots — 92% past the figure this line advertised). `hw_wait_budget()` derives a DURATION from CNTFRQ on tegra; this constant is what that derivation falls back to when CNTFRQ_EL0 reads 0, and what it still returns verbatim off-tegra. ⚠ ONE LINE: this file is compiled knob-off and panic `Location` records embed line numbers.
 pub const HW_WAIT_BUDGET: u64 = 150_000_000;
 
-/// Busy-wait budget in `now_cycles()` (CNTVCT) units. Arch-neutral mirror of x86_64's
-/// `hw_wait_budget`; aarch64 has no PM-timer calibration path, so it returns the fixed budget.
-/// (CNTFRQ_EL0 gives the exact CNTVCT rate and could refine this later.)
+/// Busy-wait budget in `now_cycles()` (CNTVCT) units. Arch-neutral mirror of x86_64's `hw_wait_budget`,
+/// which is an honest `tsc_hz * HW_WAIT_SECONDS` once calibrated. The aarch64 twin needs no calibration
+/// — CNTFRQ_EL0 states the rate exactly — but only tegra takes it; see the tail block for why not all.
 #[inline]
 pub fn hw_wait_budget() -> u64 {
-    HW_WAIT_BUDGET
+    hw_wait_budget_derived()
 }
 
 /// WEDGE-7 — the RAII form of [`without_interrupts`], for spans that cannot be expressed as a
@@ -382,4 +421,85 @@ where
         core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack, preserves_flags));
     }
     ret
+}
+
+// ── HWBUDGET: the CNTFRQ-derived busy-wait budget (tail-defined per the Location-shift convention
+// this file and `timer.rs` already follow; the non-tegra arm is byte-identical to the constant it
+// replaced, so the pi and QEMU-virt images stay byte-identical).
+//
+// The bug: [`HW_WAIT_BUDGET`] is a CYCLE count, and every caller reads it as a DURATION ("~2 s",
+// "~2.5 s", "~8.3 s on a failing transfer" — see `drivers/xhci/mod.rs` and `main.rs`). Those two
+// only agree at one frequency, and it is not a frequency any part in this tree runs at. The Orin
+// is the worst-off: CNTFRQ_EL0 = 31_250_000 Hz makes 150e6 cycles 4.8 s, 92% past the "~2.5 s"
+// the constant advertised. `arch/aarch64/xusb_tegra.rs` had already worked this out in-lane and
+// carries the correct "~4.8 s at Orin's 31.25 MHz"; the arch constant had not caught up.
+//
+// The fix is the one x86_64 already made: state the budget as WALL CLOCK and multiply by the
+// measured rate (`tsc_hz * HW_WAIT_SECONDS` there, `cntfrq * HW_WAIT_MS / 1000` here). aarch64
+// needs no calibration pass to do it — CNTFRQ_EL0 *is* the rate, architecturally.
+//
+// ⚠ WHY THIS IS TEGRA-GATED, AND WHAT THAT COSTS. Deriving on every aarch64 part would be more
+// correct and is NOT what this commit does, because it would silently RE-TIME the Pi 4 and QEMU
+// virt: at 54 MHz a 150e6-cycle budget is the 2.78 s BOTBOUND measured on boot 11, and any whole-
+// second target re-times it (2 s → -28%, 3 s → +8%). Re-timing the Pi's BOT pump is a behavioural
+// change to a platform this seat holds no boot evidence for and does not own; it belongs to the
+// pi seat, with its own metal gate. So: tegra derives, everyone else keeps the exact cycle count
+// they have always had. This is a deliberate asymmetry, flagged here so the next reader does not
+// mistake it for an oversight — the honest one-line summary is that the CONSTANT is wrong
+// everywhere and is only FIXED where the seat that owns the silicon can prove the fix.
+//
+// ⚠ WHY 4800 ms AND NOT 2500. Because 4.8 s is what the Orin has ALWAYS waited (31_250_000 × 4800
+// / 1000 = 150_000_000 exactly — the derivation reproduces today's budget to the cycle), and no
+// evidence in this tree says the Orin's storage path wants 2.5 s. Picking the doc's aspirational
+// "~2.5 s" would have been a real 48% shortening of every xHCI/BOT/FS wait on this platform,
+// dressed up as a comment fix. The correct Orin duration is genuinely open; this commit refuses to
+// settle it silently and preserves the measured status quo instead. What it BUYS is that the
+// number is now a duration: a Tegra part that clocks CNTFRQ differently (Tegra silicon has shipped
+// 19.2 MHz and 31.25 MHz) gets 4.8 s, where the raw constant would have handed it 7.8 s.
+//
+// CNTFRQ_EL0 = 0 falls back to [`HW_WAIT_BUDGET`] rather than deriving a budget of ZERO, which
+// would fail every bounded wait instantly. That is not hypothetical on this platform: `timer::init`
+// carries a whole tegra-gated witness (`CNTFRQ-SUB`) for a firmware that never programmed it, and
+// its own comment names "every wall-clock budget derived from it" as the blast radius. This is that
+// derivation, so it takes the same guard — and the fallback is exactly the cycle count that shipped
+// before, so an unprogrammed CNTFRQ behaves precisely as it did.
+#[cfg(feature = "tegra")]
+const HW_WAIT_MS: u64 = 4800;
+
+/// Backing derivation for [`hw_wait_budget`]. Split out so the tegra-only CNTFRQ read is defined at
+/// the tail of the file, where adding it cannot shift a panic `Location` line number above it.
+#[cfg(feature = "tegra")]
+#[inline]
+fn hw_wait_budget_derived() -> u64 {
+    let hz = timer::cntfrq();
+    if hz != 0 {
+        hz.saturating_mul(HW_WAIT_MS) / 1000
+    } else {
+        HW_WAIT_BUDGET
+    }
+}
+
+/// Off-tegra: the fixed cycle count, unchanged and un-re-timed. See the block above.
+#[cfg(not(feature = "tegra"))]
+#[inline]
+fn hw_wait_budget_derived() -> u64 {
+    HW_WAIT_BUDGET
+}
+
+/// [`flush_framebuffer_range`]'s STRIDED twin: clean `rows` runs of `row_len` bytes, each `stride`
+/// apart, for the same reason and to the same Point of Coherency — the RECT form a damage-tracked
+/// present wants, where cleaning the full-width scanlines the rect sits in would touch several times
+/// the bytes the caller actually wrote. aarch64 answers with `cache::clean_rows`: a per-row
+/// `DC CVAC` sweep with ONE trailing `DSB` for the whole rect rather than one per row.
+///
+/// This is the facade `video::framebuffer::flush_rect`'s doc comment has named since it was written;
+/// until now it did not exist and that call site open-coded a `#[cfg(target_arch)]` pair instead.
+///
+/// APPENDED AT THE FILE TAIL, deliberately: this module is compiled into the knob-off `kernel8.img`
+/// whose byte-identity is a standing proof, and panic `Location` records embed line numbers, so a
+/// function inserted mid-file would move every record below it (PARITY.md 5.3). Nothing is below
+/// this, so nothing moves — the same reasoning `video/mod.rs` gives for its own tail block.
+#[inline]
+pub fn flush_framebuffer_rows(addr: usize, row_len: usize, rows: usize, stride: usize) {
+    cache::clean_rows(addr, row_len, rows, stride);
 }

@@ -59,7 +59,7 @@ mod tegra {
     const LSR_THRE: u32 = 1 << 5; // transmit holding register empty (ok to write)
     const LSR_DR: u32 = 1 << 0; // receive data ready
 
-    pub fn write_byte(byte: u8) {
+    pub fn write_byte(byte: u8) { if super::tegra_guard::drop_pre_map() { return; } // DARKWIN-GUARD (tail mod)
         unsafe {
             let thr = BASE as *mut u32;
             let lsr = (BASE + LSR) as *const u32;
@@ -78,7 +78,7 @@ mod tegra {
         }
     }
 
-    pub fn read_byte() -> Option<u8> {
+    pub fn read_byte() -> Option<u8> { if !super::tegra_guard::ready() { return None; } // DARKWIN-GUARD (tail mod)
         unsafe {
             let rbr = BASE as *const u32;
             let lsr = (BASE + LSR) as *const u32;
@@ -451,6 +451,60 @@ pub fn on_rx_interrupt() {
     RX_IRQ_SEEN.store(true, core::sync::atomic::Ordering::Relaxed);
     RX_READY.post();
 }
+
+// ── DARKWIN-GUARD (orin 1, 2026-08-18) — tail-defined per the Location-shift convention ──────
+// Between ExitBootServices and `mmu_tegra::init`, the kernel runs under the UEFI-handoff
+// translation tables, which map RAM but NOT the Tegra device window (JM2 R4: the kernel's first
+// UARTC read faulted there, caught by UEFI's still-resident ArmCpuDxe vectors — whose post-EBS
+// reporting path is gone, so the observed outcome on the box is a silent stop at the logo).
+// The trunk merge proved the class on metal: `kernel_main` step 0a2 (`video::init_edid`,
+// unconditional on every arch) printed its witness line before `tegra_early_stop`, and the
+// board died at the NVIDIA logo on every boot of 2026-08-18. This latch closes the UARTC class:
+// bytes offered before `mark_mmio_ready()` (armed by `tegra_early_stop` immediately after
+// `mmu_tegra::init` returns) are DROPPED and COUNTED, never written; the count is witnessed on
+// the wire once the window closes. Byte-granularity by design — the content of a pre-map line
+// is gone (fbcon/selftest mirrors still carry it), the COUNT is what survives to the wire.
+// Everything lives in this tail mod, with one-line calls appended to the pre-existing
+// `write_byte`/`read_byte` opening lines, so no pre-existing line shifts and the non-tegra
+// images keep their panic-Location bytes (the main.rs "35-line block" lesson).
+#[cfg(feature = "tegra")]
+mod tegra_guard {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static MMIO_READY: AtomicBool = AtomicBool::new(false);
+    static DROPPED_PRE_MAP: AtomicU32 = AtomicU32::new(0);
+
+    /// Arm the UART: the Tegra device window is mapped and UARTC MMIO is safe. Called exactly
+    /// once, by `tegra_early_stop`, the moment `mmu_tegra::init` returns.
+    pub fn mark_mmio_ready() {
+        MMIO_READY.store(true, Ordering::Release);
+    }
+
+    /// True once the device window is mapped (read-side gate: LSR is unmapped before that).
+    pub fn ready() -> bool {
+        MMIO_READY.load(Ordering::Acquire)
+    }
+
+    /// Write-side gate: returns true (and counts the byte) while the window is still dark.
+    pub fn drop_pre_map() -> bool {
+        if ready() {
+            return false;
+        }
+        DROPPED_PRE_MAP.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// How many bytes the guard dropped before the device window was mapped — nonzero means
+    /// some caller printed before `mmu_tegra::init`, exactly the class that hung the merged
+    /// base on metal.
+    pub fn dropped_pre_map() -> u32 {
+        DROPPED_PRE_MAP.load(Ordering::Relaxed)
+    }
+}
+// The module surface `tegra_early_stop` (the sole armer) and its witness line reach:
+// `arch::serial::{mark_mmio_ready, dropped_pre_map}`.
+#[cfg(feature = "tegra")]
+pub use tegra_guard::{dropped_pre_map, mark_mmio_ready};
 
 // ---- SERIAL-FOCUS: the shell's SERIAL INBOX (bare-metal Pi only) ---------------------------------
 //
