@@ -7547,7 +7547,7 @@ fn jd2_supstate_phase2(
     // line is), so a CAPSTONE straggler can't paint over the console frame.
     if !tegra_conwin_live() {
         unaos_kernel::video::fbcon::detach();
-    }
+    } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch, MISSING FROM THIS COPY until this arc and that omission produced a WRONG VERDICT ON A HEALTHY BOOT. `jd2_supstate_phase2` never returns (the drive loop at this function's tail is non-breaking), so on a `supstate` image the legacy phase 2 — the only site that latched `RG_CONSOLE_OWNS` — is unreachable and the latch was never set. Read off `display_tegra::orin_rast_census`: with `owns` false, a console that has taken the panel and repainted the cube away scores `RAST-PAINTED-OVERWRITTEN`, which that census calls "the only arm that indicts a repainter", instead of `RAST-SUPERSEDED-BY-CONSOLE`. A correct boot was being reported as a defect. Placed exactly as the legacy twin places it: on the FIRST statement of phase 2 and OUTSIDE the conwin guard, because the console takes the panel on both routes and only the detach differs. ⚠ LINE-NEUTRAL append.
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&screen);
@@ -7654,7 +7654,7 @@ fn jd2_supstate_phase2(
         // VUGRAS writeback sweep + the ORIN-CLICK census, on the cadence phase 1 advanced.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick); unaos_kernel::arch::display_tegra::sup_present_census(sweep_tick); // ORIN-SUPSOUND — the ~10 s presenter census, authored by the INPUT SOURCE on purpose: this board's UART is shared with the SPE's TCU and drops bytes, so a dead presenter must produce a REPEATING LINE (`pass=+0 -> DEAD`), never a silence. Appended to an existing statement, and un-`#[cfg]`ed because this whole block is already `supstate`-gated.
+            unaos_kernel::vugras::idle_sweep(sweep_tick); unaos_kernel::arch::display_tegra::sup_present_census(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); // ORIN-SUPSOUND — the ~10 s presenter census, authored by the INPUT SOURCE on purpose: this board's UART is shared with the SPE's TCU and drops bytes, so a dead presenter must produce a REPEATING LINE (`pass=+0 -> DEAD`), never a silence. Appended to an existing statement, and un-`#[cfg]`ed because this whole block is already `supstate`-gated. ORIN-RASTGLASS: the rast census is the phase-2 twin of the sweep-site call in `jd2_console_pump`'s phase-1 loop and it was MISSING from this copy, so on a `supstate` image the census stopped dead at the phase-1 boundary and the rung's verdict was whatever the last phase-1 sweep had said — with `RG_CONSOLE_OWNS` never latched (see the phase-2 boundary line above), permanently pre-takeover. The census self-terminates on `RG_DONE`, so restoring it here costs one relaxed load per sweep once the question is answered. ⚠ LINE-NEUTRAL append.
             #[cfg(feature = "orinclick")]
             unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick);
             sweep_tick += 1;
