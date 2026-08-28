@@ -148,6 +148,34 @@
 # (16/17) and greens again when that line is replaced by the `[orinbsprun]` banner (17/17);
 # an armed-shape synthetic flips all five new PENDINGs (14/20, PASS); an all-rows synthetic
 # proves every one of the fourteen new rows matchable and reds on the new FORBID.
+#
+# 2026-08-28 (exec-orin10-specgate): BOOT 7k — THE TERMINUS INSTRUMENTS GET ROWS, and the
+# reason is a measured gap rather than a missing feature. The TERMINUS fold (405b21f6)
+# repaired four tegra instruments and then proved that NO CHECK LEG IN THIS TREE CAN
+# DISTINGUISH TWO OF THE FOUR FIXES: it re-introduced the defects deliberately and both
+# `arm-tegra-furn` and `arm-tegra-supstate` still exited 0. Tegra legs are `cargo check`
+# only and no QEMU regression compiles `tegra`, so the compile matrix scores tegra
+# COMPILATION and cannot score tegra BEHAVIOUR at all. This file is now the only thing
+# that scores those four instruments on anything, and the block is at the foot, above the
+# COMPLETE marker.
+#   Spec-declared FORBIDs 10 -> 15, PENDINGs 20 -> 23, OPTIONALs 68 -> 74. REQUIREs stay 17
+#   — three of the four families are knob-gated and default OFF, so every failable rule is
+#   spelled as a FORBID on a FAILURE LITERAL: a token that exists only in an image that
+#   compiled the instrument, so an unarmed boot cannot trip it and its silence is never
+#   read as a pass. The one pair whose reachability is GUARANTEED (by this file's own
+#   `REQUIRE JD4.*console OWNS the panel`) is the takeover-path pair.
+# ⚠ GREEN-REFERENCE CHANGE, THE LARGEST THIS FILE HAS TAKEN. The takeover-path FORBIDs
+#   match the PRE-fold shape of a line every Orin capture in the tree carries (13 hits in
+#   capture/line-acm0/orin.log), so boot7f/7g/7h — the standing green reference included —
+#   now replay FAIL on exactly those two rows. Correct, and the point: those captures came
+#   from images that could not say which of the two takeover sites had printed. THERE IS NO
+#   GREEN REFERENCE FOR THIS FILE UNTIL A POST-405b21f6 IMAGE FLIES. Do not weaken the rows
+#   to recover a green; fly the fold.
+# Every direction proven before commit against `capture/line-acm0/orin.log` (mbench
+# --replay): the un-folded capture reds on the two takeover rows and ONLY those two; a
+# synthetic post-fold takeover line greens them; a synthetic carrying `live=FROZEN`,
+# `DEPTH-UNAVAILABLE` and `RAST-PAINTED-OVERWRITTEN` reds on each of those three rows
+# individually. The three go-red proofs are the reason those rows are not decoration.
 
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
@@ -1321,6 +1349,286 @@ OPTIONAL \[supstate\] lift gen=([2-9]|[1-9][0-9]+) screen\+console
 # boot7h slice. ZERO false hits, which the trailing ` ::` is what buys: `JD2` is tegra-only
 # text and no other line in the corpus ends `KEY <quoted-char-or-byte> ::`.
 OPTIONAL KEY ('.'|0x[0-9a-f]{2}) ::
+
+# =====================================================================================
+# BOOT 7k — THE TERMINUS INSTRUMENTS, AND THE ONE THING THE COMPILE MATRIX CANNOT SCORE
+# (2026-08-28, exec-orin10-specgate). The TERMINUS fold (405b21f6, on top of 0ed6fee2)
+# repaired four tegra instruments that had each been reporting something other than the
+# state their author intended. Its own arc then proved the more useful half: it
+# RE-INTRODUCED two of the four defects deliberately and `arm-tegra-furn` and
+# `arm-tegra-supstate` BOTH STILL EXITED 0. The tegra legs are `cargo check` only and no
+# QEMU regression in this tree compiles `tegra` (QEMU models no Tegra234), so the compile
+# matrix can score tegra COMPILATION and cannot score tegra BEHAVIOUR at all. The fold's
+# fallback was an `llvm-objdump` artifact proof, which is right for a commit and does not
+# carry forward: nothing re-checks it on the next build and nothing scores the next metal
+# capture. THIS BLOCK IS THE THING THAT SCORES THE NEXT CAPTURE. The instruments exist;
+# what was missing was anything that REQUIRES them.
+#
+# WHAT MOVES: spec-declared FORBIDs 10 -> 15, PENDINGs 20 -> 23, OPTIONALs 68 -> 74.
+# REQUIREs stay 17 and that is deliberate, not timidity — see the arming note below.
+#
+# THE ARMING NOTE, and it is the reason there is no new REQUIRE in this block but one.
+# Three of the four families are knob-gated and default OFF (`orinconwin`,
+# `orinfurn`, `rast`), and the fourth's discriminator points BOTH WAYS depending on
+# `supstate`. A REQUIRE on any of them reds an unarmed boot on CONFIGURATION rather than
+# on health — the SMPMARK/TEGRA-SD argument, permanently binding in this file. So every
+# rule below that CAN fail is spelled as a FORBID on a FAILURE LITERAL, which is the one
+# shape that is unconditionally safe: the token exists only in an image that compiled the
+# instrument, so an unarmed boot cannot trip it and its silence is never taken as a pass.
+# The healthy lines get PENDING and the honest negatives get OPTIONAL, exactly as the
+# ORINCONWIN / TEGRA-SD / net4 blocks above spell the same idea.
+# THE ONE EXCEPTION IS THE TAKEOVER-PATH PAIR, and it is the strongest position available
+# anywhere in this file: its FORBIDs sit on a line that `REQUIRE JD4.*console OWNS the
+# panel` ALREADY DEMANDS, so their precondition is guaranteed by another row of this same
+# spec. That is a FORBID whose reachability is not argued — it is required.
+#
+# THE FRESHNESS TRAP, checked on every pattern below rather than assumed. A witness that
+# also existed in the PREVIOUS image proves nothing about THIS build. Measured across the
+# whole bench capture tree (`~/unaos-bench/capture/`), with `[orinrast]` at 76 hits as the
+# control proving the scan reached:
+#   `live=FROZEN`                 0 hits   NEW — see the ORINCONWIN row for why `live=LIVE`
+#                                          is the trap and `FROZEN` is the fresh half
+#   `path=jd2-console-pump`       0 hits   NEW with the fold
+#   `path=jd2-supstate-phase2`    0 hits   NEW with the fold
+#   `[orinfurn] arm`              0 hits   never flown on this bench
+#   `[orinstkdepth]` (both arms)  0 hits   NEW with the fold, never flown
+#   `RAST-PAINTED-OVERWRITTEN`    0 hits   NOT NEW — the verdict string predates the fold
+#                                          (display_tegra.rs); what the fold changed is
+#                                          that a supstate boot can now reach the CORRECT
+#                                          arm instead of this one. Stated so no reader
+#                                          takes this row as evidence about the fold.
+#   `[orinrast] census`          38 hits   NOT NEW — armed on every recent flight
+#
+# ⚠ GREEN-REFERENCE CHANGE, AND IT IS THE LARGEST THIS FILE HAS EVER TAKEN — stated here
+# rather than discovered on the next replay, per the boot5c / boot7f precedents above.
+# The two takeover-path FORBIDs match the PRE-FOLD shape of a line every Orin capture in
+# the tree carries. Replaying boot7f / boot7g / boot7h — including the standing green
+# reference — against this file now reads FAIL on exactly those two rows, 13 hits in
+# `capture/line-acm0/orin.log`. That is correct and is the whole point: those captures were
+# cut from images that could not say which of the two takeover sites had printed, and this
+# file adjudicates the NEXT flight. THERE IS NO GREEN REFERENCE FOR THIS FILE UNTIL A
+# POST-405b21f6 IMAGE FLIES. Do not "fix" the red by weakening the rows; fly the fold.
+# =====================================================================================
+
+# --- INSTRUMENT 1: ORINCONWIN's `live=` — a read-back that used to be a literal --------
+# ARMED BY `orinconwin` (UNAOS_ORINCONWIN=1, default OFF, and it still DECLINES unless
+# UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 ride with it — §6.1, the ordering rule the block
+# above already scores). The terminus line already has its PENDING and its two verdict
+# arms up in the BOOT 7h block; this row adds the field that block never had.
+#
+# WHAT CHANGED, AND WHY THE ROW KEYS ON `FROZEN` AND NEVER ON `LIVE`. Before the fold the
+# `live=` field was the compile-time string `"LIVE"` — asserted from the build, on a line
+# whose own comment forbids exactly that of every other field on it ("DERIVED from the
+# outcome CROSSED with the route read back, never asserted"). It is now a READ-BACK of
+# `fbcon::console_is_routed()` taken at print time, AFTER `present_outcome` and
+# `composite` have run, so a route dropped by the present pass can no longer print `LIVE`.
+# THE TRAP: boot7h's `live=LIVE` (capture/line-acm0/orin.log:14833) is the OLD literal. A
+# row keyed on `live=LIVE` would be satisfied by every pre-fold capture in the tree and
+# would prove nothing about any build — decoration, and the exact failure mode this
+# project cares most about. `FROZEN` is the half that could not print before the fold.
+#
+# ⚠ THE ROW CLAIMS EXACTLY WHAT THE INSTRUMENT CLAIMS AND NOT ONE WORD MORE. The
+# instrument's own site documents its limit: `fbcon::detach()` sets GUI_ACTIVE and does
+# NOT clear CONSOLE_WIN, so after a detach `console_is_routed()` still answers true while
+# no further glyph reaches the window. The sample is taken before any terminus detach can
+# have run. So this row scores "the route was installed at this instant" and says NOTHING
+# about a later detach freezing the window — that second half is owned by the guards on
+# the two detach sites, not by this field, and no spec row here pretends otherwise.
+#
+# FAILS WHEN: an `orinconwin` image opens the console window, reaches the terminus line,
+# and the route is NOT installed at print time — i.e. the present pass dropped a route the
+# `route=` field (sampled earlier, and already on the wire) had reported as held.
+# CANNOT FALSE-RED AN UNARMED BOOT: the `[orinconwin]` tag is absent from every image that
+# did not compile the rung. Its silence is not read as a pass either — the PENDING
+# terminus row in the BOOT 7h block is what says whether the instrument fired at all, and
+# the two rows are read as a pair:
+#   PENDING terminus ⏳ + this row 0 hits  the rung was unarmed or declined. NOT SCORED.
+#   PENDING terminus ✅ + this row 0 hits  armed, window open, route installed. The pass.
+#   PENDING terminus ✅ + this row HIT     armed, window open, route dropped by the
+#                                          present pass. Quote the whole line.
+FORBID \[orinconwin\] win=.* live=FROZEN
+
+# --- INSTRUMENT 2: the DISCRIMINATED takeover, and the unattributable line it replaces --
+# THIS IS THE ONLY PAIR IN THIS BLOCK WHOSE REACHABILITY IS GUARANTEED BY THIS FILE. Both
+# rows key on the takeover line that `REQUIRE JD4.*console OWNS the panel` (in the bring-up
+# block at the head) already demands of every scored flight, so neither can be dismissed as
+# "the path was not driven": if the REQUIRE is satisfied the line printed, and these rows
+# adjudicate its SHAPE.
+#
+# THE DEFECT THE FOLD REMOVED. `jd2_console_pump` (main.rs:2801, `cfg(tegra, aarch64)` —
+# present on EVERY tegra image) and `jd2_supstate_phase2` (main.rs:7524, additionally
+# `feature = "supstate"`) each print a `console OWNS the panel` pair, and until the fold
+# the four literals were BYTE-IDENTICAL. Neither a serial capture nor a grep of the
+# artifact could say which site a boot had printed — the one question the state lift's own
+# falsifier turns on. The fold's measurement on the `arm-tegra-supstate` kernel.elf at
+# 0ed6fee2 makes it worse than the two-run case it looked like: `LC_ALL=C grep -a -o` found
+# exactly ONE `.rodata` run for each literal, because `jd2_supstate_phase2` never returns
+# and LLVM drops the legacy phase 2 as unreachable — so a SINGLE unattributable run read as
+# confirmation. Each site now names itself; the tokens are deliberately longer than 8 bytes
+# so they cannot be LLVM-immediate-encoded out of `.rodata` and defeat the artifact grep.
+#
+# THE TWO FORBIDS MATCH THE PRE-FOLD SHAPE AND NOTHING ELSE. The old wire text was
+# `…(Screen back buffer live); first key 0x..` and `…(Screen back buffer live);
+# screen-on-boot …`; the new text puts `path=<site>; ` between the `);` and the tail, so a
+# post-fold line cannot match either row. Verified against the source of both revisions
+# (`git show 0ed6fee2:…/main.rs` lines 2890/2898/7566/7574 vs HEAD's).
+# FAILS WHEN: a scored flight prints a takeover line carrying NO `path=` token — a stale
+# pre-fold image flown by mistake (a real and expensive bench error, and the one this pair
+# is worth the most against), or the discriminator reverted out of the source.
+# IMAGE-AGNOSTIC BY CONSTRUCTION: it does not need to know whether `supstate` is armed,
+# which is what makes it the one failable row here that needs no knob argument.
+# ⚠ THE ONE WAY IT COULD RED HONESTLY-BUT-WRONGLY, stated rather than left for the next
+# reader: this wire is known-lossy (UARTC shared with the SPE's TCU), so a dropped run of
+# exactly the `path=jd2-…; ` bytes would leave the pre-fold shape behind. That is a 20+
+# byte contiguous loss, a different order from the punctuation drops this file usually
+# guards against, but it is not impossible. A red here is cross-checked the same way the
+# fold proved the tokens in the first place: `LC_ALL=C grep -a` the staged kernel.elf for
+# `path=jd2-supstate-phase2` and `path=jd2-console-pump`. If the artifact carries the
+# token and the capture does not, the finding is the wire, not the build.
+# The patterns start AFTER the em dash in `:: tegra: JD2 — console OWNS …` and are
+# contiguous ASCII end to end, this file's standing rule for anything crossing UARTC.
+FORBID console OWNS the panel \(Screen back buffer live\); first key
+FORBID console OWNS the panel \(Screen back buffer live\); screen-on-boot
+# THE DISCRIMINATION READOUT ITSELF. OPTIONAL AND NOT PENDING, on the `[net4V no-lease
+# verdict]` precedent verbatim: BOTH absences are legitimate depending on the image, so
+# neither gets a ⏳ that reads as "awaiting". `jd2_supstate_phase2` is `#[cfg]`-erased
+# without `supstate`, so its token CANNOT appear on a default image; `jd2_console_pump` is
+# compiled into every tegra image but its phase 2 is unreachable under `supstate`.
+#   pump ✅ + phase2 ◦   a DEFAULT (non-supstate) flight, taking the legacy path. Correct.
+#   pump ◦ + phase2 ✅   a SUPSTATE flight with the state lift in force. Correct, and this
+#                        is the reading the fold's falsifier exists to make possible.
+#   pump ✅ + phase2 ◦   ON A SUPSTATE IMAGE this is the defect: the legacy phase 2 ran.
+#                        The table cannot tell this from row 1 — see the grammar note.
+#   pump ✅ + phase2 ✅   IMPOSSIBLE from one boot. A merged capture; re-slice.
+#   pump ◦ + phase2 ◦   with the JD4 REQUIRE satisfied, the takeover line carried no path
+#                        token at all and the two FORBIDs above have already reddened.
+# ⚠ NO FORBID IS WRITABLE FOR ROW 3 AND THAT IS A GRAMMAR LIMIT, NOT AN OVERSIGHT — the
+# same limit the ORIN-SUPSTATE block above records for the half-restructure. The rule that
+# wants writing is CONDITIONAL ("on a supstate image, FORBID path=jd2-console-pump"), and
+# mbench has no `WHEN <guard> FORBID <rx>` any more than it has the conditional REQUIRE
+# that block names as the x86-witness.spec grammar hole. Keying it unconditionally would
+# red every healthy DEFAULT flight, which is the SMPMARK error in its purest form. The
+# reading table is the instrument until the grammar grows a guard.
+OPTIONAL path=jd2-console-pump;
+OPTIONAL path=jd2-supstate-phase2;
+
+# --- INSTRUMENT 3: ORIN-STKDEPTH — the boot-core stack DEPTH at the furniture seam ------
+# ARMED BY `orinfurn` (UNAOS_ORINFURN=1, arroyo:1245, default OFF; implies
+# `desktop_firmware` + `orinclick` -> `tegra_el0` -> `tegra`). NEVER FLOWN ON THIS BENCH:
+# `[orinfurn]` and `[orinstkdepth]` both take ZERO hits across the whole capture tree, so
+# every row here is a prediction read out of the source, not a transcription off a wire.
+#
+# THE ROW THAT COULD FAIL, AND WHY ITS ARMING IS NOT AN ARGUMENT BUT A `#[cfg]` IDENTITY.
+# The two SP reads share ONE gate: the anchor `tegra_stk_anchor()` on `kernel_main`'s
+# `bootpace::record("entry")` line (main.rs:88) and the seam read beside `[orinfurn] arm`
+# (main.rs:7896) are both `#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]`.
+# So there is NO image in which the reader is compiled and the anchor is not — the
+# instrument cannot come up short on CONFIGURATION, which is the objection that keeps
+# every other row in this block off REQUIRE. `DEPTH-UNAVAILABLE` therefore always means
+# something happened, never that something was missing from the build.
+# FAILS WHEN: an `orinfurn` boot reaches the furniture seam and the depth is not
+# derivable. The instrument names which of the two it was, on the same line:
+#   reason=anchor-never-ran     the anchor is compiled in and did not store. The
+#                               `#[inline(always)]` that keeps the read in `kernel_main`'s
+#                               own frame is load-bearing; a build that reordered it out
+#                               would land exactly here.
+#   reason=anchor-below-seam    the two reads are not on one descending frame chain — the
+#                               stack was SWITCHED between `kernel_main` and the seam. On
+#                               today's Orin the boot stack is UEFI's and is never
+#                               switched, so this is a finding about the boot path and not
+#                               about the instrument. ⚠ If a future arc legitimately
+#                               switches stacks there, this row will red while the
+#                               instrument is telling the truth — and the right response
+#                               is to retire the row, because the DEPTH number it guards
+#                               would have become meaningless at the same moment.
+# CANNOT FALSE-RED AN UNARMED BOOT: the `[orinstkdepth]` tag is absent from every image
+# without `orinfurn`. Read as a pair with the PENDINGs, same three-way as instrument 1:
+#   arm ⏳                        unarmed or the seam was never reached. NOT SCORED.
+#   arm ✅ + depth-consumed ✅    the depth was taken. The pass.
+#   arm ✅ + this row HIT         armed, seam reached, no depth derivable. Quote the line.
+#
+# ⚠ DEPTH, NEVER HEADROOM, and the row is worded so it cannot be misread as the latter.
+# `depth-consumed=` is the bytes the chain `kernel_main -> tegra_early_stop ->
+# tegra_desk_furn` consumed BETWEEN the two reads. No remaining-headroom number is
+# derivable in-kernel on this board today (the Orin boot stack is the firmware's and is
+# never switched, this link defines no `__stack_top`, and the bounding `MemoryRegion`
+# slice is consumed by `memory::init`), and the instrument says so on the wire rather than
+# inventing one. NOTHING HERE CLEARS §5.2 — it clears the half that is takeable and names
+# the half that is not, which is the opposite of clearing a stop-line by argument.
+#
+# THE ARMING LINE, PENDING on the gate-line shape: `[orinfurn] arm` is printed before
+# anything in the seam can decline, so on an armed image ANY reached seam prints it. This
+# row exists to tell "the instrument did not fire" from "the instrument was not armed" —
+# it is NOT a rule and can never fail, which is the whole grammar limit this block works
+# inside. Pattern stops before the `(ORIN-DESKFURN …)` prose: that tail carries a `§` and
+# an em dash, and this file never puts a multi-byte character inside a UARTC pattern.
+PENDING \[orinfurn\] arm click=[0-9]+ conwin=[0-9]+ desk=[0-9]+
+# THE HEALTHY ARM. Pattern STOPS AT `bytes` and deliberately never reaches `anchor-sp=` /
+# `seam-sp=`: `arch_arm64.md:6263` (§ORIN-RAS-ADDR) forbids keying any row on an ADDR
+# value, and while these two are stack pointers rather than RAS sinks the rule is written
+# as a rule and this file does not carve exceptions into it. The DEPTH is the measurement;
+# the addresses are context for a human reading the quoted line.
+PENDING \[orinstkdepth\] depth-consumed=[0-9]+ bytes
+FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE
+
+# --- INSTRUMENT 4: ORIN-RASTGLASS — the latch that stopped indicting healthy boots ------
+# ARMED BY `rast` (UNAOS_RAST=1, arroyo:257; `rast` alone gates the census and does NOT
+# imply `tegra`, and `orin_rast_census` is itself `cfg(all(tegra, aarch64))`, so the
+# conjunction is exact). Armed on every recent metal flight — 38 `[orinrast]` census hits
+# in `capture/line-acm0/orin.log` — so unlike instrument 3 this family has a wire history,
+# and the counts below are transcriptions, not predictions.
+#
+# WHAT THE FOLD REPAIRED. `jd2_supstate_phase2` never returns, so on a `supstate` image the
+# legacy phase 2 — the only site that latched `RG_CONSOLE_OWNS` — is unreachable and the
+# latch was never set; the phase-2 census call was missing from that copy too, so the
+# census stopped dead at the phase-1 boundary. With `owns` false, a console that has taken
+# the panel and repainted the cube away scores `RAST-PAINTED-OVERWRITTEN` — the arm the
+# instrument's own doc calls "the only arm that indicts a repainter" — instead of
+# `RAST-SUPERSEDED-BY-CONSOLE`. A CORRECT BOOT WAS BEING REPORTED AS A DEFECT. The fold
+# restored both the boundary latch and the census call to the supstate loop.
+#
+# FAILS WHEN: a `rast` boot's census finds the cube painted at `post`, absent at `late`,
+# and the console-owns latch NOT set at sample time. Post-fold that means a genuine
+# repainter inside the window where the cube is supposed to be visible — the verdict that
+# would have named boot7j's failure. Pre-fold it was ALSO what a healthy supstate boot
+# printed, which is exactly why arming this row was not safe until 405b21f6.
+# ⚠ THIS TOKEN IS NOT NEW and the row must not be read as evidence about the fold. The
+# verdict string predates it; what the fold changed is that a supstate boot can now reach
+# the correct arm instead of this one. Zero hits tree-wide today, on 8 SUPERSEDED and 24
+# SURVIVED — every one of them from a NON-supstate image, where the legacy latch was
+# always reachable and the defect could not appear.
+# CANNOT FALSE-RED AN UNARMED BOOT: no `rast`, no `[orinrast]` tag anywhere in the image.
+FORBID \[orinrast\] census .* -> RAST-PAINTED-OVERWRITTEN
+# THE ARMING LINE, PENDING on the gate-line shape. It MATCHES ON EVERY RECENT CAPTURE and
+# mbench will therefore advise promoting it to REQUIRE. THE ADVICE MUST NOT BE TAKEN,
+# permanently, same as TEGRA-SD and the ORINCONWIN pair: `rast` is default OFF and a
+# REQUIRE would red every unarmed flight on CONFIGURATION.
+PENDING \[orinrast\] census seq=[0-9]+ t=[0-9]+ post=
+# THE LATCH'S POSITIVE WITNESS, and it is the ONE thing this block wants to require and
+# cannot. `console-owns=1` on a census line proves BOTH halves of the fold's fourth fix at
+# once: the boundary latch fired, AND a census ran after the takeover to observe it. But
+# the OTHER half of that fix — the census call restored to the supstate loop — regresses as
+# an ABSENCE (the census simply stops at the phase-1 boundary), and mbench forbids lines,
+# not absences. So a lost census is INVISIBLE to this file and a lost LATCH is visible only
+# through the FORBID above. Stated plainly because it is the sharper of the two findings
+# this block produced: the spec format can score the wrong verdict and cannot score the
+# missing instrument.
+OPTIONAL \[orinrast\] census .* console-owns=1
+# THE HEALTHY POST-TAKEOVER ARM — the design working as specified, and the arm a supstate
+# boot could not reach before the fold. 8 hits tree-wide, all pre-supstate.
+OPTIONAL \[orinrast\] census .* -> RAST-SUPERSEDED-BY-CONSOLE
+# THE HONEST NEGATIVES, OPTIONAL AND DELIBERATELY NOT FORBID. `RAST-NEVER-PAINTED` HAS
+# FIRED ON REAL METAL (`capture/line-acm0/orin.log:35236`, off a `RAST-PARTIAL` post
+# sample), so a FORBID would red a flight this bench has actually taken; the honest reading
+# is a paint-path measurement, not a regression in the console. The two `LATE-*` arms are
+# BROKEN MEASUREMENTS rather than detected faults — the instrument's own doc keeps them
+# separate from OVERWRITTEN for that reason ("a sample that did not happen must not look
+# like a sample that passed", and "reporting a broken measurement as a detected overwrite
+# would be the same overclaim this rung exists to remove"). Rows so a reader is told the
+# measurement did not happen; not FORBIDs, so an unreadable panel does not convict a build.
+OPTIONAL \[orinrast\] census .* -> RAST-NEVER-PAINTED
+OPTIONAL \[orinrast\] census .* -> (RAST-LATE-UNREADABLE|RAST-LATE-BUDGET)
+
 
 # --- COMPLETE: the END-OF-RUN MARKER this file spent its whole life without ----------
 # Until 2026-08-25 this spec declared ZERO `COMPLETE` markers, so mbench's TRUNCATED
