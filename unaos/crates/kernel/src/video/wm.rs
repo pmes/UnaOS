@@ -4335,9 +4335,20 @@ pub fn composite() {
                     {
                         COMP_STEALS.fetch_add(1, Relaxed);
                         COMP_OVERDUE_REPORTED.store(false, Relaxed);
+                        // WEDGESRC — latch the death for the blit-debt ledger. Never cleared: the
+                        // parked core stays parked, and `[wedge1] BLITAIM dead=[..]` beside a
+                        // still-owing `net=[..]` is DEBTCLEAR's unwinnable debt, named on the wire.
+                        COMP_DEAD_EVER.fetch_or(1u32 << dead.min(31), Relaxed);
+                        // WEDGESRC — D-1's stamp: how far the machine's flush odometer had turned
+                        // when the holder died, whether the dead core's last BAR1 store issued
+                        // without retiring (`blit_inflight=1` — flight-1's stuck-store shape, and
+                        // then `blit_aim` is the BAR1 byte offset it is stuck at), or retired with
+                        // only the guard's drop owed (`=0` — flight-3's bookkeeping-debt shape).
+                        let bc = dead.min(7);
                         serial_println!(
                             ":: [wcser] GATE STOLEN from c{} by c{} after {}ms — the holder was in \
-                             phase {} row {} and had not moved. The acquirer was CHOSEN, not next in \
+                             phase {} row {} and had not moved. blits_retired={} blit_aim={:#x} \
+                             blit_inflight={} The acquirer was CHOSEN, not next in \
                              line: pick={} render={} svc={}; desktop resumes on this core, c{} is \
                              DEAD and its singleton roles are owed a re-home == tripwire ::",
                             dead,
@@ -4345,6 +4356,10 @@ pub fn composite() {
                             held,
                             COMP_PASS_PHASE.load(Relaxed),
                             COMP_PASS_ROW.load(Relaxed),
+                            blits_retired_total(),
+                            BLIT_AIM_CORE[bc].load(Relaxed),
+                            (BLIT_ISSUED_CORE[bc].load(Relaxed) != BLIT_DONE_CORE[bc].load(Relaxed))
+                                as u32,
                             pick.map_or("-", StealPick::name),
                             crate::arch::smp::render_cpu().map_or(-1, |c| c as isize),
                             crate::arch::smp::service_cpu().map_or(-1, |c| c as isize),
@@ -9771,8 +9786,20 @@ pub fn wcser_overdue_probe() {
     // fields derived from that one load, so the number and the name can never describe two
     // different samples of a gauge another core is still stamping.
     let phase = COMP_PASS_PHASE.load(Relaxed);
+    // WEDGESRC (D-1) — the three fields that decide flight-1's Q1 from the wire. `blits_retired`
+    // is the machine-wide flush odometer: FROZEN across the standing 1 s repeats = no blit is
+    // retiring anywhere (the backpressure reading); CLIMBING while `row=` is frozen = the panel is
+    // being fed by other cores and only the holder is wedged. `blit_aim` is the BAR1 byte offset
+    // of the HOLDER's last-issued blit, and `blit_inflight=1` says that store issued and never
+    // retired — the holder is inside `fb.blit`, and `blit_aim` names where in the aperture the
+    // stuck store was aimed. `blit_inflight=0` on a wedged holder says the stall is DOWNSTREAM of
+    // a retired blit (flight-1's wedge-1 shape: WB store wedged by WC backpressure — beside
+    // `at=pw-content`/`pw-face`) or not a store at all. Same one-load-per-field discipline as
+    // `phase` above; all slow-path, 1 Hz at most, while already wedged.
+    let bc = holder.min(7);
     serial_println!(
-        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} at={} row={} == tripwire ::",
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} at={} row={} \
+         blits_retired={} blit_aim={:#x} blit_inflight={} == tripwire ::",
         holder,
         age,
         COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
@@ -9780,6 +9807,9 @@ pub fn wcser_overdue_probe() {
         phase,
         comp_phase_name(phase),
         COMP_PASS_ROW.load(Relaxed),
+        blits_retired_total(),
+        BLIT_AIM_CORE[bc].load(Relaxed),
+        (BLIT_ISSUED_CORE[bc].load(Relaxed) != BLIT_DONE_CORE[bc].load(Relaxed)) as u32,
     );
     // PCIH — root-port-at-wedge sampler, on the same cadence as the tripwire line (first
     // crossing + each 5 s standing repeat). ROOT PORT registers only: its config space
@@ -9923,7 +9953,113 @@ fn blitwho_pack_name(n: Option<&'static str>) -> u64 {
     w
 }
 
-/// BLITWHO — one line, printed only from the two give-up arms (never the hot path): the raw
+// ---- WEDGESRC (flight-1 D-1 / flight-3 Q1) — the per-core blit-progress ledger ----------------
+//
+// THE QUESTION THIS ANSWERS. Flight-1's wedge 1 stalled one instruction DOWNSTREAM of the
+// convicted BAR1 store (a WB heap store at `pw-content`, wedged by store-buffer backpressure from
+// a stuck write-combining store into the Kepler aperture) — and the wire could not say WHERE in
+// BAR1 the stuck store was aimed nor HOW MANY blits had retired before it. Flight-3 then produced
+// the same `[wedge1]` tripwire from a DIFFERENT mechanism entirely: `BLITWHO net=[0,1,1,..]` with
+// c1/c2 dead for ~250 s — a bookkeeping wedge (dead cores' blit debt is never cleared), not a
+// stuck store at all. The two mechanisms print identically today. This ledger is what tells them
+// apart on one line:
+//
+//   * `aim[c]`   — the BAR1 byte offset of the blit core `c` last ISSUED (stored BEFORE the copy).
+//   * `issued[c]`/`done[c]` — per-core sequence counters bracketing the copy. `issued != done`
+//     means core `c` is INSIDE `fb.blit` right now (or died there): the store was issued and never
+//     retired, and `aim[c]` names its target — flight-1's reading. `issued == done` with the
+//     BLITWHO net still owing that core means the blit RETIRED and the guard's drop never ran —
+//     flight-3's dead-core-debt reading, DEBTCLEAR's lane.
+//   * `blits_retired` (the sum of `done[]`) — the pass-progress odometer D-1 asked for.
+//
+// COST, AND WHY IT DOES NOT PERTURB WHAT IT MEASURES. Three relaxed atomic ops per FLUSHED ROW
+// (two uncontended per-core RMWs + one per-core store), x86_64 + `witness` only, riding the same
+// per-row cadence `comp_mark_row` already pays in the same loop — against a row body whose real
+// work is a 2 KiB+ `copy_nonoverlapping` into write-combining BAR1. The PRINT side runs only on
+// the tripwire/give-up/steal paths, which are once-per-boot or once-per-second-while-wedged. On
+// every other build the wrapper is `fb.blit` verbatim.
+//
+// ORDERING. x86 TSO retires stores in program order out of the store buffer, so when a core wedges
+// mid-blit the `aim` store (older, WB) has drained and is globally visible while `done` (younger,
+// never executed) is not — which is exactly the reading the tripwire takes. Last-writer-wins per
+// core; a task-context holder that migrates mid-pass smears one sample across two slots, the same
+// accepted caveat `BLIT_NET_CORE`'s own doc records.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static BLIT_ISSUED_CORE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static BLIT_DONE_CORE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// WEDGESRC — the panel byte offset (`py * fb_row + x0 * bpp`, i.e. the BAR1-relative aim of the
+/// `copy_nonoverlapping`) of the blit each core last issued. 0 until a core's first blit —
+/// disambiguated from a real offset-0 aim by `issued[c] == 0`.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static BLIT_AIM_CORE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// WEDGESRC — cores the WCSER steal has EVER declared dead, as a bitmask. Latched at the steal
+/// (never cleared — a parked core does not come back this boot; a revenant is `COMP_REVENANTS`'s
+/// story and would read here as a stale bit beside a healthy net, which is itself legible). This is
+/// what turns flight-3's forensic reconstruction — "the owed cores had been dead for 250 s" — into
+/// one field on the next flight's tripwire line: `net[c] > 0 && dead[c]` is DEBTCLEAR's unwinnable
+/// debt, named at the moment it wedges someone instead of a session of log archaeology later.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_DEAD_EVER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WEDGESRC — the flush-loop blit, instrumented. On the armed build: aim + issued before the copy,
+/// done after, all relaxed, all per-core. On every other build this IS `fb.blit`, verbatim.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+#[inline]
+fn blit_traced(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = crate::arch::sched::meter_current_cpu().min(7);
+    BLIT_AIM_CORE[c].store(byte_offset as u64, Relaxed);
+    BLIT_ISSUED_CORE[c].fetch_add(1, Relaxed);
+    fb.blit(byte_offset, src);
+    BLIT_DONE_CORE[c].fetch_add(1, Relaxed);
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "witness")))]
+#[inline(always)]
+fn blit_traced(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8]) {
+    fb.blit(byte_offset, src);
+}
+
+/// WEDGESRC — the odometer: blits retired machine-wide, summed from the per-core ledger on the
+/// slow path rather than paid for as a ninth shared-line RMW on the hot one.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn blits_retired_total() -> u64 {
+    let mut t = 0u64;
+    for d in BLIT_DONE_CORE.iter() {
+        t = t.wrapping_add(d.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    t
+}
+
+/// BLITWHO — one line, printed only from the give-up/tripwire arms (never the hot path): the raw
 /// `BLIT_ACTIVE` word beside everything derived from it, the per-core net, and the last enterer.
 #[cfg(feature = "witness")]
 fn blitwho_report(spin_core: usize) {
@@ -9942,6 +10078,41 @@ fn blitwho_report(spin_core: usize) {
         BLIT_LAST_ENTER_CORE.load(core::sync::atomic::Ordering::Relaxed),
         spin_core
     );
+    // WEDGESRC — the discriminator BLITWHO could not carry. For each core the net can owe:
+    // `inflight[c] = 1` (issued != done) says the core is INSIDE `fb.blit` — its store issued and
+    // never retired, and `aim[c]` is the BAR1 byte offset it is stuck at (flight-1's stuck-store
+    // reading). `inflight[c] = 0` with `net[c] > 0` says the blit RETIRED and only the guard's
+    // drop is owed (flight-3's dead-core bookkeeping debt). `dead[c]` marks cores the steal has
+    // declared dead, so `net[c] > 0 && dead[c] = 1` reads directly as DEBTCLEAR's unwinnable debt.
+    // `win/phase/at/row` are WCSER-H's pass gauges — the same fields flight-1's PASS OVERDUE lines
+    // carried (`at=` names every PW site: `pw-face`, `pw-content`, `span-flush`, …), stamped here
+    // so a drain-side wedge names its stall site without needing the gate tripwire to also fire.
+    // x86-only: the ledger instruments the Kepler BAR1 flush; an aarch64 BLITWHO is unchanged.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let inflight: [u32; 8] = core::array::from_fn(|i| {
+            (BLIT_ISSUED_CORE[i].load(Relaxed) != BLIT_DONE_CORE[i].load(Relaxed)) as u32
+        });
+        let aim: [u64; 8] = core::array::from_fn(|i| BLIT_AIM_CORE[i].load(Relaxed));
+        let dead = COMP_DEAD_EVER.load(Relaxed);
+        let phase = COMP_PASS_PHASE.load(Relaxed);
+        serial_println!(
+            ":: [wedge1] BLITAIM blits_retired={} inflight=[{},{},{},{},{},{},{},{}] \
+             aim=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] \
+             dead=[{},{},{},{},{},{},{},{}] win={} phase={} at={} row={} ::",
+            blits_retired_total(),
+            inflight[0], inflight[1], inflight[2], inflight[3],
+            inflight[4], inflight[5], inflight[6], inflight[7],
+            aim[0], aim[1], aim[2], aim[3], aim[4], aim[5], aim[6], aim[7],
+            dead & 1, (dead >> 1) & 1, (dead >> 2) & 1, (dead >> 3) & 1,
+            (dead >> 4) & 1, (dead >> 5) & 1, (dead >> 6) & 1, (dead >> 7) & 1,
+            COMP_PASS_WIN.load(Relaxed),
+            phase,
+            comp_phase_name(phase),
+            COMP_PASS_ROW.load(Relaxed),
+        );
+    }
 }
 
 impl BlitGuard {
@@ -10936,6 +11107,14 @@ impl DrainBarrier {
                     DRAIN_PENDING.load(Ordering::Acquire),
                     spins
                 );
+                // WEDGESRC — name the debt AT THE TRIPWIRE, not 21 s later at the abandon arm.
+                // Flight-3's first `DRAIN STALLED` (342043 ms) carried no BLITWHO; the net that
+                // convicted the dead cores only printed with `DRAIN ABANDONED` at 363075 ms. Same
+                // once-per-boot latch as the line above, same slow path, and the BLITAIM sibling it
+                // now carries is the issued-vs-retired / dead-core discriminator this stall needs
+                // read at the moment the bound STARTS being paid.
+                #[cfg(feature = "witness")]
+                blitwho_report(crate::arch::sched::meter_current_cpu());
             }
             // DRAINSTALL (PA38 metal) — **THE WAIT ENDS.** Past this point the loop stops being a
             // wait and becomes a hang, and PA38 measured what that costs: a core pinned at 99% with
@@ -20034,7 +20213,9 @@ fn stage_window(
             let py = by + band + y;
             comp_mark_row(py);
             if clip.n == 0 {
-                fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+                // WEDGESRC — `blit_traced` IS `fb.blit` plus the per-core aim/issued/done ledger
+                // (three relaxed ops, x86+witness only; the shim is `fb.blit` verbatim elsewhere).
+                blit_traced(fb, py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
                 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
                 {
                     wrote_px += bw as u64;
@@ -20053,7 +20234,7 @@ fn stage_window(
             for &(sx0, sx1) in spans[..ns].iter() {
                 let off = (sx0 - bx) * bpp;
                 let len = (sx1 - sx0) * bpp;
-                fb.blit(py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
+                blit_traced(fb, py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
                 #[cfg(all(feature = "witness", target_arch = "x86_64"))]
                 {
                     row_written += (sx1 - sx0) as u64;
