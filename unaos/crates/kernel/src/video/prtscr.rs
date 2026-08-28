@@ -56,6 +56,27 @@
 //! is never overwritten**: the search asks the filesystem for each candidate and takes the first
 //! `NotFound`. When all hundred are taken the verb refuses and says so — it does not wrap around and
 //! clobber `SCREEN0.PNG`. The names are deliberately 8.3-clean so they need no long-name entry.
+//!
+//! ## Where a capture may land — PRTSCR-VOL, the two-rung target ladder
+//!
+//! A capture wants "a writable FAT volume the operator can carry away", which is NOT the same
+//! question `mount_program_source` answers ("the volume this system is bound to"). On a machine
+//! whose boot medium is read-only by policy — the 2012 rMBP boots from the internal SD reader,
+//! which SDHC-4c mounts read-only outside the reserved flight-recorder extent — the two answers
+//! permanently diverge: flight-3 proved that `program_source()` under a `BM_SUBSTITUTED` verdict
+//! returns the Sdhc handle on every call, and FRGUARD's `default_writable()` vetoes the global slot
+//! under that same verdict, so a capture that only ever consults the program source waits for a
+//! writable volume that CANNOT arrive on that bench. [`mount_capture_target`] is the fix:
+//!
+//!  1. **The program source**, when it admits writes — every boot whose program volume is writable
+//!     (QEMU `test-fat`, a stick-booted x86 machine, the Pi's microSD) behaves exactly as before.
+//!  2. **The dedicated USB mass-storage handle** (`BlockSource::Usb`), when rung 1 is read-only or
+//!     absent. `publish_usb_geometry` populates it on EVERY stick arrival, boot-time or hot-plug
+//!     (Boot AI-2 proved hot-plug reaches the FAT layer on metal), and its read/write paths bypass
+//!     the backend selector entirely. Crucially this does NOT weaken FRGUARD: the refusal FRGUARD
+//!     exists for is a write aimed at the BOOT VOLUME silently landing on whatever claimed the
+//!     global slot. This rung aims at the stick BY NAME — the operator's own carry-away medium,
+//!     which is exactly where a screenshot belongs — and the global slot's veto stands untouched.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -163,9 +184,10 @@ pub enum Refusal {
     NoPanel,
     /// The panel's pixel layout has no colour inverse (`U8` greyscale, or an unknown format).
     NoFormat(PixelFormat),
-    /// Nothing mounted on any program-source handle.
+    /// Nothing mounted on the program-source handle NOR the dedicated USB handle.
     NoVolume(FatError),
-    /// The volume mounted and refuses writes: `(source, label, reason)`.
+    /// The program-source volume mounted and refuses writes — `(source, label, reason)` — and the
+    /// USB rung of the ladder had no writable volume to offer either.
     ReadOnly(&'static str, String, &'static str),
     /// `SCREEN0.PNG` .. `SCREEN99.PNG` are all taken. We do not overwrite.
     AllTaken,
@@ -189,12 +211,12 @@ impl Refusal {
                 ":: PRTSCR: panel layout {:?} has no RGB inverse — capture skipped ::", f
             ),
             Refusal::NoVolume(e) => serial_println!(
-                ":: PRTSCR: no FAT volume on any program-source handle ({:?}; handles={}) — capture skipped ::",
+                ":: PRTSCR: no FAT volume on the program-source or USB handles ({:?}; handles={}) — capture skipped ::",
                 e,
                 crate::drivers::block::source_census()
             ),
             Refusal::ReadOnly(source, label, why) => serial_println!(
-                ":: PRTSCR: REFUSED READ-ONLY (source={} label={} reason={}) — capture skipped ::",
+                ":: PRTSCR: REFUSED READ-ONLY (source={} label={} reason={}) — no writable USB volume attached either — capture skipped ::",
                 source,
                 if label.is_empty() { "-" } else { label.as_str() },
                 why
@@ -230,7 +252,7 @@ impl Refusal {
             Refusal::NoFormat(f) => alloc::format!("screenshot: panel layout {:?} has no RGB inverse", f),
             Refusal::NoVolume(e) => alloc::format!("screenshot: no FAT filesystem ({:?})", e),
             Refusal::ReadOnly(source, _, _) => {
-                alloc::format!("screenshot: REFUSED READ-ONLY ({})", source)
+                alloc::format!("screenshot: REFUSED READ-ONLY ({}); plug a writable USB FAT volume", source)
             }
             Refusal::AllTaken => alloc::format!(
                 "screenshot: SCREEN0..SCREEN{}.PNG all present — delete one", MAX_CAPTURES - 1
@@ -291,6 +313,37 @@ fn busy_retry<R>(mut op: impl FnMut() -> Result<R, FatError>) -> Result<R, FatEr
     Err(FatError::Busy)
 }
 
+/// PRTSCR-VOL — mount the volume a capture may write, by the two-rung ladder the module note
+/// states: the program source when it admits writes, else the dedicated USB mass-storage handle.
+///
+/// The refusal returned when BOTH rungs decline describes rung 1 — the more informative failure:
+/// `ReadOnly` names the vetoing source (and its report adds that no writable USB volume was
+/// attached either), `NoVolume` carries the mount error and the handle census. Rung 2 is consulted
+/// fresh on every call, which is what makes a LATER-ARRIVING stick reachable: `usb_info()` re-reads
+/// the registry, so the pass after `publish_usb_geometry` runs sees the new volume with no cache to
+/// invalidate.
+fn mount_capture_target() -> Result<FatFs, Refusal> {
+    let primary = match crate::fs::fat::mount_program_source() {
+        Ok(fs) => match fs.write_veto() {
+            None => return Ok(fs),
+            Some(why) => Refusal::ReadOnly(fs.source_name(), fs.label(), why),
+        },
+        Err(e) => Refusal::NoVolume(e),
+    };
+    // Rung 2: the stick under its OWN handle — never the ambient global, whose FRGUARD veto is not
+    // ours to bypass. Gated on the registry so an absent stick costs one lock, not a mount attempt.
+    if crate::drivers::block::usb_info().is_some() {
+        if let Ok(fs) = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb) {
+            // `Usb`'s write_veto is `None` today; asked anyway so this ladder keeps telling the
+            // truth if that arm ever grows a refusal.
+            if fs.write_veto().is_none() {
+                return Ok(fs);
+            }
+        }
+    }
+    Err(primary)
+}
+
 /// The first `SCREEN<n>.PNG` the volume root does not already hold.
 ///
 /// Asks the filesystem per candidate rather than scanning a directory listing, because
@@ -329,11 +382,8 @@ pub fn capture() -> Result<Shot, Refusal> {
     }
     let (width, height) = (info.width as u32, info.height as u32);
 
-    // 2. The volume, and its own veto, before anything is built.
-    let fs = crate::fs::fat::mount_program_source().map_err(Refusal::NoVolume)?;
-    if let Some(why) = fs.write_veto() {
-        return Err(Refusal::ReadOnly(fs.source_name(), fs.label(), why));
-    }
+    // 2. The volume, by the PRTSCR-VOL ladder (module note), before anything is built.
+    let fs = mount_capture_target()?;
 
     // 3. A name nothing else owns.
     let name = next_free_name(&fs)?;
@@ -407,14 +457,19 @@ pub fn capture() -> Result<Shot, Refusal> {
 /// states that precede one are transient and neither is a verdict:
 ///
 ///  * *No volume at all* — storage enumerates asynchronously, so the early passes have none.
-///  * *A volume that vetoes writes* — on x86 the program-source ladder falls back to the internal
-///    SD reader (mounted read-only by SDHC-4c) until the USB stick registers, and only THEN does it
-///    prefer the global handle. Latching on that veto gives up a second before the writable volume
-///    arrives, which is exactly what the first run of this witness did.
+///  * *A volume that vetoes writes* — on a machine whose boot medium is read-only by policy (the
+///    rMBP's internal SD reader under SDHC-4c) this state is PERMANENT for the program source:
+///    flight-3 proved the `BM_SUBSTITUTED` verdict pins `program_source()` to the Sdhc handle and
+///    FRGUARD vetoes the global, so no amount of waiting on THAT mount ever ends. The wait is real
+///    anyway because [`mount_capture_target`]'s second rung re-reads the USB registry every pass —
+///    a FAT stick hot-plugged minutes after boot reaches `publish_usb_geometry`, the next
+///    storage-ready pass mounts it under its own handle, and the deferred selftest runs THEN.
 ///
-/// So both are announced ONCE, for the log's sake, and then waited through. A boot that never gets
-/// a writable volume (a plain `./arroyo test`, which attaches no FAT-bearing device) leaves exactly
-/// one honest line and never a false FAIL.
+/// So both states are announced ONCE, for the log's sake, and then waited through — and the moment
+/// a writable volume ends a wait, the arrival is announced too, so the log shows the deferred run
+/// firing rather than a PASS appearing out of nowhere. A boot that never gets a writable volume
+/// (a plain `./arroyo test`, which attaches no FAT-bearing device) leaves exactly one honest line
+/// and never a false FAIL.
 #[cfg(feature = "prtscrst")]
 pub fn selftest_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -423,30 +478,48 @@ pub fn selftest_once() {
     if DONE.load(Ordering::Relaxed) {
         return;
     }
-    let fs = match crate::fs::fat::mount_program_source() {
+    let fs = match mount_capture_target() {
         Ok(fs) => fs,
-        Err(e) => {
+        Err(Refusal::NoVolume(e)) => {
             if !SAID_NO_VOLUME.swap(true, Ordering::Relaxed) {
                 serial_println!(
-                    ":: PRTSCR-ST: no FAT volume on any program-source handle ({:?}; handles={}) — still waiting; a boot that never gets one leaves the capture selftest SKIPPED ::",
+                    ":: PRTSCR-ST: no FAT volume on the program-source or USB handles ({:?}; handles={}) — still waiting; a boot that never gets one leaves the capture selftest SKIPPED ::",
                     e,
                     crate::drivers::block::source_census()
                 );
             }
             return;
         }
-    };
-    if let Some(why) = fs.write_veto() {
-        if !SAID_READ_ONLY.swap(true, Ordering::Relaxed) {
-            serial_println!(
-                ":: PRTSCR-ST: program source is {} and vetoes writes ({}) — still waiting for a writable volume ::",
-                fs.source_name(),
-                why
-            );
+        Err(Refusal::ReadOnly(source, _, why)) => {
+            if !SAID_READ_ONLY.swap(true, Ordering::Relaxed) {
+                serial_println!(
+                    ":: PRTSCR-ST: program source is {} and vetoes writes ({}) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::",
+                    source,
+                    why
+                );
+            }
+            return;
         }
-        return;
-    }
+        // `mount_capture_target` returns only the two refusals above; anything else would be a
+        // future variant, and waiting on it silently would be the dead-loop shape this selftest
+        // exists to disprove — so it reports (once, like its siblings) and keeps polling.
+        Err(other) => {
+            static SAID_OTHER: AtomicBool = AtomicBool::new(false);
+            if !SAID_OTHER.swap(true, Ordering::Relaxed) {
+                other.report();
+            }
+            return;
+        }
+    };
     DONE.store(true, Ordering::Relaxed);
+    if SAID_NO_VOLUME.load(Ordering::Relaxed) || SAID_READ_ONLY.load(Ordering::Relaxed) {
+        let label = fs.label();
+        serial_println!(
+            ":: PRTSCR-ST: writable volume arrived (source={} label={}) — running the deferred capture selftest ::",
+            fs.source_name(),
+            if label.is_empty() { "-" } else { label.as_str() }
+        );
+    }
 
     let shot = match capture() {
         Ok(shot) => shot,

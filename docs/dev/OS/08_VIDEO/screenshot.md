@@ -102,8 +102,34 @@ de-duplicate. The names are 8.3-clean, so they need no long-name entry.
 ## 6. Writing, and `Busy`
 
 The write is the same four-step recipe `shell::fs_write` uses, minus the truncate branch (which
-cannot apply — the name is known absent): `mount_program_source` → `write_veto` → `create_in_dir`
+cannot apply — the name is known absent): `mount_capture_target` (§6.1) → `create_in_dir`
 → `write_grow(0, 0, dir_lba, dir_off, 0, bytes)`.
+
+### 6.1 Where a capture may land — PRTSCR-VOL, the two-rung target ladder
+
+A capture wants "a writable FAT volume the operator can carry away", which is **not** the question
+`mount_program_source` answers ("the volume this system is bound to"). `prtscr::mount_capture_target`
+tries, in order:
+
+1. **The program source**, when `write_veto()` is `None`. Every boot whose program volume is
+   writable — QEMU `test-fat`, a stick-booted x86 machine, the Pi's microSD — behaves exactly as
+   before; rung 2 is never consulted.
+2. **The dedicated USB mass-storage handle** (`BlockSource::Usb`), when rung 1 is read-only or
+   absent. `publish_usb_geometry` populates that handle on *every* stick arrival — boot-time or
+   hot-plug (Boot AI-2 proved on metal that a hot-plugged card reaches the FAT layer) — and the
+   handle's read/write paths (`read_block_usb`/`write_block_usb` and their multi-sector twins)
+   bypass the backend selector entirely. The ladder re-reads the registry on every call, so there is
+   no cache to invalidate: the first storage-ready pass after the stick enumerates sees it.
+
+Rung 2 does **not** weaken FRGUARD. The hazard FRGUARD closes is a write aimed at the *boot volume*
+silently landing on whatever claimed the global slot (`default_writable()`'s `BM_SUBSTITUTED`
+refusal, born of Boot AI-2's misdirected `/UNAOS.LOG`). Rung 2 aims at the stick *by name*, under
+its own handle — the operator's carry-away medium, which is exactly where a screenshot belongs —
+and the global slot's veto stands untouched, as does SDHC-4c's read-only policy on the internal
+reader and the reserved flight-recorder extent (which no file verb can name, PNGs included).
+
+Only when *both* rungs decline does the capture refuse, and the refusal describes rung 1 — the more
+informative failure — while stating that no writable USB volume was attached either (§7).
 
 `FatError::Busy` is **not a failure**. It is the block layer refusing to *wait* for a loan it could
 not take instantly — under WEDGE-8 that is the fix working (`drivers/block.rs`: "a NORMAL,
@@ -127,8 +153,8 @@ never silence, and each names *what was inspected* rather than only what was mis
 ```
 :: PRTSCR: no panel attached (or the panel lock was contended while masked) — capture skipped ::
 :: PRTSCR: panel layout U8 has no RGB inverse — capture skipped ::
-:: PRTSCR: no FAT volume on any program-source handle (NoDisk; handles=...) — capture skipped ::
-:: PRTSCR: REFUSED READ-ONLY (source=... label=... reason=...) — capture skipped ::
+:: PRTSCR: no FAT volume on the program-source or USB handles (NoDisk; handles=...) — capture skipped ::
+:: PRTSCR: REFUSED READ-ONLY (source=... label=... reason=...) — no writable USB volume attached either — capture skipped ::
 :: PRTSCR: SCREEN0.PNG..SCREEN99.PNG all present at the volume root — capture skipped (nothing overwritten) ::
 :: PRTSCR: encoder declined (OutOfMemory) for 2880x1800 needing 15555053 bytes — capture skipped ::
 :: PRTSCR: create failed -EAGAIN (Busy; handles=...) — capture skipped ::
@@ -169,11 +195,48 @@ present; only this unattended write is behind the knob. It does not clean up aft
 (`btbond::selftest_once`'s precedent): the written file **is** the deliverable.
 
 It latches only on a pass that reached a **writable** volume. Two states precede one and neither is
-a verdict: no volume at all (storage enumerates asynchronously), and a volume that vetoes writes —
-on x86 the program-source ladder falls back to the internal SD reader, which SDHC-4c mounts
-read-only, until the USB stick registers. Both are announced once and waited through. Latching on
-the veto is exactly what the first run of this witness did, and it gave up about a second before the
-writable volume arrived.
+a verdict: no volume at all (storage enumerates asynchronously), and a volume that vetoes writes.
+Both are announced once and waited through — the wait polls `mount_capture_target` (§6.1) on every
+storage-ready pass, so a writable volume that arrives *late* is adopted, however late — and the
+arrival itself is announced, so the log shows the deferred run firing rather than a PASS appearing
+out of nowhere:
+
+```
+:: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::
+:: PRTSCR-ST: writable volume arrived (source=usb label=...) — running the deferred capture selftest ::
+```
+
+Latching on the veto is exactly what the first run of this witness did, and it gave up about a
+second before the writable volume arrived.
+
+## 8.1 Metal — the rMBP's boot medium can never take a capture, and that is policy
+
+Flight-3 (`UNAOS_PRTSCRST=1`, 2026-08) settled the metal state of this bench:
+
+- **The boot SD is read-only, permanently.** The 2012 rMBP boots from the internal SD reader, which
+  SDHC-4c mounts read-only — only the reserved flight-recorder extent admits a write, no file verb
+  can name it, and PNGs are explicitly out of its scope. Neither the boot self-test PNG nor a
+  keypress PNG can *ever* land on this machine's boot medium. That policy is deliberate and stands.
+- **Waiting on the program source alone was a dead loop by construction — the flight-3 bug.** On
+  this bench FRGUARD's boot-medium verdict is `BM_SUBSTITUTED` (boot volume positively located on
+  the Sdhc handle), which (a) pins `program_source()` to the read-only Sdhc handle on every call,
+  and (b) makes `default_writable()` veto the global slot — so even a stick that claimed the global
+  was unwritable through it. The single veto line at 26 414 ms followed by 19 minutes of silence was
+  that loop: re-polling a mount whose answer could not change.
+- **Capture on this bench requires a second, writable volume — a FAT USB stick — and hot-plug is
+  enough.** With PRTSCR-VOL (§6.1) the stick is reached under its own `Usb` handle the pass after
+  `publish_usb_geometry` runs, whether it was present at boot or plugged minutes later. On arrival:
+  a pending `PRTSCR-ST` prints the `writable volume arrived` line and runs its deferred self-test
+  against the stick; the `screenshot` verb and the Print Screen key write `SCREEN<n>.PNG` to the
+  stick's root. Unplugging the stick retracts the handle (USB-UNPLUG), and the refusal lines return.
+- **What QEMU proves and what only metal can.** QEMU (`test-fat sf`) proves the deferred sequence —
+  veto announced, writable volume arrives later, deferred selftest runs and PASSes — but there the
+  writable volume arrives as the *program source* (rung 1: the boot stick claims the global with a
+  `BM_MATCH` verdict). The `BM_SUBSTITUTED` + hot-plug case — rung 2 adopting a stick the FRGUARD
+  verdict keeps out of the program source — cannot be staged in QEMU (the emulated internal card is
+  a raw pattern image, so the verdict can never be SUBSTITUTED there) and is next flight's bench
+  protocol: boot to the veto line, plug a FAT stick in the other port, expect `writable volume
+  arrived (source=usb ...)` then the PASS line.
 
 ## 9. Verification status
 
@@ -183,14 +246,21 @@ writable volume arrived.
   source rows, in a single-block case and in an eleven-stored-block case; the refusal paths
   (`EmptyImage`, `BadRowLength`, `RowCountMismatch`) answer as specified; `encoded_len` is exact.
 
-- **Whole chain, in QEMU — a real PNG on a real FAT volume.**
-  `UNAOS_WC=1 UNAOS_PRTSCRST=1 ./arroyo test-fat sf 240` prints:
+- **Whole chain, in QEMU — a real PNG on a real FAT volume, through the deferred wait.**
+  `UNAOS_WC=1 UNAOS_PRTSCRST=1 ./arroyo test-fat sf 240` prints (2026-08-27, PRTSCR-VOL):
 
   ```
-  :: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume ::
+  :: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::
+  :: PRTSCR-ST: writable volume arrived (source=global label=UNAOS) — running the deferred capture selftest ::
   :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
   :: PRTSCR-ST: SCREEN0.PNG on the medium — 3073098 bytes, PNG signature OK, IHDR 1280x800 depth 8 colour 2 non-interlaced, IEND OK -> PASS ::
   ```
+
+  The first two lines ARE the deferred sequence: the early storage-ready passes see only the
+  emulated internal card (read-only), the veto is announced once, and the selftest keeps polling
+  until the stick's later enumeration ends the wait — then announces the arrival and runs. In QEMU
+  the arriving volume is rung 1 (`source=global`, `BM_MATCH`); on the rMBP it will be rung 2
+  (`source=usb`), per §8.1.
 
   `mcopy -i builder/fat-sf.img ::SCREEN0.PNG` pulls the file off the image host-side. `file` reports
   `PNG image data, 1280 x 800, 8-bit/color RGB, non-interlaced`; python's `zlib` decompresses the
