@@ -90,6 +90,78 @@ staged into the worktree first (§3.6 note).
 | `arm-tegra` + `tegra_el0` + `pidesk` | **2 errors** (§3.5) |
 | `arm-tegra` + `tegra_el0` + `pidesk,quarry,livecon` | **3 errors** (§3.5) |
 
+### §1.2 The arch-drift ruler was under-reporting by a third — corrected 2026-08-28
+
+The tree-wide drift census is taken with `~/unaos-bench/tools/parity-arch-gates.sh`,
+which walks `unaos/crates/kernel/src` (excluding `arch/`, per-arch by construction)
+and reports gates one arch has and the other cannot. **Every count taken with it
+before 2026-08-28 is a floor, not a total**, and the shortfall is large enough to
+change conclusions rather than merely soften them.
+
+Three defects, all closed in v4:
+
+- **Prose-pairing.** The pairing window matched raw substrings over ±25 lines and
+  did not distinguish code from comment. A genuinely one-sided gate whose own
+  justifying comment named the other arch was scored PAIRED and never reported.
+- **Phantom gates.** Comment lines that merely quoted cfg text were counted as
+  real gates.
+- **Negation.** The scanner skipped any line containing `not(`. That hid
+  negation-form gates — `not(target_arch = "aarch64")` is an x86-only gate — and
+  also hid every ordinary arch gate that happened to carry a `not(feature = ..)`
+  beside it, which is the larger of the two classes.
+
+**Controlled comparison, one variable.** Both runs are the same tree at
+`0ed6fee2`, the same 111 `.rs` files; only the ruler differs. The pre-change
+script is kept at `~/unaos-bench/scratch/orin10/parity-arch-gates.sh.pre-orin10`,
+so this is a re-run, not a recollection.
+
+| ruler | PAIRED | UNPAIRED x86-only | UNPAIRED aarch64-only |
+| --- | :-: | :-: | :-: |
+| v3 (blind) | 722 | 344 (bare 77 · arch+feature 267) | 245 (bare 99 · 146) |
+| **v4 (fixed)** | **708** | **459** (bare 119 · 340) | **285** (bare 104 · 181) |
+| delta | −14 | **+115 (+33%)** | **+40 (+16%)** |
+
+Video scope at the same HEAD: PAIRED 344 · x86-only 224 · aarch64-only 63
+(v3 read 346 / 181 / 44).
+
+**Why prose-pairing was the one to fix first.** Negation-form under-reported as
+flat absence — a uniform shortfall. Prose-pairing under-reported *selectively*,
+in favour of exactly the gates someone had bothered to document, because the
+pairing window fed on the explanation itself. It corrupted the signal rather than
+shrinking it, and it did so in proportion to how well a decline was written.
+
+**The closure, and it is against this branch's own work.** `82d9bc97` (ORIN-VPAR,
+this track) ported one `screen.rs` item and declined two *with reasons*. Its
+banner comment — `ORIN-VPAR — THE aarch64 PARITY WITNESSES FOR THIS FILE'S THREE
+x86-ONLY ITEMS`, six lines below the gates — is what paired `video/screen.rs:361`
+and `:364` away. Both are real `all(feature = "witness", target_arch = "x86_64")`
+statics; the old window found six `aarch64` mentions in it, all six of them
+comments. **The commit that carefully documented its declines is the commit that
+blinded the instrument to them.** Under v4 both report UNPAIRED x86-only and the
+banner at `:368` is correctly not scored as a gate.
+
+The general form, because it will recur: **an instrument that reads prose cannot
+audit code that is required to carry prose.** Decline-with-reasons is right and
+drift detection is right; the tool is what had to change. This is not fixed by
+writing fewer reasons.
+
+**Residual limitation, stated so it is not rediscovered as a finding.** 67 lines
+carry a `not(` that encloses the arch *indirectly* —
+`not(all(feature = "deadman", target_arch = "x86_64"))`,
+`not(any(target_arch = "x86_64", target_arch = "aarch64"))`. These are classified
+by the arch **named**, the same rule every positive gate gets; inverting them
+needs a real cfg-expression parser. Most name both arches and land in PAIRED
+anyway. Triage the report — do not trust the direction label on a `not(all(..))`
+line.
+
+⚠ **Numbers published elsewhere with the v3 ruler are not comparable to these.**
+`WCG-TRIAGE.md` §1 and §7 quote tree totals taken with it (x86-only 471 → 421 for
+the `wcg.rs` port). That *delta* is ruler-consistent — both sides were measured
+the same way — but the absolutes are not comparable to any v4 figure, and reading
+one against the other suggests a 100-gate improvement that no code change
+produced. That file is the rmbp lane's; the correction was relayed to its owner
+rather than applied here.
+
 ---
 
 ## §2 Provenance — `wm.rs` was born on aarch64
