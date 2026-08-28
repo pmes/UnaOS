@@ -1515,6 +1515,19 @@ win=1's were never overdrawn by the console.
   `unaos/scripts/specs/jetson-sync1.spec` (with this fold's new rows) reports
   `✅ MBENCH PASS — 16/16 required witnesses, 0 forbidden hit(s), 3134 lines scanned, pending 9/10 matched`.
   The one unmatched PENDING is `TEGRA-SD.*block backend published`, not exercised by this flight.
+  ⚠ **SUPERSEDED 2026-08-28 (exec-orin10-specgate) — THIS SLICE IS NO LONGER A GREEN REFERENCE, and
+  the reading above is kept as history rather than corrected in place.** The BOOT 7k block added to
+  `jetson-sync1.spec` forbids the *pre-fold* shape of the takeover line — `console OWNS the panel
+  (Screen back buffer live); screen-on-boot` with no `path=` token — because until the TERMINUS fold
+  (`405b21f6`) the two `console OWNS the panel` sites printed byte-identical literals and no capture
+  could say which had run. boot7h predates the fold, so replaying the same slice now reports
+  `❌ MBENCH FAIL — 17/17 required witnesses, 1 forbidden hit(s), 3134 lines scanned, pending 8/23 matched`,
+  the single hit being slice line 1709 — *the same line its own `REQUIRE JD4.*console OWNS the panel`
+  matches*. That coincidence is the row's whole argument: its reachability is guaranteed by another
+  `REQUIRE` in the same spec, so its silence can never be dismissed as an undriven path. Every
+  required witness still passes; nothing regressed in the image. **There is no green reference for
+  `jetson-sync1.spec` until a post-`405b21f6` image flies** — the correct response is to fly the fold,
+  never to weaken the row.
 
 ##### What this flight still did NOT establish
 
