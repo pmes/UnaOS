@@ -827,10 +827,20 @@ pub struct Controller {
     /// `Target`, its HCI interface number, and the event endpoint's max packet size. The event QH
     /// itself was spliced into the periodic list exactly once (`bt_arm_events`/`bt_evt_armed`) and
     /// is REUSED, not re-armed — so nothing here needs to describe it beyond the mps a fresh read
-    /// is sized from. `None` until `bt_probe` claims a radio; a controller with no radio never
-    /// re-triggers, and the drain in `service_ehci_hid` skips it.
+    /// is sized from. `None` until `bt_probe` claims a radio; a controller with no radio and no
+    /// pended candidate (`bt_pending`, BTCLAIM D-4) never re-triggers, and the drain in
+    /// `service_ehci_hid` skips it.
     #[cfg(feature = "bt")]
     bt_radio: Option<BtRadio>,
+    /// BTCLAIM (D-4) — a Bluetooth CANDIDATE whose phase-0 full-descriptor re-read failed even
+    /// after `BT_CFG_REREAD_ATTEMPTS`, so NO radio was claimed this boot: the device `Target`
+    /// and its `config_value`, which is everything `bt_probe` needs to be re-driven from the
+    /// top. This is what makes the recovery hatch reachable — before it, `bt_radio = None`
+    /// meant the re-trigger drain skipped the controller and the failure was permanent by
+    /// construction. Written on the re-read's final failure; cleared at `bt_probe`'s claim, so
+    /// a later successful re-drive retires it. `None` on every boot where phase 0 succeeds.
+    #[cfg(feature = "bt")]
+    bt_pending: Option<(Target, u8)>,
     /// BT-RETRY — a bring-up chain is running on this controller RIGHT NOW. `bt_retrigger` checks
     /// it and DECLINES rather than starting a second overlapping chain. Under the current
     /// synchronous service model a chain runs to completion inside one `service_ehci_hid` pass, so
@@ -2671,6 +2681,19 @@ const BT_CENSUS_MAX: usize = 12;
 /// BT-L0B — bound on endpoints listed per interface in the census line.
 #[cfg(feature = "bt")]
 const BT_EP_MAX: usize = 8;
+/// BTCLAIM (D-4) — attempts for the phase-0 FULL config re-read. Flight 1 boot 1 showed one
+/// failed control-IN here permanently voiding the radio for the whole boot: no retry existed,
+/// and the failure line said "claimed and stopped" when nothing was claimed. The re-read is a
+/// GET_DESCRIPTOR on EP0 — idempotent by definition — so re-issuing it is bring-up hygiene,
+/// not new protocol. Three attempts, each already bounded by `control`'s own wait budgets.
+#[cfg(feature = "bt")]
+const BT_CFG_REREAD_ATTEMPTS: u32 = 3;
+/// BTCLAIM (D-4) — settle between re-read attempts, milliseconds. Short on purpose: the
+/// failure mode being retried is a transient control-IN miss during enumeration, not a device
+/// that needs recovery time; 10 ms is ~2 full-speed frames of breathing room and costs a
+/// worst case of 20 ms per boot, only on the failure path.
+#[cfg(feature = "bt")]
+const BT_CFG_REREAD_DELAY_MS: u64 = 10;
 
 /// BT-L0B — one interface descriptor as the census/selection walk sees it.
 ///
@@ -4995,8 +5018,45 @@ impl Controller {
         let have = cfg.len() as u16;
         // The parameter `cfg` is DEAD past this point; the shadow is the only descriptor read.
         let cfg: &[u8] = if want > have {
-            match self.control(t, 0x80, 6, 0x0200, 0, want, true) {
-                Ok(n) if n >= 9 => {
+            // BTCLAIM (D-4) — bounded retry. Flight 1 boot 1: ONE failed control-IN here voided
+            // the radio for the whole boot, because this read had no second chance and its
+            // failure line claimed a claim that never happened. GET_DESCRIPTOR on EP0 is
+            // idempotent, so re-issuing it changes no protocol state; each attempt is already
+            // bounded inside `control`, and the inter-attempt settle is `BT_CFG_REREAD_DELAY_MS`.
+            let mut got: Option<u32> = None;
+            for attempt in 1..=BT_CFG_REREAD_ATTEMPTS {
+                match self.control(t, 0x80, 6, 0x0200, 0, want, true) {
+                    Ok(n) if n >= 9 => {
+                        if attempt > 1 {
+                            serial_println!(
+                                ":: bt-l0: [{}] addr {} full config re-read RECOVERED on attempt {}/{} — the transient miss below cost only its own settle == witness ::",
+                                self.idx, t.addr, attempt, BT_CFG_REREAD_ATTEMPTS
+                            );
+                        }
+                        got = Some(n);
+                        break;
+                    }
+                    r => {
+                        serial_println!(
+                            ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) attempt {}/{} failed ({}) ::",
+                            self.idx, t.addr, wtotal, attempt, BT_CFG_REREAD_ATTEMPTS,
+                            match r {
+                                Ok(_) => "runt reply: fewer than the 9 bytes even a bare config header needs",
+                                Err(e) => e,
+                            }
+                        );
+                        if attempt < BT_CFG_REREAD_ATTEMPTS {
+                            let start = crate::arch::now_cycles();
+                            let budget = Self::bt_l3_budget(BT_CFG_REREAD_DELAY_MS);
+                            while crate::arch::now_cycles().wrapping_sub(start) < budget {
+                                core::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+            }
+            match got {
+                Some(n) => {
                     // A short control IN (9 <= n < want) is a TRUNCATED census, not a complete one —
                     // review C4: without this the walk would read fewer bytes than the descriptor
                     // declares and the census would claim the whole device silently.
@@ -5006,10 +5066,19 @@ impl Controller {
                     }
                     core::slice::from_raw_parts(self.data_buf, (n as usize).min(BT_CFG_MAX as usize))
                 }
-                _ => {
+                None => {
+                    // BTCLAIM (D-4) — the honest terminal line. The old text said "claimed and
+                    // stopped": FALSE — no census ran, no interface was selected, no
+                    // SET_CONFIGURATION was issued, `bt_radio` stayed `None`. All this path ever
+                    // did (and still does) is WITHHOLD the device from the HID path, which is
+                    // correct — it wears a Bluetooth candidate class and has no HID interface to
+                    // arm — and the line now says exactly that. Pending the candidate is what
+                    // makes `bt_retrigger` reachable: the drain used to skip a radio-less
+                    // controller, so this failure was permanent by construction.
+                    self.bt_pending = Some((*t, config_value));
                     serial_println!(
-                        ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) FAILED — only the 64-byte HID-path view exists; claimed and stopped ::",
-                        self.idx, t.addr, wtotal
+                        ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) FAILED {}x — NO RADIO THIS BOOT: nothing was claimed (no census, no SET_CONFIGURATION, no HCI); the device is only WITHHELD from the HID path (Bluetooth candidate class, no HID interface). Candidate PENDED — a bt-retry chord re-drives the full probe without a reboot == witness ::",
+                        self.idx, t.addr, wtotal, BT_CFG_REREAD_ATTEMPTS
                     );
                     return true;
                 }
@@ -5273,6 +5342,9 @@ impl Controller {
         // boot path, after selection claimed the radio and the event endpoint is up — the one
         // place all four facts are known and true.
         self.bt_radio = Some(BtRadio { target: *t, intf, evt_ep, evt_mps });
+        // BTCLAIM (D-4): a claim retires any pended candidate — relevant only when this probe
+        // was re-driven by `bt_retrigger` after a boot whose phase-0 re-read failed out.
+        self.bt_pending = None;
         self.bt_bringup_wire(t, intf, &e);
         true
     }
@@ -5708,8 +5780,15 @@ impl Controller {
     /// (`bt_bringup_wire`: scan -> select -> page -> C1 -> C2 -> teardown) against the radio this
     /// controller claimed at boot, on demand rather than only once. Declines, each witnessed and
     /// each falsifiable:
-    ///   * no radio claimed on this controller -> nothing to run (the drain skips it before here);
+    ///   * no radio claimed AND no candidate pended -> nothing to run (the drain skips it);
     ///   * a chain already in flight (`bt_chain_busy`) -> do not start a second.
+    /// BTCLAIM (D-4): no radio but a PENDED candidate (`bt_pending` = `Some`) is the third case —
+    /// the boot probe found a Bluetooth candidate whose phase-0 full-descriptor re-read failed
+    /// out, so nothing was ever claimed. That used to be permanent: the drain skipped a
+    /// radio-less controller and this function's own guard returned silently, so the hatch was
+    /// unreachable in exactly the failure it existed for. Now the pended coordinates re-drive
+    /// the WHOLE probe — stub read, full re-read (with its retry), census, claim, bring-up —
+    /// which is the boot path re-run, not a new path.
     /// A classic link left up from an earlier run (`bt_left_link` = `Some`) is NOT a permanent
     /// decline — that would be the very "reboot to pair a speaker" this arc exists to abolish (a
     /// speaker powered off ungracefully leaves the disconnect unconfirmed, so the latch would wedge
@@ -5722,6 +5801,45 @@ impl Controller {
     #[cfg(feature = "bt")]
     unsafe fn bt_retrigger(&mut self, source: u32) {
         let Some(radio) = self.bt_radio else {
+            // BTCLAIM (D-4): the reachable hatch. No radio was claimed this boot; if a candidate
+            // is pended, re-drive the full probe against it. The stub read below is the same
+            // capped GET_DESCRIPTOR view `configure_hid` hands the boot-path probe, so
+            // `bt_probe` runs its own gate, full re-read (retry included), census, and claim
+            // exactly as at boot; on a claim it clears `bt_pending` itself.
+            let Some((t, config_value)) = self.bt_pending else {
+                return;
+            };
+            if self.bt_chain_busy {
+                serial_println!(
+                    ":: bt-retry: [{}] src={} DECLINED — a bring-up chain is already in flight on this controller; not starting a second == witness ::",
+                    self.idx, source
+                );
+                return;
+            }
+            serial_println!(
+                ":: bt-retry: [{}] src={} PENDED CANDIDATE addr={} — boot phase-0 re-read failed out and no radio was claimed; re-driving the FULL probe (stub -> full re-read -> census -> claim -> bring-up) == witness ::",
+                self.idx, source, t.addr
+            );
+            match self.control(&t, 0x80, 6, 0x0200, 0, 64, true) {
+                Ok(n) if n >= 4 => {
+                    let cfg: &[u8] =
+                        core::slice::from_raw_parts(self.data_buf, (n as usize).min(64));
+                    let claimed = self.bt_probe(&t, cfg, config_value);
+                    serial_println!(
+                        ":: bt-retry: [{}] src={} PENDED CANDIDATE outcome — probe returned, radio {} == witness ::",
+                        self.idx, source,
+                        if claimed && self.bt_radio.is_some() {
+                            "CLAIMED; the bring-up chain above is its first"
+                        } else {
+                            "still NOT claimed; the candidate stays pended and the lines above say why"
+                        }
+                    );
+                }
+                _ => serial_println!(
+                    ":: bt-retry: [{}] src={} PENDED CANDIDATE addr={} — the 64-byte stub read itself failed; the candidate stays pended and nothing ran == witness ::",
+                    self.idx, source, t.addr
+                ),
+            }
             return;
         };
         if self.bt_chain_busy {
@@ -17386,6 +17504,9 @@ pub fn init() {
                         // boot-path `bt_probe` (and, for the link, `bt_c1_page`) says otherwise.
                         #[cfg(feature = "bt")]
                         bt_radio: None,
+                        // BTCLAIM (D-4): no candidate pended until a phase-0 re-read fails out.
+                        #[cfg(feature = "bt")]
+                        bt_pending: None,
                         #[cfg(feature = "bt")]
                         bt_chain_busy: false,
                         #[cfg(feature = "btc")]
@@ -17862,7 +17983,10 @@ pub fn service_ehci_hid() {
         if src != 0 {
             let mut serviced = false;
             for c in ctrls.iter_mut() {
-                if c.bt_radio.is_some() {
+                // BTCLAIM (D-4): a pended candidate (phase-0 re-read failed out at boot, no
+                // radio claimed) is as much a re-trigger target as a claimed radio — it is the
+                // case the hatch exists for. `bt_retrigger` tells the two apart itself.
+                if c.bt_radio.is_some() || c.bt_pending.is_some() {
                     unsafe { c.bt_retrigger(src) };
                     serviced = true;
                     break;
@@ -17870,7 +17994,7 @@ pub fn service_ehci_hid() {
             }
             if !serviced {
                 serial_println!(
-                    ":: bt-retry: request src={} but NO controller claimed a radio at boot — there is no chain to re-run == witness ::",
+                    ":: bt-retry: request src={} but NO controller claimed a radio at boot and none holds a pended candidate — there is no chain to re-run == witness ::",
                     src
                 );
             }
