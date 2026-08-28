@@ -6235,6 +6235,90 @@ armed configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CF
 than inferred from a pile of missing `REQUIRE`s. `:P:` is anchored `^:P:` there because a bare `:P:`
 takes a false hit on a pre-existing `KERNEL HEAP ALLOCATED :P: released cores …` line.
 
+#### VARIANT C — the `desk1` signature, first recorded 2026-08-28
+
+A third distinct fault signature at this same seam, from the 2026-08-26 desk sitting
+(`~/unaos-bench/capture/line-acm0/raw.log` at offset **+7621395**, leg `desk1` at `f3df7ff`, knobs
+FURN+FACE+INPUT+EL1AP+LOCKFIX+RAST, conwin OFF). It is recorded because neither known signature matches
+it: before this entry `grep -r` over `docs/` and `unaos/` returned **zero** hits for both `0xbe000411`
+and `0x68000d04`.
+
+Position is identical to the park: the last kernel line is
+`ORIN-SMP-3 enumerated core 5 aff=0x00010300`, there is **no `CPU_ON` line at all**, and then two RAS
+records and a doubled `Powering off core`.
+
+```
+ERROR:   Exception reason=0 syndrome=0xbe000411
+ERROR:   RAS Uncorrectable Error in IOB, base=0xe010000:
+ERROR:   	Status = 0xec000612
+ERROR:   SERR = Error response from slave: 0x12
+ERROR:   	IERR = CBB Interface Error: 0x6
+ERROR:   	Overflow (there may be more errors) - Uncorrectable
+ERROR:   	MISC0 = 0x44062040
+ERROR:   	MISC1 = 0x6454870000000000
+ERROR:   	MISC2 = 0x0
+ERROR:   	MISC3 = 0x0
+ERROR:   	ADDR = 0x8000000000000000
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   RAS Uncorrectable Error in ACI, base=0xe01a000:
+ERROR:   	Status = 0x68000d04
+ERROR:   SERR = Assertion failure: 0x4
+ERROR:   	IERR = SNOC Write Error: 0xd
+ERROR:   	Overflow (there may be more errors) - Uncorrectable
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   Powering off core
+ERROR:   Powering off core
+```
+
+Against the two known signatures, with the park column taken from the same sitting's `desk2` leg
+(+7689131) so the comparison is one board on one afternoon:
+
+| field | **VARIANT C** (`desk1`) | the park (`desk2`) | the `bg`-verb fault |
+|---|---|---|---|
+| `Exception reason=` | present — `reason=0 syndrome=0xbe000411` | present — `reason=1 syndrome=0x82000010` | **absent entirely** |
+| IOB `Status` | `0xec000612` | `0xe4000612` | `0xec000612` |
+| IOB `SERR` / `IERR` | slave `0x12` / CBB Interface `0x6` | slave `0x12` / CBB Interface `0x6` | — |
+| IOB `Overflow` | **set** | not set | — |
+| IOB `MISC0` / `MISC1` | `0x44062040` / `0x6454870000000000` | `0xc4520040` / `0x22cc870000000000` | — |
+| IOB `ADDR` | `0x8000000000000000` | `0x8000000000000200` | `0x8000000000000000` |
+| ACI `Status` | `0x68000d04` | `0xe8000904` | — |
+| ACI `SERR` / `IERR` | Assertion failure `0x4` / **SNOC Write Error `0xd`** | Assertion failure `0x4` / FillWrite Error `0x9` | SNOC Write Error `0xd` |
+| ACI `ADDR` | **no `ADDR` line emitted** | `0x8000000000000200` | — |
+
+**It is NOT the `bg`-verb fault, and the discriminator is the `Exception reason=` line.** The trap is
+worth stating because variant C carries all three of the `bg`-verb fault's quoted values —
+`Status 0xec000612`, `SNOC Write Error 0xd`, `ADDR 0x8000000000000000` — so a value-wise match looks
+convincing. They are **split across two different records**: the `Status` belongs to the IOB record,
+whose `IERR` is CBB Interface Error `0x6`, and the SNOC Write Error belongs to the ACI record, whose
+`Status` is `0x68000d04`. No single record in variant C reproduces the `bg`-verb pairing. The `bg`-verb
+fault additionally carries no `Exception reason=` line at all, and variant C carries one, which settles
+it on its own. This is the exact confusion §ORIN-RAS-ADDR's corollary was written to prevent.
+
+**Both ADDR values here are sinks, not locations.** Per §ORIN-RAS-ADDR, strip bit 63: variant C's
+residue is `0x0` and the park's is `0x200`, and both are in that section's named sink set
+(`0x0`, `0x200`, `0xb5c`). Neither names a place in DRAM; each says only that the transaction matched
+no region. **Do not chase either.** Per the same corollary, no witness or spec rule keys on them —
+variant C's discriminating key is `Exception reason=0 syndrome=0xbe000411` plus the ACI
+`Status = 0x68000d04`.
+
+⚠ **SMPMARK was NOT armed on this sitting, so the reading table above does not apply to variant C.**
+`grep -ac ':P:'` returns 0 on all five desk-leg windows, and every `:P:` occurrence in `raw.log` lies at
+offsets 6153632–7255955, i.e. before `desk1` begins at +7621395. The desk1 and desk2 tails match the
+first row of *"Reading a parked capture"* textually (`enumerated core 5 …` then RAS), but that row's
+verdict — publication died, no `CPU_ON` was ever issued, **REFUTES H1** — requires the marks to be
+armed and absent. With the instrument off, their absence is a fact about the build, not about the boot.
+**Variant C therefore leaves H1 neither convicted nor refuted**, and an `UNAOS_SMPMARK=1` re-flight is
+what it is owed.
+
+**Rate.** Both parked legs are already counted as ordinary parks in the ~30% figure at the head of this
+section. Variant C has no rate of its own — it is one occurrence. Nothing yet distinguishes whether it
+is a separate defect or the same one presenting differently, and one sample cannot say so.
+
+**Provenance note.** This sitting's two parks were briefly read as convicting the `orinfurn` desktop
+knob. They do not: that seam prints an unconditional entry line and never printed it on any leg, and the
+2-of-5 split sits within this section's own ~30% base rate. The arithmetic and the retraction are in
+[`08_VIDEO/orin-desktop.md`](../08_VIDEO/orin-desktop.md) §3.12.1.
+
 ### ORIN-RAS-ADDR — reading a Tegra RAS `ADDR` field: it is sometimes a location and sometimes a sink
 
 A rule this file has so far only half-recorded, written down because reading it wrong cost this lane a

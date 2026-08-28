@@ -2115,13 +2115,166 @@ rather than on a bench boot.
   existing public accessor.
 * **No rung 5.** No `desktop_firmware::activate()`, no DESKTOP-CLEAR, no tegra `render_service`,
   `TEGRADESK_CASCADE_OK` untouched.
-* **UNFLOWN, and this is the whole of what is owed.** No Orin has booted an `orinfurn`
-  image. Unproven on metal: that the bar paints at all; that it paints at 1920x1200 rather
+* **UNFLOWN, and this is the whole of what is owed.** ~~No Orin has booted an `orinfurn`
+  image.~~ **Superseded 2026-08-28: two have — desk1 and desk2, both at `f3df7ff` — and
+  neither reached the seam. The rung is still UNFLOWN in the sense that matters (no verdict
+  on the bar exists), but the reason is now measured rather than absent. See §3.12.1.**
+  Unproven on metal: that the bar paints at all; that it paints at 1920x1200 rather
   than declining on a contended `SCRATCH`; that the crystal press is consumed by the menu
   band rather than falling through to the desktop; that the composite fits the boot stack.
   The falsifiers are `[orinfurn] ARMED … -> BAR-ON-GLASS` with a non-`None` `rect=`, and an
   `[orinclick] edge=press … at (x,y)` inside the printed corner rect that does **not** end
   `-> RAISED` or `MISS-SHELL`.
+
+#### §3.12.1 CORRECTION 2026-08-28 — the flight record, and the conviction it does not support
+
+Five `f3df7ff` metal flights were taken on 2026-08-26 (`~/unaos-bench/capture/line-acm0`,
+offsets into `raw.log` from `marks.txt`). Two parked during secondary bring-up; three ran clean:
+
+| leg | `raw.log` offset | knobs | outcome |
+| --- | --- | --- | --- |
+| desk1 | +7621395 | FURN+FACE+INPUT+EL1AP+LOCKFIX+RAST, conwin OFF | **park** |
+| desk2 | +7689131 | noel1ap FURN+FACE+INPUT+TENANT+RAST | **park** |
+| desk3 | +7756839 | faceonly (`orinfurn`/`orininput` OFF) | clean, 5/5 secondaries online |
+| desk4 | +7842003 | +`orininput` (bisect) | clean, 5/5 secondaries online |
+| desk5 | +7920173 | all-but-furn +`orindesk` | clean, 5/5 secondaries online |
+
+The record carried forward from that sitting read: *"`orinfurn` faults trying to composite at
+the terminus — an EL3 RAS Uncorrectable right after core 5. It is painting furniture into a
+panel whose ownership is undefined at that instant, off the boot core's entry frame, with no
+stack number obtainable there."* It was marked `[MEASURED]`, reached
+`~/.claude/plans/unaos/batons/orin-9.md:85-87`, and became a phase item there (`:101-103`,
+"THEN re-arm `orinfurn`"). **Three of its four clauses are refuted below.** They are struck
+rather than deleted so the next reader can see both what was claimed and why it did not hold.
+
+##### ~~"`orinfurn` faults trying to composite at the terminus"~~ — the seam was never entered
+
+`tegra_desk_furn`'s first statement is an unconditional `serial_println!` of
+`[orinfurn] arm click=… conwin=… desk=…` (`main.rs:7879-7886`). It precedes the one-shot
+`ORINFURN_ENTERED` latch (`:7889`) and every refusal path in the function, and its own comment
+gives the reason it exists: "a silent `false` must never be indistinguishable from 'the seam
+was never called'".
+
+The token `orinfurn` appears **zero** times in both `raw.log` and `orin.log`
+(`grep -ac orinfurn` returns 0 on each). The grep is live on those same files:
+`grep -ac 'tegra:'` returns 4138 on both. The only occurrence anywhere in the capture set is
+`marks.txt:12`, which is the operator's own label for the desk3 leg.
+
+The seam did not run. It cannot have faulted, declined, or composited.
+
+##### ~~"an EL3 RAS Uncorrectable right after core 5"~~ — after the last *enumeration line*, 96 source lines earlier
+
+"Right after core 5" is positional, not causal. `start_secondaries_tegra` dumps every
+enumerated core **before** issuing any PSCI call, deliberately:
+`arch/aarch64/smp_virt.rs:865-873` — "so the metal capture has the full set even if a later
+`CPU_ON` faults (the JM5 attempt-1 lesson: a RAS fault ate the enumeration)". `enumerated
+core 5` is therefore the last line printed before the *first* `CPU_ON` SMC. Both parked legs
+die there with **no `CPU_ON` line at all**; all three clean legs print
+`CPU_ON AP 1..5 -> SUCCESS` followed by `5/5 secondaries online`.
+
+The seam that faults is `main.rs:2621`, `smp_virt::start_secondaries_tegra(…)` under
+`#[cfg(feature = "tegrasmp")]` at `:2620`. The terminus line carrying `tegra_desk_furn()` is
+`main.rs:2717` — **96 source lines later**, and reached on neither parked leg.
+
+Note that `main.rs:2717` is a single source line carrying the whole tail wire-in set *and* the
+terminus call, by the knob-off byte-identity convention. A panic `Location` cannot discriminate
+among the seams on it. That is precisely why the entry line of §3.12.2 was the only instrument
+that could answer this question.
+
+##### The base-rate arithmetic, stated because it is the whole of the argument
+
+`arch_arm64.md` §ORIN-SMP-3-PARK (`:6151`) measures the park at **~30% across the record** and
+warns at `:6163` that at that rate "a single armed boot has a ~70% chance of returning a *clean*
+trace that convicts nothing."
+
+Against a 30% independent base rate over 5 boots:
+
+* expected parks = 5 × 0.30 = **1.5**; observed 2.
+* P(exactly 2 parks in 5) = C(5,2) × 0.30² × 0.70³ = 10 × 0.09 × 0.343 = **0.309**. The
+  observed split is the single most likely outcome under the null.
+
+The strongest form of the original argument is not the 2-of-5 split but the pairing: exactly two
+legs armed `orinfurn`, and those two are the two that parked. Under the null that is
+1 / C(5,2) = **0.10**. One chance in ten is not a conviction, and this was **not a bisect**: no
+two legs in the set differ in `orinfurn` alone. desk1 and desk2 differ from each other in
+`EL1AP`+`LOCKFIX` against `TENANT`, and the nearest FURN-off leg (desk4) differs from desk1 in
+three knobs. The set was never constructed to isolate the variable it was read as isolating.
+
+That 0.10 is moot in any case, because the entry line closes the only channel it could have acted
+through. A feature cannot act at runtime on a boot that never called it, so the sole remaining
+channel is the *image* — a build-level layout effect. **The layout axis is already closed:**
+`arch_arm64.md:6187-6190` records boot5c flights #1 (park) and #2 (clean) sharing
+`VBAR_EL2 = 0x25b115800` and `TTBR0 = 0x25b26a000` — "same binary, same physical load base,
+minutes apart, opposite outcomes."
+
+##### desk2 is the documented intermittent; desk1 is a third variant
+
+desk2's signature is `Exception reason=1 syndrome=0x82000010`, IOB `Status = 0xe4000612`,
+`ADDR = 0x8000000000000200`. That is **ORIN-SMP-3-PARK verbatim** — the pre-existing
+intermittent, spec'd as a `FORBID` at `unaos/scripts/specs/jetson-sync1.spec:1429` and described
+at `:1418-1420` as byte-identical across four metal instances dated 2026-07-15 and 2026-07-17 and
+boots 5b and 5c. **All of those predate `orinfurn`, which landed 2026-08-26.**
+
+desk1's signature is neither the park nor the `bg`-verb fault. It is recorded as a new variant in
+`arch_arm64.md` §ORIN-SMP-3-PARK.
+
+##### ~~"a panel whose ownership is undefined at that instant"~~ — unsupported by the code
+
+At the terminus every task alive on the tegra path is spawned onto cpu 0 explicitly, and an
+explicit core is a pin:
+
+* `jd2-console` — `main.rs:2495`, `cpu` argument `0`.
+* `el0-hello` — `main.rs:7022`, `spawn_user(…, 0)`, whose comment reads "Pinned to the boot core
+  (cpu 0, not `CPU_AUTO`): `pick_cpu_slot` short-circuits a non-AUTO request, so the EL0 task
+  cannot be placed on a secondary."
+* `tegra-el0-verdict` — `main.rs:7023-7028`, `cpu` argument `0`.
+
+`arch/aarch64/sched.rs:3658` sets `steal_ok: requested_cpu == CPU_AUTO` beneath the comment "A
+task spawned onto an explicit core is pinned there (no-migrate), so stealing never touches it";
+`:340` states "Tasks never migrate." `sched::spawn` appears exactly **once** inside
+`tegra_early_stop` (`main.rs:2029-2718`), at `:2495`.
+
+No second core can enter `wm::composite()`, `Screen::present_*` or `menubar::*` at that instant,
+because no task exists on a second core to do so. **The clause is withdrawn.** This says nothing
+about the separate and real ownership problem the same sitting recorded — `JD4`'s timed
+`RAST-SUPERSEDED-BY-CONSOLE` seizure of the panel — which is a *sequencing* conflict on one core,
+not a concurrency one, and is unaffected by this correction.
+
+##### What is unchanged
+
+The fourth clause, "with no stack number obtainable there", is **true and stands**:
+`sched::stk_probe` returns early on the boot core before `run_capstone_boot_core` drives the
+queue, exactly as the stop-line finding above records. What does not follow from it is that the
+park is a stack fault. It is an instrument gap, not evidence for a mechanism. `orinfurn` remains
+UNFLOWN, DEFAULT OFF, and every falsifier listed above is still owed.
+
+#### §3.12.2 METHOD — entry lines and read-back fields, as a rule for future seams
+
+Two instruments in this subsystem were exercised on 2026-08-28, one in each direction. The pair
+is worth stating as a rule, because this ladder will keep adding seams shaped like both.
+
+**An entry line printed before any decision distinguishes "never ran" from "ran and refused."**
+`tegra_desk_furn` prints `[orinfurn] arm …` unconditionally as its first statement, ahead of the
+one-shot latch and every `return false` (`main.rs:7879-7886`). That one line is what turned
+§3.12.1's question from unanswerable into arithmetic: a seam that prints nothing was not called,
+and no reasoning about the composite was required. The cost of not having such a line is on the
+record — the ambiguity it closes is exactly what produced a wrong conviction that propagated
+into a session plan as a phase item.
+
+**A status field must be read back, not asserted.** The inverse failure sits in the same
+subsystem. `display_tegra.rs:2677` prints `live={}` for the console-window route from a
+compile-time literal; the comment immediately below it says the value is "read from the BUILD,
+not from this function". Meanwhile `main.rs:6973` calls `fbcon::detach()` unguarded on the RAST
+demo path, which runs *after* `orin_conwin()` on the same terminus line (`main.rs:2717`), so a
+build carrying both knobs tears the route down immediately after installing it while the
+instrument still reports it live. That is a false PASS on the wire. A sibling arc owns the fix;
+it is named here for the rule, not claimed as repaired.
+
+The general form: **an instrument reports either what the author intended or what the machine
+did, and only the second is evidence.** `orinfurn`'s own `owns_pixels()` read-back — §3.12,
+"never inferred from having called `composite`" — is already the correct shape. Apply both halves
+to every new seam on this ladder: print on entry, before any branch; and read every reported
+state back out of the subsystem that owns it.
 
 ---
 
@@ -2310,6 +2463,24 @@ in the tree at all. Arm the cascade knowing the liveness instruments will tell y
 it is fine: pi's boot 11 printed `[el0live] verdict=LIVE` **one line after** the
 synchronous exception that killed cpu 3, and `:: SCHED: load ::` read `c3=100%`
 for the dead core.
+
+#### The stop-line has not been tested by anything, and one reading of it is retired (2026-08-28)
+
+The 2026-08-26 desk sitting was read as evidence about this stop-line. It is not. Both parked
+legs (desk1, desk2) died at `main.rs:2621` inside the first PSCI `CPU_ON`, 96 source lines
+before the terminus, and the `orinfurn` seam printed nothing on either — see §3.12.1 for the
+measurement. **No flight in this tree has yet driven the cascade far enough to sample the stack
+hazard §5 describes.** The Pi's two overflows remain the only evidence that exists, and every
+precondition, hazard and placement rule above is unchanged by the correction.
+
+One inherited reading is retired. The record inferred a stack fault at the terminus partly from
+the fact that "no stack number is obtainable there". That premise is true — `stk_probe` returns
+early on the boot core before `run_capstone_boot_core` drives the queue, which is the same
+structural gap §3.12 records as making §5.2's own clearing condition unsatisfiable. **The
+inference is not.** An unavailable measurement is an instrument gap; it is not evidence for the
+value the measurement would have returned. The stop-line stands on the Pi's two boots and on
+§5.1's inventory, and it needs the boot-stack high-water probe §3.12 names before any rung can
+claim to have cleared it.
 
 ---
 
