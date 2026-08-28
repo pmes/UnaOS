@@ -85,7 +85,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Approximately: the TSC's zero is the last processor reset, which on a warm boot need not be
     // the moment power was applied. Read the number as an upper bound on pre-kernel time, not as a
     // measurement of firmware. Heap-free and lock-light, so it is safe this early.
-    unaos_kernel::bootpace::record("entry");
+    unaos_kernel::bootpace::record("entry"); #[cfg(all(target_arch = "aarch64", feature = "orinfurn"))] tegra_stk_anchor(); // ORIN-STKDEPTH — the FIRST of two SP reads whose difference is a boot-core stack DEPTH in bytes. Anchored on the same statement `bootpace` calls "the FIRST instruction of the kernel proper", which is the earliest stable point on the frame chain `kernel_main -> tegra_early_stop -> tegra_desk_furn`; the second read is beside `tegra_desk_furn`'s `[orinfurn] arm` line. See the ORIN-STKDEPTH block at this file's tail for what the number is and — at length — what it is NOT. ⚠ LINE-NEUTRAL append, and `#[cfg]`-erased on every arch and every build without `orinfurn`, so no panic `Location` moves and the knob-off image is untouched.
 
     // 0-WC. VPERF-WC HOIST (bootpace.md §11). Retype the framebuffer's identity-map leaves to
     //     Write-Combining BEFORE the console's first paint instead of after it.
@@ -2886,8 +2886,8 @@ fn jd2_console_pump(_arg: usize) {
     pal.render();
     match first_key {
         Some(c) => {
-            serial_println!(
-                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+            serial_println!( // ORINPATH — `path=` names WHICH phase-2 printed this, and until this arc nothing did. `jd2_supstate_phase2` carries a verbatim copy of these two literals; on a `supstate` build both copies pass `#[cfg]`, so neither a serial capture nor a grep of the artifact could attribute the line to a site. See the twin's comment for the MEASURED shape of that ambiguity at 0ed6fee2. Token deliberately longer than 8 bytes — a shorter mark can be LLVM-immediate-encoded and never appear in `.rodata`, defeating the artifact grep. Placed AFTER "console OWNS the panel" so `scripts/specs/jetson-sync1.spec` / `jetson-jd5.spec`'s `REQUIRE JD4.*console OWNS the panel` still matches.
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; first key {:#04x} ::",
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
@@ -2895,7 +2895,7 @@ fn jd2_console_pump(_arg: usize) {
             pal.render();
         }
         None => serial_println!(
-            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::"
         ),
     }
 
@@ -6970,7 +6970,7 @@ fn tegra_rast_demo_maybe() {
     }
     // Detach fbcon's serial mirror first so a CAPSTONE straggler line can't paint over the demo
     // frames (serial output is unaffected). Mirrors the x86/virt wire-in and the JD2 phase-2 takeover.
-    unaos_kernel::video::fbcon::detach();
+    if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } // ORIN-CONWIN rung 4 — THE SAME GUARD ITS TWIN AT `jd2_console_pump`'s phase-2 line already carries, and it was missing here. THE DEFECT IT REMOVES: on the terminus line `orin_conwin` runs BEFORE `tegra_rast_demo_maybe`, so every image carrying both (all five orinconwin legs carry `rast`) installed the console-window route, printed `[orinconwin] … live=LIVE`, and then reached THIS statement and detached anyway — `GUI_ACTIVE` set, `fbcon::_print` returning at its first test, and the "LIVE" console window receiving no further glyph for the rest of the boot. The guard is the same one and for the same reason: `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the PANEL — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the single-writer guarantee the detach exists for is already true of the mirror path. ⚠ WHAT THE GUARD COSTS HERE, and it is NOT identical to the phase-2 site's cost, so it is stated rather than inherited: this site's stated purpose is "a straggler can't paint over the DEMO FRAMES", and a routed console still reaches glass through `wm`'s paced, damage-limited composite. So a straggler line printed while the cube spins can now composite over it INSIDE the console window's rect, and because `orin_rast_console_owns()` is not latched until phase 2 the census would score that `RAST-PAINTED-OVERWRITTEN`. That is a true reading of a real second writer, not a false one — the conwin+rast image genuinely has two panel owners — and it is the same trade the phase-2 line already took when it chose a live console over a frozen one. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof. Knob-off `tegra_conwin_live` is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been.
     serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     unaos_kernel::rast_demo::run_mc(&mut screen); unaos_kernel::rast_demo::run(&mut screen); drop(screen); unaos_kernel::arch::display_tegra::orin_rast_glass_post(); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above. ORIN-RASTGLASS: the `post` glass read-back, fired the instant `run` returns — nothing is dispatched on this core in between, so it is the ONE sample that can establish whether the blit reached the scan-out at all (`late`, from the pump sweep, then says whether it survived). `drop(screen)` first so the double buffer's own `flush` has certainly landed before the panel is read back; also releases the back buffer to the heap ahead of ~2048 volatile VRAM reads. Same-line per the convention above.
@@ -7547,7 +7547,7 @@ fn jd2_supstate_phase2(
     // line is), so a CAPSTONE straggler can't paint over the console frame.
     if !tegra_conwin_live() {
         unaos_kernel::video::fbcon::detach();
-    }
+    } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch, MISSING FROM THIS COPY until this arc and that omission produced a WRONG VERDICT ON A HEALTHY BOOT. `jd2_supstate_phase2` never returns (the drive loop at this function's tail is non-breaking), so on a `supstate` image the legacy phase 2 — the only site that latched `RG_CONSOLE_OWNS` — is unreachable and the latch was never set. Read off `display_tegra::orin_rast_census`: with `owns` false, a console that has taken the panel and repainted the cube away scores `RAST-PAINTED-OVERWRITTEN`, which that census calls "the only arm that indicts a repainter", instead of `RAST-SUPERSEDED-BY-CONSOLE`. A correct boot was being reported as a defect. Placed exactly as the legacy twin places it: on the FIRST statement of phase 2 and OUTSIDE the conwin guard, because the console takes the panel on both routes and only the detach differs. ⚠ LINE-NEUTRAL append.
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&screen);
@@ -7562,8 +7562,8 @@ fn jd2_supstate_phase2(
     pal.render();
     match first_key {
         Some(c) => {
-            serial_println!(
-                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); first key {:#04x} ::",
+            serial_println!( // ORINPATH — `path=` DISCRIMINATES THIS COPY FROM THE LEGACY ONE, and until this arc it did not: `jd2_console_pump`'s two takeover literals and these two were BYTE-IDENTICAL, so neither a serial capture nor a grep of the artifact could say which site a boot had printed — the one question the state-lift's own falsifier turns on. ⚠ MEASURED, not argued (arm-tegra-supstate kernel.elf at 0ed6fee2): `LC_ALL=C grep -a -o` found exactly ONE `.rodata` run for each of the two literals, not two — both copies pass `#[cfg]`, but `jd2_supstate_phase2` never returns, so LLVM drops the legacy phase 2 as unreachable. That is WORSE than the two-run case it looked like, because a single unattributable run reads as confirmation: the one surviving copy was the one this function prints, and nothing in the image said so. With the token in place the same grep answers it — `path=jd2-supstate-phase2` present, `path=jd2-console-pump` absent. The token is deliberately longer than 8 bytes: a witness mark of 8 or fewer can be LLVM-immediate-encoded and never reach `.rodata` at all, which would defeat the artifact-grep law this tree runs on. Placed AFTER "console OWNS the panel" on purpose: `scripts/specs/jetson-sync1.spec` and `jetson-jd5.spec` both `REQUIRE JD4.*console OWNS the panel`, and that regex still matches. ⚠ This deliberately BREAKS the "must read identically knob-on vs knob-off" property this function's doc comment names as its behavioural falsifier — being unable to tell the two transcripts apart was never evidence that they were equivalent, it was the absence of evidence either way.
+                ":: tegra: JD2 — console OWNS the panel (Screen back buffer live); path=jd2-supstate-phase2; first key {:#04x} ::",
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
@@ -7571,7 +7571,7 @@ fn jd2_supstate_phase2(
             pal.render();
         }
         None => serial_println!(
-            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); screen-on-boot (no key, ~8 s) ::"
+            ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-supstate-phase2; screen-on-boot (no key, ~8 s) ::"
         ),
     }
 
@@ -7654,7 +7654,7 @@ fn jd2_supstate_phase2(
         // VUGRAS writeback sweep + the ORIN-CLICK census, on the cadence phase 1 advanced.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick); unaos_kernel::arch::display_tegra::sup_present_census(sweep_tick); // ORIN-SUPSOUND — the ~10 s presenter census, authored by the INPUT SOURCE on purpose: this board's UART is shared with the SPE's TCU and drops bytes, so a dead presenter must produce a REPEATING LINE (`pass=+0 -> DEAD`), never a silence. Appended to an existing statement, and un-`#[cfg]`ed because this whole block is already `supstate`-gated.
+            unaos_kernel::vugras::idle_sweep(sweep_tick); unaos_kernel::arch::display_tegra::sup_present_census(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); // ORIN-SUPSOUND — the ~10 s presenter census, authored by the INPUT SOURCE on purpose: this board's UART is shared with the SPE's TCU and drops bytes, so a dead presenter must produce a REPEATING LINE (`pass=+0 -> DEAD`), never a silence. Appended to an existing statement, and un-`#[cfg]`ed because this whole block is already `supstate`-gated. ORIN-RASTGLASS: the rast census is the phase-2 twin of the sweep-site call in `jd2_console_pump`'s phase-1 loop and it was MISSING from this copy, so on a `supstate` image the census stopped dead at the phase-1 boundary and the rung's verdict was whatever the last phase-1 sweep had said — with `RG_CONSOLE_OWNS` never latched (see the phase-2 boundary line above), permanently pre-takeover. The census self-terminates on `RG_DONE`, so restoring it here costs one relaxed load per sweep once the question is answered. ⚠ LINE-NEUTRAL append.
             #[cfg(feature = "orinclick")]
             unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick);
             sweep_tick += 1;
@@ -7885,6 +7885,32 @@ fn tegra_desk_furn() -> bool {
         cfg!(feature = "tegradesk") as u8
     );
 
+    // ORIN-STKDEPTH — THE SECOND SP READ, beside the arm line and unconditional with it. Subtracted
+    // from the anchor latched on `kernel_main`'s first statement, it is the exact number of bytes of
+    // boot-core stack the chain `kernel_main -> tegra_early_stop -> tegra_desk_furn` has CONSUMED at
+    // this instant. ⚠ DEPTH CONSUMED, NOT HEADROOM — the wire says so too, and the ORIN-STKDEPTH block
+    // at this file's tail gives the full reason no headroom number is derivable on the Orin's UEFI
+    // path (firmware stack, never switched; no `__stack_top` on this link; the bounding `MemoryRegion`
+    // slice consumed by `memory::init`). §5.2 asks for BOTH; this clears the half that is takeable and
+    // names the half that is not, which is the opposite of clearing the stop-line by argument.
+    let stk_here: u64;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) stk_here, options(nomem, nostack, preserves_flags));
+    }
+    let stk_anchor = ORINSTK_ANCHOR_SP.load(Ordering::Relaxed);
+    if stk_anchor != 0 && stk_anchor >= stk_here {
+        serial_println!(
+            "[orinstkdepth] depth-consumed={} bytes anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED (this is stack CONSUMED between the two reads and is NOT headroom: the Orin boot stack is UEFI's and is never switched, this link defines no __stack_top, and the MemoryRegion slice that would bound it is consumed by memory::init — so no remaining-headroom number is derivable in-kernel today and none is claimed here)",
+            stk_anchor - stk_here, stk_anchor, stk_here
+        );
+    } else {
+        serial_println!(
+            "[orinstkdepth] DEPTH-UNAVAILABLE anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm reason={} (no number is printed rather than a number derived from an unset or non-monotonic anchor — an instrument that cannot fire in the state it exists for must say so, not guess)",
+            stk_anchor, stk_here,
+            if stk_anchor == 0 { "anchor-never-ran" } else { "anchor-below-seam (the two reads are not on one descending frame chain — the stack was switched between them)" }
+        );
+    }
+
     if ORINFURN_ENTERED.swap(true, Ordering::AcqRel) {
         serial_println!("[orinfurn] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-toggle ENABLED, bump menubar's TOGGLES counter and make its DEFAULT_LATCH witness read a history that did not happen)");
         return false;
@@ -7997,4 +8023,72 @@ fn tegra_desk_furn() -> bool {
         menubar::crystal_corner_abs(pw, ph)
     );
     true
+}
+
+// ── ORIN-STKDEPTH ───────────────────────────────────────────────────────────────────────────────
+// ⚠ APPEND-ONLY FILE TAIL, and it is the LAST block in the file. Every item below is `#[cfg]`-erased
+// in any build without `orinfurn` (and on every arch but aarch64), and nothing exists beneath it to
+// be renumbered, so the knob-off jetson image's panic `Location` records are untouched — the
+// orinclick line-neutrality rule. The one call site outside this block is a `#[cfg]`-erased append to
+// an existing line in `kernel_main`.
+//
+// **WHAT THIS PUBLISHES: A BOOT-CORE STACK DEPTH, IN BYTES. NOT HEADROOM.** Say it that way on the
+// wire and in review, because the two are not the same claim and only one of them is available on
+// this board.
+//
+// THE MEASUREMENT. Two reads of SP, taken in the same frame chain, subtracted:
+//   * the ANCHOR, `tegra_stk_anchor()`, on `kernel_main`'s `bootpace::record("entry")` line — the
+//     earliest stable point on the terminus path, before any subsystem exists;
+//   * the SEAM read, beside `tegra_desk_furn`'s unconditional `[orinfurn] arm` line, i.e. inside the
+//     deepest frame the desktop-furniture rung reaches on the boot core's own stack.
+// The chain between them is `kernel_main -> tegra_early_stop -> tegra_desk_furn`, and the difference
+// is exactly the stack those frames plus their spilled locals have CONSUMED at that instant. It needs
+// no linker symbol, no `Task`, no poison fill and no memory map — three instructions and a
+// subtraction. `#[inline(always)]` puts the anchor's read in `kernel_main`'s own frame; were it ever
+// out-of-lined the anchor would sit one leaf frame lower and the printed depth would be SMALLER, so
+// the number is a floor with respect to its anchor and can never overstate.
+//
+// WHY THIS EXISTS AT ALL. `docs/dev/OS/08_VIDEO/orin-desktop.md` §3.12 records that §5.2's stop-line
+// asks for `[u7stk]` evidence that is "structurally unsatisfiable at the terminus". That is exactly
+// right about `sched::stk_probe` — it loads `SCHED[cpu].current` and returns early when it is null
+// (`arch/aarch64/sched.rs`, the guard right after its own `mov {}, sp`), which is every rung on the
+// terminus line, because the boot core has not yet entered `run_capstone_boot_core` and owns no
+// `Task`. It is OVERSTATED about the machine: `stk_probe` needs a `Task` only for the BOUNDS it
+// prints (`low`/`top`/`hw`/`headroom`), not for the SP read, and this file already contains that same
+// three-instruction read twice — `arch/aarch64/mmu_tegra.rs`'s pre-switch PC/SP GiB check and
+// `stk_probe`'s own first statement. A DEPTH does not need bounds. So the depth number is takeable
+// here and is taken; the stop-line's other half is not, and this block does not pretend otherwise.
+//
+// ⚠ WHY THERE IS NO HEADROOM NUMBER, and why inventing one would be worse than the silence it
+// replaces. Headroom is `depth` measured against the stack's far end, and on the Orin's UEFI path
+// nothing in this kernel knows where that end is:
+//   * the boot stack is the FIRMWARE'S and is never switched. `crates/bootloader` calls the kernel
+//     entry as an ordinary function on the UEFI stack; `arch/aarch64/mmu_tegra.rs` states in its own
+//     EL1-twin argument that "the boot stack is never switched on this path"; and the JM6 drop in
+//     `arch/aarch64/boot_tegra.rs` does `mov x0, sp; msr sp_el1, x0` precisely so SP is CONTINUOUS
+//     across EL2 -> EL1 (which is also what makes the two reads above subtractable at all).
+//   * there is no `__stack_top` on this link. The symbol DOES exist in this tree — `pi-baremetal.ld`
+//     defines it and the `baremetal` `_start` in this file sets SP from it — but that is the Pi's
+//     bare-metal image. The Orin builds through `aarch64-unaos.json`, which names no linker script,
+//     so no such symbol is present in the jetson image and no `extern` could resolve to one.
+//   * the one runtime description of the region is gone by the time anything could ask. The UEFI
+//     `MemoryRegion` slice that would say how far the firmware stack extends is consumed with
+//     `boot_info` by `arch::memory::init` on `tegra_early_stop`'s heap line, long before the terminus.
+// So: a depth is a measurement, a headroom would be a guess wearing a measurement's clothes. The gap
+// is stated on the wire as well as here, so a capture cannot be read as clearing §5.2 by itself.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+static ORINSTK_ANCHOR_SP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// ORIN-STKDEPTH — latch SP at the caller's frame. `#[inline(always)]` is load-bearing, not cosmetic:
+/// the read must land in `kernel_main`'s frame, not in a callee's. Zero is the "never ran" value and
+/// the seam treats it as such, so a build that somehow reached the seam without the anchor prints
+/// `DEPTH-UNAVAILABLE` rather than a number derived from a null.
+#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]
+#[inline(always)]
+fn tegra_stk_anchor() {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    ORINSTK_ANCHOR_SP.store(sp, core::sync::atomic::Ordering::Relaxed);
 }
