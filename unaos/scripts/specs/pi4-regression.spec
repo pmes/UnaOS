@@ -603,7 +603,26 @@ FORBID \[wc-d\] verify .*-> FAIL
 # ---    `[wc-b] fixture` line deliberately exercises banding geometry, so if the fixture emits an
 # ---    AMPLIFIED reading BY DESIGN this FORBID reds honestly and must be narrowed to the rollup.
 # ---    First battery run after the fold IS the falsification; do not call this leg proven before it.
-REQUIRE \[wc-b\] rollup presents=[0-9]+ banded=[0-9]+ maxbands=[0-9]+ chrome_rows=[0-9]+ chrome_rows_used=[0-9]+ amp=1\.00x -> CLEAN
+# ---    FALSIFIED AND CORRECTED on the first post-fold battery, as the line above promised: the
+# ---    REQUIRE first demanded `-> CLEAN` and read 0 hits (117/118). The verdict WORD is
+# ---    geometry-dependent — at 640x480 nothing bands, so the rollup honestly says
+# ---    `banded=0 ... amp=1.00x -> UNBANDED`; `CLEAN` appears only once banding occurs, and the
+# ---    per-window line says `WHOLE`. The INVARIANT that encodes the defect's absence is
+# ---    chrome_rows == chrome_rows_used, i.e. amp=1.00x, so that is what is asserted and the
+# ---    verdict word is deliberately NOT.
+# ---    ⚠⚠ WHAT THIS LEG DOES AND DOES NOT PROVE, measured post-fold and stated so no successor
+# ---    reads a green as a guarantee: the banded path IS NOT ENTERED BY THIS BATTERY AT EITHER
+# ---    GEOMETRY. Both runs read `banded=0` — 640x480 AND `UNAOS_FBW=1920 UNAOS_FBH=1200`
+# ---    (chunk_rows = 4 MiB / 7680 B = 546 rows, and no window in this battery is taller than that;
+# ---    the panel being 1200 tall does not band a 332-row window). Trunk's deliberate band exercise,
+# ---    `chromeband_fixture`, is `cfg(target_arch = "x86_64")` and so never runs here at all.
+# ---    CONSEQUENCE: the REQUIRE passes on unbanded presents where amp=1.00x is trivially true, and
+# ---    the FORBID has never had the OPPORTUNITY to fire on this bench — it is UNFALSIFIED, not
+# ---    proven. It remains a real tripwire for the day banding does occur, and that is its whole
+# ---    present value. OWED, to give the leg teeth on aarch64: make the band fixture reachable on
+# ---    this arch (it is arch-neutral arithmetic behind an x86-only cfg), or drive one window past
+# ---    546 rows at 1920 wide in this battery. Until then an absence here is not evidence.
+REQUIRE \[wc-b\] rollup presents=[0-9]+ banded=[0-9]+ maxbands=[0-9]+ chrome_rows=[0-9]+ chrome_rows_used=[0-9]+ amp=1\.00x
 # ---    NOTE the FORBID is written look-around-free per the PORTABILITY RULE at the head of this
 # ---    file: `foreman` (Rust regex) refuses look-around and its preflight is all-or-nothing, so a
 # ---    single `(?!…)` here would make that evaluator reject the WHOLE spec and check nothing.

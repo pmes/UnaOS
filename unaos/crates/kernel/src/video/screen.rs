@@ -1698,7 +1698,10 @@ impl Screen {
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 dragwide::PRESENTS.fetch_add(1, Relaxed);
-                if dw_full {
+                // DRAGWIDE — reads trunk's `full` (the FULL_PRESENT swap above); pi's census was
+                // written against a `dw_full` binding that lived in the region trunk's own DRAGWIDE
+                // replaced at the 0ed6fee2 fold. Same quantity, trunk's name.
+                if full {
                     dragwide::FULL_PRESENTS.fetch_add(1, Relaxed);
                 }
                 dragwide::PX.fetch_add(dw_px, Relaxed);
