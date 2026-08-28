@@ -86,6 +86,23 @@ FORBID \[dmgovlp\] DRAIN-STUCK
 # a red, not a shrug.
 FORBID \[dmgovlp\].*SKIP
 
+# --- VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness ------------------------
+# The ladder's tail after DMGOVLP. Flight-1 Q4's gap: nothing witnessed that a vug's FIRST present
+# after a `[vugpause2]` resume edge actually happened. The fixture drives one real pause/resume
+# cycle per arm: a task parked on the input futex, released by a real `set_hidden` unhide edge.
+# Leg 1 must print the positive line (a measured resume→first-present gap); leg 2 arms the witness
+# and never presents, so the backstop must print the negative naming the furthest stage — for the
+# fixture's silent task that stage is deterministic: park-return. The verdict gates that both LINES
+# printed (emit counters), not merely that the state machine cycled. No numerics pinned: gap_ms is
+# scheduler time under TCG and varies run to run.
+REQUIRE \[vugres\] first present win=\d+ asid=\d+ gap_ms=\d+
+REQUIRE \[vugres\] NO PRESENT since resume win=\d+ — request lost at park-return .* asid=\d+ gap_ms=\d+
+REQUIRE \[vugres\] selftest pos=true neg=true -> PASS
+FORBID \[vugres\] selftest.* -> FAIL
+# A SKIP here is a fixture that lost its panel or its window rows — on this spec's own gate there
+# is no honest SKIP (same rule as DMGOVLP above).
+FORBID \[vugres\] selftest -> SKIP
+
 # TILEFIT — two windows handed the same box. PULSE-2's last-resort clamp is idempotent, so once the
 # greedy flow overflows the work area every later row pins to the same y and restarts cx at GAP: the
 # first box of an overflow row is byte-identical to the first box of the last row that fit. On metal

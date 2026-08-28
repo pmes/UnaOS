@@ -3795,11 +3795,18 @@ fn sys_win_present(win: u64) -> i64 {
             // register read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
             pace_advance(id);
         } // `_wh` drops (before `t`), then WINDOWS released — the composite below runs without it.
+        // D-3 RESUMEPAINT: the present passed the ownership proof and is entering the composite —
+        // stamp it BEFORE the composite runs, so a wedge inside the pass leaves `present-entered`
+        // as the furthest rung rather than looking like the app never presented.
+        vugres_present_enter(slot, id);
         // WCPAR — the `+1`-biased slot is the wm `owner` this window was created under (`sys_win_create`
         // passes `slot + 1`); the compositor declines the present if the resolved row no longer carries
         // it, which is the recycled-id fence that makes releasing the lock above safe.
         (wc_shim::present(wm_id, (slot as u64) + 1), wm_id)
     };
+    // D-3 RESUMEPAINT: the outcome is in — a landing one claims the pending witness and prints the
+    // resume→first-present gap; a declined one only advances the loss ladder.
+    vugres_present_outcome(slot, id, outcome);
     // VSYNC-PACE: the witness rollup, OUTSIDE the guard — see `wpace_emit` for why a serial burst may not
     // run under the outermost compositor lock.
     wpace_tick();
@@ -4710,8 +4717,13 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
             // present consumes exactly one frame slot, as a whole-box one does.
             pace_advance(id);
         } // `_wh` drops (before `t`), then WINDOWS released.
+        // D-3 RESUMEPAINT: same pre-composite stamp as the whole-box verb — a banded present is a
+        // present, and the resume witness must not go blind on a client that switched to bands.
+        vugres_present_enter(slot, id);
         (wc_shim::present_rows(wm_id, y0 as usize, y1 as usize, (slot as u64) + 1), wm_id)
     };
+    // D-3 RESUMEPAINT: as the whole-box verb — the outcome decides positive line vs ladder rung.
+    vugres_present_outcome(slot, id, outcome);
     // VSYNC-PACE: as the whole-box verb, and outside the guard for the same reason.
     wpace_tick();
     // CLOSE-TEARDOWN — same terminal answer as `sys_win_present`, same headless carve-out: a banded
@@ -4921,6 +4933,439 @@ static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
 static USER_INPUT_RESUMES: [AtomicU64; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
 
+// ---- RESUMEPAINT (D-3) — the resume-edge first-present witness --------------------------------
+//
+// FLIGHT-1 Q4 ended at a wall this block exists to remove: three tears landed inside a 2 s
+// `[vugpause2] resume` burst, the leading hypothesis was "the first present after a resume edge is
+// under-covered", and there was NO first-present instrument anywhere in the tree to convert that
+// from circumstantial to convicted — `first=` on `[wc-d] verify` is the first bad PIXEL, not the
+// first present. DRAGWIDE's present-accounting proof covered `drain_deferred`; the `edge=focus` /
+// `edge=unhide` resume path was never in it.
+//
+// WHAT THIS MEASURES, exactly: from the moment a NAMED resume edge actually releases a parked
+// waiter ([`user_input_wake_edge`], the only armer) to the moment a present from that slot next
+// REACHES THE COMPOSITOR AND LANDS (`Composited`/`Coalesced` at the present verbs' tail). One line
+// per resume episode:
+//
+//     [vugres] first present win=N asid=X gap_ms=M
+//
+// and — the arm that is the actual deliverable, because it converts silence into a named stage —
+// if no present lands within [`VUGRES_BOUND_MS`] of ACTIVE composition (see below), the backstop
+// emits the negative loudly, naming the FURTHEST stage the resume's story reached:
+//
+//     [vugres] NO PRESENT since resume win=N — request lost at <stage> asid=X gap_ms=M
+//
+// THE STAGE LADDER is the resume edge's loss map, one rung per place the first present can die:
+//   woken            the edge released a waiter and nothing was heard from the task again —
+//                    the wake was issued but the task never returned from the park (never
+//                    scheduled: dead core, rehome hole);
+//   park-return      the task came back through `sys_input_wait` and then went silent — it runs
+//                    but never drained input and never presented;
+//   input-polled     the app drained its ring (`sys_input_poll`) and then never presented — the
+//                    app-side render loop lost the request;
+//   re-parked        the app went BACK to sleep without presenting — it woke, re-read its flags,
+//                    and concluded it had nothing to do (the focus-before-unhide window, or a
+//                    stale hidden bit: the wake succeeded and the REASON was lost);
+//   present-entered  a present passed the ownership proof and entered the composite — and never
+//                    produced an outcome that lands (a wedge inside the pass);
+//   suppressed       the present reached wm and wm DECLINED it because the owner reads as hidden
+//                    — the unhide never became visible to the compositor (stale z / stale bit);
+//   no-row           the present resolved to no compositor row — the window died across the pause.
+//
+// "ACTIVE COMPOSITION": the 2 s bound is counted only against a present pipeline that is
+// demonstrably answering — [`VUGRES_ACTIVITY`] (presents from ANY slot reaching the verbs' tail)
+// must have advanced since the arm, or the backstop keeps waiting. A machine whose whole
+// compositor is wedged is Q1/D-1's business; blaming the resume path for it would be a lie.
+//
+// INSTRUMENT ONLY. No behaviour on the resume path changes; hot-path cost is O(1) atomics — one
+// relaxed load on every un-armed fast path, one CAS on the arm, one store + fetch_max on the
+// present tail. The sweep in [`vugres_backstop`] rides the existing ~256 ms backstop cadence.
+// x86-only; the aarch64 twin is untouched.
+
+/// D-3: stage ladder values. Monotone — [`vugres_stage`] advances with `fetch_max`, so the record
+/// is the FURTHEST rung, never the latest. `re-parked` deliberately outranks `input-polled`: an app
+/// that drained and then re-parked is further through the story than one that merely drained.
+const VUGRES_STAGE_NONE: u32 = 0;
+const VUGRES_STAGE_WOKEN: u32 = 1;
+const VUGRES_STAGE_PARK_RETURN: u32 = 2;
+const VUGRES_STAGE_POLLED: u32 = 3;
+const VUGRES_STAGE_REPARKED: u32 = 4;
+const VUGRES_STAGE_PRESENT_ENTERED: u32 = 5;
+const VUGRES_STAGE_SUPPRESSED: u32 = 6;
+const VUGRES_STAGE_NOROW: u32 = 7;
+
+/// D-3: how long a resumed slot may go without landing a present — measured against ACTIVE
+/// composition (see the block comment) — before the negative arm fires. Two seconds is ~8 backstop
+/// periods and two orders of magnitude above the measured resume→present gap, so a line here is a
+/// lost request, not a slow one.
+const VUGRES_BOUND_MS: u64 = 2000;
+
+/// D-3: ms timestamp of the resume edge, per slot. `0` = no witness pending — the whole state
+/// machine keys off this word, and both emit paths claim it with an atomic exchange so exactly one
+/// line is ever printed per arm.
+static VUGRES_RESUME_MS: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+/// D-3: the furthest stage the pending resume reached (the ladder above).
+static VUGRES_STAGE: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+/// D-3: [`VUGRES_ACTIVITY`]'s value at the arm — the "has anyone presented since?" baseline.
+static VUGRES_ACTIVITY_AT: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+/// D-3: the last window id this slot carried through a present verb's ownership proof —
+/// `u32::MAX` = never presented. Stamped unconditionally (one relaxed store per present) so the
+/// NEGATIVE line can name the window of a slot that never presents after its resume.
+static VUGRES_LAST_WIN: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(u32::MAX) }; crate::arch::memory::USER_SLOTS];
+/// D-3: presents (any slot, any outcome) that reached the present verbs' tail — the "composition
+/// is answering" clock the negative arm's bound is measured against.
+static VUGRES_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+/// D-3: emit counters — positive / negative lines printed, cumulative. Read by the selftest so its
+/// verdict gates the lines actually printing, not merely the state machine cycling.
+static VUGRES_EMITTED_POS: AtomicU64 = AtomicU64::new(0);
+static VUGRES_EMITTED_NEG: AtomicU64 = AtomicU64::new(0);
+
+/// D-3: the stage's wire name, with the loss reading baked into the token — see the ladder in the
+/// block comment for the long form of each.
+fn vugres_stage_name(stage: u32) -> &'static str {
+    match stage {
+        VUGRES_STAGE_WOKEN => "woken (park never returned)",
+        VUGRES_STAGE_PARK_RETURN => "park-return (ran, never drained)",
+        VUGRES_STAGE_POLLED => "input-polled (drained, never presented)",
+        VUGRES_STAGE_REPARKED => "re-parked (slept again without presenting)",
+        VUGRES_STAGE_PRESENT_ENTERED => "present-entered (composite never landed)",
+        VUGRES_STAGE_SUPPRESSED => "suppressed (wm declined: owner reads hidden)",
+        VUGRES_STAGE_NOROW => "no-row (window died across the pause)",
+        _ => "unarmed",
+    }
+}
+
+/// D-3: arm the witness for `slot`. Returns whether THIS call armed it — a pending witness is
+/// never re-stamped, so a focus+unhide burst measures from its FIRST edge and the caller can
+/// retract an arm whose wake turned out to release nobody ([`vugres_disarm`]).
+///
+/// Called BEFORE the `futex_wake`, deliberately: the released task runs the moment the wake lands,
+/// and an arm issued after it could lose the race against the task's own first present — the
+/// witness would then wait 2 s for a present that already happened and print a false negative.
+/// Armed-then-nobody-woken is the cheap direction to retract; woken-then-not-yet-armed is not.
+fn vugres_arm(slot: usize) -> bool {
+    let now = crate::arch::ms().max(1); // 0 is the "not armed" sentinel
+    if VUGRES_RESUME_MS[slot]
+        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        VUGRES_STAGE[slot].store(VUGRES_STAGE_WOKEN, Ordering::Release);
+        VUGRES_ACTIVITY_AT[slot].store(VUGRES_ACTIVITY.load(Ordering::Relaxed), Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// D-3: retract an arm whose wake released nobody (`futex_wake` returned 0 — the waiter was
+/// evicted between the parked-flag check and the wake). Only the caller that armed may retract.
+fn vugres_disarm(slot: usize) {
+    VUGRES_RESUME_MS[slot].store(0, Ordering::Release);
+    VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
+}
+
+/// D-3: advance the pending witness's stage ladder. One relaxed load on the (overwhelmingly
+/// common) un-armed path; `fetch_max` keeps the FURTHEST rung when armed.
+fn vugres_stage(slot: usize, stage: u32) {
+    if VUGRES_RESUME_MS[slot].load(Ordering::Relaxed) != 0 {
+        VUGRES_STAGE[slot].fetch_max(stage, Ordering::AcqRel);
+    }
+}
+
+/// D-3: the present verbs' PRE-composite hook — a present from `slot` carrying window `id` passed
+/// the ownership proof and is about to enter the composite. The `last_win` stamp is unconditional
+/// so the negative line can name a window even for a slot whose post-resume present never happens.
+fn vugres_present_enter(slot: usize, id: usize) {
+    VUGRES_LAST_WIN[slot].store(id as u32, Ordering::Relaxed);
+    vugres_stage(slot, VUGRES_STAGE_PRESENT_ENTERED);
+}
+
+/// D-3: the present verbs' POST-composite hook — the outcome is in. A landing outcome
+/// (`Composited`/`Coalesced`) claims the pending witness and prints the ONE positive line; a
+/// non-landing outcome only advances the ladder, because the app may retry and land the next one.
+/// Every call bumps the activity clock, armed or not — that is the negative arm's evidence that
+/// composition was answering while this slot's present was not landing.
+fn vugres_present_outcome(slot: usize, id: usize, outcome: crate::video::wm::Presented) {
+    use crate::video::wm::Presented;
+    VUGRES_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+    if VUGRES_RESUME_MS[slot].load(Ordering::Relaxed) == 0 {
+        return; // fast path: no witness pending on this slot
+    }
+    match outcome {
+        Presented::Composited | Presented::Coalesced => {
+            let t0 = VUGRES_RESUME_MS[slot].swap(0, Ordering::AcqRel);
+            if t0 != 0 {
+                VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
+                VUGRES_EMITTED_POS.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    "[vugres] first present win={} asid={} gap_ms={}",
+                    id,
+                    slot + 1,
+                    crate::arch::ms().saturating_sub(t0)
+                );
+            }
+        }
+        Presented::Suppressed => vugres_stage(slot, VUGRES_STAGE_SUPPRESSED),
+        Presented::NoRow => vugres_stage(slot, VUGRES_STAGE_NOROW),
+    }
+}
+
+/// D-3: the NEGATIVE arm — swept from [`user_input_wake_backstop`]'s existing ~256 ms cadence, so
+/// it costs the hot path nothing. A witness pending past [`VUGRES_BOUND_MS`] while the activity
+/// clock advanced (composition was answering) is a lost first present: claim it, print the furthest
+/// stage, and name the slot's last-known window.
+fn vugres_backstop() {
+    let now = crate::arch::ms();
+    let act = VUGRES_ACTIVITY.load(Ordering::Relaxed);
+    for slot in 0..crate::arch::memory::USER_SLOTS {
+        let t0 = VUGRES_RESUME_MS[slot].load(Ordering::Acquire);
+        if t0 == 0 || now.saturating_sub(t0) < VUGRES_BOUND_MS {
+            continue;
+        }
+        if act == VUGRES_ACTIVITY_AT[slot].load(Ordering::Relaxed) {
+            continue; // nobody has presented since the arm — composition idle/dead; not this lane's verdict
+        }
+        if VUGRES_RESUME_MS[slot]
+            .compare_exchange(t0, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue; // a present landed under us and claimed the witness — its line is the truth
+        }
+        let stage = VUGRES_STAGE[slot].swap(VUGRES_STAGE_NONE, Ordering::AcqRel);
+        let win = VUGRES_LAST_WIN[slot].load(Ordering::Relaxed);
+        VUGRES_EMITTED_NEG.fetch_add(1, Ordering::Relaxed);
+        if win == u32::MAX {
+            serial_println!(
+                "[vugres] NO PRESENT since resume win=? — request lost at {} asid={} gap_ms={}",
+                vugres_stage_name(stage),
+                slot + 1,
+                now.saturating_sub(t0)
+            );
+        } else {
+            serial_println!(
+                "[vugres] NO PRESENT since resume win={} — request lost at {} asid={} gap_ms={}",
+                win,
+                vugres_stage_name(stage),
+                slot + 1,
+                now.saturating_sub(t0)
+            );
+        }
+    }
+}
+
+/// D-3: teardown clear, beside the vugpause2 state it shadows — a dead slot's pending witness must
+/// not fire a NO PRESENT against the next tenant. Called from [`clear_input_parked`], the same
+/// funnel that clears the park flag.
+fn vugres_clear(slot: usize) {
+    VUGRES_RESUME_MS[slot].store(0, Ordering::Release);
+    VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
+    VUGRES_LAST_WIN[slot].store(u32::MAX, Ordering::Release);
+}
+
+// ---- D-3 RESUMEPAINT selftest — one real pause/resume cycle, both witness arms ----------------
+//
+// No QEMU leg drove `vugpause2` pause/resume at all before this (the resume edges were
+// metal-only by construction, exactly the hole x86-wc.spec's header describes for DMGOVLP), so the
+// fixture makes its own: a kernel task REALLY parks on a slot's input futex the way
+// `sys_input_wait` does, a REAL `set_hidden(asid, false)` unhide edge releases it (the same seam,
+// the same `[vugpause2] resume` line), and the released task then either walks the resumed vug's
+// present path (leg 1 — the positive line, with a genuine scheduler-and-composite gap in it) or
+// goes silent (leg 2 — the negative line, with the bound run down against bystander presents that
+// keep the activity clock honest). The compositor rows are minted on `clickroute_selftest`'s
+// static-surface idiom; the slot is the TOP one, which no other fixture in the battery occupies.
+
+/// The fixture's 8x8 ARGB surface — the `hittest_selftest` geometry, one static for both rows.
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[repr(align(4))]
+struct VugresSurf([u32; 64]);
+#[cfg(all(feature = "witness", feature = "wc"))]
+static VUGRES_SURF: VugresSurf = VugresSurf([0x0060_3020; 64]);
+
+/// wm id of the fixture's vug row, for the park task (spawn carries one `usize`, and that is the slot).
+#[cfg(all(feature = "witness", feature = "wc"))]
+static VUGRES_FIX_WMID: AtomicU32 = AtomicU32::new(0);
+/// Park-task lifecycle: bumped when a spawned park task finishes its leg, so the fixture never
+/// tears the rows down under a task still using them.
+#[cfg(all(feature = "witness", feature = "wc"))]
+static VUGRES_FIX_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// D-3 fixture stand-in for a parked vug. Replicates `sys_input_wait`'s park for `slot` (same
+/// futex key, same TAIL word, same PARKED discipline), RE-PARKING across the backstop's blind
+/// ~256 ms wakes until a NAMED edge releases it — the backstop does not arm the witness, so an
+/// armed witness is the proof the wake was the edge's. The PRESENT variant (`arg` bit 8) then
+/// walks the resumed vug's own path: park-return, drain, first present through the same
+/// `wc_shim`/witness tail the syscall verbs use. The bare variant goes silent instead — it IS the
+/// negative leg's lost request.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn vugres_park_task(arg: usize) {
+    let slot = arg & 0xFF;
+    let present = arg & 0x100 != 0;
+    let key = input_futex_key(slot);
+    let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[slot]) as u64;
+    for _ in 0..64 {
+        let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
+        USER_INPUT_PARKED[slot].store(true, Ordering::Release);
+        let _ = crate::arch::sched::futex_wait(key, uaddr, tail);
+        USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+        if VUGRES_RESUME_MS[slot].load(Ordering::Acquire) != 0 {
+            break; // a NAMED edge armed the witness before waking us; blind wakes never do
+        }
+    }
+    vugres_stage(slot, VUGRES_STAGE_PARK_RETURN);
+    if present {
+        // The resumed app drains its ring and re-renders before its first present — a few ms of
+        // real scheduler time, so the printed gap is a measured one, not an arranged zero.
+        crate::arch::sched::sleep_ms(3);
+        vugres_stage(slot, VUGRES_STAGE_POLLED);
+        let wmid = VUGRES_FIX_WMID.load(Ordering::Acquire);
+        vugres_present_enter(slot, wmid as usize);
+        let outcome = wc_shim::present(wmid, (slot as u64) + 1);
+        vugres_present_outcome(slot, wmid as usize, outcome);
+    }
+    VUGRES_FIX_DONE.fetch_add(1, Ordering::AcqRel);
+}
+
+/// D-3 RESUMEPAINT fixture — both arms of the resume-edge witness, driven end to end. One-shot,
+/// self-cleaning (rows closed, park/witness state cleared through the same funnels teardown uses).
+/// See the block comment above for the shape; the verdict line gates that both LINES printed, not
+/// merely that the state machine cycled.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn vugres_selftest(cpu: usize) {
+    use crate::video::wm;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[vugres] selftest -> SKIP (framebuffer not ready)");
+            return;
+        }
+    }
+    // The TOP slot and its neighbour: no other fixture in the battery occupies them, and both are
+    // pure static state — `set_hidden`'s doc says a slot with no live tenant is harmless to write.
+    let slot = crate::arch::memory::USER_SLOTS - 1;
+    let bslot = slot - 1;
+    let asid = (slot as u64) + 1;
+    let basid = (bslot as u64) + 1;
+    let s = &raw const VUGRES_SURF as usize;
+    let len = core::mem::size_of_val(&VUGRES_SURF);
+    let wv = wm::create(asid, s, len, 8, 8, 32, b"vr-vug");
+    let wb = wm::create(basid, s, len, 8, 8, 32, b"vr-by");
+    if wv == wm::WIN_NONE || wb == wm::WIN_NONE {
+        serial_println!("[vugres] selftest -> SKIP (window table full: v={} b={})", wv, wb);
+        wm::close(wv);
+        wm::close(wb);
+        return;
+    }
+    VUGRES_FIX_WMID.store(wv, Ordering::Release);
+
+    // ---- leg 1: the POSITIVE line — pause, park, unhide edge, first present ----
+    set_hidden(asid, true);
+    VUGRES_FIX_DONE.store(0, Ordering::Release);
+    crate::arch::sched::spawn(
+        "vugres-park",
+        vugres_park_task,
+        slot | 0x100,
+        cpu,
+        crate::arch::sched::PRIO_NORMAL,
+    );
+    let mut deadline = crate::arch::ticks() + 1000;
+    while !USER_INPUT_PARKED[slot].load(Ordering::Acquire) && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    let pos_before = VUGRES_EMITTED_POS.load(Ordering::Relaxed);
+    // Fire the unhide edge; retried because the blind backstop can race the park window (the task
+    // re-parks on a blind wake, but an edge landing IN that window wakes nobody and retracts).
+    'pos: for _ in 0..10 {
+        set_hidden(asid, false);
+        let until = crate::arch::ticks() + 300;
+        while crate::arch::ticks() < until {
+            if VUGRES_EMITTED_POS.load(Ordering::Relaxed) != pos_before {
+                break 'pos;
+            }
+            crate::arch::sched::yield_now();
+        }
+    }
+    let pos_ok = VUGRES_EMITTED_POS.load(Ordering::Relaxed) == pos_before + 1;
+    deadline = crate::arch::ticks() + 1000;
+    while VUGRES_FIX_DONE.load(Ordering::Acquire) == 0 && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // ---- leg 2: the NEGATIVE line — pause, park, unhide edge, and the present never comes ----
+    set_hidden(asid, true);
+    crate::arch::sched::spawn(
+        "vugres-park2",
+        vugres_park_task,
+        slot,
+        cpu,
+        crate::arch::sched::PRIO_NORMAL,
+    );
+    deadline = crate::arch::ticks() + 1000;
+    while !USER_INPUT_PARKED[slot].load(Ordering::Acquire) && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    let neg_before = VUGRES_EMITTED_NEG.load(Ordering::Relaxed);
+    'arm: for _ in 0..10 {
+        set_hidden(asid, false);
+        let until = crate::arch::ticks() + 300;
+        while crate::arch::ticks() < until {
+            if VUGRES_RESUME_MS[slot].load(Ordering::Acquire) != 0 {
+                break 'arm;
+            }
+            crate::arch::sched::yield_now();
+        }
+    }
+    let armed = VUGRES_RESUME_MS[slot].load(Ordering::Acquire) != 0;
+    // Run the bound down with the activity clock HONESTLY advancing: bystander presents from the
+    // neighbour slot, through the same witness tail, ~10/s — the "active composition" the negative
+    // arm's 2 s is measured against.
+    deadline = crate::arch::ticks() + 3500;
+    let mut next_by = 0u64;
+    while armed
+        && VUGRES_EMITTED_NEG.load(Ordering::Relaxed) == neg_before
+        && crate::arch::ticks() < deadline
+    {
+        let now = crate::arch::ticks();
+        if now >= next_by {
+            next_by = now + 100;
+            vugres_present_enter(bslot, wb as usize);
+            let o = wc_shim::present(wb, basid);
+            vugres_present_outcome(bslot, wb as usize, o);
+        }
+        crate::arch::sched::yield_now();
+    }
+    let neg_ok = VUGRES_EMITTED_NEG.load(Ordering::Relaxed) == neg_before + 1;
+
+    // ---- teardown: rows closed, park/witness state cleared through the same funnels ----
+    deadline = crate::arch::ticks() + 1000;
+    while VUGRES_FIX_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    wm::close(wv);
+    wm::close(wb);
+    clear_input_parked(slot);
+    clear_hidden(slot);
+    vugres_clear(bslot);
+    if pos_ok && neg_ok {
+        serial_println!("[vugres] selftest pos={} neg={} -> PASS", pos_ok, neg_ok);
+    } else {
+        serial_println!(
+            "[vugres] selftest pos={} neg={} armed={} done={} -> FAIL",
+            pos_ok,
+            neg_ok,
+            armed,
+            VUGRES_FIX_DONE.load(Ordering::Acquire)
+        );
+    }
+}
+
 /// VUGPAUSE-2/x86: the synthetic futex key for `slot`'s input ring.
 ///
 /// `sched::futex_key` builds a user key as `((slot + 1) << 56) | (uaddr & 0x00FF_FFFF_FFFF_FFFF)`,
@@ -4978,6 +5423,10 @@ fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
     if !USER_INPUT_PARKED[slot].load(Ordering::Acquire) {
         return 0; // fast path: nobody has parked on this ring
     }
+    // D-3 RESUMEPAINT: arm the first-present witness BEFORE the wake, so the released task cannot
+    // outrun it — see `vugres_arm` for the race this ordering closes. Named edges only: the
+    // router's per-event wake is a running app being fed, not a resume.
+    let armed = if !edge.is_empty() { vugres_arm(slot) } else { false };
     let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
     if n != 0 {
         USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
@@ -4990,6 +5439,10 @@ fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
                 );
             }
         }
+    } else if armed {
+        // The waiter was evicted between the parked-flag check and the wake — nobody actually
+        // resumed, so there is no first present to wait for. Retract, never false-alarm.
+        vugres_disarm(slot);
     }
     n
 }
@@ -5012,6 +5465,9 @@ pub fn user_input_wake_backstop() {
             USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
+    // D-3 RESUMEPAINT: the negative arm rides this existing cadence — a pending witness past its
+    // bound (against active composition) is a lost first present, and this is where it says so.
+    vugres_backstop();
 }
 
 /// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no ring-3 target — the shell
@@ -5473,6 +5929,9 @@ fn clear_input_parked(slot: usize) {
     if slot < crate::arch::memory::USER_SLOTS {
         USER_INPUT_PARKED[slot].store(false, Ordering::Release);
         USER_INPUT_RESUMES[slot].store(0, Ordering::Relaxed);
+        // D-3 RESUMEPAINT: a dead slot's pending resume witness dies with it — the next tenant must
+        // not inherit a NO PRESENT clock it never armed.
+        vugres_clear(slot);
     }
 }
 
@@ -5540,8 +5999,15 @@ fn sys_input_wait() -> i64 {
     }
     let key = input_futex_key(slot);
     let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[slot]) as u64;
+    // D-3 RESUMEPAINT: an armed slot going BACK to sleep is a rung on the loss ladder — the app
+    // woke, concluded it had nothing to do, and never presented. One relaxed load when un-armed.
+    vugres_stage(slot, VUGRES_STAGE_REPARKED);
     let r = crate::arch::sched::futex_wait(key, uaddr, tail);
     USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+    // D-3 RESUMEPAINT: the woken task made it back to ring 3's doorstep — `woken` is no longer the
+    // furthest rung. (A `Mismatch`/backstop return walks this too; harmless — the ladder is monotone
+    // and un-armed slots cost one relaxed load.)
+    vugres_stage(slot, VUGRES_STAGE_PARK_RETURN);
     match r {
         // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the
         // caller's next drain is the thing that decides, so both are simply "go look".
@@ -5582,6 +6048,9 @@ fn sys_input_poll() -> i64 {
     let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
         return EAGAIN;
     };
+    // D-3 RESUMEPAINT: the resumed app is draining its ring — the request survived to the app's own
+    // event loop. One relaxed load on every un-armed poll (the common case).
+    vugres_stage(slot, VUGRES_STAGE_POLLED);
     let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
     let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
     if head == tail {
@@ -16918,6 +17387,12 @@ fn winx_launcher(demo_cpu: usize) {
     // rule), and it MOVES the real pointer, which no earlier fixture may inherit either.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::video::wm::dmgovlp_selftest();
+    // VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness, both arms, and the
+    // ladder's new tail. After DMGOVLP because its negative leg deliberately runs a 2 s bound down
+    // (nothing after it should wait behind that), and it is otherwise the least disruptive fixture
+    // here: it moves no pointer, re-tiles nothing, and its two rows are its own and closed on exit.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    vugres_selftest(demo_cpu);
 }
 
 // =============================================================================================
