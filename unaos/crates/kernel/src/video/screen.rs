@@ -393,17 +393,17 @@ pub static BACK_STORE_LEN: core::sync::atomic::AtomicUsize =
 // ── DESKPAR — WCD-TEARDOWN's `desk=` epoch. **PORTED, in the countable half.** ───────────────────
 //
 // `wm::DeskWriteGuard` brackets the loop that copies background spans to glass and bumps
-// `wm::PANEL_DESK_EPOCH`/`PANEL_DESK_ACTIVE`; it is `all(witness, x86_64)`, so on aarch64 the loop
-// runs completely uninstrumented — a desktop present that lands on a window's pixels leaves no trace
-// at all. The COUNTING half of that needs nothing from `wm`: the bracket is in THIS function, and an
+// `wm::PANEL_DESK_EPOCH`/`PANEL_DESK_ACTIVE`. ORIN-VPAR found it `all(witness, x86_64)`, leaving the
+// loop uninstrumented here — a desktop present landing on a window's pixels left no trace at all —
+// and recovered the COUNTING half without leaving this file: the bracket is in THIS function, and an
 // epoch, a live depth and a byte total can be kept and drained here. That is what [`DeskParGuard`]
 // below is, and the `:: DESKPAR:` line drains every counter it defines.
 //
-// WHAT IS **NOT** PORTED, stated so the line is not read as full parity: `[wc-d]`'s panel-write
+// ~~WHAT IS **NOT** PORTED, stated so the line is not read as full parity: `[wc-d]`'s panel-write
 // INTERLOCK consults `PANEL_DESK_ACTIVE` from the COMPOSITOR side, and a `screen.rs`-local static
-// cannot serve that — `wm` would have to read it, which is a `wm.rs` edit and another seat's lane.
-// So aarch64 gains "the desktop write loop ran N times and moved B bytes" and does not gain "the
-// compositor declined to tear down while it was running". `interlock=absent` on the line says so.
+// cannot serve that — `wm` would have to read it, which is a `wm.rs` edit and another seat's lane.~~
+// STRUCK by DESKHALF, which held that lane and widened `wm::DeskWriteGuard` itself: the static exists
+// on aarch64 and `[wc-d]` prints `desk=`/`dact=` here. What DESKPAR still adds is stated below.
 //
 // ── SCENEPAR — `paint_desktop_scene`. **EQUIVALENT — declined for a STRUCTURAL reason.** ─────────
 //
@@ -458,13 +458,13 @@ static VPAR_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
 const DESKPAR_EMIT_EVERY: u64 = 256;
 
-/// ORIN-VPAR/DESKPAR — the aarch64 counterpart of `wm::DeskWriteGuard`, kept HERE rather than in
-/// `wm` for one reason: `wm::DeskWriteGuard` is `all(witness, x86_64)` and `video/wm.rs` is another
-/// seat's lane on this arc. The bracket it needs to wrap is in this file, and the counters it feeds
-/// are drained in this file, so nothing about the countable half requires crossing that line.
+/// ORIN-VPAR/DESKPAR — the aarch64 counterpart of `wm::DeskWriteGuard`. ~~Kept HERE rather than in
+/// `wm` because that file was another seat's lane on this arc.~~ SPENT — DESKHALF widened
+/// `wm::DeskWriteGuard` — and this stays anyway, on a better reason: `desk=`/`dact=` sample a verdict's
+/// two boundaries; these free-run and carry `active_max=`/`bytes=`. Two questions, one loop.
 ///
-/// Same shape and same reading rule as the x86 guard: `enter()` bumps the epoch and the live depth,
-/// `Drop` releases the depth, and the epoch counts loops ENTERED — never rows written.
+/// Same reading rule as the `wm` guard: `enter()` bumps the epoch and the live depth, `Drop` releases
+/// the depth, and the epoch counts loops ENTERED — never rows written.
 #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
 struct DeskParGuard;
 
@@ -1773,14 +1773,14 @@ impl Screen {
         // since the case that motivated it paints a VACATED box, where the subtraction succeeds
         // against the current table. See `wm::PANEL_DESK_EPOCH` for the full ledger, including why
         // `[wc-d]` prints this term rather than aborting on it.
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // DESKHALF — the widen; this is `enter`'s ONLY call site in the tree
         let _desk = super::wm::DeskWriteGuard::enter();
-        // ORIN-VPAR/DESKPAR — the SAME bracket, around the SAME loop, on aarch64. `wm::DeskWriteGuard`
-        // is `all(witness, x86_64)`, so without this the loop below is entirely uninstrumented on this
-        // arch: `desk=` has no aarch64 field, and a desktop present that walks over a window's pixels
-        // leaves nothing behind for a capture to convict it with. See the ORIN-VPAR block above the
-        // statics for what this does and does NOT recover (the epoch/depth/bytes, not `[wc-d]`'s
-        // compositor-side interlock, which would need a `wm` reader this arc may not add).
+        // ORIN-VPAR/DESKPAR — the SAME bracket, around the SAME loop, kept BESIDE the widened one and
+        // not retired by it. `desk=`/`dact=` above are sampled at a `[wc-d]` verdict's two boundaries;
+        // these four counters are free-running and carry `active_max=` and `bytes=`, which no
+        // verdict-scoped pair can. DESKPAR is also `orinvpar`-gated and off by default, so a plain
+        // `witness` aarch64 boot has the widened bracket or nothing. What DID die here is the
+        // interlock apology on the `:: DESKPAR:` line — `wm::PANEL_DESK_ACTIVE` is no longer absent.
         #[cfg(all(feature = "witness", feature = "orinvpar", target_arch = "aarch64"))]
         let _deskpar = DeskParGuard::enter();
         for idx in 0..n {
@@ -1896,8 +1896,8 @@ impl Screen {
             if epoch == 1 || epoch % DESKPAR_EMIT_EVERY == 0 {
                 serial_println!(
                     ":: DESKPAR: arch=aarch64 item=WCD-TEARDOWN desk={} active={} active_max={} \
-                     bytes={} interlock=absent blocked_on=wm::PANEL_DESK_ACTIVE \
-                     blocker_gate=witness+x86_64 :: PORTED ::",
+                     bytes={} interlock=diagnostic blocked_on=none \
+                     reader=wc-d:desk=,dact= :: PORTED ::",
                     epoch,
                     DESKPAR_ACTIVE.load(Relaxed),
                     DESKPAR_ACTIVE_MAX.load(Relaxed),

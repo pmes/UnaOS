@@ -6552,8 +6552,8 @@ fn verify_window(
     // can see it — `bad` is 0 and `moved` is 0, because the source never moved — so it lands on the
     // PASS arm, which is why the PASS line carries the interlock reading too. See there.
     if !stable && (!ok || moved > 0) {
-        #[cfg(target_arch = "x86_64")] let (dk0, dk1, da0, da1) = (seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active);
-        #[cfg(not(target_arch = "x86_64"))] let (dk0, dk1, da0, da1) = ("n/a", "n/a", "n/a", "n/a");
+        // DESKHALF — one binding, both arches; the `n/a` fallback retired with the writer's arch gate.
+        let (dk0, dk1, da0, da1) = (seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active);
         let aborts = if wi < WCD_IDS { // Odometer first, unbudgeted, before the budget test.
             WCD_ABORTS[wi].fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
         } else {
@@ -6700,9 +6700,9 @@ fn verify_window(
         // not a defect in the compositor.
         // WCD-TEARDOWN — a LIVE verdict is the one place a foreign panel write can hide with `ok`
         // still true (WCD-PRE files such a pixel under `moved`, not `bad`), so the interlock's reading
-        // rides this line even when the abort did not fire. Two cfg'd emissions rather than a shim:
-        // aarch64 has no interlock and its line must stay byte-identical to the pre-interlock wire.
-        #[cfg(target_arch = "x86_64")]
+        // rides this line even when the abort did not fire. ~~Two cfg'd emissions rather than a shim:
+        // aarch64 has no interlock and its line must stay byte-identical to the pre-interlock wire.~~
+        // DESKHALF — ONE emission now, both arches; the twin's slot is below.
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
@@ -6711,15 +6711,15 @@ fn verify_window(
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
-        #[cfg(not(target_arch = "x86_64"))]
-        serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} -> LIVE (unverifiable)",
-            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum(), cksum_pre, seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active
-        );
+        // DESKHALF — the aarch64 twin of the line above stood here and is RETIRED (its premise, struck
+        // above, died with the writer's arch gate). This arch has a DESK reading now, so a twin would
+        // print the same four fields from the same statics under a second format string — the classic
+        // way a pair drifts. READING RULE, kept here because the code that carried it is gone: a
+        // pre-DESKHALF aarch64 capture has NO `desk=`/`dact=` on its LIVE, PASS or FAIL lines and
+        // `desk=n/a->n/a dact=n/a/n/a` on its abort line. Both mean "the term was not compiled", NOT
+        // a quiet desktop layer. After this commit the line reads field for field as an x86 one does.
     } else if ok {
-        // WCD-TEARDOWN — the interlock's reading rides the PASS line too, on x86.
+        // WCD-TEARDOWN — the interlock's reading rides the PASS line too (~~on x86~~ both arches).
         //
         // This is the verdict shape the HEALING exposure produces, and the one the first cut left
         // mute. Where a fill's colour happens to equal `want`, it repairs a genuinely garbled pixel:
@@ -6731,7 +6731,7 @@ fn verify_window(
         // `REQUIRE`s for a condition that is usually benign, trading a rare unreadable PASS for a
         // routine red. Printing the reading keeps the verdict where the gates expect it and makes the
         // exposure visible.
-        #[cfg(target_arch = "x86_64")]
+        // DESKHALF — ONE emission now, both arches; the twin's slot is below.
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
@@ -6740,13 +6740,13 @@ fn verify_window(
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active, yn(stable)
         );
-        #[cfg(not(target_arch = "x86_64"))]
-        serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} stable={} -> PASS",
-            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum(), seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active, yn(stable)
-        );
+        // DESKHALF — the retired twin's slot, and the proof the widen had to produce first. The test is
+        // not "does it compile" but CAN IT FIRE: an instrument that exists in the state it was written
+        // for and never runs there is an absent one in compiled clothes. BOTH ends were checked on
+        // aarch64 first. WRITER — `TargetPal::render` is `surface.flush()`, `flush` calls
+        // `present_background`, the Orin's `jd2_console_pump` drives it at console cadence, and
+        // ORIN-VPAR's `DeskParGuard` brackets the identical statement and drains a FIRED `:: DESKPAR:`
+        // line. READER — `verify_window` has no arch term; `pi4-regression.spec` REQUIREs its `-> PASS`.
     } else {
         // WCD-TEARDOWN — the FAIL line carries the interlock reading too, and this arm is the reason
         // the whole mechanism exists.
@@ -6759,7 +6759,7 @@ fn verify_window(
         // `bad_cache=0 bad_ram=197376 ... fills=4->4 fact=0/0 desk=118->121 dact=0/1` and can convict
         // the desktop layer from the line, which is the whole point of printing a term this witness
         // has deliberately declined to abort on.
-        #[cfg(target_arch = "x86_64")]
+        // DESKHALF — ONE emission, and THIS is the arm the port was for; see below.
         serial_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
@@ -6769,14 +6769,14 @@ fn verify_window(
             seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active,
             seq.desk, seq_end.desk, seq.desk_active, seq_end.desk_active
         );
-        #[cfg(not(target_arch = "x86_64"))]
-        serial_println!(
-            "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} -> FAIL",
-            r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
-            checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
-            occluded, occ_before.count(), occ_after.count(), cksum(),
-            first.0, first.1, first.2, first.3, seq.fills, seq_end.fills, seq.fill_active, seq_end.fill_active
-        );
+        // DESKHALF — the retired twin's slot, and the argument for the whole port. A recurrence driven
+        // by the DESKTOP LAYER moves `desk=` and moves no fill, so `stable` stays true, the abort does
+        // not fire, and the verdict lands HERE. The aarch64 twin printed this arm MUTE on exactly that
+        // reading: a Pi or an Orin could reproduce boot 8 and the capture would carry nothing to convict
+        // the desktop with. It now carries `desk=118->121 dact=0/1` like the rMBP's. Nothing else moved
+        // — `desk=` is in no abort test on either arch (the abort is `!stable && (!ok || moved > 0)`,
+        // and `stable` reads the FILL ring only), and `pi4-regression.spec`'s two `[wc-d]` directives
+        // match with `.*` across the field region. Slots kept as comment: line numbers are load-bearing.
     }
     // WC-D/PAYGO — the battery's terminal line, emitted right behind the verdict that closed it. `step ==
     // 1` is "this pass ran at full HORIZONTAL coverage", and `full` adds "and reached the box's last
@@ -7543,12 +7543,12 @@ static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 
 // ---- WCD-TEARDOWN — the panel-write interlock the read-back adjudicates against -----------------
 //
-// x86_64 ONLY, and the arch gate is a protection boundary rather than a scoping convenience. This
-// interlock can convert a `-> FAIL` into a `-> SKIP`, and `scripts/specs/pi4-regression.spec`'s
-// `FORBID \[wc-d\] verify .*-> FAIL` is another track's gate reading this witness's wire. A
-// feature-gated interlock would therefore have weakened a live protection on a bench this seat does
-// not own and cannot re-run. aarch64 keeps the pre-interlock behaviour verbatim: one verdict, no
-// abort, no release, no new field on any line.
+// ~~x86_64 ONLY, and the arch gate is a protection boundary rather than a scoping convenience.~~
+// STRUCK TWICE OVER, and left visible because it was quoted forward. WMPAR ported the FILL half —
+// `panel_stable`, `vrect` and the abort arm with it — so the FAIL->SKIP conversion this paragraph
+// guarded has been arch-neutral since that commit and the header outlived its subject. DESKHALF
+// finished it: the DESK half below is `witness`-gated too. `pi4-regression.spec`'s `FORBID \[wc-d\]
+// verify .*-> FAIL` is untouched — `desk=` is in NO abort test on EITHER arch. Ledger below.
 
 /// WCD-TEARDOWN — the desktop layer's blit loop: a monotone count of entries, paired with
 /// [`PANEL_DESK_ACTIVE`] for the in-flight half.
@@ -7574,15 +7574,15 @@ static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 /// read `0x000000`: `fbcon`'s `BG_DEFAULT`, console background. No erase can produce that colour.
 ///
 /// **Model 2 — an "intrusion" counter — was refuted by the code.** It counted
-/// `Screen::present_background`'s return value, on the strength of that function's own doc ("wrote
-/// background pixels INTO the window layer"). But that function has exactly three exits and ALL of
-/// them return `false`; there has been no `true` exit since WC-I made the subtraction exact, and the
-/// comment above its last `return` is visibly confused about this. The counter could never leave
-/// zero, so the stability term built on it was a TAUTOLOGY and the interlock was fill-only — which is
-/// the state it had already been bounced in. It would also have been the wrong SHAPE if wired: the
-/// scenario it was written for (a `request_full_present` armed at close/move, the write landing
-/// later) paints the VACATED box, and the subtraction succeeds against the CURRENT table there, so
-/// `intruded` stays false even when background pixels land exactly where a verdict is outstanding.
+/// `Screen::present_background`'s return value, which has three exits all returning `false` since
+/// WC-I made the subtraction exact — a TAUTOLOGY, leaving the interlock fill-only. It was also the
+/// wrong SHAPE: the scenario it was written for paints a VACATED box, where the subtraction succeeds
+/// against the current table, so `intruded` stays false with a verdict outstanding.
+///
+/// ### DESKHALF — the census these two statics rest on, re-run rather than inherited
+/// [`DeskWriteGuard`] is a field-less `pub(super)` unit struct named in exactly two places (inside
+/// `enter` and in its own declaration), so `enter()` is the only expression that can bump either
+/// static; both are module-private; `screen.rs`'s blit loop is the only call in the tree.
 ///
 /// **What is counted now is the desktop layer's actual blit loop** — the `for idx in 0..n` over the
 /// damage set that copies background spans to glass — bracketed at its real boundaries, so the term
@@ -7590,15 +7590,15 @@ static VERIFIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 ///
 /// ### It is DIAGNOSTIC, not a veto, and that is a deliberate asymmetry
 ///
-/// `desk=` is printed on every x86 verdict and is NOT in the abort test. The loop runs on every
-/// present, so "a desktop blit was in flight" is true for essentially every read-back on a live
-/// desktop; putting it in the test would abandon every verdict and adjudicate nothing. Scoping it the
-/// way the fill ring is scoped needs the per-rect geometry of another module's hot loop, which is not
-/// this arc's to restructure. So the honest arrangement is: the FILL term decides, the DESK term is
+/// `desk=` is printed on every verdict (~~x86~~ BOTH arches since DESKHALF) and is NOT in the abort
+/// test on either. The loop runs on every present, so "a desktop blit was in flight" is true for
+/// essentially every read-back on a live desktop; putting it in the test would abandon every verdict
+/// and adjudicate nothing. Scoping it the way the fill ring is scoped needs the per-rect geometry of
+/// another module's hot loop. So the honest arrangement is: the FILL term decides, the DESK term is
 /// on the wire in full (`desk=E0->E1 dact=A0/A1`) so that the next recurrence of boot 8 is read off
 /// the line instead of re-derived from the capture. Boot 8's own signature — the abort not firing
-/// while `desk=` moved — is exactly what would convict the desktop layer, and it is now printable.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+/// while `desk=` moved — is what would convict the desktop layer, and it prints on both arches now.
+#[cfg(feature = "witness")] // DESKHALF — arch-neutral; census above, can-it-fire proof at the PASS arm
 static PANEL_DESK_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// WCD-TEARDOWN — desktop blit loops in flight. With [`PANEL_DESK_EPOCH`] this is a true bracket on
@@ -7615,16 +7615,16 @@ static PANEL_DESK_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::Ato
 /// that leg is reachable and costed; see [`occluders_aged`].) The
 /// epoch also counts loops that ENTER, not rows written: a fully-occluded present bumps `desk=`
 /// and writes nothing, so `desk=E0->E1` reads "N loops ran", never "N loops wrote".
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // DESKHALF — arch-neutral; see [`PANEL_DESK_EPOCH`] for the census
 static PANEL_DESK_ACTIVE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// WCD-TEARDOWN — the desktop layer's end of the bracket. Called from `Screen::present_background`
-/// around the loop that actually copies background spans to glass. See [`PANEL_DESK_EPOCH`].
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+/// around the loop that copies background spans to glass. Arch-neutral: [`PANEL_DESK_EPOCH`].
+#[cfg(feature = "witness")] // DESKHALF — arch-neutral; census at PANEL_DESK_EPOCH, proof at the PASS arm
 pub(super) struct DeskWriteGuard;
 
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // DESKHALF — arch-neutral
 impl DeskWriteGuard {
     pub(super) fn enter() -> Self {
         PANEL_DESK_ACTIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -7633,7 +7633,7 @@ impl DeskWriteGuard {
     }
 }
 
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // DESKHALF — arch-neutral
 impl Drop for DeskWriteGuard {
     fn drop(&mut self) {
         PANEL_DESK_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
@@ -7718,14 +7718,14 @@ impl Drop for PanelWriteGuard {
     }
 }
 
-/// WCD-TEARDOWN — one reading of every panel-write detector. WMPAR — the FILL half is arch-neutral; the DESK half is NOT ported and its two fields keep the arch term, because [`DeskWriteGuard::enter`] has exactly ONE call site — `video/screen.rs`'s background blit loop — gated `all(witness, x86_64)` in a file this arc may not edit. Readers without the writer would print `desk=0->0` on aarch64: a zero no reader can tell from a measurement, which is the GR13 defect this file convicts three instruments for. Absent beats zero. The remainder is one line in `screen.rs`.
+/// WCD-TEARDOWN — one reading of every panel-write detector. ~~WMPAR — the FILL half is arch-neutral; the DESK half is NOT ported and its two fields keep the arch term, because [`DeskWriteGuard::enter`] has exactly ONE call site — `video/screen.rs`'s background blit loop — gated `all(witness, x86_64)` in a file this arc may not edit.~~ STRUCK by DESKHALF, which widened that one call site. The reason stays visible because it was right at the time and its rule still governs pre-DESKHALF captures: readers without a writer print `desk=0->0`, a zero no capture can tell from a measurement (the GR13 defect this file convicts three instruments for), and absent beats zero. The writer exists on both arches now, so the zero became a measurement.
 #[cfg(feature = "witness")] // WMPAR — WCD-TEARDOWN fill half; arch-neutral, see PANEL_FILL_EPOCH
 #[derive(Clone, Copy)]
 struct PanelSeq {
     fills: u64,
     fill_active: usize,
-    #[cfg(target_arch = "x86_64")] desk: u64,
-    #[cfg(target_arch = "x86_64")] desk_active: usize,
+    desk: u64,          // DESKHALF — arch-neutral, see [`PANEL_DESK_EPOCH`]
+    desk_active: usize, // DESKHALF — arch-neutral, see [`PANEL_DESK_ACTIVE`]
 }
 
 /// WCD-TEARDOWN — the opening read. `EPOCH` before `ACTIVE`, mirrored by [`panel_seq_close`]. With
@@ -7736,9 +7736,9 @@ struct PanelSeq {
 fn panel_seq() -> PanelSeq {
     let fills = PANEL_FILL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
     let fill_active = PANEL_FILL_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
-    #[cfg(target_arch = "x86_64")] let desk = PANEL_DESK_EPOCH.load(core::sync::atomic::Ordering::Acquire);
-    #[cfg(target_arch = "x86_64")] let desk_active = PANEL_DESK_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
-    PanelSeq { fills, fill_active, #[cfg(target_arch = "x86_64")] desk, #[cfg(target_arch = "x86_64")] desk_active }
+    let desk = PANEL_DESK_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+    let desk_active = PANEL_DESK_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    PanelSeq { fills, fill_active, desk, desk_active }
 }
 
 /// WCD-TEARDOWN — the closing read, mirrored (`ACTIVE` then `EPOCH`); see [`panel_seq`].
@@ -7746,9 +7746,9 @@ fn panel_seq() -> PanelSeq {
 fn panel_seq_close() -> PanelSeq {
     let fill_active = PANEL_FILL_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
     let fills = PANEL_FILL_EPOCH.load(core::sync::atomic::Ordering::Acquire);
-    #[cfg(target_arch = "x86_64")] let desk_active = PANEL_DESK_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
-    #[cfg(target_arch = "x86_64")] let desk = PANEL_DESK_EPOCH.load(core::sync::atomic::Ordering::Acquire);
-    PanelSeq { fills, fill_active, #[cfg(target_arch = "x86_64")] desk, #[cfg(target_arch = "x86_64")] desk_active }
+    let desk_active = PANEL_DESK_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    let desk = PANEL_DESK_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+    PanelSeq { fills, fill_active, desk, desk_active }
 }
 
 /// WCD-TEARDOWN — did any desktop-colour fill land on the panel rectangle this verdict read back?
@@ -15836,12 +15836,12 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
     // questions the rMBP is asked, and `x86-witness.spec`'s `FORBID \[drag-occ\] .*-> BLEED` is a
     // gate the arm specs may now adopt verbatim rather than approximate.
     //
-    // **Doc debt, named rather than left to be discovered.** `docs/dev/OS/08_VIDEO/PARITY.md`
-    // documents `[erase-occ]` as ERASECLIP M1/M2 (its §6.10 items, the sample capture, and the two
-    // places that record `[drag-occ]`'s `occclip_*` fields as "deliberately still x86"). All three
-    // statements are stale as of this commit. That file is outside this arc's editable lane, so the
-    // correction is REPORTED and owed, not silently skipped — and this block is where a reader who
-    // arrives from the doc lands.
+    // **Doc debt, named here and PAID by DESKHALF.** `docs/dev/OS/08_VIDEO/PARITY.md` documented
+    // `[erase-occ]` as ERASECLIP M1/M2 (§6.11's M1 row and sample capture) and `[drag-occ]`'s
+    // `occclip_*` as "deliberately still x86" (§3's occlusion row, §6.10 item 2, §6.11 owed item 1).
+    // All four were stale from WMPAR P2 and that arc could not edit the file. DESKHALF held the lane
+    // and struck them in place — superseded claims stay visible, deleted ones get re-derived — and
+    // wrote the field-for-field mapping into §6.16. This is still where a reader from the doc lands.
     //
     // **Why sixty-four lines of comment rather than a deletion.** This file's panic `Location`
     // records embed line numbers, so deleting a block shifts every line below it and moves the x86
