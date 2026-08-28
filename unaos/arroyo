@@ -3265,7 +3265,41 @@ KERNEL_CFG_MATRIX=(
   # — this leg is proven non-vacuous by that measurement). `quarry` joined 2026-08-27 (rmbp 8):
   # its ringless arms landed with 98be87ad, which pre-measured this leg green with `quarry` and
   # deferred the edit here to the seat.
-  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry"
+  #
+  # SECOND HOME FOR `orinvpar` (2026-08-28, orin 10). Until this edit `orinvpar` was named by
+  # EXACTLY ONE leg — `arm-tegra-fbconpar-cross` above — so the ARMED polarity of ELEVEN
+  # `video/screen.rs` items (the four `DESKPAR_*` counters, `VPAR_ONCE`, `DESKPAR_EMIT_EVERY`,
+  # `DeskParGuard` and its two impls, and the two blocks inside `Screen::flush`) was type-checked by
+  # that row and by nothing else. Rename or drop that row and all eleven silently stop being
+  # compiled by anything. The knob→leg coverage check below does NOT catch that: it is a MEMBERSHIP
+  # test, so one leg and twenty read identically to it. This is the state ORIN-VPAR originally
+  # shipped in — `82d9bc97` put the witness behind a default-off knob that no leg named, and the
+  # armed polarity compiled nowhere for weeks before a leg was added to fix it.
+  #
+  # WHY THIS LEG AND NOT A SECOND TEGRA ONE. Every `arm-tegra-*` row shares the same ~21-feature
+  # prefix, so a second tegra host would be a near-copy of the incumbent: the redundancy would be
+  # nominal, and the single edit most likely to remove the incumbent (a rework of the tegra family)
+  # would take the copy with it. This row is the only aarch64 leg carrying `desktop_firmware`
+  # WITHOUT an EL0 layer, so it fails independently of that family. It already carries `witness` —
+  # which all eleven sites require — and `desktop_firmware`, which is the entirety of what the knob
+  # implies (`orinvpar = ["desktop_firmware"]`), so this addition drags in NO new feature.
+  #
+  # AND IT IS THE RIGHT HOME ON THE MERITS. The note above records that this leg exists because
+  # `dock.rs` shipped an E0433 reachable from the DOCUMENTED combo `UNAOS_WITNESS=1
+  # UNAOS_ORINVPAR=1` — it was cut FOR that knob combo and then never armed the knob. Arming it
+  # here also type-checks the claim both knob docs make and no leg tested: that this is an AARCH64
+  # gap and not a Tegra one, so a ringless `desktop_firmware` build answers the same question.
+  #
+  # NON-VACUITY, MEASURED — not inferred from a green run. (EXECGATE is the precedent: twelve green
+  # legs on both arches proved nothing, because no leg carried the feature.) With `DESKPAR_EPOCH`'s
+  # initialiser changed to `AtomicUsize::new(0)`, this leg WITHOUT `orinvpar` exits 0 and WITH it
+  # exits 101 on `error[E0308] ... video/screen.rs:427 ... expected `Atomic<u64>`, found
+  # `Atomic<usize>``. The break was then reverted and screen.rs proved byte-identical.
+  #
+  # UNIVERSE SIDE EFFECT: none. `orinvpar` was already named by an arm-* leg and by no x86 leg, so
+  # `x86_cfg_universe` already dropped it and still does. Board legs +0; gate legs +0 — this widens
+  # an existing row rather than adding one. `./arroyo check` prints the live counts every run.
+  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry,orinvpar"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
