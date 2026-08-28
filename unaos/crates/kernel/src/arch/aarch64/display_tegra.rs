@@ -2676,12 +2676,25 @@ pub fn orin_conwin() -> bool {
     serial_println!(
         "[orinconwin] win={} panel={}x{} cell={}x{} stage={} table={} present={} route={} live={} -> {}",
         win, pw, ph, cw, ch, staged, wm::count(), pres, routed,
-        // LIVE vs FROZEN is the rung's second half and it is read from the BUILD, not from this
-        // function: `jd2_console_pump`'s phase-2 detach is guarded by `tegra_conwin_live()`, which is
-        // this same route. On this build the guard exists, so a routed console stays live — every
-        // kernel line printed after the handoff lands in the window and is composited, damage-limited
-        // and paced, by the machinery `fbcon` already carries.
-        "LIVE",
+        // LIVE vs FROZEN is the rung's second half. It USED TO BE A COMPILE-TIME LITERAL — the string
+        // `"LIVE"`, asserted from the build rather than measured — which is the one thing the block
+        // four lines above this forbids of every other field on this line ("DERIVED from the outcome
+        // CROSSED with the route read back, never asserted"). It is now a READ-BACK, taken here at
+        // print time, of the same `CONSOLE_WIN` cell `tegra_conwin_live()` answers off. Not redundant
+        // with `route=`: that value was sampled BEFORE `present_outcome` and `composite` ran, this one
+        // after, so a route dropped by the present pass can no longer print `live=LIVE`.
+        //
+        // ⚠ WHAT THIS READ-BACK DOES NOT PROVE — stated here so the next reader does not re-derive it.
+        // `fbcon::detach()` sets `GUI_ACTIVE` and does NOT clear `CONSOLE_WIN`, so after a detach
+        // `console_is_routed()` still answers TRUE while `fbcon::_print` returns at its first test and
+        // no further glyph ever reaches the window. This sample is taken before any terminus detach
+        // can have run, so the strongest thing it can say is "the route is installed at this instant",
+        // never "no later detach freezes it". That second half is a BEHAVIOURAL guarantee owned by the
+        // guards on the two detach sites — `main.rs`'s phase-2 line and, as of this arc, the
+        // `tegra_rast_demo_maybe` line that used to detach unguarded AFTER this rung had installed the
+        // route and printed `live=LIVE` — and not by this field. A read-back that could close the gap
+        // needs `GUI_ACTIVE` exposed from `video/fbcon.rs`; that file is outside this arc's lane.
+        if fbcon::console_is_routed() { "LIVE" } else { "FROZEN" },
         if ok && routed { "ROUTED" } else { "PRESENT-DECLINED" }
     );
     routed
