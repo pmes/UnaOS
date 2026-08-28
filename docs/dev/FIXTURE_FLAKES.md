@@ -290,6 +290,43 @@ not of this class.
   1a: a `SWEPT`-and-park handshake so the launcher's re-read happens inside a
   window where the state is provably live, instead of racing a 2000 ms deadline.
 
+### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **suspect only, seen once**
+
+**Signature on the wire** (the verdict's own format, `video/wm.rs:24379`):
+
+```
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=… drag_px=… relay=… narrow=…/12 cur=12/12 adopt=… repaint=… max_ms=… adopt_stretch=0/4 -> FAIL
+```
+
+The fingerprint that identifies the flake rather than a real CURSTICK
+regression is **every other counter green** — `passes=12/12`, `drained=12/12`,
+`cur=12/12` — with only the stretch tally at zero. `x86-wc.spec` REQUIREs
+`adopt_stretch >= 1`, and the doc at `wm.rs:24387` calls RED "structurally
+0/4"; the one sighting shows host contention can produce structural-looking
+0/4 with the fixture otherwise healthy.
+
+**Seen:** once (2026-08-27, TOPPORT re-gate, 1 of 3 `UNAOS_WC=1` runs) on a
+host running a nine-agent fleet. Patch ruled out as cause: the failing run's
+diff adds shell-verb code no spec types, and both a reverse-applied base run
+and a patched re-run on the same host pass `adopt_stretch=4/4`. Artifacts:
+`~/unaos-bench/scratch/rmbp7/topport-regate.out` (the FAIL),
+`topport-baseline-r1.out`, `topport-patched-r3.out`.
+
+**Suspected mechanism:** the stretch passes assert inside a wall-clock window
+(the CURSTICK stretch, `wm.rs:24331` — present+drain must move `CUR3_TAKEN`
+within the pass); a QEMU starved by sibling load can miss all four windows
+without any kernel defect. Same shape as 1a's deadline race, one layer up.
+
+**What to record on the next sighting:** the full verdict line; host load and
+sibling QEMU count at the time; whether an idle-host re-run is clean; and
+`max_ms=` from the failing line vs. a green one — if the failing run's
+`max_ms` is an outlier, the starvation reading is confirmed without a new
+experiment.
+
+**Disposition — WATCH.** Do not clear a gate on this line without an
+idle-host re-run (both benches' standing rule: no single-run red convicts),
+and do not let a clean re-run bury the sighting — bank it here.
+
 ---
 
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
