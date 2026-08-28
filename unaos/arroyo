@@ -895,8 +895,14 @@ _feats=""
 # Default OFF; when unset the seam vanishes, no line moves in any file compiled knob-off (the
 # display_tegra.rs half is a file-tail block; both main.rs edits are statements appended to existing
 # lines), and the jetson image is byte-identical to baseline. The ARMED build is type-checked by the
-# `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX and the `desktop_firmware` cross by `arm-tegra-desk`, not by
-# this mapping. Witness on the wire: `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`
+# `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX and the `desktop_firmware` cross by `arm-tegra-seam`
+# (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-desk` for that cross and
+# `arm-tegra-desk` carries NO `orinclick` — it never compiled the cross. `arm-tegra-seam` does, and
+# that row's own comment has said so since rung 3: "covers the opposite cross — the armed seam with
+# the router's `desktop_firmware` arms compiled in". `arm-tegra-conwin`, `-conwin-tenant`,
+# `-conwin-tenant-input`, `-ladder` and `-furn` carry both terms too), not by
+# this mapping. The `supstate` cross is `arm-tegra-supstate-el0-click`. Witness on the wire:
+# `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`
 # (the census prints every ~10 s from the pump's own loop, so `btn=0 -> IDLE-NO-CLICKS` means "alive,
 # nobody clicked" and a census that STOPS means the pump died — an absent `[clickroute]` is otherwise
 # not evidence of anything).
@@ -1272,7 +1278,11 @@ _feats=""
 # Default OFF => the tail wrapper, its two statics and its call site vanish; the call site is a
 # same-line append to `fbcon::init`'s existing `});`, so no line moves in a file compiled into the
 # knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof. The ARMED polarity is
-# type-checked by the `arm-tegra-orinface` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# type-checked by the `arm-tegra-fbconpar` and `arm-tegra-fbconpar-cross` legs of KERNEL_CFG_MATRIX,
+# never by this mapping (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-orinface`, a leg
+# that HAS NEVER EXISTED — no row of the matrix carries that label. The coverage itself was real, on
+# the two rows now named; an auditor grepping for the label found nothing and would have recorded a
+# hole that is not there).
 # UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
 # `[orinface] MISMATCH`.
 [ -n "${UNAOS_ORINFACE:-}" ] && _feats="${_feats}orinface,"
@@ -1303,7 +1313,9 @@ _feats=""
 # Default OFF => `_print`'s aarch64 arm folds back to the bare `print_masked(args)` it has always
 # been, the five counters and the census vanish, and the jetson AND pi images are byte-identical to
 # baseline. Every wire-in is a same-line fold, so no panic `Location` moves. The ARMED polarity is
-# type-checked by the `arm-tegra-orindefer` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# type-checked by the `arm-tegra-fbconpar` and `arm-tegra-fbconpar-cross` legs of KERNEL_CFG_MATRIX,
+# never by this mapping (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-orindefer`, a
+# leg that HAS NEVER EXISTED — the `arm-tegra-orinface` error one block above, repeated).
 # UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
 # `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`.
 [ -n "${UNAOS_ORINDEFER:-}" ] && _feats="${_feats}orindefer,"
@@ -2478,7 +2490,10 @@ check_user_arch() {
 # without a leg here is a one-line diff to spot. MEASURED on the SDHC-4b tree (2026-08-07), and the
 # claim was stale: the table holds 86 knobs and the three legs' union holds 85 — the one uncovered
 # knob is `nvidia-kepler-kdisp-hold`, the same long-standing gap the GATE-CFG-MIX note below already
-# names and the derived `x86-strict` sweep already closes. Counted, never incremented (re-counted on
+# names and the derived mix legs already close (⚠ CORRECTED 2026-08-28, orin 10: this said "the
+# derived `x86-strict` sweep", and no leg or leg family has ever borne that label — `build_cfg_legs`
+# emits `x86-mix-N`, plus `x86-only-<f>`/`x86-drop-<f>` under UNAOS_CFG_SWEEP=1 only. The RE-COUNTED
+# block below has the accurate account: mix legs 1, 2 and 3 carry both knobs). Counted, never incremented (re-counted on
 # the BCMA-S1 tree, 2026-08-07; and AGAIN on the BT-L0 tree, GR21, where the table holds 87 and the
 # union 86, with `nvidia-kepler-kdisp-hold` still the sole gap): compare the `[features]` table
 # (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
@@ -2494,14 +2509,16 @@ check_user_arch() {
 # LIVE measurement, reproduced with the commands below and not derived from the previous one:
 #
 #     table    150 knobs (`[features]` minus `default`)
-#     board legs' union   140, over the 30 rows of KERNEL_CFG_MATRIX
+#     board legs' union   140, over the 31 rows of KERNEL_CFG_MATRIX
 #     named by no board leg   TEN
 #     derived x86 mix legs    9, over an `x86_cfg_universe` of 76
 #
-# The two rows this arc appended (`arm-tegra-conwin-tenant-input`, `arm-tegra-supstate-el0`) moved
-# the ROW count only: both name knobs that arm-* rows already named, so the arm-only set, the union,
-# `x86_cfg_universe` and the mix-leg count are all untouched by them. The other deltas from the
-# 2026-08-27 figures were already in the tree.
+# The two rows ORIN10-LEGHOLES appended (`arm-tegra-conwin-tenant-input`, `arm-tegra-supstate-el0`)
+# and the one ORIN10-LEGHOLE4 appended (`arm-tegra-supstate-el0-click`, row count 30 -> 31, the only
+# figure above it moved) all moved the ROW count only: each names knobs that arm-* rows already
+# named, so the arm-only set, the union, `x86_cfg_universe` and the mix-leg count are untouched by
+# them. Re-measured 2026-08-28 after the LEGHOLE4 row landed: 150 / 140 / TEN, unchanged. The other
+# deltas from the 2026-08-27 figures were already in the tree.
 #
 # Reproduce it, do not increment it — that is how this note went stale twice:
 #   knobs   awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' \
@@ -2518,7 +2535,16 @@ check_user_arch() {
 # eight legs after it); `wcdvalve` is now on `x86-all`. The ten that remain do NOT all mean the same
 # thing, and the count alone hides the distinction — so each one is classified:
 #
-#   NOT HOLES — genuinely compiled, just not board-named (5). `x86_cfg_universe` inherits every
+#   ⚠ RECLASSIFIED 2026-08-28 (orin 10, ORIN10-LEGHOLE4). The counts above were live; the
+#   CLASSIFICATION of the ten was not, and it was wrong in a way that inverts an audit. It listed
+#   `orinvpar` as a REAL HOLE "named by no arm-* leg either" — but `orinvpar` is named by TWO rows,
+#   `arm-tegra-fbconpar-cross` and `arm-desk-noel0`, and that second row's own comment (added the
+#   SAME DAY, further down this file) says so in as many words: "SECOND HOME FOR `orinvpar`". So the
+#   list enumerated a hole that does not exist, and — because it still said TEN — silently omitted the
+#   knob that actually occupies that slot, `aarch64_el0`, which no leg names literally. Re-derived
+#   with the three commands above: the ten unnamed are `aarch64_el0`, `nvidia-kepler-kdisp-hold`,
+#   `rtpi`, `rtwit`, `selfhost`, `v3d_hubcm`, `v3d_pmcycle`, `v3d_ptbbracket`, `vugdemo`, `vugras`.
+#   NOT HOLES — genuinely compiled, just not board-named (6). `x86_cfg_universe` inherits every
 #   unnamed feature as "unclaimed => assume x86", so these ride the 9 derived mix legs, and their
 #   `#[cfg]` sites are ones an x86 compile actually reaches:
 #     * `nvidia-kepler-kdisp-hold` — three sites in `drivers/gpu/kepler_display.rs`, which is
@@ -2536,22 +2562,31 @@ check_user_arch() {
 #       EXPRESSION (`pub const ARMED: bool = cfg!(feature = "vugras");` — vugras.rs:55). A `cfg!`
 #       type-checks both polarities on every leg, so this knob is covered by construction and cannot
 #       be a hole while that stays true. Re-check if an item gate is ever added.
+#     * `aarch64_el0` — COVERED BY IMPLICATION, a sixth category the previous classification had no
+#       slot for and therefore dropped the knob entirely. It is never named in a leg's feature
+#       string, so the union computed above (which reads the LITERAL third field) does not see it —
+#       but `tegra_el0 = ["tegra", "aarch64_el0"]`, and ELEVEN arm-tegra-* rows carry `tegra_el0`, so
+#       Cargo resolves this knob ON for every one of them and its `arch/aarch64/mod.rs` module gates
+#       are compiled in both polarities. Not a hole; do NOT "fix" it by appending it to a row. The
+#       lesson for the next auditor: the union is a literal-string measurement and undercounts by
+#       exactly the implied features, so a knob missing from it is a QUESTION, not a verdict.
 #
 #   REAL HOLES — swept onto the x86 mix legs by the "assume x86" rule, where every site is behind an
 #   aarch64 qualifier and compiles GREEN and VACUOUS; named by no arm-* leg either, so the armed
-#   polarity is type-checked by NOTHING (5):
+#   polarity is type-checked by NOTHING (4):
 #     * `vugdemo` — the worst of them, because the gate is a MODULE declaration:
 #       `#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))] pub mod vug;` (lib.rs), with the
 #       matching `use` and the two shell verb arms in `shell.rs`. No leg compiles `src/vug.rs` at all
 #       — roughly 1.3 kloc of Ring-0 renderer, plus its `vugras::frame_sweep` call, checked by no
 #       gate in this repo. (Its `cfg!(feature = "vugdemo")` EXPRESSION sites in `shell.rs` are fine,
 #       for the same reason `vugras` is.) Pi lane.
-#     * `orinvpar` — every site is `all(target_arch = "aarch64", feature = "witness", feature =
-#       "orinvpar")` in `video/menubar.rs`, or `all(feature = "orinvpar", target_arch = "aarch64")` in
-#       `video/screen.rs`. The arm-tegra-* legs already carry `witness`, so ONE leg naming this knob
-#       closes it. Jetson lane. Note it implies `desktop_firmware` in Cargo.toml, so arming it on an
-#       x86 mix leg drags an arm-named knob onto x86 today — harmless (it type-checks) but worth
-#       knowing before anyone reads the mix legs' feature strings.
+#       (`orinvpar` WAS listed here and is not a hole — see the RECLASSIFIED note above. Its sites are
+#       `all(target_arch = "aarch64", feature = "witness", feature = "orinvpar")` in
+#       `video/menubar.rs` and `all(feature = "orinvpar", target_arch = "aarch64")` in
+#       `video/screen.rs`, and `arm-tegra-fbconpar-cross` + `arm-desk-noel0` both carry `witness` and
+#       name the knob, so the armed polarity is compiled twice over. Nothing is owed the jetson lane
+#       here; the entry above is kept as a marker so the next reader does not re-derive the hole from
+#       the stale text in an older revision of this file.)
 #     * `v3d_hubcm`, `v3d_pmcycle`, `v3d_ptbbracket` — all sites in `arch/aarch64/v3d.rs`, which is
 #       `all(feature = "baremetal", feature = "v3d")`. `arm-pi` carries both, so the DISARMED
 #       polarity of all three is checked; the ARMED polarity is not. Pi lane.
@@ -3179,9 +3214,19 @@ KERNEL_CFG_MATRIX=(
   # smpmark/bsptick shape: every site needs nothing beyond `tegra`). Deliberately WITHOUT
   # `orinclick`: the census call sites inside the supstate roles carry their own `#[cfg(feature =
   # "orinclick")]`, and this leg compiling with them ERASED proves the lift does not depend on the
-  # instrument (`arm-tegra-orinclick` keeps compiling the legacy pump's armed shape; the CROSS —
-  # supstate + orinclick together — rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`, run
-  # at this arc's gate).
+  # instrument (`arm-tegra-orinclick` keeps compiling the legacy pump's armed shape).
+  #
+  # ⚠ CORRECTED 2026-08-28 (orin 10, ORIN10-LEGHOLE4). Until this edit the sentence above ended by
+  # claiming the CROSS — supstate + orinclick together — "rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1
+  # ./arroyo check`, run at this arc's gate". THAT CLAIM WAS FALSE AS COVERAGE and is struck. An
+  # operator-run check is a MEASUREMENT TAKEN ONCE: it bound no later edit, it re-ran never, and it
+  # sat in this file reading exactly like a leg, so an audit conducted by reading comments counted
+  # the cross as covered and was wrong. Verified 2026-08-28 by enumerating the third field of every
+  # KERNEL_CFG_MATRIX row: NO row carried both terms, literally or through Cargo (nothing implies
+  # `supstate`; `orinclick` is implied only by `orinladder`/`orinfurn`, whose rows name it anyway).
+  # The cross is now compiled by `arm-tegra-supstate-el0-click` two rows below, where every future
+  # gate re-runs it. Do not re-word a hand-run into this file as coverage again — the census above
+  # records that an invariant asserted in prose and left unenforced has now rotted four times.
   #
   # UNIVERSE SIDE EFFECT: none that moves a mix count — `supstate` is a NEW `[features]` entry named
   # only on an arm-* leg, so `x86_cfg_universe` drops it (every site is inside
@@ -3220,6 +3265,57 @@ KERNEL_CFG_MATRIX=(
   # UNIVERSE SIDE EFFECT: none. Both knobs are already named by arm-* legs, so `x86_cfg_universe` and
   # the derived mix-leg count are unchanged. Board legs +1.
   "arm-tegra-supstate-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate"
+
+  # ORIN10-LEGHOLE4 (appended 2026-08-28) — the `supstate` x `orinclick` cross, compiled by NO leg.
+  # The FOURTH hole of the class ORIN10-LEGHOLES closed three of, and the one it flagged and left.
+  #
+  # THE HOLE, ENUMERATED not assumed. Split the third field of all 30 KERNEL_CFG_MATRIX rows on
+  # commas: `supstate` appears on exactly two (`arm-tegra-supstate`, `arm-tegra-supstate-el0`) and
+  # `orinclick` on eight, and the two sets are DISJOINT. Cargo cannot close the gap either — nothing
+  # in `[features]` implies `supstate`, and `orinclick` is implied only by `orinladder` and
+  # `orinfurn`, whose rows already name it literally. `build_cfg_legs` emits `x86-mix-*` only, so no
+  # derived leg sweeps an aarch64 combination up. The cross was compiled by nothing.
+  #
+  # WHAT IS UNCOMPILED WHEN IT IS UNCOMPILED. `jd2_supstate_phase2` (main.rs, itself
+  # `#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]`) carries a
+  # `#[cfg(feature = "orinclick")] orin_click_census(sweep_tick)` in its ~10 s sweep — the state
+  # lift's OWN copy of the census call, distinct from the legacy pump's. `arm-tegra-supstate*`
+  # compiles that statement cfg-ERASED; `arm-tegra-orinclick` compiles the legacy pump's copy and
+  # erases the whole enclosing function. Neither row type-checks the lift's copy, which is the one a
+  # `supstate` bench image would actually run.
+  #
+  # THE CLAIM THIS REPLACES was `arm-tegra-supstate`'s own comment — see the struck sentence there.
+  # A knob combination checked ONCE by hand at some past arc's gate is a MEASUREMENT, not COVERAGE.
+  #
+  # HOSTED ON `arm-tegra-supstate-el0`'s LIST VERBATIM + `orinclick` — a ONE-TOKEN delta on a row
+  # already proven green, so a red on this leg names the cross and nothing else. The delta is one
+  # feature AFTER Cargo resolution too: `orinclick = ["tegra_el0"]` -> `tegra` + `aarch64_el0`, and
+  # the host already carries all three, so the resolved set grows by exactly {orinclick}.
+  #
+  # WHY THAT BASE AND NOT `arm-tegra-supstate`. That is the row a reader would reach for, because it
+  # is where the false sentence lived — and it is the WRONG base. `arm-tegra-supstate` carries no
+  # `tegra_el0`, so appending `orinclick` there widens the resolved set by THREE features
+  # (`orinclick` + `tegra_el0` + `aarch64_el0`) and a red could not distinguish "the instrument does
+  # not compile inside the lift" from "the EL0 chain does not compile inside the lift" — exactly the
+  # distinction `arm-tegra-supstate-el0` was added one commit ago to make. Hosting on
+  # `arm-tegra-orinclick` + `supstate` would produce the IDENTICAL feature set and is equally
+  # minimal; the two differ only in framing, and this one is chosen because the row under audit is
+  # the supstate family and the added token is the instrument whose absence the struck claim was
+  # about. Both neighbours are kept: `arm-tegra-supstate-el0` (subject, no instrument) and
+  # `arm-tegra-orinclick` (instrument, no subject) are the two one-term rows the proof below needs.
+  #
+  # NON-VACUITY, MEASURED not argued (2026-08-28), two-sided: a
+  # `#[cfg(feature = "orinclick")] orin_click_census("ORIN10-LEGHOLE4-PROBE")` appended inside
+  # `jd2_supstate_phase2` reds THIS leg — E0308, `expected `u64`, found `&str``, the note naming
+  # `display_tegra.rs`'s `orin_click_census` — and leaves BOTH neighbours at EXIT 0:
+  # `arm-tegra-supstate-el0` (no `orinclick`, the statement cfg-erased) and `arm-tegra-orinclick`
+  # (no `supstate`, the enclosing function cfg-erased). Probe reverted, revert proven by sha256.
+  # Only this combination sees it, which is what "not vacuous" has to mean.
+  #
+  # UNIVERSE SIDE EFFECT: none. All three knobs are already named by arm-* legs, so the table (150),
+  # the board union (140), the ten unnamed knobs, `x86_cfg_universe` and the derived mix-leg count
+  # are every one of them unchanged. Board legs +1 (30 -> 31); gate +1.
+  "arm-tegra-supstate-el0-click ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,orinclick"
 
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
