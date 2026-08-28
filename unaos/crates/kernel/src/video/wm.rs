@@ -5594,7 +5594,7 @@ fn composite_inner() -> CursorTail {
     let focus = focus_asid();
     // WC-K3 — publish the live drag's geometry for the occludee witness, from the same snapshot this
     // pass blits from. One relaxed store on a pass with no drag live.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     dragocc_pass(&rows);
 
     // WEDGE-2 `<F8>` (owner core) / `<f8>` (a concurrent core) — the guard is HELD, the damage set is
@@ -15132,32 +15132,32 @@ fn dropres_audit(win: WinId) {
 // `direct=` names the one such path that exists today so it cannot hide inside a zero.
 /// WC-K3 — the dragged window's outer box for THIS pass: `x`, `y`, `w`, `h`. `w == 0` means no drag
 /// is live (or its row has gone), and every term below stays where it is.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// WC-K3 — the dragged window's `(z, id)`, packed `z << 32 | id`, so a painter can ask whether it is
 /// BELOW the drag with one relaxed load and the same key the blit order uses.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_ZID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — ids (bit per id, `id < 32`) that painted a neighbour pixel during this gesture.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_NEIGH_MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// WC-K3 — panel pixels this gesture published for windows other than the dragged one.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_NEIGH_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — THE VERDICT TERM: of those, pixels that landed inside the dragged window's box, published
 /// by a window stacked below it. The bleed. Must be 0.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_OCC_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — pixels the clip SUPPRESSED for those same windows. The mechanism's own denominator: a
 /// gesture whose neighbours were genuinely occluded and whose `clip_px` is 0 has a clip that never
 /// ran, and its `occ_px=0` proves nothing.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_CLIP_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — presents an occluded neighbour took on the UNCLIPPED direct path (`stage_window`
 /// declined). Those pixels bypass the clip entirely, so the count is part of the verdict rather than
 /// a footnote.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_DIRECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — presents of an occluded neighbour the whole-window skip declined outright.
 ///
@@ -15166,7 +15166,7 @@ static DO_DIRECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 /// would report `neigh=0 clip_px=0` and read exactly like a gesture over empty desktop. The two
 /// denominators together are what let a reader tell "nothing was occluded" from "occlusion was
 /// handled".
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static DO_BURIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WC-K3 — THE SECOND VERDICT TERM: `DESKTOP_BG` pixels the drain's staged fill published inside the
 /// dragged window's box. The coalesced erase reaching under its own occluder, which is the mechanism
@@ -15372,7 +15372,7 @@ static DO_FILL_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// gesture that erased nothing would read the drain's stale (or never-written) box and call it this
 /// path's answer, which is the class of borrowed-instrument error this repo keeps convicting. Two
 /// paths, two publications, and a capture in which they DISAGREE is itself a finding.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static OD_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
 /// WCK5 — **window blits during this gesture whose clip CARRIED the strip.** The population term.
@@ -15387,7 +15387,7 @@ static OD_BOX: [core::sync::atomic::AtomicUsize; 4] =
 /// A per-gesture sum, swapped at [`drag_report`] with the other totals — not a snapshot like
 /// [`DO_CLIP_N`], because the question here is "did the mechanism run during this gesture" rather
 /// than "what shape was the last drain's clip".
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static OD_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// WCK5 — **panel pixels the WINDOW blits withheld specifically because of the dock strip** during
 /// this gesture. The term Peter's Boot B report has no counterpart for anywhere on the wire.
@@ -15402,7 +15402,7 @@ static OD_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 /// which returns `None` for the dragged window itself, and the dragged window is precisely the one
 /// whose chrome crosses the strip in the reported symptom. A term that could not see the dragged
 /// window would have been blind to the whole defect.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static OD_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// STRIPFACTOR × WCK5 — the MENU BAR's triplet, the twin of [`OD_BOX`]/[`OD_N`]/[`OD_PX`] for the
@@ -15419,12 +15419,12 @@ static OD_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// `OB_*` rather than a generalised `occclip_furn=` sum, deliberately: WCK5's `occclip_dock=` stays
 /// verbatim (the coordinator's "keep the dock witness working"), and per-strip attribution means a
 /// FORBID hit names WHICH strip leaked rather than "some furniture did".
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static OB_BOX: [core::sync::atomic::AtomicUsize; 4] =
     [const { core::sync::atomic::AtomicUsize::new(0) }; 4];
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static OB_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 static OB_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// WCK5 — [`OD_BOX`] on the wire, as `WxH+X+Y` or the literal `absent`.
@@ -15438,10 +15438,10 @@ static OB_PX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// Takes the width it was already read with, so the `w == 0` decision and the printed `w` are the
 /// same load; the remaining three are read here, which is [`DO_DOCK_BOX`]'s own D6 tolerance for a
 /// four-atomic box that is not a transaction.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 struct OccDockBox(usize);
 
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 impl core::fmt::Display for OccDockBox {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         use core::sync::atomic::Ordering::Relaxed;
@@ -15492,7 +15492,7 @@ fn dragfill_box(rows: &[Window; MAX_WINDOWS]) {
 /// core's pass overwrites it with its own answer; the terms are per-gesture totals and a one-pass
 /// disagreement about a window that is moving anyway cannot manufacture a nonzero `occ_px` out of
 /// pixels nobody wrote.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 fn dragocc_pass(rows: &[Window; MAX_WINDOWS]) {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
     let id = DRAG_WIN.load(Acquire);
@@ -15517,7 +15517,7 @@ fn dragocc_pass(rows: &[Window; MAX_WINDOWS]) {
 /// WC-K3 — is `r` a window whose pixels the live drag would OCCLUDE? `Some(box)` hands back the
 /// dragged window's box to test writes against; `None` means there is nothing to charge (no drag,
 /// `r` IS the drag, or `r` is stacked above it and legitimately paints over it).
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 fn dragocc_target(r: &Window) -> Option<(usize, usize, usize, usize)> {
     use core::sync::atomic::Ordering::Relaxed;
     let w = DO_BOX[2].load(Relaxed);
@@ -15564,7 +15564,7 @@ fn span_occ(d: Option<(usize, usize, usize, usize)>, y: usize, x0: usize, x1: us
 }
 
 /// WC-K3 — fold one occluded neighbour's present into the gesture's totals.
-#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+#[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
 fn dragocc_note(id: WinId, written: u64, occ: u64, clipped: u64) {
     use core::sync::atomic::Ordering::Relaxed;
     if id < 32 {
@@ -15688,7 +15688,7 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
     // `[drag]`'s wire; adding to it would move a gate another seat owns. Emitted unconditionally
     // beside `[drag]` (same `moves == 0` silence above), so a gesture that bled is never a MISSING
     // line — a witness whose absence and whose clean verdict look the same is no witness.
-    #[cfg(target_arch = "x86_64")]
+    // WMPAR — the arch gate is GONE: every term this block reads is arch-neutral as of P2.
     {
         let mask = DO_NEIGH_MASK.swap(0, Relaxed);
         let npx = DO_NEIGH_PX.swap(0, Relaxed);
@@ -15793,70 +15793,70 @@ fn drag_report(id: WinId, owner: u64, how: &str, moves: u64) {
             );
         }
     }
-    // ERASECLIP M2 — **THE aarch64 ERASE WIRE, and why it is a SEPARATE LINE rather than `[drag-occ]`
-    // with holes in it.**
+    // ERASECLIP M2 / WMPAR P2 — **`[erase-occ]` IS RETIRED, AND THIS IS ITS HEADSTONE.**
     //
-    // `[drag-occ]` above reports a gesture's WHOLE paint budget: the neighbour mask, the window
-    // blit's own bleed (`occ_px`, `clip_px`, `buried`, `direct`) and OCC62's `occclip_*` pairs, all
-    // fed by statics this arc did not port and does not own — that is the drag/blit instrument
-    // §6.10 item 2 assigns to another arc. What ERASECLIP ports is the ERASE half, and only the
-    // erase half.
+    // What stood here until WMPAR P2 was a second report line, `[erase-occ]`, emitted on aarch64
+    // only. It existed for one reason and said so: `[drag-occ]` above was compiled `x86_64` only,
+    // because the statics feeding its window-blit half — `DO_BOX`/`DO_ZID`/`DO_NEIGH_*`/`DO_OCC_PX`/
+    // `DO_CLIP_PX`/`DO_DIRECT`/`DO_BURIED` and OCC62's `OD_*`/`OB_*` pairs — were `all(witness,
+    // x86_64)`. ERASECLIP had ported the ERASE half and only the erase half, so on aarch64 there
+    // were live totals with no line to drain them.
     //
-    // Printing that half under the `[drag-occ]` tag with the other fields zeroed or missing is the
-    // exact defect GR13 convicted three instruments for: a field that means one thing on x86 and
-    // another on aarch64, where a reader cannot tell "the term measured zero" from "the term is not
-    // compiled". So the Pi gets its own tag, carrying ONLY terms that are live on it, and every
-    // field on it means precisely what the identically-named field on `[drag-occ]` means.
+    // Its author declined, correctly, to print those terms under the `[drag-occ]` tag with the
+    // other fields missing: that is the "one field, two meanings, two arches" defect GR13 convicted
+    // three instruments for, and a reader cannot tell "the term measured zero" from "the term is
+    // not compiled". So the Pi and the Orin got their own tag, carrying ONLY terms live on them,
+    // every field meaning exactly what the identically-named field on `[drag-occ]` meant.
     //
-    // §6.10's instruction was "make the aarch64 wire honest — fire the legs, or document the
-    // silence." This fires them. `fillover_px` in particular is the FORBID the erase path owes: it
-    // audits the span walk by asking whether a published pixel landed inside a box the clip HOLDS,
-    // and until this arc it could not be nonzero on aarch64 because the clip was structurally empty.
-    // `clipn=` and `dock=` are beside it for the reason [`DO_FILL_OVER_PX`] gives — a zero
-    // `fillover_px` over an EMPTY clip is a pass by vacancy, and the reader must be able to see that.
+    // **P2 removes the premise.** The whole DRAGOCC family now gates on `witness` alone — there is
+    // no hardware reason for an arch term on a witness built out of atomics, box intersections and
+    // a span walk, and none was ever stated. `[drag-occ]` therefore compiles and emits on aarch64,
+    // carrying `fill_px`, `fillpub_px`, `fillclip_px`, `fillover_px`, `fillruns`, `clipn`, `dock`,
+    // `bars`, `bar` and `fillclip_dock_px` — every field `[erase-occ]` carried, spelled the same —
+    // AND the window-blit half beside them: `neigh`, `neigh_px`, `occ_px`, `clip_px`, `buried`,
+    // `direct`, `occdock`, `occclip_dock`, `occclip_dock_px`, `occclip_bar`, `occclip_bar_px`.
     //
-    // Read `load`-not-`swap` for the shape terms and `swap` for the totals, identically to the x86
-    // arm, so the two lines are comparable field by field across a bench A/B.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let fpx = DO_FILL_PX.swap(0, Relaxed);
-        let fpub = DO_FILL_PUB_PX.swap(0, Relaxed);
-        let fclip = DO_FILL_CLIP_PX.swap(0, Relaxed);
-        let fovr = DO_FILL_OVER_PX.swap(0, Relaxed);
-        let fruns = DO_FILL_RUNS.swap(0, Relaxed);
-        let fdock = DO_FILL_CLIP_DOCK_PX.swap(0, Relaxed);
-        let clipn = DO_CLIP_N.load(Relaxed);
-        let dockw = DO_DOCK_BOX[2].load(Relaxed);
-        let barsn = DO_STRIP_N.load(Relaxed);
-        let barw = DO_BAR_W.load(Relaxed);
-        // Retired with the gesture, on the x86 arm's argument exactly: between two gestures no drain
-        // need run, so a box left standing charges the next gesture's opening fills against geometry
-        // that belonged to the last one.
-        DO_FILL_BOX[2].store(0, Relaxed);
-        // The verdict carries the two FORBIDs the ERASE owns and no others. `fill_px` is the erase
-        // publishing into the dragged window's live box; `fillover_px` is the span walk emitting a
-        // column the clip covered. `occ_px`/`direct` are the window blit's and are not measured here.
-        let clean = fpx == 0 && fovr == 0;
-        if dockw == 0 {
-            serial_println!(
-                "[erase-occ] win={} owner={:#x} moves={} fill_px={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock=absent bars={}/{} bar={} fillclip_dock_px={} -> {}",
-                id, owner, moves, fpx, fpub, fclip, fovr, fruns, clipn,
-                barsn, FURNITURE_MAX, barw, fdock,
-                if clean { "CLEAN" } else { "BLEED" }
-            );
-        } else {
-            serial_println!(
-                "[erase-occ] win={} owner={:#x} moves={} fill_px={} fillpub_px={} fillclip_px={} fillover_px={} fillruns={} clipn={} dock={}x{}+{}+{} bars={}/{} bar={} fillclip_dock_px={} -> {}",
-                id, owner, moves, fpx, fpub, fclip, fovr, fruns, clipn,
-                dockw,
-                DO_DOCK_BOX[3].load(Relaxed),
-                DO_DOCK_BOX[0].load(Relaxed),
-                DO_DOCK_BOX[1].load(Relaxed),
-                barsn, FURNITURE_MAX, barw, fdock,
-                if clean { "CLEAN" } else { "BLEED" }
-            );
-        }
-    }
+    // **Keeping both would have been a LYING WIRE, not a redundancy.** The `[drag-occ]` block above
+    // `swap`s the `DO_FILL_*` totals to zero as it reads them — that is how a gesture's totals are
+    // scoped to the gesture. A surviving `[erase-occ]` runs AFTER it, on the same `drag_report`
+    // call, and would have swapped the same statics a second time: every fill term it printed
+    // would have read 0, on every gesture, forever. `clean = fpx == 0 && fovr == 0` would then be
+    // unconditionally true and the line would have said `-> CLEAN` on a gesture that bled across
+    // the console. A witness whose verdict cannot be false is not a witness, and this one would
+    // have been the loudest kind of false: an instrument that used to work.
+    //
+    // **For a reader holding an old capture.** `[erase-occ] win=… fill_px=… fillover_px=… -> …`
+    // maps field for field onto `[drag-occ] win=… fill_px=… fillover_px=… -> …`. The verdict term
+    // is the one thing that CHANGED meaning and it changed in the strict direction: `[erase-occ]`
+    // adjudicated on the two FORBIDs the erase owns (`fill_px`, `fillover_px`), while `[drag-occ]`
+    // adjudicates on four (`occ_px`, `fill_px`, `direct`, `fillover_px`). A gesture that read
+    // `-> CLEAN` on the old tag can read `-> BLEED` on the new one WITHOUT any regression: the two
+    // extra terms are the window blit's, they were always live, and on aarch64 nothing was asking
+    // them. That is the point of the port — the Orin and the Pi are now asked the same four
+    // questions the rMBP is asked, and `x86-witness.spec`'s `FORBID \[drag-occ\] .*-> BLEED` is a
+    // gate the arm specs may now adopt verbatim rather than approximate.
+    //
+    // **Doc debt, named rather than left to be discovered.** `docs/dev/OS/08_VIDEO/PARITY.md`
+    // documents `[erase-occ]` as ERASECLIP M1/M2 (its §6.10 items, the sample capture, and the two
+    // places that record `[drag-occ]`'s `occclip_*` fields as "deliberately still x86"). All three
+    // statements are stale as of this commit. That file is outside this arc's editable lane, so the
+    // correction is REPORTED and owed, not silently skipped — and this block is where a reader who
+    // arrives from the doc lands.
+    //
+    // **Why sixty-four lines of comment rather than a deletion.** This file's panic `Location`
+    // records embed line numbers, so deleting a block shifts every line below it and moves the x86
+    // artifact's hash for a change that has nothing to do with x86. Every WMPAR substitution is
+    // line-count neutral by construction, and a retirement is a substitution like any other: the
+    // code that stood here is replaced by exactly as many lines of the ledger explaining why it no
+    // longer stands. The next arc to touch this neighbourhood may reclaim the space; until then
+    // the space is carrying its weight.
+    //
+    // The `wc` knob is not involved anywhere in this family, which matters: `wc` is named by ZERO
+    // aarch64 legs in `arroyo`'s cfg matrix, so a port that needed it would compile GREEN and be
+    // VACUOUS. `witness` is named by all 26, so everything above is type-checked on this arch
+    // rather than merely absent from it — proved, not assumed: a deliberate type error planted in
+    // `dragocc_target` turned the `arm-tegra` leg RED before this commit was written, and green
+    // again on its removal.
 }
 /// WMDIRECT — `[wm-act]` lines emitted, against [`WM_ACT_LOG_MAX`]. The begin/end/close lines are
 /// human-rate by construction (a hand cannot grab faster than serial can print), but the CANCEL arm
@@ -16797,7 +16797,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // §6.2 owes the Pi, and widening that wire is not this arc's to do. Named rather than
             // silent: on aarch64 the strips are in the clip and `occclip_dock`/`occclip_bar` do not
             // report it, so a Pi capture's silence there is an ABSENT instrument, not a zero.
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (dx, dy, dw, dh) = rect.unwrap_or((0, 0, 0, 0));
@@ -16811,7 +16811,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
                     // WCK5 — one window blit whose clip CARRIED the strip. The population term for
                     // `occclip_dock_px`: a gesture with `occclip_dock=0` withheld nothing because no
                     // blit met the strip, which is a different statement from "the clip did not work".
-                    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+                    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                     OD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -16833,7 +16833,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // Default OFF: `strip_rect` returns `None` after one relaxed load on every boot that has
             // not enabled the bar, so this arm costs one atomic per window and pushes nothing.
             let bar = super::menubar::strip_rect(pw, ph);
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
             {
                 use core::sync::atomic::Ordering::Relaxed;
                 let (bx0, by0, bw0, bh0) = bar.unwrap_or((0, 0, 0, 0));
@@ -16844,7 +16844,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             }
             if let Some(b) = bar {
                 if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) && c.push(b) {
-                    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+                    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                     OB_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -18363,7 +18363,7 @@ fn draw_window(
     // from every clip SET already. Letting the skip apply to it would be the one place this arc
     // changed the full-screen path, on an arm nothing else in the arc touches.
     if !r.compat && clip.buries((bx, by, bw, bh)) {
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
         if dragocc_target(r).is_some() {
             DO_BURIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
@@ -18440,7 +18440,7 @@ fn draw_window(
         // what covers this path for the case that matters (buried outright). A partially occluded
         // neighbour that lands here still publishes over its occluder, so the drag witness counts the
         // present as `direct=` and the gesture reads `-> BLEED` — the residual names itself.
-        #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+        #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
         if dragocc_target(r).is_some() {
             DO_DIRECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
@@ -19759,15 +19759,15 @@ fn stage_window(
     // `dragocc_target`), read once here rather than per row: it is the independent yardstick the
     // verdict is measured against, and it comes from a different source than the `clip` this loop
     // subtracts, which is what keeps `occ_px` from being an assertion about itself.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     let dbox = dragocc_target(r);
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     let (mut wrote_px, mut occ_px, mut clip_px) = (0u64, 0u64, 0u64);
     // WCK5 — the strip as THIS clip holds it, read once for the whole present on `dbox`'s precedent:
     // it is fixed for the pass, and reading it per row would be an atomic load inside the blit loop.
     // `w == 0` means `for_panel` answered `None`, and then `odock_px` correctly stays 0 — which is
     // the honest answer, and the reason `occclip_dock=` is on the wire beside it.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     let odockb = {
         use core::sync::atomic::Ordering::Relaxed;
         let dw = OD_BOX[2].load(Relaxed);
@@ -19782,11 +19782,11 @@ fn stage_window(
             ))
         }
     };
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     let mut odock_px = 0u64;
     // STRIPFACTOR — the MENU BAR's box, read once for the present exactly as `odockb` is. `w == 0`
     // (the bar is off, or the panel cannot host it) leaves `obar_px` at 0, the honest answer.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     let obarb = {
         use core::sync::atomic::Ordering::Relaxed;
         let bw0 = OB_BOX[2].load(Relaxed);
@@ -19801,7 +19801,7 @@ fn stage_window(
             ))
         }
     };
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     let mut obar_px = 0u64;
 
     // WC-K3 — ONCE PER PRESENT, not once per scanline (review, SHOULD-FIX 4). The occluder geometry
@@ -19914,7 +19914,7 @@ fn stage_window(
             comp_mark_row(py);
             if clip.n == 0 {
                 fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
-                #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+                #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     wrote_px += bw as u64;
                     occ_px += span_occ(dbox, py, bx, bx + bw);
@@ -19927,13 +19927,13 @@ fn stage_window(
                 continue;
             }
             let ns = occ.spans(py, bx, bx + bw, &mut spans);
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
             let (mut row_written, mut row_dock_pub, mut row_bar_pub) = (0u64, 0u64, 0u64);
             for &(sx0, sx1) in spans[..ns].iter() {
                 let off = (sx0 - bx) * bpp;
                 let len = (sx1 - sx0) * bpp;
                 fb.blit(py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
-                #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+                #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     row_written += (sx1 - sx0) as u64;
                     occ_px += span_occ(dbox, py, sx0, sx1);
@@ -19945,7 +19945,7 @@ fn stage_window(
                     row_bar_pub += span_occ(obarb, py, sx0, sx1);
                 }
             }
-            #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+            #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
             {
                 wrote_px += row_written;
                 clip_px += bw as u64 - row_written;
@@ -19963,19 +19963,19 @@ fn stage_window(
     }
 
     // WC-K3 — fold this present into the live gesture's totals, if it was a neighbour of one.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     if dbox.is_some() {
         dragocc_note(r.id, wrote_px, occ_px, clip_px);
     }
     // WCK5 — and fold the strip's withheld total UNCONDITIONALLY, outside that gate. See [`OD_PX`]:
     // `dragocc_target` is `None` for the DRAGGED window, and the dragged window is the one whose
     // chrome crosses the taskbar in the symptom this term exists to falsify.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     if odock_px > 0 {
         OD_PX.fetch_add(odock_px, core::sync::atomic::Ordering::Relaxed);
     }
     // STRIPFACTOR — the menu bar's withheld total, folded on the same unconditional terms.
-    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
     if obar_px > 0 {
         OB_PX.fetch_add(obar_px, core::sync::atomic::Ordering::Relaxed);
     }
