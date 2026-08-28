@@ -5068,9 +5068,11 @@ fn bg_jobs(console: &mut Console) {
                 serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
                 *slot = None;
             }
-            // CLOSE-CLEAN is an aarch64-only `BgPoll` variant (the x86 WINX-2 enum has four:
-            // Running / Exited / Faulted / Gone), so this arm is arch-gated rather than invented.
-            #[cfg(target_arch = "aarch64")]
+            // CLOSE-CLEAN. Both arches carry the `Closed` variant now (the x86 WINX-2 enum gained
+            // it for shape parity), so the arm is unconditional. On x86 it is currently
+            // unreachable-by-value rather than dead-by-cfg: the x86 close box kills through
+            // `bg_kill`, which reaps the row itself, so a closed x86 job polls `Gone` — see the
+            // variant's own doc in `arch/x86_64/syscall.rs`.
             BgPoll::Closed => {
                 // CLOSE-CLEAN: the operator clicked the window's close box — a clean, asked-for
                 // exit. Reads like a normal completed job, never like a fault.

@@ -16127,6 +16127,16 @@ pub enum BgPoll {
     Exited(i32),
     /// Killed by the fault-kill net (contained fault); if `reap` was set the row has been freed.
     Faulted,
+    /// CLOSE-CLEAN, shape parity with the aarch64 twin: closed by the operator via the window's
+    /// close box. **No x86 path constructs this today** — the x86 close box ([`wc_close_click`])
+    /// kills through [`bg_kill`], which claims and frees the Proc row itself, so a closed job's
+    /// next poll reads [`BgPoll::Gone`] (there is no x86 `EXEC_CLOSED_STATUS` and no settle path).
+    /// The variant exists so the two arches' `BgPoll` have the same shape and the arch-neutral
+    /// consumers (the shell's `jobs` verb, quarry's `reap_jobs`) can name the arm unconditionally
+    /// instead of `cfg`-gating it per arch; if x86 ever grows an aarch64-style close-settle (mark
+    /// the row `PEXITED` with a closed sentinel instead of reaping), [`bg_poll`] gains the producer
+    /// and every consumer is already wired.
+    Closed,
     /// No row holds this pid (already reaped, or never existed).
     Gone,
 }
