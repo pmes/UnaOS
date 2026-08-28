@@ -114,11 +114,11 @@ These are x86 *hardware* or x86-only subsystems. They are not defects and should
 | Uncached-PCIe VRAM shadow | `fbcon.rs` ×9 | `shadow_store` exists because x86 scan-out memory is uncached PCIe; the Pi's framebuffer is not. |
 | `videobench` / `videocap` | `framebuffer.rs` ×2, `fbcon.rs` ×4, `mod.rs` ×1 | Bench levers over the x86-only `vperf` module. |
 | x86-only compositor gate | `wm.rs` ×8 | `COMP_GATE` / `COMP_PENDING` / `COMP_RERUN_MAX` + `wcser_emit`. Documented in-tree as "x86 ONLY, and the gate is the justification". |
-| WCD-TEARDOWN interlock | `wm.rs` ×7, `wcg.rs` ×1 | `panel_seq`, `vrect`, `panel_stable`. In-tree doc: "aarch64 has no interlock at all". |
+| WCD-TEARDOWN interlock | `wm.rs` ×7, `wcg.rs` ×1 | `panel_seq`, `vrect`, `panel_stable`. ~~In-tree doc: "aarch64 has no interlock at all".~~ **CLOSED in two steps.** WMPAR ported the FILL half — `panel_seq`, `panel_seq_close`, `vrect`, `panel_stable` and the abort arm — so a foreign fill has converted `-> FAIL` to `-> SKIP` on aarch64 since that commit; `exec-orin10-deskhalf` ported the DESK half (`PANEL_DESK_EPOCH`, `PANEL_DESK_ACTIVE`, `DeskWriteGuard`, `PanelSeq`'s two fields), so `desk=`/`dact=` are on every aarch64 `[wc-d]` verdict. The quoted claim is false in both halves. See §6.16. |
 | Wide glass read-back | `wcg.rs` ×5 | x86 scan-out `GlassRow` reads. |
 | ACPI soft-off | `crystal.rs` ×1, `instgui.rs` ×1 | S5 poweroff; the Pi has no soft-off and its arm answers honestly (PSCI). |
 | x86 PCI wifi (bcma), flight recorder, selfhost, irqstorage, installdemo | `main.rs` ×15 | Broadcom over x86 PCI (not the Pi's SDIO part); the recorder taps the x86 serial print seam. |
-| Occlusion *witness legs* | `crystal.rs` ×1, `menubar.rs` ×1, `wm.rs` ×1, `wcg.rs` ×8 | These probe `wm::occ_clip`. §6.2 has landed (`exec-occ62`), so the `wcg.rs` legs — `occluded=`/`occ=` on `[wc-d]`/`[wc-g]` — are now LIVE on aarch64 and carried the proof. The `[drag-occ]` legs (`occclip_dock`/`occclip_bar`, `wm.rs`) are deliberately **still x86**: that wire belongs to the drag instrument, not to §6.2. See §6.10. |
+| Occlusion *witness legs* | `crystal.rs` ×1, `menubar.rs` ×1, `wm.rs` ×1, `wcg.rs` ×8 | These probe `wm::occ_clip`. §6.2 has landed (`exec-occ62`), so the `wcg.rs` legs — `occluded=`/`occ=` on `[wc-d]`/`[wc-g]` — are now LIVE on aarch64 and carried the proof. ~~The `[drag-occ]` legs (`occclip_dock`/`occclip_bar`, `wm.rs`) are deliberately **still x86**: that wire belongs to the drag instrument, not to §6.2.~~ **STRUCK — WMPAR P2 (DRAGOCC) took the arch term off the whole family**, so `occclip_dock`/`occclip_dock_px`/`occclip_bar`/`occclip_bar_px` are live on aarch64 and `[drag-occ]` itself emits there. See §6.10, §6.11 and §6.16. |
 
 ---
 
@@ -1559,10 +1559,14 @@ fully-covered subject proves it FIRES. Zero `[wc-d] … -> FAIL` remain on the a
 1. **The deferred-erase side.** `erase_clip` and `screen.rs:1050` are untouched and still x86-only.
    §6.2 as originally written named both the blit and the erase; **only the blit is closed.** A
    deferred erase on the Pi can still publish over a strip.
-2. **The `[drag-occ]` witness legs** (`occclip_dock`/`occclip_bar`, `OD_*`/`OB_*`) stay x86 by choice —
+2. ~~**The `[drag-occ]` witness legs** (`occclip_dock`/`occclip_bar`, `OD_*`/`OB_*`) stay x86 by choice —
    that wire belongs to the drag instrument another arc owns. On aarch64 the strips ARE in the clip and
    those fields do not report it, so **silence there is an absent instrument, not a zero.** Named in
-   `occ_clip`'s ledger so no future capture is misread.
+   `occ_clip`'s ledger so no future capture is misread.~~
+   **CLOSED by WMPAR P2 (DRAGOCC).** The arch term came off the whole family — there was never a
+   hardware reason for one on a witness built out of atomics, box intersections and a span walk — so
+   those four fields report on aarch64 and the silence is gone. Struck, not deleted: the "absent
+   instrument, not a zero" reading rule still governs any capture taken before that commit.
 3. **The SHELLPIN residual**, carried from `dock.rs`'s integrator note and now also disclosed on the
    consumer. `dock_tiles` counts dock-addressable ROWS and cannot see the tile `dock::pin_shell`
    appends while the shell is closed, so the clip protects a strip one tile narrower than the painted
@@ -1586,7 +1590,7 @@ the shape x86 has run since WCK4, and the work was `cfg` boundaries plus the wit
 | **M1** | `erase_clip`'s FURNITURE arm — `strip::rects`, i.e. dock + menu bar from the registry | `any(all(x86_64, wc), all(aarch64, pidesk))` — the furniture family's own gate |
 | **M1** | `OccClip::push` | ungated (was `any(x86_64, all(aarch64, pidesk))`) |
 | **M1** | The erase-side witness: `DO_FILL_*`, `DO_CLIP_N`, `DO_DOCK_BOX`, `DO_STRIP_N`, `DO_BAR_W`, `dragfill_box`, `span_occ`, `covered_len` and their `stage_fill` legs | `feature = "witness"` (arch term dropped) |
-| **M1** | `[erase-occ]` — a NEW aarch64 report line | `witness` + `aarch64` |
+| **M1** | ~~`[erase-occ]` — a NEW aarch64 report line~~ **RETIRED by WMPAR P2**; its fields are now on `[drag-occ]`, which emits on both arches. Mapping in §6.16. | ~~`witness` + `aarch64`~~ (gone) |
 
 **Why `push` had to be ungated, which an attribute census could not have predicted.** `occ_clip`'s
 window loop writes `boxes[n]` directly under an `OCC_CLIP_MAX` bound; `erase_clip`'s admits through
@@ -1600,18 +1604,28 @@ port that only moves `cfg` attributes cannot see this class.
 acquisition and the `dock_scan` inside `strip::rects` are affordable; occ62's "no second table lock"
 rule was a property of the per-window blit loop and is deliberately **not** imported here.
 
-#### The witness FIRES on aarch64, and why it is a new tag
+#### The witness FIRES on aarch64, and why it *was* a new tag — and why the tag is now gone
 
-§6.10 item 2 left `[drag-occ]`'s `occclip_*` fields x86-only and documented the silence as an absent
+> **SUPERSEDED, 2026-08-28.** Everything in this subsection was true when written and the tag it
+> describes no longer exists: **WMPAR P2 retired `[erase-occ]`.** Kept in full and struck rather than
+> rewritten, because captures carrying the old tag are still in the bench archive and this is the
+> text that tells a reader what its fields meant. The field-for-field mapping to `[drag-occ]`, and
+> the one term whose MEANING changed, are in **§6.16**. Read that before reading the numbers below.
+
+~~§6.10 item 2 left `[drag-occ]`'s `occclip_*` fields x86-only and documented the silence as an absent
 instrument. For the ERASE the instruction was the opposite — fire the legs — and they do, on
 **`[erase-occ]`**, not on `[drag-occ]`. `[drag-occ]` carries the whole gesture budget, including
 blit-side terms (`occ_px`, `clip_px`, `buried`, `direct`, `occclip_*`) fed by statics this arc does
 not own. Printing the erase half under that tag with the rest missing is the "one field, two meanings
-on two arches" defect GR13 convicted three instruments for. Every field on `[erase-occ]` means exactly
-what the identically-named field on `[drag-occ]` means.
+on two arches" defect GR13 convicted three instruments for.~~ The premise died with the arch term:
+`[drag-occ]` now carries BOTH halves on aarch64, so there is nothing left for a second tag to protect.
+The one sentence that survives unstruck is the one that makes the old captures readable — **every
+field on `[erase-occ]` means exactly what the identically-named field on `[drag-occ]` means.**
 
 **The evidence the erase clip works**, from the armed bench-geometry run — these lines do not exist at
-the base sha at all, because the aarch64 clip was structurally empty:
+the base sha at all, because the aarch64 clip was structurally empty. *A capture of this shape can
+only come from a build older than WMPAR P2; a current one prints the same numbers under `[drag-occ]`,
+with the window-blit half beside them:*
 
 ```
 [erase-occ] win=3 owner=0xd40 moves=10 fill_px=0 fillpub_px=1308476 fillclip_px=2164162
@@ -1653,14 +1667,16 @@ lesson: a census greps attributes, and a disclosure is not an attribute either.
 * Knob-off `./arroyo kernel8-test 210` — **MBENCH PASS, 117/117 required witnesses, 0 forbidden hit(s),
   19506 lines scanned.** At floor. Note the knob-off leg runs **no drags at all** (`[drag]` count 0),
   so `[erase-occ]` is legitimately absent there — a vacant instrument, not a silent one, and the
-  `[wc-k]` `runs`/`spans` pair is what carries the erase reading on that leg.
+  `[wc-k]` `runs`/`spans` pair is what carries the erase reading on that leg. *(Post-WMPAR P2 the
+  same leg is silent under `[drag-occ]` for the same reason: no drags, no line. Unchanged reading.)*
 * The armed bench-geometry leg (`UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200`) is **red at the base
   sha as well** (116/117). Its A/B and the attribution of every residue are in the arc's landing
   report; none of the shared residue belongs to §6.2.
 
 #### What is still OWED after this arc
 
-1. `[drag-occ]`'s `occclip_*` fields (§6.10 item 2) remain x86 by choice — unchanged by this arc.
+1. ~~`[drag-occ]`'s `occclip_*` fields (§6.10 item 2) remain x86 by choice — unchanged by this arc.~~
+   **CLOSED by WMPAR P2**, along with the tag this arc introduced. See §6.16.
 2. The armed leg's pre-existing red (`[wc-d] verify win=3 … -> FAIL`, `[wc-c] side-by-side drawn=1`,
    `[wc-g] … slow=yes -> RACE`, `[dragperf] … -> FAIL`) is present at the base sha and belongs to
    whichever arc owns those instruments. It is named here so a future capture is not misread as this
@@ -2233,6 +2249,136 @@ Cross-tree note for the integrator: the fold with this commit aboard is landable
 rmbp-side items (x86-witness presspop re-arm + the two new fat-spec lines) live in their
 `fold2-1783bee6.patch` and must be taken deliberately — a mechanical re-merge drops all three
 silently. Archive: `~/unaos-bench/scratch/rmbp2-close/fold2/`; rmbp 3 executes the fold.
+
+---
+
+### 6.16 The `exec-orin10-deskhalf` arc — WCD-TEARDOWN's DESK half, and `[erase-occ]`'s obituary
+
+Two things, one commit: the half WMPAR deliberately left owed, and the doc debt WMPAR could not pay
+because `docs/` was outside its lane. Both are bookkeeping about the same witness family, and keeping
+them apart would have left this file contradicting `video/wm.rs` for a second arc running.
+
+#### The DESK half — widened, not declined, and the test it had to pass first
+
+WMPAR ported WCD-TEARDOWN's FILL half and stopped at the DESK half (`PANEL_DESK_EPOCH`,
+`PANEL_DESK_ACTIVE`, `DeskWriteGuard` + `Drop`, and `PanelSeq`'s two fields) on a stated ground:
+`DeskWriteGuard::enter` had exactly ONE call site — `video/screen.rs`'s background blit loop — itself
+gated `all(witness, x86_64)` in a file WMPAR could not edit. Porting the readers alone would have
+printed `desk=0->0 dact=0/0` on aarch64: a zero indistinguishable from a measurement, which is the
+GR13 defect `wm.rs` convicts three of its own instruments for. **That was the right stopping point.**
+
+The completion was one gate, and the question that decides whether a gate should move is *not* "does
+it compile" — it is **"can the instrument fire in the state it exists for"**. Both ends were checked
+on this arch before anything was widened:
+
+| End | Runs on aarch64? | How that was established |
+|---|---|---|
+| WRITER — `present_background`'s serial blit loop | **Yes** | `TargetPal::render` (`pal.rs`) is `self.surface.flush()`; `Screen::flush` calls `present_background`; the Orin's `jd2_console_pump` owns a `Screen` and drives exactly that at console cadence (recorded in `arch/aarch64/display_tegra.rs`). Independently: ORIN-VPAR's `DeskParGuard` already brackets the *identical statement position* here and drains a **fired** `:: DESKPAR:` line with a real epoch and byte total — the path is measured on this arch, not merely compiled. |
+| READER — `verify_window`'s four verdict arms | **Yes** | `verify_window` is `witness`-gated with no arch term, and `pi4-regression.spec` REQUIREs `[wc-d] verify … -> PASS` on the Pi. Another track's gate already reads these lines on aarch64. |
+
+The census was re-run rather than inherited, and by construction rather than by one grep:
+`DeskWriteGuard` is a field-less `pub(super)` unit struct, named in exactly two places (inside
+`enter`, and in its own declaration), so `enter()` is the only expression in the language that can
+bump those statics; both statics are module-private with no other mutator; nothing re-exports the
+type and no macro expands to it. `screen.rs:1777` is the only call in the tree. **Verdict: WIDEN.**
+
+**It moves no verdict and breaks no gate.** `desk=` is diagnostic and appears in *no* abort test on
+*either* arch — the abort is `!stable && (!ok || moved > 0)`, and `stable` reads the FILL ring only.
+`pi4-regression.spec`'s two `[wc-d]` directives (`REQUIRE … bad_cache=0 bad_ram=0.*-> PASS`,
+`FORBID … -> FAIL`) match with `.*` across the field region, so four new fields land between them.
+
+**`:: DESKPAR:` stays.** It is not the same instrument wearing another name: it is free-running (one
+line per 256 loops) and carries `active_max=` and `bytes=`, which a verdict-scoped pair cannot; the
+new fields are sampled at a `[wc-d]` read-back's two boundaries, the correlation DESKPAR structurally
+cannot offer. DESKPAR is also `orinvpar`-gated and off by default, so on a plain `witness` aarch64
+boot it is this bracket or nothing. Its line did have to stop apologising: `interlock=absent
+blocked_on=wm::PANEL_DESK_ACTIVE blocker_gate=witness+x86_64` named a blocker that no longer exists
+and is now `interlock=diagnostic blocked_on=none reader=wc-d:desk=,dact=`.
+
+**Reading rule for aarch64 captures across this commit** — the abort arm previously printed
+`desk=n/a->n/a dact=n/a/n/a` and the LIVE/PASS/FAIL arms omitted the fields entirely. Neither was a
+measurement of zero; both meant *the term was not compiled*. After it, an aarch64 line reads field for
+field as an x86 one, and `desk=E->E dact=0/0` means what it means on the rMBP: no desktop blit loop
+opened or closed under this read-back.
+
+#### `[erase-occ]` is RETIRED — the doc debt WMPAR named, paid
+
+WMPAR P2 removed the second report line `[erase-occ]` that §6.11 introduced, and could not say so
+here. The mechanism is not "it became redundant" — **keeping it would have made it lie.** The
+`[drag-occ]` block `swap`s the `DO_FILL_*` totals to zero as it reads them (that is how a gesture's
+totals are scoped to the gesture). `[erase-occ]` ran AFTER it on the same `drag_report` call, so once
+`[drag-occ]` compiled on aarch64 every fill term `[erase-occ]` printed would have read `0`, on every
+gesture, forever — `clean = fpx == 0 && fovr == 0` unconditionally true, and a gesture that bled
+across the console printing `-> CLEAN`. An instrument whose verdict cannot be false, in the loudest
+variety: one that used to work.
+
+**Field-for-field, so an archived capture stays readable:**
+
+| `[erase-occ]` field | `[drag-occ]` field | Meaning |
+|---|---|---|
+| `win`, `owner`, `moves` | same names | identical |
+| `fill_px` | `fill_px` | erase pixels published over a live occluder — a FORBID term |
+| `fillpub_px` | `fillpub_px` | erase pixels published in total |
+| `fillclip_px` | `fillclip_px` | erase pixels WITHHELD by the clip |
+| `fillover_px` | `fillover_px` | span-walk audit residue — a FORBID term |
+| `fillruns` | `fillruns` | rows the drain walked |
+| `clipn` | `clipn` | boxes in the erase clip |
+| `dock`, `bars`, `bar` | same names | furniture geometry as the clip saw it |
+| `fillclip_dock_px` | `fillclip_dock_px` | of `fillclip_px`, the dock's share |
+| *(absent)* | `neigh`, `neigh_px`, `occ_px`, `clip_px`, `buried`, `direct`, `occdock`, `occclip_dock`, `occclip_dock_px`, `occclip_bar`, `occclip_bar_px` | the WINDOW-BLIT half, which `[erase-occ]` never carried and aarch64 never had |
+
+**The verdict term is the one field whose meaning changed, and it changed STRICTLY.** `[erase-occ]`
+adjudicated `-> CLEAN`/`-> BLEED` on the **two** FORBIDs the erase owns (`fill_px`, `fillover_px`).
+`[drag-occ]` adjudicates on **four** — `clean = opx == 0 && fpx == 0 && direct == 0 && fovr == 0`,
+i.e. `occ_px`, `fill_px`, `direct`, `fillover_px`. So **a gesture that read `-> CLEAN` on the old tag
+can legitimately read `-> BLEED` on the new one with no regression behind it**: the two extra terms
+belong to the window blit, they were always live, and on aarch64 nothing was asking them. That is the
+point of the port — the Orin and the Pi are now asked the same four questions as the rMBP, and
+`x86-witness.spec`'s `FORBID \[drag-occ\] .*-> BLEED` is a gate the arm specs may adopt verbatim
+rather than approximate.
+
+#### What this arc corrected in this file (re-derived, not inherited)
+
+Every line number below was re-derived against the pre-edit file; all four cited in the handoff held.
+
+| Line (pre-edit) | Claim struck |
+|---|---|
+| 117 | §3 table, WCD-TEARDOWN row: *"aarch64 has no interlock at all"* — false in both halves since WMPAR, doubly so now. |
+| 121 | §3 table, occlusion-witness row: `[drag-occ]`'s `occclip_*` *"deliberately still x86"*. |
+| 1562 | §6.10 owed item 2, the same claim in its original voice. |
+| 1589 | §6.11's M1 table row presenting `[erase-occ]` as a live new line. |
+| 1603–1630 | §6.11's *"why it is a new tag"* subsection and its sample capture. |
+| 1655 | §6.11's gates bullet on `[erase-occ]`'s legitimate absence on the knob-off leg. |
+| 1663 | §6.11 owed item 1. |
+
+#### Gates
+
+* `./arroyo check` — **CHECK_EXIT=0**, both arches, at the widened tree (baseline also 0).
+* **Go-red proof**, because a green gate that would also be green with the code absent proves nothing.
+  A deliberate `E0308` planted inside the newly-armed `DeskWriteGuard::enter` body reddened **26
+  aarch64 legs** — `arm-pi`, `arm-tegra` and its 23 variants, `arm-desk-noel0` — with
+  `expected u32, found usize` at `wm.rs:7649`; the featureless `aarch64` syntax leg stayed green,
+  which is correct (it carries no `witness`, so the guard is not compiled there). Restore proven by
+  `sha256` on both files, before and after, identical.
+* **Artifact proof, not diff proof.** A missing `serial_println!` is not a type error and no compile
+  leg reports one. In the built **aarch64** kernel, `nm` shows `video2wm16PANEL_DESK_EPOCH` and
+  `video2wm17PANEL_DESK_ACTIVE` in `.bss` — both ABSENT from the same build at the base sha, which
+  carries only `PANEL_FILL_EPOCH` — and `Screen::present_background` grew from **3864 to 3936 bytes**,
+  the bracket's own cost. `LC_ALL=C grep -a -o` (never `strings`) confirms the reworded `:: DESKPAR:`
+  wire: `interlock=diagnostic blocked_on=none` and `reader=wc-d:desk=,dact=` present in the armed
+  image and absent from the base, `interlock=absent blocked_on=wm::PANEL_DESK_ACTIVE` and
+  `blocker_gate=witness+x86_64` the other way round. Note for anyone repeating this: `desk=`/`dact=`
+  themselves are 6-byte fragments and were ALREADY in the aarch64 `.rodata` via the abort arm's `n/a`
+  form, so no grep on them could have decided anything — the symbol table is the falsifier here.
+* **Byte-identity — achieved, not approximated.** Every substitution in `wm.rs` and `screen.rs` is
+  **1:1 in place**: each diff hunk is `-N,C +N,C`, so no line in either file changes its number. The
+  x86 `objcopy -O binary` image is **byte-identical** across the change
+  (`3766aa6e…`), with a determinism control first — two independent builds of the baseline source in
+  separate target dirs reproduce the same hash. This mattered concretely: a first cut that was
+  line-count neutral at the FILE level but not at the LINE level (the ledger added above one hunk,
+  paid back at another 8000 lines away) produced an image of **identical size with 8 differing
+  bytes** — panic `Location` line constants, exactly the drift the convention exists to prevent, and
+  invisible to any check short of the byte compare.
 
 ---
 
