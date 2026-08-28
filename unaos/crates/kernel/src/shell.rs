@@ -21,9 +21,7 @@ use crate::fs::fat::{DirEntry, FatError, FatFs};
 // The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module, and since DECRUD-1 a
 // knob-gated one — see the `pub mod vug` note in `lib.rs`. The verbs that drive it carry the identical
 // gate, so wherever the module is not compiled they are not registered at all and the words fall
-// through to the normal unknown-command reply: on x86 always, and on the Pi unless `UNAOS_VUGDEMO=1`.
-#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
-use crate::vug;
+// through to the normal unknown-command reply on every arch (DECRUD-2 retired the in-kernel demos).
 use crate::pal::TargetPal;
 
 // STORM-X86: the module that owns the user address-space slot POOL, aliased per-arch so the `storm`
@@ -2502,10 +2500,6 @@ fn midden_facts() -> midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
         x86: cfg!(target_arch = "x86_64"),
         v3d: cfg!(all(target_arch = "aarch64", feature = "v3d")),
-        // BARENAME (§6.6a): the knob the `vug`/`pulse` match arms actually carry. It is a pure
-        // `feature` read — `Avail::VugDemo` composes it with `aarch64` — so this line says one
-        // thing and says it truthfully: DEFAULT OFF, and off means the words are not verbs.
-        vugdemo: cfg!(feature = "vugdemo"),
         proc_verbs,
         proc_rows,
         // BARENAME (PARITY §6.6a): bare-name launch exists exactly where the PROCESS VERBS exist.
@@ -2647,7 +2641,6 @@ pub fn midden_witness() {
         proc_rows: midden_facts().proc_rows,
         aarch64: false,
         v3d: false,
-        vugdemo: false,
     };
 
     // 1. dispatch — a core verb is answered by the core, with real text.
@@ -2951,12 +2944,12 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // x86 neither `vug` nor `pulse` is registered (the demo module is aarch64-only), so nothing here
     // takes the screen: claiming otherwise would suppress the console repaint that carries the
     // "Unknown command" reply, and typing `vug` would present as a hang instead of a refusal.
-    // DECRUD-1 adds the `vugdemo` half of exactly that rule: knob-off the two arms below are not
-    // registered on aarch64 either, so the words must stop claiming the screen there too.
+    // DECRUD-2 retired the in-kernel `vug`/`pulse` arms outright, so on aarch64 only `v3d` can
+    // claim the screen; the two words are ordinary unrecognised commands on every arch now.
     #[cfg(all(target_arch = "aarch64", feature = "v3d"))]
-    let took_screen = (cfg!(feature = "vugdemo") && (command == "vug" || command == "pulse")) || command == "v3d";
+    let took_screen = command == "v3d";
     #[cfg(all(target_arch = "aarch64", not(feature = "v3d")))]
-    let took_screen = cfg!(feature = "vugdemo") && (command == "vug" || command == "pulse");
+    let took_screen = false;
     #[cfg(not(target_arch = "aarch64"))]
     let took_screen = false;
 
@@ -3873,28 +3866,6 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
         // x86, where the verb is therefore an ordinary unrecognised word. DECRUD-1: and on the
-        // `vugdemo` knob, DEFAULT OFF — knob-off the verb is that same unrecognised word on the Pi,
-        // and `VUG.ELF` (`run vug`) is the program that does this for real, in ring 3.
-        #[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
-        "vug" => {
-             match args.first().copied() {
-                 Some("bebox") => {
-                     console.println("Vug: BeBox tribute (press any key)...");
-                     vug::run_bebox_mode(pal);
-                     // Tribute screen stays up; `took_screen` keeps the console off it.
-                 }
-                 Some("wire") => {
-                     console.println("Vug: sculpting the quartz (wireframe)...");
-                     vug::run_crystal(pal, vug::Mode::Wire);
-                     console.draw(pal); // clean exit: restore the shell over the demo
-                 }
-                 _ => {
-                     console.println("Vug: sculpting the quartz (solid)...");
-                     vug::run_crystal(pal, vug::Mode::Solid);
-                     console.draw(pal); // clean exit: restore the shell over the demo
-                 }
-             }
-        },
         // PI-APP-1: the V3D visible-battery app. Registered in the same launcher path as `vug` (a
         // shell-command match arm — the kernel's convention for a launchable UI program). It replays
         // the four visible V3D stages (gradient / animate / multi-primitive / blit) onto the live
@@ -3913,18 +3884,6 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 console.draw(pal);
             }
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
-        },
-        // UI1-M3's full-screen monitor draws through the same `vug` module, so it is gated the same
-        // way — arch AND (DECRUD-1) the `vugdemo` knob. x86 keeps the per-core instrument it always
-        // had — the `ui_status` strip and `sched` — and this verb is an unrecognised word there;
-        // knob-off the Pi is in the same position, with `PULSE.ELF` (`run pulse`) as the real one.
-        #[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
-        "pulse" => {
-            // UI1-M3: the full-screen system monitor (BeOS Pulse homage). Any key exits; the
-            // console repaints over it on the way out (same contract as the vug crystal).
-            console.println("Pulse: system monitor (press any key)...");
-            vug::run_pulse(pal);
-            console.draw(pal); // clean exit: restore the shell over the monitor
         },
         "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the

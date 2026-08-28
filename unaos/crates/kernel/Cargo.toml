@@ -311,7 +311,6 @@ simmer_test = []
 # never a demo, the VUG-HONESTY classifier entry point and its `parked_display_witness`, moved to
 # `ui_status` (ungated, both arches), so the witness survives with this feature off.
 # See docs/dev/OS/kernel-decrud.md §3.1.
-vugdemo = []
 # USB bring-up debug view for serial-less hardware: run the full main-loop USB path (enumeration +
 # storage + hubs) but KEEP the boot log on the framebuffer (no GUI takeover, no fbcon detach) and
 # print each input event, so external USB storage/keyboard/mouse enumeration AND live keypresses /

@@ -2545,12 +2545,6 @@ check_user_arch() {
 #   REAL HOLES — swept onto the x86 mix legs by the "assume x86" rule, where every site is behind an
 #   aarch64 qualifier and compiles GREEN and VACUOUS; named by no arm-* leg either, so the armed
 #   polarity is type-checked by NOTHING (5):
-#     * `vugdemo` — the worst of them, because the gate is a MODULE declaration:
-#       `#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))] pub mod vug;` (lib.rs), with the
-#       matching `use` and the two shell verb arms in `shell.rs`. No leg compiles `src/vug.rs` at all
-#       — roughly 1.3 kloc of Ring-0 renderer, plus its `vugras::frame_sweep` call, checked by no
-#       gate in this repo. (Its `cfg!(feature = "vugdemo")` EXPRESSION sites in `shell.rs` are fine,
-#       for the same reason `vugras` is.) Pi lane.
 #     * `orinvpar` — every site is `all(target_arch = "aarch64", feature = "witness", feature =
 #       "orinvpar")` in `video/menubar.rs`, or `all(feature = "orinvpar", target_arch = "aarch64")` in
 #       `video/screen.rs`. The arm-tegra-* legs already carry `witness`, so ONE leg naming this knob
@@ -3519,7 +3513,6 @@ check_kernel_cfg() {
     # wearing a green verdict). Those FAIL here unless allowlisted below.
     #
     # Allowlist — KNOWN holes, each pre-assigned to the track that owns it (census block above):
-    #   vugdemo                          Pi lane   (module-decl gate; ~1.3 kloc compiled by no leg)
     #   v3d_hubcm v3d_pmcycle v3d_ptbbracket  Pi lane   (armed polarity checked by no leg)
     # Removing an entry here without adding the leg reintroduces a silent hole — don't.
     #
@@ -3546,7 +3539,7 @@ check_kernel_cfg() {
     esac
     for _kl_f in $_kl_declared; do
         case "$_kl_covered" in *",${_kl_f},"*) continue ;; esac
-        case "$_kl_f" in vugdemo|v3d_hubcm|v3d_pmcycle|v3d_ptbbracket) continue ;; esac
+        case "$_kl_f" in v3d_hubcm|v3d_pmcycle|v3d_ptbbracket) continue ;; esac
         if grep -rlq "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/arch/aarch64/" 2>/dev/null \
            || grep -rn "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/" 2>/dev/null | grep -q 'target_arch = "aarch64"'; then
             _kl_miss="${_kl_miss} ${_kl_f}"
@@ -5345,24 +5338,6 @@ kernel8() {
     if [ -n "${UNAOS_PIRAST:-}" ]; then
         K8_FEATS="${K8_FEATS},pirast"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIRAST: software-rasterizer spinning cube on the BCM2711 panel (first 3D pixels on the Pi; 90 paced frames, then the shell repaints)${COLOR_RESET}"
-    fi
-    # DECRUD-1: UNAOS_VUGDEMO=1 adds the `vugdemo` feature — the IN-KERNEL `vug` / `vug wire` /
-    # `vug bebox` / `pulse` shell demos (crates/kernel/src/vug.rs, ~1.3 kloc of fixed-point software
-    # renderer, BeOS-Pulse-homage monitor and BeBox tribute screen). DEFAULT OFF, and this is the
-    # DEFAULT-QUIET law applied to a demo rather than to a witness family: the three verbs have shipped
-    # EL0 replacements that this very image already stages into its FAT root — VUG.ELF (crates/user-vug)
-    # and PULSE.ELF (crates/user-pulse) — and the bench runs those (`UVUG:` streams while the in-kernel
-    # `[vugfps]` counter reads 0). No boot path on either arch calls into the module; the only way in is
-    # an operator typing at the console. So OFF unlinks the whole demo and every default kernel8.img
-    # stops carrying a Ring-0 3D renderer that nothing on the machine can reach. NOT a witness gate:
-    # `parked_display_witness` (VUG-HONESTY) moved to `ui_status` first, precisely so this knob cannot
-    # take a metal-earned falsifier off a boot. K8_FEATS is CURATED (like UNAOS_PIRAST above), so the arm
-    # must be here or the feature never reaches the Pi image; `builder/src/main.rs` is deliberately NOT
-    # touched — builder makes the x86/virt ESP media, and vug.rs is aarch64-only.
-    # See docs/dev/OS/kernel-decrud.md §3.1.
-    if [ -n "${UNAOS_VUGDEMO:-}" ]; then
-        K8_FEATS="${K8_FEATS},vugdemo"
-        echo -e "${COLOR_YELLOW}  • UNAOS_VUGDEMO: the in-kernel vug/pulse/bebox shell demos (default OFF — VUG.ELF/PULSE.ELF in ring 3 are the real ones)${COLOR_RESET}"
     fi
     # PI-DESK: UNAOS_PIDESK=1 adds the `desktop_firmware` feature — the desktop FURNITURE family on the Pi panel.
     # Compiles `video::strip` (the furniture-strip primitive), `video::dock` (the window switcher),
