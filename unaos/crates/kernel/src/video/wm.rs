@@ -1022,11 +1022,18 @@ pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
 /// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`).
 pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
 
-/// CLICK-X86: the desktop furniture's row. **No producer since the kernel-apps eviction** — it named
-/// `desktop_uefi::activate`'s kernel-drawn demo window, which is now a ring-3 process (`STAT.ELF`) owning an
-/// ordinary user row. Kept as a RESERVED value rather than deleted: [`is_kernel_owner`] is a range
-/// test over the whole band, the console row above still uses it, and the next piece of kernel-owned
-/// desktop furniture should take this number rather than mint a third one.
+/// CLICK-X86: the desktop furniture's row — since SHELLWIN, **the LIVE SHELL's own window** (the
+/// singleton row `open_shell_window`/`dock::pin_shell` mint and WCSER-REMINT adopts; see the
+/// singleton ledger at [`shell_row_geometry`]). Its first tenancy — `desktop_uefi::activate`'s
+/// kernel-drawn demo window — was evicted to a ring-3 process (`STAT.ELF`) owning an ordinary user
+/// row, and the value was then re-used for the shell window rather than a third number minted.
+///
+/// FURNITUREFOCUS (flight 3 D-7): "unreachable as a user focus TARGET" means no input ring exists
+/// behind this ASID — the click router's furniture arms hand the KEYBOARD to the shell (slot 0)
+/// instead, and `focus_changed(KERNEL_OWNER_DESKTOP)` is only the visible half (raise + chrome
+/// highlight). Whether slot 0 actually drains is the render task's shell-tuple binding, published
+/// through `syscall::shell_key_sink_note` — the flight-3 strand was this value focused while that
+/// sink was dead, which the router's deflection now forbids.
 pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
 
 /// CLICK-X86 — is `asid` in the reserved kernel-owner band? `false` for `0`, which still means

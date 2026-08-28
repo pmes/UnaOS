@@ -6543,6 +6543,17 @@ fn x86_render_service(cpu: usize) {
     let mut shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
     #[cfg(feature = "wc")]
     let mut shell_dirty = false;
+    // FURNITUREFOCUS — publish where a slot-0 keystroke LANDS as of this binding, so the click
+    // router's furniture arms can decline a keyboard hand-off into a dead sink (flight 3 D-7:
+    // the corpse shell read as "keyboard gone" because `user_input_set_active(0)` pointed at a
+    // tuple this task never bound). One line, computed FROM the tuple rather than alongside it,
+    // so every arm above — boot mint, its decline, the WCSER-REMINT adoption and each of its
+    // decline arms — is covered by construction and cannot drift from the truth it publishes.
+    #[cfg(feature = "wc")]
+    unaos_kernel::arch::x86_64::syscall::shell_key_sink_note(
+        desktop,
+        shell_id != unaos_kernel::video::wm::WIN_NONE,
+    );
 
     if desktop {
         serial_println!(
@@ -6911,6 +6922,10 @@ fn x86_render_service(cpu: usize) {
                             unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
                         );
                         unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                        // FURNITUREFOCUS — the reopen re-binds the tuple, so the slot-0 sink is
+                        // live again: re-declare it so furniture clicks resume handing the
+                        // keyboard to the shell.
+                        unaos_kernel::arch::x86_64::syscall::shell_key_sink_note(true, true);
                         shell_dirty = false;
                         serial_println!("[shellwin] reopen win={} route=dock == witness ::", id);
                     }

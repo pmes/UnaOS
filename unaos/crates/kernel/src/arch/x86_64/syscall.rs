@@ -5498,6 +5498,101 @@ pub fn user_input_active() -> u64 {
     USER_INPUT_ACTIVE.load(Ordering::Acquire)
 }
 
+// ── FURNITUREFOCUS — where does a slot-0 keystroke actually LAND? ────────────────────────────
+//
+// `user_input_set_active(0)` says "the shell owns the keyboard", and every furniture arm of the
+// click router says it on a press over a kernel-band row. But "the shell" is not always a live
+// key sink on this arch: on the crispy desktop the render task routes slot-0 keys into its shell
+// WINDOW tuple (`main.rs`, the SHELLWIN key arm), and that arm DROPS the key when no tuple is
+// bound (`shell_id == WIN_NONE`) or fences the present off when the row is gone. Flight 3 D-7 is
+// the priced consequence: four rehomes in, the live render instance ran with an empty tuple, a
+// real trackpad click on the corpse shell row (asid 0xffffff02) took the furniture arm, the
+// keyboard went to slot 0 — and slot 0 drained into nothing. The postmortem read "focus parked on
+// kernel furniture"; the parked half was really the slot-0 sink being dead. WCSER-REMINT closes
+// the common case (the rescue instance re-binds the tuple); what remains are its own decline arms
+// (`alloc`, `row-changed`, no-row-no-desktop) and the closed-shell-row window, in which the OLD
+// behaviour let a furniture click yank the keyboard from a working app into the void.
+//
+// So the render task now PUBLISHES the sink state, and the furniture arms consult it: when the
+// sink is dead the press is still consumed and the row still raised (the visible half of the
+// gesture), but the keyboard STAYS where it was — a no-op instead of a strand. Three states:
+const SHELL_SINK_BACKDROP: u8 = 0; // slot-0 keys go to the backdrop console — always drains (default; also every pre-render / wc-off state, which keeps the old behaviour there)
+const SHELL_SINK_WINDOW: u8 = 1; // desktop: keys go to the bound shell WINDOW — drains iff the KERNEL_OWNER_DESKTOP row is still live (an operator close or wedge-abandon teardown kills it with no extra hook)
+const SHELL_SINK_UNBOUND: u8 = 2; // desktop with NO bound tuple (a REMINT decline arm) — keys are dropped by the SHELLWIN key arm
+static SHELL_KEY_SINK: AtomicU8 = AtomicU8::new(SHELL_SINK_BACKDROP);
+
+/// FURNITUREFOCUS — the render task's declaration of where slot-0 keystrokes land, made wherever
+/// the shell tuple binding changes (task bring-up, the WCSER-REMINT arms via the same binding, the
+/// dock reopen). `desktop == false` means the backdrop console is the sink (always live).
+pub fn shell_key_sink_note(desktop: bool, bound: bool) {
+    let s = if !desktop {
+        SHELL_SINK_BACKDROP
+    } else if bound {
+        SHELL_SINK_WINDOW
+    } else {
+        SHELL_SINK_UNBOUND
+    };
+    SHELL_KEY_SINK.store(s, Ordering::Release);
+}
+
+/// FURNITUREFOCUS — raw state save/restore, for the selftest's deflect leg only (its one caller,
+/// hence its gate).
+#[cfg(feature = "witness")]
+fn shell_key_sink_raw() -> u8 {
+    SHELL_KEY_SINK.load(Ordering::Acquire)
+}
+#[cfg(feature = "witness")]
+fn shell_key_sink_set_raw(v: u8) {
+    SHELL_KEY_SINK.store(v, Ordering::Release);
+}
+
+/// FURNITUREFOCUS — can a keystroke handed to the shell (slot 0) actually be drained right now?
+fn shell_keys_reachable() -> bool {
+    match SHELL_KEY_SINK.load(Ordering::Acquire) {
+        SHELL_SINK_UNBOUND => false,
+        SHELL_SINK_WINDOW => {
+            // The row is the live half of the binding: the tuple can outlive the row (a stale
+            // `shell_id` after the operator's close box — the present is fenced to `NoRow` and the
+            // keys go nowhere visible), so "bound" alone is not "drains".
+            #[cfg(feature = "wc")]
+            {
+                crate::video::wm::shell_row_geometry().is_some()
+            }
+            #[cfg(not(feature = "wc"))]
+            {
+                true
+            }
+        }
+        _ => true,
+    }
+}
+
+/// FURNITUREFOCUS — bounded witness budget for the deflection line: operator-rate by nature (a
+/// hand on furniture), capped for the same reason every `[clickroute]` line is. The selftest's
+/// deflect leg burns exactly one proving the line fires from the live router (the CLICK-BAND
+/// rule); the rest are the metal's.
+static FURNDEFLECT_LOGGED: AtomicU32 = AtomicU32::new(0);
+const FURNDEFLECT_LOG_MAX: u32 = 4;
+
+/// FURNITUREFOCUS — the furniture arms' keyboard half. When the shell can drain keys, hand the
+/// keyboard over exactly as before (flight 3's D-7 lesson as WCSER-REMINT states it: desktop
+/// focus = shell keyboard). When it cannot, LEAVE THE KEYBOARD WHERE IT IS — the raise still
+/// happens (the caller's `focus_changed`), the press is still consumed, but a working app's
+/// keystream is never redirected into a sink that drains nothing. Named on the wire once per
+/// budget slot so a capture can tell a deflection from a routing miss.
+fn furniture_keyboard_to_shell(owner: u64, cur: u64) {
+    if shell_keys_reachable() {
+        user_input_set_active(0);
+    } else if cur != 0
+        && FURNDEFLECT_LOGGED.fetch_add(1, Ordering::Relaxed) < FURNDEFLECT_LOG_MAX
+    {
+        serial_println!(
+            "[clickroute] furniture deflect owner={:#x} keep={:#x} sink=dead — keyboard stays put",
+            owner, cur
+        );
+    }
+}
+
 /// WINX-7: `(delivered, dropped, focus_revokes)` — the router's own accounting, for the witness line.
 pub fn user_input_stats() -> (u64, u64, u64) {
     (
@@ -7512,9 +7607,11 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 // TITLE BAR / BORDER — raise and focus through the SAME primitives the content arms
                 // use (no second focus mechanism), then, on the title strip only, grab the window.
                 // Kernel furniture and focus-exempt rows keep their own rule: raise the row, but
-                // hand the KEYBOARD to the shell rather than to a program with no input ring.
+                // hand the KEYBOARD to the shell rather than to a program with no input ring —
+                // FURNITUREFOCUS: unless the shell cannot drain it, in which case the keyboard
+                // stays put (see `furniture_keyboard_to_shell`).
                 if crate::video::wm::is_kernel_owner(owner) || owner_is_focus_exempt(owner) {
-                    user_input_set_active(0);
+                    furniture_keyboard_to_shell(owner, cur);
                 } else if owner != cur {
                     user_input_set_active(owner);
                 }
@@ -7535,9 +7632,11 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         }
         match crate::video::wm::hit_test(x, y) {
             // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
+            // FURNITUREFOCUS: the hand-off happens only while the shell can drain a key; a dead
+            // slot-0 sink deflects it and the keyboard stays with the focused app (flight 3 D-7).
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
-                user_input_set_active(0);
+                furniture_keyboard_to_shell(owner, cur);
                 crate::video::wm::focus_changed(owner);
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
@@ -7565,7 +7664,9 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             // used to mean the opposite.
             Some((win, owner, _z)) if owner_is_focus_exempt(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
-                user_input_set_active(0);
+                // FURNITUREFOCUS — same deflection as the kernel arm above: the two arms are one
+                // rule ("furniture hands the keyboard to the shell") and share its exception.
+                furniture_keyboard_to_shell(owner, cur);
                 crate::video::wm::focus_changed(owner);
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
@@ -7709,6 +7810,11 @@ static CLICK_SURF: ClickSurf = ClickSurf([0x0020_4060; 64]);
 ///     the shell. Skipped, and said so, if the live panel leaves no unowned point to probe.
 ///  6. **nofab** — the release that follows a CONSUMED press is dropped rather than delivered. A
 ///     release in an app that never saw the press is a fabricated click; the sentinel forbids it.
+///  7. **deflect** — FURNITUREFOCUS: with the shell's slot-0 key sink declared dead (the flight 3
+///     post-rehome state — desktop, no bound shell tuple), a press over the same kernel row is
+///     still consumed and raised, but the keyboard STAYS with the focused app and its ring still
+///     drains a subsequent event. The direction the old shape failed: `user_input_set_active(0)`
+///     unconditionally, stranding the keystream in a sink that drops every key.
 ///
 /// Self-cleaning: the probe rows are closed, the input focus is restored to whatever held it, and
 /// `wm::focus_reset` un-names the synthetic focus owner.
@@ -7833,14 +7939,34 @@ pub fn clickroute_selftest() {
         None => None,
     };
 
+    // Leg 7 — FURNITUREFOCUS: the sink-dead deflection, driven through the LIVE router. The state
+    // is the one flight 3 D-7 recorded: a desktop whose render instance has no bound shell tuple
+    // (four rehomes in, pre-REMINT — and REMINT's own decline arms still reach it). A furniture
+    // press must then be a keyboard NO-OP: consumed, raised, but `USER_INPUT_ACTIVE` untouched and
+    // the previous owner's ring still draining. Saved/restored around the probe so the real
+    // machine state (and every later leg of the boot) is undisturbed.
+    let sink_saved = shell_key_sink_raw();
+    shell_key_sink_note(true, false);
+    user_input_set_active(OWNER_A);
+    wm::focus_changed(OWNER_A);
+    let d_consumed = wc_click_route_at(Event::Button(1), kpx, kpy);
+    let d_kept = user_input_active() == OWNER_A;
+    // The keystream still reaches the previous owner: one event routed into the ACTIVE ring lands
+    // in A's ring (the arrival reset it, so the depth read is exact).
+    let d_drains = user_input_enqueue(Event::Button(1)) && user_input_depth(OWNER_A) == 1;
+    let d_nofab = wc_click_route_at(Event::Button(0), kpx, kpy);
+    let deflect_ok = d_consumed && d_kept && d_drains && d_nofab;
+    shell_key_sink_set_raw(sink_saved);
+
     let ok = hit_ok
         && deliver_ok
         && depth_ok
         && kernel_ok
         && nofab_ok
+        && deflect_ok
         && desktop_ok.unwrap_or(true);
     serial_println!(
-        "[clickroute] route hit={} deliver={} depth={}/{} kernel={} desktop={} nofab={} -> {}",
+        "[clickroute] route hit={} deliver={} depth={}/{} kernel={} desktop={} nofab={} deflect={} -> {}",
         hit_ok,
         deliver_ok,
         depth_press,
@@ -7851,6 +7977,7 @@ pub fn clickroute_selftest() {
             None => "skip",
         },
         nofab_ok,
+        deflect_ok,
         if ok { "PASS" } else { "FAIL" }
     );
 

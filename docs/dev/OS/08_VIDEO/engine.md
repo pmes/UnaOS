@@ -2539,6 +2539,47 @@ nothing, it adopted) and the row live and compositing after (`[wcn] win=1 asid=0
 73 PASS / 0 FAIL. `UNAOS_WC=1 ./arroyo test 150` (`wc` in the features banner): 68 PASS / 0 FAIL /
 0 panic, and no `[wedgeinj]`/re-mint lines — the knob-off build carries none of it.
 
+#### FURNITUREFOCUS — a furniture click never hands the keyboard to a sink that drains nothing (2026-08-27)
+
+**The gap (flight 3 D-7, rmbp7).** At 798 453 ms a real trackpad click landed on the shell-furniture
+window (win=2, `KERNEL_OWNER_DESKTOP` = 0xffffff02) and the postmortem read the resulting
+`[wc-fv] focus raise asid=0xffffff02` / `[vugmin] focus asid=0xffffff02` pair as *"focus parked on
+kernel furniture — keys went to a window that consumes nothing"*. The routing was in fact correct:
+the router's furniture arms already did `user_input_set_active(0)` (keyboard to the SHELL) +
+`focus_changed(owner)` (the raise — which never moves the keyboard). The dead half was the **slot-0
+sink itself**: four rehomes in, the live render instance ran with an EMPTY shell tuple
+(`shell_id == WIN_NONE`, the pre-REMINT rescue shape), and the SHELLWIN key arm in `main.rs` drops
+every slot-0 key when no tuple is bound. So the same `focus_changed(KERNEL_OWNER_DESKTOP)` has one
+meaning ("desktop focus = shell keyboard", the pair WCSER-REMINT deliberately runs after adoption,
+when the sink is live) and had another that flight ("keyboard re-routed into the void"). REMINT
+closes the common corpse case; still reachable without this arc were its own decline arms
+(`alloc`, `row-changed`, no-row-off-desktop) and the stale-tuple window after an operator/teardown
+close of the shell row — in each, a click on ANY kernel furniture (console included) yanked the
+keyboard from a working app into a sink that drains nothing.
+
+* **The sink is now published, then consulted.** The x86 render task declares where a slot-0
+  keystroke lands (`syscall::shell_key_sink_note`), computed FROM the tuple binding at task
+  bring-up (covering boot mint, its decline, and every REMINT arm by construction) and re-declared
+  at the dock reopen. Three states: backdrop console (always drains — the default, so wc-off and
+  pre-render behaviour is untouched), bound window (drains iff the `KERNEL_OWNER_DESKTOP` row is
+  still live — `shell_row_geometry()`, so a closed row needs no extra hook), unbound (drops).
+* **The deflection (`furniture_keyboard_to_shell`).** All three furniture keyboard-hand-off seams
+  in `wc_click_route_at` (chrome arm's kernel/exempt branch, the KERNEL FURNITURE content arm, the
+  DESKTOP-APP FURNITURE arm) route through one helper: sink live → `user_input_set_active(0)`
+  exactly as before; sink dead → the press is still consumed and the row still raised (the visible
+  half of the gesture), but `USER_INPUT_ACTIVE` is left untouched — the focused app keeps its
+  keystream. A no-op instead of a strand; never a state where keyboard input goes nowhere.
+* **REMINT's chain is untouched:** its `user_input_set_active(0)` + `focus_changed` pair is called
+  directly (not through the router helper), and a successful adoption re-binds the tuple, which is
+  exactly what makes the sink read "live" again.
+* **Witness.** `[clickroute] furniture deflect owner=<asid> keep=<asid> sink=dead — keyboard stays
+  put`, lifetime-budgeted at 4 lines (the selftest's leg burns one proving the line fires from the
+  live router, the CLICK-BAND rule).
+* **Fixture.** `clickroute_selftest` leg 7 (`deflect=` on the `[clickroute] route …` verdict):
+  declares the flight-3 state (desktop, unbound), presses the synthetic kernel row from a live app
+  focus, and asserts consumed + keyboard kept + the previous owner's ring still draining + the
+  release dropped; the real sink state is saved/restored around the probe.
+
 #### SHELLWIN-PI — the same shell window, on the other chip (2026-08-13, landed 2026-08-17 on the CONSWIN-PI tip)
 
 **The ruling this closes.** *"THIS IS ONE OS. THE X86 PART IS NOT SEPARATE, IT JUST RUNS ON A
