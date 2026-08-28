@@ -700,7 +700,7 @@ pub fn _print(args: core::fmt::Arguments) {
     // PANEL-DEFER (x86; aarch64 under ORIN-DEFER): mirror through the split layout/paint path when the
     // draw target is VRAM (no cached-RAM shadow) and we are not on the panic path. See `panel_mirror`.
     #[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "orindefer")))] // ORIN-DEFER — THE PORT. This is the one gate that kept the whole split layout/paint path x86-only; every callee below already compiled on aarch64. See the `orindefer` note in Cargo.toml. ⚠ SAME-LINE attribute widening.
-    if defer_route_open() { defer_note_seen(); // ORIN-DEFER — the panic gate, arch-split at the file tail. On x86 this IS `!PANIC_MIRROR.load(Relaxed)`, unchanged byte for byte. It could NOT be that on aarch64: `PANIC_MIRROR`'s only `store` is `#[cfg(target_arch = "x86_64")]` (`panic_screen`), so on this arch the flag is permanently `false` and reading it would route PANIC output through the split path — the one case the x86 design excludes by name. The aarch64 arm reads `serial_ring::in_panic_mode()` instead, which the `#[panic_handler]` sets BEFORE `panic_screen()` and before its first `serial_println!`. Then: one charge per line reaching the armed route, taken BEFORE it decides, so `seen` is the denominator every other counter is read against and the census fires even on a boot where the split path never once won. The census latch is set before its print, so the nested `_print` that print causes cannot re-enter it. ⚠ SAME-LINE fold.
+    if defer_route_open() { defer_note_seen(); // ORIN-DEFER — the panic gate, arch-split at the file tail. On x86 this IS `!PANIC_MIRROR.load(Relaxed)`, unchanged byte for byte. It is not that on aarch64, and PANICARM did not make it one: `PANIC_MIRROR` is written on this arch too now, but INSIDE `panic_screen`, whereas the aarch64 arm reads `serial_ring::in_panic_mode()` — set by the `#[panic_handler]` BEFORE `panic_screen()` and before its first `serial_println!`, so it is true EARLIER and is true as well for a panic that never reaches `panic_screen`. Routing PANIC output through the split path is the one case the x86 design excludes by name, so each arm takes the signal that closes that window widest. Then: one charge per line reaching the armed route, taken BEFORE it decides, so `seen` is the denominator every other counter is read against and the census fires even on a boot where the split path never once won. The census latch is set before its print, so the nested `_print` that print causes cannot re-enter it. ⚠ SAME-LINE fold.
         let mut sink = PanelSink::new();
         let _ = core::fmt::Write::write_fmt(&mut sink, args);
         if sink.finish() {
@@ -2640,14 +2640,14 @@ pub fn orin_face_arm() {
 
 /// ORIN-DEFER — **is the split layout/paint route open for this line?**
 ///
-/// The panic gate, arch-split because it could not be shared. On x86 this is
+/// The panic gate, arch-split because the two arches do not have the same EARLIEST panic signal.
+/// Sending PANIC output down the split path is what the x86 design excludes by name ("a panic must
+/// never find the `FBCON` lock held by a preempted paint"), so each arm takes whichever signal is
+/// already true by the time the first panic line reaches `_print`. On x86 that is
 /// `!PANIC_MIRROR.load(Relaxed)` — the exact expression [`_print`] carried before this arc, unchanged
-/// byte for byte. On aarch64 it could NOT be: `PANIC_MIRROR`'s only `store` is
-/// `#[cfg(target_arch = "x86_64")]` (see [`panic_screen`]), so on this arch the flag is permanently
-/// `false` and reading it would send PANIC output down the split path — precisely the case the x86
-/// design excludes by name ("a panic must never find the `FBCON` lock held by a preempted paint").
-/// The aarch64 arm reads [`crate::serial_ring::in_panic_mode`], which the `#[panic_handler]` sets
-/// BEFORE `panic_screen()` and before its first `serial_println!`, and which is arch-neutral.
+/// byte for byte. On aarch64 it is [`crate::serial_ring::in_panic_mode`], set by the
+/// `#[panic_handler]` BEFORE [`panic_screen`] and before its first `serial_println!` — EARLIER than
+/// `PANIC_MIRROR` (which PANICARM now writes on this arch too), and true for a panic that never reaches `panic_screen` at all. The arm that closes the window widest wins; the two do NOT merge.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn defer_route_open() -> bool {
