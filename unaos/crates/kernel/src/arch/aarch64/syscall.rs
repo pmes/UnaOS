@@ -13418,6 +13418,85 @@ pub fn user_input_set_active(asid: u64) {
     user_input_wake_edge(asid, "focus");
 }
 
+// ── SINKVALID — may this ASID be handed the KEYBOARD at all? ──────────────────────────────────────
+//
+// `user_input_set_active` stores ANY u64, but `user_input_enqueue` only ever pushes into `1..=USER_SLOTS`
+// (its own guard: `if asid == 0 || asid as usize > USER_SLOTS { return false }`). Everything outside that
+// range is a PSEUDO-ASID — a `video::wm` row owner naming a kernel-drawn surface (`wm::KERNEL_OWNER_*`) or
+// a fixture row — and it has NO RING. Focus parked on one is a keyboard pointed at nothing: the router
+// accepts the keystroke and the ring seam refuses it, four hops later, silently.
+//
+// MEASURED, on the Jetson bench (`~/unaos-bench/capture/line-acm0/orin.log`, `LC_ALL=C grep -a`):
+//
+//   :13084  [clickroute] press hit asid=4294967042 win=1 (was 0) delivered
+//   :13085  [orinclick] edge=press … owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED
+//   :13089  [orinclick] census … focus=0xffffff02 -> ROUTING            (and three more after it)
+//
+// `4294967042` is `0xffffff02` is `wm::KERNEL_OWNER_DESKTOP`. The press took the `owner != cur` arm below
+// and its `user_input_set_active(owner)`; the two arms above it that would have caught the case are
+// `#[cfg(feature = "desktop_firmware")]` and that image had the knob off. Keys reached the shell on that
+// boot only BY ACCIDENT — `main.rs::jd2_console_pump` feeds `handle_key` regardless of focus — and the
+// accident is not a property: with `orininput` armed, `xusb_tegra::oi_pump` skips its drain only when
+// `user_input_active() == 0`, and a pseudo-ASID reads NON-zero, so the pump drains `pal::EVENT_QUEUE`
+// into a seam that refuses every event, DESTROYING the operator's keystrokes instead of leaving them for
+// the console. The Pi reaches the identical state through `main.rs`'s
+// `user_input_active() != 0 -> route_input_to_active_el0()` branch. One router, one defect, both boards.
+//
+// WHY NOT `wm::is_kernel_owner`. Widening the two `desktop_firmware` arms would answer the KERNEL BAND
+// (`0xFFFF_FF00..=0xFFFF_FFFF`) and nothing else. That is a strict SUBSET of "has no ring": any other
+// ownerless row owner — a fixture ASID such as `wm.rs`'s `0xC0A`/`0xE2F`, or any future band — strands
+// focus exactly the same way and `is_kernel_owner` says nothing about it. The predicate below is instead
+// the exact COMPLEMENT of the ring seam's own refusal, so the two cannot drift apart.
+//
+// WHY THE DEFLECTION TARGET IS THE SHELL, where x86's FURNITUREFOCUS keeps the keyboard where it is. That
+// arc's dead sink WAS slot 0 (the x86 render task routes slot-0 keys into a shell WINDOW tuple that can go
+// stale), so 0 was the one place it could not send the keyboard. On aarch64 there is no such tuple: slot 0
+// is `handle_key` driving the backdrop console directly, on every image and every knob setting, and it
+// always drains. So here 0 is the one target that is ALWAYS live — and it is also what the operator asked
+// for by pressing on a kernel-furniture row, which is exactly what the `desktop_firmware` arms above
+// already do (`user_input_set_active(0)`). This arc makes that behaviour unconditional and widens its
+// predicate; it does not invent a new one. The tegra problem is the DUAL of x86's, so the fix is too.
+fn key_sink_drains(asid: u64) -> bool {
+    // 0 = the SHELL/console drain (always live, see above); 1..=USER_SLOTS = a private EL0 ring, which is
+    // precisely the set `user_input_enqueue` will push into. Anything else drains nothing, ever.
+    (asid as usize) <= super::uslots::USER_SLOTS
+}
+
+/// SINKVALID — witness budget for the deflection line. Operator-rate by nature (a hand on a furniture
+/// row), and capped for the same reason every other `[clickroute]` line is; the x86 twin's
+/// `FURNDEFLECT_LOG_MAX` is the same number for the same reason.
+static SINKDEFLECT_LOGGED: AtomicU32 = AtomicU32::new(0);
+const SINKDEFLECT_LOG_MAX: u32 = 4;
+
+/// SINKVALID — the click router's KEYBOARD half, and the only way any arm of [`wc_click_route`] leaves
+/// `USER_INPUT_ACTIVE` naming a hit-tested row's owner.
+///
+/// Returns `true` when the grant went through (`owner` can drain, so it gets the keyboard exactly as
+/// before) and `false` when it was DEFLECTED. The caller uses the answer to settle the PRESS: a press must
+/// never be left addressed to a ring the enqueue seam is going to refuse, so a deflected arm consumes it
+/// (target [`CLICK_TARGET_DROP`], so the release is dropped with it and no half-pair reaches anyone). The
+/// VISIBLE half of the gesture is unchanged either way — the caller still raises the row.
+fn focus_grant_or_shell(owner: u64, cur: u64, win: crate::video::wm::WinId) -> bool {
+    if key_sink_drains(owner) {
+        user_input_set_active(owner);
+        return true;
+    }
+    // Dead sink. Hand the keyboard to the shell — the one sink on this arch that no image can turn off —
+    // rather than to a row with no ring. Skipped when focus is ALREADY the shell: `user_input_set_active`
+    // is not free (a real focus drains up to 64 events off `pal::EVENT_QUEUE`, resets the takeover latch
+    // and runs a wake edge), and re-asserting 0 over 0 would be a wake edge nobody is waiting on.
+    if cur != 0 {
+        user_input_set_active(0);
+    }
+    if SINKDEFLECT_LOGGED.fetch_add(1, Ordering::Relaxed) < SINKDEFLECT_LOG_MAX {
+        serial_println!(
+            "[clickroute] focus deflect owner={:#x} win={} was={:#x} sink=dead -> shell keyboard",
+            owner, win, cur
+        );
+    }
+    false
+}
+
 /// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
 ///
 /// When focus is the shell slot, `user_input_active()` is 0 and `main.rs` never calls
@@ -13901,8 +13980,14 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 // Raise and focus first: a maximise the operator cannot see the result of (because
                 // the window stayed behind another one) is not a maximise.
+                //
+                // SINKVALID — through the guarded grant, like every other focus move in this router.
+                // The arm CONSUMES unconditionally (it is a control-disc press, an instruction to the
+                // window system), so a deflection changes nothing here beyond where the keyboard lands:
+                // zooming a kernel-furniture row leaves the keyboard at the shell rather than parking it
+                // on a row with no ring.
                 if owner != cur {
-                    user_input_set_active(owner);
+                    focus_grant_or_shell(owner, cur, win);
                 }
                 crate::video::wm::focus_changed(owner);
                 let settle = crate::video::wm::zoom(win);
@@ -13923,23 +14008,48 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 // on a window other than the focused one), so it needs no throttle of its own. The
                 // line names the DISPOSITION as well as the address — CLICK-PLAIN: `delivered`, the
                 // wire proof that the raised window was handed its own press.
-                serial_println!(
-                    "[clickroute] press hit asid={} win={} (was {}) delivered",
-                    owner, win, cur
-                );
                 // The wake chain runs FIRST and in full: focus arrival (`user_input_set_active` ->
                 // `user_input_wake_edge(asid, "focus")`) then the raise and its unhide
                 // (`focus_changed` -> `set_hidden(asid, false)` -> `user_input_wake_edge(asid,
                 // "unhide")`). Only then does the caller push, and by then `USER_INPUT_ACTIVE` is
                 // `owner`, so the press lands in the ring of the window that was clicked.
-                user_input_set_active(owner);
+                //
+                // SINKVALID — ask FIRST, and say what actually happened. This is the arm the Jetson
+                // bench took onto `0xffffff02`, and the `delivered` line above it was a lie the moment
+                // `owner` had no ring: the press it announced was refused by the enqueue seam a few
+                // lines later. A deflected press is CONSUMED here instead — the row is still raised and
+                // the release is still dropped with the press, so the gesture looks the same to the
+                // operator and no half-pair reaches anyone.
+                if !focus_grant_or_shell(owner, cur, win) {
+                    crate::video::wm::focus_changed(owner);
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    return true;
+                }
+                serial_println!(
+                    "[clickroute] press hit asid={} win={} (was {}) delivered",
+                    owner, win, cur
+                );
                 crate::video::wm::focus_changed(owner);
                 // The release must follow the press into the SAME ring: record the raised owner, not
                 // the sentinel, so the pair is delivered whole.
                 CLICK_PRESS_TARGET.store(owner, Ordering::Release);
                 false
             }
-            Some(_) => {
+            Some((win, _owner, _z)) => {
+                // SINKVALID — the ALREADY-FOCUSED window (the arm above took every `owner != cur`), and
+                // the router's self-heal. After this arc no click can leave `cur` naming a dead sink, but
+                // the TAB ring still can: `wc_focus_key` cycles over `wm::focus_ring`, which lists every
+                // non-compat row owner including the kernel band. That seam is deliberately NOT changed
+                // here (deflecting it to the shell would WELD the rotation — `ring[0]` would be re-chosen
+                // and re-deflected forever, and the honest fix is to filter the ring, in `video/wm.rs`).
+                // So answer it where the operator will: a press on the row they are looking at hands the
+                // keyboard back to the shell and is consumed, instead of being addressed to a ring that
+                // does not exist. Costs one range compare on the hottest arm in the router.
+                if !key_sink_drains(cur) {
+                    focus_grant_or_shell(cur, cur, win);
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    return true;
+                }
                 CLICK_PRESS_TARGET.store(cur, Ordering::Release);
                 false
             }
