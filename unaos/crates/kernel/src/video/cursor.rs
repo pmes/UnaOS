@@ -1825,7 +1825,7 @@ fn undraw_locked(
     // already refuses for the SPRITE lock: unpreemptible, tick-less, on a lock a preempted
     // preemptible holder may own. A refusal leaves `sp.drawn` SET — which is the signal
     // `refresh_locked` reads to know the arrow is still on the glass and a draw must not follow.
-    let Some(fb) = super::panel_snapshot() else {
+    let Some(fb) = sprite_panel() else {
         owe_repaint();
         return None;
     };
@@ -2346,7 +2346,7 @@ fn settle_pending_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     // on both present chains. A refusal KEEPS the pending bits (unlike the not-ready arm below,
     // which drops them because there is no surface left to settle against) and owes the whole-sprite
     // refresh, which is that settlement in its strongest form.
-    let Some(fb) = super::panel_snapshot() else {
+    let Some(fb) = sprite_panel() else {
         owe_repaint();
         return;
     };
@@ -2478,7 +2478,7 @@ fn undraw_within_locked(
     }
     // LOCKFIX — masked-safe (see `super::panel_snapshot`); this function's one caller is the WC-L
     // drain, which runs masked. A refusal hands nothing back and owes the whole-sprite refresh.
-    let Some(fb) = super::panel_snapshot() else {
+    let Some(fb) = sprite_panel() else {
         owe_repaint();
         return (None, 0);
     };
@@ -2769,7 +2769,7 @@ fn refresh_locked(
     //
     // LOCKFIX — and masked-safe like the two phases. A refused snapshot means the writes above have
     // not reached RAM; the owed whole-sprite refresh redoes both the pixels and their clean.
-    match super::panel_snapshot() {
+    match sprite_panel() {
         Some(fb) => pend.flush(&fb),
         None => owe_repaint(),
     }
@@ -3480,7 +3480,7 @@ fn current_origin() -> Option<(usize, usize)> {
     // LOCKFIX — masked-safe (see `super::panel_snapshot`). A query, not a paint: a refusal answers
     // `None` — "the published plan cannot be confirmed" — and owes nothing, exactly as
     // [`sprite_plan`]'s Busy policy declines to owe for a pass that raced a live rebuild.
-    let Some(fb) = super::panel_snapshot() else {
+    let Some(fb) = sprite_panel() else {
         return None;
     };
     if !fb.is_ready() {
@@ -3727,7 +3727,7 @@ fn redraw_off_locked(sp: &mut Sprite, unsupported_now: &mut bool) {
     // LOCKFIX — masked-safe (see `super::panel_snapshot`). Reached from `adopt_overlay`, whose
     // callers include masked present tails; a refusal leaves the off-panel pixels off (they hold the
     // compositor's content, which is correct) and owes the whole-sprite refresh that re-delivers them.
-    let Some(fb) = super::panel_snapshot() else {
+    let Some(fb) = sprite_panel() else {
         owe_repaint();
         return;
     };
@@ -3792,7 +3792,7 @@ fn draw_locked(
     // the sprite stays DOWN (`sp.drawn` is only set at the tail of a completed draw), which is a
     // state the module already handles everywhere, and the owed whole-sprite refresh puts the arrow
     // back at the next composite tail. Distinct from `Err(())`, which disables the cursor for good.
-    let Some(fb) = super::panel_snapshot() else {
+    let Some(fb) = sprite_panel() else {
         owe_repaint();
         return Ok(None);
     };
@@ -3916,4 +3916,42 @@ fn draw_locked(
         return Ok(Some((px, py)));
     }
     Ok(None)
+}
+
+// ── PANELREFUSE — Tier 2: the SPRITE declines once the machine is dying ──────────────────────────
+//
+// Appended at the tail of this file for the same reason `video/mod.rs`'s own PANELREFUSE block is:
+// nothing is below it, so no existing line in this file moves and every panic `Location` below the
+// seven call sites keeps its number. The seven sites themselves changed by ONE TOKEN each
+// (`super::panel_snapshot()` -> `sprite_panel()`), which is a same-line edit and moves nothing
+// either. The whole arc — this file, `video/wm.rs`, `video/mod.rs` — is line-neutral by construction.
+
+/// PANELREFUSE Tier 2 — the panel, for a SPRITE painter, with the panic refusal applied.
+///
+/// The seven `cursor` sites that reached [`crate::video::panel_snapshot`] directly now come through
+/// here. Everything below the refusal is unchanged: the same door, the same `None` on a masked-and-
+/// contended `WRITER`, the same `owe_repaint()` degradation at each caller.
+///
+/// **Why the check is HERE and not in `panel_snapshot`.** That door does not distinguish a read from
+/// a write, and it has twelve callers — seven of them this module's, four `wm`'s, and one
+/// `prtscr::capture`'s READ. Refusing there would refuse a Print Screen of the panic itself, which
+/// is the one screen an operator most wants a PNG of; it would also overload `None`, whose existing
+/// meaning at every one of those callers is TRANSIENT contention, with a permanent one — which is
+/// how a refusal becomes indistinguishable from a retry. `cursor` is the only regime Tier 2 is
+/// actually about, so the check lives in `cursor` and `panel_snapshot` stays byte-identical.
+///
+/// **What a refusal means at each caller, all of it pre-existing behaviour:** `draw_locked` declines
+/// the draw and owes it, so the arrow stays DOWN; `undraw_locked` owes the refresh and leaves
+/// `sp.drawn` SET, so the arrow stays ON the glass — which is the right answer on a dying machine,
+/// where restoring stale save-under would paint the pre-panic desktop back over the panic backdrop;
+/// `current_origin` answers `None` ("the published plan cannot be confirmed") and owes nothing.
+///
+/// LOCKFIX — the refusal returns BEFORE `panel_snapshot`, so a refused call takes neither the
+/// blocking arm nor the `try_lock` arm. Strictly less lock traffic than today on the refusing path.
+fn sprite_panel() -> Option<super::FrameBuffer> {
+    if let Some(term) = super::panel_refuse_term() {
+        super::note_panel_write_refused(super::REFUSE_TIER_SPRITE, term, "video::cursor");
+        return None;
+    }
+    super::panel_snapshot()
 }
