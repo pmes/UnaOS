@@ -7889,6 +7889,16 @@ than overturning the decision:
   `key_sink_drains` — SINKVALID's exact complement of the ring seam's own refusal, which is a
   superset of the band — so property one now holds on both arches *at the callers*, and still not
   in `wm::focus_ring` itself.
+  **GATED 2026-08-31 (TABFIXTURE).** The correction above landed UNFLOWN, and the struck sentence is
+  exactly the kind that survives because nothing tests it. `tabring_selftest`
+  (`arch/aarch64/syscall.rs`, `witness`-gated) now asserts both halves in one boot on the aarch64
+  side: leg 1 is the **positive control** — `wm::focus_ring` really does hand back
+  `KERNEL_OWNER_CONSOLE` and `KERNEL_OWNER_DESKTOP`, so the band is measurably *not* skipped here —
+  and legs 2/5 are the caller's filter removing exactly those rows from the rotation. Without leg 1,
+  leg 5 would be a zero-hit result indicting the pattern rather than a finding about the filter.
+  Ledger and metal residue: `02_KERNEL_CORE/userspace.md` §TABKEY. The x86 twin
+  (`arch/x86_64/syscall.rs::focus_ring_apps`) has **no such fixture** and is still in the state
+  aarch64's was in before this arc.
 * `close_owner` refuses the band outright — property two, preserved, and *strengthened*: owner 0 was
   safe only because no teardown seam happens to pass 0.
 * `hit_test` needs no change: the band is non-zero, so kernel rows became hittable by construction.

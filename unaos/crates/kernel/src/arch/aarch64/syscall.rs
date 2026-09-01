@@ -13617,6 +13617,291 @@ pub fn wc_shell_focus_key(ev: crate::pal::Event) -> bool {
     wc_focus_key(ev)
 }
 
+// ── TABFIXTURE — the TAB rotation, PRESSED and SCORED, with no keyboard and no metal ────────────
+//
+// WHY THIS EXISTS. TABKEY landed UNFLOWN and said so: `./arroyo check` green, `test-arm` green,
+// `kernel8-test` MBENCH PASS 117/117 — and every one of those is a NO-REGRESSION verdict, because
+// NOTHING IN ANY FIXTURE PRESSED TAB. Measured on the exact TABKEY tree: `target/serial-arm.log`
+// and `target/serial-pi.log` both carried ZERO `[wc-c] focus tab-cycle` lines, against the Pi's own
+// metal capture (`~/unaos-bench/capture/line-acm0/pi.log`) with 249. A rotation with no press behind
+// it is mechanism, not evidence, and the one property TABKEY exists for — that the cycle SKIPS an
+// owner which drains no key — was gated by nothing at all.
+//
+// WHAT IT PROVES AND WHAT IT DOES NOT. It presses TAB through the SAME body both real doors funnel
+// into ([`wc_focus_key`]) and scores where `USER_INPUT_ACTIVE` went, over a ring it BUILDS: two rows
+// owned by real private slots and two owned by the KERNEL BAND — `wm::KERNEL_OWNER_CONSOLE`
+// (0xFFFF_FF01) and `wm::KERNEL_OWNER_DESKTOP` (0xFFFF_FF02), two of the four pi 5 decoded out of
+// their 249-line capture, none of which drains a key. It does NOT press a physical key, does not
+// cross a HID decoder, and does not touch either door's CALL SITE: `wc_shell_focus_key`'s single
+// `tegra_el0` caller in `main.rs`'s `jd2_console_pump` and the router seam in `user_input_enqueue`
+// are still unflown and still need metal. This fixture makes the CYCLE falsifiable; it does not make
+// the WIRING falsifiable.
+//
+// EVERY EXPECTATION IS COMPUTED FROM THE LIVE TABLE, never from a constant. The fixture runs inside
+// `wcb_launcher`'s tail, where the table is normally empty, but "normally" is not a gate: a
+// pre-existing row (a console window on a metal boot, a leaked fixture row) would silently change
+// the ring, and a fixture whose expectations are hard-coded would then be asserting the wrong thing
+// while still going green. So leg 2's expected ring is the `key_sink_drains` subset of the ring
+// `wm::focus_ring` ACTUALLY returned this boot, and legs 7 and 8 report `n/a` rather than a fake
+// `true` when the table they need cannot be constructed.
+//
+// THE WITNESS BITS ARE ONE LINE, and it is deliberately the `:: LABEL: … :: PASS ::` form and NOT
+// `:: LABEL: … -> PASS ::` — the doubly-arrowed form is what `pi4-regression.spec`'s `COUNT 26`
+// counts, and a new line in that shape would have raised the measured count and RED-ed the Pi suite
+// for adding a fixture. The FAIL branch spells `:: FAIL ::`, which is a builtin FORBID in
+// `mbench.py` (DEFAULT_FORBIDS) AND a member of `arroyo`'s `FAULT_PATTERNS` — so a broken rotation
+// reds `kernel8-test` and `test-arm` with no spec edit at all.
+
+/// TABFIXTURE leg 1 — POSITIVE CONTROL ON THE INSTRUMENT. The UNFILTERED `wm::focus_ring` really does
+/// carry both kernel-band owners this boot. Without it, "the band is absent from the filtered ring" is
+/// a zero-hit result indicting the pattern rather than a finding about the filter.
+#[cfg(feature = "witness")]
+const TABRING_W_RAWBAND: u32 = 1 << 0;
+/// TABFIXTURE leg 2 — [`focus_ring_apps`] is EXACTLY the `key_sink_drains` subset of that raw ring,
+/// in the same order, and it contains both app owners and neither band owner.
+#[cfg(feature = "witness")]
+const TABRING_W_FILTER: u32 = 1 << 1;
+/// TABFIXTURE leg 3 — the first `n` presses from the shell walk `apps[0..n]` IN ORDER. An off-by-one,
+/// a reversed walk or a stuck cycle all miss here.
+#[cfg(feature = "witness")]
+const TABRING_W_ORDER: u32 = 1 << 2;
+/// TABFIXTURE leg 4 — press `n + 1` (the ring plus the shell slot) returns focus to the shell, i.e.
+/// to where the walk started. This is the WRAP.
+#[cfg(feature = "witness")]
+const TABRING_W_WRAP: u32 = 1 << 3;
+/// TABFIXTURE leg 5 — THE ONE THAT MATTERS. No press in the whole cycle ever published a focus that
+/// fails `key_sink_drains`; in particular neither band owner leg 1 proved was in the raw ring.
+#[cfg(feature = "witness")]
+const TABRING_W_SKIP: u32 = 1 << 4;
+/// TABFIXTURE leg 6 — every press AND every release edge in the cycle was CONSUMED (`true`), so the
+/// keystroke cannot also reach the console as an ordinary key.
+#[cfg(feature = "witness")]
+const TABRING_W_CONSUME: u32 = 1 << 5;
+/// TABFIXTURE leg 7 — ANTI-WELD. Focus stranded on an owner the filtered ring does not contain (its
+/// row closed under it) is RESCUED by one TAB onto an owner that does drain. This is the property
+/// that makes the filter a filter and not a trap.
+#[cfg(feature = "witness")]
+const TABRING_W_NOWELD: u32 = 1 << 6;
+/// TABFIXTURE leg 8 — shell + an EMPTY app ring leaves TAB an ordinary key: not consumed, focus
+/// unmoved, and above all not a hang.
+#[cfg(feature = "witness")]
+const TABRING_W_SHELLPASS: u32 = 1 << 7;
+/// TABFIXTURE — all eight legs.
+#[cfg(feature = "witness")]
+const TABRING_W_ALL: u32 = 0xFF;
+
+/// TABFIXTURE — press `<TAB>` and score where the keyboard went. See the block comment above.
+///
+/// Self-cleaning: it closes every row it mints (BY WINDOW ID — never `close_owner` on a kernel-band
+/// owner, which on a metal boot would reap the REAL console window), restores `USER_INPUT_ACTIVE` to
+/// the value it found, and runs `wm::focus_reset` — the restore every selftest that drives
+/// `focus_changed` with synthetic owners owes.
+#[cfg(feature = "witness")]
+pub fn tabring_selftest() {
+    use crate::video::wm;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    const K_TAB: u8 = b'\t';
+    // Both app owners are REAL private slots (`key_sink_drains` is `asid <= USER_SLOTS`), taken from
+    // the TOP of the range because slots are handed out from the bottom — so these are the last two a
+    // live app would be holding, and by this point in the cascade `el0-wcb` has exited and freed its.
+    const APP_A: u64 = 7;
+    const APP_B: u64 = 8;
+    // 8x8 ARGB8888, stride 32 B: `w*4 <= stride` and `h*stride <= surf_len` (256), which is
+    // `wm::create`'s F1 surface-extent contract satisfied exactly, with nothing to spare.
+    static TR_SURF: [u32; 64] = [0xFF30_4050u32; 64];
+    let s = &raw const TR_SURF as usize;
+    let len = core::mem::size_of_val(&TR_SURF);
+
+    let entry_focus = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    if entry_focus != 0 {
+        // An app holds the keyboard. Taking it away to run a rotation would be a fixture with a side
+        // effect on a live program; say so and decline. Not reachable in the cascade's own ordering.
+        serial_println!(
+            ":: TABRING: TAB rotation — an app holds the keyboard (focus={:#x}), SKIP ::",
+            entry_focus
+        );
+        return;
+    }
+
+    let band_a = wm::KERNEL_OWNER_CONSOLE;
+    let band_b = wm::KERNEL_OWNER_DESKTOP;
+    // The BASELINE ring, read before a single row is minted: what the table already held is what the
+    // teardown must hand back, and it is also what stops the leak sweep below from convicting a real
+    // console row this fixture never created.
+    let mut base = [0u64; wm::MAX_WINDOWS];
+    let nbase = wm::focus_ring(&mut base);
+
+    // INTERLEAVED on purpose — app, band, app, band. `focus_ring` is in WINDOW-ID order and ids
+    // ascend with creation, so a filter that merely truncated the tail (or dropped a fixed slot)
+    // would still have to survive a band owner sitting BETWEEN the two app owners.
+    let wa = wm::create(APP_A, s, len, 8, 8, 32, b"tab-a");
+    let wk1 = wm::create(band_a, s, len, 8, 8, 32, b"tab-k1");
+    let wb = wm::create(APP_B, s, len, 8, 8, 32, b"tab-b");
+    let wk2 = wm::create(band_b, s, len, 8, 8, 32, b"tab-k2");
+    if wa == wm::WIN_NONE || wk1 == wm::WIN_NONE || wb == wm::WIN_NONE || wk2 == wm::WIN_NONE {
+        serial_println!(
+            ":: TABRING: TAB rotation — window table full (a={} k1={} b={} k2={}), SKIP ::",
+            wa, wk1, wb, wk2
+        );
+        for id in [wa, wk1, wb, wk2] {
+            wm::close(id);
+        }
+        return;
+    }
+
+    // ---- leg 1: the raw ring really carries the band (the positive control) -------------------
+    let mut raw = [0u64; wm::MAX_WINDOWS];
+    let nraw = wm::focus_ring(&mut raw);
+    let rawband_ok = raw[..nraw].contains(&band_a)
+        && raw[..nraw].contains(&band_b)
+        && raw[..nraw].contains(&APP_A)
+        && raw[..nraw].contains(&APP_B);
+
+    // ---- leg 2: the filter is exactly the draining subset, in order ---------------------------
+    let mut want = [0u64; wm::MAX_WINDOWS];
+    let mut wn = 0usize;
+    for i in 0..nraw {
+        if key_sink_drains(raw[i]) {
+            want[wn] = raw[i];
+            wn += 1;
+        }
+    }
+    let mut apps = [0u64; wm::MAX_WINDOWS];
+    let n = focus_ring_apps(&mut apps);
+    let filter_ok = n == wn
+        && apps[..n] == want[..wn]
+        && !apps[..n].contains(&band_a)
+        && !apps[..n].contains(&band_b)
+        && apps[..n].contains(&APP_A)
+        && apps[..n].contains(&APP_B);
+
+    // ---- legs 3-6: press TAB (n + 1) times from the shell and record every destination --------
+    // `user_input_set_active(0)` rather than a bare store, so the walk starts from the same state a
+    // real focus-to-shell leaves — this fixture must exercise the primitive, not tiptoe around it.
+    user_input_set_active(0);
+    let presses = n + 1;
+    let mut seq = [0u64; wm::MAX_WINDOWS + 1];
+    let mut consume_ok = true;
+    let mut skip_ok = true;
+    for slot in seq[..presses].iter_mut() {
+        let down = wc_focus_key(crate::pal::Event::Key(K_TAB));
+        let up = wc_focus_key(crate::pal::Event::KeyUp(K_TAB));
+        if !down || !up {
+            consume_ok = false;
+        }
+        let f = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+        *slot = f;
+        if !key_sink_drains(f) {
+            skip_ok = false; // a press published a focus with no ring behind it — SINKVALID's defect
+        }
+    }
+    let order_ok = n > 0 && seq[..n] == apps[..n];
+    let wrap_ok = seq[presses - 1] == 0; // the (n+1)th press is back at the shell it started from
+
+    // ---- leg 7: ANTI-WELD — a focus stranded off the ring is rescued by one TAB ---------------
+    // Strand it deliberately: park focus on APP_A, then close BOTH app rows under it. `at` is then
+    // `None` in the cycle, which is the arm a real "the focused app closed its own window" takes.
+    user_input_set_active(APP_A);
+    wm::close(wa);
+    wm::close(wb);
+    let mut after = [0u64; wm::MAX_WINDOWS];
+    let n_after = focus_ring_apps(&mut after);
+    // The claim is a PROPERTY, not a position: it must MOVE, and it must land somewhere that drains.
+    // Re-deriving the destination here would only restate the code under test. `n/a` when a row this
+    // fixture does not own still carries APP_A — then focus was never actually stranded.
+    let noweld: Option<bool> = if after[..n_after].contains(&APP_A) {
+        None
+    } else {
+        let consumed = wc_focus_key(crate::pal::Event::Key(K_TAB));
+        let _ = wc_focus_key(crate::pal::Event::KeyUp(K_TAB));
+        let landed = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+        Some(consumed && landed != APP_A && key_sink_drains(landed))
+    };
+
+    // ---- leg 8: shell + empty app ring — TAB is an ordinary key, and not a hang ---------------
+    let shellpass: Option<bool> = if n_after == 0 {
+        user_input_set_active(0);
+        let consumed = wc_focus_key(crate::pal::Event::Key(K_TAB));
+        Some(!consumed && USER_INPUT_ACTIVE.load(Ordering::Acquire) == 0)
+    } else {
+        None // other app rows survive in this table; the empty-ring arm is not reachable here
+    };
+
+    let mut w = 0u32;
+    if rawband_ok {
+        w |= TABRING_W_RAWBAND;
+    }
+    if filter_ok {
+        w |= TABRING_W_FILTER;
+    }
+    if order_ok {
+        w |= TABRING_W_ORDER;
+    }
+    if wrap_ok {
+        w |= TABRING_W_WRAP;
+    }
+    if skip_ok {
+        w |= TABRING_W_SKIP;
+    }
+    if consume_ok {
+        w |= TABRING_W_CONSUME;
+    }
+    // A leg that is `n/a` sets its bit: the mask says "nothing here is broken", and the printed
+    // field is what says whether the leg RAN. A reader who wants "all eight legs really fired"
+    // asserts `noweld=true shellpass=true` on the line, which the spec REQUIRE does.
+    if noweld.unwrap_or(true) {
+        w |= TABRING_W_NOWELD;
+    }
+    if shellpass.unwrap_or(true) {
+        w |= TABRING_W_SHELLPASS;
+    }
+
+    // Teardown BEFORE the verdict print, so a verdict is never issued over a table this fixture
+    // still owns. By WINDOW ID only — `close_owner(KERNEL_OWNER_CONSOLE)` would reap a real console
+    // row on a metal boot, which is a fixture destroying the system it is measuring.
+    wm::close(wk1);
+    wm::close(wk2);
+    for id in [wa, wb] {
+        wm::close(id);
+    }
+    // LEAK GUARD, against the BASELINE and not against emptiness: a row this fixture minted must not
+    // outlive it, and a row it found must not have been reaped by it. Either direction is a FAIL.
+    let mut end = [0u64; wm::MAX_WINDOWS];
+    let nend = wm::focus_ring(&mut end);
+    let mut leak = false;
+    for a in [APP_A, APP_B, band_a, band_b] {
+        if end[..nend].contains(&a) != base[..nbase].contains(&a) {
+            leak = true;
+        }
+    }
+    user_input_set_active(entry_focus);
+    wm::focus_reset();
+
+    let tri = |v: Option<bool>| match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "n/a",
+    };
+    let ok = w == TABRING_W_ALL && !leak;
+    if ok {
+        serial_println!(
+            ":: TABRING: TAB rotation — witness={:#x} ring={} raw={} presses={} band={:#x}/{:#x} noweld={} shellpass={} :: PASS ::",
+            w, n, nraw, presses, band_a, band_b, tri(noweld), tri(shellpass)
+        );
+    } else {
+        serial_println!(
+            ":: TABRING: TAB rotation — witness={:#x} (want {:#x}) ring={} raw={} presses={} leak={} rawband={} filter={} order={} wrap={} skip={} consume={} noweld={} shellpass={} seq={:#x},{:#x},{:#x},{:#x} :: FAIL ::",
+            w, TABRING_W_ALL, n, nraw, presses, leak,
+            rawband_ok, filter_ok, order_ok, wrap_ok, skip_ok, consume_ok,
+            tri(noweld), tri(shellpass),
+            seq[0], seq[1], seq[2], seq[3]
+        );
+    }
+}
+
 // ---- CLICK-ROUTE: a pointer button goes to the window UNDER THE CURSOR ------------------------
 
 /// CLICK-ROUTE: the pointer-button bitmask as the ROUTER last saw it, so this layer can tell a PRESS
@@ -15211,6 +15496,18 @@ fn wcb_launcher(_demo_cpu: usize) {
     // capture.
     #[cfg(feature = "witness")]
     crate::video::knurl::selftest();
+    // TABFIXTURE: the TAB rotation, pressed and scored — LAST in this tail, and the position is the
+    // argument. It mints FOUR rows (two app owners, two KERNEL-BAND owners) and drives `focus_changed`
+    // n+1 times, so it must run after every per-window one-shot latch above has been claimed and after
+    // the three material fixtures have hashed their tiles; run earlier it would burn `[wc-c]`/`[wc-d]`
+    // latches the arc's real windows are owed, which is the same measurement `SHELLWIN-PI` recorded
+    // when the Pi shell window was minted too early (`MBENCH FAIL — 104/108`). It is also the last
+    // point at which the table is still EMPTY: `desktop_firmware::arm()` runs the moment this launcher
+    // RETURNS, and the shell window it mints would put a fifth owner in the ring the fixture measures.
+    // Self-cleaning (closes its rows by id, restores the entry focus, `wm::focus_reset`), so
+    // `desktop_firmware::arm()` still sees exactly the table it saw before this line existed.
+    #[cfg(feature = "witness")]
+    tabring_selftest();
 }
 
 // =============================================================================================
