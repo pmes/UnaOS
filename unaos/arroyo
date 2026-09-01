@@ -3482,6 +3482,113 @@ KERNEL_CFG_MATRIX=(
   # `all(aarch64, pidesk)`), where `panel_console_face_arm` is reached through BOTH of its gate terms
   # at once, and where `orin_conwin`'s existing call to it coexists with `fbcon::init`'s new one — the
   # double-arm this arc claims is idempotent. `orinconwin`'s host list, plus the two knobs.
+
+  # ── SMPMARKLEG (appended 2026-08-31, orin 11) — the SMPMARK cross the seat is about to fly ──────
+  #
+  # THE HOLE, MEASURED not assumed. `smpmark` is carried by EXACTLY ONE row of this matrix,
+  # `arm-tegra-smpmark`, whose feature list is `arm-tegra`'s VERBATIM + the knob. It therefore
+  # crosses `smpmark` with NONE of the knobs either Orin flight image carries. Measured over the
+  # third field of all 31 rows, closed under Cargo's implications (`tegrasmp`->`tegra`;
+  # `tegra_el0`->`tegra`+`aarch64_el0`; `orinclick`->`tegra_el0`; `orinconwin`/`orinvpar`->
+  # `desktop_firmware`; `orinfurn`->`desktop_firmware`+`orinclick`; `supstate`->`tegra`), the set of
+  # rows carrying `smpmark` together with each of these is EMPTY — every one of the eight:
+  #     smpmark x tegra_el0  none     smpmark x desktop_firmware  none
+  #     smpmark x orindesk   none     smpmark x orinclick         none
+  #     smpmark x orinconwin none     smpmark x orinfurn          none
+  #     smpmark x orinvpar   none     smpmark x supstate          none
+  # So `UNAOS_SMPMARK=1` on either flight image produced a configuration NO leg compiled: the
+  # tegra_el0 / EXECGATE shape that shipped a board-killer on this branch, and the reason the
+  # standing law is ADD THE LEG FIRST AND PROVE IT GOES RED, never arm-then-discover.
+  #
+  # ROW 1 — BOOT A (`witness, rast, orindesk, orinclick, orinvpar, tegra_el0, tegra, tegrasmp,
+  # orinconwin, desktop_firmware, orinfurn`) with `smpmark` armed. HOSTED ON `arm-tegra-furn`'s LIST
+  # VERBATIM + `orinvpar,smpmark`, the precedent shape of `arm-tegra-conwin` / `arm-tegra-furn` /
+  # `arm-tegra-supstate-el0-click`. Two tokens, and exactly two AFTER Cargo resolution as well:
+  # `orinvpar` implies only `desktop_firmware`, which the host already carries, and `smpmark` implies
+  # nothing — the resolved set grows by precisely {`orinvpar`, `smpmark`}.
+  #
+  # WHY `arm-tegra-furn` AND NOT `arm-tegra-fbconpar-cross`, the only other row that could host
+  # BOOT A. `arm-tegra-furn`'s closure is BOOT A minus exactly ONE token (`orinvpar`);
+  # `arm-tegra-fbconpar-cross`'s is BOOT A minus `orinfurn` PLUS `orinface` and `orindefer`, two
+  # knobs BOOT A does not carry. Hosting there would widen the leg past the flown image in a
+  # direction the image does not go, and a red could not distinguish the SMPMARK cross from the
+  # fbcon-parity pair — the same base-choice argument `arm-tegra-supstate-el0-click`'s comment makes
+  # about why it is hosted on `arm-tegra-supstate-el0` rather than on `arm-tegra-supstate`.
+  #
+  # THIS ROW ALSO CLOSES A SECOND, INDEPENDENT HOLE — measured, not incidental. `orinvpar` x
+  # `orinfurn` is carried by NO row either: `arm-tegra-fbconpar-cross` has `orinvpar` without
+  # `orinfurn`, `arm-tegra-furn` has `orinfurn` without `orinvpar`, and BOOT A carries both. So
+  # BOOT A's feature closure was compiled by nothing even with `smpmark` OFF, and no row of this
+  # matrix was a superset of it. That is a stronger finding than the one this arc was sent for, and
+  # it is stated here rather than in a landing note because the row is where the next reader looks.
+  #
+  # ROW 2 — BOOT B (`witness, rast, supstate, tegra_el0, tegra, tegrasmp`) with `smpmark` armed.
+  # HOSTED ON `arm-tegra-supstate-el0`'s LIST VERBATIM + `smpmark` — a ONE-TOKEN delta, one token
+  # after resolution too, on a row already proven green, so a red on this leg names the cross and
+  # nothing else. This is the `arm-tegra-supstate-el0-click` shape exactly: the host is a row whose
+  # closure ALREADY covers BOOT B (measured: `arm-tegra-supstate-el0` and
+  # `arm-tegra-supstate-el0-click` are the two rows whose closures are supersets of BOOT B), and the
+  # single added token is the instrument whose cross was uncompiled.
+  #
+  # WHY TWO ROWS AND NOT ONE UNION ROW. Neither image's feature set contains the other's: BOOT A
+  # carries the desk stack and no `supstate`; BOOT B carries `supstate` and none of
+  # `desktop_firmware`/`orindesk`/`orinclick`/`orinconwin`/`orinvpar`/`orinfurn`. One row carrying
+  # the union would compile a THIRD configuration — `supstate` with the whole desk stack — that no
+  # flight image builds, leaving BOTH flown images compiled by nothing, which is the exact condition
+  # these rows exist to end. It would also be undiagnosable: a red on a union row cannot say WHICH
+  # boot is broken. (The union row is not built by this arc and NO claim is made here about whether
+  # it compiles.) Two rows is therefore the minimum, not a convenience: one per flown image.
+  #
+  # NON-VACUITY, MEASURED not argued, TWO-SIDED (2026-08-31). A leg that cannot go red is not
+  # coverage. Two probes were appended to the SMPMARK sites in `arch/aarch64/smp_virt.rs`, each
+  # conjoined so exactly one NEW row reaches it and no existing row does:
+  #     #[cfg(all(feature = "smpmark", feature = "orinfurn", feature = "orinvpar"))] let _pa: u32 = "SMPMARKLEG-PROBE-A";
+  #     #[cfg(all(feature = "smpmark", feature = "supstate"))]                       let _pb: u32 = "SMPMARKLEG-PROBE-B";
+  # both appended after the `:P:` mark inside `start_secondaries_tegra` (itself
+  # `#[cfg(feature = "tegrasmp")]`, which both new rows carry). Result, each leg run as its own
+  # `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  #     arm-tegra-furn-vpar-smpmark     EXIT 101   error[E0308] expected `u32`, found `&str`
+  #     arm-tegra-supstate-el0-smpmark  EXIT 101   error[E0308] expected `u32`, found `&str`
+  #     arm-tegra-smpmark               EXIT 0     smpmark, neither conjunct
+  #     arm-tegra-furn                  EXIT 0     orinfurn, no smpmark / no orinvpar
+  #     arm-tegra-fbconpar-cross        EXIT 0     orinvpar, no smpmark / no orinfurn
+  #     arm-tegra-supstate-el0          EXIT 0     supstate, no smpmark
+  #     arm-tegra-supstate-el0-click    EXIT 0     supstate, no smpmark
+  # The WHOLE-GATE run with both probes in agrees and is the stronger form of the second side:
+  # `./arroyo check` exited 1 naming EXACTLY these two legs
+  # (`❌ kernel cfg coverage FAILED ... legs: arm-tegra-furn-vpar-smpmark
+  # arm-tegra-supstate-el0-smpmark`) with all 40 other legs of the 42 green, and `error[E0308]` was
+  # the ONLY error code emitted anywhere in the run — twice, once per new leg, each pointing at its
+  # own probe line. That last fact is what licenses the verdict below: the sole compile error in
+  # either new configuration was the deliberate one, so with the probes gone both crosses build.
+  # Both probes reverted and `smp_virt.rs` proved byte-identical by sha256
+  # (206a188e49964884a8d6f0238c846f173383c614c97c9006ed3f3e94439568ac). ONLY these two combinations
+  # see the break, which is what "not vacuous" has to mean.
+  #
+  # THE VERDICT THIS ROW PAIR LICENSES: `UNAOS_SMPMARK=1` is legal on BOTH flight images. Neither
+  # cross is unbuildable — the clean gate has both rows at ✅ — so the seat may arm the knob on
+  # BOOT A and on BOOT B, and a future edit that breaks either cross now reds a leg that NAMES it.
+  #
+  # UNIVERSE SIDE EFFECT: none, and MEASURED rather than asserted — this is the figure the census
+  # block above has had to correct three times. Every knob named on these two rows (`smpmark`,
+  # `orinvpar`, `supstate`, `orinfurn` and the rest of the desk family, `tegra_el0`) is ALREADY
+  # named by an existing arm-* leg, so the set of arm-named knobs is IDENTICAL before and after
+  # (89 both ways, delta empty) and the board union is 140 both ways. `x86_cfg_universe` is
+  # therefore unchanged and so is the derived mix-leg count — the gate line reads
+  # `33 board + 9 x86 pairwise-mix`, the same 9 as before. Board legs +2 (31 -> 33); gate legs +2.
+  # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
+  #
+  # WHAT THIS DOES NOT COVER, said so nobody reads the green as more than it is: this is a TYPE
+  # CHECK and nothing more. QEMU models no Tegra234, so no gate in this repo can boot either image;
+  # whether the `:A:` / `:P:` / `:R<idx>:` marks reach the wire on a parked secondary is an
+  # Orin-metal verdict and remains UNFLOWN. What these rows buy is that `UNAOS_SMPMARK=1` on either
+  # image can no longer be a configuration that compiles nowhere.
+  #
+  # PRECONDITION: like `arm-tegra-furn`, both rows compile `arch/aarch64/syscall.rs` (they carry
+  # `tegra_el0`), which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see
+  # check_both) supplies it.
+  "arm-tegra-furn-vpar-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinfurn,orinvpar,smpmark"
+  "arm-tegra-supstate-el0-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,smpmark"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
