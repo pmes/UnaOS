@@ -5741,6 +5741,33 @@ controller 0. (M3) per enumerated BAR, an all-ones probe write **and** an immedi
 32-bit BAR, ≤ 4 for a 64-bit pair). That is the complete set; nothing else touches fabric, config, or
 system registers.
 
+**⚠ CENSUS2LIE — the verdict line lied *in the capture*, and the captures keep it (orin 11, 2026-08-31).**
+`census2` prints its terminal verdict **after** `net2_link_and_device` returns, and that verdict read
+`ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes)` on **every** build,
+`pcie3` included. From `893fe5c7` onward the string was false the instant it reached the wire: the pass
+directly above it had already enabled an LTSSM and driven all-ones probes into BAR dwords. This is worse
+than the stale header comments the sibling PCIEHDR pass struck — a comment misleads a reader of the
+source; a printed verdict misleads the **capture**, which is the evidence this project adjudicates on.
+Staged media `boot7h`, `boot7i` and `boot7j` (all `net4`, hence `pcie3,pcie2` — see
+`~/unaos-bench/flash/orin/MANIFEST`) each carry it, and **those logs are never edited**. So, for the
+record: when reading any Orin capture taken before this correction, **the read-only claim on that line is
+void**, and the `>>> FABRIC WRITE` lines are the only truthful account of what that boot wrote.
+
+The correction is forward-only and **line-neutral** — a `#[cfg]` split occupying the same four source
+lines, so the knob-off `Location` ledger disclosed below is undisturbed. Under
+`not(all(pcie3, tegra))` the literal is unchanged byte for byte (there, the page-table descriptors really
+are the only writes, and `scripts/orin-net2-bench.md`'s wire block stays correct as written). Under
+`pcie3 + tegra` the line now states the pass is **not** read-only, names the two fabric-write classes it
+arms, and keeps the bounding that is genuinely true — controller 0 only, nothing outside those classes, no
+driver bind. Two deliberate properties of the new wording: (1) neither write is unconditional at runtime
+(the LTSSM enable is skipped when firmware already left the link up — exactly what the metal sitting's
+`LINK-UP-pre-LTSSM` observation recorded — and the BAR probes need a device answering), so the line
+advertises what the image **arms** and refers the reader to the `>>> FABRIC WRITE` lines for what a given
+boot **issued**; (2) it says explicitly that a `net4` image's `COMMAND` decode-enable happens *below* this
+line, so the bounding cannot be misread as a claim about the whole boot. What may **not** be concluded
+from the new line, and could be from the old one, is that this pass cannot bring a link up. It can, and
+that is its purpose.
+
 **Byte-identity (knob-off) — the ratified 1-byte Location class.** Knob-off (`pcie3` and `pcie2` both off)
 the module blocks + all call sites are compiled out. The `TCR_*_ACTIVE` constants fold to the exact NET-2
 literals (so `enable_el2`/`enable_el1`/the drop program identical values and the `mmu-regs` banner is

@@ -906,10 +906,10 @@ pub fn census2(ctx: &PcieCtx) {
         );
     }
 
-    serial_println!(
-        "{} ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes) ::",
-        P2
-    );
+    #[cfg(not(all(feature = "pcie3", feature = "tegra")))] // pcie2-only (or non-tegra): the page-table descriptors really ARE the only writes, so this literal stays byte-for-byte what `orin-net2-bench.md` §wire promises.
+    serial_println!("{} ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes) ::", P2);
+    #[cfg(all(feature = "pcie3", feature = "tegra"))] // ⚠ CENSUS2LIE (orin 11): the literal above ALSO printed here and was FALSE from 893fe5c7 on — boot7h/7i/7j carry it on the wire, so the archive keeps a read-only claim over a boot that enabled an LTSSM and sized BARs. Corrected forward only; captures are never edited. ⚠ FOLDED IN PLACE, never added lines (panic `Location` records embed line numbers). Reversal: arch_arm64.md §ORIN-NET-3.
+    serial_println!("{} ORIN-NET-2 controller-0 preamble DONE — NOT read-only on this pcie3 image: past the page-table mappings this pass ARMS controller-0 fabric writes (the appl LTSSM enable, which can and does take the link from not-training to training; BAR-dword all-ones probes, each original restored the next statement, high half refused at slot 5). Which of them THIS boot issued is the `>>> FABRIC WRITE` lines above — read those, never this one. Bounding THIS PASS keeps, and nothing past it: controller 0 only, and outside those two classes no command-reg/decode-enable, LNKCTL, PERST, PHY, clock, power-domain or PSCI write, and no driver bind — on a `net4` image the driver's own decode-enable comes LATER, below this line ::", P2);
 }
 
 /// The metal half of NET-2 (tegra build only): map/reach controller-0's apertures via the kernel
