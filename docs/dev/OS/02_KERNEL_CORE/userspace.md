@@ -1735,6 +1735,30 @@
     - *Still open (out of arc):* `jd2_console_pump` feeds `handle_key` regardless of focus, so once TAB
       hands focus to a live EL0 slot the Orin console still consumes the keystrokes unless `orininput`
       is armed. That is `xusb_tegra.rs`'s defect 2, unchanged here.
+    - *GATED 2026-08-31 by TABFIXTURE (jetson track) — TABKEY shipped UNFLOWN and this is the half of
+      that debt QEMU can pay.* TABKEY's three green gates were all **no-regression** verdicts: nothing
+      in any fixture pressed TAB, and both `target/serial-arm.log` and `target/serial-pi.log` carried
+      **zero** `[wc-c] focus tab-cycle` lines against the Pi capture's 249. `tabring_selftest`
+      (`arch/aarch64/syscall.rs`, `witness`-gated, last in `wcb_launcher`'s tail) now builds a ring of
+      four rows — app owners 7 and 8 **interleaved** with `KERNEL_OWNER_CONSOLE` and
+      `KERNEL_OWNER_DESKTOP` — presses `<TAB>` `n+1` times through `wc_focus_key`, and scores where
+      `USER_INPUT_ACTIVE` went, in eight legs on one `witness=0xff` mask: the raw ring really carries
+      the band (**the positive control** — without it "the band is absent" indicts the pattern, not
+      the filter), the filtered ring is exactly the `key_sink_drains` subset in order, the walk is in
+      order, it wraps to the shell, no press ever published a non-draining focus, every press and
+      release was consumed, a focus stranded off the ring is rescued by one TAB (anti-weld), and shell
+      + empty ring leaves TAB an ordinary key. Every expectation is computed from the **live** table,
+      never a constant, and the two legs that need a table the boot may not offer print `n/a` rather
+      than a fake `true`. Two new `pi4-regression.spec` REQUIREs (**117 → 119**): the wire line
+      `[wc-c] focus tab-cycle` — which had never appeared in a QEMU capture on either arch — and the
+      `witness=0xff … noweld=true shellpass=true … :: PASS ::` verdict. The FAIL branch spells
+      `:: FAIL ::`, already a builtin FORBID in `mbench.py` and a member of `arroyo`'s
+      `FAULT_PATTERNS`, so no FORBID pair was added. **What it still does not prove:** it presses at
+      the `wc_focus_key` seam, so neither door's *call site* is flown — `wc_shell_focus_key`'s
+      `tegra_el0` caller in `jd2_console_pump` and the `user_input_enqueue` router seam still need
+      metal, and so does the whole HID decode ahead of them. The fixture is compiled only where
+      `aarch64_el0` is (`baremetal` or `tegra_el0`), so `test-arm` — the aarch64 *virt* leg — does not
+      carry `arch/aarch64/syscall.rs` at all and cannot exercise it; `kernel8-test` is the gate.
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
     `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
     `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the
