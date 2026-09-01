@@ -1702,6 +1702,39 @@
     Scope, as WC-C already conceded: the boot's real programs do not overlap, so a ring of two or more
     exists today only under the `el0-wcb` fixture — this completes the mechanism, not yet an operator
     workflow.
+  - **TABKEY (2026-08-31, jetson track): the Orin had the in-ring door and no shell door, and the ring
+    itself could park focus on a row with no ring.** Two independent defects, one arc.
+    - *The missing door.* Both `wc_shell_focus_key` call sites live in `main.rs::pump_usb_into_gui`,
+      which is `cfg(all(aarch64, baremetal))`; `baremetal` implies `pi`, and `pi` + `tegra` is a hard
+      `compile_error!`, so on a Jetson image that function does not exist. The Orin's only HID drain is
+      `main.rs::jd2_console_pump`, whose `Event::Key` arm fed `handle_key` directly — and `handle_key`
+      has no byte-9 arm, so `<TAB>` was silently dropped. The in-ring door was never missing:
+      `user_input_enqueue` asks `wc_focus_key` at the router seam, and `orininput`'s
+      `xusb_tegra::oi_pump` drives that seam. MEASURED (`~/unaos-bench/capture/line-acm0/`): `orin.log`
+      has 5× `:: tegra: JD2 — KEY 0x09 ::` at :13071–13080 and **zero** `[wc-c] focus tab-cycle`;
+      `pi.log`, same tool and directory, has 249. The fix is one `tegra_el0`-gated
+      `wc_shell_focus_key(ev)` folded onto an existing statement in the pump's key arm (line-neutral —
+      the knob-off tegra media stays byte-identical), placed *after* the `KEY` serial echo so a capture
+      reads `KEY 0x09` → `[wc-c] focus tab-cycle` as an adjacent pair and the fix is scoreable from the
+      wire.
+    - *The dead-sink rotation.* `wm::focus_ring` filters `used && !compat && owner_asid != 0` and does
+      **not** skip the kernel band, despite `engine.md` having claimed it did (corrected there).
+      SINKVALID (`86640a5a`) closed the CLICK door onto that state and declined the TAB door with
+      reasons, because *deflecting* a chosen dead sink to the shell welds the rotation — `cur` becomes
+      0, 0 is in no ring slot, the next press re-chooses `ring[0]` and re-deflects, forever. TABKEY
+      *filters* instead, which has no fixed point: `wc_focus_key` now rotates over a new
+      `focus_ring_apps` in `arch/aarch64/syscall.rs` — the twin of x86's helper of the same name, but
+      predicated on `key_sink_drains` rather than `is_kernel_owner`, since the band is a strict subset
+      of "has no ring". Unconditional, so every leg compiling that file carries it. Measured need, on
+      the Pi: 102 of its 249 tab-cycles (41%) named a kernel-band destination.
+    - *What this costs, stated:* `<TAB>` no longer raises kernel furniture on either board. Those rows
+      were never a usable keyboard destination (landing there killed the keyboard, and with `orininput`
+      armed it *destroyed* keystrokes); they stay reachable by click, via `wc_click_route`'s furniture
+      arm and SINKVALID's self-heal. Making them a *visual* rotation stop again needs a raise-cursor
+      distinct from `USER_INPUT_ACTIVE` — an arc on the focus primitive, not a keybinding fix.
+    - *Still open (out of arc):* `jd2_console_pump` feeds `handle_key` regardless of focus, so once TAB
+      hands focus to a live EL0 slot the Orin console still consumes the keystrokes unless `orininput`
+      is armed. That is `xusb_tegra.rs`'s defect 2, unchanged here.
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
     `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
     `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the
