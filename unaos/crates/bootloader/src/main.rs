@@ -740,7 +740,21 @@ fn main() -> Status {
     }
     
     let kernel_pages = ((max_vaddr - min_vaddr + 4095) / 4096) as usize;
-    log::info!("Kernel ELF: min_vaddr={:#x}, max_vaddr={:#x}, pages={}", min_vaddr, max_vaddr, kernel_pages);
+    // THE IMAGE-IDENTITY WITNESS — KEEP IT UNDER 80 COLUMNS. The Orin's UEFI ConOut is sometimes
+    // committed to 80x25 and sometimes is not: the loader never calls SetMode, so the width is
+    // inherited firmware state. On an 80-column boot the terminal driver hard-wraps every ConOut
+    // write at column 80 with a real CRLF — the bytes survive, but every reader here is
+    // line-oriented, so the tail vanishes from `awk '/pattern/'`. The old wording (`Kernel ELF:
+    // min_vaddr=…, max_vaddr=…, pages=…`) rendered at 100 and broke at the word `max_vaddr`, so the
+    // one line saying WHICH IMAGE THIS IS read as truncated while the value was on the wire all
+    // along — that cost orin 11 a session. Budget: the `uefi` prefix `[ INFO]: <file>@NNN: ` is 44
+    // columns, leaving 36. Measured on the QEMU wire: 32 of payload on aarch64 (76 total) and 34 on
+    // x86_64 (78 total, `max=0x127902f pg=4730` — the larger kernel already spends a seventh hex
+    // digit and a fourth page digit). x86_64 is the binding case, with 2 columns to spare, so do not
+    // add a field here. `max` keeps its name because it is what tells two images apart. 14 of the 15
+    // loader call sites are over budget and stay that way; read those with
+    // `~/unaos-bench/tools/unwrap80.sh <log>`.
+    log::info!("KELF min={:#x} max={:#x} pg={}", min_vaddr, max_vaddr, kernel_pages);
     
     let load_base = match boot::allocate_pages(
         boot::AllocateType::AnyPages,

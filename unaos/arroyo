@@ -4065,6 +4065,36 @@ check_both() {
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
 
+    # GATE-BOOTLOADER: `check` type-checked the KERNEL crate and nothing else, so every edit to
+    # `crates/bootloader` — the UEFI loader that owns the whole pre-ExitBootServices window on both
+    # arches — went into a commit whose DONE gate could not see it. Proven by go-red, orin 12: a
+    # deliberate format-arity defect at the loader's identity-witness call site left `./arroyo check`
+    # at exit 0, while these legs return 101. The loader is not exotic code to leave unchecked: it is
+    # the only thing that runs between firmware and `kernel_entry()`, and a defect there costs a
+    # power cycle and an attended bench seat to find.
+    #
+    # Three legs. The two DEFAULT ones mirror how the loader is really built — `esp-arm` builds
+    # aarch64-unknown-uefi here, the `builder` crate builds x86_64-unknown-uefi from the same source
+    # — and they honour $BOOTLOADER_FEATURES so an operator's own UNAOS_BOOTDIAG/UNAOS_JB8_LEVER run
+    # checks what it is about to build. The third is a FEATURE leg: `bootdiag` and `jb8lever` are
+    # aarch64-only and OFF by default, so their code is compiled by no default leg on any arch and
+    # would rot unseen. It is a cross (both at once) rather than two singles because the features are
+    # independent blocks that never interact — a cross costs one leg and covers both.
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: bootloader (aarch64-unknown-uefi, x86_64-unknown-uefi, +feature leg)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/bootloader"
+    for _bl_target in aarch64-unknown-uefi x86_64-unknown-uefi; do
+        cargo +nightly check --release --target "$_bl_target" \
+          $BOOTLOADER_FEATURES \
+          -Z build-std=core,compiler_builtins,alloc \
+          -Z build-std-features=compiler-builtins-mem
+    done
+    cargo +nightly check --release --target aarch64-unknown-uefi \
+      --features bootdiag,jb8lever \
+      -Z build-std=core,compiler_builtins,alloc \
+      -Z build-std-features=compiler-builtins-mem
+    cd "$WORKSPACE_DIR"
+    echo -e "${COLOR_GREEN}✅ bootloader OK${COLOR_RESET}"
+
     # GATE-CFG: the cfg-gated coverage legs, immediately behind the two DEFAULT kernel legs so all the
     # kernel verdicts sit together in the scrollback. The default legs stay first and unchanged: they
     # are what the operator's own UNAOS_* knobs compile, and they are the fastest way to a diagnostic
