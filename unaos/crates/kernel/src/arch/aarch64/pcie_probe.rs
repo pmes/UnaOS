@@ -924,10 +924,10 @@ pub fn census2(ctx: &PcieCtx) {
 /// APPL_CTRL LTSSM enable) and `net3_enumerate_and_size` (the BAR-sizing ritual). Under `pcie2` alone
 /// the page-table descriptors ARE the only writes; under `pcie3` they are the least of them.
 ///
-/// KNOWN DEFECT, NOT FIXED HERE (comment-only arc): `census2` prints "recon DONE (read-only;
-/// page-table mappings the only writes)" AFTER this function returns, so on a `pcie3,tegra` boot the
-/// serial log tells the operator the run was read-only when it enabled a link and sized BARs. That is
-/// a string, not a comment; correcting it moves the image and belongs to a behavioural arc.
+/// FIXED by CENSUS2LIE, 2026-09-01, and this paragraph is kept as the record of its own falsification
+/// rather than silently replaced (`sdhc4c.rs`'s precedent). It read "KNOWN DEFECT, NOT FIXED HERE" and
+/// described `census2` claiming "read-only" after this function enabled a link and sized BARs. The DONE
+/// line is now `#[cfg]`-SPLIT — a flat rewrite would have made the `pcie2`-alone case newly false.
 #[cfg(all(feature = "pcie2", feature = "tegra"))]
 fn net2_link_and_device(
     appl: Option<(u64, u64)>,
