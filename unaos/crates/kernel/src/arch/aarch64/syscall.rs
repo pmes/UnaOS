@@ -13205,12 +13205,94 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     user_input_push(asid, packed)
 }
 
+/// TABKEY — [`crate::video::wm::focus_ring`] with the DEAD SINKS removed. The aarch64 twin of x86's
+/// `focus_ring_apps` (`arch/x86_64/syscall.rs`), and named after it so a reader who has met one meets the
+/// other; only the predicate differs, and that difference is argued below.
+///
+/// ### The claim this exists to falsify
+/// x86's copy says, in its own doc comment: *"On aarch64 that IS the app set: every row belongs to an EL0
+/// ASID."* **It is not, and the bench captures are what settle it.**
+///
+/// `~/unaos-bench/capture/line-acm0/pi.log`, 249 `[wc-c] focus tab-cycle` lines, tallied by destination:
+///
+/// ```text
+///   live EL0 slots  1..=6 …………………………  124   (and the shell slot 0: 23)
+///   0xffffff01 KERNEL_OWNER_CONSOLE ……   28
+///   0xffffff02 KERNEL_OWNER_DESKTOP ……   23
+///   0xffffff03 …………………………………………………   25
+///   0xffffff60 …………………………………………………   26
+///                                       ---
+///   kernel band …………………………………………… 102 of 249  = 41% of every TAB the operator pressed
+/// ```
+///
+/// Kernel-owned rows reach `wm::TABLE` on this arch exactly as they do on x86 —
+/// `fbcon::panel_console_window_open`, and the `orinconwin` / `orindesk` / `pidesk` furniture — and
+/// `focus_ring`'s `used && !compat && owner_asid != 0` test passes every one of them.
+///
+/// ### What a dead sink in the rotation costs
+/// SINKVALID's defect, reached through a second door. `user_input_set_active` publishes the pseudo-ASID;
+/// `user_input_enqueue`'s ring seam refuses it four hops later (`asid > USER_SLOTS`), silently; and TAB
+/// prints a witness naming a focus that can receive nothing — the trap intact behind a line saying
+/// otherwise. With `orininput` armed it is worse than inert: `xusb_tegra::oi_pump` skips its drain only on
+/// `user_input_active() == 0`, and a pseudo-ASID reads NON-zero, so the pump DRAINS `pal::EVENT_QUEUE`
+/// into a seam that refuses everything — destroying the operator's keystrokes rather than leaving them for
+/// the console.
+///
+/// ### Why [`key_sink_drains`] and not `wm::is_kernel_owner`
+/// SINKVALID's reason verbatim: the kernel band (`0xFFFF_FF00..=0xFFFF_FFFF`) is a strict SUBSET of "has
+/// no ring" — a fixture ASID such as `wm.rs`'s `0xC0A` / `0xE2F`, or any future band, strands focus
+/// identically and `is_kernel_owner` says nothing about it. This predicate is the exact COMPLEMENT of the
+/// ring seam's own refusal, so the two cannot drift apart. (x86 uses `is_kernel_owner` because on that arch
+/// the two sets coincide today; nothing here depends on that staying true.)
+///
+/// ### Why FILTERING and not deflecting
+/// SINKVALID declined to touch this seam and said why: deflecting a chosen dead sink to the shell WELDS the
+/// rotation — `cur` becomes 0, 0 sits in no ring slot, so the next press takes the unknown-focus arm,
+/// re-chooses `ring[0]`, and re-deflects, forever. Removing the row from the rotation has no such fixed
+/// point: every survivor is a live sink and the shell slot stays reachable from all of them.
+///
+/// ### Why HERE and not in `video/wm.rs`, which is where SINKVALID's note pointed
+/// That file is compiled and executed by x86, so narrowing the shared helper would change x86 focus
+/// behaviour as a side effect of an aarch64 fix — and x86 already filters on its own side, with its own
+/// predicate, which the narrowing would silently double. The arch layer is also the only layer that KNOWS
+/// the answer: `USER_SLOTS` is a per-arch `uslots` constant and `wm` cannot see it.
+///
+/// ### Consequence, stated rather than discovered later
+/// `<TAB>` no longer raises kernel furniture — the console window and the desktop row leave the rotation on
+/// both boards. They were never a usable destination (landing there killed the keyboard); they remain
+/// reachable by CLICK, through `wc_click_route`'s furniture arm and SINKVALID's self-heal. Restoring them
+/// as a *visual* rotation stop needs a raise-cursor distinct from `USER_INPUT_ACTIVE`, which is an arc on
+/// the focus primitive, not a keybinding fix.
+///
+/// Compacts in place and zeroes the tail, so the caller reads `ring[..n]` with no stale owner behind it.
+/// `out` is `focus_ring`'s own buffer type, so no second array is allocated anywhere. Unconditional — no
+/// feature gate — so it is armed in every leg that compiles this file, and so the knob-off byte-identity
+/// rule does not reach it: that rule protects "arming a knob does not change the knob-off image", and this
+/// is not a knob (SINKVALID's ruling one commit ago, same file, same reasoning).
+fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
+    let n = crate::video::wm::focus_ring(out);
+    let mut k = 0usize;
+    for i in 0..n {
+        let owner = out[i];
+        if !key_sink_drains(owner) {
+            continue;
+        }
+        out[k] = owner;
+        k += 1;
+    }
+    for e in out[k..n].iter_mut() {
+        *e = 0;
+    }
+    k
+}
+
 /// WC-C — the TAB focus-cycle. Returns `true` when the event was CONSUMED by the window system and must
 /// not reach any app's ring.
 ///
-/// Cycling means: take the compositor's focus ring (`video::wm::focus_ring` — the distinct owner ASIDs of
-/// the live windows, in window-id order) PLUS one more slot for the SHELL (`USER_INPUT_ACTIVE == 0`), find
-/// where the current focus sits, and hand focus to the next slot. `user_input_set_active` is the ONE way
+/// Cycling means: take the compositor's focus ring ([`focus_ring_apps`] — the distinct owner ASIDs of the
+/// live windows, in window-id order, MINUS the ones that drain nothing) PLUS one more slot for the SHELL
+/// (`USER_INPUT_ACTIVE == 0`), find where the current focus sits, and hand focus to the next slot.
+/// `user_input_set_active` is the ONE way
 /// focus moves, so the tab-cycle inherits everything that already hangs off it: the incoming ring is
 /// reset, the interactive-takeover latch is cleared (the newly-focused app has consumed nothing yet, so
 /// its `run` deadline re-arms and the UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply
@@ -13241,6 +13323,9 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
 ///    which is an arc-sized change to the focus primitive, not a keybinding fix.
 ///  * The KeyUp is swallowed too, on the same predicate. Delivering a lone KeyUp for a KeyDown the app
 ///    never saw is exactly the dropped-edge shape UVUG-6 spent an arc removing from the typematic path.
+///
+/// TABKEY: the rotation is over [`focus_ring_apps`], not `wm::focus_ring` directly — see that helper for
+/// why, and for the Pi capture that proves the raw ring parks focus on rows with no ring 41% of the time.
 fn wc_focus_key(ev: crate::pal::Event) -> bool {
     const K_TAB: u8 = b'\t';
     let down = match ev {
@@ -13251,10 +13336,12 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // WEDGE-2 `<F1>` — a TAB edge has been recognised and the chain begins. Emitted BEFORE
     // `focus_ring`, which takes the window TABLE lock: a `<F1>` with no successor means the chain
     // died reading the ring, i.e. against `TABLE`. Both entry points (the in-ring router seam and
-    // `wc_shell_focus_key`) funnel through this one body, so one token covers both.
+    // `wc_shell_focus_key`) funnel through this one body, so one token covers both. TABKEY: still
+    // ahead of the only `TABLE` acquisition — `focus_ring_apps` filters the result of that same call
+    // and takes no lock of its own — so the token's meaning is unchanged.
     crate::wedge2::mark("<F1>");
     let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
-    let n = crate::video::wm::focus_ring(&mut ring);
+    let n = focus_ring_apps(&mut ring);
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
     // justified when windows could not outlive `run`: a lone window meant a parked shell, so consuming
@@ -14045,6 +14132,16 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 // So answer it where the operator will: a press on the row they are looking at hands the
                 // keyboard back to the shell and is consumed, instead of being addressed to a ring that
                 // does not exist. Costs one range compare on the hottest arm in the router.
+                //
+                // ⚠ TABKEY UPDATE — THE TAB DOOR IS NOW SHUT, so the paragraph above is history, not a
+                // live hazard. `wc_focus_key` rotates over `focus_ring_apps`, which drops every owner
+                // failing `key_sink_drains`; the filter does not weld because it REMOVES the row rather
+                // than deflecting off it, and it lives in this file rather than `video/wm.rs` because
+                // that file is x86's too (see `focus_ring_apps`'s note). This self-heal is KEPT and is
+                // now insurance rather than the only answer: `user_input_set_active` is `pub` and has
+                // callers outside the click and TAB paths (`run_user_image`, `dock::focus_set`), so a
+                // dead sink arriving from a third door still meets a way out, at the cost of one range
+                // compare. It is also the only path that can rescue a focus stranded before this fix.
                 if !key_sink_drains(cur) {
                     focus_grant_or_shell(cur, cur, win);
                     CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
