@@ -2714,7 +2714,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); #[cfg(feature = "orinfurn")] tegra_desk_furn(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + ORIN-DESKFURN, the menu bar + SHARD menu (no-op unless UNAOS_ORINFURN=1; DESKFURN tail block — LAST of the rungs on purpose, so every earlier rung's probe still reads a panel with no bar on it and its captures stay comparable to boot7f/7g/7h; and still AHEAD of `boot_ok_disarm`, so the boot watchdog covers the composite it drives) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); #[cfg(feature = "orinfurn")] tegra_desk_furn(); #[cfg(feature = "orinrender")] tegra_render_arm(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + ORIN-DESKFURN, the menu bar + SHARD menu (no-op unless UNAOS_ORINFURN=1; DESKFURN tail block — LAST of the rungs on purpose, so every earlier rung's probe still reads a panel with no bar on it and its captures stay comparable to boot7f/7g/7h; and still AHEAD of `boot_ok_disarm`, so the boot watchdog covers the composite it drives) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -8091,4 +8091,177 @@ fn tegra_stk_anchor() {
         core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
     }
     ORINSTK_ANCHOR_SP.store(sp, core::sync::atomic::Ordering::Relaxed);
+}
+
+// ============================== ORINRENDER — the Orin's render pass ==============================
+// Rung 5's owed core (orin-desktop.md §3.6). DEFAULT OFF. The full argument for why the Pi's
+// `render_service` is not portable, and why this grows the existing pump's other half instead of
+// adding a second event loop, is on the `orinrender` feature in Cargo.toml. Short form: both of the
+// Pi service's transports are `baremetal`-gated and `baremetal` + `tegra` is a hard `compile_error!`;
+// its blocking `recv()` would park forever because `run_capstone_boot_core` has no sleeper drain;
+// and `jd2_console_pump` already owns the input half, so a second drainer would steal its events.
+
+/// One-shot latch — the seam must never run twice. A second pass would re-mint the shell window and
+/// leave the first row's heap store owned by nothing.
+#[cfg(all(target_arch = "aarch64", feature = "orinrender"))]
+static ORINRENDER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// ORINRENDER — evaluate the floors on the tegra terminus and spawn the render pass.
+///
+/// Returns whether the service was spawned. Every decline is NAMED on the wire: a silent `false`
+/// must never be indistinguishable from "the seam was never called", which is the ambiguity that
+/// made `orinfurn`'s missing bar read as a mystery rather than as a refusal.
+#[cfg(all(target_arch = "aarch64", feature = "orinrender"))]
+fn tegra_render_arm() -> bool {
+    use core::sync::atomic::Ordering;
+
+    // THE ENTRY LINE, before anything can decline. The sibling knobs are printed because this rung's
+    // usefulness is a function of them — without `orinconwin` there is no console window beside the
+    // shell window this mints — and printed as `cfg!()` reads rather than as literals, so the line is
+    // falsifiable rather than trusted. That distinction is not pedantry here: `orinconwin` shipped a
+    // `live=LIVE` that was a compile-time literal and would have printed LIVE whatever the route did.
+    serial_println!(
+        "[orinrender] arm conwin={} furn={} tenant={} click={} desk={} (ORIN-RENDER entered on the tegra terminus; §5.2 UNCROSSED — desktop_firmware::activate is NOT called)",
+        cfg!(feature = "orinconwin") as u8,
+        cfg!(feature = "orinfurn") as u8,
+        cfg!(feature = "orintenant") as u8,
+        cfg!(feature = "orinclick") as u8,
+        cfg!(feature = "orindesk") as u8
+    );
+
+    if ORINRENDER_ARMED.swap(true, Ordering::AcqRel) {
+        serial_println!("[orinrender] REFUSE reason=already-armed (the seam is one-shot; a second spawn would mint a second shell window and orphan the first row's heap store)");
+        return false;
+    }
+
+    // FLOOR 1 — THE PANEL, read off the surface the compositor composites onto rather than assumed.
+    // Copy the info out and drop `WRITER` immediately: nothing below may hold it across a `wm` call,
+    // which is ORIN-WM1's WRITER/TABLE acquisition-order rule. A headless Orin (no DTB
+    // `simple-framebuffer` handoff, so JD1 seeded no scanout) has no geometry to mint against.
+    let ready = {
+        let fb = *unaos_kernel::video::WRITER.lock();
+        fb.is_ready()
+    };
+    if !ready {
+        serial_println!("[orinrender] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the shell window's geometry and the present that paints it are both functions of panel geometry)");
+        return false;
+    }
+
+    // THE GAP THIS RUNG EXISTS TO CLOSE. `desktop_firmware::armed()` is false for the entire Orin
+    // boot: its only setter is `arm()`, whose one call site is inside `u7_launcher`, spawned from the
+    // `kernel_main` body that tegra never reaches (`tegra_early_stop` is `-> !`). So on the Orin
+    // `open_shell_window`'s guard has never once been true, and the minting code has sat compiled and
+    // unreachable. `arm()` is a latch store plus one serial line — it is NOT `activate()`, and the
+    // cascade §5.2 stops is not driven here. Armed BEFORE the spawn so the service's first pass can
+    // mint rather than idling a full pass waiting for a latch nothing else on this board will set.
+    unaos_kernel::video::desktop_firmware::arm();
+
+    // PLACEMENT IS CHOSEN, NOT CONVENIENT — §5.2's rule, from two seats on the same day (rmbp's steal
+    // handed composite work to the busiest core; pi co-pinned `usb-pump` with `input` and destroyed
+    // the only redundancy in its service set). cpu 0 is not a convenience here, it is the only legal
+    // choice: cores 1-5 are online and dispatching but are still at EL2 (only the boot core drops to
+    // EL1), and `run_capstone_boot_core`'s loop is the only dispatcher that will ever run this task.
+    // Explicit pin, never CPU_AUTO — `ONLINE_MASK[0]` is false on the Orin, so an auto placement would
+    // be decided by a filter that does not know this core exists.
+    let tid = unaos_kernel::arch::sched::spawn("orin-render", orin_render_service, 0, 0);
+    serial_println!(
+        "[orinrender] spawned tid={} cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)",
+        tid
+    );
+    true
+}
+
+/// The Orin's render pass. Cooperative, pinned to cpu 0, and it NEVER SLEEPS.
+///
+/// `run_capstone_boot_core` has no `drain_due_sleepers` and never sets `SCHED_ACTIVE`, so a task on
+/// this core that sleeps parks in `SLEEPERS[0]` and is never woken. `yield_now` is the only legal
+/// blocking discipline here, which is the same reason `jd2_console_pump` busy-polls.
+///
+/// IT DOES NOT DRAIN EVENTS. `jd2_console_pump` owns `pal::EVENT_QUEUE` and feeds `handle_key`; a
+/// second drainer would steal keystrokes from the shell. This task owns the PAINT half only.
+#[cfg(all(target_arch = "aarch64", feature = "orinrender"))]
+fn orin_render_service(_: usize) {
+    // `render`/`width`/`height`/`clear_screen` are trait methods on `GneissPal`, not inherent ones.
+    use unaos_kernel::pal::GneissPal;
+    use unaos_kernel::video::wm;
+
+    let front_fb = *unaos_kernel::video::WRITER.lock();
+    let info = front_fb.info();
+    let (pw, ph) = (info.width, info.height);
+    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+
+    // The shell window's heap store is bound and never read again ON PURPOSE: the `wm` row holds a
+    // raw pointer into it, and this task never returns, so the binding IS the lifetime. Same
+    // construction as the Pi service's `_shell_store`, and same reason.
+    let mut _shell_store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut shell_id = wm::WIN_NONE;
+    // One decline is final. `open_shell_window` already names its reason on the wire; retrying every
+    // pass would turn a full heap into a serial flood.
+    let mut shell_declined = false;
+    let mut passes: u64 = 0;
+    let mut presents: u64 = 0;
+
+    loop {
+        passes += 1;
+        let mut dirty = false;
+
+        // LAZY MINT, once. Guarded on `armed()` rather than on having called `arm()` above, because
+        // the guard is what `open_shell_window` itself reads and a rung that checks a different fact
+        // than the one that gates it is the defect class this branch keeps paying for.
+        if shell_id == wm::WIN_NONE
+            && !shell_declined
+            && unaos_kernel::video::desktop_firmware::armed()
+        {
+            match open_shell_window(pw, ph) {
+                Some((store, _surf_fb, id)) => {
+                    _shell_store = store;
+                    shell_id = id;
+                    // Claim the backdrop only now, at the pass that actually mints — never at task
+                    // start, which would leave a backdrop going stale across the whole boot.
+                    pal.clear_screen(wm::DESKTOP_BG);
+                    unaos_kernel::video::retire_desktop_chrome(pw, ph);
+                    dirty = true;
+                    serial_println!(
+                        "[orinrender] win={} panel={}x{} pass={} -> SHELL-WINDOW (the first shell window ever minted on this board; `open_shell_window` was compiled and callerless on tegra until this rung)",
+                        id, pw, ph, passes
+                    );
+                }
+                None => {
+                    shell_declined = true;
+                    serial_println!("[orinrender] DECLINE reason=open-shell-window-refused (it named the reason on the line above; not retried — one decline is final)");
+                }
+            }
+        }
+
+        // The pulse window's own service pass. Compiled on tegra under `desktop_firmware` and, until
+        // this rung, called by nothing on this board.
+        unaos_kernel::video::pulsewin::service();
+
+        // The status strip's ~1 Hz repaint. `tick` returns whether it changed anything, so a quiet
+        // pass costs one compare and no present.
+        dirty |= unaos_kernel::ui_status::tick(&mut pal);
+
+        // AT MOST ONE PRESENT PER PASS, and only when something changed. The Pi service measured a
+        // 96-100% core peg before it took this rule; on this board the cost lands on cpu 0, which is
+        // also the only core that can dispatch `jd2_console_pump`.
+        if dirty {
+            pal.render();
+            presents += 1;
+        }
+
+        // Rate-limited liveness. This task is a SINGLETON ROLE and this tree has no re-home path —
+        // §5.2: `steal_ok` is false for every explicitly-pinned task, so if this dies nothing inherits
+        // the paint. Pi boot 11 printed `verdict=LIVE` one line after the exception that killed cpu 3,
+        // so the counter is printed rather than a bare "alive".
+        if passes % 20000 == 0 {
+            serial_println!(
+                "[orinrender] census passes={} presents={} win={} declined={} -> RENDER-LIVE",
+                passes, presents, shell_id, shell_declined as u8
+            );
+        }
+
+        // Cooperative yield — never `sleep_ticks`. See this function's doc.
+        unaos_kernel::arch::sched::yield_now();
+    }
 }

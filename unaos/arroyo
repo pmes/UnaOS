@@ -1249,6 +1249,16 @@ _feats=""
 # Witness on the wire: `[orinfurn] arm`, `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`,
 # `[orinfurn] crystal LIVE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
 [ -n "${UNAOS_ORINFURN:-}" ] && _feats="${_feats}orinfurn,desktop_firmware,orinclick,tegra_el0,tegra,"
+# ORINRENDER: UNAOS_ORINRENDER=1 gives the Orin a RENDER PASS — `main.rs::tegra_render_arm` on the
+# tegra terminus line, which arms `desktop_firmware`'s latch (false for the whole Orin boot until
+# now: its only setter is inside `u7_launcher`, spawned from a `kernel_main` body tegra never
+# reaches) and spawns `orin-render`, a cooperative cpu-0-pinned task that mints the shell window,
+# services `pulsewin`, ticks the status strip and presents at most once per pass when dirty.
+# DEFAULT OFF. §5.2 UNCROSSED — `desktop_firmware::activate()` is NOT called, so the cascade that
+# overflowed twice on Pi metal is not driven. It does NOT drain events: `jd2_console_pump` owns
+# `pal::EVENT_QUEUE`, and a second drainer would steal the shell's keystrokes.
+# The terms are appended here as well as implied by Cargo so the banner shows what it actually built.
+[ -n "${UNAOS_ORINRENDER:-}" ] && _feats="${_feats}orinrender,desktop_firmware,tegra_el0,tegra,"
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,desktop_firmware,tegra_el0,tegra,"
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
 # ORDINARY Orin boot. This is the one item of the 2026-08-26 `video/` parity survey that an operator
@@ -3046,6 +3056,22 @@ KERNEL_CFG_MATRIX=(
   # `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see
   # check_both) supplies it.
   "arm-tegra-conwin ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick"
+  # ORINRENDER — rung 5's owed core (orin-desktop.md §3.6): the Orin's render pass. `orinrender` is a
+  # NEW `[features]` entry, so no existing row names it and Cargo cannot close the gap either —
+  # nothing in `[features]` implies it. Without this leg the feature is unclaimed, `x86_cfg_universe`
+  # inherits it as x86, and the derived mix legs try to compile a tegra-only rung on x86_64.
+  #
+  # HOSTED ON `arm-tegra-conwin`'s LIST + `orinrender`, chosen so the resolved set grows by EXACTLY
+  # {orinrender}: `orinrender = ["desktop_firmware", "tegra_el0"]` and this row already carries both,
+  # so a red here is attributable to the new rung and to nothing else. `arm-tegra-furn` was the other
+  # candidate and is rejected for that reason — it would have added `orinfurn` to the delta.
+  #
+  # PRECONDITION: this row carries `tegra_el0`, which compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin` — supplied by `ensure_user_blob` ahead of the matrix.
+  #
+  # UNIVERSE SIDE EFFECT: `orinrender` becomes arm-claimed, so it leaves `x86_cfg_universe` and the
+  # derived `x86-mix-*` count is unchanged. Board legs 34 -> 35; gate legs 43 -> 44.
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
