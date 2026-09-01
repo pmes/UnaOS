@@ -2704,7 +2704,7 @@ decoration.** Publishing beat asserting, and it did so on the arch the word was 
 This is the same rule §3.12.2 states from the other direction, and it is now demonstrated rather
 than only argued.
 
-##### Two gaps found on the way, both real, neither fixed
+##### Two gaps found on the way, both real — one now CLOSED (CONWINCLOSE), one still owed
 
 * **`video::init_panel` is never called on tegra.** The Orin seeds `video::WRITER` directly in
   `tegra_early_stop`'s JD1 block; the tree already says so at
@@ -2712,10 +2712,88 @@ than only argued.
   function's own older strings `:: FB Init ::` and `:: Framebuffer painted #1E1E1E ::` are absent
   from a tegra artifact too, so the absence is the function's and not the new token's. ⚠ Relayed
   from the authoring arc; this section did not rebuild the artifact.
-* **`fbcon::panel_console_window_closed` has exactly ONE caller tree-wide** —
+* **`fbcon::panel_console_window_closed` had exactly ONE caller tree-wide** —
   `arch/x86_64/syscall.rs:5942` — and none on aarch64 (verified by `grep` over `--include=*.rs` at
-  `63b86488`). **The Orin can OPEN a console window under `orinconwin` and has no close path that
-  calls it.** A real gap on this board; outside that arc, and owed.
+  `63b86488`). **The Orin can OPEN a console window under `orinconwin` and had no close path that
+  calls it.** A real gap on this board; outside that arc, and owed. **CLOSED by CONWINCLOSE — see
+  §3.12.4 below.**
+
+###### §3.12.4 CONWINCLOSE — the aarch64 close path (2026-08-31)
+
+**The inherited claim was RE-DERIVED before it was built on, and it SURVIVED**, on a search whose
+pattern was validated rather than assumed. `panel_console_window_closed` appears in exactly four
+source lines tree-wide: its definition (`video/fbcon.rs:2069`), one string literal inside it
+(`:2090`), one doc reference (`arch/x86_64/syscall.rs:5927`) and **one call — `arch/x86_64/syscall.rs:5942`,
+inside `wc_close_furniture`.** Zero calls on aarch64. The control that makes that zero mean
+something: the same search shape run for `user_input_enqueue` returns **16 hits in
+`arch/aarch64/syscall.rs`** — ripgrep does read the aarch64 file and the pattern form does match
+there, so the zero is the tree's and not the query's.
+
+**The gap was WORSE than "no close path", and the second half is what the original finding did not
+say.** Three facts compose:
+
+1. `wm::ctrls_for` returns `&CTRLS` — all three discs — **for every row including kernel
+   furniture** (NORMALWIN, Peter 2026-08-11). `control_hit` / `close_box_hit` are arch-neutral, in
+   `wm.rs`. So the console window on aarch64 **is painted with a live-looking close disc**.
+2. The aarch64 router's close arm (`arch/aarch64/syscall.rs`, `wc_click_route`) had **no
+   `is_kernel_owner` split**: every close-disc press went to `wc_close_click(owner)`.
+3. `wc_close_click`'s first move is `wm::close_owner`, which **REFUSES the reserved kernel band**
+   (CLOSEISO — unchanged, and correctly so), after which the DRAINSTALL guard returns
+   `"furniture-refused"`.
+
+Net: on aarch64 the console window's close disc was **a control that could not act** — the exact
+thing `wm::ctrls_for`'s own doc block forbids (*"A control that cannot act must not be painted"*),
+and that doc block's remedy sentence points only at *"x86's `Ctrl::Close` arm"*. The claim was true
+of x86 and false of aarch64 for the whole of that window's life on this board.
+
+**It is not Orin-only.** Both aarch64 openers reach `fbcon::panel_console_window_open`:
+`video/desktop_firmware.rs:237` (the Pi's `desktop_firmware::activate`) and
+`arch/aarch64/display_tegra.rs:2656` (`orin_conwin`, under `orinconwin`). The fix is therefore
+gated `all(target_arch = "aarch64", feature = "desktop_firmware")` — **the callee's own predicate,
+verbatim** — not on `orinconwin`.
+
+**What landed.** An aarch64 `wc_close_furniture(win, owner)` in `arch/aarch64/syscall.rs`, the shape
+of x86's, plus a one-line `is_kernel_owner` split in the router's close arm:
+
+| Seam | Before | After |
+| --- | --- | --- |
+| aarch64 `Ctrl::Close` arm | `wc_close_click(owner)` for every row | `wc_close_furniture(win, owner)` for kernel-band rows |
+| console ROUTE on a furniture close | never dropped (`CONSOLE_WIN` kept pointing at the live row) | `fbcon::panel_console_window_closed(win)`, **first**, before `wm::close` |
+| the row | survived (`close_owner` refused it) | `wm::close(win)` — **id-scoped**, `close_owner`'s band refusal UNCHANGED |
+| focus | untouched | `focus_release(owner, "route=close-furniture …")` — never `focus_changed(0)` |
+| settle token | `furniture-refused` | `furniture-closed` / `furniture-norow` |
+
+**Why the tokens are not x86's `closed`/`norow`.** This arch feeds `close_settle_code`, where
+`CLOSE_SETTLE_CLOSED` means *kill confirmed* — and a furniture close kills nobody. The two new
+tokens fall to `CLOSE_SETTLE_OTHER` and stay distinguishable on the wire from `furniture-refused`
+(the disc did nothing), which is the CLOSE-FIX P82 discriminator rule applied rather than restated.
+
+**LOCKFIX `7847ceea` holds, and it was checked rather than assumed.** This arm is on the input path.
+`panel_console_window_closed` is a bare `compare_exchange` plus `publish_panel_owner`, which is one
+`swap(AcqRel)` and a `witness`-gated `serial_println!` (`video/mod.rs:336-350`) — **no panel lock,
+neither `WRITER` nor `FBCON`, in either polarity**. `wm::close` / `focus_release` take the window
+TABLE, which this very arm's `wc_close_click` sibling has always taken from the same band, so no new
+lock and no new order. No protection was weakened to land this: `close_owner`'s kernel-band refusal,
+the CLOSEISO guard and the panic path are all untouched.
+
+**PARITY.md §5.3 — LINE-NEUTRAL, by construction and by measurement.** `arch/aarch64/syscall.rs` is
+compiled into the knob-off `kernel8.img`, so the whole change is three folded one-line substitutions:
+`git diff --numstat` reads **`3 3`**. `desktop_firmware` is absent from `kernel8()`'s curated
+`K8_FEATS` (`baremetal,skip_xhci`), so the knob-off Pi image gains zero bytes *and* zero renumbered
+panic `Location`s. (Necessary, not provably sufficient — the hash re-measure is the Pi seat's.)
+
+**Owed to the rmbp seat (shared-video prose only, no code).** Two comments in `video/fbcon.rs` now
+understate their own scope and were left untouched because that file is the x86 seat's lane:
+`:2049` (*"Called from x86's `wc_close_furniture` BEFORE `wm::close(id)`"*) and `:2082`
+(*"⚠ THIS SITE IS ON THE INPUT PATH — it is called from x86's `wc_close_furniture`"*). Both should
+read *"x86's and aarch64's"*; the LOCKFIX argument at `:2082` is now load-bearing on two arches.
+`video/wm.rs`'s `ctrls_for` block is the opposite case — its *"a control that cannot act must not be
+painted"* claim was FALSE on aarch64 and this arc makes it true, so it needs no edit.
+
+**What this does NOT claim.** No metal. The aarch64 armed polarity is type-checked (see the leg
+named in the landing report) and nothing here has been clicked on a panel. `orinconwin` still
+DECLINES on an image missing `orindesk`/`orinclick`, so the bench image that can exercise this is
+the fully-armed ladder cross, and that flight is owed.
 
 ##### One deliberate surrender, stated rather than buried
 
