@@ -3589,6 +3589,105 @@ KERNEL_CFG_MATRIX=(
   # check_both) supplies it.
   "arm-tegra-furn-vpar-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinfurn,orinvpar,smpmark"
   "arm-tegra-supstate-el0-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,smpmark"
+  # EL0JD1DC — the JD1-DC probe, compiled at last in the EL0 regime it FLEW in (appended 2026-08-31).
+  #
+  # THE HOLE, re-derived in this tree at 66a2ac7f rather than inherited, with the controls that make a
+  # zero mean something (a bare "0 rows" indicts the pattern, not the matrix — the rule the census
+  # block above had to learn three times). Both sides closed under Cargo's implication graph, because
+  # a literal-string comparison undercounts by exactly the implied features:
+  #     rows carrying `jd1dc`                :  1   (`arm-tegra-jd1dc`, and nothing else)
+  #     rows carrying `tegra_el0`            : 16
+  #     rows carrying BOTH                   :  0   <- the hole
+  #     rows carrying `smpmark` + `tegra_el0`:  2   <- POSITIVE CONTROL: the same test, same closure,
+  #                                                   non-zero on the SMPMARKLEG pair two rows above
+  #     rows carrying `aarch64_el0`          : 17 closed / 0 literal  <- the closure itself is live
+  # And no row of this matrix was a superset of the flown closure: measured, `arm-tegra-furn-vpar-smpmark`
+  # is the ONLY row whose closure covers boot7e/boot7f minus `jd1dc`, and it does not carry `jd1dc`.
+  #
+  # WHY IT MATTERS. `arm-tegra-jd1dc` is hosted on `arm-tegra`, and `arm-tegra` is deliberately the
+  # EL0-DISARMED twin (see the JETSON-EL0 block above — that polarity has real code behind it and has
+  # to stay). So every leg that compiled the probe had `tegra_el0` OFF, and every leg that had
+  # `tegra_el0` ON compiled the probe out. That is the EXECGATE shape exactly, one knob over: a
+  # feature whose sites all sit under `src/arch/aarch64/` or behind a `target_arch` qualifier, swept
+  # onto no leg that arms its neighbour, so the armed pair is type-checked by nothing.
+  #
+  # AND IT FLEW THAT WAY. Four staged Orin images carry `jd1dc` AND `tegra_el0` (the latter riding in
+  # via `orinclick`, per the MANIFEST's own 2026-08-25 correction): boot7e, boot7f, boot7g, boot7h.
+  # ⚠ FLIGHT-RECORD CORRECTION: `boot7-el0smp-install-20260822T1949Z` is NOT a fifth. It carries
+  # `tegra_el0` and `smpmark` but its MANIFEST block records `jd1dc` knob-gated OFF and verified so by
+  # `strings` (0 hits for `JD1-DC VERDICT=`); its banner list has no `jd1dc` in it. It belongs to the
+  # SMPMARK cross, which the two rows above already claim, not to this one. boot7b/boot7c/boot7d carry
+  # `jd1dc` WITHOUT `tegra_el0` and are covered by `arm-tegra-jd1dc` on the pair this row is about.
+  #
+  # THE VERDICT THIS ROW LICENSES, and it is the finding this leg was written to produce: THE CROSS
+  # COMPILES. `jd1dc` + `tegra_el0` type-checks clean on aarch64 — EXIT 0, zero errors — so the four
+  # flights above were not flying an unbuildable configuration. That was not knowable before this row:
+  # EXECGATE passed twelve legs and could not compile the armed build at all.
+  #
+  # HOSTED ON `arm-tegra-el0`'s LIST VERBATIM + `jd1dc` — a ONE-TOKEN delta, one token after resolution
+  # too (`jd1dc` is STANDALONE: `jd1dc = []`), on a row already proven green, so a red here names the
+  # cross and nothing else. This is the `arm-tegra-supstate-el0-click` / `arm-tegra-conwin` /
+  # `arm-tegra-furn` shape, and it makes this leg the ARMED TWIN of `arm-tegra-jd1dc`: between the two,
+  # `jd1dc`'s items are now compiled in BOTH polarities of `tegra_el0`, which is the same twin argument
+  # `x86-vsyncpace` and `arm-tegra-el0` itself are built on.
+  #
+  # WHY ONE ROW AND NOT THE `jd1dc,smpmark` PAIR THE CENSUS RECOMMENDED. That recommendation predates
+  # the SMPMARKLEG fold two rows above, and half of it is now already paid: `smpmark` x `tegra_el0` is
+  # carried by 2 rows (measured, above), so appending `smpmark` here buys no cross that does not
+  # already exist. It is not free either — a two-token delta means a red cannot say WHICH cross broke,
+  # which is the whole reason these tail legs are one token wide. And the triple is not a distinct
+  # obligation: NO `#[cfg]` in src/ names both `jd1dc` and `smpmark` (measured: 0 sites; all 20 `jd1dc`
+  # sites are the bare `feature = "jd1dc"`), so compiling them together checks nothing that compiling
+  # them apart does not.
+  #
+  # DOES SMPMARKLEG'S UNION-REJECTION APPLY HERE? No, and the reason is worth stating because the two
+  # cases look alike. That block refused ONE row for TWO flown images because neither image's feature
+  # set contained the other's, so a union row would have compiled a third configuration no flight
+  # builds and left both flights covered by nothing. Here there is ONE cross and one flown SHAPE:
+  # boot7e ⊆ boot7f ⊆ boot7g ⊆ boot7h in the knob dimension (each adds, none drops). Nothing is being
+  # unioned across incomparable images, so the argument that forced two rows there forces one here.
+  #
+  # NON-VACUITY, MEASURED not argued, TWO-SIDED. A leg that cannot go red is not coverage. One probe
+  # was planted inside `jd1_dc_probe` (`arch/aarch64/display_tegra.rs`), conjoined so that exactly one
+  # row of this matrix reaches it and no existing row does:
+  #     #[cfg(all(feature = "jd1dc", feature = "tegra_el0"))] let _pjd: u32 = "EL0JD1DC-PROBE";
+  # Each leg run as its own `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  #     arm-tegra-el0-jd1dc (NEW)       EXIT 101   error[E0308] expected `u32`, found `&str`
+  #                                                display_tegra.rs:802:75 — the planted line
+  #     arm-tegra-jd1dc                 EXIT 0     jd1dc, no tegra_el0
+  #     arm-tegra-el0                   EXIT 0     tegra_el0, no jd1dc
+  #     arm-tegra                       EXIT 0     neither
+  #     arm-tegra-supstate-el0          EXIT 0     tegra_el0, no jd1dc
+  #     arm-tegra-furn-vpar-smpmark     EXIT 0     tegra_el0 + smpmark, no jd1dc
+  # The WHOLE-GATE run with the probe in is the stronger form of the second side: `./arroyo check`
+  # exited 1 naming EXACTLY this leg (`❌ kernel cfg coverage FAILED ... legs: arm-tegra-el0-jd1dc`)
+  # with all 42 other legs of the 43 green, and `error[E0308]` was the ONLY error code emitted anywhere
+  # in the run. That is what licenses the COMPILES verdict above: the sole compile error in the new
+  # configuration was the deliberate one. Probe reverted and `display_tegra.rs` proved byte-identical
+  # by sha256 (963c3b83cd31fe6faf1108c26875640747d9f5f60862437a61417b020b61300f, before and after).
+  #
+  # UNIVERSE SIDE EFFECT: none, and MEASURED. Both knobs this row names are ALREADY named by an arm-*
+  # leg (`tegra_el0` by 16 rows, `jd1dc` by `arm-tegra-jd1dc`), so the arm-named knob set is identical
+  # before and after — 89 both ways, delta EMPTY — the board union is 140 both ways, `x86_cfg_universe`
+  # is 76 both ways, and the derived mix-leg count is 9 both ways. Board legs +1 (33 -> 34); gate legs
+  # +1 (42 -> 43). `./arroyo check` prints the live board/mix counts every run — read them there.
+  #
+  # WHAT THIS DOES NOT COVER, said so nobody reads the green as more than it is. (1) It is a TYPE
+  # CHECK: QEMU models no Tegra234, so no gate in this repo can boot the image, and whether
+  # `JD1-DC VERDICT=` reaches the wire on an EL0-armed boot stays an Orin-metal verdict. (2) `jd1dc` is
+  # still crossed with NOTHING else the flights carried — measured at 34 rows, `jd1dc` x `orindesk`,
+  # x `orinclick`, x `orinconwin` and x `smpmark` are all still 0 rows, so boot7e..boot7h are still a
+  # superset of no row in this matrix. The one-token change that would close all four at once is
+  # `arm-tegra-furn-vpar-smpmark`'s list verbatim + `jd1dc` (its closure already covers boot7e/boot7f
+  # minus the token — measured). That row is NOT added here: it is a desk-lattice row and the desk
+  # lattice is the seat's call, not this arc's. (3) boot7g/boot7h additionally carry the media-default
+  # knobs (`ehcihid`, `kbdwit`, `smolnet`, `sdhcblk`) and `pidesk`, which no arm-tegra row names —
+  # a media-fingerprint question, deliberately untouched.
+  #
+  # PRECONDITION: like `arm-tegra-el0` itself, this row compiles `arch/aarch64/syscall.rs` (it carries
+  # `tegra_el0`), which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both)
+  # supplies it.
+  "arm-tegra-el0-jd1dc ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,jd1dc"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
