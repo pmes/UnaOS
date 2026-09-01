@@ -36,6 +36,46 @@
 # counted into the tally — mbench.py:176); spec-declared FORBID rows go 5 -> 7, three
 # arrive and the one that could never match is gone.
 #
+# ============================================================================
+# 2026-08-31 (orin 11, SPECSCORE) — HOW TO SCORE A CAPTURE AGAINST THIS FILE, and the one
+# thing mbench cannot tell you.
+#
+#   scripts/orin-specscore.py <capture> --spec scripts/specs/jetson-sync1.spec \
+#       --image ~/unaos-bench/flash/orin/<staged-dir>/
+#
+# `mbench.py --replay` remains the semantics of record and orin-specscore imports it rather
+# than re-implementing it, so the verdict is the same verdict. What it ADDS is the question
+# this file had no way to ask: COULD THIS RULE HAVE FIRED ON THE IMAGE THAT PRODUCED THIS
+# CAPTURE? A rule whose emitter is `#[cfg]`-erased from the build prints `✅ 0 hits` and is
+# indistinguishable, in mbench's table, from a rule that passed — and this file carries
+# SIX such rows against the 2026-09-01 staged pair (the two sdmmc rows, the `[wedge4]`
+# tripwire, the two stale-image takeover rows, and the firmware RAS row). Each is argued
+# where it lives; none is deleted, because each is correct for an image that builds it.
+# The tool exits 4 (PASS-BUT-VACUOUS) when a capture passes while a FAILABLE row could not
+# have fired, and `--accept-dead <spec lines>` records the reviewed exemptions ON THE
+# COMMAND LINE rather than in this file — see the GRAMMAR LIMIT note below.
+#
+# ⚠ GRAMMAR LIMIT, restated here because three separate blocks below run into it: mbench
+# has no `WHEN <guard> REQUIRE/FORBID <rx>`, so this file CANNOT say "this row applies to
+# the conwin image only". Every per-image asymmetry is therefore handled by making the row
+# a FORBID or a PENDING (neither can red an unarmed boot) and arguing the reading in prose.
+# That works for FORBIDs and it is why the `orinconwin` / `orinstkdepth` / `supstate` rows
+# are shaped the way they are; it does NOT give the file a way to REQUIRE something of one
+# image and not the other, and nothing here should be read as if it did. orin-specscore
+# does not invent that syntax either — it MEASURES which rows a given image can fire and
+# reports the answer, which is the part that was missing.
+#
+# ⚠ AND: a rule keyed on RUNTIME-COMPOSED text cannot be validated against an artifact at
+# all. `live=FROZEN` is the worked example (see its block); the contiguous string is never
+# in any `.rodata` because `live={}` and `"FROZEN"` are separate literals. Before grepping
+# a staged `kernel.elf` to "check" a row, confirm the row's text is a CONTIGUOUS LITERAL in
+# the source. If it spans a `{}`, the grep can only ever return zero and means nothing.
+#
+# A synthetic green reference lives at `scripts/specs/jetson-sync1-green.capture` — 17/17,
+# zero forbidden hits. It is SYNTHETIC and is not a metal green reference; its job is to
+# prove this file CAN go green, since every real capture predating the folds now reds.
+# ============================================================================
+#
 # 2026-08-25 (exec-spec, second pass): THE PENDING SWEEP. All 8 PENDING rows matched on
 # boot7f, and "it matched" was NOT treated as sufficient — the test applied to each was
 # whether promoting it adds a way for a HEALTHY boot to red. Three passed and were
@@ -295,6 +335,18 @@ PENDING TEGRA-SD.*block backend published
 # all of them genuine armed stops. The bare token `recon` appears 862 times across the tree
 # (`disp-userd-recon`, `recon-pre`, `recon-post`, `reconfig`, …), which is exactly why the
 # verdict word is part of the pattern and not just the tag.
+# ⚠ BOTH ROWS ARE UNFIREABLE ON THE 2026-09-01 STAGED PAIR, and the corpus counts above are
+# the reason that is easy to miss. Measured 2026-08-31 (orin 11, SPECSCORE): every emitter
+# behind them is `#[cfg(…, feature = "sdmmc")]` — the recon stops at sdmmc_tegra.rs:2569+,
+# the publish/refuse pair at block.rs:1653+ — and NEITHER staged image carries `sdmmc`
+# (conwin1 and supstate1 both build `…,sdhcblk,…` and no `sdmmc`). The strings `recon `
+# and `TEGRA-SD` take ZERO hits in both `kernel.elf`s; the five real corpus hits cited above
+# are all from ARMED-SDMMC flights, which these two are not. So a `✅ 0 hits` on either
+# staged boot says nothing about the card path — it says the card path was not built. The
+# rows are KEPT, not deleted: they are correct and proven for an `sdmmc` image, and this is
+# a configuration gap, not a bad rule. The PENDING `TEGRA-SD.*block backend published` row
+# at the head of this file is unfireable on the same pair for the same reason, so its ⏳ can
+# never promote from these two flights either.
 FORBID recon (SKIPPED|REFUSED|STOPPED at M3|done at M2)
 FORBID TEGRA-SD: REFUSED to publish
 
@@ -1176,6 +1228,14 @@ OPTIONAL \[net4G\] interim pop slot=[0-9]+
 # ZERO hits across the whole bench capture tree (313 files, 2,383,287 lines) and zero on
 # the boot7h slice; the cooperative tell takes 6 hits on `capture/line-acm0/orin.log` (one
 # per Orin flight on that wire) and 1 on the boot7h slice, which is exactly what it should.
+# ⚠ AND IT CANNOT PROMOTE FROM THE 2026-09-01 STAGED PAIR. `run_bsp_tegra` is
+# `#[cfg(all(feature = "tegra", feature = "bsprun"))]` (sched.rs:10447) and NEITHER staged
+# image carries `bsprun`; the token `orinbsprun` takes ZERO hits in both `kernel.elf`s
+# (measured 2026-08-31, orin 11). So a ⏳ here on boot A or boot B is CONFIGURATION, never
+# evidence, and the paired reading above must not be entered at all for those two flights.
+# The `REQUIRE` at the head of this file that names this token is unaffected — it is an
+# alternation whose OTHER arm, `CAPSTONE COMPLETE`, is present in both images and is what
+# will satisfy it.
 PENDING \[orinbsprun\] boot core [0-9]+ joins run\(\)
 OPTIONAL running the full M4 CAPSTONE cooperatively
 # THE SECOND, INDEPENDENT REGIME TELL — and it is worth having BOTH because it is emitted
@@ -1287,6 +1347,21 @@ OPTIONAL \[wedge4\] RQ STALL core=[0-9]+
 # arming it costs every existing capture nothing and it can only ever speak about a bsprun
 # flight. Rate-limited at `W4A_PRINT_MAX`, so a breached boot reds on the first few and then
 # goes quiet — the count is not the evidence, the presence is.
+# ⚠ CORRECTION, measured 2026-08-31 (orin 11, SPECSCORE). The paragraph above says this row
+# cannot fire because `timer_preempt` returns at its first line without `SCHED_ACTIVE`. The
+# RUNTIME argument is right but it is not the operative one, and the difference matters to
+# anyone who tries to check this row against an artifact: the string `preempt-in-section`
+# is NOT IN EITHER STAGED IMAGE'S `.rodata` AT ALL — zero hits in both `conwin1-…-93825ea`
+# and `supstate1-…-93825ea` — while its sibling `[wedge4] RQ STALL core=` (the OPTIONAL row
+# above) is present once in each. The emitter is not merely un-driven, it is OPTIMISED AWAY:
+# with no tegra `SCHED_ACTIVE` setter compiled in — `run_bsp_tegra` is
+# `#[cfg(all(tegra, bsprun))]` and neither staged image carries `bsprun`, and the only other
+# aarch64 setter, `start_aps`, is the Pi's — the whole guarded block is unreachable and LLVM
+# drops it. CONSEQUENCE FOR THE READER: a `✅ 0 hits` here on either staged boot is VACUOUS,
+# not a passed invariant, and no amount of behaviour on those flights can change it. The row
+# stays (it is correct and cheap, and a `bsprun` image will arm it), but it is not coverage
+# of the two boots this file is about. `scripts/orin-specscore.py` scores it DEAD on both
+# and refuses to let it count toward a pass.
 FORBID \[wedge4\] preempt-in-section core=[0-9]+
 
 # --- ORIN-SUPSTATE: the lift, the split, and the half-restructure between them -------
@@ -1446,6 +1521,20 @@ OPTIONAL KEY ('.'|0x[0-9a-f]{2}) ::
 #   PENDING terminus ✅ + this row 0 hits  armed, window open, route installed. The pass.
 #   PENDING terminus ✅ + this row HIT     armed, window open, route dropped by the
 #                                          present pass. Quote the whole line.
+# ⚠ DO NOT TRY TO CONFIRM THIS ROW WITH `strings` / `grep -a` ON THE ARTIFACT, AND DO NOT
+# READ A ZERO-HIT RESULT AS A BROKEN IMAGE. Measured 2026-08-31 (orin 11, SPECSCORE) on
+# BOTH staged images: `live=FROZEN` takes ZERO hits in `conwin1-…-93825ea/kernel.elf` and
+# ZERO in `supstate1-…-93825ea/kernel.elf`, and that is CORRECT for both. The emitter
+# (display_tegra.rs:2677) prints `live={}` with `"LIVE"` and `"FROZEN"` chosen at print
+# time as separate literals, so the contiguous byte string `live=FROZEN` exists ONLY ON
+# THE WIRE and can never be in the `.rodata` of ANY image, healthy or broken. The artifact
+# grep this file recommends 40 lines below (the `path=jd2-…` cross-check) is valid THERE
+# because those tokens are contiguous literals; it is invalid here.
+# WHAT THE ARTIFACT CAN ANSWER is whether the INSTRUMENT is compiled in — grep the tag
+# `[orinconwin] win=`, present in conwin1 and absent in supstate1, so this row is
+# unfireable on supstate1 BY CONFIGURATION (harmless for a FORBID, but not coverage).
+# `scripts/orin-specscore.py --image <staged dir>` draws exactly that distinction without
+# being told: it scores this row WIRE on conwin1 and DEAD on supstate1.
 FORBID \[orinconwin\] win=.* live=FROZEN
 
 # --- INSTRUMENT 2: the DISCRIMINATED takeover, and the unattributable line it replaces --
@@ -1487,6 +1576,18 @@ FORBID \[orinconwin\] win=.* live=FROZEN
 # token and the capture does not, the finding is the wire, not the build.
 # The patterns start AFTER the em dash in `:: tegra: JD2 — console OWNS …` and are
 # contiguous ASCII end to end, this file's standing rule for anything crossing UARTC.
+# ⚠ WHAT THESE TWO ARE AND ARE NOT COVERAGE OF, measured 2026-08-31 (orin 11, SPECSCORE).
+# On a CURRENT image these rows are UNMATCHABLE BY CONSTRUCTION, and that is the assertion,
+# not a defect: all four takeover literals (main.rs:2890/2898/7566/7574) now put
+# `path=jd2-…; ` between the `);` and the tail, so no format string in the tree can put
+# either pattern on the wire. An automated reachability check therefore scores both rows
+# `FOREIGN` — "nothing this kernel emits can match this" — on conwin1 AND supstate1, which
+# is EXACTLY RIGHT and must not be filed as a broken rule. Read it as: these two carry zero
+# coverage of the CURRENT build, and 100% of their value is against a STALE one. They earn
+# their place the day a pre-fold image is flown by mistake, and on that day they are the
+# only rows in this file that will notice. The proof that they still bite is in
+# `scripts/specs/jetson-sync1-green.capture`'s header: the pre-fold boot5b capture reds row
+# two 13 times, and the same capture with only the `path=` token restored goes green.
 FORBID console OWNS the panel \(Screen back buffer live\); first key
 FORBID console OWNS the panel \(Screen back buffer live\); screen-on-boot
 # THE DISCRIMINATION READOUT ITSELF. OPTIONAL AND NOT PENDING, on the `[net4V no-lease

@@ -1,0 +1,45 @@
+### SYNTHETIC. THIS IS NOT A METAL GREEN REFERENCE AND MUST NEVER BE CITED AS ONE.
+### It is a hand-built capture whose only job is to prove that jetson-sync1.spec CAN
+### go green -- that its 17 REQUIREs and its end-of-run marker are simultaneously
+### satisfiable, and that a clean boot trips none of its 18 FORBIDs. A scorer that
+### has only ever been run against captures that red has not been tested; this file
+### is the other direction.
+###
+### PROVENANCE, line by line: every witness below is the VERBATIM wire text of the
+### first line that satisfied that rule in the boot5b/desk sitting
+### (~/unaos-bench/capture/line-acm0/orin.log), EXCEPT the JD2/JD4 takeover pair,
+### which is rewritten to the CURRENT post-fold shape from main.rs:2890/2898 -- the
+### `path=jd2-console-pump; ` discriminator that the two stale-image FORBIDs at
+### jetson-sync1.spec:1490/1491 exist to demand. That rewrite is the whole point:
+### the old capture reds on those two rows precisely because it predates the fold.
+###
+### The tail block is a BOOT A (conwin1) shape -- orinconwin / orinfurn / orinstkdepth
+### / orinrast -- so the PENDING rows those instruments own are shown promoting. A
+### BOOT B (supstate1) capture will not carry them, and that asymmetry is legitimate;
+### see the COVERAGE section of scripts/orin-specscore.py for which rules each image
+### can and cannot fire.
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2b — keyboard ARMED (slot 5, root port 6) -> PASS ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JD3 — mass storage ready (slot 2); panel shell ls/cat live ::
+:: IRQEL-RT: first IRQ taken at EL1 on cpu 0 — banked vector path live (ELR_EL1 bank) ::
+:: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 (~100 ms window) ::
+:: IRQEL-RT: EL1 one-shot proof IRQ taken at EL1 on cpu 0 (the ARMING core) ::
+:: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x40000000 sp 0x40010000 ::
+:: TEGRA-EL0: el0-hello round-trip -> PASS ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
+:: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
+:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
+:: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+[orinfurn] arm click=1 conwin=1 desk=1
+[orinconwin] gate panel=1920x1200x32
+[orinconwin] win=1 panel=1920x1200 cell=8x16 stage=1 table=1 present=Composited route=true live=LIVE -> ROUTED
+:: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::
+[orinrast] census seq=1 t=120 post=1 late=0 console-owns=1 conwin=1 pidesk=0 final=1 -> RAST-SUPERSEDED-BY-CONSOLE
+[orinstkdepth] depth-consumed=3184 bytes anchor-sp=0xffff000040200000 seam-sp=0xffff0000401ff390 at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
+:: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
