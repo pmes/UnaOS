@@ -2633,9 +2633,10 @@ figures are the authoring arc's survey; this section relays them and has not re-
 sides (`:336`), `note_panel_overpaint()` for a whole-surface paint that is not a handover (`:360`),
 and five publish sites in `fbcon.rs`: `init` (`:566`), `detach` (`:1622`),
 `panel_console_window_open` (`:2031`), `panel_console_window_closed` (`:2090`, on a successful CAS
-only) and `panic_screen` (`:2104`). **It PUBLISHES ONLY.** Nothing consults it before painting, no
-writer declines or defers on it, and no pixel moves. A refusal is a change to x86 paint order and is
-a separate commit the x86 seat reviews first.
+only) and `panic_screen` (`:2104`). **It PUBLISHED ONLY** — true of PANELOWN as landed, and no longer
+true of the tree: nothing consulted the word before painting, no writer declined or deferred on it,
+and no pixel moved. "A refusal is a change to x86 paint order and is a separate commit the x86 seat
+reviews first" was the standing promise, and it is now discharged — see **§3.13.2 (PANELREFUSE)**.
 
 Three constraints from the cross-lane grant, each with a reason worth keeping:
 
@@ -2807,6 +2808,145 @@ The grantor's ruling, recorded because the reasoning generalises: **a feature-ga
 permanent artifact on a census under active repair, while this is a one-time re-baseline of a
 proof, and a cost that ends is cheaper than a cost that compounds.** And: **a stale proof claim left
 standing is worse than a voided proof, because the next reader trusts it.**
+
+#### §3.13.2 PANELREFUSE — the word acquires teeth: two writers now decline on it
+
+PANELOWN's standing promise ("a refusal is a change to x86 paint order and is a separate commit the
+x86 seat reviews first") is discharged here. The design went to the rmbp seat before a line was
+written; the verdict was **ACCEPT**, with two conditions, three corrections, and one requirement that
+had not been in the design. All of them are honoured below and each is named at its site in source.
+
+**What lands.** Two tiers over one predicate, both in the shared video core under the rmbp grant.
+
+* **The predicate** — `video::panel_refuse_term()` (`video/mod.rs:833`). Returns `Option<&'static
+  str>`: `None` means paint as today, `Some(term)` means decline and *names the term that fired*.
+  Two terms, OR'd: `owner-word-panic` (`panel_owner() == PanelOwner::Panic`) and `serial-panic-mode`
+  (`serial_ring::in_panic_mode()`).
+* **Tier 1, the whole pass** — `wm::composite()` (`video/wm.rs:4258`) returns at the top of the
+  function, above the arch split and before `COMP_GATE`.
+* **Tier 2, the sprite** — `cursor::sprite_panel()` (`video/cursor.rs:3951`), one helper, through
+  which the module's seven `panel_snapshot` sites now go. Each keeps its existing `owe_repaint()`
+  degradation; the door itself is unchanged.
+* **The wire** — `video::note_panel_write_refused()` (`video/mod.rs:859`), `witness`-only, latched to
+  one line per tier per boot: `[panel-owner] panel-write-refused term=… owner=… site=…`. A third line
+  kind beside `panel-ownership-handover` and `panel-repaint-over-owner`, deliberately: a handover is
+  the discipline working, an over-paint is it being ignored, a refusal is it being enforced.
+
+**Why the whole pass and not the door.** The proposal that reached this arc was a refusal at
+`video::panel_snapshot`. It does not work, and this is the finding both seats rate highest.
+`composite_pass_half` calls `strip::compose_all` (`video/wm.rs:4713`) *after* `composite_inner`
+returns, and the furniture — dock, menu bar, crystal dropdown — reaches the glass through its own
+bare blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal at the door alone
+therefore yields a **partial paint**: windows suppressed, furniture stamped across the panic
+backdrop, a screen state no boot has produced and no capture in the corpus describes. Refusing above
+the fork declines both halves in one place. ⚠ Scope, corrected by the reviewer and carried here as
+corrected: that `compose_all` call is `cfg`-gated (`video/wm.rs:4712-4715`, x86+`wc` or
+aarch64+`desktop_firmware`, with a `false` fallback), so the correct statement is that it runs
+**unconditionally on any build where the furniture exists** — which is every build this design is
+about.
+
+**Why the door is left byte-identical.** `panel_snapshot` cannot tell a read from a write, and it has
+twelve callers — seven `cursor`, four `wm`, one `prtscr::capture`. A refusal there would refuse a
+Print Screen of the panic itself, the one screen an operator most wants a PNG of. It would also
+overload `None`, whose meaning at every caller is *transient* contention, with a permanent one, which
+is how a refusal becomes indistinguishable from a retry. The count is exact and was re-derived
+independently by both seats.
+
+**Why the OR, and why there is no latch.** The owner word is a plain `swap`, so four `fbcon` publish
+sites can move it off `Panic` after a panic — and `panel_console_window_closed` is on the *input
+path*, reached on x86 from a press of the console window's close disc. Un-latched, a click after a
+panic would let the desktop grow back over the panic text: the original defect, now intermittent and
+so harder to convict than when it was unconditional. `serial_ring::in_panic_mode()` is monotone — the
+`#[panic_handler]` sets it *before* it calls `panic_screen`, nothing clears it, and it is true as well
+for a panic that never reaches `panic_screen` — so the OR closes that hole without touching a publish
+path that runs on the input band. A terminal-`Panic` latch was designed and offered; the reviewing
+seat did not require it and it is **not taken**, so no compare-exchange of any shape lands on that
+band. **The reviewer's added requirement follows from that choice and is why the term is returned
+rather than a `bool`:** un-latched, `panel_owner()` can legitimately read something other than `Panic`
+while the monotone term is what refused, so a line saying `owner=owner-panic-screen` would be false
+on the wire. The wire names the term that fired and prints the owner word separately, as read.
+
+**LOCKFIX.** Two atomic loads (`Acquire` on the owner word, `Relaxed` on the panic flag). Not a lock,
+cannot block, bounded — the same argument `publish_panel_owner`'s `swap` makes, one weaker. Both
+tiers sit on the input path (the click router reaches `crystal::press_at`, which calls
+`wm::composite()`), so the question is live for both, and a refusing call is strictly *lighter* than
+today: Tier 1 returns before `COMP_GATE`, Tier 2 returns before either arm of `panel_snapshot`.
+`COMP_PENDING` is deliberately **not** set on a refused pass — nothing is coming to service the
+damage, and arming a re-drive on a dying machine is a futile wake.
+
+**Line-neutrality, chosen rather than discovered.** A check inserted as a new line at
+`video/wm.rs:4258` would renumber every panic `Location` in the remaining ~21k lines of that file.
+The reviewer required that cost be a decision, not a side effect, and offered either a same-line fold
+or a named one-time re-baseline. **The same-line fold was taken, in all three files, so the arc costs
+no re-baseline at all:** `wm::composite`'s check is folded onto the `pub fn` line (the
+`⚠ SAME-LINE fold` idiom `video/fbcon.rs` already carries and documents); `cursor`'s seven sites
+changed by one token each; and both new blocks are appended at their files' tails, below everything,
+for the reason `video/mod.rs`'s own REALDESK block gives — nothing is below them, so no existing line
+moves. Two prose claims the change falsified were corrected in place at the same line count:
+`video/mod.rs`'s module header ("It PUBLISHES ONLY") and `panel_snapshot`'s "nothing below this
+comment consults `PanelOwner`", which the tail block would otherwise have made false.
+
+**Correction owed back to the design, re-derived here.** The design asserted that
+`panel_info_nonblocking` has no x86 caller anywhere in the tree. **That is false.** `video/quarry` is
+declared for x86+`wc` as well as aarch64+`desktop_firmware` (`video/mod.rs:684-685`), and
+`video/quarry/live.rs` calls the door at `:1699` and `:2325`, inside `open()` and `wheel_route()`,
+neither of which carries a `cfg` of its own — so an x86 `wc` build compiles two callers. The honest
+limit, which is the reviewer's own: quarry's implementation is armed separately by `UNAOS_QUARRY=1`,
+so compiled-on-x86 is not runs-on-a-default-x86-boot. What is refuted is the *caller* claim, not the
+traffic. It does not weaken the separate finding that x86's `click_pointer_pos` blocks on `WRITER`
+from the input band where the aarch64 twin uses the non-blocking door.
+
+**Out of scope by agreement.** The two pre-existing LOCKFIX violations found while deriving this —
+the furniture's masked blocking `WRITER.lock()`, and x86's `click_pointer_pos` — are the rmbp seat's,
+P1 in their own queue, and narrowed by them this turn from five candidate sites to one plus the
+furniture (the other four are selftests driven from one boot-time block, not the preemptible band).
+Neither is caused by this change and neither is fixed by it. Not opened here.
+
+**Landing order.** PANELOWN (`63b86488`) is **not on trunk** — re-derived in this worktree with a
+positive control that had to hit: it is an ancestor of `hw-jetson` and of no other track branch nor
+of `main`, while `0ed6fee2` is an ancestor of `main`, so the test can pass. Two consequences. The
+rmbp seat cannot exercise this predicate on x86 today, because the word does not exist in their tree;
+and foundation and refusal land together or in order, with whoever lands second reconciling — their
+own unlanded arc also touches `video/wm.rs`.
+
+##### Evidence status for §3.13.2
+
+* **Gates:** `./arroyo check` green both arches, 42 legs. `./arroyo test-arm` green.
+* **Compiled by NAMED legs, proven by breaking them** (a deliberate type error planted in each new
+  region, the leg's exit code recorded, the plant reverted, and the three files re-hashed byte-identical
+  afterwards): the `wm::composite` fold and the `cursor::sprite_panel` helper red `x86-all`,
+  `arm-tegra` and `arm-pi` at exit 101, each naming its own line; the `witness` arm of
+  `note_panel_write_refused` reds `x86-all` and `arm-tegra` while both **default** legs stay green,
+  and the `not(witness)` arm reds both default legs while `arm-tegra` stays green — so each polarity
+  is checked by a leg that compiles it and by one that does not.
+* **Both directions proven in the ARTIFACT, at instruction granularity** — the aarch64
+  `unaos-kernel` built by `test-arm`, which is the board shape this seat owns. `wm::composite`'s
+  prologue is followed immediately by `ldarb` of `video::PANEL_OWNER`, `cmp #0x4`
+  (`PanelOwner::Panic`), `b.ne` to the second term; then `ldrb` of `serial_ring::PANIC_MODE` and
+  `cbz` to the compositor's own first atomic. The refusing path builds the witness args — its two
+  `adr`/length pairs are exactly `.rodata` `owner-word-panic` (16 bytes) and `serial-panic-mode`
+  (17), with `wm::composite` (13) as the site — takes the `ldxrb`/`orr #1`/`stxrb` latch, calls
+  `_print`, and branches to the function's own epilogue, `ret`, **before any `COMP_GATE` atomic**.
+  `cursor::sprite_panel` has the same two-term head, symbolised against the same two statics, with
+  its non-refusing arm falling into `mrs DAIF` and `video::WRITER` — `panel_snapshot` inlined. So the
+  refusing arm demonstrably returns without touching the panel, and the non-refusing arm is the
+  pre-existing code path unchanged. All five new tokens are one-hit in the image under
+  `LC_ALL=C grep -a`.
+* **⚠ Runtime: NEITHER DIRECTION EXERCISED, and no QEMU configuration in this tree can do it.** The
+  refusing direction needs a real panic and there is no deliberate-panic injection knob on aarch64;
+  adding one is a behaviour change in shared core and outside this arc's grant. The non-refusing
+  direction needs `wm::composite()` to actually run, and it does not on the aarch64 QEMU boot: the
+  compositor's aarch64 entries are the `orinfurn`/`tegra` display path and the `desktop_firmware`
+  furniture, and the desktop-family virt configuration
+  (`UNAOS_TEGRA_EL0=1 UNAOS_PIDESK=1 UNAOS_LIVECON=1 ./arroyo test-arm`) was tried this arc and does
+  not reach the kernel at all — the capture stops in the bootloader. Tier 2 is equally unreached:
+  the gate has no HID pointer, so no sprite is ever drawn. **A green `test-arm` therefore bounds
+  "nothing else broke", not "the check evaluated"**, and it is recorded that way rather than as a
+  false-direction pass. What would close it: an aarch64 boot that panics with the compositor live
+  (Orin or Pi metal, or a QEMU boot with such a knob added under its own grant), and on the other
+  arch the `UNAOS_WC=1` witness boot the rmbp seat has already reserved — which is also the
+  measurement that would most change the design's own worth-it number, since if a composite never in
+  fact lands after a panic on that machine, the honest answer becomes "do not build this."
 
 #### Evidence status for §3.13, stated once
 

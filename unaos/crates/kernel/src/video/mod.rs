@@ -34,7 +34,7 @@
 //! BETWEEN them, so "used at different times" is a convention, not an invariant. [`PanelOwner`] is
 //! the word that says which regime holds the glass, [`panel_owner`] reads it, and every handover
 //! publishes it through [`publish_panel_owner`] — announced on both sides under `witness`. It
-//! PUBLISHES ONLY: nothing consults it before painting and no writer refuses on it.
+//! PANELREFUSE — and two writers now REFUSE on it: [`panel_refuse_term`], at the file tail.
 
 pub mod fbcon;
 // FONT (GR27) — the shared anti-aliased text face: the Noto Sans Mono alpha atlas plus the
@@ -436,13 +436,13 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
 /// the `[inwedge]` witness reports on. Paint-path refusals are already counted by `[wedge9]`
 /// (`owe_repaint` is their sink), and mixing the two would make both unreadable.
 ///
-/// PANELOWN — **this is the READ point.** Every compositor and cursor writer that reaches the panel
-/// comes through here, so this is the one place a panel-ownership CHECK would ever need to live,
-/// and [`panel_owner`] is the call it would make. It is deliberately not made here: this arc
-/// publishes the word and does not refuse on it, and a refusal added at this line would change x86
-/// paint order (the compositor's masked present chains reach `cursor`'s locked helpers through this
-/// function) without a pixel of the design having been reviewed. Nothing below this comment
-/// consults [`PanelOwner`]; the body is byte-for-byte the pre-PANELOWN body.
+/// PANELOWN/PANELREFUSE — **the READ point, and the refusal deliberately does NOT live here.** Every
+/// compositor and cursor writer that reaches the panel comes through here, which is why PANELOWN
+/// named this as the one place an ownership CHECK would ever need to live. PANELREFUSE reviewed that
+/// and chose against it: this door cannot tell a READ from a WRITE, so a refusal on this line would
+/// also refuse `prtscr::capture` — making the one screen an operator most wants a PNG of, the panic,
+/// the one screen that cannot be captured. The refusal sits at [`panel_refuse_term`]'s two callers.
+/// THIS FUNCTION consults [`PanelOwner`] nowhere; its body is byte-for-byte the pre-PANELOWN body.
 pub(crate) fn panel_snapshot() -> Option<FrameBuffer> {
     if crate::arch::irqs_masked() {
         WRITER.try_lock().map(|fb| *fb)
@@ -662,7 +662,7 @@ pub mod desktop_firmware;
 // face and the x86 app's ten-segment face. Gated like the furniture family — `wc` on x86, `desktop_firmware`
 // on the Pi — and deliberately NOT on an arch: it is experience-layer code with no hardware in it,
 // so it builds once and runs on every chip. Appended below `desktop_firmware` for `desktop_firmware`'s own reason, five
-// lines up: nothing is below this either, so nothing moves.
+// lines up: it went in BELOW every existing item, so nothing moved. Later appends ride the same rule.
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
@@ -705,7 +705,7 @@ pub mod quarry;
 // is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof,
 // and panic `Location` records embed line numbers, so a static and three functions added there would
 // move the hash for a feature the image does not contain. Appended below `quarry` for `quarry`'s own
-// reason: nothing is below this, so no existing line in this file moves either. The static and all
+// reason: it went in BELOW every existing item, so no existing line moved. PANELREFUSE rides it too. The static and all
 // three accessors carry the furniture gate, and `ui_status`'s three call sites carry it too, so a
 // knob-off build compiles NONE of this and that file's diff reduces to line-neutral comment text.
 // MEASURED rather than reasoned, as §5.3 requires: knob-off `kernel8.img` is
@@ -770,4 +770,105 @@ pub fn desktop_scene_owns_backdrop() -> bool {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn dock_reserve_h() -> usize {
     strip::PAD + dock::STRIP_H
+}
+
+// ── PANELREFUSE — the panel REFUSES a write once the machine is dying ────────────────────────────
+//
+// PANELOWN published the owner word and deliberately refused on nothing. This is the refusal, in
+// the shape the rmbp seat reviewed and accepted (their lane owns `wm`/`cursor`; the grant is theirs
+// and its conditions are honoured here, each named at its site).
+//
+// It lives HERE, at the tail of this file, under the same append rule `quarry` and REALDESK state above:
+// a block added BELOW every existing item moves no existing line in it. Line-neutrality
+// is not decoration in this arc — panic `Location` records embed line numbers, and the whole change
+// (this file, `video/wm.rs`, `video/cursor.rs`) is line-neutral by construction. See the SAME-LINE
+// folds at `wm::composite` and at `cursor`'s `sprite_panel`.
+
+/// PANELREFUSE — witness bookkeeping only: one bit per tier, "this tier has already said it".
+///
+/// Never read by the refusal itself. A refused pass is refused whether or not it was announced, so
+/// this cannot become a gate by accident — and the latch is what keeps a panic log from being
+/// buried under one line per declined pass on a machine that is composing at 60 Hz into a corpse.
+#[cfg(feature = "witness")]
+static PANEL_REFUSE_SAID: AtomicU8 = AtomicU8::new(0);
+
+/// PANELREFUSE — Tier 1, the whole compositor pass (`wm::composite`).
+pub(crate) const REFUSE_TIER_PASS: u8 = 0;
+
+/// PANELREFUSE — Tier 2, the cursor sprite (`video::cursor`).
+pub(crate) const REFUSE_TIER_SPRITE: u8 = 1;
+
+/// PANELREFUSE — **must a panel WRITE be refused right now, and by WHICH term?**
+///
+/// `None` means paint exactly as today; `Some(term)` means decline, and `term` names the predicate
+/// that fired. Two terms, OR'd:
+///
+///   1. `owner-word-panic` — [`panel_owner`] reads [`PanelOwner::Panic`]. Published from one site,
+///      inside `panic_screen`, whose one caller is the `#[panic_handler]`. There is no path that
+///      reaches it without a real panic, so a legitimate writer cannot be refused by this term.
+///   2. `serial-panic-mode` — `serial_ring::in_panic_mode()`. The `#[panic_handler]` sets this
+///      BEFORE it calls `panic_screen`, so it is true strictly EARLIER; nothing in the tree ever
+///      clears it; and it is also true for a panic that never reaches `panic_screen` at all.
+///
+/// **Why the OR, and why there is no latch on [`publish_panel_owner`].** The owner word is a plain
+/// `swap`, so four fbcon sites (`detach`, `panel_console_window_closed`/`_open`, `init`) can move it
+/// OFF `Panic` after a panic — and one of them is on the INPUT path, reached on x86 from a press of
+/// the console window's close disc. A click after a panic would un-refuse the check and let the
+/// desktop grow back over the panic text: the original defect, now intermittent and therefore harder
+/// to convict than when it was unconditional. Term 2 is MONOTONE and closes that hole without
+/// touching a publish path that runs on the input band. A terminal-`Panic` latch was designed and
+/// offered; the reviewing seat did not require it and it is not taken, so no compare-exchange of any
+/// shape lands on that band.
+///
+/// **Why the term is returned rather than a `bool`.** Without the latch, [`panel_owner`] can
+/// legitimately read something other than `Panic` while term 2 is what refused. A witness line
+/// saying `owner=owner-panic-screen` would then be FALSE on the wire — a prose invariant with an
+/// atomic in it. The caller prints the term it was handed, so the wire names the predicate that
+/// actually fired and prints the owner word SEPARATELY, as read.
+///
+/// LOCKFIX — two atomic loads (`Acquire` on the owner word, `Relaxed` on the panic flag). Not a
+/// lock, cannot block, bounded. Legal on the preemptible input band, inside a masked present, and
+/// from an ISR alike — the same argument [`publish_panel_owner`]'s `swap` makes, one weaker. A
+/// refusing call is strictly LESS lock traffic than today: it returns before any `WRITER` acquire.
+pub(crate) fn panel_refuse_term() -> Option<&'static str> {
+    // Terms are tried in this order, so a state where BOTH hold names the owner word — the stronger
+    // statement, and the one a capture can cross-check against the `[panel-owner]` handover line.
+    // Both tokens are longer than 8 bytes, per [`PanelOwner::name`]'s LLVM-immediate rule.
+    if panel_owner() == PanelOwner::Panic {
+        Some("owner-word-panic")
+    } else if crate::serial_ring::in_panic_mode() {
+        Some("serial-panic-mode")
+    } else {
+        None
+    }
+}
+
+/// PANELREFUSE — say ONCE PER TIER PER BOOT that a panel write was refused, and by which term.
+///
+/// A no-op on a default image: the body is `witness`-gated in full, so a knob-off build carries no
+/// static, no atomic and no string. Under `witness` the shape matches the existing `[panel-owner]`
+/// tags, and it is a THIRD line kind beside `panel-ownership-handover` and `panel-repaint-over-owner`
+/// on purpose — a handover is the discipline working, an over-paint is the discipline being ignored,
+/// and a refusal is the discipline being ENFORCED. Folding any two of them would make a capture read
+/// as if the panel had changed hands when it did not.
+///
+/// `owner=` is the word as READ at this instant, not a restatement of the term: on a `serial-panic-
+/// mode` refusal it will legitimately print something other than `owner-panic-screen`, and that
+/// divergence is the finding, not a bug in the line.
+#[inline]
+pub(crate) fn note_panel_write_refused(_tier: u8, _term: &'static str, _site: &'static str) {
+    #[cfg(feature = "witness")]
+    {
+        let bit = 1u8 << _tier;
+        if PANEL_REFUSE_SAID.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            serial_println!(
+                "[panel-owner] panel-write-refused term={} owner={} site={}",
+                _term,
+                panel_owner().name(),
+                _site
+            );
+        }
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = (_tier, _term, _site);
 }
