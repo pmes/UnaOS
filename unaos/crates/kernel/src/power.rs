@@ -23,9 +23,11 @@
 //     monitor, so an SMC would be an undefined-instruction trap, and the board's actual
 //     reset/off paths (the BCM2711 PM/WDOG block, the mailbox) are the pi lane's to wire,
 //     not this arc's. Honest witness + park.
-//   * x86_64 reboot: the mechanism slot is deliberately UNWIRED this arc (the candidate
-//     paths — FADT RESET_REG, the 8042 pulse — live in the x86 lane beside
-//     `acpi_power::poweroff`, which is the rmbp seat's file). Honest witness + park.
+//   * x86_64 reboot: REAL (FADTRESET) — routed to `crate::arch::acpi_power::reboot()`, the
+//     ladder beside `poweroff` in the rmbp seat's file: the FADT RESET_REG (ACPI §4.8.3.6,
+//     honoured in SystemIO or SystemMemory space, only from a checksummed FADT that flags
+//     RESET_REG_SUP), then the 8042 pulse (0xFE to port 0x64), then the honest park. Each rung
+//     prints its own witness before it acts, lock-free (LOCKFIX).
 //   * x86_64 shutdown: REAL — routed to the existing `crate::arch::acpi_power::poweroff()`
 //     (ACPI S5, the crystal.rs Shut-Down path), which carries its own honest fallback.
 //
@@ -136,15 +138,13 @@ fn platform_shutdown() -> ! {
 
 // ── x86_64 ───────────────────────────────────────────────────────────────────────────────
 
-/// x86_64 reboot: the mechanism slot is unwired this arc — the candidate paths (FADT
-/// RESET_REG / 8042 pulse) belong beside `acpi_power::poweroff` in the x86 lane. Refuse
-/// honestly, the same shape as the S5 fallback.
+/// x86_64 reboot: REAL — the FADT RESET_REG / 8042 ladder in `acpi_power::reboot` (beside the
+/// S5 `poweroff`, the same shape: discover honestly, witness before every write, park in `hlt`
+/// with its own line if the platform will not comply). It takes no lock past this line.
 #[cfg(target_arch = "x86_64")]
 fn platform_reboot() -> ! {
-    serial_println!(
-        "[orinreboot] no reboot mechanism wired on this platform yet (x86: FADT RESET_REG slot is the rmbp lane's) — parking in hlt"
-    );
-    crate::hlt_loop();
+    serial_println!("[orinreboot] x86 mechanism: FADT RESET_REG ladder (acpi_power::reboot)");
+    crate::arch::acpi_power::reboot();
 }
 
 /// x86_64 shutdown: REAL — ACPI S5 through the existing `acpi_power::poweroff` (the

@@ -54,6 +54,21 @@ const FADT_X_DSDT: usize = 140;
 const FADT_X_PM1A_CNT_BLK: usize = 172;
 /// 12-byte Generic Address Structure: extended PM1b control block (ACPI 2.0+); preferred.
 const FADT_X_PM1B_CNT_BLK: usize = 184;
+/// u32: FADT feature flags (ACPI §5.2.9 table "Fixed ACPI Description Table Fixed Feature Flags").
+const FADT_FLAGS: usize = 112;
+/// 12-byte Generic Address Structure: the RESET_REG (ACPI 2.0+, §4.8.3.6) — the register a write of
+/// `RESET_VALUE` to resets the whole system. Meaningful only when `FADT_FLAG_RESET_REG_SUP` is set.
+const FADT_RESET_REG: usize = 116;
+/// u8: the value to write to RESET_REG to reset the system.
+const FADT_RESET_VALUE: usize = 128;
+/// FADT flag bit 10: RESET_REG_SUP — the FADT's RESET_REG / RESET_VALUE pair is valid.
+const FADT_FLAG_RESET_REG_SUP: u32 = 1 << 10;
+/// Byte offset of the `revision` field in the 36-byte SDT header (the FADT's own table revision;
+/// RESET_REG arrived with FADT revision 2 / ACPI 2.0).
+const SDT_REVISION: usize = 8;
+/// Generic Address Structure `AddressSpaceId` for System Memory space. Refused for a PM1 block (see
+/// below); honoured for RESET_REG, where the spec allows it and the write is a plain byte store.
+const GAS_SPACE_SYSTEM_MEMORY: u8 = 0;
 /// Generic Address Structure `AddressSpaceId` for System I/O space — the only space this module
 /// accepts for a PM1 block. A memory-space PM1 block is legal in the spec and appears on some
 /// reduced-hardware platforms; we refuse it rather than pretend the `out` instruction reaches it.
@@ -392,5 +407,192 @@ pub fn poweroff() -> ! {
     // sleep types were right in shape but wrong for this chipset, or the chipset was still in
     // legacy mode. Say so once, then park exactly as the pre-S5 halt path did.
     serial_println!(":: ACPI: S5 write returned — platform did not power off; parking in hlt ::");
+    crate::hlt_loop();
+}
+
+// =================================================================================================
+// FADTRESET — warm reboot through the FADT's RESET_REG, with the 8042 pulse behind it
+// =================================================================================================
+//
+// The x86 arm of `power::reboot` (ORIN-REBOOT left it an honest stub: "the FADT RESET_REG slot is
+// the rmbp lane's"). Same discipline as `poweroff` above: nothing is guessed, every step that can
+// fail says which fact was missing, and the machine is either reset mid-instruction or parked in
+// `hlt` behind a line that says so.
+//
+// The ladder, in order, each rung with its own `[orinreboot]` witness BEFORE it acts:
+//
+//   1. FADT RESET_REG (ACPI §4.8.3.6). Valid only when the FADT is revision >= 2, is long enough to
+//      carry the field, checksums clean, and sets flag bit 10 (RESET_REG_SUP). The register is a
+//      Generic Address: System I/O (an `out` of RESET_VALUE — 0xCF9/0x0E-ish on every Intel PCH
+//      including the rMBP's Series 7, 0xCF9/0x0F on QEMU q35) or System Memory (a volatile byte
+//      store; the bootloader identity-maps physical memory, so the address is used as-is). Other
+//      spaces (PCI config, embedded controller, SMBus) are refused — nothing here can reach them.
+//   2. The 8042 keyboard-controller pulse: command 0xFE to port 0x64 asserts the CPU RESET line
+//      on every PC-compatible with an (emulated) 8042 — the fallback Linux and everyone else uses
+//      when ACPI declines. Taken when rung 1 was unavailable OR when its write returned.
+//   3. `hlt`. Both rungs returned; a machine that will not reset must say so, not pretend.
+//
+// LOCKFIX — this path takes NO lock. The witnesses go out through `serial::raw_write_str`, the
+// tree's one audited lock-free UART primitive, not `serial_println!`: `_print` is `try_lock` +
+// deferral, and a witness DEFERRED into the staging ring on a path whose next instruction resets
+// the machine is a witness lost. The ring is drained first (also lock-free) so lines queued just
+// before the verb are on the wire before the reset takes them. Interrupts are masked for the same
+// reason `poweroff` masks them: nothing may run between the witness and the write.
+//
+// Witness tokens: every line carries `[orinreboot]` (12 bytes) so `strings` finds them.
+
+/// A discovered reset register: address space, address, and the value the firmware says resets
+/// the machine. Construction is the proof that every field came out of a clean, flagged FADT.
+#[derive(Clone, Copy)]
+pub struct ResetReg {
+    /// Generic Address Structure space id: `GAS_SPACE_SYSTEM_IO` or `GAS_SPACE_SYSTEM_MEMORY`.
+    space: u8,
+    /// Register address in that space (a port for I/O, a physical address for memory).
+    addr: u64,
+    /// `RESET_VALUE`.
+    value: u8,
+}
+
+/// Human-readable name of a GAS address space, for the witness line.
+fn gas_space_name(space: u8) -> &'static str {
+    match space {
+        GAS_SPACE_SYSTEM_MEMORY => "SystemMemory",
+        GAS_SPACE_SYSTEM_IO => "SystemIO",
+        2 => "PCIConfig",
+        3 => "EmbeddedController",
+        4 => "SMBus",
+        _ => "other",
+    }
+}
+
+/// ACPI table checksum: every byte of the table, header included, sums to zero mod 256. Read-only
+/// and bounded by the table's own `length` (capped so a garbage length cannot walk off the map).
+///
+/// SAFETY: `table_addr` must point at a mapped ACPI table with a valid 36-byte header.
+unsafe fn table_checksum_ok(table_addr: u64) -> bool {
+    const SANE_MAX: usize = 64 * 1024;
+    let len = acpi::table_len(table_addr);
+    if len < acpi::SDT_HEADER_LEN || len > SANE_MAX {
+        return false;
+    }
+    let bytes = core::slice::from_raw_parts(table_addr as *const u8, len);
+    bytes.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)) == 0
+}
+
+/// Discover the FADT reset register, or name the first fact that was missing. Reuses the walk
+/// `discover` uses for S5: `acpi::rsdp_addr` -> `acpi::root_sdt` -> `acpi::find_table("FACP")`.
+fn discover_reset() -> Result<ResetReg, &'static str> {
+    let rsdp = acpi::rsdp_addr();
+    let (sdt_addr, entry_size) = acpi::root_sdt(rsdp).ok_or("no RSDP / bad RSDP signature")?;
+
+    // SAFETY: firmware tables are identity-mapped by the bootloader; every access is a read of a
+    // byte-packed field through `read_unaligned`, bounded by the table's own `length`.
+    unsafe {
+        let fadt = acpi::find_table(sdt_addr, entry_size, b"FACP").ok_or("no FADT (FACP) table")?;
+        if !table_checksum_ok(fadt) {
+            return Err("FADT checksum does not sum to zero");
+        }
+        let fadt_len = acpi::table_len(fadt);
+        let revision = ((fadt as usize + SDT_REVISION) as *const u8).read_unaligned();
+        if revision < 2 {
+            return Err("FADT revision < 2 (ACPI 1.0: no RESET_REG field)");
+        }
+        if fadt_len < FADT_RESET_VALUE + 1 {
+            return Err("FADT too short to carry RESET_REG/RESET_VALUE");
+        }
+        let flags = ((fadt as usize + FADT_FLAGS) as *const u32).read_unaligned();
+        if flags & FADT_FLAG_RESET_REG_SUP == 0 {
+            return Err("FADT flag RESET_REG_SUP (bit 10) clear");
+        }
+        let gas = fadt as usize + FADT_RESET_REG;
+        let space = (gas as *const u8).read_unaligned();
+        let addr = ((gas + 4) as *const u64).read_unaligned();
+        let value = ((fadt as usize + FADT_RESET_VALUE) as *const u8).read_unaligned();
+        match space {
+            GAS_SPACE_SYSTEM_IO if addr != 0 && addr <= 0xFFFF => {}
+            GAS_SPACE_SYSTEM_IO => return Err("RESET_REG SystemIO address is 0 or exceeds 16 bits"),
+            GAS_SPACE_SYSTEM_MEMORY if addr != 0 => {}
+            GAS_SPACE_SYSTEM_MEMORY => return Err("RESET_REG SystemMemory address is 0"),
+            _ => return Err("RESET_REG address space is neither SystemIO nor SystemMemory"),
+        }
+        Ok(ResetReg { space, addr, value })
+    }
+}
+
+/// Bounded wait for the platform to act on a reset write. On a machine that resets, this never
+/// returns; on one that ignored the write, it returns after ~tens of ms so the next rung can go.
+fn reset_settle() {
+    for _ in 0..20_000_000u32 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Lock-free witness: one formatted line straight at the 16550 (see LOCKFIX above).
+fn raw_witness(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let _ = super::serial::RawUart.write_fmt(args);
+    super::serial::raw_write_str("\n");
+}
+
+/// Warm-reboot the machine: FADT RESET_REG, then the 8042 pulse, then an honest `hlt` park.
+/// Never returns. Takes no lock (see the module note above).
+pub fn reboot() -> ! {
+    // Nothing may run between a witness and the write it announces.
+    x86_64::instructions::interrupts::disable();
+    // Lines deferred into the staging ring by other cores' contention go out BEFORE ours, so the
+    // capture reads in order and nothing queued just before the verb is buried with the machine.
+    crate::serial_ring::drain(super::serial::raw_write_str);
+
+    match discover_reset() {
+        Ok(r) => {
+            raw_witness(format_args!(
+                "[orinreboot] FADT RESET_REG space={} addr={:#x} value={:#x} — writing",
+                gas_space_name(r.space),
+                r.addr,
+                r.value
+            ));
+            // SAFETY: the space, address and value all came out of a checksummed, flagged FADT —
+            // nothing invented. A System I/O register is written with `out`; a System Memory one
+            // with a volatile byte store to its identity-mapped physical address.
+            unsafe {
+                if r.space == GAS_SPACE_SYSTEM_IO {
+                    Port::<u8>::new(r.addr as u16).write(r.value);
+                } else {
+                    core::ptr::write_volatile(r.addr as *mut u8, r.value);
+                }
+            }
+            reset_settle();
+            raw_witness(format_args!(
+                "[orinreboot] FADT RESET_REG write RETURNED — platform did not reset; trying 8042 pulse"
+            ));
+        }
+        Err(why) => {
+            raw_witness(format_args!(
+                "[orinreboot] FADT has no RESET_REG — trying 8042 pulse (why: {})",
+                why
+            ));
+        }
+    }
+
+    // 8042 keyboard controller: wait (bounded) for the input buffer to drain, then command 0xFE
+    // ("pulse output port bit 0" = the CPU RESET line). No FADT fact involved; this is the legacy
+    // PC-compatible path and a machine without an 8042 simply ignores it.
+    // SAFETY: ports 0x64/0x60 are the architectural 8042 command/status pair on every PC.
+    unsafe {
+        let mut status: Port<u8> = Port::new(0x64);
+        let mut command: Port<u8> = Port::new(0x64);
+        for _ in 0..100_000u32 {
+            if status.read() & 0x02 == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        command.write(0xFE);
+    }
+    reset_settle();
+
+    raw_witness(format_args!(
+        "[orinreboot] no reboot mechanism took on this platform (x86: FADT RESET_REG and the 8042 pulse both returned) — parking in hlt"
+    ));
     crate::hlt_loop();
 }
