@@ -17,7 +17,25 @@ and [`drivers/ehci/mod.rs`](../../../../unaos/crates/kernel/src/drivers/ehci/mod
 |---|---|---|
 | `screenshot` verb | the shell task (`dispatch_command`), interrupts enabled | calls `prtscr::capture()` directly and prints the outcome on both sinks |
 | Print Screen key | the HID decoders' press edge, inside a driver lock | calls `prtscr::request()` — **one atomic store and one counter**, nothing else |
+| ⌘⇧3 / ⌘⇧4 (PRTSCRCHORD) | the same press edge, one line below the 0x46 test | the same `prtscr::request()`; the witness names which chord fired |
 | — | the device-service pass, beside `fat::probe_once()` | `prtscr::service()` sees the flag and performs the capture |
+
+**PRTSCRCHORD (2026-09-02).** The rMBP's internal Apple keyboard has no Print Screen key and never
+puts usage 0x46 on the wire, so the metal-proven capture was bound to a key the bench machine cannot
+press. The Apple chords ⌘⇧3 (GUI+Shift+3) and ⌘⇧4 (GUI+Shift+4) are bound to the same whole-screen
+capture through `xhci::hid_screenshot_chord_edge(cur_keys, prev_keys, modifiers)`, asked by both
+decoders as an `else if` directly after `hid_print_screen_edge` (so a report carrying both arms
+exactly once). The judgement has to live at the decoder: a chord is a modifier byte plus a usage,
+and the boot report is the only place both are in one hand — `pal::Event::Key` carries no modifier.
+Left and right GUI (`HID_MOD_GUI` = 0x88) and Shift (`HID_MOD_SHIFT` = 0x22) count alike; the digit
+is diffed against the previous report exactly as 0x46 and the lock keys are, so a held chord arms one
+capture, not one per restated report. **The chord types nothing:** `hid_key_ascii` already folds
+every GUI-held usage to 0, so no `Key('3')`/`Key('#')` is delivered — the same suppression 0x46 gets
+from its `(0, 0)` table entry, reached through the modifier instead. The release fold ignores GUI on
+purpose and emits a lone `KeyUp('#')`/`KeyUp('$')` when the digit lifts — the documented
+"spurious release, safe" case. ⌘⇧4 is region-select on macOS; region-select is reserved here (no
+pointer-driven selector exists) and the chord is honoured as a whole-screen capture rather than
+ignored.
 
 The split is not stylistic. The Print Screen edge is decoded inside `service_ehci_hid()` while
 `EHCI_HID` is held (or inside the xHCI event pass while its loan is held), and the writable FAT
@@ -166,7 +184,12 @@ arrived" from "the key arrived and the capture refused":
 
 ```
 :: PRTSCR: PrintScreen (HID 0x46) down on <controller> -> capture armed ::
+:: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on <controller> -> capture armed ::
+:: PRTSCR: [prtscr] chord=cmd-shift-4 (GUI+Shift+digit) down on <controller> -> capture armed ::
 ```
+
+`chord=cmd-shift-3` / `chord=cmd-shift-4` is the PRTSCRCHORD token — `awk '/chord=cmd-shift/'` on
+a serial capture answers "did the chord arrive" independently of whether the capture then succeeded.
 
 `prtscr::census()` returns `(requests, captures, refusals)` for the same reason — a key press that
 produced no file and a key press that never happened are different failures.
@@ -298,11 +321,35 @@ Flight-3 (`UNAOS_PRTSCRST=1`, 2026-08) settled the metal state of this bench:
   `./arroyo check` green on both arches, with `prtscrst` added to the `x86-all` and `arm-pi`
   cfg-coverage legs so the knob-on build is type-checked too.
 
-- **Print Screen on metal**: not proven here, and QEMU cannot prove it. What the emulated `usb-kbd`
-  proves is that the decoder hook, the deferral, the encode and the write all work on a real report.
-  What it cannot prove is that the rMBP's own internal keyboard puts usage 0x46 on the wire when
-  that key is struck — Apple keyboards are free to place the function row behind an `fn` layer or a
-  vendor usage page. That, and the timing of a 2880x1800 capture (~5.2 M `read_pixel` probes on a
-  WC-mapped GOP aperture; the QEMU panel is 1280x800), are the seat's proof at an arc boundary, on
-  the machine. If 0x46 never arrives, the census (`prtscr::census()`, and the "capture armed" line's
-  absence) says so directly, which is why the key edge announces itself before deferring.
+- **The CHORDS, in QEMU — PRTSCRCHORD, through the same real HID path (2026-09-02).** QMP
+  `send-key` with `meta_l`, `shift` and `3` (then `4`) in ONE command, so the emulated `usb-kbd` on
+  `ehci.0` emits a boot report with modifiers `0x0A` (LGUI|LShift) and usage `0x20` (then `0x21`) —
+  decoded by `decode_boot_keyboard`, the rMBP's internal-keyboard decoder. Two chords 45 s apart on
+  `UNAOS_WC=1 ./arroyo test-fat sf 200` with no `prtscrst` (the chord was the only possible trigger):
+
+  ```
+  :: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
+  :: PRTSCR: [prtscr] chord=cmd-shift-4 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN1.PNG 1280x800 3073098 bytes -> OK ::
+  ```
+
+  The only `EHCI-HID:` key lines in the whole log are `KEYUP: '#' (scancode 0x20)` and
+  `KEYUP: '$' (scancode 0x21)` — no `KEY:` press was delivered for either digit, which is the
+  no-keystroke property, and the two releases are the documented safe spurious `KeyUp`. Both files
+  pulled off `builder/fat-sf.img` with `mcopy`: `PNG image data, 1280 x 800, 8-bit/color RGB`,
+  every chunk CRC valid, IEND last, IDAT inflating to exactly `800 * (1 + 1280*3)` bytes. Gate
+  battery for the arc: `./arroyo check` green both arches; `UNAOS_WC=1 ./arroyo test 150` exit 0
+  with `wc` in the banner and no fault text; `./arroyo test-arm 60` exit 0.
+
+- **Print Screen on metal — flight 5 proved the capture, and exposed the binding.** `SCREEN2.PNG`
+  2880x1800 with IHDR and IEND verified landed on the machine, so the panel read, the encode and the
+  stick write are metal-proven; but the trigger was bound to usage 0x46 alone, and the rMBP's own
+  internal keyboard has no Print Screen key, so from the laptop's own keys the capture was
+  unreachable — which is what PRTSCRCHORD answers. What QEMU still cannot prove is that the internal keyboard's
+  report carries the chord as `GUI|Shift` in byte 0 plus usage 0x20/0x21 (Apple keyboards could in
+  principle route ⌘ through a vendor page; the boot-protocol modifier byte says they do not). The
+  metal procedure: boot, wait for the veto line, plug the FAT stick, press ⌘⇧3 — expect the
+  `chord=cmd-shift-3` witness on the wire, then the `SCREEN<n>.PNG ... -> OK` line, then the file
+  at the stick's root. If the witness never appears, the chord did not decode (the census says
+  `requests` unchanged); if it appears and no `OK` follows, the refusal line names why.

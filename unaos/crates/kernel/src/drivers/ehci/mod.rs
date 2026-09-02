@@ -16402,6 +16402,19 @@ unsafe fn decode_boot_keyboard(
     if super::xhci::hid_print_screen_edge(&cur_keys, prev_keys) {
         serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::");
         crate::video::prtscr::request();
+    } else if let Some(chord) =
+        super::xhci::hid_screenshot_chord_edge(&cur_keys, prev_keys, modifiers)
+    {
+        // PRTSCRCHORD: ⌘⇧3 / ⌘⇧4 — the Apple chords, because the rMBP's internal keyboard has no
+        // Print Screen key and so never puts 0x46 on this wire. Same shared predicate shape, same
+        // request, same deferral; `modifiers` is this report's byte 0, already in scope. `else if`
+        // so a report carrying both 0x46 and a chord arms exactly once. The chord types nothing:
+        // `ascii_of` above folds any GUI-held usage to 0 (see `hid_screenshot_chord_edge`).
+        serial_println!(
+            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on EHCI -> capture armed ::",
+            chord
+        );
+        crate::video::prtscr::request();
     }
 
     *prev_keys = cur_keys;
