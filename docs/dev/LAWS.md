@@ -60,6 +60,15 @@ belongs here, on the day it is made.
 - **Default-quiet boot** (2026-07-18). Confirmed test families are not
   re-run on default boots; batteries live behind knobs (QEMU gates arm
   them). Gate, never delete.
+- **A gate proves it can fail by tree mutation** (2026-08-31). A structural
+  check in `./arroyo check` is a gate only once a recorded mutation of the
+  tree has turned it red and reverting has turned it green; an argument
+  about the check's own text is not that proof — three seats read the
+  knob→leg check and produced three wrong explanations for a green that one
+  stubbed-cargo run explained. Every such gate carries a control probe so a
+  zero result is distinguishable from a broken pattern. The gates, their
+  recorded go-red proofs, and their legitimate update paths:
+  [`docs/dev/STRUCTURAL_GATES.md`](STRUCTURAL_GATES.md).
 
 ## Bench and media
 
