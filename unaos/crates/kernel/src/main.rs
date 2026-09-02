@@ -8213,23 +8213,32 @@ fn orin_render_service(_: usize) {
             && !shell_declined
             && unaos_kernel::video::desktop_firmware::armed()
         {
-            match open_shell_window(pw, ph) {
-                Some((store, _surf_fb, id)) => {
-                    _shell_store = store;
-                    shell_id = id;
-                    // Claim the backdrop only now, at the pass that actually mints — never at task
-                    // start, which would leave a backdrop going stale across the whole boot.
-                    pal.clear_screen(wm::DESKTOP_BG);
-                    unaos_kernel::video::retire_desktop_chrome(pw, ph);
-                    dirty = true;
-                    serial_println!(
-                        "[orinrender] win={} panel={}x{} pass={} -> SHELL-WINDOW (the first shell window ever minted on this board; `open_shell_window` was compiled and callerless on tegra until this rung)",
-                        id, pw, ph, passes
-                    );
-                }
-                None => {
-                    shell_declined = true;
-                    serial_println!("[orinrender] DECLINE reason=open-shell-window-refused (it named the reason on the line above; not retried — one decline is final)");
+            // FLIGHT-CORRECTED 2026-09-01 (render1 boot, `win=3 att=0 dout=0 dkpx=0`). The first
+            // flight minted the window and it was an EMPTY RECTANGLE for 71.5M passes. The reason is
+            // not a missing paint — it is that ON THIS BOARD THE WINDOW IS REDUNDANT. `orinconwin`
+            // already routes the live console into its own `wm` row (`win=2 … route=true`), so the
+            // Orin's shell is ALREADY in a window. The Pi needs `open_shell_window` because the Pi
+            // has no `orinconwin`; porting the mint here minted a second, contentless row above the
+            // real one. Ask the same fact `orinconwin` sets, not a `cfg!()` proxy for it: an image
+            // can carry the feature and still have the route decline at its ordering rule.
+            if unaos_kernel::video::fbcon::console_is_routed() {
+                shell_declined = true;
+                serial_println!("[orinrender] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)");
+            } else {
+                match open_shell_window(pw, ph) {
+                    Some((store, _surf_fb, id)) => {
+                        _shell_store = store;
+                        shell_id = id;
+                        dirty = true;
+                        serial_println!(
+                            "[orinrender] win={} panel={}x{} pass={} -> SHELL-WINDOW (no routed console on this image, so the shell has no window without this)",
+                            id, pw, ph, passes
+                        );
+                    }
+                    None => {
+                        shell_declined = true;
+                        serial_println!("[orinrender] DECLINE reason=open-shell-window-refused (it named the reason on the line above; not retried — one decline is final)");
+                    }
                 }
             }
         }
