@@ -35,7 +35,7 @@
 # Usage:  x86-serial-bridge.py [DEV] [LOG] [FIFO]
 #   DEV   serial device       (default: auto-detect first /dev/cu.usbserial* then /dev/cu.usbmodem*)
 #   LOG   capture file         (default: ./x86-serial.log, appended)
-#   FIFO  command inject FIFO   (default: /tmp/x86.in ; a no-op against the TX-only kernel)
+#   FIFO  command inject FIFO   (default: ~/unaos-bench/scratch/x86.in ; a no-op against the TX-only kernel)
 import os, sys, glob, select, termios, time, errno
 
 
@@ -72,7 +72,7 @@ no-op against it (kept for symmetry + the future RX arc). See the header comment
   Usage:  x86-serial-bridge.py [DEV] [LOG] [FIFO]
     DEV   serial device       (default: auto-detect first /dev/cu.usbserial* then /dev/cu.usbmodem*)
     LOG   capture file         (default: ./x86-serial.log, appended)
-    FIFO  command inject FIFO   (default: /tmp/x86.in ; a no-op against the TX-only kernel)
+    FIFO  command inject FIFO   (default: ~/unaos-bench/scratch/x86.in ; a no-op against the TX-only kernel)
 
   Stop by DEVICE (never `pkill -f`):
     for p in $(lsof -t /dev/cu.usbserial* /dev/cu.usbmodem*); do kill "$p"; done"""
@@ -85,7 +85,7 @@ def main(argv):
 
     dev = argv[1] if len(argv) > 1 else find_dev()
     log = argv[2] if len(argv) > 2 else os.path.join(os.getcwd(), "x86-serial.log")
-    fifo = argv[3] if len(argv) > 3 else "/tmp/x86.in"
+    fifo = argv[3] if len(argv) > 3 else os.path.expanduser("~/unaos-bench/scratch/x86.in")  # never /tmp (bench law: RAM-backed, 3-day cleared)
 
     if not dev:
         print("BRIDGE: no /dev/cu.usbserial* or /dev/cu.usbmodem* found — is the FTDI cable plugged in?",
