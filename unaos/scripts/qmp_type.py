@@ -12,7 +12,7 @@
 # `vug` -> test pattern). Launch QEMU with `-display none -qmp tcp:HOST:PORT,server,nowait`
 # (via UNAOS_QEMU_EXTRA on x86, or arroyo's arm paths), then point this at that port.
 #
-#   python3 scripts/qmp_type.py --port 4472 --wait 11 --text panic --enter --out /tmp/p.png
+#   python3 scripts/qmp_type.py --port 4472 --wait 11 --text panic --enter --out ~/unaos-bench/scratch/p.png
 #
 # Timing is driven from python (the shell `sleep` binary is unreliable under the sandbox).
 

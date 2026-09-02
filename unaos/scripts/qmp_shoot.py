@@ -14,8 +14,8 @@
 # and the fresh-OVMF-vars copy. Launch QEMU headless with a QMP port (via UNAOS_QEMU_EXTRA on
 # x86, or arroyo's arm paths), then point this at that port.
 #
-#   python3 scripts/qmp_shoot.py --port 4445 --wait 9 --out /tmp/shot.png
-#   python3 scripts/qmp_shoot.py --port 4445 --wait 9 --out /tmp/shot.png --quit
+#   python3 scripts/qmp_shoot.py --port 4445 --wait 9 --out ~/unaos-bench/scratch/shot.png
+#   python3 scripts/qmp_shoot.py --port 4445 --wait 9 --out ~/unaos-bench/scratch/shot.png --quit
 #
 # Timing is driven from python (time.sleep) because the shell `sleep` binary is blocked in this
 # sandbox. --quit asks QEMU to exit after the shot (useful when nothing else will kill it).
