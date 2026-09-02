@@ -381,6 +381,7 @@ build_linux() {
 }
 
 echo "==> Building ${DESC} image: ${OUT} (${SIZE_MB} MiB)"
+mkdir -p "${TMPDIR:-$HOME/unaos-bench/scratch}"   # /tmp always existed; scratch may not
 STAGE_DIR="$(mktemp -d "${TMPDIR:-$HOME/unaos-bench/scratch}/unaos-fatimg.XXXXXX")"   # never /tmp (bench law)
 trap 'rm -rf "$STAGE_DIR"' EXIT
 stage_contents "$STAGE_DIR"

@@ -92,6 +92,8 @@ def main(argv):
               flush=True)
         return 1
 
+    # /tmp always existed; scratch may not — a fresh host must not fail at its first mkfifo.
+    os.makedirs(os.path.dirname(fifo), exist_ok=True)
     if not os.path.exists(fifo):
         os.mkfifo(fifo)
     fifo_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
