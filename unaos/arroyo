@@ -3544,10 +3544,29 @@ check_kernel_cfg() {
     # positional trap 2026-08-27; this comment is why the next reader doesn't.)
     local _kl_declared _kl_covered="," _kl_f _kl_miss=""
     _kl_declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$WORKSPACE_DIR/crates/kernel/Cargo.toml" | grep -v '^default$')"
-    for _row in "${_rows[@]}"; do
-        read -r _ _ _feats <<< "$_row"
-        _kl_covered="${_kl_covered}${_feats},"
-    done
+    # KNOBLEG (2026-08-31) — THIS CHECK HAD NEVER BEEN ABLE TO FAIL, and both halves of the reason
+    # are fixed here. It is the tree's only structural check, and it printed ✅ on every run.
+    #
+    # (1) It matched over `_rows`, which is MATRIX + MIX + SWEEP — and the `x86-mix-N` legs are
+    #     MANUFACTURED AT RUNTIME by `build_cfg_legs` from feature unions that include aarch64
+    #     features. Every feature was therefore "covered" and the ❌ branch below was unreachable.
+    #     Three seats produced three wrong explanations for the green by grepping THIS FILE's text —
+    #     and the text is innocent: `aarch64_el0` appears nowhere in it, because the value is
+    #     COMPUTED, not written. A probe on `_kl_covered` inside a running `check_kernel_cfg` named
+    #     x86-mix-1/2/5/6 as the legs carrying it, in one run. Read the note in
+    #     `scripts/knob-leg-covered.py`; the harness that settled it is a copy of this file with the
+    #     `cargo check` line stubbed to `true`.
+    #     ⚠ The legs are NAMED `x86-mix-N` while their unions carry aarch64 features — which is
+    #     exactly the vacuity the ❌ string below warns about. It was accurate about itself.
+    #
+    # (2) Iterating the board matrix ALONE is necessary and NOT sufficient: a literal match cannot
+    #     see Cargo implications. `aarch64_el0` is named by no leg, yet 11 board legs name
+    #     `tegra_el0`, and `tegra_el0 = ["tegra","aarch64_el0"]` (`baremetal` implies it too). So
+    #     (1) without (2) reds a feature that IS compiled — a false positive on the one gate whose
+    #     whole value is being believed. Coverage is the TRANSITIVE CLOSURE, and the helper computes it.
+    _kl_covered=",$(printf '%s\n' "${KERNEL_CFG_MATRIX[@]}" \
+        | python3 "$WORKSPACE_DIR/scripts/knob-leg-covered.py" "$WORKSPACE_DIR/crates/kernel/Cargo.toml" \
+        | tr '\n' ',')"
     case "$_kl_covered" in
         *",vugpar,"*) : ;;
         *) echo -e "${COLOR_RED}❌ knob→leg coverage: control probe FAILED — vugpar not seen on any leg; the leg parser itself is broken (uppercase/odd-char drop?). No coverage verdict from this run.${COLOR_RESET}"; return 1 ;;
