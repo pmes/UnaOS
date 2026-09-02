@@ -3720,6 +3720,28 @@ check_both() {
         _crc=1
     fi
 
+    # GATE-FAMILY: a ratchet on platform-split symbol families — `render_service` /
+    # `x86_render_service` / `orin_render_service` and the seven others like it.
+    #
+    # WHY IT IS A GATE AND NOT A CONVENTION. Every per-platform twin in this tree was individually
+    # defensible when it was written; the result is one job with N implementations sharing 40-60% of
+    # its callees. The lane rule is NOT what produces that — crossing a lane already works, by grant
+    # (PANELOWN, the wm/fbcon parity port, CONWINCLOSE). What is missing is a PRICE ON NOT SHARING:
+    # a cross-lane edit costs a negotiation, a recorded grant and a review, while a copy costs
+    # nothing and shows up in no measurement, so the cheapest correct move is the duplicating one.
+    # This is the bill, and it arrives when the NAME is chosen — the only moment when the fix is
+    # still a rename instead of an extraction.
+    #
+    # Growing a family stays ALLOWED. It just cannot be silent: update the ledger in the same commit
+    # with the reason, and the gate is green. The script's failure text asks the three questions the
+    # reason has to answer (what is shared, which axis truly differs, would a parameter have done).
+    local _frc=0
+    if "$WORKSPACE_DIR/scripts/arch-families.sh"; then
+        echo -e "${COLOR_GREEN}  ✅ arch families (no per-platform copy added silently)${COLOR_RESET}"
+    else
+        _frc=1
+    fi
+
     if [ "$_urc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
         return 1
@@ -3730,6 +3752,10 @@ check_both() {
     fi
     if [ "$_crc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_frc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a platform-split symbol family grew (see above)${COLOR_RESET}"
         return 1
     fi
 }
