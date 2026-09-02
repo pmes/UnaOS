@@ -72,17 +72,17 @@ if [ ! -f "$LEDGER" ]; then
   exit 1
 fi
 
-if diff -u "$LEDGER" <(printf '%s\n' "$NOW") > /tmp/.gatefam.$$ 2>&1; then
+# No temp file: the diff lives in a variable. `/tmp` is RAM-backed and cleared on this bench and the
+# repo's laws forbid it outright; a gate that violates a law in the file that documents it is not a gate.
+_delta="$(diff -u "$LEDGER" <(printf '%s\n' "$NOW") 2>&1)" && {
   echo "GATE-FAMILY: OK — $(printf '%s\n' "$NOW" | grep -c . ) platform-split families, none grown"
-  rm -f /tmp/.gatefam.$$
   exit 0
-fi
+}
 
 echo "=============================================================================" >&2
 echo "GATE-FAMILY FAILED — a platform-split symbol family changed." >&2
 echo >&2
-sed -n '3,$p' /tmp/.gatefam.$$ >&2
-rm -f /tmp/.gatefam.$$
+printf '%s\n' "$_delta" | sed -n '3,$p' >&2
 cat >&2 <<'MSG'
 
 A "+" line is a family that GREW or APPEARED: one more per-platform copy of a job that
