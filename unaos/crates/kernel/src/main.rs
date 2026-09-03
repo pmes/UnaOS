@@ -8170,6 +8170,12 @@ fn tegra_render_arm() -> bool {
     // cascade §5.2 stops is not driven here. Armed BEFORE the spawn so the service's first pass can
     // mint rather than idling a full pass waiting for a latch nothing else on this board will set.
     unaos_kernel::video::desktop_firmware::arm();
+    // PAINTPULSE — the SAME gap, one latch over. `pulsewin::service()` below opens its window only on
+    // `pulsewin::ARMED`, whose sole setter before this line was `desktop_firmware::activate()`
+    // (`desktop_firmware.rs`, the `[pidesk] pulse-window ARMED` site) — the call §5.2 forbids on tegra.
+    // So the service pass ran every pass and could never open. `arm()` is the latch store and nothing
+    // else; the open itself stays where the Pi put it, in the render pass, on the first live sample.
+    unaos_kernel::video::pulsewin::arm();
 
     // PLACEMENT IS CHOSEN, NOT CONVENIENT — §5.2's rule, from two seats on the same day (rmbp's steal
     // handed composite work to the busiest core; pi co-pinned `usb-pump` with `input` and destroyed
@@ -8206,13 +8212,12 @@ fn orin_render_service(_: usize) {
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
 
-    // The shell window's heap store is bound and never read again ON PURPOSE: the `wm` row holds a
-    // raw pointer into it, and this task never returns, so the binding IS the lifetime. Same
-    // construction as the Pi service's `_shell_store`, and same reason.
-    let mut _shell_store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let mut shell_id = wm::WIN_NONE;
-    // One decline is final. `open_shell_window` already names its reason on the wire; retrying every
-    // pass would turn a full heap into a serial flood.
+    // PAINTPULSE — no shell window is minted on this board any more (both arms below decline), so
+    // there is no heap store to keep alive and no row id to learn; `shell_id` stays `WIN_NONE` and the
+    // census prints it as `win=0`, which is the truth rather than a row nothing paints.
+    let shell_id = wm::WIN_NONE;
+    // One decline is final. The arms below name their reason on the wire; repeating it every pass
+    // would be a serial flood.
     let mut shell_declined = false;
     let mut passes: u64 = 0;
     let mut presents: u64 = 0;
@@ -8231,9 +8236,9 @@ fn orin_render_service(_: usize) {
         passes += 1;
         let mut dirty = false;
 
-        // LAZY MINT, once. Guarded on `armed()` rather than on having called `arm()` above, because
-        // the guard is what `open_shell_window` itself reads and a rung that checks a different fact
-        // than the one that gates it is the defect class this branch keeps paying for.
+        // THE DECLINE, once. Still guarded on `armed()` rather than on having called `arm()` above,
+        // because the guard is what `open_shell_window` itself reads and a rung that checks a different
+        // fact than the one that gates it is the defect class this branch keeps paying for.
         if shell_id == wm::WIN_NONE
             && !shell_declined
             && unaos_kernel::video::desktop_firmware::armed()
@@ -8250,26 +8255,27 @@ fn orin_render_service(_: usize) {
                 shell_declined = true;
                 serial_println!("[orinrender] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)");
             } else {
-                match open_shell_window(pw, ph) {
-                    Some((store, _surf_fb, id)) => {
-                        _shell_store = store;
-                        shell_id = id;
-                        dirty = true;
-                        serial_println!(
-                            "[orinrender] win={} panel={}x{} pass={} -> SHELL-WINDOW (no routed console on this image, so the shell has no window without this)",
-                            id, pw, ph, passes
-                        );
-                    }
-                    None => {
-                        shell_declined = true;
-                        serial_println!("[orinrender] DECLINE reason=open-shell-window-refused (it named the reason on the line above; not retried — one decline is final)");
-                    }
-                }
+                // PAINTPULSE — the knob-solo arm used to mint here, and the window it minted was EMPTY
+                // BY CONSTRUCTION: `open_shell_window`'s surface came back as `_surf_fb` and was
+                // dropped on the floor, nothing ever drew into the store, and the row composited a
+                // `DESKTOP_BG` fill for the life of the boot (`att=0 comp>0`). The Pi's painter is
+                // seven lines, and every symbol in it compiles here — but its window is LIVE only
+                // because the Pi's render task also drains `EVENT_QUEUE` into that console. On this
+                // board `jd2_console_pump` owns the drain and its own `Console`, and this task's
+                // contract (see its doc) forbids a second drainer; a port of the paint alone would
+                // mint one frame of a prompt no keystroke can reach. That is a picture of a shell,
+                // not a shell, and a worse lie than the empty box. So: no painter, no mint, said so.
+                shell_declined = true;
+                serial_println!(
+                    "[orinrender] DECLINE reason=no-painter panel={}x{} (fbcon::console_is_routed()=false — the shell on this image is jd2_console_pump's console on the panel; this task owns no drainer for a windowed shell, so it mints no window it cannot paint; the strip pass below is what this rung contributes)",
+                    pw, ph
+                );
             }
         }
 
         // The pulse window's own service pass. Compiled on tegra under `desktop_firmware` and, until
-        // this rung, called by nothing on this board.
+        // this rung, called by nothing on this board; armed by `tegra_render_arm` (PAINTPULSE), so the
+        // open arm inside it can fire on the first pass `ui_status::loads` reports a live instrument.
         unaos_kernel::video::pulsewin::service();
 
         // The status strip's ~1 Hz repaint. `tick` returns whether it changed anything, so a quiet
