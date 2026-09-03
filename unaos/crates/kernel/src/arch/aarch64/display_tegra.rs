@@ -2495,8 +2495,9 @@ fn jx2_nvc67d_status(base: u64, size: u64) {
 // chrome arm, the SHELLWIN-PI arm) are compiled IN on an `orinconwin` image. That is not a tolerated
 // widening — it is the rung's precondition. `dock::press_at` IS §6.1's route back; without `desktop_firmware`
 // there is no dock in the image at all (`video/mod.rs` gates the whole furniture family on it), so a
-// minimise disc really would be one-way. `pulsewin::press_route` returns on a NONE window id and
-// `quarry::press_route` is the stub, so the two deep arms are unreachable on this build.
+// minimise disc really would be one-way. `pulsewin::press_route` returns on a NONE window id — the id
+// is non-NONE only once an `orinrender` image has armed and opened the pulse window (PAINTPULSE) — and
+// `quarry::press_route` is the stub, so on a plain `orinconwin` build both deep arms are unreachable.
 //
 // ── WHERE IT RUNS, AND THE STACK ─────────────────────────────────────────────────────────────────
 //

@@ -8101,8 +8101,8 @@ fn tegra_stk_anchor() {
 // its blocking `recv()` would park forever because `run_capstone_boot_core` has no sleeper drain;
 // and `jd2_console_pump` already owns the input half, so a second drainer would steal its events.
 
-/// One-shot latch — the seam must never run twice. A second pass would re-mint the shell window and
-/// leave the first row's heap store owned by nothing.
+/// One-shot latch — the seam must never run twice. A second pass would spawn a second `orin-render`
+/// task presenting into the same stage (the shell-window mint it once guarded is gone — PAINTPULSE).
 #[cfg(all(target_arch = "aarch64", feature = "orinrender"))]
 static ORINRENDER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -8195,13 +8195,13 @@ fn tegra_render_arm() -> bool {
     // tegra. The `[u7stk]` gauge SATURATES (`hw=len headroom=0` is a lower bound, never a depth), so
     // the flight's reading says "at least 16 KiB", not "16 KiB" — 32 KiB is the next power of two,
     // and the next `[u7stk]` line is what says whether it fits.
-    const ORIN_RENDER_STACK_SIZE: usize = 32 * 1024;
+    const RENDER_STACK_SIZE: usize = 32 * 1024;
     let tid = unaos_kernel::arch::sched::spawn_stack(
         "orin-render",
         orin_render_service,
         0,
         0,
-        ORIN_RENDER_STACK_SIZE,
+        RENDER_STACK_SIZE,
     );
     serial_println!(
         "[orinrender] spawned tid={} cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)",
@@ -8325,16 +8325,19 @@ fn orin_render_service(_: usize) {
             // task's bounds and its poison high-water, so calling it here yields orin-render's own
             // numbers, and it is placed AFTER the first present because the present (flush + the
             // WC-I occluder walk) is this pass's deepest call chain — a probe before it would read a
-            // shallower stack. Pass 1 only: `ui_status::tick`'s arming call always returns dirty
-            // ("first frame must paint the bars"), so pass 1 is the first present by construction,
-            // and one line is what the wire's lossy polled UART can be asked to carry. Every other
+            // shallower stack. Passes 1 and 2: `ui_status::tick`'s arming call always returns dirty
+            // ("first frame must paint the bars"), so pass 1 is the first present by construction;
+            // but `pulsewin::service()` runs BEFORE `tick` each pass and `loads` is 0 until tick has
+            // armed, so the pulse window's `wm::create_at` + composite — this task's deepest chain —
+            // lands on pass 2, and a pass-1-only gauge would exclude it. Two lines are what the
+            // wire's lossy polled UART can be asked to carry (REVIEW finding, orin 13). Every other
             // `[u7stk]` site in the tree sits in `u7_launcher`, below the `-> !` terminus this board
             // never returns from, so without this line the jetson image has NO stack gauge at all.
             // ⚠ The reading SATURATES: `hw=len headroom=0` is a lower bound, never a depth. Witness-
             // gated as the probe itself is; knob-off the image is unchanged.
             #[cfg(feature = "witness")]
-            if passes == 1 {
-                unaos_kernel::arch::sched::stk_probe("orin-render:pass1");
+            if passes == 1 || passes == 2 {
+                unaos_kernel::arch::sched::stk_probe(if passes == 1 { "orin-render:pass1" } else { "orin-render:pass2" });
             }
         }
 
