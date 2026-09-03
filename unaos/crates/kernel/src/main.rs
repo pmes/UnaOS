@@ -8184,7 +8184,25 @@ fn tegra_render_arm() -> bool {
     // EL1), and `run_capstone_boot_core`'s loop is the only dispatcher that will ever run this task.
     // Explicit pin, never CPU_AUTO — `ONLINE_MASK[0]` is false on the Orin, so an auto placement would
     // be decided by a filter that does not know this core exists.
-    let tid = unaos_kernel::arch::sched::spawn("orin-render", orin_render_service, 0, 0);
+    //
+    // STACKSEED — SIZED, NOT BLANKET. The render1 flight traversed the blanket 16 KiB task stack's
+    // redzone on pass ~1: this task's pass calls into `wm` (`pulsewin::service`, `ui_status::tick`,
+    // the `Screen` flush with its WC-I occluder walk), and `composite_inner`'s aarch64 stack
+    // exhaustion is already on the ledger (occ62). Same size and same shape as the Pi's
+    // `U7_LAUNCH_STACK_SIZE` (and its `RENDER_STACK_SIZE` / `PUMP_PATH_STACK_SIZE` siblings on
+    // `hw-pi4`): one task pays 16 KiB of heap, `TASK_STACK_SIZE` stays what it is for every other
+    // task. `spawn_stack` is ungated; `spawn_prio_stack` is `baremetal`-gated and not usable on
+    // tegra. The `[u7stk]` gauge SATURATES (`hw=len headroom=0` is a lower bound, never a depth), so
+    // the flight's reading says "at least 16 KiB", not "16 KiB" — 32 KiB is the next power of two,
+    // and the next `[u7stk]` line is what says whether it fits.
+    const ORIN_RENDER_STACK_SIZE: usize = 32 * 1024;
+    let tid = unaos_kernel::arch::sched::spawn_stack(
+        "orin-render",
+        orin_render_service,
+        0,
+        0,
+        ORIN_RENDER_STACK_SIZE,
+    );
     serial_println!(
         "[orinrender] spawned tid={} cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)",
         tid
@@ -8210,6 +8228,21 @@ fn orin_render_service(_: usize) {
     let info = front_fb.info();
     let (pw, ph) = (info.width, info.height);
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    // STACKSEED — THE BACK BUFFER IS SEEDED THE DESKTOP COLOUR BEFORE ANYTHING CAN PRESENT IT.
+    // `Screen::new` allocates its back store `vec![0u8; len]` and arms FULL-PANEL damage, so the
+    // first `pal.render` below would publish a whole panel of black that nothing ever painted. Until
+    // a1cf4900 the mint arm's `clear_screen` was seeding it by accident — on a routed board that arm
+    // never fires, so its deletion was right and this is the seed's proper home: once, before the
+    // loop. It is the same fill `screen::adopt_desktop_bg` would have `Screen::new` perform, done on
+    // THIS screen only rather than through that latch, because the latch is global and this board
+    // has a second reader: `video::witness::run` (the shell's `tste` leg `video.present`, compiled
+    // unconditionally) builds a `Screen` over a HEAP buffer and asserts its baseline flush left the
+    // front all-zero — the same reason the Pi's desktop path (`desktop_firmware` step 1b) declines to
+    // arm it on aarch64. A cached-RAM fill, never a panel read-back; `mark_full` re-arms the damage
+    // `Screen::new` already set, so no extra present. The flush's WC-I occluder walk keeps the fill
+    // off every `wm` window's box, so the routed console window survives the first present, and the
+    // colour is the one `wm::erase` already paints into vacated boxes on this arch.
+    screen.fill_screen(wm::DESKTOP_BG);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
 
     // PAINTPULSE — no shell window is minted on this board any more (both arms below decline), so
@@ -8288,6 +8321,21 @@ fn orin_render_service(_: usize) {
         if dirty {
             pal.render();
             presents += 1;
+            // STACKSEED — the ONE real stack reading this task gets. `stk_probe` reads the CURRENT
+            // task's bounds and its poison high-water, so calling it here yields orin-render's own
+            // numbers, and it is placed AFTER the first present because the present (flush + the
+            // WC-I occluder walk) is this pass's deepest call chain — a probe before it would read a
+            // shallower stack. Pass 1 only: `ui_status::tick`'s arming call always returns dirty
+            // ("first frame must paint the bars"), so pass 1 is the first present by construction,
+            // and one line is what the wire's lossy polled UART can be asked to carry. Every other
+            // `[u7stk]` site in the tree sits in `u7_launcher`, below the `-> !` terminus this board
+            // never returns from, so without this line the jetson image has NO stack gauge at all.
+            // ⚠ The reading SATURATES: `hw=len headroom=0` is a lower bound, never a depth. Witness-
+            // gated as the probe itself is; knob-off the image is unchanged.
+            #[cfg(feature = "witness")]
+            if passes == 1 {
+                unaos_kernel::arch::sched::stk_probe("orin-render:pass1");
+            }
         }
 
         // Rate-limited liveness. This task is a SINGLETON ROLE and this tree has no re-home path —
