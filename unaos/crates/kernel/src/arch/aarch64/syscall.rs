@@ -8927,11 +8927,31 @@ fn sys_cap_grant(asid: u64, src_idx: u64, req_rights: u64) -> i64 {
 /// that right, the revoke additionally marks its derivation node — every capability derived from it (every
 /// re-grant, and every re-transfer whose chain passes through it) is `-EACCES` at its next use. Without the
 /// right the drop stays local (derived copies survive — U5's semantics, unchanged).
+/// CAPREVOKE: revoking a FILE handle also releases its open-file DESCRIPTOR (`files_free`) — the x86 twin's
+/// U7x/U11x branch, now carried on both arches (before this the descriptor outlived every handle to it and a
+/// repeat open->revoke loop exhausted the FILES row to a permanent -EMFILE). An orphan chain the free yields
+/// (the LAST close of an `unlink_pending` file — `sys_close`'s U11-M2 shape) is freed after the handle drops.
 /// Returns 0, or -ECHILD if the index is out-of-range/Empty (nothing to revoke — also the double-revoke
 /// errno). After revoke, any use of the index returns -EACCES (`sys_write`) / -ECHILD (`sys_wait`).
 fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
     if idx as usize >= NHANDLE || handle_get(asid, idx as usize).is_none() {
         return ECHILD; // out-of-range or Empty — no such handle to revoke
+    }
+    // CAPREVOKE (the x86 U7x/U11x branch): revoking a FILE handle releases its open-file DESCRIPTOR too —
+    // without this, the descriptor outlived every handle to it and repeat open->revoke loops exhausted the
+    // FILES row to a permanent -EMFILE. The value word is a gen-tagged file-id `(gen << 32) | (idx + 1)`, so
+    // decode it through `file_desc_validate` (masks the low half, bounds-checks, matches the generation) rather
+    // than a bare `checked_sub(1)`. A stale/out-of-range id (a kernel bug) validates to `None` and is simply
+    // skipped; the handle clear below still denies every use. Honest scope: a GRANT-minted duplicate File
+    // handle shares the descriptor, so revoking either one frees it and the survivor's reads fail CLOSED
+    // (-EACCES at the `file_desc_validate` re-check). The orphan chain head (if any) is freed LAST, below.
+    let mut orphan = None;
+    if handle_kind(asid, idx as usize) == KIND_FILE {
+        if let Some(file_id) = handle_get(asid, idx as usize).filter(|&v| v != HANDLE_RESERVING) {
+            if let Some(fid) = file_desc_validate(asid, file_id) {
+                orphan = files_free(asid, fid);
+            }
+        }
     }
     // U8: CAP_REVOKE gets its real semantics — revoking a handle that CARRIES the right marks its
     // derivation node revoked, killing the whole subtree derived from it (every re-grant, and every
@@ -8945,6 +8965,11 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
         deriv_revoke(dn);
     }
     handle_clear(asid, idx as usize);
+    // CAPREVOKE/U11-M2: if the descriptor free above was the LAST close of an `unlink_pending` file, free its
+    // chain now — AFTER dropping the handle, never under a lock; block I/O is legal here (syscall context).
+    if let Some(fc) = orphan {
+        free_orphan_chain(fc);
+    }
     0
 }
 
@@ -20680,7 +20705,10 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
     let Some(fid) = files_alloc(A, fc, sz, 0, 0) else {
         return false;
     };
-    let file_id = (fid + 1) as u64;
+    // CAPREVOKE: pack the descriptor's CURRENT generation — the revoke below decodes this file-id through
+    // `file_desc_validate`, which checks the gen, so a bare `(fid + 1)` would fail to match and the descriptor
+    // would never be freed (leaking the row, failing the verdict).
+    let file_id = file_id_pack(FILE_GEN[A as usize][fid].load(Ordering::Acquire), fid);
     // A ROOT File cap carrying CAP_WRITE|CAP_GRANT|CAP_REVOKE at index 2 (off index 0 / CONSOLE_FD, the U8 idiom).
     install_cap(A, 2, KIND_FILE, file_id, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
     // Pre-revoke: the root File+CAP_WRITE cap resolves — a `sys_write` through it WOULD pass the CHECK.
@@ -20692,19 +20720,20 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
     if g >= 0 {
         ok &= matches!(handle_resolve(A, g as u64, CAP_WRITE), Ok(HandleTarget::File(_)));
     }
-    // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2.
+    // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2
+    // AND — because it is a File handle — frees the shared descriptor via `files_free` (CAPREVOKE).
     ok &= sys_cap_revoke(A, 2) == 0;
     // THE DENIAL: the derived File+CAP_WRITE cap is now stale — its next CAP_WRITE resolve (exactly the CHECK
     // `sys_write` performs) is `-EACCES`. This is the "a U8-revoked File cap write -> -EACCES" proof.
     if g >= 0 {
         ok &= handle_resolve(A, g as u64, CAP_WRITE).is_err();
     }
-    // Drop everything planted; index 2 was already cleared by the revoke, so clearing the derived handle drops
-    // the last node (the root's tombstone cascades free). Then demand every ledger clear — no leak on any path.
+    // Drop everything planted; index 2 was already cleared by the revoke (freeing the descriptor), so clearing
+    // the derived handle drops the last node (the root's tombstone cascades free). Then demand every ledger
+    // clear — the `files_row_is_clear` demand is what PROVES the revoke freed the descriptor (no leak on any path).
     if g >= 0 {
         handle_clear(A, g as usize);
     }
-    let _ = files_free(A, fid); // scaffold descriptor (dir_lba == 0): the refcount decrement is a no-op
     ok &= handle_row_is_clear(A) && files_row_is_clear(A) && deriv_all_free();
     ok
 }
