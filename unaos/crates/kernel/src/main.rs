@@ -781,6 +781,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
 
+    // 4b''''. BOOTFADT: name the FADT RESET_REG / RESET_VALUE the `reboot` verb will write, while the
+    // console pump is still alive. On the rMBP the verb's own witnesses never reach the FTDI cable
+    // (the reset lands before the next device-service pass), so this line is the only record of what
+    // the ladder will do on this machine. Read-only.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi_power::reset_report();
+
     // BPACE: the whole ACPI phase — MADT topology discovery, the DMAR/IOMMU report and the PM-timer
     // liveness probe. Stamped HERE rather than immediately after `acpi::init` so the next stamp's
     // `d=` is the calibration alone and nothing else. x86-only, like the three calls it closes.

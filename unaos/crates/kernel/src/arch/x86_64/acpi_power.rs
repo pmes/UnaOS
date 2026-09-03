@@ -534,6 +534,33 @@ fn raw_witness(args: core::fmt::Arguments) {
     super::serial::raw_write_str("\n");
 }
 
+/// BOOTFADT — report the FADT reset facts ONCE at boot, on the normal console path.
+///
+/// Why this exists (flight 6, 2026-09-03, 2012 rMBP): `reboot()` below witnesses through the lock-free
+/// `raw_write_str`, which is the 16550 at 0x3F8. The rMBP has no 16550; its console is the FTDI cable
+/// driven by the kernel's own xHCI stack, drained by the device-service pass. `reboot()` disables
+/// interrupts and writes RESET_REG microseconds after its witness, so on that machine NOTHING it prints
+/// ever reaches the cable — the verb reset the laptop and the wire recorded zero `[orinreboot]` lines.
+/// The facts the ladder would have named (space, address, RESET_VALUE, or which FADT check refused)
+/// are all discoverable READ-ONLY at boot, when the pump is alive. So they are printed here, and the
+/// ladder's own lines stay as they are for machines whose serial port is real.
+///
+/// Nothing is written to any register. This is `discover_reset()` plus one line.
+pub fn reset_report() {
+    match discover_reset() {
+        Ok(r) => serial_println!(
+            "[orinreboot] FADT RESET_REG discovered at boot: space={} addr={:#x} value={:#x} — the reboot verb will write this",
+            gas_space_name(r.space),
+            r.addr,
+            r.value
+        ),
+        Err(why) => serial_println!(
+            "[orinreboot] FADT RESET_REG absent at boot — the reboot verb will fall through to the 8042 pulse (why: {})",
+            why
+        ),
+    }
+}
+
 /// Warm-reboot the machine: FADT RESET_REG, then the 8042 pulse, then an honest `hlt` park.
 /// Never returns. Takes no lock (see the module note above).
 pub fn reboot() -> ! {
