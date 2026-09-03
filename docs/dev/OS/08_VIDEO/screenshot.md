@@ -353,3 +353,30 @@ Flight-3 (`UNAOS_PRTSCRST=1`, 2026-08) settled the metal state of this bench:
   `chord=cmd-shift-3` witness on the wire, then the `SCREEN<n>.PNG ... -> OK` line, then the file
   at the stick's root. If the witness never appears, the chord did not decode (the census says
   `requests` unchanged); if it appears and no `OK` follows, the refusal line names why.
+
+- **The CHORDS on metal — flight 6 (2012 rMBP, `f751cb78`, 2026-09-03): CONFIRMED.** Knob line was
+  flight 5's minus `UNAOS_PRTSCRST=1`, so no selftest could fire the capture (the staged kernel carries
+  zero `prtscrst`/`PRTSCR-ST` strings, and the wire printed none across three boots). FAT stick in at
+  370.9 s; then, on the internal keyboard:
+
+  ```
+  [ 384457ms] :: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  [ 455094ms] :: PRTSCR: SCREEN3.PNG 2880x1800 15555053 bytes -> OK ::
+  [ 455101ms] EHCI-HID: KEYUP: '#' (scancode 0x20)
+  [ 455140ms] :: PRTSCR: [prtscr] chord=cmd-shift-4 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  [ 525624ms] :: PRTSCR: SCREEN4.PNG 2880x1800 15555053 bytes -> OK ::
+  [ 525631ms] EHCI-HID: KEYUP: '$' (scancode 0x21)
+  ```
+
+  So the Apple internal keyboard does report ⌘ as the boot-protocol GUI modifier bit — the one fact
+  QEMU could not supply. No `KEY:` press line for either digit (the no-keystroke property holds on
+  metal); indices 3 and 4 because the stick still carried flight 5's SCREEN0..2 (the no-overwrite rule).
+  Both files verified host-side: PNG signature, IHDR 2880x1800 depth 8 colour 2, IHDR/IDAT/IEND with
+  every CRC valid, IDAT inflating to exactly `1800 * (1 + 2880*3)` bytes.
+
+  **Measured cost: 70.6 s and 70.5 s from chord to `OK`** for the 15,555,053-byte file — ~220 KB/s to
+  the stick — during which the USB pump made zero passes (`[deadman] pmp=0` for the whole window), so
+  keyboard and mouse were dead until the write finished. The second chord, pressed during the first
+  write, was decoded 46 ms after the first `OK`: chords are deferred by the freeze, not lost. The
+  duration is the capture running inside the device-service pass; making it incremental is a separate
+  arc, recorded here as the number to beat.

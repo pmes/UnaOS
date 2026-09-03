@@ -474,10 +474,15 @@ A recovery path that can itself wedge is worse than none. The rules, in priority
 6. **No locks, no allocation, no scheduler dependency** (§4).
 7. **The terminal state is defined, reachable, and honest about what it leaves behind:**
    condemned panel, machine still running, **serial still narrating outward but un-drivable**.
-   Not a panic, not `hlt_loop()`. The kernel's panic path never reboots (`main.rs:5085-5099`) and
-   there is **no reboot facility of any kind** in this tree — no `reboot()`, no 0xCF9 PCH reset,
-   no ACPI `RESET_REG` use (the FADT is parsed only for the PM timer and the S5 block), no
-   deliberate triple-fault helper. The one clean exit is `acpi_power::poweroff()`
+   Not a panic, not `hlt_loop()`. The kernel's panic path never reboots (`main.rs:5085-5099`).
+   Since FADTRESET (`b7901763`) the tree DOES have a reboot facility — the shell's `reboot` verb →
+   `power::reboot` → `acpi_power::reboot()`: the FADT `RESET_REG` write, then the 8042 pulse, then an
+   honest `hlt` park — but it is an OPERATOR verb, not something the condemn path invokes, and this
+   design does not change that. Two metal facts about it (flight 6, 2026-09-03): the verb did reset
+   the rMBP, and none of its `[pwrreboot]` witnesses reached the FTDI console, because the ladder
+   writes them to the 16550 that this laptop does not have and the reset lands before the xHCI
+   service pass could drain the mirror ring. BOOTFADT (`857c6dc8`) therefore prints the FADT reset
+   facts once at boot instead. The other clean exit is `acpi_power::poweroff()`
    (`arch/x86_64/acpi_power.rs:345`).
 
    Say the consequence plainly rather than dressing it up: after a condemn, the operator's only
