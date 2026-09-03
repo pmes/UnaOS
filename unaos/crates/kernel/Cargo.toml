@@ -812,11 +812,11 @@ tegrasmp = ["tegra"]
 # Tegra234 silicon — the xcarve/tegrasmp precedent), so `UNAOS_ORINWDT=1 ./arroyo check` is
 # self-sufficient. DEFAULT OFF => the module + both call sites vanish (both are statements
 # APPENDED to existing `tegra_early_stop` lines, so no panic Location shifts; the knob-off
-# image carries ZERO `[orinreboot] wdt` strings — measured — while the arc's UNCONDITIONAL
+# image carries ZERO `[orinwdt] wdt` strings — measured — while the arc's UNCONDITIONAL
 # half, the power.rs verbs, ships in every image by design, so knob-off is NOT byte-identical
 # to the pre-arc baseline and does not claim to be). The ARMED polarity is type-checked by the
 # `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
-# Witness family: `[orinreboot]` (the arch-neutral reboot VERB in power.rs shares it).
+# Witness family: `[orinwdt]` — its own since PWRNAME; the arch-neutral reboot VERB in power.rs is `[pwrreboot]`.
 orinwdt = ["tegra"]
 
 # JETSON-EL0 (M1b): the Jetson Orin (Tegra234) EL0/userspace chain. Through M1a the tegra path reached

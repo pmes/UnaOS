@@ -976,11 +976,11 @@ fi
 # `orinwdt` feature implies `tegra` (the TKE is Tegra234 silicon), so the knob is self-sufficient
 # (`UNAOS_ORINWDT=1 ./arroyo esp-jetson` builds an armed jetson image). Default OFF => the module
 # + both call sites vanish (statements APPENDED to existing lines, so no Location shifts; the
-# knob-off image carries zero `[orinreboot] wdt` strings — the arc's power.rs VERBS ship
+# knob-off image carries zero `[orinwdt] wdt` strings — the arc's power.rs VERBS ship
 # unconditionally, so no byte-identity-to-pre-arc claim). The ARMED polarity is type-checked by the
 # `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX, never by this mapping. QEMU models no TKE, so the
-# reset verdict is metal-owed. Witness family: `[orinreboot]` (shared with the reboot VERB —
-# power.rs — which is always-compiled and needs no knob).
+# reset verdict is metal-owed. Witness family: `[orinwdt]` (its own since PWRNAME; the reboot VERB in
+# power.rs is `[pwrreboot]`, always-compiled, no knob).
 [ -n "${UNAOS_ORINWDT:-}" ] && _feats="${_feats}orinwdt,"
 # ── ORINDESK rung 1: the DESKTOP FAMILY reaches this map at all ────────────────────────────────────
 #

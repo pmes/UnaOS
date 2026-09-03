@@ -419,7 +419,7 @@ pub fn poweroff() -> ! {
 // fail says which fact was missing, and the machine is either reset mid-instruction or parked in
 // `hlt` behind a line that says so.
 //
-// The ladder, in order, each rung with its own `[orinreboot]` witness BEFORE it acts:
+// The ladder, in order, each rung with its own `[pwrreboot]` witness BEFORE it acts:
 //
 //   1. FADT RESET_REG (ACPI §4.8.3.6). Valid only when the FADT is revision >= 2, is long enough to
 //      carry the field, checksums clean, and sets flag bit 10 (RESET_REG_SUP). The register is a
@@ -439,7 +439,7 @@ pub fn poweroff() -> ! {
 // before the verb are on the wire before the reset takes them. Interrupts are masked for the same
 // reason `poweroff` masks them: nothing may run between the witness and the write.
 //
-// Witness tokens: every line carries `[orinreboot]` (12 bytes) so `strings` finds them.
+// Witness tokens: every line carries `[pwrreboot]` (11 bytes) so `strings` finds them.
 
 /// A discovered reset register: address space, address, and the value the firmware says resets
 /// the machine. Construction is the proof that every field came out of a clean, flagged FADT.
@@ -540,7 +540,7 @@ fn raw_witness(args: core::fmt::Arguments) {
 /// `raw_write_str`, which is the 16550 at 0x3F8. The rMBP has no 16550; its console is the FTDI cable
 /// driven by the kernel's own xHCI stack, drained by the device-service pass. `reboot()` disables
 /// interrupts and writes RESET_REG microseconds after its witness, so on that machine NOTHING it prints
-/// ever reaches the cable — the verb reset the laptop and the wire recorded zero `[orinreboot]` lines.
+/// ever reaches the cable — the verb reset the laptop and the wire recorded zero `[pwrreboot]` lines.
 /// The facts the ladder would have named (space, address, RESET_VALUE, or which FADT check refused)
 /// are all discoverable READ-ONLY at boot, when the pump is alive. So they are printed here, and the
 /// ladder's own lines stay as they are for machines whose serial port is real.
@@ -549,13 +549,13 @@ fn raw_witness(args: core::fmt::Arguments) {
 pub fn reset_report() {
     match discover_reset() {
         Ok(r) => serial_println!(
-            "[orinreboot] FADT RESET_REG discovered at boot: space={} addr={:#x} value={:#x} — the reboot verb will write this",
+            "[pwrreboot] FADT RESET_REG discovered at boot: space={} addr={:#x} value={:#x} — the reboot verb will write this",
             gas_space_name(r.space),
             r.addr,
             r.value
         ),
         Err(why) => serial_println!(
-            "[orinreboot] FADT RESET_REG absent at boot — the reboot verb will fall through to the 8042 pulse (why: {})",
+            "[pwrreboot] FADT RESET_REG absent at boot — the reboot verb will fall through to the 8042 pulse (why: {})",
             why
         ),
     }
@@ -573,7 +573,7 @@ pub fn reboot() -> ! {
     match discover_reset() {
         Ok(r) => {
             raw_witness(format_args!(
-                "[orinreboot] FADT RESET_REG space={} addr={:#x} value={:#x} — writing",
+                "[pwrreboot] FADT RESET_REG space={} addr={:#x} value={:#x} — writing",
                 gas_space_name(r.space),
                 r.addr,
                 r.value
@@ -590,12 +590,12 @@ pub fn reboot() -> ! {
             }
             reset_settle();
             raw_witness(format_args!(
-                "[orinreboot] FADT RESET_REG write RETURNED — platform did not reset; trying 8042 pulse"
+                "[pwrreboot] FADT RESET_REG write RETURNED — platform did not reset; trying 8042 pulse"
             ));
         }
         Err(why) => {
             raw_witness(format_args!(
-                "[orinreboot] FADT has no RESET_REG — trying 8042 pulse (why: {})",
+                "[pwrreboot] FADT has no RESET_REG — trying 8042 pulse (why: {})",
                 why
             ));
         }
@@ -619,7 +619,7 @@ pub fn reboot() -> ! {
     reset_settle();
 
     raw_witness(format_args!(
-        "[orinreboot] no reboot mechanism took on this platform (x86: FADT RESET_REG and the 8042 pulse both returned) — parking in hlt"
+        "[pwrreboot] no reboot mechanism took on this platform (x86: FADT RESET_REG and the 8042 pulse both returned) — parking in hlt"
     ));
     crate::hlt_loop();
 }

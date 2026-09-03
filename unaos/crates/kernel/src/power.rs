@@ -31,14 +31,14 @@
 //   * x86_64 shutdown: REAL — routed to the existing `crate::arch::acpi_power::poweroff()`
 //     (ACPI S5, the crystal.rs Shut-Down path), which carries its own honest fallback.
 //
-// Witness families: `[orinreboot]` / `[orinshutoff]` (tokens > 8 bytes by construction —
-// each bracket prefix alone is 12 bytes — so `strings` on the artifact finds them; the LLVM
+// Witness families: `[pwrreboot]` / `[pwrshutoff]` (tokens > 8 bytes by construction —
+// each bracket prefix alone is 11+ bytes — so `strings` on the artifact finds them; the LLVM
 // ≤8-byte immediate-encoding trap cannot swallow them).
 
 /// Warm-reboot the machine via the platform's firmware mechanism. Never returns: either the
 /// platform resets, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn reboot() -> ! {
-    serial_println!("[orinreboot] reboot verb invoked — dispatching the platform mechanism");
+    serial_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
     platform_reboot()
 }
 
@@ -46,7 +46,7 @@ pub fn reboot() -> ! {
 /// boot is a cold one, and the dark board says so at a glance). Never returns: either the
 /// platform cuts power, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn shutdown() -> ! {
-    serial_println!("[orinshutoff] shutdown verb invoked — dispatching the platform mechanism");
+    serial_println!("[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism");
     platform_shutdown()
 }
 
@@ -90,13 +90,13 @@ fn psci_call(func: u64) -> i64 {
 #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
 fn platform_reboot() -> ! {
     serial_println!(
-        "[orinreboot] PSCI SYSTEM_RESET ({:#010x}) via SMC — firmware owns the machine from here",
+        "[pwrreboot] PSCI SYSTEM_RESET ({:#010x}) via SMC — firmware owns the machine from here",
         PSCI_SYSTEM_RESET
     );
     let ret = psci_call(PSCI_SYSTEM_RESET);
     // A returning SYSTEM_RESET is a refusal (NOT_SUPPORTED and friends are negative per PSCI).
     serial_println!(
-        "[orinreboot] PSCI SYSTEM_RESET RETURNED ({}) — firmware refused the reset; parking in hlt",
+        "[pwrreboot] PSCI SYSTEM_RESET RETURNED ({}) — firmware refused the reset; parking in hlt",
         ret
     );
     crate::hlt_loop();
@@ -105,12 +105,12 @@ fn platform_reboot() -> ! {
 #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
 fn platform_shutdown() -> ! {
     serial_println!(
-        "[orinshutoff] PSCI SYSTEM_OFF ({:#010x}) via SMC — firmware owns the machine from here",
+        "[pwrshutoff] PSCI SYSTEM_OFF ({:#010x}) via SMC — firmware owns the machine from here",
         PSCI_SYSTEM_OFF
     );
     let ret = psci_call(PSCI_SYSTEM_OFF);
     serial_println!(
-        "[orinshutoff] PSCI SYSTEM_OFF RETURNED ({}) — firmware refused the off; parking in hlt",
+        "[pwrshutoff] PSCI SYSTEM_OFF RETURNED ({}) — firmware refused the off; parking in hlt",
         ret
     );
     crate::hlt_loop();
@@ -123,7 +123,7 @@ fn platform_shutdown() -> ! {
 #[cfg(all(target_arch = "aarch64", feature = "pi"))]
 fn platform_reboot() -> ! {
     serial_println!(
-        "[orinreboot] no reboot mechanism wired on this platform (Pi: no PSCI; the BCM2711 PM/WDOG path is the pi lane's) — parking in hlt"
+        "[pwrreboot] no reboot mechanism wired on this platform (Pi: no PSCI; the BCM2711 PM/WDOG path is the pi lane's) — parking in hlt"
     );
     crate::hlt_loop();
 }
@@ -131,7 +131,7 @@ fn platform_reboot() -> ! {
 #[cfg(all(target_arch = "aarch64", feature = "pi"))]
 fn platform_shutdown() -> ! {
     serial_println!(
-        "[orinshutoff] no shutdown mechanism wired on this platform (Pi: no PSCI; the mailbox power path is the pi lane's) — parking in hlt"
+        "[pwrshutoff] no shutdown mechanism wired on this platform (Pi: no PSCI; the mailbox power path is the pi lane's) — parking in hlt"
     );
     crate::hlt_loop();
 }
@@ -143,7 +143,7 @@ fn platform_shutdown() -> ! {
 /// with its own line if the platform will not comply). It takes no lock past this line.
 #[cfg(target_arch = "x86_64")]
 fn platform_reboot() -> ! {
-    serial_println!("[orinreboot] x86 mechanism: FADT RESET_REG ladder (acpi_power::reboot)");
+    serial_println!("[pwrreboot] x86 mechanism: FADT RESET_REG ladder (acpi_power::reboot)");
     crate::arch::acpi_power::reboot();
 }
 
@@ -152,6 +152,6 @@ fn platform_reboot() -> ! {
 /// own witness if any required fact is missing.
 #[cfg(target_arch = "x86_64")]
 fn platform_shutdown() -> ! {
-    serial_println!("[orinshutoff] x86 mechanism: ACPI S5 (acpi_power::poweroff)");
+    serial_println!("[pwrshutoff] x86 mechanism: ACPI S5 (acpi_power::poweroff)");
     crate::arch::acpi_power::poweroff();
 }

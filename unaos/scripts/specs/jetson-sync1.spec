@@ -882,7 +882,7 @@ OPTIONAL \[net4V no-lease verdict\]
 # VERBS) is OPERATOR-DRIVEN: an unattended boot legitimately prints none of it — the
 # [orinclick]-edge argument, so OPTIONAL end to end.
 # TOKEN LENGTHS, per the >8-byte immediate-encoding trap the timer.rs tail writes up:
-# `[orinreboot]` 12 B, `[orinshutoff]` 13 B, `[orinselfup]` 12 B, `[orinbsptick]` 14 B —
+# `[pwrreboot]` 11 B, `[pwrshutoff]` 12 B, `[orinwdt]` 9 B, `[orinselfup]` 12 B, `[orinbsptick]` 14 B —
 # all artifact-grep-able as bare tags. `[net4G]` is EXACTLY 8 bytes, at the LLVM bound:
 # grep the staged artifact for the longer fragment `latch-site status` (17 B, same
 # format literal) rather than the bare tag when doing the cut-time check.
@@ -903,9 +903,9 @@ OPTIONAL \[net4V no-lease verdict\]
 # EM DASHES: both lines put one immediately after the verdict token (`ARMED — POR reset
 # in …` / `DISARMED — boot reached …`), so both patterns stop at the token and never
 # span the dash. `wdt ARMED` cannot false-hit the DISARMED line (`DISARMED` does not
-# contain ` ARMED` after `wdt `), and both carry the 12-byte family tag.
-PENDING \[orinreboot\] wdt ARMED
-PENDING \[orinreboot\] wdt DISARMED
+# contain ` ARMED` after `wdt `), and both carry the 9-byte `[orinwdt]` family tag (its own family since PWRNAME — the watchdog is a POR mechanism, not the reboot verb).
+PENDING \[orinwdt\] wdt ARMED
+PENDING \[orinwdt\] wdt DISARMED
 
 # --- ORIN-REBOOT / ORIN-SHUTOFF (verb half): the power verbs at the shell ------------
 # NOT knob-gated (power.rs compiles on every build; the aarch64 non-pi arm is the PSCI
@@ -917,7 +917,7 @@ PENDING \[orinreboot\] wdt DISARMED
 # a row: on success the PSCI dispatch line (`… via SMC — firmware owns the machine from
 # here`) is the LAST line this kernel ever prints — SYSTEM_RESET warm-resets into
 # firmware chatter, SYSTEM_OFF goes DARK and stays dark. A dark board after the
-# `[orinshutoff]` PSCI line is the shutdown verb PASSING (Peter's cold-boot ruling:
+# `[pwrshutoff]` PSCI line is the shutdown verb PASSING (Peter's cold-boot ruling:
 # the dark board IS the cold-boot-ready signal), not a hang. No spec row can assert
 # "nothing printed after"; the playbook carries that reading.
 # THE `RETURNED` ARMS ARE HONEST REFUSALS, NOT FAULTS: a returning PSCI call is the
@@ -925,12 +925,12 @@ PENDING \[orinreboot\] wdt DISARMED
 # the machine's refusal stated — a measurement about ATF, not a UnaOS invariant break,
 # so OPTIONAL and deliberately not FORBID (the JD1-DC rule). Patterns stop before each
 # line's em dash; `{:#010x}` renders lowercase `0x…`, hence `0x[0-9a-f]+`.
-OPTIONAL \[orinreboot\] reboot verb invoked
-OPTIONAL \[orinreboot\] PSCI SYSTEM_RESET \(0x[0-9a-f]+\) via SMC
-OPTIONAL \[orinreboot\] PSCI SYSTEM_RESET RETURNED
-OPTIONAL \[orinshutoff\] shutdown verb invoked
-OPTIONAL \[orinshutoff\] PSCI SYSTEM_OFF \(0x[0-9a-f]+\) via SMC
-OPTIONAL \[orinshutoff\] PSCI SYSTEM_OFF RETURNED
+OPTIONAL \[pwrreboot\] reboot verb invoked
+OPTIONAL \[pwrreboot\] PSCI SYSTEM_RESET \(0x[0-9a-f]+\) via SMC
+OPTIONAL \[pwrreboot\] PSCI SYSTEM_RESET RETURNED
+OPTIONAL \[pwrshutoff\] shutdown verb invoked
+OPTIONAL \[pwrshutoff\] PSCI SYSTEM_OFF \(0x[0-9a-f]+\) via SMC
+OPTIONAL \[pwrshutoff\] PSCI SYSTEM_OFF RETURNED
 
 # --- ORIN-SELFUP: the staged-payload self-update ladder (S0..S6) ---------------------
 # ARMED BY `selfup` (main.rs:2479 — after ORIN-INSTALL-2's slot, before the JM6 drop).
@@ -946,9 +946,9 @@ PENDING \[orinselfup\] S0 scan
 # on an update boot; the deepest ✅ is the stage the ladder reached. Wire order on a
 # successful update: S0 (staged) -> S1 verify -> S2 parse -> S3 write (once PER FILE) ->
 # S4 flip (window OPEN / per-pair `is live` / window CLOSED) -> S5 clean ->
-# UPDATE APPLIED -> S6 reboot -> the [orinreboot] verb pair above -> RESET (silence,
+# UPDATE APPLIED -> S6 reboot -> the [pwrreboot] verb pair above -> RESET (silence,
 # then firmware chatter — the boot that follows is the UPDATED kernel). S6's line is
-# NOT the last before reset: the [orinreboot] PSCI SYSTEM_RESET dispatch line is.
+# NOT the last before reset: the [pwrreboot] PSCI SYSTEM_RESET dispatch line is.
 # Every stage token is followed by an em dash on the wire; every pattern stops at the
 # stage word. The REFUSED line (`UPDATE REFUSED — S2 parse — …`) cannot false-hit the
 # ladder rows: the rows anchor the stage token directly after the family tag.

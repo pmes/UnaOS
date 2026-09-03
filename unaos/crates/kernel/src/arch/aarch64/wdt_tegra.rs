@@ -36,7 +36,7 @@
 // disarm site reach it identity-mapped.
 //
 // QEMU: `tegra`-gated module — the virt gate never compiles it, and QEMU models no TKE.
-// Witness family: `[orinreboot]` (>8-byte tokens; artifact-grep-able by `strings`).
+// Witness family: `[orinwdt]` (>8-byte tokens; artifact-grep-able by `strings`).
 
 /// TKE base — `timer@2080000` in tegra234.dtsi (fixed silicon address, same class as the
 /// 16550 base in `serial.rs`).
@@ -133,7 +133,7 @@ pub fn boot_arm() {
     // Witness with READ-BACKS, not intentions: the CR the block now holds and its status
     // register. `locked=1` says the config half was inherited from firmware, not written.
     serial_println!(
-        "[orinreboot] wdt ARMED — POR reset in {}s unless the boot completes (WDT0@{:#x} tmr{} period {}s x5, WDTCR={:#010x} WDTSR={:#010x} locked={})",
+        "[orinwdt] wdt ARMED — POR reset in {}s unless the boot completes (WDT0@{:#x} tmr{} period {}s x5, WDTCR={:#010x} WDTSR={:#010x} locked={})",
         TIMEOUT_SECS,
         WDT0_BASE,
         source,
@@ -152,7 +152,7 @@ pub fn boot_ok_disarm() {
     mmio_write(WDT0_BASE, WDTCMDR, WDTCMDR_DISABLE_COUNTER);
     mmio_write(tmr_base(source), TMRCR, 0);
     serial_println!(
-        "[orinreboot] wdt DISARMED — boot reached the EL1 terminus (WDTSR={:#010x})",
+        "[orinwdt] wdt DISARMED — boot reached the EL1 terminus (WDTSR={:#010x})",
         mmio_read(WDT0_BASE, WDTSR),
     );
 }
