@@ -8138,12 +8138,27 @@ fn tegra_render_arm() -> bool {
     // Copy the info out and drop `WRITER` immediately: nothing below may hold it across a `wm` call,
     // which is ORIN-WM1's WRITER/TABLE acquisition-order rule. A headless Orin (no DTB
     // `simple-framebuffer` handoff, so JD1 seeded no scanout) has no geometry to mint against.
-    let ready = {
+    let info = {
         let fb = *unaos_kernel::video::WRITER.lock();
-        fb.is_ready()
+        if !fb.is_ready() {
+            serial_println!("[orinrender] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the shell window's geometry and the present that paints it are both functions of panel geometry)");
+            return false;
+        }
+        fb.info()
     };
-    if !ready {
-        serial_println!("[orinrender] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the shell window's geometry and the present that paints it are both functions of panel geometry)");
+    let (pw, ph) = (info.width, info.height);
+
+    // FLOOR 2 — THE STAGING BUFFER, DESKSEAM's reason restated: `wm`'s staged presents run inside
+    // `SYS_WIN_PRESENT`'s IRQ mask, so a stage that GREW on the pass would be a masked acquisition of
+    // the global heap `Mutex` — the F1-F5 defect family. The tree's only `reserve_stage` caller on a
+    // normal boot is `video::init_panel`, which the tegra path never reaches (it seeds `WRITER` by
+    // hand instead), so a knob-solo `orinrender` image — no `orindesk`/`orinfurn`/`orintenant` seam
+    // ahead of it to have made this call — would grow the STAGE `Vec` lazily inside the mask on its
+    // first present. Grow-only and idempotent, so it is safe beside the identical calls the sibling
+    // seams make. FAILS when the 48 MiB aarch64 heap cannot spare entry 0 at all.
+    let staged = unaos_kernel::video::wm::reserve_stage(&info);
+    if staged == 0 {
+        serial_println!("[orinrender] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — every present this pass drives would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
         return false;
     }
 
@@ -8201,6 +8216,16 @@ fn orin_render_service(_: usize) {
     let mut shell_declined = false;
     let mut passes: u64 = 0;
     let mut presents: u64 = 0;
+    // The census cadence rides CNTPCT (free-running, EL-independent — the JD3 timerless mechanism;
+    // this post-drop EL1 core has no timer IRQ), the same shape as `jd2_console_pump`'s sweep.
+    // A PASS COUNT is not a rate limit on a busy-poll loop: `passes % 20000` printed one line per
+    // ~4 ms and was 82.2% of the post-terminus capture. ~1 s of wall time per line; seeded one
+    // period in the past so the first pass still prints immediately.
+    let census_ticks: u64 = {
+        let f = unaos_kernel::arch::timer::cntfrq();
+        if f == 0 { 62_500_000 } else { f }
+    };
+    let mut last_census = unaos_kernel::arch::timer::cntpct().wrapping_sub(census_ticks);
 
     loop {
         passes += 1;
@@ -8263,7 +8288,8 @@ fn orin_render_service(_: usize) {
         // §5.2: `steal_ok` is false for every explicitly-pinned task, so if this dies nothing inherits
         // the paint. Pi boot 11 printed `verdict=LIVE` one line after the exception that killed cpu 3,
         // so the counter is printed rather than a bare "alive".
-        if passes % 20000 == 0 {
+        if unaos_kernel::arch::timer::cntpct().wrapping_sub(last_census) >= census_ticks {
+            last_census = unaos_kernel::arch::timer::cntpct();
             serial_println!(
                 "[orinrender] census passes={} presents={} win={} declined={} -> RENDER-LIVE",
                 passes, presents, shell_id, shell_declined as u8
