@@ -126,3 +126,16 @@ belongs here, on the day it is made.
 
 Operational trap details (serial-log handling, media clobbers, fixture
 state, TCC, port collisions) live in the session-memory hazards ledger.
+
+## Ledgers — one per arch, one over-arching (Peter, 2026-09-05)
+
+- **Audits and inventories are high value. Re-derivation is the waste.** Every finding lands on
+  exactly one list the turn it is found: the arch ledger (`docs/dev/OS/<track>-ledger.md`) when it
+  lives in that arch's lane, `docs/dev/LEDGER.md` when it lives in a shared file, affects more than
+  one board, or is a gate/process rule.
+- **The arc that fixes, flies, or drops an item ticks it in the same commit** (SECURITY.md's rule).
+- **Every audit or inventory is briefed with the ledger** and reports only what is NEW or CHANGED.
+  An audit that re-finds known items was mis-briefed.
+- A seat that finds something in another lane records it on `LEDGER.md` with the owner AND messages
+  that seat the same turn (see COORDINATION).
+
