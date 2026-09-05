@@ -188,6 +188,7 @@ writable volume arrived.
 
   ```
   :: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume ::
+  :: PRTSCR: SCREEN0.PNG 1280x800 -> capturing (3073098 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at 0 bytes) ::
   :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
   :: PRTSCR-ST: SCREEN0.PNG on the medium — 3073098 bytes, PNG signature OK, IHDR 1280x800 depth 8 colour 2 non-interlaced, IEND OK -> PASS ::
   ```
@@ -206,14 +207,26 @@ writable volume arrived.
   delivers the `print` qcode to the emulated `usb-kbd`, which the builder attaches to `ehci.0` — so
   the report is decoded by `decode_boot_keyboard`, the same function that decodes the rMBP's
   internal keyboard. Two presses, 30 s apart, over QMP on a `test-fat sf` run carrying **no**
-  `prtscrst` (so the key was the only possible trigger):
+  `prtscrst` (so the key was the only possible trigger). Since PRTSCR2 every capture is NAMED on
+  the wire before a pixel is read — the `-> capturing` line — so the sequence reads (the PRTSCRGATE
+  run, `UNAOS_WC=1 ./arroyo test-fat sf 200`, two chords 45 s apart):
 
   ```
   :: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN0.PNG 1280x800 -> capturing (3073098 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at 0 bytes) ::
   :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
   :: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN1.PNG 1280x800 -> capturing (3073098 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at 0 bytes) ::
   :: PRTSCR: SCREEN1.PNG 1280x800 3073098 bytes -> OK ::
   ```
+
+  How to read the wire: count `-> capturing` lines against their verdicts (`-> OK`, a
+  `— capture skipped` refusal, or `refused — capture in flight`). **A `capturing` line with no
+  partner verdict = the boot ended inside the write; the card's 0-byte file carries that name**
+  (`write_grow` publishes the directory size last, so the entry `create_in_dir` made stays at 0
+  bytes — the interrupted-write signature, not a mystery file). A second press that lands while a
+  capture is in flight is decoded from inside that capture's own storage drain and re-arms the
+  request; it runs as the next capture, never as a second concurrent one (the `IN_FLIGHT` door).
 
   Two files, two indices — the no-overwrite rule doing its job. Both extract from the image and
   decode cleanly (real zlib, all chunk CRCs, `800 * (1 + 1280*3)` raw bytes each). This exercises
