@@ -1,0 +1,924 @@
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x2d92a8 pg=730
+[ INFO]: crates/bootloader/src/main.rs@805: Allocated kernel at 0x25ab39000
+[ INFO]: crates/bootloader/src/main.rs@925: Found DTB at 0x25f501000, size: 837900 bytes
+[ INFO]: crates/bootloader/src/main.rs@961: boot volume FAT serial 0xde001a13 (extended BPB BS_VolID)
+[ INFO]: crates/bootloader/src/main.rs@1208: JB8[pre-EBS]: FPCI CFG_0=0x01200020 CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@1235: JB8[pre-EBS]: FALCON CPUCTL=0xffffffff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x0000c85f
+[ INFO]: crates/bootloader/src/main.rs@1248: JB8[pre-EBS]: xHC cap=0x01200020 USBSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUARD)
+[ INFO]: crates/bootloader/src/main.rs@1165: JB6: dummy ACPI 2.0 table installed (RSDP @0x25e069000, XSDT @0x25e069040) ? XUSB Falcon teardown w:i:l lt esgerlaf:- smkmiup l
+i�v�eM m(IEnLs2t)a l�l�P�r oRtAoMc oNloIrnmtaelr-fWaBc e+:  T2e7gArBaF 0D5e5v-iBc1eB-8n-G4nCR2E6 -m8a0p4p8e-d7 4:8:F
+3:7:B AtAe2gDrFa :0 d
+ark-window guard — 89 byte(s) dropped pre-map ::
+:: video: edid present=1 hdr=OK sum=OK native=1920x1200 pclk_khz=154120 ext=1 len=256 ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4404ff TTBR0=0x25ad68000 RAM-GiB-mask=0x3fc ::
+:: === butler RESOLVED: unknown -> orin after 2732 unidentified lines over 83.8s (those lines are in unknown.log from 2026-09-05T17:15:02Z; raw.log has the bytes) ===
+tegra: XCARVE-6 carveout exclusion — 6 protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::
+:: tegra:   window[0] [0x26b800000,0x26c180000) 9728 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[1] [0xbe000000,0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[2] [0x26c400000,0x279e00000) 223232 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[3] [0x26c180000,0x26c400000) 2560 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[4] [0x26b5f0000,0x26b7f0000) 2048 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[5] [0x279e00000,0x27a760000) 9600 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac59000) ::
+:: tegra: JM7 — GOP fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4 ::
+:: tegra: JD1 — simple-fb /chosen/framebuffer: 1920x1200 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 — resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x960000] ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: fb L2 repair — 5 block(s) re-mapped in GiB 9 [0x279e00000,0x27a760000) ::
+[panel-owner] panel-ownership-handover from=owner-unknown to=owner-fbcon-panel site=fbcon::init
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d — MIDR=0x410fd421 (r0p1) — reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d — CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a — DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a — /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a — ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 — PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 — handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 — minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 — witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 — BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 — BAR2[0x004] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x008] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 — CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB11 [raw-handoff] — Falcon fw-header census: BAR2+0x1000 (IOCTL_CFGTBL_READ) -> BAR2+0x01c; no xHCI operational register is written ::
+:: tegra: JB11 [raw-handoff] — CNR gate: USBSTS=0x00000011 CNR=0 after 1 poll(s) / ~1 us — READY (mainline waits for exactly this before reading the header) ::
+:: tegra: JB11 [raw-handoff] — fw ident: magic="XUSBFW.." (0x0000574642535558) version_id=0x80050003 (Version: 80.05) ::
+:: tegra: JB11 [raw-handoff] — fw built: created=1676000890 (epoch) = 2023-02-10T03:48:10Z UTC ::
+:: tegra: JB11 [raw-handoff] — fw image: boot_codetag=0x00000000 boot_codesize=51295 B rodata_img_offset=0x00000000 fwimg_len=196608 B cksum=0x000094ba ::
+:: tegra: JB11 [raw-handoff] — fw L2 IMEM: start=0x00000000 end=0x00000000 (span=0 B) ::
+:: tegra: JB11 [raw-handoff] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::
+:: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 — CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 — touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c — XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c — PG 12 ON -> err=0 ::
+:: tegra: JB1c — PG 10 ON -> err=0 ::
+:: tegra: JB1c — CLK 267 enable -> err=0 ::
+:: tegra: JB1c — CLK 269 enable -> err=0 ::
+:: tegra: JB1c — CLK 268 enable -> err=0 ::
+:: tegra: JB1c — CLK 275 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 272 enable -> err=0 ::
+:: tegra: JB1c — CLK 103 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 100 enable -> err=0 ::
+:: tegra: JB1c — probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a — port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a — port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a — port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a — port survey done (8 ports scanned) ::
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+[uvug7] ms clock: CNTFRQ=31250000 Hz (=31250 kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent; sys_getinfo ticks=CNTVCT/(CNTFRQ/250)=125000 (NOT the per-core-summed tick counter)
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD — DTB /reserved-memory contributed 3 carveout range(s) (cap 48) to the exclusion set ::
+:: tegra: DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property = 0x0 / 0x0; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::
+:: tegra: HEAP-GUARD — kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 165 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: tegra: [net4B] Normal-NC DMA window reserved [0x268000000, 0x268200000) (2048 KiB), carved just below the heap in the same clean+DMA span ::
+:: KERNEL HEAP ALLOCATED ::
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+[wc-a] create win=1 asid=0xffffff02 surf=640x400 stride=2560 scale=1x at (640,417) z=1
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=24 gap=12 face=0xececee keyline=0xb4b4b9 bevels=0xffffff/0xaaaaaf title_act=0xeeeef1->0xe3e3e8 title_ina=0xf4f4f5->0xefeff1 ink=0x252629/0x7a7a7e ctrls=0x3d5f92/0x678cba/0x92aac9 gloss_q16=9175/32768/0 desktop=0x2d2b55
+[crispy] ramp act row0=0xf0f0f3 rowN=0xe3e3e8 ina row0=0xf6f6f6 rowN=0xefeff1
+[ceramic] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+[knurl] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=24 tile=4x4 hash=0x56957202a422b4b1
+[wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x54662d00b00cac85 civac=0x54662d00b00cac85 after=0x54662d00b00cac85 fbbad=0/256000 occluded=0 occ=0/0 us=59667 rectscan_us=5555 slow=yes -> CLEAN
+[wc-g] prof win=1 seq=0 surf_bytes=1024000 cks_blit_us=1551 civac_us=1662 cks_after_us=1551 probes=256000 readback_us=1117
+[wc-h] win=1 box=650x444 span=444 band=no bytes=1154400 compose_us=59255 present_us=300 rectscan_us=6166 torn=no -> BUFFERED
+[wc-b] win=1 span=444 bh=444 bands=1 chrome_paints=1 chrome_rows=844 chrome_rows_used=844 amp=1.00x -> WHOLE
+[wc-b] rollup presents=1 banded=0 maxbands=1 chrome_rows=844 chrome_rows_used=844 amp=1.00x -> UNBANDED
+[wc-a] composite windows=1 drawn=1
+[dock] live passes=1 paints=0 rate=0/1k scan=66cyc/2us paint=0cyc/0us px/paint=0 clob=0 presses=0 raises=0 unhides=0
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[wc-g] win=1 seq=1 own=yes scale=1x app=0x54662d00b00cac85 blit=0x54662d00b00cac85 civac=0x54662d00b00cac85 after=0x54662d00b00cac85 fbbad=0/256000 occluded=0 occ=0/0 us=979 rectscan_us=5555 slow=no -> CLEAN
+[wc-g] prof win=1 seq=1 surf_bytes=1024000 cks_blit_us=1552 civac_us=1584 cks_after_us=1551 probes=256000 readback_us=1150
+[wc-h] win=1 staged=no reason=fixture -> DIRECT
+[wc-d] verify win=1 surf=640x400 band=none scale=1x at (640,417) panel=1920x1200 checked=256000 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=256000 occluded=0 occ=0/0 cksum=0x54662d00b00cac85 first=none fills=0->0 fact=0/0 desk=0->0 dact=0/0 stable=yes -> PASS
+[wcn] win=1 asid=0xffffff02 live=yes above=yes att=1 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.0/s active=0ms parked=0ms gap=0..0ms z=1 pre=2 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=1 att=1 comp=2 hid=0 bel=0 stale=0 passes=2 aborted=0 att_rate=0.0/s comp_rate=0.0/s span=22473ms -> LIVE
+[comp2] rollup passes=2 pass_us=103613 max_us=139923 sprite_us=2646 wait_us=4 blit_us=94125 compose_us=30062 present_us=301 cache_us=160 bytes_pp=1731600 dmg_px_pp=432900 box_px_pp=432900 straddle_us=0 wcd_us=28028 util_pct=0 rate=0.0/s span=22473ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=22473ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=2 -> INERT
+[noatt] scope=live passes=2 seeds=2 noatt=1 noatt_kpx=281 rate=0.0/s taker=0 span=22473ms -> UNATTRIBUTED
+[wcpar] cores=1 total=2 max=2 c0=2 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=22473ms
+[orinwm1] win=1 panel=1920x1200 surf=640x400 box=650x444 at (635,378) scale=1 stage=4194304 present=Composited -> COMPOSITED
+[orinchrome] probe=kl_top at (960,378) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=kl_bot at (960,821) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=kl_left at (635,600) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=kl_right at (1284,600) got=0xb4b4b9 want=0xb4b4b9 -> MATCH
+[orinchrome] probe=bev_lt at (960,379) got=0xffffff want=0xffffff -> MATCH
+[orinchrome] probe=bev_sh at (960,820) got=0xaaaaaf want=0xaaaaaf -> MATCH
+[orinchrome] win=1 box=650x444 at (635,378) frame=6/6 content=0xff00ff@(960,617) MATCH strip=0xf1f1f3 face=0xe9e9eb ctrl=0xf4f4f5 (ceramic — raw, compare with [crispy]) -> CHROME-ON-GLASS
+:: tegra: JB3 — DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 — census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b — usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b — attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g — no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b — programming interrupter + rings (runtime regs) ::
+:: X200: xhci pointer-programming begins t=710148061 (cntpct) ::
+xHCI: CNR cleared after 1 polls
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+[xhciint] ERDP initialized to 0x00000002688c7540 (hi-first, EHB clear)
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2688c8580
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2688c9000 (heap PA in [0x2683ca000,0x26b3ca000))
+xHCI: CRCR set to 0x2688c6541
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: [aarch64] RS=1 witness: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 CNR=0 HCE=0) CRCR=0x0000000000000000(CRR=0 CS=0 CA=0 RCS=0) DCBAAP=0x00000002688c8580 DCBAAP_raw64=0x00000002688c8580
+xHCI: [aarch64] RS=1 witness: IR0=0x3630020 IMAN=0x3(IP=1 IE=1) ERSTSZ=1 ERSTBA=0x00000002688c8540 ERDP=0x00000002688c7548(EHB=1) ERST[0].ring=0x00000002688c7540
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan (settle_ms=150)
+xHCI: ccs-margin settle_ms=150 ppc=0 ports=8 first_assert_ms=[p1:0/pre p2:none/pre p3:none/on p4:none/on p5:none/pre p6:0/pre p7:0/pre p8:none/pre] latest=0 margin_ms=150 result=CCSMARGIN
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+:: X200: xhci RS=1 (controller may DMA from here) t=719975200 (cntpct) ::
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 11 (was not enabled — fine).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled — fine).
+:: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2688c65c0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2688cd000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2688c9040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2688c65d0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: HUB slot 1 port 1: device connected; enumerating...
+xHCI: HUB port 1 SS link trained (status 0x300203 PLS=0 U0, 1 polls, 2625545 cyc, attempt 0)
+xHCI: HUB port 1 reset OK (status 0x300203, warm reset, xHCI speed 4)
+xHCI: HUB slot 1 port 1 is a SuperSpeed port (speed forced to SS).
+xHCI: HUB downstream slot 2 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 2, bulk in 0x82/1024 out 0x1/1024) <<<
+xHCI: Configuring Bulk Endpoints for Slot 2 (IN 0x82 dci5 mps1024, OUT 0x1 dci2 mps1024)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 2). Storage ready.
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2688c6630, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: Proceeding to Address Device (Slot 3, Port 6)...
+xHCI: Addressing Device (Slot 3, Port 6)...
+xHCI: DCBAAP[3] linked to 0x2688d93c0
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2688d8b80
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2688c6640, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: >>> SLOT 3 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 3...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 3
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 3) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 3) ===
+xHCI: HUB slot 3 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 3 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 3 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 3 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+xHCI: HUB slot 3 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1c4f pid=0034 (route 0x2 tier 1)
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x81, MPS: 4, Interval: 10, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (mouse(rel)) in one Configure-Endpoint (max DCI 3).
+xHCI: [Event] Command Completion. Ptr=0x2688c6680, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: HUB slot 3 port 4: device connected; enumerating...
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x81 mps=4 interval=10 == witness ::
+:: MOUSE-1: 1 reports, last dx=0 dy=0 buttons=0x00 == witness ::
+xHCI: HUB port 4 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 5 device class=0x0 vid=1c4f pid=0002 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 3, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 5 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2688c66b0, Slot=5, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 5
+xHCI: HID Endpoints Configured (Slot 5). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 5
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=3 interval=10 == witness ::
+xHCI: HUB slot 3 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 3 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 5, iface 0).
+[hidkeys] set-idle ok slot=5 iface=0
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 4, iface 0).
+xHCI: [enum port 7] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 7...
+xHCI: [enum port 7] stage -> enable-slot
+:: tegra: JB2b — keyboard ARMED (slot 5, root port 6) -> PASS ::
+xHCI: [Event] Command Completion. Ptr=0x2688c66d0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: Proceeding to Address Device (Slot 6, Port 7)...
+xHCI: Addressing Device (Slot 6, Port 7)...
+xHCI: DCBAAP[6] linked to 0x2688dc780
+xHCI: Port 7 speed 1 -> EP0 MPS 8
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2688dbf40
+xHCI: [enum port 7] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2688c66e0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: >>> SLOT 6 ENABLED & ADDRESSED <<<
+xHCI: [tegra fs-mps] slot 6 (FS port 7): learning MPS0 before full descriptor.
+xHCI: [enum port 7] stage -> fs-mps-learn
+xHCI: [tegra fs-mps] slot 6 bMaxPacketSize0 = 64
+xHCI: [tegra fs-mps] slot 6 EP0 MPS0 -> 64 (Evaluate Context OK)
+xHCI: Requesting Device Descriptor for Slot 6...
+xHCI: [enum port 7] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 6
+>>> VENDOR ID : [13d3]
+>>> PRODUCT ID: [3549]
+xHCI: Device Found. Class=0xe0 Sub=0x1 Proto=0x1
+xHCI: no driver for device class 0xe0 (slot 6, 13d3:3549); releasing port.
+xHCI: Port enumeration queue drained.
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 2)
+:: BOT: pump budget=450000000 used=396 peak=396 route=0x1 depth=1 slot=2 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: pump budget=450000000 used=36874181 peak=36874181 route=0x1 depth=1 slot=2 n=2 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: deqprobe slot=2 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2688c8c81 -> stopped_epstate=3 stopped_ctxdeq=0x2688c8ce1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position) ::
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+:: BOT: portreg why=bringup port=1 usb3 portsc=0x00001603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=5 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=6 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=7 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+xHCI: storage ready.
+:: SPACE: [wait=1481ms(n=1) setcfg=3ms(n=1) tur=1200ms(n=2) sense=3ms(n=1) inq=27ms(n=1) rdcap=3ms(n=1) pub=75ms(n=1) resid=13ms] {cbw=0ms(n=5) data=11ms(n=3) csw=1180ms(n=5) peak=1179ms@csw} ftdi=0ms(n=0) total=2805ms sum=2792ms per_ms=31250 result=SPACE ::
+:: PIUSB: [piusb35] databuf phys=0x2688e0000 in_trb=0x2688c8c80 cbw=0x2688c8e80 csw=0x2688c8ec0 | rc-inbound=[0x0,0x100000000) offset=0 (1:1) | databuf in_window=false below_3G=false — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool ::
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE:                      
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+:: PIUSB: [piusb25] storage enumerated: slot 2 bulk_in=0x82 bulk_out=0x01 block_size=512 num_blocks=63404032 (30959 MiB) ::
+:: PIUSB: [piusb25] READ(10) LBA0 CSW=Passed residue=0 — first 16 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PIUSB: [piusb25] boot-sector sanity: 0x55AA=true type=unrecognized/raw ::
+:: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW=Passed residue=0 — 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+:: tegra: JB2b — HID: 1 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 — mass storage ready (slot 2); panel shell ls/cat live ::
+:: tegra: JB5 — witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 — inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x1f1d6_0ddd08af SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: JB3 — inst0 CB0: SCTLR=0x0bb8c70e FSR=0x00000000 FAR=0x6fbf_ded3d07e ::
+:: tegra: JB3 — inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x2ef5_f65057da SYNR0=0x0000000a SYNR1=0x00001fe3 (sid=0x1fe3) ::
+:: tegra: JB3 — inst1 CB0: SCTLR=0x29bfc70a FSR=0x00000000 FAR=0x1f9cb_36bff9fc ::
+:: tegra: JB3 — MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JD2 — EL1 console pump task spawned (boot core) ::
+:: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or newer); CPU_ON known-good on this firmware per the SMP-2 bench ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 0 aff=0x00000000 (BSP) (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 1 aff=0x00000100 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 2 aff=0x00000200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 3 aff=0x00000300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 4 aff=0x00010200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 5 aff=0x00010300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25aca06c8) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac59000) ::
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac59000) ::
+:: AARCH64 SMP: AP 2 online (aff=0x00000200) ::
+:: AARCH64 SMP: c2 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25aca06c8) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25aca06c8) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac59000) ::
+:: AARCH64 SMP: AP 3 online (aff=0x00000300) ::
+:: AARCH64 SMP: c3 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac59000) ::
+:: AARCH64 SMP: AP 4 online (aff=0x00010200) ::
+:: AARCH64 SMP: c4 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25aca06c8) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25aca06c8) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac59000) ::
+:: AARCH64 SMP: AP 5 online (aff=0x00010300) ::
+:: AARCH64 SMP: c5 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 1 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 2 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 3 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 4 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 5 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI OK (5 online APs pinged, 5 delivered; BSP ipi 1 -> 6) ::
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+:: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::
+:: tegra: JM6b pre-drop — HCR_EL2=0x88000038 MMFR1.VH=1 TTBR0_EL1=0x25ad69000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x25ad60003 ::
+:: tegra: JM6b — EL1 landing: CurrentEL=1 SCTLR_EL1=0x30d01805 ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: AARCH64 exception vectors installed (VBAR_EL1 = 0x25ac59000) ::
+:: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 on cpu 0 (~100 ms window; CORE-LOCAL, other cores' periodic PPI30 is NOT this proof) ::
+:: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880896cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] pre-arm GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=0 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=1023 ::
+:: [irqel2a] armed cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x1 ENABLE=1 IMASK=0 ISTATUS=0 CVAL-CNTPCT=124997cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] armed GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=1 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=30 ::
+:: IRQEL-RT: first IRQ taken at EL1 on cpu 0 — banked vector path live (ELR_EL1 bank) ::
+:: TEGRA-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA 0x2688ed000, 8 slots ::
+:: M6c: user blob loaded (51 bytes) ::
+:: M6b: user code page EL0-RX/EL1-RO (AT probe: EL0-read OK, EL1-write denied) ::
+:: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x7800000000 sp 0x7800004000 ::
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+[orinconwin] gate panel=1920x1200x4 stage=4194304 table=1 dock=GRANTED route=UNROUTED orindesk=1 orinclick=1 rows=12
+[wc-a] create win=2 asid=0xffffff01 surf=1295x736 stride=5180 scale=1x at (312,197) z=2
+[wc-g] win=2 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x7266f9d6972a5d25 civac=0x7266f9d6972a5d25 after=0x7266f9d6972a5d25 fbbad=0/953120 occluded=0 occ=0/0 us=5407 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=2 seq=0 surf_bytes=3812480 cks_blit_us=7336 civac_us=7710 cks_after_us=7335 probes=953120 readback_us=5263
+[wc-h] win=2 box=1305x780 span=780 band=no bytes=4071600 compose_us=3994 present_us=1071 rectscan_us=10833 torn=no -> BUFFERED
+[wc-b] win=2 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+[wc-b] rollup presents=3 banded=0 maxbands=1 chrome_rows=3204 chrome_rows_used=3204 amp=1.00x -> UNBANDED
+[dock] live passes=4 paints=1 rate=250/1k scan=46cyc/1us paint=1405cyc/44us px/paint=6240 clob=0 presses=0 raises=0 unhides=0
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[panel-owner] panel-ownership-handover from=owner-fbcon-panel to=owner-console-window site=fbcon::panel_console_window_open
+[wc-g] win=2 seq=1 own=yes scale=1x app=0x2ff76a7f4cdaffef blit=0x2ff76a7f4cdaffef civac=0x2ff76a7f4cdaffef after=0x2ff76a7f4cdaffef fbbad=0/953120 occluded=0 occ=0/0 us=542 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=2 seq=1 surf_bytes=3812480 cks_blit_us=7334 civac_us=7462 cks_after_us=7334 probes=953120 readback_us=5219
+[wc-h] win=2 box=1305x780 span=87 band=yes bytes=454140 compose_us=383 present_us=107 rectscan_us=1208 torn=no -> BUFFERED
+[wc-b] win=2 span=87 bh=780 bands=1 chrome_paints=1 chrome_rows=135 chrome_rows_used=135 amp=1.00x -> WHOLE
+[wc-d] verify win=2 surf=1295x736 band=0..48 scale=1x at (312,197) panel=1920x1200 checked=62160 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=3305 occluded=0 occ=0/0 cksum=0x500331d70034df6c first=none fills=0->0 fact=0/0 desk=0->0 dact=0/0 stable=yes -> PASS
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=1 comp=2 hid=0 bel=0 rate=0.1/s comp_rate=0.3/s active=0ms parked=0ms gap=0..0ms z=2 pre=2 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=2 att=1 comp=2 hid=0 bel=0 stale=0 passes=3 aborted=0 att_rate=0.1/s comp_rate=0.3/s span=5582ms -> LIVE
+[comp2] rollup passes=3 pass_us=74217 max_us=116986 sprite_us=1745 wait_us=4 blit_us=68518 compose_us=2729 present_us=758 cache_us=237 bytes_pp=2865780 dmg_px_pp=716445 box_px_pp=1017900 straddle_us=0 wcd_us=35225 util_pct=3 rate=0.5/s span=5582ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5582ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=5 -> INERT
+[noatt] scope=live passes=3 seeds=2 noatt=1 noatt_kpx=994 rate=0.1/s taker=0 span=5582ms -> UNATTRIBUTED
+[wcpar] cores=1 total=3 max=3 c0=3 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5582ms
+[wc-x] console-route first-paint win=2 (glyphs -> window surface, damage-limited)
+[wc-x] console-window win=2 panel=1920x1200 surf=1295x736 box=1305x780 at (307,158) cell=7x16 cols=185 rows=46
+[wc-g] win=2 seq=2 own=yes scale=1x app=0xac8d70719b4bc724 blit=0xac8d70719b4bc724 civac=0xac8d70719b4bc724 after=0xac8d70719b4bc724 fbbad=0/953120 occluded=0 occ=0/0 us=2084 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=2 seq=2 surf_bytes=3812480 cks_blit_us=7332 civac_us=7528 cks_after_us=7335 probes=953120 readback_us=5237
+[wc-h] win=2 box=1305x780 span=304 band=yes bytes=1586880 compose_us=1550 present_us=376 rectscan_us=4222 torn=no -> BUFFERED
+[wc-b] win=2 span=304 bh=780 bands=1 chrome_paints=1 chrome_rows=608 chrome_rows_used=608 amp=1.00x -> WHOLE
+[wc-x] console-window panic-fallback armed win=2 (panic paints the PANEL, not the window)
+[wc-g] win=2 seq=3 own=yes scale=1x app=0x390c8070d592e451 blit=0x390c8070d592e451 civac=0x390c8070d592e451 after=0x390c8070d592e451 fbbad=0/953120 occluded=0 occ=0/0 us=5259 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=2 seq=3 surf_bytes=3812480 cks_blit_us=7334 civac_us=7496 cks_after_us=7334 probes=953120 readback_us=5267
+[wc-g] rollup win=2 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=0 maxus=5407 wit_us=109856 frame_us=16667 -> CLEAN
+[wc-h] win=2 box=1305x780 span=780 band=no bytes=4071600 compose_us=3907 present_us=1016 rectscan_us=10833 torn=no -> BUFFERED
+[wc-b] win=2 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+[wc-h] win=2 box=1305x780 span=780 band=no bytes=4071600 compose_us=3905 present_us=1041 rectscan_us=10833 torn=no -> BUFFERED
+[wc-h] rollup win=2 scope=window emit=1 age_ms=516 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=4 banded=2 lines=5 minspan=87 minspan_bytes=454140 maxpresent_us=1096 minpresent_us=107 presspread=1 presspop=6 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-h] win=2 box=1305x780 span=192 band=yes bytes=1002240 compose_us=968 present_us=225 rectscan_us=2666 torn=no -> BUFFERED
+[wc-h] rollup win=2 scope=window emit=2 age_ms=560 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=4 banded=3 lines=6 minspan=87 minspan_bytes=454140 maxpresent_us=1096 minpresent_us=107 presspread=1 presspop=7 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] win=2 span=192 bh=780 bands=1 chrome_paints=1 chrome_rows=384 chrome_rows_used=384 amp=1.00x -> WHOLE
+[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED
+[orinrender] arm conwin=1 furn=0 tenant=0 click=1 desk=1 (ORIN-RENDER entered on the tegra terminus; §5.2 UNCROSSED — desktop_firmware::activate is NOT called)
+[wc-h] win=2 box=1305x780 span=144 band=yes bytes=751680 compose_us=734 present_us=164 rectscan_us=2000 torn=no -> BUFFERED
+[wc-h] rollup win=2 scope=window-band emit=3 age_ms=638 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=4 banded=4 lines=7 minspan=87 minspan_bytes=454140 maxpresent_us=1096 minpresent_us=107 presspread=1 presspop=8 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+:: PI-DESK: desktop armed — the witness cascade released the panel, furniture may land ::
+[orinrender] spawned tid=4 cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)
+:: AARCH64 SCHED (virt): boot core 0 at EL1 — running the full M4 CAPSTONE cooperatively ::
+:: VUG-HONESTY: parked-core display witness PASS — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::
+:: CAPSTONE: drain witnesses SKIPPED (queue not drained at entry — 4 task(s) pre-staged) ::
+:: AARCH64 SCHED-BAL: work-stealing witness — 0 steals total across 5 online cores, 0 core(s) ran work ::
+:: AARCH64 SCHED-BAL: c0 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c1 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c2 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c3 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c4 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c5 busy=0 steals=0 ::
+:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
+:: SCHED: load c0=--/f=never-folded c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=20
+:: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+:: SCHED: load c0=100%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=20
+:: SVC: EC=0x15 nr=1 — EL0->EL1 syscall path live ::
+hello from EL0
+[el0stkhw] task=2:el0-hello len=16384 hw=3696 headroom=12688 loguard=0
+:: TEGRA-EL0: el0-hello round-trip -> PASS ::
+:: UI1: scale=1 cell=8x8 line=12 ::
+[orinrender] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)
+[pstrip] armed cores=6 panel=(0,1096,1920x92) row_h=13 bar=(x=30,w=1824) leds=304 led=5x10 gap=1 bands=8 full=1000 strip_h=12 reserved=104 period=250ms attack=instant decay=1000ms
+[pstrip] src live=6/6 quantum=10 stepres=18px mono=yes PASS
+[wc-w] rollup presents=1 requested_px=0 presented_px=2304000 amp=0.00x full_presents=0 bracketq_met=0 bracketq_busy=0 -> HONOURED
+[u7stk] at=orin-render:pass1 task=4:orin-render sp=0x268de9780 low=0x268de1c80 top=0x268de9c80 len=32768 used=1280 hw=13312 headroom=19456
+[orinrender] census passes=1 presents=1 win=0 declined=1 -> RENDER-LIVE
+:: CAPSTONE: verifying all 6 sync primitives (workers on cores 0 + 0) ::
+[wc-a] create win=3 asid=0xffffff60 surf=1280x168 stride=5120 scale=1x at (15,913) z=3
+[wc-g] win=3 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x46fd96e31cd8a325 civac=0x46fd96e31cd8a325 after=0x46fd96e31cd8a325 fbbad=0/215040 occluded=0 occ=0/0 us=1213 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=3 seq=0 surf_bytes=860160 cks_blit_us=1655 civac_us=1748 cks_after_us=1655 probes=215040 readback_us=1191
+[wc-h] win=3 box=1290x212 span=212 band=no bytes=1093920 compose_us=963 present_us=136 rectscan_us=2944 torn=no -> BUFFERED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,874) view=Pi LED lamps (menu: click `View` for the two faces — first option is the Pi's)
+[wc-g] win=3 seq=1 own=yes scale=1x app=0x50836b75504ab795 blit=0x50836b75504ab795 civac=0x50836b75504ab795 after=0x50836b75504ab795 fbbad=0/215040 occluded=0 occ=0/0 us=1195 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=3 seq=1 surf_bytes=860160 cks_blit_us=1655 civac_us=1752 cks_after_us=1655 probes=215040 readback_us=1192
+[wc-h] win=3 box=1290x212 span=212 band=no bytes=1093920 compose_us=967 present_us=113 rectscan_us=2944 torn=no -> BUFFERED
+[wc-g] win=3 seq=1 own=no scale=1x app=0x50836b75504ab795 blit=0x50836b75504ab795 civac=0x50836b75504ab795 after=0x50836b75504ab795 fbbad=0/215040 occluded=0 occ=0/0 us=1167 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=3 seq=1 surf_bytes=860160 cks_blit_us=1656 civac_us=1684 cks_after_us=1655 probes=215040 readback_us=1184
+[wc-h] win=3 box=1290x212 span=212 band=no bytes=1093920 compose_us=948 present_us=108 rectscan_us=2944 torn=no -> BUFFERED
+[wc-b] rollup presents=27 banded=0 maxbands=1 chrome_rows=13967 chrome_rows_used=13967 amp=1.00x -> UNBANDED
+[wc-d] verify win=3 surf=1280x168 band=none scale=1x at (15,913) panel=1920x1200 checked=215040 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=215040 occluded=0 occ=0/0 cksum=0x50836b75504ab795 first=none fills=0->0 fact=0/0 desk=1->1 dact=0/0 stable=yes -> PASS
+[wc-g] win=3 seq=1 own=no scale=1x app=0x50836b75504ab795 blit=0x50836b75504ab795 civac=0x50836b75504ab795 after=0x50836b75504ab795 fbbad=0/215040 occluded=0 occ=0/0 us=296 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=3 seq=1 surf_bytes=860160 cks_blit_us=1654 civac_us=1684 cks_after_us=1654 probes=215040 readback_us=1190
+[wc-g] rollup win=3 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=0 maxus=1213 wit_us=24864 frame_us=16667 -> CLEAN
+[wc-h] win=3 box=1290x212 span=64 band=yes bytes=330240 compose_us=223 present_us=37 rectscan_us=888 torn=no -> BUFFERED
+[u7stk] at=orin-render:pass2 task=4:orin-render sp=0x268de9780 low=0x268de1c80 top=0x268de9c80 len=32768 used=1280 hw=22256 headroom=10512
+[wc-h] win=3 box=1290x212 span=212 band=no bytes=1093920 compose_us=937 present_us=116 rectscan_us=2944 torn=no -> BUFFERED
+[wc-h] rollup win=3 scope=window emit=1 age_ms=276 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=5 banded=1 lines=5 minspan=64 minspan_bytes=330240 maxpresent_us=136 minpresent_us=37 presspread=1 presspop=6 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: CAPSTONE Semaphore: PASS ::
+:: CAPSTONE Mutex: PASS ::
+:: CAPSTONE Channel: PASS ::
+:: CAPSTONE Condvar: PASS ::
+:: CAPSTONE RwLock: PASS ::
+:: CAPSTONE join: PASS ::
+:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
+[orinrender] census passes=356057 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=930121 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=4 age_ms=2929 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=6 banded=22 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=28 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=36 banded=0 maxbands=1 chrome_rows=17260 chrome_rows_used=17260 amp=1.00x -> UNBANDED
+[orinrender] census passes=1479666 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=2053000 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=38 banded=0 maxbands=1 chrome_rows=17580 chrome_rows_used=17580 amp=1.00x -> UNBANDED
+[orinrender] census passes=2621369 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=5 age_ms=5929 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=6 banded=25 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=31 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=39 banded=0 maxbands=1 chrome_rows=17708 chrome_rows_used=17708 amp=1.00x -> UNBANDED
+[dock] live passes=37 paints=3 rate=81/1k scan=31cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=28 comp=28 hid=0 bel=0 rate=23.4/s comp_rate=23.4/s active=1195ms parked=4630ms gap=17..217ms z=2 pre=28 drg=0 dout=2 dkpx=347 drly=0 q=1.0..13.0
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=2 comp=5 hid=0 bel=0 rate=9.7/s comp_rate=24.3/s active=205ms parked=0ms gap=205..205ms z=3 pre=3 drg=2 dout=0 dkpx=0 drly=0 q=12.3..12.3
+[wcn] rollup scope=live wins=3 att=30 comp=33 hid=0 bel=0 stale=0 passes=32 aborted=0 att_rate=5.2/s comp_rate=5.7/s span=5762ms -> LIVE
+[comp2] rollup passes=32 pass_us=27486 max_us=188361 sprite_us=163 wait_us=2 blit_us=26868 compose_us=1025 present_us=235 cache_us=99 bytes_pp=1081695 dmg_px_pp=270423 box_px_pp=941940 straddle_us=0 wcd_us=87559 util_pct=15 rate=5.5/s span=5762ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=2 overlap=6 span=5762ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=37 -> INERT
+[noatt] scope=live passes=32 seeds=31 noatt=1 noatt_kpx=267 rate=0.1/s taker=0 span=5762ms -> UNATTRIBUTED
+[wcpar] cores=1 total=34 max=34 c0=34 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5762ms
+[orinrender] census passes=3108114 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] win=3 box=1290x212 span=64 band=yes bytes=330240 compose_us=218 present_us=36 rectscan_us=888 torn=no -> BUFFERED
+[wc-h] rollup win=3 scope=window emit=2 age_ms=5992 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=5 banded=2 lines=6 minspan=64 minspan_bytes=330240 maxpresent_us=136 minpresent_us=36 presspread=1 presspop=7 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=41 banded=0 maxbands=1 chrome_rows=19313 chrome_rows_used=19313 amp=1.00x -> UNBANDED
+[orinrender] census passes=3651913 presents=2 win=0 declined=1 -> RENDER-LIVE
+:: UI1: scale=1 cell=8x8 line=12 ::
+[wc-h] rollup win=2 scope=window emit=6 age_ms=8811 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=27 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=34 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=43 banded=0 maxbands=1 chrome_rows=19665 chrome_rows_used=19665 amp=1.00x -> UNBANDED
+:: tegra: JD2 — OUT | UnaOS — Jetson Orin Nano (Tegra234) ::
+:: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
+[wc-w] rollup presents=3 requested_px=0 presented_px=4807680 amp=0.00x full_presents=0 bracketq_met=0 bracketq_busy=0 -> HONOURED
+:: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::
+[orinclick] arm panel=1920x1200 rows=3 compat=0 focus=0x0 pidesk=1 t=30 -> ARMED
+[orinrender] census passes=4176628 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=4759491 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=47 banded=0 maxbands=1 chrome_rows=20273 chrome_rows_used=20273 amp=1.00x -> UNBANDED
+[pstrip] rollup samples=38 redraws=2 skipped=36 srcdelta=1 rate=0.2/s srate=3.8/s gapmax=359ms lat_max_ms=319 period=250ms decay=1000ms
+[wc-h] rollup win=2 scope=window emit=7 age_ms=10890 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=32 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=39 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[pstrip] src live=6/6 quantum=10 stepres=18px mono=yes PASS
+[orinrender] census passes=5310390 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=5891978 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=49 banded=0 maxbands=1 chrome_rows=20657 chrome_rows_used=20657 amp=1.00x -> UNBANDED
+[dock] live passes=46 paints=3 rate=65/1k scan=30cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=9 comp=9 hid=0 bel=0 rate=76.2/s comp_rate=76.2/s active=118ms parked=5885ms gap=18..69ms z=2 pre=9 drg=0 dout=1 dkpx=80 drly=0 q=1.1..4.1
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=1 hid=0 bel=0 rate=0.0/s comp_rate=0.1/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=1 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=9 comp=10 hid=0 bel=0 stale=0 passes=9 aborted=0 att_rate=1.5/s comp_rate=1.6/s span=5969ms -> LIVE
+[comp2] rollup passes=9 pass_us=18222 max_us=55327 sprite_us=0 wait_us=2 blit_us=16902 compose_us=837 present_us=196 cache_us=78 bytes_pp=878853 dmg_px_pp=219713 box_px_pp=1048286 straddle_us=0 wcd_us=0 util_pct=2 rate=1.5/s span=5969ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5969ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=46 -> INERT
+[wcpar] cores=1 total=10 max=10 c0=10 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5969ms
+[orinrender] census passes=6413505 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=8 age_ms=12933 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=34 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=41 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=50 banded=0 maxbands=1 chrome_rows=21105 chrome_rows_used=21105 amp=1.00x -> UNBANDED
+[orinrender] census passes=6969989 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] win=3 box=1290x212 span=64 band=yes bytes=330240 compose_us=213 present_us=37 rectscan_us=888 torn=no -> BUFFERED
+[wc-h] rollup win=3 scope=window emit=3 age_ms=12992 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=5 banded=3 lines=7 minspan=64 minspan_bytes=330240 maxpresent_us=136 minpresent_us=36 presspread=1 presspop=8 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=52 banded=0 maxbands=1 chrome_rows=21423 chrome_rows_used=21423 amp=1.00x -> UNBANDED
+[orinrender] census passes=7522277 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] win=3 box=1290x212 span=64 band=yes bytes=330240 compose_us=222 present_us=37 rectscan_us=888 torn=no -> BUFFERED
+[wc-h] rollup win=3 scope=window-band emit=4 age_ms=13994 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=5 banded=4 lines=8 minspan=64 minspan_bytes=330240 maxpresent_us=136 minpresent_us=36 presspread=1 presspop=9 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=54 banded=0 maxbands=1 chrome_rows=23028 chrome_rows_used=23028 amp=1.00x -> UNBANDED
+[orinrender] census passes=8072808 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=9 age_ms=15932 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=8 banded=36 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=44 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=8635314 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=56 banded=0 maxbands=1 chrome_rows=23476 chrome_rows_used=23476 amp=1.00x -> UNBANDED
+[dock] live passes=51 paints=3 rate=58/1k scan=30cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=5 comp=5 hid=0 bel=0 rate=1.0/s comp_rate=1.0/s active=0ms parked=5000ms gap=0..0ms z=2 pre=5 drg=0 dout=2 dkpx=160 drly=0 q=0.0..0.0
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.4/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=2 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=5 comp=7 hid=0 bel=0 stale=0 passes=5 aborted=0 att_rate=1.0/s comp_rate=1.4/s span=5000ms -> LIVE
+[comp2] rollup passes=5 pass_us=41073 max_us=55841 sprite_us=0 wait_us=1 blit_us=38711 compose_us=1435 present_us=324 cache_us=135 bytes_pp=1536276 dmg_px_pp=384069 box_px_pp=1127292 straddle_us=0 wcd_us=0 util_pct=4 rate=1.0/s span=5000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=51 -> INERT
+[wcpar] cores=1 total=7 max=7 c0=7 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5000ms
+[orinrender] census passes=9156326 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=57 banded=0 maxbands=1 chrome_rows=23892 chrome_rows_used=23892 amp=1.00x -> UNBANDED
+[orinrender] census passes=9734032 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=10 age_ms=18932 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=8 banded=39 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=47 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=58 banded=0 maxbands=1 chrome_rows=24020 chrome_rows_used=24020 amp=1.00x -> UNBANDED
+[orinclick] census seq=1 t=70 up=10s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=10285169 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=353ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-b] rollup presents=61 banded=0 maxbands=1 chrome_rows=24436 chrome_rows_used=24436 amp=1.00x -> UNBANDED
+[orinrender] census passes=10857079 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=11438651 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=11 age_ms=21932 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=8 banded=44 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=52 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=63 banded=0 maxbands=1 chrome_rows=24660 chrome_rows_used=24660 amp=1.00x -> UNBANDED
+[dock] live passes=58 paints=3 rate=51/1k scan=29cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=7 comp=7 hid=0 bel=0 rate=43.4/s comp_rate=43.4/s active=161ms parked=4839ms gap=43..118ms z=2 pre=7 drg=0 dout=0 dkpx=0 drly=0 q=2.6..7.1
+[wcn] rollup scope=live wins=3 att=7 comp=7 hid=0 bel=0 stale=0 passes=7 aborted=0 att_rate=1.3/s comp_rate=1.3/s span=5034ms -> LIVE
+[comp2] rollup passes=7 pass_us=16741 max_us=53834 sprite_us=0 wait_us=1 blit_us=15106 compose_us=435 present_us=96 cache_us=44 bytes_pp=441462 dmg_px_pp=110365 box_px_pp=1017900 straddle_us=0 wcd_us=0 util_pct=2 rate=1.3/s span=5034ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5034ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=58 -> INERT
+[wcpar] cores=1 total=7 max=7 c0=7 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5034ms
+[orinrender] census passes=11948578 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=3 scope=window emit=5 age_ms=21987 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=5 banded=5 lines=8 minspan=64 minspan_bytes=330240 maxpresent_us=136 minpresent_us=36 presspread=1 presspop=10 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=65 banded=0 maxbands=1 chrome_rows=26265 chrome_rows_used=26265 amp=1.00x -> UNBANDED
+[orinrender] census passes=12504332 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=13085601 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=12 age_ms=24932 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=9 banded=46 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=55 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=67 banded=0 maxbands=1 chrome_rows=26585 chrome_rows_used=26585 amp=1.00x -> UNBANDED
+[orinrender] census passes=13643626 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=14226623 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=69 banded=0 maxbands=1 chrome_rows=26905 chrome_rows_used=26905 amp=1.00x -> UNBANDED
+[orinrender] census passes=14804379 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=13 age_ms=27932 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=9 banded=49 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=58 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=70 banded=0 maxbands=1 chrome_rows=27033 chrome_rows_used=27033 amp=1.00x -> UNBANDED
+[dock] live passes=64 paints=3 rate=46/1k scan=29cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=6 comp=6 hid=0 bel=0 rate=1.0/s comp_rate=1.0/s active=0ms parked=6000ms gap=0..0ms z=2 pre=6 drg=0 dout=1 dkpx=80 drly=0 q=0.0..0.0
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=1 hid=0 bel=0 rate=0.0/s comp_rate=0.1/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=1 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=6 comp=7 hid=0 bel=0 stale=0 passes=6 aborted=0 att_rate=1.0/s comp_rate=1.1/s span=6000ms -> LIVE
+[comp2] rollup passes=6 pass_us=25428 max_us=53822 sprite_us=0 wait_us=1 blit_us=23479 compose_us=1008 present_us=240 cache_us=94 bytes_pp=1067720 dmg_px_pp=266930 box_px_pp=1063480 straddle_us=0 wcd_us=0 util_pct=2 rate=1.0/s span=6000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=64 -> INERT
+[wcpar] cores=1 total=7 max=7 c0=7 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6000ms
+[orinrender] census passes=15306569 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinclick] census seq=2 t=110 up=20s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-b] rollup presents=72 banded=0 maxbands=1 chrome_rows=27641 chrome_rows_used=27641 amp=1.00x -> UNBANDED
+[orinrender] census passes=15875693 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=267ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-h] rollup win=2 scope=window emit=14 age_ms=30889 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=9 banded=53 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=62 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=74 banded=0 maxbands=1 chrome_rows=27865 chrome_rows_used=27865 amp=1.00x -> UNBANDED
+[orinrender] census passes=16431193 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=17012867 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=75 banded=0 maxbands=1 chrome_rows=28121 chrome_rows_used=28121 amp=1.00x -> UNBANDED
+[wc-h] rollup win=3 scope=window emit=6 age_ms=30995 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=5 banded=6 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=136 minpresent_us=19 presspread=1 presspop=11 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=17571265 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=15 age_ms=32941 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=10 banded=54 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=64 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=77 banded=0 maxbands=1 chrome_rows=29684 chrome_rows_used=29684 amp=1.00x -> UNBANDED
+[dock] live passes=70 paints=3 rate=42/1k scan=29cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=6 comp=6 hid=0 bel=0 rate=39.7/s comp_rate=39.7/s active=151ms parked=4853ms gap=151..151ms z=2 pre=6 drg=0 dout=2 dkpx=134 drly=0 q=9.1..9.1
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.3/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=2 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=6 comp=8 hid=0 bel=0 stale=0 passes=6 aborted=0 att_rate=1.1/s comp_rate=1.5/s span=5006ms -> LIVE
+[comp2] rollup passes=6 pass_us=25515 max_us=56049 sprite_us=0 wait_us=1 blit_us=23599 compose_us=1163 present_us=266 cache_us=109 bytes_pp=1243900 dmg_px_pp=310975 box_px_pp=1109060 straddle_us=0 wcd_us=0 util_pct=3 rate=1.1/s span=5006ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5006ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=70 -> INERT
+[wcpar] cores=1 total=8 max=8 c0=8 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5006ms
+[orinrender] census passes=18070148 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=18651010 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=80 banded=0 maxbands=1 chrome_rows=30413 chrome_rows_used=30413 amp=1.00x -> UNBANDED
+[orinrender] census passes=19227222 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=16 age_ms=35936 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=10 banded=57 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=67 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=81 banded=0 maxbands=1 chrome_rows=30541 chrome_rows_used=30541 amp=1.00x -> UNBANDED
+[orinrender] census passes=19785198 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=20367675 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=83 banded=0 maxbands=1 chrome_rows=30861 chrome_rows_used=30861 amp=1.00x -> UNBANDED
+[orinrender] census passes=20945496 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=17 age_ms=38936 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=10 banded=60 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=70 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=84 banded=0 maxbands=1 chrome_rows=30989 chrome_rows_used=30989 amp=1.00x -> UNBANDED
+[dock] live passes=76 paints=3 rate=39/1k scan=28cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=6 comp=6 hid=0 bel=0 rate=1.0/s comp_rate=1.0/s active=0ms parked=6000ms gap=0..0ms z=2 pre=6 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=6 comp=6 hid=0 bel=0 stale=0 passes=6 aborted=0 att_rate=1.0/s comp_rate=1.0/s span=5998ms -> LIVE
+[comp2] rollup passes=6 pass_us=19743 max_us=53912 sprite_us=0 wait_us=1 blit_us=17834 compose_us=524 present_us=116 cache_us=53 bytes_pp=528960 dmg_px_pp=132240 box_px_pp=1017900 straddle_us=0 wcd_us=0 util_pct=1 rate=1.0/s span=5998ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5998ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=76 -> INERT
+[wcpar] cores=1 total=6 max=6 c0=6 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5998ms
+[orinclick] census seq=3 t=150 up=30s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-h] rollup win=3 scope=window emit=7 age_ms=38142 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=6 banded=7 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=13 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=21429190 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=258ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-b] rollup presents=89 banded=0 maxbands=1 chrome_rows=34970 chrome_rows_used=34970 amp=1.00x -> UNBANDED
+[orinrender] census passes=21996066 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=22578803 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=18 age_ms=41936 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=12 banded=63 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=75 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=92 banded=0 maxbands=1 chrome_rows=35322 chrome_rows_used=35322 amp=1.00x -> UNBANDED
+[orinrender] census passes=23136213 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=23717607 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=94 banded=0 maxbands=1 chrome_rows=35642 chrome_rows_used=35642 amp=1.00x -> UNBANDED
+[orinrender] census passes=24294004 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=19 age_ms=44936 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=12 banded=66 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=78 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=95 banded=0 maxbands=1 chrome_rows=35770 chrome_rows_used=35770 amp=1.00x -> UNBANDED
+[dock] live passes=84 paints=3 rate=35/1k scan=28cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=8 comp=8 hid=0 bel=0 rate=39.8/s comp_rate=39.8/s active=201ms parked=5799ms gap=47..154ms z=2 pre=8 drg=0 dout=3 dkpx=427 drly=0 q=2.8..9.2
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=3 hid=0 bel=0 rate=0.0/s comp_rate=0.5/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=3 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=8 comp=11 hid=0 bel=0 stale=0 passes=8 aborted=0 att_rate=1.3/s comp_rate=1.8/s span=6000ms -> LIVE
+[comp2] rollup passes=8 pass_us=19774 max_us=53923 sprite_us=0 wait_us=1 blit_us=18236 compose_us=1519 present_us=350 cache_us=145 bytes_pp=1638487 dmg_px_pp=409621 box_px_pp=1120455 straddle_us=0 wcd_us=0 util_pct=2 rate=1.3/s span=6000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=84 -> INERT
+[wcpar] cores=1 total=11 max=11 c0=11 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6000ms
+[orinrender] census passes=24794356 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=25375908 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=97 banded=0 maxbands=1 chrome_rows=36410 chrome_rows_used=36410 amp=1.00x -> UNBANDED
+[orinrender] census passes=25952445 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=20 age_ms=47936 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=12 banded=69 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=81 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=98 banded=0 maxbands=1 chrome_rows=36538 chrome_rows_used=36538 amp=1.00x -> UNBANDED
+[orinrender] census passes=26509453 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinclick] census seq=4 t=190 up=40s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-b] rollup presents=100 banded=0 maxbands=1 chrome_rows=36858 chrome_rows_used=36858 amp=1.00x -> UNBANDED
+[orinrender] census passes=27078429 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=250ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-h] rollup win=2 scope=window emit=21 age_ms=50889 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=12 banded=73 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=85 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=102 banded=0 maxbands=1 chrome_rows=37082 chrome_rows_used=37082 amp=1.00x -> UNBANDED
+[dock] live passes=91 paints=3 rate=32/1k scan=28cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=7 comp=7 hid=0 bel=0 rate=45.4/s comp_rate=45.4/s active=154ms parked=5799ms gap=154..154ms z=2 pre=7 drg=0 dout=0 dkpx=0 drly=0 q=9.2..9.2
+[wcn] rollup scope=live wins=3 att=7 comp=7 hid=0 bel=0 stale=0 passes=7 aborted=0 att_rate=1.1/s comp_rate=1.1/s span=5953ms -> LIVE
+[comp2] rollup passes=7 pass_us=17003 max_us=53992 sprite_us=0 wait_us=1 blit_us=15362 compose_us=484 present_us=108 cache_us=49 bytes_pp=489188 dmg_px_pp=122297 box_px_pp=1017900 straddle_us=0 wcd_us=0 util_pct=2 rate=1.1/s span=5953ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5953ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=91 -> INERT
+[wcpar] cores=1 total=7 max=7 c0=7 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5953ms
+[orinrender] census passes=27630233 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=28211988 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=103 banded=0 maxbands=1 chrome_rows=38598 chrome_rows_used=38598 amp=1.00x -> UNBANDED
+[wc-h] rollup win=3 scope=window emit=8 age_ms=51079 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=6 banded=10 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=16 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=28769169 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=22 age_ms=53017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=13 banded=74 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=87 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=105 banded=0 maxbands=1 chrome_rows=38911 chrome_rows_used=38911 amp=1.00x -> UNBANDED
+[orinrender] census passes=29326944 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=29910192 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=107 banded=0 maxbands=1 chrome_rows=39231 chrome_rows_used=39231 amp=1.00x -> UNBANDED
+[orinrender] census passes=30488136 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=23 age_ms=56017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=13 banded=77 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=90 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=108 banded=0 maxbands=1 chrome_rows=39359 chrome_rows_used=39359 amp=1.00x -> UNBANDED
+[dock] live passes=96 paints=3 rate=31/1k scan=28cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=5 comp=5 hid=0 bel=0 rate=0.9/s comp_rate=0.9/s active=0ms parked=5128ms gap=0..0ms z=2 pre=5 drg=0 dout=1 dkpx=80 drly=0 q=0.0..0.0
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=1 hid=0 bel=0 rate=0.0/s comp_rate=0.1/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=1 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=5 comp=6 hid=0 bel=0 stale=0 passes=5 aborted=0 att_rate=0.9/s comp_rate=1.1/s span=5128ms -> LIVE
+[comp2] rollup passes=5 pass_us=30470 max_us=53998 sprite_us=0 wait_us=1 blit_us=28138 compose_us=1173 present_us=274 cache_us=107 bytes_pp=1231152 dmg_px_pp=307788 box_px_pp=1072596 straddle_us=0 wcd_us=0 util_pct=2 rate=0.9/s span=5128ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5128ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=96 -> INERT
+[wcpar] cores=1 total=6 max=6 c0=6 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5128ms
+[orinrender] census passes=30990335 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=31572633 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=110 banded=0 maxbands=1 chrome_rows=39967 chrome_rows_used=39967 amp=1.00x -> UNBANDED
+[orinrender] census passes=32150314 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=24 age_ms=59017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=13 banded=80 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=93 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=111 banded=0 maxbands=1 chrome_rows=40095 chrome_rows_used=40095 amp=1.00x -> UNBANDED
+[orinclick] census seq=5 t=230 up=50s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-h] rollup win=3 scope=window emit=9 age_ms=58219 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=10 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=17 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=32682248 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=39 redraws=0 skipped=39 srcdelta=0 rate=0.0/s srate=3.9/s gapmax=328ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-b] rollup presents=116 banded=0 maxbands=1 chrome_rows=42439 chrome_rows_used=42439 amp=1.00x -> UNBANDED
+[orinrender] census passes=33251789 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=33834762 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=25 age_ms=62017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=14 banded=84 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=98 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=118 banded=0 maxbands=1 chrome_rows=42663 chrome_rows_used=42663 amp=1.00x -> UNBANDED
+[dock] live passes=104 paints=3 rate=28/1k scan=28cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=8 comp=8 hid=0 bel=0 rate=28.6/s comp_rate=28.6/s active=279ms parked=5721ms gap=128..151ms z=2 pre=8 drg=0 dout=2 dkpx=347 drly=0 q=7.7..9.1
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.3/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=2 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=8 comp=10 hid=0 bel=0 stale=0 passes=8 aborted=0 att_rate=1.3/s comp_rate=1.6/s span=6000ms -> LIVE
+[comp2] rollup passes=8 pass_us=19633 max_us=54090 sprite_us=0 wait_us=1 blit_us=18126 compose_us=1056 present_us=235 cache_us=102 bytes_pp=1130017 dmg_px_pp=282504 box_px_pp=1086270 straddle_us=0 wcd_us=0 util_pct=2 rate=1.3/s span=6000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=104 -> INERT
+[wcpar] cores=1 total=10 max=10 c0=10 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6000ms
+[orinrender] census passes=34334602 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=34915617 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=120 banded=0 maxbands=1 chrome_rows=43303 chrome_rows_used=43303 amp=1.00x -> UNBANDED
+[orinrender] census passes=35492124 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=26 age_ms=65017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=14 banded=87 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=101 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=121 banded=0 maxbands=1 chrome_rows=43431 chrome_rows_used=43431 amp=1.00x -> UNBANDED
+[orinrender] census passes=36049204 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=36630651 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=123 banded=0 maxbands=1 chrome_rows=43751 chrome_rows_used=43751 amp=1.00x -> UNBANDED
+[orinrender] census passes=37207094 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=27 age_ms=68017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=14 banded=90 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=104 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=124 banded=0 maxbands=1 chrome_rows=43879 chrome_rows_used=43879 amp=1.00x -> UNBANDED
+[dock] live passes=110 paints=3 rate=27/1k scan=27cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=6 comp=6 hid=0 bel=0 rate=1.0/s comp_rate=1.0/s active=0ms parked=6000ms gap=0..0ms z=2 pre=6 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=6 comp=6 hid=0 bel=0 stale=0 passes=6 aborted=0 att_rate=1.0/s comp_rate=1.0/s span=6000ms -> LIVE
+[comp2] rollup passes=6 pass_us=19844 max_us=54178 sprite_us=0 wait_us=1 blit_us=17919 compose_us=519 present_us=115 cache_us=53 bytes_pp=528960 dmg_px_pp=132240 box_px_pp=1017900 straddle_us=0 wcd_us=0 util_pct=1 rate=1.0/s span=6000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=110 -> INERT
+[wcpar] cores=1 total=6 max=6 c0=6 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6000ms
+[orinrender] census passes=37718433 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=3 scope=window emit=10 age_ms=68068 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=12 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=19 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinclick] census seq=6 t=270 up=60s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-b] rollup presents=127 banded=0 maxbands=1 chrome_rows=45922 chrome_rows_used=45922 amp=1.00x -> UNBANDED
+[orinrender] census passes=38268383 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=251ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-h] rollup win=2 scope=window emit=28 age_ms=70889 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=15 banded=93 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=108 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=130 banded=0 maxbands=1 chrome_rows=46235 chrome_rows_used=46235 amp=1.00x -> UNBANDED
+[orinrender] census passes=38821525 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=39404672 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=132 banded=0 maxbands=1 chrome_rows=46555 chrome_rows_used=46555 amp=1.00x -> UNBANDED
+[orinrender] census passes=39982357 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=29 age_ms=73017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=15 banded=96 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=111 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=133 banded=0 maxbands=1 chrome_rows=46683 chrome_rows_used=46683 amp=1.00x -> UNBANDED
+[dock] live passes=117 paints=3 rate=25/1k scan=27cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=7 comp=7 hid=0 bel=0 rate=25.0/s comp_rate=25.0/s active=280ms parked=4720ms gap=128..152ms z=2 pre=7 drg=0 dout=2 dkpx=134 drly=0 q=7.7..9.1
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.4/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=2 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=7 comp=9 hid=0 bel=0 stale=0 passes=7 aborted=0 att_rate=1.4/s comp_rate=1.8/s span=5000ms -> LIVE
+[comp2] rollup passes=7 pass_us=21915 max_us=54173 sprite_us=0 wait_us=1 blit_us=20213 compose_us=1027 present_us=231 cache_us=97 bytes_pp=1090062 dmg_px_pp=272515 box_px_pp=1096037 straddle_us=0 wcd_us=0 util_pct=3 rate=1.4/s span=5000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=117 -> INERT
+[wcpar] cores=1 total=9 max=9 c0=9 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5000ms
+[orinrender] census passes=40483300 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=41065014 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=135 banded=0 maxbands=1 chrome_rows=47323 chrome_rows_used=47323 amp=1.00x -> UNBANDED
+[orinrender] census passes=41642766 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=30 age_ms=76017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=15 banded=99 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=114 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=136 banded=0 maxbands=1 chrome_rows=47451 chrome_rows_used=47451 amp=1.00x -> UNBANDED
+[orinrender] census passes=42200669 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=42783181 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=138 banded=0 maxbands=1 chrome_rows=47771 chrome_rows_used=47771 amp=1.00x -> UNBANDED
+[orinrender] census passes=43359466 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=31 age_ms=79017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=15 banded=102 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=117 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=139 banded=0 maxbands=1 chrome_rows=47899 chrome_rows_used=47899 amp=1.00x -> UNBANDED
+[dock] live passes=123 paints=3 rate=24/1k scan=27cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=6 comp=6 hid=0 bel=0 rate=1.0/s comp_rate=1.0/s active=0ms parked=6000ms gap=0..0ms z=2 pre=6 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=6 comp=6 hid=0 bel=0 stale=0 passes=6 aborted=0 att_rate=1.0/s comp_rate=1.0/s span=6000ms -> LIVE
+[comp2] rollup passes=6 pass_us=19863 max_us=54272 sprite_us=0 wait_us=1 blit_us=17940 compose_us=523 present_us=116 cache_us=53 bytes_pp=528960 dmg_px_pp=132240 box_px_pp=1017900 straddle_us=0 wcd_us=0 util_pct=1 rate=1.0/s span=6000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=123 -> INERT
+[wcpar] cores=1 total=6 max=6 c0=6 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6000ms
+[orinclick] census seq=7 t=310 up=70s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-h] rollup win=3 scope=window emit=11 age_ms=78249 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=14 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=21 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=43842443 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=275ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-b] rollup presents=143 banded=0 maxbands=1 chrome_rows=49792 chrome_rows_used=49792 amp=1.00x -> UNBANDED
+[orinrender] census passes=44414893 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=44997672 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=32 age_ms=82017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=16 banded=106 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=122 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=145 banded=0 maxbands=1 chrome_rows=50016 chrome_rows_used=50016 amp=1.00x -> UNBANDED
+[orinrender] census passes=45555471 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=46138570 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=147 banded=0 maxbands=1 chrome_rows=50336 chrome_rows_used=50336 amp=1.00x -> UNBANDED
+[orinrender] census passes=46716320 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=33 age_ms=85017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=16 banded=109 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=125 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=148 banded=0 maxbands=1 chrome_rows=50464 chrome_rows_used=50464 amp=1.00x -> UNBANDED
+[dock] live passes=131 paints=3 rate=22/1k scan=27cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=8 comp=8 hid=0 bel=0 rate=26.2/s comp_rate=26.2/s active=305ms parked=5695ms gap=128..177ms z=2 pre=8 drg=0 dout=1 dkpx=80 drly=0 q=7.7..10.6
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=1 hid=0 bel=0 rate=0.0/s comp_rate=0.1/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=1 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=8 comp=9 hid=0 bel=0 stale=0 passes=8 aborted=0 att_rate=1.3/s comp_rate=1.5/s span=6000ms -> LIVE
+[comp2] rollup passes=8 pass_us=19280 max_us=54266 sprite_us=0 wait_us=1 blit_us=17801 compose_us=823 present_us=189 cache_us=77 bytes_pp=863430 dmg_px_pp=215857 box_px_pp=1052085 straddle_us=0 wcd_us=0 util_pct=2 rate=1.3/s span=6000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=131 -> INERT
+[wcpar] cores=1 total=9 max=9 c0=9 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6000ms
+[orinrender] census passes=47216401 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=47797296 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=150 banded=0 maxbands=1 chrome_rows=51104 chrome_rows_used=51104 amp=1.00x -> UNBANDED
+[orinrender] census passes=48373554 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=34 age_ms=88017 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=16 banded=112 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=128 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=151 banded=0 maxbands=1 chrome_rows=51232 chrome_rows_used=51232 amp=1.00x -> UNBANDED
+[orinrender] census passes=48931366 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=3 scope=window emit=12 age_ms=88067 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=15 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=22 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinclick] census seq=8 t=350 up=80s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-b] rollup presents=154 banded=0 maxbands=1 chrome_rows=53066 chrome_rows_used=53066 amp=1.00x -> UNBANDED
+[orinrender] census passes=49480811 presents=2 win=0 declined=1 -> RENDER-LIVE
+[pstrip] rollup samples=40 redraws=0 skipped=40 srcdelta=0 rate=0.0/s srate=4.0/s gapmax=250ms lat_max_ms=0 period=250ms decay=1000ms
+[wc-h] rollup win=2 scope=window emit=35 age_ms=90889 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=17 banded=115 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=132 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=157 banded=0 maxbands=1 chrome_rows=53379 chrome_rows_used=53379 amp=1.00x -> UNBANDED
+[dock] live passes=138 paints=3 rate=21/1k scan=27cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=7 comp=7 hid=0 bel=0 rate=39.5/s comp_rate=39.5/s active=177ms parked=5695ms gap=177..177ms z=2 pre=7 drg=0 dout=2 dkpx=160 drly=0 q=10.6..10.6
+[wcn] win=3 asid=0xffffff60 live=yes above=yes att=0 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.3/s active=0ms parked=0ms gap=0..0ms z=3 pre=0 drg=2 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=7 comp=9 hid=0 bel=0 stale=0 passes=7 aborted=0 att_rate=1.1/s comp_rate=1.5/s span=5873ms -> LIVE
+[comp2] rollup passes=7 pass_us=22094 max_us=54229 sprite_us=0 wait_us=1 blit_us=20391 compose_us=1061 present_us=244 cache_us=100 bytes_pp=1133134 dmg_px_pp=283283 box_px_pp=1096037 straddle_us=0 wcd_us=0 util_pct=2 rate=1.1/s span=5873ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5873ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=138 -> INERT
+[wcpar] cores=1 total=9 max=9 c0=9 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5873ms
+[orinrender] census passes=49986510 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=50568322 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=158 banded=0 maxbands=1 chrome_rows=53955 chrome_rows_used=53955 amp=1.00x -> UNBANDED
+[orinrender] census passes=51144565 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=36 age_ms=93034 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=17 banded=117 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=134 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=159 banded=0 maxbands=1 chrome_rows=54083 chrome_rows_used=54083 amp=1.00x -> UNBANDED
+[orinrender] census passes=51702197 presents=2 win=0 declined=1 -> RENDER-LIVE
+[orinrender] census passes=52283801 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=161 banded=0 maxbands=1 chrome_rows=54403 chrome_rows_used=54403 amp=1.00x -> UNBANDED
+[orinrender] census passes=52860294 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=37 age_ms=96034 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=17 banded=120 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=137 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=162 banded=0 maxbands=1 chrome_rows=54531 chrome_rows_used=54531 amp=1.00x -> UNBANDED
+[dock] live passes=143 paints=3 rate=20/1k scan=27cyc/0us paint=2573cyc/82us px/paint=11856 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff01 live=yes above=yes att=5 comp=5 hid=0 bel=0 rate=0.9/s comp_rate=0.9/s active=0ms parked=5145ms gap=0..0ms z=2 pre=5 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=5 comp=5 hid=0 bel=0 stale=0 passes=5 aborted=0 att_rate=0.9/s comp_rate=0.9/s span=5144ms -> LIVE
+[comp2] rollup passes=5 pass_us=23483 max_us=54264 sprite_us=0 wait_us=1 blit_us=21179 compose_us=591 present_us=136 cache_us=60 bytes_pp=601344 dmg_px_pp=150336 box_px_pp=1017900 straddle_us=0 wcd_us=0 util_pct=2 rate=0.9/s span=5144ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5144ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=143 -> INERT
+[wcpar] cores=1 total=5 max=5 c0=5 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5144ms
+[orinrender] census passes=53370382 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=3 scope=window emit=13 age_ms=96085 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=7 banded=17 lines=8 minspan=43 minspan_bytes=221880 maxpresent_us=145 minpresent_us=19 presspread=1 presspop=24 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=53932970 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-b] rollup presents=165 banded=0 maxbands=1 chrome_rows=56621 chrome_rows_used=56621 amp=1.00x -> UNBANDED
+[orinrender] census passes=54507848 presents=2 win=0 declined=1 -> RENDER-LIVE
+[wc-h] rollup win=2 scope=window emit=38 age_ms=99034 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=18 banded=122 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1096 minpresent_us=51 presspread=1 presspop=140 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=167 banded=0 maxbands=1 chrome_rows=56838 chrome_rows_used=56838 amp=1.00x -> UNBANDED
+[orinclick] census seq=9 t=390 up=90s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=55057250 presents=2 win=0 declined=1 -> RENDER-LIVE

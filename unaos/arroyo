@@ -1273,6 +1273,25 @@ fi
 # `pal::EVENT_QUEUE`, and a second drainer would steal the shell's keystrokes.
 # The terms are appended here as well as implied by Cargo so the banner shows what it actually built.
 [ -n "${UNAOS_ORINRENDER:-}" ] && _feats="${_feats}orinrender,desktop_firmware,tegra_el0,tegra,"
+# SERIALRX (ORINRX): UNAOS_ORINRX=1 lets the Orin's serial console RECEIVE — `serial::serialrx::drain`
+# appended to the xHCI poll block of the four tegra console pumps (`jd2_console_pump` x2,
+# `jd2_supstate_phase2`, `kbd_pump_body`) polls UARTC and pushes each byte as `Event::Key`, so a line
+# injected at the bench (`printf 'tste\r' > …/inject.fifo`) echoes as `:: tegra: JD2 — KEY` and runs.
+# DEFAULT OFF: `BASE` is unverified on the board and a wrong BASE means phantom bytes into the shell.
+# Witness on the wire: `[serialrx] lsr=… -> RX-LIVE|RX-ZERO|RX-OPENBUS|RX-DEAD` (once), `[serialrx] rx=`
+# (~1 s). The ARMED polarity is type-checked by the `arm-tegra-orinrx` leg of KERNEL_CFG_MATRIX,
+# never by this mapping. `tegra` appended so the knob is self-sufficient (`orinrx = []` in Cargo).
+[ -n "${UNAOS_ORINRX:-}" ] && _feats="${_feats}orinrx,tegra,"
+# DESKCASCADE: UNAOS_DESKCASCADE=1 gives the Orin the NORMAL desktop, ONE knob, DEFAULT OFF —
+# `main.rs::tegra_desk_cascade` on the tegra terminus line (after the `orinfurn` seam, before
+# `tegra_render_arm`) calls `desktop_firmware::activate()`, the cascade §5.2 held, bracketed by the
+# witness-gated `[u7stk] at=boot-core:pre-cascade` / `post-cascade` boot-stack probes — the number
+# §5.2 has asked for since 2026-08-22. It also flips `TEGRADESK_CASCADE_OK` (a `cfg!` read) so the
+# `tegradesk` seam stops refusing on this image only. Fly with UNAOS_ORINRENDER=1 so the pass presents
+# what it builds; do NOT combine with UNAOS_ORINCONWIN/ORINDESK (the cascade REFUSES a non-empty table).
+# Witness: `[deskcascade] arming cascade`, `[deskcascade] -> CASCADED` / `REFUSE`. Emits real aarch64
+# code, so `arm_features` does not strip it. Type-checked by `arm-tegra-render`.
+[ -n "${UNAOS_DESKCASCADE:-}" ] && _feats="${_feats}deskcascade,desktop_firmware,tegra_el0,tegra,"
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,desktop_firmware,tegra_el0,tegra,"
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
 # ORDINARY Orin boot. This is the one item of the 2026-08-26 `video/` parity survey that an operator
@@ -3084,13 +3103,26 @@ KERNEL_CFG_MATRIX=(
   # {orinrender}: `orinrender = ["desktop_firmware", "tegra_el0"]` and this row already carries both,
   # so a red here is attributable to the new rung and to nothing else. `arm-tegra-furn` was the other
   # candidate and is rejected for that reason — it would have added `orinfurn` to the delta.
+  # DESKCASCADE (2026-09-05) rides this row too: `deskcascade = ["desktop_firmware", "tegra_el0"]`
+  # is self-sufficient in the same way, so the delta grows to {orinrender, deskcascade} and nothing
+  # else; this is the ONLY leg that compiles `tegra_desk_cascade` and the boot-stack probes.
   #
   # PRECONDITION: this row carries `tegra_el0`, which compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin` — supplied by `ensure_user_blob` ahead of the matrix.
   #
   # UNIVERSE SIDE EFFECT: `orinrender` becomes arm-claimed, so it leaves `x86_cfg_universe` and the
   # derived `x86-mix-*` count is unchanged. Board legs 34 -> 35; gate legs 43 -> 44.
-  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender"
+  #
+  # PRTSCR-ORIN (2026-09-05): `holocron` is APPENDED at the end. `main.rs::jd2_console_pump`'s sweep
+  # carries the Orin's one `prtscr::service()` call behind `cfg(feature = "holocron")` — the arming knob
+  # for "this boot may WRITE its boot medium" (`UNAOS_HOLOCRON=1 ./arroyo esp-jetson`; the knob is not
+  # stripped by `arm_features`). Until now NO aarch64 leg carried `holocron` together with `tegra`
+  # (`arm-pi` carries it, but `pi`/`tegra` are mutually exclusive), so that call site was a cfg no leg
+  # compiled — the KNOBLEG hole. Hosted here rather than on a new row because this row is already the
+  # widest tegra desk cross, so the armed key path is type-checked against every desk knob it flies
+  # with. Universe side effect: NONE — `holocron` is named on `x86-all`, so it was never "aarch64-only"
+  # and `x86_cfg_universe` is unchanged.
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
@@ -3116,6 +3148,27 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-orinwdt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinwdt"
+  # SERIALRX (ORINRX) armed (appended 2026-09-05, orin 13) — `orinrx` gates the UART RX drain
+  # appended to the xHCI poll block of the four tegra console pumps, the LSR capture fold in
+  # `tegra::read_byte`, and the `serialrx` tail module in `arch/aarch64/serial.rs`. Every site is
+  # inside `feature = "tegra"` items, so ONLY a leg carrying `tegra` compiles them at all — and no
+  # leg carries `tegra` plus this knob but this one. Without it the ARMED polarity would be compiled
+  # by NOTHING (the orinwdt / bsptick shape; the standing law is that a knob's gates must compile the
+  # configuration the knob turns ON).
+  #
+  # WHY ITS OWN TAIL LEG rather than `,orinrx` appended to `arm-tegra`: `arm-tegra` is the DISARMED
+  # twin and the only leg anywhere that compiles the SHIPPED default jetson image — the image whose
+  # byte-identity to baseline this arc measures. HOSTED ON `arm-tegra-supstate`'s LIST + `orinrx`
+  # rather than `arm-tegra`'s, deliberately: one of the four drain sites lives in
+  # `jd2_supstate_phase2`, which only `supstate` compiles, so hosting on the bare `arm-tegra` list
+  # would leave that site type-checked by no leg. The resolved set grows by EXACTLY {orinrx} over a
+  # leg that is already green, so a red here names the knob and nothing else.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `orinrx` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  "arm-tegra-orinrx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx"
   # ORIN-BSPTICK armed (appended 2026-08-25, Candidate B arc 1) — `bsptick` gates the periodic-EL1-tick
   # block at `arch/aarch64/timer.rs`'s tail (`el1_bsptick_start`, `bsptick_witness`, the two statics),
   # the statement appended to `on_tick`'s closing line, and the statement appended to `main.rs`'s

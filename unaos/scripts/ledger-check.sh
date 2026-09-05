@@ -117,8 +117,8 @@ for path in files:
 
 # Evidence excerpts (pi 6, 2026-09-05): a serial capture is append-only across many boots, so an excerpt
 # without its BOOT ANCHOR is unidentifiable. Every *.log under docs/dev/evidence must carry one:
-# aarch64 `size 0x…` (the Pi loader's kernel8 size line), x86 `img=[…` (the WXN mapped span), or the Orin's
-# UEFI loader identity `KELF min=0x… max=0x…`.
+# aarch64 `size 0x…` (the loader's kernel8 size line), x86 `img=[…` (the WXN mapped span), or the Orin's
+# UEFI loader identity `KELF min=0x… max=0x…` (orin 13, 2026-09-05 — the Orin has no kernel8 size line).
 for lg in sorted(glob.glob("docs/dev/evidence/**/*.log", recursive=True)):
     try: body = open(lg, errors="replace").read()
     except OSError: body = ""

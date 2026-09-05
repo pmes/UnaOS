@@ -216,7 +216,7 @@ unsafe extern "C" {
 /// (whose captured value has M=1 → MMU on) and a final `isb`. The map is identity, so enabling
 /// translation moves neither PC nor SP. This is the EL2 analogue of the proven baremetal
 /// `boot::enable_mmu` (EL1).
-unsafe fn enable_mmu_virt() {
+#[inline(always)] unsafe fn enable_mmu_virt() {
     let c = unsafe { core::ptr::read_volatile(&raw const SEC_CTX) };
     unsafe {
         core::arch::asm!(
@@ -896,7 +896,7 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
     for idx in 0..n_cores {
         AFF_BY_INDEX[idx].store(aff_by_index[idx], Ordering::Relaxed);
     }
-    N_CORES_PUB.store(n_cores as u32, Ordering::Release);
+    N_CORES_PUB.store(n_cores as u32, Ordering::Release); { let a = _secondary_start_virt as *const () as usize; let b = __secondary_rust_virt as *const () as usize; let lo = a.min(b) & !0xfff; let hi = a.max(b).saturating_add(8192); cache::clean_range(lo, hi.saturating_sub(lo).min(1 << 20)); } // APTEXT (orin 13, 2026-09-05; orin-ledger A15): the AP fetches its entry code with the MMU OFF — straight from DRAM, no snoop — while the loader cleaned kernel text only to the PoU (`dc cvau`) and nothing here ever cleaned it to the PoC (SEC_CTX and the stacks are, two lines up; the CODE was not). A text line still dirty in the BSP's cache is garbage to the AP: a wild jump, `Exception reason=1 syndrome=0x82000010` (instruction abort from a lower EL, synchronous external abort), IOB/ACI RAS, `Powering off core` — 5 of 23 historical Orin boots and render3 2/2, all at exactly this step, none with any kernel code of theirs yet run; the toss is the BSP's eviction state and a relink changes it. Clean the MMU-off window's code to the PoC before the first CPU_ON: the asm stub through `__secondary_rust_virt`'s prologue and the inlined `enable_mmu_virt` (8 KiB past its entry is the honest over-bound; no symbol marks its end). ~80 KiB of `dc cvac`, once. REVIEW3 M1: the two symbols are in sections the linker does not order — the range is min..max of both, saturating, capped at 1 MiB, so a relink can never wrap the length. LINE-NEUTRAL append.
 
     let freq = timer::cntfrq();
     let freq = if freq == 0 { 62_500_000 } else { freq };
