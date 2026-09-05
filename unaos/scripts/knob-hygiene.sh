@@ -58,5 +58,21 @@ if [ -n "$dead" ]; then
   echo "GATE-KNOB FAILED — feature declared but named by no cfg (a knob wired to nothing):" >&2
   for f in $dead; do echo "  DEAD: $f" >&2; done
 fi
-[ "$rc" -eq 0 ] && echo "GATE-KNOB: OK — $(printf '%s\n' "$declared" | grep -c .) features declared, $(printf '%s\n' "$used" | grep -c .) named by a cfg, 0 phantom, 0 dead"
+
+# TRAILING-COMMENT PHANTOM (orin 13, 2026-09-05, LEDGER P7): a `#[cfg(...)]` appended AFTER a line's
+# trailing `//` comment is prose. It compiles nothing and `check` stays green — PRTSCR-ORIN shipped that
+# way for two hours; a union merge did it again to ORINRX's census fold. Red when CODE precedes the `//`
+# on the line (so a pure comment or doc-comment line that quotes a cfg expression stays GREEN — the
+# prose fixture again), and `#[cfg(` sits after it.
+# Shape of the hazard, not the word: CODE before the `//`, then `#[cfg(...)]`, then a STATEMENT — an
+# identifier with a call and a `;` (or a block `{`) — still on the same line. A `} // end #[cfg(...)] block`
+# note or a comment that merely mentions a cfg has no statement after the attribute and stays green.
+trailing="$(grep -rn --include='*.rs' -E '^[^/]*[^[:space:]/][^/]*//.*#\[cfg\([^]]*\)\][[:space:]]*[A-Za-z_:][A-Za-z0-9_:]*.*(\(.*\).*;|\{)[[:space:]]*$' "$SRC" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+if [ -n "$trailing" ]; then
+  rc=1
+  echo "GATE-KNOB FAILED — a #[cfg(...)] sits AFTER a trailing // comment on a code line (it is prose; the code it was meant to gate is unconditional or absent):" >&2
+  printf '%s\n' "$trailing" | sed -E 's@^@  TRAILING: @' | cut -c1-160 >&2
+  echo "  FIX: move the attribute (and the statement it guards) BEFORE the comment, on its own line." >&2
+fi
+[ "$rc" -eq 0 ] && echo "GATE-KNOB: OK — $(printf '%s\n' "$declared" | grep -c .) features declared, $(printf '%s\n' "$used" | grep -c .) named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg"
 exit $rc

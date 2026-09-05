@@ -107,8 +107,17 @@ so prose mentioning a feature is a fixture that must stay green.
 at least one cfg. If either side fails, the script exits 2 with no verdict
 rather than reporting zero phantoms.
 
+**Trailing-comment phantom (added 2026-09-05, orin 13's finding, LEDGER P7).** A
+`#[cfg(...)]` appended after a line's trailing `//` comment is prose: it compiles
+nothing and `check` stays green (PRTSCR-ORIN shipped that way for two hours; a
+union merge did it again). The script reds any code line whose `#[cfg(` sits after
+its first `//`. A line that IS a comment (`//` or `///` first) stays green — that
+is the prose fixture, and it is why the check is "code before the comment", not
+"cfg after a slash".
+
 **Goes red when** a cfg names an undeclared feature (`PHANTOM`, with its sites
-listed) or a declared feature is named by no cfg (`DEAD`). **GO-RED proof,
+listed), a declared feature is named by no cfg (`DEAD`), or a `#[cfg(` follows a
+trailing comment on a code line (`TRAILING`). **GO-RED proof,
 recorded in `88fd5175`, four states:** a phantom cfg injected → red naming the
 site; prose quoting a feature name → green (the false-positive fixture); a
 declared-but-unused feature → red; the clean tree → green.
@@ -149,17 +158,31 @@ sha or a scratch path in a paragraph is not a row. Free text is allowed after th
 status word (`open — blocked on Peter's call`). Facts that are not defects have
 no state and belong in a list or the subsystem doc, not in a status table.
 
+**Evidence excerpts and rulings (added the same day, pi 6's two objections).**
+A serial capture is append-only across many boots — `pi.log` holds nine — so
+committing captures is out and citing a line range into an unversioned bench file
+is a citation into nothing (`~/unaos-bench` is not a repository). The convention
+is the EXCERPT: `docs/dev/evidence/<arc>/<id>-<boot>.log`, tens of KB, immutable,
+and every excerpt must carry its boot anchor — the loader's `size 0x…` line on
+aarch64, the `WXN-x86 … img=[…` span on x86 — because a range without the anchor
+rots the moment the capture grows (orin 12 nearly scored a boot-11 fault as
+tonight's that way). The gate reds an anchorless excerpt. `docs/dev/RULINGS.md`
+is checked too: every R-row has `status` ∈ live · superseded · retracted, and a
+superseded row names a real R-id in `superseded-by` — rulings get reversed (the
+cube, EVAC) and an append-only quote file would let a reader find only the dead one.
+
 **Control.** Zero ledger rows found in the files present → exit 2, no verdict.
 
 **Goes red when** an id repeats, a status begins with anything outside the enum,
 an owner is unknown, a `→ S<n>` dangles, a sha is not a commit (or a
 fixed/flown/landed sha is unreachable from every head), or a row cites evidence
-outside git. **GO-RED proof, by tree mutation on the day it shipped, nine
+outside git. **GO-RED proof, by tree mutation on the day it shipped, twelve
 states:** duplicate id → red naming the line; `standing` as a status → red;
 owner `peter` → red; sha `deadbee1` → red; a `~/unaos-bench/scratch` path → red;
 a missing `docs/` path → red; `→ S999` with a `LEDGER.md` present → red; `S99`,
 a sha and a scratch path in a PARAGRAPH → green (the prose control); `flown`
-with a reachable sha → green.
+with a reachable sha → green; an `evidence/*.log` without `size 0x`/`img=[` → red;
+a RULINGS row with status `pending` → red; a `superseded` ruling naming no R-id → red.
 
 **Legitimate update.** Fix the row: pick the enum word, move the evidence into
 `docs/dev/evidence/<arc>/`, name the sha that exists, resolve or drop the

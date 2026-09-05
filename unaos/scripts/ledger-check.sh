@@ -115,6 +115,37 @@ for path in files:
                 elif head in FETCHED and not reachable(s):
                     red.append(f"{where}: {rid} is `{head}` but sha {s} is not an ancestor of any track head")
 
+# Evidence excerpts (pi 6, 2026-09-05): a serial capture is append-only across many boots, so an excerpt
+# without its BOOT ANCHOR is unidentifiable. Every *.log under docs/dev/evidence must carry one:
+# aarch64 `size 0x…` (the loader's kernel8 size line) or x86 `img=[…` (the WXN mapped span).
+for lg in sorted(glob.glob("docs/dev/evidence/**/*.log", recursive=True)):
+    try: body = open(lg, errors="replace").read()
+    except OSError: body = ""
+    if not re.search(r"size 0x[0-9a-fA-F]+|img=\[0x[0-9a-fA-F]+", body):
+        red.append(f"{lg}: evidence excerpt carries no boot anchor (`size 0x…` or `img=[…`) — unidentifiable")
+
+# RULINGS.md (pi 6, 2026-09-05): rulings get reversed (the cube, EVAC); an append-only quote file lets a
+# reader find only the dead one. Every R-row carries status ∈ {live, superseded, retracted} and, when
+# not live, a `superseded-by` that resolves to another R-id (or the word `retracted`).
+if os.path.exists("docs/dev/RULINGS.md"):
+    rtext = open("docs/dev/RULINGS.md").read(); rids = set(); rrows = []
+    for hdr, rows in tables(rtext):
+        st = col(hdr, "status"); sb = col(hdr, "superseded")
+        if st is None: continue
+        for ln, cells in rows:
+            m = re.match(r"(R[0-9]+)", cells[0])
+            if not m: red.append(f"docs/dev/RULINGS.md:{ln}: row id `{cells[0][:20]}` is not R<n>"); continue
+            rids.add(m.group(1)); rrows.append((ln, m.group(1), cells, st, sb))
+        rows_seen += len(rows)
+    for ln, rid, cells, st, sb in rrows:
+        status = re.sub(r"[*_`]", "", cells[st]).strip().lower() if st < len(cells) else ""
+        if status not in ("live", "superseded", "retracted"):
+            red.append(f"docs/dev/RULINGS.md:{ln}: {rid} status `{status[:20]}` not in live|superseded|retracted")
+        if status == "superseded":
+            tgt = re.findall(r"R[0-9]+", cells[sb]) if (sb is not None and sb < len(cells)) else []
+            if not tgt or any(t not in rids for t in tgt):
+                red.append(f"docs/dev/RULINGS.md:{ln}: {rid} is superseded but names no existing R<n> in superseded-by")
+
 for p in skipped: say(f"SKIP {p} — not in this tree (arrives at the trunk sync)")
 if rows_seen == 0:
     say("NO VERDICT — no ledger rows found in", files or "(no ledger files)"); sys.exit(2)
@@ -122,10 +153,12 @@ if red:
     say(f"RED — {len(red)} finding(s) across {len(files)} file(s), {rows_seen} rows:")
     for r in red: print("   ", r)
     sys.exit(1)
-say(f"OK — {rows_seen} rows in {len(files)} file(s): ids unique, status ∈ enum, owners known, cross-refs resolve, shas exist, evidence in git")
+say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, status ∈ enum, owners known, cross-refs resolve, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
 PY
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
 #   `→ S999` in a row      -> RED (dangling), when LEDGER.md is present
 #   sha deadbeef1 in a row -> RED (not a commit)         `~/unaos-bench/scratch/x` in a row -> RED
 #   owner "peter"          -> RED                        `S99` in a PARAGRAPH  -> GREEN (prose control)
+#   evidence/*.log without `size 0x`/`img=[` -> RED      RULINGS R-row status `pending` -> RED
+#   RULINGS `superseded` with no R<n> in superseded-by -> RED
