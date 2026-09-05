@@ -68,7 +68,7 @@ Sources: `od` = `docs/dev/OS/08_VIDEO/orin-desktop.md` · `AC` = `docs/dev/evide
 |---|---|---|---|
 | D1 | Loader `SetMode` to the widest console mode: the 80-col wrap occurs ONLY on F11-menu boots (7/39); auto-boots inherit 240x56 | do it narrowly, knob-gated, before/after witness; one power cycle to test | `docs/dev/evidence/orin13/CONSOLEMODE-ARGUMENT.md` |
 | D2 (→ S7) | `render_service` size-3 family: convergence arc (lift the waiting + input-ownership axes) | owed; ledger entry has an expiry | merge `be3b027e` body |
-| D3 | GA10B: read-only probe rung exists, gates unverified; licensing/bunker ruling pending | Peter | `od` §4; resume |
+| D3 | GA10B: "licensing/bunker ruling pending Peter" was STALE — Peter ruled 2026-08-25 (`docs/MANIFESTO/CLEAN_ROOM_POLICY.md` §6: quarantined Group-A fact extraction over GPL `nvgpu` is admissible; facts only, provenance per fact, terms review before import). The remaining wall is a hardware fact, not a licence: the GA10B microcode is signed and encrypted with boot-ROM verification (`od` §4). Nothing is pending from Peter; a P10 phantom obligation carried from the orin 5 resume through ORIN-HW and this seat's own words twice on 2026-09-05 | dropped — ruled 2026-08-25; the arc, if ever, is a hardware question | CLEAN_ROOM_POLICY.md §6; `od` §4 |
 
 ## E. Landed but unflown (OB table 2) — each with the one question its flight answers
 TABKEY `ac9c0701` · `orintenant` (rung 6) · `orinladder` (a) glyphs-on-glass, (b) minimise round-trip ·
