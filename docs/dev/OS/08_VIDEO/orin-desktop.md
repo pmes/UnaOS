@@ -704,7 +704,11 @@ exists to close.
   legs and a 20-leg gate as of 2026-08-25.** Count the array, do not trust the
   line, and do not trust this number either: it has moved four times in three days.
 
-### §3.6 No aarch64 render service on tegra
+### §3.6 No aarch64 render service on tegra — RESOLVED, see §3.14
+
+*Superseded 2026-09-05.* ORINRENDER (`c61b47e3`, orin 12) added `orin_render_service` on the tegra
+terminus and the six-defect fix flew as `render2` (§3.14). The paragraph below is the original
+finding, kept for the reasoning.
 
 `main.rs:4686`, `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))] fn
 render_service(…)`. Same `baremetal` → `pi` → `compile_error!` chain as §3.2: on
@@ -2964,6 +2968,49 @@ own unlanded arc also touches `video/wm.rs`.
 * **⚠ And no leg can score any of it** — see the finding at the head of this section. The gate
   results above bound compilation, not behaviour.
 
+### §3.14 FLOWN 2026-09-05 (rung 5 core) — the render pass after the audit: six defects fixed, `render2` scored on metal
+
+ORINRENDER (`c61b47e3`) put a render pass on the tegra terminus and flew once as `render1`
+(2026-09-01). The architecture audit (`~/unaos-bench/scratch/orin12/ARCH-CONFORMANCE.md`) then
+found six defects in it. orin 13 fixed all six in four commits on `hw-jetson`, put them through two
+independent adversarial reviews, and flew the result as `render2-20260903T2157Z-8085c9c` (tip
+`8085c9c8`). One boot, pinned by the loader identity line `KELF min=0x0 max=0x2d92a8` — render1's
+was `0x2da2a8` — and scored from that anchor only. Scoring record:
+`~/unaos-bench/scratch/orin13/FLIGHT-RESULT.md`; scorers: `FLIGHT.md` §C.
+
+| # | defect (audit) | fix | commit | on the wire |
+|---|---|---|---|---|
+| 1 | `orin-render` on the blanket 16 KiB stack; traversed its redzone on pass 1 | `spawn_stack` 32 KiB + a `witness`-gated `stk_probe` on passes 1 and 2 | STACKSEED `01739a93`, REVIEWFIX `8085c9c8` | **0** `[redzone]` lines (render1: 8); `[u7stk]` pass1 `hw=13312 headroom=19456`, pass2 `hw=22256 headroom=10512` |
+| 2 | whole-panel present from a never-painted back buffer | `screen.fill_screen(wm::DESKTOP_BG)` once before the loop | STACKSEED | first present carries the desktop colour; `presents=2` |
+| 3 | shell window minted empty by construction | the knob-solo arm declines `reason=no-painter`; the conwin arm declines `console-already-windowed` | PAINTPULSE `7ffd2122` | `DECLINE reason=console-already-windowed` at boot line 516, after `[orinconwin] -> ROUTED` at 488; `SHELL-WINDOW` **0** |
+| 4 | `pulsewin::service()` every pass, `ARMED` never set | `pulsewin::arm()` at the seam | PAINTPULSE | `[pulsewin] open win=3 … surf=1280x168 at (10,874)` — **the first pulse window on the Orin** |
+| 5 | the only Orin seam without `wm::reserve_stage` | reserve after the panel check; `REFUSE reason=stage-unreserved` on 0 | STAGECENSUS `a5a66fc1` | `REFUSE` **0** |
+| 6 | census on a pass count: 82% of the capture | CNTPCT-paced, ~1 s | STAGECENSUS | **1.02 lines/s**, 10.8% of the boot (render1: 24.08/s, 74.5%) |
+
+Three things the boot settled beyond the six:
+
+* **The ordering assumption behind `a1cf4900` is proven.** `orin_conwin()` routes the console
+  before `tegra_render_arm()` runs; the guard is in the right place. A `-> SHELL-WINDOW` would
+  have meant the opposite, and there was none.
+* **The Orin's stack high-water is now measured, not inherited from the Pi** (the item §7 carried
+  as open). The pass that opens the pulse window reaches `hw=22256` — more than the 16 KiB
+  blanket stack the task used to run on, which is the mechanism of defect 1 stated as a number.
+  Both readings are unsaturated (`headroom > 0`), so they are depths, not lower bounds.
+* **The `[u7stk]` probe had no reachable caller on a jetson image**, `witness` or not: its only
+  call site was the `u7stk!` macro inside `u7_launcher`, which is spawned below the
+  `tegra_early_stop` terminus. The prior belief that `witness` alone would produce a reading was
+  wrong; the pass-1/pass-2 probe in `orin_render_service` is the first one this board can reach.
+
+Open, recorded for the next rung and not a defect of this one: `presents` stays at 2 for the rest
+of the boot. `ui_status::tick` never dirties again after pass 2, and `[pulse5] live` reports
+`span_max=0ms` on every core, so the load bars have nothing to repaint. The strip and the pulse
+window are painted once and then static. The Orin's load sampler is the place to look.
+
+Also landed in the same arc, outside `video/`: CAPREVOKE `06858185` — `sys_cap_revoke` on aarch64
+now frees a File handle's descriptor as the x86 twin does (audit finding, live on both bench
+boards; pi 6 granted the file). The Pi's knob-off `kernel8.img` byte-identity baseline moves
+(+29 lines in `arch/aarch64/syscall.rs`), stated in the commit for the next pi seat.
+
 ---
 
 ## §4 The GA10B boundary — stated once so nobody re-asks
@@ -3386,7 +3433,6 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
   measurement. Rung 1's error list was exhaustive as measured, and is now settled:
   fixing them revealed **no fourth error** — `arm-tegra-desk` is green, and green
   with `quarry` added once §3.5.2's held line is applied.
-- **The `[u7stk]` numbers quoted in §5 are Pi numbers.** The Orin's stack
-  high-water on its own cascade has never been measured. `[u7stk]` is present and
-  `witness`-gated here, so it can be — but until it is, §5's bound is inherited,
-  not local.
+- **The `[u7stk]` numbers quoted in §5 are Pi numbers.** The Orin's own render task was
+  measured on 2026-09-05 (§3.14: `hw=22256` on the pulse-window pass, unsaturated); the
+  boot-stack cascade §5 is about still has not been, and §5.2 stands until it is.
