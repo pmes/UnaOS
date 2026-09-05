@@ -123,6 +123,15 @@ belongs here, on the day it is made.
 - **Durability** (2026-07-17). Work is durable only once its branch is on
   origin. Full push line (all branches) after every landing; feature branches
   backed up periodically; WIP committed before any handoff.
+- **Landing-merge shape check** (pi 6, 2026-09-05, at LANDING-2 `d11cd56e`). After every
+  `--no-ff` landing, prove two facts with commands, in this order: (1) two parents —
+  `git log --pretty=%p -1 <merge>` prints the trunk tip AND the arc tip (a `checkout -b` during a
+  conflicted merge once dropped `MERGE_HEAD` and left trunk on a single-parent commit; the next
+  sync re-conflicted 386 commits); (2) `git diff <arc-tip> <merge> | wc -l` = 0 is SAFE **if and
+  only if** `git log --no-merges --oneline <merge-base>..<trunk-tip>` is EMPTY — trunk contributed no
+  original work since the base. Without (2)'s second command, a zero diff against a non-ancestor
+  parent is indistinguishable from wholesale loss of trunk-only content. Quote both in the landing
+  report.
 
 Operational trap details (serial-log handling, media clobbers, fixture
 state, TCC, port collisions) live in the session-memory hazards ledger.
