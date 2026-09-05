@@ -27,7 +27,7 @@ Sources: `od` = `docs/dev/OS/08_VIDEO/orin-desktop.md` · `AC` = `docs/dev/evide
 | A6 | One core, no preemption; five APs run zero work | orin | Orin | open — `bsprun`/`bsptick` unflown | OB#6 | — |
 | A7 (→ S4) | Dock minimise round-trip never proven; aarch64 shell tile dead (`SHELL_REOPEN` drained only on x86) | rmbp | Orin | open | OB#7; AC | dock drain is video/ (rmbp lane) |
 | A8 | No file browser (`quarry` compiles, cascade-gated) | orin | Orin | open — follows A1 | OB#8 | — |
-| A9 | Print Screen produces nothing: service call never reached the terminus | orin | Orin | fixed-unflown | OB#9 | PRTSCR-ORIN `2000608a` (needs `UNAOS_HOLOCRON=1`) |
+| A9 | Print Screen produces nothing: service call never reached the terminus | orin | Orin | fixed-unflown | OB#9 | PRTSCR-ORIN `2000608a` was INSIDE the line's trailing `//` comment — compiled nothing, check green (found at the ORINRX fold); live from PRTSCRLIVE (this commit). Needs `UNAOS_HOLOCRON=1` |
 | A10 | `<Esc>` cannot dismiss the pulse window's menu | orin | Orin | dropped — pulse window retired on the Orin (Peter 2026-09-05: it loads the old Pi background-pulse view | OB#10; AC#20 | CASCADE (removes arm/service) |
 | A11 | TAB mid-drag leaves the grab on the old window (x86 cancels) | orin | Orin | open | OB#11; AC#7 | aarch64 `wc_focus_key` |
 | A12 | No DHCP lease (NO-OFFER → static fallback); default jetson image carries no `net4` | orin | Orin | open | OB#12; NET-4A | — |

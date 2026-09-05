@@ -17,7 +17,9 @@ MANDATORY HEAD (docs/dev/EXECUTOR-BRIEF.md):
 4. Names in shared files are SUBSYSTEM-named, never board-named (`[pwrreboot]`, not `[orinreboot]`).
 5. Knob-off byte-identity: new statements go inside an existing cfg region, or folded onto an
    existing line where the file carries a LINE-NEUTRAL rule (read the nearest "LINE-NEUTRAL append"
-   comment and copy its shape). When `./arroyo knoboff <feature>` exists, run it and quote the result.
+   comment and copy its shape). AN APPEND GOES BEFORE THE LINE'S FIRST `//` — after it, the statement is
+   a comment, compiles nothing, and the check stays green (LEDGER P7). Prove the position. When
+   `./arroyo knoboff <feature>` exists, run it and quote the result.
 6. GATE before commit: `cd unaos && ./arroyo check` exit 0 both arches; run the QEMU suite named by
    the brief. Quote exit codes and leg counts, never "green".
 7. LEDGER: your commit ticks <ledger-id> in docs/dev/LEDGER.md or docs/dev/OS/<track>-ledger.md
