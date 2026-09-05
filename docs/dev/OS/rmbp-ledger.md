@@ -37,6 +37,7 @@ Status enum (GATE-LEDGER): **open** · **fixed-unflown** · **flown** · **lande
 | B4 | 2 cosmetic `unsafe` warnings at `bootloader/src/main.rs:1340/:1389` under `unaos_ivb` | rmbp | — | open — cosmetic | GATE-ROOTS leg 4 | — |
 | B6 | Cross-arch splash: `splash.rs` stays, call sites x86-gated; the `bootpace.rs:168` same-line trap | rmbp | rmbp | open — Peter asked by name | B11 P2 | — |
 | B7 | vug arbiter placement (kernel-side recommended) | rmbp | — | open — blocked on Peter's call, still unasked in his hearing | B11 P3 | — |
+| B9 | `[ptrdead] … fpop3=1 -> FAIL` in `UNAOS_WC=1 ./arroyo test-fat sf 200`: the known foreign-drain flake in `arch/x86_64/syscall.rs` fired on 1 of 2 runs of orin 14's A17 proof (run 1 exit 1, ~1000 lines before the first chord; run 2 clean). A gate that fails one run in two on an unrelated leg costs a re-run per proof | rmbp | — | open — flake rate unmeasured; prior fixes 0d509431 / badc8732 did not close it | orin 14's PRTSCR2 commit body (`f0db58bf`, hw-jetson) | — |
 | B8 | Wired NIC is Broadcom `0x14e4`, nothing drives it; `e1000` is QEMU-only; Peter's two dongles are identical `0b95:1790 ASIX AX88179B` (one USB-ethernet driver would serve every board; `drivers/xhci/ftdi.rs` is the template) | rmbp | rmbp | open — DEV-LOOP transport ranking | B11 | — |
 
 ## C. Shared-file items this lane owns — LINKS ONLY (the `docs/dev/LEDGER.md` S-row is the one home and carries the status)
