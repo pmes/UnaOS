@@ -7,25 +7,25 @@
 #      port never enumerates a console on this board),
 #   2. kills any process holding it — BY DEVICE via lsof, never `pkill -f` (see unaos-hazards),
 #   3. starts jetson-serial-bridge.py against a fresh dated log in ~/unaos-bench/ (outside target/)
-#      with a held-open command FIFO (/tmp/jetson.in),
+#      with a held-open command FIFO (~/unaos-bench/scratch/jetson.in),
 #   4. re-points ~/jetson-serial.log at that fresh log — the STABLE path to tail (this REFRESH is
 #      what makes the symlink trustworthy; a stale ~/jetson-serial.log from an old session is the
 #      documented trap).
 #
 # Usage:  scripts/jetson-bench-connect.sh [DEV] [FIFO]
 #   DEV    serial device  (default: auto-detect first /dev/cu.usbmodem*)
-#   FIFO   inject FIFO     (default: /tmp/jetson.in)
+#   FIFO   inject FIFO     (default: ~/unaos-bench/scratch/jetson.in)
 # Foreground by design — run behind the session's run_in_background, or with `&`/tmux from a shell.
 # Drive the UEFI Shell by injecting lines WITH a trailing CR, e.g.:
-#     printf 'connect -r\r' > /tmp/jetson.in ; printf 'map -r\r' > /tmp/jetson.in
-#     printf 'FS0:\EFI\BOOT\BOOTAA64.EFI\r' > /tmp/jetson.in
+#     printf 'connect -r\r' > ~/unaos-bench/scratch/jetson.in ; printf 'map -r\r' > ~/unaos-bench/scratch/jetson.in
+#     printf 'FS0:\EFI\BOOT\BOOTAA64.EFI\r' > ~/unaos-bench/scratch/jetson.in
 # If the bridge process dies, just run this script again — that IS the recovery procedure.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BENCH_DIR="${HOME}/unaos-bench"
 LINK="${HOME}/jetson-serial.log"
-FIFO="${2:-/tmp/jetson.in}"
+FIFO="${2:-${HOME}/unaos-bench/scratch/jetson.in}"
 
 # 1. Device: argument wins, else auto-detect the RPi Debug Probe (a CDC-ACM /dev/cu.usbmodem*).
 #    The device path drifts across probe re-enumerations, so always re-detect (never hardcode).
@@ -51,7 +51,7 @@ if [ -n "$HOLDERS" ]; then
 fi
 
 # 3. Fresh dated log outside target/.
-mkdir -p "$BENCH_DIR"
+mkdir -p "$BENCH_DIR" "$(dirname "$FIFO")"
 LOG="${BENCH_DIR}/jetson-serial-$(date +%Y-%m-%d-%H%M%S).log"
 touch "$LOG"
 

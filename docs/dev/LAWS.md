@@ -52,6 +52,19 @@ belongs here, on the day it is made.
   regression's `FAIL` must never be able to evaporate. Enforced every run by
   the SERWIT-1 fixture; see
   [`docs/dev/OS/02_KERNEL_CORE/serial_transport.md`](OS/02_KERNEL_CORE/serial_transport.md).
+- **A wrapped record is not a truncated one** (2026-08-31). The UEFI console
+  the bootloader logs to is sometimes 80 columns wide — the loader never calls
+  `SetMode`, so the width is inherited firmware state — and at 80 columns the
+  firmware hard-wraps every write with a real CRLF. No bytes are lost, but a
+  line-oriented read loses the tail, so `awk '/pattern/'` reports a witness
+  that is present as a witness that was cut off. Orin 11 spent a session on
+  an identity line that appeared to end at the word `max_vaddr` while the
+  value was on the wire throughout. Read bootloader-window captures through
+  `~/unaos-bench/tools/unwrap80.sh` (bench-side, outside the repo)
+  — it is a no-op on a wide-console capture, so there is no cost to always
+  using it. The image-identity witness itself is held under 80 columns so it
+  never needs the tool; see
+  [`docs/dev/OS/01_BOOT_HAL/bootloader_spec.md`](OS/01_BOOT_HAL/bootloader_spec.md) §4.
 - **A flake is an observation, not a re-run** (2026-08-18). An intermittently
   red gate is diagnosed against the fixture-flake corpus —
   [`docs/dev/FIXTURE_FLAKES.md`](FIXTURE_FLAKES.md) — before it is re-run:

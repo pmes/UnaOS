@@ -21,12 +21,14 @@
 # because there was one spec and one battery. A second spec, asserted ADDITIONALLY and only
 # when the knob is armed, keeps the base count fixed AND still gets real REQUIREs.
 #
-# THE SUITE FLOOR, in both modes:
-#   knob OFF (classic `./arroyo kernel8-test 210`) — 117/117 required, 0 forbidden, from
-#     pi4-regression.spec alone. UNCHANGED, by construction: the base spec is not edited by
-#     this arc and the qemu argv is byte-for-byte the same argv.
-#   knob ON  (`UNAOS_K8_SCRIPT=... ./arroyo kernel8-test 300`) — 117/117 from the base spec
-#     AND THEN 3/3 required, 0 forbidden, from this file. 120 required witnesses across the
+# THE SUITE FLOOR, in both modes (base count 117 -> 119 on 2026-08-31, TABFIXTURE: two REQUIREs
+# in pi4-regression.spec §4b' gate the TAB rotation — see that block. Nothing about the ARGUMENT
+# below changes; only the number the base spec contributes. This file's own 3 are untouched):
+#   knob OFF (classic `./arroyo kernel8-test 210`) — 119/119 required, 0 forbidden, from
+#     pi4-regression.spec alone. UNCHANGED BY THIS FILE, by construction: the base spec is not
+#     edited by the SUITETYPE arc and the qemu argv is byte-for-byte the same argv.
+#   knob ON  (`UNAOS_K8_SCRIPT=... ./arroyo kernel8-test 300`) — 119/119 from the base spec
+#     AND THEN 3/3 required, 0 forbidden, from this file. 122 required witnesses across the
 #     two batteries. The base spec runs FIRST and a non-PASS base verdict short-circuits:
 #     this file is only ever consulted on a capture the base spec already called complete.
 #

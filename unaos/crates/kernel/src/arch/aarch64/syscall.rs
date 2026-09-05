@@ -8927,11 +8927,31 @@ fn sys_cap_grant(asid: u64, src_idx: u64, req_rights: u64) -> i64 {
 /// that right, the revoke additionally marks its derivation node — every capability derived from it (every
 /// re-grant, and every re-transfer whose chain passes through it) is `-EACCES` at its next use. Without the
 /// right the drop stays local (derived copies survive — U5's semantics, unchanged).
+/// CAPREVOKE: revoking a FILE handle also releases its open-file DESCRIPTOR (`files_free`) — the x86 twin's
+/// U7x/U11x branch, now carried on both arches (before this the descriptor outlived every handle to it and a
+/// repeat open->revoke loop exhausted the FILES row to a permanent -EMFILE). An orphan chain the free yields
+/// (the LAST close of an `unlink_pending` file — `sys_close`'s U11-M2 shape) is freed after the handle drops.
 /// Returns 0, or -ECHILD if the index is out-of-range/Empty (nothing to revoke — also the double-revoke
 /// errno). After revoke, any use of the index returns -EACCES (`sys_write`) / -ECHILD (`sys_wait`).
 fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
     if idx as usize >= NHANDLE || handle_get(asid, idx as usize).is_none() {
         return ECHILD; // out-of-range or Empty — no such handle to revoke
+    }
+    // CAPREVOKE (the x86 U7x/U11x branch): revoking a FILE handle releases its open-file DESCRIPTOR too —
+    // without this, the descriptor outlived every handle to it and repeat open->revoke loops exhausted the
+    // FILES row to a permanent -EMFILE. The value word is a gen-tagged file-id `(gen << 32) | (idx + 1)`, so
+    // decode it through `file_desc_validate` (masks the low half, bounds-checks, matches the generation) rather
+    // than a bare `checked_sub(1)`. A stale/out-of-range id (a kernel bug) validates to `None` and is simply
+    // skipped; the handle clear below still denies every use. Honest scope: a GRANT-minted duplicate File
+    // handle shares the descriptor, so revoking either one frees it and the survivor's reads fail CLOSED
+    // (-EACCES at the `file_desc_validate` re-check). The orphan chain head (if any) is freed LAST, below.
+    let mut orphan = None;
+    if handle_kind(asid, idx as usize) == KIND_FILE {
+        if let Some(file_id) = handle_get(asid, idx as usize).filter(|&v| v != HANDLE_RESERVING) {
+            if let Some(fid) = file_desc_validate(asid, file_id) {
+                orphan = files_free(asid, fid);
+            }
+        }
     }
     // U8: CAP_REVOKE gets its real semantics — revoking a handle that CARRIES the right marks its
     // derivation node revoked, killing the whole subtree derived from it (every re-grant, and every
@@ -8945,6 +8965,11 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
         deriv_revoke(dn);
     }
     handle_clear(asid, idx as usize);
+    // CAPREVOKE/U11-M2: if the descriptor free above was the LAST close of an `unlink_pending` file, free its
+    // chain now — AFTER dropping the handle, never under a lock; block I/O is legal here (syscall context).
+    if let Some(fc) = orphan {
+        free_orphan_chain(fc);
+    }
     0
 }
 
@@ -13205,12 +13230,94 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
     user_input_push(asid, packed)
 }
 
+/// TABKEY — [`crate::video::wm::focus_ring`] with the DEAD SINKS removed. The aarch64 twin of x86's
+/// `focus_ring_apps` (`arch/x86_64/syscall.rs`), and named after it so a reader who has met one meets the
+/// other; only the predicate differs, and that difference is argued below.
+///
+/// ### The claim this exists to falsify
+/// x86's copy says, in its own doc comment: *"On aarch64 that IS the app set: every row belongs to an EL0
+/// ASID."* **It is not, and the bench captures are what settle it.**
+///
+/// `~/unaos-bench/capture/line-acm0/pi.log`, 249 `[wc-c] focus tab-cycle` lines, tallied by destination:
+///
+/// ```text
+///   live EL0 slots  1..=6 …………………………  124   (and the shell slot 0: 23)
+///   0xffffff01 KERNEL_OWNER_CONSOLE ……   28
+///   0xffffff02 KERNEL_OWNER_DESKTOP ……   23
+///   0xffffff03 …………………………………………………   25
+///   0xffffff60 …………………………………………………   26
+///                                       ---
+///   kernel band …………………………………………… 102 of 249  = 41% of every TAB the operator pressed
+/// ```
+///
+/// Kernel-owned rows reach `wm::TABLE` on this arch exactly as they do on x86 —
+/// `fbcon::panel_console_window_open`, and the `orinconwin` / `orindesk` / `pidesk` furniture — and
+/// `focus_ring`'s `used && !compat && owner_asid != 0` test passes every one of them.
+///
+/// ### What a dead sink in the rotation costs
+/// SINKVALID's defect, reached through a second door. `user_input_set_active` publishes the pseudo-ASID;
+/// `user_input_enqueue`'s ring seam refuses it four hops later (`asid > USER_SLOTS`), silently; and TAB
+/// prints a witness naming a focus that can receive nothing — the trap intact behind a line saying
+/// otherwise. With `orininput` armed it is worse than inert: `xusb_tegra::oi_pump` skips its drain only on
+/// `user_input_active() == 0`, and a pseudo-ASID reads NON-zero, so the pump DRAINS `pal::EVENT_QUEUE`
+/// into a seam that refuses everything — destroying the operator's keystrokes rather than leaving them for
+/// the console.
+///
+/// ### Why [`key_sink_drains`] and not `wm::is_kernel_owner`
+/// SINKVALID's reason verbatim: the kernel band (`0xFFFF_FF00..=0xFFFF_FFFF`) is a strict SUBSET of "has
+/// no ring" — a fixture ASID such as `wm.rs`'s `0xC0A` / `0xE2F`, or any future band, strands focus
+/// identically and `is_kernel_owner` says nothing about it. This predicate is the exact COMPLEMENT of the
+/// ring seam's own refusal, so the two cannot drift apart. (x86 uses `is_kernel_owner` because on that arch
+/// the two sets coincide today; nothing here depends on that staying true.)
+///
+/// ### Why FILTERING and not deflecting
+/// SINKVALID declined to touch this seam and said why: deflecting a chosen dead sink to the shell WELDS the
+/// rotation — `cur` becomes 0, 0 sits in no ring slot, so the next press takes the unknown-focus arm,
+/// re-chooses `ring[0]`, and re-deflects, forever. Removing the row from the rotation has no such fixed
+/// point: every survivor is a live sink and the shell slot stays reachable from all of them.
+///
+/// ### Why HERE and not in `video/wm.rs`, which is where SINKVALID's note pointed
+/// That file is compiled and executed by x86, so narrowing the shared helper would change x86 focus
+/// behaviour as a side effect of an aarch64 fix — and x86 already filters on its own side, with its own
+/// predicate, which the narrowing would silently double. The arch layer is also the only layer that KNOWS
+/// the answer: `USER_SLOTS` is a per-arch `uslots` constant and `wm` cannot see it.
+///
+/// ### Consequence, stated rather than discovered later
+/// `<TAB>` no longer raises kernel furniture — the console window and the desktop row leave the rotation on
+/// both boards. They were never a usable destination (landing there killed the keyboard); they remain
+/// reachable by CLICK, through `wc_click_route`'s furniture arm and SINKVALID's self-heal. Restoring them
+/// as a *visual* rotation stop needs a raise-cursor distinct from `USER_INPUT_ACTIVE`, which is an arc on
+/// the focus primitive, not a keybinding fix.
+///
+/// Compacts in place and zeroes the tail, so the caller reads `ring[..n]` with no stale owner behind it.
+/// `out` is `focus_ring`'s own buffer type, so no second array is allocated anywhere. Unconditional — no
+/// feature gate — so it is armed in every leg that compiles this file, and so the knob-off byte-identity
+/// rule does not reach it: that rule protects "arming a knob does not change the knob-off image", and this
+/// is not a knob (SINKVALID's ruling one commit ago, same file, same reasoning).
+fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
+    let n = crate::video::wm::focus_ring(out);
+    let mut k = 0usize;
+    for i in 0..n {
+        let owner = out[i];
+        if !key_sink_drains(owner) {
+            continue;
+        }
+        out[k] = owner;
+        k += 1;
+    }
+    for e in out[k..n].iter_mut() {
+        *e = 0;
+    }
+    k
+}
+
 /// WC-C — the TAB focus-cycle. Returns `true` when the event was CONSUMED by the window system and must
 /// not reach any app's ring.
 ///
-/// Cycling means: take the compositor's focus ring (`video::wm::focus_ring` — the distinct owner ASIDs of
-/// the live windows, in window-id order) PLUS one more slot for the SHELL (`USER_INPUT_ACTIVE == 0`), find
-/// where the current focus sits, and hand focus to the next slot. `user_input_set_active` is the ONE way
+/// Cycling means: take the compositor's focus ring ([`focus_ring_apps`] — the distinct owner ASIDs of the
+/// live windows, in window-id order, MINUS the ones that drain nothing) PLUS one more slot for the SHELL
+/// (`USER_INPUT_ACTIVE == 0`), find where the current focus sits, and hand focus to the next slot.
+/// `user_input_set_active` is the ONE way
 /// focus moves, so the tab-cycle inherits everything that already hangs off it: the incoming ring is
 /// reset, the interactive-takeover latch is cleared (the newly-focused app has consumed nothing yet, so
 /// its `run` deadline re-arms and the UVUG-8 cap keeps holding PER WINDOW), and the outgoing app simply
@@ -13241,6 +13348,9 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
 ///    which is an arc-sized change to the focus primitive, not a keybinding fix.
 ///  * The KeyUp is swallowed too, on the same predicate. Delivering a lone KeyUp for a KeyDown the app
 ///    never saw is exactly the dropped-edge shape UVUG-6 spent an arc removing from the typematic path.
+///
+/// TABKEY: the rotation is over [`focus_ring_apps`], not `wm::focus_ring` directly — see that helper for
+/// why, and for the Pi capture that proves the raw ring parks focus on rows with no ring 41% of the time.
 fn wc_focus_key(ev: crate::pal::Event) -> bool {
     const K_TAB: u8 = b'\t';
     let down = match ev {
@@ -13251,10 +13361,12 @@ fn wc_focus_key(ev: crate::pal::Event) -> bool {
     // WEDGE-2 `<F1>` — a TAB edge has been recognised and the chain begins. Emitted BEFORE
     // `focus_ring`, which takes the window TABLE lock: a `<F1>` with no successor means the chain
     // died reading the ring, i.e. against `TABLE`. Both entry points (the in-ring router seam and
-    // `wc_shell_focus_key`) funnel through this one body, so one token covers both.
+    // `wc_shell_focus_key`) funnel through this one body, so one token covers both. TABKEY: still
+    // ahead of the only `TABLE` acquisition — `focus_ring_apps` filters the result of that same call
+    // and takes no lock of its own — so the token's meaning is unchanged.
     crate::wedge2::mark("<F1>");
     let mut ring = [0u64; crate::video::wm::MAX_WINDOWS];
-    let n = crate::video::wm::focus_ring(&mut ring);
+    let n = focus_ring_apps(&mut ring);
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
     // BGRUN-1 GUARD REWRITE (supersedes WC-TAB's shared `n < 2`, deliberately). The old guard was
     // justified when windows could not outlive `run`: a lone window meant a parked shell, so consuming
@@ -13418,6 +13530,85 @@ pub fn user_input_set_active(asid: u64) {
     user_input_wake_edge(asid, "focus");
 }
 
+// ── SINKVALID — may this ASID be handed the KEYBOARD at all? ──────────────────────────────────────
+//
+// `user_input_set_active` stores ANY u64, but `user_input_enqueue` only ever pushes into `1..=USER_SLOTS`
+// (its own guard: `if asid == 0 || asid as usize > USER_SLOTS { return false }`). Everything outside that
+// range is a PSEUDO-ASID — a `video::wm` row owner naming a kernel-drawn surface (`wm::KERNEL_OWNER_*`) or
+// a fixture row — and it has NO RING. Focus parked on one is a keyboard pointed at nothing: the router
+// accepts the keystroke and the ring seam refuses it, four hops later, silently.
+//
+// MEASURED, on the Jetson bench (`~/unaos-bench/capture/line-acm0/orin.log`, `LC_ALL=C grep -a`):
+//
+//   :13084  [clickroute] press hit asid=4294967042 win=1 (was 0) delivered
+//   :13085  [orinclick] edge=press … owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED
+//   :13089  [orinclick] census … focus=0xffffff02 -> ROUTING            (and three more after it)
+//
+// `4294967042` is `0xffffff02` is `wm::KERNEL_OWNER_DESKTOP`. The press took the `owner != cur` arm below
+// and its `user_input_set_active(owner)`; the two arms above it that would have caught the case are
+// `#[cfg(feature = "desktop_firmware")]` and that image had the knob off. Keys reached the shell on that
+// boot only BY ACCIDENT — `main.rs::jd2_console_pump` feeds `handle_key` regardless of focus — and the
+// accident is not a property: with `orininput` armed, `xusb_tegra::oi_pump` skips its drain only when
+// `user_input_active() == 0`, and a pseudo-ASID reads NON-zero, so the pump drains `pal::EVENT_QUEUE`
+// into a seam that refuses every event, DESTROYING the operator's keystrokes instead of leaving them for
+// the console. The Pi reaches the identical state through `main.rs`'s
+// `user_input_active() != 0 -> route_input_to_active_el0()` branch. One router, one defect, both boards.
+//
+// WHY NOT `wm::is_kernel_owner`. Widening the two `desktop_firmware` arms would answer the KERNEL BAND
+// (`0xFFFF_FF00..=0xFFFF_FFFF`) and nothing else. That is a strict SUBSET of "has no ring": any other
+// ownerless row owner — a fixture ASID such as `wm.rs`'s `0xC0A`/`0xE2F`, or any future band — strands
+// focus exactly the same way and `is_kernel_owner` says nothing about it. The predicate below is instead
+// the exact COMPLEMENT of the ring seam's own refusal, so the two cannot drift apart.
+//
+// WHY THE DEFLECTION TARGET IS THE SHELL, where x86's FURNITUREFOCUS keeps the keyboard where it is. That
+// arc's dead sink WAS slot 0 (the x86 render task routes slot-0 keys into a shell WINDOW tuple that can go
+// stale), so 0 was the one place it could not send the keyboard. On aarch64 there is no such tuple: slot 0
+// is `handle_key` driving the backdrop console directly, on every image and every knob setting, and it
+// always drains. So here 0 is the one target that is ALWAYS live — and it is also what the operator asked
+// for by pressing on a kernel-furniture row, which is exactly what the `desktop_firmware` arms above
+// already do (`user_input_set_active(0)`). This arc makes that behaviour unconditional and widens its
+// predicate; it does not invent a new one. The tegra problem is the DUAL of x86's, so the fix is too.
+fn key_sink_drains(asid: u64) -> bool {
+    // 0 = the SHELL/console drain (always live, see above); 1..=USER_SLOTS = a private EL0 ring, which is
+    // precisely the set `user_input_enqueue` will push into. Anything else drains nothing, ever.
+    (asid as usize) <= super::uslots::USER_SLOTS
+}
+
+/// SINKVALID — witness budget for the deflection line. Operator-rate by nature (a hand on a furniture
+/// row), and capped for the same reason every other `[clickroute]` line is; the x86 twin's
+/// `FURNDEFLECT_LOG_MAX` is the same number for the same reason.
+static SINKDEFLECT_LOGGED: AtomicU32 = AtomicU32::new(0);
+const SINKDEFLECT_LOG_MAX: u32 = 4;
+
+/// SINKVALID — the click router's KEYBOARD half, and the only way any arm of [`wc_click_route`] leaves
+/// `USER_INPUT_ACTIVE` naming a hit-tested row's owner.
+///
+/// Returns `true` when the grant went through (`owner` can drain, so it gets the keyboard exactly as
+/// before) and `false` when it was DEFLECTED. The caller uses the answer to settle the PRESS: a press must
+/// never be left addressed to a ring the enqueue seam is going to refuse, so a deflected arm consumes it
+/// (target [`CLICK_TARGET_DROP`], so the release is dropped with it and no half-pair reaches anyone). The
+/// VISIBLE half of the gesture is unchanged either way — the caller still raises the row.
+fn focus_grant_or_shell(owner: u64, cur: u64, win: crate::video::wm::WinId) -> bool {
+    if key_sink_drains(owner) {
+        user_input_set_active(owner);
+        return true;
+    }
+    // Dead sink. Hand the keyboard to the shell — the one sink on this arch that no image can turn off —
+    // rather than to a row with no ring. Skipped when focus is ALREADY the shell: `user_input_set_active`
+    // is not free (a real focus drains up to 64 events off `pal::EVENT_QUEUE`, resets the takeover latch
+    // and runs a wake edge), and re-asserting 0 over 0 would be a wake edge nobody is waiting on.
+    if cur != 0 {
+        user_input_set_active(0);
+    }
+    if SINKDEFLECT_LOGGED.fetch_add(1, Ordering::Relaxed) < SINKDEFLECT_LOG_MAX {
+        serial_println!(
+            "[clickroute] focus deflect owner={:#x} win={} was={:#x} sink=dead -> shell keyboard",
+            owner, win, cur
+        );
+    }
+    false
+}
+
 /// WC-TAB — the SHELL half of the focus ring, closing the one-way exit WC-C left open.
 ///
 /// When focus is the shell slot, `user_input_active()` is 0 and `main.rs` never calls
@@ -13449,6 +13640,291 @@ pub fn wc_shell_focus_key(ev: crate::pal::Event) -> bool {
         return false; // an app owns input — the router seam handles TAB, not us
     }
     wc_focus_key(ev)
+}
+
+// ── TABFIXTURE — the TAB rotation, PRESSED and SCORED, with no keyboard and no metal ────────────
+//
+// WHY THIS EXISTS. TABKEY landed UNFLOWN and said so: `./arroyo check` green, `test-arm` green,
+// `kernel8-test` MBENCH PASS 117/117 — and every one of those is a NO-REGRESSION verdict, because
+// NOTHING IN ANY FIXTURE PRESSED TAB. Measured on the exact TABKEY tree: `target/serial-arm.log`
+// and `target/serial-pi.log` both carried ZERO `[wc-c] focus tab-cycle` lines, against the Pi's own
+// metal capture (`~/unaos-bench/capture/line-acm0/pi.log`) with 249. A rotation with no press behind
+// it is mechanism, not evidence, and the one property TABKEY exists for — that the cycle SKIPS an
+// owner which drains no key — was gated by nothing at all.
+//
+// WHAT IT PROVES AND WHAT IT DOES NOT. It presses TAB through the SAME body both real doors funnel
+// into ([`wc_focus_key`]) and scores where `USER_INPUT_ACTIVE` went, over a ring it BUILDS: two rows
+// owned by real private slots and two owned by the KERNEL BAND — `wm::KERNEL_OWNER_CONSOLE`
+// (0xFFFF_FF01) and `wm::KERNEL_OWNER_DESKTOP` (0xFFFF_FF02), two of the four pi 5 decoded out of
+// their 249-line capture, none of which drains a key. It does NOT press a physical key, does not
+// cross a HID decoder, and does not touch either door's CALL SITE: `wc_shell_focus_key`'s single
+// `tegra_el0` caller in `main.rs`'s `jd2_console_pump` and the router seam in `user_input_enqueue`
+// are still unflown and still need metal. This fixture makes the CYCLE falsifiable; it does not make
+// the WIRING falsifiable.
+//
+// EVERY EXPECTATION IS COMPUTED FROM THE LIVE TABLE, never from a constant. The fixture runs inside
+// `wcb_launcher`'s tail, where the table is normally empty, but "normally" is not a gate: a
+// pre-existing row (a console window on a metal boot, a leaked fixture row) would silently change
+// the ring, and a fixture whose expectations are hard-coded would then be asserting the wrong thing
+// while still going green. So leg 2's expected ring is the `key_sink_drains` subset of the ring
+// `wm::focus_ring` ACTUALLY returned this boot, and legs 7 and 8 report `n/a` rather than a fake
+// `true` when the table they need cannot be constructed.
+//
+// THE WITNESS BITS ARE ONE LINE, and it is deliberately the `:: LABEL: … :: PASS ::` form and NOT
+// `:: LABEL: … -> PASS ::` — the doubly-arrowed form is what `pi4-regression.spec`'s `COUNT 26`
+// counts, and a new line in that shape would have raised the measured count and RED-ed the Pi suite
+// for adding a fixture. The FAIL branch spells `:: FAIL ::`, which is a builtin FORBID in
+// `mbench.py` (DEFAULT_FORBIDS) AND a member of `arroyo`'s `FAULT_PATTERNS` — so a broken rotation
+// reds `kernel8-test` and `test-arm` with no spec edit at all.
+
+/// TABFIXTURE leg 1 — POSITIVE CONTROL ON THE INSTRUMENT. The UNFILTERED `wm::focus_ring` really does
+/// carry both kernel-band owners this boot. Without it, "the band is absent from the filtered ring" is
+/// a zero-hit result indicting the pattern rather than a finding about the filter.
+#[cfg(feature = "witness")]
+const TABRING_W_RAWBAND: u32 = 1 << 0;
+/// TABFIXTURE leg 2 — [`focus_ring_apps`] is EXACTLY the `key_sink_drains` subset of that raw ring,
+/// in the same order, and it contains both app owners and neither band owner.
+#[cfg(feature = "witness")]
+const TABRING_W_FILTER: u32 = 1 << 1;
+/// TABFIXTURE leg 3 — the first `n` presses from the shell walk `apps[0..n]` IN ORDER. An off-by-one,
+/// a reversed walk or a stuck cycle all miss here.
+#[cfg(feature = "witness")]
+const TABRING_W_ORDER: u32 = 1 << 2;
+/// TABFIXTURE leg 4 — press `n + 1` (the ring plus the shell slot) returns focus to the shell, i.e.
+/// to where the walk started. This is the WRAP.
+#[cfg(feature = "witness")]
+const TABRING_W_WRAP: u32 = 1 << 3;
+/// TABFIXTURE leg 5 — THE ONE THAT MATTERS. No press in the whole cycle ever published a focus that
+/// fails `key_sink_drains`; in particular neither band owner leg 1 proved was in the raw ring.
+#[cfg(feature = "witness")]
+const TABRING_W_SKIP: u32 = 1 << 4;
+/// TABFIXTURE leg 6 — every press AND every release edge in the cycle was CONSUMED (`true`), so the
+/// keystroke cannot also reach the console as an ordinary key.
+#[cfg(feature = "witness")]
+const TABRING_W_CONSUME: u32 = 1 << 5;
+/// TABFIXTURE leg 7 — ANTI-WELD. Focus stranded on an owner the filtered ring does not contain (its
+/// row closed under it) is RESCUED by one TAB onto an owner that does drain. This is the property
+/// that makes the filter a filter and not a trap.
+#[cfg(feature = "witness")]
+const TABRING_W_NOWELD: u32 = 1 << 6;
+/// TABFIXTURE leg 8 — shell + an EMPTY app ring leaves TAB an ordinary key: not consumed, focus
+/// unmoved, and above all not a hang.
+#[cfg(feature = "witness")]
+const TABRING_W_SHELLPASS: u32 = 1 << 7;
+/// TABFIXTURE — all eight legs.
+#[cfg(feature = "witness")]
+const TABRING_W_ALL: u32 = 0xFF;
+
+/// TABFIXTURE — press `<TAB>` and score where the keyboard went. See the block comment above.
+///
+/// Self-cleaning: it closes every row it mints (BY WINDOW ID — never `close_owner` on a kernel-band
+/// owner, which on a metal boot would reap the REAL console window), restores `USER_INPUT_ACTIVE` to
+/// the value it found, and runs `wm::focus_reset` — the restore every selftest that drives
+/// `focus_changed` with synthetic owners owes.
+#[cfg(feature = "witness")]
+pub fn tabring_selftest() {
+    use crate::video::wm;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    const K_TAB: u8 = b'\t';
+    // Both app owners are REAL private slots (`key_sink_drains` is `asid <= USER_SLOTS`), taken from
+    // the TOP of the range because slots are handed out from the bottom — so these are the last two a
+    // live app would be holding, and by this point in the cascade `el0-wcb` has exited and freed its.
+    const APP_A: u64 = 7;
+    const APP_B: u64 = 8;
+    // 8x8 ARGB8888, stride 32 B: `w*4 <= stride` and `h*stride <= surf_len` (256), which is
+    // `wm::create`'s F1 surface-extent contract satisfied exactly, with nothing to spare.
+    static TR_SURF: [u32; 64] = [0xFF30_4050u32; 64];
+    let s = &raw const TR_SURF as usize;
+    let len = core::mem::size_of_val(&TR_SURF);
+
+    let entry_focus = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    if entry_focus != 0 {
+        // An app holds the keyboard. Taking it away to run a rotation would be a fixture with a side
+        // effect on a live program; say so and decline. Not reachable in the cascade's own ordering.
+        serial_println!(
+            ":: TABRING: TAB rotation — an app holds the keyboard (focus={:#x}), SKIP ::",
+            entry_focus
+        );
+        return;
+    }
+
+    let band_a = wm::KERNEL_OWNER_CONSOLE;
+    let band_b = wm::KERNEL_OWNER_DESKTOP;
+    // The BASELINE ring, read before a single row is minted: what the table already held is what the
+    // teardown must hand back, and it is also what stops the leak sweep below from convicting a real
+    // console row this fixture never created.
+    let mut base = [0u64; wm::MAX_WINDOWS];
+    let nbase = wm::focus_ring(&mut base);
+
+    // INTERLEAVED on purpose — app, band, app, band. `focus_ring` is in WINDOW-ID order and ids
+    // ascend with creation, so a filter that merely truncated the tail (or dropped a fixed slot)
+    // would still have to survive a band owner sitting BETWEEN the two app owners.
+    let wa = wm::create(APP_A, s, len, 8, 8, 32, b"tab-a");
+    let wk1 = wm::create(band_a, s, len, 8, 8, 32, b"tab-k1");
+    let wb = wm::create(APP_B, s, len, 8, 8, 32, b"tab-b");
+    let wk2 = wm::create(band_b, s, len, 8, 8, 32, b"tab-k2");
+    if wa == wm::WIN_NONE || wk1 == wm::WIN_NONE || wb == wm::WIN_NONE || wk2 == wm::WIN_NONE {
+        serial_println!(
+            ":: TABRING: TAB rotation — window table full (a={} k1={} b={} k2={}), SKIP ::",
+            wa, wk1, wb, wk2
+        );
+        for id in [wa, wk1, wb, wk2] {
+            wm::close(id);
+        }
+        return;
+    }
+
+    // ---- leg 1: the raw ring really carries the band (the positive control) -------------------
+    let mut raw = [0u64; wm::MAX_WINDOWS];
+    let nraw = wm::focus_ring(&mut raw);
+    let rawband_ok = raw[..nraw].contains(&band_a)
+        && raw[..nraw].contains(&band_b)
+        && raw[..nraw].contains(&APP_A)
+        && raw[..nraw].contains(&APP_B);
+
+    // ---- leg 2: the filter is exactly the draining subset, in order ---------------------------
+    let mut want = [0u64; wm::MAX_WINDOWS];
+    let mut wn = 0usize;
+    for i in 0..nraw {
+        if key_sink_drains(raw[i]) {
+            want[wn] = raw[i];
+            wn += 1;
+        }
+    }
+    let mut apps = [0u64; wm::MAX_WINDOWS];
+    let n = focus_ring_apps(&mut apps);
+    let filter_ok = n == wn
+        && apps[..n] == want[..wn]
+        && !apps[..n].contains(&band_a)
+        && !apps[..n].contains(&band_b)
+        && apps[..n].contains(&APP_A)
+        && apps[..n].contains(&APP_B);
+
+    // ---- legs 3-6: press TAB (n + 1) times from the shell and record every destination --------
+    // `user_input_set_active(0)` rather than a bare store, so the walk starts from the same state a
+    // real focus-to-shell leaves — this fixture must exercise the primitive, not tiptoe around it.
+    user_input_set_active(0);
+    let presses = n + 1;
+    let mut seq = [0u64; wm::MAX_WINDOWS + 1];
+    let mut consume_ok = true;
+    let mut skip_ok = true;
+    for slot in seq[..presses].iter_mut() {
+        let down = wc_focus_key(crate::pal::Event::Key(K_TAB));
+        let up = wc_focus_key(crate::pal::Event::KeyUp(K_TAB));
+        if !down || !up {
+            consume_ok = false;
+        }
+        let f = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+        *slot = f;
+        if !key_sink_drains(f) {
+            skip_ok = false; // a press published a focus with no ring behind it — SINKVALID's defect
+        }
+    }
+    let order_ok = n > 0 && seq[..n] == apps[..n];
+    let wrap_ok = seq[presses - 1] == 0; // the (n+1)th press is back at the shell it started from
+
+    // ---- leg 7: ANTI-WELD — a focus stranded off the ring is rescued by one TAB ---------------
+    // Strand it deliberately: park focus on APP_A, then close BOTH app rows under it. `at` is then
+    // `None` in the cycle, which is the arm a real "the focused app closed its own window" takes.
+    user_input_set_active(APP_A);
+    wm::close(wa);
+    wm::close(wb);
+    let mut after = [0u64; wm::MAX_WINDOWS];
+    let n_after = focus_ring_apps(&mut after);
+    // The claim is a PROPERTY, not a position: it must MOVE, and it must land somewhere that drains.
+    // Re-deriving the destination here would only restate the code under test. `n/a` when a row this
+    // fixture does not own still carries APP_A — then focus was never actually stranded.
+    let noweld: Option<bool> = if after[..n_after].contains(&APP_A) {
+        None
+    } else {
+        let consumed = wc_focus_key(crate::pal::Event::Key(K_TAB));
+        let _ = wc_focus_key(crate::pal::Event::KeyUp(K_TAB));
+        let landed = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+        Some(consumed && landed != APP_A && key_sink_drains(landed))
+    };
+
+    // ---- leg 8: shell + empty app ring — TAB is an ordinary key, and not a hang ---------------
+    let shellpass: Option<bool> = if n_after == 0 {
+        user_input_set_active(0);
+        let consumed = wc_focus_key(crate::pal::Event::Key(K_TAB));
+        Some(!consumed && USER_INPUT_ACTIVE.load(Ordering::Acquire) == 0)
+    } else {
+        None // other app rows survive in this table; the empty-ring arm is not reachable here
+    };
+
+    let mut w = 0u32;
+    if rawband_ok {
+        w |= TABRING_W_RAWBAND;
+    }
+    if filter_ok {
+        w |= TABRING_W_FILTER;
+    }
+    if order_ok {
+        w |= TABRING_W_ORDER;
+    }
+    if wrap_ok {
+        w |= TABRING_W_WRAP;
+    }
+    if skip_ok {
+        w |= TABRING_W_SKIP;
+    }
+    if consume_ok {
+        w |= TABRING_W_CONSUME;
+    }
+    // A leg that is `n/a` sets its bit: the mask says "nothing here is broken", and the printed
+    // field is what says whether the leg RAN. A reader who wants "all eight legs really fired"
+    // asserts `noweld=true shellpass=true` on the line, which the spec REQUIRE does.
+    if noweld.unwrap_or(true) {
+        w |= TABRING_W_NOWELD;
+    }
+    if shellpass.unwrap_or(true) {
+        w |= TABRING_W_SHELLPASS;
+    }
+
+    // Teardown BEFORE the verdict print, so a verdict is never issued over a table this fixture
+    // still owns. By WINDOW ID only — `close_owner(KERNEL_OWNER_CONSOLE)` would reap a real console
+    // row on a metal boot, which is a fixture destroying the system it is measuring.
+    wm::close(wk1);
+    wm::close(wk2);
+    for id in [wa, wb] {
+        wm::close(id);
+    }
+    // LEAK GUARD, against the BASELINE and not against emptiness: a row this fixture minted must not
+    // outlive it, and a row it found must not have been reaped by it. Either direction is a FAIL.
+    let mut end = [0u64; wm::MAX_WINDOWS];
+    let nend = wm::focus_ring(&mut end);
+    let mut leak = false;
+    for a in [APP_A, APP_B, band_a, band_b] {
+        if end[..nend].contains(&a) != base[..nbase].contains(&a) {
+            leak = true;
+        }
+    }
+    user_input_set_active(entry_focus);
+    wm::focus_reset();
+
+    let tri = |v: Option<bool>| match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "n/a",
+    };
+    let ok = w == TABRING_W_ALL && !leak;
+    if ok {
+        serial_println!(
+            ":: TABRING: TAB rotation — witness={:#x} ring={} raw={} presses={} band={:#x}/{:#x} noweld={} shellpass={} :: PASS ::",
+            w, n, nraw, presses, band_a, band_b, tri(noweld), tri(shellpass)
+        );
+    } else {
+        serial_println!(
+            ":: TABRING: TAB rotation — witness={:#x} (want {:#x}) ring={} raw={} presses={} leak={} rawband={} filter={} order={} wrap={} skip={} consume={} noweld={} shellpass={} seq={:#x},{:#x},{:#x},{:#x} :: FAIL ::",
+            w, TABRING_W_ALL, n, nraw, presses, leak,
+            rawband_ok, filter_ok, order_ok, wrap_ok, skip_ok, consume_ok,
+            tri(noweld), tri(shellpass),
+            seq[0], seq[1], seq[2], seq[3]
+        );
+    }
 }
 
 // ---- CLICK-ROUTE: a pointer button goes to the window UNDER THE CURSOR ------------------------
@@ -13576,7 +14052,7 @@ pub fn wc_close_last_settle() -> u32 {
 /// FORBID plain `noproc` where only fixtures close, and an operator reading the log can tell a
 /// witness no-op from a click that killed nobody.
 fn wc_close_click(owner: u64) -> &'static str {
-    let closed = crate::video::wm::close_owner(owner); if crate::video::wm::is_kernel_owner(owner) { return "furniture-refused"; } // DRAINSTALL (PA38): close_owner REFUSED every row — a close that removed NOTHING may perform no teardown side effect. Below this line are the two that made the freeze: the focus drop and `focus_changed(0)`, i.e. a FULL SHELL RAISE that parks every user window, publishes hidden=true fleet-wide, queues N deferred erase boxes on DEFER and arms request_full_present — all predicated on a close that did not happen. That is CLOSE-TEARDOWN's ruling ("closing a window causes the other open vug stat pulse windows to minimize"), whose fix `focus_release` has zero aarch64 callers. Returning HERE is also what unwinds the CLOSE-FIX hop: the retry loop re-enters only on `noproc-selftest`, and its stated bound ("every hop removes at least the hit row") is false for a REFUSED row. One line, line-NEUTRAL, per this file's PANIC-Location rule.
+    let closed = crate::video::wm::close_owner(owner); if crate::video::wm::is_kernel_owner(owner) { return "furniture-refused"; } // DRAINSTALL (PA38): close_owner REFUSED every row — a close that removed NOTHING may perform no teardown side effect. Below this line are the two that made the freeze: the focus drop and `focus_changed(0)`, i.e. a FULL SHELL RAISE that parks every user window, publishes hidden=true fleet-wide, queues N deferred erase boxes on DEFER and arms request_full_present — all predicated on a close that did not happen. That is CLOSE-TEARDOWN's ruling ("closing a window causes the other open vug stat pulse windows to minimize"), whose fix `focus_release` had ZERO aarch64 callers when this line was written and now has exactly ONE, in `wc_close_furniture` below (CONWINCLOSE) — it is still not called HERE, and must not be: a REFUSED close hands nothing back because nothing departed. Returning HERE is also what unwinds the CLOSE-FIX hop: the retry loop re-enters only on `noproc-selftest`, and its stated bound ("every hop removes at least the hit row") is false for a REFUSED row. CONWINCLOSE: the router no longer REACHES this arm for kernel furniture — it splits on `is_kernel_owner` and calls `wc_close_furniture` instead — so this return is now the structural guard on a fn whose signature still accepts any owner, not the path a console close takes. It stays for that reason and the tag stays distinct from the two the furniture path returns. One line, line-NEUTRAL, per this file's PANIC-Location rule.
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         user_input_set_active(0);
     }
@@ -13671,7 +14147,7 @@ fn wc_close_click(owner: u64) -> &'static str {
         );
         "armed"
     }
-}
+} #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] fn wc_close_furniture(win: crate::video::wm::WinId, owner: u64) -> &'static str { let route = crate::video::fbcon::panel_console_window_closed(win); let gone = crate::video::wm::close(win); crate::video::wm::focus_release(owner, "route=close-furniture shell-raise=skipped siblings=untouched"); if CLOSE_LOG_COUNT.load(Ordering::Relaxed) < CLOSE_LOG_MAX { serial_println!("[wm-act] close-furniture win={} owner={:#x} closed={} route-dropped={} (id-scoped: close_owner is not involved)", win, owner, gone, route); } if gone { "furniture-closed" } else { "furniture-norow" } } #[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware")))] fn wc_close_furniture(_win: crate::video::wm::WinId, _owner: u64) -> &'static str { "furniture-refused" } // CONWINCLOSE — **the close disc on KERNEL FURNITURE, on aarch64: the arm x86 has had since NORMALWIN and this arch never grew.** `fbcon::panel_console_window_closed` had exactly ONE caller tree-wide (x86's `wc_close_furniture`) while BOTH arches open the console window — `desktop_firmware::activate` on the Pi, `orin_conwin` under `orinconwin` on the Orin — so on aarch64 the console's close disc was a control that could not act: the router sent it to `wc_close_click`, whose first move `close_owner` REFUSES the reserved kernel band (CLOSEISO, and that refusal is UNCHANGED here), and the row survived with the route still aimed at it. `wm::close(win)` is the id-scoped twin: it names exactly the row the operator pressed, which is what closing a window means, and it is what `wm.rs`'s own `ctrls_for` prose already claimed had happened. ORDER: the ROUTE first, because `wm::close` composites before it returns and a present routed at a row that is mid-free is the one ordering this can get wrong. LOCKFIX `7847ceea` HOLDS — this is the input path, and nothing here takes a blocking panel lock: `panel_console_window_closed` is a bare `compare_exchange` plus `publish_panel_owner` (one `swap` + a `witness`-gated print, `video/mod.rs:336`), neither `WRITER` nor `FBCON`; `wm::close`/`focus_release` take the window TABLE, which this arm's own `wc_close_click` sibling has always taken from the same band. FOCUS: `focus_release`, never `focus_changed(0)` — the latter is the SHELL RAISE that parks every surviving window (CLOSE-TEARDOWN); the owner-held-focus test is a CAS inside it, so it is called unconditionally. NOT KILLED and NO KEYBOARD to revoke: a kernel-band owner resolves to no process by arithmetic, and `user_input_set_active` refuses the band. TAGS are deliberately NOT x86's `closed`/`norow`: this arch feeds `close_settle_code`, where `CLOSE_SETTLE_CLOSED` means *kill confirmed*, and furniture kills nobody — `furniture-closed`/`furniture-norow` fall to `CLOSE_SETTLE_OTHER` and stay distinguishable on the wire from `furniture-refused` (the disc did nothing), which is the CLOSE-FIX P82 discriminator rule. Line-NEUTRAL fold per PARITY.md §5.3: `desktop_firmware` is off in `K8_FEATS`, so the knob-off `kernel8.img` gets zero bytes AND zero renumbered panic `Location`s.
 
 /// CLICK-ROUTE: the current pointer position in PANEL pixels — the point a click is addressed to.
 /// Reads the shared cursor state every other pointer consumer reads (`pal::cursor`, the same state
@@ -13851,7 +14327,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                     // CLOSE-CLEAN: the witness line is emitted AFTER the settle so it can name the
                     // outcome — `settle=closed` is the wire proof a close-box exit landed as a
                     // clean close (not a fault-kill). Same rate limit, same line, one new field.
-                    let settle = wc_close_click(owner);
+                    let settle = if crate::video::wm::is_kernel_owner(owner) { wc_close_furniture(win, owner) } else { wc_close_click(owner) }; // CONWINCLOSE — the x86 split, verbatim in shape: kernel furniture closes BY ID (`wm::close`) and drops the console ROUTE; an app owner still closes BY OWNER and is killed. Neither tag `wc_close_furniture` returns is `noproc-selftest`, so the retry hop below is unreachable from the furniture arm and its "every hop removes at least the hit row" bound is not weakened. Line-NEUTRAL, see the fn.
                     #[cfg(feature = "witness")]
                     CLOSE_LAST_SETTLE.store(close_settle_code(settle), Ordering::Release);
                     if CLOSE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX {
@@ -13901,8 +14377,14 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 // Raise and focus first: a maximise the operator cannot see the result of (because
                 // the window stayed behind another one) is not a maximise.
+                //
+                // SINKVALID — through the guarded grant, like every other focus move in this router.
+                // The arm CONSUMES unconditionally (it is a control-disc press, an instruction to the
+                // window system), so a deflection changes nothing here beyond where the keyboard lands:
+                // zooming a kernel-furniture row leaves the keyboard at the shell rather than parking it
+                // on a row with no ring.
                 if owner != cur {
-                    user_input_set_active(owner);
+                    focus_grant_or_shell(owner, cur, win);
                 }
                 crate::video::wm::focus_changed(owner);
                 let settle = crate::video::wm::zoom(win);
@@ -13923,23 +14405,58 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
                 // on a window other than the focused one), so it needs no throttle of its own. The
                 // line names the DISPOSITION as well as the address — CLICK-PLAIN: `delivered`, the
                 // wire proof that the raised window was handed its own press.
-                serial_println!(
-                    "[clickroute] press hit asid={} win={} (was {}) delivered",
-                    owner, win, cur
-                );
                 // The wake chain runs FIRST and in full: focus arrival (`user_input_set_active` ->
                 // `user_input_wake_edge(asid, "focus")`) then the raise and its unhide
                 // (`focus_changed` -> `set_hidden(asid, false)` -> `user_input_wake_edge(asid,
                 // "unhide")`). Only then does the caller push, and by then `USER_INPUT_ACTIVE` is
                 // `owner`, so the press lands in the ring of the window that was clicked.
-                user_input_set_active(owner);
+                //
+                // SINKVALID — ask FIRST, and say what actually happened. This is the arm the Jetson
+                // bench took onto `0xffffff02`, and the `delivered` line above it was a lie the moment
+                // `owner` had no ring: the press it announced was refused by the enqueue seam a few
+                // lines later. A deflected press is CONSUMED here instead — the row is still raised and
+                // the release is still dropped with the press, so the gesture looks the same to the
+                // operator and no half-pair reaches anyone.
+                if !focus_grant_or_shell(owner, cur, win) {
+                    crate::video::wm::focus_changed(owner);
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    return true;
+                }
+                serial_println!(
+                    "[clickroute] press hit asid={} win={} (was {}) delivered",
+                    owner, win, cur
+                );
                 crate::video::wm::focus_changed(owner);
                 // The release must follow the press into the SAME ring: record the raised owner, not
                 // the sentinel, so the pair is delivered whole.
                 CLICK_PRESS_TARGET.store(owner, Ordering::Release);
                 false
             }
-            Some(_) => {
+            Some((win, _owner, _z)) => {
+                // SINKVALID — the ALREADY-FOCUSED window (the arm above took every `owner != cur`), and
+                // the router's self-heal. After this arc no click can leave `cur` naming a dead sink, but
+                // the TAB ring still can: `wc_focus_key` cycles over `wm::focus_ring`, which lists every
+                // non-compat row owner including the kernel band. That seam is deliberately NOT changed
+                // here (deflecting it to the shell would WELD the rotation — `ring[0]` would be re-chosen
+                // and re-deflected forever, and the honest fix is to filter the ring, in `video/wm.rs`).
+                // So answer it where the operator will: a press on the row they are looking at hands the
+                // keyboard back to the shell and is consumed, instead of being addressed to a ring that
+                // does not exist. Costs one range compare on the hottest arm in the router.
+                //
+                // ⚠ TABKEY UPDATE — THE TAB DOOR IS NOW SHUT, so the paragraph above is history, not a
+                // live hazard. `wc_focus_key` rotates over `focus_ring_apps`, which drops every owner
+                // failing `key_sink_drains`; the filter does not weld because it REMOVES the row rather
+                // than deflecting off it, and it lives in this file rather than `video/wm.rs` because
+                // that file is x86's too (see `focus_ring_apps`'s note). This self-heal is KEPT and is
+                // now insurance rather than the only answer: `user_input_set_active` is `pub` and has
+                // callers outside the click and TAB paths (`run_user_image`, `dock::focus_set`), so a
+                // dead sink arriving from a third door still meets a way out, at the cost of one range
+                // compare. It is also the only path that can rescue a focus stranded before this fix.
+                if !key_sink_drains(cur) {
+                    focus_grant_or_shell(cur, cur, win);
+                    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+                    return true;
+                }
                 CLICK_PRESS_TARGET.store(cur, Ordering::Release);
                 false
             }
@@ -15004,6 +15521,18 @@ fn wcb_launcher(_demo_cpu: usize) {
     // capture.
     #[cfg(feature = "witness")]
     crate::video::knurl::selftest();
+    // TABFIXTURE: the TAB rotation, pressed and scored — LAST in this tail, and the position is the
+    // argument. It mints FOUR rows (two app owners, two KERNEL-BAND owners) and drives `focus_changed`
+    // n+1 times, so it must run after every per-window one-shot latch above has been claimed and after
+    // the three material fixtures have hashed their tiles; run earlier it would burn `[wc-c]`/`[wc-d]`
+    // latches the arc's real windows are owed, which is the same measurement `SHELLWIN-PI` recorded
+    // when the Pi shell window was minted too early (`MBENCH FAIL — 104/108`). It is also the last
+    // point at which the table is still EMPTY: `desktop_firmware::arm()` runs the moment this launcher
+    // RETURNS, and the shell window it mints would put a fifth owner in the ring the fixture measures.
+    // Self-cleaning (closes its rows by id, restores the entry focus, `wm::focus_reset`), so
+    // `desktop_firmware::arm()` still sees exactly the table it saw before this line existed.
+    #[cfg(feature = "witness")]
+    tabring_selftest();
 }
 
 // =============================================================================================
@@ -20176,7 +20705,10 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
     let Some(fid) = files_alloc(A, fc, sz, 0, 0) else {
         return false;
     };
-    let file_id = (fid + 1) as u64;
+    // CAPREVOKE: pack the descriptor's CURRENT generation — the revoke below decodes this file-id through
+    // `file_desc_validate`, which checks the gen, so a bare `(fid + 1)` would fail to match and the descriptor
+    // would never be freed (leaking the row, failing the verdict).
+    let file_id = file_id_pack(FILE_GEN[A as usize][fid].load(Ordering::Acquire), fid);
     // A ROOT File cap carrying CAP_WRITE|CAP_GRANT|CAP_REVOKE at index 2 (off index 0 / CONSOLE_FD, the U8 idiom).
     install_cap(A, 2, KIND_FILE, file_id, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
     // Pre-revoke: the root File+CAP_WRITE cap resolves — a `sys_write` through it WOULD pass the CHECK.
@@ -20188,19 +20720,20 @@ fn u9_check_revoked_write(fc: u32, sz: u32) -> bool {
     if g >= 0 {
         ok &= matches!(handle_resolve(A, g as u64, CAP_WRITE), Ok(HandleTarget::File(_)));
     }
-    // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2.
+    // Revoke the ROOT (index 2 carries CAP_REVOKE) -> kills the derivation subtree; the revoke clears index 2
+    // AND — because it is a File handle — frees the shared descriptor via `files_free` (CAPREVOKE).
     ok &= sys_cap_revoke(A, 2) == 0;
     // THE DENIAL: the derived File+CAP_WRITE cap is now stale — its next CAP_WRITE resolve (exactly the CHECK
     // `sys_write` performs) is `-EACCES`. This is the "a U8-revoked File cap write -> -EACCES" proof.
     if g >= 0 {
         ok &= handle_resolve(A, g as u64, CAP_WRITE).is_err();
     }
-    // Drop everything planted; index 2 was already cleared by the revoke, so clearing the derived handle drops
-    // the last node (the root's tombstone cascades free). Then demand every ledger clear — no leak on any path.
+    // Drop everything planted; index 2 was already cleared by the revoke (freeing the descriptor), so clearing
+    // the derived handle drops the last node (the root's tombstone cascades free). Then demand every ledger
+    // clear — the `files_row_is_clear` demand is what PROVES the revoke freed the descriptor (no leak on any path).
     if g >= 0 {
         handle_clear(A, g as usize);
     }
-    let _ = files_free(A, fid); // scaffold descriptor (dir_lba == 0): the refcount decrement is a no-op
     ok &= handle_row_is_clear(A) && files_row_is_clear(A) && deriv_all_free();
     ok
 }

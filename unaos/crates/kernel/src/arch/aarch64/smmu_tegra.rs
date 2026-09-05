@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// JB3 (probe half): read-only dump of the NISO1 SMMU pair — the layer the JB2c metal verdict
+// JB3 (probe half) — the file's ORIGIN, not its scope. Two acting halves grew in below it; the
+// read/write split is stated at the END of this header and that section, not this line, is the
+// safety statement for the module.
+//
+// Read-only dump of the NISO1 SMMU pair — the layer the JB2c metal verdict
 // indicted. With the USB2 pads powered (JB2c PASS) every port trains to U0, yet the controller
 // cannot write ONE command-completion or event into its rings in RAM: a total controller→memory
 // DMA-write failure, the predicted "UEFI left the XUSB stream's SMMU path as abort/stale"
@@ -34,11 +38,60 @@
 // class (USF vs context) and sGFSYNR0/1 record the faulting StreamID — the silicon literally
 // names its killer after the ENABLE_SLOT watchdogs.
 //
-// Safety: both instances live in GiB 0, Device-nGnRE in BOTH mmu_tegra tables (no new mapping);
-// the SMMU is always-powered fabric infrastructure like padctl (not a JX1 gated-partition
-// class), and this half is READ-ONLY — every register touched is a status/ID/config READ. Per
-// the JX1 discipline each instance announces itself on one serial line before its first read,
-// so a surprise dead address names itself.
+// ## Safety, and the READ/WRITE split (scope corrected 2026-08-31 — the old claim went stale)
+//
+// The MAPPING half of the old claim still holds: both instances live in GiB 0, Device-nGnRE in
+// BOTH mmu_tegra tables (no new mapping), and the SMMU is always-powered fabric infrastructure
+// like padctl — not a JX1 gated-partition class.
+//
+// THE READ-ONLY HALF DOES NOT, AND THIS RECORDS THAT RATHER THAN QUIETLY RESTATING IT. This
+// paragraph read "this half is READ-ONLY — every register touched is a status/ID/config READ"
+// from ff87ee712 (2026-07-07), when the file held nothing but the JB3 probe and the sentence was
+// true. "This half" scoped it to that probe — but nothing marked where the half ENDED, and two
+// acting halves grew into the same module beneath it: NET-4i (9f1ee7ed, 2026-07-19) added the
+// `wr()` primitive and the bypass arm, NET-4w (417f95b9, 2026-07-21) the identity-translate arm.
+// The sentence stayed at the top of the file — the only file-level safety statement a reader
+// meets — for the 43 days from that first write to this correction. Nothing enforced the split;
+// prose was the whole mechanism, and prose does not fail a build.
+//
+// WHAT READS, with no `wr`/`wrw` on any path: `rd`, `jb3_faults`, `jb3_fault_line`, `jb3_mc_errs`,
+// `jb3_v3_dump`, `jb9_stream_dump`, `net4i_recon`, `net4w_verdict`, `mmu500_geometry`.
+//
+// WHAT WRITES: exactly two entry points, `net4i_bypass` and `net4w_translate`, through `wr` (raw)
+// and `wrw` (announce → write → readback → fail closed on mismatch). SEVENTEEN register-write call
+// sites, counted by enumeration rather than inherited, in three classes:
+//   * 6 STREAM-MAPPING writes — SMR[n] / S2CR[n]. `net4i_bypass` 3 (an already-matching S2CR
+//     flipped to bypass; else a free slot's S2CR set to bypass, then that SMR marked VALID);
+//     `net4w_translate` 3 (S2CR → translate on either path, plus the SMR VALID on the free-slot
+//     path). These decide which DMA masters are translated, bypassed, or faulted. They are the
+//     opposite of read-only and the reason this section exists.
+//   * 9 CONTEXT-BANK writes — CBA2R/CBAR in GR1, then TCR2 / TTBR0_LO / TTBR0_HI / TCR / MAIR0 /
+//     SCTLR and an FSR W1C, all in a bank `net4w_translate` first proves no live stream routes to.
+//   * 2 GLOBAL TLB-MAINTENANCE writes — TLBIALLNSNH and sTLBGSYNC. TLBIALLNSNH is INSTANCE-wide:
+//     it invalidates every non-secure non-hyp entry, not merely this stream's.
+//
+// WHAT A READER MAY CONCLUDE ABOUT DMA ISOLATION HERE — AND WHAT THEY MAY NOT. On the armed path
+// this module is not a bystander to DMA isolation; it is what SETS it, for one stream, on every
+// instance the DTB named. It never lowers isolation globally: `sCR0.CLIENTPD` and `sCR0.USFCFG`
+// are read and reported, never written, and option (c) — global bypass — is deliberately not
+// implemented. It DOES place one PCIe stream either in bypass (untranslated; NET-4i) or through
+// `JB3_IDMAP`, a flat 1 GiB-block identity table covering IA[38:0] (NET-4w). Either route hands
+// that one master unrestricted reach across the covered PA range. Both arms fail closed on poison
+// or readback mismatch and announce every write before issue, so a serial capture says exactly
+// which route went live — what neither arm supplies is any BOUND on what that master may reach.
+//
+// REACHABILITY, so "carried" is never read as "runs". The module is `#[cfg(feature = "tegra")]`
+// (arch/aarch64/mod.rs), so it is in no default x86 or virt build. The reading half runs on every
+// tegra boot (`tegra_early_stop`, unknobbed). The writing half has exactly ONE caller,
+// `rtl8168_tegra::net4_bringup`, whose armed call site is `#[cfg(all(feature = "net4", feature =
+// "tegra"))]` in main.rs — a write therefore needs `UNAOS_NET4=1 UNAOS_TEGRA=1`. The default
+// jetson media (`tegra,tegrasmp`) COMPILES `net4i_bypass`/`net4w_translate` and never calls them.
+//
+// One further clause is struck rather than carried: the old paragraph also credited the JX1
+// discipline that "each instance announces itself on one serial line before its first read". That
+// described `jb3_probe`, retired in f0f28215 (2026-07-10). Among the survivors only `jb3_v3_dump`
+// still names a base before touching it; `jb3_faults` / `jb3_fault_line` read first and print
+// after.
 
 /// MMU-500 global register file 0 (GR0) offsets — SMMUv2, not v3.
 const SCR0: u64 = 0x000; // CLIENTPD b0, GFRE b1, GFIE b2, EXIDENABLE b3, USFCFG b10, SMCFCFG b21
