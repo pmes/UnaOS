@@ -61,6 +61,7 @@ Sources: `od` = `docs/dev/OS/08_VIDEO/orin-desktop.md` · `AC` = `docs/dev/evide
 | C7 | AC#21 (see AC) | orin | Orin | open | — |
 | C8 | The six render-pass defects (AC on ORINRENDER) | orin | Orin | flown — render2, all six scored | `a5a66fc1` `7ffd2122` `01739a93` `8085c9c8`; FR |
 | C9 (→ S11) | `sys_cap_revoke` leaks the fd on aarch64 | orin | Orin | fixed-unflown — QEMU kernel8-test 119/119 reaches it | CAPREVOKE `06858185` |
+| C10 | The carveout exclusion set carries two bounded GUESS windows that no DTB node or readable register confirms: the 0xbe QUIRK widened to 96 MiB (XCARVE-8 `81b2a415`) and the GiB-9 undeclared gap `[0x26c400000,0x279e00000)` up to the fb carveout (XCARVE-11 `8154bc1c`) — ~200 MiB of DRAM withheld from the heap on a guess; MC-register probing is EL3-crash class (XCARVE-8 record). Five July briefs pointed at it, nothing tracked it (P5 sweep) | orin | Orin | open — recorded fact; re-opens as a defect the moment a SNOC Carveout RAS lands OUTSIDE the set (the label is refutable by construction); no flight owed until then | `docs/dev/evidence/orin14/P5-SWEEP.md` rows 11, 13, 24, 25, 32; `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` §JETSON-XCARVE; §F row "Memory" | — |
 
 ## D. Decisions argued, awaiting Peter
 
