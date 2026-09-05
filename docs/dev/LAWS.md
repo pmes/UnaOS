@@ -127,7 +127,7 @@ belongs here, on the day it is made.
 Operational trap details (serial-log handling, media clobbers, fixture
 state, TCC, port collisions) live in the session-memory hazards ledger.
 
-## Ledgers — one per arch, one over-arching (Peter, 2026-09-05)
+## Ledgers — one per arch, one over-arching (Peter, 2026-09-05) — gated by GATE-LEDGER (`unaos/scripts/ledger-check.sh`, rmbp e693056a; go-red by tree mutation, nine states)
 
 - **Audits and inventories are high value. Re-derivation is the waste.** Every finding lands on
   exactly one list the turn it is found: the arch ledger (`docs/dev/OS/<track>-ledger.md`) when it
