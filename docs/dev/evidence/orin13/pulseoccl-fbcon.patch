@@ -1,0 +1,88 @@
+diff --git a/unaos/crates/kernel/src/video/fbcon.rs b/unaos/crates/kernel/src/video/fbcon.rs
+index f282096c..6e37b14c 100644
+--- a/unaos/crates/kernel/src/video/fbcon.rs
++++ b/unaos/crates/kernel/src/video/fbcon.rs
+@@ -1856,8 +1856,20 @@ fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (us
+         .saturating_sub(crate::ui_status::top_chrome_h(pw, ph))
+         .saturating_sub(crate::ui_status::chrome_h(ph))
+         .max(1);
++    // PULSEOCCLUDE — the console must also fit ABOVE the pulse window: the rows that window will take
++    // from the bottom of the work area (its box plus its gap, `pulsewin::reserve_h`), less this
++    // window's own chrome, cap the content height. A cap and not a subtraction from `avail_h`: the
++    // 7/8 rule and the budget loop below shrink both axes together, so shrinking the budget would
++    // have cost width the console did not need to lose. On the 1920x1200 bench panel the cap is the
++    // binding term (830 < 959) and the loop settles at 1379x672 — 42 rows where it was 46, and the
++    // last of them clear of the pulse box by 79 px instead of 64 px under it.
++    let pulse_h = super::pulsewin::reserve_h(pw, ph);
++    let fit_h = avail_h
++        .saturating_sub(pulse_h)
++        .saturating_sub(wm::TITLE_H + 2 * wm::BORDER)
++        .max(cell_h);
+     let mut w = (pw * 7 / 8).max(cell_w);
+-    let mut h = (avail_h * 7 / 8).max(cell_h);
++    let mut h = (avail_h * 7 / 8).min(fit_h).max(cell_h);
+     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
+     let box_px = |w: usize, h: usize| {
+         (w + 2 * wm::BORDER).saturating_mul(h + wm::TITLE_H + 2 * wm::BORDER)
+@@ -1963,11 +1975,17 @@ pub fn panel_console_window_open() -> wm::WinId {
+     // `win_content_extent` sized against, translated so the offset is taken below the top furniture.
+     // At `top_chrome_h == 0` (aarch64, every x86 build without `wc`, and any boot whose shell has not
+     // enabled a bar) this is the pre-MENUFIT expression unchanged.
++    // PULSEOCCLUDE — and centred in the work area LESS the pulse window's reservation, the same
++    // number `win_content_extent` just sized against, so the box lands above that window and not
++    // astride it. Zero where `pulsewin` declines the panel, and then this is the MENUFIT expression
++    // unchanged.
+     let wtop = crate::ui_status::top_chrome_h(pw, ph);
++    let pulse_h = super::pulsewin::reserve_h(pw, ph);
+     let ox = pw.saturating_sub(ow) / 2;
+     let oy = wtop
+         + ph.saturating_sub(wtop)
+             .saturating_sub(crate::ui_status::chrome_h(ph))
++            .saturating_sub(pulse_h)
+             .saturating_sub(oh)
+             / 2;
+     // CLICK-X86 — owner [`wm::KERNEL_OWNER_CONSOLE`]: the console still belongs to the KERNEL, and
+@@ -2031,8 +2049,8 @@ pub fn panel_console_window_open() -> wm::WinId {
+     publish_panel_owner(PanelOwner::ConsoleWindow, "fbcon::panel_console_window_open");
+     let (gcols, grows) = ((cw / cell_w).max(1), (ch / cell_h).max(1));
+     serial_println!(
+-        "[wc-x] console-window win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) cell={}x{} cols={} rows={}",
+-        id, pw, ph, cw, ch, ow, oh, ox, oy, cell_w, cell_h, gcols, grows
++        "[wc-x] console-window win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) cell={}x{} cols={} rows={} pulse_res={}",
++        id, pw, ph, cw, ch, ow, oh, ox, oy, cell_w, cell_h, gcols, grows, pulse_h
+     );
+     serial_println!(
+         "[wc-x] console-window panic-fallback armed win={} (panic paints the PANEL, not the window)",
+diff --git a/unaos/crates/kernel/src/video/pulsewin.rs b/unaos/crates/kernel/src/video/pulsewin.rs
+index b470ea04..1e899a5c 100644
+--- a/unaos/crates/kernel/src/video/pulsewin.rs
++++ b/unaos/crates/kernel/src/video/pulsewin.rs
+@@ -261,6 +261,28 @@ fn content_extent(pw: usize, ph: usize) -> Option<(usize, usize)> {
+ /// instrument. `ui_status::row_geometry` declines on the same principle one level down (`nled < 8`).
+ const FLOOR_CELLS: usize = 20;
+ 
++/// PULSEOCCLUDE — **the rows this window will take from the bottom of the work area once it opens**,
++/// in panel pixels: its outer box plus the gap [`open`] insets it by, or `0` when [`content_extent`]
++/// declines the panel (no window, nothing reserved).
++///
++/// For `fbcon::panel_console_window_open`, which sizes the console against the work area and centres
++/// it there, and until this existed did both as if this window did not exist. On the Orin's 1920x1200
++/// panel the two collided: the console's box sat at y 158..938 and this window's at y 874..1086 —
++/// 64 rows of overlap, z above, over the console's last four text rows, the prompt among them
++/// (`[wc-h] win=3 … span=64 band=yes`, `[wcn] win=3 … drg=N`; RENDER2-AUDIT N1). Same shape on the Pi
++/// at four cores, 16 rows deep, unnoticed because the Pi's console is frozen by the handoff before
++/// this window opens. The number is computed HERE, from the same `content_extent` + `spawn_geometry`
++/// pair `open` sizes the box with, so the reservation and the thing reserving it cannot drift apart.
++///
++/// Pure geometry: takes `WRITER` briefly inside `spawn_geometry` and nothing else, so it is safe from
++/// any caller that holds neither `WRITER` nor the window table.
++pub fn reserve_h(pw: usize, ph: usize) -> usize {
++    match content_extent(pw, ph).and_then(|(cw, ch)| wm::spawn_geometry(cw, ch)) {
++        Some((_scale, _ow, oh)) => oh.saturating_add(2 * wm::BORDER),
++        None => 0,
++    }
++}
++
+ /// The gap the content is inset by — half a line, the kit's own padding, matching the desktop band.
+ fn pad(m: &crate::ui::Metrics) -> usize {
+     (m.line_h / 2).max(2)

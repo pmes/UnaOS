@@ -1,84 +1,36 @@
-# Orin ledger — every finding, ticked once
+# ORIN-HW — Hardware support inventory, Jetson Orin Nano devkit (Tegra234)
 
-> Arch ledger for the Jetson Orin track. Cross-arch and shared-seam items live in
-> `docs/dev/LEDGER.md` (ids `S<n>`, `P<n>`); rows below that cross reference it by id.
+Executor ORINHW, 2026-09-05. Read-only: no edits, no builds, no bench. Measured against
+`hw-jetson` tip `2000608a` (PRTSCR-ORIN), the `render2` metal boot of 2026-09-05
+(`~/unaos-bench/scratch/orin13/render2-boot.log`, 924 lines; ANSI-stripped copy at
+`hw/render2-clean.txt` with the same line numbers), the butler's cumulative Orin log
+(`~/unaos-bench/capture/line-acm0/orin.log`, boots 2026-08-19 → 2026-09-05), the July bench logs
+(`~/unaos-bench/jetson-serial-2026-07-*.log`), the Pi captures (`capture/pi4-boot10/`, `pi4-boot12/`),
+the rMBP capture (`capture/rmbp9-flight5/ttyUSB0.log`), and the three track resume memories.
+Source audit detail (file:line for every claim) is in the four companion files in this directory:
+`agentA-cpu-smp-gic-timer.md`, `agentB-usb-storage-selfup.md`, `agentC-pcie-net-wifi.md`,
+`agentD-display-gpu-misc.md`. Kernel paths below are relative to
+`unaos/crates/kernel/src/`; `orin.log:N` means `capture/line-acm0/orin.log`; `r2:N` means
+`render2-boot.log`.
 
-> Rule (SECURITY.md's, applied to this track): **an arc that fixes, flies, or drops a ledger item
-> ticks it here in the same commit.** Every audit, inventory, or capture review folds its findings
-> into this table the turn it lands. Before spawning any audit, brief it with this file: report
-> only what is NEW or CHANGED. A finding re-derived because it was not here is the waste
-> (Peter, 2026-09-05).
+## The one fact that frames every row
 
-Status: **open** · **fixed-unflown** (in tree, not on metal) · **flown** (scored on the wire) ·
-**dropped** (ruled out, with the ruling) · **relayed** (another lane owns it).
-Sources: `od` = `docs/dev/OS/08_VIDEO/orin-desktop.md` · `AC` = `docs/dev/evidence/orin12/ARCH-CONFORMANCE.md` ·
-`OB` = `docs/dev/evidence/orin13/ORIN-BROKEN.md` · `RA` = `docs/dev/evidence/orin13/RENDER2-AUDIT.md` ·
-`SD` = `docs/dev/evidence/orin12/SERIAL-DEVLOOP.md` · `FR` = `docs/dev/evidence/orin13/FLIGHT-RESULT.md`.
+**The shipped Orin image carries ten features:**
+`witness,ehcihid,tegra,orindesk,orinclick,tegra_el0,tegrasmp,orinconwin,desktop_firmware,orinrender`
+(`build-render2.log` "aarch64 effective features"; `stage-render2.sh` KNOBS line). Every other
+`tegra`-capable feature in `Cargo.toml` — `pcieprobe pcie2 pcie3 net4 sdmmc sdmmc_arm vnet
+smpprobe smpmark bsptick bsprun orinel1ap orinwdt selfup rast rastmc ga10bprobe1 jd1dc orintenant
+holocron …` — is compiled only on the `arm-tegra*` type-check legs (`unaos/arroyo:2704-2836`) or
+armed by a bench knob for one flight. "WORKS ON METAL (knob)" below therefore means *proven on
+this board under an explicit `UNAOS_*` knob, absent from the image Peter boots today*.
 
-## A. What the operator sees broken (ranked by panel impact, OB table 1, 2026-09-05)
+States: **WORKS ON METAL** (cite the boot) · **WORKS ON METAL (knob)** · **COMPILED, UNFLOWN** ·
+**STUB** (prints a refusal) · **ABSENT** (no code) · **RULED OUT** (a ruling or the §4 boundary).
+Lane: **jetson** = GIC/timer + `tegra`-feature files; **pi** = Pi `arch/aarch64` files;
+**rmbp** = shared kernel-core (`sched.rs`, `drivers/xhci`, `block.rs`, `fs/fat.rs`, `video/`) —
+touching those from the jetson seat means a ccd grant first (CLAUDE.md lanes).
 
-| id | item | owner | flies-on | status | evidence | closed by |
-|---|---|---|---|---|---|---|
-| A1 | No desktop furniture (bar, dock, crystal); clicks land on nothing. §5.2 stop-line refuses `desktop_firmware::activate()` until the boot-core stack through the cascade is measured | orin | Orin | open — in flight (CASCADE) | `od` §5.2, §3.12; OB#1 | CASCADE executor (knob `deskcascade` + boot-stack probe) |
-| A2 | No EL0 program owns a window; `bg` refused; only the boot core drops to EL1 | orin | Orin | open — Peter's SMP D1–D5 ruling | `sched.rs` EL0-EL1CORE; OB#2 | — |
-| A3 | Keystrokes ignore focus; every key goes to the shell | orin | Orin | open — design (desktop pseudo-owner | `xusb_tegra.rs` header; `main.rs` ~:2916; OB#3 | — |
-| A4 | Serial RX dead; every retry is a card write + power cycle | orin | Orin | fixed-unflown — pending fold (ORINRX) | `SD`; FR q7 | ORINRX executor (knob `orinrx`, LSR witness) |
-| A5 | Strip + pulse window paint once and freeze (`presents=2`); core 0 load a structural 100% because the capstone loop never folded idle | orin | Orin | fixed-unflown | FR; OB#5 | LOADSAMPLER `341ca707` |
-| A6 | One core, no preemption; five APs run zero work | orin | Orin | open — `bsprun`/`bsptick` unflown | OB#6 | — |
-| A7 (→ S4) | Dock minimise round-trip never proven; aarch64 shell tile dead (`SHELL_REOPEN` drained only on x86) | rmbp | Orin | open | OB#7; AC | dock drain is video/ (rmbp lane) |
-| A8 | No file browser (`quarry` compiles, cascade-gated) | orin | Orin | open — follows A1 | OB#8 | — |
-| A9 | Print Screen produces nothing: service call never reached the terminus | orin | Orin | fixed-unflown | OB#9 | PRTSCR-ORIN `2000608a` (needs `UNAOS_HOLOCRON=1`) |
-| A10 | `<Esc>` cannot dismiss the pulse window's menu | orin | Orin | dropped — pulse window retired on the Orin (Peter 2026-09-05: it loads the old Pi background-pulse view | OB#10; AC#20 | CASCADE (removes arm/service) |
-| A11 | TAB mid-drag leaves the grab on the old window (x86 cancels) | orin | Orin | open | OB#11; AC#7 | aarch64 `wc_focus_key` |
-| A12 | No DHCP lease (NO-OFFER → static fallback); default jetson image carries no `net4` | orin | Orin | open | OB#12; NET-4A | — |
-| A13 (→ S3) | No `flight_recorder` on aarch64 (x86-only service) | rmbp | Orin | open — FC-2 shape | OB#13; `main.rs` ~:1747 | shared file; rmbp's FC-2 gate |
-| A14 | No Wi-Fi | orin | Orin | open — out of the north star | OB#14 | — |
-
-## B. Capture findings (RA, render2 boot 2026-09-05)
-
-| id | item | owner | flies-on | status | evidence | closed by |
-|---|---|---|---|---|---|---|
-| B1 | Pulse window overlaps the console's bottom 4 rows (prompt row); `[wc-h] win=3 span=64 band=yes` | orin | Orin | dropped — pulse window retired (A10 | RA N1 | CASCADE |
-| B2 (→ S1) | Both USB hubs fail status-change endpoint configure (codes 17 / 8); hot-plug behind hubs dead all boot. rmbp's read: interval/ESIT math in the endpoint context | rmbp | Orin | open — owner rmbp; to rmbp 11 (ledgered rmbp-12 P5) | RA N2; `xhci/mod.rs` ~:13465 | rmbp; fix flies on this bench |
-| B3 (→ S2) | `MOUSE-1` prints `vid:pid=0000:0000` for hub-attached pointers | rmbp | Orin | open — owner rmbp; to rmbp 11 | RA N3 | rmbp |
-| B4 | Three power-ons that session, two dark boots of the foreign volume `0xabfbdefa` (old loader); the firmware can still pick it | orin | bench | open — bench: find and wipe the medium carrying the old loader | RA §8; FR | Peter |
-| B5 (→ S6) | `PIUSB` witness family prints on the Orin (shared USB-storage driver, Pi-named) | rmbp | Orin | open — GATE-NEUTRAL census item | RA §6 | rmbp's GATE-NEUTRAL |
-
-## C. Architecture-conformance findings still open on the Orin (AC, 2026-09-02)
-
-| id | item | owner | flies-on | status | closed by |
-|---|---|---|---|---|---|
-| C1 (→ S9) | AC#1 knob→leg coverage check cannot fail on this branch | rmbp | Orin | open — until trunk carries KNOBLEG `647f485a` | rmbp landing |
-| C2 | AC#7 = A11 | orin | Orin | open | — |
-| C3 | AC#8/#9 layering vocabulary (`user-*` crates, "Ring 3" vs userspace) | orin | Orin | open — doc | — |
-| C4 (→ S8) | AC#12 `scan_serial_faults` passes on a missing log (negative-only suites) | rmbp | Orin | open — arroyo (shared | GATE-BLINDNESS (rmbp set) |
-| C5 | AC#14 GATE-BOOTLOADER hole: `unaos_ivb` leg | rmbp | Orin | fixed-unflown — gate, no flight; on hw-rmbp; lands with the rmbp landing | rmbp landing |
-| C6 | AC#20 = A10 | orin | Orin | dropped | — |
-| C7 | AC#21 (see AC) | orin | Orin | open | — |
-| C8 | The six render-pass defects (AC on ORINRENDER) | orin | Orin | flown — render2, all six scored | `a5a66fc1` `7ffd2122` `01739a93` `8085c9c8`; FR |
-| C9 (→ S11) | `sys_cap_revoke` leaks the fd on aarch64 | orin | Orin | fixed-unflown — QEMU kernel8-test 119/119 reaches it | CAPREVOKE `06858185` |
-
-## D. Decisions argued, awaiting Peter
-
-| id | item | recommendation | source |
-|---|---|---|---|
-| D1 | Loader `SetMode` to the widest console mode: the 80-col wrap occurs ONLY on F11-menu boots (7/39); auto-boots inherit 240x56 | do it narrowly, knob-gated, before/after witness; one power cycle to test | `docs/dev/evidence/orin13/CONSOLEMODE-ARGUMENT.md` |
-| D2 (→ S7) | `render_service` size-3 family: convergence arc (lift the waiting + input-ownership axes) | owed; ledger entry has an expiry | merge `be3b027e` body |
-| D3 | GA10B: read-only probe rung exists, gates unverified; licensing/bunker ruling pending | Peter | `od` §4; resume |
-
-## E. Landed but unflown (OB table 2) — each with the one question its flight answers
-TABKEY `ac9c0701` · `orintenant` (rung 6) · `orinladder` (a) glyphs-on-glass, (b) minimise round-trip ·
-`orinfurn` bar · `tegradesk` floors · the five §3.13 terminus instruments · `bsprun`/`bsptick` ·
-REDZONE absorber (0 lines on render2 = never fired, not held) · `reboot` verb (PSCI, never fired) ·
-NET-4 fix · window-body persistence after occluder subtraction · PRTSCR-ORIN (A9) · LOADSAMPLER (A5).
-
-## F. Hardware support inventory
-Measured 2026-09-05 (ORINHW; evidence files scratch (build logs only), capture
-`render2-clean.txt`). The shipped Orin image carries ten features; PCIe, NIC, SDMMC, watchdog, rast,
-selfup, tenants, EL1-AP and the periodic tick exist only on type-check legs or behind one-flight knobs.
-Corrections surfaced while measuring: the 48 MiB heap is the Pi's limit, the Orin maps 8 GiB; the BT
-radio IS on the Orin's USB bus (13d3:3549, no driver); audio/RTC/GPIO/I2C/SPI are absent on all
-three boards; PSCI SYSTEM_OFF has flown, SYSTEM_RESET has not.
+## The table
 
 | Subsystem | Orin status | Pi 4 status | x86 rMBP status | Evidence | What it would take | Lane |
 |---|---|---|---|---|---|---|
@@ -102,12 +54,12 @@ three boards; PSCI SYSTEM_OFF has flown, SYSTEM_RESET has not.
 | **Display — engine (mode set / vblank / page flip / cursor plane / DP-HDMI link)** | **RULED OUT (orin-desktop.md §4) for this ladder; nothing exists.** No mode set, vblank, flip, double-buffer, HW cursor or link programming in `display_tegra.rs` (0 hits). `jd1dc` (default-off, read-only, BPMP-PG-guarded) flew boot7e/7f: aperture 0x13800000 IS NV_PDISP class NVC67D (Ampere ga10x display, 2 heads, 2 SORs, 4 windows, core channel EFI-owned) — and the first *window* register read at 0x13802e00 was **EL3-fatal**; window sweep gated off. §4: "Mode-set, vsync and multi-head are DC-programming work that does not exist and is not required … until someone proves a safe non-powergated vblank source." | **ABSENT** beyond the firmware mailbox mode set; no vsync/flip tag used. | **ABSENT** beyond a single surface-repoint experiment (`nvidia-kepler-takeover`). | orin.log `JD1-DC-MODEL … MODEL-VERDICT=NVDISPLAY-CLASS-C670` ×9, `JD1-DC CENSUS heads=0 windows=0 … reads=5 writes=0` ×7; orin-desktop.md:3016-3055; `display_tegra.rs:56,687,774-800,1695` | **L / RULED OUT.** Hard fact: a correctly-bounded read inside the DTB-declared aperture is EL3-fatal on this silicon (§4, boot7f), and the permissive register reference (open-gpu-doc, nv-kernel-display-driver-source) documents a different generation's offsets. | jetson |
 | **EDID** | **WORKS ON METAL, witness only.** The bootloader reads it from the UEFI EDID protocols (`read_edid`), parses the native timing, carries it in `BootInfo::edid_block`; the kernel prints "edid present=1 hdr=OK sum=OK native=1920x1200 pclk_khz=154120 ext=1 len=256". No consumer — "`edid_block()` is the accessor a mode-set is". | unknown — not measured (Pi geometry comes from the firmware mailbox). | **WORKS ON METAL** via the same bootloader path (UEFI). | r2:13; `bootloader/src/main.rs:50,112,501-503`; `video/mod.rs:536-537,577,639` | — (only matters once the engine row exists) | jetson |
 | **GPU (GA10B)** | **RULED OUT.** §4: "GA10B GPU-core acceleration remains closed: its microcode is signed and encrypted with boot-ROM-enforced verification, so no permissive path opens it." One read-only flight (`ga10bprobe1`, knob, ends in PSCI SYSTEM_OFF): MRQ_PG GET_STATE + BAR0 GSP falcon/fuse/priscv reads, zero writes. The desktop uses the CPU + the `rast` software rasterizer (knob, unshipped): 90 frames/2970 ms = 30.3 fps at 320x240 on the 1920x1200 panel; `rastmc` spread it over 5 render cores. Pending Peter: "GA10B licensing/bunker ruling". | **COMPILED, UNFLOWN as a working path.** V3D 4.2 driver scaffolding, ~25 experiment knobs; the bin-wall / VPM write path is unresolved ("exhausted every ARM-reachable bin-wall hypothesis"). | **WORKS ON METAL, 2D only.** GK107 copy-engine blit ("present_us ~73 % of the blit"); no 3D. | orin.log `[ga10bprobe1] rung 1 complete … zero MMIO writes … SYSTEM_OFF`, `RAST: 90 frames in 2970 ms — 30.303 fps` ×11, `RAST-MC: pipeline width 5` ×7; `ga10b_probe.rs:4-60`; orin-desktop.md:3016-3055; Cargo.toml:1703,1716,1738; Pi `v3d.rs:17-38`, Cargo.toml:1169-1619; x86 `kepler_ce.rs:16-17` | **RULED OUT.** Hard fact: signed/encrypted GSP microcode; the only open question is the licensing ruling, not an engineering one. | jetson |
-| **Audio** | **ABSENT.** | **ABSENT.** | **ABSENT.** | `grep -rniE '\b(audio | hda | i2s | codec | sound | alsa)\b' --include=*.rs` → 35 prose hits, no module; no `drivers/audio`. The DTB `display@` reg-names list an `hdacodec` aperture (orin.log JD1-DC-REG) — the HDMI/DP audio codec sits inside the nvdisplay block that §4 forbids touching. | **L.** Hard fact: on the Orin the only audio hardware is the nvdisplay HDA codec (inside the EL3-fatal aperture) and I2S on the 40-pin header (needs a codec board + BPMP clocks). | jetson |
+| **Audio** | **ABSENT.** | **ABSENT.** | **ABSENT.** | `grep -rniE '\b(audio|hda|i2s|codec|sound|alsa)\b' --include=*.rs` → 35 prose hits, no module; no `drivers/audio`. The DTB `display@` reg-names list an `hdacodec` aperture (orin.log JD1-DC-REG) — the HDMI/DP audio codec sits inside the nvdisplay block that §4 forbids touching. | **L.** Hard fact: on the Orin the only audio hardware is the nvdisplay HDA codec (inside the EL3-fatal aperture) and I2S on the 40-pin header (needs a codec board + BPMP clocks). | jetson |
 | **Thermal / fan** | **WORKS ON METAL for the fan (shipped), no thermal read.** JB0: MRQ_CLK enable PWM3 (clk 107), MRQ_RESET deassert (70), one fixed CSR write ≈40 % duty ("fan ON … PASS", metal-proven 2026-07-06). No SOCTHERM read, no MRQ_THERMAL (only the "a future arc could" comment); BL31/BPMP run their own hardware thermal net independent of us (`initialized soctherm/thermal_mrq` are BPMP-firmware lines). `thermprobe` is x86-only (Apple SMC). | **ABSENT.** | **WORKS ON METAL (knob `thermprobe`).** Apple SMC SP78 temps / fpe2 RPM (`bench_ride.rs`). | r2:91-94 (JB0 fan ON PASS); `bpmp_tegra.rs:407-466`; `main.rs:2244`; Cargo.toml:931-935; `drivers/mod.rs:39`; orin.log BPMP `initialized soctherm` ×24 | **S** for a Tj readout (one more MRQ, `MRQ_THERMAL`, over the proven IVC channel); **M** for a duty loop. | jetson |
-| **RTC / time-of-day** | **ABSENT.** "The boards have NO RTC the kernel reads (§JD16)"; FAT timestamps and holocron carry no wall time. No Tegra RTC @0xc2a0000, no MRQ. | **ABSENT.** | **ABSENT** (no CMOS RTC read). | `clock.rs:3`; `fs/fat.rs:116,139`; `fs/holocron.rs:62`; `grep -rniE '\brtc\b | wallclock | cmos'` → statements of absence only | **S.** Hard fact: on the Orin the AON RTC is a plain MMIO block (needs the base verified against the DTB `rtc@` node and the same "is it powergated?" guard as everything else); alternatively NTP once the network row lands. | jetson |
+| **RTC / time-of-day** | **ABSENT.** "The boards have NO RTC the kernel reads (§JD16)"; FAT timestamps and holocron carry no wall time. No Tegra RTC @0xc2a0000, no MRQ. | **ABSENT.** | **ABSENT** (no CMOS RTC read). | `clock.rs:3`; `fs/fat.rs:116,139`; `fs/holocron.rs:62`; `grep -rniE '\brtc\b|wallclock|cmos'` → statements of absence only | **S.** Hard fact: on the Orin the AON RTC is a plain MMIO block (needs the base verified against the DTB `rtc@` node and the same "is it powergated?" guard as everything else); alternatively NTP once the network row lands. | jetson |
 | **Watchdog** | **WORKS ON METAL (knob `orinwdt`).** TKE WDT0 @0x0219_0000: `boot_arm()` programs a system-POR on the 5th expiry (60 s × 5 = 300 s), nothing pets it, `boot_ok_disarm()` at the EL1 terminus. Captures: "[orinreboot] wdt ARMED — POR reset in 300s" ×4, "wdt DISARMED — boot reached the EL1 terminus" ×2. Not on the shipped image. | **ABSENT** (BCM2711 PM/WDOG path "is the pi lane's" — not written). | **ABSENT.** | orin.log `[orinreboot] wdt ARMED/DISARMED`; `wdt_tegra.rs:4-41`; Cargo.toml:809; `main.rs:2102,2717`; `power.rs:124` | **S** to ship (it is one knob); **M** for a runtime pet from a periodic tick (needs the tick row). | jetson |
 | **Power / reset (PSCI)** | **SYSTEM_OFF WORKS ON METAL; SYSTEM_RESET COMPILED, UNFLOWN.** `power.rs` is PSCI-only on `aarch64 && !pi`: the ga10bprobe1 flight ended in "[orinshutoff] PSCI SYSTEM_OFF (0x84000008) via SMC" and the board went dark (MARK o3d "dark=success"). `reboot()` → SYSTEM_RESET 0x84000009 has never been issued on the wire; a returning call parks in `hlt`. The WDT POR above is the only reset mechanism that has fired. | **STUB.** "[orinreboot] no reboot mechanism wired on this platform (Pi: no PSCI; the BCM2711 PM/WDOG path is the pi lane's) — parking in hlt"; same for shutdown. | **Shutdown WORKS (ACPI S5 via `acpi_power::poweroff`); reboot STUB** ("FADT RESET_REG slot is the rmbp lane's — parking in hlt"); flight 6 measured a reset by other means. | orin.log `[orinshutoff] PSCI SYSTEM_OFF`, marks.txt `MARK o3d … ends SYSTEM_OFF (dark=success)`; `power.rs:38,46,57-71,90-112,121-134,142-157`; `arch/x86_64/acpi_power.rs:345` | **S** (one attended flight of `reboot` to prove SYSTEM_RESET on this BL31 v2.13). | jetson |
-| **GPIO / I2C / SPI / PWM (40-pin header)** | **ABSENT.** No GPIO, I2C or SPI driver on any board; the fan PWM CSR write is the only PWM write in the tree. | **ABSENT.** | **ABSENT.** | `grep -rniE '\bgpio\b | \bi2c\b | \bspi\b'` → one comment (`xusb_tegra.rs:29`), a future AUX-I2C note (`video/mod.rs:575`), GIC-SPI hits; `bpmp_tegra.rs:460` | **M** each. Hard fact: every header controller (GPIO, I2C, SPI) is BPMP-clocked/reset — the IVC path exists; the pinmux is UEFI's and untouched. | jetson |
+| **GPIO / I2C / SPI / PWM (40-pin header)** | **ABSENT.** No GPIO, I2C or SPI driver on any board; the fan PWM CSR write is the only PWM write in the tree. | **ABSENT.** | **ABSENT.** | `grep -rniE '\bgpio\b|\bi2c\b|\bspi\b'` → one comment (`xusb_tegra.rs:29`), a future AUX-I2C note (`video/mod.rs:575`), GIC-SPI hits; `bpmp_tegra.rs:460` | **M** each. Hard fact: every header controller (GPIO, I2C, SPI) is BPMP-clocked/reset — the IVC path exists; the pinmux is UEFI's and untouched. | jetson |
 | **BPMP / IVC (clocks, resets, power gates)** | **WORKS ON METAL (shipped).** HSP @0x3c00000 dimensioned (nSM=8), doorbell 19, SYSRAM tx/rx queues, "IVC channel ESTABLISHED", MRQ_PING 0xab5466 PASS on every boot (×31 in orin.log). MRQs implemented: PING, CLK IS_ENABLED/ENABLE, RESET DEASSERT, PG GET_STATE/SET_STATE. Used for XUSB (PG 12/10, 9 clocks), fan, SDMMC clock proofs, display PG guard. No MRQ_THERMAL / EMC / DVFS / RTC / UPHY. | **n/a** (no coprocessor; VideoCore mailbox is the Pi's equivalent — WORKS ON METAL). | **n/a** (Apple SMC via `smc`/`thermprobe` knobs). | r2:33-43 (JB1a/JB1b), r2:44-45 (JB5 PG), r2:77-90 (JB7 CLK census), r2:95-108 (JB1c); `bpmp_tegra.rs:17-36,55-68,158,183,473-570` | — (the channel is the leverage point for every other Tegra row: fan loop, RTC, PCIe C1/C4, header I/O) | jetson |
 | **Memory (RAM mapped, heap)** | **WORKS ON METAL.** `RAM-GiB-mask=0x3fc` = GiB 2..9 → all 8 GiB of DRAM mapped in 1 GiB L1 blocks (GiB 0 = device window); 6 SNOC-firewalled carveouts UNMAPPED (XCARVE-6, three from DTB `/reserved-memory`, three QUIRK guesses); heap = **48 MiB** at 0x2683ca000 chosen by `select_heap_region` as the highest window clear of 165 carveout ranges — degraded because the RC has no `dma-ranges` (RAS-2 heuristic); 2 MiB Normal-NC DMA window carved below it. **48 MiB is not the board's limit — it is the Pi's**: `allocator.rs:40-42` sets aarch64 (Pi *and* Orin) to 48 MiB because the Pi's heap region is hand-placed at 32 MiB, 64 MiB long, and the two builds are kept byte-identical. Compositor stage 4 MiB + back buffers come out of that 48 MiB. | **WORKS ON METAL.** 48 MiB heap at the hand-placed region. | **WORKS ON METAL.** 256 MiB heap. | r2:14-22 (mmu regs, XCARVE-6), r2:124-128 (HEAP-GUARD, DMA-WINDOW STOP, net4B window); `mmu_tegra.rs:259-275,714-734,1561-1596,1648,1715-1719,1786-1839`; `allocator.rs:36-42`; `fdt_tegra.rs:808,839` | **S** to give the Orin a board-sized heap (a `tegra` arm on `HEAP_SIZE`, byte-identity for the Pi preserved by the cfg); the carveout map and DMA-window derivation are the real work (**M**) and gate NVMe/NIC ring placement. | jetson (`mmu_tegra.rs`); `allocator.rs` shared |
 | **MMU / WXN / page permissions** | **WORKS ON METAL with WXN OFF at EL1, deliberately.** EL1 landing `SCTLR_EL1=0x30D01805` (M,C,I; bit 19 WXN=0). `mmu_tegra.rs:50`: setting PXN or SCTLR_EL1.WXN made every RAM GiB privileged-execute-never = "the JM6 metal dark". Protection is per-descriptor: EL0 user window in an unused GiB entry, code page EL0-RX/EL1-RO proven by AT probe ("EL0-read OK, EL1-write denied"). `wxnro` is x86-only. | Same `SCTLR_EL1_VAL` (shared `boot.rs:166`) → WXN OFF; per-descriptor EL0 protections via `aarch64_el0`. | **WORKS ON METAL.** EFER.NXE + CR4.SMEP on ("SMEP on", per-core NXE census), WXN-x86 classifier PASS, `wxnro` W-clear knob. | r2:434 (SCTLR_EL1), r2:443-445 (user window, AT probe); `boot.rs:161-166,322-329`; `mmu_tegra.rs:50,477-483,844-861`; `mmu_tegra_el0.rs:19-42`; Cargo.toml:167-170; `arch/x86_64/mod.rs:34-54`; flight5 `SMEP on`, `WXAUDIT-0 … PASS` | **M**, and a STOP-tripwire class of change: WXN needs a split map (RX kernel text, RW data) at 1 GiB block granularity today — i.e. L2/L3 tables for the kernel image before the bit can be set. | jetson (tegra map); `boot.rs` shared |
@@ -175,3 +127,16 @@ GPIO / I2C / SPI / RTC** (each S–M and each behind the proven BPMP channel, bu
 the board does before 1–5 do); **watchdog / SYSTEM_RESET / prtscr / heap size** (each S, each a
 one-knob or one-constant change worth taking on the next flight rather than an arc).
 
+## Things this inventory corrected while measuring
+
+- **The 48 MiB heap is the Pi's number, not the Orin's** (`allocator.rs:36-42`); the board maps 8 GiB.
+- **The Orin's Ethernet is a Realtek RTL8168 on PCIe**, not the Tegra EQOS; NET-4A is an Orin finding.
+- **The BT radio IS present** on the Orin's USB bus (13d3:3549, r2:363-366) — the companion
+  `agentC` file's "unsupported" line is wrong on this point and is annotated there.
+- **"AP timer PPI stretch deferred (JC3)"** on the wire is stale prose: each AP does arm a local
+  periodic tick (`smp_virt.rs:366`); what is deferred is the boot core's EL1 tick.
+- **`ehcihid` on the shipped Orin list compiles nothing on aarch64** (EHCI and the BT stack are x86-gated).
+- **`EVAC`** is not an identifier anywhere in the tree; it exists only as a retired plan word.
+- **The Orin's PCIe census stops at the first `pcie@` node**; the DTB marks three RCs okay
+  (`pcie@140a0000` = the GbE; `pcie@14100000`, `pcie@14160000` — by Tegra234 numbering the M.2
+  Key-E and Key-M slots, a mapping this tree has not measured).
