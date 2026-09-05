@@ -117,12 +117,13 @@ for path in files:
 
 # Evidence excerpts (pi 6, 2026-09-05): a serial capture is append-only across many boots, so an excerpt
 # without its BOOT ANCHOR is unidentifiable. Every *.log under docs/dev/evidence must carry one:
-# aarch64 `size 0x…` (the loader's kernel8 size line) or x86 `img=[…` (the WXN mapped span).
+# aarch64 `size 0x…` (the Pi loader's kernel8 size line), x86 `img=[…` (the WXN mapped span), or the Orin's
+# UEFI loader identity `KELF min=0x… max=0x…`.
 for lg in sorted(glob.glob("docs/dev/evidence/**/*.log", recursive=True)):
     try: body = open(lg, errors="replace").read()
     except OSError: body = ""
-    if not re.search(r"size 0x[0-9a-fA-F]+|img=\[0x[0-9a-fA-F]+", body):
-        red.append(f"{lg}: evidence excerpt carries no boot anchor (`size 0x…` or `img=[…`) — unidentifiable")
+    if not re.search(r"size 0x[0-9a-fA-F]+|img=\[0x[0-9a-fA-F]+|KELF min=0x[0-9a-fA-F]+ max=0x[0-9a-fA-F]+", body):
+        red.append(f"{lg}: evidence excerpt carries no boot anchor (`size 0x…`, `img=[…` or `KELF min=0x… max=0x…`) — unidentifiable")
 
 # RULINGS.md (pi 6, 2026-09-05): rulings get reversed (the cube, EVAC); an append-only quote file lets a
 # reader find only the dead one. Every R-row carries status ∈ {live, superseded, retracted} and, when
