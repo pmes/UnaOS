@@ -41,6 +41,7 @@ Status enum (a cell BEGINS with one of): `open` · `fixed-unflown` · `flown` ·
 | S22 | `plans/unaos/wip/u11-measure-twin-for-hw-pi4.patch` (2026-08-03): real work parked as a loose patch, **`git apply --check` FAILS** today; nobody dropped it, it died. Re-derive against the tree or rule it DROPPED | Pi | pi | Pi bench | open — decision owed | pi 6 audit 2026-09-05 |
 | S23 | `plans/unaos/wip/pi4-owed-tail-reland.md` (2026-08-12, no closure marker): a 3-milestone arc deferred at the `9259c2bf` resync when `video/wm.rs` was taken from trunk wholesale — M3 owed-tail split (`composite_tail_owed`, said to be a NO-OP SHIM), WEDGE-12 pre-size (`reserve_stage`), WCD-LIVE. Symbol counts 13/26/4 prove presence, not that the shim was filled. Invisible to pi 3–6 | Pi (`video/wm.rs` is shared) | pi (arc); rmbp (file) | Pi bench | open | pi 6 audit |
 | S24 | pi's arch ledger `docs/dev/OS/pi-ledger.md` exists at no ref; a support seat's findings had no home until this table accepted them. **Norm: LEDGER.md accepts an item from ANY seat regardless of focus; `owner` names who fixes it** | all | — | — | open — pi creates its ledger at its next focus; rows above are its seed | pi 6 |
+| S25 | LAWS.md §Ledgers names no gate: a law on the tree without the check that can fire it — the one carved exception. Amend it to name GATE-LEDGER the turn rmbp's gate sha reaches this seat, or strike the paragraph if the gate does not come | all | orin | — | open — conditional on GATE-LEDGER (rmbp) | LAWS.md §Ledgers; pi 6 2026-09-05 |
 
 ## P. Process hazards (every seat)
 
