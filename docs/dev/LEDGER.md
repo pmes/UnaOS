@@ -28,7 +28,7 @@ Status: **open** · **fixed-unflown** · **flown** · **dropped** (with the ruli
 | S9 | knob→leg coverage check could never fail (KNOBLEG `647f485a` fixes it) — not yet in trunk | all | rmbp | fixed-unlanded | rmbp landing |
 | S10 | `builder` was a second binary no check leg named (GATE-ROOTS `e1bff790` names all nine) | all | rmbp | fixed-unlanded | orin-13 baton correction |
 | S11 | `sys_cap_revoke` leaked the fd on aarch64 (x86 had the fix) | Pi, Orin | aarch64 shared `syscall.rs` | fixed-unflown `06858185`; Pi byte-identity baseline moves +29 lines | orin-ledger C9 |
-| S12 | Core-0 load accounting: the tegra capstone loop folded busy but never idle → structural 100%. Pi's `run()` folds idle correctly; **x86 boot-core path unchecked** | Orin fixed; x86 unknown | orin (`341ca707`); rmbp to check x86 | fixed-unflown / open (x86) | orin-ledger A5 |
+| S12 | Core-0 load accounting: the tegra capstone loop folded busy but never idle → structural 100%. Pi's `run()` folds idle correctly; **x86 boot-core path unchecked** | Orin only | orin (`341ca707`) | Orin fixed-unflown; **x86 checked by rmbp 11 — not the bug** (TSC-time meter folds busy AND idle; wire shows c0 5–12% idle, 88–99% under storm; rmbp-ledger C9) | orin-ledger A5 |
 | S13 | Both aarch64 boards: `[u7stk]` probe had no reachable caller outside `u7_launcher`; any task's depth needs its own probe call; the ungated `[redzone]` witness is the one that fires | Pi, Orin | each seat | recorded | orin-13 baton hard-won #1-2 |
 | S14 | Print Screen: key edge decoded in shared xHCI/EHCI on every arch; the SERVICE half is reachable on x86 and now the Orin (`2000608a`); **Pi: unverified** | all | pi to check | open (Pi) | orin-ledger A9 |
 
