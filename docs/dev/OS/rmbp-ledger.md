@@ -65,3 +65,14 @@ Status enum (GATE-LEDGER): **open** · **fixed-unflown** · **flown** · **lande
 - **`wc_shim` is an INLINE mod** at `arch/x86_64/syscall.rs:4777` — a filename search finds nothing. (B11)
 - **`panel_info_nonblocking` HAS x86 callers** (`video/quarry/live.rs:1698/:2324`, armed by `UNAOS_QUARRY=1`); the "x86 has no non-blocking door" premise was false. (B11, the C1 provenance lesson)
 - **Executor worktrees are cut from `main`, not the track tip** (→ P1). (rmbp-10)
+
+## E. Closed by the legacy sweep (2026-09-05; LEDGER P-row "one sweep of the legacy surfaces", rmbp slice)
+
+Swept: every rmbp/x86-named file under `~/.claude/plans/unaos/` (43 files, 13 surfaces); `past/` is closed by
+location. Four candidates >14 days old carried no closure marker; each now does, and the decision is here.
+
+| id | item | owner | flies-on | status | evidence | closed by |
+|---|---|---|---|---|---|---|
+| E1 | `fox/proposal-rmbp-pull7.md` (2026-07-22): Kepler display reads idle — gmux ownership / `gp_get=0` hypotheses, "awaiting Peter approval" for 45 days | rmbp | rmbp | dropped — superseded: the Kepler takeover landed and the desktop has rendered on Kepler on every flight since (`94b0ed0c` onward); the surviving residual is the iGPU mux (A7) | flights 1–7 (MANIFEST) | this sweep |
+| E2 | `wip/rmbp-arcD-M1-parked.md` (2026-08-19): phantom-press recovery redesign, "next session implements it" | rmbp | rmbp | landed — the motion discriminator is in `drivers/ehci/mod.rs:13991/:14032/:14097` and `BUTTON_UP_GEN` is gone (`pal.rs:333`), commit `4b9432bc`; the metal falsifier (a drag produces zero `recovered` increments) is unscored | `4b9432bc` | this sweep (marker added to the file) |
+| E3 | `review/rmbp-s12boot1-headdumps.md` + `rmbp-s12boot2-capture.md` (2026-07-23): raw Kepler head dumps for the GR2/GR3 pull review | rmbp | — | dropped — evidence for a review that closed in July; kept in `past/` as captures, not items | the files' own CORRECTION header | this sweep |
