@@ -58,7 +58,7 @@ witnesses counted here; no QEMU leg compiles `tegra`. The Orin evidence is the f
 Code: DESKSCENE `8cbfaadf` (A18: the cascaded scene retires the strip and its embedded pulse, the pulse
 window is serviced again; overlap now 24 px of frame) · RXDISCRIM `fe6fe3b5` (A16: `ovrf=` on the census,
 `iir=/fifo=` once, `~/unaos-bench/tools/inject-paced.sh`; knob-off kernel8.img and stripped knob-off ELF
-byte-identical) · PRTSCR2 (A17: the code commit lands via the two-chord proof; see §Flagged).
+byte-identical) · PRTSCR2 `f0db58bf` (A17: prtscr.rs per the patch + screenshot.md §9; rmbp 11 reviewed and approved; two-QMP-chord `UNAOS_WC=1 ./arroyo test-fat sf 200` proof — capturing→OK ×2, SCREEN0/SCREEN1 both valid 1280x800 PNGs of 3.07 MB; its check 66 legs / 0 red and test-arm 0 ran on the identical code tree, the docs-only commits between were gated by `ledger-check.sh`).
 Docs/ledger: LAWS `15bd2fd7` (landing-merge shape check) · FLIGHTPREP4 `8682f142` · P5SWEEP `3dcade58`
 (41 stale unmarked orin files → 30 already landed, 2 dropped, 0 still open; S27, C10) · NEUTRALTABLE
 `ebd98270` (7 families / 34 sites stripped vs the naive 12/43; 29 families / 265 sites with the colon-prefix
@@ -77,4 +77,4 @@ SCREEN files + UPD0.TMP (tidy before the render4 load). Pushes: `git push origin
 `git push origin hw-jetson`.
 
 ## Pushes
-`git push origin main` (d11cd56e) — DONE by Peter (origin main = d11cd56e, ls-remote 22:17Z). `git push origin hw-jetson` — owed, after the union check (green at `1aaf71f5`).
+`git push origin main` (d11cd56e) — DONE by Peter (origin main = d11cd56e, ls-remote 22:17Z). `git push origin hw-jetson` — owed; union check green at `1aaf71f5`, PRTSCR2 gated on its own tree.
