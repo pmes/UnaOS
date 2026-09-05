@@ -10193,12 +10193,12 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // `[pulse5]` / `[spin1]` train has never printed a line. Same placement argument as
     // `el0_refusal_rollup` directly above: baseline before the loop, poll inside the INNER `while`
     // (the outer one is runtime-dead on tegra, where the queue never drains). See `load_witness_poll`.
-    let _ = load_witness_emit();
+    let _ = load_witness_emit(); #[cfg(feature = "tegra")] let mut t_prev = now_cyc(); // LOADSAMPLER — SCHED-7's wall-clock anchor for THIS terminus (see the fold in the inner `while` below).
     // Cooperative dispatch loop: drain the run queue, then busy-poll (never WFI). `dispatch_next` returns
     // false only once the queue drains — after CAPSTONE has fully completed — at which point the core just
     // idle-spins (a headless regression captures the log within its timeout).
     loop {
-        while dispatch_next(cpu) { el0_refusal_rollup(); load_witness_poll(); }
+        while dispatch_next(cpu) { #[cfg(feature = "tegra")] { let t_now = now_cyc(); let busy = PASS_BUSY_CYC[cpu].swap(0, Ordering::Relaxed); ACCT[cpu].account(0, t_now.wrapping_sub(t_prev).saturating_sub(busy), 0); t_prev = t_now; } el0_refusal_rollup(); load_witness_poll(); } // LOADSAMPLER — the SCHED-7 IDLE fold, on the one dispatch loop the Orin boot core actually runs. `run()` folds every pass's wall-minus-busy remainder as idle (its `t_prev` anchor + the `PASS_BUSY_CYC` swap, ~line 6476); this loop folded ONLY the busy span `dispatch_next` banks, so `busy_pct()` computed `busy*100/(busy+0)` and core 0 read a structural 100% for the life of the boot (render2, 2026-09-05: `SCHED: load c0=100%` once, then silence; `[pstrip] rollup srcdelta=0 redraws=0` from the second rollup on; `[orinrender] census presents=2` frozen). Same arithmetic as `run()`'s, tegra-gated so the virt gate (whose post-drain `--` reading SCHED-8 documents) and the knob-off Pi image are byte-identical.
         core::hint::spin_loop();
     }
 }
