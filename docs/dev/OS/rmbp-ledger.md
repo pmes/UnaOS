@@ -53,6 +53,7 @@ Status enum (GATE-LEDGER): **open** · **fixed-unflown** · **flown** · **lande
 | → S9 | KNOBLEG `647f485a` — on hw-rmbp, reaches trunk at the rmbp landing | rmbp landing |
 | → S10 | GATE-ROOTS `e1bff790` — on hw-rmbp, reaches trunk at the rmbp landing | rmbp landing |
 | → S12 | Core-0 load: **checked on x86, not the bug** — TSC-time meter, `core_load` folds busy AND idle, core 0 folds every pass (`sched.rs:5411`); F6 c0 = 5–12% idle / 88–99% storm, F7 idle 6% | orin ticks S12 |
+| → S27 | 138 PRUNE-CANDIDATE origin refs from the 2026-07-25 branch triage never got Peter's OK under the never-trash law; 408 remote-tracking refs today. A `git push --delete` set that only Peter runs, on rmbp's say | rmbp prepares the list; PETER decides |
 | — | PWRNAME `bc10a469` + BOOTFADT `857c6dc8`: flown (F7), on hw-rmbp, unlanded — trunk prints `[orinreboot]` until the rmbp landing | rmbp landing (no S-row: it is the fix for S6's first instance) |
 
 ## D. Bench facts this track measured (not defects — no status; the command that measured each is the evidence)
