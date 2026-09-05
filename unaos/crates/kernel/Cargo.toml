@@ -2424,6 +2424,45 @@ orinface = []
 # UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
 # `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`. Kept in sync with arroyo.
 orindefer = []
+# SERIALRX (ORINRX): UNAOS_ORINRX=1 — the Orin's serial console can RECEIVE. Today the Orin is
+# output-only, and for the cheapest possible reason: `arch/aarch64/serial.rs`'s `tegra::read_byte`
+# (LSR.DR + RBR, the whole polled-RX contract of a 16550) is compiled into every jetson image and
+# reachable through `arch::poll_input`, but the console pumps — `jd2_console_pump` (both phases),
+# `jd2_supstate_phase2`, the headless `kbd_pump_body` — drain `pal::next_event()`, which is
+# `pop_event()` alone, no MMIO. The only tegra callers of the poll were `pal::pump_and_poll` (vug,
+# the selftest pager). Armed, ONE statement (`serial::serialrx::drain`) is appended to the xHCI poll
+# block of each of those FOUR pumps: poll the UART, push each byte as `Event::Key` onto the queue the
+# HID decoder feeds. Everything downstream (`handle_key`, the `:: tegra: JD2 — KEY` echo,
+# `shell::dispatch_command`) is already source-agnostic and untouched.
+#
+# DEFAULT OFF, AND WHY THAT IS LOAD-BEARING: the driver's `BASE = 0x0C28_0000` (UARTC, the AON port
+# the SPE streams the TCU onto) is marked TO VERIFY ON THE BOARD, and observed TX does not establish
+# RX. If BASE is wrong or the port is not ours, the failure is PHANTOM 0xFF BYTES injected into the
+# shell on every poll — the knob-off default is what protects the shipped image. Two `orinrx`-gated
+# diagnostics make a negative flight diagnosable, because `read_byte` returns `None` on an all-ones
+# LSR AND on no-data and so swallows the verdict: `[serialrx] lsr=0x… base=0x… -> RX-ZERO (0x0 = AON
+# UART held in reset / clock-gated, needs BPMP) | RX-OPENBUS (0xffffffff = open bus / wrong BASE) |
+# RX-DEAD (0xdead…, SoC decode error) | RX-LIVE`, printed once from the raw word of the first poll,
+# and `[serialrx] rx=<n>` on the pump's existing ~1 s sweep cadence. Witness token is
+# subsystem-named (`[serialrx]`), never board-named.
+#
+# Every site is a same-line append (`⚠ LINE-NEUTRAL`) and the diagnostics are a file-tail module in
+# serial.rs, so DEFAULT OFF => nothing moves in any file, no panic `Location` shifts, and the jetson
+# LOADED IMAGE is byte-identical to baseline — MEASURED, and stated precisely because the whole-file
+# sha is NOT: clean 077a8fa1 vs this tree knob-off, `llvm-objcopy --strip-all kernel.elf` shas are
+# equal (92780367…) and every byte before `.symtab` (all of .rodata/.text/.data.rel.ro/.data) is
+# equal; the whole-file sha differs in .symtab/.strtab only, where ThinLTO's `.llvm.<module-hash>`
+# symbol suffixes renamed. CONTROLS on the clean tree, one change each: a comment-only ` // x` on a
+# LIB-crate module file (xusb_tegra.rs) moves the whole-file sha exactly the same way (stripped sha
+# unchanged); the main.rs folds alone (BIN crate) do not; a new `[features]` entry alone does not.
+# So for a knob whose sites live in `unaos_kernel` module files the whole-file kernel.elf sha is
+# unattainable by construction — any byte in serial.rs or xusb_tegra.rs moves the symbol table —
+# and the byte-identity criterion for such knobs is the STRIPPED image, which this one meets.
+# The ARMED polarity is type-checked by the `arm-tegra-orinrx` leg of KERNEL_CFG_MATRIX in `arroyo`
+# (hosted on `arm-tegra-supstate`'s list so all four sites compile), never by the knob mapping.
+# UNFLOWN — no Orin has booted it; the first flight answers whether UARTC RX is ours. Kept in sync
+# with arroyo.
+orinrx = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
