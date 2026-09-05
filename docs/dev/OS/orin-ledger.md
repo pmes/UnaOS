@@ -19,10 +19,10 @@ Sources: `od` = `docs/dev/OS/08_VIDEO/orin-desktop.md` · `AC` = `docs/dev/evide
 
 | id | item | owner | flies-on | status | evidence | closed by |
 |---|---|---|---|---|---|---|
-| A1 | No desktop furniture (bar, dock, crystal); clicks land on nothing. §5.2 stop-line refuses `desktop_firmware::activate()` until the boot-core stack through the cascade is measured | orin | Orin | open — in flight (CASCADE) | `od` §5.2, §3.12; OB#1 | CASCADE executor (knob `deskcascade` + boot-stack probe) |
+| A1 | No desktop furniture (bar, dock, crystal); clicks land on nothing. §5.2 stop-line refuses `desktop_firmware::activate()` until the boot-core stack through the cascade is measured | orin | Orin | fixed-unflown — CASCADE `a20839c6` (knob `deskcascade`; boot-stack window probe pre/post; activate() on the terminus) | `od` §5.2, §3.12; OB#1 | CASCADE executor (knob `deskcascade` + boot-stack probe) |
 | A2 | No EL0 program owns a window; `bg` refused; only the boot core drops to EL1 | orin | Orin | open — Peter's SMP D1–D5 ruling | `sched.rs` EL0-EL1CORE; OB#2 | — |
 | A3 | Keystrokes ignore focus; every key goes to the shell | orin | Orin | open — design (desktop pseudo-owner | `xusb_tegra.rs` header; `main.rs` ~:2916; OB#3 | — |
-| A4 | Serial RX dead; every retry is a card write + power cycle | orin | Orin | fixed-unflown — pending fold (ORINRX) | `SD`; FR q7 | ORINRX executor (knob `orinrx`, LSR witness) |
+| A4 | Serial RX dead; every retry is a card write + power cycle | orin | Orin | fixed-unflown — ORINRX `9cb779bd` (knob `orinrx`; `[serialrx]` LSR witness), census made live in `60f7ec5e` | `SD`; FR q7 | ORINRX executor (knob `orinrx`, LSR witness) |
 | A5 | Strip + pulse window paint once and freeze (`presents=2`); core 0 load a structural 100% because the capstone loop never folded idle | orin | Orin | fixed-unflown | FR; OB#5 | LOADSAMPLER `341ca707` |
 | A6 | One core, no preemption; five APs run zero work | orin | Orin | open — `bsprun`/`bsptick` unflown | OB#6 | — |
 | A7 (→ S4) | Dock minimise round-trip never proven; aarch64 shell tile dead (`SHELL_REOPEN` drained only on x86) | rmbp | Orin | open | OB#7; AC | dock drain is video/ (rmbp lane) |
