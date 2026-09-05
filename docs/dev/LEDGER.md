@@ -11,7 +11,7 @@
 > affects more than one board, or is a gate/process rule; it goes on an arch ledger when it lives in
 > that arch's lane. Cross-reference by id (`S<n>` here, `<A|B|C|D><n>` on an arch ledger).
 
-Status enum (a cell BEGINS with one of): `open` · `fixed-unflown` · `flown` · `landed` · `dropped`; free text after " — ". `owner` ∈ {orin, pi, rmbp, shared-gate}; `flies-on` = the bench that scores it. Evidence paths point into git (`docs/dev/evidence/`); scratch holds build logs only.
+Status enum (a cell BEGINS with one of): `open` · `fixed-unflown` · `flown` · `landed` · `dropped`; free text after " — ". `owner` ∈ {orin, pi, rmbp, shared-gate}; `flies-on` = the bench that scores it. Evidence paths point into git (`docs/dev/evidence/`): reports, reviews, and capture EXCERPTS (item-scoped, ~50 KB, first line = the loader identity anchor that names the boot — a bare line range into an append-only capture rots the moment the file grows). Full captures stay on the bench (unversioned, unbacked: `~/unaos-bench` is not a git repo — pi 6 measured).
 
 ## S. Shared seams and gates
 

@@ -1,7 +1,7 @@
 # render2 FLIGHT RESULT — 2026-09-05, image render2-20260903T2157Z-8085c9c (hw-jetson 8085c9c8)
 
 Pinned by loader identity: `KELF min=0x0 max=0x2d92a8 pg=730` at raw.log unwrapped line 102226
-(render1 was max=0x2da2a8). Scored from `render2-boot.log` (924 lines at scoring time), board purity
+(render1 was max=0x2da2a8). Scored from `render2-boot.log` (924 lines at scoring time; the excerpt is committed beside this file, ANSI-stripped, first line = the loader anchor), board purity
 251 tegra lines / 0 Pi lines (the 5 `PIUSB` hits are the shared USB-storage driver's witness family
 printing on the Orin — a GATE-NEUTRAL census item, not Pi traffic). One boot OF RENDER2. Correction from the capture audit (RENDER2-AUDIT.md): the session
 had THREE power-ons — raw.log unwrapped 100418 and 101322 are dark boots of the known foreign volume
