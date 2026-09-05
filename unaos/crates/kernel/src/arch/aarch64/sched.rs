@@ -10613,3 +10613,49 @@ compile_error!(
 // census: `preempt=` (is preemption even armed), `surfwait=`/`seamwait=` (did a role ever have to
 // give the core back), and `pass=`/`flush=` (did the presenter keep up). A flight reading
 // `preempt=+0` has tested the cooperative core only and decides nothing about this section.
+
+/// DESKCASCADE — [`stk_probe`]'s scan and line over bounds the CALLER supplies, for a stack no
+/// `Task` describes. `stk_probe` reads its `low`/`top` out of `SCHED[cpu].current` and returns
+/// early when that is null, which is the boot core for the whole tegra terminus — so the Orin's
+/// desktop cascade (`main.rs`, DESKCASCADE tail block) paints a poison window below its own SP and
+/// hands the window here. Same poison, same word-then-byte scan, same `[u7stk]` shape, so one spec
+/// reads both; `task=0:<name>` stands where a task's `id:name` would. Saturates exactly as the task
+/// probe does: `hw=len headroom=0` is a lower bound, never a depth. `base` must be 8-byte aligned
+/// and `len` a whole number of words (the caller's window is SP-relative and SP is 16-aligned).
+#[cfg(feature = "witness")]
+pub fn stk_probe_bounds(at: &str, name: &str, base: u64, len: u64) {
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    let top = base + len;
+    const POISON_WORD: u64 = u64::from_ne_bytes([STACK_POISON; 8]);
+    let mut untouched;
+    unsafe {
+        let w = base as *const u64;
+        let words = len / 8;
+        let mut i = 0u64;
+        while i < words && core::ptr::read_volatile(w.add(i as usize)) == POISON_WORD {
+            i += 1;
+        }
+        untouched = i * 8;
+        let p = base as *const u8;
+        while untouched < len && core::ptr::read_volatile(p.add(untouched as usize)) == STACK_POISON {
+            untouched += 1;
+        }
+    }
+    let hw = len - untouched;
+    let used = top as i64 - sp as i64;
+    serial_println!(
+        "[u7stk] at={} task=0:{} sp={:#x} low={:#x} top={:#x} len={} used={} hw={} headroom={}",
+        at,
+        name,
+        sp,
+        base,
+        top,
+        len,
+        used,
+        hw,
+        len as i64 - hw as i64
+    );
+}

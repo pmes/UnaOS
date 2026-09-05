@@ -2354,6 +2354,17 @@ orinfurn = ["desktop_firmware", "orinclick"]
 # `orinconwin`. Declared self-sufficient so `UNAOS_ORINRENDER=1` alone can never compile the rung's
 # ABSENCE and report green.
 orinrender = ["desktop_firmware", "tegra_el0"]
+# DESKCASCADE: UNAOS_DESKCASCADE=1 gives the Orin the NORMAL desktop the Pi has — `desktop_firmware::activate()`'s
+# cascade (desktop-clear, console window, menu bar + crystal, the pulse-window latch, quarry when
+# armed) runs ONCE on the tegra terminus behind this ONE knob, DEFAULT OFF. Subsystem-named (the
+# desktop cascade), not board-named. It is the only feature that crosses §5.2's stop-line:
+# `main.rs`'s `TEGRADESK_CASCADE_OK` reads `cfg!(feature = "deskcascade")`, so the `tegradesk`
+# seam's refusal stands unchanged on every image without it. Carries the measurement §5.2 has asked
+# for since 2026-08-22 — `[u7stk] at=boot-core:pre-cascade` / `post-cascade`, a poison window laid
+# below SP on the firmware boot stack (witness-gated; `sched::stk_probe` itself is a no-op there).
+# Self-sufficient like `orinrender`, for the same reason; type-checked by `arm-tegra-render`.
+# Fly with `UNAOS_ORINRENDER=1` so the render pass presents what the cascade builds.
+deskcascade = ["desktop_firmware", "tegra_el0"]
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
 # ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
 #

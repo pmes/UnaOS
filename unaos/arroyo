@@ -1259,6 +1259,7 @@ _feats=""
 # `pal::EVENT_QUEUE`, and a second drainer would steal the shell's keystrokes.
 # The terms are appended here as well as implied by Cargo so the banner shows what it actually built.
 [ -n "${UNAOS_ORINRENDER:-}" ] && _feats="${_feats}orinrender,desktop_firmware,tegra_el0,tegra,"
+<<<<<<< HEAD
 # SERIALRX (ORINRX): UNAOS_ORINRX=1 lets the Orin's serial console RECEIVE — `serial::serialrx::drain`
 # appended to the xHCI poll block of the four tegra console pumps (`jd2_console_pump` x2,
 # `jd2_supstate_phase2`, `kbd_pump_body`) polls UARTC and pushes each byte as `Event::Key`, so a line
@@ -1268,6 +1269,18 @@ _feats=""
 # (~1 s). The ARMED polarity is type-checked by the `arm-tegra-orinrx` leg of KERNEL_CFG_MATRIX,
 # never by this mapping. `tegra` appended so the knob is self-sufficient (`orinrx = []` in Cargo).
 [ -n "${UNAOS_ORINRX:-}" ] && _feats="${_feats}orinrx,tegra,"
+=======
+# DESKCASCADE: UNAOS_DESKCASCADE=1 gives the Orin the NORMAL desktop, ONE knob, DEFAULT OFF —
+# `main.rs::tegra_desk_cascade` on the tegra terminus line (after the `orinfurn` seam, before
+# `tegra_render_arm`) calls `desktop_firmware::activate()`, the cascade §5.2 held, bracketed by the
+# witness-gated `[u7stk] at=boot-core:pre-cascade` / `post-cascade` boot-stack probes — the number
+# §5.2 has asked for since 2026-08-22. It also flips `TEGRADESK_CASCADE_OK` (a `cfg!` read) so the
+# `tegradesk` seam stops refusing on this image only. Fly with UNAOS_ORINRENDER=1 so the pass presents
+# what it builds; do NOT combine with UNAOS_ORINCONWIN/ORINDESK (the cascade REFUSES a non-empty table).
+# Witness: `[deskcascade] arming cascade`, `[deskcascade] -> CASCADED` / `REFUSE`. Emits real aarch64
+# code, so `arm_features` does not strip it. Type-checked by `arm-tegra-render`.
+[ -n "${UNAOS_DESKCASCADE:-}" ] && _feats="${_feats}deskcascade,desktop_firmware,tegra_el0,tegra,"
+>>>>>>> 71f24b4d (tegra: CASCADE — the Orin gets the whole desktop cascade behind one knob, with the boot-stack number §5.2 asked for, and the scaffold pass drops the pulse window)
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,desktop_firmware,tegra_el0,tegra,"
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
 # ORDINARY Orin boot. This is the one item of the 2026-08-26 `video/` parity survey that an operator
@@ -3074,6 +3087,9 @@ KERNEL_CFG_MATRIX=(
   # {orinrender}: `orinrender = ["desktop_firmware", "tegra_el0"]` and this row already carries both,
   # so a red here is attributable to the new rung and to nothing else. `arm-tegra-furn` was the other
   # candidate and is rejected for that reason — it would have added `orinfurn` to the delta.
+  # DESKCASCADE (2026-09-05) rides this row too: `deskcascade = ["desktop_firmware", "tegra_el0"]`
+  # is self-sufficient in the same way, so the delta grows to {orinrender, deskcascade} and nothing
+  # else; this is the ONLY leg that compiles `tegra_desk_cascade` and the boot-stack probes.
   #
   # PRECONDITION: this row carries `tegra_el0`, which compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin` — supplied by `ensure_user_blob` ahead of the matrix.
@@ -3090,7 +3106,7 @@ KERNEL_CFG_MATRIX=(
   # widest tegra desk cross, so the armed key path is type-checked against every desk knob it flies
   # with. Universe side effect: NONE — `holocron` is named on `x86-all`, so it was never "aarch64-only"
   # and `x86_cfg_universe` is unchanged.
-  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,holocron"
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
