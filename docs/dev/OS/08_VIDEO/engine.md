@@ -7980,7 +7980,30 @@ than overturning the decision:
 * `wm::KERNEL_OWNER_BASE` (`0xFFFF_FF00`) names a reserved band of owner ASIDs meaning *the kernel
   owns this window*. `KERNEL_OWNER_CONSOLE` and `KERNEL_OWNER_DESKTOP` are distinct values in it, so a
   click raises exactly the window under the hand rather than all of the furniture together.
-* `focus_ring` skips the band explicitly — property one, preserved.
+* ~~`focus_ring` skips the band explicitly — property one, preserved.~~
+  **⚠ FALSE, corrected 2026-08-31 (TABKEY).** `wm::focus_ring` filters `used && !compat &&
+  owner_asid != 0` and nothing else, so every kernel-band row it was said to skip passes straight
+  through it. Property one was preserved only where a *caller* re-established it: x86 added
+  `focus_ring_apps` (`arch/x86_64/syscall.rs`) to strip the band before its `<TAB>` rotation, and
+  that helper's own doc comment records the belief that aarch64 needed no twin because "on aarch64
+  that IS the app set". The Pi bench capture falsifies both sentences at once —
+  `~/unaos-bench/capture/line-acm0/pi.log` holds 249 `[wc-c] focus tab-cycle` lines and **102 of
+  them (41%) name a kernel-band destination**: 28× `0xffffff01`, 23× `0xffffff02`, 25×
+  `0xffffff03`, 26× `0xffffff60`. Every one of those handed the keyboard to a row with no ring.
+  TABKEY gives aarch64 its own `focus_ring_apps` (`arch/aarch64/syscall.rs`), filtering on
+  `key_sink_drains` — SINKVALID's exact complement of the ring seam's own refusal, which is a
+  superset of the band — so property one now holds on both arches *at the callers*, and still not
+  in `wm::focus_ring` itself.
+  **GATED 2026-08-31 (TABFIXTURE).** The correction above landed UNFLOWN, and the struck sentence is
+  exactly the kind that survives because nothing tests it. `tabring_selftest`
+  (`arch/aarch64/syscall.rs`, `witness`-gated) now asserts both halves in one boot on the aarch64
+  side: leg 1 is the **positive control** — `wm::focus_ring` really does hand back
+  `KERNEL_OWNER_CONSOLE` and `KERNEL_OWNER_DESKTOP`, so the band is measurably *not* skipped here —
+  and legs 2/5 are the caller's filter removing exactly those rows from the rotation. Without leg 1,
+  leg 5 would be a zero-hit result indicting the pattern rather than a finding about the filter.
+  Ledger and metal residue: `02_KERNEL_CORE/userspace.md` §TABKEY. The x86 twin
+  (`arch/x86_64/syscall.rs::focus_ring_apps`) has **no such fixture** and is still in the state
+  aarch64's was in before this arc.
 * `close_owner` refuses the band outright — property two, preserved, and *strengthened*: owner 0 was
   safe only because no teardown seam happens to pass 0.
 * `hit_test` needs no change: the band is non-zero, so kernel rows became hittable by construction.

@@ -607,10 +607,62 @@ FORBID \[wedge1\] dwell .*abandoned=[1-9]
 # ---    slot takes both windows out of those pixels — the "TAB to the prompt and read your output"
 # ---    case), reraise (a window comes back from under the shell). All four legs are in the one
 # ---    verdict, so a partial regression cannot pass by satisfying a prefix.
-# ---    The interactive path that reaches this on metal is TAB, which QEMU cannot press; the
-# ---    selftest drives `wm::focus_changed` directly, which is the same seam `wc_focus_key` calls.
+# ---    The interactive path that reaches this on metal is TAB. `[wc-fv]` drives `wm::focus_changed`
+# ---    directly, which is the same seam `wc_focus_key` calls — and until §4b' below, NOTHING in any
+# ---    fixture pressed the key that reaches that seam. (An earlier version of this note said "TAB,
+# ---    which QEMU cannot press". That was true of the PANEL half and never of the ROTATION half; see
+# ---    4b'. Corrected rather than deleted, because the sentence is why the hole survived four arcs.)
 REQUIRE \[wc-fv\] focus-vis .*-> PASS
 FORBID \[wc-fv\] focus-vis .*-> FAIL
+
+# --- 4b'. TABFIXTURE: THE ROTATION ITSELF, PRESSED. Two REQUIREs, and they are two different claims.
+# ---    THE HOLE THEY CLOSE. TABKEY (fold 2fac3552) rewrote `wc_focus_key` to rotate over
+# ---    `focus_ring_apps` — the compositor's focus ring MINUS every owner failing SINKVALID's
+# ---    `key_sink_drains` — so a cycle can no longer hand the keyboard to a row with no ring behind
+# ---    it. It landed with `./arroyo check` green, `test-arm` green and 117/117 here, and every one
+# ---    of those was a NO-REGRESSION verdict: measured on that exact tree, `target/serial-pi.log` and
+# ---    `target/serial-arm.log` carried ZERO `[wc-c] focus tab-cycle` lines, against 249 in the Pi's
+# ---    own metal capture. The filter that arc exists for was gated by nothing at all.
+# ---
+# ---    WITNESS 1 — THE WIRE. `[wc-c] focus tab-cycle <cur> -> <next> (ring of <n> + shell)` is an
+# ---    unconditional `serial_println!` inside the cycle body, reached only when a press actually
+# ---    MOVED focus. Before this fixture it had never appeared in a QEMU capture on either arch, so
+# ---    this REQUIRE is the one that says a TAB was pressed and the rotation ran — not merely that a
+# ---    fixture printed a verdict about itself. Deliberately NOT a COUNT: the fixture's press total
+# ---    is a function of how many rows the table happens to hold, and pinning it would make the gate
+# ---    hostage to the compositor's window count (the same argument §COUNT 26's floor note makes).
+# ---
+# ---    WITNESS 2 — THE SCORE. `tabring_selftest` (arch/aarch64/syscall.rs) builds a ring of FOUR
+# ---    rows — app owners 7 and 8 INTERLEAVED with `wm::KERNEL_OWNER_CONSOLE` (0xffffff01) and
+# ---    `wm::KERNEL_OWNER_DESKTOP` (0xffffff02), two of the four kernel-band owners decoded out of
+# ---    the Pi's 249-line capture, none of which drains a key — then presses TAB n+1 times and scores
+# ---    where `USER_INPUT_ACTIVE` went. Eight legs in one mask, so a partial regression cannot pass
+# ---    by satisfying a prefix: the raw ring really carries the band (the POSITIVE CONTROL, without
+# ---    which "the band is absent" indicts the pattern and not the filter), the filter is exactly the
+# ---    draining subset in order, the walk is in order, it wraps back to the shell, no press ever
+# ---    published a non-draining focus, every press and release was consumed, a focus stranded off
+# ---    the ring is rescued by one TAB (ANTI-WELD), and shell + empty ring leaves TAB an ordinary key.
+# ---    `witness=0xff` is pinned literally — a mask short of that is a leg that failed. `noweld=true
+# ---    shellpass=true` are pinned because those two legs print `n/a` when the table they need cannot
+# ---    be built, and `n/a` sets the mask bit: without these fields a boot where neither leg RAN would
+# ---    still read `0xff`. That is the whole of the difference between a check and a check that
+# ---    cannot fire.
+# ---
+# ---    NO FORBID PAIR, and that is not an omission. The failure branch prints `… :: FAIL ::`, which
+# ---    is already a builtin FORBID in mbench.py's DEFAULT_FORBIDS *and* a member of arroyo's
+# ---    FAULT_PATTERNS — so a broken rotation reds `kernel8-test` AND the spec-less `test-arm` leg
+# ---    with no directive here. A dedicated FORBID would be coverage arithmetic (the midden block's
+# ---    own argument); the SERWIT-2 ruling above is the case where one WAS needed, precisely because
+# ---    that emitter's `FAIL —` spelling matched neither default. This one matches both.
+# ---
+# ---    REQUIRED COUNT 117 -> 119, deliberately. The `pi4-barename.spec` argument for a second file
+# ---    does NOT apply here: those witnesses cannot exist in a run that types nothing, so a REQUIRE
+# ---    in this file would have red-ed the classic gate for behaving correctly. Both lines below are
+# ---    printed by every `witness` build on every boot, with no knob and no typist, so they belong in
+# ---    the base battery — and a fixture whose absence is not gated is a fixture that can be dropped
+# ---    silently, which is exactly how TABKEY came to be unflown while three gates read green.
+REQUIRE \[wc-c\] focus tab-cycle [0-9]+ -> [0-9]+ \(ring of [0-9]+ \+ shell\)
+REQUIRE :: TABRING: TAB rotation — witness=0xff .*noweld=true shellpass=true :: PASS ::
 
 # --- 4c. WEDGE-1r2: the drain barrier's DWELL ledger must reach the wire. WEDGE-1's `DRAIN STALLED`
 # ---    tripwire measures only past ~10^8 spins and speaks through a blocking serial lock, so its

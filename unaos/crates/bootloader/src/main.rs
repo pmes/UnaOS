@@ -447,6 +447,41 @@ fn main() -> Status {
     uefi::helpers::init().unwrap();
     log::info!("UnaOS UEFI Bootloader Started");
 
+    // CONGEOM — put the firmware's own console geometry on the wire, first, before anything long is
+    // printed. The loader's log is read line-wise and an 80-column ConOut hard-wraps 14 of its 15
+    // call sites (bootloader_spec.md §4), and until now a capture carried no record of the console
+    // at all — the only way to tell the regimes apart was to notice a record ending mid-word, which
+    // is exactly the read that failed.
+    //
+    // ⚠ THIS REPORTS GEOMETRY, NOT WRAPPING, AND THE TWO ARE NOT THE SAME QUESTION. Measured here:
+    // QEMU's aarch64 `virt` console reports `cur=100x31` and then renders loader lines at 240
+    // columns without wrapping anything. So `cur=` does NOT predict whether this boot will wrap;
+    // wrapping is the firmware terminal driver's behaviour, and only the Orin's does it. Read this
+    // line as "what the firmware says it has", never as "this boot is safe".
+    //
+    // READ-ONLY ON PURPOSE. This queries; it never calls `set_mode`. `wide=` reports the widest
+    // text mode the firmware offers, which is the evidence a later arc needs to decide whether
+    // asking for a wider console is even possible on this board — nobody knows today, and taking a
+    // blind SetMode on the console we are about to hand off through is not a trade this arc makes.
+    // A firmware that reports no current mode prints `cur=0x0`; that is a real answer, not a hole.
+    let (cur_c, cur_r, wide_c, wide_r, mode_n) = uefi::system::with_stdout(|out| {
+        let (mut wc, mut wr, mut n) = (0usize, 0usize, 0usize);
+        for m in out.modes() {
+            n += 1;
+            if m.columns() > wc {
+                wc = m.columns();
+                wr = m.rows();
+            }
+        }
+        let (cc, cr) = out
+            .current_mode()
+            .ok()
+            .flatten()
+            .map_or((0, 0), |m| (m.columns(), m.rows()));
+        (cc, cr, wc, wr, n)
+    });
+    log::info!("CON cur={}x{} wide={}x{} n={}", cur_c, cur_r, wide_c, wide_r, mode_n);
+
     // Boot-time diagnostics (UNAOS_BOOTDIAG=1 → `bootdiag` feature). Additive and OFF by default
     // (byte-identical boot logs when off). Runs here — while boot services are live and before any
     // GOP access — so a headless SoC (Jetson Orin) still surfaces the firmware identity, the GOP
@@ -740,7 +775,21 @@ fn main() -> Status {
     }
     
     let kernel_pages = ((max_vaddr - min_vaddr + 4095) / 4096) as usize;
-    log::info!("Kernel ELF: min_vaddr={:#x}, max_vaddr={:#x}, pages={}", min_vaddr, max_vaddr, kernel_pages);
+    // THE IMAGE-IDENTITY WITNESS — KEEP IT UNDER 80 COLUMNS. The Orin's UEFI ConOut is sometimes
+    // committed to 80x25 and sometimes is not: the loader never calls SetMode, so the width is
+    // inherited firmware state. On an 80-column boot the terminal driver hard-wraps every ConOut
+    // write at column 80 with a real CRLF — the bytes survive, but every reader here is
+    // line-oriented, so the tail vanishes from `awk '/pattern/'`. The old wording (`Kernel ELF:
+    // min_vaddr=…, max_vaddr=…, pages=…`) rendered at 100 and broke at the word `max_vaddr`, so the
+    // one line saying WHICH IMAGE THIS IS read as truncated while the value was on the wire all
+    // along — that cost orin 11 a session. Budget: the `uefi` prefix `[ INFO]: <file>@NNN: ` is 44
+    // columns, leaving 36. Measured on the QEMU wire: 32 of payload on aarch64 (76 total) and 34 on
+    // x86_64 (78 total, `max=0x127902f pg=4730` — the larger kernel already spends a seventh hex
+    // digit and a fourth page digit). x86_64 is the binding case, with 2 columns to spare, so do not
+    // add a field here. `max` keeps its name because it is what tells two images apart. 14 of the 15
+    // loader call sites are over budget and stay that way; read those with
+    // `~/unaos-bench/tools/unwrap80.sh <log>`.
+    log::info!("KELF min={:#x} max={:#x} pg={}", min_vaddr, max_vaddr, kernel_pages);
     
     let load_base = match boot::allocate_pages(
         boot::AllocateType::AnyPages,

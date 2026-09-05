@@ -2,7 +2,7 @@ fault_handler	2	aarch64_fault_handler tegra_fault_handler
 input_service	2	input_service x86_input_service
 on_block	2	on_block pi_on_block
 rast_demo_maybe	2	pi_rast_demo_maybe tegra_rast_demo_maybe
-render_service	2	render_service x86_render_service
+render_service	3	orin_render_service render_service x86_render_service
 run_bsp	2	run_bsp run_bsp_tegra
 start_secondaries	2	start_secondaries start_secondaries_tegra
 usb_pump	2	usb_pump x86_usb_pump

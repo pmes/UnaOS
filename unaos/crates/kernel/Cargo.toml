@@ -2336,6 +2336,35 @@ orinladder = ["orinconwin", "orinclick", "orindesk"]
 # Witness on the wire: `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`.
 # See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
 orinfurn = ["desktop_firmware", "orinclick"]
+
+# ORINRENDER (rung 5's owed core, §3.6) — the Orin gets a RENDER PASS. DEFAULT OFF.
+#
+# The Pi's `render_service` cannot be ported and this is measured, not stylistic. Both of its
+# transports — `GUI_CHANNEL` and `serial::shell_inbox` — are `baremetal`-gated, `baremetal` implies
+# `pi`, and `pi` + `tegra` is a hard `compile_error!` over the board UART (`arch/aarch64/serial.rs`).
+# They are absent from a tegra image, not merely unset. Its blocking discipline is illegal here too:
+# `run_capstone_boot_core` never sets `SCHED_ACTIVE` and has no sleeper drain, so a task that sleeps
+# parks in `SLEEPERS[0]` and is never woken — which is exactly why `jd2_console_pump` polls
+# cooperatively instead of blocking on a channel.
+#
+# So this knob does NOT add a second event loop. `jd2_console_pump` already owns the Orin's input
+# half (it drains `pal::EVENT_QUEUE` and feeds the shared, ungated `handle_key`); a second drainer
+# would steal its events. What is missing is the RENDER half, and most of that is already compiled
+# on tegra with zero callers: `open_shell_window`, `pulsewin::service`, `ui_status::tick`.
+#
+# The one real gap this closes: `desktop_firmware::armed()` is false for the WHOLE Orin boot. Its
+# only setter is `arm()`, called from `u7_launcher`, which is spawned in the `kernel_main` body that
+# tegra never reaches (`tegra_early_stop` is `-> !`). That latch is what stands between the Orin and
+# a shell window, and `arm()` is a latch store plus one serial line — NOT the cascade.
+#
+# §5.2 UNCROSSED, and that is the point of doing it this way: `desktop_firmware::activate()` is
+# never called, so the cascade that overflowed twice on Pi metal is not driven.
+#
+# Implies `desktop_firmware` (compiles `open_shell_window`/`pulsewin`/`retire_desktop_chrome`) and
+# `tegra_el0` (which is what turns on `aarch64_el0` and hence `pub mod syscall`), mirroring
+# `orinconwin`. Declared self-sufficient so `UNAOS_ORINRENDER=1` alone can never compile the rung's
+# ABSENCE and report green.
+orinrender = ["desktop_firmware", "tegra_el0"]
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
 # ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
 #

@@ -2028,16 +2028,17 @@ impl FatFs {
         }
     }
 
-    /// Read the FAT entry for `cluster` (the next cluster in the chain), from the FIRST FAT copy — the read
-    /// walkers' single-copy accessor. Delegates to [`FatFs::fat_entry_copy`] so the FAT-offset math (and its
-    /// out-of-region guard) lives in exactly one place.
-    fn fat_entry(&self, cluster: u32) -> Result<u32, FatError> {
-        self.fat_entry_copy(cluster, 0)
-    }
+    // CHAINGROW: the private single-copy accessor `fat_entry(c)` (a thin `fat_entry_copy(c, 0)`) used
+    // to live here. MULTIBLK moved the span walkers onto `collect_chain`, leaving `chain_clusters` as
+    // its last caller; CHAINGROW gave `chain_clusters` the same one-sector FAT cache, which reads the
+    // copy-0 sector directly (`fat_start + sec`) and inlines the identical decode. Nothing calls it any
+    // more, so it is gone rather than left behind as dead code. The multi-copy `fat_entry_copy` below
+    // is untouched and is still the accessor for every per-copy comparison.
 
     /// U10: read the FAT entry for `cluster` from a SPECIFIC FAT copy (`fat` in `0..num_fats`). A 2- or
     /// 4-byte entry never straddles a 512-byte sector boundary (2 and 4 both divide 512), so one sector read
-    /// suffices. The multi-copy accessor: `fat_entry` (copy 0) is the read path; the launcher compares copies
+    /// suffices. The multi-copy accessor: copy 0 is the read path (walked inline, with a sector cache, by
+    /// `chain_clusters` and `collect_chain`); the launcher compares copies
     /// to prove every FAT mutation mirrored to all of them. `parse_bpb` already gates the FAT size against the
     /// cluster count, but re-check `sec < fat_sz` so a stray out-of-range cluster can never read a sector
     /// outside the FAT (defense in depth on untrusted media).
@@ -2317,6 +2318,26 @@ impl FatFs {
     /// U10: every cluster in a file's chain, in order (empty for a 0-length / 0-cluster file). Bounded exactly
     /// as the read walkers (loop guard vs `count_of_clusters`). Public for the launcher's post-grow check and
     /// used by `write_grow` to find the chain tail.
+    ///
+    /// CHAINGROW: this walk CACHES the FAT sector across hops, exactly as its sibling
+    /// [`FatFs::collect_chain`] has since MULTIBLK. It is the same one-sector buffer, the same
+    /// invalidate-on-sector-change rule and the same per-CALL lifetime, so it adds no coherence
+    /// claim this file did not already make (a chain walk was never atomic against a concurrent FAT
+    /// mutation before, either). Nothing else moves: the visit order, every guard, the guard ORDER,
+    /// the returned `Vec` and every `FatError` are byte-for-byte what the uncached walk produced.
+    ///
+    /// Why it was worth doing. `write_grow` calls this ONCE per call to find the chain tail — which
+    /// is correct and is not the cost. The cost is that its streaming callers call `write_grow` once
+    /// per fixed window (`selfup_tegra.rs` `CHUNK` and `shell.rs` `CP_WINDOW`, both 32 KiB), so a
+    /// file of `n` windows pays `Σ` chain length ≈ `n²/2` hops, and every hop was an uncached
+    /// 512-byte `fat_entry` read with no block cache under it. On the Orin's measured geometry
+    /// (`spc=32`, 16 KiB clusters) staging `SRC.TGZ` (11 523 546 B) cost **123 552** single-sector
+    /// FAT reads — 94% of every block transaction the stage issued — against **1 146** with this
+    /// cache, because a FAT32 sector holds 128 entries and a formatter-laid chain is contiguous.
+    /// The quadratic TERM is the caller's and is untouched here; this removes ~128x of its constant.
+    /// (Witness for the cost: `docs/dev/OS/10_INSTALL/orin-selfupdate.md` §3 — the 300 s POR
+    /// watchdog fired mid-`SRC.TGZ`, and the harvested `UPD4.TMP` is 4 423 680 B = exactly 135
+    /// whole 32 KiB windows.)
     pub fn chain_clusters(&self, first_cluster: u32) -> Result<alloc::vec::Vec<u32>, FatError> {
         let mut out = alloc::vec::Vec::new();
         if first_cluster == 0 {
@@ -2325,6 +2346,9 @@ impl FatFs {
         if !self.valid_cluster(first_cluster) {
             return Err(FatError::BadChain);
         }
+        let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let mut buf = [0u8; SECTOR_SIZE];
+        let mut loaded = u64::MAX; // which FAT sector `buf` holds (u64::MAX = none) — as collect_chain
         let mut c = first_cluster;
         let mut hops = 0u32;
         loop {
@@ -2332,7 +2356,23 @@ impl FatFs {
                 return Err(FatError::BadChain);
             }
             out.push(c);
-            let next = self.fat_entry(c)?;
+            // Was `self.fat_entry(c)?`, i.e. `fat_entry_copy(c, 0)`. Same LBA (`fat_start + sec`,
+            // copy 0), same out-of-region guard in the same place, same decode — the ONLY change is
+            // that a hop landing in the sector already in hand does not re-read it.
+            let offset = c as u64 * entry_bytes;
+            let sec = offset / SECTOR_SIZE as u64;
+            if sec >= self.fat_sz as u64 {
+                return Err(FatError::BadChain); // `fat_entry_copy`'s defense-in-depth bound, preserved
+            }
+            if sec != loaded {
+                self.rd_sector(self.fat_start + sec, &mut buf)?;
+                loaded = sec;
+            }
+            let within = (offset % SECTOR_SIZE as u64) as usize;
+            let next = match self.kind {
+                FatKind::Fat16 => u16le(&buf, within) as u32,
+                FatKind::Fat32 => u32le(&buf, within) & 0x0FFF_FFFF,
+            };
             if self.is_eoc(next) {
                 break;
             }

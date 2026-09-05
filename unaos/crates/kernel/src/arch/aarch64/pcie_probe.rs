@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// ORIN-NET-1 — read-only PCIe root-complex + NIC recon (`pcieprobe` gated).
+// ORIN-NET-1 — read-only PCIe root-complex + NIC recon (`pcieprobe` gated) — the file's ORIGIN,
+// NOT its scope. Two later arcs grew into this same module and BOTH write — NET-2 page-table
+// descriptors, NET-3 fabric, config space, and the link-training enable. The split is stated in
+// "## The READ/WRITE split" at the END of this header, and THAT section — not this line, and not
+// the paragraph below — is the safety statement for the module.
 //
 // Orin has no network path yet. The Jetson Orin Nano devkit's NIC sits behind the Tegra234 PCIe
 // root complex, so networking begins by knowing exactly what the firmware (NVIDIA UEFI / L4T
-// 39.2.0) left us at ExitBootServices. This module is the SMP-2-style *census-before-touch* that
-// scopes the real bring-up chain (PCIe RC -> NIC -> smoltcp, already in-tree). It writes NOTHING to
-// fabric or config space, enables no clock or power domain, retrains no link, and changes no power
-// state — the wall (JETSON-XCARVE) taught this track to census before it touches.
+// 39.2.0) left us at ExitBootServices. The NET-1 CENSUS (`census`, `pcieprobe`) is the SMP-2-style
+// *census-before-touch* that scopes the real bring-up chain (PCIe RC -> NIC -> smoltcp, already
+// in-tree). THAT ENTRY POINT writes NOTHING to fabric or config space, enables no clock or power
+// domain, retrains no link, and changes no power state — the wall (JETSON-XCARVE) taught this track
+// to census before it touches. This sentence used to say "This module", and the split below records
+// why that is struck.
 //
 // Two layers, in strict order of trust:
 //
@@ -38,14 +44,86 @@
 // `0xdeadbeef` (firmware DRAM/register fill): either is ABSENT DECODE, never "present". A live
 // config space returns a plausible vendor id (not 0x0000/0xffff) whose word is not a poison fill.
 //
-// ## Read-only invariant (the arc's review lens)
+// ## The READ/WRITE split (corrected 2026-08-31 — the old claim was FALSE, not merely narrow)
 //
-// Every access in this module is a `read_volatile` or a DTB byte read. There is no `write_volatile`,
-// no `msr`/config write, no `SET_*` mailbox/MRQ, no `CPU_ON`, no link retrain, no BAR/command-reg
-// write. `GET_STATE`-class reads are the only firmware queries this arc would ever add (none are
-// needed here — the DTB `status` is the enable oracle). The compiled module is gated
-// `#[cfg(feature = "pcieprobe")]`; with the knob OFF (default) the module and its call sites vanish
-// and the image is byte-identical to baseline.
+// WHAT THIS SECTION REPLACES, quoted so the correction is RECORDED rather than silently restated
+// (the `fs/sdhc4c.rs` and `sdmmc_tegra.rs` precedent). The header used to carry, under the title
+// "Read-only invariant (the arc's review lens)": "Every access in this module is a `read_volatile`
+// or a DTB byte read. There is no `write_volatile`, no `msr`/config write, no `SET_*` mailbox/MRQ,
+// no `CPU_ON`, no link retrain, no BAR/command-reg write. ... The compiled module is gated
+// `#[cfg(feature = "pcieprobe")]`."
+//
+// Every load-bearing clause of that is false. `write_volatile` appears TWICE — once directly in
+// `net3_link_bringup`, once as the `write` closure in `net3_enumerate_and_size` that is invoked
+// four times. The module ENABLES the LTSSM, which starts link training. It DOES write BARs. And the
+// gate is wider than the sentence claims: `mod.rs` declares `pub mod pcie_probe;` under
+// `#[cfg(any(feature = "pcieprobe", feature = "pcie2"))]`, with `pcie3 = ["pcie2"]` and
+// `net4 = ["pcie3"]` above that. (Two clauses do survive and are kept below: no `msr`/mailbox/PSCI
+// call and no command-register write exist anywhere in this file.)
+//
+// HOW LONG IT STOOD, and why this is a worse failure than a claim that merely aged. The paragraph
+// was written in 223ddd53 (2026-07-17 16:13 -0600), when the module held nothing but `census`, and
+// it was true as written. NET-3 (893fe5c7) falsified it at 21:44 the SAME DAY — 5 h 31 min later —
+// by adding the exact primitive the sentence names as absent. No commit has touched these lines
+// since: the header was byte-identical from 223ddd53 to this correction, 45 days. NET-3's own
+// commit message calls itself "the lane's first deliberate fabric-write arc" and every write
+// announces itself on the wire, so nothing was hidden — it simply never propagated to the first
+// thing a reader meets. The absolute form is not the problem and stays keepable: `ga10b_probe.rs`
+// makes the same "there is no `write_volatile` in this module" claim and it holds. Prose was the
+// whole mechanism here, and prose does not fail a build.
+//
+// WHAT READS, with no MMIO write on any path: the NET-1 half in full (`census`, `decode_enabled`,
+// `config_liveness_read`), the DTB/format helpers (`leaf`, `contains`, `stringlist_has`,
+// `dump_words`, `dump_str_or_words`, `region_by_name`, `status_okay`), the liveness predicates
+// (`is_poison`, `live_vendor_device`), `dbi_dll_active`, and `census2` itself up to the point where
+// it hands off to `net2_link_and_device`.
+//
+// WHAT WRITES — three classes, in ascending order of consequence:
+//   * PAGE-TABLE DESCRIPTORS (NET-2 M1). `report_map` inside `net2_link_and_device` calls
+//     `mmu_tegra::map_mmio_window` for the dbi/config/ecam apertures (and appl, under `pcie3`);
+//     `ps_widen_witness` calls it three more times. Each `Mapped` result installs a Device-nGnRE L1
+//     block. The struck NET-1 text called a mapping "a write" and was right to.
+//   * ONE FABRIC WRITE — the LTSSM ENABLE (NET-3 M2, `net3_link_bringup`): a read-modify-write of
+//     APPL_CTRL setting LTSSM_EN (bit 7) on controller 0, followed by `dsb sy` and a
+//     finite-backstop poll of DLL-active / RDLH. This is what the struck clause "no link retrain"
+//     was reaching for, and it is STRONGER than a retrain: the PCIe-spec Retrain-Link bit
+//     (LNKCTL[5]) is never written anywhere in this file, but enabling the DesignWare LTSSM takes
+//     the link from not-training to training. In plain terms, this module brings a PCIe link UP.
+//   * FOUR CONFIG-SPACE WRITES — the BAR-SIZING RITUAL (NET-3 M3, `net3_enumerate_and_size`): one
+//     `write` closure invoked as all-ones probe + immediate restore on a BAR's low half, and the
+//     same pair on a 64-bit BAR's high half. FIVE static MMIO write sites exist in this file — one
+//     direct, four through that closure — counted here by enumeration rather than inherited;
+//     dynamically the loop can issue up to twelve config writes across the six BAR slots.
+//
+// WHAT A READER MAY CONCLUDE, AND WHAT THEY MAY NOT. The bounding the original spirit promised does
+// hold, and none of it is prose-only: the writes reach controller 0 and the one device below it,
+// never another controller; config-space writes are confined to the BAR array (dword offsets
+// 0x10..0x24) with an explicit guard that REFUSES a 64-bit type in BAR slot 5 rather than writing
+// past the array into the Cardbus CIS pointer at 0x28; every BAR original is restored on the
+// statement after its probe; each fabric write announces itself (">>> FABRIC WRITE") before issue;
+// and no command register, no LNKCTL, no PERST, no PHY, no clock, no power domain, and no
+// PSCI/mailbox call is written anywhere in this file. What a reader may NOT conclude is the thing
+// the struck paragraph promised outright — that this module cannot bring a PCIe link up. Armed, it
+// can, it does, and it leaves the link UP: nothing here tears it back down.
+//
+// REACHABILITY, so "carried" is never read as "runs". The module compiles under
+// `any(pcieprobe, pcie2)`, reachable by any of `UNAOS_PCIEPROBE`, `UNAOS_PCIE2`, `UNAOS_PCIE3` or
+// `UNAOS_NET4` (the last two imply `pcie2`). All are DEFAULT OFF, so a default jetson image does
+// not compile this file at all and every artifact stays baseline-identical modulo the ratified
+// 1-byte panic-Location class. The WRITING half additionally needs `tegra`: both `net3_*` functions
+// are `#[cfg(all(feature = "pcie3", feature = "tegra"))]` and their only call site sits in a
+// `pcie3` block inside `net2_link_and_device` (`all(pcie2, tegra)`), so a write requires
+// `UNAOS_PCIE3=1 UNAOS_TEGRA=1` or `UNAOS_NET4=1 UNAOS_TEGRA=1`. That is not a hypothetical path:
+// `net4` implies `pcie3`, so every Orin NETWORK image ever staged has carried the writers, and so
+// will every future one. The one write path that does NOT need `tegra` is `ps_widen_witness`
+// (`pcie3` alone) — on `virt` its `map_mmio_window` descriptors land in an inert static, which is
+// why the QEMU witness is safe, not why the module is read-only. Independently of any media, all 27
+// `arm-tegra*` legs of `./arroyo check` carry `pcie3,tegra`, so the writers are type-checked on
+// every check run.
+//
+// This file is a natural adopter of the opt-in `// INVARIANT: no-mmio-writes` marker the SMMUHDR
+// arc proposed: `census` / `config_liveness_read` could carry it; the two `net3_*` functions never
+// could, and that asymmetry is exactly what the marker is for.
 
 use super::fdt_tegra::Fdt;
 
@@ -828,17 +906,28 @@ pub fn census2(ctx: &PcieCtx) {
         );
     }
 
-    serial_println!(
-        "{} ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes) ::",
-        P2
-    );
+    #[cfg(not(all(feature = "pcie3", feature = "tegra")))] // pcie2-only (or non-tegra): the page-table descriptors really ARE the only writes, so this literal stays byte-for-byte what `orin-net2-bench.md` §wire promises.
+    serial_println!("{} ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes) ::", P2);
+    #[cfg(all(feature = "pcie3", feature = "tegra"))] // ⚠ CENSUS2LIE (orin 11): the literal above ALSO printed here and was FALSE from 893fe5c7 on — boot7h/7i/7j carry it on the wire, so the archive keeps a read-only claim over a boot that enabled an LTSSM and sized BARs. Corrected forward only; captures are never edited. ⚠ FOLDED IN PLACE, never added lines (panic `Location` records embed line numbers). Reversal: arch_arm64.md §ORIN-NET-3.
+    serial_println!("{} ORIN-NET-2 controller-0 preamble DONE — NOT read-only on this pcie3 image: past the page-table mappings this pass ARMS controller-0 fabric writes (the appl LTSSM enable, which can and does take the link from not-training to training; BAR-dword all-ones probes, each original restored the next statement, high half refused at slot 5). Which of them THIS boot issued is the `>>> FABRIC WRITE` lines above — read those, never this one. Bounding THIS PASS keeps, and nothing past it: controller 0 only, and outside those two classes no command-reg/decode-enable, LNKCTL, PERST, PHY, clock, power-domain or PSCI write, and no driver bind — on a `net4` image the driver's own decode-enable comes LATER, below this line ::", P2);
 }
 
 /// The metal half of NET-2 (tegra build only): map/reach controller-0's apertures via the kernel
 /// page-table path (M1), read link state from the RP's DBI config space (M2), and — if the link is up —
-/// walk the downstream device one level below (M2b). Every read is poison-rejecting; the ONLY writes are
-/// the Device-nGnRE page-table descriptors `map_mmio_window` installs. No fabric/config/BAR write, no
-/// link retrain, no BAR sizing.
+/// walk the downstream device one level below (M2b). Every read is poison-rejecting.
+///
+/// WRITES — the same correction the file header carries, applied here because this doc comment stated
+/// the identical false absolute. This USED to read "the ONLY writes are the Device-nGnRE page-table
+/// descriptors `map_mmio_window` installs. No fabric/config/BAR write, no link retrain, no BAR
+/// sizing." That is true of a `pcie2`-only build and FALSE with `pcie3` armed, which has been the case
+/// since 893fe5c7 (2026-07-17) — this very function's `pcie3` block calls `net3_link_bringup` (the
+/// APPL_CTRL LTSSM enable) and `net3_enumerate_and_size` (the BAR-sizing ritual). Under `pcie2` alone
+/// the page-table descriptors ARE the only writes; under `pcie3` they are the least of them.
+///
+/// FIXED by CENSUS2LIE, 2026-09-01, and this paragraph is kept as the record of its own falsification
+/// rather than silently replaced (`sdhc4c.rs`'s precedent). It read "KNOWN DEFECT, NOT FIXED HERE" and
+/// described `census2` claiming "read-only" after this function enabled a link and sized BARs. The DONE
+/// line is now `#[cfg]`-SPLIT — a flat rewrite would have made the `pcie2`-alone case newly false.
 #[cfg(all(feature = "pcie2", feature = "tegra"))]
 fn net2_link_and_device(
     appl: Option<(u64, u64)>,
