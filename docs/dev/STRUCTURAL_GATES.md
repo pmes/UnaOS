@@ -120,6 +120,54 @@ no allowlist beyond `default`.
 
 ---
 
+## GATE-LEDGER — the issue ledgers are a tracker, and every row is checkable
+
+**Invariant.** In `docs/dev/LEDGER.md` and every `docs/dev/OS/*-ledger.md`, each
+row of a table that has a `status` column has a unique id (`^[A-Z]+[0-9]+`), a
+status that begins with one of `open` · `fixed-unflown` · `flown` · `landed` ·
+`dropped`, an owner in {orin, pi, rmbp, shared-gate} where the table has an
+`owner` column, cross-references (`→ S<n>`) that resolve in `LEDGER.md`, shas
+that exist in the repository (and, for a fixed/flown/landed row, are ancestors of
+some track head — a fix nobody can fetch is not fixed), and evidence that lives
+in git: a `unaos-bench/scratch` path is red, a `docs/…` path must exist.
+
+**Why a gate.** Peter's rule (2026-09-05, `docs/dev/RULINGS.md` R6): one ledger
+per arch, one over-arching ledger, and the arc that fixes, flies, or drops an
+item ticks it in the same commit. A rule like that rots exactly when sessions are
+busiest: `PCIE-RP-RECOVERY.md` said "no reboot facility of any kind" for a day
+after FADTRESET landed, and on the day the ledgers were created their two files
+already used twelve spellings for about five states, mirrored one item under two
+ids with two statuses that disagreed within the hour, and cited eight evidence
+files that existed on one machine only. A table in a doc is still prose until
+something reads it.
+
+**Mechanism.** `unaos/scripts/ledger-check.sh` parses every markdown table with
+a `status` header in the ledger files present in the tree (a missing
+`LEDGER.md` is skipped with a line, since it reaches a track only at its trunk
+sync) and applies the invariant row by row. **Prose is never judged**: an id, a
+sha or a scratch path in a paragraph is not a row. Free text is allowed after the
+status word (`open — blocked on Peter's call`). Facts that are not defects have
+no state and belong in a list or the subsystem doc, not in a status table.
+
+**Control.** Zero ledger rows found in the files present → exit 2, no verdict.
+
+**Goes red when** an id repeats, a status begins with anything outside the enum,
+an owner is unknown, a `→ S<n>` dangles, a sha is not a commit (or a
+fixed/flown/landed sha is unreachable from every head), or a row cites evidence
+outside git. **GO-RED proof, by tree mutation on the day it shipped, nine
+states:** duplicate id → red naming the line; `standing` as a status → red;
+owner `peter` → red; sha `deadbee1` → red; a `~/unaos-bench/scratch` path → red;
+a missing `docs/` path → red; `→ S999` with a `LEDGER.md` present → red; `S99`,
+a sha and a scratch path in a PARAGRAPH → green (the prose control); `flown`
+with a reachable sha → green.
+
+**Legitimate update.** Fix the row: pick the enum word, move the evidence into
+`docs/dev/evidence/<arc>/`, name the sha that exists, resolve or drop the
+cross-reference. There is no allowlist. Agreed rmbp 11 ↔ orin 13, 2026-09-05;
+the LAWS §Ledgers paragraph cites this gate only now that it exists.
+
+---
+
 ## KNOBLEG — the knob→leg coverage check can now fail
 
 **Invariant.** Every aarch64-qualified kernel feature — one with a cfg site under

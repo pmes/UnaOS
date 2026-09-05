@@ -4299,6 +4299,22 @@ check_both() {
         echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
         return 1
     fi
+    # GATE-LEDGER: the issue ledgers (docs/dev/LEDGER.md, docs/dev/OS/*-ledger.md) are a TRACKER, and a
+    # tracker whose rows nothing checks is prose that rots — PCIE-RP-RECOVERY.md said "no reboot facility
+    # of any kind" for a day after FADTRESET landed. Peter's §Ledgers rule (2026-09-05: one ledger per
+    # arch, one over-arching; the arc that fixes/flies/drops an item ticks it in the same commit) is held
+    # by this block: ids unique, status begins with one of open|fixed-unflown|flown|landed|dropped, owners
+    # known, `→ S<n>` cross-refs resolve, every sha named exists (and a fixed/flown/landed row's sha is an
+    # ancestor of some track head), evidence paths live IN GIT (a `unaos-bench/scratch` path is red).
+    # Prose outside a table is never judged. Agreed rmbp 11 ↔ orin 13; go-red proven by tree mutation
+    # (see scripts/ledger-check.sh tail) before it shipped.
+    local _lrc=0
+    if "$WORKSPACE_DIR/scripts/ledger-check.sh" "$WORKSPACE_DIR/.."; then
+        echo -e "${COLOR_GREEN}  ✅ ledgers (ids, status enum, owners, cross-refs, shas, evidence in git)${COLOR_RESET}"
+    else
+        _lrc=1
+    fi
+
     if [ "$_crc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
         return 1
@@ -4313,6 +4329,10 @@ check_both() {
     fi
     if [ "$_rrc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a binary target is named by no check leg, or builder did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_lrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a ledger row is unverifiable (see GATE-LEDGER above)${COLOR_RESET}"
         return 1
     fi
 }
