@@ -3071,7 +3071,17 @@ KERNEL_CFG_MATRIX=(
   #
   # UNIVERSE SIDE EFFECT: `orinrender` becomes arm-claimed, so it leaves `x86_cfg_universe` and the
   # derived `x86-mix-*` count is unchanged. Board legs 34 -> 35; gate legs 43 -> 44.
-  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender"
+  #
+  # PRTSCR-ORIN (2026-09-05): `holocron` is APPENDED at the end. `main.rs::jd2_console_pump`'s sweep
+  # carries the Orin's one `prtscr::service()` call behind `cfg(feature = "holocron")` — the arming knob
+  # for "this boot may WRITE its boot medium" (`UNAOS_HOLOCRON=1 ./arroyo esp-jetson`; the knob is not
+  # stripped by `arm_features`). Until now NO aarch64 leg carried `holocron` together with `tegra`
+  # (`arm-pi` carries it, but `pi`/`tegra` are mutually exclusive), so that call site was a cfg no leg
+  # compiled — the KNOBLEG hole. Hosted here rather than on a new row because this row is already the
+  # widest tegra desk cross, so the armed key path is type-checked against every desk knob it flies
+  # with. Universe side effect: NONE — `holocron` is named on `x86-all`, so it was never "aarch64-only"
+  # and `x86_cfg_universe` is unchanged.
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,holocron"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
