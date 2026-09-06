@@ -135,10 +135,18 @@ for path in files:
             # stop checking a real commit sha in any row that happened to mention an image, which
             # is a check that cannot fire. An UNLABELLED hex token is still a short commit sha and
             # must resolve.
+            # DEDUP: collect first, report each distinct sha ONCE. The escape check is
+            # per-OCCURRENCE (a sha may appear both declared and bare in one row, and the bare
+            # occurrence is still a reference), but the FINDING is per-sha. Switching this loop
+            # from set(findall) to finditer to add the escape silently dropped that dedup and a
+            # row citing one bad sha twice reported it twice -- duplicate findings are how a gate
+            # teaches people to skim its output.
+            bare = set()
             for m in re.finditer(r"(?<![0-9A-Za-z])([0-9a-f]{7,8})(?![0-9A-Za-z])", rowtext):
-                s = m.group(1)
                 if re.search(r"[A-Za-z][A-Za-z0-9_-]*:$", rowtext[max(0, m.start() - 24):m.start()]):
                     continue   # author-declared artifact digest, not a commit
+                bare.add(m.group(1))
+            for s in sorted(bare):
                 if not sha_exists(s):
                     red.append(f"{where}: {rid} names sha {s} which is not a commit in this repo")
                 elif head in FETCHED and not reachable(s):
