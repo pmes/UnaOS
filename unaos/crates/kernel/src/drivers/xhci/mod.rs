@@ -2382,7 +2382,7 @@ pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 /// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
 /// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
 /// they go to `service_hid_halts`, which prints its own line.
-pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -2797,7 +2797,7 @@ pub struct DeviceSlot {
     /// last report but absent now IS a release — the decode emits `pal::Event::KeyUp(ascii)` for
     /// each such code (edge-detected here, mirroring the pointer-button press-edge idiom). All-zero
     /// = no keys held. Seeded to zero at enumeration and cleared on slot reuse.
-    pub keyboard_prev_keys: [u8; 6],
+    pub keyboard_prev_keys: [u8; 6], pub keyboard_prev_mods: u8, // PRTSCLOST (orin 17) — report byte 0 of the PREVIOUS report, kept beside its six keycodes so `KBD_RESTATED_COUNT` can compare the WHOLE report. Without it a modifier-only edge (Shift pressed with no key held, or pressed while one is) restates the six keycodes without restating the report, and would score as a lost intermediate — a false conviction on the one counter whose whole value is that it cannot be explained away. ⚠ FOLDED onto the existing field, no line added.
 
     /// HID-LED: current keyboard lock-LED bitmap for this slot (USB HID Output report,
     /// LED usage page): bit0 = Num Lock, bit1 = Caps Lock, bit2 = Scroll Lock. Toggled on
@@ -2921,7 +2921,7 @@ impl DeviceSlot {
             keyboard_expect_phys: 0,
             keyboard_prev_phys: 0,
             keyboard_report_count: 0,
-            keyboard_prev_keys: [0; 6],
+            keyboard_prev_keys: [0; 6], keyboard_prev_mods: 0, // PRTSCLOST — seeded with its six keycodes. ⚠ FOLDED.
             keyboard_leds: 0,
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
@@ -3007,7 +3007,7 @@ impl DeviceSlot {
         self.keyboard_expect_phys = 0;
         self.keyboard_prev_phys = 0;
         self.keyboard_report_count = 0;
-        self.keyboard_prev_keys = [0; 6];
+        self.keyboard_prev_keys = [0; 6]; self.keyboard_prev_mods = 0; // PRTSCLOST — cleared on slot reuse beside its six keycodes, or a recycled slot's first report would compare against a dead device's. ⚠ FOLDED.
         self.keyboard_leds = 0;
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
@@ -3653,7 +3653,7 @@ impl XhciController {
     /// the event ring is empty. This is the SINGLE entry point for consuming events —
     /// used by both poll_events() and the synchronous BOT pump — so there is exactly one
     /// ERDP owner and the EVENT_RING lock is never held across dispatch.
-    fn drain_event_ring_once(&mut self) -> bool {
+    fn drain_event_ring_once(&mut self) -> bool { { let now = crate::arch::now_cycles(); let prev = KBD_DRAIN_LAST.swap(now, Ordering::Relaxed); if prev != 0 { let gap = now.wrapping_sub(prev); KBD_DRAIN_GAP.store(gap, Ordering::Relaxed); if gap > KBD_DRAIN_GAPMAX.load(Ordering::Relaxed) { KBD_DRAIN_GAPMAX.store(gap, Ordering::Relaxed); } } } // PRTSCLOST — THE SINGLE PLACE THAT KNOWS WHEN SOFTWARE LOOKED AT THE RING. This is the one entry point for consuming events (the doc block above), so the gap between two calls of it bounds how long a retired interrupt-IN TD went un-re-armed, and therefore how long the keyboard endpoint had no TD queued. Stamped BEFORE the empty-ring early return on purpose: a pass that found nothing still LOOKED, and counting only non-empty drains would report the device's idle time instead of the pump's cadence. The keyboard completion latches `KBD_DRAIN_GAP` into `KBD_ARMGAP_MAX` so the reported bound is the one that preceded a real report rather than an enumeration stall. Cost: one `now_cycles()` (rdtsc / one MRS of CNTVCT) and three relaxed accesses against the uncached MMIO this function already does. ⚠ FOLDED onto this line — see `KBD_REARM_COUNT`'s note.
         let (trb, dequeue_index) = {
             let mut guard = EVENT_RING.lock();
             let ring = guard.as_mut().unwrap();
@@ -4246,7 +4246,7 @@ impl XhciController {
                                     if !self.hid_halt_pending.contains(&(slot_id as u8, false)) {
                                         self.hid_halt_pending.push((slot_id as u8, false));
                                     }
-                                } else {
+                                } else { KBD_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — `MOUSE_ERROR_REARM_COUNT`'s twin, which the keyboard arm never had: re-arms driven by a NON-halting error completion on the keyboard interrupt-IN. A separate population from `KBD_DISCARD_REARM_COUNT` for the same reason the pointer keeps them apart — the two hide different repairs. Halting codes are NOT counted here; they go to `service_hid_halts`, and `hid_error_witness` above already prints them UNGATED. ⚠ FOLDED.
                                     self.queue_keyboard_read(slot_id as u8);
                                 }
                                 return;
@@ -4805,9 +4805,9 @@ impl XhciController {
                                                 && slot.keyboard_ring.is_some();
                                             xdbg!("xHCI: stale/spurious keyboard event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
                                                 slot_id, param, expect);
-                                            if param != prev && have_buf {
+                                            if param != prev && have_buf { KBD_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — the guard's PIPELINE-PRESERVING exit, counted as `MOUSE_DISCARD_REARM_COUNT`'s twin: a completion whose TRB did not match the armed read, thrown away but re-armed. ⚠ FOLDED.
                                                 self.queue_keyboard_read(slot_id as u8);
-                                            }
+                                            } else if !have_buf { KBD_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } else { KBD_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } // PRTSCLOST — the guard's SILENT exit, split into the same two populations CLICKDEAD v2 gave the pointer, and with the same PRECEDENCE (`!have_buf` first: a missing buffer is the actionable fault). This branch consumes a keyboard completion, does NOT re-arm, and on a build without `usbdebug` prints nothing — so until this counter it was indistinguishable on the wire from a report that never arrived, which is the other half of PRTSCLOST's differential. ⚠ FOLDED onto the `else` of an existing `if`, no line added.
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = slot.data_buffer {
@@ -4818,7 +4818,7 @@ impl XhciController {
                                             // `[enum]` observer watches the 0→1 edge for its first-report
                                             // witness). Mirrors `mouse_report_count`; inert on x86.
                                             self.slots[slot_id as usize].keyboard_report_count =
-                                                self.slots[slot_id as usize].keyboard_report_count.wrapping_add(1);
+                                                self.slots[slot_id as usize].keyboard_report_count.wrapping_add(1); { let g = KBD_DRAIN_GAP.load(Ordering::Relaxed); if g > KBD_ARMGAP_MAX.load(Ordering::Relaxed) { KBD_ARMGAP_MAX.store(g, Ordering::Relaxed); } } // PRTSCLOST — latch the drain gap that PRECEDED this report. The TD was retired by the controller somewhere inside that gap and the endpoint has had no TD queued since, so this is an upper bound on the unarmed window for a REAL report (enumeration stalls, which precede any keyboard traffic, cannot contribute). ⚠ FOLDED.
                                             let report = core::slice::from_raw_parts(data_buf_ptr, 8);
                                             // Metal diagnostic: dump the raw report bytes so that if a keyboard
                                             // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
@@ -4915,7 +4915,7 @@ impl XhciController {
                                                 }
                                             }
 
-                                            self.slots[slot_id as usize].keyboard_prev_keys = cur_keys;
+                                            if cur_keys == prev_keys && modifiers == self.slots[slot_id as usize].keyboard_prev_mods { KBD_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); } self.slots[slot_id as usize].keyboard_prev_mods = modifiers; self.slots[slot_id as usize].keyboard_prev_keys = cur_keys; // PRTSCLOST — a report whose six keycodes are byte-identical to the previous report's. SET_IDLE was sent with duration 0 (INDEFINITE, `set_hid_idle` in this file), so the device reports ONLY on a state change and a restated report is IMPOSSIBLE from one — every one of them means at least one intermediate report never reached this decoder. It is also the exact condition under which `hid_print_screen_edge` (and the `HID_LOCK_KEYS` diff below) returns false for a genuine press: `prev_keys` still holds 0x46 because the RELEASE was the report that was lost. Counted BEFORE the store so `prev_keys` is still this report's predecessor. ⚠ FOLDED onto the existing store — no line added.
 
                                             // PRTSCR: the Print Screen press edge. `prev_keys` is the
                                             // LOCAL copy taken before the loops above, so the store on
@@ -14910,7 +14910,7 @@ impl XhciController {
                 self.slots[slot_id as usize].keyboard_expect_phys;
             self.slots[slot_id as usize].keyboard_expect_phys =
                 ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
-            self.ring_doorbell(slot_id, dci as u32);
+            self.ring_doorbell(slot_id, dci as u32); KBD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — counted AFTER the doorbell, because the doorbell is the instant the endpoint stops being unarmed: a count taken before it would claim a window this function had not yet closed. `MOUSE_REARM_COUNT`'s twin (`queue_mouse_read` bumps its own). ⚠ FOLDED.
             xdbg!("xHCI: Keyboard Read Queued.");
         }
     }

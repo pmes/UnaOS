@@ -1481,7 +1481,7 @@ pub fn orin_click_census(tick: u64) {
     if tick.wrapping_sub(CLK_CENSUS_TICK.load(Ordering::Relaxed)) < CLK_CENSUS_PERIOD {
         return;
     }
-    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed); let ptrarms = ptrpoll_witness(tick); // CLICKDEAD — the `[ptrpoll]` line, on THIS census pass and no new cadence of its own. Returns the pointer-pipeline arm balance so the census line below can carry it as `reports=`. ⚠ LINE-NEUTRAL fold: the body lives at the FILE TAIL (nothing follows it), so no line in this file moves and the knob-off image's panic-`Location` byte-identity is untouched.
+    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed); let ptrarms = ptrpoll_witness(tick); kbdpoll_witness(tick); // PRTSCLOST (orin 17) — the `[kbdpoll]` line, the KEYBOARD half of the same input pipeline, on this same census pass and with no cadence of its own. It rides the `orinclick` knob rather than minting one because a new feature would need an `arroyo` recipe change before it could reach a flight, and because this IS the pointer witness's endpoint twin: same controller, same dispatch, same dup guard, the other DCI. ⚠ LINE-NEUTRAL fold onto the existing call; the body lives at the FILE TAIL. // CLICKDEAD — the `[ptrpoll]` line, on THIS census pass and no new cadence of its own. Returns the pointer-pipeline arm balance so the census line below can carry it as `reports=`. ⚠ LINE-NEUTRAL fold: the body lives at the FILE TAIL (nothing follows it), so no line in this file moves and the knob-off image's panic-`Location` byte-identity is untouched.
     let seq = CLK_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
 
     let btn = CLK_BTN.load(Ordering::Relaxed);
@@ -5509,4 +5509,152 @@ fn ptrpoll_witness(tick: u64) -> u64 {
         if first { reports } else { base }, decoded, verdict
     );
     reports
+}
+
+// PRTSCLOST (orin 17) — THE KEYBOARD PIPELINE WITNESS, and the defect it exists to settle.
+//
+// THE OBSERVATION. render8, at the glass: Peter pressed Print Screen THREE times in fast
+// succession. The wire carries ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture
+// armed ::` (render8-boot.log, the SCREEN3 episode) and one `SCREEN3.PNG ... -> OK`. The other two
+// presses left NOTHING — not a second `armed`, not the `refused — capture in flight` line that a
+// press landing inside an open capture prints, which the SCREEN0..SCREEN2 burst earlier in the same
+// boot did print (four `armed`, one `refused`, three files). So the door works; the two presses
+// died UPSTREAM of it.
+//
+// WHAT THE CODE SAYS, WHICH IS ENOUGH TO NAME THE MECHANISM AND NOT ENOUGH TO SIZE IT.
+//   1. `set_hid_idle` sends SET_IDLE with duration 0 = INDEFINITE (drivers/xhci/mod.rs,
+//      `sync_control(.., 0x0A, 0x0000, ..)`; `[hidkeys] set-idle ok slot=5 iface=0` on render8's
+//      wire). A boot keyboard so configured reports ONLY when its state changes and NEVER resends.
+//      A report that is not collected is not repeated — it is gone.
+//   2. Exactly ONE Normal TRB is outstanding on the keyboard interrupt-IN at any time, and it is
+//      re-armed ONLY from the completion dispatch — `queue_keyboard_read` is the LAST statement of
+//      the keyboard branch, after the ASCII decode, after the key-up diff, and after
+//      `set_hid_leds`, which is a synchronous EP0 control transfer. When the controller retires the
+//      TD the transfer ring is empty; an empty ring means no IN token until the next doorbell.
+//   3. Therefore the endpoint is UNARMED from the moment hardware retires a report until software
+//      re-arms, and by (1) every state change inside that window is lost forever. A press and its
+//      release inside one window vanish with no line anywhere: `hid_print_screen_edge` never sees
+//      the press, so nothing prints, which is exactly the observed shape. A press whose RELEASE
+//      alone is lost is worse than silent — `keyboard_prev_keys` still holds 0x46, the level diff
+//      says "still held", and the NEXT genuine press is swallowed too.
+//
+// The wire cannot size the window, and every downstream explanation is already excluded because it
+// would have PRINTED: the `refused` line covers the in-flight collapse, `[hidled]` covers the LED
+// path, `hid_error_witness` is ungated and silent all boot. That leaves two silent paths, and this
+// witness separates them:
+//   * the report never arrived (the unarmed window) — `armgap_us` sizes it, `restated` proves at
+//     least one intermediate report was lost, since under SET_IDLE 0 a device cannot restate;
+//   * the report arrived and the dup-Success guard ate it — `dup=`/`nobuf=`, the counters
+//     CLICKDEAD v2 gave the POINTER and never gave the keyboard.
+//
+// HOW TO SCORE THE NEXT BOOT.
+//   * `restated>0` CONVICTS the unarmed window on its own: it is not reachable from a state change.
+//   * `armgap_us` is an upper bound on that window, latched at a real report. A human's fast triple
+//     press is ~90 ms between presses with each key held ~30-60 ms, so an `armgap_us` at or above
+//     ~30000 is wide enough to swallow a whole press+release and the mechanism is sized as well as
+//     named. Below ~10000 it is not, and the answer is `dup`/`nobuf` instead.
+//   * `gapmax_us` is the same measurement over EVERY drain including enumeration, so it is the
+//     pump-cadence ceiling rather than the input-latency number; a large `gapmax_us` beside a small
+//     `armgap_us` means the stalls exist but no key happened to land in one.
+//   * `edges=` is `prtscr::REQUESTS`, the count of press edges the decoder actually delivered, so
+//     the census and the `armed` lines above it must agree or the loss is BELOW this decoder.
+//
+// DEFAULT OFF, and at the FILE TAIL after every pre-existing line: `#[cfg(feature = "orinclick")]`
+// throughout, so knob-off nothing here compiles and no line in this file moves — panic `Location`
+// records embed line numbers and the knob-off jetson image's byte-identity is this track's proof.
+
+/// PRTSCLOST — the last `rearm + dup + nobuf + restated` this witness printed, so a dead pipeline
+/// costs one line and a live one prints at the census cadence. `u64::MAX` = never printed.
+#[cfg(feature = "orinclick")]
+static KBDPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// PRTSCLOST — the `rearm - discard - errrearm` balance the FIRST census pass saw, i.e. the
+/// enumeration arms. `reports=` minus this is the decoded-report count since the census armed.
+#[cfg(feature = "orinclick")]
+static KBDPOLL_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// PRTSCLOST — `arch::now_cycles()` (CNTVCT) units to microseconds, via CNTFRQ_EL0.
+///
+/// The counter runs at CNTFRQ, which is 31.25 MHz on the Orin and 54 MHz on the Pi 4, so a raw
+/// cycle count is a different duration on each and only the converted number can be compared
+/// against a human's press. A CNTFRQ of 0 (firmware that never programmed it) would divide by zero,
+/// so it falls back to the same 62.5 MHz `arch::aarch64` uses when CNTFRQ reads 0 — a wrong SCALE
+/// then, never a fault.
+#[cfg(feature = "orinclick")]
+fn kbdpoll_us(cycles: u64) -> u64 {
+    let f: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, CNTFRQ_EL0", out(reg) f, options(nomem, nostack, preserves_flags));
+    }
+    let hz = if f == 0 { 62_500_000 } else { f };
+    let per_us = hz / 1_000_000;
+    if per_us == 0 { cycles } else { cycles / per_us }
+}
+
+/// PRTSCLOST — read the shared driver's ungated keyboard-pipeline counters and, when they moved
+/// (and once at the start, so a frozen pipeline is still timestamped), print `[kbdpoll]`.
+///
+/// The token is `[kbdpoll]`, nine bytes — deliberately longer than eight, for the reason
+/// `ptrpoll_witness` states: it cannot be folded into an LLVM immediate, must appear in `.rodata`,
+/// and a `grep -a` of the artifact is therefore a REACHABILITY proof and not a compile proof.
+///
+/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — ten
+/// `Relaxed` loads, one `Relaxed` swap and one MRS.
+#[cfg(feature = "orinclick")]
+fn kbdpoll_witness(tick: u64) {
+    use core::sync::atomic::Ordering;
+    let rearm = crate::drivers::xhci::KBD_REARM_COUNT.load(Ordering::Relaxed);
+    let disc = crate::drivers::xhci::KBD_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
+    let err = crate::drivers::xhci::KBD_ERROR_REARM_COUNT.load(Ordering::Relaxed);
+    let dup = crate::drivers::xhci::KBD_DUP_DROP_COUNT.load(Ordering::Relaxed);
+    let nobuf = crate::drivers::xhci::KBD_NOBUF_DROP_COUNT.load(Ordering::Relaxed);
+    let restated = crate::drivers::xhci::KBD_RESTATED_COUNT.load(Ordering::Relaxed);
+    let armgap = kbdpoll_us(crate::drivers::xhci::KBD_ARMGAP_MAX.load(Ordering::Relaxed));
+    let gapmax = kbdpoll_us(crate::drivers::xhci::KBD_DRAIN_GAPMAX.load(Ordering::Relaxed));
+    let (edges, shots, refused) = crate::video::prtscr::census();
+    // Saturating for the reason `ptrpoll_witness` gives: the counters are read one at a time and a
+    // completion can land between the loads, so the arithmetic is only ordered in the limit.
+    let reports = rearm.saturating_sub(disc).saturating_sub(err);
+    let base = KBDPOLL_BASE.load(Ordering::Relaxed);
+    let first = base == u64::MAX;
+    if first {
+        KBDPOLL_BASE.store(reports, Ordering::Relaxed);
+    }
+    // The DROPS and the restatements join the movement test: a pipeline being EATEN (rearm flat,
+    // dup climbing) or one LOSING reports (restated climbing) must not be mistaken for a quiet one
+    // and print a single line for the whole boot.
+    let moved = rearm
+        .wrapping_add(dup)
+        .wrapping_add(nobuf)
+        .wrapping_add(restated);
+    let last = KBDPOLL_LAST.swap(moved, Ordering::Relaxed);
+    if !first && last == moved {
+        return; // nothing moved since the last census — one line already said so.
+    }
+    let decoded = reports.saturating_sub(if first { reports } else { base });
+    let verdict = if restated != 0 {
+        "REPORT-LOST (a keyboard report was byte-identical to its predecessor. SET_IDLE duration is 0 = INDEFINITE, so the device reports only on a STATE CHANGE and cannot restate one: at least one intermediate report never reached the decoder. This is PRTSCLOST convicted — the interrupt-IN endpoint had no TD queued when the key moved, and with `keyboard_prev_keys` left stale the NEXT genuine press is swallowed by the level diff as well. Read `armgap_us` for the size of the window)"
+    } else if armgap >= 30_000 {
+        "ARMGAP-WIDE (no report was lost YET, but the keyboard endpoint has sat unarmed for at least armgap_us between two drains — wider than a human's press-and-release, so a press landing in one would vanish with no line anywhere. The fault is the PUMP CADENCE, not the guard: look at what runs between two `drain_event_ring_once` calls on the console pump, not at the dup discrimination)"
+    } else if nobuf != 0 {
+        "NOBUF-DROP (completions ARE arriving and the guard is dropping them because `data_buffer`/`keyboard_ring` is GONE. A teardown or allocation defect, NOT a duplicate: re-arming here would be wrong, there is nothing to arm. Look at the slot's soft state)"
+    } else if dup != 0 {
+        "DUP-DROP (completions ARE arriving and the dup-Success guard is consuming them WITHOUT re-arming, buffer and ring still present. The keyboard pipeline is being EATEN, not starved — the fix is in the guard's discrimination, not in the pump)"
+    } else if disc != 0 {
+        "GUARD-REARM (completions ARE arriving but their TRB does not match the armed read; the guard is re-arming them and no report is decoding)"
+    } else if err != 0 {
+        "ERROR-REARM (non-halting error completions on the keyboard interrupt-IN; the read is being re-armed off the error path. `hid_error_witness` is UNGATED — its lines above this one name the codes)"
+    } else if decoded != 0 {
+        "STREAMING (the keyboard read is completing and re-arming, no report has been restated, and the unarmed window has stayed under a press. A missing key above this line is a ROUTING fault, not a pipeline one)"
+    } else if first {
+        "BASELINE (the enumeration arms; every later line is measured against this one)"
+    } else {
+        "ARMED-NO-COMPLETION (the read is armed, dup=0 and nobuf=0, and the controller has posted NO transfer event for the keyboard DCI since the last line — the endpoint went quiet. Look at EP state, doorbell and periodic bandwidth, not at the guard)"
+    };
+    serial_println!(
+        "[kbdpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} restated={} armgap_us={} gapmax_us={} prtscr edges={} ok={} refused={} -> {}",
+        tick, rearm, disc, err, dup, nobuf, reports,
+        if first { reports } else { base }, decoded, restated, armgap, gapmax,
+        edges, shots, refused, verdict
+    );
 }
