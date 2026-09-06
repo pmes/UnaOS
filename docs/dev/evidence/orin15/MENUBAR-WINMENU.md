@@ -587,7 +587,7 @@ written to match its siblings and it matches them in this too.
 It is still worth saying out loud, because it is **the same shape as A10** — the defect this patch
 closes. `pulsewin::key_escape` was a function that could not fire; four furniture rollups are
 functions that do not fire. One uncalled function is a bug; four in one family, all written to the
-same template, is a missing call site in whatever was supposed to drive them. It is filed as **S31**
+same template, is a missing call site in whatever was supposed to drive them. It is filed as **S32**
 rather than fixed here: driving them is a decision about the furniture family's ledger cadence, it
 belongs to the lane that owns `strip`, and inventing a fifth caller in a patch that is already asking
 for a grant would be the wrong place to make it. No line of this patch depends on the rollup firing.
@@ -712,7 +712,7 @@ sentence is a measurement rather than an excuse.
 
 ### I — the ledger rows
 
-`docs/dev/LEDGER.md` **S31** (the four uncalled furniture rollups) and `docs/dev/OS/orin-ledger.md`
+`docs/dev/LEDGER.md` **S32** (the four uncalled furniture rollups) and `docs/dev/OS/orin-ledger.md`
 **A25** ticked, in this commit. R21 is already verbatim in `docs/dev/RULINGS.md` at `191823c2` and is
 **not** re-added.
 
@@ -758,7 +758,7 @@ closes the hazard for the day an x86 publisher exists. On aarch64 the function d
 so the Orin and the Pi rely on `drive()`'s in-line composite exactly as the crystal already does
 there — a pre-existing asymmetry this patch neither creates nor widens.
 
-### 7.2 Four furniture rollups with no callers — LEDGER **S31**
+### 7.2 Four furniture rollups with no callers — LEDGER **S32**
 
 `crystal::rollup`, `dock::rollup`, `menubar::rollup` and (as written to match them) `winmenu::rollup`
 are all `pub fn rollup(scope: &str)` with **zero call sites** in the tree; their format strings are
