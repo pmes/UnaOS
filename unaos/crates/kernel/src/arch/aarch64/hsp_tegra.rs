@@ -433,3 +433,246 @@ fn w32(pa: u64, v: u32) {
 pub fn rx_mbox_armed() -> bool {
     ARMED.load(Ordering::Acquire) && RX_MBOX.load(Ordering::Acquire) != 0
 }
+
+// ═══ RXBURST (A16, orin 17) — DRAIN THE WORD, NOT THE BYTE ═══════════════════════════════════════
+//
+// THE DEFECT, from render8 2026-09-06 (`~/unaos-bench/scratch/orin17/render8-boot.log`, slice lines
+// 3238-3256, `policy=mbox-only`). The burst `tste` + CR was injected as ONE 5-byte write and the
+// mailbox delivered THREE bytes:
+//
+//   :3238  [tcurx] took=0x74 't' left=2 word=0x82007473 <- raw=0x83747374 @ 0x3c10000 n=3 took-total=1
+//   :3240  [tcurx] took=0x73 's' left=1 word=0x81000074 <- raw=0x82007473 @ 0x3c10000 n=2 took-total=2
+//   :3242  [tcurx] took=0x74 't' left=0 word=0x00000000 <- raw=0x81000074 @ 0x3c10000 n=1 took-total=3
+//   :3249  [tcu] rx-mbox raw=0x00000000 full=0 … full-edges=1 changes=3 last-full=0x81000074
+//   :3255  [serialrx] rx=3 (+3) polls=0 refused=0 ovrf=0 … mbox=3
+//   :3256  [rxmerge] census policy=mbox-only seq=3 uartc=0 mbox=3 dup=0 reorder=0 parked=9098202
+//
+// `e` and CR reached nothing. Under `mbox-only` the UARTC RBR is parked BY POLICY (A37), so those
+// two bytes exist nowhere — not in a FIFO, not in the mailbox, not in the key path. The same five
+// bytes paced at 200 ms/byte arrived 5 of 5. `full-edges=1` for the whole 76-second boot: the SPE
+// posted ONE word, ever.
+//
+// MECHANISM, and it is OURS, not the SPE's. `rx_mbox_take` consumed ONE BYTE per call and wrote the
+// word back with bit 31 STILL ASSERTED while bytes remained — that is what `word=0x82007473` and
+// `word=0x81000074` above are — and then printed its ~95-character witness, after which
+// `serialrx::deliver` printed a ~65-character `[rxmerge]` line. This console is polled 115200 8N1
+// (`tegra::write_byte` spins on THRE), so ~160 characters is ~14 ms of BLOCKING transmit per byte
+// taken. The rung-1 sampler's own trace measures the wall time independently: it polls at 45 Hz
+// (:3231 `polls=9098327` -> :3249 `polls=9098372`, one census second apart) and it caught BOTH
+// intermediate words — `changes=3`, `last-full=0x81000074`, and it never saw the original
+// 0x83747374 at all — which takes ~14 ms between takes. The slot was therefore held ~28 ms after
+// the SPE posted it. At 115200 the SPE has its next three-byte word ready 0.26 ms after the first,
+// and the CCPLEX's slot is ONE WORD DEEP. It had nowhere to put `e` and CR.
+//
+// Neither the cadence claim nor the ack-ordering claim survives the same evidence: the pump drains
+// ~50x/s (render8 `parked=` deltas 28/55/56/60 per census second) but the drain ALREADY looped to
+// empty, taking all three bytes in one pass; and the driver clears FULL strictly AFTER copying the
+// byte out of the word it read, never before. What was wrong is the SIZE OF THE OCCUPANCY WINDOW.
+//
+// THE FIX, below. Take the WHOLE WORD and free the slot in the same breath: read the word, copy its
+// up-to-three payload bytes into a local, `w32(pa, 0)` immediately, and only then print and deliver.
+// The window shrinks from ~28 ms to the handful of cycles between the read and the write, and the
+// write-back becomes the edk2 protocol's plain "the consumer clears the slot" rather than the
+// partial re-assertion of bit 31 the per-byte shape needed. Then loop: while the word reads FULL
+// take the next one, and for a bounded [`BURST_REFILL_US`] window after each word keep re-reading an
+// EMPTY word, so the SPE's next post is collected in microseconds instead of at the pump's next
+// pass. That refill spin is what covers the 0.26 ms inter-word gap; it is entered ONLY after a word
+// has actually been taken, so an idle boot never spins.
+//
+// WHY NOT THE 250 Hz TICK (A21 `[orinbsptick]`, live on this image). It would not have helped: the
+// gap this defect turns on is 0.26 ms and a 250 Hz tick is 4 ms, so the second word would still
+// have been dropped before the first harvest. It also costs what the refill spin does not — MMIO
+// and `pal::push_event` from IRQ context, against a pump that owns the event queue at task level.
+// The pump's cadence is not the bottleneck; the 28 ms of witness printing inside the window was.
+//
+// WHAT THE NEXT FLIGHT SCORES. `drained_words=` is this burst's word count and `refill=` counts the
+// words it took during the refill spin — words the old shape could not have reached at all. A burst
+// leg that returns `drained_words=2` with five bytes delivered says occupancy was the whole cause
+// (`refill=1` beside it says the second word arrived AFTER we freed the slot, i.e. the SPE retried
+// and only the spin could have caught it; `refill=0` says it was already queued). One that still
+// returns `drained_words=1` with three bytes says the SPE drops a word it cannot post, with no
+// retry at all, and `mbox-only` needs the HSP RX doorbell interrupt (a further rung), not a faster
+// poll. Either way A37's per-byte witnesses are unchanged in shape and token set —
+// one `[tcurx] took=` and one `[rxmerge] src=mbox` line per delivered byte, in order.
+//
+// EXACTLY-ONCE is preserved by construction: a word is copied out before it is cleared, it is
+// cleared exactly once, and every byte copied is delivered exactly once by the caller's `for` loop.
+// `rx_mbox_take` (the per-byte shape) is KEPT and still correct — R19: a path that failed under
+// conditions keeps its code — it simply has no caller on this policy.
+
+/// Payload bytes one TCU word carries (bits [23:0], byte 0 in [7:0]).
+#[cfg(feature = "tcurx")]
+const TCU_WORD_BYTES: usize = 3;
+/// Words one [`rx_mbox_drain`] call takes before handing the pump back its pass. A CAP, never a
+/// drop: the bound is checked BEFORE the word is read, so a capped burst leaves the slot exactly as
+/// the SPE left it and the next pass takes it.
+#[cfg(feature = "tcurx")]
+const BURST_MAX_WORDS: usize = 16;
+#[cfg(feature = "tcurx")]
+const BURST_MAX_BYTES: usize = BURST_MAX_WORDS * TCU_WORD_BYTES;
+/// How long the drain keeps re-reading an EMPTY word after taking one. Sized off the wire: at
+/// 115200 8N1 the SPE fills a fresh three-byte word every 0.26 ms, so a window a few words wide
+/// carries a burst across intact while never being entered on an idle pass.
+#[cfg(feature = "tcurx")]
+const BURST_REFILL_US: u64 = 2_000;
+
+/// Words taken out of the RX mailbox this boot, and how many of those the refill spin caught.
+#[cfg(feature = "tcurx")]
+static WORDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "tcurx")]
+static REFILL_WORDS: AtomicU64 = AtomicU64::new(0);
+/// Drains that took at least one word, and drains that hit [`BURST_MAX_WORDS`].
+#[cfg(feature = "tcurx")]
+static BURSTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "tcurx")]
+static CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// One drain's harvest: the bytes, and enough provenance for the per-byte `[tcurx]` witness to say
+/// which word each came out of. Lives on the caller's stack (~250 bytes) and is never shared.
+#[cfg(feature = "tcurx")]
+pub struct RxBurst {
+    buf: [u8; BURST_MAX_BYTES],
+    raws: [u32; BURST_MAX_BYTES],
+    n: usize,
+    words: usize,
+    refill: usize,
+    tags: usize,
+    capped: bool,
+    pa: u64,
+    took_base: u64,
+}
+
+#[cfg(feature = "tcurx")]
+impl RxBurst {
+    const fn empty() -> Self {
+        Self {
+            buf: [0; BURST_MAX_BYTES],
+            raws: [0; BURST_MAX_BYTES],
+            n: 0,
+            words: 0,
+            refill: 0,
+            tags: 0,
+            capped: false,
+            pa: 0,
+            took_base: 0,
+        }
+    }
+    /// Bytes harvested (0 on an empty mailbox, or when the probe never armed).
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// Words taken from the mailbox by this drain — the `drained_words=` field.
+    pub fn words(&self) -> usize {
+        self.words
+    }
+    /// Byte `i`, clamped rather than panicking: a `Location` in a console drain is not a diagnostic.
+    pub fn byte(&self, i: usize) -> u8 {
+        self.buf[if i < BURST_MAX_BYTES { i } else { BURST_MAX_BYTES - 1 }]
+    }
+
+    /// A16's per-byte witness, printed AFTER the mailbox is already clear — that ordering is the
+    /// whole fix, so it is stated here and not left to the caller's discretion. Token set is
+    /// render8's plus `drained_words=` / `refill=`; `word=` stays, and is now always the 0 this
+    /// consumer writes, because the slot is released in one write instead of three.
+    pub fn witness(&self, i: usize) {
+        if i >= self.n {
+            return;
+        }
+        let b = self.buf[i];
+        let raw = self.raws[i];
+        serial_println!(
+            "[tcurx] took={:#04x} '{}' left={} word={:#010x} <- raw={:#010x} @ {:#x} n={} took-total={} tags={} drained_words={} refill={} burst_bytes={} capped={} words-total={} refill-total={} bursts={}",
+            b,
+            if (0x20u8..0x7f).contains(&b) { b as char } else { '.' },
+            self.n - i - 1,
+            0u32,
+            raw,
+            self.pa,
+            (raw >> TCU_NBYTES_SHIFT) & 0b11,
+            self.took_base + i as u64 + 1,
+            TOOK_TAGS.load(Ordering::Relaxed),
+            self.words,
+            self.refill,
+            self.n,
+            self.capped as u8,
+            WORDS.load(Ordering::Relaxed),
+            REFILL_WORDS.load(Ordering::Relaxed),
+            BURSTS.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// THE DRAIN. Take whole words out of the TCU RX mailbox until it is empty, clearing the slot in
+/// the same breath as the read, and return the bytes for the caller to print and deliver off the
+/// hot path. Bounded three ways: [`BURST_MAX_WORDS`] words, a [`BURST_REFILL_US`] refill window
+/// that is only ever entered after a word has been taken, and the FULL bit itself — every iteration
+/// either clears bit 31 or leaves the loop, so it cannot spin on a stuck word.
+#[cfg(feature = "tcurx")]
+pub fn rx_mbox_drain() -> RxBurst {
+    let mut b = RxBurst::empty();
+    let pa = RX_MBOX.load(Ordering::Acquire);
+    if pa == 0 || !ARMED.load(Ordering::Acquire) {
+        return b;
+    }
+    b.pa = pa;
+    b.took_base = TOOK.load(Ordering::Relaxed);
+    let window = (cntfrq() / 1_000_000).max(1) * BURST_REFILL_US;
+    let mut since_word = cntpct();
+    // Did the loop read an EMPTY word since the last one it took? That is what separates a word the
+    // SPE posted while we were still here (`refill=`, only reachable because the slot was freed in
+    // microseconds) from one that was already queued behind the first.
+    let mut spun = false;
+    loop {
+        if b.words >= BURST_MAX_WORDS {
+            b.capped = true;
+            CAPPED.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        let raw = r32(pa);
+        if raw & TCU_FULL == 0 {
+            // The refill window — the SPE's next word is 0.26 ms behind this one on a 115200 burst,
+            // and the pump's next pass is ~20 ms away. Never entered on an idle drain.
+            if b.words == 0 || cntpct().wrapping_sub(since_word) >= window {
+                break;
+            }
+            spun = true;
+            core::hint::spin_loop();
+            continue;
+        }
+        // ── THE OCCUPANCY WINDOW, and its whole extent: the read above, the clear below. Nothing
+        //    between them touches the serial port, a lock, or the event queue. render8's defect was
+        //    ~28 ms of witness printing sitting in exactly this gap with bit 31 still asserted.
+        let n = ((raw >> TCU_NBYTES_SHIFT) & 0b11) as usize;
+        w32(pa, 0);
+        // ── window closed; the SPE may post again from here on. Bookkeeping only, below.
+        if spun {
+            b.refill += 1;
+            REFILL_WORDS.fetch_add(1, Ordering::Relaxed);
+            spun = false;
+        }
+        b.words += 1;
+        WORDS.fetch_add(1, Ordering::Relaxed);
+        since_word = cntpct();
+        if n == 0 {
+            // A FULL word with nbytes == 0 is a pure flush / hw-flush tag: consumed, no byte.
+            b.tags += 1;
+            TOOK_TAGS.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let mut k = 0;
+        while k < n && b.n < BURST_MAX_BYTES {
+            b.buf[b.n] = ((raw >> (8 * k)) & 0xff) as u8;
+            b.raws[b.n] = raw;
+            b.n += 1;
+            k += 1;
+            TOOK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if b.words > 0 {
+        BURSTS.fetch_add(1, Ordering::Relaxed);
+    }
+    b
+}
