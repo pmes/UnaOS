@@ -101,7 +101,15 @@ for path in files:
                 if not first or first[0].strip(",;") not in OWNERS:
                     red.append(f"{where}: {rid} owner `{cells[ow][:30]}` not in {sorted(OWNERS)}")
             rowtext = " | ".join(cells)
-            for ref in re.findall(r"→\s*([SP][0-9]+)", rowtext):
+            # SEAT-PREFIXED IDS (three-seat vote 2026-09-06: pi 7 proposed, orin 15 and rmbp 12
+            # agreed; S1-S32 freeze, new shared rows take SP<n> pi / SR<n> rmbp / SO<n> orin).
+            # Sequential allocation is STRUCTURALLY broken across unpushed branches -- a reserved
+            # gap only works if every seat can see it, and none can; two collisions in one night.
+            # The id check above already passes them (^[A-Z]+[0-9]+). THIS resolver did not: the
+            # old r"→\s*([SP][0-9]+)" could not match "→ SP32" (after S comes P, not a digit), so
+            # a prefixed cross-ref was SILENTLY NOT CHECKED -- not red, skipped. A check that
+            # cannot fire, in the gate whose whole job is that they can.
+            for ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", rowtext):
                 if "docs/dev/LEDGER.md" in files and ref not in ledger_ids and path != "docs/dev/LEDGER.md":
                     red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
             if "unaos-bench/scratch" in rowtext:
