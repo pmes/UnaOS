@@ -82,11 +82,28 @@ line each with its own `#[cfg]` (this repo's own byte-identity idiom, LEDGER P7 
 `arch/aarch64/mod.rs:110` carries three, and a line-anchored regex sees only the first), and a
 non-`mod.rs` parent's children living in `<stem>/` (`video/quarry.rs` → `video/quarry/live.rs`).
 
-## Gates
+## Gates — committed as `146c2e84` on `hw-rmbp`, conditioned on these exit statuses
 
     ./arroyo check                  green, exit 0, both arches — with GATE-K8REACH inside it
+    UNAOS_WC=1 ./arroyo test 150    green, exit 0, `wc` in the ⚡ kernel features banner
+    ./arroyo test-arm               green, exit 0
     ./arroyo check (mutated tree)   exit 1 — the wiring proof above
     scripts/ledger-check.sh         green — 123 rows, 1 cross-branch ref deferred (B22 → SO6)
+
+`check` was re-run after the last edit to the gate script (`sys.dont_write_bytecode`, so the evidence
+mode does not leave `__pycache__` in a checked-out tree) rather than inheriting the earlier green.
+
+## Peers
+
+pi 7 told the same turn: the registry's 104 `TODO` rows are theirs to rule on, `--evidence` makes each
+one a command, and the 39 with no Pi-live site are the cheap end.
+
+**orin 16 — the focus seat — is ARCHIVED.** The `arroyo` shared-file heads-up could not be delivered
+(`send_message` refused: "Session is archived"). Not unarchived by this seat: `isArchived` is the flag
+and Peter is the authority (memory `only-peter-closes-a-seat`). The FOCUS itself is unchanged — a
+closed session is not a reassignment — so this seat stays support. Surfaced to Peter, not acted on.
+The hunk it would have warned about: one contiguous block in `check_both` after the `knob-hygiene.sh`
+call, plus one word on the `_nrc` failure line.
 
 ## Flagged, not taken
 
