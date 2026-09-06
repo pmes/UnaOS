@@ -5551,7 +5551,7 @@ fn render_service(_: usize) {
         // cascade ending on metal and in QEMU raspi4b alike — no polling task, no new event variant.
         #[cfg(feature = "desktop_firmware")]
         if desktop
-            && shell_id == unaos_kernel::video::wm::WIN_NONE
+            && { pi_shell_reopen_drain(&mut shell_id, &mut shell_declined); shell_id == unaos_kernel::video::wm::WIN_NONE } // SHELLREOPEN-PI (S4/A7) — ⚠ SAME-LINE fold, line-NEUTRAL. The dock's shell-pin latch drains HERE, inside the mint arm's own guard, because the drain's whole product is to RE-ARM that guard: after a close `shell_id` still holds the dead id and `shell_declined` may be false, so this arm was shut against a window that no longer exists. Sited on the `shell_id` term rather than above the `if` so no line is added; `desktop` is evaluated first and short-circuits, which is the same gate the arm already had. See the SHELLREOPEN-PI block at this file's tail.
             && !shell_declined
             && unaos_kernel::video::desktop_firmware::armed()
         {
@@ -9068,3 +9068,101 @@ fn orin_shell_reopen_drain() {
 ))]
 #[inline(always)]
 fn orin_shell_reopen_drain() {}
+
+// =================================================================================================
+// SHELLREOPEN-PI (S4 / A7, SO1(a)) — **the dock's pinned shell tile is a live button on the Pi.**
+// =================================================================================================
+//
+// FOR pi 7. Written by orin 16 alongside the Orin's own drain, because the two are one defect and a
+// fix that lands on one board only leaves the ledger row half true. NOT committed by orin 16 — this
+// is the Pi's lane. Compile-proved by orin 16 (`./arroyo check`, both arches, with this applied) and
+// then reverted; pi 7 owns placing it, running `kernel8`/`kernel8-test`, and the byte-identity check.
+//
+// ## The defect
+//
+// `dock::press_at`'s pinned shell tile LATCHES a reopen request (`SHELL_REOPEN.store(true)`) because
+// a click router may not allocate a surface or take the window table; a render body drains it with
+// `dock::take_shell_reopen()`. Tree-wide that taker had exactly one real caller,
+// `x86_render_service` (the `arch/x86_64/syscall.rs` call is the `winx_launcher` selftest draining
+// the flag so it cannot race the render loop). `render_service` (Pi) and `orin_render_service` never
+// drain it, so on both aarch64 boards the tile is a button wired to nothing. Render7 confirmed it on
+// Orin metal (two `[dock] press … shell=pin -> reopen requested`, no window either time); the Pi has
+// the same dock, the same tile and the same missing drain.
+//
+// ## Why this hunk is four lines and the Orin's is a hundred
+//
+// The Pi's shell IS a window this task owns — `open_shell_window`, its own `Console`, `Screen` and
+// `TargetPal` — and this task ALREADY contains the rebuild: the SHELLWIN-PI mint arm, whose guard is
+// `shell_id == WIN_NONE && !shell_declined && armed()`. After a close, `shell_id` still holds the
+// DEAD id (nothing in the close path writes this local) and `shell_declined` may be false, so the
+// mint arm is closed against a window that no longer exists. The drain therefore does not rebuild
+// anything; it RE-ARMS the arm that already knows how, on the same pass, and the mint arm's own
+// witness (`[shellwin-pi] …`) reports the result. The Orin has no such arm — it declines to mint at
+// all, because `orinconwin` routes the live console into its own row — so its drain has to reinstall
+// the route itself.
+//
+// ## S4 / B11 / S7
+//
+// Third measured instance of one shape: the x86 render body does what the aarch64 bodies do not
+// (B11 is the drag feed, A27 was its Orin half, S4 is this). S7 steps 2-3 subsume all three; both
+// drains are written so the convergence can delete them rather than merge them.
+//
+// LINE-NEUTRAL: tail append, one same-line fold at the call site.
+
+/// SHELLREOPEN-PI — drain the dock's shell-pin latch and re-arm the SHELLWIN-PI mint.
+///
+/// Two arms, one live shell window max — `x86_render_service`'s rule, reached differently:
+///
+///  * the row is still alive under `KERNEL_OWNER_DESKTOP` (the scan-to-press race, or a parked
+///    shell) — RAISE it through `focus_changed`, which also un-parks it (fresh top-of-stack z).
+///    Never a second window.
+///  * the row is gone — clear the stale `shell_id` and lower `shell_declined`, and the mint arm
+///    immediately below the call site rebuilds through the SAME fallible path bring-up used.
+///    Clearing `shell_declined` is deliberate: a decline is final only until the operator ASKS
+///    again, and the pin press is that ask.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware"))]
+fn pi_shell_reopen_drain(
+    shell_id: &mut unaos_kernel::video::wm::WinId,
+    shell_declined: &mut bool,
+) {
+    use unaos_kernel::video::wm;
+    if !unaos_kernel::video::dock::take_shell_reopen() {
+        return;
+    }
+    if *shell_id != wm::WIN_NONE
+        && wm::owner_of(*shell_id) == Some(wm::KERNEL_OWNER_DESKTOP)
+    {
+        wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
+        serial_println!(
+            "[dock] shell-reopen drained by=render_service win={} gen={} route=already-live -> REOPEN",
+            *shell_id,
+            wm::winid_gen(*shell_id)
+        );
+        return;
+    }
+    // WINID (SO1(b)) — `was=` is the STALE id this local was still holding, and it is worth a field:
+    // `shell_id` is a slot alias with no generation (the `present_outcome_owned` note in this task's
+    // present tail says so in as many words), so between the close and this line the table was free
+    // to hand that number to somebody else's window.
+    let was = *shell_id;
+    *shell_id = wm::WIN_NONE;
+    *shell_declined = false;
+    serial_println!(
+        "[dock] shell-reopen drained by=render_service win=0 gen=0 was={} route=rearm -> REOPEN",
+        was
+    );
+}
+
+/// SHELLREOPEN-PI — the knob-off twin, so the fold at the call site costs the knob-off `kernel8.img`
+/// nothing.
+#[cfg(all(
+    target_arch = "aarch64",
+    feature = "baremetal",
+    not(feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn pi_shell_reopen_drain(
+    _shell_id: &mut unaos_kernel::video::wm::WinId,
+    _shell_declined: &mut bool,
+) {
+}
