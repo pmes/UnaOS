@@ -239,6 +239,45 @@ const fn item_count() -> usize {
 }
 const ITEM_COUNT: usize = item_count();
 
+// ── THE DROPDOWN PRIMITIVE, RE-EXPORTED ──────────────────────────────────────────────────────────
+//
+// WINMENU (R21) — a window's menus are drawn by [`super::winmenu`] as a SECOND dropdown, and Peter's
+// ruling is that it must be the SAME dropdown: *"menus belong in the menu bar"* is one surface with
+// one look, not two that resemble each other. So the row metrics leave this module by name rather
+// than being restated over there. A second copy of "how tall is a menu row" is two things that can
+// drift, and they drift SILENTLY — the only symptom is a pick landing one row off the item the
+// operator pressed.
+//
+// Deliberately NOT re-exported: `ROWS`, `menu_rect`, `item_at`, `OPEN`. Those are the SHARD menu's
+// own model and its own modal state; sharing them would make the two surfaces one surface with two
+// names, which is the opposite of what a second publisher needs.
+
+/// WINMENU — the dropdown's keyline border, px. See the block above.
+pub const DROP_BORDER: usize = BORDER;
+/// WINMENU — an item row's height, px.
+pub const DROP_ITEM_H: usize = ITEM_H;
+/// WINMENU — a separator band's height, px.
+pub const DROP_SEP_H: usize = SEP_H;
+/// WINMENU — the horizontal inset of item text from the inner edge, px.
+pub const DROP_PADX: usize = PADX;
+/// WINMENU — the glyph advance the dropdown draws at.
+pub const DROP_CELL_W: usize = CELL_W;
+/// WINMENU — the glyph cell height the dropdown draws at.
+pub const DROP_CELL_H: usize = CELL_H;
+/// WINMENU — the atlas the dropdown draws from.
+pub const DROP_FACE: super::font::Face = FACE;
+
+/// WINMENU — **is the SHARD menu dropped?**
+///
+/// Read by [`super::winmenu::press_at`]'s CLOSED arm, which declines every point while this is
+/// `true` so the press reaches [`press_at`]'s own dismiss-outside arm. That decline is the whole of
+/// the one-dropdown-at-a-time invariant `wm::MENU_OCC_MAX == 1` depends on — see `winmenu`'s header.
+/// One relaxed load; nothing else in this module is exposed.
+#[inline]
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::Relaxed)
+}
+
 const _: () = {
     // The row height must clear the glyph it centres, or the label is cut.
     assert!(ITEM_H >= CELL_H);

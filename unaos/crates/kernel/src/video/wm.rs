@@ -5117,7 +5117,7 @@ fn composite_inner() -> CursorTail {
                 Some(fb) => {
                     if fb.is_ready() {
                         let info = fb.info();
-                        if let Some(b) = super::crystal::open_rect(info.width, info.height) {
+                        if let Some(b) = super::menubar::open_dropdown_rect(info.width, info.height) {
                             if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
                                 reserved_hit = true;
                             }
@@ -16868,7 +16868,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // per window and pushes nothing until the operator opens the SHARD menu. Its slot is
             // [`MENU_OCC_MAX`], reserved above; `c.push` cannot drop it (`OCC_CLIP_MAX` accounts for
             // it and is `const`-asserted to fit `OCC_MAX`).
-            if let Some(b) = super::crystal::open_rect(pw, ph) {
+            if let Some(b) = super::menubar::open_dropdown_rect(pw, ph) {
                 if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) {
                     let _ = c.push(b);
                 }
@@ -17217,7 +17217,7 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
             // the menu is `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX == OCC_MAX` — so a dropped
             // box still reports through `dropped`, and the OCC_MAX ledger records the new worst
             // case.
-            if let Some(b) = super::crystal::open_rect(pw, ph) {
+            if let Some(b) = super::menubar::open_dropdown_rect(pw, ph) {
                 if !c.push(b) {
                     dropped += 1;
                 }

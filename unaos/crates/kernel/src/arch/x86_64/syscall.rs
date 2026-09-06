@@ -6731,12 +6731,12 @@ fn ptrdead_selftest_body() {
 /// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
 /// closes is a witness that tests the API while the path a pointer report actually takes is inert.
 pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event {
-    // CRYSTAL — Escape dismisses an open SHARD menu, and is addressed to the window system exactly as
-    // `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow
-    // it. It consumes ONLY a bare `Esc` while the menu is open; every other event, and `Esc` with no
-    // menu up, falls straight through to the chain below unchanged.
+    // CRYSTAL/WINMENU — Escape dismisses an open menu, addressed to the window system exactly as `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow it.
+    // R21 gave the panel a SECOND modal surface (a window's menus, in the bar), so the question goes to the shared `strip::key_escape` seam — beside `strip::press_route`, asked by BOTH arch routers,
+    // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
+    // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
     #[cfg(feature = "wc")]
-    if crate::video::crystal::key_escape(raw) {
+    if crate::video::strip::key_escape(raw) {
         return crate::pal::Event::Unknown;
     }
     if wc_focus_key(raw) {

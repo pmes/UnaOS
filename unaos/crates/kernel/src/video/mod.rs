@@ -126,7 +126,7 @@ pub mod menubar;
 // arm lives in `arch/x86_64/syscall.rs::wc_click_route_at` — and, since PI-DESK, in
 // `arch/aarch64/syscall.rs::wc_click_route`, both through the ONE shared router
 // [`strip::press_route`] rather than two copies of the ordering rule. Same gate as
-// `dock`/`strip`/`menubar` (x86+`wc` OR aarch64+`desktop_firmware`).
+// `dock`/`strip`/`menubar` (x86+`wc` OR aarch64+`desktop_firmware`). WINMENU (R21) rides the same gate but is declared at the FOOT of this file, not here beside its three siblings: see the closing block — the reason is `panic::Location`, and it is the one place in this patch where the tree's grouping loses to the tree's byte-identity discipline.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod crystal;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
@@ -872,3 +872,32 @@ pub(crate) fn note_panel_write_refused(_tier: u8, _term: &'static str, _site: &'
     #[cfg(not(feature = "witness"))]
     let _ = (_tier, _term, _site);
 }
+
+// ── WINMENU (R21, Peter 2026-09-06) — declared HERE, at the foot, and that is the point ─────────
+//
+// **A window's menus live in the MENU BAR.** `winmenu` is the registry a kernel window publishes a
+// `&'static` menu tree to, the bar's title layout right of the caption slot, and the dropdown those
+// titles open — the SHARD dropdown's own metrics and paint discipline, imported from `crystal`
+// rather than restated. It is the second half of the answer `pulsewin`'s header got half right: the
+// premise ("this kernel has one menu framework") was true, the conclusion (draw a private strip
+// inside the window) was not.
+//
+// **Why it is not up beside `dock`/`strip`/`menubar`/`crystal`, where it belongs by grouping.**
+// This file is compiled into EVERY image, the knob-off Pi `kernel8.img` included — `panel_owner`,
+// `publish_panel_owner`, `panel_snapshot`, `panel_info_nonblocking` and `note_panel_write_refused`
+// all live below the declaration block. Sixteen lines inserted at the crystal declaration renumber
+// every one of them, and `core::panic::Location` embeds the source LINE, so the Pi's knob-off
+// baseline would move for a module that build does not even contain. Declaring it at the tail costs
+// the reader one pointer (folded onto the `crystal` comment above, 1↔1) and buys a byte-identical
+// `kernel8.img`. Grouping is a convenience; a moving baseline is a gate nobody can trust.
+//
+// FC-2 — **the gate, and why it is this one.** The file itself is ARCH-NEUTRAL: `winmenu.rs`
+// contains no `target_arch` anywhere, and the gate below has no arch-only arm — both arches are in
+// it, on the identical knob pair every other furniture module rides. It is not written
+// `pub mod winmenu;` bare because the module is a CLIENT of `strip`, `menubar` and `crystal`, all
+// three of which ride exactly this gate; an unconditional declaration would not resolve
+// `super::strip` on a build without the desktop and would be a compile error rather than a wider
+// feature. So the gate is a DEPENDENCY fact, not a policy one, and it moves the day the furniture
+// family's does — together, in one place.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod winmenu;

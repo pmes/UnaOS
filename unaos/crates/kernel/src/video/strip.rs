@@ -692,7 +692,11 @@ pub fn compose_all() -> bool {
     // it hangs from. Cheap when closed: two relaxed atomics and a return. The `|` is still not `||`
     // for the same reason — every furniture surface must get its damage test in every pass.
     let c = super::crystal::compose();
-    a | b | c
+    // WINMENU (R21) — the FOCUSED WINDOW's dropdown, on the crystal's exact terms and for the same
+    // reason, painted AFTER it so a window menu is the topmost surface on the panel while it is down.
+    // Cheap when closed: two relaxed atomics and a return. The `|` is still not `||`.
+    let d = super::winmenu::compose();
+    a | b | c | d
 }
 
 /// **The press seam: every furniture surface's press arm, in COMPOSITE-INVERSE order.** The twin of
@@ -740,9 +744,36 @@ pub fn compose_all() -> bool {
 /// whatever holds focus after the raise. A dock press SELECTS (raises, un-hides, hands over the
 /// keyboard) and acknowledges on the wire; it does not stop, start or kill anything. Nothing in this
 /// seam touches a running program's execution.
+///
+/// # WINMENU (R21) — a THIRD arm, and it goes FIRST
+///
+/// The window-menu dropdown is the same kind of modal surface the SHARD menu is, composited after it,
+/// so by the rule above it must be judged before it. But the ordering is load-bearing for a second,
+/// sharper reason: `wm::MENU_OCC_MAX` reserves capacity for exactly ONE open dropdown. Putting
+/// `winmenu` second would let a press land on the crystal's CLOSED corner arm while a window menu was
+/// still down — two modal surfaces, one occluder slot. First, it consumes every press while its menu
+/// is open, so that cannot happen; and its own CLOSED arm declines every point while the SHARD menu
+/// is open, so the crystal keeps its dismiss-outside press. The invariant is therefore a property of
+/// this order plus those two declines, and it is what `menubar::open_dropdown_rect` reads.
 #[inline]
 pub fn press_route(x: i32, y: i32) -> bool {
-    super::crystal::press_at(x, y) || super::dock::press_at(x, y)
+    super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y)
+}
+
+/// **The KEY seam: every furniture surface's `<Esc>` arm.** The twin of [`press_route`], extracted for
+/// its reason.
+///
+/// Both arch routers asked `crystal::key_escape` by name, ahead of the focus ring, because a modal
+/// surface must get Escape before the focus ring can TAB the desktop out from under it. R21 gives the
+/// panel a SECOND modal surface, and a second name at each of two call sites in two files edited by
+/// two lanes is the drift `press_route`'s own header was written about. So the question moves here and
+/// the routers ask one thing.
+///
+/// Consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with
+/// nothing down, falls straight through, so a boot that never opens a menu is byte-alike in behaviour.
+#[inline]
+pub fn key_escape(ev: crate::pal::Event) -> bool {
+    super::crystal::key_escape(ev) || super::winmenu::key_escape(ev)
 }
 
 // ---------------------------------------------------------------------------

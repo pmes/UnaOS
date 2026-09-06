@@ -200,6 +200,17 @@ const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
 /// the logo leftmost and the app menus to its right; the caption takes that same slot here.
 const TITLE_X0: usize = strip::PAD + CRYSTAL_W + strip::PAD;
 
+/// WINMENU (R21) — **the caption's SLOT, which is fixed-width, and where the window's menus begin.**
+///
+/// The caption is drawn at [`TITLE_X0`] and is between 0 and [`wm::MAX_TITLE`] glyphs long. If the
+/// menu titles began after the caption's RENDERED width they would slide left and right every time
+/// the focused window changed — and a press would then be judged against a layout the operator was
+/// not looking at when they aimed. So the caption gets a slot of its full stored width plus one
+/// glyph of gap, and the menus start at a constant offset whatever is in it. macOS's bar has the same
+/// property for the same reason (its app name is bold and its menus do not reflow under it); the
+/// difference is only that this kernel's caption is bounded, so the slot can be a `const`.
+const MENUS_X0: usize = TITLE_X0 + (wm::MAX_TITLE + 1) * CELL_W;
+
 /// The panel height below which the bar declines.
 ///
 /// DERIVED, and stated: the bar must not crowd the dock off the panel. The dock's own floor is
@@ -638,11 +649,33 @@ struct Model {
     title_len: usize,
     /// `HH:MM`, or `None` while the civil clock has never been anchored this boot.
     clock: Option<[u8; CLOCK_GLYPHS]>,
+    /// WINMENU (R21) — **the window whose menus this bar is showing**: the FRONTMOST VISIBLE row that
+    /// has published a tree, or [`wm::WIN_NONE`].
+    ///
+    /// ⚠ It is deliberately NOT the same reduction as the caption's, and the difference is a fact
+    /// about this kernel rather than a taste call. The caption's `focused` flag is an OWNER-ASID
+    /// match, and the click router hands SHELL focus (asid `0`) to a press on kernel furniture
+    /// (`is_kernel_owner`) — so the first publisher this arc has, [`super::pulsewin`], can never be
+    /// `focused` by that test and an owner-keyed menu selection would show nothing for the one window
+    /// it exists to serve. "Frontmost visible publisher" is what an operator means by *the window in
+    /// front*, is computed from the same single [`wm::dock_scan`] the caption already runs, and is
+    /// stated on the wire (`[winmenu] publish owner=`) so the two readings can be compared rather
+    /// than confused.
+    menu_owner: wm::WinId,
+    /// WINMENU — the title boxes, laid out once per compose and handed to the row painter. Filled in
+    /// by [`compose`] after the rect is settled, because the layout is a function of the bar rect.
+    menus: super::winmenu::BarSnapshot,
 }
 
 impl Model {
     fn empty() -> Model {
-        Model { title: [0; wm::MAX_TITLE], title_len: 0, clock: None }
+        Model {
+            title: [0; wm::MAX_TITLE],
+            title_len: 0,
+            clock: None,
+            menu_owner: wm::WIN_NONE,
+            menus: super::winmenu::BarSnapshot::empty(),
+        }
     }
 
     /// The FOCUSED window's caption plus the wall clock.
@@ -663,17 +696,28 @@ impl Model {
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
         let (n, clobbered) = wm::dock_scan(&mut rows, painted);
         let mut best_z = 0u32;
+        // WINMENU — the SECOND reduction, over the SAME scan: the frontmost visible PUBLISHER. It is
+        // separate from the caption's because `focused` is an owner match and kernel furniture takes
+        // shell focus; see [`Model::menu_owner`]. `winmenu::has_tree` is lock-free
+        // (`WINMENU_MAX` relaxed loads, short-circuited to nothing when nothing has published), so
+        // this costs a boot with no menus one atomic and no second table walk.
+        let (mut menu_z, mut menu_owner) = (0u32, wm::WIN_NONE);
         for r in rows[..n].iter() {
+            let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
+            if r.visible && super::winmenu::has_tree(r.id) && (menu_owner == wm::WIN_NONE || z >= menu_z) {
+                menu_z = z;
+                menu_owner = r.id;
+            }
             if !r.focused || !r.visible {
                 continue;
             }
-            let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
             if z >= best_z {
                 best_z = z;
                 m.title_len = r.title_len.min(wm::MAX_TITLE);
                 m.title = r.title;
             }
         }
+        m.menu_owner = menu_owner;
         m.clock = clock_hhmm();
         (m, clobbered)
     }
@@ -701,6 +745,12 @@ impl Model {
             }
             None => h = strip::fnv1a(h, 0),
         }
+        // WINMENU — the title boxes are part of what the painter reads, so they are part of the
+        // "has anything changed?" test. A title that appears, moves, is relabelled or OPENS must
+        // repaint the bar; without this fold the bar would keep a stale set of menus on the glass for
+        // as long as the caption and the clock happened not to move, which on a quiet desktop is
+        // minutes. (The two lists are the same list on purpose — this function's own rule.)
+        h = strip::fnv1a_u64(h, self.menus.signature());
         strip::seal(h)
     }
 }
@@ -788,10 +838,20 @@ pub fn compose() -> bool {
     // CLOBBER-REPAIR (PA41) — the model AND the damage question, from the ONE table scan `dock_scan`
     // already ran for the caption. The rect asked about is what the bar last PAINTED, never what it is
     // about to paint: the question is whether those pixels survived.
-    let (model, clobbered) = if rect.is_some() {
+    let (mut model, clobbered) = if rect.is_some() {
         Model::read(SLOT.rect())
     } else {
         (Model::empty(), false)
+    };
+    // WINMENU (R21) — publish which window's menus the bar is showing, then take the title layout
+    // for it. ORDER matters: `set_bar_owner` is what an input-path press reads to find out whose menu
+    // it hit (so no press ever takes the window table's lock for that), and it dismisses an open
+    // dropdown whose window has just stopped being frontmost — which must happen BEFORE the snapshot
+    // is taken, or this pass would lay out a title box for a menu that is about to be torn down.
+    super::winmenu::set_bar_owner(model.menu_owner);
+    model.menus = match rect {
+        Some(_) => super::winmenu::bar_boxes(pw, ph),
+        None => super::winmenu::BarSnapshot::empty(),
     };
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -888,6 +948,42 @@ pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     Some((bx, by, TITLE_X0, bh))
 }
 
+/// WINMENU (R21) — **where the focused window's menu titles begin**, as an offset from the bar's own
+/// origin. See [`MENUS_X0`]: a fixed slot, so the titles do not slide when the caption changes.
+#[inline]
+pub fn menus_x0() -> usize {
+    MENUS_X0
+}
+
+/// WINMENU (R21) — **the panel-absolute x the menu titles must stop before**: the clock's left edge,
+/// less one [`strip::PAD`].
+///
+/// Derived from the SAME two terms [`compose_row`] draws the clock at ([`CLOCK_GLYPHS`] and
+/// [`strip::PAD`]) rather than restated, so a title can never be laid out under the time. A bar too
+/// narrow to hold the clock at all answers its own left edge, which lays out no titles.
+pub fn menus_right_limit(bar: strip::Rect) -> usize {
+    let (bx, _by, bw, _bh) = bar;
+    let need = 2 * strip::PAD + CLOCK_GLYPHS * CELL_W;
+    bx + bw.saturating_sub(need)
+}
+
+/// **THE ONE transient-dropdown accessor** — the rect of whichever menu is currently down, or `None`.
+///
+/// `wm::occ_clip`, `wm::composite_inner`'s sprite arm and `screen::present_background` each ask "where
+/// is the open dropdown" exactly once, and before R21 each asked [`super::crystal::open_rect`] by
+/// name. There are now TWO surfaces that can be that dropdown — the SHARD menu and a window menu —
+/// and `wm::MENU_OCC_MAX` reserves capacity for ONE.
+///
+/// That budget is not a bet. The two are mutually exclusive BY CONSTRUCTION: `winmenu::press_at` runs
+/// first in [`strip::press_route`] and consumes every press while a window menu is down (so the
+/// crystal's closed-corner arm is unreachable), and its own closed arm declines every point while
+/// [`super::crystal::is_open`] (so the crystal keeps its dismiss-outside press). `winmenu`'s header
+/// states that argument where it is enforced. This function is the reading of it: at most one arm
+/// can answer `Some`, so the three sites keep asking one question and `MENU_OCC_MAX` stays 1.
+pub fn open_dropdown_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
+    super::crystal::open_rect(pw, ph).or_else(|| super::winmenu::open_rect(pw, ph))
+}
+
 /// Half the crystal's silhouette width at box-relative row `v`, in px.
 ///
 /// A brilliant-cut gem: the CROWN (rows `< CRYSTAL_CROWN_H`) widens from a narrow table at the top to
@@ -972,6 +1068,18 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
 
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL_H) / 2;
+
+    // WINMENU (R21) — **the focused window's MENU TITLES, in the bar.** Peter: *"menus belong in the
+    // menu bar"*. Overlaid here, in the bar's own single paint, rather than composited as a second
+    // surface on top of it — a title is bar chrome, and a strip that had to be repainted every time a
+    // title lit would be two damage models for one row of pixels.
+    //
+    // It is BEFORE the text-band early-return because an OPEN title's box is filled for the bar's
+    // whole height (the dropdown reads as hanging from a lit title, not floating under a flat strip),
+    // and that fill lands on rows the caption never touches. `winmenu::draw_bar_row` is handed the
+    // band (`ty0`) rather than recomputing it, so a title's baseline cannot drift from the caption's.
+    super::winmenu::draw_bar_row(out, w, &m.menus, j, ty0);
+
     if j < ty0 || j >= ty0 + CELL_H {
         return;
     }
