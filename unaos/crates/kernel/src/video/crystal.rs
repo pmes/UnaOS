@@ -655,7 +655,7 @@ fn fire(verb: Verb) {
             }
             // A34 — the ACTION. Twelve minutes of an Orin that had been told to shut down (render7)
             // is what this line closes: `power::crystal_shutdown` announces `[crystal] verb=shutdown
-            // -> PSCI SYSTEM_OFF` and calls it. The Pi keeps its honest line — there is no EL3
+            // -> PSCI SYSTEM_OFF` and calls it. The Pi keeps its honest line — there is no EL3 PSCI monitor in the Pi's CURRENT boot chain (spin-table release, no BL31 — a boot-chain consequence, not a BCM2711 property)
             // behind its `smc`, and a verb that cannot act must not park the desktop to look decisive.
             #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
             crate::power::crystal_shutdown();
