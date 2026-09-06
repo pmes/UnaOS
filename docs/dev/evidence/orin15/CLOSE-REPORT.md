@@ -47,3 +47,5 @@ MENUBAR video commit `adb3b1cd` (the granted patch applied; ten files, 1403+/266
 `UNAOS_WC=1 test 150` running at write time — logs `~/unaos-bench/scratch/orin15/{check,testarm,testwc}-adb3b1cd.log`).
 CONSOLEQUIET docs `9e030696` (`CONSOLEQUIET.patch` for fbcon.rs to rmbp 12; row A26; the x86 image byte-identical, the
 Pi panic-on-glass leg demonstrated). fbcon.rs commit waits on rmbp's read.
+MENUBAR union gate on `adb3b1cd`: check exit 0 (both arches), test-arm exit 0, `UNAOS_WC=1 test 150` exit 0 (wc in the
+banner, 69 PASS, 0 panics). Pi image: `kernel8.img` before = after (apply -R method; the value TCURX2.md records).
