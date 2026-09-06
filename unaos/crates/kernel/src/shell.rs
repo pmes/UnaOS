@@ -937,11 +937,32 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// (so `mv DIR NEWNAME` needs no `-r`). The `mv SRC DIR/` idiom lands the entry under DIR as the
 /// source leaf. JD14: no-clobber is the DEFAULT — an existing destination is `-EEXIST` unless `-f`.
 ///
-/// **A cross-volume move is refused by name, and the refusal comes from the mount table**, not from
-/// a prefix test in this verb: relinking an entry is a within-volume operation, so
+/// **A cross-volume move is refused by identity, and the refusal comes from the mount table**, not
+/// from a prefix test in this verb: relinking an entry is a within-volume operation, so
 /// [`crate::fs::vfs::MountTable::same_volume`] is asked and the operator is told to `cp` then `rm`.
 /// That is the same answer the pre-VFSROUTE verb gave for the native/FAT pair — but it now holds for
 /// every pair of volumes the machine ever mounts, including two it has not met yet.
+///
+/// # THE WRITE VETO IS ASKED FIRST, AND THE ORDER IS THE DIAGNOSIS (VOLID, orin 18, rmbp 15 N1)
+///
+/// This verb asked `same_volume` BEFORE [`vfs_gate_ok`], so on a READ-ONLY volume the operator was
+/// told *"cross-volume move is not supported"* — a sentence about the namespace — when the actual
+/// obstacle was that the medium refuses every mutation. Both refusals can be true at once and the
+/// operator only ever sees the first one, so the order decides which fact they are handed, and the
+/// veto is the fact that survives the suggested workaround: `cp` then `rm` cannot help on a volume
+/// that admits no writes, while it is exactly right for a genuine cross-volume move.
+///
+/// The gate is aimed at the **source**, not the destination as before. A relink gives up an entry on
+/// the volume the file is on, so that volume must accept mutation whatever the destination is; and
+/// once `same_volume` has passed, the destination IS that volume (equal
+/// [`crate::fs::vfs::VfsBackend::volume_id`] means one medium, hence one veto — `write_veto` is a
+/// pure function of the `BlockSource`, and the source is one of the terms the id mixes), so the
+/// destination gate the old order ran is not dropped, it is subsumed. One `WRITE_GATE` stamp per
+/// `mv`, before and after.
+///
+/// The final order is **argument validity → write veto → namespace**: `mv DIR DIR/sub` is a
+/// malformed request whatever the medium's posture and keeps its `-EINVAL`, so the only diagnosis
+/// this reorder changes is the one N1 names.
 fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
     use crate::fs::vfs::{NodeKind, VfsError};
     let Some((mt, spath)) = vfs_read_open(console, "mv", src) else { return };
@@ -961,12 +982,10 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
     } else {
         dpath_arg
     };
-    match mt.same_volume(&spath, &dpath) {
-        Ok(true) => {}
-        Ok(false) => return console.println(
-            "mv: cross-volume move is not supported (copy with `cp`, then `rm`)"),
-        Err(e) => return vfs_fail(console, "mv", &dpath, e),
-    }
+    // ARGUMENT VALIDITY FIRST: a directory moved into itself is a malformed request whatever the
+    // volume's posture, so it keeps the answer it had. (It no longer sits BEHIND `same_volume`,
+    // which could only ever have answered `true` for it — both ends are the same path or one
+    // contains the other, so they are the same volume by construction.)
     if matches!(src_st.kind, NodeKind::Dir)
         && (dpath.eq_ignore_ascii_case(&spath) || is_descendant(&dpath, &spath))
     {
@@ -974,9 +993,23 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
             "mv: cannot move directory {} into itself or its own subtree ({}) (-EINVAL)",
             spath, dpath));
     }
-    if !vfs_gate_ok(console, &mt, "mv", &dpath) {
+    // VOLID N1: THE VETO BEFORE THE NAMESPACE QUESTION, and aimed at the SOURCE — see this verb's
+    // doc comment. A volume that refuses mutation refuses this move for a reason `cp` + `rm` cannot
+    // route around, so it is the refusal the operator needs to read; the cross-volume question is
+    // asked only once the medium has said it will accept a write at all.
+    if !vfs_gate_ok(console, &mt, "mv", &spath) {
         return;
     }
+    match mt.same_volume(&spath, &dpath) {
+        Ok(true) => {}
+        Ok(false) => return console.println(
+            "mv: cross-volume move is not supported (copy with `cp`, then `rm`)"),
+        Err(e) => return vfs_fail(console, "mv", &dpath, e),
+    }
+    // (The destination gate that stood here is subsumed by the source gate above: `same_volume` has
+    // passed, so `dpath` resolves to the SAME medium as `spath` and would answer the same veto —
+    // `FatBackend::write_veto` is a pure function of the `BlockSource`, and the source is one of the
+    // terms `volume_id` mixes, so equal identity implies equal veto.)
     if !dpath.eq_ignore_ascii_case(&spath) {
         match mt.stat(&dpath) {
             Ok(d) => {
@@ -3389,6 +3422,14 @@ fn shell_relics_native_witness() {
 // ARCH-NEUTRAL BY CONSTRUCTION: there is no `target_arch` in the assertions, only in the call sites
 // (aarch64 runs it after `emmc2::probe()`, x86 after the storage-ready pass — the two moments each
 // board actually has a volume).
+//
+// VOLID (orin 18) — THE SELF-ORACLE THAT WAS HERE. "The two prefixes resolve to the same volume"
+// was itself taken from `MountTable::same_volume`, the router being tested. That made the legs
+// agree with any bug IN that predicate: rmbp 15's condition C1 (one Orin card mounted twice under
+// two names and compared BY NAME, so it read as two volumes) would have moved the expectation and
+// the answer together and printed PASS. The transcript now computes that fact from the PROBE
+// OBJECT via `stat` — a different verb, consulting no volume identity — and adds
+// `vfsroute.samevol`, which convicts `same_volume` against it. See the oracle note at the probe.
 
 /// VFSROUTE: one-shot latch — the service loops call the x86 site every pass; it must speak once.
 #[cfg(feature = "witness")]
@@ -3437,13 +3478,35 @@ pub fn vfsroute_witness() {
     }
     verdict("vfsroute.route", route_ok, &route_why);
 
-    // --- the probe: a real FILE on the root volume, read off the TABLE (not off a verb), plus
-    //     whether `/fat` is the same volume as `/` on this board. Both legs below hang off these.
+    // --- VOLID (orin 18): THE IDENTITY CENSUS, PRINTED UNCONDITIONALLY -----------------------------
+    //
+    // `verdict` renders its `got` string only on FAIL, and the values this fix is SCORED on are the
+    // identities themselves — not the pass/fail of a predicate over them. So every mounted prefix
+    // publishes its `volume_id`, and `same_volume` is asked over every PAIR of mounted prefixes, on
+    // every board, on every boot of a witness build. That is what makes "is `/` the same volume as
+    // `/fat` here?" a reading off the wire instead of an argument, and it is the same line whether
+    // the board is the Orin (one card at two prefixes), x86 (one source at two prefixes), or the Pi
+    // (UnaFS and FAT on ONE card, which must still read as two volumes).
+    //
+    // `id=None` is a backend's honest "I cannot establish this volume's identity" and is NEVER equal
+    // to anything, including another `None` — so a pair printing two `None`s reads `same=false` for
+    // that reason and not because two media were compared.
+    for (i, (pa, na, _, _, _)) in rows.iter().enumerate() {
+        serial_println!(
+            ":: volid: mount {} name={} id={:?} ::", pa, na, mt.volume_id(pa).ok().flatten());
+        for (pb, nb, _, _, _) in rows.iter().skip(i + 1) {
+            serial_println!(
+                ":: volid: {} ({}) vs {} ({}) -> same={:?} ::",
+                pa, na, pb, nb, mt.same_volume(pa, pb));
+        }
+    }
+
+    // --- the probe: a real FILE on the root volume, read off the TABLE (not off a verb). Every
+    //     leg below hangs off it.
     let probe = mt
         .read_dir("/")
         .ok()
         .and_then(|rs| rs.into_iter().find(|r| matches!(r.kind, NodeKind::File)));
-    let same_as_fat = mt.same_volume("/", "/fat").unwrap_or(false);
 
     match probe {
         None => serial_println!(
@@ -3451,6 +3514,45 @@ pub fn vfsroute_witness() {
         Some(p) => {
             let root_path = vfs_join("/", &p.name);
             let fat_path = vfs_join("/fat", &p.name);
+
+            // --- THE ORACLE, AND IT DOES NOT ASK `same_volume` (VOLID, orin 18) --------------
+            //
+            // "Are `/` and `/fat` one volume?" is the fact legs 2 and 3 assert against, and it
+            // used to be computed as `mt.same_volume("/", "/fat")` — the router asked about
+            // itself. A wrong `same_volume` moved the EXPECTATION the same way it moved the
+            // answer, so every leg agreed with the bug: exactly the shape that let rmbp 15's C1
+            // (one Orin card mounted twice under two names, read as two volumes) sit under a
+            // green transcript.
+            //
+            // The independent fact is THE OBJECT. `/` listed a file with a name and a byte
+            // count; the two prefixes address one volume exactly when `/fat` shows THAT object —
+            // same name, same kind, same size — reached by a plain `stat` through the resolver,
+            // which consults no identity at all. That is a different verb from the two legs it
+            // then feeds, so no leg compares an expression with itself.
+            //
+            // Two-sided on every board by construction: on the Pi `/` is UnaFS and `/fat` is the
+            // boot FAT and neither holds the other's files (observed FALSE); on x86 and on the
+            // Orin's card both prefixes address one directory (observed TRUE). A `same_volume`
+            // stuck at either constant therefore reds this leg on one of the two shapes.
+            let observed_same = matches!(
+                mt.stat(&fat_path),
+                Ok(s) if matches!(s.kind, NodeKind::File) && s.size == p.size);
+            let reported_same = mt.same_volume("/", "/fat").unwrap_or(false);
+            serial_println!(
+                ":: volid: oracle probe={} size={} stat(/fat/probe)_matches={} same_volume={} ::",
+                p.name, p.size, observed_same, reported_same);
+            verdict(
+                "vfsroute.samevol",
+                reported_same == observed_same,
+                &alloc::format!(
+                    "reported={} observed={} probe={} size={} id(/)={:?} id(/fat)={:?}",
+                    reported_same, observed_same, p.name, p.size,
+                    mt.volume_id("/").ok().flatten(),
+                    mt.volume_id("/fat").ok().flatten()),
+            );
+            // Legs 2 and 3 assert against the OBSERVED fact, never against the router's own
+            // claim — see the oracle note above.
+            let same_as_fat = observed_same;
 
             // --- leg 2: `ls`. The probe appears under `/`, and under `/fat` IFF the two prefixes
             //     are the same volume. A verb that ignored the prefix would show it under both.
@@ -3462,7 +3564,7 @@ pub fn vfsroute_witness() {
                 "vfsroute.ls",
                 in_root && (in_fat == same_as_fat),
                 &alloc::format!(
-                    "probe={} in_root={} in_fat={} same_volume={} root=[{}] fat=[{}]",
+                    "probe={} in_root={} in_fat={} observed_same={} root=[{}] fat=[{}]",
                     p.name, in_root, in_fat, same_as_fat, ls_root, ls_fat),
             );
 
@@ -3477,7 +3579,7 @@ pub fn vfsroute_witness() {
                 "vfsroute.cat",
                 root_read && (fat_read == same_as_fat),
                 &alloc::format!(
-                    "root_read={} fat_read={} same_volume={} fat_said=[{}]",
+                    "root_read={} fat_read={} observed_same={} fat_said=[{}]",
                     root_read, fat_read, same_as_fat,
                     // Bounded: a FAIL on a binary probe file would otherwise pour the whole 8 KiB
                     // console cap onto the wire, and the serial transport is the evidence channel.
@@ -3531,6 +3633,96 @@ pub fn vfsroute_witness() {
             "fat_remove_attr={:?} root_remove_dir={:?} root_vol={}",
             fat_attr, native_rmdir, root_vol),
     );
+
+    // --- leg 6: THE ALIASING SHAPE ITSELF (VOLID, orin 18 — rmbp 15 condition C1) -----------------
+    //
+    // C1 is not a property of any prefix a particular board happens to mount: it is ONE MEDIUM
+    // BOUND TWICE UNDER TWO DIFFERENT NAMES. `sdmmc_root_bind` does exactly that on the Orin —
+    // `FatBackend::new_tegra_sd("card", …)` at `/` and `new_tegra_sd("fat", …)` at `/fat` — and
+    // `same_volume` compared the two NAMES, so one physical card read as two volumes and
+    // `mv /A.TXT /fat/B.TXT` was refused as cross-volume on the exact configuration render9 flies.
+    //
+    // NO BOARD THIS GATE CAN BOOT MOUNTS THAT SHAPE. x86 binds both prefixes under the SAME name
+    // and therefore answered correctly by luck; the Pi's two prefixes are genuinely two volumes.
+    // So the transcript BUILDS the shape, on this board's own media, in a scratch mount table that
+    // is dropped on return — nothing in the live namespace moves.
+    //
+    // BOTH DIRECTIONS OF THE NAME'S WRONGNESS, IN ONE LEG:
+    //   * `/volid-a` "card" and `/volid-b` "fat" over ONE source must be the SAME volume. A name
+    //     comparison says false here — one medium typed two names.
+    //   * `/volid-c` "card" over a DIFFERENT source must NOT be the same volume as `/volid-a`,
+    //     which carries the identical name. A name comparison says true here — two media typed one
+    //     name, the corrupting direction.
+    // Neither half is passable by a predicate stuck at a constant, and the ids are printed so the
+    // reader sees the values, not only their equality. When the second source is absent its id
+    // prints `None` and the negative half is carried by "no established identity" rather than by
+    // "a different medium" — which the line says, rather than implying a stronger measurement.
+    {
+        use crate::fs::fat::BlockSource;
+        use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+        // EVERY source this build can name, the board-specific ones FIRST so an Orin boot measures
+        // the LITERAL C1 pair (`TegraSd` under two names) rather than a stand-in, and an x86 boot
+        // finds the staged card that `Default` does not name (the first cut of this leg listed only
+        // `Default`/`Usb` and skipped itself on x86 with `handles=global=absent sdhc=present`).
+        #[allow(unused_mut)]
+        let mut cands = alloc::vec![BlockSource::Default, BlockSource::Usb];
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        cands.insert(0, BlockSource::TegraSd);
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        cands.insert(0, BlockSource::Sdhc);
+        let src = cands
+            .iter()
+            .copied()
+            .find(|s| crate::fs::fat::mount_source(*s).is_ok());
+        match src {
+            None => serial_println!(
+                ":: volid: no mountable FAT source on this board — alias leg skipped (handles={}) ::",
+                crate::drivers::block::source_census()),
+            Some(src) => {
+                // A second source that ALSO mounts makes the negative half a comparison of two live
+                // volumes; failing that, any other source, whose id is then `None` and whose line
+                // says so rather than implying a stronger measurement.
+                let other = cands
+                    .iter()
+                    .copied()
+                    .find(|s| *s != src && crate::fs::fat::mount_source(*s).is_ok())
+                    .or_else(|| cands.iter().copied().find(|s| *s != src));
+                let mut t = MountTable::new();
+                t.mount("/volid-a", alloc::boxed::Box::new(
+                    FatBackend::new_source("card", KERNEL_PRINCIPAL, true, src)));
+                t.mount("/volid-b", alloc::boxed::Box::new(
+                    FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
+                let id_a = t.volume_id("/volid-a").ok().flatten();
+                let id_b = t.volume_id("/volid-b").ok().flatten();
+                let alias_same = t.same_volume("/volid-a", "/volid-b").unwrap_or(false);
+                let (cross_same, id_c) = match other {
+                    None => (false, None),
+                    Some(o) => {
+                        t.mount("/volid-c", alloc::boxed::Box::new(
+                            FatBackend::new_source("card", KERNEL_PRINCIPAL, true, o)));
+                        (t.same_volume("/volid-a", "/volid-c").unwrap_or(false),
+                         t.volume_id("/volid-c").ok().flatten())
+                    }
+                };
+                // Printed unconditionally, for the same reason the census above is: the VALUES are
+                // the measurement, and `verdict` shows them only on FAIL.
+                serial_println!(
+                    ":: volid: alias one_source={} names=card/fat alias_same={} | cross other={} \
+                     cross_same={} | id(a)={:?} id(b)={:?} id(c)={:?} ::",
+                    src.name(), alias_same, other.map(|o| o.name()).unwrap_or("none"),
+                    cross_same, id_a, id_b, id_c);
+                verdict(
+                    "vfsroute.alias",
+                    alias_same && !cross_same && id_a.is_some() && id_a == id_b,
+                    &alloc::format!(
+                        "one_source={} names=card/fat alias_same={} cross_same={} other={} \
+                         id(a)={:?} id(b)={:?} id(c)={:?}",
+                        src.name(), alias_same, cross_same,
+                        other.map(|o| o.name()).unwrap_or("none"), id_a, id_b, id_c),
+                );
+            }
+        }
+    }
 }
 
 /// VFSROUTE (orin 17): the NATIVE-volume mutation transcript — `touch`, `ls`, `mkdir`, `rmdir`, `rm`

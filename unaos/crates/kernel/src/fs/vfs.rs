@@ -316,7 +316,102 @@ pub trait VfsBackend {
     fn describe(&self) -> Option<String> {
         None
     }
+
+    // --- VOLID (orin 18) -------------------------------------------------------
+
+    /// This volume's IDENTITY — the answer to "are these two mounts the same storage?",
+    /// which is the only question [`MountTable::same_volume`] and [`MountTable::rename`]
+    /// ever wanted.
+    ///
+    /// **Deliberately NOT the volume name.** A name is an argument the mount site typed;
+    /// identity is a fact about the medium. One machine binds ONE volume at two prefixes
+    /// under two different names — `sdmmc_root_bind` mounts the Orin card as `"card"` at
+    /// `/` and as `"fat"` at `/fat` — and a name comparison calls those two volumes,
+    /// refusing `mv /A.TXT /fat/B.TXT` as "cross-volume" when it is a plain in-volume
+    /// relink (rmbp 15, condition C1). That is the inverse of the pointer comparison the
+    /// name replaced, arriving through the other door: a pointer is too FINE (two adapters
+    /// over one medium split), and a name is wrong in BOTH directions (one medium may be
+    /// typed two names; two media may be typed one). The pointer test survives as a FLOOR
+    /// inside [`same_storage`] — never as the answer — because it is at least never wrong
+    /// when it says YES.
+    ///
+    /// A backend answers with something ALIASING CANNOT BREAK: whatever it actually reads
+    /// through, and WHICH FILESYSTEM it reads it as.
+    ///
+    /// # IDENTITY IS OVER (DEVICE, FILESYSTEM) — NEVER THE DEVICE ALONE
+    ///
+    /// The device alone is not identity, and the case that proves it is the Pi: it mounts
+    /// the native UnaFS volume at `/` and the FAT program volume at `/fat`, and BOTH live on
+    /// the one physical card — `drivers/emmc2.rs` sizes the UnaFS volume from the same card
+    /// that [`crate::fs::fat::BlockSource::Default`] reads. An id derived from the block
+    /// source alone would call those two mounts one volume and admit `mv /X.TXT /fat/X.TXT`,
+    /// relinking an UnaFS inode into a FAT directory — the C1 failure reproduced one layer
+    /// further down. So every implementor mixes a DOMAIN TAG naming its filesystem BEFORE it
+    /// mixes anything about the medium, and two different filesystems are unequal by
+    /// construction whatever they sit on. [`volid_mix`] and [`VOLID_SEED`] are the shared
+    /// derivation.
+    ///
+    /// # WHY IT IS REQUIRED, AND WHY IT RETURNS `Option`
+    ///
+    /// **No default body.** For a MUTATING method a default of `Err(Unsupported)` is the
+    /// safe direction, and this trait takes it six times above. For an IDENTITY the
+    /// instinct inverts: a constant default would make every backend that did not override
+    /// it the SAME volume as every other — the corrupting direction, and the one answer a
+    /// rename must never get wrong. A default derived from the name is no better, since
+    /// that comparison IS C1. So the compiler asks each implementor the question instead.
+    ///
+    /// `None` is the honest "I cannot establish this volume's identity", and it means
+    /// **NEVER EQUAL TO ANYTHING, INCLUDING ANOTHER `None`** — see [`same_storage`]. It is
+    /// therefore always safe to answer: refusing a legal move is an inconvenience,
+    /// performing an illegal one relinks a directory entry to a name that means nothing on
+    /// its volume. `Some(id)` is a CLAIM, and equal ids must mean the same bytes.
+    ///
+    /// A backend still compares equal to ITSELF when it answers `None`: [`same_storage`]
+    /// settles object identity first, so `mv /A.TXT /B.TXT` inside one mount never turns
+    /// into a spurious cross-volume refusal because the medium was unreadable that instant.
+    fn volume_id(&self) -> Option<u64>;
 }
+
+/// VOLID (orin 18): are these two mounts THE SAME STORAGE? The one place the identity
+/// contract is interpreted — [`MountTable::same_volume`] (what `mv` prints) and
+/// [`MountTable::rename`] (what `mv` enforces) both call it, so the two cannot drift.
+///
+/// Two rules, in order:
+///
+/// 1. **The same backend object is the same storage**, unconditionally. This is the old
+///    pointer comparison kept as a FLOOR rather than as the rule: a pointer test is too
+///    fine to BE the answer (two adapters over one medium are one volume and compare
+///    unequal), but it is never wrong in the TRUE direction — one object reads one medium.
+///    It makes the relation reflexive, and it is what keeps a backend that answers `None`
+///    usable within its own mount.
+/// 2. Otherwise `Some(a) == Some(b)`. `None` on either side is NOT equal — including
+///    `None` vs `None`, which is two backends that each said "I cannot tell", the weakest
+///    possible ground on which to relink a directory entry.
+pub fn same_storage(a: &dyn VfsBackend, b: &dyn VfsBackend) -> bool {
+    if core::ptr::addr_eq(a as *const dyn VfsBackend, b as *const dyn VfsBackend) {
+        return true;
+    }
+    match (a.volume_id(), b.volume_id()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// VOLID (orin 18): FNV-1a (64-bit) — the whole of the id derivation. No allocation, no
+/// state, `const`-evaluable, and total over any byte string, so a backend can mix its
+/// domain tag and its own identity bytes without pulling in a hasher.
+pub const fn volid_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+/// VOLID: the FNV-1a offset basis — the seed every domain tag starts from.
+pub const VOLID_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// One mount: a namespace prefix bound to a backend. The prefix is canonical —
 /// it starts with `/`, and (except the root `/`) carries no trailing slash.
@@ -474,32 +569,43 @@ impl MountTable {
     pub fn rename(&self, from: &str, to: &str, principal: &str) -> Result<(), VfsError> {
         let (bf, relf) = self.resolve(from)?;
         let (bt, relt) = self.resolve(to)?;
-        if bf.volume_name() != bt.volume_name() {
+        if !same_storage(bf, bt) {
             return Err(VfsError::Unsupported);
         }
         // Both remainders are VOLUME-ROOT-relative by construction (each mount strips its own
-        // prefix), so when the two mounts name the same volume the destination's remainder is a
+        // prefix), so when the two mounts are the same volume the destination's remainder is a
         // valid address on the source's backend — which is what lets `mv /A.TXT /fat/B.TXT` work on
-        // a machine that binds one volume at two prefixes (x86's `/` + `/fat`).
+        // a machine that binds one volume at two prefixes (x86's `/` + `/fat`, the Orin's card).
         bf.rename(relf, relt, principal)
     }
 
     /// Do `from` and `to` land on the SAME volume? The question `mv` asks before it decides between
     /// a rename and an honest cross-volume refusal.
     ///
-    /// **Compared by VOLUME NAME, not by mount identity, and the difference is load-bearing.** A
-    /// machine may bind ONE volume at two prefixes — x86 binds the program source at `/` and `/fat`,
-    /// the Orin's ROOTFS binds the card at both — and a pointer comparison calls those two volumes,
-    /// which would refuse a rename that is a plain in-volume relink. The name is the volume's own
-    /// identity, published by the backend.
+    /// **Compared by [`VfsBackend::volume_id`] — the volume's STORAGE identity — and the difference
+    /// is load-bearing (VOLID, orin 18, rmbp 15 condition C1).** A machine may bind ONE volume at two
+    /// prefixes under two different NAMES: `sdmmc_root_bind` mounts the Orin card as `"card"` at `/`
+    /// and as `"fat"` at `/fat`. This compared the two NAMES until VOLID and therefore answered
+    /// `false` for one physical card, refusing `mv /A.TXT /fat/B.TXT` on exactly the configuration
+    /// the render9 boot disk flies. A pointer comparison (the shape before that) fails the same way;
+    /// the name merely moved the failure one door over. Identity is a fact about the medium, so the
+    /// backend answers it off what it reads through, not off what its mount was called.
     ///
-    /// It errs CONSERVATIVELY in the other direction: two mounts of one medium under DIFFERENT names
-    /// read as different volumes and a rename across them is refused (`cp` then `rm` still works).
-    /// Refusing is never corrupting; the reverse is.
+    /// It still errs CONSERVATIVELY: a backend that cannot establish its storage identity answers
+    /// `None`, the two mounts read as different volumes, and the rename is refused (`cp` then `rm`
+    /// still works). Refusing is never corrupting; the reverse is. [`same_storage`] holds the whole
+    /// rule, and [`MountTable::rename`] enforces the same predicate this one reports.
     pub fn same_volume(&self, from: &str, to: &str) -> Result<bool, VfsError> {
         let (bf, _) = self.resolve(from)?;
         let (bt, _) = self.resolve(to)?;
-        Ok(bf.volume_name() == bt.volume_name())
+        Ok(same_storage(bf, bt))
+    }
+
+    /// VOLID: the storage identity of the volume claiming `path` — the value [`same_storage`]
+    /// compares. Exposed so a transcript can PRINT the two ids it is asserting over instead of only
+    /// their equality; `None` is the backend's honest "I cannot establish it", never a zero.
+    pub fn volume_id(&self, path: &str) -> Result<Option<u64>, VfsError> {
+        Ok(self.resolve(path)?.0.volume_id())
     }
 
     pub fn remove_dir(&self, path: &str, principal: &str) -> Result<(), VfsError> {
@@ -786,6 +892,52 @@ fn fat_create_err(e: crate::fs::fat::FatError) -> VfsError {
 impl VfsBackend for FatBackend {
     fn volume_name(&self) -> &str {
         &self.volume
+    }
+
+    /// VOLID (orin 18): identity = `(vfs:fat:, BLOCK SOURCE, VOLUME FINGERPRINT)` — the
+    /// FILESYSTEM tag, the device this adapter reads through, and **the mounted volume's own**
+    /// [`fingerprint`](crate::fs::fat::FatFs::volume_fingerprint), `(BS_VolID,
+    /// count_of_clusters)`.
+    ///
+    /// All three terms carry weight:
+    ///
+    /// * The **tag** is the FILESYSTEM half of `(device, filesystem)`. Without it the Pi's
+    ///   `/fat` (FAT on the card) and `/` (UnaFS on the same card) would collide.
+    /// * The **source** is what `FatBackend` actually reads through: it carries no volume
+    ///   selector at all (`volume`/`principal`/`world_readable` are a label and a posture),
+    ///   and every method reaches the medium through `fat::mount_source(self.source)`. Two
+    ///   adapters with equal `source` therefore address the same bytes whatever their mounts
+    ///   were NAMED — which is exactly the C1 aliasing, since `sdmmc_root_bind` types `"card"`
+    ///   at `/` and `"fat"` at `/fat` over one `TegraSd`. `BlockSource::name()` is the
+    ///   spelling `SourceCensus` publishes, so no second vocabulary is invented here.
+    /// * The **fingerprint** is the volume's own identity, and it is what makes this an
+    ///   identity rather than a device address: the serial is fixed at format time and the
+    ///   cluster count by the geometry, so a REFORMAT or a swapped card under an unchanged
+    ///   handle answers differently. It is the same primitive the aarch64 `UNAFS.ATR` ACL
+    ///   store already binds to (`fs/fat.rs`, K1 M2.2), so the VFS and the ACL store agree on
+    ///   what "this volume" means.
+    ///
+    /// **Why NOT `fat::volume_serials(source)`** (the shape reviewed and declined). That
+    /// function is a DEVICE-WIDE CENSUS — superfloppy plus up to 128 GPT entries plus 4 MBR
+    /// entries — and it is deliberately a SUPERSET, because its consumer is the boot-device
+    /// guard, which must recognise a disk by ANY volume on it. Two different partitions on one
+    /// device would hand back the same id set and read as one volume: C1 again, one layer
+    /// down. `mount_source` is the right call precisely because it returns THE volume this
+    /// adapter mounts, by the same first-match-wins rule every other method here uses.
+    ///
+    /// **`None` when the volume will not mount**, which is honest rather than conservative
+    /// theatre: an unreadable medium has no established identity, and [`same_storage`] treats
+    /// `None` as equal to nothing. The one case that would otherwise regress —
+    /// `mv /A.TXT /B.TXT` inside a single mount whose card blipped — is answered by
+    /// `same_storage`'s object-identity floor before this method is consulted, so the operator
+    /// gets the real I/O error from the rename instead of a false cross-volume refusal.
+    fn volume_id(&self) -> Option<u64> {
+        let fs = crate::fs::fat::mount_source(self.source).ok()?;
+        let (serial, clusters) = fs.volume_fingerprint();
+        let h = volid_mix(VOLID_SEED, b"vfs:fat:");
+        let h = volid_mix(h, self.source.name().as_bytes());
+        let h = volid_mix(h, &serial.to_le_bytes());
+        Some(volid_mix(h, &clusters.to_le_bytes()))
     }
 
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
@@ -1161,6 +1313,31 @@ impl VfsBackend for NativeBackend {
         &self.volume
     }
 
+    /// VOLID (orin 18): the DOMAIN TAG alone, and the name is not part of it — a constant that
+    /// is EXACT here rather than a degradation, because there is exactly one native volume on
+    /// this machine and it is not this struct.
+    ///
+    /// **This is the implementor `volume_fingerprint` cannot serve, and it is why identity is
+    /// a `(device, filesystem)` pair rather than a device.** A fingerprint is a method on
+    /// `FatFs`; the native UnaFS volume is not a `FatFs` and has none. Degrading it to the
+    /// block source would be catastrophic on the Pi, which mounts UnaFS at `/` and the FAT
+    /// program volume at `/fat` off THE SAME PHYSICAL CARD (`drivers/emmc2.rs` registers the
+    /// card as `BlockSource::Default` and sizes the UnaFS volume from the same geometry): the
+    /// two would collide and `mv /X.TXT /fat/X.TXT` would relink an inode across filesystems.
+    /// The `vfs:unafs:` tag is what keeps them apart, and it does so BY CONSTRUCTION — no FAT
+    /// id can equal it whatever the medium, because the tag is mixed before anything else.
+    ///
+    /// The device half is degenerate, and that is a fact about the subsystem, not an omission:
+    /// `NativeBackend` holds nothing but a label and every method goes through
+    /// `crate::fs::unafs::with_unafs`, the ONE coherent global mount. Two `NativeBackend`s are
+    /// therefore the same storage no matter what their mounts were called — the same aliasing
+    /// class as C1's FAT pair, found while fixing it and closed by the same rule. When UnaFS
+    /// grows a second mountable volume this method is where its volume identity is mixed in,
+    /// and the trait's `Option` is already the right shape for a volume that cannot supply one.
+    fn volume_id(&self) -> Option<u64> {
+        Some(volid_mix(VOLID_SEED, b"vfs:unafs:"))
+    }
+
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
         let path = native_abs(rel);
         crate::fs::unafs::with_unafs(|fs| {
@@ -1468,6 +1645,25 @@ impl VfsBackend for MockBackend {
     fn volume_name(&self) -> &str {
         &self.name
     }
+
+    /// VOLID (orin 18): `None`, and this is the implementor that shows why the trait returns
+    /// an `Option` instead of merely being required.
+    ///
+    /// A mock's storage is its own `files` map, in this object's RAM. Nothing else in the
+    /// system can address it, so the only mount that IS this storage is this very object —
+    /// which [`same_storage`] settles on object identity before it ever calls this method. A
+    /// name-derived id would be strictly WORSE than nothing: two `MockBackend::native("native")`
+    /// values are two different `Vec`s, and an id off the name would call them one volume and
+    /// admit a rename between them. That is the corrupting direction, from the exact instinct
+    /// (fall back to the name) that produced C1.
+    ///
+    /// So the honest answer is "I have no identity anything else could share", which is what
+    /// `None` means. The witness legs are unaffected: none of them asks `same_volume`, and a
+    /// rename within one mock would still be admitted by the object-identity floor.
+    fn volume_id(&self) -> Option<u64> {
+        None
+    }
+
     fn read_dir(&self, _rel: &str) -> Result<Vec<DirEnt>, VfsError> {
         Ok(self
             .files

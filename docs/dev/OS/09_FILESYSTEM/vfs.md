@@ -634,16 +634,68 @@ backend opts in to a capability rather than remembering to refuse.
 | `remove_attr(rel, key, principal)` | `Unsupported` | **not implemented** — FAT has no typed attributes | `remove_attribute` |
 | `volume_bytes() -> Option<u64>` | `None` | the BPB's volume size | `None` (no published total) |
 | `describe() -> Option<String>` | `None` | the geometry line the retired `fatinfo` printed | `None` |
+| `volume_id() -> Option<u64>` | **no default — required** (VOLID) | `Some(fnv("vfs:fat:" ‖ source ‖ BS_VolID ‖ cluster count))`; `None` if the volume will not mount | `Some(fnv("vfs:unafs:"))` — one global mount per machine |
 
 `MountTable` gained the matching resolve-then-dispatch conveniences plus `volume_name(path)`,
-`same_volume(a, b)` and `rows()` (one tuple per mount: prefix, volume, veto, capacity, description —
-the five facts `df`/`mount` render and the only five they know).
+`same_volume(a, b)`, `volume_id(path)` and `rows()` (one tuple per mount: prefix, volume, veto,
+capacity, description — the five facts `df`/`mount` render and the only five they know).
 
 **A cross-volume `rename` is refused by the TABLE, not by a verb.** A backend receives
 volume-relative paths and cannot tell that the other end lives elsewhere, so `MountTable::rename`
 compares the two resolved backends and returns `Unsupported` when they differ. `mv` prints
 *"cross-volume move is not supported (copy with `cp`, then `rm`)"* — the same answer the old verb
 gave for the native/FAT pair, now true for every pair of volumes the machine will ever mount.
+
+#### 13.2.1 What "the same volume" means (VOLID, orin 18 — rmbp 15 condition C1)
+
+That comparison has been three different things, and only the third is an identity:
+
+1. **the two backend POINTERS** — too fine. One medium bound at two prefixes is two objects, so a
+   plain in-volume relink read as a cross-volume move.
+2. **the two VOLUME NAMES** — wrong in *both* directions, and the reason this section exists.
+   `sdmmc_root_bind` binds the Orin's card as `"card"` at `/` and as `"fat"` at `/fat`, so one
+   physical card read as two volumes and `mv /A.TXT /fat/B.TXT` was refused on exactly the
+   configuration the bench flies. The converse is worse: two different media typed one name would
+   read as ONE volume, and a rename between them relinks a directory entry to a name that means
+   nothing on its volume. A name is an argument the mount site typed, never a fact about the medium.
+3. **`volume_id()` — the backend's own STORAGE IDENTITY**, which is what the question always meant.
+
+**Identity is over `(DEVICE, FILESYSTEM)`, never the device alone.** The device alone fails on the
+Pi, which mounts UnaFS at `/` and the FAT program volume at `/fat` off *the one physical card*
+(`drivers/emmc2.rs` registers it as `BlockSource::Default` and sizes the UnaFS volume from the same
+geometry). So every implementor mixes a **domain tag** naming its filesystem before it mixes
+anything about the medium, and two filesystems on one card are unequal by construction. The FAT
+adapter then adds the block source *and* the mounted volume's own fingerprint —
+`FatFs::volume_fingerprint()`, `(BS_VolID, count_of_clusters)`, the same primitive the aarch64
+`UNAFS.ATR` ACL store binds to. It deliberately does **not** use `fat::volume_serials()`: that is a
+device-wide census, a deliberate superset for the boot-device guard, so two partitions on one device
+would share its id set — the same defect one layer down.
+
+**`Option`, and no default.** A constant default would make every non-overriding backend the same
+volume as every other, which is the corrupting direction; a name-derived default is defect 2 again.
+So the method is required, and `None` means *"I cannot establish this volume's identity"* — **never
+equal to anything, including another `None`.** `fs::vfs::same_storage(a, b)` is the one
+interpretation of the contract (`same_volume` reports it, `rename` enforces it, so the two cannot
+drift): object identity first — the same backend object is the same storage, which keeps the
+relation reflexive and keeps a `None`-answering backend usable inside its own mount — then
+`Some(a) == Some(b)`.
+
+**Where it is measured.** The `vfsroute` transcript prints `:: volid: … ::` census lines
+unconditionally — each mount's `id=`, and `same=` for every pair of mounted prefixes — and carries
+two legs. `vfsroute.samevol` convicts `same_volume` against an oracle taken from the probe file's
+`stat` under both prefixes, never from `same_volume` itself (which is what the transcript did
+before, so a wrong router moved the expectation and the answer together). `vfsroute.alias` *builds*
+the C1 shape in a scratch mount table — one block source under two names, which must be the same
+volume, and a different source under the identical name, which must not be — because no board the
+QEMU gates can boot mounts that shape.
+
+**`mv` asks the write veto BEFORE the namespace question** (rmbp 15 N1). The order is the diagnosis:
+on a read-only card both refusals are true and the operator sees only the first, and *"cross-volume
+move is not supported (copy with `cp`, then `rm`)"* recommends a workaround that cannot help on a
+volume admitting no writes. The final order is **argument validity → write veto (on the source) →
+namespace**. The destination gate the old order ran is subsumed, not dropped: once `same_volume` has
+passed, the destination is the same medium, and `write_veto` is a pure function of the `BlockSource`,
+which is one of the terms `volume_id` mixes.
 
 ### 13.3 x86 has a namespace now
 
