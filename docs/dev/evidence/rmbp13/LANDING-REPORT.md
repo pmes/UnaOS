@@ -337,6 +337,35 @@ The middle proof is the one that matters: it shows the control guards the exact 
 edit that widens the detector cannot quietly turn this into a gate that reds on prose. Wired into
 `check_both` beside GATE-KNOB. Ledger row **B24**.
 
+## The round has one shape, and pi 7 named it
+
+Four instances, all found in one day, of a single property:
+
+1. **SO6** — the knob→builder probe refused a verdict when its own control would not parse, so a broken
+   path cost one executor a build instead of shipping a false green.
+2. **GATE-APPEND** — breaking its discriminator makes the control refuse a verdict, naming the prose
+   line it wrongly fired on, rather than passing.
+3. **knoboff** — its armed control refuses a verdict when arming a feature changes nothing, so
+   "byte-identical" can never be reported for a misspelled feature or a knob never passed to cargo.
+4. **SP2** (pi 7) — the null-result form: a knob-off digest is identical *by construction*, so reading
+   it as proof the wiring works is a check that cannot fire, dressed as a pass.
+
+**A check that cannot fire must SAY so rather than return green.** Every gate added today either has
+that property or was fixed to get it. That is a better summary of the round than any individual fix,
+and it is the thing to carry forward.
+
+## The error this seat made, and what actually caught it
+
+This seat wrote **B16** — the row about accepting a true answer to the question asked instead of
+enumerating the call graph — and then, hours later, grepped `pub mod wcg`, read line 73, and never read
+line 72's `#[cfg(feature = "witness")]`. The declaration checked, its gate not. Same shape, same seam,
+same day, by the seat that had just written the row.
+
+**Knowing the rule did not fire it.** What fired it was pi 7 reading at this seat's sha rather than
+taking the claim — one command. That is the only mechanism all round that reliably caught either seat,
+and it works precisely because it depends on nobody remembering anything. It is also, exactly, the
+reason the integrator-less flow says the author seat never reviews alone.
+
 ## Still owed / flagged
 
 - **J1, the rmbp landing** (72 commits) — needs a fleet, so it needs the focus.
