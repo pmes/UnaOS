@@ -109,6 +109,14 @@ for path in files:
             # old r"→\s*([SP][0-9]+)" could not match "→ SP32" (after S comes P, not a digit), so
             # a prefixed cross-ref was SILENTLY NOT CHECKED -- not red, skipped. A check that
             # cannot fire, in the gate whose whole job is that they can.
+            # MENTION vs REFERENCE (pi 7, 2026-09-06). A checker scanning free text cannot tell a
+            # MENTION of an id from a REFERENCE to one: fixtures, examples and quoted commit
+            # messages are all live input to this resolver. The escape is the ARROW GLYPH and it
+            # is now a CONTRACT, not an accident: the UNICODE arrow below is a reference the gate
+            # must resolve; an ASCII "->" is a mention and is invisible here. Cite fixtures and
+            # examples with "->". pi 7 hit this by quoting this gate's own SP99 go-red fixture
+            # into a ledger header, where the sentence documenting the test became a failing
+            # input to the test.
             for ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", rowtext):
                 if "docs/dev/LEDGER.md" in files and ref not in ledger_ids and path != "docs/dev/LEDGER.md":
                     red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")

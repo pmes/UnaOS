@@ -179,7 +179,7 @@ fixed/flown/landed sha is unreachable from every head), or a row cites evidence
 outside git. **GO-RED proof, by tree mutation on the day it shipped, twelve
 states:** duplicate id → red naming the line; `standing` as a status → red;
 owner `peter` → red; sha `deadbee1` → red; a `~/unaos-bench/scratch` path → red;
-a missing `docs/` path → red; `→ S999` with a `LEDGER.md` present → red; `S99`,
+a missing `docs/` path → red; `-> S999` with a `LEDGER.md` present → red (**written with an ASCII arrow ON PURPOSE — do not "fix" it to `→`. The resolver matches the UNICODE arrow only, so `→ S999` here would make this sentence, which documents the gate's own test, a failing INPUT to the gate. Unicode arrow = a live cross-REFERENCE the gate must resolve; ASCII arrow = a MENTION. Latent today only because this file is not in the scanned set — `LEDGER.md` + `OS/*-ledger.md` + `RULINGS.md` — and live the moment that widens**); `S99`,
 a sha and a scratch path in a PARAGRAPH → green (the prose control); `flown`
 with a reachable sha → green; an `evidence/*.log` without `size 0x`/`img=[` → red;
 a RULINGS row with status `pending` → red; a `superseded` ruling naming no R-id → red.
