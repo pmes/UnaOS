@@ -104,14 +104,96 @@
 //!    so the press re-arms it and the next service pass runs the second capture. Should `service`
 //!    itself ever meet the door taken (a verb capture on the console task), it re-arms `PENDING`
 //!    and says so once; the request is serviced when the door opens.
+//!
+//! ## PRTSCR-ASYNC — the capture is SLICED, so the machine is never wedged for it (SR2)
+//!
+//! Everything above was true and the machine still died for the duration. `service()` ran the whole
+//! encode-and-write as ONE call from inside the device-service pass, and that pass is also the pass
+//! that polls the keyboard and the trackpad: **70 s on the 2012 rMBP** (15.5 MB at ~220 KB/s, with
+//! `[deadman] pmp=0` throughout), **6–9 s on the Orin** at 1920x1200. Peter, at the glass on
+//! render7: *"3 presses in a row didn't do 3"* — and the census agreed, 8 armed / 7 OK / 1 silent.
+//! The deferral above cannot fire for a press the input pump never gets to decode.
+//!
+//! So the capture is now a **state machine that runs in bounded slices**, and `service()` advances
+//! it by one slice per pass:
+//!
+//!  * [`Job::begin`] does the cheap refusals, chooses the name, prints `-> capturing`, and builds
+//!    the encoder. Everything that could refuse still refuses before a pixel is read — and the
+//!    volume it settles on is [`mount_capture_target`]'s, the PRTSCR-VOL ladder above, NOT
+//!    `mount_program_source`: slicing must not quietly re-narrow the target back to rung 1 and
+//!    strand the rMBP's read-only boot medium all over again.
+//!  * [`Phase::Encode`] pushes [`SLICE_ROWS`] scanlines at a time into the streaming encoder.
+//!  * [`Phase::Write`] writes [`SLICE_WRITE`] bytes per `write_grow`, **in order**, from offset 0
+//!    upward, so what is on the medium is always a valid PREFIX of the finished PNG.
+//!  * [`Job::slice`] runs those units until [`slice_budget`] cycles have been spent, then returns.
+//!    The budget is a fraction of the arch's own `hw_wait_budget()`, so it is a DURATION on every
+//!    board (~31 ms on x86, ~37 ms on QEMU virt, ~43 ms on the Pi, ~75 ms on the Orin) without this
+//!    module learning any board's clock rate.
+//!
+//! **No lock is held across a slice.** The open job lives in [`JOB`], a `spin::Mutex<Option<Job>>`
+//! that is locked exactly twice per slice — once to move the job out, once to move it back — and
+//! never while a pixel is read or a byte written. The FAT/BOT layer takes and releases its own loan
+//! inside each `write_grow` exactly as it did for the single big write.
+//!
+//! **What changed for the operator, precisely.** A press that lands during an open capture prints
+//! the named [`Refusal::InFlight`] line (once per episode) **and stays armed**, so it runs as the
+//! next capture the moment the open one reaches its verdict: three presses in a row now make three
+//! files, with the collapse — when two presses land inside one slice window — named on the wire
+//! instead of silent. Progress is `:: PRTSCR: slice n=… bytes=…/… ::`, capped at
+//! [`SLICE_LINES_MAX`] lines per capture so a 484-slice rMBP write does not become 484 lines.
+//!
+//! **The interrupted-write signature moves, and this is the one thing a reader must relearn.**
+//! `write_grow` publishes the directory size last *per call*, and there are now many calls, so a
+//! boot cut mid-capture no longer leaves `SCREEN<n>.PNG` at 0 bytes — it leaves it at the last
+//! slice boundary the volume accepted, a truncated PNG with a valid header and no `IEND`. The
+//! `-> capturing` line still states the RESERVED length, so `size < reserved` and a missing verdict
+//! line are together the interrupted-write signature. A 0-byte file still means the cut landed
+//! before the first slice.
+//!
+//! **`capture()` itself is still synchronous** — it is the same state machine driven to completion
+//! in a loop, so the `screenshot` verb and PRTSCR-ST get byte-identical behaviour and the same wire.
+//! Only the Print Screen path, whose driver is the input pump, is sliced.
+//!
+//! ## The volume may leave while the capture is still writing — PRTSCR-ASYNC/UNPLUG
+//!
+//! Slicing turns a hypothetical into a routine one: a capture that used to own the machine for one
+//! uninterruptible write now spans seconds of passes during which the operator can pull the stick,
+//! and rung 2 of the ladder above aims at exactly the medium most likely to be pulled.
+//!
+//! **What happened before this section existed** (the honest one-sentence answer, and it is not "it
+//! faults"): nothing dangled and nothing paniced — `drivers/block.rs`'s USB-UNPLUG retraction clears
+//! `USB_BLOCK_DEVICE`, every block entry point re-reads the registry through `info()` / `usb_info()`
+//! on EVERY call and geometry-bounds the LBA against that fresh snapshot, so the next `write_grow`
+//! failed honestly with `BlockError::NotReady` and PRTSCR reported it as the GENERIC
+//! `Refusal::Fat("write", …)` line, which names a FAT errno and never names the disconnection.
+//!
+//! Two things were wrong with that. The refusal was unreadable — an operator who pulled a stick got
+//! a `write failed -EIO` and had to infer the cause — and, worse, the honest failure is only
+//! guaranteed while the handle stays EMPTY. A retract followed by a replug (or a different stick on
+//! a recycled xHCI slot) refills `USB_BLOCK_DEVICE` with a DIFFERENT disk, and the by-value `FatFs`
+//! this job parked between slices still holds the old volume's LBAs. The next `write_grow` would
+//! then be geometry-bounds-checked against the new disk and pass — a write through a stale handle,
+//! onto a stranger's filesystem. That is the case slicing creates and the one this refuses.
+//!
+//! **The probe, and which of rung 2's facts it uses.** Both of them, because they answer different
+//! halves. [`Job`] records, at `begin`, whether this mount is USB-backed at all, plus
+//! `block::usb_publish_gen()` — the generation `publish_usb_geometry` bumps on EVERY arrival. Before
+//! each volume-touching step (`create_in_dir`, and every `write_grow`) a USB-backed job requires
+//! **`block::usb_info().is_some()`** — the geometry publish is still standing, so the stick did not
+//! merely leave — **and the generation to be unchanged** — so no arrival has replaced it. Either
+//! test failing is [`Refusal::Vanished`], a named line carrying the byte count reached, and the
+//! write is NOT issued: the stale handle is never written through. A capture that is not USB-backed
+//! (the Pi's microSD, QEMU's `test-fat` image) skips the probe entirely and costs nothing.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use spin::Mutex;
 use unaos_boot_info::PixelFormat;
 
-use crate::fs::fat::{FatError, FatFs};
+use crate::fs::fat::{BlockSource, FatError, FatFs};
+use crate::video::FrameBuffer;
 use crate::video::png::{PngEncoder, PngError};
 
 /// Highest capture index. `SCREEN99.PNG` is 11 characters — still 8.3, still no long-name entry.
@@ -125,6 +207,37 @@ const MAX_CAPTURES: u32 = 100;
 /// retried with bounded patience exactly as `fs::fat`'s own RMW wrappers retry it, and only a
 /// budget that actually expires becomes `-EAGAIN` for the operator.
 const BUSY_ATTEMPTS: u32 = 64;
+
+/// PRTSCR-ASYNC — how long one slice may run, as a DIVISOR of the arch's hardware-wait budget.
+///
+/// `arch::hw_wait_budget()` is the one wall-clock quantity both arches already express in
+/// `now_cycles()` units — an honest `tsc_hz * 2 s` on x86 once the APIC calibration lands, and a
+/// CNTFRQ-derived 2.4 s / 2.78 s / 4.8 s on QEMU virt / the Pi 4 / the Orin. Dividing it is how this
+/// module gets a duration on a board whose clock rate it does not know: 2 s / 64 ≈ 31 ms on x86,
+/// ~37 ms on virt, ~43 ms on the Pi, ~75 ms on the Orin. All comfortably inside a human's
+/// input-latency floor, and all bounded — which is the whole property SR2 asks for.
+const SLICE_BUDGET_DIV: u64 = 64;
+
+/// PRTSCR-ASYNC — scanlines encoded between two budget checks. A row is `width` volatile loads and
+/// an `extend_from_slice`; 64 of them at 1920 px is ~123k loads, well under a millisecond, so the
+/// granularity costs nothing and the budget check does not dominate.
+const SLICE_ROWS: u32 = 64;
+
+/// PRTSCR-ASYNC — bytes handed to `write_grow` per call, and therefore the LONGEST uninterruptible
+/// span of a capture: a `write_grow` cannot be preempted from outside, so this constant IS the
+/// worst-case wedge. 32 KiB is ~145 ms on the rMBP's measured 220 KB/s and ~37 ms on the Orin's
+/// 870 KB/s — against 70 s and 7.9 s for the single write it replaces.
+///
+/// It is not smaller because each call re-walks the file's cluster chain (CHAINGROW gave that walk a
+/// FAT-sector cache precisely for windowed writers like this one, so a 15.5 MB file costs ~4 sector
+/// reads per call — ~1900 extra reads over the whole capture, ~1–2% of a 70 s write). Halving the
+/// slice doubles that overhead to buy 70 ms; this is the knee.
+const SLICE_WRITE: usize = 32 * 1024;
+
+/// PRTSCR-ASYNC — how many `slice` progress lines one capture may print. The rMBP's 15.5 MB capture
+/// is ~484 slices; the wire is evidence, not a progress bar, so it gets the opening ones (which is
+/// where a capture that dies early dies) and the verdict line carries the total.
+const SLICE_LINES_MAX: u32 = 8;
 
 /// PRTSCR — a capture has been asked for and not yet performed. Set by [`request`] (from the HID
 /// decoders' press edge, where nothing may block), cleared by [`service`] (on the device-service
@@ -158,6 +271,19 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// reaches a verdict through `service`.
 static DEFERRED_SAID: AtomicBool = AtomicBool::new(false);
 
+/// PRTSCR-ASYNC — a sliced capture is OPEN: [`JOB`] holds it (or a task is between two of its
+/// slices, holding it on the stack), and [`IN_FLIGHT`] is held on its behalf until it reaches a
+/// verdict. Read on the idle path so `service` can stay two relaxed loads when nothing is happening.
+static SLICING: AtomicBool = AtomicBool::new(false);
+
+/// PRTSCR-ASYNC — the open capture, parked between slices.
+///
+/// The lock is taken EXACTLY twice per slice — once to move the job out, once to move it back — and
+/// never across a pixel read, an encode, or a write. That is deliberate and is the rule this arc was
+/// briefed against: a lock held across a slice would reinvent the wedge one layer down. The moves
+/// are moves of a `String`, a `Vec` and a `FatFs`; nothing is copied.
+static JOB: Mutex<Option<Job>> = Mutex::new(None);
+
 /// PRTSCR — `(requests, captures, refusals)`.
 pub fn census() -> (u32, u32, u32) {
     (
@@ -177,24 +303,86 @@ pub fn request() {
     PENDING.store(true, Ordering::Relaxed);
 }
 
-/// PRTSCR — perform a pending capture, if there is one. Call from a device-service pass: task
-/// context, interrupts enabled, no driver lock held.
+/// PRTSCR — advance the capture by one bounded slice, opening one first if a request is armed.
+/// Call from a device-service pass: task context, interrupts enabled, no driver lock held.
 ///
-/// Costs one relaxed load per call when idle, which is why it can sit unconditionally beside
+/// **PRTSCR-ASYNC: this call is bounded** ([`slice_budget`], ~31–75 ms depending on the board) and
+/// returns so its caller can poll the keyboard again. It used to run the whole encode-and-write —
+/// 6–9 s on the Orin, 70 s on the rMBP — from inside the pass that services input, which is SR2.
+///
+/// Costs two relaxed loads per call when idle, which is why it can sit unconditionally beside
 /// `fat::probe_once()` at every storage-ready pass this kernel carries.
 pub fn service() {
-    if !PENDING.load(Ordering::Relaxed) {
+    if !PENDING.load(Ordering::Relaxed) && !SLICING.load(Ordering::Relaxed) {
         return;
     }
+
+    // (a) A capture is already open. Advance it by one slice and hand the machine back.
+    if SLICING.load(Ordering::Relaxed) {
+        // PRTSCR-ASYNC: a press that landed inside this capture. It is NAMED — once per episode,
+        // not once per pass — and left armed, so it becomes the next capture rather than a silent
+        // collapse. This is the line that was structurally unreachable before slicing: the input
+        // pump could not decode the press at all while the write owned the pass.
+        if PENDING.load(Ordering::Relaxed) && !DEFERRED_SAID.swap(true, Ordering::Relaxed) {
+            Refusal::InFlight.report();
+        }
+        let open = { JOB.lock().take() };
+        let mut job = match open {
+            Some(job) => job,
+            // Another task is between two slices of this same capture, holding it on its stack.
+            None => return,
+        };
+        match job.slice() {
+            Ok(None) => *JOB.lock() = Some(job),
+            Ok(Some(shot)) => finish(Ok(shot)),
+            Err(why) => finish(Err(why)),
+        }
+        return;
+    }
+
+    // (b) Nothing open and a request is armed: open one.
+    //
     // Clear BEFORE the work, not after: a press that lands mid-capture should arm the NEXT one
     // rather than be swallowed by our own clear. (On the Orin that press is decoded from INSIDE
     // this capture's own storage write — see the module note — and this clear-first order is
     // what makes it a second capture instead of a lost one.)
     PENDING.store(false, Ordering::Relaxed);
-    match capture() {
+    if IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // PRTSCR2: the door is held by another task's synchronous capture (the `screenshot` verb).
+        // Not a refusal of the request — it is re-armed and opens on the first pass after the door
+        // opens. Said once per episode so a 7 s verb capture does not print 28 copies of the line.
+        PENDING.store(true, Ordering::Relaxed);
+        if !DEFERRED_SAID.swap(true, Ordering::Relaxed) {
+            Refusal::InFlight.report();
+        }
+        return;
+    }
+    match Job::begin() {
+        Ok(job) => {
+            *JOB.lock() = Some(job);
+            SLICING.store(true, Ordering::Release);
+        }
+        // Every cheap refusal (no panel, no volume, read-only, all names taken, allocator) still
+        // arrives here, before a pixel is read — `begin` kept that order, and kept the PRTSCR-VOL
+        // ladder that decides which volume is being refused about.
+        Err(why) => finish(Err(why)),
+    }
+}
+
+/// PRTSCR-ASYNC — release the door and print the one verdict line a `-> capturing` is owed.
+///
+/// The single exit for the sliced path, so `SLICING` and `IN_FLIGHT` cannot be left set by a branch
+/// that forgot them — the PRTSCR2 "released on every exit path" rule, now that there are more exits.
+fn finish(verdict: Result<Shot, Refusal>) {
+    SLICING.store(false, Ordering::Relaxed);
+    IN_FLIGHT.store(false, Ordering::Release);
+    DEFERRED_SAID.store(false, Ordering::Relaxed);
+    match verdict {
         Ok(shot) => {
             CAPTURES.fetch_add(1, Ordering::Relaxed);
-            DEFERRED_SAID.store(false, Ordering::Relaxed);
             serial_println!(
                 ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
                 shot.name,
@@ -203,18 +391,8 @@ pub fn service() {
                 shot.bytes
             );
         }
-        // PRTSCR2: the door is held by another task's capture (the `screenshot` verb). Not a
-        // refusal of the request — it is re-armed and runs on the first pass after the door opens.
-        // Said once per episode so a 7 s verb capture does not print 28 copies of the same line.
-        Err(Refusal::InFlight) => {
-            PENDING.store(true, Ordering::Relaxed);
-            if !DEFERRED_SAID.swap(true, Ordering::Relaxed) {
-                Refusal::InFlight.report();
-            }
-        }
         Err(why) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
-            DEFERRED_SAID.store(false, Ordering::Relaxed);
             why.report();
         }
     }
@@ -251,6 +429,10 @@ pub enum Refusal {
     /// PRTSCR2 — another task's capture holds the door ([`IN_FLIGHT`]). The verb reports it and
     /// stops; [`service`] re-arms the request and runs it once the door opens.
     InFlight,
+    /// PRTSCR-ASYNC/UNPLUG — the USB volume this capture was writing left (or was replaced by a
+    /// different disk on a recycled xHCI slot) between two slices: `(name, bytes reached, wanted)`.
+    /// The write that would have gone through the now-stale handle was NOT issued.
+    Vanished(String, usize, usize),
 }
 
 impl Refusal {
@@ -297,6 +479,13 @@ impl Refusal {
             Refusal::InFlight => serial_println!(
                 ":: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::"
             ),
+            Refusal::Vanished(name, done, total) => serial_println!(
+                ":: PRTSCR: {} — volume vanished mid-capture at {}/{} bytes (usb geometry retracted or a newer publish replaced it; handles={}) — capture ABANDONED, nothing written through the stale handle ::",
+                name,
+                done,
+                total,
+                crate::drivers::block::source_census()
+            ),
         }
     }
 
@@ -324,6 +513,9 @@ impl Refusal {
             Refusal::InFlight => {
                 String::from("screenshot: a capture is already in flight — retry after its verdict")
             }
+            Refusal::Vanished(name, done, total) => alloc::format!(
+                "screenshot: {}: volume vanished mid-capture at {}/{} bytes", name, done, total
+            ),
         }
     }
 }
@@ -404,6 +596,35 @@ fn mount_capture_target() -> Result<FatFs, Refusal> {
     Err(primary)
 }
 
+/// PRTSCR-ASYNC/UNPLUG — does this mount ride the USB stick, and is therefore hot-unpluggable
+/// underneath an open sliced capture?
+///
+/// Two ways it can, and both must be caught, because [`mount_capture_target`]'s two rungs reach the
+/// same disk by different names:
+///
+///  * rung 2 mounted it explicitly — `source_name()` is `BlockSource::Usb`'s;
+///  * rung 1 mounted the PROGRAM SOURCE and on x86 that IS the stick, because
+///    `publish_usb_geometry` claims the global slot as well as the dedicated one on any target
+///    without the aarch64 backend selector. The two handles are the same disk exactly when they
+///    carry the same xHCI `slot_id`, which is the comparison `unpublish_usb_geometry` itself uses.
+///
+/// Deliberately conservative in the other direction: on the Pi the microSD holds the global with
+/// `slot_id: 0` while a stick holds the USB handle, the ids differ, and a capture to the card is
+/// therefore NOT probed — pulling an unrelated stick must not refuse it.
+fn usb_backed(fs: &FatFs) -> bool {
+    let name = fs.source_name();
+    if name == BlockSource::Usb.name() {
+        return true;
+    }
+    if name == BlockSource::Default.name() {
+        return match (crate::drivers::block::info(), crate::drivers::block::usb_info()) {
+            (Some(global), Some(usb)) => global.slot_id == usb.slot_id,
+            _ => false,
+        };
+    }
+    false
+}
+
 /// The first `SCREEN<n>.PNG` the volume root does not already hold.
 ///
 /// Asks the filesystem per candidate rather than scanning a directory listing, because
@@ -444,77 +665,306 @@ pub fn capture() -> Result<Shot, Refusal> {
     verdict
 }
 
-/// The capture proper, under the door [`capture`] holds.
+/// The capture proper, under the door [`capture`] holds — the SAME state machine [`service`]
+/// slices, driven straight to completion here.
 ///
-/// Order is chosen so the cheap refusals come first: the panel and the volume are settled before a
-/// single pixel is read or a single byte allocated, so "there is nowhere to put it" costs nothing.
+/// PRTSCR-ASYNC: the synchronous form is kept, and kept as a driver of the sliced machine rather
+/// than a second copy of the work, because two callers genuinely want a verdict in hand — the
+/// `screenshot` shell verb (which prints a sentence to the console it was typed at) and
+/// [`selftest_once`] (which reads the file back and scores it). What they lose is nothing: the wire
+/// is identical, and the slice boundaries they run through are the same ones the key path parks at.
 fn capture_inner() -> Result<Shot, Refusal> {
-    // 1. The panel — through the sanctioned door, and only for the HANDLE. See the module note.
-    let panel = crate::video::panel_snapshot().ok_or(Refusal::NoPanel)?;
-    if !panel.is_ready() {
-        return Err(Refusal::NoPanel);
-    }
-    let info = panel.info();
-    if !matches!(info.pixel_format, PixelFormat::Rgb | PixelFormat::Bgr) {
-        return Err(Refusal::NoFormat(info.pixel_format));
-    }
-    let (width, height) = (info.width as u32, info.height as u32);
-
-    // 2. The volume, by the PRTSCR-VOL ladder (module note), before anything is built.
-    let fs = mount_capture_target()?;
-
-    // 3. A name nothing else owns.
-    let name = next_free_name(&fs)?;
-
-    // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is one
-    // of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture — and the
-    // last one is what a `SCREEN<n>.PNG` at 0 bytes means (`write_grow` publishes size LAST).
-    let need = PngEncoder::encoded_len(width, height).unwrap_or(0);
-    serial_println!(
-        ":: PRTSCR: {} {}x{} -> capturing ({} bytes reserved; the verdict line follows — a boot cut before it leaves the entry at 0 bytes) ::",
-        name, width, height, need
-    );
-
-    // 4. Encode. `PngEncoder::new` reserves the whole output up front, so an allocator refusal
-    //    arrives here — before any pixel is read — rather than halfway down the screen.
-    let mut enc = PngEncoder::new(width, height)
-        .map_err(|e| Refusal::Encode(e, width, height, need))?;
-    let mut row: Vec<u8> = Vec::new();
-    if row.try_reserve_exact(width as usize * 3).is_err() {
-        return Err(Refusal::Encode(PngError::OutOfMemory, width, height, need));
-    }
-    for y in 0..info.height {
-        row.clear();
-        for x in 0..info.width {
-            // `read_pixel` is the format authority (see the module note). A pixel it cannot decode
-            // cannot happen here — the layout was checked above — but an out-of-length tail row on a
-            // firmware whose reported height overruns its own buffer would answer `None`, and black
-            // is the honest answer for "this pixel is not in the framebuffer".
-            let rgb = panel.read_pixel(x, y).unwrap_or(0);
-            row.push(((rgb >> 16) & 0xFF) as u8);
-            row.push(((rgb >> 8) & 0xFF) as u8);
-            row.push((rgb & 0xFF) as u8);
+    let mut job = Job::begin()?;
+    loop {
+        if let Some(shot) = job.slice()? {
+            return Ok(shot);
         }
-        enc.push_row(&row)
-            .map_err(|e| Refusal::Encode(e, width, height, need))?;
     }
-    let bytes = enc.finish().map_err(|e| Refusal::Encode(e, width, height, need))?;
+}
 
-    // 5. Write it. The entry is fresh (first_cluster = 0, size = 0), so the grow starts at 0 —
-    //    the same four-step recipe `shell::fs_write` uses, minus the truncate branch, which cannot
-    //    apply: `next_free_name` only ever returns a name the root does not hold.
-    let (dir_lba, dir_off) = match busy_retry(|| fs.create_in_dir(0, &name, 0x20)) {
-        Ok((_, lba, off)) => (lba, off),
-        Err(e) => return Err(Refusal::Fat("create", e)),
-    };
-    let written = match busy_retry(|| fs.write_grow(0, 0, dir_lba, dir_off, 0, &bytes)) {
-        Ok((written, _, _)) => written,
-        Err(e) => return Err(Refusal::Fat("write", e)),
-    };
-    if written != bytes.len() {
-        return Err(Refusal::Short(name, written, bytes.len()));
+/// PRTSCR-ASYNC — one slice's worth of budget, in `arch::now_cycles()` units. See
+/// [`SLICE_BUDGET_DIV`] for why the arch's hardware-wait budget is the right thing to divide.
+fn slice_budget() -> u64 {
+    let b = crate::arch::hw_wait_budget() / SLICE_BUDGET_DIV;
+    // A calibration that has not happened yet must not produce a zero-length slice that makes no
+    // progress per pass: one unit of work always runs, so the floor only bounds the LOOP.
+    if b == 0 { 1 } else { b }
+}
+
+/// PRTSCR-ASYNC — a capture in progress: everything the next slice needs and nothing it does not.
+///
+/// `FatFs` is a handful of scalars and `FrameBuffer` is a `Copy` handle whose base is a `usize`
+/// precisely so it can live in a static (`framebuffer.rs`'s `unsafe impl Send`), so parking this
+/// between passes introduces no new sharing claim: the panel is read exactly as the one-shot capture
+/// read it — without the panel lock, through the handle, tearing accepted (see the module note).
+struct Job {
+    fs: FatFs,
+    panel: FrameBuffer,
+    /// `SCREEN<n>.PNG`. Moved out into the [`Shot`] at the verdict.
+    name: String,
+    width: u32,
+    height: u32,
+    /// The reserved length the `-> capturing` line published. Denominator of the slice witness.
+    need: usize,
+    /// Slices spent so far — the witness's `n`, and what [`SLICE_LINES_MAX`] caps.
+    slices: u32,
+    /// PRTSCR-ASYNC/UNPLUG — this mount rides the hot-unpluggable USB stick ([`usb_backed`]), so
+    /// the liveness probe applies to it. `false` for the Pi's microSD and QEMU's `test-fat` image,
+    /// where the probe would cost a lock per unit and can never fire.
+    usb_backed: bool,
+    /// PRTSCR-ASYNC/UNPLUG — `block::usb_publish_gen()` as it stood when this job opened. A DIFFERENT
+    /// value means an arrival has republished the handle since — a replug, or another disk on a
+    /// recycled xHCI slot — and this job's parked `FatFs` addresses a volume that is no longer there.
+    vol_gen: u64,
+    phase: Phase,
+}
+
+/// PRTSCR-ASYNC — which half of the capture the next unit of work belongs to. Strictly sequential:
+/// the PNG cannot be written before `finish` patches the IDAT length and appends `IEND`, so the
+/// whole encode precedes the whole write. That is also what keeps the on-medium bytes a valid
+/// PREFIX of the final file at every slice boundary.
+enum Phase {
+    /// Reading the panel into the streaming encoder, `y` rows done.
+    Encode { enc: PngEncoder, row: Vec<u8>, y: u32 },
+    /// Writing the finished bytes to the volume in order, `done` bytes published.
+    Write {
+        bytes: Vec<u8>,
+        done: usize,
+        first: u32,
+        size: u32,
+        dir_lba: u64,
+        dir_off: usize,
+    },
+    /// Transient placeholder while a unit of work owns the phase by value. Never observed by a
+    /// caller: every path that takes the phase out puts one back or returns a verdict.
+    Spent,
+}
+
+/// What one unit of work produced.
+enum Step {
+    More(Phase),
+    Done(Shot),
+}
+
+impl Job {
+    /// Everything that can refuse, and nothing that takes time — the order [`capture_inner`] used
+    /// to run inline. The panel and the volume are settled, the name is chosen and announced, and
+    /// the output buffer is reserved, all before a single pixel is read.
+    fn begin() -> Result<Job, Refusal> {
+        // 1. The panel — through the sanctioned door, and only for the HANDLE. See the module note.
+        let panel = crate::video::panel_snapshot().ok_or(Refusal::NoPanel)?;
+        if !panel.is_ready() {
+            return Err(Refusal::NoPanel);
+        }
+        let info = panel.info();
+        if !matches!(info.pixel_format, PixelFormat::Rgb | PixelFormat::Bgr) {
+            return Err(Refusal::NoFormat(info.pixel_format));
+        }
+        let (width, height) = (info.width as u32, info.height as u32);
+
+        // 2. The volume, by the PRTSCR-VOL ladder (module note), before anything is built. This is
+        //    `mount_capture_target`, NOT `mount_program_source`: rung 2 is the whole reason a
+        //    read-only-boot-medium bench can capture at all, and a sliced capture must inherit it.
+        let fs = mount_capture_target()?;
+        // PRTSCR-ASYNC/UNPLUG: the two facts the liveness probe compares against, taken now, while
+        // the volume is known good. `usb_publish_gen` is read AFTER the mount so a publish that
+        // raced the mount is already reflected — a stale-low generation would refuse a live disk.
+        let usb_backed = usb_backed(&fs);
+        let vol_gen = crate::drivers::block::usb_publish_gen();
+
+        // 3. A name nothing else owns.
+        let name = next_free_name(&fs)?;
+
+        // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is
+        // one of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture.
+        // PRTSCR-ASYNC moved what that last one leaves behind: no longer always a 0-byte entry but
+        // an entry SHORTER than the reserved length, because the size is published per slice.
+        let need = PngEncoder::encoded_len(width, height).unwrap_or(0);
+        serial_println!(
+            ":: PRTSCR: {} {}x{} -> capturing ({} bytes reserved; the verdict line follows — a boot cut before it leaves the entry short of that) ::",
+            name, width, height, need
+        );
+
+        // 4. The encoder. `PngEncoder::new` reserves the whole output up front, so an allocator
+        //    refusal arrives here — before any pixel is read — rather than halfway down the screen.
+        let enc =
+            PngEncoder::new(width, height).map_err(|e| Refusal::Encode(e, width, height, need))?;
+        let mut row: Vec<u8> = Vec::new();
+        if row.try_reserve_exact(width as usize * 3).is_err() {
+            return Err(Refusal::Encode(PngError::OutOfMemory, width, height, need));
+        }
+
+        Ok(Job {
+            fs,
+            panel,
+            name,
+            width,
+            height,
+            need,
+            slices: 0,
+            usb_backed,
+            vol_gen,
+            phase: Phase::Encode { enc, row, y: 0 },
+        })
     }
-    Ok(Shot { name, width, height, bytes: written })
+
+    /// PRTSCR-ASYNC/UNPLUG — is the volume this job opened still the volume it would be writing?
+    ///
+    /// Both of rung 2's facts, because they answer different halves of the question: the geometry
+    /// publish still standing (`usb_info().is_some()` — the stick did not simply leave) AND the
+    /// publish generation unchanged (no arrival has replaced it with a different disk on the same
+    /// or a recycled slot). See the module note's UNPLUG section for why presence alone is not
+    /// enough: the block layer's own bounds check would pass a stale LBA against a NEW disk.
+    ///
+    /// Cheap: two atomic loads and, for the first, one uncontended spin lock — per volume-touching
+    /// step, of which a capture has a few hundred, against the ~1900 sector reads the same capture
+    /// already spends on chain walks.
+    fn volume_alive(&self) -> bool {
+        if !self.usb_backed {
+            return true;
+        }
+        crate::drivers::block::usb_info().is_some()
+            && crate::drivers::block::usb_publish_gen() == self.vol_gen
+    }
+
+    /// PRTSCR-ASYNC — run units of work until the slice budget is spent, then hand the machine
+    /// back. `Ok(None)` means "more to do"; `Ok(Some(shot))` is the finished capture.
+    ///
+    /// The budget is checked AFTER a unit, never before: one unit always runs, so a caller whose
+    /// clock is not yet calibrated still makes progress and cannot livelock.
+    fn slice(&mut self) -> Result<Option<Shot>, Refusal> {
+        let start = crate::arch::now_cycles();
+        let budget = slice_budget();
+        loop {
+            let phase = core::mem::replace(&mut self.phase, Phase::Spent);
+            match self.unit(phase)? {
+                Step::Done(shot) => return Ok(Some(shot)),
+                Step::More(next) => self.phase = next,
+            }
+            if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                self.slices += 1;
+                if self.slices <= SLICE_LINES_MAX {
+                    let done = match &self.phase {
+                        Phase::Write { done, .. } => *done,
+                        _ => 0,
+                    };
+                    serial_println!(
+                        ":: PRTSCR: slice n={} bytes={}/{} ::",
+                        self.slices,
+                        done,
+                        self.need
+                    );
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    /// One unit of work: [`SLICE_ROWS`] scanlines, or [`SLICE_WRITE`] bytes.
+    fn unit(&mut self, phase: Phase) -> Result<Step, Refusal> {
+        match phase {
+            Phase::Encode { mut enc, mut row, mut y } => {
+                let end = core::cmp::min(y.saturating_add(SLICE_ROWS), self.height);
+                while y < end {
+                    row.clear();
+                    for x in 0..self.width as usize {
+                        // `read_pixel` is the format authority (see the module note). A pixel it
+                        // cannot decode cannot happen here — the layout was checked in `begin` —
+                        // but an out-of-length tail row on a firmware whose reported height
+                        // overruns its own buffer would answer `None`, and black is the honest
+                        // answer for "this pixel is not in the framebuffer".
+                        let rgb = self.panel.read_pixel(x, y as usize).unwrap_or(0);
+                        row.push(((rgb >> 16) & 0xFF) as u8);
+                        row.push(((rgb >> 8) & 0xFF) as u8);
+                        row.push((rgb & 0xFF) as u8);
+                    }
+                    enc.push_row(&row)
+                        .map_err(|e| Refusal::Encode(e, self.width, self.height, self.need))?;
+                    y += 1;
+                }
+                if y < self.height {
+                    return Ok(Step::More(Phase::Encode { enc, row, y }));
+                }
+                let bytes = enc
+                    .finish()
+                    .map_err(|e| Refusal::Encode(e, self.width, self.height, self.need))?;
+                // PRTSCR-ASYNC/UNPLUG: the encode spent seconds of passes during which the stick
+                // could have gone. This is the first volume-touching step since `begin` verified
+                // the mount, so it is probed like every write below — an entry created on a disk
+                // that left, or on a stranger's, is exactly the stale-handle write this refuses.
+                if !self.volume_alive() {
+                    return Err(Refusal::Vanished(
+                        core::mem::take(&mut self.name),
+                        0,
+                        bytes.len(),
+                    ));
+                }
+                // The entry is created only now, with the pixels already in hand: the same
+                // four-step recipe `shell::fs_write` uses, minus the truncate branch, which cannot
+                // apply — `next_free_name` only ever returns a name the root does not hold.
+                let (dir_lba, dir_off) = match busy_retry(|| self.fs.create_in_dir(0, &self.name, 0x20)) {
+                    Ok((_, lba, off)) => (lba, off),
+                    Err(e) => return Err(Refusal::Fat("create", e)),
+                };
+                Ok(Step::More(Phase::Write {
+                    bytes,
+                    done: 0,
+                    first: 0,
+                    size: 0,
+                    dir_lba,
+                    dir_off,
+                }))
+            }
+            Phase::Write { bytes, mut done, mut first, mut size, dir_lba, dir_off } => {
+                // PRTSCR-ASYNC/UNPLUG: probe BEFORE the write, never after — the whole point is that
+                // the write is not issued. `done` is the byte count the wire reports, and it is the
+                // count the medium actually holds, because `write_grow` published each slice's size
+                // as it went.
+                if !self.volume_alive() {
+                    return Err(Refusal::Vanished(
+                        core::mem::take(&mut self.name),
+                        done,
+                        bytes.len(),
+                    ));
+                }
+                // In order, from `done` upward. `start == size` on every call after the first, so
+                // no hole is ever asked for, and each call publishes the grown size + chain head —
+                // which is what makes the partial file on the medium a valid PNG PREFIX rather than
+                // a size that claims bytes the data does not back.
+                let take = core::cmp::min(SLICE_WRITE, bytes.len() - done);
+                let at = done;
+                let chunk = &bytes[at..at + take];
+                let (wrote, new_size, new_first) =
+                    match busy_retry(|| self.fs.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
+                        Ok(t) => t,
+                        Err(e) => return Err(Refusal::Fat("write", e)),
+                    };
+                if wrote != take {
+                    return Err(Refusal::Short(
+                        core::mem::take(&mut self.name),
+                        at + wrote,
+                        bytes.len(),
+                    ));
+                }
+                done += wrote;
+                size = new_size;
+                first = new_first;
+                if done < bytes.len() {
+                    Ok(Step::More(Phase::Write { bytes, done, first, size, dir_lba, dir_off }))
+                } else {
+                    Ok(Step::Done(Shot {
+                        name: core::mem::take(&mut self.name),
+                        width: self.width,
+                        height: self.height,
+                        bytes: done,
+                    }))
+                }
+            }
+            // Unreachable: `slice` is the only caller and it always hands back a live phase.
+            // Answered rather than panicked, per this module's guard-with-a-return discipline.
+            Phase::Spent => Err(Refusal::Fat("slice", FatError::Io)),
+        }
+    }
 }
 
 // ================================ PRTSCR-ST — THE BOOT-TIME WITNESS ================================
