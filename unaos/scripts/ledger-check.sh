@@ -67,6 +67,8 @@ HEADS = heads()
 def reachable(s):
     return any(subprocess.run(["git", "merge-base", "--is-ancestor", s, h], capture_output=True).returncode == 0 for h in HEADS)
 
+STRICT = os.environ.get("UNAOS_LEDGER_STRICT") == "1"
+deferred = []
 ledger_ids = set()
 if "docs/dev/LEDGER.md" in files:
     for hdr, rows in tables(open("docs/dev/LEDGER.md").read()):
@@ -117,9 +119,45 @@ for path in files:
             # examples with "->". pi 7 hit this by quoting this gate's own SP99 go-red fixture
             # into a ledger header, where the sentence documenting the test became a failing
             # input to the test.
+            # CROSS-BRANCH REFS ARE NOT DANGLING REFS (pi 7 found the collision, rmbp 13 settled it,
+            # 2026-09-06). A seat-prefixed row lives on ONE branch until the landing merges the
+            # ledgers, so a reference to it is unresolvable HERE by construction and resolvable
+            # THERE by construction. The live instance: `| A36 (→ SR2) |` on hw-jetson, where SR2
+            # lives on hw-rmbp -- zero SR rows in any of that tree's three ledger files.
+            #
+            # THE PART THAT MADE THIS A RULE CHANGE RATHER THAN A ONE-OFF: orin did nothing wrong.
+            # The id contract three lines up SANCTIONS the suffix form (`^[A-Z]+[0-9]+` "a cross-ref
+            # suffix `(→ S<n>)` is allowed after it"), while LEDGER P14 said a cross-ref to an
+            # unfolded row stays PROSE. An id-suffix cross-ref cannot be prose without breaking the
+            # id convention, so the two rules collided and the sanctioned one lost -- silently today
+            # (older resolver skipped it), RED tomorrow (this one finds it). Green now, red later, on
+            # a row whose author followed the documented form.
+            #
+            # THE SPLIT: shared ids (`S<n>`, `P<n>`) live in EVERY tree's LEDGER.md -- measured, 27
+            # to 31 S-rows on main, hw-jetson, hw-pi4 and hw-rmbp alike -- so a `→ S<n>` that does
+            # not resolve is a real dangling ref and stays RED. Seat-prefixed ids (`SR`/`SO`/`SP`)
+            # are branch-local by construction (SR appears only on hw-rmbp, SO only on hw-jetson),
+            # so an unresolved one is DEFERRED: printed, counted, named in the summary -- never
+            # silently skipped, which is the failure this gate exists to not repeat.
+            #
+            # REJECTED, and why, so nobody re-proposes it: "defer only when the prefix has ZERO rows
+            # in this tree" is a sharper discriminator and would still catch a typo like `→ SR99` on
+            # hw-rmbp. It false-reds in the PARTIAL FOLD window -- SR1 landed, SR2 not yet, a ref to
+            # SR2 from a tree that now has one SR row -- which is precisely the surprise-mid-landing
+            # this change exists to prevent. Never false-red; catch the typos where they are
+            # catchable instead:
+            #
+            # `UNAOS_LEDGER_STRICT=1` turns every DEFERRED into a RED. **The landing runs it.** After
+            # a merge all three seats' ledgers are in one tree, every seat-prefixed ref is resolvable,
+            # and a typo that rode along for a week surfaces there -- at the one moment it can be
+            # told apart from a legitimate cross-branch reference.
             for ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", rowtext):
                 if "docs/dev/LEDGER.md" in files and ref not in ledger_ids and path != "docs/dev/LEDGER.md":
-                    red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
+                    pfx = re.match(r"([A-Z]+)", ref).group(1)
+                    if pfx in ("SR", "SO", "SP") and not STRICT:
+                        deferred.append(f"{where}: {rid} cross-ref → {ref} DEFERRED — {pfx} rows are branch-local; resolves when that seat's ledger lands (UNAOS_LEDGER_STRICT=1 to require it now)")
+                    else:
+                        red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
             if "unaos-bench/scratch" in rowtext:
                 red.append(f"{where}: {rid} cites evidence outside git (unaos-bench/scratch)")
             for dp in re.findall(r"`?(docs/[A-Za-z0-9_./-]+\.md)", rowtext):
@@ -187,11 +225,16 @@ if os.path.exists("docs/dev/RULINGS.md"):
 for p in skipped: say(f"SKIP {p} — not in this tree (arrives at the trunk sync)")
 if rows_seen == 0:
     say("NO VERDICT — no ledger rows found in", files or "(no ledger files)"); sys.exit(2)
+if deferred:
+    say(f"DEFERRED — {len(deferred)} cross-branch cross-ref(s); these are NOT findings, and the landing"
+        f" re-runs with UNAOS_LEDGER_STRICT=1 where they must resolve:")
+    for d in deferred: print("   ", d)
 if red:
     say(f"RED — {len(red)} finding(s) across {len(files)} file(s), {rows_seen} rows:")
     for r in red: print("   ", r)
     sys.exit(1)
-say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, status ∈ enum, owners known, cross-refs resolve, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
+_defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
+say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, status ∈ enum, owners known, cross-refs resolve{_defnote}, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
 PY
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
@@ -200,3 +243,7 @@ PY
 #   owner "peter"          -> RED                        `S99` in a PARAGRAPH  -> GREEN (prose control)
 #   evidence/*.log without `size 0x`/`img=[` -> RED      RULINGS R-row status `pending` -> RED
 #   RULINGS `superseded` with no R<n> in superseded-by -> RED
+#   `→ SO99` in a row      -> DEFERRED, exit 0, PRINTED (SO is branch-local; hw-jetson owns it)
+#   the same under UNAOS_LEDGER_STRICT=1 -> RED, exit 1   (the landing's setting)
+#   `→ SR2` on hw-rmbp     -> resolves, neither red nor deferred (the control: the check still fires
+#                             where the target is local, which is the half a blanket skip would lose)

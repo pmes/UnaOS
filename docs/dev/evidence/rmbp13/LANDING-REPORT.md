@@ -185,6 +185,51 @@ B17 changes the same file on hw-rmbp in disjoint regions (header, one function b
 one case arm). Union-mergeable at the rmbp landing — flagged to orin so a two-sided arroyo diff at J1
 is not a surprise.
 
+## GATE-LEDGER: cross-branch refs, the rule collision pi 7 found
+
+pi 7 brought a live instance of P14 and asked this seat to choose between three exits. The instance,
+verified here in the shared object store rather than relayed: `A36 (→ SR2)` at `orin-ledger.md:57` on
+hw-jetson `906e3aef`, where SR2 lives on hw-rmbp (`a2ef7279`) and that tree carries **zero `SR` rows in
+any of its three ledger files**.
+
+**What made it a rule change and not a one-off: orin did nothing wrong.** `STRUCTURAL_GATES.md`
+sanctions the id-cell suffix form, P14 said an unfolded cross-ref stays prose — and an id-suffix
+cross-ref cannot be prose without breaking the id convention. The two rules collided and the
+*sanctioned* one lost silently: skipped by the old resolver, red under the widened one. Green now, red
+later, on a row whose author followed the documented form.
+
+**The split that shipped**, chosen over all three offered exits:
+
+- **Shared ids (`S<n>`, `P<n>`) live in every tree** — measured before relying on it: 27–31 `S` rows on
+  main, hw-jetson, hw-pi4 and hw-rmbp alike. An unresolved one is a real dangling ref and stays **RED**.
+- **Seat-prefixed ids (`SR`/`SO`/`SP`) are branch-local by construction** — `SR` only on hw-rmbp, `SO`
+  only on hw-jetson. An unresolved one is **DEFERRED**: printed every run, counted, named in the summary
+  line. Never the silent skip, which is P14's own worst verdict.
+- **`UNAOS_LEDGER_STRICT=1` turns every deferral back into a red, and the landing runs strict** — the one
+  tree where all three seats' ledgers meet, and therefore the only place a typo can be told apart from a
+  legitimate cross-branch reference.
+
+pi 7's preferred exit (skip refs inside the id cell) was declined with its reason: it exempts the id
+cell entirely, so a typo there is caught *nowhere, ever*, in exactly the place the contract encourages
+refs. **And a discriminator this seat built first and then threw away** — defer only when the prefix has
+zero rows in this tree — is sharper and would still catch `→ SR99` locally, but it false-reds in the
+partial-fold window (SR1 landed, SR2 not, a ref from a tree that now has one `SR` row), which is
+precisely the surprise-mid-landing the change exists to prevent. The rejection is written at the code so
+it is not re-proposed.
+
+Four mutation proofs, each run and reverted:
+
+| mutation | result |
+|---|---|
+| `→ SO99`, default | DEFERRED, **exit 0**, printed by id |
+| `→ SO99`, `UNAOS_LEDGER_STRICT=1` | **RED, exit 1** — the landing's setting |
+| `→ S999`, default | **RED, exit 1** — shared-id behaviour unchanged |
+| the live `→ SR2` already in this ledger | resolves — neither red nor deferred |
+
+That last row is the control, and it is the half a blanket skip would have destroyed: the check still
+fires where the target is local. P14 rewritten, `STRUCTURAL_GATES.md`'s invariant updated, ledger row
+**B21**.
+
 ## Still owed / flagged
 
 - **J1, the rmbp landing** (72 commits) — needs a fleet, so it needs the focus.
