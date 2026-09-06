@@ -31,7 +31,7 @@
 //!   (the bootpace `entry` stamp, so the column lines up with BPACE/GPACE `t=` figures),
 //!   right-justified in 7 columns. Before the entry stamp exists or before the counter is
 //!   calibrated the line prints `[      ?ms] ` — an explicit unknown, never a fabricated zero.
-//! * post-sync (a civil anchor exists — SNTP on the pi, `setdate` on either arch): `[15:04:07Z] ` —
+//! * post-sync (a civil anchor exists — SNTP on the pi, `date -s` on either arch): `[15:04:07Z] ` —
 //!   UTC wall time HH:MM:SS. The prefix flips from the monotonic form to this the instant the anchor
 //!   is planted.
 //!

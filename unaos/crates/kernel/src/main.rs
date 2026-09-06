@@ -1487,7 +1487,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let online = unaos_kernel::arch::smp::online_aps();
         // Two DISTINCT cores or nothing. `XHCI_CONTROLLER` is a raw `spin::Mutex` and both the
         // service task and the render/shell task take it (the latter through `fat` block reads,
-        // `pal::pump_and_poll` inside a full-screen app, and `usbinfo`). Kernel tasks are preempted
+        // `pal::pump_and_poll` inside a full-screen app, and `lsusb`). Kernel tasks are preempted
         // like any other, so two preemptible takers of a raw spinlock on ONE core deadlock it: the
         // spinner cannot yield, so the holder it displaced can never be redispatched. Cross-core the
         // same contention is bounded spin and progresses. Declining the handoff is the honest
@@ -5766,7 +5766,7 @@ fn usb_pump(_: usize) {
 //  1. `x86_usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
 //     `spin::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
 //     the render side transitively, through `fat` block reads, `pal::pump_and_poll` inside a
-//     full-screen app, and the `usbinfo` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
+//     full-screen app, and the `lsusb` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
 //     any `current`, not just ring 3), so co-locating two preemptible takers of a raw spinlock on one
 //     core is a hard deadlock: preempt the holder and the spinner — which cannot yield — owns the
 //     core forever. Cross-core it is bounded spin, which progresses. No future task that touches xHCI

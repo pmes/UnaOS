@@ -19833,7 +19833,7 @@ fn clock3_check() -> u32 {
     }
 
     // Save the civil clock as found, then plant the deterministic Manual anchor (captures a mono tick in
-    // the same breath, exactly as `setdate`/SNTP do). Elapsed since the anchor is ~0s across the few
+    // the same breath, exactly as `date -s`/SNTP do). Elapsed since the anchor is ~0s across the few
     // I/Os below, so `fat_stamp()` extrapolates to the exact anchored second.
     let prior = crate::clock::raw_anchor();
     let tick = crate::clock::mono_ticks().unwrap_or(0);

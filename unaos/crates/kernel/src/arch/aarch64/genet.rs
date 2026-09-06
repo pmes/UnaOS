@@ -90,7 +90,7 @@ pub fn genet_bringup(_dtb_addr: u64, _dtb_size: usize) {
 #[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
 pub use metal::genet_bringup;
 
-/// PI-UI-3: a read-only snapshot of the GENET interface state for the shell's `netinfo` verb — MAC,
+/// PI-UI-3: a read-only snapshot of the GENET interface state for the `ifconfig` shell verb — MAC,
 /// the settled IPv4 (leased or static-fallback), the default gateway, and link state. The x86 `netinfo`
 /// reads `drivers::e1000::info()`; this is the Pi's equivalent, sourced from the same net-core snapshot
 /// (`net_phy::settled_ipv4`) plus the GENET driver's registered MAC and the gateway recorded at bring-up.
@@ -108,7 +108,7 @@ pub struct NetInfo {
     pub link_up: bool,
 }
 
-/// PI-UI-3: the current GENET interface snapshot for `netinfo`, or `None` where no bring-up has settled
+/// PI-UI-3: the current GENET interface snapshot for `ifconfig`, or `None` where no bring-up has settled
 /// (pre-cable, QEMU-virt/tegra, or a non-baremetal build). The baremetal path reads the live driver
 /// state; every other aarch64 configuration reports no device.
 #[cfg(all(feature = "baremetal", target_arch = "aarch64"))]
@@ -1499,12 +1499,12 @@ mod metal {
         GENET_DEVICE.lock().as_ref().map(|n| n.link_up()).unwrap_or(false)
     }
 
-    // ── PI-UI-3: the default gateway the bring-up settled on, for the `netinfo` shell verb ────────────
+    // ── PI-UI-3: the default gateway the bring-up settled on, for the `ifconfig` shell verb────────────
     // `net_phy::settled_ipv4()` already publishes the settled IP + lease flag lock-free; the gateway is
     // not in that shared snapshot, so `bind_smoltcp` records it here (packed big-endian; 0 = not yet set).
     static NET_GW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-    /// PI-UI-3: the live GENET interface snapshot the shell's `netinfo` verb reads — MAC + settled IPv4
+    /// PI-UI-3: the live GENET interface snapshot the `ifconfig` shell verb reads — MAC + settled IPv4
     /// (leased/static) + gateway + link. `None` until a bring-up has settled an address (pre-cable, or the
     /// QEMU raspi4b SKIP path where `bind_smoltcp` never runs).
     pub fn netinfo() -> Option<super::NetInfo> {
@@ -3481,7 +3481,7 @@ Content-Length: {blen}\r\nConnection: close\r\nServer: UnaOS/genet\r\n\r\n"
             PG, &mut iface, &mut dev, &now_ms, DHCP_TIMEOUT_MS, OUR_IP, 24, GATEWAY_IP,
         );
         let gw = netcfg.gw;
-        // PI-UI-3: publish the settled gateway for the `netinfo` shell verb (the settled IP + lease flag
+        // PI-UI-3: publish the settled gateway for the `ifconfig` shell verb (the settled IP + lease flag
         // already ride `net_phy::settled_ipv4()`; the gateway is not in that shared snapshot).
         NET_GW.store(u32::from_be_bytes(gw), core::sync::atomic::Ordering::Relaxed);
 

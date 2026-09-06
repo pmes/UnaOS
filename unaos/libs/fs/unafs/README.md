@@ -165,7 +165,7 @@ diff (K8c).
   repair rebuilds true multi-root refcounts.
 - **Bench counters** (`CommitStats`): `snapshots_created` / `snapshots_dropped`.
 
-The shell verbs `usnap` / `usnaps` / `usnapdrop` and the host `unafs snap` /
+The shell verb `snap` (`create` / `list` / `drop`) and the host `unafs snap` /
 `snaps` / `snapdrop` subcommands drive this surface directly.
 
 ### Snapshot reads: the read path under current-ACL (K8c)
@@ -187,7 +187,7 @@ no access control. The *governing rule* (Peter, 2026-07-16, "we want high
 security") is that a snapshot read is authorized by the **live object's CURRENT
 ACL**, re-evaluated at read time — enforced one layer up, at the kernel verb /
 ACL seam ([`fs/unafs.rs`](../../../crates/kernel/src/fs/unafs.rs), `read_authz` /
-`snapshot_read`). Every snapshot-read surface (`usnapcat`, `usnapls`, the host
+`snapshot_read`). Every snapshot-read surface (`snap cat`, `snap ls`, the host
 mirror) defers to that ONE evaluator. Honest scoping: `read_authz` enforces the
 same *semantics* as the live syscall path — current-ACL, CAP_READ-equivalent
 grant rights, fail-closed on a deleted object — but it is a kernel-verb-layer
@@ -211,8 +211,8 @@ unifying the two evaluators is a ledgered follow-up (SECURITY.md K8c entry).
   (This is the strict reading of the high-security ruling: the retained bytes are
   unreadable through the enforced path once the live object is gone.)
 
-The kernel verbs `usnapcat <gen> <path>` (read a file under current-ACL) and
-`usnapls <gen> [path]` (list a snapshot directory), and the host
+The kernel verbs `snap cat <gen> <path>` (read a file under current-ACL) and
+`snap ls <gen> [path]` (list a snapshot directory), and the host
 `unafs snapcat <gen> <path> --as <principal>`, drive this surface.
 
 ### The mutation set: `unlink` / `rename` / `remove_attribute` (F2)
@@ -260,7 +260,7 @@ remount) is exercised against a cross-directory rename in
 `tests/mutation_logic.rs` and converges to the old name or the new one — never
 both, never neither.
 
-The kernel verbs `urm` / `umv` / `urmattr` drive this surface through the
+The plain kernel verbs `rm` / `mv` and `setfattr -x` drive this surface through the
 single IRQ-masked mount, and the uncounted `F2-mutations` witness proves each
 mutation durable across a genuine remount on the live card.
 

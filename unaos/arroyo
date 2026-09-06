@@ -538,9 +538,9 @@ _feats=""
 # builder/src/main.rs.
 [ -n "${UNAOS_INSTALLDEMO:-}" ] && _feats="${_feats}installdemo,"
 # SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17, Peter's ruling). The mature
-# smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/netinfo + the socket syscalls + the
+# smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/ifconfig + the socket syscalls + the
 # boot witnesses; the hand-rolled `net` crate is RETIRED as the default (kept in tree, live, resumable
-# — it still backs connect/fetch/udpsend, the TCP echo listener, and driver DHCP). UNAOS_NOSMOLNET=1
+# — it still backs nc/curl, the TCP echo listener, and driver DHCP). UNAOS_NOSMOLNET=1
 # OPTS OUT => `smolnet` not pushed => the hand-rolled stack is the whole net path, byte-identical to
 # the pre-flip default. Mirrors the PORTSW-1/EHCI-4 default-ON/negative-knob policy. x86-only optional
 # dep + x86-gated module; the aarch64 kernel compiles STRIP it via `arm_features` (below) so aarch64
@@ -6912,7 +6912,7 @@ show_expectations_x86() {
     echo -e "    6. Tablet: mouse cursor tracks"
     echo ""
     echo -e "  ${COLOR_CYAN}IN THE SHELL (type in the QEMU window):${COLOR_RESET}"
-    echo -e "    diskinfo            show vendor/product, block size, capacity"
+    echo -e "    fdisk -l            show vendor/product, block size, capacity"
     echo -e "    read <lba>          read a sector and hexdump it"
     echo -e "    write <lba> <byte>  fill a sector with a byte (mutates usb.img)"
     echo ""

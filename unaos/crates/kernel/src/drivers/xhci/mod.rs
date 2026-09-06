@@ -650,7 +650,7 @@ pub fn install(x: XhciController) {
     XHCI_LOANED.store(false, Ordering::Release);
 }
 
-/// Human-readable mass-storage enumeration/bring-up state, for the shell `diskinfo` command when no
+/// Human-readable mass-storage enumeration/bring-up state, for the shell `fdisk -l` command when no
 /// block device is published. Lets a metal storage failure be diagnosed from the interactive shell
 /// (the boot enumeration log is wiped once the GUI takes over on the serial-less rMBP).
 pub fn storage_diag() -> alloc::string::String {
@@ -663,7 +663,7 @@ pub fn storage_diag() -> alloc::string::String {
     }
 }
 
-/// Live port + slot summary for the shell `usbinfo` command (metal enumeration diagnosis).
+/// Live port + slot summary for the shell `lsusb` command (metal enumeration diagnosis).
 pub fn usb_summary() -> alloc::vec::Vec<alloc::string::String> {
     match claim() {
         Ok(x) => x.port_slot_summary(),
@@ -674,7 +674,7 @@ pub fn usb_summary() -> alloc::vec::Vec<alloc::string::String> {
 
 /// Log the USB topology summary to serial exactly once, a short while into the main loop (after boot
 /// enumeration has had time to run or stall) — captured in QEMU serial and a metal bootlog/usbdebug
-/// build. Fires unconditionally so a stalled enumeration is recorded too; the interactive `usbinfo`
+/// build. Fires unconditionally so a stalled enumeration is recorded too; the interactive `lsusb`
 /// shell command reports the same on the serial-less GUI.
 pub fn log_summary_once() {
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -2633,7 +2633,7 @@ struct CmdPending {
 /// `port_offset .. port_offset + port_count - 1` (1-based) speak USB `major.minor`. This is the
 /// authoritative USB2-vs-USB3 port map — until now the driver inferred port type from the
 /// current PORTSC speed, which is only valid while a device is attached and trained. Needed to
-/// know which ports may take a SuperSpeed WARM reset (WPR is USB3-only) and to label `usbinfo`.
+/// know which ports may take a SuperSpeed WARM reset (WPR is USB3-only) and to label `lsusb`.
 #[derive(Clone, Copy)]
 pub struct PortProtocol {
     pub major: u8,
@@ -3088,7 +3088,7 @@ pub struct XhciController {
     ftdi_pass_logged: bool,
     /// One-shot: the FTDI-TX-disabled line has been printed (so a wedged sink logs exactly once).
     ftdi_disabled_logged: bool,
-    /// Human-readable progress of the mass-storage bring-up, surfaced by the shell `diskinfo`
+    /// Human-readable progress of the mass-storage bring-up, surfaced by the shell `fdisk -l`
     /// command. On the serial-less rMBP the boot enumeration log is wiped when the GUI takes over,
     /// so a failed bring-up would otherwise be a silent "no device"; this makes the stall point
     /// (SET_CONFIGURATION / INQUIRY / READ CAPACITY / ...) visible from the interactive shell.
@@ -3221,7 +3221,7 @@ pub struct XhciController {
 
     /// Which step of root enumeration `enumerating_port` is at ("await-reset", "enable-slot",
     /// "address-device", "dev-desc", "cfg-desc", "configure-eps", "set-config", "idle").
-    /// On the serial-less rMBP `enum_active=true` alone says "stuck somewhere"; this + `usbinfo`
+    /// On the serial-less rMBP `enum_active=true` alone says "stuck somewhere"; this + `lsusb`
     /// says WHERE, which is the difference between guessing and fixing.
     enum_stage: &'static str,
     /// `now_cycles()` when `enum_stage` was last changed — the watchdog's per-stage deadline base.
@@ -3252,7 +3252,7 @@ pub struct XhciController {
     /// re-queued by a genuine (re)attach it is treated as a hot-plug and pays the full debounce,
     /// which is the metal-proven behaviour (the SD-reader FS-chirp failure) and must not be lost.
     boot_scan_ports: Vec<u8>,
-    /// The most recent enumeration stall (for `usbinfo`): where a port's enumeration died.
+    /// The most recent enumeration stall (for `lsusb`): where a port's enumeration died.
     last_stall: Option<EnumStall>,
     /// Total enumeration stalls since boot.
     stall_count: u32,
@@ -6183,7 +6183,7 @@ impl XhciController {
     /// a command completed with an error, an EP0 transfer errored/STALLed, or the watchdog
     /// expired with no completion at all. Before this existed, ANY of those silently deadlocked
     /// the whole queue (`enum_active=true queued=N` forever — the exact state photographed on
-    /// the rMBP when the SuperSpeed SD reader stalls). Records the stall for `usbinfo`, cleans
+    /// the rMBP when the SuperSpeed SD reader stalls). Records the stall for `lsusb`, cleans
     /// every piece of in-flight bookkeeping so late completions can't alias into the FSM,
     /// disposes any half-built slot, then either RETRIES the port with a fresh reset (bounded)
     /// or gives up and starts the next queued port.
@@ -11771,7 +11771,7 @@ impl XhciController {
     /// Main-loop hook: once storage finishes configuring, run the SCSI bring-up (in a
     /// safe, non-event context) and publish the block device. Also does a one-time
     /// sanity read of LBA 0.
-    /// Multi-line dump of the live port + slot state for the shell `usbinfo` command — the metal
+    /// Multi-line dump of the live port + slot state for the shell `lsusb` command — the metal
     /// diagnostic for "which USB devices enumerated, at what speed, and how far". Read-only.
     /// PIUSB-13: read-only enumeration observability for the Pi-side `enumerate()` pump. These
     /// expose the private root-enum FSM state (stage, in-flight port, last stall) and a structured

@@ -21,7 +21,7 @@ Screen-on-boot (JD4) brings the panel to a prompt on its own (~8 s). Type on the
 
 ## 2. The write sequence (type on the panel; watch panel + serial)
 ```
-diskinfo                      # geometry — confirms the data card enumerated (else re-seat)
+fdisk -l                      # geometry — confirms the data card enumerated (else re-seat)
 ls                            # root listing
 write NOTE.TXT hello from the orin
                               # -> "wrote 19 bytes to /NOTE.TXT (19 bytes)"

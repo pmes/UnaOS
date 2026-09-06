@@ -17,7 +17,7 @@ tree, catalogued here, and **available for reuse/resumption**.
 
 It is also still **live**, regardless of the knob: the e1000/e1000e driver's
 main-loop `service_net()` poll, the boot connectivity self-test, the DHCP client,
-the TCP echo listener, the shell's `connect`/`fetch`/`udpsend` commands, and the
+the TCP echo listener, the shell's `nc` / `nc -u` / `curl` commands, and the
 `net::arp::learn` reuse the smoltcp `Device` snoops for MAC surfacing all depend
 on this crate unconditionally. smoltcp has not yet replaced those surfaces
 (SOCK-8+ future work), so retirement here is a **default + status** change, not a
@@ -25,8 +25,8 @@ code removal.
 
 - **Resume hand-rolling / run this stack as the whole net path:** build with
   `UNAOS_NOSMOLNET=1` (e.g. `UNAOS_NOSMOLNET=1 ./arroyo test 40`). That drops the
-  `smolnet` cargo feature, and this crate serves `ping`/`arp`/`netinfo` too (not
-  just connect/fetch/udpsend). The opt-out x86 build is byte-identical to the
+  `smolnet` cargo feature, and this crate serves `ping`/`arp`/`ifconfig` too (not
+  just nc/curl). The opt-out x86 build is byte-identical to the
   pre-flip default.
 - **Doc of record for the live default stack:** `unaos/docs/dev/OS/08_NET/networking.md`.
 - **This crate's own architecture doc:** `docs/dev/OS/06_NETWORK_STACK/network_stack.md`

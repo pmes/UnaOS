@@ -137,12 +137,14 @@ The command is gated `#[cfg(all(target_arch = "x86_64", feature = "smc"))]` (the
 key-less `isa-applesmc` all battery keys are honestly absent, so `batmon` prints the all-`-` line —
 the bounded-Absent proof. The real battery is read only on the physical rMBP at an attended sitting.
 
-### `bootlog` — the boot-milestone witness (GUI-WITNESS)
+### `dmesg` — the boot-milestone witness (GUI-WITNESS)
 
 **The problem.** A GUI (non-`usbdebug`) boot emits **zero serial** (cause under separate
 investigation), and it detaches `fbcon` at the GUI handoff so the boot log is painted over. When
 something goes wrong after handoff there is then **no witness surface at all** — serial cannot
-witness its own silence, and the on-panel boot log is gone. `bootlog` is that surface.
+witness its own silence, and the on-panel boot log is gone. `dmesg` is that surface. (RELICS/R26:
+the VERB is `dmesg`, the standard word for the kernel's message ring; the `bootlog` FEATURE and the
+`UNAOS_BOOTLOG` knob keep their names — a build flag is not a word an operator types.)
 
 **The recorder (`crate::bootlog`, M1).** A lock-light, heap-free ring (a `static` with an inline
 array, like the FTDI capture ring) of short `&'static` milestone tags, each stamped with
@@ -168,11 +170,11 @@ GUI handoff `detach()` — so the early milestone lines are already visible on-p
 builds never `attach_shadow` (the `Screen` back buffer owns the heap budget); the `detach()` at the
 first frame is where the boot log stops.
 
-**After handoff (M2b) — the `bootlog` verb.** Once the GUI owns the screen, `bootlog` prints the
+**After handoff (M2b) — the `dmesg` verb.** Once the GUI owns the screen, `dmesg` prints the
 milestone ring with `arch::ms()` timestamps (oldest first) to the `Console` — the operator's eyes at
 the bench, matching the `batmon` pattern (snapshot under the ring lock, release, then print; no I/O
 under the lock). It is **not** gated by arch or feature: it reads the same ring on any build, and
-prints `bootlog: no boot milestones recorded` when the ring is empty.
+prints `dmesg: no boot milestones recorded` when the ring is empty.
 
 **Serial proof path (M3).** On a build where serial *is* live (QEMU, or a `usbdebug` metal boot),
 `bootlog::service_serial_dump()` is called each main-loop iteration and re-prints the full ring

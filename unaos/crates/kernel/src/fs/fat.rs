@@ -517,7 +517,7 @@ pub struct FatFs {
     /// tampering is out of scope).
     vol_id: u32,
     /// PI-FS-5: `BS_VolLab`, the 11-byte volume label the formatter stamped into the boot sector (offset 0x2B on
-    /// FAT16, 0x47 on FAT32). Read-only; space-padded on disk, surfaced trimmed by [`FatFs::label`] for `diskinfo`.
+    /// FAT16, 0x47 on FAT32). Read-only; space-padded on disk, surfaced trimmed by [`FatFs::label`] for `fdiskfo`.
     /// A blank/`NO NAME    ` field renders as empty (the caller shows a `-` then).
     vol_label: [u8; 11],
     /// PIUSB-27: which block device every sector read of this volume routes to. `Default` for the
@@ -1900,7 +1900,7 @@ impl FatFs {
         self.kind
     }
 
-    /// One-line human summary of the parsed geometry (for `fatinfo` / boot log).
+    /// One-line human summary of the parsed geometry (for `mount` / boot log).
     pub fn describe(&self) -> String {
         let head = alloc::format!(
             "FAT{} vol@LBA{} volsec={} bps={} spc={} nfat={} fatsz={}sec reserved={} fat@LBA{} data@LBA{} clusters={}",
@@ -2087,14 +2087,14 @@ impl FatFs {
     }
 
     /// PI-FS-5: the volume's formatted usable capacity in bytes (`count_of_clusters * cluster_size`) — the
-    /// data-region size a `diskinfo` line reports for the FAT volume. Not the raw device size (which the block
+    /// data-region size a `fdisk -l` line reports for the FAT volume. Not the raw device size (which the block
     /// geometry gives): this is what the filesystem actually addresses.
     pub fn volume_bytes(&self) -> u64 {
         self.count_of_clusters as u64 * self.cluster_size() as u64
     }
 
     /// PI-FS-5: the trimmed `BS_VolLab` volume label (ASCII, space-padded on disk). Returns an empty string when
-    /// the field is blank or the conventional `NO NAME` placeholder, so `diskinfo` can show a `-` instead.
+    /// the field is blank or the conventional `NO NAME` placeholder, so `fdisk -l` can show a `-` instead.
     pub fn label(&self) -> String {
         let raw = core::str::from_utf8(&self.vol_label).unwrap_or("").trim_end_matches([' ', '\0']);
         if raw.is_empty() || raw == "NO NAME" {
@@ -3707,7 +3707,7 @@ impl FatFs {
 
 /// One-shot boot probe: the first time a block device is present, mount the FAT volume and log its
 /// geometry to serial (captured on QEMU; visible on a serial-less metal boot only in bootlog /
-/// usbdebug builds — the interactive `fatinfo`/`ls`/`cat` commands are the metal evidence). Safe to
+/// usbdebug builds — the interactive `mount`/`ls`/`cat` commands are the metal evidence). Safe to
 /// call every main-loop iteration: it no-ops until storage is up, then runs exactly once.
 pub fn probe_once() {
     static PROBED: AtomicBool = AtomicBool::new(false);

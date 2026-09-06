@@ -135,7 +135,9 @@ impl Message {
 /// survives the move out of the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Facts {
-    /// aarch64 build (the Pi / Orin verbs: `uls`, `top`, `pulse`, `vug`).
+    /// aarch64 build. RELICS (R26 clause 3): this fact no longer gates any VERB - the `u*`
+    /// family it used to gate retired into the plain file verbs, and `top` is registered on every
+    /// build. It still shapes `help` (the SMP line) and combines with `vugdemo` for the demos.
     pub aarch64: bool,
     /// x86_64 build.
     pub x86: bool,
@@ -213,7 +215,10 @@ pub const CORE_VERBS: &[&str] = &["help", "echo", "ver", "version", "gneiss", "e
 pub enum Avail {
     /// Registered on every build.
     Always,
-    /// aarch64 only (the native unafs verbs).
+    /// aarch64 only. RELICS (R26 clause 3): NO MEMBERS. The native unafs verbs it existed for
+    /// retired into the plain file verbs, which are `Always`. Kept because it is the honest
+    /// availability for a verb whose ring arm genuinely does not compile off aarch64, and a
+    /// future one may need it - but a new member needs a hardware reason written down beside it.
     Aarch64,
     /// aarch64 + `v3d` (the GPU battery replay).
     V3d,
@@ -251,56 +256,53 @@ impl Avail {
 pub const HOST_VERBS: &[(&str, Avail)] = &[
     // shell / clock
     ("clear", Avail::Always), ("panic", Avail::Always), ("date", Avail::Always),
-    ("setdate", Avail::Always), ("time", Avail::Always), ("uptime", Avail::Always),
+    ("time", Avail::Always), ("uptime", Avail::Always),
     // FAT + VFS surface
     ("ls", Avail::Always), ("dir", Avail::Always), ("cd", Avail::Always),
     ("pwd", Avail::Always), ("cat", Avail::Always), ("type", Avail::Always),
     ("head", Avail::Always), ("tail", Avail::Always), ("find", Avail::Always),
-    ("du", Avail::Always), ("stat", Avail::Always), ("xd", Avail::Always),
+    ("du", Avail::Always), ("stat", Avail::Always), ("hexdump", Avail::Always),
     ("touch", Avail::Always), ("append", Avail::Always), ("rm", Avail::Always),
     ("del", Avail::Always), ("mkdir", Avail::Always), ("md", Avail::Always),
-    ("rmdir", Avail::Always), ("rd", Avail::Always), ("vfs", Avail::Always),
+    ("rmdir", Avail::Always), ("rd", Avail::Always),
     ("cp", Avail::Always), ("copy", Avail::Always), ("mv", Avail::Always),
     ("move", Avail::Always), ("ren", Avail::Always), ("rename", Avail::Always),
     ("sync", Avail::Always), ("write", Avail::Always),
-    // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. Always — the VERB is one
+    // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. Always - the VERB is one
     // word on every UnaOS (the ONE-OS law `reboot` is registered under), and the per-platform panel
     // decides what it can capture, never whether the word exists. The ring arm refuses honestly and
     // by name when there is no panel, no writable volume, or no free index.
     ("screenshot", Avail::Always),
-    // native unafs — aarch64 only
-    ("uls", Avail::Aarch64), ("ucat", Avail::Aarch64), ("utouch", Avail::Aarch64),
-    ("uwrite", Avail::Aarch64), ("umkdir", Avail::Aarch64), ("urm", Avail::Aarch64),
-    ("usnaps", Avail::Aarch64), ("usnap", Avail::Aarch64), ("usnapdrop", Avail::Aarch64),
-    ("usnapls", Avail::Aarch64), ("usnapcat", Avail::Aarch64),
-    // BASICS (orin 17): UNREACHABLE UNTIL NOW. `umv` and `urmattr` have full `#[cfg(aarch64)]`
-    // match arms in `shell.rs` (the F2 unafs rename/move and typed-attribute removal) and were
-    // never entered in this table, so `is_verb` said no, the line fell through to bare-name
-    // resolution, and the operator got "Unknown command" about two commands the kernel carries.
-    // That is the exact failure mode `Facts`'s doc warns of, running in the other direction: not a
-    // verb advertised without an arm, but an arm shipped without a verb. The one-for-one contract
-    // above is only a contract if it is checked in both directions — the ring's witness now does
-    // (`shell.basics.table`).
-    ("umv", Avail::Aarch64), ("urmattr", Avail::Aarch64),
+    // RELICS (R26 clause 2): the native-volume file verbs ARE the plain file verbs. The `u*`
+    // family (`uls` `ucat` `utouch` `uwrite` `umkdir` `urm` `umv` `urmattr`) was a second spelling
+    // of `ls`/`cat`/`touch`/`write`/`mkdir`/`rm`/`mv` that differed only in which volume it
+    // reached, and the plain verbs now reach that volume themselves through the one namespace
+    // (`/` native, `/fat`, `/usb`) - the rule `ls`, `cat`, `run` and `bg` already followed. The
+    // one member with no plain twin, `urmattr`, becomes the standard extended-attribute verb.
+    ("setfattr", Avail::Always),
+    // RELICS (R26 clause 2): the five `usnap*` spellings collapse into ONE verb with subcommands,
+    // the way `git` / `ip` / `systemctl` spell a family. `snap list|create|drop|ls|cat`.
+    ("snap", Avail::Always),
     // block / device
-    ("diskinfo", Avail::Always), ("usbinfo", Avail::Always), ("fatinfo", Avail::Always),
-    ("read", Avail::Always),
+    ("fdisk", Avail::Always), ("lsusb", Avail::Always), ("dd", Avail::Always),
     // network
-    ("netinfo", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
-    ("connect", Avail::Always), ("udpsend", Avail::Always), ("get", Avail::Always),
+    ("ifconfig", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
+    ("nc", Avail::Always), ("curl", Avail::Always),
     // apps + scheduler + power + witnesses
     ("vug", Avail::VugDemo), ("pulse", Avail::VugDemo), ("v3d", Avail::V3d),
-    // hw-jetson (2026-08-18 sync): the Orin bench verbs — SCHED-BAL burst + the per-core
-    // load animator. Registered here so MIDDEN-M1's single interpreter routes them as
-    // Plan::Host instead of refusing them before the kernel's service arms can fire.
-    ("burst", Avail::Aarch64), ("simmer", Avail::Aarch64),
-    ("tste", Avail::Always), ("selftest", Avail::Always), ("sched", Avail::Always),
+    // RELICS (R26 clause 3, Peter: "you must stop trying to pin everything down and lock it in
+    // this is one OS not a bunch of separate ones"). `burst` and `simmer` were `Avail::Aarch64`
+    // for no hardware reason - both ring arms already carry a `#[cfg(not(aarch64))]` line that
+    // refuses honestly and by name, exactly as `top` and `batmon` (registered `Always` since they
+    // were written) do. The word exists on every UnaOS; the platform decides the answer.
+    ("burst", Avail::Always), ("simmer", Avail::Always),
+    ("tste", Avail::Always), ("selftest", Avail::Always),
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
-    ("bootlog", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
-    // ORIN-REBOOT (baton orin-6 §5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
+    ("dmesg", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
+    // ORIN-REBOOT (baton orin-6 5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
     // WARM-REBOOT verb (`shutdown`/`off`, its cold sibling, was already registered above and
     // its ring arm now powers off for real). Registered here so MIDDEN-M1's single
-    // interpreter routes it as Plan::Host to the ring's service arm (kernel `power::reboot` —
+    // interpreter routes it as Plan::Host to the ring's service arm (kernel `power::reboot` -
     // aarch64: PSCI SYSTEM_RESET via SMC; unwired platforms refuse with an honest witness).
     // Always: the VERB is one word on every UnaOS (ONE-OS law); the per-platform mechanism
     // decides what it does, never whether the word exists.
@@ -314,7 +316,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // `df`/`mount` the block layer and the mount table, `env` the build's own facts, `history` the
     // shell's dispatch record, `sleep` the timebase, `which` the resolver over a real volume.
     // `Avail::Always` throughout: these are ONE-OS words (the law `reboot` and `screenshot` are
-    // registered under) — the platform decides what the answer is, never whether the word exists.
+    // registered under) - the platform decides what the answer is, never whether the word exists.
     ("grep", Avail::Always), ("wc", Avail::Always), ("df", Avail::Always),
     ("mount", Avail::Always), ("env", Avail::Always), ("set", Avail::Always),
     ("history", Avail::Always), ("sleep", Avail::Always), ("which", Avail::Always),
@@ -562,64 +564,54 @@ fn answer(word: &str, args: &[&str], facts: &Facts) -> Message {
 pub fn help(facts: &Facts) -> String {
     let mut l: Vec<String> = Vec::new();
     macro_rules! say { ($s:expr) => { l.push(($s).to_string()) }; }
-    say!("COMMANDS: ver, help, clear, echo, panic, gneiss, exit");
+    say!("COMMANDS: ver, help, clear, echo, gneiss, exit");
     // BASICS (orin 17): the shell's own state, listed with the shell's own words rather than
     // scattered among the subsystems that own the rest of the table.
     say!("SHELL:    which <word>  (verb? program? neither), history [n] [-c], sleep <ms>");
     say!("          env  (build facts + shell variables), set [NAME [VALUE]] | set -u NAME");
-    say!("          (no $VAR expansion yet — the store is readable by `env`; expansion is midden M2)");
-    say!("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
-    say!("          df | mount  (volumes: capacity, used, free, mount point, posture)");
-    say!("FILES:    fatinfo (FAT geometry), ls [-l] [dir], cd [dir], pwd, cat <path>");
+    say!("          (no $VAR expansion yet - the store is readable by `env`; expansion is midden M2)");
+    // RELICS (R26 clause 1): the standard names. `diskinfo` was block-device GEOMETRY, which is
+    // what `fdisk -l` answers, so that is the spelling; `df`/`mount` keep the capacity question.
+    // `read <lba>` / `write <lba> <byte>` are `dd`, which ends the hazard of a mis-shaped file
+    // write being a raw block write.
+    say!("STORAGE:  df | mount  (volumes: capacity, used, free, mount point, posture)");
+    say!("          fdisk -l  (block devices: vendor, block size, blocks, capacity)");
+    say!("          dd if=<lba> | dd of=<lba> byte=<0xNN>  (ONE raw 512-byte block; no file is involved)");
+    say!("FILES:    ls [-l] [dir], cd [dir], pwd, cat <path>");
     say!("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
-    // BASICS (orin 17): the two text verbs. `grep`'s pattern is a FIXED STRING with ^/$ anchors —
+    // BASICS (orin 17): the two text verbs. `grep`'s pattern is a FIXED STRING with ^/$ anchors -
     // said here in as many words, because a help line that says "pattern" invites a regex the
     // shell does not carry, and a silent literal match of `.*` is worse than a refusal.
     say!("TEXT:     grep [-i] [-n] [-v] [-c] <pattern> <path>  (fixed string; ^ and $ anchor)");
     say!("          wc [-l|-w|-c] <path>  (lines, words, bytes)");
     say!("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
     say!("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
-    say!("VFS:      vfs write|append|rm|mkdir <path> [text]  (unified namespace: / native, /fat FAT)");
+    // RELICS (R26 clause 1): the unified-namespace write surface is spelled `mount`, the same word
+    // that answers "where is what attached" - one verb for the namespace, not two.
+    say!("MOUNT:    mount write|append|rm|mkdir <path> [text]  (the one namespace, by prefix)");
     say!("          rm -r <dir>  (recursively delete a directory tree; root refused)");
     say!("COPY:     cp [-f] <src> <dst>  (copy a file; cp FILE DIR/ lands as DIR/<leaf>)");
     say!("          cp -r <srcdir> <dst>  (recursively copy a directory tree)");
     say!("MOVE:     mv [-f] <src...> <dst>  (move/rename a file or dir, O(1); mv SRC DIR/ lands as DIR/<leaf>)");
     say!("FLAGS:    default is no-clobber; -f = force overwrite (rm: quiet on missing), -n = no-clobber");
-    say!("WILDCARD: * / ? in the last path component — ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
+    say!("WILDCARD: * / ? in the last path component - ls/cat/rm/cp/mv expand it (e.g. rm *.TMP, cp *.TXT DOCS/)");
     say!("          (create/edit/delete/copy/move files & dirs anywhere in the tree; sync = write-through, durable)");
     say!("TREE:     find [root] <pattern>  (recursive glob search), du [dir]  (recursive size tally)");
     say!("          uptime  (seconds since boot; shows the wall clock when set)");
-    say!("INSPECT:  stat <path>  (full on-disk detail), xd <path> [off] [len]  (bounded hexdump)");
-    // PRTSCR: advertised unconditionally, like the verb itself — the word exists on every UnaOS
-    // and the ring arm says honestly what this panel and this volume could not do.
-    say!("CAPTURE:  screenshot  (panel -> SCREEN<n>.PNG at the volume root; n = first free 0-99)");
-    say!("          the Print Screen key does the same thing (x86)");
+    say!("INSPECT:  stat <path>  (full on-disk detail), hexdump <path> [off] [len]  (bounded)");
+    // RELICS (R26 clause 2): the `u*` family retired into the plain file verbs, which reach the
+    // native volume through the one namespace. Only the two words with no plain twin are left, and
+    // both wear their standard spelling: extended attributes and snapshots.
+    say!("NATIVE:   the plain file verbs reach the native volume: `/` native, /fat boot FAT, /usb stick");
+    say!("          setfattr -x <key> <path>  (drop one typed attribute)");
+    say!("SNAP:     snap list, snap create <name>, snap drop <gen>  (retained roots / snapshots)");
+    say!("          snap ls <gen> [path], snap cat <gen> <path>  (read a snapshot; current-ACL enforced)");
+    say!("CLOCK:    date, date -s YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
+    say!("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/date -s)");
     if facts.aarch64 {
-        say!("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
-        say!("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
-        // BASICS (orin 17): advertised for the first time — the arms shipped, the table did not.
-        say!("          umv <src> <dst>, urmattr <path> <key>  (rename/move; drop a typed attribute)");
-    }
-    say!("          usnaps, usnap <name>, usnapdrop <gen>  (retained roots / snapshots)");
-    if facts.aarch64 {
-        say!("          usnapls <gen> [path], usnapcat <gen> <path>  (read a snapshot; current-ACL enforced)");
-    }
-    say!("CLOCK:    date, setdate YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
-    say!("          time  (shared civil clock: ISO-8601 UTC + source; unsynced until SNTP/setdate)");
-    // BARENAME (PARITY §6.6a): `vug` and `pulse` are the in-kernel DEMOS, and they are verbs only
-    // on a `vugdemo` build. Off the knob — which is every image users flash — the same two words
-    // name the ring-3 programs `VUG.ELF` / `PULSE.ELF` and belong to the bare-name lines below, so
-    // advertising them here would be advertising a verb this build cannot dispatch: the exact rule
-    // the `Facts` doc opens with.
-    if facts.aarch64 {
-        if facts.vugdemo {
-            say!("SMP:      sched (per-CPU run queues), pulse (full-screen CPU monitor)");
-        } else {
-            say!("SMP:      sched (per-CPU run queues)");
-        }
-        say!("          top  (per-core load: recent busy%, ctx-switches, last task)");
+        say!("SMP:      ps (per-CPU run queues), top (per-core load: busy%, ctx-switches, last task)");
     } else {
-        say!("SMP:      sched (per-CPU run queues)");
+        say!("SMP:      ps (per-CPU run queues)");
     }
     if facts.v3d && facts.vugdemo {
         say!("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
@@ -627,9 +619,9 @@ pub fn help(facts: &Facts) -> String {
         say!("APPS:     v3d (replay the visible GPU graphics battery)");
     }
     if facts.proc_verbs {
-        say!("PROC:     run <path> (foreground), bg <path> (background), jobs (list+reap), kill <pid>");
+        say!("PROC:     bg <path> (background), jobs (list+reap), kill <pid>");
     }
-    // BARENAME (PARITY §6.6a): keyed off `exec`, the fact these two lines actually describe, not
+    // BARENAME (PARITY 6.6a): keyed off `exec`, the fact these two lines actually describe, not
     // off `x86`, the arch that happened to be the only one carrying it. A help line that names a
     // capability must be gated on the capability.
     if facts.exec {
@@ -638,19 +630,41 @@ pub fn help(facts: &Facts) -> String {
         // where the launch rule is stated. `.elf` stays visible in `ls`.
         say!("          <name>      (the .elf is optional: vug finds VUG.ELF; ls still shows VUG.ELF)");
     }
+    say!("POWER:    reboot (warm reboot), shutdown|off (power off, cold-boot-ready) - via the platform firmware");
+    // RELICS (R26 clause 1): `netinfo` is `ifconfig` and not `ip`, and the OUTPUT is the reason.
+    // It renders ONE interface's state - MAC, link, and this NIC's frame/IRQ counters - which is
+    // ifconfig's shape. `ip` prints address OBJECTS over a set of links, and the shell has no
+    // address table to print. `connect`/`udpsend` are one `nc` (TCP, `-u` for UDP); `get` is
+    // `curl`, which is what an HTTP/1.0 GET over a socket is called everywhere else.
+    say!("NETWORK:  ifconfig  (NIC: MAC, link, counters), ping <ip> [count], arp <ip>");
+    say!("          nc [-u] <ip> <port> [message]  (TCP connect+exchange; -u = one UDP datagram)");
+    say!("          curl [http://]<ip>[:port][/path]  (HTTP/1.0 GET, printed)");
+    // RELICS (R26 clause 3, Peter: "most of those probes are useful still no?"). The probes STAY,
+    // and they are grouped so the everyday table above reads as an everyday table. Every one of
+    // them answers on every build - the ring arm says what THIS platform can do, and the word
+    // exists regardless (the ONE-OS law).
+    say!("BENCH:    tste (in-OS self-test suite), panic (enter the exception path deliberately)");
+    say!("          run <path>  (load + run an ELF64 in the foreground)");
+    say!("          screenshot  (panel -> SCREEN<n>.PNG at the volume root; n = first free 0-99)");
+    say!("          the Print Screen key does the same thing (x86)");
+    say!("          dmesg  (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
+    say!("          hexdump <path> [off] [len]  (bounded dump), lsusb  (USB device summary)");
+    say!("          burst  (SCHED-BAL multi-hot-thread burst), simmer  (per-core load animator)");
     if facts.proc_verbs {
         say!(format!(
-            "          storm [n]  (launch n vugs; n>{} is refused by the process table — serial carries the [storm] census)",
+            "          storm [n]  (launch n vugs; n>{} is refused by the process table - serial carries the [storm] census)",
             facts.proc_rows
         ));
     }
-    say!("POWER:    reboot (warm reboot), shutdown|off (power off, cold-boot-ready) — via the platform firmware");
-    say!("          batmon (SMC battery snapshot; x86 UNAOS_SMC=1 only)");
-    say!("WITNESS:  bootlog (boot-milestone ring: PORTSW / FTDI console / EHCI HID / block / GUI handoff)");
-    say!("TEST:     tste (in-OS self-test suite: boot-replay + live checks)");
-    say!("NETWORK:  netinfo, ping <ip> [count], arp <ip>");
-    say!("          connect <ip> <port> [message], udpsend <ip> <port> [message]");
-    say!("          get <ip> [port] [path]  (HTTP/1.0 GET)");
+    say!("          batmon  (battery snapshot; the platform that has one answers)");
+    // BARENAME (PARITY 6.6a): `vug` and `pulse` are the in-kernel DEMOS, and they are verbs only
+    // on a `vugdemo` build. Off the knob - which is every image users flash - the same two words
+    // name the ring-3 programs `VUG.ELF` / `PULSE.ELF` and belong to the bare-name lines above, so
+    // advertising them here would be advertising a verb this build cannot dispatch: the exact rule
+    // the `Facts` doc opens with.
+    if facts.aarch64 && facts.vugdemo {
+        say!("          pulse  (full-screen CPU monitor), vug  (in-kernel 3D sculptor)");
+    }
     l.join("\n")
 }
 
@@ -745,9 +759,12 @@ mod tests {
             aarch64: true, v3d: true, proc_verbs: true, proc_rows: 6, exec: true, ..Facts::bare()
         };
         let h = help(&arm);
-        assert!(h.contains("UNAFS:"));
-        assert!(!h.contains("pulse (full-screen CPU monitor)"), "vugdemo-only verb advertised knob-off");
-        assert!(!h.contains("vug (3D sculptor)"), "vugdemo-only verb advertised knob-off");
+        // RELICS (R26): the `u*` family retired, so the class is NATIVE and it is UNCONDITIONAL -
+        // the plain file verbs reach the native volume, and the sentence saying so is not gated on
+        // an arch. (`UNAFS:` was the old class, and it was aarch64-only because the verbs were.)
+        assert!(h.contains("NATIVE:"));
+        assert!(!h.contains("pulse  (full-screen CPU monitor)"), "vugdemo-only verb advertised knob-off");
+        assert!(!h.contains("vug  (in-kernel 3D sculptor)"), "vugdemo-only verb advertised knob-off");
         assert!(h.contains("APPS:     v3d ("), "the v3d verb is real knob-off and must stay listed");
         assert!(h.contains("n>6 is refused"));
         assert!(h.contains("the .elf is optional"), "bare-name help is gated on exec, not on x86");
@@ -755,13 +772,16 @@ mod tests {
         // The same Pi with the demo knob ON: the two verbs exist, so they are advertised again.
         let armdemo = Facts { vugdemo: true, ..arm };
         let h = help(&armdemo);
-        assert!(h.contains("pulse (full-screen CPU monitor)"));
+        assert!(h.contains("pulse  (full-screen CPU monitor)"));
         assert!(h.contains("APPS:     vug (3D sculptor), v3d ("));
 
         let x86 = Facts { x86: true, proc_verbs: true, proc_rows: 10, ..Facts::bare() };
         let h = help(&x86);
-        assert!(!h.contains("UNAFS:"));
-        assert!(h.contains("SMP:      sched (per-CPU run queues)"));
+        // RELICS (R26 clause 3): NATIVE is on every build now - the plain verbs are the verbs.
+        assert!(h.contains("NATIVE:"));
+        // RELICS (R26 clause 1): `sched` retired; `ps` is the name.
+        assert!(h.contains("SMP:      ps (per-CPU run queues)"));
+        assert!(!h.contains("sched"), "the retired `sched` spelling is still in help");
         assert!(h.contains("n>10 is refused"));
         assert!(!h.contains("just type it"), "bare-name help shown on a build with exec off");
     }
@@ -857,14 +877,77 @@ mod tests {
         );
     }
 
-    /// BASICS (orin 17): the two aarch64 unafs verbs whose match arms shipped without a table
-    /// entry, so `umv`/`urmattr` refused as unknown for the whole time they existed.
+    /// RELICS (R26 clause 1+2): the standard name REPLACED ours, it did not alias it.
+    ///
+    /// Both directions, and the first one is the point: a rename that leaves the old word
+    /// registered is an alias, and Peter's ruling is "switch to the standard names", not "offer
+    /// both". So every retired spelling must be a NON-verb on every build - at which point it is
+    /// free to be a program name again, which is what a retired verb should be.
     #[test]
-    fn the_unafs_write_verbs_are_registered() {
-        let arm = Facts { aarch64: true, ..Facts::bare() };
-        for w in ["umv", "urmattr"] {
-            assert!(is_verb(w, &arm), "{} has an aarch64 match arm and must be a verb there", w);
-            assert!(!is_verb(w, &Facts { x86: true, ..Facts::bare() }), "{} is aarch64-only", w);
+    fn the_retired_spellings_are_not_verbs_anywhere() {
+        const RETIRED: &[&str] = &[
+            // clause 1 - renamed to the standard word
+            "bootlog", "vfs", "xd", "usbinfo", "netinfo", "diskinfo", "fatinfo", "setdate",
+            "sched", "connect", "udpsend", "get", "read",
+            // clause 2 - the duplicated unafs family, and the five usnap spellings
+            "uls", "ucat", "umkdir", "umv", "urm", "urmattr", "utouch", "uwrite",
+            "usnap", "usnapcat", "usnapdrop", "usnapls", "usnaps",
+        ];
+        let builds = [
+            Facts::bare(),
+            Facts { aarch64: true, v3d: true, vugdemo: true, proc_verbs: true, exec: true, ..Facts::bare() },
+            Facts { x86: true, proc_verbs: true, exec: true, ..Facts::bare() },
+        ];
+        for f in builds {
+            for w in RETIRED {
+                assert!(!is_verb(w, &f), "retired spelling `{}` is still a verb on {:?}", w, f);
+            }
+            // ... and the standard word that replaced it is a verb on EVERY build (clause 3: no
+            // verb is pinned to a platform; the ring arm decides the answer, not the word).
+            for w in ["dmesg", "mount", "hexdump", "lsusb", "ifconfig", "fdisk", "dd", "ps",
+                      "nc", "curl", "snap", "setfattr", "burst", "simmer", "batmon", "top"] {
+                assert!(is_verb(w, &f), "`{}` must be a verb on {:?}", w, f);
+                assert!(
+                    matches!(plan(w, &f, &mut vol()), Plan::Host { .. }),
+                    "`{}` must route to the ring", w
+                );
+            }
+        }
+        // `date` absorbed `setdate` as `date -s`: the flag rides through as `rest`, untouched.
+        assert_eq!(
+            plan("date -s 2026-09-06 11:22", &Facts::bare(), &mut vol()),
+            Plan::Host { verb: "date".to_string(), rest: "-s 2026-09-06 11:22".to_string() }
+        );
+        // `mount` absorbed `vfs`: the subcommand rides through as `rest`, untouched.
+        assert_eq!(
+            plan("mount write /A.TXT hello", &Facts::bare(), &mut vol()),
+            Plan::Host { verb: "mount".to_string(), rest: "write /A.TXT hello".to_string() }
+        );
+        // `snap` absorbed the five `usnap*` spellings the same way.
+        assert_eq!(
+            plan("snap cat 7 /K3HELLO.TXT", &Facts::bare(), &mut vol()),
+            Plan::Host { verb: "snap".to_string(), rest: "cat 7 /K3HELLO.TXT".to_string() }
+        );
+    }
+
+    /// RELICS (R26 clause 3): NO VERB IS PINNED TO A PLATFORM.
+    ///
+    /// The table's arch-conditional availabilities are now exactly three, and each is a
+    /// CAPABILITY the build either compiled in or did not - never a preference about which board
+    /// deserves the word. `Avail::Aarch64` has no members left at all.
+    #[test]
+    fn no_verb_is_pinned_to_a_platform_without_a_capability() {
+        for (n, a) in HOST_VERBS {
+            assert!(
+                !matches!(a, Avail::Aarch64),
+                "`{}` is pinned to an arch with no capability behind it (R26 clause 3)", n
+            );
+        }
+        // The three that remain are knobs/capabilities, and they are the ones documented as such.
+        for (n, a) in HOST_VERBS {
+            if matches!(a, Avail::V3d | Avail::VugDemo) {
+                assert!(["v3d", "vug", "pulse"].contains(n), "unexpected knob-gated verb `{}`", n);
+            }
         }
     }
 

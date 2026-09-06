@@ -18,7 +18,7 @@ System Management Mode (SMM) is a security risk (ring -2).
 ## 4. CLOCK-X1 — the x86 wall-clock timebase (JD17 twin)
 
 JD17 (`crates/kernel/src/clock.rs`) built the kernel wall clock: operator-seeded once per boot with
-the `setdate` verb, then extended forward by the architecture's free-running counter and stamped onto
+the `date -s` form, then extended forward by the architecture's free-running counter and stamped onto
 FAT mtimes. On aarch64 that counter is `CNTPCT_EL0`/`CNTFRQ_EL0`; on x86_64 `monotonic()` originally
 returned `None`, so a set clock stayed **frozen** at its seeded second and `uptime_secs()` was `None`.
 CLOCK-X1 supplies the x86 half.
@@ -38,7 +38,7 @@ two conditions, each of which returns `None` (honest frozen clock) when unmet:
   atomic load + one `rdtsc` — cheap and lock-free, safe on the shell-verb and FAT-stamp hot paths.
 
 With the counter live the existing JD17 machinery lights up on x86 unchanged: `uptime_secs()` returns
-`Some`, `setdate`+`date` advance, `fat_stamp()` stamps real times once seeded. The aarch64 branch, the
+`Some`, `date -s`+`date` advance, `fat_stamp()` stamps real times once seeded. The aarch64 branch, the
 `fat.rs` stamp logic and the verbs are untouched.
 
 **Boot trace (M1).** `apic::calibrate` emits, after the timer re-arm:

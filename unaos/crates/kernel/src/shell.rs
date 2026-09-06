@@ -227,14 +227,14 @@ fn joined(parent_canon: &str, leaf: &str) -> String {
 /// PI-UI-3: print a verb's output line to the panel AND mirror it to the serial console as a
 /// `:: ui3:<verb>: <line> ::` witness. On the Pi bench the verb output renders panel-only, so a
 /// headless capture cannot see it; the witness gives the same content on the wire so `date`/`time`/
-/// `netinfo` are verifiable from serial alone. Same content on both sinks, byte-for-byte.
+/// `ifconfig` are verifiable from serial alone. Same content on both sinks, byte-for-byte.
 fn ui3_say(console: &mut Console, verb: &str, line: &str) {
     console.println(line);
     serial_println!(":: ui3:{}: {} ::", verb, line);
 }
 
 /// PI-FS-5: panel-line + `:: fs5: <line> ::` serial mirror (the `ui3_say` idiom, dedicated tag) — the
-/// `diskinfo` verb renders panel-only on the bench, so the witness gives a headless capture the same content.
+/// `fdisk -l` verb renders panel-only on the bench, so the witness gives a headless capture the same content.
 #[cfg(target_arch = "aarch64")]
 fn fs5_say(console: &mut Console, line: &str) {
     console.println(line);
@@ -478,6 +478,12 @@ fn mount_write_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
 //
 // Prose elsewhere in this file deliberately names the function without parentheses for the same
 // reason.
+// RELICS (orin 17): the scan is O(len) over this file, and this file grew past the default
+// `long_running_const_eval` step budget with this arc. The lint is a guard against a const that may
+// never terminate; this one provably does (a single forward walk bounded by the file length), and
+// the lint's own help says an allow is the right answer for a const that is merely long. The ASSERT
+// is untouched — the law still fails the build, which is the protection.
+#[allow(long_running_const_eval)]
 const _: () = {
     const SRC: &[u8] = include_bytes!("shell.rs");
     const NEEDLE: [u8; 9] = [b':', b':', b'm', b'o', b'u', b'n', b't', b'(', b')'];
@@ -505,10 +511,61 @@ const _: () = {
     );
 };
 
+// --- RELICS (R26 clause 2): THE PLAIN FILE VERBS REACH THE NATIVE VOLUME ------------------------
+//
+// Peter's ruling retires `uls ucat umkdir umv urm urmattr utouch uwrite` "once a transcript proves
+// the plain verb covers the unafs volume — if a plain verb does NOT cover unafs, fix the plain verb
+// so it does, then retire". Two of the eight were already covered and six were not:
+//
+// * `uls`/`ucat` — COVERED BEFORE THIS ARC. VFS-1 routed `ls` and `cat` through the mount table on
+//   aarch64, so `ls /` already listed the native root and `cat /K3HELLO.TXT` already read it. The
+//   `u*` pair had been a second spelling of a listing the plain verb already produced.
+// * `utouch`/`uwrite`/`umkdir`/`urm`/`umv` — NOT covered. The plain verbs were FAT-DIRECT: they
+//   walked fat.rs on the boot partition whatever the path said, so on aarch64 `touch A.TXT` wrote
+//   to a volume that `ls` did not list. That incoherence is the defect, not the retirement.
+//
+// THE FIX, and why it is this shape: a plain mutating verb now resolves its target through the SAME
+// seam the read verbs use (`vfs_path`, cwd-aware), and if the result is NOT claimed by a reserved
+// volume prefix it is a NATIVE path and goes to the native helper. `/fat/...` and `/usb/...` keep
+// the FAT-direct helpers they have always used. That is exactly the namespace rule `ls`, `cat`,
+// `run` and `bg` already obey, so the write verbs now agree with the read verbs about what a path
+// means — which is the whole point of having one namespace.
+//
+// WHAT IS STILL FAT-ONLY, said plainly rather than left to be discovered: `rm -r` and `rmdir` on a
+// native path. Neither had a `u*` twin to retire (the family's `urm` refused directories outright),
+// so nothing regressed and no retirement depends on them; a native recursive delete is a MountTable
+// capability that does not exist yet, and inventing one here would be a filesystem-core change
+// outside this arc.
+
+/// RELICS (R26 clause 2): the resolved path when it lands on the NATIVE volume, else `None`.
+///
+/// Boundary-matched exactly as [`unmounted_reserved_volume`] is: `/fat` and `/fat/...` name the FAT
+/// volume, but `/fatty.bin` is a native-root name and legitimately resolves there.
+#[cfg(target_arch = "aarch64")]
+fn native_target(arg: &str) -> Option<String> {
+    let path = vfs_path(arg);
+    for &pfx in RESERVED_VOLUME_PREFIXES {
+        if path == pfx
+            || (path.len() > pfx.len()
+                && path.starts_with(pfx)
+                && path.as_bytes()[pfx.len()] == b'/')
+        {
+            return None;
+        }
+    }
+    Some(path)
+}
+
 /// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
 /// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
 /// `create_in_dir` twins — the parent may be the root or any subdirectory.
 fn fs_touch(console: &mut Console, arg: &str) {
+    // RELICS (R26 clause 2): a native-namespace target goes to the native volume, which is what
+    // the retired `utouch` did — same helper, one verb.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(path) = native_target(arg) {
+        return console.println(&unafs_verb_touch(&path));
+    }
     let Some(fs) = mount_write_volume(console, "touch") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
@@ -532,6 +589,11 @@ fn fs_touch(console: &mut Console, arg: &str) {
 /// in-place shrink primitive, and the directory-field publisher is private). A directory target is
 /// refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
+    // RELICS (R26 clause 2): the retired `uwrite`'s destination, reached by the plain verb.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(path) = native_target(arg) {
+        return console.println(&unafs_verb_write(&path, data));
+    }
     let Some(fs) = mount_write_volume(console, "write") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
@@ -580,6 +642,15 @@ fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
 /// (allocate + zero-fill + chain new clusters, directory `size` published LAST). A directory target
 /// is refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
 fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
+    // RELICS (R26 clause 2): the native volume has no append primitive of its own, so `append` on a
+    // native path is read-modify-write through the same helpers `write`/`cat` use. Said here rather
+    // than hidden: on a native target this is NOT atomic and NOT an O(1) EOF extend the way the FAT
+    // path is — it is the honest implementation available, and a bounded one (the read is capped at
+    // the same 8 KiB `cat` caps at, and a file at that cap is refused rather than truncated).
+    #[cfg(target_arch = "aarch64")]
+    if let Some(path) = native_target(arg) {
+        return console.println(&unafs_verb_append(&path, data));
+    }
     let Some(fs) = mount_write_volume(console, "append") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
@@ -621,6 +692,17 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 /// missing-target error quietly (POSIX `rm -f`); a wrong-usage `-EISDIR` is still shown under `-f`.
 /// Rides the dir-aware locate_in_dir twin.
 fn fs_rm(console: &mut Console, arg: &str, force: bool) {
+    // RELICS (R26 clause 2): the retired `urm`'s destination, reached by the plain verb. `-f` is
+    // honoured the way POSIX honours it — a missing target is quiet — and the native helper's own
+    // refusal text is shown for everything else, so a directory target still says so.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(path) = native_target(arg) {
+        let msg = unafs_verb_rm(&path);
+        if force && msg.contains("NotFound") {
+            return;
+        }
+        return console.println(&msg);
+    }
     let Some(fs) = mount_write_volume(console, "rm") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
@@ -659,6 +741,11 @@ fn fs_rm(console: &mut Console, arg: &str, force: bool) {
 /// parent is a plain file → `-ENOTDIR` (both from `resolve_write_target`); volume or parent-dir full
 /// → `-ENOSPC`; a non-8.3 name → `-EINVAL`. The root itself as a target → `-EISDIR` (it always exists).
 fn fs_mkdir(console: &mut Console, arg: &str) {
+    // RELICS (R26 clause 2): the retired `umkdir`'s destination, reached by the plain verb.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(path) = native_target(arg) {
+        return console.println(&unafs_verb_mkdir(&path));
+    }
     let Some(fs) = mount_write_volume(console, "mkdir") else { return };
     let (parent, name, canon) = match resolve_write_target(&fs, arg) {
         Ok(t) => t,
@@ -1229,6 +1316,22 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
 /// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
 /// a benign duplicate (two names, one chain), never a lost chain.
 fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
+    // RELICS (R26 clause 2): the retired `umv`'s destination, reached by the plain verb. Both ends
+    // must be native — a cross-volume move is a copy-then-delete, which `move_entry` is not and
+    // which the native helper would silently mis-serve, so it is refused by name instead.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (ns, nd) = (native_target(src), native_target(dst));
+        match (ns, nd) {
+            (Some(a), Some(b)) => {
+                let _ = force; // the native helper refuses an existing destination outright
+                return console.println(&unafs_verb_mv(&a, &b));
+            }
+            (Some(_), None) | (None, Some(_)) => return console.println(
+                "mv: cross-volume move is not supported (copy with `cp`, then `rm`)"),
+            (None, None) => {}
+        }
+    }
     let Some(fs) = mount_write_volume(console, "mv") else { return };
     // --- Resolve the SOURCE to a concrete entry (file or dir). The volume root has no leaf name to
     //     move AS, so it is refused. ---
@@ -1365,7 +1468,7 @@ fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
 /// directly, so on the Pi `/` meant the SD FAT root while `ls` had already been saying `/` means
 /// native UnaFS, and `cat /usb/FILE` could not work at all — the name resolved as a literal FAT
 /// directory called `usb` and returned `-ENOENT`. Routing it through the seam makes `cat` agree with
-/// `ls`, `run`, `bg` and `vfs` about what a path means, which is the coherence this layer is for.
+/// `ls`, `run`, `bg` and `mount` about what a path means, which is the coherence this layer is for.
 ///
 /// Same 8 KiB console bound and the same `[... n of m bytes shown]` tail as the FAT renderer, so a
 /// capture cannot tell the two apart except by which volume answered.
@@ -1524,10 +1627,10 @@ fn fs_tail(console: &mut Console, arg: &str, n: u32) {
     }
 }
 
-/// JD17: parse the `setdate` argument pair — `YYYY-MM-DD HH:MM[:SS]`. Strict shapes (dash- and
+/// JD17: parse the `date -s` argument pair — `YYYY-MM-DD HH:MM[:SS]`. Strict shapes (dash- and
 /// colon-separated decimal fields, seconds optional and defaulting to 0); range validation is
 /// `clock::set`'s (`WallTime::is_valid`), so this only has to produce the numbers honestly.
-fn parse_setdate(args: &[&str]) -> Option<crate::clock::WallTime> {
+fn parse_wallclock(args: &[&str]) -> Option<crate::clock::WallTime> {
     if args.len() != 2 {
         return None;
     }
@@ -1616,7 +1719,7 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 /// `ls` on this arch, replacing the two per-volume collectors (`pi_ls_collect` against unafs and
 /// `pi_usb_ls_collect` against the USB FAT) that the verb used to choose between with a hand-rolled
 /// `/usb` prefix test. The volume is now decided by [`MountTable::resolve`] — the same longest-prefix
-/// rule `run`, `bg` and `vfs` already obey — so `ls /` lists native UnaFS, `ls /fat` the SD boot FAT
+/// rule `run`, `bg` and `mount` already obey — so `ls /` lists native UnaFS, `ls /fat` the SD boot FAT
 /// and `ls /usb` the stick, with no verb-side dispatch and no volume the verb has to know about.
 ///
 /// Returns `(is_dir, rows)` sorted by name. A directory yields its entries; a plain file yields its
@@ -1633,7 +1736,7 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     use crate::fs::vfs::{DirEnt, NodeKind};
     let mt = vfs_mount_table();
     // VFS-4: a path naming a reserved volume that is not currently bound reports the VOLUME as
-    // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `vfs`
+    // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `mount`
     // verb has had since VFS-4 rather than re-deriving it.
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
         return Err(alloc::format!("volume {} not mounted (-ENODEV)", vol));
@@ -1811,7 +1914,7 @@ fn vfs_ls_say(path: &str) {
 // A single TRAILING glob in a path's LAST component is expanded against the parent directory via the
 // read-only `read_dir` (case-insensitive 8.3 matching, already proven for `cd`/`cat`). Expansion is
 // invoked ONLY inside the fs-verb arms below — the shared arg-split at the top of `dispatch_command`
-// is unchanged, and the NET command region (netinfo/ping/arp/connect/udpsend/get — a sockets-arc
+// is unchanged, and the NET command region (ifconfig/ping/arp/nc/curl — a sockets-arc
 // lane) never sees a glob. A verb loops over the matches (SNAPSHOT-then-act: the match list is
 // captured before any mutation, so a `rm *.TXT` that deletes as it goes never invalidates its own
 // list). A glob with no match is an honest per-pattern "no match" note; a name with no metacharacter
@@ -2310,10 +2413,11 @@ fn fs_du(console: &mut Console, arg: &str) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// JD19 — read-only forensic verbs: `stat` (one entry's full on-disk detail) and `xd` (bounded
+// JD19 — read-only forensic verbs: `stat` (one entry's full on-disk detail) and `hexdump`
+// (bounded
 // hexdump). Both are `shell.rs`-only, ride the existing public fat.rs API call-never-edit, and never
 // mutate: `stat` composes resolve_path/locate_in_dir plus one raw `block::read_block` of the on-disk
-// directory sector for the true attr byte (the parsed DirEntry keeps only `is_dir`); `xd` streams a
+// directory sector for the true attr byte (the parsed DirEntry keeps only `is_dir`); `hexdump` streams a
 // bounded window through the offset-aware `read_at`. Neither is glob-wired (single path) — a
 // metacharacter resolves literally, an honest `-ENOENT`, the same as a mid-path glob today.
 
@@ -2396,7 +2500,8 @@ fn fs_stat(console: &mut Console, arg: &str) {
 
 /// JD19: hexdump `data` with each row labelled by its ABSOLUTE file offset (`base` + row start), in
 /// the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout (non-printables render as `.`). Distinct
-/// from the `read`-verb `hexdump` (which labels rows from 0 and dumps a fixed 128 bytes): `xd` needs
+/// from the `dd`-verb `hexdump` (which labels rows from 0 and dumps a fixed 128 bytes): the file
+/// dump needs
 /// the true file offset and a variable length, and pads a short final row so the ASCII gutter aligns.
 fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
     for (i, chunk) in data.chunks(16).enumerate() {
@@ -2417,33 +2522,33 @@ fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
     }
 }
 
-/// JD19 `xd <path> [off] [len]`: bounded hexdump of a file's bytes via the offset-aware `read_at`.
-/// Default off=0, len=256; `len` is hard-capped at `XD_MAX` (4096). Rows carry the absolute file
+/// JD19 `hexdump <path> [off] [len]`: bounded dump of a file's bytes via the offset-aware `read_at`.
+/// Default off=0, len=256; `len` is hard-capped at `HEXDUMP_MAX` (4096). Rows carry the absolute file
 /// offset. An `off` at or past EOF is an honest empty note; a directory target is `-EISDIR`; the root
 /// is `-EISDIR`. When more bytes remain past the dumped window an honest `[... n more byte(s)]` tail
 /// note is printed. off/len are parsed decimal or `0x`-hex by the caller.
-fn fs_xd(console: &mut Console, arg: &str, off: u32, len: usize) {
-    const XD_MAX: usize = 4096;
-    let Some(fs) = mount_read_volume(console, "xd") else { return };
+fn fs_hexdump(console: &mut Console, arg: &str, off: u32, len: usize) {
+    const HEXDUMP_MAX: usize = 4096;
+    let Some(fs) = mount_read_volume(console, "hexdump") else { return };
     let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
-        Ok(Resolved::Root) => return console.println("xd: /: is a directory (-EISDIR)"),
+        Ok(Resolved::Root) => return console.println("hexdump: /: is a directory (-EISDIR)"),
         Ok(Resolved::Entry(de, canon)) => (de, canon),
-        Err(msg) => return console.println(&alloc::format!("xd: {}", msg)),
+        Err(msg) => return console.println(&alloc::format!("hexdump: {}", msg)),
     };
     if de.is_dir {
-        return console.println(&alloc::format!("xd: {}: is a directory (-EISDIR)", canon));
+        return console.println(&alloc::format!("hexdump: {}: is a directory (-EISDIR)", canon));
     }
-    let want = core::cmp::min(len, XD_MAX);
+    let want = core::cmp::min(len, HEXDUMP_MAX);
     let mut data: Vec<u8> = Vec::new();
     if let Err(e) = fs.read_at(de.first_cluster(), de.size, off, &mut data, want) {
-        return console.println(&alloc::format!("xd: {}: {} ({:?})", canon, fat_errno(e), e));
+        return console.println(&alloc::format!("hexdump: {}: {} ({:?})", canon, fat_errno(e), e));
     }
     if data.is_empty() {
         if off >= de.size {
             return console.println(&alloc::format!(
-                "xd: {}: offset {} at/past EOF ({} byte(s)) — nothing to dump", canon, off, de.size));
+                "hexdump: {}: offset {} at/past EOF ({} byte(s)) — nothing to dump", canon, off, de.size));
         }
-        return console.println(&alloc::format!("xd: {}: 0 byte(s) read", canon));
+        return console.println(&alloc::format!("hexdump: {}: 0 byte(s) read", canon));
     }
     xd_rows(console, off as usize, &data);
     // Honest tail note whenever the file holds more bytes past the dumped window (a cap hit, a short
@@ -3201,8 +3306,8 @@ fn fs_grep(console: &mut Console, args: &[&str]) {
 /// same walker — and `free` is derived from it. That undercounts by the per-file slack up to one
 /// cluster, so the header names the method rather than letting a reader assume a block-accurate
 /// figure. A walk that fails mid-tree reports the partial tally and says which path stopped it.
-fn df_report(console: &mut Console) {
-    let Some(fs) = mount_read_volume(console, "df") else { return };
+fn df_report(console: &mut Console, verb: &str) {
+    let Some(fs) = mount_read_volume(console, verb) else { return };
     let kind = match fs.kind() {
         crate::fs::fat::FatKind::Fat16 => "FAT16",
         crate::fs::fat::FatKind::Fat32 => "FAT32",
@@ -3228,7 +3333,15 @@ fn df_report(console: &mut Console) {
         "cluster {} B, {} file(s), {} dir(s) — used = recursive file-byte tally, slack not counted",
         fs.cluster_size(), stats.files, stats.dirs));
     if let Some(msg) = note {
-        console.println(&alloc::format!("df: partial tally — {}", msg));
+        console.println(&alloc::format!("{}: partial tally — {}", verb, msg));
+    }
+    // RELICS (R26 clause 1): the retired `fatinfo` verb was one line of FAT GEOMETRY, and geometry
+    // is a property of a MOUNT, not of how full it is — so it prints under `mount` and not under
+    // `df`. Peter's ruling offered "fold into mount/df output" as an alternative to an `fsck`-style
+    // name, and that was the right half to take: `fsck` is a CHECKER, and `describe()` checks
+    // nothing; a verb named for repair that only prints numbers would be the dishonest option.
+    if verb == "mount" {
+        console.println(&fs.describe());
     }
     // NAMESPACE: the mount table's prefixes, the listing `MountTable::prefixes` was written for.
     // `crate::fs::vfs` is compiled on aarch64 only (`fs/mod.rs`), so this call cannot exist on a
@@ -3324,6 +3437,9 @@ pub fn midden_witness() {
 
     // BASICS (orin 17): the everyday verbs get their own legs, in the same battery, on both arches.
     shell_basics_witness();
+    // RELICS (orin 17, R26): the rename/retire legs, and — where there is a native volume — the
+    // transcript that proves each retired verb's plain replacement covers it.
+    shell_relics_witness();
 }
 
 // ==================== BASICS — the witness battery for the everyday verbs =========================
@@ -3340,7 +3456,7 @@ pub fn midden_witness() {
 // property a per-window counter would silently break. `basics.grep` asserts both senses of every
 // case, so a matcher stuck on `true` fails as loudly as one stuck on `false`. `basics.table`
 // compares the verb table against the words this file's `match` actually carries — the check whose
-// absence let `umv` and `urmattr` ship unreachable.
+// absence let `umv` and `urmattr` ship unreachable before they retired.
 
 /// BASICS: where a captured console's lines land. `Console::set_output_sink` takes a bare `fn`
 /// pointer (no captured state, by its own contract), so the buffer has to be a static.
@@ -3398,8 +3514,12 @@ fn shell_basics_witness() {
             missing.push_str(w);
         }
     }
+    // RELICS (R26 clause 2): `umv`/`urmattr` were asserted here by BASICS, which had just restored
+    // their table entries. They are retired now — `mv` reaches the native volume itself and the
+    // attribute verb is `setfattr` — so what this half asserts is the SURVIVORS, on the same
+    // SYNTHETIC aarch64 fact set, so the x86 gate proves the aarch64 shape too.
     let arm = midden_core::Facts { aarch64: true, ..midden_core::Facts::bare() };
-    for w in ["umv", "urmattr"] {
+    for w in ["setfattr", "snap", "mv", "mount"] {
         if !midden_core::is_verb(w, &arm) {
             missing.push(' ');
             missing.push_str(w);
@@ -3474,6 +3594,292 @@ fn shell_basics_witness() {
     ];
     let bad = g.iter().filter(|(got, want)| got != want).count();
     verdict("shell.basics.grep", bad == 0, &alloc::format!("{} of {} cases wrong", bad, g.len()));
+}
+
+// ==================== RELICS — the rename/retire transcript ======================================
+//
+// WHAT THIS BATTERY HAS TO PROVE, and why it is two halves.
+//
+// Peter's R26 has two claims that can rot in opposite directions. Clause 1 ("standard names REPLACE
+// ours") rots if a retired spelling creeps back as an alias — a table-level fact, provable on any
+// build, so `shell.relics.renamed` runs everywhere. Clause 2 ("the duplicated unafs verbs RETIRE
+// once a transcript proves the plain verb covers the unafs volume") rots if a plain verb quietly
+// stops reaching the native volume — a RUNTIME fact about a real volume, so `shell.relics.native`
+// runs only where there is one, which is the `kernel8-test` aarch64 gate.
+//
+// WHAT MAKES THEM FALSIFIABLE. `renamed` asserts BOTH senses of every pair: the old word must be a
+// non-verb AND the new word must be a verb, on three different fact sets, so a table stuck on
+// "yes" fails exactly as loudly as one stuck on "no". `native` never compares an expression with
+// itself: every leg WRITES through the plain verb's own helper and READS BACK through the mount
+// table — the seam `ls` and `cat` use — so pointing a write helper at the wrong volume reds it
+// even though the write itself succeeded.
+
+/// RELICS: the pairs R26 clause 1 renamed. `(retired spelling, the standard word that replaced it)`.
+///
+/// `read` is in this list and its entry is `dd` for the reason the `dd` arm records: POSIX `read`
+/// is a shell builtin that reads a line of INPUT, so ours was a standard word wearing a foreign
+/// meaning, which is the same defect clause 1 names — not merely a house spelling.
+#[cfg(feature = "witness")]
+const RELIC_RENAMES: &[(&str, &str)] = &[
+    ("bootlog", "dmesg"), ("vfs", "mount"), ("xd", "hexdump"), ("usbinfo", "lsusb"),
+    ("netinfo", "ifconfig"), ("diskinfo", "fdisk"), ("fatinfo", "mount"), ("setdate", "date"),
+    ("sched", "ps"), ("connect", "nc"), ("udpsend", "nc"), ("get", "curl"), ("read", "dd"),
+    ("uls", "ls"), ("ucat", "cat"), ("utouch", "touch"), ("uwrite", "write"),
+    ("umkdir", "mkdir"), ("urm", "rm"), ("umv", "mv"), ("urmattr", "setfattr"),
+    ("usnaps", "snap"), ("usnap", "snap"), ("usnapdrop", "snap"), ("usnapls", "snap"),
+    ("usnapcat", "snap"),
+];
+
+/// RELICS: the two arch-neutral legs plus, on a build with a native volume, the subsumption
+/// transcript. Called from [`midden_witness`], so it runs wherever that runs.
+#[cfg(feature = "witness")]
+fn shell_relics_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // --- renamed: the old word is gone, the new word is here, on three builds ------------------
+    let builds = [
+        midden_core::Facts::bare(),
+        midden_core::Facts { aarch64: true, ..midden_core::Facts::bare() },
+        midden_core::Facts { x86: true, exec: true, proc_verbs: true, ..midden_core::Facts::bare() },
+    ];
+    let mut bad = String::new();
+    for f in builds {
+        for (old, new) in RELIC_RENAMES {
+            if midden_core::is_verb(old, &f) {
+                bad.push_str(" alias:");
+                bad.push_str(old);
+            }
+            if !midden_core::is_verb(new, &f) {
+                bad.push_str(" missing:");
+                bad.push_str(new);
+            }
+        }
+    }
+    // PER-PAIR EVIDENCE. The leg above is one verdict over 26 pairs, which is the right shape for a
+    // gate but the wrong shape for a capture: a reader asking "was `usbinfo` really replaced, and by
+    // what?" should not have to trust an aggregate. One line per pair, on the strictest fact set (a
+    // bare build, where only `Avail::Always` verbs exist), so the line says both halves.
+    {
+        let f = midden_core::Facts::bare();
+        for (old, new) in RELIC_RENAMES {
+            serial_println!(
+                ":: [relics] {} -> {} :: retired={} registered={} ::",
+                old, new, !midden_core::is_verb(old, &f), midden_core::is_verb(new, &f)
+            );
+        }
+    }
+    verdict(
+        "shell.relics.renamed",
+        bad.is_empty(),
+        &alloc::format!("{}", if bad.is_empty() { " none" } else { &bad }),
+    );
+
+    // --- help: the description names the survivors and none of the relics, and has a BENCH class -
+    let facts = midden_facts();
+    let empty: &[&str] = &[];
+    let lines = witness_capture(|c| {
+        let mut vol = midden_core::NameList(empty);
+        match midden_core::plan("help", &facts, &mut vol) {
+            midden_core::Plan::Say(m) => render_message(c, &m),
+            other => c.println(&alloc::format!("help did not reach the core: {:?}", other)),
+        }
+    });
+    let text = lines.join("\n");
+    let has_bench = lines.iter().any(|l| l.starts_with("BENCH:"));
+    // Word-boundary-free `contains` would let `mount` match inside `unmounted`; the relics are
+    // checked as whole words the way the operator would type them, one per space-split token.
+    let stale = ["bootlog", "vfs", "xd", "usbinfo", "netinfo", "diskinfo", "fatinfo", "setdate",
+                 "sched", "udpsend", "uls", "ucat", "utouch", "uwrite", "umkdir", "urmattr",
+                 "usnap", "usnaps", "usnapls", "usnapcat", "usnapdrop"];
+    let mut leaked = String::new();
+    for w in stale {
+        if text.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == w) {
+            leaked.push(' ');
+            leaked.push_str(w);
+        }
+    }
+    let names_new = ["dmesg", "hexdump", "lsusb", "ifconfig", "fdisk", "dd", "nc", "curl",
+                     "snap", "setfattr", "ps"]
+        .iter()
+        .all(|w| text.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == *w));
+    verdict(
+        "shell.relics.help",
+        has_bench && leaked.is_empty() && names_new,
+        &alloc::format!("bench={} new={} leaked:{}", has_bench, names_new,
+            if leaked.is_empty() { " none" } else { &leaked }),
+    );
+
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    shell_relics_native_witness();
+}
+
+/// RELICS: THE SUBSUMPTION TRANSCRIPT — the leg R26 clause 2 makes the retirement conditional on.
+///
+/// One leg per retired pair, each in the `:: TSTE: shell.relics.<verb> -> PASS ::` shape, and each
+/// is a WRITE through the plain verb's own helper followed by a READ BACK through the mount table —
+/// `vfs_ls_collect` / `MountTable::read`, the seam `ls` and `cat` resolve through. That is what
+/// makes them a transcript of subsumption rather than a self-test of one helper: if `touch` were
+/// still FAT-direct on aarch64 the write would SUCCEED (on the FAT volume) and the read back off
+/// the native root would still find nothing, so the leg reds.
+///
+/// # IT SELF-CLEANS, AND THAT CONSTRAINT SHAPED THE `mkdir` LEG
+///
+/// `fs/unafs.rs`'s `k3_mount_selftest` bit5 requires the native root to hold the two staged
+/// fixtures and `acl-*` rows and NOTHING ELSE — its own doc: *"a leaked scratch fixture still fails
+/// the bit, so the fixtures' self-clean discipline stays protected."* Every file this transcript
+/// creates is deleted before it returns.
+///
+/// A DIRECTORY cannot be. The UnaFS crate has no directory removal at all (`unlink` returns
+/// `IsADirectory` unconditionally; ROADMAP §F2's own scope note: *"the crate has no `rmdir`"*), so a
+/// leg that created `/RELICD` would leave it there — invisible in QEMU, where the card is re-staged
+/// every run, and a permanent K3-mount red on any metal Pi from its second boot onward. So the
+/// `mkdir` leg proves the ROUTING without mutating: it aims `mkdir` at a name that exists ONLY on
+/// the native volume (the file the `write` leg just made) and requires the refusal to be the NATIVE
+/// crate's `FileExists`. A `mkdir` still riding fat.rs would not find that name on the FAT boot
+/// partition at all — it would CREATE a directory and report success — so the leg is two-sided
+/// against exactly the failure it exists to catch. **Residual, stated rather than hidden:** there is
+/// no POSITIVE native `mkdir` transcript, and there cannot be one until the crate can remove a
+/// directory. What carries the positive half meanwhile is `touch`/`write`, which reach the volume
+/// through the same `unafs_split` + `resolve_path(parent)` + create-in-parent path.
+///
+/// Runs after `emmc2::probe()` at the aarch64 `midden_witness` call site, so the volume is mounted —
+/// unlike the x86 call site, which is why the native half is gated to this arch and this feature.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+fn shell_relics_native_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+    /// Read a native path back through the MOUNT TABLE (never through the writer's own helper).
+    fn read_back(path: &str) -> Option<Vec<u8>> {
+        let mt = vfs_mount_table();
+        let st = mt.stat(path).ok()?;
+        mt.read(path, 0, st.size as usize).ok()
+    }
+    fn listed(dir: &str, name: &str) -> bool {
+        match vfs_ls_collect(dir) {
+            Ok((_, rows)) => rows.iter().any(|d| d.name == name),
+            Err(_) => false,
+        }
+    }
+
+    // Every leg drives the PLAIN verb's helper. `witness_capture` swallows the console line the
+    // verb prints (the fixture must not paint the operator's panel) and hands it back for the FAIL
+    // text, so a failure names what the verb actually said.
+    let say = |f: &dyn Fn(&mut Console)| -> String { witness_capture(|c| f(c)).join(" | ") };
+
+    const A: &str = "/RELIC1.TXT";
+    const B: &str = "/RELIC2.TXT";
+    const C: &str = "/RELIC3.TXT";
+
+    // 1. `write` (was `uwrite`) — read back through the mount table, byte for byte.
+    let got = say(&|c: &mut Console| fs_write(c, A, b"relics-one"));
+    let ok = read_back(A).as_deref() == Some(b"relics-one".as_slice());
+    verdict("shell.relics.write", ok, &alloc::format!("{} read={:?}", got, read_back(A)));
+
+    // 2. `append` (the native primitive the `u*` family never had) — EOF extend, not overwrite.
+    let got = say(&|c: &mut Console| fs_append(c, A, b"-two"));
+    let ok = read_back(A).as_deref() == Some(b"relics-one-two".as_slice());
+    verdict("shell.relics.append", ok, &alloc::format!("{} read={:?}", got, read_back(A)));
+
+    // 3. `cat` (was `ucat`) — the READ verb's own path, asserted against the same bytes.
+    let lines = witness_capture(|c| vfs_cat(c, A));
+    let ok = lines.iter().any(|l| l.contains("relics-one-two"));
+    verdict("shell.relics.cat", ok, &alloc::format!("{:?}", lines));
+
+    // 4. `touch` (was `utouch`) — and, through `vfs_ls_collect`, `ls` (was `uls`) as well.
+    let got = say(&|c: &mut Console| fs_touch(c, B));
+    verdict("shell.relics.touch", listed("/", "RELIC2.TXT"), &got);
+
+    // 5. `mkdir` (was `umkdir`) — the routing, proven without leaving a directory behind. See the
+    //    doc above for why this leg is shaped as a refusal. `A` exists on the NATIVE root only,
+    //    because leg 1 put it there, so a FAT-direct `mkdir` would create and report success.
+    let got = say(&|c: &mut Console| fs_mkdir(c, A));
+    let native_refusal = got.contains("FileExists");
+    let still_a_file = read_back(A).is_some();
+    verdict(
+        "shell.relics.mkdir",
+        native_refusal && still_a_file,
+        &alloc::format!("said={} native_refusal={} still_a_file={}", got, native_refusal, still_a_file),
+    );
+
+    // 6. `mv` (was `umv`) — the old name gone from the listing AND the new one in it, which a copy
+    //    would fail and a no-op would fail differently.
+    let got = say(&|c: &mut Console| fs_mv(c, B, C, false));
+    let ok = !listed("/", "RELIC2.TXT") && listed("/", "RELIC3.TXT");
+    verdict("shell.relics.mv", ok, &got);
+
+    // 7. `setfattr -x` (was `urmattr`) — plant a typed attribute through the crate, drop it through
+    //    the VERB's helper, and prove it is gone by asking the crate again. Both ends are real.
+    let planted = crate::fs::unafs::with_unafs(|fs| {
+        let id = fs.resolve_path(C).ok()?;
+        fs.set_attribute(id, String::from("relic:tag"),
+                         ::unafs::AttributeValue::String(String::from("keep"))).ok()?;
+        fs.get_attribute(id, "relic:tag").ok().flatten().map(|_| ())
+    }).ok().flatten().is_some();
+    let got = say(&|c: &mut Console| setfattr_x(c, "relic:tag", C));
+    let gone = crate::fs::unafs::with_unafs(|fs| {
+        let id = fs.resolve_path(C).ok()?;
+        fs.get_attribute(id, "relic:tag").ok().flatten()
+    }).ok().flatten().is_none();
+    verdict("shell.relics.setfattr", planted && gone, &alloc::format!(
+        "planted={} gone={} said={}", planted, gone, got));
+
+    // 8. `snap` (was `usnaps` / `usnap` / `usnapdrop` / `usnapls` / `usnapcat`) — ALL FIVE
+    //    subcommands, through the one verb, in one round trip: create, see it in the index, list
+    //    and read AS OF it, then drop it and see it leave the index.
+    //
+    //    The `cat` half is asserted against the LIVE bytes of the same file rather than against the
+    //    absence of an error prefix: every one of `unafs_verb_snapcat`'s returns starts `snap cat:`,
+    //    successes included, so a prefix test would have been a check that cannot fail — and was,
+    //    in this leg's first cut. Snapshot-read == live-read is the property that actually matters
+    //    for a file no one modified between the two.
+    let live = read_back("/K3HELLO.TXT")
+        .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+        .unwrap_or_default();
+    let created = say(&|c: &mut Console| snap_cmd(c, &["create", "relics"]));
+    let index = unafs_verb_snaps().join(" | ");
+    let snap_gen = crate::fs::unafs::with_unafs(|fs| {
+        fs.snapshot_index().ok().and_then(|v| v.iter().find(|s| s.name == "relics").map(|s| s.generation))
+    }).ok().flatten();
+    let (ok, why) = match snap_gen {
+        Some(g) => {
+            let in_index = index.contains("relics");
+            let ls_ok = unafs_verb_snapls(g, "/").iter().any(|l| l.contains("K3HELLO.TXT"));
+            let cat_ok = !live.is_empty() && unafs_verb_snapcat(g, "/K3HELLO.TXT").contains(&live);
+            let _ = say(&|c: &mut Console| snap_cmd(c, &["drop", &alloc::format!("{}", g)]));
+            let dropped = crate::fs::unafs::with_unafs(|fs| {
+                fs.snapshot_index().ok().map(|v| !v.iter().any(|s| s.generation == g))
+            }).ok().flatten().unwrap_or(false);
+            (in_index && ls_ok && cat_ok && dropped,
+             alloc::format!("gen={} index={} ls={} cat={} dropped={}", g, in_index, ls_ok, cat_ok, dropped))
+        }
+        None => (false, alloc::format!("no generation created ({})", created)),
+    };
+    verdict("shell.relics.snap", ok, &why);
+
+    // 9. `rm` (was `urm`) — and the SELF-CLEAN. Both files go; the root must be back to exactly what
+    //    `k3_mount_selftest` bit5 requires, and this leg asserts that rather than assuming it.
+    let got_a = say(&|c: &mut Console| fs_rm(c, A, false));
+    let got_c = say(&|c: &mut Console| fs_rm(c, C, false));
+    let clean = match vfs_ls_collect("/") {
+        Ok((_, rows)) => !rows.iter().any(|d| d.name.starts_with("RELIC")),
+        Err(_) => false,
+    };
+    verdict(
+        "shell.relics.rm",
+        !listed("/", "RELIC1.TXT") && !listed("/", "RELIC3.TXT") && clean,
+        &alloc::format!("{} | {} | root_clean={}", got_a, got_c, clean),
+    );
 }
 
 // ===================== FATVERB — the storage witness, after storage exists =========================
@@ -3754,8 +4160,23 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
 
     match command {
         "date" => {
+            // RELICS (R26 clause 1): `setdate` was ours; `date -s` is the standard, so the SEED is
+            // a flag on the verb that shows the clock and the second word is gone. Everything after
+            // `-s` is the old seed argument list, parsed by the same `parse_wallclock`.
+            if args.first().copied() == Some("-s") {
+                match parse_wallclock(&args[1..]) {
+                    Some(t) if crate::clock::set(t).is_ok() => {
+                        console.println(&alloc::format!(
+                            "clock set: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            t.year, t.month, t.day, t.hour, t.min, t.sec));
+                    }
+                    _ => console.println(
+                        "date: usage: date -s YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
+                }
+                return took_screen;
+            }
             // JD17/CLOCK-3/PI-UI-3: show the kernel wall clock. The UNIFIED civil clock is the source of
-            // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `setdate` seed), so a
+            // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `date -s` seed), so a
             // networked board shows the REAL date with no operator action. Historically `date` read only the
             // JD17 FAT anchor (`now()`), which the SNTP path never plants (it anchors the civil clock via
             // `set_anchor`), so a synced Pi still printed "clock not set" — the bug behind PI-UI-3. Fall back
@@ -3772,28 +4193,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match ymd {
                 Some((y, mo, d, h, mi, s)) => ui3_say(console, "date", &alloc::format!(
                     "{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)),
-                None => ui3_say(console, "date", "date: clock not set (setdate YYYY-MM-DD HH:MM:SS)"),
-            }
-        },
-        "setdate" => {
-            // JD17: seed the wall clock — `setdate YYYY-MM-DD HH:MM:SS` (seconds optional). The
-            // architectural counter extends it forward from this moment; new/rewritten FAT
-            // entries are mtime-stamped from it. Re-seeding replaces the anchor.
-            match parse_setdate(&args) {
-                Some(t) if crate::clock::set(t).is_ok() => {
-                    console.println(&alloc::format!(
-                        "clock set: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        t.year, t.month, t.day, t.hour, t.min, t.sec));
-                }
-                _ => console.println(
-                    "setdate: usage: setdate YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
+                None => ui3_say(console, "date", "date: clock not set (date -s YYYY-MM-DD HH:MM:SS)"),
             }
         },
         "time" => {
             // CLOCK-1: the shared kernel civil clock — ISO-8601 UTC plus the source that set it.
             // UNSET is first-class and honest: `unsynced` until an SNTP sync (pi/genet PI-NET-16) or a
-            // `setdate` seeds it. x86 has no SNTP client yet, so `time` there reads `unsynced` until a
-            // manual `setdate` — the seam is what this arc delivers; x86 SNTP is a future rmbp arc.
+            // `date -s` seeds it. x86 has no SNTP client yet, so `time` there reads `unsynced` until a
+            // manual `date -s` — the seam is what this arc delivers; x86 SNTP is a future rmbp arc.
             let mut buf = [0u8; 24];
             match crate::clock::iso8601_now(&mut buf) {
                 Some(n) => {
@@ -3807,7 +4214,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     // PI-UI-3: mirror to serial (verb output is panel-only on the bench).
                     ui3_say(console, "time", &alloc::format!("{} ({})", iso, src));
                 }
-                None => ui3_say(console, "time", "time: unsynced (no SNTP sync or setdate yet)"),
+                None => ui3_say(console, "time", "time: unsynced (no SNTP sync or date -s yet)"),
             }
         },
         "clear" => {
@@ -3826,14 +4233,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // Test the Exception Handler
             panic!("Manual Panic Requested by Architect!");
         },
-        "usbinfo" => {
+        // RELICS (R26 clause 1): `usbinfo` was ours; `lsusb` is the standard word for exactly
+        // this output — the list of USB devices this bus enumerated.
+        "lsusb" => {
             for line in crate::drivers::xhci::usb_summary() {
                 console.println(&line);
-            }
-        },
-        "fatinfo" => {
-            if let Some(fs) = mount_read_volume(console, "fatinfo") {
-                console.println(&fs.describe());
             }
         },
         "ls" | "dir" => {
@@ -3899,7 +4303,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 // it is deliberately NOT smuggled into this arc, which is plumbing unification.
                 Some(name) if has_glob(name) => cat_globbed(console, name),
                 // VFS-1 (adoption): on aarch64 `cat` resolves through the seam, so it agrees with
-                // `ls`/`run`/`bg`/`vfs` about the namespace (`/` = native, `/fat`, `/usb`). x86 keeps
+                // `ls`/`run`/`bg`/`mount` about the namespace (`/` = native, `/fat`, `/usb`). x86 keeps
                 // the FAT-direct path unchanged: `fs/vfs.rs` gates both backends to aarch64, so that
                 // arch has no mount table to route through and exactly one FAT volume to confuse.
                 #[cfg(target_arch = "aarch64")]
@@ -3985,10 +4389,16 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // Lines, words and bytes of one file; -l/-w/-c select, and they combine.
             fs_wc(console, &args);
         },
+        // RELICS (R26 clause 1): `vfs` folded in here. `mount` with no arguments answers "what is
+        // attached, and how full is it" (with the FAT geometry the retired `fatinfo` printed);
+        // `mount <op>` performs the op over the ONE namespace, which is the surface `vfs` was.
+        // `df` is the same table without the geometry — the capacity question, plainly.
         "df" | "mount" => {
-            // One table for both spellings: capacity, used, free, access, and (where a mount table
-            // exists) the namespace prefixes. `used` is a file-byte tally and the output says so.
-            df_report(console);
+            if verb == "mount" && !args.is_empty() {
+                vfs_cmd(console, &args);
+            } else {
+                df_report(console, command);
+            }
         },
         "env" => {
             // The build's live facts, then the shell variables. No `$VAR` expansion yet (M2).
@@ -4025,221 +4435,38 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(path) => fs_stat(console, path),
             }
         },
-        "xd" => {
-            // JD19: bounded hexdump — `xd <path> [off] [len]` (default off=0, len=256; len capped at
-            // 4096). off/len accept decimal or 0x-hex. off past EOF = honest empty; a directory =
-            // -EISDIR; an honest `[... n more byte(s)]` tail note when the file is larger.
+        // RELICS (R26 clause 1): `xd` was ours; the standard spelling of a bounded file dump is
+        // `hexdump`, and it is what an operator coming from any other system will type.
+        "hexdump" => {
+            // JD19: bounded hexdump — `hexdump <path> [off] [len]` (default off=0, len=256; len
+            // capped at 4096). off/len accept decimal or 0x-hex. off past EOF = honest empty; a
+            // directory = -EISDIR; an honest `[... n more byte(s)]` tail note when the file is larger.
             match args.first() {
-                None => console.println("usage: xd <path> [off] [len]"),
+                None => console.println("usage: hexdump <path> [off] [len]"),
                 Some(path) => {
                     let off = args.get(1).and_then(|s| parse_num(s)).unwrap_or(0) as u32;
                     let len = args.get(2).and_then(|s| parse_num(s)).map(|n| n as usize).unwrap_or(256);
-                    fs_xd(console, path, off, len);
+                    fs_hexdump(console, path, off, len);
                 }
             }
         },
-        #[cfg(target_arch = "aarch64")]
-        "uls" => {
-            // BeFS-K3/K4: list a directory on the native unafs volume (absolute paths,
-            // case-sensitive names — unafs has no shell cwd). `uls` lists the root. Routes through
-            // the single coherent mount (`with_unafs`); a pure read never writes.
-            let path = args.first().copied().unwrap_or("/");
-            let out = crate::fs::unafs::with_unafs(|fs| match fs.resolve_path(path) {
-                Ok(id) => match fs.ls(id) {
-                    Ok(entries) => {
-                        let mut lines = alloc::vec::Vec::new();
-                        for de in &entries {
-                            let size = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
-                            if de.kind == ::unafs::FileKind::Directory {
-                                lines.push(alloc::format!("  <DIR>              {}", de.name));
-                            } else {
-                                lines.push(alloc::format!("  {:>10}  {}", size, de.name));
-                            }
-                        }
-                        lines.push(alloc::format!("  ({} entries)", entries.len()));
-                        lines
-                    }
-                    Err(e) => alloc::vec![alloc::format!("uls: {}: {:?}", path, e)],
-                },
-                Err(e) => alloc::vec![alloc::format!("uls: {}: {:?}", path, e)],
-            });
-            match out {
-                Ok(lines) => for line in &lines { console.println(line); },
-                Err(e) => console.println(&alloc::format!("uls: no unafs volume ({:?})", e)),
+        // RELICS (R26 clause 2): `urmattr` had no plain twin to retire into — nothing else in the
+        // shell removes a typed attribute — so it takes the STANDARD name for the job. Argument
+        // order follows `setfattr(1)`: the flag and its key first, the path last (`urmattr` had it
+        // the other way round, which is one more thing an operator had to remember).
+        // Always-registered (clause 3): the ring decides the answer, the word exists everywhere.
+        "setfattr" => {
+            match (args.first().copied(), args.get(1).copied(), args.get(2).copied()) {
+                (Some("-x"), Some(key), Some(path)) => setfattr_x(console, key, path),
+                _ => console.println("usage: setfattr -x <key> <path>  (drop one typed attribute)"),
             }
         },
-        #[cfg(target_arch = "aarch64")]
-        "ucat" => {
-            // BeFS-K3/K4: print a file off the native unafs volume (bounded like `cat`).
-            match args.first() {
-                None => console.println("usage: ucat <path>"),
-                Some(path) => {
-                    let out = crate::fs::unafs::with_unafs(|fs| match fs.resolve_path(path) {
-                        Ok(id) => match fs.read_inode(id) {
-                            Ok(inode) if inode.kind == ::unafs::FileKind::Directory =>
-                                alloc::vec![alloc::format!("ucat: {}: is a directory (-EISDIR)", path)],
-                            Ok(inode) => {
-                                const CAP: u64 = 8192;
-                                let want = inode.size.min(CAP);
-                                match fs.read_data(id, 0, want) {
-                                    Ok(data) => {
-                                        let text: String = data.iter().filter_map(|&b| match b {
-                                            b'\n' => Some('\n'),
-                                            b'\r' => None,
-                                            0x20..=0x7e => Some(b as char),
-                                            _ => Some('.'),
-                                        }).collect();
-                                        let mut lines: alloc::vec::Vec<String> =
-                                            text.split('\n').map(|s| s.into()).collect();
-                                        if inode.size > want {
-                                            lines.push(alloc::format!(
-                                                "[... {} of {} bytes shown]", want, inode.size));
-                                        }
-                                        lines
-                                    }
-                                    Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
-                                }
-                            }
-                            Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
-                        },
-                        Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
-                    });
-                    match out {
-                        Ok(lines) => for line in &lines { console.println(line); },
-                        Err(e) => console.println(&alloc::format!("ucat: no unafs volume ({:?})", e)),
-                    }
-                }
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "utouch" => {
-            // BeFS-K4: create a 0-length file on the native unafs volume (error if it exists or the
-            // parent is missing). Absolute paths. Write-through + durable via the coherent mount.
-            match args.first().copied() {
-                None => console.println("usage: utouch <path>"),
-                Some(path) => console.println(&unafs_verb_touch(path)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "uwrite" => {
-            // BeFS-K4: create-or-replace a file on the native unafs volume with the given text
-            // (`uwrite <path> <text...>`). Durable write-through.
-            match args.first().copied() {
-                None => console.println("usage: uwrite <path> <text...>"),
-                Some(path) => {
-                    let text = args[1..].join(" ");
-                    console.println(&unafs_verb_write(path, text.as_bytes()));
-                }
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "umkdir" => {
-            // BeFS-K4: create a directory on the native unafs volume (`umkdir <path>`).
-            match args.first().copied() {
-                None => console.println("usage: umkdir <path>"),
-                Some(path) => console.println(&unafs_verb_mkdir(path)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "urm" => {
-            // BeFS-K4: delete a file on the native unafs volume (`urm <path>`). A directory is
-            // refused (the crate's `unlink` returns IsADirectory) — mirrors POSIX `rm` without -r.
-            match args.first().copied() {
-                None => console.println("usage: urm <path>"),
-                Some(path) => console.println(&unafs_verb_rm(path)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "umv" => {
-            // F2: rename or move a file/directory on the native unafs volume (`umv <src> <dst>`).
-            // `<dst>` names the target directly; an existing destination is refused (no implicit
-            // overwrite), as is moving a directory into its own descendant.
-            match (args.first().copied(), args.get(1).copied()) {
-                (Some(src), Some(dst)) => console.println(&unafs_verb_mv(src, dst)),
-                _ => console.println("usage: umv <src> <dst>"),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "urmattr" => {
-            // F2: remove one typed attribute (`urmattr <path> <key>`). Value + every catalog index
-            // entry go in one transaction; a missing key is refused with AttributeNotFound.
-            match (args.first().copied(), args.get(1).copied()) {
-                (Some(path), Some(key)) => console.println(&unafs_verb_rmattr(path, key)),
-                _ => console.println("usage: urmattr <path> <key>"),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnaps" => {
-            // K8b: list retained snapshots (the on-disk snapshot index) on the native unafs volume.
-            let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
-                Ok(snaps) => {
-                    let mut lines = alloc::vec::Vec::new();
-                    if snaps.is_empty() {
-                        lines.push(String::from("  (no retained snapshots)"));
-                    } else {
-                        for s in &snaps {
-                            lines.push(alloc::format!(
-                                "  gen {:>6}  {:<16}  by {:<12}  @{}",
-                                s.generation, s.name, s.creator, s.timestamp
-                            ));
-                        }
-                        lines.push(alloc::format!("  ({} of {} snapshots)", snaps.len(),
-                            ::unafs::SNAPSHOT_CAP));
-                    }
-                    lines
-                }
-                Err(e) => alloc::vec![alloc::format!("usnaps: {:?}", e)],
-            });
-            match out {
-                Ok(lines) => for line in &lines { console.println(line); },
-                Err(e) => console.println(&alloc::format!("usnaps: no unafs volume ({:?})", e)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnap" => {
-            // K8b: retain the current committed tree as a snapshot (`usnap <name>`). The shell runs
-            // at kernel authority, so the creator principal recorded is "kernel" (owner-or-kernel
-            // drop authority then admits any later usnapdrop from this surface).
-            match args.first().copied() {
-                None => console.println("usage: usnap <name>"),
-                Some(name) => console.println(&unafs_verb_snap(name)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnapdrop" => {
-            // K8b: drop a retained snapshot by its generation stamp (`usnapdrop <generation>`).
-            // Reclamation drains eagerly; only blocks no live/retained root still reaches are freed.
-            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: usnapdrop <generation>"),
-                Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnapls" => {
-            // K8c: list a retained snapshot's directory AS OF the snapshot (`usnapls <gen> [path]`).
-            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: usnapls <generation> [path]"),
-                Some(generation) => {
-                    let path = args.get(1).copied().unwrap_or("/");
-                    for line in &unafs_verb_snapls(generation, path) {
-                        console.println(line);
-                    }
-                }
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnapcat" => {
-            // K8c: read a file from a retained snapshot under the LIVE object's CURRENT ACL
-            // (`usnapcat <gen> <path>`). The shell is a kernel-authority surface, so it reads any
-            // LIVE object — but a file DELETED from the live tree fails closed (no current ACL row),
-            // the deleted-object edge of the high-security ruling.
-            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: usnapcat <generation> <path>"),
-                Some(generation) => match args.get(1).copied() {
-                    None => console.println("usage: usnapcat <generation> <path>"),
-                    Some(path) => console.println(&unafs_verb_snapcat(generation, path)),
-                },
-            }
+        // RELICS (R26 clause 2): five spellings (`usnaps` `usnap` `usnapdrop` `usnapls` `usnapcat`)
+        // become ONE verb with subcommands. They were never five commands: they were one noun with
+        // five operations, which is what a subcommand is for, and the `u` prefix said only "the
+        // native volume" — the volume every file verb now reaches by prefix.
+        "snap" => {
+            snap_cmd(console, &args);
         },
         "touch" => {
             // JD6: create a 0-length file if absent (idempotent), in any reachable dir. `touch <path>`.
@@ -4291,20 +4518,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(name) => fs_rmdir(console, name),
             }
         },
-        "vfs" => {
-            // SHELL-WRITE: the unified VFS write surface. Unlike the FAT-direct
-            // verbs above (`write`/`append`/`rm`/`mkdir`, which ride fat.rs on the
-            // boot partition at cwd-relative paths), this routes create / write /
-            // truncate / unlink through the VFS-2 `MountTable` over ONE namespace —
-            // the native UnaFS volume at `/`, the FAT boot partition at `/fat` — so
-            // a panel operator can exercise the per-object native ACL path and the
-            // foreign volume-level path from the same surface. `vfs <op> <path>`.
-            vfs_cmd(console, &args);
-        },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
-            // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
+            // exit status. Rides the SAME `MountTable` the `mount` verb uses (`/fat` = FAT boot partition,
             // `/usb` = USB stick, `/` = native UnaFS), so `run /fat/ELFHELLO.ELF` loads the boot-partition
             // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
@@ -4396,7 +4613,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
-        "diskinfo" => {
+        // RELICS (R26 clause 1): `diskinfo` was ours. Of the two spellings Peter offered, this
+        // output is `fdisk -l` and not `df -h`: every field is DEVICE geometry (vendor, product,
+        // block size, block count, capacity), and not one of them is about how full a filesystem
+        // is, which is what `df` answers and what `df`/`mount` already print. A bare `fdisk` is a
+        // usage line, not a listing — there is no partition EDITOR here, and a verb that silently
+        // did the read-only half of an interactive tool would be teaching the wrong reflex.
+        "fdisk" => {
+            if args.first().copied() != Some("-l") {
+                console.println("usage: fdisk -l  (list block devices; no partition editor here)");
+                return took_screen;
+            }
             // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
             // hosts unafs + the FAT boot partition) AND, when present, the USB stick (its own geometry from
             // `USB_BLOCK_DEVICE`, plus the FAT type/size/label read from the live read-only mount). x86 keeps the
@@ -4435,7 +4662,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                 // FATVERB: the posture is ASKED, not remembered. This line claimed
                                 // "(read-only)" from PIUSB-27, which USB-WRITE F3 retired when it
                                 // routed the `Usb` arm to the verified BOT WRITE(10) path — so
-                                // `diskinfo` had been telling the operator the stick could not be
+                                // `fdisk -l` had been telling the operator the stick could not be
                                 // written for as long as it could. One predicate now answers for the
                                 // VFS, the shell's write gate and this line.
                                 let posture = match fs.write_veto() {
@@ -4470,64 +4697,88 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
-        "read" => {
-            match args.first().and_then(|s| s.parse::<u64>().ok()) {
-                Some(lba) => {
+        // RELICS (R26): THE SHELLBASICS HAZARD, CLOSED. `write` carried a JD5 overload — two args
+        // that both parsed as `<u64 lba> <byte>` meant a RAW BLOCK WRITE rather than a file write,
+        // so `write 12 0` was not a file called `12` containing `0`, it was 512 bytes of zeros over
+        // logical block 12. The two operations now have two verbs, and the raw one is `dd`, which
+        // is what raw block I/O is called everywhere else.
+        //
+        // ARGUMENT SHAPE, and why it is `key=value` and not positional: `dd`'s whole convention is
+        // `if=`/`of=`, and the convention is load-bearing here — a positional `dd 12 0` would be
+        // exactly the ambiguity this arm exists to remove, because nothing in it says which way the
+        // bytes travel. So:
+        //
+        //   dd if=<lba>                  read ONE 512-byte block and dump the first 128 bytes
+        //   dd of=<lba> byte=<0xNN|n>    fill ONE 512-byte block with that byte value
+        //
+        // One block, always: `count=` is deliberately not accepted rather than accepted and capped,
+        // because a shell that takes `count=` from a bench operator and quietly does something else
+        // is worse than one that refuses the word. The retired `read <lba>` spelling is gone with
+        // the same reasoning as the rest of clause 1 — POSIX `read` is a shell builtin that reads a
+        // LINE OF INPUT into a variable, so our `read` was not merely non-standard, it was a
+        // standard word wearing someone else's meaning.
+        "dd" => {
+            let field = |k: &str| -> Option<&str> {
+                args.iter().find_map(|a| a.strip_prefix(k))
+            };
+            let lba_in = field("if=").and_then(|v| parse_num(v));
+            let lba_out = field("of=").and_then(|v| parse_num(v));
+            let byte = field("byte=").and_then(parse_byte);
+            match (lba_in, lba_out, byte) {
+                (Some(lba), None, _) => {
                     let mut buf = [0u8; 512];
                     match crate::drivers::block::read_block(lba, &mut buf) {
                         Ok(_) => {
                             console.println(&alloc::format!("LBA {}:", lba));
                             hexdump(console, &buf[0..128]);
                         }
-                        Err(e) => console.println(&alloc::format!("read error: {:?}", e)),
+                        Err(e) => console.println(&alloc::format!("dd: read error: {:?}", e)),
                     }
                 }
-                None => console.println("usage: read <lba>"),
+                (None, Some(lba), Some(b)) => {
+                    let buf = [b; 512];
+                    match crate::drivers::block::write_block(lba, &buf) {
+                        Ok(()) => console.println(&alloc::format!(
+                            "dd: wrote LBA {} (0x{:02x} x512)", lba, b)),
+                        Err(e) => console.println(&alloc::format!("dd: write error: {:?}", e)),
+                    }
+                }
+                (None, Some(_), None) => console.println("dd: of= needs byte=<0xNN>  (no source given)"),
+                (Some(_), Some(_), _) => console.println("dd: if= and of= together are not supported"),
+                _ => console.println("usage: dd if=<lba> | dd of=<lba> byte=<0xNN>  (ONE 512-byte block)"),
             }
         },
         "write" => {
-            // JD5 overload: `write <lba> <byte>` (raw block write) IFF exactly two args parse as a
-            // <u64 lba> <byte 0..=255> pair — byte-identical to the pre-JD5 behaviour. Any other
-            // shape is a FILE write `write <path> <text...>` (create-or-truncate; text = the rest of
-            // the line, whitespace-collapsed like `echo`). A numeric filename can still be reached as
-            // `/NAME` (an absolute path never parses as an LBA).
-            let raw = if args.len() == 2 {
-                match (args[0].parse::<u64>().ok(), parse_byte(args[1])) {
-                    (Some(lba), Some(b)) => Some((lba, b)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            match raw {
-                Some((lba, b)) => {
-                    let buf = [b; 512];
-                    match crate::drivers::block::write_block(lba, &buf) {
-                        Ok(()) => console.println(&alloc::format!("wrote LBA {} (0x{:02x} x512)", lba, b)),
-                        Err(e) => console.println(&alloc::format!("write error: {:?}", e)),
-                    }
-                }
-                None if args.is_empty() =>
-                    console.println("usage: write <path> <text>  |  write <lba> <byte>"),
-                None => fs_write(console, args[0], args[1..].join(" ").as_bytes()),
+            // RELICS (R26): a FILE write, and only ever a file write. `write <path> <text...>`
+            // (create-or-truncate; text = the rest of the line, whitespace-collapsed like `echo`).
+            // The raw-block overload that used to live here is `dd` — see that arm.
+            match args.first() {
+                None => console.println("usage: write <path> <text>"),
+                Some(name) => fs_write(console, name, args[1..].join(" ").as_bytes()),
             }
         },
-        "netinfo" => {
+        // RELICS (R26 clause 1): `netinfo` was ours, and of the two standard spellings Peter
+        // offered this is `ifconfig`, not `ip`. The reason is the OUTPUT: every line describes ONE
+        // interface's state — its MAC, whether the link is up, and this NIC's frame/IRQ counters —
+        // which is `ifconfig`'s shape exactly. `ip` prints ADDRESS OBJECTS over a set of links
+        // (`ip addr`, `ip route`, `ip link`), and this shell has neither a link set nor a routing
+        // table to print, so `ip` would be a name promising a subcommand tree that does not exist.
+        "ifconfig" => {
             // PI-UI-3: the Pi (GENET) has no e1000, so the x86 path below reports "no device" there. Give
             // the Pi shell an equivalent that reads the GENET interface snapshot — MAC / IP / gateway /
             // lease state — plus the civil-clock sync state, matching the x86 verb's line shape.
             #[cfg(all(target_arch = "aarch64", not(feature = "genet")))]
-            ui3_say(console, "netinfo", "No network device ready.");
+            ui3_say(console, "ifconfig", "No network device ready.");
             #[cfg(all(target_arch = "aarch64", feature = "genet"))]
             {
                 match crate::arch::aarch64::genet::netinfo() {
                     Some(n) => {
-                        ui3_say(console, "netinfo", &alloc::format!(
+                        ui3_say(console, "ifconfig", &alloc::format!(
                             "NIC: MAC {}  link {}",
                             crate::drivers::e1000::fmt_mac(&n.mac),
                             if n.link_up { "UP" } else { "DOWN" }
                         ));
-                        ui3_say(console, "netinfo", &alloc::format!(
+                        ui3_say(console, "ifconfig", &alloc::format!(
                             "IP {}.{}.{}.{} ({})  GW {}.{}.{}.{}",
                             n.ip[0], n.ip[1], n.ip[2], n.ip[3],
                             if n.leased { "dhcp" } else { "static" },
@@ -4548,9 +4799,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                             }
                             None => alloc::format!("unsynced"),
                         };
-                        ui3_say(console, "netinfo", &alloc::format!("time: {}", sync));
+                        ui3_say(console, "ifconfig", &alloc::format!("time: {}", sync));
                     }
-                    None => ui3_say(console, "netinfo", "No network device ready."),
+                    None => ui3_say(console, "ifconfig", "No network device ready."),
                 }
             }
             #[cfg(not(target_arch = "aarch64"))]
@@ -4627,9 +4878,41 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: arp <a.b.c.d>"),
             }
         },
-        "connect" => {
-            let ip = args.first().and_then(|s| parse_ipv4(s));
-            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
+        // RELICS (R26 clause 1): `connect` and `udpsend` were TWO verbs for one job — open a
+        // socket to a host:port and exchange a message — differing only in the transport, which is
+        // exactly what `nc`'s `-u` flag selects. So they are one `nc`, and the semantics do match:
+        // `nc <ip> <port> [message]` connects, sends, reads, closes; `nc -u` sends one datagram and
+        // waits briefly for a reply. What `nc` does elsewhere and does NOT do here is stream stdin
+        // — there is no pipeline in this shell to stream from — so the message is an argument, and
+        // the usage line says so rather than implying a stdin that would hang.
+        "nc" => {
+            let udp = args.first().copied() == Some("-u");
+            let rest: &[&str] = if udp { &args[1..] } else { &args[..] };
+            let ip = rest.first().and_then(|s| parse_ipv4(s));
+            let port = rest.get(1).and_then(|s| s.parse::<u16>().ok());
+            if udp {
+                match (ip, port) {
+                    (Some(ip), Some(port)) => {
+                        let msg = if rest.len() > 2 { rest[2..].join(" ") } else { String::from("unaos-udp") };
+                        console.println(&alloc::format!(
+                            "UDP {}.{}.{}.{}:{} <- {:?}", ip[0], ip[1], ip[2], ip[3], port, msg));
+                        match crate::drivers::e1000::udp_send(ip, port, msg.as_bytes()) {
+                            Some(o) if o.sent => {
+                                if o.replied {
+                                    console.println(&alloc::format!("reply: {} bytes", o.rx_len));
+                                } else {
+                                    console.println("sent; no reply (UDP is best-effort)");
+                                }
+                            }
+                            Some(_) => console.println("host unreachable (no ARP reply)"),
+                            None => console.println("No network device ready."),
+                        }
+                    }
+                    _ => console.println("usage: nc -u <a.b.c.d> <port> [message]"),
+                }
+                return took_screen;
+            }
+            let args = rest;
             match (ip, port) {
                 (Some(ip), Some(port)) => {
                     // Optional message; if omitted, just open and immediately close.
@@ -4647,39 +4930,34 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                _ => console.println("usage: connect <a.b.c.d> <port> [message]"),
+                _ => console.println("usage: nc [-u] <a.b.c.d> <port> [message]"),
             }
         },
-        "udpsend" => {
-            let ip = args.first().and_then(|s| parse_ipv4(s));
-            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
-            match (ip, port) {
-                (Some(ip), Some(port)) => {
-                    let msg = if args.len() > 2 { args[2..].join(" ") } else { String::from("unaos-udp") };
-                    console.println(&alloc::format!(
-                        "UDP {}.{}.{}.{}:{} <- {:?}", ip[0], ip[1], ip[2], ip[3], port, msg));
-                    match crate::drivers::e1000::udp_send(ip, port, msg.as_bytes()) {
-                        Some(o) if o.sent => {
-                            if o.replied {
-                                console.println(&alloc::format!("reply: {} bytes", o.rx_len));
-                            } else {
-                                console.println("sent; no reply (UDP is best-effort)");
-                            }
-                        }
-                        Some(_) => console.println("host unreachable (no ARP reply)"),
-                        None => console.println("No network device ready."),
-                    }
-                }
-                _ => console.println("usage: udpsend <a.b.c.d> <port> [message]"),
-            }
-        },
-        "get" => {
+        // RELICS (R26 clause 1): `get` was ours; an HTTP/1.0 GET over a socket, printed to the
+        // terminal, is `curl` everywhere else. The semantics match the standard verb's DEFAULT
+        // behaviour exactly (fetch and print; no follow, no upload), so the name is honest. The
+        // argument becomes a URL rather than three positionals for the same reason `dd` takes
+        // `if=`: the URL IS the standard's argument, and `curl 10.0.2.2 8000 /x` would be a verb
+        // wearing a standard name over a private argument grammar.
+        "curl" => {
             // Minimal HTTP/1.0 GET over the streaming TCP client: connect, send the request,
             // read the whole response until the server closes, and print it.
-            match args.first().and_then(|s| parse_ipv4(s)) {
-                Some(ip) => {
-                    let port = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(80);
-                    let path = if args.len() > 2 { String::from(args[2]) } else { String::from("/") };
+            let url = args.first().copied().unwrap_or("");
+            let url = url.strip_prefix("http://").unwrap_or(url);
+            let (hostport, path) = match url.find('/') {
+                Some(i) => (&url[..i], String::from(&url[i..])),
+                None => (url, String::from("/")),
+            };
+            let (host, port_str) = match hostport.rfind(':') {
+                Some(i) => (&hostport[..i], Some(&hostport[i + 1..])),
+                None => (hostport, None),
+            };
+            let port = match port_str {
+                Some(v) => match v.parse::<u16>().ok() { Some(n) => Some(n), None => None },
+                None => Some(80),
+            };
+            match (parse_ipv4(host), port) {
+                (Some(ip), Some(port)) => {
                     let req = alloc::format!(
                         "GET {} HTTP/1.0\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n",
                         path, ip[0], ip[1], ip[2], ip[3]);
@@ -4705,7 +4983,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                None => console.println("usage: get <a.b.c.d> [port] [path]"),
+                _ => console.println("usage: curl [http://]<a.b.c.d>[:port][/path]  (HTTP/1.0 GET)"),
             }
         },
         // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
@@ -4768,7 +5046,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);
         },
-        "sched" | "ps" => {
+        // RELICS (R26 clause 1): `sched` retired. `ps` was already an alias for it, and Peter's
+        // ruling is that the standard word is THE name — so the alias became the verb and the
+        // house spelling is gone. (The scheduler MODULE is still `arch::sched`; a subsystem name
+        // is not a verb name, and clause 1 is about what the operator types.)
+        "ps" => {
             // SCHEDPAR: one table body for both arches. `current_task_id`/`run_queue_len` are
             // signature-matched twins (the aarch64 pair authored by the orin seat, folded under
             // the 2026-08-27 cross-lane grant); only the core census and the demo line stay
@@ -4887,7 +5169,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(not(all(target_arch = "x86_64", feature = "smc")))]
             console.println("batmon: SMC battery monitor is x86 UNAOS_SMC=1 only");
         },
-        "bootlog" => {
+        // RELICS (R26 clause 1): the verb is `dmesg`. What it prints IS the kernel's boot message
+        // ring, which is dmesg's subject on every other system. The RING itself stays
+        // `crate::bootlog` and so does the `UNAOS_BOOTLOG` knob: a module and an env knob are not
+        // words an operator types at a prompt, and clause 1 is about the verb table.
+        "dmesg" => {
             // GUI-WITNESS M2b: print the boot-milestone ring with timestamps — the operator's eyes at
             // the bench. On a GUI (non-usbdebug) build serial is silent and fbcon detached at the GUI
             // handoff, so this verb is the ONLY witness surface for whether PORTSW flipped, the FTDI
@@ -4897,9 +5183,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let mut buf = [(0u64, ""); 32]; // matches bootlog::capacity()
             let n = crate::bootlog::snapshot(&mut buf);
             if n == 0 {
-                console.println("bootlog: no boot milestones recorded");
+                console.println("dmesg: no boot milestones recorded");
             } else {
-                console.println(&alloc::format!("bootlog: {} milestone(s) (oldest first):", n));
+                console.println(&alloc::format!("dmesg: {} milestone(s) (oldest first):", n));
                 for (ms, tag) in &buf[..n] {
                     console.println(&alloc::format!("  [{:>8} ms] {}", ms, tag));
                 }
@@ -5199,7 +5485,7 @@ fn parse_byte(s: &str) -> Option<u8> {
     }
 }
 
-/// JD19: parse a `u64` offset/length accepting decimal or `0x`-hex (the `xd` off/len args).
+/// JD19: parse a `u64` offset/length accepting decimal or `0x`-hex (the `hexdump` off/len args).
 fn parse_num(s: &str) -> Option<u64> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
@@ -5208,14 +5494,14 @@ fn parse_num(s: &str) -> Option<u64> {
     }
 }
 
-// --- SHELL-WRITE: unified VFS write surface (`vfs <op> <path> [text]`) ---------
+// --- SHELL-WRITE: the one namespace's write surface (`mount <op> <path> [text]`) ---------
 //
 // The FIRST consumer of the VFS-2 write surface. Each invocation builds the
 // process namespace fresh (stateless, like the FAT verbs — a swapped card is
 // picked up on the next command) and drives the `MountTable` create / write /
 // truncate / unlink verbs. The shell is the trusted operator console, so it
 // writes as the kernel-authority principal (`KERNEL_PRINCIPAL`) — the same
-// posture the `u*` native verbs record. Namespace: native UnaFS at `/`, the FAT
+// posture the retired `u*` native verbs recorded. Namespace: native UnaFS at `/`, the FAT
 // boot partition at `/fat`, and the hot-plugged USB FAT stick at `/usb` when
 // present (VFS-3, read-only). Both real backends are aarch64-only (the x86 build
 // has neither the unafs module nor a `VfsBackend for FatBackend` impl), so the
@@ -5233,13 +5519,13 @@ fn parse_num(s: &str) -> Option<u64> {
 /// `-ENOENT`, never a panic. The USB volume is read through the xHCI `Usb` source
 /// and is **writable** since USB-WRITE F3, which routed the `Usb` arm to the
 /// verified BOT WRITE(10) path and retired PIUSB-27's blanket refusal. Whether a
-/// `vfs write|append|rm|mkdir` at `/usb` is admitted is decided by exactly one
+/// `mount write|append|rm|mkdir` at `/usb` is admitted is decided by exactly one
 /// predicate — `fat::BlockSource::write_veto`, which `FatBackend::read_only`
 /// forwards to — so this note cannot drift from the code again the way its
 /// PIUSB-27 predecessor did. Rebuilt per invocation, so a stick
-/// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
+/// hot-plugged (or ejected) between commands is picked up on the next `mount`.
 /// EXEC-1: `run <path>` — load an ELF64 (or flat) user program off the VFS namespace and execute it in user mode,
-/// reporting its exit status. Reads the whole file through the same `MountTable` the `vfs` verb uses,
+/// reporting its exit status. Reads the whole file through the same `MountTable` the `mount` verb uses,
 /// bounds it to the kernel's 16 KiB user window (an oversize file is rejected with a clear message — never
 /// silently truncated), pre-checks the ELF64 magic + aarch64 machine for an early operator-friendly reason,
 /// then hands the bytes to the kernel loader `run_user_image`, which maps them into a fresh per-task slot
@@ -5290,7 +5576,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     // VFS-1 (adoption): through the seam, so `run`/`bg` resolve a relative name against the cwd like
     // every other verb (they used the raw argument before) and report an unbound volume as the
     // VOLUME being absent rather than as a bare -ENOENT off the native root — the VFS-4 guard the
-    // mutating `vfs` verb has had since the P44 misdirection, now shared instead of re-derived.
+    // mutating `mount` verb has had since the P44 misdirection, now shared instead of re-derived.
     let path = &vfs_path(path)[..];
     let mt = vfs_mount_table();
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
@@ -6032,7 +6318,7 @@ const EXEC_ROOT: &str = "/fat";
 /// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
 ///
 /// **Through the VFS seam, not a private path scheme.** [`vfs_path`] is what `ls`, `cat`, `run`,
-/// `bg` and `vfs` resolve through, so a bare name means exactly what those verbs say it means —
+/// `bg` and `mount` resolve through, so a bare name means exactly what those verbs say it means —
 /// `cd /fat` then `vug` works for the same reason `cd /fat` then `cat VUG.ELF` works, and a name
 /// that `ls` cannot show is a name this cannot launch.
 ///
@@ -6266,13 +6552,14 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
 }
 
 /// VFS-1 (adoption): **the seam** — the ONE place a shell verb turns an operator-typed argument into
-/// an absolute VFS path. Every routed verb (`ls`, `cat`, `run`, `bg`, `vfs`) calls this and nothing
+/// an absolute VFS path. Every routed verb (`ls`, `cat`, `run`, `bg`, `mount`, and since RELICS the
+/// plain mutating verbs) calls this and nothing
 /// else; which volume the path lands on is then decided solely by `MountTable::resolve`'s
 /// longest-prefix rule, never by the verb.
 ///
 /// It is `normalize_path` against the cwd — purely lexical, so `.` collapses and `..` pops before any
 /// backend is consulted, and a relative `VUG.ELF` means what `pwd` says it means. That last part is a
-/// FIX, not just a move: `run`, `bg` and `vfs` used their argument VERBATIM, so after a `cd` they
+/// FIX, not just a move: `run`, `bg` and `mount` used their argument VERBATIM, so after a `cd` they
 /// silently resolved against the root while every other verb honoured the cwd. One seam means one
 /// answer to "what does this path name", which is the point of the layer.
 #[cfg(target_arch = "aarch64")]
@@ -6318,11 +6605,11 @@ fn vfs_say(console: &mut Console, line: &str) {
     serial_println!(":: vfsw: {} ::", line);
 }
 
-/// VFS-4: the namespace prefixes the shell's `vfs` verb reserves for DISTINCT
+/// VFS-4: the namespace prefixes the shell's `mount` verb reserves for DISTINCT
 /// backing volumes that may be absent. A mutating verb aimed at one of these when
 /// it is NOT currently mounted must report "volume not mounted" — never fall
 /// through to the native root, which mis-reports a bare `-ENOENT`. On the P44
-/// sitting a `vfs write /usb/…` with the stick's FAT unreadable (its READ(10)
+/// sitting a `mount write /usb/…` with the stick's FAT unreadable (its READ(10)
 /// LBA0 returned all-zeros with a passing CSW, so `mount_source(Usb)` honestly
 /// found no FAT and `/usb` never bound) fell through to native-root create,
 /// which failed resolving the parent `/usb` as a native path and said
@@ -6351,15 +6638,20 @@ fn unmounted_reserved_volume(mounted: &[&str], path: &str) -> Option<&'static st
     None
 }
 
-/// SHELL-WRITE dispatcher: `vfs <write|append|rm|mkdir> <path> [text ...]`.
+/// SHELL-WRITE dispatcher, RELICS (R26 clause 1): `mount <write|append|rm|mkdir> <path> [text ...]`.
+///
+/// The verb used to be `vfs`, which named an implementation (the kernel's virtual filesystem
+/// layer) rather than anything an operator has a word for. `mount` is the standard word for the
+/// question this surface answers — where a volume is attached and what its prefix is — and Peter's
+/// ruling folded the two spellings into it, so a bare `mount` is the table and `mount <op>` acts.
 #[cfg(target_arch = "aarch64")]
 fn vfs_cmd(console: &mut Console, args: &[&str]) {
     use crate::fs::vfs::{NodeKind, VfsError, KERNEL_PRINCIPAL};
     let op = match args.first() {
         Some(&o) => o,
         None => {
-            console.println("usage: vfs <write|append|rm|mkdir> <path> [text ...]");
-            // FATVERB: not "(read-only)" — USB-WRITE F3 made the stick writable; see `diskinfo`.
+            console.println("usage: mount <write|append|rm|mkdir> <path> [text ...]");
+            // FATVERB: not "(read-only)" — USB-WRITE F3 made the stick writable; see `fdisk -l`.
             console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick");
             return;
         }
@@ -6368,7 +6660,7 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
     let path = match args.get(1) {
         Some(&p) => vfs_path(p),
         None => {
-            console.println(&alloc::format!("usage: vfs {} <path> [text ...]", op));
+            console.println(&alloc::format!("usage: mount {} <path> [text ...]", op));
             return;
         }
     };
@@ -6381,7 +6673,7 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
     // uniformly, before dispatch.
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
         vfs_say(console, &alloc::format!(
-            "vfs {}: {}: volume {} not mounted (-ENODEV)", op, path, vol));
+            "mount {}: {}: volume {} not mounted (-ENODEV)", op, path, vol));
         return;
     }
     let principal = KERNEL_PRINCIPAL;
@@ -6394,7 +6686,7 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
             // both backends. A directory target is refused up front.
             if let Ok(st) = mt.stat(path) {
                 if matches!(st.kind, NodeKind::Dir) {
-                    vfs_say(console, &alloc::format!("vfs write: {}: is a directory (-EISDIR)", path));
+                    vfs_say(console, &alloc::format!("mount write: {}: is a directory (-EISDIR)", path));
                     return;
                 }
             }
@@ -6402,30 +6694,30 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
             data.push(b'\n');
             let _ = mt.unlink(path, principal); // drop the old file if present
             if let Err(e) = mt.create(path, NodeKind::File, principal) {
-                vfs_say(console, &alloc::format!("vfs write: {}: {}", path, vfs_err(e)));
+                vfs_say(console, &alloc::format!("mount write: {}: {}", path, vfs_err(e)));
                 return;
             }
             match mt.write(path, 0, &data, principal) {
-                Ok(n) => vfs_say(console, &alloc::format!("vfs write: {}: wrote {} bytes", path, n)),
-                Err(e) => vfs_say(console, &alloc::format!("vfs write: {}: {}", path, vfs_err(e))),
+                Ok(n) => vfs_say(console, &alloc::format!("mount write: {}: wrote {} bytes", path, n)),
+                Err(e) => vfs_say(console, &alloc::format!("mount write: {}: {}", path, vfs_err(e))),
             }
         }
         "append" => {
             let offset = match mt.stat(path) {
                 Ok(st) if matches!(st.kind, NodeKind::Dir) => {
-                    vfs_say(console, &alloc::format!("vfs append: {}: is a directory (-EISDIR)", path));
+                    vfs_say(console, &alloc::format!("mount append: {}: is a directory (-EISDIR)", path));
                     return;
                 }
                 Ok(st) => st.size, // append at the current EOF
                 Err(VfsError::NoSuchPath) => {
                     if let Err(e) = mt.create(path, NodeKind::File, principal) {
-                        vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e)));
+                        vfs_say(console, &alloc::format!("mount append: {}: {}", path, vfs_err(e)));
                         return;
                     }
                     0
                 }
                 Err(e) => {
-                    vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e)));
+                    vfs_say(console, &alloc::format!("mount append: {}: {}", path, vfs_err(e)));
                     return;
                 }
             };
@@ -6433,22 +6725,22 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
             data.push(b'\n');
             match mt.write(path, offset, &data, principal) {
                 Ok(n) => vfs_say(console, &alloc::format!(
-                    "vfs append: {}: wrote {} bytes at offset {}", path, n, offset)),
-                Err(e) => vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e))),
+                    "mount append: {}: wrote {} bytes at offset {}", path, n, offset)),
+                Err(e) => vfs_say(console, &alloc::format!("mount append: {}: {}", path, vfs_err(e))),
             }
         }
         "rm" => match mt.unlink(path, principal) {
-            Ok(()) => vfs_say(console, &alloc::format!("vfs rm: {}: removed", path)),
-            Err(e) => vfs_say(console, &alloc::format!("vfs rm: {}: {}", path, vfs_err(e))),
+            Ok(()) => vfs_say(console, &alloc::format!("mount rm: {}: removed", path)),
+            Err(e) => vfs_say(console, &alloc::format!("mount rm: {}: {}", path, vfs_err(e))),
         },
         "mkdir" => match mt.create(path, NodeKind::Dir, principal) {
-            Ok(_) => vfs_say(console, &alloc::format!("vfs mkdir: {}: created", path)),
+            Ok(_) => vfs_say(console, &alloc::format!("mount mkdir: {}: created", path)),
             Err(VfsError::Backend("exists")) =>
-                vfs_say(console, &alloc::format!("vfs mkdir: {}: already exists (-EEXIST)", path)),
-            Err(e) => vfs_say(console, &alloc::format!("vfs mkdir: {}: {}", path, vfs_err(e))),
+                vfs_say(console, &alloc::format!("mount mkdir: {}: already exists (-EEXIST)", path)),
+            Err(e) => vfs_say(console, &alloc::format!("mount mkdir: {}: {}", path, vfs_err(e))),
         },
         other => console.println(&alloc::format!(
-            "vfs: unknown op '{}' (write|append|rm|mkdir)", other)),
+            "mount: unknown op '{}' (write|append|rm|mkdir)", other)),
     }
 }
 
@@ -6456,7 +6748,81 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
 /// impl), so the unified write surface is aarch64-only. Honest refusal on x86.
 #[cfg(not(target_arch = "aarch64"))]
 fn vfs_cmd(console: &mut Console, _args: &[&str]) {
-    console.println("vfs: unified VFS write surface is aarch64-only (no writable backend on this arch)");
+    console.println("mount: the namespace write surface is aarch64-only (no writable backend on this arch)");
+}
+
+// --- RELICS (R26 clause 2): the two survivors of the `u*` family --------------
+//
+// `setfattr` and `snap` are the only members with no plain file verb to retire into: nothing else
+// in the shell drops a typed attribute, and nothing else retains a tree. Both take the STANDARD
+// spelling for the job rather than a `u`-prefixed one, and both are registered on EVERY build
+// (R26 clause 3) — the ring arm below says what THIS platform can do, which is what a platform is
+// allowed to decide. The x86 twins are honest refusals, the shape `vfs_cmd` already used.
+
+/// `setfattr -x <key> <path>` — drop one typed attribute from a native-volume object.
+#[cfg(target_arch = "aarch64")]
+fn setfattr_x(console: &mut Console, key: &str, path: &str) {
+    console.println(&unafs_verb_rmattr(path, key));
+}
+
+/// x86 has no native-volume backend (`fs/unafs.rs` is aarch64 source), so there are no typed
+/// attributes to drop. Refuse by name rather than pretending the word does not exist.
+#[cfg(not(target_arch = "aarch64"))]
+fn setfattr_x(console: &mut Console, _key: &str, _path: &str) {
+    console.println("setfattr: no native volume on this build (typed attributes are a UnaFS feature)");
+}
+
+/// `snap list|create|drop|ls|cat` — the retained-root family, one verb.
+///
+/// Subcommand shapes, and why each is what it is: `list` takes nothing (it is the index); `create
+/// <name>` names the new retained root; `drop <gen>` takes the GENERATION stamp `list` prints, not
+/// the name, because names are not unique and a generation is; `ls <gen> [path]` and `cat <gen>
+/// <path>` read AS OF a snapshot and enforce the LIVE object's current ACL (the K8c ruling — a file
+/// deleted from the live tree has no current ACL row and therefore fails closed).
+#[cfg(target_arch = "aarch64")]
+fn snap_cmd(console: &mut Console, args: &[&str]) {
+    let usage = "usage: snap list | snap create <name> | snap drop <gen> | snap ls <gen> [path] | snap cat <gen> <path>";
+    match args.first().copied() {
+        None | Some("list") => {
+            for line in &unafs_verb_snaps() {
+                console.println(line);
+            }
+        }
+        Some("create") => match args.get(1).copied() {
+            None => console.println("usage: snap create <name>"),
+            Some(name) => console.println(&unafs_verb_snap(name)),
+        },
+        Some("drop") => match args.get(1).copied().and_then(|s| s.parse::<u64>().ok()) {
+            None => console.println("usage: snap drop <generation>"),
+            Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
+        },
+        Some("ls") => match args.get(1).copied().and_then(|s| s.parse::<u64>().ok()) {
+            None => console.println("usage: snap ls <generation> [path]"),
+            Some(generation) => {
+                let path = args.get(2).copied().unwrap_or("/");
+                for line in &unafs_verb_snapls(generation, path) {
+                    console.println(line);
+                }
+            }
+        },
+        Some("cat") => match (
+            args.get(1).copied().and_then(|s| s.parse::<u64>().ok()),
+            args.get(2).copied(),
+        ) {
+            (Some(generation), Some(path)) => console.println(&unafs_verb_snapcat(generation, path)),
+            _ => console.println("usage: snap cat <generation> <path>"),
+        },
+        Some(other) => {
+            console.println(&alloc::format!("snap: unknown subcommand '{}'", other));
+            console.println(usage);
+        }
+    }
+}
+
+/// x86 has no native volume, so there is nothing to retain. Honest refusal, by name.
+#[cfg(not(target_arch = "aarch64"))]
+fn snap_cmd(console: &mut Console, _args: &[&str]) {
+    console.println("snap: no native volume on this build (retained roots are a UnaFS feature)");
 }
 
 // --- BeFS-K4 native unafs write verbs -----------------------------------------
@@ -6483,12 +6849,12 @@ fn unafs_split(path: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// `utouch <path>`: create a 0-length file (error if it exists / parent missing).
+/// `touch <path>` on the native volume: create a 0-length file (error if it exists / parent missing).
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_touch(path: &str) -> String {
     let (parent, leaf) = match unafs_split(path) {
         Some(pl) => pl,
-        None => return alloc::format!("utouch: {}: invalid path", path),
+        None => return alloc::format!("touch: {}: invalid path", path),
     };
     match crate::fs::unafs::with_unafs(|fs| {
         let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
@@ -6496,18 +6862,18 @@ fn unafs_verb_touch(path: &str) -> String {
             .map(|_| ())
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("utouch: created {}", path),
-        Ok(Err(msg)) => alloc::format!("utouch: {}: {}", path, msg),
-        Err(e) => alloc::format!("utouch: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("touch: created {}", path),
+        Ok(Err(msg)) => alloc::format!("touch: {}: {}", path, msg),
+        Err(e) => alloc::format!("touch: no unafs volume ({:?})", e),
     }
 }
 
-/// `uwrite <path> <text>`: create-or-replace a file with `bytes` (durable).
+/// `write <path> <text>`: create-or-replace a file with `bytes` (durable).
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_write(path: &str, bytes: &[u8]) -> String {
     let (parent, leaf) = match unafs_split(path) {
         Some(pl) => pl,
-        None => return alloc::format!("uwrite: {}: invalid path", path),
+        None => return alloc::format!("write: {}: invalid path", path),
     };
     let n = bytes.len();
     match crate::fs::unafs::with_unafs(|fs| {
@@ -6521,18 +6887,64 @@ fn unafs_verb_write(path: &str, bytes: &[u8]) -> String {
         fs.write_data(id, 0, bytes)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("uwrite: wrote {} bytes to {}", n, path),
-        Ok(Err(msg)) => alloc::format!("uwrite: {}: {}", path, msg),
-        Err(e) => alloc::format!("uwrite: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("write: wrote {} bytes to {}", n, path),
+        Ok(Err(msg)) => alloc::format!("write: {}: {}", path, msg),
+        Err(e) => alloc::format!("write: no unafs volume ({:?})", e),
     }
 }
 
-/// `umkdir <path>`: create a directory.
+/// RELICS (R26 clause 2) `append <path> <text>` on the native volume.
+///
+/// The `u*` family had no append, so this is new code rather than a re-pointed helper — and it is
+/// the honest implementation rather than a fast one. UnaFS's `write_data` takes an offset, so the
+/// EOF extend itself is one call; what this cannot do is find EOF without asking, so it stats the
+/// inode first. The bound is deliberate and matches `cat`'s: a file at or over the 8 KiB ceiling is
+/// REFUSED rather than appended blind, because the alternative (append at a size we did not read)
+/// would be correct only as long as nothing else ever writes the volume.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_append(path: &str, bytes: &[u8]) -> String {
+    const CAP: u64 = 8192;
+    let n = bytes.len();
+    match crate::fs::unafs::with_unafs(|fs| {
+        // Absent -> create empty, then append at 0. Present -> append at its size.
+        let offset = match fs.resolve_path(path) {
+            Ok(id) => {
+                let inode = fs.read_inode(id).map_err(|e| alloc::format!("{:?}", e))?;
+                if inode.kind == ::unafs::FileKind::Directory {
+                    return Err(String::from("is a directory (-EISDIR)"));
+                }
+                if inode.size > CAP {
+                    return Err(alloc::format!(
+                        "{} bytes exceeds the {}-byte append ceiling (-E2BIG)", inode.size, CAP));
+                }
+                (id, inode.size)
+            }
+            Err(_) => {
+                let (parent, leaf) = match unafs_split(path) {
+                    Some(pl) => pl,
+                    None => return Err(String::from("invalid path")),
+                };
+                let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
+                let id = fs.create_file(pid, leaf.into()).map_err(|e| alloc::format!("{:?}", e))?;
+                (id, 0u64)
+            }
+        };
+        let (id, at) = offset;
+        fs.write_data(id, at, bytes).map_err(|e| alloc::format!("{:?}", e))?;
+        Ok(at)
+    }) {
+        Ok(Ok(at)) => alloc::format!("append: wrote {} bytes to {} at offset {}", n, path, at),
+        Ok(Err(msg)) => alloc::format!("append: {}: {}", path, msg),
+        Err(e) => alloc::format!("append: no unafs volume ({:?})", e),
+    }
+}
+
+/// `mkdir <path>` on the native volume: create a directory.
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_mkdir(path: &str) -> String {
     let (parent, leaf) = match unafs_split(path) {
         Some(pl) => pl,
-        None => return alloc::format!("umkdir: {}: invalid path", path),
+        None => return alloc::format!("mkdir: {}: invalid path", path),
     };
     match crate::fs::unafs::with_unafs(|fs| {
         let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
@@ -6540,18 +6952,18 @@ fn unafs_verb_mkdir(path: &str) -> String {
             .map(|_| ())
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("umkdir: created {}/", path),
-        Ok(Err(msg)) => alloc::format!("umkdir: {}: {}", path, msg),
-        Err(e) => alloc::format!("umkdir: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("mkdir: created {}/", path),
+        Ok(Err(msg)) => alloc::format!("mkdir: {}: {}", path, msg),
+        Err(e) => alloc::format!("mkdir: no unafs volume ({:?})", e),
     }
 }
 
-/// `urm <path>`: delete a file (a directory is refused with IsADirectory).
+/// `rm <path>` on the native volume: delete a file (a directory is refused with IsADirectory).
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_rm(path: &str) -> String {
     let (parent, leaf) = match unafs_split(path) {
         Some(pl) => pl,
-        None => return alloc::format!("urm: {}: invalid path", path),
+        None => return alloc::format!("rm: {}: invalid path", path),
     };
     match crate::fs::unafs::with_unafs(|fs| {
         let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
@@ -6559,9 +6971,9 @@ fn unafs_verb_rm(path: &str) -> String {
             .map(|_| ())
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("urm: removed {}", path),
-        Ok(Err(msg)) => alloc::format!("urm: {}: {}", path, msg),
-        Err(e) => alloc::format!("urm: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("rm: removed {}", path),
+        Ok(Err(msg)) => alloc::format!("rm: {}: {}", path, msg),
+        Err(e) => alloc::format!("rm: no unafs volume ({:?})", e),
     }
 }
 
@@ -6576,11 +6988,11 @@ fn unafs_verb_rm(path: &str) -> String {
 fn unafs_verb_mv(src: &str, dst: &str) -> String {
     let (sparent, sleaf) = match unafs_split(src) {
         Some(pl) => pl,
-        None => return alloc::format!("umv: {}: invalid path", src),
+        None => return alloc::format!("mv: {}: invalid path", src),
     };
     let (dparent, dleaf) = match unafs_split(dst) {
         Some(pl) => pl,
-        None => return alloc::format!("umv: {}: invalid path", dst),
+        None => return alloc::format!("mv: {}: invalid path", dst),
     };
     match crate::fs::unafs::with_unafs(|fs| {
         let spid = fs.resolve_path(sparent).map_err(|e| alloc::format!("{:?}", e))?;
@@ -6588,9 +7000,9 @@ fn unafs_verb_mv(src: &str, dst: &str) -> String {
         fs.rename(spid, sleaf, dpid, dleaf)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("umv: {} -> {}", src, dst),
-        Ok(Err(msg)) => alloc::format!("umv: {}: {}", src, msg),
-        Err(e) => alloc::format!("umv: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("mv: {} -> {}", src, dst),
+        Ok(Err(msg)) => alloc::format!("mv: {}: {}", src, msg),
+        Err(e) => alloc::format!("mv: no unafs volume ({:?})", e),
     }
 }
 
@@ -6606,13 +7018,43 @@ fn unafs_verb_rmattr(path: &str, key: &str) -> String {
         fs.remove_attribute(id, key)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("urmattr: removed '{}' from {}", key, path),
-        Ok(Err(msg)) => alloc::format!("urmattr: {}: {}: {}", path, key, msg),
-        Err(e) => alloc::format!("urmattr: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("setfattr: removed '{}' from {}", key, path),
+        Ok(Err(msg)) => alloc::format!("setfattr: {}: {}: {}", path, key, msg),
+        Err(e) => alloc::format!("setfattr: no unafs volume ({:?})", e),
     }
 }
 
-/// `usnap <name>`: retain the current committed tree as a snapshot. The shell
+/// RELICS (R26 clause 2) / K8b: list retained snapshots (the on-disk snapshot index) on the native
+/// volume — the body the retired `usnaps` arm carried inline, lifted so `snap list` can call it and
+/// so the whole snapshot family sits together with its siblings.
+#[cfg(target_arch = "aarch64")]
+fn unafs_verb_snaps() -> alloc::vec::Vec<String> {
+    let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
+        Ok(snaps) => {
+            let mut lines = alloc::vec::Vec::new();
+            if snaps.is_empty() {
+                lines.push(String::from("  (no retained snapshots)"));
+            } else {
+                for s in &snaps {
+                    lines.push(alloc::format!(
+                        "  gen {:>6}  {:<16}  by {:<12}  @{}",
+                        s.generation, s.name, s.creator, s.timestamp
+                    ));
+                }
+                lines.push(alloc::format!("  ({} of {} snapshots)", snaps.len(),
+                    ::unafs::SNAPSHOT_CAP));
+            }
+            lines
+        }
+        Err(e) => alloc::vec![alloc::format!("snap list: {:?}", e)],
+    });
+    match out {
+        Ok(lines) => lines,
+        Err(e) => alloc::vec![alloc::format!("snap list: no unafs volume ({:?})", e)],
+    }
+}
+
+/// `snap create <name>`: retain the current committed tree as a snapshot. The shell
 /// is a kernel-authority surface, so the creator principal is "kernel"
 /// (owner-or-kernel destructive authority — a later `usnapdrop` from this
 /// surface is always permitted). Returns the generation stamp.
@@ -6623,13 +7065,13 @@ fn unafs_verb_snap(name: &str) -> String {
         fs.snapshot_create(name.into(), "kernel".into(), ts)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(generation)) => alloc::format!("usnap: retained '{}' (generation {})", name, generation),
-        Ok(Err(msg)) => alloc::format!("usnap: {}: {}", name, msg),
-        Err(e) => alloc::format!("usnap: no unafs volume ({:?})", e),
+        Ok(Ok(generation)) => alloc::format!("snap create: retained '{}' (generation {})", name, generation),
+        Ok(Err(msg)) => alloc::format!("snap create: {}: {}", name, msg),
+        Err(e) => alloc::format!("snap create: no unafs volume ({:?})", e),
     }
 }
 
-/// `usnapdrop <generation>`: drop a retained snapshot; reclamation drains
+/// `snap drop <generation>`: drop a retained snapshot; reclamation drains
 /// eagerly, freeing only blocks no live/retained root still reaches.
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_snapdrop(generation: u64) -> String {
@@ -6637,13 +7079,13 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
         fs.snapshot_drop(generation)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("usnapdrop: dropped generation {} (blocks reclaimed)", generation),
-        Ok(Err(msg)) => alloc::format!("usnapdrop: generation {}: {}", generation, msg),
-        Err(e) => alloc::format!("usnapdrop: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("snap drop: dropped generation {} (blocks reclaimed)", generation),
+        Ok(Err(msg)) => alloc::format!("snap drop: generation {}: {}", generation, msg),
+        Err(e) => alloc::format!("snap drop: no unafs volume ({:?})", e),
     }
 }
 
-/// `usnapls <gen> [path]`: list a retained snapshot's directory AS OF the
+/// `snap ls <gen> [path]`: list a retained snapshot's directory AS OF the
 /// snapshot (K8c) — a read-only [`SnapshotView`] listing; never perturbs the
 /// live tree, refcounts, or the reclaim queue. Gated by the SAME current-ACL
 /// evaluator as `usnapcat` ([`read_authz`] on the target directory's live id) —
@@ -6659,13 +7101,13 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
             let mut view = match fs.open_snapshot(generation) {
                 Ok(v) => v,
                 Err(::unafs::fs::FileSystemError::SnapshotNotFound(_)) => {
-                    return alloc::vec![alloc::format!("usnapls: no such snapshot generation {}", generation)];
+                    return alloc::vec![alloc::format!("snap ls: no such snapshot generation {}", generation)];
                 }
-                Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+                Err(e) => return alloc::vec![alloc::format!("snap ls: {:?}", e)],
             };
             match view.resolve_path(path) {
                 Ok(id) => id,
-                Err(_) => return alloc::vec![alloc::format!("usnapls: {}: not in snapshot", path)],
+                Err(_) => return alloc::vec![alloc::format!("snap ls: {}: not in snapshot", path)],
             }
         };
         // CURRENT-ACL on the live directory — the same evaluator as usnapcat.
@@ -6673,20 +7115,20 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
             ReadAuthz::Permit => {}
             ReadAuthz::DenyNoLiveObject => {
                 return alloc::vec![alloc::format!(
-                    "usnapls: {}: refused — directory deleted from live tree (no current ACL; fail-closed)",
+                    "snap ls: {}: refused — directory deleted from live tree (no current ACL; fail-closed)",
                     path
                 )];
             }
             ReadAuthz::DenyAcl => {
                 return alloc::vec![alloc::format!(
-                    "usnapls: {}: refused — current ACL denies this principal",
+                    "snap ls: {}: refused — current ACL denies this principal",
                     path
                 )];
             }
         }
         let mut view = match fs.open_snapshot(generation) {
             Ok(v) => v,
-            Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+            Err(e) => return alloc::vec![alloc::format!("snap ls: {:?}", e)],
         };
         match view.ls(dir_id) {
             Ok(entries) => {
@@ -6699,16 +7141,16 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
                 }
                 lines
             }
-            Err(e) => alloc::vec![alloc::format!("usnapls: {:?}", e)],
+            Err(e) => alloc::vec![alloc::format!("snap ls: {:?}", e)],
         }
     });
     match out {
         Ok(lines) => lines,
-        Err(e) => alloc::vec![alloc::format!("usnapls: no unafs volume ({:?})", e)],
+        Err(e) => alloc::vec![alloc::format!("snap ls: no unafs volume ({:?})", e)],
     }
 }
 
-/// `usnapcat <gen> <path>`: read a file from a retained snapshot under the LIVE
+/// `snap cat <gen> <path>`: read a file from a retained snapshot under the LIVE
 /// object's CURRENT ACL (K8c high-security ruling). The shell runs at kernel
 /// authority, so it reads any LIVE object — but a file DELETED from the live
 /// tree fails closed (no current ACL row), and that refusal is reported plainly.
@@ -6719,27 +7161,27 @@ fn unafs_verb_snapcat(generation: u64, path: &str) -> String {
         Ok(SnapReadResult::Ok(bytes)) => {
             // Print the retained bytes as UTF-8 where possible, else a byte count.
             match core::str::from_utf8(&bytes) {
-                Ok(s) => alloc::format!("usnapcat: gen {} {} ({} bytes)\n{}", generation, path, bytes.len(), s),
-                Err(_) => alloc::format!("usnapcat: gen {} {} ({} bytes, binary)", generation, path, bytes.len()),
+                Ok(s) => alloc::format!("snap cat: gen {} {} ({} bytes)\n{}", generation, path, bytes.len(), s),
+                Err(_) => alloc::format!("snap cat: gen {} {} ({} bytes, binary)", generation, path, bytes.len()),
             }
         }
         Ok(SnapReadResult::NotInSnapshot) => {
-            alloc::format!("usnapcat: {}: not in snapshot gen {}", path, generation)
+            alloc::format!("snap cat: {}: not in snapshot gen {}", path, generation)
         }
         Ok(SnapReadResult::SnapshotMissing) => {
-            alloc::format!("usnapcat: no such snapshot generation {}", generation)
+            alloc::format!("snap cat: no such snapshot generation {}", generation)
         }
         Ok(SnapReadResult::Refused(ReadAuthz::DenyNoLiveObject)) => alloc::format!(
-            "usnapcat: {}: refused — object deleted from live tree (no current ACL; fail-closed)",
+            "snap cat: {}: refused — object deleted from live tree (no current ACL; fail-closed)",
             path
         ),
         Ok(SnapReadResult::Refused(ReadAuthz::DenyAcl)) => {
-            alloc::format!("usnapcat: {}: refused — current ACL denies this principal", path)
+            alloc::format!("snap cat: {}: refused — current ACL denies this principal", path)
         }
         Ok(SnapReadResult::Refused(ReadAuthz::Permit)) => {
             // Unreachable (Permit is not a refusal) — reported rather than panicked.
-            alloc::format!("usnapcat: {}: internal: permit reported as refusal", path)
+            alloc::format!("snap cat: {}: internal: permit reported as refusal", path)
         }
-        Err(e) => alloc::format!("usnapcat: no unafs volume ({:?})", e),
+        Err(e) => alloc::format!("snap cat: no unafs volume ({:?})", e),
     }
 }

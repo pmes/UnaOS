@@ -462,7 +462,7 @@ fn main() {
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17). Push `smolnet` (shell
-    // ping/arp/netinfo + socket syscalls + boot witnesses) UNLESS opted out with UNAOS_NOSMOLNET=1,
+    // ping/arp/ifconfig + socket syscalls + boot witnesses) UNLESS opted out with UNAOS_NOSMOLNET=1,
     // which drops the feature => the hand-rolled `net` crate is the whole net path, byte-identical to
     // the pre-flip default (PORTSW-1/EHCI-4 default-ON/negative-knob policy). x86-only optional dep +
     // module. (The builder rebuilds the kernel, so this MUST mirror arroyo's mapping.)

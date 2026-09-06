@@ -15,11 +15,11 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
 // SOCK-1 (ROADMAP §1b): the smoltcp 0.13 adapter. A `smoltcp::phy::Device` over the e1000e RX/TX
-// rings + an `Interface` (10.0.2.15/24, gw 10.0.2.2) that carries the shell's `ping`/`arp`/`netinfo`
+// rings + an `Interface` (10.0.2.15/24, gw 10.0.2.2) that carries the shell's `ping`/`arp`/`ifconfig`
 // and the boot connectivity witness through the mature stack. As of SMOLNET-DEFAULT (2026-07-17)
 // smoltcp is the DEFAULT x86 net stack; this module compiles by default and is dropped only under
 // `UNAOS_NOSMOLNET=1` (the opt-out to the hand-rolled stack). The hand-rolled `net` engines stay
-// compiled and live regardless and still own `connect`/`fetch`/`udpsend`, the TCP echo listener, and
+// compiled and live regardless and still own `nc` / `nc -u` / `curl`, the TCP echo listener, and
 // driver DHCP.
 //
 // Design (see unaos/docs/dev/OS/08_NET/networking.md):
@@ -251,7 +251,7 @@ pub fn arp_resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
     pump(mac, our_ip, ip, 1, true).mac
 }
 
-/// A one-line summary of the smolnet interface for `netinfo` (knob-on).
+/// A one-line summary of the smolnet interface for `ifconfig` (knob-on).
 pub fn info_line() -> alloc::string::String {
     match e1000::hw_addr() {
         Some((_mac, ip, up)) => alloc::format!(
@@ -1579,7 +1579,7 @@ pub fn witness_tick6() {
 //
 // The pi/genet stack learns civil time over SNTP (PI-NET-16); CLOCK-1 gave both arches the shared
 // `crate::clock` civil service (`set_anchor`/`unix_now`/`iso8601_now`), but x86 had no network writer —
-// `time` there stayed `unsynced` until a manual `setdate`. This closes that gap: one RFC 4330 client-mode
+// `time` there stayed `unsynced` until a manual `date -s`. This closes that gap: one RFC 4330 client-mode
 // request over the PERSISTENT UDP stack, its reply parsed by the shared, hostile-input-hardened
 // `crate::net_sntp` parser, then `crate::clock::set_anchor(unix, mono, Sntp{stratum})`.
 //
@@ -1755,7 +1755,7 @@ pub fn sntp_x86_gate() {
     // left in place it dated every FAT write July 22 and flipped every logts prefix to 1-second
     // civil form for the rest of the boot — the s73 kepler breakdown lost its ms resolution to
     // exactly this line. Snapshot whether a REAL anchor existed first (it cannot this early on
-    // x86, but a fixture that clobbers an operator's setdate would be the same defect again).
+    // x86, but a fixture that clobbers an operator's date -s would be the same defect again).
     let had_real_anchor = crate::clock::raw_anchor().is_some();
     let set_ok = match net_sntp::parse(&good) {
         Sntp::Ok { unix_secs, stratum } => {

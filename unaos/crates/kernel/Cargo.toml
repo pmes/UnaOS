@@ -202,7 +202,7 @@ skip_xhci = []
 bootlog = []
 # CLOCK-2: opt-in log timestamps on the kernel serial log. Prefixes each serial LINE with a compact
 # fixed-width timestamp — monotonic ms since boot (`[  12345ms] `) before a civil anchor exists,
-# flipping to UTC wall time (`[15:04:07Z] `) once SNTP/`setdate` anchors `crate::clock`. UART
+# flipping to UTC wall time (`[15:04:07Z] `) once SNTP/`date -s` anchors `crate::clock`. UART
 # byte-stream ONLY — the fbcon + capture-ring mirrors keep the raw text, so tste/UNAOS.LOG are
 # unchanged. DEFAULT OFF => module + prefix path vanish and serial is byte-identical (witness/mbench
 # specs parse serial lines and must be unaffected). Enable via `UNAOS_LOGTS=1`.
@@ -708,14 +708,14 @@ hcronst = ["holocron"]
 # every shipped image is byte-alike. Kept in sync with arroyo and builder/src/main.rs.
 prtscrst = []
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
-# path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
+# path — the shell's ping/arp/ifconfig, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles
 # the `smolnet` Device adapter over the e1000e rings (the module is additionally
 # target_arch="x86_64"-gated, so aarch64 never pulls smoltcp and its binaries are byte-identical
 # whether or not the feature is pushed). This POSITIVE feature is pushed BY DEFAULT by arroyo/builder;
 # UNAOS_NOSMOLNET=1 opts out (the feature is not pushed) => the hand-rolled `net` crate is the whole
 # net path, byte-identical to the pre-flip default. The hand-rolled stack stays compiled and live
-# regardless (it still owns connect/fetch/udpsend, the TCP echo listener, and driver DHCP). Poll-driven,
+# regardless (it still owns nc/curl, the TCP echo listener, and driver DHCP). Poll-driven,
 # static buffers (no heap growth). See unaos/docs/dev/OS/08_NET/networking.md.
 smolnet = ["dep:smoltcp"]
 # Jetson Orin Nano (Tegra234) build: point the aarch64 serial at the Tegra UART — a 16550-style

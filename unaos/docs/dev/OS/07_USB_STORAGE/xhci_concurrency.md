@@ -43,7 +43,7 @@ runs with **no lock held**. A contender is told `Busy` immediately instead of sp
 * pump/service passes (`pump_usb_into_gui`, the x86 GUI loop, `pal::pump_and_poll`, the tegra
   pumps) skip the pass and retry milliseconds later;
 * the block layer surfaces `BlockError::Busy` (below);
-* diagnostics (`usbinfo`/`diskinfo`, the one-shot topology summary) report "busy" honestly.
+* diagnostics (`lsusb`/`fdisk -l`, the one-shot topology summary) report "busy" honestly.
 
 **Masked half — fail fast, retry outside the mask.** `drivers/block.rs::claim_xhci_for_io` refuses
 to wait when IRQs are masked (`arch::irqs_masked()`) and returns `Busy` instantly; unmasked callers

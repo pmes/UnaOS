@@ -127,7 +127,7 @@
 //! # The clock is HONEST, or it is absent
 //!
 //! `clock::try_unix_now()` returns `None` until the civil clock has been anchored this boot (an SNTP sync
-//! or an operator `setdate`). A bar that showed `00:00` or `--:--` for that state would be furniture
+//! or an operator `date -s`). A bar that showed `00:00` or `--:--` for that state would be furniture
 //! asserting a fact it does not have. So the clock is simply **not drawn** while unsynced, the title
 //! keeps the width, and the witness says `clock=unsynced`. It is **UTC**: the kernel carries no
 //! timezone, and rendering local time would require inventing one.
@@ -828,7 +828,7 @@ impl Model {
 fn clock_hhmm() -> Option<[u8; CLOCK_GLYPHS]> {
     // `try_unix_now`, never `unix_now`: this runs at the composite tail and the primitive's rule is
     // that nothing on that path spins on a lock. A contended anchor (a concurrent SNTP sync or
-    // `setdate`) yields `None`, the bar draws no clock this pass and repaints on the next — the same
+    // `date -s`) yields `None`, the bar draws no clock this pass and repaints on the next — the same
     // decline-and-retry shape `strip::paint` uses for its scratch. `None` reads `unsynced`, which is
     // also what a never-anchored clock reads, so a momentary contention is indistinguishable from
     // "no time yet" and neither fabricates one.

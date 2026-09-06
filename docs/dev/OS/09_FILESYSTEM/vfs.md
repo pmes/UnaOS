@@ -5,7 +5,7 @@ This closes the gap the spine left open: VFS-1 built the resolver but marked its
 shell/syscall adoption is follow-up", and §4 named that follow-up outright ("wiring the shell … onto
 it is the follow-up adoption arc"). Until now the Pi ran **three disjoint path universes** — `ls`
 resolved against native UnaFS with a hand-rolled `/usb` prefix branch, `cat` (and the other
-FAT-direct verbs) resolved `/` as the SD FAT root, and only `run`/`bg`/`vfs` used the table. The
+FAT-direct verbs) resolved `/` as the SD FAT root, and only `run`/`bg`/`mount` used the table. The
 same typed path meant three different files depending on which verb read it. See §12.
 
 On top of:
@@ -17,10 +17,17 @@ stick is present. On top of:
 
 **VFS-2** — the write surface is implemented for both backends
 (`unaos/crates/kernel/src/fs/vfs.rs`), on top of VFS-1's read/resolve/authorize spine.
-First consumer landed (**SHELL-WRITE**): the panel shell's `vfs` verb
+> **RELICS (R26, 2026-09-06).** The verb was `vfs` until Peter's ruling replaced the house
+> names with the standard ones; it is now `mount`, which also answers the volume table
+> (`mount` with no arguments) and the FAT geometry the retired `fatinfo` printed. The MODULE
+> is still `fs/vfs.rs` and every `vfs_*` helper keeps its name — a module is not a verb.
+> On aarch64 the plain mutating verbs (`touch`/`write`/`append`/`mkdir`/`rm`/`mv`) now resolve
+> through this same namespace, which is what let the `u*` family retire.
+
+First consumer landed (**SHELL-WRITE**): the panel shell's `mount` verb
 (`unaos/crates/kernel/src/shell.rs`) routes create / write / truncate / unlink
 through the `MountTable` over one namespace — the native UnaFS volume at `/`, the
-FAT boot partition at `/fat`. `vfs write|append|rm|mkdir <path> [text]`, writing as
+FAT boot partition at `/fat`. `mount write|append|rm|mkdir <path> [text]`, writing as
 `KERNEL_PRINCIPAL` (the shell's trusted-operator posture). `SYS_OPEN` and the
 `genet`/net paths remain follow-up adoptions. VFS-2's write path is also proven by
 two self-verifying on-card witnesses (§9).
@@ -409,13 +416,13 @@ one. Writing a USB stick's contents onto a writable volume is the installer's co
 job (§5.2), not an in-place `/usb` write.
 
 **Honest hot-plug (doc §6).** The `/usb` mount is bound only when the stick is actually
-enumerated *and its FAT is mountable* — `vfs_mount_table()` (rebuilt per shell `vfs` invocation)
+enumerated *and its FAT is mountable* — `vfs_mount_table()` (rebuilt per shell `mount` invocation)
 and the witness both do a `mount_source(Usb)` presence check at build time. Absent (or the medium
 unreadable) → `/usb` is simply not in the table. A stick plugged (or ejected) between commands is
-picked up on the next `vfs`. See §11.2 for how a mutating verb reports an unbound `/usb`.
+picked up on the next `mount`. See §11.2 for how a mutating verb reports an unbound `/usb`.
 
-**The shell `vfs` verb picks it up automatically.** `vfs_mount_table()` gained the conditional
-`/usb` mount, so `vfs write|append|rm|mkdir /usb/...` route through the same four verbs — read
+**The shell `mount` verb picks it up automatically.** `vfs_mount_table()` gained the conditional
+`/usb` mount, so `mount write|append|rm|mkdir /usb/...` route through the same four verbs — read
 paths work, writes return `-ENOTSUP` (the read-only posture). No new dispatch code.
 
 ### 11.1 The VFS-3 USB-mount witness
@@ -440,8 +447,8 @@ wiring lands as a deferred diff, and a temporary proof captured the QEMU skip li
 ### 11.2 VFS-4 — unbound `/usb` reports "volume not mounted", not `-ENOENT`
 
 The P44 metal sitting exposed a **misdirecting error message**. With the USB stick fully
-enumerated (`storage enumerated … 30436 MiB`), `vfs write /usb/test123.txt hi` returned
-`vfs write: /usb/test123.txt: no such file or directory (-ENOENT)`. Root cause was **upstream of
+enumerated (`storage enumerated … 30436 MiB`), `mount write /usb/test123.txt hi` returned
+`mount write: /usb/test123.txt: no such file or directory (-ENOENT)`. Root cause was **upstream of
 the VFS** (PIUSB-34): the stick's `READ(10)` of LBA 0 returned all-zeros with a *passing* CSW, so
 `fat::mount_source(Usb)` honestly found no FAT volume, and `vfs_mount_table()`'s presence check
 therefore never bound `/usb`. The path then fell through the longest-prefix resolver to the native
@@ -454,7 +461,7 @@ the volume prefixes that may be absent (`RESERVED_VOLUME_PREFIXES = ["/usb", "/f
 `vfs_cmd` checks — before dispatch, for *every* verb — whether the target path names a reserved
 volume that is not in the live mount table (`unmounted_reserved_volume`, boundary-matched exactly
 as the resolver: `/usb` and `/usb/…` match, `/usbfoo` does not). If so it reports
-`vfs <op>: <path>: volume /usb not mounted (-ENODEV)` and stops, instead of letting the path fall
+`mount <op>: <path>: volume /usb not mounted (-ENODEV)` and stops, instead of letting the path fall
 through to the native root. The honest-absent posture of §6 is preserved — an unbound `/usb` is
 still simply not in the table — but the *message* now names the real condition. `/` is deliberately
 excluded from the reserved set: it is always mounted and is the legitimate fall-through for
@@ -490,16 +497,16 @@ the namespace the shell implemented.
 
 Three path universes coexisted on aarch64:
 
-1. **FAT-direct + cwd** — `cat`, `stat`, `cp`, `mv`, `rm`, `head`, `tail`, `find`, `du`, `xd`, `cd`
+1. **FAT-direct + cwd** — `cat`, `stat`, `cp`, `mv`, `rm`, `head`, `tail`, `find`, `du`, `hexdump`, `cd`
    and friends bound `fat::mount_program_source()` and treated `/` as the **SD FAT root**.
 2. **unafs + an inline `/usb` branch** — `ls` alone, resolving against **native UnaFS**, with a
    hand-rolled `if path == "/usb" || path.starts_with("/usb/")` test choosing a second, duplicate
    listing renderer.
-3. **the `MountTable`** — `run`, `bg`, `vfs`, where `/`, `/fat` and `/usb` meant what §4 says.
+3. **the `MountTable`** — `run`, `bg`, `mount`, where `/`, `/fat` and `/usb` meant what §4 says.
 
 Consequences: `ls /fat` failed (no `/fat` branch existed in `ls`); `cat /usb/FILE` failed (the name
 resolved as a literal FAT directory called `usb`); `cat /X` and `ls /X` named **different files**;
-and `run`/`bg`/`vfs` ignored the cwd entirely, so a relative name after a `cd` resolved against the
+and `run`/`bg`/`mount` ignored the cwd entirely, so a relative name after a `cd` resolved against the
 root. The `/usb` prefix test was also the exact `starts_with` bug §3.1's boundary rule exists to
 prevent — it was correct only because it was hand-checked, not because it used the resolver.
 
@@ -510,7 +517,7 @@ One function, `shell::vfs_path(arg)`, turns an operator-typed argument into an a
 backend is consulted). Every routed verb calls it and nothing else. **Which volume the path lands
 on is then decided solely by `MountTable::resolve`'s longest-prefix rule — never by the verb.**
 
-Adopted this arc: `ls`/`dir` (via the new `vfs_ls_collect`), `cat`/`type`, `run`, `bg`, `vfs`. All
+Adopted this arc: `ls`/`dir` (via the new `vfs_ls_collect`), `cat`/`type`, `run`, `bg`, `mount`. All
 five now agree on `/` = native UnaFS, `/fat` = SD boot FAT, `/usb` = the stick.
 
 Two per-volume listing collectors (`pi_ls_collect` against unafs, `pi_usb_ls_collect` against the
@@ -524,8 +531,8 @@ Two guards that existed on one verb became shared rather than re-derived:
 
 * the VFS-4 `-ENODEV` guard (a path naming a reserved-but-unbound volume reports the *volume* as
   missing, not a bare `-ENOENT` off the native root) now covers `ls`, `cat`, `run` and `bg` as well
-  as `vfs`. `run /usb/X` with the stick absent previously reproduced the exact P44 misdirection
-  VFS-4 fixed for `vfs`;
+  as `mount`. `run /usb/X` with the stick absent previously reproduced the exact P44 misdirection
+  VFS-4 fixed for `mount`;
 * the cwd, which the mount-table verbs did not honour at all.
 
 ### 12.3 `DirEnt` gained `size` and `mtime`
@@ -552,7 +559,7 @@ table.
 
 Still FAT-direct, and named here so the remaining gap is visible rather than implied: the JD12
 **glob** expansion (`cat *.MD`), and the mutating/inspecting FAT verbs `stat`, `cp`, `mv`, `rm`,
-`mkdir`, `head`, `tail`, `find`, `du`, `xd`, `touch`, `append`, `write`, plus `cd` (whose cwd is
+`mkdir`, `head`, `tail`, `find`, `du`, `hexdump`, `touch`, `append`, `write`, plus `cd` (whose cwd is
 still a FAT 8.3 path). `SYS_OPEN` and the `genet` `/fs/usb` route remain follow-up adoptions as
 before. x86 is unchanged by design: `fs/vfs.rs` gates both backends to aarch64, so that arch has no
 mount table to route through and exactly one FAT volume to confuse.

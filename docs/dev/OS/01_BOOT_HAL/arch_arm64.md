@@ -2615,7 +2615,7 @@ tegra image links. The attended-bench risks to watch: (a) hub-MSC **power/timing
 reader (does its SCSI bring-up complete inside the 8 s settle window?); (b) the wall-clock budget
 sizing for a real USB-MSC read latency (bump `hw_wait_budget()`'s BOT multiple if a real read
 marginally times out); (c) `set_not_live()` + the busy-poll pump actually completing a read on the
-timerless EL1 core. Bench proof = flash, then on the panel shell: `diskinfo` (geometry), `ls` (the
+timerless EL1 core. Bench proof = flash, then on the panel shell: `fdisk -l` (geometry), `ls` (the
 card's root), `cat <known file>` (its bytes).
 
 **Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin).** Serial
@@ -2626,7 +2626,7 @@ hub** enumerated on the retry boot — `HUB downstream slot 5 device … vid=058
 block_size=512 num_blocks=60800 (29 MiB)` → `READ(10) LBA0 CSW status=Passed residue=0` →
 `JD3 — mass storage ready (slot 5); panel shell ls/cat live` (the disk was up well inside the 8 s
 settle window, so the pump returned keyboard-armed + storage-ready). Then post-drop, on the panel
-shell, `diskinfo` / `ls` / `cat` read the FAT card — the M2 crux: **synchronous BOT reads completing on
+shell, `fdisk -l` / `ls` / `cat` read the FAT card — the M2 crux: **synchronous BOT reads completing on
 the timerless EL1 core** via `set_not_live()` + the wall-clock `pump_until_bot_done`. Peter's verdict:
 **PASS**, and **zero `BOT pump TIMEOUT` lines** across the whole session — the ×3 `hw_wait_budget`
 budget was ample for the real USB-MSC read latency. The first real filesystem content on the Orin
@@ -2706,7 +2706,7 @@ milestones in one session across three boots:
 - **M2 — every boot**: zero `JB2c`/`JB9b` serial lines; keyboard + storage enumeration unaffected.
 - **M1 — boot 3** (a **FAT16** card — `UNAOSRW`, the 29 MiB pi4 fixture card with a fresh
   `DOCS/README.TXT`, in the Alcor reader behind the hub, slot 5): the full navigation sequence on
-  the panel — `diskinfo` → `ls` (root: `<DIR> DOCS` + the pi4 fixtures) → `cd docs` → `ls` →
+  the panel — `fdisk -l` → `ls` (root: `<DIR> DOCS` + the pi4 fixtures) → `cd docs` → `ls` →
   `cat readme.txt` → `pwd` → `cd ..` → `cat /docs/readme.txt` → honest-error probes `cd nosuch`
   (`-ENOENT`) and `cat docs` (`-EISDIR`). Bonus proofs beyond the QEMU gates: the whole sequence
   was typed **lowercase** (case-insensitive 8.3 matching on silicon) and the card is FAT16 (the
@@ -3335,7 +3335,7 @@ its parent directory via the read-only `read_dir` (the JD4 case-insensitive 8.3 
 run and `?` = one char, via a small iterative star-backtrack matcher — no recursion, no allocation). Matches
 are `.`/`..`-filtered and sorted for a deterministic listing / serial transcript. The engine is invoked ONLY
 inside the fs-verb arms — the shared arg-split at the top of `dispatch_command` is UNCHANGED, and the NET
-command region (`netinfo`/`ping`/`arp`/`connect`/`udpsend`/`get` — a sockets-arc lane) never sees a glob. A
+command region (`ifconfig`/`ping`/`arp`/`nc`/`curl` — a sockets-arc lane) never sees a glob. A
 leaf with no metacharacter, or a glob confined to a non-trailing component, passes through literally
 (byte-identical to pre-JD12; a mid-path wildcard resolves to an honest `-ENOENT`). The verbs it lifts:
 
@@ -3759,7 +3759,7 @@ the shell-level `ls -l` verdict is **✅ METAL-CONFIRMED (2026-07-15 attended Or
 file's stamp showed through to the exact second (09:20:34), every kernel-written entry showed the honest
 dash (bench card `unaos/scripts/jd16-bench.md`).
 
-### JD17 — the KERNEL CLOCK: `setdate`-seeded wall time that stamps FAT mtime
+### JD17 — the KERNEL CLOCK: `date -s`-seeded wall time that stamps FAT mtime
 
 §JD16 exposed the honest gap: with no RTC the kernel reads, every kernel-written FAT entry carried an all-zero
 mtime and `ls -l` showed a dashed placeholder. JD17 closes that gap **without inventing a clock**: the operator
@@ -3786,11 +3786,11 @@ exactly as §JD16 documented on the read side.
 
 **The frozen-x86 note — stated honestly.** No calibrated invariant-frequency counter is plumbed on x86_64 in
 this kernel (the TSC frequency is measured nowhere), so `monotonic()` returns `None` there and a set clock is
-**frozen at its seeded second** (elapsed = 0). No x86 caller sets the clock today; the `date`/`setdate` verbs
+**frozen at its seeded second** (elapsed = 0). No x86 caller sets the clock today; the `date` / `date -s` verb
 merely compile. x86 monotonic calibration is explicitly **out of scope** (a named future arc).
 
 **The shell (`shell.rs`).** Two additive arms: `date` prints the current wall clock or `date: clock not set`
-when unset; `setdate YYYY-MM-DD HH:MM[:SS]` (seconds optional, default 0) seeds it. `parse_setdate` enforces
+when unset; `date -s YYYY-MM-DD HH:MM[:SS]` (seconds optional, default 0) seeds it. `parse_wallclock` enforces
 the strict field shapes (dash/colon-separated decimals) and hands the numbers to `clock::set`, which owns the
 range validation. A `CLOCK:` help line was added.
 
@@ -3825,7 +3825,7 @@ already stamped at create.
 `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell/fat guard). The wall-clock stamp
 is not headless-reachable in-lane, so the shell-level verdict rode the card — now **✅ METAL-CONFIRMED
 (2026-07-15 attended Orin bench)**: unset-honest both boots, seed counter-extended across live `date` reads,
-out-of-range `setdate` rejected without disturbing the set clock, post-seed files stamped at the FAT
+out-of-range `date -s` rejected without disturbing the set clock, post-seed files stamped at the FAT
 2-second resolution while a pre-seed file kept its dash, the stamp byte-identical across a genuine power
 cut, and the next boot up unset again (bench card `unaos/scripts/jd17-bench.md`).
 
@@ -3847,13 +3847,13 @@ the full tree, scoped and no-match forms honest), `du` tallied a seeded tree exa
 1 dir), `uptime` counter-derived both without and with the seeded-clock parenthetical (bench card
 `unaos/scripts/jd18-bench.md`).
 
-### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail) + `xd` (bounded hexdump)
+### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail) + `hexdump` (bounded)
 
 Two read-only inspection verbs that expose the on-disk truth of a FAT entry — **`shell.rs`-only, zero mutation, `fat.rs` call-never-edit, NET arms + unafs verbs untouched.** Both ride primitives the read path already ships (`resolve_path`/`locate_in_dir`/`read_at`) plus, for `stat`'s attr byte, one raw `block::read_block` of the on-disk directory sector — the same raw block path the `read <lba>` verb uses. Neither is glob-wired: a metacharacter in the path resolves literally, an honest `-ENOENT`, exactly as a mid-path glob does today.
 
 **`stat <path>`.** Prints one directory entry's full detail: the canonical absolute path, kind (file/dir), size in bytes, the raw FAT **attr byte** (hex + decoded `RO`/`HIDDEN`/`SYS`/`DIR`/`ARCHIVE` flags, `-` when none set), first cluster (hex; `0x0` honest for a 0-length file), the FAT last-write stamp (a bare `-` when the on-disk pair is zeroed, via the §JD16 `fmt_mtime`/`FatTimestamp::is_zero`), and the **on-disk location** — the directory-entry LBA + 32-byte slot offset. The parsed `DirEntry` keeps only `is_dir` (not the whole attr byte), so `stat` reads the true byte back from slot offset `+11` of the on-disk directory sector returned by `locate_in_dir` (which yields `(DirEntry, dir_lba, dir_off)`). **`stat /` reports the root honestly** — a directory with **no directory entry of its own** (the FAT root has no parent slot), so the `entry:` line says so rather than inventing an LBA. A missing path is `-ENOENT`.
 
-**`xd <path> [off] [len]`.** A bounded hexdump of a file's bytes via the offset-aware `read_at`: default `off=0`, `len=256`, with `len` **hard-capped at 4096**. Rows are the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout, labelled with the **absolute file offset** (starting at `off`, not from 0 like the raw `read`-verb dump) and non-printables rendered as `.`; a short final row is padded so the ASCII gutter stays aligned. When the file holds more bytes past the dumped window — a cap hit, a short `len`, or both — an honest `[... n more byte(s)]` tail note is printed. An `off` at or past EOF is an honest `offset N at/past EOF` note (no rows); a directory target (and the root) is `-EISDIR`. `off`/`len` accept decimal or `0x`-hex.
+**`hexdump <path> [off] [len]`.** A bounded dump of a file's bytes via the offset-aware `read_at`: default `off=0`, `len=256`, with `len` **hard-capped at 4096**. Rows are the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout, labelled with the **absolute file offset** (starting at `off`, not from 0 like the raw `read`-verb dump) and non-printables rendered as `.`; a short final row is padded so the ASCII gutter stays aligned. When the file holds more bytes past the dumped window — a cap hit, a short `len`, or both — an honest `[... n more byte(s)]` tail note is printed. An `off` at or past EOF is an honest `offset N at/past EOF` note (no rows); a directory target (and the root) is `-EISDIR`. `off`/`len` accept decimal or `0x`-hex.
 
 **Not in scope:** any mutation, glob expansion for these two verbs, raw-LBA dumps (the `read <lba>` verb already covers that), and any FAT-internal walk beyond the public API.
 
@@ -4711,7 +4711,7 @@ the 6-core part. Two independent root causes, both tegra-only.
 physical timer (`CNTP_CTL=0`, JD3; `timer::set_not_live`), so the timer IRQ never fires at EL1 and
 `timer::ticks()` is frozen at 0. `arch::ms()` was `ticks()*4` → stuck at 0, so `vug`'s 200 ms readout
 window (`dt >= 200`) never elapsed (the fps/ms readout, the load fraction, AND the demo-core pulse
-fallback all sit behind that window) and the render loop had no pacing. `setdate`/JD17 is a *separate*
+fallback all sit behind that window) and the render loop had no pacing. `date -s`/JD17 is a *separate*
 clock service and was correctly disproven as the culprit.
 
 *Fix:* a `tegra`-gated `ms()` fallback. When the timer is not live (`!timer::is_live()`, always the
