@@ -3450,6 +3450,30 @@ KERNEL_CFG_MATRIX=(
   # prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-bsprun ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
 
+  # ORIN-BSPRUN HOSTING (appended 2026-09-06, orin 16) — the `bsprun` x `tegra_el0` cross, which no
+  # leg compiled. The ORIN10-LEGHOLES shape, and the same remedy: `arm-tegra-supstate` /
+  # `arm-tegra-supstate-el0` are the precedent pair this row copies.
+  #
+  # THE HOLE THIS ARC WOULD HAVE OPENED. `bsprun` implies nothing but itself, and the row above
+  # carries no `tegra_el0`, so on `arm-tegra-bsprun` the whole EL0 chain is cfg-erased
+  # (`arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which only `tegra_el0` turns
+  # on) — `user_task_trampoline` included. This arc's EL0 half, `bsprun_el0_first_run` (sched.rs
+  # tail) and the statement appended to the EL0-EL1CORE guard's closing brace, is gated
+  # `all(tegra, bsprun, aarch64_el0)`: on the row above it is erased fn AND erased call site, i.e.
+  # compiled by nothing. That is the exact shape the standing law forbids — a knob's gates must
+  # compile the configuration the knob turns ON — and it matters here more than usual, because the
+  # combination this row names IS the flight image (`UNAOS_TEGRA_EL0=1 UNAOS_BSPRUN=1`), not a
+  # hypothetical corner. The `all(tegra, bsprun)` HOSTING half is already compiled by the row above,
+  # which stays as the EL0-less twin (a shape the Orin can still be built in).
+  #
+  # HOSTED ON `arm-tegra-bsprun`'s LIST VERBATIM + `tegra_el0`, so the leg's line IS the
+  # configuration it compiles (the standing matrix rule) and the pair differs by exactly one term.
+  #
+  # UNIVERSE SIDE EFFECT: none. Both knobs are already named by arm-* legs, so `x86_cfg_universe`
+  # and the derived mix-leg count are unchanged. Board legs +1; gate +1. `./arroyo check` prints the
+  # live board/mix counts every run — read them there, not here.
+  "arm-tegra-bsprun-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun,tegra_el0"
+
 
   # ORIN-SUPSTATE armed (appended 2026-08-25) — `supstate` gates the console-surface STATE LIFT
   # (Candidate A arc 1): `display_tegra.rs`'s `SupSurface`/`sup_install`/`sup_with_surface`, the
