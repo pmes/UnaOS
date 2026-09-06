@@ -6875,6 +6875,16 @@ battery() {
 # (that is SR1's open class, and it is why a pi ack is still a pi ack). Nor does it measure the ESP or
 # any staged media. A PASS is exactly one claim: the two kernel loadable images did not move.
 #
+# THE PERMANENT-REFUSAL CASE, named so nobody "fixes" it (pi 7, 2026-09-06). The control requires
+# `armed != off` on at least ONE arch, and the arches built here are x86_64 and aarch64-VIRT. A feature
+# whose sites are `baremetal`-gated lives only in `kernel8.img` — `main.rs` alone carries 72 such sites —
+# so arming it moves NEITHER built image, the control cannot fire, and knoboff returns NO VERDICT every
+# time, forever. That is correct: the tool is declining a comparison it has no power to make. But a seat
+# meeting a permanent NO VERDICT cold will read it as a broken gate and reach for a workaround, and the
+# only available workaround is weakening the control — which is precisely the failure the control exists
+# to prevent. So the refusal says so at the point of use. For `baremetal`-gated features the pi ack IS
+# the instrument, and it is not something to route around.
+#
 # EXIT STATUS is the deliverable — the brief says "run it and quote the result":
 #   0  knob-off images identical to baseline on every arch checked, control fired
 #   1  the knob-off image MOVED (the answer the brief is trying to prevent)
@@ -7052,8 +7062,18 @@ knoboff() {
     fi
 
     _knoboff_checkout() { # $1 = sha, $2 = patch-to-apply or ""
+        # ORDER IS THE WHOLE CORRECTNESS OF THIS FUNCTION, and the first cut had it wrong. A previous
+        # run leaves this tree carrying the applied working diff, so a plain `git checkout --detach`
+        # ABORTS ("local changes would be overwritten") and the `&&` chain never reaches the
+        # `reset --hard` that would have cleared them. It survived the early runs only because the
+        # baseline happened to equal the tree's current commit, where git lets the checkout no-op; the
+        # first run with a baseline that differs — i.e. every run after the first commit of a session —
+        # died at phase 1 with NO VERDICT. So: clear the tree FIRST, then move it, then clear again.
+        # `--force` on the checkout is the belt to that suspenders.
         ( cd "$TREE" \
-          && git checkout --detach -q "$1" \
+          && git reset --hard -q HEAD \
+          && git clean -fdq \
+          && git checkout --force --detach -q "$1" \
           && git reset --hard -q "$1" \
           && git clean -fdq ) >>"$LOG" 2>&1 || return 1
         if [ -n "${2:-}" ] && [ -s "$2" ]; then
@@ -7099,13 +7119,26 @@ knoboff() {
     if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — arming '$feat' changed NEITHER image.${COLOR_RESET}"
         if [ $rc_on_x -ne 0 ] || [ $rc_on_a -ne 0 ]; then
-            echo -e "         (the armed build itself failed: x86:$rc_on_x arm:$rc_on_a — a feature with an implied"
-            echo -e "          partner needs that partner's knob too; see this file's knob map.)"
+            echo -e "         (the armed build itself failed: x86:$rc_on_x arm:$rc_on_a.) TWO causes, and the"
+            echo -e "         build log below says which. A feature with an IMPLIED PARTNER needs that partner's"
+            echo -e "         knob too — see this file's knob map. OR the feature is \`baremetal\`-gated and its"
+            echo -e "         code depends on Pi-only modules that do not exist on these targets, which is the"
+            echo -e "         SAME structural limit as the case below: an unresolved import of a Pi driver is what"
+            echo -e "         that looks like from here (\`piinstall\` reaches for crate::drivers::emmc2 and cannot"
+            echo -e "         find it). If so, the refusal is CORRECT AND PERMANENT and the pi ack is the"
+            echo -e "         instrument — do not chase a partner knob that does not exist."
             tail -20 "$LOG" | sed 's/^/         /'
         else
             echo -e "         Either every site is gated on a SECOND feature nobody armed here (re-run as"
             echo -e "         ${COLOR_YELLOW}UNAOS_<PARTNER>=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff $feat${COLOR_RESET}), or the"
             echo -e "         feature emits no code at all. A comparison that cannot come out unequal is not a pass."
+            echo -e "         ${COLOR_YELLOW}⚠ IF '$feat' IS \`baremetal\`-GATED, THIS REFUSAL IS CORRECT AND PERMANENT.${COLOR_RESET}"
+            echo -e "         knoboff builds x86_64 and aarch64-VIRT only. A site gated on \`baremetal\` exists in"
+            echo -e "         kernel8.img and in NEITHER of those images, so arming the feature can never move one"
+            echo -e "         and this tool can never have power over it. That is the tool declining a comparison"
+            echo -e "         it cannot make — the pi ack is the instrument for those features. Do NOT weaken this"
+            echo -e "         control to get a verdict out of it; the control is the only reason the refusal is"
+            echo -e "         trustworthy in every OTHER case. (pi 7, SP2's neighbour, 2026-09-06.)"
         fi
         return 2
     fi

@@ -120,6 +120,15 @@ if "docs/dev/LEDGER.md" in files:
         for _, cells in rows:
             m = re.match(r"([A-Z]+[0-9]+)", cells[0])
             if m: ledger_ids.add(m.group(1))
+    # P-ROWS ARE BULLETS, NOT TABLE ROWS — and the resolver could not see them (rmbp 13, 2026-09-06).
+    # The cross-ref regex has always accepted `→ P<n>` as a reference, but `ledger_ids` was built ONLY
+    # from tables with a `status` column, and the protocol rows live in LEDGER.md as `- **P14** — …`
+    # bullets. So every `→ P<n>` that has ever been written resolved against an id set containing ZERO
+    # P ids and RED-LINED — a false red on a row that exists, in the gate whose job is telling those
+    # apart. Found by this gate reding a `→ P15` cross-ref to a P-row filed in the same commit. The
+    # id-space the gate accepts and the id-space it can resolve have to be the same one.
+    for _m in re.finditer(r"^-\s+\*\*([A-Z]+[0-9]+)\*\*", open("docs/dev/LEDGER.md").read(), re.M):
+        ledger_ids.add(_m.group(1))
 
 rows_seen = 0
 for path in files:
