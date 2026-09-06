@@ -57,3 +57,8 @@ CONSOLEQUIET union gate on `3329eec6`: check 0, test-arm 0, `UNAOS_WC=1 test 150
 knob-off image carries no `desktop_firmware`). Peter pushed hw-jetson to `12bbc0ed` (ls-remote 04:36Z); owed from there.
 xHCI instrument `7b143041` (CLICKDEAD v2 applied; rmbp grant + pi re-accept; new Pi baseline `8ff7c1d1…` per the commit
 body). render7 build (all folds aboard) + its gate chain running at write time.
+
+## render7 staged and ON THE CARD (04:46Z)
+`render7-20260906T0445Z-7be8155` — kernel.elf `c6dc3960ef7ae164`, ELF max `0x2f5e40`, 10/10 sha match, unmounted; card tidied (SCREEN0/1/2 harvested,
+sha-verified). Gate chain at 7b143041: check 0 (0 red), test-arm 0, Pi image = the re-accepted value. Every fold of this
+session is aboard. Orin 16 flies it; the questions are in the image's MANIFEST.
