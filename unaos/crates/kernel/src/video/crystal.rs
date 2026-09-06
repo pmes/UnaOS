@@ -361,30 +361,35 @@ pub fn last_press_outcome() -> &'static str {
 // Geometry — the dropdown rect, and the row layout inside it
 // ---------------------------------------------------------------------------
 
-/// **The dropdown's rect on a `pw` x `ph` panel, or `None`.** SO4 — anchored under the crystal by its
-/// RIGHT edge: the menu's right edge aligns with the crystal's right, which since SO4 IS the bar's
-/// right edge, so the dropdown falls flush into the corner. Its top is the bar's bottom edge.
+/// **The dropdown's rect on a `pw` x `ph` panel, or `None`.** Anchored under the crystal by its LEFT
+/// edge — as macOS drops its apple menu from the logo's left — and since the crystal is flush at the
+/// panel's left edge, the menu's own left edge is panel `x = 0`. Its top is the bar's bottom edge, so
+/// the menu hangs directly off the bar with nothing between.
 ///
-/// This is the whole of Peter's render7 complaint, in one line of arithmetic. The menu used to anchor
-/// by its LEFT edge to the crystal's left, and with the mark one `PAD` in from the panel's left the
-/// dropdown opened at `menu=170x121+12+34` — *"crystal menu has a gap to the left ... it should be all
-/// the way to the right edge"*. A left-anchored menu under a right-hand mark would have run off the
-/// panel and been clamped back; right-anchoring is the rule that makes the clamp unnecessary, which is
-/// why the mark's move and the menu's anchor are ONE change and not two.
+/// This is the whole of Peter's complaint, in one line of arithmetic, and the arithmetic is a
+/// PASS-THROUGH: `mx = cx`. On render7 the mark sat one `PAD` in from the left and the dropdown
+/// inherited that inset — `menu=170x121+12+34`, the twelve pixels he named. `bb513370` then read
+/// *"close the gap"* as *"move to the right edge"* and right-anchored the menu into the far corner;
+/// that was a MISREAD, re-ruled by Peter on 2026-09-06 (orin 17): **the crystal is the Mac menu,
+/// top-left, always — when he says there is a gap on the left, the answer is to CLOSE the gap.** The
+/// inset is deleted at its source (`menubar`'s `crystal_offset` is now `x = 0`), so this function does
+/// not have to correct for it and no clamp is needed: `cx` is already 0.
 ///
 /// `None` when the bar is absent (so there is no crystal to hang from) or the panel is too small to
 /// hold the menu below the bar at all — the same decline-rather-than-squeeze rule the strip
 /// constructors follow.
 fn menu_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
-    let (cx, _cy, cw, _ch) = menubar::crystal_box_abs(pw, ph)?;
+    let (cx, _cy, _cw, _ch) = menubar::crystal_box_abs(pw, ph)?;
     let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
     let my = by + bh; // flush under the bar
     if MENU_W > pw || my + MENU_H > ph {
         return None; // panel cannot host the menu below the bar
     }
-    // Right-anchored: the menu's right edge meets the crystal's. Saturating because a panel narrower
-    // than the menu is already refused above, so this can only clamp a degenerate bar to the left edge.
-    let mx = (cx + cw).saturating_sub(MENU_W);
+    // Left-anchored under the mark: the menu's left edge IS the crystal's, which is the panel's left
+    // edge. Taken from `crystal_box_abs` rather than written as a literal 0 so the menu can never
+    // drift from the glyph it hangs off — one fact, read twice. No right-edge clamp is needed:
+    // `MENU_W > pw` is refused above and `cx` is 0, so `cx + MENU_W <= pw` holds by construction.
+    let mx = cx;
     Some((mx, my, MENU_W, MENU_H))
 }
 
@@ -535,13 +540,16 @@ fn open_via(pw: usize, ph: usize, via: &str) {
         ":: SHARD-MENU: crystal_press=open via={} menu={}x{}+{}+{} items={} ::",
         via, mw, mh, mx, my, ITEM_COUNT
     );
-    // SO4 — the geometry witness, in the family that OWNS the geometry. `anchor=` states the rule the
-    // rect was derived from, and `gap_right=` is the falsifier for Peter's complaint: it is the pixels
-    // between the dropdown's right edge and the panel's, and the rule says it is 0.
+    // The geometry witness, in the family that OWNS the geometry. `anchor=` states the rule the rect
+    // was derived from, and `gap_left=` is the falsifier for Peter's complaint: it is the pixels
+    // between the PANEL's left edge and the dropdown's, and the re-ruling says it is 0. `glyph=`
+    // carries the mark's own x beside it, so an inset that crept back onto the GLYPH is visible on
+    // the wire even in the case where the menu still opened at 0 — two numbers, because "close the
+    // gap" is a claim about both the mark and the menu under it.
     let (cbx, _cby, cbw, cbh) = menubar::crystal_box_abs(pw, ph).unwrap_or((0, 0, 0, 0));
     serial_println!(
-        "[menubar] crystal menu={}x{}+{}+{} anchor=right-flush-under-crystal glyph={}x{}+{} bar_w={} gap_right={} ::",
-        mw, mh, mx, my, cbw, cbh, cbx, pw, pw.saturating_sub(mx + mw)
+        "[menubar] crystal menu={}x{}+{}+{} anchor=left-flush-under-crystal glyph={}x{}+{} bar_w={} gap_left={} ::",
+        mw, mh, mx, my, cbw, cbh, cbx, pw, mx
     );
     // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
     // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
@@ -732,12 +740,12 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true;
     }
 
-    // Closed: the press cell we own is the bar's whole upper-RIGHT corner since SO4 — FITTS-CORNER
-    // ([`menubar::crystal_corner_abs`]): the crystal's full slot (glyph flush to the right edge plus
-    // its inner PAD) by the bar's full height, so panel pixel `(pw-1, 0)` opens the menu with zero
-    // aim. Every pixel of the cell is bar chrome composited above the windows, so this claims nothing
-    // a window's own chrome could own; the DROPDOWN still anchors to `crystal_box_abs`, the painted
-    // glyph — now by its RIGHT edge, which is the same edge.
+    // Closed: the press cell we own is the bar's whole upper-LEFT corner — FITTS-CORNER
+    // ([`menubar::crystal_corner_abs`]): the crystal's full left slot (glyph flush at x=0 plus its
+    // inner PAD) by the bar's full height, anchored at the bar's origin so panel pixel (0,0) opens
+    // the menu with zero aim. Every pixel of the cell is bar chrome composited above the windows, so
+    // this claims nothing a window's own chrome could own; the DROPDOWN still anchors to
+    // `crystal_box_abs`, the painted glyph, by its LEFT edge — which is now the panel's.
     if let Some((zx, zy, zw, zh)) = menubar::crystal_corner_abs(pw, ph) {
         if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
             // The witness's `via=` word: on the painted glyph itself, or in the widened cell.
@@ -996,7 +1004,7 @@ pub fn rollup(scope: &str) {
 ///
 /// 1. **closed by default** — `OPEN` is observed `false` before the fixture touches it.
 /// 2. **a crystal press OPENS** — with the bar enabled, a press at the crystal box centre opens the
-///    menu and [`menu_rect`] is placeable. And FITTS-CORNER: a press at panel pixel `(pw-1, 0)` — the
+///    menu and [`menu_rect`] is placeable. And FITTS-CORNER: a press at panel pixel `(0,0)` — the
 ///    zero-aim corner flick, a MISS before the corner cell existed — opens it too.
 /// 3. **every item resolves to its verb** — [`item_at`] at each item row's centre answers About,
 ///    Sleep, Restart, Shut Down in tree order. This is the leg that proves Shut Down is REACHABLE as
@@ -1040,12 +1048,13 @@ pub fn selftest() {
         }
         None => false,
     };
-    // Leg 2b — FITTS-CORNER: the panel's top-RIGHT pixel (SO4 moved the mark there), the zero-aim flick
-    // target, opens too. The corner principle asserted at its extreme point, not a sample in the glyph —
-    // that pixel was a MISS before the corner cell existed. Dismiss first so the press is judged by the CLOSED arm; the
-    // reopened menu is exactly the state leg 3 wants.
+    // Leg 2b — FITTS-CORNER: panel pixel (0,0), the zero-aim flick target, opens too. This is the
+    // corner principle asserted at its extreme point, not a sample inside the glyph: (0,0) was a MISS
+    // before the corner cell existed, and it is also the pixel the 2026-09-06 re-ruling names — the
+    // crystal is the Mac menu, so the Mac menu's corner must be live. Dismiss first so the press is
+    // judged by the CLOSED arm; the reopened menu is exactly the state leg 3 wants.
     dismiss("corner-leg");
-    let corner_ok = press_at(pw as i32 - 1, 0) && OPEN.load(Ordering::Acquire);
+    let corner_ok = press_at(0, 0) && OPEN.load(Ordering::Acquire);
 
     let mr = menu_rect(pw, ph);
     let placed = mr.is_some();

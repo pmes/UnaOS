@@ -46,12 +46,12 @@
 //! | bottom keyline | — | [`theme::FRAME_LINE`], 1 px |
 //! | top bevel | — | [`theme::BEVEL_LIGHT`], [`theme::BEVEL`] px |
 //! | CRYSTAL, leftmost | UnaOS's brand mark (Peter, *"instead of an apple do a small crystal"*) | the kit's blue gem ramp, [`theme::CONTROL_CLOSE`]/`_MID`/`_ZOOM` |
-//! | title, left of crystal | the FOCUSED window's caption, via `wm::dock_scan` | [`theme::TITLE_TEXT_ACTIVE`] |
+//! | title, right of crystal | the FOCUSED window's caption, via `wm::dock_scan` | [`theme::TITLE_TEXT_ACTIVE`] |
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
 //! router itself; the SHARD menu ([`super::crystal`]) claims the crystal's corner cell
-//! ([`crystal_corner_abs`] — FITTS-CORNER, the bar's whole upper-RIGHT corner since SO4, not just the glyph)
+//! ([`crystal_corner_abs`] — FITTS-CORNER, the bar's whole upper-LEFT corner, not just the glyph)
 //! through the ONE shared furniture router [`strip::press_route`], which both arch routers call
 //! ahead of every window arm.
 //! Every other point on the bar falls through to whatever is behind it. The witness line says so
@@ -105,8 +105,9 @@
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
-//! A small faceted gem at the RIGHT edge since SO4 (Peter, render7: *"it should be all the way to the
-//! right edge"*) — where macOS puts its status group, not its apple. `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
+//! A small faceted gem FLUSH to the panel's LEFT edge — exactly where macOS puts its apple, which is
+//! what the crystal IS (Peter, re-ruling 2026-09-06, orin 17: the crystal is the Mac menu, top-left;
+//! close the gap). `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
 //! [`theme::CONTROL_BOX`] so it reads as the same size-family as the window's traffic-light controls.
 //! It is drawn from the kit's OWN blue accent ramp — three facets lit from the top-right, the
 //! high-contrast seam down the crown reading as a facet edge — reusing three lifted roles `theme.rs`
@@ -221,20 +222,25 @@ const CRYSTAL_W: usize = theme::CONTROL_BOX * 2 / 3;
 /// the pavilion (the rest) tapers to the point. Two-fifths, the classic brilliant-cut proportion.
 const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
 
-/// SO4 — **the crystal's RIGHT SLOT**, and the whole of the geometry rule this arc changes.
+/// **The crystal's LEFT SLOT**, and the whole of the geometry rule this constant carries.
 ///
-/// Peter, render7 2026-09-06: *"crystal menu has a gap to the left as should be seen in scr 5 and it
-/// should be all the way to the right edge"*. The mark used to sit one [`strip::PAD`] in from the bar's
-/// LEFT edge, where macOS puts its apple, and its dropdown hung from that inset at `+12`. It now sits
-/// FLUSH to the bar's RIGHT edge — where macOS puts its STATUS group — with zero outside inset: the gap
-/// he named is the one this constant refuses to spend. The slot is the glyph plus one PAD of clearance
-/// on its INNER (left) side, which is what separates the mark from the clock beside it.
+/// Peter, re-ruling 2026-09-06 (orin 17): *the crystal is the Mac menu, top-left; close the gap.*
+/// The mark's home is the panel's upper-LEFT corner, always — it is UnaOS's apple, and an apple menu
+/// that migrates is not an apple menu. Two earlier readings are both wrong and both recorded so the
+/// next reader does not re-derive either: the mark once sat one [`strip::PAD`] in from the left, and
+/// its dropdown hung from that inset at `menu=170x121+12+34` (the gap Peter named on render7); and
+/// `bb513370` then MISREAD "close the gap" as "move to the other edge" and sent the whole group
+/// flush right. **When Peter says there is a gap on the left, the answer is to CLOSE the gap** — not
+/// to spend it, and not to move the thing that has it. So the glyph's outside inset is ZERO: the
+/// crystal starts at bar-relative `x = 0`. The slot is the glyph plus one PAD of clearance on its
+/// INNER (right) side, which is what separates the mark from the caption beside it.
 const CRYSTAL_SLOT: usize = CRYSTAL_W + strip::PAD;
 
-/// The title's left inset. With the crystal moved to the RIGHT edge (SO4) the caption no longer has to
-/// start past it, so it takes the bar's own left inset — one [`strip::PAD`] — and the bar reads
-/// caption, then menus, from the very left edge with nothing before them.
-const TITLE_X0: usize = strip::PAD;
+/// The title's left inset: past the crystal's whole slot, which is [`CRYSTAL_SLOT`] — the glyph flush
+/// at `x = 0` plus its one PAD of inner clearance. macOS puts the apple leftmost and the app menus to
+/// its right; the caption takes that same slot here. (Before the 2026-09-06 re-ruling this was
+/// `PAD + CRYSTAL_W + PAD` — the extra term was the outside inset the ruling deletes.)
+const TITLE_X0: usize = CRYSTAL_SLOT;
 
 /// WINMENU (R21) — **the caption's SLOT, which is fixed-width, and where the window's menus begin.**
 ///
@@ -259,11 +265,12 @@ const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
 /// The panel width below which the bar declines: the insets, the clock, the crystal's slot, and at
 /// least one glyph of title. Below it the bar would be a strip with nothing legible on it.
 ///
-/// The `+ CRYSTAL_SLOT` term is the brand mark's own slot. SO4 moved that slot from the bar's left to
-/// its right and dropped the outside inset, so the floor loses one [`strip::PAD`] and is otherwise the
-/// same arithmetic: the crystal costs the bar its width and one gap wherever it sits. Still far below
-/// every suite panel (152 vs 640/1280/1920), so no gate declines.
-const FLOOR_W: usize = 3 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W;
+/// The `+ CRYSTAL_SLOT` term is the brand mark's own left slot: the crystal pushes the title inset
+/// right, so the floor that guarantees "crystal, one title glyph, and the clock all fit" grows by the
+/// slot. The crystal's OUTSIDE inset is zero (the 2026-09-06 re-ruling), so the two PADs left are the
+/// title-to-clock gap and the clock's own right inset. Still far below every suite panel, so no gate
+/// declines — [`FLOOR_W`] is asserted `<= 640` below, which is the claim that matters.
+const FLOOR_W: usize = 2 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W;
 
 const _: () = {
     // The caption must fit inside the bar it is centred in, or there is nothing to draw.
@@ -284,16 +291,19 @@ const _: () = {
     assert!(CRYSTAL_CROWN_H > 0);
     assert!(CRYSTAL_CROWN_H < CRYSTAL_H);
     assert!(CRYSTAL_W >= 4);
-    // SO4 — the crystal and the clock must not collide on the SMALLEST panel the bar draws on. They
-    // are now NEIGHBOURS at the right end: the crystal owns `[FLOOR_W - CRYSTAL_W, FLOOR_W)` and the
-    // clock ends one PAD before it. This is the clock's left edge staying to the right of the title's
-    // first glyph, so a metric change that would slide the time under the caption fails the BUILD.
-    assert!(TITLE_X0 + CELL_W <= FLOOR_W - CRYSTAL_SLOT - strip::PAD - CLOCK_GLYPHS * CELL_W);
-    // The crystal's slot must fit in the floor panel at all, with the clock's own slot beside it.
-    assert!(CRYSTAL_SLOT + strip::PAD + CLOCK_GLYPHS * CELL_W < FLOOR_W);
+    // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
+    // owns `[0, CRYSTAL_W)` — flush left, no outside inset — and the clock
+    // `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL_W, FLOOR_W - PAD)`; this is the gap between them staying
+    // positive, so a future metric change that would overlap them fails the BUILD rather than painting
+    // the gem over the time.
+    assert!(CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    // The title, shifted past the crystal's slot, must still leave room for at least one glyph before
+    // the clock on the floor panel.
+    assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
     // FITTS-CORNER: the press cell (`crystal_corner_abs`, CRYSTAL_SLOT wide by the bar's height, at the
-    // bar's RIGHT end) must CONTAIN the painted glyph box, or a press on the visible mark could miss its
+    // bar's LEFT end) must CONTAIN the painted glyph box, or a press on the visible mark could miss its
     // own menu. The horizontal half is the load-bearing one; vertical containment is the bevel assert.
+    // The glyph starts at 0 and the cell starts at 0, so this is the widths.
     assert!(CRYSTAL_W <= CRYSTAL_SLOT);
 };
 
@@ -964,21 +974,25 @@ pub fn compose() -> bool {
     true
 }
 
-/// SO4 — the crystal's box-relative top-left in the bar: FLUSH to the bar's right edge (no outside
-/// inset — "all the way to the right edge"), centred vertically. THE ONE offset both the painter and
-/// [`crystal_box`] read, so the mark the fixture witnesses is the mark the painter drew. A bar too
-/// narrow to seat the glyph answers 0 rather than wrapping, and the floor asserts forbid that panel.
+/// The crystal's box-relative top-left in the bar: **`x = 0`, FLUSH to the bar's left edge** — no
+/// outside inset, because the bar is `frame_flush(Top)` and so the bar's left edge IS the panel's;
+/// centred vertically. THE ONE offset both the painter and [`crystal_box`] read, so the mark the
+/// fixture witnesses is the mark the painter drew.
+///
+/// The zero is the 2026-09-06 re-ruling in one term: *close the gap*. It is not a defaulted constant
+/// — [`CRYSTAL_SLOT`] spends its one PAD on the INNER side, where it separates the mark from the
+/// caption, and spends nothing on the outer side, where it would only push the mark off the corner.
 #[inline]
-fn crystal_offset(w: usize, h: usize) -> (usize, usize) {
-    (w.saturating_sub(CRYSTAL_W), (h - CRYSTAL_H) / 2)
+fn crystal_offset(h: usize) -> (usize, usize) {
+    (0, (h - CRYSTAL_H) / 2)
 }
 
 /// The crystal's rect on the PANEL, for the witness — `(x, y, w, h)`, absolute. A function of the bar
 /// rect and nothing else, so `crystal=WxH+X+Y` on the fixture line is falsifiable against where the
 /// painter put it.
 fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
-    let (rx, ry, w, h) = r;
-    let (ox, oy) = crystal_offset(w, h);
+    let (rx, ry, _w, h) = r;
+    let (ox, oy) = crystal_offset(h);
     (rx + ox, ry + oy, CRYSTAL_W, CRYSTAL_H)
 }
 
@@ -994,16 +1008,18 @@ pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 ///
 /// Peter, at the Orin bench (2026-08-25): *"the crystal menu took too much exact aim to open — the
 /// ENTIRE upper left corner where it lives should open the menu, not clicking directly on the
-/// crystal."* The glyph box is 16x22 with a [`strip::PAD`] inset on every side — a Fitts target that
+/// crystal."* The glyph box is 16x22 inside a 34-row bar — a Fitts target that
 /// demands aim at exactly the place aim should be free: a screen corner is the one target a flick
 /// reaches with none, because the edges stop the pointer. So the PRESS target and the PAINT box part
 /// ways here: [`crystal_box_abs`] stays the painter's and the dropdown-anchor's truth, and this cell
 /// is what the click router hits against.
 ///
-/// Derived, not hardcoded. SO4 MIRRORED it: the cell is now the bar's upper-RIGHT corner, because that
-/// is where the mark went, and the Fitts argument is a property of a CORNER, not of the left one. It
-/// spans the crystal's whole slot — [`CRYSTAL_SLOT`] wide (`CRYSTAL_W + PAD`: the glyph flush to the
-/// right edge plus its inner margin) by the bar's full height. Every pixel of the cell is a pixel the
+/// Derived, not hardcoded: anchored at the bar rect's own origin — the true panel corner, since the
+/// bar is `frame_flush(Top)`, so `(0,0)` is inside it by construction — and spanning the crystal's
+/// whole left slot, [`CRYSTAL_SLOT`] wide (`CRYSTAL_W + PAD`: the glyph flush at `x = 0` plus its one
+/// inner margin, i.e. everything left of the title's inset) by the bar's full height. `bb513370`
+/// mirrored this cell to the upper-RIGHT; the 2026-09-06 re-ruling puts it back, because the crystal
+/// is the Mac menu and the Mac menu is top-left. Every pixel of the cell is a pixel the
 /// BAR paints and composites above the windows, so widening the press target to it steals nothing: a
 /// window dragged under the corner is under the bar there, and a press on visible bar chrome routing
 /// to bar furniture is the fixed-furniture rule, not an exception to it.
@@ -1012,7 +1028,7 @@ pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// a press with no bar still falls through to the arms below.
 pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     let (bx, by, bw, bh) = strip_rect(pw, ph)?;
-    Some((bx + bw.saturating_sub(CRYSTAL_SLOT), by, CRYSTAL_SLOT.min(bw), bh))
+    Some((bx, by, CRYSTAL_SLOT.min(bw), bh))
 }
 
 /// WINMENU (R21) — **where the focused window's menu titles begin**, as an offset from the bar's own
@@ -1038,13 +1054,14 @@ pub fn caption_x0() -> usize {
 /// WINMENU (R21) — **the panel-absolute x the menu titles must stop before**: the clock's left edge,
 /// less one [`strip::PAD`].
 ///
-/// Derived from the SAME terms [`compose_row`] draws the clock at ([`CLOCK_GLYPHS`], [`strip::PAD`] and
-/// — since SO4 — [`CRYSTAL_SLOT`], because the clock now sits INSIDE the crystal rather than at the far
-/// edge) rather than restated, so a title can never be laid out under the time or under the mark. A bar
-/// too narrow to hold them answers its own left edge, which lays out no titles.
+/// Derived from the SAME two terms [`compose_row`] draws the clock at ([`CLOCK_GLYPHS`] and
+/// [`strip::PAD`]) rather than restated, so a title can never be laid out under the time. The crystal
+/// does not appear here: it holds the bar's LEFT corner (2026-09-06 re-ruling), so it bounds where the
+/// titles BEGIN ([`MENUS_X0`], via [`TITLE_X0`]) and not where they must stop. A bar too narrow to hold
+/// the clock at all answers its own left edge, which lays out no titles.
 pub fn menus_right_limit(bar: strip::Rect) -> usize {
     let (bx, _by, bw, _bh) = bar;
-    let need = CRYSTAL_SLOT + 2 * strip::PAD + CLOCK_GLYPHS * CELL_W;
+    let need = 2 * strip::PAD + CLOCK_GLYPHS * CELL_W;
     bx + bw.saturating_sub(need)
 }
 
@@ -1132,9 +1149,9 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         out[i] = fill;
     }
 
-    // The brand CRYSTAL, overlaid at the RIGHT edge (SO4). Drawn BEFORE the text early-return because
+    // The brand CRYSTAL, overlaid FLUSH at the LEFT edge. Drawn BEFORE the text early-return because
     // the gem spans more rows than the glyph cell does — it is centred in the whole bar, not the band.
-    let (cx0, cy0) = crystal_offset(w, h);
+    let (cx0, cy0) = crystal_offset(h);
     if j >= cy0 && j < cy0 + CRYSTAL_H {
         let v = j - cy0;
         for u in 0..CRYSTAL_W {
@@ -1184,12 +1201,13 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     let cap_ink = if m.menus.app_open() { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
     super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
 
-    // Clock, right — but INSIDE the crystal since SO4, one PAD to the mark's left, so the brand keeps
-    // the corner. Secondary ink: the title is what the operator reads, the clock what they glance at.
+    // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of
+    // the brand sits out here. Secondary ink: the title is what the operator is reading, the clock is
+    // what they glance at.
     if let Some(c) = m.clock {
         let cw = CLOCK_GLYPHS * CELL_W;
-        if w > cw + strip::PAD + CRYSTAL_SLOT {
-            super::font::draw_row(out, w, &c, w - CRYSTAL_SLOT - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+        if w > cw + strip::PAD {
+            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
         }
     }
 }
@@ -1311,7 +1329,8 @@ pub fn selftest() {
     let dismissed = SLOT.packed() == 0;
 
     // Leg 7 — the crystal is drawn, and inside the bar. `r` is the enabled rect (from leg 3); the
-    // crystal box must be the compiled size, sit wholly within it, and (SO4) be FLUSH to its right edge.
+    // crystal box must be the compiled size, sit wholly within it, and be FLUSH to its LEFT edge — the
+    // 2026-09-06 re-ruling's falsifier at the paint end: zero gap, zero inset, the Mac menu's corner.
     let (cbx, cby, cbw, cbh) = r.map(crystal_box).unwrap_or((0, 0, 0, 0));
     let crystal_ok = match r {
         Some((brx, bry, brw, brh)) => {
@@ -1321,7 +1340,8 @@ pub fn selftest() {
                 && cbx + cbw <= brx + brw
                 && cby >= bry
                 && cby + cbh <= bry + brh
-                && cbx + cbw == brx + brw // SO4: flush to the bar's right edge, no gap
+                && cbx == brx // flush to the bar's LEFT edge: no gap, no inset
+                && cbx + cbw <= brx + TITLE_X0 // and left of where the title begins
         }
         None => false,
     };
