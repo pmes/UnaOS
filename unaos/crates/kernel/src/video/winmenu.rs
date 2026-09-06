@@ -1272,7 +1272,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     // SO3 — **the BRAND MARK keeps its corner.** Before this arc the title boxes began at
     // `menus_x0()` (193 px in) and could not reach the crystal; the app box begins one `TPAD` before
-    // the caption's glyphs (34 px), and `crystal_corner_abs` runs to `TITLE_X0` (40) — so six pixels
+    // the caption's glyphs (22 px — 28 − TPAD 6, since CRYSTALFIX 1046f81c; was 34 under bb513370), and `crystal_corner_abs` runs to `TITLE_X0` (40) — so six pixels
     // now belong to two surfaces, and `strip::press_route` asks THIS arm first. Declining them keeps
     // the SHARD menu reachable at every pixel it has always been reachable at; what is lost is six
     // pixels of the app box's left padding, which carries no glyph.
