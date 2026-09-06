@@ -46,7 +46,7 @@
 //! Every directory read goes through [`crate::shell::vfs_ls_collect`] — the ONE collector VFS-1
 //! (adoption) left behind when it deleted the per-volume ones. Quarry therefore inherits, for free and
 //! by construction: longest-prefix mount resolution, the VFS-4 `-ENODEV` guard for a reserved-but-
-//! unbound volume, the synthesized mount-point rows (`/fat`, `/usb`) below a listed path, and the
+//! unbound volume, the synthesized mount-point rows (`/boot`, `/usb`) below a listed path, and the
 //! `.`/`..` filter. It never names a backend, never calls `fat::mount()`, and never calls
 //! `unafs::with_unafs()`. The volume list on the left is [`MountTable::prefixes`], read from the same
 //! table the collector builds.
@@ -71,11 +71,11 @@
 //!    candidate partition) before a single directory sector is read. On top of that v1's model asked
 //!    for the SAME directory twice on every navigation: [`Model::expand`] collects a row's children
 //!    and [`Model::show`] then collects the identical path again for the list pane. Landing on
-//!    `/fat` therefore cost ~4 mount probes and 2 root-directory walks where 1 of each would do.
+//!    `/boot` therefore cost ~4 mount probes and 2 root-directory walks where 1 of each would do.
 //!    The fix is [`Model::collect_cached`] — see §Cost below.
-//! 2. **"/fat is LISTED TWICE."** Not a rendering bug and not a collector bug: v1 made *every* mount
-//!    prefix a tree ROOT (`mt.prefixes()` = `/`, `/fat`, `/usb`) and then expanded `/`, whose
-//!    listing carries the same mount points as synthesized child rows. `/fat` was a depth-0 root
+//! 2. **"/boot is LISTED TWICE."** Not a rendering bug and not a collector bug: v1 made *every* mount
+//!    prefix a tree ROOT (`mt.prefixes()` = `/`, `/boot`, `/usb`) and then expanded `/`, whose
+//!    listing carries the same mount points as synthesized child rows. `/boot` was a depth-0 root
 //!    AND a depth-1 child of `/`, both naming the same path. [`root_prefixes`] is the fix and it is
 //!    a statement about namespaces rather than about FAT: **a mount point claimed by another mount
 //!    point is not a root — it is reached through its parent.** `/` claims everything, so on this
@@ -88,10 +88,10 @@
 //!    [`DOUBLE_CLICK_MS`] for the honest derivation.
 //! 4. **"where is vug, where is the kernel."** True, and measurable: the native UnaFS root that v1
 //!    opened on holds exactly two files (`K3HELLO.TXT`, `K3PAT.BIN` — see `arroyo`'s staging step),
-//!    while the card a person means when they say "my card" is `/fat`, with `KERNEL8.IMG`,
+//!    while the card a person means when they say "my card" is `/boot`, with `KERNEL8.IMG`,
 //!    `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the firmware on it. v1 was not hiding anything; it
 //!    landed on the emptiest volume in the namespace. [`Model::landing`] fixes that with a rule
-//!    stated on the wire rather than a hardcoded `/fat`.
+//!    stated on the wire rather than a hardcoded `/boot`.
 //!
 //! ## Cost, measured rather than asserted
 //!
@@ -426,7 +426,7 @@ fn collect(_path: &str) -> Result<(bool, Vec<DirEnt>), String> {
 }
 
 /// Every mount prefix, sorted. NOT the tree's roots — see [`root_prefixes`], which is the fix for
-/// the duplicate `/fat`.
+/// the duplicate `/boot`.
 ///
 /// This is the one call that costs a `vfs_mount_table()`, and therefore a USB probe, so the model
 /// makes it exactly once per `reload_roots` and remembers the answer in `Model::mounts`.
@@ -477,12 +477,12 @@ fn prefix_claims(q: &str, p: &str) -> bool {
     p.len() == q.len() || p.as_bytes()[q.len()] == b'/'
 }
 
-/// **The `/fat`-listed-twice fix.** Reduce a mount prefix list to the prefixes that are genuinely
+/// **The `/boot`-listed-twice fix.** Reduce a mount prefix list to the prefixes that are genuinely
 /// ROOTS of the tree — those not claimed by some OTHER prefix in the same list.
 ///
-/// v1 made every prefix a depth-0 row and then expanded `/`, whose listing carries `/fat` and `/usb`
+/// v1 made every prefix a depth-0 row and then expanded `/`, whose listing carries `/boot` and `/usb`
 /// as synthesized mount-point rows (`shell::vfs_ls_collect`'s "mount points immediately below
-/// `path`" arm). So `/fat` was a root AND a child of the root — one path, two rows, which is what
+/// `path`" arm). So `/boot` was a root AND a child of the root — one path, two rows, which is what
 /// the bench saw. Dropping the row would have been the wrong repair: the CHILD row is the correct
 /// one, because it is where the path actually lives in the one namespace and it is what a person
 /// means by "inside my machine". So the ROOT row goes, and the rule that removes it is a statement
@@ -729,7 +729,7 @@ impl Model {
     /// gives the table itself, inherited rather than re-invented.
     ///
     /// The roots are [`root_prefixes`] of the mount list, NOT the mount list — that is the
-    /// duplicate-`/fat` fix, and the reason it lives here rather than in the painter is that the
+    /// duplicate-`/boot` fix, and the reason it lives here rather than in the painter is that the
     /// duplicate was a MODEL fact: two rows existed, both real, both naming one path.
     fn reload_roots(&mut self) {
         let keep = self.tree.get(self.tree_sel).map(|r| r.path.clone());
@@ -794,7 +794,7 @@ impl Model {
     ///
     /// The measurement that motivates it is in `arroyo`'s own staging step: the native UnaFS volume
     /// this machine mounts at `/` is built with exactly two files on it (`K3HELLO.TXT`, `K3PAT.BIN`),
-    /// while `/fat` is the boot card — `KERNEL8.IMG`, `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the
+    /// while `/boot` is the boot card — `KERNEL8.IMG`, `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the
     /// firmware. v1 opened on `/`, saw two files, and was correctly called dumb. It was not hiding
     /// the kernel's own files from the owner; it had simply landed on the emptiest volume there was.
     ///
@@ -1821,7 +1821,7 @@ pub fn open() {
 /// every refresh. None of them is a verdict; they are measurements, and each one answers a bench
 /// complaint in the terms it was made in.
 ///
-///  * `volumes=` — the mount prefixes and the ROOT rows they reduced to. `/fat listed twice` is
+///  * `volumes=` — the mount prefixes and the ROOT rows they reduced to. `/boot listed twice` is
 ///    convicted or cleared by comparing the two lists, without a photograph.
 ///  * `reads=/hits=/cycles=` — the cost of the listing path. `reads` is seam calls actually made,
 ///    `hits` is the calls the cache answered; on this machine an open used to make four and now
@@ -1835,7 +1835,7 @@ fn census(when: &str) {
     };
     let roots: Vec<&str> = m.tree.iter().filter(|r| r.depth == 0).map(|r| r.path.as_str()).collect();
     serial_println!(
-        "[quarry] {} volumes mounts={:?} roots={:?} tree-rows={} (a mount claimed by another mount is not a root — that is the duplicate-/fat rule)",
+        "[quarry] {} volumes mounts={:?} roots={:?} tree-rows={} (a mount claimed by another mount is not a root — that is the duplicate-/boot rule)",
         when, m.mounts, roots, m.tree.len()
     );
     serial_println!(
@@ -2582,7 +2582,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         status: None,
     };
     m.tree.push(TreeRow { path: String::from("/"), name: String::from("/"), depth: 0, expanded: false });
-    m.tree.push(TreeRow { path: String::from("/fat"), name: String::from("fat"), depth: 0, expanded: false });
+    m.tree.push(TreeRow { path: String::from("/boot"), name: String::from("fat"), depth: 0, expanded: false });
     let before = m.tree.len();
     // Splice a synthetic level under row 0 the way `expand` would, then prove `collapse` removes
     // exactly it — the property a hand-rolled index walk gets wrong when a sibling follows.
@@ -2601,15 +2601,15 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     if m.subtree_len(0) != 3 {
         return Err("subtree_len did not stop at the sibling");
     }
-    // The SELECTION follows the rows. Select the later sibling (`/fat`, now at index 4) and prove the
+    // The SELECTION follows the rows. Select the later sibling (`/boot`, now at index 4) and prove the
     // collapse leaves the highlight ON IT rather than dragging it back onto the row that closed — the
     // defect a bare `sel > i` test has, and the reason the arithmetic below has three cases.
     m.tree_sel = 4;
     m.collapse(0);
-    if m.tree.len() != before || m.tree[1].path != "/fat" {
+    if m.tree.len() != before || m.tree[1].path != "/boot" {
         return Err("collapse did not restore the tree exactly");
     }
-    if m.tree_sel != 1 || m.tree[m.tree_sel].path != "/fat" {
+    if m.tree_sel != 1 || m.tree[m.tree_sel].path != "/boot" {
         return Err("collapse moved the selection off the sibling it was on");
     }
     // And a selection INSIDE the subtree has nowhere to go but the row that closed over it. Spliced
@@ -2657,18 +2657,18 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("list press-to-row did not clear the header");
     }
 
-    // ── leg 6: the duplicate-root rule — the `/fat`-listed-twice fix, as a property ───────────────
+    // ── leg 6: the duplicate-root rule — the `/boot`-listed-twice fix, as a property ───────────────
     // `prefix_claims` first, because `root_prefixes` is only as good as the boundary rule under it.
-    if !prefix_claims("/", "/fat") || !prefix_claims("/usb", "/usb/a") || !prefix_claims("/usb", "/usb") {
+    if !prefix_claims("/", "/boot") || !prefix_claims("/usb", "/usb/a") || !prefix_claims("/usb", "/usb") {
         return Err("prefix_claims failed to claim a path its prefix owns");
     }
-    if prefix_claims("/usb", "/usbfoo") || prefix_claims("/fat", "/") || prefix_claims("/fat", "/usb") {
+    if prefix_claims("/usb", "/usbfoo") || prefix_claims("/boot", "/") || prefix_claims("/boot", "/usb") {
         return Err("prefix_claims claimed a path across a name boundary");
     }
     // THE DEFECT, in one assertion: this is exactly the live mount table of a Pi with a stick in it,
     // and v1 turned it into three depth-0 rows, two of which the expanded `/` then repeated.
     let live: Vec<String> =
-        alloc::vec![String::from("/"), String::from("/fat"), String::from("/usb")];
+        alloc::vec![String::from("/"), String::from("/boot"), String::from("/usb")];
     let rooted = root_prefixes(&live);
     if rooted.len() != 1 || rooted[0] != "/" {
         return Err("root_prefixes did not reduce a rooted namespace to its single root");
@@ -2679,14 +2679,14 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("root_prefixes is not idempotent");
     }
     let shuffled: Vec<String> =
-        alloc::vec![String::from("/usb"), String::from("/"), String::from("/fat")];
+        alloc::vec![String::from("/usb"), String::from("/"), String::from("/boot")];
     if root_prefixes(&shuffled) != rooted {
         return Err("root_prefixes depends on the order of the mount table");
     }
     // …and it must not HIDE a volume on a table with no root mount, which is the failure mode the
     // lazy fix ("just drop everything but `/`") would have had on an arch that has not adopted the
     // VFS root, or on a namespace assembled from peers.
-    let rootless: Vec<String> = alloc::vec![String::from("/fat"), String::from("/usb")];
+    let rootless: Vec<String> = alloc::vec![String::from("/boot"), String::from("/usb")];
     if root_prefixes(&rootless).len() != 2 {
         return Err("root_prefixes hid a volume on a table with no root mount");
     }
@@ -2774,7 +2774,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // Disk-free, exactly as leg 4's tree is: the list is hand-built, so the leg is honest on a
     // machine with no volume at all.
     m.cache.clear();
-    m.cwd = String::from("/fat");
+    m.cwd = String::from("/boot");
     m.list = alloc::vec![
         DirEnt { name: String::from("VUG.ELF"), kind: NodeKind::File, size: 12568, mtime: None },
         DirEnt { name: String::from("CONFIG.TXT"), kind: NodeKind::File, size: 842, mtime: None },
@@ -2801,7 +2801,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     }
     match (content_press(&mut m, px_x, row0_y), clock_live) {
         (Act::Launch(p), true) => {
-            if p != "/fat/VUG.ELF" {
+            if p != "/boot/VUG.ELF" {
                 return Err("the double-click launched the wrong path");
             }
         }
@@ -2825,7 +2825,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     let _ = content_press(&mut m, px_x, row1_y);
     match (content_press(&mut m, px_x, row1_y), clock_live) {
         (Act::NoOpener(p), true) => {
-            if p != "/fat/CONFIG.TXT" {
+            if p != "/boot/CONFIG.TXT" {
                 return Err("the unhandled double-click named the wrong path");
             }
         }
@@ -2967,7 +2967,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // must still not eat the stamp.
     let _ = wheel_scroll(&mut m, list_x, list_y, -1);
     match (content_press(&mut m, px_x, row0_y), clock_live) {
-        (Act::Launch(p), true) if p == "/fat/VUG.ELF" => {}
+        (Act::Launch(p), true) if p == "/boot/VUG.ELF" => {}
         (Act::None, false) => {} // the zero-clock guard, as everywhere else in this battery
         (_, true) => return Err("a scroll between two presses broke the double-click"),
         (_, false) => return Err("a double-click fired on a zero clock"),

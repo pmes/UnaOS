@@ -552,7 +552,7 @@ fn main() {
     // WINX-5: the x86 EL0 persistence program (crates/user-stat, built by arroyo's build_user_stat_x86
     // to target/STAT-X86.ELF). Copy it onto the ESP as STAT.ELF so the metal boot media carries it, the
     // same way HELLO.BIN reaches the volume just above; the x86 shell's `run`/`bg` read the FAT boot
-    // partition's root, so `bg /fat/STAT.ELF` finds it there. The name is un-suffixed ON the volume
+    // partition's root, so `bg /boot/STAT.ELF` finds it there. The name is un-suffixed ON the volume
     // (STAT.ELF, not STAT-X86.ELF) because the operator command should read the same on both arches —
     // the arch suffix exists only in target/, where both arches' images share one directory.
     // Absent when the program wasn't built (a bare `cargo run` in builder/) — then `run`/`bg` simply
@@ -560,14 +560,14 @@ fn main() {
     let stat_elf = target_dir.join("STAT-X86.ELF");
     if stat_elf.exists() {
         std::fs::copy(&stat_elf, esp_dir.join("STAT.ELF")).unwrap();
-        println!("   WINX: copied STAT.ELF onto the ESP (bg /fat/STAT.ELF)");
+        println!("   WINX: copied STAT.ELF onto the ESP (bg /boot/STAT.ELF)");
     } else {
         println!("   WINX: target/STAT-X86.ELF absent — ESP has no STAT.ELF (run via ./arroyo esp-x86)");
     }
 
     // WINX-7: the x86 EL0 mini-vug (crates/user-vug, built by arroyo's build_user_vug_x86 to
     // target/VUG-X86.ELF), staged as VUG.ELF exactly like STAT.ELF above and for the same reasons —
-    // un-suffixed on the volume so `bg /fat/VUG.ELF` reads the same on both arches.
+    // un-suffixed on the volume so `bg /boot/VUG.ELF` reads the same on both arches.
     //
     // VUGSCENE: THREE images, not one. `crates/user-vug` is built three times from the same source —
     // adaptive (VUG.ELF), pinned to the classic wireframe (VUGC.ELF) and pinned to the full shard
@@ -586,7 +586,7 @@ fn main() {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
             std::fs::copy(&vug_elf, esp_dir.join(dst)).unwrap();
-            println!("   WINX: copied {dst} onto the ESP (bg /fat/{dst})");
+            println!("   WINX: copied {dst} onto the ESP (bg /boot/{dst})");
         } else {
             println!("   WINX: target/{src} absent — ESP has no {dst} (run via ./arroyo esp-x86)");
         }
@@ -594,11 +594,11 @@ fn main() {
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
     // target/PULSE-X86.ELF), staged as PULSE.ELF exactly like STAT.ELF/VUG.ELF above and for the same
-    // reasons — un-suffixed on the volume so `bg /fat/PULSE.ELF` reads the same on both arches.
+    // reasons — un-suffixed on the volume so `bg /boot/PULSE.ELF` reads the same on both arches.
     let pulse_elf = target_dir.join("PULSE-X86.ELF");
     if pulse_elf.exists() {
         std::fs::copy(&pulse_elf, esp_dir.join("PULSE.ELF")).unwrap();
-        println!("   PULSE: copied PULSE.ELF onto the ESP (bg /fat/PULSE.ELF)");
+        println!("   PULSE: copied PULSE.ELF onto the ESP (bg /boot/PULSE.ELF)");
     } else {
         println!("   PULSE: target/PULSE-X86.ELF absent — ESP has no PULSE.ELF (run via ./arroyo esp-x86)");
     }
@@ -621,7 +621,7 @@ fn main() {
     //     carries no boot-device handle, so the kernel cannot learn what it booted from, let alone
     //     read it.
     //
-    // So `bg /fat/STAT.ELF` searches the USB stick while the build put STAT.ELF on the ESP. When the
+    // So `bg /boot/STAT.ELF` searches the USB stick while the build put STAT.ELF on the ESP. When the
     // operator boots a SINGLE stick that is both, the two coincide and everything works — which is
     // precisely why this went unnoticed: the `esp-x86` procedure assumed one stick, and the bench has
     // two devices. The kernel-side message even calls the mounted volume "the boot partition", which
@@ -649,7 +649,7 @@ fn main() {
         (target_dir.join("VUGC-X86.ELF"), "VUGC.ELF"),
         (target_dir.join("VUGX-X86.ELF"), "VUGX.ELF"),
         // KVUG: the kernel-vug image rides the data volume for the same reason the pins do — `bg
-        // /fat/VUGK.ELF` must reach the volume the kernel actually reads.
+        // /boot/VUGK.ELF` must reach the volume the kernel actually reads.
         (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {

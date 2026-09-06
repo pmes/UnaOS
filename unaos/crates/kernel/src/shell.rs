@@ -209,7 +209,7 @@ mod bind {
     /// Asked; nothing mounted (the decline path).
     pub const DECLINED: u8 = 1;
     // VFSROUTE: the three HANDLE codes are stamped only where a program source is bound — the x86
-    // arm of `vfs_mount_table` and the x86 exec probe. aarch64 mounts NAMED volumes (`/`, `/fat`,
+    // arm of `vfs_mount_table` and the x86 exec probe. aarch64 mounts NAMED volumes (`/`, `/boot`,
     // `/usb`) and never asks the block layer "which handle holds the programs", so it stamps only
     // the write gate's ADMITTED/REFUSED_RO/DECLINED.
     #[cfg(target_arch = "x86_64")]
@@ -368,7 +368,7 @@ const _: () = {
 // ls so it lists."*
 //
 // He is describing the defect exactly. Before this arc a file verb CHOSE a filesystem: `ls` picked
-// unafs on aarch64 and FAT on x86, `cat` had two bodies, and every mutating verb ran a `/fat`/`/usb`
+// unafs on aarch64 and FAT on x86, `cat` had two bodies, and every mutating verb ran a `/boot`/`/usb`
 // prefix test (RELICS's `native_target`) to decide whether to call `unafs_verb_*` or walk `fat.rs`.
 // That is "adding each filesystem to ls", and the next volume would have added a third arm to every
 // one of them.
@@ -642,7 +642,7 @@ fn fs_rmdir(console: &mut Console, arg: &str) {
 /// Returns the byte count, or a formatted error line.
 ///
 /// **A cross-volume copy now works**, and it works for free: the read side asks whichever backend
-/// owns `src` and the write side asks whichever owns `dst`, so `cp /K3HELLO.TXT /fat/HELLO.TXT`
+/// owns `src` and the write side asks whichever owns `dst`, so `cp /K3HELLO.TXT /boot/HELLO.TXT`
 /// moves bytes between the native volume and the FAT card. The pre-VFSROUTE verb could not — it held
 /// ONE `FatFs` and both ends had to be on it.
 fn vfs_copy_bytes(
@@ -1469,7 +1469,7 @@ fn df_report(console: &mut Console, verb: &str) {
     console.println("Volume      Prefix      Size(KiB)  Used(KiB)  Free(KiB)  Access");
     let mut descriptions: Vec<String> = Vec::new();
     // One TALLY per distinct VOLUME, not per mount: a machine that binds one volume at two prefixes
-    // (x86's `/` + `/fat`, the Orin's ROOTFS pair) would otherwise walk the whole card twice to
+    // (x86's `/` + `/boot`, the Orin's ROOTFS pair) would otherwise walk the whole card twice to
     // print the same number twice. The rows still list every mount — a mount point is a fact — they
     // just share the walk.
     let mut tallied: Vec<(String, u64, u32, u32)> = Vec::new();
@@ -1573,7 +1573,7 @@ fn vfs_print_rows(console: &mut Console, rows: &[crate::fs::vfs::DirEnt], long: 
 /// Peter's question was about exactly this function: a mounted filesystem is listable because it
 /// implements [`crate::fs::vfs::VfsBackend::read_dir`], and `ls` walks whatever the mount table
 /// hands it. There is no unafs arm, no FAT arm and no `/usb` prefix test in here; `ls /` lists the
-/// root volume, `ls /fat` the boot FAT, `ls /usb` the stick, and a volume mounted tomorrow lists
+/// root volume, `ls /boot` the boot FAT, `ls /usb` the stick, and a volume mounted tomorrow lists
 /// with no edit to this file at all.
 ///
 /// Emits the per-invocation `:: ls1: <path>: <names> (N file, M dir) ::` serial witness unchanged —
@@ -1847,7 +1847,7 @@ fn parse_wallclock(args: &[&str]) -> Option<crate::clock::WallTime> {
 /// `ls` on this arch, replacing the two per-volume collectors (`pi_ls_collect` against unafs and
 /// `pi_usb_ls_collect` against the USB FAT) that the verb used to choose between with a hand-rolled
 /// `/usb` prefix test. The volume is now decided by [`MountTable::resolve`] — the same longest-prefix
-/// rule `run`, `bg` and `mount` already obey — so `ls /` lists native UnaFS, `ls /fat` the SD boot FAT
+/// rule `run`, `bg` and `mount` already obey — so `ls /` lists native UnaFS, `ls /boot` the SD boot FAT
 /// and `ls /usb` the stick, with no verb-side dispatch and no volume the verb has to know about.
 ///
 /// Returns `(is_dir, rows)` sorted by name. A directory yields its entries; a plain file yields its
@@ -1881,7 +1881,7 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     let mut rows = mt
         .read_dir(path)
         .map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
-    // Mount points immediately below `path` — `/fat` and `/usb` when listing `/`. Boundary-matched
+    // Mount points immediately below `path` — `/boot` and `/usb` when listing `/`. Boundary-matched
     // the way the resolver matches, and only for prefixes that are actually bound, so an absent
     // stick contributes no row (honest hot-plug, doc §6).
     let base = if path == "/" { "" } else { path };
@@ -2274,7 +2274,7 @@ impl midden_core::Volume for FatVolume {
     /// aarch64 is not x86 with a different mnemonic set here: x86 has no VFS, so its whole path
     /// universe IS the program-source FAT and "resolve from the cwd" already means "resolve on the
     /// volume executables live on". On the Pi those are two different statements — `/` is native
-    /// UnaFS and the executables are on `/fat` — so the faithful port is not the x86 code with the
+    /// UnaFS and the executables are on `/boot` — so the faithful port is not the x86 code with the
     /// mount swapped, it is [`exec_resolve`]: the cwd first (so `ls`/`cat`/`run` and a bare name
     /// agree about what a name means, VFS-1's whole point), then the program-source root. See
     /// `exec_resolve` for the order and why it is the same order.
@@ -3414,8 +3414,8 @@ fn shell_relics_native_witness() {
 // namespace and answers off whichever volume it happens to hold. So the legs are written against a
 // PROBE NAME taken off the root volume's own listing, and then require that name to appear under a
 // DIFFERENT volume's prefix if and only if the two prefixes resolve to the same volume. On aarch64
-// `/` is native UnaFS and `/fat` is the boot FAT, so a `ls`/`cat`/`stat` that had kept its old
-// FAT-direct body would show a native file under `/fat` and the leg reds. On x86 the two prefixes
+// `/` is native UnaFS and `/boot` is the boot FAT, so a `ls`/`cat`/`stat` that had kept its old
+// FAT-direct body would show a native file under `/boot` and the leg reds. On x86 the two prefixes
 // ARE one volume, and the same expression requires the opposite answer — so neither arch's leg can
 // pass by being stuck.
 //
@@ -3484,7 +3484,7 @@ pub fn vfsroute_witness() {
     // identities themselves — not the pass/fail of a predicate over them. So every mounted prefix
     // publishes its `volume_id`, and `same_volume` is asked over every PAIR of mounted prefixes, on
     // every board, on every boot of a witness build. That is what makes "is `/` the same volume as
-    // `/fat` here?" a reading off the wire instead of an argument, and it is the same line whether
+    // `/boot` here?" a reading off the wire instead of an argument, and it is the same line whether
     // the board is the Orin (one card at two prefixes), x86 (one source at two prefixes), or the Pi
     // (UnaFS and FAT on ONE card, which must still read as two volumes).
     //
@@ -3513,50 +3513,50 @@ pub fn vfsroute_witness() {
             ":: vfsroute: the root volume ({}) lists no file — ls/cat/stat legs skipped ::", root_vol),
         Some(p) => {
             let root_path = vfs_join("/", &p.name);
-            let fat_path = vfs_join("/fat", &p.name);
+            let fat_path = vfs_join("/boot", &p.name);
 
             // --- THE ORACLE, AND IT DOES NOT ASK `same_volume` (VOLID, orin 18) --------------
             //
-            // "Are `/` and `/fat` one volume?" is the fact legs 2 and 3 assert against, and it
-            // used to be computed as `mt.same_volume("/", "/fat")` — the router asked about
+            // "Are `/` and `/boot` one volume?" is the fact legs 2 and 3 assert against, and it
+            // used to be computed as `mt.same_volume("/", "/boot")` — the router asked about
             // itself. A wrong `same_volume` moved the EXPECTATION the same way it moved the
             // answer, so every leg agreed with the bug: exactly the shape that let rmbp 15's C1
             // (one Orin card mounted twice under two names, read as two volumes) sit under a
             // green transcript.
             //
             // The independent fact is THE OBJECT. `/` listed a file with a name and a byte
-            // count; the two prefixes address one volume exactly when `/fat` shows THAT object —
+            // count; the two prefixes address one volume exactly when `/boot` shows THAT object —
             // same name, same kind, same size — reached by a plain `stat` through the resolver,
             // which consults no identity at all. That is a different verb from the two legs it
             // then feeds, so no leg compares an expression with itself.
             //
-            // Two-sided on every board by construction: on the Pi `/` is UnaFS and `/fat` is the
+            // Two-sided on every board by construction: on the Pi `/` is UnaFS and `/boot` is the
             // boot FAT and neither holds the other's files (observed FALSE); on x86 and on the
             // Orin's card both prefixes address one directory (observed TRUE). A `same_volume`
             // stuck at either constant therefore reds this leg on one of the two shapes.
             let observed_same = matches!(
                 mt.stat(&fat_path),
                 Ok(s) if matches!(s.kind, NodeKind::File) && s.size == p.size);
-            let reported_same = mt.same_volume("/", "/fat").unwrap_or(false);
+            let reported_same = mt.same_volume("/", "/boot").unwrap_or(false);
             serial_println!(
-                ":: volid: oracle probe={} size={} stat(/fat/probe)_matches={} same_volume={} ::",
+                ":: volid: oracle probe={} size={} stat(/boot/probe)_matches={} same_volume={} ::",
                 p.name, p.size, observed_same, reported_same);
             verdict(
                 "vfsroute.samevol",
                 reported_same == observed_same,
                 &alloc::format!(
-                    "reported={} observed={} probe={} size={} id(/)={:?} id(/fat)={:?}",
+                    "reported={} observed={} probe={} size={} id(/)={:?} id(/boot)={:?}",
                     reported_same, observed_same, p.name, p.size,
                     mt.volume_id("/").ok().flatten(),
-                    mt.volume_id("/fat").ok().flatten()),
+                    mt.volume_id("/boot").ok().flatten()),
             );
             // Legs 2 and 3 assert against the OBSERVED fact, never against the router's own
             // claim — see the oracle note above.
 
-            // --- leg 2: `ls`. The probe appears under `/`, and under `/fat` IFF the two prefixes
+            // --- leg 2: `ls`. The probe appears under `/`, and under `/boot` IFF the two prefixes
             //     are the same volume. A verb that ignored the prefix would show it under both.
             let ls_root = witness_capture(|c| vfs_ls(c, "/", false)).join(" | ");
-            let ls_fat = witness_capture(|c| vfs_ls(c, "/fat", false)).join(" | ");
+            let ls_fat = witness_capture(|c| vfs_ls(c, "/boot", false)).join(" | ");
             let in_root = ls_root.contains(p.name.as_str());
             let in_fat = ls_fat.contains(p.name.as_str());
             verdict(
@@ -3568,7 +3568,7 @@ pub fn vfsroute_witness() {
             );
 
             // --- leg 3: `cat`. The same shape on the read path: the probe reads under `/`, and
-            //     under `/fat` IFF one volume. "Reads" is asserted as "did not print an error
+            //     under `/boot` IFF one volume. "Reads" is asserted as "did not print an error
             //     line", and the negative half as "did", so both directions are convictable.
             let cat_root = witness_capture(|c| vfs_cat(c, &root_path)).join(" | ");
             let cat_fat = witness_capture(|c| vfs_cat(c, &fat_path)).join(" | ");
@@ -3615,7 +3615,7 @@ pub fn vfsroute_witness() {
     // has no directory removal, so `NativeBackend` inherits the default there too. Before VFSROUTE
     // that keystroke walked fat.rs looking for the name on the BOOT PARTITION — the silent
     // fall-through this arc exists to delete.
-    let fat_attr = mt.remove_attr("/fat/VFSROUTE.TXT", "k", SHELL_PRINCIPAL);
+    let fat_attr = mt.remove_attr("/boot/VFSROUTE.TXT", "k", SHELL_PRINCIPAL);
     let fat_refused = fat_attr == Err(VfsError::Unsupported);
     let native_rmdir = mt.remove_dir("/VFSROUTE.DIR", SHELL_PRINCIPAL);
     // On a board whose root volume IS a FAT mount, `remove_dir` is implemented and answers about the
@@ -4180,7 +4180,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "cd" => {
             // JD4: change the shell's working directory. No argument (or `/`) returns to the root.
-            // VFSROUTE: resolved through the mount table, so `cd /fat` and `cd /usb` are ordinary
+            // VFSROUTE: resolved through the mount table, so `cd /boot` and `cd /usb` are ordinary
             // directory changes rather than names that only one volume's walker understands. The
             // stored cwd is the normalized namespace path — a path string, not a cached chain head,
             // so a swapped card can only ever produce an honest `-ENOENT`.
@@ -4415,15 +4415,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
-            // exit status. Rides the SAME `MountTable` the `mount` verb uses (`/fat` = FAT boot partition,
-            // `/usb` = USB stick, `/` = native UnaFS), so `run /fat/ELFHELLO.ELF` loads the boot-partition
+            // exit status. Rides the SAME `MountTable` the `mount` verb uses (`/boot` = FAT boot partition,
+            // `/usb` = USB stick, `/` = native UnaFS), so `run /boot/ELFHELLO.ELF` loads the boot-partition
             // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
             // runs them under user mode + the fault-kill net. `run <path>`.
             //
             // X86RUN (GR20): also on x86, where the read side differs (there is no VFS namespace on
             // this arch) but nothing else does — see `read_el0_image`'s x86 twin for the path rules.
-            // `run /fat/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's root there.
+            // `run /boot/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's root there.
             match args.first() {
                 None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
@@ -5125,7 +5125,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))] // NOT widened to `tegra_el0` with its neighbours, DELIBERATELY — the one process verb that is not. `storm` is the only arm reaching past the process table into board hardware: it reads `storm_slots` (= `arch::boot`, the BCM2711 slot pool; `arch::uslots` is the facade an Orin port would use) and spawns `storm_fat_writer`, which drives `BlockSource::Usb` and is `#[cfg(feature = "baremetal")]` with no arch arm at all. Whether the Orin gets a FAT-writer leg under storm is a HW-JETSON question about that board's storage, not a gate typo — left to that seat rather than guessed at here. Folded onto this line to stay line-neutral (PARITY.md 5.3).
         "storm" => {
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
-            // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
+            // default 6, so an operator can raise a load storm without typing `bg /boot/VUG.ELF` six
             // times. Each launch is EXACTLY the bg path (same spawn, same job table, same messages);
             // this verb adds the loop and, since STORM-HEADROOM, the MEASUREMENT around the loop. It
             // still decides nothing about how a vug is spawned or where it is placed. Stops honestly
@@ -5222,10 +5222,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
             for _ in 0..n {
-                if !bg_program(console, "/fat/VUG.ELF") {
+                if !bg_program(console, "/boot/VUG.ELF") {
                     // `bg_program` has already said WHY, but not uniformly on this wire: a SPAWN
                     // refusal also prints `:: BGRUN: bg … rejected (…)` to serial, while an
-                    // IMAGE-READ failure (missing, empty or oversized /fat/VUG.ELF) is console-only.
+                    // IMAGE-READ failure (missing, empty or oversized /boot/VUG.ELF) is console-only.
                     // A serial-only capture would therefore be unable to tell the fleet ceiling from
                     // a bad card, which is exactly the confusion this arc exists to remove — so this
                     // line re-reads the census rather than pointing at a neighbour that may not be
@@ -5396,7 +5396,7 @@ fn parse_num(s: &str) -> Option<u64> {
 // truncate / unlink verbs. The shell is the trusted operator console, so it
 // writes as the kernel-authority principal (`KERNEL_PRINCIPAL`) — the same
 // posture the retired `u*` native verbs recorded. Namespace: native UnaFS at `/`, the FAT
-// boot partition at `/fat`, and the hot-plugged USB FAT stick at `/usb` when
+// boot partition at `/boot`, and the hot-plugged USB FAT stick at `/usb` when
 // present (VFS-3, read-only). Both real backends are aarch64-only (the x86 build
 // has neither the unafs module nor a `VfsBackend for FatBackend` impl), so the
 // x86 arm is an honest "unsupported on this arch" line.
@@ -5404,9 +5404,9 @@ fn parse_num(s: &str) -> Option<u64> {
 /// EXEC-1 / X86RUN / VFSROUTE: read an ELF64 user image off the VFS namespace, or explain why not.
 ///
 /// **One body, both arches.** It used to be two: an aarch64 twin that went through the mount table
-/// and an x86 twin that mounted the program source and walked `fat.rs` itself, with the `/fat`
+/// and an x86 twin that mounted the program source and walked `fat.rs` itself, with the `/boot`
 /// prefix hand-rolled as a string rewrite because x86 "has no VFS namespace". x86 has one now — the
-/// mount table binds the program source at `/` and `/fat` — so the prefix is a real mount and both
+/// mount table binds the program source at `/` and `/boot` — so the prefix is a real mount and both
 /// arches ask the same resolver. Every check that could say NO still says it, and each in the same
 /// words as before.
 ///
@@ -6058,19 +6058,19 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
 /// "the volume executables live on".
 ///
 /// x86 has no VFS: its whole path universe is the program-source FAT, so there "resolve from the
-/// cwd" and "resolve on the volume executables live on" are the same sentence, and `/fat` is
+/// cwd" and "resolve on the volume executables live on" are the same sentence, and `/boot` is
 /// carried only as an alias for that one volume's root. On the Pi the two come apart — `/` is
 /// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
-/// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/fat`. This constant is
+/// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/boot`. This constant is
 /// that half of the x86 sentence, named rather than inlined.
 #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
-const EXEC_ROOT: &str = "/fat";
+const EXEC_ROOT: &str = "/boot";
 
 /// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
 ///
 /// **Through the VFS seam, not a private path scheme.** [`vfs_path`] is what `ls`, `cat`, `run`,
 /// `bg` and `mount` resolve through, so a bare name means exactly what those verbs say it means —
-/// `cd /fat` then `vug` works for the same reason `cd /fat` then `cat VUG.ELF` works, and a name
+/// `cd /boot` then `vug` works for the same reason `cd /boot` then `cat VUG.ELF` works, and a name
 /// that `ls` cannot show is a name this cannot launch.
 ///
 /// Order, and it is x86's order transposed rather than a new policy:
@@ -6080,7 +6080,7 @@ const EXEC_ROOT: &str = "/fat";
 ///    would repeat probe 1. On x86 this step is not absent, it is *implied*: its cwd already sits
 ///    on the program source, so its single probe covers both. Dropping it on the Pi would mean the
 ///    operator at `/` still could not type `vug` — the exact defect §6.6a names, with `bg
-///    /fat/VUG.ELF` still the only way in — so it is the step that makes the port a port.
+///    /boot/VUG.ELF` still the only way in — so it is the step that makes the port a port.
 ///
 /// A directory never resolves: a bare name launches a program.
 #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
@@ -6216,9 +6216,9 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 ///
 /// **On aarch64 (PARITY §6.6a)** the same two sentences hold with one substitution: the resolution
 /// is `exec_resolve` — the VFS seam `ls`/`cat`/`run`/`bg` share, cwd first and then the
-/// program-source root `/fat` — and `canon` is recovered by [`exec_canon`] from the parent listing
+/// program-source root `/boot` — and `canon` is recovered by [`exec_canon`] from the parent listing
 /// rather than from a FAT directory entry. Case behaves the same way for the same reason: the FAT
-/// backend behind `/fat` matches components case-insensitively, so arm 2 of the core's resolver
+/// backend behind `/boot` matches components case-insensitively, so arm 2 of the core's resolver
 /// (`vug` → `vug.elf`) already hits the on-disk `VUG.ELF` and the upper-cased arm 3 stays latent
 /// here too.
 ///
@@ -6330,18 +6330,18 @@ fn vfs_path(arg: &str) -> String {
 /// `ls` and `cat` carry two bodies, and Peter's ruling is that they should carry none: a mounted
 /// filesystem is listable because it implements the backend trait, whatever the board.
 ///
-/// **aarch64** binds `/` = native UnaFS, `/fat` = the SD boot partition, and `/usb` = the stick when
+/// **aarch64** binds `/` = native UnaFS, `/boot` = the SD boot partition, and `/usb` = the stick when
 /// it is actually enumerated (honest hot-plug, doc §6). The Orin's ROOTFS knob re-points both `/` and
-/// `/fat` at the Tegra card, since this machine has neither of the first two volumes.
+/// `/boot` at the Tegra card, since this machine has neither of the first two volumes.
 ///
 /// **x86** binds THE PROGRAM SOURCE — `crate::drivers::block::program_source`, resolved through
 /// [`open_read_volume`] so the READ_BIND instrument is stamped exactly as it was when each verb
 /// mounted for itself. That is FATVERB's law, unchanged: the verbs and the exec probe must bind the
 /// same handle, and on a machine booted from the internal SD reader the global slot is the wrong
-/// one. It is bound at BOTH `/` and `/fat`, because `/fat` is the spelling the packaging text, the
+/// one. It is bound at BOTH `/` and `/boot`, because `/boot` is the spelling the packaging text, the
 /// staged-image script and `exec_resolve`'s second probe all use for that one volume — the same
 /// two-prefix shape `sdmmc_root_bind` already uses on the Orin, and honest for the same reason
-/// (`/fat` IS a mount point, so `ls /` showing it is a fact, not decoration).
+/// (`/boot` IS a mount point, so `ls /` showing it is a fact, not decoration).
 ///
 /// An arch with no volume at all returns an EMPTY table, and the verbs report "no filesystem
 /// mounted (-ENODEV)" — which is a better answer than the pre-VFSROUTE `no FAT filesystem (NoDisk)`
@@ -6354,7 +6354,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     {
         use crate::fs::vfs::NativeBackend;
         mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
-        mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/fat` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points BOTH at the card's FAT through BlockSource::TegraSd (`/fat` too, because it is EXEC_ROOT and the literal prefix of /fat/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
+        mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points BOTH at the card's FAT through BlockSource::TegraSd (`/boot` too, because it is EXEC_ROOT and the literal prefix of /boot/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
         // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
         if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
             mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
@@ -6367,7 +6367,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
             let src = fs.source();
             mt.mount("/", alloc::boxed::Box::new(
                 FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
-            mt.mount("/fat", alloc::boxed::Box::new(
+            mt.mount("/boot", alloc::boxed::Box::new(
                 FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
         }
     }
@@ -6408,7 +6408,7 @@ fn vfs_say(console: &mut Console, line: &str) {
 /// "no such file or directory (-ENOENT)". That misdirection cost bench time; the
 /// honest answer is that the *volume* is not mounted. `/` (native) is excluded —
 /// it is always mounted and is the legitimate fall-through for un-prefixed paths.
-const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/fat"];
+const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/boot"];
 
 /// VFS-4: if `path` targets a reserved volume prefix (see
 /// [`RESERVED_VOLUME_PREFIXES`]) that is not present in the live `mounted`
@@ -6485,7 +6485,7 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
 ///
 /// VFSROUTE: routed, and therefore ONE body on both arches. `remove_attr` is a backend capability:
 /// the native UnaFS backend implements it, the FAT backend inherits the trait's refusal, so
-/// `setfattr -x k /fat/F` prints `-ENOTSUP` — FAT's own honest answer — instead of the verb knowing
+/// `setfattr -x k /boot/F` prints `-ENOTSUP` — FAT's own honest answer — instead of the verb knowing
 /// in advance which volume has typed attributes. The previous shape was a `target_arch` split with
 /// an x86 body that refused by name; that refusal was right about x86 for the wrong reason (it is
 /// the VOLUME that has no attributes, not the architecture).

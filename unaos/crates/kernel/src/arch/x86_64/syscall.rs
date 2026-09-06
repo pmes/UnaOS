@@ -16086,7 +16086,7 @@ fn u8_kernel_check() -> bool {
 // preemption boundary. So both `run` and `bg` spawn preemptible here.
 //
 // That is not a downgrade, it is the only correct choice: `STAT.ELF` has NO exit path by design ("runs
-// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /fat/STAT.ELF` would wedge
+// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /boot/STAT.ELF` would wedge
 // the shell task forever with no way back. Preemptible ring 3 (RFLAGS.IF set) is the proven U3.5 path,
 // and the scheduler's reap tears the address space down through `free_user_space_by_cr3` — which, since
 // WINX-1, also retires the task's compositor windows and drops its FB leaves. A killed windowed app

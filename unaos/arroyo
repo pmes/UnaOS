@@ -343,7 +343,7 @@ _feats=""
 # INTERNAL slot, which makes that reader the ONLY program source on the machine — and with the knob
 # off there is no handle for it, so the default x86 image cannot reach its own boot volume. GR26
 # Boot D is the conviction: `[sdhc] … CARD IDENTIFIED`, three ADMA/PIO windows matched, MBR p0
-# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /fat/VUG.ELF`
+# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /boot/VUG.ELF`
 # with nothing to open. Default-on costs a third handle and no global-slot change.
 # REVIEW CORRECTION (GR26): "READ-ONLY at the FAT layer, unconditionally" above is GR20's property and
 # SDHC-4c SUPERSEDED it — `write_sector`/`write_sectors` now admit a span inside the reserved extent
@@ -1201,7 +1201,7 @@ _feats=""
 #
 # THE DEMONSTRATION FLIGHT is the §6.1 conjunction PLUS this knob:
 #     UNAOS_ORINTENANT=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 ./arroyo esp-jetson
-# then `run /fat/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
+# then `run /boot/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
 # create line names the window. `orintenant` alone is also sound (stage reserved, witnesses live,
 # tenants composited beside the raw console) but carries no dock and no click routing; the census
 # prints `desktop_firmware=`/knob fields so a capture names which image shape it ran on.
@@ -1665,12 +1665,12 @@ fi
 # type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by this mapping.
 [ -n "${UNAOS_SDMMCWRITE:-}" ] && _feats="${_feats}sdmmcwrite,sdmmc,"
 # ROOTFS (orin 16, ledger A28): UNAOS_SDMMCROOT=1 gives the VFS a ROOT the Orin actually has. On the
-# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/fat` to BlockSource::Default —
+# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/boot` to BlockSource::Default —
 # neither exists on this machine (the card carries only the FAT32 ESP; nothing registers a Default
 # block device on an Orin boot), so `ls /` and quarry both answered `/: backend error: unafs-mount`.
 # Armed, the table instead binds `/` to the card's FAT volume read through BlockSource::TegraSd (the
-# census-published CMD17 path, metal-proven by A23) and re-points `/fat` at that same volume — `/fat`
-# is `shell::EXEC_ROOT` and the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
+# census-published CMD17 path, metal-proven by A23) and re-points `/boot` at that same volume — `/boot`
+# is `shell::EXEC_ROOT` and the literal prefix of `/boot/VUG.ELF`, `/boot/STAT.ELF`, `/boot/ELFHELLO.ELF`
 # and quarry's launch route, so it is what makes the desktop able to run anything, not decoration.
 # READ-ONLY twice over and NOT by this
 # knob's say-so: BlockSource::TegraSd::write_veto vetoes the source and block::write_block_tegra_sd
@@ -4136,7 +4136,7 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
   # ROOTFS armed (appended 2026-09-06, orin 16) — `sdmmcroot` gates the VFS root bind at the tail of
   # `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_root_bind` + `root_probe` + the verdict cache), the same-line
-  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/fat` mount line
+  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/boot` mount line
   # in `shell::vfs_mount_table`, and the early-probe statement appended to the `sdmmc_census` call line
   # in `main.rs`. The file-tail `impl FatBackend::new_tegra_sd` in `fs/vfs.rs` is
   # gated `all(aarch64, tegra, sdmmc)` — every `arm-tegra*` leg already compiles THAT — but the CALLER
@@ -4740,7 +4740,7 @@ pack_source_along() {
 # WINX-7 PKG — WHY THIS SPLIT NOW. An attended rMBP boot reported
 #   `:: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::`
 # with STAT.ELF verifiably on the booted card: the firmware booted the SD-card ESP while xHCI
-# enumerated a USB stick, so the shell's `bg /fat/STAT.ELF` searched the stick for a file the build
+# enumerated a USB stick, so the shell's `bg /boot/STAT.ELF` searched the stick for a file the build
 # had put on the card. The old one-line instruction ("copy the contents to a FAT32 USB root") was
 # correct for a ONE-STICK boot and silently wrong for a two-device one; naming the two volumes is
 # the fix. On a single stick, write BOTH trees to that one root and everything behaves as before.
@@ -4770,7 +4770,7 @@ esp_x86() {
     echo -e "     DATA volume  <- target/x86_64_data/   (the kernel's FAT mount = the USB stick on storage_slot)"
     echo -e "   ONE stick:  write BOTH trees to that stick's FAT32 root — they do not collide."
     echo -e "   TWO devices (e.g. SD-card ESP + USB stick): esp tree -> the bootable device,"
-    echo -e "               data tree -> the USB stick, or \`bg /fat/VUG.ELF\` reports -ENOENT."
+    echo -e "               data tree -> the USB stick, or \`bg /boot/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
 }
@@ -5316,7 +5316,7 @@ build_one_vug_aarch64() {
 # the only channel a pin can travel down — hence three link products rather than one flag. All three names
 # are 8.3-clean and land in the FAT root beside STAT.ELF/PULSE.ELF, so each gets its own IMAGE_SHA256
 # principal and both reach paths work on them unchanged: Quarry's double-click (`.ELF` is launchable — see
-# video/quarry/live.rs) and `bg /fat/VUGX.ELF` at the shell.
+# video/quarry/live.rs) and `bg /boot/VUGX.ELF` at the shell.
 #
 # The aarch64 names carry no `-ARM` suffix (the x86 ones carry `-X86`) because the aarch64 build IS the
 # staged name: the x86 side stages target/VUG*-X86.ELF *as* VUG*.ELF via builder/make-fat-img, while kernel8
@@ -6338,7 +6338,7 @@ kernel8() {
     fi
     # FATFIX M2: UNAOS_FATPERF=1 adds the `fatperf` feature — the COST INSTRUMENT for the VFS listing
     # and file-read paths. One line per operation, raw words only:
-    #   [fatperf] op=list path=/fat sectors=222 us=13456
+    #   [fatperf] op=list path=/boot sectors=222 us=13456
     # `sectors` is counted at fat.rs's two read funnels (so a chunked multi-block transfer counts the
     # sectors it moved); `us` brackets the whole VFS operation including FatBackend's per-call
     # `mount_source` volume probe — the term quarry.md §11.1 convicted as the per-CALL cost. It is a
@@ -6410,14 +6410,14 @@ kernel8() {
 
     # UVUG-1: carry the mini-vug static ELF64 onto the boot media as VUG.ELF (make-pi-img.sh ditto's the
     # whole staging dir). The kernel's UVUG witness reads it back off the SD through the VFS and runs it via
-    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/VUG.ELF`
+    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /boot/VUG.ELF`
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
     #
     # VUGSTAGE (PARITY §6.6b): the two PINNED siblings ride along — VUGC.ELF (pinlo, the classic wireframe
     # baseline) and VUGX.ELF (pinhi, the full per-pixel shard). x86 media has carried all three since
     # VUGSCENE; this closes the last of that gap on the Pi. They are launched exactly like VUG.ELF —
-    # `bg /fat/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
+    # `bg /boot/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
     # the volume — so no kernel change is needed for them to be reachable, only these bytes on the FAT.
     # Cost against the 64 MiB image is the three sizes printed by build_user_vug_aarch64 above (~10 KiB
     # each): under 0.05% of the volume, and the UVUG witness still reads VUG.ELF, unchanged.
@@ -6426,18 +6426,18 @@ kernel8() {
     cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/VUGX.ELF"
     echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
 
-    # KVUG: the kernel-vug image beside it — `run /fat/VUGK.ELF` / `bg /fat/VUGK.ELF` on the panel. Its own
+    # KVUG: the kernel-vug image beside it — `run /boot/VUGK.ELF` / `bg /boot/VUGK.ELF` on the panel. Its own
     # 8.3 name, so its own IMAGE_SHA256 principal; never collides with VUG.ELF or the flat fixtures.
     cp "${WORKSPACE_DIR}/target/VUGK.ELF" "$KERNEL8_DIR/VUGK.ELF"
 
     # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
     # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and
-    # spawns it detached; the operator drives the same bytes with `bg /fat/STAT.ELF`. Distinct 8.3 name =>
+    # spawns it detached; the operator drives the same bytes with `bg /boot/STAT.ELF`. Distinct 8.3 name =>
     # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or VUG.ELF.
     cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
 
     # PULSE-1: carry the cpu-pulse static ELF64 onto the boot media as PULSE.ELF, same reasoning as STAT
-    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /fat/PULSE.ELF`.
+    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /boot/PULSE.ELF`.
     cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/PULSE.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
@@ -7019,7 +7019,7 @@ battery() {
     # already caught by the generic FAIL scan; these steps require the positive `ok` witness present.
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
-    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /fat/STAT.ELF` / `bg /fat/VUG.ELF` read off a
+    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /boot/STAT.ELF` / `bg /boot/VUG.ELF` read off a
     # REAL attached FAT volume, through the ELF loader, into a compositor window. Same cheap re-grep
     # shape as the usb-write witnesses above (no extra QEMU run): the FAT-attached boot already
     # happened in the `test-fat` step, these two just require its POSITIVE verdicts to be present.

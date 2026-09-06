@@ -277,7 +277,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // family (`uls` `ucat` `utouch` `uwrite` `umkdir` `urm` `umv` `urmattr`) was a second spelling
     // of `ls`/`cat`/`touch`/`write`/`mkdir`/`rm`/`mv` that differed only in which volume it
     // reached, and the plain verbs now reach that volume themselves through the one namespace
-    // (`/` native, `/fat`, `/usb`) - the rule `ls`, `cat`, `run` and `bg` already followed. The
+    // (`/` native, `/boot`, `/usb`) - the rule `ls`, `cat`, `run` and `bg` already followed. The
     // one member with no plain twin, `urmattr`, becomes the standard extended-attribute verb.
     ("setfattr", Avail::Always),
     // RELICS (R26 clause 2): the five `usnap*` spellings collapse into ONE verb with subcommands,
@@ -602,7 +602,7 @@ pub fn help(facts: &Facts) -> String {
     // RELICS (R26 clause 2): the `u*` family retired into the plain file verbs, which reach the
     // native volume through the one namespace. Only the two words with no plain twin are left, and
     // both wear their standard spelling: extended attributes and snapshots.
-    say!("NATIVE:   the plain file verbs reach the native volume: `/` native, /fat boot FAT, /usb stick");
+    say!("NATIVE:   the plain file verbs reach the native volume: `/` native, /boot the boot FAT, /usb stick");
     say!("          setfattr -x <key> <path>  (drop one typed attribute)");
     say!("SNAP:     snap list, snap create <name>, snap drop <gen>  (retained roots / snapshots)");
     say!("          snap ls <gen> [path], snap cat <gen> <path>  (read a snapshot; current-ACL enforced)");

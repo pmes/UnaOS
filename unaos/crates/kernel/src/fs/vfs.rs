@@ -297,7 +297,7 @@ pub trait VfsBackend {
 
     /// Drop one typed attribute (`key`) from the object at `rel`. FAT carries no
     /// typed attributes, so the FAT backend inherits the default refusal and
-    /// `setfattr -x k /fat/F` says so rather than pretending to succeed.
+    /// `setfattr -x k /boot/F` says so rather than pretending to succeed.
     fn remove_attr(&self, _rel: &str, _key: &str, _principal: &str) -> Result<(), VfsError> {
         Err(VfsError::Unsupported)
     }
@@ -574,8 +574,8 @@ impl MountTable {
         }
         // Both remainders are VOLUME-ROOT-relative by construction (each mount strips its own
         // prefix), so when the two mounts are the same volume the destination's remainder is a
-        // valid address on the source's backend — which is what lets `mv /A.TXT /fat/B.TXT` work on
-        // a machine that binds one volume at two prefixes (x86's `/` + `/fat`, the Orin's card).
+        // valid address on the source's backend — which is what lets `mv /A.TXT /boot/B.TXT` work on
+        // a machine that binds one volume at two prefixes (x86's `/` + `/boot`, the Orin's card).
         bf.rename(relf, relt, principal)
     }
 
@@ -585,8 +585,8 @@ impl MountTable {
     /// **Compared by [`VfsBackend::volume_id`] — the volume's STORAGE identity — and the difference
     /// is load-bearing (VOLID, orin 18, rmbp 15 condition C1).** A machine may bind ONE volume at two
     /// prefixes under two different NAMES: `sdmmc_root_bind` mounts the Orin card as `"card"` at `/`
-    /// and as `"fat"` at `/fat`. This compared the two NAMES until VOLID and therefore answered
-    /// `false` for one physical card, refusing `mv /A.TXT /fat/B.TXT` on exactly the configuration
+    /// and as `"fat"` at `/boot`. This compared the two NAMES until VOLID and therefore answered
+    /// `false` for one physical card, refusing `mv /A.TXT /boot/B.TXT` on exactly the configuration
     /// the render9 boot disk flies. A pointer comparison (the shape before that) fails the same way;
     /// the name merely moved the failure one door over. Identity is a fact about the medium, so the
     /// backend answers it off what it reads through, not off what its mount was called.
@@ -696,7 +696,7 @@ fn components(rel: &str) -> impl Iterator<Item = &str> {
 /// VFS-3: the adapter is parametrized by the block [`crate::fs::fat::BlockSource`]
 /// it mounts through, so ONE `MountTable` can carry BOTH FAT volumes the Pi
 /// exposes at once — the SD boot partition ([`Default`](crate::fs::fat::BlockSource::Default),
-/// at `/fat`) and the hot-plugged USB stick ([`Usb`](crate::fs::fat::BlockSource::Usb),
+/// at `/boot`) and the hot-plugged USB stick ([`Usb`](crate::fs::fat::BlockSource::Usb),
 /// at `/usb`) — each reaching its own device.
 ///
 /// USBFALL F3 (was PIUSB-27): a `Usb`-sourced mount is **no longer read-only by
@@ -1983,7 +1983,7 @@ fn checksum(bytes: &[u8]) -> u32 {
 
 // =========================================================================================
 // VFS-3 USB-mount witness — proves the hot-plugged USB FAT stick lives in the VFS namespace
-// (at `/usb`) ALONGSIDE the SD boot FAT (at `/fat`), each routing to its own block device, and
+// (at `/usb`) ALONGSIDE the SD boot FAT (at `/boot`), each routing to its own block device, and
 // that the USB volume is WRITABLE through the table (USB-WRITE cleared the old read-only guard:
 // a `create` at `/usb/...` now lands a real entry rather than being refused).
 //
@@ -1994,7 +1994,7 @@ fn checksum(bytes: &[u8]) -> u32 {
 // posture the whole piusb line already carries ("attended-metal for positive verify").
 // =========================================================================================
 
-/// VFS-3 USB-mount witness: build a `MountTable` carrying the SD boot FAT at `/fat` and the USB
+/// VFS-3 USB-mount witness: build a `MountTable` carrying the SD boot FAT at `/boot` and the USB
 /// FAT stick at `/usb` (each on its own block source), then prove through the table that (a) the
 /// USB volume is reachable — its root lists and a file reads back — and (b) the USB volume is
 /// now WRITABLE: a `create` at `/usb/...` succeeds through the table (USB-WRITE made
@@ -2017,7 +2017,7 @@ pub fn vfs3_usb_mount_witness() {
     let mut mt = MountTable::new();
     // Both FAT volumes in ONE namespace, each on its own device — the SHELL-WRITE flag's core
     // concern (before VFS-3 the FatBackend could only ever reach the Default/boot device).
-    mt.mount("/fat", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    mt.mount("/boot", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
     mt.mount("/usb", Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
 
     // (a) the USB root lists through the table.
@@ -2054,12 +2054,12 @@ pub fn vfs3_usb_mount_witness() {
             return;
         }
     };
-    // (d) the two mounts are independent: /fat still resolves to the Default-source backend and
+    // (d) the two mounts are independent: /boot still resolves to the Default-source backend and
     // its root lists (coexistence — /usb did not displace the boot FAT).
-    let fat_ok = mt.read_dir("/fat").is_ok();
+    let fat_ok = mt.read_dir("/boot").is_ok();
 
     serial_println!(
-        ":: VFS3: usb-mount test — /usb root {} entries, read {} bytes, create-ok={}, /fat coexists={} :: PASS ::",
+        ":: VFS3: usb-mount test — /usb root {} entries, read {} bytes, create-ok={}, /boot coexists={} :: PASS ::",
         entries.len(),
         read_bytes,
         create_ok,
@@ -2085,7 +2085,7 @@ pub fn vfs3_usb_mount_witness() {
 /// VFS-1 (adoption): prove the LIVE mount table routes each namespace to the backend that owns it.
 ///
 /// Legs:
-/// * **fat** — `/fat/…` resolves to the FAT backend with the mount prefix stripped.
+/// * **fat** — `/boot/…` resolves to the FAT backend with the mount prefix stripped.
 /// * **native** — a bare `/…` resolves to the native UnaFS backend, whole path intact.
 /// * **boundary** — `/fatty.bin` and `/usbfoo` are NATIVE names, not volume names: a prefix claims a
 ///   path only at a component boundary (§3.1). This is the negative the seam most needs, because a
@@ -2108,25 +2108,25 @@ pub fn vfs1_routing_witness() {
     // real namespace rather than a fixture of its own.
     let mut mt = MountTable::new();
     mt.mount("/", Box::new(NativeBackend::new("native")));
-    mt.mount("/fat", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    mt.mount("/boot", Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
     let usb_present = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok();
     if usb_present {
         mt.mount("/usb", Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
     }
 
-    // --- leg 1: a /fat path reaches the FAT backend, prefix stripped. -------------------------
-    match mt.resolve("/fat/VUG.ELF") {
+    // --- leg 1: a /boot path reaches the FAT backend, prefix stripped. -------------------------
+    match mt.resolve("/boot/VUG.ELF") {
         Ok((b, rel)) if b.volume_name() == "fat" && rel == "/VUG.ELF" => {
-            serial_println!(":: VFS-1: route /fat/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::");
+            serial_println!(":: VFS-1: route /boot/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::");
         }
         Ok((b, rel)) => {
             serial_println!(
-                ":: VFS-1: route /fat/VUG.ELF -> vol={} rel={} (want fat,/VUG.ELF) :: FAIL ::",
+                ":: VFS-1: route /boot/VUG.ELF -> vol={} rel={} (want fat,/VUG.ELF) :: FAIL ::",
                 b.volume_name(), rel);
             return;
         }
         Err(e) => {
-            serial_println!(":: VFS-1: route /fat/VUG.ELF -> {:?} :: FAIL ::", e);
+            serial_println!(":: VFS-1: route /boot/VUG.ELF -> {:?} :: FAIL ::", e);
             return;
         }
     }

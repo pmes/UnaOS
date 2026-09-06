@@ -2279,8 +2279,8 @@ FORBID \[serfocus\] split .* :: FAIL ::
 # --- What it guards — ten legs, all pure functions over synthetic input, so none of them can be made
 # --- vacuous by a machine with no volume (QEMU raspi4b has no stick; x86 has no mount table at all):
 # ---   * geometry / scroll_follow / thumb / tree splice / press-to-row — M1's five, unchanged;
-# ---   * duplicate roots — `root_prefixes(["/", "/fat", "/usb"]) == ["/"]`, the EXACT live table that
-# ---                       produced the bench's double `/fat`, plus idempotence, order-independence,
+# ---   * duplicate roots — `root_prefixes(["/", "/boot", "/usb"]) == ["/"]`, the EXACT live table that
+# ---                       produced the bench's double `/boot`, plus idempotence, order-independence,
 # ---                       and the two negative claims that reject the lazy fix (it must not hide a
 # ---                       volume on a rootless table, nor drop a `/usbfoo` sibling);
 # ---   * name dedupe    — `dedupe_by_name` keeps the first of each name, in order;

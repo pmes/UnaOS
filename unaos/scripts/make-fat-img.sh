@@ -17,7 +17,7 @@
 #     script never touches a physical disk).
 #   * Linux — mkfs.vfat + mtools (mcopy) + sfdisk. FATIMG-CI: added 2026-07-29. Before it,
 #     this helper was macOS-only, so `./arroyo fat-img` / `test-fat` — and therefore the whole
-#     FAT-ATTACHED configuration, including the WINX-2 `bg /fat/STAT.ELF` end-to-end witness —
+#     FAT-ATTACHED configuration, including the WINX-2 `bg /boot/STAT.ELF` end-to-end witness —
 #     could not run on a Linux box and silently skipped in every automated suite run there.
 #     A fixture that only runs when someone remembers to attach a stick is a fixture that will
 #     be wrong again. Nothing here needs root: mtools writes the filesystem image as a plain
@@ -110,7 +110,7 @@ stage_contents() {
 
     # WINX-5: the x86 EL0 persistence program (crates/user-stat → target/STAT-X86.ELF, built by arroyo's
     # build_user_stat_x86). Copy it onto the image as STAT.ELF so the x86 shell's `run`/`bg` — which read the
-    # FAT boot partition's root — can load it (`bg /fat/STAT.ELF`). Same shape and same freshness argument as
+    # FAT boot partition's root — can load it (`bg /boot/STAT.ELF`). Same shape and same freshness argument as
     # the HELLO.BIN hunk above. Un-suffixed on the volume so the operator command reads the same on both
     # arches; the -X86 suffix exists only in target/, where both arches' images share one directory.
     local STAT_ELF="${WORKSPACE_DIR}/target/STAT-X86.ELF"
@@ -123,7 +123,7 @@ stage_contents() {
 
     # WINX-7: the x86 EL0 mini-vug (crates/user-vug → target/VUG-X86.ELF, built by arroyo's
     # build_user_vug_x86). Same shape, same freshness argument and same un-suffixed on-volume name as the
-    # STAT.ELF hunk above — `bg /fat/VUG.ELF` reads identically on both arches.
+    # STAT.ELF hunk above — `bg /boot/VUG.ELF` reads identically on both arches.
     local VUG_ELF="${WORKSPACE_DIR}/target/VUG-X86.ELF"
     if [ -f "$VUG_ELF" ]; then
         COPYFILE_DISABLE=1 cp "$VUG_ELF" "${S}/VUG.ELF"

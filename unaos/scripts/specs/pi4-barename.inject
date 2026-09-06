@@ -30,7 +30,7 @@ WAIT 240 :: BANDY-ACL:
 # §6.6a-closed repro used and it is kept, now measured from a later and better anchor.
 SLEEP 12
 
-# 1. THE BARE NAME, from `/`. Must resolve VUG.ELF on the program-source volume (`/fat`)
+# 1. THE BARE NAME, from `/`. Must resolve VUG.ELF on the program-source volume (`/boot`)
 #    and launch it DETACHED — the whole point of LAUNCHVUG, and, because VUGSCENE renders
 #    only when the info-page detached bit is set, the drawing path too.
 vug

@@ -184,7 +184,7 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
 // slot, `sdhcblk` is default-on, and `publish_usb_geometry` claims the global UNCONDITIONALLY on
 // x86. So a USB stick inserted merely to CARRY files — the b43 firmware blobs, this week, for real —
 // would claim the global mid-boot and, under the old rule, silently become the program source:
-// `/fat` would stop meaning the volume the machine booted from and `bg /fat/VUG.ELF` would resolve
+// `/boot` would stop meaning the volume the machine booted from and `bg /boot/VUG.ELF` would resolve
 // against the stick.
 //
 // FRGUARD already refuses the WRITE half of exactly that substitution (`BM_SUBSTITUTED`, Boot AI-2,
@@ -414,7 +414,7 @@ pub fn program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
 /// Making the preference above authoritative for that read would mean "to try a firmware blob,
 /// re-flash your boot card", which is a worse OS. The firmware search is READ-ONLY, its whole job is
 /// "find a user-supplied file wherever it is" (it already walks three directories per volume for the
-/// same reason), and none of the hazards the preference closes — `/fat` meaning the wrong volume for
+/// same reason), and none of the hazards the preference closes — `/boot` meaning the wrong volume for
 /// an exec, a write landing on a foreign medium — apply to it.
 ///
 /// Nothing else should use this. A caller that means "the volume this system is bound to" wants

@@ -766,7 +766,7 @@ pub fn desktop_app_service() {
     }
     // SHORT READ. `read_file`'s own doc: a file whose cluster chain ends before `de.size` yields a
     // SHORT READ rather than an error. FATREAD-1 was exactly this class of silent mismatch — it is
-    // what blocked `bg /fat/STAT.ELF` on x86 — and the shell's `read_el0_image` carries this check
+    // what blocked `bg /boot/STAT.ELF` on x86 — and the shell's `read_el0_image` carries this check
     // for that reason. Without it the loader gets a truncated image and reports something unrelated.
     if bytes.len() != de.size as usize {
         serial_println!(

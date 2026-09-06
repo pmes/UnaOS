@@ -3415,7 +3415,7 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     // `handle=UNBUILT`) are distinguishable and each reachable — `register_sdhc` returns false on a
     // zero-block card, and `UNAOS_NOSDHCBLK=1` still builds the third rendering. It is also the
     // discriminator for the NEXT boot: with the knob now default-on, a boot that still fails to
-    // reach `/fat` reads `handle=built register=ok` here and moves the question downstream to
+    // reach `/boot` reads `handle=built register=ok` here and moves the question downstream to
     // `:: SDHCBLK: no FAT volume … ::`, which already separates NotFat from Io.
     #[cfg(feature = "sdhcblk")]
     {

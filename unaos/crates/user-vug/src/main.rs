@@ -6,7 +6,7 @@
 // UVUG-3: the first INTERACTIVE EL0 application — a userspace mini-vug that draws a real vug-style
 // wireframe quartz crystal and responds to live keyboard/mouse. A static ELF64 (aarch64) program,
 // loaded by the kernel's EXEC-1 machinery (`run_user_image`) into a fresh per-process slot and run at
-// EL0 — the identical path the operator drives with `run /fat/VUG.ELF`.
+// EL0 — the identical path the operator drives with `run /boot/VUG.ELF`.
 //
 // WHAT IT DOES
 //   1. WC-C: creates its own 288x288 ARGB8888 WINDOW via SYS_WIN_CREATE — a real compositor window with
@@ -110,7 +110,7 @@
 //
 // The split is by LAUNCH MODE, which the program can already see (the info-page DETACHED bit), not by
 // a kernel-side special case:
-//   * DETACHED (`bg /fat/VUG.ELF` — the desktop spawn): UNBOUNDED. It exits on ESC or `kill`, never on
+//   * DETACHED (`bg /boot/VUG.ELF` — the desktop spawn): UNBOUNDED. It exits on ESC or `kill`, never on
 //     a frame counter. At the frame the old cap would have fired it prints ONE
 //     `[vuglife] budget waived (interactive) frames=<n>` line and keeps running, so the next attended
 //     boot PROVES the waiver fired rather than inferring it from an absence.
@@ -2710,7 +2710,7 @@ pub extern "C" fn _start() -> ! {
     }
     // VUG-BG: read the process-flags word the kernel publishes in the RO info page (base + 0x4000, u32
     // index 0x20/4 — see the info-page layout in userspace.md). Bit 0 says this process was started
-    // DETACHED, i.e. by `bg /fat/VUG.ELF` rather than `run`. A detached vug has no operator to press ESC
+    // DETACHED, i.e. by `bg /boot/VUG.ELF` rather than `run`. A detached vug has no operator to press ESC
     // and, being unfocused, never receives input — so the 300-frame auto cap would end it in about a
     // second, which is exactly what read as "the app crashed" on the bench. Detached therefore means: run
     // the SAME deterministic auto path, but with no frame cap, until `kill` takes it down.

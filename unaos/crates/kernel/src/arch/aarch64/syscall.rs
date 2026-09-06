@@ -8324,7 +8324,7 @@ pub fn spawn_user_image_bg(bytes: &[u8]) -> Result<(u64, u64, u64), &'static str
     // replay the BSP's EL2 regime, so EVERY `bg` is refused. Asking here — before `proc_reserve`,
     // before the image is mapped into a slot — means the refusal costs no unwinding, and (the point)
     // it takes the `Err` arm, which `shell.rs`'s `bg_program` already prints to the CONSOLE. Without
-    // it the shell would report `bg: /fat/vug.elf started — pid 0` and read as a win: task id 0 is a
+    // it the shell would report `bg: /boot/vug.elf started — pid 0` and read as a win: task id 0 is a
     // sentinel nobody at a bench knows, and a refusal that reports success is worse than the board
     // kill it replaces, which was at least unambiguous.
     //
@@ -10494,7 +10494,7 @@ fn elf1_launcher(_demo_cpu: usize) {
 }
 
 /// EXEC-1 witness: prove the panel `run <path>` PATH end-to-end at boot. Reads ELFHELLO.ELF through the VFS
-/// `MountTable` (the same namespace the `run` verb builds — `/fat` = FAT boot partition), then hands the
+/// `MountTable` (the same namespace the `run` verb builds — `/boot` = FAT boot partition), then hands the
 /// bytes to the NEW loader entry `run_user_image`, which maps them into a fresh EL0 slot, runs the program
 /// co-located, and returns its exit status. The ELF-1 launcher's twin, but driven through the VFS read +
 /// `run_user_image` (not the by-name `load_program_into_slot`), so it self-verifies the EXEC-1 integration:
@@ -10515,8 +10515,8 @@ fn exec1_witness(_demo_cpu: usize) {
     }
     use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
-    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
-    let path = "/fat/ELFHELLO.ELF";
+    mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    let path = "/boot/ELFHELLO.ELF";
     let st = match mt.stat(path) {
         Ok(s) => s,
         Err(e) => {
@@ -10596,14 +10596,14 @@ fn bgrun_witness(_demo_cpu: usize) {
     }
     use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
-    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
     let read = |mt: &MountTable, path: &str| -> Option<alloc::vec::Vec<u8>> {
         let st = mt.stat(path).ok()?;
         mt.read(path, 0, st.size as usize).ok()
     };
     // Leg 1: spawn -> exit -> reap on the three-syscall hello program.
-    let Some(hello) = read(&mt, "/fat/ELFHELLO.ELF") else {
-        serial_println!(":: BGRUN-ST: /fat/ELFHELLO.ELF not found — skipped ::");
+    let Some(hello) = read(&mt, "/boot/ELFHELLO.ELF") else {
+        serial_println!(":: BGRUN-ST: /boot/ELFHELLO.ELF not found — skipped ::");
         return;
     };
     match spawn_user_image_bg(&hello) {
@@ -10702,8 +10702,8 @@ fn bgrun_witness(_demo_cpu: usize) {
     }
     // Leg 2: kill mid-run. UVUG runs 300 frames — seconds of runtime, syscalls every frame, so the
     // kill lands on a live target with abundant boundaries.
-    let Some(uvug) = read(&mt, "/fat/VUG.ELF") else {
-        serial_println!(":: BGRUN-ST: /fat/VUG.ELF not found — kill leg skipped ::");
+    let Some(uvug) = read(&mt, "/boot/VUG.ELF") else {
+        serial_println!(":: BGRUN-ST: /boot/VUG.ELF not found — kill leg skipped ::");
         return;
     };
     match spawn_user_image_bg(&uvug) {
@@ -10747,8 +10747,8 @@ fn bgrun_witness(_demo_cpu: usize) {
     // kill it and require the row settles exactly as leg 2 does. The interval is timer-derived (2 s of
     // `cntpct`), comfortably longer than UVUG's whole 300-frame auto run — so "still running" here cannot
     // be confused with "has not got round to exiting yet".
-    let Some(stat) = read(&mt, "/fat/STAT.ELF") else {
-        serial_println!(":: BGRUN-ST: /fat/STAT.ELF not found — persistence leg skipped ::");
+    let Some(stat) = read(&mt, "/boot/STAT.ELF") else {
+        serial_println!(":: BGRUN-ST: /boot/STAT.ELF not found — persistence leg skipped ::");
         return;
     };
     match spawn_user_image_bg(&stat) {
@@ -10886,7 +10886,7 @@ fn killbound_witness() {
 
 /// UVUG-1 witness: prove the mini-vug EL0 graphics program end-to-end at boot. Reads VUG.ELF through the
 /// VFS `MountTable` (the same namespace the panel `run` verb builds) and executes it via `run_user_image` —
-/// the identical path the operator drives with `run /fat/VUG.ELF`. The program maps its off-screen surface
+/// the identical path the operator drives with `run /boot/VUG.ELF`. The program maps its off-screen surface
 /// (SYS_FB_MAP), spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX frame
 /// barrier, presents each frame (SYS_FB_PRESENT), joins both (SYS_THREAD_JOIN), and prints its OWN witness
 /// line `:: UVUG: frames=300 threads=2 checksum=<hex> ::` before exiting 0. This launcher only asserts the
@@ -10907,8 +10907,8 @@ fn uvug_witness(_demo_cpu: usize) {
     }
     use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
-    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
-    let path = "/fat/VUG.ELF";
+    mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    let path = "/boot/VUG.ELF";
     let st = match mt.stat(path) {
         Ok(s) => s,
         Err(e) => {
@@ -13105,12 +13105,12 @@ pub fn el0_focus_revokes() -> u64 {
 }
 
 /// UVUG-8: the ASID of the EL0 app that has entered INTERACTIVE TAKEOVER (0 = none). An EL0 full-screen app
-/// (`run /fat/VUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
+/// (`run /boot/VUG.ELF`) flips to interactive mode the instant it drains its FIRST real input event (the
 /// UVUG-4 input-driven switch) — the same edge the app announces with `:: UVUG: interactive takeover ::`.
 ///
 /// UVUG-8r2 moves the engage edge from PRODUCER to CONSUMER. The first cut latched in `user_input_push` — an
 /// event merely REACHING the ring. That mis-fired on metal at t≈0: `user_input_set_active` reset the per-ASID
-/// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /fat/VUG.ELF` drained
+/// ring but NOT `pal::EVENT_QUEUE`, so the Enter KeyUp left over from typing `run /boot/VUG.ELF` drained
 /// straight into the new app's ring and engaged takeover before the app had run a single frame — giving EVERY
 /// keyboard-launched run (batch apps included, which never poll at all) a suspended deadline. Now the latch is
 /// set by `sys_input_poll` only when the app ACTUALLY CONSUMES a packed event, so it reflects the app's own
@@ -13471,7 +13471,7 @@ fn user_input_push(asid: u64, packed: u64) -> bool {
 pub fn user_input_set_active(asid: u64) {
     // UVUG-8r2: a fresh focus must also start with an empty UPSTREAM queue. `clear_input_row` resets only the
     // per-ASID ring; `pal::EVENT_QUEUE` sits in front of it and, on metal, still holds the tail of the
-    // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /fat/VUG.ELF`. Left there, the
+    // keystroke that LAUNCHED this program — the Enter KeyUp from typing `run /boot/VUG.ELF`. Left there, the
     // router drains it into the new app's ring microseconds after launch, and the app's first poll reads it as
     // genuine in-app interaction (pre-r2, the push itself engaged takeover, so every keyboard-launched run —
     // batch programs included — got a suspended deadline at t≈0). Drain and DISCARD it here: events queued
@@ -14588,7 +14588,7 @@ fn clear_input_parked(asid: u64) {
 /// event (>= 0) or `-EAGAIN` when the ring is empty (or the caller has no private slot — ASID 0). The SPSC
 /// consumer half: this EL0 task is the sole consumer of its own ring.
 fn sys_input_poll() -> i64 {
-    // UVUG-5: an EL0 full-screen app (`run /fat/VUG.ELF`) drives input through THIS syscall every frame —
+    // UVUG-5: an EL0 full-screen app (`run /boot/VUG.ELF`) drives input through THIS syscall every frame —
     // it never touches the kernel `pal::pump_and_poll` path that feeds `gui_watchdog::note_progress`. So the
     // watchdog, armed by `on_app_enter` when the `run` command took the screen, never saw a heartbeat and
     // FALSELY declared the healthy, polling UVUG app wedged at 5 s (`[gui] watchdog app wedged 5s (no drain
@@ -16354,7 +16354,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     fb_launcher(demo_cpu);
     u7stk!("after:fb");
     // UVUG-1: the first REAL EL0 graphics program — the mini-vug. Reads VUG.ELF through the VFS and runs it
-    // via the EXEC-1 `run_user_image` path (the same path `run /fat/VUG.ELF` drives at the panel): it maps an
+    // via the EXEC-1 `run_user_image` path (the same path `run /boot/VUG.ELF` drives at the panel): it maps an
     // off-screen surface, spawns 2 EL0 worker threads that render halves of an animated pattern under a FUTEX
     // frame barrier, presents each frame, joins both, and prints its OWN deterministic
     // `:: UVUG: frames=300 threads=2 checksum=<hex> ::` witness before exiting 0. Placed after `fb_launcher`
@@ -16502,7 +16502,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     u7stk!("after:vfs2_fat_write");
     crate::fs::vfs::vfs2_native_write_witness();
     u7stk!("after:vfs2_native_write");
-    // VFS-1 (adoption): the routing battery for the seam every path verb now shares — /fat reaches
+    // VFS-1 (adoption): the routing battery for the seam every path verb now shares — /boot reaches
     // the FAT backend, a bare path reaches native UnaFS, the boundary negatives (/fatty.bin,
     // /usbfoo) stay native, and a read-only backend refuses every mutating verb through the table.
     // Touches no disk except to read; its own uncounted `:: VFS-1: … ::` lines.

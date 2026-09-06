@@ -1126,9 +1126,9 @@ sdmmcwrite = ["sdmmc"]
 # carries no UnaFS volume, so `ls /` and quarry both answer `/: backend error: unafs-mount`. This
 # feature makes `shell::vfs_mount_table` REBIND `/` to the card's FAT volume, read through
 # `BlockSource::TegraSd` (the census-published `read_block_tegra_sd` path — CMD17 single-block, 1-bit
-# default speed, PROVEN on metal by A23), and re-point `/fat` at the SAME volume — its `Default`
-# source is registered by no Orin boot, and `/fat` is `shell::EXEC_ROOT` and the literal prefix of
-# `/fat/VUG.ELF`, `/fat/STAT.ELF` and `/fat/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
+# default speed, PROVEN on metal by A23), and re-point `/boot` at the SAME volume — its `Default`
+# source is registered by no Orin boot, and `/boot` is `shell::EXEC_ROOT` and the literal prefix of
+# `/boot/VUG.ELF`, `/boot/STAT.ELF` and `/boot/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
 # launch anything at all. READ-ONLY BY CONSTRUCTION and not by policy stated here:
 # `BlockSource::TegraSd::write_veto` is `Some(TEGRA_SD_VETO)` and `write_block_tegra_sd` refuses in
 # every cfg, so no VFS verb can reach the medium. The vendor pad block stays DISABLED (the FWALL
@@ -1942,7 +1942,7 @@ quarry = []
 # `fs/fatperf.rs` and turns the two `#[inline(always)]` shims in `fs/mod.rs` from no-ops into a
 # sector counter (at `fat.rs`'s two read funnels) and a microsecond bracket (around
 # `MountTable::read_dir` / `MountTable::read`), which together print one line per operation:
-#   [fatperf] op=list path=/fat sectors=222 us=13456
+#   [fatperf] op=list path=/boot sectors=222 us=13456
 # Raw words only — no rates, no ratios, no verdict. It changes NO behaviour: the fix (cluster-chain
 # caching, or migration onto ORIN's UnaFS) is a later arc, because the baton forbids building on the
 # FAT namespace twice and a repair chosen before the cost is measured is a guess.
