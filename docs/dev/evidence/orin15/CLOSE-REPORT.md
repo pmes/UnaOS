@@ -49,3 +49,5 @@ CONSOLEQUIET docs `9e030696` (`CONSOLEQUIET.patch` for fbcon.rs to rmbp 12; row 
 Pi panic-on-glass leg demonstrated). fbcon.rs commit waits on rmbp's read.
 MENUBAR union gate on `adb3b1cd`: check exit 0 (both arches), test-arm exit 0, `UNAOS_WC=1 test 150` exit 0 (wc in the
 banner, 69 PASS, 0 panics). Pi image: `kernel8.img` before = after (apply -R method; the value TCURX2.md records).
+CONSOLEQUIET fbcon commit `3329eec6` (approved by rmbp 12; union gate check + test-arm + wc + kernel8 sha running at write
+time — logs `~/unaos-bench/scratch/orin15/*-3329eec6.log`).
