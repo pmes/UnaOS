@@ -1157,6 +1157,14 @@ pub fn selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");
+    // WINMENU (R21/MENUBAR2) — the window-menu fixture chains from here, exactly as
+    // `dock::selftest` chains `menubar::selftest`: the x86 battery names ONE furniture fixture and
+    // the family reaches the rest, so a surface added to `video/` never needs a line in
+    // `arch/x86_64/syscall.rs`, which another lane owns. It runs AFTER this one because it needs the
+    // SHARD menu closed — `winmenu::press_at`'s closed arm declines every point while the crystal is
+    // up, which is the one-dropdown-at-a-time invariant — and this function's restore above has just
+    // guaranteed that.
+    super::winmenu::selftest();
 }
 
 /// SHARD-PRESS fixture (PA41) — **a press on the crystal, through the LIVE furniture router, puts the

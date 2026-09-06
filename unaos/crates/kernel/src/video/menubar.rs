@@ -161,6 +161,30 @@ const CELL_H: usize = wm::TITLE_CELL_H;
 /// glyph calls below can never disagree about which face the bar is drawing.
 const FACE: super::font::Face = super::font::Face::Chrome;
 
+/// SO2 — **the caption's WEIGHT.** The bar draws its app name bold (macOS's rule, recorded at the
+/// `draw_row` call in [`compose_row`]) and its clock regular. It is a `const` rather than a literal
+/// at the call site because [`super::winmenu`] now draws with it too: R21's menus are the bar's own
+/// text, and Peter's SO2 reading of `render7` — *"misplaced and different font from main app menu
+/// item font"* — was exactly this, a window menu set in the bar's face at the bar's cell but NOT at
+/// the bar's weight, so the drop-down read as a different typeface from the name it hangs under.
+const BOLD: bool = true;
+
+/// SO2 — **THE BAR'S TYPE, exported as one set.** `winmenu` took its face and cell from
+/// [`super::crystal`]'s dropdown constants, which happen to resolve to the same atlas — so the two
+/// agreed by coincidence, through a third party, and the one attribute that did NOT come along was
+/// the weight. These four name the bar's own type so a client draws the BAR'S text by construction,
+/// and [`BAR_FONT_NAME`] is what the `[winmenu] open … font=` witness prints, so a capture states
+/// which type the drop-down was set in instead of leaving it to be inferred from pixels.
+pub const BAR_FACE: super::font::Face = FACE;
+/// SO2 — the bar's glyph advance, px. See [`BAR_FACE`].
+pub const BAR_CELL_W: usize = CELL_W;
+/// SO2 — the bar's glyph cell height, px. See [`BAR_FACE`].
+pub const BAR_CELL_H: usize = CELL_H;
+/// SO2 — the bar's text weight. See [`BAR_FACE`].
+pub const BAR_BOLD: bool = BOLD;
+/// SO2 — the bar's type, named for the wire. See [`BAR_FACE`].
+pub const BAR_FONT_NAME: &str = "chrome20-bold";
+
 /// The clock's rendered width in glyphs: `HH:MM`.
 const CLOCK_GLYPHS: usize = 5;
 
@@ -674,6 +698,12 @@ struct Model {
     /// stated on the wire (`[winmenu] publish owner=`) so the two readings can be compared rather
     /// than confused.
     menu_owner: wm::WinId,
+    /// SO3 — **the window the CAPTION names**, i.e. the row [`title`](Self::title) was taken from.
+    /// Distinct from [`menu_owner`](Self::menu_owner) on purpose: that one is the frontmost
+    /// PUBLISHER and this one is the frontmost FOCUSED row, and they differ whenever a window with
+    /// menus sits behind a window without them. The app menu belongs to the name the operator is
+    /// reading, so `Quit` must reap THIS row and not the publisher's.
+    cap_owner: wm::WinId,
     /// WINMENU — the title boxes, laid out once per compose and handed to the row painter. Filled in
     /// by [`compose`] after the rect is settled, because the layout is a function of the bar rect.
     menus: super::winmenu::BarSnapshot,
@@ -686,6 +716,7 @@ impl Model {
             title_len: 0,
             clock: None,
             menu_owner: wm::WIN_NONE,
+            cap_owner: wm::WIN_NONE,
             menus: super::winmenu::BarSnapshot::empty(),
         }
     }
@@ -737,6 +768,7 @@ impl Model {
                 best_z = z;
                 m.title_len = r.title_len.min(wm::MAX_TITLE);
                 m.title = r.title;
+                m.cap_owner = r.id; // SO3 — the app menu's owner is the row the caption came from
             }
         }
         m.menu_owner = menu_owner;
@@ -871,6 +903,11 @@ pub fn compose() -> bool {
     // dropdown whose window has just stopped being frontmost — which must happen BEFORE the snapshot
     // is taken, or this pass would lay out a title box for a menu that is about to be torn down.
     super::winmenu::set_bar_owner(model.menu_owner);
+    // SO3 (Peter's ruling) — publish the CAPTION and the row it names, so the bar's app title is a
+    // menu title like any other. Lock-free stores only; like `set_bar_owner` above this runs INSIDE
+    // `strip::compose_all`, so an owner change here clears menu STATE and never drives a composite
+    // (PANEL V-1's rule, and `winmenu::compose` discharges the erase later in this same pass).
+    super::winmenu::set_app_window(model.cap_owner, &model.title[..model.title_len]);
     model.menus = match rect {
         Some(_) => super::winmenu::bar_boxes(pw, ph),
         None => super::winmenu::BarSnapshot::empty(),
@@ -983,6 +1020,19 @@ pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 #[inline]
 pub fn menus_x0() -> usize {
     MENUS_X0
+}
+
+/// SO3 — **where the CAPTION's glyphs begin**, as an offset from the bar's own origin: [`TITLE_X0`],
+/// the same constant [`compose_row`] hands `draw_row`.
+///
+/// Peter's ruling (SO3, 2026-09-06): *every* app window's name in the bar must open a menu carrying
+/// at least **Quit**. The name is drawn HERE and nowhere else, so this is the anchor the app-menu
+/// title box is laid out around ([`super::winmenu::bar_boxes`]) — one constant, one accessor, so the
+/// box a press lands in is the box the caption's glyphs were drawn in. Exported rather than
+/// duplicated for the reason `crystal_box_abs` records for the brand mark.
+#[inline]
+pub fn caption_x0() -> usize {
+    TITLE_X0
 }
 
 /// WINMENU (R21) — **the panel-absolute x the menu titles must stop before**: the clock's left edge,
@@ -1124,8 +1174,15 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // painted (a RAM scratch row — the read the blend does is cached, never a panel mapping).
     // BOLD, the weight macOS gives the menu bar's app name; the clock stays regular, the same
     // primary/secondary split the two inks already draw.
+    //
+    // SO3 — the caption is the APP MENU's title, so when that menu is down it takes the lit-title
+    // ink `winmenu::draw_bar_row` gives every other open title. The box fill under it was already
+    // laid by that call (it runs above the band return, and box 0 is the caption's); this is the
+    // other half of the same convention, kept HERE because the bar owns the caption's glyphs and
+    // `draw_bar_row` deliberately does not redraw them.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true, FACE);
+    let cap_ink = if m.menus.app_open() { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
+    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
 
     // Clock, right — but INSIDE the crystal since SO4, one PAD to the mark's left, so the brand keeps
     // the corner. Secondary ink: the title is what the operator reads, the clock what they glance at.
