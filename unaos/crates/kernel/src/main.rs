@@ -2492,7 +2492,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // xHCI rings/contexts/buffers are live, and the enumerating port is flagged — so a decoded
             // RAS fault ADDR can be matched from the capture alone. No-op with the knob off.
             unaos_kernel::vugras::boot_witness();
-            unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0);
+            unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0); #[cfg(feature = "tcuprobe")] unaos_kernel::arch::hsp_tegra::tcuprobe_arm(dtb_addr, dtb_size, mmu.ram_gib_mask); // TCURX (orin 14, `tcuprobe`, DEFAULT OFF): the console pump's ARM point is where the DTB, its size and the RAM-GiB mask are all in scope and the pump has just been spawned — so this is the one call site: it resolves the TCU console node + its HSP RX/TX mailboxes from the live DTB, prints `[tcu] hsp …`, takes one read-only sample of the RX mailbox word and spawns the `tcu-probe` sampler task (boot core, cooperative, `[tcu] rx-mbox` census ~1 s). No HSP/UART write, no IRQ enable — see `arch/aarch64/hsp_tegra.rs`. ⚠ LINE-NEUTRAL append, and the attribute sits BEFORE this line's first `//` (P7): panic `Location` records embed line numbers and the knob-off jetson image byte-identity is this track's standing proof.
             serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
         // XCARVE-2 temporal bracket: after the JB2b xHCI attach + enumeration window (the event-ring/ERST

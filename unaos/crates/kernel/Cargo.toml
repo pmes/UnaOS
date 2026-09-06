@@ -2496,6 +2496,35 @@ orindefer = []
 # UNFLOWN — no Orin has booted it; the first flight answers whether UARTC RX is ours. Kept in sync
 # with arroyo.
 orinrx = []
+# TCURX (TCUPROBE): UNAOS_TCUPROBE=1 — the Tegra234 HSP shared-mailbox / Tegra Combined UART (TCU)
+# RX probe, READ-ONLY, DEFAULT OFF. Render4 (A16) determined that the serial RX loss on UARTC
+# (`0x0C28_0000`) is a COMPETING READER: UARTC is the SPE's combined-UART port and the SPE drains the
+# same RBR. On this SoC the CCPLEX's console is meant to run over HSP shared mailboxes between the
+# CCPLEX and the SPE — UEFI itself reads its keystrokes from the TCU RX mailbox (edk2-nvidia,
+# BSD-2-Clause-Patent: `DEBUG_SERIAL_PORT_TCU_RX_MAILBOX` default `0x03C10000` = HSP top0 shared
+# mailbox 0; TX `0x0C168000` = HSP AON shared mailbox 1). This knob compiles
+# `arch/aarch64/hsp_tegra.rs` and ONE call site appended to the console pump's spawn line in
+# `tegra_early_stop`: resolve the `tcu` console node's `mboxes` + the HSP nodes' `reg`/`#mbox-cells`
+# from the LIVE DTB, print `[tcu] hsp top0=… aon=… tx-mbox=… rx-mbox=…`, bound the index by the
+# block's `HSP_INT_DIMENSIONING` (+0x380, read-only), take one sample of the RX mailbox word, then
+# spawn a boot-core sampler task (`tcu-probe`) that reads the word every pass and prints
+# `[tcu] rx-mbox raw=0x… full=<0|1> nbytes=… data=[…] | … full-edges=… -> FULL-NEVER|FULL-SEEN|FULL-NOW`
+# once a second. With render5's burst/paced injection that line discriminates "the SPE forwards RX
+# into the mailbox" (full toggles / the payload carries the byte) from "nothing arrives" — without a
+# single HSP or UART register WRITE and no IRQ enable (the TCU consumer protocol is write-back of
+# the word; this probe deliberately never consumes). Design + the fix path:
+# `docs/dev/evidence/orin14/TCURX-DESIGN.md`. Facts come from the DTB, the public DT bindings and
+# BSD-licensed edk2-nvidia — no GPL driver was read (orin-ledger D3, CLEAN_ROOM_POLICY §6).
+#
+# Implies `tegra` (the HSP blocks and the TCU are Tegra234 silicon — the `orinwdt`/`tegrasmp`/
+# `ga10bprobe1` precedent), so `UNAOS_TCUPROBE=1 ./arroyo check` compiles it alone. DEFAULT OFF =>
+# the module and its call site vanish and the jetson image is byte-identical to baseline (the call
+# site is a same-line append before that line's first `//`, P7; the `mod.rs` declaration is appended
+# to the line that already hosts `selfup_tegra`/`ga10b_probe`, so no Pi-lexed line moves —
+# `kernel8.img` sha measured equal before/after in the TCURX commit). Witness tokens are
+# subsystem-named (`[tcu]`, `[hsp]`). The ARMED polarity is type-checked by the `arm-tegra-tcuprobe`
+# leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping. UNFLOWN — flies on render5/6.
+tcuprobe = ["tegra"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

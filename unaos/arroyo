@@ -1268,6 +1268,17 @@ _feats=""
 # (~1 s). The ARMED polarity is type-checked by the `arm-tegra-orinrx` leg of KERNEL_CFG_MATRIX,
 # never by this mapping. `tegra` appended so the knob is self-sufficient (`orinrx = []` in Cargo).
 [ -n "${UNAOS_ORINRX:-}" ] && _feats="${_feats}orinrx,tegra,"
+# TCURX (TCUPROBE): UNAOS_TCUPROBE=1 arms the READ-ONLY Tegra234 HSP shared-mailbox / TCU RX probe
+# (`arch/aarch64/hsp_tegra.rs`, one call site on the console pump's spawn line in `tegra_early_stop`).
+# Render4 showed UARTC RX is drained by a competing reader (the SPE, A16); UEFI reads its own console
+# input from the TCU RX mailbox (HSP top0 SM0 @ 0x03C10000). Armed, the boot prints
+# `[tcu] hsp top0=… aon=… tx-mbox=… rx-mbox=…` from the live DTB, one `[hsp] dim=…` line, and then
+# `[tcu] rx-mbox raw=0x… full=<0|1> … -> FULL-NEVER|FULL-SEEN|FULL-NOW` once a second — no HSP/UART
+# write, no IRQ enable. DEFAULT OFF; the knob-off image is byte-identical (same-line appends only).
+# `tegra` appended so the knob is self-sufficient (`tcuprobe = ["tegra"]` in Cargo). The ARMED
+# polarity is type-checked by the `arm-tegra-tcuprobe` leg of KERNEL_CFG_MATRIX, never by this
+# mapping. Design: `docs/dev/evidence/orin14/TCURX-DESIGN.md`. UNFLOWN — flies on render5/6.
+[ -n "${UNAOS_TCUPROBE:-}" ] && _feats="${_feats}tcuprobe,tegra,"
 # DESKCASCADE: UNAOS_DESKCASCADE=1 gives the Orin the NORMAL desktop, ONE knob, DEFAULT OFF —
 # `main.rs::tegra_desk_cascade` on the tegra terminus line (after the `orinfurn` seam, before
 # `tegra_render_arm`) calls `desktop_firmware::activate()`, the cascade §5.2 held, bracketed by the
@@ -3164,6 +3175,16 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-orinrx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx"
+  # TCURX armed (orin 14, 2026-09-05) — `tcuprobe` gates `arch/aarch64/hsp_tegra.rs` (the read-only
+  # HSP shared-mailbox / TCU RX probe) and ONE call site appended to the console pump's spawn line in
+  # `tegra_early_stop`. Its own tail leg for the reason `arm-tegra-orinrx` has one: `arm-tegra` is the
+  # DISARMED twin that compiles the shipped default jetson image, whose byte-identity this arc
+  # measures. HOSTED ON `arm-tegra`'s LIST + `tcuprobe` (not `arm-tegra-supstate`'s, unlike orinrx):
+  # the one site lives in `tegra_early_stop`, which every tegra leg compiles, so the bare list already
+  # type-checks it and the resolved set grows by EXACTLY {tcuprobe} — a red here names the knob and
+  # nothing else. UNIVERSE SIDE EFFECT: none that moves a mix count (`tcuprobe` implies `tegra`; every
+  # site is inside `feature = "tegra"` items, so `x86_cfg_universe` drops it). Board legs +1; gate +1.
+  "arm-tegra-tcuprobe ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tcuprobe"
   # ORIN-BSPTICK armed (appended 2026-08-25, Candidate B arc 1) — `bsptick` gates the periodic-EL1-tick
   # block at `arch/aarch64/timer.rs`'s tail (`el1_bsptick_start`, `bsptick_witness`, the two statics),
   # the statement appended to `on_tick`'s closing line, and the statement appended to `main.rs`'s
