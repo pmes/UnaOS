@@ -263,6 +263,49 @@ seam the proof turns.
 
 The middle row is the wiring claim itself. Seven proofs on this gate now, each run and reverted.
 
+## Later grants: WINID, and a gate defect filed back to this seat
+
+**WINID (ASK #6) — granted, and the enumeration was short by one.** orin's design is a holder registry
+in `wm.rs`: `close` clears every registered cell holding the dying id with an id-checked
+compare_exchange, generation-in-the-id refused on the WC-B syscall ABI. My condition — every `wm.rs`
+hunk N→N or a tail append — was measured here rather than read from their table, and all nine hold.
+
+**The finding: `video/wcg.rs:455 SEAM_WIN` is a sixth holder they did not name.** Found by sweeping for
+the shape instead of checking their list: one store tree-wide (`:490`), cleared on no path, compared at
+`:3636` and `:3783`. Not x86-only — `video/mod.rs:73` declares `pub mod wcg;` unconditionally and the
+`:3636` arm is `cfg(not(all(x86_64, wcg-paygo)))`, so aarch64 is exactly what compiles it. And not
+merely diagnostic: the comparison gates a `W_REARM`/`REARM_MAX` decision on the compositor path, so a
+recycled id can let one window's non-CLEAN verdict steer or suppress another's seam re-arm. **A
+registry closes exactly the holders it knows about**, so the condition is to register it or name it in
+the row — the class must not read as closed while a sixth cell caches an id across a close.
+
+Also raised, not blocking: `ORINWM1_WIN` doubles as an idempotence latch cleared on no path, so once
+the registry clears it on close, `orin_wm1` becomes re-mintable. That is probably the intent (it is
+S4's "bring it back"), but it changes a guarantee and the row must say what the second call now does.
+
+**SO6 — filed to this seat by orin, fixed here.** `unaos/arroyo check` run from the repo root red-lined
+the knob→builder probe. Root cause: `${BASH_SOURCE[0]}` is the path arroyo was *invoked* with, so that
+form is relative — and the probe runs after arroyo has cd'd internally, where `unaos/arroyo` no longer
+resolves. Anchored to `$WORKSPACE_DIR/$(basename …)`. Proved from both directories: repo root went
+`control probe FAILED` → `knob→builder wiring OK`, and `unaos/` is unchanged, which is the control.
+
+**The part of SO6 worth keeping is that it failed loudly.** The probe refuses a verdict when its own
+control does not parse, so a broken path cost one executor a build instead of shipping a false green.
+That is the same design GATE-KNOB and the knob→leg check use, and it is the second time this round a
+control probe earned its keep.
+
+**pi 7's residual on the strict trigger, taken.** The trigger is a branch *name*, and this repo has
+renamed its trunk once — CLAUDE.md carries a standing instruction to verify which ref is trunk rather
+than trust it, and the retired `UnaOS-gemini` name is still a live ref on origin that is not main's tip.
+If trunk is renamed again and nobody sets `UNAOS_LEDGER_TRUNK`, strict silently stops firing: "a
+backstop that runs never", returning through the rename door. Documented at the code, with the reason it
+is quiet rather than silent — the DEFERRED line names the regime, so a seat on a renamed trunk reads
+"branch `<newname>` is a track branch" and has the contradiction in front of them.
+
+**And the deferral fired on a real row for the first time**, not a fixture: this seat's own B22 carries
+`→ SO6`, a cross-ref to a row that lives on hw-jetson. It defers, prints by id, exits 0, and becomes a
+red automatically when it lands on trunk — which is the whole design, demonstrating itself.
+
 ## Still owed / flagged
 
 - **J1, the rmbp landing** (72 commits) — needs a fleet, so it needs the focus.

@@ -4096,7 +4096,15 @@ check_kernel_cfg() {
         case "$_leg" in x86-mix-*) : ;; x86-*) _kb_x86="${_kb_x86}${_feats}," ;; esac
     done
     local _kb_map
-    _kb_map="$(sed -n 's/^\[ -n "\${\(UNAOS_[A-Z0-9_]*\):-}" \] && _feats="\${_feats}\([A-Za-z0-9_,-]*\),"$/\1 \2/p' "${BASH_SOURCE[0]}")"
+    # SO6 (orin 16 found it, rmbp 13 fixed it, 2026-09-06): `${BASH_SOURCE[0]}` is the path this script
+    # was INVOKED with, so `unaos/arroyo check` from the repo root makes it relative — and this function
+    # runs after arroyo has cd'd internally, where `unaos/arroyo` no longer resolves. `sed` then read
+    # nothing, the control probe correctly refused a verdict, and the run red-lined with no defect behind
+    # it (WINID lost a build to exactly this). $WORKSPACE_DIR is absolute by construction at the top of
+    # this file, so anchor to it; basename keeps the rename case working. THE CONTROL PROBE IS WHY THIS
+    # WAS A LOUD FAILURE RATHER THAN A SILENT PASS — it is the same design this file's other gates use,
+    # and it earned its keep here.
+    _kb_map="$(sed -n 's/^\[ -n "\${\(UNAOS_[A-Z0-9_]*\):-}" \] && _feats="\${_feats}\([A-Za-z0-9_,-]*\),"$/\1 \2/p' "$WORKSPACE_DIR/$(basename "${BASH_SOURCE[0]}")")"
     case "$_kb_map" in
         *"UNAOS_WC wc"*) : ;;
         *) echo -e "${COLOR_RED}❌ knob→builder wiring: control probe FAILED — UNAOS_WC->wc not parsed from this file's knob map; the map parser is broken. No wiring verdict from this run.${COLOR_RESET}"; return 1 ;;

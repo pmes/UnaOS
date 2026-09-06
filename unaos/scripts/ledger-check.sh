@@ -88,6 +88,15 @@ def reachable(s):
 # reference to a THIRD seat's unlanded row then reds on a branch that could never have carried it. The
 # branch test has no such window because it does not try to infer the landing from the contents.
 #
+# ⚠ THE TRIGGER IS A BRANCH NAME, AND THIS REPO HAS RENAMED ITS TRUNK ONCE (pi 7's residual, taken).
+# CLAUDE.md carries a standing instruction to VERIFY which ref is trunk rather than trust it -- the
+# retired `UnaOS-gemini` staging name is still a live ref on origin and is NOT main's tip. If the trunk
+# is renamed again and nobody sets `UNAOS_LEDGER_TRUNK`, strict silently stops firing and every tree
+# defers forever: "a backstop that runs never", returning through the rename door. What keeps it merely
+# quiet rather than silent is the DEFERRED line naming the regime in force -- a seat standing on a
+# renamed trunk reads "branch `<newname>` is a track branch" and has the contradiction in front of them.
+# Whoever renames the trunk sets `UNAOS_LEDGER_TRUNK` here, or changes this default in the same commit.
+#
 # `UNAOS_LEDGER_STRICT=1` still forces strict anywhere (and `=0` suppresses it, trunk included, for a
 # trunk that is mid-landing and knows it). `UNAOS_LEDGER_TRUNK` names the trunk branch -- it defaults
 # to `main`, is the one knob the go-red proof turns, and is why that proof can run on a track branch.
