@@ -77,6 +77,24 @@ touched, so no `arroyo check` claim is made here.
     right value, wrong provenance. One class, and it is this seat's own standing rule arriving in its
     own outbound messages.
 
+11. **B62/B63/B64 and the env-dep D-row**, all from the same evening's traffic: LAYOUT's spec blast
+    radius is one line (`pi4-barename.spec:63`, and orin ruled its post-rename value `/apps/VUG.ELF`
+    rather than the mechanical `/boot`); GATE-LEDGER reds a split row only when the debris lands in a
+    column it validates, which this seat proved by walking into it twice in one commit; and
+    **GATE-K8REACH cannot see a knob that arrives by `option_env!` instead of a cargo feature** —
+    `UNAOS_DMAWIN` is read in source and armed by no `arroyo` command at all. The last is SR1's class
+    through the other door and the most useful thing the round produced for the gate backlog.
+12. **C1 gained a negative leg and orin adopted it as fold-blocking.** The five briefed values were
+    all positive configurations, which cannot separate "identity implemented" from "identity present
+    but bypassed". Two backends with one `volume_name` over two sources is the case that still means
+    something after someone refactors the comparison.
+
+## Round shape, so far
+Zero executors. Every finding above came from reading a peer's work or from being read by a peer:
+three seats, one evening, and **not one of the stale statements was found by re-reading the file it
+lived in**. The three guards-that-cannot-fire (name-based `same_volume`, the USB-scoped prtscr probe,
+quarry's card-blind stamp) were each found by someone looking for something else.
+
 ## Open at time of writing
 C1 is with orin 18 (either the armed `UNAOS_SDMMCROOT=1` run, or the identity fix, and I review the
 fix same-turn). SHELLRELICS closes when its leg's diff arrives. Everything else in the queue waits
