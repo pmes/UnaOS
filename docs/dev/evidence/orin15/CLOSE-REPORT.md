@@ -33,3 +33,7 @@ ga10bprobe2 (+ tick1).
 ## Process
 The session opened by asking who holds the focus and idled an hour; the rule that produced that is amended and
 tooled (`orin-open.sh`). The session's Fable spend was its context size re-billed per turn — orin 16 opens lean.
+
+## Union gate on the TCURX2 fold (fb5d0d8a)
+`./arroyo check` exit 0 — 69 ✅ / 0 ❌, GATE-KNOB OK, GATE-LEDGER OK (`~/unaos-bench/scratch/orin15/check-fb5d0d8a.log`);
+`./arroyo test-arm 60` exit 0 (`testarm-fb5d0d8a.log`).
