@@ -5321,6 +5321,21 @@ kernel8() {
         K8_FEATS="${K8_FEATS},logts"
         echo -e "${COLOR_YELLOW}  • UNAOS_LOGTS: kernel8 serial lines carry a timestamp prefix (monotonic ms → UTC after sync)${COLOR_RESET}"
     fi
+    # SR1 — UNAOS_BOOTLOG=1 adds the `bootlog` feature. Without this arm the knob is UNREACHABLE for
+    # every Pi bare-metal image (K8_FEATS is curated; see the LOGTS note above), which since
+    # CONSOLEQUIET means a UNAOS_PIDESK=1 image has NO way to put the serial->panel mirror back.
+    # Found by orin 15 via CONSOLEQUIET; lane is rmbp (arroyo is a gate file). OFF => byte-identical.
+    if [ -n "${UNAOS_BOOTLOG:-}" ]; then
+        K8_FEATS="${K8_FEATS},bootlog"
+        echo -e "${COLOR_YELLOW}  • UNAOS_BOOTLOG: kernel8 keeps the full serial->panel mirror (the CONSOLEQUIET escape hatch)${COLOR_RESET}"
+    fi
+    # SR1 — UNAOS_PRTSCRST=1 adds the `prtscrst` feature. Absent this arm the Print Screen self-test
+    # gate greens about nothing on the Pi, which blocked LEDGER S14 for a week without a warning of
+    # any kind. Found by pi 7. OFF => the path is not compiled and the image is byte-identical.
+    if [ -n "${UNAOS_PRTSCRST:-}" ]; then
+        K8_FEATS="${K8_FEATS},prtscrst"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PRTSCRST: kernel8 carries the Print Screen self-test (PRTSCR-ST)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
         K8_FEATS="${K8_FEATS},k2_leave"
         echo -e "${COLOR_YELLOW}  • UNAOS_K2_LEAVE: k2_liveenf → two-boot money-shot mode (boot-1 leaves K2PRIV.BIN; power-cycle; boot-2 verifies)${COLOR_RESET}"
