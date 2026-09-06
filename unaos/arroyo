@@ -1529,6 +1529,21 @@ fi
 # UNAOS_TEGRA=1. Default OFF => module + call sites vanish, smoltcp not pulled, byte-identical to
 # baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
 [ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,"
+# ORIN-NET-5: UNAOS_NET5=1 arms the RING RE-FETCH PROBE on top of the net4 driver — one knob, one boot,
+# one question (arch/aarch64/rtl8168_tegra.rs § NET-5). AFTER `CR = RxEnb|TxEnb` it re-points RX
+# descriptors 1..31 at a tagged SHADOW block in the same Normal-NC window (slot 0 kept as the control),
+# proves the rewrite reached DRAM with an NC readback, and re-stamps EVERY ring + shadow landing tag
+# after each pop — so each pop's landing set means "written SINCE THE PREVIOUS POP" instead of
+# cumulatively, which is the sticky-tag defect that made [net4F]'s "4 consecutive completions wrote ONLY
+# buffer 17" one datum printed four times. After the re-point no descriptor carries buffer 17's address,
+# so a landing there is an address the NIC holds internally. Witnesses: `[net5R]` (arm + readback, or
+# NOT ARMED with the failing precondition), `[net5T]` (per-pop arm: REFETCH-LIVE | REFETCH-WRONGSLOT |
+# STALE-ORIG | PREFETCHED | NOWHERE), `[net5V]` (window-close tally + ranked answer). Implies net4
+# (hence pcie3,pcie2); `esp-jetson` forces tegra, which the driver's metal half needs. Default OFF =>
+# every field, site and string vanishes and the image is byte-identical to a net4 build. The ARMED
+# polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# Design: docs/dev/evidence/orin16/NET5.md. UNFLOWN — flies on net5.
+[ -n "${UNAOS_NET5:-}" ] && _feats="${_feats}net5,net4,pcie3,pcie2,"
 # ORIN-SDMMC-1: UNAOS_SDMMC=1 arms the Tegra234 microSD-slot SDMMC controller READ-ONLY recon — the
 # installer line's first rung (arch/aarch64/sdmmc_tegra.rs). Resolves the controller from the live DTB
 # (compatible/name match, no hardcoded base; the enabled removable instance = the microSD slot), maps
@@ -3244,7 +3259,7 @@ KERNEL_CFG_MATRIX=(
   # {tcuprobe, tcurx} over the already-green `arm-tegra-orinrx`, so a red here names this knob pair and
   # nothing else. UNIVERSE SIDE EFFECT: none that moves a mix count (`tcurx` implies `tegra`; every
   # site is inside `feature = "tegra"` items, so `x86_cfg_universe` drops it). Board legs +1; gate +1.
-  "arm-tegra-tcurx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx,tcuprobe,tcurx"
+  "arm-tegra-tcurx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,net5,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx,tcuprobe,tcurx"
   # ORIN-BSPTICK armed (appended 2026-08-25, Candidate B arc 1) — `bsptick` gates the periodic-EL1-tick
   # block at `arch/aarch64/timer.rs`'s tail (`el1_bsptick_start`, `bsptick_witness`, the two statics),
   # the statement appended to `on_tick`'s closing line, and the statement appended to `main.rs`'s
