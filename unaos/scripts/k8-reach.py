@@ -125,8 +125,37 @@ def site_verdicts(feat, src, ctx):
         if arch == {"x86_64"}:
             res.append((rel, lno, "X86", text)); continue
         near = enclosing_arch(text, pos)
-        res.append((rel, lno, "X86" if (near and "aarch64" not in near) else "PI-LIVE", text))
+        if near and "aarch64" not in near:
+            res.append((rel, lno, "X86", text)); continue
+        res.append((rel, lno, "NEG" if inside_not(text, pos) else "PI-LIVE", text))
     return res
+
+
+def inside_not(line, pos):
+    """Is the feature token at `pos` inside a `not( ... )` group?
+
+    A site where the feature appears as an EXCLUSION term — `not(any(baremetal, tegra_el0,
+    virt_el0))` — is not a site the feature enables; it is a site the feature turns OFF. Counting
+    those as live sites makes an arch-specific knob look Pi-reachable: `virt_el0` reads as 25
+    Pi-live sites on orin 17's JV1 tree and 21 of them are negations (rmbp 14, 2026-09-06). A
+    ruling made on that number would be made on a number that means the opposite of what it says.
+    """
+    depth = 0
+    for m in re.finditer(r'not\s*\(', line):
+        start = m.end() - 1
+        if start > pos:
+            continue
+        d = 0
+        for i in range(start, len(line)):
+            if line[i] == "(":
+                d += 1
+            elif line[i] == ")":
+                d -= 1
+                if d == 0:
+                    if start < pos < i:
+                        return True
+                    break
+    return False
 
 
 def enclosing_arch(line, pos):
@@ -220,9 +249,10 @@ def evidence(name, knob_feats, src):
     for f in feats:
         rows = site_verdicts(f, src, ctx)
         live = sum(1 for r in rows if r[2] == "PI-LIVE")
+        neg = sum(1 for r in rows if r[2] == "NEG")
         imp = sorted(closure(f))
-        print("%s: %d site(s), %d Pi-live%s"
-              % (f, len(rows), live, ("  [implies: %s]" % ", ".join(imp)) if imp else ""))
+        print("%s: %d site(s), %d Pi-live, %d negated%s"
+              % (f, len(rows), live, neg, ("  [implies: %s]" % ", ".join(imp)) if imp else ""))
         for rel, lno, v, text in rows:
             print("  %-14s %s:%s  %s" % (v, rel, lno, text.strip()[:100]))
 
@@ -278,6 +308,7 @@ def main():
             live = 0
             for f in sorted(knob_feats[k]):
                 live += sum(1 for r in site_verdicts(f, src, ctx) if r[2] == "PI-LIVE")
+
             print("%-26s TODO  seeded 2026-09-06; %s"
                   % (k, "no Pi-live cfg site" if live == 0 else "%d Pi-live cfg site(s)" % live))
         return 0
