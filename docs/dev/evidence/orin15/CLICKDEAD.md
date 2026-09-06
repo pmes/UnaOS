@@ -584,3 +584,5 @@ A `grep -a` that only ever reports hits is not a gate. `DUP-DROP`, `NOBUF-DROP`,
 ` nobuf=` are the control: all four are **absent** from the unpatched armed artifact and
 **present** in the patched one, built from the same recipe on the same tree, and a nonsense
 token is 0 in both. Both columns are recorded in §6.3.
+
+> **Reading the census: `nobuf=` is NOT a milder `dup=`.** They are different defects with opposite remedies — `dup` (known duplicate, buffer intact) says re-arm anyway; `nobuf` (`mouse_data_buffer`/`mouse_ring` gone) says the slot's soft state was torn down and re-arming would be wrong. Never add them: `dup + nobuf` equals the silent-exit total by construction, and a census where they do not is itself a bug signal (rmbp 12, 2026-09-06).
