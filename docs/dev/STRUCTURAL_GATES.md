@@ -138,8 +138,10 @@ status that begins with one of `open` · `fixed-unflown` · `flown` · `landed` 
 `owner` column, cross-references (`→ S<n>`) that resolve in `LEDGER.md` — with
 seat-prefixed refs (`SR`/`SO`/`SP`) DEFERRED rather than red when they name a row that
 is still on another branch, printed and counted every run, and turned back into reds by
-`UNAOS_LEDGER_STRICT=1`, which the landing sets because that is the one tree where all
-three seats' ledgers meet — shas
+`UNAOS_LEDGER_STRICT=1` and, with no variable set at all, by being on the trunk
+branch: the trunk enforces, track branches defer. A landing merges to trunk and
+runs the battery there, so it gets strictness without anyone remembering to ask
+for it — shas
 that exist in the repository (and, for a fixed/flown/landed row, are ancestors of
 some track head — a fix nobody can fetch is not fixed), and evidence that lives
 in git: a `unaos-bench/scratch` path is red, a `docs/…` path must exist.

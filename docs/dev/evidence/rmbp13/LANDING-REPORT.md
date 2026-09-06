@@ -230,6 +230,39 @@ That last row is the control, and it is the half a blanket skip would have destr
 fires where the target is local. P14 rewritten, `STRUCTURAL_GATES.md`'s invariant updated, ledger row
 **B21**.
 
+### The follow-up: the backstop was remembered, not wired
+
+pi 7 turned this seat's own criterion back on it within the hour, and they were right. Strict was
+reachable only by a landing seat exporting `UNAOS_LEDGER_STRICT=1` **by hand** — and they measured
+that there is exactly one invocation of the script (arroyo's `check_both`, no environment) and no
+landing-specific gate command for that export to live in. "The landing runs strict" was therefore the
+same shape as the norm-only exits this change was chosen over: one seat's memory away from never
+running.
+
+**Their proposed trigger was declined, with its window measured.** Auto-strict when the tree carries
+two or more distinct seat prefixes reads as structural, but it infers the landing from the tree's
+contents: a track branch inherits another seat's prefix the moment that seat lands to trunk and the
+track syncs, so hw-rmbp gains `SO` rows and is permanently "strict" — and a reference to a *third*
+seat's unlanded row would then red on a branch that could never have carried it. Same false-red class
+as the discriminator already rejected, arriving by a different door. Both rejected alternatives are now
+written at the code with the window that kills them, so neither is re-derived as an improvement.
+
+**What shipped: the branch is the trigger — the trunk enforces, track branches defer.** Semantic
+rather than heuristic, and therefore windowless: on a track branch another seat's row is unresolvable
+by construction and deferring is correct; on trunk it is not, because trunk is where everything lands,
+so a trunk row pointing off-trunk is dangling whoever wrote it. A landing merges to trunk and runs the
+battery there, so strictness arrives exactly where the refs became resolvable with nobody remembering
+it. `UNAOS_LEDGER_STRICT=1` forces, `=0` suppresses, `UNAOS_LEDGER_TRUNK` names the trunk and is the
+seam the proof turns.
+
+| mutation | result |
+|---|---|
+| track branch, `→ SO99`, no env | DEFERRED, exit 0 |
+| **same tree, trunk named as this branch** | **RED, exit 1 — with no strict variable set anywhere** |
+| trunk + `UNAOS_LEDGER_STRICT=0` | DEFERRED, exit 0 (suppression works) |
+
+The middle row is the wiring claim itself. Seven proofs on this gate now, each run and reverted.
+
 ## Still owed / flagged
 
 - **J1, the rmbp landing** (72 commits) — needs a fleet, so it needs the focus.

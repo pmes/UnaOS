@@ -67,7 +67,42 @@ HEADS = heads()
 def reachable(s):
     return any(subprocess.run(["git", "merge-base", "--is-ancestor", s, h], capture_output=True).returncode == 0 for h in HEADS)
 
-STRICT = os.environ.get("UNAOS_LEDGER_STRICT") == "1"
+# STRICT — WIRED, NOT REMEMBERED (pi 7, 2026-09-06, turning rmbp 13's own criterion back on it).
+# The deferral above is only honest if something forces the deferred refs to resolve SOMEWHERE, and
+# the first cut left that to a landing seat exporting UNAOS_LEDGER_STRICT=1 by hand. There is exactly
+# ONE invocation of this script (arroyo's `check_both`, no environment), and no landing-specific gate
+# command for the export to live in -- so "the landing runs strict" was a remembered step, which is
+# the same shape as the norm-only exits this whole change was chosen over. A backstop nobody is wired
+# to run is a backstop that runs never.
+#
+# THE TRIGGER IS THE BRANCH, and it is semantic rather than heuristic: **the trunk enforces, track
+# branches defer.** On a track branch a reference to another seat's row is unresolvable by
+# construction and deferring is correct. On the TRUNK it is not: trunk is where everything lands, so a
+# trunk row pointing at something not on trunk IS a dangling reference, whoever wrote it. The landing
+# merges to trunk and runs the trunk battery there, so strict arrives exactly when and where the refs
+# became resolvable, with nobody remembering anything.
+#
+# REJECTED — pi 7's proposal, and it was close: auto-strict when the tree carries rows from two or
+# more distinct seat prefixes. It reads as structural but it keeps a false-red window: a track branch
+# that syncs trunk inherits another seat's prefix (hw-rmbp gains SO rows the moment orin lands), and a
+# reference to a THIRD seat's unlanded row then reds on a branch that could never have carried it. The
+# branch test has no such window because it does not try to infer the landing from the contents.
+#
+# `UNAOS_LEDGER_STRICT=1` still forces strict anywhere (and `=0` suppresses it, trunk included, for a
+# trunk that is mid-landing and knows it). `UNAOS_LEDGER_TRUNK` names the trunk branch -- it defaults
+# to `main`, is the one knob the go-red proof turns, and is why that proof can run on a track branch.
+TRUNK = os.environ.get("UNAOS_LEDGER_TRUNK", "main")
+_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()
+_env_strict = os.environ.get("UNAOS_LEDGER_STRICT")
+if _env_strict == "0":
+    STRICT, STRICT_WHY = False, "suppressed by UNAOS_LEDGER_STRICT=0"
+elif _env_strict == "1":
+    STRICT, STRICT_WHY = True, "forced by UNAOS_LEDGER_STRICT=1"
+elif _branch == TRUNK:
+    STRICT, STRICT_WHY = True, f"automatic: on the trunk branch `{TRUNK}`, where every ref must resolve"
+else:
+    STRICT, STRICT_WHY = False, f"off: branch `{_branch}` is a track branch, cross-branch refs deferred"
 deferred = []
 ledger_ids = set()
 if "docs/dev/LEDGER.md" in files:
@@ -226,8 +261,8 @@ for p in skipped: say(f"SKIP {p} — not in this tree (arrives at the trunk sync
 if rows_seen == 0:
     say("NO VERDICT — no ledger rows found in", files or "(no ledger files)"); sys.exit(2)
 if deferred:
-    say(f"DEFERRED — {len(deferred)} cross-branch cross-ref(s); these are NOT findings, and the landing"
-        f" re-runs with UNAOS_LEDGER_STRICT=1 where they must resolve:")
+    say(f"DEFERRED — {len(deferred)} cross-branch cross-ref(s); NOT findings. Strict is {STRICT_WHY};"
+        f" these become reds automatically when this lands on `{TRUNK}`:")
     for d in deferred: print("   ", d)
 if red:
     say(f"RED — {len(red)} finding(s) across {len(files)} file(s), {rows_seen} rows:")
