@@ -4445,3 +4445,29 @@ fn piusb27_walk_subtree(fs: &FatFs, entries: &[DirEntry], prefix: &str, depth: u
         }
     }
 }
+
+// =========================================================================================
+// VFSROUTE (orin 17) — the mounted volume's own block source, appended at the FILE TAIL.
+//
+// A separate `impl FatFs` block rather than a method beside `source_name`, for the reason the rest
+// of this tree gives for tail appends: `fat.rs` is compiled into the knob-off `kernel8.img` and
+// `panic::Location` embeds source line numbers, so a method inserted mid-file moves every panic
+// site below it. A tail append moves nothing.
+//
+// WHY IT IS NEEDED. `mount_program_source()` resolves the block handle THE SHELL'S FILE VERBS MUST
+// USE (FATVERB's law: a verb and the exec probe bind the same handle), but it hands back a mounted
+// `FatFs` and keeps which handle it chose to itself. The shell's `vfs_mount_table()` has to rebuild
+// that same volume as a `crate::fs::vfs::FatBackend`, which is parametrized by `BlockSource` — so it
+// needs to ASK the mount which source it came from rather than re-deriving the precedence rule at a
+// second call site, which is exactly how `read_only` and the shell's write gate drifted apart
+// before `BlockSource::write_veto` became the one definition.
+// =========================================================================================
+
+impl FatFs {
+    /// VFSROUTE: the block source this volume is mounted through. The typed twin of
+    /// [`FatFs::source_name`], for a caller that must REBUILD the same mount through another
+    /// surface instead of merely printing which one it is.
+    pub fn source(&self) -> BlockSource {
+        self.source
+    }
+}

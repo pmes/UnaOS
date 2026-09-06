@@ -245,6 +245,77 @@ pub trait VfsBackend {
     fn unlink(&self, _rel: &str, _principal: &str) -> Result<(), VfsError> {
         Err(VfsError::Unsupported)
     }
+
+    // --- VFSROUTE (orin 17) ----------------------------------------------------
+    //
+    // The six operations a SHELL FILE VERB needs that VFS-2 did not shape, added
+    // because the verbs that needed them were reaching around the trait to get
+    // them: `mv` called `fat::rename_entry`/`move_entry` and `unafs::rename`
+    // directly, `rmdir`/`rm -r` called `fat::remove_dir`, `setfattr` called
+    // `unafs::remove_attribute`, and every write verb re-derived the read-only
+    // question from `fat::BlockSource::write_veto` at the call site. Each is a
+    // question about A VOLUME, so each belongs to the volume's backend.
+    //
+    // All six default to a refusal, so a backend that cannot do one says so in
+    // the type system and the verb PRINTS that refusal — the rule this arc is
+    // built on: a backend that cannot perform an operation returns a typed error,
+    // never a silent fall-through to some other filesystem.
+
+    /// Why this volume refuses ordinary file mutation, or `None` if it accepts it.
+    ///
+    /// The trait-level twin of [`crate::fs::fat::BlockSource::write_veto`], hoisted so a caller can
+    /// ask BEFORE it starts a multi-step verb (`write`'s delete-then-recreate, `mv`'s relink) and
+    /// get a whole answer instead of a half-finished mutation and an opaque I/O error several
+    /// sectors in. The default is a refusal: a backend exposes a write surface by opting in.
+    fn write_veto(&self) -> Option<&'static str> {
+        Some("this volume exposes no write surface")
+    }
+
+    /// Rename or move the node at `from_rel` to `to_rel` WITHIN this volume (both
+    /// paths are already volume-relative, so a cross-volume move never reaches a
+    /// backend — the mount table refuses it). An existing `to_rel` is refused with
+    /// [`VfsError::Backend`]`("exists")`, the spelling [`create`](VfsBackend::create)
+    /// already uses. Implementors authorize the write FIRST.
+    fn rename(&self, _from_rel: &str, _to_rel: &str, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Remove the EMPTY directory at `rel`. A file is [`VfsError::NotADirectory`];
+    /// a non-empty directory is [`VfsError::Backend`]`("not-empty")`; the volume
+    /// root is never removable ([`VfsError::IsADirectory`]). Implementors
+    /// authorize the write FIRST.
+    ///
+    /// The native UnaFS backend deliberately does NOT implement this: the crate
+    /// has no directory removal at all (`unlink` returns `IsADirectory`
+    /// unconditionally), so it inherits the default and `rmdir /SOMEDIR` on the
+    /// native volume prints an honest `-ENOTSUP` instead of silently deleting
+    /// something on the FAT volume — which is exactly what the pre-VFSROUTE verb
+    /// did.
+    fn remove_dir(&self, _rel: &str, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Drop one typed attribute (`key`) from the object at `rel`. FAT carries no
+    /// typed attributes, so the FAT backend inherits the default refusal and
+    /// `setfattr -x k /fat/F` says so rather than pretending to succeed.
+    fn remove_attr(&self, _rel: &str, _key: &str, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// The volume's total capacity in bytes, when the medium publishes one.
+    /// `None` is an honest "this backend does not know", which `df` renders as a
+    /// dash — never a fabricated figure.
+    fn volume_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// One line of the volume's own geometry/identity, for the `mount` listing —
+    /// the backend describing ITSELF, which is the only layer that can. `None`
+    /// means the backend publishes no description and the listing prints the
+    /// prefix + name + access it already knows.
+    fn describe(&self) -> Option<String> {
+        None
+    }
 }
 
 /// One mount: a namespace prefix bound to a backend. The prefix is canonical —
@@ -372,6 +443,92 @@ impl MountTable {
     pub fn unlink(&self, path: &str, principal: &str) -> Result<(), VfsError> {
         let (b, rel) = self.resolve(path)?;
         b.unlink(rel, principal)
+    }
+
+    // --- VFSROUTE (orin 17): the resolve-then-dispatch surface the shell verbs ask ---
+
+    /// The name of the volume that claims `path` (`"native"`, `"fat"`, `"usb"`, …).
+    /// A verb uses it to say WHICH volume answered without knowing what kind of
+    /// filesystem that volume is.
+    pub fn volume_name(&self, path: &str) -> Result<String, VfsError> {
+        // Owned, not borrowed: `resolve` ties the returned reference's lifetime to the PATH's (they
+        // share one lifetime parameter so the volume-relative remainder can borrow from it), so a
+        // `&str` here would outlive nothing useful. One small allocation per call, at a call site
+        // that is about to format a line anyway.
+        Ok(self.resolve(path)?.0.volume_name().to_string())
+    }
+
+    /// Why the volume claiming `path` refuses mutation, or `None` if it accepts it.
+    pub fn write_veto(&self, path: &str) -> Result<Option<&'static str>, VfsError> {
+        Ok(self.resolve(path)?.0.write_veto())
+    }
+
+    /// Rename or move `from` to `to`. **A cross-volume move is refused here**, in
+    /// the ONE place that can see both ends: a backend is handed volume-relative
+    /// paths and could not tell that the other end lives on a different volume, so
+    /// letting the call through would relink an entry on one volume to a name that
+    /// means nothing there. The refusal is [`VfsError::Unsupported`] — the caller
+    /// is authorized; the operation has no sound implementation across volumes
+    /// (copy-then-delete is a different operation and the operator asks for it by
+    /// typing `cp` then `rm`).
+    pub fn rename(&self, from: &str, to: &str, principal: &str) -> Result<(), VfsError> {
+        let (bf, relf) = self.resolve(from)?;
+        let (bt, relt) = self.resolve(to)?;
+        if bf.volume_name() != bt.volume_name() {
+            return Err(VfsError::Unsupported);
+        }
+        // Both remainders are VOLUME-ROOT-relative by construction (each mount strips its own
+        // prefix), so when the two mounts name the same volume the destination's remainder is a
+        // valid address on the source's backend — which is what lets `mv /A.TXT /fat/B.TXT` work on
+        // a machine that binds one volume at two prefixes (x86's `/` + `/fat`).
+        bf.rename(relf, relt, principal)
+    }
+
+    /// Do `from` and `to` land on the SAME volume? The question `mv` asks before it decides between
+    /// a rename and an honest cross-volume refusal.
+    ///
+    /// **Compared by VOLUME NAME, not by mount identity, and the difference is load-bearing.** A
+    /// machine may bind ONE volume at two prefixes — x86 binds the program source at `/` and `/fat`,
+    /// the Orin's ROOTFS binds the card at both — and a pointer comparison calls those two volumes,
+    /// which would refuse a rename that is a plain in-volume relink. The name is the volume's own
+    /// identity, published by the backend.
+    ///
+    /// It errs CONSERVATIVELY in the other direction: two mounts of one medium under DIFFERENT names
+    /// read as different volumes and a rename across them is refused (`cp` then `rm` still works).
+    /// Refusing is never corrupting; the reverse is.
+    pub fn same_volume(&self, from: &str, to: &str) -> Result<bool, VfsError> {
+        let (bf, _) = self.resolve(from)?;
+        let (bt, _) = self.resolve(to)?;
+        Ok(bf.volume_name() == bt.volume_name())
+    }
+
+    pub fn remove_dir(&self, path: &str, principal: &str) -> Result<(), VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.remove_dir(rel, principal)
+    }
+
+    pub fn remove_attr(&self, path: &str, key: &str, principal: &str) -> Result<(), VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.remove_attr(rel, key, principal)
+    }
+
+    /// One row per mount, for the `mount`/`df` listing: `(prefix, volume name,
+    /// write veto, capacity, description)`. The verb renders these five facts and
+    /// knows nothing else about any volume — which is the whole point.
+    #[allow(clippy::type_complexity)]
+    pub fn rows(&self) -> Vec<(&str, &str, Option<&'static str>, Option<u64>, Option<String>)> {
+        self.mounts
+            .iter()
+            .map(|m| {
+                (
+                    m.prefix.as_str(),
+                    m.backend.volume_name(),
+                    m.backend.write_veto(),
+                    m.backend.volume_bytes(),
+                    m.backend.describe(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -831,6 +988,71 @@ impl VfsBackend for FatBackend {
         fs.delete_located(dir_lba, dir_off, de.first_cluster()).map_err(fat_err)?;
         Ok(())
     }
+
+    // --- VFSROUTE (orin 17) ---------------------------------------------------------------
+
+    /// FORWARD, not a second copy: [`FatBackend::read_only`] already forwards to
+    /// [`crate::fs::fat::BlockSource::write_veto`], which is the single definition of "may an
+    /// ordinary file mutation reach this handle". The trait method hands the shell's write verbs
+    /// the same answer the block layer gives, with the REASON attached, so the operator line names
+    /// the mechanism that said no instead of a bare `-ENOTSUP`.
+    fn write_veto(&self) -> Option<&'static str> {
+        self.source.write_veto()
+    }
+
+    fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {
+        self.authorize_write(from_rel, principal)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
+        let (sparent, sleaf) = Self::resolve_parent(&fs, from_rel)?;
+        let (dparent, dleaf) = Self::resolve_parent(&fs, to_rel)?;
+        // Locate-first destination check, the create discipline: an existing name is refused with
+        // the SAME spelling `create` uses, so a caller has one string to test for.
+        let same_slot = sparent == dparent && dleaf.eq_ignore_ascii_case(&sleaf);
+        if !same_slot {
+            match fs.locate_in_dir(dparent, &dleaf) {
+                Ok(_) => return Err(VfsError::Backend("exists")),
+                Err(crate::fs::fat::FatError::NotFound) => {}
+                Err(e) => return Err(fat_err(e)),
+            }
+        }
+        // Same parent -> rename in place (files AND dirs); across parents -> move (the seam refuses
+        // a DIRECTORY source with IsDirectory, because its `..` would need rewriting).
+        let r = if sparent == dparent {
+            fs.rename_entry(sparent, &sleaf, &dleaf)
+        } else {
+            fs.move_entry(sparent, &sleaf, dparent, &dleaf)
+        };
+        r.map(|_| ()).map_err(fat_create_err)
+    }
+
+    fn volume_bytes(&self) -> Option<u64> {
+        crate::fs::fat::mount_source(self.source).ok().map(|fs| fs.volume_bytes())
+    }
+
+    /// The FAT geometry line the retired `fatinfo` verb printed. It prints under `mount` because
+    /// geometry is a property of a MOUNT — and it prints THROUGH THE BACKEND because the `mount`
+    /// verb must not know that this volume happens to be FAT.
+    fn describe(&self) -> Option<String> {
+        crate::fs::fat::mount_source(self.source).ok().map(|fs| fs.describe())
+    }
+
+    fn remove_dir(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        self.authorize_write(rel, principal)?;
+        let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
+        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (de, _, _) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
+        if !de.is_dir {
+            return Err(VfsError::NotADirectory);
+        }
+        match fs.remove_dir(parent, &leaf) {
+            Ok(_) => Ok(()),
+            // The fat.rs seam spells a NON-EMPTY directory `IsDirectory`; the VFS spells it
+            // `Backend("not-empty")` so a caller can tell it from "you aimed a file verb at a
+            // directory", which is what `IsADirectory` means everywhere else in this trait.
+            Err(crate::fs::fat::FatError::IsDirectory) => Err(VfsError::Backend("not-empty")),
+            Err(e) => Err(fat_err(e)),
+        }
+    }
 }
 
 /// Native UnaFS backend adapter (aarch64 only — the kernel `unafs` module is
@@ -1026,6 +1248,13 @@ impl VfsBackend for NativeBackend {
             // leaf does not exist yet), then plants the node under it.
             let (parent_id, leaf) = native_parent(fs, rel)?;
             native_write_authz(fs, parent_id, principal)?;
+            // VFSROUTE: locate-first, the same create discipline the FAT twin uses, so an existing
+            // name is refused with the ONE spelling every caller tests for (`Backend("exists")`)
+            // instead of the crate's own `FileExists` arriving as an opaque backend string. The verb
+            // renders it `-EEXIST` for every volume.
+            if fs.resolve_path(&native_abs(rel)).is_ok() {
+                return Err(VfsError::Backend("exists"));
+            }
             let id = match kind {
                 NodeKind::File => fs
                     .create_file(parent_id, leaf)
@@ -1115,6 +1344,55 @@ impl VfsBackend for NativeBackend {
             fs.unlink(parent_id, &leaf)
                 .map_err(|_| VfsError::Backend("unafs-unlink"))?;
             Ok(())
+        })
+        .map_err(unafs_err)?
+    }
+
+    // --- VFSROUTE (orin 17) ---------------------------------------------------------------
+
+    /// The native volume is journaled and read-write since K4 — there is no block-layer veto on it
+    /// (the ONE coherent mount is the write path itself), so it accepts mutation.
+    fn write_veto(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {
+        crate::fs::unafs::with_unafs(|fs| {
+            let from = native_abs(from_rel);
+            let id = fs.resolve_path(&from).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            let (sparent, sleaf) = native_parent(fs, from_rel)?;
+            let (dparent, dleaf) = native_parent(fs, to_rel)?;
+            // An existing destination is refused by the crate (`FileExists`) and never silently
+            // overwritten. It is tested HERE, by name, rather than by matching the crate's error
+            // variant: the caller needs to tell "the name was taken" from every other failure, and
+            // a locate-first check is the same discipline the FAT twin above uses.
+            if sparent != dparent || sleaf != dleaf {
+                let to = native_abs(to_rel);
+                if fs.resolve_path(&to).is_ok() {
+                    return Err(VfsError::Backend("exists"));
+                }
+            }
+            // Both directory rewrites land in ONE CoW transaction, so there is no "in neither
+            // directory" window to crash into.
+            fs.rename(sparent, &sleaf, dparent, &dleaf)
+                .map_err(|_| VfsError::Backend("unafs-rename"))
+        })
+        .map_err(unafs_err)?
+    }
+
+    // NOTE: `remove_dir` is deliberately NOT implemented — see the trait's note. The UnaFS crate
+    // carries no directory removal, so this backend inherits the default refusal and `rmdir` on a
+    // native path prints `-ENOTSUP`. That is the honest answer and it is the negative leg the
+    // VFSROUTE transcript asserts.
+
+    fn remove_attr(&self, rel: &str, key: &str, principal: &str) -> Result<(), VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            fs.remove_attribute(id, key)
+                .map_err(|_| VfsError::Backend("unafs-rmattr"))
         })
         .map_err(unafs_err)?
     }
@@ -1708,6 +1986,42 @@ impl FatBackend {
             principal: principal.to_string(),
             world_readable,
             source: crate::fs::fat::BlockSource::TegraSd,
+        }
+    }
+}
+
+// =========================================================================================
+// VFSROUTE (orin 17) — the source-parametrized constructor, appended at the FILE TAIL.
+//
+// A THIRD `impl FatBackend` block for the reason the ROOTFS block above gives: this file is
+// compiled into the knob-off `kernel8.img` and `panic::Location` embeds source line numbers, so a
+// method inserted mid-file moves every panic site below it. A tail append moves nothing.
+// =========================================================================================
+
+impl FatBackend {
+    /// VFSROUTE: mount a FAT volume through an EXPLICIT block source.
+    ///
+    /// Its caller is the shell's `vfs_mount_table()` on x86, which must bind THE PROGRAM SOURCE —
+    /// the handle `crate::drivers::block::program_source` names — and not the global slot. On a
+    /// machine booted from the internal SD reader those are different devices, and FATVERB's whole
+    /// argument is that a shell where `ls` and `run` disagree about which volume is the volume is
+    /// not a shell. [`FatBackend::new`] hard-codes `Default`, so a caller that has already resolved
+    /// the handle needs this constructor to say so.
+    ///
+    /// Read-only posture is not decided here: [`FatBackend::read_only`] and the trait's
+    /// `write_veto` both forward to [`crate::fs::fat::BlockSource::write_veto`], which answers for
+    /// whatever source is passed in.
+    pub fn new_source(
+        volume: &str,
+        principal: &str,
+        world_readable: bool,
+        source: crate::fs::fat::BlockSource,
+    ) -> Self {
+        Self {
+            volume: volume.to_string(),
+            principal: principal.to_string(),
+            world_readable,
+            source,
         }
     }
 }
