@@ -149,6 +149,27 @@ def load_ctx(src):
     return {rel: set(a) for rel, a in ctx.items()}
 
 
+SITE_CONTROL = "wc"
+
+
+def site_scan_control(src):
+    """Refuse to report sites at all unless a feature that certainly exists returns some.
+
+    A wrong `--root` makes every `grep -rn` come back empty, and "0 site(s), 0 Pi-live" then
+    reads as a clean answer about the tree instead of no answer at all -- the exact failure
+    this file's own control exists to prevent, which it walked into once (rmbp 14: a staged
+    tree one directory deep produced seven confident zeroes).
+    """
+    if not os.path.isdir(src):
+        return "the kernel source directory %s does not exist" % src
+    out = subprocess.run(["grep", "-rn", 'feature = "%s"' % SITE_CONTROL, src],
+                         capture_output=True, text=True).stdout
+    if not out.strip():
+        return ("the site scan found no `feature = \"%s\"` anywhere under %s; a scan that "
+                "matches nothing reports every knob as siteless" % (SITE_CONTROL, src))
+    return None
+
+
 def evidence(name, knob_feats, src):
     ctx = load_ctx(src)
     feats = sorted(knob_feats.get(name, {name}))
@@ -189,11 +210,19 @@ def main():
         return 2
 
     if argv and argv[0] == "--evidence":
+        why = site_scan_control(src)
+        if why:
+            print("%s⚠ k8-reach --evidence: %s — NO VERDICT%s" % (YELLOW, why, OFF))
+            return 2
         evidence(argv[1], knob_feats, src)
         return 0
 
     unarmed = sorted(k for k in knob_feats if k not in armed)
     if argv and argv[0] == "--seed":
+        why = site_scan_control(src)
+        if why:
+            print("%s⚠ k8-reach --seed: %s — NO VERDICT%s" % (YELLOW, why, OFF))
+            return 2
         ctx = load_ctx(src)
         print("# GATE-K8REACH registry — every UNAOS_* knob with no K8_FEATS arm, and why.")
         print("# NA <reason> = deliberately absent from the Pi bare-metal image.")
