@@ -63,6 +63,20 @@ touched, so no `arroyo check` claim is made here.
    fifth time this lane's gate has convicted its own author, and the reason the rule is to run it the
    moment the ledger is edited.
 
+9. **SR3** — quarry's cache-invalidation stamp is USB-only: `volume_gen()` is `usb_publish_gen()`,
+   whose only two bump sites sit inside `publish_usb_geometry`, and neither `register_sd` nor
+   `register_tegra_sd` advances it, so no card event ever invalidates the listing cache. Raised by
+   orin 18 while grepping their branch for text to fix, measured here — and the measurement narrowed
+   the claim: a *stick* arrival does advance it on aarch64 (`xhci/mod.rs:11758` carries no arch
+   gate), so "never fires" would itself have been a claim that cannot fire. Filed as one S-row with
+   a C-section link rather than a second home on orin's branch (P14).
+10. **B61 — this seat's own two failures**, recorded rather than absorbed: it routed a text fix to
+    orin having verified only the code and never read the text (both texts were already correct, and
+    `prtscr.rs` being unconditional meant the no-op edit would have spent pi's cleanest byte-identity
+    control), and it told pi 8 a push count was "run this turn" when the check was two turns old —
+    right value, wrong provenance. One class, and it is this seat's own standing rule arriving in its
+    own outbound messages.
+
 ## Open at time of writing
 C1 is with orin 18 (either the armed `UNAOS_SDMMCROOT=1` run, or the identity fix, and I review the
 fix same-turn). SHELLRELICS closes when its leg's diff arrives. Everything else in the queue waits
