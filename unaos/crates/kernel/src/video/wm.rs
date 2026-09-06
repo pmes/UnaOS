@@ -5818,7 +5818,7 @@ fn composite_inner() -> CursorTail {
         if let Some(p) = wcg_probe {
             let r = &rw;
             // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
-            // carried in the probe. PARITY §6.2 — ONE nine-argument call on both arches.
+            // carried in the probe. PARITY §6.2 — ONE ten-argument call on both arches (OCC62 added `occ_after`; counted at `wcg::end`'s signature, wcg.rs:3395).
             // OCC62 M1 — the read-back-time excuse, owned in THIS block so it leaves the frame the
             // moment the bracket closes, and handed over by reference beside the pre-blit one.
             let occ_post = occ_excuse(r.z, r.id, &clip);
