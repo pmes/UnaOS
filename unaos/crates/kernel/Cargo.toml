@@ -1059,6 +1059,30 @@ install_target = ["sdmmc_arm"]
 # the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
 sdmmcwrite = ["sdmmc"]
 
+# ROOTFS (orin 16, ledger A28): the `UNAOS_SDMMCROOT=1` VFS ROOT BIND for the Tegra234 microSD card's
+# FAT volume (arch/aarch64/sdmmc_tegra.rs, the `sdmmcroot` tail section). A28's fault is that on the
+# desktop line the VFS root has NO backend — `/` is `NativeBackend` (native UnaFS) and the Orin card
+# carries no UnaFS volume, so `ls /` and quarry both answer `/: backend error: unafs-mount`. This
+# feature makes `shell::vfs_mount_table` REBIND `/` to the card's FAT volume, read through
+# `BlockSource::TegraSd` (the census-published `read_block_tegra_sd` path — CMD17 single-block, 1-bit
+# default speed, PROVEN on metal by A23), and re-point `/fat` at the SAME volume — its `Default`
+# source is registered by no Orin boot, and `/fat` is `shell::EXEC_ROOT` and the literal prefix of
+# `/fat/VUG.ELF`, `/fat/STAT.ELF` and `/fat/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
+# launch anything at all. READ-ONLY BY CONSTRUCTION and not by policy stated here:
+# `BlockSource::TegraSd::write_veto` is `Some(TEGRA_SD_VETO)` and `write_block_tegra_sd` refuses in
+# every cfg, so no VFS verb can reach the medium. The vendor pad block stays DISABLED (the FWALL
+# SError conviction) — this feature adds no controller write of any kind. READ-only over an already
+# published card, so it is a SIBLING of `sdmmcwrite`, never an implier: it pulls only `sdmmc`, and a
+# boot whose census did not reach M3 gets one named refusal and the unchanged (broken) root. Every
+# site is `sdmmcroot`-gated: the section is a file tail inside the wholly `sdmmc`-gated
+# `sdmmc_tegra.rs`, and the `pub use`, the `vfs_mount_table` call and the `main.rs` early probe are
+# same-line appends, and
+# `FatBackend::new_tegra_sd` is a tail-appended `impl` block in `fs/vfs.rs` — so DEFAULT OFF => no
+# line moves and the Pi `kernel8.img` and the default jetson image are byte-identical to baseline.
+# The ARMED polarity is type-checked by the `arm-tegra-sdmmcroot` leg of KERNEL_CFG_MATRIX, never by
+# the knob mapping. Witness family: `[sdmmc] root` (subsystem-named). UNFLOWN.
+sdmmcroot = ["sdmmc"]
+
 # SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
 # (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
 # `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,

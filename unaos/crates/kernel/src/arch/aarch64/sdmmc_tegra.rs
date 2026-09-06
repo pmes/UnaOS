@@ -122,7 +122,7 @@ pub use metal::sdmmc_install_from_usb;
 // single-sector read, and its counted loop. Nothing here can write — the write path stays exclusively
 // behind the `sdmmc_arm` ladder further down this file, untouched by this seam.
 #[cfg(feature = "tegra")]
-pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; // SDMMCWRITE: the gap-#3 write probe (file tail); appended to THIS line for knob-off byte identity (no line moves).
+pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; #[cfg(all(feature = "tegra", feature = "sdmmcroot"))] pub use metal::{sdmmc_root_bind, sdmmc_root_probe_early}; // SDMMCWRITE: the gap-#3 write probe (file tail), and ROOTFS (orin 16, A28): the VFS root bind over the card FAT (file tail) — both appended to THIS line for knob-off byte identity (no line moves). Every item precedes the one comment: a cfg placed AFTER a // compiles nothing (the A9/PRTSCR-ORIN lesson; knob-hygiene.sh probes for it).
 
 #[cfg(feature = "tegra")]
 mod metal {
@@ -3256,6 +3256,229 @@ mod metal {
                 "{} lba={} -> FAIL mismatch={}/512 first_diff={} want={:#04x} got={:#04x}",
                 WPS, lba, 512 - matched, first_diff, pattern[first_diff], back[first_diff]
             );
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // ROOTFS (orin 16, ledger A28) — `sdmmcroot`: give the VFS a ROOT the Orin actually has.
+    //
+    // THE FAULT. On the desktop line `shell::vfs_mount_table` binds `/` to `NativeBackend` (native
+    // UnaFS) unconditionally, because that is what the Pi has: a real UnaFS system volume on its card.
+    // The Orin's card carries only the FAT32 `UNAOS` ESP — there is no UnaFS volume for
+    // `fs::unafs::with_unafs` to mount — so EVERY enumeration of `/` returns
+    // `VfsError::Backend("unafs-mount")`, which is what `ls /` and quarry printed on render7
+    // (`[quarry] open census ERROR cwd=/ "/: backend error: unafs-mount"`). The second half of the
+    // same fault is `/fat`: `FatBackend::new` reads through `BlockSource::Default`, the GLOBALLY
+    // registered block device, and nothing on an Orin boot ever registers one (`register_sd` is the
+    // Pi's `baremetal` emmc2 arm). So the Orin had two mounts and zero volumes.
+    //
+    // THE BIND. This section is the fourth work item of `docs/dev/OS/10_INSTALL/orin-unafs-root.md`
+    // §3 ("mount + witness, behind a knob"), taken at the layer the card can actually serve TODAY:
+    // items 1 and 2 landed (the census publishes the card through `register_tegra_sd`, and
+    // `BlockSource::TegraSd` routes `fat.rs` at `read_block_tegra_sd`), item 3 — a UnaFS-formatted
+    // partition 2 — is a DESTRUCTIVE installer arc that has not run on this card. Until it does, the
+    // only filesystem on the medium is the ESP's FAT32, so that is what the root binds to:
+    //
+    //   * `/`    -> the card's FAT volume through `BlockSource::TegraSd` (read-only).
+    //   * `/fat` -> the SAME volume, same source. Not decoration: `/fat` is `shell::EXEC_ROOT` and is
+    //     spelled literally in `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF` and quarry's
+    //     double-click route, so re-pointing it is what makes those paths reach real files instead of
+    //     `-ENOENT` off the new root.
+    //
+    // One volume, two prefixes, and the second one is why the desktop can launch anything. When the
+    // UnaFS system partition exists this section is where `/` goes back to `NativeBackend` and the FAT
+    // returns to being the boot shim §3 says it is — at `/fat`, where it already is.
+    //
+    // READ-ONLY, AND NOT BECAUSE THIS FILE SAYS SO. `BlockSource::TegraSd::write_veto` is
+    // `Some(TEGRA_SD_VETO)`, so `FatBackend::read_only()` is true and the VFS write verbs refuse
+    // before touching the block path; below that, `block::write_block_tegra_sd` refuses in EVERY cfg.
+    // Two independent refusals, neither of them this section's. The vendor pad block stays DISABLED
+    // (the FWALL SError conviction) — nothing here touches `base+0x100` or beyond, and no controller
+    // register at all: the whole section is `fat.rs` calls over the already-published read surface.
+    //
+    // COST. Every sector reaches the card as one polled CMD17 at 1-bit default speed (<= 25 MHz);
+    // `tegra_sd_read_blocks_512` is a LOOP over that primitive, because no unarmed CMD18 exists in
+    // this file (multi-block is `install_target`-gated and unproven). 512 B of payload is ~164 us of
+    // bus time at 25 MHz, so the term that decides a listing is the SECTOR COUNT, not the clock:
+    // `FatBackend::read_dir` re-probes the volume on every call (LBA 0, the MBR/GPT census, a BPB
+    // sector per accepted partition — ~4-6 sectors) and then walks the root directory chain (one FAT
+    // sector per cluster hop plus `sec_per_clus` data sectors per cluster). A 32 KiB-cluster FAT32 ESP
+    // with a single-cluster root is therefore ~70 sectors, and a listing should land in the low tens
+    // of milliseconds. `UNAOS_FATPERF=1` prints the two raw terms per operation
+    // (`[fatperf] op=list path=/ sectors=… us=…`) — measure there, do not argue from this comment.
+    // If the measured `us` makes the desktop feel slow, the fix is a CMD18 multi-block primitive
+    // behind the same seam (`tegra_sd_read_blocks_512`'s body, no change above it) or the cluster-chain
+    // cache FATFIX already names — NOT a bus-width or high-speed negotiation, which is a separate
+    // metal question on unproven Tegra pad settings.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// ROOTFS: stable serial prefix for the root-bind witness family (the `WPS` idiom — subsystem-named,
+    /// never board-named, per LAWS §"Name by subsystem").
+    #[cfg(feature = "sdmmcroot")]
+    const RPS: &str = "[sdmmc] root";
+
+    /// ROOTFS verdict cache. `vfs_mount_table()` is rebuilt on EVERY routed verb (and twice per quarry
+    /// reload), and the probe below costs a full FAT volume scan in CMD17s, so the answer is computed
+    /// once and remembered. Three states so "not asked yet" is distinguishable from "asked, refused".
+    #[cfg(feature = "sdmmcroot")]
+    const ROOT_UNKNOWN: u8 = 0;
+    #[cfg(feature = "sdmmcroot")]
+    const ROOT_BOUND: u8 = 1;
+    #[cfg(feature = "sdmmcroot")]
+    const ROOT_REFUSED: u8 = 2;
+
+    #[cfg(feature = "sdmmcroot")]
+    static ROOT_VERDICT: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(ROOT_UNKNOWN);
+
+    /// ROOTFS: has the one-shot post-bind census already run? The bind itself is silent after the first
+    /// call — a per-verb witness would put a line on the wire for every `ls`, and the serial transport
+    /// is the evidence channel every gate is counted from.
+    #[cfg(feature = "sdmmcroot")]
+    static ROOT_CENSUS: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// ROOTFS: elapsed microseconds since a `now_cycles()` reading, at the virtual counter's own rate.
+    /// The `fatperf::cycles_to_us` shape (delta only — an absolute counter overflows the multiply), and
+    /// `CNTFRQ_EL0 == 0` answers 0 rather than dividing by it.
+    #[cfg(feature = "sdmmcroot")]
+    fn root_us_since(c0: u64) -> u64 {
+        let hz = crate::arch::aarch64::timer::cntfrq();
+        if hz == 0 {
+            return 0;
+        }
+        crate::arch::now_cycles().saturating_sub(c0).saturating_mul(1_000_000) / hz
+    }
+
+    /// ROOTFS: can the card's FAT volume be mounted this boot? Runs at most once. Refuses, NAMED, when
+    /// the census did not publish a card (M1/M2/M3 did not all pass, or `UNAOS_SDMMC=1` was not armed on
+    /// metal) and when the medium carries no FAT volume the driver accepts.
+    #[cfg(feature = "sdmmcroot")]
+    fn root_probe() -> u8 {
+        let blocks = tegra_sd_card_blocks();
+        if blocks == 0 {
+            serial_println!(
+                "{} -> REFUSED reason=no-published-card (the census did not reach M3 this boot; needs UNAOS_SDMMC=1 on metal) ::",
+                RPS
+            );
+            return ROOT_REFUSED;
+        }
+        let c0 = crate::arch::now_cycles();
+        match crate::fs::fat::mount_source(crate::fs::fat::BlockSource::TegraSd) {
+            Ok(fs) => {
+                let us = root_us_since(c0);
+                let (vol_id, clusters) = fs.volume_fingerprint();
+                let label = fs.label();
+                serial_println!(
+                    "{} mount source=tegra-sd card_blocks={} -> OK label=\"{}\" vol_id={:#010x} clusters={} cluster_bytes={} probe_us={} ::",
+                    RPS, blocks, label, vol_id, clusters, fs.cluster_size(), us
+                );
+                ROOT_BOUND
+            }
+            Err(e) => {
+                serial_println!(
+                    "{} -> REFUSED reason=fat-mount-failed source=tegra-sd card_blocks={} err={:?} ::",
+                    RPS, blocks, e
+                );
+                ROOT_REFUSED
+            }
+        }
+    }
+
+    /// ROOTFS: run the probe EARLY — from the `sdmmc_census` call line in `main.rs`, in exactly the
+    /// context the census has just proved good (EL2, boot core, JM4 timer live, the SDHCI window mapped
+    /// one instruction ago). The bind itself cannot run here — the mount table is rebuilt per verb, far
+    /// later, inside the desktop's service pass — so this call exists for ONE reason: it splits a first
+    /// flight's two failure modes apart on the wire. `[sdmmc] root mount … -> OK` here and a desktop that
+    /// still cannot list means the card read is unreachable from the LATER context (a mapping question,
+    /// not a filesystem one); no line here at all means the census never published a card; a `REFUSED
+    /// reason=fat-mount-failed` here means the medium carries no FAT volume this driver accepts. Without
+    /// it, all three arrive as one silent desktop.
+    ///
+    /// Idempotent and cheap after the first call (a relaxed load); the probe's own cost is the volume
+    /// scan, ~4-6 CMD17s.
+    #[cfg(feature = "sdmmcroot")]
+    pub fn sdmmc_root_probe_early() {
+        use core::sync::atomic::Ordering;
+        if ROOT_VERDICT.load(Ordering::Relaxed) == ROOT_UNKNOWN {
+            let v = root_probe();
+            ROOT_VERDICT.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// ROOTFS: the seam `shell::vfs_mount_table` calls — rebind `/` to the card's FAT volume and drop the
+    /// dead `/fat`. Called on every table build; does nothing but two `Vec` operations after the first.
+    ///
+    /// It takes the table by `&mut` rather than returning a backend so the WHOLE namespace decision for
+    /// this machine lives in one place instead of being spread across the shared builder: the caller's
+    /// half is a single cfg-gated statement appended to a line that already existed.
+    #[cfg(feature = "sdmmcroot")]
+    pub fn sdmmc_root_bind(mt: &mut crate::fs::vfs::MountTable) {
+        use core::sync::atomic::Ordering;
+        let mut verdict = ROOT_VERDICT.load(Ordering::Relaxed);
+        if verdict == ROOT_UNKNOWN {
+            verdict = root_probe();
+            ROOT_VERDICT.store(verdict, Ordering::Relaxed);
+        }
+        if verdict != ROOT_BOUND {
+            return; // the refusal was named once; leave the table exactly as the shared builder left it
+        }
+        // BOTH prefixes, onto the one volume this machine has.
+        //
+        // `/` because the root has to work at all: `vfs_ls_collect` stats the path before it
+        // synthesises any child row, so a root that errors makes every other mount unreachable from
+        // the desktop and from quarry.
+        //
+        // `/fat` because it is not decoration — it is `shell::EXEC_ROOT`, the second probe of
+        // `exec_resolve` (the reason a bare `vug` works from anywhere), and it is spelled literally in
+        // the launch paths `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF` and quarry's own
+        // double-click route. Unmounting it (the first shape of this section) would have left every one
+        // of those resolving off the new root as `/fat/...`, i.e. `-ENOENT` — trading one dead
+        // namespace for another. Re-pointing it at the same card makes them all reach the real files,
+        // which is the whole point of having a root.
+        //
+        // Two adapters over one source is not a coherence risk: `FatBackend` re-mounts through
+        // `fat::mount_source` on every call and holds no volume state (the stateless posture the shell's
+        // FAT verbs have always had), so the two cannot disagree about the medium. The visible cost is
+        // one synthesised `fat` row inside the listing of `/` — which is honest (it IS a mount point)
+        // and is exactly the case quarry's `root_prefixes` already handles: `/` claims `/fat`, so `/fat`
+        // is not a second root, it is a child reached through its parent (the "duplicate-/fat rule").
+        mt.mount(
+            "/",
+            alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
+                "card",
+                crate::fs::vfs::KERNEL_PRINCIPAL,
+                true,
+            )),
+        );
+        mt.mount(
+            "/fat",
+            alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
+                "fat",
+                crate::fs::vfs::KERNEL_PRINCIPAL,
+                true,
+            )),
+        );
+        // One post-bind census, on the first bind only: the scorer's proof that the root now enumerates.
+        if !ROOT_CENSUS.swap(true, Ordering::Relaxed) {
+            let c0 = crate::arch::now_cycles();
+            match mt.read_dir("/") {
+                Ok(rows) => {
+                    let us = root_us_since(c0);
+                    let dirs = rows
+                        .iter()
+                        .filter(|r| matches!(r.kind, crate::fs::vfs::NodeKind::Dir))
+                        .count();
+                    serial_println!(
+                        "{} bound / and /fat = tegra-sd FAT read-only (both were dead: unafs has no volume here, Default has no device) entries={} dirs={} files={} list_us={} ::",
+                        RPS, rows.len(), dirs, rows.len() - dirs, us
+                    );
+                }
+                Err(e) => serial_println!(
+                    "{} bound / and /fat = tegra-sd FAT read-only but the first listing FAILED err={:?} ::",
+                    RPS, e
+                ),
+            }
         }
     }
 }

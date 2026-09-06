@@ -1588,6 +1588,29 @@ fi
 # to baseline (no line moves; see docs/dev/evidence/orin14/SDMMCWRITE.md). The ARMED polarity is
 # type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by this mapping.
 [ -n "${UNAOS_SDMMCWRITE:-}" ] && _feats="${_feats}sdmmcwrite,sdmmc,"
+# ROOTFS (orin 16, ledger A28): UNAOS_SDMMCROOT=1 gives the VFS a ROOT the Orin actually has. On the
+# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/fat` to BlockSource::Default —
+# neither exists on this machine (the card carries only the FAT32 ESP; nothing registers a Default
+# block device on an Orin boot), so `ls /` and quarry both answered `/: backend error: unafs-mount`.
+# Armed, the table instead binds `/` to the card's FAT volume read through BlockSource::TegraSd (the
+# census-published CMD17 path, metal-proven by A23) and re-points `/fat` at that same volume — `/fat`
+# is `shell::EXEC_ROOT` and the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
+# and quarry's launch route, so it is what makes the desktop able to run anything, not decoration.
+# READ-ONLY twice over and NOT by this
+# knob's say-so: BlockSource::TegraSd::write_veto vetoes the source and block::write_block_tegra_sd
+# refuses in every cfg — the vendor pad block stays DISABLED (the FWALL SError conviction) and no
+# controller register is touched. Pulls `sdmmc` for a lone knob; a SIBLING of UNAOS_SDMMCWRITE, never
+# an implier of it (this is a read path only). Metal-only in effect: the call site is `tegra`-gated,
+# and on virt the census publishes no card so the bind prints one named refusal. Witness on the wire:
+# `[sdmmc] root mount source=tegra-sd … -> OK …`, then `[sdmmc] root bound / = tegra-sd FAT read-only
+# … entries=N …`, or `[sdmmc] root -> REFUSED reason=…`. The cost terms are IN those lines: `probe_us`
+# (the volume scan) and `list_us` (the first full listing of the new root). UNAOS_FATPERF=1 would add
+# the per-operation SECTOR term, but it is wired only into the Pi `kernel8` leg (`K8_FEATS`) and not
+# into this mapping, so it is NOT available on a jetson image — extending it is a named follow-up, not
+# something to assume works. Default OFF => byte-identical to baseline (no line moves; the shared hunks
+# in shell.rs and fs/vfs.rs are a same-line append and a file-tail impl block). The ARMED polarity is
+# type-checked by the `arm-tegra-sdmmcroot` leg of KERNEL_CFG_MATRIX, never by this mapping.
+[ -n "${UNAOS_SDMMCROOT:-}" ] && _feats="${_feats}sdmmcroot,sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
 # the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping witness against the
@@ -3913,6 +3936,29 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
+  # ROOTFS armed (appended 2026-09-06, orin 16) — `sdmmcroot` gates the VFS root bind at the tail of
+  # `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_root_bind` + `root_probe` + the verdict cache), the same-line
+  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/fat` mount line
+  # in `shell::vfs_mount_table`, and the early-probe statement appended to the `sdmmc_census` call line
+  # in `main.rs`. The file-tail `impl FatBackend::new_tegra_sd` in `fs/vfs.rs` is
+  # gated `all(aarch64, tegra, sdmmc)` — every `arm-tegra*` leg already compiles THAT — but the CALLER
+  # is `sdmmcroot`-gated, and without this leg the armed polarity would be compiled by nothing (the
+  # orinrx / bsptick / sdmmcwrite shape, and the standing law that a knob's gates must compile the
+  # configuration the knob turns ON).
+  #
+  # WHY ITS OWN TAIL LEG rather than `,sdmmcroot` appended to `arm-tegra`: `arm-tegra` is the DISARMED
+  # twin and the only leg that compiles the SHIPPED default jetson image, whose byte-identity to
+  # baseline this arc measures. Hosted on `arm-tegra`'s list verbatim + `sdmmcroot` (the sdmmcwrite
+  # shape: the knob's sites need nothing beyond `tegra` + `sdmmc`, which that list already carries).
+  # The resolved set grows by EXACTLY {sdmmcroot} over a leg that is already green, so a red here names
+  # the knob and nothing else. It is a SEPARATE leg from `arm-tegra-sdmmcwrite` because the two knobs
+  # are siblings, not a ladder: neither implies the other and a build may arm either alone.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `sdmmcroot` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (`sdmmc_tegra.rs` is wholly `sdmmc`-gated
+  # and the `shell.rs` statement is inside `all(tegra, sdmmcroot)`) and the derived mix-leg count is
+  # unchanged. Board legs +1; gate +1. `./arroyo check` prints the live counts every run.
+  "arm-tegra-sdmmcroot ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcroot"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
