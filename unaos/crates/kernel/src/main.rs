@@ -5522,7 +5522,7 @@ fn render_service(_: usize) {
         }
         cursor_was_visible = cursor_vis;
         // Recompose the strip only when it was overdrawn (Key/Button) — unconditional, cached loads.
-        if strip_dirty {
+        console_reopen_drain("render_service"); if strip_dirty {
             unaos_kernel::ui_status::draw(&mut pal);
             dirty = true;
         } else if strip_tick {
@@ -6735,7 +6735,7 @@ fn x86_render_service(cpu: usize) {
                 Some(next) => raw = next,
                 None => break,
             }
-        }
+        } console_reopen_drain("x86_render_service"); // CONSOLEPIN — the DOCK'S CONSOLE PIN drains here, beside the shell's and for the identical reason: `dock::press_at` latches rather than opens because the input path may not take a blocking panel lock (LOCKFIX 7847ceea) and `fbcon::panel_console_window_open` takes two, plus the window TABLE. Costs one relaxed swap on a quiet pass. The drain fn has a knob-off `#[inline(always)]` empty twin (this file's tail), so the fold erases to nothing without the desktop and needs no `#[cfg]` here. ⚠ FOLDED onto this line, never added below it — panic `Location`s, PARITY.md §5.3.
 
         // SHELLWIN-REOPEN — service the dock's pinned shell tile (SHELLPIN, `video/dock.rs`). The
         // press that latched the request was routed INSIDE the drain above (`wc_route_event` ->
@@ -8355,7 +8355,7 @@ fn orin_render_service(_: usize) {
         // sets `st.armed`, so `loads()` answers `ncpu` before `service` asks), and thereafter repaints
         // only when the frame signature moves. It presents through its own `wm` row, not through
         // `pal`, and returns `()` — it neither reads nor sets `dirty`.
-        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::quarry::service(); orin_shell_reopen_drain(); #[cfg(feature = "holocron")] unaos_kernel::video::prtscr::service(); // SHELLREOPEN-ORIN (S4/A7) — and the DOCK'S SHELL PIN drains here too, beside quarry's latch and for the identical reason: `dock::press_at` latches rather than opens because a click router may not allocate a surface or take the window table, and this pass is where that work belongs. Until this call `dock::take_shell_reopen()` had one real caller in the tree, `x86_render_service`, so the pinned tile was a dead button on both aarch64 boards — render7 measured it (two `[dock] press … shell=pin -> reopen requested` with no window). Unlike quarry's it is NOT `#[cfg(desktop_firmware)]` at the call site: the drain fn itself has a knob-off `#[inline(always)]` empty twin, so this fold erases to nothing without the desktop. See the SHELLREOPEN-ORIN block at this file's tail for why the reopen is `fbcon::panel_console_window_open` and not `open_shell_window` on this board. ⚠ FOLDED onto this line, never added below it — panic `Location`s. // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample. QUARRY-ORIN (A8) — and the file manager's latch drains beside it. `quarry::service()` is `reap_jobs()` + one `AcqRel` swap on a quiet pass, so this costs a relaxed load per pass and nothing else; when the latch IS set it calls `open()`, which reads directories — legal HERE and not in the click router (the reason `dock::press_at` latches instead of opening). The Pi drains it from ONE place, `arch/aarch64/syscall.rs`'s strip-press arm, which this board also compiles (`desktop_firmware`, and render6-boot2's `[dock] press … raised=true` proves that arm runs here) — but that arm fires only on a dock press, so `open()`'s own `reason=panel-busy` re-latch and `tegra_quarry_seat`'s would both sit unread until an operator happened to click the strip. This is the pass-driven drain that closes them. ⚠ FOLDED onto this line rather than added below it, for the reason PULSEWIN names.
+        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::quarry::service(); orin_shell_reopen_drain(); console_reopen_drain("orin_render_service"); #[cfg(feature = "holocron")] unaos_kernel::video::prtscr::service(); // SHELLREOPEN-ORIN (S4/A7) — and the DOCK'S SHELL PIN drains here too, beside quarry's latch and for the identical reason: `dock::press_at` latches rather than opens because a click router may not allocate a surface or take the window table, and this pass is where that work belongs. Until this call `dock::take_shell_reopen()` had one real caller in the tree, `x86_render_service`, so the pinned tile was a dead button on both aarch64 boards — render7 measured it (two `[dock] press … shell=pin -> reopen requested` with no window). Unlike quarry's it is NOT `#[cfg(desktop_firmware)]` at the call site: the drain fn itself has a knob-off `#[inline(always)]` empty twin, so this fold erases to nothing without the desktop. See the SHELLREOPEN-ORIN block at this file's tail for why the reopen is `fbcon::panel_console_window_open` and not `open_shell_window` on this board. ⚠ FOLDED onto this line, never added below it — panic `Location`s. // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample. QUARRY-ORIN (A8) — and the file manager's latch drains beside it. `quarry::service()` is `reap_jobs()` + one `AcqRel` swap on a quiet pass, so this costs a relaxed load per pass and nothing else; when the latch IS set it calls `open()`, which reads directories — legal HERE and not in the click router (the reason `dock::press_at` latches instead of opening). The Pi drains it from ONE place, `arch/aarch64/syscall.rs`'s strip-press arm, which this board also compiles (`desktop_firmware`, and render6-boot2's `[dock] press … raised=true` proves that arm runs here) — but that arm fires only on a dock press, so `open()`'s own `reason=panel-busy` re-latch and `tegra_quarry_seat`'s would both sit unread until an operator happened to click the strip. This is the pass-driven drain that closes them. ⚠ FOLDED onto this line rather than added below it, for the reason PULSEWIN names.
 
         // AT MOST ONE PRESENT PER PASS, and only when something changed. The Pi service measured a
         // 96-100% core peg before it took this rule; on this board the cost lands on cpu 0, which is
@@ -9376,3 +9376,53 @@ fn tegra_shell_live_id(
 fn tegra_shell_remint() -> unaos_kernel::video::wm::WinId {
     unaos_kernel::video::wm::WIN_NONE
 }
+
+// =================================================================================================
+// CONSOLEPIN — **the dock's CONSOLE tile reopens the console window.**
+// =================================================================================================
+//
+// ## The defect (render8, Peter: *"console goes away from taskbar"*)
+//
+// `video/dock.rs` had `pin_shell` and `pin_quarry` and no `pin_console`, so the console window's tile
+// WAS its live row: the close disc cleared the row, `wm::dock_scan` stopped reporting it, and the tile
+// left the strip with the window. Until SO10 that read as working by accident — the SHELL pin's drain
+// was keyed end to end on `fbcon::CONSOLE_WIN` and re-minted the CONSOLE — and SO10 correctly ended
+// that double duty. `dock::pin_console` is the half that has to exist once it is gone.
+//
+// ## Why the drain is here and not in the router
+//
+// `dock::press_at`'s pinned tile LATCHES (`CONSOLE_REOPEN`), for `quarry`'s reason and one more that
+// is specific to this window: `fbcon::panel_console_window_open` allocates a surface, takes the window
+// TABLE and takes BOTH panel locks (`WRITER`, `FBCON`), and the input path is held to LOCKFIX
+// `7847ceea` — *"nothing here takes a blocking panel lock"*. A render body is where that work belongs,
+// which is where the shell's pin is already drained.
+//
+// ## One wrapper, three render bodies
+//
+// The whole reopen — the already-live raise, the re-mint, the witness — is in `dock.rs` and is
+// ARCH-NEUTRAL: that module's gate (x86 + `wc` OR aarch64 + `desktop_firmware`) is exactly the gate on
+// every `fbcon` entry point it calls, so there is no `target_arch` test in it. This file needs only a
+// cfg wrapper, because the three call sites (`render_service`, `x86_render_service`,
+// `orin_render_service`) are each compiled in configurations where that module does not exist. One
+// wrapper rather than three `#[cfg]`ed call sites: an attribute cannot be folded onto a line that
+// already carries a statement without capturing the wrong one, and every call site here is a FOLD.
+//
+// LINE-NEUTRAL: tail append, three same-line folds at the call sites.
+
+/// CONSOLEPIN — drain the dock's console-pin latch. One relaxed swap on a quiet pass.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn console_reopen_drain(who: &'static str) {
+    let _ = unaos_kernel::video::dock::console_reopen_service(who);
+}
+
+/// CONSOLEPIN — the knob-off twin, so the folds at the three call sites cost the knob-off
+/// `kernel8.img` nothing (`desktop_firmware` is not in `K8_FEATS`).
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn console_reopen_drain(_who: &'static str) {}

@@ -583,7 +583,7 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     // A zero rect asks the damage question nothing; only the tile count is wanted here.
     let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
     // SHELLPIN — the registry must report the strip the painter will paint, pinned tile included.
-    let n = pin_shell(&mut tiles, n);
+    let n = pin_console(&mut tiles, n); let n = pin_shell(&mut tiles, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
     let n = pin_quarry(&mut tiles, n); let n = pin_pulse(&mut tiles, n); // A30 — the pulse instrument's reopen tile; the registry must report the strip the painter will paint. See the fold in `compose`. Folded, not added — PARITY.md §5.3.
@@ -615,13 +615,13 @@ static UNHIDES: AtomicU64 = AtomicU64::new(0);
 static PRESS_OUTCOME: AtomicU64 = AtomicU64::new(0);
 const DOCK_OUT_BACKGROUND: u64 = 1;
 const DOCK_OUT_REOPEN: u64 = 2;
-const DOCK_OUT_RAISE: u64 = 3;
+const DOCK_OUT_RAISE: u64 = 3; const DOCK_OUT_CONSOLE_REOPEN: u64 = 4; // CONSOLEPIN — the console pin's own outcome word, so the router's `band=dock` witness tells a console reopen from the shell's. Folded, not added — PARITY.md §5.3.
 
 /// CLICK-BAND — the last consumed press's outcome, as the witness word.
 pub fn last_press_outcome() -> &'static str {
     match PRESS_OUTCOME.load(Ordering::Relaxed) {
         DOCK_OUT_BACKGROUND => "background",
-        DOCK_OUT_REOPEN => "shell-reopen",
+        DOCK_OUT_REOPEN => "shell-reopen", DOCK_OUT_CONSOLE_REOPEN => "console-reopen",
         DOCK_OUT_RAISE => "raise",
         _ => "none",
     }
@@ -713,7 +713,7 @@ pub fn compose() -> bool {
     let (n, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
     // SHELLPIN — the permanent shell tile, appended before the signature so a shell close (the row
     // vanishing, the pin appearing) is a MODEL change and repaints on its own.
-    let n = pin_shell(&mut rows, n);
+    let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
     let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
@@ -953,7 +953,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
     // SHELLPIN — the router routes over the same pinned model the painter drew.
-    let n = pin_shell(&mut rows, n);
+    let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
     let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
@@ -995,7 +995,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true;
     }
     if r.id == PULSE_PIN_ID { crate::video::pulsewin::arm(); serial_println!("[dock] press at ({},{}) tile={}/{} pulse=pin -> rearmed (render pass opens it)", x, y, t, n); return true; } // A30 — the pulse instrument's pinned tile. Unlike Quarry's this needs no latch and no deferral: `pulsewin::arm()` is two release stores and touches no device, and `service()`'s open arm on the next render pass is what actually mints the window — the same split that keeps the create on the compositor's own core (see that arm's readback). So the router re-arms and is done, and the press is consumed so it never falls through to a window beneath. ⚠ FOLDED onto one line rather than added as a block: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
-    if r.id == SHELL_PIN_ID {
+    if r.id == CONSOLE_PIN_ID { PRESS_OUTCOME.store(DOCK_OUT_CONSOLE_REOPEN, Ordering::Relaxed); CONSOLE_REOPEN.store(true, Ordering::Release); serial_println!("[dock] press at ({},{}) tile={}/{} console=pin -> reopen requested", x, y, t, n); return true; } if r.id == SHELL_PIN_ID {
         PRESS_OUTCOME.store(DOCK_OUT_REOPEN, Ordering::Relaxed);
         SHELL_REOPEN.store(true, Ordering::Release);
         serial_println!(
@@ -1204,7 +1204,7 @@ pub fn selftest() {
     // On a witness gate no KERNEL_OWNER_DESKTOP row exists (desktop_uefi never activates without a Kepler),
     // so the raw count is one tile short of the strip press_at lays out: every boundary shifts, the
     // probe centre lands off its tile — and can land ON the pin tile, latching a spurious reopen.
-    let n = pin_shell(&mut rows, n);
+    let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
     let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
@@ -1328,4 +1328,163 @@ fn pin_pulse(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
     e.focused = false;
     rows[n] = e;
     n + 1
+}
+
+// ------------------------------------------------------------------------------------------------
+// CONSOLEPIN — the CONSOLE window's pinned reopen tile (TAIL-APPENDED: nothing above this line moved,
+// so knob-off panic `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+
+/// CONSOLEPIN — the pinned console tile's synthetic window id. One below [`PULSE_PIN_ID`], on the
+/// argument [`SHELL_PIN_ID`] states: real ids are `1..=wm::MAX_WINDOWS` and `wm::WIN_NONE` is 0, so
+/// no sentinel in this descending run can ever name a live row or collide with [`PRESSED`]'s idle
+/// value.
+const CONSOLE_PIN_ID: wm::WinId = wm::WinId::MAX - 3;
+
+/// CONSOLEPIN — **has a console WINDOW ever existed on this boot?**
+///
+/// The pin's `ever_armed` (`pin_pulse`'s guard, same role): a tile promising a window that has never
+/// been minted is a button that would invent one, and on a board with no desktop the console is not a
+/// window at all — it is the panel. So the latch is set by [`pin_console`] itself, from the ROUTE
+/// cell (`fbcon::console_is_routed`), on the first pass after `fbcon::panel_console_window_open`
+/// installs the route, and it is never cleared: once the operator has seen a console tile, closing
+/// the window must leave the tile behind rather than take it away.
+///
+/// **Keyed on the ROUTE and not on a `KERNEL_OWNER_CONSOLE` row**, deliberately. `wm`'s own fixtures
+/// mint rows in that band (`closeiso_selftest`'s `wk`), and a row-keyed latch would let a fixture
+/// leave a phantom console tile on a boot whose console never left the panel. Only
+/// `panel_console_window_open` installs the route, so the route is the honest witness that the
+/// window existed.
+static CONSOLE_WINDOWED: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLEPIN — the reopen request, latched by [`press_at`] on the pinned tile and consumed by a
+/// render body with [`console_reopen_service`]. A `swap` on both sides, so a double press before
+/// service is one reopen, not two — [`SHELL_REOPEN`]'s rule, unchanged.
+static CONSOLE_REOPEN: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLEPIN — take (and clear) a pending console-reopen request. See [`CONSOLE_REOPEN`].
+pub fn take_console_reopen() -> bool {
+    CONSOLE_REOPEN.swap(false, Ordering::AcqRel)
+}
+
+/// CONSOLEPIN — **the console window's permanent tile, on `pin_shell`'s and [`pin_quarry`]'s
+/// precedent.**
+///
+/// ### The defect it closes (render8, Peter: *"console goes away from taskbar"*)
+///
+/// The console window is a normal app window with all three discs (NORMALWIN), and its close disc
+/// works on both arches (x86's `wc_close_furniture`, aarch64's CONWINCLOSE twin). What it did not
+/// have was a way back. There is `pin_shell` and there is `pin_quarry` and there was no
+/// `pin_console`, so the console's tile was its LIVE ROW and nothing else: `wm::close` cleared the
+/// row, `dock_scan` stopped reporting it, and the tile vanished from the strip with the window. The
+/// module's founding guarantee — *"every window has a way back"* — was false for the one window
+/// `<TAB>` cannot serve either (`focus_ring_apps` filters the reserved kernel band out of the
+/// rotation), which is the case `selftest`'s furniture leg was written to protect.
+///
+/// It read as working only by accident: until SO10 the dock's SHELL pin re-minted the CONSOLE
+/// (`orin_shell_reopen_drain` was keyed end to end on `fbcon::CONSOLE_WIN`), so pressing `shell`
+/// brought the console back. That double duty is the defect SO10 fixed; this is the half that has to
+/// exist once it is gone.
+///
+/// ### Shape
+///
+/// Identical to the other three pins and adds no fourth idea. The console window is kernel-owned
+/// furniture, its LIVE row is already dock-addressable (`dock_scan` includes kernel owners *"because
+/// a dock that could not bring the console back would be missing the one window an operator most
+/// needs to reach"*), so this pin exists only while the window is CLOSED and the model is unchanged
+/// while it is up. Applied FIRST — before `pin_shell` — so the settled strip reads
+/// `[quarry] [live rows…] [console] [shell] [pulse]`: the pin lands where the live console row sat,
+/// immediately left of the permanent shell tail, rather than jumping to the far end of the strip.
+///
+/// Returns the new count. Applied by every reader of the model — [`compose`], [`press_at`],
+/// [`strip_rect`], [`selftest`] — so painter, router, occlusion registry and self-test cannot
+/// disagree about the tile count, which is the invariant `pin_shell`'s header states.
+fn pin_console(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    // LIVE — the real row is the raise route and a second tile would be a second console. Also the
+    // one place the `ever` latch is written: this runs on every composite pass.
+    if crate::video::fbcon::console_is_routed() {
+        CONSOLE_WINDOWED.store(true, Ordering::Relaxed);
+        return n;
+    }
+    if n >= wm::MAX_WINDOWS
+        || !CONSOLE_WINDOWED.load(Ordering::Relaxed)
+        || rows[..n].iter().any(|r| r.owner_asid == wm::KERNEL_OWNER_CONSOLE)
+    {
+        return n;
+    }
+    let mut e = wm::DockEntry::empty();
+    e.id = CONSOLE_PIN_ID;
+    e.owner_asid = wm::KERNEL_OWNER_CONSOLE;
+    e.title[..7].copy_from_slice(b"console");
+    e.title_len = 7;
+    // Closed => OFF the panel, so the pip takes the minimised ink — `pin_shell`'s rule, unchanged.
+    e.visible = false;
+    e.focused = false;
+    rows[n] = e;
+    n + 1
+}
+
+/// CONSOLEPIN — **service a latched console-reopen request: raise the live window, or re-mint it.**
+///
+/// Called from a RENDER body, never from the click router, for `pin_quarry`'s reason stated in
+/// [`press_at`] and for one more that is specific to this window: `fbcon::panel_console_window_open`
+/// allocates a surface, takes the window TABLE and takes the panel locks (`WRITER`, `FBCON`), and the
+/// input path is held to LOCKFIX `7847ceea` — *"nothing here takes a blocking panel lock"*. So the
+/// press latches and this drains, exactly as the shell's pin does.
+///
+/// Two arms, one live console window max:
+///
+///  * **already live** — the scan-to-press race, or a press on a pin whose window never went away.
+///    Raise it through the pair the router's furniture arm uses (`focus_set(0)` then
+///    `wm::focus_changed`): a kernel-owned row has no input ring, so the keyboard goes to the shell,
+///    which is the furniture rule this module already states. Never a second window.
+///  * **closed** — re-mint through `fbcon::panel_console_window_open`, which is the ONE path that
+///    mints this window anywhere in the tree (`desktop_uefi::activate` on x86, `orin_conwin` and
+///    `desktop_firmware::activate` on aarch64 all reach it) and is idempotent behind `CONSOLE_WIN`.
+///    Re-installing the glyph route is the whole of the reopen: `panel_console_window_closed` clears
+///    only the route cell and deliberately leaves `c.win_fb` / `c.win_store` installed, so the console
+///    text never stopped landing in a cached-RAM surface while the window was gone.
+///
+/// A DECLINE leaves [`CONSOLE_WINDOWED`] set, so the tile stays on the dock for another try —
+/// `x86_render_service`'s rule for the shell's reopen, unchanged.
+///
+/// `who` names the render body on the wire, `orin_shell_reopen_drain`'s `by=` convention.
+///
+/// Arch-neutral: this module's own gate (x86 + `wc` OR aarch64 + `desktop_firmware`) is exactly the
+/// gate on every `fbcon` entry point it calls, so there is no `target_arch` test here and none is
+/// needed — x86 has the same dock, the same pin and the same console window.
+pub fn console_reopen_service(who: &'static str) -> bool {
+    if !take_console_reopen() {
+        return false;
+    }
+    if crate::video::fbcon::console_is_routed() {
+        let id = crate::video::fbcon::console_win();
+        focus_set(0);
+        wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+        serial_println!(
+            "[dock] console-reopen by={} win={} gen={} minted=0 route=already-live -> REOPEN",
+            who,
+            id,
+            wm::winid_gen(id)
+        );
+        return true;
+    }
+    let id = crate::video::fbcon::panel_console_window_open();
+    if id == wm::WIN_NONE {
+        serial_println!(
+            "[dock] console-reopen by={} win=0 gen=0 minted=0 route=declined -> DECLINE",
+            who
+        );
+        return false;
+    }
+    CONSOLE_WINDOWED.store(true, Ordering::Relaxed);
+    focus_set(0);
+    wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+    serial_println!(
+        "[dock] console-reopen by={} win={} gen={} minted=1 route=routed -> REOPEN",
+        who,
+        id,
+        wm::winid_gen(id)
+    );
+    true
 }
