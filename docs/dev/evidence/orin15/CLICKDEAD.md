@@ -586,3 +586,5 @@ A `grep -a` that only ever reports hits is not a gate. `DUP-DROP`, `NOBUF-DROP`,
 token is 0 in both. Both columns are recorded in §6.3.
 
 > **Reading the census: `nobuf=` is NOT a milder `dup=`.** They are different defects with opposite remedies — `dup` (known duplicate, buffer intact) says re-arm anyway; `nobuf` (`mouse_data_buffer`/`mouse_ring` gone) says the slot's soft state was torn down and re-arming would be wrong. Never add them: `dup + nobuf` equals the silent-exit total by construction, and a census where they do not is itself a bug signal (rmbp 12, 2026-09-06).
+
+> **Baseline chains are per tree (correction to the 7b143041 commit body, pi 7 2026-09-06).** `d73a8981…` → `8ff7c1d1…` is hw-jetson's knob-off `kernel8.img` chain. What pi 7 accepted is that CLICKDEAD moves the knob-off Pi image ONCE for the recorded reason (two ungated BSS atomics + one relaxed increment, the `MOUSE_REARM_COUNT` pattern); pi's own chain (`77690c77…` → `b5c0a3a1…` on hw-pi4 8131cd2d + S7 v2) re-derives its post-fold value on pi's tree. Comparing baseline shas across branches is meaningless; the invariant is no unexplained move within one chain.
