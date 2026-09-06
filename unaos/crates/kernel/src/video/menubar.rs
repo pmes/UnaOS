@@ -703,8 +703,18 @@ impl Model {
         // this costs a boot with no menus one atomic and no second table walk.
         let (mut menu_z, mut menu_owner) = (0u32, wm::WIN_NONE);
         for r in rows[..n].iter() {
+            // PANEL V-4 — `wm::info` is LAZY, below both guards. It takes `wm::TABLE` with IRQs
+            // masked (`wm::table`, and `wm.rs`'s standing rule about that critical section), so
+            // hoisting it above the guards turned one masked acquisition per bar compose into up to
+            // `MAX_WINDOWS` of them, on every composite, on every gated build — a regression against
+            // trunk, and it silently falsified the claim three lines up: the `has_tree`
+            // short-circuit cannot save a boot with no menus if `z` is computed before it is asked.
+            let publisher = r.visible && super::winmenu::has_tree(r.id);
+            if !publisher && (!r.focused || !r.visible) {
+                continue;
+            }
             let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
-            if r.visible && super::winmenu::has_tree(r.id) && (menu_owner == wm::WIN_NONE || z >= menu_z) {
+            if publisher && (menu_owner == wm::WIN_NONE || z >= menu_z) {
                 menu_z = z;
                 menu_owner = r.id;
             }
@@ -853,6 +863,13 @@ pub fn compose() -> bool {
         Some(_) => super::winmenu::bar_boxes(pw, ph),
         None => super::winmenu::BarSnapshot::empty(),
     };
+    // PANEL V-3 — the winmenu registry was CONTENDED taking that snapshot, so it lays out no titles
+    // for a reason that has nothing to do with what is published. Painting it would repaint the bar
+    // BLANK for one frame and change its signature to match, so the flicker would be recorded as the
+    // truth. DECLINE the pass instead — `strip::paint`'s own rule — and re-ask next composite.
+    if model.menus.busy {
+        return false;
+    }
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }

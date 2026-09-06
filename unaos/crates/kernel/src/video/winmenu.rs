@@ -185,6 +185,20 @@ static OPEN_TITLE: AtomicU32 = AtomicU32::new(0);
 /// The window the OPEN dropdown belongs to. Checked on every compose: a publisher that closed or
 /// cleared while its menu was down takes the menu with it.
 static OPEN_OWNER: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
+/// PANEL V-2 — **the open dropdown's rect, PUBLISHED as one atomic** ([`strip::pack_rect`]'s packing,
+/// `0` for closed, which is that function's own "none" sentinel).
+///
+/// [`open_rect`] is asked ONCE PER WINDOW inside a single occlusion walk — `wm::occ_clip`,
+/// `wm::erase_clip`, `wm::composite_inner`'s sprite arm and `screen::present_background` — so it has
+/// to be a TOTAL function of one fact. The layout it replaced took `TREES.try_lock()` TWICE per call
+/// (once in [`bar_boxes`], once in [`tree_of`]) and could therefore answer `Some` for window 3 and
+/// `None` for window 5 in the SAME walk: window 5 blits straight over the open dropdown while window
+/// 3 correctly withheld those rows. The accessor `crystal::open_rect` (which this replaced at all
+/// four sites) was one relaxed load and structurally could not do that; this restores the property.
+///
+/// Written from TASK context at open time ([`open_title`]) and refreshed ONCE per compose
+/// ([`republish_open_rect`]) — never from the per-window walk, which only ever reads it.
+static OPEN_RECT: AtomicU64 = AtomicU64::new(0);
 
 /// Falsifiable counters for the ledger line.
 static PUBLISHES: AtomicU64 = AtomicU64::new(0);
@@ -222,25 +236,45 @@ pub fn has_tree(id: wm::WinId) -> bool {
     OWNERS.iter().any(|o| o.load(Ordering::Relaxed) == id)
 }
 
-/// The tree published for `id`, or `None` — including when the table is contended, which is reported
-/// rather than swallowed.
-fn tree_of(id: wm::WinId, site: &str) -> Option<Tree> {
+/// **The registry's answer, and it is THREE-VALUED on purpose** (PANEL V-3).
+///
+/// A `try_lock` refusal and *"this window has no menus"* are DIFFERENT FACTS, and the module header's
+/// rule — *"prints a named refusal and DECLINES THE PASS"* — is only implementable if the caller can
+/// tell them apart. Folding both into one `None` made a busy lock indistinguishable from a departed
+/// publisher, and the readers act on emptiness: [`bar_boxes`] built the empty snapshot, [`compose`]
+/// read `s.open == 0` off it and tore the operator's open menu down because a lock was held for one
+/// pass. Reachable, and worst on the single-core Orin, where [`publish`]/[`clear`] hold this very
+/// guard across a `serial_println!` that re-enters the video stack on the same core.
+enum Look {
+    /// The tree published for the asked window.
+    Found(Tree),
+    /// The window genuinely has no menus. Act on it.
+    Absent,
+    /// The registry was CONTENDED: we could not look. Decline the pass; conclude nothing.
+    Busy,
+}
+
+/// The tree published for `id` — see [`Look`] for why contention is its own answer.
+fn tree_of(id: wm::WinId, site: &str) -> Look {
     if !has_tree(id) {
-        return None;
+        return Look::Absent;
     }
     let g = match TREES.try_lock() {
         Some(g) => g,
         None => {
             note_refusal(site);
-            return None;
+            return Look::Busy;
         }
     };
     for (k, slot) in g.iter().enumerate() {
         if OWNERS[k].load(Ordering::Relaxed) == id {
-            return *slot;
+            return match *slot {
+                Some(t) => Look::Found(t),
+                None => Look::Absent,
+            };
         }
     }
-    None
+    Look::Absent
 }
 
 /// **Publish `owner`'s menu tree.** `true` when the registry took it.
@@ -371,10 +405,15 @@ pub fn clear(owner: wm::WinId) -> bool {
 ///
 /// A change closes an open dropdown: the titles under it have moved, so leaving it down would anchor
 /// another window's menu under this window's title.
+///
+/// PANEL V-1 — the STATE half only. This function's one caller is [`super::menubar::compose`], i.e.
+/// it runs INSIDE `strip::compose_all`, inside the composite pass; a [`dismiss`] here would re-enter
+/// `wm::composite()` from within the pass. [`super::winmenu::compose`] runs later in the same
+/// `compose_all`, so the erase this clear owes is discharged in THIS pass, not a future one.
 pub fn set_bar_owner(id: wm::WinId) -> wm::WinId {
     let was = BAR_OWNER.swap(id, Ordering::Release);
     if was != id && OPEN_TITLE.load(Ordering::Relaxed) != 0 && OPEN_OWNER.load(Ordering::Relaxed) == was {
-        dismiss("owner-change");
+        dismiss_state("owner-change");
     }
     was
 }
@@ -415,6 +454,12 @@ const FACE: super::font::Face = crystal::DROP_FACE;
 pub struct BarSnapshot {
     /// How many boxes are laid out. `0` when there is no publisher, no bar, or no room.
     pub n: usize,
+    /// PANEL V-3 — **the registry was CONTENDED while this snapshot was taken**, so `n == 0` here
+    /// means *"we could not look"*, never *"there is nothing"*. Every reader that would ACT on
+    /// emptiness — the bar's repaint, the dropdown's teardown, the press router's dismiss-outside —
+    /// must test this first and decline the pass instead. Deliberately NOT in [`signature`]: it is a
+    /// transient property of one attempt, not content the painter reads.
+    pub busy: bool,
     /// The open title, 1-based; `0` is closed.
     pub open: usize,
     /// The window these boxes belong to.
@@ -433,6 +478,7 @@ impl BarSnapshot {
     pub const fn empty() -> BarSnapshot {
         BarSnapshot {
             n: 0,
+            busy: false,
             open: 0,
             owner: wm::WIN_NONE,
             x: [0; MENU_TITLES_MAX],
@@ -494,8 +540,15 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
         return s;
     };
     let owner = bar_owner();
-    let Some(tree) = tree_of(owner, "bar_boxes") else {
-        return s;
+    // PANEL V-3 — DECLINED and EMPTY are different snapshots. `busy` carries the difference to the
+    // readers; nothing here concludes "no publisher" from a lock it could not take.
+    let tree = match tree_of(owner, "bar_boxes") {
+        Look::Found(t) => t,
+        Look::Absent => return s,
+        Look::Busy => {
+            s.busy = true;
+            return s;
+        }
     };
     s.bar = bar;
     s.owner = owner;
@@ -587,34 +640,78 @@ fn item_at_row(items: &[MenuItem], ly: usize, mh: usize) -> Option<usize> {
 
 /// **The dropdown's rect on a `pw` x `ph` panel, or `None` while nothing is dropped.**
 ///
-/// Anchored under the OPEN title's left edge — the SHARD dropdown's rule, applied to a title box
-/// instead of to the brand mark — with the same clamp so the right edge stays on the panel, and the
-/// same decline when the panel cannot seat the menu below the bar at all.
+/// PANEL V-2 — ONE acquire load of [`OPEN_RECT`], no lock, TOTAL. The panel extent is taken only to
+/// keep the call shape the four occlusion consumers already use: the rect they get is the rect the
+/// layout published for the panel it was laid out on, identical for every window in one walk.
 ///
 /// This is what [`super::menubar::open_dropdown_rect`] folds together with the SHARD menu's own
 /// accessor for the three occlusion sites; see the module header for why exactly one of the two can
 /// ever answer `Some`.
 pub fn open_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
-    if !is_open() {
-        return None;
+    let _ = (pw, ph);
+    match OPEN_RECT.load(Ordering::Acquire) {
+        0 => None,
+        p => Some(strip::unpack_rect(p)),
     }
-    let s = bar_boxes(pw, ph);
-    if s.open == 0 {
-        return None;
+}
+
+/// What the LAYOUT concluded this pass — three-valued for [`Look`]'s reason, one level up.
+enum Layout {
+    /// The dropdown belongs at this rect.
+    At(strip::Rect),
+    /// Nothing is dropped, or the panel cannot seat the menu: the surface owes an ERASE.
+    Gone,
+    /// The registry was contended. The PUBLISHED rect stands; nothing is concluded.
+    Busy,
+}
+
+/// **Lay the dropdown out**, from the registry — the SHARD dropdown's anchoring rule applied to a
+/// title box instead of the brand mark: under the OPEN title's left edge, the same clamp so the right
+/// edge stays on the panel, and the same decline when the panel cannot seat the menu below the bar.
+///
+/// This is the half that TAKES THE LOCK, so its callers are counted: [`open_title`] (task context)
+/// and [`compose`] (once per pass). The per-window occlusion walk reads [`OPEN_RECT`] instead.
+fn layout_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Layout {
+    if s.busy {
+        return Layout::Busy;
     }
-    let tree = tree_of(s.owner, "open_rect")?;
+    if !is_open() || s.open == 0 {
+        return Layout::Gone;
+    }
+    let tree = match tree_of(s.owner, "open_rect") {
+        Look::Found(t) => t,
+        Look::Absent => return Layout::Gone,
+        Look::Busy => return Layout::Busy,
+    };
     let k = s.open - 1;
     if k >= tree.titles.len() {
-        return None;
+        return Layout::Gone;
     }
     let (mw, mh) = drop_extent(tree.titles, k);
     let (_bx, by, _bw, bh) = s.bar;
     let my = by + bh;
     if mw > pw || my + mh > ph {
-        return None;
+        return Layout::Gone;
     }
     let mx = if s.x[k] + mw > pw { pw - mw } else { s.x[k] };
-    Some((mx, my, mw, mh))
+    Layout::At((mx, my, mw, mh))
+}
+
+/// Lay the dropdown out and PUBLISH the answer into [`OPEN_RECT`], returning the rect now on the
+/// panel. A contended pass republishes nothing and answers with the standing fact — the one behaviour
+/// that keeps the accessor total across a pass in which the registry was briefly unavailable.
+fn republish_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Option<strip::Rect> {
+    match layout_open_rect(pw, ph, s) {
+        Layout::At(r) => {
+            OPEN_RECT.store(strip::pack_rect(Some(r)), Ordering::Release);
+            Some(r)
+        }
+        Layout::Gone => {
+            OPEN_RECT.store(0, Ordering::Release);
+            None
+        }
+        Layout::Busy => open_rect(pw, ph),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -627,10 +724,15 @@ fn open_title(k: usize, s: &BarSnapshot) {
     OPEN_TITLE.store((k + 1) as u32, Ordering::Release);
     OPENS.fetch_add(1, Ordering::Relaxed);
     let (pw, ph) = panel();
-    let (mx, my) = open_rect(pw, ph).map(|r| (r.0, r.1)).unwrap_or((0, 0));
-    let items = tree_of(s.owner, "open")
-        .and_then(|t| t.titles.get(k).map(|t| t.items.len()))
-        .unwrap_or(0);
+    // PANEL V-2 — publish the rect HERE, in task context, off a snapshot taken AFTER the open is
+    // visible (`s` was read before `OPEN_TITLE` was stored, so its `open` is still 0). Every reader
+    // downstream takes it as one atomic.
+    let fresh = bar_boxes(pw, ph);
+    let (mx, my) = republish_open_rect(pw, ph, &fresh).map(|r| (r.0, r.1)).unwrap_or((0, 0));
+    let items = match tree_of(s.owner, "open") {
+        Look::Found(t) => t.titles.get(k).map(|t| t.items.len()).unwrap_or(0),
+        _ => 0,
+    };
     serial_println!(
         "[winmenu] open title={} items={} at ({},{}) owner={}",
         core::str::from_utf8(s.label_of(k)).unwrap_or("?"),
@@ -639,16 +741,44 @@ fn open_title(k: usize, s: &BarSnapshot) {
     drive();
 }
 
-/// Tear the dropdown down. Idempotent. `reason` is `outside` / `esc` / `pick` / `title` / `clear` /
-/// `owner-change` — a capture must be able to tell a cancel from a selection.
+/// Tear the dropdown down AND drive the pass that erases it. Idempotent. `reason` is `outside` /
+/// `esc` / `pick` / `title` / `clear` / `owner-change` — a capture must be able to tell a cancel from
+/// a selection.
+///
+/// **TASK CONTEXT ONLY**, because [`drive`] is: the click router, [`key_escape`] and the publisher's
+/// own [`clear`]. From a COMPOSE path call [`dismiss_state`] instead.
 fn dismiss(reason: &str) {
-    if OPEN_TITLE.swap(0, Ordering::AcqRel) == 0 {
-        return;
+    if dismiss_state(reason) {
+        drive();
     }
+}
+
+/// PANEL V-1 — **the STATE half of a dismiss, with NO composite.** `true` when a menu actually went.
+///
+/// `wm::composite()` is re-entrancy-safe only on x86, where `COMP_GATE` declines a nested call. The
+/// `#[cfg(not(target_arch = "x86_64"))]` arm (`video/wm.rs`) is a bare `composite_once()` with no
+/// gate and no decline path of its own, so on the Orin and on the Pi desktop a [`drive`] reached from
+/// inside `strip::compose_all` RE-ENTERS the pass that is running: a second `cursor::undraw`
+/// save-under bracket opens inside the outer one (the inner restore writes back the outer pass's
+/// half-drawn pixels), and the `OWED_ARM`/`OWED_TAIL` stash machinery runs from inside the present's
+/// IRQ-masked half. [`drive`]'s own doc already states the precondition — *"task context only"* — and
+/// the two compose-path callers violated it.
+///
+/// Clearing the state without driving costs nothing here, because a pass IS running: [`compose`]
+/// takes the erase itself in the same call, and [`set_bar_owner`]'s caller (`menubar::compose`) is
+/// followed by `winmenu::compose` inside the same `strip::compose_all`. No gesture waits on a pass
+/// that may never come — which is the whole reason MENU-DRIVE exists.
+fn dismiss_state(reason: &str) -> bool {
+    if OPEN_TITLE.swap(0, Ordering::AcqRel) == 0 {
+        return false;
+    }
+    // PANEL V-2 — the published rect goes with the state, so the occlusion walk stops reserving rows
+    // for a menu that is down.
+    OPEN_RECT.store(0, Ordering::Release);
     let owner = OPEN_OWNER.swap(wm::WIN_NONE, Ordering::AcqRel);
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!("[winmenu] dismiss reason={} owner={}", reason, owner);
-    drive();
+    true
 }
 
 /// **An open or a dismissed menu must DRIVE the pass that paints or erases it** — [`super::crystal`]'s
@@ -704,13 +834,26 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     let s = bar_boxes(pw, ph);
 
+    // PANEL V-3 — a CONTENDED registry declines the press; it never tears the operator's menu down.
+    // A busy snapshot lays out no title boxes, so every hit-test below would miss and the miss arm
+    // is `dismiss("outside")` — a lock held for one pass would close the menu under the operator's
+    // hand. The menu is modal while it is down, so declining means CONSUMING and changing nothing.
+    if s.busy && is_open() {
+        return true;
+    }
+
     if is_open() {
         if let Some(r) = open_rect(pw, ph) {
             let (mx, my, mw, mh) = r;
             if px >= mx && px < mx + mw && py >= my && py < my + mh {
-                let Some(tree) = tree_of(s.owner, "press") else {
-                    dismiss("outside");
-                    return true;
+                let tree = match tree_of(s.owner, "press") {
+                    Look::Found(t) => t,
+                    // Contended between the snapshot and here: decline, keep the menu down.
+                    Look::Busy => return true,
+                    Look::Absent => {
+                        dismiss("outside");
+                        return true;
+                    }
                 };
                 let k = s.open.saturating_sub(1);
                 let Some(t) = tree.titles.get(k) else {
@@ -815,6 +958,25 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
 // The composite seam
 // ---------------------------------------------------------------------------
 
+/// **The erase this surface owes once the menu is down.** `true` when pixels went back.
+///
+/// CRYSTAL-DISMISS's ordering, kept: the erase lands BEFORE the slot is cleared, so a declined erase
+/// stays owed and [`paint_owed`] keeps reporting the debt instead of stranding the dismissed menu's
+/// pixels on the glass. Lifted out of [`compose`]'s head because PANEL V-1's fix needs it from two
+/// more arms — a compose-path teardown discharges its own pixels rather than driving a nested pass.
+fn erase_owed() -> bool {
+    if SLOT.packed() == 0 {
+        return false;
+    }
+    let r = SLOT.rect();
+    if !strip::erase_rect(r) {
+        return false;
+    }
+    SLOT.clear();
+    repaint_vacated(r);
+    true
+}
+
 /// **Paint or erase the dropdown.** Called from [`super::strip::compose_all`] at the composite tail,
 /// AFTER the SHARD menu, so a window menu is the topmost surface on the panel while it is down.
 ///
@@ -822,19 +984,7 @@ pub fn draw_bar_row(out: &mut [u32], w: usize, s: &BarSnapshot, j: usize, ty0: u
 /// exactly that for this module's existence — the tenant law, on a transient.
 pub fn compose() -> bool {
     if !is_open() {
-        // CRYSTAL-DISMISS's ordering, kept: the erase lands BEFORE the slot is cleared, so a declined
-        // erase stays owed and `paint_owed` keeps reporting the debt instead of stranding the
-        // dismissed menu's pixels on the glass.
-        if SLOT.packed() != 0 {
-            let r = SLOT.rect();
-            if !strip::erase_rect(r) {
-                return false;
-            }
-            SLOT.clear();
-            repaint_vacated(r);
-            return true;
-        }
-        return false;
+        return erase_owed();
     }
     let t0 = crate::arch::now_cycles();
     let (pw, ph) = {
@@ -846,13 +996,24 @@ pub fn compose() -> bool {
         (fb.width(), fb.height())
     };
     let s = bar_boxes(pw, ph);
-    // The publisher went away, or the bar moved to another window, while the menu was down. Say so
-    // and tear it down rather than painting another window's menu under this window's title.
-    if s.open == 0 {
-        dismiss("clear");
+    // PANEL V-3 — the registry was busy for this pass. DECLINE it: `s.open == 0` below is the
+    // teardown test, and reaching it off a lock we could not take is exactly how a transient refusal
+    // destroyed operator state. The menu keeps its pixels; the next pass re-asks.
+    if s.busy {
         return false;
     }
-    let rect = open_rect(pw, ph);
+    // The publisher went away, or the bar moved to another window, while the menu was down. Say so
+    // and tear it down rather than painting another window's menu under this window's title.
+    //
+    // PANEL V-1 — STATE ONLY, then the erase, HERE. This function runs from `strip::compose_all`,
+    // inside the composite pass; `dismiss` would call `drive()` -> `wm::composite()` and re-enter it
+    // (ungated on aarch64). `erase_owed` is the pixel half of what `drive` would have driven, taken
+    // in the pass that is already running. See [`dismiss_state`].
+    if s.open == 0 {
+        dismiss_state("clear");
+        return erase_owed();
+    }
+    let rect = republish_open_rect(pw, ph, &s);
     LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
     LEDGER.tick(
         "winmenu",
@@ -869,16 +1030,7 @@ pub fn compose() -> bool {
     );
 
     let Some(r) = rect else {
-        if SLOT.packed() != 0 {
-            let old = SLOT.rect();
-            if !strip::erase_rect(old) {
-                return false;
-            }
-            SLOT.clear();
-            repaint_vacated(old);
-            return true;
-        }
-        return false;
+        return erase_owed();
     };
 
     // CLOBBER-REPAIR — the dropdown's signature is a function of its rect and its content, so a
@@ -897,7 +1049,7 @@ pub fn compose() -> bool {
         strip::erase_rect(strip::unpack_rect(old));
     }
 
-    let Some(tree) = tree_of(s.owner, "compose") else {
+    let Look::Found(tree) = tree_of(s.owner, "compose") else {
         return false;
     };
     let k = s.open - 1;
@@ -918,7 +1070,7 @@ fn drop_sig(s: &BarSnapshot, r: strip::Rect) -> u64 {
     let mut h = strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r)));
     h = strip::fnv1a_u64(h, s.owner as u64);
     h = strip::fnv1a_u64(h, s.open as u64);
-    if let Some(tree) = tree_of(s.owner, "sig") {
+    if let Look::Found(tree) = tree_of(s.owner, "sig") {
         if let Some(t) = tree.titles.get(s.open.saturating_sub(1)) {
             for it in t.items.iter() {
                 h = strip::fnv1a_u64(h, it.id as u64);
