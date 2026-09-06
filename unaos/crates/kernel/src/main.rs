@@ -8355,7 +8355,7 @@ fn orin_render_service(_: usize) {
         // sets `st.armed`, so `loads()` answers `ncpu` before `service` asks), and thereafter repaints
         // only when the frame signature moves. It presents through its own `wm` row, not through
         // `pal`, and returns `()` — it neither reads nor sets `dirty`.
-        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample.
+        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::quarry::service(); // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample. QUARRY-ORIN (A8) — and the file manager's latch drains beside it. `quarry::service()` is `reap_jobs()` + one `AcqRel` swap on a quiet pass, so this costs a relaxed load per pass and nothing else; when the latch IS set it calls `open()`, which reads directories — legal HERE and not in the click router (the reason `dock::press_at` latches instead of opening). The Pi drains it from ONE place, `arch/aarch64/syscall.rs`'s strip-press arm, which this board also compiles (`desktop_firmware`, and render6-boot2's `[dock] press … raised=true` proves that arm runs here) — but that arm fires only on a dock press, so `open()`'s own `reason=panel-busy` re-latch and `tegra_quarry_seat`'s would both sit unread until an operator happened to click the strip. This is the pass-driven drain that closes them. ⚠ FOLDED onto this line rather than added below it, for the reason PULSEWIN names.
 
         // AT MOST ONE PRESENT PER PASS, and only when something changed. The Pi service measured a
         // 96-100% core peg before it took this rule; on this board the cost lands on cpu 0, which is
@@ -8622,7 +8622,7 @@ fn tegra_desk_cascade() -> bool {
         if routed { "ROUTED" } else { "UNROUTED" },
         activated
     );
-    true
+    tegra_quarry_seat(); true // QUARRY-ORIN (A8) — the cascade's READBACK of its own last step: `activate()` opened Quarry above (step 6, `#[cfg(feature = "quarry")]`), and this says whether it is on the glass, re-latching `request_open()` when it is not so the render pass reopens it with no operator action. ⚠ FOLDED onto the existing `true`, never added below it: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers — PARITY.md §5.3. Helper at the file tail (a pure append, which renumbers nothing).
 }
 
 // =================================================================================================
@@ -8865,4 +8865,85 @@ fn tegra_shell_present(
 ) {
     use unaos_kernel::pal::GneissPal;
     pal.render();
+}
+
+// =================================================================================================
+// QUARRY-ORIN (tail block) — A8: the file manager on the cascaded desktop.
+// =================================================================================================
+//
+// THE FINDING (Peter, 2026-09-06: *"what about quarry?"*). render6 flew the cascade twice and neither
+// log contains a single line matching `quarry`; the dock read `console · pulse · shell`
+// (`[dock] press … tile=2/3`). The opener was never missing and the cascade never skipped it:
+// `video/desktop_firmware.rs:394` `super::quarry::open()` is step 6 of `activate()`, `tegra_desk_cascade`
+// calls `activate()` unconditionally, and render6-boot2.log:421..485 shows that call running every
+// other step it has (`[pidesk] desktop-clear`, `activate console_win=1 routed=true`, `faces=`,
+// `menubar ENABLED`, `menubar PAINTED`, `crystal LIVE`, `pulse-window ARMED`). What was missing is the
+// FEATURE: step 6 sits behind `#[cfg(feature = "quarry")]`, render6's banner reads
+// `…,orinrender,desktop_firmware,orinrx,tcuprobe,deskcascade` with no `quarry` term, and with the knob
+// off `video/quarry.rs` resolves `open` to `#[inline(always)] pub fn open() {}`. The cascade therefore
+// executed its last step as a no-op and had nothing to print.
+//
+// ⚠ THE MISREADING THIS BLOCK EXISTS TO RETIRE. `[deskcascade] -> CASCADED … activate=false` does NOT
+// mean "activate was not called". `activate=` prints `activated`, the RETURN VALUE, and that function's
+// tail returns `routed` only under `#[cfg(feature = "livecon")]` and a literal `false` otherwise
+// (`video/desktop_firmware.rs`, the LIVE-CONSOLE DECISION). render6 carried no `livecon`, so `false` was
+// the only answer it could give — on a boot whose console demonstrably WAS windowed and routed
+// (`route=ROUTED windows=1 owns_pixels=1` on the same line). Read `bar=1` / `route=ROUTED` / `windows=`
+// for what the cascade DID; `activate=` is a `livecon` readout wearing a misleading name.
+//
+// THE FIX IS THE ARMING, AND IT IS ONE LINE OF Cargo.toml. `deskcascade = ["desktop_firmware",
+// "tegra_el0", "quarry"]` makes `UNAOS_DESKCASCADE=1` build the armed file manager — no new knob, and
+// nothing for an operator to remember (the pre-existing `UNAOS_QUARRY` knob would have worked on the
+// render6 line, and was forgotten; that is the failure mode the implication removes). It moves no
+// type-check leg — `arm-tegra-render` is the only leg naming `deskcascade` and it already named
+// `quarry` explicitly — and it does not touch the Pi, because `kernel8` never enables `deskcascade`.
+//
+// ⚠ arroyo's `UNAOS_DESKCASCADE` mapping is deliberately NOT given a `quarry,` term, though the banner
+// would then name it. That mapping makes the knob->builder wiring gate demand `builder/src/main.rs`
+// read `UNAOS_DESKCASCADE` (because `quarry` is named by the literal `x86-all` leg — the rastmc rule),
+// and the media builder has no business knowing a Jetson desktop knob. The arming proof is instead the
+// `compiled=` field of this block's own seat line, read out of the built image rather than out of the
+// script that invoked the build.
+//
+// WHAT THIS SEAT ADDS ON TOP OF THE ARMING. `open()` is allowed to DECLINE — `panel-busy` (bounded
+// `panel_info_nonblocking` retries), `panel-below-floor`, `dock-cannot-host-full-strip`, `alloc`,
+// `geometry-unavailable`, `create-failed` — and the first of those RE-LATCHES `REOPEN` on the way out,
+// on the standing promise that "the next `service()` pass reopens with no further operator action".
+// That promise has to be kept by somebody. On the Pi the only drain is `arch/aarch64/syscall.rs`'s
+// strip-press arm, i.e. an operator click; the fold in `tegra_render_arm`'s pass above is this board's
+// pass-driven drain, and this seat is what puts a request in front of it when the boot-core open did
+// not land. It is deliberately NOT a second `open()` call at cascade depth: that is the §5.2 stack the
+// `[u7stk] boot-core:pre/post-cascade` pair is measuring (render6: `len=32768 used=240 hw=15552
+// headroom=17216`, and `activate()` now carries `quarry::open()` inside that bracket — READ THAT PAIR
+// FIRST on the next flight, it is the one number this change can move).
+//
+// Nothing here is `quarry`-gated: `is_open` and `request_open` exist in BOTH polarities by the seam's
+// design (`video/quarry.rs`), so the seat prints an honest `compiled=0` on a `deskcascade` build that
+// somehow reached this line without the feature rather than vanishing and leaving no line at all.
+
+/// QUARRY-ORIN — the cascade's readback of `activate()`'s last step, and the re-latch when it declined.
+///
+/// One line, always: `[deskquarry] seat compiled=… open=… windows=… relatched=…`. Called from
+/// `tegra_desk_cascade`'s `true` (folded, line-neutral), so it runs on exactly the boots that reached
+/// `-> CASCADED` and on no others.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_quarry_seat() {
+    use unaos_kernel::video::{quarry, wm};
+    let compiled = cfg!(feature = "quarry");
+    let open = quarry::is_open();
+    // Re-latch only when the module EXISTS and the window does not. With `quarry` off `request_open`
+    // is the `#[inline(always)]` no-op and latching would be a lie in the line below; with the window
+    // already up, `open()`'s own `SKIP reason=already-open` would be the whole effect, so we do not
+    // spend a render pass on it.
+    let relatched = compiled && !open;
+    if relatched {
+        quarry::request_open();
+    }
+    serial_println!(
+        "[deskquarry] seat compiled={} open={} windows={} relatched={} (QUARRY-ORIN A8 — desktop_firmware::activate() step 6 opens the file manager behind `feature = \"quarry\"`; compiled=0 is the whole of why render6 printed no [quarry] line and its dock read tile=2/3. compiled=1 open=1 => the `[quarry] open win=… volumes=… tree-rows=… cwd=…` line above IS the window and the dock gains a pinned `quarry` tile at slot 0. compiled=1 open=0 => open() DECLINED and named its reason above; the request is re-latched and tegra_render_arm's pass drains it)",
+        compiled as u8,
+        open as u8,
+        wm::count(),
+        relatched as u8
+    );
 }

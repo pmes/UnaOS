@@ -2406,7 +2406,34 @@ orinrender = ["desktop_firmware", "tegra_el0"]
 # below SP on the firmware boot stack (witness-gated; `sched::stk_probe` itself is a no-op there).
 # Self-sufficient like `orinrender`, for the same reason; type-checked by `arm-tegra-render`.
 # Fly with `UNAOS_ORINRENDER=1` so the render pass presents what the cascade builds.
-deskcascade = ["desktop_firmware", "tegra_el0"]
+#
+# QUARRY-ORIN (2026-09-06, orin-ledger A8) — `quarry` IS THE THIRD IMPLICATION, and the parenthetical
+# "quarry when armed" three lines above is exactly what went wrong on render6. `desktop_firmware::activate()`
+# step 6 is `#[cfg(feature = "quarry")] { super::quarry::open(); … }`, so on an image WITHOUT the
+# feature the cascade runs that step as `video/quarry.rs`'s `#[inline(always)] pub fn open() {}` knob-off
+# stub — no window, no `[quarry]` line, and `dock::pin_quarry` (also `#[cfg(feature = "quarry")]`) mints no
+# tile. render6's banner reads `…,orinrender,desktop_firmware,orinrx,tcuprobe,deskcascade` with no
+# `quarry` term, and both of its boot logs contain ZERO lines matching `quarry` while the dock reads
+# `tile=2/3`: the file manager was never compiled into the image, not declined by it. `activate=false`
+# in `[deskcascade] -> CASCADED` is the RETURN VALUE (`activate()` answers `routed` only under
+# `livecon`, `false` otherwise — `video/desktop_firmware.rs` tail), NOT "activate was skipped"; the
+# `[pidesk] desktop-clear / activate / menubar ENABLED / crystal LIVE / pulse-window ARMED` run in
+# render6-boot2.log:421..485 is that same call reaching its last step.
+#
+# So: a knob whose own doc says it gives the Orin "the NORMAL desktop the Pi has" must carry the Pi's
+# file manager, and it now does — `UNAOS_DESKCASCADE=1` alone opens Quarry. The implication is free in
+# the type-check matrix: `arm-tegra-render` is the only leg that names `deskcascade` and it already
+# named `quarry` explicitly, so the resolved set of every leg is unchanged. It is also free for the Pi:
+# `kernel8` never enables `deskcascade`, so `quarry` stays off there and `kernel8.img` is byte-identical
+# across this change (re-measured, both shas quoted in the QUARRY commit body).
+#
+# THE IMPLICATION IS THE WHOLE ARMING — arroyo's `UNAOS_DESKCASCADE` mapping is deliberately NOT given a
+# `quarry,` term. Adding one maps the knob to a feature the literal `x86-all` leg names, which trips the
+# knob→builder wiring gate (`builder/src/main.rs` does not read this aarch64-only knob, and should not
+# learn to). The banner term is not needed as arming proof: `main.rs::tegra_quarry_seat` prints
+# `[deskquarry] seat compiled=…` from `cfg!(feature = "quarry")` inside the built image, which is what
+# the next flight is scored on. See the arroyo block above the mapping.
+deskcascade = ["desktop_firmware", "tegra_el0", "quarry"]
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
 # ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
 #

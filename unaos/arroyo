@@ -1314,6 +1314,27 @@ _feats=""
 # what it builds; do NOT combine with UNAOS_ORINCONWIN/ORINDESK (the cascade REFUSES a non-empty table).
 # Witness: `[deskcascade] arming cascade`, `[deskcascade] -> CASCADED` / `REFUSE`. Emits real aarch64
 # code, so `arm_features` does not strip it. Type-checked by `arm-tegra-render`.
+#
+# QUARRY-ORIN (2026-09-06, orin-ledger A8): the file manager now rides this knob, and it rides it
+# through Cargo's `deskcascade = ["desktop_firmware", "tegra_el0", "quarry"]` implication — NOT through
+# a `quarry,` term appended to the line below. Both were tried; only the implication is admissible.
+# Appending here maps UNAOS_DESKCASCADE -> `quarry`, and `quarry` is named by the literal `x86-all`
+# leg, which makes the knob->builder wiring gate demand that `builder/src/main.rs` read
+# UNAOS_DESKCASCADE too (the rastmc rule: never arm a feature for an x86 media banner without
+# building it). It does not, this is an aarch64-only knob, and teaching the media builder a Jetson
+# desktop knob to win a banner term is the wrong trade. The implication costs nothing and cannot be
+# forgotten by an operator, which the pre-existing UNAOS_QUARRY knob (line ~1028) can.
+#
+# The arming proof does not depend on the banner. `main.rs::tegra_quarry_seat` prints
+# `[deskquarry] seat compiled=<cfg!(feature = "quarry")> open=… windows=… relatched=…` on every boot
+# that reaches `-> CASCADED`, which is a reading of the BUILT IMAGE rather than of the script that
+# invoked the build — strictly stronger evidence than a `$_feats` term, and it is what convicts or
+# clears the next flight. render6 is the case in point: its banner read
+# `…,orinrender,desktop_firmware,orinrx,tcuprobe,deskcascade` with no `quarry`, both logs held zero
+# `quarry` lines and the dock read `tile=2/3`, because `desktop_firmware::activate()` step 6 ran as
+# `video/quarry.rs`'s `#[cfg(not(feature = "quarry"))] #[inline(always)] pub fn open() {}`.
+# `quarry` is NOT in `arm_features`'s strip list and must never join it: it emits real aarch64 code —
+# `video/quarry/live.rs`'s collector is the `target_arch = "aarch64"` half.
 [ -n "${UNAOS_DESKCASCADE:-}" ] && _feats="${_feats}deskcascade,desktop_firmware,tegra_el0,tegra,"
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,desktop_firmware,tegra_el0,tegra,"
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
