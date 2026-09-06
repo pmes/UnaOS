@@ -64,3 +64,12 @@ Reading: (1) NOT pi's truncation family — five of six failing runs carry every
 | k8t-patched-2 | (40,43) band 0..48 | 0x2d2b55 | 0x000000 | — |
 
 Every `got` is a legitimate frame colour, never garbage: `0x000000` = `BG_DEFAULT`, `0x1b1b1b` = an anti-aliased `FG_DEFAULT` edge over `BG_DEFAULT`, `0x2d2b55` = the desktop backdrop; the `want` greys (0x05/0x11/0x17/0x1b) are the console's anti-aliased text edges. `desktop_firmware.rs:147` already documents this exact pair (`got=0x1b1b1b want=0x000000`) as "a printing core repaints rows edge to edge … reading a panel this writer had just been over", and `wm.rs:6080` defines `moved=` as a reference that moved UNDER the verifier, counted instead of charged to the blit — `moved=851` on k8t-final-1 is the verifier reporting exactly that. Reading: the equal-count failures are the CONSOLE PRINTING CORE repainting the verified band after `want` was captured — the reference is stale, the memory is self-consistent, no kernel memory bug; host load widens the window (more console lines land inside the verify). `want` is not mis-computed (the pairs are real adjacent frames). CONSEQUENCES: the quiet-box run only removes the pressure and convicts nothing; the fix is verifier-side — quiesce the console writer or re-anchor `want` after the repaint (a re-read before verdict) — in the FIXTURE, not the kernel. The 145/83 run (k8t-baseline-1) is asymmetric and is NOT this shape; it stays a separate, unworked observation (4131's family or a third thing).
+
+## The seat's own pair on the WINID2 fold tip (89a7208b, kernel 049d2a48, 2026-09-06 ~14:5xZ)
+
+| run | host load | verdict | hit |
+|---|---|---|---|
+| gates-winid2 run 1 | ~3.9 (one executor + the chain) | FAIL 119/119 REQUIRE, 2 FORBID | `[wc-g] win=4 seq=0 own=no scale=3x … fbbad=384/4096 occluded=0 … slow=no -> BLIT` (spec :952-954) |
+| gates-winid2 run 2 | ~3.1 | PASS 119/119, 0 FORBID | — |
+
+Both runs carry `[winid] selftest … -> PASS`, `[wcgseam] … refunded=1/16`, and ZERO `winid-register REFUSED` lines (pi 7's precondition for adding the registry FORBID to pi4-regression.spec is met on this tip). The run-1 hit is a third content-bearing shape (`[wc-g] -> BLIT`, fbbad non-zero, on a 3x-scaled window 4) beside the `[wc-d] moved` and `[wc-g] RACE-PRESENT` ones; the executor's unpatched baseline-4 run showed a `[wc-g]` hit as well, so it predates WINID2. Neither run decides anything alone (LAWS); the fixture-side fix in SO7 is what makes these samples self-declaring.
