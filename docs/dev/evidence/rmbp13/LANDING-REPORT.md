@@ -121,6 +121,7 @@ been R23 again.
 | **BSPRUN-shared** (`arch/aarch64/sched.rs`, `8e864463`) | **GRANTED** | the **P7 trap**, checked rather than assumed: on both appended lines the statement sits BEFORE the line's first `//`. After it they compile nothing while the gate stays green |
 | **DESKFIX (a) A30** (`video/pulsewin.rs`, `video/dock.rs`, `0fced841`) | **GRANTED** | the defect reproduces here: `close()` never clears `ARMED`, which `service()` reads every render pass |
 | **DESKFIX (b) SO5** (`pal.rs`, filed unapplied) | **REFUSED as written, reshaped** | `sprite_scale`'s callers **enumerated**: `extent()` → `vug.rs:884`, arch-neutral, so the "aarch64-local" fix reaches the rMBP |
+| **PRTSCR-ASYNC** (`video/prtscr.rs`, `a86e3268`, SR2) | **GRANTED with one BLOCKING correction** | `Job::begin()` mounts `mount_program_source()` — the single-rung call PRTSCR-VOL replaced. As written the async capture refuses forever on the one board whose 70 s number *is* SR2 |
 
 **What was verified first-hand rather than accepted on report.** For BSPRUN: the executor's stale-row
 finding is correct (`ea182855` and `a28879de` are ancestors of origin/main, origin/hw-jetson and
@@ -143,7 +144,41 @@ seat's to cut and fly at rMBP panel geometry. orin's root cause is confirmed sou
 `SPRITE_OWNS_PAINT` is `cfg!(target_arch = "x86_64")` at `pal.rs:301`, so the "the two never coexist"
 premise really is false on aarch64. Their committed `[sprite]` witness (`same=0`) is wanted as-is.
 
-Both recorded as ledger rows **B18** and **B19**, ticked in the same commit as the work.
+**ASK #3, PRTSCR-ASYNC — and the apply failure that turned out to be the finding.** The design is
+sound: `capture_inner` becomes a `Job` state machine, `service()` advances one bounded slice per
+device-service pass, `capture()` stays synchronous as a driver of the same machine so the `screenshot`
+verb and PRTSCR-ST keep their wire. The lock discipline is exactly as described (take, work unlocked,
+put back — two acquisitions per slice, none across work) and the call sites match this tree:
+`prtscr::service` has four callers (`main.rs:1206`, `:1696`, `:3021` the holocron-gated tegra sweep,
+`:5957`) and `capture()` has one (`shell.rs:3546`).
+
+`git apply --check` on the prtscr.rs half returned **rc 1 here**, failing at `:391`. The reason matters
+more than the failure: **`origin/hw-jetson` and `origin/main` are identical in `prtscr.rs` — zero lines
+apart, not the two orin expected — so their patch applies there and their gates are valid.** hw-rmbp is
+**+103/−30 ahead** in that same file (`fed449fc` PRTSCR-VOL and reconcile merge `fda50696`), and the
+patch's `-391,80 +532,251` rewrites exactly that region.
+
+The symbol census is the whole argument:
+
+| symbol | hw-rmbp | orin's patch |
+|---|---|---|
+| `mount_capture_target` | 6 | **0** |
+| `publish_usb_geometry` | 3 | **0** |
+| `BlockSource::Usb` | 2 | **0** |
+| `default_writable` | 1 | **0** |
+
+And `Job::begin()` mounts `mount_program_source()` directly — so this is not only a merge hazard, it
+**re-opens the defect PRTSCR-VOL closed**: on this board `program_source()` under a `BM_SUBSTITUTED`
+verdict returns the read-only Sdhc handle on every call while FRGUARD vetoes the global slot (both
+flight-3 proven), so the async capture would refuse forever on the very board SR2's 70 s came from.
+
+**The condition that matters for J1: gate that merge by SYMBOL COUNT, not by a clean apply.** A
+take-theirs resolution on a 251-line rewritten `capture()` builds green, checks green, works on the
+Orin, and silently deletes the only path by which this board can write a PNG — with nothing red ever
+firing. That is the folded-witness failure mode, and it is why the four counts above are written down.
+
+Recorded as ledger rows **B18**, **B19** and **B20**, with SR2's home row in `docs/dev/LEDGER.md`
+ticked rather than duplicated.
 
 **One seam recorded both sides:** BSPRUN adds a board leg to `unaos/arroyo` inside `KERNEL_CFG_MATRIX`;
 B17 changes the same file on hw-rmbp in disjoint regions (header, one function before the entry point,
