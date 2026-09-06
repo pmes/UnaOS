@@ -1937,6 +1937,21 @@ gate_x86_rodata_no_code() {
     echo -e "${COLOR_GREEN}✅ .rodata gate: no GLOBAL code symbol in .rodata (only the AP trampoline's own labels)${COLOR_RESET}"
 }
 
+# ⚠ EVERY KERNEL IMAGE IS BUILT `--release`, AND DIAGNOSTIC CODE RELIES ON IT (rmbp 14, 2026-09-06).
+# MEASURED, not assumed: `grep -n "cargo +nightly build" arroyo | grep -v -- "--release"` is EMPTY —
+# all 15 build legs in this file pass `--release`, and there is no debug leg anywhere. (The first
+# draft of this comment said "this leg and the three below it", which was wrong by a dozen; the check
+# that corrected it is the one written above, so run it rather than trusting this sentence.)
+# Code of the form `if cfg!(feature = "witness") { ... }` — as distinct from `#[cfg]`,
+# which deletes the block outright — is COMPILED in every configuration and depends on the optimizer
+# to drop it when the feature is off. At `--release` LLVM drops it whole, atomics and all, which is
+# why the form is allowed: it keeps the block type-checked so it cannot rot, at no cost.
+# THE INSTANCE: PRTSCLOST's `KBD_DRAIN_LAST` stamp sits inside `drain_event_ring_once`, a function
+# with 18 call sites several of which are tight spin loops, and one of them carries the rMBP's
+# FTDI-over-xHCI console. **Add a debug kernel build leg and that stamp becomes live cost on that
+# path** — a TSC read and three atomics per ring-drain attempt. If a debug leg is ever added here,
+# every `if cfg!` diagnostic block goes back to `#[cfg]` in the same commit, or the leg carries its
+# own note saying which ones were audited and why they are affordable.
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"

@@ -142,3 +142,62 @@ belonged before the flag, not after it. A bounce is a routing failure until a lo
   Writing those two sections is a real job and belongs to a seat that scopes it, not to this arc.
 * The 104 `TODO` registry rows are a backlog with owners other than this seat. The 39 with no Pi-live
   cfg site are the cheap end.
+
+## The support round, after J3 — nine patch reviews, and what they cost each side
+
+Everything below happened after GATE-K8REACH landed, in an exchange with orin 17 that ran the length of
+their round. The seat wrote no feature code; the product was **verification and grants**, and it is
+recorded here as a list of what was CHECKED rather than what was said.
+
+**Reviewed by applying, never by reading.** CRYSTALFIX, A30FIX, PRTSCLOST, SO9FIX, SHELLBASICS,
+PINCONSOLE, the WINID ceiling raise. Every one: stage the base with `git archive`, `git apply`, then run
+this seat's own GATE-APPEND on the result — and afterwards on the FOLDED tip, because a fold of green
+commits is a new configuration. Two folds were verified by FILE IDENTITY against the trees reviewed
+(all five files byte-identical), which is the only check that catches a patch changing on its way in.
+
+**The landing ack was computed, not reviewed.** `git merge-tree --write-tree f49ea1e7 c5048fe6` produced
+`c5048fe6`'s exact tree oid at exit 0, and `main`'s three extra commits turned out to be merges OF
+hw-jetson, so the trunk held no original content the merge could drop — which was the only thing that
+made "byte-identical to hw-jetson" a dangerous claim. `ledger-check` was run on the merged tree under
+`UNAOS_LEDGER_STRICT=1`, answering on the actual tip a strictness question this seat had raised against
+a preview.
+
+**Two coverage findings, both of the SR1 shape — a gate that greens about nothing.**
+* The **x86 gate does not exercise the xHCI keyboard path at all**: `launch_x86_64()` attaches
+  `usb-kbd,bus=xhci.0`, but the headless test leg wires HID to EHCI (this round's own log: "usb-kbd
+  rides the ehci bus", every HID self-test `EHCI-HID`, no `[hidkeys]`). So a restructure of the
+  interrupt-IN TD ring could break x86 keyboard input entirely with every automated leg green. That
+  fact, not an opinion about risk, is why the N-TDs fix folds nowhere until the rMBP flies it (B45).
+* PINCONSOLE's x86 half ships unexercised for the same kind of reason — the x86 harness never mints a
+  console window — which orin stated rather than hid, and which now goes in the commit body.
+
+**Four stale-or-overreaching comments, which is a class and not four accidents** (B33, B35, B39, B47).
+`emmc2.rs`'s "no writes" header — repeated INTO a ledger row by this seat before orin caught it;
+`winmenu.rs:1274`'s pre-CRYSTALFIX literals; `wcg.rs:4008`'s "eight slots"; and the worst,
+`shell.rs:4305`, which asserts *"the review checked all 78 spellings arm by arm"* for a review that had
+only ever checked one direction — while two verbs with match arms and no table entry answered "Unknown
+command" for their entire existence. The others were out of date; that one claims a verification that
+did not happen. **The same error then came for this seat's own writing**: the first draft of the
+`--release` clause in `arroyo` said "this leg and the three below it", and the grep says fifteen. It
+now carries the command that would refute it.
+
+**The gate corrected its author four times, and each is in the row rather than quietly fixed.** B35 and
+B46 claimed `fixed-unflown` over shas on no track head — an accepted patch is not a fixed row. B40
+cited scratch paths as evidence, twice; the fix is to cite the COMMAND that regenerates evidence, never
+the path. And one commit went in over a red because the gate was chained with `;` rather than `&&`,
+which is the baton's "condition on the EXIT STATUS, not on having run it", exactly.
+
+**Two lane rules came out of it, both adopted by both seats.**
+1. **The seat whose branch carries the TEXT fixes the text, whoever owns the file.** Twice this round a
+   doc fix was assigned to this lane for a line that does not exist on `hw-rmbp` (`winmenu.rs:1274`,
+   `x86_64/syscall.rs:6738`). Lane ownership makes the FILE ours; it does not make a line editable that
+   is not in the tree.
+2. **An ask describes the DIFF — numstat and every call site — not the intent.** PRTSCLOST was asked as
+   "counters only" and carried a per-drain TSC stamp; PINCONSOLE was asked as "one statement in
+   `x86_render_service`" and carried three call sites, a doc block and a wrapper pair, with "the rest
+   stands without it" false because the dock's press LATCHES. Both were granted; the rule is that a lane
+   owner reads the diff, so the ask has to survive that reading.
+
+**A divergence found early rather than in a landing window:** `drivers/xhci/mod.rs` differs between
+`hw-rmbp` and `hw-jetson` by 12 insertions and 77 deletions, and orin's hunk-alone patch does not apply
+here. The J1 reconcile on that file is content-delta work, not a union (B43).
