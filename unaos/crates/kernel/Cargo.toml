@@ -2024,6 +2024,46 @@ ga10bprobe1 = ["tegra"]
 # Witness family on the wire: `[ga10bprobe2]`.
 ga10bprobe2 = ["tegra"]
 
+# GA10B-PROBE3 (`UNAOS_GA10B_PROBE3=1`): rungs 3 and 3b of the GA10B ladder
+# (docs/dev/evidence/orin14/GA10B-LADDER.md §Rung 3 / §Rung 3b; as-built spec
+# docs/dev/evidence/orin16/GA10B-RUNG3.md). The tail of `arch/aarch64/ga10b_probe.rs`
+# (`ga10bprobe3_run`) and one appended call site in `tegra_early_stop`, placed BETWEEN rung 2's call
+# and rung 1's — rung 1's `-> !` SYSTEM_OFF must never run in front of a rung that has to reach the
+# desktop. One attended FULL-BOOT flight (it RETURNS): the SAME BPMP power+clock bracket rung 2 proved
+# on metal (MRQ_PG GET_STATE pre-state -> SET_STATE ON only if off -> EXPLICIT readback -> MRQ_CLK
+# IS_ENABLED/ENABLE/IS_ENABLED per DTB clock), then a READ-ONLY pass over 25 registers in the ladder's
+# risk order (fuse -> mc -> top -> gsp-falcon-v1 -> gsp-priscv-bcr -> pmu-falcon2 LAST), each announced
+# before it is touched and each of the two NEW BAR0 address classes (mc, pmu-falcon2) announced before
+# its first touch, then a SYMMETRIC restore. It also answers rung 2's leftover with PURE MRQ_CLK
+# QUERIES (GET_MAX_CLK_ID, GET_ALL_INFO, GET_RATE per clock): why BPMP answered `err=-22` to
+# IS_ENABLED on DTB clock id 236 while 304 and 41 answered `err=0`. ZERO MMIO WRITES unless
+# `ga10bprobe3b` is also on. IMPLIES `tegra`. Every offset/bit cites the ACKED facts file
+# docs/dev/OS/09_PLATFORM/ga10b-facts/ga10b-probe-rung1.facts.md, never nvgpu; the MRQ subcommand
+# numbers cite Linux include/soc/tegra/bpmp-abi.h (GPL-2.0 OR MIT), the header bpmp_tegra.rs already
+# cites. NO display, fabric or vendor-pad-block access: the FWALL/nvdisplay SError convictions stand.
+# Default OFF => the tail + call site vanish, no panic `Location` moves (the call is appended to an
+# existing line), and the knob-off images are byte-identical to baseline (measured: sha256 of
+# target/pi_baremetal/kernel8.img before/after). The ARMED polarity is type-checked by the
+# `arm-tegra-ga10bprobe3` leg of KERNEL_CFG_MATRIX in `arroyo`. Witness family: `[ga10bprobe3]`.
+ga10bprobe3 = ["tegra"]
+
+# GA10B-PROBE3B (`UNAOS_GA10B_PROBE3=2`): the SUB-KNOB that adds RUNG 3b — the ladder's FIRST GA10B
+# MMIO WRITES — on top of rung 3. IMPLIES `ga10bprobe3` (and through it `tegra`), so it is never a
+# standalone configuration: rung 3b runs inside rung 3's bracket, after rung 3's read list is
+# exhausted, so a fatal WRITE can never be confused with a fatal READ. Three writes at most, each
+# announced on its own line BEFORE it happens: `pgsp_falcon_engine` (BAR0 0x1103c0) bit0=1 ASSERT ->
+# hold (1 ms, vs the facts file's required >= 10 us) -> 0x0 DEASSERT -> priscv `cpuctl` 0x111388
+# readback -> and ONLY if that read is sane (not all-ones, not the PRI 0xBADxxxxx pattern) one
+# MAILBOX0 (GSP falcon base + 0x040) write of 0x5A5AA5A5 and its readback. The MAILBOX pointer is
+# PUBLIC-RECALLED (nouveau nvkm/falcon, open-gpu-kernel-modules dev_falcon_v4.h, both MIT), NOT from
+# the ACKED facts file, and says so on the wire beside the write. This knob owns the module's ONLY
+# `write_volatile` (`w32`, itself `#[cfg(feature = "ga10bprobe3b")]`), so rung 1, rung 2 and rung 3
+# alone still compile with no write path to a GA10B register at all. The reset has no restore and
+# needs none: the engine was halted and never-booted before (rung 1: br_retcode=0, cpuctl=0x10) and is
+# halted and never-booted after. Default OFF. The ARMED polarity is type-checked by the
+# `arm-tegra-ga10bprobe3b` leg of KERNEL_CFG_MATRIX. Witness family: `[ga10bprobe3b]`.
+ga10bprobe3b = ["ga10bprobe3"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

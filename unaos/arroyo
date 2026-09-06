@@ -879,6 +879,41 @@ _feats=""
 # baseline. The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe2` leg of KERNEL_CFG_MATRIX,
 # not by this mapping. Witness family on the wire: `[ga10bprobe2]`.
 [ -n "${UNAOS_GA10B_PROBE2:-}" ] && _feats="${_feats}ga10bprobe2,"
+# GA10B-PROBE3 (GA10BPROBE3): ONE env knob with TWO values, driving rungs 3 and 3b of the GA10B
+# ladder (docs/dev/evidence/orin14/GA10B-LADDER.md §Rung 3 / §Rung 3b; as-built spec
+# docs/dev/evidence/orin16/GA10B-RUNG3.md).
+#   UNAOS_GA10B_PROBE3=1  -> feature `ga10bprobe3`                     — rung 3 alone, READ-ONLY
+#   UNAOS_GA10B_PROBE3=2  -> features `ga10bprobe3` + `ga10bprobe3b`   — rung 3, then rung 3b's writes
+# The two-value shape is deliberate: rung 3b is the ladder's FIRST GA10B MMIO WRITE rung, so the
+# read-only rung must be flyable on its own first if that is what the bench wants. Any other non-empty
+# value arms rung 3 alone (fail-safe: an unexpected value never buys a write).
+#
+# `arch/aarch64/ga10b_probe.rs::ga10bprobe3_run`, an appended statement in `tegra_early_stop`'s BPMP
+# block placed BETWEEN rung 2's call and rung 1's — rung 1's run is `-> !` (PSCI SYSTEM_OFF) and must
+# never execute in front of a rung that has to reach the desktop. One attended FULL-BOOT flight (rung 3
+# RETURNS): the SAME BPMP power+clock bracket rung 2 proved on metal 2026-09-06 (MRQ_PG pre-state ->
+# SET_STATE ON only if off -> EXPLICIT GET_STATE readback -> MRQ_CLK IS_ENABLED/ENABLE/IS_ENABLED per
+# DTB clock), then 25 READ-ONLY BAR0 registers in the ladder's risk order (fuse -> mc -> top ->
+# gsp-falcon-v1 -> gsp-priscv-bcr -> pmu-falcon2 LAST), each announced before it is touched and each of
+# the two NEW address classes (mc, pmu-falcon2) announced before its first touch, then a SYMMETRIC
+# restore. Two summary lines carry rung 4's inputs: `bcr_dmacfg lock_locked=<0|1>` and
+# `opt_wpr_enabled=<v>`. A pure-query MRQ_CLK block (GET_MAX_CLK_ID, GET_ALL_INFO, GET_RATE) answers
+# rung 2's leftover: why BPMP returned `err=-22` (-BPMP_EINVAL) on DTB clock id 236 while 304 and 41
+# returned `err=0`. Under `=2`, rung 3b then performs at most three announced writes
+# (pgsp_falcon_engine reset assert/deassert, one MAILBOX0 scratch write, the last one skipped unless
+# the post-reset cpuctl read is sane). NO display, fabric or vendor-pad-block access: the
+# FWALL/nvdisplay SError convictions (GA10B-HISTORY.md S2/S4/S5) stand.
+#
+# A THIRD SIBLING of ga10bprobe1/ga10bprobe2, never their dependent. IMPLIES `tegra`, so the knob is
+# self-sufficient: `UNAOS_GA10B_PROBE3=2 ./arroyo check` and `UNAOS_GA10B_PROBE3=2 ./arroyo esp-jetson`
+# both arm it (esp-jetson also forces `tegra`/`tegrasmp`). The flight arms it WITHOUT
+# UNAOS_GA10B_PROBE1 — rung 1 would power the board off behind rung 3. Default OFF => the tail + call
+# site vanish, no panic Location moves, knob-off images byte-identical to baseline. The ARMED
+# polarities are type-checked by the `arm-tegra-ga10bprobe3` and `arm-tegra-ga10bprobe3b` legs of
+# KERNEL_CFG_MATRIX, not by this mapping. Witness families on the wire: `[ga10bprobe3]`,
+# `[ga10bprobe3b]`.
+[ -n "${UNAOS_GA10B_PROBE3:-}" ] && _feats="${_feats}ga10bprobe3,"
+[ "${UNAOS_GA10B_PROBE3:-}" = "2" ] && _feats="${_feats}ga10bprobe3b,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -3561,6 +3596,29 @@ KERNEL_CFG_MATRIX=(
   # are all inside `feature = "tegra"` items under `src/arch/aarch64/` and the one main.rs site is inside
   # the tegra region). Board legs +1; gate +1 — read the live counts from `./arroyo check`.
   "arm-tegra-ga10bprobe2 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe2"
+
+  # GA10B-PROBE3 armed (appended 2026-09-06, orin 16) — `ga10bprobe3` gates the rung-3 tail of
+  # `ga10b_probe.rs` and its one appended call site in `tegra_early_stop`; the module itself is gated on
+  # ANY of the three probe knobs. The ga10bprobe2 leg's shape, copied: `arm-tegra`'s list verbatim +
+  # `ga10bprobe3` ALONE. That is the `UNAOS_GA10B_PROBE3=1` flight polarity — rung 3 read-only, with
+  # `ga10bprobe3b`'s items (the module's ONLY `write_volatile`, `w32`, and the whole `rung3b` body)
+  # cfg-erased, which is exactly the dead-code trap a 3b-only leg would hide.
+  "arm-tegra-ga10bprobe3 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe3"
+
+  # GA10B-PROBE3B armed (same arc) — the SECOND leg, and it is not redundant with the one above: it is
+  # the ONLY leg that type-checks rung 3b's armed polarity (the `w32` write helper, the `rung3b` body,
+  # and the `#[cfg(feature = "ga10bprobe3b")]` statement inside `ga10bprobe3_run` that calls it). This is
+  # the `UNAOS_GA10B_PROBE3=2` flight polarity. `ga10bprobe3b` IMPLIES `ga10bprobe3`, so Cargo resolves
+  # both ON here and the leg's literal feature string names only the sub-knob — the union measurement in
+  # the block comment above reads LITERAL strings, so `ga10bprobe3` is named by the leg before this one
+  # and neither knob is a hole. There is no `not(feature = "ga10bprobe3")` or `not(feature =
+  # "ga10bprobe3b")` site in src/, so no disarmed asymmetry is created; the default legs cover the
+  # all-off state. UNIVERSE SIDE EFFECT: none that moves a mix count — both are NEW `[features]` entries
+  # named only on these arm-* legs, and every site is inside a `feature = "tegra"` item under
+  # `src/arch/aarch64/` except the one main.rs call, which is inside the tegra region. Board legs +2;
+  # gate +2 — read the live counts from `./arroyo check`, never from the numbers in the block comment
+  # above (they have gone stale twice and this arc does not re-count them).
+  "arm-tegra-ga10bprobe3b ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe3b"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
