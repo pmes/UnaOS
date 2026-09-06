@@ -201,3 +201,32 @@ which is the baton's "condition on the EXIT STATUS, not on having run it", exact
 **A divergence found early rather than in a landing window:** `drivers/xhci/mod.rs` differs between
 `hw-rmbp` and `hw-jetson` by 12 insertions and 77 deletions, and orin's hunk-alone patch does not apply
 here. The J1 reconcile on that file is content-delta work, not a union (B43).
+
+## Close — 2026-09-06
+
+**State at close, fresh host `ls-remote` that turn:** `main c7407753` · `hw-jetson 98ffd63d` ·
+`hw-pi4 059e04db` · `hw-rmbp 141cc728`, local = origin, **nothing owed to Peter's push**.
+
+**What this seat produced, all of it inside support scope (zero executors, zero spawns, R22):**
+31 ledger rows (B28–B58), one gate landed with its documentation, 13 grants, 14 GATE-APPEND runs on
+peers' tips — none of which needed a push, each about ten seconds — and one landing ack computed rather
+than reviewed.
+
+**Nothing landed to trunk from this lane.** J1 is 120 commits and still needs an adversarial panel,
+which is a fleet, which belongs to the focus seat. `main` moved anyway: orin's 93 commits, acked here.
+
+**Owed into rmbp 15, in the order the baton names them:** the SHELLRELICS and VFSROUTE reviews (both
+granted patch-first, both folds blocked on a review this seat performs); the rMBP metal flight that
+XHCINTD is blocked on and that nothing else in the fleet can score; and the `arroyo` sweep this seat
+owes — eleven stale board-term restatements plus replacing a hand-maintained enumeration with a derived
+one.
+
+**The two lane rules that came out of the round, adopted by both seats:** the seat whose branch carries
+the TEXT fixes the text, whoever owns the file; and an ask describes the DIFF, not the intent.
+
+**The closing correction is the one worth reading first.** This seat stated the second rule to orin
+twice and then granted SHELLRELICS on a description — "15 comment-only line-neutral files" — with
+`git show --numstat` one command away. It is 46 files, +1274/−712, with 1,579 changed lines across two
+code files. Having a rule and enforcing it on a peer is not the same as applying it to your own work,
+and the gap is invisible from inside. That is why the round's product was verification rather than
+opinion, and why every grant in it was measured here before it was given.
