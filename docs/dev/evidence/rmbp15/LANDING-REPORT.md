@@ -38,6 +38,22 @@ checks, forty minutes apart, two different answers; a relayed count would have b
 deferred cross-branch ref (B22 `→ SO6`, resolves at the trunk sync). Docs-only round so far; no code
 touched, so no `arroyo check` claim is made here.
 
+5. **The VFSROUTE review** (B60) — orin 18 asked for it, so it was performed here: ACCEPT with one
+   blocking condition. `MountTable::same_volume` compares `volume_name()` strings while
+   `sdmmc_root_bind` mounts one card under two names, so the router reads one volume as two on the
+   exact config the boot disk is being built for — and the transcript cannot convict it, because it
+   uses `same_volume` as its own oracle. Three checks that could have failed came back green in the
+   same pass: the census reproduces exactly, all 17 `HOST_VERBS` keep a dispatch arm across a
+   −2497-line rewrite, and every mutating trait default is a refusal rather than a silent `Ok`.
+   Acceptance criteria for SHELLRELICS' owed leg were issued in the same message so it is cut once.
+6. **SR2 corrected** in `docs/dev/LEDGER.md` — the mid-capture volume guard is USB-scoped, not
+   universal; a Pi capture (or any rMBP capture that lands on the internal Sdhc) has no guard at all.
+   Raised by pi 7, re-raised by pi 8, relayed by orin 18, and **verified here at `98ffd63d` before
+   being written down**. Lane rule B46 splits the fix: the SR2 text is on this branch, so this seat
+   fixed it; orin's A36 and the `prtscr.rs` header prose are on hw-jetson and stay theirs — which is
+   the rule pointing the opposite way from how the relay proposed it.
+
 ## Open at time of writing
-Q2 (the SHELLRELICS / VFSROUTE reviews) is offered to orin 18 and not yet answered. Everything else in
-the queue waits for the focus.
+C1 is with orin 18 (either the armed `UNAOS_SDMMCROOT=1` run, or the identity fix, and I review the
+fix same-turn). SHELLRELICS closes when its leg's diff arrives. Everything else in the queue waits
+for the focus.

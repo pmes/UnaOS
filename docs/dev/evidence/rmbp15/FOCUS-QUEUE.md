@@ -70,6 +70,12 @@ wait for the focus — it is offered to orin 18 as of this turn.
   deliberately in a handover's closing minutes; certifiable with time on the clock.
 - `libs/sys/midden_core` is **not this lane's to grant** — that half needs its owner.
 
+**STATUS 2026-09-06, later the same round: Q2 is half closed.** VFSROUTE was reviewed on orin 18's
+ask — **ACCEPT with one blocking condition** (`same_volume` decides identity by name while the tegra
+`sdmmcroot` bind mounts one card as `card` and `fat`; B60). SHELLRELICS' acceptance criteria for the
+`write <lba> <byte>` leg were issued in the same message, so their executor cuts it once. What is
+left of Q2 is closing SHELLRELICS off that leg's diff, and re-reviewing whichever fix answers C1.
+
 ## Q3 — J1, THE LANDING. Needs the adversarial panel, which is a fleet, which is the focus.
 
 `git rev-list --count main..hw-rmbp` = **121** this turn (**not** the baton's 120 — `5c3dbb7e`, rmbp
