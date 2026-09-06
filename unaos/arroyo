@@ -1501,6 +1501,20 @@ fi
 # full install after the read census + rung-2 ladder. UNAOS_SDMMC_ARM=1 WITHOUT this is byte-identical to
 # the merged rung-2 ladder. See arch_arm64.md §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_INSTALL_TARGET_SD:-}" ] && _feats="${_feats}install_target,sdmmc_arm,sdmmc,"
+# SDMMCWRITE (orin 14): UNAOS_SDMMCWRITE=1 arms the gap-#3 write PROBE on the Tegra234 microSD slot —
+# after the read census has identified the card and read sector 0, ONE CMD24 single-block write of a
+# witness block to ONE scratch sector proven outside every partition and outside the FAT volume (the
+# top of the post-MBR gap on the bench card; the choice is printed BEFORE the write and refused, named,
+# when no such sector exists), then a CMD17 read-back compared over all 512 bytes. 1-bit default speed,
+# PIO, vendor pad block untouched (the FWALL SError conviction stands). A SECOND explicit write arm on
+# top of `sdmmc` (pulled here for a lone knob), a sibling of UNAOS_SDMMC_ARM — it does NOT arm that
+# ladder. Metal-only: the probe's call site is `tegra`-gated, so on virt (no UNAOS_TEGRA) it compiles to
+# nothing and the census prints its usual compiled-present line; `esp-jetson` forces tegra. Witness on
+# the wire: `[sdmmc] write target=lba … reason=…`, then `[sdmmc] write lba=… -> OK (512/512 match,
+# t=… ticks)` | `-> FAIL status=0x… at <step>` | `-> REFUSED reason=…`. Default OFF => byte-identical
+# to baseline (no line moves; see docs/dev/evidence/orin14/SDMMCWRITE.md). The ARMED polarity is
+# type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by this mapping.
+[ -n "${UNAOS_SDMMCWRITE:-}" ] && _feats="${_feats}sdmmcwrite,sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
 # the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping witness against the
@@ -3767,6 +3781,30 @@ KERNEL_CFG_MATRIX=(
   # `tegra_el0`), which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both)
   # supplies it.
   "arm-tegra-el0-jd1dc ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,jd1dc"
+  # SDMMCWRITE armed (appended 2026-09-05, orin 14) — `sdmmcwrite` gates the gap-#3 write probe at the
+  # tail of `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_write_probe` + its scratch-sector chooser + the CMD24
+  # twin), the same-line `pub use` on that file's TEGRA-SDBLK export line, the in-place widening of the
+  # `INT_WRITE_RDY` constant's cfg (`any(sdmmc_arm, sdmmcwrite)`), and the statement appended to the
+  # `sdmmc_census` call line in `main.rs`. Every site is inside `feature = "tegra"` items (the whole
+  # `mod metal` is `tegra`-gated), so ONLY a leg carrying `tegra` compiles them at all — and no leg
+  # carries `tegra` plus this knob but this one. Without it the ARMED polarity would be compiled by
+  # NOTHING: the exact orinrx / bsptick / smpmark shape, and the reason the standing law is that a
+  # knob's gates must compile the configuration the knob turns ON.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,sdmmcwrite` appended to `arm-tegra`: `arm-tegra` is the DISARMED
+  # twin and the only leg anywhere that compiles the SHIPPED default jetson image — the image whose
+  # byte-identity to baseline this arc measures. Hosted on `arm-tegra`'s list verbatim + `sdmmcwrite`
+  # (the bsptick shape: the knob's sites need nothing beyond `tegra` + `sdmmc`, and `arm-tegra` already
+  # carries `sdmmc`, `sdmmc_arm` and `install_target`, so the widened `INT_WRITE_RDY` cfg is exercised
+  # in BOTH its `any(...)` arms — `sdmmc_arm` alone by every other arm-tegra leg, `sdmmcwrite` here).
+  # The resolved set grows by EXACTLY {sdmmcwrite} over a leg that is already green, so a red here
+  # names the knob and nothing else.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `sdmmcwrite` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

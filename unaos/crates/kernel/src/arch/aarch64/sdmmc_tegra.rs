@@ -60,9 +60,9 @@
 // The RECON/IDENTIFY path issues ONLY the identification ladder + CMD17 single-block READ: CMD0,
 // CMD8, CMD55/ACMD41, CMD2, CMD3, CMD9, CMD7, CMD16, CMD17 — no erase (CMD32–38) exists anywhere in
 // this file, and no recon-path code can reach a write. Since ORIN-SDMMC-2/INSTALL-1 the file ALSO
-// carries an explicit write path — `write_block_at` (CMD24, `sdmmc_arm`) and `write_blocks_at`
-// (CMD25, `install_target`) — DOUBLE-GATED behind features the recon build does not carry, with no
-// caller in the identify/census code. The controller-register writes recon makes (SRST, clock,
+// carries explicit write paths — `write_block_at` (CMD24, `sdmmc_arm`), `write_blocks_at` (CMD25, `install_target`)
+// and `write_block_probe` (CMD24, `sdmmcwrite`, the gap-#3 probe at the file tail) — each DOUBLE-GATED behind a
+// feature the recon build lacks (`sdmmc` + an explicit arm), with no caller in the identify/census code. The controller-register writes recon makes (SRST, clock,
 // power, command issue) are SDHCI machinery, not card-storage writes. An earlier version of this
 // header claimed "grep for cmd(24) and find nothing" — that was true when written and is now false;
 // the reachable-from-recon invariant is the one that holds (see review/unaos-orin-sdmmc1-LANDING.md).
@@ -122,7 +122,7 @@ pub use metal::sdmmc_install_from_usb;
 // single-sector read, and its counted loop. Nothing here can write — the write path stays exclusively
 // behind the `sdmmc_arm` ladder further down this file, untouched by this seam.
 #[cfg(feature = "tegra")]
-pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512};
+pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; // SDMMCWRITE: the gap-#3 write probe (file tail); appended to THIS line for knob-off byte identity (no line moves).
 
 #[cfg(feature = "tegra")]
 mod metal {
@@ -195,7 +195,7 @@ mod metal {
     // ── INTERRUPT (0x30) bits (W1C). ──
     const INT_CMD_DONE: u32 = 1 << 0;
     const INT_DATA_DONE: u32 = 1 << 1;
-    #[cfg(feature = "sdmmc_arm")]
+    #[cfg(any(feature = "sdmmc_arm", feature = "sdmmcwrite"))]
     const INT_WRITE_RDY: u32 = 1 << 4; // Buffer Write Ready (host may push the PIO FIFO)
     const INT_READ_RDY: u32 = 1 << 5;
     const INT_ERR: u32 = 1 << 15;
@@ -2869,5 +2869,393 @@ mod metal {
             "{}   M2: pad auto-calibration complete (AUTO_CAL_CONFIG={:#010x}, status={:#010x}) ::",
             PS, read32(base, V_AUTO_CAL_CONFIG), read32(base, V_AUTO_CAL_STATUS)
         );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // SDMMCWRITE — the first-metal-question probe (`sdmmcwrite`-gated; orin-ledger §"The five gaps" #3
+    // and §F "SD card — on-die SDMMC"): on `mmc@3400000`, with the vendor pad block left DISABLED (the
+    // FWALL SError conviction above — nothing in this section touches base+0x100 or beyond), does a CMD24
+    // single-block write to a scratch sector followed by a CMD17 read-back return the written bytes, at
+    // 1-bit default speed? EVERY line below this marker is compiled out unless UNAOS_SDMMCWRITE=1, so a
+    // plain `sdmmc` build (and the shipped jetson image, which carries neither) is byte-identical to the
+    // merged recon. The knob is a second EXPLICIT write arm on top of `sdmmc`, a sibling of `sdmmc_arm`
+    // (double-gating held: no card write without `sdmmc` AND an explicit arm) — and deliberately NOT
+    // `sdmmc_arm` itself, because that arm's ladder writes the card's LAST LBA (the GPT-backup rule
+    // refuses it outright on a GPT card) and this question wants ONE write to ONE sector proven outside
+    // every partition and outside the FAT volume. The ladder's CMD24 primitive takes a `Card` this
+    // section does not hold (it consumes the census's published `SdBlk`), so `write_block_probe` below is
+    // its twin — the same command bits, the same PIO FIFO, the same bounded waits — with the failure STEP
+    // and the controller STATUS returned instead of printed, so the wire carries one verdict line. The
+    // duplication is named, as `read_block_ro` names its own.
+    //
+    // Witness tokens are SUBSYSTEM-named (`[sdmmc] write …`), never board-named. Wire shape:
+    //   `[sdmmc] write target=lba <n> reason=<why> layout=<class> first_part_lba=<n|none> card_blocks=<n>`
+    //   `[sdmmc] write prior lba=<n> = zero | witness(tick=<t>) | other(first8=…)`   (what was there)
+    //   `[sdmmc] write lba=<n> -> OK (512/512 match, t=<ticks> ticks = <us> us @ <hz> Hz)`
+    //   `[sdmmc] write lba=<n> -> FAIL status=0x<int> at <step>`
+    //   `[sdmmc] write lba=<n> -> FAIL mismatch=<n>/512 first_diff=<off> want=<b> got=<b>`
+    //   `[sdmmc] write -> REFUSED reason=<why>`
+    // The pattern is a 512-byte block: `UNAOS-SDMMC-W1` at [0..14], a version byte, the CNTPCT tick at
+    // write time at [16..24] LE, the LBA at [24..32] LE, then a position sweep — a stuck bit, a wrong-LBA
+    // landing or a partial write all fail the full 512-byte compare loudly. The block is NOT restored:
+    // the sector is chosen precisely because nothing owns it, and a witness left behind is the
+    // persistence proof the NEXT boot reads back for free (`prior … = witness(tick=…)`).
+    //
+    // THE SCRATCH-SECTOR RULE (binding; the seated card is sacred): the choice is printed BEFORE the write
+    // and refused (named) when no sector can be PROVEN outside every partition and outside the FAT volume.
+    //   MBR (classic): the sector just below the FIRST partition's start LBA — the top of the post-MBR
+    //     gap, the farthest point from sector 1 where an embedded boot image (GRUB core.img style) would
+    //     begin. A first partition at LBA 1 (no gap) is a refusal. An empty table falls back to the
+    //     card's last LBA, only after reading it and proving it is not an orphan GPT backup header.
+    //   GPT (protective 0xEE in any entry): the header at LBA 1 is read and its signature checked; the
+    //     entry array is read (entry size 128..512 dividing 512, at most 64 sectors) and the lowest used
+    //     start LBA found; the sector is that start − 1, and it must sit at or above BOTH the entry
+    //     array's end and FirstUsableLBA. No gap, an unreadable header or an unsupported entry size is a
+    //     refusal. The card's last LBA is NEVER used on GPT (it is the backup header).
+    //   FAT boot sector at LBA 0 (whole-card volume, no table): the card's last LBA, only if the BPB's
+    //     total-sector count ends below it (and it is not a GPT backup header). Otherwise a refusal.
+    //   Unknown sector 0: a refusal — a layout we cannot read is a layout we cannot prove a hole in.
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+    /// The witness family prefix — subsystem-named, greppable on the wire and in the ELF
+    /// (`grep -a -c '\[sdmmc\] write' kernel.elf`).
+    #[cfg(feature = "sdmmcwrite")]
+    const WPS: &str = "[sdmmc] write";
+    /// The witness header the written block carries at byte 0 (14 bytes) — a later boot recognises it.
+    #[cfg(feature = "sdmmcwrite")]
+    const WITNESS_MAGIC: &[u8; 14] = b"UNAOS-SDMMC-W1";
+    /// Bounded wait for the card to release DAT0 after the block is programmed. Deliberately LONGER than
+    /// `DATA_TIMEOUT_MS` (the transfer-step budget this probe otherwise shares with the reads): the SD
+    /// Physical Layer's write-timeout ceiling is 250 ms for an SDHC/SDXC card programming one block, so a
+    /// 200 ms budget could report a healthy slow card as a FAIL at `dat0-busy`. 500 ms clears the ceiling
+    /// with margin and still fails a wedged card in well under a second.
+    #[cfg(feature = "sdmmcwrite")]
+    const PROG_TIMEOUT_MS: u64 = 500;
+    /// Cap on the GPT entry-array sectors this probe will read while looking for the first partition
+    /// (128 entries × 128 bytes = 32 sectors is the universal layout; twice that is generous).
+    #[cfg(feature = "sdmmcwrite")]
+    const GPT_ARRAY_MAX_SECTORS: u64 = 64;
+
+    /// The scratch-sector decision: a proven-free LBA with the reason it is free, or a named refusal.
+    #[cfg(feature = "sdmmcwrite")]
+    enum Scratch {
+        Lba { lba: u64, reason: &'static str, first_part: Option<u64> },
+        Refused(&'static str),
+    }
+
+    #[cfg(feature = "sdmmcwrite")]
+    #[inline]
+    fn le32_at(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+    #[cfg(feature = "sdmmcwrite")]
+    #[inline]
+    fn le64_at(b: &[u8], off: usize) -> u64 {
+        let mut v = [0u8; 8];
+        v.copy_from_slice(&b[off..off + 8]);
+        u64::from_le_bytes(v)
+    }
+
+    /// Is a sector the primary or backup GPT header? (Signature `EFI PART` at byte 0.)
+    #[cfg(feature = "sdmmcwrite")]
+    fn is_gpt_header(sec: &[u8; 512]) -> bool {
+        &sec[..8] == b"EFI PART"
+    }
+
+    /// Choose the scratch sector per THE SCRATCH-SECTOR RULE in the section header. Reads only (CMD17
+    /// through the unarmed `read_block_ro`); every branch either names a proven-free LBA or a refusal.
+    #[cfg(feature = "sdmmcwrite")]
+    fn choose_scratch(base: u64, blk: bool, num_blocks: u64, sec0: &[u8; 512]) -> Scratch {
+        let sig_55aa = sec0[510] == 0x55 && sec0[511] == 0xaa;
+        let class = classify_sector0(sec0);
+        // A protective/hybrid MBR: 0xEE in ANY of the four entries routes to the GPT rule (the census's
+        // classifier looks at the first entry only, which is the spec's placement; hybrids are checked too).
+        let any_ee = sig_55aa && (0..4usize).any(|i| sec0[446 + 16 * i + 4] == 0xee);
+        if any_ee {
+            return choose_scratch_gpt(base, blk, num_blocks);
+        }
+        if class.starts_with("MBR") {
+            // Classic MBR: the lowest start LBA among used entries (type != 0, sectors != 0).
+            let mut first: Option<u64> = None;
+            for i in 0..4usize {
+                let e = 446 + 16 * i;
+                let ptype = sec0[e + 4];
+                let start = le32_at(sec0, e + 8) as u64;
+                let count = le32_at(sec0, e + 12) as u64;
+                if ptype == 0 || count == 0 {
+                    continue;
+                }
+                if start >= num_blocks {
+                    return Scratch::Refused("mbr-partition-start-beyond-card");
+                }
+                first = Some(first.map_or(start, |f: u64| f.min(start)));
+            }
+            return match first {
+                Some(s) if s >= 2 => Scratch::Lba { lba: s - 1, reason: "mbr-gap-top", first_part: Some(s) },
+                Some(_) => Scratch::Refused("mbr-first-partition-at-lba-1-no-gap"),
+                None => last_lba_if_free(base, blk, num_blocks, "mbr-empty-table-last-lba"),
+            };
+        }
+        if class.starts_with("FAT") {
+            // Whole-card FAT volume (no partition table): BPB total sectors, 16-bit at 0x13 else 32-bit at 0x20.
+            let tot16 = u16::from_le_bytes([sec0[0x13], sec0[0x14]]) as u64;
+            let total = if tot16 != 0 { tot16 } else { le32_at(sec0, 0x20) as u64 };
+            if total == 0 || total >= num_blocks {
+                return Scratch::Refused("fat-volume-spans-card");
+            }
+            return last_lba_if_free(base, blk, num_blocks, "fat-volume-ends-below-last-lba");
+        }
+        Scratch::Refused("unknown-sector0-layout")
+    }
+
+    /// The card's last LBA as scratch — only after reading it and proving it is not a (possibly orphan)
+    /// GPT backup header. `reason` names the branch that got here.
+    #[cfg(feature = "sdmmcwrite")]
+    fn last_lba_if_free(base: u64, blk: bool, num_blocks: u64, reason: &'static str) -> Scratch {
+        if num_blocks < 2 {
+            return Scratch::Refused("card-too-small");
+        }
+        let last = num_blocks - 1;
+        let mut sec = [0u8; 512];
+        if !read_block_ro(base, blk, last, &mut sec) {
+            return Scratch::Refused("last-lba-unreadable");
+        }
+        if is_gpt_header(&sec) {
+            return Scratch::Refused("orphan-gpt-backup-header-at-last-lba");
+        }
+        Scratch::Lba { lba: last, reason, first_part: None }
+    }
+
+    /// The GPT branch of the rule: primary header at LBA 1, entry array scanned for the lowest used start.
+    #[cfg(feature = "sdmmcwrite")]
+    fn choose_scratch_gpt(base: u64, blk: bool, num_blocks: u64) -> Scratch {
+        let mut hdr = [0u8; 512];
+        if !read_block_ro(base, blk, 1, &mut hdr) {
+            return Scratch::Refused("gpt-header-unreadable");
+        }
+        if !is_gpt_header(&hdr) {
+            return Scratch::Refused("gpt-header-signature-missing");
+        }
+        let first_usable = le64_at(&hdr, 40);
+        let last_usable = le64_at(&hdr, 48);
+        let entries_lba = le64_at(&hdr, 72);
+        let n_entries = le32_at(&hdr, 80) as u64;
+        let entry_size = le32_at(&hdr, 84) as u64;
+        if entry_size < 128 || entry_size > 512 || 512 % entry_size != 0 {
+            return Scratch::Refused("gpt-entry-size-unsupported");
+        }
+        let array_sectors = (n_entries * entry_size).div_ceil(512);
+        if array_sectors == 0 || array_sectors > GPT_ARRAY_MAX_SECTORS || entries_lba < 2 {
+            return Scratch::Refused("gpt-entry-array-geometry-unsupported");
+        }
+        let array_end = entries_lba + array_sectors; // first LBA past the array
+        let per_sector = (512 / entry_size) as usize;
+        let mut first: Option<u64> = None;
+        let mut seen = 0u64;
+        let mut sec = [0u8; 512];
+        for s in 0..array_sectors {
+            if !read_block_ro(base, blk, entries_lba + s, &mut sec) {
+                return Scratch::Refused("gpt-entry-array-unreadable");
+            }
+            for k in 0..per_sector {
+                if seen >= n_entries {
+                    break;
+                }
+                seen += 1;
+                let e = k * entry_size as usize;
+                // Unused entry: all-zero PartitionTypeGUID (16 bytes at +0).
+                if sec[e..e + 16].iter().all(|b| *b == 0) {
+                    continue;
+                }
+                let start = le64_at(&sec, e + 32);
+                if start >= num_blocks {
+                    return Scratch::Refused("gpt-partition-start-beyond-card");
+                }
+                first = Some(first.map_or(start, |f: u64| f.min(start)));
+            }
+        }
+        // No partition at all: the usable span is free up to LastUsableLBA (the backup array follows it).
+        let bound = first.unwrap_or(last_usable.saturating_add(1));
+        if bound < 1 {
+            return Scratch::Refused("gpt-first-partition-at-lba-0");
+        }
+        let cand = bound - 1;
+        let floor = array_end.max(first_usable);
+        if cand < floor || cand >= num_blocks {
+            return Scratch::Refused("gpt-no-gap-before-first-partition");
+        }
+        Scratch::Lba { lba: cand, reason: "gpt-gap-top", first_part: first }
+    }
+
+    /// Build the witness block: header + tick + LBA + a position sweep over the remainder.
+    #[cfg(feature = "sdmmcwrite")]
+    fn make_witness(buf: &mut [u8; 512], lba: u64, tick: u64) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7) ^ 0xa5 ^ (lba as u8);
+        }
+        buf[..WITNESS_MAGIC.len()].copy_from_slice(WITNESS_MAGIC);
+        buf[14] = 1; // pattern version
+        buf[15] = 0;
+        buf[16..24].copy_from_slice(&tick.to_le_bytes());
+        buf[24..32].copy_from_slice(&lba.to_le_bytes());
+    }
+
+    /// Write one block `lba` via polled single-block CMD24 (WRITE_BLOCK) through the PIO FIFO — the
+    /// twin of the armed ladder's `write_block_at` (see the section header), returning the CNTPCT ticks
+    /// the write took (command issue through DAT0 release) or the failing STEP and the register that
+    /// convicts it. Register facts (SD Host Controller spec; see SDMMCWRITE.md):
+    ///   * BLKSIZECNT: block size 512, block count 1 (single block; Block Count Enable unused, as the reads).
+    ///   * CMDTM: index 24, response type 48-bit (R1), CRC + index check, Data Present = 1, and Data
+    ///     Transfer Direction = 0 (host -> card) — the ONE bit that differs from the CMD17 word.
+    ///   * Then wait Buffer Write Ready (Normal Interrupt Status bit 4), push 128 LE words into the Buffer
+    ///     Data Port, wait Transfer Complete (bit 1) with the error summary (bit 15 / [31:16]) as the
+    ///     early exit, then wait Command Inhibit (DAT) clear in Present State — the card holds DAT0 low
+    ///     while it programs the flash and a read-back that raced it would read the OLD block.
+    /// No DMA, no bus-width change, no clock change, no vendor register.
+    #[cfg(feature = "sdmmcwrite")]
+    fn write_block_probe(base: u64, blk: bool, lba: u64, buf: &[u8; 512]) -> Result<u64, (&'static str, u32)> {
+        let arg = if blk {
+            if lba > u32::MAX as u64 {
+                return Err(("lba-out-of-range", 0));
+            }
+            lba as u32
+        } else {
+            match lba.checked_mul(512) {
+                Some(b) if b <= u32::MAX as u64 => b as u32,
+                _ => return Err(("lba-out-of-range", 0)),
+            }
+        };
+        let t0 = crate::arch::timer::cntpct();
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512);
+        // CMD24 WRITE_BLOCK: R1 + data present, host -> card (DAT_DIR_READ clear).
+        if let Err(int) = send_command(base, cmd(24) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA, arg) {
+            reset_cmd_dat(base);
+            return Err(("cmd24-issue", int));
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            return Err(("cmd24-r1", r1));
+        }
+        if !wait_set(base, INTERRUPT, INT_WRITE_RDY | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            let int = read32(base, INTERRUPT);
+            reset_cmd_dat(base);
+            return Err(("buffer-write-ready", int));
+        }
+        let int = read32(base, INTERRUPT);
+        if int & INT_ERR_ANY != 0 {
+            write32(base, INTERRUPT, int);
+            reset_cmd_dat(base);
+            return Err(("buffer-write-ready-error", int));
+        }
+        write32(base, INTERRUPT, INT_WRITE_RDY); // W1C
+        for i in 0..128usize {
+            let off = i * 4;
+            write32(base, DATA, u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]));
+        }
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            let int = read32(base, INTERRUPT);
+            reset_cmd_dat(base);
+            return Err(("transfer-complete", int));
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int); // W1C everything we saw
+        if int & INT_ERR_ANY != 0 {
+            reset_cmd_dat(base);
+            return Err(("data-error", int));
+        }
+        if !wait_clear(base, STATUS, ST_DAT_INHIBIT, PROG_TIMEOUT_MS) {
+            return Err(("dat0-busy", read32(base, STATUS)));
+        }
+        Ok(crate::arch::timer::cntpct().wrapping_sub(t0))
+    }
+
+    /// The probe entry (UNAOS_SDMMCWRITE=1): runs from the tegra boot sequence directly after
+    /// `sdmmc_census`, and only does anything if the census PUBLISHED the card — i.e. M1 (live SDHCI),
+    /// M2 (identified) and M3 (sector 0 read) all passed this boot. Holds the `SD_BLK` lock across the
+    /// whole probe (the register file is one shared resource; nothing else runs at this point in boot,
+    /// and the block layer's readers take the same lock, so the discipline is theirs).
+    #[cfg(feature = "sdmmcwrite")]
+    pub fn sdmmc_write_probe() {
+        let guard = SD_BLK.lock();
+        let Some(card) = *guard else {
+            serial_println!("{} -> REFUSED reason=no-published-card (census did not reach M3 this boot)", WPS);
+            return;
+        };
+        let (base, blk, num_blocks) = (card.base, card.block_addressing, card.num_blocks);
+        serial_println!(
+            "{} probe armed (UNAOS_SDMMCWRITE=1): CMD24 then CMD17 read-back, 1-bit default speed, PIO, vendor block untouched, card_blocks={}",
+            WPS, num_blocks
+        );
+        // Re-read sector 0 through the unarmed read (the census's own copy is not retained here).
+        let mut sec0 = [0u8; 512];
+        if !read_block_ro(base, blk, 0, &mut sec0) {
+            serial_println!("{} -> REFUSED reason=sector0-unreadable", WPS);
+            return;
+        }
+        let layout = classify_sector0(&sec0);
+        let (lba, reason, first_part) = match choose_scratch(base, blk, num_blocks, &sec0) {
+            Scratch::Lba { lba, reason, first_part } => (lba, reason, first_part),
+            Scratch::Refused(why) => {
+                serial_println!("{} -> REFUSED reason={} layout={} card_blocks={}", WPS, why, layout, num_blocks);
+                return;
+            }
+        };
+        // The choice on the wire BEFORE any write (binding).
+        match first_part {
+            Some(fp) => serial_println!(
+                "{} target=lba {} reason={} layout={} first_part_lba={} card_blocks={}",
+                WPS, lba, reason, layout, fp, num_blocks
+            ),
+            None => serial_println!(
+                "{} target=lba {} reason={} layout={} first_part_lba=none card_blocks={}",
+                WPS, lba, reason, layout, num_blocks
+            ),
+        }
+        // What is there now — a prior boot's witness is the persistence proof.
+        let mut prior = [0u8; 512];
+        if !read_block_ro(base, blk, lba, &mut prior) {
+            serial_println!("{} lba={} -> FAIL status=0x0 at cmd17-prior", WPS, lba);
+            return;
+        }
+        if &prior[..WITNESS_MAGIC.len()] == WITNESS_MAGIC {
+            serial_println!("{} prior lba={} = witness(tick={} lba={})", WPS, lba, le64_at(&prior, 16), le64_at(&prior, 24));
+        } else if prior.iter().all(|b| *b == 0) {
+            serial_println!("{} prior lba={} = zero", WPS, lba);
+        } else {
+            serial_println!(
+                "{} prior lba={} = other(first8={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
+                WPS, lba, prior[0], prior[1], prior[2], prior[3], prior[4], prior[5], prior[6], prior[7]
+            );
+        }
+        // The write.
+        let tick = crate::arch::timer::cntpct();
+        let mut pattern = [0u8; 512];
+        make_witness(&mut pattern, lba, tick);
+        let ticks = match write_block_probe(base, blk, lba, &pattern) {
+            Ok(t) => t,
+            Err((step, status)) => {
+                serial_println!("{} lba={} -> FAIL status={:#x} at {}", WPS, lba, status, step);
+                return;
+            }
+        };
+        // The read-back, through the same unarmed CMD17 the block layer uses.
+        let mut back = [0u8; 512];
+        if !read_block_ro(base, blk, lba, &mut back) {
+            serial_println!("{} lba={} -> FAIL status=0x0 at cmd17-readback", WPS, lba);
+            return;
+        }
+        let matched = back.iter().zip(pattern.iter()).filter(|(a, b)| a == b).count();
+        if matched == 512 {
+            let hz = crate::arch::timer::cntfrq();
+            let us = if hz != 0 { ticks.saturating_mul(1_000_000) / hz } else { 0 };
+            serial_println!("{} lba={} -> OK (512/512 match, t={} ticks = {} us @ {} Hz)", WPS, lba, ticks, us, hz);
+        } else {
+            let first_diff = back.iter().zip(pattern.iter()).position(|(a, b)| a != b).unwrap_or(0);
+            serial_println!(
+                "{} lba={} -> FAIL mismatch={}/512 first_diff={} want={:#04x} got={:#04x}",
+                WPS, lba, 512 - matched, first_diff, pattern[first_diff], back[first_diff]
+            );
+        }
     }
 }

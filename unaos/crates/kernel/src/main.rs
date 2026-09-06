@@ -2368,7 +2368,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // (QEMU models no Tegra234 SDMMC). Compiled out knob-off => byte-identical to baseline. See
     // arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
     #[cfg(all(feature = "sdmmc", feature = "tegra"))]
-    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask);
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask); #[cfg(all(feature = "sdmmcwrite", feature = "tegra"))] unaos_kernel::arch::sdmmc_tegra::sdmmc_write_probe(); // SDMMCWRITE (orin 14): the gap-#3 write probe — ONE CMD24 to a proven-free scratch sector + CMD17 read-back, directly after the census that published the card; appended to THIS line for knob-off byte identity (no line moves). See docs/dev/evidence/orin14/SDMMCWRITE.md.
 
     // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
     // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and

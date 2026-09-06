@@ -1017,6 +1017,28 @@ sdmmc_arm = ["sdmmc"]
 # §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
 install_target = ["sdmmc_arm"]
 
+# SDMMCWRITE (orin 14): the `UNAOS_SDMMCWRITE=1` gap-#3 write PROBE on the Tegra234 microSD slot
+# (arch/aarch64/sdmmc_tegra.rs, the `sdmmcwrite` tail section) — orin-ledger §"The five gaps" #3's
+# first metal question: with the vendor pad block left DISABLED (the FWALL SError conviction), does a
+# CMD24 single-block write to a scratch sector followed by a CMD17 read-back return the written bytes,
+# at 1-bit default speed? A SECOND explicit write arm on top of `sdmmc` (double-gating held: no card
+# write without `sdmmc` AND an explicit arm), a SIBLING of `sdmmc_arm` rather than an implier of it:
+# that arm's ladder writes the card's LAST LBA (refused outright on GPT) and restores it, and this
+# question wants ONE write to ONE sector proven outside every partition and outside the FAT volume,
+# left in place so the next boot reads its own witness back (`prior … = witness(tick=…)`). Runs from
+# the `sdmmc_census` call line in main.rs directly after the census, only if the census PUBLISHED the
+# card (M1+M2+M3 passed); prints the target and the reason BEFORE writing (`[sdmmc] write target=lba …
+# reason=…`), then `[sdmmc] write lba=… -> OK (512/512 match, t=… ticks)` / `-> FAIL status=0x… at <step>`
+# / `-> REFUSED reason=…`. PIO through the same SDHCI data path the reads use; no DMA, no bus-width or
+# clock change, no vendor register. Every site is `sdmmcwrite`-gated inside `tegra`-gated items (the
+# `pub use` and the main.rs call are same-line appends; the section is a file tail; the one shared
+# constant `INT_WRITE_RDY` is cfg-widened in place), so DEFAULT OFF => no line moves and the jetson
+# image and the Pi kernel8.img are byte-identical to baseline (measured on `kernel8.img` sha256 before
+# and after, and on the `llvm-objcopy -O binary` image — see docs/dev/evidence/orin14/SDMMCWRITE.md).
+# The ARMED polarity is type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by
+# the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
+sdmmcwrite = ["sdmmc"]
+
 # SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
 # (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
 # `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
