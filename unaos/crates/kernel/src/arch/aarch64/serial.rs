@@ -719,9 +719,12 @@ pub mod serialrx {
     // (UARTC is the SPE/TCU combined-UART port — two readers on one RBR). An overrun SETS LSR.OVRF;
     // a competitor never does. FIFO mode qualifies either (a 16-deep FIFO would not overrun in a
     // 2.3 ms echo at 87 µs/byte). Both are READ-ONLY witnesses; no FCR/IER/MCR write anywhere.
-    /// Polls whose raw LSR word had bit 1 (OVRF, the 16550/Tegra `UART_LSR_0` overrun flag) set.
-    /// Reading LSR clears it and every poll reads LSR, so each overrun event counts once. The open-bus
-    /// word (all ones) is excluded — every bit set means "no UART", not "overrun".
+    /// POLLS that observed bit 1 (OVRF, the 16550/Tegra `UART_LSR_0` overrun flag) set — a poll
+    /// count, not an event count: N overruns inside one stall (the pump's ~2.3 ms `KEY` echo) show
+    /// as ONE poll with the flag up, so this is a lower bound on events; the A16 verdict table only
+    /// asks `ovrf > 0`. Words with any of bits 31..16 set are excluded (all-ones = open bus,
+    /// `0xdead....` = SoC decode error — both have bit 1 set and are not overruns; Tegra's LSR uses
+    /// bits 9..0 only). PANEL4 L2, 2026-09-06.
     static OVRF: AtomicU64 = AtomicU64::new(0);
     /// Raw IIR word of the one-shot read taken on the witness line.
     static IIR_FIRST: AtomicU32 = AtomicU32::new(0);
@@ -739,7 +742,7 @@ pub mod serialrx {
             LSR_FIRST.store(status, Ordering::Relaxed);
             LSR_SEEN.store(true, Ordering::Release);
         }
-        if status != 0xFFFF_FFFF && (status & LSR_OVRF) != 0 {
+        if (status & 0xFFFF_0000) == 0 && (status & LSR_OVRF) != 0 {
             OVRF.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -785,16 +788,20 @@ pub mod serialrx {
         let lsr = LSR_FIRST.load(Ordering::Relaxed);
         // RXDISCRIM (A16): one read of IIR, off-lock, after a poll has already reached the port (so
         // the MMIO window is up — `LSR_SEEN` is set only from inside `read_byte`, past its guard).
-        // Reading IIR is side-effect-free for us (it acknowledges only a THRE interrupt, IER is not
-        // ours to arm). Same stride arithmetic as `read_byte`'s `BASE + LSR`.
+        // Reading IIR is NOT side-effect-free for the port's co-owner: a 16550 IIR read acknowledges a
+        // pending THRE interrupt, and the SPE/TCU may have armed IER on this shared UART. It is read
+        // ONCE per boot (this function is one-shot) and the line says whether the read could have
+        // eaten anything: IIR bit 0 = 1 means "no interrupt pending" (render4: 0xc1 → pending=0).
+        // PANEL4 L3, 2026-09-06. Same stride arithmetic as `read_byte`'s `BASE + LSR`.
         let iir = unsafe { core::ptr::read_volatile((super::tegra::base() + IIR) as *const u32) };
         IIR_FIRST.store(iir, Ordering::Relaxed);
         serial_println!(
-            "[serialrx] lsr={:#010x} base={:#010x} iir={:#04x} fifo={} -> {} (0x00000000 = AON UART held in reset/clock-gated, needs BPMP; 0xffffffff = open bus / wrong BASE; 0xdead.... = SoC decode error; else live)",
+            "[serialrx] lsr={:#010x} base={:#010x} iir={:#04x} fifo={} pending={} -> {} (0x00000000 = AON UART held in reset/clock-gated, needs BPMP; 0xffffffff = open bus / wrong BASE; 0xdead.... = SoC decode error; else live)",
             lsr,
             super::tegra::base(),
             iir & 0xFF,
             fifo_state(iir),
+            (iir & 1 == 0) as u8,
             classify(lsr)
         );
     }

@@ -223,3 +223,10 @@ symbol.
 Sum for the S6 row: **29 witness families (20 bracket incl. the 11 `[piusb NN]` + 9 colon-prefix)
 in 7 shared files; 265 witness sites (134 bracket + 131 colon-prefix); 51 shared-defined symbols +
 15 arch-homed symbols referenced from shared files; 26 board-named knobs.**
+
+
+## Addendum (PANEL4 L1, 2026-09-06)
+| token | kind | file | sites | subsystem | proposed name | mechanical? | note |
+|---|---|---|---|---|---|---|---|
+| `orin_desk_scene_up` | fn | `main.rs` (orinrender region, DESKSCENE `8cbfaadf`) | 3 (:8121 def, :8149, :8281) | render/desk | `render_desk_scene_up` | yes (sed-safe, cfg unchanged) | rename with the S6 batch once GATE-NEUTRAL exists; not renamed alone (memory: no lone rename commit) |
+| `[orinrender]` | witness family | `main.rs` | +1 site (:8285 census, DESKSCENE) | render | `[render]` (with the family) | yes | already tabled; count updated |

@@ -263,12 +263,13 @@ render3b control: `cascaded=1 refuse=0 pulsewin_open=0 pulsewin_decline=0 strip_
 (correct for render3b bytes: the windowed pulse was retired, the strip was live — the R17 finding).
 
 ### C.6 Scorer — A17, two Print Screen presses, two verdicts, and a valid second PNG on the card
+(PANEL4 L4: `Refusal::Short` prints `capture INCOMPLETE` — the one refusal that can only follow `-> capturing`; it is in the partner set below, so a short write reads as a NAMED refusal, not as a power cut.)
 
 Ledger row: **A17**. Two halves: the wire (two `-> OK` lines, or one OK and a NAMED refusal) and the
 card (the second file named on the wire is a PNG with signature + IHDR and size > 0).
 
 ```sh
-awk '/PRTSCR: PrintScreen \(HID 0x46\) down/{armed++} /:: PRTSCR: SCREEN[0-9]+\.PNG [0-9]+x[0-9]+ [0-9]+ bytes -> OK ::/{ok++; match($0,/SCREEN[0-9]+\.PNG/); names=names" "substr($0,RSTART,RLENGTH)} /:: PRTSCR: .*capture (skipped|INCOMPLETE)/{ref++; refs=refs" | "substr($0,1,90)}
+awk '/PRTSCR: PrintScreen \(HID 0x46\) down/{armed++} /:: PRTSCR: SCREEN[0-9]+\.PNG [0-9]+x[0-9]+ [0-9]+ bytes -> OK ::/{ok++; match($0,/SCREEN[0-9]+\.PNG/); names=names" "substr($0,RSTART,RLENGTH)} /:: PRTSCR: .*capture (INCOMPLETE|skipped|INCOMPLETE)/{ref++; refs=refs" | "substr($0,1,90)}
      END{printf "armed=%d ok=%d refusals=%d names=[%s ] -> %s\n",armed,ok,ref,names,(armed>=2&&ok==2)?"PASS (two files; now verify the second on the card)":(armed>=2&&ok==1&&ref>=1)?"PASS-BY-REFUSAL (named):"refs:(armed>=2&&ok==1&&!ref)?"FAIL A17 (second press: no verdict — the render3b signature)":(armed<2)?"INCOMPLETE (<2 presses seen)":"NO-VERDICT"}' "$B"
 awk '/:: PRTSCR:/' "$B" | cut -c1-140
 # the card half (card back in the reader, mounted at $MP): every name the wire printed `-> OK` for

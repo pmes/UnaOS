@@ -345,3 +345,7 @@ is the ORIN-BSPTICK question and outside S7.
 Net: `main.rs` shrinks by roughly 450 lines across the three steps; the family goes 3 → 1; the
 waiting axis is a trait with three impls and the input axis is one associated const; nothing in
 `video/` moves for the convergence itself.
+
+
+## Addendum (PANEL4 L5, 2026-09-06)
+`pulsewin::service()` now runs once per pass on the Orin member (DESKSCENE `8cbfaadf`, main.rs ~:8358) at ~320k passes/s — a second `PULSE.lock()` + copy + FNV per pass on cpu 0, invisible to `presents=` (the window repaints through `wm::present`). Pi parity, not a landing question: the convergence's `RenderWait` for the Orin member should pace the loop (or gate `service()` on `tick`'s sample cadence) so the pulse window is serviced at the instrument's rate, not the poll's.
