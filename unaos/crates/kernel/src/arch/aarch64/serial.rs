@@ -777,7 +777,7 @@ pub mod serialrx {
             crate::pal::push_event(crate::pal::Event::Key(b));
             RX.fetch_add(1, Ordering::Relaxed);
         }
-        witness_once();
+        #[cfg(feature = "tcurx")] mbox_drain(); witness_once();
     }
 
     /// One-shot: the raw LSR word of the first poll, printed off-lock from the pump.
@@ -827,10 +827,38 @@ pub mod serialrx {
         // RXDISCRIM (A16): `ovrf=` is the running count of polls that saw LSR.OVRF — an overrun
         // sets it, a competing reader never does. Cumulative like `rx=`, so the burst window is
         // scored by the delta across it.
-        let ovrf = OVRF.load(Ordering::Relaxed);
+        let ovrf = OVRF.load(Ordering::Relaxed); #[cfg(feature = "tcurx")] serial_println!("[serialrx] rx={} (+{}) polls={} refused={} ovrf={} lsr0={:#010x} mbox={} -> {} (TCURX2: `mbox=` = bytes TAKEN from the TCU RX mailbox and consumed by write-back; `rx=` totals BOTH sources, UARTC RBR + mailbox)", rx, delta, polls, refused, ovrf, lsr0, crate::arch::hsp_tegra::rx_mbox_took(), verdict); #[cfg(not(feature = "tcurx"))]
         serial_println!(
             "[serialrx] rx={} (+{}) polls={} refused={} ovrf={} lsr0={:#010x} -> {}",
             rx, delta, polls, refused, ovrf, lsr0, verdict
         );
+    }
+
+    // TCURX2 (orin 15, `tcurx` = tegra+orinrx+tcuprobe+tcurx, DEFAULT OFF) — the SECOND RX SOURCE.
+    //
+    // Rung 1 (`tcuprobe`, render6) proved where the CCPLEX's console input actually is: the burst
+    // `tste\r` left UARTC with `s`,`t`,`\r` while the TCU RX mailbox sat at `raw=0x82006574`
+    // (full=1, nbytes=2, data=[74 65 …]) — the two bytes UARTC lost, parked and never consumed
+    // because the probe deliberately never writes. R19 says a failed-under-conditions path stays
+    // open, so the RBR poll above is UNTOUCHED and this is an ADDITION: `drain` now pulls from both
+    // sources into the same `Event::Key` queue and the same `RX` counter, with `mbox=` in the
+    // census saying how many of those bytes came from the mailbox.
+    //
+    // Everything from here to the module's closing brace is a TAIL APPEND inside the tail module:
+    // knob-off it is `#[cfg]`-erased and no line above it moved, so every `panic::Location` in this
+    // file — and the Pi's `kernel8.img`, which compiles `serial.rs` with `tegra` off — is untouched.
+    /// Drain the TCU RX mailbox: take + consume one byte per pass until the word reports empty, and
+    /// push each as the same `Event::Key` the RBR loop pushes. The consume-by-write-back protocol
+    /// and the ONLY register write the knob adds live in `arch::aarch64::hsp_tegra::rx_mbox_take`.
+    /// Called from `drain` OFF the `SERIAL_PORT` lock (the RBR `while` above has already released
+    /// it), which is what makes the `[tcurx] took=` per-byte witness safe to print from in there.
+    /// Bounded by construction: every iteration clears bit 31 or decrements the count, and a FULL
+    /// word with nbytes == 0 is consumed as a flush tag — so the loop cannot spin on a stuck word.
+    #[cfg(feature = "tcurx")]
+    fn mbox_drain() {
+        while let Some(b) = crate::arch::hsp_tegra::rx_mbox_take() {
+            crate::pal::push_event(crate::pal::Event::Key(b));
+            RX.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

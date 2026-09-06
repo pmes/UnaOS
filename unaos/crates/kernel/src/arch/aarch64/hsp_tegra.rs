@@ -328,3 +328,97 @@ fn sampler(_arg: usize) {
         super::sched::yield_now();
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// TCURX2 (orin 15, `tcurx` knob = tcuprobe + orinrx + tegra, DEFAULT OFF) — RUNG 2: the CONSUMER.
+//
+// Everything above this line is the read-only probe of rung 1. Rung 1 flew on render6
+// (2026-09-06T01:28Z): a burst `tste\r` into the board left UARTC delivering `s`,`t`,`\r` and the
+// probe printing `[tcu] rx-mbox raw=0x82006574 full=1 nbytes=2 data=[74 65 00] … full-edges=1
+// changes=1` — bit31 set, [25:24]=2, byte0=0x74 't', byte1=0x65 'e', i.e. EXACTLY the two bytes
+// UARTC lost — and it STAYED full for the rest of the boot because the probe deliberately never
+// consumes. `TCURX-DESIGN.md` §7 row 1: "TCURX rung 2: replace serialrx::drain's LSR/RBR poll with
+// the mailbox read + write-back (§4)". This block is that write-back. Per R19 the RBR poll is NOT
+// removed — the mailbox is ADDED as a second source in `drain`, so the UARTC path stays open.
+//
+// THE ONE WRITE THIS ARC INTRODUCES, and its whole extent: the 32-bit store to the RX mailbox WORD
+// at `RX_MBOX` — the slot the TCU protocol makes the CONSUMER's to clear (§4, edk2-nvidia
+// `TegraCombinedSerialPortLib.c`, BSD-2-Clause-Patent). No other HSP register, no UART register, no
+// doorbell, no interrupt enable. The address is the same one rung 1 resolved from the LIVE DTB and
+// bounded by the block's own `HSP_INT_DIMENSIONING` before its first touch; if that resolution
+// failed, `ARMED` is false and this path is inert.
+//
+// PROTOCOL (§4), implemented literally: read the word; bit 31 clear -> nothing to take. Bit 31 set
+// -> `n` = bits [25:24]. Take byte 0 (bits [7:0]); write the word back with the remaining `n-1`
+// bytes shifted down 8 and the count decremented, keeping bit 31 set while bytes remain, and
+// writing 0 when none do — the zero word is what tells the SPE the slot is free. A FULL word with
+// n == 0 is a pure flush/hw-flush tag: it carries no byte, so it is consumed with a 0 write and
+// reported as "no byte" rather than injecting a phantom key.
+//
+// THE RUNG-1 SAMPLER STAYS, UNCHANGED AND STILL READ-ONLY. It does not fight this consumer: it only
+// ever `r32`s the word, so the two racing on the same address can at worst make the sampler print a
+// word this consumer has already replaced. Expect its census to read `full=0` most of the time once
+// `tcurx` is on (that is the fix working) with `full-edges`/`changes` still climbing as the SPE
+// refills — and DO NOT read `full=0` there as "nothing arrived"; `[serialrx] … mbox=` is the count
+// that answers that. The sampler never writes; consumption happens only here.
+/// Take ONE byte from the TCU RX mailbox and consume it per §4. `None` = nothing pending (or the
+/// probe never armed). Called from `serial::serialrx::drain` off the `SERIAL_PORT` lock, so the
+/// per-byte witness below is safe to print from here.
+#[cfg(feature = "tcurx")]
+pub fn rx_mbox_take() -> Option<u8> {
+    let pa = RX_MBOX.load(Ordering::Acquire);
+    if pa == 0 || !ARMED.load(Ordering::Acquire) {
+        return None;
+    }
+    let raw = r32(pa);
+    if raw & TCU_FULL == 0 {
+        return None;
+    }
+    let n = (raw >> TCU_NBYTES_SHIFT) & 0b11;
+    if n == 0 {
+        w32(pa, 0);
+        TOOK_TAGS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let b = (raw & 0xff) as u8;
+    let left = n - 1;
+    // Remaining bytes shift down one lane; count decremented; bit 31 held while any remain, cleared
+    // (whole word 0) when none do. `left` is 0..=2, so `8 * left` is 0/8/16 — never a wide shift.
+    let word = if left == 0 { 0 } else { ((raw >> 8) & ((1u32 << (8 * left)) - 1)) | (left << TCU_NBYTES_SHIFT) | TCU_FULL };
+    w32(pa, word);
+    let took = TOOK.fetch_add(1, Ordering::Relaxed) + 1;
+    serial_println!(
+        "[tcurx] took={:#04x} '{}' left={} word={:#010x} <- raw={:#010x} @ {:#x} n={} took-total={} tags={}",
+        b,
+        if (0x20u8..0x7f).contains(&b) { b as char } else { '.' },
+        left,
+        word,
+        raw,
+        pa,
+        n,
+        took,
+        TOOK_TAGS.load(Ordering::Relaxed)
+    );
+    Some(b)
+}
+
+/// Bytes this consumer has taken out of the RX mailbox this boot (the `mbox=` field's source).
+#[cfg(feature = "tcurx")]
+static TOOK: AtomicU64 = AtomicU64::new(0);
+/// FULL words with nbytes == 0 (flush / hw-flush tags) consumed without yielding a byte.
+#[cfg(feature = "tcurx")]
+static TOOK_TAGS: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes taken from the RX mailbox so far — read by `serial::serialrx::census` for `mbox=`.
+#[cfg(feature = "tcurx")]
+pub fn rx_mbox_took() -> u64 {
+    TOOK.load(Ordering::Relaxed)
+}
+
+/// The ONLY write in this file, and the only one the `tcurx` knob adds anywhere: the RX mailbox
+/// word. Kept beside the read helpers so a reviewer sees the whole write surface in one place.
+#[cfg(feature = "tcurx")]
+#[inline(always)]
+fn w32(pa: u64, v: u32) {
+    unsafe { core::ptr::write_volatile(pa as *mut u32, v) };
+}

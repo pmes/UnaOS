@@ -2545,6 +2545,45 @@ orinrx = []
 # subsystem-named (`[tcu]`, `[hsp]`). The ARMED polarity is type-checked by the `arm-tegra-tcuprobe`
 # leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping. UNFLOWN — flies on render5/6.
 tcuprobe = ["tegra"]
+# TCURX2 (TCURX): UNAOS_TCURX=1 — rung 2 of A16, the CONSUMER. DEFAULT OFF. Rung 1 (`tcuprobe`)
+# FLEW on render6 (2026-09-06T01:28Z) and answered §7 row 1 of `docs/dev/evidence/orin14/
+# TCURX-DESIGN.md`: a burst `tste\r` left UARTC delivering `s`,`t`,`\r` (`[serialrx] rx=3 (+3) …
+# ovrf=0`) while the TCU RX mailbox read `[tcu] rx-mbox raw=0x82006574 full=1 nbytes=2
+# data=[74 65 00]` — bit31 set, [25:24]=2, byte0=0x74 't', byte1=0x65 'e', EXACTLY the two bytes
+# UARTC lost — and it stayed full for the rest of the boot because the probe never consumes. This
+# knob adds the consumption: under `all(tegra, orinrx, tcurx)`, `serial::serialrx::drain` gains a
+# SECOND source — `hsp_tegra::rx_mbox_take()` reads the RX mailbox word, and when bit 31 is set
+# takes byte 0 and writes the word back with the count decremented, the remaining bytes shifted
+# down, and the whole word zeroed when none remain (the §4 protocol; the zero write is what tells
+# the SPE the slot is free). Each byte is pushed as the same `Event::Key` the RBR path pushes, with
+# witness `[tcurx] took=0x74 't' left=1 word=0x…` per byte and `mbox=N` appended to the
+# `[serialrx] rx=` census (existing fields and their order untouched — render4/6 scorers key on
+# `rx=` and `ovrf=`).
+#
+# R19 — FAILED PATHS STAY OPEN: the LSR/RBR poll is NOT removed. `drain` reads UARTC first and the
+# mailbox second, so the UARTC path stays live and scorable on the same boot; `rx=` totals both and
+# `mbox=` says how many came from the mailbox.
+#
+# THE ENTIRE WRITE SURFACE THIS KNOB ADDS is one 32-bit store to the RX mailbox WORD — the slot the
+# TCU protocol makes the consumer's to clear. No other HSP register, no UART register (no FCR/IER/
+# MCR — REVIEW3's warning stands), no doorbell, no IRQ enable. The address is the one rung 1
+# resolved from the LIVE DTB and bounded by the block's own `HSP_INT_DIMENSIONING`; if that failed,
+# `ARMED` is false and the path is inert. The rung-1 sampler task keeps sampling READ-ONLY and never
+# writes — with this knob on its `full` reads 0 most of the time (the consumer got there first),
+# which is the fix working, not an absence of input.
+#
+# Implies `tegra` + `orinrx` + `tcuprobe`: the drain site is inside `serial.rs`'s
+# `#[cfg(all(feature = "tegra", feature = "orinrx"))] pub mod serialrx` and the take/write-back is
+# inside `hsp_tegra.rs`'s `#[cfg(all(feature = "tegra", feature = "tcuprobe"))] pub mod`, so
+# `UNAOS_TCURX=1 ./arroyo check` compiles it alone. DEFAULT OFF => every site is `#[cfg]`-erased and
+# the jetson image is byte-identical: the two new statements in `serial.rs` are SAME-LINE folds
+# before their line's first `//` (P7) and everything else is a TAIL APPEND below the last existing
+# line of `serial.rs`'s tail module and of `hsp_tegra.rs`, so no line above moves and no
+# `panic::Location` shifts (the Pi compiles `serial.rs` with `tegra` off — `kernel8.img` sha
+# measured equal before/after in the TCURX2 commit). Witness tokens are subsystem-named (`[tcurx]`).
+# The ARMED polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX in `arroyo`,
+# never by the knob mapping. FIXED-UNFLOWN — flies on render7.
+tcurx = ["tegra", "orinrx", "tcuprobe"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
