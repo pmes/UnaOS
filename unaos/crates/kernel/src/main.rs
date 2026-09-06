@@ -2492,7 +2492,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // xHCI rings/contexts/buffers are live, and the enumerating port is flagged — so a decoded
             // RAS fault ADDR can be matched from the capture alone. No-op with the knob off.
             unaos_kernel::vugras::boot_witness();
-            unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0); #[cfg(feature = "tcuprobe")] unaos_kernel::arch::hsp_tegra::tcuprobe_arm(dtb_addr, dtb_size, mmu.ram_gib_mask); // TCURX (orin 14, `tcuprobe`, DEFAULT OFF): the console pump's ARM point is where the DTB, its size and the RAM-GiB mask are all in scope and the pump has just been spawned — so this is the one call site: it resolves the TCU console node + its HSP RX/TX mailboxes from the live DTB, prints `[tcu] hsp …`, takes one read-only sample of the RX mailbox word and spawns the `tcu-probe` sampler task (boot core, cooperative, `[tcu] rx-mbox` census ~1 s). No HSP/UART write, no IRQ enable — see `arch/aarch64/hsp_tegra.rs`. ⚠ LINE-NEUTRAL append, and the attribute sits BEFORE this line's first `//` (P7): panic `Location` records embed line numbers and the knob-off jetson image byte-identity is this track's standing proof.
+            #[cfg(not(feature = "deskcascade"))] unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0); #[cfg(feature = "deskcascade")] unaos_kernel::arch::sched::spawn_stack("jd2-console", jd2_console_pump, 0, 0, TEGRA_JD2_STACK_SIZE); #[cfg(feature = "tcuprobe")] unaos_kernel::arch::hsp_tegra::tcuprobe_arm(dtb_addr, dtb_size, mmu.ram_gib_mask); // REALDESK-SHELLWIN (A19) — SIZED stack on the cascade knob: phase 2 then mints the shell's own `wm` row and presents it, and `wm::create_at` / `present_outcome_owned` composite from THIS task's stack (orin-render measured `hw=23232` > 16 KiB on the same chain, render4 `[u7stk] orin-render:pass1`), so the knob-on size is 32 KiB (`TEGRA_JD2_STACK_SIZE`, file tail — the `[u7stk] jd2-console:shell-present` line is its measurement); knob-off the statement is the original `spawn` verbatim. ⚠ LINE-NEUTRAL fold.
             serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
         // XCARVE-2 temporal bracket: after the JB2b xHCI attach + enumeration window (the event-ring/ERST
@@ -2871,19 +2871,19 @@ fn jd2_console_pump(_arg: usize) {
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
     if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch — from here the console owns the glass, so a cube repainted away is the design, not a defect, and the census says RAST-SUPERSEDED-BY-CONSOLE instead of RAST-PAINTED-OVERWRITTEN. Placed on the FIRST statement of phase 2 and outside the conwin guard: the console takes the panel on both routes, only the detach differs. ⚠ LINE-NEUTRAL append. // ORIN-CONWIN rung 4 — the detach is GUARDED BY THE ROUTE, exactly as the Pi's GUI handoff guards it (`main.rs`'s CONSWIN-PI line). `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the panel — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the ONE thing this detach exists to guarantee (exactly one writer on the panel while the JD2 Screen console owns it) is already true, and skipping it leaves the console window LIVE instead of freezing it with the boot log. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof.
-    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut screen = unaos_kernel::video::Screen::new(front_fb); let mut shellwin = tegra_shell_window_open(&mut screen); // REALDESK-SHELLWIN (A19) — on the CASCADED scene (bar enabled AND console routed) the shell gets its own `wm` row here and the PANEL Screen is seeded `DESKTOP_BG`; `None` on every other boot (and knob-off, `#[inline(always)] None`), where the shell keeps the backdrop exactly as before. WHY: render4's SCREEN0.PNG carried this console's banner + prompt at the panel's top-left (y 46..89, x 12..495) — `console.draw` below clears the whole back buffer to `Console::BG` (== `wm::DESKTOP_BG`) and draws text, and `pal.render` flushed that through the occluder walk onto the desktop the cascade had just cleared (log order: `[deskcascade] -> CASCADED` THEN `JD2 — EL1 console pump live` THEN `JD4 — console OWNS the panel`). Not residue: a post-cascade repaint, every keystroke. ⚠ LINE-NEUTRAL fold. Helpers at file tail.
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&screen);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
-    let mut console = unaos_kernel::console::Console::new();
+    let mut console = unaos_kernel::console::Console::new(); tegra_shell_mark(&mut console, &shellwin); let shell_id = tegra_shell_id(&shellwin); let mut spal = tegra_shell_pal(&mut shellwin); // REALDESK-SHELLWIN (A19) — the shell's pal: `Some` over the window's `Screen::direct` surface on the scene (the console drops its menu-bar reservation, `mark_in_window`), `None` otherwise; every `console.draw`/`handle_key` below goes through `tegra_shell_pick(&mut spal, &mut pal)`, which is `pal` itself when `spal` is `None`. `pal` (the panel Screen) stays the cursor's — unchanged. ⚠ LINE-NEUTRAL fold.
     // JD11: mirror every command-output line to serial so an attended Orin bench captures a durable,
     // mbench-able transcript (the panel has no scrollback; before JD11 only keystrokes echoed to
     // serial). Installed before the banner so the shell-entry lines head the transcript too.
     console.set_output_sink(jd2_out_sink);
     console.println("UnaOS — Jetson Orin Nano (Tegra234)");
     console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
-    console.draw(&mut pal);
-    pal.render();
+    console.draw(tegra_shell_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19) — the banner goes to the shell surface (window on the scene, panel otherwise). ⚠ LINE-NEUTRAL fold.
+    tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19) — `pal.render()` verbatim (knob-off identical) + on the scene the window flush and its owner-fenced `wm` present; this first panel flush is the seeded DESKTOP_BG through the occluder walk — the band clear. ⚠ LINE-NEUTRAL fold.
     match first_key {
         Some(c) => {
             serial_println!( // ORINPATH — `path=` names WHICH phase-2 printed this, and until this arc nothing did. `jd2_supstate_phase2` carries a verbatim copy of these two literals; on a `supstate` build both copies pass `#[cfg]`, so neither a serial capture nor a grep of the artifact could attribute the line to a site. See the twin's comment for the MEASURED shape of that ambiguity at 0ed6fee2. Token deliberately longer than 8 bytes — a shorter mark can be LLVM-immediate-encoded and never appear in `.rodata`, defeating the artifact grep. Placed AFTER "console OWNS the panel" so `scripts/specs/jetson-sync1.spec` / `jetson-jd5.spec`'s `REQUIRE JD4.*console OWNS the panel` still matches.
@@ -2891,8 +2891,8 @@ fn jd2_console_pump(_arg: usize) {
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-            handle_key(c, &mut console, &mut pal);
-            pal.render();
+            handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
+            tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
         }
         None => serial_println!(
             ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::"
@@ -2946,7 +2946,7 @@ fn jd2_console_pump(_arg: usize) {
                     }
                     needs_render = true;
                     key_repainted = true; #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } // TABKEY — THE MISSING SHELL HALF OF THE FOCUS RING. `wc_focus_key` has always been reachable on tegra through the IN-RING door (`user_input_enqueue` asks it at syscall.rs's router seam, and `orininput`'s `oi_pump` drives that seam), but the SHELL door — the one that fires while `USER_INPUT_ACTIVE == 0`, which is this board's normal state — had NO CALLER AT ALL, because `main.rs`'s two `wc_shell_focus_key` sites both live inside `pump_usb_into_gui`, `cfg(all(aarch64, baremetal))`, and `baremetal` implies `pi` while `pi` + `tegra` is a hard `compile_error!`. So on the Orin <TAB> fell straight through to `handle_key`, which has no byte-9 arm, and was silently dropped. MEASURED on metal (`~/unaos-bench/capture/line-acm0/`): `orin.log` carries 5x `:: tegra: JD2 — KEY 0x09 ::` at :13071-13080 and ZERO `[wc-c] focus tab-cycle`; the Pi control `pi.log`, same tool and directory, has 249. The serial echo above is deliberately left AHEAD of this call so the pairing stays scoreable from a capture — a fixed board reads `KEY 0x09` immediately followed by `[wc-c] focus tab-cycle`, a regressed one reads `KEY 0x09` alone, which is exactly what the Orin capture reads today. `wc_shell_focus_key` and not `wc_focus_key`, because this pump IS the Orin's shell drain: it returns false the moment an EL0 program holds focus, leaving the in-ring case to the router seam that already owns it — one body, two doors, one witness, which is the Pi's arrangement verbatim. `continue` where the Pi's bare-shell drain `break`s: that loop's destination is fixed at `gui_send`, so a moved focus invalidates the rest of its drain, whereas this loop's destination is `handle_key` on the backdrop console, which this pump feeds REGARDLESS of focus anyway (`xusb_tegra.rs`'s defect-2 note, out of this arc's scope) — so breaking would only re-deliver the same events to the same place one pass later. Gated `tegra_el0` because `arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which a bare `tegra` image does not carry; the knob-off tegra media is therefore byte-identical, which is why this is FOLDED onto the statement above and given no line of its own — panic `Location` records embed line numbers and a line added anywhere in this file breaks that proof.
-                    if handle_key(c, &mut console, &mut pal) {
+                    if handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)) { // REALDESK-SHELLWIN (A19) — the keystroke draws into the shell surface; the cursor bracket above/below stays on `pal`, the panel. ⚠ LINE-NEUTRAL fold.
                         // A command took the whole screen (e.g. `gneiss`): stop draining this frame
                         // so a queued keystroke can't paint the console back over it (the shared
                         // drain-loop rule from the x86 GUI path).
@@ -3005,7 +3005,7 @@ fn jd2_console_pump(_arg: usize) {
             needs_render = true;
         }
         if needs_render {
-            pal.render();
+            tegra_shell_present(&mut spal, shell_id, &mut pal, key_repainted); // REALDESK-SHELLWIN (A19) — the panel flush verbatim; the window is presented only on a key repaint, never per pointer frame (the JD20 coalescing rule). ⚠ LINE-NEUTRAL fold.
         }
         // VUGRAS: the shell-idle writeback sweep on the ~250 ms cadence (boot-14's crash path — the
         // console pump was live at shell entry with no vug run). No-op with the knob off.
@@ -8623,4 +8623,246 @@ fn tegra_desk_cascade() -> bool {
         activated
     );
     true
+}
+
+// =================================================================================================
+// REALDESK-SHELLWIN (tail block) — A19: the shell's own window on the cascaded scene.
+// =================================================================================================
+//
+// THE FINDING (orin-ledger A19, render4 SCREEN0.PNG): four lines of `jd2_console_pump`'s console —
+// banner, JD2 line, prompt — at the panel's top-left under the menu bar, x 12..495, y 46..89 (four
+// 8-px glyph rows on a 12-px pitch; `Console::top_y` = `top_chrome_h` 34 + margin 12 = 46). Ruled a
+// pre-cascade residue the desktop-clear missed; it is not. The wire's order is
+// `[deskcascade] -> CASCADED` (render4-boot1.log:479) → `JD2 — EL1 console pump live` (:497) →
+// `JD4 — console OWNS the panel` (:591): the pump is spawned pre-terminus (main.rs, `spawn` in the
+// JB2b attach block) but first DISPATCHED by `run_capstone_boot_core`, which the terminus line runs
+// AFTER `tegra_desk_cascade`; its phase 2 then starts ~8 s later, builds a `Screen` over the PANEL
+// (`*WRITER.lock()`), and `Console::draw` (console.rs:243) clears that back buffer to `Console::BG`
+// (console.rs:162, 0x2D2B55 == `wm::DESKTOP_BG`, wm.rs:2400 — screen.rs:847 names the coincidence)
+// and draws text; `Screen::flush` walks `wm::occluders` (screen.rs:1583) so every window, the bar
+// and the dock survive — which is exactly why only the TEXT showed (controls 0% non-bg). Every
+// keystroke repaints it (`handle_key` → `draw_input_line`). `desktop_firmware::activate`'s
+// desktop-clear (log:417) and `orin_render_service`'s seeded pass-1 present (log:522) both ran
+// BEFORE the paint; neither could have cleared it. The fbcon route (`fbcon::console_is_routed`)
+// covers the boot-log MIRROR only (`FbCon::draw_fb` hands back the window surface); the shell
+// `Console` is a separate painter with no route at all. Case (b) of the A19 brief.
+//
+// THE FIX: on the cascaded scene the shell paints its OWN `wm` row — the Pi's SHELLWIN-PI shape
+// (main.rs `open_shell_window` + `Screen::direct` + `present_outcome_owned`), minted from the task
+// that owns the drain, which is the painter `orin_render_service`'s `no-painter` DECLINE arm says it
+// does not have. The panel `Screen` is seeded `DESKTOP_BG` so its first (full-damage) flush repaints
+// the backdrop the colour it already wears, through the occluder walk: `[realdesk] band-cleared`.
+// Not cascaded → `None`, and the shell keeps the panel verbatim (the Pi's rule: the shell stays
+// wherever the scene is not up). Every symbol is existing `pub` API; `video/` is untouched.
+//
+// PLACEMENT: half-panel wide, 2/5 of the work area tall, centred +40/+40 — the classic cascade over
+// the centred boot-log console window (bench: (307,158) 1305x780), clear of the pulse window
+// (bench: (10,914) 1290x212) and of the top-left band the render5 scorer reads (x 0..700, y 34..120
+// must be 0% non-bg — `docs/dev/evidence/orin14/A19-BAND.md`).
+//
+// ⚠ The `target_arch` term is forced (E0425 on the x86 check leg otherwise — see `tegra_conwin_live`).
+// Knob-off (`tegra` without `deskcascade`) every helper is an `#[inline(always)]` no-op twin, so the
+// pump's phase 2 folds back to the pre-A19 statements byte for byte.
+
+/// REALDESK-SHELLWIN — the jd2 pump's stack on the cascade knob: `wm::create_at` and
+/// `present_outcome_owned` composite from this task, and orin-render measured `hw=23232` on that
+/// chain (render4 `[u7stk] orin-render:pass1`), which does not fit the blanket 16 KiB.
+/// `[u7stk] jd2-console:shell-present` is this number's measurement.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+const TEGRA_JD2_STACK_SIZE: usize = 32 * 1024;
+
+/// REALDESK-SHELLWIN — the shell window: its surface store (the `wm` row holds a raw pointer into it,
+/// so it lives for the pump's life — the pump never returns), the single-buffer `Screen` over it, and
+/// the row id the presents are fenced on.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+struct TegraShellWin {
+    _store: alloc::vec::Vec<u8>,
+    screen: unaos_kernel::video::Screen,
+    id: unaos_kernel::video::wm::WinId,
+}
+
+/// REALDESK-SHELLWIN — mint the shell's `wm` row on the cascaded scene and seed the panel `Screen`.
+///
+/// `Some` only when the bar is enabled AND the console is routed — the cascade's own CASCADED
+/// readback, read at runtime (an image can carry the knob and still have `activate` decline). Every
+/// decline is named on the wire; a decline AFTER the seed still leaves the band clear (the shell's
+/// `Console::draw` clears to the same colour anyway) and the shell on the panel as before.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_window_open(panel: &mut unaos_kernel::video::Screen) -> Option<TegraShellWin> {
+    use unaos_kernel::video::{fbcon, menubar, wm, FrameBuffer, Screen};
+    let (pw, ph) = (panel.width(), panel.height());
+    let bar = menubar::enabled();
+    let routed = fbcon::console_is_routed();
+    if !(bar && routed) {
+        serial_println!(
+            "[realdesk] shell=panel reason=no-scene bar={} routed={} panel={}x{} (the shell keeps the backdrop wherever the cascaded scene is not up — the Pi's rule; no window, no seed, the pre-A19 path verbatim)",
+            bar as u8, routed as u8, pw, ph
+        );
+        return None;
+    }
+    // THE BAND CLEAR. `Screen::new` zero-filled this back buffer and armed full-panel damage; left
+    // alone, the pump's first `pal.render` would publish a panel of black (the console no longer
+    // paints into it). `DESKTOP_BG` is the colour the scene already wears, and the flush walks the
+    // occluders, so no window, bar or dock pixel is touched — the backdrop is repainted clean once.
+    panel.fill_screen(wm::DESKTOP_BG);
+    let wtop = unaos_kernel::ui_status::top_chrome_h(pw, ph);
+    let workh = ph.saturating_sub(wtop);
+    let cw = (pw / 2).clamp(320, pw.max(320));
+    let ch = (workh * 2 / 5).clamp(200, workh.max(200));
+    let stride = cw * 4;
+    let len = ch.checked_mul(stride)?;
+    let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if store.try_reserve_exact(len).is_err() {
+        serial_println!(
+            "[realdesk] shell=panel reason=alloc len={} (the window is allowed not to exist — GR26's rule; the seed above still clears the band and the shell paints the panel as before)",
+            len
+        );
+        return None;
+    }
+    store.resize(len, 0);
+    let mut fb = FrameBuffer::new();
+    // `Bgr` + 4 bytes, the console window's own shape: the little-endian `0x00RRGGBB` word
+    // `wm::draw_window` reads — a statement about the surface, not the panel's pixel format.
+    fb.init(
+        store.as_mut_ptr() as usize,
+        len,
+        unaos_boot_info::FrameBufferInfo {
+            width: cw,
+            height: ch,
+            stride: cw,
+            bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        },
+    );
+    fb.fill_screen(wm::DESKTOP_BG);
+    let Some((_scale, ow, oh)) = wm::spawn_geometry(cw, ch) else {
+        serial_println!("[realdesk] shell=panel reason=geometry surf={}x{} (wm::spawn_geometry declined)", cw, ch);
+        return None;
+    };
+    // Centred + the classic cascade offset, clamped into the work area.
+    let ox = (pw.saturating_sub(ow) / 2 + 40).min(pw.saturating_sub(ow));
+    let oy = (wtop + workh.saturating_sub(oh) / 2 + 40).min(wtop + workh.saturating_sub(oh));
+    let id = wm::create_at(
+        wm::KERNEL_OWNER_DESKTOP,
+        fb.base(),
+        len,
+        cw as u32,
+        ch as u32,
+        stride as u32,
+        b"shell",
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[realdesk] shell=panel reason=create_at-declined surf={}x{} at ({},{})", cw, ch, ox, oy);
+        return None;
+    }
+    serial_println!(
+        "[realdesk] band-cleared x=0 y={} w={} h={} bg={:06x} shell=win={} surf={}x{} box={}x{} at ({},{}) (A19: the band under the bar was jd2's own banner + prompt painted through the panel Screen AFTER the cascade, not residue; from here the shell draws into its own wm row and the panel Screen is seeded the desktop colour, so its full-damage flush walks the occluders and leaves the backdrop clean)",
+        wtop, pw, ph.saturating_sub(wtop), wm::DESKTOP_BG, id, cw, ch, ow, oh, ox, oy
+    );
+    Some(TegraShellWin { _store: store, screen: Screen::direct(fb), id })
+}
+
+/// REALDESK-SHELLWIN — a windowed shell reserves no menu-bar chrome (`Console::top_y`).
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_mark(console: &mut unaos_kernel::console::Console, win: &Option<TegraShellWin>) {
+    if win.is_some() {
+        console.mark_in_window();
+    }
+}
+
+/// REALDESK-SHELLWIN — the row id, read BEFORE the pal borrows the window (`WIN_NONE` without one).
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_id(win: &Option<TegraShellWin>) -> unaos_kernel::video::wm::WinId {
+    win.as_ref().map_or(unaos_kernel::video::wm::WIN_NONE, |w| w.id)
+}
+
+/// REALDESK-SHELLWIN — the shell's pal over the window surface; `None` leaves the shell on the panel.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_pal(win: &mut Option<TegraShellWin>) -> Option<unaos_kernel::pal::TargetPal<'_>> {
+    win.as_mut().map(|w| unaos_kernel::pal::TargetPal::new(&mut w.screen))
+}
+
+/// REALDESK-SHELLWIN — one-shot: the first shell-window present prints its outcome and the stack gauge.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+static TEGRA_SHELL_PRESENTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// REALDESK-SHELLWIN — the pump's present: the panel flush VERBATIM (`pal.render()` — the cursor's
+/// damage, and on the first call the seeded full-panel band clear), then, only when the shell
+/// repainted, the window's flush and its owner-fenced `wm` present. `present_outcome_owned`, never
+/// bare `present`: the Pi's recycled-slot fence (a slot alias with no generation).
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_present(
+    spal: &mut Option<unaos_kernel::pal::TargetPal<'_>>,
+    id: unaos_kernel::video::wm::WinId,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+    shell_dirty: bool,
+) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::GneissPal;
+    use unaos_kernel::video::wm;
+    pal.render();
+    if !shell_dirty {
+        return;
+    }
+    let Some(sp) = spal.as_mut() else {
+        return;
+    };
+    sp.render();
+    let outcome = wm::present_outcome_owned(id, wm::KERNEL_OWNER_DESKTOP);
+    if !TEGRA_SHELL_PRESENTED.swap(true, Ordering::AcqRel) {
+        serial_println!(
+            "[realdesk] shell-present win={} outcome={:?} (first owner-fenced present of the shell window from the jd2 pump; every later key repaint presents the same way, pointer frames never do)",
+            id, outcome
+        );
+        #[cfg(feature = "witness")]
+        unaos_kernel::arch::sched::stk_probe("jd2-console:shell-present");
+    }
+}
+
+/// REALDESK-SHELLWIN — the shell's drawing surface: the window pal when there is one, the panel
+/// pal otherwise. Shared by both knob states (knob-off `spal` is always `None`, so this is `pal`).
+#[cfg(all(target_arch = "aarch64", feature = "tegra"))]
+fn tegra_shell_pick<'r, 'a>(
+    spal: &'r mut Option<unaos_kernel::pal::TargetPal<'a>>,
+    pal: &'r mut unaos_kernel::pal::TargetPal<'a>,
+) -> &'r mut unaos_kernel::pal::TargetPal<'a> {
+    match spal.as_mut() {
+        Some(p) => p,
+        None => pal,
+    }
+}
+
+// Knob-off twins: `tegra` without `deskcascade` — no-ops, so phase 2 folds to its pre-A19 shape.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+enum TegraShellWin {}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_window_open(_panel: &mut unaos_kernel::video::Screen) -> Option<TegraShellWin> {
+    None
+}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_mark(_console: &mut unaos_kernel::console::Console, _win: &Option<TegraShellWin>) {}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_id(_win: &Option<TegraShellWin>) -> unaos_kernel::video::wm::WinId {
+    unaos_kernel::video::wm::WIN_NONE
+}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_pal(_win: &mut Option<TegraShellWin>) -> Option<unaos_kernel::pal::TargetPal<'_>> {
+    None
+}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_present(
+    _spal: &mut Option<unaos_kernel::pal::TargetPal<'_>>,
+    _id: unaos_kernel::video::wm::WinId,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+    _shell_dirty: bool,
+) {
+    use unaos_kernel::pal::GneissPal;
+    pal.render();
 }
