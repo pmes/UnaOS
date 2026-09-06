@@ -422,3 +422,14 @@ pub fn rx_mbox_took() -> u64 {
 fn w32(pa: u64, v: u32) {
     unsafe { core::ptr::write_volatile(pa as *mut u32, v) };
 }
+
+/// Is the RX mailbox path live — i.e. did rung 1 resolve the word address out of the LIVE DTB and
+/// arm the probe? `serial::serialrx`'s RXMERGE arbitration (A37) reads this to decide which of the
+/// two RX readers owns the console: an armed mailbox means the SPE's forward is available and the
+/// direct UARTC RBR poll must be PARKED, because that read pops the byte out of the RX FIFO the SPE
+/// is reading too. False = the DTB never resolved, `rx_mbox_take` is inert, and the RBR poll stays
+/// the only source (R19: the path that failed under conditions keeps its code and its fallback).
+#[cfg(feature = "tcurx")]
+pub fn rx_mbox_armed() -> bool {
+    ARMED.load(Ordering::Acquire) && RX_MBOX.load(Ordering::Acquire) != 0
+}
