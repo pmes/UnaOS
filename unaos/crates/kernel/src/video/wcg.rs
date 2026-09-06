@@ -3949,7 +3949,7 @@ pub fn end(
             W_WITUS[w].load(Ordering::Relaxed),
             FRAME_US,
             dominant
-        );
+        ); seam_census_emit(p.id); // WCGSEAM-CENSUS — ⚠ SAME-LINE fold, line-NEUTRAL (panic `Location`s below must not renumber). Emitted AFTER the rollup print, so nothing timed follows and no measured bracket widens; compositor context, never print context. Why the census needs a line of its own: the WCGSEAM-CENSUS block at this file's tail.
     }
 }
 
@@ -4061,3 +4061,120 @@ fn seam_register_once() {
 )))]
 #[inline(always)]
 fn seam_register_once() {}
+
+// =================================================================================================
+// WCGSEAM-CENSUS — the seam census gets a line that is NOT gated on a conviction
+// =================================================================================================
+//
+// THE DEFECT, measured on the Orin's `render8` flight (2026-09-06, card
+// `render8-20260906T1532Z-c24d951`, 16 knobs incl. `UNAOS_WITNESS=1 UNAOS_DESKCASCADE=1`).
+//
+// Both `[wcgseam]` prints in [`end`] lead with `verdict != "CLEAN"`. render8 produced 25 `[wc-g]`
+// samples — 24 `-> CLEAN`, 1 `-> CLEAN+SLOW` — and five rollups, every one `coher=0 race=0 blit=0`.
+// Zero convictions, therefore zero `[wcgseam]` lines, therefore a wire on which the seam census is
+// INVISIBLE. The flight's own scorer read that silence as a fact about the census —
+// "`A29 wcgseam: ABSENT — the seam never ran this boot`" — which the wire does not support: an
+// all-CLEAN boot suppresses the print whether the census ran, never ran, or was never compiled.
+// That is the absence-is-only-evidence law: `glyphs=0` on a build whose charge sites are `#[cfg]`'d
+// out means "never compiled", not "no writer", and today's wire cannot tell the two apart at all.
+//
+// It is NOT the gate the brief for this work assumed. That brief (orin 6, 2026-08-25) recorded the
+// charge sites as x86-only — `fbcon.rs` locked path `any(all(x86_64, wc), all(aarch64, pidesk))`,
+// unlocked split path `all(witness, x86_64, wc)` — and concluded `[wcgseam]` "CANNOT print on a
+// tegra/Orin build". Both halves have since moved: `a39aff8b` renamed the feature `pidesk` ->
+// `desktop_firmware`, and PARFB widened the unlocked split site to the same predicate as its locked
+// sibling. Today BOTH sites (`fbcon.rs:455`, `fbcon.rs:1480`) read
+// `all(witness, any(all(x86_64, wc), all(aarch64, desktop_firmware)))`, and
+// `deskcascade = ["desktop_firmware", …]`, so render8's own image COMPILED the census. The census
+// was armed on that flight and the wire said nothing either way.
+//
+// THE REMEDY IS A DENOMINATOR, NOT A VERDICT. One line beside each `[wc-g] rollup`, carrying the
+// three facts a conviction is read against, and gated on NOTHING:
+//
+//   * `armed=` — were the charge sites COMPILED? A `#[cfg]`-derived constant under the charge
+//     sites' own predicate, and the single fact no counter can ever report. `witness` alone is
+//     necessary but not sufficient: an aarch64 witness build without `desktop_firmware` (the QEMU
+//     virt ramfb witness) runs [`end`], emits rollups, and has no charge site anywhere.
+//   * `glyphs=`/`locked=` — [`SEAM_WRITES`] and its FBCON-locked share. `locked=` is what CHOOSES
+//     between the two remedies §6.14 named: FBCON-locking the console blit only serialises writers
+//     that take the lock, so a census that is all-unlocked rules that remedy out.
+//   * `routed=` — [`super::fbcon::console_is_routed`], which splits QUIET's two causes (no route
+//     for the glyphs to land in, versus a route with no glyph on it).
+//
+// The terminal is the three-way split the wire has been missing: `UNARMED` (not compiled, so
+// `glyphs=` carries no information), `QUIET` (compiled, never charged), `CHARGED` (compiled and
+// charged — after which a boot with no per-conviction `[wcgseam]` line means "no conviction", which
+// is real information rather than silence).
+//
+// WHAT IT COSTS AND WHY IT IS PAID HERE. One line per `[wc-g] rollup`, 1:1 with a line the wire
+// already carries, folded onto the rollup print's own closing line so no panic `Location` in this
+// file renumbers. It is emitted after that print, so no timed span contains it, and from compositor
+// context — never print context, whose serial write would recurse into `_print`.
+//
+// THE TAG IS DELIBERATE, AND IT IS THE EXISTING ONE. `[wcgseam]` is matched by no FORBID in
+// `x86-witness.spec` or `pi4-regression.spec` (both files' `\[wc-g\] .*-> COHER` / `RACE` / `BLIT`
+// are untouched by this and stay load-bearing), and none may ever be written for it. `census` is
+// the second word so a reader — and any future pattern — can separate the denominator line from the
+// per-conviction lines without a new tag to keep clear of the FORBIDs.
+
+/// WCGSEAM-CENSUS — were the two `fbcon` charge sites compiled into THIS image? The predicate is
+/// copied verbatim from `video/fbcon.rs:455`/`:1480`; if either moves, this constant is the thing
+/// that must move with it, because it is what makes `glyphs=0` readable.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+const SEAM_ARMED: bool = true;
+
+/// WCGSEAM-CENSUS — the erasing twin. `false` here is the whole point: it is what lets a reader
+/// know that this image's `glyphs=0` is a compile-time fact and not an observation about writers.
+#[cfg(not(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+)))]
+const SEAM_ARMED: bool = false;
+
+/// WCGSEAM-CENSUS — print the seam census beside a `[wc-g] rollup`, unconditionally.
+///
+/// `id` is the ROLLUP's window, so the line pairs with the rollup it follows; `seam_win=` is the
+/// census's own window ([`SEAM_WIN`], the routed console as `fbcon` last charged it) and the two are
+/// deliberately separate — a rollup for a window that is not the console is exactly the case the
+/// per-conviction prints decline, and the reader must be able to see that.
+///
+/// Reads four relaxed atomics and one `CONSOLE_WIN` load, then prints. No lock, no allocation, and
+/// no counter moves — a census that changed what it measures would be a second instrument.
+fn seam_census_emit(id: u32) {
+    let glyphs = SEAM_WRITES.load(Ordering::Relaxed);
+    #[cfg(any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ))]
+    let routed = if super::fbcon::console_is_routed() { "yes" } else { "no" };
+    #[cfg(not(any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )))]
+    let routed = "?";
+    serial_println!(
+        "[wcgseam] census win={} armed={} glyphs={} locked={} seam_win={} routed={} -> {}",
+        id,
+        if SEAM_ARMED { "yes" } else { "no" },
+        glyphs,
+        SEAM_LOCKED.load(Ordering::Relaxed),
+        SEAM_WIN.load(Ordering::Relaxed),
+        routed,
+        if !SEAM_ARMED {
+            "UNARMED"
+        } else if glyphs > 0 {
+            "CHARGED"
+        } else {
+            "QUIET"
+        }
+    );
+}
