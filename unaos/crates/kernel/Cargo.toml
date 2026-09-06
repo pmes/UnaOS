@@ -1960,6 +1960,26 @@ jd1dc = []
 # mapping. Witness family on the wire: `[ga10bprobe1]`.
 ga10bprobe1 = ["tegra"]
 
+# GA10B-PROBE2 (`UNAOS_GA10B_PROBE2=1`): rung 2 of the GA10B ladder (docs/dev/evidence/orin14/GA10B-LADDER.md,
+# Peter's R18 2026-09-06: probe the hardware boot by boot). The tail of `arch/aarch64/ga10b_probe.rs`
+# (`ga10bprobe2_run`) and one appended call site in `tegra_early_stop`, BEFORE rung 1's. One attended
+# FULL-BOOT flight: MRQ_PG GET_STATE of the `gpu@` domain (pre-state on the wire), SET_STATE ON only if it
+# was off, an EXPLICIT GET_STATE readback, MRQ_CLK IS_ENABLED/ENABLE/IS_ENABLED for every DTB clock the
+# node lists (only what was off is enabled), then ONE BAR0 read — NV_PMC_BOOT_0 (BAR0+0, public MIT
+# header) — behind the readback of ON, classified POWERED (Ampere chipset 0x17x) / UNPOWERED (zero,
+# all-ones, PRI 0xBAD… pattern) / REFUSED (no read), then a SYMMETRIC restore (DISABLE what it enabled,
+# SET_STATE OFF only if it powered on) and it RETURNS so the desktop boot continues. Still ZERO GA10B
+# MMIO writes. A SIBLING of `ga10bprobe1`, NOT its dependent: rung 1's `ga10bprobe1_run` is `-> !` and
+# ends the boot in SYSTEM_OFF unconditionally, so a rung-2 flight arms THIS knob alone (co-armed, rung 2
+# runs first and rung 1 then powers off — a supported build, not a flight). IMPLIES `tegra`. Every
+# offset/id cites a public source or the live DTB (never nvgpu): bpmp-abi.h (GPL-2.0 OR MIT) for the MRQ
+# shapes, tegra234 dt-bindings for the expected ids, open-gpu-kernel-modules (MIT) for PMC_BOOT_0. Default
+# OFF => the tail + call site vanish, no panic `Location` moves (the call is appended to an existing line),
+# and the knob-off images are byte-identical to baseline (measured: sha256 of kernel8.img before/after).
+# The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe2` leg of KERNEL_CFG_MATRIX in `arroyo`.
+# Witness family on the wire: `[ga10bprobe2]`.
+ga10bprobe2 = ["tegra"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

@@ -867,6 +867,18 @@ _feats=""
 # kernel.elf`). The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe1` leg of
 # KERNEL_CFG_MATRIX, not by this mapping. Witness family on the wire: `[ga10bprobe1]`.
 [ -n "${UNAOS_GA10B_PROBE1:-}" ] && _feats="${_feats}ga10bprobe1,"
+# GA10B-PROBE2 (GA10BPROBE2): UNAOS_GA10B_PROBE2=1 arms rung 2 of the GA10B ladder
+# (docs/dev/evidence/orin14/GA10B-LADDER.md) — `arch/aarch64/ga10b_probe.rs::ga10bprobe2_run`, an appended
+# statement in `tegra_early_stop`'s BPMP block placed BEFORE rung 1's call. One attended FULL-BOOT flight
+# (it RETURNS; no SYSTEM_OFF): BPMP MRQ_PG pre-state -> SET_STATE ON only if off -> explicit readback ->
+# MRQ_CLK census + ENABLE of the gpu@ node's DTB clocks -> ONE BAR0 read (NV_PMC_BOOT_0) behind the
+# readback of ON -> symmetric restore. Still zero GA10B MMIO writes. A SIBLING of ga10bprobe1 (whose run
+# is `-> !`): the rung-2 flight arms THIS knob ALONE — `UNAOS_GA10B_PROBE2=1 ./arroyo esp-jetson`, without
+# UNAOS_GA10B_PROBE1 (co-armed is a supported BUILD: rung 2, then rung 1's power-off). IMPLIES `tegra`.
+# Default OFF => the tail + call site vanish, no panic Location moves, knob-off images byte-identical to
+# baseline. The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe2` leg of KERNEL_CFG_MATRIX,
+# not by this mapping. Witness family on the wire: `[ga10bprobe2]`.
+[ -n "${UNAOS_GA10B_PROBE2:-}" ] && _feats="${_feats}ga10bprobe2,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -3451,6 +3463,18 @@ KERNEL_CFG_MATRIX=(
   # items, under `src/arch/aarch64/`) and the derived mix-leg count is unchanged. Board legs +1; gate
   # +1. `./arroyo check` prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-ga10bprobe1 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe1"
+
+  # GA10B-PROBE2 armed (appended 2026-09-06) — `ga10bprobe2` gates the rung-2 tail of `ga10b_probe.rs`
+  # and its one appended call site in `tegra_early_stop`; the module itself is gated on EITHER probe knob.
+  # The ga10bprobe1 leg's shape, copied: `arm-tegra`'s list verbatim + `ga10bprobe2` ALONE — the flight
+  # polarity (rung 2 without rung 1's SYSTEM_OFF), which is also the polarity that compiles the module
+  # with every rung-1-only item cfg-erased (the dead-code trap a co-armed leg would hide). The co-armed
+  # polarity (both knobs) is compiled by the arc's esp-jetson gate command, not by a leg. There is no
+  # `not(feature = "ga10bprobe2")` site in src/, so no disarmed asymmetry is created. UNIVERSE SIDE
+  # EFFECT: none that moves a mix count (a NEW `[features]` entry named only on this arm-* leg; its sites
+  # are all inside `feature = "tegra"` items under `src/arch/aarch64/` and the one main.rs site is inside
+  # the tegra region). Board legs +1; gate +1 — read the live counts from `./arroyo check`.
+  "arm-tegra-ga10bprobe2 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe2"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
