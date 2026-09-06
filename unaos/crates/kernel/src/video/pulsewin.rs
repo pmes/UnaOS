@@ -507,7 +507,7 @@ pub fn open() -> wm::WinId {
 /// to close itself. This is the only place that happens for this window, and it is reached from the
 /// close disc the compositor already draws on the title bar — no second control, no second rule.
 pub fn close() -> bool {
-    let id = WIN.swap(wm::WIN_NONE, Ordering::AcqRel);
+    ARMED.store(false, Ordering::Release); let id = WIN.swap(wm::WIN_NONE, Ordering::AcqRel); // A30FIX — DISARM **BEFORE** THE SWAP. A30 disarmed one statement after `wm::close`, and render8 measured that as one statement too late: from the instant `WIN` reads `WIN_NONE` with `ARMED` still set, `service`'s open arm on the RENDER core is free to mint a fresh window, and `wm::close` holds this core inside exactly that window (it runs a drain barrier that spins on in-flight composites and then composites itself). Wire, close disc: `[wm] close win=3 gen=1` (6177) -> `[wm] alloc win=3 gen=2` (6180) -> `[wc-a] create win=3` (6181) -> only THEN `[pulsewin] close … CLOSED` (6185) and `[pulsewin] open win=3` (6187); same shape at 6467->6477. The stray window is not the worst of it: the teardown below then ran against the NEW window's cells (`SURF`=0, `SURF_W/H`=0, `STORE`=None), which is why the operator's second click on the disc was needed. Disarmed here, the swap publishes a window-less state that is ALREADY un-armed, so no pass between here and the witness can re-mint. ⚠ FOLDED onto this line rather than added above it: knob-off line numbers are load-bearing (panic `Location`), PARITY.md §5.3.
     if id == wm::WIN_NONE {
         return false;
     }
@@ -519,14 +519,14 @@ pub fn close() -> bool {
     // Order matters: the row goes first, so the compositor can no longer read the surface, and only
     // then is the store dropped. The reverse would leave one composite pass reading freed memory.
     wm::close(id);
-    ARMED.store(false, Ordering::Release); SURF.store(0, Ordering::Release); // A30 — DISARM FIRST, and disarm HERE. `service`'s open arm fires on `ARMED && ncpu > 0` every pass, so a close that leaves the latch set is not a close: render7 shut this window twice from its own close disc and the very next render pass re-opened it five lines later (6923->6932, 10519->10528), which is also why A18's cascade census read `pulsewin_open=3` for ONE window. The latch means "the desktop wants this window", and a user close is the operator saying it does not; only `arm()` says it does again, and after this the sole caller that can say so post-boot is the dock's pinned tile. Store `false` before the surface teardown so no pass can observe a window-less ARMED state. ⚠ FOLDED onto this line rather than added below it: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
+    SURF.store(0, Ordering::Release); // A30 — the DISARM that used to lead this line has moved to the head of this fn (A30FIX; see there for the render8 wire that convicted this position). What A30 established stands and is why the latch is cleared at all: `service`'s open arm fires on `ARMED && ncpu > 0` every pass, so a close that leaves the latch set is not a close — render7 shut this window twice from its own close disc and the very next render pass re-opened it five lines later (6923->6932, 10519->10528), which is also why A18's cascade census read `pulsewin_open=3` for ONE window. The latch means "the desktop wants this window", and a user close is the operator saying it does not; only `arm()` says it does again, and post-boot the sole caller that can say so is the dock's pinned tile. The surface pointer stays HERE, after the row is gone, so no composite can read it. ⚠ FOLDED onto this line rather than added below it: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
     SURF_W.store(0, Ordering::Relaxed);
     SURF_H.store(0, Ordering::Relaxed);
-    *STORE.lock() = None;
+    *STORE.lock() = None; let sealed = (WIN.load(Ordering::Acquire) == wm::WIN_NONE && !ARMED.load(Ordering::Acquire)) as u32; // A30FIX — the witness value, and it is FALSIFIABLE rather than a constant `1` printed because the source says so. It re-reads both cells AFTER the whole teardown: `sealed=1` says this close ended with no window and no latch, which is the property the disarm-before-swap above buys; `sealed=0` is the exact regression render8 caught (a pass re-minted `WIN`, or something re-armed, while this fn was inside `wm::close`'s drain barrier) and it prints on the same line instead of being reconstructed from an `alloc`/`CLOSED` interleave in the wire. ⚠ FOLDED onto this line rather than added below it — PARITY.md §5.3.
     serial_println!(
-        "[pulsewin] close win={} -> CLOSED (reopen only via dock) switches={} (surface freed; menu cleared from the bar; the desktop LED band is untouched; A30 — the ARMED latch is cleared, so no render pass re-opens this window)",
+        "[pulsewin] close win={} -> CLOSED (reopen only via dock) switches={} latch_cleared_before_close={} (surface freed; menu cleared from the bar; the desktop LED band is untouched; A30FIX — the ARMED latch is cleared BEFORE the wm close, so no render pass can re-mint this window mid-close)",
         id,
-        SWITCHES.load(Ordering::Relaxed)
+        SWITCHES.load(Ordering::Relaxed), sealed
     );
     true
 }

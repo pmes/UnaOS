@@ -24835,7 +24835,7 @@ pub fn deadman_damage_sample() -> Option<(u32, u32)> {
 // | cell                         | cleared by                               | reached by the close disc?          |
 // |------------------------------|------------------------------------------|-------------------------------------|
 // | `fbcon::CONSOLE_WIN`         | `fbcon::panel_console_window_closed(id)` | YES — `wc_close_furniture` calls it |
-// | `pulsewin::WIN`              | `pulsewin::close()`                      | only via `pulsewin::press_route`    |
+// | `pulsewin::WIN`              | `pulsewin::close()`                      | press_route + winmenu Quit (A30FIX) |
 // | `quarry::live::WIN`          | `quarry::close()`                        | only via `quarry::press_route`      |
 // | `instgui::WIN`               | `instgui::close()`                       | only via its own path               |
 // | `display_tegra::ORINWM1_WIN` | NOTHING — never cleared at all           | YES, and it is the idempotence latch|

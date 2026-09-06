@@ -1312,15 +1312,15 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 /// (`arch/x86_64/syscall.rs::wc_click_route_at`, `video/quarry/live.rs::press_route`) — and the
 /// dropdown was already dismissed before this runs, so no menu state is live across the barrier.
 ///
-/// `Quit` takes the CLOSE BOX'S path, `wm::close(id)`, so the ruling's *"closes the window / ends the
-/// tenant"* means exactly what the red disc means and emits the same `[wc-a] close win=` witness. The
-/// registry is released first: a tree left behind would keep [`LIVE`] up and make `bar_boxes` lay out
-/// titles for a row that no longer exists.
+/// `Quit` takes the CLOSE BOX'S path, so the ruling's *"closes the window / ends the tenant"* means exactly what the red disc means and emits the same `[wc-a] close win=` witness. The registry is
+/// released first: a tree left behind would keep [`LIVE`] up and make `bar_boxes` lay out titles for a row that no longer exists. A30FIX — "the close box's path" is now read LITERALLY: for a window whose
+/// OWNING MODULE has its own `close()` (the pulse instrument is the one such window today), that module's close IS the close box's path and a bare `wm::close` is not it. Bare, this arm left `pulsewin::ARMED` set while A29's WINID holder registry cleared `pulsewin::WIN` from inside `wm::close` — a window-less ARMED state published by the close itself — and the next render pass re-minted the window. Wire, render8: `[wm] close win=3 gen=5 … holders-cleared=1 names=pulsewin` (7296) -> `[wm] alloc win=3 gen=6` (7299) -> `[wc-a] create` (7300) -> `[winmenu] app-menu quit win=3 closed=true` (7303) -> `[pulsewin] open win=3` (7305); again at 7405->7418 and 7499->7511. That is Peter's *"menu quit does not quit pulse"*, and it leaked the surface every time as well: the
+/// registry clears an id cell, it cannot free a `Vec`. ⚠ this block is line-NEUTRAL — the A30FIX prose was folded into the four lines that were already here, because `winmenu.rs` is a bare `pub mod` and IS compiled into the knob-off `kernel8.img`, where a doc line added above `app_pick` moves every `panic::Location` below it — PARITY.md §5.3.
 fn app_pick(win: wm::WinId, id: u32) {
     match id {
         APP_ITEM_QUIT => {
-            clear(win);
-            let closed = wm::close(win);
+            clear(win); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let closed = (crate::video::pulsewin::win() == win && crate::video::pulsewin::close()) || wm::close(win); // A30FIX — see this fn's header. The OWNING MODULE's close runs first when this is its window: `pulsewin::close()` disarms the latch BEFORE it swaps the id, then does the same `winmenu::clear` + `wm::close` + surface teardown the red disc does, so Quit and the disc are now ONE path emitting one witness pair. `||` short-circuits, so `wm::close` is not called twice; a non-pulse window (and every window on a desktop that never armed the instrument, where `win()` is `WIN_NONE` and no real id can equal it) takes the right-hand side exactly as before.
+            #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] let closed = wm::close(win); // A30FIX — the KNOB-OFF twin, and the reason the arm above is a whole `let` rather than a folded sub-expression. The gate is `video/mod.rs`'s own predicate on `pub mod pulsewin`; `winmenu.rs` is a bare `pub mod` and IS compiled into the knob-off `kernel8.img`, where that module does not exist. This line is token-for-token the statement that stood here before the arc, so the knob-off image gets not one changed byte — not an inference about what LLVM folds. ⚠ Both arms are FOLDED onto lines that already existed: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
             serial_println!("[winmenu] app-menu quit win={} closed={}", win, closed);
         }
         APP_ITEM_ABOUT => {
