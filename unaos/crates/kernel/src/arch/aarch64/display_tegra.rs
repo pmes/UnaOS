@@ -1481,7 +1481,7 @@ pub fn orin_click_census(tick: u64) {
     if tick.wrapping_sub(CLK_CENSUS_TICK.load(Ordering::Relaxed)) < CLK_CENSUS_PERIOD {
         return;
     }
-    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed);
+    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed); let ptrarms = ptrpoll_witness(tick); // CLICKDEAD — the `[ptrpoll]` line, on THIS census pass and no new cadence of its own. Returns the pointer-pipeline arm balance so the census line below can carry it as `reports=`. ⚠ LINE-NEUTRAL fold: the body lives at the FILE TAIL (nothing follows it), so no line in this file moves and the knob-off image's panic-`Location` byte-identity is untouched.
     let seq = CLK_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
 
     let btn = CLK_BTN.load(Ordering::Relaxed);
@@ -1515,9 +1515,9 @@ pub fn orin_click_census(tick: u64) {
 
     let up = if freq == 0 { 0 } else { now.wrapping_sub(CLK_T0.load(Ordering::Relaxed)) / freq };
     serial_println!(
-        "[orinclick] census seq={} t={} up={}s btn={} press={} rel={} noedge={} raised={} same={} miss={} consumed={} stuck={} nogeom={} dropped={} rows={} compat={} focus={:#x} -> {}",
+        "[orinclick] census seq={} t={} up={}s btn={} press={} rel={} noedge={} raised={} same={} miss={} consumed={} stuck={} nogeom={} dropped={} rows={} compat={} focus={:#x} reports={} -> {}",
         seq, tick, up, btn, press, rel, noedge, raised, same, miss, consumed, stuck,
-        nogeom, dropped, rows, compat as u8, sc::user_input_active(), verdict
+        nogeom, dropped, rows, compat as u8, sc::user_input_active(), ptrarms, verdict
     );
 }
 
@@ -5277,4 +5277,118 @@ pub fn orin_drag_edge() {
         DRG_WIN.store(wm::WIN_NONE, Relaxed);
         drg_end_report(seen, "release");
     }
+// CLICKDEAD — WHO RE-ARMS THE POINTER INTERRUPT-IN READ, AND DID IT? `orinclick`, FILE TAIL.
+// =================================================================================================
+//
+// THE METAL FACT THIS ANSWERS. On render6 (`docs/dev/evidence/orin15/render6-boot1.log`) the
+// `orinclick` census read `btn=0 press=0 rel=0 -> IDLE-NO-CLICKS` for 477 s with Peter's hand on
+// the mouse, `[cursor3]` read `offers=0 taken=0`, and the shared driver's own pointer witness
+// (`drivers/xhci/mod.rs:4774`, an UNGATED `serial_println!`) printed `:: MOUSE-1: 1 reports ::`
+// ONCE, at enumeration, and never again. That witness fires at `n == 1 || n % 32 == 0` on a counter
+// bumped at `mod.rs:4772-4773` — INSIDE the driver, BEFORE `pal::push_pointer_report` and therefore
+// before every consumer this file, `wc_click_route` and the cursor path contain. So the whole
+// consumer half is exonerated by that one line: fewer than 32 pointer reports were DECODED in ten
+// minutes. The control, render4 (same devices, same hub, `orinclick` absent), decoded 1536+ and
+// printed `JD20 — pointer live` and 24 `pointer BUTTON` lines. The pipeline, not the routing.
+//
+// WHAT THE WIRE COULD NOT SAY, AND WHY THIS EXISTS. The driver already accounts for every re-arm:
+// `MOUSE_REARM_COUNT` (every `queue_mouse_read`), `MOUSE_DISCARD_REARM_COUNT` (the dup-Success
+// guard's pipeline-preserving exit) and `MOUSE_ERROR_REARM_COUNT` (non-halting error re-arms) are
+// `pub` and bumped UNCONDITIONALLY (`mod.rs:2373-2386`). Only their PRINT is knob-gated —
+// `piusb39_witness` is `#[cfg(feature = "usbdebug")]` (`mod.rs:14730-14746`), and `usbdebug` is not
+// in the jetson flight recipe. render6 therefore carried the answer in three atomics nothing read.
+// This reads them. No new accounting, no change to the shared driver, no lock, no MMIO: three
+// relaxed loads on the census pass that was already going to print.
+//
+// HOW TO SCORE THE NEXT BOOT.
+//   * `reports=` on the census line is `rearm - discard - errrearm` = the arms that followed a
+//     DECODED report, PLUS one enumeration arm per pointer that enumerated (`mod.rs:4310`). On this
+//     board two pointers enumerate (the relative boot-mouse on slot 4 and the absolute pointer on
+//     the keyboard composite, slot 5), so `reports=2` means ZERO decoded reports since boot and
+//     `reports=2+k` means k of them. render6's value would have been 2.
+//   * `[ptrpoll] ... -> ARMED-NO-COMPLETION` is the render6 shape: the read was armed and the
+//     controller posted no further transfer event for the pointer DCI. That leaves exactly two
+//     live mechanisms, and they are separated by `docs/dev/evidence/orin15/CLICKDEAD-xhci.patch`
+//     (rmbp's lane, delivered as a patch, not committed): the dup-Success guard's `param ==
+//     mouse_prev_phys` arm (`mod.rs:4594`) is the ONE branch in the driver that consumes a pointer
+//     completion, does not re-arm, and — on a build without `usbdebug` — prints nothing. The patch
+//     gives that arm a counter so `dup=` tells a discarded completion apart from no completion.
+//   * `-> GUARD-REARM` / `-> ERROR-REARM` name the two churn shapes instead: completions ARE
+//     arriving and the guard or the error path is re-arming them. `-> STREAMING` is health.
+//
+// WHY THE HALT PATH IS NOT THE ANSWER HERE, AND IS STILL A HOLE. A halting completion (codes
+// 2/3/4/5/6) does not re-arm at dispatch; it is queued to `hid_halt_pending` (`mod.rs:4231-4234`)
+// and drained only by `service_hid_halts`, reachable only through `service_hid_setproto`
+// (`mod.rs:12874`). The tegra post-drop pumps call `poll_events()` and NOTHING else, deliberately —
+// `xusb_tegra.rs:1924-1926` records why: the `service_*` pumps' bounded waits ride `crate::hlt()`,
+// which after the drop has no wake source and parks the core. So on tegra a halted HID interrupt-IN
+// endpoint is unrecoverable for the rest of the boot. It is NOT what killed render6's pointer:
+// `hid_error_witness` (`mod.rs:14748-14768`) is explicitly UNGATED and the log carries zero
+// `xHCI: pointer interrupt-IN error` lines. Recorded, not convicted — see CLICKDEAD.md.
+//
+// DEFAULT OFF. Every item below is `#[cfg(feature = "orinclick")]` and sits at the END of the file,
+// after the last pre-existing line, so knob-off nothing here compiles and NO line in this file
+// moves — panic `Location` records embed line numbers and the knob-off jetson image's
+// byte-identity is this track's standing proof.
+
+/// CLICKDEAD — the last `MOUSE_REARM_COUNT` this witness printed, so a frozen pipeline costs one
+/// line and a live one prints at the census cadence. `u64::MAX` = never printed.
+#[cfg(feature = "orinclick")]
+static PTRPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// CLICKDEAD — the `rearm - discard - errrearm` balance the FIRST census pass saw, i.e. the
+/// enumeration arms. `reports=` minus this is the decoded-report count since the census armed.
+#[cfg(feature = "orinclick")]
+static PTRPOLL_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// CLICKDEAD — read the shared driver's three ungated pointer-pipeline counters and, when they
+/// moved (and once at the start, so a frozen pipeline is still timestamped), print `[ptrpoll]`.
+///
+/// Returns `rearm - discard - errrearm` for the caller's `reports=` census field, so the two lines
+/// cannot disagree: both come from the same three loads.
+///
+/// The token is `[ptrpoll]`, nine bytes — deliberately longer than eight so it cannot be folded
+/// into an LLVM immediate and must appear in `.rodata`, which is what makes `grep -a` on the
+/// artifact a reachability proof rather than a compile proof.
+///
+/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — three
+/// `Relaxed` loads and two `Relaxed` swaps. The census comment's rule (never add lock traffic to
+/// the path whose death this reports) holds by construction.
+#[cfg(feature = "orinclick")]
+fn ptrpoll_witness(tick: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let rearm = crate::drivers::xhci::MOUSE_REARM_COUNT.load(Ordering::Relaxed);
+    let disc = crate::drivers::xhci::MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
+    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed);
+    // Saturating: the three counters are read one at a time and a completion can land between the
+    // loads, so the arithmetic is only ordered in the limit. A one-off underflow would print
+    // `reports=0` and read as "worse than dead"; saturation makes it read as "not yet counted".
+    let reports = rearm.saturating_sub(disc).saturating_sub(err);
+    let base = PTRPOLL_BASE.load(Ordering::Relaxed);
+    let first = base == u64::MAX;
+    if first {
+        PTRPOLL_BASE.store(reports, Ordering::Relaxed);
+    }
+    let last = PTRPOLL_LAST.swap(rearm, Ordering::Relaxed);
+    if !first && last == rearm {
+        return reports; // nothing moved since the last census — one line already said so.
+    }
+    let decoded = reports.saturating_sub(if first { reports } else { base });
+    let verdict = if decoded != 0 {
+        "STREAMING (the pointer read is completing and re-arming; a dead click above this line is a ROUTING fault, not a pipeline one)"
+    } else if disc != 0 {
+        "GUARD-REARM (completions ARE arriving but their TRB does not match the armed read; the dup-Success guard is re-arming them and no report is decoding — mod.rs:4586)"
+    } else if err != 0 {
+        "ERROR-REARM (non-halting error completions on the pointer endpoint; the read is being re-armed off the error path — mod.rs:4238)"
+    } else if first {
+        "BASELINE (the enumeration arms; every later line is measured against this one)"
+    } else {
+        "ARMED-NO-COMPLETION (the read is armed and the controller has posted no transfer event for the pointer DCI since the last line; apply CLICKDEAD-xhci.patch for the `dup=` field that tells a silently discarded completion from no completion at all)"
+    };
+    serial_println!(
+        "[ptrpoll] t={} rearm={} discard={} errrearm={} reports={} base={} decoded={} -> {}",
+        tick, rearm, disc, err, reports,
+        if first { reports } else { base }, decoded, verdict
+    );
+    reports
 }
