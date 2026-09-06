@@ -117,6 +117,11 @@ grep, and `panic::Location` means line-neutral or tail-append only (memory
   when the debris lands in a column the gate validates; B62's landed in the last cell and passed OK.
   One line: assert each data row's field count equals its header's, and name both counts. The
   mutation proof already exists in git history, so this is the cheapest gate in the queue.
+- **B64 — GATE-K8REACH's blind sibling class.** The gate builds its universe from `arroyo`'s
+  `_feats` lines, so a knob delivered by `option_env!` rather than by a cargo feature is not
+  enumerated at all and can never be reported unregistered. `UNAOS_FBW`, `UNAOS_FBH` and
+  `UNAOS_DMAWIN` are outside it today, and `UNAOS_DMAWIN` is armed by no `arroyo` command at all.
+  One pass: enumerate `option_env!` reads from source as a second universe and rule each one.
 - Standing rule for every one of these: a check that cannot fire is not a check — printing is not
   gating, and a zero-hit result indicts the pattern (memory `a-check-that-cannot-fire`). Prove each
   gate by mutation, at the sha it will run on (memory `verification-comes-from-execution`).
