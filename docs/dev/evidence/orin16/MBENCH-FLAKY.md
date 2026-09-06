@@ -38,3 +38,17 @@ Failure signatures (verbatim, first hit per failing run; the same lines appear o
 ```
 
 Reading: the hits are the desktop's own cache/RAM verify (`[wc-d] verify … bad_cache=N bad_ram=N`) and the glyph race witness (`[wc-g] … RACE-PRESENT`), on the unpatched baseline as often as on the patched tree; WINID2 touches wcg.rs only and cannot reach either. Hypothesis: host load changes QEMU timing enough to trip these two witnesses. Status: flaky-under-load, NOT ruled out; a quiet-box re-run is owed before the landing (LAWS: failed under conditions, code kept). The seat's wave-2 run (gates-99c153ca, one executor building) passed 119/119.
+
+## Discriminators (pi 7's questions, run on the failing captures 2026-09-06)
+
+| run | REQUIRE count | truncated? | `[wc-d] verify` bad_cache / bad_ram | `[wc-g] RACE-PRESENT` |
+|---|---|---|---|---|
+| k8t-baseline-1 | 118/119 | one REQUIRE missing (the only shortfall) | 145 / 83 (×4), then 0/0 | 0 |
+| k8t-baseline-2 | 119/119 | no | 91 / 91 (×4), then 0/0 | 0 |
+| k8t-baseline-4 | 119/119 | no | 0 / 0 | 2 |
+| k8t-final-1 | 119/119 | no | 867 / 867 (×4), then 0/0 | 0 |
+| k8t-final-2 | 119/119 | no | 91 / 91 (×4), then 0/0 | 0 |
+| k8t-patched-2 | 119/119 | no | 6816 / 6816 (×4), then 0/0 | 2 |
+| k8t-baseline-3 (PASS) | 119/119 | no | 0 / 0 | 0 |
+
+Reading: (1) NOT pi's truncation family — five of six failing runs carry every REQUIRE line and reach the tail; the hits are content-bearing events from detectors that fired. (2) NOT the `wm.rs:4131` non-atomic read-back shape either — that instance is `bad_cache=0 bad_ram=144` (asymmetric); here `bad_cache == bad_ram` in four of five `[wc-d]` failures (91/91, 867/867, 6816/6816) and near-equal in the fifth (145/83), i.e. BOTH read-back passes disagree with the expected content by the same count, which reads as the expected region itself having changed under the verifier (a legitimate concurrent repaint landing before both reads, or a real intermittent race) — the window is load-widened either way. Three hypotheses stay open: host-load timing (QEMU), a non-atomic verify window hit by a legitimate write, a real race. The quiet-box run separates the first from the other two; the equal-counter signature separates this from `wm.rs:4131`. pi 7's spec asserts the same lines (`pi4-regression.spec:576-577`, `:952-954`), so this is a shared row (SO7), not an Orin one.
