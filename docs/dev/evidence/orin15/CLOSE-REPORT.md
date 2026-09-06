@@ -45,3 +45,5 @@ DRAGDEAD `4dc88314` (+ A27 tick `7580018e`) · QUARRY `f36cb82f` (+ A8 tick in `
 `563a5717` (`MENUBAR-WINMENU.patch` to rmbp 12; pi 7 asked for the C ack; LEDGER S32). CONSOLEQUIET still running.
 MENUBAR video commit `adb3b1cd` (the granted patch applied; ten files, 1403+/266−; union gate check + test-arm +
 `UNAOS_WC=1 test 150` running at write time — logs `~/unaos-bench/scratch/orin15/{check,testarm,testwc}-adb3b1cd.log`).
+CONSOLEQUIET docs `9e030696` (`CONSOLEQUIET.patch` for fbcon.rs to rmbp 12; row A26; the x86 image byte-identical, the
+Pi panic-on-glass leg demonstrated). fbcon.rs commit waits on rmbp's read.
