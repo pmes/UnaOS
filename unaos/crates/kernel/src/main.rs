@@ -8590,7 +8590,7 @@ fn tegra_desk_cascade() -> bool {
     }
 
     serial_println!(
-        "[deskcascade] arming cascade panel={}x{}x{} stage={} table={} route={} conwin={} furn={} render={} witness={} (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the [u7stk] boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for)",
+        "[deskcascade] arming cascade panel={}x{}x{} stage={} table={} route={} conwin={} furn={} render={} witness={} (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the u7stk-tagged boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for — A38: named, not reproduced)",
         pw, ph, info.bytes_per_pixel, staged, live,
         if fbcon::console_is_routed() { "ROUTED" } else { "UNROUTED" },
         cfg!(feature = "orinconwin") as u8,
@@ -8610,7 +8610,7 @@ fn tegra_desk_cascade() -> bool {
     let bar = menubar::enabled();
     if !bar {
         serial_println!(
-            "[deskcascade] REFUSE reason=activate-declined windows={} activate={} route={} bar=0 (the bar is the cascade's one unconditional step and it reads disabled — activate's own [pidesk] lines above name the decline)",
+            "[deskcascade] REFUSE reason=activate-declined windows={} activate={} route={} bar=0 (the bar is the cascade's one unconditional step and it reads disabled — activate's own pidesk-tagged lines above name the decline — A38: named, not reproduced)",
             windows, activated, if routed { "ROUTED" } else { "UNROUTED" }
         );
         return false;
@@ -8940,7 +8940,7 @@ fn tegra_quarry_seat() {
         quarry::request_open();
     }
     serial_println!(
-        "[deskquarry] seat compiled={} open={} windows={} relatched={} (QUARRY-ORIN A8 — desktop_firmware::activate() step 6 opens the file manager behind `feature = \"quarry\"`; compiled=0 is the whole of why render6 printed no [quarry] line and its dock read tile=2/3. compiled=1 open=1 => the `[quarry] open win=… volumes=… tree-rows=… cwd=…` line above IS the window and the dock gains a pinned `quarry` tile at slot 0. compiled=1 open=0 => open() DECLINED and named its reason above; the request is re-latched and tegra_render_arm's pass drains it)",
+        "[deskquarry] seat compiled={} open={} windows={} relatched={} (QUARRY-ORIN A8 — desktop_firmware::activate() step 6 opens the file manager behind `feature = \"quarry\"`; compiled=0 is the whole of why render6 printed no quarry-tagged line at all and its dock read tile=2/3. compiled=1 open=1 => the quarry module's own open witness above — its tag, then win/volumes/tree-rows/cwd — IS the window, and the dock gains a pinned quarry tile at slot 0. compiled=1 open=0 => open() DECLINED and named its reason above; the request is re-latched and tegra_render_arm's pass drains it. A38: this prose NAMES other witnesses, it never reproduces their tokens — a witness line that quotes another witness verbatim inflates every count taken over it)",
         compiled as u8,
         open as u8,
         wm::count(),

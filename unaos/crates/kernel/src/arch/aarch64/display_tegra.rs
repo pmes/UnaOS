@@ -5249,6 +5249,9 @@ pub fn orin_drag_steer(pw: i32, ph: i32) {
             cfg!(feature = "desktop_firmware") as u8
         );
     }
+    // SO5 — the pointer-sprite size witness rides this seam and NOT the drag path below it, so it is
+    // taken above the `WIN_NONE` return: the defect is about a pointer that is not dragging anything.
+    sprite_size_witness(pw, ph);
     if live == wm::WIN_NONE {
         return;
     }
@@ -5261,6 +5264,114 @@ pub fn orin_drag_steer(pw: i32, ph: i32) {
     if wm::drag_motion_paced(x, y) {
         DRG_APPLIED.fetch_add(1, Relaxed);
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// SO5 — the pointer sprite's size, and the transition that changes it
+// ------------------------------------------------------------------------------------------------
+//
+// PETER, render7 2026-09-06: *"mouse cursor grows when over desktop background"*. It does, and it is
+// not an illusion of contrast: there are TWO arrow sprites on this board and they are drawn at two
+// different block scales.
+//
+//   * `video::cursor`, the COMPOSITOR sprite, front-buffer, save-under its own:
+//     `side = (ui::BASE_CELL + 1) * Metrics::for_height(panel_h).scale` — 9·s px.
+//   * `pal::cursor`, the BACK-BUFFER sprite: `sprite_scale = metrics().scale + 1`, extent `9·(s+1)`.
+//
+// `pal::cursor::SPRITE_OWNS_PAINT` is `cfg!(target_arch = "x86_64")`, and its stated premise is that
+// "the two never coexist on a panel". On x86 that holds — `draw`/`draw_over`/`repaint_on_move` hand
+// off to `video::cursor` and `paint()` never runs. On aarch64 the constant is FALSE, so `paint()`
+// does run and BOTH sprites are live on the same panel at once. On the Orin's 1920x1200 panel
+// `Metrics::for_height(1200).scale == 1200/900 == 1`, so the pair is 9x9 and 18x18: exactly 2x.
+//
+// WHICH ONE THE OPERATOR SEES is decided by the desktop present's occluder subtraction
+// (`video::screen::present_background` -> `next_visible_span`). Over the BACKDROP the pointer's spans
+// are covered by no window box, so the back buffer — carrying the 18 px arrow — reaches glass. Over a
+// WINDOW those spans are subtracted, the 18 px arrow never lands, and the only arrow on the panel is
+// the compositor's 9 px repaint. Cross a window edge and the size toggles. Nothing grows; a bigger
+// sprite stops being covered.
+//
+// WHY NO CAPTURE HAS EVER SHOWN IT: no witness anywhere prints the sprite's scale. `[cursor12]`'s
+// `scope=desktop adm=baseline` / `scope=live adm=window` pair looked like the nearest proxy and is
+// not one — `scope` is a print-trigger label threaded from the caller and `adm` is derived inside the
+// printer from its own counters (`passes == cum` => "baseline"). Neither reaches any draw code and
+// neither can change a sprite's size. This is that missing token.
+//
+// THE FIX IS NOT HERE. The divergence is the `+ 1` in `pal::cursor::sprite_scale` (`pal.rs`), a
+// SHARED KERNEL-CORE file in the rmbp seat's lane; the structural alternative is making
+// `SPRITE_OWNS_PAINT` true on aarch64 and retiring the back-buffer sprite, which is the CURSOR-13
+// ownership arc and drags this pump's save-under bracket with it. Both are filed for grant in
+// `DESKFIX-video.patch`. What this seat owns is the MEASUREMENT, and it is written so the fix is
+// scored by it rather than argued: when the two sizes agree the line reads `same=1`.
+//
+// COST. One call per pointer FRAME (not per report — the pump has already coalesced), and on a frame
+// with no transition it is one `hit_test` and two relaxed loads. Capped at 8 printed transitions, so
+// a boot with an operator wiggling the mouse cannot flood the wire the gates are counted from.
+
+/// SO5 — the last hit target the sprite witness saw. 0 = nothing yet, 1 = window, 2 = desktop.
+#[cfg(feature = "orinclick")]
+static SPR_OVER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// SO5 — transitions printed so far, capped at [`SPR_LOG_MAX`].
+#[cfg(feature = "orinclick")]
+static SPR_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// SO5 — the print cap. Eight is enough to show both directions several times over.
+#[cfg(feature = "orinclick")]
+const SPR_LOG_MAX: u32 = 8;
+
+/// **SO5 — print the pointer sprite's size on each window/desktop transition.** See this section's
+/// header for why the size differs at all.
+///
+/// Gated with its only caller, [`orin_drag_steer`], and carrying its own `use`s for the same reason
+/// that one does: this file's top level imports neither `wm` nor `Ordering`.
+#[cfg(feature = "orinclick")]
+fn sprite_size_witness(pw: i32, ph: i32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::video::wm;
+    if pw <= 0 || ph <= 0 {
+        return;
+    }
+    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    // The hot spot IS the sprite's top-left pixel (`video::cursor::draw_locked`'s stated rule), so the
+    // hit test asks about exactly the pixel the arrow's tip is on — the same pixel `click1_dispatch`
+    // routes with. Anything else would report a target the operator's click would not agree with.
+    let over_window = wm::hit_test(x, y).is_some();
+    let now = if over_window { 1 } else { 2 };
+    // Only an EDGE prints. `swap` rather than load+store: two pointer frames cannot both claim the
+    // same transition and print it twice.
+    if SPR_OVER.swap(now, Relaxed) == now {
+        return;
+    }
+    if SPR_LOGGED.fetch_add(1, Relaxed) >= SPR_LOG_MAX {
+        return;
+    }
+    let s = crate::ui::Metrics::for_height(ph as usize).scale;
+    // The compositor sprite (front buffer) and the PAL sprite (back buffer), each as its own module
+    // computes it — restated here rather than borrowed, because a shared helper would make the two
+    // agree by construction and this witness exists to report whether they DO.
+    let comp = (crate::ui::BASE_CELL + 1) * s;
+    let pal_s = s + 1;
+    let pal_side = 9 * pal_s;
+    // The EFFECTIVE size is the one that survives the present: over the backdrop the back buffer
+    // reaches glass, over a window it is subtracted and only the compositor's arrow is left.
+    let (eff, eff_s) = if over_window { (comp, s) } else { (pal_side, pal_s) };
+    serial_println!(
+        "[sprite] size={}x{} scale={} over={} at ({},{}) panel={}x{} compositor={}x{} backbuffer={}x{} same={} n={}/{} (SO5 — two arrow sprites, two block scales; the present's occluder subtraction picks which reaches glass. same=1 is the fixed state)",
+        eff,
+        eff,
+        eff_s,
+        if over_window { "window" } else { "desktop" },
+        x,
+        y,
+        pw,
+        ph,
+        comp,
+        comp,
+        pal_side,
+        pal_side,
+        (comp == pal_side) as u8,
+        SPR_LOGGED.load(Relaxed).min(SPR_LOG_MAX),
+        SPR_LOG_MAX
+    );
 }
 
 /// **DRAGDEAD — the RELEASE edge's report.** Called at the tail of [`orin_click`] (same-line fold),

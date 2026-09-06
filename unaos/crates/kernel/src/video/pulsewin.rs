@@ -194,8 +194,9 @@ const fn tree_for(v: View) -> &'static [winmenu::MenuTitle] {
 /// the paint path.
 static VIEW: AtomicU32 = AtomicU32::new(0);
 
-/// Has a desktop asked for this window? Set by [`arm`], consumed by [`service`]'s open arm.
-static ARMED: AtomicBool = AtomicBool::new(false);
+/// Has a desktop asked for this window? Set by [`arm`], consumed by [`service`]'s open arm, and
+/// CLEARED by [`close`] — A30: an open arm that outlives the operator's close is not a close.
+static ARMED: AtomicBool = AtomicBool::new(false); static EVER_ARMED: AtomicBool = AtomicBool::new(false); // A30 — the STICKY half of the latch: set by `arm()`, never cleared, and the ONLY question `dock::pin_pulse` asks. It exists so the pinned reopen tile is a no-op on every board that has no pulse window to reopen: `desktop_firmware::activate` is the sole caller of `arm()`, so an x86 `desktop_uefi` desktop leaves this `false` forever and the dock's tile model there is byte-for-byte what it was. ⚠ FOLDED onto this line rather than added below it — knob-off line numbers are load-bearing (panic `Location`), PARITY.md §5.3.
 
 /// Falsifiable counter for the witness: how many picks actually MOVED the view (a pick of the live
 /// view is a dismissal, not a switch).
@@ -248,7 +249,7 @@ pub fn win() -> wm::WinId {
 /// keyboard to the shell rather than to a ring that does not exist, and so an ASID-scoped close sweep
 /// can never reap it by accident) while being its OWN owner, so `close_owner` on either of the other
 /// two cannot take this window with it.
-const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x60;
+pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x60; // A30 — published (was private) so `dock::pin_pulse`'s reopen tile carries THIS window's owner rather than borrowing the desktop's, which is the whole reason the owner is its own: a pin under `KERNEL_OWNER_DESKTOP` would make `pin_shell`'s "one live shell max" test read a pulse tile as a shell. Line-neutral: a visibility keyword, no line added — PARITY.md §5.3.
 
 // ------------------------------------------------------------------------------------------------
 // Geometry — all derived from the panel and the metrics, none guessed
@@ -518,12 +519,12 @@ pub fn close() -> bool {
     // Order matters: the row goes first, so the compositor can no longer read the surface, and only
     // then is the store dropped. The reverse would leave one composite pass reading freed memory.
     wm::close(id);
-    SURF.store(0, Ordering::Release);
+    ARMED.store(false, Ordering::Release); SURF.store(0, Ordering::Release); // A30 — DISARM FIRST, and disarm HERE. `service`'s open arm fires on `ARMED && ncpu > 0` every pass, so a close that leaves the latch set is not a close: render7 shut this window twice from its own close disc and the very next render pass re-opened it five lines later (6923->6932, 10519->10528), which is also why A18's cascade census read `pulsewin_open=3` for ONE window. The latch means "the desktop wants this window", and a user close is the operator saying it does not; only `arm()` says it does again, and after this the sole caller that can say so post-boot is the dock's pinned tile. Store `false` before the surface teardown so no pass can observe a window-less ARMED state. ⚠ FOLDED onto this line rather than added below it: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
     SURF_W.store(0, Ordering::Relaxed);
     SURF_H.store(0, Ordering::Relaxed);
     *STORE.lock() = None;
     serial_println!(
-        "[pulsewin] close win={} switches={} (surface freed; menu cleared from the bar; the desktop LED band is untouched)",
+        "[pulsewin] close win={} -> CLOSED (reopen only via dock) switches={} (surface freed; menu cleared from the bar; the desktop LED band is untouched; A30 — the ARMED latch is cleared, so no render pass re-opens this window)",
         id,
         SWITCHES.load(Ordering::Relaxed)
     );
@@ -620,9 +621,10 @@ pub fn service() {
 
 /// **Ask for the pulse window.** The desktop seam calls this; [`service`] does the opening. See its
 /// open arm for why the two are split. Idempotent, and it does not report a window — there is not one
-/// yet, by construction.
+/// yet, by construction. A30 — post-boot the dock's pinned tile is the only other caller, and that
+/// makes this the single re-entry point a user close can be undone through.
 pub fn arm() {
-    ARMED.store(true, Ordering::Release);
+    ARMED.store(true, Ordering::Release); EVER_ARMED.store(true, Ordering::Release); // A30 — see EVER_ARMED: sticky, so the dock keeps a reopen tile after a close. Folded, not added — PARITY.md §5.3.
 }
 
 /// **The pick sink** — R21. Handed to [`winmenu::publish`] as a bare `fn` pointer and called from the
@@ -814,4 +816,35 @@ pub fn rollup(scope: &str) {
         SURF_W.load(Ordering::Relaxed),
         SURF_H.load(Ordering::Relaxed)
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// A30 — the reopen seam (TAIL-APPENDED: nothing above this line moved, so knob-off panic `Location`
+// line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+
+/// **Has this board's desktop ever asked for the pulse window?** Sticky, and the only question the
+/// dock's pinned reopen tile asks.
+///
+/// A30's fix has two halves and this is the second. [`close`] clears `ARMED`, so a user close is
+/// final against [`service`]'s open arm — the render pass no longer re-opens the window five lines
+/// later, which is what render7 caught twice (close-box win=3, then close, then a fresh open of the
+/// same id) and what made A18's cascade census read three opens for a single window. A close that is
+/// final AND unreachable is a window the operator has LOST, though — the very failure
+/// `dock::pin_shell` and `dock::pin_quarry` exist to prevent — so the dock pins a tile that calls
+/// [`arm`] again.
+///
+/// The stickiness is what keeps that tile off boards that never had the window. `arm()` has exactly
+/// one caller outside the dock, `video::desktop_firmware::activate`, which is the Pi/Orin seam; an
+/// x86 `desktop_uefi` desktop never reaches it, so this stays `false` and `dock::pin_pulse` returns
+/// its input untouched. No `cfg` is needed to say that, and none is used: the answer is a runtime
+/// fact about the desktop that actually came up.
+pub fn ever_armed() -> bool {
+    EVER_ARMED.load(Ordering::Acquire)
+}
+
+/// **Is the pulse window on the panel right now?** The dock's other pin question — a live window has
+/// its own dock-addressable row (kernel owners are), so the pin must not add a second tile for it.
+pub fn is_open() -> bool {
+    WIN.load(Ordering::Acquire) != wm::WIN_NONE
 }
