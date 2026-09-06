@@ -248,7 +248,7 @@ struct FbCon {
     /// the little-endian word `0x00RRGGBB` — precisely the ARGB8888 pixel `wm::draw_window` reads
     /// back. Nothing converts between the two representations; they are the same bytes.
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    win_fb: FrameBuffer,
+    win_fb: FrameBuffer, #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] win_cells: Option<Vec<u8>>, #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] cell_cols: usize, #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] cell_rows: usize, // CONSOLETEXT — the console window's GLYPH CELL STORE and the store's own grid, declared under `win_store`'s exact predicate and beside it because they share its whole lifetime: allocated together in `panel_console_window_open`, retained together across a close, `mem::forget`-dropped together by `panic_screen`. `cell_cols`/`cell_rows` are the STORE's dimensions, NOT the console's — the two coincide while routed and deliberately do not between a panel-grid re-derive and the next mint, which is what makes `cell_put`'s bounds test sound. See the CONSOLETEXT block at this file's tail for the defect (render8: a re-minted console came back exactly black) and for why a copy of the retained PIXELS was the wrong source. ⚠ SAME-LINE fold, line-NEUTRAL: a line added to this file renumbers every panic `Location` below it.
     cols: usize,
     rows: usize,
     /// Live glyph cell size in pixels. `CELL_W`/`CELL_H` (the raw font8x8 cell) everywhere by
@@ -287,7 +287,7 @@ impl FbCon {
             #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
             win_store: None,
             #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-            win_fb: FrameBuffer::new(),
+            win_fb: FrameBuffer::new(), #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] win_cells: None, #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] cell_cols: 0, #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] cell_rows: 0, // CONSOLETEXT — `None`/0 until the first mint, which is what makes a first mint report `from=none` and repaint nothing without needing a latch to tell it from a re-mint. `const fn`-compatible, like every initialiser here. ⚠ SAME-LINE fold, line-NEUTRAL.
             cols: 0,
             rows: 0,
             cell_w: CELL_W,
@@ -421,11 +421,11 @@ impl FbCon {
         let ch = self.cell_h;
         let y = self.row * ch;
         out.push(Op::Fill { y0: y, y1: y + ch });
-        self.mark_rows(y, y + ch);
+        self.mark_rows(y, y + ch); self.cell_blank_row(self.row); // CONSOLETEXT — the cell store mirrors the FILL, not just the glyph: this `Op::Fill` is the wrap-around terminal erasing the row it has just landed on, and a store that recorded only glyphs would keep the previous pass's text on a row the glass shows blank. Empty `#[inline(always)]` twin off the console-window predicate. ⚠ SAME-LINE fold, line-NEUTRAL.
         if next != self.row {
             let ny = next * ch;
             out.push(Op::Fill { y0: ny, y1: ny + ch });
-            self.mark_rows(ny, ny + ch);
+            self.mark_rows(ny, ny + ch); self.cell_blank_row(next); // CONSOLETEXT — and the moving blank MARKER row below the cursor, for the same reason. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
     }
 
@@ -441,7 +441,7 @@ impl FbCon {
                 }
                 let cy = self.row * self.cell_h;
                 out.push(Op::Glyph { ch: b, x: self.col * self.cell_w, y: cy });
-                self.mark_rows(cy, cy + self.cell_h);
+                self.mark_rows(cy, cy + self.cell_h); self.cell_put(self.row, self.col, b); // CONSOLETEXT — THE CHOKE POINT. Every console byte on every path reaches this arm: the classic `write_byte` (and through it `Sink`, `print_masked` and `milestone`) and the split `PanelSink::flush`, on both arches. Recording HERE — beside the `Op::Glyph` it is the record of, and after the wrap `plan_newline` may just have taken — is what makes the store the text the glass actually shows rather than the text somebody asked for. Empty `#[inline(always)]` twin off the console-window predicate. ⚠ SAME-LINE fold, line-NEUTRAL.
                 self.col += 1;
             }
             _ => {} // ignore other control bytes
@@ -1630,7 +1630,7 @@ pub fn clear() {
         if let Some(mut c) = FBCON.try_lock() {
             if c.ready {
                 c.col = 0;
-                c.row = 0;
+                c.row = 0; c.cell_clear(); // CONSOLETEXT — "clear the console" clears the STORE too, on both arms below: the routed arm fills the window surface and the panel arm fills the panel, and either way the screenful the next mint would repaint is gone from the glass and must be gone from the record. Empty `#[inline(always)]` twin off the console-window predicate. ⚠ SAME-LINE fold, line-NEUTRAL.
                 // CONSOLE-WINDOW: "clear the console" means clear the CONSOLE, and while the console
                 // is a window that is its surface — not the panel, which now belongs to the
                 // compositor and holds other windows' pixels. Presented after the lock drops.
@@ -1994,7 +1994,7 @@ pub fn panel_console_window_open() -> wm::WinId {
 
     // Install the route. From the store's move into `FbCon` onwards, every glyph lands in the
     // window's surface.
-    let mut installed = false;
+    let mut installed = false; let mut retained = false; let (rgc, rgr) = ((cw / cell_w).max(1), (ch / cell_h).max(1)); let mut rm = cells_remint(&surf_fb, rgc, rgr, cell_w, cell_h); // CONSOLETEXT — THE REPAINT, placed HERE and not one statement earlier: every decline above this line (`console-not-ready`, `alloc`, `geometry-unavailable`, `create-failed`) returns without a window, and a mint that never happened must not consume the retained text. The one decline BELOW it, `install-contended`, does consume it — it is refusing the window as well, and the retention goes down with the window it refused. `surf_fb` is `create_at`'s row source but nothing is routed at it yet (`CONSOLE_WIN` is stored after the install block), so the whole-screenful repaint runs unmasked and unlocked against a surface no other writer can reach. ⚠ SAME-LINE fold, line-NEUTRAL.
     crate::arch::without_interrupts(|| {
         if let Some(mut c) = FBCON.try_lock() {
             if !c.ready {
@@ -2004,8 +2004,8 @@ pub fn panel_console_window_open() -> wm::WinId {
             c.win_store = Some(core::mem::take(&mut store));
             c.cols = (cw / c.cell_w).max(1);
             c.rows = (ch / c.cell_h).max(1);
-            c.col = 0;
-            c.row = 0;
+            c.col = rm.col; c.win_cells = rm.store.take(); c.cell_cols = rgc; c.cell_rows = rgr; retained = c.win_cells.is_some(); // CONSOLETEXT — adopt the cell store and the CURSOR the repaint hands back. `rm.col`/`rm.row` are `(0, 0)` verbatim whenever nothing was repainted (a first mint, a blank previous screenful, a contended take), so every boot that is not a re-mint homes the cursor exactly as it always did; on a re-mint they are the retained cursor clamped to the new grid, so the next printed line continues where the console left off instead of overwriting its own restored top row. ⚠ SAME-LINE fold, line-NEUTRAL.
+            c.row = rm.row;
             installed = true;
         }
     });
@@ -2038,7 +2038,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         "[wc-x] console-window panic-fallback armed win={} (panic paints the PANEL, not the window)",
         id
     );
-    cascadefit_witness(pw, ph, ox, oy, ow, oh); route_present(); // CASCADEFIT — the fit is MEASURED here, after the row exists and against the box that was actually created, and never asserted: both windows' geometry is a runtime function of the furniture, so `overlap_rows=` is the only honest statement of the rule. ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3).
+    serial_println!("[fbcon] remint win={} repainted_rows={} from={} grid={}x{} was={}x{} cursor={},{} retain={}", id, rm.repainted_rows, if rm.had { "cells" } else { "none" }, rgc, rgr, rm.was.0, rm.was.1, rm.col, rm.row, if retained { "ok" } else { "declined" }); route_present(); cascadefit_witness(pw, ph, ox, oy, ow, oh); route_present(); // CONSOLETEXT — the witness, on EVERY mint and UNGATED (no `witness` knob): this is the one line that separates "the console came back with its text" from "the console came back black", and the second is the defect render8 caught on the glass with nothing on the wire to name it. `from=none repainted_rows=0` is a FIRST mint; `from=cells repainted_rows=<n>` is a re-mint that restored `n` rows; `from=cells repainted_rows=0` is a re-mint whose previous screenful was genuinely blank. `retain` reads `ok` when the store was adopted by the install block — read back from `c.win_cells` inside the install block itself — and `declined` when the allocation was refused, i.e. when the NEXT mint will have nothing to repaint from. Emitted before `route_present` and outside every lock, per this function's standing rule for its two `[wc-x]` lines. ⚠ SAME-LINE fold, line-NEUTRAL. ‖ CASCADEFIT — the fit is MEASURED here, after the row exists and against the box that was actually created, and never asserted: both windows' geometry is a runtime function of the furniture, so `overlap_rows=` is the only honest statement of the rule. ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3).
     id
 }
 
@@ -2134,7 +2134,7 @@ pub fn panic_screen() {
                     if let Some(s) = c.win_store.take() {
                         core::mem::forget(s);
                     }
-                    c.win_fb = FrameBuffer::new();
+                    c.win_fb = FrameBuffer::new(); if let Some(k) = c.win_cells.take() { core::mem::forget(k); } c.cell_cols = 0; c.cell_rows = 0; // CONSOLETEXT — the cell store goes down with the surface it records, by `mem::forget` and for the IDENTICAL reason given two statements up: this is a panic context that may already hold the allocator's lock, and a free here would deadlock a dying machine. Zeroing the store's dims is what keeps `cell_put` from indexing a store that is gone once the grid below is re-derived against the PANEL. ⚠ SAME-LINE fold, line-NEUTRAL.
                     if c.cell_w != 0 && c.cell_h != 0 {
                         let info = c.fb.info();
                         c.cols = (info.width / c.cell_w).max(1);
@@ -3193,4 +3193,240 @@ fn cascadefit_witness(pw: usize, ph: usize, ox: usize, oy: usize, ow: usize, oh:
             ow, oh, ox, oy
         ),
     }
+}
+// =================================================================================================
+// CONSOLETEXT — a re-minted console repaints its retained text.
+// =================================================================================================
+//
+// THE DEFECT, from the glass (render8, `docs/dev/evidence/orin16/PIXELS-render8.md` A26). The
+// console window carried monospaced grey-on-black text at 15:43Z (SCREEN0-2: 5379 of 73204 pixels
+// in its content rect were non-black) and was EXACTLY black at 15:52Z (SCREEN3: 0 of 387354) —
+// after it had been closed with its own disc and re-minted. A re-minted console came back EMPTY.
+//
+// WHY, in three facts that are each individually correct and jointly the bug:
+//
+//  1. **There was no text buffer anywhere.** This console is a wrap-around GLYPH terminal that
+//     "never scrolls, never reads the surface back" (the file header): `plan_byte` turns a byte
+//     into `Op::Glyph`/`Op::Fill` and `paint_ops` pokes pixels. Nothing between the byte and the
+//     pixel remembered the character. The one place the prose points at — "the text is on serial
+//     and in `TERM_RING` regardless" (`panel_console_window_closed`) — is a bounded *transport*
+//     that is DRAINED by its consumer (`termring.rs`, `LineRing::drain`), not a retained screenful,
+//     and it is the terminal-output channel of the Console APP, not this mirror.
+//
+//  2. **`wm::close` does not free the surface** (`video/wm.rs:2219-2226` frees the table ROW only:
+//     `*r = Window::empty()`), and `panel_console_window_closed` deliberately leaves `win_fb` /
+//     `win_store` installed. So the pixels the operator was looking at survive the close, in cached
+//     kernel RAM, and console text keeps landing in them while the window is gone.
+//
+//  3. **The re-mint throws them away.** `panel_console_window_open` allocates a FRESH `store`,
+//     `surf_fb.fill_screen(BG_DEFAULT)`s it, moves it into `c.win_store` — dropping the old Vec
+//     with every glyph in it — and homes the cursor to `(0, 0)`. Exactly black, every time.
+//
+// THE CURE — a cell store, not a pixel copy. The retained surface of fact (2) was the obvious
+// source and is the wrong one: it is only retained by the close path's choice, `panic_screen`
+// `mem::forget`s it, and it cannot survive a geometry change (a re-mint under a different panel
+// mode, or after `orin_face_arm` changes the cell). So the console gets what it never had: a
+// `cols x rows` byte grid, one glyph per cell, written by `plan_byte` — the SINGLE choke point
+// every console byte passes through, on both the classic (`write_byte`) and split (`PanelSink`)
+// paths and from every caller (`print_masked`, `milestone`, `Sink`). Blanking follows the paint
+// exactly: `plan_newline` clears the cell rows it fills, `clear()` clears the grid it clears.
+//
+// ARCH-NEUTRAL. Every new item carries the SAME predicate `win_store`/`win_fb` are declared under —
+// `any(all(x86_64, wc), all(aarch64, desktop_firmware))` — which is the console WINDOW's own
+// predicate on both arches, not an arch gate: x86's `wc` desktop has the same window, the same
+// re-mint and the same defect. Off that predicate `cell_put`/`cell_blank_row`/`cell_clear` are
+// `#[inline(always)]` empty twins (the `shadowed()` idiom at ITEM 2), so a build with no console
+// window — the default `kernel8.img` among them — gets zero bytes and zero behaviour change.
+//
+// FIRST MINT vs RE-MINT, and why the code needs no latch to tell them apart. The cell store is
+// allocated BESIDE the window surface, in `panel_console_window_open`, so before the first mint it
+// is `None` and records nothing: the first mint finds nothing retained, repaints nothing, and comes
+// up exactly as black as it always did. That is deliberate and not an omission — at first mint the
+// only thing a panel-grid store could hold is the pre-desktop BOOT LOG, and Peter's render6 ruling
+// (see CONSOLEQUIET) is precisely that the desktop's largest window must not come up holding the
+// boot-log stream. The witness fires on every mint either way and says which it was.
+//
+// LINE-NEUTRAL — tail append. Everything genuinely new is HERE, below every panic `Location` in the
+// file; the eight touch points above are same-line folds. See the CONSWIN-PI note for the rule.
+
+/// CONSOLETEXT — the console window's glyph cell store: `cell_rows x cell_cols` bytes, one per grid
+/// cell, `0` = blank. Allocated in [`panel_console_window_open`] at the window's own grid size,
+/// retained across a close exactly as `win_store` is, and `mem::forget`-dropped by [`panic_screen`]
+/// for `win_store`'s stated reason (the allocator's lock may be held by whatever is panicking).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+impl FbCon {
+    /// Record one printable byte at `(row, col)`. Bounds-checked against the store's OWN dimensions
+    /// rather than `self.cols`/`self.rows`: the two coincide while routed, and a print that lands
+    /// between a panel-grid re-derive and the next mint must not index past the allocation.
+    fn cell_put(&mut self, row: usize, col: usize, ch: u8) {
+        if row >= self.cell_rows || col >= self.cell_cols {
+            return;
+        }
+        let i = row * self.cell_cols + col;
+        if let Some(k) = self.win_cells.as_mut() {
+            if i < k.len() {
+                k[i] = ch;
+            }
+        }
+    }
+
+    /// Blank one cell row — the mirror of `plan_newline`'s `Op::Fill` band, so the moving blank
+    /// marker line the wrap-around terminal keeps below the cursor is blank in the store too.
+    fn cell_blank_row(&mut self, row: usize) {
+        if row >= self.cell_rows || self.cell_cols == 0 {
+            return;
+        }
+        let (a, b) = (row * self.cell_cols, (row + 1) * self.cell_cols);
+        if let Some(k) = self.win_cells.as_mut() {
+            if b <= k.len() {
+                for c in &mut k[a..b] {
+                    *c = 0;
+                }
+            }
+        }
+    }
+
+    /// Blank the whole grid — `clear()`'s mirror.
+    fn cell_clear(&mut self) {
+        if let Some(k) = self.win_cells.as_mut() {
+            for c in k.iter_mut() {
+                *c = 0;
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+impl FbCon {
+    /// The absent-field arm. See the sibling above and the `shadowed()` idiom at ITEM 2.
+    #[inline(always)]
+    fn cell_put(&mut self, _row: usize, _col: usize, _ch: u8) {}
+    #[inline(always)]
+    fn cell_blank_row(&mut self, _row: usize) {}
+    #[inline(always)]
+    fn cell_clear(&mut self) {}
+}
+
+/// CONSOLETEXT — what a mint took from the previous route, and what it owes the install block.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+struct Remint {
+    /// Cell rows that carried at least one non-blank glyph and were repainted into the new surface.
+    repainted_rows: usize,
+    /// The cell store to install: the retained one when the grid is unchanged (so its contents
+    /// survive a SECOND close/re-mint untouched), a fresh one seeded from the retained overlap when
+    /// the grid moved, `None` when the allocation was declined.
+    store: Option<Vec<u8>>,
+    /// Cursor for the new route: the retained one, clamped to the new grid, when something was
+    /// repainted; `(0, 0)` — the pre-CONSOLETEXT behaviour verbatim — when nothing was.
+    col: usize,
+    row: usize,
+    /// The retained store's grid, for the witness. `(0, 0)` when there was none.
+    was: (usize, usize),
+    /// Was there a retained store at all? Distinguishes `from=cells` (a re-mint whose previous
+    /// screenful happened to be blank) from `from=none` (a first mint, or a contended take).
+    had: bool,
+}
+
+/// CONSOLETEXT — **take the retained cell store, repaint its screenful into the fresh surface, and
+/// hand the install block the store and cursor to adopt.**
+///
+/// Called from [`panel_console_window_open`] AFTER `wm::create_at` has succeeded, so a mint that
+/// declines for geometry or a full window table never consumes the retained text; the one remaining
+/// failure below it (`install-contended`) does, and drops the retention with the window it refused.
+///
+/// ### Locking — the two halves, split for the reason PANEL-DEFER exists
+///
+/// The take is MASKED and LOCKED and moves a `Vec` and eight `Copy` fields: no allocation, no pixel.
+/// The repaint — up to a whole screenful of `draw_glyph`, which is the same order of work as the
+/// hundreds of printed lines that produced it — runs UNMASKED and UNLOCKED against `surf`, a surface
+/// no other writer can reach yet: it is `create_at`'s row source but the console is not routed at it
+/// (`CONSOLE_WIN` is still `wm::WIN_NONE`, stored by the caller only after the install block) and no
+/// present has been asked for. The allocation, when the grid moved, is outside the mask for the same
+/// reason the caller allocates `store` there.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn cells_remint(
+    surf: &FrameBuffer,
+    gcols: usize,
+    grows: usize,
+    cell_w: usize,
+    cell_h: usize,
+) -> Remint {
+    let none = Remint { repainted_rows: 0, store: None, col: 0, row: 0, was: (0, 0), had: false };
+    let mut taken = None;
+    crate::arch::without_interrupts(|| {
+        if let Some(mut c) = FBCON.try_lock() {
+            let k = c.win_cells.take();
+            taken = Some((k, c.cell_cols, c.cell_rows, c.col, c.row, c.fg, c.bg, c.scale, c.aa));
+            c.cell_cols = 0;
+            c.cell_rows = 0;
+        }
+    });
+    let Some((old, ocols, orows, ocol, orow, fg, bg, scale, aa)) = taken else {
+        // The console lock was contended. Nothing is lost that was not already unreachable: the
+        // caller's install block takes the same lock two statements later and declines outright.
+        return none;
+    };
+    let (rc, rr) = (ocols.min(gcols), orows.min(grows));
+    let mut repainted_rows = 0usize;
+    if let Some(k) = old.as_ref() {
+        if ocols != 0 && cell_w != 0 && cell_h != 0 {
+            for r in 0..rr {
+                let mut any = false;
+                for c in 0..rc {
+                    let i = r * ocols + c;
+                    let b = if i < k.len() { k[i] } else { 0 };
+                    if b == 0 {
+                        continue;
+                    }
+                    draw_glyph(surf, b, c * cell_w, r * cell_h, fg, bg, scale, aa);
+                    any = true;
+                }
+                if any {
+                    repainted_rows += 1;
+                }
+            }
+        }
+    }
+    let had = old.is_some();
+    let want = gcols.saturating_mul(grows);
+    let store = match old {
+        Some(k) if ocols == gcols && orows == grows && k.len() == want => Some(k),
+        other => {
+            let mut n: Vec<u8> = Vec::new();
+            if want != 0 && n.try_reserve_exact(want).is_ok() {
+                n.resize(want, 0);
+                if let Some(k) = other.as_ref() {
+                    for r in 0..rr {
+                        for c in 0..rc {
+                            let i = r * ocols + c;
+                            if i < k.len() {
+                                n[r * gcols + c] = k[i];
+                            }
+                        }
+                    }
+                }
+                Some(n)
+            } else {
+                None
+            }
+        }
+    };
+    let (col, row) = if repainted_rows > 0 {
+        (ocol.min(gcols.saturating_sub(1)), orow.min(grows.saturating_sub(1)))
+    } else {
+        (0, 0)
+    };
+    Remint { repainted_rows, store, col, row, was: (ocols, orows), had }
 }
