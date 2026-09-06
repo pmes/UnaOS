@@ -43,3 +43,5 @@ DRAGDEAD `4dc88314` (+ A27 tick `7580018e`) · QUARRY `f36cb82f` (+ A8 tick in `
 `092c85fb` (`CLICKDEAD-xhci.patch`, rmbp GRANTED on the split-counter condition; v2 in flight) · FOLDFIX `80ed35a4`
 (the display_tegra.rs tail union rebuilt 3-way after the seat's hand splice cut a function open) · MENUBAR docs
 `563a5717` (`MENUBAR-WINMENU.patch` to rmbp 12; pi 7 asked for the C ack; LEDGER S32). CONSOLEQUIET still running.
+MENUBAR video commit `adb3b1cd` (the granted patch applied; ten files, 1403+/266−; union gate check + test-arm +
+`UNAOS_WC=1 test 150` running at write time — logs `~/unaos-bench/scratch/orin15/{check,testarm,testwc}-adb3b1cd.log`).
