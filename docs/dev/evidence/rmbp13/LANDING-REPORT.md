@@ -366,6 +366,44 @@ taking the claim — one command. That is the only mechanism all round that reli
 and it works precisely because it depends on nobody remembering anything. It is also, exactly, the
 reason the integrator-less flow says the author seat never reviews alone.
 
+## The line pi 7 wrote that explains the discipline better than the rule does
+
+Late in the round pi 7 ran the fixed gate over their own tree and reported: 30 table ids, **P1–P13**,
+one cross-ref, zero reds, zero deferrals. This seat counts **15** protocol bullets. The two they are
+missing are **P14 and P15** — the rows recording pi 7's own two findings, sitting unfolded on hw-rmbp.
+
+*"I cannot cite them from my own tree; they are yours and unfolded. That is the whole per-tree lesson
+in one line, arriving on the artifacts that document it."*
+
+That is worth more than the rule it illustrates. "Baselines are per tree" reads as bookkeeping; a seat
+unable to reference its own contribution, because the contribution and the reference live on different
+branches until a landing, is the thing itself. It is also why their pre-fold run — checking that B25
+introduces no red on hw-pi4 *before* it folds — is the cheaper direction: the same check-at-the-other-
+seat's-sha habit, run forward instead of as a correction.
+
+## PRTSCR3 — the re-cut, and the condition that turned out to be checkable
+
+SR2's fix came back as three commits after this seat blocked the first cut on one line. Everything was
+verified at their commits in the shared object store rather than from their report:
+
+- **sha256 IDENTITY** on `prtscr.rs` (`cc77d61bc7ce7074`) and `screenshot.md` (`5adea27109d52165`)
+  against hw-rmbp — byte-identical, both files. The content-delta route did what the measured-conflicting
+  cherry-pick could not, and identity is a check a diffstat cannot make.
+- `Job::begin()` calls `mount_capture_target()` at `prtscr.rs:768`. The blocking line is gone.
+- Symbol census **recounted here**: 9 / 6 / 4 / 1 against the required 6 / 3 / 2 / 1.
+- The cadence commit is line-neutral: `main.rs` 8949 before and after, one insertion, one deletion.
+
+**Their hot-unplug work is the best thing in the patch and it contains this round's own rule, unprompted.**
+Asked what happens *today* first, they answered honestly — a generic `Refusal::Fat` that never names the
+disconnection. Then the fix probes **both** `usb_info().is_some()` and `usb_publish_gen()`, and the
+generation half is load-bearing: a retract-then-replug refills the handle with a **different disk** whose
+bounds a parked `FatFs`'s stale LBAs would sail through. A presence check alone would have been a check
+that cannot fire, one layer down. The premise was verified here, not trusted — `usb_publish_gen()` exists
+at `drivers/block.rs:761`.
+
+Because the two trees are now equal in `prtscr.rs`, **J1's symbol-count gate has nothing left to catch
+there** — which was the point of blocking the first cut.
+
 ## Still owed / flagged
 
 - **J1, the rmbp landing** (72 commits) — needs a fleet, so it needs the focus.
