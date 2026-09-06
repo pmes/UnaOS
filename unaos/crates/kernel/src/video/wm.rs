@@ -24896,14 +24896,14 @@ pub fn deadman_damage_sample() -> Option<(u32, u32)> {
 // LINE-NEUTRAL: this whole block is a TAIL APPEND, and its call sites are same-line folds onto
 // statements that already exist. Not one `panic::Location` in this file, or in any file, moves.
 
-/// WINID — how many id caches the registry can hold. Five exist today (the table above); the spare
-/// capacity is for the next piece of kernel furniture, which should register here rather than invent
-/// a sixth private clearing rule.
+/// WINID — how many id caches the registry can hold. SEVEN exist today (the table above, plus SO10's
+/// `orin-shell`, orin 17, which took a witness Orin boot to 8/8); raised 8 → 12 in the same commit per
+/// orin-ledger A29 ("raise WINID_HOLDER_MAX in the SAME commit as the seventh holder"). Cost: +96 B static, +64 B per frame (two).
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-pub const WINID_HOLDER_MAX: usize = 8;
+pub const WINID_HOLDER_MAX: usize = 12;
 
 /// WINID — one registered id cache: the cell, and the name that goes on the wire when it is cleared.
 #[cfg(any(

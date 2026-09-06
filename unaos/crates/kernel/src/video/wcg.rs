@@ -4005,7 +4005,7 @@ pub fn end(
 // (`fbcon.rs:455`, the locked classic path, and `fbcon.rs:1480`, the unlocked split path).
 // Co-extensive by construction: on an image where those two charge sites are compiled out
 // `SEAM_WIN` can never hold anything but `WIN_NONE`, so there is nothing for a close to clear and
-// registering it would only spend one of `WINID_HOLDER_MAX`'s eight slots. The metal image is built
+// registering it would only spend one of `WINID_HOLDER_MAX`'s twelve slots (eight until SO10 raised it, orin 17). The metal image is built
 // WITHOUT `witness`, so this costs the flown artifact nothing — measured, not assumed:
 // `./arroyo kernel8` is `8ff7c1d1f4e8938d…` before and after this change.
 //
