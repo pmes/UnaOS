@@ -718,6 +718,13 @@ pub struct FatBackend {
     /// globally-registered device (SD on the Pi); `Usb` = the USB stick read
     /// directly through xHCI (read-only, PIUSB-27).
     source: crate::fs::fat::BlockSource,
+    /// LAYOUT (orin 18): the volume-relative DIRECTORY this mount exposes as its root — `""` for
+    /// the volume root (every mount before this arc), `"/APPS"` for the `/apps` program mount,
+    /// which is the ESP's `APPS/` directory bound at its own prefix. Every `rel` the trait hands
+    /// this backend is prefixed with it before the FAT walk (see [`FatBackend::on_volume`]), so a
+    /// consumer of `/apps/VUG.ELF` reaches `APPS/VUG.ELF` on the medium and can never reach above
+    /// the directory. Set only by [`FatBackend::rooted`].
+    root: String,
 }
 
 impl FatBackend {
@@ -731,6 +738,7 @@ impl FatBackend {
             principal: principal.to_string(),
             world_readable,
             source: crate::fs::fat::BlockSource::Default,
+            root: String::new(),
         }
     }
 
@@ -746,6 +754,7 @@ impl FatBackend {
             principal: principal.to_string(),
             world_readable: true,
             source: crate::fs::fat::BlockSource::Usb,
+            root: String::new(),
         }
     }
 
@@ -773,6 +782,50 @@ impl FatBackend {
     /// single definition; the VFS reports its presence as a boolean and the shell prints its text.
     fn read_only(&self) -> bool {
         self.source.write_veto().is_some()
+    }
+
+    /// LAYOUT (orin 18): bind this mount's root at `dir` — a volume-relative directory such as
+    /// `/APPS` — instead of the volume root. The directory need not exist at mount time (the
+    /// table is rebuilt per verb and a missing directory answers `NoSuchPath` on first use, which
+    /// is the honest answer for a card staged before this layout). Case-insensitive on the walk,
+    /// like every other FAT lookup here, so `/APPS` and `/apps` name the same directory.
+    pub fn rooted(mut self, dir: &str) -> Self {
+        let mut root = String::new();
+        for c in components(dir) {
+            root.push('/');
+            root.push_str(c);
+        }
+        self.root = root;
+        self
+    }
+
+    /// LAYOUT: the path on the MEDIUM for a mount-relative `rel` — `root` + `rel`. The volume
+    /// root is `""` and prefixes nothing, so every pre-LAYOUT mount is byte-for-byte the old walk.
+    fn on_volume(&self, rel: &str) -> String {
+        let mut s = String::with_capacity(self.root.len() + rel.len() + 1);
+        s.push_str(&self.root);
+        for c in components(rel) {
+            s.push('/');
+            s.push_str(c);
+        }
+        s
+    }
+
+    /// LAYOUT: [`resolve_entry`](Self::resolve_entry) from this mount's root.
+    fn entry(&self, fs: &crate::fs::fat::FatFs, rel: &str)
+        -> Result<Option<crate::fs::fat::DirEntry>, VfsError> {
+        Self::resolve_entry(fs, &self.on_volume(rel))
+    }
+
+    /// LAYOUT: [`resolve_parent`](Self::resolve_parent) from this mount's root. The mount point
+    /// itself has no leaf from the consumer's point of view whatever the root is, so an empty
+    /// `rel` is refused as [`VfsError::IsADirectory`] BEFORE the root is prepended — otherwise a
+    /// `create("")` on `/apps` would resolve to "create `APPS` in the volume root".
+    fn parent(&self, fs: &crate::fs::fat::FatFs, rel: &str) -> Result<(u32, String), VfsError> {
+        if components(rel).next().is_none() {
+            return Err(VfsError::IsADirectory);
+        }
+        Self::resolve_parent(fs, &self.on_volume(rel))
     }
 
     /// Resolve a volume-relative path to its FAT directory entry by walking the
@@ -942,7 +995,7 @@ impl VfsBackend for FatBackend {
 
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let entries = match Self::resolve_entry(&fs, rel)? {
+        let entries = match self.entry(&fs, rel)? {
             None => fs.read_root().map_err(fat_err)?, // volume root
             Some(e) if e.is_dir => fs.read_dir(e.first_cluster()).map_err(fat_err)?,
             Some(_) => return Err(VfsError::NotADirectory),
@@ -981,7 +1034,7 @@ impl VfsBackend for FatBackend {
 
     fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        match Self::resolve_entry(&fs, rel)? {
+        match self.entry(&fs, rel)? {
             None => Ok(Stat {
                 kind: NodeKind::Dir,
                 size: 0,
@@ -995,7 +1048,7 @@ impl VfsBackend for FatBackend {
 
     fn read(&self, rel: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let entry = Self::resolve_entry(&fs, rel)?.ok_or(VfsError::IsADirectory)?;
+        let entry = self.entry(&fs, rel)?.ok_or(VfsError::IsADirectory)?;
         if entry.is_dir {
             return Err(VfsError::IsADirectory);
         }
@@ -1052,7 +1105,7 @@ impl VfsBackend for FatBackend {
     fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
         self.authorize_write(rel, principal)?;
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (parent, leaf) = self.parent(&fs, rel)?;
         // Reject an existing name (create is not idempotent-overwrite).
         match fs.locate_in_dir(parent, &leaf) {
             Ok(_) => return Err(VfsError::Backend("exists")),
@@ -1076,7 +1129,7 @@ impl VfsBackend for FatBackend {
     fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
         self.authorize_write(rel, principal)?;
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (parent, leaf) = self.parent(&fs, rel)?;
         let off32: u32 = offset.try_into().map_err(|_| VfsError::Unsupported)?;
         let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
         if de.is_dir {
@@ -1098,7 +1151,7 @@ impl VfsBackend for FatBackend {
     fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError> {
         self.authorize_write(rel, principal)?;
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (parent, leaf) = self.parent(&fs, rel)?;
         let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
         if de.is_dir {
             return Err(VfsError::IsADirectory);
@@ -1132,7 +1185,7 @@ impl VfsBackend for FatBackend {
     fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
         self.authorize_write(rel, principal)?;
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (parent, leaf) = self.parent(&fs, rel)?;
         let (de, dir_lba, dir_off) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
         if de.is_dir {
             return Err(VfsError::IsADirectory); // directory removal is a separate verb
@@ -1155,8 +1208,8 @@ impl VfsBackend for FatBackend {
     fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {
         self.authorize_write(from_rel, principal)?;
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let (sparent, sleaf) = Self::resolve_parent(&fs, from_rel)?;
-        let (dparent, dleaf) = Self::resolve_parent(&fs, to_rel)?;
+        let (sparent, sleaf) = self.parent(&fs, from_rel)?;
+        let (dparent, dleaf) = self.parent(&fs, to_rel)?;
         // Locate-first destination check, the create discipline: an existing name is refused with
         // the SAME spelling `create` uses, so a caller has one string to test for.
         let same_slot = sparent == dparent && dleaf.eq_ignore_ascii_case(&sleaf);
@@ -1191,7 +1244,7 @@ impl VfsBackend for FatBackend {
     fn remove_dir(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
         self.authorize_write(rel, principal)?;
         let fs = crate::fs::fat::mount_source(self.source).map_err(fat_err)?;
-        let (parent, leaf) = Self::resolve_parent(&fs, rel)?;
+        let (parent, leaf) = self.parent(&fs, rel)?;
         let (de, _, _) = fs.locate_in_dir(parent, &leaf).map_err(fat_err)?;
         if !de.is_dir {
             return Err(VfsError::NotADirectory);
@@ -2182,6 +2235,7 @@ impl FatBackend {
             principal: principal.to_string(),
             world_readable,
             source: crate::fs::fat::BlockSource::TegraSd,
+            root: String::new(),
         }
     }
 }
@@ -2218,6 +2272,7 @@ impl FatBackend {
             principal: principal.to_string(),
             world_readable,
             source,
+            root: String::new(),
         }
     }
 }

@@ -96,6 +96,13 @@ pub enum FatKind {
 /// on the presentation callers); a name whose UTF-8 would not fit falls back to its 8.3 short name.
 const LNAME_MAX: usize = 768;
 
+/// LAYOUT (orin 18): the on-medium directory that holds the launchable programs — the ESP's
+/// `APPS/`, bound in the namespace at `/apps` (`shell::EXEC_ROOT`). An 8.3 SHORT name by
+/// construction: this driver's create path writes 8.3 names only (VFAT LFN write is out of scope,
+/// see `fat_create_err`), the staging scripts (`arroyo`, `builder`, `make-fat-img.sh`) spell it the
+/// same way, and every lookup is case-insensitive, so `apps`/`Apps`/`APPS` on the wire all reach it.
+pub const APPS_DIR: &str = "APPS";
+
 /// A parsed directory entry. Carries the on-disk short (8.3) name (uppercase, e.g. `KERNEL.ELF`) and,
 /// when VFAT long-file-name (LFN) entries preceded it and validated (PI-FS-3), the decoded UTF-8 long
 /// name. `name()` returns the long name when present, else the short; `eq_name` matches EITHER, so a
@@ -2516,6 +2523,27 @@ impl FatFs {
     /// Find a top-level entry by 8.3 name (case-insensitive).
     pub fn find_in_root(&self, name: &str) -> Result<DirEntry, FatError> {
         for de in self.read_root()? {
+            if de.eq_name(name) {
+                return Ok(de);
+            }
+        }
+        Err(FatError::NotFound)
+    }
+
+    /// LAYOUT (orin 18): find a PROGRAM by name — an entry of the volume's [`APPS_DIR`] directory
+    /// (case-insensitive on both components). This is the FAT-direct twin of the namespace's
+    /// `/apps` mount (`shell::EXEC_ROOT`): the loaders and witnesses that bind a `FatFs` themselves
+    /// rather than the mount table (the EL0 slot loader, the U2/M6g flat loader, the desktop's
+    /// app launcher, the WINX/PULSE end-to-end witnesses) ask THIS, so the one definition of
+    /// "where programs live on the medium" is `APPS_DIR` and nothing else. A volume with no
+    /// `APPS/` directory answers `NotFound`, the same answer a missing program gives — there is
+    /// no fallback to the root, because a program the layout does not know is not a program.
+    pub fn find_app(&self, name: &str) -> Result<DirEntry, FatError> {
+        let dir = self.find_in_root(APPS_DIR)?;
+        if !dir.is_dir {
+            return Err(FatError::NotFound);
+        }
+        for de in self.read_dir(dir.first_cluster())? {
             if de.eq_name(name) {
                 return Ok(de);
             }
