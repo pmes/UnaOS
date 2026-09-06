@@ -7133,6 +7133,17 @@ knoboff() {
         echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired.${COLOR_RESET}"
         echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built"
         echo -e "   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack."
+        # WHICH QUESTION THE SHA ANSWERS (pi 7's SP2, 2026-09-06). A before/after digest answers exactly
+        # one of two questions and they are not interchangeable: GUARDING A BASELINE (compare the artifact
+        # that EXCLUDES the change — identical means the baseline is safe) or PROVING THE CHANGE LANDED
+        # (score the artifact that CONTAINS it). For a knob-gated change the knob-off artifact is
+        # identical BY CONSTRUCTION, so reading it as proof the wiring works is a null result dressed as
+        # a pass — a check that cannot fire. knoboff answers the FIRST question, and the armed control
+        # probe above is why it cannot be mistaken for the second: it refuses a verdict outright unless
+        # arming the feature moves something, so a PASS here always carries a demonstration that the
+        # comparison had the power to fail.
+        echo -e "   This PASS GUARDS A BASELINE. It is not evidence the feature WORKS — score that on the"
+        echo -e "   armed artifact or by strings at the site (SP2). The control above is what keeps the two apart."
     else
         echo -e "${COLOR_RED}knoboff: FAIL — the knob-off image is not the baseline's. If nothing here is meant to be${COLOR_RESET}"
         echo -e "${COLOR_RED}         armed by default, the usual cause is a LINE SHIFT: an inserted line moves every${COLOR_RESET}"
