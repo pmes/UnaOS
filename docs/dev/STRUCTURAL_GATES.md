@@ -195,8 +195,18 @@ than swallowed as "no verdict" — a control must not blind the gate to the very
 instances that created the class.
 
 **Goes red when** a knob has no arm and no registry row (`UNREGISTERED`), a
-registry row names a knob that is no longer in `_feats` (`STALE`), or a knob is
-both armed and registered as unarmed (`CONTRADICTION`). **GO-RED proof, recorded
+registry row names a knob that is not in `_feats` (`STALE`), or a knob is
+both armed and registered as unarmed (`CONTRADICTION`).
+
+**STALE is DEFERRED on a track branch and red on the trunk**, for an ordering
+constraint rather than out of leniency: the registry lives on `hw-rmbp` while knobs
+are added on every branch, so a correct, evidenced row can name a knob that has not
+merged yet (orin 17's seven, 2026-09-06). Strict would red this branch for being
+early; waiting would deliver the gate's answer after the commit that needed it. A
+deferred row is LISTED on every run and becomes a red automatically on the trunk,
+where every branch's `_feats` is present and a row nothing matches really is dead —
+the same mechanism and the same trunk trigger as GATE-LEDGER above, with
+`UNAOS_K8REACH_STRICT=1`/`=0` and `UNAOS_K8REACH_TRUNK` as its knobs. **GO-RED proof, recorded
 in this commit — eight states, all executed:** a new `UNAOS_NEWTHING` line added
 to `_feats` → red naming it; **`UNAOS_PRTSCRST`'s arm deleted from `kernel8()`,
 i.e. the historical instance replayed → red**; a registry row for a knob that

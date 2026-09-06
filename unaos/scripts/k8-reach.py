@@ -23,8 +23,19 @@ ACCOUNTED FOR -- armed, or written down as deliberately unarmed. A knob added to
 cannot be silently unreachable; it fails this gate until someone rules on it.
 
   RED  UNREGISTERED   a knob in `_feats` with no `K8_FEATS` arm and no registry row.
-  RED  STALE          a registry row for a knob that no longer exists in `_feats`.
+  RED  STALE          a registry row for a knob that is not in `_feats` -- DEFERRED on a track
+                      branch, red on the trunk (see below).
   RED  CONTRADICTION  a knob that is both armed and registered as unarmed.
+
+STALE IS DEFERRED ON A TRACK BRANCH, and the reason is a real ordering constraint rather than
+leniency. The registry lives on `hw-rmbp` and knobs are added on every branch: orin 17's seven
+NA rows are correct, evidenced and ready, and they name knobs that exist only on `hw-jetson`
+until the merge. Landing them here strictly would red this branch for being early; holding them
+until the merge means the gate's answer arrives after the commit that needed it. So a row whose
+knob this tree does not have is DEFERRED and LISTED on a track branch, and becomes a red
+automatically on the trunk, where every branch's `_feats` is present and a row nothing matches
+really is dead. Same mechanism, same trunk trigger and the same override knobs as GATE-LEDGER's
+DEFERRED/STRICT split (rmbp-ledger B21) -- wired, not remembered.
 
 `--evidence` re-runs the site classification behind a row (module-tree context, prose
 stripped, per-arm `target_arch`) so that ruling on a TODO row is a command, not a squint.
@@ -49,6 +60,7 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 CANARIES = ("UNAOS_PRTSCRST", "UNAOS_BOOTLOG")
+TRUNK = os.environ.get("UNAOS_K8REACH_TRUNK", "main")
 STATUSES = ("NA", "TODO")
 
 RED, GREEN, YELLOW, OFF = "\033[91m", "\033[92m", "\033[93m", "\033[0m"
@@ -170,13 +182,47 @@ def site_scan_control(src):
     return None
 
 
+def cargo_implications(cargo):
+    """feature -> the features it pulls in transitively, out of `[features]`.
+
+    arroyo's `_feats` line shows only what the KNOB names; Cargo pulls the rest. orin 17 found
+    the gap the hard way: `UNAOS_GA10B_PROBE2` arms `ga10bprobe2`, and `ga10bprobe2 = ["tegra"]`
+    makes it a tegra knob that no arroyo line says is one. A `--evidence` run that does not print
+    the closure invites exactly the ruling that misses it.
+    """
+    deps, inf = {}, False
+    for line in open(cargo, encoding="utf8", errors="replace"):
+        if line.startswith("[features]"):
+            inf = True; continue
+        if line.startswith("["):
+            inf = False; continue
+        if not inf:
+            continue
+        m = re.match(r'^([A-Za-z0-9_-]+)[ \t]*=[ \t]*\[(.*)\]', line)
+        if m:
+            deps[m.group(1)] = [d.strip().strip('"') for d in m.group(2).split(",")
+                                if d.strip() and "dep:" not in d and "/" not in d]
+
+    def closure(f, seen=None):
+        seen = seen if seen is not None else set()
+        for d in deps.get(f, []):
+            if d not in seen:
+                seen.add(d)
+                closure(d, seen)
+        return seen
+    return closure
+
+
 def evidence(name, knob_feats, src):
     ctx = load_ctx(src)
+    closure = cargo_implications(os.path.join(os.path.dirname(src), "Cargo.toml"))
     feats = sorted(knob_feats.get(name, {name}))
     for f in feats:
         rows = site_verdicts(f, src, ctx)
         live = sum(1 for r in rows if r[2] == "PI-LIVE")
-        print("%s: %d site(s), %d Pi-live" % (f, len(rows), live))
+        imp = sorted(closure(f))
+        print("%s: %d site(s), %d Pi-live%s"
+              % (f, len(rows), live, ("  [implies: %s]" % ", ".join(imp)) if imp else ""))
         for rel, lno, v, text in rows:
             print("  %-14s %s:%s  %s" % (v, rel, lno, text.strip()[:100]))
 
@@ -245,20 +291,40 @@ def main():
     stale = [k for k in rows if k not in knob_feats]
     contradiction = [k for k in rows if k in armed]
 
+    branch = subprocess.run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    env_strict = os.environ.get("UNAOS_K8REACH_STRICT")
+    if env_strict == "0":
+        strict, why = False, "suppressed by UNAOS_K8REACH_STRICT=0"
+    elif env_strict == "1":
+        strict, why = True, "forced by UNAOS_K8REACH_STRICT=1"
+    elif branch == TRUNK:
+        strict, why = True, "automatic: on the trunk branch `%s`, where every branch's knobs are present" % TRUNK
+    else:
+        strict, why = False, "off: branch `%s` is a track branch, cross-branch rows deferred" % (branch or "<unknown>")
+    deferred = []
+    if not strict and stale:
+        deferred, stale = stale, []
+
     if unregistered:
         print("%s❌ k8-reach UNREGISTERED: %s — knob(s) with no K8_FEATS arm and no registry row. "
               "Setting one and flashing kernel8 changes nothing, silently (LEDGER SR1). Add the "
               "arm in kernel8(), or a row in scripts/k8-reach.registry saying why not "
               "(`--evidence <KNOB>` prints the sites).%s" % (RED, " ".join(unregistered), OFF))
     if stale:
-        print("%s❌ k8-reach STALE: %s — registry row(s) for knob(s) that are no longer in the "
-              "_feats map. Delete the row.%s" % (RED, " ".join(stale), OFF))
+        print("%s❌ k8-reach STALE: %s — registry row(s) for knob(s) that are not in the _feats "
+              "map (%s). On the trunk every branch's knobs are present, so a row nothing matches "
+              "is dead: delete it.%s" % (RED, " ".join(stale), why, OFF))
     if contradiction:
         print("%s❌ k8-reach CONTRADICTION: %s — armed in kernel8() AND registered as unarmed. "
               "The row is wrong; delete it.%s" % (RED, " ".join(contradiction), OFF))
     if unregistered or stale or contradiction:
         return 1
 
+    if deferred:
+        print("  k8-reach DEFERRED — %d row(s) for knob(s) this tree does not have; NOT findings. "
+              "Strict is %s; these become reds automatically on the trunk: %s"
+              % (len(deferred), why, " ".join(sorted(deferred))))
     todo = sum(1 for k, (s, _) in rows.items() if s == "TODO")
     print("%s  ✅ k8 reachability (%d knobs: %d armed, %d registered unarmed — %d still TODO)%s"
           % (GREEN, len(knob_feats), len(armed & set(knob_feats)), len(rows), todo, OFF))
