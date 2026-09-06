@@ -42,3 +42,20 @@ lines (its pattern lacked the `(aff=…)` group) — the FILE is the evidence, t
 ## Card after the flight
 `SCREEN0.PNG` (6913793 B, sha `3f4ee48a…`) is on the card and harvested to `~/unaos-bench/scratch/orin15/SCREEN0.PNG`
 (sha-equal). Tidy before the next load (FLIGHT.md §A.4) or the next capture is named `SCREEN1.PNG`.
+
+## Boot 2 (same image, 2026-09-06T01:42–01:5xZ; Peter powered on again after boot 1)
+Excerpt `render6-boot2.log` (6389 lines, `orin_marks=998 pi_marks=0 -> PURE`, unwrapped anchor 61656); scores
+`render6-boot2-scores.txt`. No serial injection this boot (keyboard only: `keys=7`), so A16/A22 legs are N/A and
+`[tcu] rx-mbox` reads `FULL-NEVER changes=0` — consistent.
+| q | scorer line | verdict |
+|---|---|---|
+| A15 | `cpu_on_success=5 … online_line=1` | PASS — pass 4 |
+| A1 | `hw=15552 headroom=17216` | same as boot 1 |
+| A18 | `cascaded=1 … census_strip=retired census_pulsewin=2` | PASS, pass 3 |
+| A19 | `band_cleared=1 shell_present=1 jd2_probe=1` | wire PASS (pixels scored on boot 1) |
+| A20 | `clickroute_press=5 consumed=9`; `[orinclick] census … press=10 rel=10 consumed=9 -> ROUTING`; `MOUSE-1: 3040 reports`; `[cursor3] … offers=2 … COMPOSED` | **clicks LAND** — the boot-1 pointer death is intermittent, same image |
+| A17 | `armed=4 capturing=2 ok=2 refusals=0 names=[ SCREEN1.PNG SCREEN2.PNG ]` (Peter: four fast presses) | two files OK; **the two presses during an in-flight capture printed no refusal** — `Refusal::InFlight` is not on the wire; gap |
+| A10 | `KEY 0x1b` ×3 with the menu open, no dismiss; `[pulsewin] menu dismiss reason=content` ×3, each right before a press | **Esc does not dismiss** — confirmed; folds into A25/R21 |
+| A27 (new) | `[wm-act] drag-begin win=3 … at (1156,431) -> grabbed` … `drag-end win=3 … at (520,441) -> no-move` ×4 | **drag does not move the window** (Peter: "click and drag does not work but clicks are") |
+| liveness | `heartbeat=1 el1=1 … live=736 redzone=0 exceptions=0` | PASS |
+Card after boot 2: `SCREEN0.PNG` (boot 1), `SCREEN1.PNG`, `SCREEN2.PNG` — harvest + validate when the card is in the reader.
