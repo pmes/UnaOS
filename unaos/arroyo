@@ -13,6 +13,10 @@
 #                          + the ring-3 user-* crates
 #                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+2N legs, 150 today)
 #   ./arroyo build         Build both targets (no QEMU)
+#   ./arroyo knoboff <feature> [baseline-ref]
+#                          Knob-off byte-identity: build the knob-OFF loadable image at the baseline
+#                          and at this tree IN ONE DIRECTORY and compare them, with an armed control
+#                          probe. Exit 0 identical / 1 moved / 2 no verdict. EXECUTOR-BRIEF §5.
 #   ./arroyo clean         Purge all build artifacts
 
 set -e
@@ -6801,6 +6805,323 @@ battery() {
     return $rc
 }
 
+# KNOBOFF (`./arroyo knoboff <feature> [baseline-ref]`) — the byte-identity check EXECUTOR-BRIEF §5
+# has been telling executors to run "when it exists". It exists now.
+#
+# THE QUESTION IT ANSWERS. An arc adds knob-gated code. Every knob comment in this file claims some
+# form of "default OFF => the sites vanish, media byte-identical to baseline". That claim is about the
+# DEFAULT image — the one every other board ships — and it is the claim a `#[cfg]` does NOT by itself
+# buy you: `panic::Location` embeds the source LINE, so inserting a line ABOVE existing code shifts
+# every panic site below it and moves bytes in an image that contains none of the new feature's code
+# (pi 7, 2026-09-06; memory `cfg-does-not-protect-byte-identity`). That is why the brief tells
+# executors to append onto an existing line or inside an existing cfg region — and why the append has
+# to be MEASURED rather than reasoned about.
+#
+# WHAT IT COMPARES, and why not the obvious things.
+#   * The `llvm-objcopy -O binary` LOADABLE IMAGE, never `kernel.elf` and never the ESP. The .elf
+#     carries build-path and debug metadata and LLVM's `.llvm.<hash>` internal-symbol suffixes in
+#     .strtab (JB11 measured a pair differing by exactly one loadable byte and a further 32 non-loaded
+#     ones); the ESP embeds SRC.TGZ, so it differs whenever the source differs, which is always.
+#   * BOTH builds run in the SAME directory — a throwaway worktree under
+#     ~/unaos-bench/scratch/knoboff/ — because a build's own path reaches the artifact (XUSBFW's
+#     measurement says "measured in ONE directory" for exactly this reason, and 38ae067e/`orindesk`
+#     says "same worktree path"). Comparing your tree against a baseline built somewhere else would
+#     put a path delta and a code delta in the same number.
+#   * NEVER `git stash` (the stack is shared across every worktree of this repo). The working diff is
+#     snapshotted to scratch with `git diff HEAD` and applied into the throwaway tree; this worktree is
+#     not touched, and the patch file is left behind so the run is reproducible.
+#
+# THE CONTROL PROBE, and why the check refuses a verdict without it. A comparison that cannot come out
+# unequal reports "byte-identical" for a feature whose name is misspelled, whose cfg sites are gated
+# on a second feature nobody armed, or whose knob this run never actually passed to cargo — and it
+# reports it in exactly the words a real pass uses (memory `a-check-that-cannot-fire`). So every run
+# also builds the CURRENT tree with `<feature>` ARMED and requires that image to differ from the
+# knob-off one on at least one arch. If arming the feature changes nothing anywhere, there is no
+# verdict to give and the exit status is 2, not 0.
+#
+# ENV HYGIENE. The default-image claim is only measured if the OFF build IS the default build, so a
+# run refuses to start with any `UNAOS_*` knob set unless `UNAOS_KNOBOFF_WITH_ENV=1` says the caller
+# means it. That escape is the right one for a feature whose sites are all gated on another feature
+# (`UNAOS_TEGRA=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff bsptick` measures "does bsptick move the
+# TEGRA knob-off image", which is the honest question for every tegra-gated knob) — the verdict line
+# then names the set it actually built, because "byte-identical" without the feature set beside it is
+# not a claim anyone can check.
+#
+# WHAT IT DOES NOT COVER, said here so a green run is not over-quoted. knoboff measures the x86_64 and
+# aarch64-virt KERNEL images. It does NOT measure `kernel8.img`: the Pi bare-metal image compiles from
+# `kernel8()`'s curated `K8_FEATS`, a separate list that deliberately does not draw from the knob map
+# above, so a feature's presence or absence here says nothing about whether it reaches a Pi image
+# (that is SR1's open class, and it is why a pi ack is still a pi ack). Nor does it measure the ESP or
+# any staged media. A PASS is exactly one claim: the two kernel loadable images did not move.
+#
+# EXIT STATUS is the deliverable — the brief says "run it and quote the result":
+#   0  knob-off images identical to baseline on every arch checked, control fired
+#   1  the knob-off image MOVED (the answer the brief is trying to prevent)
+#   2  no verdict — undeclared feature, dirty env, untracked sources, build failure, or a control
+#      that did not fire. A 2 is never a pass.
+_knoboff_arm_csv() {
+    local _save="$KERNEL_FEATURES" _out
+    KERNEL_FEATURES="${1:+--features $1}"
+    _out="$(arm_features)"
+    KERNEL_FEATURES="$_save"
+    printf '%s' "${_out#--features }"
+}
+
+# Build one (arch, feature-set) in the throwaway tree and objcopy the loadable image out.
+# $1 tree  $2 target-dir  $3 x86|arm  $4 features-csv  $5 out-flat  $6 log
+_knoboff_flat() {
+    local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6"
+    local _tspec _elf _TOOLBIN
+    _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    case "$_arch" in
+        x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
+        arm) _tspec="../../aarch64-unaos.json"; _elf="$_tgt/aarch64-unaos/release/unaos-kernel" ;;
+        *)   echo "knoboff: bad arch $_arch" >&2; return 2 ;;
+    esac
+    local _fargs=""; [ -n "$_feats" ] && _fargs="--features $_feats"
+    if ! ( cd "$_tree/unaos/crates/kernel" \
+           && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
+              --target "$_tspec" $NIGHTLY_FLAGS $_fargs ) >>"$_log" 2>&1; then
+        return 1
+    fi
+    [ -f "$_elf" ] || return 1
+    "$_TOOLBIN/llvm-objcopy" -O binary "$_elf" "$_out" >>"$_log" 2>&1 || return 1
+    return 0
+}
+
+# sha256 + size of a flat image, "sha size" on one line.
+_knoboff_id() { printf '%s %s' "$(sha256_of "$1")" "$(wc -c < "$1" | tr -d ' ')"; }
+
+knoboff() {
+    local feat="${1:-}" baseline="${2:-}"
+    if [ -z "$feat" ]; then
+        echo -e "${COLOR_RED}usage: ./arroyo knoboff <feature> [baseline-ref]${COLOR_RESET}"
+        echo "       <feature>      a cargo feature declared in crates/kernel/Cargo.toml [features]"
+        echo "       [baseline-ref] default: HEAD when the tree is dirty, HEAD~1 when it is clean"
+        return 2
+    fi
+
+    local REPO; REPO="$(cd "$WORKSPACE_DIR/.." && pwd)"
+    local CARGO_TOML="$WORKSPACE_DIR/crates/kernel/Cargo.toml"
+
+    # (1) DECLARED. A cfg on an undeclared feature is always false — it builds, it passes `check`, and
+    # every site under it is dead while reading as live (GATE-KNOB / knob-hygiene.sh). Measuring
+    # byte-identity for a name cargo has never heard of is measuring nothing.
+    local declared
+    declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$CARGO_TOML" | sort -u)"
+    if ! printf '%s\n' "$declared" | grep -qx -- "$feat"; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — '$feat' is not declared in crates/kernel/Cargo.toml [features].${COLOR_RESET}"
+        echo -e "         A cfg on an undeclared feature is always false, so nothing here could be measured."
+        echo -e "         Declared: $(printf '%s' "$declared" | tr '\n' ' ')"
+        return 2
+    fi
+
+    # (2) ENV — asked as a FEATURE-SET question, not as an env-var-name question. The first cut of this
+    # check scanned for `UNAOS_*` in the environment and refused; it fired on every single run, because
+    # BUILD-SHA-1 fifty lines up EXPORTS `UNAOS_GIT_SHA` itself. A guard that trips on its own script is
+    # a guard everyone learns to pass `WITH_ENV=1` to, which is how the real condition stops being
+    # checked. So compare the set this run would build knob-off against the set a knob-free invocation
+    # composes, by re-entering this very script with every `UNAOS_*` stripped and reading the banner
+    # back — the mapping is 1400 lines of `[ -n "${UNAOS_X:-}" ] && _feats=`, and no second copy of it
+    # in this function would stay true for a week.
+    #
+    # ⚠ `UNAOS_GIT_SHA` is `option_env!`-embedded in the image (BUILD-SHA-1), so it is a byte the
+    # comparison would see. All three builds below inherit THIS process's value — one arroyo, one sha,
+    # constant across the three — which is the whole reason knoboff drives cargo itself instead of
+    # calling the baseline tree's own `./arroyo`, whose sha would be its own.
+    export UNAOS_GIT_SHA="${UNAOS_GIT_SHA:-unknown}"
+    local _u=() _v
+    for _v in $(env | sed -n 's/^\(UNAOS_[A-Za-z0-9_]*\)=.*/\1/p'); do _u+=( -u "$_v" ); done
+    local default_csv=""
+    default_csv="$( env "${_u[@]}" "$0" knoboff 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*m//g' \
+                    | sed -n 's/^⚡ kernel features: //p' | head -1 )" || true
+
+    # (3) SOURCES. An untracked .rs is part of the change and `git diff HEAD` cannot carry it, so a run
+    # that ignored it would compare a tree that does not exist.
+    local untracked
+    untracked="$(cd "$REPO" && git ls-files --others --exclude-standard -- unaos/crates unaos/*.json 2>/dev/null || true)"
+    if [ -n "$untracked" ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — untracked source files under unaos/ :${COLOR_RESET}"
+        printf '%s\n' "$untracked" | sed 's/^/         /'
+        echo -e "         'git diff HEAD' cannot carry them. Commit them, or move them out of the tree."
+        return 2
+    fi
+
+    # (4) BASELINE.
+    local head_sha; head_sha="$(cd "$REPO" && git rev-parse HEAD)"
+    local dirty=0; ( cd "$REPO" && git diff --quiet HEAD -- ) || dirty=1
+    if [ -z "$baseline" ]; then
+        if [ "$dirty" -eq 1 ]; then baseline="$head_sha"; else baseline="${head_sha}~1"; fi
+    fi
+    local base_sha
+    if ! base_sha="$(cd "$REPO" && git rev-parse --verify "${baseline}^{commit}" 2>/dev/null)"; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — '$baseline' is not a commit in this repo.${COLOR_RESET}"
+        return 2
+    fi
+    if [ "$base_sha" = "$head_sha" ] && [ "$dirty" -eq 0 ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — baseline == HEAD and the tree is clean: there is no change to measure.${COLOR_RESET}"
+        return 2
+    fi
+
+    # (5) FEATURE SETS. off = the set this run would build with `<feature>` removed; on = the same set
+    # with it present. Both are printed with the verdict: "byte-identical" without the set beside it is
+    # not a claim anyone can check.
+    local base_feats="" f acc=""
+    case "$KERNEL_FEATURES" in --features\ *) base_feats="${KERNEL_FEATURES#--features }" ;; esac
+    for f in ${base_feats//,/ }; do [ "$f" = "$feat" ] && continue; acc="$acc$f,"; done
+    local off_csv="${acc%,}"
+    local on_csv="${off_csv:+$off_csv,}$feat"
+    local off_arm on_arm
+    off_arm="$(_knoboff_arm_csv "$off_csv")"
+    on_arm="$(_knoboff_arm_csv "$on_csv")"
+
+    # The env verdict, now that both sets exist: this run's ARMED set (whatever knobs the caller had)
+    # against the set a knob-free invocation composes. Equal => the knob-off build below IS the default
+    # image and the classic "default OFF => byte-identical to baseline" claim is what gets measured.
+    # Unequal => still a legitimate measurement ("does <feature> move the TEGRA knob-off image"), and
+    # the right one for a feature whose every site is gated on a second feature — but it is a DIFFERENT
+    # claim, so it is opt-in and the verdict line names the set.
+    if [ -n "$default_csv" ] && [ "$base_feats" != "$default_csv" ] && [ "${UNAOS_KNOBOFF_WITH_ENV:-}" != "1" ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — this environment does not compose the DEFAULT feature set.${COLOR_RESET}"
+        echo -e "         armed here : ${base_feats:-<none>}"
+        echo -e "         default    : ${default_csv}"
+        echo -e "         The knob-off build would not be the default image, which is what"
+        echo -e "         'default OFF => byte-identical to baseline' is a claim about. Either run with a"
+        echo -e "         clean environment, or say you mean the other claim:"
+        echo -e "         ${COLOR_YELLOW}UNAOS_KNOBOFF_WITH_ENV=1 <your knobs> ./arroyo knoboff $feat${COLOR_RESET}"
+        return 2
+    fi
+    if [ -z "$default_csv" ]; then
+        echo -e "${COLOR_YELLOW}⚠ knoboff: could not read the default feature set back from a knob-free re-entry;${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  proceeding, but the 'is this the default image' half is UNCHECKED this run.${COLOR_RESET}"
+    fi
+    # A feature that is ON by default inverts the question — knob-off then means REMOVING shipped code,
+    # and the baseline it is compared against still contains it. Say so rather than printing a verdict
+    # whose words ("knob-off byte-identical") mean something else here.
+    case ",${default_csv}," in
+        *",${feat},"*) echo -e "${COLOR_YELLOW}⚠ '${feat}' is ON by default: this run measures REMOVING it, not adding it.${COLOR_RESET}" ;;
+    esac
+
+    local SCR="${HOME}/unaos-bench/scratch/knoboff"
+    local TREE="$SCR/knoboff-tree" TGT="$SCR/target"
+    local STAMP; STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
+    local LOG="$SCR/build-$STAMP.log"
+    local PATCHF="$SCR/worktree-$STAMP.patch"
+    mkdir -p "$SCR" "$TGT"
+    : > "$LOG"
+
+    echo -e "${COLOR_PURPLE}══ knoboff: $feat ══${COLOR_RESET}"
+    echo -e "   baseline   ${base_sha}  $(cd "$REPO" && git log --format=%s -1 "$base_sha" | cut -c1-64)"
+    echo -e "   current    ${head_sha}$([ "$dirty" -eq 1 ] && echo ' + uncommitted diff')"
+    echo -e "   knob-off   x86: [${off_csv:-<none>}]   arm: [${off_arm:-<none>}]"
+    echo -e "   knob-on    x86: [${on_csv}]   arm: [${on_arm:-<none>}]"
+    echo -e "   tree       $TREE   (both builds run HERE — one directory, no path delta)"
+    echo -e "   log        $LOG"
+
+    ( cd "$REPO" && git diff HEAD ) > "$PATCHF"
+
+    # (6) THROWAWAY WORKTREE. Cached across runs so a second measurement is incremental.
+    if [ ! -e "$TREE/.git" ]; then
+        ( cd "$REPO" && git worktree prune ) >/dev/null 2>&1 || true
+        if ! ( cd "$REPO" && git worktree add --detach "$TREE" "$base_sha" ) >>"$LOG" 2>&1; then
+            echo -e "${COLOR_RED}knoboff: NO VERDICT — could not create the throwaway worktree; see $LOG${COLOR_RESET}"
+            return 2
+        fi
+    fi
+
+    _knoboff_checkout() { # $1 = sha, $2 = patch-to-apply or ""
+        ( cd "$TREE" \
+          && git checkout --detach -q "$1" \
+          && git reset --hard -q "$1" \
+          && git clean -fdq ) >>"$LOG" 2>&1 || return 1
+        if [ -n "${2:-}" ] && [ -s "$2" ]; then
+            ( cd "$TREE" && git apply --whitespace=nowarn "$2" ) >>"$LOG" 2>&1 || return 1
+        fi
+        return 0
+    }
+
+    local rc_base_x rc_base_a rc_cur_x rc_cur_a rc_on_x rc_on_a
+    local F_BX="$SCR/flat-base-x86.bin"  F_BA="$SCR/flat-base-arm.bin"
+    local F_CX="$SCR/flat-cur-x86.bin"   F_CA="$SCR/flat-cur-arm.bin"
+    local F_OX="$SCR/flat-armed-x86.bin" F_OA="$SCR/flat-armed-arm.bin"
+
+    echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF...${COLOR_RESET}"
+    if ! _knoboff_checkout "$base_sha" ""; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; return 2; fi
+    rc_base_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_BX" "$LOG" || rc_base_x=$?
+    rc_base_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_BA" "$LOG" || rc_base_a=$?
+
+    echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF...${COLOR_RESET}"
+    if ! _knoboff_checkout "$head_sha" "$PATCHF"; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; return 2; fi
+    rc_cur_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_CX" "$LOG" || rc_cur_x=$?
+    rc_cur_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_CA" "$LOG" || rc_cur_a=$?
+
+    echo -e "${COLOR_YELLOW}⚡ [3/3] current tree, knob ON (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
+    rc_on_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$on_csv" "$F_OX" "$LOG" || rc_on_x=$?
+    rc_on_a=0; _knoboff_flat "$TREE" "$TGT" arm "$on_arm" "$F_OA" "$LOG" || rc_on_a=$?
+
+    if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — a knob-OFF build failed (x86 base:$rc_base_x arm base:$rc_base_a x86 cur:$rc_cur_x arm cur:$rc_cur_a).${COLOR_RESET}"
+        echo -e "         tail of $LOG:"; tail -20 "$LOG" | sed 's/^/         /'
+        return 2
+    fi
+
+    # (7) CONTROL. Armed must differ from off on at least one arch. An x86-only feature legitimately
+    # leaves aarch64 alone (that is what `arm_features` is for), so the requirement is one arch, not
+    # both — but zero arches means this run could not have detected a difference at all.
+    local ctl_x=0 ctl_a=0
+    if [ $rc_on_x -eq 0 ] && ! cmp -s "$F_OX" "$F_CX"; then ctl_x=1; fi
+    if [ $rc_on_a -eq 0 ] && ! cmp -s "$F_OA" "$F_CA"; then ctl_a=1; fi
+    echo -e "   control    x86 armed≠off: $([ $ctl_x -eq 1 ] && echo YES || echo no)   arm armed≠off: $([ $ctl_a -eq 1 ] && echo YES || echo no)"
+    if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — arming '$feat' changed NEITHER image.${COLOR_RESET}"
+        if [ $rc_on_x -ne 0 ] || [ $rc_on_a -ne 0 ]; then
+            echo -e "         (the armed build itself failed: x86:$rc_on_x arm:$rc_on_a — a feature with an implied"
+            echo -e "          partner needs that partner's knob too; see this file's knob map.)"
+            tail -20 "$LOG" | sed 's/^/         /'
+        else
+            echo -e "         Either every site is gated on a SECOND feature nobody armed here (re-run as"
+            echo -e "         ${COLOR_YELLOW}UNAOS_<PARTNER>=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff $feat${COLOR_RESET}), or the"
+            echo -e "         feature emits no code at all. A comparison that cannot come out unequal is not a pass."
+        fi
+        return 2
+    fi
+
+    # (8) VERDICT.
+    local rc=0
+    local a
+    for a in x86 arm; do
+        local base cur bfile cfile
+        if [ "$a" = x86 ]; then bfile="$F_BX"; cfile="$F_CX"; else bfile="$F_BA"; cfile="$F_CA"; fi
+        base="$(_knoboff_id "$bfile")"; cur="$(_knoboff_id "$cfile")"
+        if cmp -s "$bfile" "$cfile"; then
+            echo -e "${COLOR_GREEN}   ✅ $a knob-off image BYTE-IDENTICAL to baseline — ${base}${COLOR_RESET}"
+        else
+            local nbytes; nbytes="$(cmp -l "$bfile" "$cfile" 2>/dev/null | wc -l | tr -d ' ')"
+            echo -e "${COLOR_RED}   ❌ $a knob-off image MOVED${COLOR_RESET}"
+            echo -e "${COLOR_RED}      baseline ${base}${COLOR_RESET}"
+            echo -e "${COLOR_RED}      current  ${cur}${COLOR_RESET}"
+            echo -e "${COLOR_RED}      ${nbytes} byte(s) differ$([ "${base##* }" != "${cur##* }" ] && echo ' — and the SIZE changed, so this is code, not a line shift')${COLOR_RESET}"
+            rc=1
+        fi
+    done
+
+    if [ $rc -eq 0 ]; then
+        echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired.${COLOR_RESET}"
+        echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built"
+        echo -e "   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack."
+    else
+        echo -e "${COLOR_RED}knoboff: FAIL — the knob-off image is not the baseline's. If nothing here is meant to be${COLOR_RESET}"
+        echo -e "${COLOR_RED}         armed by default, the usual cause is a LINE SHIFT: an inserted line moves every${COLOR_RESET}"
+        echo -e "${COLOR_RED}         panic::Location below it. Append onto an existing line (before its first //) or${COLOR_RESET}"
+        echo -e "${COLOR_RED}         put the statement inside an existing cfg region. EXECUTOR-BRIEF §5.${COLOR_RESET}"
+    fi
+    echo -e "   flat images kept in $SCR (flat-{base,cur,armed}-{x86,arm}.bin); patch $PATCHF"
+    return $rc
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -6869,6 +7190,11 @@ case "${1:-}" in
         shift
         exec python3 "${WORKSPACE_DIR}/scripts/mbench.py" "$@"
         ;;
+    knoboff)
+        # KNOBOFF: byte-identity of the knob-OFF image against a baseline, measured in ONE directory.
+        # Exit status IS the result (0 identical / 1 moved / 2 no verdict) — see knoboff() above.
+        knoboff "${2:-}" "${3:-}" || exit $?
+        ;;
     clean)
         clean_all
         ;;
@@ -6879,7 +7205,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
         exit 1
         ;;
 esac
