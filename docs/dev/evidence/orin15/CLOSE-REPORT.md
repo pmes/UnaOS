@@ -51,3 +51,5 @@ MENUBAR union gate on `adb3b1cd`: check exit 0 (both arches), test-arm exit 0, `
 banner, 69 PASS, 0 panics). Pi image: `kernel8.img` before = after (apply -R method; the value TCURX2.md records).
 CONSOLEQUIET fbcon commit `3329eec6` (approved by rmbp 12; union gate check + test-arm + wc + kernel8 sha running at write
 time — logs `~/unaos-bench/scratch/orin15/*-3329eec6.log`).
+CLICKDEAD v2 docs `c769e697` (split counters per rmbp; `CLICKDEAD-xhci.patch` v2; Pi image moves once, both shas in the
+doc; pi 7's re-accept asked; xhci/mod.rs applied on hw-jetson only after it).
