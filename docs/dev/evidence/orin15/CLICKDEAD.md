@@ -168,7 +168,10 @@ reports above the witness threshold with no click routed and move the fault down
 
 Refined to two sub-mechanisms that render6 cannot separate: **(a1)** completions arrive and the
 dup-guard's `param == prev` arm at `mod.rs:4594` consumes them without re-arming; **(a2)** no
-completion is posted for the pointer DCI at all. §5 is the instrument that separates them.
+completion is posted for the pointer DCI at all. §5 is the instrument that separates them,
+and patch v2 splits **(a1)** once more — `DUP-DROP` (the guard ate a recognised duplicate,
+repair in the guard) vs. `NOBUF-DROP` (`mouse_data_buffer`/`mouse_ring` gone, repair in the
+slot's soft state) — because the two need opposite fixes. §7.2.
 
 ### (b) reports arrive but are decoded by a path that never reaches `CLK_BTN`/the cursor — **REFUTED**
 
@@ -271,25 +274,43 @@ pre-existing line, so knob-off no line in `display_tegra.rs` moves. Measured, no
 `./arroyo kernel8` before and after the change → `kernel8.img` sha256
 `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0`, identical.
 
-### 5.2 Delivered as a patch, NOT committed (rmbp's lane) — `CLICKDEAD-xhci.patch`
+### 5.2 Delivered as a patch, NOT committed (rmbp's lane) — `CLICKDEAD-xhci.patch` v2
 
-`drivers/xhci/mod.rs` belongs to the rmbp seat, so the one hunk that separates (a1) from (a2) ships
-as `docs/dev/evidence/orin15/CLICKDEAD-xhci.patch` with its gate results, never as a commit to that
-file. It adds `MOUSE_DUP_DROP_COUNT` beside its three siblings and bumps it on the guard's silent
-exit (`param == prev || !have_buf`, the branch at `mod.rs:4594` that consumes a pointer completion,
-does not re-arm and prints nothing), plus the one-line fold in `display_tegra.rs` that appends
-`dup={}` to `[ptrpoll]`. Both hunks are line-neutral (statements folded onto existing lines), so the
-patch does not disturb the Pi's byte-identity proof either.
+`drivers/xhci/mod.rs` belongs to the rmbp seat, so the hunks that separate (a1) from (a2) ship
+as `docs/dev/evidence/orin15/CLICKDEAD-xhci.patch` with their gate results, never as a commit
+to that file. **rmbp 12 granted the file on 2026-09-06 on two binding conditions**, and the
+patch in the tree is v2, the revision those conditions produce (§7):
+
+1. **Split the conflated counter.** v1's single `MOUSE_DUP_DROP_COUNT` was bumped on
+   `param == prev || !have_buf` — two defects with opposite repairs under one name. v2 declares
+   `MOUSE_DUP_DROP_COUNT` (the known duplicate, buffer intact → the repair is in the guard) and
+   `MOUSE_NOBUF_DROP_COUNT` (`mouse_data_buffer`/`mouse_ring` gone → a teardown/allocation
+   defect; re-arming would be wrong, and the repair is in the slot's soft state). `!have_buf` is
+   tested first, so the two arms partition the branch. §7.2.
+2. **Keep the counters ungated, in their siblings' house pattern** — cited, not assumed:
+   `80ed35a4:MOUSE_REARM_COUNT`'s doc comment, `mod.rs:2373-2377`, *"Bumped unconditionally
+   (cheap relaxed adds); only the knob-gated witness prints."* §7.3.
+
+Both `xhci/mod.rs` hunks are folded onto existing lines (`7,7 -> 7,7`, `wc -l` 14917 = 14917),
+so the Pi's `panic::Location` layout is untouched. `display_tegra.rs` gains 4 lines at the file
+tail, where nothing follows to move. The Pi **image** still moves, because the counters are
+ungated by ruling: knob-off `kernel8.img`
+`d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` →
+`8ff7c1d1f4e8938d9a29df4a094ecc1fe01684350adeef8a577b13c5eb89dc13`, 1,254,984 bytes both. That
+cost is the substance of the grant; §7.5 states it in full.
 
 With the patch aboard the next boot reads:
 
 - `dup=` climbing while `reports=` stays flat → **(a1)**: completions ARE arriving and the
-  dup-guard is eating the pipeline. The fix is then in the guard: `param == prev` may only skip the
-  re-arm when a read is provably still outstanding.
-- `dup=0`, `rearm=` flat, `reports=` flat → **(a2)**: the controller posted nothing. The fix moves
-  to the endpoint — EP state / doorbell / periodic bandwidth (note `HUB slot 3 status-change
-  Configure-Endpoint code 8`, Bandwidth Error, ledger B2, on the same HS hub that carries the
-  mouse).
+  dup-guard is eating the pipeline. The fix is then in the guard: `param == prev` may only skip
+  the re-arm when a read is provably still outstanding.
+- `nobuf=` climbing → **(a1) with a different repair**: the completions arrive with
+  `mouse_data_buffer`/`mouse_ring` already gone. The guard is innocent; the fault is a teardown
+  or an allocation that cleared the buffer without disarming the endpoint.
+- `dup=0`, `nobuf=0`, `rearm=` flat, `reports=` flat → **(a2)**: the controller posted nothing.
+  The fix moves to the endpoint — EP state / doorbell / periodic bandwidth (note `HUB slot 3
+  status-change Configure-Endpoint code 8`, Bandwidth Error, ledger B2, on the same HS hub that
+  carries the mouse).
 
 ### 5.3 What the next boot should show on the wire
 
@@ -315,162 +336,251 @@ census's `reports=2`, is `ARMED-NO-COMPLETION` stated on the wire instead of inf
 
 ## 6. Gates
 
-Re-run in the resume worktree (`exec-orin15-clickdead2`), both states, every leg quoted.
+Re-run in this arc's worktree (`exec-orin15-clickdead3`, base `80ed35a4`), both states, every leg quoted.
 
 ### 6.1 The committed state (patch NOT applied — what the branch carries)
 
 | gate | result |
 |---|---|
-| `./arroyo check` | exit **0** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ bootloader OK`, 48 legs incl. `✅ arm-tegra-orinclick` and `✅ arm-tegra-render`, `✅ userspace x86_64 OK (4 crates)`, `✅ userspace aarch64 OK (5 crates)`, `✅ midden_core tests OK` |
-| `GATE-KNOB` | **OK** — 157 features declared, 156 named by a cfg, 0 phantom, 0 dead |
-| `GATE-LEDGER` | **OK** — 78 rows in 2 ledger files + RULINGS |
+| `./arroyo check` (committed tree, after the revert) | exit **0** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ bootloader OK`, `✅ kernel cfg coverage OK (49 legs)` incl. `✅ arm-tegra-orinclick` and `✅ arm-tegra-render`, `✅ userspace x86_64 OK (4 crates)`, `✅ userspace aarch64 OK (5 crates)`, `✅ midden_core tests OK` |
+| `GATE-KNOB` | **OK** — 158 features declared, 157 named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg |
+| `GATE-LEDGER` | **OK** — 84 rows in 2 ledger files + RULINGS |
 | `./arroyo test-arm 60` | exit **0** — `target/serial-arm.log`: 0 `-> FAIL`, 0 `EXCEPTION`/`panicked` |
 | armed jetson build (knob line §5.3) | exit **0** |
-| Pi `./arroyo kernel8` sha256, knob-off, `display_tegra.rs` at `8ab82761` → at `2de4a58b` | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` → **identical**, 1254984 bytes |
+| Pi `./arroyo kernel8` sha256, knob-off, at `80ed35a4` (= what this branch carries) | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0`, 1,254,984 bytes — unchanged from `2de4a58b`, and this arc adds no source change to move it |
 
-### 6.2 The patch applied (gated, then reverted — the branch keeps neither hunk)
+### 6.2 The patch applied (gated, then reverted — the branch keeps neither file's hunks)
 
 | gate | result |
 |---|---|
-| `git apply --check` on `CLICKDEAD-xhci.patch` | exit **0** |
-| `./arroyo check` patched | exit **0**, same 48 legs, GATE-KNOB and GATE-LEDGER OK |
-| armed jetson build patched | exit **0** |
-| Pi `./arroyo kernel8` sha256 patched | `41eda903e85796d3564fded936613a8616780d81e9d9c0d5dc7110bb3d247198` — **differs** (see §7.2; the counter is ungated by design), 1254984 bytes, `wc -l` on `xhci/mod.rs` 14917 = 14917 |
-| after `git checkout --` | `git diff f49ea1e7 -- unaos/crates/kernel/src/drivers/xhci/mod.rs` → **0 lines** |
+| `git apply --check` on `CLICKDEAD-xhci.patch` (v2, against the committed tree) | exit **0** |
+| `./arroyo check` patched | exit **0** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ bootloader OK`, 49 cfg-gated legs incl. `✅ arm-tegra-orinclick` and `✅ arm-tegra-render`, `✅ userspace x86_64 OK`, `✅ userspace aarch64 OK`, `✅ midden_core tests OK`; GATE-KNOB **OK** (158 features declared, 157 named by a cfg, 0 phantom, 0 dead), GATE-LEDGER **OK** (84 rows) |
+| `./arroyo test-arm 60` patched | exit **0** — `target/serial-arm.log`: 0 `-> FAIL`, 0 `EXCEPTION`/`panicked` |
+| armed jetson build patched (§5.3 knob line) | exit **0** |
+| Pi `./arroyo kernel8` sha256 patched | `8ff7c1d1f4e8938d9a29df4a094ecc1fe01684350adeef8a577b13c5eb89dc13` — **differs** from the unpatched `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` (see §7.5; the counters are ungated by ruling), 1,254,984 bytes both, `wc -l` on `xhci/mod.rs` 14917 = 14917 |
+| after `git checkout --` on **both** files | `git diff 80ed35a4 -- unaos/crates/kernel/src/drivers/xhci/mod.rs` → **0 lines**; same for `arch/aarch64/display_tegra.rs` → **0 lines** |
 
-### 6.3 `grep -a` on `target/aarch64_esp/kernel.elf` — with the known-absent control
+### 6.3 `grep -a -c -F` on `target/aarch64_esp/kernel.elf` — with the known-absent control
 
-A grep that only ever reports hits is not a gate. `DUP-DROP` and `dup=` are the control: same recipe,
-same tree, absent unpatched and present patched.
+A grep that only ever reports hits is not a gate. The four v2 tokens are the control: same
+recipe, same tree, absent unpatched and present patched. `-F` is mandatory — `[ptrpoll] t=` and
+`` `dup=` `` carry bracket metacharacters that a basic-regex grep would read as a class.
 
-| token | unpatched | patched |
+| token (`grep -a -c -F`) | unpatched | patched |
 |---|---|---|
-| `[ptrpoll] t=` | 2 | 2 |
+| `[ptrpoll] t=` | 1 | 1 |
 | ` errrearm=` | 1 | 1 |
-| ` decoded=` | 1 | 1 |
 | ` reports=` | 2 | 2 |
 | `ARMED-NO-COMPLETION` | 1 | 1 |
 | `GUARD-REARM` | 1 | 1 |
 | `ERROR-REARM` | 1 | 1 |
-| `STREAMING (the pointer read` | 1 | 1 |
-| `BASELINE (the enumeration arms` | 1 | 1 |
-| **` dup=`** | **0** | **2** |
 | **`DUP-DROP`** | **0** | **1** |
+| **`NOBUF-DROP`** | **0** | **1** |
+| **` dup=`** | **0** | **2** |
+| **` nobuf=`** | **0** | **2** |
 | `ZZQQ-NOT-A-TOKEN` (nonsense control) | 0 | 0 |
+
+Both artifacts were built in this worktree from the §5.3 knob line, the unpatched one after the
+revert — so the two columns differ in the patch and in nothing else.
 
 ---
 
-## 7. `CLICKDEAD-xhci.patch` — the hunk that separates (a1) from (a2), and render7's first question
+## 7. `CLICKDEAD-xhci.patch` v2 — the hunks that separate (a1) from (a2), and render7's first question
+
+**v2 supersedes v1.** rmbp 12 GRANTED `xhci/mod.rs` on 2026-09-06 on two binding conditions —
+split the conflated counter, and keep the counters ungated in their siblings' house pattern.
+§7.2 and §7.3 are what those conditions produce; the patch header states the same two, in the
+patch itself, so a reviewer reading only the patch sees the grant's terms.
 
 ### 7.1 What is in the branch and what is in the patch
 
-The branch `exec-orin15-clickdead2` carries `unaos/crates/kernel/src/drivers/xhci/mod.rs`
-**byte-identical to trunk**. That is a measured claim, not an intention:
+The branch `exec-orin15-clickdead3` carries `unaos/crates/kernel/src/drivers/xhci/mod.rs`
+**byte-identical to its base** `80ed35a4`. That is a measured claim, not an intention:
 
 ```
-git diff f49ea1e7 -- unaos/crates/kernel/src/drivers/xhci/mod.rs | wc -l   ->  0
+git diff 80ed35a4 -- unaos/crates/kernel/src/drivers/xhci/mod.rs | wc -l   ->  0
 ```
 
-The file is rmbp's lane (CLAUDE.md §Worktrees), so the hunk ships as
-`docs/dev/evidence/orin15/CLICKDEAD-xhci.patch` with its own gate results, the way A17 shipped
-`A17-prtscr.patch` for `prtscr.rs`. **`GRANT xhci/mod.rs` is asked of rmbp**; until it is given the
-patch is the deliverable.
+The file is rmbp's lane (CLAUDE.md §Worktrees), so the hunks ship as
+`docs/dev/evidence/orin15/CLICKDEAD-xhci.patch` with their own gate results, the way A17
+shipped `A17-prtscr.patch` for `prtscr.rs`.
 
-The patch carries **four hunks across two files**, and the second file needs saying out loud:
-`arch/aarch64/display_tegra.rs` **is** orin's lane, but its two `dup` hunks ride in the patch and not
-in the commit because they name `MOUSE_DUP_DROP_COUNT`, which does not exist until the first file's
-hunk lands. Committing them alone would leave the branch unbuildable. **Apply both or neither.**
+The patch carries **six hunks across two files** (v1 had four; v2 gains two in
+`display_tegra.rs` for the second verdict and the doc comments it invalidates), and the second
+file needs saying out loud: `arch/aarch64/display_tegra.rs` **is** orin's lane, but its hunks
+ride in the patch and not in the commit because they name `MOUSE_DUP_DROP_COUNT` and
+`MOUSE_NOBUF_DROP_COUNT`, which do not exist until the first file's hunks land. Committing them
+alone would leave the branch unbuildable. **Apply both or neither**, and the branch therefore
+carries neither:
 
-### 7.2 The mechanism the patch instruments, stated once
+```
+git diff 80ed35a4 -- unaos/crates/kernel/src/arch/aarch64/display_tegra.rs | wc -l   ->  0
+```
 
-Not "a TRB is not re-queued" — **a completion is consumed and the read is never re-armed, silently**.
-In `2de4a58b:XhciController::poll_events`, pointer arm (`mouse_dci == Some(endpoint_id)`,
-`mod.rs:4560`), the dup-Success guard fires on
-`slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys` (`mod.rs:4587`). Inside it,
-`2de4a58b:XhciController::queue_mouse_read` (`mod.rs:14846`) is called **only** under
-`param != prev && have_buf` (`mod.rs:4594`). The complement — `param == slot.mouse_prev_phys` (the
-known Panther-Point duplicate Success for the TD already consumed), or `mouse_data_buffer` /
-`mouse_ring` gone — falls through to the bare `return;` at `mod.rs:4599`, which:
+The claim is pinned to the base **sha**, not to the `hw-jetson` ref, because that ref moves:
+during this arc another orin commit landed on it (tip `8f73ff12`, CONSOLEQUIET). Both files
+are 0-diff against that tip as well — `git diff 8f73ff12 -- …/xhci/mod.rs` and
+`… -- …/arch/aarch64/display_tegra.rs` are both `0` — so neither the base nor the current
+track tip disagrees with the branch on either file.
 
-* consumes the transfer event (the ring dequeue pointer has already advanced),
-* enqueues **no** new interrupt-IN TD on the pointer DCI and rings no doorbell — the endpoint is
-  left with nothing armed, and
-* prints nothing, because its only witness `2de4a58b:XhciController::piusb39_witness`
-  (`mod.rs:14730-14731`) is `#[cfg(feature = "usbdebug")]`, and `usbdebug` is not in the Orin flight
-  recipe.
+v1's base was `2de4a58b`; FOLDFIX (`80ed35a4`) moved `ptrpoll_witness` from
+`display_tegra.rs:5111` to `:5361`, so v1's hunks for that file no longer sat at their stated
+offsets. v2's hunks are regenerated against `80ed35a4` and `git apply --check` is **exit 0**
+there (§6.2).
 
-Every other exit already accounts for itself — `2de4a58b:MOUSE_REARM_COUNT` (`mod.rs:2373`),
-`2de4a58b:MOUSE_DISCARD_REARM_COUNT` (`mod.rs:2378`),
-`2de4a58b:MOUSE_ERROR_REARM_COUNT` (`mod.rs:2385`), and halting completions go to the **ungated**
-`2de4a58b:XhciController::hid_error_witness` (`mod.rs:14748`). This one branch is the whole blind
-spot, and on the wire it is indistinguishable from "the controller posted nothing" — the exact
-ambiguity render6 died in.
+### 7.2 THE SPLIT — rmbp condition 1, and why one counter was wrong
 
-The patch adds `MOUSE_DUP_DROP_COUNT` (a fourth ungated `pub AtomicU64`, bumped on precisely that
-branch) and the `dup=` field plus a `DUP-DROP` verdict in `2de4a58b:ptrpoll_witness`
-(`display_tegra.rs:5111`). It also folds `dup` into the witness's movement test — **without that, a
-pipeline being EATEN (rearm flat, dup climbing) would be silently mistaken for one that is STARVED**
-and print one line for the whole boot. After the patch:
+v1 bumped a single atomic on `param == prev || !have_buf`. rmbp 12's grant condition names the
+defect exactly: that predicate **conflates two failures whose repairs point in opposite
+directions**, so a single `dup>0` on the wire would have named a symptom and not a fix.
+
+| the arm | what actually happened | where the repair goes |
+|---|---|---|
+| `param == slot.mouse_prev_phys`, buffer and ring PRESENT | the known Panther-Point duplicate Success (XHCI_SPURIOUS_SUCCESS, device 0x1e31) for a TD already consumed. The guard skips the re-arm **by design**: a fresh read is supposed to be outstanding, and re-arming would over-arm the interrupt-IN ring (the UI1-MOUSE M2 hazard) | **in the guard** — `param == prev` may only skip the re-arm when a read is *provably* outstanding |
+| `slot.mouse_data_buffer` / `slot.mouse_ring` GONE | a teardown or allocation defect. Re-arming here would be flatly **wrong** — there is nothing to arm | **in the slot's soft state** (`Slot::reset_soft_state`, `mod.rs:2991`, and whoever cleared the buffer without disarming the endpoint). The dup discrimination cannot touch this class |
+
+v2 therefore gives each its own ungated `pub AtomicU64` and its own verdict:
 
 | verdict | meaning |
 |---|---|
-| `-> DUP-DROP` | **(a1)** completions arrive; the guard eats them without re-arming |
-| `-> ARMED-NO-COMPLETION` | **(a2)** `dup=0`; the endpoint posted nothing — look at EP state, the doorbell and periodic bandwidth, not at the guard |
+| `-> DUP-DROP` | **(a1)** completions arrive; the guard ate one it recognised as the known duplicate |
+| `-> NOBUF-DROP` | **(a1)** completions arrive; the buffer/ring was already gone. **A different fix** |
+| `-> ARMED-NO-COMPLETION` | **(a2)** `dup=0` and `nobuf=0`; the endpoint posted nothing — look at EP state, the doorbell and periodic bandwidth, not at the guard |
 
-**Diagnostic only.** The guard's control flow is unchanged; the dup hazard is real (re-arming on a
-genuine duplicate over-arms the interrupt-IN ring — the UI1-MOUSE M2 hazard) and PIUSB-39's
-discrimination stays exactly as it is. One relaxed `fetch_add`, one relaxed load. No lock, no MMIO.
+**Precedence, stated because the two arms overlap.** Reaching the counted exit means
+`!(param != prev && have_buf)`, so `!have_buf` and `param == prev` cover it exhaustively but
+not disjointly. `!have_buf` is tested **first**: a duplicate arriving after the buffer is gone
+scores `NOBUF`, because the missing buffer is the actionable fault and the duplicate is noise
+on top of it. The two arms partition the branch, so `dup + nobuf` is its exact total.
 
-**Line-neutral yes; byte-neutral on the Pi image NO.** These are two claims and an earlier draft
-conflated them. Measured, both:
+### 7.3 UNGATED — rmbp condition 2, cited
 
-* **Line-neutral, verified.** `drivers/xhci/mod.rs` compiles into the Pi's `kernel8.img`, and a line
-  added anywhere in it moves every `panic::Location` below. Its two hunks are folded onto existing
-  lines: `wc -l` reads **14917 patched == 14917 unpatched**. `display_tegra.rs` gains 2 lines, both
-  past its old tail (5032), so nothing pre-existing moves there either.
-* **NOT byte-neutral**, and the patch says so rather than claiming otherwise:
+The two new statics follow the house pattern of the three they join, and the pattern has a
+citation rather than a habit behind it — `80ed35a4:MOUSE_REARM_COUNT`'s doc comment,
+`unaos/crates/kernel/src/drivers/xhci/mod.rs:2373-2377`:
+
+> PIUSB-39 witness counters. `MOUSE_REARM_COUNT` = every `queue_mouse_read` the transfer
+> dispatch issued; … **Bumped unconditionally (cheap relaxed adds); only the knob-gated witness
+> prints.**
+
+So `MOUSE_DUP_DROP_COUNT` and `MOUSE_NOBUF_DROP_COUNT` sit beside
+`80ed35a4:MOUSE_REARM_COUNT` (`mod.rs:2377`), `80ed35a4:MOUSE_DISCARD_REARM_COUNT`
+(`mod.rs:2380`) and `80ed35a4:MOUSE_ERROR_REARM_COUNT` (`mod.rs:2385`) under that same rule:
+the **count** is unconditional, the **print** is knob-gated (`ptrpoll_witness` is
+`#[cfg(feature = "orinclick")]`). The alternatives were both refused, and for named reasons:
+gating on `orinclick` would put a board-named knob in a shared driver, which
+MEMORY:"name by subsystem, not board" forbids; gating on `usbdebug` would rebuild the very
+blind spot the patch exists to close.
+
+### 7.4 The mechanism the patch instruments, stated once
+
+Not "a TRB is not re-queued" — **a completion is consumed and the read is never re-armed,
+silently**. In `80ed35a4:XhciController::poll_events`, pointer arm
+(`mouse_dci == Some(endpoint_id)`, `mod.rs:4560`), the dup-Success guard fires on
+`slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys` (`mod.rs:4587`). Inside it,
+`80ed35a4:XhciController::queue_mouse_read` (`mod.rs:14846`) is called **only** under
+`param != prev && have_buf` (`mod.rs:4593`). The complement falls through to the bare `return;`
+at `mod.rs:4599`, which:
+
+* consumes the transfer event (the ring dequeue pointer has already advanced),
+* enqueues **no** new interrupt-IN TD on the pointer DCI and rings no doorbell — the endpoint
+  is left with nothing armed, and
+* prints nothing, because its only witness `80ed35a4:XhciController::piusb39_witness`
+  (`mod.rs:14730-14731`) is `#[cfg(feature = "usbdebug")]`, and `usbdebug` is not in the Orin
+  flight recipe.
+
+Every other exit already accounts for itself — `80ed35a4:MOUSE_REARM_COUNT` (`mod.rs:2377`),
+`80ed35a4:MOUSE_DISCARD_REARM_COUNT` (`mod.rs:2380`),
+`80ed35a4:MOUSE_ERROR_REARM_COUNT` (`mod.rs:2385`), and halting completions go to the
+**ungated** `80ed35a4:XhciController::hid_error_witness` (`mod.rs:14748`). This one branch is
+the whole blind spot, and on the wire it is indistinguishable from "the controller posted
+nothing" — the exact ambiguity render6 died in.
+
+The patch adds the two counters above, the `dup=` and `nobuf=` fields plus the `DUP-DROP` and
+`NOBUF-DROP` verdicts in `80ed35a4:ptrpoll_witness` (`display_tegra.rs:5361`), and folds **both
+drops** into the witness's movement test (`PTRPOLL_LAST.swap(rearm + dup + nobuf)`) — **without
+that, a pipeline being EATEN (rearm flat, drops climbing) would be silently mistaken for one
+that is STARVED** and print one line for the whole boot.
+
+**Diagnostic only.** The guard's control flow is unchanged; the dup hazard is real and
+PIUSB-39's discrimination stays exactly as it is. Two relaxed `fetch_add`s of which **at most
+one executes per completion**, two relaxed loads on the census pass. No lock, no MMIO.
+
+### 7.5 THE COST — line-neutral in `xhci/mod.rs`, and the Pi image MOVES
+
+Three claims, measured separately, because v1's first draft conflated the first and the third.
+
+* **Line-neutral in `drivers/xhci/mod.rs` — YES.** That file compiles into the Pi's
+  `kernel8.img`, and a line added anywhere in it moves every `panic::Location` below
+  (MEMORY: "cfg does not protect byte identity"). Both hunks are folded onto existing lines and
+  both hunk headers read `7,7 -> 7,7`. Position proof (`python3`, base `80ed35a4` vs. patched):
+
+  ```
+  line counts     : old 14917  new 14917  -> EQUAL
+  differing lines : [2385, 4599]
+  MOUSE_ERROR_REARM_COUNT decl : old [2385]  new [2385]
+  MOUSE_DUP_DROP_COUNT decl    : new [2385]
+  MOUSE_NOBUF_DROP_COUNT decl  : new [2385]
+  guard bare `return;`         : old [4599]
+  guard folded `return;`       : new [4599]
+  ```
+
+* **`arch/aarch64/display_tegra.rs` gains 4 lines (5397 -> 5401) and is NOT line-neutral.**
+  rmbp's note is the general rule and it holds: added lines move every `panic::Location`
+  **below their site inside that file**. So the claim is measured, not asserted — at `80ed35a4`
+  `ptrpoll_witness` occupies `:5361-5397`, i.e. **it is the file tail**, so the set of
+  `Location`s below the site is empty and nothing pre-existing in that file moves either. The
+  four added lines are the two new verdict arms; every other change in the file is folded onto
+  an existing line.
+
+* **BYTE-neutral on the Pi image — NO. `kernel8.img` MOVES, and that is the cost of the
+  grant.** Measured knob-off, `./arroyo kernel8`, in this worktree:
 
   | knob-off `./arroyo kernel8` | `kernel8.img` sha256 | size |
   |---|---|---|
-  | patch **not** applied | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` | 1254984 |
-  | patch applied | `41eda903e85796d3564fded936613a8616780d81e9d9c0d5dc7110bb3d247198` | 1254984 |
+  | patch **not** applied (branch state, = `80ed35a4`) | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` | 1,254,984 bytes |
+  | patch applied | `8ff7c1d1f4e8938d9a29df4a094ecc1fe01684350adeef8a577b13c5eb89dc13` | 1,254,984 bytes |
 
-  Same size, different content. The reason is deliberate: `MOUSE_DUP_DROP_COUNT` and its `fetch_add`
-  are **ungated**, exactly like the three siblings they join (`mod.rs:2373-2385`). Gating them on
-  `orinclick` would put a board-named knob in a shared driver, which the "name by subsystem, not
-  board" rule forbids; gating them on `usbdebug` would rebuild the very blind spot the patch exists
-  to close. The cost is one 8-byte BSS atomic and one relaxed increment on the pointer-completion
-  path in every aarch64 image — no new file bytes, no lock, no MMIO, no control-flow change.
-  **That cost is the substance of the `GRANT xhci/mod.rs` ask**, and it is why this is a patch and
-  not a commit.
+  Same size, **different content**. The reason is §7.3: the counters are ungated by ruling, not
+  by oversight. The cost is **two 8-byte BSS atomics and one relaxed increment** on the
+  pointer-completion path in every aarch64 image — no new file bytes, no lock, no MMIO, no
+  control-flow change. That cost is the substance of the grant, and it is why this is a patch
+  and not a commit.
 
-### 7.3 render7's FIRST metal question
+### 7.6 render7's FIRST metal question
 
-**The witness line is `[ptrpoll]`** — nine bytes, deliberately longer than eight so it cannot be
-folded into an LLVM immediate and must land in `.rodata`, which is what makes `grep -a` on the
-artifact a reachability proof rather than a compile proof. It already exists (`2de4a58b`); render7
-needs no new code to answer this.
+**The witness line is `[ptrpoll]`** — nine bytes, deliberately longer than eight so it cannot
+be folded into an LLVM immediate and must land in `.rodata`, which is what makes `grep -a` on
+the artifact a reachability proof rather than a compile proof. It already exists (`80ed35a4`);
+render7 needs no new code to answer this.
 
-**The question, scored on ONE line and one field.** The first `[ptrpoll]` line rides census `seq=1`,
-which on render6 landed at `up=10s` / `t=71` (`render6-boot1.log:701`) — about ten seconds after
-`:: tegra: JB2b — keyboard ARMED ::` (`:307`) and its companion `2 pointer(s) armed` (`:356`). Read
-its `rearm=` field:
+**The question, scored on ONE line and one field.** The first `[ptrpoll]` line rides census
+`seq=1`, which on render6 landed at `up=10s` / `t=71` (`render6-boot1.log:701`) — about ten
+seconds after `:: tegra: JB2b — keyboard ARMED ::` (`:307`) and its companion
+`2 pointer(s) armed` (`:356`). Read its `rearm=` field:
 
 | first `[ptrpoll]` line | verdict | what it means |
 |---|---|---|
 | `rearm=2` | the reads **STOPPED** | two arms exist and they are the two enumeration arms (`mod.rs:4310`, one per pointer — this board enumerates the relative boot-mouse on slot 4 and the absolute pointer on slot 5). Nothing has completed since enumeration. This is the render6 boot-1 shape, stated instead of inferred. |
 | `rearm>2` | the reads **RE-ARMED** | completions are arriving and the pointer pipeline is alive; the dead click above that line is a routing fault and the hunt moves downstream. |
 
-A single sample decides it, which is the point: the movement test in `ptrpoll_witness` needs two
-census passes (~20 s) and the boot-1 failure is already fully formed at ten. `reports=` on the
-`[orinclick] census` line of the same pass carries the same balance, so the two lines cannot
-disagree — both come from the same loads.
+A single sample decides it, which is the point: the movement test in `ptrpoll_witness` needs
+two census passes (~20 s) and the boot-1 failure is already fully formed at ten. `reports=` on
+the `[orinclick] census` line of the same pass carries the same balance, so the two lines
+cannot disagree — both come from the same loads.
 
-With the patch applied, the same first line's `dup=` field answers the follow-up in the same
-ten seconds: `dup>0` = (a1) eaten, `dup=0` with `rearm=2` = (a2) starved.
+With the patch applied, the same first line's `dup=` and `nobuf=` fields answer the follow-up
+in the same ten seconds, and v2 answers it one level deeper than v1 could:
 
-### 7.4 The known-absent control for the `grep -a` gate
+| `dup=` | `nobuf=` | reading |
+|---|---|---|
+| `>0` | `0` | **(a1) eaten by the dup guard** — the repair is the guard's discrimination |
+| `0` | `>0` | **(a1) eaten with no buffer** — the repair is the slot's soft state; the guard is innocent |
+| `0` | `0`, `rearm=2` | **(a2) starved** — EP state / doorbell / periodic bandwidth |
 
-A `grep -a` that only ever reports hits is not a gate. `DUP-DROP` is the control: it is **absent**
-from the unpatched armed artifact and **present** in the patched one, built from the same recipe on
-the same tree. Both counts are recorded in §6.
+### 7.7 The known-absent control for the `grep -a` gate
+
+A `grep -a` that only ever reports hits is not a gate. `DUP-DROP`, `NOBUF-DROP`, ` dup=` and
+` nobuf=` are the control: all four are **absent** from the unpatched armed artifact and
+**present** in the patched one, built from the same recipe on the same tree, and a nonsense
+token is 0 in both. Both columns are recorded in §6.3.

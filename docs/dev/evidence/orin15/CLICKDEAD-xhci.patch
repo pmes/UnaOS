@@ -1,139 +1,236 @@
-CLICKDEAD-xhci — the fourth pointer counter: the dup-Success guard's SILENT exit.
-=================================================================================
+CLICKDEAD-xhci — v2 — the guard's SILENT exit, counted as TWO populations.
+==========================================================================
+
+**v2 supersedes v1.** rmbp 12 GRANTED `xhci/mod.rs` on 2026-09-06 with two binding
+conditions, and this revision is what they produce:
+
+  1. **SPLIT the counter.** v1's single `MOUSE_DUP_DROP_COUNT`, bumped on
+     `param == prev || !have_buf`, CONFLATED two failures that need opposite repairs.
+     v2 declares a second ungated atomic, `MOUSE_NOBUF_DROP_COUNT`, and the guard's exit
+     scores exactly one of them. See "THE SPLIT" below.
+  2. **The counters stay UNGATED, in the house pattern of their siblings.** The pattern is
+     `80ed35a4:MOUSE_REARM_COUNT`'s doc comment (`drivers/xhci/mod.rs:2373-2377`): *"Bumped
+     unconditionally (cheap relaxed adds); only the knob-gated witness prints."* The two new
+     statics join `80ed35a4:MOUSE_REARM_COUNT` (`:2377`),
+     `80ed35a4:MOUSE_DISCARD_REARM_COUNT` (`:2380`) and `80ed35a4:MOUSE_ERROR_REARM_COUNT`
+     (`:2385`) on that rule. That is what moves the Pi image, and it is the whole substance of
+     the grant — see "THE COST" below.
 
 LANE. `unaos/crates/kernel/src/drivers/xhci/mod.rs` is rmbp's lane (CLAUDE.md §Worktrees).
-This hunk is therefore delivered as a patch and is NOT committed to that file; the orin
-branch `exec-orin15-clickdead2` carries `drivers/xhci/mod.rs` byte-identical to trunk
-(`git diff f49ea1e7 -- unaos/crates/kernel/src/drivers/xhci/mod.rs` -> 0 lines). Asked of
-rmbp as `GRANT xhci/mod.rs`, the way A17 asked for `prtscr.rs`.
+This hunk is therefore delivered as a PATCH and is NOT committed to that file; the orin branch
+`exec-orin15-clickdead3` carries `drivers/xhci/mod.rs` byte-identical to its base
+(`git diff 80ed35a4 -- unaos/crates/kernel/src/drivers/xhci/mod.rs` -> 0 lines).
 
 APPLY.  git apply docs/dev/evidence/orin15/CLICKDEAD-xhci.patch
-Base: 2de4a58b (`aarch64/tegra: CLICKDEAD — …`), whose `drivers/xhci/mod.rs` == trunk
-f49ea1e7's. The second file, `arch/aarch64/display_tegra.rs`, IS orin's lane, but its `dup`
-hunks ride HERE and not in the commit for one reason: they name `MOUSE_DUP_DROP_COUNT`,
-which does not exist until the first file's hunk lands. Splitting them would leave the
-branch unbuildable. Apply both or neither.
+Base: `80ed35a4` (`aarch64/tegra: FOLDFIX — display_tegra.rs tail union …`), the hw-jetson tip.
+v1's base was `2de4a58b`; FOLDFIX moved `ptrpoll_witness` from `display_tegra.rs:5111` to
+`:5361`, so v1's `display_tegra.rs` hunks no longer sit at their stated offsets. The hunks
+below are regenerated against `80ed35a4` and apply there exactly.
 
-THE MECHANISM, NAMED. Not "a TRB is not re-queued" — a COMPLETION IS CONSUMED AND THE READ
-IS NEVER RE-ARMED, and the discard is silent. At `2de4a58b:XhciController::poll_events`,
-in the pointer arm guarded by `mouse_dci == Some(endpoint_id)` (mod.rs:4560), the
-dup-Success guard fires when `slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys`
-(mod.rs:4587). Inside it, `2de4a58b:XhciController::queue_mouse_read` (mod.rs:14846) is called
-ONLY under `param != prev && have_buf` (mod.rs:4594). The complement —
-`param == slot.mouse_prev_phys` (the known Panther-Point duplicate Success for the TD already
-consumed, XHCI_SPURIOUS_SUCCESS / device 0x1e31), OR `slot.mouse_data_buffer` /
-`slot.mouse_ring` gone — falls through to the bare `return;` at mod.rs:4599. That branch:
+The second file, `arch/aarch64/display_tegra.rs`, IS orin's lane, but its hunks ride HERE and
+not in the commit for one reason: they name `MOUSE_DUP_DROP_COUNT` and
+`MOUSE_NOBUF_DROP_COUNT`, which do not exist until the first file's hunk lands. Splitting them
+would leave the branch unbuildable. **Apply both or neither.**
+
+THE MECHANISM, NAMED. Not "a TRB is not re-queued" — a COMPLETION IS CONSUMED AND THE READ IS
+NEVER RE-ARMED, and the discard is silent. At `80ed35a4:XhciController::poll_events`, in the
+pointer arm guarded by `mouse_dci == Some(endpoint_id)` (mod.rs:4560), the dup-Success guard
+fires when `slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys` (mod.rs:4587).
+Inside it, `80ed35a4:XhciController::queue_mouse_read` (mod.rs:14846) is called ONLY under
+`param != prev && have_buf` (mod.rs:4593). The complement falls through to the bare `return;`
+at mod.rs:4599. That branch:
 
   * consumes the transfer event (the ring dequeue pointer has already advanced),
-  * does NOT call `queue_mouse_read`, so no new interrupt-IN TD is enqueued on the pointer
-    DCI and no doorbell rings — the endpoint is left with nothing armed,
+  * does NOT call `queue_mouse_read`, so no new interrupt-IN TD is enqueued on the pointer DCI
+    and no doorbell rings — the endpoint is left with nothing armed,
   * and prints NOTHING on the flight build, because its only witness,
-    `2de4a58b:XhciController::piusb39_witness` (mod.rs:14730-14731), is
+    `80ed35a4:XhciController::piusb39_witness` (mod.rs:14730-14731), is
     `#[cfg(feature = "usbdebug")]` and `usbdebug` is absent from the Orin flight recipe
     (witness,ehcihid,holocron,tegra,orinclick,tegra_el0,tegrasmp,orinrender,
     desktop_firmware,orinrx,tcuprobe,deskcascade).
 
-Every OTHER exit accounts for itself: `2de4a58b:MOUSE_REARM_COUNT` (mod.rs:2373) on every
-`queue_mouse_read`, `2de4a58b:MOUSE_DISCARD_REARM_COUNT` (mod.rs:2378) on the guard's
-re-arming exit, `2de4a58b:MOUSE_ERROR_REARM_COUNT` (mod.rs:2385) on the non-halting error
-re-arm, and halting completions go to `2de4a58b:XhciController::hid_error_witness`
-(mod.rs:14748), which is UNGATED. So this one branch is the whole blind spot, and on the
-wire it is INDISTINGUISHABLE from "the controller posted no transfer event at all" — which
-is exactly the ambiguity render6 died in (`docs/dev/evidence/orin15/render6-boot1.log`:
+Every OTHER exit accounts for itself: `80ed35a4:MOUSE_REARM_COUNT` (mod.rs:2377) on every
+`queue_mouse_read`, `80ed35a4:MOUSE_DISCARD_REARM_COUNT` (mod.rs:2380) on the guard's
+re-arming exit, `80ed35a4:MOUSE_ERROR_REARM_COUNT` (mod.rs:2385) on the non-halting error
+re-arm, and halting completions go to `80ed35a4:XhciController::hid_error_witness`
+(mod.rs:14748), which is UNGATED. So this one branch is the whole blind spot, and on the wire
+it is INDISTINGUISHABLE from "the controller posted no transfer event at all" — which is
+exactly the ambiguity render6 died in (`docs/dev/evidence/orin15/render6-boot1.log`:
 `:: MOUSE-1: 1 reports ::` once at line 286 and never again, zero `hid_error_witness` lines,
 zero `JD20 — pointer BUTTON`).
 
-WHAT THE PATCH ADDS. `MOUSE_DUP_DROP_COUNT`, a fourth ungated `pub AtomicU64` bumped on
-exactly that branch, and the `dup=` field + `DUP-DROP` verdict that
-`2de4a58b:ptrpoll_witness` (display_tegra.rs:5111) prints from it. It also folds `dup` into
-the witness's movement test — without that, a pipeline being EATEN (rearm flat, dup climbing)
-would be silently mistaken for one that is STARVED and print one line for the whole boot.
-After this patch the two live sub-mechanisms are separated on a single line:
+THE SPLIT (rmbp condition 1) — WHY ONE COUNTER WAS WRONG.
+v1 bumped one atomic on `param == prev || !have_buf`. Those are two different defects whose
+repairs point in opposite directions, so a single `dup>0` on the wire would have named a
+symptom and not a fix:
 
-  `-> DUP-DROP`            = (a1) completions arrive; the guard eats them without re-arming.
-  `-> ARMED-NO-COMPLETION` = (a2) dup=0; the endpoint posted nothing. Look at EP state, the
-                             doorbell and periodic bandwidth, not at the guard.
+  * `param == slot.mouse_prev_phys`, buffer and ring PRESENT — the known Panther-Point
+    duplicate Success (XHCI_SPURIOUS_SUCCESS, device 0x1e31) for a TD already consumed. The
+    guard skips the re-arm BY DESIGN: a fresh read is supposed to be outstanding already, and
+    re-arming would over-arm the interrupt-IN ring (the UI1-MOUSE M2 hazard). If that
+    assumption is wrong on this board, the repair is IN THE GUARD — `param == prev` may only
+    skip the re-arm when a read is provably outstanding.
+  * `slot.mouse_data_buffer` / `slot.mouse_ring` GONE — a teardown or allocation defect. Here
+    re-arming would be flatly WRONG: there is nothing to arm. The repair is in the slot's soft
+    state (`Slot::reset_soft_state`, mod.rs:2991, and whoever cleared the buffer without
+    disarming the endpoint), and it is a class of fault the dup discrimination cannot touch.
 
-The patch is DIAGNOSTIC ONLY. It does not change the guard's control flow — the dup hazard
-is real (re-arming on a genuine duplicate over-arms the interrupt-IN ring, the UI1-MOUSE M2
-hazard) and PIUSB-39's discrimination stays exactly as it is. It adds one relaxed
-`fetch_add` and one relaxed load. No lock, no MMIO.
+v2 therefore gives each its own ungated `pub AtomicU64` and its own verdict:
 
-LINE-NEUTRAL — YES. BYTE-NEUTRAL ON THE PI IMAGE — NO, AND THAT IS THE COST OF THE GRANT.
-Two separate claims, both measured, and an earlier draft of this header conflated them.
+  `-> DUP-DROP`   = the guard ate a completion it recognised as the known duplicate.
+  `-> NOBUF-DROP` = the completion arrived with the buffer/ring already gone.
 
-  * LINE-neutral, verified. `drivers/xhci/mod.rs` is compiled into the Pi's `kernel8.img`,
-    and a line added anywhere in it moves every `panic::Location` below (MEMORY: "cfg does
-    not protect byte identity"). Both of its hunks are therefore FOLDED ONTO EXISTING LINES:
-    `wc -l` reads **14917 patched == 14917 unpatched**. Nothing moves. `display_tegra.rs`
-    gains 2 lines, but both are past its old tail (5032), so nothing pre-existing moves
-    there either.
+PRECEDENCE, stated because the two arms can overlap. Reaching the counted exit means
+`!(param != prev && have_buf)`, so `!have_buf` and `param == prev` cover it exhaustively but
+not disjointly. `!have_buf` is tested FIRST: a duplicate that arrives after the buffer is gone
+scores NOBUF, because the missing buffer is the actionable fault and the duplicate is noise on
+top of it. The two arms therefore partition the branch, and `dup + nobuf` is its exact total.
+
+WHAT THE PATCH ADDS.
+  * `MOUSE_DUP_DROP_COUNT` and `MOUSE_NOBUF_DROP_COUNT` — two ungated `pub AtomicU64`s, folded
+    onto the `MOUSE_ERROR_REARM_COUNT` declaration line, bumped on exactly that branch.
+  * `dup=` and `nobuf=` fields on the `[ptrpoll]` census line printed by
+    `80ed35a4:ptrpoll_witness` (display_tegra.rs:5361), and the `DUP-DROP` / `NOBUF-DROP`
+    verdicts.
+  * `dup` and `nobuf` folded into the witness's MOVEMENT test
+    (`PTRPOLL_LAST.swap(rearm + dup + nobuf)`). Without that, a pipeline being EATEN (rearm
+    flat, drops climbing) would be silently mistaken for one that is STARVED and print one
+    line for the whole boot.
+
+After this patch the three live sub-mechanisms are separated on a single line:
+
+  `-> DUP-DROP`            = (a1) completions arrive; the guard eats a recognised duplicate.
+  `-> NOBUF-DROP`          = (a1) completions arrive; the buffer/ring is gone. Different fix.
+  `-> ARMED-NO-COMPLETION` = (a2) dup=0 and nobuf=0; the endpoint posted nothing. Look at EP
+                             state, the doorbell and periodic bandwidth, not at the guard.
+
+The patch is DIAGNOSTIC ONLY. It does not change the guard's control flow — the dup hazard is
+real and PIUSB-39's discrimination stays exactly as it is. It adds two relaxed `fetch_add`s
+(at most ONE of which executes per completion) and two relaxed loads on the census pass. No
+lock, no MMIO.
+
+LINE-NEUTRAL IN `xhci/mod.rs` — YES. BYTE-NEUTRAL ON THE PI IMAGE — NO, AND THAT IS THE COST
+OF THE GRANT. Two separate claims, both measured, and v1's header was right to separate them.
+
+  * LINE-neutral in `drivers/xhci/mod.rs`, verified. That file is compiled into the Pi's
+    `kernel8.img`, and a line added anywhere in it moves every `panic::Location` below
+    (MEMORY: "cfg does not protect byte identity"). Both of its hunks are therefore FOLDED
+    ONTO EXISTING LINES and both hunk headers read `7,7 -> 7,7`. Position proof, `python3`,
+    base `80ed35a4` vs. patched:
+
+        line counts     : old 14917  new 14917  -> EQUAL
+        differing lines : [2385, 4599]
+        MOUSE_ERROR_REARM_COUNT decl : old [2385]  new [2385]
+        MOUSE_DUP_DROP_COUNT decl    : new [2385]
+        MOUSE_NOBUF_DROP_COUNT decl  : new [2385]
+        guard bare `return;`         : old [4599]
+        guard folded `return;`       : new [4599]
+
+    Nothing in that file moves.
+  * `arch/aarch64/display_tegra.rs` gains 4 lines (5397 -> 5401) and is NOT line-neutral. Per
+    rmbp's note, added lines move every `panic::Location` BELOW their site inside that file —
+    so the claim has to be measured, not asserted. Measured here: `ptrpoll_witness` occupies
+    `:5361-5397` at `80ed35a4`, i.e. it IS the file tail, so the set of `Location`s below the
+    site is EMPTY and nothing pre-existing in that file moves either. The four added lines are
+    the two new verdict arms; every other change is folded onto an existing line.
   * BYTE-neutral on `kernel8.img` — it is NOT, and the patch must not pretend otherwise:
-        knob-off `./arroyo kernel8` unpatched -> d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0
-        knob-off `./arroyo kernel8` patched   -> 41eda903e85796d3564fded936613a8616780d81e9d9c0d5dc7110bb3d247198
-        both 1254984 bytes — same SIZE, different CONTENT.
-    The reason is deliberate, not accidental: `MOUSE_DUP_DROP_COUNT` and its `fetch_add` are
-    UNGATED, exactly like the three siblings they join (`MOUSE_REARM_COUNT`,
-    `MOUSE_DISCARD_REARM_COUNT`, `MOUSE_ERROR_REARM_COUNT`, mod.rs:2373-2385). Gating them
-    on `orinclick` would put an orin-named knob in a shared driver, which
-    MEMORY:"name by subsystem, not board" forbids; gating them on `usbdebug` would rebuild
-    the very blind spot this patch exists to close. So the patch costs every aarch64 image
-    one 8-byte BSS atomic and one relaxed increment on the pointer-completion path — no new
-    file bytes (the size is unchanged), no lock, no MMIO, no control-flow change.
+        knob-off `./arroyo kernel8` unpatched ->
+          d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0
+        knob-off `./arroyo kernel8` patched   ->
+          8ff7c1d1f4e8938d9a29df4a094ecc1fe01684350adeef8a577b13c5eb89dc13
+        both 1,254,984 bytes — same SIZE, different CONTENT.
+    The reason is deliberate, not accidental, and it is rmbp condition 2:
+    `MOUSE_DUP_DROP_COUNT` and `MOUSE_NOBUF_DROP_COUNT` and their `fetch_add`s are UNGATED,
+    exactly like the three siblings they join (`80ed35a4:MOUSE_REARM_COUNT`, mod.rs:2373-2385:
+    "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Gating
+    them on `orinclick` would put an orin-named knob in a shared driver, which
+    MEMORY:"name by subsystem, not board" forbids; gating them on `usbdebug` would rebuild the
+    very blind spot this patch exists to close. So the patch costs every aarch64 image two
+    8-byte BSS atomics and one relaxed increment on the pointer-completion path — no new file
+    bytes (the size is unchanged), no lock, no MMIO, no control-flow change.
 
-    **This is the whole substance of what rmbp is being asked to grant, and it is why the
-    hunk is a patch and not a commit.** A reviewer who wants the accounting without touching
-    the Pi's image should say so; the alternative is a `usbdebug`-gated counter that cannot
-    answer render7's question on the flight recipe.
-
-The knob-off `kernel8.img` sha for the COMMITTED work (this patch NOT applied) is unchanged
-by CLICKDEAD: d73a8981…9fb0 before and after `2de4a58b`. See CLICKDEAD.md §6.
+The knob-off `kernel8.img` sha for the COMMITTED work (this patch NOT applied) is unchanged by
+CLICKDEAD and by this revision:
+`d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0`. See CLICKDEAD.md §6.
 
 ---
 diff --git a/unaos/crates/kernel/src/arch/aarch64/display_tegra.rs b/unaos/crates/kernel/src/arch/aarch64/display_tegra.rs
-index 3108c3e6..23b61e82 100644
+index ccf989b8..850e898e 100644
 --- a/unaos/crates/kernel/src/arch/aarch64/display_tegra.rs
 +++ b/unaos/crates/kernel/src/arch/aarch64/display_tegra.rs
-@@ -5114,7 +5114,7 @@ fn ptrpoll_witness(tick: u64) -> u64 {
+@@ -5334,7 +5334,7 @@ pub fn orin_drag_edge() {
+ // moves — panic `Location` records embed line numbers and the knob-off jetson image's
+ // byte-identity is this track's standing proof.
+ 
+-/// CLICKDEAD — the last `MOUSE_REARM_COUNT` this witness printed, so a frozen pipeline costs one
++/// CLICKDEAD — the last `rearm + dup + nobuf` this witness printed, so a frozen pipeline costs one
+ /// line and a live one prints at the census cadence. `u64::MAX` = never printed.
+ #[cfg(feature = "orinclick")]
+ static PTRPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+@@ -5344,25 +5344,25 @@ static PTRPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
+ #[cfg(feature = "orinclick")]
+ static PTRPOLL_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+ 
+-/// CLICKDEAD — read the shared driver's three ungated pointer-pipeline counters and, when they
++/// CLICKDEAD — read the shared driver's five ungated pointer-pipeline counters and, when they
+ /// moved (and once at the start, so a frozen pipeline is still timestamped), print `[ptrpoll]`.
+ ///
+ /// Returns `rearm - discard - errrearm` for the caller's `reports=` census field, so the two lines
+-/// cannot disagree: both come from the same three loads.
++/// cannot disagree: both come from the same loads.
+ ///
+ /// The token is `[ptrpoll]`, nine bytes — deliberately longer than eight so it cannot be folded
+ /// into an LLVM immediate and must appear in `.rodata`, which is what makes `grep -a` on the
+ /// artifact a reachability proof rather than a compile proof.
+ ///
+-/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — three
+-/// `Relaxed` loads and two `Relaxed` swaps. The census comment's rule (never add lock traffic to
++/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — five
++/// `Relaxed` loads and one `Relaxed` swap. The census comment's rule (never add lock traffic to
+ /// the path whose death this reports) holds by construction.
+ #[cfg(feature = "orinclick")]
+ fn ptrpoll_witness(tick: u64) -> u64 {
      use core::sync::atomic::Ordering;
      let rearm = crate::drivers::xhci::MOUSE_REARM_COUNT.load(Ordering::Relaxed);
      let disc = crate::drivers::xhci::MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
 -    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed);
-+    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed); let dup = crate::drivers::xhci::MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed); // CLICKDEAD-xhci.patch — the fourth counter, the one that separates (a1) from (a2). ⚠ folded, line-neutral.
++    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed); let dup = crate::drivers::xhci::MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed); let nobuf = crate::drivers::xhci::MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the two counters that separate (a1) from (a2), and (a1)'s two sub-causes from each other: `dup` = the guard ate a known duplicate, `nobuf` = the buffer/ring was gone. ⚠ folded, line-neutral.
      // Saturating: the three counters are read one at a time and a completion can land between the
      // loads, so the arithmetic is only ordered in the limit. A one-off underflow would print
      // `reports=0` and read as "worse than dead"; saturation makes it read as "not yet counted".
-@@ -5124,8 +5124,8 @@ fn ptrpoll_witness(tick: u64) -> u64 {
+@@ -5372,8 +5372,8 @@ fn ptrpoll_witness(tick: u64) -> u64 {
      if first {
          PTRPOLL_BASE.store(reports, Ordering::Relaxed);
      }
 -    let last = PTRPOLL_LAST.swap(rearm, Ordering::Relaxed);
 -    if !first && last == rearm {
-+    let last = PTRPOLL_LAST.swap(rearm.wrapping_add(dup), Ordering::Relaxed); // CLICKDEAD-xhci.patch — `dup` joins the movement test, or a pipeline being EATEN (rearm flat, dup climbing) would be silently mistaken for one that is starved. ⚠ folded, line-neutral.
-+    if !first && last == rearm.wrapping_add(dup) {
++    let moved = rearm.wrapping_add(dup).wrapping_add(nobuf); let last = PTRPOLL_LAST.swap(moved, Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the DROPS join the movement test, or a pipeline being EATEN (rearm flat, dup/nobuf climbing) would be silently mistaken for one that is STARVED and print one line for the whole boot. ⚠ folded, line-neutral.
++    if !first && last == moved {
          return reports; // nothing moved since the last census — one line already said so.
      }
      let decoded = reports.saturating_sub(if first { reports } else { base });
-@@ -5137,12 +5137,14 @@ fn ptrpoll_witness(tick: u64) -> u64 {
+@@ -5385,12 +5385,16 @@ fn ptrpoll_witness(tick: u64) -> u64 {
          "ERROR-REARM (non-halting error completions on the pointer endpoint; the read is being re-armed off the error path — mod.rs:4238)"
      } else if first {
          "BASELINE (the enumeration arms; every later line is measured against this one)"
++    } else if nobuf != 0 {
++        "NOBUF-DROP (completions ARE arriving and the guard is dropping them because `mouse_data_buffer`/`mouse_ring` is GONE — mod.rs:4599's `!have_buf` arm. A teardown or allocation defect, NOT a duplicate: re-arming here would be wrong, there is nothing to arm. Look at the slot's soft state, not at the dup discrimination)"
 +    } else if dup != 0 {
-+        "DUP-DROP (completions ARE arriving and the dup-Success guard is consuming them WITHOUT re-arming — mod.rs:4594's `param == mouse_prev_phys` arm, or the buffer/ring gone. This is (a1): the pipeline is being eaten, not starved)"
++        "DUP-DROP (completions ARE arriving and the dup-Success guard is consuming them WITHOUT re-arming — mod.rs:4599's `param == mouse_prev_phys` arm, buffer and ring still present. This is (a1): the pipeline is being eaten, not starved)"
      } else {
 -        "ARMED-NO-COMPLETION (the read is armed and the controller has posted no transfer event for the pointer DCI since the last line; apply CLICKDEAD-xhci.patch for the `dup=` field that tells a silently discarded completion from no completion at all)"
-+        "ARMED-NO-COMPLETION (the read is armed, dup=0, and the controller has posted NO transfer event for the pointer DCI since the last line. This is (a2): the endpoint went quiet — look at EP state, doorbell and periodic bandwidth, not at the guard)"
++        "ARMED-NO-COMPLETION (the read is armed, dup=0 and nobuf=0, and the controller has posted NO transfer event for the pointer DCI since the last line. This is (a2): the endpoint went quiet — look at EP state, doorbell and periodic bandwidth, not at the guard)"
      };
      serial_println!(
 -        "[ptrpoll] t={} rearm={} discard={} errrearm={} reports={} base={} decoded={} -> {}",
 -        tick, rearm, disc, err, reports,
-+        "[ptrpoll] t={} rearm={} discard={} errrearm={} dup={} reports={} base={} decoded={} -> {}",
-+        tick, rearm, disc, err, dup, reports,
++        "[ptrpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} -> {}",
++        tick, rearm, disc, err, dup, nobuf, reports,
          if first { reports } else { base }, decoded, verdict
      );
      reports
 diff --git a/unaos/crates/kernel/src/drivers/xhci/mod.rs b/unaos/crates/kernel/src/drivers/xhci/mod.rs
-index 5c366e11..d965f940 100644
+index 5c366e11..7b5fedbc 100644
 --- a/unaos/crates/kernel/src/drivers/xhci/mod.rs
 +++ b/unaos/crates/kernel/src/drivers/xhci/mod.rs
 @@ -2382,7 +2382,7 @@ pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -141,7 +238,7 @@ index 5c366e11..d965f940 100644
  /// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
  /// they go to `service_hid_halts`, which prints its own line.
 -pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
-+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); // CLICKDEAD — the guard's SILENT exit: completions the dup-Success guard consumed WITHOUT re-arming (`param == mouse_prev_phys`, the known Panther-Point dup, or the buffer/ring gone). It is the one branch in this file that eats a pointer completion and prints nothing on a build without `usbdebug`, so on the Orin's flight recipe it is indistinguishable from "the controller posted no event at all" — which is exactly the ambiguity render6 died in. Ungated relaxed add, like its three siblings; read by `display_tegra.rs`'s `[ptrpoll]` as `dup=`. ⚠ FOLDED onto this line, never given one of its own: this file is compiled into the Pi's `kernel8.img` and a line added anywhere in it moves every panic `Location` below.
++pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
  
  /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
  /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -150,7 +247,7 @@ index 5c366e11..d965f940 100644
                                                  Self::piusb39_witness("guard");
                                              }
 -                                            return;
-+                                            if param == prev || !have_buf { MOUSE_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } return; // CLICKDEAD — count the exit that neither re-arms nor prints. ⚠ FOLDED onto the existing `return;`, never a line of its own (kernel8.img panic-`Location` byte-identity).
++                                            if !have_buf { MOUSE_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } else if param == prev { MOUSE_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } return; // CLICKDEAD v2 — count the exit that neither re-arms nor prints, SPLIT by cause. Reaching here means `!(param != prev && have_buf)`, so the two arms are exhaustive: no buffer/ring (teardown or allocation defect — re-arming would be wrong) vs. the known duplicate with the buffer intact (the guard's by-design skip). `!have_buf` wins the tie. ⚠ FOLDED onto the existing `return;`, never a line of its own (kernel8.img panic-`Location` byte-identity).
                                          }
                                          if let Some(data_buf_ptr) = slot.mouse_data_buffer {
                                              // XHCI-COHERENCE: consumer boundary — the interrupt-IN
