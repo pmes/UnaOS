@@ -514,6 +514,35 @@
 // RX is already convicted broken — it arms ONLY after the [net4F] latch verdict, so a healthy NIC
 // never runs it. `rearm_current_rx` restores the victim's correct address on recycle by construction.
 //
+// ## NET4A — ask the first metal question of orin-ledger gap #2: put the ring + 32 buffers BELOW 4 GiB.
+//
+// Boot7h's `[net4F]` conviction (four consecutive completions wrote ONLY buffer 17) was measured with the
+// NET-4s covering ALIAS in the write path: rings + buffers at 0x268000000.. in GiB 9, the NIC's 32-bit
+// truncated TLPs (boot-24) up-translated by inbound-iATU region 1 (bus 0x68000000 → DRAM 0x268000000).
+// "NIC-internal or RC/iATU-internal" was never separated because the alias was never absent. NET4A
+// removes it: `mmu_tegra::seat_net4a_low_nc` reserves the LOWEST carveout-clean, L2-split 2 MiB block in
+// `[0x8000_0000, 4 GiB)` at heap-guard (same exclusion set the heap dodges; witnessed as `[net4A]` with a
+// low-DRAM census either way), `init_rings` maps it Normal-NC through `install_nc_window` (the NET-4B
+// flip lifted out — identical MAIR AttrIdx 2, identical break-before-make + EL1-twin discipline) and lays
+// the same four DMA objects at the same offsets; `arm_dma_aliases` then finds every block "identity-
+// covered, no alias" and arms nothing. Fallback: no clean low block ⇒ the NET-4B high window + NET-4s
+// alias exactly as before, said out loud (`below4g=0`). No knob: the driver compiles only under
+// `net4`+`tegra`, runs only on the Orin, and the placement is fail-open to the proven bring-up.
+//
+// Why NET-4o's "no clean sub-4 GiB span" (boot-19) does not stand: its `lowest_clean_in` scan ran only
+// inside the loop over DERIVED `dma-ranges` inbound windows (24d4ed49), and on this board that set is
+// EMPTY (`DMA-WINDOW STOP … NO dma-ranges` every boot). The low span was never scanned; NET-4p's "packed
+// with carveouts" was the empty set read as a measurement. The NET4A scan runs on both heap paths and
+// prints the reason every rejected candidate lost on.
+//
+// The witness: `[net4F] rx-ring phys=… buffers=32 below4g=1` at rings-up, and `[net4F] distinct
+// buffers-written(count=N)=[…] across the first 4 RX completion(s)` — the UNION of buffers that lost
+// their landing tag over the first four completions — on the 4th completion and at window close:
+//   * `count=4 below4g=1` ⇒ per-descriptor addressing works with no alias ⇒ NET-4A WAS THE ALIAS.
+//   * `count<4 below4g=1` ⇒ the latch survives without the alias ⇒ NIC/RC-internal; next question is
+//                            the RC's inbound iATU region ordering.
+//   * `below4g=0`          ⇒ the question was not asked; the `[net4A]` census says why.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -571,7 +600,8 @@ mod metal {
     use super::P4;
     use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{
-        install_net4b_nc, map_mmio_window, net4b_nc_window, MmioMap,
+        install_nc_window, install_net4b_nc, map_mmio_window, net4a_low_nc_window, net4b_nc_window,
+        MmioMap,
     };
     use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
     use core::ptr::{read_volatile, write_volatile};
@@ -1240,6 +1270,16 @@ mod metal {
         net4g_interim_l_hits: u64,
         net4g_probes: u64,
         net4g_done: bool,
+        /// NET4A: the rings + buffers sit in the sub-4 GiB Normal-NC window (`net4a_low_nc_window`), so
+        /// no inbound-iATU alias is in the NIC's write path. `false` = the NET-4B high window + NET-4s
+        /// alias fallback; the `[net4F] distinct buffers-written` verdict is conditioned on this.
+        net4f_below4g: bool,
+        /// NET4A: the DISTINCT-buffers witness (header § NET4A). `net4f_distinct_seen` counts the first
+        /// four RX completions; `net4f_distinct_mask` is the union, over those completions, of every
+        /// ring buffer that had lost its landing tag at pop time (bit k = buffer k). Summarised once on
+        /// the 4th completion and again at window close (the census cadence).
+        net4f_distinct_seen: u64,
+        net4f_distinct_mask: u32,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1641,15 +1681,34 @@ mod metal {
             // CACHEABLE memory. `install_net4b_nc` flips the reserved window (carved by `select_heap_region`
             // just below the heap, in the same clean + DMA-reachable span) to Normal-NC in both live tables;
             // refuse the bring-up CLOSED if it is unavailable rather than DMA into cacheable/unmapped DRAM.
-            if !install_net4b_nc() {
+            // NET4A — prefer the SUB-4 GiB window `select_heap_region` reserves in GiB 2/3 (mmu_tegra
+            // `seat_net4a_low_nc`): a 32-bit-truncated payload TLP is a no-op truncation there and the
+            // NET-4h identity region 0 carries it, so NO inbound-iATU alias sits in the NIC's write path.
+            // That is the first metal question of orin-ledger gap #2 (does the buffer-17 latch survive
+            // without the alias?). Same Normal-NC attribute, same flip discipline (`install_nc_window` is
+            // the NET-4B flip lifted out); the high window + NET-4s alias remain the fallback, so a boot
+            // without a clean low block brings the NIC up exactly as boot7h did and SAYS so.
+            let (lo_base, lo_size) = net4a_low_nc_window();
+            let below4g = lo_base != 0 && lo_base + lo_size <= 0x1_0000_0000 && install_nc_window(lo_base, lo_size);
+            let (nc_base, nc_size) = if below4g {
+                (lo_base, lo_size)
+            } else {
                 serial_println!(
-                    "{}   !! NET-4B: Normal-NC DMA window could not be mapped — REFUSING ring bring-up (would DMA into cacheable memory, re-arming the maintenance-vs-fetch race NET-4B exists to remove) ::",
-                    P4
+                    "{}   [net4F] sub-4GiB window {} — falling back to the NET-4B high window + NET-4s inbound alias (the below-4G question is NOT asked this boot) ::",
+                    P4,
+                    if lo_base == 0 { "NOT reserved (see the [net4A] census line at heap-guard)" } else { "reserved but NOT mappable Normal-NC (its GiB is not L2-split)" }
                 );
-                return false;
-            }
-            let (nc_base, nc_size) = net4b_nc_window();
+                if !install_net4b_nc() {
+                    serial_println!(
+                        "{}   !! NET-4B: Normal-NC DMA window could not be mapped — REFUSING ring bring-up (would DMA into cacheable memory, re-arming the maintenance-vs-fetch race NET-4B exists to remove) ::",
+                        P4
+                    );
+                    return false;
+                }
+                net4b_nc_window()
+            };
             self.nc_base = nc_base;
+            self.net4f_below4g = below4g;
             serial_println!(
                 "{}   [net4B] rings + buffers in Normal-NC window [{:#x}, {:#x}) (MAIR AttrIdx 2); rx-ring @ +0x0, rx-bufs @ +0x10000, tx-ring @ +0x20000, tx-bufs @ +0x30000 — no cache maintenance, dma_wmb/dma_rmb ordering only ::",
                 P4, nc_base, nc_base + nc_size
@@ -1658,6 +1717,19 @@ mod metal {
             // doubles as the physical address (identity map); region-0 identity (NET-4h) reaches them.
             self.alloc_rx();
             self.alloc_tx();
+            // NET4A — the placement witness the ledger's gap #2 scores: where the RX ring and its 32
+            // buffers physically are, and whether that is below the 32-bit truncation ceiling.
+            serial_println!(
+                "{}   [net4F] rx-ring phys={:#x} buffers={} rx-bufs=[{:#x}..{:#x}) tx-ring phys={:#x} below4g={} — {} ::",
+                P4, self.rx_ring as u64, NUM_RX, self.rx_buffers as u64,
+                (self.rx_buffers as u64) + (NUM_RX * RX_BUF_SIZE) as u64, self.tx_ring as u64,
+                below4g as u8,
+                if below4g {
+                    "every DMA object is < 4 GiB inside the NET-4h identity region: NO inbound-iATU alias in the NIC's write path (a truncated TLP is a no-op truncation)"
+                } else {
+                    "high window: the NIC's truncated TLPs ride the NET-4s covering alias at inbound index 1, as on boot7h"
+                }
+            );
 
             // NET-4r — the SANCTIONED FALLBACK. Boot-24 proved the NET-4q full-64 descriptor path correct
             // (RINGDUMP addr=0x2683cb… [MATCH], hi-before-lo ring bases) yet the payload STILL sank at the
@@ -2291,6 +2363,9 @@ mod metal {
                     "one pass only, and RDU NEVER latched: the halt is NOT the un-serviced status latch (REFUTED) — the engine stops without reporting descriptor-unavailable, so it is not re-fetching the recycled descriptors at all"
                 }
             );
+            // NET4A — the distinct-buffers verdict at the census cadence (window close), whatever the
+            // completion count reached; the 4th-completion copy above may have printed already.
+            self.net4f_distinct_summary("window-close");
             // NET-4G — latch-site experiment status, so the window close is never silent about it:
             // the verdict fired above (repeated here as a pointer), or the arm never happened (the
             // experiment self-gates on the [net4F] latch verdict), or the victim never completed.
@@ -2324,6 +2399,42 @@ mod metal {
                     P4, cr, cr & !CR_RE
                 );
             }
+        }
+
+        /// NET4A — the DISTINCT-buffers verdict (header § NET4A): how many DISTINCT ring buffers the NIC
+        /// wrote across the first four RX completions, measured by lost landing tags (the NET-4F
+        /// instrument), and what that says given WHERE the ring sits (`net4f_below4g`). Printed on the
+        /// 4th completion and at window close; read-only.
+        fn net4f_distinct_summary(&self, at: &str) {
+            let m = self.net4f_distinct_mask;
+            let count = m.count_ones();
+            let mut list = [-1i64; 4];
+            let mut n = 0usize;
+            for k in 0..NUM_RX {
+                if m & (1u32 << k) != 0 && n < list.len() {
+                    list[n] = k as i64;
+                    n += 1;
+                }
+            }
+            let seen = self.net4f_distinct_seen;
+            let below = self.net4f_below4g;
+            serial_println!(
+                "{}   [net4F] distinct buffers-written(count={})=[{},{},{},{}] across the first {} RX completion(s) at={} below4g={} rx-ring={:#x} — {} ::",
+                P4, count, list[0], list[1], list[2], list[3], seen, at, below as u8, self.rx_ring as u64,
+                if seen == 0 {
+                    "NO RX completion this window: the question was not asked (link / cable / no traffic reached the ring)"
+                } else if seen < 4 {
+                    "fewer than four completions: UNDECIDED this window (count so far is a lower bound)"
+                } else if count >= 4 && below {
+                    "FOUR DISTINCT buffers with NO alias in the path: per-descriptor addressing works below 4 GiB ⇒ NET-4A WAS THE ALIAS (the inbound-iATU covering region); the buffer-17 latch was RC-side translation"
+                } else if count >= 4 {
+                    "four distinct buffers THROUGH the alias: the latch did not reproduce on this boot; NET-4A undecided (the below-4G question was not asked)"
+                } else if below {
+                    "a single-address latch with NO alias in the path ⇒ NIC/RC-internal, NOT the alias; next question: the RC's inbound iATU region ordering (identity region 0 vs the NIC's TLP path)"
+                } else {
+                    "the latch reproduced on the alias path (fallback boot): the below-4G question was NOT asked — see the [net4A] census line at heap-guard for why no low window seated"
+                }
+            );
         }
 
         /// NET-4V — THE ONE-LINE NO-LEASE VERDICT. Emitted once, at DHCP-window close, right after the
@@ -2934,6 +3045,21 @@ mod metal {
                             written[nwritten] = k as i64;
                             nwritten += 1;
                         }
+                        // NET4A — accumulate the DISTINCT-buffers union over the first four completions
+                        // (bit k = buffer k lost its tag at some pop). Union semantics absorb coalesced
+                        // completions (buffers written ahead of the pop that reads them).
+                        if self.net4f_distinct_seen < 4 {
+                            self.net4f_distinct_mask |= 1u32 << k;
+                        }
+                    }
+                }
+                if self.net4f_distinct_seen < 4 {
+                    self.net4f_distinct_seen += 1;
+                    if self.net4f_distinct_seen == 4 {
+                        // The 4th completion is the earliest the question can be answered; print it
+                        // here too (not only at window close) so it is on the wire even if the boot dies
+                        // in the window (the 0x200 IOB RAS class that ended boots 34/36/42).
+                        self.net4f_distinct_summary("completion-4");
                     }
                 }
                 let own = !slot_untouched;
@@ -4373,6 +4499,9 @@ mod metal {
             net4g_interim_l_hits: 0,
             net4g_probes: 0,
             net4g_done: false,
+            net4f_below4g: false,
+            net4f_distinct_seen: 0,
+            net4f_distinct_mask: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──
