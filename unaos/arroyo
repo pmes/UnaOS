@@ -4340,6 +4340,22 @@ check_both() {
         _nrc=1
     fi
 
+    # GATE-K8REACH (rmbp 14, 2026-09-06): LEDGER SR1's CLASS — build coverage is not operator
+    # reachability. `kernel8()` builds from a CURATED $K8_FEATS that deliberately does not draw from
+    # the general `_feats` map above, so a knob added there and never given an arm is UNREACHABLE in
+    # every Pi bare-metal image, with no error and no warning: the operator sets it, flashes, and the
+    # image is byte-identical. Two instances a week apart (`UNAOS_PRTSCRST`, pi 7 — the Print Screen
+    # gate greened about nothing for a week; `UNAOS_BOOTLOG`, orin 15). The gate does NOT decide which
+    # knobs BELONG in the Pi image — that is not mechanical and pi 7 was right to say so — it asserts
+    # that every knob is ACCOUNTED FOR: armed, or written down in scripts/k8-reach.registry as
+    # deliberately unarmed. A knob added tomorrow reds until someone rules on it.
+    local _k8rc=0
+    python3 "$WORKSPACE_DIR/scripts/k8-reach.py" || _k8rc=$?
+    if [ "$_k8rc" -ne 0 ]; then
+        [ "$_k8rc" -eq 2 ] && echo -e "${COLOR_RED}❌ k8-reach gate gave NO VERDICT — it did not run to a verdict, which is not a pass${COLOR_RESET}"
+        _nrc=1
+    fi
+
     # GATE-ROOTS: every BINARY target in the tree is a named root of this gate.
     #
     # `check` covers the dependency graph reachable from the roots it NAMES. The libraries come free —
@@ -4402,7 +4418,7 @@ check_both() {
         return 1
     fi
     if [ "$_nrc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene (see above)${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene or k8 reachability (see above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_rrc" -ne 0 ]; then

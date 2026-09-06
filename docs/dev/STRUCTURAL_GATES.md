@@ -7,8 +7,7 @@ what each one asserts, why it is enforced by a gate rather than by convention,
 how it goes red, and how it is legitimately updated. The compile legs themselves
 (GATE-CFG, GATE-CFG-MIX, GATE-USER, GATE-CORE, GATE-BLOB) are described in the
 comment blocks that carry those names in `unaos/arroyo`; this file covers the
-three structural gates landed on `hw-rmbp` on 2026-08-31 and the standard they
-are held to.
+structural gates and the standard they are held to.
 
 **The standard, and where it came from.** Before these gates landed, the tree
 had exactly one structural check, the knob→leg coverage assertion in
@@ -28,7 +27,7 @@ distinguishable from a broken pattern: it carries a feature or symbol that
 certainly exists and refuses to give a verdict when the probe is not seen. A
 control failure is a broken gate, not a clean tree, and it is reported as such.
 
-**Where they run.** All three run inside `check_both` in `unaos/arroyo`, after the
+**Where they run.** They run inside `check_both` in `unaos/arroyo`, after the
 compile legs; `test` and `test-arm` do not run them. Each has its own failure
 line in `check_both` so that a red is attributed to the gate that produced it.
 
@@ -126,6 +125,93 @@ declared-but-unused feature → red; the clean tree → green.
 feature in `[features]` or delete the cfg and keep the arm that was actually
 compiling. For a dead knob, add a cfg site or remove the declaration. There is
 no allowlist beyond `default`.
+
+---
+
+## GATE-K8REACH — a knob with no `K8_FEATS` arm is unreachable in every Pi image
+
+**Invariant.** Every `UNAOS_*` knob in `arroyo`'s general `_feats` map is
+accounted for in the Pi bare-metal image: it has an arm inside `kernel8()`'s
+curated `K8_FEATS`, or it has a row in `unaos/scripts/k8-reach.registry` recording
+that it deliberately has none.
+
+**Why a gate.** `kernel8()` builds from a CURATED list that deliberately does not
+draw from `_feats` — 115 knobs there, and only 11 of them armed here. An omitted
+arm is not an error and not a warning: the operator sets `UNAOS_X=1`, flashes,
+and the image is byte-identical to the one without it. LEDGER SR1 records two
+instances a week apart, by different seats, each of which cost days before anyone
+suspected the knob rather than the code: `UNAOS_PRTSCRST` (pi 7 — the Print
+Screen gate greened about nothing for a week and blocked S14) and `UNAOS_BOOTLOG`
+(orin 15 — a `UNAOS_PIDESK=1` image with no way back to the serial mirror). This
+is **not** the same invariant as KNOBLEG below. That one asks whether every
+aarch64-qualified feature is COMPILED by some check leg; a knob can be fully
+leg-covered and still absent from the image an operator boots. Build coverage is
+not operator reachability.
+
+**What it deliberately does not assert.** It does not decide which knobs BELONG
+in the Pi image. That judgment is not mechanical, and the tree says so: one of
+`nvidia-kepler`'s eleven cfg sites is in arch-neutral `video/wm.rs`, and
+`rastmc`'s single Pi-live site is a call whose callee is x86-gated. pi 7's
+objection is the right one — by inspection a Pi-meaningful knob that was never
+given an arm is indistinguishable from one deliberately omitted. So the gate
+asserts the weaker thing that IS mechanical and that both instances would have
+failed: the decision is RECORDED. A knob added tomorrow reds until someone rules
+on it, and the ruling is a registry row rather than an unwritten intention.
+
+**Mechanism.** `unaos/scripts/k8-reach.py` parses the `_feats` map on one side and
+the knobs named inside `kernel8()`'s bounds on the other, and takes the set
+differences against the registry. The red conditions are pure set membership, so
+the gate itself cannot produce a false positive out of a misjudged site.
+
+**The evidence mode, and why the site classification is not in the verdict.**
+`k8-reach.py --evidence <KNOB>` prints every cfg site behind a knob, classified
+`PI-LIVE` / `X86` / `PROSE`, so that ruling on a row is a command rather than a
+squint. That classification needs three things a grep does not have, and it is
+kept OUT of the pass/fail path because each of them is a judgment that can be
+wrong: `unaos/scripts/k8-modtree.py` resolves the `target_arch` context the module
+tree imposes on each FILE (`drivers/gpu/mod.rs` is declared under
+`target_arch = "x86_64"` in `drivers/mod.rs`, so all eleven Kepler sites inside it
+are x86-only although neither the line nor the path says so — a cfg'd-out
+`pub mod` is never lexed); prose is stripped, because `rtwit.rs:61` names its own
+feature in a `//!` line and GATE-KNOB already paid for the lesson that a gate
+which reds on a sentence gets turned off; and the arch that governs a site is the
+one on the nearest enclosing bracket group, not "does `x86_64` appear on this
+line" — `any(all(feature = "tegra", target_arch = "aarch64"), all(feature =
+"rastmc", target_arch = "x86_64"))` is aarch64-live for one feature and x86-only
+for the other, on one line.
+
+`k8-modtree.py` PRINTS every file it cannot account for (`UNREACHED`,
+`UNRESOLVED`, `INLINE`) instead of defaulting it to a context. On this tree that
+surfaced `events.rs`, which no `mod` declaration in the crate names — a file that
+is not compiled by anything.
+
+**Control.** Checked before any verdict: the `kernel8()` bounds must resolve, the
+`_feats` parse must find ≥ 50 knobs INCLUDING both SR1 instances, and the arm
+parse must find ≥ 20. A parse that silently found no knobs would report a clean
+tree, which is the failure the gate exists to prevent. The canaries are checked
+for PRESENCE, not for being armed, so that de-arming one is caught as a red rather
+than swallowed as "no verdict" — a control must not blind the gate to the very
+instances that created the class.
+
+**Goes red when** a knob has no arm and no registry row (`UNREGISTERED`), a
+registry row names a knob that is no longer in `_feats` (`STALE`), or a knob is
+both armed and registered as unarmed (`CONTRADICTION`). **GO-RED proof, recorded
+in this commit — eight states, all executed:** a new `UNAOS_NEWTHING` line added
+to `_feats` → red naming it; **`UNAOS_PRTSCRST`'s arm deleted from `kernel8()`,
+i.e. the historical instance replayed → red**; a registry row for a knob that
+does not exist → red; a row for an armed knob → red; the clean tree → green; the
+`_feats` map renamed so the parse finds nothing → exit 2, NO VERDICT; `kernel8()`
+renamed → exit 2; the registry deleted → exit 2. The wiring was proven the same
+way rather than by reading it: with one registry row removed, `./arroyo check`
+itself exited 1 with `check FAILED — knob hygiene or k8 reachability`.
+
+**Legitimate update.** Arm it or register it. A knob that should reach a Pi image
+gets its arm in `kernel8()` beside the `UNAOS_LOGTS` one; a knob that should not
+gets a registry row with the reason. The 104 rows seeded on 2026-09-06 are marked
+`TODO`, which satisfies the gate and is counted on every run — they are the
+backlog SR1's class left behind, not a ruling, and each is converted to `NA <reason>`
+(or to an arm) by whoever owns the knob. Deleting a row without adding the arm
+reintroduces the silence.
 
 ---
 
@@ -248,5 +334,8 @@ adding the leg reintroduces a silent hole.
 
 ---
 
-**In flight, same set:** GATE-ROOTS is under construction on the same standard
-and is not documented here until it has landed with its own recorded GO-RED.
+**Landed but not yet sectioned here:** GATE-ROOTS (`scripts/check-roots.sh`, every
+binary target is a named root of `check`) and GATE-APPEND (`scripts/append-position.sh`,
+LEDGER P7's trailing-comment trap) are both wired into `check_both` and green; their
+invariant, control and GO-RED live in their `arroyo` comment blocks and in the
+scripts' headers until a seat gives each a section on the standard above.
