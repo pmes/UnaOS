@@ -74,7 +74,10 @@ wait for the focus — it is offered to orin 18 as of this turn.
 ask — **ACCEPT with one blocking condition** (`same_volume` decides identity by name while the tegra
 `sdmmcroot` bind mounts one card as `card` and `fat`; B60). SHELLRELICS' acceptance criteria for the
 `write <lba> <byte>` leg were issued in the same message, so their executor cuts it once. What is
-left of Q2 is closing SHELLRELICS off that leg's diff, and re-reviewing whichever fix answers C1.
+left of Q2 is re-reviewing whichever fix answers C1 — **SHELLRELICS is ACCEPTED** as of the same
+evening: its owed leg arrived as `shell.relics.write_raw` at fold-8 tip `f3e64daf` and was read here
+rather than accepted on report. The C1 condition was checked to transfer to that tip by blob oid,
+not by assumption, and the shell.rs-resident checks were re-run there because that file does differ.
 
 ## Q3 — J1, THE LANDING. Needs the adversarial panel, which is a fleet, which is the focus.
 

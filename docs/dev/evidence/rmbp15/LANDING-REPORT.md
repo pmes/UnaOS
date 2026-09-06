@@ -53,6 +53,16 @@ touched, so no `arroyo check` claim is made here.
    fixed it; orin's A36 and the `prtscr.rs` header prose are on hw-jetson and stay theirs — which is
    the rule pointing the opposite way from how the relay proposed it.
 
+7. **SHELLRELICS ACCEPTED**, and the VFSROUTE condition carried onto the fold. The owed leg arrived
+   as `shell.relics.write_raw` at fold-8 tip `f3e64daf`; it was read here, not accepted on report —
+   the grant this seat once gave on a description is the one it now reads twice. C1's transfer was
+   established by blob oid (`fs/vfs.rs` and `sdmmc_tegra.rs` byte-identical across the three shas,
+   `shell.rs` not), so the shell.rs-resident checks were re-run at the fold tip rather than inherited.
+8. **GATE-LEDGER caught this seat again** — four blob oids read as commit shas. The gate's own escape
+   (`blob:<hash>`, already in use one row away) was the fix, not rewording the evidence. That is the
+   fifth time this lane's gate has convicted its own author, and the reason the rule is to run it the
+   moment the ledger is edited.
+
 ## Open at time of writing
 C1 is with orin 18 (either the armed `UNAOS_SDMMCROOT=1` run, or the identity fix, and I review the
 fix same-turn). SHELLRELICS closes when its leg's diff arrives. Everything else in the queue waits
