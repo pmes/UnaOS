@@ -5277,6 +5277,9 @@ pub fn orin_drag_edge() {
         DRG_WIN.store(wm::WIN_NONE, Relaxed);
         drg_end_report(seen, "release");
     }
+}
+
+// =================================================================================================
 // CLICKDEAD — WHO RE-ARMS THE POINTER INTERRUPT-IN READ, AND DID IT? `orinclick`, FILE TAIL.
 // =================================================================================================
 //
