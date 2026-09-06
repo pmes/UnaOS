@@ -33,7 +33,18 @@ Verified this turn, `git branch -r --contains <sha>` empty for all three:
 By contrast `74b7c764` (VIRTPREEMPT) and `643d2803` (CONSOLETEXT) are on `origin/hw-jetson` — folded
 and safe. The three above are one branch-prune from existing only as scratch patch files, and no peer
 can fetch them. This is the `unowned-checkouts-are-the-hazard` class: they fall BETWEEN lanes.
-**First action of the focus round: get them onto a track branch or confirm orin has.** Ledgered as B59.
+Ledgered as B59.
+
+**STATUS, later the same evening — mitigated, not closed.** orin 18 confirmed the finding in their own
+tree, added a fourth sha to it (`0019ec7a`, XHCINTD), and took holding patch files with each one proven
+by `git apply --check` against its TRUE parent in a throwaway worktree. Two things sharpen what that
+mitigation is worth, and both are recorded: **all four worktrees share ONE object store** — every tree
+answers the same `git rev-parse --git-common-dir` — so the `exec-*` branches were never a second copy of
+anything and a prune plus a `gc` takes them from every seat at once; the patch FILES are the only
+genuinely separate artifact. This seat therefore did NOT duplicate them: a second directory on the same
+disk buys nothing the files already buy. **The real close-out is a fetchable branch, and it arrives when
+fold 8 (`f3e64daf`) lands on `hw-jetson` — which C1 is the last thing blocking.** If the focus pivots
+before that lands, Q0 is still the first thing to check.
 
 ---
 
