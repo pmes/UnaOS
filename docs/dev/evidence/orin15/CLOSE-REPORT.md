@@ -37,3 +37,9 @@ tooled (`orin-open.sh`). The session's Fable spend was its context size re-bille
 ## Union gate on the TCURX2 fold (fb5d0d8a)
 `./arroyo check` exit 0 — 69 ✅ / 0 ❌, GATE-KNOB OK, GATE-LEDGER OK (`~/unaos-bench/scratch/orin15/check-fb5d0d8a.log`);
 `./arroyo test-arm 60` exit 0 (`testarm-fb5d0d8a.log`).
+
+## Folds after the executor kill (2026-09-06 03:2x–04:4xZ)
+DRAGDEAD `4dc88314` (+ A27 tick `7580018e`) · QUARRY `f36cb82f` (+ A8 tick in `092c85fb`) · CLICKDEAD `40a11ca9` + docs
+`092c85fb` (`CLICKDEAD-xhci.patch`, rmbp GRANTED on the split-counter condition; v2 in flight) · FOLDFIX `80ed35a4`
+(the display_tegra.rs tail union rebuilt 3-way after the seat's hand splice cut a function open) · MENUBAR docs
+`563a5717` (`MENUBAR-WINMENU.patch` to rmbp 12; pi 7 asked for the C ack; LEDGER S31). CONSOLEQUIET still running.
