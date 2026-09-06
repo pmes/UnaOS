@@ -189,7 +189,7 @@ pub fn on_tick() {
             super::percpu::this_cpu().cpu_index,
             local + 1
         );
-    } #[cfg(all(feature = "tegra", feature = "bsptick"))] bsptick_witness(); // ORIN-BSPTICK (appended to this line per the Location-shift convention; see file tail)
+    } #[cfg(all(feature = "tegra", feature = "bsptick"))] bsptick_witness(); #[cfg(feature = "virt_tick")] virttick_witness(); // ORIN-BSPTICK + VIRTPREEMPT (both appended to this line per the Location-shift convention; see file tail). ORIN-BSPTICK (appended to this line per the Location-shift convention; see file tail)
 }
 
 /// Monotonic count of timer ticks since boot.
@@ -754,4 +754,132 @@ fn bsptick_witness() {
             cpu
         );
     }
+}
+
+// ── VIRTPREEMPT (orin 17) — THE PERIODIC EL1 TICK ON QEMU `virt` ────────────────────────────────
+//
+// Appended at the FILE TAIL, `virt_tick`-gated, per this file's standing `panic::Location` convention
+// (ORIN-BSPTICK's block above says why): knob-off none of this is compiled and no existing line moves.
+//
+// WHAT WAS IN THE WAY, MEASURED. `boot_virt::drop_to_el1`'s asm ends with `msr cntp_ctl_el0, xzr`, and
+// its module comment gives two reasons: (1) "the shared IRQ vector stub (`exceptions::__vec_irq`) banks
+// ELR_EL2/SPSR_EL2 on this not-baremetal/not-tegra build (the fixed `irq_bank!` EL2 arm), which would
+// fault if an IRQ were taken at EL1"; (2) CAPSTONE on virt is cooperative. Reason (1) is THE blocker JV1
+// named, and it is retired by the `irq_bank!`/`irq_unbank!` gate widening in `exceptions.rs` — `virt_tick`
+// now selects the RUNTIME `CurrentEL` arm, the same one IRQEL-RT proved live at EL1 on Orin metal.
+// Reason (2) was a preference, and this arc changes it on purpose.
+//
+// THE DISARM ITSELF IS KEPT, UNTOUCHED, and that is the whole shape of the fix: the drop still ends the
+// physical timer, and this function re-arms it from EL1 afterwards — exactly the JM6-disarm /
+// `el1_bsptick_start` pairing on tegra. Re-arming at EL1 is legal because the SAME drop sets
+// CNTHCTL_EL2.EL1PCTEN|EL1PCEN (`orr x0, x0, #0x3`), and IRQs reach EL1 natively because the same drop
+// writes `HCR_EL2 = 1<<31` with IMO/FMO/AMO clear. Not one byte of `boot_virt.rs` changes.
+//
+// GIC STATE ACROSS THE DROP, since none of it is re-run at EL1: the GICv3 CPU interface is programmed by
+// `gic::init_cpu_interface_v3` at EL2 (ICC_SRE_EL2.SRE, ICC_SRE_EL1.SRE, ICC_PMR_EL1=0xFF,
+// ICC_CTLR_EL1.EOImode=0, ICC_IGRPEN1_EL1=1). In the non-VHE physical interface those ICC_*_EL1
+// registers are NOT EL-banked — EL2 and EL1 address the same state — so the interface EL1 inherits is
+// live, and `smp_virt.rs`'s ORIN-EL1AP comment already relies on exactly this ("the redistributor/PMR/
+// CTLR/IGRPEN1 state it leaves is per-core banked and survives the drop"). Redistributor PPI 30 enable is
+// likewise per-core banked; `arm_this_core` re-asserts it idempotently below anyway.
+//
+// THE HAZARDS, one by one, re-derived rather than inherited from ORIN-BSPTICK: SERIAL — `_print` masks
+// IRQs around the port lock and an IRQ-context print is `try_lock` + staging ring, so a tick landing
+// mid-print cannot deadlock; IDLE — `run_capstone_boot_core` busy-polls and never WFIs, so the tick
+// licenses no new sleep; EL0 — the 0x480 lower-EL IRQ vector routes to the same now-runtime-banked
+// `__vec_irq`, which banks SP_EL0 unconditionally, so a preempted EL0 task resumes on its own user SP;
+// AP CROSS-TALK — the three `virt` secondaries armed their OWN local-only PPI 30 in `smp_virt.rs` and
+// reach the same `handle_irq_v3`; `AP_LOCAL_TICK` already keeps them out of the shared `TICKS`, and
+// `VIRTTICK_CORE` below keeps them out of this witness (the IRQEL-CORE lesson: against machine-global
+// state a neighbour consumes the arming core's window with probability ~1).
+//
+// WITNESS RULE, inherited: the `[virttick]` token is 10 bytes — LLVM immediate-encodes tokens <= 8 bytes
+// and they become invisible to artifact grep — so this one is provable by `strings` on the ELF. ────────
+
+/// VIRTPREEMPT sentinel for [`VIRTTICK_CORE`]: no core owns the periodic tick.
+#[cfg(feature = "virt_tick")]
+const VIRTTICK_NO_CORE: u32 = u32::MAX;
+
+/// The `cpu_index` of the ONE core whose periodic EL1 tick this instrument witnesses
+/// ([`VIRTTICK_NO_CORE`] = disarmed). A core id and not a bool for the IRQEL-CORE reason: the JC2/JC3
+/// `virt` secondaries each arm their own 250 Hz PPI 30 (`timer::arm_this_core_ap`, `smp_virt.rs`) and
+/// reach the SAME `on_tick` dispatch, so a machine-global counter here would be an aggregate wearing a
+/// per-core name. Scoped to the arming core, every AP tick falls through this instrument unchanged.
+#[cfg(feature = "virt_tick")]
+static VIRTTICK_CORE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(VIRTTICK_NO_CORE);
+
+/// Ticks taken on the arming core since [`virt_tick_start`]. Written ONLY by that core (the
+/// [`VIRTTICK_CORE`] guard in [`virttick_witness`] runs before every bump).
+#[cfg(feature = "virt_tick")]
+static VIRTTICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// VIRTPREEMPT — arm THIS core's generic timer as a standing PERIODIC tick at EL1 on QEMU `virt`, and
+/// leave IRQs unmasked permanently: from here on the `run_capstone_boot_core` drive loop and every task
+/// it dispatches execute with a 250 Hz heartbeat landing through the runtime-banked `__vec_irq`.
+///
+/// Call ONCE, on the boot core, from `main.rs`'s JC3 block: AFTER `boot_virt::drop_to_el1` (this is an
+/// EL1 arm and the drop is what disabled the timer), AFTER the post-drop `exceptions::install()` (VBAR_EL1
+/// must already point at the real table), and AFTER `virt_el0_start_maybe()` (so the EL0 task and its
+/// verdict are staged with IRQs still masked and the first tick cannot land mid-`install()`).
+#[cfg(feature = "virt_tick")]
+pub fn virt_tick_start() {
+    let freq = cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let cpu = super::percpu::this_cpu().cpu_index;
+    // Re-seed INTERVAL (idempotent — `init` computed the same value at EL2 before the drop; `on_tick`
+    // reloads TVAL from it on every tick, and a zero there would be an instant re-fire storm).
+    INTERVAL.store(freq / TICK_HZ, Ordering::Relaxed);
+    VIRTTICK_COUNT.store(0, Ordering::Relaxed);
+    VIRTTICK_CORE.store(cpu, Ordering::Release);
+    // Armed banner BEFORE the unmask, so the serial lock is free when the first tick's witness prints
+    // (the ordering `el1_bsptick_start` uses for the same reason).
+    serial_println!(
+        ":: [virttick] arming PERIODIC CNTP at EL{} on cpu {} ({} Hz, PPI{}, CNTFRQ={} Hz) — IRQs stay UNMASKED across the CAPSTONE terminus; dispatch is on_tick + post-EOI timer_preempt ::",
+        super::exceptions::current_el(), cpu, TICK_HZ, TIMER_INTID, freq
+    );
+    // The BSP's own arm path, reused: banked GICR PPI enable + TVAL + ENABLE=1 + isb. NOT
+    // `arm_this_core_ap` — the boot core stays the global-clock owner, so `ticks()`/`ms()` resume
+    // advancing post-drop exactly as they did at EL2 (frozen since the JC3 disarm until now).
+    arm_this_core();
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// VIRTPREEMPT per-tick witness, called from `on_tick` (IRQ context — safe: `_print` is `try_lock` +
+/// staging, see the block comment above). Counts ONLY the arming core's ticks and emits at a low rate:
+/// tick 1 (the one-hit proof the arm delivered AT EL1 — the line JV1's deferred half is named by), then
+/// every [`TICK_HZ`]th tick (~1 line/s). The EL is RE-MEASURED per emission rather than assumed: an EL2
+/// reading here would mean the boot core never dropped, and it is reported rather than hidden.
+#[cfg(feature = "virt_tick")]
+#[inline(never)]
+fn virttick_witness() {
+    let armed = VIRTTICK_CORE.load(Ordering::Acquire);
+    if armed == VIRTTICK_NO_CORE {
+        return;
+    }
+    let cpu = super::percpu::this_cpu().cpu_index;
+    if cpu != armed {
+        return;
+    }
+    let n = VIRTTICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % TICK_HZ == 0 {
+        serial_println!(
+            ":: [virttick] tick {} taken at EL{} on cpu {} — periodic CNTP live across the CAPSTONE terminus ::",
+            n,
+            super::exceptions::current_el(),
+            cpu
+        );
+    }
+}
+
+/// VIRTPREEMPT — ticks taken on the arming core so far. Read by the preemption verdict in
+/// `sched.rs` so the verdict line carries the CLOCK alongside the interleave it produced: an
+/// alternation count with no tick count behind it cannot distinguish "preemption worked" from
+/// "the two spinners happened to be scheduled oddly".
+#[cfg(feature = "virt_tick")]
+pub fn virt_tick_count() -> u64 {
+    VIRTTICK_COUNT.load(Ordering::Relaxed)
 }

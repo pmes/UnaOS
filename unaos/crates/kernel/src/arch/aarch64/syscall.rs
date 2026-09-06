@@ -23883,3 +23883,16 @@ pub fn virt_el0_verdict(_: usize) {
         );
     }
 }
+
+/// VIRTPREEMPT (orin 17) — has the M6e EL0 spinner (`__user_prog_spin`) reached its `sys_exit`?
+///
+/// A file-tail, `virt_tick`-gated read-only accessor over the existing `EL0_SPIN_DONE` counter, added
+/// for the same reason `virt_el0_verdict` is a tail twin rather than a widened `#[cfg]`: nothing above
+/// this line moves, so the knob-off `kernel8.img` cannot. The virt preemption verdict (`sched.rs` tail)
+/// waits on it so that its EL0 evidence is read after the spinner has finished rather than at whatever
+/// instant the kernel half of the proof happened to complete — an unfinished spinner would make
+/// "EL0 was never preempted" and "EL0 has not run yet" the same reading.
+#[cfg(feature = "virt_tick")]
+pub fn el0_spin_done() -> u32 {
+    EL0_SPIN_DONE.load(Ordering::Acquire)
+}

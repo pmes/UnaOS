@@ -862,6 +862,37 @@ tegra_el0 = ["tegra", "aarch64_el0"]
 # the point of it.
 virt_el0 = ["aarch64_el0"]
 
+# VIRTPREEMPT (orin 17) — EL1 TIMER PREEMPTION ON THE QEMU `virt` TARGET, the half JV1 deferred by name
+# ("EL1 timer preemption on virt remains a separate arc"; `main.rs` tail: "EL1 timer preemption on virt
+# needs an EL1-non-banking `__vec_irq`"). Four things, all `virt_tick`-gated:
+#
+#   1. `exceptions.rs` `irq_bank!`/`irq_unbank!` — off `tegra` the shared IRQ stub picks its bank
+#      registers at COMPILE time (`baremetal` => ELR/SPSR_EL1, everything else => _EL2), and `virt` is
+#      "everything else". An IRQ taken at EL1 would `mrs x0, ELR_EL2`, which UNDEFs at EL1 straight into
+#      the halting `__vec_sync`. This feature selects the RUNTIME `CurrentEL` arm that `tegra` already
+#      uses and that IRQEL-RT proved live at EL1 on Orin metal — the same asm, no new sequence.
+#   2. `timer.rs` — a periodic 250 Hz CNTP_EL0 re-arm at EL1 (`virt_tick_start`), the `virt` twin of
+#      ORIN-BSPTICK's `el1_bsptick_start`, armed AFTER the post-drop `exceptions::install()`. The JC3
+#      drop's `msr cntp_ctl_el0, xzr` is kept exactly as it is: this re-arms from EL1, which the same
+#      drop's CNTHCTL_EL2.EL1PCEN|EL1PCTEN is what makes legal.
+#   3. `gic.rs` — the post-EOI `timer_preempt` arm in `handle_irq_v3`, previously `all(tegra, bsprun)`.
+#   4. `sched.rs` — `SCHED_ACTIVE` + the three-task preemption proof, staged inside the EXISTING
+#      cooperative `run_capstone_boot_core` terminus rather than replacing it (ORIN-BSPRUN swaps the
+#      terminus and thereby gives up CAPSTONE; this arc keeps CAPSTONE, the JV1 EL0 round-trip and every
+#      baseline emit, because `dispatch_next` already requeues a task that comes back READY — a preempt
+#      lands the drive loop back in `dispatch_next` exactly where a `yield_now` does).
+#
+# Implies `virt_el0`, deliberately and not for convenience: the EL0 half of the proof (the M6e
+# register-only spinner preempted at EL0 through the 0x480 lower-EL vector, counted by
+# `aarch64_irq_handler`'s SPSR.M test) needs the EL0 regime, and a `virt_tick` without it would ship an
+# untested second configuration of every predicate JV1 widened. One knob, one shape.
+#
+# DEFAULT OFF => the `irq_bank!` arms are the pre-arc compile-time ones, no tick is armed, `SCHED_ACTIVE`
+# stays false, the dispatch has no preempt arm, and the Pi/Orin/plain-virt/x86 images are byte-identical.
+# Enable via `UNAOS_VIRT_TICK=1` alongside `UNAOS_GICV3=1` (the JC3 EL2 -> EL1 drop this all sits on);
+# type-checked by the `arm-virt-tick` leg of KERNEL_CFG_MATRIX. See arch_arm64.md §VIRTPREEMPT.
+virt_tick = ["virt_el0"]
+
 # JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of `jb2b_attach` BEFORE the
 # no-HCRST takeover overwrites the controller's inherited DCBAAP/CRCR/ERST — so it snapshots the

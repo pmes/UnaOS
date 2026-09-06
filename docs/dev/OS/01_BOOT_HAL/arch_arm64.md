@@ -11394,3 +11394,120 @@ the jetson media and the Pi `kernel8.img` are both byte-identical to baseline. V
 * Disarmed `esp-jetson` (`tegra_el0` aboard, `orininput` off): **zero** matches for `orininput`,
   `rollup passes=`, `NEVER-RAN`, `ROUTER-DROP`, `QUEUE-INERT` — the strings are absent from the image,
   not merely unreached.
+
+## VIRTPREEMPT — EL1 timer preemption on the QEMU `virt` target (`UNAOS_VIRT_TICK`)
+
+The half [§JV1](#jv1--el0-on-the-qemu-virt-target-unaos_virt_el0) named and deferred. JV1's own header
+states the parked work exactly:
+
+> COOPERATIVE, exactly as the JC3 drop leaves things … the drop disables the physical timer,
+> `SCHED_ACTIVE` stays false, and the shared `__vec_irq` stub still banks EL2 state (`irq_el!()` == "2")
+> … EL1 timer preemption on virt needs an EL1-non-banking `__vec_irq` and is a SEPARATE arc.
+
+Arm with `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VIRT_TICK=1 ./arroyo test-arm 60`. The feature is
+`virt_tick`, and it implies `virt_el0`.
+
+### 1. The measurement: does `__vec_irq` bank EL1 today?
+
+No. `exceptions.rs` selects the IRQ stub's bank/unbank sequence at **compile** time off `tegra`:
+
+```rust
+#[cfg(all(not(feature = "tegra"), feature = "baremetal"))]      irq_bank! => "mrs x0, ELR_EL1 / mrs x1, SPSR_EL1"
+#[cfg(all(not(feature = "tegra"), not(feature = "baremetal")))] irq_bank! => "mrs x0, ELR_EL2 / mrs x1, SPSR_EL2"
+#[cfg(feature = "tegra")]                                       irq_bank! => runtime CurrentEL branch
+```
+
+A `virt` build is `not(tegra), not(baremetal)`, so it takes the **second** arm. `mrs x0, ELR_EL2`
+executed at EL1 is UNDEFINED: it traps as a synchronous exception into `__vec_sync`, which logs and
+halts. That is the blocker, and it is the reason `boot_virt::drop_to_el1`'s asm ends with
+`msr cntp_ctl_el0, xzr` — its own module comment says so in as many words.
+
+Two independent corroborations that the diagnosis is the whole of it: `__vec_sync` already carries the
+runtime `CurrentEL` test (`mrs x2, CurrentEL / cmp x2, #0x8 / b.eq 2f`) for the identical reason, and
+`tegra` has run that same three-instruction test in `__vec_irq` since `0a60e260`, with IRQEL-RT proving
+it live at EL1 on Orin metal.
+
+**The minimal change is therefore a gate widening, not a rewrite.** `virt_tick` joins the tegra arm:
+
+```rust
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), feature = "baremetal"))]      … _EL1
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), not(feature = "baremetal")))] … _EL2
+#[cfg(any(feature = "tegra", feature = "virt_tick"))]                                       … runtime CurrentEL
+```
+
+Not one byte of new assembly exists in this arc. The three arms stay mutually exclusive and exhaustive,
+and the comment above them is kept line-neutral (6 lines in, 6 out) because `exceptions::install`'s
+`assert!`/`panic!` sit below it and this file compiles into the knob-off `kernel8.img`.
+
+`boot_virt.rs` is **not touched**. The drop still disarms CNTP; `timer::virt_tick_start` re-arms it from
+EL1 afterwards — the JM6 / ORIN-BSPTICK pairing, made legal by the same drop's
+`CNTHCTL_EL2.EL1PCTEN|EL1PCEN` (`orr x0, x0, #0x3`) and `HCR_EL2 = 1<<31` with IMO/FMO/AMO clear.
+
+### 2. What the arc changes
+
+| File | Change | Shape |
+|---|---|---|
+| `exceptions.rs` | `irq_bank!`/`irq_unbank!` gates; the stale "(tegra/virt run cooperatively)" note on the M6e counter corrected | line-neutral, in place |
+| `timer.rs` | `virt_tick_start()` + `virttick_witness()` + `virt_tick_count()`; witness call folded onto `on_tick`'s existing tail line | tail append + 1 line-neutral fold |
+| `gic.rs` | the `handle_irq_v3` post-EOI preempt arm: `all(tegra,bsprun)` → `any(all(tegra,bsprun), virt_tick)` | line-neutral, in place |
+| `sched.rs` | `SCHED_ACTIVE` + the proof (`vp-spinA`/`vp-spinB`/`vp-judge`); arm folded onto the existing `SCHED_GO` line | tail append + 1 line-neutral fold |
+| `syscall.rs` | `el0_spin_done()` accessor over the existing `EL0_SPIN_DONE` | tail append |
+| `main.rs` | `virt_tick_start()` and the `el0-spin` `spawn_user` folded onto existing lines | line-neutral |
+
+GIC state is **not** re-programmed at EL1: `gic::init_cpu_interface_v3` set ICC_SRE_EL2.SRE,
+ICC_SRE_EL1.SRE, ICC_PMR_EL1=0xFF, ICC_CTLR_EL1.EOImode=0 and ICC_IGRPEN1_EL1=1 at EL2, and in the
+non-VHE physical interface those ICC_*_EL1 registers are not EL-banked, so EL1 inherits a live Group-1
+interface. `smp_virt.rs`'s ORIN-EL1AP comment already depends on exactly this property.
+
+### 3. Why the terminus is kept, unlike ORIN-BSPRUN
+
+ORIN-BSPRUN swaps `run_capstone_boot_core(0)` for `run_bsp_tegra(0)` and states its price: "an armed
+boot spawns NO CAPSTONE … and skips the cooperative terminus's baseline emits". On `virt` that price is
+unpayable — CAPSTONE and the JV1 EL0 round-trip *are* the regression this gate protects.
+
+It is also unnecessary. `dispatch_next`'s tail already handles a task that comes back READY —
+*"READY (yielded or preempted): re-enqueue at its BASE priority level"* — and `timer_preempt` switches
+to `SCHED[cpu].scheduler_sp`, the SP `dispatch_next` published on its way in. A preempt therefore returns
+the drive loop to precisely where a cooperative `yield_now` returns it. **The cooperative loop and the
+preemptive loop are the same loop; only `SCHED_ACTIVE` differs.** So the arm is folded onto the existing
+`SCHED_GO.store(...)` line: after every cooperative witness (`priority_aging_witness`, `prio_mix_witness`,
+`parked_display_witness`, `sched_bal_witness`) and after `spawn("capstone", …)`, before the loop.
+
+`mark_online(0)` is deliberately **not** called. The three `virt` EL2 secondaries sit in `run()`, and
+`try_steal` skips any core whose `ONLINE_MASK` bit is clear — cpu 0's is, so the proof below is
+single-core by construction and the interleave it measures means something.
+
+### 4. The proof, and why it is a proof
+
+Three kernel tasks on the boot core, all `PRIO_NORMAL`, **none of which ever calls `yield_now`,
+`sleep_ticks`, or any blocking primitive**:
+
+* `vp-spinA` / `vp-spinB` — each spins for a fixed 500 ms **wall-clock** window (CNTPCT, which advances
+  whether or not any interrupt is ever delivered), doing `VP_LAST.swap(my_id)` on every pass and counting
+  a **handover** whenever the previous occupant was the other spinner.
+* `vp-judge` — spawned third, also non-yielding; waits for both spinners and for the EL0 spinner, then
+  prints one self-checking line.
+
+**The discriminator is the handover count, not the loop counts.** Under a purely cooperative dispatcher
+the schedule is forced: A is dispatched, runs its whole window without ever returning to the scheduler,
+exits; then B; then the judge. `VP_ALT` therefore reads **exactly 2** — one for A's first swap over the
+initial zero, one for B's first swap over A — and it can read nothing else, because a handover requires a
+switch and cooperation offers none. Every count above 2 is an involuntary switch only the timer can have
+caused. The PASS floor is 6 (four real handovers) so no single stray switch decides the verdict; at
+`QUANTUM_TICKS = 3` and 250 Hz the measured value is two orders of magnitude clear of it.
+
+**It is bounded in both directions**, which is what a gate needs: the windows are wall-clock, so the
+*failure* mode (no tick ever delivered) is not a hang — the spinners still finish, the judge still runs,
+and it prints FAIL carrying `alternations=2`, the cooperative signature. A proof whose negative outcome
+is a timeout tells a capture nothing.
+
+**The EL0 half** is `el0-spin` (`__user_prog_spin`, the M6e register-only spinner), spawned by
+`virt_el0_start_maybe` under `virt_tick` and preempted through the 0x480 lower-EL vector — the same
+now-runtime-banked `__vec_irq`, which banks SP_EL0 unconditionally, so it resumes on its own user SP and
+reaches its `sys_exit` (`EL0_SPIN_DONE`, which the judge waits for so "not preempted" and "not finished"
+cannot be confused). It is measured from `PRIO_EL0_DISPATCH`, **not** from `aarch64_irq_handler`'s M6e
+`EL0_IRQS_AT_EL0`: the virt boot also ticks at EL2 before the JC3 drop, where SPSR_EL1 is RESET-UNKNOWN,
+so a zero there would be counted as an EL0 preempt that never happened. `virt_el0_start_maybe` stages
+exactly two EL0 tasks, `el0-hello` (one non-blocking `sys_write`, then `sys_exit`) and `el0-spin` (no
+syscall at all before its exit); neither can yield, so a cooperative boot dispatches each exactly once
+and the counter reads exactly 2. A third dispatch is EL0 preemption.

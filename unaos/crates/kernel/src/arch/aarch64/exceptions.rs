@@ -30,18 +30,18 @@ static BOOT_EL: AtomicU8 = AtomicU8::new(0);
 // The IRQ stub banks ELR/SPSR for the EL the exception was taken AT. A single `global_asm!` can't
 // `#[cfg]` individual lines, so the whole bank/unbank SEQUENCE is selected here and spliced into
 // __vec_irq via `concat!` — the newlines live INSIDE the strings, so this costs no source lines.
-// Off tegra the EL is fixed at compile time (baremetal drops to EL1 -> _EL1; UEFI/QEMU-virt stays
+// Off tegra AND off virt_tick the EL is fixed at compile time (baremetal drops to EL1 -> _EL1; UEFI/QEMU-virt stays
 // at EL2 -> _EL2) and those arms emit byte-identical asm to before. On TEGRA one table serves BOTH:
 // JM4 arms the GIC-600 + CNTP and `timer::verify_live` PROVES interrupt-driven ticks AT EL2, then
 // JM6 `boot_tegra::drop_to_el1` re-installs the same table as VBAR_EL1 — and neither digit is right
 // for both ("2" UNDEFs at EL1, into the halting __vec_sync; "1" banks the wrong register at EL2), so
-// tegra reads CurrentEL at RUNTIME (the __vec_sync/JB1f pattern; x3 scratch, labels 7/8 per-site).
-#[cfg(all(not(feature = "tegra"), feature = "baremetal"))] macro_rules! irq_bank { () => { "mrs x0, ELR_EL1\n    mrs x1, SPSR_EL1" }; }
-#[cfg(all(not(feature = "tegra"), not(feature = "baremetal")))] macro_rules! irq_bank { () => { "mrs x0, ELR_EL2\n    mrs x1, SPSR_EL2" }; }
-#[cfg(feature = "tegra")] macro_rules! irq_bank { () => { "mrs x3, CurrentEL\n    cmp x3, #0x8\n    b.eq 7f\n    mrs x0, ELR_EL1\n    mrs x1, SPSR_EL1\n    b 8f\n7:  mrs x0, ELR_EL2\n    mrs x1, SPSR_EL2\n8:" }; }
-#[cfg(all(not(feature = "tegra"), feature = "baremetal"))] macro_rules! irq_unbank { () => { "msr ELR_EL1, x0\n    msr SPSR_EL1, x1" }; }
-#[cfg(all(not(feature = "tegra"), not(feature = "baremetal")))] macro_rules! irq_unbank { () => { "msr ELR_EL2, x0\n    msr SPSR_EL2, x1" }; }
-#[cfg(feature = "tegra")] macro_rules! irq_unbank { () => { "mrs x3, CurrentEL\n    cmp x3, #0x8\n    b.eq 7f\n    msr ELR_EL1, x0\n    msr SPSR_EL1, x1\n    b 8f\n7:  msr ELR_EL2, x0\n    msr SPSR_EL2, x1\n8:" }; }
+// tegra reads CurrentEL at RUNTIME (the __vec_sync/JB1f pattern; x3 scratch, labels 7/8 per-site). VIRTPREEMPT (orin 17): `virt` is BOTH-EL for the identical reason — `timer::init` ticks at EL2 pre-JC3 and `timer::virt_tick_start` re-arms at EL1 after the JC3 drop — so `virt_tick` joins that runtime arm. THIS IS THE BLOCKER JV1 NAMED ("EL1 timer preemption on virt needs an EL1-non-banking `__vec_irq`"), and it is MEASURED, not asserted: knob-off, a `virt` build takes the SECOND arm below, whose `mrs x0, ELR_EL2` is UNDEFINED at EL1 and traps straight into __vec_sync's halt — so the minimal change is a GATE WIDENING, not a rewrite. No new asm sequence exists in this arc: it is character-for-character the tegra arm IRQEL-RT proved live at EL1 on Orin metal. Comment kept LINE-NEUTRAL (6 lines in, 6 out) because `install`'s `assert!`/`panic!` sit below it in this file and this file compiles into the knob-off `kernel8.img`.
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), feature = "baremetal"))] macro_rules! irq_bank { () => { "mrs x0, ELR_EL1\n    mrs x1, SPSR_EL1" }; }
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), not(feature = "baremetal")))] macro_rules! irq_bank { () => { "mrs x0, ELR_EL2\n    mrs x1, SPSR_EL2" }; }
+#[cfg(any(feature = "tegra", feature = "virt_tick"))] macro_rules! irq_bank { () => { "mrs x3, CurrentEL\n    cmp x3, #0x8\n    b.eq 7f\n    mrs x0, ELR_EL1\n    mrs x1, SPSR_EL1\n    b 8f\n7:  mrs x0, ELR_EL2\n    mrs x1, SPSR_EL2\n8:" }; }
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), feature = "baremetal"))] macro_rules! irq_unbank { () => { "msr ELR_EL1, x0\n    msr SPSR_EL1, x1" }; }
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), not(feature = "baremetal")))] macro_rules! irq_unbank { () => { "msr ELR_EL2, x0\n    msr SPSR_EL2, x1" }; }
+#[cfg(any(feature = "tegra", feature = "virt_tick"))] macro_rules! irq_unbank { () => { "mrs x3, CurrentEL\n    cmp x3, #0x8\n    b.eq 7f\n    msr ELR_EL1, x0\n    msr SPSR_EL1, x1\n    b 8f\n7:  msr ELR_EL2, x0\n    msr SPSR_EL2, x1\n8:" }; }
 
 // M6a: the Lower-EL-AArch64 synchronous vector (0x400) routes to __vec_svc wherever EL0 exists —
 // baremetal AND tegra_el0 (recovered boot-2 capture 2026-08-18: el0-hello's first `svc #0` hit the
@@ -571,7 +571,7 @@ extern "C" fn aarch64_irq_handler() {
     // IRQ/FIQ/SError can be taken to overwrite SPSR_EL1 before this read — even though enable_irq
     // unmasks SError (PSTATE.A) globally, that clear does not survive exception entry. SPSR.M[4:0]==0
     // is EL0t (an AArch64 EL0 return); any kernel-EL preempt has M != 0. This block is `baremetal`-gated,
-    // NARROWER than `syscall`'s own `aarch64_el0` gate: only the Pi PREEMPTS EL0 (tegra/virt run cooperatively).
+    // NARROWER than `syscall`'s own `aarch64_el0` gate. VIRTPREEMPT (orin 17) DELIBERATELY LEAVES IT SO, and this is the correction of the old parenthetical "(tegra/virt run cooperatively)": under `virt_tick` the EL0 spinner IS preempted at EL1, but this counter cannot witness it honestly — the virt boot ALSO ticks at EL2 before the JC3 drop, SPSR_EL1 is RESET-UNKNOWN there, and a zero would be counted as an EL0 preempt that never happened. The virt EL0-preemption falsifier is `PRIO_EL0_DISPATCH` instead (an EL0 task dispatched more than once was switched out and back), read in sched.rs's VIRTPREEMPT verdict. Tegra stays cooperative unless ORIN-BSPRUN is armed.
     #[cfg(feature = "baremetal")]
     {
         let spsr: u64;

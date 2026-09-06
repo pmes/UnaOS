@@ -1017,6 +1017,29 @@ _feats=""
 # Witnesses on the wire: `:: VIRT-EL0: el0-hello spawned at EL0`, `:: VIRT-EL0: el0-hello round-trip ->`,
 # and `[el0]`/`SYS_WRITE` traffic from the demo itself.
 [ -n "${UNAOS_VIRT_EL0:-}" ] && _feats="${_feats}virt_el0,"
+# VIRTPREEMPT (orin 17): UNAOS_VIRT_TICK=1 arms EL1 TIMER PREEMPTION on the QEMU `virt` target — the
+# half JV1 named and deferred ("EL1 timer preemption on virt needs an EL1-non-banking `__vec_irq` and is
+# a SEPARATE arc"). Four gated pieces, none of which adds a source line to any knob-off path:
+#   * `exceptions.rs` — the `irq_bank!`/`irq_unbank!` gates widen so `virt_tick` selects the RUNTIME
+#     `CurrentEL` arm instead of the fixed `_EL2` one. THIS is the measured blocker: knob-off, a virt
+#     build's IRQ stub does `mrs x0, ELR_EL2`, which is UNDEFINED at EL1 and traps into __vec_sync.
+#   * `timer.rs` — `virt_tick_start()`, a 250 Hz periodic CNTP re-arm AT EL1 after the JC3 drop. The
+#     drop's own `msr cntp_ctl_el0, xzr` is kept; `boot_virt.rs` is not touched by this arc.
+#   * `gic.rs` — the post-EOI `timer_preempt` arm in `handle_irq_v3` (was `all(tegra,bsprun)`).
+#   * `sched.rs` — `SCHED_ACTIVE` + the three-task preemption proof, staged INSIDE the existing
+#     cooperative `run_capstone_boot_core` terminus, so CAPSTONE and the JV1 EL0 round-trip are kept
+#     (ORIN-BSPRUN swaps the terminus and gives both up; that trade is wrong for a QEMU gate).
+# Appends its own name ONLY — the `virt_tick = ["virt_el0"]` implication lives in Cargo.toml, so the
+# banner cannot double-print `virt_el0` when both knobs are set (the BANNER-DEDUP class below).
+# Needs `UNAOS_GICV3=1` alongside it, for the same reason UNAOS_VIRT_EL0 does — the whole regime sits on
+# the JC3 EL2 -> EL1 drop, which only the GICv3 path reaches:
+#   UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VIRT_TICK=1 ./arroyo test-arm 60
+# Default OFF => the compile-time `irq_bank!` arms are the pre-arc ones, no tick is armed, SCHED_ACTIVE
+# stays false, the dispatch has no preempt arm, and every existing image (Pi, Orin, plain virt, x86) is
+# byte-identical. The ARMED polarity is type-checked by the `arm-virt-tick` leg of KERNEL_CFG_MATRIX.
+# Witnesses on the wire: `:: [virttick] arming PERIODIC CNTP at EL1`, `:: [virttick] tick N taken at EL1`,
+# `:: [virttick] PREEMPTION PASS`. See arch_arm64.md §VIRTPREEMPT.
+[ -n "${UNAOS_VIRT_TICK:-}" ] && _feats="${_feats}virt_tick,"
 # ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries_tegra
 # + the fdt_tegra `/cpus` presence enumerator) is DEFAULT-ON for tegra builds — metal-proven across
 # SMP-1..8 (entry shape, concurrency, position, image layout, idle/busy heartbeats, count-based
@@ -2272,7 +2295,7 @@ build_kernel_aarch64() {
     # Build the blob FRESH here, unconditionally, for exactly those feature sets (kernel8 and the
     # armed esp-jetson already do their own unconditional build; this closes esp-arm/arm/test-arm).
     case ",${_af#--features }," in
-        *,baremetal,*|*,tegra_el0,*)
+        *,baremetal,*|*,tegra_el0,*|*,virt_el0,*|*,virt_tick,*)  # VIRTPREEMPT (orin 17): the virt terms added. JV1 made `virt_el0` a THIRD feature set that compiles syscall.rs's `include_bytes!`, but this case still listed only two — so `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm` baked whatever blob a prior `check`/`kernel8` had left, which is exactly the "image whose contents cannot be derived from its stated inputs" BLOBATOMIC exists to forbid (and in a fresh worktree with no blob at all it simply fails to compile). `virt_tick` is listed separately because arroyo appends knob NAMES and lets Cargo resolve the `virt_tick = ["virt_el0"]` implication, so the `--features` string for UNAOS_VIRT_TICK=1 alone does not contain `virt_el0`.
             local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
             ( cd "$WORKSPACE_DIR" && build_user_blob )
             cd "$WORKSPACE_DIR/crates/kernel"
@@ -3858,6 +3881,21 @@ KERNEL_CFG_MATRIX=(
   # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
   # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
   "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0"
+  # VIRTPREEMPT (orin 17) — THE PREEMPTIVE TWIN OF THE LEG ABOVE, and not redundant with it. `virt_tick`
+  # is the ONLY configuration in the tree where the `exceptions.rs` `irq_bank!`/`irq_unbank!` runtime
+  # `CurrentEL` arm is selected WITHOUT `tegra`, so it is the only leg that type-checks that arm against a
+  # virt (PL011, no GIC-600, no carveouts) build; it is likewise the only aarch64 leg that compiles the
+  # `gic.rs` post-EOI `timer_preempt` arm without `bsprun`, and the only one that compiles sched.rs's
+  # VIRTPREEMPT tail block and timer.rs's `virt_tick_start` at all. `virt_tick` implies `virt_el0`, so the
+  # leg above remains the NON-preemptive polarity of the same file set — both are needed or one of the two
+  # states ships unchecked.
+  #
+  # PRECONDITION, inherited from the leg above: compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  #
+  # UNIVERSE SIDE EFFECT: `virt_tick` is named by this arm-* leg and by no x86 leg, so
+  # `x86_cfg_universe` drops it exactly as it drops `virt_el0`/`tegra_el0`. Board legs +1.
+  "arm-virt-tick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_tick"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
