@@ -50,7 +50,7 @@ mod tegra {
     //   divisor — but verify the UART clock on the board first.
     // Do NOT point this at the TCU mailbox (HSP doorbell @ ~0x0C16_8000): that is a different,
     // non-16550 protocol; a polled LSR/THR driver cannot drive it.
-    const BASE: usize = 0x0C28_0000;
+    const BASE: usize = 0x0C28_0000; #[cfg(feature = "orinrx")] pub(super) fn base() -> usize { BASE } // SERIALRX (ORINRX) — cfg-erased accessor for the tail mod witness, so the knob-off build keeps the const byte-for-byte as declared. ⚠ LINE-NEUTRAL append (and note the measured limit: any byte changed in this LIB-crate file, even a comment, renames ThinLTO `.llvm.<hash>` symbol suffixes in kernel.elf`s .symtab/.strtab; the loaded image stays identical — see the Cargo `orinrx` comment).
 
     // 16550 registers with Tegra reg-shift = 2 → each logical register is 4 bytes apart and
     // accessed as a 32-bit word (meaningful data in the low 8 bits). THR/RBR at +0x00, LSR at
@@ -82,7 +82,7 @@ mod tegra {
         unsafe {
             let rbr = BASE as *const u32;
             let lsr = (BASE + LSR) as *const u32;
-            let status = core::ptr::read_volatile(lsr);
+            let status = core::ptr::read_volatile(lsr); #[cfg(feature = "orinrx")] super::serialrx::note_lsr(status); // SERIALRX (ORINRX) — capture the RAW word BEFORE the guards below swallow it (store only: this runs under SERIAL_PORT; the print is off-lock in the tail mod). ⚠ LINE-NEUTRAL append.
             // Open-bus guard — the read-side counterpart to write_byte's bounded TX wait, and as
             // load-bearing here because BASE is unverified. If BASE is wrong, or the AON UART is
             // held in reset / firewalled off CCPLEX, MMIO reads return all-ones (0xFFFF_FFFF).
@@ -657,5 +657,180 @@ pub mod shell_inbox {
         DELIVERED.store(0, Ordering::Relaxed);
         DROPPED.store(0, Ordering::Relaxed);
         HIGH.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---- SERIALRX (ORINRX): the Orin's serial console RECEIVE path — `orinrx`, DEFAULT OFF ----------
+//
+// THE GAP. `tegra::read_byte` above (LSR.DR + RBR — the whole polled-RX contract of a 16550; there is
+// no RX-enable bit to find) is compiled into every jetson image and reachable through
+// `arch::poll_input` -> `poll_input_nonblocking`, yet the console path never calls it:
+// `jd2_console_pump` (both phases), its `supstate` twin `jd2_supstate_phase2` and the headless
+// `kbd_pump_body` all drain `pal::next_event()`, which is `pop_event()` alone — no MMIO. The only
+// tegra callers of the poll were `pal::pump_and_poll` (vug, the selftest pager), which the console
+// pump never enters. So the Orin has been output-only for the cheapest possible reason: routing.
+//
+// THE FIX is one statement, `drain()` below, appended to the xHCI poll block of each of those FOUR
+// pumps: poll the UART and push each byte as `Event::Key` onto the same queue the xHCI HID decoder
+// feeds, so the drain that follows sees a serial byte exactly as it sees a keystroke. Everything
+// downstream — `handle_key`, the `:: tegra: JD2 — KEY` echo, `shell::dispatch_command` — is already
+// source-agnostic. Same shape as `pump_and_poll`'s aarch64 arm in pal.rs.
+//
+// WHY A KNOB, DEFAULT OFF. `BASE` is marked TO VERIFY ON THE BOARD (header above): observed TX does
+// not establish RX. If BASE is wrong, or the AON UART is not ours, the failure mode is PHANTOM BYTES
+// injected into the shell on every poll — `read_byte`'s all-ones guard catches only the open-bus
+// case. The knob keeps the shipped image byte-identical until a board has answered.
+//
+// TWO DIAGNOSTICS, because `read_byte` SWALLOWS the one that matters: it returns `None` both on an
+// all-ones LSR and on no-data, so a silent negative would be undiagnosable.
+//   (1) `note_lsr` captures the RAW LSR word of the FIRST poll that reached the port. It is called
+//       from `read_byte` UNDER `SERIAL_PORT`, so it only stores; `witness_once` prints it off-lock
+//       from the pump, once, and classifies it by the driver header's table:
+//         0x0000_0000   RX-ZERO     AON UART held in reset / clock-gated -> needs a BPMP reset+clock call
+//         0xFFFF_FFFF   RX-OPENBUS  open bus / wrong BASE                -> try a fallback UART
+//         0xDEAD_xxxx   RX-DEAD     SoC decode/access-error sentinel     -> wrong BASE or a CCPLEX firewall
+//         anything else RX-LIVE     the UART answers (0x60 = THRE|TEMT is the idle 16550 signature)
+//   (2) `census` counts bytes delivered and prints `[serialrx] rx=` on the pump's EXISTING sweep
+//       cadence (~250 ms ticks; every 4th = ~1 s, the `[orinrender] census` rate). No new timer; the
+//       headless `kbd_pump_body` has no sweep and so carries the drain + witness only.
+//
+// The witness token is subsystem-named (`[serialrx]`), never board-named (Peter, 2026-09-03).
+// Tail module on purpose: knob-off it is `#[cfg]`-erased and nothing below it exists to shift, so
+// the file's line numbering — and every panic `Location` in it — is untouched.
+#[cfg(all(feature = "tegra", feature = "orinrx"))]
+pub mod serialrx {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    /// Raw LSR word of the first poll that reached the port; meaningful once `LSR_SEEN`.
+    static LSR_FIRST: AtomicU32 = AtomicU32::new(0);
+    static LSR_SEEN: AtomicBool = AtomicBool::new(false);
+    static LSR_PRINTED: AtomicBool = AtomicBool::new(false);
+    /// Bytes `drain` delivered to the PAL queue.
+    static RX: AtomicU64 = AtomicU64::new(0);
+    static RX_AT_LAST_CENSUS: AtomicU64 = AtomicU64::new(0);
+    static CENSUS_ARMED: AtomicBool = AtomicBool::new(false);
+    static CENSUS_TICK: AtomicU64 = AtomicU64::new(0);
+    /// Sweep ticks per census line: the pump sweeps every ~250 ms, so 4 = ~1 s.
+    const CENSUS_PERIOD: u64 = 4;
+
+    // RXDISCRIM (A16): the three discriminators for the 3-of-5 byte loss of render3b. Overrun
+    // between polls is refuted by the census (~325k polls/s vs 87 µs/byte); the live models are a
+    // stall-time overrun (the pump's own `KEY` echo under the port lock) vs a competing reader
+    // (UARTC is the SPE/TCU combined-UART port — two readers on one RBR). An overrun SETS LSR.OVRF;
+    // a competitor never does. FIFO mode qualifies either (a 16-deep FIFO would not overrun in a
+    // 2.3 ms echo at 87 µs/byte). Both are READ-ONLY witnesses; no FCR/IER/MCR write anywhere.
+    /// POLLS that observed bit 1 (OVRF, the 16550/Tegra `UART_LSR_0` overrun flag) set — a poll
+    /// count, not an event count: N overruns inside one stall (the pump's ~2.3 ms `KEY` echo) show
+    /// as ONE poll with the flag up, so this is a lower bound on events; the A16 verdict table only
+    /// asks `ovrf > 0`. Words with any of bits 31..16 set are excluded (all-ones = open bus,
+    /// `0xdead....` = SoC decode error — both have bit 1 set and are not overruns; Tegra's LSR uses
+    /// bits 9..0 only). PANEL4 L2, 2026-09-06.
+    static OVRF: AtomicU64 = AtomicU64::new(0);
+    /// Raw IIR word of the one-shot read taken on the witness line.
+    static IIR_FIRST: AtomicU32 = AtomicU32::new(0);
+    /// 16550 LSR bit 1 = OVRF (overrun error): the RBR was overwritten before it was read.
+    const LSR_OVRF: u32 = 1 << 1;
+    /// 16550 IIR = register index 2, at the tegra mod's reg-shift-2 stride (`LSR = 5 << 2`, above).
+    /// Read-only: IIR[7:6] = 0b11 reports FIFOs enabled (FCR.FIFOE latched); 0b00 = 16450 mode.
+    const IIR: usize = 2 << 2;
+    const IIR_FIFO_SHIFT: u32 = 6;
+
+    /// Called by `tegra::read_byte` UNDER `SERIAL_PORT` with the raw LSR word, ahead of its guards.
+    /// Store only — a print here would deadlock on the port the caller holds. First word wins.
+    pub fn note_lsr(status: u32) {
+        if !LSR_SEEN.load(Ordering::Acquire) {
+            LSR_FIRST.store(status, Ordering::Relaxed);
+            LSR_SEEN.store(true, Ordering::Release);
+        }
+        if (status & 0xFFFF_0000) == 0 && (status & LSR_OVRF) != 0 {
+            OVRF.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// IIR[7:6] decoded: `on` = 0b11 (FIFOs enabled), `off` = 0b00 (16450 mode), else the raw pair.
+    fn fifo_state(iir: u32) -> &'static str {
+        match (iir >> IIR_FIFO_SHIFT) & 0b11 {
+            0b11 => "on",
+            0b00 => "off",
+            0b01 => "odd(01)",
+            _ => "odd(10)",
+        }
+    }
+
+    /// The driver header's three-state table, applied to a raw LSR word.
+    pub fn classify(lsr: u32) -> &'static str {
+        if lsr == 0 {
+            "RX-ZERO (AON UART held in reset / clock-gated — needs a BPMP reset-deassert + clock-ungate)"
+        } else if lsr == 0xFFFF_FFFF {
+            "RX-OPENBUS (open bus / wrong BASE — try a fallback UART)"
+        } else if (lsr >> 16) == 0xDEAD {
+            "RX-DEAD (SoC decode/access-error sentinel — wrong BASE or a CCPLEX firewall)"
+        } else {
+            "RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)"
+        }
+    }
+
+    /// THE DRAIN — the one statement the console path lacked. Appended to the xHCI poll block of
+    /// `jd2_console_pump` (phase 1 and phase 2), `jd2_supstate_phase2` and `kbd_pump_body`.
+    pub fn drain() {
+        while let Some(b) = crate::arch::poll_input() {
+            crate::pal::push_event(crate::pal::Event::Key(b));
+            RX.fetch_add(1, Ordering::Relaxed);
+        }
+        witness_once();
+    }
+
+    /// One-shot: the raw LSR word of the first poll, printed off-lock from the pump.
+    fn witness_once() {
+        if !LSR_SEEN.load(Ordering::Acquire) || LSR_PRINTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let lsr = LSR_FIRST.load(Ordering::Relaxed);
+        // RXDISCRIM (A16): one read of IIR, off-lock, after a poll has already reached the port (so
+        // the MMIO window is up — `LSR_SEEN` is set only from inside `read_byte`, past its guard).
+        // Reading IIR is NOT side-effect-free for the port's co-owner: a 16550 IIR read acknowledges a
+        // pending THRE interrupt, and the SPE/TCU may have armed IER on this shared UART. It is read
+        // ONCE per boot (this function is one-shot) and the line says whether the read could have
+        // eaten anything: IIR bit 0 = 1 means "no interrupt pending" (render4: 0xc1 → pending=0).
+        // PANEL4 L3, 2026-09-06. Same stride arithmetic as `read_byte`'s `BASE + LSR`.
+        let iir = unsafe { core::ptr::read_volatile((super::tegra::base() + IIR) as *const u32) };
+        IIR_FIRST.store(iir, Ordering::Relaxed);
+        serial_println!(
+            "[serialrx] lsr={:#010x} base={:#010x} iir={:#04x} fifo={} pending={} -> {} (0x00000000 = AON UART held in reset/clock-gated, needs BPMP; 0xffffffff = open bus / wrong BASE; 0xdead.... = SoC decode error; else live)",
+            lsr,
+            super::tegra::base(),
+            iir & 0xFF,
+            fifo_state(iir),
+            (iir & 1 == 0) as u8,
+            classify(lsr)
+        );
+    }
+
+    /// `[serialrx] rx=` on the pump's sweep cadence (every `CENSUS_PERIOD` ticks). `polls`/`refused`
+    /// are the SERFIX counters: `polls=0` means the drain never reached the port at all.
+    pub fn census(tick: u64) {
+        if CENSUS_ARMED.swap(true, Ordering::Relaxed)
+            && tick.wrapping_sub(CENSUS_TICK.load(Ordering::Relaxed)) < CENSUS_PERIOD
+        {
+            return;
+        }
+        CENSUS_TICK.store(tick, Ordering::Relaxed);
+        let rx = RX.load(Ordering::Relaxed);
+        let delta = rx.wrapping_sub(RX_AT_LAST_CENSUS.swap(rx, Ordering::Relaxed));
+        let (polls, refused) = super::serfix_census();
+        let lsr0 = LSR_FIRST.load(Ordering::Relaxed);
+        let verdict = if !LSR_SEEN.load(Ordering::Acquire) {
+            "RX-UNPOLLED (no poll has reached the port: SERIAL_PORT held every pass, or the MMIO window still dark)"
+        } else {
+            classify(lsr0)
+        };
+        // RXDISCRIM (A16): `ovrf=` is the running count of polls that saw LSR.OVRF — an overrun
+        // sets it, a competing reader never does. Cumulative like `rx=`, so the burst window is
+        // scored by the delta across it.
+        let ovrf = OVRF.load(Ordering::Relaxed);
+        serial_println!(
+            "[serialrx] rx={} (+{}) polls={} refused={} ovrf={} lsr0={:#010x} -> {}",
+            rx, delta, polls, refused, ovrf, lsr0, verdict
+        );
     }
 }

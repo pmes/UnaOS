@@ -52,6 +52,19 @@ belongs here, on the day it is made.
   regression's `FAIL` must never be able to evaporate. Enforced every run by
   the SERWIT-1 fixture; see
   [`docs/dev/OS/02_KERNEL_CORE/serial_transport.md`](OS/02_KERNEL_CORE/serial_transport.md).
+- **A wrapped record is not a truncated one** (2026-08-31). The UEFI console
+  the bootloader logs to is sometimes 80 columns wide — the loader never calls
+  `SetMode`, so the width is inherited firmware state — and at 80 columns the
+  firmware hard-wraps every write with a real CRLF. No bytes are lost, but a
+  line-oriented read loses the tail, so `awk '/pattern/'` reports a witness
+  that is present as a witness that was cut off. Orin 11 spent a session on
+  an identity line that appeared to end at the word `max_vaddr` while the
+  value was on the wire throughout. Read bootloader-window captures through
+  `~/unaos-bench/tools/unwrap80.sh` (bench-side, outside the repo)
+  — it is a no-op on a wide-console capture, so there is no cost to always
+  using it. The image-identity witness itself is held under 80 columns so it
+  never needs the tool; see
+  [`docs/dev/OS/01_BOOT_HAL/bootloader_spec.md`](OS/01_BOOT_HAL/bootloader_spec.md) §4.
 - **A flake is an observation, not a re-run** (2026-08-18). An intermittently
   red gate is diagnosed against the fixture-flake corpus —
   [`docs/dev/FIXTURE_FLAKES.md`](FIXTURE_FLAKES.md) — before it is re-run:
@@ -110,6 +123,28 @@ belongs here, on the day it is made.
 - **Durability** (2026-07-17). Work is durable only once its branch is on
   origin. Full push line (all branches) after every landing; feature branches
   backed up periodically; WIP committed before any handoff.
+- **Landing-merge shape check** (pi 6, 2026-09-05, at LANDING-2 `d11cd56e`). After every
+  `--no-ff` landing, prove two facts with commands, in this order: (1) two parents —
+  `git log --pretty=%p -1 <merge>` prints the trunk tip AND the arc tip (a `checkout -b` during a
+  conflicted merge once dropped `MERGE_HEAD` and left trunk on a single-parent commit; the next
+  sync re-conflicted 386 commits); (2) `git diff <arc-tip> <merge> | wc -l` = 0 is SAFE **if and
+  only if** `git log --no-merges --oneline <merge-base>..<trunk-tip>` is EMPTY — trunk contributed no
+  original work since the base. Without (2)'s second command, a zero diff against a non-ancestor
+  parent is indistinguishable from wholesale loss of trunk-only content. Quote both in the landing
+  report.
 
 Operational trap details (serial-log handling, media clobbers, fixture
 state, TCC, port collisions) live in the session-memory hazards ledger.
+
+## Ledgers — one per arch, one over-arching (Peter, 2026-09-05) — gated by GATE-LEDGER (`unaos/scripts/ledger-check.sh`, rmbp e693056a; go-red by tree mutation, nine states)
+
+- **Audits and inventories are high value. Re-derivation is the waste.** Every finding lands on
+  exactly one list the turn it is found: the arch ledger (`docs/dev/OS/<track>-ledger.md`) when it
+  lives in that arch's lane, `docs/dev/LEDGER.md` when it lives in a shared file, affects more than
+  one board, or is a gate/process rule.
+- **The arc that fixes, flies, or drops an item ticks it in the same commit** (SECURITY.md's rule).
+- **Every audit or inventory is briefed with the ledger** and reports only what is NEW or CHANGED.
+  An audit that re-finds known items was mis-briefed.
+- A seat that finds something in another lane records it on `LEDGER.md` with the owner AND messages
+  that seat the same turn (see COORDINATION).
+

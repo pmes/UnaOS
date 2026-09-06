@@ -1702,6 +1702,63 @@
     Scope, as WC-C already conceded: the boot's real programs do not overlap, so a ring of two or more
     exists today only under the `el0-wcb` fixture — this completes the mechanism, not yet an operator
     workflow.
+  - **TABKEY (2026-08-31, jetson track): the Orin had the in-ring door and no shell door, and the ring
+    itself could park focus on a row with no ring.** Two independent defects, one arc.
+    - *The missing door.* Both `wc_shell_focus_key` call sites live in `main.rs::pump_usb_into_gui`,
+      which is `cfg(all(aarch64, baremetal))`; `baremetal` implies `pi`, and `pi` + `tegra` is a hard
+      `compile_error!`, so on a Jetson image that function does not exist. The Orin's only HID drain is
+      `main.rs::jd2_console_pump`, whose `Event::Key` arm fed `handle_key` directly — and `handle_key`
+      has no byte-9 arm, so `<TAB>` was silently dropped. The in-ring door was never missing:
+      `user_input_enqueue` asks `wc_focus_key` at the router seam, and `orininput`'s
+      `xusb_tegra::oi_pump` drives that seam. MEASURED (`~/unaos-bench/capture/line-acm0/`): `orin.log`
+      has 5× `:: tegra: JD2 — KEY 0x09 ::` at :13071–13080 and **zero** `[wc-c] focus tab-cycle`;
+      `pi.log`, same tool and directory, has 249. The fix is one `tegra_el0`-gated
+      `wc_shell_focus_key(ev)` folded onto an existing statement in the pump's key arm (line-neutral —
+      the knob-off tegra media stays byte-identical), placed *after* the `KEY` serial echo so a capture
+      reads `KEY 0x09` → `[wc-c] focus tab-cycle` as an adjacent pair and the fix is scoreable from the
+      wire.
+    - *The dead-sink rotation.* `wm::focus_ring` filters `used && !compat && owner_asid != 0` and does
+      **not** skip the kernel band, despite `engine.md` having claimed it did (corrected there).
+      SINKVALID (`86640a5a`) closed the CLICK door onto that state and declined the TAB door with
+      reasons, because *deflecting* a chosen dead sink to the shell welds the rotation — `cur` becomes
+      0, 0 is in no ring slot, the next press re-chooses `ring[0]` and re-deflects, forever. TABKEY
+      *filters* instead, which has no fixed point: `wc_focus_key` now rotates over a new
+      `focus_ring_apps` in `arch/aarch64/syscall.rs` — the twin of x86's helper of the same name, but
+      predicated on `key_sink_drains` rather than `is_kernel_owner`, since the band is a strict subset
+      of "has no ring". Unconditional, so every leg compiling that file carries it. Measured need, on
+      the Pi: 102 of its 249 tab-cycles (41%) named a kernel-band destination.
+    - *What this costs, stated:* `<TAB>` no longer raises kernel furniture on either board. Those rows
+      were never a usable keyboard destination (landing there killed the keyboard, and with `orininput`
+      armed it *destroyed* keystrokes); they stay reachable by click, via `wc_click_route`'s furniture
+      arm and SINKVALID's self-heal. Making them a *visual* rotation stop again needs a raise-cursor
+      distinct from `USER_INPUT_ACTIVE` — an arc on the focus primitive, not a keybinding fix.
+    - *Still open (out of arc):* `jd2_console_pump` feeds `handle_key` regardless of focus, so once TAB
+      hands focus to a live EL0 slot the Orin console still consumes the keystrokes unless `orininput`
+      is armed. That is `xusb_tegra.rs`'s defect 2, unchanged here.
+    - *GATED 2026-08-31 by TABFIXTURE (jetson track) — TABKEY shipped UNFLOWN and this is the half of
+      that debt QEMU can pay.* TABKEY's three green gates were all **no-regression** verdicts: nothing
+      in any fixture pressed TAB, and both `target/serial-arm.log` and `target/serial-pi.log` carried
+      **zero** `[wc-c] focus tab-cycle` lines against the Pi capture's 249. `tabring_selftest`
+      (`arch/aarch64/syscall.rs`, `witness`-gated, last in `wcb_launcher`'s tail) now builds a ring of
+      four rows — app owners 7 and 8 **interleaved** with `KERNEL_OWNER_CONSOLE` and
+      `KERNEL_OWNER_DESKTOP` — presses `<TAB>` `n+1` times through `wc_focus_key`, and scores where
+      `USER_INPUT_ACTIVE` went, in eight legs on one `witness=0xff` mask: the raw ring really carries
+      the band (**the positive control** — without it "the band is absent" indicts the pattern, not
+      the filter), the filtered ring is exactly the `key_sink_drains` subset in order, the walk is in
+      order, it wraps to the shell, no press ever published a non-draining focus, every press and
+      release was consumed, a focus stranded off the ring is rescued by one TAB (anti-weld), and shell
+      + empty ring leaves TAB an ordinary key. Every expectation is computed from the **live** table,
+      never a constant, and the two legs that need a table the boot may not offer print `n/a` rather
+      than a fake `true`. Two new `pi4-regression.spec` REQUIREs (**117 → 119**): the wire line
+      `[wc-c] focus tab-cycle` — which had never appeared in a QEMU capture on either arch — and the
+      `witness=0xff … noweld=true shellpass=true … :: PASS ::` verdict. The FAIL branch spells
+      `:: FAIL ::`, already a builtin FORBID in `mbench.py` and a member of `arroyo`'s
+      `FAULT_PATTERNS`, so no FORBID pair was added. **What it still does not prove:** it presses at
+      the `wc_focus_key` seam, so neither door's *call site* is flown — `wc_shell_focus_key`'s
+      `tegra_el0` caller in `jd2_console_pump` and the `user_input_enqueue` router seam still need
+      metal, and so does the whole HID decode ahead of them. The fixture is compiled only where
+      `aarch64_el0` is (`baremetal` or `tegra_el0`), so `test-arm` — the aarch64 *virt* leg — does not
+      carry `arch/aarch64/syscall.rs` at all and cannot exercise it; `kernel8-test` is the gate.
   - Gates: `./arroyo check` green both arches; `./arroyo kernel8` builds (per-blob page assertions);
     `./arroyo kernel8-test 120` MBENCH **49/49 required, 0 forbidden** (three new
     `pi4-regression.spec` directives pin the UVUG checksum, the `witness=0x1fff` ledger and the

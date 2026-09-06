@@ -1933,7 +1933,7 @@ pub fn kbd_pump_body(_arg: usize) {
     loop {
         if let Ok(mut x) = xhci::claim() {
             x.poll_events();
-        }
+        } #[cfg(feature = "orinrx")] super::serial::serialrx::drain(); // SERIALRX (ORINRX) — the headless twin of `jd2_console_pump`'s UART RX drain (serial-only boot: no scanout, so this JB2b loop IS the console pump); the `KEY` line below is then the wire witness. No sweep cadence here, so drain + the one-shot `[serialrx] lsr=` witness only. ⚠ LINE-NEUTRAL append.
         // Drain the pal queue the HID decoder feeds — the same sink the x86 GUI drains — and
         // print each keystroke as the arc's first-light evidence line. Non-key events (a mouse
         // wiggle) are consumed silently; a flood of motion deltas would drown the serial log.

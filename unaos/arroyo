@@ -906,8 +906,14 @@ _feats=""
 # Default OFF; when unset the seam vanishes, no line moves in any file compiled knob-off (the
 # display_tegra.rs half is a file-tail block; both main.rs edits are statements appended to existing
 # lines), and the jetson image is byte-identical to baseline. The ARMED build is type-checked by the
-# `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX and the `desktop_firmware` cross by `arm-tegra-desk`, not by
-# this mapping. Witness on the wire: `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`
+# `arm-tegra-orinclick` leg of KERNEL_CFG_MATRIX and the `desktop_firmware` cross by `arm-tegra-seam`
+# (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-desk` for that cross and
+# `arm-tegra-desk` carries NO `orinclick` — it never compiled the cross. `arm-tegra-seam` does, and
+# that row's own comment has said so since rung 3: "covers the opposite cross — the armed seam with
+# the router's `desktop_firmware` arms compiled in". `arm-tegra-conwin`, `-conwin-tenant`,
+# `-conwin-tenant-input`, `-ladder` and `-furn` carry both terms too), not by
+# this mapping. The `supstate` cross is `arm-tegra-supstate-el0-click`. Witness on the wire:
+# `[orinclick] arm`, `[orinclick] edge=`, `[orinclick] census`
 # (the census prints every ~10 s from the pump's own loop, so `btn=0 -> IDLE-NO-CLICKS` means "alive,
 # nobody clicked" and a census that STOPS means the pump died — an absent `[clickroute]` is otherwise
 # not evidence of anything).
@@ -1254,6 +1260,35 @@ _feats=""
 # Witness on the wire: `[orinfurn] arm`, `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`,
 # `[orinfurn] crystal LIVE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
 [ -n "${UNAOS_ORINFURN:-}" ] && _feats="${_feats}orinfurn,desktop_firmware,orinclick,tegra_el0,tegra,"
+# ORINRENDER: UNAOS_ORINRENDER=1 gives the Orin a RENDER PASS — `main.rs::tegra_render_arm` on the
+# tegra terminus line, which arms `desktop_firmware`'s latch (false for the whole Orin boot until
+# now: its only setter is inside `u7_launcher`, spawned from a `kernel_main` body tegra never
+# reaches) and spawns `orin-render`, a cooperative cpu-0-pinned task that mints the shell window,
+# services `pulsewin`, ticks the status strip and presents at most once per pass when dirty.
+# DEFAULT OFF. §5.2 UNCROSSED — `desktop_firmware::activate()` is NOT called, so the cascade that
+# overflowed twice on Pi metal is not driven. It does NOT drain events: `jd2_console_pump` owns
+# `pal::EVENT_QUEUE`, and a second drainer would steal the shell's keystrokes.
+# The terms are appended here as well as implied by Cargo so the banner shows what it actually built.
+[ -n "${UNAOS_ORINRENDER:-}" ] && _feats="${_feats}orinrender,desktop_firmware,tegra_el0,tegra,"
+# SERIALRX (ORINRX): UNAOS_ORINRX=1 lets the Orin's serial console RECEIVE — `serial::serialrx::drain`
+# appended to the xHCI poll block of the four tegra console pumps (`jd2_console_pump` x2,
+# `jd2_supstate_phase2`, `kbd_pump_body`) polls UARTC and pushes each byte as `Event::Key`, so a line
+# injected at the bench (`printf 'tste\r' > …/inject.fifo`) echoes as `:: tegra: JD2 — KEY` and runs.
+# DEFAULT OFF: `BASE` is unverified on the board and a wrong BASE means phantom bytes into the shell.
+# Witness on the wire: `[serialrx] lsr=… -> RX-LIVE|RX-ZERO|RX-OPENBUS|RX-DEAD` (once), `[serialrx] rx=`
+# (~1 s). The ARMED polarity is type-checked by the `arm-tegra-orinrx` leg of KERNEL_CFG_MATRIX,
+# never by this mapping. `tegra` appended so the knob is self-sufficient (`orinrx = []` in Cargo).
+[ -n "${UNAOS_ORINRX:-}" ] && _feats="${_feats}orinrx,tegra,"
+# DESKCASCADE: UNAOS_DESKCASCADE=1 gives the Orin the NORMAL desktop, ONE knob, DEFAULT OFF —
+# `main.rs::tegra_desk_cascade` on the tegra terminus line (after the `orinfurn` seam, before
+# `tegra_render_arm`) calls `desktop_firmware::activate()`, the cascade §5.2 held, bracketed by the
+# witness-gated `[u7stk] at=boot-core:pre-cascade` / `post-cascade` boot-stack probes — the number
+# §5.2 has asked for since 2026-08-22. It also flips `TEGRADESK_CASCADE_OK` (a `cfg!` read) so the
+# `tegradesk` seam stops refusing on this image only. Fly with UNAOS_ORINRENDER=1 so the pass presents
+# what it builds; do NOT combine with UNAOS_ORINCONWIN/ORINDESK (the cascade REFUSES a non-empty table).
+# Witness: `[deskcascade] arming cascade`, `[deskcascade] -> CASCADED` / `REFUSE`. Emits real aarch64
+# code, so `arm_features` does not strip it. Type-checked by `arm-tegra-render`.
+[ -n "${UNAOS_DESKCASCADE:-}" ] && _feats="${_feats}deskcascade,desktop_firmware,tegra_el0,tegra,"
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,desktop_firmware,tegra_el0,tegra,"
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
 # ORDINARY Orin boot. This is the one item of the 2026-08-26 `video/` parity survey that an operator
@@ -1283,7 +1318,11 @@ _feats=""
 # Default OFF => the tail wrapper, its two statics and its call site vanish; the call site is a
 # same-line append to `fbcon::init`'s existing `});`, so no line moves in a file compiled into the
 # knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof. The ARMED polarity is
-# type-checked by the `arm-tegra-orinface` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# type-checked by the `arm-tegra-fbconpar` and `arm-tegra-fbconpar-cross` legs of KERNEL_CFG_MATRIX,
+# never by this mapping (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-orinface`, a leg
+# that HAS NEVER EXISTED — no row of the matrix carries that label. The coverage itself was real, on
+# the two rows now named; an auditor grepping for the label found nothing and would have recorded a
+# hole that is not there).
 # UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
 # `[orinface] MISMATCH`.
 [ -n "${UNAOS_ORINFACE:-}" ] && _feats="${_feats}orinface,"
@@ -1314,7 +1353,9 @@ _feats=""
 # Default OFF => `_print`'s aarch64 arm folds back to the bare `print_masked(args)` it has always
 # been, the five counters and the census vanish, and the jetson AND pi images are byte-identical to
 # baseline. Every wire-in is a same-line fold, so no panic `Location` moves. The ARMED polarity is
-# type-checked by the `arm-tegra-orindefer` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# type-checked by the `arm-tegra-fbconpar` and `arm-tegra-fbconpar-cross` legs of KERNEL_CFG_MATRIX,
+# never by this mapping (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-orindefer`, a
+# leg that HAS NEVER EXISTED — the `arm-tegra-orinface` error one block above, repeated).
 # UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
 # `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`.
 [ -n "${UNAOS_ORINDEFER:-}" ] && _feats="${_feats}orindefer,"
@@ -2489,7 +2530,10 @@ check_user_arch() {
 # without a leg here is a one-line diff to spot. MEASURED on the SDHC-4b tree (2026-08-07), and the
 # claim was stale: the table holds 86 knobs and the three legs' union holds 85 — the one uncovered
 # knob is `nvidia-kepler-kdisp-hold`, the same long-standing gap the GATE-CFG-MIX note below already
-# names and the derived `x86-strict` sweep already closes. Counted, never incremented (re-counted on
+# names and the derived mix legs already close (⚠ CORRECTED 2026-08-28, orin 10: this said "the
+# derived `x86-strict` sweep", and no leg or leg family has ever borne that label — `build_cfg_legs`
+# emits `x86-mix-N`, plus `x86-only-<f>`/`x86-drop-<f>` under UNAOS_CFG_SWEEP=1 only. The RE-COUNTED
+# block below has the accurate account: mix legs 1, 2 and 3 carry both knobs). Counted, never incremented (re-counted on
 # the BCMA-S1 tree, 2026-08-07; and AGAIN on the BT-L0 tree, GR21, where the table holds 87 and the
 # union 86, with `nvidia-kepler-kdisp-hold` still the sole gap): compare the `[features]` table
 # (minus `default`) against the union of the three leg feature lists below. `sdhcblk` (SDHC-4b),
@@ -2499,14 +2543,22 @@ check_user_arch() {
 # say so — and this one MUST be visibly checked, because a `btdir` build whose code failed to
 # compile is indistinguishable at the bench from a radio that heard nothing.
 #
-# ⚠ RE-COUNTED 2026-08-27 (rmbp arc 7, on the post-merge tree 948f7859). SUPERSEDES the 2026-08-19
-# (GR26) count of "100 knobs / union 92 / EIGHT unnamed", which had gone stale by a wide margin. The
-# LIVE measurement:
+# ⚠ RE-COUNTED 2026-08-28 (orin arc 10, ORIN10-LEGHOLES, on hw-jetson at 63b86488). SUPERSEDES the
+# 2026-08-27 (rmbp arc 7) count of "147 knobs / union 137 over 27 rows / mix universe 74", which had
+# gone stale AGAIN — three of its four numbers had moved before this arc touched the matrix. The
+# LIVE measurement, reproduced with the commands below and not derived from the previous one:
 #
-#     table    147 knobs (`[features]` minus `default`)
-#     board legs' union   137, over the 27 rows of KERNEL_CFG_MATRIX
+#     table    150 knobs (`[features]` minus `default`)
+#     board legs' union   140, over the 31 rows of KERNEL_CFG_MATRIX
 #     named by no board leg   TEN
-#     derived x86 mix legs    9, over an `x86_cfg_universe` of 74
+#     derived x86 mix legs    9, over an `x86_cfg_universe` of 76
+#
+# The two rows ORIN10-LEGHOLES appended (`arm-tegra-conwin-tenant-input`, `arm-tegra-supstate-el0`)
+# and the one ORIN10-LEGHOLE4 appended (`arm-tegra-supstate-el0-click`, row count 30 -> 31, the only
+# figure above it moved) all moved the ROW count only: each names knobs that arm-* rows already
+# named, so the arm-only set, the union, `x86_cfg_universe` and the mix-leg count are untouched by
+# them. Re-measured 2026-08-28 after the LEGHOLE4 row landed: 150 / 140 / TEN, unchanged. The other
+# deltas from the 2026-08-27 figures were already in the tree.
 #
 # Reproduce it, do not increment it — that is how this note went stale twice:
 #   knobs   awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+ *=/{print $1}' \
@@ -2523,7 +2575,16 @@ check_user_arch() {
 # eight legs after it); `wcdvalve` is now on `x86-all`. The ten that remain do NOT all mean the same
 # thing, and the count alone hides the distinction — so each one is classified:
 #
-#   NOT HOLES — genuinely compiled, just not board-named (5). `x86_cfg_universe` inherits every
+#   ⚠ RECLASSIFIED 2026-08-28 (orin 10, ORIN10-LEGHOLE4). The counts above were live; the
+#   CLASSIFICATION of the ten was not, and it was wrong in a way that inverts an audit. It listed
+#   `orinvpar` as a REAL HOLE "named by no arm-* leg either" — but `orinvpar` is named by TWO rows,
+#   `arm-tegra-fbconpar-cross` and `arm-desk-noel0`, and that second row's own comment (added the
+#   SAME DAY, further down this file) says so in as many words: "SECOND HOME FOR `orinvpar`". So the
+#   list enumerated a hole that does not exist, and — because it still said TEN — silently omitted the
+#   knob that actually occupies that slot, `aarch64_el0`, which no leg names literally. Re-derived
+#   with the three commands above: the ten unnamed are `aarch64_el0`, `nvidia-kepler-kdisp-hold`,
+#   `rtpi`, `rtwit`, `selfhost`, `v3d_hubcm`, `v3d_pmcycle`, `v3d_ptbbracket`, `vugdemo`, `vugras`.
+#   NOT HOLES — genuinely compiled, just not board-named (6). `x86_cfg_universe` inherits every
 #   unnamed feature as "unclaimed => assume x86", so these ride the 9 derived mix legs, and their
 #   `#[cfg]` sites are ones an x86 compile actually reaches:
 #     * `nvidia-kepler-kdisp-hold` — three sites in `drivers/gpu/kepler_display.rs`, which is
@@ -2541,16 +2602,31 @@ check_user_arch() {
 #       EXPRESSION (`pub const ARMED: bool = cfg!(feature = "vugras");` — vugras.rs:55). A `cfg!`
 #       type-checks both polarities on every leg, so this knob is covered by construction and cannot
 #       be a hole while that stays true. Re-check if an item gate is ever added.
+#     * `aarch64_el0` — COVERED BY IMPLICATION, a sixth category the previous classification had no
+#       slot for and therefore dropped the knob entirely. It is never named in a leg's feature
+#       string, so the union computed above (which reads the LITERAL third field) does not see it —
+#       but `tegra_el0 = ["tegra", "aarch64_el0"]`, and ELEVEN arm-tegra-* rows carry `tegra_el0`, so
+#       Cargo resolves this knob ON for every one of them and its `arch/aarch64/mod.rs` module gates
+#       are compiled in both polarities. Not a hole; do NOT "fix" it by appending it to a row. The
+#       lesson for the next auditor: the union is a literal-string measurement and undercounts by
+#       exactly the implied features, so a knob missing from it is a QUESTION, not a verdict.
 #
 #   REAL HOLES — swept onto the x86 mix legs by the "assume x86" rule, where every site is behind an
 #   aarch64 qualifier and compiles GREEN and VACUOUS; named by no arm-* leg either, so the armed
-#   polarity is type-checked by NOTHING (5):
-#     * `orinvpar` — every site is `all(target_arch = "aarch64", feature = "witness", feature =
-#       "orinvpar")` in `video/menubar.rs`, or `all(feature = "orinvpar", target_arch = "aarch64")` in
-#       `video/screen.rs`. The arm-tegra-* legs already carry `witness`, so ONE leg naming this knob
-#       closes it. Jetson lane. Note it implies `desktop_firmware` in Cargo.toml, so arming it on an
-#       x86 mix leg drags an arm-named knob onto x86 today — harmless (it type-checks) but worth
-#       knowing before anyone reads the mix legs' feature strings.
+#   polarity is type-checked by NOTHING (3):
+#     (`vugdemo` WAS the worst of them, because the gate was a MODULE declaration — `pub mod vug;` in
+#       lib.rs — and it is GONE. pi's DECRUD-2 (`24937b32`) deleted `src/vug.rs` (1,471 lines) with
+#       the feature, the two shell verb arms, this knob entry and the coverage allowlist row, on
+#       Peter's ruling. VERIFIED AT THIS FOLD: no `src/vug.rs`; `vugdemo` absent from Cargo.toml;
+#       no `pub mod vug;`. The one surviving mention is the DECRUD-1 history note at `lib.rs:152`,
+#       which is prose. Kept as a marker so the next reader does not re-derive the hole from the
+#       stale text in an older revision of this file.)
+#     (`orinvpar` WAS listed here and is not a hole — see the RECLASSIFIED note above. Its sites are
+#       `all(target_arch = "aarch64", feature = "witness", feature = "orinvpar")` in
+#       `video/menubar.rs` and `all(feature = "orinvpar", target_arch = "aarch64")` in
+#       `video/screen.rs`, and `arm-tegra-fbconpar-cross` + `arm-desk-noel0` both carry `witness` and
+#       name the knob, so the armed polarity is compiled twice over. VERIFIED AT THIS FOLD: both legs
+#       present. Nothing is owed the jetson lane here; kept as a marker for the same reason.)
 #     * `v3d_hubcm`, `v3d_pmcycle`, `v3d_ptbbracket` — all sites in `arch/aarch64/v3d.rs`, which is
 #       `all(feature = "baremetal", feature = "v3d")`. `arm-pi` carries both, so the DISARMED
 #       polarity of all three is checked; the ARMED polarity is not. Pi lane.
@@ -3010,6 +3086,35 @@ KERNEL_CFG_MATRIX=(
   # `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see
   # check_both) supplies it.
   "arm-tegra-conwin ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick"
+  # ORINRENDER — rung 5's owed core (orin-desktop.md §3.6): the Orin's render pass. `orinrender` is a
+  # NEW `[features]` entry, so no existing row names it and Cargo cannot close the gap either —
+  # nothing in `[features]` implies it. Without this leg the feature is unclaimed, `x86_cfg_universe`
+  # inherits it as x86, and the derived mix legs try to compile a tegra-only rung on x86_64.
+  #
+  # HOSTED ON `arm-tegra-conwin`'s LIST + `orinrender`, chosen so the resolved set grows by EXACTLY
+  # {orinrender}: `orinrender = ["desktop_firmware", "tegra_el0"]` and this row already carries both,
+  # so a red here is attributable to the new rung and to nothing else. `arm-tegra-furn` was the other
+  # candidate and is rejected for that reason — it would have added `orinfurn` to the delta.
+  # DESKCASCADE (2026-09-05) rides this row too: `deskcascade = ["desktop_firmware", "tegra_el0"]`
+  # is self-sufficient in the same way, so the delta grows to {orinrender, deskcascade} and nothing
+  # else; this is the ONLY leg that compiles `tegra_desk_cascade` and the boot-stack probes.
+  #
+  # PRECONDITION: this row carries `tegra_el0`, which compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin` — supplied by `ensure_user_blob` ahead of the matrix.
+  #
+  # UNIVERSE SIDE EFFECT: `orinrender` becomes arm-claimed, so it leaves `x86_cfg_universe` and the
+  # derived `x86-mix-*` count is unchanged. Board legs 34 -> 35; gate legs 43 -> 44.
+  #
+  # PRTSCR-ORIN (2026-09-05): `holocron` is APPENDED at the end. `main.rs::jd2_console_pump`'s sweep
+  # carries the Orin's one `prtscr::service()` call behind `cfg(feature = "holocron")` — the arming knob
+  # for "this boot may WRITE its boot medium" (`UNAOS_HOLOCRON=1 ./arroyo esp-jetson`; the knob is not
+  # stripped by `arm_features`). Until now NO aarch64 leg carried `holocron` together with `tegra`
+  # (`arm-pi` carries it, but `pi`/`tegra` are mutually exclusive), so that call site was a cfg no leg
+  # compiled — the KNOBLEG hole. Hosted here rather than on a new row because this row is already the
+  # widest tegra desk cross, so the armed key path is type-checked against every desk knob it flies
+  # with. Universe side effect: NONE — `holocron` is named on `x86-all`, so it was never "aarch64-only"
+  # and `x86_cfg_universe` is unchanged.
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
@@ -3035,6 +3140,27 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-orinwdt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,orinwdt"
+  # SERIALRX (ORINRX) armed (appended 2026-09-05, orin 13) — `orinrx` gates the UART RX drain
+  # appended to the xHCI poll block of the four tegra console pumps, the LSR capture fold in
+  # `tegra::read_byte`, and the `serialrx` tail module in `arch/aarch64/serial.rs`. Every site is
+  # inside `feature = "tegra"` items, so ONLY a leg carrying `tegra` compiles them at all — and no
+  # leg carries `tegra` plus this knob but this one. Without it the ARMED polarity would be compiled
+  # by NOTHING (the orinwdt / bsptick shape; the standing law is that a knob's gates must compile the
+  # configuration the knob turns ON).
+  #
+  # WHY ITS OWN TAIL LEG rather than `,orinrx` appended to `arm-tegra`: `arm-tegra` is the DISARMED
+  # twin and the only leg anywhere that compiles the SHIPPED default jetson image — the image whose
+  # byte-identity to baseline this arc measures. HOSTED ON `arm-tegra-supstate`'s LIST + `orinrx`
+  # rather than `arm-tegra`'s, deliberately: one of the four drain sites lives in
+  # `jd2_supstate_phase2`, which only `supstate` compiles, so hosting on the bare `arm-tegra` list
+  # would leave that site type-checked by no leg. The resolved set grows by EXACTLY {orinrx} over a
+  # leg that is already green, so a red here names the knob and nothing else.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `orinrx` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  "arm-tegra-orinrx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx"
   # ORIN-BSPTICK armed (appended 2026-08-25, Candidate B arc 1) — `bsptick` gates the periodic-EL1-tick
   # block at `arch/aarch64/timer.rs`'s tail (`el1_bsptick_start`, `bsptick_witness`, the two statics),
   # the statement appended to `on_tick`'s closing line, and the statement appended to `main.rs`'s
@@ -3099,6 +3225,46 @@ KERNEL_CFG_MATRIX=(
   # `ensure_user_blob` (see check_both) supplies it.
   "arm-tegra-tenant ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orintenant,orininput"
 
+  # ORIN10-LEGHOLES (appended 2026-08-28) — TWO crosses that NO leg compiled, closed by ONE leg:
+  # `orininput` x `desktop_firmware` and `orininput` x `orinclick`.
+  #
+  # THE HOLE, enumerated not assumed. `arm-tegra-tenant` above was the ONLY row in this matrix naming
+  # `orininput`, and NOTHING implies it — `orininput = ["tegra_el0"]` runs one way and stops, and no
+  # other `[features]` entry lists it. That row carries neither `desktop_firmware` nor `orinclick`. So:
+  #   * `oi_pump`'s drain into `user_input_enqueue` (`xusb_tegra.rs`, the tegra HID pump — the Orin has
+  #     no `baremetal`, hence no `usb_pump` task and no `route_input_to_active_el0`) had never once been
+  #     compiled with the ROUTER'S FURNITURE ARMS present: `user_input_enqueue`'s
+  #     `#[cfg(feature = "desktop_firmware")] crystal::key_escape / quarry::key_route` head, and
+  #     `wc_click_route`'s `desktop_firmware` chrome-hit and kernel-owner arms below it. That is exactly
+  #     the combination in which the pseudo-ASID hazard changes shape.
+  #   * the pump that routes to a TENANT ring and `orin_click`, the instrument that routes clicks into
+  #     `wc_click_route`, had never been compiled together — the two producers of EL0-ring traffic on
+  #     this board, never once in the same compile.
+  # And nothing sweeps this up: there are NO derived aarch64 mix legs. `build_cfg_legs` emits
+  # `x86-mix-*` rows only, over `x86_cfg_universe`, so a tegra combination is covered ONLY if a row
+  # here NAMES it. This is the `tegra_el0`/EXECGATE shape verbatim — green everywhere, compiled nowhere.
+  #
+  # HOSTED ON `arm-tegra-conwin-tenant`'s LIST VERBATIM + `orininput` — a ONE-TOKEN delta on a row
+  # already proven green, so a red on this leg names `orininput`'s cross and nothing else.
+  # `arm-tegra-conwin-tenant` stays exactly as it was: the pump-less twin.
+  #
+  # WHY ONE LEG AND NOT TWO: the two crosses share their left term, so a single row carrying
+  # `orininput` beside both right terms compiles both. That the row actually compiles BOTH was
+  # MEASURED, not argued — each cross was probed on its own:
+  #   * `#[cfg(feature = "desktop_firmware")] user_input_enqueue("...")` appended inside `oi_pump`
+  #     (itself `#[cfg(feature = "orininput")]`) -> THIS leg RED, E0308 with the note naming
+  #     `syscall.rs`'s `user_input_enqueue`; `arm-tegra-tenant` GREEN (attribute erased) and
+  #     `arm-tegra-conwin-tenant` GREEN (the whole function erased).
+  #   * `#[cfg(feature = "orinclick")] display_tegra::orin_click("...")` in the same place -> THIS leg
+  #     RED, E0308 naming `display_tegra.rs`'s `orin_click`; `arm-tegra-tenant` GREEN and
+  #     `arm-tegra-orinclick` GREEN.
+  # Both probes reverted and the revert proven by sha256 against the pre-probe file. A leg that does
+  # not go red on its own cross is decoration; these two measurements are why this row is not.
+  #
+  # UNIVERSE SIDE EFFECT: none. Every knob on this row is already named by an arm-* leg, so
+  # `x86_cfg_universe` is unchanged and the derived mix-leg count is unchanged. Board legs +1.
+  "arm-tegra-conwin-tenant-input ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orintenant,orininput"
+
   # ORIN-BSPRUN armed (appended 2026-08-25, Candidate B arc 2) — `bsprun` gates the terminus swap
   # (`main.rs`'s terminus line: `run_bsp_tegra(0)` in place of `run_capstone_boot_core(0)`), the
   # `run_bsp_tegra` + compile_error! block at `arch/aarch64/sched.rs`'s tail, and the post-EOI
@@ -3138,15 +3304,108 @@ KERNEL_CFG_MATRIX=(
   # smpmark/bsptick shape: every site needs nothing beyond `tegra`). Deliberately WITHOUT
   # `orinclick`: the census call sites inside the supstate roles carry their own `#[cfg(feature =
   # "orinclick")]`, and this leg compiling with them ERASED proves the lift does not depend on the
-  # instrument (`arm-tegra-orinclick` keeps compiling the legacy pump's armed shape; the CROSS —
-  # supstate + orinclick together — rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo check`, run
-  # at this arc's gate).
+  # instrument (`arm-tegra-orinclick` keeps compiling the legacy pump's armed shape).
+  #
+  # ⚠ CORRECTED 2026-08-28 (orin 10, ORIN10-LEGHOLE4). Until this edit the sentence above ended by
+  # claiming the CROSS — supstate + orinclick together — "rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1
+  # ./arroyo check`, run at this arc's gate". THAT CLAIM WAS FALSE AS COVERAGE and is struck. An
+  # operator-run check is a MEASUREMENT TAKEN ONCE: it bound no later edit, it re-ran never, and it
+  # sat in this file reading exactly like a leg, so an audit conducted by reading comments counted
+  # the cross as covered and was wrong. Verified 2026-08-28 by enumerating the third field of every
+  # KERNEL_CFG_MATRIX row: NO row carried both terms, literally or through Cargo (nothing implies
+  # `supstate`; `orinclick` is implied only by `orinladder`/`orinfurn`, whose rows name it anyway).
+  # The cross is now compiled by `arm-tegra-supstate-el0-click` two rows below, where every future
+  # gate re-runs it. Do not re-word a hand-run into this file as coverage again — the census above
+  # records that an invariant asserted in prose and left unenforced has now rotted four times.
   #
   # UNIVERSE SIDE EFFECT: none that moves a mix count — `supstate` is a NEW `[features]` entry named
   # only on an arm-* leg, so `x86_cfg_universe` drops it (every site is inside
   # `all(feature = "tegra", target_arch = "aarch64")` items) and the derived mix-leg count is
   # unchanged. Board legs +1; gate +1. `./arroyo check` prints the live counts — read them there.
   "arm-tegra-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate"
+
+  # ORIN10-LEGHOLES (appended 2026-08-28) — the `supstate` x `tegra_el0` cross, compiled by NO leg.
+  #
+  # THE HOLE. `supstate = ["tegra"]` — the implication runs ONE way and stops at `tegra`, so the row
+  # above arms the state lift with the EL0 layer entirely absent: `arch/aarch64/mod.rs` gates
+  # `pub mod syscall;` on `aarch64_el0`, which only `tegra_el0` turns on. On `arm-tegra-supstate` the
+  # supstate key route therefore compiles with the WHOLE EL0 chain cfg-erased — no
+  # `user_input_enqueue`, no `user_input_set_active`, no `run_user_image`, no `bg`. And
+  # `jd2_supstate_dispatcher`'s `handle_key` is this tree's SECOND key route: the shipped one had
+  # never been type-checked with the tenant machinery present. No derived aarch64 mix leg sweeps it up
+  # (`build_cfg_legs` emits `x86-mix-*` only), so the cross was covered by nothing.
+  #
+  # The row above's own comment says the cross "rides `UNAOS_SUPSTATE=1 UNAOS_ORINCLICK=1 ./arroyo
+  # check`, run at this arc's gate". An operator-run check is a MEASUREMENT TAKEN ONCE, not coverage:
+  # it binds no later edit, and the standing law is that a cfg-widen's gates must compile the
+  # configuration the widen turns on — in the matrix, where every future gate re-runs it.
+  #
+  # HOSTED ON `arm-tegra-el0`'s LIST VERBATIM + `supstate` (the same set as `arm-tegra-supstate` +
+  # `tegra_el0`). `arm-tegra-supstate` stays as the EL0-less twin — it is the only row compiling the
+  # lift with the EL0 layer absent, which is a shape the Orin can still be built in.
+  #
+  # NON-VACUITY, MEASURED not argued (2026-08-28): a
+  # `#[cfg(feature = "tegra_el0")] user_input_set_active("...")` appended inside
+  # `jd2_supstate_dispatcher` (itself `#[cfg(all(feature = "tegra", target_arch = "aarch64",
+  # feature = "supstate"))]`) reds THIS leg — E0308, with the note naming `syscall.rs`'s
+  # `user_input_set_active` — and leaves BOTH neighbours GREEN: `arm-tegra-supstate` (no `tegra_el0`,
+  # attribute erased) and `arm-tegra-el0` (no `supstate`, the whole function erased). Probe reverted,
+  # revert proven by sha256. Only this combination sees it, which is what "not vacuous" has to mean.
+  #
+  # UNIVERSE SIDE EFFECT: none. Both knobs are already named by arm-* legs, so `x86_cfg_universe` and
+  # the derived mix-leg count are unchanged. Board legs +1.
+  "arm-tegra-supstate-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate"
+
+  # ORIN10-LEGHOLE4 (appended 2026-08-28) — the `supstate` x `orinclick` cross, compiled by NO leg.
+  # The FOURTH hole of the class ORIN10-LEGHOLES closed three of, and the one it flagged and left.
+  #
+  # THE HOLE, ENUMERATED not assumed. Split the third field of all 30 KERNEL_CFG_MATRIX rows on
+  # commas: `supstate` appears on exactly two (`arm-tegra-supstate`, `arm-tegra-supstate-el0`) and
+  # `orinclick` on eight, and the two sets are DISJOINT. Cargo cannot close the gap either — nothing
+  # in `[features]` implies `supstate`, and `orinclick` is implied only by `orinladder` and
+  # `orinfurn`, whose rows already name it literally. `build_cfg_legs` emits `x86-mix-*` only, so no
+  # derived leg sweeps an aarch64 combination up. The cross was compiled by nothing.
+  #
+  # WHAT IS UNCOMPILED WHEN IT IS UNCOMPILED. `jd2_supstate_phase2` (main.rs, itself
+  # `#[cfg(all(feature = "tegra", target_arch = "aarch64", feature = "supstate"))]`) carries a
+  # `#[cfg(feature = "orinclick")] orin_click_census(sweep_tick)` in its ~10 s sweep — the state
+  # lift's OWN copy of the census call, distinct from the legacy pump's. `arm-tegra-supstate*`
+  # compiles that statement cfg-ERASED; `arm-tegra-orinclick` compiles the legacy pump's copy and
+  # erases the whole enclosing function. Neither row type-checks the lift's copy, which is the one a
+  # `supstate` bench image would actually run.
+  #
+  # THE CLAIM THIS REPLACES was `arm-tegra-supstate`'s own comment — see the struck sentence there.
+  # A knob combination checked ONCE by hand at some past arc's gate is a MEASUREMENT, not COVERAGE.
+  #
+  # HOSTED ON `arm-tegra-supstate-el0`'s LIST VERBATIM + `orinclick` — a ONE-TOKEN delta on a row
+  # already proven green, so a red on this leg names the cross and nothing else. The delta is one
+  # feature AFTER Cargo resolution too: `orinclick = ["tegra_el0"]` -> `tegra` + `aarch64_el0`, and
+  # the host already carries all three, so the resolved set grows by exactly {orinclick}.
+  #
+  # WHY THAT BASE AND NOT `arm-tegra-supstate`. That is the row a reader would reach for, because it
+  # is where the false sentence lived — and it is the WRONG base. `arm-tegra-supstate` carries no
+  # `tegra_el0`, so appending `orinclick` there widens the resolved set by THREE features
+  # (`orinclick` + `tegra_el0` + `aarch64_el0`) and a red could not distinguish "the instrument does
+  # not compile inside the lift" from "the EL0 chain does not compile inside the lift" — exactly the
+  # distinction `arm-tegra-supstate-el0` was added one commit ago to make. Hosting on
+  # `arm-tegra-orinclick` + `supstate` would produce the IDENTICAL feature set and is equally
+  # minimal; the two differ only in framing, and this one is chosen because the row under audit is
+  # the supstate family and the added token is the instrument whose absence the struck claim was
+  # about. Both neighbours are kept: `arm-tegra-supstate-el0` (subject, no instrument) and
+  # `arm-tegra-orinclick` (instrument, no subject) are the two one-term rows the proof below needs.
+  #
+  # NON-VACUITY, MEASURED not argued (2026-08-28), two-sided: a
+  # `#[cfg(feature = "orinclick")] orin_click_census("ORIN10-LEGHOLE4-PROBE")` appended inside
+  # `jd2_supstate_phase2` reds THIS leg — E0308, `expected `u64`, found `&str``, the note naming
+  # `display_tegra.rs`'s `orin_click_census` — and leaves BOTH neighbours at EXIT 0:
+  # `arm-tegra-supstate-el0` (no `orinclick`, the statement cfg-erased) and `arm-tegra-orinclick`
+  # (no `supstate`, the enclosing function cfg-erased). Probe reverted, revert proven by sha256.
+  # Only this combination sees it, which is what "not vacuous" has to mean.
+  #
+  # UNIVERSE SIDE EFFECT: none. All three knobs are already named by arm-* legs, so the table (150),
+  # the board union (140), the ten unnamed knobs, `x86_cfg_universe` and the derived mix-leg count
+  # are every one of them unchanged. Board legs +1 (30 -> 31); gate +1.
+  "arm-tegra-supstate-el0-click ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,orinclick"
 
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
@@ -3270,7 +3529,41 @@ KERNEL_CFG_MATRIX=(
   # — this leg is proven non-vacuous by that measurement). `quarry` joined 2026-08-27 (rmbp 8):
   # its ringless arms landed with 98be87ad, which pre-measured this leg green with `quarry` and
   # deferred the edit here to the seat.
-  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry"
+  #
+  # SECOND HOME FOR `orinvpar` (2026-08-28, orin 10). Until this edit `orinvpar` was named by
+  # EXACTLY ONE leg — `arm-tegra-fbconpar-cross` above — so the ARMED polarity of ELEVEN
+  # `video/screen.rs` items (the four `DESKPAR_*` counters, `VPAR_ONCE`, `DESKPAR_EMIT_EVERY`,
+  # `DeskParGuard` and its two impls, and the two blocks inside `Screen::flush`) was type-checked by
+  # that row and by nothing else. Rename or drop that row and all eleven silently stop being
+  # compiled by anything. The knob→leg coverage check below does NOT catch that: it is a MEMBERSHIP
+  # test, so one leg and twenty read identically to it. This is the state ORIN-VPAR originally
+  # shipped in — `82d9bc97` put the witness behind a default-off knob that no leg named, and the
+  # armed polarity compiled nowhere for weeks before a leg was added to fix it.
+  #
+  # WHY THIS LEG AND NOT A SECOND TEGRA ONE. Every `arm-tegra-*` row shares the same ~21-feature
+  # prefix, so a second tegra host would be a near-copy of the incumbent: the redundancy would be
+  # nominal, and the single edit most likely to remove the incumbent (a rework of the tegra family)
+  # would take the copy with it. This row is the only aarch64 leg carrying `desktop_firmware`
+  # WITHOUT an EL0 layer, so it fails independently of that family. It already carries `witness` —
+  # which all eleven sites require — and `desktop_firmware`, which is the entirety of what the knob
+  # implies (`orinvpar = ["desktop_firmware"]`), so this addition drags in NO new feature.
+  #
+  # AND IT IS THE RIGHT HOME ON THE MERITS. The note above records that this leg exists because
+  # `dock.rs` shipped an E0433 reachable from the DOCUMENTED combo `UNAOS_WITNESS=1
+  # UNAOS_ORINVPAR=1` — it was cut FOR that knob combo and then never armed the knob. Arming it
+  # here also type-checks the claim both knob docs make and no leg tested: that this is an AARCH64
+  # gap and not a Tegra one, so a ringless `desktop_firmware` build answers the same question.
+  #
+  # NON-VACUITY, MEASURED — not inferred from a green run. (EXECGATE is the precedent: twelve green
+  # legs on both arches proved nothing, because no leg carried the feature.) With `DESKPAR_EPOCH`'s
+  # initialiser changed to `AtomicUsize::new(0)`, this leg WITHOUT `orinvpar` exits 0 and WITH it
+  # exits 101 on `error[E0308] ... video/screen.rs:427 ... expected `Atomic<u64>`, found
+  # `Atomic<usize>``. The break was then reverted and screen.rs proved byte-identical.
+  #
+  # UNIVERSE SIDE EFFECT: none. `orinvpar` was already named by an arm-* leg and by no x86 leg, so
+  # `x86_cfg_universe` already dropped it and still does. Board legs +0; gate legs +0 — this widens
+  # an existing row rather than adding one. `./arroyo check` prints the live counts every run.
+  "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry,orinvpar"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
@@ -3279,6 +3572,212 @@ KERNEL_CFG_MATRIX=(
   # `all(aarch64, pidesk)`), where `panel_console_face_arm` is reached through BOTH of its gate terms
   # at once, and where `orin_conwin`'s existing call to it coexists with `fbcon::init`'s new one — the
   # double-arm this arc claims is idempotent. `orinconwin`'s host list, plus the two knobs.
+
+  # ── SMPMARKLEG (appended 2026-08-31, orin 11) — the SMPMARK cross the seat is about to fly ──────
+  #
+  # THE HOLE, MEASURED not assumed. `smpmark` is carried by EXACTLY ONE row of this matrix,
+  # `arm-tegra-smpmark`, whose feature list is `arm-tegra`'s VERBATIM + the knob. It therefore
+  # crosses `smpmark` with NONE of the knobs either Orin flight image carries. Measured over the
+  # third field of all 31 rows, closed under Cargo's implications (`tegrasmp`->`tegra`;
+  # `tegra_el0`->`tegra`+`aarch64_el0`; `orinclick`->`tegra_el0`; `orinconwin`/`orinvpar`->
+  # `desktop_firmware`; `orinfurn`->`desktop_firmware`+`orinclick`; `supstate`->`tegra`), the set of
+  # rows carrying `smpmark` together with each of these is EMPTY — every one of the eight:
+  #     smpmark x tegra_el0  none     smpmark x desktop_firmware  none
+  #     smpmark x orindesk   none     smpmark x orinclick         none
+  #     smpmark x orinconwin none     smpmark x orinfurn          none
+  #     smpmark x orinvpar   none     smpmark x supstate          none
+  # So `UNAOS_SMPMARK=1` on either flight image produced a configuration NO leg compiled: the
+  # tegra_el0 / EXECGATE shape that shipped a board-killer on this branch, and the reason the
+  # standing law is ADD THE LEG FIRST AND PROVE IT GOES RED, never arm-then-discover.
+  #
+  # ROW 1 — BOOT A (`witness, rast, orindesk, orinclick, orinvpar, tegra_el0, tegra, tegrasmp,
+  # orinconwin, desktop_firmware, orinfurn`) with `smpmark` armed. HOSTED ON `arm-tegra-furn`'s LIST
+  # VERBATIM + `orinvpar,smpmark`, the precedent shape of `arm-tegra-conwin` / `arm-tegra-furn` /
+  # `arm-tegra-supstate-el0-click`. Two tokens, and exactly two AFTER Cargo resolution as well:
+  # `orinvpar` implies only `desktop_firmware`, which the host already carries, and `smpmark` implies
+  # nothing — the resolved set grows by precisely {`orinvpar`, `smpmark`}.
+  #
+  # WHY `arm-tegra-furn` AND NOT `arm-tegra-fbconpar-cross`, the only other row that could host
+  # BOOT A. `arm-tegra-furn`'s closure is BOOT A minus exactly ONE token (`orinvpar`);
+  # `arm-tegra-fbconpar-cross`'s is BOOT A minus `orinfurn` PLUS `orinface` and `orindefer`, two
+  # knobs BOOT A does not carry. Hosting there would widen the leg past the flown image in a
+  # direction the image does not go, and a red could not distinguish the SMPMARK cross from the
+  # fbcon-parity pair — the same base-choice argument `arm-tegra-supstate-el0-click`'s comment makes
+  # about why it is hosted on `arm-tegra-supstate-el0` rather than on `arm-tegra-supstate`.
+  #
+  # THIS ROW ALSO CLOSES A SECOND, INDEPENDENT HOLE — measured, not incidental. `orinvpar` x
+  # `orinfurn` is carried by NO row either: `arm-tegra-fbconpar-cross` has `orinvpar` without
+  # `orinfurn`, `arm-tegra-furn` has `orinfurn` without `orinvpar`, and BOOT A carries both. So
+  # BOOT A's feature closure was compiled by nothing even with `smpmark` OFF, and no row of this
+  # matrix was a superset of it. That is a stronger finding than the one this arc was sent for, and
+  # it is stated here rather than in a landing note because the row is where the next reader looks.
+  #
+  # ROW 2 — BOOT B (`witness, rast, supstate, tegra_el0, tegra, tegrasmp`) with `smpmark` armed.
+  # HOSTED ON `arm-tegra-supstate-el0`'s LIST VERBATIM + `smpmark` — a ONE-TOKEN delta, one token
+  # after resolution too, on a row already proven green, so a red on this leg names the cross and
+  # nothing else. This is the `arm-tegra-supstate-el0-click` shape exactly: the host is a row whose
+  # closure ALREADY covers BOOT B (measured: `arm-tegra-supstate-el0` and
+  # `arm-tegra-supstate-el0-click` are the two rows whose closures are supersets of BOOT B), and the
+  # single added token is the instrument whose cross was uncompiled.
+  #
+  # WHY TWO ROWS AND NOT ONE UNION ROW. Neither image's feature set contains the other's: BOOT A
+  # carries the desk stack and no `supstate`; BOOT B carries `supstate` and none of
+  # `desktop_firmware`/`orindesk`/`orinclick`/`orinconwin`/`orinvpar`/`orinfurn`. One row carrying
+  # the union would compile a THIRD configuration — `supstate` with the whole desk stack — that no
+  # flight image builds, leaving BOTH flown images compiled by nothing, which is the exact condition
+  # these rows exist to end. It would also be undiagnosable: a red on a union row cannot say WHICH
+  # boot is broken. (The union row is not built by this arc and NO claim is made here about whether
+  # it compiles.) Two rows is therefore the minimum, not a convenience: one per flown image.
+  #
+  # NON-VACUITY, MEASURED not argued, TWO-SIDED (2026-08-31). A leg that cannot go red is not
+  # coverage. Two probes were appended to the SMPMARK sites in `arch/aarch64/smp_virt.rs`, each
+  # conjoined so exactly one NEW row reaches it and no existing row does:
+  #     #[cfg(all(feature = "smpmark", feature = "orinfurn", feature = "orinvpar"))] let _pa: u32 = "SMPMARKLEG-PROBE-A";
+  #     #[cfg(all(feature = "smpmark", feature = "supstate"))]                       let _pb: u32 = "SMPMARKLEG-PROBE-B";
+  # both appended after the `:P:` mark inside `start_secondaries_tegra` (itself
+  # `#[cfg(feature = "tegrasmp")]`, which both new rows carry). Result, each leg run as its own
+  # `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  #     arm-tegra-furn-vpar-smpmark     EXIT 101   error[E0308] expected `u32`, found `&str`
+  #     arm-tegra-supstate-el0-smpmark  EXIT 101   error[E0308] expected `u32`, found `&str`
+  #     arm-tegra-smpmark               EXIT 0     smpmark, neither conjunct
+  #     arm-tegra-furn                  EXIT 0     orinfurn, no smpmark / no orinvpar
+  #     arm-tegra-fbconpar-cross        EXIT 0     orinvpar, no smpmark / no orinfurn
+  #     arm-tegra-supstate-el0          EXIT 0     supstate, no smpmark
+  #     arm-tegra-supstate-el0-click    EXIT 0     supstate, no smpmark
+  # The WHOLE-GATE run with both probes in agrees and is the stronger form of the second side:
+  # `./arroyo check` exited 1 naming EXACTLY these two legs
+  # (`❌ kernel cfg coverage FAILED ... legs: arm-tegra-furn-vpar-smpmark
+  # arm-tegra-supstate-el0-smpmark`) with all 40 other legs of the 42 green, and `error[E0308]` was
+  # the ONLY error code emitted anywhere in the run — twice, once per new leg, each pointing at its
+  # own probe line. That last fact is what licenses the verdict below: the sole compile error in
+  # either new configuration was the deliberate one, so with the probes gone both crosses build.
+  # Both probes reverted and `smp_virt.rs` proved byte-identical by sha256
+  # (206a188e49964884a8d6f0238c846f173383c614c97c9006ed3f3e94439568ac). ONLY these two combinations
+  # see the break, which is what "not vacuous" has to mean.
+  #
+  # THE VERDICT THIS ROW PAIR LICENSES: `UNAOS_SMPMARK=1` is legal on BOTH flight images. Neither
+  # cross is unbuildable — the clean gate has both rows at ✅ — so the seat may arm the knob on
+  # BOOT A and on BOOT B, and a future edit that breaks either cross now reds a leg that NAMES it.
+  #
+  # UNIVERSE SIDE EFFECT: none, and MEASURED rather than asserted — this is the figure the census
+  # block above has had to correct three times. Every knob named on these two rows (`smpmark`,
+  # `orinvpar`, `supstate`, `orinfurn` and the rest of the desk family, `tegra_el0`) is ALREADY
+  # named by an existing arm-* leg, so the set of arm-named knobs is IDENTICAL before and after
+  # (89 both ways, delta empty) and the board union is 140 both ways. `x86_cfg_universe` is
+  # therefore unchanged and so is the derived mix-leg count — the gate line reads
+  # `33 board + 9 x86 pairwise-mix`, the same 9 as before. Board legs +2 (31 -> 33); gate legs +2.
+  # `./arroyo check` prints the live board/mix counts every run — read them there, not here.
+  #
+  # WHAT THIS DOES NOT COVER, said so nobody reads the green as more than it is: this is a TYPE
+  # CHECK and nothing more. QEMU models no Tegra234, so no gate in this repo can boot either image;
+  # whether the `:A:` / `:P:` / `:R<idx>:` marks reach the wire on a parked secondary is an
+  # Orin-metal verdict and remains UNFLOWN. What these rows buy is that `UNAOS_SMPMARK=1` on either
+  # image can no longer be a configuration that compiles nowhere.
+  #
+  # PRECONDITION: like `arm-tegra-furn`, both rows compile `arch/aarch64/syscall.rs` (they carry
+  # `tegra_el0`), which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see
+  # check_both) supplies it.
+  "arm-tegra-furn-vpar-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinfurn,orinvpar,smpmark"
+  "arm-tegra-supstate-el0-smpmark ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,smpmark"
+  # EL0JD1DC — the JD1-DC probe, compiled at last in the EL0 regime it FLEW in (appended 2026-08-31).
+  #
+  # THE HOLE, re-derived in this tree at 66a2ac7f rather than inherited, with the controls that make a
+  # zero mean something (a bare "0 rows" indicts the pattern, not the matrix — the rule the census
+  # block above had to learn three times). Both sides closed under Cargo's implication graph, because
+  # a literal-string comparison undercounts by exactly the implied features:
+  #     rows carrying `jd1dc`                :  1   (`arm-tegra-jd1dc`, and nothing else)
+  #     rows carrying `tegra_el0`            : 16
+  #     rows carrying BOTH                   :  0   <- the hole
+  #     rows carrying `smpmark` + `tegra_el0`:  2   <- POSITIVE CONTROL: the same test, same closure,
+  #                                                   non-zero on the SMPMARKLEG pair two rows above
+  #     rows carrying `aarch64_el0`          : 17 closed / 0 literal  <- the closure itself is live
+  # And no row of this matrix was a superset of the flown closure: measured, `arm-tegra-furn-vpar-smpmark`
+  # is the ONLY row whose closure covers boot7e/boot7f minus `jd1dc`, and it does not carry `jd1dc`.
+  #
+  # WHY IT MATTERS. `arm-tegra-jd1dc` is hosted on `arm-tegra`, and `arm-tegra` is deliberately the
+  # EL0-DISARMED twin (see the JETSON-EL0 block above — that polarity has real code behind it and has
+  # to stay). So every leg that compiled the probe had `tegra_el0` OFF, and every leg that had
+  # `tegra_el0` ON compiled the probe out. That is the EXECGATE shape exactly, one knob over: a
+  # feature whose sites all sit under `src/arch/aarch64/` or behind a `target_arch` qualifier, swept
+  # onto no leg that arms its neighbour, so the armed pair is type-checked by nothing.
+  #
+  # AND IT FLEW THAT WAY. Four staged Orin images carry `jd1dc` AND `tegra_el0` (the latter riding in
+  # via `orinclick`, per the MANIFEST's own 2026-08-25 correction): boot7e, boot7f, boot7g, boot7h.
+  # ⚠ FLIGHT-RECORD CORRECTION: `boot7-el0smp-install-20260822T1949Z` is NOT a fifth. It carries
+  # `tegra_el0` and `smpmark` but its MANIFEST block records `jd1dc` knob-gated OFF and verified so by
+  # `strings` (0 hits for `JD1-DC VERDICT=`); its banner list has no `jd1dc` in it. It belongs to the
+  # SMPMARK cross, which the two rows above already claim, not to this one. boot7b/boot7c/boot7d carry
+  # `jd1dc` WITHOUT `tegra_el0` and are covered by `arm-tegra-jd1dc` on the pair this row is about.
+  #
+  # THE VERDICT THIS ROW LICENSES, and it is the finding this leg was written to produce: THE CROSS
+  # COMPILES. `jd1dc` + `tegra_el0` type-checks clean on aarch64 — EXIT 0, zero errors — so the four
+  # flights above were not flying an unbuildable configuration. That was not knowable before this row:
+  # EXECGATE passed twelve legs and could not compile the armed build at all.
+  #
+  # HOSTED ON `arm-tegra-el0`'s LIST VERBATIM + `jd1dc` — a ONE-TOKEN delta, one token after resolution
+  # too (`jd1dc` is STANDALONE: `jd1dc = []`), on a row already proven green, so a red here names the
+  # cross and nothing else. This is the `arm-tegra-supstate-el0-click` / `arm-tegra-conwin` /
+  # `arm-tegra-furn` shape, and it makes this leg the ARMED TWIN of `arm-tegra-jd1dc`: between the two,
+  # `jd1dc`'s items are now compiled in BOTH polarities of `tegra_el0`, which is the same twin argument
+  # `x86-vsyncpace` and `arm-tegra-el0` itself are built on.
+  #
+  # WHY ONE ROW AND NOT THE `jd1dc,smpmark` PAIR THE CENSUS RECOMMENDED. That recommendation predates
+  # the SMPMARKLEG fold two rows above, and half of it is now already paid: `smpmark` x `tegra_el0` is
+  # carried by 2 rows (measured, above), so appending `smpmark` here buys no cross that does not
+  # already exist. It is not free either — a two-token delta means a red cannot say WHICH cross broke,
+  # which is the whole reason these tail legs are one token wide. And the triple is not a distinct
+  # obligation: NO `#[cfg]` in src/ names both `jd1dc` and `smpmark` (measured: 0 sites; all 20 `jd1dc`
+  # sites are the bare `feature = "jd1dc"`), so compiling them together checks nothing that compiling
+  # them apart does not.
+  #
+  # DOES SMPMARKLEG'S UNION-REJECTION APPLY HERE? No, and the reason is worth stating because the two
+  # cases look alike. That block refused ONE row for TWO flown images because neither image's feature
+  # set contained the other's, so a union row would have compiled a third configuration no flight
+  # builds and left both flights covered by nothing. Here there is ONE cross and one flown SHAPE:
+  # boot7e ⊆ boot7f ⊆ boot7g ⊆ boot7h in the knob dimension (each adds, none drops). Nothing is being
+  # unioned across incomparable images, so the argument that forced two rows there forces one here.
+  #
+  # NON-VACUITY, MEASURED not argued, TWO-SIDED. A leg that cannot go red is not coverage. One probe
+  # was planted inside `jd1_dc_probe` (`arch/aarch64/display_tegra.rs`), conjoined so that exactly one
+  # row of this matrix reaches it and no existing row does:
+  #     #[cfg(all(feature = "jd1dc", feature = "tegra_el0"))] let _pjd: u32 = "EL0JD1DC-PROBE";
+  # Each leg run as its own `cargo +nightly check --release --target ../../aarch64-unaos.json`:
+  #     arm-tegra-el0-jd1dc (NEW)       EXIT 101   error[E0308] expected `u32`, found `&str`
+  #                                                display_tegra.rs:802:75 — the planted line
+  #     arm-tegra-jd1dc                 EXIT 0     jd1dc, no tegra_el0
+  #     arm-tegra-el0                   EXIT 0     tegra_el0, no jd1dc
+  #     arm-tegra                       EXIT 0     neither
+  #     arm-tegra-supstate-el0          EXIT 0     tegra_el0, no jd1dc
+  #     arm-tegra-furn-vpar-smpmark     EXIT 0     tegra_el0 + smpmark, no jd1dc
+  # The WHOLE-GATE run with the probe in is the stronger form of the second side: `./arroyo check`
+  # exited 1 naming EXACTLY this leg (`❌ kernel cfg coverage FAILED ... legs: arm-tegra-el0-jd1dc`)
+  # with all 42 other legs of the 43 green, and `error[E0308]` was the ONLY error code emitted anywhere
+  # in the run. That is what licenses the COMPILES verdict above: the sole compile error in the new
+  # configuration was the deliberate one. Probe reverted and `display_tegra.rs` proved byte-identical
+  # by sha256 (963c3b83cd31fe6faf1108c26875640747d9f5f60862437a61417b020b61300f, before and after).
+  #
+  # UNIVERSE SIDE EFFECT: none, and MEASURED. Both knobs this row names are ALREADY named by an arm-*
+  # leg (`tegra_el0` by 16 rows, `jd1dc` by `arm-tegra-jd1dc`), so the arm-named knob set is identical
+  # before and after — 89 both ways, delta EMPTY — the board union is 140 both ways, `x86_cfg_universe`
+  # is 76 both ways, and the derived mix-leg count is 9 both ways. Board legs +1 (33 -> 34); gate legs
+  # +1 (42 -> 43). `./arroyo check` prints the live board/mix counts every run — read them there.
+  #
+  # WHAT THIS DOES NOT COVER, said so nobody reads the green as more than it is. (1) It is a TYPE
+  # CHECK: QEMU models no Tegra234, so no gate in this repo can boot the image, and whether
+  # `JD1-DC VERDICT=` reaches the wire on an EL0-armed boot stays an Orin-metal verdict. (2) `jd1dc` is
+  # still crossed with NOTHING else the flights carried — measured at 34 rows, `jd1dc` x `orindesk`,
+  # x `orinclick`, x `orinconwin` and x `smpmark` are all still 0 rows, so boot7e..boot7h are still a
+  # superset of no row in this matrix. The one-token change that would close all four at once is
+  # `arm-tegra-furn-vpar-smpmark`'s list verbatim + `jd1dc` (its closure already covers boot7e/boot7f
+  # minus the token — measured). That row is NOT added here: it is a desk-lattice row and the desk
+  # lattice is the seat's call, not this arc's. (3) boot7g/boot7h additionally carry the media-default
+  # knobs (`ehcihid`, `kbdwit`, `smolnet`, `sdhcblk`) and `pidesk`, which no arm-tegra row names —
+  # a media-fingerprint question, deliberately untouched.
+  #
+  # PRECONDITION: like `arm-tegra-el0` itself, this row compiles `arch/aarch64/syscall.rs` (it carries
+  # `tegra_el0`), which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both)
+  # supplies it.
+  "arm-tegra-el0-jd1dc ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,jd1dc"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -3655,6 +4154,36 @@ check_both() {
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ aarch64 OK${COLOR_RESET}"
 
+    # GATE-BOOTLOADER: `check` type-checked the KERNEL crate and nothing else, so every edit to
+    # `crates/bootloader` — the UEFI loader that owns the whole pre-ExitBootServices window on both
+    # arches — went into a commit whose DONE gate could not see it. Proven by go-red, orin 12: a
+    # deliberate format-arity defect at the loader's identity-witness call site left `./arroyo check`
+    # at exit 0, while these legs return 101. The loader is not exotic code to leave unchecked: it is
+    # the only thing that runs between firmware and `kernel_entry()`, and a defect there costs a
+    # power cycle and an attended bench seat to find.
+    #
+    # Three legs. The two DEFAULT ones mirror how the loader is really built — `esp-arm` builds
+    # aarch64-unknown-uefi here, the `builder` crate builds x86_64-unknown-uefi from the same source
+    # — and they honour $BOOTLOADER_FEATURES so an operator's own UNAOS_BOOTDIAG/UNAOS_JB8_LEVER run
+    # checks what it is about to build. The third is a FEATURE leg: `bootdiag` and `jb8lever` are
+    # aarch64-only and OFF by default, so their code is compiled by no default leg on any arch and
+    # would rot unseen. It is a cross (both at once) rather than two singles because the features are
+    # independent blocks that never interact — a cross costs one leg and covers both.
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: bootloader (aarch64-unknown-uefi, x86_64-unknown-uefi, +feature leg)...${COLOR_RESET}"
+    cd "$WORKSPACE_DIR/crates/bootloader"
+    for _bl_target in aarch64-unknown-uefi x86_64-unknown-uefi; do
+        cargo +nightly check --release --target "$_bl_target" \
+          $BOOTLOADER_FEATURES \
+          -Z build-std=core,compiler_builtins,alloc \
+          -Z build-std-features=compiler-builtins-mem
+    done
+    cargo +nightly check --release --target aarch64-unknown-uefi \
+      --features bootdiag,jb8lever \
+      -Z build-std=core,compiler_builtins,alloc \
+      -Z build-std-features=compiler-builtins-mem
+    cd "$WORKSPACE_DIR"
+    echo -e "${COLOR_GREEN}✅ bootloader OK${COLOR_RESET}"
+
     # GATE-CFG: the cfg-gated coverage legs, immediately behind the two DEFAULT kernel legs so all the
     # kernel verdicts sit together in the scrollback. The default legs stay first and unchanged: they
     # are what the operator's own UNAOS_* knobs compile, and they are the fastest way to a diagnostic
@@ -3713,8 +4242,52 @@ check_both() {
         echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
         return 1
     fi
+    # GATE-KNOB: every `feature = "X"` in a cfg is declared, and every declared feature has a cfg.
+    #
+    # A cfg on an UNDECLARED feature is ALWAYS FALSE. It does not fail the build and it did not fail
+    # this gate: rustc emits `unexpected cfg condition value` and `check` threw the warning away, so
+    # the code under it was dead while READING as live, on every board, with the `not` arm taken
+    # unconditionally. pi 6 found the first instance (`pidesk`, 7 sites in `main.rs` and
+    # `video/menubar.rs` on hw-pi4 — arch-neutral files, so it reaches x86 when that lands; this
+    # tree is clean today, which is why the gate can land green and red exactly at that merge).
+    #
+    # The naive form of this — set-difference the feature names out of the sources against
+    # [features] — was proposed as "cannot false-positive". It can, and does: run it here and it
+    # reds on `pidesk` for a DOC COMMENT at `video/menubar.rs:77` that only quotes the expression in
+    # prose. The script strips comments first and carries a fixture for exactly that case, because a
+    # gate that reds on a sentence is a gate people turn off.
+    local _nrc=0
+    if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
+        echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"
+    else
+        _nrc=1
+    fi
+    # GATE-LEDGER: the issue ledgers (docs/dev/LEDGER.md, docs/dev/OS/*-ledger.md) are a TRACKER, and a
+    # tracker whose rows nothing checks is prose that rots — PCIE-RP-RECOVERY.md said "no reboot facility
+    # of any kind" for a day after FADTRESET landed. Peter's §Ledgers rule (2026-09-05: one ledger per
+    # arch, one over-arching; the arc that fixes/flies/drops an item ticks it in the same commit) is held
+    # by this block: ids unique, status begins with one of open|fixed-unflown|flown|landed|dropped, owners
+    # known, `→ S<n>` cross-refs resolve, every sha named exists (and a fixed/flown/landed row's sha is an
+    # ancestor of some track head), evidence paths live IN GIT (a `unaos-bench/scratch` path is red).
+    # Prose outside a table is never judged. Agreed rmbp 11 ↔ orin 13; go-red proven by tree mutation
+    # (see scripts/ledger-check.sh tail) before it shipped.
+    local _lrc=0
+    if "$WORKSPACE_DIR/scripts/ledger-check.sh" "$WORKSPACE_DIR/.."; then
+        echo -e "${COLOR_GREEN}  ✅ ledgers (ids, status enum, owners, cross-refs, shas, evidence in git)${COLOR_RESET}"
+    else
+        _lrc=1
+    fi
+
     if [ "$_crc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_nrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_lrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a ledger row is unverifiable (see GATE-LEDGER above)${COLOR_RESET}"
         return 1
     fi
 }

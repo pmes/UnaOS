@@ -3582,6 +3582,63 @@ banked into a neighbour. A `LOW-REDZONE TRAVERSED`, or any refusal carrying
 sends the sizes up again, and `higuard=2` is additionally the first direct
 identification of a *victim* this kernel has ever been able to make.
 
+### 2.z The `[u7stk]` gauge only reads where it is CALLED — the tegra reachability inventory and `stk_probe_bounds` (aarch64, orin 13, LEDGER S13)
+
+The poison-scan gauge of §2.x is two functions and a macro, and a board only gets a reading at a
+site that calls one of them from the task whose depth is wanted. This subsection records what the
+Orin flights of 2026-09-01..05 established about reachability (`docs/dev/evidence/orin13/FLIGHT.md`
+§A.1–A.5), and the commands that prove each point, so the finding is not re-derived.
+
+**Fact 1 — the probe is `witness`-gated and task-scoped.** `sched::stk_probe(at)` (`sched.rs:90`)
+exists only under `#[cfg(feature = "witness")]`; it reads `SCHED[cpu].current` and RETURNS with no
+output when that is null — which is the boot core for the whole tegra terminus (`main.rs:2717`
+onward), so a call placed on the terminus line prints nothing, whatever the build. Every caller must
+carry its own `witness` gate, because the symbol does not exist on a knob-off image.
+
+**Fact 2 — until orin 13 the probe had exactly one call site, and a tegra image could not reach it.**
+At `ac27b8d2` the non-comment inventory was one line:
+
+```
+$ grep -rn 'stk_probe' unaos/crates/kernel/src --include='*.rs' | grep -v ':[[:space:]]*//'
+unaos/crates/kernel/src/arch/aarch64/syscall.rs:16225:        crate::arch::sched::stk_probe($at)
+```
+
+— the body of the `u7stk!` macro, expanded sixty times inside one function, `syscall::u7_launcher`,
+which is spawned only from the `kernel_main` body below `tegra_early_stop(boot_info) -> !`
+(`main.rs:189-190`). Dead code on a jetson image regardless of `witness`, and the linker agrees: the
+`[u7stk]` format piece is absent from the flown ELF, with a positive control to show the grep can hit.
+
+```
+$ grep -a -o 'u7stk'       ~/unaos-bench/flash/orin/render1-20260901T0347Z-c61b47e/kernel.elf | wc -l   # 0
+$ grep -a -o 'RENDER-LIVE' ~/unaos-bench/flash/orin/render1-20260901T0347Z-c61b47e/kernel.elf | wc -l   # 1
+```
+
+The Pi, where `u7_launcher` runs, prints 52 `[u7stk]` lines on the same tree (PARITY.md §"THE
+INSTRUMENT"). The prior belief "no `witness` ⇒ no `[u7stk]`" was therefore true and insufficient:
+render1 was built WITH `witness` and carried no probe at all.
+
+**Fact 3 — the witness that DID fire is the ungated one.** The dispatch-time low-redzone report
+(`sched.rs:5482`, `[redzone] cpu=N LOW-REDZONE TRAVERSED task=<id>:<name> …`, capped at 16 by
+`GUARD_LO_REPORTS`) is compiled into every image (§2.y). On render1 it printed 8 lines each for
+`orin-render` and `jd2-console` and hit its cap — the 16 KiB `orin-render` stack was traversed before
+any gauge existed to size it. Where a `[u7stk]` line is missing, `[redzone]` is the reading to look
+for; its magnitude comes from `base - ctx_sp` at the refusal, never from a saturated `headroom=`.
+
+**The per-task answer.** A task's depth needs its OWN probe call, from that task, after its deepest
+call chain. Two shapes now exist in the tree (inventory at `6cc8de8c`, same command as Fact 2):
+
+| site | shape | what it reads |
+|---|---|---|
+| `syscall.rs:16250` `u7stk!` | `stk_probe` inside `u7_launcher` | the Pi's launcher, 60 checkpoints |
+| `main.rs:8340` (STACKSEED, `01739a93`) | `#[cfg(feature = "witness")] stk_probe("orin-render:pass1"/"pass2")` after the first two presents | `orin-render`, now spawned with `spawn_stack(…, 32 KiB)` (`main.rs:8199-8204`); render3b: `len=32768 used=1280 hw=13296 headroom=19472` |
+| `main.rs:8459`, `:8471` (CASCADE, `a20839c6`) | `stk_probe_bounds(at, name, base, len)` — `stk_probe`'s scan and `[u7stk]` line over bounds the CALLER supplies (`sched.rs:10626`) | a stack no `Task` describes: the boot core's firmware stack across `desktop_firmware::activate`, over a poison window the caller paints below its own SP; prints `task=0:boot-core`. render3b: `pre-cascade hw=240`, `post-cascade hw=15472 headroom=17296` of a 32 KiB window |
+
+`git show a20839c6 --stat` — `arch/aarch64/sched.rs | 46 +` is the whole of `stk_probe_bounds`
+(hunk `@@ -10613,3 +10613,49 @@`, appended at the file tail so no existing line moves). The same
+ELF grep on render3b's image now counts 3 `u7stk` tokens and 4 `boot-core` (control `RENDER-LIVE`
+= 1). Both readings saturate exactly as §2.x says: `hw=len headroom=0` is a lower bound, and the
+honest follow-up is a larger stack or a wider window on the next flight.
+
 ---
 
 ## 3. Blocking and synchronization primitives

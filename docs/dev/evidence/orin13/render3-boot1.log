@@ -1,0 +1,394 @@
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x2d2fd8 pg=723
+[ INFO]: crates/bootloader/src/main.rs@805: Allocated kernel at 0x25ab49000
+[ INFO]: crates/bootloader/src/main.rs@925: Found DTB at 0x25f501000, size: 837900 bytes
+[ INFO]: crates/bootloader/src/main.rs@961: boot volume FAT serial 0xde001a13 (extended BPB BS_VolID)
+[ INFO]: crates/bootloader/src/main.rs@1208: JB8[pre-EBS]: FPCI CFG_0=0x01200020 CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@1235: JB8[pre-EBS]: FALCON CPUCTL=0xffffffff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x0000c85f
+[ INFO]: crates/bootloader/src/main.rs@1248: JB8[pre-EBS]: xHC cap=0x01200020 USBSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUARD)
+[ INFO]: crates/bootloader/src/main.rs@1165: JB6: dummy ACPI 2.0 table installed (RSDP @0x25e069000, XSDT @0x25e069040) ? XUSB Falcon teardown w:i:l lt esgerlaf:- smkmiup l
+i�v�eM m(IEnLs2t)a l�l�P�r oRtAoMc oNloIrnmtaelr-fWaBc e+:  T2e7gArBaF 0D5e5v-iBc1eB-8n-G4nCR2E6 -m8a0p4p8e-d7 4:8:F
+3:7:B AtAe2gDrFa :0 d
+ark-window guard — 89 byte(s) dropped pre-map ::
+:: video: edid present=1 hdr=OK sum=OK native=1920x1200 pclk_khz=154120 ext=1 len=256 ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4404ff TTBR0=0x25ae0a000 RAM-GiB-mask=0x3fc ::
+:: tegra: XCARVE-6 carveout exclusion — 6 protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::
+:: tegra:   window[0] [0x26b800000,0x26c180000) 9728 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[1] [0xbe000000,0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[2] [0x26c400000,0x279e00000) 223232 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[3] [0x26c180000,0x26c400000) 2560 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[4] [0x26b5f0000,0x26b7f0000) 2048 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[5] [0x279e00000,0x27a760000) 9600 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac3f000) ::
+:: tegra: JM7 — GOP fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4 ::
+:: tegra: JD1 — simple-fb /chosen/framebuffer: 1920x1200 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 — resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x960000] ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: fb L2 repair — 5 block(s) re-mapped in GiB 9 [0x279e00000,0x27a760000) ::
+[panel-owner] panel-ownership-handover from=owner-unknown to=owner-fbcon-panel site=fbcon::init
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d — MIDR=0x410fd421 (r0p1) — reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d — CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a — DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a — /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a — ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 — PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 — handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 — minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 — witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 — BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 — BAR2[0x004] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x008] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 — CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB11 [raw-handoff] — Falcon fw-header census: BAR2+0x1000 (IOCTL_CFGTBL_READ) -> BAR2+0x01c; no xHCI operational register is written ::
+:: tegra: JB11 [raw-handoff] — CNR gate: USBSTS=0x00000011 CNR=0 after 1 poll(s) / ~1 us — READY (mainline waits for exactly this before reading the header) ::
+:: tegra: JB11 [raw-handoff] — fw ident: magic="XUSBFW.." (0x0000574642535558) version_id=0x80050003 (Version: 80.05) ::
+:: tegra: JB11 [raw-handoff] — fw built: created=1676000890 (epoch) = 2023-02-10T03:48:10Z UTC ::
+:: tegra: JB11 [raw-handoff] — fw image: boot_codetag=0x00000000 boot_codesize=51295 B rodata_img_offset=0x00000000 fwimg_len=196608 B cksum=0x000094ba ::
+:: tegra: JB11 [raw-handoff] — fw L2 IMEM: start=0x00000000 end=0x00000000 (span=0 B) ::
+:: tegra: JB11 [raw-handoff] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::
+:: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 — CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 — touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c — XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c — PG 12 ON -> err=0 ::
+:: tegra: JB1c — PG 10 ON -> err=0 ::
+:: tegra: JB1c — CLK 267 enable -> err=0 ::
+:: tegra: JB1c — CLK 269 enable -> err=0 ::
+:: tegra: JB1c — CLK 268 enable -> err=0 ::
+:: tegra: JB1c — CLK 275 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 272 enable -> err=0 ::
+:: tegra: JB1c — CLK 103 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 100 enable -> err=0 ::
+:: tegra: JB1c — probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a — port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a — port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a — port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a — port survey done (8 ports scanned) ::
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+[uvug7] ms clock: CNTFRQ=31250000 Hz (=31250 kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent; sys_getinfo ticks=CNTVCT/(CNTFRQ/250)=125000 (NOT the per-core-summed tick counter)
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD — DTB /reserved-memory contributed 3 carveout range(s) (cap 48) to the exclusion set ::
+:: tegra: DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property = 0x0 / 0x0; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::
+:: tegra: HEAP-GUARD — kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 163 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: tegra: [net4B] Normal-NC DMA window reserved [0x268000000, 0x268200000) (2048 KiB), carved just below the heap in the same clean+DMA span ::
+:: KERNEL HEAP ALLOCATED ::
+:: tegra: JB3 — DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 — census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b — usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b — attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g — no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b — programming interrupter + rings (runtime regs) ::
+:: X200: xhci pointer-programming begins t=694702279 (cntpct) ::
+xHCI: CNR cleared after 1 polls
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+[xhciint] ERDP initialized to 0x00000002683cd540 (hi-first, EHB clear)
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2683ce580
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2683cf000 (heap PA in [0x2683ca000,0x26b3ca000))
+xHCI: CRCR set to 0x2683cc541
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: [aarch64] RS=1 witness: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 CNR=0 HCE=0) CRCR=0x0000000000000000(CRR=0 CS=0 CA=0 RCS=0) DCBAAP=0x00000002683ce580 DCBAAP_raw64=0x00000002683ce580
+xHCI: [aarch64] RS=1 witness: IR0=0x3630020 IMAN=0x3(IP=1 IE=1) ERSTSZ=1 ERSTBA=0x00000002683ce540 ERDP=0x00000002683cd548(EHB=1) ERST[0].ring=0x00000002683cd540
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan (settle_ms=150)
+xHCI: ccs-margin settle_ms=150 ppc=0 ports=8 first_assert_ms=[p1:0/pre p2:none/pre p3:none/on p4:none/on p5:none/pre p6:0/pre p7:0/pre p8:none/pre] latest=0 margin_ms=150 result=CCSMARGIN
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+:: X200: xhci RS=1 (controller may DMA from here) t=704529538 (cntpct) ::
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 11 (was not enabled — fine).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled — fine).
+:: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc5c0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2683d3000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683cf040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc5d0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: HUB slot 1 port 1: device connected; enumerating...
+xHCI: HUB port 1 SS link trained (status 0x300203 PLS=0 U0, 1 polls, 2625417 cyc, attempt 0)
+xHCI: HUB port 1 reset OK (status 0x300203, warm reset, xHCI speed 4)
+xHCI: HUB slot 1 port 1 is a SuperSpeed port (speed forced to SS).
+xHCI: HUB downstream slot 2 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 2, bulk in 0x82/1024 out 0x1/1024) <<<
+xHCI: Configuring Bulk Endpoints for Slot 2 (IN 0x82 dci5 mps1024, OUT 0x1 dci2 mps1024)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 2). Storage ready.
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc630, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: Proceeding to Address Device (Slot 3, Port 6)...
+xHCI: Addressing Device (Slot 3, Port 6)...
+xHCI: DCBAAP[3] linked to 0x2683df3c0
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683deb80
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc640, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: >>> SLOT 3 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 3...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 3
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 3) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 3) ===
+xHCI: HUB slot 3 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 3 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 3 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 3 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+xHCI: HUB slot 3 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1c4f pid=0034 (route 0x2 tier 1)
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x81, MPS: 4, Interval: 10, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (mouse(rel)) in one Configure-Endpoint (max DCI 3).
+xHCI: [Event] Command Completion. Ptr=0x2683cc680, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: HUB slot 3 port 4: device connected; enumerating...
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x81 mps=4 interval=10 == witness ::
+:: MOUSE-1: 1 reports, last dx=0 dy=0 buttons=0x00 == witness ::
+xHCI: HUB port 4 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 5 device class=0x0 vid=1c4f pid=0002 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 3, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 5 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc6b0, Slot=5, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 5
+xHCI: HID Endpoints Configured (Slot 5). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 5
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=3 interval=10 == witness ::
+xHCI: HUB slot 3 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 3 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 5, iface 0).
+[hidkeys] set-idle ok slot=5 iface=0
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 4, iface 0).
+xHCI: [enum port 7] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 7...
+xHCI: [enum port 7] stage -> enable-slot
+:: tegra: JB2b — keyboard ARMED (slot 5, root port 6) -> PASS ::
+xHCI: [Event] Command Completion. Ptr=0x2683cc6d0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: Proceeding to Address Device (Slot 6, Port 7)...
+xHCI: Addressing Device (Slot 6, Port 7)...
+xHCI: DCBAAP[6] linked to 0x2683ea8c0
+xHCI: Port 7 speed 1 -> EP0 MPS 8
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683ea080
+xHCI: [enum port 7] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc6e0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: >>> SLOT 6 ENABLED & ADDRESSED <<<
+xHCI: [tegra fs-mps] slot 6 (FS port 7): learning MPS0 before full descriptor.
+xHCI: [enum port 7] stage -> fs-mps-learn
+xHCI: [tegra fs-mps] slot 6 bMaxPacketSize0 = 64
+xHCI: [tegra fs-mps] slot 6 EP0 MPS0 -> 64 (Evaluate Context OK)
+xHCI: Requesting Device Descriptor for Slot 6...
+xHCI: [enum port 7] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 6
+>>> VENDOR ID : [13d3]
+>>> PRODUCT ID: [3549]
+xHCI: Device Found. Class=0xe0 Sub=0x1 Proto=0x1
+xHCI: no driver for device class 0xe0 (slot 6, 13d3:3549); releasing port.
+xHCI: Port enumeration queue drained.
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 2)
+:: BOT: pump budget=450000000 used=391 peak=391 route=0x1 depth=1 slot=2 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: pump budget=450000000 used=38249435 peak=38249435 route=0x1 depth=1 slot=2 n=2 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: deqprobe slot=2 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2683cec81 -> stopped_epstate=3 stopped_ctxdeq=0x2683cece1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position) ::
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+:: BOT: portreg why=bringup port=1 usb3 portsc=0x00001603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=5 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=6 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=7 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+xHCI: storage ready.
+:: SPACE: [wait=1489ms(n=1) setcfg=3ms(n=1) tur=1244ms(n=2) sense=3ms(n=1) inq=27ms(n=1) rdcap=3ms(n=1) pub=75ms(n=1) resid=13ms] {cbw=0ms(n=5) data=11ms(n=3) csw=1224ms(n=5) peak=1223ms@csw} ftdi=0ms(n=0) total=2857ms sum=2844ms per_ms=31250 result=SPACE ::
+:: PIUSB: [piusb35] databuf phys=0x2683e0000 in_trb=0x2683cec80 cbw=0x2683cee80 csw=0x2683ceec0 | rc-inbound=[0x0,0x100000000) offset=0 (1:1) | databuf in_window=false below_3G=false — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool ::
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE:                      
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+:: PIUSB: [piusb25] storage enumerated: slot 2 bulk_in=0x82 bulk_out=0x01 block_size=512 num_blocks=63404032 (30959 MiB) ::
+:: PIUSB: [piusb25] READ(10) LBA0 CSW=Passed residue=0 — first 16 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PIUSB: [piusb25] boot-sector sanity: 0x55AA=true type=unrecognized/raw ::
+:: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW=Passed residue=0 — 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+:: tegra: JB2b — HID: 1 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 — mass storage ready (slot 2); panel shell ls/cat live ::
+:: tegra: JB5 — witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 — inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x1f1d4_0fed22c7 SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: JB3 — inst0 CB0: SCTLR=0x0bb8e70c FSR=0x00000000 FAR=0x1efff_56f1d07e ::
+:: tegra: JB3 — inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x126f6_f75057da SYNR0=0x0000000a SYNR1=0x00001d73 (sid=0x1d73) ::
+:: tegra: JB3 — inst1 CB0: SCTLR=0x2bbfc70a FSR=0x00000000 FAR=0x179c9_36bffdec ::
+:: tegra: JB3 — MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JD2 — EL1 console pump task spawned (boot core) ::
+:: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or newer); CPU_ON known-good on this firmware per the SMP-2 bench ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 0 aff=0x00000000 (BSP) (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 1 aff=0x00000100 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 2 aff=0x00000200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 3 aff=0x00000300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 4 aff=0x00010200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 5 aff=0x00010300 (source=DTB /cpus) ::
+::ERROR:   Exception reason=1 syndrome=0x82000010
+ERROR:   **************************************
+ERROR:   RAS Uncorrectable Error in IOB, base=0xe010000:
+ERROR:   	Status = 0xe4000612
+ERROR:   SERR = Error response from slave: 0x12
+ERROR:   	IERR = CBB Interface Error: 0x6
+ERROR:   	MISC0 = 0xc45a0040
+ERROR:   	MISC1 = 0x23cc870000000000
+ERROR:   	MISC2 = 0x0
+ERROR:   	MISC3 = 0x0
+ERROR:   	ADDR = 0x8000000000000200
+ERROR:   **************************************
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   **************************************
+ERROR:   RAS Uncorrectable Error in ACI, base=0xe01a000:
+ERROR:   	Status = 0xe8000904
+ERROR:   SERR = Assertion failure: 0x4
+ERROR:   	IERR = FillWrite Error: 0x9
+ERROR:   	Overflow (there may be more errors) - Uncorrectable
+ERROR:   	ADDR = 0x8000000000000200
+ERROR:   **************************************
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   Powering off core
+ERROR:   Powering off core

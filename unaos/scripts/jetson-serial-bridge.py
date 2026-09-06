@@ -20,7 +20,7 @@
 #      across many `printf ... > fifo` injections.
 #
 # One select() loop: serial -> (log file + stdout), FIFO -> serial. Capture is 115200 8N1 raw, no
-# echo. Run it as a background process; inject console input with `printf 'CMD\r' > /tmp/jetson.in`.
+# echo. Run it as a background process; inject console input with `printf 'CMD\r' > ~/unaos-bench/scratch/jetson.in`.
 #
 # Driving the JetPack UEFI boot (send every line with a trailing CR, i.e. \r):
 #   - tap ESC during firmware boot if it does not drop to the UEFI Shell (Shell>).
@@ -38,7 +38,7 @@
 # Usage:  jetson-serial-bridge.py [DEV] [LOG] [FIFO]
 #   DEV   serial device       (default: auto-detect the first /dev/cu.usbmodem*)
 #   LOG   capture file         (default: ./jetson-serial.log, appended)
-#   FIFO  command inject FIFO   (default: /tmp/jetson.in)
+#   FIFO  command inject FIFO   (default: ~/unaos-bench/scratch/jetson.in)
 import os, sys, glob, select, termios, time, errno
 
 
@@ -74,9 +74,9 @@ and the UEFI-Shell boot-drive recipe.
   Usage:  jetson-serial-bridge.py [DEV] [LOG] [FIFO]
     DEV   serial device       (default: auto-detect the first /dev/cu.usbmodem*)
     LOG   capture file         (default: ./jetson-serial.log, appended)
-    FIFO  command inject FIFO   (default: /tmp/jetson.in)
+    FIFO  command inject FIFO   (default: ~/unaos-bench/scratch/jetson.in)
 
-  Inject console input (trailing CR!):  printf 'connect -r\\r' > /tmp/jetson.in
+  Inject console input (trailing CR!):  printf 'connect -r\\r' > ~/unaos-bench/scratch/jetson.in
   Stop by DEVICE (never `pkill -f cat`):  for p in $(lsof -t /dev/cu.usbmodem*); do kill "$p"; done"""
 
 
@@ -87,13 +87,16 @@ def main(argv):
 
     dev = argv[1] if len(argv) > 1 else find_dev()
     log = argv[2] if len(argv) > 2 else os.path.join(os.getcwd(), "jetson-serial.log")
-    fifo = argv[3] if len(argv) > 3 else "/tmp/jetson.in"
+    fifo = os.path.expanduser(argv[3] if len(argv) > 3 else "~/unaos-bench/scratch/jetson.in")
 
     if not dev:
         print("BRIDGE: no /dev/cu.usbmodem* found — is the Debug Probe plugged in?", flush=True)
         return 1
 
     if not os.path.exists(fifo):
+        # ~/unaos-bench/scratch/ is not guaranteed to exist the way /tmp was (Peter, 2026-09-02:
+        # nothing under /tmp — it is RAM-backed and swept). Make the parent, then the FIFO.
+        os.makedirs(os.path.dirname(fifo) or ".", exist_ok=True)
         os.mkfifo(fifo)
     fifo_fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
 

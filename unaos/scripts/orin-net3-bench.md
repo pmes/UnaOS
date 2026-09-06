@@ -91,5 +91,23 @@ DECODE, the link is up but the RP's secondary-bus numbering is unset — record 
 out of scope). Verdict = "device X identified, BARs sized — ready for the NIC driver arc." STOP there:
 driver bind is the next arc.
 
+### The terminal `PCIE2` line — read the correction, not the archive
+
+Both branches then fall back into `census2`, which prints ONE last line before the boot continues. Since
+orin 11 / CENSUS2LIE it is the `pcie3` variant and it reads (wrapped here; one line on the wire):
+
+```
+:: PCIE2: ORIN-NET-2 controller-0 preamble DONE — NOT read-only on this pcie3 image: past the page-table
+          mappings this pass ARMS controller-0 fabric writes (the appl LTSSM enable … ; BAR-dword all-ones
+          probes …). Which of them THIS boot issued is the `>>> FABRIC WRITE` lines above — read those,
+          never this one. Bounding THIS PASS keeps, and nothing past it: controller 0 only, … and no
+          driver bind — on a `net4` image the driver's own decode-enable comes LATER, below this line ::
+```
+
+**On every capture taken before that correction — `boot7h`, `boot7i`, `boot7j` included — this same slot
+instead reads `recon DONE (read-only; page-table mappings the only writes)`, and that is FALSE.** The logs
+are not edited; treat the read-only claim there as void and count the `>>> FABRIC WRITE` lines instead.
+(A `pcie2`-only image still prints the original literal, where it is true — see `orin-net2-bench.md`.)
+
 The box proceeds to CAPSTONE (JM6) exactly as a normal tegra boot — the recon is a prologue. Restore the
 boot-stick default at the end of the sitting per the standing rule.

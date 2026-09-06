@@ -5741,6 +5741,33 @@ controller 0. (M3) per enumerated BAR, an all-ones probe write **and** an immedi
 32-bit BAR, ≤ 4 for a 64-bit pair). That is the complete set; nothing else touches fabric, config, or
 system registers.
 
+**⚠ CENSUS2LIE — the verdict line lied *in the capture*, and the captures keep it (orin 11, 2026-08-31).**
+`census2` prints its terminal verdict **after** `net2_link_and_device` returns, and that verdict read
+`ORIN-NET-2 controller-0 recon DONE (read-only; page-table mappings the only writes)` on **every** build,
+`pcie3` included. From `893fe5c7` onward the string was false the instant it reached the wire: the pass
+directly above it had already enabled an LTSSM and driven all-ones probes into BAR dwords. This is worse
+than the stale header comments the sibling PCIEHDR pass struck — a comment misleads a reader of the
+source; a printed verdict misleads the **capture**, which is the evidence this project adjudicates on.
+Staged media `boot7h`, `boot7i` and `boot7j` (all `net4`, hence `pcie3,pcie2` — see
+`~/unaos-bench/flash/orin/MANIFEST`) each carry it, and **those logs are never edited**. So, for the
+record: when reading any Orin capture taken before this correction, **the read-only claim on that line is
+void**, and the `>>> FABRIC WRITE` lines are the only truthful account of what that boot wrote.
+
+The correction is forward-only and **line-neutral** — a `#[cfg]` split occupying the same four source
+lines, so the knob-off `Location` ledger disclosed below is undisturbed. Under
+`not(all(pcie3, tegra))` the literal is unchanged byte for byte (there, the page-table descriptors really
+are the only writes, and `scripts/orin-net2-bench.md`'s wire block stays correct as written). Under
+`pcie3 + tegra` the line now states the pass is **not** read-only, names the two fabric-write classes it
+arms, and keeps the bounding that is genuinely true — controller 0 only, nothing outside those classes, no
+driver bind. Two deliberate properties of the new wording: (1) neither write is unconditional at runtime
+(the LTSSM enable is skipped when firmware already left the link up — exactly what the metal sitting's
+`LINK-UP-pre-LTSSM` observation recorded — and the BAR probes need a device answering), so the line
+advertises what the image **arms** and refers the reader to the `>>> FABRIC WRITE` lines for what a given
+boot **issued**; (2) it says explicitly that a `net4` image's `COMMAND` decode-enable happens *below* this
+line, so the bounding cannot be misread as a claim about the whole boot. What may **not** be concluded
+from the new line, and could be from the old one, is that this pass cannot bring a link up. It can, and
+that is its purpose.
+
 **Byte-identity (knob-off) — the ratified 1-byte Location class.** Knob-off (`pcie3` and `pcie2` both off)
 the module blocks + all call sites are compiled out. The `TCR_*_ACTIVE` constants fold to the exact NET-2
 literals (so `enable_el2`/`enable_el1`/the drop program identical values and the `mmu-regs` banner is
@@ -6234,6 +6261,90 @@ armed configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CF
 `FORBID` on the `Exception reason=1 syndrome=0x82000010` signature so a parked flight is named rather
 than inferred from a pile of missing `REQUIRE`s. `:P:` is anchored `^:P:` there because a bare `:P:`
 takes a false hit on a pre-existing `KERNEL HEAP ALLOCATED :P: released cores …` line.
+
+#### VARIANT C — the `desk1` signature, first recorded 2026-08-28
+
+A third distinct fault signature at this same seam, from the 2026-08-26 desk sitting
+(`~/unaos-bench/capture/line-acm0/raw.log` at offset **+7621395**, leg `desk1` at `f3df7ff`, knobs
+FURN+FACE+INPUT+EL1AP+LOCKFIX+RAST, conwin OFF). It is recorded because neither known signature matches
+it: before this entry `grep -r` over `docs/` and `unaos/` returned **zero** hits for both `0xbe000411`
+and `0x68000d04`.
+
+Position is identical to the park: the last kernel line is
+`ORIN-SMP-3 enumerated core 5 aff=0x00010300`, there is **no `CPU_ON` line at all**, and then two RAS
+records and a doubled `Powering off core`.
+
+```
+ERROR:   Exception reason=0 syndrome=0xbe000411
+ERROR:   RAS Uncorrectable Error in IOB, base=0xe010000:
+ERROR:   	Status = 0xec000612
+ERROR:   SERR = Error response from slave: 0x12
+ERROR:   	IERR = CBB Interface Error: 0x6
+ERROR:   	Overflow (there may be more errors) - Uncorrectable
+ERROR:   	MISC0 = 0x44062040
+ERROR:   	MISC1 = 0x6454870000000000
+ERROR:   	MISC2 = 0x0
+ERROR:   	MISC3 = 0x0
+ERROR:   	ADDR = 0x8000000000000000
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   RAS Uncorrectable Error in ACI, base=0xe01a000:
+ERROR:   	Status = 0x68000d04
+ERROR:   SERR = Assertion failure: 0x4
+ERROR:   	IERR = SNOC Write Error: 0xd
+ERROR:   	Overflow (there may be more errors) - Uncorrectable
+ERROR:   sdei_dispatch_event returned -1
+ERROR:   Powering off core
+ERROR:   Powering off core
+```
+
+Against the two known signatures, with the park column taken from the same sitting's `desk2` leg
+(+7689131) so the comparison is one board on one afternoon:
+
+| field | **VARIANT C** (`desk1`) | the park (`desk2`) | the `bg`-verb fault |
+|---|---|---|---|
+| `Exception reason=` | present — `reason=0 syndrome=0xbe000411` | present — `reason=1 syndrome=0x82000010` | **absent entirely** |
+| IOB `Status` | `0xec000612` | `0xe4000612` | `0xec000612` |
+| IOB `SERR` / `IERR` | slave `0x12` / CBB Interface `0x6` | slave `0x12` / CBB Interface `0x6` | — |
+| IOB `Overflow` | **set** | not set | — |
+| IOB `MISC0` / `MISC1` | `0x44062040` / `0x6454870000000000` | `0xc4520040` / `0x22cc870000000000` | — |
+| IOB `ADDR` | `0x8000000000000000` | `0x8000000000000200` | `0x8000000000000000` |
+| ACI `Status` | `0x68000d04` | `0xe8000904` | — |
+| ACI `SERR` / `IERR` | Assertion failure `0x4` / **SNOC Write Error `0xd`** | Assertion failure `0x4` / FillWrite Error `0x9` | SNOC Write Error `0xd` |
+| ACI `ADDR` | **no `ADDR` line emitted** | `0x8000000000000200` | — |
+
+**It is NOT the `bg`-verb fault, and the discriminator is the `Exception reason=` line.** The trap is
+worth stating because variant C carries all three of the `bg`-verb fault's quoted values —
+`Status 0xec000612`, `SNOC Write Error 0xd`, `ADDR 0x8000000000000000` — so a value-wise match looks
+convincing. They are **split across two different records**: the `Status` belongs to the IOB record,
+whose `IERR` is CBB Interface Error `0x6`, and the SNOC Write Error belongs to the ACI record, whose
+`Status` is `0x68000d04`. No single record in variant C reproduces the `bg`-verb pairing. The `bg`-verb
+fault additionally carries no `Exception reason=` line at all, and variant C carries one, which settles
+it on its own. This is the exact confusion §ORIN-RAS-ADDR's corollary was written to prevent.
+
+**Both ADDR values here are sinks, not locations.** Per §ORIN-RAS-ADDR, strip bit 63: variant C's
+residue is `0x0` and the park's is `0x200`, and both are in that section's named sink set
+(`0x0`, `0x200`, `0xb5c`). Neither names a place in DRAM; each says only that the transaction matched
+no region. **Do not chase either.** Per the same corollary, no witness or spec rule keys on them —
+variant C's discriminating key is `Exception reason=0 syndrome=0xbe000411` plus the ACI
+`Status = 0x68000d04`.
+
+⚠ **SMPMARK was NOT armed on this sitting, so the reading table above does not apply to variant C.**
+`grep -ac ':P:'` returns 0 on all five desk-leg windows, and every `:P:` occurrence in `raw.log` lies at
+offsets 6153632–7255955, i.e. before `desk1` begins at +7621395. The desk1 and desk2 tails match the
+first row of *"Reading a parked capture"* textually (`enumerated core 5 …` then RAS), but that row's
+verdict — publication died, no `CPU_ON` was ever issued, **REFUTES H1** — requires the marks to be
+armed and absent. With the instrument off, their absence is a fact about the build, not about the boot.
+**Variant C therefore leaves H1 neither convicted nor refuted**, and an `UNAOS_SMPMARK=1` re-flight is
+what it is owed.
+
+**Rate.** Both parked legs are already counted as ordinary parks in the ~30% figure at the head of this
+section. Variant C has no rate of its own — it is one occurrence. Nothing yet distinguishes whether it
+is a separate defect or the same one presenting differently, and one sample cannot say so.
+
+**Provenance note.** This sitting's two parks were briefly read as convicting the `orinfurn` desktop
+knob. They do not: that seam prints an unconditional entry line and never printed it on any leg, and the
+2-of-5 split sits within this section's own ~30% base rate. The arithmetic and the retraction are in
+[`08_VIDEO/orin-desktop.md`](../08_VIDEO/orin-desktop.md) §3.12.1.
 
 ### ORIN-RAS-ADDR — reading a Tegra RAS `ADDR` field: it is sometimes a location and sometimes a sink
 
@@ -10658,6 +10769,124 @@ point. What this arc deliberately does not do: no AP EL1 drop (Candidate C), no 
 (F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
 
 
+## §ORIN-STKDEPTH — a boot-core stack DEPTH at the tegra terminus (`orinfurn`, DEFAULT OFF)
+
+Landed 2026-08-28 in the TERMINUS fold (`405b21f6`, commit `81f304d2`). The section it argues
+with is `docs/dev/OS/08_VIDEO/orin-desktop.md` §3.12 / §5.2; the instrument itself is a boot/HAL
+measurement and is recorded here.
+
+### What it measures, and the record it corrects
+
+`orin-desktop.md` §5.2 gates the desktop cascade on `[u7stk]`/`[redzone]` stack evidence, and §3.12
+recorded that requirement as *structurally unsatisfiable at the terminus*. That record is right
+about `sched::stk_probe` and overstated about the machine, and the distinction is the whole of this
+instrument.
+
+`stk_probe` loads `SCHED[cpu].current` and returns early when it is null, which is every rung on
+`tegra_early_stop`'s terminus line: the boot core has not entered `run_capstone_boot_core` and owns
+no `Task`. Everything it reports (`base`, `len`) is derived from `task.stack`, so it is not
+adaptable to this seam. The SP itself needs none of that — it is three instructions, and the same
+read already exists twice in tree (`arch/aarch64/mmu_tegra.rs`'s pre-switch PC/SP check;
+`stk_probe`'s own first statement).
+
+ORIN-STKDEPTH takes two SP reads on one descending frame chain and subtracts them:
+
+* the **anchor**, `tegra_stk_anchor()`, appended to `kernel_main`'s `bootpace::record("entry")`
+  statement — `main.rs:88`, the earliest stable point on the chain;
+* the **seam** read, inside `tegra_desk_furn` beside its unconditional `[orinfurn] arm` line —
+  `main.rs:7896-7899`.
+
+The difference is the number of bytes of boot-core stack the chain
+`kernel_main -> tegra_early_stop -> tegra_desk_furn` has consumed at that instant. No linker
+symbol, no `Task`, no poison fill, no memory map.
+
+The anchor helper is `#[inline(always)]` (`main.rs:8082-8094`) and that is load-bearing rather than
+cosmetic: the read must land in `kernel_main`'s own frame, not a callee's. Were it ever out-of-lined
+the anchor would sit one leaf frame lower and the number would shrink — so the published depth is a
+**floor with respect to its anchor** and cannot overstate consumption.
+
+### Wire format
+
+```
+[orinstkdepth] depth-consumed=<n> bytes anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
+[orinstkdepth] DEPTH-UNAVAILABLE anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm reason=<anchor-never-ran | anchor-below-seam>
+```
+
+`main.rs:7900-7912`. **Fails closed:** the guard is `stk_anchor != 0 && stk_anchor >= stk_here`, so
+an anchor that never ran (zero) or a pair that is not on one descending chain prints
+`DEPTH-UNAVAILABLE` with the reason named, never a number derived from a null.
+
+### ⚠ DEPTH CONSUMED IS NOT HEADROOM, and no headroom number is derivable in-kernel today
+
+Stated in the code comment, in the tail block (`main.rs:8028-8080`) and **on the wire**, so a
+capture cannot be read as clearing §5.2 by itself. Three independent reasons, each verified in this
+tree:
+
+1. **The Orin boot stack is the firmware's and is never switched.** The JM6 drop in
+   `arch/aarch64/boot_tegra.rs` does `mov x0, sp; msr sp_el1, x0` precisely so SP is continuous
+   across EL2 → EL1 — which is also what makes the two reads subtractable at all.
+   `arch/aarch64/mmu_tegra.rs` states the same in its EL1-twin argument.
+2. **No `__stack_top` is linked into the jetson image.** `unaos/aarch64-unaos.json` names no linker
+   script — its `pre-link-args` carry only `--fix-cortex-a53-843419` — so no such symbol exists on
+   this link and no `extern` could resolve to one. ⚠ **The symbol DOES appear in Rust source in this
+   tree**, at `main.rs:51-52` inside the `global_asm!` whose `_start` sets SP from it, and
+   `crates/kernel/pi-baremetal.ld` defines it. That block is
+   `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` — the Pi's bare-metal link, which
+   the Orin never takes, and no tegra leg carries `baremetal`. Do not restate this as "the symbol
+   appears nowhere in the tree"; that overstatement has already been corrected once.
+3. **The one runtime description of the region is gone before anything could ask.** The UEFI
+   `MemoryRegion` slice that would say how far the firmware stack extends is consumed with
+   `boot_info` by `arch::memory::init` on `tegra_early_stop`'s heap line, long before the terminus.
+
+So the instrument publishes a depth and prints `DEPTH-UNAVAILABLE` for the other half. A depth is a
+measurement; a headroom would be a guess wearing a measurement's clothes. Closing the headroom half
+needs one of: a linker script for the aarch64 kernel target, the `MemoryRegion` slice retained past
+`memory::init`, or the cascade moved off the boot stack. All three are real arcs; none is a comment
+change.
+
+### Gating and verification status
+
+Every item is `#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]`-erased. The call site is
+a line-neutral append to an existing `kernel_main` statement; the statics and helper are `main.rs`'s
+last block with nothing below to renumber; the seam's added lines sit inside `tegra_desk_furn`,
+itself the file's last item. The knob-off jetson image's panic `Location` records are therefore
+untouched.
+
+Verified at `81f304d2` (fold `405b21f6`), build and artifact only:
+
+* `./arroyo check` green both arches;
+* `[orinstkdepth] depth-consumed=` and `[orinstkdepth] DEPTH-UNAVAILABLE` each one-hit in the
+  `arm-tegra-furn` `kernel.elf` (`LC_ALL=C grep -a -o`). The leg is `arroyo:3226`.
+
+⚠ **UNFLOWN — no depth number exists.** No Orin has booted an `orinfurn` image that reached the
+seam; the two 2026-08-26 desk flights died 96 source lines earlier (`orin-desktop.md` §3.12.1).
+Every claim above is a source and artifact reading. The depth itself has never been measured on
+hardware, and the `DEPTH-UNAVAILABLE` arm has never been observed firing either.
+
+⚠ And see `orin-desktop.md` §3.13: **no check leg in this tree can score tegra behaviour.**
+`arm-tegra-furn` going green means this instrument compiles, not that it prints anything. The
+mitigation is SPECGATE (fold `0ea79938`, 2026-08-28), which scores a metal CAPTURE instead:
+`unaos/scripts/specs/jetson-sync1.spec:1571-1572` carries
+`PENDING \[orinstkdepth\] depth-consumed=[0-9]+ bytes` beside
+`FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE`, read as a pair with the `[orinfurn] arm` PENDING at
+`:1565` so "did not fire" is distinguishable from "was not armed". Two notes the spec makes and
+this section endorses:
+
+* **The instrument cannot come up short on CONFIGURATION.** The anchor and the seam read share one
+  `#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]`, so there is no image in which the
+  reader is compiled and the anchor is not. `DEPTH-UNAVAILABLE` therefore always means something
+  happened, never that something was missing from the build — which is why this family gets a
+  FORBID where the other three get weaker rows.
+* **The `depth-consumed=` pattern deliberately stops at `bytes`** and never reaches `anchor-sp=` /
+  `seam-sp=`, because §ORIN-RAS-ADDR forbids keying any spec row on an ADDR value. The depth is the
+  measurement; the two addresses are context for a human reading the quoted line.
+
+⚠ If a future arc legitimately switches stacks between `kernel_main` and the seam, the
+`reason=anchor-below-seam` arm will red while the instrument is telling the truth. The right
+response then is to RETIRE the row, because the depth number it guards would have become
+meaningless at the same moment.
+
+
 ## §ORIN-SUPSTATE — the console-surface state lift + role split (SMP-redesign Candidate A, arc 1; `supstate`, DEFAULT OFF)
 
 ### The defect this arc addresses
@@ -10721,6 +10950,21 @@ Knob-off there are none (byte-identity below). Knob-on, on the serial wire:
    which the dispatcher marks `SCREEN_APP_ACTIVE` goes to the shell after the command returns
    rather than to the command's own pump — today's typed-ahead semantics, but the window is now one
    input pass instead of zero. Human-rate keys; benign.
+6. **The JD2/JD4 takeover literals now name their site (ORINPATH, `a4b1b338`, 2026-08-28).** Both
+   copies print `path=jd2-supstate-phase2` here (`main.rs:7565-7574`) against
+   `path=jd2-console-pump` in the legacy phase 2 (`main.rs:2889-2898`). ⚠ **This deliberately breaks
+   the "reads identically knob-on vs knob-off" property** stated as this arc's behavioural falsifier
+   below, and the break is the point: being unable to tell the two transcripts apart was never
+   evidence that they were equivalent, it was the absence of evidence either way. The token is
+   deliberately longer than 8 bytes — a shorter witness mark can be LLVM-immediate-encoded and never
+   reach `.rodata`, defeating the artifact-grep law this tree runs on — and is placed AFTER
+   `console OWNS the panel` so `scripts/specs/jetson-sync1.spec` and `jetson-jd5.spec`'s
+   `REQUIRE JD4.*console OWNS the panel` still matches. See `orin-desktop.md` §3.13.
+7. **The ORIN-RASTGLASS latch and census, restored to this copy (`e1bb9b49`, 2026-08-28).** On a
+   `rast` image `[orinrast] census` lines now continue past the phase-1 boundary
+   (`main.rs:7657`) and `console-owns=1` appears from the phase-2 boundary (`main.rs:7550`).
+   Knob-on captures taken before that commit scored a healthy boot `RAST-PAINTED-OVERWRITTEN`;
+   see `orin-desktop.md` §3.13 for the defect.
 
 While `SCREEN_APP_ACTIVE` is set the input source leaves the PAL queue alone (GUI-CLICK-2's
 contract: the command's own `pump_and_poll` is the consumer), and it keeps polling the xHCI —
@@ -10794,7 +11038,10 @@ list above and the one place a knob-on capture must differ.
 
 What the metal flight must show: the `[supstate] lift` and `[supstate] roles` lines at phase-2
 entry, then a JD2 interactive session and an `[orinclick]` census transcript that read identically
-to a knob-off boot apart from the deltas enumerated above. What this arc deliberately does not do:
+to a knob-off boot apart from the deltas enumerated above. ⚠ **AMENDED 2026-08-28:** the
+"read identically" half is retired as a falsifier — ORINPATH (delta 6) makes the two transcripts
+differ on purpose at the JD2/JD4 takeover lines, and the correct knob-on reading is now
+`path=jd2-supstate-phase2` present with `path=jd2-console-pump` absent. What this arc deliberately does not do:
 no supervisor, no reap, no restart, no heartbeat records (arc 2, gated on B's clock); no EL
 changes, no core wakes, no `steal_ok`, no migration — a role still dies on the core it lived on;
 the lift's whole point is that its STATE no longer dies with it.
