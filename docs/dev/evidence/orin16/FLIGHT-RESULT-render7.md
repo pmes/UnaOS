@@ -197,7 +197,7 @@ Opened this flight: **A28** VFS root has no backend · **A29 (→ SO1)** console
 **A30** closing pulse reopens it · **A31 (→ SO2)** `View` drop-down placement and typeface ·
 **A32 (→ SO3)** no application menu, no Quit · **A33 (→ SO4)** crystal menu anchoring ·
 **A34** crystal Restart/Shut Down inert · **A35 (→ SO5)** cursor grows over the backdrop ·
-**A36 (→ SR2)** Print Screen wedge · **A37** serial RX double-delivers and reorders ·
+**A36 (-> rmbp SR2)** Print Screen wedge · **A37** serial RX double-delivers and reorders ·
 **A38** a witness that quotes another witness inflates every count.
 
 Ticked from the four probe boots later the same day (`PROBES-2026-09-06.md`): **A21** (flown PASS), **A23** (flown PASS), **A12** (flown, measured NEGATIVE), **A24** (flown PASS, rung 2).
