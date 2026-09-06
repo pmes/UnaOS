@@ -475,7 +475,7 @@ pub fn open() -> wm::WinId {
         return wm::WIN_NONE;
     }
     *STORE.lock() = Some(store);
-    WIN.store(id, Ordering::Release);
+    WIN.store(id, Ordering::Release); wm::winid_register_holder(&WIN, "pulsewin"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. `close()` below clears this cell, and `press_route` is the only caller of it — so a close that arrives through the operator's close disc on the ROUTER's furniture arm (`wc_close_furniture` -> `wm::close`) frees the row behind this cell's back and leaves it naming a slot the table is free to re-issue. Registering it makes `wm::close` the backstop on every path.
     // R21 — **publish the `View` menu into the BAR.** After `WIN` is stored, because the registry is
     // keyed by window id and a tree published against `WIN_NONE` is refused; before the witness, so a
     // capture reads `[winmenu] publish` and `[pulsewin] open` in the order they happened. A refused

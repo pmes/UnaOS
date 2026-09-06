@@ -1794,7 +1794,7 @@ pub fn open() {
         SURF.lock().clear();
         return;
     }
-    WIN.store(id, Ordering::Relaxed);
+    WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&WIN, "quarry"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Same argument as pulsewin's: `close()` clears this cell and `press_route` is its only caller, so a close taken by the router's furniture arm would free the row and leave this cell naming a re-issuable slot. render7 is the boot where this window WAS re-issued the console's id (`[quarry] open win=1` after `close-furniture win=1`).
     wm::focus_changed(OWNER);
     let (roots_n, tn, ln) = {
         let gd = MODEL.lock();

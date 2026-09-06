@@ -8355,7 +8355,7 @@ fn orin_render_service(_: usize) {
         // sets `st.armed`, so `loads()` answers `ncpu` before `service` asks), and thereafter repaints
         // only when the frame signature moves. It presents through its own `wm` row, not through
         // `pal`, and returns `()` — it neither reads nor sets `dirty`.
-        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::quarry::service(); // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample. QUARRY-ORIN (A8) — and the file manager's latch drains beside it. `quarry::service()` is `reap_jobs()` + one `AcqRel` swap on a quiet pass, so this costs a relaxed load per pass and nothing else; when the latch IS set it calls `open()`, which reads directories — legal HERE and not in the click router (the reason `dock::press_at` latches instead of opening). The Pi drains it from ONE place, `arch/aarch64/syscall.rs`'s strip-press arm, which this board also compiles (`desktop_firmware`, and render6-boot2's `[dock] press … raised=true` proves that arm runs here) — but that arm fires only on a dock press, so `open()`'s own `reason=panel-busy` re-latch and `tegra_quarry_seat`'s would both sit unread until an operator happened to click the strip. This is the pass-driven drain that closes them. ⚠ FOLDED onto this line rather than added below it, for the reason PULSEWIN names.
+        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::quarry::service(); orin_shell_reopen_drain(); // SHELLREOPEN-ORIN (S4/A7) — and the DOCK'S SHELL PIN drains here too, beside quarry's latch and for the identical reason: `dock::press_at` latches rather than opens because a click router may not allocate a surface or take the window table, and this pass is where that work belongs. Until this call `dock::take_shell_reopen()` had one real caller in the tree, `x86_render_service`, so the pinned tile was a dead button on both aarch64 boards — render7 measured it (two `[dock] press … shell=pin -> reopen requested` with no window). Unlike quarry's it is NOT `#[cfg(desktop_firmware)]` at the call site: the drain fn itself has a knob-off `#[inline(always)]` empty twin, so this fold erases to nothing without the desktop. See the SHELLREOPEN-ORIN block at this file's tail for why the reopen is `fbcon::panel_console_window_open` and not `open_shell_window` on this board. ⚠ FOLDED onto this line, never added below it — panic `Location`s. // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample. QUARRY-ORIN (A8) — and the file manager's latch drains beside it. `quarry::service()` is `reap_jobs()` + one `AcqRel` swap on a quiet pass, so this costs a relaxed load per pass and nothing else; when the latch IS set it calls `open()`, which reads directories — legal HERE and not in the click router (the reason `dock::press_at` latches instead of opening). The Pi drains it from ONE place, `arch/aarch64/syscall.rs`'s strip-press arm, which this board also compiles (`desktop_firmware`, and render6-boot2's `[dock] press … raised=true` proves that arm runs here) — but that arm fires only on a dock press, so `open()`'s own `reason=panel-busy` re-latch and `tegra_quarry_seat`'s would both sit unread until an operator happened to click the strip. This is the pass-driven drain that closes them. ⚠ FOLDED onto this line rather than added below it, for the reason PULSEWIN names.
 
         // AT MOST ONE PRESENT PER PASS, and only when something changed. The Pi service measured a
         // 96-100% core peg before it took this rule; on this board the cost lands on cpu 0, which is
@@ -8947,3 +8947,124 @@ fn tegra_quarry_seat() {
         relatched as u8
     );
 }
+
+// =================================================================================================
+// SHELLREOPEN-ORIN (S4 / A7, SO1(a)) — **the dock's pinned shell tile is a live button on the Orin.**
+// =================================================================================================
+//
+// ## The defect, metal-confirmed
+//
+// `video/dock.rs`'s pinned shell tile does not raise anything itself; it LATCHES a request
+// (`SHELL_REOPEN.store(true)`, the SHELLPIN comment says why — a click router may not open a window)
+// and the render service drains it at the tail of the same event burst with `dock::take_shell_reopen()`.
+// That taker had exactly ONE real caller tree-wide, `x86_render_service` (the
+// `arch/x86_64/syscall.rs` call is the `winx_launcher` selftest draining the flag so it cannot race
+// the render loop). Neither aarch64 render body drains it, so on the Pi and on the Orin the tile is a
+// button wired to nothing — and render7 proved it on hardware: Peter closed the console window
+// (`[wm-act] close-furniture win=1 owner=0xffffff01 closed=true route-dropped=true`) and pressed the
+// pin TWICE (`[dock] press at (1054,1161) tile=2/3 shell=pin -> reopen requested`, then again at
+// (1046,1161)) with no window on either press, while quarry's pin on the same dock opened normally.
+//
+// ## What "reopen the shell" MEANS on this board, which is not what it means on x86
+//
+// `x86_render_service` owns a shell WINDOW — its own `Console`, `Screen` and `TargetPal`, minted by
+// `open_shell_window` — so its drain either raises that row or rebuilds the whole tuple. This task
+// owns no such thing and says so twice in its own body: `orin_render_service` DECLINES to mint a
+// shell window (`[orinrender] DECLINE reason=console-already-windowed`) because `orinconwin` has
+// already routed the LIVE kernel console into its own `wm` row. On the Orin the shell IS the routed
+// console, so reopening it is reinstalling that route on a fresh row — `fbcon::panel_console_window_open()`,
+// the same shared implementation `orin_conwin` step 7 calls.
+//
+// It cannot go back through `orin_conwin`: that seam is ONE-SHOT (`ORINCONWIN_ENTERED`, whose own
+// decline text says a second pass "would re-arm the face and re-present a row
+// panel_console_window_open would hand straight back"). `panel_console_window_open` is the idempotent
+// half — it returns the existing id when a route is installed and mints a new row when
+// `CONSOLE_WIN` is `WIN_NONE`, which is exactly the state a close leaves behind. The glyph route
+// itself (`c.win_fb` / `c.win_store`) was deliberately NOT torn down by the close, so no console text
+// was lost while the window was gone; the install block re-points it at the new surface.
+//
+// ## Why the drain is HERE and not in the click router
+//
+// The same reason `dock::press_at` latches instead of opening, and the same reason
+// `quarry::service()` is drained from this line: the router runs in the input band, and reopening the
+// console allocates a multi-megabyte surface and takes the window table. This pass is where that
+// belongs. It costs one relaxed swap per pass on a quiet board.
+//
+// ## S4 / B11 / S7 — one defect class
+//
+// This is the third measured instance of the SAME shape: the x86 render body does something the
+// aarch64 bodies do not. B11 is the drag feed (`drag_route_tail`: Pi 2 calls, x86 feeds
+// `wm::drag_motion` directly, Orin 0), A27 was its Orin half, and S4 is this. S7 steps 2-3
+// (render-family convergence — the Orin then x86 adopting the shared body) SUBSUME all of them; this
+// drain is the point fix that makes the tile work before that arc lands, and it is written so the
+// convergence can delete it rather than merge it.
+//
+// LINE-NEUTRAL: tail append, one same-line fold at the call site.
+
+/// SHELLREOPEN-ORIN — drain [`unaos_kernel::video::dock::take_shell_reopen`] and reinstall the
+/// console route. One `AcqRel` swap on a quiet pass; everything below it runs only on a press.
+///
+/// The witness is UNGATED (`witness` is off in the metal image, so a claim gated on it is not a claim
+/// about the artifact that flies) and it names the SERVICE, because the whole finding is that the
+/// three render bodies do different things:
+///
+/// ```text
+/// [dock] shell-reopen drained by=orin_render_service win=5 gen=2 route=routed -> REOPEN
+/// ```
+#[cfg(all(target_arch = "aarch64", feature = "orinrender", feature = "desktop_firmware"))]
+fn orin_shell_reopen_drain() {
+    use unaos_kernel::video::{fbcon, wm};
+    if !unaos_kernel::video::dock::take_shell_reopen() {
+        return;
+    }
+    // ALREADY LIVE — the scan-to-press race, or a press on a pin whose console never went away.
+    // Raise it through the pair the router's furniture arm uses; never mint a second console.
+    if fbcon::console_is_routed() {
+        let id = fbcon::console_win();
+        wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+        serial_println!(
+            "[dock] shell-reopen drained by=orin_render_service win={} gen={} route=already-live -> REOPEN",
+            id,
+            wm::winid_gen(id)
+        );
+        return;
+    }
+    let win = fbcon::panel_console_window_open();
+    if win == wm::WIN_NONE {
+        // `panel_console_window_open` has already named its own reason on the line above this one
+        // (console-not-ready / alloc / geometry-unavailable / create-failed / install-contended).
+        // Nothing was torn down and nothing is owed: the tile stays on the dock for another try.
+        serial_println!(
+            "[dock] shell-reopen drained by=orin_render_service win=0 gen=0 route=declined -> REOPEN"
+        );
+        return;
+    }
+    // `orin_conwin` step 8's pair, for its reason: `present_outcome` over `present` so "the pass ran"
+    // and "the pass was suppressed" do not look alike, then one composite so the row reaches glass
+    // before the next pass decides nothing changed.
+    let outcome = unaos_kernel::video::wm::present_outcome(win);
+    wm::composite();
+    wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+    serial_println!(
+        "[dock] shell-reopen drained by=orin_render_service win={} gen={} route={} present={} -> REOPEN",
+        win,
+        wm::winid_gen(win),
+        if fbcon::console_is_routed() { "routed" } else { "unrouted" },
+        match outcome {
+            wm::Presented::Composited => "Composited",
+            wm::Presented::Coalesced => "Coalesced",
+            wm::Presented::Suppressed => "Suppressed",
+            wm::Presented::NoRow => "NoRow",
+        }
+    );
+}
+
+/// SHELLREOPEN-ORIN — the knob-off twin. `#[inline(always)]` and empty, so the fold at the call site
+/// costs the image nothing on a build without the desktop.
+#[cfg(all(
+    target_arch = "aarch64",
+    feature = "orinrender",
+    not(feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn orin_shell_reopen_drain() {}

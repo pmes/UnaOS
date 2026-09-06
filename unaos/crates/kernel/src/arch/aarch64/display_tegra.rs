@@ -494,7 +494,7 @@ pub fn orin_wm1() -> crate::video::wm::WinId {
     // The row is live and holds a raw pointer into `store`: park it where it outlives this frame.
     // Moving the `Vec` moves its header, not its heap block.
     *ORINWM1_STORE.lock() = Some(store);
-    ORINWM1_WIN.store(id, Ordering::Release);
+    ORINWM1_WIN.store(id, Ordering::Release); crate::video::wm::winid_register_holder(&ORINWM1_WIN, "orinwm1"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. This cell is the WORST of the five the WINID block catalogues, and it is orin's own: NOTHING clears it on ANY path, and it is also this function's IDEMPOTENCE LATCH (the `existing` test above). render7 closed this very window through the disc — `[wm-act] close-furniture win=4 owner=0xffffff02 closed=true route-dropped=false` — and the cell went on holding 4; the next call would hand a dead id back to its caller, and once the table re-issues slot 3 it would hand back a stranger's window. Registered, `wm::close` clears it and the latch correctly re-mints.
 
     // 7. PRESENT + COMPOSITE. `create_at` already composited the new row; the explicit present is what
     //    this rung is actually measuring — the surface→panel path, end to end, on Orin silicon.

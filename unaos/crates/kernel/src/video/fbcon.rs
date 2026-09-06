@@ -2017,7 +2017,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         return wm::WIN_NONE;
     }
 
-    CONSOLE_WIN.store(id, Ordering::Relaxed);
+    CONSOLE_WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&CONSOLE_WIN, "console"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Registering the route cell means `wm::close` clears it on EVERY close path, not only the one that remembers to call `panel_console_window_closed`. That hook stays the primary writer and is unchanged (it is the only one that also publishes the `Gui` panel-owner handover); this is the backstop, and the `route=dropped` reading in `wm::close`'s WINID witness is precisely the wire signature of a close path that reached the console row WITHOUT the hook. Idempotent by cell address, so the second boot-time open costs a pointer scan.
     // PANELOWN — the console's glyphs LEAVE THE PANEL for a window surface. From the store above,
     // `draw_fb` lands every cell in `win_fb` (cached RAM) and the compositor decides which of those
     // pixels reach the glass, so the console has stopped being a panel writer entirely. That is a
@@ -3052,4 +3052,28 @@ fn conquiet_held() -> bool {
 #[inline(always)]
 fn conquiet_held() -> bool {
     false
+}
+
+// =================================================================================================
+// WINID (SO1(b)) — the console route's id, readable.
+// =================================================================================================
+
+/// WINID — **the window the console is routed at, or [`wm::WIN_NONE`].**
+///
+/// [`console_is_routed`] answers the same cell as a `bool`; this answers WHICH window, which is what
+/// `wm::close`'s WINID witness needs to say `route=dropped|kept|none` — the on-the-wire answer to
+/// SO1's second question (why the console's close read `route-dropped=true` while the desktop
+/// furniture row's read `false`: the predicate is "was this id the ROUTED CONSOLE", and only one row
+/// on the panel can be).
+///
+/// Read-only and lock-free by construction, for [`CONSOLE_WIN`]'s own stated reason: the cell is kept
+/// outside the `FBCON` mutex so a damage declaration can read it with the console lock released.
+///
+/// LINE-NEUTRAL: tail append.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn console_win() -> wm::WinId {
+    CONSOLE_WIN.load(Ordering::Relaxed)
 }
