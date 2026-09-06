@@ -618,7 +618,7 @@ fn usb_backed(fs: &FatFs) -> bool {
     }
     if name == BlockSource::Default.name() {
         return match (crate::drivers::block::info(), crate::drivers::block::usb_info()) {
-            (Some(global), Some(usb)) => global.slot_id == usb.slot_id,
+            (Some(global), Some(usb)) => global.slot_id == usb.slot_id, // safe ONLY because slot 0 is never a real xHCI device (xhci/mod.rs:2890; the SD sentinel is emmc2.rs:632 slot_id 0): if that invariant moves, the Pi's card is misclassified USB-backed and volume_alive() probes a generation that never advances → permanent refusal (pi 7)
             _ => false,
         };
     }
