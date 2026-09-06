@@ -2611,6 +2611,640 @@ fn render_message(console: &mut Console, msg: &midden_core::Message) {
     }
 }
 
+// ==================== BASICS — the everyday verbs, back in the table ==============================
+//
+// Peter, 2026-09-06: *"what about the basic shell commands that were removed"* / *"some of the
+// commands were 1 off tests we need basic commands back"*.
+//
+// WHAT WAS ACTUALLY REMOVED, precisely, because it changes what the fix is. `c7b12e23` ("shell: one
+// interpreter, and it is midden's") did NOT delete `help`, `echo`, `ver` or `gneiss` — it MOVED them
+// out of this file's `match` and into `midden_core`, where the command table lives, and they have
+// answered from there ever since. What the shell has never had is the other half of a usable
+// prompt: no way to search a file, count it, see how full the volume is, ask what a word means, see
+// what was typed, or wait. Those are added here, and two verbs that WERE lost are restored: `umv`
+// and `urmattr` shipped `#[cfg(aarch64)]` match arms that no table entry ever pointed at, so the
+// operator got "Unknown command" about commands this kernel carries (MIDDEN_CONVERGENCE's
+// one-for-one contract, violated in the direction nobody was checking).
+//
+// WHERE EACH VERB LIVES, per MIDDEN_CONVERGENCE §1(c). A verb belongs in `midden_core` when the
+// core can answer it in full — `exit` is there, because the honest answer is a sentence about what
+// the shell IS. Everything added below needs the volume, the block layer, the timebase or the
+// shell's own state, so each is `Plan::Host`: midden owns the parse and the wording, this file
+// performs the call. That is the same split `ls`/`cat`/`head` already sit on.
+//
+// ARCH-NEUTRAL BY DEFAULT (LAWS). Not one of these helpers carries a `target_arch` gate: they ride
+// `mount_read_volume` (the program source on every board), `crate::arch::ms()` (the arch-neutral
+// timebase both arches publish), and `midden_core` itself. The single exception is the NAMESPACE
+// line `df` prints, which reads `crate::fs::vfs` — a module `fs/mod.rs` compiles on aarch64 only,
+// so the call site cannot exist elsewhere. That is a capability gate on a module, the same one
+// `vfs_cat` carries, not an arch preference.
+
+/// BASICS: what the shell was told, oldest first. Bounded, drop-oldest, heap-only.
+///
+/// Recorded at the TOP of `dispatch_command`, before the line is planned, so the record is of what
+/// the operator typed and not of what the shell made of it — a typo is history too, which is the
+/// whole reason anyone reads a history. Empty lines are not recorded (they are not commands).
+///
+/// This is deliberately NOT `Console::history`, which is the SCROLLBACK (every output line the view
+/// is holding). Two different questions — "what did I type" vs "what is on screen" — and conflating
+/// them is why `history` could not simply read the console.
+static CMD_HISTORY: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// BASICS: how many command lines `history` retains. Small and fixed: this is a bench console, the
+/// store is heap, and a run-away paste must not be able to grow it without bound.
+const HISTORY_CAP: usize = 64;
+
+/// BASICS: the shell's variable store — `set` writes it, `env` reads it.
+///
+/// **Inert on purpose, and said so in `help`.** Nothing expands `$NAME` yet: expansion is a change
+/// to `midden_core`'s parser (M2), not to this file, and a store that silently did nothing while
+/// the help text implied substitution would be worse than no store. What it is good for today is
+/// what an operator at a bench actually uses it for — writing down a path, an address or a pid
+/// between commands, on a machine with no notepad.
+static ENV_VARS: spin::Mutex<Vec<(String, String)>> = spin::Mutex::new(Vec::new());
+
+/// BASICS: caps on the variable store. A shell variable is a convenience, not a database.
+const ENV_MAX_VARS: usize = 32;
+const ENV_MAX_NAME: usize = 32;
+const ENV_MAX_VALUE: usize = 256;
+
+/// BASICS: record one typed line in [`CMD_HISTORY`]. Called from `dispatch_command`'s first act.
+fn history_record(line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let mut h = CMD_HISTORY.lock();
+    if h.len() >= HISTORY_CAP {
+        h.remove(0);
+    }
+    h.push(String::from(line));
+}
+
+/// BASICS `history [n] [-c]`: the last `n` command lines (default: all retained), numbered from the
+/// oldest retained line so the numbers are stable while the ring is not full.
+///
+/// `history -c` clears the store and says how many it dropped — a count, not silence, because a
+/// clear that prints nothing is indistinguishable from a clear that did not run.
+fn history_cmd(console: &mut Console, args: &[&str]) {
+    if args.first() == Some(&"-c") {
+        let mut h = CMD_HISTORY.lock();
+        let n = h.len();
+        h.clear();
+        drop(h);
+        return console.println(&alloc::format!("history: cleared {} line(s)", n));
+    }
+    let want = args.first().and_then(|s| s.parse::<usize>().ok());
+    let h = CMD_HISTORY.lock().clone();
+    if h.is_empty() {
+        return console.println("history: nothing recorded yet");
+    }
+    let from = match want {
+        Some(n) => h.len().saturating_sub(n),
+        None => 0,
+    };
+    for (i, line) in h.iter().enumerate().skip(from) {
+        console.println(&alloc::format!("{:>5}  {}", i + 1, line));
+    }
+}
+
+/// BASICS `env`: the build's own facts first, then the shell variables.
+///
+/// The facts are READ LIVE at every call (cwd, uptime, the process cap) rather than snapshotted at
+/// boot, so `env` after a `cd` says where you are. The version string is not re-typed here — it is
+/// asked of `midden_core`, the one place that owns the shell's identity, so `ver` and `env` can
+/// never drift into printing two different versions of the same kernel.
+fn env_report(console: &mut Console) {
+    let facts = midden_facts();
+    let empty: &[&str] = &[];
+    let mut vol = midden_core::NameList(empty);
+    let ver = match midden_core::plan("ver", &facts, &mut vol) {
+        midden_core::Plan::Say(m) => String::from(m.text()),
+        _ => String::from("(unavailable)"),
+    };
+    let arch = if facts.aarch64 {
+        "aarch64"
+    } else if facts.x86 {
+        "x86_64"
+    } else {
+        "unknown"
+    };
+    console.println(&alloc::format!("ARCH={}", arch));
+    console.println(&alloc::format!("VER={}", ver));
+    console.println("SHELL=midden_core");
+    console.println(&alloc::format!("CWD={}", cwd_path()));
+    console.println(&alloc::format!("UPTIME_MS={}", crate::arch::ms()));
+    console.println(&alloc::format!("EXEC={}", if facts.exec { "on" } else { "off" }));
+    console.println(&alloc::format!(
+        "PROCS={}",
+        if facts.proc_verbs { facts.proc_rows } else { 0 }
+    ));
+    console.println(&alloc::format!("V3D={}", if facts.v3d { "on" } else { "off" }));
+    console.println(&alloc::format!("VUGDEMO={}", if facts.vugdemo { "on" } else { "off" }));
+    let vars = ENV_VARS.lock().clone();
+    if vars.is_empty() {
+        console.println("(no shell variables set — `set NAME VALUE` to add one)");
+        return;
+    }
+    for (k, v) in &vars {
+        console.println(&alloc::format!("{}={}", k, v));
+    }
+}
+
+/// BASICS `set [NAME [VALUE...]]` / `set -u NAME`: read, write and drop shell variables.
+///
+/// Shapes, all of them printing what happened rather than succeeding in silence:
+/// * `set` — list the variables (not the build facts; `env` is the one that shows both).
+/// * `set NAME` — print `NAME=value`, or say it is unset.
+/// * `set NAME VALUE...` — set it; the value is the rest of the line, spaces and all.
+/// * `set -u NAME` — remove it.
+///
+/// A name is restricted to ASCII alphanumerics and `_`, which is not fussiness: a name containing
+/// `=` or whitespace could never be read back unambiguously by the `$NAME` expansion M2 will add,
+/// so accepting one now would be writing a value nobody can ever reference.
+fn set_cmd(console: &mut Console, args: &[&str], rest: &str) {
+    if args.is_empty() {
+        let vars = ENV_VARS.lock().clone();
+        if vars.is_empty() {
+            return console.println("set: no shell variables (usage: set NAME VALUE)");
+        }
+        for (k, v) in &vars {
+            console.println(&alloc::format!("{}={}", k, v));
+        }
+        return;
+    }
+    if args[0] == "-u" {
+        let Some(name) = args.get(1) else {
+            return console.println("usage: set -u <NAME>");
+        };
+        let mut vars = ENV_VARS.lock();
+        let before = vars.len();
+        vars.retain(|(k, _)| k != name);
+        let gone = vars.len() != before;
+        drop(vars);
+        return console.println(&if gone {
+            alloc::format!("set: {} removed", name)
+        } else {
+            alloc::format!("set: {}: not set", name)
+        });
+    }
+    let name = args[0];
+    if name.len() > ENV_MAX_NAME
+        || name.is_empty()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return console.println(&alloc::format!(
+            "set: {}: bad name (ASCII letters, digits and _ only, max {})", name, ENV_MAX_NAME));
+    }
+    if args.len() == 1 {
+        let vars = ENV_VARS.lock().clone();
+        return match vars.iter().find(|(k, _)| k == name) {
+            Some((k, v)) => console.println(&alloc::format!("{}={}", k, v)),
+            None => console.println(&alloc::format!("set: {}: not set", name)),
+        };
+    }
+    // The value is the remainder of the line after the name, with its interior spacing preserved —
+    // the same rule `write`/`append` follow, so `set MSG hello  world` stores what was typed.
+    // `rest` arrives from `Plan::Host` already left-trimmed and `name` is its first token, so the
+    // slice below is exactly "everything after the name" and needs no search to find it.
+    let value = rest[core::cmp::min(name.len(), rest.len())..].trim();
+    if value.len() > ENV_MAX_VALUE {
+        return console.println(&alloc::format!(
+            "set: {}: value too long ({} > {} bytes)", name, value.len(), ENV_MAX_VALUE));
+    }
+    let mut vars = ENV_VARS.lock();
+    if let Some(slot) = vars.iter_mut().find(|(k, _)| k == name) {
+        slot.1 = String::from(value);
+    } else {
+        if vars.len() >= ENV_MAX_VARS {
+            drop(vars);
+            return console.println(&alloc::format!(
+                "set: refused — the variable store is full ({} max); `set -u NAME` frees a slot",
+                ENV_MAX_VARS));
+        }
+        vars.push((String::from(name), String::from(value)));
+    }
+    drop(vars);
+    console.println(&alloc::format!("{}={}", name, value));
+}
+
+/// BASICS `which <word>`: what does this word mean to the shell, right now, on THIS build?
+///
+/// It answers through `midden_core` rather than by looking at this file's `match`, and that is the
+/// point: verb-ness is per-build (`vug` is a verb on a `vugdemo` Pi and a program name everywhere
+/// else), so any second opinion assembled here would eventually disagree with the interpreter and
+/// send an operator hunting for a fault that is only in the help. Same table, same
+/// `Avail` filter, same resolver, same precedence — `which` cannot lie unless `plan` lies too.
+fn which_report(console: &mut Console, word: &str) {
+    let facts = midden_facts();
+    let canon = midden_core::canon_verb(word);
+    if midden_core::CORE_VERBS.contains(&canon.as_str()) {
+        return console.println(&alloc::format!("{}: shell built-in (answered by midden_core)", canon));
+    }
+    if midden_core::is_verb(&canon, &facts) {
+        return console.println(&alloc::format!("{}: kernel verb (serviced by the shell)", canon));
+    }
+    if facts.exec {
+        let mut vol = FatVolume;
+        if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
+            return console.println(&alloc::format!("{}: program {}", word, name));
+        }
+        return console.println(&alloc::format!("{}: not found (no verb, no program)", word));
+    }
+    console.println(&alloc::format!(
+        "{}: not a verb on this build (and this build cannot launch programs)", word));
+}
+
+/// BASICS `sleep <ms>`: wait, bounded twice over.
+///
+/// Two independent bounds, because either one alone is a hang. The DEADLINE (`arch::ms()`) is the
+/// one that normally ends the wait. The SPIN CAP is what ends it when the deadline never arrives:
+/// on x86 `ms()` is the local-APIC tick count, so a caller reached with interrupts masked would
+/// watch a frozen clock forever. When the cap is what fired, the verb SAYS SO rather than printing
+/// a plausible "slept 500 ms" — a sleep that silently did not sleep is the kind of thing a later
+/// timing bug gets blamed on for a week.
+///
+/// `core::hint::spin_loop()` and not `hlt`/`yield_now`: this runs in three different contexts
+/// (the x86 GUI inline loop, which is not a scheduled task; the Orin console pump; the Pi GUI
+/// channel task — see `selftest.rs` §context safety), and the spin hint is the only one of the
+/// three that is correct in all of them and needs no arch gate to say so.
+fn shell_sleep(console: &mut Console, ms: u64) {
+    const MAX_MS: u64 = 10_000;
+    const SPIN_CAP: u64 = 50_000_000;
+    let want = core::cmp::min(ms, MAX_MS);
+    if want != ms {
+        console.println(&alloc::format!("sleep: {} ms capped to {} ms", ms, MAX_MS));
+    }
+    let start = crate::arch::ms();
+    let mut spins: u64 = 0;
+    while crate::arch::ms().saturating_sub(start) < want && spins < SPIN_CAP {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let elapsed = crate::arch::ms().saturating_sub(start);
+    if elapsed < want {
+        return console.println(&alloc::format!(
+            "sleep: clock did not advance ({} of {} ms after {} spins) — no calibrated timebase here",
+            elapsed, want, spins));
+    }
+    console.println(&alloc::format!("slept {} ms", elapsed));
+}
+
+/// BASICS: how many bytes `grep` and `wc` will scan of one file before they stop and say so.
+///
+/// Sixteen times `head`'s ceiling: those verbs page a window, these ones answer a question ABOUT
+/// the whole file, and a count that quietly described the first 64 KiB would be a wrong answer
+/// rather than a short one. It is still a ceiling, and both verbs print the truncation note, so the
+/// reader is never left to assume.
+const SCAN_MAX: u32 = 1024 * 1024;
+
+/// BASICS: stream a file's bytes through `sink` in bounded windows, stopping at `SCAN_MAX`.
+///
+/// The shared spine under `wc` and `grep`. Returns the number of bytes actually delivered, so the
+/// caller can compare it against `de.size` and report truncation. Rides the offset-aware `read_at`
+/// exactly as `head` does — every access on the JD3 wall-clock BOT pump, so a stalled transfer is
+/// an `-EIO` and never a hang on the timerless kernel core.
+fn scan_file(
+    fs: &FatFs,
+    de: &DirEntry,
+    mut sink: impl FnMut(&[u8]),
+) -> Result<u32, FatError> {
+    const WINDOW: usize = 4096;
+    let (fc, size) = (de.first_cluster(), de.size);
+    let mut off = 0u32;
+    let mut buf: Vec<u8> = Vec::new();
+    while off < size && off < SCAN_MAX {
+        buf.clear();
+        fs.read_at(fc, size, off, &mut buf, WINDOW)?;
+        if buf.is_empty() {
+            break;
+        }
+        sink(&buf);
+        off += buf.len() as u32;
+    }
+    Ok(off)
+}
+
+/// BASICS: resolve one path argument to a readable FILE, or explain why not. The shared front half
+/// of `wc` and `grep`, wearing the caller's verb name so the error lines stay in house style.
+fn scan_target(console: &mut Console, verb: &str, arg: &str) -> Option<(FatFs, DirEntry, String)> {
+    let fs = mount_read_volume(console, verb)?;
+    match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
+        Ok(Resolved::Root) => {
+            console.println(&alloc::format!("{}: /: is a directory (-EISDIR)", verb));
+            None
+        }
+        Ok(Resolved::Entry(de, canon)) => {
+            if de.is_dir {
+                console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, canon));
+                return None;
+            }
+            Some((fs, de, canon))
+        }
+        Err(msg) => {
+            console.println(&alloc::format!("{}: {}", verb, msg));
+            None
+        }
+    }
+}
+
+/// BASICS: count lines, words and bytes over a byte run, carrying the word-boundary state across
+/// window edges.
+///
+/// `in_word` is an in/out parameter and not a local, which is the only interesting thing here: a
+/// word split across two 4 KiB reads must be counted ONCE, and a per-window counter would count it
+/// twice on every file larger than the window — a bug that never shows up on a small test file.
+///
+/// Definitions, matching `wc`: a LINE is a `\n` (so a file with no trailing newline reports one
+/// fewer line than it has visible rows, exactly as `wc` does); a WORD is a maximal run of
+/// non-whitespace; a BYTE is a byte, counted raw and never through `render_text` — the point of
+/// `wc -c` is the on-disk size, so a non-printable must not be normalised into a `.` first.
+fn wc_accumulate(data: &[u8], in_word: &mut bool, lines: &mut u64, words: &mut u64, bytes: &mut u64) {
+    for &b in data {
+        *bytes += 1;
+        if b == b'\n' {
+            *lines += 1;
+        }
+        let space = matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        if space {
+            *in_word = false;
+        } else if !*in_word {
+            *in_word = true;
+            *words += 1;
+        }
+    }
+}
+
+/// BASICS `wc [-l|-w|-c] <path>`: lines, words and bytes of one file.
+///
+/// With no flag all three are printed followed by the canonical path, the familiar layout. A single
+/// selector prints that one number and the path. Multiple selectors are accepted and print in the
+/// fixed l/w/c order rather than in the order typed — `wc` has never promised otherwise, and a
+/// column order that depended on the argument order would be unreadable in a capture.
+fn fs_wc(console: &mut Console, args: &[&str]) {
+    let mut want_l = false;
+    let mut want_w = false;
+    let mut want_c = false;
+    let mut path: Option<&str> = None;
+    for a in args {
+        if a.starts_with('-') && a.len() > 1 {
+            for ch in a[1..].chars() {
+                match ch {
+                    'l' => want_l = true,
+                    'w' => want_w = true,
+                    'c' => want_c = true,
+                    other => {
+                        return console.println(&alloc::format!(
+                            "wc: unknown flag -{} (usage: wc [-l|-w|-c] <path>)", other));
+                    }
+                }
+            }
+        } else if path.is_none() {
+            path = Some(a);
+        } else {
+            return console.println("usage: wc [-l|-w|-c] <path>  (one path)");
+        }
+    }
+    let Some(path) = path else {
+        return console.println("usage: wc [-l|-w|-c] <path>");
+    };
+    if !want_l && !want_w && !want_c {
+        want_l = true;
+        want_w = true;
+        want_c = true;
+    }
+    let Some((fs, de, canon)) = scan_target(console, "wc", path) else { return };
+    let (mut lines, mut words, mut bytes, mut in_word) = (0u64, 0u64, 0u64, false);
+    let res = scan_file(&fs, &de, |chunk| {
+        wc_accumulate(chunk, &mut in_word, &mut lines, &mut words, &mut bytes)
+    });
+    let scanned = match res {
+        Ok(n) => n,
+        Err(e) => {
+            return console.println(&alloc::format!(
+                "wc: {}: {} ({:?})", canon, fat_errno(e), e));
+        }
+    };
+    let mut out = String::new();
+    for (on, n) in [(want_l, lines), (want_w, words), (want_c, bytes)] {
+        if on {
+            out.push_str(&alloc::format!("{:>8}", n));
+        }
+    }
+    console.println(&alloc::format!("{}  {}", out, canon));
+    if (scanned as u64) < de.size as u64 {
+        console.println(&alloc::format!(
+            "[... counted {} of {} bytes; scan ceiling {}]", scanned, de.size, SCAN_MAX));
+    }
+}
+
+/// BASICS: does `line` match `pat`? FIXED STRING, with `^` and `$` as the only metacharacters.
+///
+/// **No regex, deliberately, and `help` says so in as many words.** There is no matcher in the tree
+/// to borrow (`glob_match` is a FILENAME glob — `*` there does not cross a `/`, and its semantics
+/// are wrong for line text), and a hand-rolled engine is not a shell verb, it is its own arc. The
+/// failure mode of pretending otherwise is silent and awful: a user types `grep 'foo.*bar'`, the
+/// shell matches it literally, finds nothing, and reports the file does not contain what it does
+/// contain. Two anchors cost four lines and cover most of what a bench operator wants; everything
+/// else is honestly absent.
+///
+/// A bare `^` is start-anchored-empty (every line matches, as `grep '^'` does); `^$` matches only
+/// empty lines. `ci` lower-cases both sides in ASCII only — the same rule `canon_verb` follows, and
+/// for the same reason: case folding must not change a string's length.
+fn grep_match(pat: &str, line: &str, ci: bool) -> bool {
+    let (pat, line) = if ci {
+        (pat.to_ascii_lowercase(), line.to_ascii_lowercase())
+    } else {
+        (String::from(pat), String::from(line))
+    };
+    let anchored_start = pat.starts_with('^');
+    let anchored_end = pat.ends_with('$') && pat.len() > 1;
+    let body = &pat[usize::from(anchored_start)..pat.len() - usize::from(anchored_end)];
+    match (anchored_start, anchored_end) {
+        (true, true) => line == body,
+        (true, false) => line.starts_with(body),
+        (false, true) => line.ends_with(body),
+        (false, false) => body.is_empty() || line.contains(body),
+    }
+}
+
+/// BASICS: the four `grep` flags, carried as one value so the emitter's signature stays readable
+/// and adding a fifth is one field rather than one more positional `bool` nobody can tell apart at
+/// the call site.
+struct GrepOpts {
+    ci: bool,
+    numbered: bool,
+    invert: bool,
+    count_only: bool,
+}
+
+/// BASICS: test one assembled line and print it if it counts. Split out of [`fs_grep`] so the
+/// streaming closure can call it while holding the console borrow — a closure that captured the
+/// console AND was called from inside another closure that captured it would not borrow-check.
+fn grep_emit(
+    console: &mut Console,
+    pat: &str,
+    line: &str,
+    lineno: u64,
+    opts: &GrepOpts,
+    hits: &mut u64,
+) {
+    if grep_match(pat, line, opts.ci) == opts.invert {
+        return;
+    }
+    *hits += 1;
+    if opts.count_only {
+        return;
+    }
+    if opts.numbered {
+        console.println(&alloc::format!("{}:{}", lineno, line));
+    } else {
+        console.println(line);
+    }
+}
+
+/// BASICS `grep [-i] [-n] [-v] [-c] <pattern> <path>`: print the lines of one file that match.
+///
+/// Flags are the four that earn their place at a bench: `-i` fold case, `-n` number the lines,
+/// `-v` invert the sense, `-c` print only the count. They combine (`-in`), and an unknown flag is a
+/// refusal rather than a silent literal — `grep -r foo F` must not quietly search for `foo` in one
+/// file and let the operator believe it recursed.
+///
+/// Lines are rendered by `head`'s rules (printable ASCII kept, everything else a `.`), so grepping
+/// a binary cannot corrupt the console and what is printed is what `cat` would have shown.
+fn fs_grep(console: &mut Console, args: &[&str]) {
+    let (mut ci, mut numbered, mut invert, mut count_only) = (false, false, false, false);
+    let mut positional: Vec<&str> = Vec::new();
+    for a in args {
+        if a.starts_with('-') && a.len() > 1 && positional.is_empty() {
+            for ch in a[1..].chars() {
+                match ch {
+                    'i' => ci = true,
+                    'n' => numbered = true,
+                    'v' => invert = true,
+                    'c' => count_only = true,
+                    other => {
+                        return console.println(&alloc::format!(
+                            "grep: unknown flag -{} (usage: grep [-i] [-n] [-v] [-c] <pattern> <path>)",
+                            other));
+                    }
+                }
+            }
+        } else {
+            positional.push(a);
+        }
+    }
+    if positional.len() != 2 {
+        return console.println("usage: grep [-i] [-n] [-v] [-c] <pattern> <path>");
+    }
+    let (pat, path) = (positional[0], positional[1]);
+    let opts = GrepOpts { ci, numbered, invert, count_only };
+    let Some((fs, de, canon)) = scan_target(console, "grep", path) else { return };
+    let mut cur = String::new();
+    let mut lineno: u64 = 0;
+    let mut hits: u64 = 0;
+    // STREAMED, not buffered. The obvious shape — collect every window into a `Vec<Vec<u8>>` and
+    // walk it afterwards — would hold a megabyte of file in the heap to print a handful of lines,
+    // on a kernel whose heap budget is the reason the console has a 256-line scrollback cap. The
+    // line assembly lives in this closure rather than in `scan_file` so `wc`, which never wants a
+    // `String`, does not pay for one.
+    let res = scan_file(&fs, &de, |chunk| {
+        for &b in chunk {
+            match b {
+                b'\n' => {
+                    lineno += 1;
+                    grep_emit(console, pat, &cur, lineno, &opts, &mut hits);
+                    cur.clear();
+                }
+                b'\r' => {}
+                0x20..=0x7e => cur.push(b as char),
+                _ => cur.push('.'),
+            }
+        }
+    });
+    let scanned = match res {
+        Ok(n) => n,
+        Err(e) => {
+            return console.println(&alloc::format!(
+                "grep: {}: {} ({:?})", canon, fat_errno(e), e));
+        }
+    };
+    // A last line with no trailing newline is a line; `cat` shows it, so `grep` must consider it.
+    if !cur.is_empty() {
+        lineno += 1;
+        grep_emit(console, pat, &cur, lineno, &opts, &mut hits);
+    }
+    if count_only {
+        console.println(&alloc::format!("{}", hits));
+    } else if hits == 0 {
+        console.println(&alloc::format!("grep: {}: no match in {} line(s)", canon, lineno));
+    }
+    if (scanned as u64) < de.size as u64 {
+        console.println(&alloc::format!(
+            "[... searched {} of {} bytes; scan ceiling {}]", scanned, de.size, SCAN_MAX));
+    }
+}
+
+/// BASICS `df` / `mount`: what volumes exist, how big they are, how much is in them, and whether
+/// they can be written.
+///
+/// **One verb, two spellings, and that is a decision.** On a POSIX box `df` and `mount` answer
+/// different halves of one question (how full / where attached) out of history, not design. This
+/// shell has one FAT volume and a mount table with a handful of prefixes, so splitting the answer
+/// would mean two commands that each show half of a six-line table. They share an arm, and `help`
+/// lists them together.
+///
+/// **`used` is a file-byte tally, not a free-cluster count, and the line says so.** fat.rs publishes
+/// no free-cluster total (`first_free_cluster` finds the first hole, which is not the same
+/// question), and adding one is a change to a filesystem core outside this arc's lane. So `used` is
+/// the recursive sum of every file's size — the number `du` prints for the root, computed by the
+/// same walker — and `free` is derived from it. That undercounts by the per-file slack up to one
+/// cluster, so the header names the method rather than letting a reader assume a block-accurate
+/// figure. A walk that fails mid-tree reports the partial tally and says which path stopped it.
+fn df_report(console: &mut Console) {
+    let Some(fs) = mount_read_volume(console, "df") else { return };
+    let kind = match fs.kind() {
+        crate::fs::fat::FatKind::Fat16 => "FAT16",
+        crate::fs::fat::FatKind::Fat32 => "FAT32",
+    };
+    let label = fs.label();
+    let label = if label.is_empty() { String::from("-") } else { label };
+    let total = fs.volume_bytes();
+    let mut stats = DuStats { files: 0, dirs: 0 };
+    let (used, note) = match du_subtree(&fs, 0, "", 0, &mut stats) {
+        Ok(n) => (n, None),
+        Err(msg) => (0u64, Some(msg)),
+    };
+    let free = total.saturating_sub(used);
+    let posture = match fs.write_veto() {
+        None => "read-write",
+        Some(why) => why,
+    };
+    console.println("Volume      Type    Label     Size(KiB)  Used(KiB)  Free(KiB)  Access");
+    console.println(&alloc::format!(
+        "{:<11} {:<7} {:<9} {:>9}  {:>9}  {:>9}  {}",
+        fs.source_name(), kind, label, total / 1024, used / 1024, free / 1024, posture));
+    console.println(&alloc::format!(
+        "cluster {} B, {} file(s), {} dir(s) — used = recursive file-byte tally, slack not counted",
+        fs.cluster_size(), stats.files, stats.dirs));
+    if let Some(msg) = note {
+        console.println(&alloc::format!("df: partial tally — {}", msg));
+    }
+    // NAMESPACE: the mount table's prefixes, the listing `MountTable::prefixes` was written for.
+    // `crate::fs::vfs` is compiled on aarch64 only (`fs/mod.rs`), so this call cannot exist on a
+    // build that has no mount table — the same module gate `vfs_cat` carries, not an arch opinion.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mt = vfs_mount_table();
+        let mut line = String::from("namespace:");
+        for p in mt.prefixes() {
+            line.push(' ');
+            line.push_str(p);
+        }
+        console.println(&line);
+    }
+}
+
 /// MIDDEN-M1 WITNESS (witness battery): prove, headlessly and on BOTH arches, that the console's
 /// interpreter is the shared core and that extension-elided resolution works.
 ///
@@ -2687,6 +3321,159 @@ pub fn midden_witness() {
     // publish, so every storage leg read `handles=global=absent sdhc=absent` and passed on all-false
     // inputs — vacuous on QEMU and on metal, forever. They now live in `fatverb_storage_witness`
     // below, called from the storage-ready service pass beside `fat::probe_once`.
+
+    // BASICS (orin 17): the everyday verbs get their own legs, in the same battery, on both arches.
+    shell_basics_witness();
+}
+
+// ==================== BASICS — the witness battery for the everyday verbs =========================
+//
+// WHY A FIXTURE AND NOT A TYPED TRANSCRIPT. The headless QEMU gates type nothing (`./arroyo test`,
+// `test-arm`, and `kernel8-test` without `UNAOS_K8_SCRIPT`), so a claim like "`help` prints" that
+// depends on a keystroke is not gated on any arch. These legs drive the SAME code the prompt drives
+// — `midden_core::plan`, `render_message`, and the verbs' own helpers — and assert what came out.
+//
+// WHAT MAKES THEM FALSIFIABLE. Not one leg compares an expression with itself. `basics.help` and
+// `basics.echo` capture REAL console output through a real `Console::set_output_sink`, so deleting
+// the `SHELL:` help line or breaking `render_message` reds them. `basics.wc` asserts counts against
+// literals AND asserts that a two-window split gives the same answer as one pass, which is the one
+// property a per-window counter would silently break. `basics.grep` asserts both senses of every
+// case, so a matcher stuck on `true` fails as loudly as one stuck on `false`. `basics.table`
+// compares the verb table against the words this file's `match` actually carries — the check whose
+// absence let `umv` and `urmattr` ship unreachable.
+
+/// BASICS: where a captured console's lines land. `Console::set_output_sink` takes a bare `fn`
+/// pointer (no captured state, by its own contract), so the buffer has to be a static.
+#[cfg(feature = "witness")]
+static WITNESS_CAPTURE: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// BASICS: the sink itself. Touches nothing but its own lock, which satisfies the sink contract's
+/// "must not call back into this `Console` and must hold no lock the call site could already hold".
+#[cfg(feature = "witness")]
+fn witness_sink(line: &str) {
+    WITNESS_CAPTURE.lock().push(String::from(line));
+}
+
+/// BASICS: run `f` against a throwaway console and return every line it printed.
+///
+/// The console is heap-only and dropped on return, exactly as `fatverb_storage_witness` does it, so
+/// the fixture's own output never reaches the operator's panel.
+#[cfg(feature = "witness")]
+fn witness_capture(f: impl FnOnce(&mut Console)) -> Vec<String> {
+    WITNESS_CAPTURE.lock().clear();
+    let mut c = Console::new();
+    c.set_output_sink(witness_sink);
+    f(&mut c);
+    let out = WITNESS_CAPTURE.lock().clone();
+    out
+}
+
+/// BASICS: the five legs. Called from `midden_witness`, so it runs wherever that runs — both
+/// arches, every headless gate — without a new call site in `main.rs`.
+#[cfg(feature = "witness")]
+fn shell_basics_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // --- table: the words this build's `match` carries are the words the table registers ---------
+    //
+    // Both directions. The basics must be verbs HERE (a table that forgot one sends the line to
+    // bare-name resolution and answers "Unknown command" about a verb the kernel carries), and the
+    // two unafs write verbs must be verbs on an aarch64 build (the defect this arc found: arms
+    // shipped, table silent). The aarch64 half is asserted against a SYNTHETIC fact set so the x86
+    // gate proves it too — the same trick `midden.resolve` uses to test elision on the Pi.
+    let facts = midden_facts();
+    let empty: &[&str] = &[];
+    let basics = ["grep", "wc", "df", "mount", "env", "set", "history", "sleep", "which"];
+    let mut missing = String::new();
+    for w in basics {
+        let mut vol = midden_core::NameList(empty);
+        if !matches!(midden_core::plan(w, &facts, &mut vol), midden_core::Plan::Host { .. }) {
+            missing.push(' ');
+            missing.push_str(w);
+        }
+    }
+    let arm = midden_core::Facts { aarch64: true, ..midden_core::Facts::bare() };
+    for w in ["umv", "urmattr"] {
+        if !midden_core::is_verb(w, &arm) {
+            missing.push(' ');
+            missing.push_str(w);
+        }
+    }
+    verdict(
+        "shell.basics.table",
+        missing.is_empty(),
+        &alloc::format!("unregistered:{}", if missing.is_empty() { " none" } else { &missing }),
+    );
+
+    // --- help: the command table describes itself, and the new classes are in the description ----
+    let lines = witness_capture(|c| {
+        let mut vol = midden_core::NameList(empty);
+        match midden_core::plan("help", &facts, &mut vol) {
+            midden_core::Plan::Say(m) => render_message(c, &m),
+            other => c.println(&alloc::format!("help did not reach the core: {:?}", other)),
+        }
+    });
+    let has_shell = lines.iter().any(|l| l.starts_with("SHELL:"));
+    let has_text = lines.iter().any(|l| l.starts_with("TEXT:"));
+    let has_df = lines.iter().any(|l| l.contains("df | mount"));
+    verdict(
+        "shell.basics.help",
+        lines.len() > 20 && has_shell && has_text && has_df,
+        &alloc::format!("lines={} shell={} text={} df={}", lines.len(), has_shell, has_text, has_df),
+    );
+
+    // --- echo: the core answers, and the ring renders exactly what it answered ------------------
+    let lines = witness_capture(|c| {
+        let mut vol = midden_core::NameList(empty);
+        match midden_core::plan("echo hi there", &facts, &mut vol) {
+            midden_core::Plan::Say(m) => render_message(c, &m),
+            other => c.println(&alloc::format!("echo did not reach the core: {:?}", other)),
+        }
+    });
+    verdict(
+        "shell.basics.echo",
+        lines.len() == 1 && lines[0] == "hi there",
+        &alloc::format!("{:?}", lines),
+    );
+
+    // --- wc: the counts, and the window-split invariant ----------------------------------------
+    //
+    // `SAMPLE` is chosen so every field is a different number (2 lines, 4 words, 19 bytes) — three
+    // counters that all read 4 would let a wire-crossing pass. The split point falls INSIDE the
+    // word `two`, which is the case a per-window counter double-counts.
+    const SAMPLE: &[u8] = b"one two\nthree four\n";
+    let (mut l1, mut w1, mut b1, mut iw1) = (0u64, 0u64, 0u64, false);
+    wc_accumulate(SAMPLE, &mut iw1, &mut l1, &mut w1, &mut b1);
+    let (mut l2, mut w2, mut b2, mut iw2) = (0u64, 0u64, 0u64, false);
+    wc_accumulate(&SAMPLE[..5], &mut iw2, &mut l2, &mut w2, &mut b2);
+    wc_accumulate(&SAMPLE[5..], &mut iw2, &mut l2, &mut w2, &mut b2);
+    verdict(
+        "shell.basics.wc",
+        (l1, w1, b1) == (2, 4, 19) && (l2, w2, b2) == (l1, w1, b1),
+        &alloc::format!("one_pass={:?} split={:?}", (l1, w1, b1), (l2, w2, b2)),
+    );
+
+    // --- grep: substring, both anchors, case folding, and every one of them in both senses ------
+    let g = [
+        (grep_match("two", "one two three", false), true),
+        (grep_match("TWO", "one two three", false), false),
+        (grep_match("TWO", "one two three", true), true),
+        (grep_match("^one", "one two three", false), true),
+        (grep_match("^two", "one two three", false), false),
+        (grep_match("three$", "one two three", false), true),
+        (grep_match("two$", "one two three", false), false),
+        (grep_match("^one two three$", "one two three", false), true),
+        (grep_match("^one two$", "one two three", false), false),
+        (grep_match("", "anything", false), true),
+    ];
+    let bad = g.iter().filter(|(got, want)| got != want).count();
+    verdict("shell.basics.grep", bad == 0, &alloc::format!("{} of {} cases wrong", bad, g.len()));
 }
 
 // ===================== FATVERB — the storage witness, after storage exists =========================
@@ -2887,6 +3674,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // What is still deferred is stated plainly rather than implied: the FAT/VFS/net/process verbs
     // remain kernel-side implementations reached through `Plan::Host`. See
     // docs/dev/USERLAND/MIDDEN_CONVERGENCE.md §2 for the split and what M2 moves.
+    // BASICS: the history record is the FIRST act, ahead of the planner, so what is retained is
+    // what the operator typed — including the line the shell is about to refuse. A record taken
+    // after `plan` would hold only the commands that worked, which is the opposite of what anyone
+    // reads a history for.
+    history_record(cmd_line);
     let facts = midden_facts();
     let mut vol = FatVolume;
     let plan = midden_core::plan(cmd_line, &facts, &mut vol);
@@ -3177,6 +3969,51 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     }
                 }
                 None => console.println("uptime: no calibrated counter on this arch"),
+            }
+        },
+        // ---- BASICS (orin 17) ------------------------------------------------------------------
+        // Peter, 2026-09-06: "we need basic commands back". Nine service arms, every one of them
+        // `Avail::Always` in `midden_core::HOST_VERBS` and free of a `target_arch` gate, so the
+        // words mean the same thing on the rMBP, the Pi and the Orin. The helpers they call live
+        // in the BASICS section above `midden_witness`.
+        "grep" => {
+            // Fixed-string search over one file, with ^/$ anchors and -i/-n/-v/-c. Deliberately
+            // not a regex — see `grep_match` for why a literal match of `.*` is worse than none.
+            fs_grep(console, &args);
+        },
+        "wc" => {
+            // Lines, words and bytes of one file; -l/-w/-c select, and they combine.
+            fs_wc(console, &args);
+        },
+        "df" | "mount" => {
+            // One table for both spellings: capacity, used, free, access, and (where a mount table
+            // exists) the namespace prefixes. `used` is a file-byte tally and the output says so.
+            df_report(console);
+        },
+        "env" => {
+            // The build's live facts, then the shell variables. No `$VAR` expansion yet (M2).
+            env_report(console);
+        },
+        "set" => {
+            // `set` / `set NAME` / `set NAME VALUE...` / `set -u NAME`.
+            set_cmd(console, &args, &rest);
+        },
+        "history" => {
+            // The last n typed lines, numbered; `history -c` clears and says how many it dropped.
+            history_cmd(console, &args);
+        },
+        "sleep" => {
+            // Bounded twice: a deadline on `arch::ms()` and a spin cap for a clock that is frozen.
+            match args.first().and_then(|s| parse_num(s)) {
+                Some(ms) => shell_sleep(console, ms),
+                None => console.println("usage: sleep <ms>  (decimal or 0x-hex, capped at 10000)"),
+            }
+        },
+        "which" => {
+            // Verb, program, or neither — answered through `midden_core`, never re-derived here.
+            match args.first() {
+                Some(word) => which_report(console, word),
+                None => console.println("usage: which <word>"),
             }
         },
         "stat" => {

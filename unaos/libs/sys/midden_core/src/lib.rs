@@ -190,7 +190,13 @@ impl Facts {
 /// These are the shell's own words: what it is, what it knows, and echoing back
 /// what it was told. Everything else needs a filesystem, a NIC, a scheduler or
 /// a screen, and is therefore [`Plan::Host`].
-pub const CORE_VERBS: &[&str] = &["help", "echo", "ver", "version", "gneiss"];
+/// BASICS (orin 17): `exit`/`quit` are here and not in the ring because the
+/// honest answer to them is a *sentence about what the shell is*, and that is
+/// the core's own subject. There is no parent process to return to — the
+/// framebuffer console IS the shell (shell_philosophy §5) — so the word must
+/// neither be swallowed as "Unknown command" (a lie: it is a command everyone
+/// knows) nor silently reboot the machine. It says what to type instead.
+pub const CORE_VERBS: &[&str] = &["help", "echo", "ver", "version", "gneiss", "exit", "quit"];
 
 /// When a host verb exists.
 ///
@@ -267,6 +273,15 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("uwrite", Avail::Aarch64), ("umkdir", Avail::Aarch64), ("urm", Avail::Aarch64),
     ("usnaps", Avail::Aarch64), ("usnap", Avail::Aarch64), ("usnapdrop", Avail::Aarch64),
     ("usnapls", Avail::Aarch64), ("usnapcat", Avail::Aarch64),
+    // BASICS (orin 17): UNREACHABLE UNTIL NOW. `umv` and `urmattr` have full `#[cfg(aarch64)]`
+    // match arms in `shell.rs` (the F2 unafs rename/move and typed-attribute removal) and were
+    // never entered in this table, so `is_verb` said no, the line fell through to bare-name
+    // resolution, and the operator got "Unknown command" about two commands the kernel carries.
+    // That is the exact failure mode `Facts`'s doc warns of, running in the other direction: not a
+    // verb advertised without an arm, but an arm shipped without a verb. The one-for-one contract
+    // above is only a contract if it is checked in both directions — the ring's witness now does
+    // (`shell.basics.table`).
+    ("umv", Avail::Aarch64), ("urmattr", Avail::Aarch64),
     // block / device
     ("diskinfo", Avail::Always), ("usbinfo", Avail::Always), ("fatinfo", Avail::Always),
     ("read", Avail::Always),
@@ -293,6 +308,16 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // processes
     ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
+    // BASICS (orin 17, Peter: "some of the commands were 1 off tests we need basic commands
+    // back"). The everyday words a prompt is unusable without. Every one is `Plan::Host` and not
+    // core-answered, because each needs something only the ring has: `grep`/`wc` need the volume,
+    // `df`/`mount` the block layer and the mount table, `env` the build's own facts, `history` the
+    // shell's dispatch record, `sleep` the timebase, `which` the resolver over a real volume.
+    // `Avail::Always` throughout: these are ONE-OS words (the law `reboot` and `screenshot` are
+    // registered under) — the platform decides what the answer is, never whether the word exists.
+    ("grep", Avail::Always), ("wc", Avail::Always), ("df", Avail::Always),
+    ("mount", Avail::Always), ("env", Avail::Always), ("set", Avail::Always),
+    ("history", Avail::Always), ("sleep", Avail::Always), ("which", Avail::Always),
 ];
 
 /// The canonical (lower-case) spelling of a typed word.
@@ -510,6 +535,17 @@ fn answer(word: &str, args: &[&str], facts: &Facts) -> Message {
         "gneiss" => Message::TerminalOutput("Gneiss is Home.".to_string()),
         "echo" => Message::TerminalOutput(args.join(" ")),
         "help" => Message::TerminalOutput(help(facts)),
+        // BASICS (orin 17). `TerminalOutput`, not `TerminalError`: the user typed a real command
+        // and got a real answer, so the refusal wording and the error channel would both be
+        // wrong. What is refused is the ACTION, and there is no action — there is no parent shell
+        // and no session to close, because this console is the shell. Naming `shutdown` and
+        // `reboot` here is the whole value of the verb: those are the two words that do what
+        // someone typing `exit` at the last prompt of the day actually wants.
+        "exit" | "quit" => Message::TerminalOutput(
+            "this console IS the shell — there is nothing to exit to. \
+             Use `shutdown` to power off, `reboot` to restart, `clear` to blank the screen."
+                .to_string(),
+        ),
         // `plan` only routes CORE_VERBS here, so this arm is unreachable; it
         // exists so adding a name to CORE_VERBS without an arm is a visible
         // refusal rather than a silent nothing.
@@ -526,10 +562,21 @@ fn answer(word: &str, args: &[&str], facts: &Facts) -> Message {
 pub fn help(facts: &Facts) -> String {
     let mut l: Vec<String> = Vec::new();
     macro_rules! say { ($s:expr) => { l.push(($s).to_string()) }; }
-    say!("COMMANDS: ver, help, clear, echo, panic, gneiss");
+    say!("COMMANDS: ver, help, clear, echo, panic, gneiss, exit");
+    // BASICS (orin 17): the shell's own state, listed with the shell's own words rather than
+    // scattered among the subsystems that own the rest of the table.
+    say!("SHELL:    which <word>  (verb? program? neither), history [n] [-c], sleep <ms>");
+    say!("          env  (build facts + shell variables), set [NAME [VALUE]] | set -u NAME");
+    say!("          (no $VAR expansion yet — the store is readable by `env`; expansion is midden M2)");
     say!("STORAGE:  diskinfo, usbinfo, read <lba>, write <lba> <byte>");
+    say!("          df | mount  (volumes: capacity, used, free, mount point, posture)");
     say!("FILES:    fatinfo (FAT geometry), ls [-l] [dir], cd [dir], pwd, cat <path>");
     say!("PAGING:   head <path> [n], tail <path> [n]  (first / last n lines, default 10)");
+    // BASICS (orin 17): the two text verbs. `grep`'s pattern is a FIXED STRING with ^/$ anchors —
+    // said here in as many words, because a help line that says "pattern" invites a regex the
+    // shell does not carry, and a silent literal match of `.*` is worse than a refusal.
+    say!("TEXT:     grep [-i] [-n] [-v] [-c] <pattern> <path>  (fixed string; ^ and $ anchor)");
+    say!("          wc [-l|-w|-c] <path>  (lines, words, bytes)");
     say!("WRITE:    touch <path>, write <path> <text>, append <path> <text>, rm [-r] [-f] <path>");
     say!("DIRS:     mkdir <path>, rmdir <path>  (create / remove empty directories)");
     say!("VFS:      vfs write|append|rm|mkdir <path> [text]  (unified namespace: / native, /fat FAT)");
@@ -550,6 +597,8 @@ pub fn help(facts: &Facts) -> String {
     if facts.aarch64 {
         say!("UNAFS:    uls [path], ucat <path>  (native unafs volume, absolute paths)");
         say!("          utouch <path>, uwrite <path> <text>, umkdir <path>, urm <path>  (write-through)");
+        // BASICS (orin 17): advertised for the first time — the arms shipped, the table did not.
+        say!("          umv <src> <dst>, urmattr <path> <key>  (rename/move; drop a typed attribute)");
     }
     say!("          usnaps, usnap <name>, usnapdrop <gen>  (retained roots / snapshots)");
     if facts.aarch64 {
@@ -779,6 +828,44 @@ mod tests {
         let mut v = NameList(&["SS.ELF", "FI.ELF"]);
         assert_eq!(resolve_exec("ß", &mut v), None);
         assert_eq!(resolve_exec("\u{fb01}", &mut v), None);
+    }
+
+    /// BASICS (orin 17): the words Peter asked for are verbs on EVERY build, they route to the
+    /// ring rather than being answered here, and they carry their arguments through untouched.
+    /// A build-conditional basic would be the bug this asserts against — `wc` must not be a verb
+    /// on the Pi and a program name on the rMBP.
+    #[test]
+    fn the_basics_are_verbs_everywhere() {
+        for f in [Facts::bare(), Facts { aarch64: true, ..Facts::bare() },
+                  Facts { x86: true, exec: true, ..Facts::bare() }] {
+            for w in ["grep", "wc", "df", "mount", "env", "set", "history", "sleep", "which"] {
+                assert!(is_verb(w, &f), "{} is not a verb on {:?}", w, f);
+                assert!(
+                    matches!(plan(w, &f, &mut vol()), Plan::Host { .. }),
+                    "{} must route to the ring, not be answered in-core", w
+                );
+            }
+            // `exit` is the exception, and deliberately: the core answers it in full.
+            let Plan::Say(m) = plan("exit", &f, &mut vol()) else { panic!("exit") };
+            assert!(m.text().contains("shutdown"), "exit must name the verb that does the thing");
+            assert_eq!(m.kind(), "TerminalOutput", "a known command is not an error");
+        }
+        // Arguments survive the trip, including flags and a pattern with spaces around it.
+        assert_eq!(
+            plan("grep -i  needle  DOCS/HAY.TXT", &Facts::bare(), &mut vol()),
+            Plan::Host { verb: "grep".to_string(), rest: "-i  needle  DOCS/HAY.TXT".to_string() }
+        );
+    }
+
+    /// BASICS (orin 17): the two aarch64 unafs verbs whose match arms shipped without a table
+    /// entry, so `umv`/`urmattr` refused as unknown for the whole time they existed.
+    #[test]
+    fn the_unafs_write_verbs_are_registered() {
+        let arm = Facts { aarch64: true, ..Facts::bare() };
+        for w in ["umv", "urmattr"] {
+            assert!(is_verb(w, &arm), "{} has an aarch64 match arm and must be a verb there", w);
+            assert!(!is_verb(w, &Facts { x86: true, ..Facts::bare() }), "{} is aarch64-only", w);
+        }
     }
 
     #[test]
