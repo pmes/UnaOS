@@ -1600,7 +1600,7 @@ impl Screen {
             // return to the desktop on the very next present and the dropdown's own dismissal erase
             // (`strip::erase_rect`, from `crystal::compose`) is what clears the glass — the same
             // vacate contract the strips keep, obtained from the same kind of accessor.
-            if let Some(m) = super::crystal::open_rect(self.info.width, self.info.height) {
+            if let Some(m) = super::menubar::open_dropdown_rect(self.info.width, self.info.height) {
                 if m.2 != 0 && m.3 != 0 && n < occ.len() {
                     occ[n] = m;
                     n += 1;

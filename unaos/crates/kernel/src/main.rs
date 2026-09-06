@@ -2251,7 +2251,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                         // the pads down, so they arrive live and the RMW was dead code.)
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
-                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe1")] unaos_kernel::arch::ga10b_probe::ga10bprobe1_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE1 (UNAOS_GA10B_PROBE1=1, default OFF) — the first read-only GA10B iGPU probe rung: it borrows the SAME `chan` `jb1b_ping` established (BPMP-first: the rail gate that earns the first BAR0 read cannot be asked without it), reads the risk-ordered register list announce-first, and ENDS THE BOOT in PSCI SYSTEM_OFF (`power::shutdown`) per the cold-boot bench law — so it never returns and no later boot phase runs on a probe flight. Its own media by design (co-arming with other tegra knobs is not a supported flight). Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
+                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe2")] unaos_kernel::arch::ga10b_probe::ga10bprobe2_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe3")] unaos_kernel::arch::ga10b_probe::ga10bprobe3_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe1")] unaos_kernel::arch::ga10b_probe::ga10bprobe1_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE1 (UNAOS_GA10B_PROBE1=1, default OFF) — the first read-only GA10B iGPU probe rung: it borrows the SAME `chan` `jb1b_ping` established (BPMP-first: the rail gate that earns the first BAR0 read cannot be asked without it), reads the risk-ordered register list announce-first, and ENDS THE BOOT in PSCI SYSTEM_OFF (`power::shutdown`) per the cold-boot bench law — so it never returns and no later boot phase runs on a probe flight. Its own media by design (co-arming with other tegra knobs is not a supported flight). Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE2 (UNAOS_GA10B_PROBE2=1, default OFF; a SIBLING knob, not a dependent) — rung 2 of the GA10B ladder (docs/dev/evidence/orin14/GA10B-LADDER.md): BPMP power-on + clock-enable of the gpu@ node's domain and clocks, one PMC_BOOT_0 read behind an explicit pg=ON readback, symmetric restore, and it RETURNS — so it sits BEFORE rung 1's call (a co-armed image runs rung 2 then rung 1's SYSTEM_OFF; the rung-2 flight arms rung 2 alone and boots through to the desktop). Appended to this line, never a new one. GA10B-PROBE3 (UNAOS_GA10B_PROBE3=1 for rung 3 alone, =2 for rung 3 + rung 3b; default OFF; a THIRD sibling knob) — rungs 3 and 3b of the same ladder: the SAME BPMP power+clock bracket rung 2 proved, then the read-only pass over what the platform firmware left behind (fuses -> MC -> TOP -> GSP falcon v1 -> GSP priscv BCR -> PMU falcon2, the one new read aperture, LAST), and under `ga10bprobe3b` the ladder's FIRST GA10B MMIO WRITES (GSP engine reset assert/deassert, then one MAILBOX0 scratch write) — then symmetric restore and it RETURNS, like rung 2. It sits between rung 2's call and rung 1's for the same reason rung 2 does: rung 1's SYSTEM_OFF must never run in front of a rung that has to reach the desktop.
             }
         }
         None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
@@ -2368,7 +2368,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // (QEMU models no Tegra234 SDMMC). Compiled out knob-off => byte-identical to baseline. See
     // arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
     #[cfg(all(feature = "sdmmc", feature = "tegra"))]
-    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask);
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask); #[cfg(all(feature = "sdmmcwrite", feature = "tegra"))] unaos_kernel::arch::sdmmc_tegra::sdmmc_write_probe(); #[cfg(all(feature = "sdmmcroot", feature = "tegra"))] unaos_kernel::arch::sdmmc_tegra::sdmmc_root_probe_early(); // SDMMCWRITE (orin 14): the gap-#3 write probe — ONE CMD24 to a proven-free scratch sector + CMD17 read-back, directly after the census that published the card; appended to THIS line for knob-off byte identity (no line moves). See docs/dev/evidence/orin14/SDMMCWRITE.md. AND ROOTFS (orin 16, A28): the VFS-root probe, appended to the same line for the same reason — it mounts nothing (the mount table is built per verb, in shell::vfs_mount_table), it only asks HERE, where the census has just proved the window, whether the card carries a FAT volume, so a first flight can tell an unmountable medium from a later context that cannot reach the card.
 
     // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
     // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and
@@ -2492,7 +2492,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // xHCI rings/contexts/buffers are live, and the enumerating port is flagged — so a decoded
             // RAS fault ADDR can be matched from the capture alone. No-op with the knob off.
             unaos_kernel::vugras::boot_witness();
-            unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0);
+            #[cfg(not(feature = "deskcascade"))] unaos_kernel::arch::sched::spawn("jd2-console", jd2_console_pump, 0, 0); #[cfg(feature = "deskcascade")] unaos_kernel::arch::sched::spawn_stack("jd2-console", jd2_console_pump, 0, 0, TEGRA_JD2_STACK_SIZE); #[cfg(feature = "tcuprobe")] unaos_kernel::arch::hsp_tegra::tcuprobe_arm(dtb_addr, dtb_size, mmu.ram_gib_mask); // REALDESK-SHELLWIN (A19) — SIZED stack on the cascade knob: phase 2 then mints the shell's own `wm` row and presents it, and `wm::create_at` / `present_outcome_owned` composite from THIS task's stack (orin-render measured `hw=23232` > 16 KiB on the same chain, render4 `[u7stk] orin-render:pass1`), so the knob-on size is 32 KiB (`TEGRA_JD2_STACK_SIZE`, file tail — the `[u7stk] jd2-console:shell-present` line is its measurement); knob-off the statement is the original `spawn` verbatim. ⚠ LINE-NEUTRAL fold.
             serial_println!(":: tegra: JD2 — EL1 console pump task spawned (boot core) ::");
         }
         // XCARVE-2 temporal bracket: after the JB2b xHCI attach + enumeration window (the event-ring/ERST
@@ -2871,19 +2871,19 @@ fn jd2_console_pump(_arg: usize) {
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
     if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch — from here the console owns the glass, so a cube repainted away is the design, not a defect, and the census says RAST-SUPERSEDED-BY-CONSOLE instead of RAST-PAINTED-OVERWRITTEN. Placed on the FIRST statement of phase 2 and outside the conwin guard: the console takes the panel on both routes, only the detach differs. ⚠ LINE-NEUTRAL append. // ORIN-CONWIN rung 4 — the detach is GUARDED BY THE ROUTE, exactly as the Pi's GUI handoff guards it (`main.rs`'s CONSWIN-PI line). `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the panel — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the ONE thing this detach exists to guarantee (exactly one writer on the panel while the JD2 Screen console owns it) is already true, and skipping it leaves the console window LIVE instead of freezing it with the boot log. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof.
-    let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    let mut screen = unaos_kernel::video::Screen::new(front_fb); let mut shellwin = tegra_shell_window_open(&mut screen); // REALDESK-SHELLWIN (A19) — on the CASCADED scene (bar enabled AND console routed) the shell gets its own `wm` row here and the PANEL Screen is seeded `DESKTOP_BG`; `None` on every other boot (and knob-off, `#[inline(always)] None`), where the shell keeps the backdrop exactly as before. WHY: render4's SCREEN0.PNG carried this console's banner + prompt at the panel's top-left (y 46..89, x 12..495) — `console.draw` below clears the whole back buffer to `Console::BG` (== `wm::DESKTOP_BG`) and draws text, and `pal.render` flushed that through the occluder walk onto the desktop the cascade had just cleared (log order: `[deskcascade] -> CASCADED` THEN `JD2 — EL1 console pump live` THEN `JD4 — console OWNS the panel`). Not residue: a post-cascade repaint, every keystroke. ⚠ LINE-NEUTRAL fold. Helpers at file tail.
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&screen);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
-    let mut console = unaos_kernel::console::Console::new();
+    let mut console = unaos_kernel::console::Console::new(); tegra_shell_mark(&mut console, &shellwin); let shell_id = tegra_shell_id(&shellwin); let mut spal = tegra_shell_pal(&mut shellwin); // REALDESK-SHELLWIN (A19) — the shell's pal: `Some` over the window's `Screen::direct` surface on the scene (the console drops its menu-bar reservation, `mark_in_window`), `None` otherwise; every `console.draw`/`handle_key` below goes through `tegra_shell_pick(&mut spal, &mut pal)`, which is `pal` itself when `spal` is `None`. `pal` (the panel Screen) stays the cursor's — unchanged. ⚠ LINE-NEUTRAL fold.
     // JD11: mirror every command-output line to serial so an attended Orin bench captures a durable,
     // mbench-able transcript (the panel has no scrollback; before JD11 only keystrokes echoed to
     // serial). Installed before the banner so the shell-entry lines head the transcript too.
     console.set_output_sink(jd2_out_sink);
     console.println("UnaOS — Jetson Orin Nano (Tegra234)");
     console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
-    console.draw(&mut pal);
-    pal.render();
+    console.draw(tegra_shell_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19) — the banner goes to the shell surface (window on the scene, panel otherwise). ⚠ LINE-NEUTRAL fold.
+    tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19) — `pal.render()` verbatim (knob-off identical) + on the scene the window flush and its owner-fenced `wm` present; this first panel flush is the seeded DESKTOP_BG through the occluder walk — the band clear. ⚠ LINE-NEUTRAL fold.
     match first_key {
         Some(c) => {
             serial_println!( // ORINPATH — `path=` names WHICH phase-2 printed this, and until this arc nothing did. `jd2_supstate_phase2` carries a verbatim copy of these two literals; on a `supstate` build both copies pass `#[cfg]`, so neither a serial capture nor a grep of the artifact could attribute the line to a site. See the twin's comment for the MEASURED shape of that ambiguity at 0ed6fee2. Token deliberately longer than 8 bytes — a shorter mark can be LLVM-immediate-encoded and never appear in `.rodata`, defeating the artifact grep. Placed AFTER "console OWNS the panel" so `scripts/specs/jetson-sync1.spec` / `jetson-jd5.spec`'s `REQUIRE JD4.*console OWNS the panel` still matches.
@@ -2891,8 +2891,8 @@ fn jd2_console_pump(_arg: usize) {
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-            handle_key(c, &mut console, &mut pal);
-            pal.render();
+            handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
+            tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
         }
         None => serial_println!(
             ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::"
@@ -2945,8 +2945,8 @@ fn jd2_console_pump(_arg: usize) {
                         serial_println!(":: tegra: JD2 — KEY {:#04x} ::", c);
                     }
                     needs_render = true;
-                    key_repainted = true; #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } // TABKEY — THE MISSING SHELL HALF OF THE FOCUS RING. `wc_focus_key` has always been reachable on tegra through the IN-RING door (`user_input_enqueue` asks it at syscall.rs's router seam, and `orininput`'s `oi_pump` drives that seam), but the SHELL door — the one that fires while `USER_INPUT_ACTIVE == 0`, which is this board's normal state — had NO CALLER AT ALL, because `main.rs`'s two `wc_shell_focus_key` sites both live inside `pump_usb_into_gui`, `cfg(all(aarch64, baremetal))`, and `baremetal` implies `pi` while `pi` + `tegra` is a hard `compile_error!`. So on the Orin <TAB> fell straight through to `handle_key`, which has no byte-9 arm, and was silently dropped. MEASURED on metal (`~/unaos-bench/capture/line-acm0/`): `orin.log` carries 5x `:: tegra: JD2 — KEY 0x09 ::` at :13071-13080 and ZERO `[wc-c] focus tab-cycle`; the Pi control `pi.log`, same tool and directory, has 249. The serial echo above is deliberately left AHEAD of this call so the pairing stays scoreable from a capture — a fixed board reads `KEY 0x09` immediately followed by `[wc-c] focus tab-cycle`, a regressed one reads `KEY 0x09` alone, which is exactly what the Orin capture reads today. `wc_shell_focus_key` and not `wc_focus_key`, because this pump IS the Orin's shell drain: it returns false the moment an EL0 program holds focus, leaving the in-ring case to the router seam that already owns it — one body, two doors, one witness, which is the Pi's arrangement verbatim. `continue` where the Pi's bare-shell drain `break`s: that loop's destination is fixed at `gui_send`, so a moved focus invalidates the rest of its drain, whereas this loop's destination is `handle_key` on the backdrop console, which this pump feeds REGARDLESS of focus anyway (`xusb_tegra.rs`'s defect-2 note, out of this arc's scope) — so breaking would only re-deliver the same events to the same place one pass later. Gated `tegra_el0` because `arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which a bare `tegra` image does not carry; the knob-off tegra media is therefore byte-identical, which is why this is FOLDED onto the statement above and given no line of its own — panic `Location` records embed line numbers and a line added anywhere in this file breaks that proof.
-                    if handle_key(c, &mut console, &mut pal) {
+                    key_repainted = true; #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } // QUARRYDOOR (KEYDOORS F1) — QUARRY'S WHOLE KEYBOARD HAD ONE CALLER AND IT WAS THE EL0 RING DOOR. `quarry::key_route` — <Esc> closes the file manager, `0x1C`..`0x1F` move the selection, <Enter> opens, Backspace goes up, `r` re-reads, and `Event::Wheel` scrolls — was asked ONLY at `arch/aarch64/syscall.rs:13211`, which fires while `USER_INPUT_ACTIVE != 0`. On the Orin that is never: this pump IS the board's key drain and its normal state is focus 0. And Quarry is ON THE GLASS AT BOOT on a `desktop_firmware`+`quarry` Orin image — `video/desktop_firmware.rs:394` runs `quarry::open()` as step 6 of `activate()`, and `main.rs`'s `tegra_quarry_seat` calls `request_open()` — so the file manager shipped with every arrow key falling past it into `handle_key`, and NO WAY TO CLOSE IT FROM THE KEYBOARD. Exactly TABKEY's defect and A10's defect, a third time, in this same statement: one body, two doors, only the ring door wired. Ordered AFTER `strip::key_escape` because a bar/SHARD menu composites ABOVE Quarry's window and the modal surface must win, and BEFORE `wc_shell_focus_key` because an open file manager eats its own arrows before the focus ring sees them; that is x86's order in `wc_route_event` and the aarch64 router's order in `user_input_enqueue`. NO focus guard is needed at the call site and adding one would be wrong: `key_route` self-guards on `on_glass()` (`video/quarry/live.rs:1651` — a live `WIN` id whose `z` is above `wm::shell_z()`), so with Quarry closed or buried it returns false and the shell keeps every arrow it has today. Gated `desktop_firmware` because `video/mod.rs:685` gates `pub mod quarry;` on it; the `UNAOS_QUARRY` knob is handled INSIDE the seam (`video/quarry.rs:47` is `#[inline(always)] false` knob-off) precisely so a folded call needs no second `cfg`. ⚠ FOLDED, and CODE-BEFORE-COMMENT per F0's rule on this line. // A10FIX (KEYDOORS F0) — THE A10 FOLD COMMENTED TABKEY OUT, AND ONLY A COLUMN-AWARE READ OF THIS LINE CAN SEE IT. `b768331a` folded `strip::key_escape` onto this statement and then wrote its prose at column 139 — AHEAD of the `wc_shell_focus_key` call TABKEY had folded on at column ~1600. A `//` runs to end of line, so from `b768331a` onward the Orin's TAB call was INSIDE the A10 comment: dead text, not a call. Nothing already in the tree could catch it — the line count is unchanged (so the `kernel8.img` byte-identity gate is silent), `./arroyo check` is green (the callee is a `pub fn` in a lib crate, so no dead-code warning exists to fire), and `git grep -n wc_shell_focus_key` STILL PRINTS THIS LINE, which is why the KEYDOORS audit scored the Orin's TAB door WIRED. Only reading the raw line by character offset finds it. This fix is ORDER ONLY — no call added, none removed: both calls now sit ahead of ALL prose and the two comment bodies are concatenated behind them. THE RULE THIS STATEMENT NOW CARRIES FOR EVERY FUTURE FOLD: **code first, all of it, then the comments** — a folded call written after a `//` is not a call. Line-neutral, one line in and one line out. // A10 (MENUBAR2) — <Esc> DISMISSES AN OPEN MENU, AND THE SHELL DOOR HAD NO CALLER. `strip::key_escape` was asked in exactly two places: x86's `wc_route_event` and aarch64's `user_input_enqueue` — and `user_input_enqueue` is the EL0 RING door, reached only while `USER_INPUT_ACTIVE != 0`. On the Orin that is never: this pump IS the board's key drain and its normal state is focus 0, so every <Esc> went straight past the modal surface into `handle_key`. MEASURED, render7 (`~/unaos-bench/scratch/orin16/render7-boot1.log`, awk): `[winmenu] open title=View` at :2414, `:: tegra: JD2 — KEY 0x1b ::` at :2437, `state=open` STILL at :2487 and :2526, and the menu finally closed `reason=outside` at :2569 — the exact shape TABKEY measured for <TAB> one arc earlier, in this same statement, for this same reason (one body, two doors, and only the ring door wired). Asked FIRST and ahead of `wc_shell_focus_key`, which is x86's order in `wc_route_event` and the aarch64 router's order in `user_input_enqueue`: a modal surface must get the key before the focus ring can TAB the desktop out from under an open menu. It consumes ONLY a bare <Esc> while a menu is down, so every other boot is behaviour-alike. Gated `desktop_firmware` because `video/mod.rs:112` gates `pub mod strip;` on it; a knob-off tegra or Pi image compiles this to nothing. ⚠ FOLDED onto the statement, never given a line of its own — panic `Location` records embed line numbers and the knob-off `kernel8.img` byte-identity proof is this track's standing gate. // TABKEY — THE MISSING SHELL HALF OF THE FOCUS RING. `wc_focus_key` has always been reachable on tegra through the IN-RING door (`user_input_enqueue` asks it at syscall.rs's router seam, and `orininput`'s `oi_pump` drives that seam), but the SHELL door — the one that fires while `USER_INPUT_ACTIVE == 0`, which is this board's normal state — had NO CALLER AT ALL, because `main.rs`'s two `wc_shell_focus_key` sites both live inside `pump_usb_into_gui`, `cfg(all(aarch64, baremetal))`, and `baremetal` implies `pi` while `pi` + `tegra` is a hard `compile_error!`. So on the Orin <TAB> fell straight through to `handle_key`, which has no byte-9 arm, and was silently dropped. MEASURED on metal (`~/unaos-bench/capture/line-acm0/`): `orin.log` carries 5x `:: tegra: JD2 — KEY 0x09 ::` at :13071-13080 and ZERO `[wc-c] focus tab-cycle`; the Pi control `pi.log`, same tool and directory, has 249. The serial echo above is deliberately left AHEAD of this call so the pairing stays scoreable from a capture — a fixed board reads `KEY 0x09` immediately followed by `[wc-c] focus tab-cycle`, a regressed one reads `KEY 0x09` alone, which is exactly what the Orin capture reads today. `wc_shell_focus_key` and not `wc_focus_key`, because this pump IS the Orin's shell drain: it returns false the moment an EL0 program holds focus, leaving the in-ring case to the router seam that already owns it — one body, two doors, one witness, which is the Pi's arrangement verbatim. `continue` where the Pi's bare-shell drain `break`s: that loop's destination is fixed at `gui_send`, so a moved focus invalidates the rest of its drain, whereas this loop's destination is `handle_key` on the backdrop console, which this pump feeds REGARDLESS of focus anyway (`xusb_tegra.rs`'s defect-2 note, out of this arc's scope) — so breaking would only re-deliver the same events to the same place one pass later. Gated `tegra_el0` because `arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which a bare `tegra` image does not carry; the knob-off tegra media is therefore byte-identical, which is why this is FOLDED onto the statement above and given no line of its own — panic `Location` records embed line numbers and a line added anywhere in this file breaks that proof.
+                    if handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)) { // REALDESK-SHELLWIN (A19) — the keystroke draws into the shell surface; the cursor bracket above/below stays on `pal`, the panel. ⚠ LINE-NEUTRAL fold.
                         // A command took the whole screen (e.g. `gneiss`): stop draining this frame
                         // so a queued keystroke can't paint the console back over it (the shared
                         // drain-loop rule from the x86 GUI path).
@@ -2993,7 +2993,7 @@ fn jd2_console_pump(_arg: usize) {
                 // Absolute tablet coords are raw HID 0..=32767; `set_abs` scales to the panel.
                 cursor::set_abs(ax, ay, pal.width() as i32, pal.height() as i32);
             }
-            cursor::draw_over(&mut pal);
+            #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_drag_steer(pal.width() as i32, pal.height() as i32); cursor::draw_over(&mut pal); // DRAGDEAD (A27) — STEER a live title-bar grab from the ORIN's ONLY pointer drain. `wm` mints the grab (`drag_begin`, via `wc_click_route`'s chrome arm) and ends it (`drag_end`, on the release edge) but nothing on this board ever fed it MOTION, so `[wm-act] drag-end … -> no-move` four times in render6 boot 2 — `DRAG_MOVES` never left zero because `drag_motion` was never called. The x86 drains reach it through `wc_route_tail` (main.rs:1991/6725) and the Pi's through `wm::drag_route_tail` (main.rs:3879/5442/5452, `route_input_to_active_el0` and `render_service`); the Orin runs NEITHER — this pump is its pointer path and it only moved the arrow. PLACED AHEAD OF `draw_over` DELIBERATELY, and both halves matter: after `move_rel`/`set_abs` so `pal::cursor::pos` already carries this frame's travel (the window must not trail the arrow by a frame), and before the arrow goes back on the glass so a compositor pass cannot land under it and make the next `cursor::restore` stamp a stale cursor-sized patch over the moved window. Once per FRAME, not per report — the pump has already coalesced every report of the frame into `pending_rel`/`pending_abs`, and `wm`'s own pacer (`drag_motion_paced`) is the second gate. Idle cost: one relaxed load of `DRAG_WIN`. Geometry comes from the `Screen` this task is already holding, so no `WRITER` lock is taken at this seam (LOCKFIX `7847ceea`) — which is why `wm::drag_route_tail` itself is NOT the call: it reads the panel through a blocking `*WRITER.lock()` one line above the pacer. ⚠ SAME-LINE fold, line-NEUTRAL — knob-off this statement is `#[cfg]`-erased and the line is `cursor::draw_over(&mut pal);` verbatim.
             needs_render = true;
         } else if key_repainted && cursor::visible() {
             // A key repaint erased the cursor and redrew the console; put the arrow back on top.
@@ -3005,7 +3005,7 @@ fn jd2_console_pump(_arg: usize) {
             needs_render = true;
         }
         if needs_render {
-            pal.render();
+            tegra_shell_present(&mut spal, shell_id, &mut pal, key_repainted); // REALDESK-SHELLWIN (A19) — the panel flush verbatim; the window is presented only on a key repaint, never per pointer frame (the JD20 coalescing rule). ⚠ LINE-NEUTRAL fold.
         }
         // VUGRAS: the shell-idle writeback sweep on the ~250 ms cadence (boot-14's crash path — the
         // console pump was live at shell entry with no vug run). No-op with the knob off.
@@ -4520,7 +4520,7 @@ fn pump_usb_into_gui() {
                     // So gate on an ACTUAL transition: snapshot the active ASID and compare. This is the
                     // same test the bare-shell drain below makes before it breaks, which is the symmetry
                     // that was the point of having one shared body.
-                    let before = unaos_kernel::arch::aarch64::syscall::user_input_active();
+                    #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { unaos_kernel::pal::note_uncounted_discard(1); continue; } let before = unaos_kernel::arch::aarch64::syscall::user_input_active(); // APPESC (KEYDOORS F3) — THIS BRANCH HAD <TAB> BUT NOT <Esc>. A10 folded `strip::key_escape` onto the bare-shell drain below (:4578) and stopped there, so on the Pi with a full-screen KERNEL app on the panel and focus 0, <TAB> still cycled but <Esc> could not dismiss an open bar or SHARD menu: it was re-buffered and requeued to the app, exactly as it reached `gui_send` on the other branch before A10. One key, one branch, one board — the narrowest of the KEYDOORS findings and the last of A10's three doors. Placed AHEAD of the `let before`/`wc_shell_focus_key` pair on the modal-first rule both arch routers follow (a modal surface must get the key before the focus ring can TAB the desktop out from under an open menu). ⚠ THE `note_uncounted_discard(1)` IS NOT DECORATION AND IS WHY THIS FOLD IS NOT A COPY OF :4578's. This loop peeks off the UNCOUNTED seam (`peek_event_uncounted`), so an event that leaves the pipeline and is never requeued must be accounted, or `[uvug10] evq`'s `push - drop - pop` occupancy reads permanently high by one per swallowed <Esc>. The `wc_shell_focus_key` swallow arm three lines below already pays exactly this, for exactly this reason; the COUNTED-`next_event` twin at :4578 owes nothing and correctly says nothing. ⚠ FOLDED onto the `let`, code before comment (F0's rule).
                     if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
                         if unaos_kernel::arch::aarch64::syscall::user_input_active() != before {
                             cycled = true;
@@ -4575,7 +4575,7 @@ fn pump_usb_into_gui() {
         // swallowed release edge rather than a cycle, and only a real move invalidates this loop's
         // destination. (Events here come off the COUNTED `next_event`, so no discard accounting is owed —
         // unlike the uncounted peek above.)
-        let before = unaos_kernel::arch::aarch64::syscall::user_input_active();
+        #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } let before = unaos_kernel::arch::aarch64::syscall::user_input_active(); // QUARRYDOOR (KEYDOORS F1) — the PI's half of Quarry's missing shell door. `quarry::key_route` (Esc closes, `0x1C`..`0x1F` navigate, Enter opens, Backspace ascends, `r` re-reads, Wheel scrolls) had exactly ONE caller in the tree — `arch/aarch64/syscall.rs:13211`, the EL0 RING door — so on the path a Pi desktop boot with focus 0 actually takes, every one of those keys fell through to `gui_send` and the file manager could not even be closed from the keyboard. Same statement, same shape, same reason as TABKEY and A10 before it. Ordered AFTER `strip::key_escape` (a bar or SHARD menu composites above Quarry's window, so the modal surface wins) and BEFORE `wc_shell_focus_key` (an open file manager eats its own arrows before the focus ring sees them) — the order both arch routers already follow. No focus test here on purpose: `key_route` self-guards on `on_glass()` (`video/quarry/live.rs:1651`), returning false unless Quarry's row is live AND above `wm::shell_z()`, so a closed or buried Quarry cannot steal an arrow from the shell. `continue`, not `break`: a consumed key moved no focus, so this loop's `gui_send` destination is still valid — the `break` below is for a real focus MOVE only. Events here come off the COUNTED `next_event`, so no discard accounting is owed (unlike the uncounted peek above). Gated `desktop_firmware` (`video/mod.rs:685`); `UNAOS_QUARRY` is handled inside the seam so this fold needs no second `cfg`. ⚠ FOLDED onto the `let`, code before comment. // A10 (MENUBAR2) — the PI's half of the same missing shell door. `strip::key_escape` was asked only at the EL0 RING door (`user_input_enqueue`) and in x86's `wc_route_event`; this bare-shell drain — the path a Pi desktop boot with focus 0 actually takes — asked nobody, so <Esc> reached `gui_send` and the open menu stayed down. Measured on the Orin's twin of this loop (render7 :2414 open, :2437 KEY 0x1b, :2487/:2526 still open, :2569 closed reason=outside); the Pi is the same code with the same gap, and the two are fixed together because R21's menus are ONE OS. Placed ahead of `wc_shell_focus_key` on the modal-first rule both arch routers already follow. Consumes only a bare <Esc> with a menu down, so every other boot is behaviour-alike. ⚠ FOLDED onto the `let` below, never given a line of its own: `kernel8.img`'s panic-`Location` byte-identity proof names this file.
         if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) {
             if unaos_kernel::arch::aarch64::syscall::user_input_active() != before {
                 break;
@@ -5551,7 +5551,7 @@ fn render_service(_: usize) {
         // cascade ending on metal and in QEMU raspi4b alike — no polling task, no new event variant.
         #[cfg(feature = "desktop_firmware")]
         if desktop
-            && shell_id == unaos_kernel::video::wm::WIN_NONE
+            && { pi_shell_reopen_drain(&mut shell_id, &mut shell_declined); shell_id == unaos_kernel::video::wm::WIN_NONE } // SHELLREOPEN-PI (S4/A7) — ⚠ SAME-LINE fold, line-NEUTRAL. The dock's shell-pin latch drains HERE, inside the mint arm's own guard, because the drain's whole product is to RE-ARM that guard: after a close `shell_id` still holds the dead id and `shell_declined` may be false, so this arm was shut against a window that no longer exists. Sited on the `shell_id` term rather than above the `if` so no line is added; `desktop` is evaluated first and short-circuits, which is the same gate the arm already had. See the SHELLREOPEN-PI block at this file's tail.
             && !shell_declined
             && unaos_kernel::video::desktop_firmware::armed()
         {
@@ -7510,8 +7510,8 @@ fn tegra_conwin_live() -> bool {
 /// is reconstructed per lock scope via its public `surface` field — `TargetPal::new` is called
 /// exactly once, below, so the armed boot carries the same single `:: UI1:` line the baseline does.
 ///
-/// WHAT IS DELIBERATELY THE SAME: the drive loop below is the legacy pump's phase-2 loop, clause
-/// for clause (xHCI poll, coalesced pointer drain, save-under cursor bracket, ~250 ms sweep cadence
+/// WHAT IS DELIBERATELY THE SAME: the drive loop below is the legacy pump's phase-2 loop, clause for clause — a claim that was FALSE from TABKEY until KEYDOORS F2 restored it (this clone predates the key-door folds and carried NONE of them), so it is now load-bearing: a fold added at :2948 is OWED HERE TOO, and this sentence is the drift detector that must catch the next one
+/// for clause (the key-door chain `strip::key_escape` -> `quarry::key_route` -> `wc_shell_focus_key` in that order, xHCI poll, coalesced pointer drain, save-under cursor bracket, ~250 ms sweep cadence
 /// with the census on the same counter phase 1 advanced, `yield_now` — never `sleep_ticks`, the JC3
 /// rule: this core's terminus drains no sleepers). Behavioural falsifier: the `[orinclick]` census
 /// and the `:: tegra: JD2 —` transcript, which must read identically knob-on vs knob-off.
@@ -7616,7 +7616,7 @@ fn jd2_supstate_phase2(
                 match ev {
                     Event::Key(c) => {
                         // Cannot fail: the seam's bound was checked before the pop above.
-                        let _ = unaos_kernel::arch::display_tegra::sup_key_push(c);
+                        #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } let _ = unaos_kernel::arch::display_tegra::sup_key_push(c); // SUPDOOR (KEYDOORS F2) — THIS WAS A WHOLE SHELL DOOR WITH NO INTERCEPTION AT ALL. `jd2_supstate_phase2` is `jd2_console_pump`'s phase 2 with the surface lifted out of task-local storage, and it was cloned from the legacy pump BEFORE TABKEY and BEFORE A10. Neither `strip::key_escape` nor `wc_shell_focus_key` appeared anywhere in it or in `jd2_supstate_dispatcher`: `git grep -n` for either name in main.rs returned only :2948, :4524 and :4578/:4579. So on a `feature = "supstate"` Orin image A10, TABKEY and F1 were all three undone — <Esc> could not dismiss a menu, <TAB> could not cycle focus, and Quarry ate nothing — while the legacy pump three thousand lines up had all three. Latent rather than live only because the knob is default-off; the day supstate becomes the boot path it re-opens every one of them at once. THE CALL GOES HERE AND NOT IN THE DISPATCHER, and that is forced, not chosen: these three seams take a whole `pal::Event`, and `jd2_supstate_dispatcher` (:7681) is handed a bare `u8` through `sup_key_push`/`sup_key_pop` — by the time the dispatcher sees a keystroke the event is gone. This drain is the last place `ev` still exists. Ordered strip -> quarry -> focus ring, the same order :2948 carries and the same order both arch routers use. `continue` continues THIS `while`, dropping a consumed key before it reaches the seam's ring, which is what the legacy pump's `continue` does with the same events. No discard accounting is owed: these come off the COUNTED `next_event`, as at :4578 and unlike the uncounted peek at :4524. ⚠ FOLDED onto the `let`, CODE BEFORE COMMENT per F0's rule.
                     }
                     Event::Mouse { x, y } => {
                         let (ax, ay) = pending_rel.unwrap_or((0, 0));
@@ -7772,7 +7772,7 @@ fn jd2_supstate_presenter(_arg: usize) {
             })
             .unwrap_or(false);
         }
-        unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); unaos_kernel::arch::sched::yield_now(); // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict.
+        #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_drag_steer(0, 0); unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); unaos_kernel::arch::sched::yield_now(); // DRAGDEAD (A27) — the `supstate` twin of the steer folded onto `jd2_console_pump`'s `cursor::draw_over` line, and it is OUTSIDE `sup_with_surface`'s closure on purpose rather than beside its cursor block. That closure runs with `SUP_SURFACE` HELD, and the supstate design states its seams as LEAF locks "never held across a yield"; `wm::move_to_inner` composites and can yield, so steering from inside it would break the rule the whole state-lift rests on. Here the closure has returned, the frame's travel is already in `pal::cursor` (applied inside it), and no supstate lock is held. `0, 0` asks the callee for its own geometry — there is no `Screen` in scope out here — which it takes from `video::panel_info_nonblocking()`, still no `WRITER` lock. Without this site the knob would be INERT on a `supstate` image (the ORIN-RASTGLASS omission shape this file records twice). ⚠ SAME-LINE fold, line-NEUTRAL. // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict.
     }
 }
 
@@ -8355,7 +8355,7 @@ fn orin_render_service(_: usize) {
         // sets `st.armed`, so `loads()` answers `ncpu` before `service` asks), and thereafter repaints
         // only when the frame signature moves. It presents through its own `wm` row, not through
         // `pal`, and returns `()` — it neither reads nor sets `dirty`.
-        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample.
+        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::quarry::service(); orin_shell_reopen_drain(); #[cfg(feature = "holocron")] unaos_kernel::video::prtscr::service(); // SHELLREOPEN-ORIN (S4/A7) — and the DOCK'S SHELL PIN drains here too, beside quarry's latch and for the identical reason: `dock::press_at` latches rather than opens because a click router may not allocate a surface or take the window table, and this pass is where that work belongs. Until this call `dock::take_shell_reopen()` had one real caller in the tree, `x86_render_service`, so the pinned tile was a dead button on both aarch64 boards — render7 measured it (two `[dock] press … shell=pin -> reopen requested` with no window). Unlike quarry's it is NOT `#[cfg(desktop_firmware)]` at the call site: the drain fn itself has a knob-off `#[inline(always)]` empty twin, so this fold erases to nothing without the desktop. See the SHELLREOPEN-ORIN block at this file's tail for why the reopen is `fbcon::panel_console_window_open` and not `open_shell_window` on this board. ⚠ FOLDED onto this line, never added below it — panic `Location`s. // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample. QUARRY-ORIN (A8) — and the file manager's latch drains beside it. `quarry::service()` is `reap_jobs()` + one `AcqRel` swap on a quiet pass, so this costs a relaxed load per pass and nothing else; when the latch IS set it calls `open()`, which reads directories — legal HERE and not in the click router (the reason `dock::press_at` latches instead of opening). The Pi drains it from ONE place, `arch/aarch64/syscall.rs`'s strip-press arm, which this board also compiles (`desktop_firmware`, and render6-boot2's `[dock] press … raised=true` proves that arm runs here) — but that arm fires only on a dock press, so `open()`'s own `reason=panel-busy` re-latch and `tegra_quarry_seat`'s would both sit unread until an operator happened to click the strip. This is the pass-driven drain that closes them. ⚠ FOLDED onto this line rather than added below it, for the reason PULSEWIN names.
 
         // AT MOST ONE PRESENT PER PASS, and only when something changed. The Pi service measured a
         // 96-100% core peg before it took this rule; on this board the cost lands on cpu 0, which is
@@ -8590,7 +8590,7 @@ fn tegra_desk_cascade() -> bool {
     }
 
     serial_println!(
-        "[deskcascade] arming cascade panel={}x{}x{} stage={} table={} route={} conwin={} furn={} render={} witness={} (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the [u7stk] boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for)",
+        "[deskcascade] arming cascade panel={}x{}x{} stage={} table={} route={} conwin={} furn={} render={} witness={} (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the u7stk-tagged boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for — A38: named, not reproduced)",
         pw, ph, info.bytes_per_pixel, staged, live,
         if fbcon::console_is_routed() { "ROUTED" } else { "UNROUTED" },
         cfg!(feature = "orinconwin") as u8,
@@ -8610,7 +8610,7 @@ fn tegra_desk_cascade() -> bool {
     let bar = menubar::enabled();
     if !bar {
         serial_println!(
-            "[deskcascade] REFUSE reason=activate-declined windows={} activate={} route={} bar=0 (the bar is the cascade's one unconditional step and it reads disabled — activate's own [pidesk] lines above name the decline)",
+            "[deskcascade] REFUSE reason=activate-declined windows={} activate={} route={} bar=0 (the bar is the cascade's one unconditional step and it reads disabled — activate's own pidesk-tagged lines above name the decline — A38: named, not reproduced)",
             windows, activated, if routed { "ROUTED" } else { "UNROUTED" }
         );
         return false;
@@ -8622,5 +8622,547 @@ fn tegra_desk_cascade() -> bool {
         if routed { "ROUTED" } else { "UNROUTED" },
         activated
     );
-    true
+    tegra_quarry_seat(); true // QUARRY-ORIN (A8) — the cascade's READBACK of its own last step: `activate()` opened Quarry above (step 6, `#[cfg(feature = "quarry")]`), and this says whether it is on the glass, re-latching `request_open()` when it is not so the render pass reopens it with no operator action. ⚠ FOLDED onto the existing `true`, never added below it: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers — PARITY.md §5.3. Helper at the file tail (a pure append, which renumbers nothing).
+}
+
+// =================================================================================================
+// REALDESK-SHELLWIN (tail block) — A19: the shell's own window on the cascaded scene.
+// =================================================================================================
+//
+// THE FINDING (orin-ledger A19, render4 SCREEN0.PNG): four lines of `jd2_console_pump`'s console —
+// banner, JD2 line, prompt — at the panel's top-left under the menu bar, x 12..495, y 46..89 (four
+// 8-px glyph rows on a 12-px pitch; `Console::top_y` = `top_chrome_h` 34 + margin 12 = 46). Ruled a
+// pre-cascade residue the desktop-clear missed; it is not. The wire's order is
+// `[deskcascade] -> CASCADED` (render4-boot1.log:479) → `JD2 — EL1 console pump live` (:497) →
+// `JD4 — console OWNS the panel` (:591): the pump is spawned pre-terminus (main.rs, `spawn` in the
+// JB2b attach block) but first DISPATCHED by `run_capstone_boot_core`, which the terminus line runs
+// AFTER `tegra_desk_cascade`; its phase 2 then starts ~8 s later, builds a `Screen` over the PANEL
+// (`*WRITER.lock()`), and `Console::draw` (console.rs:243) clears that back buffer to `Console::BG`
+// (console.rs:162, 0x2D2B55 == `wm::DESKTOP_BG`, wm.rs:2400 — screen.rs:847 names the coincidence)
+// and draws text; `Screen::flush` walks `wm::occluders` (screen.rs:1583) so every window, the bar
+// and the dock survive — which is exactly why only the TEXT showed (controls 0% non-bg). Every
+// keystroke repaints it (`handle_key` → `draw_input_line`). `desktop_firmware::activate`'s
+// desktop-clear (log:417) and `orin_render_service`'s seeded pass-1 present (log:522) both ran
+// BEFORE the paint; neither could have cleared it. The fbcon route (`fbcon::console_is_routed`)
+// covers the boot-log MIRROR only (`FbCon::draw_fb` hands back the window surface); the shell
+// `Console` is a separate painter with no route at all. Case (b) of the A19 brief.
+//
+// THE FIX: on the cascaded scene the shell paints its OWN `wm` row — the Pi's SHELLWIN-PI shape
+// (main.rs `open_shell_window` + `Screen::direct` + `present_outcome_owned`), minted from the task
+// that owns the drain, which is the painter `orin_render_service`'s `no-painter` DECLINE arm says it
+// does not have. The panel `Screen` is seeded `DESKTOP_BG` so its first (full-damage) flush repaints
+// the backdrop the colour it already wears, through the occluder walk: `[realdesk] band-cleared`.
+// Not cascaded → `None`, and the shell keeps the panel verbatim (the Pi's rule: the shell stays
+// wherever the scene is not up). Every symbol is existing `pub` API; `video/` is untouched.
+//
+// PLACEMENT: half-panel wide, 2/5 of the work area tall, centred +40/+40 — the classic cascade over
+// the centred boot-log console window (bench: (307,158) 1305x780), clear of the pulse window
+// (bench: (10,914) 1290x212) and of the top-left band the render5 scorer reads (x 0..700, y 34..120
+// must be 0% non-bg — `docs/dev/evidence/orin14/A19-BAND.md`).
+//
+// ⚠ The `target_arch` term is forced (E0425 on the x86 check leg otherwise — see `tegra_conwin_live`).
+// Knob-off (`tegra` without `deskcascade`) every helper is an `#[inline(always)]` no-op twin, so the
+// pump's phase 2 folds back to the pre-A19 statements byte for byte.
+
+/// REALDESK-SHELLWIN — the jd2 pump's stack on the cascade knob: `wm::create_at` and
+/// `present_outcome_owned` composite from this task, and orin-render measured `hw=23232` on that
+/// chain (render4 `[u7stk] orin-render:pass1`), which does not fit the blanket 16 KiB.
+/// `[u7stk] jd2-console:shell-present` is this number's measurement.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+const TEGRA_JD2_STACK_SIZE: usize = 32 * 1024;
+
+/// REALDESK-SHELLWIN — the shell window: its surface store (the `wm` row holds a raw pointer into it,
+/// so it lives for the pump's life — the pump never returns), the single-buffer `Screen` over it, and
+/// the row id the presents are fenced on.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+struct TegraShellWin {
+    _store: alloc::vec::Vec<u8>,
+    screen: unaos_kernel::video::Screen,
+    id: unaos_kernel::video::wm::WinId,
+}
+
+/// REALDESK-SHELLWIN — mint the shell's `wm` row on the cascaded scene and seed the panel `Screen`.
+///
+/// `Some` only when the bar is enabled AND the console is routed — the cascade's own CASCADED
+/// readback, read at runtime (an image can carry the knob and still have `activate` decline). Every
+/// decline is named on the wire; a decline AFTER the seed still leaves the band clear (the shell's
+/// `Console::draw` clears to the same colour anyway) and the shell on the panel as before.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_window_open(panel: &mut unaos_kernel::video::Screen) -> Option<TegraShellWin> {
+    use unaos_kernel::video::{fbcon, menubar, wm, FrameBuffer, Screen};
+    let (pw, ph) = (panel.width(), panel.height());
+    let bar = menubar::enabled();
+    let routed = fbcon::console_is_routed();
+    if !(bar && routed) {
+        serial_println!(
+            "[realdesk] shell=panel reason=no-scene bar={} routed={} panel={}x{} (the shell keeps the backdrop wherever the cascaded scene is not up — the Pi's rule; no window, no seed, the pre-A19 path verbatim)",
+            bar as u8, routed as u8, pw, ph
+        );
+        return None;
+    }
+    // THE BAND CLEAR. `Screen::new` zero-filled this back buffer and armed full-panel damage; left
+    // alone, the pump's first `pal.render` would publish a panel of black (the console no longer
+    // paints into it). `DESKTOP_BG` is the colour the scene already wears, and the flush walks the
+    // occluders, so no window, bar or dock pixel is touched — the backdrop is repainted clean once.
+    panel.fill_screen(wm::DESKTOP_BG);
+    let wtop = unaos_kernel::ui_status::top_chrome_h(pw, ph);
+    let workh = ph.saturating_sub(wtop);
+    let cw = (pw / 2).clamp(320, pw.max(320));
+    let ch = (workh * 2 / 5).clamp(200, workh.max(200));
+    let stride = cw * 4;
+    let len = ch.checked_mul(stride)?;
+    let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if store.try_reserve_exact(len).is_err() {
+        serial_println!(
+            "[realdesk] shell=panel reason=alloc len={} (the window is allowed not to exist — GR26's rule; the seed above still clears the band and the shell paints the panel as before)",
+            len
+        );
+        return None;
+    }
+    store.resize(len, 0);
+    let mut fb = FrameBuffer::new();
+    // `Bgr` + 4 bytes, the console window's own shape: the little-endian `0x00RRGGBB` word
+    // `wm::draw_window` reads — a statement about the surface, not the panel's pixel format.
+    fb.init(
+        store.as_mut_ptr() as usize,
+        len,
+        unaos_boot_info::FrameBufferInfo {
+            width: cw,
+            height: ch,
+            stride: cw,
+            bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        },
+    );
+    fb.fill_screen(wm::DESKTOP_BG);
+    let Some((_scale, ow, oh)) = wm::spawn_geometry(cw, ch) else {
+        serial_println!("[realdesk] shell=panel reason=geometry surf={}x{} (wm::spawn_geometry declined)", cw, ch);
+        return None;
+    };
+    // Centred + the classic cascade offset, clamped into the work area.
+    let ox = (pw.saturating_sub(ow) / 2 + 40).min(pw.saturating_sub(ow));
+    let oy = (wtop + workh.saturating_sub(oh) / 2 + 40).min(wtop + workh.saturating_sub(oh));
+    let id = wm::create_at(
+        wm::KERNEL_OWNER_DESKTOP,
+        fb.base(),
+        len,
+        cw as u32,
+        ch as u32,
+        stride as u32,
+        b"shell",
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        serial_println!("[realdesk] shell=panel reason=create_at-declined surf={}x{} at ({},{})", cw, ch, ox, oy);
+        return None;
+    }
+    serial_println!(
+        "[realdesk] band-cleared x=0 y={} w={} h={} bg={:06x} shell=win={} surf={}x{} box={}x{} at ({},{}) (A19: the band under the bar was jd2's own banner + prompt painted through the panel Screen AFTER the cascade, not residue; from here the shell draws into its own wm row and the panel Screen is seeded the desktop colour, so its full-damage flush walks the occluders and leaves the backdrop clean)",
+        wtop, pw, ph.saturating_sub(wtop), wm::DESKTOP_BG, id, cw, ch, ow, oh, ox, oy
+    );
+    Some(TegraShellWin { _store: store, screen: Screen::direct(fb), id })
+}
+
+/// REALDESK-SHELLWIN — a windowed shell reserves no menu-bar chrome (`Console::top_y`).
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_mark(console: &mut unaos_kernel::console::Console, win: &Option<TegraShellWin>) {
+    if win.is_some() {
+        console.mark_in_window();
+    }
+}
+
+/// REALDESK-SHELLWIN — the row id, read BEFORE the pal borrows the window (`WIN_NONE` without one).
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_id(win: &Option<TegraShellWin>) -> unaos_kernel::video::wm::WinId {
+    win.as_ref().map_or(unaos_kernel::video::wm::WIN_NONE, |w| w.id)
+}
+
+/// REALDESK-SHELLWIN — the shell's pal over the window surface; `None` leaves the shell on the panel.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_pal(win: &mut Option<TegraShellWin>) -> Option<unaos_kernel::pal::TargetPal<'_>> {
+    win.as_mut().map(|w| unaos_kernel::pal::TargetPal::new(&mut w.screen))
+}
+
+/// REALDESK-SHELLWIN — one-shot: the first shell-window present prints its outcome and the stack gauge.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+static TEGRA_SHELL_PRESENTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// REALDESK-SHELLWIN — the pump's present: the panel flush VERBATIM (`pal.render()` — the cursor's
+/// damage, and on the first call the seeded full-panel band clear), then, only when the shell
+/// repainted, the window's flush and its owner-fenced `wm` present. `present_outcome_owned`, never
+/// bare `present`: the Pi's recycled-slot fence (a slot alias with no generation).
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_shell_present(
+    spal: &mut Option<unaos_kernel::pal::TargetPal<'_>>,
+    id: unaos_kernel::video::wm::WinId,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+    shell_dirty: bool,
+) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::pal::GneissPal;
+    use unaos_kernel::video::wm;
+    pal.render();
+    if !shell_dirty {
+        return;
+    }
+    let Some(sp) = spal.as_mut() else {
+        return;
+    };
+    sp.render();
+    let outcome = wm::present_outcome_owned(id, wm::KERNEL_OWNER_DESKTOP);
+    if !TEGRA_SHELL_PRESENTED.swap(true, Ordering::AcqRel) {
+        serial_println!(
+            "[realdesk] shell-present win={} outcome={:?} (first owner-fenced present of the shell window from the jd2 pump; every later key repaint presents the same way, pointer frames never do)",
+            id, outcome
+        );
+        #[cfg(feature = "witness")]
+        unaos_kernel::arch::sched::stk_probe("jd2-console:shell-present");
+    }
+}
+
+/// REALDESK-SHELLWIN — the shell's drawing surface: the window pal when there is one, the panel
+/// pal otherwise. Shared by both knob states (knob-off `spal` is always `None`, so this is `pal`).
+#[cfg(all(target_arch = "aarch64", feature = "tegra"))]
+fn tegra_shell_pick<'r, 'a>(
+    spal: &'r mut Option<unaos_kernel::pal::TargetPal<'a>>,
+    pal: &'r mut unaos_kernel::pal::TargetPal<'a>,
+) -> &'r mut unaos_kernel::pal::TargetPal<'a> {
+    match spal.as_mut() {
+        Some(p) => p,
+        None => pal,
+    }
+}
+
+// Knob-off twins: `tegra` without `deskcascade` — no-ops, so phase 2 folds to its pre-A19 shape.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+enum TegraShellWin {}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_window_open(_panel: &mut unaos_kernel::video::Screen) -> Option<TegraShellWin> {
+    None
+}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_mark(_console: &mut unaos_kernel::console::Console, _win: &Option<TegraShellWin>) {}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_id(_win: &Option<TegraShellWin>) -> unaos_kernel::video::wm::WinId {
+    unaos_kernel::video::wm::WIN_NONE
+}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_pal(_win: &mut Option<TegraShellWin>) -> Option<unaos_kernel::pal::TargetPal<'_>> {
+    None
+}
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_shell_present(
+    _spal: &mut Option<unaos_kernel::pal::TargetPal<'_>>,
+    _id: unaos_kernel::video::wm::WinId,
+    pal: &mut unaos_kernel::pal::TargetPal<'_>,
+    _shell_dirty: bool,
+) {
+    use unaos_kernel::pal::GneissPal;
+    pal.render();
+}
+
+// =================================================================================================
+// QUARRY-ORIN (tail block) — A8: the file manager on the cascaded desktop.
+// =================================================================================================
+//
+// THE FINDING (Peter, 2026-09-06: *"what about quarry?"*). render6 flew the cascade twice and neither
+// log contains a single line matching `quarry`; the dock read `console · pulse · shell`
+// (`[dock] press … tile=2/3`). The opener was never missing and the cascade never skipped it:
+// `video/desktop_firmware.rs:394` `super::quarry::open()` is step 6 of `activate()`, `tegra_desk_cascade`
+// calls `activate()` unconditionally, and render6-boot2.log:421..485 shows that call running every
+// other step it has (`[pidesk] desktop-clear`, `activate console_win=1 routed=true`, `faces=`,
+// `menubar ENABLED`, `menubar PAINTED`, `crystal LIVE`, `pulse-window ARMED`). What was missing is the
+// FEATURE: step 6 sits behind `#[cfg(feature = "quarry")]`, render6's banner reads
+// `…,orinrender,desktop_firmware,orinrx,tcuprobe,deskcascade` with no `quarry` term, and with the knob
+// off `video/quarry.rs` resolves `open` to `#[inline(always)] pub fn open() {}`. The cascade therefore
+// executed its last step as a no-op and had nothing to print.
+//
+// ⚠ THE MISREADING THIS BLOCK EXISTS TO RETIRE. `[deskcascade] -> CASCADED … activate=false` does NOT
+// mean "activate was not called". `activate=` prints `activated`, the RETURN VALUE, and that function's
+// tail returns `routed` only under `#[cfg(feature = "livecon")]` and a literal `false` otherwise
+// (`video/desktop_firmware.rs`, the LIVE-CONSOLE DECISION). render6 carried no `livecon`, so `false` was
+// the only answer it could give — on a boot whose console demonstrably WAS windowed and routed
+// (`route=ROUTED windows=1 owns_pixels=1` on the same line). Read `bar=1` / `route=ROUTED` / `windows=`
+// for what the cascade DID; `activate=` is a `livecon` readout wearing a misleading name.
+//
+// THE FIX IS THE ARMING, AND IT IS ONE LINE OF Cargo.toml. `deskcascade = ["desktop_firmware",
+// "tegra_el0", "quarry"]` makes `UNAOS_DESKCASCADE=1` build the armed file manager — no new knob, and
+// nothing for an operator to remember (the pre-existing `UNAOS_QUARRY` knob would have worked on the
+// render6 line, and was forgotten; that is the failure mode the implication removes). It moves no
+// type-check leg — `arm-tegra-render` is the only leg naming `deskcascade` and it already named
+// `quarry` explicitly — and it does not touch the Pi, because `kernel8` never enables `deskcascade`.
+//
+// ⚠ arroyo's `UNAOS_DESKCASCADE` mapping is deliberately NOT given a `quarry,` term, though the banner
+// would then name it. That mapping makes the knob->builder wiring gate demand `builder/src/main.rs`
+// read `UNAOS_DESKCASCADE` (because `quarry` is named by the literal `x86-all` leg — the rastmc rule),
+// and the media builder has no business knowing a Jetson desktop knob. The arming proof is instead the
+// `compiled=` field of this block's own seat line, read out of the built image rather than out of the
+// script that invoked the build.
+//
+// WHAT THIS SEAT ADDS ON TOP OF THE ARMING. `open()` is allowed to DECLINE — `panel-busy` (bounded
+// `panel_info_nonblocking` retries), `panel-below-floor`, `dock-cannot-host-full-strip`, `alloc`,
+// `geometry-unavailable`, `create-failed` — and the first of those RE-LATCHES `REOPEN` on the way out,
+// on the standing promise that "the next `service()` pass reopens with no further operator action".
+// That promise has to be kept by somebody. On the Pi the only drain is `arch/aarch64/syscall.rs`'s
+// strip-press arm, i.e. an operator click; the fold in `tegra_render_arm`'s pass above is this board's
+// pass-driven drain, and this seat is what puts a request in front of it when the boot-core open did
+// not land. It is deliberately NOT a second `open()` call at cascade depth: that is the §5.2 stack the
+// `[u7stk] boot-core:pre/post-cascade` pair is measuring (render6: `len=32768 used=240 hw=15552
+// headroom=17216`, and `activate()` now carries `quarry::open()` inside that bracket — READ THAT PAIR
+// FIRST on the next flight, it is the one number this change can move).
+//
+// Nothing here is `quarry`-gated: `is_open` and `request_open` exist in BOTH polarities by the seam's
+// design (`video/quarry.rs`), so the seat prints an honest `compiled=0` on a `deskcascade` build that
+// somehow reached this line without the feature rather than vanishing and leaving no line at all.
+
+/// QUARRY-ORIN — the cascade's readback of `activate()`'s last step, and the re-latch when it declined.
+///
+/// One line, always: `[deskquarry] seat compiled=… open=… windows=… relatched=…`. Called from
+/// `tegra_desk_cascade`'s `true` (folded, line-neutral), so it runs on exactly the boots that reached
+/// `-> CASCADED` and on no others.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_quarry_seat() {
+    use unaos_kernel::video::{quarry, wm};
+    let compiled = cfg!(feature = "quarry");
+    let open = quarry::is_open();
+    // Re-latch only when the module EXISTS and the window does not. With `quarry` off `request_open`
+    // is the `#[inline(always)]` no-op and latching would be a lie in the line below; with the window
+    // already up, `open()`'s own `SKIP reason=already-open` would be the whole effect, so we do not
+    // spend a render pass on it.
+    let relatched = compiled && !open;
+    if relatched {
+        quarry::request_open();
+    }
+    serial_println!(
+        "[deskquarry] seat compiled={} open={} windows={} relatched={} (QUARRY-ORIN A8 — desktop_firmware::activate() step 6 opens the file manager behind `feature = \"quarry\"`; compiled=0 is the whole of why render6 printed no quarry-tagged line at all and its dock read tile=2/3. compiled=1 open=1 => the quarry module's own open witness above — its tag, then win/volumes/tree-rows/cwd — IS the window, and the dock gains a pinned quarry tile at slot 0. compiled=1 open=0 => open() DECLINED and named its reason above; the request is re-latched and tegra_render_arm's pass drains it. A38: this prose NAMES other witnesses, it never reproduces their tokens — a witness line that quotes another witness verbatim inflates every count taken over it)",
+        compiled as u8,
+        open as u8,
+        wm::count(),
+        relatched as u8
+    );
+}
+
+// =================================================================================================
+// SHELLREOPEN-ORIN (S4 / A7, SO1(a)) — **the dock's pinned shell tile is a live button on the Orin.**
+// =================================================================================================
+//
+// ## The defect, metal-confirmed
+//
+// `video/dock.rs`'s pinned shell tile does not raise anything itself; it LATCHES a request
+// (`SHELL_REOPEN.store(true)`, the SHELLPIN comment says why — a click router may not open a window)
+// and the render service drains it at the tail of the same event burst with `dock::take_shell_reopen()`.
+// That taker had exactly ONE real caller tree-wide, `x86_render_service` (the
+// `arch/x86_64/syscall.rs` call is the `winx_launcher` selftest draining the flag so it cannot race
+// the render loop). Neither aarch64 render body drains it, so on the Pi and on the Orin the tile is a
+// button wired to nothing — and render7 proved it on hardware: Peter closed the console window
+// (`[wm-act] close-furniture win=1 owner=0xffffff01 closed=true route-dropped=true`) and pressed the
+// pin TWICE (`[dock] press at (1054,1161) tile=2/3 shell=pin -> reopen requested`, then again at
+// (1046,1161)) with no window on either press, while quarry's pin on the same dock opened normally.
+//
+// ## What "reopen the shell" MEANS on this board, which is not what it means on x86
+//
+// `x86_render_service` owns a shell WINDOW — its own `Console`, `Screen` and `TargetPal`, minted by
+// `open_shell_window` — so its drain either raises that row or rebuilds the whole tuple. This task
+// owns no such thing and says so twice in its own body: `orin_render_service` DECLINES to mint a
+// shell window (`[orinrender] DECLINE reason=console-already-windowed`) because `orinconwin` has
+// already routed the LIVE kernel console into its own `wm` row. On the Orin the shell IS the routed
+// console, so reopening it is reinstalling that route on a fresh row — `fbcon::panel_console_window_open()`,
+// the same shared implementation `orin_conwin` step 7 calls.
+//
+// It cannot go back through `orin_conwin`: that seam is ONE-SHOT (`ORINCONWIN_ENTERED`, whose own
+// decline text says a second pass "would re-arm the face and re-present a row
+// panel_console_window_open would hand straight back"). `panel_console_window_open` is the idempotent
+// half — it returns the existing id when a route is installed and mints a new row when
+// `CONSOLE_WIN` is `WIN_NONE`, which is exactly the state a close leaves behind. The glyph route
+// itself (`c.win_fb` / `c.win_store`) was deliberately NOT torn down by the close, so no console text
+// was lost while the window was gone; the install block re-points it at the new surface.
+//
+// ## Why the drain is HERE and not in the click router
+//
+// The same reason `dock::press_at` latches instead of opening, and the same reason
+// `quarry::service()` is drained from this line: the router runs in the input band, and reopening the
+// console allocates a multi-megabyte surface and takes the window table. This pass is where that
+// belongs. It costs one relaxed swap per pass on a quiet board.
+//
+// ## S4 / B11 / S7 — one defect class
+//
+// This is the third measured instance of the SAME shape: the x86 render body does something the
+// aarch64 bodies do not. B11 is the drag feed (`drag_route_tail`: Pi 2 calls, x86 feeds
+// `wm::drag_motion` directly, Orin 0), A27 was its Orin half, and S4 is this. S7 steps 2-3
+// (render-family convergence — the Orin then x86 adopting the shared body) SUBSUME all of them; this
+// drain is the point fix that makes the tile work before that arc lands, and it is written so the
+// convergence can delete it rather than merge it.
+//
+// LINE-NEUTRAL: tail append, one same-line fold at the call site.
+
+/// SHELLREOPEN-ORIN — drain [`unaos_kernel::video::dock::take_shell_reopen`] and reinstall the
+/// console route. One `AcqRel` swap on a quiet pass; everything below it runs only on a press.
+///
+/// The witness is UNGATED (`witness` is off in the metal image, so a claim gated on it is not a claim
+/// about the artifact that flies) and it names the SERVICE, because the whole finding is that the
+/// three render bodies do different things:
+///
+/// ```text
+/// [dock] shell-reopen drained by=orin_render_service win=5 gen=2 route=routed -> REOPEN
+/// ```
+#[cfg(all(target_arch = "aarch64", feature = "orinrender", feature = "desktop_firmware"))]
+fn orin_shell_reopen_drain() {
+    use unaos_kernel::video::{fbcon, wm};
+    if !unaos_kernel::video::dock::take_shell_reopen() {
+        return;
+    }
+    // ALREADY LIVE — the scan-to-press race, or a press on a pin whose console never went away.
+    // Raise it through the pair the router's furniture arm uses; never mint a second console.
+    if fbcon::console_is_routed() {
+        let id = fbcon::console_win();
+        wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+        serial_println!(
+            "[dock] shell-reopen drained by=orin_render_service win={} gen={} route=already-live -> REOPEN",
+            id,
+            wm::winid_gen(id)
+        );
+        return;
+    }
+    let win = fbcon::panel_console_window_open();
+    if win == wm::WIN_NONE {
+        // `panel_console_window_open` has already named its own reason on the line above this one
+        // (console-not-ready / alloc / geometry-unavailable / create-failed / install-contended).
+        // Nothing was torn down and nothing is owed: the tile stays on the dock for another try.
+        serial_println!(
+            "[dock] shell-reopen drained by=orin_render_service win=0 gen=0 route=declined -> REOPEN"
+        );
+        return;
+    }
+    // `orin_conwin` step 8's pair, for its reason: `present_outcome` over `present` so "the pass ran"
+    // and "the pass was suppressed" do not look alike, then one composite so the row reaches glass
+    // before the next pass decides nothing changed.
+    let outcome = unaos_kernel::video::wm::present_outcome(win);
+    wm::composite();
+    wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+    serial_println!(
+        "[dock] shell-reopen drained by=orin_render_service win={} gen={} route={} present={} -> REOPEN",
+        win,
+        wm::winid_gen(win),
+        if fbcon::console_is_routed() { "routed" } else { "unrouted" },
+        match outcome {
+            wm::Presented::Composited => "Composited",
+            wm::Presented::Coalesced => "Coalesced",
+            wm::Presented::Suppressed => "Suppressed",
+            wm::Presented::NoRow => "NoRow",
+        }
+    );
+}
+
+/// SHELLREOPEN-ORIN — the knob-off twin. `#[inline(always)]` and empty, so the fold at the call site
+/// costs the image nothing on a build without the desktop.
+#[cfg(all(
+    target_arch = "aarch64",
+    feature = "orinrender",
+    not(feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn orin_shell_reopen_drain() {}
+
+// =================================================================================================
+// SHELLREOPEN-PI (S4 / A7, SO1(a)) — **the dock's pinned shell tile is a live button on the Pi.**
+// =================================================================================================
+//
+// FOR pi 7. Written by orin 16 alongside the Orin's own drain, because the two are one defect and a
+// fix that lands on one board only leaves the ledger row half true. NOT committed by orin 16 — this
+// is the Pi's lane. Compile-proved by orin 16 (`./arroyo check`, both arches, with this applied) and
+// then reverted; pi 7 owns placing it, running `kernel8`/`kernel8-test`, and the byte-identity check.
+//
+// ## The defect
+//
+// `dock::press_at`'s pinned shell tile LATCHES a reopen request (`SHELL_REOPEN.store(true)`) because
+// a click router may not allocate a surface or take the window table; a render body drains it with
+// `dock::take_shell_reopen()`. Tree-wide that taker had exactly one real caller,
+// `x86_render_service` (the `arch/x86_64/syscall.rs` call is the `winx_launcher` selftest draining
+// the flag so it cannot race the render loop). `render_service` (Pi) and `orin_render_service` never
+// drain it, so on both aarch64 boards the tile is a button wired to nothing. Render7 confirmed it on
+// Orin metal (two `[dock] press … shell=pin -> reopen requested`, no window either time); the Pi has
+// the same dock, the same tile and the same missing drain.
+//
+// ## Why this hunk is four lines and the Orin's is a hundred
+//
+// The Pi's shell IS a window this task owns — `open_shell_window`, its own `Console`, `Screen` and
+// `TargetPal` — and this task ALREADY contains the rebuild: the SHELLWIN-PI mint arm, whose guard is
+// `shell_id == WIN_NONE && !shell_declined && armed()`. After a close, `shell_id` still holds the
+// DEAD id (nothing in the close path writes this local) and `shell_declined` may be false, so the
+// mint arm is closed against a window that no longer exists. The drain therefore does not rebuild
+// anything; it RE-ARMS the arm that already knows how, on the same pass, and the mint arm's own
+// witness (`[shellwin-pi] …`) reports the result. The Orin has no such arm — it declines to mint at
+// all, because `orinconwin` routes the live console into its own row — so its drain has to reinstall
+// the route itself.
+//
+// ## S4 / B11 / S7
+//
+// Third measured instance of one shape: the x86 render body does what the aarch64 bodies do not
+// (B11 is the drag feed, A27 was its Orin half, S4 is this). S7 steps 2-3 subsume all three; both
+// drains are written so the convergence can delete them rather than merge them.
+//
+// LINE-NEUTRAL: tail append, one same-line fold at the call site.
+
+/// SHELLREOPEN-PI — drain the dock's shell-pin latch and re-arm the SHELLWIN-PI mint.
+///
+/// Two arms, one live shell window max — `x86_render_service`'s rule, reached differently:
+///
+///  * the row is still alive under `KERNEL_OWNER_DESKTOP` (the scan-to-press race, or a parked
+///    shell) — RAISE it through `focus_changed`, which also un-parks it (fresh top-of-stack z).
+///    Never a second window.
+///  * the row is gone — clear the stale `shell_id` and lower `shell_declined`, and the mint arm
+///    immediately below the call site rebuilds through the SAME fallible path bring-up used.
+///    Clearing `shell_declined` is deliberate: a decline is final only until the operator ASKS
+///    again, and the pin press is that ask.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "desktop_firmware"))]
+fn pi_shell_reopen_drain(
+    shell_id: &mut unaos_kernel::video::wm::WinId,
+    shell_declined: &mut bool,
+) {
+    use unaos_kernel::video::wm;
+    if !unaos_kernel::video::dock::take_shell_reopen() {
+        return;
+    }
+    if *shell_id != wm::WIN_NONE
+        && wm::owner_of(*shell_id) == Some(wm::KERNEL_OWNER_DESKTOP)
+    {
+        wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
+        serial_println!(
+            "[dock] shell-reopen drained by=render_service win={} gen={} route=already-live -> REOPEN",
+            *shell_id,
+            wm::winid_gen(*shell_id)
+        );
+        return;
+    }
+    // WINID (SO1(b)) — `was=` is the STALE id this local was still holding, and it is worth a field:
+    // `shell_id` is a slot alias with no generation (the `present_outcome_owned` note in this task's
+    // present tail says so in as many words), so between the close and this line the table was free
+    // to hand that number to somebody else's window.
+    let was = *shell_id;
+    *shell_id = wm::WIN_NONE;
+    *shell_declined = false;
+    serial_println!(
+        "[dock] shell-reopen drained by=render_service win=0 gen=0 was={} route=rearm -> REOPEN",
+        was
+    );
+}
+
+/// SHELLREOPEN-PI — the knob-off twin, so the fold at the call site costs the knob-off `kernel8.img`
+/// nothing.
+#[cfg(all(
+    target_arch = "aarch64",
+    feature = "baremetal",
+    not(feature = "desktop_firmware")
+))]
+#[inline(always)]
+fn pi_shell_reopen_drain(
+    _shell_id: &mut unaos_kernel::video::wm::WinId,
+    _shell_declined: &mut bool,
+) {
 }

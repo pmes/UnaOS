@@ -1199,6 +1199,16 @@ pub fn install_net4b_nc() -> bool {
         );
         return false;
     }
+    install_nc_window(base, size)
+}
+
+/// NET4A: map ANY reserved 2 MiB-block-aligned DRAM window as Normal Non-Cacheable in the LIVE tables —
+/// the NET-4B flip, lifted out of `install_net4b_nc` so the sub-4 GiB window `seat_net4a_low_nc` reserves
+/// (GiB 2/3) rides exactly the same break-before-make + EL1-twin discipline as the GiB-9 window did.
+/// Refuses (false) if the window's GiB is not L2-split (the L1 entry is a 1 GiB block, not a table) —
+/// flipping a whole GiB to NC is never what a 2 MiB DMA window wants, so the caller falls back instead.
+#[cfg(feature = "tegra")]
+pub fn install_nc_window(base: u64, size: u64) -> bool {
     const BLK2: u64 = 2 * 1024 * 1024;
     const TABLE_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
     let el = current_el();
@@ -1781,6 +1791,7 @@ pub fn select_heap_region(
         // No derivable inbound window: keep the RAS-2 highest-clean heuristic, but witness the degrade.
         if let Some(s) = best_uncon {
             let heap_base = seat(s);
+            seat_net4a_low_nc(regions, carveouts, heap_base, heap_base + heap_need, windows);
             let (ncb, ncs) = net4b_nc_window();
             serial_println!(
                 ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
@@ -1815,6 +1826,7 @@ pub fn select_heap_region(
     );
     if let Some(s) = best_in_win {
         let heap_base = seat(s);
+        seat_net4a_low_nc(regions, carveouts, heap_base, heap_base + heap_need, windows);
         let (ncb, ncs) = net4b_nc_window();
         serial_println!(
             ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window INSIDE the derived PCIe inbound-DMA window(s) (RAS-2 boundary now DERIVED, not folklore), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
@@ -1869,4 +1881,128 @@ fn fb_map_gib_refused(gib: u64, desc: u64) {
         ":: tegra: JD1-MAP REFUSED — GiB {} still not RAM after patch (L1 desc={:#x}); scanout span not fully mapped ::",
         gib, desc
     );
+}
+
+// ── NET4A — the sub-4 GiB Normal-NC DMA window (tail-defined per the Location-shift convention) ───────
+//
+// The RTL8168's payload TLPs truncate to `addr[31:0]` on this RC integration (boot-24), so every high
+// ring/buffer PA has ridden an inbound-iATU ALIAS (NET-4r/4s: bus 0x68000000 → DRAM 0x268000000). The
+// boot7h `[net4F]` conviction — four consecutive completions wrote ONLY buffer 17 — was measured WITH
+// that alias in the path, so "NIC-internal" and "RC/iATU-internal" were never separated. Placing the
+// rings + buffers BELOW 4 GiB (yet at/above the 0x8000_0000 DRAM base, inside the NET-4h identity
+// region 0) removes the alias from the path: a truncated TLP is then a no-op truncation. That is the
+// first metal question of the orin ledger's gap #2, and this window is what asks it.
+//
+// NET-4o (2026-07-19) tried the same placement and boot-19 reported "no clean sub-4 GiB span" — but its
+// `lowest_clean_in` scan ran ONLY inside the `for &(wb, ws) in windows` loop over DERIVED `dma-ranges`
+// windows (commit 24d4ed49, mmu_tegra.rs:1071-1081 at that sha), and on this board that set is EMPTY
+// (`DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property`, every boot since). The
+// low span was therefore never scanned; NET-4p's "[2 GiB, 4 GiB) is packed with carveouts" was the
+// empty-set result read as a measurement. This scan runs on BOTH heap paths (degraded and derived).
+//
+// PLACEMENT LAW (same as the NET-4B window, one axis lower): one 2 MiB-aligned 2 MiB L2 block, entirely
+// inside ONE UEFI `Usable` region, clear of every carveout the heap dodges (UEFI non-Usable + DTB
+// `/reserved-memory` + the XCARVE QUIRK set), clear of the heap span and the NET-4B high window, inside a
+// derived inbound window when any is derived, and in a GiB `install_carveout_holes` has L2-SPLIT (the
+// 0xbe QUIRK straddles GiB 2/3, so both are split on every tegra boot — `install_nc_window` flips one L2
+// entry, never a whole GiB). LOWEST such block wins. The census line prints the reasons every rejected
+// candidate lost on, so a failed seat is a measurement, not a shrug (the NET-4o lesson).
+#[cfg(feature = "tegra")]
+static NET4A_LOW_NC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// NET4A: the reserved sub-4 GiB Normal-NC DMA window `(base, size)`, or `(0, 0)` when none seated. Read
+/// by the RTL8168 driver ahead of `net4b_nc_window`; it maps the window with `install_nc_window`.
+#[cfg(feature = "tegra")]
+pub fn net4a_low_nc_window() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    let base = NET4A_LOW_NC_BASE.load(Ordering::Relaxed);
+    (base, if base != 0 { NET4B_NC_SIZE } else { 0 })
+}
+
+/// NET4A: seat the LOWEST carveout-clean, L2-split, 2 MiB-aligned 2 MiB block in `[0x8000_0000, 4 GiB)`
+/// (see the header above) and latch it in `NET4A_LOW_NC_BASE`. Prints one census line either way.
+#[cfg(feature = "tegra")]
+fn seat_net4a_low_nc(
+    regions: &[MemoryRegion],
+    carveouts: &[(u64, u64)],
+    heap_lo: u64,
+    heap_hi: u64,
+    windows: &[(u64, u64)],
+) {
+    const LOW_LO: u64 = 0x8000_0000; // DRAM base == NET-4h identity region base
+    const LOW_HI: u64 = 0x1_0000_0000; // the 32-bit truncation ceiling
+    const BLK2: u64 = NET4B_NC_SIZE;
+    let (ncb, ncs) = net4b_nc_window();
+    let l1 = &raw const L1 as *const u64;
+    let overlaps = |a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64| -> bool { a_lo < b_hi && b_lo < a_hi };
+    let mut best: Option<u64> = None;
+    // Census counters: what the scan saw, so the wire carries the measurement even on a miss.
+    let mut usable_regions = 0u64;
+    let mut usable_bytes = 0u64;
+    let mut cand = 0u64;
+    let mut rej_carve = 0u64;
+    let mut rej_heap = 0u64;
+    let mut rej_win = 0u64;
+    let mut rej_split = 0u64;
+    let mut carve_low = 0u64;
+    for &(cb, cs) in carveouts {
+        if cs != 0 && overlaps(cb, cb.wrapping_add(cs), LOW_LO, LOW_HI) {
+            carve_low += 1;
+        }
+    }
+    for r in regions {
+        if r.kind != MemoryRegionKind::Usable {
+            continue;
+        }
+        let r_lo = r.phys_start.max(LOW_LO);
+        let r_hi = r.phys_start.wrapping_add(r.page_count * 4096).min(LOW_HI);
+        if r_hi <= r_lo {
+            continue;
+        }
+        usable_regions += 1;
+        usable_bytes += r_hi - r_lo;
+        let mut s = (r_lo + BLK2 - 1) & !(BLK2 - 1);
+        while s + BLK2 <= r_hi {
+            let e = s + BLK2;
+            cand += 1;
+            let mut ok = true;
+            for &(cb, cs) in carveouts {
+                if cs != 0 && overlaps(s, e, cb, cb.wrapping_add(cs)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                rej_carve += 1;
+            } else if overlaps(s, e, heap_lo, heap_hi) || (ncs != 0 && overlaps(s, e, ncb, ncb + ncs)) {
+                ok = false;
+                rej_heap += 1;
+            } else if !windows.is_empty() && !windows.iter().any(|&(wb, ws)| s >= wb && e <= wb.wrapping_add(ws)) {
+                ok = false;
+                rej_win += 1;
+            } else if !is_table_desc(unsafe { l1.add((s >> 30) as usize).read_volatile() }) {
+                ok = false;
+                rej_split += 1;
+            }
+            if ok {
+                best = Some(best.map_or(s, |b| b.min(s)));
+                break; // lowest block in this region; a lower region may still beat it
+            }
+            s = e;
+        }
+    }
+    match best {
+        Some(b) => {
+            NET4A_LOW_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed);
+            serial_println!(
+                ":: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [{:#x}, {:#x}) ({} KiB) — lowest clean L2-split block in [{:#x}, {:#x}); low-DRAM census: {} Usable region(s) / {} MiB usable, {} carveout(s) below 4 GiB, {} candidate block(s) scanned (rejected: carveout={} heap/nc={} window={} unsplit={}) ::",
+                b, b + BLK2, BLK2 >> 10, LOW_LO, LOW_HI,
+                usable_regions, usable_bytes >> 20, carve_low, cand, rej_carve, rej_heap, rej_win, rej_split
+            );
+        }
+        None => serial_println!(
+            ":: tegra: [net4A] NO sub-4GiB Normal-NC DMA window: no clean L2-split 2 MiB block in [{:#x}, {:#x}); low-DRAM census: {} Usable region(s) / {} MiB usable, {} carveout(s) below 4 GiB, {} candidate block(s) scanned (rejected: carveout={} heap/nc={} window={} unsplit={}) — the NIC falls back to the high window + inbound-iATU alias (NET-4s) ::",
+            LOW_LO, LOW_HI, usable_regions, usable_bytes >> 20, carve_low, cand, rej_carve, rej_heap, rej_win, rej_split
+        ),
+    }
 }

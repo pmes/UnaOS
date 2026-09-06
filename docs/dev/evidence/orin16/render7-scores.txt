@@ -1,0 +1,67 @@
+== render7 scorers over /home/pmes/unaos-bench/scratch/orin16/render7-boot1.log (11627 lines) ==
+A15 smp: cpu_on_success=5 cpu_on_error=0 el3_abort=0 poweroff=0 online_line=1 -> PASS (A15 pass 5)
+A1 u7stk: arming=1 post_cascade=1 len=32768 hw=14400 (render6=15552 delta=-1152) headroom=18368 -> PASS-SHALLOWER (1152 bytes below render6 — check the quarry actually opened)
+[u7stk] at=boot-core:pre-cascade task=0:boot-core sp=0x26b3fd820 low=0x26b3f5910 top=0x26b3fd910 len=32768 used=240 hw=240 headroom=32528
+[u7stk] at=boot-core:post-cascade task=0:boot-core sp=0x26b3fd820 low=0x26b3f5910 top=0x26b3fd910 len=32768 used=240 hw=14400 headroom=18368
+A18 cascade: cascaded=1 refuse=0 pulsewin_open=3 pulsewin_decline=0 strip_kept=0 census_strip=retired census_pulsewin=3 -> PASS
+[deskcascade] -> CASCADED windows=2 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=ROUTED; the render pass ahead presents t
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+A19 band: band_cleared=1 shell_present=1 jd2_probe=1 -> WIRE PASS (now A19-pngband.py SCREEN0.PNG must read non-bg=0/60200)
+A20 clicks: arm_click1=1 orinclick_armed=1 clickroute_press=19 consumed=30 routing_census=0 -> PASS (A20 flown)
+   [clickroute] press hit furniture asid=4294967041 win=1 (was 0) consume -> shell focus
+A22 tcu: arm=1 stop=0 census=1239 full_final=0 nbytes=0 full_edges=2 changes=4 data=[00 00 00] -> ROW2: FULL-SEEN then consumed
+HEALTH: heartbeat=1 el1=1 arm=1 armed=1 live=1237 redzone=0 exceptions=0 -> PASS
+-- render7 additions --
+A16 tcurx2: tcurx_took=7 took_total=7 serialrx_census=1227 rx_final=11 mbox_final=7 ovrf=0 tcu_full_final=0 keys=21 -> PASS rung 2 (the consumer took 7 byte(s) and left the mailbox empty)
+[serialrx] rx=11 (+0) polls=219956001 refused=0 ovrf=0 lsr0=0x00000200 mbox=7 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=`
+[serialrx] rx=11 (+0) polls=220120108 refused=0 ovrf=0 lsr0=0x00000200 mbox=7 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=`
+[serialrx] rx=11 (+0) polls=220310411 refused=0 ovrf=0 lsr0=0x00000200 mbox=7 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=`
+[serialrx] rx=11 (+0) polls=220504594 refused=0 ovrf=0 lsr0=0x00000200 mbox=7 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=`
+A16 leg burst: keys=5 tcurx_took=2 rx_after=5 mbox_after=2 ovrf_after=0 -> PASS 5/5
+    KEY 's' :: KEY 't' :: KEY 0x0d :: KEY 't' :: KEY 'e' ::
+A16 leg paced: keys=6 tcurx_took=5 rx_after=11 mbox_after=7 ovrf_after=0 -> PARTIAL 6/5
+    KEY 't' :: KEY 's' :: KEY 't' :: KEY 'e' :: KEY 0x0d :: KEY 0x0d ::
+A27 drag: wired=1 control_absent=0 arm=8 end=8 steered=8 fed-no-move=0 no-feed=0 | wm_drag_begin=11 wm_drag_end=11 placed=8 no-move=3 -> PASS A27 (steered 8 gesture(s), wm placed 8)
+   [dragroute] wired panel=1920x1200 desktop_firmware=1 -> READY
+   [dragroute] end win=2 via=release fed=56 applied=42 at (423,99) -> STEERED
+   [wm-act] drag-end win=3 owner=0xffffff60 at (15,953) -> no-move
+A8 quarry: quarry_open=4 skip=0 decline=0 pidesk_true=1 deskquarry_seat=1 compiled=1 open=1 relatched=0 -> PASS A8 (compiled=1 open=1, the window is on the wire; now count 4 dock tiles on the glass)
+   [quarry] open win=1 surf=1152x720 ts=2 box=1162x764 at (379,203) volumes=1 tree-rows=1 list-rows=0 cwd=/
+   [pidesk] quarry open=true — the file manager is a desktop tenant (arrows/Enter/Backspace move, Esc closes, the
+   [deskquarry] seat compiled=1 open=1 windows=2 relatched=0 (QUARRY-ORIN A8 — desktop_firmware::activate() step 
+A25 winmenu: publish=5 publish_refuse=0 contend_refuse=0 open=3 last_title=View pick=2 dismiss=3 (esc=0 outside=1 pick=2) -> OPENED and dismissed, but NOT by esc (reasons above) — press Esc with the menu down
+   [winmenu] open title=View items=2 at (193,34) owner=3
+   [winmenu] pick owner=3 id=0 label=Pi LED lamps
+   [winmenu] dismiss reason=outside owner=3
+A25 negative: in-window title_press=0 in-window menu-dismiss=0 (winmenu pick callback=2, expected>=0) -> PASS (no in-window View strip token — R21 holds)
+A26 conquiet: console_route=1 console_window=1 mirror_off=1 (at line 1) census=0 dropped=0 -> PASS-WEAK (mirror=off once; fewer than 256 lines dropped so no census line — read the glass)
+   [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+   [conquiet] mirror=off since=console-window-route win=1 lines_dropped=1 knob=bootlog (the full serial stream stops mirror
+A20 ptrpoll: lines=37 first_rearm=497 first_dup=0 first_nobuf=0 | final rearm=8552 dup=0 nobuf=0 reports=8552 | verdicts STREAMING=36 BASELINE=1 GUARD-REARM=0 DUP-DROP=0 NOBUF-DROP=0 ARMED-NO-COMPLETION=0 -> RE-ARMED (rearm=497 > 2 at census 1 — the pipeline is moving; a dead click is a ROUTING fault)
+   first:  [ptrpoll] t=71 rearm=497 discard=0 errrearm=0 dup=0 nobuf=0 reports=497 base=497 decoded=0 -> BASELINE (the enumeration arms; every later line is meas
+   last:   [ptrpoll] t=4831 rearm=8552 discard=0 errrearm=0 dup=0 nobuf=0 reports=8552 base=497 decoded=8055 -> STREAMING (the pointer read is completing and re-
+A17 prtscr: armed=8 capturing=7 ok=7 inflight_refusals=0 other_refusals=0 names=[ SCREEN0.PNG SCREEN1.PNG SCREEN2.PNG SCREEN3.PNG SCREEN4.PNG SCREEN5.PNG SCREEN6.PNG ] -> FAIL A17 GAP STANDS (8 presses, 7 verdicts, 1 silent — no refusal named)
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN0.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN1.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN1.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN2.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN2.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN3.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN3.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: SCREEN4.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN4.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN5.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN5.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN6.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN6.PNG 1920x1200 6913793 bytes -> OK ::

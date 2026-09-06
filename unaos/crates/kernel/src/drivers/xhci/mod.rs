@@ -2382,7 +2382,7 @@ pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 /// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
 /// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
 /// they go to `service_hid_halts`, which prints its own line.
-pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -4596,7 +4596,7 @@ impl XhciController {
                                                 self.queue_mouse_read(slot_id as u8);
                                                 Self::piusb39_witness("guard");
                                             }
-                                            return;
+                                            if !have_buf { MOUSE_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } else if param == prev { MOUSE_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } return; // CLICKDEAD v2 — count the exit that neither re-arms nor prints, SPLIT by cause. Reaching here means `!(param != prev && have_buf)`, so the two arms are exhaustive: no buffer/ring (teardown or allocation defect — re-arming would be wrong) vs. the known duplicate with the buffer intact (the guard's by-design skip). `!have_buf` wins the tie. ⚠ FOLDED onto the existing `return;`, never a line of its own (kernel8.img panic-`Location` byte-identity).
                                         }
                                         if let Some(data_buf_ptr) = slot.mouse_data_buffer {
                                             // XHCI-COHERENCE: consumer boundary — the interrupt-IN

@@ -1,0 +1,920 @@
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x2e6880 pg=743
+[ INFO]: crates/bootloader/src/main.rs@805: Allocated kernel at 0x25ab2b000
+[ INFO]: crates/bootloader/src/main.rs@925: Found DTB at 0x25f501000, size: 8379
+00 bytes
+[ INFO]: crates/bootloader/src/main.rs@961: boot volume FAT serial 0xde001a13 (e
+xtended BPB BS_VolID)
+[ INFO]: crates/bootloader/src/main.rs@1208: JB8[pre-EBS]: FPCI CFG_0=0x01200020
+ CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@1235: JB8[pre-EBS]: FALCON CPUCTL=0xfffff
+fff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x000
+0c85f
+[ INFO]: crates/bootloader/src/main.rs@1248: JB8[pre-EBS]: xHC cap=0x01200020 US
+BSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ?
+ falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so t
+he owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUA
+RD)
+[ INFO]: crates/bootloader/src/main.rs@1165: JB6: dummy ACPI 2.0 table installed
+ (RSDP @0x25e069000, XSDT @0x25e069040) ? XUSB Falcon teardown w:i:l lt esgerlaf:- smkmiup l
+i�v�eM m(IEnLs2t)a l�l�P�r oRtAoMc oNloIrnmtaelr-fWaBc e+:  T2e7gArBaF 0D5e5v-iBc1eB-8n-G4nCR2E6 -m8a0p4p8e-d7 4:8:F
+3:7:B AtAe2gDrFa :0 d
+ark-window guard — 89 byte(s) dropped pre-map ::
+:: video: edid present=1 hdr=OK sum=OK native=1920x1200 pclk_khz=154120 ext=1 len=256 ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4404ff TTBR0=0x25adf9000 RAM-GiB-mask=0x3fc ::
+:: tegra: XCARVE-6 carveout exclusion — 6 protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::
+:: tegra:   window[0] [0x26b800000,0x26c180000) 9728 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[1] [0xbe000000,0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[2] [0x26c400000,0x279e00000) 223232 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[3] [0x26c180000,0x26c400000) 2560 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[4] [0x26b5f0000,0x26b7f0000) 2048 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[5] [0x279e00000,0x27a760000) 9600 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac48000) ::
+:: tegra: JM7 — GOP fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4 ::
+:: tegra: JD1 — simple-fb /chosen/framebuffer: 1920x1200 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 — resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x960000] ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: fb L2 repair — 5 block(s) re-mapped in GiB 9 [0x279e00000,0x27a760000) ::
+[panel-owner] panel-ownership-handover from=owner-unknown to=owner-fbcon-panel site=fbcon::init
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d — MIDR=0x410fd421 (r0p1) — reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d — CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a — DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a — /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a — ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 — PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 — handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 — minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 — witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 — BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 — BAR2[0x004] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x008] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 — CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB11 [raw-handoff] — Falcon fw-header census: BAR2+0x1000 (IOCTL_CFGTBL_READ) -> BAR2+0x01c; no xHCI operational register is written ::
+:: tegra: JB11 [raw-handoff] — CNR gate: USBSTS=0x00000011 CNR=0 after 1 poll(s) / ~1 us — READY (mainline waits for exactly this before reading the header) ::
+:: tegra: JB11 [raw-handoff] — fw ident: magic="XUSBFW.." (0x0000574642535558) version_id=0x80050003 (Version: 80.05) ::
+:: tegra: JB11 [raw-handoff] — fw built: created=1676000890 (epoch) = 2023-02-10T03:48:10Z UTC ::
+:: tegra: JB11 [raw-handoff] — fw image: boot_codetag=0x00000000 boot_codesize=51295 B rodata_img_offset=0x00000000 fwimg_len=196608 B cksum=0x000094ba ::
+:: tegra: JB11 [raw-handoff] — fw L2 IMEM: start=0x00000000 end=0x00000000 (span=0 B) ::
+:: tegra: JB11 [raw-handoff] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::
+:: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 — CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 — touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c — XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c — PG 12 ON -> err=0 ::
+:: tegra: JB1c — PG 10 ON -> err=0 ::
+:: tegra: JB1c — CLK 267 enable -> err=0 ::
+:: tegra: JB1c — CLK 269 enable -> err=0 ::
+:: tegra: JB1c — CLK 268 enable -> err=0 ::
+:: tegra: JB1c — CLK 275 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 272 enable -> err=0 ::
+:: tegra: JB1c — CLK 103 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 100 enable -> err=0 ::
+:: tegra: JB1c — probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a — port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a — port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a — port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a — port survey done (8 ports scanned) ::
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+[uvug7] ms clock: CNTFRQ=31250000 Hz (=31250 kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent; sys_getinfo ticks=CNTVCT/(CNTFRQ/250)=125000 (NOT the per-core-summed tick counter)
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD — DTB /reserved-memory contributed 3 carveout range(s) (cap 48) to the exclusion set ::
+:: tegra: DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property = 0x0 / 0x0; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::
+:: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [0x80000000, 0x80200000) (2048 KiB) — lowest clean L2-split block in [0x80000000, 0x100000000); low-DRAM census: 2 Usable region(s) / 1983 MiB usable, 1 carveout(s) below 4 GiB, 2 candidate block(s) scanned (rejected: carveout=0 heap/nc=0 window=0 unsplit=0) ::
+:: tegra: HEAP-GUARD — kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 165 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: tegra: [net4B] Normal-NC DMA window reserved [0x268000000, 0x268200000) (2048 KiB), carved just below the heap in the same clean+DMA span ::
+:: KERNEL HEAP ALLOCATED ::
+:: SDMMC: ORIN-SDMMC-1 Tegra234 microSD READ-ONLY recon (DTB @0x25f501000 size=0xcc90c) ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3400000 reg=0x03400000(size 0x20000) status=okay removable cd-gpios compat='nvidia,tegra234-sdhci|nvidia,tegra186-sdhci|' ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3460000 reg=0x03460000(size 0x20000) status=disabled removable no-cd compat='nvidia,tegra234-sdhci|nvidia,tegra186-sdhci|' ::
+:: SDMMC:   M1: picked /bus@0/mmc@3400000 @ 0x03400000 (size 0x20000) as the microSD slot ::
+:: SDMMC:   M1: controller window 0x03400000(+0x20000) is in the GiB-0 device window (already Device-nGnRE) ::
+:: SDMMC:   M1: live SDHCI — CAPABILITIES=0x3f6ccc8c (base-clk 204 MHz, 8-bit=1, ADMA2=1), spec-version reg=0x05 (SDHCI ?) ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1101 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x1d 0x0 0x1d] rx=[0x1d 0x0 0x1d] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: SDMMC:   CLKPROOF: CLK 120 IS_ENABLED = 1 ::
+:: SDMMC:   CLKPROOF: CLK 219 IS_ENABLED = 1 ::
+:: SDMMC:   CLKPROOF: all 2 node clock(s) proven enabled ::
+:: SDMMC:   FWALL: vendor block DISABLED — metal conviction: SError with clocks proven on (boots 4e+5); ladder runs without pad snapshot/restore ::
+:: SDMMC:   M2: vendor snapshot SKIPPED — core clock not proven (CLKPROOF); ladder runs without pad snapshot/restore ::
+:: SDMMC:   M2: SRST_ALL (controller software reset) ::
+:: SDMMC:   M2: bus power 3.3 V applied (CONTROL0=0x00000f00) ::
+:: SDMMC:   M2: card detected (Present State 0x01fb00f0) ::
+:: SDMMC:   M2: 400 kHz identification clock running (CONTROL1=0x000eff07, base 204 MHz) ::
+:: SDMMC:   M2: CMD0 GO_IDLE ok ::
+:: SDMMC:   M2: CMD8 SEND_IF_COND ok (R7 echo 0x1aa) ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) ok ::
+:: SDMMC:   M2: ACMD41 SD_SEND_OP_COND ok ::
+:: SDMMC:   M2: ACMD41 power-up complete in 4 round(s) — OCR 0xc0ff8000 (CCS=1) ::
+:: SDMMC:   M2: CMD2 ALL_SEND_CID ok ::
+:: SDMMC:   M2: CID manufacturer(MID)=0x03 OEM(OID)='SD' product(PNM)='SS32G' rev=0x80 serial(PSN)=0x19f1bca4 date=12/2014 ::
+:: SDMMC:   M2: CMD3 SEND_RELATIVE_ADDR ok ::
+:: SDMMC:   M2: CMD9 SEND_CSD ok ::
+:: SDMMC:   M2: capacity 62333952 blocks (30436 MiB, CSD v2), addressing block (SDHC/SDXC), v2 (CMD8 ok) ::
+:: SDMMC:   M2: CMD7 SELECT_CARD ok ::
+:: SDMMC:   M2: CMD16 SET_BLOCKLEN 512 ok ::
+:: SDMMC:   M2: identified — RCA 0xaaaa, bus 1-bit, default-speed (<=25 MHz) [4-bit/HS negotiation deferred] ::
+:: SDMMC:   M3: sector 0 first 16 bytes = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: SDMMC:   M3: sector-0 signature = MBR (0x55AA boot signature; classic partition table) ::
+:: SDMMC: ORIN-SDMMC-1 DONE — microSD censused: 62333952 blocks (30436 MiB, CSD v2), sector-0 MBR (0x55AA boot signature; classic partition table) (READ-ONLY; no card write) ::
+:: TEGRA-SD: block backend published — 62333952 sectors (read-only) ::
+[sdmmc] write probe armed (UNAOS_SDMMCWRITE=1): CMD24 then CMD17 read-back, 1-bit default speed, PIO, vendor block untouched, card_blocks=62333952
+[sdmmc] write target=lba 2047 reason=mbr-gap-top layout=MBR (0x55AA boot signature; classic partition table) first_part_lba=2048 card_blocks=62333952
+[sdmmc] write prior lba=2047 = zero
+[sdmmc] write lba=2047 -> OK (512/512 match, t=78112 ticks = 2499 us @ 31250000 Hz)
+:: tegra: JB3 — DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 — census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b — usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b — attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g — no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b — programming interrupter + rings (runtime regs) ::
+:: X200: xhci pointer-programming begins t=694556105 (cntpct) ::
+xHCI: CNR cleared after 1 polls
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+[xhciint] ERDP initialized to 0x00000002683cd540 (hi-first, EHB clear)
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2683ce580
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2683cf000 (heap PA in [0x2683ca000,0x26b3ca000))
+xHCI: CRCR set to 0x2683cc541
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: [aarch64] RS=1 witness: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 CNR=0 HCE=0) CRCR=0x0000000000000000(CRR=0 CS=0 CA=0 RCS=0) DCBAAP=0x00000002683ce580 DCBAAP_raw64=0x00000002683ce580
+xHCI: [aarch64] RS=1 witness: IR0=0x3630020 IMAN=0x3(IP=1 IE=1) ERSTSZ=1 ERSTBA=0x00000002683ce540 ERDP=0x00000002683cd548(EHB=1) ERST[0].ring=0x00000002683cd540
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan (settle_ms=150)
+xHCI: ccs-margin settle_ms=150 ppc=0 ports=8 first_assert_ms=[p1:0/pre p2:none/pre p3:none/on p4:none/on p5:none/pre p6:0/pre p7:0/pre p8:none/pre] latest=0 margin_ms=150 result=CCSMARGIN
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+:: X200: xhci RS=1 (controller may DMA from here) t=704383196 (cntpct) ::
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 11 (was not enabled — fine).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled — fine).
+:: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc5c0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2683d3000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683cf040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc5d0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: HUB slot 1 port 1: device connected; enumerating...
+xHCI: HUB port 1 SS link trained (status 0x300203 PLS=0 U0, 1 polls, 2625408 cyc, attempt 0)
+xHCI: HUB port 1 reset OK (status 0x300203, warm reset, xHCI speed 4)
+xHCI: HUB slot 1 port 1 is a SuperSpeed port (speed forced to SS).
+xHCI: HUB downstream slot 2 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 2, bulk in 0x82/1024 out 0x1/1024) <<<
+xHCI: Configuring Bulk Endpoints for Slot 2 (IN 0x82 dci5 mps1024, OUT 0x1 dci2 mps1024)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 2). Storage ready.
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc630, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: Proceeding to Address Device (Slot 3, Port 6)...
+xHCI: Addressing Device (Slot 3, Port 6)...
+xHCI: DCBAAP[3] linked to 0x2683df3c0
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683deb80
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc640, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: >>> SLOT 3 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 3...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 3
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 3) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 3) ===
+xHCI: HUB slot 3 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 3 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 3 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 3 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+xHCI: HUB slot 3 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1c4f pid=0034 (route 0x2 tier 1)
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x81, MPS: 4, Interval: 10, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (mouse(rel)) in one Configure-Endpoint (max DCI 3).
+xHCI: [Event] Command Completion. Ptr=0x2683cc680, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: HUB slot 3 port 4: device connected; enumerating...
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x81 mps=4 interval=10 == witness ::
+:: MOUSE-1: 1 reports, last dx=1 dy=0 buttons=0x00 == witness ::
+xHCI: HUB port 4 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 5 device class=0x0 vid=1c4f pid=0002 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 3, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 5 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc6b0, Slot=5, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 5
+xHCI: HID Endpoints Configured (Slot 5). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 5
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=3 interval=10 == witness ::
+xHCI: HUB slot 3 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 3 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 5, iface 0).
+[hidkeys] set-idle ok slot=5 iface=0
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 4, iface 0).
+xHCI: [enum port 7] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 7...
+xHCI: [enum port 7] stage -> enable-slot
+:: tegra: JB2b — keyboard ARMED (slot 5, root port 6) -> PASS ::
+xHCI: [Event] Command Completion. Ptr=0x2683cc6d0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: Proceeding to Address Device (Slot 6, Port 7)...
+xHCI: Addressing Device (Slot 6, Port 7)...
+xHCI: DCBAAP[6] linked to 0x2683ea8c0
+xHCI: Port 7 speed 1 -> EP0 MPS 8
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683ea080
+xHCI: [enum port 7] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc6e0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: >>> SLOT 6 ENABLED & ADDRESSED <<<
+xHCI: [tegra fs-mps] slot 6 (FS port 7): learning MPS0 before full descriptor.
+xHCI: [enum port 7] stage -> fs-mps-learn
+xHCI: [tegra fs-mps] slot 6 bMaxPacketSize0 = 64
+xHCI: [tegra fs-mps] slot 6 EP0 MPS0 -> 64 (Evaluate Context OK)
+xHCI: Requesting Device Descriptor for Slot 6...
+xHCI: [enum port 7] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 6
+>>> VENDOR ID : [13d3]
+>>> PRODUCT ID: [3549]
+xHCI: Device Found. Class=0xe0 Sub=0x1 Proto=0x1
+xHCI: no driver for device class 0xe0 (slot 6, 13d3:3549); releasing port.
+xHCI: Port enumeration queue drained.
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 2)
+:: BOT: pump budget=450000000 used=425 peak=425 route=0x1 depth=1 slot=2 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: pump budget=450000000 used=36874314 peak=36874314 route=0x1 depth=1 slot=2 n=2 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: deqprobe slot=2 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2683cec81 -> stopped_epstate=3 stopped_ctxdeq=0x2683cece1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position) ::
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+:: BOT: portreg why=bringup port=1 usb3 portsc=0x00001603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=5 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=6 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=7 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+xHCI: storage ready.
+:: SPACE: [wait=1481ms(n=1) setcfg=3ms(n=1) tur=1200ms(n=2) sense=3ms(n=1) inq=27ms(n=1) rdcap=3ms(n=1) pub=75ms(n=1) resid=13ms] {cbw=0ms(n=5) data=11ms(n=3) csw=1180ms(n=5) peak=1179ms@csw} ftdi=0ms(n=0) total=2805ms sum=2792ms per_ms=31250 result=SPACE ::
+:: PIUSB: [piusb35] databuf phys=0x2683e0000 in_trb=0x2683cec80 cbw=0x2683cee80 csw=0x2683ceec0 | rc-inbound=[0x0,0x100000000) offset=0 (1:1) | databuf in_window=false below_3G=false — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool ::
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE: 
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+:: PIUSB: [piusb25] storage enumerated: slot 2 bulk_in=0x82 bulk_out=0x01 block_size=512 num_blocks=63404032 (30959 MiB) ::
+:: PIUSB: [piusb25] READ(10) LBA0 CSW=Passed residue=0 — first 16 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PIUSB: [piusb25] boot-sector sanity: 0x55AA=true type=unrecognized/raw ::
+:: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW=Passed residue=0 — 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+:: tegra: JB2b — HID: 1 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 — mass storage ready (slot 2); panel shell ls/cat live ::
+:: tegra: JB5 — witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 — inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x1fbd2_07fd00a7 SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: JB3 — inst0 CB0: SCTLR=0x0bb9c706 FSR=0x00000000 FAR=0x16fff_f6f5d07e ::
+:: tegra: JB3 — inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x26f5_b750dfda SYNR0=0x0000000a SYNR1=0x00001fe3 (sid=0x1fe3) ::
+:: tegra: JB3 — inst1 CB0: SCTLR=0x29ffc70e FSR=0x00000000 FAR=0x1f9c9_36bff9bc ::
+:: tegra: JB3 — MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JD2 — EL1 console pump task spawned (boot core) ::
+:: PART: mbr-raw handle=tegra-sd dev_blocks=62333952 sig=55aa ::
+:: PART: mbr-raw handle=tegra-sd e1 = 00 ff ff ff 0c ff ff ff 00 08 00 00 00 b8 01 00 ::
+:: PART: mbr-raw handle=tegra-sd e2 = 00 ff ff ff 7f ff ff ff 00 c0 01 00 00 40 00 00 ::
+:: PART: mbr-raw handle=tegra-sd e3 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr-raw handle=tegra-sd e4 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr handle=tegra-sd slot=1 type=0x0c boot=0x00 start=2048 count=112640 end=114688 ACCEPT ::
+:: PART: mbr handle=tegra-sd slot=2 type=0x7f boot=0x00 start=114688 count=16384 end=131072 ACCEPT ::
+:: PART: mbr handle=tegra-sd slot=3 REJECT Empty ::
+:: PART: mbr handle=tegra-sd slot=4 REJECT Empty ::
+:: PART: mbr census handle=tegra-sd protective=0 accepted=2 rejected=0 ::
+:: PART: unafs span check — slot=2 type=0x7f part=[114688..131072) span_base=114688 span_blocks=2048 fits=yes magic=ok ::
+:: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — card 62333952 sectors, 0 committed root flip(s) on the volume ::
+:: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or newer); CPU_ON known-good on this firmware per the SMP-2 bench ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 0 aff=0x00000000 (BSP) (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 1 aff=0x00000100 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 2 aff=0x00000200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 3 aff=0x00000300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 4 aff=0x00010200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 5 aff=0x00010300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25ac2a8f8) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac48000) ::
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac48000) ::
+:: AARCH64 SMP: AP 2 online (aff=0x00000200) ::
+:: AARCH64 SMP: c2 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25ac2a8f8) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25ac2a8f8) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac48000) ::
+:: AARCH64 SMP: AP 3 online (aff=0x00000300) ::
+:: AARCH64 SMP: c3 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac48000) ::
+:: AARCH64 SMP: AP 4 online (aff=0x00010200) ::
+:: AARCH64 SMP: c4 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25ac2a8f8) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25ac2a8f8) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac48000) ::
+:: AARCH64 SMP: AP 5 online (aff=0x00010300) ::
+:: AARCH64 SMP: c5 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 1 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 2 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 3 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 4 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 5 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI OK (5 online APs pinged, 5 delivered; BSP ipi 1 -> 6) ::
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+:: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::
+:: tegra: JM6b pre-drop — HCR_EL2=0x88000038 MMFR1.VH=1 TTBR0_EL1=0x25adfa000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x25adf1003 ::
+:: tegra: JM6b — EL1 landing: CurrentEL=1 SCTLR_EL1=0x30d01805 ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: AARCH64 exception vectors installed (VBAR_EL1 = 0x25ac48000) ::
+:: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 on cpu 0 (~100 ms window; CORE-LOCAL, other cores' periodic PPI30 is NOT this proof) ::
+:: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-881159cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] pre-arm GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=0 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=1023 ::
+:: [irqel2a] armed cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x1 ENABLE=1 IMASK=0 ISTATUS=0 CVAL-CNTPCT=124998cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] armed GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=1 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=30 ::
+:: IRQEL-RT: first IRQ taken at EL1 on cpu 0 — banked vector path live (ELR_EL1 bank) ::
+:: TEGRA-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA 0x2683f4000, 8 slots ::
+:: M6c: user blob loaded (51 bytes) ::
+:: M6b: user code page EL0-RX/EL1-RO (AT probe: EL0-read OK, EL1-write denied) ::
+:: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x7800000000 sp 0x7800004000 ::
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+[deskcascade] arming cascade panel=1920x1200x4 stage=4194304 table=0 route=UNROUTED conwin=0 furn=0 render=1 witness=1 (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the [u7stk] boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for)
+[u7stk] at=boot-core:pre-cascade task=0:boot-core sp=0x26b3fd730 low=0x26b3f5820 top=0x26b3fd820 len=32768 used=240 hw=240 headroom=32528
+[pidesk] desktop-clear panel=1920x1200 bg=002D2B55 (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)
+[wc-a] create win=1 asid=0xffffff01 surf=1295x736 stride=5180 scale=1x at (312,197) z=1
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=24 gap=12 face=0xececee keyline=0xb4b4b9 bevels=0xffffff/0xaaaaaf title_act=0xeeeef1->0xe3e3e8 title_ina=0xf4f4f5->0xefeff1 ink=0x252629/0x7a7a7e ctrls=0x3d5f92/0x678cba/0x92aac9 gloss_q16=9175/32768/0 desktop=0x2d2b55
+[crispy] ramp act row0=0xf0f0f3 rowN=0xe3e3e8 ina row0=0xf6f6f6 rowN=0xefeff1
+[ceramic] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+[knurl] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=24 tile=4x4 hash=0x56957202a422b4b1
+[wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x7266f9d6972a5d25 civac=0x7266f9d6972a5d25 after=0x7266f9d6972a5d25 fbbad=0/953120 occluded=0 occ=0/0 us=63493 rectscan_us=10222 slow=yes -> CLEAN
+[wc-g] prof win=1 seq=0 surf_bytes=3812480 cks_blit_us=7328 civac_us=7659 cks_after_us=7328 probes=953120 readback_us=5198
+[wc-h] win=1 box=1305x780 span=780 band=no bytes=4071600 compose_us=62073 present_us=1080 rectscan_us=10833 torn=no -> BUFFERED
+[wc-b] win=1 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+[wc-b] rollup presents=1 banded=0 maxbands=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> UNBANDED
+[wc-a] composite windows=1 drawn=1
+[dock] live passes=1 paints=0 rate=0/1k scan=72cyc/2us paint=0cyc/0us px/paint=0 clob=0 presses=0 raises=0 unhides=0
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[panel-owner] panel-ownership-handover from=owner-fbcon-panel to=owner-console-window site=fbcon::panel_console_window_open
+[wc-g] win=1 seq=1 own=yes scale=1x app=0x2ff76a7f4cdaffef blit=0x2ff76a7f4cdaffef civac=0x2ff76a7f4cdaffef after=0x2ff76a7f4cdaffef fbbad=0/953120 occluded=0 occ=0/0 us=4267 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=1 seq=1 surf_bytes=3812480 cks_blit_us=7327 civac_us=7449 cks_after_us=7329 probes=953120 readback_us=5252
+[wc-h] win=1 staged=no reason=fixture -> DIRECT
+[wc-d] verify win=1 surf=1295x736 band=0..48 scale=1x at (312,197) panel=1920x1200 checked=62160 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=3305 occluded=0 occ=0/0 cksum=0xb7be10621c7ea528 first=none fills=0->0 fact=0/0 desk=0->0 dact=0/0 stable=yes -> PASS
+[wcn] win=1 asid=0xffffff01 live=yes above=yes att=1 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.0/s active=0ms parked=0ms gap=0..0ms z=1 pre=2 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=1 att=1 comp=2 hid=0 bel=0 stale=0 passes=2 aborted=0 att_rate=0.0/s comp_rate=0.0/s span=27783ms -> LIVE
+[comp2] rollup passes=2 pass_us=135452 max_us=166022 sprite_us=2634 wait_us=5 blit_us=125623 compose_us=33015 present_us=1101 cache_us=499 bytes_pp=6107400 dmg_px_pp=1526850 box_px_pp=1526850 straddle_us=0 wcd_us=35347 util_pct=0 rate=0.0/s span=27783ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=27783ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=2 -> INERT
+[noatt] scope=live passes=2 seeds=2 noatt=1 noatt_kpx=994 rate=0.0/s taker=0 span=27783ms -> UNATTRIBUTED
+[wcpar] cores=1 total=2 max=2 c0=2 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=27783ms
+[wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+[wc-x] console-window win=1 panel=1920x1200 surf=1295x736 box=1305x780 at (307,158) cell=7x16 cols=185 rows=46
+[wc-g] win=1 seq=2 own=yes scale=1x app=0xb21d07270baa02fd blit=0xb21d07270baa02fd civac=0xb21d07270baa02fd after=0xb21d07270baa02fd fbbad=0/953120 occluded=0 occ=0/0 us=2000 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=1 seq=2 surf_bytes=3812480 cks_blit_us=7330 civac_us=7530 cks_after_us=7329 probes=953120 readback_us=5247
+[wc-h] win=1 box=1305x780 span=288 band=yes bytes=1503360 compose_us=1492 present_us=356 rectscan_us=4000 torn=no -> BUFFERED
+[wc-b] win=1 span=288 bh=780 bands=1 chrome_paints=1 chrome_rows=576 chrome_rows_used=576 amp=1.00x -> WHOLE
+[wc-x] console-window panic-fallback armed win=1 (panic paints the PANEL, not the window)
+[wc-g] win=1 seq=3 own=yes scale=1x app=0x90d3c890bdaed77a blit=0x90d3c890bdaed77a civac=0x90d3c890bdaed77a after=0x90d3c890bdaed77a fbbad=0/953120 occluded=0 occ=0/0 us=5244 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=1 seq=3 surf_bytes=3812480 cks_blit_us=7328 civac_us=7486 cks_after_us=7329 probes=953120 readback_us=5229
+[wc-g] rollup win=1 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=1 maxus=63493 wit_us=109678 frame_us=16667 -> CLEAN+SLOW
+[wc-h] win=1 box=1305x780 span=780 band=no bytes=4071600 compose_us=3843 present_us=1070 rectscan_us=10833 torn=no -> BUFFERED
+[wc-h] rollup win=1 scope=window emit=1 age_ms=485 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=3 banded=1 lines=4 minspan=288 minspan_bytes=1503360 maxpresent_us=1122 minpresent_us=356 presspread=1 presspop=4 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] win=1 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+[pidesk] activate panel=1920x1200 console_win=1 routed=true (the window freezes at the handoff detach that follows — x86's desktop lane does the same)
+[pidesk] faces=title:noto20-aa,menu:noto20-aa,crystal:noto20-aa,dock:noto20-aa,console:noto16-aa chrome=9x20 body=7x16 bar=34 ::
+[wc-h] win=1 box=1305x780 span=208 band=yes bytes=1085760 compose_us=1058 present_us=259 rectscan_us=2888 torn=no -> BUFFERED
+[wc-b] win=1 span=208 bh=780 bands=1 chrome_paints=1 chrome_rows=416 chrome_rows_used=416 amp=1.00x -> WHOLE
+[pidesk] menubar ENABLED panel=1920x1200 rect=Some((0, 0, 1920, 34)) was=false (the desktop scene owns the top of the glass)
+:: MENUBAR-OCC-PAR: arch=aarch64 bar_enabled=true clip_arm=present clip_gate=x86+wc|aarch64+desktop_firmware probe=present blocked_on=none occclip_bar=1 occclip_bar_px=32640 forbid_bar=1 forbid_bar_px=0 bar=1920x34+0+0 panel=1920x1200 win=960x136+480+0 crossed=true at_risk_px=32640 clob=0 pre_ok=true :: PASS ::
+[wc-h] win=1 box=1305x780 span=112 band=yes bytes=584640 compose_us=572 present_us=134 rectscan_us=1555 torn=no -> BUFFERED
+[wc-b] win=1 span=112 bh=780 bands=1 chrome_paints=1 chrome_rows=224 chrome_rows_used=224 amp=1.00x -> WHOLE
+[menubar] live passes=1 paints=0 rate=0/1k scan=45cyc/1us paint=0cyc/0us px/paint=0 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[pidesk] menubar PAINTED owns_pixels=true retried=false (composite at the enable seam, read back rather than assumed)
+[pidesk] crystal LIVE — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track yet)
+[wc-b] win=1 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+:: SHARD-MENU: crystal_press=open via=crystal-glyph menu=170x121+12+34 items=4 ::
+[crystal] live passes=1 paints=0 rate=0/1k scan=10cyc/0us paint=0cyc/0us px/paint=0 state=open opens=1 dismisses=0 picks=0 clob=0
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+:: SHARD-MENU: crystal_press=dismiss reason=outside ::
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+:: SHARD-PRESS: menu=170x121+12+34 panel=1920x1200 routed=true(open) opened=true painted=true dismissed=true(dismiss) closed=true erased=true :: PASS ::
+[wc-h] win=1 box=1305x780 span=96 band=yes bytes=501120 compose_us=499 present_us=118 rectscan_us=1333 torn=no -> BUFFERED
+[wc-h] rollup win=1 scope=window-band emit=2 age_ms=749 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=5 banded=4 lines=7 minspan=96 minspan_bytes=501120 maxpresent_us=1122 minpresent_us=118 presspread=1 presspop=9 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[pidesk] pulse-window ARMED view=Pi LED lamps (the render pass opens it on its first live instrument sample; menu: click `View` in the window's own strip — first option is the Pi LED face, second is the x86 segment face; the desktop LED band is unchanged)
+[u7stk] at=boot-core:post-cascade task=0:boot-core sp=0x26b3fd730 low=0x26b3f5820 top=0x26b3fd820 len=32768 used=240 hw=14208 headroom=18560
+[deskcascade] -> CASCADED windows=1 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=ROUTED; the render pass ahead presents the scene and mints the shell window on its first pass)
+[orinrender] arm conwin=0 furn=0 tenant=0 click=1 desk=0 cascade=1 scene=1 (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+:: PI-DESK: desktop armed — the witness cascade released the panel, furniture may land ::
+[orinrender] spawned tid=4 cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)
+:: AARCH64 SCHED (virt): boot core 0 at EL1 — running the full M4 CAPSTONE cooperatively ::
+:: VUG-HONESTY: parked-core display witness PASS — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::
+:: CAPSTONE: drain witnesses SKIPPED (queue not drained at entry — 4 task(s) pre-staged) ::
+:: AARCH64 SCHED-BAL: work-stealing witness — 0 steals total across 5 online cores, 0 core(s) ran work ::
+:: AARCH64 SCHED-BAL: c0 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c1 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c2 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c3 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c4 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c5 busy=0 steals=0 ::
+:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
+:: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=25
+:: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+[serialrx] lsr=0x00000220 base=0x0c280000 iir=0xc1 fifo=on pending=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (0x00000000 = AON UART held in reset/clock-gated, needs BPMP; 0xffffffff = open bus / wrong BASE; 0xdead.... = SoC decode error; else live)
+:: SCHED: load c0=99%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=27
+:: SVC: EC=0x15 nr=1 — EL0->EL1 syscall path live ::
+hello from EL0
+[el0stkhw] task=2:el0-hello len=16384 hw=3872 headroom=12512 loguard=0
+:: TEGRA-EL0: el0-hello round-trip -> PASS ::
+:: UI1: scale=1 cell=8x8 line=12 ::
+[wc-b] rollup presents=21 banded=0 maxbands=1 chrome_rows=10977 chrome_rows_used=10977 amp=1.00x -> UNBANDED
+[realdesk] backdrop=desktop-scene retired=pulse-band,status-line bottom_reserved=104->64 panel=1920x1200 menubar=Some((0, 0, 1920, 34)) dock_h=64 was=false == witness ::
+[orinrender] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)
+[pstrip] armed cores=6 panel=(0,1096,1920x92) row_h=13 bar=(x=30,w=1824) leds=304 led=5x10 gap=1 bands=8 full=1000 strip_h=12 reserved=64 period=250ms attack=instant decay=1000ms
+[pstrip] src live=6/6 quantum=10 stepres=18px mono=yes PASS
+[wc-a] create win=2 asid=0xffffff60 surf=1280x168 stride=5120 scale=1x at (15,953) z=2
+[wc-g] win=2 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x46fd96e31cd8a325 civac=0x46fd96e31cd8a325 after=0x46fd96e31cd8a325 fbbad=0/215040 occluded=0 occ=0/0 us=1222 rectscan_us=2333 slow=no -> CLEAN
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[wc-g] prof win=2 seq=0 surf_bytes=860160 cks_blit_us=1654 civac_us=1750 cks_after_us=1654 probes=215040 readback_us=1204
+[wc-h] win=2 box=1290x212 span=212 band=no bytes=1093920 compose_us=960 present_us=149 rectscan_us=2944 torn=no -> BUFFERED
+[pulsewin] open win=2 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: click `View` for the two faces — first option is the Pi's)
+[wc-g] win=2 seq=1 own=yes scale=1x app=0x2453a2d625c11dd5 blit=0x2453a2d625c11dd5 civac=0x2453a2d625c11dd5 after=0x2453a2d625c11dd5 fbbad=0/215040 occluded=0 occ=0/0 us=1181 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=2 seq=1 surf_bytes=860160 cks_blit_us=1653 civac_us=1751 cks_after_us=1654 probes=215040 readback_us=1199
+[wc-h] win=2 box=1290x212 span=212 band=no bytes=1093920 compose_us=945 present_us=122 rectscan_us=2944 torn=no -> BUFFERED
+[wc-d] verify win=2 surf=1280x168 band=none scale=1x at (15,953) panel=1920x1200 checked=215040 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=215040 occluded=0 occ=0/0 cksum=0x2453a2d625c11dd5 first=none fills=0->0 fact=0/0 desk=0->0 dact=0/0 stable=yes -> PASS
+[wc-w] rollup presents=1 requested_px=0 presented_px=2304000 amp=0.00x full_presents=1 bracketq_met=0 bracketq_busy=0 -> WIDENED
+[u7stk] at=orin-render:pass1 task=4:orin-render sp=0x268cf0740 low=0x268ce8c80 top=0x268cf0c80 len=32768 used=1344 hw=23104 headroom=9664
+[orinrender] census passes=1 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: CAPSTONE: verifying all 6 sync primitives (workers on cores 0 + 0) ::
+[serialrx] rx=0 (+0) polls=2 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: CAPSTONE Semaphore: PASS ::
+:: CAPSTONE Mutex: PASS ::
+:: CAPSTONE Channel: PASS ::
+:: CAPSTONE Condvar: PASS ::
+[wc-g] win=2 seq=2 own=yes scale=1x app=0xf2be9673aeb928d6 blit=0xf2be9673aeb928d6 civac=0xf2be9673aeb928d6 after=0xf2be9673aeb928d6 fbbad=0/215040 occluded=0 occ=0/0 us=1191 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=2 seq=2 surf_bytes=860160 cks_blit_us=1654 civac_us=1751 cks_after_us=1653 probes=215040 readback_us=1184
+[wc-h] win=2 box=1290x212 span=212 band=no bytes=1093920 compose_us=958 present_us=118 rectscan_us=2944 torn=no -> BUFFERED
+[wc-h] rollup win=2 scope=window emit=1 age_ms=277 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=4 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=118 presspread=1 presspop=4 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: CAPSTONE RwLock: PASS ::
+:: CAPSTONE join: PASS ::
+:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
+[wc-g] win=2 seq=3 own=yes scale=1x app=0xc74fe10beff5d222 blit=0xc74fe10beff5d222 civac=0xc74fe10beff5d222 after=0xc74fe10beff5d222 fbbad=0/215040 occluded=0 occ=0/0 us=1179 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=2 seq=3 surf_bytes=860160 cks_blit_us=1654 civac_us=1751 cks_after_us=1654 probes=215040 readback_us=1183
+[wc-g] rollup win=2 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=0 maxus=1222 wit_us=25003 frame_us=16667 -> CLEAN
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +337287/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=50
+[wc-b] rollup presents=43 banded=0 maxbands=1 chrome_rows=17265 chrome_rows_used=17265 amp=1.00x -> UNBANDED
+[orinrender] census passes=255587 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=257927 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +637744/win nofold=0x0) ::
+[wc-h] rollup win=1 scope=window emit=3 age_ms=3048 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=7 banded=32 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1122 minpresent_us=52 presspread=1 presspop=39 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=75
+[wc-b] rollup presents=51 banded=0 maxbands=1 chrome_rows=20905 chrome_rows_used=20905 amp=1.00x -> UNBANDED
+[orinrender] census passes=560720 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=564365 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=2 age_ms=2481 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=15 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=106 presspread=1 presspop=15 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +589027/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=97
+[orinrender] census passes=871279 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-b] rollup presents=62 banded=0 maxbands=1 chrome_rows=24865 chrome_rows_used=24865 amp=1.00x -> UNBANDED
+[serialrx] rx=0 (+0) polls=871838 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +635902/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=120
+[dock] live passes=65 paints=2 rate=30/1k scan=25cyc/0us paint=2893cyc/92us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[wc-h] rollup win=1 scope=window emit=4 age_ms=5150 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=8 banded=39 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1122 minpresent_us=52 presspread=1 presspop=47 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=1175485 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-b] rollup presents=68 banded=0 maxbands=1 chrome_rows=26485 chrome_rows_used=26485 amp=1.00x -> UNBANDED
+[wcn] win=1 asid=0xffffff01 live=yes above=yes att=46 comp=46 hid=0 bel=0 rate=18.7/s comp_rate=18.7/s active=2451ms parked=2770ms gap=18..206ms z=1 pre=46 drg=0 dout=3 dkpx=801 drly=0 q=1.1..12.4
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=15 comp=19 hid=0 bel=0 rate=5.1/s comp_rate=6.5/s active=2919ms parked=1000ms gap=171..250ms z=2 pre=16 drg=3 dout=0 dkpx=0 drly=0 q=10.3..15.0
+[wcn] rollup scope=live wins=2 att=61 comp=65 hid=0 bel=0 stale=0 passes=65 aborted=0 att_rate=11.9/s comp_rate=12.6/s span=5126ms -> LIVE
+[comp2] rollup passes=65 pass_us=13831 max_us=124419 sprite_us=268 wait_us=2 blit_us=11330 compose_us=915 present_us=191 cache_us=91 bytes_pp=983951 dmg_px_pp=245987 box_px_pp=804507 straddle_us=0 wcd_us=28636 util_pct=17 rate=12.6/s span=5126ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=2 overlap=13 span=5126ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=67 -> INERT
+[noatt] scope=live passes=65 seeds=62 noatt=1 noatt_kpx=267 rate=0.1/s taker=0 span=5126ms -> UNATTRIBUTED
+[wcpar] cores=1 total=66 max=66 c0=66 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5126ms
+[serialrx] rx=0 (+0) polls=1175486 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=3 age_ms=4537 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=22 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=104 presspread=1 presspop=22 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[menubar] live passes=64 paints=1 rate=15/1k scan=32004cyc/1024us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+:: SCHED: load c0=87%/f=0ms c1=0%/f=0ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +510846/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=144
+[orinrender] census passes=1444657 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=1480635 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=76 banded=0 maxbands=1 chrome_rows=28901 chrome_rows_used=28901 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +635157/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=168
+[orinrender] census passes=1762290 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-h] rollup win=1 scope=window emit=5 age_ms=7327 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=8 banded=46 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1122 minpresent_us=52 presspread=1 presspop=54 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[serialrx] rx=0 (+0) polls=1786896 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=84 banded=0 maxbands=1 chrome_rows=32578 chrome_rows_used=32578 amp=1.00x -> UNBANDED
+[wc-h] rollup win=2 scope=window emit=4 age_ms=6797 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=33 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=104 presspread=1 presspop=33 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=87%/f=0ms c1=0%/f=0ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +589708/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=192
+[orinrender] census passes=2057157 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=2093122 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=94 banded=0 maxbands=1 chrome_rows=35338 chrome_rows_used=35338 amp=1.00x -> UNBANDED
+[panel-owner] panel-ownership-handover from=owner-console-window to=owner-gui-screen site=fbcon::detach
+[wc-a] create win=3 asid=0xffffff02 surf=960x466 stride=3840 scale=1x at (520,441) z=3
+[wc-g] win=3 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0xaa7c847d47e0c325 civac=0xaa7c847d47e0c325 after=0xaa7c847d47e0c325 fbbad=0/447360 occluded=0 occ=0/0 us=2787 rectscan_us=6472 slow=no -> CLEAN
+[wc-g] prof win=3 seq=0 surf_bytes=1789440 cks_blit_us=3438 civac_us=3638 cks_after_us=3438 probes=447360 readback_us=2453
+[wc-h] win=3 box=970x510 span=510 band=no bytes=1978800 compose_us=1903 present_us=705 rectscan_us=7083 torn=no -> BUFFERED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[realdesk] band-cleared x=0 y=34 w=1920 h=1166 bg=2d2b55 shell=win=3 surf=960x466 box=970x510 at (515,402) (A19: the band under the bar was jd2's own banner + prompt painted through the panel Screen AFTER the cascade, not residue; from here the shell draws into its own wm row and the panel Screen is seeded the desktop colour, so its full-damage flush walks the occluders and leaves the backdrop clean)
+:: UI1: scale=1 cell=8x8 line=12 ::
+:: UI1: scale=1 cell=8x8 line=12 ::
+:: tegra: JD2 — OUT | UnaOS — Jetson Orin Nano (Tegra234) ::
+:: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
+[wc-w] rollup presents=2 requested_px=0 presented_px=4608000 amp=0.00x full_presents=1 bracketq_met=0 bracketq_busy=0 -> WIDENED
+[wc-g] win=3 seq=1 own=yes scale=1x app=0xee96897462a68f6e blit=0xee96897462a68f6e civac=0xee96897462a68f6e after=0xee96897462a68f6e fbbad=0/447360 occluded=0 occ=0/0 us=2772 rectscan_us=6472 slow=no -> CLEAN
+[wc-g] prof win=3 seq=1 surf_bytes=1789440 cks_blit_us=3444 civac_us=3572 cks_after_us=3443 probes=447360 readback_us=2461
+[wc-h] win=3 box=970x510 span=510 band=no bytes=1978800 compose_us=1886 present_us=701 rectscan_us=7083 torn=no -> BUFFERED
+[wc-d] verify win=3 surf=960x466 band=none scale=1x at (520,441) panel=1920x1200 checked=447360 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=447360 occluded=0 occ=0/0 cksum=0xee96897462a68f6e first=none fills=0->0 fact=0/0 desk=2->2 dact=0/0 stable=yes -> PASS
+[realdesk] shell-present win=3 outcome=Composited (first owner-fenced present of the shell window from the jd2 pump; every later key repaint presents the same way, pointer frames never do)
+[u7stk] at=jd2-console:shell-present task=1:jd2-console sp=0x2683f2c10 low=0x2683eb4c0 top=0x2683f34c0 len=32768 used=2224 hw=14672 headroom=18096
+:: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::
+[orinclick] arm panel=1920x1200 rows=3 compat=0 focus=0x0 pidesk=1 t=31 -> ARMED
+:: SCHED: load c0=96%/f=0ms c1=0%/f=3ms c2=0%/f=0ms c3=0%/f=3ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +620733/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=222
+[orinrender] census passes=2280939 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=2349793 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=101 banded=0 maxbands=1 chrome_rows=39502 chrome_rows_used=39502 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +642055/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=245
+[wc-h] rollup win=2 scope=window emit=5 age_ms=9151 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=40 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=104 presspread=1 presspop=40 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[dock] live passes=99 paints=3 rate=30/1k scan=24cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=1 asid=0xffffff01 live=yes above=yes att=12 comp=12 hid=0 bel=0 rate=28.0/s comp_rate=28.0/s active=428ms parked=2710ms gap=21..117ms z=1 pre=12 drg=0 dout=2 dkpx=534 drly=0 q=1.3..7.0
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=18 comp=20 hid=0 bel=0 rate=5.5/s comp_rate=6.1/s active=3247ms parked=1923ms gap=249..250ms z=2 pre=18 drg=2 dout=0 dkpx=0 drly=0 q=14.9..15.0
+[wcn] win=3 asid=0xffffff02 live=yes above=yes att=1 comp=2 hid=0 bel=0 rate=0.1/s comp_rate=0.3/s active=0ms parked=0ms gap=0..0ms z=3 pre=2 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=3 att=31 comp=34 hid=0 bel=0 stale=0 passes=32 aborted=0 att_rate=6.1/s comp_rate=6.7/s span=5016ms -> LIVE
+[comp2] rollup passes=32 pass_us=11668 max_us=92971 sprite_us=164 wait_us=2 blit_us=10668 compose_us=1023 present_us=197 cache_us=108 bytes_pp=1138205 dmg_px_pp=284551 box_px_pp=599015 straddle_us=0 wcd_us=35347 util_pct=7 rate=6.3/s span=5016ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=2 overlap=3 span=5016ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=99 -> INERT
+[noatt] scope=live passes=32 seeds=32 noatt=1 noatt_kpx=483 rate=0.1/s taker=0 span=5016ms -> UNATTRIBUTED
+[wcpar] cores=1 total=35 max=35 c0=35 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5016ms
+[orinrender] census passes=2600095 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=2618747 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=104 banded=0 maxbands=1 chrome_rows=40642 chrome_rows_used=40642 amp=1.00x -> UNBANDED
+[menubar] live passes=96 paints=1 rate=10/1k scan=21341cyc/682us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[pstrip] rollup samples=39 redraws=35 skipped=4 srcdelta=34 rate=3.5/s srate=3.9/s gapmax=354ms lat_max_ms=354 period=250ms decay=1000ms
+[pstrip] src live=6/6 quantum=10 stepres=18px mono=yes PASS
+:: SCHED: load c0=86%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +520823/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=269
+[orinrender] census passes=2912629 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=2932330 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +650067/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=293
+[wc-b] rollup presents=108 banded=0 maxbands=1 chrome_rows=42162 chrome_rows_used=42162 amp=1.00x -> UNBANDED
+[orinrender] census passes=3235442 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=3255126 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=6 age_ms=11401 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=46 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=104 presspread=1 presspop=46 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[orinrender] census passes=3557338 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=3577049 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=3890397 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=3910078 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=4223331 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=4243003 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=4556204 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=4575918 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=4889162 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=4908880 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=5222468 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=5242188 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinclick] census seq=1 t=71 up=10s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+:: SCHED: load c0=86%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +4616165/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=461
+[wc-h] rollup win=2 scope=window emit=7 age_ms=18156 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=48 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=103 presspread=1 presspop=48 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=111 banded=0 maxbands=1 chrome_rows=43302 chrome_rows_used=43302 amp=1.00x -> UNBANDED
+[dock] live passes=107 paints=3 rate=28/1k scan=24cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=102 paints=1 rate=9/1k scan=20086cyc/642us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=8 comp=8 hid=0 bel=0 rate=8.0/s comp_rate=8.0/s active=1000ms parked=8006ms gap=250..250ms z=2 pre=8 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=3 att=8 comp=8 hid=0 bel=0 stale=0 passes=8 aborted=0 att_rate=0.8/s comp_rate=0.8/s span=9030ms -> LIVE
+[comp2] rollup passes=8 pass_us=16015 max_us=66595 sprite_us=0 wait_us=2 blit_us=11430 compose_us=937 present_us=107 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=0.8/s span=9030ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=9030ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=107 -> INERT
+[wcpar] cores=1 total=8 max=8 c0=8 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=9030ms
+[orinrender] census passes=5497221 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=5516930 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +553753/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=485
+[orinrender] census passes=5820971 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=5840698 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=116 banded=0 maxbands=1 chrome_rows=45202 chrome_rows_used=45202 amp=1.00x -> UNBANDED
+[pstrip] rollup samples=40 redraws=13 skipped=27 srcdelta=13 rate=1.3/s srate=4.0/s gapmax=255ms lat_max_ms=255 period=250ms decay=1000ms
+[orinrender] census passes=6147101 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=6166825 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=8 age_ms=20406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=56 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=97 presspread=1 presspop=56 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=119 banded=0 maxbands=1 chrome_rows=46342 chrome_rows_used=46342 amp=1.00x -> UNBANDED
+[orinrender] census passes=6465684 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=6485376 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=122 banded=0 maxbands=1 chrome_rows=47482 chrome_rows_used=47482 amp=1.00x -> UNBANDED
+[orinrender] census passes=6795278 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=6815002 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=9 age_ms=22656 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=61 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=97 presspread=1 presspop=61 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=124 banded=0 maxbands=1 chrome_rows=48242 chrome_rows_used=48242 amp=1.00x -> UNBANDED
+[orinrender] census passes=7112662 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=7132356 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[dock] live passes=123 paints=3 rate=24/1k scan=23cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=118 paints=1 rate=8/1k scan=17364cyc/555us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=5.3/s comp_rate=5.3/s active=2999ms parked=2250ms gap=249..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=14.9..15.0
+[wcn] rollup scope=live wins=3 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=3.0/s comp_rate=3.0/s span=5206ms -> LIVE
+[comp2] rollup passes=16 pass_us=8227 max_us=40197 sprite_us=0 wait_us=1 blit_us=6744 compose_us=937 present_us=104 cache_us=106 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=3.0/s span=5206ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5206ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=123 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5206ms
+[wc-b] rollup presents=129 banded=0 maxbands=1 chrome_rows=50142 chrome_rows_used=50142 amp=1.00x -> UNBANDED
+[orinrender] census passes=7410554 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=7430284 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=7742289 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=7762000 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=10 age_ms=25406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=69 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=97 presspread=1 presspop=69 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=132 banded=0 maxbands=1 chrome_rows=51282 chrome_rows_used=51282 amp=1.00x -> UNBANDED
+[orinrender] census passes=8061130 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=8080867 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=135 banded=0 maxbands=1 chrome_rows=52422 chrome_rows_used=52422 amp=1.00x -> UNBANDED
+[orinrender] census passes=8390746 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=8410486 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=11 age_ms=27656 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=74 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=97 presspread=1 presspop=74 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=137 banded=0 maxbands=1 chrome_rows=53182 chrome_rows_used=53182 amp=1.00x -> UNBANDED
+[orinclick] census seq=2 t=111 up=20s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=8704815 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=8724509 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[dock] live passes=135 paints=3 rate=22/1k scan=22cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=130 paints=1 rate=7/1k scan=15762cyc/504us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=12 comp=12 hid=0 bel=0 rate=8.0/s comp_rate=8.0/s active=1500ms parked=3750ms gap=250..250ms z=2 pre=12 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=3 att=12 comp=12 hid=0 bel=0 stale=0 passes=12 aborted=0 att_rate=2.2/s comp_rate=2.2/s span=5250ms -> LIVE
+[comp2] rollup passes=12 pass_us=10598 max_us=40287 sprite_us=0 wait_us=1 blit_us=8657 compose_us=936 present_us=104 cache_us=105 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.2/s span=5250ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5250ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=135 -> INERT
+[wcpar] cores=1 total=12 max=12 c0=12 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5250ms
+[wc-b] rollup presents=140 banded=0 maxbands=1 chrome_rows=54322 chrome_rows_used=54322 amp=1.00x -> UNBANDED
+[orinrender] census passes=9002110 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9021799 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[pstrip] rollup samples=40 redraws=25 skipped=15 srcdelta=25 rate=2.5/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=9330880 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9350623 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=12 age_ms=30406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=81 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=97 presspread=1 presspop=81 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=144 banded=0 maxbands=1 chrome_rows=55842 chrome_rows_used=55842 amp=1.00x -> UNBANDED
+[orinrender] census passes=9649745 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9669491 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=147 banded=0 maxbands=1 chrome_rows=56982 chrome_rows_used=56982 amp=1.00x -> UNBANDED
+[orinrender] census passes=9979245 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9998951 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=13 age_ms=32656 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=86 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=97 presspread=1 presspop=86 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=149 banded=0 maxbands=1 chrome_rows=57742 chrome_rows_used=57742 amp=1.00x -> UNBANDED
+[orinrender] census passes=10296605 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=10316293 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[dock] live passes=149 paints=3 rate=20/1k scan=21cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=144 paints=1 rate=6/1k scan=14230cyc/455us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=5.6/s comp_rate=5.6/s active=2500ms parked=2500ms gap=250..250ms z=2 pre=14 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=3 att=14 comp=14 hid=0 bel=0 stale=0 passes=14 aborted=0 att_rate=2.8/s comp_rate=2.8/s span=5000ms -> LIVE
+[comp2] rollup passes=14 pass_us=9252 max_us=40296 sprite_us=0 wait_us=1 blit_us=7574 compose_us=937 present_us=106 cache_us=105 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.8/s span=5000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=149 -> INERT
+[wcpar] cores=1 total=14 max=14 c0=14 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5000ms
+[wc-b] rollup presents=154 banded=0 maxbands=1 chrome_rows=59642 chrome_rows_used=59642 amp=1.00x -> UNBANDED
+[orinrender] census passes=10593818 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=10613519 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=10925314 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=10944992 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=14 age_ms=35406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=95 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=95 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=158 banded=0 maxbands=1 chrome_rows=61162 chrome_rows_used=61162 amp=1.00x -> UNBANDED
+[orinrender] census passes=11243627 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=11263341 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=161 banded=0 maxbands=1 chrome_rows=62302 chrome_rows_used=62302 amp=1.00x -> UNBANDED
+[orinrender] census passes=11572784 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=11592458 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=15 age_ms=37656 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=100 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=100 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=163 banded=0 maxbands=1 chrome_rows=63062 chrome_rows_used=63062 amp=1.00x -> UNBANDED
+[orinclick] census seq=3 t=151 up=30s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+:: SCHED: load c0=86%/f=0ms c1=0%/f=3ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +12115859/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=936
+[orinrender] census passes=11878272 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=11897960 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +647385/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=960
+[wc-b] rollup presents=167 banded=0 maxbands=1 chrome_rows=64582 chrome_rows_used=64582 amp=1.00x -> UNBANDED
+[dock] live passes=163 paints=3 rate=18/1k scan=21cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=158 paints=1 rate=6/1k scan=12970cyc/415us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=7.0/s comp_rate=7.0/s active=2000ms parked=3500ms gap=250..250ms z=2 pre=14 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=3 att=14 comp=14 hid=0 bel=0 stale=0 passes=14 aborted=0 att_rate=2.5/s comp_rate=2.5/s span=5510ms -> LIVE
+[comp2] rollup passes=14 pass_us=9951 max_us=40447 sprite_us=0 wait_us=1 blit_us=8054 compose_us=937 present_us=105 cache_us=106 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.5/s span=5510ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5510ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=163 -> INERT
+[wcpar] cores=1 total=14 max=14 c0=14 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5510ms
+[orinrender] census passes=12167935 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=12187621 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[pstrip] rollup samples=40 redraws=25 skipped=15 srcdelta=25 rate=2.5/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=12496956 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=12516646 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=16 age_ms=40406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=106 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=106 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=169 banded=0 maxbands=1 chrome_rows=65342 chrome_rows_used=65342 amp=1.00x -> UNBANDED
+[orinrender] census passes=12815097 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=12834789 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=172 banded=0 maxbands=1 chrome_rows=66482 chrome_rows_used=66482 amp=1.00x -> UNBANDED
+[orinrender] census passes=13144355 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13164046 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=17 age_ms=42656 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=111 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=111 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=174 banded=0 maxbands=1 chrome_rows=67242 chrome_rows_used=67242 amp=1.00x -> UNBANDED
+[orinrender] census passes=13461470 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13481156 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=13793181 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13812915 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=179 banded=0 maxbands=1 chrome_rows=69142 chrome_rows_used=69142 amp=1.00x -> UNBANDED
+[dock] live passes=175 paints=3 rate=17/1k scan=21cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=170 paints=1 rate=5/1k scan=12055cyc/385us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=12 comp=12 hid=0 bel=0 rate=6.8/s comp_rate=6.8/s active=1750ms parked=3500ms gap=250..250ms z=2 pre=12 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=3 att=12 comp=12 hid=0 bel=0 stale=0 passes=12 aborted=0 att_rate=2.2/s comp_rate=2.2/s span=5250ms -> LIVE
+[comp2] rollup passes=12 pass_us=10882 max_us=40450 sprite_us=0 wait_us=1 blit_us=8687 compose_us=937 present_us=103 cache_us=106 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.2/s span=5250ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5250ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=175 -> INERT
+[wcpar] cores=1 total=12 max=12 c0=12 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5250ms
+[wc-h] rollup win=2 scope=window emit=18 age_ms=44906 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=118 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=118 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3739229/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1104
+[orinrender] census passes=14072032 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=14091730 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=184 banded=0 maxbands=1 chrome_rows=71042 chrome_rows_used=71042 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +643936/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1128
+[orinrender] census passes=14394018 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=14413749 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=187 banded=0 maxbands=1 chrome_rows=72182 chrome_rows_used=72182 amp=1.00x -> UNBANDED
+[orinrender] census passes=14723290 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=14742996 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=19 age_ms=47406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=125 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=125 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=189 banded=0 maxbands=1 chrome_rows=72942 chrome_rows_used=72942 amp=1.00x -> UNBANDED
+[orinclick] census seq=4 t=191 up=40s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=3 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+:: SCHED: load c0=86%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1274192/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1176
+[orinrender] census passes=15030069 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15049795 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +645865/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1200
+[wc-b] rollup presents=193 banded=0 maxbands=1 chrome_rows=74462 chrome_rows_used=74462 amp=1.00x -> UNBANDED
+[orinrender] census passes=15351802 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15371504 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=20 age_ms=49656 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=132 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=132 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[dock] live passes=191 paints=3 rate=15/1k scan=20cyc/0us paint=2895cyc/92us px/paint=15600 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=186 paints=1 rate=5/1k scan=11019cyc/352us paint=5578cyc/178us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=5.8/s comp_rate=5.8/s active=2749ms parked=2501ms gap=249..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=14.9..15.0
+[wcn] rollup scope=live wins=3 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=3.0/s comp_rate=3.0/s span=5273ms -> LIVE
+[comp2] rollup passes=16 pass_us=9926 max_us=55859 sprite_us=0 wait_us=1 blit_us=8254 compose_us=935 present_us=110 cache_us=105 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=3 rate=3.0/s span=5273ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5273ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=191 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5273ms
+[pstrip] rollup samples=40 redraws=28 skipped=12 srcdelta=28 rate=2.8/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=15636728 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15656462 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=198 banded=0 maxbands=1 chrome_rows=76362 chrome_rows_used=76362 amp=1.00x -> UNBANDED
+[orinrender] census passes=15966386 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15986130 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=201 banded=0 maxbands=1 chrome_rows=77502 chrome_rows_used=77502 amp=1.00x -> UNBANDED
+[orinrender] census passes=16296062 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=16315799 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=21 age_ms=52406 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=139 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=149 minpresent_us=96 presspread=1 presspop=139 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=203 banded=0 maxbands=1 chrome_rows=78262 chrome_rows_used=78262 amp=1.00x -> UNBANDED
+[orinrender] census passes=16615564 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=16635274 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=16947158 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=16966909 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=206 banded=0 maxbands=1 chrome_rows=79402 chrome_rows_used=79402 amp=1.00x -> UNBANDED

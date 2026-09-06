@@ -867,6 +867,53 @@ _feats=""
 # kernel.elf`). The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe1` leg of
 # KERNEL_CFG_MATRIX, not by this mapping. Witness family on the wire: `[ga10bprobe1]`.
 [ -n "${UNAOS_GA10B_PROBE1:-}" ] && _feats="${_feats}ga10bprobe1,"
+# GA10B-PROBE2 (GA10BPROBE2): UNAOS_GA10B_PROBE2=1 arms rung 2 of the GA10B ladder
+# (docs/dev/evidence/orin14/GA10B-LADDER.md) — `arch/aarch64/ga10b_probe.rs::ga10bprobe2_run`, an appended
+# statement in `tegra_early_stop`'s BPMP block placed BEFORE rung 1's call. One attended FULL-BOOT flight
+# (it RETURNS; no SYSTEM_OFF): BPMP MRQ_PG pre-state -> SET_STATE ON only if off -> explicit readback ->
+# MRQ_CLK census + ENABLE of the gpu@ node's DTB clocks -> ONE BAR0 read (NV_PMC_BOOT_0) behind the
+# readback of ON -> symmetric restore. Still zero GA10B MMIO writes. A SIBLING of ga10bprobe1 (whose run
+# is `-> !`): the rung-2 flight arms THIS knob ALONE — `UNAOS_GA10B_PROBE2=1 ./arroyo esp-jetson`, without
+# UNAOS_GA10B_PROBE1 (co-armed is a supported BUILD: rung 2, then rung 1's power-off). IMPLIES `tegra`.
+# Default OFF => the tail + call site vanish, no panic Location moves, knob-off images byte-identical to
+# baseline. The ARMED polarity is type-checked by the `arm-tegra-ga10bprobe2` leg of KERNEL_CFG_MATRIX,
+# not by this mapping. Witness family on the wire: `[ga10bprobe2]`.
+[ -n "${UNAOS_GA10B_PROBE2:-}" ] && _feats="${_feats}ga10bprobe2,"
+# GA10B-PROBE3 (GA10BPROBE3): ONE env knob with TWO values, driving rungs 3 and 3b of the GA10B
+# ladder (docs/dev/evidence/orin14/GA10B-LADDER.md §Rung 3 / §Rung 3b; as-built spec
+# docs/dev/evidence/orin16/GA10B-RUNG3.md).
+#   UNAOS_GA10B_PROBE3=1  -> feature `ga10bprobe3`                     — rung 3 alone, READ-ONLY
+#   UNAOS_GA10B_PROBE3=2  -> features `ga10bprobe3` + `ga10bprobe3b`   — rung 3, then rung 3b's writes
+# The two-value shape is deliberate: rung 3b is the ladder's FIRST GA10B MMIO WRITE rung, so the
+# read-only rung must be flyable on its own first if that is what the bench wants. Any other non-empty
+# value arms rung 3 alone (fail-safe: an unexpected value never buys a write).
+#
+# `arch/aarch64/ga10b_probe.rs::ga10bprobe3_run`, an appended statement in `tegra_early_stop`'s BPMP
+# block placed BETWEEN rung 2's call and rung 1's — rung 1's run is `-> !` (PSCI SYSTEM_OFF) and must
+# never execute in front of a rung that has to reach the desktop. One attended FULL-BOOT flight (rung 3
+# RETURNS): the SAME BPMP power+clock bracket rung 2 proved on metal 2026-09-06 (MRQ_PG pre-state ->
+# SET_STATE ON only if off -> EXPLICIT GET_STATE readback -> MRQ_CLK IS_ENABLED/ENABLE/IS_ENABLED per
+# DTB clock), then 25 READ-ONLY BAR0 registers in the ladder's risk order (fuse -> mc -> top ->
+# gsp-falcon-v1 -> gsp-priscv-bcr -> pmu-falcon2 LAST), each announced before it is touched and each of
+# the two NEW address classes (mc, pmu-falcon2) announced before its first touch, then a SYMMETRIC
+# restore. Two summary lines carry rung 4's inputs: `bcr_dmacfg lock_locked=<0|1>` and
+# `opt_wpr_enabled=<v>`. A pure-query MRQ_CLK block (GET_MAX_CLK_ID, GET_ALL_INFO, GET_RATE) answers
+# rung 2's leftover: why BPMP returned `err=-22` (-BPMP_EINVAL) on DTB clock id 236 while 304 and 41
+# returned `err=0`. Under `=2`, rung 3b then performs at most three announced writes
+# (pgsp_falcon_engine reset assert/deassert, one MAILBOX0 scratch write, the last one skipped unless
+# the post-reset cpuctl read is sane). NO display, fabric or vendor-pad-block access: the
+# FWALL/nvdisplay SError convictions (GA10B-HISTORY.md S2/S4/S5) stand.
+#
+# A THIRD SIBLING of ga10bprobe1/ga10bprobe2, never their dependent. IMPLIES `tegra`, so the knob is
+# self-sufficient: `UNAOS_GA10B_PROBE3=2 ./arroyo check` and `UNAOS_GA10B_PROBE3=2 ./arroyo esp-jetson`
+# both arm it (esp-jetson also forces `tegra`/`tegrasmp`). The flight arms it WITHOUT
+# UNAOS_GA10B_PROBE1 — rung 1 would power the board off behind rung 3. Default OFF => the tail + call
+# site vanish, no panic Location moves, knob-off images byte-identical to baseline. The ARMED
+# polarities are type-checked by the `arm-tegra-ga10bprobe3` and `arm-tegra-ga10bprobe3b` legs of
+# KERNEL_CFG_MATRIX, not by this mapping. Witness families on the wire: `[ga10bprobe3]`,
+# `[ga10bprobe3b]`.
+[ -n "${UNAOS_GA10B_PROBE3:-}" ] && _feats="${_feats}ga10bprobe3,"
+[ "${UNAOS_GA10B_PROBE3:-}" = "2" ] && _feats="${_feats}ga10bprobe3b,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -1268,6 +1315,31 @@ _feats=""
 # (~1 s). The ARMED polarity is type-checked by the `arm-tegra-orinrx` leg of KERNEL_CFG_MATRIX,
 # never by this mapping. `tegra` appended so the knob is self-sufficient (`orinrx = []` in Cargo).
 [ -n "${UNAOS_ORINRX:-}" ] && _feats="${_feats}orinrx,tegra,"
+# TCURX (TCUPROBE): UNAOS_TCUPROBE=1 arms the READ-ONLY Tegra234 HSP shared-mailbox / TCU RX probe
+# (`arch/aarch64/hsp_tegra.rs`, one call site on the console pump's spawn line in `tegra_early_stop`).
+# Render4 showed UARTC RX is drained by a competing reader (the SPE, A16); UEFI reads its own console
+# input from the TCU RX mailbox (HSP top0 SM0 @ 0x03C10000). Armed, the boot prints
+# `[tcu] hsp top0=… aon=… tx-mbox=… rx-mbox=…` from the live DTB, one `[hsp] dim=…` line, and then
+# `[tcu] rx-mbox raw=0x… full=<0|1> … -> FULL-NEVER|FULL-SEEN|FULL-NOW` once a second — no HSP/UART
+# write, no IRQ enable. DEFAULT OFF; the knob-off image is byte-identical (same-line appends only).
+# `tegra` appended so the knob is self-sufficient (`tcuprobe = ["tegra"]` in Cargo). The ARMED
+# polarity is type-checked by the `arm-tegra-tcuprobe` leg of KERNEL_CFG_MATRIX, never by this
+# mapping. Design: `docs/dev/evidence/orin14/TCURX-DESIGN.md`. UNFLOWN — flies on render5/6.
+[ -n "${UNAOS_TCUPROBE:-}" ] && _feats="${_feats}tcuprobe,tegra,"
+# TCURX2 (TCURX): UNAOS_TCURX=1 arms rung 2 of A16 — the CONSUMER. Rung 1 flew on render6 and showed
+# the two bytes UARTC lost parked in the TCU RX mailbox (`raw=0x82006574 full=1 nbytes=2
+# data=[74 65 00]`), unconsumed forever because the probe never writes. Armed, `serialrx::drain`
+# gains a SECOND source: read the RX mailbox word, and on bit 31 take byte 0 and write the word back
+# with the count decremented / remaining bytes shifted down / 0 when none remain (the §4 protocol —
+# the ONLY register write this knob adds anywhere). The UARTC RBR poll is KEPT (R19: failed paths
+# stay open), so both sources are scorable on one boot. On the wire: `[tcurx] took=0x74 't' left=1
+# word=0x…` per byte and `mbox=N` appended to the `[serialrx] rx=` census. DEFAULT OFF; the knob-off
+# image is byte-identical (same-line folds before the line's first `//`, plus tail appends below the
+# last existing line of both tail modules). `tegra,orinrx,tcuprobe` appended so the knob is
+# self-sufficient (`tcurx = ["tegra","orinrx","tcuprobe"]` in Cargo). The ARMED polarity is
+# type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX, never by this mapping. Design:
+# `docs/dev/evidence/orin14/TCURX-DESIGN.md` §4/§7; this rung: `docs/dev/evidence/orin15/TCURX2.md`.
+[ -n "${UNAOS_TCURX:-}" ] && _feats="${_feats}tcurx,tcuprobe,orinrx,tegra,"
 # DESKCASCADE: UNAOS_DESKCASCADE=1 gives the Orin the NORMAL desktop, ONE knob, DEFAULT OFF —
 # `main.rs::tegra_desk_cascade` on the tegra terminus line (after the `orinfurn` seam, before
 # `tegra_render_arm`) calls `desktop_firmware::activate()`, the cascade §5.2 held, bracketed by the
@@ -1277,6 +1349,27 @@ _feats=""
 # what it builds; do NOT combine with UNAOS_ORINCONWIN/ORINDESK (the cascade REFUSES a non-empty table).
 # Witness: `[deskcascade] arming cascade`, `[deskcascade] -> CASCADED` / `REFUSE`. Emits real aarch64
 # code, so `arm_features` does not strip it. Type-checked by `arm-tegra-render`.
+#
+# QUARRY-ORIN (2026-09-06, orin-ledger A8): the file manager now rides this knob, and it rides it
+# through Cargo's `deskcascade = ["desktop_firmware", "tegra_el0", "quarry"]` implication — NOT through
+# a `quarry,` term appended to the line below. Both were tried; only the implication is admissible.
+# Appending here maps UNAOS_DESKCASCADE -> `quarry`, and `quarry` is named by the literal `x86-all`
+# leg, which makes the knob->builder wiring gate demand that `builder/src/main.rs` read
+# UNAOS_DESKCASCADE too (the rastmc rule: never arm a feature for an x86 media banner without
+# building it). It does not, this is an aarch64-only knob, and teaching the media builder a Jetson
+# desktop knob to win a banner term is the wrong trade. The implication costs nothing and cannot be
+# forgotten by an operator, which the pre-existing UNAOS_QUARRY knob (line ~1028) can.
+#
+# The arming proof does not depend on the banner. `main.rs::tegra_quarry_seat` prints
+# `[deskquarry] seat compiled=<cfg!(feature = "quarry")> open=… windows=… relatched=…` on every boot
+# that reaches `-> CASCADED`, which is a reading of the BUILT IMAGE rather than of the script that
+# invoked the build — strictly stronger evidence than a `$_feats` term, and it is what convicts or
+# clears the next flight. render6 is the case in point: its banner read
+# `…,orinrender,desktop_firmware,orinrx,tcuprobe,deskcascade` with no `quarry`, both logs held zero
+# `quarry` lines and the dock read `tile=2/3`, because `desktop_firmware::activate()` step 6 ran as
+# `video/quarry.rs`'s `#[cfg(not(feature = "quarry"))] #[inline(always)] pub fn open() {}`.
+# `quarry` is NOT in `arm_features`'s strip list and must never join it: it emits real aarch64 code —
+# `video/quarry/live.rs`'s collector is the `target_arch = "aarch64"` half.
 [ -n "${UNAOS_DESKCASCADE:-}" ] && _feats="${_feats}deskcascade,desktop_firmware,tegra_el0,tegra,"
 [ -n "${UNAOS_ORINLADDER:-}" ] && _feats="${_feats}orinladder,orinconwin,orinclick,orindesk,desktop_firmware,tegra_el0,tegra,"
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 arms `orinface` — the anti-aliased console face on an
@@ -1471,6 +1564,21 @@ fi
 # UNAOS_TEGRA=1. Default OFF => module + call sites vanish, smoltcp not pulled, byte-identical to
 # baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
 [ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,"
+# ORIN-NET-5: UNAOS_NET5=1 arms the RING RE-FETCH PROBE on top of the net4 driver — one knob, one boot,
+# one question (arch/aarch64/rtl8168_tegra.rs § NET-5). AFTER `CR = RxEnb|TxEnb` it re-points RX
+# descriptors 1..31 at a tagged SHADOW block in the same Normal-NC window (slot 0 kept as the control),
+# proves the rewrite reached DRAM with an NC readback, and re-stamps EVERY ring + shadow landing tag
+# after each pop — so each pop's landing set means "written SINCE THE PREVIOUS POP" instead of
+# cumulatively, which is the sticky-tag defect that made [net4F]'s "4 consecutive completions wrote ONLY
+# buffer 17" one datum printed four times. After the re-point no descriptor carries buffer 17's address,
+# so a landing there is an address the NIC holds internally. Witnesses: `[net5R]` (arm + readback, or
+# NOT ARMED with the failing precondition), `[net5T]` (per-pop arm: REFETCH-LIVE | REFETCH-WRONGSLOT |
+# STALE-ORIG | PREFETCHED | NOWHERE), `[net5V]` (window-close tally + ranked answer). Implies net4
+# (hence pcie3,pcie2); `esp-jetson` forces tegra, which the driver's metal half needs. Default OFF =>
+# every field, site and string vanishes and the image is byte-identical to a net4 build. The ARMED
+# polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX, never by this mapping.
+# Design: docs/dev/evidence/orin16/NET5.md. UNFLOWN — flies on net5.
+[ -n "${UNAOS_NET5:-}" ] && _feats="${_feats}net5,net4,pcie3,pcie2,"
 # ORIN-SDMMC-1: UNAOS_SDMMC=1 arms the Tegra234 microSD-slot SDMMC controller READ-ONLY recon — the
 # installer line's first rung (arch/aarch64/sdmmc_tegra.rs). Resolves the controller from the live DTB
 # (compatible/name match, no hardcoded base; the enabled removable instance = the microSD slot), maps
@@ -1501,6 +1609,43 @@ fi
 # full install after the read census + rung-2 ladder. UNAOS_SDMMC_ARM=1 WITHOUT this is byte-identical to
 # the merged rung-2 ladder. See arch_arm64.md §ORIN-INSTALL-1 and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_INSTALL_TARGET_SD:-}" ] && _feats="${_feats}install_target,sdmmc_arm,sdmmc,"
+# SDMMCWRITE (orin 14): UNAOS_SDMMCWRITE=1 arms the gap-#3 write PROBE on the Tegra234 microSD slot —
+# after the read census has identified the card and read sector 0, ONE CMD24 single-block write of a
+# witness block to ONE scratch sector proven outside every partition and outside the FAT volume (the
+# top of the post-MBR gap on the bench card; the choice is printed BEFORE the write and refused, named,
+# when no such sector exists), then a CMD17 read-back compared over all 512 bytes. 1-bit default speed,
+# PIO, vendor pad block untouched (the FWALL SError conviction stands). A SECOND explicit write arm on
+# top of `sdmmc` (pulled here for a lone knob), a sibling of UNAOS_SDMMC_ARM — it does NOT arm that
+# ladder. Metal-only: the probe's call site is `tegra`-gated, so on virt (no UNAOS_TEGRA) it compiles to
+# nothing and the census prints its usual compiled-present line; `esp-jetson` forces tegra. Witness on
+# the wire: `[sdmmc] write target=lba … reason=…`, then `[sdmmc] write lba=… -> OK (512/512 match,
+# t=… ticks)` | `-> FAIL status=0x… at <step>` | `-> REFUSED reason=…`. Default OFF => byte-identical
+# to baseline (no line moves; see docs/dev/evidence/orin14/SDMMCWRITE.md). The ARMED polarity is
+# type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by this mapping.
+[ -n "${UNAOS_SDMMCWRITE:-}" ] && _feats="${_feats}sdmmcwrite,sdmmc,"
+# ROOTFS (orin 16, ledger A28): UNAOS_SDMMCROOT=1 gives the VFS a ROOT the Orin actually has. On the
+# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/fat` to BlockSource::Default —
+# neither exists on this machine (the card carries only the FAT32 ESP; nothing registers a Default
+# block device on an Orin boot), so `ls /` and quarry both answered `/: backend error: unafs-mount`.
+# Armed, the table instead binds `/` to the card's FAT volume read through BlockSource::TegraSd (the
+# census-published CMD17 path, metal-proven by A23) and re-points `/fat` at that same volume — `/fat`
+# is `shell::EXEC_ROOT` and the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
+# and quarry's launch route, so it is what makes the desktop able to run anything, not decoration.
+# READ-ONLY twice over and NOT by this
+# knob's say-so: BlockSource::TegraSd::write_veto vetoes the source and block::write_block_tegra_sd
+# refuses in every cfg — the vendor pad block stays DISABLED (the FWALL SError conviction) and no
+# controller register is touched. Pulls `sdmmc` for a lone knob; a SIBLING of UNAOS_SDMMCWRITE, never
+# an implier of it (this is a read path only). Metal-only in effect: the call site is `tegra`-gated,
+# and on virt the census publishes no card so the bind prints one named refusal. Witness on the wire:
+# `[sdmmc] root mount source=tegra-sd … -> OK …`, then `[sdmmc] root bound / = tegra-sd FAT read-only
+# … entries=N …`, or `[sdmmc] root -> REFUSED reason=…`. The cost terms are IN those lines: `probe_us`
+# (the volume scan) and `list_us` (the first full listing of the new root). UNAOS_FATPERF=1 would add
+# the per-operation SECTOR term, but it is wired only into the Pi `kernel8` leg (`K8_FEATS`) and not
+# into this mapping, so it is NOT available on a jetson image — extending it is a named follow-up, not
+# something to assume works. Default OFF => byte-identical to baseline (no line moves; the shared hunks
+# in shell.rs and fs/vfs.rs are a same-line append and a file-tail impl block). The ARMED polarity is
+# type-checked by the `arm-tegra-sdmmcroot` leg of KERNEL_CFG_MATRIX, never by this mapping.
+[ -n "${UNAOS_SDMMCROOT:-}" ] && _feats="${_feats}sdmmcroot,sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
 # the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping witness against the
@@ -3150,6 +3295,29 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-orinrx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx"
+  # TCURX armed (orin 14, 2026-09-05) — `tcuprobe` gates `arch/aarch64/hsp_tegra.rs` (the read-only
+  # HSP shared-mailbox / TCU RX probe) and ONE call site appended to the console pump's spawn line in
+  # `tegra_early_stop`. Its own tail leg for the reason `arm-tegra-orinrx` has one: `arm-tegra` is the
+  # DISARMED twin that compiles the shipped default jetson image, whose byte-identity this arc
+  # measures. HOSTED ON `arm-tegra`'s LIST + `tcuprobe` (not `arm-tegra-supstate`'s, unlike orinrx):
+  # the one site lives in `tegra_early_stop`, which every tegra leg compiles, so the bare list already
+  # type-checks it and the resolved set grows by EXACTLY {tcuprobe} — a red here names the knob and
+  # nothing else. UNIVERSE SIDE EFFECT: none that moves a mix count (`tcuprobe` implies `tegra`; every
+  # site is inside `feature = "tegra"` items, so `x86_cfg_universe` drops it). Board legs +1; gate +1.
+  "arm-tegra-tcuprobe ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tcuprobe"
+  # TCURX2 armed (orin 15, 2026-09-06) — `tcurx` gates rung 2 of A16: the write-back consumer in
+  # `arch/aarch64/hsp_tegra.rs` (tail, `rx_mbox_take`/`rx_mbox_took`/`w32`) and the second RX source
+  # inside `serial.rs`'s `serialrx` (the `mbox_drain` tail fn, the fold on `drain`'s `witness_once();`
+  # line, and the `mbox=` census variant folded onto `census`'s `let ovrf =` line). Its own leg for the
+  # reason the two above have one: `arm-tegra` / `arm-tegra-tcuprobe` are the DISARMED twins whose
+  # byte-identity this arc measures. HOSTED ON `arm-tegra-orinrx`'s LIST (supstate included) + the two
+  # knobs `tcurx` needs to see its own sites — `serialrx` lives behind `all(tegra, orinrx)` and the
+  # consumer behind `all(tegra, tcuprobe)`, and one of the four `drain` call sites is in
+  # `jd2_supstate_phase2`, which only `supstate` compiles. The resolved set grows by EXACTLY
+  # {tcuprobe, tcurx} over the already-green `arm-tegra-orinrx`, so a red here names this knob pair and
+  # nothing else. UNIVERSE SIDE EFFECT: none that moves a mix count (`tcurx` implies `tegra`; every
+  # site is inside `feature = "tegra"` items, so `x86_cfg_universe` drops it). Board legs +1; gate +1.
+  "arm-tegra-tcurx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,net5,sdmmc,sdmmc_arm,install_target,vnet,supstate,orinrx,tcuprobe,tcurx"
   # ORIN-BSPTICK armed (appended 2026-08-25, Candidate B arc 1) — `bsptick` gates the periodic-EL1-tick
   # block at `arch/aarch64/timer.rs`'s tail (`el1_bsptick_start`, `bsptick_witness`, the two statics),
   # the statement appended to `on_tick`'s closing line, and the statement appended to `main.rs`'s
@@ -3282,6 +3450,30 @@ KERNEL_CFG_MATRIX=(
   # prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-bsprun ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
 
+  # ORIN-BSPRUN HOSTING (appended 2026-09-06, orin 16) — the `bsprun` x `tegra_el0` cross, which no
+  # leg compiled. The ORIN10-LEGHOLES shape, and the same remedy: `arm-tegra-supstate` /
+  # `arm-tegra-supstate-el0` are the precedent pair this row copies.
+  #
+  # THE HOLE THIS ARC WOULD HAVE OPENED. `bsprun` implies nothing but itself, and the row above
+  # carries no `tegra_el0`, so on `arm-tegra-bsprun` the whole EL0 chain is cfg-erased
+  # (`arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which only `tegra_el0` turns
+  # on) — `user_task_trampoline` included. This arc's EL0 half, `bsprun_el0_first_run` (sched.rs
+  # tail) and the statement appended to the EL0-EL1CORE guard's closing brace, is gated
+  # `all(tegra, bsprun, aarch64_el0)`: on the row above it is erased fn AND erased call site, i.e.
+  # compiled by nothing. That is the exact shape the standing law forbids — a knob's gates must
+  # compile the configuration the knob turns ON — and it matters here more than usual, because the
+  # combination this row names IS the flight image (`UNAOS_TEGRA_EL0=1 UNAOS_BSPRUN=1`), not a
+  # hypothetical corner. The `all(tegra, bsprun)` HOSTING half is already compiled by the row above,
+  # which stays as the EL0-less twin (a shape the Orin can still be built in).
+  #
+  # HOSTED ON `arm-tegra-bsprun`'s LIST VERBATIM + `tegra_el0`, so the leg's line IS the
+  # configuration it compiles (the standing matrix rule) and the pair differs by exactly one term.
+  #
+  # UNIVERSE SIDE EFFECT: none. Both knobs are already named by arm-* legs, so `x86_cfg_universe`
+  # and the derived mix-leg count are unchanged. Board legs +1; gate +1. `./arroyo check` prints the
+  # live board/mix counts every run — read them there, not here.
+  "arm-tegra-bsprun-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun,tegra_el0"
+
 
   # ORIN-SUPSTATE armed (appended 2026-08-25) — `supstate` gates the console-surface STATE LIFT
   # (Candidate A arc 1): `display_tegra.rs`'s `SupSurface`/`sup_install`/`sup_with_surface`, the
@@ -3396,6 +3588,46 @@ KERNEL_CFG_MATRIX=(
   # are every one of them unchanged. Board legs +1 (30 -> 31); gate +1.
   "arm-tegra-supstate-el0-click ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,orinclick"
 
+  # KEYDOORS F2 (appended 2026-09-06) — the `supstate` x `desktop_firmware` cross, compiled by NO leg.
+  # The FIFTH hole of the ORIN10-LEGHOLES class, and the one KEYDOORS F2's fix would otherwise have
+  # walked straight into.
+  #
+  # THE HOLE, ENUMERATED not assumed. Split the third field of every KERNEL_CFG_MATRIX row on commas:
+  # `supstate` appears on exactly five rows (`arm-tegra-supstate`, `-el0`, `-el0-click`,
+  # `-el0-smpmark`, plus `arm-tegra-orinrx`/`-tcurx` which carry it), `desktop_firmware` on twelve,
+  # and the two sets are DISJOINT. Cargo closes nothing: nothing in `[features]` implies `supstate`,
+  # and `build_cfg_legs` emits `x86-mix-*` only, so no derived leg sweeps an aarch64 combination up.
+  #
+  # WHY IT MATTERS NOW. KEYDOORS F2 folds the shell key-door chain — `strip::key_escape` ->
+  # `quarry::key_route` -> `wc_shell_focus_key` — into `jd2_supstate_phase2`'s key drain (main.rs
+  # :7619), which had NONE of the three. The first two are `#[cfg(feature = "desktop_firmware")]`
+  # inside a function that is itself `#[cfg(all(tegra, aarch64, supstate))]`. Without this row those
+  # two calls are compiled by NOTHING: every green leg either erases the attribute (no
+  # `desktop_firmware`) or erases the whole function (no `supstate`), which is a fix wearing a green
+  # verdict — the exact failure ORIN10-LEGHOLES was minted to stop. The standing law is that a
+  # cfg-widen's gates must compile the configuration the widen turns on, IN THE MATRIX, where every
+  # future gate re-runs it, not in an operator-run check that binds no later edit.
+  #
+  # HOSTED ON `arm-tegra-desk`'s LIST VERBATIM + `supstate` (equivalently `arm-tegra-supstate-el0` +
+  # `desktop_firmware,livecon,quarry`). `quarry` is included and is not optional: with the knob off,
+  # `video/quarry.rs`'s seam is `#[inline(always)] false`, so the leg would compile a STUB and prove
+  # nothing about `key_route`'s real signature — the vacuity this row exists to prevent.
+  # `arm-tegra-supstate` and `-el0` stay as the furniture-less twins; both remain buildable shapes.
+  #
+  # NON-VACUITY, MEASURED not argued (2026-09-06, KEYDOORS-FIX): the name inside the
+  # `desktop_firmware`-gated `quarry` fold at main.rs:7619 was replaced with an undefined one and the
+  # three legs re-run directly. Result: RED arm-tegra-supstate-el0-desk, GREEN arm-tegra-supstate-el0
+  # (no `desktop_firmware`, so the attribute erases the statement), GREEN arm-tegra-desk (no
+  # `supstate`, so the whole function erases). Probe reverted. Only this combination sees it, which is
+  # what "not vacuous" has to mean. Reproduce: ~/unaos-bench/scratch/orin16/keydoors-fix/vacuity-probe.sh
+  #
+  # UNIVERSE SIDE EFFECT: none. Every knob named here is already named by other arm-* legs
+  # (`supstate` by five, `desktop_firmware`/`livecon`/`quarry` by twelve, `tegra_el0` by many), so the
+  # feature table, the board union, the unnamed-knob set, `x86_cfg_universe` and the derived mix-leg
+  # count are all unchanged. Board legs +1 (40 -> 41, counted from the runner's own banner, not from
+  # the prose figures above — those are older and were not re-derived here); gate +1.
+  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate"
+
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
   # the ARMED polarity would be compiled by NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark /
@@ -3416,6 +3648,41 @@ KERNEL_CFG_MATRIX=(
   # items, under `src/arch/aarch64/`) and the derived mix-leg count is unchanged. Board legs +1; gate
   # +1. `./arroyo check` prints the live board/mix counts every run — read them there, not here.
   "arm-tegra-ga10bprobe1 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe1"
+
+  # GA10B-PROBE2 armed (appended 2026-09-06) — `ga10bprobe2` gates the rung-2 tail of `ga10b_probe.rs`
+  # and its one appended call site in `tegra_early_stop`; the module itself is gated on EITHER probe knob.
+  # The ga10bprobe1 leg's shape, copied: `arm-tegra`'s list verbatim + `ga10bprobe2` ALONE — the flight
+  # polarity (rung 2 without rung 1's SYSTEM_OFF), which is also the polarity that compiles the module
+  # with every rung-1-only item cfg-erased (the dead-code trap a co-armed leg would hide). The co-armed
+  # polarity (both knobs) is compiled by the arc's esp-jetson gate command, not by a leg. There is no
+  # `not(feature = "ga10bprobe2")` site in src/, so no disarmed asymmetry is created. UNIVERSE SIDE
+  # EFFECT: none that moves a mix count (a NEW `[features]` entry named only on this arm-* leg; its sites
+  # are all inside `feature = "tegra"` items under `src/arch/aarch64/` and the one main.rs site is inside
+  # the tegra region). Board legs +1; gate +1 — read the live counts from `./arroyo check`.
+  "arm-tegra-ga10bprobe2 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe2"
+
+  # GA10B-PROBE3 armed (appended 2026-09-06, orin 16) — `ga10bprobe3` gates the rung-3 tail of
+  # `ga10b_probe.rs` and its one appended call site in `tegra_early_stop`; the module itself is gated on
+  # ANY of the three probe knobs. The ga10bprobe2 leg's shape, copied: `arm-tegra`'s list verbatim +
+  # `ga10bprobe3` ALONE. That is the `UNAOS_GA10B_PROBE3=1` flight polarity — rung 3 read-only, with
+  # `ga10bprobe3b`'s items (the module's ONLY `write_volatile`, `w32`, and the whole `rung3b` body)
+  # cfg-erased, which is exactly the dead-code trap a 3b-only leg would hide.
+  "arm-tegra-ga10bprobe3 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe3"
+
+  # GA10B-PROBE3B armed (same arc) — the SECOND leg, and it is not redundant with the one above: it is
+  # the ONLY leg that type-checks rung 3b's armed polarity (the `w32` write helper, the `rung3b` body,
+  # and the `#[cfg(feature = "ga10bprobe3b")]` statement inside `ga10bprobe3_run` that calls it). This is
+  # the `UNAOS_GA10B_PROBE3=2` flight polarity. `ga10bprobe3b` IMPLIES `ga10bprobe3`, so Cargo resolves
+  # both ON here and the leg's literal feature string names only the sub-knob — the union measurement in
+  # the block comment above reads LITERAL strings, so `ga10bprobe3` is named by the leg before this one
+  # and neither knob is a hole. There is no `not(feature = "ga10bprobe3")` or `not(feature =
+  # "ga10bprobe3b")` site in src/, so no disarmed asymmetry is created; the default legs cover the
+  # all-off state. UNIVERSE SIDE EFFECT: none that moves a mix count — both are NEW `[features]` entries
+  # named only on these arm-* legs, and every site is inside a `feature = "tegra"` item under
+  # `src/arch/aarch64/` except the one main.rs call, which is inside the tegra region. Board legs +2;
+  # gate +2 — read the live counts from `./arroyo check`, never from the numbers in the block comment
+  # above (they have gone stale twice and this arc does not re-count them).
+  "arm-tegra-ga10bprobe3b ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe3b"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
@@ -3767,6 +4034,53 @@ KERNEL_CFG_MATRIX=(
   # `tegra_el0`), which `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both)
   # supplies it.
   "arm-tegra-el0-jd1dc ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,jd1dc"
+  # SDMMCWRITE armed (appended 2026-09-05, orin 14) — `sdmmcwrite` gates the gap-#3 write probe at the
+  # tail of `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_write_probe` + its scratch-sector chooser + the CMD24
+  # twin), the same-line `pub use` on that file's TEGRA-SDBLK export line, the in-place widening of the
+  # `INT_WRITE_RDY` constant's cfg (`any(sdmmc_arm, sdmmcwrite)`), and the statement appended to the
+  # `sdmmc_census` call line in `main.rs`. Every site is inside `feature = "tegra"` items (the whole
+  # `mod metal` is `tegra`-gated), so ONLY a leg carrying `tegra` compiles them at all — and no leg
+  # carries `tegra` plus this knob but this one. Without it the ARMED polarity would be compiled by
+  # NOTHING: the exact orinrx / bsptick / smpmark shape, and the reason the standing law is that a
+  # knob's gates must compile the configuration the knob turns ON.
+  #
+  # WHY ITS OWN TAIL LEG rather than `,sdmmcwrite` appended to `arm-tegra`: `arm-tegra` is the DISARMED
+  # twin and the only leg anywhere that compiles the SHIPPED default jetson image — the image whose
+  # byte-identity to baseline this arc measures. Hosted on `arm-tegra`'s list verbatim + `sdmmcwrite`
+  # (the bsptick shape: the knob's sites need nothing beyond `tegra` + `sdmmc`, and `arm-tegra` already
+  # carries `sdmmc`, `sdmmc_arm` and `install_target`, so the widened `INT_WRITE_RDY` cfg is exercised
+  # in BOTH its `any(...)` arms — `sdmmc_arm` alone by every other arm-tegra leg, `sdmmcwrite` here).
+  # The resolved set grows by EXACTLY {sdmmcwrite} over a leg that is already green, so a red here
+  # names the knob and nothing else.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `sdmmcwrite` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (every site is inside `feature = "tegra"`
+  # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
+  # the live board/mix counts every run — read them there, not here.
+  "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
+  # ROOTFS armed (appended 2026-09-06, orin 16) — `sdmmcroot` gates the VFS root bind at the tail of
+  # `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_root_bind` + `root_probe` + the verdict cache), the same-line
+  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/fat` mount line
+  # in `shell::vfs_mount_table`, and the early-probe statement appended to the `sdmmc_census` call line
+  # in `main.rs`. The file-tail `impl FatBackend::new_tegra_sd` in `fs/vfs.rs` is
+  # gated `all(aarch64, tegra, sdmmc)` — every `arm-tegra*` leg already compiles THAT — but the CALLER
+  # is `sdmmcroot`-gated, and without this leg the armed polarity would be compiled by nothing (the
+  # orinrx / bsptick / sdmmcwrite shape, and the standing law that a knob's gates must compile the
+  # configuration the knob turns ON).
+  #
+  # WHY ITS OWN TAIL LEG rather than `,sdmmcroot` appended to `arm-tegra`: `arm-tegra` is the DISARMED
+  # twin and the only leg that compiles the SHIPPED default jetson image, whose byte-identity to
+  # baseline this arc measures. Hosted on `arm-tegra`'s list verbatim + `sdmmcroot` (the sdmmcwrite
+  # shape: the knob's sites need nothing beyond `tegra` + `sdmmc`, which that list already carries).
+  # The resolved set grows by EXACTLY {sdmmcroot} over a leg that is already green, so a red here names
+  # the knob and nothing else. It is a SEPARATE leg from `arm-tegra-sdmmcwrite` because the two knobs
+  # are siblings, not a ladder: neither implies the other and a build may arm either alone.
+  #
+  # UNIVERSE SIDE EFFECT: none that moves a mix count. `sdmmcroot` is a NEW `[features]` entry named
+  # only on this arm-* leg, so `x86_cfg_universe` drops it (`sdmmc_tegra.rs` is wholly `sdmmc`-gated
+  # and the `shell.rs` statement is inside `all(tegra, sdmmcroot)`) and the derived mix-leg count is
+  # unchanged. Board legs +1; gate +1. `./arroyo check` prints the live counts every run.
+  "arm-tegra-sdmmcroot ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcroot"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

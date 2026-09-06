@@ -5448,7 +5448,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};
     let mut mt = MountTable::new();
     mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
-    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/fat` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points BOTH at the card's FAT through BlockSource::TegraSd (`/fat` too, because it is EXEC_ROOT and the literal prefix of /fat/VUG.ELF etc). Appended to THIS line for knob-off byte identity (no line moves — panic::Location). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
     // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
     if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
         mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));

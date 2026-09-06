@@ -3254,7 +3254,7 @@ pub fn begin(
     surf_len: usize,
     compat: bool,
 ) -> Option<Probe> {
-    let i = id as usize;
+    let i = id as usize; seam_register_once(); // WINID2 (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. `SEAM_WIN` is the SIXTH id cache the WINID block's table of five missed (rmbp 13's sweep for the shape), and it is cleared on no path at all. It cannot be registered on its own store line the way the other five are — that line is inside `seam_glyph_note`, which runs once per GLYPH in print context under this file's own "never take a lock, allocate, or print" contract — so it is registered HERE instead: `begin` STRICTLY DOMINATES both readers (`end` adjudicates only a `Probe` this call handed out), it is off the print path, and it is ahead of the first timed span in this function, so no measured bracket widens. Boot-once latched, so the registry mutex is taken exactly once. See the WINID2 block at this file's tail.
     if compat || surf == 0 || surf_len == 0 || i >= IDS {
         return None;
     }
@@ -3952,3 +3952,112 @@ pub fn end(
         );
     }
 }
+
+// =================================================================================================
+// WINID2 (SO1(b) / A29) — **`SEAM_WIN` is the SIXTH id holder, and it is now registered.**
+// =================================================================================================
+//
+// rmbp 13 (2026-09-06) swept the tree for WINID's SHAPE — a `static AtomicU32` outside `wm` that
+// caches a `WinId` across a close — and found one the WINID block's table of five had missed:
+// [`SEAM_WIN`], declared beside [`SEAM_WRITES`] in this file. It is stored in exactly ONE place
+// ([`seam_glyph_note`]), read in exactly TWO (both in [`end`]), and CLEARED ON NO PATH AT ALL —
+// `display_tegra::ORINWM1_WIN`'s exact defect, in a file `video/mod.rs:73` declares unconditionally.
+//
+// WHY IT MATTERS, stated as the wrong behaviour rather than as a category. Both readers are
+// `verdict != "CLEAN" && p.id != 0 && p.id == SEAM_WIN.load(Relaxed)` — the test "is the window this
+// pass just convicted the one fbcon charged as the routed console". The FIRST of them is gated
+// `#[cfg(not(all(target_arch = "x86_64", feature = "wcg-paygo")))]`, so the aarch64 side compiles
+// it, and it is the WCGSEAM-HB REFUND GATE: on a match it may refund the sample's budget spend
+// (`TAKEN[w].fetch_sub`) and bump `W_REARM[w]` toward [`REARM_MAX`]. So a recycled id lets ONE
+// window's non-CLEAN verdict steer ANOTHER window's seam re-arm — the console closes, `wm` re-issues
+// its slot (render7: the console's win 1 came back as quarry's win 1), and the new tenant's
+// convictions are then refunded against a bound the console's boot-seam writer earned. The SECOND
+// reader only prints, but it prints `[wcgseam] win=N … routed=…` attributing a CONSOLE census to a
+// window that is not the console, which is the instrument lying on the wire.
+//
+// WHAT THE TWO COMPARISONS DO AFTER A CLOSE, now that the registry clears the cell — READ, not
+// assumed. `wm::close` stores [`crate::video::wm::WIN_NONE`] into it, and `WIN_NONE` is `0`
+// (`wm.rs:183`), which is the value `SEAM_WIN` was BORN with (`AtomicU32::new(0)`). Both call sites
+// already lead with `p.id != 0`, and `p.id` is a live row's id, never 0 — so with the cell at 0 the
+// equality can hold for no reachable `p.id` and the whole conjunct is INERT. Nothing becomes
+// reachable that was not, and nothing that was reachable is lost: the refund gate and the
+// `[wcgseam]` print simply stop firing until fbcon charges a routed glyph write again, which
+// re-stores a LIVE id. That is precisely the pre-route behaviour this instrument already ships —
+// the header note's own x86-QEMU reading, "no takeover, no routed console, `SEAM_WIN` never
+// written" — so a close returns the gate to a state the corpus has already characterised.
+//
+// WHERE THE REGISTRATION IS SITED, AND WHY NOT ON THE STORE LINE. The other five holders register on
+// their own `WIN.store(id, …)` line because that line runs ONCE PER WINDOW. `SEAM_WIN`'s does not:
+// it is inside [`seam_glyph_note`], which fbcon calls once per GLYPH from its two paint paths, in
+// PRINT CONTEXT, under a contract this file states in that function's own doc — "Three relaxed
+// atomics and nothing else — called from print context, so it must never take a lock, allocate, or
+// print." [`crate::video::wm::winid_register_holder`] takes the `HOLDERS` mutex and, on a full
+// registry, prints; folding it onto that line would break the contract on every glyph and put a
+// `serial_println!` back into the middle of a `serial_println!`. So the registration is sited on
+// [`begin`] instead, and the siting is a DOMINANCE argument, not a convenience: `end` adjudicates
+// only a `Probe` that `begin` handed out, so no read of `SEAM_WIN` is reachable without a prior
+// `begin`; `begin` is off the print path; and the fold is ahead of the first timed span in the
+// function, so no measured bracket widens by one cycle. The boot-once latch below keeps the mutex
+// to exactly ONE acquisition per boot rather than leaning on the registry's pointer scan.
+//
+// THE GATE is `all(witness, any(all(x86_64, wc), all(aarch64, desktop_firmware)))` — TIGHTER than
+// the WINID block's, and it is the exact predicate carried by the two lines that WRITE the cell
+// (`fbcon.rs:455`, the locked classic path, and `fbcon.rs:1480`, the unlocked split path).
+// Co-extensive by construction: on an image where those two charge sites are compiled out
+// `SEAM_WIN` can never hold anything but `WIN_NONE`, so there is nothing for a close to clear and
+// registering it would only spend one of `WINID_HOLDER_MAX`'s eight slots. The metal image is built
+// WITHOUT `witness`, so this costs the flown artifact nothing — measured, not assumed:
+// `./arroyo kernel8` is `8ff7c1d1f4e8938d…` before and after this change.
+//
+// LINE-NEUTRAL: this block is a TAIL APPEND and its one call site is a same-line fold onto a
+// statement that already existed. No `panic::Location` in this file moves — which matters more here
+// than in most, because `wcg.rs` is compiled unconditionally on every image the tree builds.
+
+/// WINID2 — has [`SEAM_WIN`] been handed to `wm`'s holder registry yet? A boot-once latch, so
+/// [`begin`] pays one atomic load per pass and the registry mutex is acquired exactly once.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+static SEAM_REGISTERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// WINID2 — register [`SEAM_WIN`] with `wm`'s holder registry, once per boot.
+///
+/// The `swap` publishes the latch BEFORE the registry call, and that ordering is load-bearing rather
+/// than stylistic: [`crate::video::wm::winid_register_holder`]'s registry-full arm prints, so a
+/// future caller on a paint path could re-enter this function through fbcon — the latch is already
+/// `true` by then and the second entry returns without touching the mutex.
+///
+/// LOCKFIX: `HOLDERS` is `wm`'s leaf mutex (taken by nothing else, held across nothing), so
+/// acquiring it here cannot participate in a cycle with `TABLE`, `WRITER` or `FBCON`.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn seam_register_once() {
+    if SEAM_REGISTERED.load(Ordering::Relaxed) {
+        return;
+    }
+    if SEAM_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::video::wm::winid_register_holder(&SEAM_WIN, "wcgseam");
+}
+
+/// WINID2 — the erasing twin. Without the two `witness` charge sites [`SEAM_WIN`] is never written,
+/// so there is no holder to register, and [`begin`]'s fold costs such an image not one byte.
+#[cfg(not(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+)))]
+#[inline(always)]
+fn seam_register_once() {}

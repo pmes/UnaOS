@@ -1,0 +1,3 @@
+MARK render6 f2eae02 pre-boot card=render6-20260906T0049Z-f2eae02 ksha=bec22fd0280a1e85 elfmax=0x2db188 butler=34809 seat=orin15 at 2026-09-06T01:27:28Z raw=10128578 orin=56018 unknown=15944
+MARK render6 f2eae02 q-burst 'tste\r' injected at 2026-09-06T01:28:44Z raw=10260727 orin=57750
+MARK render6 f2eae02 q-paced 'tste\r' 50ms at 2026-09-06T01:29:10Z raw=10292848 orin=57965

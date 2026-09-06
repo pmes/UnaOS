@@ -1743,7 +1743,7 @@ extern "C" fn user_task_trampoline() -> ! {
             (current_el >> 2) & 0b11
         );
         exit(); // marks FINISHED, retires the slot, posts joiners, switches to the scheduler
-    }
+    } #[cfg(all(feature = "tegra", feature = "bsprun", feature = "aarch64_el0"))] bsprun_el0_first_run(cpu, unsafe { (*raw).name }); // ORIN-BSPRUN — the ACCEPT half of the refusal above, appended ON this line (zero source lines added). The refusal has had a voice since EL0-EL1CORE; the acceptance never has, so a flight could not tell "an EL0 task first-ran at EL1 on the boot core" from "no EL0 task was ever dispatched". Rate-limited; see the fn at this file's tail.
     // SPSR_EL1 = 0x240 (M6e): M[3:0]=0b0000 (EL0t — a dedicated SP_EL0; EL0h/0b0001 is an illegal
     // return from EL1 -> PSTATE.IL), M[4]=0 (AArch64), DAIF = D,F masked with A (SError) and I (IRQ)
     // CLEAR. I unmasked => the generic timer preempts a running EL0 task (M6e; safe now that
@@ -10455,7 +10455,7 @@ pub fn run_bsp_tegra(cpu: usize) -> ! {
     // SCHED_ACTIVE store below has not happened yet.
     el0_refusal_rollup();
     let _ = load_witness_emit();
-    SCHED_ACTIVE.store(true, Ordering::Release);
+    SCHED_ACTIVE.store(true, Ordering::Release); mark_online(cpu); bsprun_hosting_witness(cpu); // ORIN-BSPRUN HOSTING (orin 16) — appended ON this line, zero source lines added (the Location-shift convention). `mark_online` is idempotent and `run_bsp` calls it again a statement later; hoisting it here is what lets the witness MEASURE `el0_placement_possible` instead of predicting it, and the measurement is the whole point (see the fn's doc at this file's tail).
     run_bsp(cpu)
 }
 
@@ -10658,4 +10658,102 @@ pub fn stk_probe_bounds(at: &str, name: &str, base: u64, len: u64) {
         hw,
         len as i64 - hw as i64
     );
+}
+
+// ── ORIN-BSPRUN — the HOSTING witnesses (orin 16) ────────────────────────────────────────────────
+//
+// Appended at the FILE TAIL, after every existing item, so not one panic `Location` line number
+// above moves; both call sites are statements APPENDED to lines that already existed. Everything
+// here is `all(tegra, bsprun)`-gated (the EL0 half additionally `aarch64_el0`-gated, so the
+// `arm-tegra-bsprun` matrix leg — which carries no `tegra_el0` — compiles neither the fn nor a
+// call to it and grows no dead-code warning). Knob-off the whole block vanishes and the Pi
+// `kernel8.img` is byte-identical, which is the proof this arc reports rather than asserts.
+//
+// WHY THESE TWO LINES EXIST. `UNAOS_BSPRUN=1` closes the EL0-EL1CORE refusal as a SIDE EFFECT that
+// no witness states. The refusal's exact predicate is `el0_placement_possible(CPU_AUTO)` =
+// `any(c) { ONLINE_MASK[c] && el1_core(c) }` (see the fn above), and on the shipped Orin image both
+// halves are false-by-different-reasons: cores 1-5 are in `ONLINE_MASK` but replay the BSP's EL2
+// regime (never stamped into `EL1_CORE_MASK`), while core 0 IS stamped at EL1 by the JM6 drop
+// (`main.rs` EL0-EL1CORE stamp; `[el0core] el1 core MEASURED: cpu=0 mask=0x1`) but is NOT in
+// `ONLINE_MASK` — the cooperative terminus never calls `mark_online`. `run_bsp_tegra` calls it, so
+// the conjunction becomes satisfiable at core 0 for the first time and `bg /fat/vug.elf` should
+// stop printing "no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)".
+// "Should" is the problem. Nothing on the wire says so, and the two lines that DO exist are both
+// negative: `[el0core] rollup:` is emitted by `run_bsp_tegra` BEFORE `mark_online`, so it reports
+// the pre-join state forever, and `SCHED: EL0 entry REFUSED` only prints when the thing fails. A
+// flight scored on absence-of-refusal cannot distinguish "the boot core became a legal EL0 host"
+// from "nobody tried". These two lines make both facts positive and measured.
+
+/// ORIN-BSPRUN — state, at the terminus and AFTER `mark_online(cpu)`, whether this core is now a
+/// legal host for an EL0 task, by evaluating the launcher's own predicate rather than restating the
+/// design. `CurrentEL` is re-read here (not inherited from the JM6 stamp) for the same reason
+/// [`mark_el1_core`] measures instead of assuming: the stamp proves what was true at the drop, this
+/// proves what is true at the instant placement becomes possible.
+///
+/// `HOSTING` is [`el0_placement_possible`]`(CPU_AUTO)` verbatim — the predicate
+/// `spawn_user_image_bg` refuses on — so a `REFUSING` verdict here is a falsified premise for the
+/// whole arc and not a cosmetic miss. Printed once, before `run()` entry and therefore before the
+/// first quantum expiry, so it can never itself be the first preempted print.
+#[cfg(all(feature = "tegra", feature = "bsprun"))]
+fn bsprun_hosting_witness(cpu: usize) {
+    let raw_el: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {el}, CurrentEL",
+            el = out(reg) raw_el,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let el = (raw_el >> 2) & 0b11;
+    let mut online_bits: u64 = 0;
+    let mut i = 0;
+    while i < NUM_CPUS {
+        if ONLINE_MASK[i].load(Ordering::Acquire) {
+            online_bits |= 1u64 << i;
+        }
+        i += 1;
+    }
+    let hosting = el0_placement_possible(CPU_AUTO);
+    serial_println!(
+        ":: [bsprun] host core={} el={} -> {} (online={:#x} el1cores={:#x}; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses on — EL0-EL1CORE) ::",
+        cpu,
+        el,
+        if hosting { "HOSTING" } else { "REFUSING" },
+        online_bits,
+        EL1_CORE_MASK.load(Ordering::Acquire)
+    );
+}
+
+/// ORIN-BSPRUN — cap on [`bsprun_el0_first_run`]'s lines, on the same terms as `EL0_REFUSE_LOG_MAX`:
+/// a first-run witness is per-TASK, and a desktop that launches and reaps tenants all afternoon
+/// would otherwise flood the wire. The count is uncapped; only the printing stops.
+#[cfg(all(feature = "tegra", feature = "bsprun", feature = "aarch64_el0"))]
+const BSPRUN_EL0_FIRSTRUN_LOG_MAX: u32 = 8;
+#[cfg(all(feature = "tegra", feature = "bsprun", feature = "aarch64_el0"))]
+static BSPRUN_EL0_FIRSTRUN: AtomicU32 = AtomicU32::new(0);
+
+/// ORIN-BSPRUN — the ACCEPT half of `user_task_trampoline`'s EL0-EL1CORE guard: this task passed the
+/// `CurrentEL == EL1` check and is about to `eret` to EL0 from core `cpu`. Called from the statement
+/// appended to the guard's closing brace, so it sits exactly where the refusal would have been taken
+/// and reports the same instant from the other side.
+///
+/// "The wire may not lose lines" applies to the cap as it does everywhere else: the line that
+/// announces the cap is emitted by exactly one caller (the counter is monotonic), so a capped run is
+/// never indistinguishable from a run that stopped dispatching EL0 tasks.
+#[cfg(all(feature = "tegra", feature = "bsprun", feature = "aarch64_el0"))]
+fn bsprun_el0_first_run(cpu: usize, name: &str) {
+    let n = BSPRUN_EL0_FIRSTRUN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= BSPRUN_EL0_FIRSTRUN_LOG_MAX {
+        serial_println!(
+            ":: [bsprun] el0 first-run '{}' on core {} — CurrentEL EL1 checked, eret to EL0 ACCEPTED (n={}) ::",
+            name,
+            cpu,
+            n
+        );
+    } else if n == BSPRUN_EL0_FIRSTRUN_LOG_MAX + 1 {
+        serial_println!(
+            ":: [bsprun] el0 first-run witness CAPPED at {} lines — further first-runs are COUNTED, not printed ::",
+            BSPRUN_EL0_FIRSTRUN_LOG_MAX
+        );
+    }
 }

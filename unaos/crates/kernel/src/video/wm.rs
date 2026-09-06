@@ -2209,7 +2209,7 @@ pub fn close(id: WinId) -> bool {
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
     // slot may be re-issued and a live drag would be steering a stranger's window.
-    drag_forget(id);
+    drag_forget(id); winid_close_teardown(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path.
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -5117,7 +5117,7 @@ fn composite_inner() -> CursorTail {
                 Some(fb) => {
                     if fb.is_ready() {
                         let info = fb.info();
-                        if let Some(b) = super::crystal::open_rect(info.width, info.height) {
+                        if let Some(b) = super::menubar::open_dropdown_rect(info.width, info.height) {
                             if b.2 != 0 && b.3 != 0 && boxes_overlap(sbox, b) {
                                 reserved_hit = true;
                             }
@@ -16868,7 +16868,7 @@ fn occ_clip(rows: &[Window; MAX_WINDOWS], i: usize, shell: u32, pw: usize, ph: u
             // per window and pushes nothing until the operator opens the SHARD menu. Its slot is
             // [`MENU_OCC_MAX`], reserved above; `c.push` cannot drop it (`OCC_CLIP_MAX` accounts for
             // it and is `const`-asserted to fit `OCC_MAX`).
-            if let Some(b) = super::crystal::open_rect(pw, ph) {
+            if let Some(b) = super::menubar::open_dropdown_rect(pw, ph) {
                 if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) {
                     let _ = c.push(b);
                 }
@@ -17217,7 +17217,7 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
             // the menu is `MAX_WINDOWS + FURNITURE_MAX + MENU_OCC_MAX == OCC_MAX` — so a dropped
             // box still reports through `dropped`, and the OCC_MAX ledger records the new worst
             // case.
-            if let Some(b) = super::crystal::open_rect(pw, ph) {
+            if let Some(b) = super::menubar::open_dropdown_rect(pw, ph) {
                 if !c.push(b) {
                     dropped += 1;
                 }
@@ -20832,7 +20832,7 @@ pub fn vacate_selftest() {
         n1.1, n2.1
     );
     retile_selftest();
-    closeiso_selftest();
+    closeiso_selftest(); winid_selftest(); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Sited beside `closeiso_selftest` because it asserts the other half of the same close: that one proves WHICH ROWS a close removes, this one proves what a close leaves BEHIND in the caches that named them.
     movevacate_selftest();
     repaint();
 }
@@ -22216,8 +22216,8 @@ fn create_inner(
     // This is `wcn_forget`'s precedent — WC-N clears its per-slot cell under the table lock, at the
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
-    t.rows[slot] = row;
-    drop(t);
+    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
+    drop(t); winid_alloc_witness(id, winid_generation); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
     // where the id demonstrably names something new.
@@ -24807,4 +24807,493 @@ pub fn deadman_damage_sample() -> Option<(u32, u32)> {
         }
     }
     Some((rows, stat))
+}
+
+// =================================================================================================
+// WINID — **a closed window's id is cleared out of every cache that holds it, BEFORE the slot can be
+// re-issued.** SO1(b) / orin-ledger A29, first proved on the Orin (render7, 2026-09-06).
+// =================================================================================================
+//
+// ## The defect
+//
+// `WinId` is a slot alias: `create_inner` takes the lowest free row and hands back `slot + 1`, and
+// `close` frees the row. So the SAME NUMBER names a different window after a close, and the render7
+// wire shows exactly that happening on metal:
+//
+// ```text
+// [wm-act] close-furniture win=4 owner=0xffffff02 closed=true route-dropped=false
+// [wm-act] close-furniture win=1 owner=0xffffff01 closed=true route-dropped=true
+// [wc-a]   close win=2
+// [quarry] open win=1 surf=1152x720 ...        <- quarry is now win 1, the console's old id
+// ```
+//
+// The table itself is sound — `create_inner` already re-arms every PER-SLOT battery it owns (wc-d,
+// wc-g/wch, paygo, CTRLWIT, WPACE shadow) precisely because "an id is a recycled slot alias". What it
+// cannot reach is the caches OUTSIDE this module that hold an id across a close, one per piece of
+// kernel furniture:
+//
+// | cell                         | cleared by                               | reached by the close disc?          |
+// |------------------------------|------------------------------------------|-------------------------------------|
+// | `fbcon::CONSOLE_WIN`         | `fbcon::panel_console_window_closed(id)` | YES — `wc_close_furniture` calls it |
+// | `pulsewin::WIN`              | `pulsewin::close()`                      | only via `pulsewin::press_route`    |
+// | `quarry::live::WIN`          | `quarry::close()`                        | only via `quarry::press_route`      |
+// | `instgui::WIN`               | `instgui::close()`                       | only via its own path               |
+// | `display_tegra::ORINWM1_WIN` | NOTHING — never cleared at all           | YES, and it is the idempotence latch|
+//
+// Only the console has a hook on the id-scoped close path. Every other cell is cleared by its own
+// module's `close()` and by nothing else, so a close that arrives through the operator's close disc
+// (`wc_close_furniture` -> `wm::close(id)`, the aarch64 CONWINCLOSE arm and its x86 twin) frees the
+// row behind the cell's back. `ORINWM1_WIN` is the worst of them because it is never cleared on ANY
+// path AND it is an idempotence latch: after its window is closed, `orin_wm1_open` hands the stale id
+// straight back to its caller, and once the table re-issues that slot the latch is naming a
+// stranger's window.
+//
+// ## Why teardown-on-close and NOT a generation counter in the id
+//
+// The generation counter (slot + gen packed into `WinId`, so a stale reference can never match) was
+// the other candidate and it is refused, on this module's own prior reasoning and on diff size:
+//
+//  * `WinId` is `u32` and it CROSSES THE SYSCALL ABI — WC-B's `SYS_WIN_*` verbs pass it to and from
+//    ring 3. `compat_present`'s F2 note already weighed and rejected exactly this ("Chosen over
+//    widening `WinId` with a generation counter because the flag is exact for this hazard and keeps
+//    the id a plain slot number for WC-B's syscall ABI"). Nothing has changed to reopen that.
+//  * `dock`'s two pin sentinels are `WinId::MAX` and `WinId::MAX - 1`, chosen because "real ids are
+//    `1..=MAX_WINDOWS`". Packing a generation into the id destroys that argument at the same moment
+//    it destroys the arithmetic every `win=N` witness in the corpus is read by.
+//  * It is the LARGER diff by two orders of magnitude — every producer and consumer of an id — and
+//    `wm.rs` is ~21k lines under a strict line-neutral rule (see `composite`'s marker).
+//
+// Teardown is also the property SO1 actually needs. A generation counter makes a stale reference FAIL
+// to match; it does not make `ORINWM1_WIN`'s latch mint a new window, and it does not stop
+// `fbcon::route_present` from being aimed at a dead id. Clearing the cell does both.
+//
+// ## The shape
+//
+// One registry of `&'static AtomicU32` cells, each registered once by the module that owns it at the
+// point where it stores an id. [`close`] clears every registered cell that holds the dying id — an
+// `AcqRel` `compare_exchange`, so a cell holding some OTHER id is untouched and a foreign or stale
+// argument can never unhook a live window (`panel_console_window_closed`'s exact safety property,
+// generalised). It runs BESIDE `drag_forget` — ahead of the table lock and therefore ahead of the row
+// free — for `drag_forget`'s stated reason: "the slot may be re-issued and a live drag would be
+// steering a stranger's window".
+//
+// ## THE GATE, and why gating this is CORRECT and not a dodge
+//
+// Every item below is gated `any(all(x86_64, wc), all(aarch64, desktop_firmware))` — the furniture
+// family's own gate — and every entry point has an erasing twin, so a knob-off image gets not one
+// byte. That is not a byte-identity dodge, it is the predicate's exact meaning: all five caches in
+// the table above BELONG to furniture that only exists under those features. Without them there is
+// no console window, no pulse window, no quarry, no installer and no ORIN-WM1 row, therefore no
+// registered cell, therefore nothing for a close to clear. The gate was ADDED after measurement:
+// ungated, `./arroyo kernel8` moved the knob-off Pi image from `8ff7c1d1…` to `8f9bf221…`, because
+// the teardown call, the generation bump and the two witnesses are real code in `close` and
+// `create_inner`, which the Pi's knob-off image compiles. With the gate the image is byte-identical.
+//
+// LOCKFIX: `close` is on the input path. [`HOLDERS`] is a LEAF mutex — taken by nothing else, never
+// held across a `wm`, `WRITER`, `FBCON` or heap call, and never held across a `serial_println!` (the
+// registry is copied out and the guard dropped before anything else runs).
+//
+// LINE-NEUTRAL: this whole block is a TAIL APPEND, and its call sites are same-line folds onto
+// statements that already exist. Not one `panic::Location` in this file, or in any file, moves.
+
+/// WINID — how many id caches the registry can hold. Five exist today (the table above); the spare
+/// capacity is for the next piece of kernel furniture, which should register here rather than invent
+/// a sixth private clearing rule.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub const WINID_HOLDER_MAX: usize = 8;
+
+/// WINID — one registered id cache: the cell, and the name that goes on the wire when it is cleared.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[derive(Clone, Copy)]
+struct WinIdHolder {
+    cell: Option<&'static core::sync::atomic::AtomicU32>,
+    tag: &'static str,
+}
+
+/// WINID — the registry. A leaf mutex; see this block's LOCKFIX note.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static HOLDERS: Mutex<[WinIdHolder; WINID_HOLDER_MAX]> =
+    Mutex::new([WinIdHolder { cell: None, tag: "" }; WINID_HOLDER_MAX]);
+
+/// WINID — **register an id cache so [`close`] can clear it.** Idempotent by CELL ADDRESS, so the
+/// natural call site (the module's own `WIN.store(id, ...)` line, which runs once per window) costs a
+/// pointer scan and nothing else on every call after the first.
+///
+/// Returns `true` if the cell is registered when this returns — including the "already registered"
+/// case. `false` means the registry is full, which is a build-time fact (`WINID_HOLDER_MAX`) and is
+/// therefore reported LOUDLY rather than swallowed: an unregistered cache is the defect this whole
+/// block exists to remove, and it must never fail silently.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn winid_register_holder(
+    cell: &'static core::sync::atomic::AtomicU32,
+    tag: &'static str,
+) -> bool {
+    let mut free = None;
+    {
+        let mut h = HOLDERS.lock();
+        for i in 0..WINID_HOLDER_MAX {
+            match h[i].cell {
+                Some(c) if core::ptr::eq(c, cell) => return true,
+                None if free.is_none() => free = Some(i),
+                _ => {}
+            }
+        }
+        if let Some(i) = free {
+            h[i] = WinIdHolder { cell: Some(cell), tag };
+        }
+    }
+    if free.is_none() {
+        serial_println!(
+            "[wm] winid-register REFUSED tag={} reason=registry-full max={} (raise WINID_HOLDER_MAX — an unregistered id cache is SO1(b) re-entered)",
+            tag,
+            WINID_HOLDER_MAX
+        );
+    }
+    free.is_some()
+}
+
+/// WINID — the erasing twin. On an image with no window furniture there is no cache to register; the
+/// call sites keep their shape and the image keeps its bytes.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+pub fn winid_register_holder(
+    _cell: &'static core::sync::atomic::AtomicU32,
+    _tag: &'static str,
+) -> bool {
+    false
+}
+
+/// WINID — clear `id` out of every registered cache. Returns how many cells actually held it, and
+/// writes their tags into `names`. Id-checked per cell (`compare_exchange`), so a cell pointing at a
+/// different window is never disturbed.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX]) -> usize {
+    if id == WIN_NONE {
+        return 0;
+    }
+    let snapshot = *HOLDERS.lock();
+    let mut n = 0;
+    for e in snapshot.iter() {
+        if let Some(c) = e.cell {
+            if c.compare_exchange(
+                id,
+                WIN_NONE,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+            {
+                names[n] = e.tag;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// WINID — per-SLOT reuse generation. NOT part of the id (see the block header): this is evidence
+/// only, the number of times the slot has been handed to a window, so a capture can tell the console
+/// that was win 1 from the quarry that is win 1 now. Wrapping, because a boot that recycles a slot
+/// four billion times has already proved whatever this counter could.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static SLOT_GEN: [core::sync::atomic::AtomicU32; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS];
+
+/// WINID — the generation `id`'s slot is currently on, or 0 for a non-id.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn winid_gen(id: WinId) -> u32 {
+    let slot = (id as usize).wrapping_sub(1);
+    if id == WIN_NONE || slot >= MAX_WINDOWS {
+        return 0;
+    }
+    SLOT_GEN[slot].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// WINID — the erasing twin. No furniture, no generation counter, and `gen=0` is the same reading a
+/// non-id gives on a gated build.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+pub fn winid_gen(_id: WinId) -> u32 {
+    0
+}
+
+/// WINID — bump `slot`'s generation as it is handed to a new window. Called from `create_inner`
+/// under the table lock (a relaxed RMW on a per-slot cell; it takes nothing and can block nothing),
+/// so the new generation is published with the row itself.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_slot_bump(slot: usize) -> u32 {
+    SLOT_GEN[slot]
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+/// WINID — the erasing twin, so `create_inner`'s fold costs a knob-off image nothing.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn winid_slot_bump(_slot: usize) -> u32 {
+    0
+}
+
+/// WINID — witness bound. Closes and creates are operator-scale events, but `close_owner` can reap a
+/// fleet in one call and this line is UNGATED BY `witness` (the metal image is built without
+/// `witness`, so a claim gated on it is not a claim on the artifact that flies). Bounded rather than
+/// gated, on `CLOSE_LOG_MAX`'s precedent in `arch/*/syscall.rs`. A close that actually CLEARED a
+/// holder is always spoken: that is the defect's own signature and it must not fall off a budget.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+const WINID_LOG_MAX: u32 = 32;
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static WINID_CLOSE_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static WINID_ALLOC_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WINID — the close half of the witness.
+///
+/// `route=` is read from `fbcon::CONSOLE_WIN` BEFORE the clear, and it is the answer to SO1's second
+/// question — why the console's close read `route-dropped=true` while the desktop furniture row's
+/// read `false`:
+///
+///  * `dropped` — this id WAS the routed console and this call is what unhooked it. On the
+///    `wc_close_furniture` path it will NOT read this, because that arm calls
+///    `fbcon::panel_console_window_closed` one statement earlier and the route is already gone;
+///    seeing `dropped` here therefore means a close path reached the console row WITHOUT the hook,
+///    which is a finding.
+///  * `none` — no console route is installed (the normal reading on the furniture path, after the
+///    hook has run).
+///  * `kept` — a console route is installed and it points at a DIFFERENT window; this close does not
+///    touch it. That is precisely what `route-dropped=false` was saying about the desktop row.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_close_witness(
+    id: WinId,
+    cleared: usize,
+    names: &[&'static str; WINID_HOLDER_MAX],
+    route: &'static str,
+) {
+    if cleared == 0
+        && WINID_CLOSE_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX
+    {
+        return;
+    }
+    serial_println!(
+        "[wm] close win={} gen={} route={} holders-cleared={} names={},{},{},{}",
+        id,
+        winid_gen(id),
+        route,
+        cleared,
+        names[0],
+        names[1],
+        names[2],
+        names[3]
+    );
+}
+
+/// WINID — the teardown itself, folded into [`close`]. Split out so the fold is one call.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_close_teardown(id: WinId) {
+    let route = winid_console_route(id);
+    let mut names: [&'static str; WINID_HOLDER_MAX] = [""; WINID_HOLDER_MAX];
+    let cleared = winid_holders_clear(id, &mut names);
+    winid_close_witness(id, cleared, &names, route);
+}
+
+/// WINID — the erasing twin. No furniture on this image, so a close has nothing to tear down and
+/// `close` compiles to exactly the instructions it did before this arc.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn winid_close_teardown(_id: WinId) {}
+
+/// WINID — `route=` for the close witness.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_console_route(id: WinId) -> &'static str {
+    let cw = super::fbcon::console_win();
+    if cw == WIN_NONE {
+        "none"
+    } else if cw == id {
+        "dropped"
+    } else {
+        "kept"
+    }
+}
+
+/// WINID — the alloc half of the witness, folded into `create_inner` AFTER its table guard drops.
+/// Never called under the lock: a `serial_println!` on a routed console asks for a composite, and a
+/// composite takes `TABLE`.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_alloc_witness(id: WinId, generation: u32) {
+    if WINID_ALLOC_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX {
+        return;
+    }
+    serial_println!("[wm] alloc win={} gen={}", id, generation);
+}
+
+/// WINID — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn winid_alloc_witness(_id: WinId, _generation: u32) {}
+
+/// WINID — **the falsifier for SO1(b): does a closed window's id survive in a cache that held it?**
+///
+/// This is the QEMU-runnable proof the metal capture could only suggest. render7 showed the console
+/// leaving win 1 and quarry arriving as win 1, but a boot log cannot show what a private static in
+/// another module still contains — so the fixture registers a cell of its own, drives the exact
+/// sequence, and reads the cell back.
+///
+/// Four legs, and legs 2 and 3 are the ones that FAIL on the pre-WINID tree:
+///
+///  1. `register` — the cell is accepted (and re-accepted: registration is idempotent by address).
+///  2. `cleared`  — after `close(w1)`, the cell that held `w1` reads `WIN_NONE`. Before WINID it
+///                  still read `w1`, and that is the whole defect.
+///  3. `recycled` — the very next `create` hands the SAME id back (slot reuse, proved rather than
+///                  assumed) and its generation has advanced. This is what makes leg 2 matter: a
+///                  cell that survived leg 2 would now be pointing at a DIFFERENT window while
+///                  every liveness test in the tree — `wm::info`, `owner_of`, `z` — answers yes.
+///  4. `id-scoped` — closing some OTHER window does NOT disturb a cell holding `w2`
+///                  (`panel_console_window_closed`'s safety property, generalised to the registry).
+///
+/// `witness`-gated like every fixture in this file, and gated on the furniture predicate too, since
+/// that is what the machinery under test is gated on. The WITNESSES it exercises (`[wm] close …` /
+/// `[wm] alloc …`) are NOT `witness`-gated, because the metal image is built without `witness`.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn winid_selftest() {
+    use core::sync::atomic::Ordering;
+
+    /// The fixture's own id cache — a stand-in for `pulsewin::WIN`, `quarry::live::WIN`,
+    /// `instgui::WIN`, `display_tegra::ORINWM1_WIN` and `fbcon::CONSOLE_WIN`, which are private to
+    /// their modules and cannot be read from here.
+    static PROBE_CELL: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(WIN_NONE);
+    const ASID_PROBE: u64 = 0xE2D;
+
+    let sa = &raw const FV_SURF_A as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+
+    // LEG 1 — registration, twice, to assert idempotence by cell address rather than a second slot.
+    let reg1 = winid_register_holder(&PROBE_CELL, "winid-probe");
+    let reg2 = winid_register_holder(&PROBE_CELL, "winid-probe");
+    let reg_ok = reg1 && reg2;
+
+    let w1 = create(ASID_PROBE, sa, len, 8, 8, 32, b"winid-1");
+    if w1 == WIN_NONE {
+        serial_println!("[winid] selftest -> SKIP (window table full)");
+        return;
+    }
+    let g1 = winid_gen(w1);
+    PROBE_CELL.store(w1, Ordering::Release);
+
+    // LEG 2 — the close. `close` is the ID-SCOPED primitive the furniture close disc calls
+    // (`wc_close_furniture` -> `wm::close`), which is the exact path that used to run behind every
+    // one of these caches' backs.
+    close(w1);
+    let held_after_close = PROBE_CELL.load(Ordering::Acquire);
+    let cleared_ok = held_after_close == WIN_NONE;
+
+    // LEG 3 — the recycle. The table hands out the LOWEST free slot, so this reclaims w1's slot and
+    // `w2 == w1` is the reused ALIAS, not a coincidence. `gen` is what tells the two apart.
+    let w2 = create(ASID_PROBE, sa, len, 8, 8, 32, b"winid-2");
+    let g2 = winid_gen(w2);
+    let recycled_ok = w2 == w1 && g2 == g1.wrapping_add(1);
+
+    // LEG 4 — id-scoping. A third window's close must not touch a cell holding w2.
+    PROBE_CELL.store(w2, Ordering::Release);
+    let w3 = create(ASID_PROBE, sa, len, 8, 8, 32, b"winid-3");
+    close(w3);
+    let scoped_ok = PROBE_CELL.load(Ordering::Acquire) == w2;
+
+    close(w2);
+    PROBE_CELL.store(WIN_NONE, Ordering::Release);
+
+    let ok = reg_ok && cleared_ok && recycled_ok && scoped_ok;
+    serial_println!(
+        "[winid] selftest register={} cleared={} (held={} after close win={}) recycled={} (w1={} gen={} -> w2={} gen={}) id-scoped={} -> {}",
+        reg_ok as u8,
+        cleared_ok as u8,
+        held_after_close,
+        w1,
+        recycled_ok as u8,
+        w1,
+        g1,
+        w2,
+        g2,
+        scoped_ok as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    composite();
+}
+
+/// WINID — the SKIP twin, so the fixture's call site needs no gate of its own and a reader of a
+/// knob-off capture is told the fixture did not run rather than left to infer it from silence.
+#[cfg(all(
+    feature = "witness",
+    not(any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ))
+))]
+fn winid_selftest() {
+    serial_println!("[winid] selftest -> SKIP (no window furniture on this image: the five id caches WINID guards all live behind `wc` / `desktop_firmware`)");
 }

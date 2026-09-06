@@ -1,0 +1,5 @@
+[sdmmc] write probe armed (UNAOS_SDMMCWRITE=1): CMD24 then CMD17 read-back, 1-bit default speed, PIO, vendor block untouched, card_blocks=62333952
+[sdmmc] write target=lba 2047 reason=mbr-gap-top layout=MBR (0x55AA boot signature; classic partition table) first_part_lba=2048 card_blocks=62333952
+[sdmmc] write prior lba=2047 = zero
+[sdmmc] write lba=2047 -> OK (512/512 match, t=78112 ticks = 2499 us @ 31250000 Hz)
+cpu_on=5 exceptions=0

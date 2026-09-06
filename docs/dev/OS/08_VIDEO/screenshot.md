@@ -17,7 +17,25 @@ and [`drivers/ehci/mod.rs`](../../../../unaos/crates/kernel/src/drivers/ehci/mod
 |---|---|---|
 | `screenshot` verb | the shell task (`dispatch_command`), interrupts enabled | calls `prtscr::capture()` directly and prints the outcome on both sinks |
 | Print Screen key | the HID decoders' press edge, inside a driver lock | calls `prtscr::request()` — **one atomic store and one counter**, nothing else |
+| ⌘⇧3 / ⌘⇧4 (PRTSCRCHORD) | the same press edge, one line below the 0x46 test | the same `prtscr::request()`; the witness names which chord fired |
 | — | the device-service pass, beside `fat::probe_once()` | `prtscr::service()` sees the flag and performs the capture |
+
+**PRTSCRCHORD (2026-09-02).** The rMBP's internal Apple keyboard has no Print Screen key and never
+puts usage 0x46 on the wire, so the metal-proven capture was bound to a key the bench machine cannot
+press. The Apple chords ⌘⇧3 (GUI+Shift+3) and ⌘⇧4 (GUI+Shift+4) are bound to the same whole-screen
+capture through `xhci::hid_screenshot_chord_edge(cur_keys, prev_keys, modifiers)`, asked by both
+decoders as an `else if` directly after `hid_print_screen_edge` (so a report carrying both arms
+exactly once). The judgement has to live at the decoder: a chord is a modifier byte plus a usage,
+and the boot report is the only place both are in one hand — `pal::Event::Key` carries no modifier.
+Left and right GUI (`HID_MOD_GUI` = 0x88) and Shift (`HID_MOD_SHIFT` = 0x22) count alike; the digit
+is diffed against the previous report exactly as 0x46 and the lock keys are, so a held chord arms one
+capture, not one per restated report. **The chord types nothing:** `hid_key_ascii` already folds
+every GUI-held usage to 0, so no `Key('3')`/`Key('#')` is delivered — the same suppression 0x46 gets
+from its `(0, 0)` table entry, reached through the modifier instead. The release fold ignores GUI on
+purpose and emits a lone `KeyUp('#')`/`KeyUp('$')` when the digit lifts — the documented
+"spurious release, safe" case. ⌘⇧4 is region-select on macOS; region-select is reserved here (no
+pointer-driven selector exists) and the chord is honoured as a whole-screen capture rather than
+ignored.
 
 The split is not stylistic. The Print Screen edge is decoded inside `service_ehci_hid()` while
 `EHCI_HID` is held (or inside the xHCI event pass while its loan is held), and the writable FAT
@@ -102,8 +120,34 @@ de-duplicate. The names are 8.3-clean, so they need no long-name entry.
 ## 6. Writing, and `Busy`
 
 The write is the same four-step recipe `shell::fs_write` uses, minus the truncate branch (which
-cannot apply — the name is known absent): `mount_program_source` → `write_veto` → `create_in_dir`
+cannot apply — the name is known absent): `mount_capture_target` (§6.1) → `create_in_dir`
 → `write_grow(0, 0, dir_lba, dir_off, 0, bytes)`.
+
+### 6.1 Where a capture may land — PRTSCR-VOL, the two-rung target ladder
+
+A capture wants "a writable FAT volume the operator can carry away", which is **not** the question
+`mount_program_source` answers ("the volume this system is bound to"). `prtscr::mount_capture_target`
+tries, in order:
+
+1. **The program source**, when `write_veto()` is `None`. Every boot whose program volume is
+   writable — QEMU `test-fat`, a stick-booted x86 machine, the Pi's microSD — behaves exactly as
+   before; rung 2 is never consulted.
+2. **The dedicated USB mass-storage handle** (`BlockSource::Usb`), when rung 1 is read-only or
+   absent. `publish_usb_geometry` populates that handle on *every* stick arrival — boot-time or
+   hot-plug (Boot AI-2 proved on metal that a hot-plugged card reaches the FAT layer) — and the
+   handle's read/write paths (`read_block_usb`/`write_block_usb` and their multi-sector twins)
+   bypass the backend selector entirely. The ladder re-reads the registry on every call, so there is
+   no cache to invalidate: the first storage-ready pass after the stick enumerates sees it.
+
+Rung 2 does **not** weaken FRGUARD. The hazard FRGUARD closes is a write aimed at the *boot volume*
+silently landing on whatever claimed the global slot (`default_writable()`'s `BM_SUBSTITUTED`
+refusal, born of Boot AI-2's misdirected `/UNAOS.LOG`). Rung 2 aims at the stick *by name*, under
+its own handle — the operator's carry-away medium, which is exactly where a screenshot belongs —
+and the global slot's veto stands untouched, as does SDHC-4c's read-only policy on the internal
+reader and the reserved flight-recorder extent (which no file verb can name, PNGs included).
+
+Only when *both* rungs decline does the capture refuse, and the refusal describes rung 1 — the more
+informative failure — while stating that no writable USB volume was attached either (§7).
 
 `FatError::Busy` is **not a failure**. It is the block layer refusing to *wait* for a loan it could
 not take instantly — under WEDGE-8 that is the fix working (`drivers/block.rs`: "a NORMAL,
@@ -127,8 +171,8 @@ never silence, and each names *what was inspected* rather than only what was mis
 ```
 :: PRTSCR: no panel attached (or the panel lock was contended while masked) — capture skipped ::
 :: PRTSCR: panel layout U8 has no RGB inverse — capture skipped ::
-:: PRTSCR: no FAT volume on any program-source handle (NoDisk; handles=...) — capture skipped ::
-:: PRTSCR: REFUSED READ-ONLY (source=... label=... reason=...) — capture skipped ::
+:: PRTSCR: no FAT volume on the program-source or USB handles (NoDisk; handles=...) — capture skipped ::
+:: PRTSCR: REFUSED READ-ONLY (source=... label=... reason=...) — no writable USB volume attached either — capture skipped ::
 :: PRTSCR: SCREEN0.PNG..SCREEN99.PNG all present at the volume root — capture skipped (nothing overwritten) ::
 :: PRTSCR: encoder declined (OutOfMemory) for 2880x1800 needing 15555053 bytes — capture skipped ::
 :: PRTSCR: create failed -EAGAIN (Busy; handles=...) — capture skipped ::
@@ -140,7 +184,12 @@ arrived" from "the key arrived and the capture refused":
 
 ```
 :: PRTSCR: PrintScreen (HID 0x46) down on <controller> -> capture armed ::
+:: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on <controller> -> capture armed ::
+:: PRTSCR: [prtscr] chord=cmd-shift-4 (GUI+Shift+digit) down on <controller> -> capture armed ::
 ```
+
+`chord=cmd-shift-3` / `chord=cmd-shift-4` is the PRTSCRCHORD token — `awk '/chord=cmd-shift/'` on
+a serial capture answers "did the chord arrive" independently of whether the capture then succeeded.
 
 `prtscr::census()` returns `(requests, captures, refusals)` for the same reason — a key press that
 produced no file and a key press that never happened are different failures.
@@ -169,11 +218,48 @@ present; only this unattended write is behind the knob. It does not clean up aft
 (`btbond::selftest_once`'s precedent): the written file **is** the deliverable.
 
 It latches only on a pass that reached a **writable** volume. Two states precede one and neither is
-a verdict: no volume at all (storage enumerates asynchronously), and a volume that vetoes writes —
-on x86 the program-source ladder falls back to the internal SD reader, which SDHC-4c mounts
-read-only, until the USB stick registers. Both are announced once and waited through. Latching on
-the veto is exactly what the first run of this witness did, and it gave up about a second before the
-writable volume arrived.
+a verdict: no volume at all (storage enumerates asynchronously), and a volume that vetoes writes.
+Both are announced once and waited through — the wait polls `mount_capture_target` (§6.1) on every
+storage-ready pass, so a writable volume that arrives *late* is adopted, however late — and the
+arrival itself is announced, so the log shows the deferred run firing rather than a PASS appearing
+out of nowhere:
+
+```
+:: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::
+:: PRTSCR-ST: writable volume arrived (source=usb label=...) — running the deferred capture selftest ::
+```
+
+Latching on the veto is exactly what the first run of this witness did, and it gave up about a
+second before the writable volume arrived.
+
+## 8.1 Metal — the rMBP's boot medium can never take a capture, and that is policy
+
+Flight-3 (`UNAOS_PRTSCRST=1`, 2026-08) settled the metal state of this bench:
+
+- **The boot SD is read-only, permanently.** The 2012 rMBP boots from the internal SD reader, which
+  SDHC-4c mounts read-only — only the reserved flight-recorder extent admits a write, no file verb
+  can name it, and PNGs are explicitly out of its scope. Neither the boot self-test PNG nor a
+  keypress PNG can *ever* land on this machine's boot medium. That policy is deliberate and stands.
+- **Waiting on the program source alone was a dead loop by construction — the flight-3 bug.** On
+  this bench FRGUARD's boot-medium verdict is `BM_SUBSTITUTED` (boot volume positively located on
+  the Sdhc handle), which (a) pins `program_source()` to the read-only Sdhc handle on every call,
+  and (b) makes `default_writable()` veto the global slot — so even a stick that claimed the global
+  was unwritable through it. The single veto line at 26 414 ms followed by 19 minutes of silence was
+  that loop: re-polling a mount whose answer could not change.
+- **Capture on this bench requires a second, writable volume — a FAT USB stick — and hot-plug is
+  enough.** With PRTSCR-VOL (§6.1) the stick is reached under its own `Usb` handle the pass after
+  `publish_usb_geometry` runs, whether it was present at boot or plugged minutes later. On arrival:
+  a pending `PRTSCR-ST` prints the `writable volume arrived` line and runs its deferred self-test
+  against the stick; the `screenshot` verb and the Print Screen key write `SCREEN<n>.PNG` to the
+  stick's root. Unplugging the stick retracts the handle (USB-UNPLUG), and the refusal lines return.
+- **What QEMU proves and what only metal can.** QEMU (`test-fat sf`) proves the deferred sequence —
+  veto announced, writable volume arrives later, deferred selftest runs and PASSes — but there the
+  writable volume arrives as the *program source* (rung 1: the boot stick claims the global with a
+  `BM_MATCH` verdict). The `BM_SUBSTITUTED` + hot-plug case — rung 2 adopting a stick the FRGUARD
+  verdict keeps out of the program source — cannot be staged in QEMU (the emulated internal card is
+  a raw pattern image, so the verdict can never be SUBSTITUTED there) and is next flight's bench
+  protocol: boot to the veto line, plug a FAT stick in the other port, expect `writable volume
+  arrived (source=usb ...)` then the PASS line.
 
 ## 9. Verification status
 
@@ -183,15 +269,23 @@ writable volume arrived.
   source rows, in a single-block case and in an eleven-stored-block case; the refusal paths
   (`EmptyImage`, `BadRowLength`, `RowCountMismatch`) answer as specified; `encoded_len` is exact.
 
-- **Whole chain, in QEMU — a real PNG on a real FAT volume.**
-  `UNAOS_WC=1 UNAOS_PRTSCRST=1 ./arroyo test-fat sf 240` prints:
+- **Whole chain, in QEMU — a real PNG on a real FAT volume, through the deferred wait.**
+  `UNAOS_WC=1 UNAOS_PRTSCRST=1 ./arroyo test-fat sf 240` prints (2026-08-27, PRTSCR-VOL):
 
   ```
+  :: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::
+  :: PRTSCR-ST: writable volume arrived (source=global label=UNAOS) — running the deferred capture selftest ::
   :: PRTSCR-ST: program source is sdhc and vetoes writes (...) — still waiting for a writable volume ::
   :: PRTSCR: SCREEN0.PNG 1280x800 -> capturing (3073098 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at 0 bytes) ::
   :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
   :: PRTSCR-ST: SCREEN0.PNG on the medium — 3073098 bytes, PNG signature OK, IHDR 1280x800 depth 8 colour 2 non-interlaced, IEND OK -> PASS ::
   ```
+
+  The first two lines ARE the deferred sequence: the early storage-ready passes see only the
+  emulated internal card (read-only), the veto is announced once, and the selftest keeps polling
+  until the stick's later enumeration ends the wait — then announces the arrival and runs. In QEMU
+  the arriving volume is rung 1 (`source=global`, `BM_MATCH`); on the rMBP it will be rung 2
+  (`source=usb`), per §8.1.
 
   `mcopy -i builder/fat-sf.img ::SCREEN0.PNG` pulls the file off the image host-side. `file` reports
   `PNG image data, 1280 x 800, 8-bit/color RGB, non-interlaced`; python's `zlib` decompresses the
@@ -241,11 +335,62 @@ writable volume arrived.
   `./arroyo check` green on both arches, with `prtscrst` added to the `x86-all` and `arm-pi`
   cfg-coverage legs so the knob-on build is type-checked too.
 
-- **Print Screen on metal**: not proven here, and QEMU cannot prove it. What the emulated `usb-kbd`
-  proves is that the decoder hook, the deferral, the encode and the write all work on a real report.
-  What it cannot prove is that the rMBP's own internal keyboard puts usage 0x46 on the wire when
-  that key is struck — Apple keyboards are free to place the function row behind an `fn` layer or a
-  vendor usage page. That, and the timing of a 2880x1800 capture (~5.2 M `read_pixel` probes on a
-  WC-mapped GOP aperture; the QEMU panel is 1280x800), are the seat's proof at an arc boundary, on
-  the machine. If 0x46 never arrives, the census (`prtscr::census()`, and the "capture armed" line's
-  absence) says so directly, which is why the key edge announces itself before deferring.
+- **The CHORDS, in QEMU — PRTSCRCHORD, through the same real HID path (2026-09-02).** QMP
+  `send-key` with `meta_l`, `shift` and `3` (then `4`) in ONE command, so the emulated `usb-kbd` on
+  `ehci.0` emits a boot report with modifiers `0x0A` (LGUI|LShift) and usage `0x20` (then `0x21`) —
+  decoded by `decode_boot_keyboard`, the rMBP's internal-keyboard decoder. Two chords 45 s apart on
+  `UNAOS_WC=1 ./arroyo test-fat sf 200` with no `prtscrst` (the chord was the only possible trigger):
+
+  ```
+  :: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN0.PNG 1280x800 3073098 bytes -> OK ::
+  :: PRTSCR: [prtscr] chord=cmd-shift-4 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  :: PRTSCR: SCREEN1.PNG 1280x800 3073098 bytes -> OK ::
+  ```
+
+  The only `EHCI-HID:` key lines in the whole log are `KEYUP: '#' (scancode 0x20)` and
+  `KEYUP: '$' (scancode 0x21)` — no `KEY:` press was delivered for either digit, which is the
+  no-keystroke property, and the two releases are the documented safe spurious `KeyUp`. Both files
+  pulled off `builder/fat-sf.img` with `mcopy`: `PNG image data, 1280 x 800, 8-bit/color RGB`,
+  every chunk CRC valid, IEND last, IDAT inflating to exactly `800 * (1 + 1280*3)` bytes. Gate
+  battery for the arc: `./arroyo check` green both arches; `UNAOS_WC=1 ./arroyo test 150` exit 0
+  with `wc` in the banner and no fault text; `./arroyo test-arm 60` exit 0.
+
+- **Print Screen on metal — flight 5 proved the capture, and exposed the binding.** `SCREEN2.PNG`
+  2880x1800 with IHDR and IEND verified landed on the machine, so the panel read, the encode and the
+  stick write are metal-proven; but the trigger was bound to usage 0x46 alone, and the rMBP's own
+  internal keyboard has no Print Screen key, so from the laptop's own keys the capture was
+  unreachable — which is what PRTSCRCHORD answers. What QEMU still cannot prove is that the internal keyboard's
+  report carries the chord as `GUI|Shift` in byte 0 plus usage 0x20/0x21 (Apple keyboards could in
+  principle route ⌘ through a vendor page; the boot-protocol modifier byte says they do not). The
+  metal procedure: boot, wait for the veto line, plug the FAT stick, press ⌘⇧3 — expect the
+  `chord=cmd-shift-3` witness on the wire, then the `SCREEN<n>.PNG ... -> OK` line, then the file
+  at the stick's root. If the witness never appears, the chord did not decode (the census says
+  `requests` unchanged); if it appears and no `OK` follows, the refusal line names why.
+
+- **The CHORDS on metal — flight 6 (2012 rMBP, `f751cb78`, 2026-09-03): CONFIRMED.** Knob line was
+  flight 5's minus `UNAOS_PRTSCRST=1`, so no selftest could fire the capture (the staged kernel carries
+  zero `prtscrst`/`PRTSCR-ST` strings, and the wire printed none across three boots). FAT stick in at
+  370.9 s; then, on the internal keyboard:
+
+  ```
+  [ 384457ms] :: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  [ 455094ms] :: PRTSCR: SCREEN3.PNG 2880x1800 15555053 bytes -> OK ::
+  [ 455101ms] EHCI-HID: KEYUP: '#' (scancode 0x20)
+  [ 455140ms] :: PRTSCR: [prtscr] chord=cmd-shift-4 (GUI+Shift+digit) down on EHCI -> capture armed ::
+  [ 525624ms] :: PRTSCR: SCREEN4.PNG 2880x1800 15555053 bytes -> OK ::
+  [ 525631ms] EHCI-HID: KEYUP: '$' (scancode 0x21)
+  ```
+
+  So the Apple internal keyboard does report ⌘ as the boot-protocol GUI modifier bit — the one fact
+  QEMU could not supply. No `KEY:` press line for either digit (the no-keystroke property holds on
+  metal); indices 3 and 4 because the stick still carried flight 5's SCREEN0..2 (the no-overwrite rule).
+  Both files verified host-side: PNG signature, IHDR 2880x1800 depth 8 colour 2, IHDR/IDAT/IEND with
+  every CRC valid, IDAT inflating to exactly `1800 * (1 + 2880*3)` bytes.
+
+  **Measured cost: 70.6 s and 70.5 s from chord to `OK`** for the 15,555,053-byte file — ~220 KB/s to
+  the stick — during which the USB pump made zero passes (`[deadman] pmp=0` for the whole window), so
+  keyboard and mouse were dead until the write finished. The second chord, pressed during the first
+  write, was decoded 46 ms after the first `OK`: chords are deferred by the freeze, not lost. The
+  duration is the capture running inside the device-service pass; making it incremental is a separate
+  arc, recorded here as the number to beat.
