@@ -1004,7 +1004,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // BOT-PARK: the USB retry ladder's global-floor arithmetic, checked on every boot of every
     // arch. Deliberately OUTSIDE the `skip_xhci` split below: it needs no controller, and the Pi
     // kernel8 battery — the gate that has to hold this line — is a `skip_xhci` build.
-    unaos_kernel::drivers::xhci::bot_park_selftest();
+    unaos_kernel::drivers::xhci::bot_park_selftest(); unaos_kernel::drivers::xhci::kbd_dupguard_selftest(); // DUPGUARD — the keyboard dup guard's accept/reject decision, both sides, on every boot of every arch. Same placement and the same three reasons as BOT-PARK to its left: it needs no controller, it must hold on the `skip_xhci` Pi kernel8 battery (where the shared xHCI core is regression-gated), and it is arch-neutral. ⚠ FOLDED onto the existing call rather than given a line of its own — this file is compiled into kernel8.img and a line added here shifts every panic `Location` record below it.
     #[cfg(not(feature = "skip_xhci"))]
     unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
     // BPACE: PCI scan + xHCI controller bring-up returned. This is the SYNCHRONOUS half of USB; the

@@ -259,7 +259,10 @@ COMPLETE :: BANDY-RT:
 # ---    FLOOR 25 -> 26 (2026-08-17, BOT-PARK): `:: BOT-PARK: selftest … -> PASS ::` is the same
 # ---    doubly-framed fixture-verdict form, so the maintenance rule applies again — one new
 # ---    fixture, floor +1, same landing.
-COUNT 26 :: (?:(?:[0-9A-DF-RT-Za-z_\-]|E[0-9A-KM-WYZa-z_\-]|EL[0-9A-EG-Za-z_\-]|ELF[02-9A-Za-z_\-]|ELF1[0-9A-Za-z_\-]|EX[0-9A-DF-Za-z_\-]|EXE[0-9ABD-Za-z_\-]|EXEC[02-9A-Za-z_]|EXEC\-[0-9A-TV-Za-z_\-]|EXEC\-U[0-9A-UW-Za-z_\-]|EXEC\-UV[0-9A-TV-Za-z_\-]|EXEC\-UVU[0-9A-FH-Za-z_\-]|EXEC\-UVUG[0-9A-Za-z_\-]|EXEC1[0-9A-Za-z_\-]|S[0-9A-DF-Za-z_\-]|SE[0-9A-QS-Za-z_\-]|SER[0-9A-VX-Za-z_\-]|SERW[0-9A-HJ-Za-z_\-]|SERWI[0-9A-SU-Za-z_\-]|SERWIT[0-9A-Za-z_]|SERWIT\-[013-9A-Za-z_\-]|SERWIT\-2[0-9A-Za-z_\-])[A-Za-z0-9_-]*|E|EL|ELF|EX|EXE|EXEC|EXEC\-|EXEC\-U|EXEC\-UV|EXEC\-UVU|S|SE|SER|SERW|SERWI|SERWIT|SERWIT\-): .*-> PASS ::
+# ---    FLOOR 26 -> 27 (2026-09-06, DUPGUARD): `:: DUPGUARD: kbd dup guard … -> PASS ::` is the
+# ---    same doubly-framed form — one new fixture, floor +1, same landing. The maintenance rule
+# ---    above is what obliges this bump; the fixture's own REQUIRE/FORBID pair is below.
+COUNT 27 :: (?:(?:[0-9A-DF-RT-Za-z_\-]|E[0-9A-KM-WYZa-z_\-]|EL[0-9A-EG-Za-z_\-]|ELF[02-9A-Za-z_\-]|ELF1[0-9A-Za-z_\-]|EX[0-9A-DF-Za-z_\-]|EXE[0-9ABD-Za-z_\-]|EXEC[02-9A-Za-z_]|EXEC\-[0-9A-TV-Za-z_\-]|EXEC\-U[0-9A-UW-Za-z_\-]|EXEC\-UV[0-9A-TV-Za-z_\-]|EXEC\-UVU[0-9A-FH-Za-z_\-]|EXEC\-UVUG[0-9A-Za-z_\-]|EXEC1[0-9A-Za-z_\-]|S[0-9A-DF-Za-z_\-]|SE[0-9A-QS-Za-z_\-]|SER[0-9A-VX-Za-z_\-]|SERW[0-9A-HJ-Za-z_\-]|SERWI[0-9A-SU-Za-z_\-]|SERWIT[0-9A-Za-z_]|SERWIT\-[013-9A-Za-z_\-]|SERWIT\-2[0-9A-Za-z_\-])[A-Za-z0-9_-]*|E|EL|ELF|EX|EXE|EXEC|EXEC\-|EXEC\-U|EXEC\-UV|EXEC\-UVU|S|SE|SER|SERW|SERWI|SERWIT|SERWIT\-): .*-> PASS ::
 
 # --- SERWIT-2: mirror-tap conservation (promoted 2026-08-13, see ruling block above) ----------
 REQUIRE :: SERWIT-2: mirror taps .*-> PASS ::
@@ -281,6 +284,26 @@ FORBID :: SERWIT-2: FAIL —
 # --- storage unusable by design and would red every fixture downstream of a mounted disk).
 REQUIRE :: BOT-PARK: selftest .*-> PASS ::
 FORBID :: BOT-PARK: selftest .*-> FAIL ::
+
+# --- DUPGUARD: the keyboard dup guard, both sides (2026-09-06) ---------------------------------
+# --- WHAT IT GUARDS. The xHCI keyboard interrupt-IN keeps KBD_INFLIGHT Normal TRBs outstanding
+# --- (XHCINTD), and the dup guard is what decides which transfer completions the driver may act
+# --- on. INVARIANT: every completion the driver acts on must name a TRB the driver itself armed
+# --- and has not yet retired. A Panther-Point controller (XHCI_SPURIOUS_SUCCESS, 0x1e31) posts a
+# --- duplicate Success for a TD the Short Packet already retired; accepting it double-injects the
+# --- keystrokes and over-arms the ring.
+# --- WHY BOTH SIDES. rmbp 14 grant condition 3, row B44: "a dup guard that has never been observed
+# --- rejecting anything is indistinguishable from one that rejects everything." The fixture
+# --- therefore asserts the REJECT (a repeated retire of the same TRB phys, counted into
+# --- KBD_DUP_DROP_COUNT and not into the discard population) AND the ACCEPT (a fresh completion for
+# --- an armed TRB, before and after that dup, handed the retired TD's OWN buffer), plus the pre-arm
+# --- fall-through and the out-of-order pop-through.
+# --- WHY A SELFTEST AND NOT A KEYSTROKE. QEMU's usb-kbd sends no reports without injected keys, and
+# --- QEMU models no duplicate Success at all, so a fixture needing the real event would be
+# --- permanently VACUOUS. Same call, same reasons, as BOT-PARK directly above; it likewise needs no
+# --- controller and holds on the `skip_xhci` captures every pi4 regression run produces.
+REQUIRE :: DUPGUARD: kbd dup guard .*-> PASS ::
+FORBID :: DUPGUARD: kbd dup guard .*-> FAIL ::
 
 # --- scheduler capstone: all 6 sync primitives in one boot -------------------------
 COUNT 6 CAPSTONE \w+: PASS

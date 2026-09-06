@@ -4798,16 +4798,16 @@ impl XhciController {
                                         // PIUSB-39: same pipeline-preserving exit as the pointer path
                                         // (the keyboard carried the identical defect — only its lower
                                         // traffic kept it from being observed on metal).
-                                        let (kprev, kexpect, kbuf0, kring) = (slot.keyboard_prev_phys, slot.keyboard_expect_phys, slot.data_buffer, slot.keyboard_ring.is_some()); let kbd_hit = self.kbd_retire(slot_id as u8, param); if kexpect != 0 && kbd_hit.is_none() { // XHCINTD — the dup guard now tests SET MEMBERSHIP. `kbd_retire` searches the N armed TRBs for `param`, and on a hit POPS it (and everything older) and hands back the buffer that TD was DMA-written into; on a miss it changes nothing and returns None, which is exactly the old `param != keyboard_expect_phys`. The four fields are copied out FIRST because `slot` is a shared borrow of `self.slots` and `kbd_retire` takes `&mut self`: the borrow must be DEAD here, so no line below may name `slot` again on this path. ⚠ FOLDED — five lines in, five lines out.
+                                        let (kprev, kexpect, kbuf0, kring) = (slot.keyboard_prev_phys, slot.keyboard_expect_phys, slot.data_buffer, slot.keyboard_ring.is_some()); let kbd_v = self.kbd_guard(slot_id as u8, param, kexpect); let kbd_hit = kbd_v.hit(); if kbd_v == KbdGuard::Reject { // XHCINTD — the dup guard tests SET MEMBERSHIP. The four fields are copied out FIRST because `slot` is a shared borrow of `self.slots` and the guard takes `&mut self`: the borrow must be DEAD here, so no line below may name `slot` again on this path. DUPGUARD — and the decision itself is no longer this `if`: `kbd_guard` -> `kbd_guard_verdict` (file tail) makes it, so the fixture `kbd_dupguard_selftest` consults THE SAME FUNCTION the dispatch does instead of imitating it. `kbd_v.hit()` is the old `kbd_hit` verbatim (the retired TD's buffer, `None` on a miss or pre-arm), so every line below the guard is unchanged. ⚠ FOLDED — five lines in, five lines out.
                                             let prev = kprev;
                                             let expect = kexpect;
                                             let have_buf = kbuf0.is_some()
                                                 && kring;
                                             xdbg!("xHCI: stale/spurious keyboard event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
                                                 slot_id, param, expect);
-                                            if param != prev && have_buf { KBD_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — the guard's PIPELINE-PRESERVING exit, counted as `MOUSE_DISCARD_REARM_COUNT`'s twin: a completion whose TRB did not match the armed read, thrown away but re-armed. ⚠ FOLDED.
+                                            if kbd_reject_count(param, prev, have_buf) == KBD_REJECT_DISCARD { // PRTSCLOST — the guard's PIPELINE-PRESERVING exit, counted as `MOUSE_DISCARD_REARM_COUNT`'s twin: a completion whose TRB did not match the armed read, thrown away but re-armed. DUPGUARD — the classification and its three counters moved into `kbd_reject_count` (file tail), unchanged in behaviour and precedence; only the DISCARD class re-arms, which is the one thing that has to stay here because it needs `&mut self`. ⚠ FOLDED.
                                                 self.kbd_top_up(slot_id as u8); // XHCINTD — TOP UP to N rather than arm one more. This exit fires on a completion the guard cannot account for, so the outstanding count is unknown; `kbd_top_up` arms until the set holds N and is a NO-OP when it already does, which is the property the old unconditional `queue_keyboard_read` lacked — it could only ever over-arm or under-arm.
-                                            } else if !have_buf { KBD_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } else { KBD_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } // PRTSCLOST — the guard's SILENT exit, split into the same two populations CLICKDEAD v2 gave the pointer, and with the same PRECEDENCE (`!have_buf` first: a missing buffer is the actionable fault). This branch consumes a keyboard completion, does NOT re-arm, and on a build without `usbdebug` prints nothing — so until this counter it was indistinguishable on the wire from a report that never arrived, which is the other half of PRTSCLOST's differential. ⚠ FOLDED onto the `else` of an existing `if`, no line added.
+                                            } // PRTSCLOST — the guard's SILENT exit, split into the same two populations CLICKDEAD v2 gave the pointer, and with the same PRECEDENCE (`!have_buf` first: a missing buffer is the actionable fault). This branch consumes a keyboard completion, does NOT re-arm, and on a build without `usbdebug` prints nothing — so until this counter it was indistinguishable on the wire from a report that never arrived, which is the other half of PRTSCLOST's differential. DUPGUARD — the two `else` arms are now `kbd_reject_count`'s, on line 4808; this line keeps its brace. ⚠ FOLDED onto the `else` of an existing `if`, no line added.
                                             return;
                                         }
                                         if let Some(data_buf_ptr) = kbd_hit.map(|b| b as *mut u8).or(kbuf0) { // XHCINTD — decode the buffer belonging to the TD THAT JUST RETIRED, not a single shared one. With N TDs outstanding the controller may be DMA-writing any of the others right now, so `data_buffer` (buffer 0 of the pool) is no longer the answer; `kbd_retire` returned the right one. The `.or(kbuf0)` fallback preserves the pre-arm path verbatim — when `kexpect == 0` nothing has ever been armed, there is no armed set to hit, and the old code read `data_buffer`. ⚠ FOLDED.
@@ -14974,27 +14974,27 @@ impl XhciController {
     /// The caller must not hold a borrow of `self.slots` across this call.
     fn kbd_retire(&mut self, slot_id: u8, param: u64) -> Option<u64> {
         let s = &mut self.slots[slot_id as usize];
-        let n = s.keyboard_armed_n as usize;
-        let mut p = usize::MAX;
-        for i in 0..n {
-            if s.keyboard_armed_trb[i] == param { p = i; break; }
-        }
-        if p == usize::MAX { return None; }
-        let buf = s.keyboard_armed_buf[p];
-        s.keyboard_prev_phys = param;
-        if p > 0 { KBD_SKIPPED_COUNT.fetch_add(p as u64, Ordering::Relaxed); }
-        let keep = n - p - 1;
-        for i in 0..keep {
-            s.keyboard_armed_trb[i] = s.keyboard_armed_trb[p + 1 + i];
-            s.keyboard_armed_buf[i] = s.keyboard_armed_buf[p + 1 + i];
-        }
-        for i in keep..n {
-            s.keyboard_armed_trb[i] = 0;
-            s.keyboard_armed_buf[i] = 0;
-        }
-        s.keyboard_armed_n = keep as u8;
-        KBD_OUTSTANDING.store(keep as u64, Ordering::Relaxed);
-        Some(buf)
+        kbd_retire_set(&mut s.keyboard_armed_trb, &mut s.keyboard_armed_buf, &mut s.keyboard_armed_n, &mut s.keyboard_prev_phys, param) // DUPGUARD — the body moved VERBATIM into the free function `kbd_retire_set` at the file tail so the fixture can drive THE SAME CODE over its own arrays instead of a copy of it. This method is now only the unpacking of the slot; every decision it used to make is made there. `bot_park_selftest`'s shape exactly (this file, ~:1600): "exercises the ledger's pure functions over its own local tables".
+        // DUPGUARD — the twenty-one lines this body used to occupy are kept as twenty-one lines so
+        // the hunk is LINE-NEUTRAL and nothing below it moves. That is not tidiness: this file is
+        // compiled into the Pi's kernel8.img, `core::panic::Location` records embed the source line
+        // of every indexing and `unwrap` site, and a line added or removed here would shift every
+        // such record in `kbd_top_up` and `queue_keyboard_read` below — a byte-different image for
+        // a change that alters no behaviour. XHCINTD used the same device on this file ("the
+        // statement's two lines became two comment lines"); it is the file's standing discipline.
+        //
+        // WHAT MOVED, AND WHY. The pop-through this body used to hold — search the armed set for
+        // `param`, take that TD's buffer, record `keyboard_prev_phys`, count `KBD_SKIPPED_COUNT`
+        // for every entry the match stepped over, compact the set and republish `KBD_OUTSTANDING`
+        // — is now the free function `kbd_retire_set` at the file tail, VERBATIM. Nothing about it
+        // changed; only its address did. It had to move because it is half of the dup guard's
+        // discrimination, the guard is what rmbp 14's grant condition 3 requires a fixture for, and
+        // a method that reaches through `self.slots` cannot be driven without a controller.
+        // `bot_park_selftest` in this same file answered the identical problem the identical way:
+        // pure functions over the caller's own tables, so the fixture exercises THE PRODUCTION CODE
+        // rather than a copy of it that can drift away from it silently.
+        // The other half — the `kexpect != 0` arming test that decides whether a miss is a REJECT
+        // at all — is in `kbd_guard_verdict` beside it, and `kbd_guard` is this method's twin.
     }
 
     /// Arm Normal TRBs on this slot's keyboard interrupt-IN until `kbd_inflight()` are outstanding.
@@ -15024,4 +15024,279 @@ impl XhciController {
             self.queue_keyboard_read(slot_id);
         }
     }
+}
+
+// DUPGUARD (orin 17) — the keyboard dup guard, extracted so it can be TESTED, and its fixture.
+// TAIL APPEND below XHCINTD's own tail block, so nothing above moves.
+//
+// THE INVARIANT, in one sentence: **every keyboard transfer completion the driver acts on must name
+// a TRB the driver itself armed and has not yet retired** — formally
+// `param ∈ keyboard_armed_trb[0..keyboard_armed_n]`, a set that is append-on-arm, pop-through-match
+// on retire, and cleared whenever the controller's dequeue pointer moves out from under it (slot
+// reset, halt recovery). A completion outside that set is by construction either a Panther-Point
+// duplicate Success for an already-retired TD (`param == keyboard_prev_phys`) or unaccounted;
+// neither may be decoded, and neither may over-arm the ring.
+//
+// WHY THIS EXISTS AS A FUNCTION AND NOT AS AN `if`. rmbp 14's grant condition 3 on this file: *"a
+// dup guard that has never been observed rejecting anything is indistinguishable from one that
+// rejects everything."* Both halves of the decision therefore live in ONE pure function that the
+// completion dispatch and the fixture consult — not in an `if` the dispatch owns and the fixture
+// imitates. Stubbing `kbd_guard_verdict` to accept unconditionally IS removing the guard, and it
+// reds the fixture in the same edit; there is no way to weaken the production path without moving
+// the thing the fixture measures.
+
+/// [`kbd_reject_count`] — the completion was not accounted for, but the ring must be kept armed:
+/// throw it away and top up. `MOUSE_DISCARD_REARM_COUNT`'s twin.
+pub const KBD_REJECT_DISCARD: u8 = 0;
+/// [`kbd_reject_count`] — the slot has no report buffer or no ring. The ACTIONABLE fault, and
+/// therefore tested first: re-arming would be wrong because there is nothing to arm.
+pub const KBD_REJECT_NOBUF: u8 = 1;
+/// [`kbd_reject_count`] — the Panther-Point duplicate Success for the TD just retired
+/// (`param == prev`). Recognised and deliberately NOT re-armed: a fresh read is already outstanding.
+pub const KBD_REJECT_DUP: u8 = 2;
+
+/// The guard's verdict on one keyboard transfer completion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KbdGuard {
+    /// Decode it. `Some(buf)` is the report buffer the retired TD was DMA-written into; `None` is
+    /// the PRE-ARM case (`keyboard_expect_phys == 0` — this endpoint has never been armed, so there
+    /// is no set to be a member of), where the dispatch falls back to `data_buffer` as it always did.
+    Accept(Option<u64>),
+    /// Drop it. The dispatch classifies and counts it with [`kbd_reject_count`] and returns.
+    Reject,
+}
+
+impl KbdGuard {
+    /// The retired TD's buffer, or `None` on a pre-arm accept or a rejection. Exactly the old
+    /// `kbd_hit` value, so the decode below the guard is unchanged.
+    pub fn hit(&self) -> Option<u64> {
+        match *self { KbdGuard::Accept(b) => b, KbdGuard::Reject => None }
+    }
+}
+
+/// Match a completion against an armed set and, on a hit, retire it — the pop-through, moved here
+/// VERBATIM from [`XhciController::kbd_retire`] so that method and the fixture share one body.
+///
+/// On a **miss** nothing changes and `None` comes back, which is byte-for-byte the pre-XHCINTD
+/// `param != keyboard_expect_phys` verdict and keeps the Panther-Point quirk handling intact. On a
+/// **hit** at position `p` the set is popped through `p` — the entries older than the match name TDs
+/// that will never report, so holding them would leak the set to full and stall every later top-up.
+/// `p > 0` is counted into `KBD_SKIPPED_COUNT` rather than folded into the guard's drop counters,
+/// because "the controller retired out of order / an event was missed" is a different repair from
+/// "the controller posted a duplicate".
+///
+/// `prev_phys` is set to the retired TRB here — the Panther-Point dup-Success names THAT address,
+/// and once the entry has been popped out of the set it is the only record of it.
+fn kbd_retire_set(
+    armed_trb: &mut [u64; KBD_INFLIGHT],
+    armed_buf: &mut [u64; KBD_INFLIGHT],
+    armed_n: &mut u8,
+    prev_phys: &mut u64,
+    param: u64,
+) -> Option<u64> {
+    let n = *armed_n as usize;
+    let mut p = usize::MAX;
+    for i in 0..n {
+        if armed_trb[i] == param { p = i; break; }
+    }
+    if p == usize::MAX { return None; }
+    let buf = armed_buf[p];
+    *prev_phys = param;
+    if p > 0 { KBD_SKIPPED_COUNT.fetch_add(p as u64, Ordering::Relaxed); }
+    let keep = n - p - 1;
+    for i in 0..keep {
+        armed_trb[i] = armed_trb[p + 1 + i];
+        armed_buf[i] = armed_buf[p + 1 + i];
+    }
+    for i in keep..n {
+        armed_trb[i] = 0;
+        armed_buf[i] = 0;
+    }
+    *armed_n = keep as u8;
+    KBD_OUTSTANDING.store(keep as u64, Ordering::Relaxed);
+    Some(buf)
+}
+
+/// **THE GUARD.** The whole accept/reject decision for one keyboard transfer completion, in one
+/// place, over an armed set the caller owns.
+///
+/// `Accept` iff the completion satisfies the invariant at the top of this block: either `param`
+/// names a TRB in the armed set (which this call then retires, handing back that TD's own buffer),
+/// or nothing has ever been armed on this endpoint (`kexpect == 0`) and there is no set to test
+/// against — the pre-arm path, which the dispatch has always let through to `data_buffer`.
+/// Otherwise `Reject`, and the caller counts it with [`kbd_reject_count`].
+///
+/// Removing the guard means making this function accept unconditionally. That is what
+/// [`kbd_dupguard_selftest`] measures, and it is the reason the decision is not an `if` in the
+/// dispatch: an `if` there can be deleted without the fixture noticing.
+fn kbd_guard_verdict(
+    armed_trb: &mut [u64; KBD_INFLIGHT],
+    armed_buf: &mut [u64; KBD_INFLIGHT],
+    armed_n: &mut u8,
+    prev_phys: &mut u64,
+    param: u64,
+    kexpect: u64,
+) -> KbdGuard {
+    let hit = kbd_retire_set(armed_trb, armed_buf, armed_n, prev_phys, param);
+    if kexpect != 0 && hit.is_none() { KbdGuard::Reject } else { KbdGuard::Accept(hit) }
+}
+
+/// Classify a REJECTED completion into exactly one population, and count it there.
+///
+/// `KBD_REJECT_NOBUF` takes precedence over `KBD_REJECT_DUP` — CLICKDEAD v2's precedence, preserved:
+/// a dup that arrives after the buffer is gone scores NOBUF, because the missing buffer is the
+/// actionable fault. Only `KBD_REJECT_DISCARD` re-arms; the other two are the guard's silent exit,
+/// which is why they were indistinguishable on the wire from a report that never arrived until
+/// PRTSCLOST split them.
+fn kbd_reject_count(param: u64, prev: u64, have_buf: bool) -> u8 {
+    if param != prev && have_buf { KBD_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); KBD_REJECT_DISCARD }
+    else if !have_buf { KBD_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); KBD_REJECT_NOBUF }
+    else { KBD_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); KBD_REJECT_DUP }
+}
+
+impl XhciController {
+    /// [`kbd_guard_verdict`] over this slot's armed set. The unpacking only; every decision is made
+    /// there. The caller must not hold a borrow of `self.slots` across this call.
+    fn kbd_guard(&mut self, slot_id: u8, param: u64, kexpect: u64) -> KbdGuard {
+        let s = &mut self.slots[slot_id as usize];
+        kbd_guard_verdict(&mut s.keyboard_armed_trb, &mut s.keyboard_armed_buf, &mut s.keyboard_armed_n, &mut s.keyboard_prev_phys, param, kexpect)
+    }
+}
+
+/// DUPGUARD — the keyboard dup guard's fixture, exercised on BOTH sides on every boot of both arches.
+///
+/// **What it asserts, and why each leg.** rmbp 14's grant condition 3 (row B44) is that the guard's
+/// invariant be named and that a fixture go RED when the guard is removed. The named invariant is at
+/// the top of this block. The legs:
+///
+/// 1. `accept` — a fresh completion for an armed TRB is ACCEPTED, and hands back **that TD's own**
+///    report buffer rather than buffer 0. With N TDs outstanding the controller may be DMA-writing
+///    any of the others, so decoding buffer 0 would decode a report that is not the one that landed.
+/// 2. `reject_dup` — the SAME TRB physical address retired a second time is REJECTED. This is the
+///    Panther-Point shape the code names (XHCI_SPURIOUS_SUCCESS, device 0x1e31): a boot-keyboard
+///    report is always shorter than the endpoint MPS, so the controller can post a duplicate Success
+///    for a TD the Short Packet already retired. Accepting it double-injects the keystrokes.
+/// 3. `dup_counted` — and it lands in `KBD_DUP_DROP_COUNT`, not in the unaccounted-discard
+///    population. A dup misfiled as a discard is the same wire with a wrong diagnosis, and it also
+///    RE-ARMS, which over-arms the ring.
+/// 4. `dup_inert` — the rejection leaves the armed set untouched: the three TRBs still outstanding
+///    are still outstanding.
+/// 5. `accept_after` — the next genuine completion is still accepted AFTER the dup. This is the leg
+///    that convicts a guard which rejects everything, which is the failure mode a one-sided fixture
+///    cannot see.
+/// 6. `foreign` — a completion for a TRB that was never armed at all is rejected and counted as
+///    `KBD_REJECT_DISCARD`, the pipeline-preserving exit that tops the ring back up.
+/// 7. `nobuf` — with the slot's buffer gone, the same completion scores NOBUF instead: CLICKDEAD
+///    v2's precedence, because a missing buffer is the actionable fault.
+/// 8. `prearm` — `kexpect == 0` is NOT a rejection. Nothing has ever been armed, there is no set to
+///    be a member of, and the dispatch must still fall through to `data_buffer` exactly as it did
+///    before the set existed. A guard that rejects here would kill the first report of every boot.
+/// 9. `skip` — a completion that steps OVER older armed TRBs pops through them and counts them into
+///    `KBD_SKIPPED_COUNT`, and is accepted rather than rejected.
+///
+/// **Why a fixture and not a real keystroke.** QEMU's `usb-kbd` sends no reports without injected
+/// keystrokes, and the duplicate Success this guard exists for is a Panther-Point controller quirk
+/// QEMU does not model at all — so a fixture that needed the real event would be permanently
+/// VACUOUS, which is worse than none. `bot_park_selftest` in this same file made the same call for
+/// the same reason. What runs here is the guard's own decision function over a local armed set: no
+/// controller, no slot, no allocation, no hardware, no MMIO. The addresses are never dereferenced.
+///
+/// **Counter hygiene.** The legs bump the same process-global counters `[kbdpoll]` prints, so every
+/// one of them is snapshotted on entry and RESTORED before this function returns. A metal capture's
+/// `dup=`/`discard=`/`nobuf=`/`skipped=`/`outstanding=` therefore carry no arithmetic of this
+/// fixture's — the assertions are made against DELTAS taken inside the window, not against the
+/// counters' absolute values.
+pub fn kbd_dupguard_selftest() {
+    let save = (
+        KBD_DUP_DROP_COUNT.load(Ordering::Relaxed),
+        KBD_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
+        KBD_NOBUF_DROP_COUNT.load(Ordering::Relaxed),
+        KBD_SKIPPED_COUNT.load(Ordering::Relaxed),
+        KBD_OUTSTANDING.load(Ordering::Relaxed),
+    );
+
+    // The armed set as a value — the exact three fields `DeviceSlot` carries, plus the fourth the
+    // guard reads. Local, so this needs no controller and no slot.
+    let mut trb = [0u64; KBD_INFLIGHT];
+    let mut buf = [0u64; KBD_INFLIGHT];
+    let mut n: u8 = 0;
+    let mut prev: u64 = 0;
+
+    // Arm N TRBs the way `queue_keyboard_read`'s registration does: NEWEST LAST, each with its own
+    // pool buffer at `KBD_BUF_STRIDE`. RING/POOL are plausible heap addresses and are NEVER
+    // dereferenced — this fixture reads and writes nothing but the four locals above.
+    const RING: u64 = 0x0000_1000_0000_0000;
+    const POOL: u64 = 0x0000_2000_0000_0000;
+    let stride = core::mem::size_of::<Trb>() as u64;
+    for i in 0..KBD_INFLIGHT {
+        trb[i] = RING + i as u64 * stride;
+        buf[i] = POOL + (i * KBD_BUF_STRIDE) as u64;
+        n = (i + 1) as u8;
+    }
+    // What `queue_keyboard_read` leaves in the slot: the newest TRB armed. Non-zero is the "this
+    // endpoint has been armed at least once" test the guard applies before it may reject anything.
+    let kexpect = trb[KBD_INFLIGHT - 1];
+
+    // 1. ACCEPT a fresh completion for the OLDEST armed TRB, and get THAT TD's buffer back.
+    let accept = kbd_guard_verdict(&mut trb, &mut buf, &mut n, &mut prev, RING, kexpect)
+        == KbdGuard::Accept(Some(POOL))
+        && n as usize == KBD_INFLIGHT - 1
+        && prev == RING;
+
+    // 2-4. THE DUPLICATE: the very same TRB physical address, retired a second time.
+    let d0 = KBD_DUP_DROP_COUNT.load(Ordering::Relaxed);
+    let reject_dup = kbd_guard_verdict(&mut trb, &mut buf, &mut n, &mut prev, RING, kexpect)
+        == KbdGuard::Reject;
+    let dup_counted = kbd_reject_count(RING, prev, true) == KBD_REJECT_DUP
+        && KBD_DUP_DROP_COUNT.load(Ordering::Relaxed) == d0 + 1;
+    let dup_inert = n as usize == KBD_INFLIGHT - 1 && trb[0] == RING + stride;
+
+    // 5. And the NEXT genuine completion is still accepted — the leg a guard that rejects
+    //    everything fails.
+    let accept_after = kbd_guard_verdict(&mut trb, &mut buf, &mut n, &mut prev, RING + stride, kexpect)
+        == KbdGuard::Accept(Some(POOL + KBD_BUF_STRIDE as u64))
+        && n as usize == KBD_INFLIGHT - 2;
+
+    // 6. A completion for a TRB never armed at all: rejected, and counted as the pipeline-preserving
+    //    DISCARD rather than as a dup (`param != prev`).
+    let never_armed = RING + 0x400;
+    let c0 = KBD_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
+    let foreign = kbd_guard_verdict(&mut trb, &mut buf, &mut n, &mut prev, never_armed, kexpect)
+        == KbdGuard::Reject
+        && kbd_reject_count(never_armed, prev, true) == KBD_REJECT_DISCARD
+        && KBD_DISCARD_REARM_COUNT.load(Ordering::Relaxed) == c0 + 1;
+
+    // 7. The same completion with the slot's buffer gone scores NOBUF — the precedence.
+    let b0 = KBD_NOBUF_DROP_COUNT.load(Ordering::Relaxed);
+    let nobuf = kbd_reject_count(never_armed, prev, false) == KBD_REJECT_NOBUF
+        && KBD_NOBUF_DROP_COUNT.load(Ordering::Relaxed) == b0 + 1;
+
+    // 8. PRE-ARM: nothing has ever been armed, so the same unmatched completion is NOT a rejection.
+    let mut etrb = [0u64; KBD_INFLIGHT];
+    let mut ebuf = [0u64; KBD_INFLIGHT];
+    let (mut en, mut eprev) = (0u8, 0u64);
+    let prearm = kbd_guard_verdict(&mut etrb, &mut ebuf, &mut en, &mut eprev, never_armed, 0)
+        == KbdGuard::Accept(None);
+
+    // 9. OUT-OF-ORDER: two TRBs are still armed; retire the NEWER one. The older is popped through
+    //    and counted as skipped, and the completion is ACCEPTED (a skip is not a rejection).
+    let s0 = KBD_SKIPPED_COUNT.load(Ordering::Relaxed);
+    let skip = kbd_guard_verdict(&mut trb, &mut buf, &mut n, &mut prev, RING + 3 * stride, kexpect)
+        == KbdGuard::Accept(Some(POOL + 3 * KBD_BUF_STRIDE as u64))
+        && KBD_SKIPPED_COUNT.load(Ordering::Relaxed) == s0 + 1
+        && n == 0;
+
+    KBD_DUP_DROP_COUNT.store(save.0, Ordering::Relaxed);
+    KBD_DISCARD_REARM_COUNT.store(save.1, Ordering::Relaxed);
+    KBD_NOBUF_DROP_COUNT.store(save.2, Ordering::Relaxed);
+    KBD_SKIPPED_COUNT.store(save.3, Ordering::Relaxed);
+    KBD_OUTSTANDING.store(save.4, Ordering::Relaxed);
+
+    let pass = accept && reject_dup && dup_counted && dup_inert && accept_after && foreign && nobuf
+        && prearm && skip;
+    serial_println!(
+        ":: DUPGUARD: kbd dup guard accept={} reject_dup={} dup_counted={} dup_inert={} accept_after={} foreign={} nobuf={} prearm={} skip={} inflight={} stride={} -> {} ::",
+        accept, reject_dup, dup_counted, dup_inert, accept_after, foreign, nobuf, prearm, skip,
+        KBD_INFLIGHT, KBD_BUF_STRIDE,
+        if pass { "PASS" } else { "FAIL" });
 }
