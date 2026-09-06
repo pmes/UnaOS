@@ -117,7 +117,20 @@ for path in files:
             for dp in re.findall(r"`?(docs/[A-Za-z0-9_./-]+\.md)", rowtext):
                 if not os.path.exists(dp):
                     red.append(f"{where}: {rid} evidence path {dp} does not exist in the tree")
-            for s in set(re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{7,8})(?![0-9A-Za-z])", rowtext)):
+            # ARTIFACT DIGESTS ARE NOT COMMITS, and a row legitimately cites them: a BLOB sha
+            # (`git rev-parse <commit>:<path>`), an objcopy/sha256 of a built image, a kernel8.img
+            # digest. Two reddened this gate in one session and both "fixes" were to damage the
+            # evidence to satisfy the checker -- pad the token, or reword around it.
+            # The escape is EXPLICIT and author-declared: prefix the hash with a label and a colon
+            # (`sha256:731c8f5b`, `blob:311bccea`, `img:d73a8981`). An INFERRED label -- "skip if
+            # the word `img` appears nearby" -- was tried first and rejected: it would silently
+            # stop checking a real commit sha in any row that happened to mention an image, which
+            # is a check that cannot fire. An UNLABELLED hex token is still a short commit sha and
+            # must resolve.
+            for m in re.finditer(r"(?<![0-9A-Za-z])([0-9a-f]{7,8})(?![0-9A-Za-z])", rowtext):
+                s = m.group(1)
+                if re.search(r"[A-Za-z][A-Za-z0-9_-]*:$", rowtext[max(0, m.start() - 24):m.start()]):
+                    continue   # author-declared artifact digest, not a commit
                 if not sha_exists(s):
                     red.append(f"{where}: {rid} names sha {s} which is not a commit in this repo")
                 elif head in FETCHED and not reachable(s):
