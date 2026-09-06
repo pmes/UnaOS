@@ -1165,6 +1165,15 @@ pub fn selftest() {
     // up, which is the one-dropdown-at-a-time invariant — and this function's restore above has just
     // guaranteed that.
     super::winmenu::selftest();
+    // QUARRYDOOR (KEYDOORS F1) — the file manager's KEY DOOR fixture, chained here for the same
+    // reason `winmenu::selftest` is: the x86 battery names ONE furniture fixture and the family
+    // reaches the rest. Chained from THIS tail rather than from `winmenu::selftest`'s, because that
+    // function has three early SKIP returns (no panel, full window table) and a door fixture that
+    // silently vanished with them would be a proof that stops existing exactly when the tree gets
+    // interesting. It runs LAST because it opens and closes a real `wm` row, and both neighbours
+    // above want the desktop quiet.
+    #[cfg(all(feature = "quarry", feature = "witness"))]
+    super::quarry::door_selftest();
 }
 
 /// SHARD-PRESS fixture (PA41) — **a press on the crystal, through the LIVE furniture router, puts the
