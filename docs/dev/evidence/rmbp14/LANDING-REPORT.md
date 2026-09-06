@@ -93,6 +93,29 @@ non-`mod.rs` parent's children living in `<stem>/` (`video/quarry.rs` → `video
 `check` was re-run after the last edit to the gate script (`sys.dont_write_bytecode`, so the evidence
 mode does not leave `__pycache__` in a checked-out tree) rather than inheriting the earlier green.
 
+## The pi 7 exchange — a peer reading at this seat's sha, which is the mechanism that catches errors
+
+pi 7 answered the registry hand-off with four items. Three changed the tree.
+
+**`events.rs` is worse than "compiled by nothing", and it is deleted (B29).** pi 7 pointed out what
+this seat had recorded and then walked past: the file defines `pub fn push_event` / `pub fn pop_event`,
+and `pal.rs` defines the LIVE pair called from the serial drain and the HID path. A seat grepping
+either name gets two hits and the dead one is readable, editable and plausible, with every gate green
+over a patch to it. Verified here before acting rather than accepted on report — 0 `mod events`
+declarations, 0 `events::` references, no `include!`/`#[path]`, and the same three zeroes on
+`origin/main`, `origin/hw-jetson`, `origin/hw-pi4`. Precedent for the shape: Peter on `video/vug.rs`.
+
+**An `NA` row now cites the command that justified it.** pi 7 turned this seat's own SR1 argument on
+the human pass: a reader marking the 39 "no Pi-live site" rows inherits the classifier's blind spots
+exactly, because the arch-neutral file and the x86-gated callee are precisely the cases a person also
+mis-sorts. The registry header and §GATE-K8REACH now require the `--evidence` output behind an `NA`.
+
+**The denominator is stated instead of quoted.** pi 7 measured 118 arms / 113 distinct knobs on
+hw-pi4 `f25f1601` against this seat's 115. Both are right: this tree has 119 append lines carrying 115
+distinct names (and all 119 precede `kernel8()`, which is what makes the parse boundary sound). B28
+now says the number is DISTINCT NAMES, records the cross-tree pair, and says it is derived per tree
+rather than quoted across them.
+
 ## Peers
 
 pi 7 told the same turn: the registry's 104 `TODO` rows are theirs to rule on, `--evidence` makes each

@@ -2,6 +2,14 @@
 # NA <reason> = deliberately absent from the Pi bare-metal image.
 # TODO <owner/note> = grandfathered at seeding, nobody has ruled yet.
 # `scripts/k8-reach.py --evidence <KNOB>` prints the sites behind a row.
+#
+# AN `NA` ROW CITES THE COMMAND THAT JUSTIFIED IT, not a reason string alone (pi 7,
+# 2026-09-06). A human first pass inherits the classifier's blind spots exactly: the
+# arch-neutral file (`nvidia-kepler`'s site in `video/wm.rs`) and the x86-gated callee
+# (`rastmc`) are the cases a reader also mis-sorts, because the path and the cfg both
+# look decisive and neither is. `NA  x86 only` is a second classifier with no proof and
+# worse recall; `NA  --evidence: 11 sites, 0 Pi-live (all under drivers/gpu, x86 mod tree)`
+# is checkable by the next seat.
 UNAOS_BAR1EXP              TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BCMARECON            TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BCMAS1               TODO  seeded 2026-09-06; no Pi-live cfg site

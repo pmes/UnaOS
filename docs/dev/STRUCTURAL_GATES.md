@@ -183,7 +183,8 @@ for the other, on one line.
 `k8-modtree.py` PRINTS every file it cannot account for (`UNREACHED`,
 `UNRESOLVED`, `INLINE`) instead of defaulting it to a context. On this tree that
 surfaced `events.rs`, which no `mod` declaration in the crate names — a file that
-is not compiled by anything.
+was not compiled by anything, and whose `push_event`/`pop_event` shadowed the live
+`pal.rs` pair a grep would land on beside it. Deleted (rmbp-ledger B29).
 
 **Control.** Checked before any verdict: the `kernel8()` bounds must resolve, the
 `_feats` parse must find ≥ 50 knobs INCLUDING both SR1 instances, and the arm
@@ -210,8 +211,11 @@ gets its arm in `kernel8()` beside the `UNAOS_LOGTS` one; a knob that should not
 gets a registry row with the reason. The 104 rows seeded on 2026-09-06 are marked
 `TODO`, which satisfies the gate and is counted on every run — they are the
 backlog SR1's class left behind, not a ruling, and each is converted to `NA <reason>`
-(or to an arm) by whoever owns the knob. Deleting a row without adding the arm
-reintroduces the silence.
+(or to an arm) by whoever owns the knob. **An `NA` cites the `--evidence` command that
+justified it, not a reason string alone**: a human pass inherits the classifier's blind
+spots exactly — the arch-neutral file and the x86-gated callee are what a reader also
+mis-sorts — so an `NA` without its command is a second classifier with no proof (pi 7,
+2026-09-06). Deleting a row without adding the arm reintroduces the silence.
 
 ---
 
