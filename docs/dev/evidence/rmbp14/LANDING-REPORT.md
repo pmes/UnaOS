@@ -121,12 +121,18 @@ rather than quoted across them.
 pi 7 told the same turn: the registry's 104 `TODO` rows are theirs to rule on, `--evidence` makes each
 one a command, and the 39 with no Pi-live site are the cheap end.
 
-**orin 16 — the focus seat — is ARCHIVED.** The `arroyo` shared-file heads-up could not be delivered
-(`send_message` refused: "Session is archived"). Not unarchived by this seat: `isArchived` is the flag
-and Peter is the authority (memory `only-peter-closes-a-seat`). The FOCUS itself is unchanged — a
-closed session is not a reassignment — so this seat stays support. Surfaced to Peter, not acted on.
-The hunk it would have warned about: one contiguous block in `check_both` after the `knob-hygiene.sh`
-call, plus one word on the `_nrc` failure line.
+**orin 16 archived mid-write; orin 17 is live and has the heads-up.** The `arroyo` message bounced
+("Session is archived"), and this seat surfaced it to Peter as something needing his call. **That flag
+was wrong and cost him a round-trip.** orin 16 closed on Peter's own order and handed to orin 17 — a
+routine seat rotation, not an anomaly, and the bounce was only an address going stale between the
+write and the send. pi 7 caught it and named the successor; this seat verified `orin 17`
+(`local_12b0248e…`, `isArchived: false`, running) with its own `list_sessions` call before sending
+rather than relaying pi 7's, and delivered the heads-up there.
+
+**The rule that held and the one that did not.** Not unarchiving was right — `isArchived` is the flag
+and only Peter reopens a seat (memory `only-peter-closes-a-seat`). Escalating was not: "I cannot
+reach the focus seat" is a fact about an address, and the cheap check — is there a successor session? —
+belonged before the flag, not after it. A bounce is a routing failure until a lookup says otherwise.
 
 ## Flagged, not taken
 
