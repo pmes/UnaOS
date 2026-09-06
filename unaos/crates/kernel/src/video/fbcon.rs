@@ -678,7 +678,7 @@ pub fn _print(args: core::fmt::Arguments) {
     let tap = &crate::serial_ring::TAP_FBCON;
     tap.submit();
     // Once the GUI owns the screen, don't mirror to the framebuffer (serial still gets it).
-    if GUI_ACTIVE.load(Ordering::Relaxed) || panel_mirror_held() { // DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `desktop_firmware::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+desktop_firmware. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
+    if GUI_ACTIVE.load(Ordering::Relaxed) || panel_mirror_held() || conquiet_held() { // CONSOLEQUIET — the THIRD term is aarch64's half of x86's QUIET-PANEL rule, and it covers the case the second one deliberately does not: a console that is ROUTED INTO A WINDOW. `panel_mirror_held`'s `unrouted` term lifts the hold the instant `panel_console_window_open` installs the glyph route, on the argument that a blank console window is worse than the defect; Peter's render6 ruling is the opposite (the cascade's largest window was a scrolling census log), so from the route install onwards the full serial stream stops reaching the console on aarch64 too. Compile-time `false` on x86, on `bootlog`, and on every aarch64 build without `desktop_firmware` (kernel8's DEFAULT curated K8_FEATS has none; `arroyo:5990` adds it under `UNAOS_PIDESK=1` alone, and that Pi desktop is covered by this rule too — ONE OS), so those images are byte-identical. Panic override THREE times over — see `conquiet_held` at the file tail. DESKHOLD — the second half is the Pi's counterpart of x86's QUIET-PANEL gate: once `desktop_firmware::activate` has cleared the glass to `DESKTOP_BG` the compositor owns those pixels and the panel mirror is a SECOND writer on them. Serial is untouched, the panic mirror overrides, and the test is a compile-time `false` off aarch64+desktop_firmware. See `panel_mirror_held` at the file tail. LINE-NEUTRAL fold, PARITY §5.3 — this file is compiled into the knob-off image and a line added here renumbers every panic `Location` below it.
         tap.suppress();
         return;
     }
@@ -2904,3 +2904,152 @@ fn defer_note_classic() {}
 #[allow(dead_code)]
 #[inline(always)]
 fn defer_note_tear() {}
+
+/// CONSOLEQUIET — **the aarch64 half of x86's QUIET-PANEL rule, for a console that is a WINDOW.**
+///
+/// ### The defect (Orin, render6 boot 1, `docs/dev/evidence/orin15/render6-SCREEN0-small.png`)
+///
+/// The cascaded desktop's first and largest window — `console`, 1305x780 at (307,158),
+/// `[wc-x] console-window win=1 … cols=185 rows=46` — is a scrolling kernel log for the life of the
+/// boot: `[orinrender] census …`, `[serialrx] rx=…`, `[tcu] rx-mbox …`, `[pulse5] live …`,
+/// `[wc-h] rollup …`, one line per second per instrument. A user boots to a desktop and the biggest
+/// thing on it is a debug log.
+///
+/// ### Why the two gates already in `_print` do not cover it
+///
+/// The file header states the split plainly: *"QUIET-PANEL policy (x86): … aarch64 keeps the full
+/// mirror."* On x86 `_print`'s second gate returns before the console lock unless `bootlog`,
+/// `PANIC_MIRROR` or `PANEL_CONSOLE` says otherwise, so the whole serial stream is off the glass by
+/// default. aarch64 has no such gate at all.
+///
+/// DESKHOLD was the first half of the port and it stops one line short. `panel_mirror_held`'s THIRD
+/// term is `unrouted = CONSOLE_WIN == wm::WIN_NONE`, and its own doc says why: *"Once the glyph route
+/// is installed `draw_fb()` is the window's surface and `_print` writes no panel pixel at all, so
+/// there is nothing left for the hold to protect — and holding on would leave the console WINDOW
+/// blank for the rest of the boot, which is the one outcome worse than the defect."* On the Orin
+/// `desktop_firmware::activate` arms the hold at DESKTOP-CLEAR (`video/desktop_firmware.rs:163`) and
+/// then opens the window seventy lines below it (`:237`), so the hold lifts within the same call and
+/// the stream that had been kept off the panel is delivered into the window instead. The hold was
+/// never wrong; the judgement in its third term has been overruled. A blank console window is now
+/// the intended outcome, and it is what an x86 `wc` desktop that never took the Kepler seam shows.
+///
+/// ### The rule
+///
+/// **On aarch64, from the moment the console is routed into a window, the full serial stream stops
+/// mirroring into the console.** The knob is x86's own — `bootlog`, whose entire purpose is holding
+/// the whole log on the glass — not a board twin. THE WIRE IS UNTOUCHED: every dropped line was
+/// already written to the UART, the staging ring, `UNAOS.LOG` and the `tste` ring by
+/// `arch::aarch64::serial::_print` before it ever called this file, and this gate is charged
+/// `suppressed` on the SERWIT-2 tap, so `submitted == absorbed + dropped + suppressed` still holds.
+///
+/// ### The boundary, stated rather than implied
+///
+/// It is the ROUTE INSTALL, not boot. Before the window exists, aarch64's panel mirror is unchanged —
+/// on this arch fbcon IS the bring-up console, and x86's replacement for the pre-GUI stream
+/// (`milestone`, fed by `bootlog::record`) is `#[cfg(target_arch = "x86_64")]` and has never been
+/// ported. Matching x86's boundary exactly therefore means porting `milestone` first; until then the
+/// closest honest analogue is "quiet from the moment the desktop has a console window", which is the
+/// whole of the window the render6 screenshot is about. See `CONSOLEQUIET.md` §6.
+///
+/// ### The panic override, three independent times
+///
+/// 1. `panic_screen` clears `CONSOLE_WIN` **first**, before any panic byte is printed (PANIC PATH
+///    LAW), so the routed test below is already false on that path;
+/// 2. `PANIC_MIRROR` — written on this arch since PANICARM — is tested explicitly;
+/// 3. `serial_ring::in_panic_mode()` is tested as well, the signal `defer_route_open`'s aarch64 arm
+///    takes for the same reason: the `#[panic_handler]` sets it EARLIER than `panic_screen`, and it
+///    is true as well for a panic that never reaches `panic_screen` at all.
+///
+/// Each of the three alone is sufficient. Orin 10's PANICMIRROR fix stands untouched.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog")))]
+static CONQUIET_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// CONSOLEQUIET — one-shot latch for the `mirror=off` switch line.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog")))]
+static CONQUIET_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLEQUIET — one-shot latch for the `dropped=N` census.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog")))]
+static CONQUIET_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLEQUIET — let the switch line ITSELF through, so the window is not a mystery blank box.
+///
+/// The announcement is emitted with `serial_println!`, which re-enters `_print` synchronously on this
+/// core; this flag makes `conquiet_held` decline for exactly that nested line, so one line — the one
+/// that says why the console went quiet — lands on the glass and every line after it is dropped.
+/// A concurrent line on another core may slip through in the same instant. That is harmless by
+/// construction: it is bounded by the width of one `serial_println!` and every subsequent line on
+/// every core is still dropped.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog")))]
+static CONQUIET_PASS: AtomicBool = AtomicBool::new(false);
+
+/// CONSOLEQUIET — drops seen before the census speaks. Not 1: the switch line already reports the
+/// switch, and a census at 1 would report nothing the switch line did not. 256 is past the point
+/// where a desk boot is unambiguously printing steadily, so a reading of it is a statement about a
+/// running desktop rather than about the handful of lines around the route install.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog")))]
+const CONQUIET_CENSUS_AT: u64 = 256;
+
+/// CONSOLEQUIET — the armed arm. See the block above for the rule and the three panic overrides.
+///
+/// Called from `_print`'s first gate, AFTER `GUI_ACTIVE` and `panel_mirror_held` have both declined
+/// (`||` short-circuits), so it is reached exactly once per line the desktop's console would
+/// otherwise have swallowed — which makes it the natural place to count them. No lock is taken and
+/// nothing is allocated: three relaxed loads on the common path.
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog")))]
+fn conquiet_held() -> bool {
+    if CONQUIET_PASS.load(Ordering::Relaxed) {
+        return false;
+    }
+    // Guards 2 and 3 of the panic override (guard 1 is `panic_screen`'s `CONSOLE_WIN` clear, which
+    // the routed test below reads). Any one of the three alone restores the mirror.
+    if PANIC_MIRROR.load(Ordering::Relaxed) || crate::serial_ring::in_panic_mode() {
+        return false;
+    }
+    let win = CONSOLE_WIN.load(Ordering::Relaxed);
+    if win == wm::WIN_NONE {
+        // Not routed: the panel is still the console, and this gate has nothing to say about it.
+        return false;
+    }
+    let n = CONQUIET_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !CONQUIET_ANNOUNCED.swap(true, Ordering::Relaxed) {
+        CONQUIET_PASS.store(true, Ordering::Relaxed);
+        serial_println!(
+            "[conquiet] mirror=off since=console-window-route win={} lines_dropped={} knob=bootlog (the full serial stream stops mirroring into the console from the route install onwards — aarch64's half of x86's QUIET-PANEL rule; the WIRE is untouched and carries every one of these lines, UNAOS_BOOTLOG=1 puts them back on the glass, and a panic overrides this three independent ways)",
+            win,
+            n
+        );
+        CONQUIET_PASS.store(false, Ordering::Relaxed);
+    } else if n >= CONQUIET_CENSUS_AT && !CONQUIET_CENSUS_DONE.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[conquiet] census dropped={} win={} -> QUIET (lines the desktop's console window would have scrolled and did not; every one of them is on this wire above)",
+            n,
+            win
+        );
+    }
+    true
+}
+
+/// CONSOLEQUIET — the absent arm: x86, `bootlog`, and every aarch64 build without `desktop_firmware`.
+/// `|| false` folds away, so `_print`'s gate is the two terms it has always been on those images.
+///
+/// ⚠ THE PI IS IN BOTH SETS, and the split is the knob, not the board. `kernel8()`'s curated
+/// `K8_FEATS` starts `baremetal,skip_xhci` and adds `desktop_firmware` at exactly one place —
+/// `arroyo:5990`, under `UNAOS_PIDESK=1`. So the DEFAULT `kernel8.img` takes the absent arm and is
+/// byte-identical, and a `UNAOS_PIDESK=1` Pi image takes the ARMED arm and its console mirror
+/// changes BY DESIGN: the Pi desktop routes the console into a window through the same
+/// `panel_console_window_open` seam, so it has the same defect and takes the same cure. ONE OS —
+/// this is a rule about a routed console, not about a board.
+///
+/// ⚠ WHY THE `target_arch` TERM STAYS, when PARFB argued the arch term in `panel_mirror_held` was
+/// incidental. There it was: nothing on x86 called `panel_mirror_hold`, so widening changed no x86
+/// boot. Here it is NOT. `_print`'s x86 QUIET-PANEL gate two statements below already returns for
+/// the default build, so a widened term would be reached only on the paths that gate lets THROUGH —
+/// `PANEL_CONSOLE` (the Kepler-takeover lane) and `PANIC_MIRROR` — and on the first of those it
+/// would be a live behaviour change in a lane this seat does not own. Widening it is rmbp's call to
+/// make, on rmbp's evidence; this patch leaves x86 byte-identical and says so.
+#[cfg(not(all(target_arch = "aarch64", feature = "desktop_firmware", not(feature = "bootlog"))))]
+#[inline(always)]
+fn conquiet_held() -> bool {
+    false
+}
