@@ -3153,6 +3153,49 @@ fn shell_relics_witness() {
             if leaked.is_empty() { " none" } else { &leaked }),
     );
 
+    // --- write: the retired raw overload cannot come back — `write 0 0` is a FILE write ----------
+    //
+    // rmbp 14's condition on RELICS (fold 8). Before R26 clause 1, `write <lba> <byte>` with exactly
+    // two numeric arguments was 512 bytes of that byte over that logical block (`wrote LBA 12
+    // (0x00 x512)`), so `write 12 0` at a bench prompt was a sector write, not a file named 12. This
+    // leg types the OLD spelling into the SAME dispatcher the prompt drives and reads what came out.
+    // Two-sided: it REQUIRES a file-verb line (a `write:` refusal, or `wrote N bytes to /0`) and
+    // FORBIDS the sector vocabulary (`LBA`, or the old arm's `write error:`). On the x86 battery
+    // there is no block device, so an overload that grew back would print `write error: NotReady`
+    // (forbidden) and no file line (required), and the leg reds on both counts. Proven failable at
+    // fold 8 by routing `write 0 0` to a stub that printed the old line.
+    {
+        // A throwaway pal over a 16x16 heap "framebuffer", the shape `video::witness::run` uses.
+        // `dispatch_command` needs a pal only for full-screen apps, which `write` is not. Built by
+        // struct literal so `TargetPal::new`'s once-per-surface `:: UI1:` line is not repeated.
+        let info = unaos_boot_info::FrameBufferInfo {
+            width: 16, height: 16, stride: 16, bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        };
+        let mut store = alloc::vec![0u8; 16 * 16 * 4];
+        let mut fb = crate::video::FrameBuffer::new();
+        fb.init(store.as_mut_ptr() as usize, store.len(), info);
+        let mut screen = crate::video::Screen::new(fb);
+        let mut pal = TargetPal { surface: &mut screen };
+        let lines = witness_capture(|c| {
+            let _ = dispatch_command("write 0 0", c, &mut pal);
+        });
+        let file_line = lines.iter().any(|l| {
+            l.starts_with("write:") || (l.starts_with("wrote ") && l.contains(" bytes to /0"))
+        });
+        let sector_line = lines.iter().any(|l| l.contains("LBA") || l.starts_with("write error"));
+        // Self-clean: a volume that ACCEPTED the write now holds a file named `0`; remove it the
+        // same way, through the dispatcher, so the battery leaves the root as it found it.
+        if lines.iter().any(|l| l.starts_with("wrote ")) {
+            let _ = witness_capture(|c| { let _ = dispatch_command("rm 0", c, &mut pal); });
+        }
+        verdict(
+            "shell.relics.write_raw",
+            file_line && !sector_line,
+            &alloc::format!("file={} sector={} lines={:?}", file_line, sector_line, lines),
+        );
+    }
+
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     shell_relics_native_witness();
     #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
