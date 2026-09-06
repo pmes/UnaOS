@@ -53,3 +53,5 @@ CONSOLEQUIET fbcon commit `3329eec6` (approved by rmbp 12; union gate check + te
 time — logs `~/unaos-bench/scratch/orin15/*-3329eec6.log`).
 CLICKDEAD v2 docs `c769e697` (split counters per rmbp; `CLICKDEAD-xhci.patch` v2; Pi image moves once, both shas in the
 doc; pi 7's re-accept asked; xhci/mod.rs applied on hw-jetson only after it).
+CONSOLEQUIET union gate on `3329eec6`: check 0, test-arm 0, `UNAOS_WC=1 test 150` 0, `kernel8.img` unchanged (the Pi
+knob-off image carries no `desktop_firmware`). Peter pushed hw-jetson to `12bbc0ed` (ls-remote 04:36Z); owed from there.
