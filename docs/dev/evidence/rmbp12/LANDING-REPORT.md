@@ -90,3 +90,47 @@ taken from a rule that authorised what the seat wanted, instead of from the inst
   four. It remains a reading task.
 - Peter's standing, unasked: **A4** (card as default startup volume), **B7** (vug arbiter placement),
   **S27** (138 prune-candidate refs, list six weeks old).
+
+---
+
+## Addendum — the seat ran on (2026-09-06 ~12:00–13:00Z, orin 16's full round)
+
+Written in place per the note at the top. orin 15 closed; orin 16 flew render7 and opened a
+nine-executor round on Peter's order.
+
+**A grant of this seat's let a real bug through.** orin 16's independent landing panel BLOCKED on four
+findings in the MENUBAR fold (`adb3b1cd`). **V-1 re-derived here and confirmed** — `wm::composite()` →
+`menubar.rs:851` → `winmenu.rs:852 dismiss("clear")` → `:652 drive()` → `wm::composite()`, re-entrant,
+and `wm.rs:4258`'s own comment records that the non-x86 arm is *"a bare `composite_once()` with no gate
+and no decline path of its own"*. Worse than the panel stated: `drive()`'s doc names the precondition
+the fold broke — *"Task context only"* — and the new callers run inside the compose path.
+
+**The review defect is this seat's** (`B16`): condition G asked whether the dismiss path used a latch,
+got a true answer — *"no latch, `drive()` on the caller's thread"* — and never asked the next question,
+**which threads are callers**. `drive()`'s own doc answers it in one line. Fix steer sent: not a gate on
+`composite()` (suppresses the symptom, licences the next violation) but a non-driving `dismiss` for the
+compose path. FIXPANEL was already in flight; told orin to let it land and compare shapes rather than
+re-cut to this seat's preference before anyone tested it.
+
+**Peter's glass report decomposed rather than filed.** Eight items; three corrections made:
+- **(1) Print Screen wedges / 3 presses ≠ 3 captures is `A2` reproducing**, not new → promoted to
+  **`SR2`** (`a2ef7279`), rMBP's 70 s number kept, orin's A17 8-armed/7-OK/**1-silent** cited as
+  instance 2. A17's "silent" capture is what a dropped press looks like from the other end.
+- **(7) is TWO defects.** "Shell cannot be reopened" is **`S4`**, measured: `take_shell_reopen()`
+  (`dock.rs:502`) has one real caller, `main.rs:6906` inside `x86_render_service`; neither aarch64 body
+  calls it. Ticked with Peter's instance, not filed new. The **other** half — a window id reused after a
+  route-dropped close — is new, dangerous, and now orin's queue slot 0 (WINID).
+- **(2) splits** into a layout row and a design row (Peter asked for Quit in app menus by name).
+
+**The pattern worth more than any single row: `S4` and `B11` are one class** — `x86_render_service` does
+things the aarch64 render bodies do not (drains `SHELL_REOPEN`; feeds `wm::drag_motion`). Two
+independent bugs, one shape, both closed structurally by the render-family convergence. **S7 steps 2–3
+are a bug fix, not tidiness.**
+
+**Also corrected: this seat was caught relaying a stale origin value** for several turns (`e769bea8`
+when origin had moved to `5f1c5124`), by orin 16 running their own `ls-remote`. A status line is an
+announce and carries the same same-turn fresh-check duty as any other claim.
+
+**Owed to this seat, all patch-first, none granted:** FIXPANEL (V-1..V-4), PRTSCR-ASYNC (SR2 — this
+seat owns the row and cannot staff it, so orin cuts and this seat grants or reshapes), CRYSTAL-video,
+DESKFIX-video, ROOTFS-shared, BSPRUN-shared, then WINID and MENUBAR2.
