@@ -53,7 +53,7 @@ macro_rules! svc_vec {
         "__vec_svc"
     };
 }
-#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 macro_rules! svc_vec {
     () => {
         "__vec_sync"
@@ -103,7 +103,7 @@ __vec_svc_fault:
 "#
     };
 }
-#[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+#[cfg(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 macro_rules! svc_stub {
     () => {
         ""
@@ -570,8 +570,8 @@ extern "C" fn aarch64_irq_handler() {
     // entry's, and it stays valid because exception ENTRY masks ALL of DAIF (D,A,I,F=1): no nested
     // IRQ/FIQ/SError can be taken to overwrite SPSR_EL1 before this read — even though enable_irq
     // unmasks SError (PSTATE.A) globally, that clear does not survive exception entry. SPSR.M[4:0]==0
-    // is EL0t (an AArch64 EL0 return); any kernel-EL preempt has M != 0. `syscall` is baremetal-only,
-    // so the whole block is cfg-gated (the EL2/UEFI/jetson build has no EL0 and no `syscall` module).
+    // is EL0t (an AArch64 EL0 return); any kernel-EL preempt has M != 0. This block is `baremetal`-gated,
+    // NARROWER than `syscall`'s own `aarch64_el0` gate: only the Pi PREEMPTS EL0 (tegra/virt run cooperatively).
     #[cfg(feature = "baremetal")]
     {
         let spsr: u64;

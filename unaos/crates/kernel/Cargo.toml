@@ -832,6 +832,36 @@ orinwdt = ["tegra"]
 # witness is metal-owed/attended. See arch_arm64.md §JETSON-EL0.
 tegra_el0 = ["tegra", "aarch64_el0"]
 
+# JV1 (orin 17) — THE EL0 REGIME ON THE QEMU `virt` TARGET, so EL0 regressions are catchable without a
+# board. The THIRD board term behind `aarch64_el0` (after `baremetal`/Pi and `tegra_el0`/Orin), and the
+# one the capability comment above predicted would "add one line here instead of editing a predicate in
+# fifty-one places" — that is exactly what this is.
+#
+# WHY IT NEEDS NO NEW MMU BACKEND, WHICH IS THE WHOLE REASON THIS IS ONE LINE AND NOT A MODULE.
+# `arch/aarch64/mmu_tegra_el0.rs` was written as the Tegra234 slot backend, but it is coupled to Tegra
+# in exactly TWO live call sites (`mmu_tegra::MMU_MAX_HOLES` / `carveout_holes`, both inside
+# `carveout_overlaps`), and it does NOT reference `mmu_tegra`'s `L1_EL1` static at all: `install()`
+# latches the LIVE `TTBR0_EL1` (`live_ttbr0_root`), so it hangs its user window off whatever EL1 root
+# the boot path actually installed. `boot_virt::drop_to_el1` installs an L1 of the SAME SHAPE
+# `mmu_tegra` builds (`L1[0]` = the low-1-GiB Device window, every RAM GiB = a Normal-WB block, the
+# rest invalid), so `USER_GIB` (480) is as unmapped on `virt` as it is on the Orin and `install()`'s
+# "verify the entry is invalid before claiming it" check passes for the same reason. The carveout arm
+# is INERT rather than wrong on virt: `carveout_holes` reads `HOLE_N`, which only the `tegra`-gated
+# `resolve_carveout_holes` ever writes, so it returns 0 and `carveout_overlaps` is `false` — which is
+# the correct answer on a machine with no SNOC firewall. `mmu_tegra` itself already compiles off-tegra
+# (ORIN-NET-3 carries it on the `pcie3` virt witness), so this reuses a build that exists.
+#
+# It therefore implies `aarch64_el0` ONLY — NOT `tegra`, and NOT `pi`. `pi` + `tegra` is a hard
+# `compile_error!` (`arch/aarch64/serial.rs:23`), so a board term that dragged either in could not
+# coexist with the other board; this one drags in neither and the virt PL011 stays the console.
+#
+# DEFAULT OFF => `mmu_tegra`/`mmu_tegra_el0` are not compiled on virt, `uslots` has no virt arm, and
+# every existing configuration (Pi `baremetal`, Orin `tegra_el0`, plain virt, x86) is byte-identical to
+# baseline. Enable via `UNAOS_VIRT_EL0=1` (`./arroyo test-arm`, `check`); type-checked by the
+# `arm-virt-el0` leg of KERNEL_CFG_MATRIX. Unlike `tegra_el0`, this one IS QEMU-exercisable — that is
+# the point of it.
+virt_el0 = ["aarch64_el0"]
+
 # JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of `jb2b_attach` BEFORE the
 # no-HCRST takeover overwrites the controller's inherited DCBAAP/CRCR/ERST — so it snapshots the

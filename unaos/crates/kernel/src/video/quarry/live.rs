@@ -1053,7 +1053,7 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// ⚠ **"ARCH-NEUTRAL" WAS THE WRONG AXIS — THERE ARE THREE STATES, NOT TWO (rmbp-7 QUARRY2).**
 /// `arch::syscall` is not a property of the *arch*; it is a property of the **EL0 layer**. On x86 the
 /// module is unconditional (`arch/x86_64/mod.rs:11`), but `arch/aarch64/mod.rs:47` gates
-/// `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the rings, the
+/// `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")` — the rings, the
 /// process table and `bg_poll` all belong to that layer. So an aarch64 build carrying
 /// `desktop_firmware` (this window's own gate) with NEITHER of those two features named a module that
 /// does not exist, and this function failed E0432/E0433 at the `use` and at the `bg_poll` call. No
@@ -1070,7 +1070,7 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// with a reason, in the arm below.
 #[cfg(any(
     target_arch = "x86_64",
-    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 ))]
 fn reap_jobs() {
     use crate::arch::syscall::BgPoll;
@@ -1110,7 +1110,7 @@ fn reap_jobs() {
 /// passes) and gating each of them would put the same conjunct in five places to drift out of step.
 #[cfg(not(any(
     target_arch = "x86_64",
-    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 )))]
 fn reap_jobs() {}
 
@@ -1138,7 +1138,7 @@ fn reap_jobs() {}
 /// ⚠ **THE DISPATCH IS THREE-WAY, NOT TWO-WAY (rmbp-7 QUARRY2).** This body needs BOTH halves of the
 /// seam — `uslots::USER_REGION_SIZE` for the ceiling and `arch::syscall::spawn_user_image_bg` for the
 /// spawn — and `arch/aarch64/mod.rs` gates both modules behind
-/// `any(feature = "baremetal", feature = "tegra_el0")`, because the user address space and the
+/// `any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")`, because the user address space and the
 /// process table belong to the EL0 layer rather than to the chip. `target_arch = "aarch64"` alone
 /// therefore over-claimed: it named this body for a ringless `desktop_firmware` build that has
 /// neither module, and it failed E0433 at the `CAP` const and again at the spawn call. The conjunct
@@ -1149,7 +1149,7 @@ fn reap_jobs() {}
 /// that HAS an EL0 layer, and a wider one is the E0433 back again.
 #[cfg(all(
     target_arch = "aarch64",
-    any(feature = "baremetal", feature = "tegra_el0")
+    any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
 ))]
 fn launch(path: &str) -> String {
     use crate::fs::vfs::{NodeKind as NK, VfsError};
@@ -1263,14 +1263,14 @@ fn launch(path: &str) -> String {
 /// is also what [`super::super::dock`]'s focus seam does one file over (`ba3e9b62`).
 #[cfg(all(
     target_arch = "aarch64",
-    not(any(feature = "baremetal", feature = "tegra_el0"))
+    not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 ))]
 fn launch(path: &str) -> String {
     serial_println!(
-        "[quarry] launch REFUSED path={} reason=no-el0-layer (this aarch64 build has neither `baremetal` nor `tegra_el0`, so `arch::syscall`/`uslots` are not compiled)",
+        "[quarry] launch REFUSED path={} reason=no-el0-layer (this aarch64 build has none of `baremetal` / `tegra_el0` / `virt_el0`, so `arch::syscall`/`uslots` are not compiled)",
         path
     );
-    String::from("no EL0 layer in this build (needs `baremetal` or `tegra_el0`)")
+    String::from("no EL0 layer in this build (needs `baremetal`, `tegra_el0` or `virt_el0`)")
 }
 
 /// Perform an [`Act`] decided inside the model lock, with that lock RELEASED, then record its

@@ -56,27 +56,34 @@ pub mod bus;
 // `map_mmio_window` reach ceiling there; on virt the L1 statics are inert, not the active regime.)
 #[cfg(any(feature = "tegra", feature = "pcie3"))]
 pub mod mmu_tegra;
-// JETSON-EL0 (M1b): the EL0 user address-space machinery for the tegra EL1 regime — the M6d slot system
-// (`boot.rs`) re-implemented against `mmu_tegra`'s `L1_EL1` instead of the Pi's BCM2711 identity map.
-// See the module header for the three places it necessarily diverges from `boot.rs`.
-#[cfg(feature = "tegra_el0")]
+// JETSON-EL0 (M1b): the EL0 user address-space machinery for an EL1 regime whose low GiB is a Device
+// window — the M6d slot system (`boot.rs`) re-implemented against the LIVE `TTBR0_EL1` root instead of
+// the Pi's BCM2711 identity map. See the module header for the three places it necessarily diverges
+// from `boot.rs`. JV1 (orin 17) widened the gate from `tegra_el0` to also cover `virt_el0`: the module
+// is board-NAMED but not board-COUPLED, and `boot_virt`'s EL1 L1 has the same shape `mmu_tegra` builds.
+#[cfg(any(feature = "tegra_el0", feature = "virt_el0"))]
 pub mod mmu_tegra_el0;
 
 // JETSON-EL0 (M1b): THE FACADE. `syscall.rs` and `sched.rs` consume one user-address-space API — the
-// slot pool, the user window VA, the W^X leaf flips, the FB surface hole, ASID teardown. Two modules
-// implement it: `boot.rs` for the Pi (BCM2711, `baremetal`) and `mmu_tegra_el0.rs` for the Orin
-// (Tegra234, `tegra_el0`). Routing the consumers through this one re-export is what let the EL0 chain
-// reach the Orin WITHOUT editing a single line of logic in either consumer — `syscall.rs`'s 308 call
-// sites changed module path only (`super::boot::` -> `super::uslots::`), and `sched.rs`'s five changed
-// the same way. The two features are mutually exclusive in practice (`baremetal` implies `pi`,
-// `tegra_el0` implies `tegra`, and `pi`/`tegra` are mutually exclusive), but `baremetal` is written to
-// win the arm explicitly so a nonsensical both-on build picks one deterministically instead of
-// colliding on a duplicate glob import.
+// slot pool, the user window VA, the W^X leaf flips, the FB surface hole, ASID teardown. THREE board
+// terms select an implementation of it: `boot.rs` for the Pi (BCM2711, `baremetal`), and
+// `mmu_tegra_el0.rs` for BOTH the Orin (Tegra234, `tegra_el0`) and, since JV1, the QEMU `virt` target
+// (`virt_el0`) — that module turned out to be regime-generic rather than Tegra-specific: it latches the
+// LIVE `TTBR0_EL1` in `install()` instead of naming `mmu_tegra`'s `L1_EL1`, so it hangs its window off
+// whatever EL1 root the boot path installed, and its ONE Tegra coupling (`carveout_overlaps`) is
+// cfg-split. Routing the consumers through this one re-export is what let the EL0 chain reach the Orin
+// WITHOUT editing a single line of logic in either consumer — `syscall.rs`'s 308 call sites changed
+// module path only (`super::boot::` -> `super::uslots::`), and `sched.rs`'s five changed the same way;
+// it is also why JV1 reached `virt` without touching either consumer at all. The board terms are
+// mutually exclusive in practice (`baremetal` implies `pi`, `tegra_el0` implies `tegra`, `pi`/`tegra`
+// are mutually exclusive, and `virt_el0` implies neither board), but `baremetal` is written to win the
+// arm explicitly so a nonsensical both-on build picks one deterministically instead of colliding on a
+// duplicate glob import.
 #[cfg(feature = "aarch64_el0")]
 pub mod uslots {
     #[cfg(feature = "baremetal")]
     pub use super::boot::*;
-    #[cfg(all(feature = "tegra_el0", not(feature = "baremetal")))]
+    #[cfg(all(any(feature = "tegra_el0", feature = "virt_el0"), not(feature = "baremetal")))]
     pub use super::mmu_tegra_el0::*;
 }
 // JB1a: bounded read-only FDT walker — prints the BPMP IPC geometry (shmem/mboxes/reserved-memory)
@@ -503,3 +510,39 @@ fn hw_wait_budget_derived() -> u64 {
 pub fn flush_framebuffer_rows(addr: usize, row_len: usize, rows: usize, stride: usize) {
     cache::clean_rows(addr, row_len, rows, stride);
 }
+
+// ── JV1 (orin 17): `aarch64_el0` IS A CAPABILITY, NOT A BOARD — enforce it ──────────────────────────
+//
+// THE TRAP THIS CLOSES, quoted from the sites that predicted it. Eleven `#[cfg]`s across five files
+// carry the comment "Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`,
+// not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled
+// `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check
+// over the legs would PASS while the hazard shipped."
+//
+// JV1 measured that build. `--features aarch64_el0` with no board is not a hazard that ships: it is
+// 329 compile errors, every one of them the `uslots` facade resolving to nothing, because the facade
+// has an arm per BOARD and a bare capability selects none. The Cargo.toml comment on `aarch64_el0` says
+// the same thing in prose — "arming the capability without a board to back it compiles code whose slot
+// backend does not exist." So the correct status of that configuration is REJECTED, not merely unbuilt,
+// and saying so here costs one `cfg` and turns a documented drift risk into a diagnosable message.
+//
+// WHAT IT BUYS BEYOND THE MESSAGE: with this in place the three board terms are exhaustive over
+// `aarch64_el0`, so `not(any(baremetal, tegra_el0, virt_el0))` and `not(aarch64_el0)` are now provably
+// the same predicate. That is what makes JV1's widening of the eleven negated sites COMPLETE rather
+// than merely careful — and it is the precondition a later cleanup needs to collapse all eleven to the
+// single-name spelling `aarch64_el0` exists for. That collapse is deliberately NOT done here: it is a
+// four-file edit with no behaviour in it, and this arc's non-regression claim is easier to audit
+// without it.
+//
+// Fires only on aarch64 (`arch/mod.rs` gates this module on `target_arch`), and in no configuration any
+// gate leg or any board builds: `baremetal`, `tegra_el0` and `virt_el0` each imply `aarch64_el0`, and
+// nothing else sets it.
+#[cfg(all(
+    feature = "aarch64_el0",
+    not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
+))]
+compile_error!(
+    "feature `aarch64_el0` is a CAPABILITY, not a board: it is implied by `baremetal` (Pi 4), \
+     `tegra_el0` (Jetson Orin) or `virt_el0` (QEMU virt), and enabling it alone compiles the EL0 \
+     chain with no `uslots` slot backend behind it. Enable one of those three instead."
+);

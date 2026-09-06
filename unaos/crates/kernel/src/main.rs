@@ -389,8 +389,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unsafe { unaos_kernel::arch::boot_virt::drop_to_el1(jc3_ram_gib_mask) };
         // Now at EL1 with the MMU live and DAIF masked. Re-seed this core's per-CPU block (now TPIDR_EL1)
         // and install the EL1 exception vectors (VBAR_EL1), then run CAPSTONE cooperatively (never returns).
-        unaos_kernel::arch::percpu::init(0);
-        unaos_kernel::arch::exceptions::install();
+        unaos_kernel::arch::percpu::init(0); #[cfg(feature = "virt_el0")] unaos_kernel::arch::sched::mark_el1_core(); // JV1 — THE EL0-EL1CORE STAMP, and without it the whole arc is inert. `spawn_user` filters placement through `EL1_CORE_MASK`, which a core writes ONLY by measuring its own `CurrentEL` in `mark_el1_core`; `boot_tegra` stamps on the JM6 drop, `boot_virt` never did, and `sched.rs`'s own comment said so ("drops to EL1 through `boot_virt` ... so it stamps nothing"). MEASURED before this line existed: `:: SCHED: EL0 placement REFUSED (spawn) 'el0-hello' req=0 — no core at EL1 is a candidate ::` with `el1cores=0x0` in the rollup, on a boot where the user window installed and the blob loaded — everything else worked and the task was simply never placed. Position is the tegra site verbatim and for the tegra reasons: AFTER `percpu::init` (the stamp needs `cpu_index`, and TPIDR_EL1 is RESET-UNKNOWN on this core until that re-seed) and ABOVE `virt_el0_start_maybe()` (an unstamped mask refuses the pinned spawn). `mark_el1_core` re-measures `CurrentEL` itself and stamps nothing if it is not EL1, so the filter fails CLOSED if this ever moves above the drop. Gated `virt_el0` and NOT unconditional: on a knob-off virt boot the stamp would flip the `[el0core] rollup` witness from `el1cores=0x0` to `0x1` with no EL0 spawn path in the build to justify it — a changed line in a run this arc must leave byte-identical. FOLDED, code-before-comment: `main.rs` panic `Location`s must not shift.
+        unaos_kernel::arch::exceptions::install(); virt_el0_start_maybe(); // JV1 — EL0 ON VIRT, staged HERE and nowhere else. It must be AFTER `exceptions::install()`, which is what puts the real `VBAR_EL1` in place for the `SVC` the EL0 task takes, and AFTER `boot_virt::drop_to_el1`, because `mmu_tegra_el0::install()` hangs its user window off the LIVE `TTBR0_EL1` and that root is not the EL1 one until the drop. It must be BEFORE `run_capstone_boot_core`, which never returns. Pre-staging onto the queue is the SUPPORTED shape, not a workaround: `capstone_queue_pre_staged` exists precisely so the two priority witnesses (which DRAIN the queue) stand down when tasks are already staged, so the EL0 task cannot be eaten before CAPSTONE runs. FOLDED onto this line, and code-before-comment, for the `panic::Location` reason this file's other tail-defined knobs cite — a source line added here shifts every later Location in `main.rs` and moves the knob-off `kernel8.img` hash.
         unaos_kernel::arch::sched::run_capstone_boot_core(0);
     }
 
@@ -9426,3 +9426,62 @@ fn console_reopen_drain(who: &'static str) {
 )))]
 #[inline(always)]
 fn console_reopen_drain(_who: &'static str) {}
+// ── JV1 (orin 17): EL0 on the QEMU `virt` target ────────────────────────────────────────────────────
+//
+// The `virt_el0` twin of `tegra_el0_start_maybe` above, and deliberately the SAME five steps in the same
+// order — install the user window in the live EL1 regime, copy the demo in, flip the code page to its
+// final EL0-RX/EL1-RO shape, spawn the EL0 task pinned to the boot core, arm the verdict.
+//
+// WHY THIS NEEDED NO NEW MMU BACKEND, which is the finding this arc turns on. `mmu_tegra_el0.rs` reads
+// as Tegra234 code and is named for it, but it is coupled to Tegra in exactly ONE predicate
+// (`carveout_overlaps`, now cfg-split) — it never touches `mmu_tegra`'s `L1_EL1` static. `install()`
+// latches the LIVE `TTBR0_EL1` (`live_ttbr0_root`) and hangs the user window off whatever EL1 root the
+// boot path installed, so it is regime-generic by construction. `boot_virt::drop_to_el1` installs an L1
+// of exactly the shape `mmu_tegra` builds (`L1[0]` = the low-1-GiB Device window, every RAM GiB a
+// Normal-WB block, the rest invalid), so `USER_GIB` (480) is unmapped on `virt` for the same reason it
+// is unmapped on the Orin, and `install()`'s "verify the entry is invalid before claiming it" check
+// passes on its own terms rather than on a promise made here.
+//
+// COOPERATIVE, exactly as the JC3 drop leaves things and as the parked JV1 brief specified: the drop
+// disables the physical timer, `SCHED_ACTIVE` stays false, and the shared `__vec_irq` stub still banks
+// EL2 state (`irq_el!()` == "2") — so there is no IRQ source and the EL0 task runs to its next `svc`.
+// EL1 timer preemption on virt needs an EL1-non-banking `__vec_irq` and is a SEPARATE arc; nothing here
+// touches `irq_el!()`.
+//
+// FILE-TAIL + a same-line call, per this file's standing `panic::Location` convention (see
+// `tegra_el0_start_maybe`'s header): zero source lines are added ahead of any existing Location, so the
+// knob-off images do not move.
+#[cfg(all(feature = "virt_el0", target_arch = "aarch64"))]
+fn virt_el0_start_maybe() {
+    if !unaos_kernel::arch::mmu_tegra_el0::install() {
+        // `install` already printed WHY it refused; this is the machine-checkable FAIL line, so a
+        // capture never has to infer the outcome from the absence of a PASS.
+        serial_println!(":: VIRT-EL0: el0-hello round-trip -> FAIL — user window not installed ::");
+        return;
+    }
+    let demo = unaos_kernel::arch::syscall::setup();
+    unaos_kernel::arch::syscall::protect();
+    // Pinned to the boot core (cpu 0, not CPU_AUTO): `pick_cpu_slot` short-circuits a non-AUTO request,
+    // so the EL0 task cannot be placed on a secondary. Load-bearing here for the same reason as on the
+    // Orin AND for one more: the JC2 `virt` secondaries are still parked at EL2: an EL0 task placed on
+    // one would hit `user_task_trampoline`'s `CurrentEL` guard and be refused (EL0-EL1CORE).
+    unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, 0);
+    unaos_kernel::arch::sched::spawn(
+        "virt-el0-verdict",
+        unaos_kernel::arch::syscall::virt_el0_verdict,
+        0,
+        0,
+    );
+    serial_println!(
+        ":: VIRT-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry {:#x} sp {:#x} ::",
+        demo.hello,
+        demo.sp
+    );
+}
+
+// Knob-off aarch64 build (plain virt, Pi, Orin): the wire-in compiles to nothing. `#[inline(always)]` on
+// an empty body means the folded call on the drop line emits zero instructions, so every existing image
+// stays byte-identical.
+#[cfg(all(not(feature = "virt_el0"), target_arch = "aarch64"))]
+#[inline(always)]
+fn virt_el0_start_maybe() {}

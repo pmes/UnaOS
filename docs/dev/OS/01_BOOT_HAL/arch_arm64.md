@@ -9615,6 +9615,172 @@ carries `REQUIRE SCHED: load c0=(--|[0-9]+%)/f=` on the baseline's reachability 
 `[el0core] rollup:` precedent verbatim), go-red-proven against boot7g's slice, which predates the
 arc and reds on exactly that row.
 
+## JV1 — EL0 on the QEMU `virt` target (`UNAOS_VIRT_EL0`)
+
+### Why: EL0 regressions were catchable only at a bench
+
+`arch/aarch64/mod.rs` gates `syscall`, `bus` and the `uslots` facade on the **capability** feature
+`aarch64_el0`, which nothing sets directly — it is implied by `baremetal` (Pi 4) and `tegra_el0`
+(Orin). Both are board features for boards QEMU does not model: `baremetal` implies `pi`, and `pi` +
+`tegra` is a hard `compile_error!` (`arch/aarch64/serial.rs:23`). The `virt` legs (`./arroyo test-arm`,
+with or without `UNAOS_GICV3=1`) carry neither, so before this arc **`test-arm` exercised zero lines of
+EL0 code** — measured, not assumed: `awk` over a plain `test-arm` capture returns no `el0`, `eret` or
+`user mode` line at all. Every EL0/BSPRUN regression was therefore metal-owed, on hardware that stays
+at the bench.
+
+`virt_el0` is the third board term behind `aarch64_el0`, and the first one QEMU can run.
+
+### The finding: `mmu_tegra_el0.rs` is board-NAMED, not board-COUPLED
+
+The obvious reading of the gate is that the obstacle is the `#[cfg]` — add a term to it and the virt
+kernel compiles the user machinery. That is false, and the measurement says so loudly: a build with
+`aarch64_el0` on and no board term exits 101 on **329 errors, every one of them the `uslots` facade
+resolving to nothing** (77 × `USER_SLOTS`, 50 × `USER_CODE_SIZE`, 29 × `slot_ttbr0`, …). The facade has
+one arm per board and a bare capability selects none. The Cargo.toml comment on `aarch64_el0` had
+already said this in prose — "arming the capability without a board to back it compiles code whose slot
+backend does not exist."
+
+So the arc's real question was where the third slot backend comes from. The parked brief budgeted a new
+~900-line `boot_virt_user.rs`. It is not needed, and the reason is worth stating precisely because the
+file's own name hides it:
+
+* **`mmu_tegra_el0.rs` never names `mmu_tegra`'s `L1_EL1` static.** `install()` calls
+  `live_ttbr0_root()` — a `mrs TTBR0_EL1` with the ASID stripped — and hangs the user window off
+  *whatever EL1 root the boot path installed*. The module is regime-generic by construction.
+* **`boot_virt::drop_to_el1` installs an L1 of exactly the shape `mmu_tegra` builds**: `L1[0]` = the
+  low-1-GiB Device window (GICv3 distributor at `0x0800_0000`, GICR at `0x080A_0000`, PL011 at
+  `0x0900_0000`), every RAM GiB a Normal-WB block, the rest invalid — same `TCR_EL1.T0SZ = 25`, same
+  39-bit VA. So divergence (1) of the JETSON-EL0 section — *the user window cannot live in GiB 0, it
+  goes in the otherwise-unused `USER_GIB = 480`* — holds on `virt` for the same reason, and `install`'s
+  "verify the entry is invalid before claiming it" check passes on its own evidence.
+* **The whole Tegra coupling is one predicate.** `carveout_overlaps` asks `mmu_tegra` for the
+  SNOC-firewalled window set; `carveout_holes` is `#[cfg(feature = "tegra")]`, so it is cfg-split. QEMU
+  `virt` has no SNOC firewall and no `/reserved-memory` carveouts, so the virt arm answers `false` on
+  those grounds rather than as a stub. (Note the tegra arm would compute `false` there anyway:
+  `carveout_holes` reads `HOLE_N`, which only the `tegra`-gated `resolve_carveout_holes` writes.)
+
+`virt_el0 = ["aarch64_el0"]` therefore implies **neither** `tegra` nor `pi` — it drags in no board UART
+and the virt PL011 stays the console.
+
+### The trap this arc was standing in, and the leg that now guards it
+
+Eleven `#[cfg]`s across five files carry a verbatim note: *"Cargo feature implication is ONE-WAY:
+`baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from
+this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is
+the trap — a byte-identity check over the legs would PASS while the hazard shipped."*
+
+**JV1 is that combination.** Every negated site left longhand for that reason would have gone live
+*alongside* its positive twin on a `virt_el0` build — duplicate definitions, not a silent hazard, but
+only because someone wrote the longhand down. All 21 board-pair predicates
+(`exceptions.rs` ×2, `sched.rs` ×5, `shell.rs` ×2, `video/quarry/live.rs` ×6, `video/dock.rs` ×5,
+comments included) are widened line-neutrally to name `virt_el0`, and the new `arm-virt-el0` leg of
+`KERNEL_CFG_MATRIX` is the leg those comments asked for by name — it is the only aarch64 leg with an
+EL0 layer and neither `pi` nor `tegra`, so the family now fails independently of both boards.
+
+Two things make the widening **complete** rather than merely careful:
+
+* `arch/aarch64/mod.rs` now carries a `compile_error!` rejecting `aarch64_el0` with no board term. The
+  configuration was never buildable (329 errors); saying so turns a documented drift risk into a
+  diagnosable message.
+* With that guard, the three board terms are exhaustive over `aarch64_el0`, so
+  `not(any(baremetal, tegra_el0, virt_el0))` and `not(aarch64_el0)` are now **provably** the same
+  predicate. Collapsing all 21 sites to the single-name spelling `aarch64_el0` exists for is therefore
+  now safe — deliberately left as follow-on work, since it is a five-file edit with no behaviour in it.
+
+### The bring-up and the witness
+
+`main.rs::virt_el0_start_maybe()` is the `virt` twin of `tegra_el0_start_maybe`, the same five steps in
+the same order: `mmu_tegra_el0::install()` → `syscall::setup()` → `syscall::protect()` →
+`spawn_user("el0-hello", …)` pinned to the boot core → `spawn("virt-el0-verdict", …)`. It is folded onto
+the `exceptions::install();` line in the JC3 GICv3 block, which is the only correct home: after
+`boot_virt::drop_to_el1` (the user window hangs off the *live* `TTBR0_EL1`, which is not the EL1 root
+until the drop), after `exceptions::install()` (that is what puts the real `VBAR_EL1` in place for the
+`SVC`), and before `run_capstone_boot_core`, which never returns. Pre-staging onto the queue is the
+supported shape rather than a workaround: `capstone_queue_pre_staged` exists precisely so the two
+priority witnesses — which *drain* the queue — stand down when tasks are already staged.
+
+The boot-core pin is load-bearing for one more reason than on the Orin: the JC2 `virt` secondaries are
+still parked at EL2, so an EL0 task placed on one would hit `user_task_trampoline`'s `CurrentEL` guard
+and be refused (EL0-EL1CORE).
+
+### `EL1_CORE_MASK` — the one real defect, and the tree had already named it
+
+The first armed boot installed the window, loaded the blob, passed the W^X AT probe — and then refused
+to place the task:
+
+```
+:: SCHED: EL0 placement REFUSED (spawn) 'el0-hello' req=0 — no core at EL1 is a candidate ... n=1 ::
+:: SCHED: [el0core] rollup: el0refuse=1 el1cores=0x0 (EL0-EL1CORE) ::
+```
+
+`spawn_user` filters placement through `EL1_CORE_MASK`, which a core writes **only** by measuring its own
+`CurrentEL` in `sched::mark_el1_core()`. `boot_tegra` stamps on the JM6 drop; `boot_virt` never has — and
+`sched.rs`'s own comment said exactly that: *"drops to EL1 through `boot_virt` (not this arc's lane, so it
+stamps nothing)"*. So the EL0-EL1CORE guard was doing its job perfectly: on virt, no core had ever
+**proved** it was at EL1, and the guard fails closed.
+
+The fix is one folded, line-neutral statement at the tegra site verbatim — after `percpu::init(0)` (the
+stamp needs `cpu_index`, and TPIDR_EL1 is RESET-UNKNOWN on this core until that re-seed) and above
+`virt_el0_start_maybe()` (an unstamped mask refuses the pinned spawn). It is **gated `virt_el0`, not
+unconditional**: on a knob-off virt boot the stamp would flip the `[el0core]` rollup from `el1cores=0x0`
+to `0x1` with no EL0 spawn path in the build to justify it, changing a line in a run this arc must leave
+byte-identical.
+
+With the stamp, the same boot reads:
+
+```
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: VIRT-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA 0x40017000, 8 slots ::
+:: M6c: user blob loaded (51 bytes) ::
+:: M6b: user code page EL0-RX/EL1-RO (AT probe: EL0-read OK, EL1-write denied) ::
+:: VIRT-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x7800000000 sp 0x7800004000 ::
+:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
+:: VIRT-EL0: el0-hello round-trip -> PASS ::
+```
+
+with `CAPSTONE COMPLETE — all 6 sync primitives verified in one boot` and both SMP heartbeat PASSes
+still on the same boot.
+
+**The witness tag.** `install()`'s six witnesses were hard-coded `TEGRA-EL0:`, so the first PASS boot
+printed `:: TEGRA-EL0: user window installed ::` **on QEMU virt** — naming a board absent from the build.
+They now route through an `EL0TAG` const: `"TEGRA-EL0"` under `tegra_el0`, so every existing Orin
+capture, spec and `awk` pattern matches the identical string, and `"VIRT-EL0"` under `virt_el0`.
+
+**Cooperative, exactly as JC3 leaves things.** The drop disables the physical timer, `SCHED_ACTIVE`
+stays false, and the shared `__vec_irq` stub still banks EL2 state (`irq_el!()` == `"2"`), so there is
+no IRQ source and the EL0 task runs to its next `svc`. **EL1 timer preemption on virt is a separate
+arc** — it needs an EL1-non-banking `__vec_irq`, and nothing here touches `irq_el!()`.
+
+Run it with:
+
+```
+UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm 60
+```
+
+Witnesses on the wire — `VIRT-EL0`, never `TEGRA-EL0`, because `test-arm` captures and Orin metal
+captures are read by the same eyes and the same `awk` patterns, and a `TEGRA-EL0` line emitted by a QEMU
+`virt` boot would be an actively misleading artifact:
+
+```
+:: VIRT-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x... sp 0x...
+:: VIRT-EL0: el0-hello round-trip -> PASS ::
+```
+
+`virt_el0_verdict` is a tail-defined twin of `tegra_el0_verdict` with the same four-counter assertion
+(`exited_ok == 1`, everything else 0) and the same CNTPCT bound, so a wedged EL0 task reports FAIL with
+its counts instead of hanging the boot dark. It is a twin rather than a widened `#[cfg]` so that the
+Orin's live, metal-flown path keeps this arc's fingerprints off it entirely.
+
+### Non-regression
+
+`virt_el0` default OFF ⇒ `mmu_tegra_el0` is not compiled on `virt`, `uslots` has no virt arm, the folded
+`virt_el0_start_maybe()` call emits zero instructions (`#[inline(always)]` empty body), and all 21
+widened predicates read exactly as they did. Every new source line is either `virt_el0`-gated or at a
+file tail, per this tree's standing `panic::Location` rule — `syscall.rs` and `main.rs` compile into the
+knob-off Pi `kernel8.img`, and a line inserted above an existing `panic!`/`assert!`/bounds-check site
+shifts its baked `Location` and moves the image hash.
+
+
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
 ### The failure

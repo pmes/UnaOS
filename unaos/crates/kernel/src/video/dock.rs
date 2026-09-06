@@ -198,7 +198,7 @@ use super::{ceramic, strip, theme, wm};
 // ⚠ **THERE ARE THREE STATES HERE, NOT TWO — and writing only two is what broke the build (SMALLS3).**
 // The seam was written as an exhaustive `x86_64` / `aarch64` pair on the unstated premise that every
 // build of one of those arches HAS a `syscall` module. On aarch64 that is false: `arch/aarch64/mod.rs`
-// gates `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the input rings
+// gates `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")` — the input rings
 // belong to the EL0 layer, and a build without it has no ring table to designate into. So this module's
 // own gate (`desktop_firmware`) armed with NEITHER of those two features named the module path in a
 // build where the module does not exist, and both functions failed E0433. No coverage leg reached the
@@ -229,7 +229,7 @@ fn focus_set(asid: u64) {
     crate::arch::x86_64::syscall::user_input_set_active(asid);
     #[cfg(all(
         target_arch = "aarch64",
-        any(feature = "baremetal", feature = "tegra_el0")
+        any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
     ))]
     crate::arch::aarch64::syscall::user_input_set_active(asid);
     // No ring table in this build: nothing to designate into, and the argument still has to be consumed.
@@ -237,7 +237,7 @@ fn focus_set(asid: u64) {
         target_arch = "x86_64",
         all(
             target_arch = "aarch64",
-            any(feature = "baremetal", feature = "tegra_el0")
+            any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
         )
     )))]
     let _ = asid;
@@ -254,7 +254,7 @@ fn focus_get() -> u64 {
     }
     #[cfg(all(
         target_arch = "aarch64",
-        any(feature = "baremetal", feature = "tegra_el0")
+        any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
     ))]
     {
         crate::arch::aarch64::syscall::user_input_active()
@@ -266,7 +266,7 @@ fn focus_get() -> u64 {
         target_arch = "x86_64",
         all(
             target_arch = "aarch64",
-            any(feature = "baremetal", feature = "tegra_el0")
+            any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
         )
     )))]
     {

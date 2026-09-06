@@ -360,11 +360,11 @@ pub struct Task {
     /// EL0 user-mode entry point + initial SP_EL0 (M6a). Non-zero only for `is_user` tasks made via
     /// `spawn_user`: such a task's initial frame lands in `user_task_trampoline`, which `eret`s to EL0
     /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks. Read only by
-    /// `user_task_trampoline` (baremetal-only); on the `virt` build every task is a kernel thread, so
+    /// `user_task_trampoline` (`aarch64_el0`-gated); on a build with no EL0 regime every task is a kernel thread, so
     /// these stay 0 and unread (`spawn_inner` still initialises them for the shared struct layout).
-    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     user_entry: u64,
-    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     user_sp: u64,
     /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
     /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
@@ -1659,7 +1659,7 @@ extern "C" fn task_trampoline() -> ! {
 
 /// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
 /// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it. EL0/user machinery
-/// is baremetal-only (the `virt` JC3 path runs kernel-thread CAPSTONE, no EL0 — see the module gate).
+/// is `aarch64_el0`-gated: Pi `baremetal`, Orin `tegra_el0`, and — since JV1 — QEMU `virt` under `virt_el0`.
 #[cfg(feature = "aarch64_el0")]
 fn user_never(_: usize) {
     unreachable!("user task's kernel `entry` was called");
@@ -1677,7 +1677,7 @@ fn user_never(_: usize) {
 /// the stack the later `svc`/IRQ re-entry (`__vec_svc`/`__vec_irq`) runs on, so the 16 KiB Box must
 /// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
 /// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
-/// runs after the drop. Baremetal-only (EL0/user machinery — the `virt` path has no EL0 this arc).
+/// runs after the drop. Gated on the `aarch64_el0` capability (Pi `baremetal`, Orin `tegra_el0`, JV1 `virt_el0`).
 #[cfg(feature = "aarch64_el0")]
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
@@ -1909,8 +1909,8 @@ static EL0_RESIDENTS: [PaddedUsize; NUM_CPUS] =
 /// `pick_cpu` on another core can never place a second resident against a stale count. Returns the
 /// new (inclusive) resident count, which the placement witness prints.
 ///
-/// `allow(dead_code)`: the only callers are the two EL0 spawn paths, which are `baremetal`-gated (the
-/// `virt`/JC3 aarch64 build runs kernel threads only and creates no EL0 task). The RELEASE side stays
+/// `allow(dead_code)`: the only callers are the two EL0 spawn paths, which are `aarch64_el0`-gated (an
+/// aarch64 build with no board EL0 term runs kernel threads only, creating no EL0 task). The RELEASE side stays
 /// ungated because `exit()` is shared by both worlds — it simply never fires there (`user_entry == 0`).
 #[allow(dead_code)]
 #[inline]
@@ -3340,7 +3340,7 @@ static EL0_ROLLUP_NEXT: AtomicU64 = AtomicU64::new(0);
 /// per-event trace stops, and `EL0_REFUSALS` keeps the count, read out by `[el0core] rollup:`.
 ///
 /// Gated with `el0_refuse` itself on the EL0-machinery features, matching `SPREAD4_LOG_MAX`'s `pi`
-/// gate: the `virt`/JC3 legs build no EL0 spawn path at all, so on those the pair would be dead.
+/// gate: a leg with no EL0 spawn path at all (a knob-off `virt`/JC3 build) would find the pair dead.
 #[cfg(feature = "aarch64_el0")]
 const EL0_REFUSE_LOG_MAX: u32 = 16;
 #[cfg(feature = "aarch64_el0")]
@@ -3432,7 +3432,7 @@ fn el0_refuse(site: &str, name: &str, requested: usize) {
 /// COST ON THE HOT PATH: two relaxed loads and a compare per dispatch pass, which is noise beside the
 /// context switch that pass just performed. Everything else is behind the "the count changed" guard.
 ///
-/// SCOPED TO THE BUILDS THAT CAN REFUSE. `virt`/JC3 compiles no EL0 spawn path at all and its boot core
+/// SCOPED TO THE BUILDS THAT CAN REFUSE. A knob-off `virt`/JC3 leg compiles no EL0 spawn path and its core
 /// drops to EL1 through `boot_virt` (not this arc's lane, so it stamps nothing), so on that leg the
 /// line would report a counter nothing can increment beside an EL1 mask nothing populates — a false
 /// zero is worse than no line. `cfg!` rather than `#[cfg]` so both polarities keep type-checking on
@@ -3447,7 +3447,7 @@ fn el0_refuse(site: &str, name: &str, requested: usize) {
 /// than the thing it reads. But a reader diffing a DEFAULT-media capture against an ARMED one will go
 /// looking for the baseline `el0refuse=0` and not find it. Absent here means "not armed", NOT "dead".
 fn el0_refusal_rollup() {
-    if !cfg!(any(feature = "baremetal", feature = "tegra_el0")) { // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    if !cfg!(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")) { // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
         return;
     }
     let n = EL0_REFUSALS.load(Ordering::Relaxed);
@@ -3771,8 +3771,8 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 /// boot root (rather than 0) is load-bearing: if a per-slot task last ran on this core, `dispatch_next`
 /// must switch TTBR0 back to the boot root before this task's EL0 access hits the shared window VA.
 ///
-/// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`) is baremetal-only: it reaches
-/// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
+/// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`), gated on the `aarch64_el0`
+/// CAPABILITY: it reaches into `super::uslots`, the per-board user-MMU facade. Pi, Orin, and (JV1) virt.
 #[cfg(feature = "aarch64_el0")]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
     spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu, TASK_STACK_SIZE)
@@ -4639,7 +4639,7 @@ static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
 /// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
 /// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
 /// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
-#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only — EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only — EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 fn asid_thread_enter(user_ttbr0: u64) {
     let asid = (user_ttbr0 >> 48) as usize;
     if asid != 0 && asid < KILL_ASID_SLOTS {
@@ -5676,7 +5676,7 @@ static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 /// input ring, nothing can park on one, and the backstop has nothing to do.
 #[inline]
 fn input_wait_backstop() {
-    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     return;
     #[cfg(feature = "aarch64_el0")]
     {

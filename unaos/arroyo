@@ -999,6 +999,24 @@ _feats=""
 # the module + spawn block vanish, and the jetson media is byte-identical to baseline. QEMU models no
 # Tegra234, so the round-trip witness is metal-owed (attended bench). See arch_arm64.md §JETSON-EL0.
 [ -n "${UNAOS_TEGRA_EL0:-}" ] && _feats="${_feats}tegra_el0,tegra,"
+# JV1 (orin 17): UNAOS_VIRT_EL0=1 arms the EL0 regime on the QEMU `virt` target — the THIRD board term
+# behind the `aarch64_el0` capability, after `baremetal` (Pi 4) and `tegra_el0` (Orin), and the first one
+# QEMU can actually run. It reuses `arch/aarch64/mmu_tegra_el0.rs` UNCHANGED as the slot backend: that
+# module never touches `mmu_tegra`'s `L1_EL1` static, it latches the LIVE `TTBR0_EL1` in `install()`, so
+# it hangs its user window off whatever EL1 root the boot path installed — and `boot_virt::drop_to_el1`
+# installs one of exactly the shape `mmu_tegra` builds. Its single Tegra coupling (`carveout_overlaps`)
+# is cfg-split; on virt there is no SNOC firewall to ask about.
+#
+# Implies `aarch64_el0` ONLY — NOT `tegra` and NOT `pi`, so it drags in neither board UART and the virt
+# PL011 stays the console (`pi` + `tegra` is a hard `compile_error!`, `arch/aarch64/serial.rs:23`).
+# It needs `UNAOS_GICV3=1` alongside it to reach the JC3 EL2 -> EL1 drop the EL0 regime sits on:
+#   UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm 60
+# Default OFF => `mmu_tegra_el0` is not compiled, `uslots` has no virt arm, the `virt_el0_start_maybe`
+# call emits zero instructions, and every existing image (Pi, Orin, plain virt, x86) is byte-identical.
+# The ARMED polarity is type-checked by the `arm-virt-el0` leg of KERNEL_CFG_MATRIX, not by this mapping.
+# Witnesses on the wire: `:: VIRT-EL0: el0-hello spawned at EL0`, `:: VIRT-EL0: el0-hello round-trip ->`,
+# and `[el0]`/`SYS_WRITE` traffic from the demo itself.
+[ -n "${UNAOS_VIRT_EL0:-}" ] && _feats="${_feats}virt_el0,"
 # ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries_tegra
 # + the fdt_tegra `/cpus` presence enumerator) is DEFAULT-ON for tegra builds — metal-proven across
 # SMP-1..8 (entry shape, concurrency, position, image layout, idle/busy heartbeats, count-based
@@ -1684,6 +1702,7 @@ fi
 # in this block: several knobs append an implied feature alongside their own, unguarded —
 #   UNAOS_TEGRA      -> `tegra,`
 #   UNAOS_TEGRA_EL0  -> `tegra_el0,tegra,`
+#   (UNAOS_VIRT_EL0  -> `virt_el0,` — appends its own name ONLY, so it is not a member of this class)
 #   UNAOS_TEGRASMP   -> `tegrasmp,tegra,`   (and the NOTEGRASMP default-on line appends the same pair)
 #   UNAOS_NETTEST    -> `nettest,genet,`    (duplicates `genet` if UNAOS_GENET=1 is also set)
 # — so any two of them naming the same implied feature print it twice. It is a CLASS, not a tegra
@@ -3820,6 +3839,25 @@ KERNEL_CFG_MATRIX=(
   # `x86_cfg_universe` already dropped it and still does. Board legs +0; gate legs +0 — this widens
   # an existing row rather than adding one. `./arroyo check` prints the live counts every run.
   "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry,orinvpar"
+  # JV1 (orin 17) — THE EL0 REGIME ON `virt`, AND THE LEG THE `aarch64_el0` COMMENTS ASKED FOR BY NAME.
+  # Eleven `#[cfg]`s across five files carry the note "No gate leg builds that combination, which is the
+  # trap — a byte-identity check over the legs would PASS while the hazard shipped", about a build with
+  # `aarch64_el0` on and neither `baremetal` nor `tegra_el0`. This row IS that combination, so the
+  # negated-predicate family finally has a leg that would go red if a future edit widened one of the
+  # positive sites and forgot its negative twin (or the reverse: both arms live => duplicate definition).
+  #
+  # WHAT MAKES IT NON-VACUOUS, MEASURED rather than inferred (the EXECGATE precedent). Before the
+  # `virt_el0` term existed, this exact feature set with `aarch64_el0` in place of `virt_el0` exits 101
+  # on 329 errors — every one of them the `uslots` facade resolving to nothing, since the facade has an
+  # arm per BOARD and a bare capability selects none. It is the only aarch64 leg with an EL0 layer and
+  # NEITHER `pi` NOR `tegra`, so it fails independently of both board families.
+  #
+  # PRECONDITION: compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`.
+  # `ensure_user_blob` (see check_both) supplies it ahead of the matrix.
+  #
+  # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
+  # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
+  "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.

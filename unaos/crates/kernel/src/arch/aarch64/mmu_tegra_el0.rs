@@ -4,6 +4,28 @@
 // JETSON-EL0 (M1b) — the EL0 user address-space machinery for the Jetson Orin Nano (Tegra234),
 // behind `feature = "tegra_el0"`.
 //
+// ── JV1 (orin 17): ALSO THE QEMU `virt` BACKEND, behind `feature = "virt_el0"` ─────────────────────
+//
+// This module is board-NAMED but, as it turns out, not board-COUPLED, and JV1 measured that rather than
+// assuming it. Read the divergence notes below with `mmu_tegra` swapped for `boot_virt` and they still
+// hold line for line: `install()` never names `mmu_tegra`'s `L1_EL1` static — it latches the LIVE
+// `TTBR0_EL1` (`live_ttbr0_root`) and hangs the user window off whatever EL1 root the boot path
+// installed. `boot_virt::drop_to_el1` installs an L1 of exactly the shape `mmu_tegra` builds (`L1[0]` =
+// the low-1-GiB Device window, every RAM GiB a Normal-WB block, the rest invalid), so divergence (1) —
+// the user window cannot live in GiB 0, it goes in the otherwise-unused `USER_GIB` — is true on `virt`
+// for the SAME reason and by the SAME check (`install` verifies the entry is invalid before claiming
+// it). Divergence (2), backings off the heap rather than BSS, is regime-independent and stays.
+//
+// THE ONE COUPLING, and it is a question about a MACHINE rather than a regime: `carveout_overlaps`
+// asks `mmu_tegra` for the SNOC-firewalled window set. That function is `#[cfg(feature = "tegra")]`, so
+// it is cfg-split below; QEMU `virt` has no SNOC firewall and no `/reserved-memory` carveouts, and the
+// virt arm answers `false` on those grounds, not as a stub. See the split for the full argument.
+//
+// WHAT IS NOT CLAIMED. The PAN note below is about the Cortex-A78AE and `boot_tegra`'s `SPSR_EL2`; on
+// `virt` the equivalent facts belong to `boot_virt::drop_to_el1` and are that module's to state. The
+// conservative per-grant `tlbi aside1is` of divergence (3) is kept on both paths — it costs one
+// broadcast per task launch and makes the grant's correctness independent of the teardown argument.
+//
 // WHAT THIS IS. `arch/aarch64/boot.rs` carries the M6a..M6d user-window/slot system that
 // `arch/aarch64/syscall.rs` and `sched.rs`'s `spawn_user*` arms consume: a 4 KiB-granular EL0 window,
 // per-task private translation-table branches with their own ASIDs, W^X leaf permissions, and the
@@ -82,7 +104,17 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::mmu_tegra;
+#[cfg(feature = "tegra")] use super::mmu_tegra;
+
+/// JV1 (orin 17) — THE WITNESS TAG, because this module now serves two regimes and its lines are read by
+/// the same eyes and the same `awk` patterns on both. A `TEGRA-EL0:` line emitted by a QEMU `virt` boot
+/// names a board that is not in the build; that is an actively misleading artifact, which is the one
+/// thing a witness may never be. `tegra_el0` keeps the exact string every existing Orin capture, spec
+/// and `awk` pattern already matches — this is a rename for the NEW regime only, never for the flown one.
+#[cfg(feature = "tegra_el0")]
+const EL0TAG: &str = "TEGRA-EL0";
+#[cfg(all(feature = "virt_el0", not(feature = "tegra_el0")))]
+const EL0TAG: &str = "VIRT-EL0"; // JV1 — `mmu_tegra` is `any(tegra, pcie3)`-gated in `mod.rs`, so on a `virt_el0` build (which implies NEITHER) the module does not exist. The one place this import is used, `carveout_overlaps`, is cfg-split below on the same term.
 
 /// The EL1 boot root — `TTBR0_EL1` with the ASID field stripped, i.e. the PA of the table
 /// `boot_tegra::drop_to_el1` actually installed (`mmu_tegra`'s `L1_EL1`). Latched ONCE by `install`.
@@ -299,11 +331,30 @@ fn sync() {
 /// True iff `[pa, pa+len)` intersects any window `mmu_tegra` excluded from the cacheable map (the
 /// XCARVE SNOC-firewalled carveout set). Such a window has NO translation, so a backing frame inside
 /// one would fault on the first EL0 touch — see divergence (2) in the module header.
+#[cfg(feature = "tegra")]
 fn carveout_overlaps(pa: u64, len: usize) -> bool {
     let mut set = [(0u64, 0u64, 0u8); mmu_tegra::MMU_MAX_HOLES];
     let n = mmu_tegra::carveout_holes(&mut set);
     let end = pa + len as u64;
     set[..n].iter().any(|&(hb, hs, _)| hs != 0 && pa < hb + hs && hb < end)
+}
+
+/// JV1 (orin 17) — the `virt_el0` arm of the same predicate. THE ONLY TEGRA COUPLING IN THIS MODULE,
+/// and it is a question about a machine, not about a regime: `carveout_holes` enumerates the SNOC
+/// firewall windows `mmu_tegra` excluded from the cacheable map, and QEMU `virt` has no SNOC firewall
+/// and no `/reserved-memory` carveouts to exclude — `boot_virt::build_l1` maps every RAM GiB the
+/// firmware memory map names as a Normal-WB block with no holes punched in it. So `false` is the
+/// CORRECT answer here, not a stub: there is no window a heap backing could land in that would lack a
+/// translation.
+///
+/// Note this is also what the tegra arm would compute if it were compiled on virt — `carveout_holes`
+/// reads `HOLE_N`, which only the `#[cfg(feature = "tegra")]` `resolve_carveout_holes` ever writes, so
+/// it would return 0 and the `.any()` would be `false`. The split exists because the FUNCTION is
+/// `tegra`-gated, not because the two arms would disagree; keeping the virt arm honest about WHY it
+/// answers `false` is the point, so a future virt-with-holes machine trips over this comment.
+#[cfg(not(feature = "tegra"))]
+fn carveout_overlaps(_pa: u64, _len: usize) -> bool {
+    false
 }
 
 /// Allocate one zeroed, page-aligned `USER_STATIC_SIZE` backing off the kernel heap, refusing (and
@@ -323,7 +374,8 @@ fn alloc_backing() -> u64 {
         // hand the block back and fail the caller loudly rather than map an unbacked frame to EL0.
         unsafe { alloc::alloc::dealloc(p, layout) };
         serial_println!(
-            ":: TEGRA-EL0: backing alloc {:#x} intersects a carveout hole — REFUSED ::",
+            ":: {}: backing alloc {:#x} intersects a carveout hole — REFUSED ::",
+            EL0TAG,
             pa
         );
         return 0;
@@ -349,7 +401,7 @@ pub fn install() -> bool {
     // Latch the live EL1 root (see BOOT_ROOT) and use it as the L1 table pointer.
     let root = live_ttbr0_root();
     if root == 0 {
-        serial_println!(":: TEGRA-EL0: TTBR0_EL1 is 0 — not at EL1 post-drop; user window NOT installed ::");
+        serial_println!(":: {}: TTBR0_EL1 is 0 — not at EL1 post-drop; user window NOT installed ::", EL0TAG);
         return false;
     }
     BOOT_ROOT.store(root, Ordering::Release);
@@ -359,7 +411,8 @@ pub fn install() -> bool {
     let existing = unsafe { l1.add(USER_GIB).read_volatile() };
     if existing != 0 {
         serial_println!(
-            ":: TEGRA-EL0: L1_EL1[{}] already mapped ({:#x}) — user window NOT installed ::",
+            ":: {}: L1_EL1[{}] already mapped ({:#x}) — user window NOT installed ::",
+            EL0TAG,
             USER_GIB,
             existing
         );
@@ -368,7 +421,7 @@ pub fn install() -> bool {
     // (b) The shared window's backing.
     let backing = alloc_backing();
     if backing == 0 {
-        serial_println!(":: TEGRA-EL0: shared-window backing allocation FAILED ::");
+        serial_println!(":: {}: shared-window backing allocation FAILED ::", EL0TAG);
         return false;
     }
     SHARED_BACKING.store(backing, Ordering::Release);
@@ -403,7 +456,8 @@ pub fn install() -> bool {
     sync();
     INSTALLED.store(true, Ordering::Release);
     serial_println!(
-        ":: TEGRA-EL0: user window installed — VA {:#x} (L1_EL1[{}]), backing PA {:#x}, {} slots ::",
+        ":: {}: user window installed — VA {:#x} (L1_EL1[{}]), backing PA {:#x}, {} slots ::",
+        EL0TAG,
         USER_VA_BASE,
         USER_GIB,
         backing,
@@ -478,7 +532,7 @@ pub fn alloc_user_slot() -> Option<usize> {
                 let pa = alloc_backing();
                 if pa == 0 {
                     SLOT_USED[s].store(false, Ordering::Release); // never installed -> no TLBI owed
-                    serial_println!(":: TEGRA-EL0: slot {} backing allocation FAILED ::", s);
+                    serial_println!(":: {}: slot {} backing allocation FAILED ::", EL0TAG, s);
                     return None;
                 }
                 SLOT_BACKING[s].store(pa, Ordering::Release);

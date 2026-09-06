@@ -4127,7 +4127,7 @@ fn proc_orphan(i: usize) -> Option<i32> {
 /// `run_user_image` frees it itself — reclaiming it here would race that, and a `PRUNNING` row can also
 /// belong to a live parent/child relationship this hook has no business touching. Fail-closed: an
 /// unmatched pid is a silent no-op.
-#[allow(dead_code)] // no caller on the `virt` build (the kill path's syscall hook is baremetal-only)
+#[allow(dead_code)] // no caller on a knob-off `virt` build (the kill path's syscall hook is `baremetal`-gated)
 pub fn note_killed_task_retired(pid: u64) {
     if let Some(i) = proc_find_orphaned(pid) {
         serial_println!(
@@ -23838,4 +23838,48 @@ pub fn orin_tenant_win_stats() -> (u32, u32, u64) {
         }
     }
     (rows, bound, FB_PRESENT_COUNT.load(Ordering::Acquire))
+}
+
+/// JV1 (orin 17) — the `virt_el0` verdict task: the QEMU-testable twin of [`tegra_el0_verdict`], with
+/// the SAME four-counter assertion and a different witness prefix.
+///
+/// WHY A TWIN AND NOT A WIDENED `#[cfg]` ON THE TEGRA ONE. Two reasons, both about evidence rather than
+/// taste. (1) The wire has to say WHICH REGIME ran: `test-arm` and the Orin's metal capture are read by
+/// the same eyes and the same `awk` patterns, and a `TEGRA-EL0` line emitted by a QEMU `virt` boot would
+/// be an actively misleading artifact — the one thing a witness may never be. (2) `tegra_el0_verdict` is
+/// on the Orin's live, metal-flown path; widening its gate would put this arc's fingerprints on a
+/// function the Jetson boots through, for zero gain. A tail-defined twin leaves that path bit-identical.
+///
+/// FILE-TAIL on purpose, and this is load-bearing rather than stylistic: `syscall.rs` compiles into the
+/// knob-off Pi `kernel8.img`, and `panic::Location` bakes FILE + LINE into rodata, so a line inserted
+/// anywhere above shifts every later Location and moves the image hash. Appended at the tail, this adds
+/// zero lines ahead of any existing Location; gated `virt_el0`, it adds no code to any other build.
+///
+/// Bounded by CNTPCT (free-running), so a wedged EL0 task reports FAIL with its counts instead of
+/// hanging the boot dark — the same discipline the tegra twin runs under.
+#[cfg(feature = "virt_el0")]
+pub fn virt_el0_verdict(_: usize) {
+    // ~5 s; the single round trip completes in well under 1 s.
+    let _ = wait_while_secs(5, || {
+        EL0_EXITED_OK.load(Ordering::Acquire)
+            + EL0_EXITED_ERR.load(Ordering::Acquire)
+            + EL0_KILLED_EXPECTED.load(Ordering::Acquire)
+            + EL0_KILLED_UNEXPECTED.load(Ordering::Acquire)
+            < 1
+    });
+    let ok = EL0_EXITED_OK.load(Ordering::Acquire);
+    let err = EL0_EXITED_ERR.load(Ordering::Acquire);
+    let exp = EL0_KILLED_EXPECTED.load(Ordering::Acquire);
+    let unexp = EL0_KILLED_UNEXPECTED.load(Ordering::Acquire);
+    if ok == 1 && err == 0 && exp == 0 && unexp == 0 {
+        serial_println!(":: VIRT-EL0: el0-hello round-trip -> PASS ::");
+    } else {
+        serial_println!(
+            ":: VIRT-EL0: el0-hello round-trip -> FAIL — exited_ok={} exited_err={} killed_expected={} killed_unexpected={} (want 1/0/0/0) ::",
+            ok,
+            err,
+            exp,
+            unexp
+        );
+    }
 }

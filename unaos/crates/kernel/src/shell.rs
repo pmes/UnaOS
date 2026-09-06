@@ -2496,7 +2496,7 @@ fn midden_facts() -> midden_core::Facts {
     // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
     #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
     let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
-    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     let (proc_verbs, proc_rows) = (false, 0usize);
     midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
@@ -3722,7 +3722,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // this comment used to promise. What is left is the build with no process table at all,
             // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
             // the match is total.
-            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
             {
                 let _ = (&typed, &name);
                 console.println("Unknown command. Type 'help' for assistance.");
