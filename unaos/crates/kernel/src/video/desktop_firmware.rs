@@ -192,6 +192,26 @@ pub fn activate() -> bool {
     //    ordering did not: the bigger cell can no longer be painted onto the glass in the window
     //    between this line and the route install, because nothing is painted onto the glass there.
     let face_cell = fbcon::panel_console_face_arm();
+    // 2b. CASCADEFIT — **the desktop DECLARES its boot windows before it PLACES any of them.**
+    //
+    //     `super::pulsewin::arm()` is step 6's, moved to run here as well and left there untouched
+    //     (it is two release stores and idempotent, so the second call is a no-op and step 6's
+    //     ordering argument — after the bar, after the composite — is about `open`, which is still
+    //     the render pass's and still happens exactly where it did).
+    //
+    //     It has to be said HERE because of what it lets the next step do. `fbcon`'s console window
+    //     opens twenty lines below and the pulse window opens minutes later on a render pass, and
+    //     until this arc the first knew nothing about the second — so on the bench panel the console
+    //     was centred in a work area whose bottom 232 rows the pulse window was going to claim, and
+    //     its box came down over the pulse's entire title band (render8: 61 rows, close disc and drag
+    //     handle unreachable for the life of the boot). `fbcon::console_work_bottom` now asks
+    //     `pulsewin::boot_keepout_top` where that window will be, and that question answers `None`
+    //     until the desktop has armed it. Arming after the console was placed made the answer a lie.
+    //
+    //     Nothing else moves and no `cfg` is involved: an x86 `desktop_uefi` desktop never reaches
+    //     this function, so `ever_armed()` stays false there and its console is placed exactly where
+    //     it always was. The fit itself is stated on the wire by `[deskcascade] fit … overlap_rows=`.
+    super::pulsewin::arm();
     if face_cell.is_none() {
         serial_println!("[pidesk] console-face DECLINE reason=console-not-ready (the console keeps font8x8)");
     }

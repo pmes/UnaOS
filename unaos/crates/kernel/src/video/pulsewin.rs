@@ -445,14 +445,14 @@ pub fn open() -> wm::WinId {
     // left clears the probe box, and it does NOT resolve the underlying conflict — a witness battery
     // written against a Pi desktop with no furniture rows still has to be reconciled with one that has
     // them, and that reconciliation is the integrator's. See engine.md §PULSEWIN.
-    let wtop = ui_status::top_chrome_h(pw, ph);
-    let gap = wm::BORDER * 2;
-    let ox = gap.min(pw.saturating_sub(ow));
-    let oy = ph
-        .saturating_sub(ui_status::chrome_h(ph))
-        .saturating_sub(gap)
-        .saturating_sub(oh)
-        .max(wtop);
+    // CASCADEFIT — the eight lines that stood here are now [`place`], at this file's tail, and the
+    // expression is unchanged: `at (10,914)` on the 1920x1200 bench panel is still `at (10,914)`.
+    // They moved because they acquired a SECOND reader. `fbcon`'s console window opens BEFORE this
+    // one and has to end above this window's title bar, so it must ask where this box WILL be while
+    // it does not yet exist — [`boot_box`] answers that, over this same function. Two copies of one
+    // placement rule is exactly how a window ends up under another window's title bar, which is the
+    // defect this arc closes (render8: the console covered rows 914..974 of this box).
+    let (ox, oy) = place(pw, ph, ow, oh);
 
     SURF.store(base, Ordering::Release);
     SURF_LEN.store(len, Ordering::Relaxed);
@@ -847,4 +847,89 @@ pub fn ever_armed() -> bool {
 /// its own dock-addressable row (kernel owners are), so the pin must not add a second tile for it.
 pub fn is_open() -> bool {
     WIN.load(Ordering::Acquire) != wm::WIN_NONE
+}
+
+// ------------------------------------------------------------------------------------------------
+// CASCADEFIT — where this window WILL be, asked before it exists (TAIL-APPENDED: nothing above this
+// line moved, so knob-off panic `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+//
+// THE DEFECT, in one sentence: the boot cascade opened the console window and then this one, and on
+// the 1920x1200 bench panel the console's box (307,195) 1305x780 came down to row 974 while this
+// window's box (10,914) 1290x212 started at row 914 — 61 rows of overlap, of which the first 34 are
+// this window's whole TITLE BAND. The close disc and the drag handle were therefore unreachable
+// whenever the console was above it in z, on every boot, with no operator action able to fix it.
+// Measured in render8's SCREEN3.PNG by executor SO11FIX; the chrome itself was never wrong.
+//
+// THE RULE, stated once: **a window the desktop opens at boot may not cover another such window's
+// title bar.** It is enforced on the CONSOLE, because the console is the one that opens first and
+// is the one with slack — `fbcon::win_content_extent` already sizes it to a fraction of its work
+// area, so shortening that area is a size the console was always prepared to be given. There is no
+// room below the console for this window to move to (at 1200 rows the free band between the
+// console's bottom and the dock's reserved rows is 161 px and this box is 212), which is why the
+// console yields and not the pulse.
+//
+// Panel-relative throughout: every term is `ph`, `pw`, `ui_status`'s two chrome bands or `wm`'s
+// border, so the rule holds on QEMU raspi4b's 640x480 and under `UNAOS_FBW`/`UNAOS_FBH` exactly as
+// it holds on the bench. On a panel that cannot seat this window at all, `content_extent` declines,
+// `boot_box` is `None`, and the console gets its whole work area back unchanged.
+
+/// CASCADEFIT — **where the outer box sits**, given its size, on a `pw` x `ph` panel.
+///
+/// Bottom-left of the work area, one gap in, flush above the reserved rows — the rule [`open`]'s
+/// `WHERE IT OPENS` block argues for, moved here so [`boot_box`] can evaluate it for a window that
+/// has not been created yet. The `.max(wtop)` clamp is what keeps the box out of the top furniture
+/// on a panel too short to seat it below; it can only raise `oy`, never make it negative.
+fn place(pw: usize, ph: usize, ow: usize, oh: usize) -> (usize, usize) {
+    let wtop = ui_status::top_chrome_h(pw, ph);
+    let gap = wm::BORDER * 2;
+    let ox = gap.min(pw.saturating_sub(ow));
+    let oy = ph
+        .saturating_sub(ui_status::chrome_h(ph))
+        .saturating_sub(gap)
+        .saturating_sub(oh)
+        .max(wtop);
+    (ox, oy)
+}
+
+/// CASCADEFIT — **the outer box this window will occupy on THIS boot**, as `(x, y, w, h)`, or `None`
+/// when no such window is coming.
+///
+/// Three ways to be `None`, and each is a real "there is nothing to keep clear of":
+///  1. the desktop never asked for the window — [`ever_armed`], the same runtime question
+///     `dock::pin_pulse` asks, and the reason an x86 `desktop_uefi` desktop's console is placed
+///     byte-for-byte where it always was (`arm()`'s only non-dock caller is
+///     `desktop_firmware::activate`, which x86 never reaches);
+///  2. the panel cannot seat the content ([`content_extent`] declines);
+///  3. the compositor cannot give a spawn geometry.
+///
+/// It is a PREDICTION, and honestly so: the window is opened later, by the render pass, and both
+/// chrome bands are runtime values. If the furniture changes between this call and [`open`] the two
+/// answers differ — which is why the fit is stated on the wire as a measured `overlap_rows` rather
+/// than asserted. In practice the two readings agree, because `oy` is anchored to the panel's BOTTOM
+/// — `ph - chrome_h(ph) - gap - oh` — and `top_chrome_h` enters it only through the `.max(wtop)`
+/// clamp, which is inert on any panel tall enough to seat the box below the furniture. So a menu bar
+/// enabled between this call and [`open`] (`desktop_firmware::activate` enables it at its step 4,
+/// AFTER the console window it places at step 3) moves neither answer. MEASURED, `UNAOS_PIDESK=1
+/// ./arroyo kernel8-test`: the prediction matched `open`'s own `at (10,922)` at 1920x1200 and
+/// `at (10,230)` at 640x480, to the pixel, and the fit witness read `overlap_rows=0` on both.
+pub fn boot_box(pw: usize, ph: usize) -> Option<(usize, usize, usize, usize)> {
+    if !ever_armed() {
+        return None;
+    }
+    let (cw, ch) = content_extent(pw, ph)?;
+    let (_scale, ow, oh) = wm::spawn_geometry(cw, ch)?;
+    let (ox, oy) = place(pw, ph, ow, oh);
+    Some((ox, oy, ow, oh))
+}
+
+/// CASCADEFIT — **the lowest panel row a neighbour may occupy without covering this window's title
+/// bar**: the top of [`boot_box`] less one gap, or `None` when no pulse window is coming.
+///
+/// Exclusive, i.e. a neighbour's outer box must satisfy `y + h <= keepout_top`. The gap is `wm`'s
+/// own `BORDER * 2` — the same spacing [`place`] holds against the reserved rows — so two boxes that
+/// just clear each other are separated by the desktop's own gutter and not by a hairline.
+pub fn boot_keepout_top(pw: usize, ph: usize) -> Option<usize> {
+    let (_ox, oy, _ow, _oh) = boot_box(pw, ph)?;
+    Some(oy.saturating_sub(wm::BORDER * 2))
 }

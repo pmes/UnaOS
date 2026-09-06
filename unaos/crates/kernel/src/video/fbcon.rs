@@ -1850,12 +1850,12 @@ const WIN_BOX_BUDGET_PX: usize = 4 * 1024 * 1024 / 4;
 /// therefore "as much of the panel as the compositor can present cheaply", which is what the
 /// generous default actually means once the present path is priced.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (usize, usize) {
+fn win_content_extent(pw: usize, ph: usize, wbot: usize, cell_w: usize, cell_h: usize) -> (usize, usize) {
     // MENUFIT — the work area's HEIGHT: panel less the top furniture, less the bottom instrument.
-    let avail_h = ph
-        .saturating_sub(crate::ui_status::top_chrome_h(pw, ph))
-        .saturating_sub(crate::ui_status::chrome_h(ph))
-        .max(1);
+    let wtop = crate::ui_status::top_chrome_h(pw, ph); let avail_h = ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).max(1); // ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3): unchanged expression, `wtop` merely named because the cap below needs it too.
+    // CASCADEFIT — THE HEIGHT CAP, and deliberately ONLY the height: the tallest CONTENT whose outer box still ends above the keep-out published by a boot window below (`wbot` = [`console_work_bottom`], this file's tail).
+    // ⚠ It is applied AFTER the budget loop, at the return, and NOT folded into `avail_h` above — the loop shrinks both axes together, so a shorter work area handed in at the top would make it terminate earlier and the console would come out WIDER and somewhere else in `x`: a placement fix that moved the axis it was not about. Capped afterwards, `w` is derived from the panel exactly as before and only the height can move. MEASURED (`UNAOS_PIDESK=1 ./arroyo kernel8-test`, this arc): at 1920x1200 the cap is 868 content rows against a console that wants 736, so it does not bind and the whole correction is in the centring below; at 640x480 it is 176 against 352, and it binds.
+    let cap = wbot.saturating_sub(wtop).saturating_sub(wm::TITLE_H + 2 * wm::BORDER); // Never negative: saturating, and `.max(1)` at the return keeps at least one glyph row.
     let mut w = (pw * 7 / 8).max(cell_w);
     let mut h = (avail_h * 7 / 8).max(cell_h);
     // Outer box = content + chrome. Budget the box, not the content: the box is what gets staged.
@@ -1866,7 +1866,7 @@ fn win_content_extent(pw: usize, ph: usize, cell_w: usize, cell_h: usize) -> (us
         w = (w * 15 / 16).max(cell_w);
         h = (h * 15 / 16).max(cell_h);
     }
-    ((w / cell_w).max(1) * cell_w, (h / cell_h).max(1) * cell_h)
+    ((w / cell_w).max(1) * cell_w, (h.min(cap) / cell_h).max(1) * cell_h)
 }
 
 /// CONSOLE-WINDOW — turn the panel console into a WINDOW: allocate its surface, open a row in the
@@ -1914,7 +1914,7 @@ pub fn panel_console_window_open() -> wm::WinId {
             }
         }
     };
-    let (cw, ch) = win_content_extent(pw, ph, cell_w, cell_h);
+    let wbot = console_work_bottom(pw, ph); let (cw, ch) = win_content_extent(pw, ph, wbot, cell_w, cell_h); // CASCADEFIT — the work area's bottom is asked for ONCE, here, and is then the only bottom this function knows: the SIZE below and the PLACEMENT thirty lines down must agree about it or the box would be sized to fit above the pulse window and then centred over it anyway. ⚠ SAME-LINE fold, line-NEUTRAL — `fbcon.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof and panic `Location` records embed line numbers (PARITY.md §5.3), so this arc adds no line to this file above its tail.
     let stride = cw * 4;
     let len = ch * stride;
 
@@ -1966,9 +1966,9 @@ pub fn panel_console_window_open() -> wm::WinId {
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop
-        + ph.saturating_sub(wtop)
-            .saturating_sub(crate::ui_status::chrome_h(ph))
-            .saturating_sub(oh)
+        + wbot // CASCADEFIT — centred in the area the HEIGHT CAP was taken from, not in the panel's
+            .saturating_sub(wtop) // own work area: `wbot` is `ph - chrome_h(ph)` less any keep-out a
+            .saturating_sub(oh) // boot window below published, so it is where this box must END.
             / 2;
     // CLICK-X86 — owner [`wm::KERNEL_OWNER_CONSOLE`]: the console still belongs to the KERNEL, and
     // both properties owner 0 was chosen for hold unchanged — it is out of `focus_ring` (which skips
@@ -2038,7 +2038,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         "[wc-x] console-window panic-fallback armed win={} (panic paints the PANEL, not the window)",
         id
     );
-    route_present();
+    cascadefit_witness(pw, ph, ox, oy, ow, oh); route_present(); // CASCADEFIT — the fit is MEASURED here, after the row exists and against the box that was actually created, and never asserted: both windows' geometry is a runtime function of the furniture, so `overlap_rows=` is the only honest statement of the rule. ⚠ SAME-LINE fold, line-NEUTRAL (PARITY.md §5.3).
     id
 }
 
@@ -3076,4 +3076,121 @@ fn conquiet_held() -> bool {
 ))]
 pub fn console_win() -> wm::WinId {
     CONSOLE_WIN.load(Ordering::Relaxed)
+}
+
+// ================================================================================================
+// CASCADEFIT — the boot cascade may not open one window over another window's TITLE BAR.
+// (TAIL-APPENDED: nothing above this line moved, so knob-off panic `Location` line numbers are
+// untouched — PARITY.md §5.3. The four edits above are N->N for the same reason: two same-line
+// folds, and two hunks that replace N lines with N lines. This file grows only at its end.)
+// ================================================================================================
+//
+// THE DEFECT (render8, 1920x1200 bench panel, measured by executor SO11FIX in SCREEN3.PNG): the
+// console window's outer box was `1305x780 at (307,195)`, so it ended at row 974; the pulse window's
+// was `1290x212 at (10,914)`. They overlap on x 307..1299 and y 914..974 — 61 rows, of which the
+// first 34 are the pulse window's ENTIRE title band. Its close disc and its drag handle were
+// unreachable whenever the console was above it in z, which on a boot cascade is always, and no
+// operator gesture could recover them. Neither window's chrome was wrong; the PLACEMENT was.
+//
+// THE RULE, one OS: **a window the desktop opens at boot ends above the next boot window's title
+// band, with the desktop's own gutter between them.** It is enforced on the CONSOLE and not on the
+// pulse, for a reason that is arithmetic rather than taste: with the dock reserving the last
+// `dock_reserve_h()` rows, the free band under the console at 1200 rows is 161 px and the pulse's
+// box is 212, so there is nowhere below the console for the pulse to go. The console is also the
+// window with slack — `win_content_extent` already sizes it to 7/8 of its work area and then shrinks
+// it to a staging budget, so a shorter work area is a size it was always prepared to be handed.
+//
+// WHAT ACTUALLY MOVES, MEASURED rather than predicted — `UNAOS_PIDESK=1 ./arroyo kernel8-test` on
+// this arc's tree against the same command on `c5048fe6`, both panels, console box then pulse box:
+//   1920x1200 (`UNAOS_FBW`/`UNAOS_FBH`): `1305x780 at (307,158)` -> `1305x780 at (307,66)`, pulse
+//     unmoved at `(10,922)`; 16 overlapping rows -> 0. The 184-row keep-out still leaves room for a
+//     780-tall box, so the CAP does not bind: same surface, same width, same `x`, only the centring.
+//   640x480 (QEMU raspi4b, no override): `570x396 at (35,4)` -> `570x220 at (35,0)`, pulse unmoved at
+//     `(10,230)`; 164 overlapping rows — the pulse box was ENTIRELY under the console — -> 0. Here
+//     the cap DOES bind: eleven text rows go, and the width and `x` are again exactly what they were.
+//
+// x86 IS UNAFFECTED, by construction rather than by a `cfg`: `boot_keepout_top` is `None` unless
+// `pulsewin::ever_armed()`, whose only non-dock caller is `desktop_firmware::activate` — the
+// Pi/Orin seam. An x86 `desktop_uefi` desktop never arms a pulse window, so `console_work_bottom`
+// returns `ph - chrome_h(ph)` and every number above is the number that was there before. The rule
+// is still ONE rule: it is evaluated on both arches and is vacuously satisfied where there is no
+// second boot window, which the witness states as `pulse=none`.
+
+/// CASCADEFIT — **the last panel row + 1 the console window's work area may use.**
+///
+/// `ph - chrome_h(ph)` — the work area's bottom as it has always been — unless a boot window below
+/// the console publishes a keep-out, in which case that keep-out wins. Panel-relative in every term,
+/// so QEMU raspi4b's 640x480 and any `UNAOS_FBW`/`UNAOS_FBH` override are governed by the same
+/// expression as the bench's 1920x1200.
+///
+/// **The floor, and why it relaxes rather than clamps to nothing.** A keep-out that would leave the
+/// console less than half of its work area is refused: on such a panel the pulse window is the
+/// intruder, not the console, and a two-row console is a worse desktop than an overlapping one.
+/// Refusing is announced on the wire with the numbers that produced it, so an OVERLAP verdict from
+/// the witness below always has a line above it saying why. The subtraction can never go negative —
+/// every term is `saturating_sub` and `keep >= bottom` returns early — so there is no arm in which
+/// this hands back a bottom above the top of the work area.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn console_work_bottom(pw: usize, ph: usize) -> usize {
+    let wtop = crate::ui_status::top_chrome_h(pw, ph);
+    let bottom = ph.saturating_sub(crate::ui_status::chrome_h(ph));
+    let keep = match super::pulsewin::boot_keepout_top(pw, ph) {
+        Some(k) => k,
+        None => return bottom,
+    };
+    if keep >= bottom {
+        return bottom;
+    }
+    if keep.saturating_sub(wtop) * 2 < bottom.saturating_sub(wtop) {
+        serial_println!(
+            "[deskcascade] fit RELAXED panel={}x{} work={}..{} keepout={} -> the boot window below would leave the console less than half its work area; the console keeps the whole area and the boxes may overlap (clamped, never negative — the pulse window is the intruder on a panel this short)",
+            pw, ph, wtop, bottom, keep
+        );
+        return bottom;
+    }
+    keep
+}
+
+/// CASCADEFIT — rows on which two outer boxes overlap, `0` when their x spans do not meet.
+///
+/// Both boxes are `(x, y, w, h)` with half-open spans, which is how `wm` states them, so two boxes
+/// that touch edge to edge overlap on zero rows. The x test comes first because it is what makes the
+/// number mean *"is a title bar covered"* rather than *"do these share a scanline"*: two windows in
+/// different columns of the same band are not in each other's way.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn box_overlap_rows(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> usize {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    if ax.max(bx) >= (ax + aw).min(bx + bw) {
+        return 0;
+    }
+    (ay + ah).min(by + bh).saturating_sub(ay.max(by))
+}
+
+/// CASCADEFIT — **the fit, measured and stated, at cascade time.**
+///
+/// `[deskcascade] fit console=WxH+X+Y pulse=WxH+X+Y overlap_rows=N -> FIT|OVERLAP`, one line, from
+/// the box the console row was actually created with and the box the pulse window will be created
+/// with. The rule this arc adds is `overlap_rows=0`, so the line is the gate predicate rather than a
+/// description of one — a capture that says `OVERLAP` says the placement regressed, and says by how
+/// many rows and against which box, which is the reading the render8 still cost a PNG decoder to get.
+///
+/// `pulse=none` is the honest reading on every desktop that opens no second boot window (x86's, and
+/// any panel that cannot seat the pulse); it is `FIT` because the rule is satisfied, not skipped.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn cascadefit_witness(pw: usize, ph: usize, ox: usize, oy: usize, ow: usize, oh: usize) {
+    match super::pulsewin::boot_box(pw, ph) {
+        Some((px, py, pbw, pbh)) => {
+            let n = box_overlap_rows((ox, oy, ow, oh), (px, py, pbw, pbh));
+            serial_println!(
+                "[deskcascade] fit console={}x{}+{}+{} pulse={}x{}+{}+{} overlap_rows={} -> {}",
+                ow, oh, ox, oy, pbw, pbh, px, py, n,
+                if n == 0 { "FIT" } else { "OVERLAP" }
+            );
+        }
+        None => serial_println!(
+            "[deskcascade] fit console={}x{}+{}+{} pulse=none overlap_rows=0 -> FIT (no second boot window claims a keep-out on this desktop: `pulsewin::boot_box` is None — unarmed, or the panel cannot seat it)",
+            ow, oh, ox, oy
+        ),
+    }
 }
