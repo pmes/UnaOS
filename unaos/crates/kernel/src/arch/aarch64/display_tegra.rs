@@ -5334,7 +5334,7 @@ pub fn orin_drag_edge() {
 // moves — panic `Location` records embed line numbers and the knob-off jetson image's
 // byte-identity is this track's standing proof.
 
-/// CLICKDEAD — the last `MOUSE_REARM_COUNT` this witness printed, so a frozen pipeline costs one
+/// CLICKDEAD — the last `rearm + dup + nobuf` this witness printed, so a frozen pipeline costs one
 /// line and a live one prints at the census cadence. `u64::MAX` = never printed.
 #[cfg(feature = "orinclick")]
 static PTRPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
@@ -5344,25 +5344,25 @@ static PTRPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 #[cfg(feature = "orinclick")]
 static PTRPOLL_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// CLICKDEAD — read the shared driver's three ungated pointer-pipeline counters and, when they
+/// CLICKDEAD — read the shared driver's five ungated pointer-pipeline counters and, when they
 /// moved (and once at the start, so a frozen pipeline is still timestamped), print `[ptrpoll]`.
 ///
 /// Returns `rearm - discard - errrearm` for the caller's `reports=` census field, so the two lines
-/// cannot disagree: both come from the same three loads.
+/// cannot disagree: both come from the same loads.
 ///
 /// The token is `[ptrpoll]`, nine bytes — deliberately longer than eight so it cannot be folded
 /// into an LLVM immediate and must appear in `.rodata`, which is what makes `grep -a` on the
 /// artifact a reachability proof rather than a compile proof.
 ///
-/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — three
-/// `Relaxed` loads and two `Relaxed` swaps. The census comment's rule (never add lock traffic to
+/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — five
+/// `Relaxed` loads and one `Relaxed` swap. The census comment's rule (never add lock traffic to
 /// the path whose death this reports) holds by construction.
 #[cfg(feature = "orinclick")]
 fn ptrpoll_witness(tick: u64) -> u64 {
     use core::sync::atomic::Ordering;
     let rearm = crate::drivers::xhci::MOUSE_REARM_COUNT.load(Ordering::Relaxed);
     let disc = crate::drivers::xhci::MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
-    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed);
+    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed); let dup = crate::drivers::xhci::MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed); let nobuf = crate::drivers::xhci::MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the two counters that separate (a1) from (a2), and (a1)'s two sub-causes from each other: `dup` = the guard ate a known duplicate, `nobuf` = the buffer/ring was gone. ⚠ folded, line-neutral.
     // Saturating: the three counters are read one at a time and a completion can land between the
     // loads, so the arithmetic is only ordered in the limit. A one-off underflow would print
     // `reports=0` and read as "worse than dead"; saturation makes it read as "not yet counted".
@@ -5372,8 +5372,8 @@ fn ptrpoll_witness(tick: u64) -> u64 {
     if first {
         PTRPOLL_BASE.store(reports, Ordering::Relaxed);
     }
-    let last = PTRPOLL_LAST.swap(rearm, Ordering::Relaxed);
-    if !first && last == rearm {
+    let moved = rearm.wrapping_add(dup).wrapping_add(nobuf); let last = PTRPOLL_LAST.swap(moved, Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the DROPS join the movement test, or a pipeline being EATEN (rearm flat, dup/nobuf climbing) would be silently mistaken for one that is STARVED and print one line for the whole boot. ⚠ folded, line-neutral.
+    if !first && last == moved {
         return reports; // nothing moved since the last census — one line already said so.
     }
     let decoded = reports.saturating_sub(if first { reports } else { base });
@@ -5385,12 +5385,16 @@ fn ptrpoll_witness(tick: u64) -> u64 {
         "ERROR-REARM (non-halting error completions on the pointer endpoint; the read is being re-armed off the error path — mod.rs:4238)"
     } else if first {
         "BASELINE (the enumeration arms; every later line is measured against this one)"
+    } else if nobuf != 0 {
+        "NOBUF-DROP (completions ARE arriving and the guard is dropping them because `mouse_data_buffer`/`mouse_ring` is GONE — mod.rs:4599's `!have_buf` arm. A teardown or allocation defect, NOT a duplicate: re-arming here would be wrong, there is nothing to arm. Look at the slot's soft state, not at the dup discrimination)"
+    } else if dup != 0 {
+        "DUP-DROP (completions ARE arriving and the dup-Success guard is consuming them WITHOUT re-arming — mod.rs:4599's `param == mouse_prev_phys` arm, buffer and ring still present. This is (a1): the pipeline is being eaten, not starved)"
     } else {
-        "ARMED-NO-COMPLETION (the read is armed and the controller has posted no transfer event for the pointer DCI since the last line; apply CLICKDEAD-xhci.patch for the `dup=` field that tells a silently discarded completion from no completion at all)"
+        "ARMED-NO-COMPLETION (the read is armed, dup=0 and nobuf=0, and the controller has posted NO transfer event for the pointer DCI since the last line. This is (a2): the endpoint went quiet — look at EP state, doorbell and periodic bandwidth, not at the guard)"
     };
     serial_println!(
-        "[ptrpoll] t={} rearm={} discard={} errrearm={} reports={} base={} decoded={} -> {}",
-        tick, rearm, disc, err, reports,
+        "[ptrpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} -> {}",
+        tick, rearm, disc, err, dup, nobuf, reports,
         if first { reports } else { base }, decoded, verdict
     );
     reports
