@@ -306,6 +306,37 @@ is quiet rather than silent — the DEFERRED line names the regime, so a seat on
 `→ SO6`, a cross-ref to a row that lives on hw-jetson. It defers, prints by id, exits 0, and becomes a
 red automatically when it lands on trunk — which is the whole design, demonstrating itself.
 
+## GATE-APPEND — the one grant condition a machine can own
+
+Three of the grants this round were same-line appends for byte identity, and on every one the check
+that mattered most was the same: **is the appended statement before the line's first `//`?** After it,
+the statement is comment text — it compiles nothing, `check` stays green, `strings` finds no witness,
+and the arc reports a pass for code that was never built. That is LEDGER P7, and it bit ROOTFS's first
+build this round.
+
+Until now every seat reviewing an append re-derived that check by eye, per patch, forever. It is the
+only condition in the grant checklist a machine can own outright, so it now does.
+
+**The naive form is unshippable, and that was measured rather than argued.** Flagging `#[cfg(` after a
+comment marker finds **seven** lines in this tree and every one is prose — doc comments quoting cfg
+expressions, some inside backtick spans that *open on an earlier line*, which a per-line strip cannot
+see. A gate that reds on a sentence teaches people to disable it; that is `knob-hygiene.sh`'s own
+lesson, in this same tree.
+
+**The discriminator: the trap is a statement, and an appended statement is the last thing on the line,
+so the comment text ends in a semicolon.** Prose naming a cfg does not. One condition, seven false
+positives to zero, still firing on both real trap shapes.
+
+| proof | result |
+|---|---|
+| a real trap injected into `video/pulsewin.rs` | **RED, exit 1**, naming file and line |
+| the discriminator broken | **control refuses a verdict, exit 2** — naming the prose line it wrongly fired on |
+| restored tree | green, exit 0, 162 files |
+
+The middle proof is the one that matters: it shows the control guards the exact property, so a future
+edit that widens the detector cannot quietly turn this into a gate that reds on prose. Wired into
+`check_both` beside GATE-KNOB. Ledger row **B24**.
+
 ## Still owed / flagged
 
 - **J1, the rmbp landing** (72 commits) — needs a fleet, so it needs the focus.

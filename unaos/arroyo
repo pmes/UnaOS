@@ -4321,6 +4321,19 @@ check_both() {
     # prose. The script strips comments first and carries a fixture for exactly that case, because a
     # gate that reds on a sentence is a gate people turn off.
     local _nrc=0
+    # GATE-APPEND (rmbp 13, 2026-09-06): LEDGER P7's trap, checked by machine instead of by eye. A
+    # statement folded onto an existing line for byte identity must sit BEFORE that line's first `//`;
+    # after it, it is comment text that compiles nothing while every gate stays green. It bit ROOTFS's
+    # first build this round, and until now every seat reviewing a same-line append re-derived the check
+    # by inspection, per patch. See scripts/append-position.sh for why the naive form is unshippable
+    # (seven prose false positives in this tree) and what the discriminator is.
+    if "$WORKSPACE_DIR/scripts/append-position.sh"; then
+        echo -e "${COLOR_GREEN}  ✅ append position (no statement hiding after a comment marker)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ append-position gate FAILED${COLOR_RESET}"
+        return 1
+    fi
+
     if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
         echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"
     else
