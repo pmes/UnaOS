@@ -5610,7 +5610,7 @@ fn kbdpoll_witness(tick: u64) {
     let nobuf = crate::drivers::xhci::KBD_NOBUF_DROP_COUNT.load(Ordering::Relaxed);
     let restated = crate::drivers::xhci::KBD_RESTATED_COUNT.load(Ordering::Relaxed);
     let armgap = kbdpoll_us(crate::drivers::xhci::KBD_ARMGAP_MAX.load(Ordering::Relaxed));
-    let gapmax = kbdpoll_us(crate::drivers::xhci::KBD_DRAIN_GAPMAX.load(Ordering::Relaxed));
+    let gapmax = kbdpoll_us(crate::drivers::xhci::KBD_DRAIN_GAPMAX.load(Ordering::Relaxed)); let outstanding = crate::drivers::xhci::KBD_OUTSTANDING.load(Ordering::Relaxed); let skipped = crate::drivers::xhci::KBD_SKIPPED_COUNT.load(Ordering::Relaxed); let want = crate::drivers::xhci::KBD_DEPTH_WANT.load(Ordering::Relaxed); // XHCINTD (orin 17) — the two numbers that say whether the N-outstanding repair is actually running, read here so the format line below can carry them. `outstanding` is a GAUGE, not a total: how many Normal TRBs are armed on the keyboard interrupt-IN right now. ⚠ FOLDED.
     let (edges, shots, refused) = crate::video::prtscr::census();
     // Saturating for the reason `ptrpoll_witness` gives: the counters are read one at a time and a
     // completion can land between the loads, so the arithmetic is only ordered in the limit.
@@ -5626,13 +5626,18 @@ fn kbdpoll_witness(tick: u64) {
     let moved = rearm
         .wrapping_add(dup)
         .wrapping_add(nobuf)
+        .wrapping_add(skipped) // XHCINTD — a skip is movement. Without this term a pipeline whose ONLY event is the controller stepping over armed TDs would look quiet and print one line for the whole boot.
         .wrapping_add(restated);
     let last = KBDPOLL_LAST.swap(moved, Ordering::Relaxed);
     if !first && last == moved {
         return; // nothing moved since the last census — one line already said so.
     }
     let decoded = reports.saturating_sub(if first { reports } else { base });
-    let verdict = if restated != 0 {
+    let verdict = if skipped != 0 {
+        "TRB-SKIPPED (a keyboard completion matched an armed TRB that was NOT the oldest, so the controller retired TDs out of order or a transfer event went missing. Distinct from the dup guard: the TRB is one of ours and the report is real. With N outstanding the armed set is popped through the match, so the pipeline SURVIVES this — but the skipped TDs report never, and any report they were carrying is lost. Look at the event ring for dropped events and at the endpoint's TR Dequeue Pointer, not at the pump)"
+    } else if want != 0 && outstanding != 0 && outstanding < want {
+        "DEPTH-DECAYED (the keyboard interrupt-IN is armed but BELOW the N this fix keeps outstanding, so the unarmed window PRTSCLOST measured is partly back. Every top-up is a no-op when full and arms otherwise, so a steady deficit means `kbd_free_buf` is returning None with the set short — i.e. the pool and the armed set disagree. Read `skipped` and `nobuf` first)"
+    } else if restated != 0 {
         "REPORT-LOST (a keyboard report was byte-identical to its predecessor. SET_IDLE duration is 0 = INDEFINITE, so the device reports only on a STATE CHANGE and cannot restate one: at least one intermediate report never reached the decoder. This is PRTSCLOST convicted — the interrupt-IN endpoint had no TD queued when the key moved, and with `keyboard_prev_keys` left stale the NEXT genuine press is swallowed by the level diff as well. Read `armgap_us` for the size of the window)"
     } else if armgap >= 30_000 {
         "ARMGAP-WIDE (no report was lost YET, but the keyboard endpoint has sat unarmed for at least armgap_us between two drains — wider than a human's press-and-release, so a press landing in one would vanish with no line anywhere. The fault is the PUMP CADENCE, not the guard: look at what runs between two `drain_event_ring_once` calls on the console pump, not at the dup discrimination)"
@@ -5645,16 +5650,17 @@ fn kbdpoll_witness(tick: u64) {
     } else if err != 0 {
         "ERROR-REARM (non-halting error completions on the keyboard interrupt-IN; the read is being re-armed off the error path. `hid_error_witness` is UNGATED — its lines above this one name the codes)"
     } else if decoded != 0 {
-        "STREAMING (the keyboard read is completing and re-arming, no report has been restated, and the unarmed window has stayed under a press. A missing key above this line is a ROUTING fault, not a pipeline one)"
+        "STREAMING (the keyboard read is completing and re-arming at full depth, no report has been restated, and the unarmed window has stayed under a press. A missing key above this line is a ROUTING fault, not a pipeline one)"
     } else if first {
         "BASELINE (the enumeration arms; every later line is measured against this one)"
     } else {
         "ARMED-NO-COMPLETION (the read is armed, dup=0 and nobuf=0, and the controller has posted NO transfer event for the keyboard DCI since the last line — the endpoint went quiet. Look at EP state, doorbell and periodic bandwidth, not at the guard)"
     };
     serial_println!(
-        "[kbdpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} restated={} armgap_us={} gapmax_us={} prtscr edges={} ok={} refused={} -> {}",
+        "[kbdpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} restated={} armgap_us={} gapmax_us={} outstanding={}/{} skipped={} rearm_before_decode=1 prtscr edges={} ok={} refused={} -> {}",
         tick, rearm, disc, err, dup, nobuf, reports,
         if first { reports } else { base }, decoded, restated, armgap, gapmax,
+        outstanding, want, skipped,
         edges, shots, refused, verdict
     );
 }

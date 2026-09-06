@@ -2382,7 +2382,7 @@ pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 /// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
 /// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
 /// they go to `service_hid_halts`, which prints its own line.
-pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); pub static KBD_OUTSTANDING: AtomicU64 = AtomicU64::new(0); pub static KBD_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DEPTH_WANT: AtomicU64 = AtomicU64::new(0); pub const KBD_INFLIGHT: usize = 4; pub const KBD_BUF_STRIDE: usize = 64; // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // XHCINTD (orin 17) — PRTSCLOST's fix, folded onto the same line as its witness. `KBD_INFLIGHT` = how many Normal TRBs the keyboard interrupt-IN keeps outstanding AT ONCE, and it is the whole repair: with ONE TRB the endpoint is unarmed from the instant the controller retires a TD until software re-arms, and under SET_IDLE 0 (INDEFINITE — the device reports only on a state change and NEVER resends) every key edge in that window is lost FOREVER. With N the controller always has an IN to issue, so a retirement does not empty the ring and the window never opens. `KBD_BUF_STRIDE` = 64 is NOT cosmetic: each outstanding TRB needs its OWN report buffer (N TDs share one endpoint and the controller may DMA into any of them), and 64 is the aarch64 D-cache line (`dma_coherency::CACHE_LINE`), so the `inval` of one buffer at the consumer boundary cannot touch a sibling that is still armed. N*STRIDE = 256 ≤ the 512-byte `data_buffer` allocation, so NOTHING in the allocation changes. `KBD_OUTSTANDING` is a GAUGE (stored, not added): how many TRBs are armed right now — `[kbdpoll] outstanding=`, which is N in steady state and the number that falsifies this fix if it decays. `KBD_DEPTH_WANT` is the depth `kbd_top_up` last aimed at — normally `KBD_INFLIGHT`, but 1 for a device whose MPS will not fit the pool's 64-byte stride, which is the ONLY honest denominator for `outstanding=`: printing the constant would report a correctly-armed single-TRB device as decayed. `KBD_SKIPPED_COUNT` counts armed TRBs a completion stepped OVER: with N outstanding the FIFO must be popped through the match, and a non-zero count means the controller retired TDs out of order or an event was missed, which is a different fault from the dup guard's and must not hide inside it. ⚠ FOLDED onto this line — same reason as everything else on it.
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -2783,7 +2783,7 @@ pub struct DeviceSlot {
     /// dup observed) but PORTSW-1 brings the INTERNAL keyboard onto this exact path, so the guard
     /// mirrors the pointer path pre-emptively. Set in `queue_keyboard_read`, matched in the
     /// interrupt-IN transfer dispatch. On QEMU (no dup) `param` always matches, so it never trips.
-    pub keyboard_expect_phys: u64,
+    pub keyboard_expect_phys: u64, pub keyboard_armed_trb: [u64; KBD_INFLIGHT], pub keyboard_armed_buf: [u64; KBD_INFLIGHT], pub keyboard_armed_n: u8, // XHCINTD (orin 17) — the ARMED SET, which replaces `keyboard_expect_phys`' single expectation as the dup guard's test. `keyboard_armed_trb[..n]` are the physical addresses of the Normal TRBs currently outstanding on this keyboard's interrupt-IN, OLDEST FIRST; `keyboard_armed_buf[i]` is the report buffer TRB `i` will be DMA-written into. A completion is REAL iff its `param` is in that set — with one TRB the old `param != keyboard_expect_phys` said the same thing, but with N it would reject N-1 of every N genuine reports. `keyboard_expect_phys` is KEPT and still tracks the most recently armed TRB, because the slot dump and the halt-recovery clear read it and its `!= 0` still means `this endpoint has been armed at least once`. ⚠ FOLDED onto the existing field — no line added (kernel8.img panic-`Location` byte-identity).
     /// PIUSB-39: physical address of the PREVIOUS armed keyboard TRB. Same discrimination as
     /// `mouse_prev_phys`: a dup-Success for the consumed TD is discarded silently (a read is
     /// already armed), any other mismatch discards the data but RE-ARMS the read.
@@ -2918,7 +2918,7 @@ impl DeviceSlot {
             keyboard_intf: 0,
             keyboard_state: 0,
             keyboard_ring: None,
-            keyboard_expect_phys: 0,
+            keyboard_expect_phys: 0, keyboard_armed_trb: [0; KBD_INFLIGHT], keyboard_armed_buf: [0; KBD_INFLIGHT], keyboard_armed_n: 0, // XHCINTD — seeded empty beside its sibling. ⚠ FOLDED.
             keyboard_prev_phys: 0,
             keyboard_report_count: 0,
             keyboard_prev_keys: [0; 6], keyboard_prev_mods: 0, // PRTSCLOST — seeded with its six keycodes. ⚠ FOLDED.
@@ -3004,7 +3004,7 @@ impl DeviceSlot {
         self.keyboard_interval = 0;
         self.keyboard_intf = 0;
         self.keyboard_state = 0;
-        self.keyboard_expect_phys = 0;
+        self.keyboard_expect_phys = 0; self.keyboard_armed_trb = [0; KBD_INFLIGHT]; self.keyboard_armed_buf = [0; KBD_INFLIGHT]; self.keyboard_armed_n = 0; // XHCINTD — cleared on slot reuse beside its sibling, or a recycled slot would inherit a dead device's armed TRB addresses and accept the first foreign completion that happened to match. ⚠ FOLDED.
         self.keyboard_prev_phys = 0;
         self.keyboard_report_count = 0;
         self.keyboard_prev_keys = [0; 6]; self.keyboard_prev_mods = 0; // PRTSCLOST — cleared on slot reuse beside its six keycodes, or a recycled slot's first report would compare against a dead device's. ⚠ FOLDED.
@@ -4247,7 +4247,7 @@ impl XhciController {
                                         self.hid_halt_pending.push((slot_id as u8, false));
                                     }
                                 } else { KBD_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — `MOUSE_ERROR_REARM_COUNT`'s twin, which the keyboard arm never had: re-arms driven by a NON-halting error completion on the keyboard interrupt-IN. A separate population from `KBD_DISCARD_REARM_COUNT` for the same reason the pointer keeps them apart — the two hide different repairs. Halting codes are NOT counted here; they go to `service_hid_halts`, and `hid_error_witness` above already prints them UNGATED. ⚠ FOLDED.
-                                    self.queue_keyboard_read(slot_id as u8);
+                                    let _ = self.kbd_retire(slot_id as u8, param); self.kbd_top_up(slot_id as u8); // XHCINTD — RETIRE THE ERRORING TD FIRST, then top up. This is the NON-HALTING error arm, and it is the one place a keyboard TD leaves the ring without a report: the completion is an error, so the decode branch that would have popped it never runs. Under one outstanding TRB the old bare re-arm was harmless; under N it is fatal, because the errored TD would sit in the armed set forever, and after N of them `kbd_top_up` — which arms only up to N — would be a permanent no-op and the keyboard would be DEAD. `kbd_retire` returns None if `param` is not ours, in which case this degrades to exactly the top-up alone. ⚠ FOLDED onto the existing arm.
                                 }
                                 return;
                             }
@@ -4285,7 +4285,7 @@ impl XhciController {
                                     if self.slots[slot_id as usize].keyboard_state == 2 {
                                         self.slots[slot_id as usize].keyboard_state = 3;
                                         self.slots[slot_id as usize].keyboard_report_count = 0;
-                                        self.queue_keyboard_read(slot_id as u8);
+                                        self.kbd_top_up(slot_id as u8); // XHCINTD — THE ENUMERATION ARM, and the only one that has to fill an empty set: every later top-up merely restores what a completion consumed, so if this one armed a single TRB the endpoint would run at depth 1 for the whole boot and the fix would be inert. `keyboard_armed_n` is 0 here (the slot was reset), so this arms exactly N.
                                     }
                                     if self.slots[slot_id as usize].mouse_state == 2 {
                                         self.slots[slot_id as usize].mouse_state = 3;
@@ -4798,19 +4798,19 @@ impl XhciController {
                                         // PIUSB-39: same pipeline-preserving exit as the pointer path
                                         // (the keyboard carried the identical defect — only its lower
                                         // traffic kept it from being observed on metal).
-                                        if slot.keyboard_expect_phys != 0 && param != slot.keyboard_expect_phys {
-                                            let prev = slot.keyboard_prev_phys;
-                                            let expect = slot.keyboard_expect_phys;
-                                            let have_buf = slot.data_buffer.is_some()
-                                                && slot.keyboard_ring.is_some();
+                                        let (kprev, kexpect, kbuf0, kring) = (slot.keyboard_prev_phys, slot.keyboard_expect_phys, slot.data_buffer, slot.keyboard_ring.is_some()); let kbd_hit = self.kbd_retire(slot_id as u8, param); if kexpect != 0 && kbd_hit.is_none() { // XHCINTD — the dup guard now tests SET MEMBERSHIP. `kbd_retire` searches the N armed TRBs for `param`, and on a hit POPS it (and everything older) and hands back the buffer that TD was DMA-written into; on a miss it changes nothing and returns None, which is exactly the old `param != keyboard_expect_phys`. The four fields are copied out FIRST because `slot` is a shared borrow of `self.slots` and `kbd_retire` takes `&mut self`: the borrow must be DEAD here, so no line below may name `slot` again on this path. ⚠ FOLDED — five lines in, five lines out.
+                                            let prev = kprev;
+                                            let expect = kexpect;
+                                            let have_buf = kbuf0.is_some()
+                                                && kring;
                                             xdbg!("xHCI: stale/spurious keyboard event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
                                                 slot_id, param, expect);
                                             if param != prev && have_buf { KBD_DISCARD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — the guard's PIPELINE-PRESERVING exit, counted as `MOUSE_DISCARD_REARM_COUNT`'s twin: a completion whose TRB did not match the armed read, thrown away but re-armed. ⚠ FOLDED.
-                                                self.queue_keyboard_read(slot_id as u8);
+                                                self.kbd_top_up(slot_id as u8); // XHCINTD — TOP UP to N rather than arm one more. This exit fires on a completion the guard cannot account for, so the outstanding count is unknown; `kbd_top_up` arms until the set holds N and is a NO-OP when it already does, which is the property the old unconditional `queue_keyboard_read` lacked — it could only ever over-arm or under-arm.
                                             } else if !have_buf { KBD_NOBUF_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } else { KBD_DUP_DROP_COUNT.fetch_add(1, Ordering::Relaxed); } // PRTSCLOST — the guard's SILENT exit, split into the same two populations CLICKDEAD v2 gave the pointer, and with the same PRECEDENCE (`!have_buf` first: a missing buffer is the actionable fault). This branch consumes a keyboard completion, does NOT re-arm, and on a build without `usbdebug` prints nothing — so until this counter it was indistinguishable on the wire from a report that never arrived, which is the other half of PRTSCLOST's differential. ⚠ FOLDED onto the `else` of an existing `if`, no line added.
                                             return;
                                         }
-                                        if let Some(data_buf_ptr) = slot.data_buffer {
+                                        if let Some(data_buf_ptr) = kbd_hit.map(|b| b as *mut u8).or(kbuf0) { // XHCINTD — decode the buffer belonging to the TD THAT JUST RETIRED, not a single shared one. With N TDs outstanding the controller may be DMA-writing any of the others right now, so `data_buffer` (buffer 0 of the pool) is no longer the answer; `kbd_retire` returned the right one. The `.or(kbuf0)` fallback preserves the pre-arm path verbatim — when `kexpect == 0` nothing has ever been armed, there is no armed set to hit, and the old code read `data_buffer`. ⚠ FOLDED.
                                             // XHCI-COHERENCE: consumer boundary — the boot-keyboard
                                             // report was DMA-written; invalidate before decoding. No-op x86.
                                             dma_coherency::inval(data_buf_ptr as usize, 8);
@@ -4819,7 +4819,7 @@ impl XhciController {
                                             // witness). Mirrors `mouse_report_count`; inert on x86.
                                             self.slots[slot_id as usize].keyboard_report_count =
                                                 self.slots[slot_id as usize].keyboard_report_count.wrapping_add(1); { let g = KBD_DRAIN_GAP.load(Ordering::Relaxed); if g > KBD_ARMGAP_MAX.load(Ordering::Relaxed) { KBD_ARMGAP_MAX.store(g, Ordering::Relaxed); } } // PRTSCLOST — latch the drain gap that PRECEDED this report. The TD was retired by the controller somewhere inside that gap and the endpoint has had no TD queued since, so this is an upper bound on the unarmed window for a REAL report (enumeration stalls, which precede any keyboard traffic, cannot contribute). ⚠ FOLDED.
-                                            let report = core::slice::from_raw_parts(data_buf_ptr, 8);
+                                            let rep8: [u8; 8] = core::ptr::read(data_buf_ptr as *const [u8; 8]); self.kbd_top_up(slot_id as u8); let report = &rep8[..]; // XHCINTD — THE FIX, IN ORDER, AND THE ORDER IS THE POINT. (1) copy the eight report bytes off the retired buffer onto the stack, AFTER the `inval` above so the copy is of DMA-fresh DRAM; (2) re-arm — the retired TD's buffer is free the instant `kbd_retire` popped it, so `kbd_top_up` puts the ring back to N Normal TRBs and rings the doorbell HERE, BEFORE the decode, instead of ~130 lines below it after the ASCII loop, the typematic feed, the key-up diff, the PrintScreen edge and `set_hid_leds`' synchronous EP0 control transfer; (3) only then decode. Everything after this point reads `rep8`, a STACK copy, so the buffer it came from can be back in the controller's hands with no aliasing at all — which is also what makes the re-entrancy below safe. ⚠ FOLDED onto the existing `report` binding — no line added.
                                             // Metal diagnostic: dump the raw report bytes so that if a keyboard
                                             // interrupt-IN transfer arrives but decodes to nothing (e.g. the device is
                                             // in HID report protocol rather than boot protocol, which needs
@@ -4953,7 +4953,7 @@ impl XhciController {
                                                 self.set_hid_leds(slot_id as u8, kbd_intf);
                                             }
 
-                                            self.queue_keyboard_read(slot_id as u8);
+                                            self.kbd_top_up(slot_id as u8); // XHCINTD — kept as a NO-OP-when-full backstop, not as the re-arm: the real one ran before the decode. It still earns its place because the branch between there and here can RE-ENTER this dispatch — `set_hid_leds` → `sync_control` → `pump_until_ep0_done` → `drain_event_ring_once` → `handle_event_trb` — and a nested keyboard completion pops the set on its way through; this call restores N on the way out. RE-ENTRANCY, stated in full: (a) the nested pass reads and writes the armed set through `kbd_retire`/`kbd_top_up` only, and the OUTER pass has already finished with the set at the `rep8` line, so the outer can no longer stale-write it; (b) the outer decodes a STACK copy, so the nested pass may re-arm and the controller may overwrite any pool buffer without touching the outer's bytes; (c) `keyboard_prev_keys`/`keyboard_prev_mods` are stored ABOVE `set_hid_leds`, so the nested pass's newer store lands AFTER the outer's older one and the level diff cannot regress — the failure mode PRTSCLOST named when it rejected re-arm-before-decode without N buffers, and the reason it is safe with them.
                                         }
                                     } else if hub_int_dci == Some(endpoint_id as u8) {
                                         // --- XENUM-2: hub Status Change Endpoint completion ---
@@ -14824,7 +14824,7 @@ impl XhciController {
             {
                 let s = &mut self.slots[slot as usize];
                 if is_mouse { s.mouse_expect_phys = 0; s.mouse_prev_phys = 0; }
-                else { s.keyboard_expect_phys = 0; s.keyboard_prev_phys = 0; }
+                else { s.keyboard_expect_phys = 0; s.keyboard_prev_phys = 0; s.keyboard_armed_trb = [0; KBD_INFLIGHT]; s.keyboard_armed_buf = [0; KBD_INFLIGHT]; s.keyboard_armed_n = 0; } // XHCINTD — the armed SET is stale for exactly the reason the two expectations beside it are: CLEAR_FEATURE(HALT) plus the Set TR Dequeue moved the controller's dequeue pointer, so every TRB address recorded here names a TD the endpoint will never retire. Leaving them would make `kbd_top_up` believe N were outstanding and arm NOTHING — a permanently dead keyboard, which is the PIUSB-39 pointer defect wearing a new hat. ⚠ FOLDED.
             }
             let armable = {
                 let s = &self.slots[slot as usize];
@@ -14837,7 +14837,7 @@ impl XhciController {
                     self.queue_mouse_read(slot);
                     Self::piusb39_witness("halt");
                 } else {
-                    self.queue_keyboard_read(slot);
+                    self.kbd_top_up(slot); // XHCINTD — the halt-recovery arm; N, and safe to call unconditionally because the set was just cleared above.
                 }
             }
         }
@@ -14889,7 +14889,7 @@ impl XhciController {
             let dir_in = (self.slots[slot_id as usize].keyboard_ep & 0x80) != 0;
             let dci = (ep_num * 2) + if dir_in { 1 } else { 0 };
 
-            let data_phys = self.slots[slot_id as usize].data_buffer.unwrap() as u64;
+            let data_phys = match self.kbd_free_buf(slot_id) { Some(b) => b, None => return }; // XHCINTD — arm into a buffer NOT currently armed, instead of always into `data_buffer`. With N TDs outstanding a shared buffer would let the controller DMA a newer report over one this dispatch has not decoded yet; `kbd_free_buf` walks the pool and skips every address in the armed set. `None` means the pool is exhausted (the set is already full) or there is no buffer at all — both are `do not push a TRB`, and returning here is what makes `kbd_top_up` terminate. This also SUBSUMES the old `.unwrap()`, which would have panicked on a slot with no `data_buffer`.
             // XHCI-COHERENCE: evict stale/dirty lines of the report buffer before arming the
             // interrupt-IN read (controller DMA-writes it; completion path invalidates before
             // decoding). No-op x86.
@@ -14906,12 +14906,122 @@ impl XhciController {
             // already-consumed TD (see `keyboard_expect_phys`). Mirrors `queue_mouse_read`.
             let ring_base = self.slots[slot_id as usize].keyboard_ring.as_ref().unwrap().get_ptr();
             // PIUSB-39: mirror of `queue_mouse_read` — remember the TD being retired.
-            self.slots[slot_id as usize].keyboard_prev_phys =
-                self.slots[slot_id as usize].keyboard_expect_phys;
+            // XHCINTD — `keyboard_prev_phys` is NO LONGER written here; `kbd_retire` records it. Under one outstanding TRB "the expectation before the current one" WAS the TD that had just been retired, because this function ran immediately after that TD was consumed. Under N it is not: it names another TRB that is still ARMED. The dup guard's `param == prev` test would then never match a genuine Panther-Point duplicate (whose TRB is the one just retired) and every dup would score as an unaccounted completion in `KBD_DISCARD_REARM_COUNT` instead of `KBD_DUP_DROP_COUNT` — the same wire, a wrong diagnosis, and `[kbdpoll]`'s DUP-DROP verdict silently dead. Recording it where the retirement actually happens gives the identical value at N=1 and the correct one at N>1.
+            // (see `kbd_retire`, at the file tail. ⚠ the statement's two lines are kept as two comment lines — none added, none removed.)
             self.slots[slot_id as usize].keyboard_expect_phys =
-                ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
+                ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64); { let t = self.slots[slot_id as usize].keyboard_expect_phys; let s = &mut self.slots[slot_id as usize]; let n = s.keyboard_armed_n as usize; if n < KBD_INFLIGHT { s.keyboard_armed_trb[n] = t; s.keyboard_armed_buf[n] = data_phys; s.keyboard_armed_n = (n + 1) as u8; } KBD_OUTSTANDING.store(s.keyboard_armed_n as u64, Ordering::Relaxed); } // XHCINTD — register the TRB we just produced in the armed set, NEWEST LAST, so `kbd_retire`'s FIFO order matches the ring's production order and `keyboard_armed_buf[i]` is the buffer TRB `i` was armed with. Appended after `keyboard_expect_phys` is written so both records name the same TD. The `n < KBD_INFLIGHT` test cannot fail on the `kbd_top_up` path (it stops at N) and is a hard bound for any future caller. `KBD_OUTSTANDING` is the gauge `[kbdpoll]` prints. ⚠ FOLDED onto the existing store's value line — no line added.
             self.ring_doorbell(slot_id, dci as u32); KBD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — counted AFTER the doorbell, because the doorbell is the instant the endpoint stops being unarmed: a count taken before it would claim a window this function had not yet closed. `MOUSE_REARM_COUNT`'s twin (`queue_mouse_read` bumps its own). ⚠ FOLDED.
             xdbg!("xHCI: Keyboard Read Queued.");
+        }
+    }
+}
+
+// XHCINTD (orin 17) — the armed-set helpers. TAIL APPEND, below every pre-existing line in this
+// file, so nothing above moves and the only `Location` records that shift are the ones inside these
+// four new functions. Growth here is unavoidable: PRTSCLOST's witness could be folded onto existing
+// lines because it only counted, but keeping N TRBs outstanding needs a FIFO, and a FIFO needs code.
+impl XhciController {
+    /// How many Normal TRBs this slot's keyboard interrupt-IN may keep outstanding.
+    ///
+    /// `KBD_INFLIGHT` normally, but **1** when the endpoint's max packet size exceeds
+    /// `KBD_BUF_STRIDE`: the pool is carved out of the one 512-byte `data_buffer` allocation at a
+    /// 64-byte stride, so an MPS above that would make two buffers overlap and a report would be
+    /// DMA-written across its neighbour. A boot keyboard's interrupt-IN is 8 bytes, so the fallback
+    /// is unreachable on every device we have seen; it exists so that a device which does not fit
+    /// the pool degrades to EXACTLY today's single-TRB behaviour rather than corrupting reports.
+    fn kbd_inflight(&self, slot_id: u8) -> usize {
+        let s = &self.slots[slot_id as usize];
+        if s.data_buffer.is_none() || s.keyboard_ring.is_none() { return 0; }
+        if (s.keyboard_mps as usize) > KBD_BUF_STRIDE { 1 } else { KBD_INFLIGHT }
+    }
+
+    /// The lowest-addressed report buffer in this slot's pool that is **not** currently armed.
+    ///
+    /// The pool is `data_buffer + i * KBD_BUF_STRIDE` for `i` in `0..kbd_inflight()`, every entry on
+    /// its own aarch64 D-cache line so the consumer-side `inval` of a retired buffer cannot discard
+    /// a sibling the controller is still writing. Buffer 0 is `data_buffer` itself, which is what
+    /// makes the pre-arm fallback in the completion branch (`.or(kbuf0)`) name a real pool member.
+    ///
+    /// Returns `None` when every buffer is armed — the signal that the endpoint is already at
+    /// depth N, and the reason `kbd_top_up` terminates.
+    fn kbd_free_buf(&self, slot_id: u8) -> Option<u64> {
+        let want = self.kbd_inflight(slot_id);
+        let s = &self.slots[slot_id as usize];
+        let base = s.data_buffer? as u64;
+        let n = s.keyboard_armed_n as usize;
+        for i in 0..want {
+            let cand = base + (i * KBD_BUF_STRIDE) as u64;
+            if !s.keyboard_armed_buf[..n].contains(&cand) { return Some(cand); }
+        }
+        None
+    }
+
+    /// Match a keyboard transfer completion against the armed set; on a hit, retire it and hand back
+    /// the buffer that TD was DMA-written into.
+    ///
+    /// This is the dup-Success guard's discrimination generalised from one expectation to N. On a
+    /// **miss** nothing changes and `None` comes back, which is byte-for-byte the old
+    /// `param != keyboard_expect_phys` verdict and keeps the Panther-Point quirk handling intact.
+    /// On a **hit** at position `p` the set is popped through `p` — the entries older than the match
+    /// name TDs that will never report, so holding them would leak the set to full and stall every
+    /// later top-up. `p > 0` is counted into `KBD_SKIPPED_COUNT` rather than folded into the guard's
+    /// drop counters, because "the controller retired out of order / an event was missed" is a
+    /// different repair from "the controller posted a duplicate".
+    ///
+    /// `keyboard_prev_phys` is set to the retired TRB here — the Panther-Point dup-Success names THAT
+    /// address, and it is the only record of it once the entry has been popped out of the armed set.
+    ///
+    /// The caller must not hold a borrow of `self.slots` across this call.
+    fn kbd_retire(&mut self, slot_id: u8, param: u64) -> Option<u64> {
+        let s = &mut self.slots[slot_id as usize];
+        let n = s.keyboard_armed_n as usize;
+        let mut p = usize::MAX;
+        for i in 0..n {
+            if s.keyboard_armed_trb[i] == param { p = i; break; }
+        }
+        if p == usize::MAX { return None; }
+        let buf = s.keyboard_armed_buf[p];
+        s.keyboard_prev_phys = param;
+        if p > 0 { KBD_SKIPPED_COUNT.fetch_add(p as u64, Ordering::Relaxed); }
+        let keep = n - p - 1;
+        for i in 0..keep {
+            s.keyboard_armed_trb[i] = s.keyboard_armed_trb[p + 1 + i];
+            s.keyboard_armed_buf[i] = s.keyboard_armed_buf[p + 1 + i];
+        }
+        for i in keep..n {
+            s.keyboard_armed_trb[i] = 0;
+            s.keyboard_armed_buf[i] = 0;
+        }
+        s.keyboard_armed_n = keep as u8;
+        KBD_OUTSTANDING.store(keep as u64, Ordering::Relaxed);
+        Some(buf)
+    }
+
+    /// Arm Normal TRBs on this slot's keyboard interrupt-IN until `kbd_inflight()` are outstanding.
+    ///
+    /// **This is the whole defect's repair.** With one TRB the endpoint is unarmed from the instant
+    /// the controller retires a TD until software re-arms; `set_hid_idle` sends SET_IDLE duration 0
+    /// (INDEFINITE), so a boot keyboard reports only on a state change and never resends, and every
+    /// edge inside that window is gone — a press and its release both landing there vanish with no
+    /// line anywhere, and a lost release alone leaves `keyboard_prev_keys` holding the key so the
+    /// NEXT genuine press is swallowed by the level diff too. Keeping N outstanding means a
+    /// retirement never empties the ring: the controller always has an IN token to issue.
+    ///
+    /// A **no-op when already full**, which is what lets every call site use it unconditionally —
+    /// including the backstop after `set_hid_leds`, where a nested dispatch may already have
+    /// restored the set. Bounded by `KBD_INFLIGHT` iterations regardless of what the slot state
+    /// says, so a corrupted count can stall the endpoint but can never spin the pump.
+    ///
+    /// Publishes the depth it aimed at into `KBD_DEPTH_WANT` (skipping the un-armable `0`, which is
+    /// a slot with no buffer rather than a device that wants no reads), so `[kbdpoll] outstanding=n/w`
+    /// carries the denominator this slot actually runs at instead of the compile-time constant.
+    fn kbd_top_up(&mut self, slot_id: u8) {
+        let want = self.kbd_inflight(slot_id);
+        if want != 0 { KBD_DEPTH_WANT.store(want as u64, Ordering::Relaxed); }
+        for _ in 0..KBD_INFLIGHT {
+            if (self.slots[slot_id as usize].keyboard_armed_n as usize) >= want { break; }
+            if self.kbd_free_buf(slot_id).is_none() { break; }
+            self.queue_keyboard_read(slot_id);
         }
     }
 }
