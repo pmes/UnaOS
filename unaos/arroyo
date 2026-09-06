@@ -343,7 +343,7 @@ _feats=""
 # INTERNAL slot, which makes that reader the ONLY program source on the machine — and with the knob
 # off there is no handle for it, so the default x86 image cannot reach its own boot volume. GR26
 # Boot D is the conviction: `[sdhc] … CARD IDENTIFIED`, three ADMA/PIO windows matched, MBR p0
-# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /boot/VUG.ELF`
+# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /apps/VUG.ELF`
 # with nothing to open. Default-on costs a third handle and no global-slot change.
 # REVIEW CORRECTION (GR26): "READ-ONLY at the FAT layer, unconditionally" above is GR20's property and
 # SDHC-4c SUPERSEDED it — `write_sector`/`write_sectors` now admit a span inside the reserved extent
@@ -1201,7 +1201,7 @@ _feats=""
 #
 # THE DEMONSTRATION FLIGHT is the §6.1 conjunction PLUS this knob:
 #     UNAOS_ORINTENANT=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 ./arroyo esp-jetson
-# then `run /boot/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
+# then `run /apps/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
 # create line names the window. `orintenant` alone is also sound (stage reserved, witnesses live,
 # tenants composited beside the raw console) but carries no dock and no click routing; the census
 # prints `desktop_firmware=`/knob fields so a capture names which image shape it ran on.
@@ -1670,7 +1670,7 @@ fi
 # block device on an Orin boot), so `ls /` and quarry both answered `/: backend error: unafs-mount`.
 # Armed, the table instead binds `/` to the card's FAT volume read through BlockSource::TegraSd (the
 # census-published CMD17 path, metal-proven by A23) and re-points `/boot` at that same volume — `/boot`
-# is `shell::EXEC_ROOT` and the literal prefix of `/boot/VUG.ELF`, `/boot/STAT.ELF`, `/boot/ELFHELLO.ELF`
+# is `shell::EXEC_ROOT` and the literal prefix of `/apps/VUG.ELF`, `/apps/STAT.ELF`, `/apps/ELFHELLO.ELF`
 # and quarry's launch route, so it is what makes the desktop able to run anything, not decoration.
 # READ-ONLY twice over and NOT by this
 # knob's say-so: BlockSource::TegraSd::write_veto vetoes the source and block::write_block_tegra_sd
@@ -4740,7 +4740,7 @@ pack_source_along() {
 # WINX-7 PKG — WHY THIS SPLIT NOW. An attended rMBP boot reported
 #   `:: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::`
 # with STAT.ELF verifiably on the booted card: the firmware booted the SD-card ESP while xHCI
-# enumerated a USB stick, so the shell's `bg /boot/STAT.ELF` searched the stick for a file the build
+# enumerated a USB stick, so the shell's `bg /apps/STAT.ELF` searched the stick for a file the build
 # had put on the card. The old one-line instruction ("copy the contents to a FAT32 USB root") was
 # correct for a ONE-STICK boot and silently wrong for a two-device one; naming the two volumes is
 # the fix. On a single stick, write BOTH trees to that one root and everything behaves as before.
@@ -4770,7 +4770,7 @@ esp_x86() {
     echo -e "     DATA volume  <- target/x86_64_data/   (the kernel's FAT mount = the USB stick on storage_slot)"
     echo -e "   ONE stick:  write BOTH trees to that stick's FAT32 root — they do not collide."
     echo -e "   TWO devices (e.g. SD-card ESP + USB stick): esp tree -> the bootable device,"
-    echo -e "               data tree -> the USB stick, or \`bg /boot/VUG.ELF\` reports -ENOENT."
+    echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
 }
@@ -4959,31 +4959,38 @@ esp_arm() {
 stage_jetson_el0_images() {
     local staged=0
     echo -e "${COLOR_CYAN}⚡ Staging EL0 programs onto the Jetson boot volume...${COLOR_RESET}"
+    # LAYOUT (orin 18): into `APPS/`, the one place the loader looks (`fat::APPS_DIR` /
+    # `shell::EXEC_ROOT` = `/apps`). The ESP's own boot files (EFI/, the kernel) stay in the root
+    # where the firmware reads them.
+    local APPS_DIR_ARM="${ESP_DIR_ARM}/APPS"
+    mkdir -p "$APPS_DIR_ARM"
     # The five static-ELF64 images `build_user_el0_elf_images` just produced. Each already passed its
     # ELF-magic + 16 KiB slot-window assertions there; re-assert PRESENCE here, because the failure this
     # guards against is a staging step that silently copied nothing.
     for img in ELFHELLO.ELF VUG.ELF VUGK.ELF STAT.ELF PULSE.ELF; do
         local src="${WORKSPACE_DIR}/target/${img}"
         [ -s "$src" ] || { echo -e "${COLOR_RED}ERROR: ${img} missing/empty — cannot stage the jetson boot volume${COLOR_RESET}"; exit 1; }
-        cp "$src" "${ESP_DIR_ARM}/${img}"
+        cp "$src" "${APPS_DIR_ARM}/${img}"
         staged=$((staged + 1))
     done
     # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
     if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
         case ",${_feats}" in
             *",tegra_el0,"*)
-                cp "${WORKSPACE_DIR}/target/user_blob.bin" "${ESP_DIR_ARM}/HELLO.BIN"
+                cp "${WORKSPACE_DIR}/target/user_blob.bin" "${APPS_DIR_ARM}/HELLO.BIN"
                 staged=$((staged + 1))
                 ;;
         esac
     fi
     # THE VALIDITY CHECK (this track's rule): an instrument that is not in the image proves nothing. Print
     # what actually landed, with sizes, so the build's own output is the evidence — not a claim about it.
-    echo -e "${COLOR_GREEN}✅ EL0 programs on the boot volume (${staged}):${COLOR_RESET}"
+    # It reads `APPS/` and NOT the root: a listing of the root would have kept printing the old,
+    # stale copies of these names if the move had silently failed to happen.
+    echo -e "${COLOR_GREEN}✅ EL0 programs in APPS/ on the boot volume (${staged}):${COLOR_RESET}"
     local f
-    for f in "${ESP_DIR_ARM}"/*.ELF "${ESP_DIR_ARM}"/*.BIN; do
+    for f in "${APPS_DIR_ARM}"/*.ELF "${APPS_DIR_ARM}"/*.BIN; do
         [ -f "$f" ] || continue
-        printf '     %-14s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
+        printf '     APPS/%-14s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
     done
     # PULSE.ELF's honest note, printed where the operator will read it. ABIFREEZE divergence D2:
     # SYS_CPUPULSE (49) is dispatched ONLY by the x86 kernel; the aarch64 dispatcher has no arm for it and
@@ -5316,7 +5323,7 @@ build_one_vug_aarch64() {
 # the only channel a pin can travel down — hence three link products rather than one flag. All three names
 # are 8.3-clean and land in the FAT root beside STAT.ELF/PULSE.ELF, so each gets its own IMAGE_SHA256
 # principal and both reach paths work on them unchanged: Quarry's double-click (`.ELF` is launchable — see
-# video/quarry/live.rs) and `bg /boot/VUGX.ELF` at the shell.
+# video/quarry/live.rs) and `bg /apps/VUGX.ELF` at the shell.
 #
 # The aarch64 names carry no `-ARM` suffix (the x86 ones carry `-X86`) because the aarch64 build IS the
 # staged name: the x86 side stages target/VUG*-X86.ELF *as* VUG*.ELF via builder/make-fat-img, while kernel8
@@ -6384,61 +6391,72 @@ kernel8() {
     cp "$FW_CACHE/overlays/miniuart-bt.dtbo" "$KERNEL8_DIR/overlays/"
     echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR} (firmware raspberrypi/firmware ${FW_TAG})${COLOR_RESET}"
 
-    # M6g: carry the EL0 user blob onto the boot media as HELLO.BIN, next to kernel8.img in the FAT32
-    # root (make-pi-img.sh ditto's the whole staging dir). On metal the kernel's M6g loader reads this
-    # very file back off the microSD it booted from; in QEMU it rides the same image attached via if=sd.
-    # Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
-    cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/HELLO.BIN"
+    # LAYOUT (orin 18): PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT. `fat::APPS_DIR` is the on-medium
+    # spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; the aarch64 loader
+    # (`load_program_into_slot` -> `FatFs::find_app`) looks HERE and nowhere else, so a program left
+    # in the root is a program the kernel will not find. 8.3 by construction — this FAT driver's
+    # create path writes short names only. make-pi-img.sh installs the staging dir RECURSIVELY
+    # (`mcopy -s` on Linux, `ditto` on macOS), so the directory rides along with no change there.
+    #
+    # What stays in the ROOT, deliberately: kernel8.img, config.txt, the Pi firmware + overlays/
+    # (the firmware reads those by fixed path), and the mutable fixture files SCRATCH.BIN / GROW.BIN
+    # (data the EL0 demos write, not code they load).
+    mkdir -p "$KERNEL8_DIR/APPS"
+
+    # M6g: carry the EL0 user blob onto the boot media as APPS/HELLO.BIN. On metal the kernel's M6g
+    # loader reads this very file back off the microSD it booted from; in QEMU it rides the same
+    # image attached via if=sd. Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
+    cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/APPS/HELLO.BIN"
 
     # K2: carry the two additional EL0 programs onto the boot media (make-pi-img.sh ditto's the whole
     # staging dir). K2OWN.BIN = the private-create owner; K2IMP.BIN = the non-owner impostor. Re-created
     # every kernel8 build (KERNEL8_DIR is wiped above), present in every kernel8-test image AND on metal.
     # NEVER collide with HELLO.BIN/SCRATCH.BIN/GROW.BIN (other fixtures load/mutate those).
-    cp "${WORKSPACE_DIR}/target/owner_blob.bin" "$KERNEL8_DIR/K2OWN.BIN"
-    cp "${WORKSPACE_DIR}/target/imp_blob.bin" "$KERNEL8_DIR/K2IMP.BIN"
+    cp "${WORKSPACE_DIR}/target/owner_blob.bin" "$KERNEL8_DIR/APPS/K2OWN.BIN"
+    cp "${WORKSPACE_DIR}/target/imp_blob.bin" "$KERNEL8_DIR/APPS/K2IMP.BIN"
 
     # BANDY-1 M4: carry midden (program #3) onto the boot media as MIDDEN.BIN — the bandy_rt
     # launcher spawns it for the round-trip + equivalence witnesses. Distinct 8.3 name => its own
     # IMAGE_SHA256 principal via the sole mint path.
-    cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/MIDDEN.BIN"
+    cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/APPS/MIDDEN.BIN"
 
     # ELF-1: carry the minimal static ELF64 program onto the boot media as ELFHELLO.ELF (make-pi-img.sh
     # ditto's the whole staging dir). The kernel's ELF1 witness reads it back off the SD, validates + maps
     # its two PT_LOAD segments, and runs it at EL0. Distinct 8.3 name => its own IMAGE_SHA256 principal via
     # the sole mint path. NEVER collides with the flat fixtures (HELLO/K2*/MIDDEN/SCRATCH/GROW .BIN).
-    cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/ELFHELLO.ELF"
+    cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/APPS/ELFHELLO.ELF"
 
     # UVUG-1: carry the mini-vug static ELF64 onto the boot media as VUG.ELF (make-pi-img.sh ditto's the
     # whole staging dir). The kernel's UVUG witness reads it back off the SD through the VFS and runs it via
-    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /boot/VUG.ELF`
+    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /apps/VUG.ELF`
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
     #
     # VUGSTAGE (PARITY §6.6b): the two PINNED siblings ride along — VUGC.ELF (pinlo, the classic wireframe
     # baseline) and VUGX.ELF (pinhi, the full per-pixel shard). x86 media has carried all three since
     # VUGSCENE; this closes the last of that gap on the Pi. They are launched exactly like VUG.ELF —
-    # `bg /boot/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
+    # `bg /apps/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
     # the volume — so no kernel change is needed for them to be reachable, only these bytes on the FAT.
     # Cost against the 64 MiB image is the three sizes printed by build_user_vug_aarch64 above (~10 KiB
     # each): under 0.05% of the volume, and the UVUG witness still reads VUG.ELF, unchanged.
-    cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
-    cp "${WORKSPACE_DIR}/target/VUGC.ELF" "$KERNEL8_DIR/VUGC.ELF"
-    cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/VUGX.ELF"
-    echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
+    cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/APPS/VUG.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGC.ELF" "$KERNEL8_DIR/APPS/VUGC.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/APPS/VUGX.ELF"
+    echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/APPS/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/APPS/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/APPS/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
 
-    # KVUG: the kernel-vug image beside it — `run /boot/VUGK.ELF` / `bg /boot/VUGK.ELF` on the panel. Its own
+    # KVUG: the kernel-vug image beside it — `run /apps/VUGK.ELF` / `bg /apps/VUGK.ELF` on the panel. Its own
     # 8.3 name, so its own IMAGE_SHA256 principal; never collides with VUG.ELF or the flat fixtures.
-    cp "${WORKSPACE_DIR}/target/VUGK.ELF" "$KERNEL8_DIR/VUGK.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGK.ELF" "$KERNEL8_DIR/APPS/VUGK.ELF"
 
     # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
     # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and
-    # spawns it detached; the operator drives the same bytes with `bg /boot/STAT.ELF`. Distinct 8.3 name =>
+    # spawns it detached; the operator drives the same bytes with `bg /apps/STAT.ELF`. Distinct 8.3 name =>
     # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or VUG.ELF.
-    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
+    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/APPS/STAT.ELF"
 
     # PULSE-1: carry the cpu-pulse static ELF64 onto the boot media as PULSE.ELF, same reasoning as STAT
-    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /boot/PULSE.ELF`.
-    cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/PULSE.ELF"
+    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /apps/PULSE.ELF`.
+    cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/APPS/PULSE.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it
@@ -7019,7 +7037,7 @@ battery() {
     # already caught by the generic FAIL scan; these steps require the positive `ok` witness present.
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
-    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /boot/STAT.ELF` / `bg /boot/VUG.ELF` read off a
+    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /apps/STAT.ELF` / `bg /apps/VUG.ELF` read off a
     # REAL attached FAT volume, through the ELF loader, into a compositor window. Same cheap re-grep
     # shape as the usb-write witnesses above (no extra QEMU run): the FAT-attached boot already
     # happened in the `test-fat` step, these two just require its POSITIVE verdicts to be present.

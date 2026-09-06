@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! [fatperf] op=list path=/boot sectors=222 us=13456
-//! [fatperf] op=read path=/boot/VUG.ELF sectors=41 us=2210
+//! [fatperf] op=read path=/apps/VUG.ELF sectors=41 us=2210
 //! ```
 //!
 //! Four RAW words. `sectors` is 512-byte sector reads the block layer actually performed under the

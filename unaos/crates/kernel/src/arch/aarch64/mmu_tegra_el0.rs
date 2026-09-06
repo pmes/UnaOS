@@ -175,7 +175,7 @@ pub const USER_CODE_SIZE: usize = 0x1000;
 // copied the PRE-CRYSTAL-HD table, so the paragraph above was false at this module's birth. The
 // divergence was not cosmetic; it was two live defects, both removed by restoring the parity the
 // paragraph claims:
-//   * `run /boot/VUG.ELF` on the Orin died at its first syscall: the shipped `user-vug` asks
+//   * `run /apps/VUG.ELF` on the Orin died at its first syscall: the shipped `user-vug` asks
 //     `SYS_WIN_CREATE(288, 288)` (its `SW`/`SH` — CRYSTAL-HD's 288-as-committed, Peter-ruled
 //     2026-08-18) and the 128 cap here answered `-EINVAL`, so the program printed
 //     `:: UVUG: SYS_WIN_CREATE failed ::` and exited(1) — no EL0 program could ever own a

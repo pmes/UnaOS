@@ -2562,7 +2562,7 @@ impl FatFs {
     /// contents with the file appended after them. Every caller that pre-sized its buffer from the
     /// directory (`vec![0u8; de.size]` — a natural reading of "read the file into this") therefore got
     /// a result of exactly `2 * de.size`, silently, with the file's real bytes sitting behind a run of
-    /// zeros. That is the doubling that blocked `bg /boot/STAT.ELF` and `bg /boot/VUG.ELF` on x86: the
+    /// zeros. That is the doubling that blocked `bg /apps/STAT.ELF` and `bg /apps/VUG.ELF` on x86: the
     /// directory said 8472 / 12568 and the loader was handed 16944 / 25136 — past the 16 KiB user
     /// window, so both were rejected as oversize. It read as time-dependent (early boot fine, later
     /// broken) only because the doubling is invisible until `2 * size` crosses a caller's cap: U2's

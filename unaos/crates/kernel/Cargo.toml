@@ -1128,7 +1128,7 @@ sdmmcwrite = ["sdmmc"]
 # `BlockSource::TegraSd` (the census-published `read_block_tegra_sd` path — CMD17 single-block, 1-bit
 # default speed, PROVEN on metal by A23), and re-point `/boot` at the SAME volume — its `Default`
 # source is registered by no Orin boot, and `/boot` is `shell::EXEC_ROOT` and the literal prefix of
-# `/boot/VUG.ELF`, `/boot/STAT.ELF` and `/boot/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
+# `/apps/VUG.ELF`, `/apps/STAT.ELF` and `/apps/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
 # launch anything at all. READ-ONLY BY CONSTRUCTION and not by policy stated here:
 # `BlockSource::TegraSd::write_veto` is `Some(TEGRA_SD_VETO)` and `write_block_tegra_sd` refuses in
 # every cfg, so no VFS verb can reach the medium. The vendor pad block stays DISABLED (the FWALL

@@ -2774,7 +2774,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // Disk-free, exactly as leg 4's tree is: the list is hand-built, so the leg is honest on a
     // machine with no volume at all.
     m.cache.clear();
-    m.cwd = String::from("/boot");
+    m.cwd = String::from("/apps");
     m.list = alloc::vec![
         DirEnt { name: String::from("VUG.ELF"), kind: NodeKind::File, size: 12568, mtime: None },
         DirEnt { name: String::from("CONFIG.TXT"), kind: NodeKind::File, size: 842, mtime: None },
@@ -2801,7 +2801,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     }
     match (content_press(&mut m, px_x, row0_y), clock_live) {
         (Act::Launch(p), true) => {
-            if p != "/boot/VUG.ELF" {
+            if p != "/apps/VUG.ELF" {
                 return Err("the double-click launched the wrong path");
             }
         }
@@ -2825,7 +2825,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     let _ = content_press(&mut m, px_x, row1_y);
     match (content_press(&mut m, px_x, row1_y), clock_live) {
         (Act::NoOpener(p), true) => {
-            if p != "/boot/CONFIG.TXT" {
+            if p != "/apps/CONFIG.TXT" {
                 return Err("the unhandled double-click named the wrong path");
             }
         }
@@ -2967,7 +2967,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // must still not eat the stamp.
     let _ = wheel_scroll(&mut m, list_x, list_y, -1);
     match (content_press(&mut m, px_x, row0_y), clock_live) {
-        (Act::Launch(p), true) if p == "/boot/VUG.ELF" => {}
+        (Act::Launch(p), true) if p == "/apps/VUG.ELF" => {}
         (Act::None, false) => {} // the zero-clock guard, as everywhere else in this battery
         (_, true) => return Err("a scroll between two presses broke the double-click"),
         (_, false) => return Err("a double-click fired on a zero clock"),

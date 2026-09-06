@@ -17,7 +17,7 @@
 #     script never touches a physical disk).
 #   * Linux — mkfs.vfat + mtools (mcopy) + sfdisk. FATIMG-CI: added 2026-07-29. Before it,
 #     this helper was macOS-only, so `./arroyo fat-img` / `test-fat` — and therefore the whole
-#     FAT-ATTACHED configuration, including the WINX-2 `bg /boot/STAT.ELF` end-to-end witness —
+#     FAT-ATTACHED configuration, including the WINX-2 `bg /apps/STAT.ELF` end-to-end witness —
 #     could not run on a Linux box and silently skipped in every automated suite run there.
 #     A fixture that only runs when someone remembers to attach a stick is a fixture that will
 #     be wrong again. Nothing here needs root: mtools writes the filesystem image as a plain
@@ -96,38 +96,45 @@ stage_contents() {
     printf 'hello from the UnaOS FAT reader\nthis file lives on a real FAT32 volume\n' > "${S}/hello.txt"
     printf 'UnaOS read-only FAT32/16 reader test volume (%s layout).\n' "$LAYOUT" > "${S}/readme.txt"
 
+    # LAYOUT (orin 18): PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT — `fat::APPS_DIR` on the medium,
+    # `shell::EXEC_ROOT` (`/apps`) in the namespace. The four programs below are what `FatFs::find_app`
+    # looks for, and it looks nowhere else. Everything else on this volume keeps its place: EFI/,
+    # kernel.elf, hello.txt, readme.txt and every STOR-1/U9x/S8 fixture stay in the ROOT, because they
+    # are data the witnesses read or write, not code the loader loads.
+    mkdir -p "${S}/APPS"
+
     # U2: the x86 ring-3 "hello from disk" program (crates/user-blob-x86 → target/hello.bin, built by
     # arroyo's build_user_hello_x86). Copy it onto the image as HELLO.BIN so the kernel's U2 FAT loader
     # finds + runs it in ring 3. Read straight from target/hello.bin (fresh — every x86 build path builds
     # it before make-fat-img runs), independent of whether the ESP payload carried it.
     local HELLO_BIN="${WORKSPACE_DIR}/target/hello.bin"
     if [ -f "$HELLO_BIN" ]; then
-        COPYFILE_DISABLE=1 cp "$HELLO_BIN" "${S}/HELLO.BIN"
-        echo "    added HELLO.BIN ($(wc -c < "$HELLO_BIN" | tr -d ' ') bytes) for the U2 loader"
+        COPYFILE_DISABLE=1 cp "$HELLO_BIN" "${S}/APPS/HELLO.BIN"
+        echo "    added APPS/HELLO.BIN ($(wc -c < "$HELLO_BIN" | tr -d ' ') bytes) for the U2 loader"
     else
         echo "    WARNING: ${HELLO_BIN} absent — image has no HELLO.BIN (run './arroyo fat-img' via arroyo, not make-fat-img.sh directly)"
     fi
 
     # WINX-5: the x86 EL0 persistence program (crates/user-stat → target/STAT-X86.ELF, built by arroyo's
     # build_user_stat_x86). Copy it onto the image as STAT.ELF so the x86 shell's `run`/`bg` — which read the
-    # FAT boot partition's root — can load it (`bg /boot/STAT.ELF`). Same shape and same freshness argument as
+    # FAT boot partition's root — can load it (`bg /apps/STAT.ELF`). Same shape and same freshness argument as
     # the HELLO.BIN hunk above. Un-suffixed on the volume so the operator command reads the same on both
     # arches; the -X86 suffix exists only in target/, where both arches' images share one directory.
     local STAT_ELF="${WORKSPACE_DIR}/target/STAT-X86.ELF"
     if [ -f "$STAT_ELF" ]; then
-        COPYFILE_DISABLE=1 cp "$STAT_ELF" "${S}/STAT.ELF"
-        echo "    added STAT.ELF ($(wc -c < "$STAT_ELF" | tr -d ' ') bytes) for the run/bg loader"
+        COPYFILE_DISABLE=1 cp "$STAT_ELF" "${S}/APPS/STAT.ELF"
+        echo "    added APPS/STAT.ELF ($(wc -c < "$STAT_ELF" | tr -d ' ') bytes) for the run/bg loader"
     else
         echo "    WARNING: ${STAT_ELF} absent — image has no STAT.ELF (run './arroyo fat-img' via arroyo)"
     fi
 
     # WINX-7: the x86 EL0 mini-vug (crates/user-vug → target/VUG-X86.ELF, built by arroyo's
     # build_user_vug_x86). Same shape, same freshness argument and same un-suffixed on-volume name as the
-    # STAT.ELF hunk above — `bg /boot/VUG.ELF` reads identically on both arches.
+    # STAT.ELF hunk above — `bg /apps/VUG.ELF` reads identically on both arches.
     local VUG_ELF="${WORKSPACE_DIR}/target/VUG-X86.ELF"
     if [ -f "$VUG_ELF" ]; then
-        COPYFILE_DISABLE=1 cp "$VUG_ELF" "${S}/VUG.ELF"
-        echo "    added VUG.ELF ($(wc -c < "$VUG_ELF" | tr -d ' ') bytes) for the run/bg loader"
+        COPYFILE_DISABLE=1 cp "$VUG_ELF" "${S}/APPS/VUG.ELF"
+        echo "    added APPS/VUG.ELF ($(wc -c < "$VUG_ELF" | tr -d ' ') bytes) for the run/bg loader"
     else
         echo "    WARNING: ${VUG_ELF} absent — image has no VUG.ELF (run './arroyo fat-img' via arroyo)"
     fi
@@ -137,8 +144,8 @@ stage_contents() {
     # STAT.ELF / VUG.ELF hunks above. This is the file the PULSE-W end-to-end witness looks for by name.
     local PULSE_ELF="${WORKSPACE_DIR}/target/PULSE-X86.ELF"
     if [ -f "$PULSE_ELF" ]; then
-        COPYFILE_DISABLE=1 cp "$PULSE_ELF" "${S}/PULSE.ELF"
-        echo "    added PULSE.ELF ($(wc -c < "$PULSE_ELF" | tr -d ' ') bytes) for the run/bg loader"
+        COPYFILE_DISABLE=1 cp "$PULSE_ELF" "${S}/APPS/PULSE.ELF"
+        echo "    added APPS/PULSE.ELF ($(wc -c < "$PULSE_ELF" | tr -d ' ') bytes) for the run/bg loader"
     else
         echo "    WARNING: ${PULSE_ELF} absent — image has no PULSE.ELF (run './arroyo fat-img' via arroyo)"
     fi

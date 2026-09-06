@@ -184,7 +184,7 @@ pub fn usb_info() -> Option<BlockDeviceInfo> {
 // slot, `sdhcblk` is default-on, and `publish_usb_geometry` claims the global UNCONDITIONALLY on
 // x86. So a USB stick inserted merely to CARRY files — the b43 firmware blobs, this week, for real —
 // would claim the global mid-boot and, under the old rule, silently become the program source:
-// `/boot` would stop meaning the volume the machine booted from and `bg /boot/VUG.ELF` would resolve
+// `/boot` would stop meaning the volume the machine booted from and `bg /apps/VUG.ELF` would resolve
 // against the stick.
 //
 // FRGUARD already refuses the WRITE half of exactly that substitution (`BM_SUBSTITUTED`, Boot AI-2,

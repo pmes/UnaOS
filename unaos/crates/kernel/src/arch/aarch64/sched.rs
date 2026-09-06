@@ -3135,8 +3135,8 @@ pub fn mark_online(cpu: usize) {
 // `user_task_trampoline` writes ELR_EL1/SPSR_EL1 and `eret`s, and an `eret` executed at EL2 with
 // `HCR_EL2.E2H == 0` consumes ELR_EL2/SPSR_EL2 instead: the core returns to a stale EL2 PC with
 // every GPR just scrubbed to zero by the M6d hardening. On metal that is a wild fetch, a RAS
-// Uncorrectable, and a powered-off core — the observed `bg /boot/vug.elf` board kill. `run
-// /boot/vug.elf` survived only because it keeps `this_cpu()` (the BSP, at EL1) and its program
+// Uncorrectable, and a powered-off core — the observed `bg /apps/vug.elf` board kill. `run
+// /apps/vug.elf` survived only because it keeps `this_cpu()` (the BSP, at EL1) and its program
 // exited before any re-placement lane could move it off.
 //
 // THE RULE, until the APs are dropped to EL1 too: an EL0 task may be placed only on a core that is
@@ -10676,7 +10676,7 @@ pub fn stk_probe_bounds(at: &str, name: &str, base: u64, len: u64) {
 // regime (never stamped into `EL1_CORE_MASK`), while core 0 IS stamped at EL1 by the JM6 drop
 // (`main.rs` EL0-EL1CORE stamp; `[el0core] el1 core MEASURED: cpu=0 mask=0x1`) but is NOT in
 // `ONLINE_MASK` — the cooperative terminus never calls `mark_online`. `run_bsp_tegra` calls it, so
-// the conjunction becomes satisfiable at core 0 for the first time and `bg /boot/vug.elf` should
+// the conjunction becomes satisfiable at core 0 for the first time and `bg /apps/vug.elf` should
 // stop printing "no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)".
 // "Should" is the problem. Nothing on the wire says so, and the two lines that DO exist are both
 // negative: `[el0core] rollup:` is emitted by `run_bsp_tegra` BEFORE `mark_online`, so it reports

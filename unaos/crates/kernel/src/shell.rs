@@ -1847,7 +1847,8 @@ fn parse_wallclock(args: &[&str]) -> Option<crate::clock::WallTime> {
 /// `ls` on this arch, replacing the two per-volume collectors (`pi_ls_collect` against unafs and
 /// `pi_usb_ls_collect` against the USB FAT) that the verb used to choose between with a hand-rolled
 /// `/usb` prefix test. The volume is now decided by [`MountTable::resolve`] — the same longest-prefix
-/// rule `run`, `bg` and `mount` already obey — so `ls /` lists native UnaFS, `ls /boot` the SD boot FAT
+/// rule `run`, `bg` and `mount` already obey — so `ls /` lists native UnaFS, `ls /boot` the SD boot FAT,
+/// `ls /apps` the programs on it
 /// and `ls /usb` the stick, with no verb-side dispatch and no volume the verb has to know about.
 ///
 /// Returns `(is_dir, rows)` sorted by name. A directory yields its entries; a plain file yields its
@@ -2266,7 +2267,21 @@ impl midden_core::Volume for FatVolume {
                 return false;
             }
         };
-        fat_path_is_file(&fs, &normalize_path(&cwd_path(), name))
+        // LAYOUT (orin 18): TWO probes, the cwd then the program directory — the aarch64 order
+        // ([`exec_resolve`]), transposed. It is written volume-relative rather than through the
+        // namespace because this probe must keep binding `mount_program_source()` and STAMPING
+        // [`EXEC_BIND`] (the FATVERB witness reads that stamp); x86's `/` IS the volume root, so
+        // `/APPS/VUG.ELF` on the volume and `/apps/VUG.ELF` in the namespace are one file.
+        let from_cwd = normalize_path(&cwd_path(), name);
+        if fat_path_is_file(&fs, &from_cwd) {
+            return true;
+        }
+        if name.starts_with('/') {
+            return false; // an absolute token means what it says; the second probe is for bare names
+        }
+        let from_apps = normalize_path(
+            &alloc::format!("/{}", crate::fs::fat::APPS_DIR), name);
+        from_apps != from_cwd && fat_path_is_file(&fs, &from_apps)
     }
     /// BARENAME (PARITY §6.6a): the aarch64 twin — the SAME question, asked of the namespace this
     /// arch actually has.
@@ -2274,7 +2289,7 @@ impl midden_core::Volume for FatVolume {
     /// aarch64 is not x86 with a different mnemonic set here: x86 has no VFS, so its whole path
     /// universe IS the program-source FAT and "resolve from the cwd" already means "resolve on the
     /// volume executables live on". On the Pi those are two different statements — `/` is native
-    /// UnaFS and the executables are on `/boot` — so the faithful port is not the x86 code with the
+    /// UnaFS and the executables are on `/apps` — so the faithful port is not the x86 code with the
     /// mount swapped, it is [`exec_resolve`]: the cwd first (so `ls`/`cat`/`run` and a bare name
     /// agree about what a name means, VFS-1's whole point), then the program-source root. See
     /// `exec_resolve` for the order and why it is the same order.
@@ -4415,15 +4430,15 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
-            // exit status. Rides the SAME `MountTable` the `mount` verb uses (`/boot` = FAT boot partition,
-            // `/usb` = USB stick, `/` = native UnaFS), so `run /boot/ELFHELLO.ELF` loads the boot-partition
-            // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
+            // exit status. Rides the SAME `MountTable` the `mount` verb uses (`/boot` = the boot volume,
+            // `/apps` = its programs directory, `/usb` = USB stick, `/` = native UnaFS), so
+            // `run /apps/ELFHELLO.ELF` loads the staged fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
             // runs them under user mode + the fault-kill net. `run <path>`.
             //
             // X86RUN (GR20): also on x86, where the read side differs (there is no VFS namespace on
             // this arch) but nothing else does — see `read_el0_image`'s x86 twin for the path rules.
-            // `run /boot/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's root there.
+            // `run /apps/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's `APPS/` there.
             match args.first() {
                 None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
@@ -5125,7 +5140,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))] // NOT widened to `tegra_el0` with its neighbours, DELIBERATELY — the one process verb that is not. `storm` is the only arm reaching past the process table into board hardware: it reads `storm_slots` (= `arch::boot`, the BCM2711 slot pool; `arch::uslots` is the facade an Orin port would use) and spawns `storm_fat_writer`, which drives `BlockSource::Usb` and is `#[cfg(feature = "baremetal")]` with no arch arm at all. Whether the Orin gets a FAT-writer leg under storm is a HW-JETSON question about that board's storage, not a gate typo — left to that seat rather than guessed at here. Folded onto this line to stay line-neutral (PARITY.md 5.3).
         "storm" => {
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
-            // default 6, so an operator can raise a load storm without typing `bg /boot/VUG.ELF` six
+            // default 6, so an operator can raise a load storm without typing `bg /apps/VUG.ELF` six
             // times. Each launch is EXACTLY the bg path (same spawn, same job table, same messages);
             // this verb adds the loop and, since STORM-HEADROOM, the MEASUREMENT around the loop. It
             // still decides nothing about how a vug is spawned or where it is placed. Stops honestly
@@ -5222,10 +5237,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
             for _ in 0..n {
-                if !bg_program(console, "/boot/VUG.ELF") {
+                if !bg_program(console, "/apps/VUG.ELF") {
                     // `bg_program` has already said WHY, but not uniformly on this wire: a SPAWN
                     // refusal also prints `:: BGRUN: bg … rejected (…)` to serial, while an
-                    // IMAGE-READ failure (missing, empty or oversized /boot/VUG.ELF) is console-only.
+                    // IMAGE-READ failure (missing, empty or oversized /apps/VUG.ELF) is console-only.
                     // A serial-only capture would therefore be unable to tell the fleet ceiling from
                     // a bad card, which is exactly the confusion this arc exists to remove — so this
                     // line re-reads the census rather than pointing at a neighbour that may not be
@@ -5396,7 +5411,7 @@ fn parse_num(s: &str) -> Option<u64> {
 // truncate / unlink verbs. The shell is the trusted operator console, so it
 // writes as the kernel-authority principal (`KERNEL_PRINCIPAL`) — the same
 // posture the retired `u*` native verbs recorded. Namespace: native UnaFS at `/`, the FAT
-// boot partition at `/boot`, and the hot-plugged USB FAT stick at `/usb` when
+// boot volume at `/boot`, its programs directory at `/apps`, and the hot-plugged USB stick at `/usb` when
 // present (VFS-3, read-only). Both real backends are aarch64-only (the x86 build
 // has neither the unafs module nor a `VfsBackend for FatBackend` impl), so the
 // x86 arm is an honest "unsupported on this arch" line.
@@ -5404,10 +5419,10 @@ fn parse_num(s: &str) -> Option<u64> {
 /// EXEC-1 / X86RUN / VFSROUTE: read an ELF64 user image off the VFS namespace, or explain why not.
 ///
 /// **One body, both arches.** It used to be two: an aarch64 twin that went through the mount table
-/// and an x86 twin that mounted the program source and walked `fat.rs` itself, with the `/boot`
+/// and an x86 twin that mounted the program source and walked `fat.rs` itself, with the boot-volume
 /// prefix hand-rolled as a string rewrite because x86 "has no VFS namespace". x86 has one now — the
-/// mount table binds the program source at `/` and `/boot` — so the prefix is a real mount and both
-/// arches ask the same resolver. Every check that could say NO still says it, and each in the same
+/// mount table binds the program source at `/`, `/boot` and `/apps` — so the prefix is a real mount
+/// and both arches ask the same resolver. Every check that could say NO still says it, and each in the same
 /// words as before.
 ///
 /// Two things genuinely differ and stay `cfg`-split, because they are hardware facts and not
@@ -6054,23 +6069,29 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     true
 }
 
-/// BARENAME (PARITY §6.6a): the aarch64 program-source root — the namespace spelling of x86's
-/// "the volume executables live on".
+/// BARENAME (PARITY §6.6a) / LAYOUT (orin 18): **the program root — `/apps`, and it is a place,
+/// not an alias.**
 ///
-/// x86 has no VFS: its whole path universe is the program-source FAT, so there "resolve from the
-/// cwd" and "resolve on the volume executables live on" are the same sentence, and `/boot` is
-/// carried only as an alias for that one volume's root. On the Pi the two come apart — `/` is
-/// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
-/// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/boot`. This constant is
-/// that half of the x86 sentence, named rather than inlined.
-#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
-const EXEC_ROOT: &str = "/boot";
+/// Before LAYOUT this named the whole boot volume, because that is where the staging scripts
+/// dropped the images: a bare `vug` searched the volume root alongside `KERNEL8.IMG`,
+/// `CONFIG.TXT`, the firmware blobs and every fixture's scratch file. `/apps` is the directory
+/// `arroyo`, `builder` and `make-fat-img.sh` now stage `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/`VUGK.ELF`/
+/// `STAT.ELF`/`PULSE.ELF`/`ELFHELLO.ELF`/`HELLO.BIN` into (`fat::APPS_DIR` = `APPS` on the medium),
+/// bound at its own prefix by `vfs_mount_table` through [`FatBackend::rooted`].
+///
+/// **It is no longer aarch64-only, and that is a consequence of the move, not a tidy-up.** x86 had
+/// no second probe because its cwd already sat on the volume the executables lived in — "resolve
+/// from the cwd" and "resolve where programs live" were the same sentence. Putting the programs in
+/// a DIRECTORY breaks that identity on x86 exactly as it was already broken on the Pi, so both
+/// arches now reach a program by the same second probe off the same prefix.
+#[allow(dead_code)] // a build with no loader (no x86_64, no aarch64_el0) never resolves a program
+const EXEC_ROOT: &str = "/apps";
 
 /// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
 ///
 /// **Through the VFS seam, not a private path scheme.** [`vfs_path`] is what `ls`, `cat`, `run`,
 /// `bg` and `mount` resolve through, so a bare name means exactly what those verbs say it means —
-/// `cd /boot` then `vug` works for the same reason `cd /boot` then `cat VUG.ELF` works, and a name
+/// `cd /apps` then `vug` works for the same reason `cd /apps` then `cat VUG.ELF` works, and a name
 /// that `ls` cannot show is a name this cannot launch.
 ///
 /// Order, and it is x86's order transposed rather than a new policy:
@@ -6080,7 +6101,7 @@ const EXEC_ROOT: &str = "/boot";
 ///    would repeat probe 1. On x86 this step is not absent, it is *implied*: its cwd already sits
 ///    on the program source, so its single probe covers both. Dropping it on the Pi would mean the
 ///    operator at `/` still could not type `vug` — the exact defect §6.6a names, with `bg
-///    /boot/VUG.ELF` still the only way in — so it is the step that makes the port a port.
+///    /apps/VUG.ELF` still the only way in — so it is the step that makes the port a port.
 ///
 /// A directory never resolves: a bare name launches a program.
 #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
@@ -6156,16 +6177,24 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
         serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
         return None;
     }
-    let canon = vfs_path(name);
-    match mt.stat(&canon) {
-        Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir) =>
-            Some((String::from(name), canon)),
-        _ => {
-            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
-            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
-            None
+    // LAYOUT (orin 18): the same two probes the exec PROBE now makes, in the same order — the cwd,
+    // then [`EXEC_ROOT`]. Asked of the namespace here (the mount table is what `read_el0_image`
+    // will open through), so the path handed back is `/apps/VUG.ELF` and reaches `APPS/VUG.ELF` on
+    // the medium through the rooted mount.
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir));
+    let from_cwd = vfs_path(name);
+    if is_file(&from_cwd) {
+        return Some((String::from(name), from_cwd));
+    }
+    if !name.starts_with('/') {
+        let from_apps = normalize_path(EXEC_ROOT, name);
+        if from_apps != from_cwd && is_file(&from_apps) {
+            return Some((from_apps.clone(), from_apps));
         }
     }
+    console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+    serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+    None
 }
 
 /// BARENAME (PARITY §6.6a): the aarch64 twin — [`exec_resolve`] again (the same walk the probe
@@ -6354,7 +6383,13 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     {
         use crate::fs::vfs::NativeBackend;
         mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
-        mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points BOTH at the card's FAT through BlockSource::TegraSd (`/boot` too, because it is EXEC_ROOT and the literal prefix of /boot/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
+        mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+        // LAYOUT (orin 18): `/apps` is the SAME volume as `/boot`, rooted at its `APPS/` directory —
+        // so it carries `/boot`'s volume NAME, not a third one. A distinct name here would make
+        // `same_volume("/boot", "/apps")` answer false about one card, which is the aliasing defect
+        // (rmbp 15 C1) in a new spelling.
+        mt.mount("/apps", alloc::boxed::Box::new(
+            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points ALL THREE at the card's FAT through BlockSource::TegraSd (`/boot` and `/apps` too, because `/apps` is EXEC_ROOT and the literal prefix of /apps/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
         // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
         if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
             mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
@@ -6369,6 +6404,11 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
                 FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
             mt.mount("/boot", alloc::boxed::Box::new(
                 FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
+            // LAYOUT (orin 18): the programs' directory on that same volume, at its own prefix and
+            // under the SAME volume name (see the aarch64 arm's note on aliasing).
+            mt.mount("/apps", alloc::boxed::Box::new(
+                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)
+                    .rooted(crate::fs::fat::APPS_DIR)));
         }
     }
     mt

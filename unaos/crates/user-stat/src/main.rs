@@ -12,7 +12,7 @@
 // spawn->exit->reap and kill-mid-run legs on silicon. What it could NOT make operator-verifiable was the
 // WC-TAB window ring: the only windowed EL0 app was UVUG, and a BACKGROUNDED uvug is UNFOCUSED, so no HID
 // event ever reaches it, so it never leaves its deterministic auto path — 300 frames and gone. Two windows
-// flashed past before a hand could reach TAB. This program is the missing fixture: `bg /boot/STAT.ELF`
+// flashed past before a hand could reach TAB. This program is the missing fixture: `bg /apps/STAT.ELF`
 // twice puts two windows on the panel that STAY there, and TAB walks between them for as long as the
 // operator likes.
 //

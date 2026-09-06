@@ -932,7 +932,7 @@ fn run_storage_section(
     }
 
     // Known-file read: length + content sanity (READ-ONLY).
-    let de = match fs.find_in_root(KNOWN_FILE) {
+    let de = match fs.find_app(KNOWN_FILE) {
         Ok(de) => de,
         Err(_) => {
             report(

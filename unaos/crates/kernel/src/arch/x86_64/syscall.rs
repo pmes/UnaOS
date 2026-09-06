@@ -10286,7 +10286,7 @@ pub fn u2_probe_once() {
             return;
         }
     };
-    let de = match fs.find_in_root("HELLO.BIN") {
+    let de = match fs.find_app("HELLO.BIN") {
         Ok(de) => de,
         Err(_) => {
             serial_println!(":: U2: HELLO.BIN not found on the FAT volume — loader skipped ::");
@@ -10767,7 +10767,7 @@ fn stage_hello() -> bool {
         Ok(fs) => fs,
         Err(_) => return false,
     };
-    let de = match fs.find_in_root("HELLO.BIN") {
+    let de = match fs.find_app("HELLO.BIN") {
         Ok(de) => de,
         Err(_) => return false,
     };
@@ -16086,7 +16086,7 @@ fn u8_kernel_check() -> bool {
 // preemption boundary. So both `run` and `bg` spawn preemptible here.
 //
 // That is not a downgrade, it is the only correct choice: `STAT.ELF` has NO exit path by design ("runs
-// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /boot/STAT.ELF` would wedge
+// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /apps/STAT.ELF` would wedge
 // the shell task forever with no way back. Preemptible ring 3 (RFLAGS.IF set) is the proven U3.5 path,
 // and the scheduler's reap tears the address space down through `free_user_space_by_cr3` — which, since
 // WINX-1, also retires the task's compositor windows and drops its FB leaves. A killed windowed app
@@ -16930,7 +16930,7 @@ fn winx2_launcher(_demo_cpu: usize) {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root("STAT.ELF") else {
+    let Ok(de) = fs.find_app("STAT.ELF") else {
         // WINX-7 PKG — the message names the VOLUME, because the previous wording ("the boot volume")
         // was not merely vague, it was WRONG in the case that actually fired. `fat::mount()` binds the
         // global block device, which on x86 is always the USB mass-storage device xHCI enumerated;
@@ -18682,7 +18682,7 @@ fn winx8_launcher(_demo_cpu: usize) {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root("VUG.ELF") else {
+    let Ok(de) = fs.find_app("VUG.ELF") else {
         // The same volume-naming the WINX-2 skip carries, and for the same reason: on x86 the mounted
         // volume is the USB mass-storage device, never the UEFI boot volume, and staging into
         // `target/x86_64_esp/` alone puts the artifact where the running kernel has no path to it.
@@ -18820,7 +18820,7 @@ fn pulsew_launcher(_demo_cpu: usize) {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root("PULSE.ELF") else {
+    let Ok(de) = fs.find_app("PULSE.ELF") else {
         // The same volume-naming the WINX-2/8 skips carry, and for the same reason: on x86 the mounted
         // volume is the USB mass-storage device, never the UEFI boot volume.
         serial_println!(

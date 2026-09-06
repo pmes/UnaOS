@@ -3976,7 +3976,7 @@ fn input_router_selftest() {
     // keyboard-started run a suspended deadline at t≈0. (The consume edge itself needs a live user task, so it
     // is metal-only; this asserts the half QEMU can see.)
     let push_does_not_engage = sc::el0_takeover_active() == 0;
-    // UVUG-8r2 (b): STALE PRE-LAUNCH EVENTS ARE DISCARDED ON FOCUS. This is the metal `run /boot/VUG.ELF`
+    // UVUG-8r2 (b): STALE PRE-LAUNCH EVENTS ARE DISCARDED ON FOCUS. This is the metal `run /apps/VUG.ELF`
     // scenario in miniature: an event sits in EVENT_QUEUE from before the app existed (the Enter KeyUp that
     // launched it), then focus is granted. `user_input_set_active` must drain it, so the very next router pass
     // finds nothing to deliver — the app cannot mistake its own launch keystroke for in-app interaction.
@@ -6212,7 +6212,7 @@ fn desktop_owns_backdrop() -> bool {
 /// SHELLWIN — allocate the live SHELL's compositor-window surface and register its `wm` row.
 ///
 /// SHELLNOTDESK took the interactive shell off the desktop backdrop so the crispy scene owns the glass,
-/// but that left the operator with no shell to type `bg /boot/VUG.ELF` into — the keystroke path had no
+/// but that left the operator with no shell to type `bg /apps/VUG.ELF` into — the keystroke path had no
 /// backdrop console to reach. This gives the shell a WINDOW of its own: a kernel-owned managed row, the
 /// same machinery [`unaos_kernel::video::fbcon::panel_console_window_open`] mints for the frozen
 /// boot-log console, over a cached-RAM surface the render service drives a `Screen`/`Console` on.

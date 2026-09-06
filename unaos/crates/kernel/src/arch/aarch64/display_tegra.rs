@@ -2704,7 +2704,7 @@ pub fn orin_conwin() -> bool {
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 // ORIN-TENANT — rung 6 of the Orin desktop ladder. `orintenant`, DEFAULT OFF.
 //
-// EL0 WINDOW TENANTS: an EL0 program (`run /boot/VUG.ELF`) owns a compositor window through the
+// EL0 WINDOW TENANTS: an EL0 program (`run /apps/VUG.ELF`) owns a compositor window through the
 // arch-neutral SYS_WIN_* surface instead of the raw panel. The verbs themselves are NOT this rung's —
 // they are the shared WC-B implementation `arch/aarch64/syscall.rs` has carried since the Pi arc, and
 // they compile on this board under `tegra_el0` alone. What this rung adds is (a) the CRYSTAL-HD
