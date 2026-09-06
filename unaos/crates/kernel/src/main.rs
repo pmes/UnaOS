@@ -2896,7 +2896,7 @@ fn jd2_console_pump(_arg: usize) {
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
     if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch — from here the console owns the glass, so a cube repainted away is the design, not a defect, and the census says RAST-SUPERSEDED-BY-CONSOLE instead of RAST-PAINTED-OVERWRITTEN. Placed on the FIRST statement of phase 2 and outside the conwin guard: the console takes the panel on both routes, only the detach differs. ⚠ LINE-NEUTRAL append. // ORIN-CONWIN rung 4 — the detach is GUARDED BY THE ROUTE, exactly as the Pi's GUI handoff guards it (`main.rs`'s CONSWIN-PI line). `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the panel — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the ONE thing this detach exists to guarantee (exactly one writer on the panel while the JD2 Screen console owns it) is already true, and skipping it leaves the console window LIVE instead of freezing it with the boot log. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof.
-    let screen: &'static mut unaos_kernel::video::Screen = alloc::boxed::Box::leak(alloc::boxed::Box::new(unaos_kernel::video::Screen::new(front_fb))); let mut shellwin = tegra_shell_window_open(screen.width(), screen.height()); if shellwin.is_some() { screen.fill_screen(unaos_kernel::video::wm::DESKTOP_BG); } // APPPIN — the panel `Screen` is LEAKED (`Box::leak`): this pump never returns, so it lived for the boot already, and a `'static` panel pal is what lets the shell's pal be `'static` too — `TargetPal<'a>` is invariant behind `&mut`, so `tegra_shell_pick` unifies the two pals' lifetimes, and a shell pal that BORROWED `shellwin` would pin `shellwin` for the loop's life (E0506 on every quit/relaunch assignment). The mint takes `(pw, ph)` (a tile relaunch calls it with the panel `Screen` already borrowed by `pal`), and THE BAND CLEAR is this call site's: the scene's first paint, taken only when a window was minted (a decline leaves the panel to `console.draw`, which clears to the same colour). REALDESK-SHELLWIN (A19) — on the CASCADED scene (bar enabled AND console routed) the shell gets its own `wm` row here and the PANEL Screen is seeded `DESKTOP_BG`; `None` on every other boot (and knob-off, `#[inline(always)] None`), where the shell keeps the backdrop exactly as before. WHY: render4's SCREEN0.PNG carried this console's banner + prompt at the panel's top-left (y 46..89, x 12..495) — `console.draw` below clears the whole back buffer to `Console::BG` (== `wm::DESKTOP_BG`) and draws text, and `pal.render` flushed that through the occluder walk onto the desktop the cascade had just cleared (log order: `[deskcascade] -> CASCADED` THEN `JD2 — EL1 console pump live` THEN `JD4 — console OWNS the panel`). Not residue: a post-cascade repaint, every keystroke. ⚠ LINE-NEUTRAL fold. Helpers at file tail.
+    let screen: &'static mut unaos_kernel::video::Screen = alloc::boxed::Box::leak(alloc::boxed::Box::new(unaos_kernel::video::Screen::new(front_fb))); let mut shellwin = tegra_shell_window_open(screen.width(), screen.height()); if shellwin.is_some() { screen.fill_screen(unaos_kernel::video::wm::DESKTOP_BG); } tegra_boot_focus(&shellwin); // APPPIN — the panel `Screen` is LEAKED (`Box::leak`): this pump never returns, so it lived for the boot already, and a `'static` panel pal is what lets the shell's pal be `'static` too — `TargetPal<'a>` is invariant behind `&mut`, so `tegra_shell_pick` unifies the two pals' lifetimes, and a shell pal that BORROWED `shellwin` would pin `shellwin` for the loop's life (E0506 on every quit/relaunch assignment). The mint takes `(pw, ph)` (a tile relaunch calls it with the panel `Screen` already borrowed by `pal`), and THE BAND CLEAR is this call site's: the scene's first paint, taken only when a window was minted (a decline leaves the panel to `console.draw`, which clears to the same colour). REALDESK-SHELLWIN (A19) — on the CASCADED scene (bar enabled AND console routed) the shell gets its own `wm` row here and the PANEL Screen is seeded `DESKTOP_BG`; `None` on every other boot (and knob-off, `#[inline(always)] None`), where the shell keeps the backdrop exactly as before. WHY: render4's SCREEN0.PNG carried this console's banner + prompt at the panel's top-left (y 46..89, x 12..495) — `console.draw` below clears the whole back buffer to `Console::BG` (== `wm::DESKTOP_BG`) and draws text, and `pal.render` flushed that through the occluder walk onto the desktop the cascade had just cleared (log order: `[deskcascade] -> CASCADED` THEN `JD2 — EL1 console pump live` THEN `JD4 — console OWNS the panel`). Not residue: a post-cascade repaint, every keystroke. ⚠ LINE-NEUTRAL fold. Helpers at file tail. BOOT-FOCUS (SO14) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST (SO8). THE SHELL WINDOW IS THE LAST WINDOW THE BOOT MINTS, AND UNTIL THIS CALL NOTHING FOCUSED IT. `create_at` above already gives the row a fresh top-of-stack z, so the shell was FRONT from the instant it existed; what it never got was the KEYBOARD. The last focus call of the whole boot cascade is `quarry::open`'s own raise (`video/quarry/live.rs:1804`, reached from `desktop_firmware.rs:414`, step 6 of `activate()`), which lands ~8 s before this line — so after SO9FIX `63b109f6` gated `quarry::key_route` on `wm::focus_asid() == OWNER`, a boot-opened Quarry HELD Enter, Backspace and the arrows and the shell got none of them until the operator clicked the shell window (ledger SO14). Called UNCONDITIONALLY on the result, not from inside the `Some` arm, so a scene with no shell window says `-> NO-SHELL` on the wire instead of going quiet. `quarry::open()`'s own focus call is deliberately NOT touched: a Quarry the OPERATOR launches still comes to the front. Helper + knob-off twin at the file tail.
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&*screen);
     let mut pal = unaos_kernel::pal::TargetPal::new(screen);
@@ -10079,3 +10079,124 @@ fn x86_ptr_install(dx: i32, dy: i32) {
     #[cfg(feature = "wc")]
     PTRI_INSTALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
+
+// =================================================================================================
+// BOOT-FOCUS (tail block) — SO14: the SHELL window is front and FOCUSED at the end of the boot cascade.
+// =================================================================================================
+//
+// ## The finding (orin-ledger SO14, out of SO9FIX `63b109f6`)
+//
+// Peter's expectation of a rendered boot is that he sits down and types at the shell ("i cannot
+// launch apps from cmd line"). On render8 he could not: every keystroke went to Quarry.
+//
+// The cascade's focus order, end to end, is a single call. `desktop_firmware::activate()` mints the
+// console window (`desktop_firmware.rs:257`, `KERNEL_OWNER_CONSOLE`), enables the bar (`:312`), arms
+// the pulse window (`:393`) and opens Quarry (`:414`) — and of those four steps exactly ONE touches
+// focus: `quarry::open()` raises itself through `wm::focus_changed(OWNER)`
+// (`video/quarry/live.rs:1804`, and `:1675` on its already-open arm). So `tegra_desk_cascade` returns
+// with `FOCUS_ASID` naming Quarry, 0xffffff03. Roughly 8 s later the jd2 pump's phase 2 mints the
+// SHELL window (`tegra_shell_window_open`, `wm::create_at(KERNEL_OWNER_DESKTOP, …)`) and does not
+// call `focus_changed` at all.
+//
+// Before SO9FIX that was invisible: `quarry::key_route` gated on `on_glass()` alone, so it took
+// Enter/Backspace/arrows whether or not it held focus, and the defect was scored as Quarry's. SO9FIX
+// made the gate `wm::focus_asid() == OWNER && on_glass()` — correct, and it moved the whole question
+// here, because the answer to "who holds focus at boot?" was never written down: it fell out of the
+// open ORDER. Quarry opens last of the cascade's windows and raises; the shell is minted later and
+// does not. The boot therefore ended with the shell window FRONT (its `create_at` z is a fresh
+// top-of-stack allocation, `wm.rs:22134`) and NOT focused — front and deaf, which is the exact state
+// the operator reads as "the desktop ignores my keyboard".
+//
+// ## The rule this installs
+//
+// *At the end of the boot cascade the SHELL window is front and focused.* Quarry stays open and
+// stays on the glass (its dock tile lit); it simply does not hold the keyboard it was never given by
+// a person. A later click on Quarry focuses it exactly as today — `press_route`'s own
+// `wm::focus_changed(OWNER)` (`live.rs:2135`) is untouched, and so is `open()`'s, so an
+// operator-LAUNCHED Quarry still comes to the front. Only the BOOT-time order is decided here.
+//
+// ## Why this call site and not the tail of `tegra_desk_cascade`
+//
+// Because the witness has to name a window. At the end of `tegra_desk_cascade` the shell row does not
+// exist yet — the pump mints it ~8 s later — so a `focus_changed` there could only move `FOCUS_ASID`
+// to an ASID that owns nothing (`focus_changed` raises nothing in that case, by its own doc), and the
+// line would read `win=0` on every boot that works. Sited on the SHELL MINT, the call is the last
+// step of the boot's window sequence by construction: it runs after the last window is minted,
+// whatever order the earlier steps ran in, and it reports the id it focused.
+//
+// ## x86 — ONE OS, and nothing to change there
+//
+// The rule already holds on x86, and it holds for a reason rather than by luck. `desktop_uefi`'s
+// activation opens no file manager (`quarry::open()` has exactly one boot caller tree-wide,
+// `desktop_firmware.rs:414`, and `video/mod.rs:657` gates `pub mod desktop_firmware` on aarch64 only), and
+// the one thing x86 DOES launch at desktop-ready — `DESKTOP_APP` / STAT.ELF — is spawned into a slot
+// marked `SLOT_NO_AUTOFOCUS` (`arch/x86_64/syscall.rs:16315`/`:16347`) precisely so it cannot take
+// the focus the operator has not given it. So on x86 `FOCUS_ASID` is still 0 — the SHELL slot — when
+// `x86_render_service` mints its `KERNEL_OWNER_DESKTOP` shell window, and the shell has the keyboard.
+// No `video/` file is touched by this arc; the divergence was aarch64's alone.
+//
+// LINE-NEUTRAL: tail append (nothing is below it, so no panic `Location` moves), one same-line fold
+// at the call site.
+
+/// BOOT-FOCUS (SO14) — has the boot focus already been placed? One-shot: [`tegra_boot_focus`] is
+/// called from a `let` binding in a pump that never returns, so a second entry is a future
+/// call site rather than a boot event — and it must not be able to yank focus back to the shell out
+/// from under an operator who has since clicked somewhere else.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+static TEGRA_BOOT_FOCUS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// BOOT-FOCUS (SO14) — **give the SHELL window the front of the stack and the keyboard, once, at the
+/// end of the boot cascade.**
+///
+/// `wm::focus_changed(KERNEL_OWNER_DESKTOP)` and nothing else: the same single call the click path
+/// makes for this row (`orin_shell_reopen_drain`'s already-live arm, and the router's kernel-furniture
+/// arm `arch/aarch64/syscall.rs:14401`). It raises every row that owner holds above `SHELL_Z`,
+/// re-damages the loser so the focus highlight moves, and composites before it returns — so the
+/// change is on the glass at the seam rather than at the next event.
+///
+/// Not `focus_changed(0)`: that is the SHELL ARM, which parks every window below `SHELL_Z` — it would
+/// take the console window, the pulse window and Quarry off the glass at boot. The Orin's shell is a
+/// WINDOW (`KERNEL_OWNER_DESKTOP`), and focusing a window is what this needs to say.
+///
+/// `None` — the scene minted no shell window (`no-scene`, `alloc`, `geometry`: `tegra_shell_window_open`
+/// has already named which on the line above) — is `-> NO-SHELL` and NO focus change. There is no row
+/// to focus, and the alternatives are both wrong: `focus_changed(0)` would park the scene, and leaving
+/// Quarry focused is at least the state the operator can fix with one click.
+#[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
+fn tegra_boot_focus(win: &Option<TegraShellWin>) {
+    use core::sync::atomic::Ordering;
+    use unaos_kernel::video::wm;
+    if TEGRA_BOOT_FOCUS_DONE.swap(true, Ordering::AcqRel) {
+        serial_println!(
+            "[deskcascade] boot-focus REFUSE reason=already-placed held={:#x} (one-shot: the boot focus is placed once, and a second pass would pull focus back from wherever the operator has since put it)",
+            wm::focus_asid()
+        );
+        return;
+    }
+    let held = wm::focus_asid();
+    let Some(w) = win.as_ref() else {
+        serial_println!(
+            "[deskcascade] boot-focus target=shell asid={:#x} win={} held={:#x} -> NO-SHELL (this scene minted no shell window — the decline and its reason are on the line above — so there is no row to focus and focus is left exactly where the cascade put it)",
+            wm::KERNEL_OWNER_DESKTOP,
+            wm::WIN_NONE,
+            held
+        );
+        return;
+    };
+    wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
+    serial_println!(
+        "[deskcascade] boot-focus target=shell asid={:#x} win={} held={:#x} now={:#x} -> FOCUSED (SO14: the cascade's last focus call is quarry::open's own raise, ~8 s before this line, so the shell was minted front and DEAF — every Enter and Backspace bound by quarry::key_route. Quarry stays open and on the glass, unfocused; clicking it focuses it as before)",
+        wm::KERNEL_OWNER_DESKTOP,
+        w.id,
+        held,
+        wm::focus_asid()
+    );
+}
+
+/// BOOT-FOCUS (SO14) — the knob-off twin. Without `deskcascade` there is no scene and no shell row
+/// (`tegra_shell_window_open` is the `#[inline(always)] None` twin), so the folded call at the mint
+/// site emits zero instructions and the image is byte-identical.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
+#[inline(always)]
+fn tegra_boot_focus(_win: &Option<TegraShellWin>) {}
