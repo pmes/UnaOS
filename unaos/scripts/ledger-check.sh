@@ -130,6 +130,17 @@ if "docs/dev/LEDGER.md" in files:
     for _m in re.finditer(r"^-\s+\*\*([A-Z]+[0-9]+)\*\*", open("docs/dev/LEDGER.md").read(), re.M):
         ledger_ids.add(_m.group(1))
 
+def _check_ref(ref, where, rid, red, deferred, ledger_ids, files, STRICT):
+    """One home for the resolve/defer/red decision, so the TABLE scan and the BULLET scan below
+    cannot drift apart — two copies of this logic is how one of them silently stops matching."""
+    if "docs/dev/LEDGER.md" not in files or ref in ledger_ids:
+        return
+    pfx = re.match(r"([A-Z]+)", ref).group(1)
+    if pfx in ("SR", "SO", "SP") and not STRICT:
+        deferred.append(f"{where}: {rid} cross-ref → {ref} DEFERRED — {pfx} rows are branch-local; resolves when that seat's ledger lands (UNAOS_LEDGER_STRICT=1 to require it now)")
+    else:
+        red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
+
 rows_seen = 0
 for path in files:
     text = open(path).read(); ids = set()
@@ -170,6 +181,12 @@ for path in files:
             # is now a CONTRACT, not an accident: the UNICODE arrow below is a reference the gate
             # must resolve; an ASCII "->" is a mention and is invisible here. Cite fixtures and
             # examples with "->". pi 7 hit this by quoting this gate's own SP99 go-red fixture
+            # ⚠ CORRECTED 2026-09-06 (pi 7, on their own claim; this seat had propagated it): that
+            # SP99 sat in LEDGER.md's header, and until the fix above LEDGER.md's own refs were
+            # EXEMPT — so it would have passed silently, forever, not red-lined. The mention-vs-
+            # reference hazard is real and the arrow contract stands, but the incident that
+            # illustrated it did not actually fire. It fires NOW, which is the better reason to keep
+            # citing fixtures with "->": the exemption that made it inert is gone.
             # into a ledger header, where the sentence documenting the test became a failing
             # input to the test.
             # CROSS-BRANCH REFS ARE NOT DANGLING REFS (pi 7 found the collision, rmbp 13 settled it,
@@ -204,13 +221,22 @@ for path in files:
             # a merge all three seats' ledgers are in one tree, every seat-prefixed ref is resolvable,
             # and a typo that rode along for a week surfaces there -- at the one moment it can be
             # told apart from a legitimate cross-branch reference.
-            for ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", rowtext):
-                if "docs/dev/LEDGER.md" in files and ref not in ledger_ids and path != "docs/dev/LEDGER.md":
-                    pfx = re.match(r"([A-Z]+)", ref).group(1)
-                    if pfx in ("SR", "SO", "SP") and not STRICT:
-                        deferred.append(f"{where}: {rid} cross-ref → {ref} DEFERRED — {pfx} rows are branch-local; resolves when that seat's ledger lands (UNAOS_LEDGER_STRICT=1 to require it now)")
-                    else:
-                        red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
+            for ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", rowtext):  # see _check_ref below
+                # LEDGER.md'S OWN CROSS-REFS WERE NEVER RESOLVED (pi 7 found it, rmbp 13 fixed it,
+                # 2026-09-06). This condition used to carry `and path != "docs/dev/LEDGER.md"`, which
+                # exempted the over-arching ledger from the check every arch ledger is subjected to —
+                # the one file all three seats write to, and the one every arch ledger is resolved
+                # AGAINST. Proved by mutation on both trees, not by reading: `→ S777` injected into
+                # LEDGER.md passed at exit 0; the same ref in an arch ledger red at exit 1. Every
+                # `→ S<n>` written into LEDGER.md this session had been unchecked.
+                #
+                # The exemption was defensible when it was written: without seat prefixes there was no
+                # way to tell a self-reference from a cross-branch one, so resolving LEDGER.md would
+                # have red-lined legitimate refs to rows on other branches. `SR`/`SO`/`SP` plus the
+                # branch-triggered strict/deferred split solve exactly that, so the clause is now
+                # obsolete rather than load-bearing — a cross-branch ref from LEDGER.md defers like any
+                # other, and a dangling one reds like any other.
+                _check_ref(ref, where, rid, red, deferred, ledger_ids, files, STRICT)
             if "unaos-bench/scratch" in rowtext:
                 red.append(f"{where}: {rid} cites evidence outside git (unaos-bench/scratch)")
             for dp in re.findall(r"`?(docs/[A-Za-z0-9_./-]+\.md)", rowtext):
@@ -275,6 +301,22 @@ if os.path.exists("docs/dev/RULINGS.md"):
             if not tgt or any(t not in rids for t in tgt):
                 red.append(f"docs/dev/RULINGS.md:{ln}: {rid} is superseded but names no existing R<n> in superseded-by")
 
+# BULLET ROWS ARE ROWS TOO (pi 7's class, second half, 2026-09-06). The scan above walks TABLE rows,
+# so `docs/dev/LEDGER.md`'s protocol entries — `- **P14** — …` bullets, 15 of them — were never
+# scanned for cross-refs at all: a `→ S<n>` written inside a P-row has never been resolved. That is the
+# same shape as the two defects fixed today (a `→ P<n>` the resolver accepted but could never resolve;
+# LEDGER.md's own table refs exempted): **the id-space the gate accepts, the id-space it can resolve,
+# and the file-space it actually scans have to be the same three sets.** Routed through `_check_ref` so
+# this half and the table half cannot drift. Measured before enabling: the 15 bullets carry 2 refs, both
+# `→ SR1`, which resolves here and defers correctly on a branch without it.
+if "docs/dev/LEDGER.md" in files:
+    for _ln, _line in enumerate(open("docs/dev/LEDGER.md").read().split("\n"), 1):
+        _m = re.match(r"^-\s+\*\*([A-Z]+[0-9]+)\*\*", _line)
+        if not _m:
+            continue
+        for _ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", _line):
+            _check_ref(_ref, f"docs/dev/LEDGER.md:{_ln}", _m.group(1), red, deferred, ledger_ids, files, STRICT)
+
 for p in skipped: say(f"SKIP {p} — not in this tree (arrives at the trunk sync)")
 if rows_seen == 0:
     say("NO VERDICT — no ledger rows found in", files or "(no ledger files)"); sys.exit(2)
@@ -282,6 +324,11 @@ if deferred:
     say(f"DEFERRED — {len(deferred)} cross-branch cross-ref(s); NOT findings. Strict is {STRICT_WHY};"
         f" these become reds automatically when this lands on `{TRUNK}`:")
     for d in deferred: print("   ", d)
+# DEDUPE, for the reason f9255b68 deduped shas: a row citing the same missing id three times printed
+# three identical findings, and duplicate findings are how a gate teaches people to skim its output.
+# Order-preserving so the first occurrence still reads in file order.
+red = list(dict.fromkeys(red))
+deferred = list(dict.fromkeys(deferred))
 if red:
     say(f"RED — {len(red)} finding(s) across {len(files)} file(s), {rows_seen} rows:")
     for r in red: print("   ", r)
