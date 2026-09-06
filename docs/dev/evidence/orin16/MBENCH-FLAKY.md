@@ -52,3 +52,15 @@ Reading: the hits are the desktop's own cache/RAM verify (`[wc-d] verify … bad
 | k8t-baseline-3 (PASS) | 119/119 | no | 0 / 0 | 0 |
 
 Reading: (1) NOT pi's truncation family — five of six failing runs carry every REQUIRE line and reach the tail; the hits are content-bearing events from detectors that fired. (2) NOT the `wm.rs:4131` non-atomic read-back shape either — that instance is `bad_cache=0 bad_ram=144` (asymmetric); here `bad_cache == bad_ram` in four of five `[wc-d]` failures (91/91, 867/867, 6816/6816) and near-equal in the fifth (145/83), i.e. BOTH read-back passes disagree with the expected content by the same count, which reads as the expected region itself having changed under the verifier (a legitimate concurrent repaint landing before both reads, or a real intermittent race) — the window is load-widened either way. Three hypotheses stay open: host-load timing (QEMU), a non-atomic verify window hit by a legitimate write, a real race. The quiet-box run separates the first from the other two; the equal-counter signature separates this from `wm.rs:4131`. pi 7's spec asserts the same lines (`pi4-regression.spec:576-577`, `:952-954`), so this is a shared row (SO7), not an Orin one.
+
+## got/want discriminator (pi 7, second pass) — verifier-side, and the tree already names the shape
+
+| run | `[wc-d]` first bad | got | want | moved= |
+|---|---|---|---|---|
+| k8t-baseline-1 | (40,43) band 0..112 | 0x000000 | 0x050505 | — |
+| k8t-baseline-2 | (40,43) band 0..112 | 0x000000 | 0x111111 | — |
+| k8t-final-1 | (50,125) band 0..112 | 0x1b1b1b | 0x000000 | 851 |
+| k8t-final-2 | (40,43) band 0..112 | 0x000000 | 0x171717 | — |
+| k8t-patched-2 | (40,43) band 0..48 | 0x2d2b55 | 0x000000 | — |
+
+Every `got` is a legitimate frame colour, never garbage: `0x000000` = `BG_DEFAULT`, `0x1b1b1b` = an anti-aliased `FG_DEFAULT` edge over `BG_DEFAULT`, `0x2d2b55` = the desktop backdrop; the `want` greys (0x05/0x11/0x17/0x1b) are the console's anti-aliased text edges. `desktop_firmware.rs:147` already documents this exact pair (`got=0x1b1b1b want=0x000000`) as "a printing core repaints rows edge to edge … reading a panel this writer had just been over", and `wm.rs:6080` defines `moved=` as a reference that moved UNDER the verifier, counted instead of charged to the blit — `moved=851` on k8t-final-1 is the verifier reporting exactly that. Reading: the equal-count failures are the CONSOLE PRINTING CORE repainting the verified band after `want` was captured — the reference is stale, the memory is self-consistent, no kernel memory bug; host load widens the window (more console lines land inside the verify). `want` is not mis-computed (the pairs are real adjacent frames). CONSEQUENCES: the quiet-box run only removes the pressure and convicts nothing; the fix is verifier-side — quiesce the console writer or re-anchor `want` after the repaint (a re-read before verdict) — in the FIXTURE, not the kernel. The 145/83 run (k8t-baseline-1) is asymmetric and is NOT this shape; it stays a separate, unworked observation (4131's family or a third thing).
