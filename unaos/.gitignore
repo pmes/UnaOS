@@ -23,3 +23,7 @@ target
 # Build artifacts
 bios.img
 builder/bios.img
+
+# Peers import these scripts (orin 17 called parse_registry directly, 2026-09-06) and Python
+# writes the cache into whichever tree it imported from, not the caller's.
+__pycache__/
