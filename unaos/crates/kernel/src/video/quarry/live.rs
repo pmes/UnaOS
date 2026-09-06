@@ -1644,10 +1644,16 @@ pub fn is_open() -> bool {
 ///
 /// `wm` expresses "minimised" as a POSITION: the row's `z` drops below `SHELL_Z`, it stops
 /// compositing, and the dock is the way back. So [`is_open`] alone is the wrong question for the
-/// KEYBOARD — a parked Quarry that kept first refusal on arrows and `Esc` would be eating keys for a
+/// KEYBOARD — a parked Quarry that kept first refusal on arrows and `<Enter>` would be eating keys for a
 /// window the operator cannot see, which is the same defect in kind as typing into a hidden shell.
 /// The pointer needs no equivalent guard: `wm::hit_test` does not report a row that is not
 /// compositing, so [`press_route`] already declines a parked window by construction.
+///
+/// SO9: this is no longer the WHOLE keyboard gate, it is one conjunct of it. [`key_route`] binds a
+/// key only when Quarry also HOLDS FOCUS; being on the glass is necessary and was never sufficient.
+/// It is still asked, and still load-bearing, because [`close`] does not release focus — `FOCUS_ASID`
+/// can name [`OWNER`] with no row left to route to. The WHEEL keeps this as its only guard, for the
+/// reason [`key_route`]'s header gives.
 fn on_glass() -> bool {
     let id = WIN.load(Ordering::Relaxed);
     id != wm::WIN_NONE && wm::info(id).map(|i| i.z > wm::shell_z()).unwrap_or(false)
@@ -1878,34 +1884,72 @@ pub fn close() {
 
 /// Keyboard. Returns `true` when the key was CONSUMED.
 ///
-/// The contract is `video::instgui`'s, for its reason: while Quarry's window is open it takes first
-/// refusal on the keys it binds, and `Esc` closes it and hands the keyboard straight back. It never
-/// swallows a key it does not bind, so the console keeps working underneath for everything else.
-///
 /// Arrow keys arrive as the C0 codes the HID map assigns (`0x1C..=0x1F`, right/left/down/up) — the
 /// same bytes `una_abi::KEY_RIGHT`..`KEY_UP` publish to ring 3, decoded once in the driver.
+///
+/// ### SO9 — THE GATE IS FOCUS, NOT PRESENCE
+///
+/// This used to say: *"the contract is `video::instgui`'s — while Quarry's window is OPEN it takes
+/// first refusal on the keys it binds, and it never swallows a key it does not bind, so the console
+/// keeps working underneath for everything else."* The second clause is true and practically empty.
+/// `<Enter>` and `<Backspace>` are the two keys a line editor cannot work without, and they are both
+/// bound here — so an open-but-unfocused Quarry did not leave "the console working underneath", it
+/// left a console that could not run a command or erase a character. Measured on the Orin, render8
+/// 2026-09-06: Quarry was on the glass from boot (`desktop_firmware::activate` step 6) and stayed
+/// there for the whole session, so `<Enter>` at the shell opened a FILE for every keystroke of the
+/// flight, while `[wc-fv] focus raise asid=0xffffff01` says focus was on the CONSOLE for long
+/// stretches of it (`docs/dev/LEDGER.md` SO9).
+///
+/// The remedy is the desktop model Peter asked for — **keys go to the FOCUSED window only.** Quarry
+/// binds a key when `wm::focus_asid()` names [`OWNER`], and at no other time; unfocused, every key
+/// falls straight through to the drain that called us. Focus arrives the way it does on a Mac: the
+/// operator CLICKS the window ([`press_route`] raises through `wm::focus_changed(OWNER)`), or Quarry
+/// mints/raises its own window ([`open`]). Focus LEAVES the same way — a click on the console's
+/// content is `arch/aarch64/syscall.rs`'s SHELLWIN-PI arm (`focus_changed(owner)`), a click on the
+/// bare desktop is `focus_changed(0)`.
+///
+/// [`on_glass`] stays in the conjunction and is not redundant: [`close`] does not release focus, so
+/// `FOCUS_ASID` can still name [`OWNER`] after the window is gone.
+///
+/// ### R24 — `<Esc>` NO LONGER CLOSES QUARRY
+///
+/// The `if c == 0x1B { close(); return true; }` arm that stood here is RETRACTED BY RULING, not
+/// fixed: *"esc should not close any app windows"* (Peter, 2026-09-06, `docs/dev/RULINGS.md` R24).
+/// Esc dismisses MENUS ONLY, and it already does — `strip::key_escape` is asked AHEAD of this
+/// function in all three routers (`main.rs:2948`, `main.rs:4578`, `arch/x86_64/syscall.rs:6740`), so
+/// the modal surface still gets it first and a bare Esc with nothing down now falls past Quarry
+/// untouched. The close disc and the dock tile are the ways out of this window.
+///
+/// ### The WHEEL is deliberately NOT focus-gated
+///
+/// [`wheel_route`] resolves the pointer against `wm::hit_test` and scrolls the window UNDER THE
+/// CURSOR, which is the same desktop model this gate is enforcing for the keyboard — scroll-under-
+/// pointer is not focus theft, and the hit test already stops Quarry taking a detent that belongs to
+/// a window above it. Gating it on focus would delete a working gesture no defect asks about. It
+/// keeps the [`on_glass`] guard only, exactly as before.
 pub fn key_route(ev: crate::pal::Event) -> bool {
-    if !on_glass() {
-        return false;
-    }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
     // handed the whole `pal::Event` rather than a keycode and `arch/aarch64/syscall.rs` is a
     // byte-identity-critical file no arc may add a line to (PARITY.md §5.3). The name is a keyboard
     // noun and the event is not one; that trade is stated in [`wheel_route`] and in `quarry.md` §14
     // rather than paid for with an edit to the router. Asked BEFORE the `Event::Key` test for the
     // ordinary reason: the arm below would otherwise decline it and the wheel would fall through to
-    // the focus ring, which has no consumer for it either.
+    // the focus ring, which has no consumer for it either. SO9 keeps it on [`on_glass`] alone — see
+    // this function's header, §"The WHEEL is deliberately NOT focus-gated".
     if let crate::pal::Event::Wheel(d) = ev {
-        return wheel_route(d);
+        return on_glass() && wheel_route(d);
     }
     let crate::pal::Event::Key(c) = ev else {
         return false;
     };
-    // ESC is answered before the model lock: closing must work even if a directory read left the
-    // model in a state the rest of this function would rather not be in.
-    if c == 0x1B {
-        close();
-        return true;
+    // SO9 — the two facts, read once each, in the order that makes the witness readable.
+    let live = is_open();
+    let focused = wm::focus_asid() == OWNER;
+    if !(focused && on_glass()) {
+        if live {
+            key_witness(c, focused, false);
+        }
+        return false;
     }
     let mut acted = true;
     let mut refreshed = false;
@@ -1914,6 +1958,9 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else {
+            // Focused, on the glass, and no model — the close that is mid-flight. Declined, and said
+            // so on the wire: an unwitnessed decline here would read as the SO9 gate firing.
+            key_witness(c, true, false);
             return false;
         };
         match c {
@@ -2016,7 +2063,36 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if acted {
         repaint();
     }
+    key_witness(c, true, acted);
     acted
+}
+
+/// SO9 — the routed-key witness's line budget. A per-EVENT family on the input band, so it is capped
+/// the way every other one in the tree is (`CLOSE_LOG_MAX` in both `syscall.rs` files is the idiom):
+/// enough lines to score a whole bench sitting's worth of gestures, few enough that a stuck key
+/// cannot bury the capture the rest of the flight is read from.
+const KEY_LOG_MAX: usize = 96;
+static KEY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// SO9 — **one line per key this function was asked about while Quarry's window was live.**
+///
+/// `focus=1 took=0` is a bound key declined for a reason that is not focus (a close mid-flight);
+/// `focus=0 took=0` is the SO9 gate doing its job — the key is on its way to the shell drain;
+/// `focus=1 took=1` is Quarry consuming its own key. A capture that shows `focus=0 took=1` on any
+/// line is this fix regressed, which is the point of printing `took` beside `focus` rather than
+/// inferring one from the other.
+///
+/// Silent when the window is not live: a board with no file manager on the glass owes no line per
+/// keystroke, and the SO9 question is not being asked there.
+fn key_witness(c: u8, focus: bool, took: bool) {
+    if KEY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < KEY_LOG_MAX {
+        serial_println!(
+            "[quarry] key_route key={:#04x} focus={} took={}",
+            c,
+            focus as u8,
+            took as u8
+        );
+    }
 }
 
 /// Pointer press, in PANEL coordinates. Returns `true` when Quarry consumed it.
@@ -2929,8 +3005,14 @@ pub fn selftest() {
     }
 }
 
-/// QUARRYDOOR (KEYDOORS F1) — **<Esc> and an arrow reach Quarry through the SHELL DOOR, not through
-/// the seam.**
+/// QUARRYDOOR (KEYDOORS F1, then SO9/R24) — **an arrow reaches a FOCUSED Quarry through the SHELL
+/// DOOR, and `<Enter>`/`<Backspace>` reach the SHELL past an unfocused one.**
+///
+/// F1's original claim was reachability: `key_route` had one caller and it was the EL0 ring door.
+/// SO9 added the second half — reachability without a focus gate is key THEFT — and R24 deleted the
+/// escape hatch that made the theft survivable. Legs 3 and 4 below are those two, and they are the
+/// legs that GO RED on the pre-SO9 tree: leg 3 saw `Event::Unknown` for `<Enter>` (Quarry ate it) and
+/// leg 4 saw the window gone (Esc closed it).
 ///
 /// ### Which seam this drives, and why it is a different claim from [`selftest`]
 ///
@@ -2950,23 +3032,40 @@ pub fn selftest() {
 /// The other two doors F1 fixed are `main.rs` drain loops (`jd2_console_pump`,
 /// `pump_usb_into_gui`) — they are not functions a fixture can call, they only exist inside a running
 /// pump, and the aarch64 QEMU targets emulate no HID to feed one. Those two folds are scoreable only
-/// from a metal capture: `[quarry] closed win=…` following a `KEY 0x1b` in the transcript. This leg
-/// says so on the wire rather than reporting a silent PASS that covered one arch.
+/// from a metal capture, and SO9 gave that capture a better witness than the close line it used to
+/// name: every key `key_route` is asked about while the window is live now prints
+/// `[quarry] key_route key=0x.. focus=<0|1> took=<0|1>` ([`key_witness`]), so a bench seat scores the
+/// aarch64 doors by pairing each `KEY 0x..` echo with its route line — `focus=0 took=0` beside a
+/// shell keystroke is SO9 fixed, and any `took=1` with `focus=0` is SO9 back. This leg says so on the
+/// wire rather than reporting a silent PASS that covered one arch.
 ///
 /// ### Legs
 ///
-/// 1. `open` — Quarry is on the glass (`on_glass()`, i.e. a live row ABOVE `wm::shell_z()`).
+/// 1. `open` — Quarry is on the glass (`on_glass()`, i.e. a live row ABOVE `wm::shell_z()`) AND
+///    holds focus, because [`open`] raises through `wm::focus_changed(OWNER)`.
 ///    A DECLINE is a SKIP, not a FAIL: at 640x480 `open()` refuses by design so the pixel-exact video
 ///    battery is unperturbed, and that refusal is not this fixture's defect.
-/// 2. `arrow` — `wc_route_event(Key(0x1E))` is CONSUMED (`Event::Unknown`) while Quarry is open.
+/// 2. `arrow` — `wc_route_event(Key(0x1E))` is CONSUMED (`Event::Unknown`) while Quarry is FOCUSED.
 ///    Down-arrow, the key that fell through to `handle_key` on every board before F1.
-/// 3. `esc` — `wc_route_event(Key(0x1B))` is consumed AND the window is gone: `is_open()` false and
-///    `wm::info(win)` `None`. `close()` prints `[quarry] closed win=N paints=N` immediately above this
-///    line, which is the close witness a capture is scored on.
-/// 4. `shut` — THE CONTROL, and the leg that makes leg 2 mean something. With Quarry closed,
-///    `key_route(Key(0x1E))` must return FALSE: `on_glass()` is the guard that stops a closed file
+/// 3. `enter_blind` — **SO9, and the leg this fixture exists for now.** Focus is handed to the
+///    console owner (`wm::focus_changed(KERNEL_OWNER_CONSOLE)`, which raises the console's rows and
+///    leaves `SHELL_Z` alone, so Quarry is STILL ON THE GLASS — asserted, not assumed), and then
+///    `wc_route_event(Key(b'\r'))` must come back UNCHANGED. That is a shell `<Enter>` reaching the
+///    drain past an open file manager: the exact gesture that opened a FILE for the whole of the
+///    Orin's render8 flight. Backspace (`0x08`) is asserted in the same breath, because the two
+///    together are what a line editor cannot work without.
+/// 4. `esc_keeps` — **R24.** With focus handed back to Quarry, `wc_route_event(Key(0x1B))` must come
+///    back UNCHANGED and the window must still be there. Esc dismisses menus only; the `close()` arm
+///    that used to sit in `key_route` is retracted by ruling, and this leg is the tripwire against a
+///    reader restoring it (`docs/dev/RULINGS.md` R24).
+/// 5. `shut` — THE CONTROL, and the leg that makes leg 2 mean something. With Quarry closed,
+///    `key_route(Key(0x1E))` must return FALSE: `on_glass()` is the conjunct that stops a closed file
 ///    manager stealing the shell's arrows, and a fixture that only ever tested the open case could not
 ///    tell a working guard from a missing one.
+///
+/// Focus is snapshotted at entry and restored at exit, the discipline `winmenu::selftest` and
+/// `dock`'s fixture already keep: a witness that leaves `FOCUS_ASID` naming a row it invented is a
+/// witness that changes the boot it was measuring.
 #[cfg(feature = "witness")]
 pub fn door_selftest() {
     use core::sync::atomic::AtomicBool;
@@ -2977,42 +3076,61 @@ pub fn door_selftest() {
     #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
     {
         serial_println!(
-            ":: QUARRYDOOR: this arch's shell doors are main.rs drain loops (jd2_console_pump, pump_usb_into_gui) — not callable from a fixture, and no HID is emulated to drive one; score them from a metal capture as `[quarry] closed win=` after a `KEY 0x1b` :: SKIP ::"
+            ":: QUARRYDOOR: this arch's shell doors are main.rs drain loops (jd2_console_pump, pump_usb_into_gui) — not callable from a fixture, and no HID is emulated to drive one; score them from a metal capture by pairing each `KEY 0x..` echo with its `[quarry] key_route key= focus= took=` line (SO9: focus=0 took=0 is a key on its way to the shell; focus=0 took=1 anywhere is SO9 back) :: SKIP ::"
         );
     }
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     {
+        // Snapshot BEFORE the first `open()`, which raises through `focus_changed(OWNER)`.
+        let saved_focus = wm::focus_asid();
         if is_open() {
             close();
         }
         open();
         if !is_open() {
+            wm::focus_changed(saved_focus);
             serial_println!(
                 ":: QUARRYDOOR: quarry declined to open — see the `[quarry] DECLINE reason=` line above (640x480 refuses by design) :: SKIP ::"
             );
             return;
         }
         let win = WIN.load(Ordering::Relaxed);
-        let leg_open = on_glass();
-        // Leg 2 — an ARROW, through the door.
+        let leg_open = on_glass() && wm::focus_asid() == OWNER;
+        // Leg 2 — an ARROW, through the door, while Quarry is FOCUSED.
         let arrow = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1E));
         let leg_arrow = leg_open && matches!(arrow, crate::pal::Event::Unknown);
-        // Leg 3 — <Esc>, through the same door. This is the gesture that had no way home.
+        // Leg 3 (SO9) — focus to the CONSOLE, Quarry still on the glass, and the shell's two
+        // indispensable keys must come back UNCHANGED. `KERNEL_OWNER_CONSOLE` and not the shell slot
+        // `0`: the `asid == 0` arm of `focus_changed` gives `SHELL_Z` a fresh z, which would park
+        // Quarry and let `on_glass()` pass this leg for the wrong reason. `still_glass` is asserted
+        // so the leg can only be green because FOCUS declined the key.
+        wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+        let still_glass = on_glass();
+        let enter = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(b'\r'));
+        let bsp = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x08));
+        let leg_blind = still_glass
+            && !matches!(enter, crate::pal::Event::Unknown)
+            && !matches!(bsp, crate::pal::Event::Unknown)
+            && is_open();
+        // Leg 4 (R24) — focus back to Quarry, and <Esc> must NOT close it.
+        wm::focus_changed(OWNER);
         let esc = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1B));
-        let leg_esc = matches!(esc, crate::pal::Event::Unknown)
-            && !is_open()
-            && wm::info(win).is_none();
-        // Leg 4 — the control: a CLOSED Quarry consumes nothing.
+        let leg_esc_keeps = !matches!(esc, crate::pal::Event::Unknown)
+            && is_open()
+            && wm::info(win).is_some();
+        // Leg 5 — the control: a CLOSED Quarry consumes nothing.
+        close();
         let leg_shut = !key_route(crate::pal::Event::Key(0x1E));
         // Restore: if a red leg left the row standing, take it back rather than leaving a file
-        // manager on the operator's desktop.
+        // manager on the operator's desktop — and give the focus owner back whatever held it.
         if wm::info(win).is_some() {
             close();
         }
-        let ok = leg_open && leg_arrow && leg_esc && leg_shut;
+        wm::focus_changed(saved_focus);
+        let ok = leg_open && leg_arrow && leg_blind && leg_esc_keeps && leg_shut;
         serial_println!(
-            ":: QUARRYDOOR: win={} seam=arch::x86_64::syscall::wc_route_event on_glass={} arrow_consumed={} esc_closes={} closed_consumes_nothing={} :: {} ::",
-            win, leg_open, leg_arrow, leg_esc, leg_shut,
+            ":: QUARRYDOOR: win={} seam=arch::x86_64::syscall::wc_route_event focused_on_glass={} arrow_consumed={} unfocused_enter_bsp_pass={} esc_keeps_window={} closed_consumes_nothing={} :: {} ::",
+            win, leg_open, leg_arrow, leg_blind, leg_esc_keeps, leg_shut,
             if ok { "PASS" } else { "FAIL" }
         );
     }

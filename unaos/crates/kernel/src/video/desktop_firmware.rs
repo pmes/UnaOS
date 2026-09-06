@@ -393,7 +393,7 @@ pub fn activate() -> bool {
     {
         super::quarry::open();
         serial_println!(
-            "[pidesk] quarry open={} — the file manager is a desktop tenant (arrows/Enter/Backspace move, Esc closes, the dock's pinned tile reopens)",
+            "[pidesk] quarry open={} — the file manager is a desktop tenant (arrows/Enter/Backspace move it ONLY WHILE IT HOLDS FOCUS — SO9; click it to focus, click the console to hand the keyboard back; Esc dismisses menus only and never closes a window — R24; the close disc and the dock's pinned tile are the way out and back)",
             super::quarry::is_open()
         );
     }
