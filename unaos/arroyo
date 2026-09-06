@@ -3588,6 +3588,46 @@ KERNEL_CFG_MATRIX=(
   # are every one of them unchanged. Board legs +1 (30 -> 31); gate +1.
   "arm-tegra-supstate-el0-click ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,supstate,orinclick"
 
+  # KEYDOORS F2 (appended 2026-09-06) — the `supstate` x `desktop_firmware` cross, compiled by NO leg.
+  # The FIFTH hole of the ORIN10-LEGHOLES class, and the one KEYDOORS F2's fix would otherwise have
+  # walked straight into.
+  #
+  # THE HOLE, ENUMERATED not assumed. Split the third field of every KERNEL_CFG_MATRIX row on commas:
+  # `supstate` appears on exactly five rows (`arm-tegra-supstate`, `-el0`, `-el0-click`,
+  # `-el0-smpmark`, plus `arm-tegra-orinrx`/`-tcurx` which carry it), `desktop_firmware` on twelve,
+  # and the two sets are DISJOINT. Cargo closes nothing: nothing in `[features]` implies `supstate`,
+  # and `build_cfg_legs` emits `x86-mix-*` only, so no derived leg sweeps an aarch64 combination up.
+  #
+  # WHY IT MATTERS NOW. KEYDOORS F2 folds the shell key-door chain — `strip::key_escape` ->
+  # `quarry::key_route` -> `wc_shell_focus_key` — into `jd2_supstate_phase2`'s key drain (main.rs
+  # :7619), which had NONE of the three. The first two are `#[cfg(feature = "desktop_firmware")]`
+  # inside a function that is itself `#[cfg(all(tegra, aarch64, supstate))]`. Without this row those
+  # two calls are compiled by NOTHING: every green leg either erases the attribute (no
+  # `desktop_firmware`) or erases the whole function (no `supstate`), which is a fix wearing a green
+  # verdict — the exact failure ORIN10-LEGHOLES was minted to stop. The standing law is that a
+  # cfg-widen's gates must compile the configuration the widen turns on, IN THE MATRIX, where every
+  # future gate re-runs it, not in an operator-run check that binds no later edit.
+  #
+  # HOSTED ON `arm-tegra-desk`'s LIST VERBATIM + `supstate` (equivalently `arm-tegra-supstate-el0` +
+  # `desktop_firmware,livecon,quarry`). `quarry` is included and is not optional: with the knob off,
+  # `video/quarry.rs`'s seam is `#[inline(always)] false`, so the leg would compile a STUB and prove
+  # nothing about `key_route`'s real signature — the vacuity this row exists to prevent.
+  # `arm-tegra-supstate` and `-el0` stay as the furniture-less twins; both remain buildable shapes.
+  #
+  # NON-VACUITY, MEASURED not argued (2026-09-06, KEYDOORS-FIX): the name inside the
+  # `desktop_firmware`-gated `quarry` fold at main.rs:7619 was replaced with an undefined one and the
+  # three legs re-run directly. Result: RED arm-tegra-supstate-el0-desk, GREEN arm-tegra-supstate-el0
+  # (no `desktop_firmware`, so the attribute erases the statement), GREEN arm-tegra-desk (no
+  # `supstate`, so the whole function erases). Probe reverted. Only this combination sees it, which is
+  # what "not vacuous" has to mean. Reproduce: ~/unaos-bench/scratch/orin16/keydoors-fix/vacuity-probe.sh
+  #
+  # UNIVERSE SIDE EFFECT: none. Every knob named here is already named by other arm-* legs
+  # (`supstate` by five, `desktop_firmware`/`livecon`/`quarry` by twelve, `tegra_el0` by many), so the
+  # feature table, the board union, the unnamed-knob set, `x86_cfg_universe` and the derived mix-leg
+  # count are all unchanged. Board legs +1 (40 -> 41, counted from the runner's own banner, not from
+  # the prose figures above — those are older and were not re-derived here); gate +1.
+  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate"
+
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
   # the ARMED polarity would be compiled by NOTHING — the tegra_el0 / simmer_test / xusbfw / smpmark /

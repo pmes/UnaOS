@@ -7510,8 +7510,8 @@ fn tegra_conwin_live() -> bool {
 /// is reconstructed per lock scope via its public `surface` field — `TargetPal::new` is called
 /// exactly once, below, so the armed boot carries the same single `:: UI1:` line the baseline does.
 ///
-/// WHAT IS DELIBERATELY THE SAME: the drive loop below is the legacy pump's phase-2 loop, clause
-/// for clause (xHCI poll, coalesced pointer drain, save-under cursor bracket, ~250 ms sweep cadence
+/// WHAT IS DELIBERATELY THE SAME: the drive loop below is the legacy pump's phase-2 loop, clause for clause — a claim that was FALSE from TABKEY until KEYDOORS F2 restored it (this clone predates the key-door folds and carried NONE of them), so it is now load-bearing: a fold added at :2948 is OWED HERE TOO, and this sentence is the drift detector that must catch the next one
+/// for clause (the key-door chain `strip::key_escape` -> `quarry::key_route` -> `wc_shell_focus_key` in that order, xHCI poll, coalesced pointer drain, save-under cursor bracket, ~250 ms sweep cadence
 /// with the census on the same counter phase 1 advanced, `yield_now` — never `sleep_ticks`, the JC3
 /// rule: this core's terminus drains no sleepers). Behavioural falsifier: the `[orinclick]` census
 /// and the `:: tegra: JD2 —` transcript, which must read identically knob-on vs knob-off.
@@ -7616,7 +7616,7 @@ fn jd2_supstate_phase2(
                 match ev {
                     Event::Key(c) => {
                         // Cannot fail: the seam's bound was checked before the pop above.
-                        let _ = unaos_kernel::arch::display_tegra::sup_key_push(c);
+                        #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } let _ = unaos_kernel::arch::display_tegra::sup_key_push(c); // SUPDOOR (KEYDOORS F2) — THIS WAS A WHOLE SHELL DOOR WITH NO INTERCEPTION AT ALL. `jd2_supstate_phase2` is `jd2_console_pump`'s phase 2 with the surface lifted out of task-local storage, and it was cloned from the legacy pump BEFORE TABKEY and BEFORE A10. Neither `strip::key_escape` nor `wc_shell_focus_key` appeared anywhere in it or in `jd2_supstate_dispatcher`: `git grep -n` for either name in main.rs returned only :2948, :4524 and :4578/:4579. So on a `feature = "supstate"` Orin image A10, TABKEY and F1 were all three undone — <Esc> could not dismiss a menu, <TAB> could not cycle focus, and Quarry ate nothing — while the legacy pump three thousand lines up had all three. Latent rather than live only because the knob is default-off; the day supstate becomes the boot path it re-opens every one of them at once. THE CALL GOES HERE AND NOT IN THE DISPATCHER, and that is forced, not chosen: these three seams take a whole `pal::Event`, and `jd2_supstate_dispatcher` (:7681) is handed a bare `u8` through `sup_key_push`/`sup_key_pop` — by the time the dispatcher sees a keystroke the event is gone. This drain is the last place `ev` still exists. Ordered strip -> quarry -> focus ring, the same order :2948 carries and the same order both arch routers use. `continue` continues THIS `while`, dropping a consumed key before it reaches the seam's ring, which is what the legacy pump's `continue` does with the same events. No discard accounting is owed: these come off the COUNTED `next_event`, as at :4578 and unlike the uncounted peek at :4524. ⚠ FOLDED onto the `let`, CODE BEFORE COMMENT per F0's rule.
                     }
                     Event::Mouse { x, y } => {
                         let (ax, ay) = pending_rel.unwrap_or((0, 0));
