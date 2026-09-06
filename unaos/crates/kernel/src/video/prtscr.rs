@@ -77,6 +77,33 @@
 //!     exists for is a write aimed at the BOOT VOLUME silently landing on whatever claimed the
 //!     global slot. This rung aims at the stick BY NAME — the operator's own carry-away medium,
 //!     which is exactly where a screenshot belongs — and the global slot's veto stands untouched.
+//!
+//! ## One capture at a time, and the wire names every state (PRTSCR2)
+//!
+//! A capture is seconds of work — on the Orin, 1920x1200 encodes and writes 6.9 MB over USB BOT in
+//! ~7.9 s (render3b, `[pstrip] gapmax=7894ms`) — and the FAT write is crash-consistent in exactly
+//! one direction: `write_grow` publishes the directory entry's size LAST (`fs/fat.rs`, "SAFE
+//! ORDER"), so a boot cut mid-write leaves the entry `create_in_dir` made at its original 0 bytes.
+//! That 0-byte `SCREEN<n>.PNG` is therefore not a mystery file but the interrupted-write signature,
+//! and this module's job is to make sure the wire has already NAMED that file before the entry can
+//! exist. Three rules follow:
+//!
+//!  * **`capture` announces before it commits.** The `-> capturing` line prints after the name is
+//!    chosen and before a pixel is read, so every capture the wire sees ends in exactly one of
+//!    `-> OK`, a `— capture skipped` refusal, or nothing after `-> capturing` — and the last one
+//!    means the boot ended inside the capture, which the operator can then read off the log.
+//!  * **One capture at a time.** [`IN_FLIGHT`] is taken at the door of [`capture`] and released on
+//!    every exit path. The Print Screen key and the `screenshot` verb reach `capture` from different
+//!    tasks (the device-service pass and the console), and `next_free_name` -> `create_in_dir`
+//!    cannot de-duplicate across two concurrent callers — both would choose the same free index.
+//!    A caller that finds the door taken gets [`Refusal::InFlight`], a named refusal on the wire.
+//!  * **A press during a capture is deferred, not dropped.** The xHCI event ring is drained by the
+//!    same `drain_event_ring_once` whether `poll_events` or the synchronous BOT pump is running, so
+//!    the keyboard's press edge is decoded — and [`request`] runs — from INSIDE the storage write of
+//!    the capture already in flight. [`service`] cleared [`PENDING`] before starting that capture,
+//!    so the press re-arms it and the next service pass runs the second capture. Should `service`
+//!    itself ever meet the door taken (a verb capture on the console task), it re-arms `PENDING`
+//!    and says so once; the request is serviced when the door opens.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -120,6 +147,17 @@ static CAPTURES: AtomicU32 = AtomicU32::new(0);
 /// PRTSCR — capture attempts that ended in a refusal (no volume, read-only, full, I/O).
 static REFUSALS: AtomicU32 = AtomicU32::new(0);
 
+/// PRTSCR2 — the capture door: `true` while a [`capture`] is running on ANY task. Taken by
+/// compare-exchange at the top of `capture`, released on every exit path (one release site, after
+/// the inner body returns). See the module note: two callers past `next_free_name` at once would
+/// both take the same free index and `create_in_dir` would make two entries with one name.
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// PRTSCR2 — `service` has already said "deferred: capture in flight" for the request it is
+/// holding. One line per deferral episode, not one per 250 ms sweep: cleared whenever a capture
+/// reaches a verdict through `service`.
+static DEFERRED_SAID: AtomicBool = AtomicBool::new(false);
+
 /// PRTSCR — `(requests, captures, refusals)`.
 pub fn census() -> (u32, u32, u32) {
     (
@@ -149,11 +187,14 @@ pub fn service() {
         return;
     }
     // Clear BEFORE the work, not after: a press that lands mid-capture should arm the NEXT one
-    // rather than be swallowed by our own clear.
+    // rather than be swallowed by our own clear. (On the Orin that press is decoded from INSIDE
+    // this capture's own storage write — see the module note — and this clear-first order is
+    // what makes it a second capture instead of a lost one.)
     PENDING.store(false, Ordering::Relaxed);
     match capture() {
         Ok(shot) => {
             CAPTURES.fetch_add(1, Ordering::Relaxed);
+            DEFERRED_SAID.store(false, Ordering::Relaxed);
             serial_println!(
                 ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
                 shot.name,
@@ -162,8 +203,18 @@ pub fn service() {
                 shot.bytes
             );
         }
+        // PRTSCR2: the door is held by another task's capture (the `screenshot` verb). Not a
+        // refusal of the request — it is re-armed and runs on the first pass after the door opens.
+        // Said once per episode so a 7 s verb capture does not print 28 copies of the same line.
+        Err(Refusal::InFlight) => {
+            PENDING.store(true, Ordering::Relaxed);
+            if !DEFERRED_SAID.swap(true, Ordering::Relaxed) {
+                Refusal::InFlight.report();
+            }
+        }
         Err(why) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
+            DEFERRED_SAID.store(false, Ordering::Relaxed);
             why.report();
         }
     }
@@ -197,6 +248,9 @@ pub enum Refusal {
     Fat(&'static str, FatError),
     /// The write was accepted but short: `(name, written, wanted)`.
     Short(String, usize, usize),
+    /// PRTSCR2 — another task's capture holds the door ([`IN_FLIGHT`]). The verb reports it and
+    /// stops; [`service`] re-arms the request and runs it once the door opens.
+    InFlight,
 }
 
 impl Refusal {
@@ -240,6 +294,9 @@ impl Refusal {
                 ":: PRTSCR: {} short write {} of {} bytes — capture INCOMPLETE ::",
                 name, written, wanted
             ),
+            Refusal::InFlight => serial_println!(
+                ":: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::"
+            ),
         }
     }
 
@@ -263,6 +320,9 @@ impl Refusal {
             Refusal::Fat(what, e) => alloc::format!("screenshot: {}: {} ({:?})", what, fat_errno(*e), e),
             Refusal::Short(name, written, wanted) => {
                 alloc::format!("screenshot: {}: short write {} of {} bytes", name, written, wanted)
+            }
+            Refusal::InFlight => {
+                String::from("screenshot: a capture is already in flight — retry after its verdict")
             }
         }
     }
@@ -368,9 +428,27 @@ fn next_free_name(fs: &FatFs) -> Result<String, Refusal> {
 
 /// PRTSCR — **capture the panel and write it to the volume root as a PNG.** Task context only.
 ///
+/// PRTSCR2: the door. One capture at a time on the whole machine — the body is [`capture_inner`],
+/// and [`IN_FLIGHT`] is released HERE, after it returns, whichever of its exits it took. A second
+/// caller is told [`Refusal::InFlight`] and is never let past `next_free_name`, which is the only
+/// point at which two captures could choose one name.
+pub fn capture() -> Result<Shot, Refusal> {
+    if IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(Refusal::InFlight);
+    }
+    let verdict = capture_inner();
+    IN_FLIGHT.store(false, Ordering::Release);
+    verdict
+}
+
+/// The capture proper, under the door [`capture`] holds.
+///
 /// Order is chosen so the cheap refusals come first: the panel and the volume are settled before a
 /// single pixel is read or a single byte allocated, so "there is nowhere to put it" costs nothing.
-pub fn capture() -> Result<Shot, Refusal> {
+fn capture_inner() -> Result<Shot, Refusal> {
     // 1. The panel — through the sanctioned door, and only for the HANDLE. See the module note.
     let panel = crate::video::panel_snapshot().ok_or(Refusal::NoPanel)?;
     if !panel.is_ready() {
@@ -388,9 +466,17 @@ pub fn capture() -> Result<Shot, Refusal> {
     // 3. A name nothing else owns.
     let name = next_free_name(&fs)?;
 
+    // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is one
+    // of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture — and the
+    // last one is what a `SCREEN<n>.PNG` at 0 bytes means (`write_grow` publishes size LAST).
+    let need = PngEncoder::encoded_len(width, height).unwrap_or(0);
+    serial_println!(
+        ":: PRTSCR: {} {}x{} -> capturing ({} bytes reserved; the verdict line follows — a boot cut before it leaves the entry at 0 bytes) ::",
+        name, width, height, need
+    );
+
     // 4. Encode. `PngEncoder::new` reserves the whole output up front, so an allocator refusal
     //    arrives here — before any pixel is read — rather than halfway down the screen.
-    let need = PngEncoder::encoded_len(width, height).unwrap_or(0);
     let mut enc = PngEncoder::new(width, height)
         .map_err(|e| Refusal::Encode(e, width, height, need))?;
     let mut row: Vec<u8> = Vec::new();

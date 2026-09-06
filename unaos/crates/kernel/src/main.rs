@@ -8253,6 +8253,24 @@ fn tegra_stk_anchor() {
 #[cfg(all(target_arch = "aarch64", feature = "orinrender"))]
 static ORINRENDER_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// DESKSCENE — **is the cascaded desktop SCENE on the panel?** The render pass's one predicate for
+/// retiring the legacy backdrop tenants (`ui_status`'s LED band + status line) and for servicing the
+/// pulse window; read at arm (printed) and once more at the head of the pass (acted on).
+///
+/// It is the cascade's own CASCADED readback restated — `bar=1` (`menubar::enabled()`, the one step
+/// of `activate` with no decline arm) AND `route=ROUTED` (`fbcon::console_is_routed()`: the console
+/// lives in its own `wm` row and is no longer the wallpaper) — behind the `deskcascade` cfg, so a
+/// board that reached the same two facts through the partial seams (`orinfurn` + `orinconwin`) keeps
+/// its strip: the Pi's rule (main.rs SHELLWIN-PI fold) is that the instrument stays wherever the
+/// shell still owns the backdrop, and the brief's scope is the CASCADE path. Runtime reads, never
+/// `cfg!()` proxies — an image can carry the knob and still have `activate` decline at its floors.
+#[cfg(all(target_arch = "aarch64", feature = "orinrender"))]
+fn orin_desk_scene_up() -> bool {
+    cfg!(feature = "deskcascade")
+        && unaos_kernel::video::menubar::enabled()
+        && unaos_kernel::video::fbcon::console_is_routed()
+}
+
 /// ORINRENDER — evaluate the floors on the tegra terminus and spawn the render pass.
 ///
 /// Returns whether the service was spawned. Every decline is NAMED on the wire: a silent `false`
@@ -8268,13 +8286,14 @@ fn tegra_render_arm() -> bool {
     // falsifiable rather than trusted. That distinction is not pedantry here: `orinconwin` shipped a
     // `live=LIVE` that was a compile-time literal and would have printed LIVE whatever the route did.
     serial_println!(
-        "[orinrender] arm conwin={} furn={} tenant={} click={} desk={} cascade={} (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1)",
+        "[orinrender] arm conwin={} furn={} tenant={} click={} desk={} cascade={} scene={} (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)",
         cfg!(feature = "orinconwin") as u8,
         cfg!(feature = "orinfurn") as u8,
         cfg!(feature = "orintenant") as u8,
         cfg!(feature = "orinclick") as u8,
         cfg!(feature = "orindesk") as u8,
-        cfg!(feature = "deskcascade") as u8
+        cfg!(feature = "deskcascade") as u8,
+        orin_desk_scene_up() as u8
     );
 
     if ORINRENDER_ARMED.swap(true, Ordering::AcqRel) {
@@ -8318,11 +8337,12 @@ fn tegra_render_arm() -> bool {
     // cascade §5.2 stops is not driven here. Armed BEFORE the spawn so the service's first pass can
     // mint rather than idling a full pass waiting for a latch nothing else on this board will set.
     unaos_kernel::video::desktop_firmware::arm();
-    // PAINTPULSE RETIRED (Peter, 2026-09-05): the pulse window on the Orin loaded the old Pi
-    // background-pulse view, so this scaffold pass no longer arms it and no longer services it — the
-    // `pulsewin::arm()` that stood here and the `pulsewin::service()` in the pass are both gone.
-    // `desktop_firmware::activate()` still arms the latch on the `deskcascade` path (its own step 6,
-    // untouched); with no service call on this board the latch is inert and no window is minted.
+    // DESKSCENE (Peter, 2026-09-05, R17) — the WINDOWED pulse is the one that belongs. PAINTPULSE
+    // read the ruling backwards and retired `pulsewin` while leaving the EMBEDDED pulse (the strip's
+    // per-core lamps) and the status line on the cascaded panel. This seam still does not call
+    // `pulsewin::arm()`: `desktop_firmware::activate()` arms it on the `deskcascade` path (its own
+    // step 6) and the PASS below services it, so the armed window OPENS on the pass's first sample.
+    // On an un-cascaded board the latch is never set and `service()` is one accessor call per pass.
 
     // PLACEMENT IS CHOSEN, NOT CONVENIENT — §5.2's rule, from two seats on the same day (rmbp's steal
     // handed composite work to the busiest core; pi co-pinned `usb-pump` with `input` and destroyed
@@ -8391,6 +8411,26 @@ fn orin_render_service(_: usize) {
     // colour is the one `wm::erase` already paints into vacated boxes on this arch.
     screen.fill_screen(wm::DESKTOP_BG);
     let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    // DESKSCENE — THE BACKDROP HAND-OFF, the Pi's SHELLWIN-PI fold on this board's terms. The Pi
+    // retires the legacy tenants in the SAME statement that claims the backdrop, after
+    // `open_shell_window` returned a window; here the cascade ran on the boot core BEFORE this task
+    // was spawned (`tegra_desk_cascade` is ahead of `tegra_render_arm` on the terminus line), so
+    // "after the cascade, with the console in a window" is task start, and the claim is the seed
+    // above. `retire_desktop_chrome` (video/mod.rs tail) is the ONE writer of
+    // `desktop_scene_owns_backdrop()`, and until this line nothing on the Orin ever set it — which is
+    // why render3b showed the strip (`[pstrip] … reserved=104`, 29 presents of it): `ui_status::draw`,
+    // `chrome_h` and `tick`'s present all read the latch and all took the legacy arm. After it
+    // `draw` is a no-op, `chrome_h` shrinks to the dock's floor (`bottom_reserved=104->64` on the
+    // bench panel, the `[realdesk]` witness), and `tick` never asks for a present again. The
+    // sampler and the `loads()` envelope are untouched — `pulsewin` reads them (ui_status.rs:1285).
+    // Declined, named, on any board where the scene is not up: the instrument stays where the
+    // shell still owns the glass.
+    let scene = orin_desk_scene_up();
+    if scene {
+        unaos_kernel::video::retire_desktop_chrome(pw, ph);
+    } else {
+        serial_println!("[orinrender] strip=kept reason=no-scene cascade={} bar={} routed={} (the strip retires only on the cascaded scene — bar enabled AND console routed; here the shell still owns the backdrop, the Pi's rule)", cfg!(feature = "deskcascade") as u8, unaos_kernel::video::menubar::enabled() as u8, unaos_kernel::video::fbcon::console_is_routed() as u8);
+    }
 
     // PAINTPULSE — no shell window is minted on this board any more (both arms below decline), so
     // there is no heap store to keep alive and no row id to learn; `shell_id` stays `WIN_NONE` and the
@@ -8453,18 +8493,30 @@ fn orin_render_service(_: usize) {
             }
         }
 
-        // PAINTPULSE RETIRED (Peter, 2026-09-05): `pulsewin::service()` stood here and is gone — the
-        // pulse window loaded the old Pi background-pulse view on this board, so the pass neither
-        // arms nor services it (see the arm site in `tegra_render_arm`). The strip's LED band in
-        // `ui_status::tick` below is unchanged and remains the load instrument's only seat.
-
-        // The status strip's ~1 Hz repaint. `tick` returns whether it changed anything, so a quiet
-        // pass costs one compare and no present.
-        dirty |= unaos_kernel::ui_status::tick(&mut pal);
+        // DESKSCENE — the SAMPLER, then the pulse WINDOW, the Pi's order (main.rs SHELLWIN-PI pass).
+        // `tick` is the one sampler on this machine: it publishes the per-core envelope at ~1 Hz and
+        // returns whether the PANEL band changed — which, once `retire_desktop_chrome` ran above, is
+        // `false` forever (ui_status.rs:1285 masks it; `draw` is already a no-op). `pulsewin::service`
+        // is a second VIEW of the numbers `tick` just published: it OPENS the armed window on the
+        // first pass `loads()` reports a live instrument (that is THIS pass — `tick`'s arming pass
+        // sets `st.armed`, so `loads()` answers `ncpu` before `service` asks), and thereafter repaints
+        // only when the frame signature moves. It presents through its own `wm` row, not through
+        // `pal`, and returns `()` — it neither reads nor sets `dirty`.
+        dirty |= unaos_kernel::ui_status::tick(&mut pal); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::pulsewin::service(); // PULSEWIN — the Pi's fold, restored (DESKSCENE): same cadence, same envelope, never a second sample.
 
         // AT MOST ONE PRESENT PER PASS, and only when something changed. The Pi service measured a
         // 96-100% core peg before it took this rule; on this board the cost lands on cpu 0, which is
         // also the only core that can dispatch `jd2_console_pump`.
+        //
+        // WHAT "CHANGED" MEANS ON THE CASCADED SCENE (DESKSCENE): this pass's own product is the
+        // BACKDROP — the `DESKTOP_BG` seed above, presented once so the `Screen`'s full-panel damage
+        // reaches glass through the occluder walk (the console row, the bar's and the dock's rows are
+        // withheld) — and nothing else: the strip no longer paints, and the pulse window is `wm`'s to
+        // present. So pass 1 presents by construction (it also carries the `[u7stk]` gauge below, and
+        // it is now the pass that OPENED the window — the deepest chain this task has), and after it
+        // `tick` is the only source of `dirty`, which on the cascaded scene is never. An un-cascaded
+        // board is unchanged: `tick`'s arming pass returns dirty on pass 1 anyway.
+        dirty |= passes == 1;
         if dirty {
             pal.render();
             presents += 1;
@@ -8476,7 +8528,9 @@ fn orin_render_service(_: usize) {
             // ("first frame must paint the bars"), so pass 1 is the first present by construction;
             // pass 2 is kept as the second sample (it was the pulse window's `wm::create_at` pass
             // before PAINTPULSE was retired; now it is the first pass after the shell mint has
-            // settled, so it bounds the steady-state present). Two lines are what the
+            // settled, so it bounds the steady-state present — DESKSCENE: on the cascaded scene the
+            // window opens on pass 1 again and pass 2 is never dirty, so only the pass-1 line prints,
+            // and it is the reading that includes the open). Two lines are what the
             // wire's lossy polled UART can be asked to carry (REVIEW finding, orin 13). Every other
             // `[u7stk]` site in the tree sits in `u7_launcher`, below the `-> !` terminus this board
             // never returns from, so without this line the jetson image has NO stack gauge at all.
@@ -8495,8 +8549,10 @@ fn orin_render_service(_: usize) {
         if unaos_kernel::arch::timer::cntpct().wrapping_sub(last_census) >= census_ticks {
             last_census = unaos_kernel::arch::timer::cntpct();
             serial_println!(
-                "[orinrender] census passes={} presents={} win={} declined={} -> RENDER-LIVE",
-                passes, presents, shell_id, shell_declined as u8
+                "[orinrender] census passes={} presents={} win={} declined={} strip={} pulsewin={} -> RENDER-LIVE",
+                passes, presents, shell_id, shell_declined as u8,
+                if unaos_kernel::video::desktop_scene_owns_backdrop() { "retired" } else { "live" },
+                unaos_kernel::video::pulsewin::win()
             );
         }
 
