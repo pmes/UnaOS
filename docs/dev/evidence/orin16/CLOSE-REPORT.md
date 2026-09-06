@@ -1,6 +1,6 @@
-# DRAFT — orin 16 CLOSE REPORT (2026-09-06, the render7 flight and the full round behind it)
+# orin 16 CLOSE REPORT (2026-09-06) — render7 flew, four probes flew, 13 folds gated; render8 STAGED and ON THE CARD (unflown; orin 17 boots it); the landing is orin 17's step 2
 
-> **DRAFT.** Written by executor CLOSEDOCS at 2026-09-06T15:0xZ, before the render8 flight and before the
+> **STATUS at orin 16 close (15:4xZ): the round is complete on hw-jetson; render8 render8-20260906T1532Z-c24d951 is on the card UNFLOWN; the landing (and this report's final battery section) belongs to orin 17. Written by executor CLOSEDOCS,** Written by executor CLOSEDOCS at 2026-09-06T15:0xZ, before the render8 flight and before the
 > landing. The seat finalises it: the tip below moved while this was being written (KEYDOORS-FIX folded
 > mid-draft), every "PENDING" line is a live state, and the render8 verdicts are not in it. Nothing here is
 > a landing record — that is [`LANDING-REPORT-4.md`](LANDING-REPORT-4.md).
