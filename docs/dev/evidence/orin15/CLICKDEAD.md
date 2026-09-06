@@ -315,10 +315,162 @@ census's `reports=2`, is `ARMED-NO-COMPLETION` stated on the wire instead of inf
 
 ## 6. Gates
 
+Re-run in the resume worktree (`exec-orin15-clickdead2`), both states, every leg quoted.
+
+### 6.1 The committed state (patch NOT applied — what the branch carries)
+
 | gate | result |
 |---|---|
-| `./arroyo check` (both arches, knob hygiene, ledgers) | exit **0** |
-| `./arroyo test-arm 60` | see the commit body |
+| `./arroyo check` | exit **0** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ bootloader OK`, 48 legs incl. `✅ arm-tegra-orinclick` and `✅ arm-tegra-render`, `✅ userspace x86_64 OK (4 crates)`, `✅ userspace aarch64 OK (5 crates)`, `✅ midden_core tests OK` |
+| `GATE-KNOB` | **OK** — 157 features declared, 156 named by a cfg, 0 phantom, 0 dead |
+| `GATE-LEDGER` | **OK** — 78 rows in 2 ledger files + RULINGS |
+| `./arroyo test-arm 60` | exit **0** — `target/serial-arm.log`: 0 `-> FAIL`, 0 `EXCEPTION`/`panicked` |
 | armed jetson build (knob line §5.3) | exit **0** |
-| `grep -a` on `target/aarch64_esp/kernel.elf` | `[ptrpoll] t=` ×1, ` reports=` ×2, ` errrearm=` ×1, ` decoded=` ×1, `ARMED-NO-COMPLETION` ×1, `GUARD-REARM` ×1, `ERROR-REARM` ×1, `STREAMING (the pointer read` ×1, `BASELINE (the enumeration arms` ×1 |
-| Pi `./arroyo kernel8` sha256 before → after | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` → identical |
+| Pi `./arroyo kernel8` sha256, knob-off, `display_tegra.rs` at `8ab82761` → at `2de4a58b` | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` → **identical**, 1254984 bytes |
+
+### 6.2 The patch applied (gated, then reverted — the branch keeps neither hunk)
+
+| gate | result |
+|---|---|
+| `git apply --check` on `CLICKDEAD-xhci.patch` | exit **0** |
+| `./arroyo check` patched | exit **0**, same 48 legs, GATE-KNOB and GATE-LEDGER OK |
+| armed jetson build patched | exit **0** |
+| Pi `./arroyo kernel8` sha256 patched | `41eda903e85796d3564fded936613a8616780d81e9d9c0d5dc7110bb3d247198` — **differs** (see §7.2; the counter is ungated by design), 1254984 bytes, `wc -l` on `xhci/mod.rs` 14917 = 14917 |
+| after `git checkout --` | `git diff f49ea1e7 -- unaos/crates/kernel/src/drivers/xhci/mod.rs` → **0 lines** |
+
+### 6.3 `grep -a` on `target/aarch64_esp/kernel.elf` — with the known-absent control
+
+A grep that only ever reports hits is not a gate. `DUP-DROP` and `dup=` are the control: same recipe,
+same tree, absent unpatched and present patched.
+
+| token | unpatched | patched |
+|---|---|---|
+| `[ptrpoll] t=` | 2 | 2 |
+| ` errrearm=` | 1 | 1 |
+| ` decoded=` | 1 | 1 |
+| ` reports=` | 2 | 2 |
+| `ARMED-NO-COMPLETION` | 1 | 1 |
+| `GUARD-REARM` | 1 | 1 |
+| `ERROR-REARM` | 1 | 1 |
+| `STREAMING (the pointer read` | 1 | 1 |
+| `BASELINE (the enumeration arms` | 1 | 1 |
+| **` dup=`** | **0** | **2** |
+| **`DUP-DROP`** | **0** | **1** |
+| `ZZQQ-NOT-A-TOKEN` (nonsense control) | 0 | 0 |
+
+---
+
+## 7. `CLICKDEAD-xhci.patch` — the hunk that separates (a1) from (a2), and render7's first question
+
+### 7.1 What is in the branch and what is in the patch
+
+The branch `exec-orin15-clickdead2` carries `unaos/crates/kernel/src/drivers/xhci/mod.rs`
+**byte-identical to trunk**. That is a measured claim, not an intention:
+
+```
+git diff f49ea1e7 -- unaos/crates/kernel/src/drivers/xhci/mod.rs | wc -l   ->  0
+```
+
+The file is rmbp's lane (CLAUDE.md §Worktrees), so the hunk ships as
+`docs/dev/evidence/orin15/CLICKDEAD-xhci.patch` with its own gate results, the way A17 shipped
+`A17-prtscr.patch` for `prtscr.rs`. **`GRANT xhci/mod.rs` is asked of rmbp**; until it is given the
+patch is the deliverable.
+
+The patch carries **four hunks across two files**, and the second file needs saying out loud:
+`arch/aarch64/display_tegra.rs` **is** orin's lane, but its two `dup` hunks ride in the patch and not
+in the commit because they name `MOUSE_DUP_DROP_COUNT`, which does not exist until the first file's
+hunk lands. Committing them alone would leave the branch unbuildable. **Apply both or neither.**
+
+### 7.2 The mechanism the patch instruments, stated once
+
+Not "a TRB is not re-queued" — **a completion is consumed and the read is never re-armed, silently**.
+In `2de4a58b:XhciController::poll_events`, pointer arm (`mouse_dci == Some(endpoint_id)`,
+`mod.rs:4560`), the dup-Success guard fires on
+`slot.mouse_expect_phys != 0 && param != slot.mouse_expect_phys` (`mod.rs:4587`). Inside it,
+`2de4a58b:XhciController::queue_mouse_read` (`mod.rs:14846`) is called **only** under
+`param != prev && have_buf` (`mod.rs:4594`). The complement — `param == slot.mouse_prev_phys` (the
+known Panther-Point duplicate Success for the TD already consumed), or `mouse_data_buffer` /
+`mouse_ring` gone — falls through to the bare `return;` at `mod.rs:4599`, which:
+
+* consumes the transfer event (the ring dequeue pointer has already advanced),
+* enqueues **no** new interrupt-IN TD on the pointer DCI and rings no doorbell — the endpoint is
+  left with nothing armed, and
+* prints nothing, because its only witness `2de4a58b:XhciController::piusb39_witness`
+  (`mod.rs:14730-14731`) is `#[cfg(feature = "usbdebug")]`, and `usbdebug` is not in the Orin flight
+  recipe.
+
+Every other exit already accounts for itself — `2de4a58b:MOUSE_REARM_COUNT` (`mod.rs:2373`),
+`2de4a58b:MOUSE_DISCARD_REARM_COUNT` (`mod.rs:2378`),
+`2de4a58b:MOUSE_ERROR_REARM_COUNT` (`mod.rs:2385`), and halting completions go to the **ungated**
+`2de4a58b:XhciController::hid_error_witness` (`mod.rs:14748`). This one branch is the whole blind
+spot, and on the wire it is indistinguishable from "the controller posted nothing" — the exact
+ambiguity render6 died in.
+
+The patch adds `MOUSE_DUP_DROP_COUNT` (a fourth ungated `pub AtomicU64`, bumped on precisely that
+branch) and the `dup=` field plus a `DUP-DROP` verdict in `2de4a58b:ptrpoll_witness`
+(`display_tegra.rs:5111`). It also folds `dup` into the witness's movement test — **without that, a
+pipeline being EATEN (rearm flat, dup climbing) would be silently mistaken for one that is STARVED**
+and print one line for the whole boot. After the patch:
+
+| verdict | meaning |
+|---|---|
+| `-> DUP-DROP` | **(a1)** completions arrive; the guard eats them without re-arming |
+| `-> ARMED-NO-COMPLETION` | **(a2)** `dup=0`; the endpoint posted nothing — look at EP state, the doorbell and periodic bandwidth, not at the guard |
+
+**Diagnostic only.** The guard's control flow is unchanged; the dup hazard is real (re-arming on a
+genuine duplicate over-arms the interrupt-IN ring — the UI1-MOUSE M2 hazard) and PIUSB-39's
+discrimination stays exactly as it is. One relaxed `fetch_add`, one relaxed load. No lock, no MMIO.
+
+**Line-neutral yes; byte-neutral on the Pi image NO.** These are two claims and an earlier draft
+conflated them. Measured, both:
+
+* **Line-neutral, verified.** `drivers/xhci/mod.rs` compiles into the Pi's `kernel8.img`, and a line
+  added anywhere in it moves every `panic::Location` below. Its two hunks are folded onto existing
+  lines: `wc -l` reads **14917 patched == 14917 unpatched**. `display_tegra.rs` gains 2 lines, both
+  past its old tail (5032), so nothing pre-existing moves there either.
+* **NOT byte-neutral**, and the patch says so rather than claiming otherwise:
+
+  | knob-off `./arroyo kernel8` | `kernel8.img` sha256 | size |
+  |---|---|---|
+  | patch **not** applied | `d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` | 1254984 |
+  | patch applied | `41eda903e85796d3564fded936613a8616780d81e9d9c0d5dc7110bb3d247198` | 1254984 |
+
+  Same size, different content. The reason is deliberate: `MOUSE_DUP_DROP_COUNT` and its `fetch_add`
+  are **ungated**, exactly like the three siblings they join (`mod.rs:2373-2385`). Gating them on
+  `orinclick` would put a board-named knob in a shared driver, which the "name by subsystem, not
+  board" rule forbids; gating them on `usbdebug` would rebuild the very blind spot the patch exists
+  to close. The cost is one 8-byte BSS atomic and one relaxed increment on the pointer-completion
+  path in every aarch64 image — no new file bytes, no lock, no MMIO, no control-flow change.
+  **That cost is the substance of the `GRANT xhci/mod.rs` ask**, and it is why this is a patch and
+  not a commit.
+
+### 7.3 render7's FIRST metal question
+
+**The witness line is `[ptrpoll]`** — nine bytes, deliberately longer than eight so it cannot be
+folded into an LLVM immediate and must land in `.rodata`, which is what makes `grep -a` on the
+artifact a reachability proof rather than a compile proof. It already exists (`2de4a58b`); render7
+needs no new code to answer this.
+
+**The question, scored on ONE line and one field.** The first `[ptrpoll]` line rides census `seq=1`,
+which on render6 landed at `up=10s` / `t=71` (`render6-boot1.log:701`) — about ten seconds after
+`:: tegra: JB2b — keyboard ARMED ::` (`:307`) and its companion `2 pointer(s) armed` (`:356`). Read
+its `rearm=` field:
+
+| first `[ptrpoll]` line | verdict | what it means |
+|---|---|---|
+| `rearm=2` | the reads **STOPPED** | two arms exist and they are the two enumeration arms (`mod.rs:4310`, one per pointer — this board enumerates the relative boot-mouse on slot 4 and the absolute pointer on slot 5). Nothing has completed since enumeration. This is the render6 boot-1 shape, stated instead of inferred. |
+| `rearm>2` | the reads **RE-ARMED** | completions are arriving and the pointer pipeline is alive; the dead click above that line is a routing fault and the hunt moves downstream. |
+
+A single sample decides it, which is the point: the movement test in `ptrpoll_witness` needs two
+census passes (~20 s) and the boot-1 failure is already fully formed at ten. `reports=` on the
+`[orinclick] census` line of the same pass carries the same balance, so the two lines cannot
+disagree — both come from the same loads.
+
+With the patch applied, the same first line's `dup=` field answers the follow-up in the same
+ten seconds: `dup>0` = (a1) eaten, `dup=0` with `rearm=2` = (a2) starved.
+
+### 7.4 The known-absent control for the `grep -a` gate
+
+A `grep -a` that only ever reports hits is not a gate. `DUP-DROP` is the control: it is **absent**
+from the unpatched armed artifact and **present** in the patched one, built from the same recipe on
+the same tree. Both counts are recorded in §6.
