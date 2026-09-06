@@ -37,20 +37,20 @@
 //! | 0 | About This Shard  | prints the Shard identity + version to the log (REAL)           |
 //! | 1 | — (separator)     | —                                                               |
 //! | 2 | Sleep             | honest STUB — prints `unimplemented: Sleep` (no ACPI S3 path)    |
-//! | 3 | Restart           | honest STUB — prints `unimplemented: Restart` (no reboot path)   |
-//! | 4 | Shut Down         | x86: REAL — [`crate::arch::acpi_power::poweroff`] (ACPI S5). aarch64: honest STUB |
+//! | 3 | Restart           | aarch64 non-Pi: REAL — PSCI `SYSTEM_RESET` ([`crate::power::crystal_restart`]). x86/Pi: honest STUB |
+//! | 4 | Shut Down         | x86: REAL — ACPI S5 ([`crate::arch::acpi_power::poweroff`]). aarch64 non-Pi: REAL — PSCI `SYSTEM_OFF`. Pi: honest STUB |
 //!
-//! PI-DESK — **the RENDER and the HIT-TEST cross to aarch64 whole; two of the four ACTIONS do not,
-//! and the menu says so on the wire rather than pretending.** `About` is REAL on both arches. On the
-//! Pi, `Restart` and `Shut Down` join `Sleep` as honest stubs, each printing a line that names the
-//! missing mechanism by name (PSCI `SYSTEM_RESET` / `SYSTEM_OFF` need an EL3 secure monitor, and Pi 4
-//! bare-metal runs at EL2 with nothing behind the `smc`; the real Pi wiring is the BCM2711
-//! watchdog/`PM_RSTS` block, which is a driver arc). See [`fire`] for the full ledger.
+//! A34 (Peter, render7 2026-09-06: *"crystal restart/shut down not working"*) — **the RENDER and the
+//! HIT-TEST cross to aarch64 whole, and so now do the ACTIONS, wherever a monitor answers PSCI.** On
+//! the ORIN, ATF/BL31 at EL3 services `SYSTEM_RESET` / `SYSTEM_OFF` on the same SMC conduit
+//! `smp_virt`'s `CPU_ON` proves every boot, so both verbs are REAL there. The **Pi 4** keeps its
+//! honest stubs: bare-metal at EL2 with nothing behind the `smc`, its real wiring is the BCM2711
+//! watchdog/`PM_RSTS` block, a driver arc. See [`fire`] for the full ledger.
 //!
-//! **A stub is not a no-op and not a fake success.** Sleep and Restart RENDER as pickable items — a
-//! menu item that could not be shown pickable would be unfalsifiable — and their pick prints one
-//! honest line naming the verb and that it is unimplemented. Peter sees on glass/serial that the item
-//! is a stub, not that the menu is broken.
+//! **A stub is not a no-op and not a fake success.** Sleep (and Restart where it is one) RENDER as
+//! pickable items — an item that could not be shown pickable would be unfalsifiable — and the pick
+//! prints one honest line naming the verb and that it is unimplemented. Peter sees on glass/serial
+//! that the item is a stub, not that the menu is broken. `action=` on the pick line is arch-TRUE.
 //!
 //! # Destructive-action discipline
 //!
@@ -112,9 +112,9 @@ pub enum Verb {
     About,
     /// Sleep — ACPI S3 suspend. STUB: no S3 path exists; the pick prints `unimplemented`.
     Sleep,
-    /// Restart — a warm reboot. STUB: no reboot path exists; the pick prints `unimplemented`.
+    /// Restart — a warm reboot. REAL where PSCI answers (aarch64 non-Pi); an honest STUB elsewhere.
     Restart,
-    /// Shut Down — ACPI S5 soft-off. REAL, and the one action that halts the machine.
+    /// Shut Down — ACPI S5 (x86) or PSCI SYSTEM_OFF (aarch64 non-Pi). The one action that halts the box.
     ShutDown,
 }
 
@@ -132,7 +132,7 @@ impl Verb {
     /// `true` when the verb is BACKED by a real action, `false` when it is an honest stub. On the
     /// witness so a capture reads `action=real` or `action=stub` beside the pick.
     const fn real(self) -> bool {
-        matches!(self, Verb::About | Verb::ShutDown)
+        matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
     }
 
     /// The verb's stable ordinal for the witness (`u8`), independent of its row index.
@@ -583,29 +583,28 @@ pub fn dismiss_for_bar_off() {
 ///
 /// - `About`    — prints the Shard identity + version (REAL).
 /// - `Sleep`    — honest STUB: prints `unimplemented: Sleep`, no side effect.
-/// - `Restart`  — honest STUB: prints `unimplemented: Restart`, no side effect.
-/// - `ShutDown` — on x86, REAL: [`crate::arch::acpi_power::poweroff`], which does not return.
+/// - `Restart`  — aarch64 non-Pi: REAL, [`crate::power::crystal_restart`] (PSCI `SYSTEM_RESET`). Else STUB.
+/// - `ShutDown` — x86: REAL, [`crate::arch::acpi_power::poweroff`]. aarch64 non-Pi: REAL, PSCI `SYSTEM_OFF`.
 ///
-/// ⛔ The fixture must NEVER call this with [`Verb::ShutDown`], and does not: it drives picks only for
-/// the safe verbs and proves Shut Down's routing through [`item_at`].
+/// ⛔ The fixture must NEVER drive a verb that ACTS. It drives Shut Down never, and A34 widens the ban
+/// to Restart on any board where PSCI answers — leg 4 tests [`Verb::real`], the same predicate the arms
+/// below dispatch on, so the ban cannot drift away from the wiring it is protecting against.
 ///
-/// # PI-DESK — what Restart and Shut Down are on the Pi, and why they are NOT wired
+/// # A34 — why these two verbs were INERT, and what they call now
 ///
-/// The render and the hit-test cross to aarch64 whole; the ACTIONS do not, and the honest answer is
-/// stated on the wire rather than faked. `acpi_power::poweroff` is an x86 path (ACPI S5 through the
-/// PM1 control block) and has no aarch64 twin. The aarch64 twin *of the family* is PSCI —
-/// `SYSTEM_OFF` (0x8400_0008) and `SYSTEM_RESET` (0x8400_0009) through an `smc` — and this kernel does
-/// carry PSCI, but only in `arch/aarch64/smpprobe.rs`, only `CPU_ON`/`AFFINITY_INFO`/`FEATURES`, and
-/// only on the **Tegra** path where an EL3 secure monitor answers. `SYSTEM_OFF` is queried by
-/// `PSCI_FEATURES` there and, in that file's own words, *"never invoked"*.
+/// render7, 2026-09-06: the wire carried `crystal_pick verb=ShutDown action=real`, and the Orin stayed
+/// up another twelve minutes until Peter cut the power. Nothing in the menu was broken — the pick
+/// resolved, the dropdown dismissed, `fire` ran. What `fire` ran was a PRINT. Both aarch64 arms held a
+/// Pi-era `unimplemented:` line written when the Pi was the only aarch64 desktop, and `#[cfg(target_arch
+/// = "aarch64")]` cannot tell a Pi from an Orin. The Orin's chain is ATF/BL31 + OP-TEE: an EL3 monitor
+/// servicing PSCI on the same SMC conduit `smp_virt`'s `CPU_ON` proves every boot. The MECHANISM was
+/// never missing — [`crate::power`] has carried `SYSTEM_RESET` (0x8400_0009) and `SYSTEM_OFF`
+/// (0x8400_0008) since ORIN-REBOOT. The CALL was. So both arms split on `feature = "pi"`, not on arch.
 ///
-/// The Pi 4 is the case that settles it: bare-metal BCM2711 boots to EL2 with **no EL3 firmware
-/// behind it**, so an `smc` is not a power call — it is an unhandled exception. There is nothing to
-/// route to. So both verbs print an `unimplemented:` line naming what is missing, exactly as `Sleep`
-/// already did on x86, and the menu remains fully live: it opens, it hit-tests, it dismisses, and
-/// `About` is REAL on both arches. Wiring these means a Pi power path (the watchdog/PM block for
-/// reset, `PM_RSTS` for halt) — a driver arc, not a menu arc, and named as the follow-up rather than
-/// smuggled in here.
+/// [`Verb::real`] was the other half and is fixed with it: a flat `About | ShutDown` match printed
+/// `action=real` beside a Shut Down that only printed a line. A verb announcing `real` and doing
+/// nothing is worse than one announcing `stub` — it spends the operator's trust in the witness — so
+/// `real` is computed from the same `cfg` the arms dispatch on. The Pi's lines and image are untouched.
 fn fire(verb: Verb) {
     match verb {
         Verb::About => {
@@ -623,12 +622,12 @@ fn fire(verb: Verb) {
         Verb::Restart => {
             #[cfg(target_arch = "x86_64")]
             serial_println!(":: SHARD: unimplemented: Restart (no reboot path) ::");
-            // PI-DESK — the same honest line, naming the aarch64 reason rather than the x86 one. See
-            // this function's header: PSCI SYSTEM_RESET needs an EL3 monitor the Pi does not have.
-            #[cfg(target_arch = "aarch64")]
-            serial_println!(
-                ":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::"
-            );
+            // A34 — the ACTION, at last: `power::crystal_restart` announces `[crystal] verb=restart ->
+            // PSCI SYSTEM_RESET`, hands the board to ATF/BL31, and returns only to name the refusal code.
+            #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+            crate::power::crystal_restart();
+            #[cfg(all(target_arch = "aarch64", feature = "pi"))]
+            serial_println!(":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::");
         }
         Verb::ShutDown => {
             // Deliberate and destructive: the operator opened the menu and pressed Shut Down. Say so
@@ -639,14 +638,14 @@ fn fire(verb: Verb) {
                 serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
                 crate::arch::acpi_power::poweroff();
             }
-            // PI-DESK — NOT wired, and it returns. `smpprobe.rs` carries PSCI SYSTEM_OFF as a
-            // FEATURES query it deliberately never invokes, and on the Pi there is no EL3 behind the
-            // `smc` to answer it at all. A verb that cannot act says so and leaves the machine
-            // running; it does not park the operator's desktop in a `wfi` to look decisive.
-            #[cfg(target_arch = "aarch64")]
-            serial_println!(
-                ":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::"
-            );
+            // A34 — the ACTION. Twelve minutes of an Orin that had been told to shut down (render7)
+            // is what this line closes: `power::crystal_shutdown` announces `[crystal] verb=shutdown
+            // -> PSCI SYSTEM_OFF` and calls it. The Pi keeps its honest line — there is no EL3
+            // behind its `smc`, and a verb that cannot act must not park the desktop to look decisive.
+            #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+            crate::power::crystal_shutdown();
+            #[cfg(all(target_arch = "aarch64", feature = "pi"))]
+            serial_println!(":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::");
         }
     }
 }
@@ -1050,8 +1049,9 @@ pub fn selftest() {
         }
     }
 
-    // Leg 4 — a SAFE pick fires and dismisses. About first (real), then Sleep and Restart (stubs) so
-    // the wire carries their honest lines. Shut Down is NEVER driven.
+    // Leg 4 — a SAFE pick fires and dismisses. About, Sleep, then Restart ONLY where A34 left it a stub:
+    // where PSCI answers, driving that row would RESET the board mid-fixture (Shut Down's ban, widened).
+    let drive_restart = !Verb::Restart.real();
     let picks_before = PICKS.load(Ordering::Relaxed);
     let pick_safe = |verb: Verb| -> bool {
         // Reopen and press the row that carries `verb`.
@@ -1070,8 +1070,8 @@ pub fn selftest() {
     };
     let about_fired = pick_safe(Verb::About);
     let sleep_fired = pick_safe(Verb::Sleep);
-    let restart_fired = pick_safe(Verb::Restart);
-    let picks_counted = PICKS.load(Ordering::Relaxed) == picks_before + 3;
+    let restart_fired = !drive_restart || pick_safe(Verb::Restart);
+    let picks_counted = PICKS.load(Ordering::Relaxed) == picks_before + if drive_restart { 3 } else { 2 };
     let pick_ok = about_fired && sleep_fired && restart_fired && picks_counted;
 
     // Leg 5 — click-outside dismisses.
