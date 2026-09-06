@@ -113,6 +113,10 @@ grep, and `panic::Location` means line-neutral or tail-append only (memory
   which gives them a run-to-run VARIABLE forbidden set. Specs live in `unaos/scripts/specs/`
   (`x86-wc.spec`).
 - **The `supstate` × `holocron` / `orintenant` / `orinladder` matrix gap.**
+- **B63 — GATE-LEDGER's column-count blind spot.** A row split by a stray pipe character reds only
+  when the debris lands in a column the gate validates; B62's landed in the last cell and passed OK.
+  One line: assert each data row's field count equals its header's, and name both counts. The
+  mutation proof already exists in git history, so this is the cheapest gate in the queue.
 - Standing rule for every one of these: a check that cannot fire is not a check — printing is not
   gating, and a zero-hit result indicts the pattern (memory `a-check-that-cannot-fire`). Prove each
   gate by mutation, at the sha it will run on (memory `verification-comes-from-execution`).
