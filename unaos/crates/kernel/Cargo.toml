@@ -751,9 +751,13 @@ smpmark = []
 # remain unmasked from the arm onward; dispatch is `on_tick` only (no `SCHED_ACTIVE`, no
 # preemption — the capstone loop stays cooperative). Witness: `[orinbsptick]` — tick 1, then every
 # 250th tick, carrying count + re-measured CurrentEL + cpu. Standalone (does NOT imply `tegra`,
-# mirroring `smpmark`) but every site is `all(tegra, bsptick)`-gated, so arm it WITH tegra. With the
-# feature OFF (default) every site vanishes and the tegra image is byte-identical to baseline.
-# Enable via `UNAOS_BSPTICK=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-BSPTICK.
+# mirroring `smpmark`) but every site is `all(tegra, bsptick)`-gated, so arm it WITH tegra.
+# ⚠ DEFAULT-ON FOR TEGRA as of ORIN-TICKDEFAULT (orin 19, Peter 2026-09-07): every tegra build arms
+# this unless `UNAOS_NOBSPTICK=1` opts out, and it is that OPT-OUT — no longer the mere absence of
+# `UNAOS_BSPTICK=1` — that reproduces the tickless image byte-identical to baseline. `UNAOS_BSPTICK=1`
+# is kept for back-compat and is byte-identical to the new default. Metal-proven before the flip:
+# tick1 (orin 16) `arm=1 tmax=33000 el2=0 exceptions=0 -> PASS`; render8 (orin 17) 718 s of ticks
+# under the full desktop. See arch_arm64.md §ORIN-BSPTICK and arroyo's ORIN-TICKDEFAULT block.
 bsptick = []
 
 # ORIN-BSPRUN (Candidate B arc 2): the `UNAOS_BSPRUN=1` terminus swap — the Orin boot core joins
@@ -768,10 +772,15 @@ bsptick = []
 # leg's line IS the configuration it compiles (the standing matrix rule), and a hand-rolled list
 # that splits them should fail loudly at the compile_error!, not be silently widened. Standalone
 # otherwise (does NOT imply `tegra`, mirroring `bsptick`) but every site is `all(tegra, bsprun)`-
-# gated (the main.rs terminus is inside tegra-gated code), so arm it WITH tegra. With the feature
-# OFF (default) every site vanishes and the tegra image is byte-identical to baseline. Witness:
-# `[orinbsprun]` — the terminus banner. Enable via `UNAOS_BSPRUN=1 ./arroyo esp-jetson`.
-# See arch_arm64.md §ORIN-BSPRUN.
+# gated (the main.rs terminus is inside tegra-gated code), so arm it WITH tegra.
+# ⚠ DEFAULT-ON FOR TEGRA as of ORIN-TICKDEFAULT (orin 19, Peter 2026-09-07): every tegra build arms
+# this unless opted out. TWO opt-outs, because there are three configurations worth reaching:
+# `UNAOS_NOBSPRUN=1` drops preemption and keeps the tick (the tick1-flown rung, cooperative
+# terminus); `UNAOS_NOBSPTICK=1` drops BOTH — it has to, since `bsprun` without `bsptick` trips the
+# `compile_error!` below — and that is the one that reproduces the pre-flip image byte-identical to
+# baseline. Metal-proven before the flip: render8 (orin 17) `orinbsprun_join=1 -> HOSTING`,
+# `[bsprun] host core=0 el=1 -> HOSTING`, `el0 first-run … eret to EL0 ACCEPTED`. Witness:
+# `[orinbsprun]` — the terminus banner. See arch_arm64.md §ORIN-BSPRUN and arroyo's ORIN-TICKDEFAULT.
 bsprun = []
 
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback

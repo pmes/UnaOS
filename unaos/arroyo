@@ -781,14 +781,22 @@ _feats=""
 # ORIN-BSPTICK (Candidate B arc 1): UNAOS_BSPTICK=1 arms the PERIODIC EL1 generic-timer tick on the
 # Orin boot core — timer.rs `el1_bsptick_start`, called from `tegra_early_stop`'s terminus line right
 # after the IRQEL-RT one-shot proof self-disarms. The boot core keeps a standing 250 Hz CNTP tick at
-# EL1 with IRQs unmasked across `run_capstone_boot_core`; dispatch is `on_tick` only (SCHED_ACTIVE
-# stays false, `timer_preempt` is baremetal-gated), so the terminus stays cooperative — this is the
-# clock, not the preemption (that is ORIN-BSPRUN, the next mapping). Standalone feature (does NOT
+# EL1 with IRQs unmasked across `run_capstone_boot_core`. ⚠ THE NEXT CLAUSE IS SCOPED TO A
+# BSPTICK-WITHOUT-BSPRUN BUILD, which since ORIN-TICKDEFAULT is the `UNAOS_NOBSPRUN=1` opt-out and
+# no longer the default: there dispatch is `on_tick` only (SCHED_ACTIVE stays false, no post-EOI
+# `timer_preempt` arm in the v3 dispatch) and the terminus stays cooperative — this feature is the
+# clock, not the preemption (that is ORIN-BSPRUN, the next mapping). The wire says which of the two
+# it got without anyone having to remember: `el1_bsptick_start`'s banner is `cfg!(feature =
+# "bsprun")`-split (timer.rs:713) and names the dispatch regime the image actually carries.
+# Standalone feature (does NOT
 # imply tegra, mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
 # `UNAOS_TEGRA=1 UNAOS_BSPTICK=1 ./arroyo check`, or `UNAOS_BSPTICK=1 ./arroyo esp-jetson` (esp-jetson
-# forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson OBJCOPY'D
-# LOADABLE IMAGE is byte-identical to baseline (measured on `llvm-objcopy -O binary kernel.elf`, the
-# orindesk precedent). The ARMED build is type-checked by the `arm-tegra-bsptick` leg of
+# forces tegra). ⚠ NO LONGER DEFAULT OFF — as of ORIN-TICKDEFAULT (below) every tegra build arms this
+# feature unless `UNAOS_NOBSPTICK=1` opts out; this explicit knob is kept for back-compat and is
+# byte-identical to the new default. The knob-off byte-identity claim that used to live on this line
+# (`llvm-objcopy -O binary kernel.elf` vs baseline, the orindesk precedent) has MOVED to the opt-out:
+# it is `UNAOS_NOBSPTICK=1` that now reproduces the pre-flip image, not the absence of this knob.
+# The ARMED build is type-checked by the `arm-tegra-bsptick` leg of
 # KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `[orinbsptick]` — tick 1, then every
 # 250th tick, count + re-measured CurrentEL + cpu.
 [ -n "${UNAOS_BSPTICK:-}" ] && _feats="${_feats}bsptick,"
@@ -804,12 +812,53 @@ _feats=""
 # compile_error! in sched.rs rather than building silently inert. Standalone feature (does NOT
 # imply tegra, mirroring bsptick), but every site is tegra-gated, so arm it WITH tegra:
 # `UNAOS_TEGRA=1 UNAOS_BSPRUN=1 ./arroyo check`, or `UNAOS_BSPRUN=1 ./arroyo esp-jetson`
-# (esp-jetson forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson
-# OBJCOPY'D LOADABLE IMAGE is byte-identical to baseline (measured, the bsptick/orindesk
-# precedent). The ARMED build is type-checked by the `arm-tegra-bsprun` leg of KERNEL_CFG_MATRIX,
+# (esp-jetson forces tegra). ⚠ NO LONGER DEFAULT OFF — see ORIN-TICKDEFAULT immediately below; the
+# opt-outs are `UNAOS_NOBSPRUN=1` (tick, cooperative terminus) and `UNAOS_NOBSPTICK=1` (neither, the
+# pre-flip image). This explicit knob is kept for back-compat and is byte-identical to the new
+# default. The ARMED build is type-checked by the `arm-tegra-bsprun` leg of KERNEL_CFG_MATRIX,
 # not by this mapping. Witness on the wire: `[orinbsprun]` — the terminus banner (then the load
 # train itself, whose emission IS the arc's payload).
 [ -n "${UNAOS_BSPRUN:-}" ] && { _feats="${_feats}bsprun,"; case ",${_feats}" in *",bsptick,"*) ;; *) _feats="${_feats}bsptick,";; esac; }
+# ORIN-TICKDEFAULT (orin 19, TICKDEFAULT — Peter's "OK" of 2026-09-07 to the decision-list question
+# "shall a stock Jetson build get a tick and preemption?"): `bsptick` + `bsprun` are DEFAULT-ON for
+# tegra builds. Until this flip a default Jetson image took exactly ONE EL1 interrupt in its whole
+# life (the IRQEL-RT one-shot at `timer.rs:486`, which self-disarms at `:532`), ran the entire
+# terminus with CNTP_CTL.ENABLE=0 — the JM6 drop zeroes it at `boot_tegra.rs:158` and `main.rs:2689`
+# marks the timer not-live — and reached the COOPERATIVE `run_capstone_boot_core(0)`. Nothing
+# periodic could be scheduled, nothing could sleep and wake, nothing involuntarily yielded, and
+# `arch::ticks()` was frozen from the drop onward. (Only the TICK-DERIVED clock froze: `arch::ms()`
+# reads CNTVCT and `clock::monotonic()` reads CNTPCT, and ENABLE=0 stops the comparator, not the
+# counter — so those kept running throughout and still do.)
+#
+# THIS IS NOT NEW CAPABILITY; IT IS MAKING FLOWN CAPABILITY THE DEFAULT. Both knobs have already
+# flown PASS on metal, individually: `bsptick` at tick1 (orin 16, `arm=1 tmax=33000 el2=0
+# exceptions=0 -> PASS`) and both together at render8 (orin 17, `orinbsprun_join=1 -> HOSTING`,
+# `el0_first_run=1` ACCEPTED) — orin-ledger A21, and A6's 2026-09-07 correction. The flip changes
+# WHICH POLARITY IS DEFAULT; it does not change one byte of `.rs`, so the source the metal compiled
+# is the source that ships.
+#
+# THE TWO WAYS BACK, because the old behaviour is the byte-identity baseline and must stay reachable:
+#   UNAOS_NOBSPRUN=1   -> `bsptick` only: the standing 250 Hz EL1 tick with the COOPERATIVE terminus.
+#                         This is exactly the tick1-flown configuration (orin 16) and is the useful
+#                         middle rung if a flight has to bisect tick vs preemption.
+#   UNAOS_NOBSPTICK=1  -> NEITHER feature: the pre-flip tickless image, byte-identical to baseline.
+#                         DOMINANT, and it has to be — `bsprun` without `bsptick` is a flag with no
+#                         clock and trips the `compile_error!` at `sched.rs:10465`, so dropping the
+#                         tick must drop the preemption with it. That is the exact inverse of the
+#                         UNAOS_BSPRUN mapping above, which arms both.
+# Negative-knob spelling per UNAOS_NOTEGRASMP / UNAOS_NOSDHCBLK; the SHAPE of this whole block is the
+# ORIN-SMP-DEFAULT precedent (arroyo:1051-1052 + esp_jetson) verbatim — a default-on line keyed on
+# UNAOS_TEGRA here, an idempotent force block in `esp_jetson` for the media path, and the explicit
+# positive knobs left in place. BOTH POLARITIES STAY TYPE-CHECKED WITHOUT A MATRIX EDIT: the armed
+# default's feature closure IS `arm-tegra-bsprun` (`arm-tegra`'s list verbatim + `bsptick,bsprun`),
+# and `arm-tegra` itself remains the disarmed polarity that `UNAOS_NOBSPTICK=1` still builds.
+# ⚠ TEGRA-ONLY, and that is structural, not a promise: the Pi compiles from `kernel8()`'s CURATED
+# $K8_FEATS, which never draws from `$_feats` (see the TOOLFIX/BANNER note at the `KERNEL_FEATURES`
+# choke point), and `arch/aarch64/boot.rs` has no `cntp_ctl` write at all; the QEMU-virt legs
+# (`arm`, `test-arm`) never set UNAOS_TEGRA. ⚠ QEMU models no Tegra234, so the armed default is
+# type-checked and reasoned here and PROVEN only by an attended bench flight.
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOBSPTICK:-}" ] && _feats="${_feats}bsptick,tegra,"
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOBSPTICK:-}" ] && [ -z "${UNAOS_NOBSPRUN:-}" ] && _feats="${_feats}bsprun,"
 # ORIN-WM1 (ORINDESK): UNAOS_ORINDESK=1 arms the Jetson Orin's FIRST real compositor window —
 # `arch/aarch64/display_tegra.rs::orin_wm1`, called from `tegra_early_stop`'s step-3c heap line. It
 # calls `wm::reserve_stage` (the Orin's missing half: this board seeds `video::WRITER` by hand and never
@@ -5025,6 +5074,26 @@ esp_jetson() {
             *",tegrasmp,"*) ;;
             *) _feats="${_feats}tegrasmp,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
         esac
+    fi
+    # ORIN-TICKDEFAULT: the standing EL1 tick + the preemptive terminus are default-on for the jetson
+    # IMAGE, not only for `UNAOS_TEGRA=1 ./arroyo check` — this is the block that reaches bench media,
+    # since `esp-jetson` forces `tegra` in the feature list without ever setting the UNAOS_TEGRA env
+    # var the knob-mapping line keys on. Opt out with UNAOS_NOBSPRUN=1 (tick only, cooperative
+    # terminus — the tick1-flown rung) or UNAOS_NOBSPTICK=1 (neither, the pre-flip byte-identity
+    # baseline). ORDER IS LOAD-BEARING: `bsprun` requires `bsptick` (`compile_error!` at
+    # sched.rs:10465), so the tick arms first and the preempt arm is nested inside its opt-out.
+    # Idempotent, the tegrasmp shape. See ORIN-TICKDEFAULT in the knob mapping for the full argument.
+    if [ -z "${UNAOS_NOBSPTICK:-}" ]; then
+        case ",${_feats}" in
+            *",bsptick,"*) ;;
+            *) _feats="${_feats}bsptick,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+        esac
+        if [ -z "${UNAOS_NOBSPRUN:-}" ]; then
+            case ",${_feats}" in
+                *",bsprun,"*) ;;
+                *) _feats="${_feats}bsprun,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+            esac
+        fi
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"

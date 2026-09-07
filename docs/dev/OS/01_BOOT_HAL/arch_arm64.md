@@ -10766,7 +10766,7 @@ ran again with every NEXTTOUCH read survived and the same verdict —
 `JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION` (capture
 line 14273), `JX2-SWEEPDISABLED` (14274) and the `DECODES-NOMATCH` retraction (14276) beside it.
 The channel census is a two-flight result; both non-establishment bullets above stand unchanged.
-## ORIN-BSPTICK — a periodic EL1 tick on the boot core (`UNAOS_BSPTICK`, default OFF)
+## ORIN-BSPTICK — a periodic EL1 tick on the boot core (**default ON for tegra**; `UNAOS_NOBSPTICK` opts out)
 
 **Candidate B arc 1** of the SMP redesign (Peter's 2026-08-25 ruling: highest performance, which
 orders B first among the code arcs). The Orin boot core post-JM6 has taken exactly ONE interrupt at
@@ -10836,7 +10836,7 @@ advancing while the JD2 console stays interactive (the tick must not perturb the
 arc deliberately does not do (arc 2, gated on the sched.rs peer grant): no `run_bsp` swap, no
 `run()` entry on the boot core, no `SCHED_ACTIVE`, no preemption, no placement change.
 
-## ORIN-BSPRUN — the boot core joins `run()` (`UNAOS_BSPRUN`, default OFF)
+## ORIN-BSPRUN — the boot core joins `run()` (**default ON for tegra**; `UNAOS_NOBSPRUN` opts out)
 
 **Candidate B arc 2** of the SMP redesign (Peter's 2026-08-25 highest-performance ruling; arc 1 =
 §ORIN-BSPTICK, `72d3d36e`). Arc 1 gave the post-JM6 boot core a standing 250 Hz EL1 clock and
@@ -11012,6 +11012,174 @@ esp-jetson` — its own boot, never folded into the render line while Peter's SM
 pending.
 What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
 (F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
+
+
+## ORIN-TICKDEFAULT — the tick and the preemptive terminus become the tegra DEFAULT
+
+Landed orin 19 (executor TICKDEFAULT) on **Peter's "OK" of 2026-09-07** to the decision-list
+question *"shall a stock Jetson build get a tick and preemption?"*. This section is the record of
+what changed, what it costs, and what a flight has to show; §ORIN-BSPTICK and §ORIN-BSPRUN above
+remain the record of the mechanisms themselves, which this arc does not touch.
+
+### What a default Jetson build did until this flip
+
+Exactly one EL1 interrupt in the whole life of the boot core, and then silence:
+
+* the JM6 drop asm zeroes the timer condition — `msr cntp_ctl_el0, xzr`, `boot_tegra.rs:158`,
+  reached ungated from `main.rs`'s `drop_to_el1` call;
+* `timer::set_not_live()` immediately after it records that the reading `verify_live` took at EL2
+  is now stale;
+* the IRQEL-RT one-shot proof (`timer::el1_oneshot_proof`, `timer.rs:486`) re-arms CNTP for a
+  single ~100 ms window and **disarms again on every path** at `timer.rs:532`;
+* nothing re-arms it. `el1_bsptick_start` was the only post-drop re-arm in the tree and its call
+  site was `#[cfg(feature = "bsptick")]`, erased by default;
+* the terminus was the cooperative `run_capstone_boot_core(0)`, and preemption was off three
+  independent ways over: no clock, no `timer_preempt` caller (`gic.rs`'s post-EOI arm is
+  `all(tegra, bsprun)`-gated), and `timer_preempt`'s own `!SCHED_ACTIVE` early return.
+
+Consequence: nothing periodic could be scheduled, nothing could sleep and wake, nothing
+involuntarily yielded, and `arch::ticks()` was frozen from the drop onward.
+
+**One correction worth keeping, because the shorter phrasing is wrong.** Only the TICK-DERIVED
+clock froze. `arch::ms()` reads CNTVCT directly and `clock::monotonic()` reads CNTPCT directly, and
+both stay legal at EL1 because the same drop asm sets `CNTHCTL_EL2.EL1PCTEN|EL1PCEN`.
+`CNTP_CTL.ENABLE=0` stops the **comparator**, never the counter — so `clock::mono_ticks()`,
+`logts` and the civil `unix_now()` anchor kept running throughout and still do. The load-bearing
+consequence survives the correction; the phrase "frozen monotonic clock" does not.
+
+### This is not new capability — it is making flown capability the default
+
+Both knobs had already flown PASS on Orin silicon, individually and together, before the flip:
+
+* `bsptick` — tick1, 2026-09-06 (orin 16): `arm=1 tick_lines=133 tmax=33000 el2=0 exceptions=0
+  -> PASS`;
+* both — render8, 2026-09-06 (orin 17): `orinbsprun_join=1 -> HOSTING`, `[bsprun] host core=0
+  el=1 -> HOSTING`, `el0 first-run … eret to EL0 ACCEPTED`, with 718 s of ticks under the full
+  desktop (`tmax=179500`).
+
+See `orin-ledger.md` A21, and A6's 2026-09-07 correction. The flip therefore changes **which
+polarity is default**, not what the code does when armed.
+
+### The mechanism, and why this one
+
+`bsptick` + `bsprun` are pushed into the feature list for tegra builds by the build scripts — the
+**ORIN-SMP-DEFAULT (`tegrasmp` / `UNAOS_NOTEGRASMP`) precedent, verbatim in shape**: a default-on
+line in `arroyo`'s knob mapping keyed on `UNAOS_TEGRA`, an idempotent force block in
+`esp_jetson()` for the media path, and the explicit positive knobs left in place for back-compat.
+
+**Not one line of `.rs` changed.** The eighteen `cfg` sites keep their predicates exactly as the
+metal compiled them, so the flown source is the shipped source. The alternative — deleting the
+gates — was rejected: it removes the way back to the baseline, it cannot be done line-neutrally
+across four files (and `sched.rs:1746` sits above ~9200 `panic::Location`s), it would leave
+`bsptick`/`bsprun` declared with no `cfg` site and red GATE-KNOB, and it would produce a source
+tree the bench has never compiled.
+
+### The three configurations, and the way back
+
+| build | features | terminus | what it is |
+|---|---|---|---|
+| default tegra / `esp-jetson` | `bsptick,bsprun` | `run_bsp_tegra(0)` | tick + preemption — **new default** |
+| `UNAOS_NOBSPRUN=1` | `bsptick` | `run_capstone_boot_core(0)` | tick only; the tick1-flown rung |
+| `UNAOS_NOBSPTICK=1` | neither | `run_capstone_boot_core(0)` | the pre-flip image; **the byte-identity baseline** |
+
+`UNAOS_NOBSPTICK` is dominant and has to be: `bsprun` without `bsptick` is a flag with no clock and
+trips the `compile_error!` at `sched.rs:10465`, so dropping the tick must drop preemption with it.
+That is the exact inverse of the `UNAOS_BSPRUN` mapping, which arms both. Where a positive and a
+negative knob are both set the positive wins, matching `UNAOS_TEGRASMP` / `UNAOS_NOTEGRASMP`.
+
+Both polarities stay type-checked **without a matrix edit**: the armed default's feature closure
+*is* `arm-tegra-bsprun` (`arm-tegra`'s list verbatim + `bsptick,bsprun`), the EL0 cross that is the
+flight image is `arm-tegra-bsprun-el0`, and `arm-tegra` itself remains the disarmed polarity that
+`UNAOS_NOBSPTICK=1` still builds.
+
+### Scope: tegra only, and structurally so
+
+The Pi is untouched — `kernel8()` compiles from a **curated `K8_FEATS`** that never draws from
+`$_feats`, and `arch/aarch64/boot.rs` (the Pi drop) contains no `cntp_ctl` write at all; the Pi's
+`timer_preempt` arm is `baremetal`-gated and was already live. The QEMU-virt legs (`arm`,
+`test-arm`) never set `UNAOS_TEGRA`, and x86 never sees an aarch64 feature. `unaos/builder`
+needs no change: it never mapped `UNAOS_BSPTICK`/`UNAOS_BSPRUN` (they are aarch64-only), exactly as
+it maps `UNAOS_TEGRASMP` for parity but not `UNAOS_NOTEGRASMP`.
+
+### ⚠ What this flip costs, stated rather than waved through
+
+**It ends the tegra knob-off byte-identity proof as a property of the DEFAULT build.** The
+invariant is not destroyed — it moves to the opt-out: `UNAOS_NOBSPTICK=1 ./arroyo esp-jetson` is
+what now reproduces the pre-flip image. Every recorded baseline that keyed on "the default jetson
+image" instead of "the disarmed polarity" is stale by construction and must be re-derived against
+the opt-out, starting with the objcopy sha256 pair recorded under §ORIN-BSPRUN above.
+
+### ⚠ What a bench flight must show — the predicate
+
+QEMU models no Tegra234, so the armed default is type-checked and reasoned, never QEMU-proven.
+Nothing below has been observed on a default image; this is the predicate, not a result. It is
+written to distinguish three outcomes that a careless read would conflate — **armed and
+preempting**, **armed but idle**, and **the old tickless behaviour** — on a bare
+`./arroyo esp-jetson` with no `UNAOS_BSPTICK` / `UNAOS_BSPRUN` in the command line:
+
+1. **The build is the armed one.** `⚡ kernel features (jetson):` contains `bsptick` AND `bsprun`,
+   and `strings kernel.elf` finds `[orinbsptick]` and `[orinbsprun]` — banner AND artifact, per the
+   full-knob law.
+2. **The tick is armed** — `[orinbsptick] arming PERIODIC CNTP at EL1 on cpu 0`.
+3. **The tick is DELIVERED and ADVANCING**, which is the line that separates armed-and-ticking from
+   armed-but-idle: `[orinbsptick] tick N taken at EL1 on cpu 0` for **at least two distinct N**.
+   `bsptick_witness` emits at `n == 1` and then every `TICK_HZ`th tick, so the second emission is
+   `tick 250`; a lone `tick 1` is indistinguishable from the one-shot's signature and must NOT be
+   scored as a pass. `EL1`, not `EL2`, on every emission — an EL2 reading means `HCR_EL2.IMO`
+   regressed, and the pattern deliberately matches any EL digit so a regressed line still lands in
+   the table where a reader sees it.
+4. **The terminus is the preemptive one** — `[orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true,
+   mark_online(0)`, and `CAPSTONE COMPLETE` **absent** (it is printed by `capstone_body`, which only
+   `run_capstone_boot_core` spawns; its presence on a default boot means the flip did not reach the
+   image). Then `[bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x1)` — `el=1`, and
+   `HOSTING` rather than `REFUSING`.
+5. **Preemption actually DELIVERED, not merely became legal — the `load_witness_tick` train.** This
+   is what separates "armed and preempting" from "armed but idle", and the reason is link-time:
+   `load_witness_tick` (`sched.rs:8404`) has **exactly one** caller, `timer_preempt`
+   (`sched.rs:5150`), which returns at its first line unless `SCHED_ACTIVE` — and `run_bsp_tegra` is
+   the only thing on tegra that ever sets it. Before ORIN-BSPRUN these strings were not merely
+   absent from the wire, they were **absent from the linked image**: `sched.rs:3312` records the
+   `LC_ALL=C grep -a` over the linked `arm-tegra-el0` kernel that found no `[spread4] live`, because
+   every caller was unreachable. Score two lines, and mind which is suppressible:
+   * `[el0live] verdict=` — chained at `sched.rs:8414` **before** the change-suppression, so it
+     prints on every window regardless of whether load moved. **This is the primary predicate**: an
+     armed-but-idle machine still emits it, so its absence is a real failure rather than a quiet
+     machine.
+   * `[spread4] live c0=N/M` and `[prio] svc=` — chained at `:8418`/`:8419`, i.e. only when
+     `load_witness_emit()` returned true (the packed per-core busy signature CHANGED). Expect them
+     on a render8-shaped boot with the desktop, quarry and pulse live; their absence on a genuinely
+     idle boot is not by itself a failure.
+
+   ⚠ All of these are **cross-platform** strings the Pi prints constantly (tens of thousands of hits
+   tree-wide, overwhelmingly Pi). Score a per-flight LINE RANGE of the Orin capture, never the
+   shared `raw.log` — reading another board's preemption as this board's is the standing trap.
+6. **An EL0 tenant is admitted and runs under it** — `[bsprun] el0 first-run … eret to EL0 ACCEPTED`,
+   with the JD2 console still answering a keystroke and a click afterwards. Interactivity surviving
+   quantum expiry is the point of the flip; a tenant accepted onto a wedged console is not a pass.
+7. **Nothing regressed** — `exceptions=0`, `el2=0`, and zero hits of the `[wedge4]
+   preempt-in-section` tripwire (`sched.rs:5157`), which lives inside `timer_preempt` and becomes
+   reachable on tegra only under this configuration.
+8. **The way back still works** — `UNAOS_NOBSPTICK=1 ./arroyo esp-jetson` produces an image whose
+   objcopy sha256 matches the pre-flip default, and whose wire carries zero `[orinbsptick]` and zero
+   `[orinbsprun]` lines and `CAPSTONE COMPLETE` present. Without this leg the flight proves the new
+   default works but not that the baseline is still reachable.
+
+**⚠ Lines that look like discriminators and are not.** `:: SCHED: load ::` does **not** distinguish
+the preemptive terminus from the cooperative one: its emitter `load_witness_emit` has two callers,
+`load_witness_tick` (from `timer_preempt`) and `load_witness_poll` (`sched.rs:8455`), and the poll
+is called from **`run_capstone_boot_core` itself** at `sched.rs:10201` — the *old* default's drive
+loop, at a CNTPCT-rate-limited ~1/s. A tickless boot prints the load train too, and `[pulse5]` /
+`[spin1]` ride the same emit. That is precisely why (5) keys on `[spread4]`, which the poll path
+does not chain, and not on the load line it sits beside.
+
+**The instrument for (2)-(4) is not yet armed.** `scripts/specs/jetson-sync1.spec:1063-1064` carry
+the two `[orinbsptick]` rows as `PENDING`, and PENDING is not failable in `orin-specscore.py`
+(`failable = d.kind in ("REQUIRE","COUNT","FORBID")`). On a default image those rows must become
+`REQUIRE` + a `COUNT`, and `:269`'s `REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] …)` alternation must
+collapse to the `[orinbsprun]` arm — otherwise a silently tickless default boot scores green. That
+inversion belongs to the flight arc, with the synthetic `jetson-sync1-green.capture` gaining the
+same lines in the same commit, and is deliberately NOT made here: a REQUIRE that no capture in the
+tree satisfies is a red gate with no flight behind it.
 
 
 ## §ORIN-STKDEPTH — a boot-core stack DEPTH at the tegra terminus (`orinfurn`, DEFAULT OFF)
