@@ -672,6 +672,35 @@ impl MountTable {
         // Asked UNCONDITIONALLY, in both directions. Gating them on which mount executes is what let
         // the hole open in the first place, and the executor is an implementation detail of where the
         // pair can be addressed — never a statement about who may write.
+        //
+        // ⚠ WHAT THE SECOND CALL DOES *TODAY*, stated so a reader does not credit it with more
+        // (rmbp 15's B68, measured, and it corrects this commit's own first claim). This function has
+        // exactly ONE caller — `shell.rs`'s `mv` — and it passes `SHELL_PRINCIPAL`, which IS
+        // `KERNEL_PRINCIPAL`: the shell is the console of the machine, not a tenant. Both authorizers
+        // short-circuit on that principal, so for every invocation REACHABLE TODAY the destination
+        // call reduces to the existence check `NativeBackend::authorize_write` runs before its ACL.
+        // It is a destination-parent EXISTENCE check now and an ACL check the day a non-kernel
+        // principal reaches this surface. Both halves are worth having; only one of them can fire,
+        // and no fixture driven through the shell verb can exercise the other — a green run through
+        // `mv` would prove nothing about the ACL. A witness has to call this seam directly with a
+        // non-kernel principal.
+        //
+        // ⚠ AND IT CAN REFUSE FOR A REASON THAT IS NOT AN ACL (pi 8): `native_write_authz` reads the
+        // inode BEFORE it short-circuits on the kernel principal, and a read miss returns `Denied` —
+        // so a destination parent that resolves to an id that will not read is INDISTINGUISHABLE
+        // from an ACL refusal, kernel principal or not. The root case is the one that would bite
+        // (`receiving_dir` yields `""` for a leaf at the mount root, which `native_abs` renders `/`),
+        // and it is MEASURED GREEN rather than argued: on the Pi `kernel8-test` leg `/` IS the native
+        // UnaFS volume (`:: ls1: /: K3HELLO.TXT K3PAT.BIN apps/ boot/ ::`), `shell.relics.mv` moves a
+        // file whose DESTINATION is at that root, and it passes — while `c8eb4038`, which asked about
+        // the destination LEAF instead of its parent, is exactly where that same path returned
+        // `-ENOENT`. The resolution half is live and proven on the leg that convicted the other shape.
+        //
+        // ⚠ FAT's new refusal point (rmbp 15): `FatBackend::authorize_write` ignores its `rel` but
+        // consults `read_only()` FIRST, so this call refuses a move INTO a read-only mount whose
+        // SOURCE is writable. Correct, and unreachable today only because `/boot` and `/apps` are one
+        // volume with one posture — which is the same unstated "both mounts share a posture"
+        // invariant that produced this defect, now load-bearing in one more place.
         bf.authorize_write(relf, principal)?;
         bt.authorize_write(&receiving_dir(relt), principal)?;
         b.rename(rf, rt, principal)
@@ -1466,7 +1495,23 @@ fn native_write_authz(
     use ::unafs::inode::AttributeValue;
     let ino = match fs.read_inode(id) {
         Ok(i) => i,
-        Err(_) => return Err(VfsError::Denied), // gone -> fail closed for everyone
+        // FAIL CLOSED, BUT NOT IN AN ACL'S CLOTHES (rmbp 15 — the N1 class this round kept finding
+        // in corners: `mv` reporting cross-volume where the truth was a write veto, quarry's stamp
+        // claiming an invalidation it never performs, and this).
+        //
+        // The POSTURE is right and unchanged: an object whose inode will not read authorizes
+        // nothing, for everyone. Note it fails closed BEFORE the kernel short-circuit below, which
+        // is what makes it reachable at kernel authority — the reason `MountTable::rename`'s
+        // destination-parent call is NOT inert on today's only caller, which passes
+        // `KERNEL_PRINCIPAL`.
+        //
+        // The SPELLING was wrong. `Denied` renders as "permission denied (-EACCES)" in BOTH
+        // renderers (`shell.rs`'s `vfs_err` and `video/quarry/live.rs`), so a STORAGE failure was
+        // reported as a PERMISSIONS failure — sending an operator to look for an owner row that was
+        // never the problem, and making a consistency fault indistinguishable from an ACL refusal
+        // at exactly the seam where the two now meet. `Backend("inode-gone")` renders "backend
+        // error: inode-gone" and names the mechanism instead.
+        Err(_) => return Err(VfsError::Backend("inode-gone")),
     };
     if principal == KERNEL_PRINCIPAL {
         return Ok(());
