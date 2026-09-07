@@ -129,8 +129,36 @@ acquire_lock
 reclaim_stale_attach
 # ---- end BUILD-2 guards; critical section below is unchanged --------------------------------
 
-# Reserve an 8 MB tail for the unafs partition when one is staged.
-UNAFS_MB=8
+# Reserve a tail for the unafs partition when one is staged.
+#
+# UNAFSGROW (2026-09-07, orin 20): the two numbers this script used to BAKE IN — the size of the
+# reserved tail and the FAT volume's label — are now named knobs, defaulting to exactly the values
+# they were literals for. This is deliberately the smallest change that lets a SECOND platform lay
+# down the layout of record at its own size without a second partition writer to keep in sync (two
+# MBR stampers that drift is the class of defect `partition_witness` in fs/unafs.rs exists to catch).
+#
+#   UNAOS_IMG_UNAFS_MB    reserved partition-2 tail, MiB               default 8      (pi4: unchanged)
+#   UNAOS_IMG_FAT_LABEL   the FAT32 volume label on partition 1        default UNAOS-PI
+#
+# THE LABEL IS NOT COSMETIC on the Orin: the bench addresses the card BY LABEL and never by position
+# (~/unaos-bench/scratch/orin11/load-card.sh's `LABEL_WANT=UNAOS-ORIN` walk, and the same rule in
+# ~/unaos-bench/tools/card-watch.sh, where the label is "both the guard and the router"). A jetson
+# card image stamped UNAOS-PI would be refused by the very tool that loads it.
+#
+# BOTH DEFAULTS ARE TODAY'S VALUES — the knobs are read, not applied, on every existing call site.
+#
+# MEASURED, not asserted, and the honest number is not "byte-identical": this image can never be
+# byte-identical run-to-run, because `mkfs.fat` seeds `BS_VolID` from the clock. Same inputs
+# (UNAOS_NOSRC=1, one src tree, one unafs image), `cmp -l`:
+#   * PRE-KNOB script vs POST-KNOB script  ->  6 bytes differ, ALL of them inside BS_VolID
+#     (boot sector @+67 and its backup copy in sector 6). The FAT label reads `UNAOS-PI` in both.
+#   * PRE-KNOB script vs ITSELF, run twice ->  12 bytes differ: the same two BS_VolID fields plus
+#     four directory-entry timestamp bytes from mcopy.
+# So the knobbed script introduces STRICTLY LESS divergence than the unmodified script already
+# produces against itself. That is the strongest identity claim this build admits, and it is the
+# one to make rather than a "byte-identical" that a single `cmp` would falsify.
+UNAFS_MB="${UNAOS_IMG_UNAFS_MB:-8}"
+FAT_LABEL="${UNAOS_IMG_FAT_LABEL:-UNAOS-PI}"
 if [ -n "$UNAFS_IMG" ]; then
     [ -f "$UNAFS_IMG" ] || { echo "unafs image not found: $UNAFS_IMG" >&2; exit 1; }
     UNAFS_BYTES=$(fsize "$UNAFS_IMG")
@@ -242,9 +270,9 @@ if [ "$OS" = Darwin ]; then
     DEV=$(hdiutil attach -nomount "$OUT" | awk 'NR==1{print $1; exit}')
     # (cleanup trap already installed above detaches $DEV on any exit path)
     if [ -n "$UNAFS_IMG" ]; then
-        diskutil partitionDisk "$DEV" 2 MBR "MS-DOS FAT32" UNAOS-PI "$FAT_SPEC" "Free Space" FREE R >/dev/null
+        diskutil partitionDisk "$DEV" 2 MBR "MS-DOS FAT32" "$FAT_LABEL" "$FAT_SPEC" "Free Space" FREE R >/dev/null
     else
-        diskutil partitionDisk "$DEV" 1 MBR "MS-DOS FAT32" UNAOS-PI 100% >/dev/null
+        diskutil partitionDisk "$DEV" 1 MBR "MS-DOS FAT32" "$FAT_LABEL" 100% >/dev/null
     fi
     # NEVER address the volume by /Volumes name: if a physical card/stick named UNAOS is mounted,
     # partitionDisk's auto-mount lands the image at "/Volumes/UNAOS 1" and a name-addressed ditto
@@ -285,7 +313,7 @@ else
         | dd of="$OUT" bs=1 seek=446 count=16 conv=notrunc 2>/dev/null
     printf '\x55\xaa' | dd of="$OUT" bs=1 seek=510 count=2 conv=notrunc 2>/dev/null
     # -F 32 forced: mkfs.fat would pick FAT16 at this size, and the Pi GPU ROM wants FAT32.
-    mkfs.fat -F 32 -n UNAOS-PI -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) >/dev/null
+    mkfs.fat -F 32 -n "$FAT_LABEL" -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) >/dev/null
     mcopy -s -i "$OUT@@$(( P1_START * 512 ))" "$SRC"/* ::/
     # SOURCE-ALONG (see the Darwin branch note): copied explicitly, not via $SRC.
     if [ -n "$SRC_TGZ" ]; then

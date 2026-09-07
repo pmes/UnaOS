@@ -5139,6 +5139,248 @@ esp_jetson() {
 EOF
 }
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# UNAFSGROW (orin 20, 2026-09-07) — `esp-jetson-img`: the Orin's CARD IMAGE, geometry included.
+#
+# ## The gap this closes
+#
+# `esp_jetson` above stages a DIRECTORY TREE at $ESP_DIR_ARM and stops there. Every Orin card write
+# in this tree's history has then been a FILE-LEVEL copy of that tree into an ALREADY-PARTITIONED
+# FAT volume — `~/unaos-bench/scratch/orin11/load-card.sh` (`cp -R "$SRC/." "$MP/"` into the mount of
+# the partition labelled UNAOS-ORIN) and, before it, `~/unaos-bench/tools/card-watch.sh` (same shape).
+# NEITHER writes a partition table. So there has been NO in-tree command that lays down Orin card
+# GEOMETRY at all, and the geometry the bench card actually carries is inherited, not built:
+#
+#     :: PART: mbr handle=tegra-sd slot=1 type=0x0c start=2048   count=112640 end=114688 ACCEPT ::
+#     :: PART: mbr handle=tegra-sd slot=2 type=0x7f start=114688 count=16384  end=131072 ACCEPT ::
+#     :: PART: unafs span check — slot=2 ... span_blocks=2048 fits=yes magic=ok ::
+#         (docs/dev/evidence/orin16/sdmmcwrite-boot1.log:422-427)
+#
+# That is `make-pi-img.sh`'s DEFAULT layout with SIZE_MB=64 and UNAFS_MB=8, byte for byte — i.e. a PI
+# image was written whole onto the Orin's 62,333,952-sector (29.7 GiB) card at some point, and every
+# write since has only refreshed files inside its 55 MiB FAT. Three independent fingerprints agree:
+# the two MBR entries reproduce exactly under this script's Linux branch with no knobs set; their
+# 0xFF CHS fillers are this script's own `printf '\x00\xff\xff\xff…'` (sfdisk and diskutil write real
+# CHS); and the card's FAT32 BPB label is STILL `UNAOS-PI` on the wire —
+# `[sdmmc] root mount source=tegra-sd card_blocks=62333952 -> OK label="UNAOS-PI" …` — so a later
+# relabel touched only the root-directory entry `lsblk` reads and left the BPB saying pi.
+#
+# ⚠ READ `span_blocks` CORRECTLY, because the obvious reading is wrong and this arc nearly shipped
+# it. `PartitionSpan::block_count` is `p.sector_count / SECTORS_PER_BLOCK` — "number of whole 4096 B
+# blocks THE PARTITION HOLDS" (`libs/fs/unafs/src/adapter.rs`, the struct's own doc and
+# `locate_unafs`). It is the PARTITION span, never the volume's `superblock.block_count`, and both
+# witnesses print only the span. So `span_blocks=2048` says the partition is 8 MiB and says NOTHING
+# about the volume inside it — measured: a `unafs init -s 4` volume (block_count 1024) in the same
+# 8 MiB tail also reports `span_blocks=2048`. The volume on the bench card is therefore the 4 MiB Pi
+# K3 fixture (`arroyo` kernel8's `-s 4`), inside an 8 MiB partition, on a 29.7 GiB card — with
+# 99.8 % of the card outside the partition table entirely. Nothing on the read-only probe path ever
+# prints the volume's own block_count (only the `install_target` formatter does, sdmmc_tegra.rs), so
+# the volume's size is proven HOST-SIDE, by the readback below, and on the wire only indirectly —
+# by the partition span it exactly fills, and by the marker file staged into its root.
+#
+# ## Why 512 MiB, and why that number is not invented here
+#
+# The size is NOT a free parameter, and the tree already contains its derivation: `UNAFS_CAP_BLOCKS`
+# in `arch/aarch64/sdmmc_tegra.rs` (the TEGRA-UNAFS-FMT section), which caps the volume the INSTALLER
+# writes at 512 MiB = 131,072 blocks. Three constraints fix it, all of them properties of the mount
+# and none of them of the staging:
+#
+#   1. HEAP. `RefMap::try_new(block_count)` holds two `Vec<u32>` views = 8 B per 4096 B volume block,
+#      against `allocator::HEAP_SIZE` = 48 MiB on aarch64. At 512 MiB the map is 1 MiB (2.0 % of the
+#      heap); at the card's full 29.7 GiB it would be ~59.3 MiB, i.e. 1.24× the ENTIRE heap — format
+#      and mount would both fail.
+#   2. PER-BOOT READ COST. `main.rs`'s ORIN-UNAFS-ROOT probe-mount is gated on `sdmmc`, not on
+#      `install_target`, so `UnaFS::mount` → `load_committed` re-reads the refmap index plus every
+#      leaf on EVERY sdmmc boot, through `unafs::adapter::BlockAdapter`, which issues EIGHT 512 B
+#      `read_sector` calls per 4096 B block. Leaves scale as block_count/1024: 128 leaves + 1 index
+#      ≈ 1,032 polled CMD17 transfers at 512 MiB, ≈ 8,216 at 4 GiB.
+#   3. REFMAP SHAPE. 131,072 ≤ `superblock::MAX_BLOCK_COUNT_ONE_LEVEL` (524,288), so the volume stays
+#      SINGLE-LEVEL — the v3/v4 shape every existing volume in this tree uses. A larger cap would put
+#      the two-level index-of-indexes path (v5, host-tested only) on metal for the first time.
+#
+# Matching the installer's already-argued number is the point: the MBR staging path and the GPT
+# installer path then agree on the volume size instead of drifting, and `partition_witness`'s whole
+# job (two independent partition readers agreeing about one medium) keeps its meaning one layer up.
+# 512 MiB is 64× today's 8 MiB and 0.2 % of a 62,333,952-sector card — small against the card and
+# large against every consumer `/` has.
+#
+# ## The rest of the layout
+#
+#   FAT (p1, type 0x0c, label UNAOS-ORIN)  128 MiB   [2048 .. 262144)
+#   unafs (p2, type 0x7f)                  512 MiB   [262144 .. 1310720)
+#   image total                            640 MiB
+#
+# 128 MiB for the FAT is sized on measurement, not on habit: the staged tree is 17 MiB
+# (~/unaos-bench/flash/orin/render9-*), the largest thing that has ever ridden beside it is a
+# whole-tree `UPDATE.PAK` at 14 MiB, and the card accumulates screenshot harvests between writes.
+# 128 MiB is ~4× the largest observed occupancy and still leaves the image small enough to `dd` in
+# under a minute.
+#
+# THE LABEL IS LOAD-BEARING: `load-card.sh` finds the card by `LABEL_WANT=UNAOS-ORIN` and refuses
+# outright if no partition carries it, so the image must stamp that label or the very tool that
+# loads the card cannot see it. `make-pi-img.sh` learned `UNAOS_IMG_FAT_LABEL` for exactly this.
+#
+# ## Both layers, not one
+#
+# ORIN-TICKDEFAULT's lesson applies here in reverse: `esp-jetson` forces `tegra` into the FEATURE
+# LIST without setting `UNAOS_TEGRA`, so anything that keys on the env var alone never reaches bench
+# media. This verb therefore does not re-derive features at all — it CALLS `esp_jetson`, so the
+# image is built from exactly the tree the flown path produces, with every default-on knob
+# (`tegrasmp`, `bsptick`, `bsprun`) applied by the one block that applies them.
+#
+# `UNAOS_NOSRC=1` is set for the make-pi-img.sh call deliberately: `esp_jetson` → `pack_source_along`
+# has ALREADY written SRC.TGZ/SRC.SHA into $ESP_DIR_ARM, so letting make-pi-img.sh pack a second
+# copy would put two differently-timed tarballs on one volume.
+#
+# Usage:  ./arroyo esp-jetson-img            # -> target/UnaOS-orin-card.img  (+ the geometry witness)
+# Knobs:  UNAOS_ORIN_UNAFS_MB (512), UNAOS_ORIN_FAT_MB (128) — both feed the readback assertion, so a
+#         changed number is checked, never assumed.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+ORIN_CARD_IMG="${WORKSPACE_DIR}/target/UnaOS-orin-card.img"
+ORIN_UNAFS_IMG="${WORKSPACE_DIR}/target/unafs-orin.img"
+esp_jetson_img() {
+    local unafs_mb="${UNAOS_ORIN_UNAFS_MB:-512}"
+    local fat_mb="${UNAOS_ORIN_FAT_MB:-128}"
+    local img_mb=$(( fat_mb + unafs_mb ))
+
+    # 1. The boot tree, from the flown path itself (features, EL0 images, SRC.TGZ and all).
+    esp_jetson
+
+    # 2. The native volume. Formatted by the host `unafs` CLI — the same frozen on-disk format the
+    #    kernel mounts, KAT-pinned in unaos/libs/fs/unafs — so the bytes on the card are produced by
+    #    the implementation of record and not by a second, drifting writer. `init -s N` sets the file
+    #    to N MiB and `FileSystem::format` takes `block_count` from the DEVICE, so the superblock's
+    #    block_count is N*256 by construction; step 4 reads it back off the image rather than trusting
+    #    that sentence.
+    local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
+    echo -e "${COLOR_YELLOW}⚡ Formatting the Orin native volume: ${unafs_mb} MiB (${ORIN_UNAFS_IMG})...${COLOR_RESET}"
+    rm -f "$ORIN_UNAFS_IMG"
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$ORIN_UNAFS_IMG" -s "$unafs_mb"
+    # One marker file in the volume root, and it is LOAD-BEARING rather than decorative. Nothing on
+    # the read-only probe path prints the volume's own `block_count` (see the ⚠ above), so the wire
+    # can witness the PARTITION and not the VOLUME. This file is the volume's own name for itself: a
+    # boot that lists `/` off the card can tell the grown volume from the stale K3 fixture by NAME,
+    # which no geometry line can do when the geometry line is the thing under suspicion. Its content
+    # states the size. 8.3-clean, subsystem-named (never board-named).
+    printf 'UNAFSGROW %s MiB volume, %s blocks of 4096 B, staged by arroyo esp-jetson-img\n' \
+        "$unafs_mb" "$(( unafs_mb * 256 ))" > "${WORKSPACE_DIR}/target/UNAFSVOL.TXT"
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/UNAFSVOL.TXT" / -i "$ORIN_UNAFS_IMG"
+
+    # 3. The card image. ONE partition writer for both platforms; the knobs carry the differences.
+    echo -e "${COLOR_YELLOW}⚡ Building the Orin card image: ${img_mb} MiB (FAT ${fat_mb} + unafs ${unafs_mb})...${COLOR_RESET}"
+    rm -f "$ORIN_CARD_IMG"
+    UNAOS_NOSRC=1 UNAOS_IMG_UNAFS_MB="$unafs_mb" UNAOS_IMG_FAT_LABEL=UNAOS-ORIN \
+        bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" \
+        "$ESP_DIR_ARM" "$ORIN_CARD_IMG" "$img_mb" "$ORIN_UNAFS_IMG"
+
+    # 4. READ THE GEOMETRY BACK OFF THE BUILT IMAGE, and refuse if it is not what was asked for.
+    #    Not a print: every field is asserted, and the exit code is the verdict. The line it emits is
+    #    shaped like `fs/unafs.rs::partition_witness`'s own so a build and a boot can be compared by
+    #    eye. Superblock decode: bincode LEGACY config = fixed-width little-endian, so `Superblock`
+    #    (`libs/fs/unafs/src/superblock.rs`) is magic[5] | version u32 | block_size u32 |
+    #    block_count u64 | root_inode u64 | catalog_inode u64 — block_count at byte 13.
+    ORIN_IMG="$ORIN_CARD_IMG" ORIN_WANT_UNAFS_MB="$unafs_mb" ORIN_WANT_FAT_MB="$fat_mb" \
+        python3 - <<'PYORINGEO' || return 1
+import os, struct, sys
+
+img  = os.environ["ORIN_IMG"]
+uwant = int(os.environ["ORIN_WANT_UNAFS_MB"])
+fwant = int(os.environ["ORIN_WANT_FAT_MB"])
+fail = []
+
+with open(img, "rb") as f:
+    mbr = f.read(512)
+    if mbr[510:512] != b"\x55\xaa":
+        sys.exit("esp-jetson-img: no MBR boot signature at LBA 0 of " + img)
+
+    def entry(slot):                      # slot 1..4 -> (type, start_lba, sector_count)
+        off = 446 + (slot - 1) * 16
+        t = mbr[off + 4]
+        start, count = struct.unpack("<II", mbr[off + 8:off + 16])
+        return t, start, count
+
+    t1, s1, c1 = entry(1)
+    t2, s2, c2 = entry(2)
+
+    # The FAT volume label, read out of the FAT32 BPB (`BS_VolLab`, offset 71, 11 bytes) — the SAME
+    # field the kernel reads (`fs/fat.rs::FatFs::label`), NOT the root-directory label entry that
+    # `lsblk`/`udisks` read. The two can disagree, and on the bench card they DO: the wire says
+    # label="UNAOS-PI" while lsblk says UNAOS-ORIN, because the 2026-08-18 repurpose relabelled only
+    # the root-dir entry. Checking the BPB is what makes this assertion mean "new media".
+    f.seek(s1 * 512)
+    bpb = f.read(512)
+    label = bpb[71:82].decode("ascii", "replace").strip()
+
+    # The unafs superblock, read through the partition-2 offset the MBR itself declares.
+    f.seek(s2 * 512)
+    sb = f.read(512)
+    magic_ok = sb[0:5] == b"UNAFS"
+    version, block_size = struct.unpack("<II", sb[5:13])
+    block_count, = struct.unpack("<Q", sb[13:21])
+
+if t1 != 0x0C:  fail.append(f"p1 type 0x{t1:02x} != 0x0c")
+if s1 != 2048:  fail.append(f"p1 start {s1} != 2048")
+if c1 != fwant * 2048 - 2048:
+    fail.append(f"p1 count {c1} != {fwant * 2048 - 2048} ({fwant} MiB FAT)")
+if label != "UNAOS-ORIN":
+    fail.append(f"p1 FAT label {label!r} != 'UNAOS-ORIN' — load-card.sh finds the card by this label")
+if t2 != 0x7F:  fail.append(f"p2 type 0x{t2:02x} != 0x7f")
+if s2 != fwant * 2048:
+    fail.append(f"p2 start {s2} != {fwant * 2048}")
+if c2 != uwant * 2048:
+    fail.append(f"p2 count {c2} != {uwant * 2048} ({uwant} MiB tail)")
+if not magic_ok:
+    fail.append("p2 carries no UNAFS superblock magic")
+if block_size != 4096:
+    fail.append(f"superblock block_size {block_size} != 4096")
+if block_count != uwant * 256:
+    fail.append(f"superblock block_count {block_count} != {uwant * 256}")
+
+fits = block_count * 8 <= c2
+if not fits:
+    fail.append(f"volume {block_count} blocks ({block_count * 8} sectors) does NOT fit p2 ({c2} sectors)")
+
+# TWO DIFFERENT NUMBERS, NAMED APART ON PURPOSE. `span_blocks` is what the kernel's
+# `partition_witness` prints and it is the PARTITION span (c2/8, per `PartitionSpan::block_count`);
+# `vol_blocks` is the volume's own `superblock.block_count`, which no read-only boot ever prints.
+# This layout makes them equal — the volume exactly fills its partition — and that equality is
+# asserted above, so the wire's `span_blocks` is a faithful proxy for the volume size ON THIS MEDIA
+# and on no other.
+print(":: ORIN-CARD: p1 type=0x%02x part=[%d..%d) label=%s | p2 type=0x%02x part=[%d..%d) "
+      "span_blocks=%d vol_blocks=%d v%d fits=%s magic=%s ::"
+      % (t1, s1, s1 + c1, label, t2, s2, s2 + c2, c2 // 8, block_count, version,
+         "yes" if fits else "NO", "ok" if magic_ok else "MISSING"))
+print(":: ORIN-CARD: unafs volume %d MiB in a %d MiB partition on a %d MiB image ::"
+      % (block_count * 4096 // 1048576, c2 // 2048, os.path.getsize(img) // 1048576))
+
+if fail:
+    print("esp-jetson-img: GEOMETRY READBACK FAILED:", file=sys.stderr)
+    for x in fail:
+        print("   " + x, file=sys.stderr)
+    sys.exit(1)
+PYORINGEO
+
+    echo -e "${COLOR_GREEN}✅ Orin card image: ${ORIN_CARD_IMG} ($(du -h "$ORIN_CARD_IMG" | cut -f1), sha256 $(sha256_of "$ORIN_CARD_IMG" | cut -c1-16)...)${COLOR_RESET}"
+    cat <<EOF
+
+  WRITE IT — this REPARTITIONS the card and ERASES everything on it. One time only: after this,
+  ordinary staging (load-card.sh) keeps working unchanged, because the FAT partition is still
+  partition 1 and still labelled UNAOS-ORIN.
+    1. Harvest anything the card still holds that is not already off it (screenshots, captures).
+    2. Find the WHOLE-DISK node — not the p1 partition node the file-level tools use:
+         lsblk -o NAME,LABEL,SIZE,TYPE            # UNAOS-ORIN is on mmcblk0p1 => the disk is mmcblk0
+         udisksctl unmount -b /dev/mmcblk0p1      # must be unmounted
+    3. Write the image to the DISK:
+         sudo dd if=${ORIN_CARD_IMG} of=/dev/mmcblk0 bs=4M conv=fsync status=progress
+         sync
+    4. Re-seat the card and confirm the new table before booting:
+         sudo partprobe /dev/mmcblk0 ; lsblk -o NAME,LABEL,SIZE /dev/mmcblk0
+       Expect p1 UNAOS-ORIN ${fat_mb}M and p2 (unlabelled, type 0x7f) ${unafs_mb}M.
+    5. Stage as usual — the card is a normal UNAOS-ORIN card again:
+         ~/unaos-bench/scratch/orin11/load-card.sh <staged-dir> --write
+EOF
+}
+
 # ORIN-SELFUP payload builder — the SCAFFOLDING-SIDE half of the self-update transport seam.
 # Packs a staged ESP tree (default: the esp-jetson output at $ESP_DIR_ARM) into the UPK1 container
 # the kernel's `arch/aarch64/selfup_tegra.rs` parses, plus its detached digest:
@@ -7199,6 +7441,9 @@ case "${1:-}" in
     esp-jetson|esp_jetson|jetson)
         esp_jetson
         ;;
+    esp-jetson-img|esp_jetson_img|jetson-img)
+        esp_jetson_img
+        ;;
     selfup-pak|selfup_pak)
         selfup_pak "${2:-}" "${3:-}"
         ;;
@@ -7246,7 +7491,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
         exit 1
         ;;
 esac
