@@ -3458,14 +3458,192 @@ mod metal {
         crate::fs::unafs::locate_on(crate::drivers::block::BlockHandle::TegraSd)
     }
 
+    /// BOOTIDLIVE (orin 20): the boot-medium identity verdict — "is the card I am about to root on the
+    /// medium this kernel was loaded from?"
+    ///
+    /// A named type rather than a `bool` because the answer has THREE outcomes and only one of them is
+    /// a refusal. A `bool` would have to fold `disarmed` into `proceed`, and the wire would then be
+    /// unable to say whether the guard ran and agreed or never had an operand — the FRGUARD lesson (a
+    /// witness that only speaks on mismatch is a guard whose input is invisible).
+    #[cfg(feature = "sdmmcroot")]
+    #[derive(Clone, Copy, Debug)]
+    enum BootMedium {
+        /// Both identities were read and they AGREE. The card in the Tegra slot carries the FAT volume
+        /// the loader booted from, so `/`, `/boot` and `/apps` all land on the boot medium.
+        Same,
+        /// One of the two operands does not exist this boot, so no comparison is possible. FAILS OPEN —
+        /// the bind proceeds exactly as it did before this guard existed, and says so.
+        Disarmed,
+        /// Both identities were read and they DISAGREE. The kernel was loaded from one medium and asked
+        /// to root on another. Refuses.
+        Foreign,
+    }
+
+    /// BOOTIDLIVE: the whole decision, as a pure `const fn` over its two operands.
+    ///
+    /// **It is a `const fn` so that it can be EXECUTED by the type-check gate.** `arch/aarch64/serial.rs`
+    /// already carries this idiom and its reason: the kernel crate is `no_std` with no host test runner,
+    /// `#[cfg(test)]` code is invisible to `./arroyo check`, and the tree has deliberately deleted such
+    /// modules (`gui_watchdog.rs`, `drivers/gpu/kepler.rs`). A `const _: () = assert!(..)` below is not a
+    /// comment about what this function would do — rustc const-evaluates it on every build of the
+    /// `arm-tegra-sdmmcroot` leg, and a wrong answer is a RED gate, not a stale doc line.
+    ///
+    /// Splitting the decision out of [`root_probe`] is what makes that possible: the runtime function
+    /// cannot be const-evaluated (it reads a card), this one takes the two values and nothing else.
+    #[cfg(feature = "sdmmcroot")]
+    const fn boot_medium_verdict(boot_serial: u32, card_esp_serial: Option<u32>) -> BootMedium {
+        // 0 is the loader's ABSENT SENTINEL, not a serial: `read_boot_volume_serial` returns 0 from
+        // every failure path (`crates/bootloader/src/main.rs`), and `arch/aarch64/boot.rs` builds a
+        // `BootInfo` with `boot_volume_serial: 0` on a board whose loader never reads one. Comparing
+        // against it would refuse every such boot on a value that means "unknown".
+        if boot_serial == 0 {
+            return BootMedium::Disarmed;
+        }
+        match card_esp_serial {
+            // The card carries no FAT volume this driver accepts, so there is no second identity. This
+            // is a NEW disarm case that the fallback-only guard could not have: on the fallback leg the
+            // FAT mount succeeding is a precondition of reaching the check at all, but on the native leg
+            // `/` comes from UnaFS and the ESP may legitimately be unreadable. Refusing there would turn
+            // a working native root RED on the strength of a volume `/` does not use.
+            None => BootMedium::Disarmed,
+            Some(v) => {
+                if v == boot_serial {
+                    BootMedium::Same
+                } else {
+                    BootMedium::Foreign
+                }
+            }
+        }
+    }
+
+    /// BOOTIDLIVE: the render9 operands, as DATA — the two identities that were both on the wire of one
+    /// Orin flight while no code compared them.
+    ///
+    /// `~/unaos-bench/scratch/orin19/pointerlag/boot-render9.log`:
+    ///
+    /// ```text
+    ///   crates/bootloader/src/main.rs@961: boot volume FAT serial 0xde001a13 (extended BPB BS_VolID)
+    ///   [sdmmc] root mount source=tegra-sd card_blocks=62333952 -> OK label="UNAOS-PI" vol_id=0xabfbdefa …
+    /// ```
+    ///
+    /// They are constants HERE so the falsifier is a DATA edit. Changing [`RENDER9_CARD_ESP_VOL_ID`] to
+    /// equal [`RENDER9_LOADER_SERIAL`] turns the first assertion below RED without one character of the
+    /// comparison moving — which is the only kind of falsifier that proves the operands are load-bearing.
+    /// Editing the `if` would prove the branch prints, and nothing else.
+    #[cfg(feature = "sdmmcroot")]
+    const RENDER9_LOADER_SERIAL: u32 = 0xde00_1a13;
+    /// BOOTIDLIVE: see [`RENDER9_LOADER_SERIAL`]. The FAT `BS_VolID` of the ESP on the card in the Orin's
+    /// own microSD slot, as `root_probe` printed it on render9 — a DIFFERENT physical medium.
+    #[cfg(feature = "sdmmcroot")]
+    const RENDER9_CARD_ESP_VOL_ID: u32 = 0xabfb_defa;
+    /// BOOTIDLIVE: the value the card's ESP must carry for a flight to BIND — the operator fix render9
+    /// convicts, which is to boot and stage the SAME medium. A separate constant rather than reusing
+    /// [`RENDER9_LOADER_SERIAL`] twice so the agreement assertion below has a falsifier of its own: an
+    /// assertion whose two operands are literally the same constant cannot be made to fail by editing
+    /// data, and an assertion that cannot fail proves nothing.
+    #[cfg(feature = "sdmmcroot")]
+    const RENDER10_STAGED_ESP_VOL_ID: u32 = 0xde00_1a13;
+
+    /// BOOTIDLIVE: [`boot_medium_verdict`] EXECUTED, at compile time, on all four of its outcomes.
+    ///
+    /// The third and fourth assertions are the AGREEMENT and DISARMED cases, and they are here for the
+    /// same reason the wire prints them: a guard exercised only on its refusal arm has an invisible
+    /// input. If the function ever degenerated to "always Foreign" — the shape a mismatch-only test
+    /// cannot catch — assertion 2 reds.
+    #[cfg(feature = "sdmmcroot")]
+    const _: () = {
+        // 1. render9 EXACTLY AS FLOWN -> REFUSE. Two media, two serials, no agreement.
+        assert!(matches!(
+            boot_medium_verdict(RENDER9_LOADER_SERIAL, Some(RENDER9_CARD_ESP_VOL_ID)),
+            BootMedium::Foreign
+        ));
+        // 2. THE AGREEMENT CASE — the same loader, on a card staged from the medium it booted.
+        assert!(matches!(
+            boot_medium_verdict(RENDER9_LOADER_SERIAL, Some(RENDER10_STAGED_ESP_VOL_ID)),
+            BootMedium::Same
+        ));
+        // 3. No loader serial (the absent sentinel) -> DISARMED, never Foreign.
+        assert!(matches!(
+            boot_medium_verdict(0, Some(RENDER9_CARD_ESP_VOL_ID)),
+            BootMedium::Disarmed
+        ));
+        // 4. No readable ESP on the card -> DISARMED, never Foreign. This is the native leg's own
+        //    disarm case, and getting it wrong would red a working native root.
+        assert!(matches!(
+            boot_medium_verdict(RENDER9_LOADER_SERIAL, None),
+            BootMedium::Disarmed
+        ));
+    };
+
     /// ROOTFS: can the card's FAT volume be mounted this boot? Runs at most once. Refuses, NAMED, when
     /// the census did not publish a card (M1/M2/M3 did not all pass, or `UNAOS_SDMMC=1` was not armed on
     /// metal) and when the medium carries no FAT volume the driver accepts.
     ///
     /// UNAFSROOT (orin 20): it now answers a THREE-way question, and it asks the medium before it
-    /// answers. The native leg runs first because the native volume is the root of record on this
-    /// architecture (`shell::vfs_mount_table`'s aarch64 arm mounts `NativeBackend` at `/`); the FAT
-    /// leg below is the FALLBACK, and reaching it now requires a partition-table walk to have failed.
+    /// answers. The native volume is the root of record on this architecture
+    /// (`shell::vfs_mount_table`'s aarch64 arm mounts `NativeBackend` at `/`); the FAT leg below is
+    /// the FALLBACK, and reaching it requires a partition-table walk to have failed.
+    ///
+    /// ── BOOTIDLIVE (orin 20): THE IDENTITY QUESTION IS ASKED ONCE, ABOVE THE ROOT CHOICE. ─────────
+    ///
+    /// **The composition defect this fixes.** UNAFSROOT and ORIN-BOOTID were each correct alone and
+    /// dead together. UNAFSROOT added an `Ok(span) => … return ROOT_NATIVE` arm ABOVE the FAT mount;
+    /// ORIN-BOOTID folded the boot-medium comparison INTO that FAT mount's `Ok` arm. Composed, the
+    /// early return fires first and the guard sits on the FALLBACK LEG ONLY. Nothing conflicted,
+    /// nothing failed to compile, and no gate could notice: a guard the taken path never reaches is
+    /// indistinguishable from a guard that agreed.
+    ///
+    /// **And the bench card takes the native leg**, so the guard ran on no boot at all. render9's wire
+    /// carries `:: PART: unafs span check — slot=2 type=0x7f part=[114688..131072) … magic=ok ::` —
+    /// the success condition of the very `locate_on(TegraSd)` call [`root_native_witness`] makes. The
+    /// two mismatching identities that flight exposed (loader `boot volume FAT serial 0xde001a13` vs
+    /// mounted `vol_id=0xabfbdefa`, label `"UNAOS-PI"`) would have gone uncompared on the next flight
+    /// exactly as they did on that one.
+    ///
+    /// **So the check is HOISTED onto the unconditional path**, between the card census and the root
+    /// choice. It is not "the FAT leg's check, also run on the native leg" — it is a different and
+    /// prior question: *is this card the medium I booted from?*, asked before anything decides what to
+    /// mount on it. Both legs then inherit it by construction rather than by two copies staying in
+    /// step, and a future fourth root choice inherits it too.
+    ///
+    /// **Why the card's FAT ESP is the right operand on BOTH legs, and not a stand-in.** The native
+    /// leg is not FAT-free: it re-points `/boot` and `/apps` at `FatBackend::new_tegra_sd` — the card's
+    /// ESP — and leaves only `/` on UnaFS. So on the native leg this compares the identity of a volume
+    /// that IS being mounted. And it settles `/` too, transitively: `locate_on(BlockHandle::TegraSd)`
+    /// and `fat::mount_source(BlockSource::TegraSd)` both dispatch to
+    /// `block::read_block_tegra_sd` (`fs/fat.rs`'s read dispatch and `fs/unafs.rs`'s
+    /// `SdSectorDevice::open_on`) — ONE physical disk end to end, the SDSEAM discipline. If that card's
+    /// ESP is the boot volume, the card is the boot medium, and the UnaFS volume found on that same
+    /// card is on the boot medium.
+    ///
+    /// **Why a block-device-level comparison is NOT the shape.** It is the question one would rather
+    /// ask, and this board cannot ask it: the medium the firmware loaded from may be a USB card reader
+    /// behind the FIRMWARE's own USB stack, for which the kernel holds no handle (`BlockHandle` has
+    /// `Global`/`Usb`/`TegraSd`, and the `Usb` slot is this kernel's own xHCI enumeration — a different
+    /// device discovery with no identity link to the firmware's, and `UNAOS_SKIP_XHCI` can suppress it
+    /// outright). `drivers/block.rs`'s own note on `boot_volume_serial` states the same conclusion.
+    /// Loader-serial vs card-ESP-serial is the only comparison available here, and it is exact.
+    ///
+    /// **Why the two operands are genuinely independent** — the round's standing condition:
+    ///
+    /// | | `boot_volume_serial()` | the card's ESP `vol_id` |
+    /// |---|---|---|
+    /// | read by | the UEFI firmware's block driver | this kernel's Tegra SDHCI driver |
+    /// | path | `LoadedImage` -> device handle -> `BlockIO::read_blocks(LBA 0)` | `mount_source` -> MBR walk -> BPB sector -> polled CMD17 |
+    /// | when | before `ExitBootServices` | after it |
+    /// | on which medium | whatever the firmware booted from | the card in the Orin's own microSD slot |
+    ///
+    /// Neither is computed from the other; they share no cache, no code path and no variable. The
+    /// kernel cannot derive the first (it has no handle for the firmware's boot device); the
+    /// bootloader cannot derive the second (it never touches the Tegra SDHCI window). The ONLY way
+    /// they can be equal is if both readers read the same physical bytes — which is the claim. And it
+    /// is MEASURED, not argued: on render9 they disagreed (`0xde001a13` vs `0xabfbdefa`), which two
+    /// values sharing a source cannot do.
+    ///
+    /// **Cost.** One extra `fat::mount_source` on the NATIVE leg, which previously made none —
+    /// render9 measured that mount at `probe_us=89088`, so ~89 ms once per boot, at probe time, and
+    /// the new witness prints it as `esp_us=` rather than leaving it to be discovered. The FALLBACK
+    /// leg pays nothing new: the single mount taken here is the one it already made, reused below.
     #[cfg(feature = "sdmmcroot")]
     fn root_probe() -> u8 {
         let blocks = tegra_sd_card_blocks();
@@ -3475,6 +3653,64 @@ mod metal {
                 RPS
             );
             return ROOT_REFUSED;
+        }
+        // BOOTIDLIVE: ASK THE IDENTITY QUESTION FIRST — on the UNCONDITIONAL path, before anything
+        // below chooses a root. Every `return` this function can still take from here on is BELOW this
+        // block, so no root choice exists that skips it.
+        //
+        // The mount is taken ONCE and reused by the FAT fallback below (`match fat`), so the fallback
+        // leg's cost is unchanged and the two can never read different volumes — a second
+        // `mount_source` here would have been a second read of a medium that may have changed, and the
+        // guard would then be judging a volume the bind does not use.
+        let c0 = crate::arch::now_cycles();
+        let fat = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::TegraSd);
+        let us = root_us_since(c0);
+        let bvs = crate::drivers::block::boot_volume_serial();
+        // `.as_ref()` — the borrow ends with this statement, so `fat` itself is still owned by the
+        // fallback arm below.
+        let card_esp = fat.as_ref().ok().map(|fs| fs.volume_fingerprint().0);
+        match boot_medium_verdict(bvs, card_esp) {
+            // THE GATE, and it is a gate rather than a warning: returning `ROOT_REFUSED` makes
+            // `sdmmc_root_bind` leave the mount table exactly as the shared builder left it (its
+            // `verdict == ROOT_REFUSED` early return), so NEITHER `/` nor `/boot` nor `/apps` binds to
+            // a medium this kernel was not loaded from. Before BOOTIDLIVE this arm was unreachable on
+            // the card the bench actually boots.
+            BootMedium::Foreign => {
+                serial_println!(
+                    "{} -> REFUSED reason=boot-medium-mismatch boot_volume_serial={:#010x} card_esp_vol_id={:#010x} source=tegra-sd label=\"{}\" card_blocks={} esp_us={} — this kernel was LOADED from one medium and asked to bind `/`, `/boot` and `/apps` to a DIFFERENT one; REFUSING the bind rather than naming it. Checked ABOVE the root choice, so this covers the NATIVE leg as well as the FAT fallback ::",
+                    RPS,
+                    bvs,
+                    card_esp.unwrap_or(0),
+                    fat.as_ref().map(|f| f.label()).unwrap_or_default(),
+                    blocks,
+                    us
+                );
+                return ROOT_REFUSED;
+            }
+            // THE AGREEMENT WITNESS. It speaks on the green path on purpose: a guard that only prints
+            // when it refuses cannot be told apart from a guard that never ran, which is precisely the
+            // failure this arc exists to fix (FRGUARD's lesson, and rmbp's standing condition).
+            BootMedium::Same => serial_println!(
+                "{} bootid boot_volume_serial={:#010x} == card_esp_vol_id={:#010x} -> SAME-MEDIUM (checked before the root choice; covers the native leg) esp_us={} ::",
+                RPS,
+                bvs,
+                card_esp.unwrap_or(0),
+                us
+            ),
+            // FAILS OPEN, NAMED. Two different missing operands, and the wire says which — an
+            // unidentifiable boot volume is a reason to speak, not to refuse, matching the
+            // disarmed-sentinel direction `drivers/block.rs` and INSTALL-SELF take on the same value.
+            BootMedium::Disarmed => serial_println!(
+                "{} bootid DISARMED reason={} boot_volume_serial={:#010x} card_esp={} esp_us={} — no comparison is possible, so the bind proceeds exactly as it did before this guard existed ::",
+                RPS,
+                if bvs == 0 { "no-boot-serial (the loader published no BS_VolID for the medium it loaded this kernel from)" } else { "card-esp-unreadable (this card carries no FAT volume the driver accepts, so there is no second identity)" },
+                bvs,
+                match fat.as_ref() {
+                    Ok(f) => alloc::format!("{:#010x}", f.volume_fingerprint().0),
+                    Err(e) => alloc::format!("unreadable ({:?})", e),
+                },
+                us
+            ),
         }
         // UNAFSROOT: ASK THE MEDIUM. Both fields below are returned values; neither is a literal.
         let default = root_default_witness();
@@ -3499,12 +3735,14 @@ mod metal {
                 RPS, e, default
             ),
         }
-        let c0 = crate::arch::now_cycles();
-        match crate::fs::fat::mount_source(crate::fs::fat::BlockSource::TegraSd) {
+        // BOOTIDLIVE: the SAME `fat` value the identity gate above judged — MOVED here, not re-taken.
+        // A second `mount_source` would cost another ~89 ms volume scan and, worse, open a window in
+        // which the guard's operand and the volume actually bound could differ. `us` is that one
+        // mount's measured cost and keeps its `probe_us=` name on the wire.
+        match fat {
             Ok(fs) => {
-                let us = root_us_since(c0);
                 let (vol_id, clusters) = fs.volume_fingerprint();
-                let label = fs.label(); let bvs = crate::drivers::block::boot_volume_serial(); if bvs == 0 { serial_println!("{} bootid DISARMED reason=no-boot-serial mounted_vol_id={:#010x} — the loader published no BS_VolID for the medium it loaded this kernel from, so no comparison is possible; the bind proceeds exactly as it did before this check existed ::", RPS, vol_id); } else if bvs != vol_id { serial_println!("{} -> REFUSED reason=boot-medium-mismatch boot_volume_serial={:#010x} mounted_vol_id={:#010x} source=tegra-sd label=\"{}\" card_blocks={} — this kernel was LOADED from one medium and asked to bind `/`, `/boot` and `/apps` to a DIFFERENT one; REFUSING the bind rather than naming it ::", RPS, bvs, vol_id, label, blocks); return ROOT_REFUSED; } else { serial_println!("{} bootid boot_volume_serial={:#010x} == mounted_vol_id={:#010x} -> SAME-MEDIUM ::", RPS, bvs, vol_id); } // ORIN-BOOTID — THE COMPARISON THIS PROBE COULD NOT MAKE. `vol_id` has always been read here and PRINTED; nothing tested it. render9 is what that costs: the Orin booted the correct kernel off a USB card reader (loader `boot volume FAT serial 0xde001a13`) and then bound `/`, `/boot` and `/apps` to `BlockSource::TegraSd` — `vol_id=0xabfbdefa`, label "UNAOS-PI", a SECOND physical medium that staging never writes. Both identities were on the wire on the same flight and no code compared them. THREE ARMS, and the middle one is a GATE, not a warning: a mismatch RETURNS `ROOT_REFUSED`, so `sdmmc_root_bind` leaves the table exactly as the shared builder left it (its `verdict != ROOT_BOUND` early return) instead of rooting the system on a medium it did not boot from. FAILS OPEN on `bvs == 0` and says so, matching the disarmed-sentinel direction `drivers/block.rs` and INSTALL-SELF both take on the same value — an unidentifiable boot volume is a reason to speak, not to refuse. ⚠ THIS TURNS THE CURRENT ORIN FLIGHT RED, and that is the point: render9's bind was the defect, and the operator fix is to boot and stage the SAME medium. Folded onto the `let label` statement, statements before the first `//`, so no line below moves and a `sdmmc`-without-`sdmmcroot` image stays byte-identical.
+                let label = fs.label();
                 serial_println!(
                     "{} mount source=tegra-sd card_blocks={} -> OK label=\"{}\" vol_id={:#010x} clusters={} cluster_bytes={} probe_us={} ::",
                     RPS, blocks, label, vol_id, clusters, fs.cluster_size(), us
