@@ -3361,6 +3361,129 @@ fn shell_relics_native_witness() {
     let ok = !listed("/", "RELIC2.TXT") && listed("/", "RELIC3.TXT");
     verdict("shell.relics.mv", ok, &got);
 
+    // 6b. XVOL (orin 19) — `mv` BETWEEN TWO VOLUMES, and it asserts THE REFUSAL, because refusing is
+    //     what this move does and what it MUST do. Leg 6 above is native -> native (both operands at
+    //     `/`), so every `mv` witness in this tree stayed inside one backend; `layout.mv` crosses two
+    //     MOUNTS but they are one VOLUME by construction (it skips itself unless `same_volume` says
+    //     so). Nothing exercised the arm that decides between those two worlds.
+    //
+    //     # THE LEG WAS FIRST WRITTEN TO ASSERT THE MOVE, AND THE MEASUREMENT REFUTED IT
+    //
+    //     Written to assert `mv /XVOL.TXT /boot/XVOL.TXT` LANDS — gone from the native root, present
+    //     on the FAT side, bytes identical — it reds, and the capture says why in the verb's own
+    //     words: `mv: cross-volume move is not supported (copy with `cp`, then `rm`)`, with
+    //     `gone_here=false at_far=false`. That is not a defect to be fixed into a pass. `/` is UnaFS
+    //     and `/boot` is FAT on ONE physical card, `NativeBackend::volume_id` mixes the `vfs:unafs:`
+    //     domain tag BEFORE anything about the medium precisely so no FAT id can ever equal it, and
+    //     `fs_mv`'s `same_volume` guard plus `MountTable::rename`'s `same_storage` guard both refuse.
+    //     A rename relinks a directory entry; relinking an UnaFS inode into a FAT directory is the
+    //     corruption those guards exist to prevent. Copy-then-delete is a different operation and the
+    //     operator asks for it by typing `cp` then `rm`.
+    //
+    //     # SO THIS IS WHAT IT ASSERTS, AND IT IS TWO-SIDED
+    //
+    //     Not merely "the verb printed a refusal" — a leg that only reads the console would pass on a
+    //     verb that refused AFTER destroying the source. Four facts per direction, off the table:
+    //     the two volumes really are two (`same_volume` false, both ids `Some` and unequal — without
+    //     this the whole leg is vacuous, so it is asserted rather than assumed); `MountTable::rename`
+    //     ITSELF answers `Unsupported`, asked directly, so the guard is proven at the seam and not
+    //     only at the verb that happens to check first today; the source SURVIVES with its bytes
+    //     intact; and NOTHING appears at the destination.
+    //
+    //     What reds it is the aliasing regression the identity contract was built against (VOLID's
+    //     C1, one layer down): make `volume_id` medium-derived and the Pi's UnaFS root and FAT boot
+    //     volume — same card — compare EQUAL, the move is admitted, and every one of those facts
+    //     flips. Asserted in BOTH directions, because the two ends are two different backends and a
+    //     guard that held one way round has been the bug here before.
+    //
+    //     THE FAR PREFIX IS DERIVED, NEVER TYPED. It was `/fat` before LAYOUT and is `/boot` after
+    //     it; a literal that goes stale would silently become a within-FAT no-op — the exact defect
+    //     this leg exists to catch, hiding inside the test for it. Picking it by VOLUME IDENTITY is
+    //     stronger than any constant: the prefix chosen is by construction one whose `volume_id`
+    //     differs from `/`'s, so it cannot degrade into a same-volume move whatever gets renamed.
+    {
+        use crate::fs::vfs::VfsError;
+        const XV: &str = "XVOL.TXT"; // 8.3: FAT create on this driver writes short names only.
+        const BODY: &[u8] = b"xvol-bytes";
+        let mt = vfs_mount_table();
+        let here_id = mt.volume_id("/").ok().flatten();
+        let far_prefix = mt
+            .prefixes()
+            .into_iter()
+            .find(|p| {
+                let id = mt.volume_id(p).ok().flatten();
+                *p != "/" && id.is_some() && id != here_id
+            })
+            .map(String::from);
+        // A board with one volume (the Orin, whose ROOTFS knob re-points `/` and `/boot` at the one
+        // card) cannot exhibit the pair at all, and says so rather than passing silently.
+        match far_prefix {
+            None => serial_println!(
+                ":: relics: this board binds no volume beside / — shell.relics.mv.xvol skipped ::"),
+            Some(far_prefix) if matches!(mt.write_veto("/"), Ok(Some(_)))
+                || matches!(mt.write_veto(&far_prefix), Ok(Some(_))) => serial_println!(
+                ":: relics: / or {} refuses writes — shell.relics.mv.xvol skipped ::", far_prefix),
+            Some(far_prefix) => {
+                let native = vfs_join("/", XV);
+                let far = vfs_join(&far_prefix, XV);
+                let scrub = || {
+                    let _ = mt.unlink(&native, SHELL_PRINCIPAL);
+                    let _ = mt.unlink(&far, SHELL_PRINCIPAL);
+                };
+                scrub(); // a red earlier run may have left the probe on either side
+                // THE PREMISE, ASSERTED: two volumes, and the table says so. If this ever answers
+                // `true` the leg is testing a same-volume move and must red, not quietly pass.
+                let two_volumes = mt.same_volume(&native, &far) == Ok(false)
+                    && here_id.is_some()
+                    && mt.volume_id(&far_prefix).ok().flatten().is_some();
+
+                // ── direction 1: native root -> the far volume ──────────────────────────────────
+                let staged_out = say(&|c: &mut Console| fs_write(c, &native, BODY));
+                let out_seam = mt.rename(&native, &far, SHELL_PRINCIPAL) == Err(VfsError::Unsupported);
+                let said_out = say(&|c: &mut Console| fs_mv(c, &native, &far, false));
+                let out_refused = said_out.contains("cross-volume");
+                let out_src_intact =
+                    listed("/", XV) && read_back(&native).as_deref() == Some(BODY);
+                let out_dst_empty = !listed(&far_prefix, XV) && read_back(&far).is_none();
+                scrub();
+
+                // ── direction 2: the far volume -> the native root ─────────────────────────────
+                let staged_back = say(&|c: &mut Console| fs_write(c, &far, BODY));
+                let back_staged = read_back(&far).as_deref() == Some(BODY);
+                let back_seam = mt.rename(&far, &native, SHELL_PRINCIPAL) == Err(VfsError::Unsupported);
+                let said_back = say(&|c: &mut Console| fs_mv(c, &far, &native, false));
+                let back_refused = said_back.contains("cross-volume");
+                let back_src_intact =
+                    listed(&far_prefix, XV) && read_back(&far).as_deref() == Some(BODY);
+                let back_dst_empty = !listed("/", XV) && read_back(&native).is_none();
+                // SELF-CLEAN: `k3_mount_selftest` bit5 requires the native root to hold the staged
+                // fixtures and NOTHING else, so the probe leaves under both prefixes either way.
+                scrub();
+
+                // Said once, beside the verdict, so no reader of a bare `-> PASS ::` can take this
+                // leg for a claim that the move SUCCEEDS. It asserts that it is refused, intact.
+                serial_println!(
+                    ":: relics: mv between / and {} is REFUSED BY VOLUME IDENTITY (two filesystems, \
+                     one card); this leg asserts the refusal AND that both ends survive it ::",
+                    far_prefix);
+                verdict(
+                    "shell.relics.mv.xvol",
+                    two_volumes
+                        && out_seam && out_refused && out_src_intact && out_dst_empty
+                        && back_staged && back_seam && back_refused && back_src_intact
+                        && back_dst_empty,
+                    &alloc::format!(
+                        "far={} two_volumes={} | out: seam={} refused={} src_intact={} \
+                         dst_empty={} said=[{}] staged=[{}] | back: staged={} seam={} refused={} \
+                         src_intact={} dst_empty={} said=[{}] staged=[{}]",
+                        far_prefix, two_volumes, out_seam, out_refused, out_src_intact,
+                        out_dst_empty, said_out, staged_out, back_staged, back_seam, back_refused,
+                        back_src_intact, back_dst_empty, said_back, staged_back),
+                );
+            }
+        }
+    }
+
     // 7. `setfattr -x` (was `urmattr`) — plant a typed attribute through the crate, drop it through
     //    the VERB's helper, and prove it is gone by asking the crate again. Both ends are real.
     let planted = crate::fs::unafs::with_unafs(|fs| {
