@@ -938,7 +938,7 @@ pub fn default_writable() -> bool {
 
 /// FRGUARD: `BS_VolID` of the volume the kernel was loaded from, as the UEFI loader read it. 0 = absent
 /// (the disarmed sentinel). Published once from the kernel entry path before any storage exists.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "sdhcblk"), all(target_arch = "aarch64", feature = "sdmmc")))] // ORIN-BOOTID: the x86 arm is CHARACTER-IDENTICAL to the predicate that was here, so no x86 build of any feature combination gains or loses an item, and the edit is LINE-NEUTRAL so no `panic::Location` in this file moves. The aarch64 arm carries ONLY the cell and its two accessors below — never `BOOT_MEDIUM_VERDICT`, the `BM_*` verdicts, `evaluate_boot_medium_once`, `default_writable` or `program_source`, all of which stay `all(x86_64, sdhcblk)`. `sdmmc`, NOT `sdmmcroot` — rmbp 15's condition on the grant, and it DELETES a hazard rather than scheduling around it. `sdmmcroot = ["sdmmc"]` in `crates/kernel/Cargo.toml`, so `sdmmc` is a strict SUPERSET: every build that would have matched the narrower gate still matches, and the only builds ADDED are `sdmmc`-without-`sdmmcroot`, where the added effect is retaining a value nothing on that build reads — inert by construction. Written against `sdmmcroot` this would MISCOMPILE SILENTLY the moment C15 (`cdce5129`) lands, because C15 DELETES that feature: an arm that compiles to nothing while looking correct, and no merge conflict to catch it. Against `sdmmc` the two fold in either order — the same substitution C15 already performs on its own three outside sites. The only aarch64 CONSUMER is `arch::aarch64::sdmmc_tegra::{root_probe, sdmmc_root_bind}`, which keeps its own `sdmmcroot` gate in that file, so this still cannot put the facility on a board with no Tegra SD slot; and on an aarch64 board whose loader never reads a `BS_VolID` the field is 0 (`arch/aarch64/boot.rs` builds `BootInfo` with `boot_volume_serial: 0`), which is the disarmed sentinel this module already documents four lines above.
 static BOOT_VOLUME_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Not yet derived for the current occupant of the global slot.
@@ -974,9 +974,9 @@ static BOOT_MEDIUM_VERDICT: core::sync::atomic::AtomicU8 = core::sync::atomic::A
 /// the installer features and is absent from every bench/boot build, which is exactly why its
 /// `:: install: boot volume serial …` line appears ZERO times in the 30-boot capture. This one is not
 /// gated on the installer, so the guard's own input is on the wire on every boot it can affect.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "sdhcblk"), all(target_arch = "aarch64", feature = "sdmmc")))] // ORIN-BOOTID — see the widening note on `BOOT_VOLUME_SERIAL`. On aarch64 the caller is NOT `main.rs`'s FRGUARD line: `kernel_main` calls `tegra_early_stop` (`-> !`) 73 lines above it, so on a tegra image that publish is unreachable and the tegra publish rides `tegra_early_stop`'s `memory::init` line instead.
 pub fn set_boot_volume_serial(serial: u32) {
-    BOOT_VOLUME_SERIAL.store(serial, core::sync::atomic::Ordering::Release);
+    BOOT_VOLUME_SERIAL.store(serial, core::sync::atomic::Ordering::Release); #[cfg(not(target_arch = "x86_64"))] let _ = serial; #[cfg(target_arch = "x86_64")] // ORIN-BOOTID — ⚠ THE FRGUARD WITNESS BELOW IS X86-ONLY ON PURPOSE, and this gate is the correction to the naive widening. Both of its lines name the "Default-write substitution guard", and on aarch64 THAT GUARD DOES NOT EXIST: `default_writable`, `evaluate_boot_medium_once` and the `BM_*` verdicts all keep `all(x86_64, sdhcblk)`. Printing `ARMED` on the Orin would announce a facility the image does not contain. The aarch64 witness is `sdmmc_tegra::root_probe`'s three-armed `bootid` line, which is strictly better: it names BOTH identities and it REFUSES. x86 is untouched — the attribute is satisfied there, so the `if` compiles exactly as before; the `let _` absorbs the otherwise-unused `serial` on the aarch64 arm. ⚠ LINE-NEUTRAL: the attribute rides the tail of the `store` statement's line and binds to the `if` below.
     if serial == 0 {
         serial_println!(
             ":: FRGUARD: boot volume serial ABSENT (0) — Default-write substitution guard DISARMED \
@@ -997,7 +997,7 @@ pub fn set_boot_volume_serial(serial: u32) {
 /// volume serial side by side, so a capture shows whether the reserved extent lives on the medium
 /// this kernel booted from, and the FRGUARD verdict above can be read together with it. Nothing
 /// keys behaviour off this getter: SDHC-4c's bound is the LBA extent, not an identity test.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "sdhcblk"), all(target_arch = "aarch64", feature = "sdmmc")))] // ORIN-BOOTID — see the widening note on `BOOT_VOLUME_SERIAL`. The "nothing keys behaviour off this getter" sentence above is X86-SCOPED and stays true there; on aarch64 `sdmmc_tegra::root_probe` DOES key behaviour off it — a boot serial that disagrees with the mounted volume's `vol_id` REFUSES the `/` `/boot` `/apps` bind rather than naming it. That asymmetry is deliberate: on x86 the boot medium is reachable through the block layer and `evaluate_boot_medium_once` can judge it; on the Orin the boot medium may be a USB card reader the kernel has no handle for, so the only comparison available is loader-serial vs mounted-volume-serial, and it is exact.
 pub fn boot_volume_serial() -> u32 {
     BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire)
 }
