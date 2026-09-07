@@ -73,6 +73,19 @@ belongs here, on the day it is made.
 - **Default-quiet boot** (2026-07-18). Confirmed test families are not
   re-run on default boots; batteries live behind knobs (QEMU gates arm
   them). Gate, never delete.
+- **A wrapper that swallows the exit status is a gate that cannot fire**
+  (2026-09-07, pi 8's near-miss, caught by them before it went out). A pipe
+  reports the LAST stage's status: `cmd --check ... | head` yields `head`'s
+  exit, so `cmd ... | head && echo APPLIES CLEAN` prints APPLIES CLEAN over a
+  `git apply` that failed. pi 8 sent themselves that green, caught it only by
+  re-running for the exit code alone, and reported the method error beside the
+  result. **The defect class is identical to a check whose pattern can never
+  match** — in both, the reading is produced by the harness rather than by the
+  thing under test, and both read as success. Any pipeline whose verdict is a
+  claim about an earlier stage must capture THAT stage's status (`PIPESTATUS`,
+  a temp file, or no pipe at all); a sentence of the form "X applies" / "X
+  passes" is worth exactly the exit code it was read from, and if you cannot
+  name that exit code you do not have the claim.
 
 ## Bench and media
 
