@@ -831,6 +831,80 @@ OPTIONAL \[orinclick\] .* -> DECLINE reason=
 # READ THIS BEFORE THE FLIGHT: it means an attended click that finds `stuck-focus`
 # turns the WHOLE replay FAIL. That is the intended reading, not a spec defect.
 
+# --- PTRPOLL / EVQPRINT (orin 20): the pointer-pipeline witness, and the one term on ---
+# --- it that was counted for a month and printed to nobody ----------------------------
+# ARMED BY `orinclick` — the same knob, the same file and the SAME census pass as the
+# three ORINCLICK rows above (`ptrpoll_witness`, arch/aarch64/display_tegra.rs, called
+# from the tick census beside `kbdpoll_witness`). This file has carried NO row for
+# `[ptrpoll]` since the instrument landed with CLICKDEAD (orin 15): render8 printed 25 of
+# these lines and render9 printed 27, and nothing in any spec had ever heard of them.
+#
+# WHAT ORIN 20 CHANGED, AND WHY IT NEEDED A ROW. `pal::EVQ_COALESCE_PTR` counts a
+# relative-motion report FOLDED into the event ring's newest entry instead of being given
+# a slot — its own doc: "a nonzero reading means the drain fell behind the pad and the
+# arrow was handed the whole backlog at once instead of walking it". It has been
+# incremented on this board on every boot since PTRDEAD and, until EVQPRINT, was read on
+# aarch64 by NOTHING: its only consumers were the x86-only `[ptrdead]` fixture's two
+# calls. POINTERLAG (orin 19) diagnosed Peter's pointer lag as one `jd2_console_pump`
+# iteration of motion-to-photon and named this counter as the cheapest corroboration
+# available. `[ptrpoll]` now carries it as `folded=` (per-boot total, the term name the
+# x86 `[ptrdead] backlog` line already uses for this counter) and `foldnew=` (the delta
+# since the PREVIOUS PRINTED `[ptrpoll]` line — a bare monotonic total says nothing about
+# now). An instrument that counts a real event and reports it to no one is the shape this
+# round is fixing; a rule that lets the report vanish again would leave it half fixed.
+#
+# ⚠ WHY THERE IS NO `REQUIRE` HERE. Stated in full so nobody adds one later believing it
+# was an oversight. This file's head has held the rule since 2026-08-25: "The knob-gated
+# instruments (`orindesk` / `orinclick` / `jd1dc`) never move the count in either
+# direction; that is what their PENDING/OPTIONAL kinds are for", beside "ALL FIFTEEN [17
+# as of this arc] are forced by `tegra` + `tegra_el0` alone — no other knob moves the
+# required tally." `[ptrpoll]` is `orinclick`-gated. A REQUIRE on it would red every
+# unarmed boot on CONFIGURATION rather than on health — the SMPMARK argument in full, and
+# the same reason the `[orinclick]` census above is PENDING and not REQUIRE. So the
+# REQUIRE tally is UNMOVED at 17; the row that can red is a FORBID, below, and it moves
+# the spec-declared FORBID tally 16 -> 17.
+PENDING \[ptrpoll\] t=[0-9]+ rearm=[0-9]+
+# ---   GUARDS the FAMILY's liveness — that the pointer census is still printing at all.
+# ---   Absence on an `orinclick` capture means a dead pump, a cfg drift, or a dropped
+# ---   call site, exactly as for the `[orinclick] census` PENDING above.
+# ---   READS ⏳ AND NEVER REDS, for the configuration reason argued above. mbench will
+# ---   advise promoting it once it matches; the advice must NOT be taken, permanently,
+# ---   same as TEGRA-SD and the two `[orinclick]` PENDINGs.
+PENDING \[ptrpoll\] .*decoded=[0-9]+ folded=[0-9]+ foldnew=[0-9]+ ->
+# ---   GUARDS the two fold terms AND — the reason it is keyed on all three fields in
+# ---   ORDER rather than on `folded=` alone — the exact ADJACENCY the FORBID below
+# ---   depends on to be able to fire at all. If a later seat inserts a new term between
+# ---   `decoded=` and `folded=`, the FORBID silently becomes unfirable while everything
+# ---   stays green; this row drops to ⏳ in the same table on the same run and says so.
+# ---   A check that cannot fire is the failure this pair is shaped to make visible.
+# THE ROW THAT CAN ACTUALLY RED. `folded=`/`foldnew=` are printed between `decoded=` and
+# the ` -> ` that precedes every `[ptrpoll]` verdict, so a line where `decoded=<n>` is
+# followed DIRECTLY by ` ->` is a line that lost them. That shape is the pre-EVQPRINT
+# wire text verbatim and it is unreachable from the current format string, which is what
+# makes this a FORBID and not a wish. It cannot red an unarmed boot: it can only match a
+# `[ptrpoll]` line, and a boot without `orinclick` prints none.
+FORBID \[ptrpoll\] .*decoded=[0-9]+ ->
+# ---   GUARDS the two fold terms' PRESENCE on every `[ptrpoll]` line the wire carries.
+# ---   REDS WHEN: the `folded=`/`foldnew=` terms are dropped from `ptrpoll_witness`'s
+# ---   format string, or the fold read is cfg-erased and the line reverts.
+# ---   MEASURED, both directions, before this row shipped (orin 20, EVQPRINT):
+# ---     RED — the PRE-ARC green reference (`git show 98213b7f:` of the .capture beside
+# ---       this file, i.e. before this arc added a `[ptrpoll]` line to it) + ONE verbatim
+# ---       pre-fold `[ptrpoll]` line from render9 (~/unaos-bench/scratch/orin19/
+# ---       pointerlag/bootB-render9.log) replayed against this spec: EXIT=1, `MBENCH FAIL
+# ---       — 17/17 required witnesses, 1 forbidden hit(s)`. 17/17 — i.e. every pre-existing
+# ---       witness in this file stayed GREEN while the report was gone, which is the
+# ---       whole reason the row exists.
+# ---     RED, unsynthesised — the real render9 capture (27 `[ptrpoll]` lines, all
+# ---       pre-fold) replayed whole: 27 forbidden hits on this row.
+# ---     GREEN — the same synthetic capture with that one line replaced by the
+# ---       post-fold shape (derived by EXECUTING the new format string, not transcribed):
+# ---       EXIT=0, `MBENCH PASS — 17/17`, 0 forbidden hits, and the two PENDINGs above
+# ---       both promoted.
+# ---   The two captures differ in ONE line, so the row is a DISCRIMINATOR and not merely
+# ---   a red. ⚠ IF THIS REDS IT IS NOT A SPEC BUG — the fold terms are gone; put them
+# ---   back rather than relaxing the pattern.
+
 # --- JD1-DC: does the CCPLEX decode nvdisplay, and through WHICH register map? ------
 # ARMED BY `jd1dc`. `jd1_dc_probe` (display_tegra.rs:632) is called from main.rs:2127
 # with no runtime knob, inside the block guarded by JB1b's resolved DTB geometry —
