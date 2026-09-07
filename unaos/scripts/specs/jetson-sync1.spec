@@ -445,6 +445,93 @@ FORBID TEGRA-SD: REFUSED to publish
 # guards is `#[cfg(feature = "sdmmcroot")]`, so on an image without the knob this row is
 # unfireable for the same reason the two rows above it are — the code it forbids was not built.
 FORBID unafs has no volume here
+# --- UNAFSGROW: the card's NATIVE-VOLUME GEOMETRY, and the posture it is mounted in -----
+# 2026-09-07 (orin 20). Until this block the card's geometry lived in NOBODY'S memory but the
+# card's own. Every Orin write in this tree's history is a FILE-LEVEL copy into an
+# already-partitioned FAT volume (`~/unaos-bench/scratch/orin11/load-card.sh`, and
+# `~/unaos-bench/tools/card-watch.sh` before it), so the partition table was inherited from a
+# one-off whole-image write nobody recorded, and no rule anywhere asserted what it should be.
+# It was measured, and it is `make-pi-img.sh`'s DEFAULT pi4 layout — 64 MiB image, 8 MiB tail:
+#
+#     :: PART: mbr handle=tegra-sd slot=2 type=0x7f boot=0x00 start=114688 count=16384 end=131072 ACCEPT ::
+#     :: PART: unafs span check — slot=2 ... span_blocks=2048 fits=yes magic=ok ::
+#         (docs/dev/evidence/orin16/sdmmcwrite-boot1.log:423,427)
+#
+# The card's FAT32 BPB still says `UNAOS-PI` on the wire, which settles it —
+# `[sdmmc] root mount source=tegra-sd card_blocks=62333952 -> OK label="UNAOS-PI" …` — a later
+# relabel touched only the root-directory entry `lsblk` reads.
+#
+# ⚠ `span_blocks` IS THE PARTITION, NOT THE VOLUME. `PartitionSpan::block_count` is
+# `p.sector_count / SECTORS_PER_BLOCK` ("number of whole 4096 B blocks THE PARTITION HOLDS" —
+# `libs/fs/unafs/src/adapter.rs`, struct doc + `locate_unafs`), and BOTH witnesses print only the
+# span. Measured: a `unafs init -s 4` volume (block_count 1024) in the same 8 MiB tail also reports
+# `span_blocks=2048`. So today's card is an 8 MiB PARTITION holding the 4 MiB Pi K3 fixture, on a
+# 62,333,952-sector (29.7 GiB) card with 99.8 % of it outside the partition table — and NOTHING on
+# the read-only probe path ever prints the volume's own `block_count` (only `install_target`'s
+# formatter does). The rows below can therefore pin the PARTITION honestly and the volume only
+# indirectly; `esp-jetson-img` builds the volume to fill its partition exactly and asserts BOTH
+# host-side, which is what makes `span_blocks` a faithful proxy on this media and on no other.
+#
+# `arroyo esp-jetson-img` now BUILDS that geometry instead of inheriting it — 128 MiB FAT (label
+# UNAOS-ORIN, in the BPB this time) + a 512 MiB native volume filling a 512 MiB partition — and
+# asserts it out of the built image before it hands anyone a card-write recipe. These rows are the
+# same assertion on the WIRE, so the two ends cannot drift.
+#
+# WHY 512 MiB IS THE NUMBER TO PIN: it is not chosen here. `UNAFS_CAP_BLOCKS` in
+# `arch/aarch64/sdmmc_tegra.rs` already caps the INSTALLER's volume at 131,072 blocks for three
+# reasons that are properties of the MOUNT, not of the staging — the refmap costs 8 B per 4096 B
+# block against a 48 MiB aarch64 heap; the `sdmmc`-gated probe-mount in `main.rs` re-reads every
+# refmap leaf on EVERY boot through a single-sector adapter (128 leaves at this size, 1,024 at
+# 4 GiB); and 131,072 <= `superblock::MAX_BLOCK_COUNT_ONE_LEVEL` keeps the refmap single-level.
+# Pinning the same number is what keeps the MBR staging path and the GPT installer path agreeing.
+#
+# THE THREE POSITIVE ROWS ARE **PENDING**, NOT REQUIRE, and that is the standing rule of this
+# file rather than a hedge: every emitter below is reached only from `main.rs`'s ORIN-UNAFS-ROOT
+# probe under `#[cfg(feature = "sdmmc")]`, so a REQUIRE would red every unarmed boot on
+# CONFIGURATION rather than on health — the SMPMARK/TEGRA-SD argument, permanently binding here.
+# A boot that DOES carry them reads ✅ and mbench advises the promotion; the advice must not be
+# taken for the same reason it must not be taken for `TEGRA-SD.*block backend published`.
+# Required witnesses are therefore UNCHANGED at 17 by this block: PENDING and FORBID rows never
+# enter the REQUIRE/COUNT tally (mbench.py:323).
+#
+# EM DASHES: `partition_witness` puts its verdict after one, and the wire has mangled dashes
+# before, so no pattern here spans a literal dash — the span row keys on the contiguous ASCII
+# run `part=[...]` onward, and the two verdict FORBIDs bridge the dash with `.*`.
+PENDING PART: mbr handle=tegra-sd slot=2 type=0x7f boot=0x[0-9a-f]{2} start=262144 count=1048576 end=1310720 ACCEPT
+PENDING part=\[262144\.\.1310720\) span_base=262144 span_blocks=131072 fits=yes magic=ok
+# THE POSTURE, pinned as it actually is TODAY: read-only. `drivers/block.rs`'s
+# `write_block_tegra_sd` refuses in EVERY cfg by design — the card's only writer is the armed
+# `sdmmc_arm` -> `install_target` ladder — and `main.rs` mounts the volume, witnesses it and
+# DROPS it, leaving the shared `fs::unafs::MOUNT` on `BlockHandle::Global`. This row exists so
+# that if that posture ever changes it changes DELIBERATELY, with this line edited in the same
+# commit, instead of a boot quietly starting to say something else.
+PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
+# THE REGRESSION HALF. Each of these is a POSITIVE claim about the medium, and each fires only
+# when the witness line is present at all — so none of them can red an unarmed boot, exactly as
+# the two `recon`/`REFUSED to publish` rows above cannot.
+#   * `span_blocks=2048 fits=` is the STALE 8 MiB PARTITION (the one holding the 4 MiB Pi K3
+#     fixture). After the regrow, seeing it again means the card was reverted (or a second card
+#     was booted) — and note this row keys on the only number the wire actually carries, since
+#     the volume's own block_count is never printed. The first capture this
+#     row reds is one taken before the card is rewritten, and that is the CORRECT verdict, not
+#     a false alarm: the whole defect being closed is that nothing noticed the stale geometry.
+#   * `fits=NO` and `magic=MISSING` are `partition_witness`'s own two failure verdicts
+#     (fs/unafs.rs, the `if fits` / `if magic_ok` ternaries). BOTH ARE REACHABLE, and the reason
+#     matters because the obvious reading of `fits` makes it look tautological: `span` comes from
+#     the unafs crate's `parse_partitions` while `p` comes from the kernel's `block::decode_mbr`,
+#     and `fits` is `span.block_count * 8 <= p.sector_count`. When the two decoders AGREE,
+#     `span.block_count` is `p.sector_count / 8` and the inequality holds by construction — so
+#     `fits=NO` fires on exactly one condition: THE TWO PARTITION-TABLE READERS DISAGREEING about
+#     this partition's extent, which is the overlapping-extent hazard `partition_witness` was
+#     written to catch. `magic=MISSING` means the bounded, partition-relative path does not reach
+#     the superblock the crate's own arithmetic just read. Neither is ever noise.
+#   * `mount on TegraSd FAILED` is main.rs's own catch-all arm, whose comment already calls it
+#     "a real defect worth a capture". `NoVolume` is deliberately NOT forbidden beside it: that
+#     one is the honest pre-install answer and a seat may legitimately boot such a card.
+FORBID span_blocks=2048 fits=
+FORBID unafs span check .*fits=NO
+FORBID unafs span check .*magic=MISSING
+FORBID TEGRA-UNAFS: mount on TegraSd FAILED
 
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the
