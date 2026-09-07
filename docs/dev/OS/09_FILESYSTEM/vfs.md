@@ -577,7 +577,7 @@ shell builds, in the uncounted `:: VFS-1: … ::` idiom of the VFS-2/VFS-3 witne
 
 | leg | claim |
 | --- | --- |
-| `route /apps/VUG.ELF` | resolves to the **FAT** backend, mount prefix stripped (`rel=/VUG.ELF`) |
+| `route /boot/VUG.ELF` | resolves to the **FAT** backend, mount prefix stripped (`rel=/VUG.ELF`) |
 | `route /K3HELLO.TXT` | resolves to the **native UnaFS** backend, path intact |
 | `boundary` | `/fatty.bin` and `/usbfoo` are **native** names, verbatim — a prefix claims a path only at a component boundary (§3.1). The negative a naive `starts_with` gets wrong |
 | `ro-seam` | a backend implementing no write methods refuses `create`/`write`/`truncate`/`unlink` through the table with `Unsupported`, **and still reads** — read-only is the trait's *default* posture, not something a backend must remember to assert |
@@ -586,7 +586,7 @@ Measured on `./arroyo kernel8-test 210` (QEMU raspi4b, no stick attached, so the
 reports `usb bound=false` honestly):
 
 ```
-:: VFS-1: route /apps/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::
+:: VFS-1: route /boot/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::
 :: VFS-1: route /K3HELLO.TXT -> vol=native rel=/K3HELLO.TXT :: PASS ::
 :: VFS-1: boundary /fatty.bin,/usbfoo -> vol=native verbatim (usb bound=false) :: PASS ::
 :: VFS-1: ro-seam create/write/truncate/unlink -> Unsupported, read still ok=true :: PASS ::
