@@ -1,9 +1,14 @@
 ### SYNTHETIC. THIS IS NOT A METAL GREEN REFERENCE AND MUST NEVER BE CITED AS ONE.
 ### It is a hand-built capture whose only job is to prove that jetson-sync1.spec CAN
 ### go green -- that its 23 REQUIREs, its one COUNT and its end-of-run marker are
-### simultaneously satisfiable, and that a clean boot trips none of its 18 spec-declared
+### simultaneously satisfiable, and that a clean boot trips none of its 20 spec-declared
 ### FORBIDs nor any of mbench's three default ones. A scorer that has only ever been run
 ### against captures that red has not been tested; this file is the other direction.
+### (20, not SPECARM's 18: the render10 INTEGRATE fold puts UNAFSROOT's one FORBID and
+### EVQPRINT's one FORBID into the same spec as SPECARM's two, and this number is DERIVED
+### from `orin-specscore.py`'s FAILABILITY line at the integrated tip -- `44 of the 135
+### rule(s) THIS SPEC DECLARES can fail it`, i.e. 23 REQUIRE + 1 COUNT + 20 FORBID -- not
+### carried by hand across a merge, which is exactly the failure the note below records.)
 ### (The line that stood here said "18 FORBIDs" without saying which set it counted; what
 ### the OLD number was measuring has not been re-derived and is not asserted here. Every
 ### number in this header is now `mbench.parse_spec` filtered on `not d.builtin` -- the
