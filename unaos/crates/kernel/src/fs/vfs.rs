@@ -624,9 +624,8 @@ impl MountTable {
         // lifted to the volume through its OWN mount (`on_volume`), and the pair is then expressed
         // inside whichever of the two mounts can address both: the source's if it can reach the
         // destination (`/boot` → `/apps`), otherwise the destination's if it can reach the source
-        // (`/apps` → `/boot`). Both mounts name one volume, so either is a sound executor; when the
-        // DESTINATION's mount executes, the source mount's write ACL is asked as well, so a move
-        // out of a rooted mount cannot borrow the other mount's write posture.
+        // (`/apps` → `/boot`). Both mounts name one volume, so either is a sound executor, and which
+        // one executes says NOTHING about who may write: both postures are asked either way, below.
         //
         // Neither can address both (two sibling rooted mounts, `/apps` and a future `/lib`) → the
         // move is genuinely cross-space and is REFUSED BY NAME. Refusing is never corrupting;
@@ -639,22 +638,42 @@ impl MountTable {
         // change to make under a boot deadline.
         let src_abs = bf.on_volume(relf);
         let dst_abs = bt.on_volume(relt);
-        let (b, rf, rt, via_dst) = if let (Some(rf), Some(rt)) = (
+        let (b, rf, rt) = if let (Some(rf), Some(rt)) = (
             under_mount_root(bf.mount_root(), &src_abs),
             under_mount_root(bf.mount_root(), &dst_abs),
         ) {
-            (bf, rf, rt, false)
+            (bf, rf, rt)
         } else if let (Some(rf), Some(rt)) = (
             under_mount_root(bt.mount_root(), &src_abs),
             under_mount_root(bt.mount_root(), &dst_abs),
         ) {
-            (bt, rf, rt, true)
+            (bt, rf, rt)
         } else {
             return Err(VfsError::Backend("cross-mount-root"));
         };
-        if via_dst {
-            bf.authorize_write(relf, principal)?;
-        }
+        // TWO MOUNTS, TWO DIFFERENT QUESTIONS — not one question asked twice (rmbp 15's B67, and
+        // their withdrawal of the shape that preceded it; orin 19 holds the falsifier).
+        //
+        // A mount is a POSTURE as much as an address space, so a move that crosses two mounts of one
+        // volume must satisfy both. The symmetric-LOOKING form — `bt.authorize_write(relt)` — was
+        // implemented and MEASURED RED (`exec-orin18-aclsym`, `MBENCH FAIL 118/119`,
+        // `mv: /RELIC3.TXT: -ENOENT`): a rename's DESTINATION DOES NOT EXIST YET, so authorizing the
+        // destination PATH asks a backend about an object that is not there. It is backend-specific
+        // besides — `FatBackend::authorize_write` ignores its `rel` (posture only), so the call was a
+        // no-op on FAT, while `NativeBackend::authorize_write` resolves the path and maps the miss to
+        // `NoSuchPath`. That red is kept as the falsifier this shape had to survive.
+        //
+        // The two questions, stated apart:
+        //   - the SOURCE mount is asked about the object that LEAVES it — which exists;
+        //   - the DESTINATION mount is asked about the directory that RECEIVES the leaf — because the
+        //     leaf does not exist yet. That is already this file's own convention: `NativeBackend::
+        //     create` authorizes against the PARENT with the reason written there verbatim.
+        //
+        // Asked UNCONDITIONALLY, in both directions. Gating them on which mount executes is what let
+        // the hole open in the first place, and the executor is an implementation detail of where the
+        // pair can be addressed — never a statement about who may write.
+        bf.authorize_write(relf, principal)?;
+        bt.authorize_write(&receiving_dir(relt), principal)?;
         b.rename(rf, rt, principal)
     }
 
@@ -782,6 +801,30 @@ fn under_mount_root<'a>(root: &str, abs: &'a str) -> Option<&'a str> {
         Some(b'/') => Some(&abs[root.len()..]), // a name beneath it
         Some(_) => None,                        // `/APPSTORE` merely starts with `/APPS`
     }
+}
+
+/// The mount-relative DIRECTORY that will RECEIVE the leaf named by `rel`: `rel` minus its last
+/// component, and `""` — the mount point itself — when the leaf sits directly under the mount root.
+///
+/// **The destination side of [`MountTable::rename`]'s ACL question, and it is a DIFFERENT question
+/// from the source side's.** The source names an object that exists and can be authorized directly;
+/// the destination names one that does not exist yet, so the mount is asked about the directory it
+/// will be planted in. This is not a new convention: `NativeBackend::create` authorizes against the
+/// parent for exactly this reason, written there verbatim — the leaf does not exist yet. (Plain
+/// backticks, not an intra-doc link: that type is `cfg(target_arch = "aarch64")` and the link would
+/// dangle on the x86 build of this same file.)
+///
+/// The output form is [`VfsBackend::on_volume`]'s (`/`-led components, empty for the root), which
+/// `native_abs` renders as `/` and the FAT adapter ignores entirely.
+fn receiving_dir(rel: &str) -> String {
+    let mut comps: Vec<&str> = components(rel).collect();
+    comps.pop();
+    let mut s = String::new();
+    for c in comps {
+        s.push('/');
+        s.push_str(c);
+    }
+    s
 }
 
 // =========================================================================================
