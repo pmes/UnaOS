@@ -945,6 +945,8 @@ pub fn compose() -> bool {
     if model.menus.busy {
         return false;
     }
+    // MENUOWN — **WHOSE menus the bar is showing, and WHERE it put them.** See [`MENUROW_KEY`].
+    menurow_witness(&model);
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
@@ -988,6 +990,46 @@ pub fn compose() -> bool {
     LEDGER.paint(crate::arch::now_cycles().saturating_sub(t1), (r.2 * r.3) as u64);
     SLOT.store(sig, Some(r));
     true
+}
+
+/// MENUOWN — the last item row this bar announced, as [`super::winmenu::BarSnapshot::owner_key`].
+/// `0` is "never announced", so the FIRST composed row always speaks: a boot whose bar never says
+/// whose menus it is showing must be distinguishable from one whose row never changed.
+static MENUROW_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// MENUOWN — **the bar's ownership and layout, ON THE WIRE, on change.**
+///
+/// Peter, at the bench on `render9` (2026-09-07): *"pulse view menu item still showing across all
+/// apps and spaced incorrectly"*. Both halves of that reading were GLASS-ONLY facts. The bar's
+/// existing instruments could not have caught either: `[winmenu] publish owner=` fires once when a
+/// tenant registers and never again, the `[menubar]` cost ledger carries `press=`/`clob=`/`toggles=`
+/// and no layout at all, and `bar_owner=` on the `[winmenu]` rollup is a bare id with nothing to
+/// compare it to. So a flight could show `View` sitting under the word `console` at a column the
+/// caption never moved, and every line on the wire read green. This is the line that makes both
+/// falsifiable:
+///
+///  * `cap_owner=`/`cap=` — the app the bar NAMES. `menu_owner=` — the app whose menus it SHOWS.
+///    **They must be the same window**, and a capture where they differ is defect one, stated.
+///  * `items=` — every box's label at its panel-absolute column. A tenant title whose `x` does not
+///    move when `cap=` changes length is defect two, stated.
+///
+/// UNGATED, deliberately. The metal image is built without `witness` and Peter's captures come off
+/// metal; an instrument that is absent from the artifact he flies is not an instrument. It is
+/// affordable because it is EDGE-TRIGGERED on [`MENUROW_KEY`] — one relaxed load per composite in
+/// the steady state, and a line only when the row genuinely moved.
+fn menurow_witness(m: &Model) {
+    let key = m.menus.owner_key(m.cap_owner);
+    if MENUROW_KEY.swap(key, Ordering::Relaxed) == key {
+        return;
+    }
+    serial_println!(
+        "[menubar] menus cap_owner={} cap={} menu_owner={} boxes={} items={}",
+        m.cap_owner,
+        core::str::from_utf8(&m.title[..m.title_len]).unwrap_or("?"),
+        m.menu_owner,
+        m.menus.n,
+        m.menus.items()
+    );
 }
 
 /// The crystal's box-relative top-left in the bar: **one [`strip::PAD`] from the left**, centred

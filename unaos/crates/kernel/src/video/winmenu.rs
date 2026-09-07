@@ -734,6 +734,76 @@ impl BarSnapshot {
         &self.label[k][..self.label_len[k]]
     }
 
+    /// MENUOWN — **the item row, rendered for the wire.** See [`BarItems`].
+    #[inline]
+    pub fn items(&self) -> BarItems<'_> {
+        BarItems(self)
+    }
+}
+
+/// MENUOWN — **the bar's item row as one wire field**: `app:console@22+75,View@97+48`, or `none`.
+///
+/// A borrowing [`core::fmt::Display`] wrapper rather than a formatted buffer, because the whole
+/// point of this field is that it costs a quiet desktop NOTHING: [`super::menubar::compose`] emits
+/// it only when the row actually changes, and until then no glyph of it is ever produced. A
+/// `[u8; N]` scratch would have to be filled on every pass to be available on the rare one.
+///
+/// Each entry is `LABEL@X+W` with `X`/`W` panel-ABSOLUTE, so a capture states where every menu item
+/// was laid out without a pixel measurement — which is the whole reason this exists. Before MENUOWN
+/// the bar's layout was GLASS-ONLY: `render9` put `View` at a fixed `x=187` under two different app
+/// names and the wire said nothing at all, so the defect survived a flight and had to be decoded off
+/// a PNG. The app box carries an `app:` prefix because it is the WM's box, not a tenant's, and the
+/// two are laid out by different rules.
+pub struct BarItems<'a>(&'a BarSnapshot);
+
+impl core::fmt::Display for BarItems<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.0;
+        if s.n == 0 {
+            return f.write_str("none");
+        }
+        for k in 0..s.n {
+            if k > 0 {
+                f.write_str(",")?;
+            }
+            if s.is_app_box(k) {
+                f.write_str("app:")?;
+            }
+            // ASCII by construction — `publish` refuses a label this registry did not vet, and the
+            // caption is the kernel's own copy of the title. A stray high byte prints as its escape
+            // rather than as a malformed UTF-8 sequence on the wire.
+            for &b in s.label_of(k) {
+                f.write_str(core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("?"))?;
+            }
+            write!(f, "@{}+{}", s.x[k], s.w[k])?;
+        }
+        Ok(())
+    }
+}
+
+impl BarSnapshot {
+    /// MENUOWN — the layout's own change key: the two owners and the boxes, folded to one word.
+    ///
+    /// DELIBERATELY NOT [`signature`](Self::signature): that one drives the bar's REPAINT and folds
+    /// in `open`, so it moves every time a menu is dropped or dismissed and would make this witness
+    /// speak on gestures that changed no layout. This key moves when — and only when — the bar
+    /// starts showing a different app's menus or lays an item out at a different column, which is
+    /// exactly the pair of defects it exists to report.
+    pub fn owner_key(&self, cap_owner: wm::WinId) -> u64 {
+        let mut h = strip::FNV_BASIS;
+        h = strip::fnv1a_u64(h, cap_owner as u64);
+        h = strip::fnv1a_u64(h, self.owner as u64);
+        h = strip::fnv1a_u64(h, self.n as u64);
+        for k in 0..self.n {
+            h = strip::fnv1a_u64(h, self.x[k] as u64);
+            h = strip::fnv1a_u64(h, self.w[k] as u64);
+            for &b in self.label_of(k) {
+                h = strip::fnv1a(h, b);
+            }
+        }
+        strip::seal(h)
+    }
+
     /// The snapshot reduced to one integer, for the bar's damage test. The bar repaints when a title
     /// appears, moves, is relabelled, or opens — and on nothing else.
     pub fn signature(&self) -> u64 {
