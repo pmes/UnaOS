@@ -74,6 +74,18 @@ Typical use, the moment a capture lands:
 `--image` accepts the staged flash directory (it finds `kernel.elf`) or the ELF
 itself.  Without `--image` the tool is exactly `mbench --replay` plus a warning
 that the reachability column is the whole point.
+
+AND ONE LINE THAT NEEDS NEITHER ARTIFACT (added 2026-09-07, ORIN-SPECARM).  The
+coverage column above asks whether a rule COULD HAVE FIRED on this image.  It
+never asked the cheaper question sitting one step in front of it: is the rule
+ALLOWED TO FAIL AT ALL?  `PENDING` and `OPTIONAL` rows are scored and printed
+and gate nothing, and a spec can therefore be mostly decoration without any
+line of output saying so -- which is exactly what jetson-sync1.spec's nine
+tick/preempt rows were when a real TICKLESS Jetson capture scored `PASS 17/17`,
+exit 0.  So every run now prints a FAILABILITY line under the tally, splitting
+the spec's own rules from mbench's default FORBIDs and making the groups add
+back up to the total.  It is REPORTING ONLY: no exit code, verdict or gate
+depends on it.
 """
 
 import argparse
@@ -600,6 +612,45 @@ def main():
     print("  ─────")
     print(f"  {verdict} — {got}/{len(req)} required witnesses, {forb} forbidden hit(s), "
           f"{matcher.lineno} lines scanned")
+
+    # THE SECOND WAY A ROW CAN BE COVERAGE-CLAIMED-AND-NOT-HELD, and until 2026-09-07 this
+    # tool printed only the first.  The COVERAGE block below asks "could this rule have
+    # FIRED on this image".  It never asked the cheaper question one line above it: is this
+    # rule ALLOWED TO FAIL AT ALL?  A PENDING or OPTIONAL row is scored, printed with a
+    # glyph, and counted in nothing -- `failable` (below) is what decides, and neither kind
+    # is in it.  ORIN-SPECARM found the cost: jetson-sync1.spec's NINE tick/preempt rows
+    # were all PENDING/OPTIONAL, so a Jetson image that booted silently TICKLESS scored
+    # `PASS -- 17/17 required witnesses, 0 forbidden hit(s)`, exit 0 -- measured on a real
+    # pre-flip capture.  The flight could not fail on the thing the flight was for, and no
+    # line of this tool's output said so.  It is a property of the SPEC, not of the image,
+    # so it prints unconditionally: without `--image` the coverage block never runs, and
+    # that is exactly when the hole is least visible.
+    # ⚠ REPORTING ONLY.  Nothing here touches `rc`, `verdict`, `satisfied()` or the
+    # vacuity gate; a spec of a hundred OPTIONALs still exits 0 if mbench says PASS.
+    # Deciding WHICH of these should be failable is a judgement about the subsystem and
+    # belongs in the spec, per rule, with a go-red proof -- this only refuses to let the
+    # question go unasked.
+    # The arithmetic is made to CLOSE against the directive total, deliberately: a reader who
+    # cannot add the groups back up to the whole has been handed a number they must take on
+    # trust, which is the habit this line exists to break.  `COMPLETE` is its own group
+    # because it is neither -- it never fails, but it does move the code (it is what
+    # separates TRUNCATED from FAIL on a cut capture; mbench's rule 3).  And mbench's DEFAULT
+    # FORBIDs are counted apart from the spec's own: they are failable and they are real
+    # coverage, but they are not something the spec's author wrote or can be credited with,
+    # and folding them in is how a "spec-declared FORBIDs" tally goes quietly wrong (measured
+    # 2026-09-07: jetson-sync1's header said 15, a naive parse said 19, the file had 16).
+    decl = [d for d in directives if not d.builtin]
+    n_pend = sum(1 for d in decl if d.kind == "PENDING")
+    n_opt = sum(1 for d in decl if d.kind == "OPTIONAL")
+    n_comp = sum(1 for d in decl if d.kind == "COMPLETE")
+    n_failable = sum(1 for d in decl if d.kind in ("REQUIRE", "COUNT", "FORBID"))
+    n_builtin = len(directives) - len(decl)
+    comp = f", {n_comp} COMPLETE marker(s) gating TRUNCATED-vs-FAIL" if n_comp else ""
+    extra = f" (+{n_builtin} of mbench's default FORBIDs, also failable)" if n_builtin else ""
+    print(f"  ◦ FAILABILITY: {n_failable} of the {len(decl)} rule(s) THIS SPEC DECLARES can fail it "
+          f"(REQUIRE/COUNT/FORBID){extra};")
+    print(f"    {n_pend + n_opt} CANNOT ({n_pend} PENDING + {n_opt} OPTIONAL){comp}. "
+          "A ⏳/◦ row is a reading, never a pass.")
 
     if img is None:
         print("  ⚠ no --image: the coverage question was not asked, let alone answered.")
