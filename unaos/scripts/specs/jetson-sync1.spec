@@ -350,6 +350,44 @@ PENDING TEGRA-SD.*block backend published
 FORBID recon (SKIPPED|REFUSED|STOPPED at M3|done at M2)
 FORBID TEGRA-SD: REFUSED to publish
 
+# --- UNAFSROOT (orin 20): the root-bind census may never ASSERT what the medium holds ------
+# THE DEFECT THIS ROW MAKES UNREPEATABLE. Until orin 20 the `[sdmmc] root bound …` census in
+# `arch/aarch64/sdmmc_tegra.rs::sdmmc_root_bind` carried the sentence
+#   (all were dead: unafs has no volume here, Default has no device)
+# as a STRING LITERAL inside its `serial_println!`. It printed on every boot regardless of the
+# medium, and the bind aliased `/` onto the card's FAT on that stated premise. The render9
+# capture has the contradiction in ONE boot — `scratch/orin19/pointerlag/boot-render9.log`:
+#   745  :: PART: unafs span check — slot=2 type=0x7f part=[114688..131072) … magic=ok ::
+#   746  :: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — 62333952 sectors ::
+#   862  [sdmmc] root bound … (all were dead: unafs has no volume here, Default has no device)
+# The probe says MOUNTED, the binder says it does not exist, 117 lines apart. There was no
+# wrong check — there was NO CHECK. A claim that cannot be wrong on any boot is never falsified
+# by any boot, so no spec row could ever have convicted it: the sentence was not a verdict.
+# WHY A FORBID AND NOT A REQUIRE ON THE REPLACEMENT. The replacement line's fields are DERIVED
+# (`fs::unafs::locate_on(TegraSd)`, a returned error value), so their wording depends on what
+# the card holds and a REQUIRE would have to guess a medium. What must never come back is the
+# ASSERTION, and that is a fixed string — exactly the shape a FORBID keys on. The render10
+# REQUIRE rows for the derived line are SCORER10's to add; this row is the tripwire under them.
+# NARROW ON PURPOSE, AND MEASURED IN BOTH DIRECTIONS BEFORE IT LANDED. The pattern is the volume
+# half of the sentence only. Keying on the whole sentence would let a re-worded half through
+# (the literal has already been re-worded once — orin 16 said `both were dead`, orin 18 said
+# `all were dead`, and the volume clause survived both edits unchanged, which is exactly why it
+# is the right key); keying on `all were dead` alone would be a common-English phrase on a wire
+# this large. Counted across the repo and the whole bench capture corpus: EVERY hit is either a
+# capture of a boot that ran the literal, or a doc quoting it. There is not one unrelated use —
+# no false-positive surface at all.
+#   RED  proof: `mbench.py --replay scratch/orin19/pointerlag/boot-render9.log` against this row
+#               alone -> `❌ MBENCH FAIL — 2 forbidden hit(s)`, exit 1, first hit line 862.
+#   GREEN proof: the SAME 22617-line boot with only the census line replaced by the derived form
+#               -> `✅ MBENCH PASS — 0 forbidden hit(s)`, exit 0. A rule that only reds is not
+#               proven; this one is shown to permit the fix and forbid the defect.
+# The `[sdmmc] root` prefix is deliberately NOT part of the pattern: if this sentence ever
+# reappears under a different prefix it is the same defect wearing a different hat.
+# ARMED ONLY ON AN `sdmmcroot` IMAGE, and that is honest rather than a gap: the emitter it
+# guards is `#[cfg(feature = "sdmmcroot")]`, so on an image without the knob this row is
+# unfireable for the same reason the two rows above it are — the code it forbids was not built.
+FORBID unafs has no volume here
+
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the
 # smp_virt path only the BSP drops to EL1 — every PSCI-woken AP replays the BSP's EL2

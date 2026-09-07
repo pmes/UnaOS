@@ -3289,6 +3289,42 @@ mod metal {
     // UnaFS system partition exists this section is where `/` goes back to `NativeBackend` and the FAT
     // returns to being the boot shim §3 says it is — at `/boot`, where it already is.
     //
+    // ── UNAFSROOT (orin 20). ITEM 3 HAPPENED, AND THIS SECTION DID NOT NOTICE. ────────────────────
+    //
+    // Everything above this line was written when the premise "the only filesystem on the medium is
+    // the ESP's FAT32" was TRUE. It stopped being true, and the code kept saying it — because it was
+    // saying it as a STRING LITERAL rather than as a check. The census line carried the sentence
+    // *"all were dead: unafs has no volume here, Default has no device"* hardcoded inside its
+    // `serial_println!`, so it printed on every boot no matter what the card held, and the bind
+    // aliased `/` onto FAT on that stated premise.
+    //
+    // The render9 capture (`~/unaos-bench/scratch/orin19/pointerlag/boot-render9.log`) has all three
+    // lines in ONE boot:
+    //
+    //   745  :: PART: unafs span check — slot=2 type=0x7f part=[114688..131072) … magic=ok ::
+    //   746  :: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — card 62333952 … ::
+    //   862  [sdmmc] root bound /, /boot and /apps = tegra-sd FAT read-only (all were dead: …) ::
+    //
+    // The probe says MOUNTED; the binder says it does not exist. There was no wrong check — there was
+    // NO CHECK, and a claim that cannot be wrong on any boot is never falsified by any boot.
+    //
+    // So the choice is now DERIVED, in `root_probe`, from `fs::unafs::locate_on(TegraSd)` — the same
+    // shape `drivers/emmc2.rs::onecard_witness` has carried on the Pi all along, where `absent` is a
+    // returned error value and not a word. Three outcomes, and the wire says which:
+    //
+    //   * card carries a UnaFS volume  -> `ROOT_NATIVE`: `/` is LEFT as the shared builder's
+    //     `NativeBackend`, and only `/boot` + `/apps` are re-pointed at the FAT ESP.
+    //   * partition walk returns an error -> the FAT fallback above, WITH THE ERROR PRINTED.
+    //   * no published card -> `ROOT_REFUSED`, unchanged.
+    //
+    // THE TWO CONSTRAINTS THAT ARE REAL. The native volume is 8 MiB (`PartitionSpan::block_count`
+    // counts whole 4096 B blocks, so render9's `span_blocks=2048` is 8 MiB — corroborated by the MBR
+    // extent `[114688..131072)`, 16384 sectors) and it is READ-ONLY, because
+    // `block::write_block_tegra_sd` refuses in every cfg. Both are genuine reasons to want `/`
+    // somewhere else; NEITHER is "there is no volume", and the difference is the whole arc. Growing
+    // the volume and giving it a writer is UNAFSGROW's arc, not this one — so a write verb aimed at
+    // `/` REFUSES, and that refusal is asserted rather than hidden (the `XVOL` posture).
+    //
     // READ-ONLY, AND NOT BECAUSE THIS FILE SAYS SO. `BlockSource::TegraSd::write_veto` is
     // `Some(TEGRA_SD_VETO)`, so `FatBackend::read_only()` is true and the VFS write verbs refuse
     // before touching the block path; below that, `block::write_block_tegra_sd` refuses in EVERY cfg.
@@ -3326,6 +3362,12 @@ mod metal {
     const ROOT_BOUND: u8 = 1;
     #[cfg(feature = "sdmmcroot")]
     const ROOT_REFUSED: u8 = 2;
+    /// UNAFSROOT (orin 20): `/` is the card's NATIVE UnaFS volume, and the shared builder's
+    /// `NativeBackend` mount is therefore LEFT STANDING. A fourth state rather than a flag on
+    /// [`ROOT_BOUND`] because the cache must not be able to answer "we have a root" without also
+    /// answering WHICH root: `ROOT_BOUND` is the FAT fallback and nothing else.
+    #[cfg(feature = "sdmmcroot")]
+    const ROOT_NATIVE: u8 = 3;
 
     #[cfg(feature = "sdmmcroot")]
     static ROOT_VERDICT: core::sync::atomic::AtomicU8 =
@@ -3350,9 +3392,80 @@ mod metal {
         crate::arch::now_cycles().saturating_sub(c0).saturating_mul(1_000_000) / hz
     }
 
+    /// UNAFSROOT (orin 20): the `BlockSource::Default` half of the medium census, DERIVED.
+    ///
+    /// `BlockSource::Default` reads through the GLOBAL block registry
+    /// (`fat::BlockSource::name()` spells it `"global"`), so this is one `block::info()` read of
+    /// that slot — no probe, no wait, and nothing that can change what gets mounted.
+    ///
+    /// **WHICH KIND OF ABSENCE — and it is not the same kind as [`root_native_witness`]'s.**
+    /// `absent` here is a statement about the BOOT SEQUENCE, not about any medium: the global slot
+    /// on an Orin is claimed by the USB stick if and when xHCI enumerates one, and this runs from
+    /// the mount-table build, which can be reached before that. It means "nothing had registered by
+    /// the time this table was built", and a later boot stage may legitimately change it. It does
+    /// NOT mean "this machine has no global device" — the emmc2 `ONECARD` census carries the same
+    /// warning on its own `usb=` field, for the same reason, and this is that warning ported.
+    #[cfg(feature = "sdmmcroot")]
+    fn root_default_witness() -> alloc::string::String {
+        match crate::drivers::block::info() {
+            Some(d) => alloc::format!("present ({} blocks)", d.num_blocks),
+            None => alloc::string::String::from("absent-so-far"),
+        }
+    }
+
+    /// UNAFSROOT (orin 20): the NATIVE-volume half of the medium census, DERIVED — the fact
+    /// [`sdmmc_root_bind`] chooses `/` on.
+    ///
+    /// ### The defect this replaces
+    ///
+    /// Until orin 20 the post-bind census carried the sentence *"all were dead: unafs has no volume
+    /// here, Default has no device"* as a STRING LITERAL inside its `serial_println!`. It printed on
+    /// every boot regardless of the medium, and `sdmmc_root_bind` aliased `/` onto the card's FAT on
+    /// that stated premise — while the SAME BOOT had already printed, 116 lines earlier, that the
+    /// card carries a UnaFS volume at MBR slot 2 with its superblock magic intact
+    /// (`fs/unafs.rs::partition_witness` and `main.rs`'s `TEGRA-UNAFS` probe; render9 capture
+    /// `~/unaos-bench/scratch/orin19/pointerlag/boot-render9.log`, lines 745, 746 and 862 of one
+    /// boot). There was no wrong check — there was NO CHECK. A claim that cannot be wrong on any
+    /// boot is never falsified by any boot.
+    ///
+    /// So this is `drivers/emmc2.rs::onecard_witness`'s `native` binding ported: the verdict is a
+    /// RETURNED ERROR VALUE from `locate_on`, never a literal. `absent` cannot be printed unless a
+    /// walk of this card's partition table actually ran and actually failed.
+    ///
+    /// ### WHICH KIND of absence — the conflation that caused the defect
+    ///
+    /// `absent` here is a statement about THIS MEDIUM, complete at the moment it is made:
+    /// `locate_on(TegraSd)` opens the card's own handle and walks the card's own MBR, reading the
+    /// superblock magic through the card's own routed reads (`fs/unafs.rs::locate_on`, the SDSEAM
+    /// discipline — one disk end to end). Nothing later in the boot can turn this `absent` into a
+    /// `present`. That is the OPPOSITE of [`root_default_witness`]'s "not registered yet", and
+    /// treating the two as one word — "dead" — is precisely what let `/` be aliased onto FAT while a
+    /// real UnaFS volume sat at slot 2 with `magic=ok`.
+    ///
+    /// ### The two constraints that are real, and are NOT "there is no volume"
+    ///
+    /// The volume is **8 MiB** (`block_count` is counted in whole 4096 B blocks —
+    /// `unafs/src/adapter.rs::PartitionSpan` — so render9's `span_blocks=2048` is 8 MiB, which the
+    /// MBR extent `[114688..131072)` = 16384 sectors x 512 B corroborates independently), and it is
+    /// **read-only**, because `block::write_block_tegra_sd` refuses in EVERY cfg (the card's only
+    /// writer is the armed `sdmmc_arm` ladder in this file). Both are genuine reasons an operator
+    /// might not want `/` there. NEITHER of them is "there is no volume", and neither is asserted
+    /// here — the size is computed from the returned span, and the read-only fact is a property of
+    /// the block layer that this function only names.
+    #[cfg(feature = "sdmmcroot")]
+    fn root_native_witness()
+    -> Result<::unafs::adapter::PartitionSpan, crate::fs::unafs::MountError> {
+        crate::fs::unafs::locate_on(crate::drivers::block::BlockHandle::TegraSd)
+    }
+
     /// ROOTFS: can the card's FAT volume be mounted this boot? Runs at most once. Refuses, NAMED, when
     /// the census did not publish a card (M1/M2/M3 did not all pass, or `UNAOS_SDMMC=1` was not armed on
     /// metal) and when the medium carries no FAT volume the driver accepts.
+    ///
+    /// UNAFSROOT (orin 20): it now answers a THREE-way question, and it asks the medium before it
+    /// answers. The native leg runs first because the native volume is the root of record on this
+    /// architecture (`shell::vfs_mount_table`'s aarch64 arm mounts `NativeBackend` at `/`); the FAT
+    /// leg below is the FALLBACK, and reaching it now requires a partition-table walk to have failed.
     #[cfg(feature = "sdmmcroot")]
     fn root_probe() -> u8 {
         let blocks = tegra_sd_card_blocks();
@@ -3362,6 +3475,29 @@ mod metal {
                 RPS
             );
             return ROOT_REFUSED;
+        }
+        // UNAFSROOT: ASK THE MEDIUM. Both fields below are returned values; neither is a literal.
+        let default = root_default_witness();
+        match root_native_witness() {
+            Ok(span) => {
+                // `block_count` is whole 4096 B blocks (`PartitionSpan`), so the MiB is computed,
+                // not quoted. `saturating_mul` because a corrupt superblock must not panic a boot.
+                let mib = span
+                    .block_count
+                    .saturating_mul(::unafs::BLOCK_SIZE)
+                    / (1024 * 1024);
+                serial_println!(
+                    "{} medium native=present base_lba={} blocks={} ({} MiB) writable=no (block::write_block_tegra_sd refuses in every cfg) | Default={} -> / = NATIVE unafs ::",
+                    RPS, span.base_lba, span.block_count, mib, default
+                );
+                return ROOT_NATIVE;
+            }
+            // DERIVED absence, about THIS CARD — see `root_native_witness`. The reason is the
+            // error the partition walk returned, printed so a fallback can never be silent.
+            Err(e) => serial_println!(
+                "{} medium native=absent ({:?}) | Default={} -> / falls back to the card FAT ::",
+                RPS, e, default
+            ),
         }
         let c0 = crate::arch::now_cycles();
         match crate::fs::fat::mount_source(crate::fs::fat::BlockSource::TegraSd) {
@@ -3421,14 +3557,48 @@ mod metal {
             verdict = root_probe();
             ROOT_VERDICT.store(verdict, Ordering::Relaxed);
         }
-        if verdict != ROOT_BOUND {
+        if verdict == ROOT_REFUSED || verdict == ROOT_UNKNOWN {
             return; // the refusal was named once; leave the table exactly as the shared builder left it
         }
-        // BOTH prefixes, onto the one volume this machine has.
+        // UNAFSROOT (orin 20): `/` IS THE NATIVE VOLUME WHEN THE CARD CARRIES ONE.
         //
-        // `/` because the root has to work at all: `vfs_ls_collect` stats the path before it
-        // synthesises any child row, so a root that errors makes every other mount unreachable from
-        // the desktop and from quarry.
+        // On `ROOT_NATIVE` this section binds `/boot` and `/apps` and STOPS. It does not mount
+        // anything at `/`, and that is the whole fix: the shared builder's aarch64 arm
+        // (`shell::vfs_mount_table`) has already mounted `NativeBackend::new("native")` there, so
+        // "bind the native volume" is spelled as NOT CLOBBERING IT. This is exactly the transition
+        // the ROOTFS banner above predicted — *"when the UnaFS system partition exists this section
+        // is where `/` goes back to `NativeBackend`"* — and it costs one `Vec` operation fewer than
+        // the fallback rather than one more.
+        //
+        // Note what is NOT touched: `fs/vfs.rs`'s `#[cfg(target_arch = "aarch64")]` guards on the
+        // `NativeBackend` arms stay exactly as they are. The x86 arm is not the same defect —
+        // `NativeBackend` does not exist as a type there, so `/` = FAT on x86 is forced at COMPILE
+        // TIME rather than chosen at runtime on a claim about the medium, and that arm makes no
+        // claim at all. Widening those guards is a STOP tripwire (rmbp 15), not a lane question.
+        //
+        // THE ROOT IS READ-ONLY, AND THE REFUSAL IS THE POINT. Every sector of the native volume
+        // reaches the card through `block::write_block_tegra_sd`, which refuses in EVERY cfg with
+        // `BlockError::NotReady` and prints `:: TEGRA-SD: WRITE refused at the block layer ::` once.
+        // So a write verb aimed at `/` REFUSES rather than corrupting, and it refuses at the block
+        // layer, below anything this file could weaken. That refusal is reported, never hidden: it
+        // is the fixed behaviour, in the same sense that `XVOL`'s cross-volume `mv` refusal is.
+        // Making the volume writable (and growing it past the 8 MiB the installer stamped) is
+        // UNAFSGROW's arc, not this one.
+        if verdict != ROOT_NATIVE {
+            // FALLBACK ONLY — reached when `root_probe`'s partition walk of THIS CARD returned an
+            // error, which it printed. `/` becomes the card's FAT because a root that errors makes
+            // every other mount unreachable: `vfs_ls_collect` stats the path before it synthesises
+            // any child row.
+            mt.mount(
+                "/",
+                alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
+                    "card",
+                    crate::fs::vfs::KERNEL_PRINCIPAL,
+                    true,
+                )),
+            );
+        }
+        // The remaining prefixes, onto the FAT ESP — the volume that actually holds the programs.
         //
         // `/boot` because the boot volume has a name an operator types, and unmounting it (the first
         // shape of this section) would have traded one dead namespace for another.
@@ -3455,14 +3625,6 @@ mod metal {
         // and is exactly the case quarry's `root_prefixes` already handles: `/` claims `/boot`, so `/boot`
         // is not a second root, it is a child reached through its parent (the "duplicate-/boot rule").
         mt.mount(
-            "/",
-            alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
-                "card",
-                crate::fs::vfs::KERNEL_PRINCIPAL,
-                true,
-            )),
-        );
-        mt.mount(
             "/boot",
             alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
                 "fat",
@@ -3482,7 +3644,22 @@ mod metal {
             ),
         );
         // One post-bind census, on the first bind only: the scorer's proof that the root now enumerates.
+        //
+        // UNAFSROOT (orin 20): every field on this line is DERIVED. `root=` is the verdict
+        // `root_probe` returned after walking the card's partition table, not a sentence about the
+        // medium written at compile time; `rode=` is the handle the shared unafs mount ACTUALLY
+        // bound, read back AFTER the listing forced the lazy bind (`mount_bound_handle` is a
+        // read-only peek that never triggers one, so asking before the `read_dir` would answer
+        // `n/a` on every boot). Those two together are what makes "/ is the card's native volume"
+        // falsifiable: `root=native` with `rode=usb` would mean the root is some OTHER disk's
+        // volume — the "assembled from two disks" defect SDSEAM exists to prevent — and it would
+        // now say so on the wire instead of reading as a success.
         if !ROOT_CENSUS.swap(true, Ordering::Relaxed) {
+            let root = if verdict == ROOT_NATIVE {
+                "native-unafs-ro"
+            } else {
+                "tegra-sd-fat-ro"
+            };
             let c0 = crate::arch::now_cycles();
             match mt.read_dir("/") {
                 Ok(rows) => {
@@ -3491,14 +3668,22 @@ mod metal {
                         .iter()
                         .filter(|r| matches!(r.kind, crate::fs::vfs::NodeKind::Dir))
                         .count();
+                    // The disk the shared mount rode, or `n/a` when `/` is FAT and no unafs mount
+                    // was ever bound. `{:?}` on `BlockHandle` (which derives `Debug`) rather than a
+                    // hand-written name table: a handle added to the block layer must not be able to
+                    // print as a stale string here.
+                    let rode = match crate::fs::unafs::mount_bound_handle() {
+                        Some(h) => alloc::format!("{:?}", h),
+                        None => alloc::string::String::from("n/a"),
+                    };
                     serial_println!(
-                        "{} bound /, /boot and /apps = tegra-sd FAT read-only (all were dead: unafs has no volume here, Default has no device) entries={} dirs={} files={} list_us={} ::",
-                        RPS, rows.len(), dirs, rows.len() - dirs, us
+                        "{} bound / = {} rode={}, /boot and /apps = tegra-sd FAT read-only entries={} dirs={} files={} list_us={} ::",
+                        RPS, root, rode, rows.len(), dirs, rows.len() - dirs, us
                     );
                 }
                 Err(e) => serial_println!(
-                    "{} bound /, /boot and /apps = tegra-sd FAT read-only but the first listing FAILED err={:?} ::",
-                    RPS, e
+                    "{} bound / = {}, /boot and /apps = tegra-sd FAT read-only but the first listing FAILED err={:?} ::",
+                    RPS, root, e
                 ),
             }
         }

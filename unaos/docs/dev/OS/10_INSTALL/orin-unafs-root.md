@@ -163,6 +163,115 @@ place that changes. Code: `arch/aarch64/sdmmc_tegra.rs` §ROOTFS,
 `fs/vfs.rs`'s tail `FatBackend::new_tegra_sd`, and one cfg-gated statement in
 `shell::vfs_mount_table`.
 
+### 5.1 UNAFSROOT (orin 20) — item 3 HAPPENED, and item 4 did not notice
+
+The paragraph above is the prediction; this subsection is it coming true, plus
+the reason it took a round to notice.
+
+**Item 3 has run.** A card in the bench Orin carries a UnaFS volume at MBR
+slot 2. The render9 capture
+(`~/unaos-bench/scratch/orin19/pointerlag/boot-render9.log`) proves it twice
+over, from two independent readers, at lines 745 and 746:
+
+```
+:: PART: unafs span check — slot=2 type=0x7f part=[114688..131072) span_base=114688 span_blocks=2048 fits=yes magic=ok ::
+:: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — card 62333952 sectors, 0 committed root flip(s) on the volume ::
+```
+
+**And the binder contradicted them, in the same boot, 117 lines later:**
+
+```
+[sdmmc] root bound /, /boot and /apps = tegra-sd FAT read-only (all were dead: unafs has no volume here, Default has no device) …
+```
+
+The parenthesis was a **string literal** inside the census `serial_println!`. It
+printed on every boot regardless of the medium, and `sdmmc_root_bind` aliased
+`/` onto the FAT ESP on that stated premise. There was no wrong check — there
+was **no check**, and a claim that cannot be wrong on any boot is never
+falsified by any boot. No amount of flying would have surfaced it.
+
+**The fix is that the claim became a measurement.** `root_probe` now derives the
+fact from `fs::unafs::locate_on(BlockHandle::TegraSd)`, which walks the card's
+own partition table through the card's own routed reads (the SDSEAM "one disk
+end to end" discipline). This is `drivers/emmc2.rs::onecard_witness`'s shape
+ported from the Pi, where `absent` has always been a returned error value rather
+than a word. Three outcomes, and the wire says which:
+
+| verdict | `/` | when |
+|---|---|---|
+| `ROOT_NATIVE` | **left on `NativeBackend`** — the shared builder already mounted it | `locate_on(TegraSd)` returned `Ok` |
+| `ROOT_BOUND` | the card's FAT, as before | the partition walk returned an error, **which is printed** |
+| `ROOT_REFUSED` | untouched | no published card (unchanged) |
+
+Note the shape of the first row: *binding the native volume is spelled as **not
+clobbering** the mount `shell::vfs_mount_table` already made.* `/boot` and
+`/apps` still re-point at the FAT ESP, which is why program launching is
+unaffected — `EXEC_ROOT` and the literal `/apps/VUG.ELF` paths reach the same
+files they always did.
+
+No new mount mechanism was needed. `fs/unafs.rs`'s `bind_probe_admitted`
+already carries its `BlockHandle::TegraSd => true` arm, so `with_unafs` — and
+therefore `NativeBackend` — could already discover the card's volume whenever
+the global path has none. The only thing standing between the Orin and a native
+root was this file overwriting it.
+
+**Witness, new form.** The medium census, then the bind:
+
+```
+[sdmmc] root medium native=present base_lba=114688 blocks=2048 (8 MiB) writable=no (block::write_block_tegra_sd refuses in every cfg) | Default=absent-so-far -> / = NATIVE unafs ::
+[sdmmc] root bound / = native-unafs-ro rode=TegraSd, /boot and /apps = tegra-sd FAT read-only entries=N dirs=N files=N list_us=N ::
+```
+
+`rode=` is `fs::unafs::mount_bound_handle()` — the handle the shared unafs mount
+**actually** bound, read back after the first listing forced the lazy bind. It
+is on the line for one reason: `root=native-unafs-ro` with `rode=Global` or
+`rode=Usb` would mean `/` is some *other* disk's volume (UNAFSBIND rule 1 is
+"Global wins whenever it holds a volume", and on an Orin `Global` is the USB
+stick). That is the "assembled from two disks" defect, and it now says so on the
+wire instead of reading as a success.
+
+The fallback prints its reason rather than asserting one:
+
+```
+[sdmmc] root medium native=absent (NoVolume) | Default=… -> / falls back to the card FAT ::
+```
+
+`jetson-sync1.spec` carries `FORBID unafs has no volume here` so the literal
+cannot come back silently. It was proved RED on render9 (2 hits, `MBENCH FAIL`)
+and GREEN on the same boot with only the census line replaced, before it landed.
+
+#### The two constraints that ARE real — and the size correction
+
+Two things could still make an operator want `/` elsewhere. **Neither of them is
+"there is no volume", and that distinction is the whole arc.**
+
+- **Read-only.** `block::write_block_tegra_sd` refuses in every cfg with
+  `BlockError::NotReady`. A write verb aimed at `/` therefore **REFUSES**, below
+  anything this file could weaken. That refusal is asserted, not hidden: a
+  correctly-reported refusal is the fixed behaviour, the same posture `XVOL`
+  takes on the cross-volume `mv`.
+- **Size — and it is 8 MiB, not 1 MiB.** `PartitionSpan::block_count`
+  (`libs/fs/unafs/src/adapter.rs`) counts **whole 4096 B blocks**, so render9's
+  `span_blocks=2048` is 8 MiB. The wire corroborates independently:
+  `part=[114688..131072)` is 16384 sectors x 512 B = 8 MiB, and `fits=yes` with
+  2048 x 8 = 16384 means the volume fills its partition exactly. Reading
+  `block_count` as 512 B sectors gives the 1 MiB figure, an 8x undercount.
+
+Making the volume writable, and growing it, are separate arcs. Section §3's
+layout is still the layout of record; what changed here is only that `/` now
+believes the card.
+
+#### Consequence to expect on the first flight
+
+`entries=` on the census reports the **native volume's** root from now on, not
+the FAT ESP's, so the count will change and may be zero. That is a statement
+about what the installer wrote into the 8 MiB partition, not about the binding.
+`shell::layout_volid`'s probe degrades honestly on an empty root (it prints
+`lists no file — ls/cat/stat legs skipped`), and its `vfsroute.samevol` leg
+keeps passing because its oracle is observed rather than reported: with `/` on
+UnaFS and `/boot` on FAT the Orin now takes the **Pi's** shape, where the two
+prefixes genuinely are two filesystems.
+
 ## 6. Open calls (named, not acted)
 
 - **NVMe bring-up** — new hardware lane work; sequenced after the card-resident
