@@ -3688,9 +3688,21 @@ pub fn vfsroute_witness() {
             // then feeds, so no leg compares an expression with itself.
             //
             // Two-sided on every board by construction: on the Pi `/` is UnaFS and `/boot` is the
-            // boot FAT and neither holds the other's files (observed FALSE); on x86 and on the
-            // Orin's card both prefixes address one directory (observed TRUE). A `same_volume`
-            // stuck at either constant therefore reds this leg on one of the two shapes.
+            // boot FAT and neither holds the other's files (observed FALSE); on x86 both prefixes
+            // address one directory (observed TRUE). A `same_volume` stuck at either constant
+            // therefore reds this leg on one of the two shapes.
+            //
+            // UNAFSROOT (orin 20) MOVED THE ORIN ONTO THE PI'S BRANCH OF THAT SENTENCE, AND NOTHING
+            // BELOW NEEDED EDITING. On a `ROOT_NATIVE` verdict `sdmmc_root_bind` leaves `/` on the
+            // card's native UnaFS volume and re-points only `/boot` and `/apps` at its FAT ESP, so
+            // this board now reads like the Pi: neither prefix holds the other's files, the two
+            // `volume_id`s genuinely differ, and this leg passes as `false == false` where it used
+            // to pass as `true == true`. THAT is the property worth recording. The oracle is
+            // OBSERVED rather than reported — it re-derives its expectation from the medium on the
+            // boot it runs — so it survived the medium changing underneath it, and it convicts a
+            // wrong `same_volume` on the new shape exactly as it did on the old. A fixture that had
+            // quoted "the Orin's card is one volume" as a constant would instead have gone red on a
+            // correct kernel. See `arch/aarch64/sdmmc_tegra.rs` §ROOTFS/UNAFSROOT.
             let observed_same = matches!(
                 mt.stat(&fat_path),
                 Ok(s) if matches!(s.kind, NodeKind::File) && s.size == p.size);
@@ -7132,8 +7144,12 @@ fn vfs_path(arg: &str) -> String {
 /// filesystem is listable because it implements the backend trait, whatever the board.
 ///
 /// **aarch64** binds `/` = native UnaFS, `/boot` = the SD boot partition, and `/usb` = the stick when
-/// it is actually enumerated (honest hot-plug, doc §6). The Orin's ROOTFS knob re-points both `/` and
-/// `/boot` at the Tegra card, since this machine has neither of the first two volumes.
+/// it is actually enumerated (honest hot-plug, doc §6). The Orin's ROOTFS knob re-points `/boot` and
+/// `/apps` at the Tegra card, since `BlockSource::Default` is a source no Orin boot registers. Whether
+/// it re-points `/` as well is decided by the verdict `sdmmc_tegra::metal::root_probe` returns after
+/// walking the card's partition table, not by a sentence about the medium: `ROOT_NATIVE` re-points
+/// those TWO and leaves `/` on the `NativeBackend` bound below, `ROOT_BOUND` takes all three, and
+/// `ROOT_REFUSED` takes none. See `arch/aarch64/sdmmc_tegra.rs` §ROOTFS/UNAFSROOT.
 ///
 /// **x86** binds THE PROGRAM SOURCE — `crate::drivers::block::program_source`, resolved through
 /// [`open_read_volume`] so the READ_BIND instrument is stamped exactly as it was when each verb
@@ -7161,7 +7177,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         // `same_volume("/boot", "/apps")` answer false about one card, which is the aliasing defect
         // (rmbp 15 C1) in a new spelling.
         mt.mount("/apps", alloc::boxed::Box::new(
-            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points ALL THREE at the card's FAT through BlockSource::TegraSd (`/boot` and `/apps` too, because `/apps` is EXEC_ROOT and the literal prefix of /apps/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
+            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28) + UNAFSROOT (orin 20): `/boot` (BlockSource::Default) names a volume this machine does not have, so this re-points it — and `/apps` with it — at the card's FAT through BlockSource::TegraSd. WHETHER `/` GOES WITH THEM IS A VERDICT, NOT A READING OF THE MEDIUM. orin 16 asserted `/` (native UnaFS) was dead too and re-pointed all three; render9 falsified that assertion in the same boot that printed it, so `sdmmc_tegra::metal::root_probe` now WALKS the card's own partition table and returns one of: `ROOT_NATIVE` — re-point TWO, `/boot` and `/apps`, and leave the `NativeBackend` mounted at `/` a few lines above STANDING; `ROOT_BOUND` — the walk returned an error, so all THREE go to the FAT; `ROOT_REFUSED` (reasons `no-published-card` / `fat-mount-failed`, each named once on the wire) — `sdmmc_root_bind` returns early and re-points NONE. Score a boot by the verdict the `[sdmmc] root` lines print, never by this sentence: a `ROOT_NATIVE` over a card carrying no UnaFS volume is a PROBE defect, and naming the verdict here is what makes it surface as a contradiction between the log and this comment instead of hiding behind a claim about the medium that reads as true under either. `/apps` and `/boot` stay on the FAT ESP, so `/apps/VUG.ELF` and `exec_resolve`'s `EXEC_ROOT` probe reach the same files they reached on render9 — the arc did not move program launching. See arch/aarch64/sdmmc_tegra.rs §ROOTFS/UNAFSROOT.
         // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
         if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
             mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
