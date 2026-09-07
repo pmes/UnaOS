@@ -116,6 +116,29 @@ belongs here, on the day it is made.
   a temp file, or no pipe at all); a sentence of the form "X applies" / "X
   passes" is worth exactly the exit code it was read from, and if you cannot
   name that exit code you do not have the claim.
+- **A default-quiet knob has two polarities and the gate must compile the one
+  that SHIPS** (orin 20, 2026-09-07). `witness` is armed for exactly the four
+  battery commands (`unaos/arroyo:44`) and left OFF for every boot/media
+  command, so `esp-jetson`, `esp-arm`, `esp-x86`, `kernel8` and `vm-image` all
+  build witness-FREE — and until this arc all 47 board legs of
+  `KERNEL_CFG_MATRIX` carried it ON. Nothing anywhere compiled a BOARD feature
+  set (`tegra`, `pi`, `baremetal`, `tegra_el0`, `bsptick`, `bsprun`) with the
+  knob OFF, which is every configuration that reaches a card. It is not enough
+  that *some* leg is witness-free: five derived `x86-mix-N` legs and both
+  default legs in `check_both` already were, but they are x86 or carry no board
+  feature, and the arm-only board features are dropped from
+  `x86_cfg_universe` by construction — so the coverage read as present and was
+  absent where it mattered. **The generalisation: for a knob whose OFF state is
+  the shipped state, coverage of the ON state is coverage of a build nobody
+  boots.** Read the polarity, not the leg count — `./arroyo check` now prints
+  the census (ON/OFF split by arch, plus the witness-free legs by name) so a
+  future gap is a line in the log instead of a near-miss. This is the sibling of
+  the **Full-knob gate** rule above, running the other way: that one says an
+  ARMED knob needs the gate run armed; this one says a DEFAULT-OFF knob needs a
+  leg that compiles it off *with the board*. Both were paid for the same way —
+  orin 19's BATTERY1S1 would have shipped a link with eight undefined symbols
+  on `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson`, and a reader in review caught it,
+  not an instrument.
 
 ## Bench and media
 
