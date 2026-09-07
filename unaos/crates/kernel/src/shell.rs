@@ -3660,9 +3660,9 @@ pub fn vfsroute_witness() {
     //
     // C1 is not a property of any prefix a particular board happens to mount: it is ONE MEDIUM
     // BOUND TWICE UNDER TWO DIFFERENT NAMES. `sdmmc_root_bind` does exactly that on the Orin —
-    // `FatBackend::new_tegra_sd("card", …)` at `/` and `new_tegra_sd("fat", …)` at `/fat` — and
+    // `FatBackend::new_tegra_sd("card", …)` at `/` and `new_tegra_sd("fat", …)` at `/boot` — and
     // `same_volume` compared the two NAMES, so one physical card read as two volumes and
-    // `mv /A.TXT /fat/B.TXT` was refused as cross-volume on the exact configuration render9 flies.
+    // `mv /A.TXT /boot/B.TXT` was refused as cross-volume on the exact configuration render9 flies.
     //
     // NO BOARD THIS GATE CAN BOOT MOUNTS THAT SHAPE. x86 binds both prefixes under the SAME name
     // and therefore answered correctly by luck; the Pi's two prefixes are genuinely two volumes.

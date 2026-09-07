@@ -361,8 +361,8 @@ pub trait VfsBackend {
     /// **Deliberately NOT the volume name.** A name is an argument the mount site typed;
     /// identity is a fact about the medium. One machine binds ONE volume at two prefixes
     /// under two different names — `sdmmc_root_bind` mounts the Orin card as `"card"` at
-    /// `/` and as `"fat"` at `/fat` — and a name comparison calls those two volumes,
-    /// refusing `mv /A.TXT /fat/B.TXT` as "cross-volume" when it is a plain in-volume
+    /// `/` and as `"fat"` at `/boot` — and a name comparison calls those two volumes,
+    /// refusing `mv /A.TXT /boot/B.TXT` as "cross-volume" when it is a plain in-volume
     /// relink (rmbp 15, condition C1). That is the inverse of the pointer comparison the
     /// name replaced, arriving through the other door: a pointer is too FINE (two adapters
     /// over one medium split), and a name is wrong in BOTH directions (one medium may be
@@ -376,10 +376,10 @@ pub trait VfsBackend {
     /// # IDENTITY IS OVER (DEVICE, FILESYSTEM) — NEVER THE DEVICE ALONE
     ///
     /// The device alone is not identity, and the case that proves it is the Pi: it mounts
-    /// the native UnaFS volume at `/` and the FAT program volume at `/fat`, and BOTH live on
+    /// the native UnaFS volume at `/` and the FAT program volume at `/boot`, and BOTH live on
     /// the one physical card — `drivers/emmc2.rs` sizes the UnaFS volume from the same card
     /// that [`crate::fs::fat::BlockSource::Default`] reads. An id derived from the block
-    /// source alone would call those two mounts one volume and admit `mv /X.TXT /fat/X.TXT`,
+    /// source alone would call those two mounts one volume and admit `mv /X.TXT /boot/X.TXT`,
     /// relinking an UnaFS inode into a FAT directory — the C1 failure reproduced one layer
     /// further down. So every implementor mixes a DOMAIN TAG naming its filesystem BEFORE it
     /// mixes anything about the medium, and two different filesystems are unequal by
@@ -1049,13 +1049,13 @@ impl VfsBackend for FatBackend {
     /// All three terms carry weight:
     ///
     /// * The **tag** is the FILESYSTEM half of `(device, filesystem)`. Without it the Pi's
-    ///   `/fat` (FAT on the card) and `/` (UnaFS on the same card) would collide.
+    ///   `/boot` (FAT on the card) and `/` (UnaFS on the same card) would collide.
     /// * The **source** is what `FatBackend` actually reads through: it carries no volume
     ///   selector at all (`volume`/`principal`/`world_readable` are a label and a posture),
     ///   and every method reaches the medium through `fat::mount_source(self.source)`. Two
     ///   adapters with equal `source` therefore address the same bytes whatever their mounts
     ///   were NAMED — which is exactly the C1 aliasing, since `sdmmc_root_bind` types `"card"`
-    ///   at `/` and `"fat"` at `/fat` over one `TegraSd`. `BlockSource::name()` is the
+    ///   at `/` and `"fat"` at `/boot` over one `TegraSd`. `BlockSource::name()` is the
     ///   spelling `SourceCensus` publishes, so no second vocabulary is invented here.
     /// * The **fingerprint** is the volume's own identity, and it is what makes this an
     ///   identity rather than a device address: the serial is fixed at format time and the
@@ -1486,9 +1486,9 @@ impl VfsBackend for NativeBackend {
     /// a `(device, filesystem)` pair rather than a device.** A fingerprint is a method on
     /// `FatFs`; the native UnaFS volume is not a `FatFs` and has none. Degrading it to the
     /// block source would be catastrophic on the Pi, which mounts UnaFS at `/` and the FAT
-    /// program volume at `/fat` off THE SAME PHYSICAL CARD (`drivers/emmc2.rs` registers the
+    /// program volume at `/boot` off THE SAME PHYSICAL CARD (`drivers/emmc2.rs` registers the
     /// card as `BlockSource::Default` and sizes the UnaFS volume from the same geometry): the
-    /// two would collide and `mv /X.TXT /fat/X.TXT` would relink an inode across filesystems.
+    /// two would collide and `mv /X.TXT /boot/X.TXT` would relink an inode across filesystems.
     /// The `vfs:unafs:` tag is what keeps them apart, and it does so BY CONSTRUCTION — no FAT
     /// id can equal it whatever the medium, because the tag is mixed before anything else.
     ///

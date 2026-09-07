@@ -659,15 +659,15 @@ That comparison has been three different things, and only the third is an identi
 1. **the two backend POINTERS** — too fine. One medium bound at two prefixes is two objects, so a
    plain in-volume relink read as a cross-volume move.
 2. **the two VOLUME NAMES** — wrong in *both* directions, and the reason this section exists.
-   `sdmmc_root_bind` binds the Orin's card as `"card"` at `/` and as `"fat"` at `/fat`, so one
-   physical card read as two volumes and `mv /A.TXT /fat/B.TXT` was refused on exactly the
+   `sdmmc_root_bind` binds the Orin's card as `"card"` at `/` and as `"fat"` at `/boot`, so one
+   physical card read as two volumes and `mv /A.TXT /boot/B.TXT` was refused on exactly the
    configuration the bench flies. The converse is worse: two different media typed one name would
    read as ONE volume, and a rename between them relinks a directory entry to a name that means
    nothing on its volume. A name is an argument the mount site typed, never a fact about the medium.
 3. **`volume_id()` — the backend's own STORAGE IDENTITY**, which is what the question always meant.
 
 **Identity is over `(DEVICE, FILESYSTEM)`, never the device alone.** The device alone fails on the
-Pi, which mounts UnaFS at `/` and the FAT program volume at `/fat` off *the one physical card*
+Pi, which mounts UnaFS at `/` and the FAT program volume at `/boot` off *the one physical card*
 (`drivers/emmc2.rs` registers it as `BlockSource::Default` and sizes the UnaFS volume from the same
 geometry). So every implementor mixes a **domain tag** naming its filesystem before it mixes
 anything about the medium, and two filesystems on one card are unequal by construction. The FAT
