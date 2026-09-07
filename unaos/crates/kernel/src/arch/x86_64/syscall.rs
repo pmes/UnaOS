@@ -10286,7 +10286,7 @@ pub fn u2_probe_once() {
             return;
         }
     };
-    let de = match fs.find_app("HELLO.BIN") {
+    let de = match fs.find_in_root("HELLO.BIN") {
         Ok(de) => de,
         Err(_) => {
             serial_println!(":: U2: HELLO.BIN not found on the FAT volume — loader skipped ::");
@@ -10767,7 +10767,7 @@ fn stage_hello() -> bool {
         Ok(fs) => fs,
         Err(_) => return false,
     };
-    let de = match fs.find_app("HELLO.BIN") {
+    let de = match fs.find_in_root("HELLO.BIN") {
         Ok(de) => de,
         Err(_) => return false,
     };

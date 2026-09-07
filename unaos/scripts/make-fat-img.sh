@@ -96,11 +96,13 @@ stage_contents() {
     printf 'hello from the UnaOS FAT reader\nthis file lives on a real FAT32 volume\n' > "${S}/hello.txt"
     printf 'UnaOS read-only FAT32/16 reader test volume (%s layout).\n' "$LAYOUT" > "${S}/readme.txt"
 
-    # LAYOUT (orin 18): PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT — `fat::APPS_DIR` on the medium,
-    # `shell::EXEC_ROOT` (`/apps`) in the namespace. The four programs below are what `FatFs::find_app`
-    # looks for, and it looks nowhere else. Everything else on this volume keeps its place: EFI/,
-    # kernel.elf, hello.txt, readme.txt and every STOR-1/U9x/S8 fixture stay in the ROOT, because they
-    # are data the witnesses read or write, not code the loader loads.
+    # LAYOUT (orin 18): THE LAUNCHABLE PROGRAMS GO IN `APPS/` — `fat::APPS_DIR` on the medium,
+    # `shell::EXEC_ROOT` (`/apps`) in the namespace. STAT.ELF / VUG.ELF / PULSE.ELF below are what
+    # `FatFs::find_app` reads for WINX-2, WINX-8, PULSE-W and the desktop app launcher.
+    #
+    # HELLO.BIN stays in the ROOT with everything else (EFI/, kernel.elf, hello.txt, readme.txt and
+    # every STOR-1/U9x/S8 fixture): the U2 program is ALSO opened by EL0, by name, through
+    # `sys_open`, whose namespace is a flat 8.3 volume root with no directory component.
     mkdir -p "${S}/APPS"
 
     # U2: the x86 ring-3 "hello from disk" program (crates/user-blob-x86 → target/hello.bin, built by
@@ -109,8 +111,8 @@ stage_contents() {
     # it before make-fat-img runs), independent of whether the ESP payload carried it.
     local HELLO_BIN="${WORKSPACE_DIR}/target/hello.bin"
     if [ -f "$HELLO_BIN" ]; then
-        COPYFILE_DISABLE=1 cp "$HELLO_BIN" "${S}/APPS/HELLO.BIN"
-        echo "    added APPS/HELLO.BIN ($(wc -c < "$HELLO_BIN" | tr -d ' ') bytes) for the U2 loader"
+        COPYFILE_DISABLE=1 cp "$HELLO_BIN" "${S}/HELLO.BIN"
+        echo "    added HELLO.BIN ($(wc -c < "$HELLO_BIN" | tr -d ' ') bytes) for the U2 loader"
     else
         echo "    WARNING: ${HELLO_BIN} absent — image has no HELLO.BIN (run './arroyo fat-img' via arroyo, not make-fat-img.sh directly)"
     fi

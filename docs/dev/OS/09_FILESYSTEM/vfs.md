@@ -124,19 +124,25 @@ wants case-folding across a heterogeneous namespace layers it above the VFS, not
 
 ## 4. The namespace of record
 
-The forward-looking namespace the VFS enables:
+**The names now have their own file: [`layout.md`](layout.md)** (LAYOUT, orin 18). This section
+owns the *shape*; that file owns the *names*, per platform, as measured — plus what was
+deliberately not created, and the open questions.
+
+The live boot-time mount set:
 
 ```
-/          → native UnaFS   (the native root; per-object ACL)
-/usb       → FAT            (hot-plugged stick; volume-level ACL)
+/          → the native root  (UnaFS on the Pi; the card's FAT on the Orin and on x86)
+/boot      → the volume this machine booted from
+/apps      → the programs on that volume  (= /boot's APPS/ directory, a `FatBackend::rooted` mount)
+/usb       → FAT              (hot-plugged stick; volume-level ACL)
 ```
 
 This is the "do it right" shape: the **native** filesystem is the root of the namespace, and
 foreign (FAT) volumes hang off named mount points. It generalizes the metal-proven `/` vs `/usb`
-split the shell hand-rolled — the on-SD FAT card and any future volume become additional named
-mounts (`/sd`, `/net/…`) without new dispatch code. The VFS-1 spine can host this table today;
-wiring the shell and `SYS_OPEN` onto it (and choosing the exact boot-time mount set) is the
-follow-up adoption arc.
+split the shell hand-rolled — any future volume becomes an additional named mount (`/net/…`)
+without new dispatch code. VFSROUTE (§13) wired the shell onto it; `SYS_OPEN` is **not** wired
+onto it and remains a flat 8.3 volume-root namespace, which is why the EL0 fixture blobs stay in
+the root ([`layout.md`](layout.md) §2.1, §5.2).
 
 ## 5. How the ACL check composes across native and foreign volumes
 
@@ -717,10 +723,11 @@ because a mount table is an aarch64 idea. That gate is what forced every verb to
 
 On x86 the table binds **the program source** (`block::program_source`, resolved through
 `open_read_volume` so the FATVERB `READ_BIND` instrument is stamped exactly as it was when each verb
-mounted for itself) at BOTH `/` and `/boot` — `/boot` being the spelling the packaging text, the
-staged-image script and `exec_resolve`'s second probe all use for that one volume. This is the
-two-prefix shape `sdmmc_root_bind` already uses on the Orin, honest for the same reason: `/boot` IS a
-mount point, so `ls /` showing it is a fact, not decoration.
+mounted for itself) at `/` and `/boot`, and — since LAYOUT — at `/apps`, that volume's `APPS/`
+directory. This is the multi-prefix shape `sdmmc_root_bind` already uses on the Orin, honest for the
+same reason: `/boot` and `/apps` ARE mount points, so `ls /` showing them is a fact, not decoration.
+All three carry the SAME volume name: `same_volume` compares constructor strings, so a distinct name
+would make one medium read as several volumes ([`layout.md`](layout.md) §5.1).
 
 An arch with no volume returns an EMPTY table and the verbs say `no filesystem mounted (-ENODEV)` —
 better than the old `no FAT filesystem (NoDisk)`, which named a filesystem the operator never asked

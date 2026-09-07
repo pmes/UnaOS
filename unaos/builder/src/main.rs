@@ -524,11 +524,14 @@ fn main() {
     let _ = std::fs::remove_dir_all(&esp_dir);
     let boot_dir = esp_dir.join("EFI/BOOT");
     std::fs::create_dir_all(&boot_dir).unwrap();
-    // LAYOUT (orin 18): PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT. `fat::APPS_DIR` is the
-    // on-medium spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; the x86 program
-    // readers (U2, WINX-2/8, PULSE-W, the desktop app launcher) all go through `FatFs::find_app`,
-    // which looks HERE and nowhere else. The firmware's own files — EFI/BOOT/BOOTX64.EFI and
-    // kernel.elf — stay in the ROOT, because UEFI reads those by fixed path.
+    // LAYOUT (orin 18): THE LAUNCHABLE PROGRAMS GO IN `APPS/`. `fat::APPS_DIR` is the on-medium
+    // spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; WINX-2, WINX-8, PULSE-W and
+    // the desktop app launcher read through `FatFs::find_app`, which looks there.
+    //
+    // Two groups stay in the ROOT. The firmware's own files — EFI/BOOT/BOOTX64.EFI and kernel.elf —
+    // because UEFI reads those by fixed path. And HELLO.BIN, because the U2 program is ALSO opened
+    // by EL0, by name, through `sys_open`, whose namespace is a flat 8.3 volume root with no
+    // directory component at all — a syscall-ABI fact, not a layout preference.
     let esp_apps = esp_dir.join("APPS");
     std::fs::create_dir_all(&esp_apps).unwrap();
     
@@ -550,8 +553,8 @@ fn main() {
     // the blob wasn't built (a bare `cargo run` in builder/) — then U2 simply NoFile-skips, harmless.
     let hello_bin = target_dir.join("hello.bin");
     if hello_bin.exists() {
-        std::fs::copy(&hello_bin, esp_apps.join("HELLO.BIN")).unwrap();
-        println!("   U2: copied HELLO.BIN into APPS/ on the ESP");
+        std::fs::copy(&hello_bin, esp_dir.join("HELLO.BIN")).unwrap();
+        println!("   U2: copied HELLO.BIN onto the ESP root (EL0 opens it by name; see APPS/ note)");
     } else {
         println!("   U2: target/hello.bin absent — ESP has no HELLO.BIN (run via ./arroyo esp-x86)");
     }
@@ -651,8 +654,12 @@ fn main() {
     let data_apps = data_dir.join("APPS");
     std::fs::create_dir_all(&data_apps).unwrap();
     let mut staged_data: Vec<&str> = Vec::new();
+    // HELLO.BIN first, and into the volume ROOT — see the ESP note above (EL0 names it directly).
+    if target_dir.join("hello.bin").exists() {
+        std::fs::copy(target_dir.join("hello.bin"), data_dir.join("HELLO.BIN")).unwrap();
+        staged_data.push("HELLO.BIN (root)");
+    }
     for (src, dst) in [
-        (target_dir.join("hello.bin"), "HELLO.BIN"),
         (target_dir.join("STAT-X86.ELF"), "STAT.ELF"),
         (target_dir.join("VUG-X86.ELF"), "VUG.ELF"),
         // VUGSCENE: the two PINNED vug images ride the data volume too — the pin exists for benchmarking,
@@ -721,7 +728,7 @@ fn main() {
     ).unwrap();
 
     println!(
-        "   WINX-7 PKG: data volume tree target/x86_64_data/ — APPS/{} (+ hello.txt, readme.txt, SCRATCH.BIN, GROW.BIN, S8W.BIN, BLOCK.TXT in the root)",
+        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (all but HELLO.BIN under APPS/; + hello.txt, readme.txt, SCRATCH.BIN, GROW.BIN, S8W.BIN, BLOCK.TXT in the root)",
         if staged_data.is_empty() { "no EL0 artifacts built".to_string() } else { staged_data.join(", ") }
     );
 

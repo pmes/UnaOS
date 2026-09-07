@@ -4977,7 +4977,9 @@ stage_jetson_el0_images() {
     if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
         case ",${_feats}" in
             *",tegra_el0,"*)
-                cp "${WORKSPACE_DIR}/target/user_blob.bin" "${APPS_DIR_ARM}/HELLO.BIN"
+                # LAYOUT: the ROOT, not APPS/ — EL0 opens this blob by name through `sys_open`,
+                # whose namespace is the flat 8.3 volume root (see the kernel8 block's note).
+                cp "${WORKSPACE_DIR}/target/user_blob.bin" "${ESP_DIR_ARM}/HELLO.BIN"
                 staged=$((staged + 1))
                 ;;
         esac
@@ -4988,9 +4990,13 @@ stage_jetson_el0_images() {
     # stale copies of these names if the move had silently failed to happen.
     echo -e "${COLOR_GREEN}✅ EL0 programs in APPS/ on the boot volume (${staged}):${COLOR_RESET}"
     local f
-    for f in "${APPS_DIR_ARM}"/*.ELF "${APPS_DIR_ARM}"/*.BIN; do
+    for f in "${APPS_DIR_ARM}"/*.ELF; do
         [ -f "$f" ] || continue
         printf '     APPS/%-14s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
+    done
+    for f in "${ESP_DIR_ARM}"/*.BIN; do
+        [ -f "$f" ] || continue
+        printf '     %-19s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
     done
     # PULSE.ELF's honest note, printed where the operator will read it. ABIFREEZE divergence D2:
     # SYS_CPUPULSE (49) is dispatched ONLY by the x86 kernel; the aarch64 dispatcher has no arm for it and
@@ -6391,34 +6397,41 @@ kernel8() {
     cp "$FW_CACHE/overlays/miniuart-bt.dtbo" "$KERNEL8_DIR/overlays/"
     echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR} (firmware raspberrypi/firmware ${FW_TAG})${COLOR_RESET}"
 
-    # LAYOUT (orin 18): PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT. `fat::APPS_DIR` is the on-medium
-    # spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; the aarch64 loader
-    # (`load_program_into_slot` -> `FatFs::find_app`) looks HERE and nowhere else, so a program left
-    # in the root is a program the kernel will not find. 8.3 by construction — this FAT driver's
-    # create path writes short names only. make-pi-img.sh installs the staging dir RECURSIVELY
-    # (`mcopy -s` on Linux, `ditto` on macOS), so the directory rides along with no change there.
+    # LAYOUT (orin 18): THE LAUNCHABLE PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT. `fat::APPS_DIR`
+    # is the on-medium spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; the loader
+    # (`load_program_into_slot` -> `FatFs::find_app`) looks there first, and `run`/`bg`/quarry reach
+    # them through the `/apps` mount. 8.3 by construction — this FAT driver's create path writes
+    # short names only. make-pi-img.sh installs the staging dir RECURSIVELY (`mcopy -s` on Linux,
+    # `ditto` on macOS), so the directory rides along with no change there.
     #
-    # What stays in the ROOT, deliberately: kernel8.img, config.txt, the Pi firmware + overlays/
-    # (the firmware reads those by fixed path), and the mutable fixture files SCRATCH.BIN / GROW.BIN
-    # (data the EL0 demos write, not code they load).
+    # WHAT STAYS IN THE ROOT, AND THE SECOND GROUP IS THE INTERESTING ONE:
+    #   * kernel8.img, config.txt, the Pi firmware + overlays/ — the firmware reads those by fixed
+    #     path, and SCRATCH.BIN / GROW.BIN, which the EL0 demos WRITE (data, not code).
+    #   * THE FLAT EL0 FIXTURE BLOBS — HELLO.BIN, K2OWN.BIN, K2IMP.BIN, MIDDEN.BIN. These are
+    #     spawned by the kernel AND opened BY EL0, by name, through `sys_open`, whose namespace is a
+    #     flat 8.3 volume root with no directory component at all. Staging them under APPS/ was
+    #     measured on kernel8-test: the kernel loaded them fine and every EL0 `SYS_OPEN` of
+    #     HELLO.BIN answered -ENOENT, taking U6b and the whole U7 chain behind it. Moving them needs
+    #     a syscall-ABI change, not a layout change, so they stay where EL0 can name them.
     mkdir -p "$KERNEL8_DIR/APPS"
 
-    # M6g: carry the EL0 user blob onto the boot media as APPS/HELLO.BIN. On metal the kernel's M6g
-    # loader reads this very file back off the microSD it booted from; in QEMU it rides the same
-    # image attached via if=sd. Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
-    cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/APPS/HELLO.BIN"
+    # M6g: carry the EL0 user blob onto the boot media as HELLO.BIN, next to kernel8.img in the FAT32
+    # root (see the note above: EL0 opens this one by name). On metal the kernel's M6g loader reads
+    # this very file back off the microSD it booted from; in QEMU it rides the same image attached
+    # via if=sd. Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
+    cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/HELLO.BIN"
 
     # K2: carry the two additional EL0 programs onto the boot media (make-pi-img.sh ditto's the whole
     # staging dir). K2OWN.BIN = the private-create owner; K2IMP.BIN = the non-owner impostor. Re-created
     # every kernel8 build (KERNEL8_DIR is wiped above), present in every kernel8-test image AND on metal.
     # NEVER collide with HELLO.BIN/SCRATCH.BIN/GROW.BIN (other fixtures load/mutate those).
-    cp "${WORKSPACE_DIR}/target/owner_blob.bin" "$KERNEL8_DIR/APPS/K2OWN.BIN"
-    cp "${WORKSPACE_DIR}/target/imp_blob.bin" "$KERNEL8_DIR/APPS/K2IMP.BIN"
+    cp "${WORKSPACE_DIR}/target/owner_blob.bin" "$KERNEL8_DIR/K2OWN.BIN"
+    cp "${WORKSPACE_DIR}/target/imp_blob.bin" "$KERNEL8_DIR/K2IMP.BIN"
 
     # BANDY-1 M4: carry midden (program #3) onto the boot media as MIDDEN.BIN — the bandy_rt
     # launcher spawns it for the round-trip + equivalence witnesses. Distinct 8.3 name => its own
     # IMAGE_SHA256 principal via the sole mint path.
-    cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/APPS/MIDDEN.BIN"
+    cp "${WORKSPACE_DIR}/target/midden_blob.bin" "$KERNEL8_DIR/MIDDEN.BIN"
 
     # ELF-1: carry the minimal static ELF64 program onto the boot media as ELFHELLO.ELF (make-pi-img.sh
     # ditto's the whole staging dir). The kernel's ELF1 witness reads it back off the SD, validates + maps

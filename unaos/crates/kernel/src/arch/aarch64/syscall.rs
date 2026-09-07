@@ -7648,11 +7648,21 @@ fn spawn_errno(e: &SpawnErr) -> i64 {
 fn load_program_into_slot(name: &str) -> Result<Loaded, SpawnErr> {
     let fs = crate::fs::fat::mount().map_err(SpawnErr::NoMount)?;
     let kind = fs.kind();
-    // LAYOUT (orin 18): PROGRAMS, and only programs — `APPS/` on the medium (`fat::find_app`), the
-    // FAT-direct twin of the `/apps` mount `read_el0_image` opens through. `find_in_root` here
-    // would keep loading a program out of the volume root beside `KERNEL8.IMG` and every fixture's
-    // scratch file, which is the layout this arc removes.
-    let de = fs.find_app(name).map_err(|_| SpawnErr::NoFile(kind))?;
+    // LAYOUT (orin 18): `APPS/` FIRST — that is where programs live, and it is the FAT-direct twin
+    // of the `/apps` mount `read_el0_image` opens through (`fat::find_app`).
+    //
+    // THEN THE VOLUME ROOT, AND THE FALLBACK IS NOT LAZINESS. The flat fixture blobs this loader
+    // also spawns — `HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN` — are ALSO opened BY EL0,
+    // by name, through `sys_open`, whose namespace is a flat 8.3 volume root with no directory
+    // component at all (`MAX_NAME`, `find_located`). Moving those into `APPS/` would need a
+    // syscall-ABI change, not a layout change, and the U6b/U9x/U10 batteries measured it: with
+    // `HELLO.BIN` in `APPS/` the kernel loaded the program fine and every EL0 `SYS_OPEN` of it
+    // answered -ENOENT. So they stay where EL0 can name them, and this loader reaches them there.
+    // The order still means "a program is an APPS/ program if one exists by that name".
+    let de = fs
+        .find_app(name)
+        .or_else(|_| fs.find_in_root(name))
+        .map_err(|_| SpawnErr::NoFile(kind))?;
     // Read the WHOLE on-disk image, bounded by the slot's user window (the U2 truncation lesson: `read_file`
     // caps at min(de.size, cap), so a post-read length check could never SEE an oversize file — it would
     // silently truncate then run it; gate on `de.size` up front). The cap is the 16 KiB WINDOW, not one code
@@ -8719,9 +8729,9 @@ fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> {
 /// owner principal, now an image digest not a name) and by the IMG-SIG witness.
 fn image_principal_of_file(name: &str) -> Option<PrincipalRecord> {
     let fs = crate::fs::fat::mount().ok()?;
-    // LAYOUT (orin 18): the same lookup the loader makes, so the stamp stays bit-identical to the
-    // live one — `APPS/`, never the volume root.
-    let de = fs.find_app(name).ok()?;
+    // LAYOUT (orin 18): the same two-probe lookup the loader makes, in the same order, so the stamp
+    // stays bit-identical to the live one.
+    let de = fs.find_app(name).or_else(|_| fs.find_in_root(name)).ok()?;
     let cap = super::uslots::USER_REGION_SIZE;
     if de.size == 0 || de.size as u64 > cap as u64 {
         return None;
@@ -16045,7 +16055,10 @@ pub fn u6b_launcher(demo_cpu: usize) {
     //    unmountable / absent / a directory) skips with NOTHING allocated to unwind — no leaked address-space
     //    slot (there is no free-an-undispatched-slot primitive, so the fix is to not allocate before this).
     let (nocap_fc, nocap_sz) = match crate::fs::fat::mount()
-        .and_then(|fs| fs.find_app("HELLO.BIN").map(|de| (de.first_cluster(), de.size, de.is_dir)))
+        // LAYOUT (orin 18): `find_in_root`, deliberately — this pre-open must describe the SAME
+        // object EL0 is about to open with `SYS_OPEN("HELLO.BIN")`, and that syscall's namespace is
+        // the flat 8.3 volume root.
+        .and_then(|fs| fs.find_in_root("HELLO.BIN").map(|de| (de.first_cluster(), de.size, de.is_dir)))
     {
         Ok((fc, sz, false)) => (fc, sz),
         _ => {

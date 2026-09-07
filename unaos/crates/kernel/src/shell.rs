@@ -3252,6 +3252,9 @@ fn shell_relics_witness() {
     // that runs AFTER `emmc2::probe()` — i.e. the first moment this board has volumes to route to.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
     vfsroute_witness();
+    // LAYOUT (orin 18): the namespace transcript, on the same site and for the same reason.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    layout_witness();
 }
 
 /// RELICS: THE SUBSUMPTION TRANSCRIPT — the leg R26 clause 2 makes the retirement conditional on.
@@ -3739,6 +3742,151 @@ pub fn vfsroute_witness() {
     }
 }
 
+/// LAYOUT (orin 18): one-shot latch — the x86 service loop calls this site every pass.
+#[cfg(feature = "witness")]
+static LAYOUT_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// LAYOUT (orin 18): **the namespace this arc establishes, asserted on the live table.**
+///
+/// Two legs, and they fail for different reasons on purpose:
+///
+/// * `layout.apps` — programs are reachable at `/apps` and the old `/fat` prefix is GONE. It is
+///   two-sided: the probe must resolve under `/apps`, and the SAME leaf must NOT resolve under
+///   `/fat`, so a build that merely added a mount without retiring the old one still reds. The
+///   third claim is the one that makes it a layout gate rather than a mount gate — a bare name
+///   resolves through [`EXEC_ROOT`] to the `/apps` path, which is what an operator typing `vug`
+///   actually depends on. Point `EXEC_ROOT` back at the boot volume and this leg reds.
+///
+/// * `layout.volid` — **the aliasing property, with an oracle that is not `same_volume`.** If `/`
+///   and `/boot` are ONE medium, `MountTable::same_volume("/", "/boot")` must say so. The oracle is
+///   `VfsBackend::describe()` — the backend's own FAT geometry line (`part_lba`, `vol_sectors`,
+///   `bytes_per_sec`, `sec_per_clus`, `fat_start`, `data_start`, `count_of_clusters`) — plus an
+///   entry-for-entry comparison of the two root listings. Two mounts that agree on all of that are
+///   reading one volume; `same_volume` compares constructor STRINGS and can disagree, which is
+///   exactly rmbp 15's blocking condition C1: the Orin binds one card as `card` at `/` and `fat` at
+///   `/boot`, so one card reads as two volumes. **This leg is EXPECTED RED on the Orin
+///   (`sdmmcroot`) until the VOLID arc lands volume identity.** It is not red anywhere else: on the
+///   Pi `/` is native UnaFS and `/boot` is FAT, so the oracle says "different" and the implication
+///   is satisfied vacuously (the witness text says which); on x86 both prefixes carry one name and
+///   both sides say "same".
+///
+/// A board with no `/apps` mount, or one whose medium has no `APPS/` directory (a card staged
+/// before this layout), SKIPS with a stated line rather than failing — the honest answer, and the
+/// reason `./arroyo test` on the pattern-image default does not red.
+#[cfg(feature = "witness")]
+pub fn layout_witness() {
+    use core::sync::atomic::Ordering;
+    use crate::fs::vfs::NodeKind;
+    if LAYOUT_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+    let mt = vfs_mount_table();
+
+    // ── layout.volid: the aliasing property ─────────────────────────────────────────────────────
+    // Run FIRST, and independently of `/apps`, because it is a claim about `/` and `/boot` that
+    // holds (or does not) whatever the program directory looks like.
+    {
+        let rows = mt.rows();
+        let at = |p: &str| rows.iter().position(|r| r.0 == p);
+        match (at("/"), at("/boot")) {
+            (None, _) | (_, None) => serial_println!(
+                ":: layout: this board binds no {} — layout.volid skipped ::",
+                if at("/").is_some() { "/boot" } else { "/" }),
+            (Some(i_root), Some(i_boot)) => {
+                // The ORACLE, and it is deliberately not `same_volume`: the backends' own
+                // descriptions of the medium (`rows()`'s fifth field — the FAT geometry line each
+                // backend prints about ITSELF), plus their root listings compared entry for entry.
+                let same_geometry = rows[i_root].4.is_some() && rows[i_root].4 == rows[i_boot].4;
+                let listings_match = match (mt.read_dir("/"), mt.read_dir("/boot")) {
+                    (Ok(a), Ok(b)) => {
+                        !a.is_empty()
+                            && a.len() == b.len()
+                            && a.iter().zip(b.iter()).all(|(x, y)| {
+                                x.name == y.name && x.kind == y.kind && x.size == y.size
+                            })
+                    }
+                    _ => false,
+                };
+                let oracle_one_volume = same_geometry && listings_match;
+                let says_same = mt.same_volume("/", "/boot").unwrap_or(false);
+                // The implication, not the equality: the oracle can only ever prove SAMENESS (two
+                // different media could in principle carry identical geometry AND identical
+                // listings), so "the oracle says different" is not a licence to demand
+                // `same_volume == false`.
+                verdict(
+                    "layout.volid",
+                    !oracle_one_volume || says_same,
+                    &alloc::format!(
+                        "oracle_one_volume={} (geometry_match={} listings_match={}) same_volume={} root_vol={} boot_vol={}",
+                        oracle_one_volume, same_geometry, listings_match, says_same,
+                        rows[i_root].1, rows[i_boot].1),
+                );
+            }
+        }
+    }
+
+    // ── layout.apps: programs are at /apps, and /fat is gone ────────────────────────────────────
+    // THE PREFIX IS SPELLED OUT, not read from [`EXEC_ROOT`]. This leg is the claim that programs
+    // live at `/apps`; taking the directory from the constant under test would make it say only
+    // "programs live wherever EXEC_ROOT points", which is true of every value of EXEC_ROOT and
+    // therefore convicts nothing. EXEC_ROOT appears once below, in the bare-name leg, where the
+    // whole point is that it must AGREE with this prefix.
+    const APPS_MOUNT: &str = "/apps";
+    let apps = match mt.read_dir(APPS_MOUNT) {
+        Ok(rows) => rows,
+        Err(e) => {
+            serial_println!(
+                ":: layout: {} does not list on this board ({:?}) — layout.apps skipped ::",
+                APPS_MOUNT, e);
+            return;
+        }
+    };
+    // Prefer the program the rest of the battery launches; fall back to whatever file IS staged, so
+    // the leg is a claim about the LAYOUT rather than about one image's presence.
+    let probe = apps
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case("VUG.ELF") && matches!(r.kind, NodeKind::File))
+        .or_else(|| apps.iter().find(|r| matches!(r.kind, NodeKind::File)));
+    let Some(probe) = probe else {
+        serial_println!(
+            ":: layout: {} lists {} entries but no file — layout.apps skipped ::",
+            APPS_MOUNT, apps.len());
+        return;
+    };
+    let in_apps = vfs_join(APPS_MOUNT, &probe.name);
+    let in_fat = vfs_join("/fat", &probe.name);
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, NodeKind::Dir));
+    let resolves = is_file(&in_apps);
+    // `/fat` must not be a mount prefix AND must not resolve as an object — it is retired, not
+    // aliased. (`/fat/<leaf>` is checked too: a leftover mount would answer for the leaf.)
+    let fat_prefix_gone = !mt.rows().iter().any(|r| r.0 == "/fat");
+    let fat_gone = fat_prefix_gone && mt.stat("/fat").is_err() && !is_file(&in_fat);
+    // THE LEG THAT MOVES WITH `EXEC_ROOT`: a bare name, from `/`, must land on the `/apps` path.
+    // This is what reds if `EXEC_ROOT` is pointed back at the boot volume.
+    #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
+    let (bare_ok, bare_got) = {
+        let got = exec_resolve(&probe.name);
+        (got.as_deref() == Some(in_apps.as_str()), alloc::format!("{:?}", got))
+    };
+    #[cfg(not(all(feature = "aarch64_el0", target_arch = "aarch64")))]
+    let (bare_ok, bare_got) = (true, String::from("n/a (no exec_resolve on this build)"));
+    verdict(
+        "layout.apps",
+        resolves && fat_gone && bare_ok,
+        &alloc::format!(
+            "probe={} apps_resolves={} fat_prefix_gone={} fat_gone={} bare={} exec_root={}",
+            probe.name, resolves, fat_prefix_gone, fat_gone, bare_got, EXEC_ROOT),
+    );
+}
+
 /// VFSROUTE (orin 17): the NATIVE-volume mutation transcript — `touch`, `ls`, `mkdir`, `rmdir`, `rm`
 /// through the plain verbs, on the volume the pre-VFSROUTE mutating verbs could not reach.
 ///
@@ -3980,6 +4128,9 @@ pub fn fatverb_storage_witness() {
     // something in it.
     #[cfg(feature = "witness")]
     vfsroute_witness();
+    // LAYOUT (orin 18): the namespace transcript rides the same site, for the same reason.
+    #[cfg(feature = "witness")]
+    layout_witness();
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
