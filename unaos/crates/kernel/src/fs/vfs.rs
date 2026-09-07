@@ -160,6 +160,41 @@ pub trait VfsBackend {
     /// The volume's own name (`"native"`, `"usb"`, …) — for tracing/listing.
     fn volume_name(&self) -> &str;
 
+    /// LAYOUT (orin 18): the VOLUME-relative directory this mount is rooted at, or `""` when the
+    /// mount IS the volume root.
+    ///
+    /// **This is the fact that makes a `rel` MOUNT-relative rather than volume-relative, and it is
+    /// on the trait because the one caller that holds two mounts at once — [`MountTable::rename`] —
+    /// cannot be correct without it.** Before LAYOUT every mount was rooted at the volume root, so
+    /// the two spaces coincided and a remainder produced by one mount was a valid address on any
+    /// other mount of the same volume. A rooted mount breaks exactly that: `/boot` and `/apps` can
+    /// be ONE VOLUME and still be TWO ADDRESS SPACES.
+    ///
+    /// The default is `""` — a backend with no notion of a sub-root (native UnaFS, the witness
+    /// mock) is addressed in its volume's own space and overrides nothing, so this places no
+    /// obligation on any implementor.
+    fn mount_root(&self) -> &str {
+        ""
+    }
+
+    /// LAYOUT: the VOLUME-relative path that the mount-relative `rel` names on the medium —
+    /// [`mount_root`](VfsBackend::mount_root) followed by `rel`'s components.
+    ///
+    /// The SINGLE definition of mount-space → volume-space: the FAT walk and
+    /// [`MountTable::rename`]'s cross-mount translation both go through it, so the two cannot
+    /// drift apart. The volume root is `""` and prefixes nothing, which makes every pre-LAYOUT
+    /// mount byte-for-byte the old walk.
+    fn on_volume(&self, rel: &str) -> String {
+        let root = self.mount_root();
+        let mut s = String::with_capacity(root.len() + rel.len() + 1);
+        s.push_str(root);
+        for c in components(rel) {
+            s.push('/');
+            s.push_str(c);
+        }
+        s
+    }
+
     /// List the directory at `rel`. Errors: [`VfsError::NoSuchPath`] (absent),
     /// [`VfsError::NotADirectory`] (a file).
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError>;
@@ -572,11 +607,55 @@ impl MountTable {
         if !same_storage(bf, bt) {
             return Err(VfsError::Unsupported);
         }
-        // Both remainders are VOLUME-ROOT-relative by construction (each mount strips its own
-        // prefix), so when the two mounts are the same volume the destination's remainder is a
-        // valid address on the source's backend — which is what lets `mv /A.TXT /boot/B.TXT` work on
-        // a machine that binds one volume at two prefixes (x86's `/` + `/boot`, the Orin's card).
-        bf.rename(relf, relt, principal)
+        // ONE VOLUME IS NOT ONE ADDRESS SPACE (LAYOUT, orin 18 — rmbp 15's finding B66).
+        //
+        // This block used to rest on the sentence "both remainders are VOLUME-ROOT-relative by
+        // construction (each mount strips its own prefix)" and hand `relt` straight to `bf`. LAYOUT
+        // falsified that sentence: [`VfsBackend::mount_root`] lets a mount be rooted at a
+        // DIRECTORY, so a remainder is mount-relative, and `/boot` (root `""`) and `/apps`
+        // (root `/APPS`) are one volume addressed two ways. Passing the destination's remainder to
+        // the source's backend then produced a SILENT WRONG LOCATION that reported success:
+        // `mv /boot/A.TXT /apps/B.TXT` wrote `B.TXT` to the volume root (never inside `APPS/`) and
+        // `mv /apps/X.ELF /boot/Y.ELF` renamed `APPS/X.ELF` to `APPS/Y.ELF` (the program never left
+        // `/apps`). Both ends exist afterwards, so a presence-only check passes on the bug — which
+        // is why `layout.mv` asserts ABSENCE from the source as well.
+        //
+        // The fix is to put both ends in ONE space before the backend is called. Each remainder is
+        // lifted to the volume through its OWN mount (`on_volume`), and the pair is then expressed
+        // inside whichever of the two mounts can address both: the source's if it can reach the
+        // destination (`/boot` → `/apps`), otherwise the destination's if it can reach the source
+        // (`/apps` → `/boot`). Both mounts name one volume, so either is a sound executor; when the
+        // DESTINATION's mount executes, the source mount's write ACL is asked as well, so a move
+        // out of a rooted mount cannot borrow the other mount's write posture.
+        //
+        // Neither can address both (two sibling rooted mounts, `/apps` and a future `/lib`) → the
+        // move is genuinely cross-space and is REFUSED BY NAME. Refusing is never corrupting;
+        // silently relinking into the wrong directory is.
+        //
+        // Two shapes were rejected. Refusing whenever the two roots differ is a capability
+        // regression — `mv /boot/X /apps/Y` is a legitimate same-volume move that worked before
+        // LAYOUT. Making the two-argument backend ops take volume-absolute paths is the structural
+        // answer, and it changes the `VfsBackend` contract for every implementor; that is not a
+        // change to make under a boot deadline.
+        let src_abs = bf.on_volume(relf);
+        let dst_abs = bt.on_volume(relt);
+        let (b, rf, rt, via_dst) = if let (Some(rf), Some(rt)) = (
+            under_mount_root(bf.mount_root(), &src_abs),
+            under_mount_root(bf.mount_root(), &dst_abs),
+        ) {
+            (bf, rf, rt, false)
+        } else if let (Some(rf), Some(rt)) = (
+            under_mount_root(bt.mount_root(), &src_abs),
+            under_mount_root(bt.mount_root(), &dst_abs),
+        ) {
+            (bt, rf, rt, true)
+        } else {
+            return Err(VfsError::Backend("cross-mount-root"));
+        };
+        if via_dst {
+            bf.authorize_write(relf, principal)?;
+        }
+        b.rename(rf, rt, principal)
     }
 
     /// Do `from` and `to` land on the SAME volume? The question `mv` asks before it decides between
@@ -679,6 +758,32 @@ fn components(rel: &str) -> impl Iterator<Item = &str> {
     rel.split('/').filter(|c| !c.is_empty())
 }
 
+/// LAYOUT (orin 18): express the VOLUME-relative `abs` as a remainder inside a mount rooted at
+/// `root`, or `None` when `abs` lies OUTSIDE that mount's address space. The inverse of
+/// [`VfsBackend::on_volume`], and the second half of [`MountTable::rename`]'s translation.
+///
+/// The root is matched case-insensitively, like every other FAT lookup here (`/APPS` and `/apps`
+/// name one directory), and at a PATH BOUNDARY — a mount rooted at `/APPS` claims `/APPS` and
+/// `/APPS/…` but never `/APPSTORE/…`, the same boundary rule [`prefix_claims`] applies to namespace
+/// prefixes. `abs` equal to the root is the mount point itself and yields `""`, which every write
+/// verb already refuses as [`VfsError::IsADirectory`].
+fn under_mount_root<'a>(root: &str, abs: &'a str) -> Option<&'a str> {
+    if root.is_empty() {
+        return Some(abs); // the volume root addresses the whole volume
+    }
+    if abs.len() < root.len()
+        || !abs.is_char_boundary(root.len())
+        || !abs[..root.len()].eq_ignore_ascii_case(root)
+    {
+        return None;
+    }
+    match abs.as_bytes().get(root.len()) {
+        None => Some(""),                       // `abs` IS the mount point
+        Some(b'/') => Some(&abs[root.len()..]), // a name beneath it
+        Some(_) => None,                        // `/APPSTORE` merely starts with `/APPS`
+    }
+}
+
 // =========================================================================================
 // Adapters — thin glue over the EXISTING backends. Neither FS is rewritten; each adapter
 // wraps that backend's public mount API and translates its DirEntry/Inode/error into the
@@ -721,9 +826,10 @@ pub struct FatBackend {
     /// LAYOUT (orin 18): the volume-relative DIRECTORY this mount exposes as its root — `""` for
     /// the volume root (every mount before this arc), `"/APPS"` for the `/apps` program mount,
     /// which is the ESP's `APPS/` directory bound at its own prefix. Every `rel` the trait hands
-    /// this backend is prefixed with it before the FAT walk (see [`FatBackend::on_volume`]), so a
-    /// consumer of `/apps/VUG.ELF` reaches `APPS/VUG.ELF` on the medium and can never reach above
-    /// the directory. Set only by [`FatBackend::rooted`].
+    /// this backend is prefixed with it before the FAT walk (see [`VfsBackend::on_volume`], which
+    /// reads it through [`VfsBackend::mount_root`]), so a consumer of `/apps/VUG.ELF` reaches
+    /// `APPS/VUG.ELF` on the medium and can never reach above the directory. Set only by
+    /// [`FatBackend::rooted`].
     root: String,
 }
 
@@ -797,18 +903,6 @@ impl FatBackend {
         }
         self.root = root;
         self
-    }
-
-    /// LAYOUT: the path on the MEDIUM for a mount-relative `rel` — `root` + `rel`. The volume
-    /// root is `""` and prefixes nothing, so every pre-LAYOUT mount is byte-for-byte the old walk.
-    fn on_volume(&self, rel: &str) -> String {
-        let mut s = String::with_capacity(self.root.len() + rel.len() + 1);
-        s.push_str(&self.root);
-        for c in components(rel) {
-            s.push('/');
-            s.push_str(c);
-        }
-        s
     }
 
     /// LAYOUT: [`resolve_entry`](Self::resolve_entry) from this mount's root.
@@ -991,6 +1085,24 @@ impl VfsBackend for FatBackend {
         let h = volid_mix(h, self.source.name().as_bytes());
         let h = volid_mix(h, &serial.to_le_bytes());
         Some(volid_mix(h, &clusters.to_le_bytes()))
+    }
+
+    /// LAYOUT (orin 18) composed with VOLID: the ONE backend that can be rooted below the volume
+    /// root — `""` for every mount before LAYOUT, `/APPS` for the program mount. The trait's
+    /// default `on_volume` is what the walk below (`entry`/`parent`) and `MountTable::rename`
+    /// both read it through.
+    ///
+    /// **The root is deliberately NOT part of [`volume_id`](FatBackend::volume_id) above, and the
+    /// two answers must stay orthogonal.** Identity is a fact about the STORAGE; the root is a
+    /// fact about this MOUNT's address space. `/boot` (root `""`) and `/apps` (root `/APPS`) are
+    /// ONE volume over one `BlockSource` and must compare EQUAL, or `mv /boot/X /apps/Y` is
+    /// refused as cross-volume — C1 all over again, which is the bug VOLID fixed. What makes that
+    /// equality safe is the other half of the pair: `MountTable::rename` translates between the
+    /// two roots before it calls a backend, so "same volume" no longer implies "same address
+    /// space" anywhere that matters (B66). Mixing the root into the id would buy the translation's
+    /// safety by reintroducing VOLID's defect, which is the wrong trade in both directions.
+    fn mount_root(&self) -> &str {
+        &self.root
     }
 
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {

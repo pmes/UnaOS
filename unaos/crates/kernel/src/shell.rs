@@ -3255,6 +3255,11 @@ fn shell_relics_witness() {
     // LAYOUT (orin 18): the namespace transcript, on the same site and for the same reason.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
     layout_witness();
+    // LAYOUT (orin 18): the cross-address-space `mv` transcript (B66). aarch64 bare-metal ONLY —
+    // see the fn's note: it is a write transcript, and the x86 witness site is the storage-ready
+    // pass whose timing this arc already measured breaking under added block I/O.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    layout_mv_witness();
 }
 
 /// RELICS: THE SUBSUMPTION TRANSCRIPT — the leg R26 clause 2 makes the retirement conditional on.
@@ -3747,6 +3752,43 @@ pub fn vfsroute_witness() {
 static LAYOUT_WITNESS_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// LAYOUT (orin 18): **does the tree beneath this file derive volume identity from the MEDIUM
+/// rather than from the mount's constructor NAME?** Measured, never declared.
+///
+/// This is what makes `layout.volid`'s expected-red EXPIRE without anyone editing a comment. It
+/// builds the aliasing shape in a SCRATCH [`crate::fs::vfs::MountTable`] that no board mounts, and
+/// reads the mechanism's answer back:
+///
+/// * **A** — two mounts of ONE source under DIFFERENT names. Name-derived identity answers
+///   DIFFERENT; medium-derived identity answers SAME.
+/// * **B** — two mounts of ONE source under the SAME name. Name-derived identity answers SAME;
+///   medium-derived identity answers SAME when that source carries a volume and DIFFERENT when it
+///   does not (an identity that cannot be established is equal to nothing, not even to itself).
+///
+/// `A || !B` is therefore true under medium-derived identity **whether or not
+/// `BlockSource::Default` has a volume on this board**, and false under name-derived identity in
+/// both cases. That independence is the point: it is a probe of the MECHANISM, not of the medium,
+/// so it answers correctly on the Orin (where `Default` has no device at all) as well as on a board
+/// that boots from it.
+///
+/// COST: none on the green path. It is consulted only on the branch where `layout.volid` would
+/// otherwise fail, and a name-derived `same_volume` compares two `&str` and touches no block
+/// device. That matters because this file's x86 call site is the storage-ready pass, where added
+/// block I/O was measured shifting the window-manager battery into two fixture flakes.
+#[cfg(feature = "witness")]
+fn volume_identity_is_medium_derived() -> bool {
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    let probe = |na: &str, nb: &str| {
+        let mut mt = MountTable::new();
+        mt.mount("/a", alloc::boxed::Box::new(FatBackend::new(na, KERNEL_PRINCIPAL, true)));
+        mt.mount("/b", alloc::boxed::Box::new(FatBackend::new(nb, KERNEL_PRINCIPAL, true)));
+        mt.same_volume("/a", "/b").unwrap_or(false)
+    };
+    let a = probe("layout-probe-x", "layout-probe-y");
+    let b = probe("layout-probe", "layout-probe");
+    a || !b
+}
+
 /// LAYOUT (orin 18): **the namespace this arc establishes, asserted on the live table.**
 ///
 /// Two legs, and they fail for different reasons on purpose:
@@ -3765,11 +3807,24 @@ static LAYOUT_WITNESS_DONE: core::sync::atomic::AtomicBool =
 ///   entry-for-entry comparison of the two root listings. Two mounts that agree on all of that are
 ///   reading one volume; `same_volume` compares constructor STRINGS and can disagree, which is
 ///   exactly rmbp 15's blocking condition C1: the Orin binds one card as `card` at `/` and `fat` at
-///   `/boot`, so one card reads as two volumes. **This leg is EXPECTED RED on the Orin
-///   (`sdmmcroot`) until the VOLID arc lands volume identity.** It is not red anywhere else: on the
+///   `/boot`, so one card reads as two volumes. It is not red anywhere else: on the
 ///   Pi `/` is native UnaFS and `/boot` is FAT, so the oracle says "different" and the implication
 ///   is satisfied vacuously (the witness text says which); on x86 both prefixes carry one name and
 ///   both sides say "same".
+///
+///   **THE EXPECTED RED EXPIRES BY ITSELF, AND THE LEG DETECTS THE CONDITION — it is not told by a
+///   comment.** This leg used to carry the sentence "EXPECTED RED on the Orin until the VOLID arc
+///   lands volume identity", and rmbp 15 was right that such a sentence is a MASK: while a leg is
+///   expected to fail it cannot report anything ELSE failing, and nobody re-reads the comment to
+///   find out when the excuse expired. So the excuse is now measured, on the branch where the leg
+///   would otherwise fail, by [`volume_identity_is_medium_derived`] — a probe of the MECHANISM in a
+///   scratch `MountTable` that no board mounts. Medium-derived identity beneath us and the claim
+///   still violated ⇒ `layout.volid -> FAIL`, a real defect. Identity still NAME-derived ⇒ the leg
+///   scores, **under the different name `layout.volid.pre`**, the only shape that is excusable
+///   without VOLID: one medium reported as two volumes *because the two constructor names differ*.
+///   Any other shape reds that leg too, so nothing is masked; and the day VOLID lands beneath this
+///   tree the probe flips, `layout.volid.pre` disappears from the transcript, and `layout.volid`
+///   must be GREEN. A `layout.volid -> PASS` therefore always means the full claim.
 ///
 /// A board with no `/apps` mount, or one whose medium has no `APPS/` directory (a card staged
 /// before this layout), SKIPS with a stated line rather than failing — the honest answer, and the
@@ -3842,13 +3897,40 @@ pub fn layout_witness() {
             // The implication, not the equality: the oracle can only ever prove SAMENESS (two
             // different media could in principle carry identical geometry AND identical listings),
             // so "the oracle says different" is not a licence to demand `same_volume == false`.
-            verdict(
-                "layout.volid",
-                !oracle_one_volume || says_same,
-                &alloc::format!(
-                    "oracle_one_volume={} same_volume={} oracle: {}",
-                    oracle_one_volume, says_same, why),
-            );
+            let claim_holds = !oracle_one_volume || says_same;
+            let got = alloc::format!(
+                "oracle_one_volume={} same_volume={} oracle: {}",
+                oracle_one_volume, says_same, why);
+            // THE EXPECTED-RED EXPIRY (rmbp 15's non-blocking note), and the probe is reached ONLY
+            // here — on the branch that is already failing — so the green path costs nothing.
+            if claim_holds {
+                verdict("layout.volid", true, &got);
+            } else if volume_identity_is_medium_derived() {
+                verdict(
+                    "layout.volid",
+                    false,
+                    &alloc::format!(
+                        "{} identity=MEDIUM-derived (scratch-table probe) — the pre-VOLID excuse \
+                         has expired and this is a real defect",
+                        got),
+                );
+            } else {
+                // Identity is still the constructor NAME beneath us. Score the ONLY shape that is
+                // excusable without VOLID — one medium, two names — under a DIFFERENT LEG NAME, so
+                // no transcript can read this as the full claim and no spec can require it by
+                // mistake. Any other shape here still reds.
+                let names_differ = mt.volume_name("/").ok() != mt.volume_name("/boot").ok();
+                serial_println!(
+                    ":: layout: volume identity is still NAME-derived beneath this leg (probe: one \
+                     source mounted twice under two names compares unequal), so the aliasing claim \
+                     is scored as layout.volid.pre; it reverts to layout.volid the moment that \
+                     probe flips ::");
+                verdict(
+                    "layout.volid.pre",
+                    names_differ,
+                    &alloc::format!("{} names_differ={}", got, names_differ),
+                );
+            }
         }
     }
 
@@ -3906,6 +3988,165 @@ pub fn layout_witness() {
             "probe={} apps_resolves={} fat_prefix_gone={} fat_gone={} bare={} exec_root={}",
             probe.name, resolves, fat_prefix_gone, fat_gone, bare_got, EXEC_ROOT),
     );
+}
+
+/// LAYOUT (orin 18): one-shot latch for [`layout_mv_witness`].
+#[cfg(feature = "witness")]
+static LAYOUT_MV_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// LAYOUT (orin 18): `layout.mv` — **a move across the TWO ADDRESS SPACES of ONE VOLUME, in both
+/// directions, scored by ABSENCE FROM THE SOURCE as well as presence at the destination.**
+///
+/// This is rmbp 15's blocking finding B66 made failable. `/boot` and `/apps` are one volume with
+/// two roots (`""` and `/APPS`), and `MountTable::rename` used to hand the DESTINATION's remainder
+/// to the SOURCE's backend. Both wrong outcomes reported success and left a file that exists
+/// SOMEWHERE:
+///
+/// * `mv /boot/A.TXT /apps/B.TXT` wrote `B.TXT` to the VOLUME ROOT, never inside `APPS/`;
+/// * `mv /apps/X.ELF /boot/Y.ELF` renamed `APPS/X.ELF` to `APPS/Y.ELF` — the program never left
+///   `/apps`.
+///
+/// **So a presence-only assertion passes on the bug in both directions**, and the absence half is
+/// the load-bearing one. Each direction asserts three things: the destination lists the new leaf,
+/// the source lists NEITHER the old leaf (it really moved) NOR the new one (it did not land in the
+/// source's own space under the destination's name).
+///
+/// The two directions each stage their OWN probe rather than one consuming the other's output.
+/// Chaining them would let direction 1's failure turn direction 2 into "not run" instead of
+/// convicted — an un-exercised half is exactly what this leg exists to rule out.
+///
+/// It also asserts `roots_differ` through [`crate::fs::vfs::VfsBackend::mount_root`], because
+/// without that the whole leg is vacuous: two mounts rooted at the same directory cannot exhibit
+/// the defect, so a build that quietly un-rooted `/apps` would turn this from a passing gate into
+/// a passing no-op. The leg says so instead.
+///
+/// It goes through `fs_mv`, the operator's own verb, so the verb's success line is on the wire next
+/// to the verdict — the defect's whole character is that it REPORTS SUCCESS.
+///
+/// # WHERE IT RUNS, AND WHY NOT ON x86
+///
+/// Only the aarch64 bare-metal witness site. The x86 site is the storage-ready pass, and added
+/// block I/O there was MEASURED (this arc's own commit `38b56dba`) shifting the window-manager
+/// battery into two different fixture flakes. This leg is create + rename + rename + two listings
+/// per direction + unlink, which is well past what that pass tolerates, and the code under test is
+/// arch-neutral (`fs/vfs.rs`), so the Pi bare-metal gate convicts it for both arches.
+///
+/// # IT SELF-CLEANS
+///
+/// Every name it makes is unlinked under BOTH prefixes before it returns — under both, because on
+/// the failing path the probe is in the space the fixture did not aim at, and a fixture that leaks
+/// a file on a red run poisons the next boot's `layout.apps` probe selection.
+///
+/// A board that binds only one of the two prefixes, that reports them as different volumes, or
+/// whose volume refuses writes (the Orin's read-only card) SKIPS with a stated line — the honest
+/// answer, and never a silent pass.
+#[cfg(feature = "witness")]
+pub fn layout_mv_witness() {
+    use core::sync::atomic::Ordering;
+    // `mount_root` is reached on a `&dyn VfsBackend`, whose trait methods are inherent candidates —
+    // no `use` of the trait is needed (and importing it warns as unused).
+    use crate::fs::vfs::NodeKind;
+    if LAYOUT_MV_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    const BOOT: &str = "/boot";
+    const APPS: &str = "/apps";
+    // 8.3 short names: FAT create is 8.3-only on this driver (VFAT LFN write is out of scope).
+    const N1: &str = "LAYMV1.TMP";
+    const N2: &str = "LAYMV2.TMP";
+    const N3: &str = "LAYMV3.TMP";
+
+    let mt = vfs_mount_table();
+    let prefixes = mt.prefixes();
+    let bound = |p: &str| prefixes.iter().any(|q| *q == p);
+    if !bound(BOOT) || !bound(APPS) {
+        return serial_println!(
+            ":: layout: this board binds no {} — layout.mv skipped ::",
+            if bound(BOOT) { APPS } else { BOOT });
+    }
+    if !mt.same_volume(BOOT, APPS).unwrap_or(false) {
+        return serial_println!(
+            ":: layout: {} and {} are not one volume on this board — layout.mv skipped ::",
+            BOOT, APPS);
+    }
+    for p in [BOOT, APPS] {
+        if let Ok(Some(veto)) = mt.write_veto(p) {
+            return serial_println!(
+                ":: layout: {} refuses writes ({}) — layout.mv skipped ::", p, veto);
+        }
+    }
+    // The two mounts must really be two spaces, or the leg proves nothing.
+    let root_of = |p: &str| {
+        mt.resolve(p).map(|(b, _)| String::from(b.mount_root())).unwrap_or_default()
+    };
+    let (boot_root, apps_root) = (root_of(BOOT), root_of(APPS));
+    let roots_differ = !boot_root.eq_ignore_ascii_case(&apps_root);
+
+    let lists = |dir: &str, leaf: &str| {
+        matches!(mt.read_dir(dir), Ok(rs)
+            if rs.iter().any(|r| r.name.eq_ignore_ascii_case(leaf)
+                && matches!(r.kind, NodeKind::File)))
+    };
+    let scrub = || {
+        for dir in [BOOT, APPS] {
+            for leaf in [N1, N2, N3] {
+                let _ = mt.unlink(&vfs_join(dir, leaf), SHELL_PRINCIPAL);
+            }
+        }
+    };
+    scrub(); // a previous red run may have left one of these somewhere
+
+    // THE TWO DIRECTIONS ARE INDEPENDENT: each stages its OWN probe rather than consuming the
+    // other's output. Chaining them would make direction 1's failure hide direction 2's assertion
+    // entirely — the falsifier reds direction 1, and a chained direction 2 would then be "not run"
+    // rather than convicted, which is precisely the kind of un-exercised half this leg exists to
+    // rule out.
+    let stage = |dir: &str, leaf: &str| {
+        mt.create(&vfs_join(dir, leaf), NodeKind::File, SHELL_PRINCIPAL)
+    };
+
+    // ── direction 1: /boot -> /apps. The bug wrote the leaf to the VOLUME ROOT and said "moved".
+    if let Err(e) = stage(BOOT, N1) {
+        return serial_println!(
+            ":: layout: cannot stage {} on {} ({:?}) — layout.mv skipped ::", N1, BOOT, e);
+    }
+    let said_a = witness_capture(|c| fs_mv(c, &vfs_join(BOOT, N1), &vfs_join(APPS, N2), false))
+        .join(" | ");
+    let a_at_dst = lists(APPS, N2);
+    let a_src_clean = !lists(BOOT, N1) && !lists(BOOT, N2);
+    scrub();
+
+    // ── direction 2: /apps -> /boot. The bug renamed within APPS/ and said "moved".
+    if let Err(e) = stage(APPS, N2) {
+        return serial_println!(
+            ":: layout: cannot stage {} on {} ({:?}) — layout.mv skipped ::", N2, APPS, e);
+    }
+    let said_b = witness_capture(|c| fs_mv(c, &vfs_join(APPS, N2), &vfs_join(BOOT, N3), false))
+        .join(" | ");
+    let b_at_dst = lists(BOOT, N3);
+    let b_src_clean = !lists(APPS, N2) && !lists(APPS, N3);
+    scrub();
+
+    verdict_layout_mv(
+        roots_differ && a_at_dst && a_src_clean && b_at_dst && b_src_clean,
+        &alloc::format!(
+            "roots_differ={} ({:?} vs {:?}) a_at_dst={} a_src_clean={} b_at_dst={} \
+             b_src_clean={} said_a=[{}] said_b=[{}]",
+            roots_differ, boot_root, apps_root, a_at_dst, a_src_clean, b_at_dst, b_src_clean,
+            &said_a[..core::cmp::min(said_a.len(), 96)],
+            &said_b[..core::cmp::min(said_b.len(), 96)]),
+    );
+}
+
+/// LAYOUT (orin 18): [`layout_mv_witness`]'s verdict line, in the house `:: TSTE: <leg> ->` shape.
+#[cfg(feature = "witness")]
+fn verdict_layout_mv(ok: bool, got: &str) {
+    if ok {
+        serial_println!(":: TSTE: layout.mv -> PASS ::");
+    } else {
+        serial_println!(":: TSTE: layout.mv -> FAIL (got {}) ::", got);
+    }
 }
 
 /// VFSROUTE (orin 17): the NATIVE-volume mutation transcript — `touch`, `ls`, `mkdir`, `rmdir`, `rm`

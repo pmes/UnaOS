@@ -129,6 +129,43 @@ Three paths, and they now agree:
 
 `IMAGE_SHA256` principals are content hashes, so no principal moved.
 
+### 2.3 One volume is no longer one address space — what `mv` had to learn (rmbp 15 B66)
+
+A rooted mount splits a distinction that used to be free. Before this arc every mount was rooted
+at its volume root, so the remainder the resolver hands a backend was **volume**-relative and one
+mount's remainder was a valid address on any other mount of the same volume. `MountTable::rename`
+was built on exactly that sentence, written out in its own comment, and it handed the DESTINATION's
+remainder to the SOURCE's backend. `/apps` falsified the sentence: `/boot` (root `""`) and `/apps`
+(root `/APPS`) are **one volume with two address spaces**, and the remainder is now MOUNT-relative.
+
+Both outcomes were silent, wrong-location, and reported success:
+
+| the operator typed | the file actually went | the operator was told |
+|---|---|---|
+| `mv /boot/A.TXT /apps/B.TXT` | `B.TXT` at the **volume root** — never inside `APPS/` | `moved … -> /apps/B.TXT` |
+| `mv /apps/X.ELF /boot/Y.ELF` | `APPS/X.ELF` → `APPS/Y.ELF` — **never left `/apps`** | `moved … -> /boot/Y.ELF` |
+
+Both leave a file that exists *somewhere*, so a presence-only test passes on the bug. That is why
+`layout.mv` (§6) scores **absence from the source** as well.
+
+**The fix translates; it does not refuse.** `VfsBackend` gained two DEFAULTED methods —
+`mount_root()` (`""` for every mount that is not `.rooted(…)`) and `on_volume()` (the one definition
+of mount-space → volume-space, used by the FAT walk *and* by the translation, so they cannot drift).
+`MountTable::rename` lifts each remainder to the volume through its own mount and then expresses the
+pair inside whichever of the two mounts can address both — the source's when it reaches the
+destination, otherwise the destination's when it reaches the source. When the destination's mount
+executes, the source mount's `authorize_write` is asked too, so a move out of a rooted mount cannot
+borrow the other mount's write posture. Two sibling rooted mounts that can each reach only their own
+subtree are genuinely cross-space and are refused **by name**,
+`VfsError::Backend("cross-mount-root")` — no board mounts that shape today.
+
+Two other shapes were considered and rejected. *Refusing whenever the two roots differ* is a real
+capability regression: `mv /boot/X /apps/Y` is a legitimate same-volume move that worked before this
+arc. *Making the two-argument backend ops take volume-absolute paths* is the structural answer — no
+caller could mix spaces again — but it changes the `VfsBackend` contract for every implementor, and
+that is not a change to make under a boot deadline. The defaulted accessors above are deliberately
+**not** that change: no implementor gains an obligation.
+
 ---
 
 ## 3. Nothing empty was created
@@ -188,10 +225,45 @@ not exist. **Deferred to Peter, with the current placement stated so the deferra
   on the next, with the same commit green twice at the baseline). Same reason `layout.apps` reads
   `prefixes()` rather than `rows()`: a listing question must not cost a FAT mount per mount point.
 
-  **It is EXPECTED RED on the Orin (`sdmmcroot`) until VOLID lands**, and green everywhere else:
-  on the Pi `/` is native UnaFS and `/boot` is FAT, so the oracle says "different" and the
-  implication holds vacuously (the witness text prints which); on x86 both prefixes carry one name
-  and both sides say "same".
+  It is green everywhere but the Orin: on the Pi `/` is native UnaFS and `/boot` is FAT, so the
+  oracle says "different" and the implication holds vacuously (the witness text prints which); on
+  x86 both prefixes carry one name and both sides say "same".
+
+  **The Orin's expected red now EXPIRES BY ITSELF, and the leg detects the condition.** This leg
+  used to carry the sentence *"EXPECTED RED on the Orin until VOLID lands"*, and rmbp 15 was right
+  that such a sentence is a **mask**: while a leg is expected to fail it cannot report anything else
+  failing, and nobody re-reads a comment to find out when the excuse expired. The excuse is now
+  *measured*, by `shell::volume_identity_is_medium_derived` — a probe of the MECHANISM, built in a
+  scratch `MountTable` that no board mounts:
+
+  * **A** — one source mounted twice under **different** names. Name-derived identity says
+    DIFFERENT; medium-derived identity says SAME.
+  * **B** — one source mounted twice under the **same** name. Name-derived identity says SAME;
+    medium-derived identity says SAME when that source carries a volume and DIFFERENT when it does
+    not (an identity that cannot be established equals nothing, not even another such identity).
+
+  `A || !B` is true under medium-derived identity **whether or not `BlockSource::Default` has a
+  volume on this board**, and false under name-derived identity in both cases — which is what makes
+  it a probe of the mechanism rather than of the medium, and why it answers correctly on the Orin,
+  where `Default` has no device at all.
+
+  What the leg then does:
+
+  | probe | claim violated? | emitted |
+  |---|---|---|
+  | either | no | `layout.volid -> PASS` |
+  | medium-derived | yes | `layout.volid -> FAIL` — the excuse has expired; a real defect |
+  | name-derived | yes | `layout.volid.pre -> PASS/FAIL` on the weaker claim, under a **different leg name** |
+
+  The weaker claim is the only shape excusable without VOLID: *one medium reported as two volumes
+  **because the two constructor names differ***. Any other shape reds `layout.volid.pre` too, so
+  nothing is masked. The day VOLID lands beneath this tree the probe flips, `layout.volid.pre`
+  disappears from the transcript, and `layout.volid` must be GREEN — so a
+  `layout.volid -> PASS` line always means the full claim, and never a graded one.
+
+  **The probe is consulted only on the branch that is already failing**, so the green path costs
+  nothing: a name-derived `same_volume` compares two `&str` and touches no block device. That
+  matters for the same measured reason the oracle is lazy (above).
 
 ### 5.2 EL0 has no directory namespace
 
@@ -205,8 +277,14 @@ lets the layout be honest about it rather than pretend. Not this arc's lane.
 
 `shell::layout_witness` runs on the same two call sites as `vfsroute_witness` — aarch64 after
 `emmc2::probe()`, x86 after the storage-ready pass — i.e. the first moment each board has volumes.
-Both legs emit `:: TSTE: layout.<leg> -> PASS ::` / `-> FAIL (got …) ::`, and `arroyo`'s standing
-fault patterns treat `-> FAIL` as a gate failure, so neither leg can go quietly.
+Every leg emits `:: TSTE: layout.<leg> -> PASS ::` / `-> FAIL (got …) ::`, and `arroyo`'s standing
+fault patterns treat `-> FAIL` as a gate failure, so no leg can go quietly.
+
+`shell::layout_mv_witness` (`layout.mv`, §2.3) rides the **aarch64 bare-metal site only**. It is a
+write transcript — create, two renames, four listings, unlinks — and the x86 site is the
+storage-ready pass, whose timing this same arc measured breaking under added block I/O
+(commit `38b56dba`). The code it convicts is arch-neutral (`fs/vfs.rs`), so the Pi bare-metal gate
+convicts it for both arches.
 
 `layout.apps` asserts three things about the LIVE table, and the prefix `/apps` is **spelled out**
 rather than read from `EXEC_ROOT` — reading the constant under test would make the leg say only
@@ -229,9 +307,37 @@ GREEN  :: TSTE: layout.apps -> PASS ::
        MBENCH PASS — 119/119 required witnesses, 0 forbidden hit(s)      exit 0
 ```
 
+`layout.mv` asserts, per direction: the destination lists the new leaf, and the source lists
+**neither** the old leaf (it really moved) **nor** the new one (it did not land in the source's own
+space under the destination's name). The absence half is the load-bearing one — both wrong outcomes
+leave a file that exists somewhere, so a presence-only assertion passes on the bug. It also asserts
+`roots_differ`, without which the leg would be a passing no-op on a build that quietly un-rooted
+`/apps`. The two directions stage their own probes rather than chaining, so neither can hide behind
+the other's failure.
+
+Proved failable on `kernel8-test`, on this arc's final code, by stubbing the translation in
+`MountTable::rename` back to `(bf, relf, relt)` — the pre-fix body, nothing else touched:
+
+```
+RED    :: TSTE: layout.mv -> FAIL (got roots_differ=true ("" vs "/APPS") a_at_dst=false
+              a_src_clean=false b_at_dst=false b_src_clean=false
+              said_a=[moved /boot/LAYMV1.TMP -> /apps/LAYMV2.TMP]
+              said_b=[moved /apps/LAYMV2.TMP -> /boot/LAYMV3.TMP]) ::
+       MBENCH FAIL — 119/119 required witnesses, 1 forbidden hit(s)      exit 1
+
+GREEN  :: TSTE: layout.mv -> PASS ::
+       MBENCH PASS — 119/119 required witnesses, 0 forbidden hit(s)      exit 0
+```
+
+Read the two `said_` fields in the RED verdict: **the verb reported success in both directions while
+all four location assertions were false.** That is the defect's whole character, on the wire beside
+the verdict.
+
 A board with no `/apps` mount, or one whose medium has no `APPS/` directory (a card staged before
 this layout), **skips with a stated line** rather than failing — the honest answer, and the reason
-`./arroyo test` on the default pattern image does not red.
+`./arroyo test` on the default pattern image does not red. `layout.mv` skips the same way when a
+board binds only one of the two prefixes, reports them as different volumes, or vetoes writes (the
+Orin's read-only card).
 
 ---
 
