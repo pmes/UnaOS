@@ -3552,7 +3552,6 @@ pub fn vfsroute_witness() {
             );
             // Legs 2 and 3 assert against the OBSERVED fact, never against the router's own
             // claim — see the oracle note above.
-            let same_as_fat = observed_same;
 
             // --- leg 2: `ls`. The probe appears under `/`, and under `/fat` IFF the two prefixes
             //     are the same volume. A verb that ignored the prefix would show it under both.
@@ -3562,10 +3561,10 @@ pub fn vfsroute_witness() {
             let in_fat = ls_fat.contains(p.name.as_str());
             verdict(
                 "vfsroute.ls",
-                in_root && (in_fat == same_as_fat),
+                in_root && (in_fat == observed_same),
                 &alloc::format!(
                     "probe={} in_root={} in_fat={} observed_same={} root=[{}] fat=[{}]",
-                    p.name, in_root, in_fat, same_as_fat, ls_root, ls_fat),
+                    p.name, in_root, in_fat, observed_same, ls_root, ls_fat),
             );
 
             // --- leg 3: `cat`. The same shape on the read path: the probe reads under `/`, and
@@ -3577,10 +3576,10 @@ pub fn vfsroute_witness() {
             let fat_read = !cat_fat.starts_with("cat: ");
             verdict(
                 "vfsroute.cat",
-                root_read && (fat_read == same_as_fat),
+                root_read && (fat_read == observed_same),
                 &alloc::format!(
                     "root_read={} fat_read={} observed_same={} fat_said=[{}]",
-                    root_read, fat_read, same_as_fat,
+                    root_read, fat_read, observed_same,
                     // Bounded: a FAIL on a binary probe file would otherwise pour the whole 8 KiB
                     // console cap onto the wire, and the serial transport is the evidence channel.
                     &cat_fat[..core::cmp::min(cat_fat.len(), 96)]),

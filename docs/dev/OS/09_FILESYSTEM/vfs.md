@@ -697,6 +697,19 @@ namespace**. The destination gate the old order ran is subsumed, not dropped: on
 passed, the destination is the same medium, and `write_veto` is a pure function of the `BlockSource`,
 which is one of the terms `volume_id` mixes.
 
+**Two bounds on `same_storage`, recorded so neither is rediscovered (rmbp 15, 2026-09-06).**
+
+*The `addr_eq` floor assumes NON-ZERO-SIZED backends.* It is sound for every backend that exists,
+because distinct live non-ZST objects have distinct addresses. A future zero-sized backend breaks it:
+two ZST instances can share an address, and `same_storage` would then answer TRUE for two genuinely
+different volumes. A ZST backend must therefore either carry a real `volume_id()` or not rely on the
+floor.
+
+*Cost.* `volume_id()` calls `fat::mount_source`, so one `same_storage` costs up to two mounts, and a
+mount is about three sector reads (LBA 0, the GPT header, one BPB sector per MBR partition — the
+figure measured for the C15 knob-cost question). Bounded and irrelevant for `mv`, which asks once. It
+would matter if anything ever asked inside a loop; nothing does today.
+
 ### 13.3 x86 has a namespace now
 
 `vfs_mount_table()` was `#[cfg(target_arch = "aarch64")]` from VFS-1 — because the Pi came first, not
