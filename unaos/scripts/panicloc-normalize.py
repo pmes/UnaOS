@@ -246,9 +246,9 @@ class Image:
     def digest(self):
         """The hash this tool gates on.
 
-        A flat image hashes whole.  An ELF hashes its allocated PROGBITS sections
-        in address order, each bound to its name and address so a section cannot
-        silently move.
+        A flat image hashes whole.  An ELF hashes every allocated section that has
+        file content, in address order, each bound to its name and address so a
+        section cannot silently move without the hash saying so.
         """
         h = hashlib.sha256()
         if not self.is_elf:
@@ -270,7 +270,10 @@ def find_records(img):
     recs = []
     seen = set()
     for scan_off, scan_size, scan_addr in img.scannable():
-        start = scan_off + (-scan_off % LOC_ALIGN)
+        # Align on the VADDR, not the file offset: a Location is 8-aligned in the
+        # address space, and the relocation map is keyed by vaddr too.  For every
+        # section seen so far the two agree, but nothing in ELF guarantees it.
+        start = scan_off + (-scan_addr % LOC_ALIGN)
         for off in range(start, scan_off + scan_size - LOC_SIZE + 1, LOC_ALIGN):
             if off in seen:
                 continue
@@ -424,8 +427,12 @@ def cmd_compare(a_path, b_path, base, fields):
         print("   ...ELSEWHERE (real change)     %d" % len(stray))
         for o, x, y in stray[:20]:
             print("        stray file offset %d   %02x -> %02x" % (o, x, y))
+    what = " and ".join(sorted(fields))
     if norm_a == norm_b:
-        print("VERDICT: EQUIVALENT — the images differ only in panic line numbers.")
+        if raw_a == raw_b:
+            print("VERDICT: EQUIVALENT — the images are byte-identical before normalization.")
+        else:
+            print("VERDICT: EQUIVALENT — the images differ ONLY in panic::Location %s." % what)
         return 0
     print("VERDICT: DIFFERENT — a real change survives normalization.")
     return 1
