@@ -845,7 +845,14 @@ fn under_mount_root<'a>(root: &str, abs: &'a str) -> Option<&'a str> {
 ///
 /// The output form is [`VfsBackend::on_volume`]'s (`/`-led components, empty for the root), which
 /// `native_abs` renders as `/` and the FAT adapter ignores entirely.
-fn receiving_dir(rel: &str) -> String {
+///
+/// ACLSYM (orin 19): `pub(crate)` so the witness can assert this mapping as a VALUE. `crate::shell`'s
+/// `vfs.aclsym.dir` leg pins all four shapes — `/APPS/X.ELF` → `/APPS`, `/X.TXT` → `""`, `""` → `""`,
+/// `/A/B/C` → `/A/B` — which is what stops the "the leaf does not exist yet" decision above from
+/// rotting into a silent identity function. It is pure and touches no medium, so that leg has no
+/// skip branch on any board the TSTE battery reaches (the Pi bare-metal gate and the x86 gate —
+/// measured; `./arroyo test-arm` reaches the battery on neither arc's watch).
+pub(crate) fn receiving_dir(rel: &str) -> String {
     let mut comps: Vec<&str> = components(rel).collect();
     comps.pop();
     let mut s = String::new();

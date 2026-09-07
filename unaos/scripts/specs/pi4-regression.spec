@@ -1983,6 +1983,36 @@ REQUIRE :: TSTE: vfsroute\.route -> PASS ::
 # --- written first to assert the MOVE, went red, and was rewritten to assert the REFUSAL; it reds
 # --- on the VOLID-C1 aliasing regression (make volume_id medium-derived and the move is admitted).
 REQUIRE :: TSTE: shell\.relics\.mv\.xvol -> PASS ::
+# --- ACLSYM (orin 19): the rename ACL is asked of BOTH mounts, and the check can FIRE ------------
+# `a62188c9` made `MountTable::rename` ask the SOURCE mount about the object that leaves it and the
+# DESTINATION mount about the receiving DIRECTORY. Its own closing paragraph named what it had not
+# done: *"no test EXERCISES the new refusal ... the gate above proves NO REGRESSION — not that the
+# fix fires."* Every mount the tree binds carries one principal, so deleting the destination call
+# changed nothing anywhere and all 119 witnesses stayed green. `shell::vfs_aclsym_witness` closes
+# that on a SCRATCH mount table with two postures over one volume, and the two rows below are here
+# because the default `-> FAIL` FORBID catches a leg that FAILS but not a leg that STOPS SPEAKING —
+# which is the same silence this pair exists to end.
+#
+#   vfs.aclsym.dir  — `receiving_dir` as a VALUE (`/APPS/X.ELF` -> `/APPS`, `/X.TXT` -> `""`, `""`
+#                     -> `""`, `/A/B/C` -> `/A/B`). Pure, no medium, NO SKIP BRANCH, so it is
+#                     required flatly: on any capture that reaches the TSTE battery it PASSes or it
+#                     FAILs, and absence is a defect.
+#   vfs.aclsym      — the destination mount's posture refusing a principal the SOURCE mount permits,
+#                     with a same-principal CONTROL beside it. It needs a writable FAT volume, so it
+#                     SKIPS (with a stated reason) on a board that has none. THE ROW THEREFORE
+#                     REQUIRES THAT IT SPOKE, not that it passed: `PASS` or a stated skip satisfies
+#                     it, a leg deleted from the battery does not, and a FAIL is convicted by the
+#                     FORBID below and by the built-in `-> FAIL`. Requiring `PASS` outright would
+#                     red an honest no-volume board, which is a spec asserting a fact about the
+#                     MEDIUM in a row about the ACL.
+#
+# Proven failable, not asserted: `a62188c9`'s two `authorize_write` lines removed in the worktree ->
+# `:: TSTE: vfs.aclsym -> FAIL (got ... refused=Err(NoSuchPath) want=Err(Denied) ... ) ::`,
+# `kernel8-test` EXIT=1, `MBENCH FAIL — 119/119 required witnesses, 1 forbidden hit(s)` — 119/119,
+# i.e. the pre-existing battery could not see the hole and this leg is the only thing that convicts.
+REQUIRE :: TSTE: vfs.aclsym.dir -> PASS ::
+REQUIRE :: (?:TSTE: vfs.aclsym -> PASS|aclsym: .*vfs.aclsym skipped) ::
+FORBID :: TSTE: vfs\.aclsym[\w.]* -> FAIL
 
 REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
 #

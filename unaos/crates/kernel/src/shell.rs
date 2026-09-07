@@ -3244,6 +3244,11 @@ fn shell_relics_witness() {
         );
     }
 
+    // ACLSYM (orin 19): the receiving-directory SHAPE leg. Deliberately NOT arch-gated — it is a
+    // string split over four literals and touches no medium, so it has no skip branch on any board
+    // this battery reaches. `vfs.aclsym.dir` is the half of this arc that runs on both gates.
+    vfs_aclsym_shape_witness();
+
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     shell_relics_native_witness();
     #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
@@ -3260,6 +3265,12 @@ fn shell_relics_witness() {
     // pass whose timing this arc already measured breaking under added block I/O.
     #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
     layout_mv_witness();
+    // ACLSYM (orin 19): the two-posture REFUSAL leg — `a62188c9`'s own STILL OWED. aarch64
+    // bare-metal only, for `layout_mv_witness`'s measured reason (the x86 witness site is the
+    // storage-ready pass, whose timing orin 18 measured breaking under added block I/O). The code
+    // under test is arch-neutral, so this gate convicts it for both arches.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    vfs_aclsym_witness();
 }
 
 /// RELICS: THE SUBSUMPTION TRANSCRIPT — the leg R26 clause 2 makes the retirement conditional on.
@@ -4270,6 +4281,231 @@ fn verdict_layout_mv(ok: bool, got: &str) {
     } else {
         serial_println!(":: TSTE: layout.mv -> FAIL (got {}) ::", got);
     }
+}
+
+// ============ ACLSYM (orin 19) — the two-posture witness `a62188c9` said it still owed ============
+//
+// `a62188c9` made `MountTable::rename` ask BOTH mounts — the source about the object that LEAVES it,
+// the destination about the RECEIVING DIRECTORY — and closed with the defect it had not closed:
+//
+//     "STILL OWED, and named so it cannot go quiet: no test EXERCISES the new refusal. Every mount
+//      in the tree is built with the identical principal and world_readable ... so the gate above
+//      proves NO REGRESSION — not that the fix fires."
+//
+// That is a check that cannot fire, and a check that cannot fire is theatre. These two legs are the
+// falsifier. They have DIFFERENT reachability on purpose, and each says which:
+//
+//   * `vfs.aclsym.dir` — the SHAPE, pure, no medium. It has no skip branch at all.
+//   * `vfs.aclsym` — the POSTURE, and it needs a FAT volume, so it SKIPS with a stated reason where
+//     there is none. A skip is never scored as a pass and never as a fail.
+//
+// MEASURED REACH, because "every board" is the kind of claim this arc exists to stop taking on
+// trust. `midden_witness` — the battery both legs hang off — is called from `main.rs` under
+// `all(aarch64, baremetal, witness)` and `all(x86_64, witness)`, so the TSTE family reaches the Pi
+// bare-metal gate and the x86 gate and NOT aarch64/virt: `./arroyo test-arm` prints
+// `witness=on` and zero `:: TSTE:` lines, before this arc as after it. `vfs.aclsym.dir` therefore
+// fires on every board the battery reaches, which is not the same sentence as "every board".
+
+/// ACLSYM (orin 19): one-shot latch for [`vfs_aclsym_shape_witness`] — the x86 service loop reaches
+/// its call site every pass.
+#[cfg(feature = "witness")]
+static VFS_ACLSYM_SHAPE_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// ACLSYM (orin 19): one-shot latch for [`vfs_aclsym_witness`].
+#[cfg(feature = "witness")]
+static VFS_ACLSYM_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// ACLSYM (orin 19): the two legs' verdict line, in the house `:: TSTE: <leg> ->` shape. One helper
+/// rather than a copy per function, because the two legs must be spelled identically or a spec row
+/// written against one would silently not match the other.
+#[cfg(feature = "witness")]
+fn verdict_aclsym(name: &str, ok: bool, got: &str) {
+    if ok {
+        serial_println!(":: TSTE: {} -> PASS ::", name);
+    } else {
+        serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+    }
+}
+
+/// ACLSYM (orin 19): **`vfs.aclsym.dir` — the receiving directory, asserted as a VALUE.**
+///
+/// [`crate::fs::vfs::receiving_dir`] encodes one decision: a rename's destination LEAF DOES NOT
+/// EXIST YET, so the destination mount is asked about the DIRECTORY that will receive it. That
+/// decision cost `exec-orin18-aclsym` a red gate (`MBENCH FAIL 118/119`, `mv: /RELIC3.TXT: -ENOENT`)
+/// before it was found, and a decision that lives only in a comment rots without a conflict. So the
+/// mapping is pinned here, all four shapes:
+///
+/// | `rel`          | receiving directory | what it pins                                  |
+/// |----------------|---------------------|-----------------------------------------------|
+/// | `/APPS/X.ELF`  | `/APPS`             | the leaf is dropped, the parent is kept        |
+/// | `/X.TXT`       | `""`                | a leaf at the mount root yields the MOUNT POINT|
+/// | `""`           | `""`                | total on the empty remainder — no panic on pop |
+/// | `/A/B/C`       | `/A/B`              | only the LAST component goes                   |
+///
+/// **It can fail.** Every case compares against a literal, and the FAIL line prints each input with
+/// what it got beside what was wanted. Make `receiving_dir` the identity and all four red; make it
+/// return `""` unconditionally and two red; drop the `""` case's guard and it panics rather than
+/// passing.
+///
+/// **It has no skip branch**: a `Vec` of `&str` and a `String` push, no block device, no mount. So
+/// wherever the TSTE battery runs at all — the Pi bare-metal gate and the x86 gate; see the module
+/// note above for the measured reach — this leg either PASSes or FAILs. It cannot go quiet.
+#[cfg(feature = "witness")]
+pub fn vfs_aclsym_shape_witness() {
+    use core::sync::atomic::Ordering;
+    if VFS_ACLSYM_SHAPE_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // (mount-relative destination, the directory that must receive its leaf)
+    const CASES: [(&str, &str); 4] = [
+        ("/APPS/X.ELF", "/APPS"),
+        ("/X.TXT", ""),
+        ("", ""),
+        ("/A/B/C", "/A/B"),
+    ];
+    let mut ok = true;
+    let mut got = String::new();
+    for (rel, want) in CASES {
+        let have = crate::fs::vfs::receiving_dir(rel);
+        if have != want {
+            ok = false;
+        }
+        if !got.is_empty() {
+            got.push(' ');
+        }
+        got.push_str(&alloc::format!("{:?}->{:?}(want {:?})", rel, have, want));
+    }
+    verdict_aclsym("vfs.aclsym.dir", ok, &got);
+}
+
+/// ACLSYM (orin 19): **`vfs.aclsym` — the DESTINATION mount's posture refusing a principal the
+/// SOURCE mount permits.** The refusal `a62188c9` added and nothing exercised.
+///
+/// # WHY NOTHING EXERCISED IT, AND WHY THIS TABLE IS LOCAL
+///
+/// Every mount the live table binds is constructed with the identical principal and
+/// `world_readable`. That is the unstated invariant rmbp 15 called load-bearing: while it holds, the
+/// destination's `authorize_write` answers exactly what the source's answered, so deleting the new
+/// call changes NOTHING on the live tree and the whole 119-witness battery stays green. A witness
+/// built on the live table therefore cannot convict, however it is written.
+///
+/// So this builds its OWN [`crate::fs::vfs::MountTable`] that no board mounts — the same scratch
+/// -table technique [`volume_identity_is_medium_derived`] uses — and binds ONE volume
+/// ([`crate::fs::vfs::FatBackend`] over `BlockSource::Default`, three times) under THREE POSTURES:
+///
+/// * `/aclsym-src`  — principal `alice`. The source.
+/// * `/aclsym-deny` — principal `bob`. The destination that must refuse.
+/// * `/aclsym-ok`   — principal `alice`. The CONTROL destination, identical to `-deny` in every
+///   field except the principal, so the two legs differ in exactly ONE variable.
+///
+/// # THE TWO LEGS, AND WHY THE CONTROL IS NOT OPTIONAL
+///
+/// * **refusal** — `rename("/aclsym-src/…", "/aclsym-deny/…", "alice")` must be
+///   [`VfsError::Denied`](crate::fs::vfs::VfsError::Denied). `alice` owns the SOURCE mount, so the
+///   source's `authorize_write` says yes; only the destination mount's posture can say no. Revert
+///   `a62188c9`'s `bt.authorize_write(&receiving_dir(relt), principal)?` and this leg reds — measured,
+///   not asserted (see this arc's PROGRESS note).
+/// * **control** — the SAME call with the destination built for `alice` must be anything BUT
+///   `Denied`. Without it the refusal leg is ambiguous three ways: a `Denied` could equally come from
+///   the SOURCE's posture, from a read-only medium, or from a rename that refuses everything. The
+///   control holds all three fixed and flips only the destination principal. It is deliberately NOT
+///   asserted to be `Ok`: the probe file does not exist, so the FAT backend answers a `NotFound`-class
+///   error from inside `rename` — which is past the ACL and is exactly what the leg needs to see.
+///
+/// **Neither leg needs a file to exist.** `MountTable::rename` runs both `authorize_write` calls
+/// BEFORE `b.rename`, and `FatBackend::authorize_write` ignores its `rel` entirely (it is a volume
+/// posture, not a per-object ACL) — verified in the code, not assumed. The refusal leg never reaches
+/// the backend at all; the control leg does, and finds nothing.
+///
+/// # WHERE IT SKIPS, AND WHY EACH SKIP IS THE HONEST ANSWER
+///
+/// Three conditions would make a leg say `Denied`/not-`Denied` for a reason that is not the posture.
+/// Each returns a STATED skip line rather than a verdict — never a FAIL, and never a silent pass:
+///
+/// 1. **No FAT volume behind the source.** `volume_id` is `None`, [`crate::fs::vfs::same_storage`]
+///    treats `None` as equal to nothing, and `rename` returns `Unsupported` BEFORE any ACL runs. This
+///    is asked through `same_volume`, the public spelling of the same predicate `rename` enforces.
+/// 2. **The medium refuses writes.** `FatBackend::authorize_write` checks `read_only()` FIRST and
+///    answers `Unsupported`, so the principal comparison is never reached and BOTH legs would pass
+///    vacuously (`Unsupported` is not `Denied`) — the exact shape of a check that cannot fire.
+/// 3. **The probe names already exist.** The control leg runs `b.rename` to completion; a real
+///    `ACLSYM1.TMP` on the volume would be MOVED by it. The leg refuses to run rather than mutate a
+///    file it did not stage. (It stages nothing and cleans nothing — it has nothing to clean.)
+///
+/// # WHERE IT RUNS
+///
+/// aarch64 bare-metal only, the same site and the same reason as [`layout_mv_witness`]: the x86
+/// witness site is the storage-ready pass, where added block I/O was MEASURED (orin 18's `38b56dba`)
+/// shifting the window-manager battery into two fixture flakes. The code under test is arch-neutral
+/// (`fs/vfs.rs`), so the Pi bare-metal gate convicts it for both arches. The SHAPE leg above carries
+/// no such cost and runs everywhere.
+#[cfg(feature = "witness")]
+pub fn vfs_aclsym_witness() {
+    use core::sync::atomic::Ordering;
+    use crate::fs::vfs::{FatBackend, MountTable, VfsError};
+    if VFS_ACLSYM_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    const SRC: &str = "/aclsym-src";
+    const DENY: &str = "/aclsym-deny";
+    const OK: &str = "/aclsym-ok";
+    // Neither is `KERNEL_PRINCIPAL` ("kernel"), which `authorize_write` admits unconditionally.
+    const OWNER: &str = "alice";
+    const STRANGER: &str = "bob";
+    // 8.3 short names: FAT create/rename is 8.3-only on this driver.
+    const N1: &str = "ACLSYM1.TMP";
+    const N2: &str = "ACLSYM2.TMP";
+
+    let mut mt = MountTable::new();
+    mt.mount(SRC, alloc::boxed::Box::new(FatBackend::new("fat", OWNER, true)));
+    mt.mount(DENY, alloc::boxed::Box::new(FatBackend::new("fat", STRANGER, false)));
+    mt.mount(OK, alloc::boxed::Box::new(FatBackend::new("fat", OWNER, false)));
+
+    // SKIP 1 — `rename` refuses on `same_storage` BEFORE it reaches either ACL, so without a volume
+    // both legs would read `Unsupported` and the refusal leg would fail for a reason that is not the
+    // posture. Asked in both directions: the control's destination is a third mount.
+    if !mt.same_volume(SRC, DENY).unwrap_or(false) || !mt.same_volume(SRC, OK).unwrap_or(false) {
+        return serial_println!(
+            ":: aclsym: this board binds no FAT volume on BlockSource::Default (volume_id={:?}) \
+             — vfs.aclsym skipped ::",
+            mt.volume_id(SRC).ok().flatten());
+    }
+    // SKIP 2 — a read-only medium answers `Unsupported` from `authorize_write`'s FIRST guard, before
+    // the principal is ever compared. Both legs would then "pass" without exercising a posture.
+    for p in [SRC, DENY, OK] {
+        if let Ok(Some(veto)) = mt.write_veto(p) {
+            return serial_println!(
+                ":: aclsym: {} refuses writes ({}) — vfs.aclsym skipped ::", p, veto);
+        }
+    }
+    let from = vfs_join(SRC, N1);
+    let to_deny = vfs_join(DENY, N2);
+    let to_ok = vfs_join(OK, N2);
+    // SKIP 3 — the control leg runs `b.rename` to completion. If these names were real files on the
+    // medium it would MOVE one. Refuse rather than mutate what this leg did not stage.
+    if mt.stat(&from).is_ok() || mt.stat(&to_deny).is_ok() {
+        return serial_println!(
+            ":: aclsym: {} or {} already exists on this volume — vfs.aclsym skipped ::", N1, N2);
+    }
+
+    // THE REFUSAL: `alice` owns the SOURCE, so the source's posture says yes and only the
+    // DESTINATION mount's can say no. This is the call that returned `Ok`-then-rename before
+    // `a62188c9`, on a tree where no gate could see it.
+    let refused = mt.rename(&from, &to_deny, OWNER);
+    // THE CONTROL: one variable changed — the destination mount's principal. Anything but `Denied`.
+    let control = mt.rename(&from, &to_ok, OWNER);
+    let refusal_ok = refused == Err(VfsError::Denied);
+    let control_ok = control != Err(VfsError::Denied);
+    verdict_aclsym(
+        "vfs.aclsym",
+        refusal_ok && control_ok,
+        &alloc::format!(
+            "src=({},{}) deny=({},{}) ok=({},{}) principal={} refused={:?} want=Err(Denied) \
+             control={:?} want=anything-but-Err(Denied) refusal_ok={} control_ok={}",
+            SRC, OWNER, DENY, STRANGER, OK, OWNER, OWNER, refused, control, refusal_ok, control_ok),
+    );
 }
 
 /// VFSROUTE (orin 17): the NATIVE-volume mutation transcript — `touch`, `ls`, `mkdir`, `rmdir`, `rm`
