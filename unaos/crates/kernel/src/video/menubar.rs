@@ -105,9 +105,13 @@
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
-//! A small faceted gem FLUSH to the panel's LEFT edge — exactly where macOS puts its apple, which is
-//! what the crystal IS (Peter, re-ruling 2026-09-06, orin 17: the crystal is the Mac menu, top-left;
-//! close the gap). `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
+//! A small faceted gem at the panel's TOP-LEFT, one [`strip::PAD`] in from the left edge — exactly
+//! where macOS puts its apple, which is what the crystal IS (Peter, re-ruling 2026-09-06, orin 17:
+//! the crystal is the Mac menu, top-left). **The MARK's inset is not the gap Peter named** — his
+//! render9 sentence (2026-09-07) settles which of the two things moves: *"the drop down part of the
+//! crystal menu is the only fucking thing that ever needed to move ... yet here it is jammed right up
+//! to the edge"*. So the glyph keeps its PAD, exactly as it always had, and only the DROPDOWN goes
+//! flush to `x = 0` ([`super::crystal`]'s `menu_rect`). `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
 //! [`theme::CONTROL_BOX`] so it reads as the same size-family as the window's traffic-light controls.
 //! It is drawn from the kit's OWN blue accent ramp — three facets lit from the top-right, the
 //! high-contrast seam down the crown reading as a facet edge — reusing three lifted roles `theme.rs`
@@ -224,22 +228,33 @@ const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
 
 /// **The crystal's LEFT SLOT**, and the whole of the geometry rule this constant carries.
 ///
-/// Peter, re-ruling 2026-09-06 (orin 17): *the crystal is the Mac menu, top-left; close the gap.*
-/// The mark's home is the panel's upper-LEFT corner, always — it is UnaOS's apple, and an apple menu
-/// that migrates is not an apple menu. Two earlier readings are both wrong and both recorded so the
-/// next reader does not re-derive either: the mark once sat one [`strip::PAD`] in from the left, and
-/// its dropdown hung from that inset at `menu=170x121+12+34` (the gap Peter named on render7); and
-/// `bb513370` then MISREAD "close the gap" as "move to the other edge" and sent the whole group
-/// flush right. **When Peter says there is a gap on the left, the answer is to CLOSE the gap** — not
-/// to spend it, and not to move the thing that has it. So the glyph's outside inset is ZERO: the
-/// crystal starts at bar-relative `x = 0`. The slot is the glyph plus one PAD of clearance on its
-/// INNER (right) side, which is what separates the mark from the caption beside it.
-const CRYSTAL_SLOT: usize = CRYSTAL_W + strip::PAD;
+/// Peter, re-ruling 2026-09-06 (orin 17): *the crystal is the Mac menu, top-left.* The mark's home is
+/// the panel's upper-LEFT corner, always — it is UnaOS's apple, and an apple menu that migrates is
+/// not an apple menu.
+///
+/// **Which of the two things carries the inset is settled, and it is the GLYPH** (Peter, render9,
+/// 2026-09-07): *"the drop down part of the crystal menu is the only fucking thing that ever needed
+/// to move. how i never once said to move the fucking crystal yet here it is jammed right up to the
+/// edge."* Three readings are on the record and only the last is the rule; the first two are kept so
+/// the next reader does not re-derive either:
+///
+/// 1. render7's layout — glyph at one [`strip::PAD`], dropdown INHERITING that inset at
+///    `menu=170x121+12+34`. The 12 px Peter named was the dropdown's, not the glyph's.
+/// 2. `bb513370` MISREAD "close the gap" as "move to the other edge" and sent the whole group flush
+///    right (rejected on render8, re-ruled R25).
+/// 3. `1046f81c` then closed the gap by moving BOTH to `x = 0` — which took the glyph off its inset
+///    as collateral. Rejected on render9: the glyph was never the thing with the gap.
+///
+/// So the glyph keeps its ONE outside PAD (state 1's mark, unchanged since it was first drawn) and
+/// the DROPDOWN alone goes flush — it is decoupled from the glyph in [`super::crystal`]'s
+/// `menu_rect` rather than derived from it, which is what makes the two positions independently
+/// settable at all. This slot is therefore the glyph's outside PAD, the glyph, and one PAD of
+/// clearance on its INNER (right) side separating the mark from the caption beside it.
+const CRYSTAL_SLOT: usize = strip::PAD + CRYSTAL_W + strip::PAD;
 
-/// The title's left inset: past the crystal's whole slot, which is [`CRYSTAL_SLOT`] — the glyph flush
-/// at `x = 0` plus its one PAD of inner clearance. macOS puts the apple leftmost and the app menus to
-/// its right; the caption takes that same slot here. (Before the 2026-09-06 re-ruling this was
-/// `PAD + CRYSTAL_W + PAD` — the extra term was the outside inset the ruling deletes.)
+/// The title's left inset: past the crystal's whole slot, which is [`CRYSTAL_SLOT`] — the glyph's
+/// outside PAD, the glyph, and its one PAD of inner clearance. macOS puts the apple leftmost and the
+/// app menus to its right; the caption takes that same slot here.
 const TITLE_X0: usize = CRYSTAL_SLOT;
 
 /// WINMENU (R21) — **the caption's SLOT, which is fixed-width, and where the window's menus begin.**
@@ -267,9 +282,10 @@ const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
 ///
 /// The `+ CRYSTAL_SLOT` term is the brand mark's own left slot: the crystal pushes the title inset
 /// right, so the floor that guarantees "crystal, one title glyph, and the clock all fit" grows by the
-/// slot. The crystal's OUTSIDE inset is zero (the 2026-09-06 re-ruling), so the two PADs left are the
-/// title-to-clock gap and the clock's own right inset. Still far below every suite panel, so no gate
-/// declines — [`FLOOR_W`] is asserted `<= 640` below, which is the claim that matters.
+/// slot. The slot already carries the glyph's outside PAD (render9's ruling), so the two PADs written
+/// separately here are the title-to-clock gap and the clock's own right inset. Still far below every
+/// suite panel, so no gate declines — [`FLOOR_W`] is asserted `<= 640` below, which is the claim that
+/// matters.
 const FLOOR_W: usize = 2 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W;
 
 const _: () = {
@@ -292,19 +308,19 @@ const _: () = {
     assert!(CRYSTAL_CROWN_H < CRYSTAL_H);
     assert!(CRYSTAL_W >= 4);
     // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
-    // owns `[0, CRYSTAL_W)` — flush left, no outside inset — and the clock
+    // owns `[PAD, PAD + CRYSTAL_W)` — one PAD in from the left, render9's ruling — and the clock
     // `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL_W, FLOOR_W - PAD)`; this is the gap between them staying
     // positive, so a future metric change that would overlap them fails the BUILD rather than painting
     // the gem over the time.
-    assert!(CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    assert!(strip::PAD + CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
     // The title, shifted past the crystal's slot, must still leave room for at least one glyph before
     // the clock on the floor panel.
     assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
     // FITTS-CORNER: the press cell (`crystal_corner_abs`, CRYSTAL_SLOT wide by the bar's height, at the
     // bar's LEFT end) must CONTAIN the painted glyph box, or a press on the visible mark could miss its
     // own menu. The horizontal half is the load-bearing one; vertical containment is the bevel assert.
-    // The glyph starts at 0 and the cell starts at 0, so this is the widths.
-    assert!(CRYSTAL_W <= CRYSTAL_SLOT);
+    // The cell starts at 0 and the glyph at PAD, so the glyph's RIGHT edge is what must fit.
+    assert!(strip::PAD + CRYSTAL_W <= CRYSTAL_SLOT);
 };
 
 // ---------------------------------------------------------------------------
@@ -974,17 +990,20 @@ pub fn compose() -> bool {
     true
 }
 
-/// The crystal's box-relative top-left in the bar: **`x = 0`, FLUSH to the bar's left edge** — no
-/// outside inset, because the bar is `frame_flush(Top)` and so the bar's left edge IS the panel's;
-/// centred vertically. THE ONE offset both the painter and [`crystal_box`] read, so the mark the
-/// fixture witnesses is the mark the painter drew.
+/// The crystal's box-relative top-left in the bar: **one [`strip::PAD`] from the left**, centred
+/// vertically. THE ONE offset both the painter and [`crystal_box`] read, so the mark the fixture
+/// witnesses is the mark the painter drew.
 ///
-/// The zero is the 2026-09-06 re-ruling in one term: *close the gap*. It is not a defaulted constant
-/// — [`CRYSTAL_SLOT`] spends its one PAD on the INNER side, where it separates the mark from the
-/// caption, and spends nothing on the outer side, where it would only push the mark off the corner.
+/// ⛔ **This PAD is not the gap, and it is not spendable.** `1046f81c` set this term to `0` while
+/// closing the DROPDOWN's inset, which moved the mark onto the panel edge as collateral; Peter
+/// rejected that on render9 (*"how i never once said to move the fucking crystal yet here it is
+/// jammed right up to the edge"*). The mark's position is the one thing in this file that has never
+/// been asked to change: it is the Mac apple's position, top-left and INSET. The dropdown's `x` is a
+/// separate number, computed in [`super::crystal`]'s `menu_rect` and no longer derived from this one
+/// — see [`CRYSTAL_SLOT`] for the three-state history.
 #[inline]
 fn crystal_offset(h: usize) -> (usize, usize) {
-    (0, (h - CRYSTAL_H) / 2)
+    (strip::PAD, (h - CRYSTAL_H) / 2)
 }
 
 /// The crystal's rect on the PANEL, for the witness — `(x, y, w, h)`, absolute. A function of the bar
@@ -1008,16 +1027,17 @@ pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 ///
 /// Peter, at the Orin bench (2026-08-25): *"the crystal menu took too much exact aim to open — the
 /// ENTIRE upper left corner where it lives should open the menu, not clicking directly on the
-/// crystal."* The glyph box is 16x22 inside a 34-row bar — a Fitts target that
+/// crystal."* The glyph box is 16x22 with a [`strip::PAD`] inset on every side — a Fitts target that
 /// demands aim at exactly the place aim should be free: a screen corner is the one target a flick
 /// reaches with none, because the edges stop the pointer. So the PRESS target and the PAINT box part
-/// ways here: [`crystal_box_abs`] stays the painter's and the dropdown-anchor's truth, and this cell
-/// is what the click router hits against.
+/// ways here: [`crystal_box_abs`] stays the painter's truth, and this cell is what the click router
+/// hits against. **This is also why the glyph's own PAD costs nothing in reach** — the corner pixel
+/// opens the menu whether or not the mark is drawn on it.
 ///
 /// Derived, not hardcoded: anchored at the bar rect's own origin — the true panel corner, since the
 /// bar is `frame_flush(Top)`, so `(0,0)` is inside it by construction — and spanning the crystal's
-/// whole left slot, [`CRYSTAL_SLOT`] wide (`CRYSTAL_W + PAD`: the glyph flush at `x = 0` plus its one
-/// inner margin, i.e. everything left of the title's inset) by the bar's full height. `bb513370`
+/// whole left slot, [`CRYSTAL_SLOT`] wide (`PAD + CRYSTAL_W + PAD`: the glyph with both of its
+/// margins, i.e. everything left of the title's inset) by the bar's full height. `bb513370`
 /// mirrored this cell to the upper-RIGHT; the 2026-09-06 re-ruling puts it back, because the crystal
 /// is the Mac menu and the Mac menu is top-left. Every pixel of the cell is a pixel the
 /// BAR paints and composites above the windows, so widening the press target to it steals nothing: a
@@ -1127,7 +1147,7 @@ fn crystal_facet(u: usize, v: usize) -> Option<u32> {
 
 /// Compose panel row `j` of the bar into `out[0..w]` as logical `0x00RRGGBB` colours.
 ///
-/// A field pass (face, bevel, keyline), then the brand CRYSTAL overlaid at the left edge, then the two
+/// A field pass (face, bevel, keyline), then the brand CRYSTAL overlaid at its left inset, then the two
 /// texts overlaid by index — the dock's shape, and for its reason: an overlay keeps the inner loop a
 /// handful of integer compares instead of a scan over every caption at every pixel. The bar is FLUSH,
 /// so there is no corner arithmetic at all.
@@ -1149,8 +1169,9 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         out[i] = fill;
     }
 
-    // The brand CRYSTAL, overlaid FLUSH at the LEFT edge. Drawn BEFORE the text early-return because
-    // the gem spans more rows than the glyph cell does — it is centred in the whole bar, not the band.
+    // The brand CRYSTAL, overlaid at its one-PAD left inset ([`crystal_offset`]). Drawn BEFORE the
+    // text early-return because the gem spans more rows than the glyph cell does — it is centred in
+    // the whole bar, not the band.
     let (cx0, cy0) = crystal_offset(h);
     if j >= cy0 && j < cy0 + CRYSTAL_H {
         let v = j - cy0;
@@ -1329,8 +1350,11 @@ pub fn selftest() {
     let dismissed = SLOT.packed() == 0;
 
     // Leg 7 — the crystal is drawn, and inside the bar. `r` is the enabled rect (from leg 3); the
-    // crystal box must be the compiled size, sit wholly within it, and be FLUSH to its LEFT edge — the
-    // 2026-09-06 re-ruling's falsifier at the paint end: zero gap, zero inset, the Mac menu's corner.
+    // crystal box must be the compiled size, sit wholly within it, and sit at EXACTLY one
+    // [`strip::PAD`] from its left edge — render9's falsifier at the paint end. The equality is the
+    // load-bearing half in BOTH directions: a larger x is the pre-`bb513370` drift creeping back, and
+    // `cbx == brx` is `1046f81c`'s regression, the mark jammed onto the panel edge. The DROPDOWN's own
+    // x is not tested here — it is a separate number now, witnessed by `crystal.rs`.
     let (cbx, cby, cbw, cbh) = r.map(crystal_box).unwrap_or((0, 0, 0, 0));
     let crystal_ok = match r {
         Some((brx, bry, brw, brh)) => {
@@ -1340,7 +1364,7 @@ pub fn selftest() {
                 && cbx + cbw <= brx + brw
                 && cby >= bry
                 && cby + cbh <= bry + brh
-                && cbx == brx // flush to the bar's LEFT edge: no gap, no inset
+                && cbx == brx + strip::PAD // one PAD in from the bar's LEFT edge, never flush
                 && cbx + cbw <= brx + TITLE_X0 // and left of where the title begins
         }
         None => false,
