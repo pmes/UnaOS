@@ -95,6 +95,17 @@ three seats, one evening, and **not one of the stale statements was found by re-
 lived in**. The three guards-that-cannot-fire (name-based `same_volume`, the USB-scoped prtscr probe,
 quarry's card-blind stamp) were each found by someone looking for something else.
 
+## The argument for J1, which this round produced by accident
+
+For a week the landing has been an owed item with no price attached. On 2026-09-07 it acquired one:
+orin's `cargo test -p foreman` reds on `x86-fat.spec:238`'s look-around, **and the fix has existed
+on this branch since 2026-08-27** — `cc283929`, prefix-factored, unit-tested 8/8 against the original
+`(?!u1b-)` semantics. `git merge-base --is-ancestor cc283929` says origin/hw-jetson, origin/main and
+origin/hw-pi4 all lack it. **J1 is no longer an abstract obligation; it is a peer's red build.** orin
+19 then declined the offered one-line grant for a good reason — taking a tested fix from an unlanded
+branch would collide with that same fix at the landing — which is the second cost the arc charges:
+not just the missing fix, but the fact that the sane workaround is also blocked by it.
+
 ## Open at time of writing
 C1 is with orin 18 (either the armed `UNAOS_SDMMCROOT=1` run, or the identity fix, and I review the
 fix same-turn). SHELLRELICS closes when its leg's diff arrives. Everything else in the queue waits
