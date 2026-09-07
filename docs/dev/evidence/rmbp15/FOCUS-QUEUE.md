@@ -155,6 +155,18 @@ grep, and `panic::Location` means line-neutral or tail-append only (memory
 
 ---
 
+## Two briefing rules the orin seats paid for, adopt them on the pivot
+
+**`git rev-parse HEAD` as every executor's mandatory first command.** orin 20 had FOUR of fifteen
+executors handed the wrong base — each branched explicitly, as briefed, from a stale worktree — and
+the check paid for itself three times over (one bad gate, one stale citation, two clean catches).
+The harness cuts worktrees the same way here.
+
+**A cited SYMBOL is a claim, not metadata.** `layout_volid` was carried by three seats on the same
+afternoon all three adopted "file plus symbol, never a bare line number" — the symbol does not exist,
+and what saved the work was identifying prose, not the citation. A bare line number announces its own
+fragility; a plausible symbol name does the opposite. One grep verifies it.
+
 ## Nine-executor shape, if the pivot comes with the fleet
 
 1 metal (Q1, the seat itself at the glass) · 1 `xhci/mod.rs` 12/77 reconcile (Q3) · 2 landing panel
