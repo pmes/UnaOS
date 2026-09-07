@@ -73,6 +73,36 @@ belongs here, on the day it is made.
 - **Default-quiet boot** (2026-07-18). Confirmed test families are not
   re-run on default boots; batteries live behind knobs (QEMU gates arm
   them). Gate, never delete.
+- **A spec must be look-around free — `foreman` refuses the dialect and its
+  preflight is all-or-nothing** (pi 8, source text `pi4-regression.spec:626-629`
+  at `hw-pi4 059e04db`). Rust's `regex` rejects `(?=…) (?!…) (?<=…) (?<!…)` and
+  backreferences, so one such pattern in a spec makes `preflight_spec`
+  (`tools/foreman/src/main.rs:114`, ahead of `parse_spec` at `:115`) abort the
+  whole run with a named-line report and print no verdict table. Use the
+  documented prefix-factored form instead. **The rule is recorded HERE because
+  of how it was broken:** it existed only as a comment at the head of ONE arch's
+  spec, riding an unlanded arc, so it was unreachable from trunk and from the
+  other tracks — and the seat that violated it could not have read it. A rule
+  enforced by a comment in a file only one seat can see is not a rule. Census
+  2026-09-07: one non-comment look-around across eleven specs.
+- **A zero-hit grep bounds only the tree you ran it in** (pi 8, 2026-09-07).
+  Two seats greped the same path for the same sentence and got 1 and 0 — both
+  correct, because the text rode 36 unlanded commits. Absence proven in your
+  worktree is absence *there*; before calling a citation wrong, establish which
+  tree it was written against.
+- **"Sourced from code" is not "verified end-to-end" — reading a function is a
+  citation too** (pi 8's formulation, orin 19's error, rmbp 15's catch;
+  2026-09-07). A seat could not resolve a citation, went to the source, read
+  `parse_spec_bytes` and correctly found that one bad pattern aborts before the
+  builtin forbids are installed — then reported the consequence as silent
+  vacuum. It is not: the caller preflights first and refuses loudly. The
+  function was read; the PATH FROM ENTRY POINT TO BEHAVIOUR was not. Going to
+  the source is right and does not by itself settle severity: ask "could this
+  path have been reached", not only "is this sourced". One
+  `grep -n 'parse_spec' main.rs` would have answered it and nobody ran it.
+  ⚠ Record this one as the COUNTER-EXAMPLE it is — an instrument built not to
+  fail silently (`457ed7c5` SPECFLIGHT), which worked. A ledger that collects
+  only failures teaches a fleet the wrong thing about its own instruments.
 - **A wrapper that swallows the exit status is a gate that cannot fire**
   (2026-09-07, pi 8's near-miss, caught by them before it went out). A pipe
   reports the LAST stage's status: `cmd --check ... | head` yields `head`'s
