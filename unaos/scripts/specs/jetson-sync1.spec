@@ -217,6 +217,55 @@
 # `DEPTH-UNAVAILABLE` and `RAST-PAINTED-OVERWRITTEN` reds on each of those three rows
 # individually. The three go-red proofs are the reason those rows are not decoration.
 
+# 2026-09-07 (exec-orin20-specarm): ORIN-SPECARM — THE NINE TICK/PREEMPT ROWS BECOME
+# FAILABLE. ORIN-TICKDEFAULT (98213b7f) made `bsptick`+`bsprun` the tegra DEFAULT and then
+# said, in its own commit message, that this file could not yet fail on it. It could not:
+# `orin-specscore.py`'s `failable = d.kind in ("REQUIRE","COUNT","FORBID")` means a
+# PENDING/OPTIONAL row moves NOTHING, and all nine tick/preempt rows were PENDING or
+# OPTIONAL. THE NUMBER THAT CONVICTS: a REAL pre-flip TICKLESS Orin flight
+# (`capture/line-acm0/orin.log:41451-46241` — zero `orinbsptick`, zero `orinbsprun`, and
+# the cooperative terminus banner present) scored `PASS — 17/17 required witnesses, 0
+# forbidden hit(s)`, exit 0, against this file at 98213b7f. The flight could not fail on
+# the thing the flight is for.
+#   C1 arming banner          PENDING  -> REQUIRE
+#   C2 tick N delivered       PENDING  -> COUNT 2   (a lone `tick 1` is the IRQEL-RT
+#                                                    one-shot's signature — see the row)
+#   C3 [orinbsprun] terminus  PENDING  -> REQUIRE
+#   C4 cooperative terminus   OPTIONAL -> FORBID
+#   C5 dispatch + preempt     PENDING  -> REQUIRE
+#   C6 dispatch on_tick ONLY  OPTIONAL -> FORBID
+#   C7 [spread4] live         PENDING  -> REQUIRE   (its "PERMANENTLY NO-PROMOTE" note is
+#                                                    struck at the row; the premise died)
+#   C8 [el0live] verdict=     OPTIONAL -> REQUIRE
+#   C9 [prio] svc=            OPTIONAL -> REQUIRE
+# ⚠ THE SCORED FLOOR MOVES 17/17 -> 24/24 (REQUIRE 17 -> 23, COUNT 0 -> 1). Spec-declared
+#   failable rules 33 -> 42 (45 with mbench's three DEFAULT FORBIDs, which this file does
+#   not declare and must not be credited with); PENDING 23 -> 18, OPTIONAL 74 -> 70;
+#   spec-declared FORBIDs 16 -> 18; the spec-declared directive TOTAL is unchanged at 131
+#   — not one row was added or removed, nine changed kind. A reader who sees 24/24 where
+#   17/17 stood is looking at a bigger denominator, NOT a regression.
+# ⚠ HOUSEKEEPING, and it is a lesson about tallies rather than a footnote. The 2026-08-28
+#   entry above records "spec-declared FORBIDs 10 -> 15". Measured at 98213b7f the file
+#   carried 16 spec-declared FORBIDs — and a NAIVE count through `mbench.parse_spec` says
+#   19, because that list also carries mbench's three built-in default FORBIDs. Two
+#   different wrong numbers were available for the same question, one too low (a tally that
+#   went stale under later folds) and one too high (a parse that credited this file with
+#   rules it does not contain). Every number in THIS entry is `parse_spec` FILTERED ON
+#   `not d.builtin`, and `orin-specscore.py`'s new FAILABILITY line makes the same split on
+#   every run so the next reader does not have to know this.
+# ⚠ GREEN-REFERENCE CHANGE, and it rides in the same commit by necessity — a promoted
+#   REQUIRE whose green reference lacks the witness is a spec that reds its own proof.
+#   `jetson-sync1-green.capture` gains seven lines and LOSES `CAPSTONE COMPLETE`: on an
+#   armed image `run_bsp_tegra` replaces `run_capstone_boot_core`, which is the only thing
+#   that spawns `capstone_body`, so a capture carrying both the ORIN-BSPRUN banner and
+#   `CAPSTONE COMPLETE` is a boot no image can produce. All eight are VERBATIM wire text
+#   from an armed metal flight (`orin.log:132872-133705`), per that file's provenance rule.
+# Every direction proven before commit, per rule, with the command in
+#   `~/unaos-bench/scratch/orin20/specarm/PROGRESS.md`: each promoted row scored against a
+#   REAL tickless flight and a REAL tick-only flight (`orin.log:20381-23309` — `bsptick`
+#   armed, `bsprun` not; the capture C1/C2 alone cannot tell from an armed boot) and shown
+#   RED, then against the green capture and shown GREEN.
+
 # --- boot bring-up witnesses (the JD/JB chain — all previously metal-proven) --------
 REQUIRE JD1.*scanout:.*sane=true
 REQUIRE JD1.*panel LIVE
@@ -266,6 +315,15 @@ REQUIRE JD4.*console OWNS the panel
 # between them that can legitimately decline, so a boot that prints the banner and not the
 # other two has faulted in between — a genuine regression that SHOULD red. No new way for a
 # healthy boot to red, in either polarity.
+#
+# ⚠ 2026-09-07 (exec-orin20-specarm): THIS ALTERNATION IS NOW REDUNDANT, NOT A HOLE, AND IS
+# DELIBERATELY LEFT WIDE. Read it with C3/C4 (ORIN-BSPRUN half 1) before concluding that the
+# `CAPSTONE COMPLETE` arm lets a tickless boot through: C3 REQUIREs the `[orinbsprun]` banner
+# outright and C4 FORBIDs the cooperative terminus's own line, so a boot that satisfies this
+# row through the `CAPSTONE COMPLETE` arm now reds twice below. Narrowing this row to the
+# `[orinbsprun]` arm would be a SECOND, unrelated rule change (it is the file's "did the boot
+# reach a terminus at all" anchor, and both arms are honest answers to that question), so
+# ORIN-SPECARM left it alone and closed the hole where the hole actually was.
 REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] boot core [0-9]+ joins run\(\))
 
 # --- NEW this boot: witnesses shipped ahead of their bench (promote on capture) -----
@@ -1092,14 +1150,47 @@ OPTIONAL \[orinselfup\] UPDATE REFUSED
 # prints the arming banner BEFORE the unmask; the per-tick witness prints tick 1 (the
 # arm-delivered proof) and then every TICK_HZ-th tick (~1/s) FOREVER — unlike SCHED:
 # load's poll, this emitter lives in IRQ context off the timer itself, so the lines do
-# NOT stop when the drive loop dispatches the pump. PENDING both (the wdt-pair shape).
+# NOT stop when the drive loop dispatches the pump.
 # THE COUNT ADVANCING IS THE MEASUREMENT — periodic, not one-shot — and the EL is
 # re-measured per emission (an EL2 reading would mean HCR_EL2.IMO regressed, printed
 # rather than hidden; the pattern deliberately matches ANY EL digit so a regressed line
 # still lands in the table where a reader sees the digit). The banner's em dash sits
 # after `(… Hz, PPI…)`; both patterns stop well before their line's first non-ASCII.
-PENDING \[orinbsptick\] arming PERIODIC CNTP at EL[0-9]+ on cpu [0-9]+
-PENDING \[orinbsptick\] tick [0-9]+ taken at EL[0-9]+ on cpu [0-9]+
+#
+# ⚠ 2026-09-07 (exec-orin20-specarm), ORIN-SPECARM: PROMOTED PENDING -> REQUIRE + COUNT 2.
+# `PENDING both (the wdt-pair shape)` STOOD HERE AND IS STRUCK. It rested on `bsptick`
+# being an opt-IN knob, so that a REQUIRE would have red every stock boot on
+# CONFIGURATION. ORIN-TICKDEFAULT (98213b7f) inverted that: a stock `./arroyo esp-jetson`
+# now compiles `bsptick`+`bsprun`, and the disarmed image is the OPT-OUT
+# (`UNAOS_NOBSPTICK=1`). While these two rows stayed PENDING the file could not fail on
+# the thing it exists to measure — measured, not argued: a REAL pre-flip TICKLESS Orin
+# flight (`capture/line-acm0/orin.log:41451-46241`, zero `orinbsptick`, zero
+# `orinbsprun`) scored `PASS — 17/17 required witnesses, 0 forbidden hit(s)` against this
+# file at 98213b7f. A silently tickless default boot scored GREEN.
+# ⚠ AND THE TICK ROW IS A `COUNT 2`, NOT A `REQUIRE`, DELIBERATELY. `bsptick_witness`
+# (timer.rs) emits at `n == 1` and then every `TICK_HZ`-th tick, so `tick 1` ALONE is
+# indistinguishable from the IRQEL-RT one-shot's signature — i.e. from the OLD behaviour
+# this arc exists to convict. A `REQUIRE` on the bare pattern would certify the bug. The
+# second emission is `tick 250`; `BSPTICK_COUNT` is monotonic and boot-core-scoped
+# (`BSPTICK_CORE` guard), so two matched lines ARE two distinct N.
+REQUIRE \[orinbsptick\] arming PERIODIC CNTP at EL[0-9]+ on cpu [0-9]+
+#   GUARDS (C1) that the periodic CNTP was ARMED AT ALL at EL1 on the boot core — the
+#   `el1_bsptick_start` (timer.rs, `#[cfg(all(tegra, bsptick))]`) banner, printed BEFORE
+#   the `daifclr` unmask. It is the only line that says the clock exists; without it the
+#   image is the pre-flip one and every row below it is meaningless.
+#   REDS WHEN: `bsptick` is not in the feature list (a hand-rolled list, `UNAOS_NOBSPTICK=1`,
+#   or arroyo's default-on line regressing), or `el1_bsptick_start` stops being called from
+#   the terminus line. MEASURED RED: the tickless flight cited above, 0 hits.
+COUNT 2 \[orinbsptick\] tick [0-9]+ taken at EL[0-9]+ on cpu [0-9]+
+#   GUARDS (C2) that the tick was DELIVERED AND IS ADVANCING — armed-and-ticking, not
+#   armed-but-idle. Two emissions can only come from `BSPTICK_COUNT` reaching 1 and then
+#   `TICK_HZ`, i.e. ~1 s of standing periodic IRQs at EL1 on the arming core.
+#   REDS WHEN: CNTP is armed and never fires (a `TVAL`/`INTERVAL` of zero re-fire storm
+#   that wedges before the second window, a GICR PPI enable that did not persist, an
+#   `on_tick` that stops re-arming), or the tick lands on a core that is not
+#   `BSPTICK_CORE`. MEASURED RED: the tickless flight above, 0 hits; and a ONE-SHOT-shaped
+#   capture (`tick 1` alone) scores 1 hit against `COUNT 2` and reds — which is the whole
+#   reason this row is not a `REQUIRE`.
 
 # --- NET-4G: the latch-SITE discriminator (rides `net4`, self-gating) ----------------
 # THE TAG IS CASE-SENSITIVE AND THAT IS LOAD-BEARING, measured: lowercase `[net4g]` is
@@ -1263,19 +1354,58 @@ OPTIONAL \[net4G\] interim pop slot=[0-9]+
 #                                  half-2 note explains). Re-slice and re-run.
 # The pattern stops at `run()` — the wire text continues `— SCHED_ACTIVE=true, …` past an
 # em dash — and `run\(\)` is contiguous ASCII with the 12-byte family tag in front of it.
-# ZERO hits across the whole bench capture tree (313 files, 2,383,287 lines) and zero on
-# the boot7h slice; the cooperative tell takes 6 hits on `capture/line-acm0/orin.log` (one
-# per Orin flight on that wire) and 1 on the boot7h slice, which is exactly what it should.
-# ⚠ AND IT CANNOT PROMOTE FROM THE 2026-09-01 STAGED PAIR. `run_bsp_tegra` is
-# `#[cfg(all(feature = "tegra", feature = "bsprun"))]` (sched.rs:10447) and NEITHER staged
-# image carries `bsprun`; the token `orinbsprun` takes ZERO hits in both `kernel.elf`s
-# (measured 2026-08-31, orin 11). So a ⏳ here on boot A or boot B is CONFIGURATION, never
-# evidence, and the paired reading above must not be entered at all for those two flights.
-# The `REQUIRE` at the head of this file that names this token is unaffected — it is an
-# alternation whose OTHER arm, `CAPSTONE COMPLETE`, is present in both images and is what
-# will satisfy it.
-PENDING \[orinbsprun\] boot core [0-9]+ joins run\(\)
-OPTIONAL running the full M4 CAPSTONE cooperatively
+# ⚠ THE COUNTS THAT STOOD HERE ARE RE-DERIVED, NOT RELAYED (exec-orin20-specarm,
+# 2026-09-07). They read *"ZERO hits across the whole bench capture tree (313 files,
+# 2,383,287 lines) … the cooperative tell takes 6 hits on `capture/line-acm0/orin.log`"*.
+# Both moved under them, and nothing re-derived them until this arc: the ORIN-BSPRUN banner
+# now takes 4 hits on `orin.log` (the four armed metal flights) and appears in 2 files
+# tree-wide (`orin.log` and the merged `raw.log` it is split from); the cooperative tell
+# takes 25 on `orin.log`. The RATIO is what the pair is for and it is unchanged in meaning:
+# every armed flight prints the banner and no cooperative tell, every unarmed flight the
+# reverse — measured per-flight, never on the merged wire.
+# ⚠ 2026-09-07 (exec-orin20-specarm), ORIN-SPECARM: PROMOTED PENDING -> REQUIRE, and the
+# cooperative tell beside it OPTIONAL -> FORBID. THE PARAGRAPH THAT STOOD HERE IS STRUCK:
+# *"AND IT CANNOT PROMOTE FROM THE 2026-09-01 STAGED PAIR … a ⏳ here on boot A or boot B
+# is CONFIGURATION, never evidence"*. It was true of two images built before
+# ORIN-TICKDEFAULT (98213b7f), which made `bsprun` a DEFAULT for tegra; the staged pair it
+# names is not the image this file now scores, and re-deriving a baseline against the
+# opt-out (`UNAOS_NOBSPTICK=1`) is what that section of arch_arm64.md now says to do.
+# THE PAIR IS NOW FAILABLE IN BOTH DIRECTIONS, which is what makes the binary above a
+# GATE and not a reading: the armed terminus must be present AND the cooperative one must
+# be absent. `main.rs`'s terminus line selects between them with
+# `#[cfg(not(feature = "bsprun"))]` / `#[cfg(feature = "bsprun")]` on the same statement,
+# so on any ONE image exactly one of these two rows can be satisfied — the FORBID cannot
+# red a boot the REQUIRE greens.
+# ⚠ THE HEAD-OF-FILE `REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] …)` ALTERNATION IS NOW
+# REDUNDANT, NOT A HOLE. It can still be satisfied by the `CAPSTONE COMPLETE` arm, but a
+# boot that takes that arm reds HERE (missing REQUIRE + a FORBID hit on the cooperative
+# tell), so a tickless boot can no longer reach a green verdict through it. It is left
+# widened on purpose: narrowing it would be a second, unrelated rule change, and the
+# alternation is still the honest statement of "this file has reached the terminus".
+REQUIRE \[orinbsprun\] boot core [0-9]+ joins run\(\)
+#   GUARDS (C3) that the boot took the PREEMPTIVE terminus — `run_bsp_tegra`
+#   (sched.rs, `#[cfg(all(tegra, bsprun))]`) printing before it stores `SCHED_ACTIVE`.
+#   This is the one row that separates "the tick is armed" from "the scheduler is
+#   preemptive": without `SCHED_ACTIVE` every tick reaches `timer_preempt`'s first line
+#   and returns, and nothing in the ORIN-BSPTICK block above can see that.
+#   REDS WHEN: `bsprun` is absent from the feature list (`UNAOS_NOBSPRUN=1`, a hand-rolled
+#   list, or arroyo's default-on line regressing), or `tegra_early_stop`'s terminus line
+#   stops calling `run_bsp_tegra`. MEASURED RED: the tickless flight
+#   (`orin.log:41451-46241`) 0 hits, AND the TICK-ONLY flight (`orin.log:20381-23309` —
+#   `bsptick` armed, `bsprun` not) 0 hits. The tick-only leg is the load-bearing one: it
+#   is the capture C1/C2 alone CANNOT tell from a fully armed boot.
+FORBID running the full M4 CAPSTONE cooperatively
+#   GUARDS (C4) the same binary from the other side: this is `run_capstone_boot_core`'s
+#   OWN banner (sched.rs), so its presence on a wire this file is scoring means the boot
+#   reached the COOPERATIVE terminus — the flip did not reach the image. Kept as a
+#   separate FORBID rather than folded into C3 because C3 catches the armed terminus
+#   DISAPPEARING while this catches the boot taking the WRONG ARM; on a capture that
+#   stopped before the terminus C3 reds alone and this stays quiet, which is the correct
+#   pair of readings and the reason the two are not one rule.
+#   REDS WHEN: an image without `bsprun` is flown against this file (that is the intended
+#   red — score the opt-out with `--accept-dead`/a different spec, not by softening this).
+#   MEASURED RED: the tickless flight 1 hit, the tick-only flight 1 hit; 0 hits on all
+#   four armed metal flights on `orin.log`.
 # THE SECOND, INDEPENDENT REGIME TELL — and it is worth having BOTH because it is emitted
 # from a different file by a different arc. ORIN-BSPTICK's arming banner (timer.rs:705, in
 # `el1_bsptick_start` at :693) had its regime clause `cfg!`-split by ORIN-BSPRUN precisely
@@ -1284,18 +1414,39 @@ OPTIONAL running the full M4 CAPSTONE cooperatively
 #   `dispatch is on_tick + post-EOI timer_preempt`  the v3 dispatch CARRIES the arm
 #   `dispatch is on_tick ONLY (no timer_preempt …)` arc 1 alone — tick, no preemption
 # Both arms live INSIDE the `all(tegra, bsptick)` banner, so a bsptick-less image prints
-# NEITHER and both read ◦ — which is why the second is OPTIONAL and not the PENDING its
-# unconditionality would otherwise earn: on the boot7i/boot7j knob set `bsprun` implies
-# `bsptick`, so an armed boot7j boot prints the FIRST arm unconditionally (PENDING) while
-# the second arm belongs to a configuration boot7j is not flying (OPTIONAL).
+# NEITHER and both read ◦.
 # CROSS-CHECK AGAINST HALF 1, and this is the row's real value: banner ✅ with `on_tick
 # ONLY` ✅ would mean `run_bsp_tegra` ran while the gic.rs arm was compiled out — a
 # feature-list split that the `compile_error!` is supposed to make unbuildable. If that
 # combination ever appears on a wire, the backstop has a hole and it is a finding, not a
 # flight result. Both patterns are contiguous ASCII well before their line's first em dash.
-# ZERO hits tree-wide for both.
-PENDING dispatch is on_tick \+ post-EOI timer_preempt
-OPTIONAL dispatch is on_tick ONLY \(no timer_preempt arm
+#
+# ⚠ 2026-09-07 (exec-orin20-specarm), ORIN-SPECARM: PROMOTED PENDING -> REQUIRE and
+# OPTIONAL -> FORBID. THE RATIONALE THAT STOOD HERE IS STRUCK: *"which is why the second
+# is OPTIONAL and not the PENDING its unconditionality would otherwise earn … the second
+# arm belongs to a configuration boot7j is not flying"*. Both halves of it were about a
+# knob set in which `bsptick`-without-`bsprun` was a shipping configuration. Post
+# ORIN-TICKDEFAULT the default arms BOTH, `bsptick`-only is reached solely through
+# `UNAOS_NOBSPRUN=1`, and the second arm belongs to no configuration this file scores.
+# THE STALE "ZERO hits tree-wide for both" LINE IS ALSO STRUCK, and it is a lesson worth
+# leaving visible: `capture/line-acm0/orin.log` carries the first arm 4 times (the four
+# armed metal flights) and the second 3 times, measured 2026-09-07. The tree moved under a
+# recorded count and nothing re-derived it.
+REQUIRE dispatch is on_tick \+ post-EOI timer_preempt
+#   GUARDS (C5) the SECOND, INDEPENDENT regime tell — the `cfg!(feature = "bsprun")` arm
+#   of `el1_bsptick_start`'s banner (timer.rs), i.e. a claim made from a DIFFERENT FILE by
+#   a different arc than C3's. Two independent readings of one fact is the point: C3 says
+#   sched.rs took the armed terminus, this says timer.rs was compiled believing it would.
+#   REDS WHEN: `bsprun` leaves the feature list — same trigger as C3, deliberately, so the
+#   two red together on a knob regression and SEPARATELY on a cfg-split defect.
+#   MEASURED RED: tickless flight 0 hits; tick-only flight 0 hits.
+FORBID dispatch is on_tick ONLY \(no timer_preempt arm
+#   GUARDS (C6) the other arm of that same `cfg!`. On an image this file now scores it
+#   cannot be printed at all, so a hit means the flown image is `bsptick`-only.
+#   ⚠ IF C6 REDS WITH C3 GREEN IT IS NOT A SPEC BUG AND NOT A KNOB SLIP — it is the
+#   `sched.rs` `compile_error!` backstop having a hole (`run_bsp_tegra` linked while the
+#   gic.rs post-EOI arm was compiled out). Quote it whole; do not relax the row.
+#   MEASURED RED: tick-only flight 1 hit; 0 hits on all four armed metal flights.
 
 # --- ORIN-BSPRUN, half 2: DID PREEMPTION ACTUALLY DELIVER, OR IS THE FLAG INERT? -----
 # THE FAILURE MODE THIS HALF EXISTS FOR. `SCHED_ACTIVE` true with no timer arm, or a timer
@@ -1320,33 +1471,105 @@ OPTIONAL dispatch is on_tick ONLY \(no timer_preempt arm
 #
 # THE FALSE-POSITIVE HAZARD IS REAL AND IS MEASURED, because these three are CROSS-PLATFORM
 # strings and the Pi prints them constantly. Across the bench tree: `[spread4] live c0=`
-# 32,337 hits, `[el0live] verdict=` 11,837, `[prio] svc=` 45,113 — overwhelmingly Pi. Scoped
-# to genuinely-Orin captures the picture is the one the rows need: `capture/line-acm0/orin.log`
-# — the Orin scoring wire, 211 `tegra: JD1` lines — carries ZERO of all three, as does every
-# other single-board Orin capture and the boot7h slice. The 2,846 / 5,466 / 3,990 "Orin-ish"
+# 32,337 hits, `[el0live] verdict=` 11,837, `[prio] svc=` 45,113 — overwhelmingly Pi.
+# ⚠ THE SENTENCE THAT FOLLOWED IS STALE AND IS REPLACED (exec-orin20-specarm, 2026-09-07);
+# leaving it would tell a reader the exact opposite of what the promoted row below asserts.
+# It read: *"`capture/line-acm0/orin.log` — the Orin scoring wire, 211 `tegra: JD1` lines —
+# carries ZERO of all three"*. Re-derived 2026-09-07: that wire now has 463 `tegra: JD1`
+# lines and carries `[spread4] live c0=` 2,365, `[el0live] verdict=` 2,799, `[prio] svc=`
+# 2,365 — ALL of them inside the four ARMED flights on it (89715-107555, 107556-127570,
+# 127571-132871, 132872-133705) and NONE outside them. That distribution IS the row's
+# evidence: the lines appear exactly where `bsprun` was armed and nowhere else on the same
+# board. The original zero was true of a wire that had never carried an armed boot.
+# The 2,846 / 5,466 / 3,990 "Orin-ish"
 # hits are ALL in files that are not one Orin boot: `line-acm0/pi.log` and `line-acm0/unknown.log`
 # (the bridge directory is SHARED between benches), `line-acm0/raw.log` (both boards merged), and
 # `orin1-boot2/boot2-recovered.log` (7 tegra lines against a Pi session — `[spin1] … task=99:input`
 # on `cpu=3` is the Pi's task on the Pi's 4-core geometry). NEVER REPLAY THIS FILE AGAINST
 # `raw.log`: it would read another board's preemption as this board's. Score a per-flight LINE
 # RANGE of `orin.log`, which is this file's standing convention anyway.
-# PENDING, AND PERMANENTLY NO-PROMOTE — the TEGRA-SD rule. It is knob-gated by `bsprun`; a
-# REQUIRE would red every unarmed boot on CONFIGURATION. mbench will advise the promotion on
-# the first armed capture; the advice must not be taken, ever.
-PENDING \[spread4\] live c0=[0-9]+/[0-9]+
+# ⚠ 2026-09-07 (exec-orin20-specarm), ORIN-SPECARM: PROMOTED PENDING -> REQUIRE. THE
+# SENTENCE THAT STOOD HERE IS STRUCK IN FULL AND MUST NOT BE RESTORED: *"PENDING, AND
+# PERMANENTLY NO-PROMOTE — the TEGRA-SD rule. It is knob-gated by `bsprun`; a REQUIRE would
+# red every unarmed boot on CONFIGURATION. mbench will advise the promotion on the first
+# armed capture; the advice must not be taken, ever."*
+# ITS PREMISE DIED AT ORIN-TICKDEFAULT (98213b7f). "Unarmed" is no longer a boot this file
+# scores — it is the OPT-OUT (`UNAOS_NOBSPTICK=1`). The TEGRA-SD analogy does not carry
+# either: TEGRA-SD's row is about a CARD that may not be in the slot, a fact about the
+# bench; `bsprun` is a fact about the IMAGE, and the image is now built armed by default.
+# THIS IS PRECISELY THE ROW THAT HAD TO PROMOTE FOR A FLIGHT TO BE ABLE TO FAIL ON
+# PREEMPTION. C3/C5 say the image BELIEVES it is preemptive; only the tick train says a
+# timer IRQ actually reached `timer_preempt` and got past `SCHED_ACTIVE`.
+# ⚠ WHAT THIS ROW COSTS, STATED RATHER THAN DISCOVERED. `[spread4]` is chained AFTER
+# `load_witness_emit()`'s change-suppression, so a boot whose packed per-core busy
+# signature NEVER CHANGES for the whole capture prints it zero times and reds here. That is
+# accepted, and it is close to an assertion in its own right: a board whose load signature
+# is frozen across thousands of windows is a wedged board, which is what this file is for.
+# THERE IS NO NON-TICK EMITTER ON TEGRA, and that is what makes these three rows evidence
+# rather than correlation. `spread4_witness`/`prio_witness`/`el0live_witness` have exactly
+# THREE call sites in the tree and the other two cannot exist on this board:
+#   `load_accounting_witness` — `#[cfg(feature = "pi")]`, and `pi`+`tegra` is a hard
+#                               `compile_error!` in arch/aarch64/serial.rs.
+#   `storm_census`            — reached only from shell.rs's `storm` verb, whose arm is
+#                               `#[cfg(any(all(feature = "baremetal", target_arch =
+#                               "aarch64"), target_arch = "x86_64"))]`. That arm was
+#                               DELIBERATELY not widened to `tegra_el0` with its
+#                               neighbours (shell.rs states why: `storm` reaches past the
+#                               process table into BCM2711 slot state and spawns the
+#                               baremetal-only FAT writer), and `baremetal` implies `pi`.
+# So on tegra the ONLY reachable emitter of all three is `load_witness_tick`, whose only
+# caller is `timer_preempt`. ⚠ IF THAT SHELL ARM IS EVER WIDENED TO TEGRA, THESE THREE ROWS
+# GAIN A SECOND EMITTER AND STOP BEING PURE PREEMPTION EVIDENCE — re-derive this paragraph
+# in the same commit that widens it. (Checked 2026-09-07, exec-orin20-specarm. This block
+# first claimed the opposite, that `storm_census` was reachable here; the cfg had not been
+# read. The correction makes the rows stronger, and the way it was found is the point —
+# the citation was to a call site, not to the gate above it.)
+REQUIRE \[spread4\] live c0=[0-9]+/[0-9]+
 # THE TWO COMPANIONS THE SAME TICK CHAINS. `[el0live]` is chained UNCONDITIONALLY from
 # `load_witness_tick` (before the change-suppression, deliberately — sched.rs:8342 says why);
-# `[prio]` is chained only when the load line actually printed. Neither is ever a gate: they
-# are state dumps, and nothing should be REQUIRED to print one (the `[irqel2a]` rule). They
-# are OPTIONAL rather than PENDING for a second reason too — both are change-suppressed, so a
-# genuinely quiet armed board can legitimately print `[spread4]` and not these, and a PENDING
-# would advise promoting a line whose absence is legal.
+# `[prio]` is chained only when the load line actually printed.
 # WHAT THEY BUY THE READER: `[el0live] verdict=` names whether the EL0 fleet is NONE / LIVE /
 # STARVED / EXTINCT under preemption, which is the first thing to check if `el0-hello` stops
 # round-tripping; `[prio] svc=`'s per-window deltas say who WON the dispatches the new quantum
-# started handing out. Every arm of both is a MEASUREMENT, never a failure (the JD1-DC rule).
-OPTIONAL \[el0live\] verdict=[A-Z]+ el0 runnable/parked/committed=
-OPTIONAL \[prio\] svc=[0-9]+ el0=[0-9]+ defer=[0-9]+ agedin=[0-9]+ /win
+# started handing out. Every ARM of both is a MEASUREMENT, never a failure (the JD1-DC rule) —
+# and that is why the patterns below match ANY verdict word and ANY delta. The rows assert
+# that the LINE PRINTED, never which arm it took.
+#
+# ⚠ 2026-09-07 (exec-orin20-specarm), ORIN-SPECARM: PROMOTED OPTIONAL -> REQUIRE (both). THE
+# RATIONALE THAT STOOD HERE IS STRUCK: *"Neither is ever a gate: they are state dumps, and
+# nothing should be REQUIRED to print one (the `[irqel2a]` rule). They are OPTIONAL rather
+# than PENDING for a second reason too — both are change-suppressed …"*. The `[irqel2a]` rule
+# forbids REQUIRING A FAILURE ARM, and it is not touched: these rows require the DUMP, not a
+# verdict. What has changed is what an absence MEANS. Knob-off these lines were not merely
+# quiet, they were LINK-TIME DEAD on tegra (sched.rs:3401's `LC_ALL=C grep -a` over the linked
+# `arm-tegra-el0` kernel), so an absence said "not built". On the armed default the only
+# tegra caller of both is `load_witness_tick`, whose only caller is `timer_preempt`, so an
+# absence now says PREEMPTION NEVER DELIVERED — which is exactly the failure this half exists
+# for and must be failable.
+REQUIRE \[el0live\] verdict=[A-Z]+ el0 runnable/parked/committed=
+#   GUARDS (C8) — THE PRIMARY DELIVERY PREDICATE, and the one to read first when this block
+#   reds. `el0live_tick` is chained from `load_witness_tick` BEFORE the load line's
+#   change-suppression, and its own suppression is liveness-shaped and CANNOT SWALLOW THE
+#   FIRST WINDOW — `el0live_tick`'s guard is `last_sig == sig && healthy`, and on the first
+#   window either the signature differs from the initial 0 (it carries the `healthy` bit, so
+#   a healthy first window packs 1) or `healthy` is false; both arms print. So an armed
+#   board that takes even ONE preemption emits it. It is therefore strictly harder to
+#   silence than C7/C9, and an armed-but-IDLE machine still prints it.
+#   REDS WHEN: `timer_preempt` returns at `SCHED_ACTIVE` on every tick (the flag never
+#   stored), or `load_witness_tick` loses its call site, or no timer IRQ reaches the v3
+#   dispatch's post-EOI arm at all. MEASURED RED: tickless flight 0 hits; tick-only flight
+#   0 hits — while BOTH of those captures carry the `:: SCHED: load ::` train, which is the
+#   trap this row exists to route around (see the SMPINSTR block: `load_witness_poll` is
+#   called from `run_capstone_boot_core` itself, so the load line is NOT a discriminator).
+REQUIRE \[prio\] svc=[0-9]+ el0=[0-9]+ defer=[0-9]+ agedin=[0-9]+ /win
+#   GUARDS (C9) that the dispatch ACCOUNTING behind the new quantum is wired and reached.
+#   `prio_witness` is chained on the same line as `spread4_witness`, after the same
+#   `load_witness_emit()` gate, and neither has any internal suppression — so C7 and C9 fire
+#   together by construction and a SPLIT between them is itself the finding: one of the two
+#   chain calls was lost. That co-firing is the reason C9 is worth a REQUIRE beside C7 rather
+#   than being redundant with it.
+#   REDS WHEN: C7's triggers, or `prio_witness`'s chain call is dropped from
+#   `load_witness_tick`. MEASURED RED: tickless flight 0 hits; tick-only flight 0 hits.
 # THE WEDGE NAMER, AND THE ONE ROW THAT ADJUDICATES "PREEMPTION FIRED AND KILLED THE BOARD".
 # `[spin1]` fires from `pulse5_witness` when a core has been inside ONE task for >10 s while
 # the witness still runs. Knob-off it is unreachable in practice — the cooperative terminus

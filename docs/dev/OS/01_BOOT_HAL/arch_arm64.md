@@ -11172,14 +11172,77 @@ loop, at a CNTPCT-rate-limited ~1/s. A tickless boot prints the load train too, 
 `[spin1]` ride the same emit. That is precisely why (5) keys on `[spread4]`, which the poll path
 does not chain, and not on the load line it sits beside.
 
-**The instrument for (2)-(4) is not yet armed.** `scripts/specs/jetson-sync1.spec:1063-1064` carry
-the two `[orinbsptick]` rows as `PENDING`, and PENDING is not failable in `orin-specscore.py`
-(`failable = d.kind in ("REQUIRE","COUNT","FORBID")`). On a default image those rows must become
-`REQUIRE` + a `COUNT`, and `:269`'s `REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] …)` alternation must
-collapse to the `[orinbsprun]` arm — otherwise a silently tickless default boot scores green. That
-inversion belongs to the flight arc, with the synthetic `jetson-sync1-green.capture` gaining the
-same lines in the same commit, and is deliberately NOT made here: a REQUIRE that no capture in the
-tree satisfies is a red gate with no flight behind it.
+### The instrument is now armed — ORIN-SPECARM (orin 20, 2026-09-07)
+
+The paragraph that stood here said the instrument was **not** armed: `jetson-sync1.spec` carried the
+`[orinbsptick]` rows as `PENDING`, and PENDING is not failable in `orin-specscore.py`
+(`failable = d.kind in ("REQUIRE","COUNT","FORBID")`). That was true and it was worse than it read —
+**nine** rows, not two, and the hole was measured rather than argued: a **real pre-flip TICKLESS Orin
+flight** (`capture/line-acm0/orin.log:41451-46241` — zero `orinbsptick`, zero `orinbsprun`, the
+cooperative terminus banner present) scored `PASS — 17/17 required witnesses, 0 forbidden hit(s)`,
+exit 0, against the spec at `98213b7f`.
+
+All nine are now failable, each with a per-rule provenance block at the row naming what it guards and
+what mutation reds it, and `jetson-sync1-green.capture` gained the witnesses in the same commit:
+
+| # | row | was | is |
+|---|---|---|---|
+| C1 | `[orinbsptick] arming PERIODIC CNTP` | PENDING | REQUIRE |
+| C2 | `[orinbsptick] tick N taken` | PENDING | **COUNT 2** |
+| C3 | `[orinbsprun] boot core N joins run()` | PENDING | REQUIRE |
+| C4 | `running the full M4 CAPSTONE cooperatively` | OPTIONAL | FORBID |
+| C5 | `dispatch is on_tick + post-EOI timer_preempt` | PENDING | REQUIRE |
+| C6 | `dispatch is on_tick ONLY (no timer_preempt arm` | OPTIONAL | FORBID |
+| C7 | `[spread4] live c0=N/M` | PENDING | REQUIRE |
+| C8 | `[el0live] verdict=` | OPTIONAL | REQUIRE |
+| C9 | `[prio] svc=` | OPTIONAL | REQUIRE |
+
+**C2 is a `COUNT 2` and not a `REQUIRE`, which is predicate (3) made mechanical**: `bsptick_witness`
+emits at `n == 1` and then every `TICK_HZ`-th tick, so a `REQUIRE` on the bare pattern would be
+satisfied by a lone `tick 1` — the IRQEL-RT one-shot's signature, i.e. the old behaviour. `BSPTICK_COUNT`
+is monotonic and boot-core-scoped, so two matched lines are two distinct N.
+
+**The scored floor moves 17/17 → 24/24** (REQUIRE 17 → 23, COUNT 0 → 1, spec-declared FORBID 16 → 18;
+spec-declared failable rules 33 → 42, or 45 counting mbench's three built-in default FORBIDs). The
+spec-declared directive total is unchanged at 131 — nine rows changed kind, none was added. A reader
+who sees 24/24 where 17/17 stood is looking at a bigger denominator, not a regression.
+
+**`:269`'s alternation was deliberately NOT collapsed**, and the earlier instruction to collapse it is
+withdrawn as unnecessary rather than wrong: with C3 a `REQUIRE` and C4 a `FORBID`, a boot that
+satisfies `:269` through its `CAPSTONE COMPLETE` arm reds twice below, so the alternation is now
+redundant rather than a hole. Narrowing it would be a second, unrelated rule change to the file's
+"did this boot reach a terminus at all" anchor.
+
+**What ORIN-SPECARM also had to correct in the predicate above**: the `[el0live]` bullet's *"chained
+… before the change-suppression, so it prints on every window"* is right about the LOAD suppression
+and silent about `el0live_tick`'s own liveness-shaped one (`sched.rs`), which does mute a healthy
+unchanged window. It remains the primary predicate for a stronger reason: that guard is
+`last_sig == sig && healthy`, and on the first window either the signature differs from the initial
+zero (it carries the `healthy` bit, so a healthy first window packs 1) or `healthy` is false — both
+arms print, so the FIRST window can never be suppressed and an armed board that takes even one
+preemption emits it. And one thing the predicate leaves implicit that C7/C8/C9 now depend on: the
+three witnesses have exactly **three** call sites in the tree, and on tegra only one of them can
+exist. `load_accounting_witness` is `#[cfg(feature = "pi")]` and `pi`+`tegra` is a hard
+`compile_error!`; `storm_census` is reached only from `shell.rs`'s `storm` verb, whose arm is
+`#[cfg(any(all(baremetal, aarch64), x86_64))]` — deliberately *not* widened to `tegra_el0` with its
+neighbours, because `storm` reaches into BCM2711 slot state and the baremetal-only FAT writer. So on
+this board `load_witness_tick` is the only reachable emitter, and its only caller is `timer_preempt`.
+⚠ Widening that shell arm to tegra would give these rows a second emitter and cost them their status
+as pure preemption evidence; re-derive the spec's paragraph in the same commit that widens it.
+
+**⚠ How to score predicate (8), the way-back leg, now that these rows are failable.** A
+`UNAOS_NOBSPTICK=1 ./arroyo esp-jetson` capture is *supposed* to carry zero `[orinbsptick]`, zero
+`[orinbsprun]` and `CAPSTONE COMPLETE` present, so replaying `jetson-sync1.spec` against it will red
+C1-C9 by construction. **That red is the leg passing, not failing** — and it is what predicate (8)
+asks for. Score the way-back leg by its own three facts (the objcopy sha256 matching the pre-flip
+default, zero `[orinbsptick]`, `CAPSTONE COMPLETE` present), not by this spec's verdict; if a
+scored run is wanted, `--accept-dead` names the rows in the command line where a reviewer can see
+them, which is exactly why that exemption is a harness argument and not spec syntax. Do NOT soften
+the rows to make the opt-out green: that would put the default boot back where ORIN-SPECARM found it.
+
+`orin-specscore.py` now also prints a **FAILABILITY** line under every tally — how many of a spec's
+rules can move the exit code and how many cannot — so this class of hole is visible on every run
+rather than discoverable. It is reporting only; no scoring semantics changed.
 
 
 ## §ORIN-STKDEPTH — a boot-core stack DEPTH at the tegra terminus (`orinfurn`, DEFAULT OFF)
