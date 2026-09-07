@@ -889,7 +889,10 @@ pub fn compose() -> bool {
         if SLOT.packed() != 0 {
             let r = SLOT.rect();
             SLOT.clear();
-            return strip::erase_rect(r);
+            // TEARSCOPE — `strip::vacate` IS `strip::erase_rect` plus the census; same return, same
+            // behaviour. `new=None` (the bar is going away, so all of `r` is uncovered) and
+            // `owed=false` (the slot is already cleared, so a decline is forgotten).
+            return strip::vacate("menubar", r, None, false);
         }
         return false;
     }
@@ -972,7 +975,8 @@ pub fn compose() -> bool {
     let Some(r) = rect else {
         SLOT.clear();
         return match vacated {
-            Some(v) => strip::erase_rect(v),
+            // TEARSCOPE — accounted, not changed. `owed=false`: the slot is cleared above.
+            Some(v) => strip::vacate("menubar", v, None, false),
             None => false,
         };
     };
@@ -980,7 +984,12 @@ pub fn compose() -> bool {
     let t1 = crate::arch::now_cycles();
     if let Some(v) = vacated {
         // Erase FIRST, then paint, so the two never race to own an overlapping pixel.
-        strip::erase_rect(v);
+        //
+        // TEARSCOPE — accounted, not changed. `owed=false` because `SLOT.store` below re-publishes
+        // this tenant's rect whatever the erase returned. The bar is `frame_flush(Top)` and so is
+        // full-panel-width, which means a content change alone does not move it; this arm is reached
+        // when the RECT itself changes (a panel resize, or the bar crossing its floor).
+        strip::vacate("menubar", v, Some(r), false);
     }
     if !strip::paint("menubar", r, |out, j| compose_row(out, &model, r, j)) {
         return false;

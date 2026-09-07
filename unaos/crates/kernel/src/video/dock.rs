@@ -764,7 +764,10 @@ pub fn compose() -> bool {
     let Some(l) = layout else {
         SLOT.clear();
         return match vacated {
-            Some(v) => strip::erase_rect(v),
+            // TEARSCOPE — `strip::vacate` IS `strip::erase_rect` plus the census; it returns exactly
+            // what the erase returned and this arm behaves as it did. `owed=false`: the slot was
+            // cleared above, so a declined erase is a span nothing comes back for.
+            Some(v) => strip::vacate("dock", v, None, false),
             None => false,
         };
     };
@@ -773,7 +776,11 @@ pub fn compose() -> bool {
     if let Some(v) = vacated {
         // Erase FIRST, then paint: the new strip lands on top of the cleaned area, so the two never
         // race to own an overlapping pixel and the panel never shows a half-erased strip.
-        strip::erase_rect(v);
+        //
+        // TEARSCOPE — accounted, not changed. `owed=false` because `SLOT.store` below re-publishes
+        // this tenant's rect whatever the erase returned, so a decline here strands the ENDS this
+        // centred, tile-sized strip just stopped owning. That is the span Peter watched.
+        strip::vacate("dock", v, Some(l.rect()), false);
     }
     if !paint(&l, &rows[..n], pressed) {
         return false;
