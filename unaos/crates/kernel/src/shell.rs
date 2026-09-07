@@ -3794,42 +3794,61 @@ pub fn layout_witness() {
     // Run FIRST, and independently of `/apps`, because it is a claim about `/` and `/boot` that
     // holds (or does not) whatever the program directory looks like.
     {
-        let rows = mt.rows();
-        let at = |p: &str| rows.iter().position(|r| r.0 == p);
-        match (at("/"), at("/boot")) {
-            (None, _) | (_, None) => serial_println!(
+        let prefixes = mt.prefixes();
+        let bound = |p: &str| prefixes.iter().any(|q| *q == p);
+        if !bound("/") || !bound("/boot") {
+            serial_println!(
                 ":: layout: this board binds no {} — layout.volid skipped ::",
-                if at("/").is_some() { "/boot" } else { "/" }),
-            (Some(i_root), Some(i_boot)) => {
-                // The ORACLE, and it is deliberately not `same_volume`: the backends' own
-                // descriptions of the medium (`rows()`'s fifth field — the FAT geometry line each
-                // backend prints about ITSELF), plus their root listings compared entry for entry.
+                if bound("/") { "/boot" } else { "/" });
+        } else {
+            let says_same = mt.same_volume("/", "/boot").unwrap_or(false);
+            // THE ORACLE IS CONSULTED ONLY WHEN THE ANSWER UNDER TEST IS "NO", and that is a
+            // consequence of the claim being an IMPLICATION rather than an equality: a
+            // `same_volume` that already says "one volume" satisfies it whatever the medium turns
+            // out to be. Asking anyway costs two FAT re-mounts (`describe()` mounts per call) and
+            // two full root walks, and that I/O is not free at this call site — it was measured
+            // shifting the x86 window-manager battery's timing into two different fixture flakes.
+            //
+            // When it IS consulted, it is deliberately not `same_volume`: the backends' own
+            // descriptions of the medium (the FAT geometry line each prints about ITSELF —
+            // `part_lba`, `vol_sectors`, `bytes_per_sec`, `sec_per_clus`, `fat_start`,
+            // `data_start`, `count_of_clusters`), and only if those agree, their root listings
+            // compared entry for entry.
+            let (oracle_one_volume, why) = if says_same {
+                (false, String::from("not consulted (same_volume already true)"))
+            } else {
+                let rows = mt.rows();
+                let at = |p: &str| rows.iter().position(|r| r.0 == p).unwrap_or(0);
+                let (i_root, i_boot) = (at("/"), at("/boot"));
                 let same_geometry = rows[i_root].4.is_some() && rows[i_root].4 == rows[i_boot].4;
-                let listings_match = match (mt.read_dir("/"), mt.read_dir("/boot")) {
-                    (Ok(a), Ok(b)) => {
-                        !a.is_empty()
-                            && a.len() == b.len()
-                            && a.iter().zip(b.iter()).all(|(x, y)| {
-                                x.name == y.name && x.kind == y.kind && x.size == y.size
-                            })
-                    }
-                    _ => false,
-                };
-                let oracle_one_volume = same_geometry && listings_match;
-                let says_same = mt.same_volume("/", "/boot").unwrap_or(false);
-                // The implication, not the equality: the oracle can only ever prove SAMENESS (two
-                // different media could in principle carry identical geometry AND identical
-                // listings), so "the oracle says different" is not a licence to demand
-                // `same_volume == false`.
-                verdict(
-                    "layout.volid",
-                    !oracle_one_volume || says_same,
-                    &alloc::format!(
-                        "oracle_one_volume={} (geometry_match={} listings_match={}) same_volume={} root_vol={} boot_vol={}",
-                        oracle_one_volume, same_geometry, listings_match, says_same,
-                        rows[i_root].1, rows[i_boot].1),
-                );
-            }
+                let listings_match = same_geometry
+                    && match (mt.read_dir("/"), mt.read_dir("/boot")) {
+                        (Ok(a), Ok(b)) => {
+                            !a.is_empty()
+                                && a.len() == b.len()
+                                && a.iter().zip(b.iter()).all(|(x, y)| {
+                                    x.name == y.name && x.kind == y.kind && x.size == y.size
+                                })
+                        }
+                        _ => false,
+                    };
+                (
+                    same_geometry && listings_match,
+                    alloc::format!(
+                        "geometry_match={} listings_match={} root_vol={} boot_vol={}",
+                        same_geometry, listings_match, rows[i_root].1, rows[i_boot].1),
+                )
+            };
+            // The implication, not the equality: the oracle can only ever prove SAMENESS (two
+            // different media could in principle carry identical geometry AND identical listings),
+            // so "the oracle says different" is not a licence to demand `same_volume == false`.
+            verdict(
+                "layout.volid",
+                !oracle_one_volume || says_same,
+                &alloc::format!(
+                    "oracle_one_volume={} same_volume={} oracle: {}",
+                    oracle_one_volume, says_same, why),
+            );
         }
     }
 
@@ -3867,7 +3886,9 @@ pub fn layout_witness() {
     let resolves = is_file(&in_apps);
     // `/fat` must not be a mount prefix AND must not resolve as an object — it is retired, not
     // aliased. (`/fat/<leaf>` is checked too: a leftover mount would answer for the leaf.)
-    let fat_prefix_gone = !mt.rows().iter().any(|r| r.0 == "/fat");
+    // `prefixes()`, not `rows()`: `rows()` calls `describe()` on every mount, which re-mounts the
+    // volume once per row — a listing question must not cost a FAT mount per mount point.
+    let fat_prefix_gone = !mt.prefixes().iter().any(|p| *p == "/fat");
     let fat_gone = fat_prefix_gone && mt.stat("/fat").is_err() && !is_file(&in_fat);
     // THE LEG THAT MOVES WITH `EXEC_ROOT`: a bare name, from `/`, must land on the `/apps` path.
     // This is what reds if `EXEC_ROOT` is pointed back at the boot volume.

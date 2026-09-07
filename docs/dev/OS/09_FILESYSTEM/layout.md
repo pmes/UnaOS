@@ -180,6 +180,14 @@ not exist. **Deferred to Peter, with the current placement stated so the deferra
   The implication, not the equality — the oracle can only ever prove SAMENESS, since two different
   media could in principle carry identical geometry and identical listings.
 
+  **The oracle is consulted only when `same_volume` says NO**, which follows from the claim being
+  an implication: a `same_volume` that already says "one volume" satisfies it whatever the medium
+  turns out to be. That is not only tidiness — `describe()` re-mounts the volume per call and the
+  listings are two full root walks, and asking anyway was measured shifting the x86 window-manager
+  battery's timing into two different fixture flakes (`WINMENU` on one run, `[wm-act] lead=false`
+  on the next, with the same commit green twice at the baseline). Same reason `layout.apps` reads
+  `prefixes()` rather than `rows()`: a listing question must not cost a FAT mount per mount point.
+
   **It is EXPECTED RED on the Orin (`sdmmcroot`) until VOLID lands**, and green everywhere else:
   on the Pi `/` is native UnaFS and `/boot` is FAT, so the oracle says "different" and the
   implication holds vacuously (the witness text prints which); on x86 both prefixes carry one name
