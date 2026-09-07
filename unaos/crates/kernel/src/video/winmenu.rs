@@ -39,10 +39,10 @@
 //!    `menubar`'s protocol design ledger already fixed for the eventual ring-3 wire form
 //!    ([`MENU_LABEL_MAX`] 24, [`MENU_DEPTH_MAX`] 2, [`MENU_ITEMS_MAX`] 64), so a tree that is legal
 //!    here is legal on the wire later and the bus arc adds a decoder rather than a second model.
-//! 2. **A BAR COMPOSE.** [`bar_boxes`] reports the title boxes of the frontmost publishing window,
-//!    right of the caption slot; [`super::menubar::compose_row`] overlays them into the bar's own
-//!    face. No focused window, or a focused window with no tree, means no boxes and a bar that looks
-//!    exactly as it did before this arc.
+//! 2. **A BAR COMPOSE.** [`bar_boxes`] reports the title boxes of the FOCUSED window — the same row
+//!    the bar's caption names (MENUOWN) — right of that caption; [`super::menubar::compose_row`]
+//!    overlays them into the bar's own face. No focused window, or a focused window with no tree,
+//!    means no tenant boxes and a bar that looks exactly as it did before this arc.
 //! 3. **A DROPDOWN.** [`compose`] paints it through [`super::strip::paint`] and erases it through
 //!    [`super::strip::erase_rect`] — the SHARD dropdown's own discipline, with the SHARD dropdown's own
 //!    row metrics, imported from [`super::crystal`] rather than re-derived here.
@@ -226,8 +226,13 @@ static BAR_OWNER: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 /// input path — so a press on the app title never takes the window table's lock to find out which
 /// row `Quit` must reap.
 ///
-/// NOT the same window as [`BAR_OWNER`]: that is the frontmost PUBLISHER and this is the frontmost
-/// FOCUSED row, and they differ whenever a window with menus sits behind a window without them.
+/// MENUOWN — since 2026-09-07 this is the SAME window as [`BAR_OWNER`] whenever that one is set:
+/// both are the frontmost focused row, and `BAR_OWNER` is additionally filtered by whether the row
+/// publishes. The two statics stay separate because they answer different questions — *which name
+/// is on the bar* and *whose menus are on the bar* — and a window with a name but no menus makes
+/// the second [`wm::WIN_NONE`] while the first is live. They can no longer name DIFFERENT windows.
+/// (They used to: `BAR_OWNER` was the frontmost PUBLISHER, so a window with menus sitting BEHIND a
+/// window without them put one app's `View` beside another app's name. That is the render9 defect.)
 static APP_OWNER: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 /// SO3 — the caption's bytes, as two words. [`wm::MAX_TITLE`] is 16 (asserted at the file's foot),
 /// so the whole name fits in a pair of atomics and the app title box is laid out, hit-tested and
@@ -659,7 +664,9 @@ pub struct BarSnapshot {
     pub busy: bool,
     /// The open title, 1-based; `0` is closed.
     pub open: usize,
-    /// The window the TENANT boxes belong to (the frontmost publisher).
+    /// The window the TENANT boxes belong to: the FOCUSED window, when it publishes a tree
+    /// (MENUOWN). [`wm::WIN_NONE`] when the focused window has no menus of its own, which lays out
+    /// the app box and nothing else.
     pub owner: wm::WinId,
     /// SO3 — box `0` is the APP MENU (the bar's own caption), so the tenant's published titles start
     /// at box 1. `false` when there is no focused window to name one for, in which case box 0 is the

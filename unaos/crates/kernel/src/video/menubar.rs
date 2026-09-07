@@ -711,24 +711,37 @@ struct Model {
     title_len: usize,
     /// `HH:MM`, or `None` while the civil clock has never been anchored this boot.
     clock: Option<[u8; CLOCK_GLYPHS]>,
-    /// WINMENU (R21) — **the window whose menus this bar is showing**: the FRONTMOST VISIBLE row that
-    /// has published a tree, or [`wm::WIN_NONE`].
+    /// WINMENU (R21) — **the window whose menus this bar is showing**, or [`wm::WIN_NONE`].
     ///
-    /// ⚠ It is deliberately NOT the same reduction as the caption's, and the difference is a fact
-    /// about this kernel rather than a taste call. The caption's `focused` flag is an OWNER-ASID
-    /// match, and the click router hands SHELL focus (asid `0`) to a press on kernel furniture
-    /// (`is_kernel_owner`) — so the first publisher this arc has, [`super::pulsewin`], can never be
-    /// `focused` by that test and an owner-keyed menu selection would show nothing for the one window
-    /// it exists to serve. "Frontmost visible publisher" is what an operator means by *the window in
-    /// front*, is computed from the same single [`wm::dock_scan`] the caption already runs, and is
-    /// stated on the wire (`[winmenu] publish owner=`) so the two readings can be compared rather
-    /// than confused.
+    /// MENUOWN (Peter, 2026-09-07): **it is the row the CAPTION names**, when that row has published
+    /// a tree. The bar shows ONE app's menus and names ONE app, and on a Mac those are the same app;
+    /// a bar that names `console` over `pulse`'s `View` is showing two apps at once.
+    ///
+    /// ⚠ **It used to be "the frontmost VISIBLE PUBLISHER", which ignored focus entirely, and the
+    /// premise that justified that is FALSE.** The claim recorded here was: *"the caption's `focused`
+    /// flag is an OWNER-ASID match, and the click router hands SHELL focus (asid `0`) to a press on
+    /// kernel furniture (`is_kernel_owner`) — so [`super::pulsewin`] can never be `focused` by that
+    /// test"*. It conflates the two things the router's furniture arm does on ONE line
+    /// (`arch/aarch64/syscall.rs`, the SHELLWIN-PI arm): `user_input_set_active(0)` hands the
+    /// KEYBOARD to the shell, and `wm::focus_changed(owner)` — called with the furniture's OWN owner
+    /// — sets `FOCUS_ASID`, which is what `dock_scan`'s `focused` reads. Kernel furniture therefore
+    /// DOES take focus by that test, and `render9` proves it from the glass: the caption read
+    /// `console` in one frame and `quarry` in the next, which is only reachable if `FOCUS_ASID` had
+    /// become `KERNEL_OWNER_CONSOLE` and then quarry's `OWNER`. Under the old reduction that same
+    /// pair of frames carried pulse's `View` in the bar the whole time, because pulse was the only
+    /// publisher and "frontmost publisher" cannot see a window that is in front of it without menus.
+    ///
+    /// Keeping the two reductions apart cost exactly that defect, so they are now ONE reading:
+    /// [`cap_owner`](Self::cap_owner), filtered by whether it publishes.
     menu_owner: wm::WinId,
-    /// SO3 — **the window the CAPTION names**, i.e. the row [`title`](Self::title) was taken from.
-    /// Distinct from [`menu_owner`](Self::menu_owner) on purpose: that one is the frontmost
-    /// PUBLISHER and this one is the frontmost FOCUSED row, and they differ whenever a window with
-    /// menus sits behind a window without them. The app menu belongs to the name the operator is
-    /// reading, so `Quit` must reap THIS row and not the publisher's.
+    /// SO3 — **the window the CAPTION names**, i.e. the row [`title`](Self::title) was taken from:
+    /// the frontmost FOCUSED VISIBLE row. The app menu belongs to the name the operator is reading,
+    /// so `Quit` reaps THIS row.
+    ///
+    /// MENUOWN — it is now also what [`menu_owner`](Self::menu_owner) is derived from, so the bar
+    /// cannot name one app and drop another's menus. The two fields remain separate because the
+    /// second is this one FILTERED by `winmenu::has_tree`: a focused window with no menus of its own
+    /// still has a name, and still gets its `Quit`.
     cap_owner: wm::WinId,
     /// WINMENU — the title boxes, laid out once per compose and handed to the row painter. Filled in
     /// by [`compose`] after the rect is settled, because the layout is a function of the bar rect.
@@ -765,31 +778,23 @@ impl Model {
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
         let (n, clobbered) = wm::dock_scan(&mut rows, painted);
         let mut best_z = 0u32;
-        // WINMENU — the SECOND reduction, over the SAME scan: the frontmost visible PUBLISHER. It is
-        // separate from the caption's because `focused` is an owner match and kernel furniture takes
-        // shell focus; see [`Model::menu_owner`]. `winmenu::has_tree` is lock-free
-        // (`WINMENU_MAX` relaxed loads, short-circuited to nothing when nothing has published), so
-        // this costs a boot with no menus one atomic and no second table walk.
-        let (mut menu_z, mut menu_owner) = (0u32, wm::WIN_NONE);
+        // MENUOWN — ONE reduction, not two. The frontmost FOCUSED VISIBLE row is the app the bar
+        // names, and it is now also the app whose menus the bar shows: `menu_owner` is taken from
+        // `cap_owner` below rather than computed here from a separate "frontmost publisher" walk.
+        // See [`Model::menu_owner`] for the premise that walk rested on and why it is false.
+        //
+        // PANEL V-4 — `wm::info` is LAZY, below the guard. It takes `wm::TABLE` with IRQs masked
+        // (`wm::table`, and `wm.rs`'s standing rule about that critical section), so hoisting it
+        // above the guard turned one masked acquisition per bar compose into up to `MAX_WINDOWS` of
+        // them, on every composite, on every gated build. The guard is now STRICTLY tighter than it
+        // was — the old `publisher ||` arm let every published row past it — so this reduction takes
+        // no more of those acquisitions than before, and on a desktop with a background publisher it
+        // takes fewer.
         for r in rows[..n].iter() {
-            // PANEL V-4 — `wm::info` is LAZY, below both guards. It takes `wm::TABLE` with IRQs
-            // masked (`wm::table`, and `wm.rs`'s standing rule about that critical section), so
-            // hoisting it above the guards turned one masked acquisition per bar compose into up to
-            // `MAX_WINDOWS` of them, on every composite, on every gated build — a regression against
-            // trunk, and it silently falsified the claim three lines up: the `has_tree`
-            // short-circuit cannot save a boot with no menus if `z` is computed before it is asked.
-            let publisher = r.visible && super::winmenu::has_tree(r.id);
-            if !publisher && (!r.focused || !r.visible) {
-                continue;
-            }
-            let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
-            if publisher && (menu_owner == wm::WIN_NONE || z >= menu_z) {
-                menu_z = z;
-                menu_owner = r.id;
-            }
             if !r.focused || !r.visible {
                 continue;
             }
+            let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
             if z >= best_z {
                 best_z = z;
                 m.title_len = r.title_len.min(wm::MAX_TITLE);
@@ -797,7 +802,14 @@ impl Model {
                 m.cap_owner = r.id; // SO3 — the app menu's owner is the row the caption came from
             }
         }
-        m.menu_owner = menu_owner;
+        // MENUOWN — the bar shows the FOCUSED app's menus, and no one else's. `winmenu::has_tree` is
+        // lock-free (`WINMENU_MAX` relaxed loads, short-circuited to nothing when nothing has
+        // published), and it is asked ONCE here rather than once per row, so this is cheaper than
+        // the walk it replaces as well as correct. A focused window that published nothing answers
+        // `WIN_NONE`: the bar keeps its app-menu box (SO3 gives every window a name-menu) and lays
+        // out no tenant titles, which is exactly what a Mac shows for an app with no menus of its
+        // own — and is what `render9` should have shown while `console` and `quarry` held focus.
+        m.menu_owner = if super::winmenu::has_tree(m.cap_owner) { m.cap_owner } else { wm::WIN_NONE };
         m.clock = clock_hhmm();
         (m, clobbered)
     }
