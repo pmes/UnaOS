@@ -831,10 +831,12 @@ impl BarSnapshot {
 
 /// **THE accessor**: the title boxes on a `pw` x `ph` panel.
 ///
-/// Laid out left to right from [`super::menubar::menus_x0`] — a FIXED offset past the caption slot,
-/// not past the caption's rendered width. A caption changing length must not make the menus dance
-/// under the operator's hand, and a fixed slot is the only layout in which the box a press lands in
-/// is the box the previous frame drew.
+/// Laid out left to right from the APP TITLE BOX's right edge (MENUOWN), so an app's menus sit one
+/// constant gap after its name however long the name is — macOS's rule, and the fix for Peter's
+/// *"spaced incorrectly"* on `render9`. [`super::menubar::menus_x0`] is the fallback for a bar with
+/// no caption to follow. The box a press lands in is the box the previous frame drew because THIS
+/// function is the single source for the painter, the hit test and the dropdown anchor alike — not
+/// because the column is a constant.
 ///
 /// A title that would collide with the clock is DROPPED, not squeezed: the strip constructors'
 /// decline rule. So a narrow panel shows the titles that fit and says so through `n`.
@@ -890,7 +892,22 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     };
     if let Some(tree) = tree {
         s.owner = owner;
-        let mut x = bx + menubar::menus_x0();
+        // MENUOWN — **the titles follow the APP TITLE BOX, not a fixed column.** Peter, render9:
+        // *"spaced incorrectly"*. `menus_x0()` was an absolute offset (181 px on the bench panel),
+        // so the visible gap between the app name and its first menu was a function of how long the
+        // name happened to be — 97 px after `console`, 105 after `quarry`, measured off the capture.
+        // Anchoring on the app box's RIGHT EDGE makes that gap `2 * TPAD` always: this box's own
+        // left padding plus the app box's right padding, which is `strip::PAD` — the same gap the
+        // crystal already keeps from the caption. One spacing rule across the whole bar, and it is
+        // derived from the kit's existing constant rather than a new number.
+        //
+        // The fallback is the app box's own origin, for a window with menus and no name: the titles
+        // then start where a caption would have, not 153 px into empty chrome.
+        let mut x = if s.app {
+            s.x[0] + s.w[0]
+        } else {
+            (bx + menubar::menus_x0()).saturating_sub(TPAD)
+        };
         for t in tree.titles.iter().take(MENU_TITLES_MAX) {
             let l = t.label.as_bytes();
             let w = l.len() * CELL_W + 2 * TPAD;
@@ -1348,7 +1365,8 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return false;
     }
     // SO3 — **the BRAND MARK keeps its corner.** Before this arc the title boxes began at
-    // `menus_x0()` (193 px in) and could not reach the crystal; the app box begins one `TPAD` before
+    // `menus_x0()`, then an absolute 193 px in (MENUOWN has since made that accessor the no-caption
+    // FALLBACK anchor and the titles follow the app box), and could not reach the crystal; the app box begins one `TPAD` before
     // the caption's glyphs (22 px — 28 − TPAD 6, since CRYSTALFIX 1046f81c; was 34 under bb513370), and `crystal_corner_abs` runs to `TITLE_X0` (28 = CRYSTAL_SLOT, since 1046f81c; was 40) — so six pixels
     // now belong to two surfaces, and `strip::press_route` asks THIS arm first. Declining them keeps
     // the SHARD menu reachable at every pixel it has always been reachable at; what is lost is six

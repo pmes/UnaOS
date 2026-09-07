@@ -257,16 +257,30 @@ const CRYSTAL_SLOT: usize = strip::PAD + CRYSTAL_W + strip::PAD;
 /// app menus to its right; the caption takes that same slot here.
 const TITLE_X0: usize = CRYSTAL_SLOT;
 
-/// WINMENU (R21) — **the caption's SLOT, which is fixed-width, and where the window's menus begin.**
+/// WINMENU (R21) — **where the window's menus begin WHEN THE BAR NAMES NO APP.**
 ///
-/// The caption is drawn at [`TITLE_X0`] and is between 0 and [`wm::MAX_TITLE`] glyphs long. If the
-/// menu titles began after the caption's RENDERED width they would slide left and right every time
-/// the focused window changed — and a press would then be judged against a layout the operator was
-/// not looking at when they aimed. So the caption gets a slot of its full stored width plus one
-/// glyph of gap, and the menus start at a constant offset whatever is in it. macOS's bar has the same
-/// property for the same reason (its app name is bold and its menus do not reflow under it); the
-/// difference is only that this kernel's caption is bounded, so the slot can be a `const`.
-const MENUS_X0: usize = TITLE_X0 + (wm::MAX_TITLE + 1) * CELL_W;
+/// MENUOWN (Peter, 2026-09-07: *"spaced incorrectly"*). This was a FIXED COLUMN —
+/// `TITLE_X0 + (MAX_TITLE + 1) * CELL_W`, which on the bench's panel is 181 px — and the menus were
+/// laid out there whatever the caption's rendered width. `render9` measured the consequence: `View`
+/// began at x=187 under `console` (ink ending at 89) and at x=187 under `quarry` (ink ending at 81),
+/// so the visible gap between the app name and its first menu was 97 px in one frame and 105 in the
+/// other. A gap that changes size with the length of the word before it is the definition of
+/// spaced wrong, and macOS has no such property: an app's menus sit one fixed gap after its name.
+///
+/// **The argument that produced the fixed column was sound, and was answered elsewhere.** It read:
+/// *"if the menu titles began after the caption's RENDERED width they would slide left and right
+/// every time the focused window changed — and a press would then be judged against a layout the
+/// operator was not looking at when they aimed"*. But the titles ALREADY move under the operator on
+/// every focus change, because which titles exist at all is a property of the focused window; a
+/// stationary column bought no stability, it only bought a variable gap. The press/paint agreement
+/// the argument actually wanted is a different property, and `bar_boxes` has it by construction:
+/// one layout feeds the painter, the hit test and the dropdown anchor.
+///
+/// So the menus now follow the APP TITLE BOX ([`super::winmenu::bar_boxes`]), and this constant is
+/// what is left of the old one: the anchor for a bar with no caption to follow. It is [`TITLE_X0`] —
+/// where the name WOULD have been — so a window with menus and no name puts them where a named
+/// window's name starts, rather than 153 px into empty chrome.
+const MENUS_X0: usize = TITLE_X0;
 
 /// The panel height below which the bar declines.
 ///
@@ -1105,8 +1119,11 @@ pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     Some((bx, by, CRYSTAL_SLOT.min(bw), bh))
 }
 
-/// WINMENU (R21) — **where the focused window's menu titles begin**, as an offset from the bar's own
-/// origin. See [`MENUS_X0`]: a fixed slot, so the titles do not slide when the caption changes.
+/// WINMENU (R21) / MENUOWN — **where the focused window's menu titles begin when the bar names no
+/// app**, as an offset from the bar's own origin. See [`MENUS_X0`].
+///
+/// This is the FALLBACK anchor, not the usual one: with a caption on the bar the titles follow the
+/// app title box, one box gap after the name, and never a fixed column.
 #[inline]
 pub fn menus_x0() -> usize {
     MENUS_X0
