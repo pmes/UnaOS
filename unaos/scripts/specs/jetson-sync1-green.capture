@@ -42,6 +42,24 @@
 ### BOOT B (supstate1) capture will not carry them, and that asymmetry is legitimate;
 ### see the COVERAGE section of scripts/orin-specscore.py for which rules each image
 ### can and cannot fire.
+###
+### 2026-09-07 (orin 20, EVQPRINT): a `[ptrpoll]` line is added at the foot, and it is the
+### SECOND rewritten line in this file, for the same reason as the JD2/JD4 pair. The tail
+### block is a BOOT A shape and carries `[orinfurn] arm click=1`, so `orinclick` is armed
+### and a real capture of this shape WOULD carry `[ptrpoll]` — this file simply predated
+### the row. The text is NOT harvested wire: it is the byte-for-byte output of
+### `ptrpoll_witness`'s CURRENT format string (arch/aarch64/display_tegra.rs), obtained by
+### EXECUTING that literal rather than transcribing it, with the field values taken from
+### the BASELINE line of render9 (~/unaos-bench/scratch/orin19/pointerlag/bootB-render9.log)
+### plus the two terms EVQPRINT added. Every real capture predating EVQPRINT reds on the
+### EVQPRINT FORBID row in jetson-sync1.spec -- correct, not a regression: a spec
+### adjudicates the NEXT flight, and render9 is measured at 27 hits on that row.
+###
+### ⚠ THE ROW'S REGEX IS DELIBERATELY NOT QUOTED IN THIS FILE, and neither should any other
+### spec pattern be. mbench scans EVERY line of a capture, `###` prose included (this file
+### reads 60 lines scanned, not 21), so a pattern written out here is a line the scorer can
+### match. The escaped form happened to be safe by one backslash; that is luck, not design.
+### Name rows here, never quote them.
 :: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
 :: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
 :: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
@@ -73,3 +91,4 @@
 [orinrast] census seq=1 t=120 post=1 late=0 console-owns=1 conwin=1 pidesk=0 final=1 -> RAST-SUPERSEDED-BY-CONSOLE
 [orinstkdepth] depth-consumed=3184 bytes anchor-sp=0xffff000040200000 seam-sp=0xffff0000401ff390 at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
 :: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
+[ptrpoll] t=71 rearm=3 discard=0 errrearm=0 dup=0 nobuf=0 reports=3 base=3 decoded=0 folded=0 foldnew=0 -> BASELINE (the enumeration arms; every later line is measured against this one)
