@@ -467,31 +467,31 @@ fn partition_witness(handle: block::BlockHandle, span: &PartitionSpan) {
         return;
     };
 
-    // Does the mounted volume fit inside that partition? `block_count` is 4096 B blocks; the
-    // partition is counted in 512 B sectors, so eight sectors per block. Checked, not assumed.
-    let fits = span
-        .block_count
-        .checked_mul(8)
-        .map(|s| s <= p.sector_count)
-        .unwrap_or(false);
-
-    // Re-read the superblock magic through the BOUNDED, partition-relative path.
+    // PARTITION-FITS: re-read block 0 through the BOUNDED, partition-relative path — the magic AND
+    // the volume's OWN declared block count, out of the same 512 bytes. The verdict, the witness
+    // line and the overrun scream live in [`span_fit_report`] at EOF, because `panic::Location`
+    // embeds source line numbers: growing a body HERE would rewrite every location string in the
+    // ~2100 lines below it in this arch-neutral module, moving bytes in images (x86 included) that
+    // see no behavioural change at all. This block is line-for-line the size of the one it replaced.
+    //
+    // WHY THE OLD `fits=` COULD NOT READ `NO`. It tested `span.block_count * 8 <= p.sector_count`.
+    // `span.block_count` is set by the unafs crate's `locate_unafs` to `p.sector_count /
+    // SECTORS_PER_BLOCK` off the SAME MBR entry (`libs/fs/unafs/src/adapter.rs`), so the test
+    // reduced to `(n / 8) * 8 <= n` — true for every `n` under floor division. It could fire only
+    // if the crate's `parse_mbr` and the kernel's `decode_mbr` returned different sector counts for
+    // one slot, and both decode the same little-endian u32 at entry offset 12 of the same LBA 0. A
+    // field named for a containment property was reporting a tautology, and it has been read as
+    // evidence the volume was sound. [`span_fit_report`] compares the SUPERBLOCK's declared
+    // `block_count` instead — written at format time, read back off the medium, an INDEPENDENT
+    // source — which is the property `k3_mount_selftest` bit3 asserts and the only one this field's
+    // name ever promised.
     let range = block::PartitionRange::new(handle, &p);
     let mut b0 = [0u8; 512];
-    let magic_ok = range.read_block(0, &mut b0).is_ok()
-        && b0[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC;
-
-    serial_println!(
-        ":: PART: unafs span check — slot={} type=0x{:02x} part=[{}..{}) span_base={} span_blocks={} fits={} magic={} ::",
-        p.slot,
-        p.type_byte,
-        p.start_lba,
-        p.end_lba(),
-        span.base_lba,
-        span.block_count,
-        if fits { "yes" } else { "NO" },
-        if magic_ok { "ok" } else { "MISSING" }
-    );
+    let read_ok = range.read_block(0, &mut b0).is_ok();
+    let magic_ok =
+        read_ok && b0[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC;
+    let sb0 = if magic_ok { Some(&b0) } else { None };
+    span_fit_report(&p, span, sb0, magic_ok);
 }
 
 /// UNAFSBIND: the mount cache entry — the live mount PLUS the handle it was mounted from.
@@ -2613,3 +2613,83 @@ pub fn f2_mutations_selftest() {
 pub static ACL_PERSIST_FLIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "nsspan")]
 pub static ACL_PERSIST_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PARTITION-FITS: the containment verdict, the `unafs span check` witness line, and the overrun
+/// scream — the tail half of [`partition_witness`].
+///
+/// AT EOF ON PURPOSE. `panic::Location` embeds source line numbers, so a body grown mid-file
+/// rewrites every location string below it in this arch-neutral module and moves bytes in images
+/// that see no behavioural change at all. Appending here moves nothing above it — the same
+/// discipline the K9-MASKCUT statics above follow.
+///
+/// WHAT IT COMPARES, AND WHY THAT IS THE FIX. `span.block_count` is the unafs crate's own
+/// `p.sector_count / SECTORS_PER_BLOCK`, so testing it back against `p.sector_count` was a
+/// tautology (see [`partition_witness`]). The superblock's `block_count` is a SECOND, INDEPENDENT
+/// source: it is written at format time and read back off the medium here, through the bounded
+/// partition-relative path. Comparing the two is exactly `k3_mount_selftest` bit3 — which runs on
+/// NEITHER board's flashed image, for two DIFFERENT reasons: on tegra its spawn site sits below
+/// `tegra_early_stop`'s `-> !`; on the Pi it is `witness`-gated and the media `K8_FEATS` omits it.
+/// So on ANY card that boots THIS is the only check; every board, first mount attempt, pass or fail.
+///
+/// `sb0` is `Some` only when the magic just verified on that same read, and that gate is
+/// load-bearing: the bincode-legacy `Superblock` encoding is all fixed-width, so a decode of
+/// arbitrary bytes SUCCEEDS with garbage. A non-UnaFS or unreadable block 0 therefore yields
+/// `sb_blocks=? fits=?` and never a scream. The decode is prefix-only (trailing block padding is
+/// ignored) and deliberately skips `Superblock::from_bytes`, whose `validate` would also reject a
+/// version this build does not know — a format bump must not be reported as a containment breach.
+///
+/// `sb_blocks=` prints on AGREEMENT too, not only on failure. A guard whose input never appears in
+/// the log cannot be read, only trusted, and a trusted field is what this replaced.
+///
+/// SCREAM, NOT REFUSE. `BlockAdapter::for_partition` already bounds every access at
+/// `span.block_count`, so an over-declaring volume is enforced against STRUCTURALLY — it gets
+/// `OutOfBounds`, never a cross-partition access. What was missing was visibility, so an overrun
+/// gets its own line ending `=> FAIL ::`, a builtin mbench FORBID (`scripts/mbench.py`,
+/// `DEFAULT_FORBIDS`): a violation reddens every spec on every board with no spec edit anywhere.
+/// The witness stays advisory about the mount itself, exactly as its own docs promise.
+fn span_fit_report(
+    p: &block::PartitionEntry,
+    span: &PartitionSpan,
+    sb0: Option<&[u8; 512]>,
+    magic_ok: bool,
+) {
+    let declared = sb0.and_then(|b| {
+        ::unafs::codec::deserialize_block::<::unafs::Superblock>(b)
+            .ok()
+            .map(|sb| sb.block_count)
+    });
+    match declared {
+        Some(n) => serial_println!(
+            ":: PART: unafs span check — slot={} type=0x{:02x} part=[{}..{}) span_base={} span_blocks={} sb_blocks={} fits={} magic={} ::",
+            p.slot,
+            p.type_byte,
+            p.start_lba,
+            p.end_lba(),
+            span.base_lba,
+            span.block_count,
+            n,
+            if n <= span.block_count { "yes" } else { "NO" },
+            if magic_ok { "ok" } else { "MISSING" }
+        ),
+        None => serial_println!(
+            ":: PART: unafs span check — slot={} type=0x{:02x} part=[{}..{}) span_base={} span_blocks={} sb_blocks=? fits=? magic={} ::",
+            p.slot,
+            p.type_byte,
+            p.start_lba,
+            p.end_lba(),
+            span.base_lba,
+            span.block_count,
+            if magic_ok { "ok" } else { "MISSING" }
+        ),
+    }
+    if let Some(n) = declared {
+        if n > span.block_count {
+            serial_println!(
+                ":: PART: unafs span check — volume declares {} blocks but MBR slot {} carries only {} => FAIL ::",
+                n,
+                p.slot,
+                span.block_count
+            );
+        }
+    }
+}
