@@ -1959,6 +1959,31 @@ REQUIRE :: TSTE: midden.resolve -> PASS ::
 REQUIRE :: TSTE: midden.precedence -> PASS ::
 FORBID :: TSTE: midden\.\w+ -> FAIL
 
+# --- LIVENESS ANCHORS (orin 19, 2026-09-07; pi 8's grant, scoped to these four directives) ---
+# --- WHY A REQUIRE AND NOT ANOTHER FORBID: mbench's builtin DEFAULT_FORBIDS (mbench.py:135)
+# --- catches a witness that FAILS. It cannot catch a witness that never RAN. Until these lines,
+# --- `shell.relics.*` (12 legs), `layout.*` (3) and `vfsroute.*` (11) had NO named directive in
+# --- ANY spec in this tree -- only `midden.*` above and `fatverb.*` in x86-fat did. So a witness
+# --- family that stopped executing (cfg drift, an early return, a fold that drops the call site)
+# --- was invisible to every spec, and the run still printed green. One anchor per family converts
+# --- that silent absence into a red. Only a REQUIRE catches absence.
+# --- ANCHORS CHOSEN BY OBSERVATION, NOT BY GUESS -- each was read emitting `-> PASS` in
+# --- target/serial-pi.log on this exact config before the directive was written, which is the same
+# --- observe-then-write discipline that stopped `mv.xvol` from asserting a bug (see below).
+# --- `layout.mv` is the deliberate one: it carries FOUR skip paths that print `layout.mv skipped`
+# --- and DO NOT red (rmbp 15). Anchoring on its PASS converts all four silent exits into
+# --- convictable ones. It does not skip on this config -- it moves between /boot and /apps, which
+# --- are ONE volume here -- so the anchor is honest rather than lucky.
+REQUIRE :: TSTE: shell\.relics\.mv -> PASS ::
+REQUIRE :: TSTE: layout\.mv -> PASS ::
+REQUIRE :: TSTE: vfsroute\.route -> PASS ::
+# --- mv.xvol: the cross-VOLUME refusal. `mv` between the native volume and the FAT program volume
+# --- is REFUSED BY VOLUME IDENTITY and must stay refused -- admitting it would relink an UnaFS
+# --- inode into a FAT directory on any board carrying both filesystems on one card. This leg was
+# --- written first to assert the MOVE, went red, and was rewritten to assert the REFUSAL; it reds
+# --- on the VOLID-C1 aliasing regression (make volume_id medium-derived and the move is admitted).
+REQUIRE :: TSTE: shell\.relics\.mv\.xvol -> PASS ::
+
 REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
 #
 # ---    2. THE FIXTURE VERDICT is the stronger statement, and it is why the hash above is not
