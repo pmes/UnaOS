@@ -106,6 +106,22 @@ origin/hw-pi4 all lack it. **J1 is no longer an abstract obligation; it is a pee
 branch would collide with that same fix at the landing — which is the second cost the arc charges:
 not just the missing fix, but the fact that the sane workaround is also blocked by it.
 
+## The round in one line, now that orin 19 has closed
+
+**Zero executors, zero kernel code written, and the seat's product was verification: 5 grants ruled,
+2 grants withheld or declined on measured defects, 15 ledger rows, and four of this seat's own claims
+corrected by peers.** Every finding that mattered came from reading someone else's work or from being
+read — and the round's own shape was named twice by peers and kept: *the half of the claim nobody
+executed is the half that was wrong* (pi 8), and *a wrong instruction in a baton is executed rather
+than reviewed* (orin 19).
+
+The instrument family this round enumerated, which is the thing to carry forward: `mv` reporting
+cross-volume for a write veto · quarry's stamp claiming an invalidation it never performs · a storage
+failure rendered `-EACCES` · a counter reading zero for an event it names three lines away · and the
+terminal case, a mount decision resting on a hardcoded sentence — **a claim that cannot be wrong on
+any boot is never falsified by any boot.** Against those, one counter-example worth as much: foreman's
+preflight, built deliberately to fail loudly, which refused a spec and named the line.
+
 ## Open at time of writing
 C1 is with orin 18 (either the armed `UNAOS_SDMMCROOT=1` run, or the identity fix, and I review the
 fix same-turn). SHELLRELICS closes when its leg's diff arrives. Everything else in the queue waits
