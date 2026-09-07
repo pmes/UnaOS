@@ -36,7 +36,14 @@ the crate, take the size-band hit or negotiate it, route the verbs through the V
 spine). **Named here, not acted on — out of this track's lane.** The Orin side,
 below, is in-lane and does not depend on it.
 
-## 2. Where Orin stands
+## 2. Where Orin stood (2026-08-18 — SUPERSEDED, kept as the starting position)
+
+> **Epoch marker.** Every present-tense claim in this section describes the tree
+> at `122ed63e`, 2026-08-18. Items 1 and 2 have since landed and **falsified the
+> two absences below**: `sdmmc_tegra` now does register with `drivers::block`
+> (`block::register_tegra_sd`), and the card is no longer invisible to the block
+> layer. Read §5a and §5.1 for the current position. This section is retained
+> because it is the problem statement the design answers, not a status report.
 
 The Orin boots from a FAT32 `UNAOS` volume on microSD, and its installer flow
 (`arch/aarch64/sdmmc_tegra.rs`) *creates* FAT: `install::{gpt, fat32}` clone the
@@ -61,7 +68,15 @@ THE CARD first (beside the ESP — same medium, correct layout), and moves to NV
 when that bring-up happens. The card layout is identical either way; only the
 block backend under it changes.
 
-Target card layout (GPT):
+Target card layout (GPT). **Note the divergence from the card actually in the
+bench Orin**, established in §5.1: that card is **MBR**, not GPT — render9 reads
+its volume through `block::mbr_census` at `slot=2 type=0x7f`. It is a
+`make-pi-img.sh` image (the script writes exactly that: MBR entry 2, type
+`0x7f`, at offset 462), i.e. a repurposed Pi 4 card — render9 prints its FAT as
+`label="UNAOS-PI" vol_id=0xabfbdefa`, the Pi label, on the Orin's own boot. The
+GPT layout below remains the design of record; the MBR card is the staging
+medium that got there first, and the two must not be confused when reading a
+wire capture.
 
 | # | Partition | FS | Role |
 | - | --- | --- | --- |
@@ -121,12 +136,24 @@ the mount is attended bench work, not this arc's job.
 Items 1 and 2 landed (TEGRA-SDBLK: `sdmmc_census` publishes the card through
 `block::register_tegra_sd`, `BlockSource::TegraSd` routes `fat.rs` at
 `read_block_tegra_sd`, and `SdSectorDevice::open_on` carries the tegra
-sector-count arm). **Item 3 has not run on any card** — no Orin card carries a
-UnaFS partition — and that is what ledger A28 turned out to be: on render7 the
-desktop's `ls /` and quarry both answered `/: backend error: unafs-mount`,
-because `shell::vfs_mount_table` binds `/` to `NativeBackend` (native UnaFS)
-unconditionally, and `/fat` to `BlockSource::Default`, which no Orin boot ever
-registers. Two mounts, zero volumes.
+sector-count arm). **Item 3 had not been OBSERVED to run** — and that is the
+whole of what could be said, because nothing on the boot path was asking. No
+code read the card's partition table looking for a UnaFS superblock, so the
+absence of a UnaFS partition was this section's *premise*, never its
+*measurement*. **The stronger sentence that stood here until orin 20 — "Item 3
+has not run on any card, no Orin card carries a UnaFS partition" — was false**;
+see §5.1, which convicts it from the wire, and the retraction note closing this
+section.
+
+What ledger A28 turned out to be: on render7 the desktop's `ls /` and quarry
+both answered `/: backend error: unafs-mount`, because
+`shell::vfs_mount_table` binds `/` to `NativeBackend` (native UnaFS)
+unconditionally, and `/fat` to `BlockSource::Default`, which no Orin boot had
+been observed to register. That is `Default=absent-so-far`, a statement about
+the boot SEQUENCE (the global slot is claimed by the USB stick if and when xHCI
+enumerates), not `Default=absent` as a property of the machine — the very
+distinction §5.1 had to introduce at the code site. Two mounts, and on the
+evidence then in hand, no volume either mount could reach.
 
 Item 4 is therefore taken at the layer the medium can serve today, behind
 `UNAOS_SDMMCROOT=1` (cargo `sdmmcroot`, ⇒ `sdmmc`; default OFF ⇒ byte-identical):
@@ -135,9 +162,9 @@ Item 4 is therefore taken at the layer the medium can serve today, behind
   READ-ONLY (`write_veto` on the source, and `write_block_tegra_sd` refuses in
   every cfg — the card's only writer is still the armed ladder).
 - `/fat` re-points at the **same** volume. It named the unregistered `Default`
-  device, and it is not decoration: `/fat` is `shell::EXEC_ROOT` (the second
-  probe of `exec_resolve`, which is why a bare `vug` works from anywhere) and
-  the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
+  device, and it is not decoration: `/fat` was then the execution namespace (the
+  second probe of `exec_resolve`, which is why a bare `vug` works from anywhere)
+  and the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
   and quarry's double-click route. Unmounting it would trade one dead namespace
   for another; re-pointing it is what lets the desktop launch anything. Two
   adapters over one source is safe — `FatBackend` re-mounts per call and holds
@@ -162,6 +189,35 @@ FAT returns to the boot-shim role §3 gives it; `sdmmc_root_bind` is the one
 place that changes. Code: `arch/aarch64/sdmmc_tegra.rs` §ROOTFS,
 `fs/vfs.rs`'s tail `FatBackend::new_tegra_sd`, and one cfg-gated statement in
 `shell::vfs_mount_table`.
+
+#### Retraction (orin 20, DOCTRUTH) — what this section got wrong, and its class
+
+The sentence that stood at the head of this section from `45d02b4b`
+(orin 16, 2026-09-06) until orin 20 read: *"Item 3 has not run on any card — no
+Orin card carries a UnaFS partition."* **It was false**, and the card in the
+bench Orin had a UnaFS volume at MBR slot 2 with `magic=ok` while it stood.
+
+The class is the one this whole arc exists to delete: **an absence asserted
+rather than derived.** It is the prose twin of the code defect §5.1 convicts —
+`sdmmc_root_bind` printing *"unafs has no volume here"* as a string literal
+three lines after its own probe had printed `MOUNTED`. Neither claim came from
+a check that could have failed, so neither was ever falsified by flying. The
+code got a `FORBID` rule; the sentence had nothing watching it.
+
+It is recorded rather than quietly corrected for two reasons. First, provenance:
+a reader who finds the correction alone cannot tell whether the doc was wrong or
+merely late, and that difference decides how much of the rest to trust. Second,
+`c3abd946` — the commit that *disproved* the sentence, in §5.1 below — **left it
+standing 47 lines above its own refutation**, so the document shipped
+self-contradictory for a round. Correcting a document by accretion, adding the
+true section without retracting the false one, is its own defect: every reader
+who stops at §5a gets the old answer, and nothing in the file tells them to keep
+reading. **A correction that does not retract is not a correction.**
+
+Also corrected in this pass, same audit: `/fat` was cited here as
+`shell::EXEC_ROOT`; `EXEC_ROOT` is `"/apps"` (`shell.rs`), and the sentence has
+been dated instead. See §5.1's size note for the volume/partition correction,
+and §2 and §3 for two further stale absences found by the same sweep.
 
 ### 5.1 UNAFSROOT (orin 20) — item 3 HAPPENED, and item 4 did not notice
 
@@ -250,12 +306,30 @@ Two things could still make an operator want `/` elsewhere. **Neither of them is
   anything this file could weaken. That refusal is asserted, not hidden: a
   correctly-reported refusal is the fixed behaviour, the same posture `XVOL`
   takes on the cross-volume `mv`.
-- **Size — and it is 8 MiB, not 1 MiB.** `PartitionSpan::block_count`
-  (`libs/fs/unafs/src/adapter.rs`) counts **whole 4096 B blocks**, so render9's
-  `span_blocks=2048` is 8 MiB. The wire corroborates independently:
-  `part=[114688..131072)` is 16384 sectors x 512 B = 8 MiB, and `fits=yes` with
-  2048 x 8 = 16384 means the volume fills its partition exactly. Reading
+- **Size — the PARTITION is 8 MiB, not 1 MiB; the VOLUME in it is 4 MiB.**
+  `PartitionSpan::block_count` (`libs/fs/unafs/src/adapter.rs`) counts **whole
+  4096 B blocks**, so render9's `span_blocks=2048` is 8 MiB. Reading
   `block_count` as 512 B sectors gives the 1 MiB figure, an 8x undercount.
+
+  **But `span_blocks` is a property of the PARTITION, and cannot report the
+  volume at all.** `locate_unafs` sets `block_count = p.sector_count /
+  SECTORS_PER_BLOCK` from the MBR entry (`adapter.rs`), so it is the partition's
+  size by construction, whatever volume sits inside. `fits` then evaluates
+  `block_count * 8 <= p.sector_count` on that same partition
+  (`fs/unafs.rs`) — i.e. `(sector_count / 8) * 8 <= sector_count`, which floor
+  division makes true for every input. **`fits=yes` is therefore not evidence
+  that the volume fills the partition; it is barely evidence of anything**, and
+  the earlier reading of it here — "2048 x 8 = 16384 means the volume fills its
+  partition exactly" — was an over-read of a check that cannot fail.
+
+  The bench card is a **4 MiB volume inside the 8 MiB partition**. That is not
+  visible on the read-only probe path — nothing there reads the volume's own
+  size — and it was established by the orin 20 `unafsgrow` arc, which built the
+  falsifier: a deliberately-built 4 MiB volume laid into the same 8 MiB tail
+  still reports `span_blocks=2048`. The writer side agrees at this base:
+  `make-pi-img.sh` reserves `UNAFS_MB=8` and admits any image with
+  `UNAFS_BYTES <= UNAFS_MB * 1024 * 1024` — **`<=`, not `==`** — so a volume
+  smaller than its partition is the expected case, not an anomaly.
 
 Making the volume writable, and growing it, are separate arcs. Section §3's
 layout is still the layout of record; what changed here is only that `/` now
@@ -266,9 +340,10 @@ believes the card.
 `entries=` on the census reports the **native volume's** root from now on, not
 the FAT ESP's, so the count will change and may be zero. That is a statement
 about what the installer wrote into the 8 MiB partition, not about the binding.
-`shell::layout_volid`'s probe degrades honestly on an empty root (it prints
-`lists no file — ls/cat/stat legs skipped`), and its `vfsroute.samevol` leg
-keeps passing because its oracle is observed rather than reported: with `/` on
+The `vfsroute` probe degrades honestly on an empty root (`shell.rs`: it prints
+`:: vfsroute: the root volume (…) lists no file — ls/cat/stat legs skipped ::`),
+and its `vfsroute.samevol` leg keeps passing because its oracle is observed
+rather than reported: with `/` on
 UnaFS and `/boot` on FAT the Orin now takes the **Pi's** shape, where the two
 prefixes genuinely are two filesystems.
 
