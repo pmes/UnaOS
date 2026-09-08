@@ -4359,37 +4359,171 @@ build_cfg_legs() {
 # an edit is most likely to break, so their diagnostics stay at the top of the scrollback. A red mix
 # leg names the leg AND its exact `--features` string, because the label alone ("x86-mix-3") does not
 # tell you which configuration broke and the whole point of these legs is to name the configuration.
+# ── GATE-CFG-PAR: the matrix runs P-wide, each slot owning its own --target-dir ────────────────
+#
+# WHY. The matrix was the gate: orin 21 measured it at 75.6% of a cold `./arroyo check` (557 s of
+# 737) and 98.8% of a warm one (155 s of 157). Every leg is one single-threaded `cargo check` of the
+# same crate — one core of twenty, 55 times in a row.
+#
+# ORIN 21's EXPLANATION FOR THE WARM 155 s WAS THRASH — each leg evicting the last from the one
+# shared `target/`. **That does not reproduce on this tree, and this comment says so rather than
+# inheriting it.** Re-measured here, 55 legs, every leg under `/usr/bin/time`
+# (`~/unaos-bench/scratch/orin22/matrixpar/`: `measure.sh`, `addendum.sh`, `measure.table`):
+#
+#   serial, DEFAULT dir, matrix cold in it        387.2 s   7.03 s/leg wall   6.98 s/leg CPU
+#   serial, DEFAULT dir, immediately again          3.1 s   0.05 s/leg wall   0.05 s/leg CPU
+#   serial, DEFAULT dir, after `./arroyo test-arm`  3.2 s   0.05 s/leg wall   0.05 s/leg CPU
+#   P=1, all 55 legs on slot0, cold               474.2 s   8.61 s/leg
+#   P=1, all 55 legs on slot0, again                3.9 s   0.06 s/leg
+#   P=6, slots cold                               152.5 s   (leg-CPU sum 983.9 s)
+#   P=6, slots warm                                 1.2 s   0.08 s/leg
+#   P=6, slots warm after `./arroyo test-arm`       1.2 s   0.08 s/leg
+#
+# A dir that has built a leg's fingerprint KEEPS it. Fifty-five fingerprints in ONE dir re-check at
+# 0.05 s/leg, and another verb running in that same dir does not disturb them. There is no eviction
+# here to fix. What probe (F) really priced — and what reproduces here exactly — is FIRST BUILD IN A
+# GIVEN DIR, 6–9 s: under `UNAOS_CHECK_P=1` the legs that re-checked in ≤0.3 s were EXACTLY the 8
+# that had owned slot0 in the previous P=6 run (identical sets), and the other 47 cost 5.30–7.90 s.
+#
+# SO THE WIN IS COLD, AND IT IS THE PARALLELISM: 387.2 → 152.5 s, 2.54×, −234.7 s. Warm is ~2 s
+# either way and no reason on its own to have built any of this. **The per-slot dirs are not the
+# saving; they are what MAKES the parallelism possible**, because P cargos sharing one target dir
+# serialise on its build lock. The price, stated because it is real: 2.4 GB of disk, and 2.56× the
+# total CPU (leg-CPU sum 383.8 → 983.9 s) since each slot builds its own
+# `core`/`alloc`/`compiler_builtins`. For the same reason `UNAOS_CHECK_P=1` is SLOWER than the old
+# serial path on a cold slot (474.2 s vs 387.2 s) — it is a debugging mode, not a fast path.
+#
+# THE MAP IS KEYED BY LEG NAME, NEVER BY LIST POSITION. `cksum(leg) % P`. The prototype used
+# `index % P`, which is fine for one run and wrong as a shipped rule: inserting ONE row shifts every
+# later leg onto a slot dir that never built its fingerprint, and the table above prices that
+# migration at 6–9 s per moved leg. Measured on this tree: insert one leg into the 55-leg list at
+# P=6 and the number that change slot is 0 under the name key and 52 under the index key. Renaming
+# a leg does move it — the honest cost of a name key, and a rename is rare and deliberate.
+#
+# SCHEDULING IS BY SLOT, NOT BY LEG. There are exactly P workers, worker N owning `slot<N>` and
+# running ITS legs sequentially. The alternative — a P-wide pool over the leg list — lets two legs
+# that hash to the same slot run at once, and cargo would then serialise them on the target dir's
+# build lock anyway while holding a worker idle. One worker per dir is the only shape in which a
+# name-keyed map cannot self-collide. The cost is that the slots are unequal (8/12/11/9/9/6 at 55
+# legs, P=6); the wave is as long as its longest slot.
+#
+# WHAT IS PRESERVED, EXACTLY. Same legs, same order in the list, same flags, same per-leg rc, same
+# `→` / `✅` / `❌` lines and counts, same `configuration:` line on a red, same return code. Each leg's
+# cargo output is captured to a file and REPLAYED IN LIST ORDER after the wave, so the board legs'
+# diagnostics still sit at the top of the scrollback (the invariant the comment above states) and
+# nothing interleaves. The live `·` heartbeat lines DO interleave — that is what they are for — so
+# each one names its own leg and slot and carries its own rc; no red is ever anonymous.
+#
+# A LEG THAT NEVER RAN IS NOT A LEG THAT PASSED. The wave's result for a leg is a `<leg>.rc` file
+# written after cargo returns; the replay asserts legs-run == legs-listed and reds on a mismatch,
+# naming the missing legs. Without that assert a worker that died, or a feed line that got dropped,
+# would simply subtract legs from the matrix and the gate would stay green — the exact silent-hole
+# failure mode the knob→leg check below exists to stop in the other direction.
+#
+# DISK. ~400 MB per populated slot — 2.4 GB total at the default P=6, measured on THIS tree after a
+# cold P=6 run (`du -sh`: slot0 389 M … slot5 371 M; orin 21 measured ~417 MB/slot on its own tree).
+# It lives under `target/check-slots/`, which `target` already gitignores and `rm -rf target` cleans.
+# `UNAOS_CHECK_P=1` is serial-in-slot-dirs (one slot, one worker); `UNAOS_CHECK_P` is read once here
+# and stated in the banner along with the disk cost.
+#
+# NOT MEASURED, so not claimed: why orin 21's tree showed a 155 s warm serial matrix at all when
+# this one shows 3.1 s. Their REPORT §6 addendum already recorded the mechanism as unestablished;
+# this arc did not establish it either, and the two trees differ in more than one way. What is
+# established here is the table above and nothing beyond it.
+_cfg_slot_of() {
+    # Stable leg→slot: keyed by the leg NAME so inserting a row cannot migrate its neighbours.
+    local _h; _h="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+    echo $(( _h % $2 ))
+}
+_cfg_slot_worker() {
+    # One worker per slot dir. Reads the whole feed, runs only its own rows, in list order.
+    local _s="$1" _res="$2" _slotbase="$3"
+    local _fs _fleg _ftgt _ffeats _t0 _t1 _lrc
+    while IFS=$'\t' read -r _fs _fleg _ftgt _ffeats; do
+        [ "$_fs" = "$_s" ] || continue
+        _t0=$(date +%s.%N)
+        # `if ... else` (not a bare command) so `set -e` cannot abort the worker on the first red leg.
+        if cargo +nightly check --release --target "$_ftgt" $NIGHTLY_FLAGS --features "$_ffeats" \
+             --target-dir "${_slotbase}/slot${_s}" > "${_res}/${_fleg}.log" 2>&1; then _lrc=0; else _lrc=$?; fi
+        _t1=$(date +%s.%N)
+        # `.t` first, `.rc` LAST: the rc file is the "this leg ran" token the count check consumes,
+        # so it must not exist until the leg has actually finished.
+        printf '%s %s %s\n' "$_t0" "$_t1" "$_s" > "${_res}/${_fleg}.t"
+        printf '%s\n' "$_lrc" > "${_res}/${_fleg}.rc"
+        echo -e "${COLOR_CYAN}  · ${_fleg} (slot ${_s}) $(awk "BEGIN{printf \"%.1f\", ${_t1}-${_t0}}")s rc=${_lrc}${COLOR_RESET}"
+    done < "${_res}/feed"
+    return 0   # a red leg is recorded in its .rc file, never in this worker's exit status
+}
 check_kernel_cfg() {
     local _rc=0 _n=0 _failed=""
     local _row _leg _tgt _feats
     local -a _rows=()
     build_cfg_legs || return 1
     _rows=("${KERNEL_CFG_MATRIX[@]}" "${KERNEL_CFG_MIX[@]}" "${KERNEL_CFG_SWEEP[@]}")
+    local _p="${UNAOS_CHECK_P:-6}"
+    case "$_p" in ''|*[!0-9]*|0) _p=6 ;; esac
+    # A slot with no legs is a wasted fork and a slot dir nothing ever populates; clamp rather than
+    # let `UNAOS_CHECK_P=200` fork 200 workers to run 55 legs.
+    [ "$_p" -le "${#_rows[@]}" ] || _p="${#_rows[@]}"
+    local _slotbase="$WORKSPACE_DIR/target/check-slots"
+    local _res="$_slotbase/.results"
+    rm -rf "$_res"; mkdir -p "$_res"
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: kernel cfg-gated coverage (${#_rows[@]} legs)...${COLOR_RESET}"
     if [ "${UNAOS_CFG_SWEEP:-0}" != "1" ]; then
         echo -e "${COLOR_CYAN}  (${#KERNEL_CFG_MATRIX[@]} board + ${#KERNEL_CFG_MIX[@]} x86 pairwise-mix; UNAOS_CFG_SWEEP=1 adds the per-feature sweep)${COLOR_RESET}"
     fi
-    cd "$WORKSPACE_DIR/crates/kernel"
+    echo -e "${COLOR_CYAN}  (P=${_p} — UNAOS_CHECK_P; leg→slot = cksum(leg name) % P; per-slot target dirs target/check-slots/slot0..$((_p - 1)), ~400 MB of disk per populated slot)${COLOR_RESET}"
+    # The feed the workers consume. Built here, from _rows, in list order — so legs-listed
+    # (${#_rows[@]}) and legs-fed are the same statement, and the count check below is what proves
+    # legs-RUN is too.
+    : > "$_res/feed"
     for _row in "${_rows[@]}"; do
         read -r _leg _tgt _feats <<< "$_row"
-        _n=$((_n + 1))
+        printf '%s\t%s\t%s\t%s\n' "$(_cfg_slot_of "$_leg" "$_p")" "$_leg" "$_tgt" "$_feats" >> "$_res/feed"
+    done
+    cd "$WORKSPACE_DIR/crates/kernel"
+    local _s
+    for (( _s = 0; _s < _p; _s++ )); do
+        _cfg_slot_worker "$_s" "$_res" "$_slotbase" &
+    done
+    wait || true
+    cd "$WORKSPACE_DIR"
+    # ── replay, in list order: the serial gate's output, verbatim, once the wave is done ──
+    local _ran=0 _missing=""
+    for _row in "${_rows[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
         echo -e "${COLOR_CYAN}  → ${_leg}${COLOR_RESET}"
-        # `if ... else` (not a bare command) so `set -e` cannot abort the loop before every leg has run.
-        if cargo +nightly check --release --target "$_tgt" $NIGHTLY_FLAGS --features "$_feats"; then
-            echo -e "${COLOR_GREEN}  ✅ ${_leg}${COLOR_RESET}"
+        if [ -f "$_res/${_leg}.rc" ]; then
+            _ran=$((_ran + 1))
+            # `if`, not `[ -s … ] && cat …`: an AND-list whose test fails returns 1 as a statement,
+            # and `set -e` (line 18) would take the whole gate down on the first leg whose cargo
+            # output happened to be empty.
+            if [ -s "$_res/${_leg}.log" ]; then cat "$_res/${_leg}.log"; fi
+            if [ "$(cat "$_res/${_leg}.rc")" = "0" ]; then
+                echo -e "${COLOR_GREEN}  ✅ ${_leg}${COLOR_RESET}"
+            else
+                echo -e "${COLOR_RED}  ❌ ${_leg} — unaos-kernel FAILED to compile${COLOR_RESET}"
+                # Name the CONFIGURATION, not just the leg. For the board legs the label already implies
+                # it; for a derived mix/sweep leg the feature string IS the finding — it is the thing the
+                # author has to reproduce, and reconstructing it from a label costs a round-trip.
+                echo -e "${COLOR_RED}     configuration: --target ${_tgt} --features ${_feats}${COLOR_RESET}"
+                _failed="${_failed} ${_leg}"
+                _rc=1
+            fi
         else
-            echo -e "${COLOR_RED}  ❌ ${_leg} — unaos-kernel FAILED to compile${COLOR_RESET}"
-            # Name the CONFIGURATION, not just the leg. For the board legs the label already implies
-            # it; for a derived mix/sweep leg the feature string IS the finding — it is the thing the
-            # author has to reproduce, and reconstructing it from a label costs a round-trip.
-            echo -e "${COLOR_RED}     configuration: --target ${_tgt} --features ${_feats}${COLOR_RESET}"
-            _failed="${_failed} ${_leg}"
+            echo -e "${COLOR_RED}  ❌ ${_leg} — leg NEVER RAN (no result from the P=${_p} wave)${COLOR_RESET}"
+            _missing="${_missing} ${_leg}"
             _rc=1
         fi
     done
-    cd "$WORKSPACE_DIR"
+    if [ "$_ran" -ne "${#_rows[@]}" ]; then
+        echo -e "${COLOR_RED}❌ kernel cfg coverage: legs-run ${_ran} != legs-listed ${#_rows[@]} — vanished leg(s):${_missing}${COLOR_RESET}"
+        echo -e "${COLOR_RED}   A leg that never ran is not a leg that passed. Do not read this run as coverage.${COLOR_RESET}"
+        _rc=1
+    fi
+    _n="$_ran"
     if [ "$_rc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ kernel cfg coverage FAILED (crate unaos-kernel), legs:${_failed}${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ kernel cfg coverage FAILED (crate unaos-kernel), legs:${_failed}${_missing}${COLOR_RESET}"
         return 1
     fi
     # ── KNOB→LEG COVERAGE CHECK (2026-08-27, rmbp 7) ────────────────────────────────────────────
