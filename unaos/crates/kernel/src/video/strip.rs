@@ -817,8 +817,8 @@ const _: () = {
 // (`~/unaos-bench/capture/line-acm0/orin.log`, boot at lines 106765..126738) carries 530
 // `scope=window` rollups, 363 `scope=live`, 5 `scope=desktop` and ONE `scope=fills`. **There is no
 // `bar` scope and there never was.** The only `torn=` counter on the wire for that boot belonged to
-// `[wc-h] rollup … scope=window`, which measures a WINDOW's staged present, so it read `torn=0` for
-// the whole boot while a human watched the taskbar tear. `[wc-k] rollup scope=fills`, which does
+// `[wc-h] rollup … scope=window`, which measures a WINDOW's staged present: torn=0 across the
+// close (emits 22/23), torn=1 at emits 30-36 ~20 s later. `[wc-k] rollup scope=fills`, which does
 // carry a `torn=` over the DESKTOP-erase path, is a one-shot at its fourth sample: it printed at
 // line 108593 and the close happened at 111570, ~3000 lines later, with nothing to re-read it.
 //
