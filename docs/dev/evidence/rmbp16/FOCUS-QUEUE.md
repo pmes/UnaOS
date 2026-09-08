@@ -158,6 +158,12 @@ source lines, so line-neutral or tail-append only.
   `grep -c UNAOS_DMAWIN unaos/arroyo` = **0**, while `arch/aarch64/rtl8168_tegra.rs:4255` reads
   `option_env!("UNAOS_DMAWIN")`. `UNAOS_FBW` / `UNAOS_FBH` are the same class. One pass: enumerate
   `option_env!` reads from source as a second universe and rule each one.
+  **⚠ Class NARROWED 2026-09-08, by being wrong at a peer: NEGATIVE knobs are NOT the blind spot.
+  `arroyo:982` spells `UNAOS_NOTEGRASMP` as a guard ON a `_feats` line, so the parse sees it and
+  `k8-reach.registry:53` already carries its row. **A knob is inside the universe if it appears on
+  a `_feats` line in ANY polarity**; the blind spot is `option_env!` reads armed by no `_feats`
+  line at all. Same check found a live gotcha for orin: `k8-reach.py:25` REDS an unregistered
+  knob, so `UNAOS_NOSDMMC` needs a registry row in the same commit that adds it.
 - **B47 — `HOST_VERBS` ↔ dispatch-arm, in BOTH set directions.** Table at
   `unaos/libs/sys/midden_core/src/lib.rs:245` (use sites :336, :491), arms in `shell.rs`. Two verbs
   answered "Unknown command" for their entire existence while a comment claimed the invariant held.
