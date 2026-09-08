@@ -372,11 +372,11 @@ static NOWORD_SAID: AtomicBool = AtomicBool::new(false);
 pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)) -> bool {
     let (x, y, w, h) = r;
     if w == 0 || h == 0 || w > MAX_STRIP_W {
-        return false;
+        return bar_decline(name, DECL_GEOM); // TEARSCOPE — counted, still `false`
     }
     let fb = *super::WRITER.lock();
     if !fb.is_ready() {
-        return false;
+        return bar_decline(name, DECL_READY); // TEARSCOPE
     }
     if !fb.word4() {
         // Said ONCE for the whole primitive rather than once per tenant: the condition is a property
@@ -389,14 +389,15 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
                 name
             );
         }
-        return false;
+        return bar_decline(name, DECL_WORD); // TEARSCOPE
     }
     let info = fb.info();
     if x + w > info.width || y + h > info.height {
-        return false;
+        return bar_decline(name, DECL_GEOM); // TEARSCOPE
     }
     let Some(mut s) = SCRATCH.try_lock() else {
-        return false; // contended: the next pass repaints (the signature is still unmatched).
+        // contended: the next pass repaints (the signature is still unmatched).
+        return bar_decline(name, DECL_LOCK); // TEARSCOPE
     };
 
     // CURSOR — take the arrow off the panel before the first byte lands. `wm::erase`'s bracket, and
@@ -405,6 +406,11 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     // `true`, which upgrades the pass's cursor tail to `Repaint`).
     super::cursor::undraw();
 
+    // TEARSCOPE — the PRESENT clock opens here, at the first byte, and closes after `flush_rect`.
+    // It brackets exactly what reaches the SCAN-OUT and nothing else: the compose of each row happens
+    // inside it because a strip composes row-by-row INTO the panel, which is the whole reason a bar's
+    // present can outrun the beam where a window's staged blit cannot. See [`bar_painted`].
+    let tp0 = crate::arch::now_cycles();
     let stride_b = info.stride * 4;
     for j in 0..h {
         compose_row(&mut s.log[..w], j);
@@ -428,6 +434,8 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
         fb.blit(off, bytes);
     }
     fb.flush_rect(x, y, w, h);
+    // TEARSCOPE — record what this present cost against what the beam spends on the same rows.
+    bar_painted(name, r, crate::arch::now_cycles().saturating_sub(tp0), info.height);
     true
 }
 
@@ -696,6 +704,10 @@ pub fn compose_all() -> bool {
     // reason, painted AFTER it so a window menu is the topmost surface on the panel while it is down.
     // Cheap when closed: two relaxed atomics and a return. The `|` is still not `||`.
     let d = super::winmenu::compose();
+    // TEARSCOPE — the bar's census speaks from here, at the furniture tail, AFTER every tenant has
+    // had its damage test. Rate- and delta-gated (see `bar_rollup_one`), so a pass that changed
+    // nothing costs five relaxed loads and five compares.
+    bar_rollup_tick();
     a | b | c | d
 }
 
@@ -792,4 +804,499 @@ const _: () = {
     assert!(MAX_STRIP_W >= 2048);
     // A margin of zero would make `frame_centred` and `frame_flush` the same function.
     assert!(PAD > 0);
+};
+
+// ---------------------------------------------------------------------------
+// TEARSCOPE — the BAR's own census
+// ---------------------------------------------------------------------------
+//
+// # Why this exists, and what the render9 capture proved was missing
+//
+// Peter, at the bench on the render9 flight, 2026-09-07: *"there was major tearing on the ends of the
+// taskbar when i closed pulse that went away when i reopened"*. The capture
+// (`~/unaos-bench/capture/line-acm0/orin.log`, boot at lines 106765..126738) carries 530
+// `scope=window` rollups, 363 `scope=live`, 5 `scope=desktop` and ONE `scope=fills`. **There is no
+// `bar` scope and there never was.** The only `torn=` counter on the wire for that boot belonged to
+// `[wc-h] rollup … scope=window`, which measures a WINDOW's staged present: torn=0 across the
+// close (emits 22/23), torn=1 at emits 30-36 ~20 s later. `[wc-k] rollup scope=fills`, which does
+// carry a `torn=` over the DESKTOP-erase path, is a one-shot at its fourth sample: it printed at
+// line 108593 and the close happened at 111570, ~3000 lines later, with nothing to re-read it.
+//
+// So the bar had no instrument at all, and this is it.
+//
+// # What owns the bar's pixels, and why the metrics are the ones they are
+//
+// [`paint`] is the single front-buffer writer for every furniture surface — dock, menubar, and the
+// two transient dropdowns. It composes each row in cached RAM and `blit`s it straight into the
+// SCAN-OUT; there is no back buffer and no compositor present in front of it. That is the
+// load-bearing difference from a window, and it is why `torn=` here is a stronger claim than the
+// `[wc-h]` one rather than a weaker one: a window's pixels are staged and published, a strip's are
+// written under the beam. The definition is `wcg::erase_note`'s, unchanged — a present whose
+// wall-clock duration exceeds the time the beam spends on the rows it covered
+// (`rectscan_us = FRAME_US * h / panel_h`) could have been overtaken.
+//
+// **`torn=` is nevertheless not the metric that scores Peter's episode, and saying so is the point.**
+// A bar is short. The dock on the bench panel is ~64 rows of 1200, so `rectscan_us` is ~889 µs and
+// the measured `paint=124us` on the render9 `[dock] live` lines sits comfortably under it. `torn=` on
+// a healthy bar reads 0 STRUCTURALLY, and an instrument whose headline number cannot move is the
+// defect this arc was sent to remove. It is kept because it is honest, cheap, and the one thing that
+// would catch a genuinely slow bar paint — but the census below carries the fields that actually
+// distinguish *"repainted correctly"* from *"left stale"* over the span a shrinking strip uncovers.
+//
+// # The uncovered span, which is what "the ends of the taskbar" names
+//
+// The dock is `frame_centred(Edge::Bottom, …)` (`super::dock::Layout::for_panel`, via
+// [`frame_centred`]) and is AUTO-SIZED TO ITS TILES. Close a window and the tile count changes, so
+// the strip narrows — and because it is CENTRED, the pixels it stops owning are at BOTH ENDS.
+// `dock`'s own comment names the symptom, written before any instrument could see it: *"a strip that
+// shrinks … would leave its old ends standing on the panel until something else happened to paint
+// over them"*. [`erase_rect`] is the only thing that repaints them, and it can DECLINE (a contended
+// [`SCRATCH`], a surface that is not ready).
+//
+// [`vacate`] is [`erase_rect`] with that question asked out loud. It computes the UNCOVERED area —
+// the part of the old rect the new rect does not cover — so a strip that GROWS (old inside new, the
+// common case through a boot) correctly owes nothing, and only a shrink or a move can move the
+// counters that matter. `owed=` records whether the CALLER keeps the debt when the erase declines: a
+// site that re-publishes its slot regardless has FORGOTTEN the span, and no later pass is coming
+// back for it.
+//
+// # What is deliberately NOT claimed
+//
+// `flat=` counts an uncovered span that WAS erased, successfully, to flat `wm::DESKTOP_BG` — which is
+// the only colour [`erase_rect`] paints — with no backdrop repaint requested. On a board whose
+// desktop is a SCENE (`super::desktop_scene_owns_backdrop()`, which is what
+// `[orinrender] census … strip=retired` reports) that is a flat slab where scene content belongs. It
+// is REPORTED and `scene=` says whether it can be seen; whether it is what Peter saw is a question
+// for the next capture, not for this comment. `super::crystal` and `super::winmenu` already call
+// their own `repaint_vacated` after an erase and are the precedent; `dock` and `menubar` do not.
+//
+// **This module counts. It changes no paint order, no damage propagation and no return value.**
+// [`vacate`] returns exactly what [`erase_rect`] returned, and every caller uses it exactly as it
+// used the call it replaced.
+
+/// One 60 Hz frame, in microseconds — the constant `[wc-h]` and `[wc-k]` both print as `frame_us=`.
+///
+/// Duplicated rather than imported: `super::wcg` is `#[cfg(feature = "witness")]` and this module is
+/// not, and the bar's census has to reach the METAL image — which is built WITHOUT `witness` — or it
+/// is not a claim about the panel Peter watches. `wcg::FRAME_US` is the original; the two must stay
+/// equal, and this is the only copy.
+const FRAME_US: u64 = 16_667;
+
+/// Decline reason: the shared [`SCRATCH`] was contended, so this pass painted nothing.
+const DECL_LOCK: usize = 0;
+/// Decline reason: the surface is not ready.
+const DECL_READY: usize = 1;
+/// Decline reason: the surface is not the 4-byte word layout the row-run path covers.
+const DECL_WORD: usize = 2;
+/// Decline reason: a zero, oversized, or off-panel rect.
+const DECL_GEOM: usize = 3;
+
+/// How many decline reasons [`paint`] has. One per arm, and the array is indexed by the constants
+/// above, so an arm added without a constant fails the BUILD rather than landing in the wrong bucket.
+const DECL_KINDS: usize = 4;
+
+/// How many tenants the census tracks: the two registered strips, the two transient dropdowns that
+/// also paint through [`paint`], and a catch-all.
+const BAR_SLOTS: usize = 5;
+
+/// The census slot names, in slot order. Slot [`BAR_OTHER`] catches a name this table does not know,
+/// so a furniture surface added without touching this array is REPORTED under `tenant=other` rather
+/// than silently dropped.
+const BAR_NAMES: [&str; BAR_SLOTS] = ["dock", "menubar", "crystal", "winmenu", "other"];
+
+/// The catch-all slot. See [`BAR_NAMES`].
+const BAR_OTHER: usize = 4;
+
+/// How often a tenant's `scope=bar` rollup may speak. The [`Ledger`]'s own cadence, so a capture
+/// carries the census and the cost ledger for the same strip side by side and at the same rate.
+const BAR_ROLLUP_US: u64 = ROLLUP_PERIOD_US;
+
+/// One-shot latch: the STALE-ENDS evidence line has been printed for this tenant.
+///
+/// The rollup is rate-limited to [`BAR_ROLLUP_US`] and Peter's episode is instantaneous, so the COUNT
+/// lives on the rollup and the EVIDENCE gets its own line at the moment it happens. That is
+/// `[wc-k] rollup scope=starve`'s precedent, adopted for its reason: a verdict is only worth having
+/// if the boot can still trip it after the rollup has spoken.
+const SAID_STALE: u64 = 1;
+/// One-shot latch for the retryable half of the same fault.
+const SAID_UNERASED: u64 = 2;
+/// One-shot latch for a bar present that outran the beam.
+const SAID_TORN: u64 = 4;
+
+/// Per-tenant bar census.
+///
+/// Every field is a MONOTONE TOTAL, incremented once per event at record time; nothing here is a
+/// delta and printing does not reset it. A rollup line is therefore a snapshot, and the reader's rule
+/// is `[wc-h]`'s: take the GREATEST `emit=` for each `tenant=`, never sum lines.
+struct BarCensus {
+    paints: AtomicU64,
+    paint_px: AtomicU64,
+    maxpaint_us: AtomicU64,
+    minpaint_us: AtomicU64,
+    scan_us: AtomicU64,
+    torn: AtomicU64,
+    declines: AtomicU64,
+    decl: [AtomicU64; DECL_KINDS],
+    vacates: AtomicU64,
+    uncovered: AtomicU64,
+    uncovered_px: AtomicU64,
+    unerased: AtomicU64,
+    unerased_px: AtomicU64,
+    forgotten: AtomicU64,
+    flat: AtomicU64,
+    flat_px: AtomicU64,
+    rect: AtomicU64,
+    emit: AtomicU64,
+    t0: AtomicU64,
+    last: AtomicU64,
+    lastcensus: AtomicU64,
+    said: AtomicU64,
+}
+
+impl BarCensus {
+    const fn new() -> BarCensus {
+        BarCensus {
+            paints: AtomicU64::new(0),
+            paint_px: AtomicU64::new(0),
+            maxpaint_us: AtomicU64::new(0),
+            // `u64::MAX` is the "no sample yet" sentinel, printed as `0`. A real present cannot reach
+            // it, so the sentinel is unambiguous — `wcg::H_MINPRES`'s convention.
+            minpaint_us: AtomicU64::new(u64::MAX),
+            scan_us: AtomicU64::new(0),
+            torn: AtomicU64::new(0),
+            declines: AtomicU64::new(0),
+            decl: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            vacates: AtomicU64::new(0),
+            uncovered: AtomicU64::new(0),
+            uncovered_px: AtomicU64::new(0),
+            unerased: AtomicU64::new(0),
+            unerased_px: AtomicU64::new(0),
+            forgotten: AtomicU64::new(0),
+            flat: AtomicU64::new(0),
+            flat_px: AtomicU64::new(0),
+            rect: AtomicU64::new(0),
+            emit: AtomicU64::new(0),
+            t0: AtomicU64::new(0),
+            last: AtomicU64::new(0),
+            lastcensus: AtomicU64::new(0),
+            said: AtomicU64::new(0),
+        }
+    }
+
+    /// Every event this tenant has had. The quantity the rollup's delta gate is taken over — "nothing
+    /// new to say, say nothing", which is what keeps an idle desktop silent.
+    fn total(&self) -> u64 {
+        self.paints
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.declines.load(Ordering::Relaxed))
+            .wrapping_add(self.vacates.load(Ordering::Relaxed))
+    }
+}
+
+/// One census per tenant slot. `static` rather than per-tenant declarations for the reason
+/// [`TENANTS`] is a registry: a tenant added without a census would be invisible, and the catch-all
+/// slot makes that impossible.
+static BARS: [BarCensus; BAR_SLOTS] = [
+    BarCensus::new(),
+    BarCensus::new(),
+    BarCensus::new(),
+    BarCensus::new(),
+    BarCensus::new(),
+];
+
+/// Which census slot a tenant name occupies.
+///
+/// Four short byte-slice comparisons on a `&'static str` literal, on a path that runs only when a
+/// strip actually paints, declines or vacates — never per pixel, never per row, and never on the pass
+/// that finds its signature unchanged.
+fn bar_slot(name: &str) -> usize {
+    let mut k = 0;
+    while k < BAR_OTHER {
+        if BAR_NAMES[k].as_bytes() == name.as_bytes() {
+            return k;
+        }
+        k += 1;
+    }
+    BAR_OTHER
+}
+
+/// Note that this tenant has been seen, so `age_ms=` has an origin.
+///
+/// `compare_exchange` from `0`, never a plain store: the origin must be the FIRST record, and a later
+/// store would silently reset the age and make every subsequent rollup read like a startup burst.
+#[inline]
+fn bar_seen(c: &BarCensus) {
+    if c.t0.load(Ordering::Relaxed) == 0 {
+        let _ =
+            c.t0.compare_exchange(0, crate::arch::now_cycles(), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// TEARSCOPE — record a [`paint`] that declined, and return the `false` the caller was already
+/// returning.
+///
+/// **The return value is the whole contract.** This function exists so a decline can be counted
+/// without an `if` appearing at four arms of [`paint`], and it changes nothing about what [`paint`]
+/// does: every arm that called it returned `false` before this arc and returns `false` now.
+fn bar_decline(name: &str, reason: usize) -> bool {
+    let c = &BARS[bar_slot(name)];
+    bar_seen(c);
+    c.declines.fetch_add(1, Ordering::Relaxed);
+    c.decl[reason].fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// TEARSCOPE — record a completed [`paint`]: what it covered, what the present cost, and whether that
+/// present outran the beam over the rows it wrote.
+fn bar_painted(name: &str, r: Rect, cyc: u64, panel_h: usize) {
+    let (_, _, w, h) = r;
+    let c = &BARS[bar_slot(name)];
+    bar_seen(c);
+    let present_us = cycles_to_us(cyc);
+    // `wcg::erase_note`'s arithmetic, and its deliberate bias toward NOT reporting a tear: `FRAME_US`
+    // includes blanking the beam does not spend on visible rows, so the real scan time of these rows
+    // is SHORTER than the figure the present is compared against, and a `torn=0` near the threshold
+    // is not a proof of safety.
+    let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * h as u64 / panel_h as u64 };
+    c.paints.fetch_add(1, Ordering::Relaxed);
+    c.paint_px.fetch_add((w as u64) * (h as u64), Ordering::Relaxed);
+    c.maxpaint_us.fetch_max(present_us, Ordering::Relaxed);
+    c.minpaint_us.fetch_min(present_us, Ordering::Relaxed);
+    c.scan_us.store(rectscan_us, Ordering::Relaxed);
+    c.rect.store(pack_rect(Some(r)), Ordering::Relaxed);
+    if present_us > rectscan_us {
+        let n = c.torn.fetch_add(1, Ordering::Relaxed) + 1;
+        if c.said.fetch_or(SAID_TORN, Ordering::Relaxed) & SAID_TORN == 0 {
+            serial_println!(
+                "[strip] paint tenant={} box={}x{} present_us={} rectscan_us={} torn={} -> AT-RISK",
+                name,
+                w,
+                h,
+                present_us,
+                rectscan_us,
+                n
+            );
+        }
+    }
+}
+
+/// The area of `old` that `new` does not cover — the span a shrinking or moving strip UNCOVERS, in
+/// pixels. `0` for a strip that grew over its own old rect, which owes nothing.
+///
+/// Both rects are axis-aligned, so the uncovered area is exactly `area(old) - area(old ∩ new)`. A
+/// `new` of `None` is a strip going away entirely, which uncovers all of `old`.
+fn bar_uncovered(old: Rect, new: Option<Rect>) -> u64 {
+    let (ox, oy, ow, oh) = old;
+    let area = (ow as u64) * (oh as u64);
+    let Some((nx, ny, nw, nh)) = new else {
+        return area;
+    };
+    let x0 = ox.max(nx);
+    let y0 = oy.max(ny);
+    let x1 = (ox + ow).min(nx + nw);
+    let y1 = (oy + oh).min(ny + nh);
+    if x1 <= x0 || y1 <= y0 {
+        return area;
+    }
+    area - ((x1 - x0) as u64) * ((y1 - y0) as u64)
+}
+
+/// **Erase a rect a strip has VACATED, and say what became of the span it uncovered.**
+///
+/// A thin accounting wrapper over [`erase_rect`]: it calls it, returns exactly what it returned, and
+/// counts. `new` is the rect this tenant is about to own (`None` when the strip is going away
+/// entirely), and only the part of `old` that `new` does not cover can be left stale.
+///
+/// `owed` is the CALLER's debt policy, and it is what separates a latency cost from a defect:
+///
+///  * `owed = true` — the caller keeps its [`Slot`] until the erase has actually painted, so a
+///    decline stays visible and the next pass retries. `super::crystal`'s dismiss arm is the
+///    precedent, and its own comment is the argument: clearing the slot first *"turned that decline
+///    into a silent loss"*.
+///  * `owed = false` — the caller re-publishes its slot regardless of what this returned, so a
+///    decline here is a span nothing is coming back for. That is `forgotten=`, and it is the field
+///    Peter's episode is scored on.
+///
+/// **This function does not retry, defer, or hold anything.** Making a declined vacate arrive is a
+/// change to the damage discipline and belongs to a different arc; this one measures.
+pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
+    let c = &BARS[bar_slot(name)];
+    bar_seen(c);
+    c.vacates.fetch_add(1, Ordering::Relaxed);
+    let px = bar_uncovered(old, new);
+    let erased = erase_rect(old);
+    if px == 0 {
+        // A grow: the new rect covers every pixel the old one held, so nothing is uncovered and a
+        // declined erase costs the panel nothing. Counted as a vacate and excluded from every risk
+        // field — which is also why a boot's dock, which grows tile by tile, cannot spend the
+        // evidence latches before the operator's first close.
+        return erased;
+    }
+    c.uncovered.fetch_add(1, Ordering::Relaxed);
+    c.uncovered_px.fetch_add(px, Ordering::Relaxed);
+    let (ox, oy, ow, oh) = old;
+    if !erased {
+        c.unerased.fetch_add(1, Ordering::Relaxed);
+        c.unerased_px.fetch_add(px, Ordering::Relaxed);
+        if !owed {
+            let n = c.forgotten.fetch_add(1, Ordering::Relaxed) + 1;
+            if c.said.fetch_or(SAID_STALE, Ordering::Relaxed) & SAID_STALE == 0 {
+                serial_println!(
+                    "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=no owed=no forgotten={} -> STALE-ENDS",
+                    name, ow, oh, ox, oy, px, n
+                );
+            }
+        } else if c.said.fetch_or(SAID_UNERASED, Ordering::Relaxed) & SAID_UNERASED == 0 {
+            serial_println!(
+                "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=no owed=yes -> UNERASED",
+                name, ow, oh, ox, oy, px
+            );
+        }
+        return erased;
+    }
+    // Erased — to flat `wm::DESKTOP_BG`, which is the only colour [`erase_rect`] paints. Whether that
+    // is the right colour for those pixels is the `scene=` question the rollup carries.
+    c.flat.fetch_add(1, Ordering::Relaxed);
+    c.flat_px.fetch_add(px, Ordering::Relaxed);
+    erased
+}
+
+/// TEARSCOPE — emit every tenant's `scope=bar` rollup that owes one.
+///
+/// ### Reachability, and how it is guaranteed rather than assumed
+///
+/// [`compose_all`] is the sole call site, and it has itself exactly one caller —
+/// `wm::composite_pass_half`, the furniture seam, the pass's last layer under the sprite. So this
+/// runs on exactly the population it reports on: a strip that is composing is a strip whose census is
+/// being read. It needs no timer, no thread and no new call site.
+///
+/// The corollary matters as much: a board that never composites never prints a line, and on the Orin
+/// the render task does not drive `wm::composite` itself. That it nevertheless runs there is not
+/// assumed — the render9 capture carries 183 `[dock] live` and 184 `[menubar] live` lines in one
+/// boot, and those come from [`Ledger::tick`] on this same seam.
+fn bar_rollup_tick() {
+    let mut k = 0;
+    while k < BAR_SLOTS {
+        bar_rollup_one(k);
+        k += 1;
+    }
+}
+
+/// One tenant's `scope=bar` line, if it owes one.
+fn bar_rollup_one(k: usize) {
+    let c = &BARS[k];
+    // Delta gate first — nothing new to say, say nothing. One relaxed load and a compare on the
+    // common case, which is an idle desktop arriving here at composite rate. A tenant that has never
+    // been seen is silent for the whole boot, which is how an absent strip stays free.
+    let total = c.total();
+    if total == 0 || total == c.lastcensus.load(Ordering::Relaxed) {
+        return;
+    }
+    // Rate gate, on the free-running counter rather than a pass count, so the cadence is the same
+    // whether the panel is idle or busy. `last == 0` is the first line and is not held back.
+    let last = c.last.load(Ordering::Relaxed);
+    let now = crate::arch::now_cycles();
+    if last != 0 && cycles_to_us(now.saturating_sub(last)) < BAR_ROLLUP_US {
+        return;
+    }
+    // Arm: exactly one core proceeds. The loser observed the same `last`, its swap fails, and it
+    // returns without printing — which is correct, because the counters are shared and its line would
+    // have carried the same census.
+    if c.last.compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    c.lastcensus.store(total, Ordering::Relaxed);
+    let emit = c.emit.fetch_add(1, Ordering::Relaxed) + 1;
+    let t0 = c.t0.load(Ordering::Relaxed);
+    let age_ms = if t0 == 0 { 0 } else { cycles_to_us(now.saturating_sub(t0)) / 1000 };
+    let (x, y, w, h) = unpack_rect(c.rect.load(Ordering::Relaxed));
+    let forgotten = c.forgotten.load(Ordering::Relaxed);
+    let unerased = c.unerased.load(Ordering::Relaxed);
+    let torn = c.torn.load(Ordering::Relaxed);
+    let flat = c.flat.load(Ordering::Relaxed);
+    let declines = c.declines.load(Ordering::Relaxed);
+    // Whether a flat `DESKTOP_BG` slab is VISIBLE at all: on a scene-owned backdrop it stands where
+    // scene content belongs, and on a flat one it is the same colour as its surroundings. A field
+    // rather than a term folded into the counts, because it is a property of the BOARD and everything
+    // else on the line is a property of the bar.
+    let scene = super::desktop_scene_owns_backdrop();
+    // Precedence, worst and most specific first.
+    //
+    //  * STALE-ENDS — an uncovered span whose erase declined at a site that then re-published its
+    //    slot. Those panel rows hold the departed strip's pixels and NO later pass is coming for
+    //    them. It outranks everything below because every other term describes a repaint that
+    //    happened — late, or flat, or fast; this one describes a repaint that did not happen and
+    //    will not.
+    //  * UNERASED — the same decline where the caller kept the debt. Still owed, so still arriving.
+    //  * AT-RISK — a bar present outran the beam over its own rows. Below the two above because a
+    //    torn frame is replaced by the next one and a stale span is not.
+    //  * FLAT-VACATE — every uncovered span WAS erased, to flat desktop colour, on a board whose
+    //    backdrop is a SCENE. Reported, never forbidden: it is a colour question, and the capture is
+    //    what settles whether it is visible.
+    //  * DECLINED — a paint declined. One decline is a fact to report, not a boot to fail.
+    let verdict = if forgotten > 0 {
+        "STALE-ENDS"
+    } else if unerased > 0 {
+        "UNERASED"
+    } else if torn > 0 {
+        "AT-RISK"
+    } else if flat > 0 && scene {
+        "FLAT-VACATE"
+    } else if declines > 0 {
+        "DECLINED"
+    } else {
+        "CLEAN"
+    };
+    let minp = c.minpaint_us.load(Ordering::Relaxed);
+    serial_println!(
+        "[strip] rollup tenant={} scope=bar emit={} age_ms={} rect={}x{}+{}+{} scene={} pop=all-paints paints={} paint_px={} torn={} maxpaint_us={} minpaint_us={} rectscan_us={} declines={} decl_lock={} decl_ready={} decl_word={} decl_geom={} pop=vacates vacates={} uncovered={} uncovered_px={} unerased={} unerased_px={} forgotten={} flat={} flat_px={} pop=constant frame_us={} -> {}",
+        BAR_NAMES[k],
+        emit,
+        age_ms,
+        w,
+        h,
+        x,
+        y,
+        if scene { "yes" } else { "no" },
+        c.paints.load(Ordering::Relaxed),
+        c.paint_px.load(Ordering::Relaxed),
+        torn,
+        c.maxpaint_us.load(Ordering::Relaxed),
+        if minp == u64::MAX { 0 } else { minp },
+        c.scan_us.load(Ordering::Relaxed),
+        declines,
+        c.decl[DECL_LOCK].load(Ordering::Relaxed),
+        c.decl[DECL_READY].load(Ordering::Relaxed),
+        c.decl[DECL_WORD].load(Ordering::Relaxed),
+        c.decl[DECL_GEOM].load(Ordering::Relaxed),
+        c.vacates.load(Ordering::Relaxed),
+        c.uncovered.load(Ordering::Relaxed),
+        c.uncovered_px.load(Ordering::Relaxed),
+        unerased,
+        c.unerased_px.load(Ordering::Relaxed),
+        forgotten,
+        flat,
+        c.flat_px.load(Ordering::Relaxed),
+        FRAME_US,
+        verdict
+    );
+}
+
+const _: () = {
+    // Every decline reason must have a bucket, or a counted decline lands in the wrong one.
+    assert!(DECL_LOCK < DECL_KINDS);
+    assert!(DECL_READY < DECL_KINDS);
+    assert!(DECL_WORD < DECL_KINDS);
+    assert!(DECL_GEOM < DECL_KINDS);
+    // The catch-all must be the LAST slot: `bar_slot` scans `0..BAR_OTHER` and falls through to it,
+    // so a catch-all anywhere else would shadow a real tenant's name.
+    assert!(BAR_OTHER == BAR_SLOTS - 1);
+    // Both registered tenants must have a census slot ahead of the catch-all, or the two strips this
+    // arc exists to watch would report as `tenant=other`.
+    assert!(BAR_SLOTS > STRIP_MAX);
 };

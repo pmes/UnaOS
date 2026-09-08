@@ -5473,7 +5473,7 @@ fn ptrpoll_witness(tick: u64) -> u64 {
     use core::sync::atomic::Ordering;
     let rearm = crate::drivers::xhci::MOUSE_REARM_COUNT.load(Ordering::Relaxed);
     let disc = crate::drivers::xhci::MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
-    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed); let dup = crate::drivers::xhci::MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed); let nobuf = crate::drivers::xhci::MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the two counters that separate (a1) from (a2), and (a1)'s two sub-causes from each other: `dup` = the guard ate a known duplicate, `nobuf` = the buffer/ring was gone. ⚠ folded, line-neutral.
+    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed); let dup = crate::drivers::xhci::MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed); let nobuf = crate::drivers::xhci::MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed); let fold = crate::pal::pointer_motion_coalesced(); // CLICKDEAD-xhci.patch v2 — the two counters that separate (a1) from (a2), and (a1)'s two sub-causes from each other: `dup` = the guard ate a known duplicate, `nobuf` = the buffer/ring was gone. ⚠ folded, line-neutral. // EVQPRINT (orin 20) — `fold` is `pal::EVQ_COALESCE_PTR` (pal.rs, read through the already-`pub` `pal::pointer_motion_coalesced`): a relative-motion report FOLDED into the ring's newest entry instead of being given a slot of its own (`pal::push_pointer_report` -> `EventQueue::coalesce_relative_motion`). It has been incremented on this board on EVERY boot since PTRDEAD and printed by NOTHING on aarch64 — its only other readers in the tree are the x86-only `[ptrdead]` fixture (arch/x86_64/syscall.rs, `folded=` on its `backlog` line). Its own doc states the reading: a nonzero value means THE DRAIN FELL BEHIND THE PAD and the arrow was handed the whole backlog at once instead of walking it — which is the quantity POINTERLAG (orin 19) needed and could not get. One `Relaxed` load; no new accounting, no change to `pal`, no lock and no MMIO, exactly like the five loads to its left. ⚠ folded, line-neutral.
     // Saturating: the three counters are read one at a time and a completion can land between the
     // loads, so the arithmetic is only ordered in the limit. A one-off underflow would print
     // `reports=0` and read as "worse than dead"; saturation makes it read as "not yet counted".
@@ -5483,11 +5483,11 @@ fn ptrpoll_witness(tick: u64) -> u64 {
     if first {
         PTRPOLL_BASE.store(reports, Ordering::Relaxed);
     }
-    let moved = rearm.wrapping_add(dup).wrapping_add(nobuf); let last = PTRPOLL_LAST.swap(moved, Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the DROPS join the movement test, or a pipeline being EATEN (rearm flat, dup/nobuf climbing) would be silently mistaken for one that is STARVED and print one line for the whole boot. ⚠ folded, line-neutral.
+    let moved = rearm.wrapping_add(dup).wrapping_add(nobuf).wrapping_add(fold); let last = PTRPOLL_LAST.swap(moved, Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the DROPS join the movement test, or a pipeline being EATEN (rearm flat, dup/nobuf climbing) would be silently mistaken for one that is STARVED and print one line for the whole boot. ⚠ folded, line-neutral. // EVQPRINT (orin 20) — the FOLDS join it for the same reason, and the term is NOT redundant today only by a coupling this line should not depend on: a fold needs a decoded report, a decoded report needs a re-arm, so on the present producer `fold` cannot move while `rearm` stands still. Any producer that pushes pointer motion WITHOUT a mouse re-arm behind it (an absolute pointer on a second slot, a synthetic or replayed path) breaks that coupling, and without this term a boot whose only movement was folding would print one line and go silent. ⚠ folded, line-neutral.
     if !first && last == moved {
         return reports; // nothing moved since the last census — one line already said so.
     }
-    let decoded = reports.saturating_sub(if first { reports } else { base });
+    let decoded = reports.saturating_sub(if first { reports } else { base }); let foldnew = fold.saturating_sub(PTRPOLL_FOLD_LAST.swap(fold, Ordering::Relaxed)); // EVQPRINT (orin 20) — the DELTA, and it is taken HERE, AFTER the early return above, on purpose: the reading wanted is "folded since the previous PRINTED LINE", not "since the previous census pass". A pass that returns early printed nothing, so its folds must still be attributable to the next line that does print; swapping before the return would silently drop them into a line nobody ever saw. Saturating for the reason the block above gives — `fold` was loaded before the movement test and a producer can increment between that load and this swap, which would make the next delta one short rather than make this one underflow into `u64::MAX`. ⚠ folded, line-neutral.
     let verdict = if decoded != 0 {
         "STREAMING (the pointer read is completing and re-arming; a dead click above this line is a ROUTING fault, not a pipeline one)"
     } else if disc != 0 {
@@ -5504,9 +5504,9 @@ fn ptrpoll_witness(tick: u64) -> u64 {
         "ARMED-NO-COMPLETION (the read is armed, dup=0 and nobuf=0, and the controller has posted NO transfer event for the pointer DCI since the last line. This is (a2): the endpoint went quiet — look at EP state, doorbell and periodic bandwidth, not at the guard)"
     };
     serial_println!(
-        "[ptrpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} -> {}",
+        "[ptrpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} folded={} foldnew={} -> {}",
         tick, rearm, disc, err, dup, nobuf, reports,
-        if first { reports } else { base }, decoded, verdict
+        if first { reports } else { base }, decoded, fold, foldnew, verdict
     );
     reports
 }
@@ -5658,3 +5658,49 @@ fn kbdpoll_witness(tick: u64) {
         edges, shots, refused, verdict
     );
 }
+
+/// EVQPRINT (orin 20) — the `pal::EVQ_COALESCE_PTR` total the PREVIOUS `[ptrpoll]` line printed, so
+/// the line can carry a DELTA beside the per-boot total instead of a bare monotonic number.
+///
+/// WHY THIS EXISTS AT ALL. `EVQ_COALESCE_PTR` (pal.rs) has been incremented on this board on every
+/// boot since PTRDEAD and READ BY NOTHING on aarch64: its only consumers in the tree were
+/// `pal::pointer_motion_coalesced`'s two call sites inside the x86-only `[ptrdead]` fixture
+/// (arch/x86_64/syscall.rs). POINTERLAG (orin 19) diagnosed Peter's pointer lag as one
+/// `jd2_console_pump` iteration of motion-to-photon and named this counter as the cheapest
+/// instrument that could corroborate it — a real event, counted correctly, reported to no one.
+/// This is the report.
+///
+/// WHY A DELTA AND NOT JUST THE TOTAL. `folded=` is monotonic and can only rise, so after a few
+/// minutes of use it is a large number that says nothing about NOW: a boot that folded 4000 reports
+/// in its first minute and none since reads identically to one folding steadily. `foldnew=` is the
+/// count attributable to the window between two PRINTED lines, which is the interval every other
+/// movement on this instrument is measured over, and it is the term that answers "is the drain
+/// falling behind RIGHT NOW". `folded=` is kept beside it because it is the name the x86 `[ptrdead]`
+/// line already uses for this counter and because it is what makes two lines comparable across a
+/// suppressed pass.
+///
+/// INITIALISED TO 0, NOT `u64::MAX`. The two siblings above (`PTRPOLL_LAST`, `PTRPOLL_BASE`) use the
+/// `u64::MAX` sentinel because they must distinguish "never printed" from a legitimate value of
+/// zero. This one does not need to: the counter itself starts at 0, so on the FIRST line
+/// `foldnew = fold - 0` is exactly the honest reading "folded since boot", and the sentinel would
+/// only add a branch to produce the same number.
+///
+/// THE VERDICT CHAIN IS DELIBERATELY UNTOUCHED, and this is the part to understand rather than
+/// undo. `[ptrpoll]`'s verdict axis is ONE question — is the xHCI pointer pipeline alive — and
+/// every arm of it names an endpoint, a guard or a TRB. Coalescing is not a pipeline fault: it
+/// happens when the pipeline is HEALTHY and the CONSUMER is slow, so an arm keyed on `fold != 0`
+/// would shadow `STREAMING` and tell a reader the pointer endpoint is sick when the endpoint is the
+/// one thing that is fine. The fold terms are DATA on this line and their verdict belongs to the
+/// drain-cadence question `[kbdpoll] armgap_us=` opened, not to this one. A future seat wanting a
+/// verdict for them should give it its own witness, not overload this chain.
+///
+/// WHY IT IS ON `[ptrpoll]` AND NOT ON `[kbdpoll]` (which is the line already carrying `armgap_us`).
+/// `[kbdpoll]`'s print is gated on KEYBOARD movement — `rearm + dup + nobuf + restated`. A sitting
+/// where Peter moves the mouse and never touches a key leaves that gate flat, so `[kbdpoll]` would
+/// print its BASELINE line and nothing else, and a POINTER counter riding it would be reported
+/// exactly once, as 0, in precisely the flight it exists to measure. `[ptrpoll]` is gated on
+/// pointer movement, which is the movement that produces folds. Both witnesses are called from the
+/// SAME census pass (this file's `orin_click_census` call site), so riding `[ptrpoll]` costs no new
+/// stream and no new cadence — the same line count on the wire, keyed to the right pipeline.
+#[cfg(feature = "orinclick")]
+static PTRPOLL_FOLD_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

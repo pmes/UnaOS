@@ -4170,6 +4170,82 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
+  # ── WITNESSGAP (appended 2026-09-07, orin 20) — the WITNESS-FREE polarity, which is the polarity
+  # every piece of BOOT MEDIA actually ships ──────────────────────────────────────────────────────
+  #
+  # THE HOLE. `witness` is DEFAULT-QUIET: arroyo arms it for exactly the four battery commands
+  # (`test`, `test-fat`, `test-arm`, `kernel8-test` — the case at arroyo:44) and leaves it OFF for
+  # every boot/media command. Three independent places read that one env var and none of them is
+  # reached by `check`: the general knob mapping (arroyo:153, feeding `esp-arm`/`esp-jetson`/`arm`),
+  # `kernel8()`'s curated K8_FEATS (arroyo:5676, feeding `kernel8`/`kernel8-run`/`install-pi`), and
+  # `builder/src/main.rs:48` (feeding `esp-x86`/`vm-image`/`x86`). So `esp-jetson`, `esp-arm`,
+  # `esp-x86`, `kernel8` and `vm-image` all build `witness` OFF.
+  #
+  # Before this block, every one of the 47 board legs above carried `witness` — measured, not
+  # assumed. The two DEFAULT legs in `check_both` do compile witness-OFF, but they compile the
+  # OPERATOR'S OWN knob set, which on a bare `./arroyo check` is `ehcihid,kbdwit,sdhcblk,smolnet`:
+  # no `tegra`, no `pi`, no `baremetal`, no `tegra_el0`, no `bsptick`/`bsprun`. And `tegra`,
+  # `baremetal`, `pi` and `tegra_el0` are arm-only, so `x86_cfg_universe` drops them and no derived
+  # x86 mix leg carries them either. Net: NO leg anywhere compiled a BOARD feature set with
+  # `witness` OFF, which is every configuration that reaches a card.
+  #
+  # NOT HYPOTHETICAL. orin 19's BATTERY1S1 nearly shipped a break through exactly this hole: gating
+  # the aarch64 fixture asm on `witness` would have left `setup()`'s eight `__fault_blob_*` /
+  # `__eret_prog_*` / `__user_prog_*` symbols undefined on a `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson`
+  # link, because `main.rs`'s `tegra_el0_start_maybe` and `virt_el0_start_maybe` call `setup()`
+  # WITHOUT a `witness` gate. It was caught by hand, by a reader, in the review — not by the gate.
+  # (Evidence: ~/unaos-bench/scratch/orin19/battery1s1/PROGRESS.md §2b.)
+  #
+  # THE SHAPE OF THE FIX. One witness-free TWIN per SHIPPED media configuration — not a twin per
+  # board leg, which would have doubled a 56-leg gate for coverage nothing ships. Each twin is an
+  # existing GREEN leg's list VERBATIM MINUS the single token `witness`, so a red here names the
+  # polarity and nothing else (the `arm-tegra-sdmmcwrite` discipline, run in reverse).
+  #
+  # WHY THESE FOUR, AND WHY NOT FEWER:
+  #   arm-tegra-bsprun-nowitness      the DEFAULT jetson image. `esp_jetson()` forces `tegra` +
+  #                                   `tegrasmp` + `bsptick` + `bsprun` into the feature list
+  #                                   (arroyo:5065-5096) regardless of env, so `arm-tegra-bsprun`
+  #                                   is the leg whose list matches the card, and this is its
+  #                                   witness-free twin.
+  #   arm-tegra-bsprun-el0-nowitness  the ARMED (`UNAOS_TEGRA_EL0=1`) jetson image — the exact
+  #                                   configuration BATTERY1S1 §2b named as compiled by nothing.
+  #                                   It is NOT redundant with the row above even though its
+  #                                   feature set is a strict superset: `main.rs`'s
+  #                                   `#[cfg(all(feature = "tegra", not(feature = "tegra_el0"),
+  #                                   target_arch = "aarch64"))]` item is compiled ONLY by the
+  #                                   non-el0 build, so dropping the first row would leave the
+  #                                   SHIPPED default image's own code uncovered. Both, or neither
+  #                                   polarity of that `not(...)` is checked.
+  #   arm-pi-nowitness                `kernel8` — the Pi bare-metal image. K8_FEATS is
+  #                                   `baremetal,skip_xhci` plus knobs; `arm-pi` is a superset of
+  #                                   it, so its witness-free twin covers the media build and the
+  #                                   whole Pi knob family with it.
+  #   x86-all-nowitness               `esp-x86` / `vm-image` at full knob width. The 9 derived mix
+  #                                   legs already put x86 witness-OFF under SOME coverage (5 of
+  #                                   them draw `witness` OFF by mask), but a mask subset is not
+  #                                   the full-knob build, and the brief's requirement is both
+  #                                   arches by construction rather than by accident of a mask.
+  #
+  # NO `esp-arm` ROW. `esp-arm` (QEMU virt aarch64) builds `$(arm_features)` — the operator's own
+  # knob set — which is precisely what the DEFAULT aarch64 leg in `check_both` already compiles,
+  # witness OFF. A fifth row would be that leg again.
+  #
+  # UNIVERSE SIDE EFFECT: none. Every feature named here is already named by the parent leg it was
+  # copied from, so `x86_cfg_universe`'s arm-only set is unchanged and the derived mix-leg count
+  # stays where it was. Board legs +4; gate +4. `./arroyo check` prints the live board/mix counts
+  # AND (since this arc) their witness polarity every run — read them there, not here.
+  #
+  # PROVEN BY GO-RED, not by reading: two deliberate type errors gated
+  # `all(feature = "tegra", not(feature = "witness"))` and
+  # `all(feature = "baremetal", not(feature = "witness"))` in `arch/aarch64/timer.rs` left
+  # `./arroyo check` at EXIT 0 on the 56-leg gate while `./arroyo kernel8` and `./arroyo esp-jetson`
+  # both failed to compile; with these four rows in place the same mutation reds
+  # `arm-tegra-bsprun-nowitness`, `arm-tegra-bsprun-el0-nowitness` and `arm-pi-nowitness` and the
+  # gate returns 1. Evidence: ~/unaos-bench/scratch/orin20/witnessgap/PROGRESS.md §M2/§M3.
+  "arm-tegra-bsprun-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
+  "arm-tegra-bsprun-el0-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun,tegra_el0"
+  "arm-pi-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -4369,6 +4445,43 @@ check_kernel_cfg() {
     if [ "${UNAOS_CFG_SWEEP:-0}" != "1" ]; then
         echo -e "${COLOR_CYAN}  (${#KERNEL_CFG_MATRIX[@]} board + ${#KERNEL_CFG_MIX[@]} x86 pairwise-mix; UNAOS_CFG_SWEEP=1 adds the per-feature sweep)${COLOR_RESET}"
     fi
+    # GATE-CENSUS (orin 20, WITNESSGAP): print the leg list's `witness` POLARITY every run.
+    #
+    # THE DEFECT THIS ANSWERS IS NOT A MISSING LEG — it is that a whole polarity could go
+    # unchecked for months and nothing said so. `witness` is DEFAULT-QUIET: the four battery
+    # commands arm it (the `case` at the head of this file) and every boot/media command leaves it
+    # OFF, so the polarity `esp-jetson` / `esp-arm` / `esp-x86` / `kernel8` / `vm-image` actually
+    # ship is the OFF one. Until the WITNESSGAP rows above, all 47 board legs carried it ON and the
+    # only witness-free legs anywhere were x86 mix legs that drew it OFF BY ACCIDENT OF A MASK. The
+    # counts were already printed; the POLARITY was not, so the gap was invisible in the log and
+    # discoverable only by a near-miss (orin 19 BATTERY1S1 §2b — caught by a reader in review, not
+    # by any instrument).
+    #
+    # This block PRINTS and does not gate: it changes no exit code and compiles no leg. A zero in
+    # the aarch64 column is meant to be read as the finding it is, and the witness-free legs are
+    # NAMED rather than merely counted because a name survives being pasted into a report.
+    #
+    # Reading $KERNEL_FEATURES here does NOT breach the "deliberately does NOT consult
+    # $KERNEL_FEATURES" note below: that rule governs what these legs COMPILE, which must be the
+    # same fixed matrix for every operator. The two DEFAULT legs in check_both do compile the
+    # operator's own set, they are part of the gate's real coverage, and stating their polarity
+    # beside the matrix's is the only way this census describes the whole gate rather than most of
+    # it.
+    local _wON=0 _wOFF=0 _wOFFarm=0 _wOFFx86=0 _wNAMES="" _wDEF="OFF"
+    for _row in "${_rows[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
+        case ",${_feats}," in
+            *,witness,*) _wON=$((_wON + 1)) ;;
+            *)  _wOFF=$((_wOFF + 1)); _wNAMES="${_wNAMES} ${_leg}"
+                case "$_tgt" in
+                    *aarch64*) _wOFFarm=$((_wOFFarm + 1)) ;;
+                    *)         _wOFFx86=$((_wOFFx86 + 1)) ;;
+                esac ;;
+        esac
+    done
+    case ",${KERNEL_FEATURES#--features }," in *,witness,*) _wDEF="ON" ;; esac
+    echo -e "${COLOR_CYAN}  witness census — legs ON ${_wON} / OFF ${_wOFF} (OFF: aarch64 ${_wOFFarm}, x86_64 ${_wOFFx86}); the 2 default legs are witness ${_wDEF}${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}  witness-free legs (the polarity every media build ships):${_wNAMES:- NONE — no leg compiles what esp-jetson/esp-arm/esp-x86/kernel8/vm-image build}${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     for _row in "${_rows[@]}"; do
         read -r _leg _tgt _feats <<< "$_row"

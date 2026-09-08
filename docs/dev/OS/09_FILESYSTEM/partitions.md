@@ -197,7 +197,14 @@ Latched once per handle per boot.
 :: PART: mbr handle=global slot=4 REJECT Empty ::
 :: PART: mbr census handle=global protective=0 accepted=2 rejected=0 ::
 :: PART: fat mounted from MBR slot 1 — extent LBA …..… (… sectors), FAT32 vol@LBA… volsec=… … ::
-:: PART: unafs span check — slot=2 type=0x7f part=[…..…) span_base=… span_blocks=… fits=yes magic=ok ::
+:: PART: unafs span check — slot=2 type=0x7f part=[…..…) span_base=… span_blocks=… sb_blocks=… fits=yes magic=ok ::
+```
+
+…and, on a volume that does **not** fit the partition carrying it, a second line — which ends in
+`FAIL ::`, a builtin `mbench` FORBID, so the condition reddens every spec on every board:
+
+```
+:: PART: unafs span check — volume declares … blocks but MBR slot … carries only … => FAIL ::
 ```
 
 **Instrument honesty.** `accepted` and `rejected` are properties of the *medium*, read at the moment
@@ -217,6 +224,44 @@ goes through a `PartitionRange`, so a `magic=ok` also proves the bounded partiti
 sector 0 to the same bytes the crate's adapter reached by its own arithmetic. It is strictly
 advisory — every outcome is a printed line, never an error — so a wrong witness can mislead a reader
 but can never change what gets mounted. aarch64 only, because `fs::unafs` is.
+
+**`fits=` compares the superblock, not the partition against itself (PARTITION-FITS).** It used to
+test `span.block_count * 8 <= p.sector_count`. But `span.block_count` is set by the crate's
+`locate_unafs` to `p.sector_count / SECTORS_PER_BLOCK` off that same MBR entry, so the test reduced
+to `(n / 8) * 8 <= n` — **true for every `n`** under floor division. The field was named for a
+containment property and reported a tautology; `fits=yes` was quoted as evidence a volume was sound.
+It now compares the **superblock's own declared `block_count`**, decoded from the block 0 the
+witness already re-reads on the bounded path, against the MBR-derived span. That is a genuinely
+independent second source — the volume's word against the partition table's — and it is exactly the
+property `k3_mount_selftest` bit3 asserts. `sb_blocks=` prints that operand on an **agreeing** boot
+too, so the verdict is re-derivable from any log rather than merely trusted.
+
+This matters most where bit3 cannot help — and that is **neither board's flashed image, for two
+different reasons.** `k3_mount_selftest`'s only caller is `u7_launcher`
+(`arch/aarch64/syscall.rs:16288`, calling it at `:16476`), spawned from `main.rs:757`. Two separate
+things remove that spawn:
+
+* **Tegra — the early-stop terminus.** `kernel_main` calls `tegra_early_stop(boot_info)` at
+  `main.rs:190` and that function is declared `-> !`, so every line of `kernel_main` below `:190` —
+  the `u7_launcher` spawn at `:757` among them — is dead on a tegra image, whatever it was compiled
+  with. **bit3 never runs on the Orin.**
+* **Pi — the `witness` build gate.** The spawn also sits under `main.rs:527`'s
+  `#[cfg(feature = "witness")]`. `arroyo`'s `kernel8()` builds the bare-metal image from a *curated*
+  `K8_FEATS="baremetal,skip_xhci"` (`arroyo:5785`) and appends `witness` only when `UNAOS_WITNESS`
+  is set (`arroyo:5789`) — and `arroyo:43` arms that variable for the **test** verbs only
+  (`test`, `test-x86`, `test-fat`, `test-arm`, `test-aarch64`, `kernel8-test`, `test-pi`).
+  `kernel8` and `install-pi` are not in that list, so the feature is off and the whole cascade is
+  `#[cfg]`-erased. **bit3 never runs on the Pi's flashed card either** — it runs in
+  `kernel8-test`'s QEMU battery and nowhere else.
+
+So: **bit3 runs on neither board's flashed image — tegra by the early-stop terminus, Pi by the
+witness gate — and on any card that boots, this witness is the only check of the property.** The two
+mechanisms are independent: removing either one would still leave the other board uncovered. Do not
+read the tegra clause as the whole story; a Pi reader who takes `fits=` as corroborated by bit3 on
+the image they actually boot is reading a claim about a QEMU battery, not about their card.
+Containment itself stays enforced by `BlockAdapter::for_partition`, which bounds every access at
+`span.block_count`; what the old field lacked was not enforcement but visibility, so an overrun now
+gets its own `=> FAIL ::` line rather than a quiet `yes`.
 
 ## 5. Bounds of this arc
 
