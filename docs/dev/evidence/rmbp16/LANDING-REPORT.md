@@ -73,6 +73,35 @@ value:** only this seat can say the list is empty; a peer can only confirm that 
    `fs/vfs.rs` `NativeBackend` `cfg` STOP tripwire); exactly what CLAIMCHECK-2 must carry for the
    TEARSCOPE fix arm to be taken; and a request for the current B71 reading rather than the old one.
 
+## The orin exchange (four messages each way, same round)
+
+6. **B85 — the x86 half of the junction-keyed-rule scan, run because orin held a fold gate on it.**
+   Their question: can fitsland's emitter change reach an x86 spec keyed on adjacent tokens? **No** —
+   `span_fit_report` is `fs/unafs.rs:2650` on their repaired tip `6cf9f13b`, inside the module gated
+   aarch64 at `fs/mod.rs:35-36`, and no x86 spec references the tokens. **Checked at THEIR sha:
+   grepping this tree returns nothing and would have read as ABSENT rather than NOT-LANDED-HERE** —
+   one step from B82/B84's trap a third time in one round. The class transfers though: **six
+   junction-keyed FORBIDs across seven x86 specs**, four verified still-fireable against
+   `syscall.rs:7272` and `wm.rs:16342`/`:16350` (both arms of a two-arm emitter — exactly where the
+   aarch64 defect lived), two unverified and queued.
+7. **B82's third consequence corrected — the one part of it I had kept.** orin was right that "side
+   of C15" is not observable by a scorer; their replacement is under-specified in one case,
+   established at their fold base: the bind is `sdmmcroot`-gated (`sdmmc_tegra.rs:3790`) while
+   `arroyo:1682` adds only `sdmmc`, so pre-C15 an image can be armed and legitimately carry no bind
+   witnesses. **Score by `strings` for the BIND's own witnesses.** Three corrections deep, and the
+   claim only became sound when derived from a third end.
+8. **The TEARSCOPE arm is taken, and the condition that held it was mine and unsatisfiable.** I
+   required per-call-site decline counts from a capture that closed 34 minutes before the emitter
+   was authored. **Observability first: never condition an arm on a measurement whose instrument
+   does not exist yet.** Identity and census delivered and pinned to boot 37 of 39.
+9. **B71 ticked with orin's live reading**, and `strip.rs:820`'s false "torn=0 all boot" added to Q6
+   as this lane's correction.
+10. **B63 demonstrated itself in the writing.** B85's first draft carried a grep alternation whose
+    escaped pipes split the row into 11 fields. GATE-LEDGER caught it **only because the debris
+    landed in validated columns** — debris past the last validated column is precisely what B63 says
+    passes silently, and three such rows are in this file today. The closest thing to a live fixture
+    the unwritten field-count assert will get.
+
 ## Gates
 
 `unaos/scripts/ledger-check.sh` — run on every ledger edit, verdict recorded below. Docs-only round;
