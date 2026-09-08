@@ -147,10 +147,12 @@ machine."* orin 22's BOOTROOT makes every UEFI arch find its root by walking to 
 
 ## Q3c — THE 81x ON `check` (B92). Shared tooling, highest value-per-line in the queue.
 
-`./arroyo check`'s 56-leg cfg matrix: **557.2 s cold, 155.0 s warm-serial, 1.9 s at P=6 with per-slot
-target dirs** (orin 21's measurement, cause isolated by forcing all legs onto one slot — same source,
-no edit, 8.0–11.9 s per leg). A feature set is part of cargo's fingerprint, so legs sharing a target
-dir invalidate each other in turn.
+⚠ **THE 81× IS WITHDRAWN — orin re-measured and the 155 s baseline never reproduced.** At load 1.2:
+serial in the default dir is **3.1 s warm**, and **3.2 s after a `test-arm` in the same dir** — no
+eviction. The honest result is **cold-only: 387.2 → 152.5 s, 2.54×**, bought with **2.56× total CPU**
+(383.8 → 983.9 s; every slot rebuilds its own `core`/`alloc`/`compiler_builtins`) and 2.4 GB of disk.
+**On a box shared with 4–6 executors that trade is a fleet-wide loss, and the warm case — the common
+one — saves 1.9 s.**
 
 **`arroyo` already documents this remedy in three other places** (`:2062`, `:5045`, `:2452` — the
 `target/{x86,x86-pinlo,…}` split) and does not apply it to `KERNEL_CFG_MATRIX` at `:2683`.
