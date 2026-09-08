@@ -139,6 +139,12 @@ source lines, so line-neutral or tail-append only.
   A gate that **reads** midden_core needs no grant; only an edit would.
 - **B53 — the `[wc-d]`/`[wc-g]`/`[wc-h]`/`[wc-k]` fixtures do not model the console window**, giving
   them a run-to-run VARIABLE forbidden set. Specs in `unaos/scripts/specs/x86-wc.spec`.
+- **B85 — six junction-keyed FORBIDs in this lane's specs.** aarch64 lost one to a sibling emitter
+  interposing a token between the two the rule keyed on; a FORBID that stops matching is a false
+  green and announces nothing. Four verified still-fireable here against `syscall.rs:7272` and
+  `wm.rs:16342`/`:16350` (both arms); **`[wc-d] paygo` and `[wc-h] rollup` remain unverified.** The
+  gate: assert every FORBID matches its emitter's current format, and adopt pi 9's REKEY rule — a
+  rule keys on the token it is ABOUT, bounded, never on its neighbour.
 - The `supstate` × `holocron` / `orintenant` / `orinladder` matrix gap.
 - Standing rule for all of them: **a check that cannot fire is not a check** — printing is not
   gating, a zero-hit result indicts the pattern, and each gate is proved by MUTATION at the sha it
@@ -146,12 +152,21 @@ source lines, so line-neutral or tail-append only.
 
 ## Q6 — SMALLER, ALL LEDGERED
 
-- **B74 TEARSCOPE's fix arm** — `strip::erase_rect` can DECLINE and three call sites discard it
-  (`dock.rs`, `menubar.rs`, `crystal.rs`), after which `SLOT.store` forgets the debt; `crystal.rs`'s
-  own comment says this was fixed on the dismiss arm and left on the move arm. ⚠ **Do not build on
-  TEARSCOPE's scope census — it was measured over an unidentified boot.** Taking the arm needs
-  orin's CLAIMCHECK-2 relay to carry the boot's identity (`KELF max=` span), old vs new side by
-  side, and per-call-site decline counts. Asked for in rmbp 16's first turn.
+- **B74 TEARSCOPE's fix arm — TAKEN. Contract met by CLAIMCHECK-2, and my third condition was a
+  bad ask.** `strip::erase_rect` can DECLINE and three call sites discard it (`dock.rs`,
+  `menubar.rs`, `crystal.rs`), after which `SLOT.store` forgets the debt. The census is now pinned to
+  an identified boot — **boot 37 of 39, image `0x33f480` via `unknown.log:17778`; in
+  `boot-render9.log` stop at file line 19966, since 19967+ is boot 38** — and all five numbers
+  reproduce under `rollup ∧ scope=X` on that boot and no other. **Per-call-site decline counts are
+  unobtainable by construction: `orin.log` closed 34 minutes before the emitter was authored, so the
+  instrument postdates the capture.** They become a render10 measurement, i.e. the first boot
+  carrying this fix — the arm and its measurement ride the same image, which is better than what
+  this seat specified. **Observability first: never condition an arm on a measurement whose
+  instrument does not exist yet.**
+- **`strip.rs:820`'s "read torn=0 all boot" is FALSE and is this lane's to correct at fold time** —
+  boot 37 has seven `torn=1` `win=1` rollups (emits 30–36), the only ones in the file, appearing
+  ~20 s AFTER the close. A window tore; no bar was scored either way, so TEARSCOPE's conclusion
+  stands and only the sentence is wrong.
 - **B74's second defect** — `[wc-k] rollup scope=fills` renders a VERDICT on `samples=4`, so it reds
   under host load. It wants `INSUFFICIENT-SAMPLE` as a state distinct from a verdict.
 - **`UNAOS_GIT_SHA`** — stamped into every build, read only by a Pi-only default-off HTTP body.
