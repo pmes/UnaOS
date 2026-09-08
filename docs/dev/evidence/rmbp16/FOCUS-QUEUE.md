@@ -77,8 +77,14 @@ no reports without an injector `arroyo` does not have. **The rMBP at the glass i
   `git format-patch -1 0019ec7a --stdout` / `-1 28899d5c --stdout`.
 - ⚠ `0019ec7a` also touches `arch/aarch64/display_tegra.rs` (14 lines). That is orin's lane —
   read it before applying and negotiate if it survives the rebase.
-- Gate before the card write: `./arroyo check` both arches, `UNAOS_WC=1 ./arroyo test 150` with `wc`
-  in the **build log**, `./arroyo test-arm`.
+- **Gate before the card write, UNDER R27 (Peter, 2026-09-08): the FOCUS PLATFORM'S OWN.** `./arroyo
+  check` (one verb, both arches, 3.1 s warm — R27 does not reach it) and `UNAOS_WC=1 ./arroyo test 150`
+  with `wc` in the **build log**. **`./arroyo test-arm` moves to the BACKGROUND and becomes a LANDING
+  condition, not a flight condition** — start it, fly, and read it before the merge.
+  **⚠ Two things this lane owes because of that: the trade bites hardest HERE (x86 leads shared
+  kernel-core, so x86 changes are the likeliest to break the arch whose battery is still running),
+  and the background result must land as a NAMED ARTIFACT in the landing report or "background"
+  becomes "never" — B95's family.**
 - Score the boot by the **loaded image's `max_vaddr` span** first. A 10/10 card sha proves the WRITE.
 - Ride-alongs, each an open ledger row and the machine is open anyway: **A6** `[clickroute] -> FAIL`
   (deterministic on metal, green in QEMU — bracket it new-with-arc or pre-existing) · **A5** shell
