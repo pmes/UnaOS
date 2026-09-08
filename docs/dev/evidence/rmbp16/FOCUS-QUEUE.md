@@ -207,6 +207,10 @@ source lines, so line-neutral or tail-append only.
   Re-key with `\b` (or a whitespace-or-end lookahead) — **never a trailing space: `mbench.py:256` strips every spec line
   while `Directive.__init__` compiles verbatim (`:157`), so a space bound silently vanishes and the
   rule then false-hits a longer token.**
+- **B93 — the mid-line-comment gate.** `main.rs:2051` is 933 chars with four statements packed before
+  the first `//` (deliberate: a same-line append moves no `panic::Location`). Safe today, and the
+  invariant is REMEMBERED not GATED. One mechanical check — no `;` after the first `//` outside a
+  string, any line — protects it permanently and would have caught the original A9/PRTSCR-ORIN bug.
 - The `supstate` × `holocron` / `orintenant` / `orinladder` matrix gap.
 - Standing rule for all of them: **a check that cannot fire is not a check** — printing is not
   gating, a zero-hit result indicts the pattern, and each gate is proved by MUTATION at the sha it
