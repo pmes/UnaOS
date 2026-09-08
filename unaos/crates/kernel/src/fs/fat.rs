@@ -1795,6 +1795,57 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
     out
 }
 
+/// BOOTROOT (orin 22): which compiled-in [`BlockSource`] carries the FAT volume whose `BS_VolID` is
+/// `serial` — the loader's answer to "where did I come from", resolved against the disks this kernel
+/// can actually reach.
+///
+/// ⚠ **This is a SEAM, not the root rule, and the distinction is the whole point of the arc.**
+/// `shell::vfs_mount_table` does NOT call it. Peter's direction (2026-09-08) is that the kernel is
+/// told nothing about its provenance — "WTF does it matter what method I choose to boot? You are
+/// assuming too much" — so `crate::fs::bootdisk` picks the root by CONTENT: it compares this running
+/// kernel's own `.text` window against candidate files on every enumerated volume, and a serial the
+/// firmware handed over never enters that decision. What DOES need this lookup is the pair of
+/// consumers that must not touch the medium they booted from: INSTALL-SELF (do not offer it as an
+/// erase target) and FRGUARD (do not substitute writes onto it). Both used to reach the datum through
+/// x86-shaped code; rmbp 16 asked for one arch-neutral lookup, and this is it.
+///
+/// `serial == 0` is the disarmed sentinel `drivers::block::set_boot_volume_serial` publishes when the
+/// loader could not identify its medium (and on every board with no loader at all), so it never
+/// matches: the answer is `None`, which is the honest "the loader named nothing" rather than a guess.
+///
+/// Bounded exactly as [`volume_serials`] is, because it IS `volume_serials` — one call per compiled-in
+/// source, in `BlockSource` declaration order, first source carrying the serial wins. Two disks
+/// bearing one serial is a formatter collision, not a boot question, and a caller that must not guess
+/// between them should be asking `bootdisk` instead.
+pub fn locate_boot_volume(serial: u32) -> Option<BlockSource> {
+    if serial == 0 {
+        return None;
+    }
+    for src in ALL_SOURCES {
+        if volume_serials(*src).iter().any(|v| *v == serial) {
+            return Some(*src);
+        }
+    }
+    None
+}
+
+/// BOOTROOT (orin 22): every [`BlockSource`] THIS BUILD compiled, in declaration order.
+///
+/// One list, because two walkers over "all the disks" that can disagree is the defect this arc is
+/// removing in another spelling. `locate_boot_volume` above and `crate::fs::bootdisk::locate` both
+/// iterate it, so a board whose driver set grows gains the disk in both places or in neither. The
+/// cfg pattern is `BlockSource`'s own (`fs/fat.rs:599`), copied deliberately rather than abstracted:
+/// the enum is the declaration site, and a variant that exists only under a feature must appear here
+/// under the same feature or the array will not compile — which is exactly the check we want.
+pub const ALL_SOURCES: &[BlockSource] = &[
+    BlockSource::Default,
+    BlockSource::Usb,
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    BlockSource::Sdhc,
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    BlockSource::TegraSd,
+];
+
 /// Append `v` only if absent. The serial list is at most a handful of entries, so a linear scan is
 /// both the simplest and the fastest thing here.
 fn push_unique(out: &mut alloc::vec::Vec<u32>, v: u32) {

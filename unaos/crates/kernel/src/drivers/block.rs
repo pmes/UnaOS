@@ -938,7 +938,21 @@ pub fn default_writable() -> bool {
 
 /// FRGUARD: `BS_VolID` of the volume the kernel was loaded from, as the UEFI loader read it. 0 = absent
 /// (the disarmed sentinel). Published once from the kernel entry path before any storage exists.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+///
+/// BOOTROOT (orin 22): **arch-neutral, on every target that has a loader** — the gate was
+/// `cfg(x86_64 + sdhcblk)` when its only consumer was the FRGUARD verdict below.
+///
+/// ⚠ **It is NOT how the root is chosen, and nothing here should be read as saying it is.** Peter's
+/// direction (2026-09-08) is that the kernel is told NOTHING about where it came from: "WTF does it
+/// matter what method I choose to boot? You are assuming too much." `fs::bootdisk` decides what `/`
+/// is by CONTENT — it enumerates every disk the board has and finds the one carrying the file whose
+/// bytes are this kernel's own `.text` window — and a loader-supplied serial is exactly the kind of
+/// hint that walk refuses to take. What this static is, and all it is: a SEAM. INSTALL-SELF and
+/// FRGUARD read it to refuse the medium they booted from as an erase/substitute target, and
+/// [`crate::fs::fat::locate_boot_volume`] offers the same datum to any caller that wants the volume
+/// a loader NAMED (as opposed to the volume the kernel was FOUND on). Un-gated because that seam has
+/// no arch in it, not because the root grew a dependency on it. The FRGUARD machinery around it
+/// (`BM_*`, `evaluate_boot_medium_once`, `default_writable`) stays gated exactly as it was.
 static BOOT_VOLUME_SERIAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Not yet derived for the current occupant of the global slot.
@@ -974,7 +988,12 @@ static BOOT_MEDIUM_VERDICT: core::sync::atomic::AtomicU8 = core::sync::atomic::A
 /// the installer features and is absent from every bench/boot build, which is exactly why its
 /// `:: install: boot volume serial …` line appears ZERO times in the 30-boot capture. This one is not
 /// gated on the installer, so the guard's own input is on the wire on every boot it can affect.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+///
+/// BOOTROOT (orin 22): un-gated, for the reason on [`BOOT_VOLUME_SERIAL`] — the seam it publishes is
+/// arch-neutral, so the publication is too. It does NOT decide the root; `fs::bootdisk` does that by
+/// content, and takes no hint from here. The witness text below is unchanged; on a target that
+/// compiles no FRGUARD the "guard ARMED/DISARMED" clause reads as what it has always been, a
+/// statement about the x86 substitution guard.
 pub fn set_boot_volume_serial(serial: u32) {
     BOOT_VOLUME_SERIAL.store(serial, core::sync::atomic::Ordering::Release);
     if serial == 0 {
@@ -995,9 +1014,16 @@ pub fn set_boot_volume_serial(serial: u32) {
 ///
 /// SDHC-4c reads it for its reserve witness ONLY — the line names the boot serial and the card's
 /// volume serial side by side, so a capture shows whether the reserved extent lives on the medium
-/// this kernel booted from, and the FRGUARD verdict above can be read together with it. Nothing
-/// keys behaviour off this getter: SDHC-4c's bound is the LBA extent, not an identity test.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+/// this kernel booted from, and the FRGUARD verdict above can be read together with it.
+///
+/// BOOTROOT (orin 22): un-gated on every arch, and STILL not a behavioural input to the root.
+/// [`crate::fs::fat::locate_boot_volume`] is the one seam over it — "which enumerated source carries
+/// the volume the loader named?" — and `shell::vfs_mount_table` deliberately does not call it:
+/// `fs::bootdisk` finds the disk by comparing this kernel's `.text` against candidate files, so a
+/// board that boots off USB one flight and the onboard slot the next needs no hint and gets none.
+/// The sentence that used to end this doc ("Nothing keys behaviour off this getter") is therefore
+/// still true, and is kept: SDHC-4c's bound is the LBA extent, not an identity test, and the root's
+/// bound is a byte comparison, not a serial.
 pub fn boot_volume_serial() -> u32 {
     BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire)
 }

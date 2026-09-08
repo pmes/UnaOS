@@ -1677,8 +1677,18 @@ fi
 # READ-ONLY to the card by construction (no CMD24/write path). Standalone (does NOT imply tegra, mirroring
 # pcieprobe): the recon runs on BOTH the metal tegra path (combine with UNAOS_TEGRA=1) and the QEMU virt
 # GICv3 path, where — QEMU modelling no Tegra234 SDMMC — the tegra-gated MMIO is compiled out and it prints
-# one honest compiled-present witness line (zero MMIO). Default OFF => module + call sites vanish,
-# byte-identical to baseline. See arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
+# one honest compiled-present witness line (zero MMIO).
+#
+# ⚠ BOOTROOT (orin 22): "Default OFF" IS NO LONGER TRUE OF THE JETSON IMAGE, and this line is not
+# where that is decided. `esp_jetson()` now forces `sdmmc` the way it forces `tegrasmp` and
+# `bsptick` (opt out with UNAOS_NOSDMMC=1) — see the block there for the argument. It has to:
+# `BlockSource::TegraSd` exists ONLY under `sdmmc` (fs/fat.rs:599), so without it the boot-disk
+# walk cannot enumerate the Orin's onboard slot at all, and "boot dumb, presume nothing about the
+# machine" means every disk driver the board has is aboard, not behind an opt-in. THIS knob is
+# still what arms the recon on OTHER paths (virt GICv3 `test-arm`, `UNAOS_TEGRA=1 ./arroyo check`),
+# where it remains default OFF and byte-identical to baseline.
+#
+# See arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_SDMMC:-}" ] && _feats="${_feats}sdmmc,"
 # ORIN-SDMMC-2: UNAOS_SDMMC_ARM=1 is the SEPARATE explicit write ARM on top of UNAOS_SDMMC (double-gating —
 # writes require BOTH the sdmmc feature AND this arm; the recon knob alone never writes the card). It pulls
@@ -5048,6 +5058,27 @@ esp_jetson() {
                 *) _feats="${_feats}bsprun,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
             esac
         fi
+    fi
+    # BOOTROOT (orin 22): `sdmmc` is DEFAULT-ON for the jetson image. Opt out with UNAOS_NOSDMMC=1
+    # (the pre-flip baseline: no onboard-slot driver in the image at all). Idempotent, the tegrasmp
+    # shape, and in this block rather than the knob mapping for the reason ORIN-TICKDEFAULT gives —
+    # `esp-jetson` forces `tegra` into the feature list without ever setting the UNAOS_* env var the
+    # mapping lines key on, so a knob-mapping entry would never reach bench media.
+    #
+    # WHY IT IS NOT OPTIONAL ANY MORE. Peter, 2026-09-08: "boot cold, boot dumb, presume nothing about
+    # the machine." The kernel is no longer told where it came from — `fs::bootdisk` enumerates every
+    # disk the board has and binds the one carrying THIS kernel's own bytes. That walk can only see a
+    # disk whose driver is IN THE IMAGE, and `BlockSource::TegraSd` exists only under `sdmmc`
+    # (`fs/fat.rs:599`), so a plain `./arroyo esp-jetson` could not enumerate the Orin's onboard slot
+    # AT ALL — the type does not exist to name it (rmbp 16's type-level blocker). Boot dumb means
+    # every disk driver the board has is aboard; a card-resident root behind an opt-in knob is the
+    # presumption this arc removes. The card stays READ-ONLY: `BlockSource::TegraSd::write_veto` and
+    # `block::write_block_tegra_sd` both refuse in every cfg, so arming the driver arms no writer.
+    if [ -z "${UNAOS_NOSDMMC:-}" ]; then
+        case ",${_feats}" in
+            *",sdmmc,"*) ;;
+            *) _feats="${_feats}sdmmc,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+        esac
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"

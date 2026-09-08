@@ -252,14 +252,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
     unaos_kernel::install::selfguard::set_boot_volume_serial(boot_info.boot_volume_serial);
 
-    // FRGUARD (GR21): the SAME field, published a second time — into the block layer's Default-write
-    // substitution guard. Deliberately not sharing INSTALL-SELF's copy above: that one is gated on the
-    // installer features, which no bench or boot build carries, and that is exactly why its
+    // BOOTROOT (orin 22, was FRGUARD/GR21): the SAME field, published a second time — into the block
+    // layer. Deliberately not sharing INSTALL-SELF's copy above: that one is gated on the installer
+    // features, which no bench or boot build carries, and that is exactly why its
     // `:: install: boot volume serial …` witness appears ZERO times across the 30-boot capture at
     // capture/rmbp-gr16-s73. A guard whose own input is invisible on the wire can be neither trusted
-    // nor falsified, so this arm carries its own publication and its own witness. Gated to the builds
-    // that compile the guard, so every other target is untouched.
-    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    // nor falsified, so this arm carries its own publication and its own witness.
+    //
+    // UN-GATED, on every target. It used to be `cfg(x86_64 + sdhcblk)` with the note "gated to the
+    // builds that compile the guard, so every other target is untouched" — true while the only
+    // reader was the x86 Default-write substitution guard, and FALSE the moment the datum became a
+    // shared seam. That sentence is the one rmbp 16 asked be rewritten rather than left to rot, and
+    // this is the rewrite.
+    //
+    // ⚠ WHAT IT IS NOT: it is not how `/` is chosen. BOOTROOT's root walk (`fs::bootdisk`) takes NO
+    // hint from the loader — Peter, 2026-09-08: "WTF does it matter what method I choose to boot?
+    // You are assuming too much." The kernel brings up every disk driver the board has, enumerates
+    // every FAT volume on every source, and binds the disk carrying the file whose bytes ARE this
+    // kernel's `.text` window. A serial the firmware handed over is precisely the assumption that
+    // walk exists to avoid making.
+    //
+    // WHAT IT IS: the seam its two real consumers need — INSTALL-SELF and FRGUARD both have to know
+    // which volume the loader came off so they can refuse to erase or substitute it, and rmbp asked
+    // that the seam be arch-neutral rather than x86-shaped. `fat::locate_boot_volume` is its one
+    // lookup. A build with no loader (Pi bare-metal `kernel8`, which synthesizes its own BootInfo)
+    // publishes nothing here and roots perfectly well without it; a loader that could not identify
+    // its medium publishes 0, the disarmed sentinel, and nothing about the root changes either.
     unaos_kernel::drivers::block::set_boot_volume_serial(boot_info.boot_volume_serial);
 
     // JC3 (virt/UEFI, GICv3 only): capture the firmware RAM-GiB map from boot_info BEFORE memory::init
@@ -2030,7 +2048,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // 1. Install the kernel's own MMU FIRST — SILENT. Nothing has printed yet (fbcon::init is
     //    print-free when fb_addr == 0), and the serial path cannot touch UARTC until this maps the
     //    Tegra device window. The FIRST serial byte of the whole kernel is the `mmu live` line below.
-    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info); unaos_kernel::arch::serial::mark_mmio_ready(); // DARKWIN-GUARD arm — window mapped; see tegra_darkwin_witness (tail)
+    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info); unaos_kernel::arch::serial::mark_mmio_ready(); unaos_kernel::drivers::block::set_boot_volume_serial(boot_info.boot_volume_serial); // DARKWIN-GUARD arm — window mapped; see tegra_darkwin_witness (tail). BOOTROOT (orin 22): the boot-volume-serial publish, folded onto THIS line. `kernel_main` calls `tegra_early_stop(boot_info)` at :190 and this fn is `-> !`, so the publish at :281 is DEAD CODE on a tegra image — a cfg widening alone would compile a seam nothing ever writes (ORIN-BOOTID, 72e2ecff, made the same fold for the same reason). It rides this line because `mark_mmio_ready()` immediately before it is what lets the witness reach UARTC at all, and because a same-line append moves no panic::Location. Every statement precedes the first `//` (the A9/PRTSCR-ORIN lesson). It does NOT decide the root: `fs::bootdisk` finds that by content — see the block at :255.
     serial_println!(
         ":: tegra: mmu live (EL{}) — RAM Normal-WB + Tegra Device-nGnRE mapped ::",
         mmu.el
