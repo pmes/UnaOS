@@ -170,6 +170,21 @@ The executable half is the point: `unaos/arroyo:2143`'s `case ",${_af#--features
 :247). **Derive the case from it.** The commit carries its own grep, and `panic::Location` embeds
 source lines, so line-neutral or tail-append only.
 
+## Q4b — THE x86 SPECS ARE WIRED TO NOTHING (B95). Above the gate work, because it decides what the gate work is worth.
+
+**No `arroyo` verb runs any x86 spec.** Every `--spec` call in the tree is a Pi one (`:6477`
+`pi4-regression.spec`, `:6500` `$k8_spec`); the x86 verbs assert via `DEFAULT_FORBIDS` (`:2259`) and
+never open a spec file. So `x86-witness.spec`, `x86-wc.spec`, `x86-fat.spec`, `x86-holocron.spec`,
+`x86-wifival.spec`, `rmbp-boot.spec` and `round6-rmbp.spec` are operator-invocable through the
+`mbench` passthrough (`:7287`) and exercised by no DONE gate.
+
+**Prose already treats them as live** — `arroyo:611` on what `x86-wifival.spec` "asserts", five
+`engine.md` citations of `x86-witness.spec` pinning invariants.
+
+**Do this before Q5's junction/gate work:** B85 verified six FORBIDs could fire against their
+emitters and never asked whether the file runs. Wiring one spec into the x86 verb is worth more than
+perfecting rules inside a file nothing opens — and the wiring is where a RED-first proof belongs.
+
 ## Q5 — GATES THIS LANE OWES. Code-only, parallelizable, one executor each.
 
 - **B63 — GATE-LEDGER's column-count blind spot.** Confirmed absent at `unaos/scripts/ledger-check.sh`
