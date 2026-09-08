@@ -439,8 +439,14 @@ pub enum Verdict {
 pub struct Home {
     /// The source its mount reads through. Printed as `source=`; never part of the path.
     pub source: BlockSource,
-    /// The full mount point, `/volumes/<NAME>`, already made unique against its siblings.
+    /// The full mount point, `/volumes/<NAME>`, already made unique against its siblings. This is
+    /// what gets MOUNTED.
     pub point: String,
+    /// Just the NAME — the unique leaf of `point`, without the `/volumes/` prefix. This is what the
+    /// witness PRINTS (beside a literal `/volumes/`, so the path is greppable in the artifact), and
+    /// it is the `FatBackend`'s volume name. Carried rather than re-split off `point` at each use:
+    /// two derivations of one value drift, and both of these are load-bearing.
+    pub name: String,
     /// The label bytes this name was derived from — printed as `label_raw=` only when `altered`.
     pub label_raw: [u8; 11],
     /// Did sanitizing have to change any byte? `true` ⇒ the witness prints `label_raw=`, so a card
@@ -616,7 +622,9 @@ fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
 ///
 /// The suffix is a fact about a COLLISION between two cards on this machine, not about either card,
 /// so it is not `altered` and it does not reach the witness's `label_raw=`.
-fn next_volume_point(used: &mut Vec<String>, name: &str) -> String {
+/// Returns `(unique name, full point)` — BOTH, from the one value, so the witness and the mount
+/// cannot come to disagree about what this volume is called.
+fn next_volume_point(used: &mut Vec<String>, name: &str) -> (String, String) {
     let mut candidate = String::from(name);
     let mut n = 0u32;
     while used.iter().any(|u| u == &candidate) {
@@ -624,7 +632,8 @@ fn next_volume_point(used: &mut Vec<String>, name: &str) -> String {
         candidate = alloc::format!("{} {}", name, n);
     }
     used.push(candidate.clone());
-    alloc::format!("{}/{}", VOLUMES, candidate)
+    let point = alloc::format!("{}/{}", VOLUMES, candidate);
+    (candidate, point)
 }
 
 /// HOMESOIL: admit a source as a NEW disk, or record it as an ALIAS of one already admitted.
@@ -656,9 +665,11 @@ fn plan(disks: &[Disk], unafs: &[bool]) -> (Option<usize>, Vec<Home>) {
             continue;
         }
         let (name, altered) = sanitize_label(&d.label);
+        let (uniq, point) = next_volume_point(&mut used, &name);
         others.push(Home {
             source: d.source,
-            point: next_volume_point(&mut used, &name),
+            point,
+            name: uniq,
             label_raw: d.label,
             altered,
             unafs: unafs.get(i).copied().unwrap_or(false),
@@ -1070,7 +1081,20 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     for h in s.others.iter() {
         // The backend's volume NAME is the point's unique leaf, so `same_volume` answers about the
         // mount a person can see rather than about a bus the path no longer names.
-        let vol_name = h.point.rsplit('/').next().unwrap_or(UNTITLED);
+        //
+        // It is also what the witness PRINTS, with `/volumes/` spelled as a LITERAL in the format
+        // string below rather than folded into the argument. The wire is byte-identical either way;
+        // what changes is that `strings kernel.elf | grep 'volume mounted /volumes/'` can find it.
+        // A `{}` carrying the whole runtime-built point leaves only `[vfs] volume mounted ` in
+        // rodata, and an artifact census for the path would then read 0 on a correct image — which
+        // is how a census comes to certify the wrong thing. (Found by this arc's own gate.)
+        //
+        // The leaf is the one `next_volume_point` handed out, carried on [`Home`] rather than
+        // re-split off `point` here: a witness that re-derives what it prints from a string can
+        // drift from the thing it is describing, and the literal above only stays honest while the
+        // point really is `/volumes/` + this name. `point` is what gets MOUNTED; `name` is what
+        // gets PRINTED; `plan` built both from the same value in the same statement.
+        let vol_name = h.name.as_str();
         let be = FatBackend::new_source(vol_name, KERNEL_PRINCIPAL, true, h.source);
         // ONE sample, from the backend being mounted — not a second derivation of the posture.
         let rw = !be.read_only();
@@ -1080,16 +1104,16 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
             // shows all 11 bytes as hex, un-interpreted.
             if h.altered {
                 serial_println!(
-                    "[vfs] volume mounted {} source={} rw={} label_raw={} ::",
-                    h.point,
+                    "[vfs] volume mounted /volumes/{} source={} rw={} label_raw={} ::",
+                    vol_name,
                     h.source.name(),
                     if rw { "yes" } else { "no" },
                     hex11(&h.label_raw)
                 );
             } else {
                 serial_println!(
-                    "[vfs] volume mounted {} source={} rw={} ::",
-                    h.point,
+                    "[vfs] volume mounted /volumes/{} source={} rw={} ::",
+                    vol_name,
                     h.source.name(),
                     if rw { "yes" } else { "no" }
                 );
@@ -1240,10 +1264,16 @@ fn homesoil_selftest() {
     let dots = sanitize_label(b"..         "); // `.` is NOT whitelisted, so `..` cannot survive
     let evil = sanitize_label(&L_EVIL); // separators, NUL, DEL, a byte >= 0x80
     let mut used: Vec<String> = Vec::new();
+    // `.1` is the full point; `.0` is the leaf the witness prints. Both are asserted, because the
+    // wire is `/volumes/` (a literal) + the leaf, and a leaf that did not match its own point would
+    // print a path nothing is mounted at.
     let c0 = next_volume_point(&mut used, &blank.0);
     let c1 = next_volume_point(&mut used, &noname.0);
     let c2 = next_volume_point(&mut used, &named.0);
     let c3 = next_volume_point(&mut used, &named.0);
+    let leaves_agree = [&c0, &c1, &c2, &c3]
+        .iter()
+        .all(|(n, p)| *p == alloc::format!("{}/{}", VOLUMES, n));
     // What the RESOLVER must never see, asserted on the PRODUCED string rather than argued about:
     // every byte of every name this function can emit is in the whitelist, so `/`, `\`, NUL, control
     // bytes and everything ≥ 0x80 are absent by the same rule that admits the rest.
@@ -1264,10 +1294,11 @@ fn homesoil_selftest() {
         && evil.1
         && clean
         && dot_excluded
-        && c0 == "/volumes/Untitled"
-        && c1 == "/volumes/Untitled 1"
-        && c2 == "/volumes/UNAOS-PI"
-        && c3 == "/volumes/UNAOS-PI 1";
+        && leaves_agree
+        && c0.1 == "/volumes/Untitled"
+        && c1.1 == "/volumes/Untitled 1"
+        && c2.1 == "/volumes/UNAOS-PI"
+        && c3.1 == "/volumes/UNAOS-PI 1";
     serial_println!(
         ":: HOMESOIL: names {} blank={} noname={} dots={} evil={} raw={} points {} {} {} {} :: {} ::",
         named.0,
@@ -1276,10 +1307,10 @@ fn homesoil_selftest() {
         dots.0,
         evil.0,
         hex11(&L_EVIL),
-        c0,
-        c1,
-        c2,
-        c3,
+        c0.1,
+        c1.1,
+        c2.1,
+        c3.1,
         if leg3 { "PASS" } else { "FAIL" }
     );
 
