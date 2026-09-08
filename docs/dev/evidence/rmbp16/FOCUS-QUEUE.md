@@ -155,8 +155,11 @@ source lines, so line-neutral or tail-append only.
 - **B74's second defect** — `[wc-k] rollup scope=fills` renders a VERDICT on `samples=4`, so it reds
   under host load. It wants `INSUFFICIENT-SAMPLE` as a state distinct from a verdict.
 - **`UNAOS_GIT_SHA`** — stamped into every build, read only by a Pi-only default-off HTTP body.
-- **`partitions.md`'s "aarch64 only, because `fs::unafs` is"** is false (`lib.rs` / `fs/mod.rs`
-  declare it unconditionally). One-paragraph doc fix; this lane carries it, orin flagged it.
+- ~~`partitions.md`'s "aarch64 only, because `fs::unafs` is" is false~~ — **REMOVED, B84. The
+  sentence is TRUE and the flag was wrong**: it names the kernel MODULE `fs::unafs`, declared once at
+  `fs/mod.rs:36` under `#[cfg(target_arch = "aarch64")]` on every head checked; what is unconditional
+  is the arch-neutral library CRATE of the same name at `unaos/libs/fs/unafs/src/lib.rs` (zero
+  `target_arch` gates). Do not edit the doc.
 - **B58's `video/prtscr.rs`** — still FAT-direct; the module doc at `:17` says so in as many words.
 - **B10 — the R19 shut-out register. A READING task, still never started**; its executor was killed
   at minute four three rounds ago. R19 is why it matters: failed paths stay open, and this register
@@ -176,12 +179,19 @@ source lines, so line-neutral or tail-append only.
 
 ## What rmbp 16 REMOVED from this queue, and why it matters
 
-rmbp 15's queue and the rmbp-16 baton both carried: *C15 collapses the arming polarity, so
+**Two items, not one.** rmbp 15's queue and the rmbp-16 baton both carried: *C15 collapses the arming polarity, so
 `#require=sdmmc` stops discriminating and this seat owes a new staging predicate.* **Retracted —
 B82.** `esp_jetson()` forces `tegra` (+`tegrasmp`) and never adds `sdmmc`; `sdmmc` enters only via
 `UNAOS_SDMMC=1` (`arroyo:1682`) or `UNAOS_SDMMCROOT=1` (`:1738`). Verified here at this seat's own
 tip after orin 21 derived it from the other end. **A queued work item that existed only because of a
 wrong premise is deleted, not scheduled** — which is the cheapest thing verification ever buys.
+
+The second is the `partitions.md` doc fix, **retracted as B84**: the flag read the arch-neutral
+library crate `unafs` and the doc's sentence names the aarch64-gated kernel module `fs::unafs`. The
+"fix" would have introduced the falsehood it was sent to remove. **Two queued items deleted by
+verification this round, zero scheduled** — and all three of this round's findings (B81's legibility,
+B82's matrix leg, B84's shared name) are the same class: the wrong object is the one easier to reach,
+and nothing in any of them malfunctions.
 
 ## Nine-executor shape, if the pivot comes with the fleet
 

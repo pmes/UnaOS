@@ -56,7 +56,18 @@ value:** only this seat can say the list is empty; a peer can only confirm that 
    **166 ahead / 94 behind**, not 121/94; `drivers/xhci/mod.rs` diverges **21/86 over 22 hunks**,
    not 12/77; and Q2 is closed. The J1 growth has a measured rate — **+45 commits in one round in
    which no kernel code was written** — so the landing's price is a function of rounds waited.
-4. **orin told, first turn**, with the same-turn `ls-remote`: their bounced Correction-02 delivered
+4. **B84 — a queued doc "fix" that would have introduced the falsehood it was sent to remove.**
+   The baton carries, from orin, that `partitions.md`'s *"aarch64 only, because `fs::unafs` is"* is
+   false. It is TRUE: the sentence names the kernel module, declared once at `fs/mod.rs:36` under
+   `#[cfg(target_arch = "aarch64")]` — present on all seven refs checked, including the fold tip, so
+   it is not branch skew. What is unconditional is a **different object with the same name**, the
+   arch-neutral library crate at `unaos/libs/fs/unafs/src/lib.rs` (zero `target_arch` gates); the
+   doc's own paragraph contrasts them two sentences earlier. Retraction, not an edit.
+   **Three findings this round, one class** — B82's matrix leg read as a build verb, B84's crate read
+   as a module, and B81's legible instrument cited over the sound one. **Two queued work items
+   deleted by verification, zero scheduled.**
+
+5. **orin told, first turn**, with the same-turn `ls-remote`: their bounced Correction-02 delivered
    and independently verified here; the standing grants re-stated in a form they can hold this seat
    to (`fs/unafs.rs` size 8 MiB granted / posture stopped; `fits=` make-it-sound-do-not-rename; the
    `fs/vfs.rs` `NativeBackend` `cfg` STOP tripwire); exactly what CLAIMCHECK-2 must carry for the
