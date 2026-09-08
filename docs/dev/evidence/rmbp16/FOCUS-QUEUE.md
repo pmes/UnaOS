@@ -181,9 +181,26 @@ never open a spec file. So `x86-witness.spec`, `x86-wc.spec`, `x86-fat.spec`, `x
 **Prose already treats them as live** — `arroyo:611` on what `x86-wifival.spec` "asserts", five
 `engine.md` citations of `x86-witness.spec` pinning invariants.
 
-**Do this before Q5's junction/gate work:** B85 verified six FORBIDs could fire against their
-emitters and never asked whether the file runs. Wiring one spec into the x86 verb is worth more than
-perfecting rules inside a file nothing opens — and the wiring is where a RED-first proof belongs.
+**⛔ THE FIRST FIX WRITTEN HERE WAS ITSELF A HARD-CODING and is retracted: "wire one spec into the
+x86 verb" is `:6477`'s defect copied to a second lane — a verb naming a path.** Peter, mid-round, on
+exactly this. **The shape that is not a hard-coding is the same one BOOTROOT uses for disks: DISCOVER,
+do not ENUMERATE.**
+
+- **The spec already declares what it is for — in a comment.** `x86-witness.spec:5`:
+  `#   Run:    ./arroyo mbench --replay <capture> --spec … --platform x86`. The fact exists and is not
+  machine-readable, so the verb keeps a second, drifting copy of it.
+- **`--platform pi` on the command line is the same defect one level down:** the platform is ASSERTED
+  BY THE CALLER instead of DECLARED BY THE SPEC. Two sources for one fact and the caller wins — the
+  round's own pattern (the artifact answers; not the argument one layer up).
+- **The fix: the spec declares its own applicability as a DIRECTIVE** (mbench already parses
+  directives — `KIND_ORDER` at `:137`), **and the verb ENUMERATES `scripts/specs/*.spec` and runs
+  every spec that declares itself for this platform.** Then adding a spec wires itself, no path is
+  named anywhere, and `UNAOS_K8_SPEC` (`:6367`) stops being the only way to point the runner at
+  something new.
+- **RED-first belongs at the discovery, not the rules:** a spec that declares a platform and is NOT
+  picked up must fail the run — otherwise the enumeration is itself a check that cannot fire.
+
+**Do this before Q5's junction/gate work:** B85 perfected rules inside a file nothing opens.
 
 ## Q5 — GATES THIS LANE OWES. Code-only, parallelizable, one executor each.
 
