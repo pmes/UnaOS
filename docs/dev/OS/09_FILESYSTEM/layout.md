@@ -31,6 +31,19 @@ firmware, `overlays/` and every fixture's scratch file. `shell::EXEC_ROOT` was `
 second probe of `exec_resolve`, i.e. the reason a bare `vug` worked from anywhere.
 
 ### 1.2 Jetson Orin Nano (`hw-jetson`, `tegra` + `sdmmcroot`)
+> **SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** The per-board root knob this
+> section describes — `UNAOS_SDMMCROOT=1` / cargo `sdmmcroot`, its file-tail section in
+> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::TegraSd` constructor in `fs/vfs.rs`
+> and its statement in `shell::vfs_mount_table` — is DELETED. Nothing below is edited away: the rows
+> record what was true and why, and remain the history of how the fault was found. What replaces it
+> is `fs/bootdisk.rs`: the kernel is told nothing about where it came from, brings up every disk
+> driver the board has, enumerates every FAT volume on every source, and finds the ONE file whose
+> bytes are this running kernel's own `.text` window. That disk is the hard drive; `/`, `/boot` and
+> `/apps` bind to it. Zero disks or no match prints one witness naming what was looked for and what
+> was found, and the mount table is EMPTY (the verbs answer `-ENODEV`); two or more matches REFUSE
+> rather than guess. No board, slot, bus, serial, card geometry, boot method or knob is in the
+> decision.
+
 
 The shared builder above ran, and then `sdmmc_tegra::sdmmc_root_bind` (§ROOTFS,
 `arch/aarch64/sdmmc_tegra.rs`) **re-pointed both `/` and `/fat`** at the card's FAT through

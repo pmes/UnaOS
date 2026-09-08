@@ -3793,10 +3793,12 @@ pub fn vfsroute_witness() {
     // --- leg 6: THE ALIASING SHAPE ITSELF (VOLID, orin 18 — rmbp 15 condition C1) -----------------
     //
     // C1 is not a property of any prefix a particular board happens to mount: it is ONE MEDIUM
-    // BOUND TWICE UNDER TWO DIFFERENT NAMES. `sdmmc_root_bind` does exactly that on the Orin —
-    // `FatBackend::new_tegra_sd("card", …)` at `/` and `new_tegra_sd("fat", …)` at `/boot` — and
-    // `same_volume` compared the two NAMES, so one physical card read as two volumes and
-    // `mv /A.TXT /boot/B.TXT` was refused as cross-volume on the exact configuration render9 flies.
+    // BOUND TWICE UNDER TWO DIFFERENT NAMES. The retired per-board root knob did exactly that on
+    // the Orin — the card typed `"card"` at `/` and `"fat"` at `/boot` — and `same_volume` compared
+    // the two NAMES, so one physical card read as two volumes and `mv /A.TXT /boot/B.TXT` was
+    // refused as cross-volume on the exact configuration render9 flies. BOOTROOT (orin 22) mounts
+    // the found boot disk under ONE name at every prefix it binds, so no live table types that
+    // shape today — which is precisely why this leg still has to build it.
     //
     // NO BOARD THIS GATE CAN BOOT MOUNTS THAT SHAPE. x86 binds both prefixes under the SAME name
     // and therefore answered correctly by luck; the Pi's two prefixes are genuinely two volumes.
@@ -7141,7 +7143,7 @@ fn vfs_path(arg: &str) -> String {
 /// same handle, and on a machine booted from the internal SD reader the global slot is the wrong
 /// one. It is bound at BOTH `/` and `/boot`, because `/boot` is the spelling the packaging text, the
 /// staged-image script and `exec_resolve`'s second probe all use for that one volume — the same
-/// two-prefix shape `sdmmc_root_bind` already uses on the Orin, and honest for the same reason
+/// two-prefix shape the aarch64 arm uses on the Orin, and honest for the same reason
 /// (`/boot` IS a mount point, so `ls /` showing it is a fact, not decoration).
 ///
 /// An arch with no volume at all returns an EMPTY table, and the verbs report "no filesystem
@@ -7161,7 +7163,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         // `same_volume("/boot", "/apps")` answer false about one card, which is the aliasing defect
         // (rmbp 15 C1) in a new spelling.
         mt.mount("/apps", alloc::boxed::Box::new(
-            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points ALL THREE at the card's FAT through BlockSource::TegraSd (`/boot` and `/apps` too, because `/apps` is EXEC_ROOT and the literal prefix of /apps/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
+            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR)));
         // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
         if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
             mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));

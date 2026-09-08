@@ -11,6 +11,16 @@
 
 Status: **open** · **fixed-unflown** (in tree, not on metal) · **flown** (scored on the wire) ·
 **dropped** (ruled out, with the ruling) · **relayed** (another lane owns it).
+
+> **A28 SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** Row A28's fix — the
+> `sdmmcroot` per-board root knob that re-pointed `/`, `/boot` and `/apps` at the Orin card — is
+> DELETED, and no row below is deleted or re-scored by that: A28 records a real fault and a real
+> fix, and stays as the history of how the root came to be bound at all. It is replaced, not
+> reverted, by `fs/bootdisk.rs`: the kernel is told nothing about where it came from, brings up
+> every disk driver the board has, enumerates every FAT volume on every source, and binds the disk
+> carrying the ONE file whose bytes are this kernel's own `.text` window. Nothing found prints one
+> witness and leaves the table EMPTY; two or more matches REFUSE rather than guess.
+
 Sources: `od` = `docs/dev/OS/08_VIDEO/orin-desktop.md` · `AC` = `docs/dev/evidence/orin12/ARCH-CONFORMANCE.md` ·
 `OB` = `docs/dev/evidence/orin13/ORIN-BROKEN.md` · `RA` = `docs/dev/evidence/orin13/RENDER2-AUDIT.md` ·
 `SD` = `docs/dev/evidence/orin12/SERIAL-DEVLOOP.md` · `FR` = `docs/dev/evidence/orin13/FLIGHT-RESULT.md`.
