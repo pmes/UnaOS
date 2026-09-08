@@ -33,6 +33,24 @@ import re, sys, os, subprocess, glob
 root = sys.argv[1]
 ENUM = ("open", "fixed-unflown", "flown", "landed", "dropped")
 OWNERS = {"orin", "pi", "rmbp", "shared-gate"}
+
+# GATE-LEDGER FIELD COUNT (rmbp-ledger B63, built rmbp 17 2026-09-08). A markdown row is its PIPES,
+# so a literal `|` inside a cell silently becomes a column boundary — and `\|` does NOT save it in
+# this parser. The failure is nasty because it is not silent in a useful way: the row keeps parsing,
+# the columns SHIFT, and what goes red is `owner` or `status` naming a fragment of somebody's prose.
+# That is a gate reporting a symptom two columns downstream of the defect. Assert the count directly,
+# name the sign, and STOP scoring the row — every later check on it would be reading the wrong cells.
+#
+# REGISTERED EXCEPTIONS, and they are registrations rather than a skip list: each is PRINTED on every
+# run, and one that no longer matches a real mismatch goes RED. An allowlist nothing can falsify is
+# the thing this lane keeps convicting (rmbp-ledger B95/B96/B98/B101), so this one is falsifiable in
+# both directions. Both entries must reach zero; neither is a decision to leave the row broken.
+FIELDCOUNT_REG = {
+    "docs/dev/OS/rmbp-ledger.md:B24": "three injections put TWO rows' content on one line; splitting them is a CONTENT call, and the ledger-cell pipe convention it belongs to is Peter's open decision (rmbp-ledger J6). Registered 2026-09-08 by rmbp 17",
+    "docs/dev/OS/orin-ledger.md:C10": "another seat's ledger file — one field over its 6-column header; reported to orin, theirs to fix under their own lane. Registered 2026-09-08 by rmbp 17",
+}
+fc_seen = set()
+registered = []
 FETCHED = ("fixed-unflown", "flown", "landed")
 files = [p for p in ["docs/dev/LEDGER.md"] + sorted(glob.glob("docs/dev/OS/*-ledger.md")) if os.path.exists(p)]
 skipped = [p for p in ["docs/dev/LEDGER.md"] if not os.path.exists(p)]
@@ -155,6 +173,19 @@ for path in files:
             if not m:
                 red.append(f"{where}: row id `{cells[0][:30]}` does not match ^[A-Z]+[0-9]+"); continue
             rid = m.group(1)
+            # FIELD COUNT first: every check below indexes cells by header position, so a shifted row
+            # makes all of them read the wrong text. Report the row, not its symptom, and move on.
+            if len(cells) != len(hdr):
+                _k = f"{path}:{rid}"
+                _d = len(cells) - len(hdr)
+                if _k in FIELDCOUNT_REG:
+                    fc_seen.add(_k)
+                    registered.append(f"{where}: {rid} fields={len(cells)} header={len(hdr)} ({_d:+d}) REGISTERED — {FIELDCOUNT_REG[_k]}")
+                else:
+                    _why = ("a literal `|` inside a cell splits the row (`\\|` does not save it) — reword it"
+                            if _d > 0 else "a cell is missing; every column needs one, `—` for empty")
+                    red.append(f"{where}: {rid} has {len(cells)} fields, header has {len(hdr)} ({_d:+d}) — {_why}")
+                continue
             if rid in ids: red.append(f"{where}: duplicate id {rid}")
             ids.add(rid)
             status_raw = cells[st] if st < len(cells) else ""
@@ -317,9 +348,18 @@ if "docs/dev/LEDGER.md" in files:
         for _ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", _line):
             _check_ref(_ref, f"docs/dev/LEDGER.md:{_ln}", _m.group(1), red, deferred, ledger_ids, files, STRICT)
 
+# A REGISTRATION THAT NO LONGER MATCHES ANYTHING IS ITSELF A FINDING — the allowlist has to be
+# falsifiable or it becomes the place defects go to be forgotten. Skipped for a file not in this tree.
+for _k, _why in FIELDCOUNT_REG.items():
+    if _k not in fc_seen and _k.split(":")[0] in files:
+        red.append(f"stale field-count registration {_k} — the row parses correctly now; delete the entry ({_why})")
+
 for p in skipped: say(f"SKIP {p} — not in this tree (arrives at the trunk sync)")
 if rows_seen == 0:
     say("NO VERDICT — no ledger rows found in", files or "(no ledger files)"); sys.exit(2)
+if registered:
+    say(f"FIELD COUNT — {len(registered)} registered exception(s); NOT findings, and each must reach zero:")
+    for r in registered: print("   ", r)
 if deferred:
     say(f"DEFERRED — {len(deferred)} cross-branch cross-ref(s); NOT findings. Strict is {STRICT_WHY};"
         f" these become reds automatically when this lands on `{TRUNK}`:")
@@ -334,7 +374,7 @@ if red:
     for r in red: print("   ", r)
     sys.exit(1)
 _defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
-say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, status ∈ enum, owners known, cross-refs resolve{_defnote}, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
+say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, field counts match their header, status ∈ enum, owners known, cross-refs resolve{_defnote}, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
 PY
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
@@ -343,6 +383,10 @@ PY
 #   owner "peter"          -> RED                        `S99` in a PARAGRAPH  -> GREEN (prose control)
 #   evidence/*.log without `size 0x`/`img=[` -> RED      RULINGS R-row status `pending` -> RED
 #   RULINGS `superseded` with no R<n> in superseded-by -> RED
+#   a literal `|` added inside any cell -> RED naming the row, the counts and the sign (B63)
+#   a cell DELETED from a row              -> RED, the negative sign, "a cell is missing"
+#   a registered row (B24/C10) unchanged   -> printed as REGISTERED, exit 0, never silent
+#   a registration whose row is repaired   -> RED as a stale registration (the allowlist is falsifiable)
 #   `→ SO99` in a row      -> DEFERRED, exit 0, PRINTED (SO is branch-local; hw-jetson owns it)
 #   the same under UNAOS_LEDGER_STRICT=1 -> RED, exit 1   (the landing's setting)
 #   `→ SR2` on hw-rmbp     -> resolves, neither red nor deferred (the control: the check still fires
