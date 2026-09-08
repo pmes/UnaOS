@@ -79,12 +79,13 @@ no reports without an injector `arroyo` does not have. **The rMBP at the glass i
   read it before applying and negotiate if it survives the rebase.
 - **Gate before the card write, UNDER R27 (Peter, 2026-09-08): the FOCUS PLATFORM'S OWN.** `./arroyo
   check` (one verb, both arches, 3.1 s warm — R27 does not reach it) and `UNAOS_WC=1 ./arroyo test 150`
-  with `wc` in the **build log**. **`./arroyo test-arm` moves to the BACKGROUND and becomes a LANDING
-  condition, not a flight condition** — start it, fly, and read it before the merge.
-  **⚠ Two things this lane owes because of that: the trade bites hardest HERE (x86 leads shared
-  kernel-core, so x86 changes are the likeliest to break the arch whose battery is still running),
-  and the background result must land as a NAMED ARTIFACT in the landing report or "background"
-  becomes "never" — B95's family.**
+  with `wc` in the **build log**. **`./arroyo test-arm` is DEFERRED — it does not run during the flight
+  at all.** Sequence: gate → stage → card → **metal boot → metal result IN** → *then* `test-arm`,
+  concurrent with the next round's work. A landing condition, never a flight condition.
+  **⚠ Two things this lane owes: the trade still bites hardest HERE (x86 leads shared kernel-core, so an
+  x86 change is the likeliest to break the other arch — AFTER the boot now, not beside it), and the
+  deferred result must land as a NAMED ARTIFACT in the landing report or it becomes "never" — B95's
+  family, and SHARPER here because it is read while this seat is already working the next round.**
 - Score the boot by the **loaded image's `max_vaddr` span** first. A 10/10 card sha proves the WRITE.
 - Ride-alongs, each an open ledger row and the machine is open anyway: **A6** `[clickroute] -> FAIL`
   (deterministic on metal, green in QEMU — bracket it new-with-arc or pre-existing) · **A5** shell
