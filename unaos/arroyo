@@ -4424,7 +4424,9 @@ build_cfg_legs() {
 # cold P=6 run (`du -sh`: slot0 389 M … slot5 371 M; orin 21 measured ~417 MB/slot on its own tree).
 # It lives under `target/check-slots/`, which `target` already gitignores and `rm -rf target` cleans.
 # `UNAOS_CHECK_P=1` is serial-in-slot-dirs (one slot, one worker); `UNAOS_CHECK_P` is read once here
-# and stated in the banner along with the disk cost.
+# and stated in the banner along with the disk cost. UNSET is the DEFAULT and is the OLD PATH: one
+# worker, no --target-dir, the default `target/` — because the table above says the win is COLD only,
+# and a P=6 default on a shared box spends 2.56x the CPU of every other seat's build to save ~2 s warm.
 #
 # NOT MEASURED, so not claimed: why orin 21's tree showed a 155 s warm serial matrix at all when
 # this one shows 3.1 s. Their REPORT §6 addendum already recorded the mechanism as unestablished;
@@ -4443,8 +4445,11 @@ _cfg_slot_worker() {
         [ "$_fs" = "$_s" ] || continue
         _t0=$(date +%s.%N)
         # `if ... else` (not a bare command) so `set -e` cannot abort the worker on the first red leg.
+        # An EMPTY _slotbase means the default target dir (UNAOS_CHECK_P unset): no --target-dir at all,
+        # so the leg is the old serial gate's cargo line verbatim and shares the dir every other verb uses.
+        local -a _tdarg=(); [ -n "$_slotbase" ] && _tdarg=(--target-dir "${_slotbase}/slot${_s}")
         if cargo +nightly check --release --target "$_ftgt" $NIGHTLY_FLAGS --features "$_ffeats" \
-             --target-dir "${_slotbase}/slot${_s}" > "${_res}/${_fleg}.log" 2>&1; then _lrc=0; else _lrc=$?; fi
+             "${_tdarg[@]}" > "${_res}/${_fleg}.log" 2>&1; then _lrc=0; else _lrc=$?; fi
         _t1=$(date +%s.%N)
         # `.t` first, `.rc` LAST: the rc file is the "this leg ran" token the count check consumes,
         # so it must not exist until the leg has actually finished.
@@ -4460,19 +4465,28 @@ check_kernel_cfg() {
     local -a _rows=()
     build_cfg_legs || return 1
     _rows=("${KERNEL_CFG_MATRIX[@]}" "${KERNEL_CFG_MIX[@]}" "${KERNEL_CFG_SWEEP[@]}")
-    local _p="${UNAOS_CHECK_P:-6}"
-    case "$_p" in ''|*[!0-9]*|0) _p=6 ;; esac
-    # A slot with no legs is a wasted fork and a slot dir nothing ever populates; clamp rather than
-    # let `UNAOS_CHECK_P=200` fork 200 workers to run 55 legs.
-    [ "$_p" -le "${#_rows[@]}" ] || _p="${#_rows[@]}"
-    local _slotbase="$WORKSPACE_DIR/target/check-slots"
-    local _res="$_slotbase/.results"
+    # DEFAULT = THE OLD PATH (rmbp 16's objection on the table above, accepted): UNAOS_CHECK_P unset
+    # means ONE worker in the DEFAULT target dir — the 3.1 s warm configuration, no extra CPU taken from
+    # other seats on a shared box, no slot dirs. The P-wide slot-dir wave is the COLD-build lever and is
+    # OPT-IN: `UNAOS_CHECK_P=N`. `=1` is one worker in slot0 — a debugging mode, slower cold than the
+    # default (474 s vs 387 s); it is kept because it isolates the matrix from every other verb's dir.
+    local _p="${UNAOS_CHECK_P:-}" _slotbase="$WORKSPACE_DIR/target/check-slots" _mode
+    if [ -z "$_p" ]; then
+        _p=1; _slotbase=""; _mode="serial in the default target dir (set UNAOS_CHECK_P=N for the cold-build lever: N workers, per-slot target dirs, ~400 MB/slot, ~2.5x total CPU)"
+    else
+        case "$_p" in *[!0-9]*|0) _p=6 ;; esac
+        # A slot with no legs is a wasted fork and a slot dir nothing ever populates; clamp rather than
+        # let `UNAOS_CHECK_P=200` fork 200 workers to run 55 legs.
+        [ "$_p" -le "${#_rows[@]}" ] || _p="${#_rows[@]}"
+        _mode="P=${_p} — UNAOS_CHECK_P; leg→slot = cksum(leg name) % P; per-slot target dirs target/check-slots/slot0..$((_p - 1)), ~400 MB/slot, ~2.5x total CPU"
+    fi
+    local _res="$WORKSPACE_DIR/target/check-slots/.results"
     rm -rf "$_res"; mkdir -p "$_res"
     echo -e "${COLOR_YELLOW}⚡ Syntax Check: kernel cfg-gated coverage (${#_rows[@]} legs)...${COLOR_RESET}"
     if [ "${UNAOS_CFG_SWEEP:-0}" != "1" ]; then
         echo -e "${COLOR_CYAN}  (${#KERNEL_CFG_MATRIX[@]} board + ${#KERNEL_CFG_MIX[@]} x86 pairwise-mix; UNAOS_CFG_SWEEP=1 adds the per-feature sweep)${COLOR_RESET}"
     fi
-    echo -e "${COLOR_CYAN}  (P=${_p} — UNAOS_CHECK_P; leg→slot = cksum(leg name) % P; per-slot target dirs target/check-slots/slot0..$((_p - 1)), ~400 MB of disk per populated slot)${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}  (${_mode})${COLOR_RESET}"
     # The feed the workers consume. Built here, from _rows, in list order — so legs-listed
     # (${#_rows[@]}) and legs-fed are the same statement, and the count check below is what proves
     # legs-RUN is too.
