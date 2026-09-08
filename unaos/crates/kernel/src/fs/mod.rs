@@ -25,6 +25,14 @@
 
 pub mod fat;
 
+/// BOOTROOT (orin 22): find the disk this kernel is running FROM, by finding this kernel ON it.
+///
+/// Arch-neutral by construction and with no board `cfg` anywhere in it — that is the whole point.
+/// Peter, 2026-09-08: "boot cold, boot dumb, presume nothing about the machine." The kernel is not
+/// told where it came from; it enumerates every disk the board has and compares its own running
+/// `.text` against candidate files until it finds itself. Design of record: the module docs.
+pub mod bootdisk;
+
 /// SDHC-4c (x86, `sdhcblk` knob): the WRITE PERMIT for the internal SD card — one published,
 /// immutable LBA interval, and the single decision point every FAT-layer write to that card passes
 /// through. Kept in its own file rather than inside `fat.rs` because it is the whole safety

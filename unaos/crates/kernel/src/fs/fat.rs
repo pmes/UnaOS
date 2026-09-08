@@ -1663,7 +1663,12 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
 /// enums are deliberately separate types (one names a FAT read path, the other a registry slot);
 /// this is the single place they are related, so the census can never be attributed to the wrong
 /// device.
-fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
+///
+/// BOOTROOT (orin 22): made `pub` — `fs::bootdisk` has to ask the same question when it decides what
+/// `/` is (the FAT volume it matched the kernel on rides a handle, and whether the native UnaFS mount
+/// rides THAT handle is what separates a native root from a FAT one). It is still the single place
+/// the two enums are related.
+pub fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
     match source {
         BlockSource::Default => crate::drivers::block::BlockHandle::Global,
         BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
@@ -1793,6 +1798,25 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
         }
     }
     out
+}
+
+/// BOOTROOT (orin 22): does a DEVICE exist behind this [`BlockSource`] at all?
+///
+/// The distinction this answers is the one a root witness has to make and [`mount_source`] cannot:
+/// "no disk here" and "a disk with no FAT volume on it" are different facts about a machine, and a
+/// boot that mounts nothing is owed the one that is true. `mount_source(src).is_err()` collapses
+/// them; this does not. Same registry lookups [`volume_serials`] uses, in the same order, so the two
+/// can never disagree about which slot a source names.
+pub fn source_present(source: BlockSource) -> bool {
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
+    };
+    dev.is_some()
 }
 
 /// BOOTROOT (orin 22): which compiled-in [`BlockSource`] carries the FAT volume whose `BS_VolID` is

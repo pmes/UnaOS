@@ -30,7 +30,7 @@ Programs were staged into the FAT **volume root**, beside `KERNEL8.IMG`, `config
 firmware, `overlays/` and every fixture's scratch file. `shell::EXEC_ROOT` was `"/fat"` — the
 second probe of `exec_resolve`, i.e. the reason a bare `vug` worked from anywhere.
 
-### 1.2 Jetson Orin Nano (`hw-jetson`, `tegra` + `sdmmcroot`)
+### 1.2 Jetson Orin Nano (`hw-jetson`, `tegra`) — HISTORY; see §1.4 for what the aarch64 boards do now
 > **SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** The per-board root knob this
 > section describes — `UNAOS_SDMMCROOT=1` / cargo `sdmmcroot`, its file-tail section in
 > `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::TegraSd` constructor in `fs/vfs.rs`
@@ -68,6 +68,58 @@ x86 had **no `EXEC_ROOT`**: its cwd already sat on the volume the executables li
 covered both.
 
 ---
+
+### 1.4 BOTH aarch64 boards, today (BOOTROOT, orin 22) — the root is the disk the kernel was FOUND on
+
+§1.1 and §1.2 describe two different answers to one question, each written down in advance: the Pi
+got `NativeBackend` at `/` unconditionally because the Pi has a UnaFS volume, and the Orin got a knob
+that named the Tegra card because it does not. `shell::vfs_mount_table`'s aarch64 arm now carries
+ONE body with no board `cfg` in it, and it asks instead of assuming.
+
+Peter, 2026-09-08: *"It is an OS booting off an SD card. The card is the hard drive. Every boot is
+stone cold — no prefs, no special checks. Boot cold, boot dumb, presume nothing about the machine,
+even though we keep booting the same machine."* And, on being handed the boot medium's identity by a
+loader: *"WTF does it matter what method I choose to boot? You are assuming too much."*
+
+**The mechanism** (`crates/kernel/src/fs/bootdisk.rs`; the module docs are the design of record):
+
+1. Every disk driver the board has is in the image — none behind a knob. On the jetson image that
+   meant making `sdmmc` default-on (`arroyo`'s `esp_jetson()`, opt out `UNAOS_NOSDMMC=1`), because
+   `BlockSource::TegraSd` exists only under that feature and a walk cannot enumerate a slot whose
+   type is not compiled.
+2. Every FAT volume on every compiled-in `BlockSource` is walked (depth ≤ 4, ≤ 4096 entries; a cap
+   that is HIT is a named reason, never a silent stop).
+3. Every file with `size ≥ 4096` is tested by CONTENT: 4096 bytes of the running kernel's own
+   `.text`, at `_start`, against the same bytes at the corresponding offset in the file — computed
+   through the file's `PT_LOAD`s for an ELF, and at `_start`'s distance from the image base for a
+   flat image. No name, extension, size or directory heuristic is involved.
+4. Matches are COUNTED across all sources. Exactly one ⇒ bind. Zero ⇒ one witness and an EMPTY
+   table (the verbs answer `-ENODEV`); never a guess at another disk. Two or more ⇒ REFUSE, listing
+   `source:path` for each.
+
+**The layout over that disk**, which is the part this document is about:
+
+| prefix  | volume                                                                       |
+|---------|------------------------------------------------------------------------------|
+| `/boot` | the FAT volume the kernel's own image was found in                            |
+| `/apps` | the SAME volume, rooted at `APPS/`, under the SAME volume NAME (see §5.1)     |
+| `/`     | that DISK's native UnaFS volume when it has one and the shared mount is riding that disk; otherwise `/boot`'s volume |
+| `/usb`  | unchanged — the stick, and only when it is actually enumerated (honest hot-plug) |
+
+So the Pi's namespace in §1.1 is reproduced exactly, and now for a reason rather than by
+coincidence: its card carries `KERNEL8.IMG` on FAT p1 and a UnaFS volume on p2, so `/` is native and
+`/boot` is FAT. Measured on `./arroyo kernel8-test 300`:
+
+```
+[vfs] root = boot volume serial=0x894e44b4 source=global match=/KERNEL8.IMG unafs=present
+  matches=1 window_off=0x80000 window_len=4096 file_off=0x0 candidates=12
+  disks=global=present usb=absent sdhc=unbuilt tegra-sd=unbuilt ::
+```
+
+`window_off=0x80000` is the Pi's load address — the window IS `_start` — and `file_off=0x0` is the
+flat-image arm: the first 4096 bytes of `KERNEL8.IMG` are the first 4096 bytes of the running
+kernel. An Orin whose card carries only the FAT ESP gets `/`, `/boot` and `/apps` over that one
+volume, which is the outcome §1.2's knob produced, reached without naming the board.
 
 ## 2. The namespace this arc establishes
 

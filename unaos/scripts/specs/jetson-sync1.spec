@@ -350,6 +350,52 @@ PENDING TEGRA-SD.*block backend published
 FORBID recon (SKIPPED|REFUSED|STOPPED at M3|done at M2)
 FORBID TEGRA-SD: REFUSED to publish
 
+# --- BOOTROOT (orin 22): the root is the disk this kernel was FOUND on ------------------
+# There is nothing here to retire. The brief expected rows keyed on `[sdmmc] root` — the
+# witness family of the deleted `sdmmcroot` knob — and `grep -rn "sdmmc\] root"
+# scripts/specs/` takes ZERO hits across every spec in this tree. That knob was UNFLOWN;
+# no Orin capture ever carried its line, so no row was ever written for it. Measured, not
+# assumed, and stated here so the next reader does not go looking again.
+#
+# WHAT REPLACES IT is `shell::vfs_mount_table` -> `fs::bootdisk::locate`, which is told
+# NOTHING about where the kernel came from: it enumerates every disk the board has and
+# compares this kernel's own running `.text` window (4096 bytes at `_start`) against every
+# candidate file on every FAT volume it can reach. It emits exactly ONE line, on the first
+# build of the mount table, in one of two shapes:
+#
+#   [vfs] root = boot volume serial=0x… source=… match=… unafs=… matches=1
+#                window_off=0x… window_len=4096 file_off=0x… candidates=N disks=… ::
+#   [vfs] root -> NONE reason=… matches=N matched=… disks=… candidates=N
+#                window_off=0x… window_len=4096 ::
+#
+# BOTH ROWS ARE PENDING, and each is pending for its own reason — neither is a placeholder.
+#
+#   `window_len=4096` fires on EITHER shape, so it asks only "did the walk run, and what
+#   window did it compare?". It is PENDING rather than REQUIRE because the line is emitted
+#   when the FIRST VERB builds the mount table, and this spec adjudicates a bring-up boot
+#   whose serial half carries `::` witnesses and keystroke echoes — a flight that never
+#   reaches a filesystem verb legitimately prints no line at all, and reading that as a
+#   regression would be wrong about what failed. An armed flight that DOES reach a verb
+#   reads ✅ and mbench advises the promotion.
+#
+#   `matches=1` fires on the BIND shape only: exactly one file, on one disk, IS this
+#   kernel. It is the row that separates "the walk ran" from "the walk found the machine's
+#   hard drive", and it cannot be promoted ahead of the first row for the same reason.
+#
+# BOUNDING (PI-GRANT rule 5, applied here too): each key is ONE field, `\b`-bounded on the
+# side that can abut, and neither spans two fields joined by a bare space — the fields are
+# emitted in a fixed order today but that order is not a property anyone promised, and a
+# two-field key would red on a re-ordering that changed nothing. No trailing space: mbench's
+# `parse_spec` (scripts/mbench.py:248) `.strip()`s the line, so a trailing space silently
+# inverts the key.
+#
+# DELIBERATELY NOT ADDED — a FORBID on `reason=multiple-kernels`. That line is the finder
+# REFUSING to guess between two disks that both carry this kernel, which is correct
+# behaviour and a fact about the operator's media, not a kernel defect. It belongs in the
+# capture review, not in a row that would red a boot for telling the truth.
+PENDING \bwindow_len=4096\b
+PENDING \bmatches=1\b
+
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the
 # smp_virt path only the BSP drops to EL1 — every PSCI-woken AP replays the BSP's EL2

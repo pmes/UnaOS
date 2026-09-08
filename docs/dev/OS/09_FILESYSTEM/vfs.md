@@ -825,3 +825,124 @@ Call sites: aarch64 after `emmc2::probe()` (the `midden_witness` tail), x86 from
 `fatverb_storage_witness` — the two moments each board actually has volumes to route to.
 `midden_witness`'s own x86 site is at boot step 5, before `pci::init` and the storage publish, where
 a routing leg would assert against an empty namespace and be dead rather than quiet.
+
+
+## 14. BOOTROOT (orin 22) — what `/` IS, and why the kernel is not told
+
+§4's namespace of record answered "what is mounted where" with a per-board table. This section
+replaces the aarch64 half of that answer with a question the kernel asks the machine at run time.
+
+### 14.1 The direction
+
+Peter, 2026-09-08: *"It is an OS booting off an SD card. The card is the hard drive. Every boot is
+stone cold — no prefs, no special checks. Boot cold, boot dumb, presume nothing about the machine,
+even though we keep booting the same machine."* The Pi/Orin difference *"should not matter in either
+case."* And on being handed the boot medium's identity by a loader: *"WTF does it matter what method
+I choose to boot? You are assuming too much."*
+
+So: the kernel is **not told** where it came from. It brings up every disk driver the board has
+(none behind a knob), enumerates the disks, and finds the one that has THIS KERNEL on it, by
+content. That disk is the hard drive. **No board, slot, bus, serial, card geometry, boot method or
+knob is in the decision**, and `crates/kernel/src/fs/bootdisk.rs` carries no board `cfg` anywhere.
+
+What it replaced was two answers written down in advance: an unconditional `NativeBackend` at `/`
+(right for the Pi, a dead mount on the Orin — ledger A28, `ls /` answering `backend error:
+unafs-mount`) and the Orin's `sdmmcroot` knob, which named the Tegra card. Both are deleted.
+
+### 14.2 The window, and why it is `.text` at `_start`
+
+`WINDOW` is **4096 bytes starting at the symbol `_start`**, and the two things compared are the
+bytes at `_start` in the running kernel's memory and the bytes at the corresponding file offset in a
+candidate file. Three properties make that symbol the right one, each measured rather than assumed:
+
+* **It exists on all three link layouts** — x86 UEFI, aarch64 UEFI, and the Pi's flat bare-metal
+  image, where `global_asm!` places it in `.text.boot` and `pi-baremetal.ld` puts that first at the
+  load address. It is `#[unsafe(no_mangle)]` in every one, which is how a LIBRARY module names a
+  symbol defined in the BINARY crate.
+* **It IS the image entry point**, so it doubles as the anchor that maps runtime addresses to file
+  offsets with no second assumption. On the aarch64 image `readelf -h` reports entry `0x64790` and
+  `readelf -s` reports `_start` at `0x64790`.
+* **`.text` is the only section whose bytes are the same in the file and in RAM.** Never
+  `.bss`/`.data`: on the Pi the VideoCore firmware loads `kernel8.img` FLAT and early boot zeroes
+  BSS and writes into the image region long before any VFS work. And it survives PIE relocation:
+  the aarch64 kernel is `Type: DYN`, and `readelf -r` reports ZERO relocations whose offset falls in
+  the `R E` segment `[0x61000, 0x150fb4)`.
+
+### 14.3 The test, per candidate file
+
+Every file with `size >= WINDOW` is a candidate; nothing about its name, extension, size or
+directory is consulted. Its first bytes classify it:
+
+* **ELF** (`\x7fELF`, 64-bit LE): parse `e_entry`, `e_phoff`, `e_phentsize`, `e_phnum`, read the
+  program-header table (bounded, from further sectors when it does not sit in the first), and find
+  the `PT_LOAD` containing the window. With `bias = _start_runtime - e_entry`, a segment's runtime
+  base is `p_vaddr + bias` and the window's file offset is
+  `p_offset + (window_runtime - (p_vaddr + bias))`, bounds-checked against `p_filesz`.
+* **flat image**: entry at file offset 0 by the convention this OS's own build uses for one, so
+  `file_off = window_runtime - _start_runtime`.
+
+`WINDOW` bytes are then read with `FatFs::read_at` — a BOUNDED range read, never a whole file — and
+compared. A candidate that is some *other* program (`VUG.ELF`, `STAT.ELF`) parses fine and yields an
+offset computed from ITS entry; the bytes there are not this kernel's `.text`, so it does not match.
+
+### 14.4 Counting, never first-wins
+
+The walk visits every source and does not stop at the first hit.
+
+| matches | outcome |
+|---------|---------|
+| 1       | bind it |
+| 0       | one `[vfs] root -> NONE reason=…` witness and an **EMPTY** mount table — the verbs answer `-ENODEV` (`vfs_read_target`, `shell.rs`). Never a guess at another disk. |
+| ≥ 2     | **REFUSE**: `reason=multiple-kernels matches=N matched=source:path,…`, table EMPTY |
+
+`reason` is one of `no-disk-enumerated`, `kernel-not-found-on-any-volume`, `walk-cap-hit`,
+`multiple-kernels` — so "no disk at all", "disks but not this kernel" and "the walk ran out of
+budget before it could say" are three different sentences, not one.
+
+### 14.5 The layout over that disk
+
+`/boot` is the FAT volume the kernel was found in. `/apps` is the SAME volume rooted at `APPS/`,
+under the **same volume NAME** — a distinct name would make `same_volume("/boot", "/apps")` answer
+false about one card, which is §13.2.1's C1 aliasing defect in a new spelling. `/` is that disk's
+native UnaFS volume when it has one *and* the shared `unafs::MOUNT` is riding that disk; otherwise
+`/boot`'s volume, so a card carrying only a FAT volume still has a root. `/usb` is unchanged and
+still bound only when the stick is actually enumerated.
+
+The middle clause is not a formality. `unafs::MOUNT` is handle-DISCOVERING (UNAFSBIND): it probes
+`bind_probe_candidates()` in enum order and `Global` wins outright whenever it holds a volume. On a
+machine where two disks carry UnaFS volumes the shared mount may therefore be riding a *different*
+disk from the one the kernel booted off, and binding `NativeBackend` at `/` there would root the
+system on a medium it did not come from. Building a second live mount to avoid that is exactly what
+`unafs::mount_on`'s own doc forbids (a K4 write-coherence hazard). So it is neither: the witness
+says `unafs=present-on-other-handle` and `/` falls back to the FAT volume.
+
+### 14.6 The witness, and what it proved
+
+One line, on the first build of the mount table (the result is cached — the mount table is rebuilt
+per verb, the walk is not). Measured on `./arroyo kernel8-test 300`:
+
+```
+[vfs] root = boot volume serial=0x894e44b4 source=global match=/KERNEL8.IMG unafs=present
+  matches=1 window_off=0x80000 window_len=4096 file_off=0x0 candidates=12
+  disks=global=present usb=absent sdhc=unbuilt tegra-sd=unbuilt ::
+```
+
+Three mutations, each reverted, establish that the comparison is the thing deciding:
+
+| mutation | result |
+|----------|--------|
+| flip ONE byte of `KERNEL8.IMG` on the card, inside the window | `NONE reason=kernel-not-found-on-any-volume matches=0` |
+| add `DECOY.IMG`, a byte-identical copy, to the same volume | `NONE reason=multiple-kernels matches=2 matched=global:/KERNEL8.IMG,global:/DECOY.IMG` |
+| corrupt the MEMORY side (`window_addr() + 1`) and rebuild | `NONE reason=kernel-not-found-on-any-volume`, and `pi4-regression.spec` fell to 121/125 with 15 forbidden hits |
+
+The third is also the proof that the clean 125/125 is not vacuous: the Pi battery genuinely gates on
+a bound root.
+
+### 14.7 The seam that is NOT the root key
+
+`drivers::block::BOOT_VOLUME_SERIAL` and its accessors are un-gated for every arch in this arc, and
+`fat::locate_boot_volume(serial) -> Option<BlockSource>` is the one arch-neutral lookup over them.
+Neither decides anything about `/`. They exist for INSTALL-SELF and FRGUARD, which must know which
+volume the loader came off so they can refuse to erase or substitute it. `shell::vfs_mount_table`
+deliberately does not call `locate_boot_volume`: a serial the firmware handed over is precisely the
+assumption §14.1 exists to avoid making.
