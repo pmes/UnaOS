@@ -7160,7 +7160,7 @@ fn vfs_path(arg: &str) -> String {
 /// mounted (-ENODEV)" — which is a better answer than the pre-VFSROUTE `no FAT filesystem (NoDisk)`
 /// because it does not name a filesystem the operator never asked about.
 pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
-    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    use crate::fs::vfs::MountTable;
     #[allow(unused_mut)]
     let mut mt = MountTable::new();
     #[cfg(target_arch = "aarch64")]
@@ -7168,19 +7168,22 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         // BOOTROOT (orin 22): `/`, `/boot` and `/apps` over the disk this kernel was FOUND on. The
         // LAYOUT (orin 18) rule that `/apps` carries `/boot`'s volume NAME lives inside `bind` with
         // the rest of the layout — one place, so `same_volume("/boot", "/apps")` cannot drift.
-        // Binds NOTHING when the walk found no kernel: an empty table is the honest answer and the
-        // verbs say `-ENODEV`.
+        // Binds no ROOT when the walk found no kernel: that is the honest answer and the verbs say
+        // `-ENODEV`.
+        //
+        // TWOCARD (orin 22): the same call also mounts EVERY OTHER enumerated disk that carries a
+        // FAT volume, at an indexed bus point (`/usb`, `/usb1`, `/sd`, …) with that source's OWN
+        // write posture. VFS-3's separate `/usb` bind USED TO STAND HERE and is gone — not deleted,
+        // absorbed: the same volume reaches the same path under the same posture and the same
+        // present-only condition, and now a SECOND stick or the Orin's slot card gets one too. It
+        // moved inside `bind` because the point assignment has to see every disk at once to index
+        // them, and because a disk deduped away as an alias of the root's device (the Orin's card,
+        // published under both `Default` and `Usb`) must not be mounted beside itself.
         crate::fs::bootdisk::bind(&mut mt);
-        // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug). AFTER the
-        // root bind on purpose — the stick is a second volume the operator plugged in, never a
-        // candidate for `/`, and `bootdisk` may itself have bound `/boot` THROUGH the USB source if
-        // that is where this kernel's image actually is.
-        if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
-            mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
-        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
         // FATVERB: the program source, and its READ_BIND stamp, in the one place a verb now binds.
         if let Ok(fs) = open_read_volume() {
             let src = fs.source();

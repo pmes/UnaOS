@@ -931,11 +931,19 @@ impl FatBackend {
     }
 
     /// VFS-3: mount the hot-plugged USB FAT stick into the VFS, read through the
-    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the same mount
-    /// `ls /usb` and the `/fs/usb` HTTP route already use. World-readable (its
+    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the mount `ls /usb`
+    /// and the `/fs/usb` HTTP route used. World-readable (its
     /// contents are meant to be read) and **writable** since USB-WRITE: the
     /// write verbs route to the verified BOT WRITE(10) path (`write_block_usb`,
     /// MISSION RMW+restore witnessed), which superseded the PIUSB-27 guard.
+    ///
+    /// ⚠ **TWOCARD (orin 22): `vfs_mount_table` no longer calls this.** `/usb` is now one instance
+    /// of the general home-soil rule — every enumerated non-root disk gets an indexed, bus-named
+    /// point with its SOURCE's own posture — so `fs::bootdisk::bind` builds it through
+    /// [`FatBackend::new_source`], which is this constructor with the source spelled out instead of
+    /// baked in. The posture is identical (`Usb`'s `write_veto` is `None` either way), which is
+    /// what made the fold safe on the Pi. Kept, not deleted: it is the honest one-argument spelling
+    /// for a caller that means the stick and nothing else.
     pub fn new_usb(volume: &str, principal: &str) -> Self {
         Self {
             volume: volume.to_string(),
@@ -968,7 +976,7 @@ impl FatBackend {
     /// free to drift, on a target where the `Default` arm is the difference between a write that
     /// lands and a write that fails closed several sectors in. `BlockSource::write_veto` is the
     /// single definition; the VFS reports its presence as a boolean and the shell prints its text.
-    fn read_only(&self) -> bool {
+    pub(crate) fn read_only(&self) -> bool { // TWOCARD (orin 22): `pub(crate)` on the SAME LINE (no line moves) so `fs::bootdisk` can print `rw=` from the SAME sample that built the mount, instead of re-deriving the posture at a second site — which is the drift `write_veto` was made the one definition to end.
         self.source.write_veto().is_some()
     }
 

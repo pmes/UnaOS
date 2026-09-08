@@ -447,12 +447,36 @@ FORBID TEGRA-SD: REFUSED to publish
 # `parse_spec` (scripts/mbench.py:248) `.strip()`s the line, so a trailing space silently
 # inverts the key.
 #
-# DELIBERATELY NOT ADDED — a FORBID on `reason=multiple-kernels`. That line is the finder
-# REFUSING to guess between two disks that both carry this kernel, which is correct
-# behaviour and a fact about the operator's media, not a kernel defect. It belongs in the
-# capture review, not in a row that would red a boot for telling the truth.
+# DELIBERATELY NOT ADDED — a FORBID on `reason=multiple-kernels`. ⚠ SUPERSEDED WITHIN THE
+# ARC, and kept as the record of why the row was never written: that reason no longer
+# exists. TWOCARD (Peter, 2026-09-08 — "booting dumb means booting dumb; if it sees another
+# UnaOS disk it is home soil and nothing more") replaced the refusal with first-found +
+# home soil, so `multiple-kernels` is deleted from the kernel's vocabulary. A FORBID on it
+# would now be a check that CANNOT FIRE, which is worse than no row.
+#
+# --- TWOCARD (orin 22): the fields the two-card rule added -------------------------------
+# `matches=1` above keeps its meaning and gains a sharper one: it now counts DISKS, so on a
+# machine with the operator's second UnaOS card plugged in it reads `matches=2` and the
+# boot is still healthy. That is why it stays PENDING and is NOT promoted to REQUIRE — the
+# operator's media decides the number, and the kernel is correct either way.
+#
+# `files=1` is the same statement about the ROOT DISK: how many files on it are this
+# kernel. A decoy copy beside the image makes it 2 and binds anyway. PENDING, and pending
+# for a reason of its own: it is the field that separates "one disk" from "one file", which
+# is precisely the distinction the refusal used to get wrong.
+#
+# `disk mounted` fires once per NON-ROOT disk carrying a FAT volume. On the Orin devkit with
+# nothing but the boot card there are none, so this row can only be honest as PENDING: a
+# ✅ says a second disk was there AND was mounted as home soil; an absence says the machine
+# had one disk, which is not a defect. `rw=` is deliberately NOT part of any key — a
+# `Default`-sourced mount's posture is conditional on FRGUARD's `default_writable()`, a
+# runtime state, so a fixed expectation for it would be a lie waiting to fire.
+#
+# BOUNDING, as above: one field per key, `\b` on the side that can abut, no trailing space.
 PENDING \bwindow_len=4096\b
 PENDING \bmatches=1\b
+PENDING \bfiles=1\b
+PENDING \[vfs\] disk mounted /
 
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the

@@ -4574,3 +4574,44 @@ impl FatFs {
         self.source
     }
 }
+
+// =========================================================================================
+// TWOCARD (orin 22) — the DEVICE's block count, appended at the FILE TAIL.
+//
+// Same tail-append reason the two blocks above give: `fat.rs` is compiled into the knob-off
+// `kernel8.img` and `panic::Location` embeds source line numbers, so anything inserted mid-file
+// moves every panic site below it. A tail append moves nothing.
+//
+// WHY IT IS NEEDED. Peter's two-card rule counts matches per DISK, and on the tegra build one disk
+// wears two `BlockSource` names: `drivers::block::publish_usb_geometry`'s
+// `#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]` variant stores the SAME
+// `BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and `USB_BLOCK_DEVICE` (read as
+// `Usb`). Without a device-level key the walk would visit that one card twice, count it as two
+// disks, and mount it a second time as "home soil" beside itself.
+//
+// WHY NOT `crate::drivers::block::BlockDeviceId` (its declaration site is the `pub struct
+// BlockDeviceId` in `drivers/block.rs`): its FIRST FIELD IS `handle`, and the handle is exactly
+// what differs between the two names for the one card — two `BlockDeviceId`s for one device is the
+// alias, not a key for it. `crate::fs::bootdisk` therefore keys on `(num_blocks, BS_VolID)`: the
+// geometry this function returns, plus the mounted volume's own serial from
+// [`FatFs::volume_fingerprint`]. Both are read from the MEDIUM rather than from the registry slot,
+// so aliased handles agree by construction.
+// =========================================================================================
+
+/// TWOCARD (orin 22): how many blocks the DEVICE behind this source reports, or `None` when no
+/// device is registered on that handle.
+///
+/// The same registry lookups [`source_present`] and [`volume_serials`] use, in the same order — one
+/// vocabulary for "which slot is this source", so a dedupe key and a presence census can never
+/// disagree about which device a source names.
+pub fn source_blocks(source: BlockSource) -> Option<u64> {
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
+    };
+    dev.map(|d| d.num_blocks)
+}

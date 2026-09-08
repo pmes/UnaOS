@@ -885,19 +885,43 @@ directory is consulted. Its first bytes classify it:
 compared. A candidate that is some *other* program (`VUG.ELF`, `STAT.ELF`) parses fine and yields an
 offset computed from ITS entry; the bytes there are not this kernel's `.text`, so it does not match.
 
-### 14.4 Counting, never first-wins
+### 14.4 Counting — per DISK, and a second one is HOME SOIL (TWOCARD)
 
-The walk visits every source and does not stop at the first hit.
+Peter, 2026-09-08: *"booting dumb means booting dumb. If it sees another UnaOS disk it is home soil
+and nothing more."* And, on why the two must not be tied together: *"not making assumptions and not
+tying them together, possibly staining the testing of the newer version."*
 
-| matches | outcome |
-|---------|---------|
-| 1       | bind it |
-| 0       | one `[vfs] root -> NONE reason=…` witness and an **EMPTY** mount table — the verbs answer `-ENODEV` (`vfs_read_target`, `shell.rs`). Never a guess at another disk. |
-| ≥ 2     | **REFUSE**: `reason=multiple-kernels matches=N matched=source:path,…`, table EMPTY |
+The walk visits every source and does not stop at the first hit. What it counts is **DISKS — block
+DEVICES — not files**.
 
-`reason` is one of `no-disk-enumerated`, `kernel-not-found-on-any-volume`, `walk-cap-hit`,
-`multiple-kernels` — so "no disk at all", "disks but not this kernel" and "the walk ran out of
-budget before it could say" are three different sentences, not one.
+| what the machine has | outcome |
+|----------------------|---------|
+| one disk carries this kernel | bind it, `matches=1` |
+| several disks carry it | the **FIRST in enumeration order is root**; every other one is HOME SOIL, mounted like any other non-root disk (§14.5a). `matches=N home=<src:path,…>` names them all. **No refusal.** |
+| two copies on ONE disk | one disk ⇒ bind, and the witness says `files=2`. A decoy beside the real image changes nothing about which medium this kernel came off. |
+| none | `[vfs] root -> NONE reason=…`, no `/`, `/boot` or `/apps` — the verbs answer `-ENODEV` (`vfs_read_target`, `shell.rs`). Never a guess at another disk. The non-root disks are still mounted: they are home soil whether or not a root was found, which is also what preserves VFS-3's `/usb` behaviour exactly. |
+
+`reason` is one of `no-disk-enumerated`, `kernel-not-found-on-any-volume`, `walk-cap-hit` — so "no
+disk at all", "disks but not this kernel" and "the walk ran out of budget before it could say" are
+three different sentences, not one. **`reason=multiple-kernels` was this module's answer for one
+afternoon and is DELETED from the vocabulary**, in the code and here: refusing to boot because a
+second UnaOS card is plugged in is an assumption about the machine, which is the thing §14.1 exists
+not to make. The loader's serial is not consulted by any of this (§14.7).
+
+#### 14.4a One disk can wear two names — dedupe by DEVICE
+
+`drivers::block::publish_usb_geometry`'s `#[cfg(not(all(target_arch = "aarch64", feature =
+"baremetal")))]` variant — the one the **tegra** build compiles — stores the *same*
+`BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and `USB_BLOCK_DEVICE` (read as
+`Usb`). One card, two source names. A walk keyed on the source would count it as two disks and mount
+it beside itself.
+
+The key is therefore the DEVICE: `bootdisk::DiskId` = `(num_blocks, BS_VolID)` — the geometry
+`fat::source_blocks` reports plus the mounted volume's own serial from `FatFs::volume_fingerprint`.
+Both are read from the *medium*, so two handles onto one card agree by construction.
+`drivers::block::BlockDeviceId` is deliberately **not** the key: its first field is `handle`, which
+is exactly what differs between the two names for the one card. A deduped source is named on the
+wire (`aliased=usb->global`), never dropped silently.
 
 ### 14.5 The layout over that disk
 
@@ -905,8 +929,30 @@ budget before it could say" are three different sentences, not one.
 under the **same volume NAME** — a distinct name would make `same_volume("/boot", "/apps")` answer
 false about one card, which is §13.2.1's C1 aliasing defect in a new spelling. `/` is that disk's
 native UnaFS volume when it has one *and* the shared `unafs::MOUNT` is riding that disk; otherwise
-`/boot`'s volume, so a card carrying only a FAT volume still has a root. `/usb` is unchanged and
-still bound only when the stick is actually enumerated.
+`/boot`'s volume, so a card carrying only a FAT volume still has a root.
+
+#### 14.5a The other disks — home soil, at a bus point, with their OWN write posture
+
+Every enumerated disk that carries a FAT volume and is not the root is mounted at an **indexed,
+bus-named** point: `/usb`, `/usb1`, … for the xHCI mass-storage handles (`Default`, `Usb`) and
+`/sd`, `/sd1`, … for a controller slot (`Sdhc`, `TegraSd`). The point name is the BUS; the witness
+carries `source=` beside it, so a point is never the only identification of a disk.
+
+The posture is **the source's own**, sampled from the very `FatBackend` that gets mounted —
+`rw = !FatBackend::read_only()`, which forwards to `BlockSource::write_veto`:
+
+* `Usb` is **writable** (the Pi's verified BOT WRITE(10) path). Forcing a read-only mount here would
+  be a behaviour change on the Pi, so it is not done.
+* `TegraSd` is vetoed in every cfg, so `/sd` on the Orin is read-only **by the veto**, not by this
+  mount.
+* `Default` is **conditional** on FRGUARD's `default_writable()` — a RUNTIME state, not a property
+  of the volume. So there is no fixed `rw=` expectation for a `Default`-sourced mount anywhere, in
+  code or in a spec row; the assertion available is consistency *within one call*.
+
+One witness line per mount: `[vfs] disk mounted /usb source=global rw=yes ::`. **Nothing on a
+non-root disk influences root.** VFS-3's separate `/usb` bind in `shell::vfs_mount_table` is gone —
+not deleted, absorbed: same volume, same path, same posture, same present-only condition, and now a
+second stick or the Orin's slot card gets a point too.
 
 The middle clause is not a formality. `unafs::MOUNT` is handle-DISCOVERING (UNAFSBIND): it probes
 `bind_probe_candidates()` in enum order and `Global` wins outright whenever it holds a volume. On a
@@ -922,21 +968,41 @@ One line, on the first build of the mount table (the result is cached — the mo
 per verb, the walk is not). Measured on `./arroyo kernel8-test 300`:
 
 ```
-[vfs] root = boot volume serial=0x894e44b4 source=global match=/KERNEL8.IMG unafs=present
-  matches=1 window_off=0x80000 window_len=4096 file_off=0x0 candidates=12
-  disks=global=present usb=absent sdhc=unbuilt tegra-sd=unbuilt ::
+[vfs] root = boot volume serial=0x8b657eb1 source=global match=/KERNEL8.IMG unafs=present
+  matches=1 home=- files=1 aliased=- window_off=0x80000 window_len=4096 file_off=0x0
+  candidates=12 disks=global=present usb=absent sdhc=unbuilt tegra-sd=unbuilt ::
 ```
 
-Three mutations, each reverted, establish that the comparison is the thing deciding:
+Fields may be INSERTED, never renamed — the flight scorer parses `serial=`, `source=` and `reason=`.
+
+Mutations, each reverted, establish that the comparison is the thing deciding:
 
 | mutation | result |
 |----------|--------|
 | flip ONE byte of `KERNEL8.IMG` on the card, inside the window | `NONE reason=kernel-not-found-on-any-volume matches=0` |
-| add `DECOY.IMG`, a byte-identical copy, to the same volume | `NONE reason=multiple-kernels matches=2 matched=global:/KERNEL8.IMG,global:/DECOY.IMG` |
+| add `DECOY.IMG`, a byte-identical copy, to the same volume | binds, `matches=1 files=2` — one disk is one disk (TWOCARD; this mutation REFUSED before §14.4 was rewritten) |
 | corrupt the MEMORY side (`window_addr() + 1`) and rebuild | `NONE reason=kernel-not-found-on-any-volume`, and `pi4-regression.spec` fell to 121/125 with 15 forbidden hits |
 
 The third is also the proof that the clean 125/125 is not vacuous: the Pi battery genuinely gates on
 a bound root.
+
+**What QEMU cannot show, and how it is covered instead.** The `raspi4b` machine models NO PCI bus
+(`-device qemu-xhci` ⇒ *"No 'PCI' bus found"*) and the Pi image is built `skip_xhci`, so a SECOND
+disk cannot be attached to the leg that exercises the finder end to end — and `test-arm`, which does
+have xHCI, never builds a mount table at all. So the multi-disk legs are executed at unit level
+instead of reasoned about: `bootdisk::admit` and `bootdisk::plan` are pure over their inputs, and a
+`witness`-gated `twocard_selftest` drives them with SYNTHETIC devices on the real call path,
+printing four uncounted lines beside the root witness:
+
+```
+:: TWOCARD: two-disks root_ix=Some(0) matches=2 others=1 point=/usb :: PASS ::
+:: TWOCARD: alias disks=1 aliases=1 root_ix=Some(0) others=0 :: PASS ::
+:: TWOCARD: points /usb /usb1 /sd /usb2 :: PASS ::
+:: TWOCARD: posture global=rw usb=rw (rw == !read_only, one sample per source) :: PASS ::
+```
+
+The fourth asserts CONSISTENCY WITHIN ONE CALL and prints what it read — never a fixed expectation
+per source, for the `default_writable()` reason in §14.5a.
 
 ### 14.7 The seam that is NOT the root key
 
