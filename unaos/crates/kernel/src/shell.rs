@@ -1869,7 +1869,56 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
         return Err(alloc::format!("volume {} not mounted (-ENODEV)", vol));
     }
-    let st = mt.stat(path).map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
+    // HOMESOIL (orin 22): the CHILD NAMES `path` gets purely from the mount table — the first
+    // component of every mount prefix that lives strictly below it. `/boot` and `/volumes` when
+    // listing `/`; `UNAOS-PI` and `Untitled` when listing `/volumes`. Boundary-matched the way the
+    // resolver matches (the prefix must end where a `/` begins, so `/vol` never claims `/volumes`),
+    // and only for prefixes that are actually bound, so an absent stick contributes no row (honest
+    // hot-plug, doc §6).
+    //
+    // Before HOMESOIL a mount point was always ONE component deep, so this took the whole tail.
+    // `/volumes/<NAME>` is two, and taking the whole tail would have produced a row literally named
+    // `volumes/UNAOS-PI` under `/` and nothing at all under `/volumes`.
+    let base = if path == "/" { "" } else { path.trim_end_matches('/') };
+    let mut synth: Vec<String> = Vec::new();
+    for pfx in mt.prefixes() {
+        if pfx == "/" {
+            continue;
+        }
+        let Some(tail) = pfx.strip_prefix(base) else { continue };
+        if !tail.starts_with('/') {
+            continue; // `/vol` is not a parent of `/volumes` — the boundary must be a separator
+        }
+        let name = tail.trim_start_matches('/');
+        let head = name.split('/').next().unwrap_or(name);
+        if !head.is_empty() && !synth.iter().any(|s| s == head) {
+            synth.push(String::from(head));
+        }
+    }
+
+    let st = match mt.stat(path) {
+        Ok(st) => st,
+        // HOMESOIL: `/volumes` is an ANCESTOR of mount points and not a mount itself, so no backend
+        // can stat it — and answering `-ENOENT` for a directory whose children are mounted and
+        // browsable would be a lie. A path that no backend has but that at least one mount hangs
+        // under lists exactly those mounts, and nothing else.
+        Err(e) => {
+            if synth.is_empty() {
+                return Err(alloc::format!("{}: {}", path, vfs_err(e)));
+            }
+            let mut rows: Vec<DirEnt> = synth
+                .iter()
+                .map(|n| DirEnt {
+                    name: n.clone(),
+                    kind: NodeKind::Dir,
+                    size: 0,
+                    mtime: None,
+                })
+                .collect();
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok((true, rows));
+        }
+    };
     if !matches!(st.kind, NodeKind::Dir) {
         let leaf = String::from(path.rsplit('/').next().unwrap_or(path));
         return Ok((false, alloc::vec![DirEnt {
@@ -1882,24 +1931,14 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     let mut rows = mt
         .read_dir(path)
         .map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
-    // Mount points immediately below `path` — `/boot` and `/usb` when listing `/`. Boundary-matched
-    // the way the resolver matches, and only for prefixes that are actually bound, so an absent
-    // stick contributes no row (honest hot-plug, doc §6).
-    let base = if path == "/" { "" } else { path };
-    for pfx in mt.prefixes() {
-        if pfx == "/" {
-            continue;
-        }
-        if let Some(tail) = pfx.strip_prefix(base) {
-            let name = tail.trim_start_matches('/');
-            if !name.is_empty() && !name.contains('/') && !rows.iter().any(|r| r.name == name) {
-                rows.push(DirEnt {
-                    name: String::from(name),
-                    kind: NodeKind::Dir,
-                    size: 0,
-                    mtime: None,
-                });
-            }
+    for name in synth.iter() {
+        if !rows.iter().any(|r| &r.name == name) {
+            rows.push(DirEnt {
+                name: name.clone(),
+                kind: NodeKind::Dir,
+                size: 0,
+                mtime: None,
+            });
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -7171,14 +7210,15 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         // Binds no ROOT when the walk found no kernel: that is the honest answer and the verbs say
         // `-ENODEV`.
         //
-        // TWOCARD (orin 22): the same call also mounts EVERY OTHER enumerated disk that carries a
-        // FAT volume, at an indexed bus point (`/usb`, `/usb1`, `/sd`, …) with that source's OWN
-        // write posture. VFS-3's separate `/usb` bind USED TO STAND HERE and is gone — not deleted,
-        // absorbed: the same volume reaches the same path under the same posture and the same
-        // present-only condition, and now a SECOND stick or the Orin's slot card gets one too. It
-        // moved inside `bind` because the point assignment has to see every disk at once to index
-        // them, and because a disk deduped away as an alias of the root's device (the Orin's card,
-        // published under both `Default` and `Usb`) must not be mounted beside itself.
+        // HOMESOIL (orin 22): the same call also mounts EVERY OTHER enumerated disk that carries a
+        // FAT volume, at `/volumes/<the volume's own label>` with that source's OWN write posture.
+        // VFS-3's separate `/usb` bind USED TO STAND HERE and is gone — not deleted, absorbed: the
+        // same volume, the same posture and the same present-only condition, under the name the
+        // person holding the card gave it instead of the bus it happens to hang off (Peter: "/usb0
+        // and /usb1 are meaningless outside the kernel"). It moved inside `bind` because the name
+        // assignment has to see every disk at once to break collisions, and because a disk deduped
+        // away as an alias of the root's device (the Orin's card, published under both `Default` and
+        // `Usb`) must not be mounted beside itself.
         crate::fs::bootdisk::bind(&mut mt);
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -7249,7 +7289,13 @@ fn vfs_say(console: &mut Console, line: &str) {
 /// wrong about which thing is missing, since what is missing is every volume.
 /// The list keeps exactly the prefixes that can be absent while OTHERS are
 /// present, which is the case this mechanism was built for.
-const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/boot"];
+// HOMESOIL (orin 22): `/usb` LEAVES this list, because the path no longer exists in the vocabulary.
+// A non-root disk mounts at `/volumes/<its own label>`, so there is no fixed path for "the stick"
+// to be reported missing at — `ls /usb` on a machine with a stick in it would have answered "volume
+// /usb not mounted (-ENODEV)" about a volume that IS mounted, one directory over. `/volumes` does
+// NOT take its place: it is an ancestor `vfs_ls_collect` lists synthetically, and putting it here
+// would make it report ENODEV whenever it is not itself a mount, which is always.
+const RESERVED_VOLUME_PREFIXES: &[&str] = &["/boot"];
 
 /// VFS-4: if `path` targets a reserved volume prefix (see
 /// [`RESERVED_VOLUME_PREFIXES`]) that is not present in the live `mounted`

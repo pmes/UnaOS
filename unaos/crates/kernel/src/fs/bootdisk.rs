@@ -87,7 +87,7 @@
 //! offset computed from ITS entry; the bytes there are not this kernel's `.text`, so it does not
 //! match. The test contains no name, extension, size or directory heuristic at all.
 //!
-//! # Counting — per DISK, and a second one is HOME SOIL (TWOCARD, Peter, 2026-09-08)
+//! # Counting — per DISK, and a second one is HOME SOIL (HOMESOIL, Peter, 2026-09-08)
 //!
 //! > "booting dumb means booting dumb. If it sees another UnaOS disk it is home soil and nothing
 //! > more."
@@ -112,7 +112,7 @@
 //! * **zero** ⇒ `[vfs] root -> NONE`, one witness naming what was looked for and what was found,
 //!   and NO `/`, `/boot` or `/apps` — the verbs answer `-ENODEV`. Never a guess at another disk.
 //!   (The non-root disks below are still mounted: they are home soil whether or not a root was
-//!   found, and that is also what preserves VFS-3's `/usb` behaviour exactly.)
+//!   found, and that is also what carries VFS-3's hot-plug behaviour forward.)
 //!
 //! **The loader's serial is not consulted here at all.** `drivers::block::BOOT_VOLUME_SERIAL` is a
 //! seam for INSTALL-SELF and FRGUARD (`docs/dev/OS/09_FILESYSTEM/vfs.md` §14.7); root does not read
@@ -133,25 +133,66 @@
 //! `handle`, which is precisely what differs between the two names for the one card. A deduped
 //! source is named on the wire (`aliased=usb->global`), never dropped silently.
 //!
-//! # The other disks — home soil, at a bus-named point, with their OWN write posture
+//! # The other disks — home soil, at `/volumes/<NAME>`, with their OWN write posture
 //!
-//! Every enumerated disk carrying a FAT volume that is not the root is mounted at an INDEXED,
-//! bus-named point: `/usb`, `/usb1`, … for the xHCI mass-storage handles ([`BlockSource::Default`],
-//! [`BlockSource::Usb`]) and `/sd`, `/sd1`, … for a controller slot (`Sdhc`, `TegraSd`). The point
-//! name is the BUS, and the witness carries `source=` beside it, so the point is never the only
-//! identification of a disk.
+//! > Peter, 2026-09-08: "what if the disk has a label? here again you are hard coding — `/usb0` and
+//! > `/usb1` are meaningless outside the kernel."
+//!
+//! Every enumerated disk carrying a FAT volume that is not the root is mounted at
+//! `/volumes/<NAME>`, where NAME is **the volume's own label, read off the medium**. No bus, no
+//! slot, no index appears in any path: `/usb1` is a fact about which controller a card happens to
+//! be hanging off, which is the kernel's business and nobody else's. The witness still carries
+//! `source=`, so the bus is on the wire where it belongs.
+//!
+//! ## The NAME, and why it cannot overflow anything
+//!
+//! > Peter, 2026-09-08: "joe user might get scared by some crazy disk name appearing if you use the
+//! > serial… is it possible to know if there's no volume name set, or a name containing illegal —
+//! > possibly even harmful — volume name meant to overflow memory."
+//!
+//! * **Source**: [`crate::fs::fat::FatFs::label_raw`] — the root directory's `ATTR_VOLUME_ID` entry
+//!   when the volume has one, else the BPB's `BS_VolLab`. Both are FIXED 11-byte fields and both
+//!   come back as `[u8; 11]`. **No length is ever read from the medium**, so there is no length to
+//!   be wrong about and an overflow is impossible by construction rather than by check.
+//! * **Unnamed is a KNOWN VALUE, not an absence**: all-spaces, or the conventional `NO NAME`
+//!   placeholder, mount as `/volumes/Untitled`. **The serial NEVER appears in a path** — it appears
+//!   on the witness line, where an operator can read it and a file manager cannot frighten anyone
+//!   with it.
+//! * **Sanitize by WHITELIST**, never by blacklist: `A`–`Z`, `a`–`z`, `0`–`9`, space and the
+//!   punctuation FAT itself permits in a label (``! # $ % & ' ( ) - @ ^ _ ` { } ~``). EVERY other
+//!   byte — control bytes, `/`, NUL, `.` in the wrong place, anything ≥ 0x80 — becomes `_`. Trailing
+//!   spaces are trimmed; `.`, `..` and empty become `Untitled`. A path separator therefore cannot
+//!   reach the resolver, which is the actual attack this rule is against.
+//! * **A collision gets a numeric suffix** — `Untitled`, `Untitled 1`, `Untitled 2` — the macOS
+//!   shape, assigned in enumeration order.
+//! * **If ANY byte was altered**, the mount line carries `label_raw=<22 hex>`: a card whose label is
+//!   trying something announces itself, instead of quietly becoming `Untitled` like every honest
+//!   unnamed volume. An unaltered label prints no `label_raw`, so the field's PRESENCE is the signal.
+//!
+//! ## Posture
 //!
 //! **The posture is the SOURCE's own**, sampled from the very `FatBackend` that gets mounted:
 //! `rw = !FatBackend::read_only()`, which forwards to `BlockSource::write_veto`. `Usb` is WRITABLE
 //! (the Pi's verified BOT WRITE(10) path — forcing a read-only mount here would be a behaviour
-//! change on the Pi), `TegraSd` is vetoed in every cfg so `/sd` on the Orin is read-only BY THE
+//! change on the Pi), `TegraSd` is vetoed in every cfg so the Orin's slot card is read-only BY THE
 //! VETO rather than by this mount, and `Default` is CONDITIONAL on FRGUARD's `default_writable()`,
 //! which is a RUNTIME state and not a property of the volume — so there is no fixed expectation for
 //! a `Default`-sourced mount anywhere, in code or in a spec row. One witness line per mount:
-//! `[vfs] disk mounted /usb source=global rw=yes ::`.
+//! `[vfs] volume mounted /volumes/UNAOS-PI source=global rw=yes ::`.
+//!
+//! ## A friend's UnaFS volume
+//!
+//! Checked at the DECLARATION SITE (`unaos/libs/fs/unafs/src/superblock.rs`, `pub struct
+//! Superblock`): the fields are `magic`, `version`, `block_size`, `block_count`, `root_inode`,
+//! `catalog_inode`. **UnaFS carries no volume label.** So a non-root disk's UnaFS volume has no name
+//! to mount it under, and inventing one — the serial, the handle, an index — is exactly what the
+//! rule above forbids. It is ANNOUNCED and left alone:
+//! `[vfs] unafs volume on global — unnamed, not mounted ::`. When UnaFS grows a volume name, the
+//! same naming rules apply to it and this becomes a mount.
 //!
 //! **Nothing on a non-root disk influences root.** VFS-3's `/usb` hot-plug mount is this rule's
-//! first instance rather than a special case beside it: same path, same posture, same condition.
+//! ancestor, not a special case beside it: the same volume, the same posture, the same present-only
+//! condition — under a name the person holding the card chose.
 //!
 //! # Cost
 //!
@@ -214,7 +255,7 @@ pub struct Found {
     pub file_off: u32,
 }
 
-/// TWOCARD (orin 22): the identity of one block DEVICE, good across the two `BlockSource` names a
+/// HOMESOIL (orin 22): the identity of one block DEVICE, good across the two `BlockSource` names a
 /// single card can wear. See the module docs §"One disk can wear two names".
 ///
 /// `num_blocks` comes from the block registry ([`crate::fs::fat::source_blocks`]) and `vol_id` is
@@ -226,19 +267,23 @@ pub struct DiskId {
     pub vol_id: u32,
 }
 
-/// TWOCARD: one file on one disk whose bytes ARE this running kernel.
+/// HOMESOIL: one file on one disk whose bytes ARE this running kernel.
 #[derive(Clone)]
 pub struct Hit {
     pub path: String,
     pub file_off: u32,
 }
 
-/// TWOCARD: one enumerated DISK carrying a FAT volume, and what the walk found on it.
+/// HOMESOIL: one enumerated DISK carrying a FAT volume, and what the walk found on it.
 #[derive(Clone)]
 pub struct Disk {
     /// The first source name this device answered to — the one its mount reads through.
     pub source: BlockSource,
     pub id: DiskId,
+    /// The volume's label BYTES, exactly as they sit on the medium — a FIXED 11-byte field, never a
+    /// length taken from the card. `sanitize_label` turns this into the mount-point name; the raw
+    /// bytes are kept so the witness can print `label_raw=` when sanitizing had to alter one.
+    pub label: [u8; 11],
     /// Every path on this disk whose bytes ARE this running kernel. Usually 0 or 1; a decoy copy
     /// beside the real image makes it 2 and changes nothing (`files=2`).
     pub hits: Vec<Hit>,
@@ -248,7 +293,7 @@ pub struct Disk {
 
 /// Why the walk bound nothing. Spelled exactly as the `reason=` field prints it.
 ///
-/// ⚠ `MultipleKernels` / `reason=multiple-kernels` USED TO BE HERE and is deleted (TWOCARD, Peter's
+/// ⚠ `MultipleKernels` / `reason=multiple-kernels` USED TO BE HERE and is deleted (HOMESOIL, Peter's
 /// two-card rule): several disks carrying this kernel is not an error, it is home soil.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NoRoot {
@@ -279,7 +324,25 @@ pub enum Verdict {
     None_(NoRoot),
 }
 
-/// TWOCARD: the whole answer — the root (if any) and every OTHER disk with the point it gets.
+/// HOMESOIL: one non-root disk — home soil — with the `/volumes/<NAME>` point it was given and
+/// everything the witness owes about how that name was arrived at.
+#[derive(Clone)]
+pub struct Home {
+    /// The source its mount reads through. Printed as `source=`; never part of the path.
+    pub source: BlockSource,
+    /// The full mount point, `/volumes/<NAME>`, already made unique against its siblings.
+    pub point: String,
+    /// The label bytes this name was derived from — printed as `label_raw=` only when `altered`.
+    pub label_raw: [u8; 11],
+    /// Did sanitizing have to change any byte? `true` ⇒ the witness prints `label_raw=`, so a card
+    /// carrying a hostile or unprintable label announces itself instead of quietly being `Untitled`.
+    pub altered: bool,
+    /// Does this disk ALSO carry a UnaFS volume? UnaFS has no volume label (checked at
+    /// `unafs::superblock::Superblock`), so there is no name to mount it under — it is announced.
+    pub unafs: bool,
+}
+
+/// HOMESOIL: the whole answer — the root (if any) and every OTHER disk with the point it gets.
 #[derive(Clone)]
 pub struct Survey {
     /// The disk this kernel was found on: the FIRST in enumeration order that carries it.
@@ -288,9 +351,9 @@ pub struct Survey {
     pub root_files: u32,
     /// Why there is no root. `Some` exactly when `root` is `None`.
     pub reason: Option<NoRoot>,
-    /// Home soil: `(source, mount point)` for every enumerated non-root disk with a FAT volume,
-    /// in enumeration order. Mounted whether or not a root was found.
-    pub others: Vec<(BlockSource, String)>,
+    /// Home soil: one [`Home`] per enumerated non-root disk with a FAT volume, in enumeration
+    /// order. Mounted whether or not a root was found.
+    pub others: Vec<Home>,
 }
 
 /// The cached answer (module docs §Cost). A plain spin lock rather than the interrupt-masked idiom
@@ -366,80 +429,145 @@ fn tegra_sd_state() -> &'static str {
     }
 }
 
-/// TWOCARD: the mount point a non-root disk gets. The BUS, not the medium — `/usb*` for the two
-/// xHCI mass-storage handles, `/sd*` for a controller slot. The witness prints `source=` beside it,
-/// so the point is never the only identification of a disk.
-fn bus_name(src: BlockSource) -> &'static str {
-    match src {
-        BlockSource::Default | BlockSource::Usb => "usb",
-        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        BlockSource::Sdhc => "sd",
-        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockSource::TegraSd => "sd",
-    }
+/// HOMESOIL: the prefix every non-root volume hangs under. Not a mount itself — an ANCESTOR of
+/// mounts, which `shell::vfs_ls_collect` lists synthetically so `/volumes` can be browsed.
+pub const VOLUMES: &str = "/volumes";
+
+/// HOMESOIL: the name an unnamed, blank-named or unusable-named volume gets. Never the serial: a
+/// path is a thing a PERSON reads, and `/volumes/3F7A1C88` frightens people for no gain. The serial
+/// is on the witness line, which is where an operator who needs it will look.
+pub const UNTITLED: &str = "Untitled";
+
+/// HOMESOIL: is this byte allowed in a `/volumes/<NAME>` path component?
+///
+/// A WHITELIST, deliberately — the blacklist spelling of this ("reject `/` and NUL") is the one that
+/// keeps being wrong, because the set of bytes that mean something to some later consumer is not
+/// knowable from here. Letters, digits, space, and the punctuation the FAT specification itself
+/// permits in a volume label. Everything else — control bytes, `/`, NUL, `\`, `:`, `*`, `?`, `"`,
+/// `<`, `>`, `|`, `+`, `,`, `;`, `=`, `[`, `]`, `.`, and every byte ≥ 0x80 — is out.
+fn label_byte_ok(b: u8) -> bool {
+    b.is_ascii_uppercase()
+        || b.is_ascii_lowercase()
+        || b.is_ascii_digit()
+        || b == b' '
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'(' | b')' | b'-' | b'@' | b'^' | b'_'
+                | b'`' | b'{' | b'}' | b'~'
+        )
 }
 
-/// TWOCARD: `/usb`, then `/usb1`, `/usb2`, … — the first disk on a bus takes the bare name, and the
-/// index is per bus, assigned in enumeration order. `used` carries one counter per bus seen.
-fn next_point(used: &mut Vec<(&'static str, u32)>, bus: &'static str) -> String {
-    let n = match used.iter_mut().find(|(b, _)| *b == bus) {
-        Some(slot) => {
-            slot.1 += 1;
-            slot.1
-        }
-        None => {
-            used.push((bus, 0));
-            0
-        }
-    };
-    if n == 0 {
-        let mut p = String::from("/");
-        p.push_str(bus);
-        p
-    } else {
-        alloc::format!("/{}{}", bus, n)
+/// HOMESOIL: 11 label bytes ⇒ `(name, altered)`.
+///
+/// `altered` is `true` when the RESULT is not the label the medium carries — a byte was replaced, or
+/// the whole thing was rejected in favour of [`UNTITLED`] — which is what makes `label_raw=` on the
+/// witness line a signal rather than noise. Note what does NOT count as altered: trailing spaces,
+/// and the two KNOWN "no name" spellings (an all-blank field, and the `NO NAME` placeholder every
+/// formatter writes). Those are honest unnamed volumes, not suspicious ones.
+///
+/// The input is `[u8; 11]` by type. There is no length here that came from a card, and no buffer
+/// that a card's contents can size, so this cannot overflow anything — by construction, not by check.
+fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
+    // The PAD comes off first, and only off the END: a short label is stored space-padded, and some
+    // formatters NUL-pad instead. Stripping the pad before sanitizing is what keeps `UNAOS` from
+    // becoming `UNAOS______`. A NUL in the MIDDLE of a label is not padding — it survives this trim
+    // and is sanitized like any other disallowed byte, and it counts as an alteration.
+    let mut end = raw.len();
+    while end > 0 && (raw[end - 1] == b' ' || raw[end - 1] == 0) {
+        end -= 1;
     }
+    let mut out = String::new();
+    let mut altered = false;
+    for &b in raw[..end].iter() {
+        if label_byte_ok(b) {
+            out.push(b as char);
+        } else {
+            out.push('_');
+            altered = true;
+        }
+    }
+    let trimmed = out.trim_end_matches(' ');
+    // The two KNOWN "unnamed" values — an empty field and the formatter's `NO NAME` placeholder.
+    // Neither is an alteration: they are honest unnamed volumes, and `label_raw=` must stay a signal
+    // about a SUSPICIOUS card rather than firing on every blank one.
+    //
+    // `.` and `..` need NO case here, and that is a property of the whitelist rather than an
+    // oversight: `.` is not in the FAT label character set and `label_byte_ok` does not admit it, so
+    // `..` sanitizes to `__` — a legal path component — long before any "is this name `..`" test
+    // could run. A guard for it would be a check that cannot fire. What keeps that true is asserted
+    // instead, on the live predicate, in `homesoil_selftest` leg 3.
+    if trimmed.is_empty() || trimmed == "NO NAME" {
+        return (String::from(UNTITLED), altered);
+    }
+    (String::from(trimmed), altered)
 }
 
-/// TWOCARD: admit a source as a NEW disk, or record it as an ALIAS of one already admitted.
+/// HOMESOIL: `/volumes/<name>`, made unique against the points already handed out — `Untitled`,
+/// then `Untitled 1`, `Untitled 2`, … (the macOS shape), assigned in enumeration order.
+///
+/// The suffix is a fact about a COLLISION between two cards on this machine, not about either card,
+/// so it is not `altered` and it does not reach the witness's `label_raw=`.
+fn next_volume_point(used: &mut Vec<String>, name: &str) -> String {
+    let mut candidate = String::from(name);
+    let mut n = 0u32;
+    while used.iter().any(|u| u == &candidate) {
+        n += 1;
+        candidate = alloc::format!("{} {}", name, n);
+    }
+    used.push(candidate.clone());
+    alloc::format!("{}/{}", VOLUMES, candidate)
+}
+
+/// HOMESOIL: admit a source as a NEW disk, or record it as an ALIAS of one already admitted.
 /// `true` ⇒ it is new and must be walked; `false` ⇒ this device has been walked already under
 /// another name and must not be walked, counted or mounted twice.
 ///
-/// Pure over its arguments, so `twocard_selftest` can drive it with synthetic devices.
-fn admit(disks: &mut Vec<Disk>, src: BlockSource, id: DiskId) -> bool {
+/// Pure over its arguments, so `homesoil_selftest` can drive it with synthetic devices.
+fn admit(disks: &mut Vec<Disk>, src: BlockSource, id: DiskId, label: [u8; 11]) -> bool {
     if let Some(d) = disks.iter_mut().find(|d| d.id == id) {
         d.aliases.push(src.name());
         return false;
     }
-    disks.push(Disk { source: src, id, hits: Vec::new(), aliases: Vec::new() });
+    disks.push(Disk { source: src, id, label, hits: Vec::new(), aliases: Vec::new() });
     true
 }
 
-/// TWOCARD: pick the root and hand every other disk a point. Split out from the walk on purpose —
-/// it is pure, so the `twocard_selftest` fixture can drive it with SYNTHETIC disks and prove the
-/// counting, the dedupe and the indexing without a second card in the machine.
-fn plan(disks: &[Disk]) -> (Option<usize>, Vec<(BlockSource, String)>) {
+/// HOMESOIL: pick the root and hand every other disk its `/volumes/<NAME>` point. Split out from the
+/// walk on purpose — it is pure, so the `homesoil_selftest` fixture can drive it with SYNTHETIC
+/// disks and prove the counting, the dedupe and the NAMING without a second card in the machine.
+///
+/// `unafs` is passed in rather than probed here so this stays pure: the walk knows which disks carry
+/// a UnaFS volume, and asking the block layer from inside a planner would make it untestable.
+fn plan(disks: &[Disk], unafs: &[bool]) -> (Option<usize>, Vec<Home>) {
     let root_ix = disks.iter().position(|d| !d.hits.is_empty());
-    let mut used: Vec<(&'static str, u32)> = Vec::new();
-    let mut others: Vec<(BlockSource, String)> = Vec::new();
+    let mut used: Vec<String> = Vec::new();
+    let mut others: Vec<Home> = Vec::new();
     for (i, d) in disks.iter().enumerate() {
         if Some(i) == root_ix {
             continue;
         }
-        others.push((d.source, next_point(&mut used, bus_name(d.source))));
+        let (name, altered) = sanitize_label(&d.label);
+        others.push(Home {
+            source: d.source,
+            point: next_volume_point(&mut used, &name),
+            label_raw: d.label,
+            altered,
+            unafs: unafs.get(i).copied().unwrap_or(false),
+        });
     }
     (root_ix, others)
 }
 
 /// The whole walk, plus the ONE witness line it owes.
 fn walk_and_witness() -> Survey {
-    // TWOCARD: the synthetic legs, on the cached path so they run exactly once, ahead of the walk
+    // HOMESOIL: the synthetic legs, on the cached path so they run exactly once, ahead of the walk
     // they describe. Default-quiet (`witness`-gated); see the block comment at the file tail.
     #[cfg(feature = "witness")]
-    twocard_selftest();
+    homesoil_selftest();
     let mut budget: u32 = MAX_ENTRIES;
     let mut candidates: u32 = 0;
     let mut disks: Vec<Disk> = Vec::new();
+    let mut unafs: Vec<bool> = Vec::new();
     let mut any_disk = false;
     let mut cap_hit = false;
 
@@ -452,12 +580,17 @@ fn walk_and_witness() -> Survey {
         // DEDUPE BY DEVICE, before the walk and before the mount: on the tegra build one card is
         // published under BOTH `Default` and `Usb` (module docs §"One disk can wear two names").
         let id = DiskId { num_blocks: fat::source_blocks(*src).unwrap_or(0), vol_id };
+        // HOMESOIL: the label is read HERE, off the volume that is already mounted for the walk —
+        // one mount, one read, and the bytes travel with the disk rather than being fetched again
+        // at bind time from a volume that may have been swapped underneath us.
+        let label = fs.label_raw();
         // Admitted even when its root directory turns out to be unreadable below: it HAS a FAT
         // volume (the mount succeeded), so it is a disk this machine has, and home soil is a fact
         // about the disk, not about what could be walked on it.
-        if !admit(&mut disks, *src, id) {
+        if !admit(&mut disks, *src, id, label) {
             continue;
         }
+        unafs.push(unafs_present(*src));
         let mut hits: Vec<Hit> = Vec::new();
         if let Ok(rows) = fs.read_root() {
             if !walk_rows(&fs, "", 0, &rows, &mut budget, &mut candidates, &mut hits) {
@@ -469,7 +602,7 @@ fn walk_and_witness() -> Survey {
         }
     }
 
-    let (root_ix, others) = plan(&disks);
+    let (root_ix, others) = plan(&disks, &unafs);
     let matching = disks.iter().filter(|d| !d.hits.is_empty()).count();
     let win = window_addr();
 
@@ -745,6 +878,25 @@ fn unafs_state(_src: BlockSource) -> &'static str {
     }
 }
 
+/// HOMESOIL: does THIS disk carry a UnaFS volume? The `locate_on` half of [`unafs_state`] and
+/// nothing else — deliberately no `with_unafs`, because forcing the shared bind is a side effect
+/// that has no business running for a disk we are only going to NAME on the wire.
+///
+/// Used for the home-soil announcement: UnaFS has no volume label (checked at
+/// `unafs::superblock::Superblock`, whose fields are magic / version / block_size / block_count /
+/// root_inode / catalog_inode), so a friend's UnaFS volume has no name to be mounted under and
+/// inventing one is what §"The other disks" forbids.
+fn unafs_present(_src: BlockSource) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::fs::unafs::locate_on(fat::handle_of(_src)).is_ok()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
 /// Bind `/`, `/boot` and `/apps` over the disk this kernel was found on.
 ///
 /// * `/boot` — the FAT volume the kernel was found in.
@@ -760,11 +912,12 @@ fn unafs_state(_src: BlockSource) -> &'static str {
 /// independent of that: they are the disks the machine HAS, and whether this kernel was found on
 /// one of them does not change what the others are.
 ///
-/// TWOCARD: every other enumerated disk with a FAT volume is mounted at its bus point with ITS OWN
-/// write posture, sampled from the very backend that gets mounted (`rw = !FatBackend::read_only()`,
-/// which forwards to `BlockSource::write_veto`). There is deliberately no fixed expectation for a
-/// `Default`-sourced mount: its veto is conditional on FRGUARD's `default_writable()`, a runtime
-/// state. VFS-3's `/usb` is this rule's first instance, not a special case beside it.
+/// HOMESOIL: every other enumerated disk with a FAT volume is mounted at `/volumes/<NAME>` — the
+/// volume's OWN label, sanitized by whitelist — with ITS OWN write posture, sampled from the very
+/// backend that gets mounted (`rw = !FatBackend::read_only()`, which forwards to
+/// `BlockSource::write_veto`). There is deliberately no fixed expectation for a `Default`-sourced
+/// mount: its veto is conditional on FRGUARD's `default_writable()`, a runtime state. VFS-3's `/usb`
+/// is this rule's ancestor, not a special case beside it.
 pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
     let s = survey();
@@ -773,19 +926,43 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     // the root witness is (which rides the cached walk): announced once, on the first table built.
     let announce = !MOUNTS_ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed);
 
-    for (osrc, point) in s.others.iter() {
-        let be = FatBackend::new_source(bus_name(*osrc), KERNEL_PRINCIPAL, true, *osrc);
+    for h in s.others.iter() {
+        // The backend's volume NAME is the point's unique leaf, so `same_volume` answers about the
+        // mount a person can see rather than about a bus the path no longer names.
+        let vol_name = h.point.rsplit('/').next().unwrap_or(UNTITLED);
+        let be = FatBackend::new_source(vol_name, KERNEL_PRINCIPAL, true, h.source);
         // ONE sample, from the backend being mounted — not a second derivation of the posture.
         let rw = !be.read_only();
         if announce {
-            serial_println!(
-                "[vfs] disk mounted {} source={} rw={} ::",
-                point,
-                osrc.name(),
-                if rw { "yes" } else { "no" }
-            );
+            // `label_raw=` appears ONLY when sanitizing altered a byte. Its PRESENCE is the signal,
+            // so an ordinary card's line stays short and a card whose label is trying something
+            // shows all 11 bytes as hex, un-interpreted.
+            if h.altered {
+                serial_println!(
+                    "[vfs] volume mounted {} source={} rw={} label_raw={} ::",
+                    h.point,
+                    h.source.name(),
+                    if rw { "yes" } else { "no" },
+                    hex11(&h.label_raw)
+                );
+            } else {
+                serial_println!(
+                    "[vfs] volume mounted {} source={} rw={} ::",
+                    h.point,
+                    h.source.name(),
+                    if rw { "yes" } else { "no" }
+                );
+            }
+            if h.unafs {
+                // No volume label exists in the UnaFS superblock, so there is no honest name for
+                // this volume and it is left where it is. Said out loud, never silently skipped.
+                serial_println!(
+                    "[vfs] unafs volume on {} — unnamed, not mounted ::",
+                    h.source.name()
+                );
+            }
         }
-        mt.mount(point, alloc::boxed::Box::new(be));
+        mt.mount(&h.point, alloc::boxed::Box::new(be));
     }
 
     let Some(found) = s.root else { return };
@@ -815,45 +992,76 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     );
 }
 
-/// One-shot latch for the `[vfs] disk mounted …` witnesses. See [`bind`].
+/// HOMESOIL: 11 label bytes as 22 lowercase hex digits, un-interpreted. Fixed width by the type, so
+/// the field on the wire is always exactly 22 characters and a reader can slice it without parsing.
+fn hex11(raw: &[u8; 11]) -> String {
+    let mut s = String::new();
+    for &b in raw.iter() {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    s
+}
+
+/// One-shot latch for the `[vfs] volume mounted …` witnesses. See [`bind`].
 static MOUNTS_ANNOUNCED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 // =====================================================================================
-// TWOCARD self-test — the legs a single-card QEMU machine cannot show us.
+// HOMESOIL self-test — the legs a single-card QEMU machine cannot show us.
 //
 // The end-to-end proofs (a real byte flip on the card, a decoy beside the image) run on the QEMU
-// Pi leg. What that machine CANNOT do is present a SECOND disk, or present ONE disk under TWO
-// handles, so the counting, the dedupe and the point indexing would otherwise be reasoned about
-// and never executed — which is the defect class this fleet has paid for repeatedly. The planner
-// ([`admit`] and [`plan`]) is pure over its inputs precisely so it can be driven here with
-// SYNTHETIC devices, at the real call, on the real code path.
+// Pi leg. What that machine CANNOT do is present a SECOND disk, present ONE disk under TWO handles,
+// or present a card whose LABEL is hostile — so the counting, the dedupe and the whole naming rule
+// would otherwise be reasoned about and never executed, which is the defect class this fleet has
+// paid for repeatedly. The planner ([`admit`], [`plan`], [`sanitize_label`], [`next_volume_point`])
+// is pure over its inputs precisely so it can be driven here with SYNTHETIC devices and SYNTHETIC
+// label bytes, at the real call, on the real code path.
+//
+// Leg 3 is RED-FIRST in the only sense available without a card: it feeds the exact byte sequence
+// amendment 03 v4 names (`..`, NUL, `/`, DEL, and a byte ≥ 0x80) and asserts that what comes back
+// carries NO separator and NO byte outside the whitelist — the resolver never sees one.
 //
 // `witness`-gated, in the default-quiet idiom (`arroyo` arms `witness` for exactly the four battery
 // commands), and driven from the cached walk so it runs once, on the boot that builds the first
-// mount table. Uncounted `:: TWOCARD: … PASS ::` lines, beside the `[vfs] root` witness.
+// mount table. Uncounted `:: HOMESOIL: … PASS ::` lines, beside the `[vfs] root` witness.
 // =====================================================================================
 
-/// TWOCARD: the counting, dedupe, indexing and posture-sampling legs. See the block comment above.
+/// HOMESOIL: the counting, dedupe, indexing and posture-sampling legs. See the block comment above.
 #[cfg(feature = "witness")]
-fn twocard_selftest() {
+fn homesoil_selftest() {
     use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
 
-    // --- leg 1: TWO disks carrying this kernel — first wins, second is home soil, matches=2. ----
+    // --- leg 1: TWO disks carrying this kernel — first wins, second is home soil at its LABEL. ---
+    const L_SPARE: [u8; 11] = *b"SPARE      ";
     let mut ds: Vec<Disk> = Vec::new();
-    assert_admit(&mut ds, BlockSource::Default, DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 });
-    assert_admit(&mut ds, BlockSource::Usb, DiskId { num_blocks: 200, vol_id: 0xbbbb_0002 });
+    assert_admit(
+        &mut ds,
+        BlockSource::Default,
+        DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 },
+        *b"UNAOS-BOOT ",
+    );
+    assert_admit(
+        &mut ds,
+        BlockSource::Usb,
+        DiskId { num_blocks: 200, vol_id: 0xbbbb_0002 },
+        L_SPARE,
+    );
     ds[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
     ds[1].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
-    let (root_ix, others) = plan(&ds);
+    let (root_ix, others) = plan(&ds, &[false, false]);
     let matching = ds.iter().filter(|d| !d.hits.is_empty()).count();
-    let leg1 = root_ix == Some(0) && matching == 2 && others.len() == 1 && others[0].1 == "/usb";
+    let leg1 = root_ix == Some(0)
+        && matching == 2
+        && others.len() == 1
+        && others[0].point == "/volumes/SPARE"
+        && !others[0].altered;
     serial_println!(
-        ":: TWOCARD: two-disks root_ix={:?} matches={} others={} point={} :: {} ::",
+        ":: HOMESOIL: two-disks root_ix={:?} matches={} others={} point={} :: {} ::",
         root_ix,
         matching,
         others.len(),
-        if others.is_empty() { "-" } else { others[0].1.as_str() },
+        if others.is_empty() { "-" } else { others[0].point.as_str() },
         if leg1 { "PASS" } else { "FAIL" }
     );
 
@@ -862,10 +1070,10 @@ fn twocard_selftest() {
     // `BlockDeviceInfo` into both `BLOCK_DEVICE` and `USB_BLOCK_DEVICE`.
     let same = DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 };
     let mut ad: Vec<Disk> = Vec::new();
-    let first = admit(&mut ad, BlockSource::Default, same);
-    let second = admit(&mut ad, BlockSource::Usb, same);
+    let first = admit(&mut ad, BlockSource::Default, same, L_SPARE);
+    let second = admit(&mut ad, BlockSource::Usb, same, L_SPARE);
     ad[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
-    let (aroot, aothers) = plan(&ad);
+    let (aroot, aothers) = plan(&ad, &[false]);
     let leg2 = first
         && !second
         && ad.len() == 1
@@ -874,7 +1082,7 @@ fn twocard_selftest() {
         && aroot == Some(0)
         && aothers.is_empty();
     serial_println!(
-        ":: TWOCARD: alias disks={} aliases={} root_ix={:?} others={} :: {} ::",
+        ":: HOMESOIL: alias disks={} aliases={} root_ix={:?} others={} :: {} ::",
         ad.len(),
         ad[0].aliases.len(),
         aroot,
@@ -882,19 +1090,55 @@ fn twocard_selftest() {
         if leg2 { "PASS" } else { "FAIL" }
     );
 
-    // --- leg 3: the point index is per bus, in enumeration order. -------------------------------
-    let mut used: Vec<(&'static str, u32)> = Vec::new();
-    let p0 = next_point(&mut used, "usb");
-    let p1 = next_point(&mut used, "usb");
-    let p2 = next_point(&mut used, "sd");
-    let p3 = next_point(&mut used, "usb");
-    let leg3 = p0 == "/usb" && p1 == "/usb1" && p2 == "/sd" && p3 == "/usb2";
+    // --- leg 3: the NAME rule — sanitize by whitelist, KNOWN unnamed values, collisions. --------
+    // Five labels chosen to cover every branch of `sanitize_label`, including the hostile one.
+    const L_EVIL: [u8; 11] = *b"..\x00/\x7f\xff AB  ";
+    let named = sanitize_label(b"UNAOS-PI   "); // ordinary; `-` is FAT-permitted, so untouched
+    let blank = sanitize_label(b"           "); // all spaces: a KNOWN unnamed value
+    let noname = sanitize_label(b"NO NAME    "); // the formatter's placeholder: also KNOWN
+    let dots = sanitize_label(b"..         "); // `.` is NOT whitelisted, so `..` cannot survive
+    let evil = sanitize_label(&L_EVIL); // separators, NUL, DEL, a byte >= 0x80
+    let mut used: Vec<String> = Vec::new();
+    let c0 = next_volume_point(&mut used, &blank.0);
+    let c1 = next_volume_point(&mut used, &noname.0);
+    let c2 = next_volume_point(&mut used, &named.0);
+    let c3 = next_volume_point(&mut used, &named.0);
+    // What the RESOLVER must never see, asserted on the PRODUCED string rather than argued about:
+    // every byte of every name this function can emit is in the whitelist, so `/`, `\`, NUL, control
+    // bytes and everything ≥ 0x80 are absent by the same rule that admits the rest.
+    let clean = evil.0.bytes().all(label_byte_ok)
+        && dots.0.bytes().all(label_byte_ok)
+        && !evil.0.contains('/');
+    // The live form of the claim `sanitize_label` makes about `.`: it is out of the charset, so no
+    // `.`/`..` special case is needed and none is written. If the whitelist ever admits `.`, this
+    // fails here rather than in a path resolver.
+    let dot_excluded = !label_byte_ok(b'.') && !dots.0.contains('.') && dots.0 == "__";
+    let leg3 = named.0 == "UNAOS-PI"
+        && !named.1
+        && blank.0 == UNTITLED
+        && !blank.1
+        && noname.0 == UNTITLED
+        && !noname.1
+        && dots.1
+        && evil.1
+        && clean
+        && dot_excluded
+        && c0 == "/volumes/Untitled"
+        && c1 == "/volumes/Untitled 1"
+        && c2 == "/volumes/UNAOS-PI"
+        && c3 == "/volumes/UNAOS-PI 1";
     serial_println!(
-        ":: TWOCARD: points {} {} {} {} :: {} ::",
-        p0,
-        p1,
-        p2,
-        p3,
+        ":: HOMESOIL: names {} blank={} noname={} dots={} evil={} raw={} points {} {} {} {} :: {} ::",
+        named.0,
+        blank.0,
+        noname.0,
+        dots.0,
+        evil.0,
+        hex11(&L_EVIL),
+        c0,
+        c1,
+        c2,
+        c3,
         if leg3 { "PASS" } else { "FAIL" }
     );
 
@@ -906,7 +1150,7 @@ fn twocard_selftest() {
     let mut leg4 = true;
     let mut census = String::new();
     for src in fat::ALL_SOURCES {
-        let be = FatBackend::new_source(bus_name(*src), KERNEL_PRINCIPAL, true, *src);
+        let be = FatBackend::new_source(UNTITLED, KERNEL_PRINCIPAL, true, *src);
         let rw = !be.read_only();
         if rw != src.write_veto().is_none() {
             leg4 = false;
@@ -919,7 +1163,7 @@ fn twocard_selftest() {
         census.push_str(if rw { "rw" } else { "ro" });
     }
     serial_println!(
-        ":: TWOCARD: posture {} (rw == !read_only, one sample per source) :: {} ::",
+        ":: HOMESOIL: posture {} (rw == !read_only, one sample per source) :: {} ::",
         census,
         if leg4 { "PASS" } else { "FAIL" }
     );
@@ -928,8 +1172,8 @@ fn twocard_selftest() {
 /// Admit and say so on the wire if it unexpectedly aliased — a synthetic setup that silently
 /// collapsed would make the leg above vacuous.
 #[cfg(feature = "witness")]
-fn assert_admit(disks: &mut Vec<Disk>, src: BlockSource, id: DiskId) {
-    if !admit(disks, src, id) {
-        serial_println!(":: TWOCARD: setup source={} aliased unexpectedly :: FAIL ::", src.name());
+fn assert_admit(disks: &mut Vec<Disk>, src: BlockSource, id: DiskId, label: [u8; 11]) {
+    if !admit(disks, src, id, label) {
+        serial_println!(":: HOMESOIL: setup source={} aliased unexpectedly :: FAIL ::", src.name());
     }
 }

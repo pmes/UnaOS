@@ -465,18 +465,43 @@ FORBID TEGRA-SD: REFUSED to publish
 # for a reason of its own: it is the field that separates "one disk" from "one file", which
 # is precisely the distinction the refusal used to get wrong.
 #
-# `disk mounted` fires once per NON-ROOT disk carrying a FAT volume. On the Orin devkit with
-# nothing but the boot card there are none, so this row can only be honest as PENDING: a
-# ✅ says a second disk was there AND was mounted as home soil; an absence says the machine
-# had one disk, which is not a defect. `rw=` is deliberately NOT part of any key — a
+# `volume mounted` fires once per NON-ROOT disk carrying a FAT volume. On the Orin devkit
+# with nothing but the boot card there are none, so this row can only be honest as PENDING:
+# a ✅ says a second disk was there AND was mounted as home soil; an absence says the
+# machine had one disk, which is not a defect. `rw=` is deliberately NOT part of any key — a
 # `Default`-sourced mount's posture is conditional on FRGUARD's `default_writable()`, a
 # runtime state, so a fixed expectation for it would be a lie waiting to fire.
 #
-# BOUNDING, as above: one field per key, `\b` on the side that can abut, no trailing space.
+# --- HOMESOIL v4 (orin 22): the mount point is the volume's LABEL ------------------------
+# The row was `\[vfs\] disk mounted /` for one afternoon. Peter struck the bus-named point
+# ("`/usb0` and `/usb1` are meaningless outside the kernel; what if the disk has a label?"),
+# so the wire is now `[vfs] volume mounted /volumes/<NAME> source=… rw=…`, and the key ends
+# at the `/` after `volumes` — which is the whole boundary argument for this row: the
+# trailing separator is what stops it claiming a hypothetical `/volumesfoo`, and it is a
+# non-word character, so per the BOUNDING TABLE a `\b` here would be wrong (the boundary
+# already exists) and a trailing space would be stripped by `parse_spec`.
+#
+# `unafs volume on …not mounted` is the friend-disk announcement: UnaFS's superblock
+# (`unaos/libs/fs/unafs/src/superblock.rs`) carries NO volume label, so a non-root disk's
+# UnaFS volume has no honest name to be mounted under and is announced instead of being
+# given an invented one. PENDING for the same reason as the row above — it takes a second
+# UnaOS disk in the machine to fire. The key spans to `not mounted` deliberately: `on ` with
+# a trailing space would be stripped, and `\[vfs\] unafs volume on\b` would also claim any
+# future line that begins the same way and says something else.
+#
+# NO ROW FOR `label_raw=`, and the reason is the `multiple-kernels` reason one paragraph up
+# in reverse: it is emitted ONLY when a card's label had a byte altered by the sanitizer.
+# A REQUIRE could never fire on healthy media and a FORBID would forbid the announcement
+# this arc exists to make. It is proven at unit level instead, on the real predicate
+# (`homesoil_selftest` leg 3).
+#
+# BOUNDING, as above: one field per key, `\b` on the side that can abut a word character and
+# NOT where the sibling differs by punctuation, no trailing space.
 PENDING \bwindow_len=4096\b
 PENDING \bmatches=1\b
 PENDING \bfiles=1\b
-PENDING \[vfs\] disk mounted /
+PENDING \[vfs\] volume mounted /volumes/
+PENDING \[vfs\] unafs volume on .*not mounted
 
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the

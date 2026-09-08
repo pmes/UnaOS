@@ -4576,7 +4576,7 @@ impl FatFs {
 }
 
 // =========================================================================================
-// TWOCARD (orin 22) — the DEVICE's block count, appended at the FILE TAIL.
+// HOMESOIL (orin 22) — the DEVICE's block count, appended at the FILE TAIL.
 //
 // Same tail-append reason the two blocks above give: `fat.rs` is compiled into the knob-off
 // `kernel8.img` and `panic::Location` embeds source line numbers, so anything inserted mid-file
@@ -4598,7 +4598,7 @@ impl FatFs {
 // so aliased handles agree by construction.
 // =========================================================================================
 
-/// TWOCARD (orin 22): how many blocks the DEVICE behind this source reports, or `None` when no
+/// HOMESOIL (orin 22): how many blocks the DEVICE behind this source reports, or `None` when no
 /// device is registered on that handle.
 ///
 /// The same registry lookups [`source_present`] and [`volume_serials`] use, in the same order — one
@@ -4614,4 +4614,94 @@ pub fn source_blocks(source: BlockSource) -> Option<u64> {
         BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
     };
     dev.map(|d| d.num_blocks)
+}
+
+// =========================================================================================
+// HOMESOIL (orin 22) — the volume LABEL, as BYTES.
+//
+// `FatFs::label()` above is the `fdisk`-facing spelling: trimmed, `NO NAME` folded to empty, a
+// `String`. A MOUNT POINT cannot be built from it, for two reasons that are not style:
+//
+//  * it has already thrown away WHICH bytes were there, so `/volumes/<name>` could not report that
+//    it had altered any of them; and
+//  * it is a `String`, i.e. a length derived from the medium's content. The mount-point builder must
+//    never take a length from a card. Both functions below hand back a FIXED `[u8; 11]` — the field
+//    is 11 bytes by the FAT specification, the buffer is 11 bytes by the type, and the copy is a
+//    `copy_from_slice` over an exactly-11-byte slice, so a truncated, over-long or unterminated
+//    field on a hostile card cannot make the copy write past the buffer. There is no length to
+//    trust, so there is nothing to get wrong.
+//
+// WHICH FIELD. A FAT volume can carry the label in two places and formatters disagree about which
+// one they update: `BS_VolLab` in the extended BPB (offset 0x2B on FAT12/16, 0x47 on FAT32) and a
+// root-directory entry with `ATTR_VOLUME_ID` (0x08) set. `mkfs.fat -n`, `mlabel`, Windows' format
+// and macOS all write the ROOT-DIRECTORY entry and most also mirror it into the BPB, while a
+// RENAME typically updates only the directory entry. So the directory entry is preferred and the
+// BPB is the fallback — see [`FatFs::label_raw`].
+// =========================================================================================
+
+impl FatFs {
+    /// HOMESOIL: the extended BPB's `BS_VolLab`, exactly as it sits on the medium — 11 bytes, no
+    /// trimming, no interpretation. Already a fixed-size field in [`FatFs`] (`vol_label`), read once
+    /// at mount from the boot sector.
+    pub fn label_raw_bpb(&self) -> [u8; 11] {
+        self.vol_label
+    }
+
+    /// HOMESOIL: the FIRST root-directory entry carrying `ATTR_VOLUME_ID` (0x08) and NOT the
+    /// long-file-name marker (0x0F, which has 0x08 set and is not a label), or `None` when the root
+    /// directory has no such entry — the ordinary case on a volume that was never named.
+    ///
+    /// Walks the root's own sectors through [`FatFs::walk_dir_sectors`], the same reader every other
+    /// directory walk uses, and stops at the 0x00 end-of-directory terminator exactly as
+    /// [`classify_dir_slot`] does. The label entry is one of the slots that function classifies as
+    /// `Skip`, which is why it cannot be found through the entry walkers and needs its own scan.
+    ///
+    /// A read error yields `None`, and the BPB fallback then applies: a volume whose root directory
+    /// cannot be read is not a volume whose label is knowable, and refusing to mount home soil over
+    /// an unreadable NAME would be the wrong trade — the name is a convenience, the mount is not.
+    pub fn label_raw_rootdir(&self) -> Option<[u8; 11]> {
+        let start = match self.kind {
+            FatKind::Fat32 => Some(self.root_cluster),
+            FatKind::Fat16 => None,
+        };
+        let mut found: Option<[u8; 11]> = None;
+        let r = self.walk_dir_sectors(start, |_lba, sec| {
+            let mut i = 0usize;
+            while i + 32 <= SECTOR_SIZE {
+                let e = &sec[i..i + 32];
+                if e[0] == 0x00 {
+                    return true; // end of directory — this volume has no label entry
+                }
+                let attr = e[11];
+                if e[0] != 0xE5 && attr & 0x0F != 0x0F && attr & 0x08 != 0 {
+                    let mut b = [0u8; 11];
+                    // EXACTLY 11 bytes, out of a slice that is exactly 11 bytes long. No length is
+                    // read from the medium anywhere on this path.
+                    b.copy_from_slice(&e[0..11]);
+                    found = Some(b);
+                    return true;
+                }
+                i += 32;
+            }
+            false
+        });
+        if r.is_err() {
+            return None;
+        }
+        found
+    }
+
+    /// HOMESOIL: the volume's label BYTES — the root-directory `ATTR_VOLUME_ID` entry when the
+    /// volume has one, else the BPB's `BS_VolLab`. See the block comment above for why the directory
+    /// entry wins.
+    ///
+    /// ALWAYS 11 bytes. An unnamed volume is not an ABSENCE here: it comes back as 11 spaces, or as
+    /// the conventional `NO NAME    ` placeholder — both KNOWN values, which is what lets the caller
+    /// say `Untitled` rather than invent something.
+    pub fn label_raw(&self) -> [u8; 11] {
+        match self.label_raw_rootdir() {
+            Some(b) => b,
+            None => self.label_raw_bpb(),
+        }
+    }
 }

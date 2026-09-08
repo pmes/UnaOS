@@ -937,7 +937,7 @@ impl FatBackend {
     /// write verbs route to the verified BOT WRITE(10) path (`write_block_usb`,
     /// MISSION RMW+restore witnessed), which superseded the PIUSB-27 guard.
     ///
-    /// ⚠ **TWOCARD (orin 22): `vfs_mount_table` no longer calls this.** `/usb` is now one instance
+    /// ⚠ **HOMESOIL (orin 22): `vfs_mount_table` no longer calls this.** `/usb` is now one instance
     /// of the general home-soil rule — every enumerated non-root disk gets an indexed, bus-named
     /// point with its SOURCE's own posture — so `fs::bootdisk::bind` builds it through
     /// [`FatBackend::new_source`], which is this constructor with the source spelled out instead of
@@ -976,7 +976,7 @@ impl FatBackend {
     /// free to drift, on a target where the `Default` arm is the difference between a write that
     /// lands and a write that fails closed several sectors in. `BlockSource::write_veto` is the
     /// single definition; the VFS reports its presence as a boolean and the shell prints its text.
-    pub(crate) fn read_only(&self) -> bool { // TWOCARD (orin 22): `pub(crate)` on the SAME LINE (no line moves) so `fs::bootdisk` can print `rw=` from the SAME sample that built the mount, instead of re-deriving the posture at a second site — which is the drift `write_veto` was made the one definition to end.
+    pub(crate) fn read_only(&self) -> bool { // HOMESOIL (orin 22): `pub(crate)` on the SAME LINE (no line moves) so `fs::bootdisk` can print `rw=` from the SAME sample that built the mount, instead of re-deriving the posture at a second site — which is the drift `write_veto` was made the one definition to end.
         self.source.write_veto().is_some()
     }
 
