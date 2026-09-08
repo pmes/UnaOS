@@ -87,7 +87,29 @@
 //! offset computed from ITS entry; the bytes there are not this kernel's `.text`, so it does not
 //! match. The test contains no name, extension, size or directory heuristic at all.
 //!
-//! # Counting — per DISK, and a second one is HOME SOIL (HOMESOIL, Peter, 2026-09-08)
+//! # The window is not enough on its own — VERSIONWIN, the second range
+//!
+//! Peter, 2026-09-08, on two builds and two cards: *"not making assumptions and not tying them
+//! together, possibly staining the testing of the newer version."*
+//!
+//! 4 KiB of `.text` at `_start` is EARLY BOOT CODE, which barely changes. Two builds from different
+//! commits can be byte-identical there while differing everywhere else — and with the first-found
+//! rule above, a NEWER kernel booted from the reader could then match an OLDER install's image on
+//! the onboard slot, enumerate it first, and root the new build on the old build's disk. Silently,
+//! and exactly while someone is testing the new build.
+//!
+//! So the compared bytes include this build's own identity: [`UNAOS_BUILD_STAMP`], a magic-prefixed
+//! byte array carrying `UNAOS_GIT_SHA`, placed in `.text` and compared as a SECOND range whose file
+//! offset is derived by the SAME rule as the window's (`offset_of`). A candidate must match BOTH.
+//! The witness prints `sha=` beside `match=`.
+//!
+//! **The limit is stated where the mechanism is** (see the `VERSIONWIN` block below): two builds
+//! from the SAME COMMIT share a stamp by design, because same-commit byte identity is load-bearing
+//! for this fleet's identity gates. Two DIRTY trees at one commit are separated by `arroyo`'s
+//! tracked-diff suffix. If the env was absent at build time the stamp reads `unstamped`, the witness
+//! says so, and the decision falls back to code bytes — announced, never silent.
+//!
+//! # Counting — per DISK, and another one is HOME SOIL (HOMESOIL, Peter, 2026-09-08)
 //!
 //! > "booting dumb means booting dumb. If it sees another UnaOS disk it is home soil and nothing
 //! > more."
@@ -232,6 +254,93 @@ pub fn window_addr() -> usize {
     _start as *const () as usize
 }
 
+// =====================================================================================
+// VERSIONWIN (orin 22) — the build stamp, and why the code window alone is not enough.
+//
+// rmbp 16 named the hole and Peter ruled on it (2026-09-08): "not making assumptions and not tying
+// them together, possibly staining the testing of the newer version." A 4 KiB slice of `.text` at
+// `_start` is early-boot code that barely changes; two builds from DIFFERENT COMMITS can be
+// byte-identical THERE while differing everywhere else. With HOMESOIL's first-found rule that is a
+// real failure: a NEWER kernel, booted from the card in the reader, could match an OLDER install's
+// image on the onboard slot, enumerate it first, and root the new build on the old build's disk —
+// silently, and precisely while someone is trying to test the new build.
+//
+// THE FIX is to put the build's own identity INTO the compared bytes. `UNAOS_GIT_SHA` is exported
+// by `arroyo` under its `# BUILD-SHA-1` marker (grep the marker — the line number differs between
+// trees) and read here with `option_env!`. It is placed in `.text` as a magic-prefixed byte array
+// and compared as a SECOND range, derived from the candidate file's layout EXACTLY as the window is
+// (`offset_of`) — not as a name, a date or a size.
+//
+// THE LIMIT, STATED AT THE SITE: two builds from the SAME COMMIT share a stamp BY DESIGN. That is
+// not an oversight to be papered over with a per-build nonce — same-commit byte identity is
+// load-bearing for this fleet's identity gates (the knob-off/knob-on comparisons, the staged-media
+// sha). What the stamp separates is COMMITS. Two DIRTY trees at one commit are separated by
+// `arroyo`'s tracked-diff suffix (same marker, `-d<6hex>`), and a clean build keeps exact bytes.
+//
+// IF THE ENV WAS ABSENT at build time the stamp reads `unstamped`, the witness says so, and the
+// walk still decides on code bytes — announced, never silent.
+// =====================================================================================
+
+/// The stamp's magic prefix. Distinctive on purpose: `strings kernel.elf | grep UNAOS-BUILD-STAMP`
+/// is how a build's identity is read back out of an artifact.
+pub const STAMP_MAGIC: &[u8; 20] = b"UNAOS-BUILD-STAMP-1:";
+
+/// Bytes reserved for the sha text after the magic. 8 hex + a `-d<6hex>` dirty suffix is 16; the
+/// rest is zero padding, which costs nothing and leaves room for a longer marker.
+pub const STAMP_SHA_MAX: usize = 28;
+
+/// Total stamped length — the second compared range.
+pub const STAMP_LEN: usize = STAMP_MAGIC.len() + STAMP_SHA_MAX;
+
+/// This build's identity as `arroyo` exported it, or `unstamped` when nothing did.
+pub const BUILD_SHA: &str = match option_env!("UNAOS_GIT_SHA") {
+    Some(s) => s,
+    None => "unstamped",
+};
+
+const fn build_stamp() -> [u8; STAMP_LEN] {
+    let mut out = [0u8; STAMP_LEN];
+    let mut i = 0;
+    while i < STAMP_MAGIC.len() {
+        out[i] = STAMP_MAGIC[i];
+        i += 1;
+    }
+    let s = BUILD_SHA.as_bytes();
+    let mut j = 0;
+    while j < s.len() && j < STAMP_SHA_MAX {
+        out[STAMP_MAGIC.len() + j] = s[j];
+        j += 1;
+    }
+    out
+}
+
+/// The build stamp, in `.text`.
+///
+/// `.text` for the SAME reason the window is `.text` (module docs §"What is compared"): it is the
+/// only section whose bytes are identical in the file and in RAM on all three link layouts. The
+/// input section name is `.text.unaos_build_stamp`, which every link this OS performs folds into
+/// `.text` — `crates/kernel/pi-baremetal.ld` does it explicitly (`.text : { *(.text .text.*) }`) and
+/// the two UEFI links inherit lld's default script, which does the same.
+///
+/// `#[used]` + `#[unsafe(no_mangle)]` because nothing ever reads this array through its Rust name in
+/// a way the optimizer can see — only its ADDRESS is taken, in [`stamp_addr`] — so without both it
+/// is a static the compiler is entitled to drop and the linker is entitled to garbage-collect.
+#[used]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.unaos_build_stamp")]
+pub static UNAOS_BUILD_STAMP: [u8; STAMP_LEN] = build_stamp();
+
+/// The runtime address of the build stamp.
+#[inline]
+pub fn stamp_addr() -> usize {
+    core::ptr::addr_of!(UNAOS_BUILD_STAMP) as *const u8 as usize
+}
+
+/// The stamp as this kernel currently holds it in RAM.
+fn stamp_mem() -> &'static [u8] {
+    unsafe { core::slice::from_raw_parts(stamp_addr() as *const u8, STAMP_LEN) }
+}
+
 /// The window as this kernel currently holds it in RAM.
 ///
 /// Sound in the way that matters: it reads `WINDOW` bytes of the kernel's OWN `.text`, mapped
@@ -294,7 +403,7 @@ pub struct Disk {
 /// Why the walk bound nothing. Spelled exactly as the `reason=` field prints it.
 ///
 /// ⚠ `MultipleKernels` / `reason=multiple-kernels` USED TO BE HERE and is deleted (HOMESOIL, Peter's
-/// two-card rule): several disks carrying this kernel is not an error, it is home soil.
+/// home-soil rule): several disks carrying this kernel is not an error, it is home soil.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum NoRoot {
     /// Not one source has a device behind it. The machine showed the kernel no disks at all.
@@ -650,12 +759,13 @@ fn walk_and_witness() -> Survey {
             file_off: d.hits[0].file_off,
         };
         serial_println!(
-            "[vfs] root = boot volume serial=0x{:08x} source={} match={} unafs={} matches={} \
-             home={} files={} aliased={} window_off={:#x} window_len={} file_off={:#x} \
-             candidates={} disks={} ::",
+            "[vfs] root = boot volume serial=0x{:08x} source={} match={} sha={} unafs={} \
+             matches={} home={} files={} aliased={} window_off={:#x} window_len={} \
+             file_off={:#x} candidates={} disks={} ::",
             f.vol_id,
             f.source.name(),
             f.path,
+            BUILD_SHA,
             unafs_state(f.source),
             matching,
             home,
@@ -679,9 +789,10 @@ fn walk_and_witness() -> Survey {
         NoRoot::KernelNotFound
     };
     serial_println!(
-        "[vfs] root -> NONE reason={} matches=0 matched=- home={} files=0 aliased={} disks={} \
-         candidates={} window_off={:#x} window_len={} ::",
+        "[vfs] root -> NONE reason={} sha={} matches=0 matched=- home={} files=0 aliased={} \
+         disks={} candidates={} window_off={:#x} window_len={} ::",
         reason.as_str(),
+        BUILD_SHA,
         home,
         aliased,
         disk_census(),
@@ -733,7 +844,10 @@ fn walk_rows(
         }
         *candidates += 1;
         if let Some(file_off) = window_offset_in(fs, de) {
-            if compare_window(fs, de, file_off) {
+            // VERSIONWIN: BOTH ranges, or it is not this kernel. The code window says "same early
+            // `.text`", which two builds from different commits can share; the stamp says "same
+            // build". Neither alone is the claim.
+            if compare_window(fs, de, file_off) && compare_stamp(fs, de) {
                 hits.push(Hit { path, file_off });
             }
         }
@@ -745,6 +859,15 @@ fn walk_rows(
 /// question has no answer for the file's shape (a header we cannot read exactly, `PT_LOAD`s that do
 /// not cover the window, a short read, an offset past EOF).
 fn window_offset_in(fs: &FatFs, de: &DirEntry) -> Option<u32> {
+    offset_of(fs, de, window_addr(), WINDOW)
+}
+
+/// VERSIONWIN: the general form — where in THIS file would the `len` bytes this kernel holds at
+/// runtime address `addr` live, if this file were this kernel? The window and the build stamp are
+/// both derived through it, so the second compared range cannot be located by a different rule from
+/// the first. `_start` remains the ONE anchor: it is the image entry, so it is what ties a runtime
+/// address to a file offset on both shapes.
+fn offset_of(fs: &FatFs, de: &DirEntry, addr: usize, len: usize) -> Option<u32> {
     let mut head: Vec<u8> = Vec::new();
     fs.read_at(de.first_cluster(), de.size, 0, &mut head, 64).ok()?;
     if head.len() < 64 {
@@ -752,10 +875,11 @@ fn window_offset_in(fs: &FatFs, de: &DirEntry) -> Option<u32> {
     }
 
     // (b) NOT an ELF — a flat image, entry at file offset 0 by the convention this OS's own build
-    // uses for one (`llvm-objcopy -O binary` over a link whose first section holds `_start`).
+    // uses for one (`llvm-objcopy -O binary` over a link whose first section holds `_start`). So a
+    // runtime address maps to the file by its distance from `_start`, which is 0 in the file.
     if head[0..4] != *b"\x7fELF" {
-        let off = (window_addr() as u64).checked_sub(window_addr() as u64)?;
-        if off.checked_add(WINDOW as u64)? > de.size as u64 {
+        let off = (addr as u64).checked_sub(window_addr() as u64)?;
+        if off.checked_add(len as u64)? > de.size as u64 {
             return None;
         }
         return u32::try_from(off).ok();
@@ -796,7 +920,7 @@ fn window_offset_in(fs: &FatFs, de: &DirEntry) -> Option<u32> {
     // RUNNING and where this file says it was LINKED. Wrapping, because a link base above the
     // runtime address is legal and the difference is still the right modular offset.
     let bias = (window_addr() as u64).wrapping_sub(e_entry);
-    let win = window_addr() as u64;
+    let win = addr as u64;
     for i in 0..e_phnum {
         let p = &phdrs[usize::try_from(i * e_phentsize).ok()?..];
         if u32le(p, 0) != 1 {
@@ -810,11 +934,11 @@ fn window_offset_in(fs: &FatFs, de: &DirEntry) -> Option<u32> {
             continue;
         }
         let within = win - seg_mem_base;
-        if within.checked_add(WINDOW as u64)? > p_filesz {
+        if within.checked_add(len as u64)? > p_filesz {
             continue;
         }
         let file_off = p_offset.checked_add(within)?;
-        if file_off.checked_add(WINDOW as u64)? > de.size as u64 {
+        if file_off.checked_add(len as u64)? > de.size as u64 {
             return None;
         }
         return u32::try_from(file_off).ok();
@@ -829,6 +953,23 @@ fn compare_window(fs: &FatFs, de: &DirEntry, file_off: u32) -> bool {
         return false;
     }
     buf.len() == WINDOW && buf.as_slice() == window_mem()
+}
+
+/// VERSIONWIN: the SECOND compared range — this build's stamp, at the offset the file's own layout
+/// puts it, derived through [`offset_of`] exactly as the window is.
+///
+/// Called only for a candidate whose WINDOW already matched, so the cost on the eleven files that
+/// are not this kernel is unchanged; a real match pays one extra header read and one 48-byte read.
+/// A candidate whose layout cannot place the stamp (no `PT_LOAD` covers it, the offset runs past
+/// EOF, a short read) is DECLINED rather than guessed at — the same conservative direction the
+/// window derivation takes.
+fn compare_stamp(fs: &FatFs, de: &DirEntry) -> bool {
+    let Some(off) = offset_of(fs, de, stamp_addr(), STAMP_LEN) else { return false };
+    let mut buf: Vec<u8> = Vec::new();
+    if fs.read_at(de.first_cluster(), de.size, off, &mut buf, STAMP_LEN).is_err() {
+        return false;
+    }
+    buf.len() == STAMP_LEN && buf.as_slice() == stamp_mem()
 }
 
 fn u16le(b: &[u8], o: usize) -> u16 {

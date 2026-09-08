@@ -34,7 +34,7 @@
 // ## The Tegra vendor-quirk assumptions this READ-ONLY recon relies on (documented; metal-pending)
 //
 //  1. The firmware/BPMP has already ENABLED the sdmmc1 module clock + pad power and left the slot's
-//     rails up (the bootloader read the card to boot). We do NOT program the CAR/BPMP clock, and we
+//     rails up — a statement about the SLOT at handover, implying NOTHING about which medium the loader READ; the parenthetical that used to stand here said otherwise and the wire contradicts it (see LOADER-MEDIUM at this file's tail). We do NOT program the CAR/BPMP clock, and we
 //     AUTHOR no Tegra vendor pad-control value (>= 0x100) — we drive ONLY the standard SDHCI
 //     internal-clock divider (CONTROL1) off whatever base clock the controller already has running. If
 //     metal shows the internal clock never stabilises (CLK_STABLE never sets), the diagnosis is "the
@@ -3259,3 +3259,29 @@ mod metal {
         }
     }
 }
+
+// =====================================================================================
+// LOADER-MEDIUM (orin 22) — the parenthetical assumption 1 used to carry, and why it is gone.
+//
+// Assumption 1 above read: "the firmware/BPMP has already ENABLED the sdmmc1 module clock + pad
+// power and left the slot's rails up (THE BOOTLOADER READ THE CARD TO BOOT)". The parenthetical was
+// offered as the REASON the rails are up, and it is a claim about which MEDIUM the loader read —
+// which the wire contradicts on this very board.
+//
+// MEASURED, render9 on the Orin: the loader reported boot volume serial `0xde001a13`, while the
+// card in the sdmmc1 slot carries `vol_id 0xabfbdefa`, with `:: PSRC: … global=present
+// tegra_sd=present` on the same boot. Two different media. So the loader did NOT read the slot
+// card, and the slot's rails were up anyway.
+//
+// WHAT IS ACTUALLY KNOWN, and all that assumption 1 needs: the firmware leaves sdmmc1's module
+// clock, pad power and rails UP at handover. That is a statement about the SLOT's state, and it is
+// what the recon depends on. Which medium the loader READ is a separate fact, it is not implied by
+// this one, and nothing in this driver needs it.
+//
+// The cost of the old wording is on the record: it misled the rmbp seat within an hour of being
+// read. A comment that asserts a machine fact the wire denies is worse than no comment — the wire
+// beats the comment (`docs/dev/LAWS.md`), and a comment that cannot lose to it should not be
+// written. The rewrite above is LINE-NEUTRAL (one line replaced by one line, this block appended at
+// the FILE TAIL) so no `panic::Location` in this file moves and the tegra knob-off byte-identity
+// gates are untouched.
+// =====================================================================================

@@ -449,12 +449,12 @@ FORBID TEGRA-SD: REFUSED to publish
 #
 # DELIBERATELY NOT ADDED — a FORBID on `reason=multiple-kernels`. ⚠ SUPERSEDED WITHIN THE
 # ARC, and kept as the record of why the row was never written: that reason no longer
-# exists. TWOCARD (Peter, 2026-09-08 — "booting dumb means booting dumb; if it sees another
+# exists. HOMESOIL (Peter, 2026-09-08 — "booting dumb means booting dumb; if it sees another
 # UnaOS disk it is home soil and nothing more") replaced the refusal with first-found +
 # home soil, so `multiple-kernels` is deleted from the kernel's vocabulary. A FORBID on it
 # would now be a check that CANNOT FIRE, which is worse than no row.
 #
-# --- TWOCARD (orin 22): the fields the two-card rule added -------------------------------
+# --- HOMESOIL (orin 22): the fields the home-soil rule added -------------------------------
 # `matches=1` above keeps its meaning and gains a sharper one: it now counts DISKS, so on a
 # machine with the operator's second UnaOS card plugged in it reads `matches=2` and the
 # boot is still healthy. That is why it stays PENDING and is NOT promoted to REQUIRE — the

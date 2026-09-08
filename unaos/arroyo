@@ -47,7 +47,43 @@ esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
 # This makes the build ID available to all cargo invocations (check/test/kernel8/esp targets).
-export UNAOS_GIT_SHA="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+#
+# VERSIONWIN (orin 22, rmbp 16's item 6'): the value is now part of the KERNEL'S OWN IDENTITY, not
+# just a label. `fs/bootdisk.rs` places it in `.text` as `UNAOS_BUILD_STAMP` and compares it as a
+# second range when it decides which disk this kernel was found on, so two builds that differ only
+# outside the 4 KiB `.text` window can no longer match each other's card.
+#
+# THE DIRTY SUFFIX and its two limits, both deliberate:
+#   * A CLEAN TREE KEEPS EXACT BYTES. `_sha_suffix` stays empty, so every same-commit clean build is
+#     byte-identical to the one before it — which the fleet's identity gates (knob-off/knob-on
+#     comparisons, staged-media shas) depend on. That is why there is no per-build nonce here.
+#   * ONE VALUE PER PROCESS. Computed ONCE, on this line, before any build runs — so the knoboff
+#     guard, which composes three builds inside a single `arroyo` invocation, sees one sha across
+#     all three and its comparison stays meaningful. Recomputing per build would break it.
+#   * UNTRACKED-ONLY DIFFERENCES ARE INVISIBLE, by design: `git diff HEAD` covers TRACKED changes,
+#     and hashing untracked paths would sweep in build noise, editor droppings and scratch files,
+#     which would defeat the clean-build identity above rather than sharpen it.
+# `git rev-parse` failing (not a repo) yields `unknown` and NO suffix — a failed `git diff` must not
+# be read as "dirty".
+#
+# THE REBUILD IS REAL, AND IT WAS MEASURED, not assumed — a cached stale stamp would make the second
+# compared range in `fs/bootdisk.rs` a lie, and this crate has NO `build.rs` to declare the
+# dependency. Three cargo builds of a one-file crate using `option_env!("UNAOS_GIT_SHA")`, source
+# untouched between them: `aaaaaaaa` -> `aaaaaaaa-dbeef01` -> env unset -> `unstamped`, each read
+# back OUT OF THE BINARY. Cargo picks the env-dep up from rustc's dep-info, so changing this value
+# re-fingerprints the crate on its own.
+#
+# THE SCOPE OF `git diff HEAD` WAS MEASURED TOO, in a throwaway repo, seven probes: clean twice (same
+# value), an UNTRACKED file added (unchanged — the documented blind spot, by design), a tracked edit
+# (suffix appears), the SAME edit staged (identical suffix — `diff HEAD` covers the index, so `git
+# add` does not silently change a build's identity), a DIFFERENT edit (different suffix), reverted
+# (back to clean with the untracked file still there), and outside any repo (`unknown`, no suffix).
+_sha_base="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+_sha_suffix=""
+if [ "$_sha_base" != "unknown" ]; then
+    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | sha256sum | cut -c1-6)"
+fi
+export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"

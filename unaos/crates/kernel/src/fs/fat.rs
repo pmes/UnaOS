@@ -4582,7 +4582,7 @@ impl FatFs {
 // `kernel8.img` and `panic::Location` embeds source line numbers, so anything inserted mid-file
 // moves every panic site below it. A tail append moves nothing.
 //
-// WHY IT IS NEEDED. Peter's two-card rule counts matches per DISK, and on the tegra build one disk
+// WHY IT IS NEEDED. Peter's home-soil rule counts matches per DISK, and on the tegra build one disk
 // wears two `BlockSource` names: `drivers::block::publish_usb_geometry`'s
 // `#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]` variant stores the SAME
 // `BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and `USB_BLOCK_DEVICE` (read as
