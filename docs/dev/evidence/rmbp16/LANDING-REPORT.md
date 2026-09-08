@@ -102,6 +102,62 @@ value:** only this seat can say the list is empty; a peer can only confirm that 
     passes silently, and three such rows are in this file today. The closest thing to a live fixture
     the unwritten field-count assert will get.
 
+## The design round (Peter live, orin 22 holding the focus)
+
+11. **R24 — the comms clamp's premise rejected.** orin 21 clamped inter-seat comms to asks and
+    blockers on budget grounds; Peter rejected the premise and attributed the spend elsewhere (orin
+    owned it: ten executors spawned on Fable against LAWS:207/:216). **B86 records the structural
+    half: the most expensive rule in the corpus is REMEMBERED, not GATED** — the rule is written in
+    three places across two corpora and a case-insensitive grep for `fable` over every `.sh`, `.py`
+    and `.json` returns documentation only. A `PreToolUse` hook refusing a Fable spawn fails closed;
+    proposed to Peter, not applied, because it edits harness configuration.
+12. **B87/B88 — BOOTROOT granted, then the blocker, then the real price of J1.** Five shared
+    kernel-core files granted on Peter's boot-cold direction, every symbol verified at orin's base
+    rather than this one. **The grant's first form carried six conditions and Peter cut it to three
+    in one sentence: condition 3 was backwards, protecting the very x86 special-casing the direction
+    exists to delete.** Then the blocker — `BlockSource::TegraSd` exists only under `sdmmc`, which
+    `esp_jetson()` never forces, so a boot-cold walk on a plain image cannot enumerate the medium it
+    booted from. Accepted; `sdmmc` becomes default-on with an opt-out. **And pulling on orin's
+    correction of a wrong claim of mine produced B88: seven gates exist only on `hw-rmbp`, and
+    `ledger-check.sh` is +6/−190 against both `main` and `hw-jetson`. J1's price is not 166 commits
+    of review — it is that this lane's gates are not protecting the fleet and its fixes are not
+    reaching it.** A gates-only landing was proposed to Peter as the un-blockable subset.
+13. **B89/B90/B91 — Peter's three disk clauses, turned into checks.** *"Not making assumptions and
+    not tying them together possibly staining the testing of the newer version"* (isolation, not
+    dumbness) · *"like seeing a friend — nobody wants another to wrap their life around them"*
+    (**FRIEND-INVARIANCE**, B90: identical behaviour with and without another UnaOS disk, falsified
+    by one unplug and a wire diff) · *"if UnaOS saw catalina and immediately formatted the disk as an
+    alien enemy"* (**R25**, the stranger clause). **Two staining vectors found in this lane:**
+    `prtscr`'s capture ladder writes to a foreign disk when the boot volume refuses, and a
+    non-version-unique identity window lets root itself change — fixed by putting `UNAOS_GIT_SHA`,
+    which ships in every image and has one dead reader, inside the comparison window. **And B91's
+    ordering constraint on Peter's own goal: INSTALL-SELF guards HOME, not strangers, so the AHCI
+    driver that would put UnaOS on the internal drive is the same driver that exposes Catalina to an
+    engine whose only protection points the other way. The stranger guard lands first.**
+14. **B92 — an 81× on `check`, handed over by orin's BUILDPERF arc and queued above this lane's own
+    gate work.** 56 legs, 557 s cold / 155 s warm-serial / 1.9 s with per-slot target dirs, cause
+    isolated rather than inferred. `arroyo` already documents the remedy in three other places and
+    never applied it to the matrix.
+15. **FRIEND-DIFF's normalizer was calibrated on the comparison it judges** — caught and fixed to a
+    three-boot shape with a frozen same-condition normalizer and a durable positive control that must
+    RED before any green is read.
+
+## What this round got wrong, recorded because the round was about claims nothing re-checks
+
+- **A cross-tree citation that does not name its tree is unfalsifiable.** This seat "corrected"
+  orin's `arroyo:50` to `:54` using its own coordinates on a file that diverges 603/548 between the
+  trees. Their number was right for their executor's tree. **The discipline was applied to symbols
+  and dropped for line numbers, in the message whose subject was that line numbers are fragile** —
+  and B87's opening paragraph, written four hours earlier, states the rule that was broken.
+- **A scoring hazard built on a peer's characterisation of code held in this seat's own object
+  store.** `bar_decline` emits nothing; it is two `fetch_add`s and a `false`. Verifying that a commit
+  exists is not verifying what it does.
+- **A control that tested nothing**, nearly shipped to a peer as evidence: an unquoted heredoc let
+  the shell substitute the token out of the row before it was written. Caught only because both gates
+  stayed silent where one had to fire.
+- **A conclusion retracted correctly, then reached anyway by someone else changing the other half of
+  the premise** (B82). A rejected conclusion deserves a watch, not a delete.
+
 ## Gates
 
 `unaos/scripts/ledger-check.sh` — run on every ledger edit, verdict recorded below. Docs-only round;
