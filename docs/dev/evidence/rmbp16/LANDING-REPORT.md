@@ -158,6 +158,37 @@ value:** only this seat can say the list is empty; a peer can only confirm that 
 - **A conclusion retracted correctly, then reached anyway by someone else changing the other half of
   the premise** (B82). A rejected conclusion deserves a watch, not a delete.
 
+## The late round — design closed before any gate ran (R28–R31)
+
+16. **Peter's "why immediately start testing garbage" froze the design first**, and it paid immediately:
+    every objection this seat raised on INTEGRATE cost code time and not one battery. The frozen set
+    (label mounts, build stamp, general QEMU early exit) took four conditions from here, of which one
+    was landing-blocking.
+17. **The landing-blocking one, and it is Peter's own bench: `DiskId = (num_blocks, BS_VolID)` merges a
+    card and the clone it was imaged from.** "Image the microSD, leave the reader card in" produces
+    exactly that pair — same size, and a byte-copy inherits the volume serial — so one card would
+    vanish from `/volumes` while the witness claimed an alias. **A false MERGE, worse than the false
+    split first warned about: a doubled card is confusing, a hidden card is invisible.** Fix taken:
+    dedupe only on provable same-device registry identity; equal key without proof mounts BOTH as
+    `aliased=ambiguous`; two clones count as two disks so the first-found root ruling is untouched.
+18. **R28–R31 turned the whole day into one thread nothing had connected: SELF-HOSTING.** Peter's
+    reason under R27 — *"rebooting the very machine we just wrote the code on"* — makes B89's device
+    hard-codings prerequisites rather than curiosities, B91's stranger guard an ordering constraint on
+    the AHCI driver, and B90's friend-invariance the state a self-hosting box with an experimental card
+    is in by construction. **Order fixed by the goal: stranger guard → capability → self-host**, and
+    the same sequence arrived independently from the write-tooling question.
+19. **Two positions of this seat's superseded by better ones, both recorded rather than quietly
+    dropped:** "bench scripts as labelled scaffolding" lost to Peter's *host installer as a PRODUCT*;
+    and "our loader chooses on one medium" was shown to be an appendage for one of three boards (no
+    loader of ours runs before `kernel8.img`) — the same criticism this seat had levelled at a
+    boot-variable design, applied symmetrically. **orin's corrupted-medium note is the one neither
+    proposal covered.**
+20. **R31's gap, flagged before the idea hardened: the export system solves DISTRIBUTION, not
+    PRIVILEGE.** A native app on a user's machine still cannot write a raw disk — macOS root plus
+    unmount, Windows admin plus volume lock, Linux root or udisks — and nothing in-tree does a
+    privileged host write today. Recorded as its own roadmap line, to be designed with the handler
+    rather than after it.
+
 ## Gates
 
 `unaos/scripts/ledger-check.sh` — run on every ledger edit, verdict recorded below. Docs-only round;
