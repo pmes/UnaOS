@@ -51,8 +51,9 @@ belongs here, on the day it is made.
   defect, and the scorer must know which. rmbp 16's amendment (Correction-04,
   same day) fixes what the field IS: the bind's own four witnesses present or
   absent — `boot-medium-mismatch`, `SAME-MEDIUM`, `bootid DISARMED`,
-  `covers the native leg`, all in `sdmmc_tegra.rs` — never a feature name one
-  layer up, because pre-C15 `UNAOS_SDMMC=1` arms recon but not
+  `covers the native leg`, all in `sdmmc_tegra.rs` at BOOTIDLIVE `aec2c604` —
+  never a feature name one layer up, because pre-C15 `UNAOS_SDMMC=1` arms
+  recon but not
   `sdmmc_root_bind` (that is `sdmmcroot`-gated) while post-C15 the same knob
   arms both, so "sdmmc armed" is ambiguous on one side and the witnesses are
   correct on both without knowing the side. Do not invent a narrower feature
@@ -284,9 +285,10 @@ belongs here, on the day it is made.
   three-way fold `21727dc0` merged unafsgrow's `FORBID span_blocks=2048 fits=` cleanly onto
   fitsland's rewritten `fs::unafs::span_fit_report`, leaving a tripwire no emitted line could match
   (false GREEN). Two rules follow. Re-run each change's OWN falsifier on the FOLDED tree, not only
-  the fold's build gate — the dead row was found by replaying the pre-fold wire against the folded
-  spec (1 hit / exit 1 before, 0 / 0 after), and its repair `6cf9f13b`
-  (`FORBID span_blocks=2048 sb_blocks=`) was proved the same way. And predict conflicts from
+  the fold's build gate — the dead row was found by holding the row fixed and running it against
+  two wires of the same stale geometry, the pre-fitsland wire (1 hit / exit 1) and the fold's
+  (0 / 0), and its repair `6cf9f13b` (`FORBID span_blocks=2048 sb_blocks=`) was proved the same
+  way, red on the stale wire first. And predict conflicts from
   diffstats against each change's own base, never from intuition: the brief's "they touch different
   files, so a clean merge is likely" was refuted by `git diff --stat` before the merge ran
   (unafsgrow forked below integrate2, so `unaos/arroyo` and `jetson-sync1.spec` were two-sided; one
