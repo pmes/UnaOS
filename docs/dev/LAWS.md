@@ -165,6 +165,45 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   gates on its feature knob, never on `target_arch` without a stated hardware reason. No board, bus,
   slot, serial or card geometry in kernel source; root is the volume the kernel was found on, by
   content (Peter 2026-09-08). No reserving cores by policy (Peter 2026-08-19).
+- **Boot cold, boot dumb, presume nothing about the machine** (Peter,
+  2026-09-08, to the orin seat; the sentence above is his, recorded as a gist
+  rather than word-for-word in the orin 22 bulletin §1, and the two quotations
+  below are verbatim). The card is the hard drive, and every boot is stone
+  cold: no prefs, no special checks, no accumulated knowledge of the box —
+  even though it is the same box every time. Four consequences, in the order
+  they were broken. **(1) The kernel finds the disk that has THIS kernel on
+  it, by content**: it compares a window of its own running image against the
+  candidate files on every block source it enumerated, and roots the OS layout
+  on the disk that matches. Nothing else identifies the disk. **(2) No board,
+  bus, slot, card serial, card geometry, knob or BOOT METHOD appears in that
+  decision.** The boot method is a presumption like any other — a design in
+  which the loader hands the kernel the volume it was loaded from works under
+  UEFI and not under Pi firmware, which lets the machine decide what the
+  kernel is allowed to know. Peter, to the pi seat the same day: *"WTF does it
+  matter what method I choose to boot? You are assuming too much."* **(3)
+  Every disk driver the board has is in the default image.** A driver behind a
+  knob is the same presumption one layer up — that the operator knows which
+  disk they used — and it is not academic: with `sdmmc` opt-in, the
+  `BlockHandle::TegraSd` variant exists only under that feature, so a plain
+  image could not see the slot at all. Default-on with a named opt-out, never
+  opt-in. **(4) Nothing found is a witnessed refusal, never a guess**: no
+  fallback to a table of volumes the machine may not have, and the wire
+  carries the refusal with its reason. **Incident**: orin 19–21 built the
+  opposite and none of it flew — root bound by name to one SoC's SD slot
+  (`sdmmc_root_bind`, `locate_on(TegraSd)`, `fat::mount_source(TegraSd)`,
+  baton orin-22 D1); `boot_medium_verdict`, a guard asking "is the slot card
+  the card I booted from?", a question only a board with exactly this slot can
+  be asked (D2); this bench's card serials as kernel `const`s with
+  compile-time assertions (`RENDER9_LOADER_SERIAL`, `RENDER9_CARD_ESP_VOL_ID`,
+  `RENDER10_STAGED_ESP_VOL_ID`, D3); `/boot` and `/apps` bound to
+  `FatBackend::new_tegra_sd` (D4); and knobs and check legs named for the
+  board (`UNAOS_SDMMCROOT`, `arm-tegra-sdmmcroot`, D5). Two more of the same
+  shape were caught mid-round rather than in the tree: the loader-serial
+  hand-off of (2), and the opt-in driver of (3). Peter, verbatim, on why it
+  matters: *"We're making an OS for computers. The Orin is one specific
+  computer we are doing early development on, and you are hard-coding it in
+  while we are removing hard-coding."*
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **Never trash code, never offer to discard work** (2026-07-16; R20). Stopped or superseded work is
   archived and catalogued in `wip/`; finish a questioned job on the gate you have and name the leg
   that did not run.
@@ -267,6 +306,34 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   checkout/restore/stash/clean` any file; foreign red files are report-not-touch; no title
   instruction; no unscoped `pkill` (a pattern naming `cargo` kills the issuing shell; stop your own
   gate by `/proc/<pid>/cwd`); report by final message only, with any STOP question in it.
+- **The brief is the only channel into a running executor** (orin 22,
+  2026-09-08). There is no message path into an executor once it is running,
+  so a brief that turns out to be wrong cannot be amended — it can only be
+  replaced, and everything the executor has done to that point is spend with
+  no product. It cost three restarts of one arc inside a single hour:
+  BOOTROOT v1 killed at ~4 minutes when a peer's lane grant arrived carrying
+  conditions; v2 stopped when the mechanism itself changed (a ruling that the
+  boot method may not be load-bearing, plus DISPOSE finding the brief's
+  central call site dead on the board — the terminus rule above); v3 stopped
+  in setup when a peer's blocker landed (the driver was opt-in, so the plain
+  image could not see the disk). Every one of those facts existed and was
+  reachable BEFORE the spawn, and not one of them was found by the executor.
+  Three rules follow. **(1) Close the peer round first.** Before spawning any
+  executor that touches a shared file or carries a design decision, the grants
+  AND the facts those peers hold are settled; a grant with conditions is not
+  closed until its conditions are in the brief. **(2) Batch the peer asks into
+  the same turn as the read-first, and spawn in the next.** This does not
+  suspend the Throughput floor and is not a licence to stand by — the arcs
+  whose briefs depend on nothing pending spawn in the first turn as always;
+  only the design-bearing one waits, and it waits one turn, not a round.
+  **(3) Give the brief a written amendment channel.** The brief names a
+  `BRIEF-AMENDMENT.md` in the executor's own scratch directory
+  (`~/unaos-bench/scratch/<arc>/<exec>/`) and instructs the executor to
+  re-read it at every commit boundary. It does not buy a stop-free round — an
+  executor already past the boundary an amendment invalidates still has to be
+  replaced — but it turns the cheap corrections into edits and leaves the
+  restarts for the ones that are genuinely structural.
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **An executor's summary is a claim, not the seat's measurement.** Before relaying it, run the
   census yourself or name it as the executor's. Absence of signal is not "still running": inspect
   before reporting agent status.
@@ -286,6 +353,24 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   gate defects in a day, none found by reading). To verify a gate, make it fail by mutation; to
   verify a branch, make it print and quote the output; to verify a claim about a peer's tree, read
   at their sha (`git show <sha>:<path>`); run a peer's new gate against your tree before folding it.
+- **Wire beats comment** (rmbp 16, orin 22, 2026-09-08). A source comment that
+  asserts a fact about the MACHINE is a claim like any other, but unlike code
+  it is never re-executed: it ages silently and reads with the authority of
+  the file it sits in.
+  `unaos/crates/kernel/src/arch/aarch64/sdmmc_tegra.rs:36-37`, in the recon
+  driver's list of documented vendor-quirk assumptions, states that "the
+  bootloader read the card to boot". For the slot card on the render9 flight
+  that is false — the loader's volume serial is not that card's, and the boot
+  medium that flight was USB. rmbp 16 built a blocker premise on the comment,
+  was shown the render9 wire line, and withdrew the premise in one message,
+  inside an hour of the comment first misleading a seat. Two rules. **A
+  comment that asserts a machine fact carries the wire line or capture that
+  proved it, or says `unverified`** — and its repair is scheduled the turn the
+  comment is found wrong, by the arc that found it. **In a disagreement
+  between prose and a capture, the capture settles it**, and the seat holding
+  the capture quotes the line rather than summarising it; this one closed in a
+  single exchange because the line itself was sent.
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **The structural gates, their recorded go-red proofs and their legitimate update paths** live in
   `docs/dev/STRUCTURAL_GATES.md` (~1360 lines as of 2026-09-16; rmbp 11's GATESDOC). Every such gate carries a control
   probe so a zero result is distinguishable from a broken pattern. That file is on `hw-rmbp` only and
@@ -372,9 +457,51 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 - **Before shipping a check into a brief, feed it a case that must pass and one that must fail**; a
   guard that fires on every input is a constant; before building a warning, measure how often it will
   fire (22 names on every run trains the eye to skip the region).
+- **Require a PROPERTY, never a LIMITATION** (pi 9's nomination, adopted by
+  orin 22, 2026-09-08). A spec row exists to make a defect impossible to ship
+  green. A REQUIRE keyed on a line the system emits only when it FAILS inverts
+  that: the row makes the gate the defect's advocate. Green then certifies the
+  limitation, the floor number counts it as coverage, and the fix that removes
+  the limitation must argue its way past a green gate and a floor decrement in
+  order to delete its own tripwire. The instance was caught before it was
+  written. While the Pi was expected to come out with no root, pi 9's grant to
+  the orin 22 root arc asked for a `REQUIRE` on `[vfs] root -> NONE reason=…`
+  and moved the Pi floor 120 → 121; when the mechanism changed the same hour
+  and the Pi was expected to mount after all, the condition was withdrawn and
+  the floor stayed 120. The discriminator is one question — **what does this
+  row certify when it is GREEN?** If the answer is "the system is limited",
+  the row is upside down. The failure mode belongs to a FORBID, and the shape
+  that gets both is already in the tree: `pi4-regression.spec:2032` REQUIREs
+  `PASS` OR a stated skip, and at `:2052` the row
+  `FORBID aclsym: .*vfs\.aclsym skipped`
+  closes the skip arm (the eighth directive, `42eb2736`). REQUIRE
+  catches the family disappearing; FORBID catches it taking the wrong arm;
+  neither substitutes, and neither requires the defect.
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **An absence is evidence only if the producing path ran** (pi 4 2026-08-22); an instrument's
   silence counts only if it can execute in the state it reports on; a flat series is compared to the
   absolute, not to itself; an inherited success has its capture re-read before it is built on.
+- **The early-stop terminus kills everything below it** (orin 22's DISPOSE
+  survey, 2026-09-08; the same shape as pi 8's bit-3 witness the day before).
+  On a `tegra` image `kernel_main` diverges into `tegra_early_stop(boot_info)`
+  at `unaos/crates/kernel/src/main.rs:190`, and that function returns `!`
+  (declared at `:2029`), so EVERY un-gated line below the call is dead on that
+  board while compiling clean, type-checking on both arches, and passing every
+  QEMU leg — `tegra` is off in every QEMU build, so no gate this fleet runs by
+  default can observe the difference. The measured instance: `main.rs:263`'s
+  boot-volume-serial publish, taken to be the kernel's one source for the
+  loader's volume, sits below the divergence AND is `x86_64`-gated, so on the
+  Orin it ran zero times; a second publish had been folded into
+  `tegra_early_stop` in `72e2ecff` for exactly this reason, and a brief
+  written from the first site alone was wrong. The same terminus is why the
+  Orin runs no U-series battery at all (~47 legs, baton orin-22 C8) — a port,
+  not a knob. Note that the call site is ALREADY commented as unreachable
+  (`main.rs:185-188`) and was missed anyway, so the comment is not the
+  control. **A change to the shared entry path names the terminus above it and
+  proves reachability on the DIVERGING board by `strings` on the artifact that
+  will be flashed AND by a line on that board's wire — never by a `cfg` that
+  reads correctly, and never by a green `check`.**
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **Verify before claiming owed; no deferred verification.** Never write an owed or pending line
   without running the falsifying check that turn; owed verification runs the moment it is noticed;
   inherited claims are hypotheses; facts have a shelf life. The null hypothesis is our code: code and
