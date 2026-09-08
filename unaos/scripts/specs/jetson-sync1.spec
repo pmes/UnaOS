@@ -498,7 +498,13 @@ FORBID unafs has no volume here
 # before, so no pattern here spans a literal dash — the span row keys on the contiguous ASCII
 # run `part=[...]` onward, and the two verdict FORBIDs bridge the dash with `.*`.
 PENDING PART: mbr handle=tegra-sd slot=2 type=0x7f boot=0x[0-9a-f]{2} start=262144 count=1048576 end=1310720 ACCEPT
-PENDING part=\[262144\.\.1310720\) span_base=262144 span_blocks=131072 fits=yes magic=ok
+# ORINFOLD (2026-09-08, orin 21): fitsland's `span_fit_report` now prints the superblock's OWN
+# block_count as `sb_blocks=`, BETWEEN `span_blocks=` and `fits=`. That makes the paragraph above's
+# "never prints the volume's own block_count" false on the folded tree — the volume is pinned
+# DIRECTLY here now, not by proxy — and it would have left this row unable to match anything the
+# fold emits (the `sb_blocks=` field interposed). Both counts pin at UNAFS_CAP_BLOCKS = 131,072,
+# the same equality `esp-jetson-img` asserts host-side (volume fills its partition exactly).
+PENDING part=\[262144\.\.1310720\) span_base=262144 span_blocks=131072 sb_blocks=131072 fits=yes magic=ok
 # THE POSTURE, pinned as it actually is TODAY: read-only. `drivers/block.rs`'s
 # `write_block_tegra_sd` refuses in EVERY cfg by design — the card's only writer is the armed
 # `sdmmc_arm` -> `install_target` ladder — and `main.rs` mounts the volume, witnesses it and
@@ -509,12 +515,18 @@ PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
 # THE REGRESSION HALF. Each of these is a POSITIVE claim about the medium, and each fires only
 # when the witness line is present at all — so none of them can red an unarmed boot, exactly as
 # the two `recon`/`REFUSED to publish` rows above cannot.
-#   * `span_blocks=2048 fits=` is the STALE 8 MiB PARTITION (the one holding the 4 MiB Pi K3
+#   * `span_blocks=2048 sb_blocks=` is the STALE 8 MiB PARTITION (the one holding the 4 MiB Pi K3
 #     fixture). After the regrow, seeing it again means the card was reverted (or a second card
-#     was booted) — and note this row keys on the only number the wire actually carries, since
-#     the volume's own block_count is never printed. The first capture this
-#     row reds is one taken before the card is rewritten, and that is the CORRECT verdict, not
-#     a false alarm: the whole defect being closed is that nothing noticed the stale geometry.
+#     was booted). The first capture this row reds is one taken before the card is rewritten, and
+#     that is the CORRECT verdict, not a false alarm: the whole defect being closed is that
+#     nothing noticed the stale geometry.
+#     ORINFOLD (2026-09-08, orin 21): this row was born as `span_blocks=2048 fits=` and was DEAD
+#     on arrival — fitsland's `span_fit_report` (fs/unafs.rs) interposes `sb_blocks=` between the
+#     two tokens on every line the folded tree emits, so the contiguous literal could match nothing
+#     and the stale geometry passed SILENTLY (proven by execution: the fold's own wire carrying
+#     `span_blocks=2048 sb_blocks=1024` scored 0 hits against the old row and 1 against this one).
+#     Keyed on the two tokens that are adjacent in BOTH of `span_fit_report`'s arms; no `.*`, so
+#     the wire's mangled dashes cannot widen it.
 #   * `fits=NO` and `magic=MISSING` are `partition_witness`'s own two failure verdicts
 #     (fs/unafs.rs, the `if fits` / `if magic_ok` ternaries). BOTH ARE REACHABLE, and the reason
 #     matters because the obvious reading of `fits` makes it look tautological: `span` comes from
@@ -528,7 +540,7 @@ PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
 #   * `mount on TegraSd FAILED` is main.rs's own catch-all arm, whose comment already calls it
 #     "a real defect worth a capture". `NoVolume` is deliberately NOT forbidden beside it: that
 #     one is the honest pre-install answer and a seat may legitimately boot such a card.
-FORBID span_blocks=2048 fits=
+FORBID span_blocks=2048 sb_blocks=
 FORBID unafs span check .*fits=NO
 FORBID unafs span check .*magic=MISSING
 FORBID TEGRA-UNAFS: mount on TegraSd FAILED
