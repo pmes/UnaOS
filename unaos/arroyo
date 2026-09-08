@@ -4427,6 +4427,9 @@ build_cfg_legs() {
 # and stated in the banner along with the disk cost. UNSET is the DEFAULT and is the OLD PATH: one
 # worker, no --target-dir, the default `target/` — because the table above says the win is COLD only,
 # and a P=6 default on a shared box spends 2.56x the CPU of every other seat's build to save ~2 s warm.
+# Even the default mode creates `target/check-slots/.results/` (the per-leg capture the replay and the
+# vanished-leg count read from); it populates NO slot dir, so the ~400 MB/slot cost is opt-in only —
+# the .results dir is a few KB of logs, not a build tree (rmbp 16's note on 1dcd5644).
 #
 # NOT MEASURED, so not claimed: why orin 21's tree showed a 155 s warm serial matrix at all when
 # this one shows 3.1 s. Their REPORT §6 addendum already recorded the mechanism as unestablished;
