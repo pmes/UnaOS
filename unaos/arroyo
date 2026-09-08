@@ -2531,6 +2531,178 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
     ' "$logf"
 }
 
+# ── QEMU-FAST: a QEMU verb ends when the RUN ends, not when the clock does ──────────────────────
+# ONE mechanism, in the shared runner, for every QEMU verb this script has. No verb is named as
+# special and none is exempt: `test`, `test-arm`, `install-pi` and `kernel8-test` all sat out the
+# SAME blind wall — `sleep "$secs"` here, and `qmp_shoot.py --wait` -> an unconditional `time.sleep`
+# over in test_kernel8 — with no predicate evaluated on the path, so the wall was paid in full
+# whether the run finished in eleven seconds or never started at all.
+#
+# MEASURED, not assumed (orin 21, ~/unaos-bench/scratch/orin21/buildperf/REPORT.md §2 — three
+# `kernel8-test 300` runs on this box): the run was OVER at +11.0 / +45.3 / +13.7 s and QEMU then
+# idled for 288 / 254 / 285 s, i.e. 85-96% of the QEMU span proving nothing. The ~4x spread across
+# those three is HOST LOAD, which is what the grace window is sized against.
+#
+# THE PREDICATE IS DERIVED, NEVER INVENTED. Each verb's completion source is whatever that verb's
+# OWN CHECKER already asserts, and nothing else:
+#   kernel8-test   scripts/specs/pi4-regression.spec — the spec `test_kernel8` replays through
+#                  mbench, which declares two COMPLETE end-of-run markers.
+#   test-arm       NONE. Its checker is `scan_serial_faults` above: negative-only, no notion of the
+#   test           run having finished, and no spec anywhere replays target/serial-arm.log or is
+#   install-pi     what `./arroyo test` asserts. They therefore KEEP THE FULL WALL and say so.
+#                  (docs/dev/LEDGER.md row S33 carries this as owed; S8 already names `test`/
+#                  `test-arm` as negative-only GATE-BLINDNESS. Declaring a completion source for an
+#                  x86 spec is rmbp's call, not this lane's — an invented marker would be a gate
+#                  asserting a line nobody chose.)
+# `scripts/qemu_await.py` drives mbench's OWN shipped predicate — `Matcher.complete()`, the one
+# `run_follow()` stops on ("Follow-mode EARLY EXIT") — which fires only once EVERY REQUIRE and
+# COUNT in the spec is satisfied AND an end-of-run marker has been seen. So a fast capture can
+# never be short of a required witness, and a run carrying a real regression never shortens at all
+# (the predicate simply never fires, the cap is reached, and the full window is preserved for the
+# replay). `mbench.py --replay` remains the SINGLE verdict authority; this path decides only WHEN
+# to stop reading.
+#
+# THE GRACE WINDOW, and its default. `complete()` says every witness we assert has landed; it says
+# nothing about a fault that has not happened yet. After completion QEMU is kept alive and read for
+# UNAOS_QEMU_GRACE seconds with every FORBID still live — mbench's three phase-unbound builtins
+# (`PANIC`, `-> FAIL`, `FAIL ::`) and every FORBID the verb's spec declares — so anything they match
+# in that window lands in the capture exactly as it would have on the full wall. THE DEFAULT IS 20 s
+# AND IT COMES FROM THE MARKER SPREAD ABOVE: completion at +11.0 quiet vs +45.3 at load 21 is a ~4x
+# load-driven swing, so a grace sized on a quiet box is not a grace under nine executors; 20 s is
+# that spread with room, and it is a fixed window AFTER completion, so the load that moves the
+# marker moves the exit with it.
+#
+# WHAT FAST MODE COSTS, stated rather than buried. A grace is not a soak. `[pstrip] rollup` fires
+# once per 10 s for the whole window, so a 300 s wall is a de-facto 28-window soak of that one
+# instrument and a graced fast exit keeps 2-3 of them; and any MONOTONIC ACCUMULATOR read out of a
+# fast capture (`[u7stk] hw=` high-water marks and their kind) is a FLOOR, not a final value.
+# UNAOS_QEMU_FULL=1 restores the full wall for exactly this reason and IS WHAT THE ARC'S DONE GATE
+# RUNS. Hard cap is the verb's own `secs` in BOTH modes.
+QEMU_GRACE_DEFAULT=20
+
+# ── THE RUN STAMP GOES IN A SIDECAR, AND THE SERIAL LOG STAYS PURE GUEST BYTES ──────────────────
+# An earlier shape of this appended a `:: qemu-run … ::` TRAILER to the capture itself, and it was
+# wrong for a reason that outranks how carefully the trailer was worded: the harness would be
+# writing into the very evidence mbench and `scan_serial_faults` then judge. That needs a whole gate
+# (a spec-vocabulary check across every directive of every spec) to stay safe, and a gate is not a
+# fix — it is a standing tax on every future spec author, who has no reason to think about a line
+# the shell appends. The tree's own principle at `test_kernel8` already said the answer: "the
+# guest's bytes still land in exactly $logf and mbench still replays exactly that file."
+#
+# So the run metadata is written BESIDE the log, at `<logfile>.run`, and no harness text can reach a
+# directive by construction. Capture conventions already carry manifests, so the sidecar travels
+# with the capture the same way.
+#
+# ORDERING IS THE SHARP EDGE, and it is why this is one function called at ONE point. The sidecar
+# carries the LOG'S IDENTITY (its size and sha256) so that a sidecar sitting beside a log it does
+# not describe is reported STALE rather than believed — confidently wrong beats obviously absent.
+# That identity is therefore computed over the log AS THE VERDICT WILL READ IT: AFTER QEMU has been
+# killed AND `wait`ed (no further bytes can land), immediately before the replay. The mode, grace,
+# completion and wall values are decided EARLIER and carried in shell variables; only the FILE is
+# written last. A sidecar written at the exit decision would mismatch on every single run — late
+# flush, teardown — and turn `stale` into a systematic false result, and a check that fires every
+# time gets deleted within the week.
+qemu_run_sidecar() { # $1 = log file  $2..= key=value pairs, already decided
+    local logf="$1"; shift
+    [ -f "$logf" ] || return 0
+    {
+        printf '%s\n' "$@"
+        printf 'log_bytes=%s\n' "$(wc -c < "$logf" | tr -d ' ')"
+        printf 'log_sha256=%s\n' "$(sha256sum "$logf" | cut -d' ' -f1)"
+    } > "${logf}.run"
+}
+
+# Wait out a QEMU run and end it. FAST by default (completion + grace); UNAOS_QEMU_FULL=1 keeps the
+# whole wall. Hard cap is `secs` in both modes.
+#   $1 qpid   $2 logfile   $3 secs (hard cap)   $4 completion source (spec path, or "" for none)
+#   $5 label  $6.. optional command run while QEMU is STILL ALIVE, just before the kill
+#             (kernel8-test's QMP screendump; `|| true`-guarded, never fails the run)
+qemu_wait_or_complete() {
+    local qpid="$1" logf="$2" secs="$3" src="$4" label="${5:-qemu-run}"
+    shift 5
+    local grace="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}"
+    local t0 wall mode awaited="" arc=0 status="" cat_="-" fh="0"
+    t0=$(date +%s.%N)
+    if [ "${UNAOS_QEMU_FULL:-0}" = "1" ]; then
+        mode=full
+        echo -e "${COLOR_YELLOW}⚡ ${label}: UNAOS_QEMU_FULL=1 — the full ${secs}s wall (the DONE-gate form).${COLOR_RESET}"
+        sleep "$secs"
+    elif [ -z "$src" ] || [ ! -f "$src" ]; then
+        mode=full
+        echo -e "${COLOR_YELLOW}⚡ ${label}: no completion signal declared for this verb — the full ${secs}s wall stands.${COLOR_RESET}"
+        sleep "$secs"
+    else
+        mode=fast
+        # `|| arc=$?` rather than a bare call: this script runs under `set -e`, and rc 3 (cap
+        # reached without completion) is an ORDINARY outcome here, not an error.
+        awaited=$(python3 "${WORKSPACE_DIR}/scripts/qemu_await.py" --log "$logf" --spec "$src" \
+                      --cap "$secs" --grace "$grace" --label "$label") || arc=$?
+        status=$(printf '%s\n' "$awaited" | awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="status")print a[2]}}')
+        cat_=$(printf '%s\n' "$awaited" | awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="complete_at")print a[2]}}')
+        fh=$(printf '%s\n' "$awaited" | awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="forbid_hits")print a[2]}}')
+        # EVERY NON-`complete` OUTCOME PAYS THE REST OF THE WALL. This is the branch a unit run
+        # caught getting it wrong (helper-unit H5, 2026-09-08): `nosignal` came back in 0.0 s, the
+        # code set `mode=full` and fell straight through to the kill, and a 3 s gate ran for 0.0 s
+        # while its own stdout said "FULL wall 0.0s". The same shape as the broken-waiter case
+        # below, one branch over — so the wall payment is written ONCE, after the case, keyed on
+        # `mode`, instead of once per arm where an arm can forget it.
+        case "$status" in
+          complete) ;;                     # the fast exit was earned
+          cap)      mode=fastcap ;;        # ran to the verb's own wall; identical to before
+          nosignal)
+            # The spec has no COMPLETE marker (it lost one, or the caller named a spec that never
+            # had one). An honest answer, not a failure — but it is NOT permission to stop early.
+            mode=full
+            cat_="-"
+            echo -e "${COLOR_YELLOW}⚡ ${label}: the named spec declares no COMPLETE marker — nothing can say when this run is over, so the full ${secs}s wall stands.${COLOR_RESET}"
+            ;;
+          *)
+            # THE ONE OUTCOME THAT MUST NOT BE SILENT. If the waiter died (a crash, a bad
+            # interpreter, a moved import) `$status` is empty and the naive code would fall
+            # straight through to the kill — turning a 300 s gate into a 0 s one and reporting
+            # whatever fragment of a boot happened to be on disk. Say so loudly, so a broken
+            # helper degrades to TODAY'S behaviour rather than to a false verdict.
+            echo -e "${COLOR_RED}✖ ${label}: the completion waiter produced no verdict line (rc ${arc}) — falling back to the full wall. The fast path is BROKEN, not merely unlucky; fix scripts/qemu_await.py.${COLOR_RESET}"
+            mode=full
+            cat_="-"
+            ;;
+        esac
+        if [ "$mode" = full ]; then
+            local spent
+            spent=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.0f", b-a}')
+            if [ "$spent" -lt "$secs" ]; then sleep "$((secs - spent))"; fi
+        fi
+    fi
+    # The pre-kill hook runs with QEMU still alive (screendump); never allowed to fail the run.
+    if [ "$#" -gt 0 ]; then "$@" || true; fi
+    # `if`, not `[ … ] && …`: under `set -e` a bare `test && cmd` whose test FAILS is a failed
+    # command at statement level and aborts the script. (Same trap as the k8_script guard below.)
+    if [ -n "$qpid" ]; then
+        kill "$qpid" 2>/dev/null || true
+        wait "$qpid" 2>/dev/null || true
+    fi
+    wall=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')
+    # AFTER the kill AND the wait — see the ORDERING note above. `fast` and `full` are the only two
+    # modes a reader is offered; `fastcap` is recorded as `full` because that is what it PAID, with
+    # the distinction kept in `note=` for a human.
+    case "$mode" in
+      fast)    qemu_run_sidecar "$logf" "mode=fast" "completion_at=${cat_}" "grace=${grace}" \
+                   "wall=${wall}" "cap=${secs}" "spec=${src}" "sha=${UNAOS_GIT_SHA:-unstamped}" \
+                   "label=${label}" "forbid_hits_in_grace=${fh:-0}" ;;
+      fastcap) qemu_run_sidecar "$logf" "mode=full" "completion_at=-" "grace=${grace}" \
+                   "wall=${wall}" "cap=${secs}" "spec=${src}" "sha=${UNAOS_GIT_SHA:-unstamped}" \
+                   "label=${label}" "note=fast-requested-no-completion-inside-cap" ;;
+      *)       qemu_run_sidecar "$logf" "mode=full" "completion_at=-" "grace=${grace}" \
+                   "wall=${wall}" "cap=${secs}" "spec=${src:--}" "sha=${UNAOS_GIT_SHA:-unstamped}" \
+                   "label=${label}" ;;
+    esac
+    case "$mode" in
+      fast)    echo -e "${COLOR_GREEN}⚡ ${label}: FAST exit — completion at +${cat_}s + ${grace}s grace; wall ${wall}s of a ${secs}s cap (saved $(awk -v s="$secs" -v w="$wall" 'BEGIN{printf "%.0f", s-w}')s). UNAOS_QEMU_FULL=1 for the whole wall.${COLOR_RESET}" ;;
+      fastcap) echo -e "${COLOR_YELLOW}⚡ ${label}: no completion inside the ${secs}s cap — full wall paid (${wall}s), saved 0s.${COLOR_RESET}" ;;
+      *)       echo -e "${COLOR_YELLOW}⚡ ${label}: FULL wall ${wall}s of a ${secs}s cap, saved 0s.${COLOR_RESET}" ;;
+    esac
+}
+
 # Headless aarch64 run: serial -> target/serial-arm.log, self-terminates after N secs.
 test_aarch64() {
     local secs="${1:-20}"
@@ -2552,9 +2724,12 @@ test_aarch64() {
         -no-reboot -no-shutdown \
         ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!
-    sleep "$secs"
-    kill "$qpid" 2>/dev/null || true
-    wait "$qpid" 2>/dev/null || true
+    # QEMU-FAST: the shared runner ends this run. `test-arm`'s checker is `scan_serial_faults` —
+    # negative-only, with no notion of the run having finished — and no spec replays
+    # target/serial-arm.log, so the completion source is EMPTY and this verb keeps the full wall.
+    # It is wired here anyway, and NOT exempted, so the day an aarch64-virt spec declares a
+    # COMPLETE marker this leg gets the fast exit by naming that spec and nothing else.
+    qemu_wait_or_complete "$qpid" "$logf" "$secs" "" "test-arm"
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${logf}) ════════════${COLOR_RESET}"
@@ -2610,9 +2785,25 @@ test_x86_64() {
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
     rm -f "$SERIAL_LOG"
     cd "$WORKSPACE_DIR/builder"
+    local xt0 xwall
+    xt0=$(date +%s.%N)
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
+    # QEMU-FAST: `test` is NOT exempt — it has no COMPLETION SIGNAL, which is a different thing.
+    # Its checker is `scan_serial_faults` below: negative-only, with no notion of the run having
+    # finished, and nothing in scripts/specs/ is what this verb asserts (x86-witness.spec DOES carry
+    # two structural COMPLETE markers, but it is scoped to a paygo/witness/logts-armed METAL
+    # capture, so adopting it here would be asserting a spec this verb does not run — and x86 specs
+    # are rmbp's lane). So the full wall stands, and the capture's SIDECAR says so rather than
+    # leaving a reader to guess. The wall itself lives in builder/src/main.rs's `thread::sleep`
+    # (the builder owns this QEMU, not this script), so when rmbp declares a completion source the
+    # wait has to be plumbed through there — recorded as owed in LEDGER S33, not silently skipped.
+    xwall=$(awk -v a="$xt0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')
+    echo -e "${COLOR_YELLOW}⚡ test: no completion signal declared for this verb — full wall ${xwall}s, saved 0s.${COLOR_RESET}"
+    qemu_run_sidecar "$SERIAL_LOG" "mode=full" "completion_at=-" \
+        "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" "spec=-" \
+        "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test"
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
@@ -6888,9 +7079,25 @@ test_kernel8() {
         if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; fi
         return 4
     fi
-    python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
-    kill "$qpid" 2>/dev/null || true
-    wait "$qpid" 2>/dev/null || true
+    # QEMU-FAST: the wait, the screendump and the kill all go through the shared runner now. What
+    # used to be here was `qmp_shoot.py --wait $((secs-1))` — whose `--wait` is an unconditional
+    # `time.sleep` (scripts/qmp_shoot.py) — with `|| sleep "$secs"` behind it, i.e. a blind wall
+    # either way and a full EXTRA wall if the QMP connect ever failed. The completion source is the
+    # spec THIS FUNCTION ALREADY REPLAYS forty lines below, named once and used for both:
+    # pi4-regression.spec's two COMPLETE markers, via mbench's own `Matcher.complete()`. The shot
+    # is taken by the pre-kill hook, so it still happens with QEMU alive, now at the end of the
+    # grace instead of at `secs-1`; a shot failure no longer costs a second wall.
+    # TYPED MODE IS NOT FAST-ELIGIBLE, and the reason is a real hazard rather than caution: the
+    # completion source is the BASE spec, which knows nothing about the typed battery, while
+    # `k8_type.py` is still typing on its own `--budget "$secs"` schedule. A fast exit computed
+    # from the base spec would kill QEMU out from under the typist and red pi4-barename.spec on a
+    # healthy boot. Typed runs therefore declare no completion source and keep the full wall until
+    # a source that accounts for the inject script exists (pi's lane — pi4-barename.spec declares
+    # no COMPLETE line today).
+    local k8_spec_main="${WORKSPACE_DIR}/scripts/specs/pi4-regression.spec"
+    if [ -n "$k8_script" ]; then k8_spec_main=""; fi
+    qemu_wait_or_complete "$qpid" "$logf" "$secs" "$k8_spec_main" "kernel8-test" \
+        python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait 0 --out "$png"
     if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
 
@@ -6998,9 +7205,13 @@ install_pi() {
         -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
         ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!
-    sleep "$secs"
-    kill "$qpid" 2>/dev/null || true
-    wait "$qpid" 2>/dev/null || true
+    # QEMU-FAST: the FOURTH blind wall in this script, wired to the same shared runner so no verb is
+    # an exception. `install-pi`'s checker is the in-kernel `:: INSTALL: …` awk below plus the host
+    # re-read — there is no spec and therefore no completion source, so this takes the identical
+    # full-wall path `test-arm` takes (sleep the wall, kill, write the sidecar) and its behaviour is
+    # unchanged. Nothing is written into `$logf`, so this function's `/PIINSTALL|:: INSTALL:/` scan
+    # and its PASS regex see exactly the bytes they saw before.
+    qemu_wait_or_complete "$qpid" "$logf" "$secs" "" "install-pi"
 
     # ── In-kernel verdict ──
     echo -e "${COLOR_YELLOW}── INSTALL-PI serial verdict ──${COLOR_RESET}"

@@ -140,6 +140,54 @@ belongs here, on the day it is made.
   on `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson`, and a reader in review caught it,
   not an instrument.
 
+## Gates
+
+- **QEMU verbs exit at COMPLETION + GRACE, not at a wall; the DONE gate keeps
+  the wall** (Peter, 2026-09-08; orin 22). Every QEMU verb in `unaos/arroyo`
+  used to sit out a blind `sleep`, and no verb was special about it — measured
+  on this box, three `kernel8-test 300` runs were over at +11.0 / +45.3 / +13.7 s
+  and then idled 85–96% of the QEMU span (orin 21 buildperf §2). All of them now
+  run through `qemu_wait_or_complete`, which stops when the verb's OWN checker
+  says the run finished — mbench's shipped `Matcher.complete()` predicate over
+  the spec that verb already replays, never an invented marker — then holds
+  `UNAOS_QEMU_GRACE` (default 20 s, the measured load spread) with every FORBID
+  still live, and never exceeds the verb's `secs` in either mode. **A verb with
+  no declared completion source pays the full wall, and every non-completing
+  outcome pays it too** — `nosignal`, a cap reached, a broken waiter. A gate that
+  cannot say when a run finished must never shorten it; that branch shipping
+  wrong for one afternoon is what this clause is made of.
+  **`UNAOS_QEMU_FULL=1` restores the whole wall and is the form an arc's DONE
+  gate runs.**
+- **A fast capture is sound for pass/fail and is a FLOOR for anything monotonic**
+  (same ruling). Completion means every REQUIRE and COUNT has already landed, so
+  a fast run cannot be short of a witness and cannot shorten a failing run at all.
+  What it does drop is TIME: an accumulator's high-water value (`[u7stk] hw=` and
+  its kind) read from a fast capture is a lower bound, not a final value, and a
+  periodic instrument's soak shrinks with it (`[pstrip] rollup` fires once per
+  10 s — 28 windows on a 300 s wall, 2–3 after a graced exit). Measure
+  accumulators and soaks under `UNAOS_QEMU_FULL=1` only. **The pair that makes
+  this concrete: a fault emitted INSIDE the grace reds both modes; a fault
+  emitted BEYOND it reds only the full wall.** That second case is hidden by
+  design and is the whole price of fast mode.
+- **A harness never writes into its own evidence; it writes BESIDE it** (Peter's
+  amendment, 2026-09-08; orin 22). The run stamp naming a capture's mode does not
+  go into the serial log — that log is the thing mbench and `scan_serial_faults`
+  then judge, and a harness line in it could match a FORBID (reddening healthy
+  runs) or a REQUIRE/COMPLETE (satisfying a witness the guest never printed). The
+  first shape of this arc did append a trailer and proposed a gate to keep it
+  inert; the gate was the tell. `arroyo` writes `<logfile>.run` instead, the log
+  stays pure guest bytes, and no spec author ever has to think about it.
+- **A capture's mode is read THREE-VALUED: fast, full, or unknown** (same
+  amendment). `unknown` covers absent, unreadable, malformed **and stale**, it
+  must be sayable in a verdict line (`[mode unknown: …]`), and **every consumer
+  treats unknown as NOT-FULL** and refuses to certify a tail clean or read a final
+  accumulator off that capture. A reader that infers "not fast, therefore full"
+  has collapsed the third value in the unsafe direction. Staleness is detected,
+  not assumed away: the sidecar carries the log's byte length and sha256,
+  recorded **after QEMU exited and was `wait`ed, immediately before the replay** —
+  written at the exit decision instead, it would mismatch on every run (late
+  flush, teardown) and a check that fires every time gets deleted within the week.
+
 ## Bench and media
 
 - **Flash staging** (2026-07-15). No path under any `target/` is ever handed

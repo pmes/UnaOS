@@ -104,6 +104,7 @@ Typical bench:  ./arroyo mbench --follow ~/pi-serial.log \
 
 import argparse
 import contextlib
+import hashlib
 import io
 import os
 import re
@@ -370,6 +371,97 @@ def split_lines(buf):
 
 
 # ---------------------------------------------------------------------------
+# QEMU-FAST run sidecar — was this capture a FAST exit or a FULL wall?
+# ---------------------------------------------------------------------------
+#
+# `unaos/arroyo`'s `qemu_wait_or_complete` can end a QEMU run at its completion
+# predicate plus a grace window instead of at the clock, which makes a capture
+# SHORTER than the verb's nominal wall while still carrying every required witness.
+# That is sound for pass/fail and NOT sound for anything monotonic — a high-water
+# mark read out of a fast capture is a FLOOR — so a reader has to be able to tell
+# the two apart from the capture alone. arroyo writes `<logfile>.run` beside the log
+# (never INTO it: the log stays pure guest bytes, so no harness text can ever match a
+# directive).
+#
+# THE READ IS THREE-VALUED, and that is the whole point. "fast", "full", and
+# UNKNOWN — absent, unreadable, malformed, or STALE. Collapsing the third value into
+# either of the first two is the shape of the bug this guards against: a reader that
+# infers "not fast, therefore full" is confidently wrong in the unsafe direction, and
+# a reader that treats a stale sidecar as authoritative is worse than one with no
+# sidecar at all. So:
+#
+#   * every consumer treats `unknown` (and `stale`) as NOT-FULL and must refuse to
+#     certify a tail clean or read a final accumulator value off that capture; and
+#   * `stale` is DETECTED rather than assumed away. The sidecar carries the log's
+#     identity — its byte length and sha256 — recorded by arroyo AFTER QEMU exited and
+#     was `wait`ed, immediately before the replay. A sidecar whose identity does not
+#     match the log it sits beside describes some other run.
+
+RUN_SIDECAR_SUFFIX = ".run"
+
+
+def read_run_sidecar(log_path):
+    """Read `<log_path>.run`. Returns (mode, detail, fields).
+
+    `mode` is one of "fast", "full", "unknown" — never anything else, and never
+    guessed. `detail` is a short human phrase for the verdict line. `fields` is the
+    parsed key=value dict (empty when there is nothing to parse).
+    """
+    path = log_path + RUN_SIDECAR_SUFFIX
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    except OSError:
+        return "unknown", "no run sidecar", {}
+
+    fields = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        fields[k.strip()] = v.strip()
+
+    mode = fields.get("mode")
+    if mode not in ("fast", "full"):
+        return "unknown", "run sidecar is malformed (no usable mode=)", fields
+
+    # IDENTITY. Mandatory, not optional: a sidecar left behind by a previous run of the
+    # same verb sits at exactly the same path as the current one's.
+    want_bytes = fields.get("log_bytes")
+    want_sha = fields.get("log_sha256")
+    if not want_bytes or not want_sha:
+        return "unknown", "run sidecar carries no log identity", fields
+    try:
+        got_bytes = os.path.getsize(log_path)
+        h = hashlib.sha256()
+        with open(log_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        got_sha = h.hexdigest()
+    except OSError:
+        return "unknown", "run sidecar present but the log could not be identified", fields
+    if str(got_bytes) != want_bytes or got_sha != want_sha:
+        return ("unknown",
+                f"run sidecar is STALE — it describes a {want_bytes}-byte log, this one is "
+                f"{got_bytes} bytes", fields)
+
+    return mode, "", fields
+
+
+def run_mode_note(log_path):
+    """The one-line `[…]` suffix the verdict line carries. ONE implementation, so no
+    consumer can invent a second reading of the same file."""
+    mode, detail, f = read_run_sidecar(log_path)
+    if mode == "fast":
+        return (f"[fast: completion +{f.get('completion_at', '?')}s "
+                f"grace {f.get('grace', '?')}s wall {f.get('wall', '?')}s]")
+    if mode == "full":
+        return f"[full wall {f.get('wall', '?')}s]"
+    return f"[mode unknown: {detail}]"
+
+
+# ---------------------------------------------------------------------------
 # Verdict table — reads like the battery summary
 # ---------------------------------------------------------------------------
 
@@ -396,6 +488,11 @@ def verdict_table(matcher, spec_path, log_path, elapsed=None, out=None):
                f", {matcher.lineno} lines scanned")
     if pend:
         summary += f", pending {pmatched}/{len(pend)} matched"
+    # QEMU-FAST: say on the verdict line WHICH KIND OF CAPTURE this verdict is about.
+    # Three-valued (see read_run_sidecar): a reader who needs a final accumulator value
+    # or a certified-clean tail must see `full` here and nothing else — `unknown` is not
+    # a quiet synonym for it.
+    summary += " " + run_mode_note(log_path)
     if verdict == "PASS":
         print(f"  {GLYPH['ok']} MBENCH PASS — {summary}", file=out)
     elif verdict == "TRUNCATED":

@@ -11,6 +11,19 @@ several sessions can work in parallel without stepping on each other.
   `test` / `test-arm` (headless QEMU, serial → `target/serial*.log`),
   `x86` / `arm` (QEMU GUI), `esp-x86` / `esp-arm` (metal boot media),
   `kernel8` / `kernel8-run` / `kernel8-test` (Pi 4 bare-metal image / QEMU raspi4b).
+  **Every QEMU verb exits at COMPLETION + GRACE by default** — `qemu_wait_or_complete`
+  stops when the verb's own checker says the run finished (mbench's
+  `Matcher.complete()` over the spec that verb already replays), holds
+  `UNAOS_QEMU_GRACE` (default 20 s) with all FORBIDs live, and never exceeds the
+  verb's `secs`. A verb with no declared completion source pays the full wall, and
+  so does every non-completing outcome. **The arc's DONE gate runs
+  `UNAOS_QEMU_FULL=1`** (the whole wall). Each run's mode is stamped in a SIDECAR,
+  `<logfile>.run` — never in the log, which stays pure guest bytes — and mbench's
+  verdict line reads it three-valued (`[fast: …]` / `[full wall …]` /
+  `[mode unknown: …]`, where unknown covers absent, malformed and STALE and must
+  never be read as full). Fast captures are sound for pass/fail and are FLOORS for
+  any monotonic accumulator; measure those under `UNAOS_QEMU_FULL=1`. See
+  [`docs/dev/LAWS.md`](docs/dev/LAWS.md) §Gates.
   Env knobs: `UNAOS_WC` (**arms the x86 window compositor — any gate touching
   the video stack MUST carry `UNAOS_WC=1`, and the run MUST show `wc` in the
   `⚡ kernel features:` banner. It gates `video/desktop_uefi.rs` — the x86 panel path —
