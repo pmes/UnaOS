@@ -145,8 +145,14 @@ source lines, so line-neutral or tail-append only.
   interposing a token between the two the rule keyed on; a FORBID that stops matching is a false
   green and announces nothing. Four verified still-fireable here against `syscall.rs:7272` and
   `wm.rs:16342`/`:16350` (both arms); **`[wc-d] paygo` and `[wc-h] rollup` remain unverified.** The
-  gate: assert every FORBID matches its emitter's current format, and adopt pi 9's REKEY rule — a
-  rule keys on the token it is ABOUT, bounded, never on its neighbour.
+  gate: assert every FORBID matches its emitter's current format. **Census closed at 6/6 verified,
+  0 defective** — but the point is not the census: **`video/wcg.rs:3920-3925` already documents the
+  contract** (fields MAY be inserted between matched keys; nothing renamed, reordered, or moved past
+  the verdict), so these six are simply the x86 FORBIDs written stricter than the contract their
+  emitters honour, and an emitter can invalidate them at any time while breaking no stated rule.
+  Re-key with `\b` (or a whitespace-or-end lookahead) — **never a trailing space: `mbench.py:256` strips every spec line
+  while `Directive.__init__` compiles verbatim (`:157`), so a space bound silently vanishes and the
+  rule then false-hits a longer token.**
 - The `supstate` × `holocron` / `orintenant` / `orinladder` matrix gap.
 - Standing rule for all of them: **a check that cannot fire is not a check** — printing is not
   gating, a zero-hit result indicts the pattern, and each gate is proved by MUTATION at the sha it
