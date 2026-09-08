@@ -525,8 +525,13 @@ PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
 #     two tokens on every line the folded tree emits, so the contiguous literal could match nothing
 #     and the stale geometry passed SILENTLY (proven by execution: the fold's own wire carrying
 #     `span_blocks=2048 sb_blocks=1024` scored 0 hits against the old row and 1 against this one).
-#     Keyed on the two tokens that are adjacent in BOTH of `span_fit_report`'s arms; no `.*`, so
-#     the wire's mangled dashes cannot widen it.
+#     REKEY (2026-09-08, orin 21; pi 9's adjacency scan): the ORINFOLD row was keyed on a JUNCTION
+#     again (`span_blocks=2048 sb_blocks=`) — the same class of key that just died once. It is now
+#     ONE bounded field, `span_blocks=2048\b`, independent of every neighbour: a field inserted
+#     after it still fires, and `\b` keeps `span_blocks=20480` from matching. `\b` and NOT a
+#     trailing space because `mbench.py::parse_spec` runs `line.strip()` on every row — a trailing
+#     space is silently dropped and the row would then match `20480` (proven by execution).
+#     `Directive.__init__` hands the row verbatim to `re.compile`, so `\b` is honoured. No `.*`.
 #   * `fits=NO` and `magic=MISSING` are `partition_witness`'s own two failure verdicts
 #     (fs/unafs.rs, the `if fits` / `if magic_ok` ternaries). BOTH ARE REACHABLE, and the reason
 #     matters because the obvious reading of `fits` makes it look tautological: `span` comes from
@@ -540,7 +545,7 @@ PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
 #   * `mount on TegraSd FAILED` is main.rs's own catch-all arm, whose comment already calls it
 #     "a real defect worth a capture". `NoVolume` is deliberately NOT forbidden beside it: that
 #     one is the honest pre-install answer and a seat may legitimately boot such a card.
-FORBID span_blocks=2048 sb_blocks=
+FORBID span_blocks=2048\b
 FORBID unafs span check .*fits=NO
 FORBID unafs span check .*magic=MISSING
 FORBID TEGRA-UNAFS: mount on TegraSd FAILED
@@ -2269,5 +2274,10 @@ FORBID X200 FLAG
 # carries NO `Exception reason=` line at all. Conflating the two has already cost this lane
 # a wrong claim to a peer seat, so this keys on the syndrome and never on `RAS` or on an
 # `ADDR` value. See arch_arm64.md §ORIN-RAS-ADDR for why an ADDR must never be the key.
+# REKEY (2026-09-08, orin 21): pi 9's adjacency scan flags this row too (two `key=` fields on a
+# bare space). Left as one literal ON PURPOSE: the emitter is the board's EL3 firmware (NVIDIA
+# TF-A's external-abort handler, `ERROR:   Exception reason=%u syndrome=0x%llx`), not anything
+# this repo builds — no arc here can interpose a field. Nothing under `unaos/` emits the string
+# (the only hits are `smp_virt.rs` comments quoting it).
 FORBID Exception reason=1 syndrome=0x82000010
 FORBID \[wm\] winid-register REFUSED
