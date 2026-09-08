@@ -145,6 +145,20 @@ machine."* orin 22's BOOTROOT makes every UEFI arch find its root by walking to 
 - Files: `unaos/arroyo` (the x86 QEMU drive lines), `builder/src/main.rs`, and whichever x86 specs
   assert the current two-device shape. Prove it by mutation at the sha it will run on.
 
+## Q3c — THE 81x ON `check` (B92). Shared tooling, highest value-per-line in the queue.
+
+`./arroyo check`'s 56-leg cfg matrix: **557.2 s cold, 155.0 s warm-serial, 1.9 s at P=6 with per-slot
+target dirs** (orin 21's measurement, cause isolated by forcing all legs onto one slot — same source,
+no edit, 8.0–11.9 s per leg). A feature set is part of cargo's fingerprint, so legs sharing a target
+dir invalidate each other in turn.
+
+**`arroyo` already documents this remedy in three other places** (`:2062`, `:5045`, `:2452` — the
+`target/{x86,x86-pinlo,…}` split) and does not apply it to `KERNEL_CFG_MATRIX` at `:2683`.
+
+**Ordered above the gate work because `check` both arches is in the DONE gate of every arc on every
+track — 153 s per check per seat per commit is the fleet's iteration speed, not a build nicety.**
+Coordinate with orin before cutting: their BUILDPERF arc found it and may take it.
+
 ## Q4 — THE `arroyo` SWEEP THIS LANE OWES (B55). Code-only, one line-neutral commit.
 
 Re-verified at `1b24cb8a`: all eleven still restate the gate as `any(baremetal, tegra_el0)` in prose
