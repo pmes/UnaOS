@@ -38,7 +38,25 @@ belongs here, on the day it is made.
   (1) the gate run with every relevant knob armed, and (2) proof the code is
   in the builder-path artifact (`strings kernel.elf | grep <probe-tag>`).
   The builder has its own env→feature map that can silently drop features;
-  `./arroyo check` alone proves nothing about optional features.
+  `./arroyo check` alone proves nothing about optional features. rmbp 15's
+  ruling on the Orin card path (orin 21 Correction-03, 2026-09-08) sharpens
+  the split into three parts: a spec's `#require=` asserts only what a build
+  log can honestly assert — the features the image needs (`tegra`, `sdmmc`) —
+  and is not evidence of arming; arming is proven on the ARTIFACT, by
+  `strings` for the witnesses the armed path emits; and every scored capture
+  carries a REQUIRED arming field, established by `strings` on the image that
+  was flashed, never by which knobs were typed. A capture without that field
+  FAILS TO SCORE rather than scoring wrong, because an unarmed image's absent
+  witnesses are unexercised while an armed image's absent witnesses are a
+  defect, and the scorer must know which. rmbp 16's amendment (Correction-04,
+  same day) fixes what the field IS: the bind's own four witnesses present or
+  absent — `boot-medium-mismatch`, `SAME-MEDIUM`, `bootid DISARMED`,
+  `covers the native leg`, all in `sdmmc_tegra.rs` — never a feature name one
+  layer up, because pre-C15 `UNAOS_SDMMC=1` arms recon but not
+  `sdmmc_root_bind` (that is `sdmmcroot`-gated) while post-C15 the same knob
+  arms both, so "sdmmc armed" is ambiguous on one side and the witnesses are
+  correct on both without knowing the side. Do not invent a narrower feature
+  to give `#require` teeth; that re-creates the knob C15 deletes.
 - **Null hypothesis is our code** (2026-07-22). Our code / boot-chain /
   sequence theories outrank hardware-, firmware-, and environment-blame
   theories by default. Bench cross-checks are proposed neutrally as
@@ -89,7 +107,15 @@ belongs here, on the day it is made.
   Two seats greped the same path for the same sentence and got 1 and 0 — both
   correct, because the text rode 36 unlanded commits. Absence proven in your
   worktree is absence *there*; before calling a citation wrong, establish which
-  tree it was written against.
+  tree it was written against. The same bound holds for a count — **a
+  measurement is scoped to its base exactly as a claim is scoped to its
+  check** (orin 21 Correction-01, 2026-09-07; rmbp 15's phrasing, 2026-09-08).
+  The orin 21 baton's "thirteen `sdmmcroot` cfgs" was measured at `98213b7f`
+  and handed to executors based at its descendant `aec2c604`, where
+  BOOTIDLIVE had made it 22 live predicates (23 raw): true where measured,
+  false where used, and the brief said to force the number. Report a count
+  with the sha it was taken at, and derive it again at the base you actually
+  build from.
 - **"Sourced from code" is not "verified end-to-end" — reading a function is a
   citation too** (pi 8's formulation, orin 19's error, rmbp 15's catch;
   2026-09-07). A seat could not resolve a citation, went to the source, read
@@ -116,6 +142,81 @@ belongs here, on the day it is made.
   a temp file, or no pipe at all); a sentence of the form "X applies" / "X
   passes" is worth exactly the exit code it was read from, and if you cannot
   name that exit code you do not have the claim.
+- **A check is trusted only when its corpus can produce more than one
+  outcome** (pi 9's sharpening, orin 21 co-signed; 2026-09-08, four instances
+  across two seats). A green check proves nothing in two distinct ways. (a)
+  The falsifier is absent from what was scanned: ORINFOLD's
+  `FORBID span_blocks=2048 fits=` after fitsland's `fs::unafs::span_fit_report`
+  interposed `sb_blocks=` between the two tokens, so no line the fold emits
+  can match — the same stale geometry scored 1 hit / exit 1 pre-fold and
+  0 hits / exit 0 on the fold; and `unaos/scripts/identify-card.sh`, which
+  always exits 0, so an exit-status guard on it can never fire. (b) The
+  falsifier is excluded by corpus SELECTION: pi 9's "0 late FORBID hits on a
+  PASS capture" (a capture selected for passing carries no FORBID hit by
+  construction), and pi 8's sample of three shas that all postdated the
+  authoring commit. When it is (b), change the corpus, not the pattern —
+  and ask a green corpus only about content (what is emitted after the last
+  COMPLETE marker), never about failures. Sibling of the exit-status rule
+  above: there the harness produces the reading, here the corpus does, and
+  both read as success. The corollary for (a) is structural, not a recurring
+  obligation (pi 9, Note-07 — "re-check after every sibling change to the
+  emitter" is agreed and then quietly not done): key a FORBID or REQUIRE on
+  ONE bounded field wherever the property permits (`span_blocks=2048\b`),
+  because adjacency across fields is a dependency on a neighbour you do not
+  own. Where the property is a conjunction (`skipped=0` AND `srcdelta=0`),
+  bounded fields joined by `.*` absorb insertion but not reordering;
+  order-independence needs look-aheads, which `mbench.py`'s Python `re`
+  accepts (`Directive.__init__` compiles the pattern verbatim after
+  `clean_line`) and `foreman` refuses (the look-around rule above) — a
+  house-style call per spec, decided by which tool reads it.
+- **A matrix leg's feature list is not a build verb's forced set — cite the
+  declaration site, not the nearest symbol of that name** (orin 21's own
+  retracted Correction-01 §C3, refuted by C15KNOBS deriving from the other
+  end, Correction-02, 2026-09-08; the class named by rmbp 16 after B81/B82/
+  B84). The seat read the `arm-tegra` check leg of `KERNEL_CFG_MATRIX` in
+  `unaos/arroyo` (which carries `sdmmc`), treated it as the `esp-jetson`
+  IMAGE's feature set, and published "C15 collapses the arming polarity" to
+  both peers. `esp_jetson()` forces only `tegra,tegrasmp` (plus
+  `bsptick,bsprun`) and never adds `sdmmc`; the polarity survives C15 with
+  the knob renamed. An image claim cites the verb's function. rmbp 16 named
+  the class on its third instance in one round — a vacuous `fits=` quoted
+  over the sound bit 3 (B81), a matrix leg read as a build verb (B82), the
+  `libs/fs/unafs` CRATE read as the `#[cfg(target_arch = "aarch64")] pub mod
+  unafs;` MODULE in `fs/mod.rs` (B84): the wrong object is the one whose name
+  is easier to reach, and nothing malfunctions to say so. The discriminator
+  is the declaration site — `esp_jetson()`, `fs/mod.rs`'s `mod unafs`, the
+  emitter — one `sed -n` from falsified, never a symbol that merely matches
+  the name.
+- **Legibility outcompetes soundness** (pi 8 and rmbp 15, orin 20,
+  2026-09-07; recorded as the pair both seats asked for, each having
+  nominated the other's half). The vacuous check printed a readable word,
+  `fits=yes`; the sound check was bit 3 of a hex mask, `w=0x1ff`. Nobody
+  quotes a hex mask; everybody quoted `fits=yes` — in the baton's headline
+  finding, the bulletin, and three seats' messages all day. rmbp's half says
+  why it survives scrutiny: the legible instrument is not broken — it is
+  right and irrelevant, and nothing malfunctions. pi 8's half says why it
+  gets cited: legibility drove citation, not soundness. Together: a working
+  instrument, answering an unasked question, in the more readable format.
+  Three artifacts that day presented as measurements and were not — `fits=`,
+  a symbol name, a timestamp — each quoted because it presented well. This
+  is not scope, time or observability; it is the summary beating the source,
+  one layer down. Before quoting a field, ask what it compares; and when the
+  legible field is the vacuous one, make it sound rather than rename it
+  honest (rmbp 15's ruling on `fits=`: renaming documents the gap precisely
+  and leaves it open on the artifact that boots).
+- **Derive from a different end and compare** (pi 8, rmbp 15 and orin 20,
+  2026-09-07). In one day three seats propagated a unit error (1 MiB), a
+  phantom symbol (`layout_volid`) and a timezone-broken absence claim, all
+  by relay. The `fits=` vacuity was found by pi 8 forward from
+  `libs/fs/unafs/src/adapter.rs`, rmbp backward from `sdmmc_tegra.rs`'s
+  sizing guard, and orin from the caller graph of `fs/unafs.rs`'s `mount_on`
+  — none relaying another, same result — which is the strongest evidence
+  shape this fleet has produced. What makes it adoptable is the cost: the
+  second derivation only has to be INDEPENDENT, not thorough, and
+  independence is a test you run by trying to write why the two are
+  independent — if that sentence cannot be written, it is one derivation
+  relayed. It is also what caught Correction-01 §C3 the next day (C15KNOBS
+  from `esp_jetson()`, the seat from the check-leg list).
 
 ## Bench and media
 
@@ -175,6 +276,21 @@ belongs here, on the day it is made.
   original work since the base. Without (2)'s second command, a zero diff against a non-ancestor
   parent is indistinguishable from wholesale loss of trunk-only content. Quote both in the landing
   report.
+- **A clean merge is where composition defects hide** (ORINFOLD, orin 21, 2026-09-07/08; the class
+  orin 20 met first). Two correct changes compose wrong with nothing for `git` to report. orin 20:
+  Task A's cfg widening in `drivers/block.rs` was inert alone because the tegra publish sat below
+  the `tegra_early_stop` divergence in `main.rs`, and an arm keyed on `sdmmcroot` would compile to
+  nothing once C15 deleted the feature — a silent miscompile, not a conflict. orin 21: the
+  three-way fold `21727dc0` merged unafsgrow's `FORBID span_blocks=2048 fits=` cleanly onto
+  fitsland's rewritten `fs::unafs::span_fit_report`, leaving a tripwire no emitted line could match
+  (false GREEN). Two rules follow. Re-run each change's OWN falsifier on the FOLDED tree, not only
+  the fold's build gate — the dead row was found by replaying the pre-fold wire against the folded
+  spec (1 hit / exit 1 before, 0 / 0 after), and its repair `6cf9f13b`
+  (`FORBID span_blocks=2048 sb_blocks=`) was proved the same way. And predict conflicts from
+  diffstats against each change's own base, never from intuition: the brief's "they touch different
+  files, so a clean merge is likely" was refuted by `git diff --stat` before the merge ran
+  (unafsgrow forked below integrate2, so `unaos/arroyo` and `jetson-sync1.spec` were two-sided; one
+  conflict region, union-resolved, the conflicted original kept).
 
 Operational trap details (serial-log handling, media clobbers, fixture
 state, TCC, port collisions) live in the session-memory hazards ledger.
