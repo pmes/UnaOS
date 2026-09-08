@@ -1,0 +1,21 @@
+M00	BASE (contract-shaped PASS wire, armed artifact)	exit=0	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=PASS ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=PASS 	== 0 red, 6 green, 0 note(s), 0 not-exercised ==
+M01	loader serial line DELETED (loader still speaks)	exit=1	ARMING=PASS LOADER-SERIAL=ABSENT ROOT-BIND=NOT-SCORED ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=PASS 	== 2 red, 4 green, 0 note(s), 0 not-exercised ==
+M02	ALL loader lines DELETED (loader control zero)	exit=1	ARMING=PASS LOADER-SERIAL=NOT-SCORED ROOT-BIND=NOT-SCORED ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=PASS 	== 2 red, 4 green, 0 note(s), 0 not-exercised ==
+M03	bind serial ALTERED to 0x0badcafe (mismatch)	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=FAIL ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=PASS 	== 1 red, 5 green, 0 note(s), 0 not-exercised ==
+M04	bind line DELETED, no NONE line	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=ABSENT ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOT-EXERCISED 	== 1 red, 4 green, 0 note(s), 1 not-exercised ==
+M05	NONE inserted, reason=kernel-not-found-on-any-volume	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=NOTE ROOT-NONE=FAIL OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOT-EXERCISED 	== 1 red, 3 green, 1 note(s), 1 not-exercised ==
+M06	NONE inserted, reason=multiple-kernels	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=NOTE ROOT-NONE=FAIL OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOT-EXERCISED 	== 1 red, 3 green, 1 note(s), 1 not-exercised ==
+M07	retired [sdmmc] root line INSERTED on the wire	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=PASS ROOT-NONE=PASS OLD-BIND-ABSENT=WRONG-IMAGE SOURCE-VOCAB=PASS 	== 1 red, 5 green, 0 note(s), 0 not-exercised ==
+M08	second loader serial 0xfeed0001 INSERTED (two boots)	exit=1	ARMING=PASS LOADER-SERIAL=FAIL ROOT-BIND=FAIL ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=PASS 	== 2 red, 4 green, 0 note(s), 0 not-exercised ==
+M09	bind source ALTERED to source=potato	exit=0	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=PASS ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOTE 	== 0 red, 5 green, 1 note(s), 0 not-exercised ==
+M10	bind line with NO serial= field	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=FAIL ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=PASS 	== 1 red, 5 green, 0 note(s), 0 not-exercised ==
+M11	loader-only wire (kernel control zero)	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=NOT-SCORED ROOT-NONE=NOT-SCORED OLD-BIND-ABSENT=NOT-SCORED SOURCE-VOCAB=NOT-EXERCISED 	== 3 red, 2 green, 0 note(s), 1 not-exercised ==
+M12	NONE with an UNDOCUMENTED reason	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=NOTE ROOT-NONE=FAIL OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOT-EXERCISED 	== 1 red, 3 green, 1 note(s), 1 not-exercised ==
+M13	bind line with NO source= field	exit=0	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=PASS ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOTE 	== 0 red, 5 green, 1 note(s), 0 not-exercised ==
+M14	second bind line, DIFFERENT serial	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=FAIL ROOT-NONE=PASS OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOTE 	== 1 red, 4 green, 1 note(s), 0 not-exercised ==
+M15	EMPTY wire, armed artifact	exit=1	ARMING=PASS LOADER-SERIAL=NOT-SCORED ROOT-BIND=NOT-SCORED ROOT-NONE=NOT-SCORED OLD-BIND-ABSENT=NOT-SCORED SOURCE-VOCAB=NOT-EXERCISED 	== 4 red, 1 green, 0 note(s), 1 not-exercised ==
+M16	UNARMED artifact + wire with no [vfs] lines	exit=3	ARMING=NOT-EXERCISED LOADER-SERIAL=PASS ROOT-BIND=NOT-EXERCISED ROOT-NONE=NOT-EXERCISED OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOT-EXERCISED 	== 0 red, 2 green, 0 note(s), 4 not-exercised ==
+M17	UNARMED artifact + wire that HAS [vfs] lines	exit=1	ARMING=WRONG-IMAGE LOADER-SERIAL=PASS ROOT-BIND=NOT-EXERCISED ROOT-NONE=NOT-EXERCISED OLD-BIND-ABSENT=PASS SOURCE-VOCAB=NOT-EXERCISED 	== 1 red, 2 green, 0 note(s), 3 not-exercised ==
+M18	artifact with arming literal but NO positive control	exit=2	(refused before scoring)	-
+M19	artifact path does not exist	exit=2	(refused before scoring)	-
+M20	clean wire, artifact still carries [sdmmc] root	exit=1	ARMING=PASS LOADER-SERIAL=PASS ROOT-BIND=PASS ROOT-NONE=PASS OLD-BIND-ABSENT=WRONG-IMAGE SOURCE-VOCAB=PASS 	== 1 red, 5 green, 0 note(s), 0 not-exercised ==
