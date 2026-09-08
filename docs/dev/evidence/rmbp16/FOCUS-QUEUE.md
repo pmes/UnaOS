@@ -47,10 +47,12 @@ against the landed shas, not a rescue.**
         git grep -l 'kbd_dupguard_selftest' $r -- unaos/; done   -> 0 hits on all four
     git grep -l 'kbdwit' origin/hw-rmbp -- unaos/                -> 6   (positive control: the grep can hit)
 
-These three are the **inputs to Q1**. They exist in exactly one object store, on two local branches,
-and one `git worktree prune` plus a `gc` takes them from every seat at once. **ONE push closes it:
-`exec-orin17-dupguard` carries all three** (`28899d5c` is its tip; `0019ec7a` and `e390721f` are its
-ancestors). Named to Peter in rmbp 16's first turn.
+These three are the **inputs to Q1**. **✅ CLOSED 2026-09-08 — Peter pushed `exec-orin17-dupguard`
+mid-round**, and all three are ancestors of `origin/exec-orin17-dupguard` (verified by
+`git merge-base --is-ancestor` after a fresh fetch, not by reading the ref's value). Every seat can
+fetch the metal flight's inputs; the `prune`+`gc` hazard on this half is gone. **What is still open
+is the CITATION half above** — B58's and B60's shas resolve only on this machine, and the remedy is
+a re-cite against the landed shas.
 
 **And the census instrument was wrong, which is why the fifth commit was missed.** B59 was built by
 enumerating NAMED GRANT TARGETS. The derivation from the other end is one command:
