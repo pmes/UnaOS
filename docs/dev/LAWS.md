@@ -178,6 +178,22 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   `git apply && …` without `|| exit`. A fold of two green commits is a new configuration: re-gate the
   union, count conflict markers before `git add`, and `LC_ALL=C grep -a -o -F` every witness in the
   built artifact after any merge that touches one.
+- **A clean merge is where composition defects hide** (ORINFOLD, orin 21, 2026-09-07/08; the class
+  orin 20 met first). Two correct changes compose wrong with nothing for `git` to report. orin 20:
+  Task A's cfg widening in `drivers/block.rs` was inert alone because the tegra publish sat below
+  the `tegra_early_stop` divergence in `main.rs`, and an arm keyed on `sdmmcroot` would compile to
+  nothing once C15 deleted the feature — a silent miscompile, not a conflict. orin 21: the
+  three-way fold `21727dc0` merged unafsgrow's `FORBID span_blocks=2048 fits=` cleanly onto
+  fitsland's rewritten `fs::unafs::span_fit_report`, leaving a tripwire no emitted line could match
+  (false GREEN). Two rules follow. Re-run each change's OWN falsifier on the FOLDED tree, not only
+  the fold's build gate — the dead row was found by replaying the pre-fold wire against the folded
+  spec (1 hit / exit 1 before, 0 / 0 after), and its repair `6cf9f13b`
+  (`FORBID span_blocks=2048 sb_blocks=`) was proved the same way. And predict conflicts from
+  diffstats against each change's own base, never from intuition: the brief's "they touch different
+  files, so a clean merge is likely" was refuted by `git diff --stat` before the merge ran
+  (unafsgrow forked below integrate2, so `unaos/arroyo` and `jetson-sync1.spec` were two-sided; one
+  conflict region, union-resolved, the conflicted original kept).
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **Folds** (rmbp 2026-09-16, QUEUEGATE — 12 branches, six defects, every one CLEAN-auto-merged past
   green gates): a fold is UNION BY ROW ID, never by hunk — a queue/ledger row present in both parents
   is present in the result or the merge message names it `DROPPED <id>`; every `.rs` union is followed
@@ -288,7 +304,15 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   owed"; reading a function is a citation, verify the path from entry point to behaviour; watch the
   adverb added in relay; record defended near-misses as counter-examples. Scope the search to a file
   and you may only claim about that file (rmbp 17); before saying a symbol does not exist, search
-  content not filenames and read the peer's sha.
+  content not filenames and read the peer's sha. The same bound holds for a count — **a
+  measurement is scoped to its base exactly as a claim is scoped to its
+  check** (orin 21 Correction-01, 2026-09-07; rmbp 15's phrasing, 2026-09-08).
+  The orin 21 baton's "thirteen `sdmmcroot` cfgs" was measured at `98213b7f`
+  and handed to executors based at its descendant `aec2c604`, where
+  BOOTIDLIVE had made it 22 live predicates (23 raw): true where measured,
+  false where used, and the brief said to force the number. Report a count
+  with the sha it was taken at, and derive it again at the base you actually
+  build from. (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **A pipe launders the verdict** (rmbp 18 2026-09-08): never score a gate through `| tail`,
   `| head`, `| grep`; `cmd > log 2>&1; echo rc=$?`, then filter the file. When text and exit code
   disagree, the text wins until proven otherwise. Say which channel you read.
@@ -311,6 +335,26 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   builder-path artifact; `./arroyo check` skips baremetal, so `kernel8-test` is the Pi gate after
   arch or asm changes; a video gate carries `UNAOS_WC=1` and is verified reachable, not merely
   compiled. A certification names a control string that exists only in the build under test.
+  rmbp 15's
+  ruling on the Orin card path (orin 21 Correction-03, 2026-09-08) sharpens
+  the split into three parts: a spec's `#require=` asserts only what a build
+  log can honestly assert — the features the image needs (`tegra`, `sdmmc`) —
+  and is not evidence of arming; arming is proven on the ARTIFACT, by
+  `strings` for the witnesses the armed path emits; and every scored capture
+  carries a REQUIRED arming field, established by `strings` on the image that
+  was flashed, never by which knobs were typed. A capture without that field
+  FAILS TO SCORE rather than scoring wrong, because an unarmed image's absent
+  witnesses are unexercised while an armed image's absent witnesses are a
+  defect, and the scorer must know which. rmbp 16's amendment (Correction-04,
+  same day) fixes what the field IS: the bind's own four witnesses present or
+  absent — `boot-medium-mismatch`, `SAME-MEDIUM`, `bootid DISARMED`,
+  `covers the native leg`, all in `sdmmc_tegra.rs` — never a feature name one
+  layer up, because pre-C15 `UNAOS_SDMMC=1` arms recon but not
+  `sdmmc_root_bind` (that is `sdmmcroot`-gated) while post-C15 the same knob
+  arms both, so "sdmmc armed" is ambiguous on one side and the witnesses are
+  correct on both without knowing the side. Do not invent a narrower feature
+  to give `#require` teeth; that re-creates the knob C15 deletes.
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **Byte identity is measured, never argued** (orin 1 2026-08-19): compare the loadable image
   (`objcopy -O binary`), never `.elf` or anything embedding `SRC.TGZ`; a baseline is a per-tree chain
   naming its recipe and HEAD (`kernel8-test` auto-arms `UNAOS_WITNESS`; `genet.rs` embeds the git
@@ -344,6 +388,38 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   literals, and the new path is a design question.
 - **Cite the declaration site, not the symbol** (rmbp 16 2026-09-08): a check leg is not the image
   verb, a library crate is not the kernel module, the legible instrument is not the sound one.
+- **Legibility outcompetes soundness** (pi 8 and rmbp 15, orin 20,
+  2026-09-07; recorded as the pair both seats asked for, each having
+  nominated the other's half). The vacuous check printed a readable word,
+  `fits=yes`; the sound check was bit 3 of a hex mask, `w=0x1ff`. Nobody
+  quotes a hex mask; everybody quoted `fits=yes` — in the baton's headline
+  finding, the bulletin, and three seats' messages all day. rmbp's half says
+  why it survives scrutiny: the legible instrument is not broken — it is
+  right and irrelevant, and nothing malfunctions. pi 8's half says why it
+  gets cited: legibility drove citation, not soundness. Together: a working
+  instrument, answering an unasked question, in the more readable format.
+  Three artifacts that day presented as measurements and were not — `fits=`,
+  a symbol name, a timestamp — each quoted because it presented well. This
+  is not scope, time or observability; it is the summary beating the source,
+  one layer down. Before quoting a field, ask what it compares; and when the
+  legible field is the vacuous one, make it sound rather than rename it
+  honest (rmbp 15's ruling on `fits=`: renaming documents the gap precisely
+  and leaves it open on the artifact that boots).
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
+- **Derive from a different end and compare** (pi 8, rmbp 15 and orin 20,
+  2026-09-07). In one day three seats propagated a unit error (1 MiB), a
+  phantom symbol (`layout_volid`) and a timezone-broken absence claim, all
+  by relay. The `fits=` vacuity was found by pi 8 forward from
+  `libs/fs/unafs/src/adapter.rs`, rmbp backward from `sdmmc_tegra.rs`'s
+  sizing guard, and orin from the caller graph of `fs/unafs.rs`'s `mount_on`
+  — none relaying another, same result — which is the strongest evidence
+  shape this fleet has produced. What makes it adoptable is the cost: the
+  second derivation only has to be INDEPENDENT, not thorough, and
+  independence is a test you run by trying to write why the two are
+  independent — if that sentence cannot be written, it is one derivation
+  relayed. It is also what caught Correction-01 §C3 the next day (C15KNOBS
+  from `esp_jetson()`, the seat from the check-leg list).
+  (nominated orin 21/22, rescued 2026-09-22 — Peter's word pending)
 - **A defect that reappears each layer down belongs at the bottom layer;** ship the layer's fix
   anyway and carry the design as its own arc. An unstated invariant shared by two objects is this
   codebase's defect shape: check it in code. Identity comes from the enumerator, never from bytes
