@@ -107,9 +107,20 @@ inherited 12/77. Budget an executor for that reconcile alone; it is the largest 
 - COI guard holds: the author seat never reviews alone. Panel → ccd announce → peer ack from at least
   one other track seat → this seat's own `--no-ff` merge → trunk battery, with a **fresh `ls-remote`
   in the same turn as the merge**, both seats.
-- **J1 has a measured price paid by another lane (B71):** orin's `cargo test -p foreman` reds because
-  `cc283929` (lookahead fix, unit-tested 8/8, landed here 2026-08-27) is on `origin/hw-rmbp` and on
-  no other head. Confirmed this turn by `git branch -r --contains cc283929`.
+- **J1's price, in the form that is actually true (B88).** Not 166 commits of review — **the fleet is
+  running SEVEN fewer gates and an older GATE-LEDGER because of this branch.** `k8-reach.py`,
+  `k8-reach.registry`, `k8-modtree.py`, `knob-leg-covered.py`, `check-roots.sh`, `arch-families.sh`
+  and `append-position.sh` exist on `hw-rmbp` and on **no other head**; `ledger-check.sh` is
+  **+6/−190** against both `origin/main` and `origin/hw-jetson`, so the other seats validate their
+  ledgers with a gate missing rmbp 12's four mutation-proven fixes. Eleven files diverge in total.
+- **And this lane's FIXES are not reaching the fleet either (B71):** orin's `cargo test -p foreman`
+  reds because `cc283929` (lookahead fix, unit-tested 8/8) is on `origin/hw-rmbp` and no other head —
+  still red at their tip on 2026-09-08, their run. **Two instances in one day makes it a pattern:
+  every other seat pays for this branch staying unlanded.**
+- **Landing checklist item, agreed with orin 22:** their arc lands first, so the `UNAOS_NOSDMMC`
+  registry row (`UNAOS_NOTEGRASMP` shape, status "deliberately unarmed on Pi builds — sdmmc is
+  tegra-only") is **this seat's to add in the landing merge**, or `check` reds on a knob the gate has
+  never seen.
 
 ## Q3b — THE x86 HARNESS LIES ABOUT THE BOOT TOPOLOGY (B87). New this round; do it BEFORE trusting any x86 boot gate.
 
