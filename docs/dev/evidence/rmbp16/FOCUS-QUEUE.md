@@ -204,9 +204,13 @@ source lines, so line-neutral or tail-append only.
   contract** (fields MAY be inserted between matched keys; nothing renamed, reordered, or moved past
   the verdict), so these six are simply the x86 FORBIDs written stricter than the contract their
   emitters honour, and an emitter can invalidate them at any time while breaking no stated rule.
-  Re-key with `\b` (or a whitespace-or-end lookahead) — **never a trailing space: `mbench.py:256` strips every spec line
-  while `Directive.__init__` compiles verbatim (`:157`), so a space bound silently vanishes and the
-  rule then false-hits a longer token.**
+  **⛔ CHOOSE THE BOUND BY WHAT THE SIBLING TOKEN STARTS WITH, never by habit (pi 9, executed; verified
+  independently here).** `\b` guards only against WORD-character extension: `span_blocks=2048\b` does
+  NOT match `span_blocks=20480` (digit = word char, REKEY's case, sound) but **`scope=window\b` DOES
+  match `scope=window-band`, because `-` is a non-word character and a boundary exists right there.**
+  When the sibling differs by a non-word character, `\b` is INERT and `(?=\s|$)` is mandatory.
+  **And never a trailing space: `mbench.py:256` strips every spec line while `Directive.__init__`
+  compiles verbatim (`:157`), so a space bound vanishes and the rule false-hits the longer token.**
 - **B93 — the mid-line-comment gate.** `main.rs:2051` is 933 chars with four statements packed before
   the first `//` (deliberate: a same-line append moves no `panic::Location`). Safe today, and the
   invariant is REMEMBERED not GATED. One mechanical check — no `;` after the first `//` outside a
