@@ -111,6 +111,29 @@ inherited 12/77. Budget an executor for that reconcile alone; it is the largest 
   `cc283929` (lookahead fix, unit-tested 8/8, landed here 2026-08-27) is on `origin/hw-rmbp` and on
   no other head. Confirmed this turn by `git branch -r --contains cc283929`.
 
+## Q3b — THE x86 HARNESS LIES ABOUT THE BOOT TOPOLOGY (B87). New this round; do it BEFORE trusting any x86 boot gate.
+
+Peter, 2026-09-08: *"the card is the hard drive … boot cold, boot dumb, presume nothing about the
+machine."* orin 22's BOOTROOT makes every UEFI arch find its root by walking to the boot volume.
+**x86 was scoped out of that arc for a reason this lane owns.**
+
+- Under QEMU the boot ESP is deliberately a separate `-drive` and the kernel's `Default` is the
+  `usb-storage` stick (`drivers/block.rs:918-919`, choice made in `builder/src/main.rs`), and **no
+  AHCI/SATA/IDE block driver exists** — `drivers/` is `sdhc.rs`, `emmc2.rs`, `ehci`, `xhci`. So the
+  dumb walk finds no root in the harness.
+- **But metal already matches the walk**: `drivers/block.rs:182` — *"machine boots from a USB card
+  reader, so the global slot IS the boot volume."* On the rMBP the boot volume and `Default` are the
+  same device. **The divergence is the harness modelling a box we do not own.**
+- **So this is not convergence blocked on a missing driver. It is: make QEMU present the ESP the way
+  metal does, then converge on `fat::locate_boot_volume(serial) -> Option<BlockSource>`** (orin's
+  shared helper, landing with BOOTROOT).
+- **Why it is ordered before the gates: after BOOTROOT lands, an x86 QEMU boot exercises a topology
+  metal does not have, so a green gate says nothing about the boot path it is named after.** Same
+  family as everything else this round — the instrument does not model the thing it measures — except
+  this one lives in this lane's harness rather than in anyone's code.
+- Files: `unaos/arroyo` (the x86 QEMU drive lines), `builder/src/main.rs`, and whichever x86 specs
+  assert the current two-device shape. Prove it by mutation at the sha it will run on.
+
 ## Q4 — THE `arroyo` SWEEP THIS LANE OWES (B55). Code-only, one line-neutral commit.
 
 Re-verified at `1b24cb8a`: all eleven still restate the gate as `any(baremetal, tegra_el0)` in prose
