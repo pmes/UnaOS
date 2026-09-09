@@ -3295,7 +3295,7 @@ pub fn mark_el1_core() -> bool {
 /// Read-only, and deliberately so: the mask is written in exactly one place ([`mark_el1_core`], by a
 /// core measuring its OWN `CurrentEL`), which is the property that makes it evidence instead of
 /// configuration. Nothing here can set a bit.
-#[cfg(feature = "orinel1ap")]
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 pub fn el1_core_mask() -> u64 {
     EL1_CORE_MASK.load(Ordering::Acquire)
 }
@@ -8717,13 +8717,13 @@ pub fn el0live_witness() {
     let mut runnable = 0usize;
     let mut parked = 0usize;
     let mut last_disp = 0u64;
-    let mut last_wake = 0u64;
+    let mut last_wake = 0u64; let mut el0_cpus = 0u64; let mut last_cpu = usize::MAX; // ORIN-APSRUN — WHERE, not just when. Every field on this line was machine-wide (a max over cores, a sum over cores), so a render11 capture in which all six cores were online and only core 0 ever dispatched an EL0 thread reads IDENTICALLY to a healthy six-core spread. `el0cpus` is the set of cores whose EL0 dispatch clock was ever stamped and `lastcpu` is the core holding the most recent stamp; both come from the per-core arrays this loop already reads, so nothing new is tracked and no lock is taken. APPENDED to this line — zero source lines added.
     for cpu in 0..NUM_CPUS {
         committed += el0_committed(cpu);
         runnable += el0_active(cpu);
         parked += el0_parked_raw(cpu);
         last_disp = last_disp.max(EL0_LAST_DISPATCH_CYC[cpu].0.load(Ordering::Relaxed));
-        last_wake = last_wake.max(EL0_LAST_WAKE_CYC[cpu].0.load(Ordering::Relaxed));
+        last_wake = last_wake.max(EL0_LAST_WAKE_CYC[cpu].0.load(Ordering::Relaxed)); { let d = EL0_LAST_DISPATCH_CYC[cpu].0.load(Ordering::Relaxed); if d != 0 { el0_cpus |= 1u64 << cpu; if last_cpu == usize::MAX || d == last_disp { last_cpu = cpu; } } } // ORIN-APSRUN. `d == last_disp` after the `max` above holds for the core that JUST supplied the running maximum, so the winner is the last core to satisfy it — a single pass, no second loop, and re-reading the same relaxed word is honest here because a stamp that advanced between the two loads only names a core that dispatched EL0 even more recently.
     }
     // Age against `now` rather than against each other: CNTPCT is monotonic and machine-wide, and
     // `saturating_sub` makes a stamp taken microseconds ago on another core read 0 rather than wrap.
@@ -8765,12 +8765,12 @@ pub fn el0live_witness() {
         }
     };
     serial_println!(
-        "[el0live] verdict={} el0 runnable/parked/committed={}/{}/{} last_disp={} last_wake={} stall>={}ms | reaped exit={} kill_oncpu={} kill_offcpu={} corrupt={} nopark={} | totals el0_disp={}",
+        "[el0live] verdict={} el0 runnable/parked/committed={}/{}/{} last_disp={} last_wake={} stall>={}ms | where hosts={:#x} el0cpus={:#x} lastcpu={} | reaped exit={} kill_oncpu={} kill_offcpu={} corrupt={} nopark={} | totals el0_disp={}",
         verdict,
         runnable, parked, committed,
         age(last_disp, disp_ms),
         age(last_wake, wake_ms),
-        EL0_STALL_MS,
+        EL0_STALL_MS, el0_host_mask(), el0_cpus, if last_cpu == usize::MAX { -1 } else { last_cpu as isize }, // ORIN-APSRUN — the `where` group. `hosts` is the set of cores an EL0 task MAY run on right now (`online & el1cores`), `el0cpus` the set it HAS run on, `lastcpu` the core that ran it most recently (-1 = never, the same `--`-for-untracked discipline the age fields use). `hosts` wider than `el0cpus` is a placement question; `hosts` == 0x1 is the ORIN-APSRUN defect itself, on the line an operator already reads every window.
         reap_exit, reap_kill_on, reap_kill_off, reap_corrupt, reap_nopark,
         el0_disp,
     );
@@ -10715,12 +10715,12 @@ fn bsprun_hosting_witness(cpu: usize) {
     }
     let hosting = el0_placement_possible(CPU_AUTO);
     serial_println!(
-        ":: [bsprun] host core={} el={} -> {} (online={:#x} el1cores={:#x}; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses on — EL0-EL1CORE) ::",
+        ":: [bsprun] host core={} el={} -> {} (online={:#x} el1cores={:#x} hosts={:#x}; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses on — EL0-EL1CORE) ::",
         cpu,
         el,
         if hosting { "HOSTING" } else { "REFUSING" },
         online_bits,
-        EL1_CORE_MASK.load(Ordering::Acquire)
+        EL1_CORE_MASK.load(Ordering::Acquire), el0_host_mask() // ORIN-APSRUN — `hosts` is the SET behind the bool: `online & el1cores`, per core. `HOSTING` says only that SOME core can host, which on render11 was true with a single candidate and read exactly like a healthy machine; `hosts=0x1` vs `hosts=0x3f` is the difference Peter's "we are still only on one core" was about, and no field on this line could express it. APPENDED to this line (zero source lines added; the file's Location-shift convention).
     );
 }
 
@@ -10951,4 +10951,44 @@ fn virt_preempt_arm(cpu: usize) {
     spawn("vp-spinB", vp_spin_body, 2, cpu);
     spawn("vp-judge", vp_judge_body, 0, cpu);
     SCHED_ACTIVE.store(true, Ordering::Release);
+}
+
+// ── ORIN-APSRUN (orin 23) — the WHERE half of the EL0 witnesses ──────────────────────────────────
+//
+// Appended at the FILE TAIL, after every existing item, so not one panic `Location` line number above
+// moves and the Pi `kernel8.img` keeps its bytes; both call sites are expressions APPENDED to lines
+// that already existed. Ungated for the same reason `el0live_witness` itself is ungated — the
+// counters it reads exist on every aarch64 build and read the empty baseline where there is no EL0.
+//
+// WHY A SET AND NOT A BOOL. `el0_placement_possible(CPU_AUTO)` is `any(c) { ONLINE_MASK[c] &&
+// el1_core(c) }`. It answers "can this machine host an EL0 task at all", and on render11 it answered
+// YES — truthfully — with exactly one candidate, so `[bsprun] host … -> HOSTING` printed on a boot
+// whose whole userspace was pinned to core 0. `hosts` is that predicate's WITNESS SET rather than its
+// verdict: same conjunction, evaluated per core and published as a mask, so `0x1` and `0x3f` are
+// distinguishable on the wire. It is a strict generalisation — `hosts != 0` iff
+// `el0_placement_possible(CPU_AUTO)` — which is what lets it be read beside the bool without a second
+// definition of "host" existing anywhere.
+
+/// ORIN-APSRUN — the set of cores an EL0 task may be dispatched from RIGHT NOW: `ONLINE_MASK[c] &&
+/// el1_core(c)`, one bit per `cpu_index`. The per-core expansion of
+/// [`el0_placement_possible`]`(CPU_AUTO)`, and deliberately expressed in the same two terms so the
+/// two can never disagree about what a host is.
+///
+/// Reads only, lock-free, safe from any core and from IRQ context — it takes no run-queue lock, which
+/// is what lets it ride the same timer-IRQ witness train `[el0live]` rides. `NUM_CPUS` is 8 on tegra
+/// and 4 elsewhere, so a `u64` covers the machine with room to spare.
+///
+/// On `pi` this reads back as the online set: `el1_core` folds to `true` there (every Pi core is at
+/// EL1 before the scheduler exists), which is the right answer and the reason the Pi's line is
+/// unchanged in meaning.
+fn el0_host_mask() -> u64 {
+    let mut mask = 0u64;
+    let mut c = 0usize;
+    while c < NUM_CPUS {
+        if ONLINE_MASK[c].load(Ordering::Acquire) && el1_core(c) {
+            mask |= 1u64 << c;
+        }
+        c += 1;
+    }
+    mask
 }
