@@ -1211,6 +1211,10 @@ fn launch(path: &str) -> String {
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, asid, entry)) => {
+            // APPTITLE — a double-click launch names its windows exactly as `bg` does; the file
+            // manager knows the path, so the window it opens carries the program's name rather than
+            // the window seam's generated label. See `wm::app_name_arm`.
+            crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
             JOBS.lock().push(Job { pid, asid, name: String::from(path) });
             serial_println!(
                 ":: QUARRY-LAUNCH: {} — {} bytes, entry {:#x}, pid={} asid={} DETACHED (spawn_user_image_bg, the same seam `bg` takes) ::",
@@ -1790,7 +1794,7 @@ pub fn open() {
         g.w as u32,
         g.h as u32,
         (g.w * 4) as u32,
-        b"quarry",
+        b"Quarry",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );

@@ -484,7 +484,7 @@ pub fn open() {
         W as u32,
         H as u32,
         (W * 4) as u32,
-        b"install unaos",
+        b"Install UnaOS",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );
