@@ -1513,8 +1513,27 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     //
     // SYNC-FOLD 2026-08-22 — `presspop=` sits DIRECTLY after `presspread=`: the pi4 spec's AT-RISK
     // FORBID and the re-armed x86-witness FORBID both key on that adjacency. Arity is 27 = 27.
+    //
+    // COMPGATE — `blitnet=` is an INSERTION, and its position is chosen against both live FORBIDs
+    // rather than for tidiness. It sits directly after `decl_alloc=`, i.e. at the END of the decline
+    // decomposition and INSIDE `pop=all-presents`, because that is the one place in this line where
+    // no spec keys on an adjacency: `x86-witness.spec:1234` requires `presspread=… presspop=… \
+    // pop=constant` to stay contiguous (an insertion there would make that FORBID unable to fire,
+    // which is a worse defect than the one this arc is fixing), and `pi4-regression.spec:970`
+    // matches `declines=.*-> TEAR-FREE` with a wildcard that an insertion cannot break. Arity is now
+    // 35 = 35 (27 + eight per-core nets).
+    //
+    // WHAT IT IS. `wm::BLIT_NET_CORE`, the signed per-enter-core net of live `BlitGuard`s that the
+    // compositor has maintained unconditionally since DRAGFIX M1. A slot above 1 means two composite
+    // blits entered on that core and neither has retired — i.e. RE-ENTRANCY, which is the mechanism
+    // behind `decl_lock=` (the staging buffer is per core, so no two cores can contend for one
+    // entry, and a lost `try_lock` can only have been lost to the same core). It was already in the
+    // tree and it was unreadable in practice: the only printer was `wm::blitwho_report`, reachable
+    // from the two drain GIVE-UP arms alone, so a boot that tore without ever stalling a drain never
+    // printed the number that convicts its tear. It now rides the verdict line itself. `torn>0` with
+    // every slot at or below 1 is the statement that the tear has a DIFFERENT source.
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} blitnet=[{},{},{},{},{},{},{},{}] fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,
         scope,
         emit,
@@ -1529,6 +1548,14 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         declby(DECL_CAP),
         declby(DECL_LOCK),
         declby(DECL_ALLOC),
+        blitnet[0],
+        blitnet[1],
+        blitnet[2],
+        blitnet[3],
+        blitnet[4],
+        blitnet[5],
+        blitnet[6],
+        blitnet[7],
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
