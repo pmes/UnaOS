@@ -3013,6 +3013,86 @@ boards; pi 6 granted the file). The Pi's knob-off `kernel8.img` byte-identity ba
 
 ---
 
+### §3.15 CLOSEMIN — closing one window minimised the others (render11, 2026-09-08)
+
+**Peter, on the glass, render11: "closing one window minimizes others."** The wire carries the whole
+mechanism three times over (`boot-render11-B-full.log`, bench-side capture):
+
+```text
+9501: [wc-a] close_owner asid=0x3 closed=1 ids=[7] refused=0
+9504: [wm-act] park win=5 owner=0x1 at (0,0) -> cause=shell-raise
+9505: [wm-act] park win=8 owner=0x4 at (0,0) -> cause=shell-raise
+9506: [wm-act] park win=9 owner=0x5 at (0,0) -> cause=shell-raise
+9507: [wc-fv] focus shell z=45 hidden=3 exempt=0 furniture=4
+9512: [orinclick] edge=press ... win=7 owner=0x3 focus 0x3->0x0 consumed=1 -> CONSUMED
+```
+
+One close disc pressed; ONE row reaped (`ids=[7]`, `close_owner` behaving exactly as CLOSEISO
+specifies); and three OTHER programs' windows parked at `PARKED_Z` by the same gesture.
+
+**The mechanism, one line.** `arch/aarch64/syscall.rs`'s `wc_close_click` returned the orphaned focus
+to the shell with `wm::focus_changed(0)` — the SHELL ARM, which mints a fresh `SHELL_Z` above every
+SURVIVING window, erases their boxes to `DESKTOP_BG`, stops them compositing, and has `vugmin_scan`
+publish `hidden=true` to every owner. That is the correct semantics for TAB-to-the-shell and the
+wrong semantics for a close: **a close is a WINDOW gesture and may not speak for the table.**
+
+**It was a known defect with a cure this arch never took.** `wm::focus_release` was written for
+exactly this (GR27 Boot A, same operator words), x86's `wc_close_click` took it at CLOSE-TEARDOWN,
+and aarch64 did not — `focus_release` had ONE aarch64 caller, `wc_close_furniture` (§3.12.4
+CONWINCLOSE), and the app close path was not it.
+
+**Why no battery caught it in nine boots.** The arm fires only when the closed window's owner already
+held `FOCUS_ASID`, i.e. only when the operator had clicked INTO the window before closing it — the
+"SOMETIMES" in the original report, exact. The same render11 wire holds the control: the one close
+that did not trip it (`9364: close_owner asid=0x2` at `focus 0x3->0x3`) emits no `[wc-fv] focus
+shell` line at all. Worse, `wm::closeiso_selftest` encoded the buggy sequence as *"the gesture,
+exactly as `wc_close_click` performs it"* and asserted the sibling's disappearance as CORRECT — a
+fixture pinned to the defect. It is relabelled: its shell raise is now driven as the deliberate
+TAB-to-shell gesture its legs are actually about.
+
+**The fix.** `wm::focus_after_close(win, owner, route)` is the close routers' one focus verb on both
+arches:
+
+1. `focus_release` — drop the departing owner's highlight, CAS-guarded, **no shell raise**. Survivors
+   keep their `z`, keep compositing, keep their hidden bits.
+2. Promote `top_visible_owner` through `focus_changed`'s RAISE arm, which since CLICK-PLAIN is purely
+   additive. Only when the closed owner HELD focus. Kernel furniture is excluded: the console is not
+   a keyboard focus target (`user_input_set_active` refuses the reserved band), and a highlight the
+   keystrokes cannot follow is the one state focus must never be in.
+3. `[wm] close-scope` on the wire.
+
+**The witnesses, because both halves of this were silent.** The render11 capture was a witness build
+and still could not answer "what did that close do to everything else" in one read:
+
+* `[wm] close-scope win=N owner=0x.. next_focus=0x.. shell_z=N visible_after=[..] hidden_after=[..]`
+  — unconditional (not `witness`-gated), its own 64-line lifetime budget, emitted at the moment the
+  close's focus handback completes. `hidden_after` is the field the defect prints in.
+* `[wm-act] hide|unhide win=0 owner=0x.. -> cause=shell-raise|focus-raise|minimise` — one line per
+  hidden-bit TRANSITION, naming the caller. Every set and clear of that bit was previously visible
+  only as a count in a `[vugmin] wm` rollup.
+
+**The fixture, and it went red on demand.** `wm::closemin_selftest` runs on BOTH arches (tail of
+`hittest_selftest`, which x86's and aarch64's batteries both drive), needs no HID, and carries its
+own control leg — after asserting the close left both siblings on the glass it drives `focus_changed(0)`
+deliberately and asserts they DO park, so the instrument is proven able to read both values.
+Go-red measured, not asserted: with `focus_after_close`'s body replaced by the pre-CLOSEMIN
+`focus_changed(0)`, `UNAOS_WC=1 ./arroyo test` exits **1** on
+
+```text
+[closemin] close-scope base=1 closed=1 siblings_visible=0 shell_moved=1 next_focus=0x0 focus=0 unhidden=0 shell_arm_control=1 -> FAIL
+[wm] close-scope win=1 owner=0xc30 next_focus=0x0 shell_z=14 visible_after=[] hidden_after=[2, 3]
+```
+
+and with the fix in place exits **0** on `siblings_visible=1 shell_moved=0 next_focus=0xc32 -> PASS`.
+
+**What is still owed: the glass.** QEMU cannot press a disc on the Orin panel. The bench check is one
+gesture: open two or more program windows, CLICK INTO one of them (the precondition — without it the
+old arm never fired either), close it with its disc, and confirm the others stay where they are.
+The wire answers it in one line per close — `[wm] close-scope … hidden_after=[]` is the pass, any id
+in `hidden_after` is the defect returning.
+
+---
+
 ## §4 The GA10B boundary — stated once so nobody re-asks
 
 **Scanout on Tegra234 is nvdisplay + the DCE. That is a different block from the

@@ -698,7 +698,7 @@ fn owner_hidden(t: &Table, asid: u64, shell: u32) -> bool {
 /// [`VUGMIN_SHADOW`] would let one stale shadow bit (ASID recycle clears the real bit behind `wm`'s
 /// back) leave a fresh tenant permanently idling. Republishing a bit that is already right costs one
 /// `u32` store on a path that runs at operator speed.
-fn vugmin_publish(asid: u64, hidden: bool) {
+fn vugmin_publish(asid: u64, hidden: bool, _reason: &'static str) {
     if asid == 0 || asid >= 64 {
         return;
     }
@@ -731,9 +731,9 @@ fn vugmin_publish(asid: u64, hidden: bool) {
         };
         if (before & bit != 0) != hidden {
             if hidden {
-                VUGMIN_HIDES.fetch_add(1, Relaxed);
+                VUGMIN_HIDES.fetch_add(1, Relaxed); wm_act("hide", WIN_NONE, asid, _reason, 0, 0); // CLOSEMIN — ⚠ SAME-LINE fold, line-NEUTRAL. The hidden bit is the thing an operator SEES as "minimised", and until this line every set and clear of it was silent: the render11 wire carried four hides and four unhides in `[vugmin] wm` ROLLUPS with no per-edge line, so "closing one window minimised the others" could only be inferred from `[wm-act] park` (the z half) and never read off the hide half at all. On the `wm_act` budget deliberately — same 256-line lifetime cap, same tag — so a hide storm cannot flood the wire, and the reason is the CALLER's static token, which is what makes an unexplained hide impossible to confuse with an explained one.
             } else {
-                VUGMIN_UNHIDES.fetch_add(1, Relaxed);
+                VUGMIN_UNHIDES.fetch_add(1, Relaxed); wm_act("unhide", WIN_NONE, asid, _reason, 0, 0); // CLOSEMIN — ⚠ SAME-LINE fold, line-NEUTRAL. See the hide arm above; the unhide edge is the one VUGPAUSE-2 delivers as a wake, so naming its cause is what distinguishes "the operator raised this window" from "something republished a bit".
             }
         }
     }
@@ -2831,8 +2831,12 @@ pub fn focus_changed(asid: u64) {
     // lock (atomics + one `u32` info-page store), so this is a convention rather than a necessity, but
     // it is the file's convention. The shell arm hides every owner at once; a raise publishes at most
     // two rows, the owner arriving and the owner leaving, and says nothing at all about the rest.
+    // CLOSEMIN — the REASON travels with the bit. The two arms are different events on the glass (a
+    // whole-table park the operator asked for, versus one window arriving), and until the reason was
+    // carried here the wire could not tell them apart at the point the bit actually moved.
+    let vreason = if asid == 0 { "cause=shell-raise" } else { "cause=focus-raise" };
     for &(asid, hid) in marks[..nmarks].iter() {
-        vugmin_publish(asid, hid);
+        vugmin_publish(asid, hid, vreason);
     }
 
     // WEDGE-2 `<F5>` — the z-bump is done and the table guard is dropped; the immediate REPAINT half
@@ -14472,7 +14476,7 @@ pub fn minimise(id: WinId) -> &'static str {
     // gesture; this one names the park itself, uniformly with the incidental kind.)
     wm_act("park", id, owner, "cause=minimise", 0, 0);
     // VUGMIN-B — outside the guard, on this module's standing convention for this seam.
-    vugmin_publish(owner, hid);
+    vugmin_publish(owner, hid, "cause=minimise");
     // The vacate epilogue, identical to `move_to_inner`'s and load-bearing for the same reasons:
     // barrier first so an in-flight blit of the old geometry cannot land after the erase, then
     // desktop colour, then re-damage the neighbours the erase reached, then force the desktop's next
@@ -21665,12 +21669,16 @@ fn closeiso_selftest() {
     let sample = |id: WinId| -> u32 { probe(id).map(|(x, y)| read(x, y)).unwrap_or(0) };
 
     // The app holds focus, as it does after the operator drags or clicks its title bar — this is what
-    // makes `wc_close_click` take the `focus_changed(0)` arm at all.
+    // made `wc_close_click` take the `focus_changed(0)` arm at all. CLOSEMIN: that arm is GONE from
+    // both close routers (they take [`focus_after_close`] now), so the shell raise below is driven
+    // DELIBERATELY here, as the TAB-to-shell gesture it always was — which is the gesture these legs
+    // are actually about (furniture survives it; an ordinary row does not). The claim that a CLOSE
+    // does not raise the shell is [`closemin_selftest`]'s, not this fixture's.
     focus_changed(ASID_APP);
     let base_k = sample(wk) == k_col;
     let base_f = sample(wf) == f_col;
 
-    // ── THE GESTURE, exactly as `wc_close_click` performs it ────────────────────────────────────
+    // ── THE CLOSE, then the SHELL RAISE as its own deliberate gesture (see above) ───────────────
     let closed = close_owner(ASID_APP);
     focus_changed(0);
 
@@ -23820,7 +23828,7 @@ pub fn hittest_selftest() {
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
-    repaint();
+    repaint(); closemin_selftest(); // CLOSEMIN — ⚠ SAME-LINE fold, line-NEUTRAL. Sited HERE, at the tail of the one window fixture BOTH arches drive (x86 `arch/x86_64/syscall.rs`'s battery and aarch64's alike), because the defect it pins is arch-neutral code reached from two arch routers and only one of them had the cure. After this battery's own teardown sweep, so no synthetic row of its can be inherited; it mints, reaps and restores its own three rows on the same terms.
 }
 
 /// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
@@ -25296,4 +25304,290 @@ fn winid_selftest() {
 ))]
 fn winid_selftest() {
     serial_println!("[winid] selftest -> SKIP (no window furniture on this image: the five id caches WINID guards all live behind `wc` / `desktop_firmware`)");
+}
+
+// ---- CLOSEMIN — a close is a WINDOW gesture, and it may not speak for the table ----------------
+//
+// Peter, Jetson Orin Nano, render11, 2026-09-08, on the glass: **"closing one window minimizes
+// others"**. The wire says exactly how, three times in one boot
+// (`~/unaos-bench/scratch/orin23/boot-render11-B-full.log`):
+//
+// ```text
+// 9501: [wc-a] close_owner asid=0x3 closed=1 ids=[7] refused=0
+// 9504: [wm-act] park win=5 owner=0x1 at (0,0) -> cause=shell-raise
+// 9505: [wm-act] park win=8 owner=0x4 at (0,0) -> cause=shell-raise
+// 9506: [wm-act] park win=9 owner=0x5 at (0,0) -> cause=shell-raise
+// 9507: [wc-fv] focus shell z=45 hidden=3 exempt=0 furniture=4
+// 9512: [orinclick] edge=press ... win=7 owner=0x3 focus 0x3->0x0 consumed=1 -> CONSUMED
+// ```
+//
+// One close disc, one row reaped — and three OTHER programs' windows parked at [`PARKED_Z`] by the
+// same gesture. The cause is the focus handback: `arch::aarch64::syscall::wc_close_click` returned
+// the orphaned focus to the shell with [`focus_changed`]`(0)`, which is the SHELL ARM — a fresh
+// [`SHELL_Z`] above every survivor, their boxes erased to [`DESKTOP_BG`], and [`vugmin_scan`]
+// publishing `hidden=true` fleet-wide. That is the correct semantics for TAB-to-the-shell and the
+// wrong semantics for a close.
+//
+// It is the SAME defect [`focus_release`]'s doc block already records from GR27 Boot A, and the same
+// cure: x86 took it (`arch::x86_64::syscall::wc_close_click`, CLOSE-TEARDOWN), aarch64 never did —
+// `focus_release` had exactly one aarch64 caller (`wc_close_furniture`, CONWINCLOSE) and the app
+// close path was not it. **"SOMETIMES" is exact and is why it survived a QEMU battery**: the arm
+// fires only when the closed window's owner already held `FOCUS_ASID`, i.e. only when the operator
+// had clicked INTO the window before closing it. In the render11 capture the one close that did NOT
+// trip it is visible on the same wire (`9364: close_owner asid=0x2` with `focus 0x3->0x3`, no
+// `[wc-fv] focus shell` line) — a perfect control, recorded by accident.
+//
+// [`focus_after_close`] is the whole cure and this is the module's one close-focus verb from here:
+// release without the raise, then promote the top-most survivor, then SAY what happened.
+
+/// CLOSEMIN — lifetime cap on the `[wm] close-scope` line. Its own budget rather than `wm_act`'s
+/// 256, because this line must survive a boot in which the gesture vocabulary has already spent that
+/// budget: it is the ONE line that answers "did this close take anything else off the glass".
+const CLOSE_SCOPE_LOG_MAX: u32 = 64;
+static CLOSE_SCOPE_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// CLOSEMIN — **the top-most window that is still ON THE GLASS, as an owner ASID.** `0` when there
+/// is none.
+///
+/// Scoped exactly like the thing it is for. Skipped: `exclude` (the owner that just departed — belt
+/// and braces, its rows are already reaped by the time this runs), compat rows (the full-screen
+/// present path, never a focus target — see [`focus_ring`]), owner 0 (the shell/desktop row, which
+/// is not a window), rows below the shell ([`above_shell`], so a parked window is never promoted
+/// back onto the glass by someone else's close), and KERNEL FURNITURE.
+///
+/// Furniture is excluded deliberately and it is the only judgement call here. The console window is
+/// the machine's own surface, not a program's: `user_input_set_active` refuses the reserved band, so
+/// promoting it would name a focus holder the KEYBOARD can never follow — the highlight and the
+/// keystrokes would disagree, which is the one state focus must never be in. When the only survivors
+/// are furniture the answer is `0` and focus stays released at the shell, which is precisely the
+/// state x86's close path has had since CLOSE-TEARDOWN.
+fn top_visible_owner(exclude: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let shell = SHELL_Z.load(Ordering::Acquire);
+    let t = table();
+    let mut best_z = 0u32;
+    let mut best = 0u64;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid == 0 || r.owner_asid == exclude {
+            continue;
+        }
+        if is_kernel_owner(r.owner_asid) || !above_shell(r, shell) {
+            continue;
+        }
+        if r.z > best_z {
+            best_z = r.z;
+            best = r.owner_asid;
+        }
+    }
+    best
+}
+
+/// CLOSEMIN — **the `[wm] close-scope` line: what a close did to every OTHER window.**
+///
+/// Unconditional (not `witness`-gated) and budgeted at [`CLOSE_SCOPE_LOG_MAX`]. The render11 boot
+/// was a witness build and still could not answer this question in one read: `[wc-a] close win=N`
+/// named the row, `[wm-act] park` named the collateral, `[wc-fv] focus shell` named the raise, and
+/// nothing tied the three together or said what focus landed on. One line, at the moment the close's
+/// focus handback completes, naming the closed window, its owner, where focus went, and the ids that
+/// are OFF THE GLASS afterwards. `hidden_after` is the field the defect would have shown up in: a
+/// close that parks siblings prints their ids here.
+fn close_scope_witness(win: WinId, owner: u64, next_focus: u64) {
+    use core::sync::atomic::Ordering;
+    if CLOSE_SCOPE_LOG.fetch_add(1, Ordering::Relaxed) >= CLOSE_SCOPE_LOG_MAX {
+        return;
+    }
+    let mut hidden = [WIN_NONE; MAX_WINDOWS];
+    let mut nhidden = 0usize;
+    let mut visible = [WIN_NONE; MAX_WINDOWS];
+    let mut nvisible = 0usize;
+    {
+        let shell = SHELL_Z.load(Ordering::Acquire);
+        let t = table();
+        for r in t.rows.iter() {
+            if !r.used {
+                continue;
+            }
+            if above_shell(r, shell) {
+                visible[nvisible] = r.id;
+                nvisible += 1;
+            } else {
+                hidden[nhidden] = r.id;
+                nhidden += 1;
+            }
+        }
+    }
+    serial_println!(
+        "[wm] close-scope win={} owner={:#x} next_focus={:#x} shell_z={} visible_after={:?} hidden_after={:?}",
+        win,
+        owner,
+        next_focus,
+        SHELL_Z.load(Ordering::Acquire),
+        &visible[..nvisible],
+        &hidden[..nhidden]
+    );
+}
+
+/// CLOSEMIN — **the whole focus handback a CLOSE owes, and the only one a close router may make.**
+/// Returns the owner focus landed on (`0` = the shell, i.e. nothing was promoted).
+///
+/// Three steps, and the ORDER is the argument:
+///
+/// 1. [`focus_release`] — drop the departing owner's highlight, CAS-guarded, **no shell raise**.
+///    Survivors keep their `z`, keep compositing, keep their hidden bits. This is the step whose
+///    absence on aarch64 was the defect (see this section's header block).
+/// 2. **Promote the top-most survivor** ([`top_visible_owner`]) through [`focus_changed`]'s RAISE
+///    arm — which since CLICK-PLAIN is purely ADDITIVE: it starts the window it names and stops
+///    nothing. The promoted row is by construction already the top-most one on the glass, so the
+///    fresh `z` moves no pixel; what it does is put the focus highlight and the `hidden=false` wake
+///    edge on a window the operator can actually see. Only when the closed owner HELD focus: a close
+///    aimed at a background window must not steal focus from the window the operator is working in.
+/// 3. [`close_scope_witness`] — say it on the wire, once, in one line.
+///
+/// The keyboard half (`user_input_set_active`) stays with the syscall layer on both arches, exactly
+/// as [`focus_release`]'s contract says; this verb is the wm half only. `win` is the id the operator
+/// pressed, carried for the witness alone — pass [`WIN_NONE`] from an owner-scoped caller that no
+/// longer knows it.
+///
+/// ### The `held` read, and why a plain load is enough
+/// `held` is read before the release rather than returned by the CAS inside it. Both are on the
+/// operator's own input path — one pump, one core, at click rate — and the failure mode of losing
+/// the race is one skipped promotion, i.e. focus resting at the shell, which is the state this whole
+/// path had before CLOSEMIN. It cannot park a sibling under any interleaving, which is the property
+/// that matters.
+pub fn focus_after_close(win: WinId, owner: u64, route: &'static str) -> u64 {
+    let held = owner != 0 && focus_asid() == owner;
+    focus_release(owner, route);
+    let next = if held { top_visible_owner(owner) } else { 0 };
+    if next != 0 {
+        focus_changed(next);
+    }
+    close_scope_witness(win, owner, next);
+    next
+}
+
+/// CLOSEMIN — **the fixture: closing one window may not take another off the glass.**
+///
+/// Runs on BOTH arches (called from [`hittest_selftest`], which x86 and aarch64 both drive), needs
+/// no pointer and no HID: it drives the two verbs the close routers call, in the order they call
+/// them, against three rows it mints itself.
+///
+/// ### The legs
+/// * **1 — the close reaps exactly its own row.** `close_owner` returns 1 and the siblings' rows live.
+/// * **2 — THE DEFECT.** Both siblings are still [`above_shell`] after the close's focus handback,
+///   and [`SHELL_Z`] has not moved. This is the leg that REDS against the pre-CLOSEMIN aarch64
+///   router: substitute `focus_changed(0)` for [`focus_after_close`] and both siblings park at
+///   [`PARKED_Z`], `shell_z` jumps, and this leg reports `siblings_visible=false shell_moved=true`.
+/// * **3 — focus lands on the top-most survivor**, not on the shell and not on the reaped owner.
+/// * **4 — the CONTROL, and it is what makes leg 2 a measurement rather than a tautology.** The
+///   shell arm is then driven DELIBERATELY (`focus_changed(0)`) and both siblings MUST park. A
+///   fixture that can only ever see "visible" would pass over a build in which nothing can hide at
+///   all; this leg proves the instrument can read the other value.
+///
+/// Self-cleaning on [`focusvis_selftest`]'s terms: every row it mints is reaped and
+/// [`SHELL_Z`]/[`FOCUS_ASID`] are restored by its caller's own epilogue.
+#[cfg(feature = "witness")]
+pub fn closemin_selftest() {
+    use core::sync::atomic::Ordering;
+
+    /// The owner whose window the operator closes — it HOLDS focus, which is the precondition that
+    /// made the defect fire "sometimes" (see this section's header block).
+    const ASID_CLOSER: u64 = 0xC30;
+    /// The two survivors. `HI` is created last, so it holds the higher `z` and is the row leg 3 says
+    /// focus must land on.
+    const ASID_LO: u64 = 0xC31;
+    const ASID_HI: u64 = 0xC32;
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[closemin] close-scope -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 256 || info.height < 128 {
+        serial_println!(
+            "[closemin] close-scope -> SKIP (panel {}x{} too small)",
+            info.width, info.height
+        );
+        return;
+    }
+
+    let sa = &raw const FV_SURF_A as usize;
+    let sb = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let wc = create(ASID_CLOSER, sa, len, 8, 8, 32, b"cm-c");
+    let wl = create(ASID_LO, sb, len, 8, 8, 32, b"cm-l");
+    let wh = create(ASID_HI, sa, len, 8, 8, 32, b"cm-h");
+    if wc == WIN_NONE || wl == WIN_NONE || wh == WIN_NONE {
+        serial_println!(
+            "[closemin] close-scope -> SKIP (window table full: c={} l={} h={})",
+            wc, wl, wh
+        );
+        close(wc);
+        close(wl);
+        close(wh);
+        close_owner(ASID_CLOSER);
+        close_owner(ASID_LO);
+        close_owner(ASID_HI);
+        return;
+    }
+
+    // The survivors take their z in order, so `HI` is unambiguously the top-most one on the glass;
+    // then the CLOSER takes focus, which is what a click into a window before closing it does and
+    // what makes the old shell arm reachable at all.
+    focus_changed(ASID_LO);
+    focus_changed(ASID_HI);
+    focus_changed(ASID_CLOSER);
+
+    let onglass = |id: WinId| -> bool {
+        let shell = SHELL_Z.load(Ordering::Acquire);
+        let t = table();
+        row(&t, id).map(|r| above_shell(r, shell)).unwrap_or(false)
+    };
+    let shell_before = SHELL_Z.load(Ordering::Acquire);
+    let base_ok = onglass(wl) && onglass(wh) && focus_asid() == ASID_CLOSER;
+
+    // ── THE GESTURE, exactly as the close routers now perform it ────────────────────────────────
+    let closed = close_owner(ASID_CLOSER);
+    let next = focus_after_close(wc, ASID_CLOSER, "route=closemin-selftest");
+
+    let closed_ok = closed == 1 && info_box(wc).is_none();
+    let siblings_visible = onglass(wl) && onglass(wh);
+    let shell_moved = SHELL_Z.load(Ordering::Acquire) != shell_before;
+    let focus_ok = next == ASID_HI && focus_asid() == ASID_HI;
+    // The hidden half, read through the predicate every present-suppression path reads.
+    let unhidden_ok = {
+        let t = table();
+        let shell = SHELL_Z.load(Ordering::Acquire);
+        !owner_hidden(&t, ASID_LO, shell) && !owner_hidden(&t, ASID_HI, shell)
+    };
+
+    // ── LEG 4: the CONTROL — the shell arm still parks, so leg 2 is a measurement ────────────────
+    focus_changed(0);
+    let control_ok = !onglass(wl) && !onglass(wh);
+
+    let ok = base_ok && closed_ok && siblings_visible && !shell_moved && focus_ok && unhidden_ok && control_ok;
+    serial_println!(
+        "[closemin] close-scope base={} closed={} siblings_visible={} shell_moved={} next_focus={:#x} focus={} unhidden={} shell_arm_control={} -> {}",
+        base_ok as u8,
+        closed_ok as u8,
+        siblings_visible as u8,
+        shell_moved as u8,
+        next,
+        focus_ok as u8,
+        unhidden_ok as u8,
+        control_ok as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    // Teardown on `hittest_selftest`'s own terms: a sweep, not an assertion, and a leak is loud.
+    let mut leaked = 0usize;
+    for a in [ASID_CLOSER, ASID_LO, ASID_HI] {
+        leaked += close_owner(a);
+    }
+    if leaked > 3 {
+        serial_println!("[closemin] close-scope teardown LEAK — {} row(s) reaped -> FAIL", leaked);
+    }
+    SHELL_Z.store(0, Ordering::Release);
+    FOCUS_ASID.store(0, Ordering::Release);
+    repaint();
 }
