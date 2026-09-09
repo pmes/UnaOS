@@ -5548,6 +5548,22 @@ esp_jetson() {
          FSx:\\EFI\\BOOT\\BOOTAA64.EFI     # launch UnaOS  (x = the number map showed)
   Serial console: Raspberry Pi Debug Probe on the board TTL header (pin 3 = RX, pin 4 = TX), 115200.
 EOF
+    # UNAFSROOT (orin 24, 2026-09-09): the CARD IMAGE is part of `esp-jetson`, not a second verb the
+    # operator has to remember. Peter's question this round — "how come you are not showing me the
+    # unafs partition as / aka the main disk" — has one root cause on the media side: the flight card
+    # carries ONE FAT partition, so `fs::bootdisk` finds no native volume to root on and falls back to
+    # the FAT. A card image that carries the native volume must therefore be produced by the SAME verb
+    # that produces the tree that goes on it, or the two drift again (they already did once: the tree
+    # was built in-tree for a year while the geometry was inherited from an unrecorded pi write).
+    #
+    # `UNAOS_ESP_IMG=0` skips it, for the one honest case: a tree-only rebuild on a host without
+    # mkfs.fat/mtools. It is OFF-BY-DEFAULT-NOTHING — the default is to build the image, so the media
+    # path is exercised by every staging run rather than by a verb nobody types.
+    if [ "${UNAOS_ESP_IMG:-1}" != "0" ]; then
+        jetson_card_image
+    else
+        echo -e "${COLOR_YELLOW}⚡ card image skipped (UNAOS_ESP_IMG=0) — the ESP tree is staged, no media geometry was built${COLOR_RESET}"
+    fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -5649,13 +5665,19 @@ EOF
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 ORIN_CARD_IMG="${WORKSPACE_DIR}/target/UnaOS-orin-card.img"
 ORIN_UNAFS_IMG="${WORKSPACE_DIR}/target/unafs-orin.img"
+# UNAFSROOT (orin 24): the verb is now TWO functions, because `esp_jetson` itself calls the second
+# one. `esp_jetson_img` is kept as a name so an operator (or a note) that types `esp-jetson-img` still
+# works; it is exactly `esp_jetson`, which builds the tree and then the image. `jetson_card_image` is
+# the media half alone and assumes the tree at $ESP_DIR_ARM is already staged — it is never called
+# from anywhere but those two places, so the tree can never be stale relative to the image.
 esp_jetson_img() {
+    esp_jetson
+}
+
+jetson_card_image() {
     local unafs_mb="${UNAOS_ORIN_UNAFS_MB:-512}"
     local fat_mb="${UNAOS_ORIN_FAT_MB:-128}"
     local img_mb=$(( fat_mb + unafs_mb ))
-
-    # 1. The boot tree, from the flown path itself (features, EL0 images, SRC.TGZ and all).
-    esp_jetson
 
     # 2. The native volume. Formatted by the host `unafs` CLI — the same frozen on-disk format the
     #    kernel mounts, KAT-pinned in unaos/libs/fs/unafs — so the bytes on the card are produced by
@@ -5763,6 +5785,17 @@ print(":: ORIN-CARD: p1 type=0x%02x part=[%d..%d) label=%s | p2 type=0x%02x part
          "yes" if fits else "NO", "ok" if magic_ok else "MISSING"))
 print(":: ORIN-CARD: unafs volume %d MiB in a %d MiB partition on a %d MiB image ::"
       % (block_count * 4096 // 1048576, c2 // 2048, os.path.getsize(img) // 1048576))
+
+# UNAFSROOT (orin 24): the SAME geometry, in the one grammar the bench writer already parses.
+# `~/unaos-bench/tools/media-writer.sh`'s C7-GEOMETRY reads `CARDREADY-GEOM: <spec>` out of a file
+# and compares it, field for field, against what it probes off the medium — `slot:type:start:count`,
+# comma-separated, type in lowercase hex, which is exactly `probe_medium`'s own `%d:%02x:%d:%d`.
+# Emitting it HERE, from the built image rather than from a note somebody typed, is what stops the
+# writer's expectation and the image's reality drifting: the only way to change the expectation is
+# to build a different image. Redirect it into docs/dev/evidence/<round>/CARDREADY-GEOM.md and point
+# `--geom-from` at that file (R32: a record lives in git, never in a round's scratch).
+print("CARDREADY-GEOM: %d:%02x:%d:%d,%d:%02x:%d:%d"
+      % (1, t1, s1, c1, 2, t2, s2, c2))
 
 if fail:
     print("esp-jetson-img: GEOMETRY READBACK FAILED:", file=sys.stderr)
