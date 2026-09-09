@@ -6529,6 +6529,116 @@ arches; knob-off `UNAOS_GICV3=1 ./arroyo test-arm 40` CAPSTONE 6/6, `./arroyo te
 22` + `./arroyo kernel8-test` 0 FAIL; knob-on `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm 40` prints the
 witness line + CAPSTONE 6/6 intact. Landing: `review/unaos-orin-sdmmc1-LANDING.md`.
 
+##### SDV1 — identifying an SD v1.x (SDSC) card (orin 24, ledger A49)
+
+**What the bench showed.** render12 boot 2, with a 1.9 GB FAT card (label `UNAOS-DATA`, a plain FAT volume
+with no UnaOS content) in the Orin's slot — the full extract is
+[`docs/dev/evidence/orin24/sdv1-wire.txt`](../../evidence/orin24/sdv1-wire.txt):
+
+```
+:: SDMMC:   M2: card detected (Present State 0x01fb00f0) ::
+:: SDMMC:   M2: CMD0 GO_IDLE ok ::
+:: SDMMC:   M2: CMD8 no response (INTERRUPT=0x00018000) — SD v1.x card or no v2 support; continuing without HCS ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) FAILED — INTERRUPT=0x00018000 PresentState=0x01fb0000 … — STOP ::
+:: SDMMC: ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop) ::
+```
+
+and `tegra-sd=absent` on the `[vfs] root =` line. A 1.9 GB card is standard-capacity (SDSC), so the CMD8
+timeout is the *correct* answer — CMD8 is a v2 command and an SD v1.x card does not implement it. The
+failure is the line after it: CMD55 timed out too, with `INTERRUPT=0x00018000` (bit 15 error summary +
+bit 16 Command Timeout) and a Present State showing the controller un-inhibited and the card still seated.
+Every card this ladder had identified on metal before this boot was CSD v2; the v1.x branch had never run.
+
+**Two defects, both in `identify`, neither a data-path defect.** The v1.x DATA path was already correct and
+is unchanged by this fix — ACMD41 with HCS=0 (`0x00ff_8000`), CCS taken from OCR[30], the CSD v1
+`C_SIZE`/`C_SIZE_MULT`/`READ_BL_LEN` product, CMD16 SET_BLOCKLEN 512, and `lba * 512` byte addressing in
+CMD17. The ladder simply never reached any of it.
+
+1. **No re-idle after the unanswered CMD8.** A card that has just been handed a command it does not
+   implement is not obliged to answer the next one. The recovery every mature host applies is to put it
+   back in idle before starting over: U-Boot's `sd_send_op_cond()` opens with `mmc_go_idle(mmc)` under the
+   comment "Some cards seem to need this". CMD0 is broadcast, needs no response, and costs one command, so
+   the fix is unconditional recovery on the v1.x branch rather than a guess about which card is seated. The
+   v2 path — which reached ACMD41 on this bench across two rounds of boots — is untouched.
+2. **The ACMD41 loop spent none of its own budget.** It declares `ACMD41_TIMEOUT_MS = 1000` for the card to
+   leave power-up busy, and then went through `cmd_step_at`, whose `?` ends the ladder. The FIRST
+   unanswered CMD55 therefore printed "STOP" and discarded the remaining ~1000 ms, after asking the card
+   exactly once. Both commands now go through `cmd_retry`, which witnesses the timeout, resets the CMD/DAT
+   lines and returns `false`; only the loop ends the ladder, when the budget expires or after
+   `ACMD41_NAK_LIMIT` (8) consecutive unanswered rounds. Its verdict line names the alternatives a reader
+   needs (an MMC card answers CMD1, not ACMD41; a 1.8 V-signalling card answers neither at 3.3 V). The
+   CMD55/ACMD41 pair is issued under short-circuit `&&`, because ACMD41 is only an *application* command by
+   virtue of the CMD55 immediately before it — a CMD41 issued after a lost CMD55 is the reserved standard
+   command, not the one intended.
+
+**There was no silent `None`.** The stop was witnessed at every step: `cmd_step_at` prints its `FAILED —
+INTERRUPT=… PresentState=… CONTROL0=… CONTROL1=…` line on *every* `Err`, including the rounds whose success
+line is suppressed (`verbose` gates only the `ok` line). All twelve `None` sites in `identify` — SRST
+self-clear, no card seated, 400 kHz clock never stable, the seven `cmd_step` `?`s, the ACMD41 verdicts, the
+CSD refusal, and the 25 MHz raise — print their cause before returning, and did so before this change too.
+The audit is recorded here rather than as a code change because the property already held; a future edit
+that adds a `None` without a line is what this paragraph exists to make visible.
+
+**Three supporting changes.**
+
+- **`csd_capacity_blocks` is now a pure function at file scope**, outside the `tegra`-gated `mod metal`,
+  with `r2_bits` beside it. QEMU models no Tegra234 SDHCI, so the CSD arithmetic is the *only* part of the
+  identification ladder that can be gated off metal, and it is also the part where a wrong answer is a
+  plausible-looking capacity rather than a visible failure — a v1 CSD read with the v2 formula returns a
+  different believable card, not an error. It also now **refuses** a reserved `CSD_STRUCTURE` (2 or 3) and
+  an out-of-range `READ_BL_LEN` instead of decoding them with v1 field offsets, and the caller prints the
+  raw `CSD_STRUCTURE` and the four response words on refusal: "the driver could not read this card's CSD"
+  and "there is no card" are different facts, and only the first was true on that boot.
+- **`reset_cmd_dat` verifies SDHCI 3.00 §3.10.1 recovery.** The SRST bits self-clearing says the *host*
+  finished resetting; the bus has recovered only when CMD and DAT[3:0] have all returned high. A reset that
+  cleared while the card was still driving a line makes the next command's timeout a symptom of the reset
+  rather than a fact about the card — a distinction that was unrecoverable from the render12 capture, which
+  is why it is now a line: `M2: CMD/DAT reset left the bus NON-IDLE (Present State …)`.
+- **The card class is named on its own line**, beside (never replacing) the capacity line the v2 arm has
+  always printed: `M2: identified SDSC v1.x card capacity=<N> MiB byte-addressed`.
+
+**The SDCSD fixture** (`csd_capacity_selftest`, `witness`-gated) runs from both census entry points — the
+virt witness half and the metal recon head — so an armed metal boot certifies its own arithmetic before it
+touches a card, and `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm` gates it off metal:
+
+```
+:: SDCSD: v1=3905536 v2=124735488 refused=2/2 -> PASS ::
+```
+
+Both vectors are built field by field through the same off-by-8 addressing `r2_bits` reads through, so the
+fixture exercises the production extractor rather than a second copy of it. The v1 vector
+(`READ_BL_LEN=10, C_SIZE=3813, C_SIZE_MULT=7` ⇒ 3905536 blocks, 1907 MiB) is the ordinary 2 GB SDSC
+spelling and the class of card that produced this defect. The v2 vector's `C_SIZE=121811` is **back-derived
+from a capacity this bench actually measured** (`[sdhc] verify mbr … CSD capacity 124735488 blocks`, Pi 4
+capture `~/unaos-bench/capture/pi4-r23s1u/ttyACM0.log`); no capture on this bench has ever printed raw CSD
+response words, so the surrounding bits are constructed per the SD Physical Layer spec and only the capacity
+field is bench-sourced. Two negative controls ride with the pair — a reserved `CSD_STRUCTURE` and an illegal
+`READ_BL_LEN`, both of which must be refused — because a decode that returned a number for every input would
+otherwise pass. Go-red proven by mutating the v1 shift (`c_size_mult + 2` → `+ 3`): `v1=7811072 … -> FAIL`,
+`test-arm` rc=1; restored and re-run green.
+
+**What the next armed boot should show**, with the same card in the slot — the SDSC branch is
+**fixed-unflown**, and only metal can say whether the re-idle is what that card wanted:
+
+```
+:: SDCSD: v1=3905536 v2=124735488 refused=2/2 -> PASS ::
+:: SDMMC:   M2: CMD8 no response (INTERRUPT=0x00018000) — SD v1.x card or no v2 support; continuing without HCS ::
+:: SDMMC:   M2: SD v1.x recovery — re-idling before ACMD41 (a card that has just been handed a command it does not implement need not answer the next one) ::
+:: SDMMC:   M2: CMD0 GO_IDLE (v1.x re-idle) ok ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) ok ::
+:: SDMMC:   M2: ACMD41 power-up complete in … round(s) — OCR 0x……… (CCS=0) ::
+:: SDMMC:   M2: capacity 3905536 blocks (1907 MiB, CSD v1), addressing byte (SDSC), legacy ::
+:: SDMMC:   M2: identified SDSC v1.x card capacity=1907 MiB byte-addressed ::
+:: SDMMC: ORIN-SDMMC-1 DONE — microSD censused: … (READ-ONLY; no card write) ::
+[vfs] volume mounted /volumes/UNAOS-DATA source=tegra-sd rw=no ::
+```
+
+with `tegra-sd=present` on the `[vfs] root =` line. **The stranger card is HOMESOIL's business, not this
+driver's, and HOMESOIL does mount it** — read-only, at `/volumes/<its own label>`, with its posture sampled
+from the backend being mounted (`fs/bootdisk.rs::bind`). It is never a root candidate and never written:
+`BlockSource::TegraSd` is write-vetoed in every cfg. If the re-idle is not enough, the retry loop's verdict
+line now says how many of how many rounds went unanswered, which is the datum the next arc needs.
+
 #### ORIN-SDMMC-2 — the write path behind the paranoia ladder (`UNAOS_SDMMC_ARM`, a SEPARATE arm on top of `UNAOS_SDMMC`)
 
 **Double-gating (the seated card is sacred).** The write path is gated on a **second, separate** explicit arm

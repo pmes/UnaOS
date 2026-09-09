@@ -73,6 +73,149 @@
 /// block, exactly as NET-4 uses `:: PCIE4:`.
 const PS: &str = ":: SDMMC:";
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// CSD capacity decode — PURE, and deliberately outside `mod metal`.
+//
+// QEMU models no Tegra234 SDHCI, so nothing in the identification ladder can be exercised off metal
+// — except this. The CSD arithmetic is the one part of the ladder that is a function of bits rather
+// than of a controller, and it is also the part where a wrong answer is a plausible-looking capacity
+// instead of a visible failure. Factored out here so `csd_capacity_selftest` can gate it under QEMU.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Extract bit range `[hi:lo]` from a 136-bit R2 response (CID or CSD). SDHCI strips the CRC byte and
+/// shifts the 120-bit content right 8, so register bit `b` (b >= 8) lands at overall response bit
+/// `b-8` (the classic off-by-8 — identical for CID and CSD). `resp[i]` holds response bits
+/// `[32i+31 : 32i]`.
+fn r2_bits(resp: &[u32; 4], hi: u32, lo: u32) -> u64 {
+    let mut val = 0u64;
+    let mut b = hi;
+    loop {
+        let r = b - 8;
+        let bit = (resp[(r / 32) as usize] >> (r % 32)) & 1;
+        val = (val << 1) | bit as u64;
+        if b == lo {
+            break;
+        }
+        b -= 1;
+    }
+    val
+}
+
+/// Decode a card's capacity in 512-byte blocks from its CMD9 CSD (the four SDHCI response registers),
+/// returning `(blocks, csd_version)`.
+///
+/// * **CSD v2** (`CSD_STRUCTURE = 1`; SDHC/SDXC) — capacity is one field:
+///   `blocks = (C_SIZE[69:48] + 1) * 1024`. READ_BL_LEN is fixed at 9 and takes no part.
+/// * **CSD v1** (`CSD_STRUCTURE = 0`; SDSC) — capacity is a product of three:
+///   `blocks = (C_SIZE[73:62] + 1) * 2^(C_SIZE_MULT[49:47] + 2) * 2^READ_BL_LEN[83:80] / 512`.
+///   READ_BL_LEN is legally 9, 10 or 11 (512/1024/2048), and the ordinary 2 GB SDSC spelling uses
+///   **10** — which is why a v1 CSD read with the v2 formula does not come out visibly broken, it
+///   comes out as a different plausible card.
+///
+/// Returns `None` — never a guess — for a CSD that names no usable layout or capacity: a reserved
+/// `CSD_STRUCTURE` (2 or 3), an out-of-range READ_BL_LEN, an overflowing product, or a decoded zero.
+/// This is deliberately stricter than the "anything that is not 1 is v1" spelling it replaces: a
+/// reserved structure means the field offsets are unknown, and decoding unknown offsets is how a
+/// census invents a card. The caller prints the refusal with the raw `CSD_STRUCTURE` beside it, so
+/// the operator sees the card the driver could not read rather than a silent absence.
+fn csd_capacity_blocks(csd: &[u32; 4]) -> Option<(u64, u8)> {
+    match r2_bits(csd, 127, 126) {
+        1 => {
+            let c_size = r2_bits(csd, 69, 48);
+            let blocks = (c_size + 1).checked_mul(1024)?;
+            if blocks == 0 {
+                return None;
+            }
+            Some((blocks, 2u8))
+        }
+        0 => {
+            let read_bl_len = r2_bits(csd, 83, 80) as u32;
+            if !(9..=11).contains(&read_bl_len) {
+                return None;
+            }
+            let c_size = r2_bits(csd, 73, 62);
+            let c_size_mult = r2_bits(csd, 49, 47) as u32;
+            let mult = 1u64 << (c_size_mult + 2);
+            let block_len = 1u64 << read_bl_len;
+            let blocks = (c_size + 1).checked_mul(mult)?.checked_mul(block_len)? / 512;
+            if blocks == 0 {
+                return None;
+            }
+            Some((blocks, 1u8))
+        }
+        _ => None,
+    }
+}
+
+/// SDCSD fixture: the CSD capacity decode's known-answer tests. Runs on ANY `sdmmc` build — metal or
+/// QEMU virt — because it touches no controller, which is the whole reason the decode was factored
+/// out. One uncounted `:: SDCSD: … ::` line; no MMIO, no allocation, no card.
+///
+/// Both vectors are built FIELD BY FIELD through `put`, which uses the same off-by-8 addressing
+/// `r2_bits` reads through, so the fixture exercises the production extractor rather than a second
+/// copy of it. Built rather than pasted as opaque words so a reader can check each field placement
+/// against the spec table without a decoder:
+///
+/// * **v1 (SDSC)** — `READ_BL_LEN=10, C_SIZE=3813, C_SIZE_MULT=7` ⇒ 3905536 blocks (1907 MiB). That
+///   is the ordinary 2 GB SDSC spelling, and the class of card in the Orin's slot on render12 boot 2
+///   (a 1.9 GB FAT volume labelled `UNAOS-DATA`) — the boot that exposed the ladder's v1.x stop.
+/// * **v2 (SDHC)** — `C_SIZE=121811` ⇒ 124735488 blocks. The C_SIZE is BACK-DERIVED from a capacity
+///   this bench actually measured (`[sdhc] verify mbr … CSD capacity 124735488 blocks`, Pi 4 capture
+///   `~/unaos-bench/capture/pi4-r23s1u/ttyACM0.log`). No capture on this bench has ever printed the
+///   raw CSD response words, so the surrounding bits are CONSTRUCTED per the spec and only the
+///   capacity field is bench-sourced. Said out loud rather than presented as a captured vector.
+///
+/// Two negative controls ride with them — a reserved `CSD_STRUCTURE` and an illegal `READ_BL_LEN`,
+/// both of which must be REFUSED. Without them a decode that returned a number for every input would
+/// pass: the corpus has to be able to produce more than one outcome.
+#[cfg(feature = "witness")]
+pub fn csd_capacity_selftest() {
+    /// Place `val` into response bits `[hi:lo]` of a 136-bit R2 image. ORs, never clears — the vectors
+    /// below start from zero, and the negative controls deliberately widen a field they inherit.
+    fn put(resp: &mut [u32; 4], hi: u32, lo: u32, val: u64) {
+        let mut b = lo;
+        let mut i = 0u32;
+        while b <= hi {
+            if (val >> i) & 1 != 0 {
+                let r = b - 8;
+                resp[(r / 32) as usize] |= 1 << (r % 32);
+            }
+            b += 1;
+            i += 1;
+        }
+    }
+
+    let mut v1 = [0u32; 4];
+    put(&mut v1, 127, 126, 0); // CSD_STRUCTURE = 0 (v1.0)
+    put(&mut v1, 83, 80, 10); // READ_BL_LEN = 10 => 1024-byte read block
+    put(&mut v1, 73, 62, 3813); // C_SIZE
+    put(&mut v1, 49, 47, 7); // C_SIZE_MULT = 7 => mult 2^9
+
+    let mut v2 = [0u32; 4];
+    put(&mut v2, 127, 126, 1); // CSD_STRUCTURE = 1 (v2.0)
+    put(&mut v2, 83, 80, 9); // READ_BL_LEN fixed at 9; takes no part in the v2 formula
+    put(&mut v2, 69, 48, 121_811); // C_SIZE
+
+    // Negative controls, each a one-field mutation of the v1 vector.
+    let mut bad_struct = v1;
+    put(&mut bad_struct, 127, 126, 3); // reserved CSD_STRUCTURE
+    let mut bad_bl = v1;
+    put(&mut bad_bl, 83, 80, 15); // READ_BL_LEN outside the legal 9..=11
+
+    let a = csd_capacity_blocks(&v1);
+    let b = csd_capacity_blocks(&v2);
+    let refused = csd_capacity_blocks(&bad_struct).is_none() as u32
+        + csd_capacity_blocks(&bad_bl).is_none() as u32;
+    let pass = a == Some((3_905_536, 1)) && b == Some((124_735_488, 2)) && refused == 2;
+    serial_println!(
+        ":: SDCSD: v1={} v2={} refused={}/2 -> {} ::",
+        a.map(|(n, _)| n).unwrap_or(0),
+        b.map(|(n, _)| n).unwrap_or(0),
+        refused,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
 // ── The witness half (virt / non-tegra build): one honest line, zero MMIO ──────────────────────────
 
 /// The QEMU-safe witness: on a `sdmmc`-but-not-`tegra` build (QEMU models no Tegra234 SDMMC controller),
@@ -85,6 +228,10 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
         "{} ORIN-SDMMC-1 Tegra234 microSD recon compiled; no Tegra234 SDMMC on this build (QEMU virt) — recon is metal-only (UNAOS_SDMMC=1 UNAOS_TEGRA=1) ::",
         PS
     );
+    // SDCSD: the one part of the identification ladder that needs no controller. It runs HERE, on the
+    // virt build, because this is the only place the ladder's arithmetic can be gated off metal.
+    #[cfg(feature = "witness")]
+    csd_capacity_selftest();
     // ORIN-SDMMC-2: when the write ARM is compiled in on a virt build, one honest metal-only line — the
     // paranoia ladder touches a real Tegra234 SDMMC controller QEMU does not model, so there is nothing to
     // write here and we do zero MMIO. Mirrors the census witness above.
@@ -126,7 +273,9 @@ pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blo
 
 #[cfg(feature = "tegra")]
 mod metal {
-    use super::PS;
+    // `r2_bits` and `csd_capacity_blocks` live at FILE scope, not here: the CSD arithmetic is the only
+    // part of the ladder QEMU can execute, so it had to leave the `tegra`-gated module to be gatable.
+    use super::{csd_capacity_blocks, r2_bits, PS};
     use crate::arch::aarch64::fdt_tegra::{Fdt, PropWords};
 
     // ── SDHCI register offsets (32-bit views — identical to the Pi `emmc2` model, standard SDHCI) ──
@@ -183,6 +332,12 @@ mod metal {
     const ST_CMD_INHIBIT: u32 = 1 << 0;
     const ST_DAT_INHIBIT: u32 = 1 << 1;
     const ST_CARD_INSERTED: u32 = 1 << 16;
+    /// DAT[3:0] Line Signal Level and CMD Line Signal Level. An idle SD bus pulls all five HIGH, which
+    /// is how SDHCI 3.00 §3.10.1 defines "error recovery complete" after a command timeout: the SRST
+    /// bits self-clearing says the HOST finished resetting, not that the CARD let go of the bus.
+    const ST_DAT30_LEVEL: u32 = 0xf << 20;
+    const ST_CMD_LEVEL: u32 = 1 << 24;
+    const ST_BUS_IDLE: u32 = ST_DAT30_LEVEL | ST_CMD_LEVEL;
 
     // ── CONTROL1 (0x2C) bits. ──
     const C1_CLK_INTLEN: u32 = 1 << 0;
@@ -314,25 +469,6 @@ mod metal {
     #[inline]
     fn read_resp(base: u64) -> [u32; 4] {
         [read32(base, RESP0), read32(base, RESP1), read32(base, RESP2), read32(base, RESP3)]
-    }
-
-    /// Extract bit range `[hi:lo]` from a 136-bit R2 response (CID or CSD). SDHCI strips the CRC byte and
-    /// shifts the 120-bit content right 8, so register bit `b` (b >= 8) lands at overall response bit
-    /// `b-8` (the classic off-by-8 — identical for CID and CSD). `resp[i]` holds response bits
-    /// `[32i+31 : 32i]`.
-    fn r2_bits(resp: &[u32; 4], hi: u32, lo: u32) -> u64 {
-        let mut val = 0u64;
-        let mut b = hi;
-        loop {
-            let r = b - 8;
-            let bit = (resp[(r / 32) as usize] >> (r % 32)) & 1;
-            val = (val << 1) | bit as u64;
-            if b == lo {
-                break;
-            }
-            b -= 1;
-        }
-        val
     }
 
     /// Resolve the SD base clock in Hz: CAPABILITIES[15:8] MHz if nonzero, else the documented assumed
@@ -509,21 +645,68 @@ mod metal {
                 false
             }
         };
+        // 7b. SDV1: RE-IDLE before the ACMD41 loop when CMD8 went unanswered.
+        //
+        //     render12 boot 2 is the wire this exists for. A 1.9 GB SDSC card (label UNAOS-DATA) in the
+        //     Orin's slot: CMD0 ok, CMD8 timed out exactly as an SD v1.x card requires — and then the
+        //     very next command, CMD55, timed out too, with the SAME INTERRUPT (0x00018000) and an
+        //     otherwise healthy Present State. The card had gone quiet, not absent.
+        //
+        //     A card is not obliged to be responsive on the command AFTER one it does not implement, and
+        //     the fix every mature host applies is to put it back in idle before starting over: U-Boot's
+        //     `sd_send_op_cond()` opens with `mmc_go_idle(mmc)` under the comment "Some cards seem to
+        //     need this". CMD0 is broadcast, needs no response, and costs one command — so this is
+        //     unconditional recovery, not a guess about which card is in the slot. It runs only on the
+        //     v1.x branch, leaving the v2 path (which reached ACMD41 on this bench for two rounds of
+        //     boots) byte-for-byte the sequence it already flew.
+        if !sdhc_capable {
+            serial_println!(
+                "{}   M2: SD v1.x recovery — re-idling before ACMD41 (a card that has just been handed a command it does not implement need not answer the next one) ::",
+                PS
+            );
+            cmd_step(base, "CMD0 GO_IDLE (v1.x re-idle)", cmd(0) | CMD_RESP_NONE, 0)?;
+            delay_ms(2);
+        }
+
         // 8. ACMD41 loop (bounded ~1 s): CMD55 (APP_CMD) then ACMD41 (SD_SEND_OP_COND) with HCS + the
         //    3.3 V window, until power-up-busy (RESP0[31]) clears. ccs = RESP0[30].
         //    HCS (bit 30) is asserted ONLY when CMD8 was answered — a v1.x card must not be told the host
         //    supports high capacity. The loop paces itself (the card is allowed to stay busy for up to a
         //    second; hammering it back-to-back is not required and upsets some cards) and counts its
         //    rounds so the witness says how long power-up actually took.
+        //
+        //    SDV1: an unanswered CMD55 or ACMD41 is a RETRY, not the end of the ladder. The loop used to
+        //    `?` out of `cmd_step_at` on the first timeout, throwing away the ~1000 ms of power-up budget
+        //    it had just declared — so "STOP" was printed for a card that had been asked once. Both
+        //    commands now go through `cmd_retry`, and only the loop decides the ladder is over: when the
+        //    budget expires, or when the card has ignored `ACMD41_NAK_LIMIT` consecutive attempts, which
+        //    is the honest "nothing on this bus is answering the SD application-command protocol".
+        const ACMD41_NAK_LIMIT: u32 = 8;
         let acmd41_arg = if sdhc_capable { 0x40ff_8000 } else { 0x00ff_8000 };
         let acmd41_deadline = deadline_ms(ACMD41_TIMEOUT_MS);
         let mut ocr;
         let mut rounds = 0u32;
+        let mut naks = 0u32;
         loop {
             rounds += 1;
             let first = rounds == 1; // one witness for the first round; the rest are summarised below
-            cmd_step_at(base, "CMD55 APP_CMD (before ACMD41)", cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0, first)?;
-            cmd_step_at(base, "ACMD41 SD_SEND_OP_COND", cmd(41) | CMD_RESP_48, acmd41_arg, first)?;
+            // The pair is atomic by protocol: ACMD41 is only an ACMD because CMD55 immediately preceded
+            // it, so a CMD55 that went unanswered must NOT be followed by the CMD41 — that would issue
+            // the standard CMD41, which is reserved. Short-circuit `&&` is what enforces that ordering.
+            if !cmd_retry(base, "CMD55 APP_CMD (before ACMD41)", cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0, first)
+                || !cmd_retry(base, "ACMD41 SD_SEND_OP_COND", cmd(41) | CMD_RESP_48, acmd41_arg, first)
+            {
+                naks += 1;
+                if naks >= ACMD41_NAK_LIMIT || expired(acmd41_deadline) {
+                    serial_println!(
+                        "{}   M2: APP_CMD/ACMD41 unanswered on {} of {} round(s) within the {} ms power-up budget — nothing on this bus is speaking the SD application-command protocol (an MMC card answers CMD1, not ACMD41; a 1.8 V-signalling card answers neither at 3.3 V) — STOP ::",
+                        PS, naks, rounds, ACMD41_TIMEOUT_MS
+                    );
+                    return None;
+                }
+                delay_ms(10);
+                continue;
+            }
             ocr = read32(base, RESP0);
             if ocr & (1 << 31) != 0 {
                 break;
@@ -556,24 +739,17 @@ mod metal {
         // 11. CMD9 SEND_CSD (R2) — card must be in stand-by (post-CMD3, pre-CMD7). Parse capacity.
         cmd_step(base, "CMD9 SEND_CSD", cmd(9) | CMD_RESP_136 | CMD_CRCCHK, rca_arg)?;
         let csd = read_resp(base);
-        let csd_structure = r2_bits(&csd, 127, 126);
-        let (num_blocks, csd_version) = if csd_structure == 1 {
-            // CSD v2 (SDHC/SDXC): C_SIZE = CSD[69:48]; blocks = (C_SIZE+1)*1024.
-            let c_size = r2_bits(&csd, 69, 48);
-            ((c_size + 1) * 1024, 2u8)
-        } else {
-            // CSD v1 (SDSC): blocks(512) = (C_SIZE+1) * 2^(C_SIZE_MULT+2) * 2^READ_BL_LEN / 512.
-            let read_bl_len = r2_bits(&csd, 83, 80) as u32;
-            let c_size = r2_bits(&csd, 73, 62);
-            let c_size_mult = r2_bits(&csd, 49, 47) as u32;
-            let mult = 1u64 << (c_size_mult + 2);
-            let block_len = 1u64 << read_bl_len;
-            ((c_size + 1) * mult * block_len / 512, 1u8)
-        };
-        if num_blocks == 0 {
-            serial_println!("{}   M2: CSD decoded 0 capacity — STOP (won't census a zero-size card) ::", PS);
+        // SDV1: the decode is `super::csd_capacity_blocks` — one pure function, gated off metal by the
+        // SDCSD fixture, refusing rather than guessing (see its contract). The `None` arm prints the raw
+        // CSD_STRUCTURE, because "the driver could not read this card's CSD" and "there is no card" are
+        // different facts and only one of them is true here.
+        let Some((num_blocks, csd_version)) = csd_capacity_blocks(&csd) else {
+            serial_println!(
+                "{}   M2: CSD names no usable capacity (CSD_STRUCTURE={}, raw {:#010x}{:08x}{:08x}{:08x}) — STOP (won't census a card whose layout we cannot read) ::",
+                PS, r2_bits(&csd, 127, 126), csd[3], csd[2], csd[1], csd[0]
+            );
             return None;
-        }
+        };
         let mib = num_blocks * 512 / (1024 * 1024);
         serial_println!(
             "{}   M2: capacity {} blocks ({} MiB, CSD v{}), addressing {}, {} ::",
@@ -581,6 +757,16 @@ mod metal {
             if block_addressing { "block (SDHC/SDXC)" } else { "byte (SDSC)" },
             if sdhc_capable { "v2 (CMD8 ok)" } else { "legacy" }
         );
+        // SDV1: name the CLASS on its own line. The capacity line above says four things at once and a
+        // reader has to assemble the verdict from them; this says which of the two card generations the
+        // ladder just identified, in the words the bench runbook and the ledger use. The v2 arm keeps
+        // the line it always printed — this is an addition beside it, not a replacement.
+        if csd_version == 1 && !block_addressing {
+            serial_println!(
+                "{}   M2: identified SDSC v1.x card capacity={} MiB byte-addressed ::",
+                PS, mib
+            );
+        }
 
         // 12. CMD7 SELECT_CARD (R1b) -> transfer state.
         cmd_step(base, "CMD7 SELECT_CARD", cmd(7) | CMD_RESP_48_BUSY | CMD_CRCCHK | CMD_IXCHK, rca_arg)?;
@@ -2563,6 +2749,10 @@ mod metal {
             "{} ORIN-SDMMC-1 Tegra234 microSD READ-ONLY recon (DTB @{:#x} size={:#x}) ::",
             PS, dtb_addr, dtb_size
         );
+        // SDCSD: the CSD decode's KATs, run on metal too. The fixture is the SAME function the ladder
+        // below calls, so an armed metal boot certifies its own arithmetic before it touches a card.
+        #[cfg(feature = "witness")]
+        super::csd_capacity_selftest();
 
         // ── M1: resolve the microSD-slot controller from the live DTB ──
         let Some((base, size, clk_ids, n_clks)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
@@ -2778,6 +2968,20 @@ mod metal {
             serial_println!("{}   M2: CMD/DAT line reset did not self-clear (controller wedged) ::", PS);
         }
         write32(base, INTERRUPT, 0xffff_ffff);
+        // SDHCI 3.00 §3.10.1 finishes the command-timeout recovery here, not at the self-clear: the bus
+        // has recovered only when CMD and DAT[3:0] have all returned HIGH. A reset whose bits cleared
+        // while the card is still driving a line is a reset that did NOT recover the bus, and the NEXT
+        // command's timeout is then a symptom of this one rather than a fact about the card. Witnessed
+        // because that distinction is unrecoverable from a capture otherwise — render12 boot 2 showed a
+        // CMD8 timeout followed by a CMD55 timeout and there was no line saying which of the two states
+        // the bus was in between them.
+        let st = read32(base, STATUS);
+        if st & ST_BUS_IDLE != ST_BUS_IDLE {
+            serial_println!(
+                "{}   M2: CMD/DAT reset left the bus NON-IDLE (Present State {:#010x}: CMD level {}, DAT[3:0] {:#x}) — the card is still driving it ::",
+                PS, st, (st >> 24) & 1, (st >> 20) & 0xf
+            );
+        }
     }
 
     /// Issue one NAMED identification command, witnessing both outcomes. `None` (which `?` turns into the
@@ -2785,6 +2989,34 @@ mod metal {
     /// what the controller had latched — the thing boot 3 could not tell us.
     fn cmd_step(base: u64, name: &str, cmdtm: u32, arg: u32) -> Option<()> {
         cmd_step_at(base, name, cmdtm, arg, true)
+    }
+
+    /// `cmd_step` for a command that is ALLOWED to fail and be retried, returning `bool` rather than the
+    /// `Option` whose `?` ends the ladder.
+    ///
+    /// The distinction is load-bearing (SDV1, render12 boot 2): the ACMD41 power-up poll owns a whole
+    /// second of budget for the card to leave busy, but every command inside it used to go through
+    /// `cmd_step_at`, whose `?` abandoned the ladder on the FIRST unanswered CMD55 — discarding the
+    /// remaining ~1000 ms and printing "STOP" for a card that had not been given a second chance to
+    /// answer anything. A command timeout during power-up is a retry, not a verdict; the verdict is the
+    /// loop's, once the budget is spent, and it is the loop that prints it.
+    fn cmd_retry(base: u64, name: &str, cmdtm: u32, arg: u32, verbose: bool) -> bool {
+        match send_command(base, cmdtm, arg) {
+            Ok(()) => {
+                if verbose {
+                    serial_println!("{}   M2: {} ok ::", PS, name);
+                }
+                true
+            }
+            Err(int) => {
+                serial_println!(
+                    "{}   M2: {} unanswered — INTERRUPT={:#010x} PresentState={:#010x} — retrying inside the power-up budget ::",
+                    PS, name, int, read32(base, STATUS)
+                );
+                reset_cmd_dat(base);
+                false
+            }
+        }
     }
 
     /// `cmd_step` with the success line suppressed — for the ACMD41 poll, whose rounds are summarised
