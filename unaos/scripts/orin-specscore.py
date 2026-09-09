@@ -551,16 +551,29 @@ def main():
         print()
         for d in directives:
             where = f"{os.path.basename(args.spec)}:{d.spec_line}" if not d.builtin else "mbench DEFAULT_FORBIDS"
-            # QUOTED (pi 9, review of this change): the pattern is DELIMITED, not bare. `parse_spec`
-            # `.strip()`s the line, so a stored pattern cannot CARRY a trailing space -- which makes
-            # the interesting reader the one who WROTE `FORBID span_blocks=2048 ` and is asking why
-            # their bound does not bind. Bare output shows `span_blocks=2048` and the space's
-            # ABSENCE reads past easily; quoted, it is unmistakable. That inversion -- a trailing
-            # space the parser deletes, turning a bound key into an unbounded one -- is a real
-            # incident, and this tool is where someone would come to diagnose it. Quotes are added
-            # by hand rather than with `!r`, because `repr()` doubles the backslashes that every
-            # regex in these specs is made of and would misreport the pattern it is clarifying.
-            print(f"   {d.label():<12} {where:<28} '{d.pattern}'")
+            # DELIMITED, not bare (pi 9, review of this change): `parse_spec` `.strip()`s the line
+            # (`mbench.py:256`), so a stored pattern cannot CARRY a trailing space -- which makes the
+            # reader who matters the one who WROTE `FORBID span_blocks=2048 ` and is asking why their
+            # bound does not bind. Bare, the space's ABSENCE reads past easily; delimited, it is
+            # unmistakable. That inversion is a real incident: a trailing space the parser deletes,
+            # turning a bound key into an unbounded one, and this tool is where it gets diagnosed.
+            #
+            # WHICH DELIMITER, measured over the corpus rather than chosen by taste -- 692
+            # spec-authored directives across 11 specs contain: single-quote 7, double-quote 3,
+            # BACKTICK 0. The first cut of this used single quotes and rendered
+            # `:: SCHED: task 'el0-midden' -> core` with four identical quote characters, which is
+            # precisely the ambiguity the delimiter was added to remove (pi 9 again, on a pattern in
+            # their own file that this tool's acceptance spec does not contain).
+            #
+            # AND THE CHOICE IS ASSERTED, NOT ASSUMED. "Zero collisions today" is a fact about
+            # today's corpus, and a delimiter nothing contains is a delimiter nothing TESTS. So a
+            # pattern carrying the delimiter is NAMED on its own row instead of rendering ambiguous
+            # output: the day a spec gains a backtick, this says so rather than quietly lying.
+            # `repr()` is NOT used for any of it -- it doubles the backslashes every regex here is
+            # made of, so the tool would misreport the pattern it exists to clarify.
+            DELIM = "`"
+            clash = " ⚠ pattern contains the delimiter — this row's quoting is ambiguous" if DELIM in d.pattern else ""
+            print(f"   {d.label():<12} {where:<28} {DELIM}{d.pattern}{DELIM}{clash}")
         print()
         print("   * = builtin: NOT in the spec file, enforced anyway. A grep over the spec "
               "cannot see these.")
