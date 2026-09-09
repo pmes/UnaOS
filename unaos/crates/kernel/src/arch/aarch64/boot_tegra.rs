@@ -239,7 +239,7 @@ pub unsafe fn drop_to_el1(l1_pa: u64) {
     // drop on its own core (see the ORIN-EL1AP block at the file tail). Placed BEFORE the drop rather
     // than after because there is no "after" on this side — `drop_el2_to_el1_tegra` returns to our
     // CALLER, not to us. Knob-off the statement does not exist.
-    #[cfg(feature = "orinel1ap")]
+    #[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
     EL1_ROOT.store(l1_pa, core::sync::atomic::Ordering::Release);
     unsafe {
         enable_el1_regime(l1_pa);
@@ -319,18 +319,101 @@ pub unsafe fn drop_to_el1(l1_pa: u64) {
 /// Generous on purpose: the BSP reaches its drop only after PCIe/USB/SD enumeration, and a budget
 /// tight enough to expire during a slow probe would turn a healthy boot into a refusal. Bounded all
 /// the same — a BSP that never drops must not park an AP forever.
-#[cfg(feature = "orinel1ap")]
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 const EL1AP_ROOT_WAIT_S: u64 = 30;
 
 /// ORIN-EL1AP — the EL1 root the BSP ACTUALLY installed (`mmu_tegra`'s `L1_EL1` PA), published by
 /// [`drop_to_el1`] on its way through. Zero = the BSP has not dropped yet, which is why zero is the
 /// value the AP refuses on rather than a sentinel it could mistake for a table at PA 0.
-#[cfg(feature = "orinel1ap")]
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 static EL1_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// ORIN-EL1AP — the single AP-at-EL1 seat. `swap(true)` is the claim; there is no release.
-#[cfg(feature = "orinel1ap")]
-static EL1AP_SEAT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// ORIN-APSRUN (orin 23) — EVERY secondary drops, not one
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// PETER'S DEFECT, VERBATIM: "WE ARE STILL ONLY ON ONE CORE". render11's wire is the proof, and it is
+// NOT the tick — every AP already has one. `:: AARCH64 SMP: c1..c5 timer PPI live (tick 1) ::` says
+// all five armed their own 250 Hz CNTP through `timer::arm_this_core_ap`, and each then entered
+// `sched::secondary_run` -> `run()`. `online=0x3f` on the `[bsprun] host` line says the scheduler
+// agrees. The field on that same line that does NOT is `el1cores=0x1`.
+//
+// So the parked-AP diagnosis in the baton ("the five secondaries are parked after CPU_ON because the
+// AP timer PPI stretch was deferred") is FALSIFIED BY THE WIRE and the real park is one layer up: the
+// APs replay the BSP's **EL2** regime and stay there, `EL1_CORE_MASK` therefore holds only the BSP's
+// bit, and `el0_placement_possible` (sched.rs, the predicate `spawn_user_image_bg` refuses on) admits
+// exactly one core. Every EL0 tenant — shell, render pump, pointer poll, every `bg` — is funnelled
+// onto core 0 while five ticking cores steal nothing but kernel tasks. That is "one core" as the
+// operator experiences it, and it is why the pointer goes sluggish under load.
+//
+// The `:: AARCH64 SMP: ... AP timer PPI stretch deferred (JC3) ::` line the baton quotes is STALE
+// PROSE in `start_secondaries_tegra` — the BSP prints it before the APs reach `arm_this_core_ap`, and
+// JC3 promoted the stretch long ago. This arc corrects that line rather than acting on it.
+//
+// WHAT CHANGES: ORIN-EL1AP's seat count, and nothing else about the drop. Candidate C deliberately
+// took ONE seat as the minimum blast radius for a first flight; that flight's mechanism — reuse the
+// BSP's `enable_el1_regime` + `drop_el2_to_el1_tegra` verbatim on the AP, re-seed TPIDR_EL1, reinstall
+// VBAR_EL1, stamp, unmask — is unchanged here, statement for statement. Only [`EL1AP_SEATS`] moves,
+// from 1 to unbounded, so `el1cores` grows to `0x3f` and the EL1-filtered candidate set becomes the
+// whole machine. sched.rs's own EL0-EL1CORE block already names this as the disposal condition:
+// "WHEN TO DELETE THIS: when the `smp_virt` secondaries drop to EL1 before entering `secondary_run`."
+//
+// NO PROTECTION IS TOUCHED. The drop installs `L1_EL1` — the EL1-precise twin, RAM at AP[2:1]=0b00
+// (EL1 RW, no EL0 access, EL1-executable) and Device UXN|PXN|nGnRE — on each AP exactly as on the
+// BSP. SCTLR_EL1 is the same absolute M|C|I|RES1 literal. WXN, the page permissions, and the EL0
+// window's own tables are untouched by this arc; the change is arithmetic on a seat counter.
+
+/// ORIN-APSRUN — how many APs may take the EL1 seat. ORIN-EL1AP's `1` was the deliberate minimum for
+/// its first flight; APSRUN lifts the cap so every `/cpus`-named secondary drops and stamps.
+///
+/// A CONSTANT, NOT A KNOB, and the two polarities are two `#[cfg]` arms rather than a runtime bound,
+/// so `UNAOS_ORINEL1AP=1` still builds the exact one-seat image that flew — the fallback rung if a
+/// bench flight has to bisect "one AP at EL1" against "all five".
+#[cfg(feature = "apsrun")]
+const EL1AP_SEATS: usize = usize::MAX;
+#[cfg(all(feature = "orinel1ap", not(feature = "apsrun")))]
+const EL1AP_SEATS: usize = 1;
+
+/// ORIN-EL1AP/APSRUN — how many APs have claimed an EL1 seat. A monotonic counter, never released: a
+/// core that claimed and then failed does NOT hand the seat back, because a core that could not
+/// complete the drop is evidence about the platform, not a transient.
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
+static EL1AP_SEAT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// ORIN-APSRUN — publish the EL1 root the BSP is going to install, BEFORE `start_secondaries_tegra`
+/// issues its first `CPU_ON`, so no AP ever waits for it.
+///
+/// WHY THIS EXISTS AND WHY IT IS NOT MERELY AN OPTIMISATION. ORIN-EL1AP's claimant waits for
+/// [`drop_to_el1`] to publish, which happens at `main.rs`'s JM6 drop — past the entire PCIe/xHCI/SD
+/// probe stretch. With ONE claimant that wait is a curiosity. With five it is a HAZARD WITH A METAL
+/// PRECEDENT: `timer.rs`'s `this_core_has_local_tick` records boot-12, where five Orin cores spinning
+/// against shared state starved the boot core's cooperative xHCI HID poll into "keyboard+mouse armed
+/// but ZERO deliveries". Five cores spinning through the probe stretch is that shape again, and the
+/// fix is to delete the wait rather than to tune it.
+///
+/// IT IS THE SAME VALUE, FROM THE SAME EXPRESSION. The call site passes `mmu.ttbr0_el1` — the literal
+/// argument `main.rs` hands [`drop_to_el1`] eighty lines later — so this is not a second reference
+/// that could drift from the BSP's table; it is the same one, read once and used twice. `drop_to_el1`
+/// still stores it on its way through (idempotent: the same value), so the ONE-publisher discipline
+/// holds and an `orinel1ap`-only build, which has no call to this, is completely unaffected.
+///
+/// Storing zero is refused rather than published: zero is the value [`drop_ap_to_el1`] waits ON, and
+/// a caller with no table must leave the APs waiting for the real one, not race past a false root.
+#[cfg(feature = "apsrun")]
+pub fn publish_el1_root(l1_pa: u64) {
+    use core::sync::atomic::Ordering;
+    if l1_pa == 0 {
+        serial_println!(
+            ":: tegra: [apsrun] EL1 root NOT published — l1_pa=0; every AP will wait for the BSP drop instead ::"
+        );
+        return;
+    }
+    EL1_ROOT.store(l1_pa, Ordering::Release);
+    serial_println!(
+        ":: tegra: [apsrun] EL1 root published EARLY (TTBR0_EL1={:#x}) — APs drop without waiting on the BSP ::",
+        l1_pa
+    );
+}
 
 /// ORIN-EL1AP — the claiming AP's own copy of the four EL2 registers `drop_el2_to_el1_tegra` latches
 /// (same order as [`JM6_EL2_LATCH`]: HCR_EL2, CNTHCTL_EL2, ICC_SRE_EL1, ICC_SRE_EL2).
@@ -340,7 +423,14 @@ static EL1AP_SEAT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// reads back from RAM precisely BECAUSE those registers are unreadable at EL1. So the AP snapshots
 /// the latch before its drop and restores it after, publishing its own four values here instead. The
 /// restore is what keeps `[irqel2a]` honest; this array is the AP's half of the same evidence.
-#[cfg(feature = "orinel1ap")]
+///
+/// ORIN-APSRUN — with five claimants this is LAST-WRITER-WINS, and that is the correct reading rather
+/// than a defect to fix. The four values are properties of the DROP SEQUENCE, not of the core: every
+/// AP runs the same asm and latches HCR_EL2/CNTHCTL_EL2/ICC_SRE_EL1/ICC_SRE_EL2 to the same
+/// architectural values, so "some AP's post-drop latch" and "every AP's post-drop latch" are the same
+/// reading. What would NOT have been safe is the per-core snapshot this pairs with — see
+/// [`capture_bsp_latch_once`], which is where five seats needed real new code.
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 pub static JM6_AP_LATCH: [core::sync::atomic::AtomicU64; 4] = [
     core::sync::atomic::AtomicU64::new(0),
     core::sync::atomic::AtomicU64::new(0),
@@ -352,7 +442,7 @@ pub static JM6_AP_LATCH: [core::sync::atomic::AtomicU64; 4] = [
 /// `(HCR_EL2, CNTHCTL_EL2, ICC_SRE_EL1, ICC_SRE_EL2)`. All zeroes means no AP has dropped, which is
 /// honest for the same reason [`jm6_el2_latch`]'s is: HCR_EL2 is never legitimately 0 after the drop
 /// (it always sets RW, bit 31).
-#[cfg(feature = "orinel1ap")]
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 pub fn jm6_ap_latch() -> (u64, u64, u64, u64) {
     use core::sync::atomic::Ordering;
     (
@@ -361,6 +451,59 @@ pub fn jm6_ap_latch() -> (u64, u64, u64, u64) {
         JM6_AP_LATCH[2].load(Ordering::Relaxed),
         JM6_AP_LATCH[3].load(Ordering::Relaxed),
     )
+}
+
+/// ORIN-APSRUN — the BSP's four `JM6_EL2_LATCH` values, captured once, before ANY AP has dropped.
+/// Zero-initialised and only ever written by the one-shot capture below, so the state "not yet
+/// captured" is distinguishable from any legitimate captured value (HCR_EL2 is never 0 after the
+/// drop — it always sets RW, bit 31).
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
+static JM6_BSP_LATCH: [core::sync::atomic::AtomicU64; 4] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// ORIN-APSRUN — the capture's three-state gate: 0 = untouched, 1 = a core is mid-capture, 2 = the
+/// four values are published. Three states and not a `bool` because a loser must be able to WAIT for
+/// the winner's stores rather than read a half-written snapshot; the Acquire/Release pair on state 2
+/// is what publishes them.
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
+static JM6_BSP_LATCH_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// ORIN-APSRUN — return the BSP's pristine `JM6_EL2_LATCH`, capturing it on the first call.
+///
+/// Called from [`drop_ap_to_el1`] step (5), which every claiming AP reaches BEFORE its own drop — so
+/// the first caller reads a latch no AP has touched, and every later caller gets that same reading
+/// instead of whatever an earlier AP's `eret` left behind. See the block at the call site for why a
+/// per-core snapshot is a corruption once there is more than one seat.
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
+fn capture_bsp_latch_once() -> [u64; 4] {
+    use core::sync::atomic::Ordering;
+    if JM6_BSP_LATCH_STATE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        for i in 0..4 {
+            JM6_BSP_LATCH[i].store(JM6_EL2_LATCH[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        JM6_BSP_LATCH_STATE.store(2, Ordering::Release);
+    } else {
+        // A loser waits for the winner's Release. Bounded by construction: the winner's critical
+        // section is four relaxed loads and four relaxed stores with no lock, no MMIO and no branch
+        // that can fail, and it runs at EL2 with the MMU on — there is no path on which it does not
+        // complete. `spin_loop` keeps it a pure load in the meantime.
+        while JM6_BSP_LATCH_STATE.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+    }
+    [
+        JM6_BSP_LATCH[0].load(Ordering::Relaxed),
+        JM6_BSP_LATCH[1].load(Ordering::Relaxed),
+        JM6_BSP_LATCH[2].load(Ordering::Relaxed),
+        JM6_BSP_LATCH[3].load(Ordering::Relaxed),
+    ]
 }
 
 /// ORIN-EL1AP — claim the single AP-at-EL1 seat and drop THIS core EL2 -> EL1, reusing the BSP's
@@ -376,7 +519,7 @@ pub fn jm6_ap_latch() -> (u64, u64, u64, u64) {
 /// un-knobbed boot does.
 ///
 /// Prints on every path, including every refusal.
-#[cfg(feature = "orinel1ap")]
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 pub unsafe fn drop_ap_to_el1(cpu: usize) -> bool {
     use core::sync::atomic::Ordering;
 
@@ -400,10 +543,13 @@ pub unsafe fn drop_ap_to_el1(cpu: usize) -> bool {
 
     // (2) CLAIM BEFORE WAITING, so exactly ONE AP pays the wait. Every other AP is told so and falls
     // straight through to the unchanged path — no stall, no second candidate, no race at the drop.
-    if EL1AP_SEAT.swap(true, Ordering::AcqRel) {
+    let seat = EL1AP_SEAT.fetch_add(1, Ordering::AcqRel);
+    if seat >= EL1AP_SEATS {
         serial_println!(
-            ":: tegra: [el1ap] REFUSED cpu={} — the EL1 seat is already held; core stays at EL2 and out of el1cores ::",
-            cpu
+            ":: tegra: [el1ap] REFUSED cpu={} — every EL1 seat is held ({} of {}); core stays at EL2 and out of el1cores ::",
+            cpu,
+            seat,
+            EL1AP_SEATS
         );
         return false;
     }
@@ -450,12 +596,23 @@ pub unsafe fn drop_ap_to_el1(cpu: usize) -> bool {
     }
 
     // (5) Snapshot the shared drop latch — our asm is about to overwrite it (see `JM6_AP_LATCH`).
-    let saved = [
-        JM6_EL2_LATCH[0].load(Ordering::Relaxed),
-        JM6_EL2_LATCH[1].load(Ordering::Relaxed),
-        JM6_EL2_LATCH[2].load(Ordering::Relaxed),
-        JM6_EL2_LATCH[3].load(Ordering::Relaxed),
-    ];
+    //
+    // ORIN-APSRUN — THE SNAPSHOT MUST NOT BE PER-CORE ANY MORE, and this is the one place where five
+    // seats is not the same code as one. With a single claimant, "load the latch, drop, store it
+    // back" is exact: nothing else writes it. With five racing claimants it is a corruption: AP2 can
+    // take its snapshot in the window after AP1's `eret` has overwritten the latch and before AP1's
+    // restore, so AP2 would faithfully "restore" AP1's DROP values as if they were the BSP's — and
+    // `timer.rs`'s `[irqel2a]` witness, whose whole job is to report EL2 registers that are
+    // unreadable at EL1, would print an AP's HCR_EL2 while calling it the BSP's. A silently wrong
+    // measurement is worse than a missing one.
+    //
+    // So the BSP's four values are captured EXACTLY ONCE, by whichever AP arrives first, into
+    // [`JM6_BSP_LATCH`], and every AP restores from THAT. The capture is a compare-exchange on a
+    // one-shot flag, so it happens strictly before any drop has run (an AP reaches here only by way
+    // of a seat claim, and no drop precedes the first arrival). Every restore then writes the same
+    // four values, in any order, any number of times — idempotent by construction, so the race that
+    // remains cannot change the result.
+    let saved = capture_bsp_latch_once();
 
     // The last line printable with this core's EL2 identity intact.
     serial_println!(
