@@ -4534,6 +4534,18 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-bsprun-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
   "arm-tegra-bsprun-el0-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun,tegra_el0"
   "arm-pi-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  # ── NET5VIRT (appended 2026-09-08, orin 23) — `net5` WITHOUT `tegra`, the only leg that has it ──
+  #
+  # THE HOLE, MEASURED. Before this row, `net5` was carried by exactly ONE row of this matrix —
+  # `arm-tegra-tcurx` — and that row carries `tegra` too. `rtl8168_tegra.rs` splits at `mod metal`
+  # (`#[cfg(feature = "tegra")]`), so every `cfg(all(net5, not(tegra)))` site compiled on NO leg of
+  # this gate: the QEMU-virt witness half, where orin 23 put the `[net5F]` length-derivation fixture —
+  # the only part of the render11 no-lease fix a board-less machine can run. Code compiled by no leg
+  # is code that rots unseen, and that fixture would have rotted first.
+  #
+  # No universe side effect: `net4` and `net5` are already named by `arm-tegra-*` rows, so
+  # `x86_cfg_universe` drops them exactly as it did before. Board legs +1.
+  "arm-net5-virt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,net4,net5"
   "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
 )
 
