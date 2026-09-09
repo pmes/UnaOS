@@ -1,4 +1,4 @@
-# rmbp 17 — landing report (OPEN; written early, updated in place)
+# rmbp 17 — landing report (CLOSED 2026-09-09 on Peter's word; successor baton `rmbp-18.md`)
 
 A SUPPORT round from the first turn and it stayed one: **zero executors, zero metal, zero
 kernel code.** Peter at open — *"you are at this very moment opening as a supporter of orin's
@@ -121,10 +121,14 @@ green from a gate blind to the change. orin has taken a discovery-shaped self-te
 
 ## Flagged / owed
 
-* **THE TRUNK SYNC — sized and HELD.** 246 ahead / 94 behind; **18 overlapping files, 11 of them
-  `.rs`**, so the DONE gate is the full battery. Held on pi 9's post-metal clause; timing put to
-  orin because five executors are building. Verification shape from pi's fold: resolved id set ==
-  exact UNION, every row byte-identical to ONE side.
+* **THE TRUNK SYNC — SCOUTED, then aborted clean on the close (B110), so rmbp 18 inherits a map
+  rather than an estimate.** orin measured the box and gave a GO with three conditions; the merge
+  ran, **TEN of the eleven `.rs` files auto-merged clean** and **four files conflicted in five
+  hunks** (`LEDGER.md`, `screenshot.md`, `RULINGS.md`, `prtscr.rs` ×2). `LEDGER.md` union target
+  is **45 ids**. **Aborted rather than handed over conflicted — a conflicted working tree is not a
+  handoff.** And the conflict paid for itself: it surfaced that **B98's fix is not a design,
+  `prtscr.rs:621` on trunk already reads `global.slot_id == usb.slot_id`** (pi 7's `usb_backed`),
+  which is the round's own class landing on its author one last time.
 * **THE GATES-ONLY LANDING, with Peter, unanswered.** Re-measured this round: seven gates exist
   only on `hw-rmbp` (re-enumerated per file per ref, current), and `ledger-check.sh` is **+287/−6**
   against a tree that synced tonight. pi 9's framing: *not "rmbp is behind on landing" but the
