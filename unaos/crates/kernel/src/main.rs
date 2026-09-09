@@ -2635,7 +2635,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // §ORIN-SMP-DEFAULT: `tegrasmp` is DEFAULT-ON for every tegra build (arroyo arms it for
     // `UNAOS_TEGRA=1` and `esp-jetson` alike, metal-proven across SMP-1..8) unless `UNAOS_NOTEGRASMP=1`
     // opts out, dropping call + enumerator => pre-flip baseline. Flip record: arch_arm64.md §ORIN-SMP-DEFAULT.
-    #[cfg(feature = "tegrasmp")]
+    #[cfg(feature = "apsrun")] unaos_kernel::arch::boot_tegra::publish_el1_root(mmu.ttbr0_el1); /* ORIN-APSRUN (orin 23) — publish the EL1 root BEFORE the first CPU_ON. Every AP that drops needs `mmu_tegra`'s EL1-PRECISE twin (`L1_EL1`), never the live EL2 `L1` (boot_tegra's AP[1]-forces-PXN lesson, five dark boots), and ORIN-EL1AP's ONE claimant waited for `drop_to_el1` to publish it — which is eighty lines below, past the entire PCIe/xHCI/SD probe stretch. With FIVE claimants that wait becomes the boot-12 shape: five Orin cores spinning against shared state starved the boot core's cooperative xHCI HID poll into "keyboard+mouse armed but ZERO deliveries" (timer.rs `this_core_has_local_tick`). Deleting the wait is the fix; tuning it is not. IT IS THE SAME VALUE FROM THE SAME EXPRESSION — `mmu.ttbr0_el1` is the literal argument `drop_to_el1` is handed below — so this is not a second reference that could drift, and `drop_to_el1` still stores it (idempotent, same value). Position: AFTER `mmu_tegra::init` built the twin (`mmu` is in hand) and BEFORE `start_secondaries_tegra` issues any CPU_ON. FOLDED ONTO THE LINE THAT CARRIES THE NEXT STATEMENT'S ATTRIBUTE, code-before-attribute, so not one source line is added and no `panic::Location` in this file moves — the knob-off `kernel8.img` keeps its hash. */ #[cfg(feature = "tegrasmp")]
     unaos_kernel::arch::smp_virt::start_secondaries_tegra(dtb_addr, dtb_size, mmu.ram_gib_mask);
 
     // 4. JM6: drop the Orin BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE at EL1 — the
@@ -8387,7 +8387,7 @@ fn orin_render_service(_: usize) {
         // it is now the pass that OPENED the window — the deepest chain this task has), and after it
         // `tick` is the only source of `dirty`, which on the cascaded scene is never. An un-cascaded
         // board is unchanged: `tick`'s arming pass returns dirty on pass 1 anyway.
-        dirty |= passes == 1;
+        dirty |= passes == 1 || unaos_kernel::video::screen::present_owed(); // CURSORBG — the THIRD source of `dirty`, and the one the two above cannot cover: a present another task OWES this layer. `Screen::flush` is the only consumer in this subsystem of both deferred queues (`present_background` drains `PRESENT_RECTS` and swaps `FULL_PRESENT`) and the only caller of `wm::service_damage`, so a request enqueued by `wm::drain_deferred`, `crystal`/`winmenu::repaint_vacated`, `cursor::repair` or `strip::restore_vacated` reaches the glass only through a pass this predicate lets run. Without it this task's `dirty` is `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is masked out forever (ui_status.rs:1285) — render11 measured the consequence, `[orinrender] census passes=13998251 presents=1`. A peek, never a drain (see `screen::present_owed`), so the pass that follows still finds the queue to publish; and it is a pure function of two already-live statics, so an image whose queues nobody fills presents exactly as often as it did before. ⚠ FOLDED onto this line, never added below it — panic `Location`s.
         if dirty {
             pal.render();
             presents += 1;

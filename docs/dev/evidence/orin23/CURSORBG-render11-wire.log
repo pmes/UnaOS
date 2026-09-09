@@ -1,0 +1,18 @@
+CURSORBG (orin 23, exec-orin23-cursorbg) -- the render11 wire, excerpted from the bench
+capture ~/unaos-bench/scratch/orin23/boot-render11-B-full.log, 2026-09-08. Boot anchor first,
+then the lines the A45/A46 ledger rows and docs/dev/OS/08_VIDEO/orin-desktop.md cite.
+
+--- boot anchor (Orin UEFI loader identity) ---
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x34b748 pg=844
+
+--- A45: the dock vacates and hands nothing back (last rollup of the boot) ---
+[strip] rollup tenant=dock scope=bar emit=40 age_ms=466908 rect=552x52+684+1136 scene=yes pop=all-paints paints=75 paint_px=2983968 torn=0 maxpaint_us=248 minpaint_us=103 rectscan_us=722 declines=0 decl_lock=0 decl_ready=0 decl_word=0 decl_geom=0 pop=vacates vacates=13 uncovered=6 uncovered_px=33696 unerased=0 unerased_px=0 forgotten=0 flat=6 flat_px=33696 pop=constant frame_us=16667 -> FLAT-VACATE
+
+--- A45: the render pump presented once in a 466 s boot ---
+[orinrender] census passes=13998251 presents=1 win=0 declined=1 strip=retired pulsewin=4 -> RENDER-LIVE
+
+--- A45: the competing hypothesis (stale occluder snapshot) refuted on the same boot ---
+[wc-i] rollup scope=live windowed_flushes=5130 stale=0 intrusions=0 cursor_passes=76994 cursor_brackets=25954 -> CLEAN
+
+--- A46: the tearing half -- same-core compositor reentrancy, relayed, NOT fixed here ---
+[wc-h] rollup win=1 scope=window emit=204 age_ms=283290 pop=budgeted samples=4 budget=4 pop=all-presents torn=2 stalls=6 longpres=2 declines=5 decl_geom=0 decl_cap=0 decl_lock=73 decl_alloc=0 fixture=0 whole=332 banded=62574 lines=7 minspan=6 minspan_bytes=27888 maxpresent_us=117479 minpresent_us=0 presspread=135506 presspop=70800 pop=constant frame_us=16667 stallbound_us=33334 -> AT-RISK

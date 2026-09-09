@@ -50,6 +50,13 @@ pub enum InflateError {
     OutputBudget,
     /// The sink refused a byte (the tar walker rejecting a malformed member).
     SinkRejected,
+    /// FACET: not a zlib stream (RFC 1950 §2.2) — a compression method other than DEFLATE, a window
+    /// size above 32 KiB, a preset dictionary we cannot supply, or a header whose FCHECK is wrong.
+    BadZlibHeader,
+    /// FACET: the zlib trailer's Adler-32 disagrees with what we actually produced. Distinct from
+    /// [`InflateError::TrailerMismatch`] so a PNG's refusal names the checksum that failed rather
+    /// than borrowing gzip's wording for a container it never had.
+    AdlerMismatch,
 }
 
 /// The hard ceiling on decompressed output, and the one bound this decoder needs that RFC 1951 does
@@ -342,36 +349,7 @@ pub fn gunzip<S: ByteSource, K: Sink>(
 
     // --- RFC 1951 deflate stream ---
     let mut win = Window::new(sink);
-    loop {
-        let last = br.bit()?;
-        let btype = br.bits(2)?;
-        match btype {
-            0 => {
-                br.align();
-                let len = br.byte()? as u32 | ((br.byte()? as u32) << 8);
-                let nlen = br.byte()? as u32 | ((br.byte()? as u32) << 8);
-                if len != (!nlen & 0xFFFF) {
-                    return Err(InflateError::BadBlock);
-                }
-                for _ in 0..len {
-                    let b = br.byte()?;
-                    win.emit(b)?;
-                }
-            }
-            1 => {
-                let (lit, dist) = fixed_tables()?;
-                inflate_block(&mut br, &mut win, &lit, &dist)?;
-            }
-            2 => {
-                let (lit, dist) = dynamic_tables(&mut br)?;
-                inflate_block(&mut br, &mut win, &lit, &dist)?;
-            }
-            _ => return Err(InflateError::BadBlock),
-        }
-        if last == 1 {
-            break;
-        }
-    }
+    deflate_body(&mut br, &mut win)?;
 
     // --- RFC 1952 §2.3.1 trailer: CRC32 then ISIZE, both little-endian ---
     br.align();
@@ -394,6 +372,172 @@ pub fn gunzip<S: ByteSource, K: Sink>(
         compressed: br.consumed,
         crc: got_crc,
     })
+}
+
+/// The RFC 1951 block loop, from the first `BFINAL` bit to the end of the last block, leaving the bit
+/// reader positioned on the first bit after it.
+///
+/// LIFTED OUT OF [`gunzip`] BY FACET, verbatim and with no behaviour change, for one reason: the PNG
+/// viewer needs the SAME decoder behind a zlib (RFC 1950) wrapper instead of a gzip (RFC 1952) one,
+/// and the two containers differ ONLY in their header and trailer. A second copy of this loop would
+/// be a second decoder to audit and a second place for a back-reference bug to hide, which is exactly
+/// what the module header's "short enough to audit line by line" claim is worth protecting. The
+/// wrappers stay separate — they check different checksums and must say so by name.
+fn deflate_body<S: ByteSource, K: Sink>(
+    br: &mut BitReader<'_, S>,
+    win: &mut Window<'_, K>,
+) -> Result<(), InflateError> {
+    loop {
+        let last = br.bit()?;
+        let btype = br.bits(2)?;
+        match btype {
+            0 => {
+                br.align();
+                let len = br.byte()? as u32 | ((br.byte()? as u32) << 8);
+                let nlen = br.byte()? as u32 | ((br.byte()? as u32) << 8);
+                if len != (!nlen & 0xFFFF) {
+                    return Err(InflateError::BadBlock);
+                }
+                for _ in 0..len {
+                    let b = br.byte()?;
+                    win.emit(b)?;
+                }
+            }
+            1 => {
+                let (lit, dist) = fixed_tables()?;
+                inflate_block(br, win, &lit, &dist)?;
+            }
+            2 => {
+                let (lit, dist) = dynamic_tables(br)?;
+                inflate_block(br, win, &lit, &dist)?;
+            }
+            _ => return Err(InflateError::BadBlock),
+        }
+        if last == 1 {
+            return Ok(());
+        }
+    }
+}
+
+/// What a completed walk of one zlib stream produced. The gzip twin of this is [`GzipReport`]; the
+/// checksum is the container's own, so the field is named for it rather than for "the checksum".
+pub struct ZlibReport {
+    /// Decompressed byte count.
+    pub uncompressed: u64,
+    /// Compressed bytes consumed, including the 2-byte header and the 4-byte trailer.
+    pub compressed: u64,
+    /// Adler-32 of the decompressed stream, checked against the trailer.
+    pub adler: u32,
+}
+
+/// A sink that Adler-32s every byte on its way through to the real one.
+///
+/// The checksum lives HERE rather than in [`Window`] because [`Window`] is on `gunzip`'s hot path and
+/// gzip does not want an Adler: a field added there would cost every SELFHOST-2 byte a second
+/// accumulator for a container it never uses. Wrapping is free when nobody wraps.
+struct AdlerSink<'a, K: Sink> {
+    inner: &'a mut K,
+    a: u32,
+    b: u32,
+    /// Bytes absorbed since the last reduction — see [`ADLER_NMAX`].
+    since: usize,
+}
+
+/// The classic zlib `NMAX`: the largest `n` for which `b` cannot overflow `u32` before a reduction.
+/// Reducing per byte would cost two divisions per pixel byte over a ~6.9 MB screenshot; this makes it
+/// two per 5552.
+const ADLER_NMAX: usize = 5552;
+/// Adler-32's modulus — the largest prime below 65536 (RFC 1950 §9).
+const ADLER_BASE: u32 = 65521;
+
+impl<'a, K: Sink> AdlerSink<'a, K> {
+    fn new(inner: &'a mut K) -> Self {
+        Self { inner, a: 1, b: 0, since: 0 }
+    }
+
+    #[inline]
+    fn reduce(&mut self) {
+        self.a %= ADLER_BASE;
+        self.b %= ADLER_BASE;
+        self.since = 0;
+    }
+
+    fn finish(&mut self) -> u32 {
+        self.reduce();
+        (self.b << 16) | self.a
+    }
+}
+
+impl<K: Sink> Sink for AdlerSink<'_, K> {
+    #[inline]
+    fn push(&mut self, byte: u8) -> Result<(), ()> {
+        self.a += byte as u32;
+        self.b += self.a;
+        self.since += 1;
+        if self.since >= ADLER_NMAX {
+            self.reduce();
+        }
+        self.inner.push(byte)
+    }
+}
+
+/// Decompress one zlib stream (RFC 1950) from `src`, pushing every decompressed byte into `sink`.
+///
+/// FACET's entry, and deliberately a SIBLING of [`gunzip`] rather than a second decoder: PNG's IDAT
+/// payload is a zlib stream, which is the identical DEFLATE body between a 2-byte header and a
+/// 4-byte big-endian Adler-32 instead of gzip's 10-byte header and 8-byte CRC/ISIZE trailer.
+/// [`deflate_body`] is the shared half.
+///
+/// THE TRAILER IS CHECKED, for [`gunzip`]'s reason restated in this container's terms: a decoder that
+/// produced garbage would still be internally consistent, but it could not also reproduce the
+/// Adler-32 the encoder stamped over the ORIGINAL bytes. That check is what makes `[facet] decoded
+/// … inflate=OK` a claim about the image on the medium rather than about whatever this decoder
+/// happened to emit — and it is why a corrupted IDAT surfaces as a named refusal instead of as
+/// plausible-looking noise on the glass.
+///
+/// The 32 KiB window bound is asserted rather than assumed: RFC 1950's `CINFO` may name a window up
+/// to 32 KiB and no more, and [`WINDOW`] is exactly that, so a stream claiming more is refused at the
+/// header instead of silently mis-resolving a back-reference later.
+pub fn zlib_inflate<S: ByteSource, K: Sink>(
+    src: &mut S,
+    sink: &mut K,
+) -> Result<ZlibReport, InflateError> {
+    let mut adler_sink = AdlerSink::new(sink);
+    let mut br = BitReader::new(src);
+
+    // --- RFC 1950 §2.2 header: CMF then FLG ---
+    let cmf = br.byte()?;
+    let flg = br.byte()?;
+    if cmf & 0x0F != 8 {
+        return Err(InflateError::BadZlibHeader); // CM: only DEFLATE is defined
+    }
+    if (cmf >> 4) > 7 {
+        return Err(InflateError::BadZlibHeader); // CINFO > 7 => a window larger than 32 KiB
+    }
+    if ((cmf as u32) << 8 | flg as u32) % 31 != 0 {
+        return Err(InflateError::BadZlibHeader); // FCHECK
+    }
+    if flg & 0x20 != 0 {
+        return Err(InflateError::BadZlibHeader); // FDICT: we have no preset dictionary to supply
+    }
+
+    let mut win = Window::new(&mut adler_sink);
+    deflate_body(&mut br, &mut win)?;
+    let produced = win.produced;
+    drop(win);
+
+    // --- RFC 1950 §2.2 trailer: ADLER32, BIG-endian (gzip's is little — this is the trap) ---
+    br.align();
+    let mut want = 0u32;
+    for _ in 0..4 {
+        want = (want << 8) | br.byte()? as u32;
+    }
+    let got = adler_sink.finish();
+    if got != want {
+        return Err(InflateError::AdlerMismatch);
+    }
+
+    Ok(ZlibReport { uncompressed: produced, compressed: br.consumed, adler: got })
 }
 
 fn fixed_tables() -> Result<(Huffman, Huffman), InflateError> {
@@ -514,5 +658,7 @@ pub fn inflate_reason(e: InflateError) -> &'static str {
         InflateError::TrailerMismatch => "gzip trailer crc/isize mismatch",
         InflateError::OutputBudget => "decompressed output exceeded the 512 MiB budget",
         InflateError::SinkRejected => "tar walk rejected the stream",
+        InflateError::BadZlibHeader => "not a zlib/DEFLATE stream",
+        InflateError::AdlerMismatch => "zlib trailer adler-32 mismatch",
     }
 }

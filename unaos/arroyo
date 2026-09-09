@@ -1187,6 +1187,22 @@ _feats=""
 # it landed. Corrected here 2026-08-25 (this comment had gone stale by three commits; the leg below
 # already carried `,quarry`).
 [ -n "${UNAOS_QUARRY:-}" ] && _feats="${_feats}quarry,"
+# FACET (ORIN-FACET, Peter 2026-09-08): UNAOS_FACET=1 arms UnaOS's IMAGE VIEWER (`video/facet.rs`) —
+# `docs/CODEX.md` §2's **Facet — Images — "The Canvas"**. Pair it with UNAOS_QUARRY (Cargo does that
+# for you: `facet = ["quarry"]`) and with the desktop knob that opens the file manager — `facet`
+# compiles the viewer, `quarry` is its ONLY door (double-click or <Enter> on a `.PNG` row), and
+# `desktop_firmware`/`wc` is what routes the press to either of them.
+#
+# YOU DO NOT NEED THIS KNOB ON THE JETSON. `deskcascade = [..., "facet"]` carries it, exactly as it
+# carries `quarry` (QUARRY-ORIN's ruling one block down: the IMPLICATION is admissible, appending a
+# `facet,` term to the UNAOS_DESKCASCADE line is not, because `facet` is named by the `x86-all` leg
+# and a knob mapping cannot be un-set by an operator). The knob exists for the OTHER two boards and
+# for `UNAOS_FACET=1 ./arroyo check`, which type-checks the viewer alone.
+#
+# Arming proof is not the banner: `[pidesk] facet ARMED` is printed by `desktop_firmware::activate`
+# inside the built image, and `strings -a target/aarch64_esp/kernel.elf | grep -c '\[facet\]'` is the
+# artifact-side check the full-knob-gate law asks for.
+[ -n "${UNAOS_FACET:-}" ] && _feats="${_feats}facet,"
 # ORINDESK RUNG 2 (TEGRADESK): UNAOS_TEGRADESK=1 arms the Orin's DESKTOP SEAM — `main.rs`'s
 # `tegra_desk_arm`, called as an appended statement on `tegra_early_stop`'s terminus line (the last
 # instruction before `run_capstone_boot_core(0)`, which never returns). It is the tegra-shaped
@@ -1334,6 +1350,37 @@ _feats=""
 #
 # NOT PROVEN ON HARDWARE. Nothing in this arc has been on the bench.
 [ -n "${UNAOS_ORINEL1AP:-}" ] && _feats="${_feats}orinel1ap,tegrasmp,tegra_el0,tegra,"
+# ORIN-APSRUN (orin 23): every Orin secondary drops EL2 -> EL1, arms its own 250 Hz CNTP at EL1, stamps
+# itself into `EL1_CORE_MASK` and enters `sched::run()` — so `el1cores` reads 0x3f instead of 0x1 and an
+# EL0 thread is placeable on any of the six cores.
+#
+# THE DEFECT, Peter 2026-09-08: "WE ARE STILL ONLY ON ONE CORE". render11's wire ACQUITS the tick and
+# the run loop — `c1..c5 timer PPI live (tick 1)` five times, `online=0x3f` on the `[bsprun] host` line.
+# The field that pinned userspace to the boot core is `el1cores=0x1` on that same line: the APs replay
+# the BSP's EL2 regime and never leave it, so the EL0 placement filter had one candidate and the shell,
+# the render pump, the pointer poll and every `bg` shared it.
+#
+# DEFAULT-ON, and the shape is ORIN-TICKDEFAULT's verbatim: a default-on line keyed on UNAOS_TEGRA
+# here, an idempotent force block in `esp_jetson` for the media path (which forces `tegra` into the
+# feature list without ever setting the UNAOS_TEGRA env var these lines key on), and the explicit
+# positive knob left in place. NESTED INSIDE THE `tegrasmp` OPT-OUT, and that nesting is load-bearing:
+# `apsrun` drops PSCI-woken APs and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]`,
+# so `UNAOS_NOTEGRASMP=1` must drop `apsrun` with it — a knob whose cores do not exist is a flag with
+# nothing behind it, the exact `bsprun`-without-`bsptick` shape.
+#
+# THE WAY BACK: UNAOS_NOAPSRUN=1 -> the pre-flip image (five APs at EL2, `el1cores=0x1`), which is the
+# render11 configuration and the bisect rung if a flight has to separate "APs at EL1" from everything
+# else in this arc. UNAOS_ORINEL1AP=1 without this is the intermediate rung: ONE AP at EL1.
+#
+# BOTH POLARITIES STAY TYPE-CHECKED WITHOUT A MATRIX EDIT BEING OPTIONAL: the armed closure is
+# `arm-tegra`'s list + `apsrun` (the `arm-tegra-apsrun` leg below), and `arm-tegra` itself remains the
+# disarmed polarity — which has real code behind it (`smp_virt::__secondary_rust_virt` with no drop
+# block at all), so it is not a vacuous twin.
+#
+# ⚠ QEMU MODELS NO Tegra234. Every site is `tegra`-gated, so `test-arm`/`arm` exercise none of it; the
+# armed default is type-checked and reasoned here and PROVEN only by an attended bench flight.
+[ -n "${UNAOS_APSRUN:-}" ] && _feats="${_feats}apsrun,tegrasmp,tegra,"
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && [ -z "${UNAOS_NOAPSRUN:-}" ] && _feats="${_feats}apsrun,tegrasmp,tegra,"
 # ORIN-INPUT: UNAOS_ORININPUT=1 arms the tegra input pump + route inside `run_user_image`'s wait loop
 # (arch/aarch64/xusb_tegra.rs `oi_*` + three call sites in arch/aarch64/syscall.rs), so HID actually
 # REACHES an EL0 tenant on the Orin. The chain itself is already compiled in on `tegra_el0` (per-process
@@ -3149,7 +3196,7 @@ KERNEL_CFG_MATRIX=(
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,facet"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -3165,7 +3212,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3245,6 +3292,21 @@ KERNEL_CFG_MATRIX=(
   # `orinel1ap`-OFF compiled by nothing on this arch, which is the "gate whose knob cannot satisfy it"
   # defect in the other direction. Two legs type-check both polarities.
   "arm-tegra-el1ap ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinel1ap"
+  # ORIN-APSRUN armed (orin 23) — the `arm-tegra-el1ap` row + `apsrun`, and it carries `orinel1ap` too
+  # ON PURPOSE: `apsrun` widens seven of that feature's `#[cfg]`s to `any(orinel1ap, apsrun)`, so the
+  # BOTH-ARMED closure is the one combination in which `EL1AP_SEATS` has two candidate definitions and
+  # the `#[cfg(all(orinel1ap, not(apsrun)))]` arm must be proven to lose. A row with `apsrun` alone
+  # would type-check the interesting half and leave the collision uncompiled — the "gate whose knob
+  # cannot satisfy it" defect. `apsrun`-alone IS covered: it is the DEFAULT for every tegra build, so
+  # `esp-jetson` and `UNAOS_TEGRA=1 ./arroyo check` compile it on every run of either.
+  #
+  # The DISARMED polarity keeps its own legs (`arm-tegra`, `arm-tegra-el0`, `arm-tegra-el1ap`), and it
+  # is not a vacuous twin: with `apsrun` off, `smp_virt::__secondary_rust_virt` has no drop block, the
+  # two `[apsrun]` witnesses do not exist, and `boot_tegra` has neither `publish_el1_root` nor
+  # `capture_bsp_latch_once`. Same x86 universe side effect as its neighbours': `apsrun` is aarch64-only
+  # in effect (every site is under `src/arch/aarch64/`), so naming it here removes it from the x86 mix
+  # universe, where it emitted nothing.
+  "arm-tegra-apsrun ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinel1ap,apsrun"
   # SIMMER armed (appended 2026-08-21) — closes one of the two "real holes wearing a green verdict"
   # the RE-COUNTED 2026-08-19 note above records. `simmer_test = []` is board-neutral aarch64: its
   # four cfg sites all live in `arch/aarch64/sched.rs` (three self-test fns + the boot-core spawn in
@@ -3400,7 +3462,7 @@ KERNEL_CFG_MATRIX=(
   #
   # PRECONDITION: like `arm-tegra-el0`, this leg compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
-  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry"
+  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet"
   # ORINDESK RUNG 2 — the DESKTOP SEAM armed (appended 2026-08-25). `tegradesk` gates `main.rs`'s
   # `tegra_desk_arm` (the wrapper, its latch, its two stop-line consts) plus the one statement
   # appended to `tegra_early_stop`'s terminus line. BOTH sites sit behind `tegra` as well
@@ -3444,7 +3506,7 @@ KERNEL_CFG_MATRIX=(
   # set it — the disarmed twin for BOTH knobs — and there is no `#[cfg(not(feature = "orinclick"))]`
   # site in src/, so no disarmed asymmetry is created. TYPE-CHECK only: booting `desktop_firmware` + the cascade
   # is rung 5 and stays blocked by orin-desktop.md §5.2 (the seam's second stop-line is still `false`).
-  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,tegradesk,orinclick"
+  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,tegradesk,orinclick,facet"
 
   # ORIN-CLICK rung 3 armed (appended 2026-08-25) — `orinclick` wires `jd2_console_pump`'s
   # `Event::Button` arm into `arch/aarch64/syscall.rs::wc_click_route` and adds the `[orinclick]`
@@ -4472,6 +4534,18 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-bsprun-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
   "arm-tegra-bsprun-el0-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun,tegra_el0"
   "arm-pi-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  # ── NET5VIRT (appended 2026-09-08, orin 23) — `net5` WITHOUT `tegra`, the only leg that has it ──
+  #
+  # THE HOLE, MEASURED. Before this row, `net5` was carried by exactly ONE row of this matrix —
+  # `arm-tegra-tcurx` — and that row carries `tegra` too. `rtl8168_tegra.rs` splits at `mod metal`
+  # (`#[cfg(feature = "tegra")]`), so every `cfg(all(net5, not(tegra)))` site compiled on NO leg of
+  # this gate: the QEMU-virt witness half, where orin 23 put the `[net5F]` length-derivation fixture —
+  # the only part of the render11 no-lease fix a board-less machine can run. Code compiled by no leg
+  # is code that rots unseen, and that fixture would have rotted first.
+  #
+  # No universe side effect: `net4` and `net5` are already named by `arm-tegra-*` rows, so
+  # `x86_cfg_universe` drops them exactly as it did before. Board legs +1.
+  "arm-net5-virt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,net4,net5"
   "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
 )
 
@@ -5378,6 +5452,18 @@ esp_jetson() {
             *",tegrasmp,"*) ;;
             *) _feats="${_feats}tegrasmp,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
         esac
+        # ORIN-APSRUN (orin 23): with the secondaries started, DROP THEM TO EL1 — each arms its own
+        # 250 Hz CNTP at EL1, stamps `EL1_CORE_MASK` and enters `run()`, so `el1cores` reads 0x3f and
+        # EL0 threads are placeable on all six cores instead of only the boot core (Peter: "WE ARE
+        # STILL ONLY ON ONE CORE"). NESTED INSIDE the tegrasmp opt-out on purpose: `apsrun` drops
+        # PSCI-woken APs, so `UNAOS_NOTEGRASMP=1` (no APs at all) must drop it too. Opt out on its own
+        # with UNAOS_NOAPSRUN=1 => the render11 image. Idempotent, the tegrasmp/TICKDEFAULT shape.
+        if [ -z "${UNAOS_NOAPSRUN:-}" ]; then
+            case ",${_feats}" in
+                *",apsrun,"*) ;;
+                *) _feats="${_feats}apsrun,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+            esac
+        fi
     fi
     # ORIN-TICKDEFAULT: the standing EL1 tick + the preemptive terminus are default-on for the jetson
     # IMAGE, not only for `UNAOS_TEGRA=1 ./arroyo check` — this is the block that reaches bench media,

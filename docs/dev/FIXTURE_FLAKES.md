@@ -20,10 +20,13 @@ an observation: record the run, capture what the entry asks for, and only then
 re-run. A class entry that never accumulates recurrence evidence is a class that
 can never be closed.
 
-**Scope.** Everything here is an x86 QEMU-gate observation from the `hw-rmbp`
-lane. None of these classes has been seen on metal, and none is metal-specific:
-they are all launcher/observer races or transport-margin effects that host load
-makes visible.
+**Scope.** Classes 1-3 are x86 QEMU-gate observations from the `hw-rmbp` lane;
+Class 4 is an aarch64 `virt` one from `hw-jetson` (added orin 23, 2026-09-08 —
+the sentence that used to stand here said "everything here is x86", and adding an
+aarch64 class without correcting it would have left a doc that reads false to the
+next cold reader). None of these classes has been seen on metal, and none is
+metal-specific: they are all launcher/observer races or transport-margin effects
+that host load makes visible.
 
 ---
 
@@ -464,6 +467,38 @@ the host's cores, and this class is the second-order cost — the same reason
 `target/` is never a flash-staging handoff source.
 
 ---
+
+## Class 4 — `test-arm` captures NO serial bytes at all (aarch64 virt, loaded host)
+
+### 4a. `no serial bytes captured … QEMU produced nothing. Exit 4` — **suspect only, one occurrence**
+
+**Signature on the wire.** There is none — that is the class. `target/serial-arm.log`
+is zero bytes and the harness says so itself, on stdout:
+
+```
+✖ test-arm: no serial bytes captured at …/target/serial-arm.log — QEMU produced nothing.
+  This run carries NO verdict: not a pass, not a regression. Exit 4.
+```
+
+**Trigger conditions.** Seen once, orin 23 (2026-09-08), on
+`UNAOS_GICV3=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo test-arm`, with **twelve other
+`./arroyo check` runs live on the same host** (a nine-executor fleet plus other
+seats). The immediately preceding and following runs of the SAME command on the
+SAME tree were both exit 0 and produced a full 454-line log, so the image and the
+invocation are exonerated by differential.
+
+**Root cause.** Unknown; host-load launcher race is the suspect. The harness
+already handles it correctly and that is why this entry is short: exit 4 is a
+distinct code and the text says in as many words that the run carries no verdict.
+It is NOT a regression signal and must never be scored as one.
+
+**What to capture on recurrence.** The host load at the time (`uptime`, count of
+concurrent `arroyo`/`cargo`/`qemu-system-*`), whether the ESP was rebuilt that run,
+and whether the log file was created-but-empty or absent. If it ever recurs on an
+idle host, it stops being a load artifact and becomes a launcher defect.
+
+**Disposition.** On watch. One occurrence, re-run green on the spot; recorded here
+so the next seat spends the minute on the corpus and not on the driver.
 
 ## Adding an entry
 
