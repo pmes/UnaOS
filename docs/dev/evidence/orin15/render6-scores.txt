@@ -1,0 +1,30 @@
+cpu_on_success=5 cpu_on_error=0 el3_abort=0 poweroff=0 online_line=1 -> PASS (A15 pass +1)
+arming=1 post_cascade=1 len=32768 hw=15552 headroom=17216 -> PASS (unsaturated)
+[u7stk] at=boot-core:pre-cascade task=0:boot-core sp=0x26b3fd820 low=0x26b3f5910 top=0x26b3fd910 len=32768 used=240 hw=240 headroom=32528
+[u7stk] at=boot-core:post-cascade task=0:boot-core sp=0x26b3fd820 low=0x26b3f5910 top=0x26b3fd910 len=32768 used=240 hw=15552 headroom=17216
+cascaded=1 refuse=0 pulsewin_open=1 pulsewin_decline=0 strip_kept=0 census_strip=retired census_pulsewin=2 -> PASS
+[deskcascade] -> CASCADED windows=1 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=ROUTED; the render pass ahead presents t
+[pulsewin] open win=2 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: click `View` for the two faces — first option is the Pi'
+armed=1 ok=1 refusals=0 names=[ SCREEN0.PNG ] -> INCOMPLETE (<2 presses seen)
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry at
+:: PRTSCR: SCREEN0.PNG 1920x1200 6913793 bytes -> OK ::
+Traceback (most recent call last):
+  File "<stdin>", line 3, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/run/host/run/media/pmes/UNAOS-ORIN/SCREEN*.PNG'
+cp: cannot stat '/run/host/run/media/pmes/UNAOS-ORIN/SCREEN*.PNG': No such file or directory
+lsr_lines=1 iir_lines=1 census=482 rx_final=3 ovrf_final=0 keys=3 -> DISCRIMINATORS PRESENT — verdict per A16-SCORE.md
+[serialrx] lsr=0x00000220 base=0x0c280000 iir=0xc1 fifo=on pending=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (0x00000000 = A
+burst: keys=3 rx_after=3 ovrf_after=0
+    KEY 's' :: KEY 't' :: KEY 0x0d ::
+paced: keys=0 rx_after=0 ovrf_after=0
+   
+heartbeat=1 el1=1 arm=1 armed=1 live=483 redzone=0 exceptions=0 -> PASS
+arm_click1=1 orinclick_armed=1 clickroute_press=0 consumed=0 routing_census=0 -> ARMED, NO CLICK SEEN (press not made or not routed)
+arm=1 stop=0 census=484 full_final=1 nbytes=2 full_edges=1 changes=1 data=[74 65 00] -> ROW1: SPE forwards RX into the mailbox and parks it — TCURX rung 2
+band_cleared=1 shell_present=1 jd2_probe=1 -> WIRE PASS (now A19-pngband.py SCREEN0.PNG must read non-bg=0/60200)
+   [realdesk] band-cleared x=0 y=34 w=1920 h=1166 bg=2d2b55 shell=win=3 surf=960x466 box=970x510 at (515,402) (A19: the band under the bar was 
+menu_open=1 esc_seen=0 dismiss=1 -> NO-VERDICT
+   open: :: SHARD-MENU: crystal_press=open via=crystal-glyph menu=170x121+12+34 items=4 ::
+   dismiss: :: SHARD-MENU: crystal_press=dismiss reason=outside ::
+python3: can't open file '/docs/dev/evidence/orin14/A19-pngband.py': [Errno 2] No such file or directory

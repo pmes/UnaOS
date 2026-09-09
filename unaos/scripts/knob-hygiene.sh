@@ -67,12 +67,44 @@ fi
 # Shape of the hazard, not the word: CODE before the `//`, then `#[cfg(...)]`, then a STATEMENT — an
 # identifier with a call and a `;` (or a block `{`) — still on the same line. A `} // end #[cfg(...)] block`
 # note or a comment that merely mentions a cfg has no statement after the attribute and stays green.
-trailing="$(grep -rn --include='*.rs' -E '^[^/]*[^[:space:]/][^/]*//.*#\[cfg\([^]]*\)\][[:space:]]*[A-Za-z_:][A-Za-z0-9_:]*.*(\(.*\).*;|\{)[[:space:]]*$' "$SRC" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+#
+# ⚠ THE END-OF-LINE ANCHOR WAS REMOVED (KEYDOORS F0, orin 16, 2026-09-06), AND THAT REMOVAL IS THE
+# WHOLE POINT OF THIS PARAGRAPH. Until then the pattern ended `...(\(.*\).*;|\{)[[:space:]]*$`, i.e.
+# the buried statement had to be the LAST thing on the line. main.rs:2948 was a fold carrying TWO
+# comments: A10's prose was written at column 139, ahead of TABKEY's `#[cfg(feature = "tegra_el0")]
+# if …wc_shell_focus_key(ev) { continue; }` at column ~1600, and TABKEY's own prose ran on after it.
+# The buried call therefore had a second `//` behind it, the `$` did not match, and this gate — the
+# one check in the tree aimed squarely at this hazard — reported OK on a LIVE regression that had
+# silently disabled <TAB> on the Orin for an entire arc. Nothing else could see it either: the line
+# count never moved (so the kernel8.img byte-identity proof is silent), `check` is green (the callee
+# is a `pub fn` in a lib crate, so no dead-code warning fires), and `git grep` still printed the line.
+# One anchor, one missed regression. Do not put it back: a buried call is buried whether or not more
+# prose follows it.
+#
+# GO-RED, MEASURED (2026-09-06): the pre-fix `39e4b6c7:main.rs` scanned with the OLD pattern -> 0
+# hits; with the pattern below -> 1 hit, main.rs:2948, the real defect. The fixed tree -> 0 hits with
+# both. Reproduce: ~/unaos-bench/scratch/orin16/keydoors-fix/regex-gored.sh
+#
+# ONE pattern, held in a variable, used by BOTH the tree scan and the control probe — so the probe
+# can never certify a pattern the scan is not actually running.
+TRAILING_RE='^[^/]*[^[:space:]/][^/]*//.*#\[cfg\([^]]*\)\][[:space:]]*[A-Za-z_:][A-Za-z0-9_:]*.*(\(.*\).*;|\{)'
+# CONTROL PROBE, the discipline the phantom/dead checks above already follow: a pattern that matched
+# NOTHING would report "0 trailing-comment cfg" and read as a clean tree, so a zero has to be
+# distinguishable from a broken regex. Two fixtures, both required, because this check has two ways
+# to rot — it can stop catching the hazard, or start catching prose:
+#   HAZARD fixture   must MATCH (the F0 shape: code, comment, buried cfg+call, MORE comment)
+#   PROSE  fixture   must NOT match (a pure comment line quoting a cfg expression — the false
+#                    positive that made the naive form of this whole gate unusable, see the top note)
+_hz='    foo(); // prose #[cfg(feature = "wc")] bar::baz(ev); // and still more prose'
+_pr='    // see the #[cfg(feature = "wc")] bar::baz(ev); fold above'
+printf '%s\n' "$_hz" | grep -qE "$TRAILING_RE" || { echo "GATE-KNOB: control FAILED — the TRAILING-COMMENT pattern no longer matches its own hazard fixture; it would report 0 on any tree. No verdict." >&2; exit 2; }
+printf '%s\n' "$_pr" | grep -vE '^[[:space:]]*//' | grep -qE "$TRAILING_RE" && { echo "GATE-KNOB: control FAILED — the TRAILING-COMMENT pattern now matches a PROSE fixture; it would red on a sentence, which teaches people to disable it. No verdict." >&2; exit 2; }
+trailing="$(grep -rn --include='*.rs' -E "$TRAILING_RE" "$SRC" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
 if [ -n "$trailing" ]; then
   rc=1
-  echo "GATE-KNOB FAILED — a #[cfg(...)] sits AFTER a trailing // comment on a code line (it is prose; the code it was meant to gate is unconditional or absent):" >&2
+  echo "GATE-KNOB FAILED — a #[cfg(...)] and the statement it guards sit AFTER a trailing // comment on a code line (they are PROSE: the call does not happen, and neither the line count, nor \`check\`, nor \`git grep\` can tell you so):" >&2
   printf '%s\n' "$trailing" | sed -E 's@^@  TRAILING: @' | cut -c1-160 >&2
-  echo "  FIX: move the attribute (and the statement it guards) BEFORE the comment, on its own line." >&2
+  echo "  FIX: move the attribute AND its statement ahead of every comment on the line. The rule for folds in this tree is CODE FIRST, ALL OF IT, THEN THE COMMENTS." >&2
 fi
 [ "$rc" -eq 0 ] && echo "GATE-KNOB: OK — $(printf '%s\n' "$declared" | grep -c .) features declared, $(printf '%s\n' "$used" | grep -c .) named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg"
 exit $rc

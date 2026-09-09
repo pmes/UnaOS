@@ -10733,6 +10733,34 @@ cooperative terminus's baseline emits are skipped — the two that prove reader 
 (`el0_refusal_rollup`, `load_witness_emit`) are re-emitted by `run_bsp_tegra` before `run()`
 entry, un-preempted by construction (the `SCHED_ACTIVE` store comes after them).
 
+### The EL0-EL1CORE refusal closes here, and that was never stated (orin 16, 2026-09-06)
+
+`UNAOS_BSPRUN=1` also answers Peter's glass complaint — *"i cannot launch apps from cmd line (no
+core is at el1)"* — and until orin 16 no line of code or documentation said so.
+
+The refusal is one predicate. `shell.rs`'s `bg` verb calls `syscall.rs::spawn_user_image_bg`, whose
+first act is `sched::el0_placement_possible(CPU_AUTO)`; that is
+
+```
+any(c in 0..NUM_CPUS) { ONLINE_MASK[c] && el1_core(c) }
+```
+
+and on the shipped Orin image **both halves are false for different reasons**. Cores 1-5 are in
+`ONLINE_MASK` (their `secondary_run` calls `mark_online`) but replay the BSP's EL2 regime and are
+never stamped into `EL1_CORE_MASK`. Core 0 **is** stamped at EL1 by the JM6 drop (`main.rs`
+EL0-EL1CORE stamp; `[el0core] el1 core MEASURED: cpu=0 mask=0x1`) but is **not** in `ONLINE_MASK`,
+because the cooperative terminus `run_capstone_boot_core(0)` never calls `mark_online`. The
+conjunction is therefore empty, and every `bg` returns *"no core is at EL1 to host a background EL0
+task on this platform (EL0-EL1CORE)"*.
+
+`run_bsp_tegra` supplies the missing half. It is the only tegra caller of `mark_online(0)`, so with
+`bsprun` armed the conjunction is satisfiable at core 0 for the first time and `bg` should be
+accepted. **Should** — this is a code-level derivation, not a flight result; it is `fixed-unflown`
+exactly like the rest of the arc, and the two witnesses below exist so the flight can score it.
+
+Note what this does NOT change: `el1_core` still answers `false` for cores 1-5, so an EL0 tenant
+still runs only on the boot core. Candidate C (`orinel1ap`) is what widens that.
+
 ### Witness
 
 `[orinbsprun]` (12 bytes, over the 8-byte immediate-encode floor) — the terminus banner, printed
@@ -10740,14 +10768,55 @@ once, before the `SCHED_ACTIVE` store (so it cannot itself be the first preempte
 arc's real payload witness is the load train itself. Arc 1's `[orinbsptick]` arming banner is
 cfg!-split so it stops claiming "no preemption" on a `bsprun` image.
 
+`[bsprun]` (orin 16) — the two lines that make the paragraph above scoreable instead of argued.
+Both live at sched.rs's FILE TAIL and are reached from statements APPENDED to lines that already
+existed, so no panic `Location` above them moves:
+
+* `:: [bsprun] host core=0 el=1 -> HOSTING (online=0x… el1cores=0x1; predicate =
+  el0_placement_possible(CPU_AUTO) …) ::` — emitted by `run_bsp_tegra` after a `mark_online(cpu)`
+  hoisted onto the `SCHED_ACTIVE` store line, so the predicate is **measured at the instant it
+  becomes true** rather than predicted. `CurrentEL` is re-read here rather than inherited from the
+  JM6 stamp, on `mark_el1_core`'s own reasoning. A `REFUSING` verdict is a falsified premise for
+  the whole arc, not a cosmetic miss. Why the existing `[el0core] rollup:` could not serve: it is
+  emitted by `run_bsp_tegra` **before** `mark_online`, so it reports the pre-join state forever.
+* `:: [bsprun] el0 first-run '<task>' on core N — CurrentEL EL1 checked, eret to EL0 ACCEPTED
+  (n=…) ::` — the ACCEPT half of `user_task_trampoline`'s EL0-EL1CORE guard, which has had a voice
+  only when it REFUSES since the guard was written. Without it a flight cannot distinguish "an EL0
+  task first-ran at EL1 on the boot core" from "nobody launched one". Rate-limited at 8 lines with
+  the cap announced once (`EL0_REFUSE_LOG_MAX`'s terms; the count itself is uncapped).
+
+The shell's accept line already existed and needs nothing: `:: BGRUN: bg <path> — loaded N bytes,
+entry 0x…, pid=… slot=… DETACHED ::` (`shell.rs`), paired with `:: BGRUN: bg <path> — rejected
+(…) ::` on the other branch.
+
+Gating: `bsprun_hosting_witness` is `all(tegra, bsprun)`; the EL0 pair is
+`all(tegra, bsprun, aarch64_el0)` so the EL0-less `arm-tegra-bsprun` leg compiles neither the fn
+nor a call to it. That cross — `bsprun` × `tegra_el0`, which **is** the flight image — was compiled
+by no leg, so orin 16 adds `arm-tegra-bsprun-el0` (`arm-tegra-bsprun`'s list verbatim +
+`tegra_el0`), the `arm-tegra-supstate` / `arm-tegra-supstate-el0` pattern.
+
+Measured 2026-09-06 (orin 16, still **not flown on metal**): `./arroyo check` exit 0, 46 legs, both
+`arm-tegra-bsprun` and `arm-tegra-bsprun-el0` green; `./arroyo test-arm 60` and the x86 `./arroyo
+test` exit 0; Pi `kernel8.img` sha256
+`d73a8981d65bd24e254567934f0f2d21b3307b4a761408618d576623e2669fb0` identical before and after
+(`cmp` clean), and the knob-off jetson objcopy'd loadable image identical at
+`a052a27502b2fefe847fbfb37354106a468fff4ad85cc2d14bccd5efb94c6f40` (only the non-loadable
+`.strtab` differs in the ELF container). The armed image
+(`witness,ehcihid,holocron,tegra,bsptick,bsprun,orinclick,tegra_el0,tegrasmp,orinrender,desktop_firmware,orinrx,deskcascade`)
+carries `[bsprun] host core=` ×1, `[bsprun] el0 first-run` ×2, `[orinbsprun]` ×1 and
+`[orinbsptick]` ×2 — `strings`-proven on `target/aarch64_esp/kernel.elf`.
+
 ### Gating and verification status
 
 Sites: `main.rs` terminus line (cfg-selected swap, zero lines added), sched.rs FILE TAIL
-(`run_bsp_tegra` + `compile_error!`, all `all(tegra, bsprun)` — the run-loop/terminus region; no
-spawn-path site), `gic.rs` EOI line (post-EOI `timer_preempt`, `all(tegra, bsprun)`), `timer.rs`
-banner truth-split. Armed polarity type-checked by the `arm-tegra-bsprun` matrix leg (`arm-tegra`
-verbatim + `bsptick,bsprun`; the bsprun-without-bsptick polarity is compiled by NO leg — it is the
-`compile_error!`'s job).
+(`run_bsp_tegra` + `compile_error!` + orin 16's `bsprun_hosting_witness` / `bsprun_el0_first_run`,
+all `all(tegra, bsprun)` — the run-loop/terminus region; no spawn-path site), sched.rs
+`user_task_trampoline`'s EL0-EL1CORE guard (orin 16, the accept-half call appended to the guard's
+closing brace, `all(tegra, bsprun, aarch64_el0)`), `gic.rs` EOI line (post-EOI `timer_preempt`,
+`all(tegra, bsprun)`), `timer.rs` banner truth-split. Armed polarity type-checked by the
+`arm-tegra-bsprun` matrix leg (`arm-tegra` verbatim + `bsptick,bsprun`) and, for the EL0 cross that
+is the actual flight image, by `arm-tegra-bsprun-el0` (orin 16; the same list + `tegra_el0`). The
+bsprun-without-bsptick polarity is compiled by NO leg — it is the `compile_error!`'s job.
 
 Verified 2026-08-25 at exec-smpb2 (QEMU/build only — **not yet flown on metal**):
 
@@ -10765,7 +10834,17 @@ Verified 2026-08-25 at exec-smpb2 (QEMU/build only — **not yet flown on metal*
 What the metal flight must show (a later image, not this arc's job): the `[orinbsprun]` banner,
 the first real `:: SCHED: load ::` / `[pulse5]` emission on Orin silicon, and the JD2 console
 still interactive under preemption — a keystroke and a click surviving quantum expiry is the whole
-point. What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
+point. Added orin 16, because it is the half Peter actually asked for: `[bsprun] host core=0 el=1
+-> HOSTING` at the terminus, then `bg /fat/vug.elf` accepted (`BGRUN: … loaded … pid=`, NOT
+`rejected (… EL0-EL1CORE)`) and `[bsprun] el0 first-run` naming the tenant. Prerequisite for that
+half: `bsptick` must have flown (it did, 2026-09-06 — tick1 PASS, `tmax=33000`, `exceptions=0`,
+`el2=0`), because `bsprun` without a live tick is `SCHED_ACTIVE` with no clock.
+The flight image is arc 1's line plus the one knob:
+`UNAOS_TEGRA=1 UNAOS_TEGRA_EL0=1 UNAOS_WITNESS=1 UNAOS_ORINRENDER=1 UNAOS_DESKCASCADE=1
+UNAOS_ORINRX=1 UNAOS_HOLOCRON=1 UNAOS_ORINCLICK=1 UNAOS_BSPTICK=1 UNAOS_BSPRUN=1 ./arroyo
+esp-jetson` — its own boot, never folded into the render line while Peter's SMP D1–D5 ruling is
+pending.
+What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
 (F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
 
 

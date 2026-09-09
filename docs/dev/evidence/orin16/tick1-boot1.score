@@ -1,0 +1,1 @@
+tick1: cpu_on=5 arm=1 irqel_rt=2 tick_lines=133 tmax=33000 el2=0 census=140 passes 1..43561864 serialrx=139 exceptions=0 clicks=0 -> PASS

@@ -485,7 +485,7 @@ const SHELL_PIN_ID: wm::WinId = wm::WinId::MAX;
 /// same argument: real ids are `1..=wm::MAX_WINDOWS` and `wm::WIN_NONE` is 0, so neither sentinel can
 /// ever name a live row or collide with [`PRESSED`]'s idle value. Declared in both feature polarities
 /// (a `const` costs nothing) so the press arm below reads the same either way.
-const QUARRY_PIN_ID: wm::WinId = wm::WinId::MAX - 1;
+const QUARRY_PIN_ID: wm::WinId = wm::WinId::MAX - 1; const PULSE_PIN_ID: wm::WinId = wm::WinId::MAX - 2; // A30 — the pulse instrument's pinned reopen id, one below quarry's on the same argument (real ids are 1..=wm::MAX_WINDOWS, WIN_NONE is 0, so no sentinel can name a live row or collide with PRESSED's idle value). Folded, not added — PARITY.md §5.3.
 
 /// SHELLPIN — the reopen request, latched by [`press_at`] on the pinned tile and consumed by the
 /// render service (`main.rs`) with [`take_shell_reopen`] at the tail of the same event burst. A
@@ -586,7 +586,7 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let n = pin_shell(&mut tiles, n);
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut tiles, n);
+    let n = pin_quarry(&mut tiles, n); let n = pin_pulse(&mut tiles, n); // A30 — the pulse instrument's reopen tile; the registry must report the strip the painter will paint. See the fold in `compose`. Folded, not added — PARITY.md §5.3.
     Layout::for_panel(n, pw, ph).map(|l| l.rect())
 }
 
@@ -716,7 +716,7 @@ pub fn compose() -> bool {
     let n = pin_shell(&mut rows, n);
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n);
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
     // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -956,7 +956,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let n = pin_shell(&mut rows, n);
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n);
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
@@ -994,6 +994,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         );
         return true;
     }
+    if r.id == PULSE_PIN_ID { crate::video::pulsewin::arm(); serial_println!("[dock] press at ({},{}) tile={}/{} pulse=pin -> rearmed (render pass opens it)", x, y, t, n); return true; } // A30 — the pulse instrument's pinned tile. Unlike Quarry's this needs no latch and no deferral: `pulsewin::arm()` is two release stores and touches no device, and `service()`'s open arm on the next render pass is what actually mints the window — the same split that keeps the create on the compositor's own core (see that arm's readback). So the router re-arms and is done, and the press is consumed so it never falls through to a window beneath. ⚠ FOLDED onto one line rather than added as a block: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
     if r.id == SHELL_PIN_ID {
         PRESS_OUTCOME.store(DOCK_OUT_REOPEN, Ordering::Relaxed);
         SHELL_REOPEN.store(true, Ordering::Release);
@@ -1206,7 +1207,7 @@ pub fn selftest() {
     let n = pin_shell(&mut rows, n);
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n);
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
     let mine: [Option<usize>; 3] = [
         rows[..n].iter().position(|r| r.id == w[0]),
         rows[..n].iter().position(|r| r.id == w[1]),
@@ -1277,4 +1278,54 @@ pub fn selftest() {
         );
     }
     rollup("selftest");
+}
+
+// ------------------------------------------------------------------------------------------------
+// A30 — the pulse instrument's pinned reopen tile (TAIL-APPENDED: nothing above this line moved, so
+// knob-off panic `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+
+/// A30-PIN — the PULSE instrument's permanent tile, on `pin_shell`'s and [`pin_quarry`]'s precedent.
+///
+/// **Why it has to exist.** `pulsewin::close` now clears the window's ARMED latch, which is A30's
+/// actual fix: before it, `pulsewin::service`'s open arm re-opened the window on the very next render
+/// pass and the operator's close disc did nothing that lasted (render7 caught it twice, and it is why
+/// A18's cascade census counted three opens of one window). But a close that is final and has no way
+/// back is the failure the shell's and Quarry's pins were minted to prevent — "a window an operator
+/// can close and cannot call back is a window they have lost". So the close is final AGAINST THE
+/// RENDER PASS and reversible BY THE OPERATOR, and this tile is the whole of the second half.
+///
+/// **This is not a launcher and it is not a new tile model.** Same rule as Quarry's pin: the pulse
+/// window is kernel-owned furniture, its LIVE row is already dock-addressable (kernel owners are), so
+/// this pin exists only while the window is closed and adds nothing while it is up. It APPENDS rather
+/// than prepending — Quarry is the leftmost pinned app by Peter's direction and the shell is the
+/// permanent tail, so the settled strip reads `quarry | live rows | shell | pulse`, with the
+/// instrument at the far end where a status item belongs.
+///
+/// **It is a no-op on every board that has no pulse window.** The guard is
+/// `pulsewin::ever_armed()` — a runtime fact, not a `cfg`. `pulsewin::arm()`'s only non-dock caller
+/// is `desktop_firmware::activate`, the Pi/Orin seam, so an x86 `desktop_uefi` desktop never arms it
+/// and this returns `n` untouched: the x86 dock's tile model, layout, damage signature and occlusion
+/// clip are all byte-identical to what they were.
+///
+/// Returns the new count. Applied by every reader of the model — `compose`, [`press_at`],
+/// [`strip_rect`], `selftest` — so painter, router, registry and self-test cannot disagree about the
+/// tile count, which is the invariant `pin_shell`'s header states and `selftest` checks.
+fn pin_pulse(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    if n >= wm::MAX_WINDOWS
+        || !crate::video::pulsewin::ever_armed()
+        || crate::video::pulsewin::is_open()
+    {
+        return n;
+    }
+    let mut e = wm::DockEntry::empty();
+    e.id = PULSE_PIN_ID;
+    e.owner_asid = crate::video::pulsewin::OWNER;
+    e.title[..5].copy_from_slice(b"pulse");
+    e.title_len = 5;
+    // Closed => OFF the panel, so the pip takes the minimised ink — `pin_shell`'s rule, unchanged.
+    e.visible = false;
+    e.focused = false;
+    rows[n] = e;
+    n + 1
 }

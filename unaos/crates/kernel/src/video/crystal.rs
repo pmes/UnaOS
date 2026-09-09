@@ -37,20 +37,20 @@
 //! | 0 | About This Shard  | prints the Shard identity + version to the log (REAL)           |
 //! | 1 | — (separator)     | —                                                               |
 //! | 2 | Sleep             | honest STUB — prints `unimplemented: Sleep` (no ACPI S3 path)    |
-//! | 3 | Restart           | honest STUB — prints `unimplemented: Restart` (no reboot path)   |
-//! | 4 | Shut Down         | x86: REAL — [`crate::arch::acpi_power::poweroff`] (ACPI S5). aarch64: honest STUB |
+//! | 3 | Restart           | aarch64 non-Pi: REAL — PSCI `SYSTEM_RESET` ([`crate::power::crystal_restart`]). x86/Pi: honest STUB |
+//! | 4 | Shut Down         | x86: REAL — ACPI S5 ([`crate::arch::acpi_power::poweroff`]). aarch64 non-Pi: REAL — PSCI `SYSTEM_OFF`. Pi: honest STUB |
 //!
-//! PI-DESK — **the RENDER and the HIT-TEST cross to aarch64 whole; two of the four ACTIONS do not,
-//! and the menu says so on the wire rather than pretending.** `About` is REAL on both arches. On the
-//! Pi, `Restart` and `Shut Down` join `Sleep` as honest stubs, each printing a line that names the
-//! missing mechanism by name (PSCI `SYSTEM_RESET` / `SYSTEM_OFF` need an EL3 secure monitor, and Pi 4
-//! bare-metal runs at EL2 with nothing behind the `smc`; the real Pi wiring is the BCM2711
-//! watchdog/`PM_RSTS` block, which is a driver arc). See [`fire`] for the full ledger.
+//! A34 (Peter, render7 2026-09-06: *"crystal restart/shut down not working"*) — **the RENDER and the
+//! HIT-TEST cross to aarch64 whole, and so now do the ACTIONS, wherever a monitor answers PSCI.** On
+//! the ORIN, ATF/BL31 at EL3 services `SYSTEM_RESET` / `SYSTEM_OFF` on the same SMC conduit
+//! `smp_virt`'s `CPU_ON` proves every boot, so both verbs are REAL there. The **Pi 4** keeps its
+//! honest stubs: bare-metal at EL2 with nothing behind the `smc`, its real wiring is the BCM2711
+//! watchdog/`PM_RSTS` block, a driver arc. See [`fire`] for the full ledger.
 //!
-//! **A stub is not a no-op and not a fake success.** Sleep and Restart RENDER as pickable items — a
-//! menu item that could not be shown pickable would be unfalsifiable — and their pick prints one
-//! honest line naming the verb and that it is unimplemented. Peter sees on glass/serial that the item
-//! is a stub, not that the menu is broken.
+//! **A stub is not a no-op and not a fake success.** Sleep (and Restart where it is one) RENDER as
+//! pickable items — an item that could not be shown pickable would be unfalsifiable — and the pick
+//! prints one honest line naming the verb and that it is unimplemented. Peter sees on glass/serial
+//! that the item is a stub, not that the menu is broken. `action=` on the pick line is arch-TRUE.
 //!
 //! # Destructive-action discipline
 //!
@@ -112,9 +112,9 @@ pub enum Verb {
     About,
     /// Sleep — ACPI S3 suspend. STUB: no S3 path exists; the pick prints `unimplemented`.
     Sleep,
-    /// Restart — a warm reboot. STUB: no reboot path exists; the pick prints `unimplemented`.
+    /// Restart — a warm reboot. REAL where PSCI answers (aarch64 non-Pi); an honest STUB elsewhere.
     Restart,
-    /// Shut Down — ACPI S5 soft-off. REAL, and the one action that halts the machine.
+    /// Shut Down — ACPI S5 (x86) or PSCI SYSTEM_OFF (aarch64 non-Pi). The one action that halts the box.
     ShutDown,
 }
 
@@ -132,7 +132,7 @@ impl Verb {
     /// `true` when the verb is BACKED by a real action, `false` when it is an honest stub. On the
     /// witness so a capture reads `action=real` or `action=stub` beside the pick.
     const fn real(self) -> bool {
-        matches!(self, Verb::About | Verb::ShutDown)
+        matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
     }
 
     /// The verb's stable ordinal for the witness (`u8`), independent of its row index.
@@ -239,6 +239,45 @@ const fn item_count() -> usize {
 }
 const ITEM_COUNT: usize = item_count();
 
+// ── THE DROPDOWN PRIMITIVE, RE-EXPORTED ──────────────────────────────────────────────────────────
+//
+// WINMENU (R21) — a window's menus are drawn by [`super::winmenu`] as a SECOND dropdown, and Peter's
+// ruling is that it must be the SAME dropdown: *"menus belong in the menu bar"* is one surface with
+// one look, not two that resemble each other. So the row metrics leave this module by name rather
+// than being restated over there. A second copy of "how tall is a menu row" is two things that can
+// drift, and they drift SILENTLY — the only symptom is a pick landing one row off the item the
+// operator pressed.
+//
+// Deliberately NOT re-exported: `ROWS`, `menu_rect`, `item_at`, `OPEN`. Those are the SHARD menu's
+// own model and its own modal state; sharing them would make the two surfaces one surface with two
+// names, which is the opposite of what a second publisher needs.
+
+/// WINMENU — the dropdown's keyline border, px. See the block above.
+pub const DROP_BORDER: usize = BORDER;
+/// WINMENU — an item row's height, px.
+pub const DROP_ITEM_H: usize = ITEM_H;
+/// WINMENU — a separator band's height, px.
+pub const DROP_SEP_H: usize = SEP_H;
+/// WINMENU — the horizontal inset of item text from the inner edge, px.
+pub const DROP_PADX: usize = PADX;
+/// WINMENU — the glyph advance the dropdown draws at.
+pub const DROP_CELL_W: usize = CELL_W;
+/// WINMENU — the glyph cell height the dropdown draws at.
+pub const DROP_CELL_H: usize = CELL_H;
+/// WINMENU — the atlas the dropdown draws from.
+pub const DROP_FACE: super::font::Face = FACE;
+
+/// WINMENU — **is the SHARD menu dropped?**
+///
+/// Read by [`super::winmenu::press_at`]'s CLOSED arm, which declines every point while this is
+/// `true` so the press reaches [`press_at`]'s own dismiss-outside arm. That decline is the whole of
+/// the one-dropdown-at-a-time invariant `wm::MENU_OCC_MAX == 1` depends on — see `winmenu`'s header.
+/// One relaxed load; nothing else in this module is exposed.
+#[inline]
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::Relaxed)
+}
+
 const _: () = {
     // The row height must clear the glyph it centres, or the label is cut.
     assert!(ITEM_H >= CELL_H);
@@ -322,23 +361,30 @@ pub fn last_press_outcome() -> &'static str {
 // Geometry — the dropdown rect, and the row layout inside it
 // ---------------------------------------------------------------------------
 
-/// **The dropdown's rect on a `pw` x `ph` panel, or `None`.** Anchored under the crystal: its left
-/// edge aligns with the crystal's left (as macOS drops its apple menu from the logo's left), its top
-/// is the bar's bottom edge, and it is clamped so it never runs off the right or bottom of the panel.
+/// **The dropdown's rect on a `pw` x `ph` panel, or `None`.** SO4 — anchored under the crystal by its
+/// RIGHT edge: the menu's right edge aligns with the crystal's right, which since SO4 IS the bar's
+/// right edge, so the dropdown falls flush into the corner. Its top is the bar's bottom edge.
+///
+/// This is the whole of Peter's render7 complaint, in one line of arithmetic. The menu used to anchor
+/// by its LEFT edge to the crystal's left, and with the mark one `PAD` in from the panel's left the
+/// dropdown opened at `menu=170x121+12+34` — *"crystal menu has a gap to the left ... it should be all
+/// the way to the right edge"*. A left-anchored menu under a right-hand mark would have run off the
+/// panel and been clamped back; right-anchoring is the rule that makes the clamp unnecessary, which is
+/// why the mark's move and the menu's anchor are ONE change and not two.
 ///
 /// `None` when the bar is absent (so there is no crystal to hang from) or the panel is too small to
 /// hold the menu below the bar at all — the same decline-rather-than-squeeze rule the strip
 /// constructors follow.
 fn menu_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
-    let (cx, _cy, _cw, _ch) = menubar::crystal_box_abs(pw, ph)?;
+    let (cx, _cy, cw, _ch) = menubar::crystal_box_abs(pw, ph)?;
     let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
     let my = by + bh; // flush under the bar
     if MENU_W > pw || my + MENU_H > ph {
         return None; // panel cannot host the menu below the bar
     }
-    // Clamp x so the right edge stays on the panel; the left never goes past 0 because the crystal is
-    // one PAD in from the left already.
-    let mx = if cx + MENU_W > pw { pw - MENU_W } else { cx };
+    // Right-anchored: the menu's right edge meets the crystal's. Saturating because a panel narrower
+    // than the menu is already refused above, so this can only clamp a degenerate bar to the left edge.
+    let mx = (cx + cw).saturating_sub(MENU_W);
     Some((mx, my, MENU_W, MENU_H))
 }
 
@@ -489,6 +535,14 @@ fn open_via(pw: usize, ph: usize, via: &str) {
         ":: SHARD-MENU: crystal_press=open via={} menu={}x{}+{}+{} items={} ::",
         via, mw, mh, mx, my, ITEM_COUNT
     );
+    // SO4 — the geometry witness, in the family that OWNS the geometry. `anchor=` states the rule the
+    // rect was derived from, and `gap_right=` is the falsifier for Peter's complaint: it is the pixels
+    // between the dropdown's right edge and the panel's, and the rule says it is 0.
+    let (cbx, _cby, cbw, cbh) = menubar::crystal_box_abs(pw, ph).unwrap_or((0, 0, 0, 0));
+    serial_println!(
+        "[menubar] crystal menu={}x{}+{}+{} anchor=right-flush-under-crystal glyph={}x{}+{} bar_w={} gap_right={} ::",
+        mw, mh, mx, my, cbw, cbh, cbx, pw, pw.saturating_sub(mx + mw)
+    );
     // MENU-DRIVE (x86 trunk 122ed63e, ported; PA41 on the Pi) — **an open menu must DRIVE the pass
     // that paints it.** [`compose`] runs only from `strip::compose_all` at the tail of
     // `wm::composite_once`, and every OTHER state-changing gesture (a close, a drag, a zoom, a
@@ -544,29 +598,28 @@ pub fn dismiss_for_bar_off() {
 ///
 /// - `About`    — prints the Shard identity + version (REAL).
 /// - `Sleep`    — honest STUB: prints `unimplemented: Sleep`, no side effect.
-/// - `Restart`  — honest STUB: prints `unimplemented: Restart`, no side effect.
-/// - `ShutDown` — on x86, REAL: [`crate::arch::acpi_power::poweroff`], which does not return.
+/// - `Restart`  — aarch64 non-Pi: REAL, [`crate::power::crystal_restart`] (PSCI `SYSTEM_RESET`). Else STUB.
+/// - `ShutDown` — x86: REAL, [`crate::arch::acpi_power::poweroff`]. aarch64 non-Pi: REAL, PSCI `SYSTEM_OFF`.
 ///
-/// ⛔ The fixture must NEVER call this with [`Verb::ShutDown`], and does not: it drives picks only for
-/// the safe verbs and proves Shut Down's routing through [`item_at`].
+/// ⛔ The fixture must NEVER drive a verb that ACTS. It drives Shut Down never, and A34 widens the ban
+/// to Restart on any board where PSCI answers — leg 4 tests [`Verb::real`], the same predicate the arms
+/// below dispatch on, so the ban cannot drift away from the wiring it is protecting against.
 ///
-/// # PI-DESK — what Restart and Shut Down are on the Pi, and why they are NOT wired
+/// # A34 — why these two verbs were INERT, and what they call now
 ///
-/// The render and the hit-test cross to aarch64 whole; the ACTIONS do not, and the honest answer is
-/// stated on the wire rather than faked. `acpi_power::poweroff` is an x86 path (ACPI S5 through the
-/// PM1 control block) and has no aarch64 twin. The aarch64 twin *of the family* is PSCI —
-/// `SYSTEM_OFF` (0x8400_0008) and `SYSTEM_RESET` (0x8400_0009) through an `smc` — and this kernel does
-/// carry PSCI, but only in `arch/aarch64/smpprobe.rs`, only `CPU_ON`/`AFFINITY_INFO`/`FEATURES`, and
-/// only on the **Tegra** path where an EL3 secure monitor answers. `SYSTEM_OFF` is queried by
-/// `PSCI_FEATURES` there and, in that file's own words, *"never invoked"*.
+/// render7, 2026-09-06: the wire carried `crystal_pick verb=ShutDown action=real`, and the Orin stayed
+/// up another twelve minutes until Peter cut the power. Nothing in the menu was broken — the pick
+/// resolved, the dropdown dismissed, `fire` ran. What `fire` ran was a PRINT. Both aarch64 arms held a
+/// Pi-era `unimplemented:` line written when the Pi was the only aarch64 desktop, and `#[cfg(target_arch
+/// = "aarch64")]` cannot tell a Pi from an Orin. The Orin's chain is ATF/BL31 + OP-TEE: an EL3 monitor
+/// servicing PSCI on the same SMC conduit `smp_virt`'s `CPU_ON` proves every boot. The MECHANISM was
+/// never missing — [`crate::power`] has carried `SYSTEM_RESET` (0x8400_0009) and `SYSTEM_OFF`
+/// (0x8400_0008) since ORIN-REBOOT. The CALL was. So both arms split on `feature = "pi"`, not on arch.
 ///
-/// The Pi 4 is the case that settles it: bare-metal BCM2711 boots to EL2 with **no EL3 firmware
-/// behind it**, so an `smc` is not a power call — it is an unhandled exception. There is nothing to
-/// route to. So both verbs print an `unimplemented:` line naming what is missing, exactly as `Sleep`
-/// already did on x86, and the menu remains fully live: it opens, it hit-tests, it dismisses, and
-/// `About` is REAL on both arches. Wiring these means a Pi power path (the watchdog/PM block for
-/// reset, `PM_RSTS` for halt) — a driver arc, not a menu arc, and named as the follow-up rather than
-/// smuggled in here.
+/// [`Verb::real`] was the other half and is fixed with it: a flat `About | ShutDown` match printed
+/// `action=real` beside a Shut Down that only printed a line. A verb announcing `real` and doing
+/// nothing is worse than one announcing `stub` — it spends the operator's trust in the witness — so
+/// `real` is computed from the same `cfg` the arms dispatch on. The Pi's lines and image are untouched.
 fn fire(verb: Verb) {
     match verb {
         Verb::About => {
@@ -584,12 +637,12 @@ fn fire(verb: Verb) {
         Verb::Restart => {
             #[cfg(target_arch = "x86_64")]
             serial_println!(":: SHARD: unimplemented: Restart (no reboot path) ::");
-            // PI-DESK — the same honest line, naming the aarch64 reason rather than the x86 one. See
-            // this function's header: PSCI SYSTEM_RESET needs an EL3 monitor the Pi does not have.
-            #[cfg(target_arch = "aarch64")]
-            serial_println!(
-                ":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::"
-            );
+            // A34 — the ACTION, at last: `power::crystal_restart` announces `[crystal] verb=restart ->
+            // PSCI SYSTEM_RESET`, hands the board to ATF/BL31, and returns only to name the refusal code.
+            #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+            crate::power::crystal_restart();
+            #[cfg(all(target_arch = "aarch64", feature = "pi"))]
+            serial_println!(":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::");
         }
         Verb::ShutDown => {
             // Deliberate and destructive: the operator opened the menu and pressed Shut Down. Say so
@@ -600,14 +653,14 @@ fn fire(verb: Verb) {
                 serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
                 crate::arch::acpi_power::poweroff();
             }
-            // PI-DESK — NOT wired, and it returns. `smpprobe.rs` carries PSCI SYSTEM_OFF as a
-            // FEATURES query it deliberately never invokes, and on the Pi there is no EL3 behind the
-            // `smc` to answer it at all. A verb that cannot act says so and leaves the machine
-            // running; it does not park the operator's desktop in a `wfi` to look decisive.
-            #[cfg(target_arch = "aarch64")]
-            serial_println!(
-                ":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::"
-            );
+            // A34 — the ACTION. Twelve minutes of an Orin that had been told to shut down (render7)
+            // is what this line closes: `power::crystal_shutdown` announces `[crystal] verb=shutdown
+            // -> PSCI SYSTEM_OFF` and calls it. The Pi keeps its honest line — there is no EL3 PSCI monitor in the Pi's CURRENT boot chain (spin-table release, no BL31 — a boot-chain consequence, not a BCM2711 property)
+            // behind its `smc`, and a verb that cannot act must not park the desktop to look decisive.
+            #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+            crate::power::crystal_shutdown();
+            #[cfg(all(target_arch = "aarch64", feature = "pi"))]
+            serial_println!(":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::");
         }
     }
 }
@@ -679,12 +732,12 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true;
     }
 
-    // Closed: the press cell we own is the bar's whole upper-left corner — FITTS-CORNER
-    // ([`menubar::crystal_corner_abs`]): the crystal's full left slot (glyph plus both PAD margins)
-    // by the bar's full height, anchored at the bar's origin so panel pixel (0,0) opens the menu
-    // with zero aim. Every pixel of the cell is bar chrome composited above the windows, so this
-    // claims nothing a window's own chrome could own; the DROPDOWN still anchors to
-    // `crystal_box_abs`, the painted glyph, unchanged.
+    // Closed: the press cell we own is the bar's whole upper-RIGHT corner since SO4 — FITTS-CORNER
+    // ([`menubar::crystal_corner_abs`]): the crystal's full slot (glyph flush to the right edge plus
+    // its inner PAD) by the bar's full height, so panel pixel `(pw-1, 0)` opens the menu with zero
+    // aim. Every pixel of the cell is bar chrome composited above the windows, so this claims nothing
+    // a window's own chrome could own; the DROPDOWN still anchors to `crystal_box_abs`, the painted
+    // glyph — now by its RIGHT edge, which is the same edge.
     if let Some((zx, zy, zw, zh)) = menubar::crystal_corner_abs(pw, ph) {
         if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
             // The witness's `via=` word: on the painted glyph itself, or in the widened cell.
@@ -943,7 +996,7 @@ pub fn rollup(scope: &str) {
 ///
 /// 1. **closed by default** — `OPEN` is observed `false` before the fixture touches it.
 /// 2. **a crystal press OPENS** — with the bar enabled, a press at the crystal box centre opens the
-///    menu and [`menu_rect`] is placeable. And FITTS-CORNER: a press at panel pixel `(0,0)` — the
+///    menu and [`menu_rect`] is placeable. And FITTS-CORNER: a press at panel pixel `(pw-1, 0)` — the
 ///    zero-aim corner flick, a MISS before the corner cell existed — opens it too.
 /// 3. **every item resolves to its verb** — [`item_at`] at each item row's centre answers About,
 ///    Sleep, Restart, Shut Down in tree order. This is the leg that proves Shut Down is REACHABLE as
@@ -987,12 +1040,12 @@ pub fn selftest() {
         }
         None => false,
     };
-    // Leg 2b — FITTS-CORNER: panel pixel (0,0), the zero-aim flick target, opens too. This is the
-    // corner principle asserted at its extreme point, not a sample inside the glyph: (0,0) was a MISS
-    // before the corner cell existed. Dismiss first so the press is judged by the CLOSED arm; the
+    // Leg 2b — FITTS-CORNER: the panel's top-RIGHT pixel (SO4 moved the mark there), the zero-aim flick
+    // target, opens too. The corner principle asserted at its extreme point, not a sample in the glyph —
+    // that pixel was a MISS before the corner cell existed. Dismiss first so the press is judged by the CLOSED arm; the
     // reopened menu is exactly the state leg 3 wants.
     dismiss("corner-leg");
-    let corner_ok = press_at(0, 0) && OPEN.load(Ordering::Acquire);
+    let corner_ok = press_at(pw as i32 - 1, 0) && OPEN.load(Ordering::Acquire);
 
     let mr = menu_rect(pw, ph);
     let placed = mr.is_some();
@@ -1011,8 +1064,9 @@ pub fn selftest() {
         }
     }
 
-    // Leg 4 — a SAFE pick fires and dismisses. About first (real), then Sleep and Restart (stubs) so
-    // the wire carries their honest lines. Shut Down is NEVER driven.
+    // Leg 4 — a SAFE pick fires and dismisses. About, Sleep, then Restart ONLY where A34 left it a stub:
+    // where PSCI answers, driving that row would RESET the board mid-fixture (Shut Down's ban, widened).
+    let drive_restart = !Verb::Restart.real();
     let picks_before = PICKS.load(Ordering::Relaxed);
     let pick_safe = |verb: Verb| -> bool {
         // Reopen and press the row that carries `verb`.
@@ -1031,8 +1085,8 @@ pub fn selftest() {
     };
     let about_fired = pick_safe(Verb::About);
     let sleep_fired = pick_safe(Verb::Sleep);
-    let restart_fired = pick_safe(Verb::Restart);
-    let picks_counted = PICKS.load(Ordering::Relaxed) == picks_before + 3;
+    let restart_fired = !drive_restart || pick_safe(Verb::Restart);
+    let picks_counted = PICKS.load(Ordering::Relaxed) == picks_before + if drive_restart { 3 } else { 2 };
     let pick_ok = about_fired && sleep_fired && restart_fired && picks_counted;
 
     // Leg 5 — click-outside dismisses.
@@ -1103,6 +1157,23 @@ pub fn selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");
+    // WINMENU (R21/MENUBAR2) — the window-menu fixture chains from here, exactly as
+    // `dock::selftest` chains `menubar::selftest`: the x86 battery names ONE furniture fixture and
+    // the family reaches the rest, so a surface added to `video/` never needs a line in
+    // `arch/x86_64/syscall.rs`, which another lane owns. It runs AFTER this one because it needs the
+    // SHARD menu closed — `winmenu::press_at`'s closed arm declines every point while the crystal is
+    // up, which is the one-dropdown-at-a-time invariant — and this function's restore above has just
+    // guaranteed that.
+    super::winmenu::selftest();
+    // QUARRYDOOR (KEYDOORS F1) — the file manager's KEY DOOR fixture, chained here for the same
+    // reason `winmenu::selftest` is: the x86 battery names ONE furniture fixture and the family
+    // reaches the rest. Chained from THIS tail rather than from `winmenu::selftest`'s, because that
+    // function has three early SKIP returns (no panel, full window table) and a door fixture that
+    // silently vanished with them would be a proof that stops existing exactly when the tree gets
+    // interesting. It runs LAST because it opens and closes a real `wm` row, and both neighbours
+    // above want the desktop quiet.
+    #[cfg(all(feature = "quarry", feature = "witness"))]
+    super::quarry::door_selftest();
 }
 
 /// SHARD-PRESS fixture (PA41) — **a press on the crystal, through the LIVE furniture router, puts the

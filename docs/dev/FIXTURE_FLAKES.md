@@ -399,6 +399,72 @@ let a green spec run bury it.
 
 ---
 
+## Class 3 — PTRDEAD's backlog leg loses its coalesced entry to a FOREIGN consumer
+
+**Signature on the wire.** The `-> FAIL` form of
+`arch/x86_64/syscall.rs:6699`'s rollup, with `fpop12` NON-ZERO:
+
+```
+[ptrdead] backlog whole=false nodrop=true order=true pushed=192 entries=0 travel=(0,0) folded=191 dropped=0 fpop12=2 fpop3=0 quiesced=false -> FAIL
+```
+
+The PASS from the same build, same session, on an idle host:
+
+```
+[ptrdead] backlog whole=true nodrop=true order=true pushed=192 entries=1 travel=(192,-192) folded=192 dropped=0 fpop12=0 fpop3=0 quiesced=false -> PASS
+```
+
+**`fpop12` is the discriminator and it is already printed** — read it before
+anything else. `foreign12 = (evq_pops() - pop0) - entries` (`arch/x86_64/syscall.rs`,
+in the same fixture) counts pops made by a consumer *other than this leg* while the
+leg held the queue. The leg pushes `QUEUE_SIZE_PUB * 3` relative reports expecting
+them to coalesce into ONE entry carrying the whole travel; another drain popping two
+of them mid-leg leaves `entries=0`, `travel=(0,0)` and `folded` one short of
+`pushed`, and `whole` is false by arithmetic. Note `quiesced=false` on BOTH lines
+above: it is *not* the discriminator, and reading it as one sends you after the
+wrong mechanism.
+
+**Trigger conditions.** Host CPU contention. Observed once (2026-09-06, orin 16
+KEYDOORS-FIX) on the single `./arroyo test 60` run that was launched while
+`./arroyo kernel8` was compiling in the same worktree — the two share `target/`
+and the host's cores. Three runs of the **same kernel binary** with the host
+otherwise idle were green, before and after. Same family as Class 1 — an observer
+racing another consumer, made visible by load — but a different leg and a
+different accounting field.
+
+**Root cause — SUSPECT, mechanism clear, not confirmed.** `fpop12=2` proves a
+foreign consumer ran; *which* one has not been established. The likely candidates
+are the render-service drain and the drag belt, both of which pop `EVENT_QUEUE`
+and neither of which is quiesced for this leg. Whether the correct cure is to
+quiesce them (as the `order` leg alongside it already does via `SFQ_QUIESCE`) or
+to make the leg tolerate a foreign pop is a design question this entry does not
+answer.
+
+**What to capture on recurrence.**
+
+1. The full `[ptrdead] backlog` line — specifically `fpop12`, `fpop3`,
+   `entries`, `folded` and `pushed`. `fpop12=0` with `whole=false` is a
+   DIFFERENT failure and does not belong to this class: it means the coalescing
+   itself broke, which is a regression.
+2. The `[ptrdead] order detail: got=… fpop=… fpush=… quiesced=…` line, if the
+   `order` leg also went red.
+3. What else was running on the host — concurrent `arroyo` invocations above all.
+   A red seen alongside a build is weak evidence; a red on a quiet host is strong
+   evidence and moves this entry off SUSPECT.
+4. Whether a re-run on an idle host is clean, and how many.
+
+**Disposition — WATCH.** Not fixed, and it DOES turn the x86 gate red on its own:
+`FAIL ::` / `-> FAIL` are in arroyo's `FAULT_PATTERNS` (`arroyo:2349`) and the
+test leg's exit status is the fault scan's. So this is a real gate failure to
+diagnose, not a line to skim past — but with `fpop12` non-zero and a build racing
+it, it is this class rather than a regression in whatever arc is in flight.
+
+**Do not run gates concurrently in one worktree.** The runs share `target/` and
+the host's cores, and this class is the second-order cost — the same reason
+`target/` is never a flash-staging handoff source.
+
+---
+
 ## Adding an entry
 
 An entry earns its place when a failure has been seen **more than once**, or once

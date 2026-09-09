@@ -1,0 +1,9 @@
+[ga10bprobe2] pg=0x1 clk=2/3 boot0=0xb7b000a1 -> POWERED chipset=0x17b arch=0x17 (Ampere) impl=0xb (GA10B as inferred) r
+[ga10bprobe2] rung 2 complete — RETURNING to the boot (no SYSTEM_OFF; the flight is a full boot)
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25ac52208) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25ac52208) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25ac52208) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25ac52208) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25ac52208) ::
+[deskcascade] -> CASCADED windows=1 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=
+FINAL 2026-09-06T12:27:30Z 2184 lines

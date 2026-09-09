@@ -773,11 +773,19 @@ pub mod serialrx {
     /// THE DRAIN — the one statement the console path lacked. Appended to the xHCI poll block of
     /// `jd2_console_pump` (phase 1 and phase 2), `jd2_supstate_phase2` and `kbd_pump_body`.
     pub fn drain() {
-        while let Some(b) = crate::arch::poll_input() {
-            crate::pal::push_event(crate::pal::Event::Key(b));
-            RX.fetch_add(1, Ordering::Relaxed);
+        // RXMERGE (A37): the RBR read POPS the byte out of the RX FIFO the SPE reads too, so a
+        // parked source must not read AT ALL — read-and-discard would destroy the byte instead of
+        // leaving it for the mailbox. `uartc_owns_rbr` is the whole arbitration; see the RXMERGE
+        // block at the foot of this module.
+        if uartc_owns_rbr() {
+            while let Some(b) = crate::arch::poll_input() {
+                deliver(SRC_UARTC, b);
+            }
+        } else {
+            PARKED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tcurx")] seed_lsr_parked();
         }
-        witness_once();
+        #[cfg(feature = "tcurx")] mbox_drain(); witness_once();
     }
 
     /// One-shot: the raw LSR word of the first poll, printed off-lock from the pump.
@@ -827,10 +835,326 @@ pub mod serialrx {
         // RXDISCRIM (A16): `ovrf=` is the running count of polls that saw LSR.OVRF — an overrun
         // sets it, a competing reader never does. Cumulative like `rx=`, so the burst window is
         // scored by the delta across it.
-        let ovrf = OVRF.load(Ordering::Relaxed);
+        let ovrf = OVRF.load(Ordering::Relaxed); #[cfg(feature = "tcurx")] serial_println!("[serialrx] rx={} (+{}) polls={} refused={} ovrf={} lsr0={:#010x} mbox={} -> {} (TCURX2: `mbox=` = bytes TAKEN from the TCU RX mailbox and consumed by write-back; `rx=` totals BOTH sources, UARTC RBR + mailbox)", rx, delta, polls, refused, ovrf, lsr0, crate::arch::hsp_tegra::rx_mbox_took(), verdict); #[cfg(not(feature = "tcurx"))]
         serial_println!(
             "[serialrx] rx={} (+{}) polls={} refused={} ovrf={} lsr0={:#010x} -> {}",
             rx, delta, polls, refused, ovrf, lsr0, verdict
+        );
+        // RXMERGE (A37): the source split and the two rule counters, on the same cadence.
+        #[cfg(feature = "tcurx")]
+        rxmerge_census();
+    }
+
+    // TCURX2 (orin 15, `tcurx` = tegra+orinrx+tcuprobe+tcurx, DEFAULT OFF) — the SECOND RX SOURCE.
+    //
+    // Rung 1 (`tcuprobe`, render6) proved where the CCPLEX's console input actually is: the burst
+    // `tste\r` left UARTC with `s`,`t`,`\r` while the TCU RX mailbox sat at `raw=0x82006574`
+    // (full=1, nbytes=2, data=[74 65 …]) — the two bytes UARTC lost, parked and never consumed
+    // because the probe deliberately never writes. R19 says a failed-under-conditions path stays
+    // open, so the RBR poll above is UNTOUCHED and this is an ADDITION: `drain` now pulls from both
+    // sources into the same `Event::Key` queue and the same `RX` counter, with `mbox=` in the
+    // census saying how many of those bytes came from the mailbox.
+    //
+    // Everything from here to the module's closing brace is a TAIL APPEND inside the tail module:
+    // knob-off it is `#[cfg]`-erased and no line above it moved, so every `panic::Location` in this
+    // file — and the Pi's `kernel8.img`, which compiles `serial.rs` with `tegra` off — is untouched.
+    /// Drain the TCU RX mailbox: take + consume one byte per pass until the word reports empty, and
+    /// push each as the same `Event::Key` the RBR loop pushes. The consume-by-write-back protocol
+    /// and the ONLY register write the knob adds live in `arch::aarch64::hsp_tegra::rx_mbox_take`.
+    /// Called from `drain` OFF the `SERIAL_PORT` lock (the RBR `while` above has already released
+    /// it), which is what makes the `[tcurx] took=` per-byte witness safe to print from in there.
+    /// Bounded by construction: every iteration clears bit 31 or decrements the count, and a FULL
+    /// word with nbytes == 0 is consumed as a flush tag — so the loop cannot spin on a stuck word.
+    #[cfg(feature = "tcurx")]
+    fn mbox_drain() {
+        while let Some(b) = crate::arch::hsp_tegra::rx_mbox_take() {
+            deliver(SRC_MBOX, b);
+        }
+    }
+
+    // ═══ RXMERGE (A37, orin 16) — ONE OWNER, ONE ORDERED STREAM ══════════════════════════════════
+    //
+    // THE DEFECT, from render7 2026-09-06 (`~/unaos-bench/scratch/orin16/render7-boot1.log`, the
+    // injector's own log beside it proving five bytes per leg):
+    //
+    //   BURST `tste` + CR — UARTC's RBR delivered `s`,`t`,CR (:1347-1349) and the mailbox delivered
+    //   `t`,`e` SIXTEEN LINES LATER (:1363-1366), after the shell had already run the CR. Five bytes
+    //   in, five keys out — exactly-once held — but the ORDER was `s t CR t e`, so the shell saw
+    //   `cmd="st"` and the late `te` fell into the next line.
+    //
+    //   PACED, same five bytes — the mailbox carried ALL FIVE in order (`t`,`s`,`t`,`e` at :1498-1507
+    //   then CR at :1521) while UARTC ALSO delivered the CR (:1508, no `[tcurx] took=` ahead of it).
+    //   `keys=6` for five injected: `rx=11 (+6) … mbox=7`. THE SAME BYTE CAME DOWN BOTH TRANSPORTS.
+    //
+    // MECHANISM. UARTC is the SPE/TCU's combined-UART port (A16): the SPE reads its RBR and forwards
+    // console RX into the HSP shared mailbox, which is the CCPLEX's actual console-input contract.
+    // Our direct RBR poll is a SECOND reader on that one FIFO. Each RBR read pops an entry, so the
+    // two readers normally split the stream (the burst leg: 3 to us, 2 to the SPE) — but the pop is
+    // not atomic across two masters, so an overlapping pair of reads can both retire the same entry
+    // (the paced CR). The two transports then have wildly different latencies — the RBR is delivered
+    // in the pass that reads it, the mailbox whenever the SPE gets round to posting and we next
+    // drain — so their interleave at `Event::Key` is arbitrary. Two readers, no shared sequence.
+    //
+    // WHY NOT A MERGE QUEUE. A merge "keyed by arrival" is what the code already did: both sources
+    // push into one PAL queue in observation order, and that produced `cmd="st"`. There is NO
+    // ordering tag on the wire — the mailbox word carries a byte count, not a sequence number — so
+    // no consumer can reconstruct the send order from two unsequenced transports. Nor can duplicates
+    // be filtered by value: a human typing `tt` is indistinguishable from one `t` mirrored, and a
+    // value filter would silently eat the second keystroke. **Exactly-once and in-order therefore
+    // require exactly ONE reader.** That is this block.
+    //
+    // WHICH ONE — the mailbox, on the paced leg's evidence: it carried 5 of 5 in order, unaided. The
+    // burst leg's mailbox share was short (2 of 5) precisely because our RBR poll stole the other
+    // three first; remove the thief and the SPE has the whole stream to forward. The RBR poll is
+    // KEPT, not deleted (R19): it is the source whenever the mailbox never armed (no DTB resolution,
+    // or a board where the TCU is not the console), which is also the `tcurx`-off image's behaviour,
+    // unchanged.
+    //
+    // THE RULE IS STATED AS `const fn`s AND CHECKED BY `./arroyo check`. `#[cfg(test)] mod tests` is
+    // dead code in this crate by construction — nothing runs `cargo test` on a `no_std` kernel and
+    // `check` cannot see it (the reason `gui_watchdog.rs` and `drivers/gpu/kepler.rs` both removed
+    // theirs). The `const _` block below is const-evaluated on every `arm-tegra-tcurx` leg of
+    // `./arroyo check`, so a regression in the ordering/dedup rule is a BUILD FAILURE, and QEMU
+    // models no Tegra234 so there is nothing for `test-arm` to exercise anyway.
+
+    /// Source tags. Plain `u8` so the whole rule below is const-evaluable.
+    const SRC_UARTC: u8 = 0;
+    #[cfg(feature = "tcurx")]
+    const SRC_MBOX: u8 = 1;
+
+    /// Both readers deliver — the render7 behaviour, and the state before the mailbox arms.
+    pub const POLICY_BOTH: u8 = 0;
+    /// The mailbox owns RX outright; the UARTC RBR is not read at all.
+    #[cfg(feature = "tcurx")]
+    pub const POLICY_MBOX_ONLY: u8 = 1;
+
+    /// THE ARBITRATION. An armed mailbox (rung 1 resolved the word from the live DTB) means the SPE
+    /// forward is available, and it takes the console outright.
+    #[cfg(feature = "tcurx")]
+    pub const fn policy_for(mbox_armed: bool) -> u8 {
+        if mbox_armed { POLICY_MBOX_ONLY } else { POLICY_BOTH }
+    }
+
+    /// May the direct UARTC RBR poll run? Only under `BOTH`. This is a "do not READ" rule, never a
+    /// "read and drop" one: the read is what pops the byte away from the SPE.
+    pub const fn polls_uartc(policy: u8) -> bool {
+        policy == POLICY_BOTH
+    }
+
+    /// A cross-source handoff: the delivered stream just switched transports. This is render7's
+    /// REORDER signature (the burst's `s t CR` from UARTC then `t e` from the mailbox). Under
+    /// `MBOX_ONLY` it can never be true — which is the claim this arc makes.
+    pub const fn is_handoff(prev_src: u8, src: u8, have_prev: bool) -> bool {
+        have_prev && prev_src != src
+    }
+
+    /// A cross-source value repeat — render7's paced double-CR. A DETECTOR, NEVER A FILTER: no byte
+    /// is ever dropped on its account. `prev_src != src` is what separates a transport duplicate
+    /// from a legitimate repeat, because a human typing `tt` sends both bytes down ONE transport.
+    pub const fn is_xdup(prev_src: u8, prev_byte: u8, src: u8, byte: u8, have_prev: bool) -> bool {
+        have_prev && prev_src != src && prev_byte == byte
+    }
+
+    /// Replay a recorded `(source, byte)` wire feed under a policy: returns
+    /// `(delivered, handoffs, xdups)`. A byte offered by a parked source is never delivered — on
+    /// metal it is never popped from the FIFO either, so the SPE forwards it instead.
+    pub const fn replay<const N: usize>(policy: u8, feed: &[(u8, u8); N]) -> (u32, u32, u32) {
+        let (mut delivered, mut handoffs, mut xdups) = (0u32, 0u32, 0u32);
+        let (mut prev_src, mut prev_byte, mut have_prev) = (0u8, 0u8, false);
+        let mut i = 0;
+        while i < N {
+            let (src, byte) = feed[i];
+            i += 1;
+            if src == SRC_UARTC && !polls_uartc(policy) {
+                continue;
+            }
+            if is_handoff(prev_src, src, have_prev) {
+                handoffs += 1;
+            }
+            if is_xdup(prev_src, prev_byte, src, byte, have_prev) {
+                xdups += 1;
+            }
+            prev_src = src;
+            prev_byte = byte;
+            have_prev = true;
+            delivered += 1;
+        }
+        (delivered, handoffs, xdups)
+    }
+
+    // THE RULE, checked at build time on the two render7 legs as they were actually recorded.
+    #[cfg(feature = "tcurx")]
+    const _: () = {
+        // Parking is a read ban, not a drop rule.
+        assert!(polls_uartc(POLICY_BOTH));
+        assert!(!polls_uartc(POLICY_MBOX_ONLY));
+        assert!(policy_for(true) == POLICY_MBOX_ONLY);
+        assert!(policy_for(false) == POLICY_BOTH);
+
+        // render7 BURST as flown: UARTC s,t,CR then the mailbox's t,e sixteen lines later.
+        // Exactly-once held (5 in, 5 out) but ONE cross-source handoff put them out of order —
+        // the shell read `st`. The counters must SEE that; a counter that cannot fire is no gate.
+        const BURST: [(u8, u8); 5] =
+            [(SRC_UARTC, b's'), (SRC_UARTC, b't'), (SRC_UARTC, 0x0d), (SRC_MBOX, b't'), (SRC_MBOX, b'e')];
+        assert!(matches!(replay(POLICY_BOTH, &BURST), (5, 1, 0)));
+
+        // render7 PACED as flown: the mailbox carried all five in order and UARTC ALSO delivered the
+        // CR. Six keys for five bytes, one handoff into the stray CR and one back out, one xdup.
+        const PACED: [(u8, u8); 6] = [
+            (SRC_MBOX, b't'),
+            (SRC_MBOX, b's'),
+            (SRC_MBOX, b't'),
+            (SRC_MBOX, b'e'),
+            (SRC_UARTC, 0x0d),
+            (SRC_MBOX, 0x0d),
+        ];
+        assert!(matches!(replay(POLICY_BOTH, &PACED), (6, 2, 1)));
+        // …and under the fix the same wire delivers the five injected bytes, in order, once each.
+        assert!(matches!(replay(POLICY_MBOX_ONLY, &PACED), (5, 0, 0)));
+
+        // A legitimate same-source repeat is NOT a duplicate — `tt` keeps both bytes.
+        const REPEAT: [(u8, u8); 2] = [(SRC_MBOX, b't'), (SRC_MBOX, b't')];
+        assert!(matches!(replay(POLICY_MBOX_ONLY, &REPEAT), (2, 0, 0)));
+        // The burst wire under the fix: the three bytes UARTC stole are never popped by us at
+        // all, so they stay in the FIFO for the SPE — what is DELIVERED here is the mailbox's own
+        // two, in order, with no handoff and no duplicate.
+        assert!(matches!(replay(POLICY_MBOX_ONLY, &BURST), (2, 0, 0)));
+    };
+
+    /// The policy in force (`POLICY_*`). Starts at `BOTH` and flips once the mailbox arms.
+    #[cfg(feature = "tcurx")]
+    static POLICY: AtomicU32 = AtomicU32::new(POLICY_BOTH as u32);
+    /// Drain passes in which the UARTC RBR poll was PARKED because the mailbox owns RX.
+    static PARKED: AtomicU64 = AtomicU64::new(0);
+    /// Monotonic delivery index — every byte handed to the key path gets one, from either source.
+    #[cfg(feature = "tcurx")]
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    /// Per-source delivered counts.
+    #[cfg(feature = "tcurx")]
+    static N_UARTC: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "tcurx")]
+    static N_MBOX: AtomicU64 = AtomicU64::new(0);
+    /// `dup=` / `reorder=` — the two rule violations, counted, never acted on.
+    #[cfg(feature = "tcurx")]
+    static XDUP: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "tcurx")]
+    static HANDOFF: AtomicU64 = AtomicU64::new(0);
+    /// Previous delivery packed as `have<<16 | src<<8 | byte`, so one relaxed load carries the
+    /// whole predecessor the two rules need.
+    #[cfg(feature = "tcurx")]
+    static PREV: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "tcurx")]
+    const PREV_HAVE: u32 = 1 << 16;
+
+    #[cfg(feature = "tcurx")]
+    fn src_name(src: u8) -> &'static str {
+        if src == SRC_UARTC { "uartc" } else { "mbox" }
+    }
+
+    #[cfg(feature = "tcurx")]
+    fn policy_name(policy: u8) -> &'static str {
+        if polls_uartc(policy) { "both" } else { "mbox-only" }
+    }
+
+    /// Arbitrate, once per drain pass. Announces the ONE transition it can make, off-lock.
+    #[cfg(feature = "tcurx")]
+    fn uartc_owns_rbr() -> bool {
+        let want = policy_for(crate::arch::hsp_tegra::rx_mbox_armed());
+        if POLICY.swap(want as u32, Ordering::Relaxed) != want as u32 {
+            serial_println!(
+                "[rxmerge] policy={} armed={} uartc-rbr={} -> A37: one owner, one ordered stream (the parked reader is NOT read — an RBR read pops the byte away from the SPE; `dup=`/`reorder=` on the census stay 0 while this holds, and `[serialrx] polls=0` becomes the CORRECT reading of a parked port — the LSR witness is taken directly instead, which does not pop the RBR)",
+                policy_name(want),
+                crate::arch::hsp_tegra::rx_mbox_armed() as u8,
+                if polls_uartc(want) { "polled" } else { "parked" }
+            );
+        }
+        polls_uartc(want)
+    }
+
+    /// Knob-off there is no second source, so the RBR always owns the port.
+    #[cfg(not(feature = "tcurx"))]
+    fn uartc_owns_rbr() -> bool {
+        true
+    }
+
+    /// 16550 LSR at the tegra mod's reg-shift-2 stride, same arithmetic as `read_byte`'s `BASE + LSR`.
+    #[cfg(feature = "tcurx")]
+    const LSR_REG: usize = 5 << 2;
+
+    /// KEEP A16's WITNESS ALIVE ON A PARKED PORT. `note_lsr` is fed from inside `read_byte`, which
+    /// is precisely the call parking stops making — so without this a parked boot would print
+    /// `polls=0 -> RX-UNPOLLED` with no LSR word at all and A16's `lsr=`/`iir=`/`fifo=` evidence
+    /// would SILENTLY stop appearing, which is the one failure mode the serial-transport law
+    /// forbids. An LSR read returns the LINE STATE and does not pop the RBR, so unlike a data read
+    /// it cannot steal a byte from the SPE; it is taken ONCE per boot, off-lock, the same one-shot
+    /// discipline and the same accepted side-effect class as the IIR read PANEL4 L3 sanctioned.
+    /// NOTE for the scorer: with the port parked, `ovrf=` is at most 1 — it counts POLLS that saw
+    /// the flag, and there is now exactly one such poll per boot instead of millions.
+    #[cfg(feature = "tcurx")]
+    fn seed_lsr_parked() {
+        // DARKWIN-GUARD, the same read-side gate `read_byte` opens with: LSR is UNMAPPED until
+        // `mmu_tegra::init` returns, so this must never be the read that touches a dark window.
+        if LSR_SEEN.load(Ordering::Acquire) || !super::tegra_guard::ready() {
+            return;
+        }
+        note_lsr(unsafe { core::ptr::read_volatile((super::tegra::base() + LSR_REG) as *const u32) });
+    }
+
+    /// THE ONE INTAKE. Every RX byte from every source reaches the key path through here and
+    /// nowhere else, which is what makes `seq=` a total order over the console stream.
+    #[cfg(feature = "tcurx")]
+    fn deliver(src: u8, b: u8) {
+        crate::pal::push_event(crate::pal::Event::Key(b));
+        RX.fetch_add(1, Ordering::Relaxed);
+        let prev = PREV.load(Ordering::Relaxed);
+        let (have, psrc, pbyte) = (prev & PREV_HAVE != 0, ((prev >> 8) & 0xff) as u8, (prev & 0xff) as u8);
+        if is_handoff(psrc, src, have) {
+            HANDOFF.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_xdup(psrc, pbyte, src, b, have) {
+            XDUP.fetch_add(1, Ordering::Relaxed);
+        }
+        PREV.store(PREV_HAVE | ((src as u32) << 8) | b as u32, Ordering::Relaxed);
+        if src == SRC_UARTC { &N_UARTC } else { &N_MBOX }.fetch_add(1, Ordering::Relaxed);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        serial_println!(
+            "[rxmerge] src={} seq={} byte={:#04x} '{}' policy={} dup={} reorder={}",
+            src_name(src),
+            seq,
+            b,
+            if (0x20u8..0x7f).contains(&b) { b as char } else { '.' },
+            policy_name(POLICY.load(Ordering::Relaxed) as u8),
+            XDUP.load(Ordering::Relaxed),
+            HANDOFF.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Knob-off: the byte-for-byte pre-RXMERGE intake, one source, no witness.
+    #[cfg(not(feature = "tcurx"))]
+    fn deliver(_src: u8, b: u8) {
+        crate::pal::push_event(crate::pal::Event::Key(b));
+        RX.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The scoreable rollup, printed on the census cadence beside `[serialrx] rx=`.
+    #[cfg(feature = "tcurx")]
+    fn rxmerge_census() {
+        let policy = POLICY.load(Ordering::Relaxed) as u8;
+        let (dup, reorder) = (XDUP.load(Ordering::Relaxed), HANDOFF.load(Ordering::Relaxed));
+        serial_println!(
+            "[rxmerge] census policy={} seq={} uartc={} mbox={} dup={} reorder={} parked={} -> {}",
+            policy_name(policy),
+            SEQ.load(Ordering::Relaxed),
+            N_UARTC.load(Ordering::Relaxed),
+            N_MBOX.load(Ordering::Relaxed),
+            dup,
+            reorder,
+            PARKED.load(Ordering::Relaxed),
+            if dup == 0 && reorder == 0 {
+                "SINGLE-SOURCE (exactly-once, in-order: every byte came down one transport). EXPECTED SIDE EFFECTS under policy=mbox-only: `[serialrx] polls=0` beside this line is CORRECT, not a dead drain — the UARTC RBR is never read; `parked=` is the drain-liveness counter that replaces `polls=`. A16's `lsr=`/`iir=`/`fifo=` witness still prints (one direct LSR read, which does not pop the RBR) but `ovrf=` is now at most 1, because it counts POLLS that saw the flag and there is exactly one per boot"
+            } else {
+                "SPLIT-SOURCE (A37 live: two readers are still both delivering — dup>0 is the same byte down both transports, reorder>0 is a cross-transport handoff in the delivered stream)"
+            }
         );
     }
 }

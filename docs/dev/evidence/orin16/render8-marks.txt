@@ -1,0 +1,4 @@
+MARK render8 c24d951 pre-boot card=render8-20260906T1532Z-c24d951 elfmax=0x3395c8 kernel=4297df1f butler=756188 port=/dev/ttyACM1 seat=orin17 at 2026-09-06T15:40:39Z raw=145097 orin=87996
+MARK render8 burstA=91229 burstB=91468 seat=orin17 at 2026-09-06T15:44:17Z
+MARK render8 pacedA=92082 pacedB=92198 seat=orin17 at 2026-09-06T15:44:57Z
+MARK render8 c24d951 power-off (Peter powered off; crystal Restart NOT exercised) seat=orin17 at 2026-09-06T15:57:37Z raw=163864 orin=106763

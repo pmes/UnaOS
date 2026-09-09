@@ -155,3 +155,54 @@ fn platform_shutdown() -> ! {
     serial_println!("[orinshutoff] x86 mechanism: ACPI S5 (acpi_power::poweroff)");
     crate::arch::acpi_power::poweroff();
 }
+
+// ── CRYSTAL (A34) — the power verbs as the DESKTOP invokes them ───────────────────────────
+//
+// Peter, render7 2026-09-06: *"crystal restart/shut down not working"*. Both verbs reached their
+// terminus on the wire (`:: SHARD-MENU: crystal_pick verb=ShutDown action=real ::`) and neither
+// acted — `video/crystal.rs` printed a Pi-era `unimplemented:` line on EVERY aarch64 board,
+// including the Orin, whose ATF/BL31 monitor at EL3 answers PSCI on the very SMC conduit
+// `smp_virt`'s `CPU_ON` already uses and proves every boot. The verbs were never missing a
+// MECHANISM — this module has carried both since ORIN-REBOOT. They were missing the CALL.
+//
+// Why these two entries exist instead of the menu calling `reboot()`/`shutdown()` directly: the
+// witness a flight scores for A34 is a `[crystal]` line, and it must carry the SMC return value,
+// because **a PSCI power call that RETURNS has failed**. An operator who pressed Shut Down is owed
+// that fact in the family they are grepping, not one line down in another. The four-line mechanism
+// body below is duplicated from `platform_reboot`/`platform_shutdown` deliberately: the alternative
+// is turning those `-> !` functions fallible, which rewrites lines in the middle of a file three
+// other callers (`shell`, `ga10b_probe`, `selfup_tegra`) already depend on.
+//
+// GATED `not(feature = "pi")`, and that gate is the honest half of A34. The Pi 4 boots bare-metal to
+// EL2 with no EL3 monitor behind the `smc`, so there is nothing to call; a menu verb that PARKED the
+// Pi's desktop in `hlt` to look decisive would be strictly worse than the `unimplemented:` line it
+// prints today. On the Pi these symbols do not exist, `crystal.rs` keeps its unchanged arm, and the
+// Pi's kernel8 image is unmoved by this half of the arc.
+
+/// CRYSTAL **Restart** — announce on the `[crystal]` family, then PSCI `SYSTEM_RESET` through the
+/// SMC. Never returns: either the firmware resets the board mid-instruction, or the refusal witness
+/// names the return code and the core parks in `hlt_loop`.
+#[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+pub fn crystal_restart() -> ! {
+    serial_println!("[crystal] verb=restart -> PSCI SYSTEM_RESET");
+    let ret = psci_call(PSCI_SYSTEM_RESET);
+    serial_println!(
+        "[crystal] verb=restart -> PSCI SYSTEM_RESET RETURNED ret={} — a returning PSCI power call is a REFUSAL; parking in hlt",
+        ret
+    );
+    crate::hlt_loop();
+}
+
+/// CRYSTAL **Shut Down** — announce on the `[crystal]` family, then PSCI `SYSTEM_OFF` through the
+/// SMC. Same contract as [`crystal_restart`]: the announce precedes the action, and the only line
+/// that can follow it is the refusal.
+#[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
+pub fn crystal_shutdown() -> ! {
+    serial_println!("[crystal] verb=shutdown -> PSCI SYSTEM_OFF");
+    let ret = psci_call(PSCI_SYSTEM_OFF);
+    serial_println!(
+        "[crystal] verb=shutdown -> PSCI SYSTEM_OFF RETURNED ret={} — a returning PSCI power call is a REFUSAL; parking in hlt",
+        ret
+    );
+    crate::hlt_loop();
+}

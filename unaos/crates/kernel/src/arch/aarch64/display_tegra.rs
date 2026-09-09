@@ -494,7 +494,7 @@ pub fn orin_wm1() -> crate::video::wm::WinId {
     // The row is live and holds a raw pointer into `store`: park it where it outlives this frame.
     // Moving the `Vec` moves its header, not its heap block.
     *ORINWM1_STORE.lock() = Some(store);
-    ORINWM1_WIN.store(id, Ordering::Release);
+    ORINWM1_WIN.store(id, Ordering::Release); crate::video::wm::winid_register_holder(&ORINWM1_WIN, "orinwm1"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. This cell is the WORST of the five the WINID block catalogues, and it is orin's own: NOTHING clears it on ANY path, and it is also this function's IDEMPOTENCE LATCH (the `existing` test above). render7 closed this very window through the disc — `[wm-act] close-furniture win=4 owner=0xffffff02 closed=true route-dropped=false` — and the cell went on holding 4; the next call would hand a dead id back to its caller, and once the table re-issues slot 3 it would hand back a stranger's window. Registered, `wm::close` clears it and the latch correctly re-mints.
 
     // 7. PRESENT + COMPOSITE. `create_at` already composited the new row; the explicit present is what
     //    this rung is actually measuring — the surface→panel path, end to end, on Orin silicon.
@@ -1385,7 +1385,7 @@ pub fn orin_click(mask: u8) {
             edge, mask, x, y, if geom.is_some() { "yes" } else { "REFUSED" },
             hit, win, owner, focus_before, focus_after, consumed as u8, verdict
         );
-    }
+    } orin_drag_edge(); // DRAGDEAD (A27) — the RELEASE half of the gesture's report. `wc_click_route` above already called `wm::drag_end()` (arch/aarch64/syscall.rs:14485, at the TOP of the release arm), so the drag is over by the time control is back here and this is the first place that can say so. Sited AFTER the `[orinclick] edge=` line on purpose: a capture reads the router's verdict and then the gesture's outcome, in that order, and `[dragroute] end` is deliberately not folded INTO that line because it is a different claim on a different cadence (once per gesture, not once per edge). Costs one relaxed load per button edge when no drag is live. ⚠ SAME-LINE fold, line-NEUTRAL: this block is `orinclick`-gated but the FILE is not, so a line added here would renumber every panic `Location` below it in a knob-off jetson image.
 }
 
 /// **ORIN-CLICK — the ARM line and the periodic CENSUS, emitted from inside the pump's own drain loop.**
@@ -1481,7 +1481,7 @@ pub fn orin_click_census(tick: u64) {
     if tick.wrapping_sub(CLK_CENSUS_TICK.load(Ordering::Relaxed)) < CLK_CENSUS_PERIOD {
         return;
     }
-    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed);
+    CLK_CENSUS_TICK.store(tick, Ordering::Relaxed); let ptrarms = ptrpoll_witness(tick); // CLICKDEAD — the `[ptrpoll]` line, on THIS census pass and no new cadence of its own. Returns the pointer-pipeline arm balance so the census line below can carry it as `reports=`. ⚠ LINE-NEUTRAL fold: the body lives at the FILE TAIL (nothing follows it), so no line in this file moves and the knob-off image's panic-`Location` byte-identity is untouched.
     let seq = CLK_CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
 
     let btn = CLK_BTN.load(Ordering::Relaxed);
@@ -1515,9 +1515,9 @@ pub fn orin_click_census(tick: u64) {
 
     let up = if freq == 0 { 0 } else { now.wrapping_sub(CLK_T0.load(Ordering::Relaxed)) / freq };
     serial_println!(
-        "[orinclick] census seq={} t={} up={}s btn={} press={} rel={} noedge={} raised={} same={} miss={} consumed={} stuck={} nogeom={} dropped={} rows={} compat={} focus={:#x} -> {}",
+        "[orinclick] census seq={} t={} up={}s btn={} press={} rel={} noedge={} raised={} same={} miss={} consumed={} stuck={} nogeom={} dropped={} rows={} compat={} focus={:#x} reports={} -> {}",
         seq, tick, up, btn, press, rel, noedge, raised, same, miss, consumed, stuck,
-        nogeom, dropped, rows, compat as u8, sc::user_input_active(), verdict
+        nogeom, dropped, rows, compat as u8, sc::user_input_active(), ptrarms, verdict
     );
 }
 
@@ -5029,4 +5029,484 @@ pub fn orin_rast_census(tick: u64) {
 #[cfg(feature = "rast")]
 pub fn orin_rast_console_owns() {
     RG_CONSOLE_OWNS.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// =================================================================================================
+// DRAGDEAD (ledger A27) — **STEER the live title-bar grab from the Orin console pump.**
+// =================================================================================================
+//
+// THE DEFECT, on the wire (docs/dev/evidence/orin15/render6-boot2.log, four times, windows 1/2/3):
+//
+//     [clickroute] press chrome win=3 owner=4294967042 at (1156,431) -> drag
+//     [wm-act] drag-begin win=3 owner=0xffffff02 at (1156,431) -> grabbed
+//     [wm-act] drag-end   win=3 owner=0xffffff02 at (520,441)  -> no-move
+//
+// The grab is minted and the grab is released and the window never moves. `drag_end`'s verb is
+// decided by ONE counter — `DRAG_MOVES`, `video/wm.rs:16211` — and the only thing in the tree that
+// increments it is `drag_motion`'s `Moved::Placed { changed: true }` arm (`video/wm.rs:16195`). So
+// `no-move` is not a clamp, not a refusal and not a lost release: it is the arithmetic statement
+// that `drag_motion` was NEVER CALLED for that gesture. The coordinates on the `drag-end` line say
+// the same thing a second way — they are `DRAG_LAST_X/Y`, which `drag_begin` seeds with the ROW's
+// origin (`video/wm.rs:15921-15922`) and only `drag_motion` ever re-seeds, so `(520,441)` is where
+// the window already was, not where the hand went.
+//
+// WHY IT WAS NEVER CALLED, and the positive controls that make this a proof rather than a reading.
+// `wm` publishes an arch-neutral steering tail for exactly this, `wm::drag_route_tail`
+// (`video/wm.rs:16069`), whose own doc block names its two intended aarch64 call sites. Both exist
+// and both are compiled into this image (`orinrender`/`deskcascade` imply `desktop_firmware`):
+//
+//   * x86 control:  `arch/x86_64/syscall.rs:6764 wc_route_tail` -> `wm::drag_motion`, driven from
+//                   `main.rs:1991` and `main.rs:6725` — the two x86 drains.
+//   * Pi control:   `main.rs:3879` (`route_input_to_active_el0`, the focused-app drain) and
+//                   `main.rs:5442`/`:5452` (`render_service`'s `Mouse`/`MouseAbsolute` arms).
+//
+// The Orin runs NEITHER drain. Its pointer path is `jd2_console_pump` phase 2 (`main.rs:2801`),
+// whose `Event::Mouse`/`Event::MouseAbsolute` arms only accumulate `pending_rel`/`pending_abs` and
+// whose per-frame block (`main.rs:2987-2998`) applies them to `pal::cursor` and repaints the arrow.
+// That block is the whole of what a pointer report does on this board, and no call to
+// `drag_route_tail`, `drag_motion_paced` or `drag_motion` appears anywhere on it. Falsifier as run:
+// `grep -rn 'drag_route_tail\|drag_motion' crates/kernel/src` returns the x86 and Pi sites above and
+// nothing under `arch/aarch64/display_tegra.rs`, `arch/aarch64/syscall.rs` or the tegra region of
+// `main.rs`. The tegra router (`arch/aarch64/syscall.rs:14400` press, `:14485` release) is complete:
+// it BEGINS and it ENDS the drag. The gesture's middle had no owner on this board. This is it.
+//
+// WHY NOT SIMPLY CALL `wm::drag_route_tail` FROM THE PUMP. That function reads the panel geometry
+// through `*super::WRITER.lock()` — a BLOCKING panel lock — before it reaches the pacer
+// (`video/wm.rs:16081`). LOCKFIX (`7847ceea`) is standing law for this track's input path, and the
+// adjacent `orinclick` router already obeys it by taking its geometry from
+// `video::panel_info_nonblocking()` (`clk_pointer_pos`, this file). The pump moreover HAS the
+// geometry already — it is holding the `Screen` it just drew the cursor on — so the lock would buy
+// nothing. `orin_drag_steer` therefore takes the geometry from its caller and enters `wm` at
+// `drag_motion_paced`, the same entry `drag_route_tail` uses one line later. Every lock below that
+// point is `wm`'s own (`move_to_inner` takes `WRITER`, drops it, then takes `TABLE`) and is the
+// identical sequence the x86 and Pi paths already drive; this seam adds none of its own.
+//
+// WHERE IT IS CALLED, and the placement is load-bearing in both directions. The call sits in
+// `jd2_console_pump`'s per-frame pointer block IMMEDIATELY BEFORE `cursor::draw_over(&mut pal)`
+// (`main.rs:2996`). AFTER `move_rel`/`set_abs`, because `pal::cursor::pos` must already carry this
+// frame's travel or the window would trail the arrow by a frame — the same "call it where the
+// cursor is FRESH" rule `drag_route_tail`'s doc states for the Pi. BEFORE `draw_over`, because
+// `draw_over` saves the pixels under the arrow and `restore` writes them back: a compositor pass
+// that repainted the panel between those two would make the next `restore` stamp a stale
+// cursor-sized patch over the moved window. With the steer ahead of `draw_over` the arrow is off
+// the glass while `wm` composites and goes back on top of the finished frame.
+//
+// RATE. `drag_motion_paced` is `wm`'s own coalescer (`video/wm.rs:16023`): it admits at most one
+// reposition per `DRAG_MOTION_MS` and counts the rest as coalesced. The pump has already coalesced
+// once on its own — every report in a drain frame collapses into a single `pending_rel`/
+// `pending_abs` — so this seam is called once per FRAME, not once per report, and the pacer is the
+// second gate behind it. Idle cost when nobody is dragging: one relaxed load of `DRAG_WIN`.
+//
+// SUPSTATE IS DELIBERATELY NOT WIRED INSIDE THE SURFACE LOCK, and the reason is named rather than
+// left to be discovered. `jd2_supstate_phase2`'s twin block (`main.rs:7749-7767`) runs INSIDE
+// `sup_with_surface`'s closure, which holds `SUP_SURFACE` across `f` (this file) under a stated
+// LEAF-LOCK rule — "never held across a yield". `move_to_inner` composites and can yield, so
+// steering from inside that closure would break the rule the supstate design is built on. The call
+// therefore goes on the line AFTER the closure returns (`main.rs:7775`), where the cursor is already
+// current and no supstate lock is held, and it passes `0,0` so the geometry is fetched non-blocking
+// here.
+//
+// WITNESS. `wm` has no `drag-move` line of its own — it counts moves and reports them only at
+// `drag_end` — so this seam prints its own, and NEVER per report:
+//   `[dragroute] wired panel=WxH …`   once per boot, on the first pointer frame that reaches here.
+//                                     Proves the CALL SITE is reached even on a boot where nobody
+//                                     drags, which an absent `[dragroute] end` cannot.
+//   `[dragroute] arm win=N …`         once per gesture, when a grab first becomes visible here.
+//   `[dragroute] end win=N via=… fed=… applied=… at (x,y) -> VERDICT`   once per gesture.
+//        `STEERED`     — the pacer admitted at least one reposition. Expect `drag-end … -> placed`.
+//        `FED-NO-MOVE` — motion was fed and `wm` moved nothing: a clamp against a panel edge, or
+//                        the cheap-skip on an unchanged origin. Distinguishes "the seam is dead"
+//                        from "the window is already where it is being asked to go".
+//        `NO-FEED`     — the grab began and ended without one pointer frame in between (a click on
+//                        the title bar that never moved). The honest `no-move`.
+// CONTROL: the token `[dragroute] control-absent` is written NOWHERE in this tree on purpose, so a
+// `grep -a` for it returning zero proves the search can return zero and a zero for the tokens above
+// is absence rather than a broken pattern.
+//
+// DEFAULT OFF. Every item is `#[cfg(feature = "orinclick")]` and this whole file is
+// `#[cfg(feature = "tegra")]` (`arch/aarch64/mod.rs:105`), so it is absent from the Pi's
+// `kernel8.img` by construction and vanishes from a knob-off jetson image. It is appended at the
+// FILE TAIL and the three `main.rs`/`orin_click` sites are statements folded onto existing lines, so
+// no line moves in either file and no panic `Location` is renumbered.
+//
+// A NOTE ON `RELEASE-DROPPED`, since the same captures raise it and it is NOT a defect.
+// `[orinclick] edge=release … hit=no win=0 … -> RELEASE-DROPPED` reads as a lost release, and it is
+// neither. `hit=no win=0` is `orin_click`'s own doing: it hit-tests only on a PRESS edge (`let
+// target = if pressed != 0 { … } else { None }`), because the release belongs to whoever took the
+// press, so `target` is `None` on every release by construction. `DROPPED` is `wc_click_route`
+// returning `true` — the release was CONSUMED by the window layer rather than delivered to an EL0
+// app — and that is the correct outcome for a chrome press, which stored `CLICK_TARGET_DROP`. The
+// release does reach `drag_end`: `arch/aarch64/syscall.rs:14485` ends the grab at the TOP of the
+// release arm, before the target is even read, which is why `[wm-act] drag-end` prints at all. The
+// word is a misreport of what a reader expects it to mean, not of what happened. NOT renamed in
+// this arc — it is `orinclick`'s wire vocabulary and four flights of scorers key on it.
+
+/// DRAGDEAD — the window id whose gesture this seam is currently steering, `WIN_NONE` when idle.
+/// Compared against `wm::drag_active()` every frame to find the gesture's edges: `wm` owns the
+/// drag's truth, this cell only remembers what was last seen so a transition can be reported once.
+#[cfg(feature = "orinclick")]
+static DRG_WIN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(crate::video::wm::WIN_NONE);
+/// DRAGDEAD — pointer frames FED to `wm::drag_motion_paced` across the live gesture.
+#[cfg(feature = "orinclick")]
+static DRG_FED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGDEAD — repositions `wm` actually APPLIED across the live gesture (the pacer admitted them and
+/// the origin changed). This is the quantity `drag_end`'s `placed`/`no-move` verb is decided by.
+#[cfg(feature = "orinclick")]
+static DRG_APPLIED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGDEAD — gestures this seam has seen, so the `arm` line carries an ordinal.
+#[cfg(feature = "orinclick")]
+static DRG_GEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// DRAGDEAD — last panel point fed, reported at the end of the gesture. Unlike `drag-end`'s own
+/// coordinates (the WINDOW's origin) this is where the HAND was, so the two lines together say
+/// whether the window followed it.
+#[cfg(feature = "orinclick")]
+static DRG_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+#[cfg(feature = "orinclick")]
+static DRG_Y: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+/// DRAGDEAD — the serial budget, the same discipline `CLK_LOG_MAX` applies to `[orinclick]`: a
+/// gesture is an operator action and cannot storm, but a cancel loop could.
+#[cfg(feature = "orinclick")]
+static DRG_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "orinclick")]
+const DRG_LOG_MAX: u32 = 96;
+/// DRAGDEAD — has the `wired` line been printed? One relaxed swap on the first pointer frame.
+#[cfg(feature = "orinclick")]
+static DRG_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// DRAGDEAD — report and clear the gesture just ended. `via` names WHICH edge observed the end:
+/// `release` (the button came up and `wc_click_route` called `drag_end`) or `ended` (the drag was
+/// gone by the next pointer frame without this seam seeing the release — `wm`'s own `drag_cancel`,
+/// i.e. `barrier-stalled`, `row-gone` or `row-recycled`, whose reason is on the adjacent
+/// `[wm-act] drag-cancel` line).
+#[cfg(feature = "orinclick")]
+fn drg_end_report(win: crate::video::wm::WinId, via: &str) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let fed = DRG_FED.swap(0, Relaxed);
+    let applied = DRG_APPLIED.swap(0, Relaxed);
+    let (x, y) = (DRG_X.load(Relaxed), DRG_Y.load(Relaxed));
+    let verdict = if fed == 0 {
+        "NO-FEED"
+    } else if applied == 0 {
+        "FED-NO-MOVE"
+    } else {
+        "STEERED"
+    };
+    if DRG_LOGGED.fetch_add(1, Relaxed) < DRG_LOG_MAX {
+        serial_println!(
+            "[dragroute] end win={} via={} fed={} applied={} at ({},{}) -> {}",
+            win, via, fed, applied, x, y, verdict
+        );
+    }
+}
+
+/// **DRAGDEAD — feed one pointer FRAME to the live title-bar drag.**
+///
+/// Called from `jd2_console_pump`'s per-frame pointer block (`main.rs`, same-line fold) after the
+/// frame's travel has been applied to `pal::cursor` and before the arrow is drawn back on. Pass the
+/// panel geometry the caller already holds; pass `0, 0` to have it read non-blocking from
+/// `video::panel_info_nonblocking()` (the supstate site, which has no `Screen` in scope).
+///
+/// Total and cheap when nobody is dragging: one relaxed load and a return, which is what makes it
+/// safe on every pointer frame of every boot.
+#[cfg(feature = "orinclick")]
+pub fn orin_drag_steer(pw: i32, ph: i32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::video::wm;
+    let live = wm::drag_active();
+    let seen = DRG_WIN.load(Relaxed);
+    if live != seen {
+        // An edge. Report the gesture that ended (a superseding `drag_begin` ends one too), then
+        // arm the new one. `wm` decided both; this only names them on the wire.
+        if seen != wm::WIN_NONE {
+            drg_end_report(seen, "ended");
+        }
+        DRG_WIN.store(live, Relaxed);
+        if live != wm::WIN_NONE {
+            DRG_FED.store(0, Relaxed);
+            DRG_APPLIED.store(0, Relaxed);
+            let n = DRG_GEST.fetch_add(1, Relaxed) + 1;
+            if DRG_LOGGED.fetch_add(1, Relaxed) < DRG_LOG_MAX {
+                serial_println!("[dragroute] arm win={} gesture={} -> STEERING", live, n);
+            }
+        }
+    }
+    let (pw, ph) = if pw > 0 && ph > 0 {
+        (pw, ph)
+    } else {
+        match crate::video::panel_info_nonblocking() {
+            Some(i) => (i.width as i32, i.height as i32),
+            // No geometry means no cursor position worth reading; `[dragroute] end` will say
+            // `NO-FEED` for the gesture, which is the honest report of a frame we could not steer.
+            None => return,
+        }
+    };
+    if !DRG_ARMED.swap(true, Relaxed) {
+        serial_println!(
+            "[dragroute] wired panel={}x{} desktop_firmware={} -> READY",
+            pw,
+            ph,
+            cfg!(feature = "desktop_firmware") as u8
+        );
+    }
+    // SO5 — the pointer-sprite size witness rides this seam and NOT the drag path below it, so it is
+    // taken above the `WIN_NONE` return: the defect is about a pointer that is not dragging anything.
+    sprite_size_witness(pw, ph);
+    if live == wm::WIN_NONE {
+        return;
+    }
+    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    DRG_X.store(x, Relaxed);
+    DRG_Y.store(y, Relaxed);
+    DRG_FED.fetch_add(1, Relaxed);
+    // `drag_motion_paced` coalesces to one reposition per frame period and re-tests the row's owner
+    // under `TABLE` inside `move_to_inner`; a row that died under the hand cancels there, not here.
+    if wm::drag_motion_paced(x, y) {
+        DRG_APPLIED.fetch_add(1, Relaxed);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// SO5 — the pointer sprite's size, and the transition that changes it
+// ------------------------------------------------------------------------------------------------
+//
+// PETER, render7 2026-09-06: *"mouse cursor grows when over desktop background"*. It does, and it is
+// not an illusion of contrast: there are TWO arrow sprites on this board and they are drawn at two
+// different block scales.
+//
+//   * `video::cursor`, the COMPOSITOR sprite, front-buffer, save-under its own:
+//     `side = (ui::BASE_CELL + 1) * Metrics::for_height(panel_h).scale` — 9·s px.
+//   * `pal::cursor`, the BACK-BUFFER sprite: `sprite_scale = metrics().scale + 1`, extent `9·(s+1)`.
+//
+// `pal::cursor::SPRITE_OWNS_PAINT` is `cfg!(target_arch = "x86_64")`, and its stated premise is that
+// "the two never coexist on a panel". On x86 that holds — `draw`/`draw_over`/`repaint_on_move` hand
+// off to `video::cursor` and `paint()` never runs. On aarch64 the constant is FALSE, so `paint()`
+// does run and BOTH sprites are live on the same panel at once. On the Orin's 1920x1200 panel
+// `Metrics::for_height(1200).scale == 1200/900 == 1`, so the pair is 9x9 and 18x18: exactly 2x.
+//
+// WHICH ONE THE OPERATOR SEES is decided by the desktop present's occluder subtraction
+// (`video::screen::present_background` -> `next_visible_span`). Over the BACKDROP the pointer's spans
+// are covered by no window box, so the back buffer — carrying the 18 px arrow — reaches glass. Over a
+// WINDOW those spans are subtracted, the 18 px arrow never lands, and the only arrow on the panel is
+// the compositor's 9 px repaint. Cross a window edge and the size toggles. Nothing grows; a bigger
+// sprite stops being covered.
+//
+// WHY NO CAPTURE HAS EVER SHOWN IT: no witness anywhere prints the sprite's scale. `[cursor12]`'s
+// `scope=desktop adm=baseline` / `scope=live adm=window` pair looked like the nearest proxy and is
+// not one — `scope` is a print-trigger label threaded from the caller and `adm` is derived inside the
+// printer from its own counters (`passes == cum` => "baseline"). Neither reaches any draw code and
+// neither can change a sprite's size. This is that missing token.
+//
+// THE FIX IS NOT HERE. The divergence is the `+ 1` in `pal::cursor::sprite_scale` (`pal.rs`), a
+// SHARED KERNEL-CORE file in the rmbp seat's lane; the structural alternative is making
+// `SPRITE_OWNS_PAINT` true on aarch64 and retiring the back-buffer sprite, which is the CURSOR-13
+// ownership arc and drags this pump's save-under bracket with it. Both are filed for grant in
+// `DESKFIX-video.patch`. What this seat owns is the MEASUREMENT, and it is written so the fix is
+// scored by it rather than argued: when the two sizes agree the line reads `same=1`.
+//
+// COST. One call per pointer FRAME (not per report — the pump has already coalesced), and on a frame
+// with no transition it is one `hit_test` and two relaxed loads. Capped at 8 printed transitions, so
+// a boot with an operator wiggling the mouse cannot flood the wire the gates are counted from.
+
+/// SO5 — the last hit target the sprite witness saw. 0 = nothing yet, 1 = window, 2 = desktop.
+#[cfg(feature = "orinclick")]
+static SPR_OVER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// SO5 — transitions printed so far, capped at [`SPR_LOG_MAX`].
+#[cfg(feature = "orinclick")]
+static SPR_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// SO5 — the print cap. Eight is enough to show both directions several times over.
+#[cfg(feature = "orinclick")]
+const SPR_LOG_MAX: u32 = 8;
+
+/// **SO5 — print the pointer sprite's size on each window/desktop transition.** See this section's
+/// header for why the size differs at all.
+///
+/// Gated with its only caller, [`orin_drag_steer`], and carrying its own `use`s for the same reason
+/// that one does: this file's top level imports neither `wm` nor `Ordering`.
+#[cfg(feature = "orinclick")]
+fn sprite_size_witness(pw: i32, ph: i32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::video::wm;
+    if pw <= 0 || ph <= 0 {
+        return;
+    }
+    let (x, y) = crate::pal::cursor::pos(pw, ph);
+    // The hot spot IS the sprite's top-left pixel (`video::cursor::draw_locked`'s stated rule), so the
+    // hit test asks about exactly the pixel the arrow's tip is on — the same pixel `click1_dispatch`
+    // routes with. Anything else would report a target the operator's click would not agree with.
+    let over_window = wm::hit_test(x, y).is_some();
+    let now = if over_window { 1 } else { 2 };
+    // Only an EDGE prints. `swap` rather than load+store: two pointer frames cannot both claim the
+    // same transition and print it twice.
+    if SPR_OVER.swap(now, Relaxed) == now {
+        return;
+    }
+    if SPR_LOGGED.fetch_add(1, Relaxed) >= SPR_LOG_MAX {
+        return;
+    }
+    let s = crate::ui::Metrics::for_height(ph as usize).scale;
+    // The compositor sprite (front buffer) and the PAL sprite (back buffer), each as its own module
+    // computes it — restated here rather than borrowed, because a shared helper would make the two
+    // agree by construction and this witness exists to report whether they DO.
+    let comp = (crate::ui::BASE_CELL + 1) * s;
+    let pal_s = s + 1;
+    let pal_side = 9 * pal_s;
+    // The EFFECTIVE size is the one that survives the present: over the backdrop the back buffer
+    // reaches glass, over a window it is subtracted and only the compositor's arrow is left.
+    let (eff, eff_s) = if over_window { (comp, s) } else { (pal_side, pal_s) };
+    serial_println!(
+        "[sprite] size={}x{} scale={} over={} at ({},{}) panel={}x{} compositor={}x{} backbuffer={}x{} same={} n={}/{} (SO5 — two arrow sprites, two block scales; the present's occluder subtraction picks which reaches glass. same=1 is the fixed state)",
+        eff,
+        eff,
+        eff_s,
+        if over_window { "window" } else { "desktop" },
+        x,
+        y,
+        pw,
+        ph,
+        comp,
+        comp,
+        pal_side,
+        pal_side,
+        (comp == pal_side) as u8,
+        SPR_LOGGED.load(Relaxed).min(SPR_LOG_MAX),
+        SPR_LOG_MAX
+    );
+}
+
+/// **DRAGDEAD — the RELEASE edge's report.** Called at the tail of [`orin_click`] (same-line fold),
+/// after `wc_click_route` has run: the release arm of the router calls `wm::drag_end()` before it
+/// reads its target, so by the time control is back here the gesture is over. Reporting from the
+/// button edge rather than waiting for the next pointer frame is what makes the `[dragroute] end`
+/// line exist for a drag the operator ends without moving the mouse again.
+#[cfg(feature = "orinclick")]
+pub fn orin_drag_edge() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use crate::video::wm;
+    let seen = DRG_WIN.load(Relaxed);
+    if seen != wm::WIN_NONE && wm::drag_active() == wm::WIN_NONE {
+        DRG_WIN.store(wm::WIN_NONE, Relaxed);
+        drg_end_report(seen, "release");
+    }
+}
+
+// =================================================================================================
+// CLICKDEAD — WHO RE-ARMS THE POINTER INTERRUPT-IN READ, AND DID IT? `orinclick`, FILE TAIL.
+// =================================================================================================
+//
+// THE METAL FACT THIS ANSWERS. On render6 (`docs/dev/evidence/orin15/render6-boot1.log`) the
+// `orinclick` census read `btn=0 press=0 rel=0 -> IDLE-NO-CLICKS` for 477 s with Peter's hand on
+// the mouse, `[cursor3]` read `offers=0 taken=0`, and the shared driver's own pointer witness
+// (`drivers/xhci/mod.rs:4774`, an UNGATED `serial_println!`) printed `:: MOUSE-1: 1 reports ::`
+// ONCE, at enumeration, and never again. That witness fires at `n == 1 || n % 32 == 0` on a counter
+// bumped at `mod.rs:4772-4773` — INSIDE the driver, BEFORE `pal::push_pointer_report` and therefore
+// before every consumer this file, `wc_click_route` and the cursor path contain. So the whole
+// consumer half is exonerated by that one line: fewer than 32 pointer reports were DECODED in ten
+// minutes. The control, render4 (same devices, same hub, `orinclick` absent), decoded 1536+ and
+// printed `JD20 — pointer live` and 24 `pointer BUTTON` lines. The pipeline, not the routing.
+//
+// WHAT THE WIRE COULD NOT SAY, AND WHY THIS EXISTS. The driver already accounts for every re-arm:
+// `MOUSE_REARM_COUNT` (every `queue_mouse_read`), `MOUSE_DISCARD_REARM_COUNT` (the dup-Success
+// guard's pipeline-preserving exit) and `MOUSE_ERROR_REARM_COUNT` (non-halting error re-arms) are
+// `pub` and bumped UNCONDITIONALLY (`mod.rs:2373-2386`). Only their PRINT is knob-gated —
+// `piusb39_witness` is `#[cfg(feature = "usbdebug")]` (`mod.rs:14730-14746`), and `usbdebug` is not
+// in the jetson flight recipe. render6 therefore carried the answer in three atomics nothing read.
+// This reads them. No new accounting, no change to the shared driver, no lock, no MMIO: three
+// relaxed loads on the census pass that was already going to print.
+//
+// HOW TO SCORE THE NEXT BOOT.
+//   * `reports=` on the census line is `rearm - discard - errrearm` = the arms that followed a
+//     DECODED report, PLUS one enumeration arm per pointer that enumerated (`mod.rs:4310`). On this
+//     board two pointers enumerate (the relative boot-mouse on slot 4 and the absolute pointer on
+//     the keyboard composite, slot 5), so `reports=2` means ZERO decoded reports since boot and
+//     `reports=2+k` means k of them. render6's value would have been 2.
+//   * `[ptrpoll] ... -> ARMED-NO-COMPLETION` is the render6 shape: the read was armed and the
+//     controller posted no further transfer event for the pointer DCI. That leaves exactly two
+//     live mechanisms, and they are separated by `docs/dev/evidence/orin15/CLICKDEAD-xhci.patch`
+//     (rmbp's lane, delivered as a patch, not committed): the dup-Success guard's `param ==
+//     mouse_prev_phys` arm (`mod.rs:4594`) is the ONE branch in the driver that consumes a pointer
+//     completion, does not re-arm, and — on a build without `usbdebug` — prints nothing. The patch
+//     gives that arm a counter so `dup=` tells a discarded completion apart from no completion.
+//   * `-> GUARD-REARM` / `-> ERROR-REARM` name the two churn shapes instead: completions ARE
+//     arriving and the guard or the error path is re-arming them. `-> STREAMING` is health.
+//
+// WHY THE HALT PATH IS NOT THE ANSWER HERE, AND IS STILL A HOLE. A halting completion (codes
+// 2/3/4/5/6) does not re-arm at dispatch; it is queued to `hid_halt_pending` (`mod.rs:4231-4234`)
+// and drained only by `service_hid_halts`, reachable only through `service_hid_setproto`
+// (`mod.rs:12874`). The tegra post-drop pumps call `poll_events()` and NOTHING else, deliberately —
+// `xusb_tegra.rs:1924-1926` records why: the `service_*` pumps' bounded waits ride `crate::hlt()`,
+// which after the drop has no wake source and parks the core. So on tegra a halted HID interrupt-IN
+// endpoint is unrecoverable for the rest of the boot. It is NOT what killed render6's pointer:
+// `hid_error_witness` (`mod.rs:14748-14768`) is explicitly UNGATED and the log carries zero
+// `xHCI: pointer interrupt-IN error` lines. Recorded, not convicted — see CLICKDEAD.md.
+//
+// DEFAULT OFF. Every item below is `#[cfg(feature = "orinclick")]` and sits at the END of the file,
+// after the last pre-existing line, so knob-off nothing here compiles and NO line in this file
+// moves — panic `Location` records embed line numbers and the knob-off jetson image's
+// byte-identity is this track's standing proof.
+
+/// CLICKDEAD — the last `rearm + dup + nobuf` this witness printed, so a frozen pipeline costs one
+/// line and a live one prints at the census cadence. `u64::MAX` = never printed.
+#[cfg(feature = "orinclick")]
+static PTRPOLL_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// CLICKDEAD — the `rearm - discard - errrearm` balance the FIRST census pass saw, i.e. the
+/// enumeration arms. `reports=` minus this is the decoded-report count since the census armed.
+#[cfg(feature = "orinclick")]
+static PTRPOLL_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// CLICKDEAD — read the shared driver's five ungated pointer-pipeline counters and, when they
+/// moved (and once at the start, so a frozen pipeline is still timestamped), print `[ptrpoll]`.
+///
+/// Returns `rearm - discard - errrearm` for the caller's `reports=` census field, so the two lines
+/// cannot disagree: both come from the same loads.
+///
+/// The token is `[ptrpoll]`, nine bytes — deliberately longer than eight so it cannot be folded
+/// into an LLVM immediate and must appear in `.rodata`, which is what makes `grep -a` on the
+/// artifact a reachability proof rather than a compile proof.
+///
+/// Runs on the census pass only (~1 in 40 sweeps, ~10 s), takes no lock and touches no MMIO — five
+/// `Relaxed` loads and one `Relaxed` swap. The census comment's rule (never add lock traffic to
+/// the path whose death this reports) holds by construction.
+#[cfg(feature = "orinclick")]
+fn ptrpoll_witness(tick: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let rearm = crate::drivers::xhci::MOUSE_REARM_COUNT.load(Ordering::Relaxed);
+    let disc = crate::drivers::xhci::MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed);
+    let err = crate::drivers::xhci::MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed); let dup = crate::drivers::xhci::MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed); let nobuf = crate::drivers::xhci::MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the two counters that separate (a1) from (a2), and (a1)'s two sub-causes from each other: `dup` = the guard ate a known duplicate, `nobuf` = the buffer/ring was gone. ⚠ folded, line-neutral.
+    // Saturating: the three counters are read one at a time and a completion can land between the
+    // loads, so the arithmetic is only ordered in the limit. A one-off underflow would print
+    // `reports=0` and read as "worse than dead"; saturation makes it read as "not yet counted".
+    let reports = rearm.saturating_sub(disc).saturating_sub(err);
+    let base = PTRPOLL_BASE.load(Ordering::Relaxed);
+    let first = base == u64::MAX;
+    if first {
+        PTRPOLL_BASE.store(reports, Ordering::Relaxed);
+    }
+    let moved = rearm.wrapping_add(dup).wrapping_add(nobuf); let last = PTRPOLL_LAST.swap(moved, Ordering::Relaxed); // CLICKDEAD-xhci.patch v2 — the DROPS join the movement test, or a pipeline being EATEN (rearm flat, dup/nobuf climbing) would be silently mistaken for one that is STARVED and print one line for the whole boot. ⚠ folded, line-neutral.
+    if !first && last == moved {
+        return reports; // nothing moved since the last census — one line already said so.
+    }
+    let decoded = reports.saturating_sub(if first { reports } else { base });
+    let verdict = if decoded != 0 {
+        "STREAMING (the pointer read is completing and re-arming; a dead click above this line is a ROUTING fault, not a pipeline one)"
+    } else if disc != 0 {
+        "GUARD-REARM (completions ARE arriving but their TRB does not match the armed read; the dup-Success guard is re-arming them and no report is decoding — mod.rs:4586)"
+    } else if err != 0 {
+        "ERROR-REARM (non-halting error completions on the pointer endpoint; the read is being re-armed off the error path — mod.rs:4238)"
+    } else if first {
+        "BASELINE (the enumeration arms; every later line is measured against this one)"
+    } else if nobuf != 0 {
+        "NOBUF-DROP (completions ARE arriving and the guard is dropping them because `mouse_data_buffer`/`mouse_ring` is GONE — mod.rs:4599's `!have_buf` arm. A teardown or allocation defect, NOT a duplicate: re-arming here would be wrong, there is nothing to arm. Look at the slot's soft state, not at the dup discrimination)"
+    } else if dup != 0 {
+        "DUP-DROP (completions ARE arriving and the dup-Success guard is consuming them WITHOUT re-arming — mod.rs:4599's `param == mouse_prev_phys` arm, buffer and ring still present. This is (a1): the pipeline is being eaten, not starved)"
+    } else {
+        "ARMED-NO-COMPLETION (the read is armed, dup=0 and nobuf=0, and the controller has posted NO transfer event for the pointer DCI since the last line. This is (a2): the endpoint went quiet — look at EP state, doorbell and periodic bandwidth, not at the guard)"
+    };
+    serial_println!(
+        "[ptrpoll] t={} rearm={} discard={} errrearm={} dup={} nobuf={} reports={} base={} decoded={} -> {}",
+        tick, rearm, disc, err, dup, nobuf, reports,
+        if first { reports } else { base }, decoded, verdict
+    );
+    reports
 }

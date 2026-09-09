@@ -1,0 +1,171 @@
+diff --git a/unaos/crates/kernel/src/main.rs b/unaos/crates/kernel/src/main.rs
+--- a/unaos/crates/kernel/src/main.rs
++++ b/unaos/crates/kernel/src/main.rs
+@@ -8866,3 +8866,167 @@
+     use unaos_kernel::pal::GneissPal;
+     pal.render();
+ }
++
++// ═══════════════════════════════════════════════════════════════════════════════════════════════
++// S7 — THE RENDER FAMILY'S TWO AXES (docs/dev/evidence/orin14/S7-CONVERGENCE.md §3).
++//
++// The GATE-FAMILY ruling (docs/dev/evidence/orin13/LANDING-REPORT.md:24-37) found three render
++// members that share one pass loop and differ in exactly two things: HOW THE PASS WAITS and WHO OWNS
++// INPUT. `render_pass<W>` above is the one body; these traits are the two axes; the impls below are
++// named by their wait DISCIPLINE, never by a board (LEDGER S6). Step 1 (this block) carries the Pi's
++// impl only; step 2 adds the polled terminus (`CounterPollWait`, `OWNS_INPUT = false`) and widens the
++// cfg on this block to the union of the two aarch64 members; step 3 adds x86 (`FoldingChannelWait`).
++// Until then the block is gated exactly as the Pi member it replaces, so a `tegra` image cannot name
++// `GUI_CHANNEL` even by accident and `pi` + `tegra` stays the `compile_error!` it is
++// (`arch/aarch64/serial.rs:23`).
++//
++// PLACEMENT: the FILE TAIL, below every line a Pi-compiled item occupies, because `main.rs` is compiled
++// into the knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof and panic
++// `Location` records embed line numbers (PARITY §5.3). Nothing above this comment moved for S7.
++// ═══════════════════════════════════════════════════════════════════════════════════════════════
++
++/// What a pass was woken for. `Input` carries the routed event; `Tick` is the furniture cadence (the
++/// strip pulse on the Pi and x86, the CNTPCT-derived period on a polled terminus); `Retire` is the x86
++/// revenant order and is never produced elsewhere (its handler is step 3's; `Input` is guarded by
++/// `InputOwner::OWNS_INPUT` at the match).
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++#[allow(dead_code)] // `Retire` is constructed by the x86 impl (step 3); `try_next` is called by its burst loop.
++enum Wake {
++    Input(unaos_kernel::pal::Event),
++    Tick,
++    Retire,
++}
++
++/// THE WAITING AXIS. One impl per wait discipline. `new` takes the spawn argument (the x86 impl keeps
++/// its `cpu` for the census; the Pi discards it); `wait` blocks, sleeps or yields until there is
++/// something to do and opens the pass bracket; `try_next` is the non-blocking "more of this burst?"
++/// (x86 folds motion here; the Pi and a polled terminus answer `None`); `census` closes the bracket
++/// after the presents and prints the rate-limited line (three clocks today, one call site).
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++trait RenderWait: Sized {
++    fn new(cpu: usize) -> Self;
++    fn wait(&mut self) -> Wake;
++    #[allow(dead_code)]
++    fn try_next(&mut self) -> Option<Wake>;
++    fn census(&mut self, presented: bool);
++}
++
++/// THE INPUT-OWNERSHIP AXIS. `OWNS_INPUT == false` makes every input arm of the body a match on
++/// nothing: the arms still compile, `wait` never returns `Wake::Input`, and the serial-inbox drain is
++/// skipped — the polled terminus's contract ("IT DOES NOT DRAIN EVENTS", `jd2_console_pump` owns the
++/// keys) becomes one constant instead of a second copy of the loop.
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++trait InputOwner {
++    const OWNS_INPUT: bool;
++}
++
++/// The furniture a board services on `Wake::Tick`. Constants, not runtime flags, so every guard in
++/// the body folds at monomorphisation and a knob-off image compiles the same code it did before the
++/// lift. `DOCK_REOPEN` / `INSTGUI` / `STACK_PROBE` are read by steps 2-3 (x86's dock reopen arm and
++/// `instgui::service`, the terminus's `[u7stk]` probes); on the Pi they are `false` today.
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++#[allow(dead_code)]
++trait Furniture {
++    const STRIP: bool;
++    const PULSEWIN: bool;
++    const DOCK_REOPEN: bool;
++    const INSTGUI: bool;
++    const STACK_PROBE: bool;
++}
++
++/// Pi: the CHANNEL discipline. `wait` = `GUI_CHANNEL.recv()` — `Semaphore::wait` parks the task
++/// (`STATE_BLOCKED`, `switch_context` to the scheduler; `arch/aarch64/sched.rs`), so an idle render
++/// core is off the run queue — plus the GUI-CLICK-2 depth count and the [sched6] pass bracket. The
++/// strip pulse's `Event::Timer` is mapped to `Wake::Tick` here, which is what the body's Tick arm
++/// already means; everything else is `Wake::Input`. The fields are the pre-S7 `s6_*` locals and `t0`,
++/// one for one; `census` is the pre-S7 tail of the pass, verbatim in text and in wire shape.
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++struct ChannelWait {
++    t0: u64,
++    passes: u64,
++    composites: u64,
++    cyc: u64,
++    last_ms: u64,
++}
++
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++impl RenderWait for ChannelWait {
++    #[inline(always)]
++    fn new(_cpu: usize) -> Self {
++        Self { t0: 0, passes: 0, composites: 0, cyc: 0, last_ms: unaos_kernel::arch::ms() }
++    }
++    #[inline(always)]
++    fn wait(&mut self) -> Wake {
++        // Block until an event arrives (recv parks the task — an idle render core burns nothing).
++        let ev = GUI_CHANNEL.recv();
++        GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // GUI-CLICK-2 depth accounting
++        self.t0 = unaos_kernel::arch::now_cycles();
++        self.passes += 1;
++        match ev {
++            unaos_kernel::pal::Event::Timer => Wake::Tick,
++            ev => Wake::Input(ev),
++        }
++    }
++    #[inline(always)]
++    fn try_next(&mut self) -> Option<Wake> {
++        None // one event per pass on this discipline; the burst fold is x86's (step 3).
++    }
++    #[inline(always)]
++    fn census(&mut self, presented: bool) {
++        if presented {
++            self.composites += 1;
++        }
++        self.cyc += unaos_kernel::arch::now_cycles().wrapping_sub(self.t0);
++        // Rate-limited [sched6] witness: incoming pass rate vs presented-composite rate + mean pass
++        // cost over the window (proves the pacing — presents track real activity, not the event rate).
++        let now = unaos_kernel::arch::ms();
++        let span = now.wrapping_sub(self.last_ms);
++        if span >= 5000 {
++            let passes_per_s = self.passes.saturating_mul(1000) / span.max(1);
++            let comps_per_s = self.composites.saturating_mul(1000) / span.max(1);
++            let mean_cyc = self.cyc / self.passes.max(1);
++            serial_println!(
++                // PULSE-4: the strip's cadence moved to 4 Hz; this witness's own 5 s span is
++                // deliberately UNCHANGED (wire volume). The label names the strip's rate, not this
++                // line's, so it tracks `PSTRIP_PERIOD_MS` rather than restating a stale literal.
++                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@{}ms)",
++                passes_per_s,
++                comps_per_s,
++                mean_cyc,
++                unaos_kernel::ui_status::PSTRIP_PERIOD_MS
++            );
++            // SCHED-PRIO: the dispatch-share line, emitted on `[sched6]`'s cadence and immediately
++            // after it, so a capture reads "composites=N/s" and "who won the dispatches that produced
++            // them" as one pair. This is the only site that fires while a fleet is actually live —
++            // the scheduler's own two emitters are metal-only and boot-once respectively.
++            unaos_kernel::arch::sched::prio_witness();
++            self.passes = 0;
++            self.composites = 0;
++            self.cyc = 0;
++            self.last_ms = now;
++        }
++    }
++}
++
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++impl InputOwner for ChannelWait {
++    const OWNS_INPUT: bool = true;
++}
++
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++impl Furniture for ChannelWait {
++    const STRIP: bool = true;
++    const PULSEWIN: bool = cfg!(feature = "desktop_firmware");
++    const DOCK_REOPEN: bool = false;
++    const INSTGUI: bool = false;
++    const STACK_PROBE: bool = false;
++}
++
++/// The Pi member's ENTRY, unchanged in name and cfg so the spawn site (`spawn_prio("render",
++/// render_service, …)`) and the family count (`render_service` / `x86_render_service` /
++/// `orin_render_service` entries — 3, GATE-FAMILY) do not move in step 1. It is a shim: construct the
++/// channel discipline, run the one body. `arg` is the spawn argument (0 today), forwarded.
++#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
++fn render_service(arg: usize) {
++    render_pass::<ChannelWait>(arg)
++}

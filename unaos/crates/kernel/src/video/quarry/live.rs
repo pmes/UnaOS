@@ -1794,7 +1794,7 @@ pub fn open() {
         SURF.lock().clear();
         return;
     }
-    WIN.store(id, Ordering::Relaxed);
+    WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&WIN, "quarry"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Same argument as pulsewin's: `close()` clears this cell and `press_route` is its only caller, so a close taken by the router's furniture arm would free the row and leave this cell naming a re-issuable slot. render7 is the boot where this window WAS re-issued the console's id (`[quarry] open win=1` after `close-furniture win=1`).
     wm::focus_changed(OWNER);
     let (roots_n, tn, ln) = {
         let gd = MODEL.lock();
@@ -2926,5 +2926,94 @@ pub fn selftest() {
             a, b, DOUBLE_CLICK_MS, MAX_CACHE, WHEEL_ROWS
         ),
         Err(why) => serial_println!(":: QUARRY: {} :: FAIL ::", why),
+    }
+}
+
+/// QUARRYDOOR (KEYDOORS F1) — **<Esc> and an arrow reach Quarry through the SHELL DOOR, not through
+/// the seam.**
+///
+/// ### Which seam this drives, and why it is a different claim from [`selftest`]
+///
+/// [`selftest`] is pure logic and [`key_route`] has always been correct; the KEYDOARS F1 defect was
+/// never in the callee. It was that `key_route` had exactly ONE caller in the whole tree —
+/// `arch/aarch64/syscall.rs:13211`, the EL0 RING door — so on every SHELL path the function was
+/// unreachable. A fixture that calls `key_route` directly would have passed on the broken tree, which
+/// makes it worthless as a proof of this fix.
+///
+/// So this one drives **`arch::x86_64::syscall::wc_route_event`** — x86's actual shell door, the
+/// function `main.rs`'s two x86 drains call for every event, and the exact statement F1 edited. That
+/// is the same choice `wmdirect_selftest` made for the pointer chain and for the same reason: assert
+/// against the REAL chain, never against a transcription of it.
+///
+/// ### Why x86 only, stated rather than silently skipped
+///
+/// The other two doors F1 fixed are `main.rs` drain loops (`jd2_console_pump`,
+/// `pump_usb_into_gui`) — they are not functions a fixture can call, they only exist inside a running
+/// pump, and the aarch64 QEMU targets emulate no HID to feed one. Those two folds are scoreable only
+/// from a metal capture: `[quarry] closed win=…` following a `KEY 0x1b` in the transcript. This leg
+/// says so on the wire rather than reporting a silent PASS that covered one arch.
+///
+/// ### Legs
+///
+/// 1. `open` — Quarry is on the glass (`on_glass()`, i.e. a live row ABOVE `wm::shell_z()`).
+///    A DECLINE is a SKIP, not a FAIL: at 640x480 `open()` refuses by design so the pixel-exact video
+///    battery is unperturbed, and that refusal is not this fixture's defect.
+/// 2. `arrow` — `wc_route_event(Key(0x1E))` is CONSUMED (`Event::Unknown`) while Quarry is open.
+///    Down-arrow, the key that fell through to `handle_key` on every board before F1.
+/// 3. `esc` — `wc_route_event(Key(0x1B))` is consumed AND the window is gone: `is_open()` false and
+///    `wm::info(win)` `None`. `close()` prints `[quarry] closed win=N paints=N` immediately above this
+///    line, which is the close witness a capture is scored on.
+/// 4. `shut` — THE CONTROL, and the leg that makes leg 2 mean something. With Quarry closed,
+///    `key_route(Key(0x1E))` must return FALSE: `on_glass()` is the guard that stops a closed file
+///    manager stealing the shell's arrows, and a fixture that only ever tested the open case could not
+///    tell a working guard from a missing one.
+#[cfg(feature = "witness")]
+pub fn door_selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        serial_println!(
+            ":: QUARRYDOOR: this arch's shell doors are main.rs drain loops (jd2_console_pump, pump_usb_into_gui) — not callable from a fixture, and no HID is emulated to drive one; score them from a metal capture as `[quarry] closed win=` after a `KEY 0x1b` :: SKIP ::"
+        );
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        if is_open() {
+            close();
+        }
+        open();
+        if !is_open() {
+            serial_println!(
+                ":: QUARRYDOOR: quarry declined to open — see the `[quarry] DECLINE reason=` line above (640x480 refuses by design) :: SKIP ::"
+            );
+            return;
+        }
+        let win = WIN.load(Ordering::Relaxed);
+        let leg_open = on_glass();
+        // Leg 2 — an ARROW, through the door.
+        let arrow = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1E));
+        let leg_arrow = leg_open && matches!(arrow, crate::pal::Event::Unknown);
+        // Leg 3 — <Esc>, through the same door. This is the gesture that had no way home.
+        let esc = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1B));
+        let leg_esc = matches!(esc, crate::pal::Event::Unknown)
+            && !is_open()
+            && wm::info(win).is_none();
+        // Leg 4 — the control: a CLOSED Quarry consumes nothing.
+        let leg_shut = !key_route(crate::pal::Event::Key(0x1E));
+        // Restore: if a red leg left the row standing, take it back rather than leaving a file
+        // manager on the operator's desktop.
+        if wm::info(win).is_some() {
+            close();
+        }
+        let ok = leg_open && leg_arrow && leg_esc && leg_shut;
+        serial_println!(
+            ":: QUARRYDOOR: win={} seam=arch::x86_64::syscall::wc_route_event on_glass={} arrow_consumed={} esc_closes={} closed_consumes_nothing={} :: {} ::",
+            win, leg_open, leg_arrow, leg_esc, leg_shut,
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 }

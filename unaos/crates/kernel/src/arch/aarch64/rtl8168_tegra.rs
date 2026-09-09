@@ -514,6 +514,104 @@
 // RX is already convicted broken — it arms ONLY after the [net4F] latch verdict, so a healthy NIC
 // never runs it. `rearm_current_rx` restores the victim's correct address on recycle by construction.
 //
+// ## NET4A — ask the first metal question of orin-ledger gap #2: put the ring + 32 buffers BELOW 4 GiB.
+//
+// Boot7h's `[net4F]` conviction (four consecutive completions wrote ONLY buffer 17) was measured with the
+// NET-4s covering ALIAS in the write path: rings + buffers at 0x268000000.. in GiB 9, the NIC's 32-bit
+// truncated TLPs (boot-24) up-translated by inbound-iATU region 1 (bus 0x68000000 → DRAM 0x268000000).
+// "NIC-internal or RC/iATU-internal" was never separated because the alias was never absent. NET4A
+// removes it: `mmu_tegra::seat_net4a_low_nc` reserves the LOWEST carveout-clean, L2-split 2 MiB block in
+// `[0x8000_0000, 4 GiB)` at heap-guard (same exclusion set the heap dodges; witnessed as `[net4A]` with a
+// low-DRAM census either way), `init_rings` maps it Normal-NC through `install_nc_window` (the NET-4B
+// flip lifted out — identical MAIR AttrIdx 2, identical break-before-make + EL1-twin discipline) and lays
+// the same four DMA objects at the same offsets; `arm_dma_aliases` then finds every block "identity-
+// covered, no alias" and arms nothing. Fallback: no clean low block ⇒ the NET-4B high window + NET-4s
+// alias exactly as before, said out loud (`below4g=0`). No knob: the driver compiles only under
+// `net4`+`tegra`, runs only on the Orin, and the placement is fail-open to the proven bring-up.
+//
+// Why NET-4o's "no clean sub-4 GiB span" (boot-19) does not stand: its `lowest_clean_in` scan ran only
+// inside the loop over DERIVED `dma-ranges` inbound windows (24d4ed49), and on this board that set is
+// EMPTY (`DMA-WINDOW STOP … NO dma-ranges` every boot). The low span was never scanned; NET-4p's "packed
+// with carveouts" was the empty set read as a measurement. The NET4A scan runs on both heap paths and
+// prints the reason every rejected candidate lost on.
+//
+// The witness: `[net4F] rx-ring phys=… buffers=32 below4g=1` at rings-up, and `[net4F] distinct
+// buffers-written(count=N)=[…] across the first 4 RX completion(s)` — the UNION of buffers that lost
+// their landing tag over the first four completions — on the 4th completion and at window close:
+//   * `count=4 below4g=1` ⇒ per-descriptor addressing works with no alias ⇒ NET-4A WAS THE ALIAS.
+//   * `count<4 below4g=1` ⇒ the latch survives without the alias ⇒ NIC/RC-internal; next question is
+//                            the RC's inbound iATU region ordering.
+//   * `below4g=0`          ⇒ the question was not asked; the `[net4A]` census says why.
+//
+// ## NET-5 — the ring RE-FETCH probe: is the payload address STALE INSIDE THE NIC, or is the payload
+// ## never delivered at all? (knob `UNAOS_NET5=1`; design doc `docs/dev/evidence/orin16/NET5.md`)
+//
+// The 2026-09-06 net4 boot answered NET4A NEGATIVE (`[net4F] distinct buffers-written(count=2)=[0,17]
+// … below4g=1 rx-ring=0x80000000`) and refuted the un-serviced RDU latch (`RDU-clears=0`). Re-reading
+// that boot's own lines against the code that produced them finds a THIRD instrument defect, of the
+// same family as the two the campaign has already retired ([net4z]'s content match, [net4A]'s
+// correlation over it):
+//
+//   **`[net4F]`'s landing tags are re-stamped ONLY for the slot that just popped** (`rearm_current_rx`).
+//   A buffer the NIC never completes — buffer 17 among them — loses its tag ONCE and is reported as
+//   "written" on EVERY later pop, forever. So `rx[1..4] buffers-written=[17]` is ONE datum printed four
+//   times, and the VERDICT line's "4 consecutive completions wrote ONLY buffer 17" does not follow from
+//   it. What the scan DOES prove (it re-reads all 32 buffers every pop) is the weaker and more
+//   interesting statement: across five completions with real writeback lengths (60/60/62/342), exactly
+//   TWO ring buffers were EVER written — 0 (pop 0's own, correct) and 17 (at or before pop 1). Three or
+//   four of those payloads reached no ring DRAM at all, which is precisely the `count=0` reading the
+//   [net4F] vocabulary already names: "an address REUSE cannot produce this".
+//
+// Two causes survive that reading, and they need different fixes in different lanes:
+//   * **C1 — inbound PAYLOAD delivery loss.** 16-byte descriptor writebacks land per-slot the whole
+//     time; 60..342-byte payload bursts do not, after the first. Selective by burst, not by address.
+//   * **C2 — a NIC-internal STALE payload address.** Buffer 17 is the same INDEX in two placements two
+//     GiB apart (boot7h `0x268018800`, net4 `0x80018800` — both window+0x18800), which an incidental
+//     write cannot reproduce; ring DRAM held the correct distinct addr for every slot both times.
+//
+// The probe separates them by making the ring's per-slot addresses UNRECOGNISABLE after the engine is
+// live, and by making the landing scan per-pop instead of cumulative:
+//
+//   1. **SHADOW RE-POINT** (`net5_arm`, once, immediately after `CR = RxEnb|TxEnb` and the RX-mode
+//      writes): rewrite the `addr` of descriptors 1..31 from `rx_buffers + k*2048` to
+//      `shadow + k*2048`, `shadow = nc_base + 0x50000` — a tagged, reserved 64 KiB block in the SAME
+//      Normal-NC window, inside the SAME NET-4h identity inbound region, so its reachability is the
+//      buffers' own (checked against `[dma_ident_lo, dma_ident_hi)` before arming, and refused out
+//      loud otherwise). Slot 0 is left pointing at its original buffer: it is the one slot that has
+//      landed correctly on every boot in the record, so it stays as the control. `rearm_current_rx`
+//      keeps the shadow address for k≥1, so the re-point holds for the whole pass. The `addr` store is
+//      a single aligned 8-byte volatile write to a 16-byte descriptor on a 256-byte-aligned NC ring, so
+//      a concurrent fetch sees the old or the new address WHOLE — both are named arms.
+//      **After the re-point NO descriptor anywhere carries buffer 17's address.**
+//   2. **RESTAMP-ALL** (`net5_on_pop`): scan ring AND shadow for lost tags, print, then re-stamp EVERY
+//      tag in both blocks. Each pop's set is then "written since the previous pop" — the sticky-tag
+//      artifact is removed by construction, and a repeated landing has to be re-proven every time.
+//
+// VERDICT ARMS (`[net5T] … verdict=`; mutually exclusive, decided in this order):
+//   * `REFETCH-LIVE`       shadow[s] written, s = the completing slot ⇒ the NIC re-fetched desc[s]
+//                          AFTER enable and honored the rewritten address. Per-descriptor addressing is
+//                          live; the "latch" was the instrument. (RX may simply work on this boot.)
+//   * `REFETCH-WRONGSLOT`  shadow[j], j≠s ⇒ it re-fetched but resolves to another slot's address: a
+//                          genuine index/address reuse, now measured with the address moved under it.
+//   * `STALE-ORIG`         an ORIGINAL ring buffer written although no descriptor holds a ring address
+//                          any more ⇒ the emitted address is held INSIDE the NIC and predates the
+//                          re-point. C2 CONVICTED, and convicted as a stale value, not a fetched one.
+//   * `PREFETCHED`         ring buffer s (its own original) written ⇒ desc[s] was already prefetched
+//                          when the re-point ran; measures prefetch depth (the max such s, +1).
+//   * `NOWHERE`            a real writeback length and NOT ONE tag lost in either block ⇒ the payload
+//                          never reached this DRAM. C1 CONVICTED.
+// `[net5V]` at window close tallies the arms and states the ranked answer.
+//
+// ABSENCE IS A VERDICT, in three shapes: no `[net5R] ARMED` line (the probe refused — the `[net5R] NOT
+// ARMED` line names below4g=0 or a shadow outside the identity region: UNDECIDED, not FAIL); a
+// `[net5R] re-point readback … MISMATCH` (the rewrite never reached DRAM — the probe is VOID and no
+// landing arm may be read off it); no `[net5T]` line at all while `[net4F] rx[` lines exist (the knob
+// is not in the built image — a BUILD fault, never a hardware verdict).
+//
+// The whole probe is `#[cfg(feature = "net5")]`; every [net4F]/[net4G]/[net4z] instrument is kept
+// verbatim (R19 — failed paths stay open with their conditions), so the knob-off image is unchanged
+// and both readings are scorable side by side on the armed boot.
+//
 // ## Write discipline
 //
 // The driver, being a driver, DOES the fabric writes NET-3 refused: it enables the device's
@@ -571,7 +669,8 @@ mod metal {
     use super::P4;
     use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{
-        install_net4b_nc, map_mmio_window, net4b_nc_window, MmioMap,
+        install_nc_window, install_net4b_nc, map_mmio_window, net4a_low_nc_window, net4b_nc_window,
+        MmioMap,
     };
     use crate::net_phy::{fmt_mac, RawNic, SmoltcpPhy};
     use core::ptr::{read_volatile, write_volatile};
@@ -792,6 +891,24 @@ mod metal {
     /// Outside 0..NUM_RX, so neither tag can ever collide with a ring buffer's landing tag.
     const NET4G_DECOY_TAGIDX: usize = 0x44;
     const NET4G_CSITE_TAGIDX: usize = 0x43;
+
+    // ── NET-5 — the ring RE-FETCH probe + the honest per-pop landing scan (header § NET-5) ──
+    /// NET-5: the SHADOW buffer block's offset inside the 2 MiB Normal-NC DMA window. The window's
+    /// occupied offsets are rx-ring +0x0, rx-bufs +0x10000, tx-ring +0x20000, tx-bufs +0x30000 and the
+    /// NET-4G decoy page +0x40000; +0x50000 is the next free 64 KiB-aligned block and 32 × 2048 = 64 KiB
+    /// fits exactly, so the shadow ends at +0x60000, still far inside 2 MiB.
+    #[cfg(feature = "net5")]
+    const NET5_SHADOW_OFF: u64 = 0x50000;
+    /// NET-5: tag-index base for the shadow buffers. `net4f_tag(idx)` keys on `idx as u8`, so the shadow
+    /// tags occupy 0x80..0x9f — disjoint from the ring's 0x00..0x1f AND from the NET-4G decoy/C-site
+    /// (0x44/0x43). A tag can therefore never be mistaken for another block's.
+    #[cfg(feature = "net5")]
+    const NET5_SHADOW_TAGBASE: usize = 0x80;
+    /// NET-5: bound on the per-pop `[net5T]` landing lines. Twelve is four more than `NET4F_WITNESS_N`
+    /// (the record's longest observed window is five pops) so the probe outlives the [net4F] scan
+    /// without flooding the window.
+    #[cfg(feature = "net5")]
+    const NET5_WITNESS_N: u64 = 12;
 
     /// NET-4G: does `addr` still carry the 16-byte landing tag for `tagidx`? Volatile NC-DRAM reads;
     /// `dma_rmb` is the caller's obligation (one barrier per probe pass, not per site).
@@ -1240,6 +1357,37 @@ mod metal {
         net4g_interim_l_hits: u64,
         net4g_probes: u64,
         net4g_done: bool,
+        /// NET4A: the rings + buffers sit in the sub-4 GiB Normal-NC window (`net4a_low_nc_window`), so
+        /// no inbound-iATU alias is in the NIC's write path. `false` = the NET-4B high window + NET-4s
+        /// alias fallback; the `[net4F] distinct buffers-written` verdict is conditioned on this.
+        net4f_below4g: bool,
+        /// NET4A: the DISTINCT-buffers witness (header § NET4A). `net4f_distinct_seen` counts the first
+        /// four RX completions; `net4f_distinct_mask` is the union, over those completions, of every
+        /// ring buffer that had lost its landing tag at pop time (bit k = buffer k). Summarised once on
+        /// the 4th completion and again at window close (the census cadence).
+        net4f_distinct_seen: u64,
+        net4f_distinct_mask: u32,
+        /// NET-5 — the ring RE-FETCH probe (header § NET-5). `net5_shadow` is the re-pointed buffer
+        /// block's base (0 = the probe never armed, so every net5 site is inert); `net5_witnessed`
+        /// bounds the per-pop `[net5T]` lines; the five tallies are the verdict arms counted over the
+        /// window and read out by `[net5V]` at window close; `net5_depth` is the deepest slot that
+        /// landed in its ORIGINAL buffer (the prefetch-depth measurement).
+        #[cfg(feature = "net5")]
+        net5_shadow: u64,
+        #[cfg(feature = "net5")]
+        net5_witnessed: u64,
+        #[cfg(feature = "net5")]
+        net5_refetch_live: u64,
+        #[cfg(feature = "net5")]
+        net5_refetch_wrongslot: u64,
+        #[cfg(feature = "net5")]
+        net5_stale_orig: u64,
+        #[cfg(feature = "net5")]
+        net5_prefetched: u64,
+        #[cfg(feature = "net5")]
+        net5_nowhere: u64,
+        #[cfg(feature = "net5")]
+        net5_depth: i64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -1641,15 +1789,34 @@ mod metal {
             // CACHEABLE memory. `install_net4b_nc` flips the reserved window (carved by `select_heap_region`
             // just below the heap, in the same clean + DMA-reachable span) to Normal-NC in both live tables;
             // refuse the bring-up CLOSED if it is unavailable rather than DMA into cacheable/unmapped DRAM.
-            if !install_net4b_nc() {
+            // NET4A — prefer the SUB-4 GiB window `select_heap_region` reserves in GiB 2/3 (mmu_tegra
+            // `seat_net4a_low_nc`): a 32-bit-truncated payload TLP is a no-op truncation there and the
+            // NET-4h identity region 0 carries it, so NO inbound-iATU alias sits in the NIC's write path.
+            // That is the first metal question of orin-ledger gap #2 (does the buffer-17 latch survive
+            // without the alias?). Same Normal-NC attribute, same flip discipline (`install_nc_window` is
+            // the NET-4B flip lifted out); the high window + NET-4s alias remain the fallback, so a boot
+            // without a clean low block brings the NIC up exactly as boot7h did and SAYS so.
+            let (lo_base, lo_size) = net4a_low_nc_window();
+            let below4g = lo_base != 0 && lo_base + lo_size <= 0x1_0000_0000 && install_nc_window(lo_base, lo_size);
+            let (nc_base, nc_size) = if below4g {
+                (lo_base, lo_size)
+            } else {
                 serial_println!(
-                    "{}   !! NET-4B: Normal-NC DMA window could not be mapped — REFUSING ring bring-up (would DMA into cacheable memory, re-arming the maintenance-vs-fetch race NET-4B exists to remove) ::",
-                    P4
+                    "{}   [net4F] sub-4GiB window {} — falling back to the NET-4B high window + NET-4s inbound alias (the below-4G question is NOT asked this boot) ::",
+                    P4,
+                    if lo_base == 0 { "NOT reserved (see the [net4A] census line at heap-guard)" } else { "reserved but NOT mappable Normal-NC (its GiB is not L2-split)" }
                 );
-                return false;
-            }
-            let (nc_base, nc_size) = net4b_nc_window();
+                if !install_net4b_nc() {
+                    serial_println!(
+                        "{}   !! NET-4B: Normal-NC DMA window could not be mapped — REFUSING ring bring-up (would DMA into cacheable memory, re-arming the maintenance-vs-fetch race NET-4B exists to remove) ::",
+                        P4
+                    );
+                    return false;
+                }
+                net4b_nc_window()
+            };
             self.nc_base = nc_base;
+            self.net4f_below4g = below4g;
             serial_println!(
                 "{}   [net4B] rings + buffers in Normal-NC window [{:#x}, {:#x}) (MAIR AttrIdx 2); rx-ring @ +0x0, rx-bufs @ +0x10000, tx-ring @ +0x20000, tx-bufs @ +0x30000 — no cache maintenance, dma_wmb/dma_rmb ordering only ::",
                 P4, nc_base, nc_base + nc_size
@@ -1658,6 +1825,19 @@ mod metal {
             // doubles as the physical address (identity map); region-0 identity (NET-4h) reaches them.
             self.alloc_rx();
             self.alloc_tx();
+            // NET4A — the placement witness the ledger's gap #2 scores: where the RX ring and its 32
+            // buffers physically are, and whether that is below the 32-bit truncation ceiling.
+            serial_println!(
+                "{}   [net4F] rx-ring phys={:#x} buffers={} rx-bufs=[{:#x}..{:#x}) tx-ring phys={:#x} below4g={} — {} ::",
+                P4, self.rx_ring as u64, NUM_RX, self.rx_buffers as u64,
+                (self.rx_buffers as u64) + (NUM_RX * RX_BUF_SIZE) as u64, self.tx_ring as u64,
+                below4g as u8,
+                if below4g {
+                    "every DMA object is < 4 GiB inside the NET-4h identity region: NO inbound-iATU alias in the NIC's write path (a truncated TLP is a no-op truncation)"
+                } else {
+                    "high window: the NIC's truncated TLPs ride the NET-4s covering alias at inbound index 1, as on boot7h"
+                }
+            );
 
             // NET-4r — the SANCTIONED FALLBACK. Boot-24 proved the NET-4q full-64 descriptor path correct
             // (RINGDUMP addr=0x2683cb… [MATCH], hi-before-lo ring bases) yet the payload STILL sank at the
@@ -1831,6 +2011,11 @@ mod metal {
                 "{}   rings up: RX @ {:#x} ({} desc) TX @ {:#x} ({} desc); TCR readback {:#010x} (live); CPlusCmd {:#06x} PCIDAC={} (expected clear; 64-bit DMA rides the descriptor addr) ::",
                 P4, rx_phys, NUM_RX, tx_phys, NUM_TX, tcr_rb, cpc_rb, pcidac
             );
+            // NET-5 — ARM the ring RE-FETCH probe (header § NET-5). LAST, after RxEnb and every RX-mode
+            // write: the engine is live, so any per-slot address it uses from here on it fetched AFTER
+            // enable, and any landing at an ORIGINAL buffer is an address it was already holding.
+            #[cfg(feature = "net5")]
+            self.net5_arm();
             true
         }
 
@@ -2291,6 +2476,9 @@ mod metal {
                     "one pass only, and RDU NEVER latched: the halt is NOT the un-serviced status latch (REFUTED) — the engine stops without reporting descriptor-unavailable, so it is not re-fetching the recycled descriptors at all"
                 }
             );
+            // NET4A — the distinct-buffers verdict at the census cadence (window close), whatever the
+            // completion count reached; the 4th-completion copy above may have printed already.
+            self.net4f_distinct_summary("window-close");
             // NET-4G — latch-site experiment status, so the window close is never silent about it:
             // the verdict fired above (repeated here as a pointer), or the arm never happened (the
             // experiment self-gates on the [net4F] latch verdict), or the victim never completed.
@@ -2309,6 +2497,12 @@ mod metal {
                 self.net4g_victim, self.net4g_latched,
                 self.net4g_interim_pops, self.net4g_interim_l_hits
             );
+            // NET-5 — the ring RE-FETCH tally + ranked answer (header § NET-5), before the no-lease
+            // verdict: on an armed boot it is the authority on WHERE the payloads went, and net4V's
+            // `zero-payload` counter (which reads the ORIGINAL ring buffer) is distorted by the
+            // re-point by construction.
+            #[cfg(feature = "net5")]
+            self.net5_verdict();
             self.net4v_verdict();
             // NET-4E (armed-diagnostic builds only): QUENCH RX DMA at window close. The NIC's
             // misdirected payload writes (NET-4A mechanism, cause unfound) continue as long as RX
@@ -2324,6 +2518,42 @@ mod metal {
                     P4, cr, cr & !CR_RE
                 );
             }
+        }
+
+        /// NET4A — the DISTINCT-buffers verdict (header § NET4A): how many DISTINCT ring buffers the NIC
+        /// wrote across the first four RX completions, measured by lost landing tags (the NET-4F
+        /// instrument), and what that says given WHERE the ring sits (`net4f_below4g`). Printed on the
+        /// 4th completion and at window close; read-only.
+        fn net4f_distinct_summary(&self, at: &str) {
+            let m = self.net4f_distinct_mask;
+            let count = m.count_ones();
+            let mut list = [-1i64; 4];
+            let mut n = 0usize;
+            for k in 0..NUM_RX {
+                if m & (1u32 << k) != 0 && n < list.len() {
+                    list[n] = k as i64;
+                    n += 1;
+                }
+            }
+            let seen = self.net4f_distinct_seen;
+            let below = self.net4f_below4g;
+            serial_println!(
+                "{}   [net4F] distinct buffers-written(count={})=[{},{},{},{}] across the first {} RX completion(s) at={} below4g={} rx-ring={:#x} — {} ::",
+                P4, count, list[0], list[1], list[2], list[3], seen, at, below as u8, self.rx_ring as u64,
+                if seen == 0 {
+                    "NO RX completion this window: the question was not asked (link / cable / no traffic reached the ring)"
+                } else if seen < 4 {
+                    "fewer than four completions: UNDECIDED this window (count so far is a lower bound)"
+                } else if count >= 4 && below {
+                    "FOUR DISTINCT buffers with NO alias in the path: per-descriptor addressing works below 4 GiB ⇒ NET-4A WAS THE ALIAS (the inbound-iATU covering region); the buffer-17 latch was RC-side translation"
+                } else if count >= 4 {
+                    "four distinct buffers THROUGH the alias: the latch did not reproduce on this boot; NET-4A undecided (the below-4G question was not asked)"
+                } else if below {
+                    "a single-address latch with NO alias in the path ⇒ NIC/RC-internal, NOT the alias; next question: the RC's inbound iATU region ordering (identity region 0 vs the NIC's TLP path)"
+                } else {
+                    "the latch reproduced on the alias path (fallback boot): the below-4G question was NOT asked — see the [net4A] census line at heap-guard for why no low window seated"
+                }
+            );
         }
 
         /// NET-4V — THE ONE-LINE NO-LEASE VERDICT. Emitted once, at DHCP-window close, right after the
@@ -2500,6 +2730,10 @@ mod metal {
                 // NET-4G — an error-frame completion still moves the ring past the victim; the
                 // latch-site experiment must observe it BEFORE the re-arm restores the victim's addr.
                 self.net4g_on_pop();
+                // NET-5 — an RES completion is still a completion: score its landing (and re-stamp) so
+                // an error-frame pass cannot leave the per-pop masks carrying a previous pop's write.
+                #[cfg(feature = "net5")]
+                self.net5_on_pop(0);
                 self.rearm_current_rx();
                 return None;
             }
@@ -2674,6 +2908,20 @@ mod metal {
                     len = d.max(60).min(RX_BUF_SIZE).min(out.len());
                 }
             }
+            // NET-5 — with the ring re-pointed, the completing slot's descriptor ADDRESS is its shadow
+            // buffer, so that is where a correctly-addressed payload lands. This is not the NET-4D
+            // harvest heuristic: it reads the frame from the address the descriptor actually carries.
+            // Falls through to the original buffer whenever the shadow buffer still holds its tag.
+            #[cfg(feature = "net5")]
+            let buf = if self.net5_shadow != 0
+                && !net4g_tag_intact(
+                    self.net5_shadow + (self.rx_cur * RX_BUF_SIZE) as u64,
+                    NET5_SHADOW_TAGBASE + self.rx_cur,
+                ) {
+                (self.net5_shadow + (self.rx_cur * RX_BUF_SIZE) as u64) as *mut u8
+            } else {
+                buf
+            };
             let src: *const u8 = if !harvest.is_null() { harvest } else { buf };
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
@@ -2934,6 +3182,21 @@ mod metal {
                             written[nwritten] = k as i64;
                             nwritten += 1;
                         }
+                        // NET4A — accumulate the DISTINCT-buffers union over the first four completions
+                        // (bit k = buffer k lost its tag at some pop). Union semantics absorb coalesced
+                        // completions (buffers written ahead of the pop that reads them).
+                        if self.net4f_distinct_seen < 4 {
+                            self.net4f_distinct_mask |= 1u32 << k;
+                        }
+                    }
+                }
+                if self.net4f_distinct_seen < 4 {
+                    self.net4f_distinct_seen += 1;
+                    if self.net4f_distinct_seen == 4 {
+                        // The 4th completion is the earliest the question can be answered; print it
+                        // here too (not only at window close) so it is on the wire even if the boot dies
+                        // in the window (the 0x200 IOB RAS class that ended boots 34/36/42).
+                        self.net4f_distinct_summary("completion-4");
                     }
                 }
                 let own = !slot_untouched;
@@ -3009,6 +3272,10 @@ mod metal {
             // NET-4G — latch-site experiment per-pop half: interim tally + re-stamp, or the victim's
             // verdict. MUST precede the re-arm (it restores the victim's address + own-buffer tag).
             self.net4g_on_pop();
+            // NET-5 — the honest per-pop landing scan + RESTAMP-ALL. AFTER net4g_on_pop (which needs
+            // pre-restamp state for its attribution) and BEFORE the re-arm.
+            #[cfg(feature = "net5")]
+            self.net5_on_pop(len);
             self.rearm_current_rx();
             Some(len)
         }
@@ -3194,6 +3461,196 @@ mod metal {
             );
         }
 
+        /// NET-5 — ARM the ring RE-FETCH probe (header § NET-5). Called exactly once, from the tail of
+        /// `init_rings` AFTER `CR = RxEnb|TxEnb` and the RX-mode writes, so every descriptor address the
+        /// engine consumes from here on is one it FETCHED after enable. Rewrites descriptors 1..31 to a
+        /// tagged SHADOW block in the same Normal-NC window (slot 0 stays on its own buffer as the
+        /// control — the one slot that has landed correctly on every boot in the record), and proves the
+        /// rewrite reached DRAM with an NC direct read. Refuses out loud unless the shadow's inbound
+        /// reachability is the buffers' own, so a null landing can never be an unreachable-target
+        /// artifact. `net5_shadow == 0` afterwards ⇒ every other net5 site is inert.
+        #[cfg(feature = "net5")]
+        fn net5_arm(&mut self) {
+            let shadow = self.nc_base + NET5_SHADOW_OFF;
+            let shadow_end = shadow + (NUM_RX * RX_BUF_SIZE) as u64;
+            // Reachability, proven the way `arm_dma_aliases` proves the four DMA blocks': the shadow
+            // must lie inside the NET-4h identity inbound region. below4g is required too — the
+            // high-window fallback rides the NET-4s covering alias, which was sized for the four blocks
+            // and does NOT reach +0x50000, so re-pointing there would aim the NIC at a sink.
+            if !self.net4f_below4g
+                || self.nc_base == 0
+                || shadow < self.dma_ident_lo
+                || shadow_end > self.dma_ident_hi
+            {
+                serial_println!(
+                    "{}   [net5R] NOT ARMED: below4g={} nc-base={:#x} shadow=[{:#x}..{:#x}) identity-inbound=[{:#x}..{:#x}) — the ring RE-FETCH probe REFUSES rather than re-point descriptors at a surface whose inbound reachability is not proven. Every [net5T]/[net5V] line is absent this boot, and that absence reads UNDECIDED, never FAIL ::",
+                    P4, self.net4f_below4g as u8, self.nc_base, shadow, shadow_end,
+                    self.dma_ident_lo, self.dma_ident_hi
+                );
+                return;
+            }
+            // Stamp every shadow buffer with its own landing tag (tag index 0x80+k — disjoint from the
+            // ring's 0x00..0x1f and from the NET-4G decoy/C-site 0x44/0x43, so no tag can be attributed
+            // to the wrong block). Deliberately NOT a 64 KiB zero-fill like `alloc_rx`'s: this runs with
+            // the RX engine already live, and 64 Ki uncached byte-stores would push the re-point several
+            // milliseconds past RxEnb, handing the engine a bigger prefetch head start for nothing —
+            // the TAG is the instrument, not the surrounding bytes, and the frame copy takes `len` only.
+            for k in 0..NUM_RX {
+                net4g_stamp_tag(shadow + (k * RX_BUF_SIZE) as u64, NET5_SHADOW_TAGBASE + k);
+            }
+            dma_wmb();
+            // The re-point itself. Each store is a single aligned 8-byte volatile write to offset 8 of a
+            // 16-byte descriptor on a 256-byte-aligned NC ring, so a concurrent fetch sees the old or the
+            // new address WHOLE — both are named verdict arms (PREFETCHED vs the re-fetch arms).
+            for k in 1..NUM_RX {
+                let desc = unsafe { self.rx_ring.add(k) };
+                unsafe {
+                    write_volatile(
+                        core::ptr::addr_of_mut!((*desc).addr),
+                        shadow + (k * RX_BUF_SIZE) as u64,
+                    );
+                }
+            }
+            dma_wmb();
+            self.net5_shadow = shadow;
+            // Readback through the NC window. A MISMATCH means the store never reached DRAM and every
+            // landing arm below is VOID — said on the wire, and the probe disarms itself. desc[17] is
+            // quoted on purpose: it is the slot both boot7h and the 2026-09-06 net4 boot latched on.
+            let a1 = unsafe { read_volatile(self.rx_ring.add(1)) }.addr;
+            let a17 = unsafe { read_volatile(self.rx_ring.add(17)) }.addr;
+            let e1 = shadow + RX_BUF_SIZE as u64;
+            let e17 = shadow + (17 * RX_BUF_SIZE) as u64;
+            let ok = a1 == e1 && a17 == e17;
+            serial_println!(
+                "{}   [net5R] ARMED: rx-desc[1..{}].addr re-pointed from rx-bufs {:#x} to SHADOW {:#x} (NC window +{:#x}, {} B, tag idx {:#x}..) AFTER RxEnb; slot 0 left on its own buffer as the control. Re-point readback (NC direct DRAM): rx-desc[1].addr={:#x} expect={:#x} rx-desc[17].addr={:#x} expect={:#x} [{}] — NO descriptor carries buffer 17's address ({:#x}) any more, so a later landing THERE is an address the NIC holds internally ::",
+                P4, NUM_RX - 1, self.rx_buffers as u64, shadow, NET5_SHADOW_OFF,
+                NUM_RX * RX_BUF_SIZE, NET5_SHADOW_TAGBASE,
+                a1, e1, a17, e17,
+                if ok { "MATCH" } else { "MISMATCH — probe VOID, no landing arm may be read off it" },
+                (self.rx_buffers as u64) + (17 * RX_BUF_SIZE) as u64
+            );
+            if !ok {
+                self.net5_shadow = 0;
+            }
+        }
+
+        /// NET-5 — the honest per-pop landing scan (header § NET-5). Scans the ring AND the shadow block
+        /// for lost landing tags, emits ONE mutually-exclusive verdict arm, then RE-STAMPS EVERY tag in
+        /// both blocks so the next pop's set means "written SINCE THE PREVIOUS POP" — which is the
+        /// sticky-tag defect that made `[net4F]`'s "4 consecutive completions" run vacuous. Runs AFTER
+        /// `net4g_on_pop` (so the NET-4G attribution reads pre-restamp state) and BEFORE the re-arm.
+        /// Read-only except for the tag re-stamps.
+        #[cfg(feature = "net5")]
+        fn net5_on_pop(&mut self, len: usize) {
+            if self.net5_shadow == 0 {
+                return;
+            }
+            let s = self.rx_cur;
+            dma_rmb(); // one read barrier per probe pass; every site read below is NC direct DRAM
+            let mut ring_mask: u32 = 0;
+            let mut shadow_mask: u32 = 0;
+            let mut ring_first: i64 = -1;
+            let mut shadow_first: i64 = -1;
+            for k in 0..NUM_RX {
+                if !net4g_tag_intact((self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64, k) {
+                    ring_mask |= 1u32 << k;
+                    if ring_first < 0 {
+                        ring_first = k as i64;
+                    }
+                }
+                if !net4g_tag_intact(
+                    self.net5_shadow + (k * RX_BUF_SIZE) as u64,
+                    NET5_SHADOW_TAGBASE + k,
+                ) {
+                    shadow_mask |= 1u32 << k;
+                    if shadow_first < 0 {
+                        shadow_first = k as i64;
+                    }
+                }
+            }
+            let own_shadow = shadow_mask & (1u32 << s) != 0;
+            let own_ring = ring_mask & (1u32 << s) != 0;
+            let (arm, meaning) = if own_shadow {
+                self.net5_refetch_live += 1;
+                ("REFETCH-LIVE", "the payload is in the completing slot's SHADOW buffer — the NIC RE-FETCHED this descriptor AFTER RxEnb and honored the rewritten address: per-descriptor addressing is LIVE post-enable and the single-address latch was the instrument, not the silicon")
+            } else if shadow_mask != 0 {
+                self.net5_refetch_wrongslot += 1;
+                ("REFETCH-WRONGSLOT", "a SHADOW buffer other than the completing slot's was written — the NIC re-fetched a post-enable address but resolves payloads to another slot's: a genuine index/address reuse, measured with the address moved under it")
+            } else if own_ring {
+                self.net5_prefetched += 1;
+                if s as i64 > self.net5_depth {
+                    self.net5_depth = s as i64;
+                }
+                ("PREFETCHED", "the completing slot's ORIGINAL buffer was written — desc[s] had already been prefetched when the re-point ran, so this pop measures descriptor prefetch depth rather than a latch site")
+            } else if ring_mask != 0 {
+                self.net5_stale_orig += 1;
+                ("STALE-ORIG", "an ORIGINAL ring buffer was written although NO descriptor holds a ring address any more — the emitted address is held INSIDE the NIC and predates the re-point: a NIC-internal STALE payload address, convicted as a stale value rather than a fetched one")
+            } else {
+                self.net5_nowhere += 1;
+                ("NOWHERE", "a real writeback length completed and NOT ONE tag was lost in EITHER block — the payload never reached this DRAM at all; no address reuse can produce this, and the defect is inbound payload-write DELIVERY")
+            };
+            if self.net5_witnessed < NET5_WITNESS_N {
+                self.net5_witnessed += 1;
+                serial_println!(
+                    "{}   [net5T] rx[{}] slot={} len={} SINCE-LAST-POP shadow-mask={:#010x} (first={}) ring-mask={:#010x} (first={}) own-shadow={} own-ring={} verdict={} — {} ::",
+                    P4, self.rx_count.saturating_sub(1), s, len,
+                    shadow_mask, shadow_first, ring_mask, ring_first,
+                    own_shadow as u8, own_ring as u8, arm, meaning
+                );
+            }
+            // RESTAMP-ALL: the whole point. Every ring and shadow buffer gets its tag back, so the next
+            // pop's masks carry only what the NIC wrote between the two pops. (The ring re-stamp also
+            // de-stickies the [net4F] scan on an armed boot, which is why its `buffers-written` sets
+            // read per-pop here and cumulatively on the unarmed net4 boot.)
+            for k in 0..NUM_RX {
+                net4g_stamp_tag((self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64, k);
+                net4g_stamp_tag(
+                    self.net5_shadow + (k * RX_BUF_SIZE) as u64,
+                    NET5_SHADOW_TAGBASE + k,
+                );
+            }
+            dma_wmb();
+        }
+
+        /// NET-5 — the window-close tally and the ranked answer (header § NET-5). Printed on every armed
+        /// boot, including when every counter is zero: an all-zero line with `pops=0` is the "no traffic"
+        /// reading, distinguishable from a probe that never armed (no `[net5R] ARMED` line at all).
+        #[cfg(feature = "net5")]
+        fn net5_verdict(&self) {
+            if self.net5_shadow == 0 {
+                serial_println!(
+                    "{}   [net5V] ring RE-FETCH probe was NOT ARMED this window — see the [net5R] line for which precondition failed; UNDECIDED, never FAIL ::",
+                    P4
+                );
+                return;
+            }
+            let scored = self.net5_refetch_live
+                + self.net5_refetch_wrongslot
+                + self.net5_stale_orig
+                + self.net5_prefetched
+                + self.net5_nowhere;
+            let answer = if scored == 0 {
+                "UNDECIDED: no RX completion reached the ring this window (link / cable / traffic) — the probe armed and measured nothing"
+            } else if self.net5_refetch_live > 0 {
+                "RE-FETCH IS LIVE: at least one payload landed in the completing slot's post-enable address. Per-descriptor addressing works; the buffer-17 'single-address latch' does not survive an instrument that re-stamps every pop"
+            } else if self.net5_stale_orig > 0 {
+                "C2 CONVICTED — NIC-INTERNAL STALE ADDRESS: payloads kept landing in ORIGINAL ring buffers that no descriptor points at any more. The NIC emits an address it latched before the re-point; the fix lane is NIC register/errata work, not the iATU"
+            } else if self.net5_refetch_wrongslot > 0 {
+                "C2 CONVICTED — POST-ENABLE ADDRESS REUSE: the NIC consumed a re-pointed address but resolves every payload to one slot's. The address path is live and the reuse is an index defect, not a stale value"
+            } else if self.net5_nowhere > 0 && self.net5_prefetched == 0 {
+                "C1 CONVICTED — INBOUND PAYLOAD DELIVERY LOSS: real writeback lengths completed with NOTHING written in either block. 16-byte descriptor writebacks land, 60..1518-byte payload bursts do not; the fix lane is the RC inbound write path, not the descriptor protocol"
+            } else {
+                "MIXED: prefetched landings only, or prefetched + nowhere. The re-point never got ahead of the engine's prefetch — read `prefetch-depth` and re-fly with the shadow armed BEFORE RxEnb for the slots beyond it"
+            };
+            serial_println!(
+                "{}   [net5V] ring RE-FETCH verdict: pops-scored={} REFETCH-LIVE={} REFETCH-WRONGSLOT={} STALE-ORIG={} PREFETCHED={} NOWHERE={} prefetch-depth={} shadow={:#x} rx-bufs={:#x} below4g={} — {} ::",
+                P4, scored, self.net5_refetch_live, self.net5_refetch_wrongslot,
+                self.net5_stale_orig, self.net5_prefetched, self.net5_nowhere,
+                self.net5_depth + 1, self.net5_shadow, self.rx_buffers as u64,
+                self.net4f_below4g as u8, answer
+            );
+        }
+
         /// NET-4F — re-arm the CURRENT RX descriptor and advance `rx_cur`. Lifted out of `rx_frame_raw`
         /// so the RES (error-frame) path recycles the descriptor by exactly the same discipline instead
         /// of leaking a ring slot, and so the landing TAG is re-stamped on every arming without a second
@@ -3216,10 +3673,24 @@ mod metal {
             let eor = if i == NUM_RX - 1 { DESC_EOR } else { 0 };
             let body = eor | (RX_BUF_SIZE as u32 & DESC_LEN_MASK); // OWN CLEAR
             let desc = unsafe { self.rx_ring.add(i) };
+            // NET-5 — HOLD the shadow re-point across recycles (header § NET-5). A descriptor that
+            // reverted to its original buffer address on its first recycle would silently end the
+            // experiment mid-pass; slot 0 stays the control, unre-pointed. Its shadow tag is re-stamped
+            // here for the same reason the ring tag above is: so the NEXT completion is attributable.
+            #[cfg(feature = "net5")]
+            let rearm_addr = if self.net5_shadow != 0 && i != 0 {
+                let sa = self.net5_shadow + (i * RX_BUF_SIZE) as u64;
+                net4g_stamp_tag(sa, NET5_SHADOW_TAGBASE + i);
+                sa
+            } else {
+                (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64
+            };
+            #[cfg(not(feature = "net5"))]
+            let rearm_addr = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
             let nd = Desc {
                 opts1: body,
                 opts2: 0,
-                addr: (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64,
+                addr: rearm_addr,
             };
             unsafe {
                 write_volatile(desc, nd);
@@ -4373,6 +4844,25 @@ mod metal {
             net4g_interim_l_hits: 0,
             net4g_probes: 0,
             net4g_done: false,
+            net4f_below4g: false,
+            net4f_distinct_seen: 0,
+            net4f_distinct_mask: 0,
+            #[cfg(feature = "net5")]
+            net5_shadow: 0,
+            #[cfg(feature = "net5")]
+            net5_witnessed: 0,
+            #[cfg(feature = "net5")]
+            net5_refetch_live: 0,
+            #[cfg(feature = "net5")]
+            net5_refetch_wrongslot: 0,
+            #[cfg(feature = "net5")]
+            net5_stale_orig: 0,
+            #[cfg(feature = "net5")]
+            net5_prefetched: 0,
+            #[cfg(feature = "net5")]
+            net5_nowhere: 0,
+            #[cfg(feature = "net5")]
+            net5_depth: -1,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──

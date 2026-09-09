@@ -29,7 +29,7 @@ pub mod live;
 pub use live::{close, is_open, key_route, open, press_route, request_open, service, OWNER};
 
 #[cfg(all(feature = "quarry", feature = "witness"))]
-pub use live::{selftest, selftest_result};
+pub use live::{door_selftest, selftest, selftest_result};
 
 // ── Knob OFF ────────────────────────────────────────────────────────────────────────────────────
 //

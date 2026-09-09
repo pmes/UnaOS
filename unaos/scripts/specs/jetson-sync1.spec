@@ -1836,3 +1836,4 @@ FORBID X200 FLAG
 # a wrong claim to a peer seat, so this keys on the syndrome and never on `RAS` or on an
 # `ADDR` value. See arch_arm64.md §ORIN-RAS-ADDR for why an ADDR must never be the key.
 FORBID Exception reason=1 syndrome=0x82000010
+FORBID \[wm\] winid-register REFUSED
