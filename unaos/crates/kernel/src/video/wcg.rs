@@ -2772,6 +2772,22 @@ pub(super) fn wch_recycle(i: usize) {
     H_MINRATE[i].store(u64::MAX, Ordering::Relaxed);
     H_MAXRATE[i].store(0, Ordering::Relaxed);
     H_DECLINE[i].store(0, Ordering::Relaxed);
+    // CURSORBG — **the BREAKDOWN travels with the tenant too, and until now it did not.**
+    // `H_DECLINE` (the `declines=` total) was reset here and `H_DECLBY` (the `decl_geom=`/`decl_cap=`/
+    // `decl_lock=`/`decl_alloc=` split) was not, so the two halves of one line were measured over
+    // different populations: the total over THIS tenant, the split over every tenant the slot has
+    // ever held. A reader comparing them read a contradiction and had no way to know it was the
+    // instrument. The render11 Jetson capture is the case that found it — `[wc-h] rollup win=1 …
+    // declines=5 decl_geom=0 decl_cap=0 decl_lock=73 decl_alloc=0`, a breakdown fifteen times its own
+    // total, which is not a decline pattern but the accumulated declines of the slot's earlier
+    // tenants. `H_DECLBY` was simply missed when WCHUN added the split; this function's own header
+    // already lists `H_DECLINE` among the measurements that travel with the tenant, and this is the
+    // rest of that set. After it, `declines == sum(decl_*)` is an invariant a reader may rely on.
+    let mut k = 0;
+    while k < DECL_KINDS {
+        H_DECLBY[i][k].store(0, Ordering::Relaxed);
+        k += 1;
+    }
     H_FIXTURE[i].store(0, Ordering::Relaxed);
     H_PEND[i].store(0, Ordering::Relaxed);
     H_KIND[i].store(0, Ordering::Relaxed);

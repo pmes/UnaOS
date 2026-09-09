@@ -1126,6 +1126,14 @@ pub fn selftest() {
     // fixture depends on the coupling, and `menubar::selftest`'s own one-shot `DONE` latch makes the
     // move idempotent (a double-drive from a botched move runs once, not twice).
     super::menubar::selftest();
+    // STRIPVAC — the vacate handback's fixture, seated here on the identical compromise the block
+    // above documents (same `witness` gate, same real panel, same "after every one-shot per-window
+    // latch" ordering) and ahead of this fixture's own rows for the same reason: its subject is the
+    // strip PRIMITIVE's census, not the window table. It scores under the catch-all census slot, so
+    // it cannot move the `tenant=dock` counters the legs below drive. ⚠ Re-seat it in
+    // `arch/x86_64/syscall.rs` beside `crate::video::dock::selftest();` when that lane frees, exactly
+    // as the menu bar's call above is owed; its own `DONE` latch makes the move idempotent.
+    super::strip::vacate_selftest();
 
     /// Three 8x8 ARGB8888 surfaces in rodata — read-only, because the compositor only reads.
     static SURF: [[u32; 64]; 3] = [[0x0020_40FF; 64], [0x0040_FF20; 64], [0x00FF_4020; 64]];
