@@ -630,12 +630,26 @@ fn mount_capture_target() -> Result<FatFs, Refusal> {
 ///  * rung 2 mounted it explicitly — `source_name()` is `BlockSource::Usb`'s;
 ///  * rung 1 mounted the PROGRAM SOURCE and on x86 that IS the stick, because
 ///    `publish_usb_geometry` claims the global slot as well as the dedicated one on any target
-///    without the aarch64 backend selector. The two handles are the same disk exactly when they
-///    carry the same xHCI `slot_id`, which is the comparison `unpublish_usb_geometry` itself uses.
+///    without the aarch64 backend selector. The two handles are the same disk exactly when the
+///    ENUMERATOR says so, which is what [`crate::fs::fat::same_device`] asks.
 ///
-/// Deliberately conservative in the other direction: on the Pi the microSD holds the global with
-/// `slot_id: 0` while a stick holds the USB handle, the ids differ, and a capture to the card is
-/// therefore NOT probed — pulling an unrelated stick must not refuse it.
+/// CLONEALIAS (orin 24, rmbp-ledger B98): this used to compare `slot_id` here, inline. It is now
+/// the one predicate `fs::bootdisk::admit` also uses — deliberately, and deliberately TIGHTER than
+/// what it replaced: `same_device` adds the `num_blocks` check (a freed slot handed to some other,
+/// differently sized device no longer reads as the same disk) and makes the slot-0 refusal an
+/// EXPLICIT guard instead of a property of the sentinel. Two same-device tests that can drift apart
+/// is the defect class this closes; there is one test, and it has two callers.
+///
+///  * **Pi** — the microSD holds the global with `slot_id: 0` while a stick holds the USB handle.
+///    The `slot_id != 0` clause fails FIRST, so the answer is `false` by the guard rather than
+///    incidentally by a slot mismatch, and a capture to the card is NOT probed: pulling an
+///    unrelated stick must not refuse it. This is pi 7's caveat on the old comparison — "safe ONLY
+///    because slot 0 is never a real xHCI device (`xhci/mod.rs:2890`; the SD sentinel is
+///    `emmc2.rs:632`), and if that invariant moves the Pi's card is misclassified USB-backed and
+///    `volume_alive()` probes a generation that never advances → permanent refusal" — turned from
+///    a comment into code.
+///  * **x86** — one card under both handles: same live slot, same `num_blocks`, so `true`,
+///    unchanged.
 fn usb_backed(fs: &FatFs) -> bool {
     let name = fs.source_name();
     if name == BlockSource::Usb.name() {
@@ -643,7 +657,7 @@ fn usb_backed(fs: &FatFs) -> bool {
     }
     if name == BlockSource::Default.name() {
         return match (crate::drivers::block::info(), crate::drivers::block::usb_info()) {
-            (Some(global), Some(usb)) => global.slot_id == usb.slot_id, // safe ONLY because slot 0 is never a real xHCI device (xhci/mod.rs:2890; the SD sentinel is emmc2.rs:632 slot_id 0): if that invariant moves, the Pi's card is misclassified USB-backed and volume_alive() probes a generation that never advances → permanent refusal (pi 7)
+            (Some(global), Some(usb)) => crate::fs::fat::same_device(&global, &usb),
             _ => false,
         };
     }

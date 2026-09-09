@@ -916,12 +916,49 @@ not to make. The loader's serial is not consulted by any of this (§14.7).
 `Usb`). One card, two source names. A walk keyed on the source would count it as two disks and mount
 it beside itself.
 
-The key is therefore the DEVICE: `bootdisk::DiskId` = `(num_blocks, BS_VolID)` — the geometry
-`fat::source_blocks` reports plus the mounted volume's own serial from `FatFs::volume_fingerprint`.
-Both are read from the *medium*, so two handles onto one card agree by construction.
+`bootdisk::DiskId` = `(num_blocks, BS_VolID)` — the geometry `fat::source_blocks` reports plus the
+mounted volume's own serial from `FatFs::volume_fingerprint` — is the CANDIDATE key, and it is a
+question rather than an answer. Both fields are read from the *medium*, which is what makes two
+handles onto one card agree; it is also what makes two **clones** agree. A card imaged byte-for-byte
+from another carries the same `BS_VolID` and the same size, so a dedupe keyed on content alone
+merges two real devices into one, hides the second from `/volumes`, and prints a witness claiming —
+falsely — that one device wore two names.
+
+**Identity comes from the ENUMERATOR, never from the bytes.** The answer is `fat::same_device`, the
+one predicate the kernel has for this question:
+
+```rust
+pub fn same_device(a: &BlockDeviceInfo, b: &BlockDeviceInfo) -> bool {
+    a.slot_id != 0 && a.slot_id == b.slot_id && a.num_blocks == b.num_blocks
+}
+```
+
+`slot_id` is a registry fact — the xHCI slot the device enumerated on. A replug lands on a new slot,
+two live devices never share one, and a clone cannot forge one. `num_blocks` closes the residual
+slot-id-reuse window (a freed slot handed to some other, differently sized device does not match).
 `drivers::block::BlockDeviceId` is deliberately **not** the key: its first field is `handle`, which
-is exactly what differs between the two names for the one card. A deduped source is named on the
-wire (`aliased=usb->global`), never dropped silently.
+is exactly what differs between the two names for the one card.
+
+The `slot_id != 0` clause is not an edge case, it is the Pi. `register_sd`, `register_sdhc` and
+`register_tegra_sd` all stamp `slot_id: 0`, the xHCI "no slot" sentinel: a card that never
+enumerated on a bus carries no enumerator identity at all, so two zero-slot sources are never
+*proven* to be one device and the predicate refuses first, ahead of any comparison.
+
+`bootdisk::admit` therefore collapses two sources into one disk — walked once, mounted once,
+`aliased=usb->global` on the wire — only when that predicate proves it. Equal content **without**
+the proof admits BOTH and says so: the `aliased=` field takes a third value,
+`aliased=ambiguous:global?usb`. Two friends who look alike are two friends. Nothing is dropped
+silently in either branch, and root stays first-found — mounting is not exclusive.
+
+`video::prtscr::usb_backed` is the predicate's second caller. It compared `slot_id` inline until the
+same arc; routing it through `fat::same_device` is a deliberate tightening (it gains the
+`num_blocks` check and the explicit slot-0 guard), and it is the point of having one predicate:
+two same-device tests that can drift apart is the defect class this closes.
+
+`fs/bootdisk.rs`'s `homesoil_selftest` leg 5 executes all of it on synthetic `BlockDeviceInfo`
+records that differ only in `slot_id` — a single-card QEMU machine can present neither a clone nor a
+second slot — and carries a positive control on `same_device`, because a predicate that answered
+`false` to everything would satisfy the negative clauses for free.
 
 ### 14.5 The layout over that disk
 

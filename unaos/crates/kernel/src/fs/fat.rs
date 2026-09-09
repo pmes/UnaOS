@@ -4705,3 +4705,77 @@ impl FatFs {
         }
     }
 }
+
+// =========================================================================================
+// CLONEALIAS (orin 24, rmbp-ledger B98) — ONE same-device predicate. Two callers, never a copy.
+//
+// Tail-appended for the reason the two blocks above give: `fat.rs` is compiled into the knob-off
+// `kernel8.img`, `panic::Location` embeds source line numbers, and anything inserted mid-file moves
+// every panic site below it.
+//
+// THE DEFECT THIS CLOSES. `fs::bootdisk::admit` deduped disks on `DiskId = (num_blocks, BS_VolID)`
+// — pure CONTENT. Both fields are read from the MEDIUM, which is what makes two handles onto ONE
+// card agree; it is also what makes two CLONES agree. A card imaged byte-for-byte from another
+// carries the same `BS_VolID` and the same size, so a content key merges two real devices into one,
+// hides the second from `/volumes`, and prints a witness claiming — falsely — that one device wore
+// two names.
+//
+// WHERE IDENTITY ACTUALLY LIVES: the ENUMERATOR, never the bytes. `drivers::block` publishes a
+// `BlockDeviceInfo` per handle, and two of its fields are registry facts rather than medium facts:
+// `slot_id` (the xHCI slot the device enumerated on — a replug lands on a NEW slot, and two live
+// devices never share one) and `num_blocks`. Those are the same two fields
+// `drivers::block::lookup` resolves an INSTALL-SEL identity by, minus `handle` — and `handle` is
+// precisely what differs between the two names for one card, which is why
+// `drivers::block::BlockDeviceId` cannot serve as the key.
+//
+// THE SLOT-0 GUARD IS NOT AN EDGE CASE, IT IS THE PI. `register_sd`, `register_sdhc` and
+// `register_tegra_sd` all stamp `slot_id: 0`, the xHCI "no slot" sentinel: a card that never
+// enumerated on a bus has no enumerator identity at all. Two zero-slot sources are therefore never
+// PROVEN to be one device, and this predicate says so by refusing first, before any comparison.
+// =========================================================================================
+
+use crate::drivers::block::BlockDeviceInfo;
+
+/// CLONEALIAS: the block REGISTRY's own record for the device behind this source, or `None` when no
+/// device is registered on that handle.
+///
+/// The same lookups, in the same order, that [`source_present`], [`source_blocks`] and
+/// [`volume_serials`] use — one vocabulary for "which slot is this source", so a dedupe, a presence
+/// census and an identity check can never disagree about which device a source names.
+pub fn source_device(source: BlockSource) -> Option<BlockDeviceInfo> {
+    match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
+    }
+}
+
+/// CLONEALIAS: do these two registry records name the SAME PHYSICAL DEVICE, published twice?
+///
+/// `true` only when the enumerator PROVES it: a LIVE slot (non-zero — see the block comment above
+/// for why zero is a refusal rather than a match), the SAME slot on both sides, and the same
+/// `num_blocks` to close the residual slot-id-reuse window (a freed slot handed to some other,
+/// differently sized device will not match).
+///
+/// It is deliberately a proof of SAMENESS and never a proof of difference: `false` means "not
+/// proven the same", which is the safe direction for both callers. `fs::bootdisk::admit` mounts
+/// BOTH sources on `false` and says `aliased=ambiguous` on the wire rather than silently dropping
+/// a disk; `video::prtscr::usb_backed` declines to call a mount hot-unpluggable on `false` rather
+/// than refusing a capture.
+///
+/// Named cases:
+///  * **Pi** — the microSD holds the global handle with the `slot_id: 0` sentinel while a USB stick
+///    holds the USB handle. The `slot_id != 0` clause fails FIRST, so the answer is `false`
+///    explicitly, by the guard, not incidentally by a slot mismatch that a future sentinel change
+///    could invert (pi 7's caveat on `prtscr.rs`, now a guard). With NO microSD registered, the
+///    stick is published into BOTH handles with its own LIVE non-zero slot, and live-slot equality
+///    dedupes it correctly.
+///  * **x86** — `publish_usb_geometry` claims the global handle as well as the dedicated one, so
+///    one card is reachable under two names with the same live slot and the same size: `true`,
+///    unchanged from the comparison this replaced.
+pub fn same_device(a: &BlockDeviceInfo, b: &BlockDeviceInfo) -> bool {
+    a.slot_id != 0 && a.slot_id == b.slot_id && a.num_blocks == b.num_blocks
+}
