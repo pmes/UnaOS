@@ -1,0 +1,77 @@
+== render10 scorers over /home/pmes/unaos-bench/scratch/orin23/boot-render11-A1.log (3593 lines) ==
+-- CRYSTAL (06ffdaf8 CRYSTALPUT) --
+CRYSTAL: lines=1 anchor=panel-left=1 | menu_x=0 glyph_x=12 gap_left=0 glyph_gap_left=12 | rect menu_X=0 glyph_X=12 | RETIRED anchors: right-flush=0 left-flush-under-crystal=0 -> PASS CRYSTAL (menu_x=0 glyph_x=12 gap_left=0 glyph_gap_left=12 anchor=panel-left — the DROPDOWN alone is flush to the panel and the MARK is back on its PAD. This is 06ffdaf8, and note that glyph_x=12 is REQUIRED: the render9 scorer wanted glyph_x=0 here and would have failed this image.)
+   [menubar] crystal menu=170x121+0+34 anchor=panel-left glyph=16x22+12 bar_w=1920 menu_x=0 glyph_x=12 gap_left=0 glyph_gap_left=12 ::
+-- MENUOWN (7a76647d / bde4bece / 063d06b4) --
+MENUOWN-ARM: [menubar] menus lines=4 | bar_boxes registry-contended REFUSEs=0 | any [menubar] line=20 -> PASS MENUOWN-ARM (4 row(s) on the wire;  bar_boxes REFUSE(s)). The bar now says WHOSE menus it shows and WHERE it put them, so the two defect legs below are answerable.
+MENUOWN-OWN: rows=4 | rows with tenant titles=0 | menu_owner!=cap_owner and !=0: 0 | tenant titles under menu_owner=0: 0 -> PASS MENUOWN-OWN (all 4 row(s): menu_owner is 0 or equals cap_owner, and no tenant title is laid out under menu_owner=0). One app named, that same app menus — the Mac rule and R21 intent.
+MENUOWN-COL: rows=4 | rows with a tenant box=0 over 0 distinct app-box width(s) | tenant_x != app_x+app_w on 0 | max deviation=0 px | at the retired MENUS_X0=181: 0 -> NOT-SCORED — 4 row(s) but NOT ONE carries a tenant box beside the app box, so the column rule was never exercised. Focus the PULSE window (the only winmenu::publish on this desktop, pulsewin.rs:484) and re-capture; a bar with no tenant title cannot prove or disprove 063d06b4.
+-- TEARSCOPE (76bf3267) --
+STRIPWORD: [orinrender] census strip= lines=94 (retired=94 ) | [strip] tearscope lines=10 | any line containing the substring `strip`=119 -> NOTE — both words present and counted apart: 94 ui_status census line(s) (pulse band, main.rs:8404) and 10 video/strip.rs line(s). Neither number is evidence about the other.
+TEARSCOPE-ARM: [strip] rollup=10 over tenants{ dock menubar crystal } | vacate evidence lines=0 | paint evidence lines=0 -> PASS TEARSCOPE-ARM (10 rollup(s); dock registered;  vacate and  paint evidence line(s)). The bar has a scope.
+TEARSCOPE-DOCK: emit=5 scene=yes | vacates=2 uncovered=1 uncovered_px=5616 unerased=0 forgotten=0 flat=1 | torn=0 declines=0 | [dock] live px/paint 16 sample(s) range=23790..24211 -> CONVICT FLAT-VACATE — flat=1 with scene=yes: the uncovered ends WERE erased, to flat wm::DESKTOP_BG, over a backdrop that is a SCENE. That is a flat slab where scene content belongs — not stale content, and still wrong. (dock and menubar do not call repaint_vacated() after a vacate; crystal.rs:836 and winmenu.rs:1521 do, and are the correct precedent.)
+-- TICK / PREEMPT (98213b7f ORIN-TICKDEFAULT) --
+TICK-ARM: kernel-features banner lines=0 (naming bsptick=0 bsprun=0) | [orinbsptick] arming lines=1 at EL1 (250 Hz) -> PASS TICK-ARM (PERIODIC CNTP armed at EL1, 250 Hz). ⚠ NO features banner in this capture window, so predicate (1) banner half is UNREAD here — confirm `bsptick`+`bsprun` in `⚡ kernel features (jetson):` and in `strings kernel.elf` from the flight card.
+TICK-ADV: tick lines=76 distinct N=76 highest N=18750 | at EL1=76 at EL!=1=0 -> PASS TICK-ADV (76 distinct N up to 18750, all 76 emission(s) at EL1 — the tick is DELIVERED AND ADVANCING, which is predicate (3) and is what separates armed-and-ticking from armed-but-idle).
+PREEMPT-TERM: [orinbsprun] join=1 | CAPSTONE COMPLETE=0 | [bsprun] host lines=1 (HOSTING=1 REFUSING=0 el=1) | el0 first-run=1 accepted=1 -> PASS PREEMPT-TERM (join=1, CAPSTONE COMPLETE absent, [bsprun] host el=1 -> HOSTING, el0 first-run ACCEPTED — predicate (4) and (6) wire half).
+PREEMPT-DELIV: [el0live] verdict= lines=134 (last=EXTINCT) | [spread4] live=84 | [wedge4] preempt-in-section=0 | exceptions=0 || DATUM ONLY, never a discriminator: `:: SCHED: load`=85 -> PASS PREEMPT-DELIV (134 [el0live] line(s), last verdict EXTINCT; 84 [spread4] live line(s); no [wedge4] preempt-in-section; exceptions=0 — predicates (5) and (7)). PREEMPTION WAS DELIVERED, not merely made legal: load_witness_tick has one caller, timer_preempt, which returns early unless SCHED_ACTIVE.
+-- UNAFS / binding (SCOREFOLD: the SLOT-OPEN leg is CLOSED — four sibling predicates folded) --
+UNAFS-MEDIUM: root-medium lines=0 (present=0 absent=0) | base_lba=ABSENT blocks=ABSENT (ABSENT MiB) writable=no on 0 line(s) || CONTROL [sdmmc] root lines=0 -> ABSENT — not one [sdmmc] root line of any kind. The whole ROOTFS census is off the wire, so this zero indicts the IMAGE (or the capture window) before it indicts the binding: score the ELF max_vaddr and the sdmmcroot feature first. A zero with no passing control is not evidence.
+UNAFS-RODE: `bound / =` lines=0 (any `root bound` line=0) | verdict=ABSENT rode=ABSENT || DATUM ONLY, never scored (§D2): entries=n/a -> ABSENT — no [sdmmc] root bound line. sdmmc_root_bind did not run (or the capture window misses it), so the binding is unwitnessed. Score UNAFS-MEDIUM and the sdmmcroot feature first.
+UNAFS-BIND: [unafsbind] mount=native lines=0 (handle=tegra-sd=0, handle=n/a) | any [unafsbind] line=0 || census says rode=TegraSd on 0 line(s) -> NOT-SCORED — no [unafsbind] witness and no `rode=TegraSd` census line to demand one. The bind either did not happen or is off this capture window; there is nothing to confirm and nothing to convict. SOURCE CONFLICT, resolved conditionally: unafsroot §A row 3 REQUIREs this line, unafsgrow §10 marks it OPTIONAL (it assumed the bind needs `uls /`). See the header note (b).
+UNAFS-CENSUS: forbidden literal `unafs has no volume here` hits=0 || CONTROL — census lines on this wire=0 -> NOT-SCORED — ZERO hits on the forbidden literal AND ZERO census lines to carry it. The emitter did not run, so the zero is VACUOUS: it is evidence about the capture, not about the volume. A zero without a passing control is not evidence.
+UNAFS-WRITE: block-layer write refusals on this wire=0 -> NOTE — nothing reached the card block-layer write door this boot. Expected on a hands-off boot, and equally expected if nobody typed a write verb. NOT evidence either way about the read-only posture — the posture is a cfg fact (write_block_tegra_sd refuses in EVERY cfg), not a runtime one.
+-- UNAFS / geometry + media identity (unafsgrow render10-predicate.spec) --
+GROW-GEOM: mbr slot1=1 (regrown=0 type0x0c=1) slot2=1 (regrown=0 type0x7f=1) | mbr-raw=1 (same card=1) | span-check lines=1 (regrown=0) || FORBIDs: span_blocks=2048 hits=0 fits=NO hits=0 magic=MISSING hits=0 -> FAIL — the span check is on the wire and does not read the regrown extent (want part=[262144..1310720) span_base=262144 span_blocks=131072 fits=yes magic=ok): :: PART: unafs span check — slot=2 type=0x7f part=[114688..131072) span_base=114688 span_blocks=2048 sb_blocks=1024 fits=yes magic=ok ::
+GROW-LABEL: root-mount lines=0 | BPB label=ABSENT (UNAOS-ORIN=0 UNAOS-PI=0) | card_blocks=62333952 on 0 line(s) -> ABSENT — no `[sdmmc] root mount source=tegra-sd` line. The FAT mount witness needs the sdmmcroot configuration; without it this wire cannot be asked WHICH CARD it is, and no other row in this file can answer that question by itself.
+GROW-MOUNT: MOUNTED-read-only lines=1 | mount-FAILED lines=0 | any TEGRA-UNAFS line=1 -> PASS GROW-MOUNT (1 MOUNTED read-only line(s) on TegraSd. Read-only is the RULED render10 posture, not a defect: block::write_block_tegra_sd refuses in every cfg and the card one write door is the armed sdmmc_arm -> install_target ladder. orin 20 deliberately stopped at that gate.)
+GROW-MARKER: UNAFSVOL.TXT sightings=0 | [unafsbind] mount=native handle=tegra-sd=0 -> NOTE — no marker and no native bind on this wire. BENCH ACTION, one line: at the shell, `uls /`. bind_mount tries Global (the USB stick) first and, on NoVolume, walks bind_probe_candidates() — bind_probe_admitted(TegraSd) is true (the TEGRASD merge arm has landed) — so `uls /` should bind the card with no further work.
+-- pointer fold (evqprint) --
+EVQ-PTRFOLD: tool=/home/pmes/unaos-bench/scratch/orin20/evqprint/render10-ptrfold.py exit=0 invariants A1-A5 5/5 -> PASS EVQ-PTRFOLD (every fold invariant held: the terms are on every line in the FORBID adjacency, the pre-EVQPRINT shape is gone, conservation is EXACT, folded is monotonic, and the first printed line is its own baseline). Part B below is a READING, not a verdict — neither of its arms is a failure.
+     === /home/pmes/unaos-bench/scratch/orin23/boot-render11-A1.log
+       A1 fold terms on every line   : 3/3 -> PASS
+       A2 pre-EVQPRINT shape absent  : 0 hit(s) -> PASS
+       A3 folded[i]-folded[i-1]==foldnew : 3/3 -> PASS
+       A4 folded monotonic non-decreasing: -> PASS
+       A5 first line folded==foldnew (0==0) -> PASS
+       B  folded=11 over decoded=586 (1.9% of decoded reports)
+          -> BACKLOG CONFIRMED. The drain fell behind the pad and the arrow was
+             handed the whole backlog at once instead of walking it. Read this
+             beside `[kbdpoll] armgap_us=` (render9: 72520 us ~ 14 fps): the two
+             are the same pump period seen from the producer and the consumer.
+       => PASS (invariants only; Part B is a reading)
+EVQ-ARM: [orinclick] lines=13 | [ptrpoll] t= lines=3 -> NOTE — both witnesses present (13 orinclick, 3 ptrpoll), so the knob is on and the emitter is live. EVQ-PTRFOLD carries the verdict; this row exists only so a KNOB-OFF there can never be confused with a silent emitter.
+-- structurally impossible witnesses (NOT a pass, NOT a failure) --
+UCASCADE: K3/K4/K8a/K1-atr sightings=0 | U-series launcher sightings=0 || CONTROL — ungated same-file tokens (orin-render/jd2-console/TEGRA-) on this wire=8 -> NOT-EXERCISED — 0 sightings across 8 ungated same-file token(s) that DO fire, so the zero is a real zero AND a structurally necessary one. main.rs:527 witness block sits at brace depth 1 inside main.rs:407 cfg(all(target_arch=aarch64, feature=baremetal)) block (closing :765); baremetal = [pi, aarch64_el0] and pi+tegra will not compile together (E0428, GICD_BASE twice in arch/aarch64/gic.rs). The cascade is CFG-ERASED from every tegra image. THIS IS NEITHER A PASS NOR A FAILURE and must never be scored ABSENT: doing so teaches the next seat to suppress the rule.
+
+== render10 verdict table ==
+  PREDICATE        CLASS VERDICT
+  ---------------- ----- -------
+  CRYSTAL          GREEN PASS
+  MENUOWN-ARM      GREEN PASS
+  MENUOWN-OWN      GREEN PASS
+  MENUOWN-COL      RED   NOT-SCORED
+  STRIPWORD        note  NOTE
+  TEARSCOPE-ARM    GREEN PASS
+  TEARSCOPE-DOCK   RED   CONVICT
+  TICK-ARM         GREEN PASS
+  TICK-ADV         GREEN PASS
+  PREEMPT-TERM     GREEN PASS
+  PREEMPT-DELIV    GREEN PASS
+  UNAFS-MEDIUM     RED   ABSENT
+  UNAFS-RODE       RED   ABSENT
+  UNAFS-BIND       RED   NOT-SCORED
+  UNAFS-CENSUS     RED   NOT-SCORED
+  UNAFS-WRITE      note  NOTE
+  GROW-GEOM        RED   FAIL
+  GROW-LABEL       RED   ABSENT
+  GROW-MOUNT       GREEN PASS
+  GROW-MARKER      note  NOTE
+  EVQ-PTRFOLD      GREEN PASS
+  EVQ-ARM          note  NOTE
+  UCASCADE         n-ex  NOT-EXERCISED
+
+== 8 red, 10 green, 4 note(s), 1 not-exercised ==
+== n-ex rows are NEITHER passes NOR failures: the witness could not be exercised in the configuration that flew, for a reason recorded at the leg. Do not file them as green and do not suppress the rule. ==
+== RED: the flown image does NOT satisfy the render10 predicate set. Do not file this flight green. ==
+-- end render10 scorers --
