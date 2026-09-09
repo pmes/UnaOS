@@ -3073,10 +3073,50 @@ scored against: `[dock] tile add win=N gen=G owner=… seq=… label=…`,
 same `(id, gen)` pair, so "does the dock agree with the window manager" is two lines of one
 capture instead of an inference from behaviour.
 
+**Why `(win id, generation)` and not a generation IN the id.** `WinId` is a recycled slot alias by
+decision, taken three times and not reopened here; `wm::winid_gen` is documented as EVIDENCE, and
+this block makes it the second half of a sort key, which is a promotion that has to be argued
+rather than assumed. The argument has two parts, and the second is the limit of it.
+
+* **Safety does not rest on it.** The registry never dereferences a `WinId`. `TILE_ID` is only ever
+  COMPARED — in `tile_slot`, against a row the caller has just scanned out of the live table — and
+  is never handed back to `wm`. So the SO1(b) hazard the `winid_register_holder` teardown exists to
+  close (a cached id acted on after the slot is re-issued) cannot arise here: a stale entry can only
+  fail to match, which is exactly the retire arm. The one place the dock does act on an id,
+  `press_at`'s raise, is separately gated on the generation and raises NOTHING on a mismatch.
+* **ORDERING does rest on it, and that is stated rather than hidden.** If `winid_gen` stopped
+  distinguishing generations the tile key would collapse to the id alone, a recycled slot would
+  inherit the closed window's arrival rank, and the strip would return to the exact instability
+  §3.15 is about. That dependency is GATED, not documented: fixture legs 1 and 2 assert the recycle
+  happened and that the new window's tile is to the RIGHT of the survivor's, and both go red the
+  moment the generation stops separating the two windows.
+
+**PINCOUNT — four pins, one count, five readers.** Found in this arc's review, in `wm.rs`. Each of
+the four pin headers promises it is *"applied by every reader of the model, so painter, router and
+occlusion registry cannot disagree about the tile count."* Four readers kept it — `compose`,
+`press_at`, `strip_rect` and the fixture. The FIFTH, `wm::dock_tiles`, mirrored **`pin_shell`
+alone**, by hand, with its own transcription of that pin's condition and its own `+ 1`. It feeds
+`wm::occ_clip`'s per-window-blit dock term and `wm::erase_clip`'s strip rect, so on any desktop
+where the console, Quarry or the pulse instrument was CLOSED the occlusion clip was sized for a
+strip up to **two tiles narrower** than the one the painter drew, and a window dragged across the
+uncovered tail clobbered it until the next damage pass. That is the same defect the `SHELLPIN`
+`+ 1` was added to fix, re-entered once per pin added after it.
+
+The fix is one pure fold, `dock::pins_applied(n, present)`, which is the single definition of the
+pin arithmetic — the four conditions in application order under the same per-pin
+`n < MAX_WINDOWS` cap. Each pin's condition now lives once, in a `*_wanted` predicate the pin
+itself consults, `cfg`-gated in both polarities exactly as `pin_quarry` is, so a pin and the count
+cannot drift. `wm::dock_tiles` calls it on the rows its caller already holds — it may NOT call
+`wm::dock_scan`, whose `TABLE` lock its callers (`occ_clip` inside the blit loop, `erase_clip`) are
+already inside, which is why the row census is passed in as a closure and why `pins_applied` is
+pure. `strip_rect`, which wants the count and nothing else, now asks for the count instead of
+assembling a pinned model it then discards. The three readers that need the pinned ROWS keep the
+mutating chain; it is the same fold and it shares the predicates.
+
 **What did NOT change.** Membership is still `wm::dock_scan` plus the four pins, applied in the
-same order; `strip_rect` is untouched (the occlusion registry sizes the strip from the tile COUNT,
-which ordering cannot change); the signature, damage conditions, painter and geometry are
-unchanged. On a shipped image the registry's only writer is `dock::compose`, the
+same order; the signature, damage conditions, painter and geometry are unchanged, and neither
+`strip_rect` nor `dock_tiles` returns a different number in any state the old code got right. On a
+shipped image the registry's only writer is `dock::compose`, the
 pass-driven path — `press_at` sorts over the published ranks and mutates nothing, so the click
 router still allocates nothing and takes no panel lock (LOCKFIX). ⚠ The `witness` fixture drives
 the reconcile too, so the one-writer claim is scoped to the metal image and not made unconditionally.
@@ -3084,10 +3124,21 @@ the reconcile too, so the one-writer claim is scoped to the metal image and not 
 **Gate:** `dock::dockid_selftest` (`witness`, driven from `dock::selftest`'s tail on
 `menubar::selftest`'s precedent, because this module's call site is in `arch/x86_64/syscall.rs` and
 outside the arc's lane). It runs Peter's sequence — open three windows, close the MIDDLE one, open
-another — and asserts the recycle actually happened (or SKIPs), that the new window's tile is to
-the RIGHT of the survivor's, that the registry and the window table agree in both directions, that
-furniture ranks by constant, and that pressing the lower-id of two same-owner windows leaves THAT
-window on top. Every leg is red on the pre-DOCKID tree.
+another — and asserts, in six legs, that the recycle actually happened (or SKIPs), that the new
+window's tile is to the RIGHT of the survivor's, that the registry and the window table agree in
+both directions, that furniture ranks by constant, that the two count-only readers agree with the
+pin chain, and that pressing the lower-id of two same-owner windows leaves THAT window on top.
+Legs 1-5 are red on the pre-DOCKID tree.
+
+Leg 6 is two halves, and the split is a limitation stated rather than papered over. `count=` is the
+LIVE agreement (`wm::dock_tiles` and `strip_rect` against the chain's count) and is only
+conviction-bearing where a SECOND pin is up — which on the x86 `witness` desktop none can be: the
+leg carries no `quarry` feature, the console is routed so its pin is suppressed by design, and
+`pulsewin::ever_armed()` is false on every `desktop_uefi` boot. So the count path is also gated
+STRUCTURALLY: `pins=` runs the mutating pin chain and the `pins_applied` fold over the same empty
+census and requires the same answer, which reds on any board the moment a pin is added to one and
+not the other. Go-red measured, not asserted: dropping the shell term from `pins_applied` gives
+`count=false/3 pins=false/1 :: FAIL ::` and `UNAOS_WC=1 ./arroyo test` exits 1.
 
 ---
 

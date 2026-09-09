@@ -504,9 +504,9 @@ pub fn take_shell_reopen() -> bool {
 /// of the model — [`compose`], [`press_at`], [`strip_rect`] — so painter, router and occlusion
 /// registry cannot disagree about the tile count.
 fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
-    if n >= wm::MAX_WINDOWS
-        || rows[..n].iter().any(|r| r.owner_asid == wm::KERNEL_OWNER_DESKTOP)
-    {
+    // PINCOUNT — the condition lives ONCE (`pin_shell_wanted`, this file's tail); this is its only
+    // mutator, and `pins_applied` folds the same predicate for the two count-only readers.
+    if !pin_shell_wanted(n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) {
         return n;
     }
     let mut e = wm::DockEntry::empty();
@@ -544,9 +544,9 @@ fn pin_shell(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
 /// [`strip_rect`] — so painter, router and occlusion registry cannot disagree about the tile count.
 #[cfg(feature = "quarry")]
 fn pin_quarry(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
-    if n >= wm::MAX_WINDOWS
-        || rows[..n].iter().any(|r| r.owner_asid == crate::video::quarry::OWNER)
-    {
+    // PINCOUNT — the condition lives ONCE (`pin_quarry_wanted`, this file's tail); this is its only
+    // mutator, and `pins_applied` folds the same predicate for the two count-only readers.
+    if !pin_quarry_wanted(n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) {
         return n;
     }
     let mut e = wm::DockEntry::empty();
@@ -582,11 +582,11 @@ pub fn strip_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
     let mut tiles = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     // A zero rect asks the damage question nothing; only the tile count is wanted here.
     let (n, _) = wm::dock_scan(&mut tiles, (0, 0, 0, 0));
-    // SHELLPIN — the registry must report the strip the painter will paint, pinned tile included.
-    let n = pin_console(&mut tiles, n); let n = pin_shell(&mut tiles, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
-    // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
-    // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut tiles, n); let n = pin_pulse(&mut tiles, n); // A30 — the pulse instrument's reopen tile; the registry must report the strip the painter will paint. See the fold in `compose`. Folded, not added — PARITY.md §5.3.
+    // PINCOUNT — the registry must report the strip the painter will paint, pinned tiles included,
+    // and it wants the COUNT and nothing else — so it asks for the count rather than assembling the
+    // pinned model. `pins_applied` is the ONE definition of that arithmetic: the same four pins, in
+    // the same order, under the same per-pin `n < MAX_WINDOWS` cap `compose`'s chain applies.
+    let n = pins_applied(n, |o| tiles[..n].iter().any(|r| r.owner_asid == o));
     Layout::for_panel(n, pw, ph).map(|l| l.rect())
 }
 
@@ -1343,10 +1343,10 @@ pub fn selftest() {
 /// [`strip_rect`], `selftest` — so painter, router, registry and self-test cannot disagree about the
 /// tile count, which is the invariant `pin_shell`'s header states and `selftest` checks.
 fn pin_pulse(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
-    if n >= wm::MAX_WINDOWS
-        || !crate::video::pulsewin::ever_armed()
-        || crate::video::pulsewin::is_open()
-    {
+    // PINCOUNT — the condition lives ONCE (`pin_pulse_wanted`, this file's tail); this is its only
+    // mutator, and `pins_applied` folds the same predicate for the two count-only readers. This one
+    // takes NO row census: `ever_armed`/`is_open` are runtime cells, not a scan of the model.
+    if !pin_pulse_wanted(n) {
         return n;
     }
     let mut e = wm::DockEntry::empty();
@@ -1437,10 +1437,10 @@ fn pin_console(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
         CONSOLE_WINDOWED.store(true, Ordering::Relaxed);
         return n;
     }
-    if n >= wm::MAX_WINDOWS
-        || !CONSOLE_WINDOWED.load(Ordering::Relaxed)
-        || rows[..n].iter().any(|r| r.owner_asid == wm::KERNEL_OWNER_CONSOLE)
-    {
+    // PINCOUNT — the condition lives ONCE (`pin_console_wanted`, this file's tail); this is its only
+    // mutator. The `console_is_routed` arm ABOVE is the latch WRITE and stays here, because
+    // `pins_applied` is pure and the two count-only readers must not move this module's state.
+    if !pin_console_wanted(n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) {
         return n;
     }
     let mut e = wm::DockEntry::empty();
@@ -1856,7 +1856,7 @@ fn settle(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize, reconciling: bo
 /// of the render11 defect were invisible to it: the tile-position instabilities only appear ACROSS a
 /// close, and the wrong-window raise only appears with two windows under ONE owner.
 ///
-/// Five legs, and every one of them is red on the pre-DOCKID tree:
+/// Six legs. Legs 1-5 are red on the pre-DOCKID tree; leg 6 is red on the pre-PINCOUNT tree:
 ///
 /// 1. **recycle** — the fixture's own precondition, asserted rather than assumed. Closing the MIDDLE
 ///    window and opening another must hand the new window the CLOSED one's id (`create_inner` takes
@@ -1878,6 +1878,14 @@ fn settle(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize, reconciling: bo
 ///    so a furniture tile is in the same place whether its window is open or closed. Checked against
 ///    the ordered model rather than against the constants, so a future pin added to `settle` without
 ///    a rank fails here.
+/// 6. **one count, five readers** — two halves. `count=` is the LIVE agreement: the two count-only
+///    readers of the model, `wm::dock_tiles` (the occlusion clip's) and [`strip_rect`] (the tenant
+///    registry's), report the tile count the pin CHAIN this fixture just ran produced. `pins=` is the
+///    STRUCTURAL one: the chain and the [`pins_applied`] fold, over the same empty census, know about
+///    the same pins. The second half exists because the first is only conviction-bearing where a
+///    SECOND pin is live, and on the x86 `witness` desktop none can be (no `quarry` feature, console
+///    routed, `pulsewin::ever_armed()` false) — so on this board `count=` is a regression guard and
+///    `pins=` is the leg that convicts. See the PINCOUNT block at this file's tail.
 ///
 /// Self-cleaning: every row it mints is closed and the focus owner is restored. Driven from the tail
 /// of [`selftest`] on `menubar::selftest`'s precedent — same `witness` gate, same real panel, same
@@ -2012,6 +2020,40 @@ pub fn dockid_selftest() {
         }
     }
 
+    // Leg 6 — PINCOUNT: FOUR pins, ONE count, FIVE readers. The two COUNT-ONLY readers must report
+    // the strip the painter will paint. `wm::dock_tiles` is the one that mirrored `pin_shell` alone
+    // and therefore ran up to two tiles short whenever the console, Quarry or pulse pin was up — it
+    // sizes `occ_clip`'s per-blit dock term and `erase_clip`'s strip rect, so short means a strip
+    // tail nothing clips and a drag across it clobbers. `strip_rect` is the tenant-registry hook that
+    // publishes the rect. Both are scored against `n`, the settled model this fixture assembled
+    // through the mutating pin chain itself — so the leg compares the FOLD against the CHAIN, which
+    // is the equivalence `pins_applied`'s header claims, rather than one copy against another.
+    let tiles_probe = wm::dock_tiles_probe();
+    let (cw, ch) = {
+        let fb = *super::WRITER.lock();
+        (fb.width(), fb.height())
+    };
+    let count_ok =
+        tiles_probe == n && strip_rect(cw, ch) == Layout::for_panel(n, cw, ch).map(|l| l.rect());
+    // ...and the half that does NOT depend on which pins happen to be up. The comparison above is
+    // only conviction-bearing when a SECOND pin is live, and on the x86 `witness` desktop none can
+    // be: there is no `quarry` feature in this leg, the console is routed (so its pin is suppressed
+    // by design) and `pulsewin::ever_armed()` is false on every `desktop_uefi` boot. So the count
+    // path is also gated STRUCTURALLY: run the mutating pin CHAIN over an empty census and the
+    // `pins_applied` FOLD over the same census, and require the same answer. A pin added to the
+    // chain without a `*_wanted` predicate in the fold — which is precisely what `wm::dock_tiles`
+    // carried for three pins — makes the chain count higher than the fold and reds this leg on any
+    // board. Local scratch, so nothing global moves: the one write in the chain is `pin_console`'s
+    // `CONSOLE_WINDOWED` latch, which is idempotent and is the state `compose` already published.
+    let mut probe = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let chain = {
+        let m = pin_console(&mut probe, 0);
+        let m = pin_shell(&mut probe, m);
+        let m = pin_quarry(&mut probe, m);
+        pin_pulse(&mut probe, m)
+    };
+    let chain_ok = chain == pins_applied(0, |_| false);
+
     // Leg 4 — the identity of the press, with TWO windows under ONE owner.
     w[4] = mint(4);
     w[5] = mint(5);
@@ -2048,9 +2090,10 @@ pub fn dockid_selftest() {
     focus_set(saved_focus);
     wm::focus_changed(saved_focus);
 
-    let ok = recycle_ok && order_ok && set_ok && furniture_ok && press_ok;
+    let ok =
+        recycle_ok && order_ok && set_ok && furniture_ok && count_ok && chain_ok && press_ok;
     serial_println!(
-        ":: DOCKID: tiles={} closed=win{} reopened=win{} recycle={} order={} set={} furniture={} press={} :: {} ::",
+        ":: DOCKID: tiles={} closed=win{} reopened=win{} recycle={} order={} set={} furniture={} count={}/{} pins={}/{} press={} :: {} ::",
         n,
         w[1],
         w[3],
@@ -2058,7 +2101,132 @@ pub fn dockid_selftest() {
         order_ok,
         set_ok,
         furniture_ok,
+        count_ok,
+        tiles_probe,
+        chain_ok,
+        chain,
         if press_ran { if press_ok { "yes" } else { "no" } } else { "skip" },
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// PINCOUNT — FOUR pins, ONE count, FIVE readers (TAIL-APPENDED: nothing above this line moved, so
+// knob-off panic `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+//
+// # The defect
+//
+// This module grew four pins one at a time — [`pin_shell`] (appends), [`pin_quarry`] (prepends,
+// `quarry`-gated), [`pin_pulse`] (appends, gated on the runtime `pulsewin::ever_armed()`) and
+// [`pin_console`] (appends first, gated on the `CONSOLE_WINDOWED` latch) — and each one's header
+// carries the same promise: *"applied by every reader of the model, so painter, router and occlusion
+// registry cannot disagree about the tile count."*
+//
+// Four of the five readers kept it. [`compose`], [`press_at`], [`strip_rect`] and `dockid_selftest`
+// all apply the pins. The FIFTH is `wm::dock_tiles`, which feeds `wm::occ_clip`'s per-window-blit
+// dock term and `wm::erase_clip`'s strip rect, and it mirrored **`pin_shell` alone** — by hand, with
+// its own transcription of that pin's condition and its own `+ 1`. So on any desktop where the
+// console, Quarry or the pulse instrument is CLOSED, the occlusion clip was sized for a strip up to
+// two tiles narrower than the one the painter drew, and a window dragged across the uncovered tail
+// clobbered it until the next damage pass repainted the strip. Exactly the defect the `SHELLPIN`
+// `+ 1` was added to fix, re-entered once per pin added after it.
+//
+// # The fix, and why it is not a fifth transcription
+//
+// [`pins_applied`] is the ONE definition of the pin arithmetic: the four conditions, in application
+// order, under the same per-pin `n < MAX_WINDOWS` cap the mutating chain applies. Each pin's
+// condition is stated ONCE, in a `*_wanted` predicate that the pin itself consults, so a pin and the
+// count cannot drift — changing a pin's rule changes both, or compiles as neither.
+//
+// `wm::dock_tiles` calls it on the rows its caller already holds; [`strip_rect`], which wants the
+// count and nothing else, calls it instead of assembling a model it then throws away. The other
+// three readers need the pinned ROWS (to paint them, to route a press to them, to order them), so
+// they keep the mutating chain — which is the same fold, and the predicates are shared.
+//
+// ## The lock hazard this shape exists to respect
+//
+// `wm::dock_tiles` may NOT call `wm::dock_scan`: its callers (`occ_clip` inside the blit loop, and
+// `erase_clip`) are already holding the window TABLE, and `dock_scan` takes it. That is why the
+// census is passed in as a CLOSURE over rows the caller has in hand rather than gathered here, and
+// why [`pins_applied`] is pure — it reads runtime cells (`pulsewin::ever_armed`, `console_is_routed`,
+// `CONSOLE_WINDOWED`) and writes none. The one write in the pin chain, `pin_console`'s latch of
+// `CONSOLE_WINDOWED`, stays in `pin_console` and runs from `compose` alone.
+//
+// ## Why a fold over the bare scan equals the mutating chain
+//
+// The pins do not interact. Each tests a DISTINCT owner — `KERNEL_OWNER_CONSOLE`,
+// `KERNEL_OWNER_DESKTOP`, `quarry::OWNER` — or, for pulse, no owner at all (`is_open()` is a runtime
+// cell, not a row scan). A pin therefore cannot see, or be suppressed by, a row an earlier pin
+// inserted, so applying the four to a bare `dock_scan` census gives the same count as applying them
+// to the progressively pinned model. Only the per-pin cap is order-sensitive, and [`pins_applied`]
+// applies it in the same order for the same reason.
+
+/// PINCOUNT — the census a pin's condition asks its caller: **is there a live dock-addressable row
+/// with this owner?** A closure rather than a slice because the two count-only readers hold
+/// different things — `strip_rect` a scanned `DockEntry` model, `wm::dock_tiles` the raw window
+/// table it may not re-scan under the lock its caller holds.
+type Present<'a> = &'a dyn Fn(u64) -> bool;
+
+/// PINCOUNT — [`pin_console`]'s condition, stated once. The `console_is_routed()` term is the LIVE
+/// arm (a live console row is its own raise route and a second tile would be a second console); the
+/// latch WRITE that arm also performs belongs to `pin_console`, not here — this is pure.
+fn pin_console_wanted(n: usize, present: Present<'_>) -> bool {
+    n < wm::MAX_WINDOWS
+        && !crate::video::fbcon::console_is_routed()
+        && CONSOLE_WINDOWED.load(Ordering::Relaxed)
+        && !present(wm::KERNEL_OWNER_CONSOLE)
+}
+
+/// PINCOUNT — [`pin_shell`]'s condition, stated once: one live shell window max.
+fn pin_shell_wanted(n: usize, present: Present<'_>) -> bool {
+    n < wm::MAX_WINDOWS && !present(wm::KERNEL_OWNER_DESKTOP)
+}
+
+/// PINCOUNT — [`pin_quarry`]'s condition, stated once. `cfg`-gated in both polarities exactly as the
+/// pin is, so a build without the file manager counts no tile for it and compiles no reference to it.
+#[cfg(feature = "quarry")]
+fn pin_quarry_wanted(n: usize, present: Present<'_>) -> bool {
+    n < wm::MAX_WINDOWS && !present(crate::video::quarry::OWNER)
+}
+
+/// PINCOUNT — the erasing twin. No file manager, no tile, and the count is unchanged.
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+fn pin_quarry_wanted(_n: usize, _present: Present<'_>) -> bool {
+    false
+}
+
+/// PINCOUNT — [`pin_pulse`]'s condition, stated once. It takes no census: the instrument's presence
+/// is two runtime cells, and `ever_armed()` is false on every board that never had the window (every
+/// x86 `desktop_uefi` desktop), which is what keeps this pin off those images entirely.
+fn pin_pulse_wanted(n: usize) -> bool {
+    n < wm::MAX_WINDOWS
+        && crate::video::pulsewin::ever_armed()
+        && !crate::video::pulsewin::is_open()
+}
+
+/// PINCOUNT — **how many tiles the four pins add to a census of `n` dock-addressable rows.**
+///
+/// The one place the pin arithmetic lives. Pure: no lock, no allocation, no store — see the block
+/// header for why `wm::dock_tiles` could not have called `dock_scan` instead, and for why folding
+/// over a bare census is equivalent to the mutating chain [`compose`] runs.
+///
+/// Never a hand-rolled `+ N`: a pin added to the chain above without a `*_wanted` predicate here is
+/// a pin the occlusion clip cannot see, which is the defect this exists to close.
+pub(super) fn pins_applied(n: usize, present: impl Fn(u64) -> bool) -> usize {
+    let mut n = n;
+    if pin_console_wanted(n, &present) {
+        n += 1;
+    }
+    if pin_shell_wanted(n, &present) {
+        n += 1;
+    }
+    if pin_quarry_wanted(n, &present) {
+        n += 1;
+    }
+    if pin_pulse_wanted(n) {
+        n += 1;
+    }
+    n
 }

@@ -23993,18 +23993,18 @@ fn dock_addressable(r: &Window) -> bool {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
     let n = rows.iter().filter(|r| dock_addressable(r)).count();
-    // SHELLPIN (integrator, GR27) — mirror `dock::pin_shell`: with no live KERNEL_OWNER_DESKTOP
-    // row the dock paints one extra pinned `shell` tile, and this count is what `occ_clip` sizes
-    // the strip's blit clip from — one tile narrow and a drag across the pin clobbers it for a
-    // pass. Same cap as `pin_shell`: a full table pins nothing, so no +1 (a +1 there would make
-    // the clip one tile WIDER than the painted strip — the inverse defect).
-    if n < MAX_WINDOWS
-        && !rows.iter().any(|r| r.used && r.owner_asid == KERNEL_OWNER_DESKTOP)
-    {
-        n + 1
-    } else {
-        n
-    }
+    // PINCOUNT — mirror ALL FOUR pins, not `dock::pin_shell` alone. This count sizes `occ_clip`'s
+    // per-blit dock term and `erase_clip`'s strip rect, so a count short of the painted strip leaves
+    // the strip's tail unclipped and a drag across it clobbers the strip for a pass. The hand-written
+    // `pin_shell` mirror that used to live here was correct while the shell pin was the only pin and
+    // wrong the day the console, Quarry and pulse pins landed — up to TWO tiles short. It is now the
+    // same `dock::pins_applied` fold `dock::strip_rect` reads, over a census of the rows THIS caller
+    // already holds: `dock_tiles` must NOT call `dock_scan`, whose TABLE lock its callers are inside.
+    // The census uses `dock_addressable` rather than the old bare `r.used`, so this count and the
+    // scan the pins actually run against admit the same rows (a `compat` row is in neither).
+    super::dock::pins_applied(n, |o| {
+        rows.iter().any(|r| dock_addressable(r) && r.owner_asid == o)
+    })
 }
 
 // ---- CTRLWIT fixture ---------------------------------------------------------------------------
@@ -25640,4 +25640,30 @@ pub fn raise_one(id: WinId) -> bool {
         composite();
     }
     ok
+}
+
+// ---- PINCOUNT probe ----------------------------------------------------------------------------
+//
+// TAIL-APPENDED, `witness`-only, on the CTRLWIT block's argument: a definition inserted higher up
+// renumbers every `core::panic::Location` below it and those records live in the loadable image.
+// With the knob off this does not compile and both targets stay byte-identical.
+
+/// PINCOUNT — **[`dock_tiles`]'s answer, for the fixture.**
+///
+/// [`dock_tiles`] is private and takes a table SNAPSHOT its callers already hold; `dock::dockid_selftest`
+/// holds nothing, so this takes the table for it. That is the whole of the probe: it adds no
+/// arithmetic of its own, because a probe that recomputed the count would gate its own copy rather
+/// than the number `occ_clip` and `erase_clip` actually size their clips from.
+///
+/// Read under no other lock — `dock::dockid_selftest` calls it between composites, never inside one.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+pub fn dock_tiles_probe() -> usize {
+    let t = table();
+    dock_tiles(&t.rows)
 }
