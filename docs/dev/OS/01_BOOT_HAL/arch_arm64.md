@@ -9105,6 +9105,83 @@ Spec rows for `[net4F]`/`[net4V]`/`ORIN-NET-4 DONE` were added to
 `unaos/scripts/specs/jetson-sync1.spec` in this fold (PENDING/OPTIONAL — `net4` is knob-gated, so
 the healthy-terminus rows must never become REQUIREs; the argument is at the rows).
 
+### NET-5 render11 fold (orin 23, 2026-09-08) — the no-lease was TWO defects in OUR read path
+
+render11 flew the NET5IDX read site with the RJ45 cabled and still did not lease. The wire named both
+causes, and neither is the NIC:
+
+```
+[net5T] rx[3] slot=3 len=62  … shadow-mask=0x00020000 (first=17) slot_expected=3 slot_read=17 verdict=REFETCH-WRONGSLOT
+[net4d] rx[4] len=62  dst=4c:bb:47:25:49:c8 src=9c:69:d3:28:6e:f4 et=0x0800 class=udp-other
+[net5T] rx[4] slot=4 len=342 … shadow-mask=0x00000000 (first=-1)  slot_expected=4 slot_read=-1 verdict=NOWHERE
+[net4t] other[0] len=342 … first32B=4e455434455f04fb4e455434455f04fb0000…
+```
+
+1. **The length did not move with the frame.** `len` comes from the COMPLETING descriptor's writeback;
+   the bytes come from wherever the NIC wrote them. On a divergent read those describe two different
+   frames. Pop 3 completed slot 3 with `len=62` over the buffer that held a 342-byte frame — and that
+   frame is unicast **to our station MAC**, from the router, IPv4/UDP: the DHCP OFFER. `decode_dhcp`
+   needs the 236-byte BOOTP header plus the magic cookie, so a 62-byte OFFER files as `udp-other` and
+   `offer=0`. **Fix:** `net5_frame_len_from_headers` — on a divergent read the length is derived from
+   the frame's own L2/L3 headers (VLAN peeled), with the descriptor length as the fallback.
+
+2. **RESTAMP-ALL destroyed the unconsumed landing.** `net5_on_pop` re-stamped all 64 buffer heads at
+   the end of every pop, ~100 µs of uncached scanning AFTER the read site had already chosen its frame.
+   Anything the NIC delivered inside that window had its Ethernet header overwritten with a landing tag
+   and became indistinguishable from an untouched buffer — which is pop 4 above: the OFFER's own
+   writeback (`len=342`) over a shadow block whose tags were all intact, so the read site returned
+   nothing, the caller fell back to the completing slot's untouched original buffer, and 342 bytes of
+   `net4f_tag(4)` (`"NET4E_" + 0x04 + 0xfb`, twice — the `[net4t]` line above, verbatim) went to
+   smoltcp. **Fix:** consume-on-read. A landing tag now means "this buffer is FREE"; a missing tag
+   means "this buffer holds a frame no pop has delivered yet". `net5_consume`, called by the pop path
+   immediately after the frame copy, re-stamps exactly the one buffer this pop delivered from and
+   nothing else — `net5_on_pop` is read-only now and scores its arm off the masks the read site
+   recorded — so the sticky-tag artifact stays gone (a landing is cleared when,
+   and only when, it is read) while an unread landing can no longer be destroyed. A completion with
+   nothing to deliver anywhere now recycles the descriptor and reports `None`, the same discipline the
+   RES error path already used, instead of manufacturing a frame out of instrument bytes.
+
+Two instrument corrections ride with it. `zero-payload=` stopped lying: on a `net5` boot the original
+buffer of every slot ≥ 1 is unwritable by construction (`net5_arm` re-points those descriptors), so the
+old counter reported `4/5` as an artifact of the probe itself; it now counts completions for which no
+buffer in EITHER block held a frame. And `net5_read_src` no longer refuses a pop with two or more
+unread landings — under consume-on-read a refusal would strand a frame permanently, so it takes the
+lowest index and publishes the backlog as `[net5T] … unread=`.
+
+**What is NOT fixed, and is not ours.** The NIC resolves every re-pointed descriptor's payload to
+descriptor **17**'s buffer address — the same INDEX at every placement the driver has used: `0x268018800`
+in the boot7h high window and `0x80018800` on the net4-only low boot are both `window+0x18800`, two GiB
+of layout apart (`docs/dev/evidence/orin16/NET5.md` §3, C2), and with the shadow armed it resolves to
+`0x80058800` = `shadow+0x8800` — while its OWN/len writeback advances
+0,1,2,3,4 in ring order. `REFETCH-LIVE` is therefore expected to stay 0 and `REFETCH-WRONGSLOT` high;
+the driver's job is to deliver correctly THROUGH that reuse, which is what the two fixes above do.
+`STALE-ORIG=0` still acquits the NIC's DMA of holding a pre-re-point address.
+
+**Gates.** `[net5F]` (new) needs THREE knobs:
+
+```
+UNAOS_GICV3=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo test-arm
+```
+
+`UNAOS_GICV3` is not decoration. `net4_bringup`'s virt call site sits inside `main.rs`'s
+`if unaos_kernel::arch::gic::is_v3()` block and `./arroyo test-arm` boots `virt` at gic-version=2
+unless that knob is set, so the two-knob run exits 0 with **no `[net5F]` line anywhere on the wire** —
+a green that means nothing. That was measured, not assumed, and it is why this paragraph names the
+command. Go-red is proven the same way: mutating the IPv4 arm to return a fixed length reproduces
+render11's own number, `[net5F] MISMATCH: derived=Some(62) expected=Some(342)`, and takes `test-arm`
+itself to exit 1; reverting returns `checks=7 failures=0 => PASS`.
+
+It drives `net5_frame_len_from_headers` on QEMU virt with the render11 shapes —
+the 342-byte OFFER, the same frame 802.1Q-tagged, ARP, IPv6, a landing-tag buffer that must refuse, and
+two out-of-range IPv4 total-lengths — and prints `checks=N failures=0 => PASS`. It is the only part of
+the fix a board-less machine can run: the pop path is in `mod metal` (`cfg(tegra)`) and needs a Tegra234
+RC, the DesignWare inbound iATU and an RTL8168 that latches one payload address; virtio-net and e1000
+land every payload in the completing descriptor's own buffer, i.e. exactly the case the defect does not
+occur in, so a virtio/e1000 leg would be green on the broken code and the fixed code alike. The matrix
+row `arm-net5-virt` was added because `net5` was carried by exactly one leg (`arm-tegra-tcurx`) and that
+leg carries `tegra` too, so every `cfg(all(net5, not(tegra)))` site — the fixture included — compiled on
+no leg of `./arroyo check`.
+
 ## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
 
 An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
