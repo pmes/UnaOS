@@ -57,3 +57,16 @@ two cards carry different BS_VolIDs. HOMESOIL selftest legs (witness-gated) prin
 * §18 batteries at 600887c2 (kernel8-test 300, test-arm, UNAOS_WC=1 test) — started in the background at the metal result; rc lines go in the
   landing report.
 * Landing blockers (unchanged): clone-vs-alias fix (B98 design, in-seat, one gate), panel + peer ack, then exec-orin22-bootroot → hw-jetson.
+
+## §18 batteries at 600887c2 (run AFTER the metal result, in the throwaway worktree, log filed as `battery-postmetal-600887c2.log`)
+| verb | started (UTC) | rc | verdict line |
+|---|---|---|---|
+| `./arroyo kernel8-test 300` | 2026-09-09T00:00:25Z | 0 | `✅ MBENCH PASS — 125/125 required witnesses, 0 forbidden hit(s), 5980 lines scanned [fast: completion +12.3s grace 20s wall 32.6s]` |
+| `./arroyo test-arm` | 00:02:45Z | 0 | (only expected delta vs baseline: FRGUARD ARMED line on aarch64) |
+| `UNAOS_WC=1 ./arroyo test` | 00:03:13Z | 0 | banner `witness,ehcihid,kbdwit,sdhcblk,smolnet,wc`; WXAUDIT/U2/TSTE rows PASS |
+
+125 is the Pi floor AT THIS TREE (pi's own tip reads 120; never quote a floor across trees). pi 9's two readings on this run, recorded:
+(a) `[shellup]` (their one fast-mode concern) lands ~0.6 s after completion, inside the 20 s grace — the trade holds; (b) do NOT take
+`[u7stk] headroom=` from a fast run — `hw=` is a high-water mark and fast mode discards the late samples where it is largest; the
+32 KiB launch-stack question needs `UNAOS_QEMU_FULL=1`. `pi4-regression.spec` at this sha names `/usb`/`/volumes` in 2 COMMENT lines and
+0 directive rows: the `/volumes` namespace is unexercised on the Pi by any row — a green Pi run is blind to LABELMOUNT, not safe (pi's item).
