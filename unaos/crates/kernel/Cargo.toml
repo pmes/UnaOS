@@ -2605,7 +2605,7 @@ orinrender = ["desktop_firmware", "tegra_el0"]
 # learn to). The banner term is not needed as arming proof: `main.rs::tegra_quarry_seat` prints
 # `[deskquarry] seat compiled=…` from `cfg!(feature = "quarry")` inside the built image, which is what
 # the next flight is scored on. See the arroyo block above the mapping.
-deskcascade = ["desktop_firmware", "tegra_el0", "quarry"]
+deskcascade = ["desktop_firmware", "tegra_el0", "quarry", "facet"] # ORIN-FACET: `facet` joins the cascade through the IMPLICATION, never through an `UNAOS_DESKCASCADE -> facet,` term in arroyo — the same admissibility argument QUARRY-ORIN made one line up, and the reason the fifteen-knob jetson build carries the viewer with no sixteenth knob.
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
 # ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
 #
@@ -2783,6 +2783,36 @@ tcuprobe = ["tegra"]
 # The ARMED polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX in `arroyo`,
 # never by the knob mapping. FIXED-UNFLOWN — flies on render7.
 tcurx = ["tegra", "orinrx", "tcuprobe"]
+# FACET (ORIN-FACET, Peter 2026-09-08): `UNAOS_FACET=1` arms UnaOS's IMAGE VIEWER — `video::facet`,
+# `docs/CODEX.md` §2's **Facet — Images — "The Canvas"** — as a KERNEL DESKTOP TENANT of exactly
+# `quarry`'s shape. The ask was *"i believe we already have an image viewer in the vessels can we
+# compile it for UnaOS?"*, and the answer is no, twice over and both times measurably:
+#   * `vessels/facet` is host-native — Tokio (`libs/quartzite`), WGPU (`libs/euclase`) and the `png`
+#     crate (`libs/lux`) are three `std` dependency trees with no freestanding target;
+#   * and no EL0 program in this kernel can host a PNG decoder at all: DEFLATE's history window is
+#     32 KiB by definition (RFC 1951 §3.2.1 = `selfhost::inflate::WINDOW`), while every EL0 task gets
+#     the blanket 16 KiB (`sched.rs`). The decoder's mandatory working set is twice the whole window
+#     it would have to live in, before one pixel is stored. That is a fact about the ring.
+# So it is a `wm` row over a surface it owns, opened by a double-click or `<Enter>` on a `.PNG` row in
+# the file manager. It holds no decoded image: the file streams through the VFS and every scanline is
+# unfiltered and box-reduced straight into the window surface at target scale, so a 1920x1200
+# screenshot costs ~2.3 MB of heap rather than ~21 MB.
+#
+# IMPLIES `quarry`, and that is a DEPENDENCY fact rather than a policy one: Facet's only door is the
+# file manager (`quarry::live::run_act`'s `Act::View` arm) and its pointer routing is chained from
+# `quarry::live::press_route` — the two router files that name every other tenant are the knob-off
+# `kernel8.img`'s `arch/aarch64/syscall.rs` (byte-identity, PARITY.md §5.3) and the x86 half another
+# lane owns, so neither may gain a line. No file manager, no viewer, and the feature says so.
+#
+# It also pulls in `selfhost::inflate` ALONE (see `lib.rs`'s `not(feature = "selfhost")` inline
+# declaration): the RFC 1951 decoder is shared with SELFHOST-2 through `deflate_body`, with
+# `zlib_inflate` as the RFC 1950 sibling of `gunzip`, so this arc adds no second decompressor.
+#
+# DEFAULT OFF => `video/facet.rs` is not compiled, every hook in `quarry`/`desktop_firmware` is
+# `#[cfg]`-erased, and the image is byte-identical to baseline. Witness tokens are subsystem-named
+# (`[facet]`, `FACETPNG`). Carried by the `deskcascade` implication below so the fifteen-knob jetson
+# build reaches it with no sixteenth knob.
+facet = ["quarry"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

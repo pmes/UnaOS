@@ -1187,6 +1187,22 @@ _feats=""
 # it landed. Corrected here 2026-08-25 (this comment had gone stale by three commits; the leg below
 # already carried `,quarry`).
 [ -n "${UNAOS_QUARRY:-}" ] && _feats="${_feats}quarry,"
+# FACET (ORIN-FACET, Peter 2026-09-08): UNAOS_FACET=1 arms UnaOS's IMAGE VIEWER (`video/facet.rs`) —
+# `docs/CODEX.md` §2's **Facet — Images — "The Canvas"**. Pair it with UNAOS_QUARRY (Cargo does that
+# for you: `facet = ["quarry"]`) and with the desktop knob that opens the file manager — `facet`
+# compiles the viewer, `quarry` is its ONLY door (double-click or <Enter> on a `.PNG` row), and
+# `desktop_firmware`/`wc` is what routes the press to either of them.
+#
+# YOU DO NOT NEED THIS KNOB ON THE JETSON. `deskcascade = [..., "facet"]` carries it, exactly as it
+# carries `quarry` (QUARRY-ORIN's ruling one block down: the IMPLICATION is admissible, appending a
+# `facet,` term to the UNAOS_DESKCASCADE line is not, because `facet` is named by the `x86-all` leg
+# and a knob mapping cannot be un-set by an operator). The knob exists for the OTHER two boards and
+# for `UNAOS_FACET=1 ./arroyo check`, which type-checks the viewer alone.
+#
+# Arming proof is not the banner: `[pidesk] facet ARMED` is printed by `desktop_firmware::activate`
+# inside the built image, and `strings -a target/aarch64_esp/kernel.elf | grep -c '\[facet\]'` is the
+# artifact-side check the full-knob-gate law asks for.
+[ -n "${UNAOS_FACET:-}" ] && _feats="${_feats}facet,"
 # ORINDESK RUNG 2 (TEGRADESK): UNAOS_TEGRADESK=1 arms the Orin's DESKTOP SEAM — `main.rs`'s
 # `tegra_desk_arm`, called as an appended statement on `tegra_early_stop`'s terminus line (the last
 # instruction before `run_capstone_boot_core(0)`, which never returns). It is the tegra-shaped
@@ -3180,7 +3196,7 @@ KERNEL_CFG_MATRIX=(
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,facet"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -3196,7 +3212,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3446,7 +3462,7 @@ KERNEL_CFG_MATRIX=(
   #
   # PRECONDITION: like `arm-tegra-el0`, this leg compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
-  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry"
+  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet"
   # ORINDESK RUNG 2 — the DESKTOP SEAM armed (appended 2026-08-25). `tegradesk` gates `main.rs`'s
   # `tegra_desk_arm` (the wrapper, its latch, its two stop-line consts) plus the one statement
   # appended to `tegra_early_stop`'s terminus line. BOTH sites sit behind `tegra` as well
@@ -3490,7 +3506,7 @@ KERNEL_CFG_MATRIX=(
   # set it — the disarmed twin for BOTH knobs — and there is no `#[cfg(not(feature = "orinclick"))]`
   # site in src/, so no disarmed asymmetry is created. TYPE-CHECK only: booting `desktop_firmware` + the cascade
   # is rung 5 and stays blocked by orin-desktop.md §5.2 (the seam's second stop-line is still `false`).
-  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,tegradesk,orinclick"
+  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,tegradesk,orinclick,facet"
 
   # ORIN-CLICK rung 3 armed (appended 2026-08-25) — `orinclick` wires `jd2_console_pump`'s
   # `Event::Button` arm into `arch/aarch64/syscall.rs::wc_click_route` and adds the `[orinclick]`
