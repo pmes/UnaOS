@@ -5835,8 +5835,8 @@ pub const CLOSE_SETTLE_KILLED_X86: u32 = 2;
 /// 2. **Focus next** — in two halves, and the split is CLOSE-TEARDOWN's point. The KEYBOARD half:
 ///    if the closed owner held it, `user_input_set_active(0)` hands it back to the shell, so
 ///    keystrokes stop addressing a process that is about to be dead. The WM half:
-///    `wm::focus_release(owner)` — a CAS that drops the focus highlight iff this owner held it,
-///    and nothing else. Deliberately NOT `focus_changed(0)`: that is the SHELL ARM, which raises
+///    `wm::focus_after_close(owner)` — `focus_release`'s CAS (drop the highlight iff this owner
+///    held it) plus a promotion. Deliberately NOT `focus_changed(0)`: that is the SHELL ARM, which raises
 ///    `SHELL_Z` over every surviving window, erases their boxes and publishes `hidden=true` to
 ///    every owner — so closing a FOCUSED window minimised every sibling on the glass (GR27 Boot A).
 ///    A close must never park a sibling; the whole-table park stays owned by the gestures that
@@ -5862,15 +5862,15 @@ fn wc_close_click(owner: u64) -> &'static str {
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         user_input_set_active(0);
     }
-    // CLOSE-TEARDOWN — the wm half of the focus handback is `focus_release`, NOT `focus_changed(0)`.
-    // The latter is the SHELL ARM: it raises `SHELL_Z` over every surviving window, erases their
-    // boxes and publishes `hidden=true` to every owner — on the glass, closing a FOCUSED window
-    // minimised every sibling (GR27 Boot A operator: "closing a window causes the other open vug
-    // stat pulse windows to minimize SOMETIMES"; "sometimes" == only when `focus_asid() == owner`,
-    // which a close-box press never establishes by itself). A close must never park a sibling.
-    // `focus_release` clears the highlight iff this owner held it, and touches nothing else; the
-    // owner-held-focus guard lives inside it (a CAS), so it is called unconditionally.
-    crate::video::wm::focus_release(owner, "route=close-box shell-raise=skipped siblings=untouched");
+    // CLOSE-TEARDOWN / CLOSEMIN — the wm half of the handback is `focus_after_close`, NEVER
+    // `focus_changed(0)`. The latter is the SHELL ARM: it raises `SHELL_Z` over every surviving
+    // window, erases their boxes and publishes `hidden=true` to every owner — on the glass, closing
+    // a FOCUSED window minimised every sibling (GR27 Boot A, and again Peter on the Orin's render11
+    // 2026-09-08: "closing one window minimizes others"; the "SOMETIMES" in the first report is
+    // exact — the arm fires only when `focus_asid() == owner`, which a close-box press never
+    // establishes by itself). A close must never park a sibling. The owner-held-focus guard lives
+    // inside the verb (a CAS in `focus_release`), so it is called unconditionally.
+    crate::video::wm::focus_after_close(crate::video::wm::WIN_NONE, owner, "route=close-box shell-raise=skipped siblings=untouched"); // CLOSEMIN — `focus_after_close` is `focus_release` PLUS two things this arm did not do: it promotes the top-most surviving window (a close that left focus at the shell left the operator with a lit desktop and no focused window) and it prints the `[wm] close-scope` line. The CLOSE-TEARDOWN property this line already had — no shell raise, no sibling parked — is unchanged and is now stated by a fixture (`wm::closemin_selftest`) that runs in THIS arch's battery.
     // `wm` owners for user rows are `slot + 1`-biased and `Proc::slot` is stored with the SAME bias
     // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
     // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
@@ -5943,10 +5943,10 @@ fn wc_close_furniture(win: crate::video::wm::WinId, owner: u64) -> &'static str 
     let gone = crate::video::wm::close(win);
     // The keyboard never belonged to a kernel row (`user_input_set_active` refuses the band), so
     // there is no grant to revoke. The wm focus, if this row held it, is dropped through
-    // `focus_release` — NOT `focus_changed(0)`, whose shell arm parks every surviving window
-    // (CLOSE-TEARDOWN: a close must never park a sibling; see `wc_close_click`).
-    crate::video::wm::focus_release(
-        owner,
+    // `focus_after_close` — NOT `focus_changed(0)`, whose shell arm parks every surviving window
+    // (CLOSE-TEARDOWN/CLOSEMIN: a close must never park a sibling; see `wc_close_click`).
+    crate::video::wm::focus_after_close(
+        win, owner,
         "route=close-furniture shell-raise=skipped siblings=untouched",
     );
     #[cfg(feature = "witness")]

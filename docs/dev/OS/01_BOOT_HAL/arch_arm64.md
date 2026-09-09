@@ -9105,6 +9105,83 @@ Spec rows for `[net4F]`/`[net4V]`/`ORIN-NET-4 DONE` were added to
 `unaos/scripts/specs/jetson-sync1.spec` in this fold (PENDING/OPTIONAL — `net4` is knob-gated, so
 the healthy-terminus rows must never become REQUIREs; the argument is at the rows).
 
+### NET-5 render11 fold (orin 23, 2026-09-08) — the no-lease was TWO defects in OUR read path
+
+render11 flew the NET5IDX read site with the RJ45 cabled and still did not lease. The wire named both
+causes, and neither is the NIC:
+
+```
+[net5T] rx[3] slot=3 len=62  … shadow-mask=0x00020000 (first=17) slot_expected=3 slot_read=17 verdict=REFETCH-WRONGSLOT
+[net4d] rx[4] len=62  dst=4c:bb:47:25:49:c8 src=9c:69:d3:28:6e:f4 et=0x0800 class=udp-other
+[net5T] rx[4] slot=4 len=342 … shadow-mask=0x00000000 (first=-1)  slot_expected=4 slot_read=-1 verdict=NOWHERE
+[net4t] other[0] len=342 … first32B=4e455434455f04fb4e455434455f04fb0000…
+```
+
+1. **The length did not move with the frame.** `len` comes from the COMPLETING descriptor's writeback;
+   the bytes come from wherever the NIC wrote them. On a divergent read those describe two different
+   frames. Pop 3 completed slot 3 with `len=62` over the buffer that held a 342-byte frame — and that
+   frame is unicast **to our station MAC**, from the router, IPv4/UDP: the DHCP OFFER. `decode_dhcp`
+   needs the 236-byte BOOTP header plus the magic cookie, so a 62-byte OFFER files as `udp-other` and
+   `offer=0`. **Fix:** `net5_frame_len_from_headers` — on a divergent read the length is derived from
+   the frame's own L2/L3 headers (VLAN peeled), with the descriptor length as the fallback.
+
+2. **RESTAMP-ALL destroyed the unconsumed landing.** `net5_on_pop` re-stamped all 64 buffer heads at
+   the end of every pop, ~100 µs of uncached scanning AFTER the read site had already chosen its frame.
+   Anything the NIC delivered inside that window had its Ethernet header overwritten with a landing tag
+   and became indistinguishable from an untouched buffer — which is pop 4 above: the OFFER's own
+   writeback (`len=342`) over a shadow block whose tags were all intact, so the read site returned
+   nothing, the caller fell back to the completing slot's untouched original buffer, and 342 bytes of
+   `net4f_tag(4)` (`"NET4E_" + 0x04 + 0xfb`, twice — the `[net4t]` line above, verbatim) went to
+   smoltcp. **Fix:** consume-on-read. A landing tag now means "this buffer is FREE"; a missing tag
+   means "this buffer holds a frame no pop has delivered yet". `net5_consume`, called by the pop path
+   immediately after the frame copy, re-stamps exactly the one buffer this pop delivered from and
+   nothing else — `net5_on_pop` is read-only now and scores its arm off the masks the read site
+   recorded — so the sticky-tag artifact stays gone (a landing is cleared when,
+   and only when, it is read) while an unread landing can no longer be destroyed. A completion with
+   nothing to deliver anywhere now recycles the descriptor and reports `None`, the same discipline the
+   RES error path already used, instead of manufacturing a frame out of instrument bytes.
+
+Two instrument corrections ride with it. `zero-payload=` stopped lying: on a `net5` boot the original
+buffer of every slot ≥ 1 is unwritable by construction (`net5_arm` re-points those descriptors), so the
+old counter reported `4/5` as an artifact of the probe itself; it now counts completions for which no
+buffer in EITHER block held a frame. And `net5_read_src` no longer refuses a pop with two or more
+unread landings — under consume-on-read a refusal would strand a frame permanently, so it takes the
+lowest index and publishes the backlog as `[net5T] … unread=`.
+
+**What is NOT fixed, and is not ours.** The NIC resolves every re-pointed descriptor's payload to
+descriptor **17**'s buffer address — the same INDEX at every placement the driver has used: `0x268018800`
+in the boot7h high window and `0x80018800` on the net4-only low boot are both `window+0x18800`, two GiB
+of layout apart (`docs/dev/evidence/orin16/NET5.md` §3, C2), and with the shadow armed it resolves to
+`0x80058800` = `shadow+0x8800` — while its OWN/len writeback advances
+0,1,2,3,4 in ring order. `REFETCH-LIVE` is therefore expected to stay 0 and `REFETCH-WRONGSLOT` high;
+the driver's job is to deliver correctly THROUGH that reuse, which is what the two fixes above do.
+`STALE-ORIG=0` still acquits the NIC's DMA of holding a pre-re-point address.
+
+**Gates.** `[net5F]` (new) needs THREE knobs:
+
+```
+UNAOS_GICV3=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo test-arm
+```
+
+`UNAOS_GICV3` is not decoration. `net4_bringup`'s virt call site sits inside `main.rs`'s
+`if unaos_kernel::arch::gic::is_v3()` block and `./arroyo test-arm` boots `virt` at gic-version=2
+unless that knob is set, so the two-knob run exits 0 with **no `[net5F]` line anywhere on the wire** —
+a green that means nothing. That was measured, not assumed, and it is why this paragraph names the
+command. Go-red is proven the same way: mutating the IPv4 arm to return a fixed length reproduces
+render11's own number, `[net5F] MISMATCH: derived=Some(62) expected=Some(342)`, and takes `test-arm`
+itself to exit 1; reverting returns `checks=7 failures=0 => PASS`.
+
+It drives `net5_frame_len_from_headers` on QEMU virt with the render11 shapes —
+the 342-byte OFFER, the same frame 802.1Q-tagged, ARP, IPv6, a landing-tag buffer that must refuse, and
+two out-of-range IPv4 total-lengths — and prints `checks=N failures=0 => PASS`. It is the only part of
+the fix a board-less machine can run: the pop path is in `mod metal` (`cfg(tegra)`) and needs a Tegra234
+RC, the DesignWare inbound iATU and an RTL8168 that latches one payload address; virtio-net and e1000
+land every payload in the completing descriptor's own buffer, i.e. exactly the case the defect does not
+occur in, so a virtio/e1000 leg would be green on the broken code and the fixed code alike. The matrix
+row `arm-net5-virt` was added because `net5` was carried by exactly one leg (`arm-tegra-tcurx`) and that
+leg carries `tegra` too, so every `cfg(all(net5, not(tegra)))` site — the fixture included — compiled on
+no leg of `./arroyo check`.
+
 ## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
 
 An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
@@ -11742,3 +11819,159 @@ so a zero there would be counted as an EL0 preempt that never happened. `virt_el
 exactly two EL0 tasks, `el0-hello` (one non-blocking `sys_write`, then `sys_exit`) and `el0-spin` (no
 syscall at all before its exit); neither can yield, so a cooperative boot dispatches each exactly once
 and the counter reads exactly 2. A third dispatch is EL0 preemption.
+
+## ORIN-APSRUN — every secondary joins at EL1 (**default ON for tegra**; `UNAOS_NOAPSRUN` opts out)
+
+**Peter, 2026-09-08, verbatim: "WE ARE STILL ONLY ON ONE CORE."** This section records what the
+render11 wire actually said, because the obvious reading of it was wrong and the correction is the
+whole arc.
+
+### The diagnosis the wire refutes
+
+The render11 capture (`boot-render11-B-full.log`) ends its SMP block with
+
+```
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+```
+
+and that line invites exactly one conclusion: the five secondaries were woken by `CPU_ON` and then
+parked tickless, so they never entered the scheduler. **That conclusion is false, and the same
+capture falsifies it.** Between the `CPU_ON` successes and the line above, the log carries
+
+```
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+```
+
+five times over, once per AP. `c<N> timer PPI live` is `timer::on_tick`'s own first-tick witness,
+emitted from the AP's own timer IRQ — it cannot be printed by a core whose PPI never fired. JC3
+promoted the deferred stretch long ago: `smp_virt::__secondary_rust_virt` calls
+`timer::arm_this_core_ap()` (which registers the core in `AP_LOCAL_TICK`, so it advances its own
+`percpu.ticks` and never the shared `TICKS`/`ms()` clock — the double-count the deferral was ever
+about) and then `sched::secondary_run(core)`, which `mark_online`s it and enters `run()`. The
+`[bsprun] host` line agrees: `online=0x3f`.
+
+**The line was stale prose.** It is printed by the BSP inside `start_secondaries_tegra`, before any
+AP has reached its arm, so the BSP was asserting a state it had not measured — and a line that
+asserts an unmeasured state is worse than no line, because it is believed. It cost this arc's first
+diagnosis. It now reports only what the BSP knows (how many checked in) and names the witnesses that
+answer the rest.
+
+### The actual park site
+
+`smp_virt.rs:344` (pre-arc), the `#[cfg(feature = "orinel1ap")]` block in `__secondary_rust_virt`:
+compiled out. Every AP therefore ran the path immediately around it — bring-up, tick, `run()` — at
+**EL2**, replaying the BSP's EL2 regime, and never called `sched::mark_el1_core()`.
+
+The consequence is one field on the `[bsprun] host` line: `el1cores=0x1`.
+
+`sched.rs`'s EL0-EL1CORE filter admits an EL0 task only onto a core that has MEASURED itself at EL1
+(`EL1_CORE_MASK`, `sched.rs:3218`), because an `eret` at EL2 with `HCR_EL2.E2H==0` banks `ELR_EL2` —
+the convicted board-killer. The filter was always right. What was missing is that only the boot core
+was ever made ELIGIBLE, so `el0_placement_possible(CPU_AUTO)` (`sched.rs:3372`) had exactly one
+candidate and the shell, the render pump, the pointer poll and every `bg` shared core 0 while five
+ticking cores steal nothing but kernel tasks. **That is "only one core" as the operator experiences
+it, and it is why the pointer goes sluggish when programs run.**
+
+sched.rs had already named this as its own disposal condition, in the EL0-EL1CORE block: *"WHEN TO
+DELETE THIS: when the `smp_virt` secondaries drop to EL1 before entering `secondary_run`."*
+
+### What changed
+
+The AP drop mechanism is **ORIN-EL1AP's, unchanged statement for statement** — the seat claim, the
+bounded wait for the BSP-published EL1 root, the `ICC_SRE_EL2.Enable` grant, the latch save/restore,
+and the verbatim reuse of `enable_el1_regime` + `drop_el2_to_el1_tegra` on the AP (every register
+that sequence writes is per-core banked, so running it on an AP programs that AP's copy and nothing
+else). `apsrun` widens seven of its `#[cfg]`s to `any(orinel1ap, apsrun)` and changes **one
+constant**: `boot_tegra::EL1AP_SEATS`, from `1` to unbounded. Three things are genuinely new:
+
+* **`boot_tegra::publish_el1_root`** — publish `mmu_tegra`'s EL1-precise twin (`mmu.ttbr0_el1`)
+  BEFORE the first `CPU_ON`, folded onto the line that carries `start_secondaries_tegra`'s attribute
+  in `main.rs` (code-before-attribute; zero source lines added, so no `panic::Location` in that file
+  moves and the knob-off `kernel8.img` keeps its hash). ORIN-EL1AP's single claimant waited for
+  `drop_to_el1` to publish, which is past the entire PCIe/xHCI/SD probe stretch. With one AP that is
+  a curiosity; with five it is **the boot-12 shape** — five Orin cores spinning against shared state
+  starved the boot core's cooperative xHCI HID poll into "keyboard+mouse armed but ZERO deliveries"
+  (`timer.rs`, `this_core_has_local_tick`). Deleting the wait is the fix; tuning it is not. It is the
+  same value from the same expression `drop_to_el1` is handed below, so nothing can drift, and
+  `drop_to_el1` still stores it (idempotent).
+* **`boot_tegra::capture_bsp_latch_once`** — the one place where five seats is not the same code as
+  one. "Load `JM6_EL2_LATCH`, drop, store it back" is exact for a single claimant. With five racing
+  claimants, AP2 can snapshot in the window after AP1's `eret` has overwritten the latch and before
+  AP1's restore, and would then faithfully "restore" AP1's DROP values as the BSP's — making
+  `timer.rs`'s `[irqel2a]` witness print an AP's `HCR_EL2` while calling it the BSP's. The BSP's four
+  values are now captured exactly once, before any drop, behind a three-state gate; every restore
+  writes the same four values and is idempotent.
+* **The `[apsrun]` witnesses** (below).
+
+**No protection is relaxed.** Each AP installs `L1_EL1` — RAM at `AP[2:1]=0b00` (EL1 RW, no EL0
+access, EL1-executable), Device `UXN|PXN|nGnRE` — and the same absolute `SCTLR_EL1` `M|C|I|RES1`
+literal the BSP uses. WXN, the page permissions and the EL0 window's own tables are untouched.
+
+### What the wire should say on the next boot
+
+Per AP, in this order (the `[el1ap]` lines are ORIN-EL1AP's, now printed five times):
+
+```
+:: tegra: [apsrun] EL1 root published EARLY (TTBR0_EL1=0x…) — APs drop without waiting on the BSP ::
+:: tegra: [el1ap] seat claimed by cpu=1 — waiting up to 30 s for the BSP EL1 root ::
+:: tegra: [el1ap] cpu=1 dropping EL2 -> EL1 (TTBR0_EL1=0x…, the BSP-installed L1_EL1) ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=1 mask=0x3 (EL0-EL1CORE) ::
+:: AARCH64 SMP: [el1ap] cpu=1 LANDED at EL1 — stamped=true el1cores=0x3 irq=unmasked (EL0-EL1CORE) ::
+:: [apsrun] cpu 1 tick armed — periodic CNTP at EL1 (250 Hz, PPI30), own redistributor, local-only clock ::
+:: [apsrun] cpu 1 joins run() at EL1 — el1cores=0x3 (EL0 placement candidate; ORIN-APSRUN) ::
+```
+
+with the mask growing `0x3, 0x7, 0xf, 0x1f, 0x3f` across cores 1..5 (in whatever order they race),
+and then, at the terminus:
+
+```
+:: [bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x3f hosts=0x3f; …) ::
+[el0live] … | where hosts=0x3f el0cpus=0x… lastcpu=N | …
+```
+
+`hosts` and the `[el0live]` `where` group are new and exist because **`HOSTING` was true on
+render11**: the bool says only that SOME core can host, so a machine with one candidate printed the
+same word as a healthy one. `hosts` is that predicate's witness SET (`online & el1cores`, per core),
+`el0cpus` the set of cores an EL0 thread has actually run on, and `lastcpu` the core that ran one
+most recently (`-1` = never). `hosts=0x1` is the defect itself, on a line the operator already reads
+every window.
+
+### FAIL shapes, stated in advance
+
+* **A hang after `[apsrun] cpu N tick armed` with no `joins run()` from that core** — the PPI fired
+  into a core that was not ready for it. The ordering that prevents it is three statements earlier:
+  `percpu::init` (TPIDR_EL1) → `exceptions::install` (VBAR_EL1) → `enable_irq`, all strictly before
+  the arm. A hang there indicts one of those three, not the timer.
+* **An exception on an AP** names the missing per-core state directly: a data abort resolving
+  `this_cpu()` is TPIDR_EL1 (the `percpu::init` re-seed), a fetch abort or a silent death right after
+  the `eret` is VBAR_EL1 (`exceptions::install`), and an UNDEF on `msr CNTP_CTL_EL0` is
+  `CNTHCTL_EL2.EL1PCEN` (which the drop asm sets — so it would indict the drop, not the arm).
+* **`[el1ap] REFUSED cpu=N — post-eret CurrentEL=…`** — fail-closed per core: that core stays an EL2
+  scheduler participant exactly as today and `el1cores` keeps the bits it has. A partial success is a
+  legal outcome; `el1cores=0x7` hosts EL0 on three cores.
+* **No `[apsrun]` line at all** — the feature is not in the image. `strings -a kernel.elf | grep -c
+  '\[apsrun\]'` before blaming the board.
+
+### Preemption on an AP — the audit whose premise this arc changes
+
+`gic.rs`'s post-EOI `timer_preempt` arm carries an IRQEL-CORE audit that ends *"on this board nothing
+is placeable there (EL1 filter) and AP queues are empty by construction."* **Both clauses stop being
+true here** — that is the point of the arc — so the audit's remaining half is what carries: an AP's
+preemption rides the EL-neutral `switch_context` through `__vec_irq`, whose `irq_bank!`/`irq_unbank!`
+are RUNTIME `CurrentEL` branches on `tegra` (`exceptions.rs`), so an IRQ taken at EL1 on an AP banks
+`ELR_EL1`/`SPSR_EL1` correctly — the identical mechanism ORIN-BSPRUN flew on core 0 at render8. This
+is the arc's principal metal risk and it is named here rather than discovered at the bench.
+
+### Gate reach
+
+⚠ **QEMU models no Tegra234.** Every site is `tegra`-gated: `boot_tegra.rs` is
+`#[cfg(all(target_arch = "aarch64", feature = "tegra"))]` (`arch/aarch64/mod.rs:29`),
+`start_secondaries_tegra` is `#[cfg(feature = "tegrasmp")]`, and `apsrun` implies `tegrasmp` implies
+`tegra`. The `arm`/`test-arm` QEMU-`virt` legs compile **none** of it, so **no `foreman` spec row can
+red-without / green-with this change** — a row keyed on `[apsrun]` would be a check that cannot fire.
+Both polarities are TYPE-CHECKED (`arm-tegra-apsrun` arms it alongside `orinel1ap`, which is the one
+closure where `EL1AP_SEATS` has two candidate definitions and the `not(apsrun)` arm must be proven to
+lose; `arm-tegra` / `arm-tegra-el0` / `arm-tegra-el1ap` keep the disarmed polarity, which is not a
+vacuous twin — knob-off there is no drop block, no witnesses, and neither new `boot_tegra` fn). The
+behaviour is PROVEN only by an attended bench flight.
