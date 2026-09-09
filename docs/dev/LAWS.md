@@ -213,6 +213,11 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   gate defects in a day, none found by reading). To verify a gate, make it fail by mutation; to
   verify a branch, make it print and quote the output; to verify a claim about a peer's tree, read
   at their sha (`git show <sha>:<path>`); run a peer's new gate against your tree before folding it.
+- **The structural gates, their recorded go-red proofs and their legitimate update paths** live in
+  `docs/dev/STRUCTURAL_GATES.md` (355 lines, rmbp 11's GATESDOC). Every such gate carries a control
+  probe so a zero result is distinguishable from a broken pattern. That file is on `hw-rmbp` only and
+  arrives when that track lands — cited here, never copied, because a second copy is how two divergent
+  ones happen. Read it at the ref: `git show hw-rmbp:docs/dev/STRUCTURAL_GATES.md`.
 - **A check that cannot fire is an absent one** (2026-08-28, all three seats). Before any destructive
   sweep: would the behaviour be identical with the check's output deleted? and is a zero a fact about
   the data or about the pattern? Prove it with a control that must hit. A true check can answer a
