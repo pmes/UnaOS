@@ -94,7 +94,7 @@ launch (`shell.rs`), Quarry's double-click (`video/quarry/live.rs`), and the x86
 (`video/desktop_uefi.rs`). ⚠ `owner_of_launch` exists because **the two arches return different
 things from `spawn_user_image_bg`** — x86 returns `mapped.slot` (0-based) while aarch64 returns
 `ttbr0 >> 48`, which is `slot + 1` — so the same handle is off by one against the compositor's owner
-namespace. Normalising the two seams is owed (LEDGER S35).
+namespace. Normalising the two seams is owed (LEDGER SO22).
 
 **The wire.** The source of every title on the glass is readable from a capture rather than believed
 from a screenshot — and it rides the `[wm] alloc` line the window system already prints once per
