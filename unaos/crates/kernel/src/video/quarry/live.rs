@@ -352,6 +352,14 @@ enum Act {
     Launch(String),
     /// A double-click on something Quarry cannot open yet. Census, no action.
     NoOpener(String),
+    /// FACET — show this absolute path in the image viewer. The FIRST opener this tree has ever had:
+    /// [`Act::NoOpener`]'s census line says "no opener exists in this tree", and for `.PNG` that
+    /// sentence has stopped being true. Kept as its own variant rather than folded into
+    /// [`Act::Launch`] because the two are genuinely different findings — `Launch` reaches the ELF
+    /// loader and the scheduler and mints a JOB, `View` reaches a decoder and mints a WINDOW, and
+    /// only one of them is bounded by [`MAX_JOBS`].
+    #[cfg(feature = "facet")]
+    View(String),
 }
 
 struct Model {
@@ -1006,6 +1014,16 @@ impl Model {
         } else if is_executable(&name) {
             Act::Launch(p)
         } else {
+            // FACET — the OPENER ARM. Asked after `is_executable` and before the census, so the two
+            // routing tests stay disjoint by extension (`.ELF`/`.BIN` spawn, `.PNG` views) and a
+            // file that is neither still reaches the honest "nothing opens this yet" line. It is one
+            // `cfg`-gated arm rather than a registry: an association TABLE is the right shape for
+            // the second opener and the wrong shape for the first, and `quarry.md` §7 already says
+            // what the table needs before it can exist.
+            #[cfg(feature = "facet")]
+            if crate::video::facet::is_png_name(&name) {
+                return Act::View(p);
+            }
             Act::NoOpener(p)
         }
     }
@@ -1304,6 +1322,24 @@ fn run_act(act: Act) {
                 p
             );
             alloc::format!("no opener for {}", leaf(&p))
+        }
+        // FACET — LATCHED, not opened, and that is `dock::press_at`'s law rather than caution.
+        //
+        // This function runs at CLICK-ROUTER DEPTH (and at key-router depth), on the input-drain
+        // band's 16 KiB kernel stack — the stack Pi boot 11 overflowed with `quarry::open()` called
+        // from exactly here. `facet::open_inner` is strictly heavier than that overflow was: a chunk
+        // walk through the VFS, a megabyte-scale streaming read, the whole inflate, an allocation
+        // and the window table. So the gesture stores a path and `facet::service()` — chained from
+        // [`service`] below, which the render pass already drains every pass — does the work.
+        //
+        // The status line therefore says OPENING rather than a verdict: `[facet] present` or
+        // `[facet] refuse` is the verdict, it lands on the wire one pass later, and claiming one
+        // here would be a claim this function cannot have.
+        #[cfg(feature = "facet")]
+        Act::View(p) => {
+            crate::video::facet::request_open(&p);
+            serial_println!("[quarry] open VIEW path={} -> facet (latched for the render pass)", p);
+            alloc::format!("opening {}", leaf(&p))
         }
     };
     if let Some(m) = MODEL.lock().as_mut() {
@@ -2104,6 +2140,20 @@ fn key_witness(c: u8, focus: bool, took: bool) {
 /// makes Quarry draggable and parkable like any other row. The CLOSE disc IS claimed, because
 /// `wc_close_click` kills an ASID and there is no process behind a kernel owner to kill.
 pub fn press_route(x: i32, y: i32) -> bool {
+    // FACET — the viewer's window is asked FIRST, and this chain is the whole of its pointer routing.
+    //
+    // WHY HERE AND NOT IN THE ROUTER. The two files that name every other tenant's press arm —
+    // `arch/aarch64/syscall.rs`'s click arm and `arch/x86_64/syscall.rs`'s — are files this arc may
+    // not add a line to: the first is compiled into the knob-off `kernel8.img` whose byte-identity
+    // proof a single added line breaks (PARITY.md §5.3, and the folded one-liners there are already
+    // at their limit), and the second is another lane's. Quarry is named in both, and Facet's only
+    // door is Quarry, so chaining costs no line in either and states the dependency truthfully.
+    // `facet::press_route` re-asks `wm::hit_test`, so it claims ONLY its own row and an occluding
+    // window keeps every press — the same contract the router's own `pulsewin || quarry` pair keeps.
+    #[cfg(feature = "facet")]
+    if crate::video::facet::press_route(x, y) {
+        return true;
+    }
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return false;
@@ -2467,6 +2517,12 @@ pub fn service() {
     if REOPEN.swap(false, Ordering::AcqRel) {
         open();
     }
+    // FACET — the viewer's latch drains HERE, and it needs no drain site of its own for the reason
+    // its press routing needs no router arm: this function is ALREADY called from both places this
+    // desktop services furniture (`main.rs`'s Orin render pass and `arch/aarch64/syscall.rs`'s
+    // strip-press arm), and neither file may gain a line. A quiet pass costs one uncontended lock.
+    #[cfg(feature = "facet")]
+    crate::video::facet::service();
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
@@ -2996,6 +3052,15 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
 /// Run [`selftest_result`] and print the one uncounted witness line.
 #[cfg(feature = "witness")]
 pub fn selftest() {
+    // FACETPNG — the image viewer's decoder fixture, chained here for the reason `crystal::selftest`
+    // states for `winmenu` and `door_selftest`: a battery names ONE furniture fixture and the family
+    // reaches the rest, so a surface added under `video/` never needs a line in a router file another
+    // lane owns. It runs FIRST because it is pure — a synthetic PNG through the real zlib entry, no
+    // panel, no volume, no window — so it cannot be skipped by a DECLINE in anything below it, and
+    // `facet::selftest` latches `DONE` so the second chain (from `door_selftest`, which is the arm
+    // the x86 battery reaches) prints nothing twice.
+    #[cfg(feature = "facet")]
+    crate::video::facet::selftest();
     match selftest_result() {
         Ok((a, b)) => serial_println!(
             ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} wheel={}rows :: PASS ::",
@@ -3069,6 +3134,15 @@ pub fn selftest() {
 #[cfg(feature = "witness")]
 pub fn door_selftest() {
     use core::sync::atomic::AtomicBool;
+    // FACETPNG, the SECOND chain — and it is not redundant with the one in [`selftest`]. The two
+    // batteries reach DIFFERENT functions: aarch64's desktop calls `quarry::selftest` from
+    // `desktop_firmware::activate`, while x86's calls `crystal::selftest`, whose tail calls THIS
+    // function and never that one. Chaining both is what makes the decoder fixture run on both
+    // arches without a line in `arch/x86_64/syscall.rs`; `facet::selftest`'s own `DONE` latch makes
+    // the second call a no-op wherever both paths run. Ahead of this function's own `DONE` swap, so
+    // it is not lost to a battery that already ran the door legs.
+    #[cfg(feature = "facet")]
+    crate::video::facet::selftest();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;
