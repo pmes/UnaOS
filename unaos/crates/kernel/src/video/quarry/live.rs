@@ -1229,7 +1229,7 @@ fn launch(path: &str) -> String {
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, asid, entry)) => {
-            // APPTITLE — a double-click launch names its windows exactly as `bg` does; the file
+            // WINTITLE — a double-click launch names its windows exactly as `bg` does; the file
             // manager knows the path, so the window it opens carries the program's name rather than
             // the window seam's generated label. See `wm::app_name_arm`.
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);

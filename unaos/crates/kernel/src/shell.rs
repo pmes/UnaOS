@@ -6701,16 +6701,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
     };
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, asid, entry)) => {
-            // APPTITLE — the program's own name, so its windows are titled `VUG` and not the window
-            // seam's generated `el0 win 2`. Armed with `owner_of_launch(asid)` because the handle the
-            // two arches return is off by one against the compositor's owner namespace; that function
-            // is where the discrepancy is written down. Armed BEFORE the job row is claimed: the task
-            // is runnable the instant the spawn returns and may reach its window create first, and a
-            // name armed late is a title the operator watches change — the same race `SLOT_DETACHED`
-            // and `spawn_focus_arm` are set inside the spawn to avoid. Fail-closed: a full name table
-            // costs the window its name, never the launch.
-            crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
+        Ok((pid, asid, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
             // reports the table full — a close-box press retires the kernel row without telling this
@@ -6836,12 +6827,7 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
     drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
     let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
     console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
-    if verdict.starts_with("killed") {
-        // APPTITLE — retire the program name with the job. Owners are recycled slot aliases, so a
-        // name left behind by a killed program would title the NEXT tenant of that slot; the shell
-        // armed this name (`bg_program` / `bare_exec`), so the shell drops it. The complete cover is
-        // a call from the arch slot-teardown seam, which is owed — see `wm::app_name_forget`.
-        crate::video::wm::app_name_forget(crate::video::wm::owner_of_launch(job.asid));
+    if verdict.starts_with("killed") { crate::video::wm::app_name_forget(crate::video::wm::owner_of_launch(job.asid)); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The shell armed this name (`bg_program` / `bare_exec`), so the shell retires it: owners are recycled slot aliases, and a name left behind by a killed program would title the slot's NEXT tenant. The complete cover is a call from the arch slot-teardown seam, which is out of this arc's lane and owed — see `wm::app_name_forget`.
         // The kernel reaped the row; the shell's entry is now the only stale handle. Drop it.
         let mut jobs = BG_JOBS.lock();
         for slot in jobs.iter_mut() {
@@ -7134,11 +7120,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // loader re-validates from scratch regardless.
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, slot, entry)) => {
-            // APPTITLE — the bare-name launch names its windows exactly as `bg` does; `canon` is the
-            // spelling the operator's typed name resolved to, which is the spelling they expect to
-            // read back in the title bar. See `bg_program` for why this is armed first.
-            crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon);
+        Ok((pid, slot, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
             if !adopt_bg_job(pid, slot, &canon) {
                 // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
                 // and `kill` could never name. Same rule `bg` follows, same reason.
