@@ -143,3 +143,19 @@ image at different load addresses), so with one pair the 0x3f0000 shift could no
 A1 and A2 agree EXACTLY; only B differs. On this board the load address is stable across cold boots in one condition and moves with the
 friend, and the 12 extra carveout ranges move with it — the correlation survives (n=2 vs 1). Still a firmware-side input, still not a
 UnaOS reorganisation; now attributed rather than assumed. (The rMBP's boot-to-boot variance is a different firmware.)
+
+### FRIEND-DIFF: the criterion, the live channel, and the positive control's DESIGN (rmbp 17, B90 ticked with 101/102)
+* **Benign-survivor criterion (into B90):** a survivor is benign iff UnaOS's behaviour is a pure function of the changed input AND the
+  change is not UnaOS-caused. Survivor 3 (12 carveout ranges → load address) passes, traceably. "Consumed honestly" alone would absorb
+  every future survivor; the criterion is what makes the next reader able to refuse one.
+* **Named channel, currently harmless:** nothing in UnaOS makes a DECISION on the load address today (x86 specs wildcard `img=[…]`;
+  STAMP-MATCH keys on the build sha). The moment anything keys on an absolute address or a load-derived span, the friend gets a
+  channel to change behaviour through the firmware without touching our code. Watch for it at every landing.
+* **Survivor 6 is a CONDITIONAL pass, not a pass.** B90's staining vector 1 (`video/prtscr.rs::mount_capture_target` falling to rung 2,
+  the USB handle) fires only when the boot volume REFUSES WRITES. All ten captures went `-> OK` to root, so the vector never entered its
+  firing condition — the flight declined to trigger it, it did not test it.
+* **Positive control, designed:** FRIEND PRESENT **and** ROOT REFUSING WRITES. Bench shape on the Orin: rung 2 is the USB handle and the
+  slot card is TegraSd (not USB, and vetoed read-only), so the friend for this control must be a USB disk with a FAT volume, and the
+  root reader card must refuse writes (its physical lock switch, or FRGUARD's `default_writable()` forced off). Then press PrintScreen:
+  captures landing on the friend = invariant falsified, B90 was right; captures REFUSED with a witness = vector 1 genuinely closed.
+  Either outcome is worth more than another clean pair. Owed at render12; needs Peter to supply a USB stick.
