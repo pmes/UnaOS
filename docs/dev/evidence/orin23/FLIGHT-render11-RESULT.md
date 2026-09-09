@@ -70,3 +70,34 @@ two cards carry different BS_VolIDs. HOMESOIL selftest legs (witness-gated) prin
 `[u7stk] headroom=` from a fast run — `hw=` is a high-water mark and fast mode discards the late samples where it is largest; the
 32 KiB launch-stack question needs `UNAOS_QEMU_FULL=1`. `pi4-regression.spec` at this sha names `/usb`/`/volumes` in 2 COMMENT lines and
 0 directive rows: the `/volumes` namespace is unexercised on the Pi by any row — a green Pi run is blind to LABELMOUNT, not safe (pi's item).
+
+## FRIEND-DIFF (FLIGHT-render11 §6, three-boot form) — flown 2026-09-09 00:42Z–00:47Z, filed under `friend/`
+Boots, same image (57ae5ec3…, stamp 600887c2), same reader card: **A1** friend ABSENT (microSD out of the slot; raw 220184–222672),
+**A2** friend ABSENT again (raw 223170–226030), **B** = the render11 boot (friend PRESENT, raw 192656–). Every window cut at the
+UnaOS loader's first line (the firmware/DCE preamble is not UnaOS) and at the 12th `[orinrender] census` (boot-relative, before any
+user click). Wire: `[vfs] root = boot volume serial=0xde001a13 … sha=600887c2 matches=1 home=- aliased=usb->global` in all three;
+`[vfs] volume mounted /volumes/UNAOS-PI source=tegra-sd rw=no` in B only. 0 exceptions, 0 panics, all three.
+
+**Normalizer built from A1 vs A2 only, then FROZEN** (`friend-norm.sh`; the rule: a field is normalised only if it varies between two
+boots in the SAME condition): 80-column console unwrap (`tools/unwrap80.sh`), timing/counter fields, the census families
+(`:: SCHED:`, `[spread*]`, `[pulse5]`, `[wc-*]`, `[prio]`, `[noatt]`, `[fluid3]`, `[comp2]`, `[strip]`, `[dock] live`, tick lines),
+SMMU fault registers (`sGFAR/SYNR/sid/FAR/SCTLR`), cycle/poll counts, and the loader's JB6 line (two cores' output interleaved
+character-wise). A1 vs A2 after freezing: 6 surviving lines, all the JB6 interleave garble and the `[irqel2a]` tail.
+
+**JUDGE A1 (absent) vs B (present), allowed-diff list frozen from §6 plus the friend's own presence witnesses
+(`:: TEGRA-SD:`, `:: PSRC:`, `[vfs] volume mounted`, `[vfs] unafs volume`, `TEGRA-UNAFS`, `[quarry] open volumes`, `:: SDMMC:`):
+64 surviving lines, every one classified (`judge-A1-vs-B.diff`):**
+| lines | class | reading |
+|---|---|---|
+| ~34 | kernel LOAD ADDRESS (`Allocated kernel at`, VBAR, TTBR0, entry=, heap/table addresses, `window_off=`) | UEFI placed the kernel 0x3f0000 lower with the slot card present — the firmware's allocator, not UnaOS; every UnaOS table moved with it and nothing in UnaOS keyed on the address. Stable within a condition, different across — recorded as a firmware observable, not an entanglement. |
+| 10 | user keypress in B (`PRTSCR … capture armed`) | Peter pressed PrintScreen before his first click; A1/A2 were untouched. |
+| 4 | `[quarry] open … tree-rows=8→9 dirs=7→8` and `entries=30→26` | +1 dir = `volumes/` (the friend — allowed); the file-count delta is TIME ORDER: SCREEN6–9.PNG were written to the card DURING B, so A1/A2 list four more files. |
+| 3 | console width (`CON cur=80x25` vs `240x56`, the ANSI clear) | orin-ledger D1: the 80-column wrap happens on some boots; independent of the friend. |
+| 5+3 | loader JB6/JB9d interleave garble; `[irqel2a]` register tail | same-condition noise (also present in the calibrate diff). |
+| 2 | capture routing artifacts (`=== butler RESOLVED`, a re-routed `dark-window guard` line) | the butler, not the board. |
+| 1 | `[menubar] live … paint=…/171us` vs `/170us` | a timing residue the normalizer's order missed; same class as the census fields. |
+
+**Verdict: no UnaOS entanglement with the friend disk found in the boot-to-desktop window.** The only cross-condition fact that is
+UnaOS-visible is the load address, and it is the firmware's. ⚠ **This green is NOT yet trusted:** §6's POSITIVE CONTROL (a one-line
+"read this only when the friend is mounted" mutation that must RED the leg) has not been flown — it needs a mutated build and a metal
+boot, owed with render12. Until then the leg is "did not red", not "proven able to red".
