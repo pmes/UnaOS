@@ -131,3 +131,15 @@ calibrate, justified: ALL hex literals are handles (SMMU stream/sid values are h
 **Verdict unchanged and stated with the asymmetry rmbp named: the invariant was not falsified on one image and one pair of boots.**
 The named survivors are the deliverable: one firmware input difference (12 carveout ranges), zero UnaOS-side reorganisation. The
 positive control (§6) is still owed; without it this leg has not yet been shown able to red.
+
+### FRIEND-DIFF survivor 3, falsifier run (rmbp 17: "diff A1 against A2 — you hold the second pair already")
+rmbp pointed out that UEFI moves an image boot to boot on the rMBP with no friend involved (`x86-witness.spec:547-548`, two boots of one
+image at different load addresses), so with one pair the 0x3f0000 shift could not be attributed. The free falsifier, run on the data:
+| boot | condition | `Allocated kernel at` | `VBAR_EL1` | `HEAP-GUARD … clear of N carveout range(s)` |
+|---|---|---|---|---|
+| A1 | friend ABSENT | 0x25ae2a000 | 0x25afbb800 | 153 |
+| A2 | friend ABSENT | 0x25ae2a000 | 0x25afbb800 | 153 |
+| B  | friend PRESENT | 0x25aa3a000 | 0x25abcb800 | 165 |
+A1 and A2 agree EXACTLY; only B differs. On this board the load address is stable across cold boots in one condition and moves with the
+friend, and the 12 extra carveout ranges move with it — the correlation survives (n=2 vs 1). Still a firmware-side input, still not a
+UnaOS reorganisation; now attributed rather than assumed. (The rMBP's boot-to-boot variance is a different firmware.)
