@@ -8,6 +8,8 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
+#   ./arroyo state         One line: branch@HEAD, behind-trunk, ahead-of-trunk, owed-above-origin, dirty
+#                          (read-only; the four drifts a seat must never have to volunteer)
 #   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
 #                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
 #                          + the ring-3 user-* crates
@@ -7184,6 +7186,26 @@ case "${1:-}" in
     test-arm|test-aarch64)
         test_aarch64 "${2:-20}"
         ;;
+    state)
+        # STATE (orin 23, 2026-09-09; pi 9 + rmbp 17): the four numbers a seat must never have to volunteer.
+        # Each measures a DIFFERENT silent failure: BEHIND trunk cost a false published measurement
+        # (rmbp-ledger B107: a 17-commit-stale shared ledger); AHEAD of trunk is an unlanded arc's price and
+        # was invisible for rounds because nobody said it aloud; OWED above origin/<branch> is the only one
+        # that answers "does Peter have a push waiting". A status line that prints two of the four just
+        # moves which drift is silent. Read-only; fetches first so the numbers are about NOW.
+        _br="$(git -C "$WORKSPACE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+        _head="$(git -C "$WORKSPACE_DIR" rev-parse --short HEAD 2>/dev/null)"
+        git -C "$WORKSPACE_DIR" fetch -q origin 2>/dev/null || echo "  (fetch failed — numbers below are as of the last fetch)"
+        _behind="$(git -C "$WORKSPACE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
+        _ahead="$(git -C "$WORKSPACE_DIR" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
+        if git -C "$WORKSPACE_DIR" rev-parse --verify -q "origin/$_br" >/dev/null 2>&1; then
+            _owed="$(git -C "$WORKSPACE_DIR" rev-list --count "origin/$_br..HEAD" 2>/dev/null || echo '?')"
+        else
+            _owed="ALL (no origin/$_br)"
+        fi
+        _dirty="$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null | grep -vc '__pycache__' )"
+        echo "state: ${_br}@${_head}  behind-trunk=${_behind}  ahead-of-trunk=${_ahead}  owed-above-origin/${_br}=${_owed}  dirty=${_dirty}"
+        ;;
     check)
         check_both
         ;;
@@ -7246,7 +7268,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
         exit 1
         ;;
 esac
