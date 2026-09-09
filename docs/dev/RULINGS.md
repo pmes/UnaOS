@@ -2,7 +2,7 @@
 
 > Numbering: rmbp 11 seeded R1–R7 on hw-rmbp; orin 13 appended R8–R16 on hw-jetson. One sequence after the union merge; never renumber an id that has been cited.
 
-> One home. LAWS.md, CLAUDE.md, batons and memories LINK a ruling id; they do not paraphrase it.
+> One home for the words. The rules derived from them live in ONE file, `docs/dev/LAWS.md` (consolidated 2026-09-09); LAWS.md cites an R-id and never paraphrases it.
 > Verbatim means the words as typed. A paraphrase is marked `(paraphrase)`. Each seat appends what
 > it heard in its own session; merges are by union.
 
