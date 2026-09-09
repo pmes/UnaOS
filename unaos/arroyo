@@ -7196,17 +7196,28 @@ case "${1:-}" in
         _br="$(git -C "$WORKSPACE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
         _head="$(git -C "$WORKSPACE_DIR" rev-parse --short HEAD 2>/dev/null)"
         git -C "$WORKSPACE_DIR" fetch -q origin 2>/dev/null || echo "  (fetch failed — numbers below are as of the last fetch)"
-        _behind="$(git -C "$WORKSPACE_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo '?')"
-        _ahead="$(git -C "$WORKSPACE_DIR" rev-list --count origin/main..HEAD 2>/dev/null || echo '?')"
+        # TRUNK is named on the line, not assumed silently: CLAUDE.md's ruling (2026-08-18) makes `main`
+        # the trunk but says to VERIFY while the UnaOS-gemini fast-forward is outstanding — the one drift an
+        # anti-drift verb cannot report is measuring against the wrong ref (rmbp 17's review). If the
+        # retired staging ref is AHEAD of origin/main, that is said aloud rather than silently measured past.
+        _trunk="origin/main"
+        _behind="$(git -C "$WORKSPACE_DIR" rev-list --count "HEAD..$_trunk" 2>/dev/null || echo '?')"
+        _ahead="$(git -C "$WORKSPACE_DIR" rev-list --count "$_trunk..HEAD" 2>/dev/null || echo '?')"
+        _gem_ahead=""
+        if git -C "$WORKSPACE_DIR" rev-parse --verify -q origin/UnaOS-gemini >/dev/null 2>&1; then
+            _g="$(git -C "$WORKSPACE_DIR" rev-list --count "$_trunk..origin/UnaOS-gemini" 2>/dev/null || echo 0)"
+            [ "$_g" != "0" ] && _gem_ahead="  ⚠ origin/UnaOS-gemini is ${_g} ahead of ${_trunk} — verify which ref is trunk (CLAUDE.md)"
+        fi
         if git -C "$WORKSPACE_DIR" rev-parse --verify -q "origin/$_br" >/dev/null 2>&1; then
             _owed="$(git -C "$WORKSPACE_DIR" rev-list --count "origin/$_br..HEAD" 2>/dev/null || echo '?')"
         else
-            _owed="ALL (no origin/$_br)"
+            # A branch with no origin counterpart still has a MAGNITUDE (rmbp 17): say how much is new.
+            _owed="NEW(${_ahead} above ${_trunk}, no origin/$_br)"
         fi
         # awk, not `grep -c`: on a CLEAN tree grep's count is 0 and its exit is 1, which under errexit
         # ended the verb silently before the line printed (found on the verb's second run, orin 23).
         _dirty="$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null | awk '!index($0,"__pycache__"){n++} END{print n+0}')"
-        echo "state: ${_br}@${_head}  behind-trunk=${_behind}  ahead-of-trunk=${_ahead}  owed-above-origin/${_br}=${_owed}  dirty=${_dirty}"
+        echo "state: ${_br}@${_head}  trunk=${_trunk}  behind-trunk=${_behind}  ahead-of-trunk=${_ahead}  owed-above-origin/${_br}=${_owed}  dirty=${_dirty}${_gem_ahead}"
         ;;
     check)
         check_both
