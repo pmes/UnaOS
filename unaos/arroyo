@@ -7203,7 +7203,9 @@ case "${1:-}" in
         else
             _owed="ALL (no origin/$_br)"
         fi
-        _dirty="$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null | grep -vc '__pycache__' )"
+        # awk, not `grep -c`: on a CLEAN tree grep's count is 0 and its exit is 1, which under errexit
+        # ended the verb silently before the line printed (found on the verb's second run, orin 23).
+        _dirty="$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null | awk '!index($0,"__pycache__"){n++} END{print n+0}')"
         echo "state: ${_br}@${_head}  behind-trunk=${_behind}  ahead-of-trunk=${_ahead}  owed-above-origin/${_br}=${_owed}  dirty=${_dirty}"
         ;;
     check)
