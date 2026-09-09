@@ -17,8 +17,8 @@ allowed() {  # lines that are permitted to differ between the two CONDITIONS (a 
                || index($0,":: TEGRA-SD:") || index($0,":: PSRC:") || index($0,"=== butler") )'
 }
 case "$mode" in
-  calibrate) diff <("$D/friend-norm.sh" "$A") <("$D/friend-norm.sh" "$B") ;;
-  judge)     diff <("$D/friend-norm.sh" "$A" | allowed) <("$D/friend-norm.sh" "$B" | allowed) ;;
+  calibrate) diff <("$D/${NORM:-friend-norm.sh}" "$A") <("$D/${NORM:-friend-norm.sh}" "$B") ;;
+  judge)     diff <("$D/${NORM:-friend-norm.sh}" "$A" | allowed) <("$D/${NORM:-friend-norm.sh}" "$B" | allowed) ;;
   *) echo "usage: friend-diff.sh calibrate|judge <a.log> <b.log>" >&2; exit 2 ;;
 esac
 rc=$?; echo "== friend-diff $mode: diff exit=$rc (0 = EMPTY) =="; exit $rc

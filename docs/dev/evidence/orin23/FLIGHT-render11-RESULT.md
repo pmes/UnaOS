@@ -101,3 +101,33 @@ character-wise). A1 vs A2 after freezing: 6 surviving lines, all the JB6 interle
 UnaOS-visible is the load address, and it is the firmware's. ⚠ **This green is NOT yet trusted:** §6's POSITIVE CONTROL (a one-line
 "read this only when the friend is mounted" mutation that must RED the leg) has not been flown — it needs a mutated build and a metal
 boot, owed with render12. Until then the leg is "did not red", not "proven able to red".
+
+### FRIEND-DIFF, second pass — rmbp 17's PRE-REGISTERED normalization (B90), run after the first pass and reported beside it
+rmbp 17 pre-registered the set before A2 existed (the message arrived after my first judge): strip ONLY (a) monotonic counters and
+timestamps, (b) addresses and handles; (c) the mount witnesses B90 exempts — NO line drops, ORDER preserved, and every later addition
+is a finding with its own justification. **What the first pass did that this one does not, declared:** it dropped whole census-family
+lines (`:: SCHED:`, `[spread*]`, `[pulse5]`, `[wc-*]`, `[prio]`, `[noatt]`, `[fluid3]`, `[comp2]`, `[strip]`, `[dock] live`, tick lines)
+instead of the counters in them, and it added three allowed-list entries (`:: TEGRA-SD:`, `:: PSRC:`, the butler lines) AFTER seeing the
+cross-condition diff. Those are post-hoc and are not used here. `friend-norm-strict.sh`; one addition after the same-condition
+calibrate, justified: ALL hex literals are handles (SMMU stream/sid values are hardware-assigned per boot).
+
+| pass | same-condition (A1 vs A2) survivors | cross-condition (A1 vs B) survivors |
+|---|---|---|
+| strict | 101 — all periodic census families whose EMISSION COUNT/PHASE differs with window length (`[prio]` 10, `[orinbsptick]` 10, `[wc-h]` 7, `[wc-b]` 6, `[spread4/7/9/10]` 6 each, `[pulse5]` 6, `[serialrx]` 4, `[el0live]` 4, `:: SCHED:` 4) + the JB6 interleave garble | 102 — the SAME families at the same counts (the noise floor), plus the lines below |
+
+**Cross-condition survivors OUTSIDE the noise floor (the deliverable, in wire order):**
+1. Console width: `CON cur=80x25` + the ANSI clear banner in B vs `240x56` in A1 — orin-ledger D1, independent of the friend.
+2. Loader JB6/JB9d interleave garble — same-condition noise (present in the calibrate diff too).
+3. **`:: tegra: HEAP-GUARD … clear of 153 carveout range(s)` (A1) vs `165` (B) — NEW, missed by the first pass.** With the slot card
+   present the UEFI memory map carries **12 more carveout ranges**; the kernel's heap-guard exclusion set is built from that map, and
+   the kernel load address moved (0x3f0000 lower) for the same reason. This is a FIRMWARE-side input difference that UnaOS consumes
+   honestly — it is not UnaOS reorganising around the friend, but it is the one place the friend's presence reaches the kernel's
+   memory layout, and it is now named.
+4. `[quarry] open census … names: … volumes/ …` — the friend's own mount (B90-exempt) plus the time-order file delta (SCREEN6–9 written during B).
+5. `[conquiet]`, `JD2 — OUT`, `[tcu] rx-mbox`, `[menubar] live` — each present on BOTH sides, moved by a few lines: emission phase, not content.
+6. `:: PRTSCR:` ×10 — Peter's PrintScreen presses in B; every capture wrote to the ROOT volume (`-> OK`, rw=yes), so B90's staining
+   vector 1 (`prtscr.rs::mount_capture_target` falling to a friend handle) did NOT fire this boot — expected, since root accepted writes.
+
+**Verdict unchanged and stated with the asymmetry rmbp named: the invariant was not falsified on one image and one pair of boots.**
+The named survivors are the deliverable: one firmware input difference (12 carveout ranges), zero UnaOS-side reorganisation. The
+positive control (§6) is still owed; without it this leg has not yet been shown able to red.
