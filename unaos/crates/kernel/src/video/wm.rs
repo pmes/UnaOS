@@ -4567,7 +4567,7 @@ fn owedtail_emit() {
 
 pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::composite"); return; } // PANELREFUSE Tier 1 — THE WHOLE PASS DECLINES once the machine is dying. Sited at the TOP OF THE FUNCTION, above the arch split on the two lines below, and that siting is the design's central finding rather than convenience: `composite_pass_half` calls `strip::compose_all` AFTER `composite_inner` returns, and the furniture (dock/menubar/crystal) reaches the glass through its OWN blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal placed at `panel_snapshot` instead would therefore produce a PARTIAL PAINT — windows suppressed, furniture stamped across the panic backdrop — a screen state no boot has ever produced and no capture in the corpus describes. Refusing above the fork declines `composite_once` -> `composite_pass_half` -> `composite_inner` AND `strip::compose_all` in one place, on both arches: the non-x86 arm below is a bare `composite_once()` with no gate and no decline path of its own, so a check inside the x86 `COMP_GATE` block would leave aarch64 uncovered. It takes NO gate (this is before `COMP_GATE`), holds nothing, clears nothing, and deliberately does NOT set `COMP_PENDING` — nothing is coming to service the damage, and arming a re-drive on a dying machine is a futile wake, not tidiness. Damage stays on the table. LOCKFIX: two atomic loads, no acquire of any kind, so a refused pass cannot leak a hold into a preemption. ⚠ SAME-LINE fold, line-NEUTRAL — `wm.rs` is ~21k lines and a line added here would renumber every panic `Location` below it; the reviewing seat required that cost be CHOSEN, and this is the choice not to pay it. Idiom: `video/fbcon.rs`'s `⚠ SAME-LINE fold` markers.
     #[cfg(not(target_arch = "x86_64"))]
-    composite_once();
+    comp_gate_pass(); // COMPGATE — NO LONGER A BARE PASS. The non-x86 arm now runs under this module's own gate: a second entrant on any core FOLDS (its damage stays on the table and is serviced by the holder's re-run) or WAITS bounded, and can never reach `draw_window`'s direct, unclipped, per-pixel front-buffer path. The gate, its preemption hold, its witnesses and its nested-present fixture are at the FILE TAIL — see the COMPGATE ledger there for the mechanism (`decl_lock=73` is same-core re-entrancy by construction, because `STAGE` is per core) and for why the hold is a switch decline rather than an interrupt mask. ⚠ SAME-LINE fold, line-NEUTRAL, on the identical argument the PANELREFUSE fold above states: `wm.rs` is ~25k lines and a line added here renumbers every panic `Location` below it. x86 is untouched — the arm below is byte-for-byte what it was.
     #[cfg(target_arch = "x86_64")]
     {
         use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -26139,4 +26139,772 @@ pub fn raise_one(id: WinId) -> bool {
 pub fn dock_tiles_probe() -> usize {
     let t = table();
     dock_tiles(&t.rows)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// COMPGATE — ONE COMPOSITE PASS ON THE PANEL AT A TIME, ON THE NON-x86 ARM TOO.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ## THE DEFECT, from the wire and not from an argument
+//
+// Peter's render11 glass tore. The rollup that scores it reads
+//
+//     [wc-h] rollup win=1 torn=2 decl_lock=73 maxpresent_us=117479
+//
+// and the three numbers are one mechanism, in this order.
+//
+// `decl_lock=73` is `stage_window`'s [`super::wcg::DECL_LOCK`] arm: `stage_for_core().try_lock()`
+// returned `None`. **That is same-core re-entrancy BY CONSTRUCTION, not cross-core contention**, and
+// the proof is one line of this module — [`stage_for_core`] indexes [`STAGE`] by
+// `meter_current_cpu()`, so two DIFFERENT cores never contend for the same entry and can never
+// produce this decline. A core can only lose that `try_lock` to ITSELF: to a present it started, was
+// interrupted inside, and then started again on top of.
+//
+// What loses the lock lands in `draw_window`'s `if !staged` arm — `paint_window`, the pre-WC-H
+// DIRECT path. That path is per-pixel through `put_pixel`, straight into the FRONT buffer, and (its
+// own note says so) UNCLIPPED. A present that takes it publishes half-composited rows to the glass
+// while another present is writing the same rows. That is the tear, and `torn=2` is the tear test
+// catching two of them.
+//
+// `maxpresent_us=117479` is why it happens at all. This arch composites with INTERRUPTS ENABLED —
+// the console reaches the compositor through `fbcon::route_present_banded` -> `present_banded` ->
+// `composite` with no mask anywhere on the path — and the preemption quantum is ~12 ms
+// (ORIN-TICKDEFAULT; `arch/aarch64/sched.rs`'s `QUANTUM_TICKS` at the 250 Hz tick). A 117 ms present
+// therefore contains about NINE involuntary switches, and every task dispatched in one of those
+// windows may start its own present on the same core. With the six-core `apsrun` in this base the
+// same preempt path runs on five more cores, so the population that can arrive mid-pass is larger
+// still — but the DECLINE remains same-core, because the buffer is.
+//
+// **The falsifier was already in the tree and had never been read.** [`BLIT_NET_CORE`] is a signed
+// per-enter-core net of live [`BlitGuard`]s, maintained unconditionally on every build. `net[c] > 1`
+// IS the re-entrancy: two composite blits entered on core `c` and neither has retired. Until this
+// arc it was printed ONLY from [`blitwho_report`], which runs from the two drain GIVE-UP arms — a
+// boot that tears without ever stalling a drain never prints it. It is now on every `[wc-h] rollup`
+// (`blitnet=[...]`, `video/wcg.rs`), so the reading that convicts is on the same line as the verdict.
+//
+// ## THE SHAPE OF THE FIX, which is x86's
+//
+// x86 has had the answer since WCSER: [`COMP_GATE`], a non-blocking `AtomicBool` around the whole
+// pass. A second entrant does not composite; it publishes `COMP_PENDING`, discharges the sprite duty
+// by DEFERRAL (`cursor::owe_repaint`, never a draw from inside another pass's bracket), and returns
+// having CLEARED NOTHING — its damage is still on the table and the holder's re-run loop absorbs it.
+// The aarch64 arm was a bare `composite_once()` with no gate and no decline path of its own, and the
+// module ledger above `COMP_GATE` says why in as many words: the gate was landed from the x86 seat,
+// with no aarch64 boot to verify it on, and this tree's verification law forbids changing another
+// platform's compositor blind. The Orin boot that verifies it is now on the wire, so the argument
+// that held it back is discharged and the arm is closed.
+//
+// This block is that arm. It is x86's SHAPE, not a copy of x86's code, and the three differences are
+// deliberate:
+//
+//   1. **A BOUNDED WAIT, not only a fold.** x86 declines and leaves. Here a cross-core entrant that
+//      can afford to spin waits up to [`COMPGATE_WAIT_US`] for the holder to finish and then
+//      composites for real, because the alternative on this arch is a console present deferred a
+//      whole frame on a machine whose panel is the only output. It is a spin, so it is priced in
+//      microseconds and not milliseconds; on expiry it FOLDS, which is x86's behaviour exactly.
+//   2. **THE SAME-CORE ARM NEVER WAITS.** If the gate's holder is THIS core, the holder cannot make
+//      progress while we spin on it — we own the core. Waiting there is a deadlock against the very
+//      preempt tick that produced the re-entrancy, so the same-core entrant folds IMMEDIATELY, and
+//      the holder is re-read inside the wait loop in case it migrates onto us mid-spin. This is
+//      `blit_samecore_futile`'s argument, applied to the gate instead of to the drain.
+//   3. **A PREEMPTION HOLD AROUND THE PASS** ([`crate::arch::sched::preempt_hold`]). The gate alone
+//      already makes the tear impossible — a re-entrant present folds instead of taking the direct
+//      path — but it leaves the pass STRETCHED across every task the quantum hands the core to,
+//      which is what turned a present into 117 ms in the first place. The hold declines the
+//      involuntary switch and nothing else: interrupts stay ENABLED, the tick is still taken and
+//      EOI'd, `arch::ms()` still advances (it reads CNTVCT, not a tick count), and every other
+//      interrupt is delivered normally. **Masking interrupts for 100 ms was considered and refused
+//      outright** — this tree has already convicted that shape once (`[comp2] max_us=302134` under a
+//      masked reopening present). If a pass is ever long enough that a hold of its length is itself
+//      the problem, the answer is x86's: SPLIT THE PHASE (the deferred `COMP_GATE` narrowing, design
+//      §8 step 3), not a longer mask.
+//
+// ## WHAT A FOLD COSTS, AND WHO PAYS THE DAMAGE BACK
+//
+// Nothing is dropped. A fold returns BEFORE the table snapshot, so every `damaged` flag it would
+// have consumed is still set; it publishes [`COMPGATE_PENDING`], and the holder — if it is unmasked
+// — runs up to [`COMPGATE_RERUN_MAX`] extra full passes for exactly the folders, each one its own
+// snapshot and its own back-to-front order. A MASKED holder does one pass and leaves, on x86's
+// review-condition-1 argument (extra masked rounds are global latency charged to the wrong caller);
+// its folders are picked up by the next present or by `service_damage`, which `screen.rs` drives.
+//
+// ## THE FAIL SHAPES, named in advance
+//
+//   * `[compgate] wait core=N us=…` that never returns => a deadlock against the tick. Structurally
+//     excluded twice over (the same-core arm never waits; the wait is bounded by a free-running
+//     counter read, not by a lock), so an occurrence falsifies this block and not the panel.
+//   * `torn>0` while `blitnet=` shows no core above 1 => the tear has a DIFFERENT source; this gate
+//     is not the fix for it and the diagnosis restarts.
+//   * `deferred=` (the preempt-hold count) rising without bound on an idle desktop => a LEAKED hold.
+//     The guard's core index is captured at acquisition for exactly this reason; see the ledger in
+//     `arch/aarch64/sched.rs`.
+
+/// COMPGATE — the gate. `true` = a composite pass owns the panel.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// COMPGATE — which core holds [`COMPGATE`]. `usize::MAX` = free. Written by the acquire winner and
+/// cleared before the release store, so a reader that sees a core sees a live holder or a stale one,
+/// never a wrong one. Read by the wait arm's futility test.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_HOLDER_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// COMPGATE — when the current held epoch began, in [`crate::arch::now_cycles`] units.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_T0_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// COMPGATE — a pass folded and its damage is still on the table. `COMP_PENDING`'s twin.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// COMPGATE — passes that took the gate.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_ENTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — passes that FOLDED into an in-progress pass. THE reading: this is the number of
+/// composites that would previously have interleaved their blits with another pass on the same
+/// glass, and (for the same-core population) the number that would have fallen to the direct path.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_FOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — entrants that took the bounded wait, and those the wait actually admitted.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_WAIT_OK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — the longest wait and the longest held epoch, both in microseconds. Gauges: a wedged
+/// holder leaves them standing, which is the point.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_MAXWAIT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_MAXHOLD_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — extra rounds a holder ran for its folders.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_RERUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — [`composite_once`] invocations that actually ran. The fixture's instrument: a nested
+/// present that FOLDS leaves this unmoved, and one that RAN moves it by exactly one.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// COMPGATE — the bounded wait, in microseconds.
+///
+/// Priced as a SPIN, which is what it is: this arm is taken only with interrupts unmasked and only
+/// against a holder on another core, and it burns the core for its whole length. 250 µs is two
+/// orders under the 12 ms quantum (so a waiter can never eat a scheduling slice), an order under the
+/// ~3 ms typical composite pass this track has measured (`[comp2] pass_us=3294`) — i.e. it is NOT
+/// sized to outlast a whole pass, deliberately, because a waiter that outlasts a pass is a waiter
+/// that should have folded — and comfortably above the tail of a pass that is nearly finished, which
+/// is the population it exists to admit.
+#[cfg(not(target_arch = "x86_64"))]
+const COMPGATE_WAIT_US: u64 = 250;
+
+/// COMPGATE — extra passes an UNMASKED holder runs for its folders. Two, on `COMP_RERUN_MAX`'s
+/// argument and for the same population: enough to absorb the overlap one contended desktop
+/// produces, cheap where it applies, and never taken by a masked holder at all.
+#[cfg(not(target_arch = "x86_64"))]
+const COMPGATE_RERUN_MAX: u32 = 2;
+
+/// COMPGATE — cadence of the `[compgate] rollup` census, in ms.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+const COMPGATE_ROLLUP_MS: u64 = 5_000;
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_ROLLUP_LAST_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — per-core one-shot latch for the `[compgate] enter` line. Bounded at one line per core
+/// per boot: the enter event happens hundreds of times a second and the interesting fact about it is
+/// WHICH CORES composite, not how often.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_ENTER_SEEN: [core::sync::atomic::AtomicBool; COMPGATE_CORES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; COMPGATE_CORES];
+/// COMPGATE — how many `fold` / `wait` lines to print before the rollup carries the census alone.
+/// The events are per-present, so an unbounded print would be a serial write on the hot path.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+const COMPGATE_EVENT_PRINT_MAX: u64 = 8;
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FOLD_PRINTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_WAIT_PRINTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// COMPGATE — the width of every per-core array in this block. NOT a claim about how many cores the
+/// machine has: it is [`BLIT_NET_CORE`]'s width, so the census this gate prints and the net it prints
+/// beside it are indexed the same way and a reader can lay one on the other. Cores at or beyond it
+/// fold onto the last slot exactly as [`stage_pool_index`] folds them, which costs those cores a
+/// shared counter and never an out-of-bounds. Lives here, in the video module, and NOT in
+/// `arch/aarch64/sched.rs`, which is shared with the Pi track and carries no literal core counts.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+const COMPGATE_CORES: usize = 8;
+
+/// COMPGATE — [`BLIT_NET_CORE`], as a plain array, for the witnesses that print it.
+///
+/// The NET itself is unconditional — every build maintains it — but every READER is a witness: the
+/// `[wc-h] rollup`'s `blitnet=` field lives in the `witness`-gated `video/wcg.rs`, and this module's
+/// `[compgate] rollup` and [`compgate_selftest`] carry the same gate. The snapshot therefore carries
+/// it too; without it a `witness`-off build compiles a function nothing can call.
+///
+/// Deliberately NOT behind `blitwho_report`: that function is reachable only from the two drain
+/// give-up arms, so a boot that TEARS without ever stalling a drain never prints the one reading
+/// that convicts the tear. `[wc-h] rollup blitnet=` is the fix for that blind spot; see the COMPGATE
+/// ledger.
+#[cfg(feature = "witness")]
+pub(super) fn blit_net_snapshot() -> [i64; 8] {
+    core::array::from_fn(|i| BLIT_NET_CORE[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// COMPGATE — the preemption hold that brackets a held pass. See the ledger in
+/// `arch/aarch64/sched.rs` for the contract and the three hazards it closes.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn compgate_preempt_hold() -> crate::arch::sched::PreemptHold {
+    crate::arch::sched::preempt_hold()
+}
+/// COMPGATE — the hold is an aarch64 facility. Any other non-x86 arch gets the gate without it: the
+/// TEAR is closed by the gate alone (a re-entrant present folds), and the hold is the LATENCY half.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn compgate_preempt_hold() {}
+
+/// COMPGATE — is anything OWED to a folder? The re-run loop's guard, and `any_damaged` +
+/// `deferred_owed` in one function because on this arch neither has a caller of its own.
+///
+/// A fold says a pass was refused, not that it had anything to do: the holder's own round is
+/// generous (the occlusion closure repaints more than the decliner asked for) and usually absorbs
+/// it. There is no menu term — this arch compiles no SHARD menu, which is why `service_damage`'s
+/// own menu arm is `x86_64`-gated too.
+#[cfg(not(target_arch = "x86_64"))]
+fn comp_gate_owed() -> bool {
+    if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let t = table();
+    t.rows.iter().any(|r| r.used && r.damaged)
+}
+
+/// COMPGATE — THE GATE. Every non-x86 `composite()` runs through here and nowhere else.
+///
+/// Three outcomes and no fourth: ENTER (took the gate, ran the pass, absorbed its folders), WAIT
+/// (spun bounded for a holder on another core, then entered or folded), FOLD (published the pending
+/// flag, deferred the sprite duty, cleared nothing, returned). **There is no arm that proceeds to
+/// `composite_once` without the gate**, which is the whole property: `draw_window`'s direct,
+/// unclipped, per-pixel path is now unreachable from a second entrant.
+#[cfg(not(target_arch = "x86_64"))]
+fn comp_gate_pass() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    let me = crate::arch::sched::meter_current_cpu();
+    let mut got = COMPGATE.compare_exchange(false, true, AcqRel, Relaxed).is_ok();
+    if !got {
+        // SECOND ENTRANT. The wait is offered only where it can terminate and only where it can be
+        // afforded: a holder that is NOT this core (a holder that IS this core cannot run while we
+        // spin — we own the core — so waiting on it is a deadlock against the preempt tick that put
+        // us here), and interrupts unmasked (a masked caller is on `sys_win_present`'s path holding
+        // the window table, and a spin there is latency charged to the whole machine).
+        let holder = COMPGATE_HOLDER_CORE.load(Relaxed);
+        if holder != me && holder != usize::MAX && !crate::arch::irqs_masked() {
+            let t0 = crate::arch::now_cycles();
+            let budget = compgate_wait_budget_cyc();
+            loop {
+                core::hint::spin_loop();
+                if COMPGATE.compare_exchange(false, true, AcqRel, Relaxed).is_ok() {
+                    got = true;
+                    break;
+                }
+                // The holder can MIGRATE onto this core mid-spin, at which point the wait becomes
+                // the futile same-core one and must end. Re-read rather than trusted from above.
+                if COMPGATE_HOLDER_CORE.load(Relaxed) == me {
+                    break;
+                }
+                if crate::arch::now_cycles().saturating_sub(t0) >= budget {
+                    break;
+                }
+            }
+            let us = compgate_cyc_to_us(crate::arch::now_cycles().saturating_sub(t0));
+            COMPGATE_WAITS.fetch_add(1, Relaxed);
+            if got {
+                COMPGATE_WAIT_OK.fetch_add(1, Relaxed);
+            }
+            COMPGATE_MAXWAIT_US.fetch_max(us, Relaxed);
+            compgate_note_wait(me, us, got);
+        }
+        if !got {
+            // FOLDED. This pass composites nothing and CLEARS NOTHING — it never reached the table
+            // snapshot, so every `damaged` flag it would have consumed is still set and belongs to
+            // the holder's next round. The pending flag is the only thing published.
+            COMPGATE_PENDING.store(true, Release);
+            COMPGATE_FOLDS.fetch_add(1, Relaxed);
+            compgate_note_fold(me);
+            // The sprite duty is DEFERRED, not discharged. We are inside another pass's CURSOR-1
+            // bracket by definition: the holder took the sprite down before its first window pixel
+            // and puts it back in its tail. Drawing here would be an unserialised sprite writer into
+            // a half-composited stack, and it would capture its save-under from those same
+            // half-composited pixels. `owe_repaint` writes nothing and hands the whole-sprite
+            // refresh to the holder's tail, which runs on a finished stack holding `SPRITE`. This is
+            // x86's REVIEW CONDITION 3 verbatim; see the decline arm of `composite`.
+            super::cursor::owe_repaint();
+            return;
+        }
+    }
+    // HELD. Stamp t0 first, then the core, so a set holder always carries a current age.
+    COMPGATE_T0_CYC.store(crate::arch::now_cycles(), Relaxed);
+    COMPGATE_HOLDER_CORE.store(me, Relaxed);
+    COMPGATE_ENTERED.fetch_add(1, Relaxed);
+    compgate_note_enter(me);
+    // The hold covers the pass AND its re-runs, and is released after the gate below.
+    let hold = compgate_preempt_hold();
+    COMPGATE_PASSES.fetch_add(1, Relaxed);
+    // The nested-present fixture, inside the hold and inside the gate — the one place a nested
+    // present is a controlled experiment rather than an accident. One-shot, witness-only.
+    #[cfg(feature = "witness")]
+    compgate_fixture(me);
+    composite_once();
+    // Service what folded while we held. Each round is a FULL pass — its own snapshot, its own
+    // upward closure, its own back-to-front order, its own cursor tail — so no tail is skipped and
+    // the coalesced damage is composited in one correct stack. A MASKED holder takes none of them:
+    // it is on the present syscall's path holding the window table, and extra masked rounds are
+    // global latency charged to a caller that did not ask for them (x86's review condition 1). Its
+    // folders are not lost — the flag stays set for the next present or for `service_damage`.
+    let masked = crate::arch::irqs_masked();
+    let mut rounds = 0u32;
+    while !masked && rounds < COMPGATE_RERUN_MAX && COMPGATE_PENDING.swap(false, AcqRel) {
+        if !comp_gate_owed() {
+            break; // the folder's damage was already absorbed by the round above
+        }
+        rounds += 1;
+        COMPGATE_RERUNS.fetch_add(1, Relaxed);
+        // Re-base the epoch clock per pass: a legal multi-pass storm must not read as one overlong
+        // hold. A wedged pass stops re-basing by definition, so the gauge's real target is unharmed.
+        COMPGATE_T0_CYC.store(crate::arch::now_cycles(), Relaxed);
+        COMPGATE_PASSES.fetch_add(1, Relaxed);
+        composite_once();
+    }
+    let held_us =
+        compgate_cyc_to_us(crate::arch::now_cycles().saturating_sub(COMPGATE_T0_CYC.load(Relaxed)));
+    COMPGATE_MAXHOLD_US.fetch_max(held_us, Relaxed);
+    // Clear the holder BEFORE the release, so a core that wins the gate next never reads a stale
+    // holder and mistakes a live wait for the futile same-core one.
+    COMPGATE_HOLDER_CORE.store(usize::MAX, Relaxed);
+    COMPGATE.store(false, Release);
+    // The hold outlives the release by exactly these two statements: a switch between the release
+    // and the drop is harmless (the gate is already free), while a switch before the release is the
+    // stretched pass this whole block exists to stop.
+    drop(hold);
+    // The selftest, ONCE per boot, from OUTSIDE the gate it tests — after the release and after the
+    // hold is dropped, which is the only point in this function where the gate is free and a
+    // control present can actually enter. Sited here rather than in a battery on a finding, not a
+    // preference: the aarch64 window battery (`hittest_selftest` <- `wcb_launcher` <- `u7_launcher`)
+    // lives inside `main.rs`'s `all(target_arch = "aarch64", feature = "baremetal")` block, so a
+    // call site there is compiled out of every UEFI aarch64 image — `./arroyo test-arm` included —
+    // and the fixture would be a check that cannot fire on the only aarch64 QEMU verb that runs
+    // this arch's UEFI path. Riding the compositor instead means the fixture is present wherever
+    // the thing it gates is present, and on a boot that never composites it costs nothing and
+    // honestly says nothing.
+    #[cfg(feature = "witness")]
+    compgate_selftest_once();
+    #[cfg(feature = "witness")]
+    compgate_rollup();
+}
+
+/// COMPGATE — [`COMPGATE_WAIT_US`] in [`crate::arch::now_cycles`] units, computed from the live
+/// timebase rather than assumed. A zero or unreadable frequency degrades to a budget of zero, i.e.
+/// to an immediate fold — the conservative direction, since a fold is always correct and only a
+/// wait can be too long.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn compgate_wait_budget_cyc() -> u64 {
+    // One µs of cycles, times the budget. `wcg_cycles_to_us` is the inverse and the two are read
+    // against each other on the wire (`maxwait_us=` must never exceed `COMPGATE_WAIT_US`).
+    let one_us = compgate_cyc_per_us();
+    one_us.saturating_mul(COMPGATE_WAIT_US)
+}
+
+/// COMPGATE — `[compgate] enter core=N`, once per core per boot. See [`COMPGATE_ENTER_SEEN`].
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_note_enter(core: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = core.min(COMPGATE_CORES - 1);
+    if COMPGATE_ENTER_SEEN[i].swap(true, Relaxed) {
+        return;
+    }
+    serial_println!(
+        ":: [compgate] enter core={} — this core has taken the composite gate for the first time; \
+         while it holds it no other core and no preempting task on this one can reach the panel, \
+         and its preemption hold is standing ::",
+        core
+    );
+}
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "witness")))]
+#[inline]
+fn compgate_note_enter(_core: usize) {}
+
+/// COMPGATE — `[compgate] fold core=N reason=in-progress`, capped at
+/// [`COMPGATE_EVENT_PRINT_MAX`] lines; the census continues on the rollup.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_note_fold(core: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if COMPGATE_FOLD_PRINTS.fetch_add(1, Relaxed) >= COMPGATE_EVENT_PRINT_MAX {
+        return;
+    }
+    serial_println!(
+        ":: [compgate] fold core={} reason=in-progress holder=c{} — this present did NOT composite \
+         and did NOT clear its damage; it published the pending flag and deferred the sprite \
+         repaint, and the holder's re-run absorbs it. Before this gate it would have fallen to \
+         draw_window's direct unclipped path ::",
+        core,
+        {
+            let h = COMPGATE_HOLDER_CORE.load(Relaxed);
+            if h == usize::MAX { -1 } else { h as isize }
+        }
+    );
+}
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "witness")))]
+#[inline]
+fn compgate_note_fold(_core: usize) {}
+
+/// COMPGATE — `[compgate] wait core=N us=…`, same cap and same reason as the fold line.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_note_wait(core: usize, us: u64, admitted: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if COMPGATE_WAIT_PRINTS.fetch_add(1, Relaxed) >= COMPGATE_EVENT_PRINT_MAX {
+        return;
+    }
+    serial_println!(
+        ":: [compgate] wait core={} us={} bound_us={} outcome={} — a bounded spin for a holder on \
+         another core. It cannot fail to return: the same-core arm never waits and the bound is a \
+         free-running counter read, not a lock ::",
+        core,
+        us,
+        COMPGATE_WAIT_US,
+        if admitted { "entered" } else { "fold" }
+    );
+}
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "witness")))]
+#[inline]
+fn compgate_note_wait(_core: usize, _us: u64, _admitted: bool) {}
+
+/// COMPGATE — the standing census, every [`COMPGATE_ROLLUP_MS`], from the release path.
+///
+/// `folds=` is THE reading: composites that would previously have interleaved their blits with a
+/// pass already on the glass. `blitnet=` is the falsifier laid beside it — a slot above 1 is live
+/// re-entrancy, and `torn>0` with every slot at or below 1 says the tear has another source.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_rollup() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::ms();
+    let last = COMPGATE_ROLLUP_LAST_MS.load(Relaxed);
+    if now.saturating_sub(last) < COMPGATE_ROLLUP_MS {
+        return;
+    }
+    if COMPGATE_ROLLUP_LAST_MS
+        .compare_exchange(last, now, core::sync::atomic::Ordering::AcqRel, Relaxed)
+        .is_err()
+    {
+        return; // another core is printing this period's line
+    }
+    let net = blit_net_snapshot();
+    let entered = COMPGATE_ENTERED.load(Relaxed);
+    let folds = COMPGATE_FOLDS.load(Relaxed);
+    let verdict = if folds > 0 || COMPGATE_WAITS.load(Relaxed) > 0 {
+        "GATED"
+    } else if entered > 0 {
+        "UNCONTENDED"
+    } else {
+        "IDLE"
+    };
+    serial_println!(
+        "[compgate] rollup entered={} folds={} waits={} waitok={} maxwait_us={} reruns={} passes={} maxhold_us={} preempt_deferred={} blitnet=[{},{},{},{},{},{},{},{}] -> {}",
+        entered,
+        folds,
+        COMPGATE_WAITS.load(Relaxed),
+        COMPGATE_WAIT_OK.load(Relaxed),
+        COMPGATE_MAXWAIT_US.load(Relaxed),
+        COMPGATE_RERUNS.load(Relaxed),
+        COMPGATE_PASSES.load(Relaxed),
+        COMPGATE_MAXHOLD_US.load(Relaxed),
+        compgate_preempt_deferrals(),
+        net[0], net[1], net[2], net[3], net[4], net[5], net[6], net[7],
+        verdict
+    );
+}
+
+/// COMPGATE — involuntary switches the preemption hold declined, or 0 where there is no hold.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn compgate_preempt_deferrals() -> u64 {
+    crate::arch::sched::preempt_deferrals()
+}
+#[cfg(all(not(target_arch = "x86_64"), not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn compgate_preempt_deferrals() -> u64 {
+    0
+}
+
+/// COMPGATE — THE NESTED-PRESENT FIXTURE, and what makes it a gate rather than a print.
+///
+/// One-shot per boot, armed on the first pass to take the gate, and it runs from INSIDE that pass —
+/// so the machine state it tests is exactly the defect's: a present in progress, on this core, with
+/// the gate held. It then does the thing the preempt tick does by accident, deliberately: it calls
+/// [`composite`] again.
+///
+/// **The assertion is measured, never asserted.** [`COMPGATE_PASSES`] counts `composite_once`
+/// invocations that actually ran. With the gate, the nested call folds and the delta is ZERO. With
+/// the gate removed — the falsifier is one edit, replacing the acquire block with an unconditional
+/// entry — the nested call runs a whole second pass concurrently with the first and the delta is
+/// ONE. `decl_lock_delta` is the same question asked of the panel instead of the gate: on a machine
+/// with windows on the glass (metal; QEMU virt composites but stages no window) an ungated nested
+/// present loses `stage_for_core().try_lock()` to the outer one and falls to the direct path, which
+/// is `[wc-h]`'s `decl_lock` moving. Zero on virt is the honest reading there and not a pass by
+/// default — the passes delta is what virt actually scores, and it is the one that is red.
+///
+/// The verdict is DERIVED from the two deltas and the fold count, never printed from an intention.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// COMPGATE — completed probe runs. The selftest's PRECONDITION, not a decoration: a run that did
+/// not move this number never got inside a held pass, and a verdict scored off stale deltas would be
+/// a check that cannot fire.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — the last probe's four deltas, published for [`compgate_selftest`] to score. Written
+/// only by the probe, which is one-shot per arming, so a reader that has confirmed
+/// [`COMPGATE_FIXTURE_RUNS`] moved is reading that arming's numbers.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_PASSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_FOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_DECL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_fixture(core: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Spent BEFORE the nested call, so the nested pass cannot re-arm the experiment on itself —
+    // that is what bounds the recursion at depth two on every build, gated or not.
+    if !COMPGATE_FIXTURE_ARMED.swap(false, Relaxed) {
+        return;
+    }
+    let passes0 = COMPGATE_PASSES.load(Relaxed);
+    let folds0 = COMPGATE_FOLDS.load(Relaxed);
+    let waits0 = COMPGATE_WAITS.load(Relaxed);
+    let decl0 = super::wcg::decl_lock_total();
+    composite();
+    let passes = COMPGATE_PASSES.load(Relaxed).saturating_sub(passes0);
+    let folds = COMPGATE_FOLDS.load(Relaxed).saturating_sub(folds0);
+    let waits = COMPGATE_WAITS.load(Relaxed).saturating_sub(waits0);
+    let decl = super::wcg::decl_lock_total().saturating_sub(decl0);
+    let outcome = if passes > 0 {
+        "ran"
+    } else if folds > 0 {
+        "fold"
+    } else if waits > 0 {
+        "wait"
+    } else {
+        "none"
+    };
+    // GATED requires BOTH halves: the nested pass did not run, AND it did not reach the panel's
+    // direct path. `none` is not a pass — a nested call that neither ran nor folded means the gate
+    // was never consulted, which is a broken fixture and reads as UNGATED.
+    let verdict = if passes == 0 && decl == 0 && (folds + waits) > 0 { "GATED" } else { "UNGATED" };
+    // Publish BEFORE the serial write and bump the run counter LAST, so a reader that has seen the
+    // counter move is guaranteed to see this arming's four deltas and never the previous one's.
+    COMPGATE_FIXTURE_PASSES.store(passes, Relaxed);
+    COMPGATE_FIXTURE_FOLDS.store(folds, Relaxed);
+    COMPGATE_FIXTURE_WAITS.store(waits, Relaxed);
+    COMPGATE_FIXTURE_DECL.store(decl, Relaxed);
+    COMPGATE_FIXTURE_RUNS.fetch_add(1, core::sync::atomic::Ordering::Release);
+    serial_println!(
+        "[compgate] fixture core={} nested=1 outcome={} passes_delta={} folds_delta={} waits_delta={} decl_lock_delta={} -> {}",
+        core,
+        outcome,
+        passes,
+        folds,
+        waits,
+        decl,
+        verdict
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// COMPGATE — THE SELFTEST. The battery's line, and the one a render12 flight is read against.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// COMPGATE — is a preemption hold standing on this core? See [`compgate_selftest`] leg 2.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn compgate_hold_standing() -> bool {
+    crate::arch::sched::preempt_hold_standing()
+}
+
+/// COMPGATE — `:: COMPGATE: … PASS ::`, driven from the window battery both arches run.
+///
+/// ## What it is testing, and why a nested present is the right stimulus
+///
+/// The defect is re-entrancy into a composite pass: on this arch the pass runs with interrupts
+/// ENABLED and the quantum is ~12 ms (ORIN-TICKDEFAULT), so a 117 ms present contains about nine
+/// involuntary switches and any task dispatched in one of them may start its own present. Waiting
+/// for that to happen by accident would make the fixture a lottery — it would pass on a quiet boot
+/// whether or not the gate existed, which is the shape of a check that cannot fire. So the stimulus
+/// is DRIVEN: [`compgate_fixture`] calls [`composite`] again from INSIDE a held pass, on this core,
+/// with the hold standing and interrupts unmasked. That is byte-for-byte the machine state a preempt
+/// tick produces, minus the wait.
+///
+/// ## The four legs, and the control that makes them measurements
+///
+/// * **1 — GATED.** The nested present did not composite (`nested_passes=0`), it was actually
+///   refused rather than skipped (`nested_folds + nested_waits > 0`), and it never reached the
+///   panel's direct, unclipped, per-pixel path (`nested_decl_lock=0`). This is the leg that REDS
+///   against the pre-gate build: with the fold arm removed the nested call runs a second
+///   `composite_once` concurrently with the first and `nested_passes` is 1.
+/// * **2 — THE PREEMPTION HOLD ARMS AND RELEASES.** No hold standing before, one standing inside the
+///   guard's scope, none standing after the drop. This is the leaked-hold hazard — a core that never
+///   preempts again — read directly rather than inferred from the absence of a symptom.
+/// * **3 — THE CONTROL, and it is what makes leg 1 a measurement rather than a tautology.** An
+///   UNCONTENDED present, driven with the gate free, must move [`COMPGATE_PASSES`] by at least one.
+///   Without it a build whose pass counter was dead would report `nested_passes=0` and pass leg 1
+///   while compositing nothing at all.
+/// * **4 — NO LIVE RE-ENTRANCY ON THE GLASS.** Every [`BLIT_NET_CORE`] slot at or below 1 after the
+///   drive: no core holds two composite blits at once. This is the falsifier `[wc-h] rollup`'s
+///   `blitnet=` publishes on the wire, asserted here instead of merely printed.
+///
+/// `preempt_deferred=` and `blitnet_max=` ride the line as OBSERVABLES — the numbers the render12
+/// wire is read against — and `drive_ms=` says how long the gated window actually was, so a reader
+/// can see whether a quantum could have elapsed inside it rather than take the claim on trust.
+///
+/// Self-cleaning: it mints no rows and touches no window state. It composites three extra times,
+/// which is what the desktop does anyway.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub fn compgate_selftest() {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+
+    // ── LEG 3: THE CONTROL, taken FIRST and on a free gate, so it cannot be contaminated by the
+    // experiment and so a dead pass counter is caught before anything is scored against it.
+    let p0 = COMPGATE_PASSES.load(Relaxed);
+    composite();
+    let control_passes = COMPGATE_PASSES.load(Relaxed).saturating_sub(p0);
+    let control_ok = control_passes >= 1;
+
+    // ── LEG 2: the preemption hold, read in all three states.
+    let held_before = compgate_hold_standing();
+    let held_during = {
+        let _hold = compgate_preempt_hold();
+        compgate_hold_standing()
+    };
+    let held_after = compgate_hold_standing();
+    let hold_ok = !held_before && held_during && !held_after;
+
+    // ── LEG 1: the nested present, driven from inside a held pass by the probe.
+    let runs0 = COMPGATE_FIXTURE_RUNS.load(Acquire);
+    let deferred0 = compgate_preempt_deferrals();
+    let t0_ms = crate::arch::ms();
+    COMPGATE_FIXTURE_ARMED.store(true, Release);
+    composite();
+    let drive_ms = crate::arch::ms().saturating_sub(t0_ms);
+    let ran = COMPGATE_FIXTURE_RUNS.load(Acquire) != runs0;
+    let n_passes = COMPGATE_FIXTURE_PASSES.load(Relaxed);
+    let n_folds = COMPGATE_FIXTURE_FOLDS.load(Relaxed);
+    let n_waits = COMPGATE_FIXTURE_WAITS.load(Relaxed);
+    let n_decl = COMPGATE_FIXTURE_DECL.load(Relaxed);
+    // `ran` is a precondition of the leg, not a leg of its own: deltas from a probe that never fired
+    // this run are stale, and scoring them would be the check that cannot fire.
+    let gated_ok = ran && n_passes == 0 && n_decl == 0 && (n_folds + n_waits) > 0;
+
+    // ── LEG 4: no core is holding two composite blits.
+    let net = blit_net_snapshot();
+    let mut netmax: i64 = 0;
+    let mut i = 0usize;
+    while i < net.len() {
+        if net[i] > netmax {
+            netmax = net[i];
+        }
+        i += 1;
+    }
+    let net_ok = netmax <= 1;
+
+    let deferred = compgate_preempt_deferrals().saturating_sub(deferred0);
+    let ok = control_ok && hold_ok && gated_ok && net_ok;
+    serial_println!(
+        ":: COMPGATE: nested_ran={} nested_passes={} nested_folds={} nested_waits={} \
+         nested_decl_lock={} gated={} hold_arm={} control_passes={} control={} blitnet_max={} \
+         blitnet={} drive_ms={} preempt_deferred={} wait_bound_us={} -> {} ::",
+        ran as u8,
+        n_passes,
+        n_folds,
+        n_waits,
+        n_decl,
+        gated_ok as u8,
+        hold_ok as u8,
+        control_passes,
+        control_ok as u8,
+        netmax,
+        net_ok as u8,
+        drive_ms,
+        deferred,
+        COMPGATE_WAIT_US,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// COMPGATE — the selftest is an aarch64 `witness` fixture; on every other arch the call site is a
+/// no-op. Declared rather than `#[cfg]`-ed at the call site, so the gate's tail reads the same on
+/// every arch it compiles for.
+#[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+#[inline]
+pub fn compgate_selftest() {}
+
+/// COMPGATE — [`compgate_selftest`], once per boot, driven from the tail of [`comp_gate_pass`].
+///
+/// The latch is spent BEFORE the call, so the three presents the selftest drives reach this same
+/// tail, find it spent and return: the recursion is bounded at the depth the fixture itself needs
+/// and can never become a per-pass fixture on a compositing desktop.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_selftest_once() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    compgate_selftest();
+}
+
+/// COMPGATE — cycles of [`crate::arch::now_cycles`] per microsecond, read from the live timebase on
+/// every call rather than cached. `wcg::cycles_to_us` is the same reader; it is duplicated here
+/// rather than reused because that module is `witness`-gated and this gate is BEHAVIOUR — it must
+/// exist, and be correctly bounded, on the image Peter actually boots.
+///
+/// A firmware that left `CNTFRQ_EL0` at zero degrades to the Pi's 54 MHz rather than dividing by
+/// zero, which is `wcg`'s own fallback and the same number, so the two readings of one clock never
+/// disagree.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn compgate_cyc_per_us() -> u64 {
+    let frq: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+    }
+    let frq = if frq == 0 { 54_000_000 } else { frq };
+    (frq / 1_000_000).max(1)
+}
+
+/// COMPGATE — the inverse. Division rather than [`u64::saturating_mul`] by a million, so a long hold
+/// cannot saturate the numerator and read back as a wrong (rather than merely coarse) duration.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn compgate_cyc_to_us(dt: u64) -> u64 {
+    dt / compgate_cyc_per_us()
+}
+
+/// COMPGATE — no timebase on an arch this kernel does not build for. A per-µs rate of zero makes
+/// [`compgate_wait_budget_cyc`] zero, i.e. the wait arm never spins and every second entrant folds:
+/// correct, just less parallel, and the direction a missing clock must fail in.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn compgate_cyc_per_us() -> u64 {
+    0
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn compgate_cyc_to_us(_dt: u64) -> u64 {
+    0
 }

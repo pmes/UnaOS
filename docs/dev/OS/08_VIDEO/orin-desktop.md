@@ -3764,3 +3764,101 @@ has never been read**: `BLIT_NET_CORE[0]` (wm.rs:9770) is an unconditional per-c
 `BlitGuard`s, and on a single-core board any value > 1 *is* the reentrancy. `blitwho_report`
 (wm.rs:9806) prints it only from the two drain give-up arms, so a healthy-but-reentrant boot says
 nothing — which is why 73 declines went unexplained for a flight.
+
+## COMPGATE — the aarch64 compositor gate against preempt and cross-core re-entrancy (A46)
+
+### The defect, from the wire
+
+render11's rollup reads `[wc-h] rollup win=1 torn=2 decl_lock=73 maxpresent_us=117479`, and the
+three numbers are one mechanism. `decl_lock` is `stage_window`'s `DECL_LOCK` arm —
+`stage_for_core().try_lock()` returned `None` — and that is same-core re-entrancy *by construction*:
+`stage_for_core` indexes `STAGE` by `meter_current_cpu()`, so two different cores never contend for
+one entry. A present that loses the lock falls into `draw_window`'s `if !staged` arm, the pre-WC-H
+DIRECT path: per pixel, through `put_pixel`, straight into the FRONT buffer, and unclipped. That is
+the tear.
+
+`maxpresent_us=117479` is why it happens. This arch composites with interrupts ENABLED — the console
+reaches the compositor through `fbcon::route_present_banded` → `wm::present_banded` →
+`wm::composite` with no mask on the path — and since ORIN-TICKDEFAULT (`98213b7f`) the preemption
+quantum is ~12 ms. A 117 ms present therefore contains about nine involuntary switches, and any task
+dispatched in one of them may start its own present on the same core. With `exec-orin23-apsrun` all
+six cores host EL0 (`el1cores=0x3f`), so the population that can arrive mid-pass is larger still,
+though the DECLINE stays same-core because the buffer is.
+
+### The fix, in two parts
+
+**1. The gate (`video/wm.rs`).** `composite()`'s non-x86 arm was a bare `composite_once()`. It now
+runs `comp_gate_pass()`, x86's `COMP_GATE` shape with three deliberate differences: a cross-core
+entrant may take a bounded 250 µs spin before folding (a console present deferred a whole frame is
+worse on a machine whose panel is the only output); the SAME-CORE entrant never waits, because the
+holder cannot make progress while we own the core; and a held pass is bracketed by a preemption
+hold. There is no arm that reaches `composite_once` without the gate, which is the whole property —
+`draw_window`'s direct unclipped path is now unreachable from a second entrant. A fold clears
+nothing (it returns before the table snapshot, so its damage flags survive) and defers the sprite
+duty through `cursor::owe_repaint`; an unmasked holder then runs up to two extra full passes for its
+folders.
+
+**2. The preemption hold (`arch/aarch64/sched.rs`).** A per-core counter. While it is non-zero the
+two involuntary switch paths — `timer_preempt` and `ipi_preempt` — decline to switch and return.
+Interrupts stay ENABLED: the tick is taken and EOI'd, `arch::ms()` still advances, every other
+interrupt is delivered. Masking interrupts for a 117 ms present was considered and refused — this
+tree has already convicted that shape once (`[comp2] max_us=302134`). Both checks sit ABOVE
+`kill_check_current`, because that function never returns for a killed task and a kill taken inside
+a hold would retire the holder without running its guard's drop, leaving the core unable to preempt
+for the rest of the boot.
+
+### Lock order
+
+`comp_gate_pass` takes, in this order: the `COMPGATE` flag (an `AtomicBool`, not a lock) → the
+per-core preemption hold → and only then, inside the pass, `TABLE` (via `table()`, which masks IRQs
+before it locks) and the panel writers. The reverse order is what would deadlock — a caller holding
+the window table spinning for the gate while the gate's holder waits for the table — and it is
+excluded structurally: `table()` masks IRQs before acquiring, so a TABLE-holding entrant always
+reads `irqs_masked() == true`, and the wait arm is guarded on `!irqs_masked()`. Such an entrant
+folds immediately instead of spinning. The same guard is what keeps `dock_tiles`' table-holding
+callers off the spin.
+
+### The fixture
+
+`wm::compgate_selftest` prints one line, `:: COMPGATE: … PASS ::`. It is driven once per boot from
+the tail of `comp_gate_pass` — after the release and after the hold is dropped, the only point in
+that function where the gate is free — rather than from the window battery, because the aarch64
+battery (`hittest_selftest` ← `wcb_launcher` ← `u7_launcher`) lives inside `main.rs`'s
+`all(target_arch = "aarch64", feature = "baremetal")` block and is compiled out of every UEFI
+aarch64 image. Riding the compositor means the fixture is present wherever the code it gates is
+present.
+
+Waiting for a preempt tick to produce a nested present by accident would make the fixture a lottery,
+so the stimulus is driven: `compgate_fixture` calls `composite()` again from INSIDE a held pass, on
+this core, with the hold standing and interrupts unmasked — the machine state a tick produces, minus
+the wait. Four legs:
+
+1. **GATED** — the nested present did not composite (`nested_passes=0`), was actually refused rather
+   than skipped (`nested_folds + nested_waits > 0`), and never reached the panel's direct path
+   (`nested_decl_lock=0`). This is the leg that reds against the pre-gate build.
+2. **HOLD** — no hold standing before, one standing inside the guard's scope, none after the drop,
+   read through the same predicate the tick path reads.
+3. **CONTROL** — an uncontended present must move `COMPGATE_PASSES` by at least one, so leg 1's zero
+   is a measurement and not a dead counter.
+4. **BLITNET** — every `BLIT_NET_CORE` slot at or below 1: no core holds two composite blits.
+
+A probe that never fired scores `nested_ran=0` and the verdict is FAIL, so a fixture that did not run
+cannot read as a pass.
+
+### What the render12 wire should say
+
+`[wc-h] rollup … decl_lock=0 … blitnet=[…]` with every slot at or below 1, and
+`[compgate] rollup entered=… folds=… waits=… maxhold_us=… preempt_deferred=…`. `folds=` is the
+reading: composites that would previously have interleaved their blits with a pass already on the
+glass. `torn>0` while every `blitnet` slot is at or below 1 says the tear has a different source and
+the diagnosis restarts.
+
+### Limit of the QEMU coverage, stated plainly
+
+No aarch64 QEMU verb in this tree composites on the UEFI virt path: `./arroyo test-arm` builds a
+non-`baremetal` image, so neither the EL0/window battery nor `desktop_firmware` is linked and
+`wm::composite` has no caller on that boot. `strings` confirms the gate and its fixture are IN that
+image; the log carries no `[compgate]` line because the compositor never runs. The verbs whose
+aarch64 image does composite are `kernel8-test` (QEMU raspi4b, `baremetal`) and the Orin metal
+`esp-jetson` flight. The fixture's go-red therefore has not been executed on a run; it is the one
+outstanding item on this arc.

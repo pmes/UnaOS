@@ -5166,6 +5166,17 @@ pub fn timer_preempt() {
     if raw.is_null() {
         return; // scheduler/idle context, or an unscheduled core (the BSP)
     }
+    // COMPGATE — a standing preemption hold declines this boundary. Placed ABOVE the kill check on
+    // purpose: `kill_check_current` NEVER RETURNS for a killed task, so a kill taken at a tick that
+    // landed inside a hold would retire the holder without ever running its guard's drop, and this
+    // core would never preempt again. Above it, a held core simply declines and the task dies at the
+    // first tick after the release. The quantum is deliberately NOT counted down here either — the
+    // held task resumes with what it had rather than being granted a fresh slice. See the COMPGATE
+    // ledger at the file tail for why this is a switch decline and not an interrupt mask.
+    if nopreempt_held(cpu) {
+        NOPREEMPT_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     // SKILL-1 on-CPU kill boundary — the load-bearing one. The quantum tick is the ONLY involuntary
     // boundary a spinning EL0 task ever reaches (it makes no syscalls and never yields), so this is what
     // turns "parked PORPHANED but still burning a core at 100%" into an actual death. Checked BEFORE the
@@ -5234,6 +5245,15 @@ pub fn ipi_preempt() {
     }
     if IN_RQ_SECTION[cpu].load(Ordering::Acquire) != 0 {
         return; // discipline breach (never expected): decline; the quantum trim still bounds the wake
+    }
+    // COMPGATE — the SECOND involuntary switch path, and it needs the same decline for the same
+    // reason: a wake-at-IPI-receipt that lands inside a compositor pass switches the holder out just
+    // as a quantum tick would. Above `kill_check_current` on the identical argument made in
+    // `timer_preempt`. The wake is not lost — the woken task is on the run queue and the quantum
+    // trim `preempt_hint` already applied still bounds when it runs.
+    if nopreempt_held(cpu) {
+        NOPREEMPT_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     // SKILL-1 on-CPU kill boundary, exactly as at the top of `timer_preempt`'s switch arm: this is a
     // legitimate involuntary boundary, so a killed incumbent dies here rather than running on.
@@ -10991,4 +11011,122 @@ fn el0_host_mask() -> u64 {
         c += 1;
     }
     mask
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// COMPGATE — A BOUNDED, PER-CORE PREEMPTION HOLD, AND WHY IT IS NOT AN INTERRUPT MASK.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT THIS SERVES (`video/wm.rs`'s COMPGATE ledger has the full statement). A composite pass
+// on this arch runs with interrupts ENABLED — the console present reaches it through
+// `fbcon::route_present_banded` -> `wm::present_banded` -> `wm::composite` with no mask — and the
+// preemption quantum is `QUANTUM_TICKS` ticks (~12 ms at the 250 Hz tick, this file's own
+// arithmetic). A present measured at 117 ms on the Orin panel therefore takes ~9 involuntary
+// switches inside itself, and every task that runs in those windows is free to start its own
+// present on the same core. The compositor's staging buffer is PER CORE (`wm::STAGE`, indexed by
+// `meter_current_cpu`), so a re-entrant present on the SAME core is the only way its `try_lock` can
+// fail — and it did, 73 times in one Orin flight (`[wc-h] rollup … decl_lock=73`), each one falling
+// through to the direct, unclipped, per-pixel front-buffer path that tears.
+//
+// WHAT THIS IS. A per-core counter. While it is non-zero, the two INVOLUNTARY switch paths on this
+// arch — `timer_preempt` (the quantum tick) and `ipi_preempt` (SPREAD-9's wake-at-IPI-receipt) —
+// decline to switch and return. Nothing else changes: the tick is still taken, the GIC still EOIs,
+// `load_witness_tick` still runs, `arch::ms()` still advances (it reads CNTVCT, not a tick count),
+// and every other interrupt on the machine is delivered normally. The ONLY thing deferred is the
+// context switch, on the one core that asked, for the length of one bounded critical section.
+//
+// WHY NOT `IrqGuard` / a mask. Masking interrupts for the length of a 117 ms present is the cure
+// that is worse than the disease: it stops the timer, the GIC, the UART and the interconnect
+// witnesses on that core for a tenth of a second, and this tree has already convicted exactly that
+// shape once (`[comp2] max_us=302134` under a masked reopening present, `video/wm.rs`). A
+// preemption hold costs the scheduler a deferred switch and costs the hardware nothing.
+//
+// THE THREE HAZARDS, and how each is closed.
+//
+//   1. **A LEAKED HOLD DISABLES PREEMPTION ON A CORE FOREVER.** The hold is an RAII guard whose drop
+//      is the only decrement, and the check below is placed ABOVE `kill_check_current()` in both
+//      switch paths — deliberately. `kill_check_current` NEVER RETURNS for a killed task, so a
+//      kill taken at a tick that landed inside a hold would retire the task without ever running
+//      its guard's drop, and the core would never preempt again. Above the kill check, a held core
+//      simply declines the boundary; the task dies at the first tick after the release, which is at
+//      most one quantum later and is the same death.
+//   2. **A HOLDER THAT YIELDS.** A guard is released by the core that took it (the index is stored
+//      IN the guard, `BlitGuard`'s idiom in `video/wm.rs`), so a migration cannot decrement a
+//      stranger's counter. A holder that blocks would still leave the hold standing on its old core
+//      until it resumes — which is why the compositor's critical section is verified yield-free:
+//      every lock it takes inside the pass is a `spin::Mutex`, and every `DrainBarrier` (the one
+//      structure in that module that can yield) is taken by the MOVE and TEARDOWN paths, outside
+//      `composite_once`.
+//   3. **STARVATION.** The hold is bounded by the pass, and a pass is bounded by the panel: the
+//      quantum is not consumed while the hold stands (this returns before the countdown), so the
+//      held task resumes with its remaining quantum and is preempted at the very next tick after
+//      the release rather than being granted a fresh one.
+//
+// The count of declined boundaries is published rather than assumed — see [`preempt_deferrals`].
+// `deferred=0` on a boot that composited is the statement that no involuntary switch ever landed
+// inside a pass; a rising `deferred=` is the mechanism working, and it is the number to read
+// against `[compgate] rollup maxhold_us=` when the two disagree about how long a pass really is.
+
+/// COMPGATE — per-core preemption-hold depth. Non-zero on core `c` = the two involuntary switch
+/// paths decline on `c`. Nested holds are counted, not flagged, so an inner section cannot release
+/// an outer one's hold.
+static NOPREEMPT: [AtomicU32; NUM_CPUS] = [const { AtomicU32::new(0) }; NUM_CPUS];
+
+/// COMPGATE — involuntary switch boundaries declined because a hold was standing. Gauge, never
+/// drained; published by [`preempt_deferrals`].
+static NOPREEMPT_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// COMPGATE — is a preemption hold standing on `cpu`? One relaxed load on the tick path.
+#[inline]
+fn nopreempt_held(cpu: usize) -> bool {
+    cpu < NUM_CPUS && NOPREEMPT[cpu].load(Ordering::Relaxed) != 0
+}
+
+/// COMPGATE — a standing preemption hold on the core that took it. Drop releases it.
+///
+/// The core index is captured at acquisition and used at release, so a task that MIGRATES between
+/// the two decrements the counter it incremented. That is the same reason `wm::BlitGuard` stores its
+/// enter-core rather than re-reading it at drop.
+pub struct PreemptHold {
+    core: usize,
+}
+
+/// COMPGATE — take a preemption hold on this core. See the ledger above for the contract; the caller
+/// must keep the section BOUNDED and free of voluntary yields.
+#[inline]
+pub fn preempt_hold() -> PreemptHold {
+    let core = meter_current_cpu().min(NUM_CPUS - 1);
+    NOPREEMPT[core].fetch_add(1, Ordering::AcqRel);
+    PreemptHold { core }
+}
+
+impl Drop for PreemptHold {
+    fn drop(&mut self) {
+        // Saturating rather than a bare `fetch_sub`: an underflow would wrap to `u32::MAX` and
+        // disable preemption on this core for the rest of the boot, which is the one failure mode
+        // this whole block exists to make impossible.
+        let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
+    }
+}
+
+/// COMPGATE — how many involuntary switch boundaries have been declined by a standing hold.
+pub fn preempt_deferrals() -> u64 {
+    NOPREEMPT_DEFERRED.load(Ordering::Relaxed)
+}
+
+/// COMPGATE — is a hold standing on THIS core, read through the SAME predicate the two switch paths
+/// read?
+///
+/// It calls [`nopreempt_held`] rather than re-deriving the test, deliberately: a fixture that asked
+/// the question its own way could report a hold the tick path does not honour, which is exactly the
+/// failure it exists to detect. `video/wm.rs`'s `compgate_selftest` leg 2 reads it in all three
+/// states — before, inside, after — so the leaked-hold hazard (a core that never preempts again) is
+/// measured rather than inferred from the absence of a symptom.
+pub fn preempt_hold_standing() -> bool {
+    // The SAME clamp [`preempt_hold`] applies, so the slot read is the slot written. Without it a
+    // core index at or beyond `NUM_CPUS` would take its hold on the last slot and then read `false`
+    // from this function, and the fixture would red on a machine whose gate was working.
+    nopreempt_held(meter_current_cpu().min(NUM_CPUS - 1))
 }
