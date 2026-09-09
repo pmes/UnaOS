@@ -45,6 +45,43 @@ OWNERS = {"orin", "pi", "rmbp", "shared-gate"}
 # run, and one that no longer matches a real mismatch goes RED. An allowlist nothing can falsify is
 # the thing this lane keeps convicting (rmbp-ledger B95/B96/B98/B101), so this one is falsifiable in
 # both directions. Both entries must reach zero; neither is a decision to leave the row broken.
+# GATE-LEDGER ABSENCE FORM (rmbp-ledger B107, built rmbp 17 2026-09-09). A row that asserts a thing
+# is ABSENT FROM A POPULATION has to name the population and show it was ENUMERATED. Three times in
+# one round this seat wrote "nothing does X" after searching one FILE, and the claim was about a
+# CAPABILITY; each search was correct about its scope and confidence tracked thoroughness WITHIN the
+# scope, which is exactly what a scope error cannot show you. orin 23's form, adopted: an absence is
+# written `population=<the command that enumerates it>, hits=0`, or it is written "not found in
+# <scope>". The moment it fires is typing the word -- which is what makes it addressable at all.
+#
+# ⛔ WHAT THIS CHECK IS AND IS NOT, because overselling it would be the defect it exists for.
+# It is a LEXICAL SAMPLER over phrasings that were thought of, NOT proof that every absence claim in
+# the corpus is enumerated -- "all the ways English says nothing does X" is itself a population that
+# cannot be enumerated, so this gate has a blind spot BY CONSTRUCTION and its own summary says so.
+# A green here means "no row matched a known absence phrasing without an enumeration", never
+# "every absence claim is sound".
+#
+# MEASURED BEFORE IT SHIPPED, and the measurement chose the pattern list. A WIDE set (no such / is
+# not in / none of them / does not exist / zero hits / ...) matched 32 of 213 rows and would have RED-
+# LINED 10, of which roughly 8 were FALSE POSITIVES: quoted program output ("no such file or
+# directory" in an -ENOENT log line), a correction of a PEER's claim, a statement about a Rust type,
+# and rows whose proof was real but not command-shaped. A gate reding honest rows in two other seats'
+# files is worse than the defect, so the wide set was DROPPED rather than papered over with
+# exceptions. The TIGHT set below matched 9 rows, every one a genuine population-absence claim, and
+# all 9 are this lane's own -- zero in orin's or pi's ledgers today.
+ABSENCE_PHRASE = re.compile(
+    r"\b(no [a-z]+ verb|run by nothing|nothing (?:runs|invokes|opens|does) |exists? only on"
+    r"|on no other head|zero commits|no commits on any branch)\b", re.I)
+# An enumeration is a COMMAND that walks the population, or the honest downgrade "not found in".
+ABSENCE_ENUM = re.compile(
+    r"`[^`]*(grep|git log|git grep|git cat-file|git rev-list|ls |find |for [a-z] in|awk)[^`]*`"
+    r"|not found in", re.I)
+ABSENCE_REG = {
+    # Same falsifiable shape as FIELDCOUNT_REG: printed every run, and a registration whose row no
+    # longer matches goes RED. Empty today -- every matching row already carries its enumeration.
+}
+abs_seen = set()
+absence = []
+
 FIELDCOUNT_REG = {
     "docs/dev/OS/rmbp-ledger.md:B24": "three injections put TWO rows' content on one line; splitting them is a CONTENT call, and the ledger-cell pipe convention it belongs to is Peter's open decision (rmbp-ledger J6). Registered 2026-09-08 by rmbp 17",
     "docs/dev/OS/orin-ledger.md:C10": "another seat's ledger file — one field over its 6-column header; reported to orin, theirs to fix under their own lane. Registered 2026-09-08 by rmbp 17",
@@ -187,6 +224,15 @@ for path in files:
                     red.append(f"{where}: {rid} has {len(cells)} fields, header has {len(hdr)} ({_d:+d}) — {_why}")
                 continue
             if rid in ids: red.append(f"{where}: duplicate id {rid}")
+            _rowtext = " | ".join(cells)
+            _ap = ABSENCE_PHRASE.search(_rowtext)
+            if _ap and not ABSENCE_ENUM.search(_rowtext):
+                _k = f"{path}:{rid}"
+                if _k in ABSENCE_REG:
+                    abs_seen.add(_k)
+                    absence.append(f"{where}: {rid} absence claim {_ap.group(0)!r} REGISTERED — {ABSENCE_REG[_k]}")
+                else:
+                    red.append(f"{where}: {rid} asserts an absence ({_ap.group(0)!r}) and names no ENUMERATION — give the command that walks the population, or write \"not found in <scope>\"")
             ids.add(rid)
             status_raw = cells[st] if st < len(cells) else ""
             status = re.sub(r"[*_`]", "", status_raw).strip()
@@ -350,6 +396,13 @@ if "docs/dev/LEDGER.md" in files:
 
 # A REGISTRATION THAT NO LONGER MATCHES ANYTHING IS ITSELF A FINDING — the allowlist has to be
 # falsifiable or it becomes the place defects go to be forgotten. Skipped for a file not in this tree.
+for _k, _why in ABSENCE_REG.items():
+    if _k not in abs_seen and _k.split(":")[0] in files:
+        red.append(f"stale absence registration {_k} — the row enumerates now; delete the entry ({_why})")
+if absence:
+    say(f"ABSENCE — {len(absence)} registered exception(s); NOT findings, and each must reach zero:")
+    for a in absence: print("   ", a)
+
 for _k, _why in FIELDCOUNT_REG.items():
     if _k not in fc_seen and _k.split(":")[0] in files:
         red.append(f"stale field-count registration {_k} — the row parses correctly now; delete the entry ({_why})")
@@ -374,7 +427,7 @@ if red:
     for r in red: print("   ", r)
     sys.exit(1)
 _defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
-say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, field counts match their header, status ∈ enum, owners known, cross-refs resolve{_defnote}, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
+say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve{_defnote}, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
 PY
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
