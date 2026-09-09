@@ -51,7 +51,7 @@
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
 //! router itself; the SHARD menu ([`super::crystal`]) claims the crystal's corner cell
-//! ([`crystal_corner_abs`] — FITTS-CORNER, the bar's whole upper-left corner, not just the glyph)
+//! ([`crystal_corner_abs`] — FITTS-CORNER, the bar's whole upper-RIGHT corner since SO4, not just the glyph)
 //! through the ONE shared furniture router [`strip::press_route`], which both arch routers call
 //! ahead of every window arm.
 //! Every other point on the bar falls through to whatever is behind it. The witness line says so
@@ -105,7 +105,8 @@
 //!
 //! # The crystal — UnaOS's mark, where macOS puts its apple
 //!
-//! A small faceted gem at the left edge, `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
+//! A small faceted gem at the RIGHT edge since SO4 (Peter, render7: *"it should be all the way to the
+//! right edge"*) — where macOS puts its status group, not its apple. `CRYSTAL_W`x`CRYSTAL_H` (16x22), sized from
 //! [`theme::CONTROL_BOX`] so it reads as the same size-family as the window's traffic-light controls.
 //! It is drawn from the kit's OWN blue accent ramp — three facets lit from the top-right, the
 //! high-contrast seam down the crown reading as a facet edge — reusing three lifted roles `theme.rs`
@@ -160,6 +161,30 @@ const CELL_H: usize = wm::TITLE_CELL_H;
 /// glyph calls below can never disagree about which face the bar is drawing.
 const FACE: super::font::Face = super::font::Face::Chrome;
 
+/// SO2 — **the caption's WEIGHT.** The bar draws its app name bold (macOS's rule, recorded at the
+/// `draw_row` call in [`compose_row`]) and its clock regular. It is a `const` rather than a literal
+/// at the call site because [`super::winmenu`] now draws with it too: R21's menus are the bar's own
+/// text, and Peter's SO2 reading of `render7` — *"misplaced and different font from main app menu
+/// item font"* — was exactly this, a window menu set in the bar's face at the bar's cell but NOT at
+/// the bar's weight, so the drop-down read as a different typeface from the name it hangs under.
+const BOLD: bool = true;
+
+/// SO2 — **THE BAR'S TYPE, exported as one set.** `winmenu` took its face and cell from
+/// [`super::crystal`]'s dropdown constants, which happen to resolve to the same atlas — so the two
+/// agreed by coincidence, through a third party, and the one attribute that did NOT come along was
+/// the weight. These four name the bar's own type so a client draws the BAR'S text by construction,
+/// and [`BAR_FONT_NAME`] is what the `[winmenu] open … font=` witness prints, so a capture states
+/// which type the drop-down was set in instead of leaving it to be inferred from pixels.
+pub const BAR_FACE: super::font::Face = FACE;
+/// SO2 — the bar's glyph advance, px. See [`BAR_FACE`].
+pub const BAR_CELL_W: usize = CELL_W;
+/// SO2 — the bar's glyph cell height, px. See [`BAR_FACE`].
+pub const BAR_CELL_H: usize = CELL_H;
+/// SO2 — the bar's text weight. See [`BAR_FACE`].
+pub const BAR_BOLD: bool = BOLD;
+/// SO2 — the bar's type, named for the wire. See [`BAR_FACE`].
+pub const BAR_FONT_NAME: &str = "chrome20-bold";
+
 /// The clock's rendered width in glyphs: `HH:MM`.
 const CLOCK_GLYPHS: usize = 5;
 
@@ -196,9 +221,31 @@ const CRYSTAL_W: usize = theme::CONTROL_BOX * 2 / 3;
 /// the pavilion (the rest) tapers to the point. Two-fifths, the classic brilliant-cut proportion.
 const CRYSTAL_CROWN_H: usize = CRYSTAL_H * 2 / 5;
 
-/// The title's left inset when the crystal is present: past the crystal and one more gap. macOS puts
-/// the logo leftmost and the app menus to its right; the caption takes that same slot here.
-const TITLE_X0: usize = strip::PAD + CRYSTAL_W + strip::PAD;
+/// SO4 — **the crystal's RIGHT SLOT**, and the whole of the geometry rule this arc changes.
+///
+/// Peter, render7 2026-09-06: *"crystal menu has a gap to the left as should be seen in scr 5 and it
+/// should be all the way to the right edge"*. The mark used to sit one [`strip::PAD`] in from the bar's
+/// LEFT edge, where macOS puts its apple, and its dropdown hung from that inset at `+12`. It now sits
+/// FLUSH to the bar's RIGHT edge — where macOS puts its STATUS group — with zero outside inset: the gap
+/// he named is the one this constant refuses to spend. The slot is the glyph plus one PAD of clearance
+/// on its INNER (left) side, which is what separates the mark from the clock beside it.
+const CRYSTAL_SLOT: usize = CRYSTAL_W + strip::PAD;
+
+/// The title's left inset. With the crystal moved to the RIGHT edge (SO4) the caption no longer has to
+/// start past it, so it takes the bar's own left inset — one [`strip::PAD`] — and the bar reads
+/// caption, then menus, from the very left edge with nothing before them.
+const TITLE_X0: usize = strip::PAD;
+
+/// WINMENU (R21) — **the caption's SLOT, which is fixed-width, and where the window's menus begin.**
+///
+/// The caption is drawn at [`TITLE_X0`] and is between 0 and [`wm::MAX_TITLE`] glyphs long. If the
+/// menu titles began after the caption's RENDERED width they would slide left and right every time
+/// the focused window changed — and a press would then be judged against a layout the operator was
+/// not looking at when they aimed. So the caption gets a slot of its full stored width plus one
+/// glyph of gap, and the menus start at a constant offset whatever is in it. macOS's bar has the same
+/// property for the same reason (its app name is bold and its menus do not reflow under it); the
+/// difference is only that this kernel's caption is bounded, so the slot can be a `const`.
+const MENUS_X0: usize = TITLE_X0 + (wm::MAX_TITLE + 1) * CELL_W;
 
 /// The panel height below which the bar declines.
 ///
@@ -209,13 +256,14 @@ const TITLE_X0: usize = strip::PAD + CRYSTAL_W + strip::PAD;
 /// back and the bar is a convenience, so the bar is the one that yields.
 const FLOOR_H: usize = BAR_H + super::dock::STRIP_H + 2 * strip::PAD;
 
-/// The panel width below which the bar declines: both insets, the clock, and at least one glyph of
-/// title. Below it the bar would be a strip with nothing legible on it.
+/// The panel width below which the bar declines: the insets, the clock, the crystal's slot, and at
+/// least one glyph of title. Below it the bar would be a strip with nothing legible on it.
 ///
-/// The `+ CRYSTAL_W` term is the brand mark's own left slot: the crystal pushes the title inset right,
-/// so the floor that guarantees "crystal, one title glyph, and the clock all fit" grows by exactly the
-/// crystal's width. Still far below every suite panel (160 vs 640/1280/1920), so no gate declines.
-const FLOOR_W: usize = 4 * strip::PAD + CRYSTAL_W + (CLOCK_GLYPHS + 1) * CELL_W;
+/// The `+ CRYSTAL_SLOT` term is the brand mark's own slot. SO4 moved that slot from the bar's left to
+/// its right and dropped the outside inset, so the floor loses one [`strip::PAD`] and is otherwise the
+/// same arithmetic: the crystal costs the bar its width and one gap wherever it sits. Still far below
+/// every suite panel (152 vs 640/1280/1920), so no gate declines.
+const FLOOR_W: usize = 3 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W;
 
 const _: () = {
     // The caption must fit inside the bar it is centred in, or there is nothing to draw.
@@ -236,18 +284,17 @@ const _: () = {
     assert!(CRYSTAL_CROWN_H > 0);
     assert!(CRYSTAL_CROWN_H < CRYSTAL_H);
     assert!(CRYSTAL_W >= 4);
-    // The crystal and the clock must not collide on the SMALLEST panel the bar draws on. The crystal
-    // occupies `[PAD, PAD + CRYSTAL_W)` and the clock `[FLOOR_W - PAD - CLOCK_GLYPHS*CELL_W, FLOOR_W - PAD)`;
-    // this is the gap between them staying positive, so a future metric change that would overlap them
-    // fails the BUILD rather than painting the gem over the time.
-    assert!(strip::PAD + CRYSTAL_W < FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
-    // The title, shifted past the crystal, must still leave room for at least one glyph before the
-    // clock on the floor panel.
-    assert!(TITLE_X0 + CELL_W <= FLOOR_W - strip::PAD - CLOCK_GLYPHS * CELL_W);
-    // FITTS-CORNER: the press cell (`crystal_corner_abs`, TITLE_X0 wide by the bar's height) must
-    // CONTAIN the painted glyph box, or a press on the visible mark could miss its own menu. The
-    // horizontal half is the load-bearing one; vertical containment is the bevel assert above.
-    assert!(strip::PAD + CRYSTAL_W <= TITLE_X0);
+    // SO4 — the crystal and the clock must not collide on the SMALLEST panel the bar draws on. They
+    // are now NEIGHBOURS at the right end: the crystal owns `[FLOOR_W - CRYSTAL_W, FLOOR_W)` and the
+    // clock ends one PAD before it. This is the clock's left edge staying to the right of the title's
+    // first glyph, so a metric change that would slide the time under the caption fails the BUILD.
+    assert!(TITLE_X0 + CELL_W <= FLOOR_W - CRYSTAL_SLOT - strip::PAD - CLOCK_GLYPHS * CELL_W);
+    // The crystal's slot must fit in the floor panel at all, with the clock's own slot beside it.
+    assert!(CRYSTAL_SLOT + strip::PAD + CLOCK_GLYPHS * CELL_W < FLOOR_W);
+    // FITTS-CORNER: the press cell (`crystal_corner_abs`, CRYSTAL_SLOT wide by the bar's height, at the
+    // bar's RIGHT end) must CONTAIN the painted glyph box, or a press on the visible mark could miss its
+    // own menu. The horizontal half is the load-bearing one; vertical containment is the bevel assert.
+    assert!(CRYSTAL_W <= CRYSTAL_SLOT);
 };
 
 // ---------------------------------------------------------------------------
@@ -638,11 +685,40 @@ struct Model {
     title_len: usize,
     /// `HH:MM`, or `None` while the civil clock has never been anchored this boot.
     clock: Option<[u8; CLOCK_GLYPHS]>,
+    /// WINMENU (R21) — **the window whose menus this bar is showing**: the FRONTMOST VISIBLE row that
+    /// has published a tree, or [`wm::WIN_NONE`].
+    ///
+    /// ⚠ It is deliberately NOT the same reduction as the caption's, and the difference is a fact
+    /// about this kernel rather than a taste call. The caption's `focused` flag is an OWNER-ASID
+    /// match, and the click router hands SHELL focus (asid `0`) to a press on kernel furniture
+    /// (`is_kernel_owner`) — so the first publisher this arc has, [`super::pulsewin`], can never be
+    /// `focused` by that test and an owner-keyed menu selection would show nothing for the one window
+    /// it exists to serve. "Frontmost visible publisher" is what an operator means by *the window in
+    /// front*, is computed from the same single [`wm::dock_scan`] the caption already runs, and is
+    /// stated on the wire (`[winmenu] publish owner=`) so the two readings can be compared rather
+    /// than confused.
+    menu_owner: wm::WinId,
+    /// SO3 — **the window the CAPTION names**, i.e. the row [`title`](Self::title) was taken from.
+    /// Distinct from [`menu_owner`](Self::menu_owner) on purpose: that one is the frontmost
+    /// PUBLISHER and this one is the frontmost FOCUSED row, and they differ whenever a window with
+    /// menus sits behind a window without them. The app menu belongs to the name the operator is
+    /// reading, so `Quit` must reap THIS row and not the publisher's.
+    cap_owner: wm::WinId,
+    /// WINMENU — the title boxes, laid out once per compose and handed to the row painter. Filled in
+    /// by [`compose`] after the rect is settled, because the layout is a function of the bar rect.
+    menus: super::winmenu::BarSnapshot,
 }
 
 impl Model {
     fn empty() -> Model {
-        Model { title: [0; wm::MAX_TITLE], title_len: 0, clock: None }
+        Model {
+            title: [0; wm::MAX_TITLE],
+            title_len: 0,
+            clock: None,
+            menu_owner: wm::WIN_NONE,
+            cap_owner: wm::WIN_NONE,
+            menus: super::winmenu::BarSnapshot::empty(),
+        }
     }
 
     /// The FOCUSED window's caption plus the wall clock.
@@ -663,17 +739,39 @@ impl Model {
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
         let (n, clobbered) = wm::dock_scan(&mut rows, painted);
         let mut best_z = 0u32;
+        // WINMENU — the SECOND reduction, over the SAME scan: the frontmost visible PUBLISHER. It is
+        // separate from the caption's because `focused` is an owner match and kernel furniture takes
+        // shell focus; see [`Model::menu_owner`]. `winmenu::has_tree` is lock-free
+        // (`WINMENU_MAX` relaxed loads, short-circuited to nothing when nothing has published), so
+        // this costs a boot with no menus one atomic and no second table walk.
+        let (mut menu_z, mut menu_owner) = (0u32, wm::WIN_NONE);
         for r in rows[..n].iter() {
-            if !r.focused || !r.visible {
+            // PANEL V-4 — `wm::info` is LAZY, below both guards. It takes `wm::TABLE` with IRQs
+            // masked (`wm::table`, and `wm.rs`'s standing rule about that critical section), so
+            // hoisting it above the guards turned one masked acquisition per bar compose into up to
+            // `MAX_WINDOWS` of them, on every composite, on every gated build — a regression against
+            // trunk, and it silently falsified the claim three lines up: the `has_tree`
+            // short-circuit cannot save a boot with no menus if `z` is computed before it is asked.
+            let publisher = r.visible && super::winmenu::has_tree(r.id);
+            if !publisher && (!r.focused || !r.visible) {
                 continue;
             }
             let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
+            if publisher && (menu_owner == wm::WIN_NONE || z >= menu_z) {
+                menu_z = z;
+                menu_owner = r.id;
+            }
+            if !r.focused || !r.visible {
+                continue;
+            }
             if z >= best_z {
                 best_z = z;
                 m.title_len = r.title_len.min(wm::MAX_TITLE);
                 m.title = r.title;
+                m.cap_owner = r.id; // SO3 — the app menu's owner is the row the caption came from
             }
         }
+        m.menu_owner = menu_owner;
         m.clock = clock_hhmm();
         (m, clobbered)
     }
@@ -701,6 +799,12 @@ impl Model {
             }
             None => h = strip::fnv1a(h, 0),
         }
+        // WINMENU — the title boxes are part of what the painter reads, so they are part of the
+        // "has anything changed?" test. A title that appears, moves, is relabelled or OPENS must
+        // repaint the bar; without this fold the bar would keep a stale set of menus on the glass for
+        // as long as the caption and the clock happened not to move, which on a quiet desktop is
+        // minutes. (The two lists are the same list on purpose — this function's own rule.)
+        h = strip::fnv1a_u64(h, self.menus.signature());
         strip::seal(h)
     }
 }
@@ -788,11 +892,33 @@ pub fn compose() -> bool {
     // CLOBBER-REPAIR (PA41) — the model AND the damage question, from the ONE table scan `dock_scan`
     // already ran for the caption. The rect asked about is what the bar last PAINTED, never what it is
     // about to paint: the question is whether those pixels survived.
-    let (model, clobbered) = if rect.is_some() {
+    let (mut model, clobbered) = if rect.is_some() {
         Model::read(SLOT.rect())
     } else {
         (Model::empty(), false)
     };
+    // WINMENU (R21) — publish which window's menus the bar is showing, then take the title layout
+    // for it. ORDER matters: `set_bar_owner` is what an input-path press reads to find out whose menu
+    // it hit (so no press ever takes the window table's lock for that), and it dismisses an open
+    // dropdown whose window has just stopped being frontmost — which must happen BEFORE the snapshot
+    // is taken, or this pass would lay out a title box for a menu that is about to be torn down.
+    super::winmenu::set_bar_owner(model.menu_owner);
+    // SO3 (Peter's ruling) — publish the CAPTION and the row it names, so the bar's app title is a
+    // menu title like any other. Lock-free stores only; like `set_bar_owner` above this runs INSIDE
+    // `strip::compose_all`, so an owner change here clears menu STATE and never drives a composite
+    // (PANEL V-1's rule, and `winmenu::compose` discharges the erase later in this same pass).
+    super::winmenu::set_app_window(model.cap_owner, &model.title[..model.title_len]);
+    model.menus = match rect {
+        Some(_) => super::winmenu::bar_boxes(pw, ph),
+        None => super::winmenu::BarSnapshot::empty(),
+    };
+    // PANEL V-3 — the winmenu registry was CONTENDED taking that snapshot, so it lays out no titles
+    // for a reason that has nothing to do with what is published. Painting it would repaint the bar
+    // BLANK for one frame and change its signature to match, so the flicker would be recorded as the
+    // truth. DECLINE the pass instead — `strip::paint`'s own rule — and re-ask next composite.
+    if model.menus.busy {
+        return false;
+    }
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
@@ -838,20 +964,21 @@ pub fn compose() -> bool {
     true
 }
 
-/// The crystal's box-relative top-left in the bar: one [`strip::PAD`] from the left, centred
-/// vertically. THE ONE offset both the painter and [`crystal_box`] read, so the mark the fixture
-/// witnesses is the mark the painter drew.
+/// SO4 — the crystal's box-relative top-left in the bar: FLUSH to the bar's right edge (no outside
+/// inset — "all the way to the right edge"), centred vertically. THE ONE offset both the painter and
+/// [`crystal_box`] read, so the mark the fixture witnesses is the mark the painter drew. A bar too
+/// narrow to seat the glyph answers 0 rather than wrapping, and the floor asserts forbid that panel.
 #[inline]
-fn crystal_offset(h: usize) -> (usize, usize) {
-    (strip::PAD, (h - CRYSTAL_H) / 2)
+fn crystal_offset(w: usize, h: usize) -> (usize, usize) {
+    (w.saturating_sub(CRYSTAL_W), (h - CRYSTAL_H) / 2)
 }
 
 /// The crystal's rect on the PANEL, for the witness — `(x, y, w, h)`, absolute. A function of the bar
 /// rect and nothing else, so `crystal=WxH+X+Y` on the fixture line is falsifiable against where the
 /// painter put it.
 fn crystal_box(r: strip::Rect) -> (usize, usize, usize, usize) {
-    let (rx, ry, _w, h) = r;
-    let (ox, oy) = crystal_offset(h);
+    let (rx, ry, w, h) = r;
+    let (ox, oy) = crystal_offset(w, h);
     (rx + ox, ry + oy, CRYSTAL_W, CRYSTAL_H)
 }
 
@@ -873,10 +1000,10 @@ pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// ways here: [`crystal_box_abs`] stays the painter's and the dropdown-anchor's truth, and this cell
 /// is what the click router hits against.
 ///
-/// Derived, not hardcoded: anchored at the bar rect's own origin (the true panel corner — the bar is
-/// `frame_flush(Top)`, so `(0,0)` is inside by construction), spanning the crystal's whole left slot
-/// — [`TITLE_X0`] wide (`PAD + CRYSTAL_W + PAD`, everything left of the title's inset, i.e. the glyph
-/// cell with both of its margins) by the bar's full height. Every pixel of the cell is a pixel the
+/// Derived, not hardcoded. SO4 MIRRORED it: the cell is now the bar's upper-RIGHT corner, because that
+/// is where the mark went, and the Fitts argument is a property of a CORNER, not of the left one. It
+/// spans the crystal's whole slot — [`CRYSTAL_SLOT`] wide (`CRYSTAL_W + PAD`: the glyph flush to the
+/// right edge plus its inner margin) by the bar's full height. Every pixel of the cell is a pixel the
 /// BAR paints and composites above the windows, so widening the press target to it steals nothing: a
 /// window dragged under the corner is under the bar there, and a press on visible bar chrome routing
 /// to bar furniture is the fixed-furniture rule, not an exception to it.
@@ -884,8 +1011,58 @@ pub fn crystal_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
 /// `None` exactly when [`crystal_box_abs`] is `None` (bar disabled, or the panel cannot host it), so
 /// a press with no bar still falls through to the arms below.
 pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
-    let (bx, by, _bw, bh) = strip_rect(pw, ph)?;
-    Some((bx, by, TITLE_X0, bh))
+    let (bx, by, bw, bh) = strip_rect(pw, ph)?;
+    Some((bx + bw.saturating_sub(CRYSTAL_SLOT), by, CRYSTAL_SLOT.min(bw), bh))
+}
+
+/// WINMENU (R21) — **where the focused window's menu titles begin**, as an offset from the bar's own
+/// origin. See [`MENUS_X0`]: a fixed slot, so the titles do not slide when the caption changes.
+#[inline]
+pub fn menus_x0() -> usize {
+    MENUS_X0
+}
+
+/// SO3 — **where the CAPTION's glyphs begin**, as an offset from the bar's own origin: [`TITLE_X0`],
+/// the same constant [`compose_row`] hands `draw_row`.
+///
+/// Peter's ruling (SO3, 2026-09-06): *every* app window's name in the bar must open a menu carrying
+/// at least **Quit**. The name is drawn HERE and nowhere else, so this is the anchor the app-menu
+/// title box is laid out around ([`super::winmenu::bar_boxes`]) — one constant, one accessor, so the
+/// box a press lands in is the box the caption's glyphs were drawn in. Exported rather than
+/// duplicated for the reason `crystal_box_abs` records for the brand mark.
+#[inline]
+pub fn caption_x0() -> usize {
+    TITLE_X0
+}
+
+/// WINMENU (R21) — **the panel-absolute x the menu titles must stop before**: the clock's left edge,
+/// less one [`strip::PAD`].
+///
+/// Derived from the SAME terms [`compose_row`] draws the clock at ([`CLOCK_GLYPHS`], [`strip::PAD`] and
+/// — since SO4 — [`CRYSTAL_SLOT`], because the clock now sits INSIDE the crystal rather than at the far
+/// edge) rather than restated, so a title can never be laid out under the time or under the mark. A bar
+/// too narrow to hold them answers its own left edge, which lays out no titles.
+pub fn menus_right_limit(bar: strip::Rect) -> usize {
+    let (bx, _by, bw, _bh) = bar;
+    let need = CRYSTAL_SLOT + 2 * strip::PAD + CLOCK_GLYPHS * CELL_W;
+    bx + bw.saturating_sub(need)
+}
+
+/// **THE ONE transient-dropdown accessor** — the rect of whichever menu is currently down, or `None`.
+///
+/// `wm::occ_clip`, `wm::composite_inner`'s sprite arm and `screen::present_background` each ask "where
+/// is the open dropdown" exactly once, and before R21 each asked [`super::crystal::open_rect`] by
+/// name. There are now TWO surfaces that can be that dropdown — the SHARD menu and a window menu —
+/// and `wm::MENU_OCC_MAX` reserves capacity for ONE.
+///
+/// That budget is not a bet. The two are mutually exclusive BY CONSTRUCTION: `winmenu::press_at` runs
+/// first in [`strip::press_route`] and consumes every press while a window menu is down (so the
+/// crystal's closed-corner arm is unreachable), and its own closed arm declines every point while
+/// [`super::crystal::is_open`] (so the crystal keeps its dismiss-outside press). `winmenu`'s header
+/// states that argument where it is enforced. This function is the reading of it: at most one arm
+/// can answer `Some`, so the three sites keep asking one question and `MENU_OCC_MAX` stays 1.
+pub fn open_dropdown_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
+    super::crystal::open_rect(pw, ph).or_else(|| super::winmenu::open_rect(pw, ph))
 }
 
 /// Half the crystal's silhouette width at box-relative row `v`, in px.
@@ -955,9 +1132,9 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         out[i] = fill;
     }
 
-    // The brand CRYSTAL, overlaid at the left. Drawn BEFORE the text early-return because the gem
-    // spans more rows than the glyph cell does — it is centred in the whole bar, not the text band.
-    let (cx0, cy0) = crystal_offset(h);
+    // The brand CRYSTAL, overlaid at the RIGHT edge (SO4). Drawn BEFORE the text early-return because
+    // the gem spans more rows than the glyph cell does — it is centred in the whole bar, not the band.
+    let (cx0, cy0) = crystal_offset(w, h);
     if j >= cy0 && j < cy0 + CRYSTAL_H {
         let v = j - cy0;
         for u in 0..CRYSTAL_W {
@@ -972,6 +1149,18 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
 
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL_H) / 2;
+
+    // WINMENU (R21) — **the focused window's MENU TITLES, in the bar.** Peter: *"menus belong in the
+    // menu bar"*. Overlaid here, in the bar's own single paint, rather than composited as a second
+    // surface on top of it — a title is bar chrome, and a strip that had to be repainted every time a
+    // title lit would be two damage models for one row of pixels.
+    //
+    // It is BEFORE the text-band early-return because an OPEN title's box is filled for the bar's
+    // whole height (the dropdown reads as hanging from a lit title, not floating under a flat strip),
+    // and that fill lands on rows the caption never touches. `winmenu::draw_bar_row` is handed the
+    // band (`ty0`) rather than recomputing it, so a title's baseline cannot drift from the caption's.
+    super::winmenu::draw_bar_row(out, w, &m.menus, j, ty0);
+
     if j < ty0 || j >= ty0 + CELL_H {
         return;
     }
@@ -985,15 +1174,22 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // painted (a RAM scratch row — the read the blend does is cached, never a panel mapping).
     // BOLD, the weight macOS gives the menu bar's app name; the clock stays regular, the same
     // primary/secondary split the two inks already draw.
+    //
+    // SO3 — the caption is the APP MENU's title, so when that menu is down it takes the lit-title
+    // ink `winmenu::draw_bar_row` gives every other open title. The box fill under it was already
+    // laid by that call (it runs above the band return, and box 0 is the caption's); this is the
+    // other half of the same convention, kept HERE because the bar owns the caption's glyphs and
+    // `draw_bar_row` deliberately does not redraw them.
     let cols = m.title_len.min(TITLE_GLYPHS);
-    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, theme::TITLE_TEXT_ACTIVE, true, FACE);
+    let cap_ink = if m.menus.app_open() { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
+    super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
 
-    // Clock, right, at one PAD from the far edge. Secondary ink: the title is what the operator is
-    // reading, the clock is what they glance at.
+    // Clock, right — but INSIDE the crystal since SO4, one PAD to the mark's left, so the brand keeps
+    // the corner. Secondary ink: the title is what the operator reads, the clock what they glance at.
     if let Some(c) = m.clock {
         let cw = CLOCK_GLYPHS * CELL_W;
-        if w > cw + strip::PAD {
-            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+        if w > cw + strip::PAD + CRYSTAL_SLOT {
+            super::font::draw_row(out, w, &c, w - CRYSTAL_SLOT - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
         }
     }
 }
@@ -1115,7 +1311,7 @@ pub fn selftest() {
     let dismissed = SLOT.packed() == 0;
 
     // Leg 7 — the crystal is drawn, and inside the bar. `r` is the enabled rect (from leg 3); the
-    // crystal box must be the compiled size and sit wholly within it, left of the title inset.
+    // crystal box must be the compiled size, sit wholly within it, and (SO4) be FLUSH to its right edge.
     let (cbx, cby, cbw, cbh) = r.map(crystal_box).unwrap_or((0, 0, 0, 0));
     let crystal_ok = match r {
         Some((brx, bry, brw, brh)) => {
@@ -1125,7 +1321,7 @@ pub fn selftest() {
                 && cbx + cbw <= brx + brw
                 && cby >= bry
                 && cby + cbh <= bry + brh
-                && cbx + cbw <= brx + TITLE_X0 // left of where the title begins
+                && cbx + cbw == brx + brw // SO4: flush to the bar's right edge, no gap
         }
         None => false,
     };

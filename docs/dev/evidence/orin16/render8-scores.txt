@@ -1,0 +1,159 @@
+== render8 scorers over render8-boot.log (18767 lines) ==
+A15 smp: cpu_on_success=5 cpu_on_error=0 el3_abort=0 poweroff=0 online_line=1 -> PASS (A15 pass 5)
+A1 u7stk: arming=1 post_cascade=1 len=32768 hw=14744 (render6=15552 delta=-808) headroom=18024 -> PASS-SHALLOWER (808 bytes below render6 — check the quarry actually opened)
+[u7stk] at=boot-core:pre-cascade task=0:boot-core sp=0x26b3fd730 low=0x26b3f5820 top=0x26b3fd820 len=32768 used=240 hw=240 headroom=32528
+[u7stk] at=boot-core:post-cascade task=0:boot-core sp=0x26b3fd730 low=0x26b3f5820 top=0x26b3fd820 len=32768 used=240 hw=14744 headroom=18024
+A18 cascade: cascaded=1 refuse=0 pulsewin_open=8 pulsewin_decline=0 strip_kept=0 census_strip=retired census_pulsewin=3 -> PASS
+[deskcascade] -> CASCADED windows=2 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=ROUTED; the render pass ahead presents t
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=5 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+A19 band: band_cleared=1 shell_present=1 jd2_probe=1 -> WIRE PASS (now A19-pngband.py SCREEN0.PNG must read non-bg=0/60200)
+A20 clicks: arm_click1=1 orinclick_armed=1 clickroute_press=10 consumed=20 routing_census=0 -> PASS (A20 flown)
+   [clickroute] press chrome win=2 owner=4294967043 at (1053,110) -> drag
+A22 tcu: arm=1 stop=0 census=857 full_final=0 nbytes=0 full_edges=3 changes=7 data=[00 00 00] -> ROW2: FULL-SEEN then consumed
+HEALTH: heartbeat=1 el1=1 arm=1 armed=1 live=853 redzone=0 exceptions=0 -> PASS
+-- render7 additions --
+A16 tcurx2: tcurx_took=8 took_total=8 serialrx_census=842 rx_final=8 mbox_final=8 ovrf=0 tcu_full_final=0 keys=41 -> PASS rung 2 (the consumer took 8 byte(s) and left the mailbox empty)
+[serialrx] rx=8 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=8 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+[serialrx] rx=8 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=8 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+[serialrx] rx=8 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=8 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+[serialrx] rx=8 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=8 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+A16 leg burst: keys=3 tcurx_took=3 rx_after=3 mbox_after=3 ovrf_after=0 -> PARTIAL 3/5
+    KEY 't' :: KEY 's' :: KEY 't' ::
+A16 leg paced: keys=5 tcurx_took=5 rx_after=8 mbox_after=8 ovrf_after=0 -> PASS 5/5
+    KEY 't' :: KEY 's' :: KEY 't' :: KEY 'e' :: KEY 0x0d ::
+A27 drag: wired=1 control_absent=0 arm=4 end=4 steered=4 fed-no-move=0 no-feed=0 | wm_drag_begin=7 wm_drag_end=7 placed=4 no-move=3 -> PASS A27 (steered 4 gesture(s), wm placed 4)
+   [dragroute] wired panel=1920x1200 desktop_firmware=1 -> READY
+   [dragroute] end win=2 via=release fed=41 applied=24 at (1233,99) -> STEERED
+   [wm-act] drag-end win=2 owner=0xffffff03 at (247,117) -> placed
+A8 quarry: quarry_open=3 skip=0 decline=0 pidesk_true=1 deskquarry_seat=1 compiled=1 open=1 relatched=0 -> PASS A8 (compiled=1 open=1, the window is on the wire; now count 4 dock tiles on the glass)
+   [quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,203) volumes=1 tree-rows=8 list-rows=24 cwd=/usb
+   [pidesk] quarry open=true — the file manager is a desktop tenant (arrows/Enter/Backspace move, Esc closes, the
+   [deskquarry] seat compiled=1 open=1 windows=2 relatched=0 (QUARRY-ORIN A8 — desktop_firmware::activate() step 
+A25 winmenu: publish=8 publish_refuse=0 contend_refuse=1 open=7 last_title=View pick=5 dismiss=7 (esc=1 outside=0 pick=5) -> PASS A25 (published, opened from the BAR, Esc dismissed — R21 satisfied on the wire)
+   [winmenu] open title=View items=2 at (171,34) title-x=171 font=chrome20-bold kind=title owner=3
+   [winmenu] pick owner=5 id=161 label=Quit -> close win=5
+   [winmenu] dismiss reason=title kind=title owner=3
+A25 negative: in-window title_press=0 in-window menu-dismiss=0 (winmenu pick callback=0, expected>=0) -> PASS (no in-window View strip token — R21 holds)
+A26 conquiet: console_route=1 console_window=2 mirror_off=1 (at line 1) census=0 dropped=0 -> PASS-WEAK (mirror=off once; fewer than 256 lines dropped so no census line — read the glass)
+   [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+   [conquiet] mirror=off since=console-window-route win=1 lines_dropped=1 knob=bootlog (the full serial stream stops mirror
+A20 ptrpoll: lines=25 first_rearm=3 first_dup=0 first_nobuf=0 | final rearm=5178 dup=0 nobuf=0 reports=5178 | verdicts STREAMING=24 BASELINE=1 GUARD-REARM=0 DUP-DROP=0 NOBUF-DROP=0 ARMED-NO-COMPLETION=0 -> RE-ARMED (rearm=3 > 2 at census 1 — the pipeline is moving; a dead click is a ROUTING fault)
+   first:  [ptrpoll] t=71 rearm=3 discard=0 errrearm=0 dup=0 nobuf=0 reports=3 base=3 decoded=0 -> BASELINE (the enumeration arms; every later line is measured a
+   last:   [ptrpoll] t=2111 rearm=5178 discard=0 errrearm=0 dup=0 nobuf=0 reports=5178 base=3 decoded=5175 -> STREAMING (the pointer read is completing and re-ar
+A17 prtscr: armed=5 capturing=4 ok=4 inflight_refusals=1 other_refusals=0 names=[ SCREEN0.PNG SCREEN1.PNG SCREEN2.PNG SCREEN3.PNG ] -> PASS A17 (two files and 1 NAMED InFlight refusal(s) — the render6 gap is closed)
+   :: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=0/6913793 ::
+:: PRTSCR: slice n=2 bytes=32768/6913793 ::
+:: PRTSCR: slice n=3 bytes=131072/6913793 ::
+:: PRTSCR: slice n=4 bytes=229376/6913793 ::
+:: PRTSCR: slice n=5 bytes=327680/6913793 ::
+:: PRTSCR: slice n=6 bytes=360448/6913793 ::
+:: PRTSCR: slice n=7 bytes=425984/6913793 ::
+:: PRTSCR: slice n=8 bytes=524288/6913793 ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN1.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=32768/6913793 ::
+:: PRTSCR: slice n=2 bytes=131072/6913793 ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::
+:: PRTSCR: slice n=3 bytes=229376/6913793 ::
+:: PRTSCR: slice n=4 bytes=327680/6913793 ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: slice n=5 bytes=425984/6913793 ::
+:: PRTSCR: slice n=6 bytes=491520/6913793 ::
+:: PRTSCR: slice n=7 bytes=589824/6913793 ::
+:: PRTSCR: slice n=8 bytes=688128/6913793 ::
+:: PRTSCR: SCREEN1.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: SCREEN2.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=32768/6913793 ::
+:: PRTSCR: slice n=2 bytes=131072/6913793 ::
+:: PRTSCR: slice n=3 bytes=196608/6913793 ::
+:: PRTSCR: slice n=4 bytes=262144/6913793 ::
+:: PRTSCR: slice n=5 bytes=360448/6913793 ::
+:: PRTSCR: slice n=6 bytes=458752/6913793 ::
+:: PRTSCR: slice n=7 bytes=557056/6913793 ::
+:: PRTSCR: slice n=8 bytes=622592/6913793 ::
+:: PRTSCR: SCREEN2.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN3.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=32768/6913793 ::
+:: PRTSCR: slice n=2 bytes=131072/6913793 ::
+:: PRTSCR: slice n=3 bytes=229376/6913793 ::
+:: PRTSCR: slice n=4 bytes=327680/6913793 ::
+:: PRTSCR: slice n=5 bytes=393216/6913793 ::
+:: PRTSCR: slice n=6 bytes=491520/6913793 ::
+:: PRTSCR: slice n=7 bytes=589824/6913793 ::
+:: PRTSCR: slice n=8 bytes=688128/6913793 ::
+:: PRTSCR: SCREEN3.PNG 1920x1200 6913793 bytes -> OK ::
+-- render8 additions --
+A21 tick: arm=1 ticklines=719 tmax=179500 census=853 passes=1->164613074 exceptions=0 -> PASS
+A21 run: host=1 hosting=1 refusing=0 bgrun=0 detached=0 rejected=0 el0_first_run=1 capped=0 orinbsprun_join=1 -> HOSTING, NO SPAWN (no BGRUN line — nothing was launched to host)
+   :: [bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x1; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses o
+   :: [bsprun] el0 first-run 'el0-hello' on core 0 — CurrentEL EL1 checked, eret to EL0 ACCEPTED (n=1) ::
+   :: [orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true, mark_online(0), preemptive terminus (clock: ORIN-BSPTICK); 
+A12 net5 Q0: net5R_lines=1 armed=1 not_armed=0 match=1 mismatch=0 (net4F rx-ring seen=1) -> ARMED + MATCH — live; read Q2
+   :: PCIE4:   [net5R] ARMED: rx-desc[1..31].addr re-pointed from rx-bufs 0x80010000 to SHADOW 0x80050000 (NC window +0x50000, 65536 B, tag idx 0x80..) AFTER RxEnb; slot 0 l
+A12 net5 Q1: rx_ring_lines=1 below4g=1 net4s=15 identity_covered=5 alias_region1=0 -> PASS placement (sub-4GiB, identity-covered, no alias in the path)
+   :: PCIE4:   [net4F] rx-ring phys=0x80000000 buffers=32 rx-bufs=[0x80010000..0x80020000) tx-ring phys=0x80020000 below4g=1 — every DMA object is < 4 GiB inside the NET-4h 
+A12 net5 Q2: net5T=5 net5V=1 pops_scored=5 | REFETCH-LIVE=0 REFETCH-WRONGSLOT=3 STALE-ORIG=0 NOWHERE=1 PREFETCHED=1 -> C2' PASS (defect located): REFETCH-WRONGSLOT — the address path is live; the reuse is an index defect.
+   :: PCIE4:   [net5V] ring RE-FETCH verdict: pops-scored=5 REFETCH-LIVE=0 REFETCH-WRONGSLOT=3 STALE-ORIG=0 PREFETCHED=1 NOWHERE=1 prefetch-depth=1 shadow=0x80050000 rx-bufs=0x80010000 below4g=
+A12 net5 Q3: dhcp_lines=1 lease=0 -> NO LEASE (meaningful only on a REFETCH-LIVE Q2)
+   :: PCIE4:   [net4V no-lease verdict] dhcp-tx: discover=1 request=0 | dhcp-rx: offer=0 ack=0 nak=0 | ring: popped=5/32 wraps=0 zero-payload=4 [ring died MID-PASS (window c
+:: PCIE4:   [net4F] rx[2] slot=2 len=60 own-buffer-written=no buffers-written(count=0)=[-1,-1,-1,-1] — the completed slot advanced with a real length and NOT ONE ring b
+:: PCIE4:   [net4F] distinct buffers-written(count=1)=[0,-1,-1,-1] across the first 4 RX completion(s) at=completion-4 below4g=1 rx-ring=0x80000000 — a single-address l
+:: PCIE4:   [net4F] rx[3] slot=3 len=62 own-buffer-written=no buffers-written(count=0)=[-1,-1,-1,-1] — the completed slot advanced with a real length and NOT ONE ring b
+:: PCIE4:   [net4F] rx[4] slot=4 len=342 own-buffer-written=no buffers-written(count=0)=[-1,-1,-1,-1] — the completed slot advanced with a real length and NOT ONE ring 
+:: PCIE4:   [net4F] RX ring pass verdict: pops=5 NUM_RX=32 wraps=0 RDU-clears=0 RXOVW-clears=0 CR=0x0c RxEnb=1 ISR=0x0084 — one pass only, and RDU NEVER latched: the ha
+:: PCIE4:   [net4F] distinct buffers-written(count=1)=[0,-1,-1,-1] across the first 4 RX completion(s) at=window-close below4g=1 rx-ring=0x80000000 — a single-address l
+A12 net4 control: net4G_lines=1 -> UNEXPECTED — [net4G] armed under the NET-5 cadence; read why
+A24 rung3: lines=93 complete=1 refused=0 rung3_complete=1 unreadable=9 bcr_lock=1 opt_wpr=1 cascaded_after_probe=1 -> PASS A24-rung3 (COMPLETE, rung 3 complete, both rung-4 inputs present, and [deskcascade] -> CASCADED after it — the boot continued behind the rung) WITH A FINDING: 9 register(s) UNREADABLE, which is itself the answer rung 4 needs
+   [ga10bprobe3] pg=0x1 clk=2/3 regs=16 of 25 readable, 9 UNREADABLE -> COMPLETE
+   [ga10bprobe3] bcr_dmacfg lock_locked=0 (raw=0x00000000) — 1 means the BCR is locked for this power cycle and rung 4 CANNOT reprogram it without a cold
+   [ga10bprobe3] opt_wpr_enabled=0x00000001
+A24 rung3b: lines=13 armed=1 write_announces=3 read_announces=2 mailbox_lines=1 wrote=0x5a5aa5a5 read=0x5a5aa5a5 held=1 mismatch=0 skipped=0 terminus=1 -> PASS A24-rung3b MAILBOX-HELD — a GA10B engine register accepted a write from this kernel and held it; the CCPLEX can drive this engine scratch state with the GSP halted
+   [ga10bprobe3b] mailbox0 wrote=0x5a5aa5a5 read=0x5a5aa5a5
+A24 STOP-CHECK: last announce at line 1123 of 18767 -> OK (the boot continued past it)
+   [ga10bprobe3b] about-to-read gsp_falcon_mailbox0 reg=0x17110040 (the scratch readback) — if this is the LAST line, THAT read was EL3-fatal
+A28 rootfs: mount=1 ok=1 bound=1 entries=4 refused=0 unafs_mount_errors=0 fat_enodev=0 -> PASS A28 (/ bound to the card's FAT through TegraSd, 4 entries, and NO unafs-mount error)
+   [sdmmc] root mount source=tegra-sd card_blocks=62333952 -> OK label="UNAOS-PI" vol_id=0xabfbdefa clusters=110874 cluster_bytes=512 probe_us=89111 ::
+   [sdmmc] root bound / and /fat = tegra-sd FAT read-only (both were dead: unafs has no volume here, Default has no device) entries=4 dirs=1 files=3 list_us=18324 
+A30 deskfix: pulsewin_open=8 close=4 close_final=4 dock_rearm=2 -> FAIL A30 (8 opens for 2 dock re-arm(s) — the render7 shape was 3)
+SO5 sprite: lines=8 same=0 cap=n=8/8 -> EXPECTED-TODAY (same=0 — the pal.rs one-liner is FILED UNAPPLIED pending the rmbp grant; the divergence is now on the wire, which is the fix's point)
+   [sprite] size=18x18 scale=2 over=desktop at (440,85) panel=1920x1200 compositor=9x9 backbuffer=18x18 same=0 n=8/8 (SO5 — two arrow sprites, two block 
+A37 rxmerge: arm=1 census=842 policy=mbox-only dup=0 reorder=0 parked=164572494 per_byte=8 | side-effects [serialrx] polls=0 ovrf=0 -> PASS A37 SINGLE-SOURCE (exactly-once, in-order; parked=164572494 is the drain-liveness counter — polls=0 beside it is CORRECT, not a dead drain)
+   [rxmerge] policy=mbox-only armed=1 uartc-rbr=parked -> A37: one owner, one ordered stream (the parked reader is NOT read — an RBR read pops the byte a
+   [rxmerge] census policy=mbox-only seq=8 uartc=0 mbox=8 dup=0 reorder=0 parked=164572494 -> SINGLE-SOURCE (exactly-once, in-order: every byte came down one transport). EXPECTED SIDE EFFECTS u
+A34/SO4 crystal: restart_announce=0 restart_RETURNED=0 shutdown_announce=0 shutdown_RETURNED=0 | SO4 menubar_lines=1 gap_right=0 -> SO4 ONLY (geometry present, gap_right=0) — A34 NOT EXERCISED: the Restart verb was never picked. It is step 13 of the FLIGHT SEQUENCE and it reboots the board.
+   [menubar] crystal menu=170x121+1750+34 anchor=right-flush-under-crystal glyph=16x22+1904 bar_w=1920 gap_right=0 ::
+SR2/A36 prtscr3: armed=5 capturing=4 ok=4 slices=32 (last n=8) inflight_refusals=1 vanished=0 -> PASS SR2/A36 (sliced encode on the wire, 1 NAMED InFlight refusal(s), 4 files written — the render7 silent-drop gap is CLOSED)
+   :: PRTSCR: slice n=8 bytes=688128/6913793 ::
+   :: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::
+SO1/A29 winid: wm_alloc=14 wm_close=11 holders_cleared_closes=6 register_REFUSED=0 | close-furniture=2 route-dropped=true=1 (last dropped id=1) quarry_open=3 (last id=2) wcgseam=0 -> PASS SO1(b) (1 route-dropped close(s), 6 close(s) cleared a holder — every reopen at a recycled id must carry a HIGHER gen; the two lines below are the pair to read)
+   [wm-act] close-furniture win=1 owner=0xffffff01 closed=true route-dropped=true (id-scoped: close_owner is not involved)
+   [quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,203) volumes=1 tree-rows=8 list-rows=24 cwd=/usb
+   [wm] close win=4 gen=1 route=none holders-cleared=0 names=,,,
+   A29 wcgseam: ABSENT — the seam never ran this boot; acceptable, NOT a failure (this board has never flown it)
+SO1/S4 drain: shell_pin_presses=3 drains=3 declined=0 -> PASS S4 (3 drain(s) after 3 press(es) — the reopen was minted)
+   [dock] press at (1135,1168) tile=3/4 shell=pin -> reopen requested
+   [dock] shell-reopen drained by=orin_render_service win=1 gen=2 route=already-live -> REOPEN
+A10/SO2/SO3 menubar2: open=7 (title-x=7 font=7) publish=8 with_app_menu=8 pick=5 quit_picks=5 app_menu_quit=5 closed=5 | dismiss=7 esc=1 outside=0 (KEY 0x1b seen=1) -> PASS A10+SO2+SO3 (Esc dismissed with reason=esc; the app menu published; a Quit pick actually closed its window)
+   [winmenu] open title=View items=2 at (171,34) title-x=171 font=chrome20-bold kind=title owner=3
+   [winmenu] publish owner=3 titles=1 items=2 slot=0 replaced=false app-menu=default
+   [winmenu] dismiss reason=esc kind=title owner=3
+   [winmenu] pick owner=5 id=161 label=Quit -> close win=5
+   [winmenu] app-menu quit win=5 closed=true
+V-1..V-4 fixpanel: v3_contended_declines=1 winmenu_successes=15 (after a decline=11) winmenu_family_lines=224 -> PASS V-3 (a transient lock refusal was DECLINED AND RETRIED — 11 later open/publish succeeded — instead of destroying operator state) and PASS V-1/V-2/V-4 by survival: the boot continued past the bar, which is V-1's only falsifier (its failure mode is a HANG inside the composite pass)
+A10-class keydoors (fold ABOARD at c24d9517): KEY 0x09=7 tab-cycle=0 (paired within 60 lines=0) | KEY 0x1b=1 quarry_closed=0 (paired=0) quarry_open=3 | drag-cancel=0 focus-key=0 -> FAIL F0 (7 x KEY 0x09, NO paired tab-cycle within 60 lines — the TAB shell door is still dead. This is the reading the previous arc had; if the fold IS aboard (6 key_route sites) the comment-swallow has recurred, so read main.rs:2948 BY COLUMN, not by grep.
+   DRAGREL-A64: NOT-EXERCISED (grab a title bar and press TAB without releasing — FLIGHT SEQUENCE step 10b)
+   ⚠ SO9 (known, open, NOT a flight defect — LEDGER.md:58): while Quarry is on the glass it takes the shell's ENTER and BACKSPACE (key_route gates on on_glass(), quarry/live.rs:1887, = OPEN not FOCUSED). A shell Enter opens a FILE. Close Quarry with Esc and the shell behaves. Do NOT file it as a shell bug.
+-- end render8 scorers --

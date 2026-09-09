@@ -1,0 +1,7 @@
+inject-paced start 2026-09-06T11:43:34.359Z mode=paced fifo=/home/pmes/unaos-bench/capture/line-acm0/inject.fifo bytes=5 ms-per-byte=50 raw=11972232
+sent 2026-09-06T11:43:34.368Z byte=0 hex=0x74 t
+sent 2026-09-06T11:43:34.427Z byte=1 hex=0x73 s
+sent 2026-09-06T11:43:34.487Z byte=2 hex=0x74 t
+sent 2026-09-06T11:43:34.546Z byte=3 hex=0x65 e
+sent 2026-09-06T11:43:34.605Z byte=4 hex=0x0d \r
+inject-paced done 2026-09-06T11:43:34.611Z sent=5 raw=11973304

@@ -1672,3 +1672,42 @@ pub fn vfs1_routing_witness() {
         ":: VFS-1: ro-seam create/write/truncate/unlink -> Unsupported, read still ok={} :: PASS ::",
         read_ok);
 }
+
+// =========================================================================================
+// ROOTFS (orin 16, ledger A28) — the `BlockSource::TegraSd` constructor, appended at the FILE TAIL.
+//
+// A SECOND `impl FatBackend` block rather than a method inside the first: this file is compiled into
+// the knob-off `kernel8.img`, and `panic::Location` embeds source line numbers, so a method inserted
+// mid-file would move every panic site below it and break the byte-identity measurement the Pi track
+// takes on every arc. A tail append moves nothing.
+//
+// The adapter itself needs no other change — it has been parametrized by `BlockSource` since VFS-3,
+// `fat.rs` is already TOTAL over `BlockSource::TegraSd` (`read_sector`, `read_sectors`,
+// `mount_source`, `volume_serials`, `name`, `write_veto`), and `read_only()` forwards to
+// `write_veto()`, which answers `Some(TEGRA_SD_VETO)` for this source. So the volume arrives
+// read-only by construction with nothing here saying so.
+// =========================================================================================
+
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+impl FatBackend {
+    /// ROOTFS: mount the Tegra microSD card's FAT volume, read through
+    /// [`TegraSd`](crate::fs::fat::BlockSource::TegraSd) — the census-published
+    /// `read_block_tegra_sd` path (polled CMD17, 1-bit default speed, proven on metal by ledger A23).
+    ///
+    /// READ-ONLY, and not by a decision taken here: [`FatBackend::read_only`] forwards to
+    /// [`crate::fs::fat::BlockSource::write_veto`], which vetoes this source, and beneath that
+    /// `block::write_block_tegra_sd` refuses in every cfg. The card's only writer remains the
+    /// explicitly armed ladder in `arch/aarch64/sdmmc_tegra.rs`.
+    ///
+    /// Its one caller is `arch::aarch64::sdmmc_tegra::sdmmc_root_bind` (the `sdmmcroot` knob), which
+    /// binds it at `/` on a machine whose native UnaFS root does not exist yet — see
+    /// `docs/dev/OS/10_INSTALL/orin-unafs-root.md` §3 item 4.
+    pub fn new_tegra_sd(volume: &str, principal: &str, world_readable: bool) -> Self {
+        Self {
+            volume: volume.to_string(),
+            principal: principal.to_string(),
+            world_readable,
+            source: crate::fs::fat::BlockSource::TegraSd,
+        }
+    }
+}

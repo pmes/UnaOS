@@ -84,7 +84,8 @@ absence = []
 
 FIELDCOUNT_REG = {
     "docs/dev/OS/rmbp-ledger.md:B24": "three injections put TWO rows' content on one line; splitting them is a CONTENT call, and the ledger-cell pipe convention it belongs to is Peter's open decision (rmbp-ledger J6). Registered 2026-09-08 by rmbp 17",
-    "docs/dev/OS/orin-ledger.md:C10": "another seat's ledger file — one field over its 6-column header; reported to orin, theirs to fix under their own lane. Registered 2026-09-08 by rmbp 17",
+    "docs/dev/OS/orin-ledger.md:C10": "another seat's ledger file — one field over its 6-column header; reported to orin, theirs to fix under their own lane. Registered 2026-09-08 by rmbp 17. ⚠ DELETION TRIGGER: orin fixed it on hw-jetson — same rule as A27, DELETE IT IN THE COMMIT THAT FOLDS hw-jetson, never before",
+    "docs/dev/OS/orin-ledger.md:A27": "another seat's ledger file — two fields over its 7-column header; a literal `|` inside A27's wire quote splits the row. Arrived here with the 2026-09-09 trunk sync, which is the first time this gate ever met it. Registered 2026-09-09 by rmbp 18. ⚠ DELETION TRIGGER: orin ALREADY fixed it on hw-jetson (c386697b, `wired |arm|end` -> `wired / arm / end`) — this entry goes RED as stale the moment that fold arrives, so DELETE IT IN THE COMMIT THAT FOLDS hw-jetson, never before (confirmed by orin 23 over ccd 2026-09-09)",
 }
 fc_seen = set()
 registered = []

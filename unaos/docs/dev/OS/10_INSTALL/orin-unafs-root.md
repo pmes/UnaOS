@@ -116,6 +116,53 @@ knob-off byte-identical for non-tegra builds. Gate: `UNAOS_TEGRA=1 ./arroyo chec
 both arches + `./arroyo test-arm` + tegra media strings-validation. Metal proof of
 the mount is attended bench work, not this arc's job.
 
+## 5a. Item-4 status: the root binds to the card's FAT until the UnaFS volume exists (ROOTFS, orin 16, 2026-09-06)
+
+Items 1 and 2 landed (TEGRA-SDBLK: `sdmmc_census` publishes the card through
+`block::register_tegra_sd`, `BlockSource::TegraSd` routes `fat.rs` at
+`read_block_tegra_sd`, and `SdSectorDevice::open_on` carries the tegra
+sector-count arm). **Item 3 has not run on any card** — no Orin card carries a
+UnaFS partition — and that is what ledger A28 turned out to be: on render7 the
+desktop's `ls /` and quarry both answered `/: backend error: unafs-mount`,
+because `shell::vfs_mount_table` binds `/` to `NativeBackend` (native UnaFS)
+unconditionally, and `/fat` to `BlockSource::Default`, which no Orin boot ever
+registers. Two mounts, zero volumes.
+
+Item 4 is therefore taken at the layer the medium can serve today, behind
+`UNAOS_SDMMCROOT=1` (cargo `sdmmcroot`, ⇒ `sdmmc`; default OFF ⇒ byte-identical):
+
+- `/` rebinds to the card's **FAT** volume through `BlockSource::TegraSd`,
+  READ-ONLY (`write_veto` on the source, and `write_block_tegra_sd` refuses in
+  every cfg — the card's only writer is still the armed ladder).
+- `/fat` re-points at the **same** volume. It named the unregistered `Default`
+  device, and it is not decoration: `/fat` is `shell::EXEC_ROOT` (the second
+  probe of `exec_resolve`, which is why a bare `vug` works from anywhere) and
+  the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
+  and quarry's double-click route. Unmounting it would trade one dead namespace
+  for another; re-pointing it is what lets the desktop launch anything. Two
+  adapters over one source is safe — `FatBackend` re-mounts per call and holds
+  no volume state — and quarry's `root_prefixes` already treats a mount point
+  claimed by another mount point as a child, not a second root.
+- Witness: `[sdmmc] root mount source=tegra-sd … -> OK label="…" …` then
+  `[sdmmc] root bound / and /fat = tegra-sd FAT read-only … entries=N dirs=… files=… list_us=…`,
+  or one named `[sdmmc] root -> REFUSED reason=…`.
+
+Cost: every sector is one polled CMD17 at 1-bit default speed (≤25 MHz) —
+`tegra_sd_read_blocks_512` loops that primitive, because the only multi-block
+path in the file is `install_target`-gated and unproven. The deciding term is
+the sector count of a listing (a volume re-probe of ~4–6 sectors plus the root
+directory's chain), not the clock. The witness carries the two times itself
+(`probe_us`, `list_us`); the SECTOR term would come from `UNAOS_FATPERF=1`, which
+`arroyo` wires only into the Pi `kernel8` leg today — extending that mapping to
+the jetson image is a named follow-up.
+
+**This does not retire item 3, and the layout in §3 is unchanged.** When the
+UnaFS system partition is formatted, `/` goes back to `NativeBackend` and the
+FAT returns to the boot-shim role §3 gives it; `sdmmc_root_bind` is the one
+place that changes. Code: `arch/aarch64/sdmmc_tegra.rs` §ROOTFS,
+`fs/vfs.rs`'s tail `FatBackend::new_tegra_sd`, and one cfg-gated statement in
+`shell::vfs_mount_table`.
+
 ## 6. Open calls (named, not acted)
 
 - **NVMe bring-up** — new hardware lane work; sequenced after the card-resident

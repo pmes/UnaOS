@@ -1,0 +1,1463 @@
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x2d9f90 pg=730
+[ INFO]: crates/bootloader/src/main.rs@805: Allocated kernel at 0x25ab37000
+[ INFO]: crates/bootloader/src/main.rs@925: Found DTB at 0x25f501000, size: 8379
+00 bytes
+[ INFO]: crates/bootloader/src/main.rs@961: boot volume FAT serial 0xde001a13 (e
+xtended BPB BS_VolID)
+[ INFO]: crates/bootloader/src/main.rs@1208: JB8[pre-EBS]: FPCI CFG_0=0x01200020
+ CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@1235: JB8[pre-EBS]: FALCON CPUCTL=0xfffff
+fff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x000
+0c85f
+[ INFO]: crates/bootloader/src/main.rs@1248: JB8[pre-EBS]: xHC cap=0x01200020 US
+BSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ?
+ falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so t
+he owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUA
+RD)
+[ INFO]: crates/bootloader/src/main.rs@1165: JB6: dummy ACPI 2.0 table installed
+ (RSDP @0x25e069000, XSDT @0x25e069040) ? XUSB Falcon teardown wi:l:l  tseeglrfa-:s kmimpu 
+l�i�vMem I(nEsLt2a)l l�P�r�o tRoAcMo lNIonrtmearlf-aWcBe :+  2T7eAgBrFa0 5D5e-vBi1cBe8--n4GCn2R6E- 8m0a4p8p-e7d4 8:F:3
+7:B:A At2eDgFr a0: 
+dark-window guard — 89 byte(s) dropped pre-map ::
+:: video: edid present=1 hdr=OK sum=OK native=1920x1200 pclk_khz=154120 ext=1 len=256 ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4404ff TTBR0=0x25ad42000 RAM-GiB-mask=0x3fc ::
+:: tegra: XCARVE-6 carveout exclusion — 6 protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::
+:: tegra:   window[0] [0x26b800000,0x26c180000) 9728 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[1] [0xbe000000,0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[2] [0x26c400000,0x279e00000) 223232 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[3] [0x26c180000,0x26c400000) 2560 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[4] [0x26b5f0000,0x26b7f0000) 2048 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[5] [0x279e00000,0x27a760000) 9600 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac31800) ::
+:: tegra: JM7 — GOP fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4 ::
+:: tegra: JD1 — simple-fb /chosen/framebuffer: 1920x1200 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 — resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x960000] ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: fb L2 repair — 5 block(s) re-mapped in GiB 9 [0x279e00000,0x27a760000) ::
+[panel-owner] panel-ownership-handover from=owner-unknown to=owner-fbcon-panel site=fbcon::init
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d — MIDR=0x410fd421 (r0p1) — reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d — CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a — DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a — /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a — ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 — PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 — handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 — minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 — witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 — BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 — BAR2[0x004] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x008] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 — CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB11 [raw-handoff] — Falcon fw-header census: BAR2+0x1000 (IOCTL_CFGTBL_READ) -> BAR2+0x01c; no xHCI operational register is written ::
+:: tegra: JB11 [raw-handoff] — CNR gate: USBSTS=0x00000011 CNR=0 after 1 poll(s) / ~1 us — READY (mainline waits for exactly this before reading the header) ::
+:: tegra: JB11 [raw-handoff] — fw ident: magic="XUSBFW.." (0x0000574642535558) version_id=0x80050003 (Version: 80.05) ::
+:: tegra: JB11 [raw-handoff] — fw built: created=1676000890 (epoch) = 2023-02-10T03:48:10Z UTC ::
+:: tegra: JB11 [raw-handoff] — fw image: boot_codetag=0x00000000 boot_codesize=51295 B rodata_img_offset=0x00000000 fwimg_len=196608 B cksum=0x000094ba ::
+:: tegra: JB11 [raw-handoff] — fw L2 IMEM: start=0x00000000 end=0x00000000 (span=0 B) ::
+:: tegra: JB11 [raw-handoff] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::
+:: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 — CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 — touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c — XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c — PG 12 ON -> err=0 ::
+:: tegra: JB1c — PG 10 ON -> err=0 ::
+:: tegra: JB1c — CLK 267 enable -> err=0 ::
+:: tegra: JB1c — CLK 269 enable -> err=0 ::
+:: tegra: JB1c — CLK 268 enable -> err=0 ::
+:: tegra: JB1c — CLK 275 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 272 enable -> err=0 ::
+:: tegra: JB1c — CLK 103 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 100 enable -> err=0 ::
+:: tegra: JB1c — probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a — port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a — port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a — port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a — port survey done (8 ports scanned) ::
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+[uvug7] ms clock: CNTFRQ=31250000 Hz (=31250 kHz per ms); ms=CNTVCT/(CNTFRQ/1000), core-count-independent; sys_getinfo ticks=CNTVCT/(CNTFRQ/250)=125000 (NOT the per-core-summed tick counter)
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD — DTB /reserved-memory contributed 3 carveout range(s) (cap 48) to the exclusion set ::
+:: tegra: DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property = 0x0 / 0x0; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::
+:: tegra: HEAP-GUARD — kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 165 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: tegra: [net4B] Normal-NC DMA window reserved [0x268000000, 0x268200000) (2048 KiB), carved just below the heap in the same clean+DMA span ::
+:: KERNEL HEAP ALLOCATED ::
+:: tegra: JB3 — DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 — census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b — usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b — attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g — no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b — programming interrupter + rings (runtime regs) ::
+:: X200: xhci pointer-programming begins t=676797314 (cntpct) ::
+xHCI: CNR cleared after 1 polls
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+[xhciint] ERDP initialized to 0x00000002683cd540 (hi-first, EHB clear)
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2683ce580
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2683cf000 (heap PA in [0x2683ca000,0x26b3ca000))
+xHCI: CRCR set to 0x2683cc541
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: [aarch64] RS=1 witness: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 CNR=0 HCE=0) CRCR=0x0000000000000000(CRR=0 CS=0 CA=0 RCS=0) DCBAAP=0x00000002683ce580 DCBAAP_raw64=0x00000002683ce580
+xHCI: [aarch64] RS=1 witness: IR0=0x3630020 IMAN=0x3(IP=1 IE=1) ERSTSZ=1 ERSTBA=0x00000002683ce540 ERDP=0x00000002683cd548(EHB=1) ERST[0].ring=0x00000002683cd540
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan (settle_ms=150)
+xHCI: ccs-margin settle_ms=150 ppc=0 ports=8 first_assert_ms=[p1:0/pre p2:none/pre p3:none/on p4:none/on p5:none/pre p6:0/pre p7:0/pre p8:none/pre] latest=0 margin_ms=150 result=CCSMARGIN
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+:: X200: xhci RS=1 (controller may DMA from here) t=686624143 (cntpct) ::
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 11 (was not enabled — fine).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled — fine).
+:: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc5c0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2683d3000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683cf040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc5d0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: HUB slot 1 port 1: device connected; enumerating...
+xHCI: HUB port 1 SS link trained (status 0x300203 PLS=0 U0, 1 polls, 2625377 cyc, attempt 0)
+xHCI: HUB port 1 reset OK (status 0x300203, warm reset, xHCI speed 4)
+xHCI: HUB slot 1 port 1 is a SuperSpeed port (speed forced to SS).
+xHCI: HUB downstream slot 2 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 2, bulk in 0x82/1024 out 0x1/1024) <<<
+xHCI: Configuring Bulk Endpoints for Slot 2 (IN 0x82 dci5 mps1024, OUT 0x1 dci2 mps1024)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 2). Storage ready.
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc630, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: Proceeding to Address Device (Slot 3, Port 6)...
+xHCI: Addressing Device (Slot 3, Port 6)...
+xHCI: DCBAAP[3] linked to 0x2683df3c0
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683deb80
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc640, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: >>> SLOT 3 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 3...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 3
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 3) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 3) ===
+xHCI: HUB slot 3 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 3 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 3 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 3 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+xHCI: HUB slot 3 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1c4f pid=0034 (route 0x2 tier 1)
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x81, MPS: 4, Interval: 10, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (mouse(rel)) in one Configure-Endpoint (max DCI 3).
+xHCI: [Event] Command Completion. Ptr=0x2683cc680, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: HUB slot 3 port 4: device connected; enumerating...
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x81 mps=4 interval=10 == witness ::
+:: MOUSE-1: 1 reports, last dx=2 dy=0 buttons=0x00 == witness ::
+xHCI: HUB port 4 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 5 device class=0x0 vid=1c4f pid=0002 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 3, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 5 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc6b0, Slot=5, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 5
+xHCI: HID Endpoints Configured (Slot 5). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 5
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=3 interval=10 == witness ::
+xHCI: HUB slot 3 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 3 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 5, iface 0).
+[hidkeys] set-idle ok slot=5 iface=0
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 4, iface 0).
+xHCI: [enum port 7] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 7...
+xHCI: [enum port 7] stage -> enable-slot
+:: tegra: JB2b — keyboard ARMED (slot 5, root port 6) -> PASS ::
+xHCI: [Event] Command Completion. Ptr=0x2683cc6d0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: Proceeding to Address Device (Slot 6, Port 7)...
+xHCI: Addressing Device (Slot 6, Port 7)...
+xHCI: DCBAAP[6] linked to 0x2683ea8c0
+xHCI: Port 7 speed 1 -> EP0 MPS 8
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683ea080
+xHCI: [enum port 7] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc6e0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: >>> SLOT 6 ENABLED & ADDRESSED <<<
+xHCI: [tegra fs-mps] slot 6 (FS port 7): learning MPS0 before full descriptor.
+xHCI: [enum port 7] stage -> fs-mps-learn
+xHCI: [tegra fs-mps] slot 6 bMaxPacketSize0 = 64
+xHCI: [tegra fs-mps] slot 6 EP0 MPS0 -> 64 (Evaluate Context OK)
+xHCI: Requesting Device Descriptor for Slot 6...
+xHCI: [enum port 7] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 6
+>>> VENDOR ID : [13d3]
+>>> PRODUCT ID: [3549]
+xHCI: Device Found. Class=0xe0 Sub=0x1 Proto=0x1
+xHCI: no driver for device class 0xe0 (slot 6, 13d3:3549); releasing port.
+xHCI: Port enumeration queue drained.
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 2)
+:: BOT: pump budget=450000000 used=410 peak=410 route=0x1 depth=1 slot=2 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: pump budget=450000000 used=36874375 peak=36874375 route=0x1 depth=1 slot=2 n=2 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: deqprobe slot=2 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2683cec81 -> stopped_epstate=3 stopped_ctxdeq=0x2683cece1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position) ::
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+:: BOT: portreg why=bringup port=1 usb3 portsc=0x00001603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=5 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=6 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=7 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+xHCI: storage ready.
+:: SPACE: [wait=1485ms(n=1) setcfg=3ms(n=1) tur=1200ms(n=2) sense=3ms(n=1) inq=27ms(n=1) rdcap=3ms(n=1) pub=75ms(n=1) resid=13ms] {cbw=0ms(n=5) data=11ms(n=3) csw=1180ms(n=5) peak=1179ms@csw} ftdi=0ms(n=0) total=2809ms sum=2796ms per_ms=31250 result=SPACE ::
+:: PIUSB: [piusb35] databuf phys=0x2683e0000 in_trb=0x2683cec80 cbw=0x2683cee80 csw=0x2683ceec0 | rc-inbound=[0x0,0x100000000) offset=0 (1:1) | databuf in_window=false below_3G=false — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool ::
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE: 
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+:: PIUSB: [piusb25] storage enumerated: slot 2 bulk_in=0x82 bulk_out=0x01 block_size=512 num_blocks=63404032 (30959 MiB) ::
+:: PIUSB: [piusb25] READ(10) LBA0 CSW=Passed residue=0 — first 16 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PIUSB: [piusb25] boot-sector sanity: 0x55AA=true type=unrecognized/raw ::
+:: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW=Passed residue=0 — 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+:: tegra: JB2b — HID: 1 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 — mass storage ready (slot 2); panel shell ls/cat live ::
+:: tegra: JB5 — witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 — inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x1f3d6_0fed22e7 SYNR0=0x00000002 SYNR1=0x0000410b (sid=0x410b) ::
+:: tegra: JB3 — inst0 CB0: SCTLR=0x0bb9c704 FSR=0x00000000 FAR=0x16fff_d6d3d07e ::
+:: tegra: JB3 — inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x12ef7_b650dfda SYNR0=0x0000000a SYNR1=0x00001fe3 (sid=0x1fe3) ::
+:: tegra: JB3 — inst1 CB0: SCTLR=0x29bfc70a FSR=0x00000000 FAR=0x1f9c9_36bff9bc ::
+:: tegra: JB3 — MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JD2 — EL1 console pump task spawned (boot core) ::
+:: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or newer); CPU_ON known-good on this firmware per the SMP-2 bench ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 0 aff=0x00000000 (BSP) (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 1 aff=0x00000100 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 2 aff=0x00000200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 3 aff=0x00000300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 4 aff=0x00010200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 5 aff=0x00010300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25ac4ed9c) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac31800) ::
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac31800) ::
+:: AARCH64 SMP: AP 2 online (aff=0x00000200) ::
+:: AARCH64 SMP: c2 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25ac4ed9c) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25ac4ed9c) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac31800) ::
+:: AARCH64 SMP: AP 3 online (aff=0x00000300) ::
+:: AARCH64 SMP: c3 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac31800) ::
+:: AARCH64 SMP: AP 4 online (aff=0x00010200) ::
+:: AARCH64 SMP: c4 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25ac4ed9c) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25ac4ed9c) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ac31800) ::
+:: AARCH64 SMP: AP 5 online (aff=0x00010300) ::
+:: AARCH64 SMP: c5 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 1 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 2 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 3 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 4 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 5 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI OK (5 online APs pinged, 5 delivered; BSP ipi 1 -> 6) ::
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+:: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::
+:: tegra: JM6b pre-drop — HCR_EL2=0x88000038 MMFR1.VH=1 TTBR0_EL1=0x25ad43000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x25ad3a003 ::
+:: tegra: JM6b — EL1 landing: CurrentEL=1 SCTLR_EL1=0x30d01805 ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: AARCH64 exception vectors installed (VBAR_EL1 = 0x25ac31800) ::
+:: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 on cpu 0 (~100 ms window; CORE-LOCAL, other cores' periodic PPI30 is NOT this proof) ::
+:: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880806cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] pre-arm GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=0 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=1023 ::
+:: [irqel2a] armed cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x1 ENABLE=1 IMASK=0 ISTATUS=0 CVAL-CNTPCT=124997cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] armed GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=1 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=30 ::
+:: IRQEL-RT: first IRQ taken at EL1 on cpu 0 — banked vector path live (ELR_EL1 bank) ::
+:: [orinbsptick] arming PERIODIC CNTP at EL1 on cpu 0 (250 Hz, PPI30) — IRQs stay UNMASKED across the terminus; dispatch is on_tick ONLY (no timer_preempt arm in the v3 dispatch without ORIN-BSPRUN, SCHED_ACTIVE false): no preemption, the capstone loop stays cooperative ::
+:: TEGRA-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA 0x2683f0000, 8 slots ::
+:: [orinbsptick] tick 1 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: M6c: user blob loaded (51 bytes) ::
+:: M6b: user code page EL0-RX/EL1-RO (AT probe: EL0-read OK, EL1-write denied) ::
+:: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x7800000000 sp 0x7800004000 ::
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+[deskcascade] arming cascade panel=1920x1200x4 stage=4194304 table=0 route=UNROUTED conwin=0 furn=0 render=1 witness=1 (desktop_firmware::activate on the boot core, §5.2 CROSSED by this knob alone; the [u7stk] boot-core:pre/post-cascade pair around it is the stack number the stop-line asked for)
+[u7stk] at=boot-core:pre-cascade task=0:boot-core sp=0x26b3fd820 low=0x26b3f5910 top=0x26b3fd910 len=32768 used=240 hw=240 headroom=32528
+[pidesk] desktop-clear panel=1920x1200 bg=002D2B55 (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)
+[wc-a] create win=1 asid=0xffffff01 surf=1295x736 stride=5180 scale=1x at (312,197) z=1
+[crispy] theme=us-crispy-modern@0787ba9f frame=5 bevel=1 title_h=34 radius=12 ctrl=24 gap=12 face=0xececee keyline=0xb4b4b9 bevels=0xffffff/0xaaaaaf title_act=0xeeeef1->0xe3e3e8 title_ina=0xf4f4f5->0xefeff1 ink=0x252629/0x7a7a7e ctrls=0x3d5f92/0x678cba/0x92aac9 gloss_q16=9175/32768/0 desktop=0x2d2b55
+[crispy] ramp act row0=0xf0f0f3 rowN=0xe3e3e8 ina row0=0xf6f6f6 rowN=0xefeff1
+[ceramic] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+[knurl] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=24 tile=4x4 hash=0x56957202a422b4b1
+[wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x7266f9d6972a5d25 civac=0x7266f9d6972a5d25 after=0x7266f9d6972a5d25 fbbad=0/953120 occluded=0 occ=0/0 us=63603 rectscan_us=10222 slow=yes -> CLEAN
+[wc-g] prof win=1 seq=0 surf_bytes=3812480 cks_blit_us=7330 civac_us=7707 cks_after_us=7326 probes=953120 readback_us=5237
+[wc-h] win=1 box=1305x780 span=780 band=no bytes=4071600 compose_us=62144 present_us=1112 rectscan_us=10833 torn=no -> BUFFERED
+[wc-b] win=1 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+[wc-b] rollup presents=1 banded=0 maxbands=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> UNBANDED
+[wc-a] composite windows=1 drawn=1
+[dock] live passes=1 paints=0 rate=0/1k scan=68cyc/2us paint=0cyc/0us px/paint=0 clob=0 presses=0 raises=0 unhides=0
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[panel-owner] panel-ownership-handover from=owner-fbcon-panel to=owner-console-window site=fbcon::panel_console_window_open
+[wc-g] win=1 seq=1 own=yes scale=1x app=0x2ff76a7f4cdaffef blit=0x2ff76a7f4cdaffef civac=0x2ff76a7f4cdaffef after=0x2ff76a7f4cdaffef fbbad=0/953120 occluded=0 occ=0/0 us=4269 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=1 seq=1 surf_bytes=3812480 cks_blit_us=7326 civac_us=7449 cks_after_us=7330 probes=953120 readback_us=5226
+[wc-h] win=1 staged=no reason=fixture -> DIRECT
+[wc-d] verify win=1 surf=1295x736 band=0..48 scale=1x at (312,197) panel=1920x1200 checked=62160 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=3305 occluded=0 occ=0/0 cksum=0xc0c9f66e4b9333ba first=none fills=0->0 fact=0/0 desk=0->0 dact=0/0 stable=yes -> PASS
+[wcn] win=1 asid=0xffffff01 live=yes above=yes att=1 comp=2 hid=0 bel=0 rate=0.0/s comp_rate=0.0/s active=0ms parked=0ms gap=0..0ms z=1 pre=2 drg=0 dout=0 dkpx=0 drly=0 q=0.0..0.0
+[wcn] rollup scope=live wins=1 att=1 comp=2 hid=0 bel=0 stale=0 passes=2 aborted=0 att_rate=0.0/s comp_rate=0.0/s span=27117ms -> LIVE
+[comp2] rollup passes=2 pass_us=135520 max_us=166219 sprite_us=2629 wait_us=5 blit_us=125673 compose_us=33049 present_us=1096 cache_us=516 bytes_pp=6107400 dmg_px_pp=1526850 box_px_pp=1526850 straddle_us=0 wcd_us=35310 util_pct=0 rate=0.0/s span=27117ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=27117ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=2 -> INERT
+[noatt] scope=live passes=2 seeds=2 noatt=1 noatt_kpx=994 rate=0.0/s taker=0 span=27117ms -> UNATTRIBUTED
+[wcpar] cores=1 total=2 max=2 c0=2 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=27117ms
+[wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+[wc-x] console-window win=1 panel=1920x1200 surf=1295x736 box=1305x780 at (307,158) cell=7x16 cols=185 rows=46
+[wc-g] win=1 seq=2 own=yes scale=1x app=0x913d555c30e9ba2c blit=0x913d555c30e9ba2c civac=0x913d555c30e9ba2c after=0x913d555c30e9ba2c fbbad=0/953120 occluded=0 occ=0/0 us=1979 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=1 seq=2 surf_bytes=3812480 cks_blit_us=7335 civac_us=7529 cks_after_us=7333 probes=953120 readback_us=5360
+[wc-h] win=1 box=1305x780 span=288 band=yes bytes=1503360 compose_us=1473 present_us=354 rectscan_us=4000 torn=no -> BUFFERED
+[wc-b] win=1 span=288 bh=780 bands=1 chrome_paints=1 chrome_rows=576 chrome_rows_used=576 amp=1.00x -> WHOLE
+[wc-x] console-window panic-fallback armed win=1 (panic paints the PANEL, not the window)
+[wc-g] win=1 seq=3 own=yes scale=1x app=0x92b03d1c5361f315 blit=0x92b03d1c5361f315 civac=0x92b03d1c5361f315 after=0x92b03d1c5361f315 fbbad=0/953120 occluded=0 occ=0/0 us=5224 rectscan_us=10222 slow=no -> CLEAN
+[wc-g] prof win=1 seq=3 surf_bytes=3812480 cks_blit_us=7332 civac_us=7491 cks_after_us=7333 probes=953120 readback_us=5236
+[wc-g] rollup win=1 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=1 maxus=63603 wit_us=109880 frame_us=16667 -> CLEAN+SLOW
+[wc-h] win=1 box=1305x780 span=780 band=no bytes=4071600 compose_us=3879 present_us=1012 rectscan_us=10833 torn=no -> BUFFERED
+[wc-h] rollup win=1 scope=window emit=1 age_ms=485 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=3 banded=1 lines=4 minspan=288 minspan_bytes=1503360 maxpresent_us=1112 minpresent_us=354 presspread=1 presspop=4 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] win=1 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+[pidesk] activate panel=1920x1200 console_win=1 routed=true (the window freezes at the handoff detach that follows — x86's desktop lane does the same)
+[pidesk] faces=title:noto20-aa,menu:noto20-aa,crystal:noto20-aa,dock:noto20-aa,console:noto16-aa chrome=9x20 body=7x16 bar=34 ::
+[wc-h] win=1 box=1305x780 span=208 band=yes bytes=1085760 compose_us=1079 present_us=257 rectscan_us=2888 torn=no -> BUFFERED
+[wc-b] win=1 span=208 bh=780 bands=1 chrome_paints=1 chrome_rows=416 chrome_rows_used=416 amp=1.00x -> WHOLE
+[pidesk] menubar ENABLED panel=1920x1200 rect=Some((0, 0, 1920, 34)) was=false (the desktop scene owns the top of the glass)
+:: MENUBAR-OCC-PAR: arch=aarch64 bar_enabled=true clip_arm=present clip_gate=x86+wc|aarch64+desktop_firmware probe=present blocked_on=none occclip_bar=1 occclip_bar_px=32640 forbid_bar=1 forbid_bar_px=0 bar=1920x34+0+0 panel=1920x1200 win=960x136+480+0 crossed=true at_risk_px=32640 clob=0 pre_ok=true :: PASS ::
+[wc-h] win=1 box=1305x780 span=112 band=yes bytes=584640 compose_us=582 present_us=131 rectscan_us=1555 torn=no -> BUFFERED
+[wc-b] win=1 span=112 bh=780 bands=1 chrome_paints=1 chrome_rows=224 chrome_rows_used=224 amp=1.00x -> WHOLE
+[menubar] live passes=1 paints=0 rate=0/1k scan=44cyc/1us paint=0cyc/0us px/paint=0 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[pidesk] menubar PAINTED owns_pixels=true retried=false (composite at the enable seam, read back rather than assumed)
+[pidesk] crystal LIVE — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track yet)
+[wc-b] win=1 span=780 bh=780 bands=1 chrome_paints=1 chrome_rows=1516 chrome_rows_used=1516 amp=1.00x -> WHOLE
+:: SHARD-MENU: crystal_press=open via=crystal-glyph menu=170x121+12+34 items=4 ::
+[crystal] live passes=1 paints=0 rate=0/1k scan=0cyc/0us paint=0cyc/0us px/paint=0 state=open opens=1 dismisses=0 picks=0 clob=0
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+:: SHARD-MENU: crystal_press=dismiss reason=outside ::
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+:: SHARD-PRESS: menu=170x121+12+34 panel=1920x1200 routed=true(open) opened=true painted=true dismissed=true(dismiss) closed=true erased=true :: PASS ::
+[wc-h] win=1 box=1305x780 span=96 band=yes bytes=501120 compose_us=491 present_us=115 rectscan_us=1333 torn=no -> BUFFERED
+[wc-h] rollup win=1 scope=window-band emit=2 age_ms=749 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=5 banded=4 lines=7 minspan=96 minspan_bytes=501120 maxpresent_us=1112 minpresent_us=115 presspread=1 presspop=9 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[pidesk] pulse-window ARMED view=Pi LED lamps (the render pass opens it on its first live instrument sample; menu: click `View` in the window's own strip — first option is the Pi LED face, second is the x86 segment face; the desktop LED band is unchanged)
+[u7stk] at=boot-core:post-cascade task=0:boot-core sp=0x26b3fd820 low=0x26b3f5910 top=0x26b3fd910 len=32768 used=240 hw=15584 headroom=17184
+[deskcascade] -> CASCADED windows=1 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=ROUTED; the render pass ahead presents the scene and mints the shell window on its first pass)
+[orinrender] arm conwin=0 furn=0 tenant=0 click=1 desk=0 cascade=1 scene=1 (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)
+[wedge12] stage-reserve panel=1920x1200x4 want=4194304 got=4194304 entries=1 reserved=1 short=0 secondary=491520 -> RESERVED
+:: PI-DESK: desktop armed — the witness cascade released the panel, furniture may land ::
+[orinrender] spawned tid=4 cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)
+:: AARCH64 SCHED (virt): boot core 0 at EL1 — running the full M4 CAPSTONE cooperatively ::
+:: VUG-HONESTY: parked-core display witness PASS — a frozen non-demo core reads PARKED (never the demo core's load); scheduled cores read their busy fraction, the demo core its render load ::
+:: CAPSTONE: drain witnesses SKIPPED (queue not drained at entry — 4 task(s) pre-staged) ::
+:: AARCH64 SCHED-BAL: work-stealing witness — 0 steals total across 5 online cores, 0 core(s) ran work ::
+:: AARCH64 SCHED-BAL: c0 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c1 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c2 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c3 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c4 busy=0 steals=0 ::
+:: AARCH64 SCHED-BAL: c5 busy=0 steals=0 ::
+:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
+:: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=26
+:: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+[serialrx] lsr=0x00000220 base=0x0c280000 iir=0xc1 fifo=on -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (0x00000000 = AON UART held in reset/clock-gated, needs BPMP; 0xffffffff = open bus / wrong BASE; 0xdead.... = SoC decode error; else live)
+:: SCHED: load c0=99%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=29
+:: SVC: EC=0x15 nr=1 — EL0->EL1 syscall path live ::
+hello from EL0
+[el0stkhw] task=2:el0-hello len=16384 hw=3696 headroom=12688 loguard=0
+:: TEGRA-EL0: el0-hello round-trip -> PASS ::
+:: UI1: scale=1 cell=8x8 line=12 ::
+[wc-b] rollup presents=21 banded=0 maxbands=1 chrome_rows=10977 chrome_rows_used=10977 amp=1.00x -> UNBANDED
+[realdesk] backdrop=desktop-scene retired=pulse-band,status-line bottom_reserved=104->64 panel=1920x1200 menubar=Some((0, 0, 1920, 34)) dock_h=64 was=false == witness ::
+[orinrender] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)
+[pstrip] armed cores=6 panel=(0,1096,1920x92) row_h=13 bar=(x=30,w=1824) leds=304 led=5x10 gap=1 bands=8 full=1000 strip_h=12 reserved=64 period=250ms attack=instant decay=1000ms
+[pstrip] src live=6/6 quantum=10 stepres=18px mono=yes PASS
+[wc-a] create win=2 asid=0xffffff60 surf=1280x168 stride=5120 scale=1x at (15,953) z=2
+[wc-g] win=2 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x46fd96e31cd8a325 civac=0x46fd96e31cd8a325 after=0x46fd96e31cd8a325 fbbad=0/215040 occluded=0 occ=0/0 us=1210 rectscan_us=2333 slow=no -> CLEAN
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[wc-g] prof win=2 seq=0 surf_bytes=860160 cks_blit_us=1654 civac_us=1750 cks_after_us=1653 probes=215040 readback_us=1179
+[wc-h] win=2 box=1290x212 span=212 band=no bytes=1093920 compose_us=952 present_us=144 rectscan_us=2944 torn=no -> BUFFERED
+[pulsewin] open win=2 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: click `View` for the two faces — first option is the Pi's)
+[wc-g] win=2 seq=1 own=yes scale=1x app=0x52ab08780d6fce15 blit=0x52ab08780d6fce15 civac=0x52ab08780d6fce15 after=0x52ab08780d6fce15 fbbad=0/215040 occluded=0 occ=0/0 us=1174 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=2 seq=1 surf_bytes=860160 cks_blit_us=1654 civac_us=1751 cks_after_us=1653 probes=215040 readback_us=1188
+[wc-h] win=2 box=1290x212 span=212 band=no bytes=1093920 compose_us=949 present_us=111 rectscan_us=2944 torn=no -> BUFFERED
+[wc-d] verify win=2 surf=1280x168 band=none scale=1x at (15,953) panel=1920x1200 checked=215040 bad_cache=0 bad_ram=0 ram_indep=yes moved=0 sprite_px=0 nonzero=215040 occluded=0 occ=0/0 cksum=0x52ab08780d6fce15 first=none fills=0->0 fact=0/0 desk=0->0 dact=0/0 stable=yes -> PASS
+[wc-w] rollup presents=1 requested_px=0 presented_px=2304000 amp=0.00x full_presents=1 bracketq_met=0 bracketq_busy=0 -> WIDENED
+[u7stk] at=orin-render:pass1 task=4:orin-render sp=0x268cec740 low=0x268ce4c80 top=0x268cecc80 len=32768 used=1344 hw=23232 headroom=9536
+[orinrender] census passes=1 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: CAPSTONE: verifying all 6 sync primitives (workers on cores 0 + 0) ::
+[serialrx] rx=0 (+0) polls=2 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: CAPSTONE Semaphore: PASS ::
+:: CAPSTONE Mutex: PASS ::
+:: CAPSTONE Channel: PASS ::
+:: CAPSTONE Condvar: PASS ::
+[wc-g] win=2 seq=2 own=yes scale=1x app=0x110d191fe0d9f936 blit=0x110d191fe0d9f936 civac=0x110d191fe0d9f936 after=0x110d191fe0d9f936 fbbad=0/215040 occluded=0 occ=0/0 us=1198 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=2 seq=2 surf_bytes=860160 cks_blit_us=1653 civac_us=1750 cks_after_us=1653 probes=215040 readback_us=1194
+[wc-h] win=2 box=1290x212 span=212 band=no bytes=1093920 compose_us=967 present_us=115 rectscan_us=2944 torn=no -> BUFFERED
+[wc-h] rollup win=2 scope=window emit=1 age_ms=277 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=4 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=109 presspread=1 presspop=4 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: CAPSTONE RwLock: PASS ::
+:: CAPSTONE join: PASS ::
+:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
+[wc-g] win=2 seq=3 own=yes scale=1x app=0x7643f59a315b1582 blit=0x7643f59a315b1582 civac=0x7643f59a315b1582 after=0x7643f59a315b1582 fbbad=0/215040 occluded=0 occ=0/0 us=1177 rectscan_us=2333 slow=no -> CLEAN
+[wc-g] prof win=2 seq=3 surf_bytes=860160 cks_blit_us=1654 civac_us=1751 cks_after_us=1655 probes=215040 readback_us=1191
+[wc-g] rollup win=2 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=0 maxus=1210 wit_us=24983 frame_us=16667 -> CLEAN
+:: [orinbsptick] tick 250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +336882/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=52
+[wc-b] rollup presents=44 banded=0 maxbands=1 chrome_rows=17361 chrome_rows_used=17361 amp=1.00x -> UNBANDED
+[orinrender] census passes=252112 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=254453 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-h] rollup win=1 scope=window emit=3 age_ms=2846 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=7 banded=33 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1120 minpresent_us=41 presspread=1 presspop=40 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=88%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +601416/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=74
+[orinrender] census passes=558370 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-b] rollup presents=56 banded=0 maxbands=1 chrome_rows=22125 chrome_rows_used=22125 amp=1.00x -> UNBANDED
+[serialrx] rx=0 (+0) polls=558371 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=2 age_ms=2481 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=16 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=104 presspread=1 presspop=16 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: [orinbsptick] tick 750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +608890/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=98
+[orinrender] census passes=862815 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-b] rollup presents=64 banded=0 maxbands=1 chrome_rows=24157 chrome_rows_used=24157 amp=1.00x -> UNBANDED
+[serialrx] rx=0 (+0) polls=862817 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 1000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-h] rollup win=1 scope=window emit=4 age_ms=4972 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=7 banded=40 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1120 minpresent_us=41 presspread=1 presspop=47 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +633706/win nofold=0x0) ::
+[dock] live passes=67 paints=2 rate=29/1k scan=25cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=124
+[orinrender] census passes=1162098 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-b] rollup presents=70 banded=0 maxbands=1 chrome_rows=25809 chrome_rows_used=25809 amp=1.00x -> UNBANDED
+[wcn] win=1 asid=0xffffff01 live=yes above=yes att=47 comp=47 hid=0 bel=0 rate=17.8/s comp_rate=17.8/s active=2626ms parked=2594ms gap=18..242ms z=1 pre=47 drg=0 dout=3 dkpx=801 drly=0 q=1.1..14.5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=20 hid=0 bel=0 rate=4.6/s comp_rate=5.8/s active=3418ms parked=500ms gap=170..250ms z=2 pre=17 drg=3 dout=0 dkpx=0 drly=0 q=10.2..15.0
+[wcn] rollup scope=live wins=2 att=63 comp=67 hid=0 bel=0 stale=0 passes=67 aborted=0 att_rate=12.2/s comp_rate=13.0/s span=5125ms -> LIVE
+[comp2] rollup passes=67 pass_us=12401 max_us=124417 sprite_us=260 wait_us=2 blit_us=10436 compose_us=861 present_us=175 cache_us=88 bytes_pp=929769 dmg_px_pp=232442 box_px_pp=799766 straddle_us=0 wcd_us=28623 util_pct=16 rate=13.0/s span=5125ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=2 overlap=12 span=5125ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=69 -> INERT
+[noatt] scope=live passes=67 seeds=64 noatt=1 noatt_kpx=267 rate=0.1/s taker=0 span=5125ms -> UNATTRIBUTED
+[wcpar] cores=1 total=68 max=68 c0=68 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5125ms
+[serialrx] rx=0 (+0) polls=1162099 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=3 age_ms=4537 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=23 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=104 presspread=1 presspop=23 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[menubar] live passes=66 paints=1 rate=15/1k scan=31036cyc/993us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+:: SCHED: load c0=87%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +502610/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=146
+:: [orinbsptick] tick 1250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=1428608 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[wc-b] rollup presents=80 banded=0 maxbands=1 chrome_rows=28990 chrome_rows_used=28990 amp=1.00x -> UNBANDED
+[serialrx] rx=0 (+0) polls=1461471 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +626960/win nofold=0x0) ::
+[wc-h] rollup win=1 scope=window emit=5 age_ms=7043 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=1 whole=8 banded=47 lines=7 minspan=48 minspan_bytes=250560 maxpresent_us=1120 minpresent_us=41 presspread=1 presspop=55 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=170
+:: [orinbsptick] tick 1500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=1731303 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=1767302 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=89 banded=0 maxbands=1 chrome_rows=32577 chrome_rows_used=32577 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 1750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=2054812 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=2090803 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=4 age_ms=7294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=34 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=104 presspread=1 presspop=34 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=96 banded=0 maxbands=1 chrome_rows=34165 chrome_rows_used=34165 amp=1.00x -> UNBANDED
+[panel-owner] panel-ownership-handover from=owner-console-window to=owner-gui-screen site=fbcon::detach
+:: UI1: scale=1 cell=8x8 line=12 ::
+:: tegra: JD2 — OUT | UnaOS — Jetson Orin Nano (Tegra234) ::
+:: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
+[wc-w] rollup presents=2 requested_px=0 presented_px=4608000 amp=0.00x full_presents=1 bracketq_met=0 bracketq_busy=0 -> WIDENED
+:: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::
+:: SCHED: load c0=88%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1218798/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=218
+[orinclick] arm panel=1920x1200 rows=2 compat=0 focus=0x0 pidesk=1 t=31 -> ARMED
+[orinrender] census passes=2344894 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 2000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=2379536 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=102 banded=0 maxbands=1 chrome_rows=36161 chrome_rows_used=36161 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +635485/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=241
+[dock] live passes=99 paints=2 rate=20/1k scan=24cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[orinrender] census passes=2662203 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 2250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=2696885 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wcn] win=1 asid=0xffffff01 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=13.9/s comp_rate=13.9/s active=1004ms parked=2677ms gap=40..220ms z=1 pre=14 drg=0 dout=3 dkpx=801 drly=0 q=2.4..13.2
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=17 comp=20 hid=0 bel=0 rate=6.1/s comp_rate=7.2/s active=2747ms parked=2566ms gap=249..250ms z=2 pre=17 drg=3 dout=0 dkpx=0 drly=0 q=14.9..15.0
+[wcn] rollup scope=live wins=2 att=31 comp=34 hid=0 bel=0 stale=0 passes=31 aborted=0 att_rate=6.0/s comp_rate=6.6/s span=5118ms -> LIVE
+[comp2] rollup passes=31 pass_us=6563 max_us=44526 sprite_us=0 wait_us=1 blit_us=5815 compose_us=904 present_us=139 cache_us=98 bytes_pp=1008851 dmg_px_pp=252212 box_px_pp=636135 straddle_us=0 wcd_us=0 util_pct=3 rate=6.0/s span=5118ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=2 overlap=2 span=5118ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=100 -> INERT
+[wcpar] cores=1 total=34 max=34 c0=34 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5118ms
+[wc-h] rollup win=2 scope=window emit=5 age_ms=9544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=42 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=103 presspread=1 presspop=42 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=105 banded=0 maxbands=1 chrome_rows=37301 chrome_rows_used=37301 amp=1.00x -> UNBANDED
+[menubar] live passes=96 paints=1 rate=10/1k scan=21342cyc/682us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +544851/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=264
+[pstrip] rollup samples=39 redraws=35 skipped=4 srcdelta=34 rate=3.5/s srate=3.9/s gapmax=306ms lat_max_ms=306 period=250ms decay=1000ms
+[pstrip] src live=6/6 quantum=10 stepres=18px mono=yes PASS
+[orinrender] census passes=2932740 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=2969179 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 2500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +638550/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=288
+[wc-b] rollup presents=110 banded=0 maxbands=1 chrome_rows=39201 chrome_rows_used=39201 amp=1.00x -> UNBANDED
+[orinrender] census passes=3251634 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=3288090 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 2750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=3581486 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=3617876 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 3000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=3912417 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=3948804 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 3250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=4244883 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=4278486 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=6 age_ms=14294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=50 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=103 presspread=1 presspop=50 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=113 banded=0 maxbands=1 chrome_rows=40341 chrome_rows_used=40341 amp=1.00x -> UNBANDED
+[dock] live passes=109 paints=2 rate=18/1k scan=24cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=9 comp=9 hid=0 bel=0 rate=5.1/s comp_rate=5.1/s active=1750ms parked=3250ms gap=250..250ms z=2 pre=9 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=9 comp=9 hid=0 bel=0 stale=0 passes=9 aborted=0 att_rate=1.7/s comp_rate=1.7/s span=5051ms -> LIVE
+[comp2] rollup passes=9 pass_us=13374 max_us=54029 sprite_us=0 wait_us=1 blit_us=10470 compose_us=947 present_us=106 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=1.7/s span=5051ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5051ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=109 -> INERT
+[wcpar] cores=1 total=9 max=9 c0=9 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5051ms
+:: [orinbsptick] tick 3500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[menubar] live passes=106 paints=1 rate=9/1k scan=19329cyc/618us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2525641/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=384
+[orinrender] census passes=4519545 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=4555977 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=118 banded=0 maxbands=1 chrome_rows=42241 chrome_rows_used=42241 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 3750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +639967/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=408
+[orinrender] census passes=4839599 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=4876087 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=7 age_ms=16544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=58 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=95 presspread=1 presspop=58 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=121 banded=0 maxbands=1 chrome_rows=43381 chrome_rows_used=43381 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 4000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +621148/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=432
+[orinrender] census passes=5147318 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=5183791 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 4250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +639186/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=456
+[orinclick] census seq=1 t=71 up=10s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-b] rollup presents=126 banded=0 maxbands=1 chrome_rows=45281 chrome_rows_used=45281 amp=1.00x -> UNBANDED
+[orinrender] census passes=5463433 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=5499891 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 4500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=5793160 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=5829555 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 4750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[pstrip] rollup samples=40 redraws=22 skipped=18 srcdelta=22 rate=2.2/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=6119837 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=6156233 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=8 age_ms=20294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=66 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=95 presspread=1 presspop=66 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=129 banded=0 maxbands=1 chrome_rows=46421 chrome_rows_used=46421 amp=1.00x -> UNBANDED
+[dock] live passes=125 paints=2 rate=16/1k scan=23cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=120 paints=1 rate=8/1k scan=17076cyc/546us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=4.9/s comp_rate=4.9/s active=3250ms parked=2750ms gap=250..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=2.6/s comp_rate=2.6/s span=6013ms -> LIVE
+[comp2] rollup passes=16 pass_us=9104 max_us=65296 sprite_us=0 wait_us=1 blit_us=6750 compose_us=943 present_us=102 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.6/s span=6013ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6013ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=125 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6013ms
+:: [orinbsptick] tick 5000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=6403555 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=6440033 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 5250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=6736287 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=6769926 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=132 banded=0 maxbands=1 chrome_rows=47561 chrome_rows_used=47561 amp=1.00x -> UNBANDED
+[wc-h] rollup win=2 scope=window emit=9 age_ms=22544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=70 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=95 presspread=1 presspop=70 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3150574/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=576
+:: [orinbsptick] tick 5500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=7045018 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=7078713 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=137 banded=0 maxbands=1 chrome_rows=49461 chrome_rows_used=49461 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +638701/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=600
+:: [orinbsptick] tick 5750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=7364380 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=7398051 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=140 banded=0 maxbands=1 chrome_rows=50601 chrome_rows_used=50601 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 6000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=7689282 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=7725732 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=10 age_ms=25294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=78 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=95 presspread=1 presspop=78 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=142 banded=0 maxbands=1 chrome_rows=51361 chrome_rows_used=51361 amp=1.00x -> UNBANDED
+[dock] live passes=138 paints=2 rate=14/1k scan=22cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=133 paints=1 rate=7/1k scan=15408cyc/493us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=13 comp=13 hid=0 bel=0 rate=5.7/s comp_rate=5.7/s active=2250ms parked=3250ms gap=250..250ms z=2 pre=13 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=13 comp=13 hid=0 bel=0 stale=0 passes=13 aborted=0 att_rate=2.3/s comp_rate=2.3/s span=5468ms -> LIVE
+[comp2] rollup passes=13 pass_us=9644 max_us=32848 sprite_us=0 wait_us=1 blit_us=7600 compose_us=939 present_us=104 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.3/s span=5468ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5468ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=138 -> INERT
+[wcpar] cores=1 total=13 max=13 c0=13 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5468ms
+:: SCHED: load c0=91%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1211312/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=648
+[orinrender] census passes=7967877 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 6250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=8002551 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +642562/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=672
+[wc-b] rollup presents=146 banded=0 maxbands=1 chrome_rows=52881 chrome_rows_used=52881 amp=1.00x -> UNBANDED
+[orinrender] census passes=8287990 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 6500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=8322615 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=11 age_ms=27544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=85 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=95 presspread=1 presspop=85 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +618469/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=696
+[orinclick] census seq=2 t=111 up=20s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=8595439 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=8631844 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=151 banded=0 maxbands=1 chrome_rows=54781 chrome_rows_used=54781 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 6750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +632245/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=720
+[orinrender] census passes=8915552 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=8951960 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 7000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=155 banded=0 maxbands=1 chrome_rows=56301 chrome_rows_used=56301 amp=1.00x -> UNBANDED
+[pstrip] rollup samples=40 redraws=27 skipped=13 srcdelta=27 rate=2.7/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=9238824 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9275292 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 7250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=9571619 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9605269 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=12 age_ms=31294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=93 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=93 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=156 banded=0 maxbands=1 chrome_rows=56681 chrome_rows_used=56681 amp=1.00x -> UNBANDED
+[dock] live passes=152 paints=2 rate=13/1k scan=22cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=147 paints=1 rate=6/1k scan=13941cyc/446us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=5.0/s comp_rate=5.0/s active=2750ms parked=2750ms gap=250..250ms z=2 pre=14 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=14 comp=14 hid=0 bel=0 stale=0 passes=14 aborted=0 att_rate=2.5/s comp_rate=2.5/s span=5532ms -> LIVE
+[comp2] rollup passes=14 pass_us=9858 max_us=65376 sprite_us=0 wait_us=1 blit_us=7953 compose_us=944 present_us=102 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.5/s span=5532ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5532ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=152 -> INERT
+[wcpar] cores=1 total=14 max=14 c0=14 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5532ms
+:: [orinbsptick] tick 7500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=9852424 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=9888852 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 7750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=159 banded=0 maxbands=1 chrome_rows=57821 chrome_rows_used=57821 amp=1.00x -> UNBANDED
+[orinrender] census passes=10180090 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=10216503 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 8000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=10511112 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=10547493 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 8250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=10843763 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=10877331 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=13 age_ms=35294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=98 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=98 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=161 banded=0 maxbands=1 chrome_rows=58581 chrome_rows_used=58581 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 8500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=11156574 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=11193001 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=165 banded=0 maxbands=1 chrome_rows=60101 chrome_rows_used=60101 amp=1.00x -> UNBANDED
+[dock] live passes=161 paints=2 rate=12/1k scan=22cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=156 paints=1 rate=6/1k scan=13138cyc/420us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=9 comp=9 hid=0 bel=0 rate=6.0/s comp_rate=6.0/s active=1500ms parked=3750ms gap=250..250ms z=2 pre=9 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=9 comp=9 hid=0 bel=0 stale=0 passes=9 aborted=0 att_rate=1.7/s comp_rate=1.7/s span=5218ms -> LIVE
+[comp2] rollup passes=9 pass_us=9758 max_us=40281 sprite_us=0 wait_us=1 blit_us=6856 compose_us=943 present_us=103 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=1.7/s span=5218ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5218ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=161 -> INERT
+[wcpar] cores=1 total=9 max=9 c0=9 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5218ms
+:: [orinbsptick] tick 8750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=88%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5056295/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=909
+[orinrender] census passes=11443655 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=11480085 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=14 age_ms=37544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=106 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=106 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=169 banded=0 maxbands=1 chrome_rows=61621 chrome_rows_used=61621 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 9000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +616602/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=933
+[orinclick] census seq=3 t=151 up=30s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=11747972 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=11784414 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 9250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +639798/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=957
+[wc-b] rollup presents=174 banded=0 maxbands=1 chrome_rows=63521 chrome_rows_used=63521 amp=1.00x -> UNBANDED
+[orinrender] census passes=12066874 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=12103282 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 9500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[pstrip] rollup samples=40 redraws=21 skipped=19 srcdelta=21 rate=2.1/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=12392520 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=12428920 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=15 age_ms=40294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=114 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=114 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=177 banded=0 maxbands=1 chrome_rows=64661 chrome_rows_used=64661 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 9750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=12708304 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=12744743 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 10000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=13039225 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13075617 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=180 banded=0 maxbands=1 chrome_rows=65801 chrome_rows_used=65801 amp=1.00x -> UNBANDED
+[dock] live passes=176 paints=2 rate=11/1k scan=21cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=171 paints=1 rate=5/1k scan=11986cyc/383us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=15 comp=15 hid=0 bel=0 rate=5.0/s comp_rate=5.0/s active=3000ms parked=2750ms gap=250..250ms z=2 pre=15 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=15 comp=15 hid=0 bel=0 stale=0 passes=15 aborted=0 att_rate=2.6/s comp_rate=2.6/s span=5750ms -> LIVE
+[comp2] rollup passes=15 pass_us=8950 max_us=40462 sprite_us=0 wait_us=1 blit_us=7164 compose_us=942 present_us=104 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.6/s span=5750ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5750ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=176 -> INERT
+[wcpar] cores=1 total=15 max=15 c0=15 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5750ms
+[wc-h] rollup win=2 scope=window emit=16 age_ms=42544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=118 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=118 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2491787/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1051
+:: [orinbsptick] tick 10250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=13317748 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13351285 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=184 banded=0 maxbands=1 chrome_rows=67321 chrome_rows_used=67321 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +637323/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1075
+:: [orinbsptick] tick 10500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=13636374 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13669983 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=188 banded=0 maxbands=1 chrome_rows=68841 chrome_rows_used=68841 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 10750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=13960743 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=13997216 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=17 age_ms=45294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=126 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=126 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=190 banded=0 maxbands=1 chrome_rows=69601 chrome_rows_used=69601 amp=1.00x -> UNBANDED
+[orinrender] census passes=14280084 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 11000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=14314743 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[orinrender] census passes=14609722 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 11250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=14644318 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=193 banded=0 maxbands=1 chrome_rows=70741 chrome_rows_used=70741 amp=1.00x -> UNBANDED
+[wc-h] rollup win=2 scope=window emit=18 age_ms=47544 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=131 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=131 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[dock] live passes=190 paints=2 rate=10/1k scan=21cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=185 paints=1 rate=5/1k scan=11080cyc/354us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=6.2/s comp_rate=6.2/s active=2250ms parked=3000ms gap=250..250ms z=2 pre=14 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=14 comp=14 hid=0 bel=0 stale=0 passes=14 aborted=0 att_rate=2.6/s comp_rate=2.6/s span=5273ms -> LIVE
+[comp2] rollup passes=14 pass_us=11190 max_us=55933 sprite_us=0 wait_us=1 blit_us=9285 compose_us=943 present_us=103 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.6/s span=5273ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5273ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=190 -> INERT
+[wcpar] cores=1 total=14 max=14 c0=14 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5273ms
+:: SCHED: load c0=88%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2500104/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1171
+[orinclick] census seq=4 t=191 up=40s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=14882471 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=14918962 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=197 banded=0 maxbands=1 chrome_rows=72261 chrome_rows_used=72261 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 11500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +632082/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1195
+[orinrender] census passes=15202511 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15238974 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 11750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[pstrip] rollup samples=40 redraws=24 skipped=16 srcdelta=24 rate=2.4/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=15529985 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15566470 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 12000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=15860950 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=15897446 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 12250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=16193837 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=16227406 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=19 age_ms=52294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=138 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=138 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=201 banded=0 maxbands=1 chrome_rows=73781 chrome_rows_used=73781 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 12500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[dock] live passes=199 paints=2 rate=10/1k scan=21cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=194 paints=1 rate=5/1k scan=10566cyc/338us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=9 comp=9 hid=0 bel=0 rate=5.1/s comp_rate=5.1/s active=1750ms parked=3500ms gap=250..250ms z=2 pre=9 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=9 comp=9 hid=0 bel=0 stale=0 passes=9 aborted=0 att_rate=1.7/s comp_rate=1.7/s span=5217ms -> LIVE
+[comp2] rollup passes=9 pass_us=8712 max_us=40465 sprite_us=0 wait_us=1 blit_us=6147 compose_us=942 present_us=106 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=1.7/s span=5217ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5217ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=199 -> INERT
+[wcpar] cores=1 total=9 max=9 c0=9 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5217ms
+:: SCHED: load c0=90%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2531224/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1291
+[orinrender] census passes=16468254 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=16504758 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=206 banded=0 maxbands=1 chrome_rows=75681 chrome_rows_used=75681 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 12750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +639750/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1315
+[orinrender] census passes=16787998 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=16824417 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 13000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=17119895 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=17153539 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=20 age_ms=55294 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=146 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=146 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=209 banded=0 maxbands=1 chrome_rows=76821 chrome_rows_used=76821 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 13250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=17432714 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=17469111 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=213 banded=0 maxbands=1 chrome_rows=78341 chrome_rows_used=78341 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 13500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=17760167 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=17796630 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 13750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinclick] census seq=5 t=231 up=50s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[wc-h] rollup win=2 scope=window emit=21 age_ms=58046 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=151 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=151 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=214 banded=0 maxbands=1 chrome_rows=78721 chrome_rows_used=78721 amp=1.00x -> UNBANDED
+[dock] live passes=210 paints=2 rate=9/1k scan=20cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=205 paints=1 rate=4/1k scan=10000cyc/320us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=11 comp=11 hid=0 bel=0 rate=6.2/s comp_rate=6.2/s active=1750ms parked=3502ms gap=250..250ms z=2 pre=11 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=11 comp=11 hid=0 bel=0 stale=0 passes=11 aborted=0 att_rate=2.0/s comp_rate=2.0/s span=5296ms -> LIVE
+[comp2] rollup passes=11 pass_us=11891 max_us=66768 sprite_us=0 wait_us=1 blit_us=9505 compose_us=941 present_us=103 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.0/s span=5296ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5296ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=210 -> INERT
+[wcpar] cores=1 total=11 max=11 c0=11 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5296ms
+[orinrender] census passes=18046680 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=18074502 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 14000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=18375225 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=18404158 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 14250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[pstrip] rollup samples=40 redraws=16 skipped=24 srcdelta=16 rate=1.6/s srate=4.0/s gapmax=252ms lat_max_ms=252 period=250ms decay=1000ms
+[orinrender] census passes=18702853 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=18731722 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=22 age_ms=60296 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=154 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=154 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=217 banded=0 maxbands=1 chrome_rows=79861 chrome_rows_used=79861 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 14500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=19020400 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=19046436 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=221 banded=0 maxbands=1 chrome_rows=81381 chrome_rows_used=81381 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 14750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=19346863 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=19372922 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=23 age_ms=62546 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=160 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=160 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=223 banded=0 maxbands=1 chrome_rows=82141 chrome_rows_used=82141 amp=1.00x -> UNBANDED
+:: SCHED: load c0=86%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5716896/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1530
+:: [orinbsptick] tick 15000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=19652135 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=19681059 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[dock] live passes=222 paints=2 rate=9/1k scan=20cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=217 paints=1 rate=4/1k scan=9448cyc/302us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=12 comp=12 hid=0 bel=0 rate=5.3/s comp_rate=5.3/s active=2250ms parked=3000ms gap=250..250ms z=2 pre=12 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=12 comp=12 hid=0 bel=0 stale=0 passes=12 aborted=0 att_rate=2.3/s comp_rate=2.3/s span=5206ms -> LIVE
+[comp2] rollup passes=12 pass_us=10086 max_us=40473 sprite_us=0 wait_us=1 blit_us=8149 compose_us=943 present_us=105 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.3/s span=5206ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5206ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=222 -> INERT
+[wcpar] cores=1 total=12 max=12 c0=12 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5206ms
+[wc-b] rollup presents=228 banded=0 maxbands=1 chrome_rows=84041 chrome_rows_used=84041 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +575589/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1554
+:: [orinbsptick] tick 15250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=19939998 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=19968920 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 15500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=20271307 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=20297336 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=24 age_ms=65296 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=169 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=169 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=232 banded=0 maxbands=1 chrome_rows=85561 chrome_rows_used=85561 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 15750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=20584149 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=20613057 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=236 banded=0 maxbands=1 chrome_rows=87081 chrome_rows_used=87081 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 16000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=20911692 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=20940580 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=25 age_ms=67546 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=175 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=175 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=238 banded=0 maxbands=1 chrome_rows=87841 chrome_rows_used=87841 amp=1.00x -> UNBANDED
+:: SCHED: load c0=86%/f=0ms c1=0%/f=2ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2559976/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1648
+[orinclick] census seq=6 t=271 up=60s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=21217846 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 16250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=21246791 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[dock] live passes=238 paints=2 rate=8/1k scan=20cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=233 paints=1 rate=4/1k scan=8799cyc/281us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=4.9/s comp_rate=4.9/s active=3250ms parked=2000ms gap=250..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=3.0/s comp_rate=3.0/s span=5250ms -> LIVE
+[comp2] rollup passes=16 pass_us=8263 max_us=40457 sprite_us=0 wait_us=1 blit_us=6782 compose_us=941 present_us=105 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=3.0/s span=5250ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5250ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=238 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5250ms
+[wc-b] rollup presents=243 banded=0 maxbands=1 chrome_rows=89741 chrome_rows_used=89741 amp=1.00x -> UNBANDED
+:: SCHED: load c0=88%/f=0ms c1=0%/f=2ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +565907/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1672
+[orinrender] census passes=21504676 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=21533566 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 16500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +644006/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1696
+[pstrip] rollup samples=40 redraws=30 skipped=10 srcdelta=30 rate=3.0/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[wc-h] rollup win=2 scope=window emit=26 age_ms=70046 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=184 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=184 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=247 banded=0 maxbands=1 chrome_rows=91261 chrome_rows_used=91261 amp=1.00x -> UNBANDED
+[orinrender] census passes=21810365 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=21839245 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 16750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=22139893 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=22168808 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 17000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=22470638 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=22499544 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=27 age_ms=72296 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=187 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=187 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=250 banded=0 maxbands=1 chrome_rows=92401 chrome_rows_used=92401 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 17250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=22786684 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=22815601 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 17500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=23117580 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=23146529 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 17750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=23450148 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=23476209 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=28 age_ms=75296 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=190 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=190 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=253 banded=0 maxbands=1 chrome_rows=93541 chrome_rows_used=93541 amp=1.00x -> UNBANDED
+[dock] live passes=249 paints=2 rate=8/1k scan=20cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=244 paints=1 rate=4/1k scan=8403cyc/268us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=11 comp=11 hid=0 bel=0 rate=5.5/s comp_rate=5.5/s active=2000ms parked=4750ms gap=250..250ms z=2 pre=11 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=11 comp=11 hid=0 bel=0 stale=0 passes=11 aborted=0 att_rate=1.6/s comp_rate=1.6/s span=6793ms -> LIVE
+[comp2] rollup passes=11 pass_us=14740 max_us=65403 sprite_us=0 wait_us=1 blit_us=12362 compose_us=942 present_us=102 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=1.6/s span=6793ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=6793ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=249 -> INERT
+[wcpar] cores=1 total=11 max=11 c0=11 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=6793ms
+:: [orinbsptick] tick 18000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=23730531 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=23759417 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=257 banded=0 maxbands=1 chrome_rows=95061 chrome_rows_used=95061 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 18250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=24059700 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=24085819 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=29 age_ms=77546 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=196 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=196 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=259 banded=0 maxbands=1 chrome_rows=95821 chrome_rows_used=95821 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 18500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5080161/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1886
+[orinclick] census seq=7 t=311 up=70s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=24360009 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=24388976 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 18750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +630732/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=1910
+[wc-b] rollup presents=264 banded=0 maxbands=1 chrome_rows=97721 chrome_rows_used=97721 amp=1.00x -> UNBANDED
+[orinrender] census passes=24680039 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=24708978 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 19000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[pstrip] rollup samples=40 redraws=20 skipped=20 srcdelta=20 rate=2.0/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=25006581 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=25035522 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 19250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=25337606 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=25366553 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 19500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=25668300 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=25697233 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 19750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=25999122 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=26028022 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=30 age_ms=83298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=204 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=204 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=267 banded=0 maxbands=1 chrome_rows=98861 chrome_rows_used=98861 amp=1.00x -> UNBANDED
+[dock] live passes=263 paints=2 rate=7/1k scan=20cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=258 paints=1 rate=3/1k scan=7948cyc/254us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=5.6/s comp_rate=5.6/s active=2500ms parked=5502ms gap=250..250ms z=2 pre=14 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=14 comp=14 hid=0 bel=0 stale=0 passes=14 aborted=0 att_rate=1.7/s comp_rate=1.7/s span=8002ms -> LIVE
+[comp2] rollup passes=14 pass_us=9491 max_us=65395 sprite_us=0 wait_us=1 blit_us=7598 compose_us=940 present_us=103 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=1.7/s span=8002ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=8002ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=263 -> INERT
+[wcpar] cores=1 total=14 max=14 c0=14 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=8002ms
+:: [orinbsptick] tick 20000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=26282761 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=26311667 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 20250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=26615612 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=26641708 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=270 banded=0 maxbands=1 chrome_rows=100001 chrome_rows_used=100001 amp=1.00x -> UNBANDED
+[wc-h] rollup win=2 scope=window emit=31 age_ms=85548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=208 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=208 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +4483377/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2078
+:: [orinbsptick] tick 20500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=26923984 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=26950100 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=274 banded=0 maxbands=1 chrome_rows=101521 chrome_rows_used=101521 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +637665/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2102
+:: [orinbsptick] tick 20750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=27240844 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=27269774 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=278 banded=0 maxbands=1 chrome_rows=103041 chrome_rows_used=103041 amp=1.00x -> UNBANDED
+[orinclick] census seq=8 t=351 up=80s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+:: [orinbsptick] tick 21000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=27564225 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=27593165 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=32 age_ms=88298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=216 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=216 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=280 banded=0 maxbands=1 chrome_rows=103801 chrome_rows_used=103801 amp=1.00x -> UNBANDED
+[dock] live passes=276 paints=2 rate=7/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=271 paints=1 rate=3/1k scan=7567cyc/242us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=13 comp=13 hid=0 bel=0 rate=5.2/s comp_rate=5.2/s active=2500ms parked=2750ms gap=250..250ms z=2 pre=13 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=13 comp=13 hid=0 bel=0 stale=0 passes=13 aborted=0 att_rate=2.4/s comp_rate=2.4/s span=5217ms -> LIVE
+[comp2] rollup passes=13 pass_us=9719 max_us=32844 sprite_us=0 wait_us=1 blit_us=7688 compose_us=939 present_us=105 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.4/s span=5217ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5217ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=276 -> INERT
+[wcpar] cores=1 total=13 max=13 c0=13 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5217ms
+:: SCHED: load c0=88%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1200185/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2150
+[orinrender] census passes=27842766 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 21250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=27871681 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=284 banded=0 maxbands=1 chrome_rows=105321 chrome_rows_used=105321 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +637784/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2174
+[pstrip] rollup samples=40 redraws=18 skipped=22 srcdelta=18 rate=1.8/s srate=4.0/s gapmax=252ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=28158803 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 21500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=28187799 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=33 age_ms=90548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=224 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=224 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=287 banded=0 maxbands=1 chrome_rows=106461 chrome_rows_used=106461 amp=1.00x -> UNBANDED
+:: SCHED: load c0=86%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +608729/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2198
+[orinrender] census passes=28466149 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=28495111 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 21750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +648969/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2222
+[wc-b] rollup presents=291 banded=0 maxbands=1 chrome_rows=107981 chrome_rows_used=107981 amp=1.00x -> UNBANDED
+[orinrender] census passes=28785554 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=28814519 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 22000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=29117257 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=29143386 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=34 age_ms=93298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=231 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=231 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=294 banded=0 maxbands=1 chrome_rows=109121 chrome_rows_used=109121 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 22250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[dock] live passes=292 paints=2 rate=6/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=287 paints=1 rate=3/1k scan=7146cyc/228us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=4.9/s comp_rate=4.9/s active=3250ms parked=2000ms gap=250..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=3.0/s comp_rate=3.0/s span=5240ms -> LIVE
+[comp2] rollup passes=16 pass_us=8305 max_us=40635 sprite_us=0 wait_us=1 blit_us=6823 compose_us=939 present_us=105 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=3.0/s span=5240ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5240ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=292 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5240ms
+:: SCHED: load c0=90%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1201610/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2269
+[orinrender] census passes=29391465 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=29420390 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 22500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=299 banded=0 maxbands=1 chrome_rows=111021 chrome_rows_used=111021 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +639432/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2293
+[orinrender] census passes=29711107 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=29741742 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=35 age_ms=95548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=239 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=239 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=302 banded=0 maxbands=1 chrome_rows=112161 chrome_rows_used=112161 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 22750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +620446/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2317
+[orinrender] census passes=30018576 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=30049263 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 23000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +642394/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2341
+[wc-b] rollup presents=307 banded=0 maxbands=1 chrome_rows=114061 chrome_rows_used=114061 amp=1.00x -> UNBANDED
+[orinrender] census passes=30337395 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=30368069 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 23250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinclick] census seq=9 t=391 up=90s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=30663352 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=30694026 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=36 age_ms=98298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=247 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=247 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=310 banded=0 maxbands=1 chrome_rows=115201 chrome_rows_used=115201 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 23500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[dock] live passes=308 paints=2 rate=6/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=303 paints=1 rate=3/1k scan=6769cyc/216us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=4.9/s comp_rate=4.9/s active=3250ms parked=1750ms gap=250..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=3.2/s comp_rate=3.2/s span=5000ms -> LIVE
+[comp2] rollup passes=16 pass_us=8297 max_us=40631 sprite_us=0 wait_us=1 blit_us=6818 compose_us=936 present_us=102 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=3.2/s span=5000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=308 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5000ms
+:: SCHED: load c0=91%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1195309/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2387
+[orinrender] census passes=30940152 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=30970826 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=315 banded=0 maxbands=1 chrome_rows=117101 chrome_rows_used=117101 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 23750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +643367/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2411
+[pstrip] rollup samples=40 redraws=31 skipped=9 srcdelta=31 rate=3.1/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=31255956 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=31286589 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=37 age_ms=100548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=255 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=255 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=318 banded=0 maxbands=1 chrome_rows=118241 chrome_rows_used=118241 amp=1.00x -> UNBANDED
+:: SCHED: load c0=87%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +608242/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2435
+:: [orinbsptick] tick 24000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=31564228 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=31594891 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +645730/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2459
+:: [orinbsptick] tick 24250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=322 banded=0 maxbands=1 chrome_rows=119761 chrome_rows_used=119761 amp=1.00x -> UNBANDED
+[orinrender] census passes=31883794 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=31914478 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 24500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=32213589 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=32244266 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 24750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=32544456 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=32575083 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 25000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=32875585 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=32906238 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 25250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=33206449 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=33237148 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=38 age_ms=106298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=262 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=262 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=325 banded=0 maxbands=1 chrome_rows=120901 chrome_rows_used=120901 amp=1.00x -> UNBANDED
+[dock] live passes=321 paints=2 rate=6/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=316 paints=1 rate=3/1k scan=6491cyc/207us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=13 comp=13 hid=0 bel=0 rate=5.2/s comp_rate=5.2/s active=2500ms parked=5000ms gap=250..250ms z=2 pre=13 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=13 comp=13 hid=0 bel=0 stale=0 passes=13 aborted=0 att_rate=1.7/s comp_rate=1.7/s span=7543ms -> LIVE
+[comp2] rollup passes=13 pass_us=10846 max_us=65671 sprite_us=1 wait_us=1 blit_us=8816 compose_us=939 present_us=103 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=1.7/s span=7543ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=7543ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=321 -> INERT
+[wcpar] cores=1 total=13 max=13 c0=13 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=7543ms
+:: [orinbsptick] tick 25500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=33489903 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=33520531 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=329 banded=0 maxbands=1 chrome_rows=122421 chrome_rows_used=122421 amp=1.00x -> UNBANDED
+[orinclick] census seq=10 t=431 up=100s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+:: [orinbsptick] tick 25750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=33814990 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=33842788 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=39 age_ms=108548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=268 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=268 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=331 banded=0 maxbands=1 chrome_rows=123181 chrome_rows_used=123181 amp=1.00x -> UNBANDED
+:: SCHED: load c0=87%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +4466490/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2625
+[orinrender] census passes=34122060 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 26000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=34150906 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=1ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +644338/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2649
+[pstrip] rollup samples=40 redraws=20 skipped=20 srcdelta=20 rate=2.0/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[wc-b] rollup presents=336 banded=0 maxbands=1 chrome_rows=125081 chrome_rows_used=125081 amp=1.00x -> UNBANDED
+[orinrender] census passes=34438960 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=34469625 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 26250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=34768642 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=34799309 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 26500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=35099398 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=35130059 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 26750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=35430125 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=35460754 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=40 age_ms=113298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=276 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=276 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=339 banded=0 maxbands=1 chrome_rows=126221 chrome_rows_used=126221 amp=1.00x -> UNBANDED
+[dock] live passes=335 paints=2 rate=5/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=330 paints=1 rate=3/1k scan=6216cyc/198us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=14 comp=14 hid=0 bel=0 rate=5.6/s comp_rate=5.6/s active=2500ms parked=4500ms gap=250..250ms z=2 pre=14 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=14 comp=14 hid=0 bel=0 stale=0 passes=14 aborted=0 att_rate=2.0/s comp_rate=2.0/s span=7000ms -> LIVE
+[comp2] rollup passes=14 pass_us=9560 max_us=65652 sprite_us=0 wait_us=1 blit_us=7666 compose_us=943 present_us=105 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=2.0/s span=7000ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=7000ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=335 -> INERT
+[wcpar] cores=1 total=14 max=14 c0=14 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=7000ms
+:: [orinbsptick] tick 27000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=35712519 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=35743181 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 27250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=36043547 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=36074242 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 27500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=36374455 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=36405097 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 27750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=36706903 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=36734685 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=41 age_ms=117298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=279 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=279 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=342 banded=0 maxbands=1 chrome_rows=127361 chrome_rows_used=127361 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 28000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinclick] census seq=11 t=471 up=110s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=37015438 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=37046635 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=346 banded=0 maxbands=1 chrome_rows=128881 chrome_rows_used=128881 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 28250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[dock] live passes=342 paints=2 rate=5/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=337 paints=1 rate=2/1k scan=6087cyc/194us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=7 comp=7 hid=0 bel=0 rate=5.6/s comp_rate=5.6/s active=1250ms parked=4000ms gap=250..250ms z=2 pre=7 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=7 comp=7 hid=0 bel=0 stale=0 passes=7 aborted=0 att_rate=1.3/s comp_rate=1.3/s span=5225ms -> LIVE
+[comp2] rollup passes=7 pass_us=12542 max_us=41246 sprite_us=0 wait_us=1 blit_us=8866 compose_us=943 present_us=105 cache_us=109 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=1 rate=1.3/s span=5225ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5225ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=342 -> INERT
+[wcpar] cores=1 total=7 max=7 c0=7 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5225ms
+:: SCHED: load c0=89%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5714606/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2865
+[orinrender] census passes=37301446 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=37332648 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=42 age_ms=119548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=287 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=287 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=350 banded=0 maxbands=1 chrome_rows=130401 chrome_rows_used=130401 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 28500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +619602/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2889
+[pstrip] rollup samples=40 redraws=16 skipped=24 srcdelta=16 rate=1.6/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=37605431 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=37636659 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 28750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +632254/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=2913
+[wc-b] rollup presents=355 banded=0 maxbands=1 chrome_rows=132301 chrome_rows_used=132301 amp=1.00x -> UNBANDED
+[orinrender] census passes=37925182 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=37956392 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 29000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=38254685 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=38285897 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=43 age_ms=122298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=295 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=295 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=358 banded=0 maxbands=1 chrome_rows=133441 chrome_rows_used=133441 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 29250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=38570476 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=38601762 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 29500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=38903356 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=38931731 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=361 banded=0 maxbands=1 chrome_rows=134581 chrome_rows_used=134581 amp=1.00x -> UNBANDED
+[dock] live passes=357 paints=2 rate=5/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=352 paints=1 rate=2/1k scan=5828cyc/186us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=15 comp=15 hid=0 bel=0 rate=5.0/s comp_rate=5.0/s active=3000ms parked=2750ms gap=250..250ms z=2 pre=15 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=15 comp=15 hid=0 bel=0 stale=0 passes=15 aborted=0 att_rate=2.6/s comp_rate=2.6/s span=5742ms -> LIVE
+[comp2] rollup passes=15 pass_us=8997 max_us=40716 sprite_us=0 wait_us=1 blit_us=7222 compose_us=941 present_us=105 cache_us=108 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=2.6/s span=5742ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5742ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=357 -> INERT
+[wcpar] cores=1 total=15 max=15 c0=15 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5742ms
+[wc-h] rollup win=2 scope=window emit=44 age_ms=124548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=299 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=299 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=86%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2503098/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3008
+:: [orinbsptick] tick 29750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=39179004 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=39207387 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=365 banded=0 maxbands=1 chrome_rows=136101 chrome_rows_used=136101 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +637885/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3032
+:: [orinbsptick] tick 30000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=39496144 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=39527427 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=369 banded=0 maxbands=1 chrome_rows=137621 chrome_rows_used=137621 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 30250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=39825269 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=39853656 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=45 age_ms=127298 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=307 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=307 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[wc-b] rollup presents=372 banded=0 maxbands=1 chrome_rows=138761 chrome_rows_used=138761 amp=1.00x -> UNBANDED
+[orinclick] census seq=12 t=511 up=120s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+:: [orinbsptick] tick 30500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=40134365 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=40165615 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 30750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=40465933 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=40494317 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=376 banded=0 maxbands=1 chrome_rows=140281 chrome_rows_used=140281 amp=1.00x -> UNBANDED
+[wc-h] rollup win=2 scope=window emit=46 age_ms=129548 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=314 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=314 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+[dock] live passes=373 paints=2 rate=5/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=368 paints=1 rate=2/1k scan=5575cyc/178us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=16 comp=16 hid=0 bel=0 rate=4.9/s comp_rate=4.9/s active=3250ms parked=2000ms gap=250..250ms z=2 pre=16 drg=0 dout=0 dkpx=0 drly=0 q=15.0..15.0
+[wcn] rollup scope=live wins=2 att=16 comp=16 hid=0 bel=0 stale=0 passes=16 aborted=0 att_rate=3.0/s comp_rate=3.0/s span=5273ms -> LIVE
+[comp2] rollup passes=16 pass_us=9990 max_us=55861 sprite_us=0 wait_us=1 blit_us=8318 compose_us=941 present_us=106 cache_us=110 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=3 rate=3.0/s span=5273ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5273ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=373 -> INERT
+[wcpar] cores=1 total=16 max=16 c0=16 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5273ms
+:: SCHED: load c0=89%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2487365/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3127
+[pstrip] rollup samples=40 redraws=27 skipped=13 srcdelta=27 rate=2.7/s srate=4.0/s gapmax=250ms lat_max_ms=250 period=250ms decay=1000ms
+[orinrender] census passes=40738580 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+:: [orinbsptick] tick 31000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[serialrx] rx=0 (+0) polls=40769801 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=380 banded=0 maxbands=1 chrome_rows=141801 chrome_rows_used=141801 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +629281/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3150
+[orinrender] census passes=41056459 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=41087696 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 31250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=384 banded=0 maxbands=1 chrome_rows=143321 chrome_rows_used=143321 amp=1.00x -> UNBANDED
+[wc-h] rollup win=2 scope=window emit=47 age_ms=131800 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=323 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=323 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: SCHED: load c0=87%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +615388/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3174
+[orinrender] census passes=41364101 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=41395388 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 31500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=389 banded=0 maxbands=1 chrome_rows=145221 chrome_rows_used=145221 amp=1.00x -> UNBANDED
+:: SCHED: load c0=85%/f=0ms c1=0%/f=0ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +640159/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3198
+[orinrender] census passes=41684085 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=41715354 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 31750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=392 banded=0 maxbands=1 chrome_rows=146361 chrome_rows_used=146361 amp=1.00x -> UNBANDED
+[orinrender] census passes=42011461 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=42042745 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=48 age_ms=134300 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=330 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=330 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: [orinbsptick] tick 32000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[wc-b] rollup presents=395 banded=0 maxbands=1 chrome_rows=147501 chrome_rows_used=147501 amp=1.00x -> UNBANDED
+[dock] live passes=391 paints=2 rate=5/1k scan=19cyc/0us paint=3270cyc/104us px/paint=14664 clob=0 presses=0 raises=0 unhides=0
+[menubar] live passes=386 paints=1 rate=2/1k scan=5316cyc/170us paint=5529cyc/176us px/paint=65280 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=5
+[wcn] win=2 asid=0xffffff60 live=yes above=yes att=18 comp=18 hid=0 bel=0 rate=5.1/s comp_rate=5.1/s active=3498ms parked=1754ms gap=249..250ms z=2 pre=18 drg=0 dout=0 dkpx=0 drly=0 q=14.9..15.0
+[wcn] rollup scope=live wins=2 att=18 comp=18 hid=0 bel=0 stale=0 passes=18 aborted=0 att_rate=3.4/s comp_rate=3.4/s span=5229ms -> LIVE
+[comp2] rollup passes=18 pass_us=7864 max_us=32844 sprite_us=0 wait_us=1 blit_us=6367 compose_us=937 present_us=102 cache_us=107 bytes_pp=1093920 dmg_px_pp=273480 box_px_pp=273480 straddle_us=0 wcd_us=0 util_pct=2 rate=3.4/s span=5229ms
+[fluid3] parks=0 park_us mean=0 max=0 p50<=1 p90<=1 p99<=1 depth_max=1 overlap=0 span=5229ms
+[wc-tail] census stash=0 cash=0 stale=0 inline=391 -> INERT
+[wcpar] cores=1 total=18 max=18 c0=18 c1=0 c2=0 c3=0 c4=0 c5=0 c6=0 c7=0 span=5229ms
+:: SCHED: load c0=91%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1212329/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3246
+[orinrender] census passes=42287192 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=42318470 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+:: [orinbsptick] tick 32250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +645853/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3270
+[wc-b] rollup presents=399 banded=0 maxbands=1 chrome_rows=149021 chrome_rows_used=149021 amp=1.00x -> UNBANDED
+[orinrender] census passes=42606111 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=42637426 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-h] rollup win=2 scope=window emit=49 age_ms=136550 pop=budgeted samples=4 budget=4 pop=all-presents torn=0 stalls=0 longpres=0 declines=0 decl_geom=0 decl_cap=0 decl_lock=0 decl_alloc=0 fixture=0 whole=338 banded=0 lines=3 minspan=0 minspan_bytes=0 maxpresent_us=144 minpresent_us=94 presspread=1 presspop=338 pop=constant frame_us=16667 stallbound_us=33334 -> TEAR-FREE
+:: [orinbsptick] tick 32500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=86%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +616612/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3293
+[orinrender] census passes=42916590 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=42947827 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=404 banded=0 maxbands=1 chrome_rows=150921 chrome_rows_used=150921 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 32750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=85%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +634118/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=3316
+[orinclick] census seq=13 t=551 up=130s btn=0 press=0 rel=0 noedge=0 raised=0 same=0 miss=0 consumed=0 stuck=0 nogeom=0 dropped=0 rows=2 compat=0 focus=0x0 -> IDLE-NO-CLICKS
+[orinrender] census passes=43232540 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE
+[serialrx] rx=0 (+0) polls=43263805 refused=0 ovrf=0 lsr0=0x00000220 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature)
+[wc-b] rollup presents=407 banded=0 maxbands=1 chrome_rows=152061 chrome_rows_used=152061 amp=1.00x -> UNBANDED
+:: [orinbsptick] tick 33000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[orinrender] census passes=43561864 presents=1 win=0 declined=1 strip=retired pulsewin=2 -> RENDER-LIVE

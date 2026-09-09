@@ -1,0 +1,8 @@
+:: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [0x80000000, 0x80200000) (2048 KiB) — lowest clean L2-split block in [0x80000000,
+:: PCIE4:   [net4F] rx-ring phys=0x80000000 buffers=32 rx-bufs=[0x80010000..0x80020000) tx-ring phys=0x80020000 below4g=1 — every DMA obje
+:: PCIE4:   [net4F] distinct buffers-written(count=2)=[0,17,-1,-1] across the first 4 RX completion(s) at=completion-4 below4g=1 rx-ring=0x8
+:: PCIE4:   [net4F] VERDICT tag-proven single-address latch: 4 consecutive completions (through slot 4) wrote ONLY buffer 17 — measured by
+:: PCIE4:   [net4F] RX ring pass verdict: pops=5 NUM_RX=32 wraps=0 RDU-clears=0 RXOVW-clears=0 CR=0x0c RxEnb=1 ISR=0x0084 — one pass only,
+:: PCIE4:   [net4F] distinct buffers-written(count=2)=[0,17,-1,-1] across the first 4 RX completion(s) at=window-close below4g=1 rx-ring=0x8
+:: PCIE4:   [net4V no-lease verdict] dhcp-tx: discover=1 request=0 | dhcp-rx: offer=0 ack=0 nak=0 | ring: popped=5/32 wraps=0 zero-payload=4
+cpu_on=5 exceptions=0 alias_region1=0 identity_covered=5

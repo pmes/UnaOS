@@ -43,37 +43,52 @@
 //!   `ui_status` (`METER_DIM`/`METER_BREATH`/`METER_PARKED`); the two the demo family owns are copied
 //!   with attribution below, exactly as `user-pulse` copied them.
 //!
-//! ## The menu, stated plainly
+//! ## The menu — ⚠ IT IS NOT IN THIS WINDOW ANY MORE (R21, Peter, 2026-09-06)
 //!
-//! Peter asked for *"the first menu option to switch between the 2 views"*. This kernel has exactly one
-//! menu framework — `crystal`'s SHARD dropdown — and it is hard-wired to the menu bar's brand mark: it
-//! owns a `const` tree of power verbs, anchors itself under `menubar::crystal_box_abs` and paints
-//! through the `strip` primitive onto the PANEL. It is not a per-window menu and generalising it into
-//! one is a different arc from this one.
+//! **What this header used to say, and it is recorded rather than deleted because the PREMISE was
+//! right and the CONCLUSION was wrong:** *"This kernel has exactly one menu framework — `crystal`'s
+//! SHARD dropdown — and it is hard-wired to the menu bar's brand mark … It is not a per-window menu
+//! and generalising it into one is a different arc from this one. So the pulse window carries its own
+//! menu strip as the first row of its own content."*
 //!
-//! So the pulse window carries **its own menu strip as the first row of its own content**, drawn into
-//! its own surface and hit-tested in its own coordinates — which is what a windowed app's menu is. One
-//! title, `View`; clicking it drops a two-row menu whose FIRST option is the Pi's lamps and whose second
-//! is the x86-style segments, with a mark against whichever is live. No framework was invented and none
-//! was generalised; nothing outside this window can see or reach this menu.
+//! Peter, on seeing that row on glass: *"WHO PUT THE GOD DAMN MENU IN THE WINDOW IT GOES IN THE -----
+//! GOD DAMN MENU BAR"*. The premise was a true statement about the code; the conclusion drew the wrong
+//! thing from it. One menu framework hard-wired to one publisher is an argument for giving the
+//! framework a SECOND publisher, not for building a private one inside a window. That generalisation
+//! is [`super::winmenu`], and this window is its first client:
+//!
+//! * On [`open`] it PUBLISHES a `&'static` tree — one title, `View`, two items, the Pi's lamps first
+//!   (Peter: *"the first menu option to switch between the 2 views"*, and the first option is the view
+//!   the window opens on) with a mark against whichever is live. On [`close`] it CLEARS it.
+//! * The bar draws that title right of the caption slot; the dropdown opens under it, through the
+//!   SHARD dropdown's own paint discipline and its own row metrics.
+//! * A pick arrives back here as [`on_menu_pick`], which sets the view and re-publishes the other
+//!   `const` tree — which is how the check mark moves without a single byte of allocation.
+//!
+//! **The window's first content row is back with the instrument.** The surface height is unchanged
+//! this arc (`content_extent` still budgets [`menu_h`]), so the meter simply gains the row the strip
+//! used to occupy; reclaiming the pixels is a geometry change and belongs to whoever next has a
+//! reason to move this box.
 //!
 //! ## Why the press arm is where it is
 //!
 //! [`press_route`] is called from the aarch64 click router's PI-DESK furniture line, ahead of every
 //! window arm, and it is the reason that line reads as an `||`. It cannot steal a click from anything:
 //! it re-asks `wm::hit_test` and declines unless the TOPMOST window at that point is this one, so a
-//! window stacked over the pulse window keeps its own presses. It claims exactly two regions — this
-//! window's close disc and this window's menu — and answers `false` everywhere else, so chrome drags,
-//! minimise, zoom and focus all still reach the arms below it untouched.
+//! window stacked over the pulse window keeps its own presses. Since R21 it claims exactly ONE region
+//! — this window's close disc — and answers `false` everywhere else, so chrome drags, minimise, zoom
+//! and focus all still reach the arms below it untouched. The menu's press is `winmenu`'s, in the bar,
+//! through the ONE shared furniture router.
 //!
 //! **And it does not PAINT.** A press flips one atomic and returns; the repaint is [`service`]'s, on the
 //! render core, one paced call per pulse period. That split is not tidiness — it is the ledger at the
 //! tail of `desktop_firmware::activate` applied before the fact. The Pi's live routed console was MEASURED turning
 //! a 108/108 bench-geometry run into 97/108 with a synchronous exception, and the diagnosis was not "who
 //! writes the panel" but *who drives the COMPOSITOR*: a surface that presents from arbitrary call
-//! context is an unsynchronised compositor client. A menu painting from the input task would be exactly
-//! that, for a picture whose whole content changes four times a second anyway. The cost is that a pick
-//! appears on the next tick rather than instantly — bounded by `ui_status::PSTRIP_PERIOD_MS`, 250 ms.
+//! context is an unsynchronised compositor client. The cost is that a face switch appears on the next
+//! tick rather than instantly — bounded by `ui_status::PSTRIP_PERIOD_MS`, 250 ms. (The BAR's half of
+//! the gesture is not paced that way and must not be: `winmenu` drives its own composite, exactly as
+//! `crystal` does, because on a static desktop no other pass is coming.)
 //!
 //! ## Gating
 //!
@@ -82,7 +97,7 @@
 //! turned on by a knob rather than by an arch. Only `desktop_firmware::activate` ARMS the window today; on x86 the
 //! module compiles, type-checks and is unreferenced, which is what keeps the port from rotting.
 
-use super::{theme, wm};
+use super::{winmenu, wm};
 use crate::pal::GneissPal;
 use crate::ui_status::{
     self, METER_BREATH, METER_DIM, METER_PARKED, PARKED, PERMILLE_FULL, PSTRIP_MAX_CPUS,
@@ -99,15 +114,6 @@ use spin::Mutex;
 /// second seat for the instrument, not a cut-out of the first, and an operator with both on the glass
 /// should be able to say which is which without reading a title.
 const WIN_BG: u32 = 0x00_100E16;
-
-/// The menu strip's face and its keyline — the kit's chrome, so the strip reads as furniture rather
-/// than as content that happens to be at the top.
-const MENU_BG: u32 = theme::CHROME_FACE;
-const MENU_LINE: u32 = theme::FRAME_LINE;
-const MENU_TEXT: u32 = theme::BUTTON_TEXT;
-/// The highlight behind an open menu title and behind the marked option.
-const MENU_HILITE: u32 = theme::ACCENT;
-const MENU_HILITE_TEXT: u32 = 0x00_FFFFFF;
 
 /// `vug::METER_PURPLE` — the load fill of the ten-segment face. COPIED, with attribution, exactly as
 /// `user-pulse/src/main.rs` copies it: `vug` is aarch64-only and declares it privately, so importing it
@@ -153,24 +159,52 @@ impl View {
     }
 }
 
-/// **The menu tree.** Order is the arc's, and it is load-bearing: Peter asked for *"the first menu
-/// option to switch between the 2 views"*, and the FIRST option is the Pi's — the view the window opens
-/// on, so option one is always the one you are looking at and option two is always the switch.
-const OPTIONS: [View; 2] = [View::Lamps, View::Segments];
+/// **The menu tree, in the MENU BAR** — R21. Two `const` trees, one per live view, and the ONLY
+/// difference between them is which item carries [`winmenu::FLAG_CHECKED`].
+///
+/// Two trees rather than one mutable tree is what keeps every published tree `&'static`: a face switch
+/// hands the registry the OTHER `const`, so the mark moves with no allocation, no interior mutability,
+/// and nothing on the paint path that a second core could be halfway through writing.
+///
+/// Order is the arc's and is load-bearing: Peter asked for *"the first menu option to switch between
+/// the 2 views"*, and the FIRST item is the Pi's — the view the window opens on, so item one is always
+/// the one you are looking at and item two is always the switch.
+const VIEW_ITEMS_LAMPS: [winmenu::MenuItem; 2] = [
+    winmenu::MenuItem { id: 0, label: "Pi LED lamps", flags: winmenu::FLAG_CHECKED },
+    winmenu::MenuItem { id: 1, label: "x86 segments", flags: 0 },
+];
+const VIEW_ITEMS_SEGS: [winmenu::MenuItem; 2] = [
+    winmenu::MenuItem { id: 0, label: "Pi LED lamps", flags: 0 },
+    winmenu::MenuItem { id: 1, label: "x86 segments", flags: winmenu::FLAG_CHECKED },
+];
+const TREE_LAMPS: [winmenu::MenuTitle; 1] =
+    [winmenu::MenuTitle { label: "View", items: &VIEW_ITEMS_LAMPS }];
+const TREE_SEGS: [winmenu::MenuTitle; 1] =
+    [winmenu::MenuTitle { label: "View", items: &VIEW_ITEMS_SEGS }];
+
+/// The tree that shows `v` as the live view.
+const fn tree_for(v: View) -> &'static [winmenu::MenuTitle] {
+    match v {
+        View::Lamps => &TREE_LAMPS,
+        View::Segments => &TREE_SEGS,
+    }
+}
 
 /// The live view. `u8`, holding a [`View::ord`], so the whole of the modal state is one relaxed load on
 /// the paint path.
 static VIEW: AtomicU32 = AtomicU32::new(0);
 
-/// Is the `View` menu dropped? `false` at open and after every pick or dismissal.
-static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// Has a desktop asked for this window? Set by [`arm`], consumed by [`service`]'s open arm, and
+/// CLEARED by [`close`] — A30: an open arm that outlives the operator's close is not a close.
+static ARMED: AtomicBool = AtomicBool::new(false); static EVER_ARMED: AtomicBool = AtomicBool::new(false); // A30 — the STICKY half of the latch: set by `arm()`, never cleared, and the ONLY question `dock::pin_pulse` asks. It exists so the pinned reopen tile is a no-op on every board that has no pulse window to reopen: `desktop_firmware::activate` is the sole caller of `arm()`, so an x86 `desktop_uefi` desktop leaves this `false` forever and the dock's tile model there is byte-for-byte what it was. ⚠ FOLDED onto this line rather than added below it — knob-off line numbers are load-bearing (panic `Location`), PARITY.md §5.3.
 
-/// Has a desktop asked for this window? Set by [`arm`], consumed by [`service`]'s open arm.
-static ARMED: AtomicBool = AtomicBool::new(false);
-
-/// Falsifiable counters for the witness: how many times the menu was opened, and how many picks
-/// actually MOVED the view (a pick of the live view is a dismissal, not a switch).
-static OPENS: AtomicU64 = AtomicU64::new(0);
+/// Falsifiable counter for the witness: how many picks actually MOVED the view (a pick of the live
+/// view is a dismissal, not a switch).
+///
+/// R21 — the `opens` counter that stood beside it is GONE rather than left reading zero. The menu is
+/// no longer this window's, so "how many times was it opened" is a question `[winmenu]`'s ledger
+/// answers and this one cannot; a field that could only ever print `0` is an instrument asserting
+/// that a working menu was never opened.
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 /// The live view, as a value.
@@ -215,7 +249,7 @@ pub fn win() -> wm::WinId {
 /// keyboard to the shell rather than to a ring that does not exist, and so an ASID-scoped close sweep
 /// can never reap it by accident) while being its OWN owner, so `close_owner` on either of the other
 /// two cannot take this window with it.
-const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x60;
+pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x60; // A30 — published (was private) so `dock::pin_pulse`'s reopen tile carries THIS window's owner rather than borrowing the desktop's, which is the whole reason the owner is its own: a pin under `KERNEL_OWNER_DESKTOP` would make `pin_shell`'s "one live shell max" test read a pulse tile as a shell. Line-neutral: a visibility keyword, no line added — PARITY.md §5.3.
 
 // ------------------------------------------------------------------------------------------------
 // Geometry — all derived from the panel and the metrics, none guessed
@@ -266,7 +300,14 @@ fn pad(m: &crate::ui::Metrics) -> usize {
     (m.line_h / 2).max(2)
 }
 
-/// The menu strip's height: one line pitch, the same band `ui_status::draw` gives the status line.
+/// R21 — **the row the in-window menu strip used to occupy.** One line pitch.
+///
+/// It is still in [`content_extent`]'s budget, so the window's outer box and its `surf=` witness are
+/// byte-for-byte what they were before the strip was deleted, and the operator's window does not
+/// change size because a menu moved. What changed is that nothing DRAWS here any more: the row went
+/// back to the instrument, which is now given the whole content rect. Reclaiming the pixels is a
+/// geometry change and belongs to whoever next has a reason to move this box; it is named here so the
+/// row is a known slack rather than a mystery.
 fn menu_h(m: &crate::ui::Metrics) -> usize {
     m.line_h
 }
@@ -275,45 +316,6 @@ fn menu_h(m: &crate::ui::Metrics) -> usize {
 /// at the density the desktop band draws at. See [`content_extent`].
 fn row_target(m: &crate::ui::Metrics) -> usize {
     m.cell_h * 3
-}
-
-/// A menu option row's height: the glyph cell plus clearance, `crystal`'s `ITEM_H` rule at this
-/// window's own scale.
-fn item_h(m: &crate::ui::Metrics) -> usize {
-    m.cell_h + 8
-}
-
-/// The `View` title's box in CONTENT coordinates: `(x, y, w, h)`.
-fn title_box(m: &crate::ui::Metrics) -> (usize, usize, usize, usize) {
-    (pad(m), 0, m.cell_w * 6, menu_h(m))
-}
-
-/// The dropdown's box in CONTENT coordinates, or `None` when the content cannot seat it below the
-/// strip. Anchored under the title's left edge, `crystal`'s rule.
-fn menu_box(m: &crate::ui::Metrics, cw: usize, ch: usize) -> Option<(usize, usize, usize, usize)> {
-    let (tx, _, _, _) = title_box(m);
-    let w = 2 * pad(m) + (2 + max_option_glyphs()) * m.cell_w;
-    let h = OPTIONS.len() * item_h(m) + 2;
-    let y = menu_h(m);
-    if tx + w > cw || y + h > ch {
-        return None;
-    }
-    Some((tx, y, w, h))
-}
-
-/// The longest option label in glyphs, walked at compile time so a relabelled option cannot silently
-/// overflow the dropdown — `crystal::max_label_glyphs`'s rule.
-const fn max_option_glyphs() -> usize {
-    let mut m = 0;
-    let mut i = 0;
-    while i < OPTIONS.len() {
-        let l = OPTIONS[i].label().len();
-        if l > m {
-            m = l;
-        }
-        i += 1;
-    }
-    m
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -473,10 +475,16 @@ pub fn open() -> wm::WinId {
         return wm::WIN_NONE;
     }
     *STORE.lock() = Some(store);
-    WIN.store(id, Ordering::Release);
+    WIN.store(id, Ordering::Release); wm::winid_register_holder(&WIN, "pulsewin"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. `close()` below clears this cell, and `press_route` is the only caller of it — so a close that arrives through the operator's close disc on the ROUTER's furniture arm (`wc_close_furniture` -> `wm::close`) frees the row behind this cell's back and leaves it naming a slot the table is free to re-issue. Registering it makes `wm::close` the backstop on every path.
+    // R21 — **publish the `View` menu into the BAR.** After `WIN` is stored, because the registry is
+    // keyed by window id and a tree published against `WIN_NONE` is refused; before the witness, so a
+    // capture reads `[winmenu] publish` and `[pulsewin] open` in the order they happened. A refused
+    // publish is NOT fatal — every refusal names itself on the wire and a pulse window without menus
+    // is still a pulse window — which is `open`'s own decline rule applied one level down.
+    winmenu::publish(id, tree_for(view()), on_menu_pick);
     serial_println!(
         "[pulsewin] open win={} panel={}x{} surf={}x{} box={}x{} at ({},{}) view={} \
-         (menu: click `View` for the two faces — first option is the Pi's)",
+         (menu: `View` is in the MENU BAR — first option is the Pi's)",
         id,
         pw,
         ph,
@@ -503,18 +511,21 @@ pub fn close() -> bool {
     if id == wm::WIN_NONE {
         return false;
     }
+    // R21 — the MENU goes FIRST, before the row: `winmenu::clear` dismisses this window's dropdown if
+    // it is down and drives the composite that erases it, and that erase must happen while the window
+    // is still a legible member of the table. Clearing after `wm::close` would leave one pass in which
+    // the bar is laying out a title for a window that no longer exists.
+    winmenu::clear(id);
     // Order matters: the row goes first, so the compositor can no longer read the surface, and only
     // then is the store dropped. The reverse would leave one composite pass reading freed memory.
     wm::close(id);
-    SURF.store(0, Ordering::Release);
+    ARMED.store(false, Ordering::Release); SURF.store(0, Ordering::Release); // A30 — DISARM FIRST, and disarm HERE. `service`'s open arm fires on `ARMED && ncpu > 0` every pass, so a close that leaves the latch set is not a close: render7 shut this window twice from its own close disc and the very next render pass re-opened it five lines later (6923->6932, 10519->10528), which is also why A18's cascade census read `pulsewin_open=3` for ONE window. The latch means "the desktop wants this window", and a user close is the operator saying it does not; only `arm()` says it does again, and after this the sole caller that can say so post-boot is the dock's pinned tile. Store `false` before the surface teardown so no pass can observe a window-less ARMED state. ⚠ FOLDED onto this line rather than added below it: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
     SURF_W.store(0, Ordering::Relaxed);
     SURF_H.store(0, Ordering::Relaxed);
-    MENU_OPEN.store(false, Ordering::Relaxed);
     *STORE.lock() = None;
     serial_println!(
-        "[pulsewin] close win={} opens={} switches={} (surface freed; the desktop LED band is untouched)",
+        "[pulsewin] close win={} -> CLOSED (reopen only via dock) switches={} (surface freed; menu cleared from the bar; the desktop LED band is untouched; A30 — the ARMED latch is cleared, so no render pass re-opens this window)",
         id,
-        OPENS.load(Ordering::Relaxed),
         SWITCHES.load(Ordering::Relaxed)
     );
     true
@@ -529,7 +540,10 @@ pub fn close() -> bool {
 fn frame_sig(loads: &[u32; PSTRIP_MAX_CPUS], ncpu: usize) -> u64 {
     let mut h = super::strip::FNV_BASIS;
     h = super::strip::fnv1a_u64(h, view().ord() as u64);
-    h = super::strip::fnv1a_u64(h, MENU_OPEN.load(Ordering::Relaxed) as u64);
+    // R21 — the menu's open state is NOT folded in any more, and that is the correct reading rather
+    // than an omission: the dropdown is a panel surface owned by `winmenu` with its own damage slot,
+    // and nothing about it changes a pixel of THIS surface. The view still is folded in, because a
+    // pick still changes the face this window draws.
     h = super::strip::fnv1a_u64(h, ncpu as u64);
     for l in loads.iter().take(ncpu) {
         h = super::strip::fnv1a_u64(h, *l as u64);
@@ -558,13 +572,12 @@ pub fn paint() {
     match view() {
         // ONE renderer, two seams: this is the desktop band's own body, given this window's rect
         // instead of `panel_geometry`'s reserved one.
-        View::Lamps => ui_status::draw_panel_at(
-            &mut p,
-            Some((0, menu_h(&m), cw, ch.saturating_sub(menu_h(&m)))),
-        ),
+        //
+        // R21 — the rect is the WHOLE content now. It was `(0, menu_h, cw, ch - menu_h)`, the rows
+        // below the in-window menu strip; with the strip gone the instrument gets its first row back.
+        View::Lamps => ui_status::draw_panel_at(&mut p, Some((0, 0, cw, ch))),
         View::Segments => draw_segments(&mut p, &m, cw, ch, &loads, ncpu),
     }
-    draw_menu(&mut p, &m, cw, ch);
     PAINTED_SIG.store(frame_sig(&loads, ncpu), Ordering::Relaxed);
     wm::present(id);
 }
@@ -608,52 +621,39 @@ pub fn service() {
 
 /// **Ask for the pulse window.** The desktop seam calls this; [`service`] does the opening. See its
 /// open arm for why the two are split. Idempotent, and it does not report a window — there is not one
-/// yet, by construction.
+/// yet, by construction. A30 — post-boot the dock's pinned tile is the only other caller, and that
+/// makes this the single re-entry point a user close can be undone through.
 pub fn arm() {
-    ARMED.store(true, Ordering::Release);
+    ARMED.store(true, Ordering::Release); EVER_ARMED.store(true, Ordering::Release); // A30 — see EVER_ARMED: sticky, so the dock keeps a reopen tile after a close. Folded, not added — PARITY.md §5.3.
 }
 
-/// The menu strip, and the dropdown when it is open.
-fn draw_menu<P: GneissPal>(p: &mut P, m: &crate::ui::Metrics, cw: usize, ch: usize) {
-    let mh = menu_h(m);
-    p.draw_rect(0, 0, cw, mh, MENU_BG);
-    p.draw_rect(0, mh.saturating_sub(1), cw, 1, MENU_LINE);
-    let (tx, ty, tw, th) = title_box(m);
-    let open = MENU_OPEN.load(Ordering::Relaxed);
-    let (face, ink) = if open {
-        (MENU_HILITE, MENU_HILITE_TEXT)
-    } else {
-        (MENU_BG, MENU_TEXT)
-    };
-    p.draw_rect(tx, ty, tw, th.saturating_sub(1), face);
-    p.draw_text(tx, ty + (th.saturating_sub(m.cell_h)) / 2, "View", ink);
-    if !open {
-        return;
+/// **The pick sink** — R21. Handed to [`winmenu::publish`] as a bare `fn` pointer and called from the
+/// bar's press arm with the item id THIS module chose ([`View::ord`]), never a kernel-assigned one.
+///
+/// Two things happen and both are one atomic each: the live view moves, and the OTHER `const` tree is
+/// re-published so the check mark lands on the item that is now live. Nothing paints here — the window
+/// repaints on [`service`]'s next paced pass, which is the same 250 ms bound a pick has always had,
+/// and the BAR's dropdown was already torn down by `winmenu` before this was called.
+fn on_menu_pick(id: u32) {
+    let picked = if id == View::Segments.ord() as u32 { View::Segments } else { View::Lamps };
+    let was = view();
+    VIEW.store(picked.ord() as u32, Ordering::Release);
+    if picked != was {
+        SWITCHES.fetch_add(1, Ordering::Relaxed);
     }
-    let Some((mx, my, mw, mmh)) = menu_box(m, cw, ch) else {
-        return;
-    };
-    p.draw_rect(mx, my, mw, mmh, MENU_BG);
-    p.draw_rect(mx, my, mw, 1, MENU_LINE);
-    p.draw_rect(mx, my + mmh - 1, mw, 1, MENU_LINE);
-    p.draw_rect(mx, my, 1, mmh, MENU_LINE);
-    p.draw_rect(mx + mw - 1, my, 1, mmh, MENU_LINE);
-    let live = view();
-    for (i, opt) in OPTIONS.iter().enumerate() {
-        let iy = my + 1 + i * item_h(m);
-        let marked = *opt == live;
-        let (face, ink) = if marked {
-            (MENU_HILITE, MENU_HILITE_TEXT)
-        } else {
-            (MENU_BG, MENU_TEXT)
-        };
-        p.draw_rect(mx + 1, iy, mw.saturating_sub(2), item_h(m), face);
-        let ty = iy + (item_h(m).saturating_sub(m.cell_h)) / 2;
-        // The mark is a glyph, not a tick sprite: the 8x8 base font is the only type this window has,
-        // and inventing a second glyph source for one checkmark would be a font for a checkmark.
-        p.draw_text(mx + pad(m), ty, if marked { ">" } else { " " }, ink);
-        p.draw_text(mx + pad(m) + 2 * m.cell_w, ty, opt.label(), ink);
+    let win = WIN.load(Ordering::Acquire);
+    if win != wm::WIN_NONE {
+        // Re-publish so the mark follows the live view. A REPLACE, not a second slot — the registry
+        // keys on the window id and swaps the tree in place.
+        winmenu::publish(win, tree_for(picked), on_menu_pick);
     }
+    serial_println!(
+        ":: PULSEWIN-MENU: pick id={} view={} was={} switched={} ::",
+        id,
+        picked.label(),
+        was.label(),
+        picked != was
+    );
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -766,145 +766,39 @@ fn draw_segments<P: GneissPal>(
 // The press route
 // ------------------------------------------------------------------------------------------------
 
-/// What a press at a CONTENT point resolves to. Pure — no side effect — so the resolution can be
-/// reasoned about (and, if a fixture ever wants it, asserted) without firing a switch.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Hit {
-    /// The `View` title: toggle the dropdown.
-    Title,
-    /// An option row: make it the live view.
-    Option(usize),
-    /// Inside the open dropdown but not on a row (its border): swallow, do not dismiss — the same
-    /// courtesy `crystal` gives a press on its own frame.
-    MenuFrame,
-    /// Anywhere else in the content while the menu is open: dismiss.
-    Elsewhere,
-}
-
-/// The pure hit resolver over CONTENT coordinates.
-fn hit_at(m: &crate::ui::Metrics, cw: usize, ch: usize, x: usize, y: usize) -> Hit {
-    let (tx, ty, tw, th) = title_box(m);
-    if x >= tx && x < tx + tw && y >= ty && y < ty + th {
-        return Hit::Title;
-    }
-    if MENU_OPEN.load(Ordering::Relaxed) {
-        if let Some((mx, my, mw, mh)) = menu_box(m, cw, ch) {
-            if x >= mx && x < mx + mw && y >= my && y < my + mh {
-                let ly = y - my;
-                if ly >= 1 {
-                    let idx = (ly - 1) / item_h(m);
-                    if idx < OPTIONS.len() {
-                        return Hit::Option(idx);
-                    }
-                }
-                return Hit::MenuFrame;
-            }
-        }
-    }
-    Hit::Elsewhere
-}
-
 /// **The click arm.** `true` when this window CONSUMED the press.
 ///
 /// Called from the aarch64 router's PI-DESK furniture line, ahead of every window arm. Three properties
 /// make that position safe, and all three are checked here rather than assumed by the caller:
 ///
 /// 1. **It declines unless this window is the TOPMOST at that point.** `wm::hit_test` answers with the
-///    front-most row, so a window stacked over the pulse window keeps every press inside its own box —
-///    the menu cannot be clicked through another window's face.
-/// 2. **It claims only its own two regions**: this window's close disc, and this window's menu. Chrome
-///    drags, the minimise and zoom discs, focus changes and every other window's everything fall
-///    through to the arms below, untouched.
-/// 3. **A press on this window's CONTENT with the menu closed is not consumed** — it falls through to
-///    the ordinary select arm, so clicking the instrument raises the window exactly as clicking any
-///    other window's content does.
+///    front-most row, so a window stacked over the pulse window keeps every press inside its own box.
+/// 2. **It claims exactly ONE region**: this window's close disc. R21 removed the second — the menu —
+///    because the menu is no longer in this window; it is in the bar, and its press is
+///    [`super::winmenu::press_at`]'s, reached through the same shared furniture router this arm sits
+///    beside. Chrome drags, the minimise and zoom discs, focus changes and every other window's
+///    everything fall through to the arms below, untouched.
+/// 3. **A press on this window's CONTENT is not consumed** — it falls through to the ordinary select
+///    arm, so clicking the instrument raises the window exactly as clicking any other window's content
+///    does. Before R21 that was true only while the in-window menu was closed; now it is unconditional,
+///    which is one fewer state an operator has to be in to raise their own window.
 pub fn press_route(x: i32, y: i32) -> bool {
     let id = WIN.load(Ordering::Acquire);
     if id == wm::WIN_NONE || x < 0 || y < 0 {
         return false;
     }
     match wm::hit_test(x, y) {
+        // Not on this window at all (or occluded by one in front of it). Nothing to dismiss here any
+        // more — the bar's dropdown has its own dismiss-outside arm, ahead of this one in the router —
+        // so the press simply belongs to whoever it landed on.
         Some((top, _, _)) if top == id => {}
-        _ => {
-            // Not on this window at all (or occluded by one in front of it). If the menu is open, the
-            // press is a dismissal — a dropdown that survives a click somewhere else is a modal the
-            // operator did not ask for — but the press itself belongs to whoever it landed on, so it
-            // is NOT consumed. `crystal` makes exactly this distinction for the SHARD menu.
-            if MENU_OPEN.swap(false, Ordering::AcqRel) {
-                serial_println!("[pulsewin] menu dismiss reason=outside");
-            }
-            return false;
-        }
+        _ => return false,
     }
     // The close disc, claimed here because `wm`'s own close arm routes through `close_owner`, which
     // refuses kernel owners — see [`close`].
     if wm::close_box_hit(id, x, y) {
         serial_println!("[pulsewin] close-box win={} at ({},{})", id, x, y);
         close();
-        return true;
-    }
-    let Some(info) = wm::info(id) else { return false };
-    let scale = info.scale.max(1);
-    if (x as usize) < info.x || (y as usize) < info.y {
-        return false; // chrome above/left of the content: the caller's arms own it
-    }
-    let (cx, cy) = ((x as usize - info.x) / scale, (y as usize - info.y) / scale);
-    if cx >= info.w || cy >= info.h {
-        return false; // chrome below/right of the content
-    }
-    let Some(p) = pal() else { return false };
-    let m = p.metrics();
-    match hit_at(&m, info.w, info.h, cx, cy) {
-        Hit::Title => {
-            // One atomic RMW, so two cores pressing at once cannot both read "closed" and both open.
-            let open = !MENU_OPEN.fetch_xor(true, Ordering::AcqRel);
-            if open {
-                OPENS.fetch_add(1, Ordering::Relaxed);
-            }
-            serial_println!(
-                ":: PULSEWIN-MENU: title_press={} options={} live={} ::",
-                if open { "open" } else { "dismiss" },
-                OPTIONS.len(),
-                view().label()
-            );
-            true
-        }
-        Hit::Option(i) => {
-            MENU_OPEN.store(false, Ordering::Release);
-            let picked = OPTIONS[i];
-            let was = view();
-            VIEW.store(picked.ord() as u32, Ordering::Release);
-            if picked != was {
-                SWITCHES.fetch_add(1, Ordering::Relaxed);
-            }
-            serial_println!(
-                ":: PULSEWIN-MENU: pick idx={} view={} was={} switched={} ::",
-                i,
-                picked.label(),
-                was.label(),
-                picked != was
-            );
-            true
-        }
-        Hit::MenuFrame => true,
-        Hit::Elsewhere => {
-            if MENU_OPEN.swap(false, Ordering::AcqRel) {
-                serial_println!("[pulsewin] menu dismiss reason=content");
-                return true;
-            }
-            false // ordinary content press: the select arm below raises the window
-        }
-    }
-}
-
-/// `<Esc>` dismisses an open menu, asked from the same position the aarch64 router asks
-/// `crystal::key_escape`. `true` when a menu was open and has been torn down.
-pub fn key_escape(ev: crate::pal::Event) -> bool {
-    if !matches!(ev, crate::pal::Event::Key(0x1B)) {
-        return false;
-    }
-    if MENU_OPEN.swap(false, Ordering::AcqRel) {
-        serial_println!("[pulsewin] menu dismiss reason=escape");
         return true;
     }
     false
@@ -914,14 +808,43 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 /// is built without `witness` and a claim absent from it is not a claim.
 pub fn rollup(scope: &str) {
     serial_println!(
-        "[pulsewin] rollup scope={} win={} view={} menu={} opens={} switches={} surf={}x{}",
+        "[pulsewin] rollup scope={} win={} view={} menu=bar switches={} surf={}x{}",
         scope,
         WIN.load(Ordering::Relaxed),
         view().label(),
-        MENU_OPEN.load(Ordering::Relaxed),
-        OPENS.load(Ordering::Relaxed),
         SWITCHES.load(Ordering::Relaxed),
         SURF_W.load(Ordering::Relaxed),
         SURF_H.load(Ordering::Relaxed)
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// A30 — the reopen seam (TAIL-APPENDED: nothing above this line moved, so knob-off panic `Location`
+// line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+
+/// **Has this board's desktop ever asked for the pulse window?** Sticky, and the only question the
+/// dock's pinned reopen tile asks.
+///
+/// A30's fix has two halves and this is the second. [`close`] clears `ARMED`, so a user close is
+/// final against [`service`]'s open arm — the render pass no longer re-opens the window five lines
+/// later, which is what render7 caught twice (close-box win=3, then close, then a fresh open of the
+/// same id) and what made A18's cascade census read three opens for a single window. A close that is
+/// final AND unreachable is a window the operator has LOST, though — the very failure
+/// `dock::pin_shell` and `dock::pin_quarry` exist to prevent — so the dock pins a tile that calls
+/// [`arm`] again.
+///
+/// The stickiness is what keeps that tile off boards that never had the window. `arm()` has exactly
+/// one caller outside the dock, `video::desktop_firmware::activate`, which is the Pi/Orin seam; an
+/// x86 `desktop_uefi` desktop never reaches it, so this stays `false` and `dock::pin_pulse` returns
+/// its input untouched. No `cfg` is needed to say that, and none is used: the answer is a runtime
+/// fact about the desktop that actually came up.
+pub fn ever_armed() -> bool {
+    EVER_ARMED.load(Ordering::Acquire)
+}
+
+/// **Is the pulse window on the panel right now?** The dock's other pin question — a live window has
+/// its own dock-addressable row (kernel owners are), so the pin must not add a second tile for it.
+pub fn is_open() -> bool {
+    WIN.load(Ordering::Acquire) != wm::WIN_NONE
 }

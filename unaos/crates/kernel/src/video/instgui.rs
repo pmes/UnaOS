@@ -493,7 +493,7 @@ pub fn open() {
         *STATE.lock() = State::Closed;
         return;
     }
-    WIN.store(id, Ordering::Relaxed);
+    WIN.store(id, Ordering::Relaxed); wm::winid_register_holder(&WIN, "instgui"); // WINID (SO1(b)) — ⚠ SAME-LINE fold, line-NEUTRAL. Registered on the same argument as pulsewin's and quarry's cells: this one is cleared by this module's own `close()` and by nothing else.
     // The dialog is modal over the GLASS: the console keeps taking glyphs and serial keeps
     // every line, but it stops presenting until we close. Without this, each boot message
     // repaints the console window AND (through wm's upward occlusion closure) this dialog —

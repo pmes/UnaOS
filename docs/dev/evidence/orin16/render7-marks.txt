@@ -1,0 +1,12 @@
+MARK render7 7be8155 pre-boot card=render7-20260906T0445Z-7be8155 ksha=c6dc3960ef7ae164 elfmax=0x2f5e40 butler=756188 port=/dev/ttyACM1 (re-enumerated after replug 11:28Z; ttyACM0 butler 34809 retired) seat=orin16 at 2026-09-06T11:39:41Z raw=11731299 orin=68179 unknown=15946
+MARK render7 7be8155 q-burst 'tste\r' injected at 2026-09-06T11:43:14Z raw=11946423 orin=69525
+MARK render7 7be8155 q-paced 'tste\r' 50ms at 2026-09-06T11:43:34Z raw=11973304 orin=69676
+MARK render7 7be8155 power-off (Peter: machine off) butler=756188 port=/dev/ttyACM1 seat=orin16 at 2026-09-06T12:03:48Z raw=13738822 orin=79806 unknown=16872
+MARK tick1 6139327 pre-boot card=tick1-20260906T0013Z-6139327 ksha=c82f813516ec58d0 butler=756188 port=/dev/ttyACM1 seat=orin16 at 2026-09-06T12:12:55Z raw=13738822 orin=79806 unknown=16872
+MARK tick1 6139327 power-off seat=orin16 at 2026-09-06T12:17:05Z raw=13953335 orin=82172
+MARK sdmmcwrite a05c2c8 pre-boot card=sdmmcwrite-20260906T0137Z-a05c2c8 elfmax=0x2e6880 expect=lba2047/mbr-gap-top (SDMMC-T1 SAFE-TO-FLY) butler=756188 port=/dev/ttyACM1 seat=orin16 at 2026-09-06T12:17:49Z raw=13953335 orin=82172
+MARK sdmmcwrite a05c2c8 power-off seat=orin16 at 2026-09-06T12:20:16Z raw=14093503 orin=83995
+MARK net4 a05c2c8 pre-boot card=net4-20260906T0138Z-a05c2c8 elfmax=0x306ee0 precondition=RJ45-cabled butler=756188 port=/dev/ttyACM1 seat=orin16 at 2026-09-06T12:20:30Z raw=14093503 orin=83995
+MARK net4 a05c2c8 power-off seat=orin16 at 2026-09-06T12:23:32Z raw=14226009 orin=85812
+MARK ga10bprobe2 a05c2c8 pre-boot card=ga10bprobe2-20260906T0139Z-a05c2c8 elfmax=0x2dc768 butler=756188 port=/dev/ttyACM1 seat=orin16 at 2026-09-06T12:23:46Z raw=14226009 orin=85812
+MARK ga10bprobe2 a05c2c8 power-off seat=orin16 at 2026-09-06T12:27:30Z raw=14421305 orin=87996

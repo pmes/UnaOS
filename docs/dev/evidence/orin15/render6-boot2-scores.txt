@@ -1,0 +1,13 @@
+cpu_on_success=5 cpu_on_error=0 el3_abort=0 poweroff=0 online_line=1 -> PASS (A15 pass +1)
+arming=1 post_cascade=1 len=32768 hw=15552 headroom=17216 -> PASS (unsaturated)
+cascaded=1 refuse=0 pulsewin_open=1 pulsewin_decline=0 strip_kept=0 census_strip=retired census_pulsewin=2 -> PASS
+armed=4 ok=2 refusals=0 names=[ SCREEN1.PNG SCREEN2.PNG ] -> PASS (two files; now verify the second on the card)
+lsr_lines=1 iir_lines=1 census=734 rx_final=0 ovrf_final=0 keys=7 -> DISCRIMINATORS PRESENT — verdict per A16-SCORE.md
+[serialrx] lsr=0x00000220 base=0x0c280000 iir=0xc1 fifo=on pending=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (0x00000000 = A
+burst: keys=0 rx_after=0 ovrf_after=0
+paced: keys=0 rx_after=0 ovrf_after=0
+heartbeat=1 el1=1 arm=1 armed=1 live=736 redzone=0 exceptions=0 -> PASS
+arm_click1=1 orinclick_armed=1 clickroute_press=5 consumed=9 routing_census=0 -> PASS (A20 flown)
+arm=1 stop=0 census=737 full_final=0 nbytes=0 full_edges=0 changes=0 data=[00 00 00] -> ROW3: FULL-NEVER — forwarding not on unprompted
+band_cleared=1 shell_present=1 jd2_probe=1 -> WIRE PASS (now A19-pngband.py SCREEN0.PNG must read non-bg=0/60200)
+menu_open=3 esc_seen=3 dismiss=3 -> CANDIDATE PASS — read the dismiss line
