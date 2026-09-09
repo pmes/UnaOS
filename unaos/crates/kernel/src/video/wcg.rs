@@ -783,6 +783,11 @@ pub fn stage_decline(id: u32, reason: u32) {
     if (reason as usize) < DECL_KINDS {
         H_DECLBY[i][reason as usize].fetch_add(1, Ordering::Relaxed);
     }
+    // COMPGATE — and the lifetime lock-decline meter, which the per-tenant array cannot serve
+    // because `stage_reset` zeroes it. See [`DECL_LOCK_LIFE`].
+    if reason == DECL_LOCK {
+        DECL_LOCK_LIFE.fetch_add(1, Ordering::Relaxed);
+    }
     let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
     if n > SAMPLES {
         H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
@@ -793,6 +798,35 @@ pub fn stage_decline(id: u32, reason: u32) {
     H_KIND[i].store(reason, Ordering::Relaxed);
     H_PEND[i].store(n, Ordering::Release);
 }
+
+/// COMPGATE — every [`DECL_LOCK`] this boot has taken, across every window id, NEVER RESET.
+///
+/// **Deliberately not the sum of [`H_DECLBY`]`[..][DECL_LOCK]`, and the difference is the whole
+/// point.** That array travels with the SLOT'S TENANT — `stage_reset` zeroes it when a window id is
+/// re-let, which is correct for the `[wc-h] rollup` verdict (a new tenant must not inherit the
+/// previous one's declines) and WRONG for a differential instrument. A fixture that reads the sum
+/// before an experiment and after it would see a reset as a DECREASE, `saturating_sub` would floor
+/// that at zero, and zero is the fixture's PASS value — i.e. the one reachable corruption of that
+/// reading turns a real re-entrancy into a green light. A monotonic lifetime counter cannot fail
+/// that way: it only ever rises, so a delta of zero is always the honest statement that no
+/// `stage_for_core().try_lock()` was lost in the window measured.
+///
+/// Incremented on the present path, so: one relaxed add, and only on the decline arm that already
+/// pays for two.
+static DECL_LOCK_LIFE: AtomicU64 = AtomicU64::new(0);
+
+/// COMPGATE — the lifetime [`DECL_LOCK`] count. See [`DECL_LOCK_LIFE`] for why this is not
+/// `sum(H_DECLBY[..][DECL_LOCK])`.
+///
+/// `DECL_LOCK` is the compositor falling out of the staged path into `draw_window`'s direct,
+/// unclipped, per-pixel front-buffer write — the tear itself. Because [`super::wm::STAGE`] is
+/// indexed per core, a lost `try_lock` can only ever have been lost to the SAME core, which makes
+/// this number a same-core re-entrancy meter and the panel-side half of the COMPGATE fixture's
+/// verdict (the gate-side half is `passes_delta`).
+pub fn decl_lock_total() -> u64 {
+    DECL_LOCK_LIFE.load(Ordering::Relaxed)
+}
+
 static H_BOX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_COMPOSE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
@@ -1532,6 +1566,11 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // from the two drain GIVE-UP arms alone, so a boot that tore without ever stalling a drain never
     // printed the number that convicts its tear. It now rides the verdict line itself. `torn>0` with
     // every slot at or below 1 is the statement that the tear has a DIFFERENT source.
+    //
+    // Read ONCE into a local rather than eight loads placed inline among the format arguments: the
+    // eight slots have to be one snapshot of one moment, or a reader laying `blitnet=` against the
+    // `decl_lock=` on the same line is comparing eight different moments to a ninth.
+    let blitnet = super::wm::blit_net_snapshot();
     serial_println!(
         "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} blitnet=[{},{},{},{},{},{},{},{}] fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,

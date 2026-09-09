@@ -25784,15 +25784,21 @@ static COMPGATE_WAIT_PRINTS: core::sync::atomic::AtomicU64 =
 /// fold onto the last slot exactly as [`stage_pool_index`] folds them, which costs those cores a
 /// shared counter and never an out-of-bounds. Lives here, in the video module, and NOT in
 /// `arch/aarch64/sched.rs`, which is shared with the Pi track and carries no literal core counts.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
 const COMPGATE_CORES: usize = 8;
 
 /// COMPGATE — [`BLIT_NET_CORE`], as a plain array, for the witnesses that print it.
 ///
-/// Unconditional (the net itself is), and deliberately NOT behind `blitwho_report`: that function is
-/// reachable only from the two drain give-up arms, so a boot that TEARS without ever stalling a
-/// drain never prints the one reading that convicts the tear. `[wc-h] rollup blitnet=` is the fix
-/// for that blind spot; see the COMPGATE ledger.
+/// The NET itself is unconditional — every build maintains it — but every READER is a witness: the
+/// `[wc-h] rollup`'s `blitnet=` field lives in the `witness`-gated `video/wcg.rs`, and this module's
+/// `[compgate] rollup` and [`compgate_selftest`] carry the same gate. The snapshot therefore carries
+/// it too; without it a `witness`-off build compiles a function nothing can call.
+///
+/// Deliberately NOT behind `blitwho_report`: that function is reachable only from the two drain
+/// give-up arms, so a boot that TEARS without ever stalling a drain never prints the one reading
+/// that convicts the tear. `[wc-h] rollup blitnet=` is the fix for that blind spot; see the COMPGATE
+/// ledger.
+#[cfg(feature = "witness")]
 pub(super) fn blit_net_snapshot() -> [i64; 8] {
     core::array::from_fn(|i| BLIT_NET_CORE[i].load(core::sync::atomic::Ordering::Relaxed))
 }
@@ -25933,6 +25939,18 @@ fn comp_gate_pass() {
     // and the drop is harmless (the gate is already free), while a switch before the release is the
     // stretched pass this whole block exists to stop.
     drop(hold);
+    // The selftest, ONCE per boot, from OUTSIDE the gate it tests — after the release and after the
+    // hold is dropped, which is the only point in this function where the gate is free and a
+    // control present can actually enter. Sited here rather than in a battery on a finding, not a
+    // preference: the aarch64 window battery (`hittest_selftest` <- `wcb_launcher` <- `u7_launcher`)
+    // lives inside `main.rs`'s `all(target_arch = "aarch64", feature = "baremetal")` block, so a
+    // call site there is compiled out of every UEFI aarch64 image — `./arroyo test-arm` included —
+    // and the fixture would be a check that cannot fire on the only aarch64 QEMU verb that runs
+    // this arch's UEFI path. Riding the compositor instead means the fixture is present wherever
+    // the thing it gates is present, and on a boot that never composites it costs nothing and
+    // honestly says nothing.
+    #[cfg(feature = "witness")]
+    compgate_selftest_once();
     #[cfg(feature = "witness")]
     compgate_rollup();
 }
@@ -26093,6 +26111,24 @@ fn compgate_preempt_deferrals() -> u64 {
 static COMPGATE_FIXTURE_ARMED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(true);
 
+/// COMPGATE — completed probe runs. The selftest's PRECONDITION, not a decoration: a run that did
+/// not move this number never got inside a held pass, and a verdict scored off stale deltas would be
+/// a check that cannot fire.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — the last probe's four deltas, published for [`compgate_selftest`] to score. Written
+/// only by the probe, which is one-shot per arming, so a reader that has confirmed
+/// [`COMPGATE_FIXTURE_RUNS`] moved is reading that arming's numbers.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_PASSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_FOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_DECL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
 fn compgate_fixture(core: usize) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -26123,6 +26159,13 @@ fn compgate_fixture(core: usize) {
     // direct path. `none` is not a pass — a nested call that neither ran nor folded means the gate
     // was never consulted, which is a broken fixture and reads as UNGATED.
     let verdict = if passes == 0 && decl == 0 && (folds + waits) > 0 { "GATED" } else { "UNGATED" };
+    // Publish BEFORE the serial write and bump the run counter LAST, so a reader that has seen the
+    // counter move is guaranteed to see this arming's four deltas and never the previous one's.
+    COMPGATE_FIXTURE_PASSES.store(passes, Relaxed);
+    COMPGATE_FIXTURE_FOLDS.store(folds, Relaxed);
+    COMPGATE_FIXTURE_WAITS.store(waits, Relaxed);
+    COMPGATE_FIXTURE_DECL.store(decl, Relaxed);
+    COMPGATE_FIXTURE_RUNS.fetch_add(1, core::sync::atomic::Ordering::Release);
     serial_println!(
         "[compgate] fixture core={} nested=1 outcome={} passes_delta={} folds_delta={} waits_delta={} decl_lock_delta={} -> {}",
         core,
@@ -26133,6 +26176,147 @@ fn compgate_fixture(core: usize) {
         decl,
         verdict
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// COMPGATE — THE SELFTEST. The battery's line, and the one a render12 flight is read against.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// COMPGATE — is a preemption hold standing on this core? See [`compgate_selftest`] leg 2.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn compgate_hold_standing() -> bool {
+    crate::arch::sched::preempt_hold_standing()
+}
+
+/// COMPGATE — `:: COMPGATE: … PASS ::`, driven from the window battery both arches run.
+///
+/// ## What it is testing, and why a nested present is the right stimulus
+///
+/// The defect is re-entrancy into a composite pass: on this arch the pass runs with interrupts
+/// ENABLED and the quantum is ~12 ms (ORIN-TICKDEFAULT), so a 117 ms present contains about nine
+/// involuntary switches and any task dispatched in one of them may start its own present. Waiting
+/// for that to happen by accident would make the fixture a lottery — it would pass on a quiet boot
+/// whether or not the gate existed, which is the shape of a check that cannot fire. So the stimulus
+/// is DRIVEN: [`compgate_fixture`] calls [`composite`] again from INSIDE a held pass, on this core,
+/// with the hold standing and interrupts unmasked. That is byte-for-byte the machine state a preempt
+/// tick produces, minus the wait.
+///
+/// ## The four legs, and the control that makes them measurements
+///
+/// * **1 — GATED.** The nested present did not composite (`nested_passes=0`), it was actually
+///   refused rather than skipped (`nested_folds + nested_waits > 0`), and it never reached the
+///   panel's direct, unclipped, per-pixel path (`nested_decl_lock=0`). This is the leg that REDS
+///   against the pre-gate build: with the fold arm removed the nested call runs a second
+///   `composite_once` concurrently with the first and `nested_passes` is 1.
+/// * **2 — THE PREEMPTION HOLD ARMS AND RELEASES.** No hold standing before, one standing inside the
+///   guard's scope, none standing after the drop. This is the leaked-hold hazard — a core that never
+///   preempts again — read directly rather than inferred from the absence of a symptom.
+/// * **3 — THE CONTROL, and it is what makes leg 1 a measurement rather than a tautology.** An
+///   UNCONTENDED present, driven with the gate free, must move [`COMPGATE_PASSES`] by at least one.
+///   Without it a build whose pass counter was dead would report `nested_passes=0` and pass leg 1
+///   while compositing nothing at all.
+/// * **4 — NO LIVE RE-ENTRANCY ON THE GLASS.** Every [`BLIT_NET_CORE`] slot at or below 1 after the
+///   drive: no core holds two composite blits at once. This is the falsifier `[wc-h] rollup`'s
+///   `blitnet=` publishes on the wire, asserted here instead of merely printed.
+///
+/// `preempt_deferred=` and `blitnet_max=` ride the line as OBSERVABLES — the numbers the render12
+/// wire is read against — and `drive_ms=` says how long the gated window actually was, so a reader
+/// can see whether a quantum could have elapsed inside it rather than take the claim on trust.
+///
+/// Self-cleaning: it mints no rows and touches no window state. It composites three extra times,
+/// which is what the desktop does anyway.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub fn compgate_selftest() {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+
+    // ── LEG 3: THE CONTROL, taken FIRST and on a free gate, so it cannot be contaminated by the
+    // experiment and so a dead pass counter is caught before anything is scored against it.
+    let p0 = COMPGATE_PASSES.load(Relaxed);
+    composite();
+    let control_passes = COMPGATE_PASSES.load(Relaxed).saturating_sub(p0);
+    let control_ok = control_passes >= 1;
+
+    // ── LEG 2: the preemption hold, read in all three states.
+    let held_before = compgate_hold_standing();
+    let held_during = {
+        let _hold = compgate_preempt_hold();
+        compgate_hold_standing()
+    };
+    let held_after = compgate_hold_standing();
+    let hold_ok = !held_before && held_during && !held_after;
+
+    // ── LEG 1: the nested present, driven from inside a held pass by the probe.
+    let runs0 = COMPGATE_FIXTURE_RUNS.load(Acquire);
+    let deferred0 = compgate_preempt_deferrals();
+    let t0_ms = crate::arch::ms();
+    COMPGATE_FIXTURE_ARMED.store(true, Release);
+    composite();
+    let drive_ms = crate::arch::ms().saturating_sub(t0_ms);
+    let ran = COMPGATE_FIXTURE_RUNS.load(Acquire) != runs0;
+    let n_passes = COMPGATE_FIXTURE_PASSES.load(Relaxed);
+    let n_folds = COMPGATE_FIXTURE_FOLDS.load(Relaxed);
+    let n_waits = COMPGATE_FIXTURE_WAITS.load(Relaxed);
+    let n_decl = COMPGATE_FIXTURE_DECL.load(Relaxed);
+    // `ran` is a precondition of the leg, not a leg of its own: deltas from a probe that never fired
+    // this run are stale, and scoring them would be the check that cannot fire.
+    let gated_ok = ran && n_passes == 0 && n_decl == 0 && (n_folds + n_waits) > 0;
+
+    // ── LEG 4: no core is holding two composite blits.
+    let net = blit_net_snapshot();
+    let mut netmax: i64 = 0;
+    let mut i = 0usize;
+    while i < net.len() {
+        if net[i] > netmax {
+            netmax = net[i];
+        }
+        i += 1;
+    }
+    let net_ok = netmax <= 1;
+
+    let deferred = compgate_preempt_deferrals().saturating_sub(deferred0);
+    let ok = control_ok && hold_ok && gated_ok && net_ok;
+    serial_println!(
+        ":: COMPGATE: nested_ran={} nested_passes={} nested_folds={} nested_waits={} \
+         nested_decl_lock={} gated={} hold_arm={} control_passes={} control={} blitnet_max={} \
+         blitnet={} drive_ms={} preempt_deferred={} wait_bound_us={} -> {} ::",
+        ran as u8,
+        n_passes,
+        n_folds,
+        n_waits,
+        n_decl,
+        gated_ok as u8,
+        hold_ok as u8,
+        control_passes,
+        control_ok as u8,
+        netmax,
+        net_ok as u8,
+        drive_ms,
+        deferred,
+        COMPGATE_WAIT_US,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// COMPGATE — the selftest is an aarch64 `witness` fixture; on every other arch the call site is a
+/// no-op. Declared rather than `#[cfg]`-ed at the call site, so the gate's tail reads the same on
+/// every arch it compiles for.
+#[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+#[inline]
+pub fn compgate_selftest() {}
+
+/// COMPGATE — [`compgate_selftest`], once per boot, driven from the tail of [`comp_gate_pass`].
+///
+/// The latch is spent BEFORE the call, so the three presents the selftest drives reach this same
+/// tail, find it spent and return: the recursion is bounded at the depth the fixture itself needs
+/// and can never become a per-pass fixture on a compositing desktop.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_selftest_once() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    compgate_selftest();
 }
 
 /// COMPGATE — cycles of [`crate::arch::now_cycles`] per microsecond, read from the live timebase on

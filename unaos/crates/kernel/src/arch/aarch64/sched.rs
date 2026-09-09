@@ -11115,3 +11115,18 @@ impl Drop for PreemptHold {
 pub fn preempt_deferrals() -> u64 {
     NOPREEMPT_DEFERRED.load(Ordering::Relaxed)
 }
+
+/// COMPGATE — is a hold standing on THIS core, read through the SAME predicate the two switch paths
+/// read?
+///
+/// It calls [`nopreempt_held`] rather than re-deriving the test, deliberately: a fixture that asked
+/// the question its own way could report a hold the tick path does not honour, which is exactly the
+/// failure it exists to detect. `video/wm.rs`'s `compgate_selftest` leg 2 reads it in all three
+/// states — before, inside, after — so the leaked-hold hazard (a core that never preempts again) is
+/// measured rather than inferred from the absence of a symptom.
+pub fn preempt_hold_standing() -> bool {
+    // The SAME clamp [`preempt_hold`] applies, so the slot read is the slot written. Without it a
+    // core index at or beyond `NUM_CPUS` would take its hold on the last slot and then read `false`
+    // from this function, and the fixture would red on a machine whose gate was working.
+    nopreempt_held(meter_current_cpu().min(NUM_CPUS - 1))
+}
