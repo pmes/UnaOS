@@ -1,0 +1,20 @@
+fold=1b50376a 2026-09-09T15:42:10Z
+check rc=0 (15:42:10→15:49:50)
+wctest rc=0 (15:49:50→15:50:59)
+testarm rc=0 (15:50:59→15:51:35)
+k8test rc=0 (15:51:35→15:54:30)
+espjet rc=0 (15:54:30→15:54:46)
+census [apsrun] = 5
+census close-scope = 1
+census restore src= = 1
+census [facet] = 9
+census PRTSCR-VOL = 2
+census dhcp-rx = 1
+census COMPGATE = 23
+census WINTITLE = 0
+census pins_applied = 0
+census UNAOS-BUILD-STAMP-1: = 1
+[0;33m⚡ kernel features: witness,ehcihid,kbdwit,sdhcblk,holocron,smolnet,tegra,bsptick,bsprun,ga10bprobe3,ga10bprobe3b,orinclick,tegra_el0,tegrasmp,apsrun,orinrender,desktop_firmware,orinrx,tcuprobe,tcurx,deskcascade,net4,pcie3,pcie2,net5[0m
+[0;33m⚡ kernel features (jetson): witness,ehcihid,kbdwit,sdhcblk,holocron,smolnet,tegra,bsptick,bsprun,ga10bprobe3,ga10bprobe3b,orinclick,tegra_el0,tegrasmp,apsrun,orinrender,desktop_firmware,orinrx,tcuprobe,tcurx,deskcascade,net4,pcie3,pcie2,net5,sdmmc[0m
+max_vaddr=0x35b340
+GATE DONE 2026-09-09T15:54:46Z

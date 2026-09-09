@@ -1,0 +1,23 @@
+-- scorer11: wire=/home/pmes/unaos-bench/scratch/orin24/boot-render12-A1.log (2449 lines) | artifact=/home/pmes/unaos-bench/flash/orin/render12-20260909T1556Z-1b50376/kernel.elf
+   ARTIFACT strings: arming '[vfs] root = boot volume'=1 | positive control 'crates/kernel/src/'=56 | retired '[sdmmc] root'=0 -> ARMED=armed
+   WIRE controls: loader lines=20 | kernel lines=90
+
+ARMING: arming literal=1, positive control=56 (fires), retired-family literal in artifact=0 -> PASS ARMING (the bind emitter IS compiled into the flashed image, so an absent [vfs] root line on the wire is a DEFECT and not a configuration. Root family is scoreable.)
+LOADER-SERIAL: 'boot volume FAT serial 0x…' lines=1 (distinct serials=1, malformed=0, value=0xde001a13) || CONTROL loader lines on wire=20 -> PASS LOADER-SERIAL (the loader named its boot volume: serial=0xde001a13, 1 line(s), one distinct value)
+ROOT-BIND: '[vfs] root = boot volume serial=' lines=1 (distinct=1, malformed=0, value=0xde001a13) vs loader 0xde001a13 || CONTROLS kernel lines=90, arming=armed, NONE lines=0 -> PASS ROOT-BIND (root bound to the boot volume: loader 0xde001a13 == kernel 0xde001a13, source=global, 1 line(s), one distinct value each side)
+ROOT-NONE: '[vfs] root -> NONE' lines=0 (reason=- serial=0x-) || CONTROLS kernel lines=90, arming=armed -> PASS ROOT-NONE (no [vfs] root -> NONE line on a wire where the kernel spoke 90 time(s) — root was not refused)
+OLD-BIND-ABSENT: retired '[sdmmc] root' lines on wire=0, in artifact=0 || CONTROLS kernel lines=90, artifact control=56 -> PASS OLD-BIND-ABSENT (retired family absent from both halves: 0 lines on a wire where the kernel spoke 90 time(s), 0 literals in an artifact whose control fires 56 time(s))
+SOURCE-VOCAB: source token(s) seen=global (distinct=1, lines missing a source field=0) || CONTROL bind lines=1, arming=armed -> PASS SOURCE-VOCAB (source=global, in the contract's set global|usb|sdhc|tegra-sd)
+
+== render11 verdict table ==
+  PREDICATE         CLASS VERDICT
+  ----------------- ----- -------
+  ARMING            GREEN PASS
+  LOADER-SERIAL     GREEN PASS
+  ROOT-BIND         GREEN PASS
+  ROOT-NONE         GREEN PASS
+  OLD-BIND-ABSENT   GREEN PASS
+  SOURCE-VOCAB      GREEN PASS
+
+== 0 red, 6 green, 0 note(s), 0 not-exercised ==
+-- end scorer11 --
