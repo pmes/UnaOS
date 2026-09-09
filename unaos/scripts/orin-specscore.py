@@ -526,6 +526,27 @@ def main():
     if not args.explain and args.capture is None:
         ap.error("a capture is required unless --explain is given")
 
+    # REFUSE LOUDLY (orin 23's ruling on this change): a capture-side flag passed beside
+    # `--explain` is IGNORED by construction, because the block below returns before any of them
+    # is read -- and "a flag that does nothing is a lie" in a tool whose whole reason to exist is
+    # that a rule which CANNOT FIRE looks identical to one that passed. Refusing costs three
+    # lines and removes a silent no-op from the one place a reader comes to stop being fooled.
+    #
+    # orin named `--image` and `--accept-dead`; the set below is all FIVE capture-side flags,
+    # because the principle does not distinguish them and refusing two of five would leave three
+    # lies standing. Named here rather than assumed silently: narrow it if that is not wanted.
+    if args.explain:
+        # The CAPTURE itself is on this list and it is the biggest instance: passing one beside
+        # `--explain` was silently ignored, and it is the likeliest slip of all (typing the log
+        # out of habit). orin named the two flags; this is the same lie wearing a positional.
+        _cap_side = [n for n, v in (("a capture", args.capture),
+                                    ("--image", args.image), ("--source", args.source),
+                                    ("--accept-dead", args.accept_dead),
+                                    ("--no-coverage-gate", args.no_coverage_gate),
+                                    ("--quiet-optional", args.quiet_optional)) if v]
+        if _cap_side:
+            ap.error("--explain takes no capture-side flags; got " + ", ".join(_cap_side))
+
     # ---- --explain: the effective directive list, and nothing else -------------------------
     #
     # READ-ONLY BY CONSTRUCTION and it lands HERE rather than in `mbench.py` on purpose: mbench
