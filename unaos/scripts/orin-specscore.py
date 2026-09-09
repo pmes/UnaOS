@@ -551,7 +551,16 @@ def main():
         print()
         for d in directives:
             where = f"{os.path.basename(args.spec)}:{d.spec_line}" if not d.builtin else "mbench DEFAULT_FORBIDS"
-            print(f"   {d.label():<12} {where:<28} {d.pattern}")
+            # QUOTED (pi 9, review of this change): the pattern is DELIMITED, not bare. `parse_spec`
+            # `.strip()`s the line, so a stored pattern cannot CARRY a trailing space -- which makes
+            # the interesting reader the one who WROTE `FORBID span_blocks=2048 ` and is asking why
+            # their bound does not bind. Bare output shows `span_blocks=2048` and the space's
+            # ABSENCE reads past easily; quoted, it is unmistakable. That inversion -- a trailing
+            # space the parser deletes, turning a bound key into an unbounded one -- is a real
+            # incident, and this tool is where someone would come to diagnose it. Quotes are added
+            # by hand rather than with `!r`, because `repr()` doubles the backslashes that every
+            # regex in these specs is made of and would misreport the pattern it is clarifying.
+            print(f"   {d.label():<12} {where:<28} '{d.pattern}'")
         print()
         print("   * = builtin: NOT in the spec file, enforced anyway. A grep over the spec "
               "cannot see these.")
