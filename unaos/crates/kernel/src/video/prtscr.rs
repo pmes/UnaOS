@@ -78,6 +78,12 @@
 //!     global slot. This rung aims at the stick BY NAME — the operator's own carry-away medium,
 //!     which is exactly where a screenshot belongs — and the global slot's veto stands untouched.
 //!
+//! Which rung won, and WHICH DISK it landed on, is on the wire: `:: PRTSCR-VOL: … -> MOUNTED ::`
+//! per mount, `:: PRTSCR-VOL: rung=none rung1=… rung2=… -> NO TARGET ::` when both decline, and
+//! `source=`/`serial=` on every verdict that follows. See the PRTSCR-VOL block at this file's TAIL
+//! for why the pair (handle, `BS_VolID`) and not the handle alone: `USB_BLOCK_DEVICE` is ONE slot
+//! that every stick arrival overwrites, so `usb` names a socket, not a disk.
+//!
 //! ## One capture at a time, and the wire names every state (PRTSCR2)
 //!
 //! A capture is seconds of work — on the Orin, 1920x1200 encodes and writes 6.9 MB over USB BOT in
@@ -383,13 +389,7 @@ fn finish(verdict: Result<Shot, Refusal>) {
     match verdict {
         Ok(shot) => {
             CAPTURES.fetch_add(1, Ordering::Relaxed);
-            serial_println!(
-                ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
-                shot.name,
-                shot.width,
-                shot.height,
-                shot.bytes
-            );
+            shot.report_ok();
         }
         Err(why) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -404,6 +404,8 @@ pub struct Shot {
     pub width: u32,
     pub height: u32,
     pub bytes: usize,
+    /// PRTSCR-VOL — WHICH volume the file landed on. See [`VolId`] at this file's tail.
+    pub vol: VolId,
 }
 
 /// Why a capture did not happen. Every variant carries what it inspected, not just what was
@@ -415,24 +417,28 @@ pub enum Refusal {
     NoFormat(PixelFormat),
     /// Nothing mounted on the program-source handle NOR the dedicated USB handle.
     NoVolume(FatError),
-    /// The program-source volume mounted and refuses writes — `(source, label, reason)` — and the
+    /// The program-source volume mounted and refuses writes — `(target, label, reason)` — and the
     /// USB rung of the ladder had no writable volume to offer either.
-    ReadOnly(&'static str, String, &'static str),
-    /// `SCREEN0.PNG` .. `SCREEN99.PNG` are all taken. We do not overwrite.
-    AllTaken,
-    /// The PNG encoder declined, with the geometry it declined for.
+    ReadOnly(VolId, String, &'static str),
+    /// `SCREEN0.PNG` .. `SCREEN99.PNG` are all taken **on that volume**. We do not overwrite.
+    AllTaken(VolId),
+    /// The PNG encoder declined, with the geometry it declined for. The only post-mount refusal
+    /// that carries no [`VolId`], and deliberately: it is a fact about the allocator and the panel
+    /// geometry, and no volume was touched to reach it.
     Encode(PngError, u32, u32, usize),
-    /// A FAT operation failed: `(what we were doing, the error)`.
-    Fat(&'static str, FatError),
-    /// The write was accepted but short: `(name, written, wanted)`.
-    Short(String, usize, usize),
+    /// A FAT operation failed: `(target, what we were doing, the error)`.
+    Fat(VolId, &'static str, FatError),
+    /// The write was accepted but short: `(target, name, written, wanted)`.
+    Short(VolId, String, usize, usize),
     /// PRTSCR2 — another task's capture holds the door ([`IN_FLIGHT`]). The verb reports it and
     /// stops; [`service`] re-arms the request and runs it once the door opens.
     InFlight,
     /// PRTSCR-ASYNC/UNPLUG — the USB volume this capture was writing left (or was replaced by a
-    /// different disk on a recycled xHCI slot) between two slices: `(name, bytes reached, wanted)`.
+    /// different disk on a recycled xHCI slot) between two slices: `(target, name, bytes reached,
+    /// wanted)` — and the target is the one the capture OPENED, which is the whole point of naming
+    /// it here: the disk now under the handle may be a different one.
     /// The write that would have gone through the now-stale handle was NOT issued.
-    Vanished(String, usize, usize),
+    Vanished(VolId, String, usize, usize),
 }
 
 impl Refusal {
@@ -451,40 +457,47 @@ impl Refusal {
                 e,
                 crate::drivers::block::source_census()
             ),
-            Refusal::ReadOnly(source, label, why) => serial_println!(
-                ":: PRTSCR: REFUSED READ-ONLY (source={} label={} reason={}) — no writable USB volume attached either — capture skipped ::",
-                source,
+            Refusal::ReadOnly(v, label, why) => serial_println!(
+                ":: PRTSCR: REFUSED READ-ONLY (source={} serial=0x{:08X} label={} reason={}) — no writable USB volume attached either — capture skipped ::",
+                v.source,
+                v.serial,
                 if label.is_empty() { "-" } else { label.as_str() },
                 why
             ),
-            Refusal::AllTaken => serial_println!(
-                ":: PRTSCR: SCREEN0.PNG..SCREEN{}.PNG all present at the volume root — capture skipped (nothing overwritten) ::",
-                MAX_CAPTURES - 1
+            Refusal::AllTaken(v) => serial_println!(
+                ":: PRTSCR: SCREEN0.PNG..SCREEN{}.PNG all present at the volume root — capture skipped (nothing overwritten) :: source={} serial=0x{:08X} ::",
+                MAX_CAPTURES - 1,
+                v.source,
+                v.serial
             ),
             Refusal::Encode(e, w, h, need) => serial_println!(
                 ":: PRTSCR: encoder declined ({:?}) for {}x{} needing {} bytes — capture skipped ::",
                 e, w, h, need
             ),
-            Refusal::Fat(what, e) => serial_println!(
-                ":: PRTSCR: {} failed {} ({:?}; handles={}) — capture skipped ::",
+            Refusal::Fat(v, what, e) => serial_println!(
+                ":: PRTSCR: {} failed {} ({:?}; handles={}) — capture skipped :: source={} serial=0x{:08X} ::",
                 what,
                 fat_errno(*e),
                 e,
-                crate::drivers::block::source_census()
+                crate::drivers::block::source_census(),
+                v.source,
+                v.serial
             ),
-            Refusal::Short(name, written, wanted) => serial_println!(
-                ":: PRTSCR: {} short write {} of {} bytes — capture INCOMPLETE ::",
-                name, written, wanted
+            Refusal::Short(v, name, written, wanted) => serial_println!(
+                ":: PRTSCR: {} short write {} of {} bytes — capture INCOMPLETE :: source={} serial=0x{:08X} ::",
+                name, written, wanted, v.source, v.serial
             ),
             Refusal::InFlight => serial_println!(
                 ":: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::"
             ),
-            Refusal::Vanished(name, done, total) => serial_println!(
-                ":: PRTSCR: {} — volume vanished mid-capture at {}/{} bytes (usb geometry retracted or a newer publish replaced it; handles={}) — capture ABANDONED, nothing written through the stale handle ::",
+            Refusal::Vanished(v, name, done, total) => serial_println!(
+                ":: PRTSCR: {} — volume vanished mid-capture at {}/{} bytes (usb geometry retracted or a newer publish replaced it; handles={}) — capture ABANDONED, nothing written through the stale handle :: source={} serial=0x{:08X} ::",
                 name,
                 done,
                 total,
-                crate::drivers::block::source_census()
+                crate::drivers::block::source_census(),
+                v.source,
+                v.serial
             ),
         }
     }
@@ -497,23 +510,25 @@ impl Refusal {
             Refusal::NoPanel => String::from("screenshot: no panel attached"),
             Refusal::NoFormat(f) => alloc::format!("screenshot: panel layout {:?} has no RGB inverse", f),
             Refusal::NoVolume(e) => alloc::format!("screenshot: no FAT filesystem ({:?})", e),
-            Refusal::ReadOnly(source, _, _) => {
-                alloc::format!("screenshot: REFUSED READ-ONLY ({}); plug a writable USB FAT volume", source)
+            Refusal::ReadOnly(v, _, _) => {
+                alloc::format!("screenshot: REFUSED READ-ONLY ({}); plug a writable USB FAT volume", v.source)
             }
-            Refusal::AllTaken => alloc::format!(
-                "screenshot: SCREEN0..SCREEN{}.PNG all present — delete one", MAX_CAPTURES - 1
+            Refusal::AllTaken(v) => alloc::format!(
+                "screenshot: SCREEN0..SCREEN{}.PNG all present on {} — delete one", MAX_CAPTURES - 1, v.source
             ),
             Refusal::Encode(e, w, h, need) => {
                 alloc::format!("screenshot: encoder declined ({:?}) for {}x{} ({} bytes)", e, w, h, need)
             }
-            Refusal::Fat(what, e) => alloc::format!("screenshot: {}: {} ({:?})", what, fat_errno(*e), e),
-            Refusal::Short(name, written, wanted) => {
+            Refusal::Fat(v, what, e) => {
+                alloc::format!("screenshot: {}: {} ({:?}) on {}", what, fat_errno(*e), e, v.source)
+            }
+            Refusal::Short(_, name, written, wanted) => {
                 alloc::format!("screenshot: {}: short write {} of {} bytes", name, written, wanted)
             }
             Refusal::InFlight => {
                 String::from("screenshot: a capture is already in flight — retry after its verdict")
             }
-            Refusal::Vanished(name, done, total) => alloc::format!(
+            Refusal::Vanished(_, name, done, total) => alloc::format!(
                 "screenshot: {}: volume vanished mid-capture at {}/{} bytes", name, done, total
             ),
         }
@@ -575,24 +590,34 @@ fn busy_retry<R>(mut op: impl FnMut() -> Result<R, FatError>) -> Result<R, FatEr
 /// the registry, so the pass after `publish_usb_geometry` runs sees the new volume with no cache to
 /// invalidate.
 fn mount_capture_target() -> Result<FatFs, Refusal> {
-    let primary = match crate::fs::fat::mount_program_source() {
+    let (primary, r1) = match crate::fs::fat::mount_program_source() {
         Ok(fs) => match fs.write_veto() {
-            None => return Ok(fs),
-            Some(why) => Refusal::ReadOnly(fs.source_name(), fs.label(), why),
+            None => {
+                vol_mounted(1, &fs);
+                return Ok(fs);
+            }
+            Some(why) => (Refusal::ReadOnly(vol_id(&fs), fs.label(), why), VOL_R_READONLY),
         },
-        Err(e) => Refusal::NoVolume(e),
+        Err(e) => (Refusal::NoVolume(e), VOL_R_NOVOLUME),
     };
     // Rung 2: the stick under its OWN handle — never the ambient global, whose FRGUARD veto is not
     // ours to bypass. Gated on the registry so an absent stick costs one lock, not a mount attempt.
+    // `r2` is advanced past each test it survives, so the decline witness names the LAST thing that
+    // was true rather than a single undifferentiated "no".
+    let mut r2 = VOL_R_ABSENT;
     if crate::drivers::block::usb_info().is_some() {
+        r2 = VOL_R_MOUNTFAIL;
         if let Ok(fs) = crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb) {
+            r2 = VOL_R_VETOED;
             // `Usb`'s write_veto is `None` today; asked anyway so this ladder keeps telling the
             // truth if that arm ever grows a refusal.
             if fs.write_veto().is_none() {
+                vol_mounted(2, &fs);
                 return Ok(fs);
             }
         }
     }
+    vol_declined(r1, r2);
     Err(primary)
 }
 
@@ -641,10 +666,10 @@ fn next_free_name(fs: &FatFs) -> Result<String, Refusal> {
         }) {
             Ok(None) => return Ok(name),
             Ok(Some(_)) => continue,
-            Err(e) => return Err(Refusal::Fat("root lookup", e)),
+            Err(e) => return Err(Refusal::Fat(vol_id(fs), "root lookup", e)),
         }
     }
-    Err(Refusal::AllTaken)
+    Err(Refusal::AllTaken(vol_id(fs)))
 }
 
 /// PRTSCR — **capture the panel and write it to the volume root as a PNG.** Task context only.
@@ -894,6 +919,7 @@ impl Job {
                 // that left, or on a stranger's, is exactly the stale-handle write this refuses.
                 if !self.volume_alive() {
                     return Err(Refusal::Vanished(
+                        vol_id(&self.fs),
                         core::mem::take(&mut self.name),
                         0,
                         bytes.len(),
@@ -904,7 +930,7 @@ impl Job {
                 // apply — `next_free_name` only ever returns a name the root does not hold.
                 let (dir_lba, dir_off) = match busy_retry(|| self.fs.create_in_dir(0, &self.name, 0x20)) {
                     Ok((_, lba, off)) => (lba, off),
-                    Err(e) => return Err(Refusal::Fat("create", e)),
+                    Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
                 };
                 Ok(Step::More(Phase::Write {
                     bytes,
@@ -922,6 +948,7 @@ impl Job {
                 // as it went.
                 if !self.volume_alive() {
                     return Err(Refusal::Vanished(
+                        vol_id(&self.fs),
                         core::mem::take(&mut self.name),
                         done,
                         bytes.len(),
@@ -937,10 +964,11 @@ impl Job {
                 let (wrote, new_size, new_first) =
                     match busy_retry(|| self.fs.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
                         Ok(t) => t,
-                        Err(e) => return Err(Refusal::Fat("write", e)),
+                        Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "write", e)),
                     };
                 if wrote != take {
                     return Err(Refusal::Short(
+                        vol_id(&self.fs),
                         core::mem::take(&mut self.name),
                         at + wrote,
                         bytes.len(),
@@ -957,12 +985,13 @@ impl Job {
                         width: self.width,
                         height: self.height,
                         bytes: done,
+                        vol: vol_id(&self.fs),
                     }))
                 }
             }
             // Unreachable: `slice` is the only caller and it always hands back a live phase.
             // Answered rather than panicked, per this module's guard-with-a-return discipline.
-            Phase::Spent => Err(Refusal::Fat("slice", FatError::Io)),
+            Phase::Spent => Err(Refusal::Fat(vol_id(&self.fs), "slice", FatError::Io)),
         }
     }
 }
@@ -1026,11 +1055,12 @@ pub fn selftest_once() {
             }
             return;
         }
-        Err(Refusal::ReadOnly(source, _, why)) => {
+        Err(Refusal::ReadOnly(v, _, why)) => {
             if !SAID_READ_ONLY.swap(true, Ordering::Relaxed) {
                 serial_println!(
-                    ":: PRTSCR-ST: program source is {} and vetoes writes ({}) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::",
-                    source,
+                    ":: PRTSCR-ST: program source is {} (serial=0x{:08X}) and vetoes writes ({}) — still waiting for a writable volume; a FAT USB volume plugged in NOW will be adopted on arrival ::",
+                    v.source,
+                    v.serial,
                     why
                 );
             }
@@ -1051,8 +1081,9 @@ pub fn selftest_once() {
     if SAID_NO_VOLUME.load(Ordering::Relaxed) || SAID_READ_ONLY.load(Ordering::Relaxed) {
         let label = fs.label();
         serial_println!(
-            ":: PRTSCR-ST: writable volume arrived (source={} label={}) — running the deferred capture selftest ::",
+            ":: PRTSCR-ST: writable volume arrived (source={} serial=0x{:08X} label={}) — running the deferred capture selftest ::",
             fs.source_name(),
+            fs.volume_fingerprint().0,
             if label.is_empty() { "-" } else { label.as_str() }
         );
     }
@@ -1065,10 +1096,7 @@ pub fn selftest_once() {
             return;
         }
     };
-    serial_println!(
-        ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
-        shot.name, shot.width, shot.height, shot.bytes
-    );
+    shot.report_ok();
 
     // Read back through the block layer — the directory entry the volume actually holds, and the
     // file's own first and last bytes. Head and tail rather than the whole file: at 2880x1800 the
@@ -1117,4 +1145,145 @@ pub fn selftest_once() {
             shot.name, sig_ok, ihdr_ok, colour_ok, w, h, shot.width, shot.height, iend_ok
         );
     }
+}
+
+// ======================== PRTSCR-VOL — WHICH DISK, ON THE WIRE (orin 23) ========================
+//
+// **The gap this closes.** `mount_capture_target` above picks the capture target by two rungs, and
+// until this block the wire never said which one won or what it landed on. That is fatal to the one
+// experiment the ladder exists for: `drivers/block.rs`'s `USB_BLOCK_DEVICE` is ONE
+// `Option<BlockDeviceInfo>` that every `publish_usb_geometry` OVERWRITES, so with two USB disks
+// attached rung 2 mounts whichever enumerated LAST — and the verdict line
+// `:: PRTSCR: SCREEN0.PNG 1920x1200 6912345 bytes -> OK ::` named no device at all. A FRIEND-DIFF
+// positive control (a friend's stick attached AND the root refusing writes) could therefore produce
+// a green capture that nobody could attribute to a disk. An experiment whose result cannot be read
+// is not an experiment.
+//
+// **Two identity fields, and why these two.** `source` is the REGISTRY HANDLE the volume was reached
+// through, spelled exactly as `BlockSource::name` and `block::source_census` spell it, so a
+// PRTSCR line and a `handles=` census read as one vocabulary. `serial` is `BS_VolID` — the volume
+// serial fixed at FORMAT time, `FatFs::volume_fingerprint`'s first field, which is the same identity
+// the aarch64 UNAFS.ATR store binds its ACL rows to. The handle answers "which slot"; the serial
+// answers "which disk", and only the pair survives the overwrite described above: two sticks share
+// the `usb` handle and cannot share a serial.
+//
+// **Nothing here changes the ladder.** Not a rung, not an order, not a refusal. Every function below
+// either reads a mounted `FatFs` or prints; the capture behaves exactly as it did at 600887c2.
+//
+// **Appended at the file TAIL on purpose.** A definition inserted higher up shifts every
+// `panic::Location` below it and so changes bytes that have nothing to do with this arc; the format
+// strings are the deliverable and they live at their call sites, which are edits in place.
+
+/// PRTSCR-VOL — the identity of the volume a capture settled on.
+///
+/// `Copy` and two words wide, so every post-mount refusal can carry it without a clone and without
+/// borrowing the `FatFs` a `Refusal` outlives.
+#[derive(Clone, Copy)]
+pub struct VolId {
+    /// The registry handle, spelled as [`BlockSource::name`] spells it: `global`, `usb`, `sdhc`,
+    /// `tegra-sd`.
+    pub source: &'static str,
+    /// `BS_VolID`, the serial fixed at format time — [`FatFs::volume_fingerprint`]'s first field.
+    pub serial: u32,
+}
+
+/// PRTSCR-VOL — read a mounted volume's identity. Two field reads off the already-parsed BPB; no
+/// I/O, so it is safe at every refusal site including the ones reached from a failing block layer.
+fn vol_id(fs: &FatFs) -> VolId {
+    VolId { source: fs.source_name(), serial: fs.volume_fingerprint().0 }
+}
+
+impl Shot {
+    /// PRTSCR-VOL — **the capture verdict line, in one place.**
+    ///
+    /// The identity is appended as a SECOND `::`-delimited segment rather than folded into the
+    /// first, because the first segment is what every scorer in the corpus keys on:
+    /// `scorers-render9.sh` matches `/:: PRTSCR: SCREEN[0-9]+\.PNG [0-9]+x[0-9]+ [0-9]+ bytes -> OK
+    /// ::/` (A17, :320 and :888) and `/:: PRTSCR: .* bytes -> OK ::/` (A36, :702), and both need
+    /// `bytes -> OK ::` CONTIGUOUS. A field inserted before that `::` would have silently zeroed
+    /// three census counters — a check that cannot fire, produced by a witness change.
+    pub fn report_ok(&self) {
+        serial_println!(
+            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} ::",
+            self.name,
+            self.width,
+            self.height,
+            self.bytes,
+            self.vol.source,
+            self.vol.serial
+        );
+    }
+}
+
+/// PRTSCR-VOL — a rung's decline reason: `(shape code, wire token)`. The code exists only so
+/// [`vol_declined`] can tell "the same decline again" from "a DIFFERENT decline" without allocating
+/// or comparing strings; the token is what the operator reads.
+type VolReason = (u32, &'static str);
+
+/// Rung 1 mounted and vetoed writes (the rMBP's SDHC-4c boot medium, and the FRIEND-DIFF control).
+const VOL_R_READONLY: VolReason = (1, "read-only");
+/// Rung 1 did not mount at all — storage has not enumerated yet, or there is no FAT volume.
+const VOL_R_NOVOLUME: VolReason = (2, "no-volume");
+/// Rung 2: no USB geometry is published, so there is no stick to try.
+const VOL_R_ABSENT: VolReason = (3, "absent");
+/// Rung 2: geometry is published but the FAT mount through the USB handle failed.
+const VOL_R_MOUNTFAIL: VolReason = (4, "mount-failed");
+/// Rung 2: it mounted and then vetoed writes. Unreachable today (`BlockSource::Usb`'s `write_veto`
+/// is `None`) and kept because the ladder asks the live predicate rather than assuming it.
+const VOL_R_VETOED: VolReason = (5, "write-vetoed");
+
+/// PRTSCR-VOL — the last decline SHAPE announced, `(rung1 code << 8) | rung2 code`; `0` means
+/// nothing is outstanding. Reset by [`vol_mounted`], so a target that arrives and later goes away
+/// announces the new decline instead of being swallowed by a latch from the previous episode.
+static VOL_DECLINED: AtomicU32 = AtomicU32::new(0);
+
+/// PRTSCR-VOL — **the witness the ladder owed: which rung took the capture, and which disk.**
+///
+/// Printed once per successful mount, which is once per capture (`Job::begin`) plus once per
+/// `selftest_once` that reaches a writable volume — not per slice and not per service pass.
+///
+/// `label` comes from `FatFs::label_raw` and `fs::bootdisk::sanitize_label`, the SAME pair the home
+/// soil mount uses, so `/volumes/<name>` and this line cannot come to disagree about what a disk is
+/// called; an unnamed volume reads `Untitled` rather than blank. `label_raw` prefers the root
+/// directory's `ATTR_VOLUME_ID` entry, so this costs a short root walk — a handful of sector reads
+/// against the several hundred a capture already spends — and a read error falls back to the BPB
+/// field rather than failing the mount.
+///
+/// `rw=` is read from the live `write_veto()` and not asserted: it reads `yes` on this line by
+/// construction today, because both rungs return only after that predicate answered `None`. It is
+/// printed anyway so that the day a rung grows a writable-but-restricted arm, the wire says so
+/// instead of the line quietly continuing to mean something else.
+fn vol_mounted(rung: u8, fs: &FatFs) {
+    VOL_DECLINED.store(0, Ordering::Relaxed);
+    let id = vol_id(fs);
+    let (label, _altered) = crate::fs::bootdisk::sanitize_label(&fs.label_raw());
+    serial_println!(
+        ":: PRTSCR-VOL: rung={} source={} serial=0x{:08X} label={} rw={} -> MOUNTED ::",
+        rung,
+        id.source,
+        id.serial,
+        label,
+        if fs.write_veto().is_none() { "yes" } else { "no" }
+    );
+}
+
+/// PRTSCR-VOL — both rungs declined: name what each one said, beside the refusal the caller reports.
+///
+/// Said once per DECLINE SHAPE, not once per call, and that distinction is the whole reason the
+/// codes exist: `selftest_once` calls `mount_capture_target` on every storage-ready pass while it
+/// waits, so a per-call line would bury the log — while a plain "said once" latch would hide the
+/// transition that matters most on the bench, `no-volume/absent` (nothing plugged in yet) becoming
+/// `read-only/absent` (the boot medium is up and refuses) becoming `read-only/mount-failed` (a stick
+/// arrived and its filesystem would not mount). Each of those speaks; a repeat of the same one does
+/// not.
+fn vol_declined(r1: VolReason, r2: VolReason) {
+    let shape = (r1.0 << 8) | r2.0;
+    if VOL_DECLINED.swap(shape, Ordering::Relaxed) == shape {
+        return;
+    }
+    serial_println!(
+        ":: PRTSCR-VOL: rung=none rung1={} rung2={} -> NO TARGET ::",
+        r1.1,
+        r2.1
+    );
 }

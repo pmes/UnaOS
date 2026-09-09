@@ -582,7 +582,7 @@ fn label_byte_ok(b: u8) -> bool {
 ///
 /// The input is `[u8; 11]` by type. There is no length here that came from a card, and no buffer
 /// that a card's contents can size, so this cannot overflow anything — by construction, not by check.
-fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
+pub(crate) fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
     // The PAD comes off first, and only off the END: a short label is stored space-padded, and some
     // formatters NUL-pad instead. Stripping the pad before sanitizing is what keeps `UNAOS` from
     // becoming `UNAOS______`. A NUL in the MIDDLE of a label is not padding — it survives this trim
