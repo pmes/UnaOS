@@ -716,7 +716,7 @@ pub fn compose() -> bool {
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, true); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3. DOCKID — the model is SETTLED here and only here: reconcile the tile registry against the assembled model (the one mutating call in the block, so the registry has exactly one writer), then sort into strip order. Ordering is what render11's defect was — `[dock] press … tile=4/5 pulse=pin` and `tile=4/5 win=8` one pixel apart, because reopening the furniture teleported win 8's tile from index 1 to index 4. See the DOCKID block at this file's tail. ⚠ FOLDED onto this line rather than added below it — PARITY.md §5.3.
     // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -963,7 +963,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, false); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3. DOCKID — the ROUTER routes over the order the painter painted. `reconciling=false`: this is the click path, and the registry's writer is `compose` alone (LOCKFIX's rule for this router — it allocates nothing and takes no panel lock), so this is a pure sort over the published ranks. ⚠ FOLDED onto this line — PARITY.md §5.3.
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
@@ -1019,7 +1019,13 @@ pub fn press_at(x: i32, y: i32) -> bool {
     } else {
         focus_set(r.owner_asid);
     }
+    let wgen = wm::winid_gen(r.id); // DOCKID — the OTHER half of the tile's identity, taken from the scan this press routed over and re-checked below: a close-and-recycle between the scan and the raise must not let this press land on the window that took the slot.
     wm::focus_changed(r.owner_asid);
+    // DOCKID — and then THIS window, specifically. `focus_changed` is keyed by ASID and raises every
+    // window the owner has, deliberately; a tile names ONE window, so with two windows under one owner
+    // the topmost after the raise was whichever row sat later in the table, not the one pressed. See
+    // `wm::raise_one`. Gated on the generation: a stale tile raises NOTHING rather than the wrong thing.
+    let raised_one = wm::winid_gen(r.id) == wgen && wm::raise_one(r.id);
     PRESSED.store(wm::WIN_NONE, Ordering::Release);
     RAISES.fetch_add(1, Ordering::Relaxed);
     if was_hidden {
@@ -1030,6 +1036,16 @@ pub fn press_at(x: i32, y: i32) -> bool {
         "[dock] press at ({},{}) tile={}/{} win={} owner={:#x} was_hidden={} -> raised={} unhid={}",
         x, y, t, n, r.id, r.owner_asid, was_hidden, now_visible,
         was_hidden && now_visible
+    );
+    // DOCKID — the IDENTITY witness, beside the geometry one above: which tile, which window, which
+    // generation, and whether THAT window was brought forward. `raised=no` is the honest reading for a
+    // tile whose window went away under the press, and it is a reading the older line cannot produce —
+    // it reports `raised=` from `z > shell_z()`, which a DIFFERENT window in the same slot satisfies
+    // just as well.
+    serial_println!(
+        "[dock] press tile={}/{} -> win={} gen={} raised={}",
+        t, n, r.id, wgen,
+        if raised_one { "yes" } else { "no" }
     );
     true
 }
@@ -1214,7 +1230,7 @@ pub fn selftest() {
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. A no-op until a console WINDOW has existed (see the block at this file's tail). Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3.
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, false); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3. DOCKID — the FIXTURE routes over the same order, or leg 2's `tile_at(centre of tile k) == Some(k)` would be checking a tile index the router never computes. ⚠ FOLDED onto this line — PARITY.md §5.3.
     let mine: [Option<usize>; 3] = [
         rows[..n].iter().position(|r| r.id == w[0]),
         rows[..n].iter().position(|r| r.id == w[1]),
@@ -1284,7 +1300,7 @@ pub fn selftest() {
             park, park_ok
         );
     }
-    rollup("selftest");
+    rollup("selftest"); dockid_selftest(); // DOCKID — the tile-IDENTITY battery, driven from here on `menubar::selftest`'s precedent (same `witness` gate, same real panel, same ordering) because this module's own call site is `arch/x86_64/syscall.rs`, outside this arc's lane. It runs LAST: it mints six rows of its own and closes them, and the legs above must not see them. Its own one-shot `DONE` latch makes a future move to the canonical call site idempotent. ⚠ FOLDED onto this line — PARITY.md §5.3.
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1494,4 +1510,547 @@ pub fn console_reopen_service(who: &'static str) -> bool {
         wm::winid_gen(id)
     );
     true
+}
+
+// ------------------------------------------------------------------------------------------------
+// DOCKID — TILE IDENTITY: one tile per live window, keyed by (win id, generation), in a position
+// that does not move under the operator's hand.  (TAIL-APPENDED: nothing above this line moved, so
+// knob-off panic `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+//
+// # The defect, and where it actually was
+//
+// Peter, render11, verbatim: *"there's something weird going on with the opening and closing of
+// windows who is who between what is open and what is showing in the taskbar. it's all crazy mixed
+// up"*.
+//
+// The tile MODEL was never wrong. [`wm::dock_scan`] re-derives it from the window table on every
+// pass, so the SET of tiles has always matched the set of live windows exactly. What was wrong is the
+// ORDER, and the order is what an operator's hand knows a tile by. Two independent instabilities,
+// both measured on `boot-render11-B-full.log`:
+//
+//  1. **A pin and its window occupy different positions.** `pin_quarry` PREPENDS, `pin_console`,
+//     `pin_shell` and `pin_pulse` APPEND — but when those windows are LIVE their rows come from the
+//     scan and sort by WINDOW ID, in the middle. So the settled strip `[quarry] [live rows…]
+//     [console] [shell] [pulse]` that those four headers describe is only true while all four are
+//     CLOSED. Opening one teleports its tile across the strip.
+//
+//  2. **Live rows are ordered by a RECYCLED SLOT ALIAS.** `create_inner` mints `id = slot + 1` and
+//     takes the lowest free slot, so closing a low-id window and opening another puts the NEW window
+//     in the MIDDLE of the strip and shifts every tile to its right by one.
+//
+// The wire shows both in four consecutive lines. With only win 8 (an app) live the strip was
+// `[quarry] [win8] [console] [shell] [pulse]` and win 8's tile was index 1:
+//
+// ```text
+// [dock] press at (792,1166)  tile=1/6 win=8 owner=0x4 …
+// [dock] press at (974,1157)  tile=2/5 console=pin -> reopen requested
+// [dock] press at (1077,1165) tile=3/5 shell=pin   -> reopen requested
+// [dock] press at (1181,1162) tile=4/5 pulse=pin   -> rearmed
+// [dock] press at (1182,1161) tile=4/5 win=8 owner=0x4 …      <-- ONE PIXEL later
+// ```
+//
+// Reopening the three furniture windows moved win 8's tile from index 1 to index 4 without the
+// operator touching it: two presses one pixel apart resolved to two different windows. That is the
+// whole of "who is who … all crazy mixed up", and no amount of correctness in the tile SET fixes it.
+//
+// A third defect is in the press itself and is fixed with [`wm::raise_one`]: `press_at` raised by
+// OWNER (`wm::focus_changed(r.owner_asid)`), which by design raises every window that owner has, so
+// with two windows under one owner the tile pressed and the window that came forward were not the
+// same window.
+//
+// # The model this installs
+//
+// A tile has an IDENTITY, and its identity fixes its position:
+//
+//  * **Furniture** (quarry, console, shell, pulse) is identified by its OWNER, and the pin and the
+//    live row are THE SAME TILE. Its position is a constant ([`fixed_rank`]), so it is the same tile
+//    in the same place whether the window is open or closed. This is what makes the four pin headers'
+//    "settled strip" claim true in every state instead of only in the all-closed one.
+//  * **Everything else** is identified by `(win id, generation)` — `wm::winid_gen`'s per-slot reuse
+//    counter, which exists precisely so a capture "can tell the console that was win 1 from the
+//    quarry that is win 1 now". Its position is its ARRIVAL RANK, allocated once when the tile is
+//    created and held until the window closes. A recycled slot id therefore gets a NEW tile at the
+//    END of the app run, never the closed window's old position.
+//
+// The registry is the dock's own belief about what is open, held ACROSS passes, so "the taskbar
+// disagrees with the window manager" becomes a statement two lines of the same capture can settle
+// ([`census`] beside `[wm] alloc`/`[wm] close`) instead of an inference from behaviour.
+//
+// # What did NOT change
+//
+// The tile SET is still `wm::dock_scan` plus the four pins, unchanged and in the same order of
+// application — this block sorts what they produce and does not decide membership. `strip_rect` is
+// untouched: the occlusion registry sizes the strip from the tile COUNT, which ordering cannot
+// change. The signature, the damage conditions, the painter and the geometry are all unchanged.
+//
+// # Cost
+//
+// One extra bounded pass over at most `MAX_WINDOWS` model rows per composite (a key per row, each a
+// linear probe of a 12-entry relaxed-atomic table) plus an insertion sort of at most 12 elements over
+// precomputed keys. No lock, no allocation, no framebuffer access. The reconcile — which is the only
+// mutating half, and the only one that can print — runs from [`compose`] alone on a shipped image
+// (the `witness` fixture drives it too; see `reconcile`).
+
+/// DOCKID — the registry's capacity. One entry per non-furniture window the table can hold; furniture
+/// is never registered because its position is a constant rather than an arrival rank.
+const MAX_TILES: usize = wm::MAX_WINDOWS;
+
+/// DOCKID — the arrival counter. Monotonic, never reused, so a tile's rank is unique for the boot and
+/// a window that closes can never hand its position to the window that recycles its slot.
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// DOCKID — registry column: the window id this slot's tile names, or `wm::WIN_NONE` for a free slot.
+static TILE_ID: [AtomicU32; MAX_TILES] = [const { AtomicU32::new(wm::WIN_NONE) }; MAX_TILES];
+/// DOCKID — registry column: the SLOT GENERATION the tile was created at. Half of the identity: a
+/// tile whose id is live but whose generation has moved names a window that no longer exists.
+static TILE_GEN: [AtomicU32; MAX_TILES] = [const { AtomicU32::new(0) }; MAX_TILES];
+/// DOCKID — registry column: the owning ASID, for the remove witness (the row is gone by then, so it
+/// cannot be asked).
+static TILE_OWNER: [AtomicU64; MAX_TILES] = [const { AtomicU64::new(0) }; MAX_TILES];
+/// DOCKID — registry column: the arrival rank, which IS the tile's position among the app tiles.
+static TILE_SEQ: [AtomicU64; MAX_TILES] = [const { AtomicU64::new(0) }; MAX_TILES];
+
+/// DOCKID — order key: the leftmost position, Quarry's, whether it is open or closed.
+const RANK_QUARRY: u64 = 0;
+/// DOCKID — order key base for the app run: `RANK_APPS + seq`, i.e. arrival order.
+const RANK_APPS: u64 = 1;
+/// DOCKID — order key base for a tile the registry has not seen yet (a window minted since the last
+/// [`compose`]). It sorts after every registered app tile and before the permanent tail, by id, so a
+/// press that lands between an alloc and the next composite still routes deterministically — and one
+/// pass later the tile has its real rank and never moves again.
+const RANK_UNSEEN: u64 = 0x4000_0000_0000_0000;
+/// DOCKID — the permanent tail, in the order the pin headers name: console, shell, pulse.
+const RANK_CONSOLE: u64 = u64::MAX - 2;
+const RANK_SHELL: u64 = u64::MAX - 1;
+const RANK_PULSE: u64 = u64::MAX;
+
+/// DOCKID — **is this owner FURNITURE with a fixed position, and which?**
+///
+/// The four owners that have a pin. Their tile is the same tile open or closed, which is the whole
+/// point: the pin is not a substitute for the window's tile, it IS the window's tile with the window
+/// away. Any other owner — an app, or a kernel row with no pin such as the window menu — is ranked by
+/// arrival instead.
+fn fixed_rank(owner: u64) -> Option<u64> {
+    #[cfg(feature = "quarry")]
+    if owner == crate::video::quarry::OWNER {
+        return Some(RANK_QUARRY);
+    }
+    match owner {
+        wm::KERNEL_OWNER_CONSOLE => Some(RANK_CONSOLE),
+        wm::KERNEL_OWNER_DESKTOP => Some(RANK_SHELL),
+        _ if owner == crate::video::pulsewin::OWNER => Some(RANK_PULSE),
+        _ => None,
+    }
+}
+
+/// DOCKID — the registry slot holding `(id, gen)`, or `None`.
+fn tile_slot(id: wm::WinId, wgen: u32) -> Option<usize> {
+    (0..MAX_TILES).find(|&s| {
+        TILE_ID[s].load(Ordering::Relaxed) == id && TILE_GEN[s].load(Ordering::Relaxed) == wgen
+    })
+}
+
+/// DOCKID — **the order key for one model row.** Pure: it reads the registry and never writes it, so
+/// [`press_at`] and `selftest` can order the model without racing [`compose`]'s reconcile.
+fn order_key(e: &wm::DockEntry) -> u64 {
+    if let Some(k) = fixed_rank(e.owner_asid) {
+        return k;
+    }
+    match tile_slot(e.id, wm::winid_gen(e.id)) {
+        Some(s) => RANK_APPS + TILE_SEQ[s].load(Ordering::Relaxed),
+        None => RANK_UNSEEN + e.id as u64,
+    }
+}
+
+/// DOCKID — **sort the assembled model into strip order.** The one place tile POSITION is decided;
+/// [`compose`], [`press_at`] and `selftest` all call it on the same model, so painter, router and
+/// fixture cannot disagree about which tile is where — the invariant `pin_shell`'s header states for
+/// the tile COUNT, extended to the tile ORDER, which is the half the operator's hand actually uses.
+///
+/// Insertion sort over PRECOMPUTED keys: `n <= MAX_WINDOWS` (12), the keys are unique by construction
+/// (a unique arrival rank, four distinct constants, or `RANK_UNSEEN + id`), and the sort is therefore
+/// total and deterministic rather than merely stable.
+fn order_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
+    let mut key = [0u64; wm::MAX_WINDOWS];
+    for i in 0..n {
+        key[i] = order_key(&rows[i]);
+    }
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && key[j - 1] > key[j] {
+            rows.swap(j - 1, j);
+            key.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
+/// DOCKID — a tiny fixed formatting buffer, so [`census`] reaches the wire as ONE `serial_println!`.
+/// A census built out of a run of `serial_print!`s could interleave with another core's line, and the
+/// standing law in this tree is that the transport is held to a stricter standard than what it
+/// reports on: a census that can be cut in half is not evidence.
+struct Census {
+    b: [u8; 224],
+    n: usize,
+}
+
+impl core::fmt::Write for Census {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            if self.n < self.b.len() {
+                self.b[self.n] = c;
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// DOCKID — the word a PIN tile carries on the wire, or `None` for a real window id.
+fn pin_word(id: wm::WinId) -> Option<&'static str> {
+    match id {
+        SHELL_PIN_ID => Some("shell"),
+        QUARRY_PIN_ID => Some("quarry"),
+        PULSE_PIN_ID => Some("pulse"),
+        CONSOLE_PIN_ID => Some("console"),
+        _ => None,
+    }
+}
+
+/// DOCKID — **the taskbar's belief, on the wire, in strip order.**
+///
+/// `[dock] census tiles=3 win:gen=1:2,8:1,shell:pin` — every tile, left to right, named by the same
+/// `(id, gen)` pair `[wm] alloc` and `[wm] close` name windows by. A capture can then settle "does the
+/// dock agree with the window manager" by reading two lines, which is exactly what could not be done
+/// on render11: the wm's belief was on the wire and the dock's was not.
+///
+/// Emitted only when the tile SET changed (see [`reconcile`]), so a quiet desktop prints nothing.
+fn census(rows: &[wm::DockEntry], n: usize) {
+    use core::fmt::Write;
+    let mut c = Census { b: [0u8; 224], n: 0 };
+    let _ = write!(c, "[dock] census tiles={} win:gen=", n);
+    for (i, r) in rows[..n].iter().enumerate() {
+        if i > 0 {
+            let _ = write!(c, ",");
+        }
+        match pin_word(r.id) {
+            Some(w) => {
+                let _ = write!(c, "{}:pin", w);
+            }
+            None => {
+                let _ = write!(c, "{}:{}", r.id, wm::winid_gen(r.id));
+            }
+        }
+    }
+    serial_println!("{}", core::str::from_utf8(&c.b[..c.n]).unwrap_or("[dock] census <unprintable>"));
+}
+
+/// DOCKID — **make the registry agree with the model, and say so on the wire.** Returns `true` iff
+/// the tile set changed.
+///
+/// The only mutating half of this block. On a shipped image it runs from [`compose`] ALONE — the
+/// pass-driven path — so the registry has exactly one writer and [`order_key`]'s readers never race a
+/// partial update. ⚠ Stated exactly: the `witness` fixture [`dockid_selftest`] also drives it, which
+/// is a second writer on a `witness` build and is why the claim above is scoped to the metal image
+/// rather than made unconditionally. The fixture runs on the boot task and drives the composites it
+/// races, so the two are serialised in practice; that is an argument, not a guarantee, and it buys a
+/// fixture that asserts the registry rather than a mock of it.
+///
+/// Two arms, in this order:
+///
+///  * **retire** — a registered `(id, gen)` that is no longer in the model. `reason=reuse` when the
+///    id is back in the model under a DIFFERENT generation (the slot was recycled by
+///    `create_inner`), `reason=close` otherwise. The distinction is the one `wm::winid_gen` exists to
+///    make and is why the tile cannot outlive its window: a recycled id retires the old tile and
+///    admits a new one, rather than silently re-pointing a stale tile at a new window.
+///  * **admit** — a model row with no registry entry takes a free slot and the next arrival rank.
+///
+/// Furniture is skipped by both arms: its rank is a constant, it has no arrival order, and its tile
+/// is permanent by design (that is what a pin IS).
+fn reconcile(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> bool {
+    let mut changed = false;
+    for s in 0..MAX_TILES {
+        let id = TILE_ID[s].load(Ordering::Relaxed);
+        if id == wm::WIN_NONE {
+            continue;
+        }
+        let tgen = TILE_GEN[s].load(Ordering::Relaxed);
+        let live = rows[..n]
+            .iter()
+            .any(|r| r.id == id && fixed_rank(r.owner_asid).is_none() && wm::winid_gen(r.id) == tgen);
+        if live {
+            continue;
+        }
+        let reuse = rows[..n].iter().any(|r| r.id == id);
+        serial_println!(
+            "[dock] tile remove win={} gen={} owner={:#x} reason={}",
+            id,
+            tgen,
+            TILE_OWNER[s].load(Ordering::Relaxed),
+            if reuse { "reuse" } else { "close" }
+        );
+        TILE_ID[s].store(wm::WIN_NONE, Ordering::Relaxed);
+        changed = true;
+    }
+    for r in rows[..n].iter() {
+        if fixed_rank(r.owner_asid).is_some() {
+            continue;
+        }
+        let wgen = wm::winid_gen(r.id);
+        if tile_slot(r.id, wgen).is_some() {
+            continue;
+        }
+        let Some(s) = (0..MAX_TILES).find(|&s| TILE_ID[s].load(Ordering::Relaxed) == wm::WIN_NONE)
+        else {
+            // The registry is exactly as large as the window table, so this is unreachable by
+            // construction — and it is reported rather than assumed, because "unreachable by
+            // construction" is the claim a future MAX_WINDOWS change would silently falsify.
+            serial_println!("[dock] tile add win={} gen={} -> DECLINED (registry full)", r.id, wgen);
+            continue;
+        };
+        let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+        TILE_GEN[s].store(wgen, Ordering::Relaxed);
+        TILE_OWNER[s].store(r.owner_asid, Ordering::Relaxed);
+        TILE_SEQ[s].store(seq, Ordering::Relaxed);
+        TILE_ID[s].store(r.id, Ordering::Relaxed);
+        serial_println!(
+            "[dock] tile add win={} gen={} owner={:#x} seq={} label={}",
+            r.id,
+            wgen,
+            r.owner_asid,
+            seq,
+            core::str::from_utf8(&r.title[..r.title_len.min(wm::MAX_TITLE)]).unwrap_or("?")
+        );
+        changed = true;
+    }
+    changed
+}
+
+/// DOCKID — the model assembly every reader shares: reconcile (compose only), then ORDER.
+///
+/// Split from the pin applications rather than folded into them so the three call sites read the same
+/// two lines, and so `strip_rect` — which wants the tile COUNT and nothing else — is not made to pay
+/// for an ordering it cannot use.
+fn settle(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize, reconciling: bool) {
+    if reconciling && reconcile(rows, n) {
+        order_model(rows, n);
+        census(rows, n);
+        return;
+    }
+    order_model(rows, n);
+}
+
+/// DOCKID — **the fixture: a tile is the window it names, and it stays where the operator left it.**
+///
+/// Peter's report was about a SEQUENCE — open some windows, close one, open another — and no leg in
+/// this module drove one. `selftest` mints three rows and never closes one mid-flight, so both halves
+/// of the render11 defect were invisible to it: the tile-position instabilities only appear ACROSS a
+/// close, and the wrong-window raise only appears with two windows under ONE owner.
+///
+/// Five legs, and every one of them is red on the pre-DOCKID tree:
+///
+/// 1. **recycle** — the fixture's own precondition, asserted rather than assumed. Closing the MIDDLE
+///    window and opening another must hand the new window the CLOSED one's id (`create_inner` takes
+///    the lowest free slot), or legs 2 and 3 prove nothing about recycled ids. A boot where the table
+///    happens not to recycle SKIPs rather than passing vacuously.
+/// 2. **arrival order** — the new window's tile is to the RIGHT of the older survivor's. On the base
+///    tree the model is ordered by WINDOW ID, so a recycled low id puts the newest window in the
+///    MIDDLE of the strip and shifts every tile right of it — the second of the two instabilities in
+///    this block's header, and the one an operator experiences as their tiles moving by themselves.
+/// 3. **set** — the dock's registry and the window table agree: every non-furniture tile names a live
+///    window at the generation the tile was created at, and every live dock-addressable non-furniture
+///    window has exactly one tile. A tile that outlived its window or predates it fails here.
+/// 4. **identity of the press** — two windows under ONE owner, and pressing the LOWER-id one's tile
+///    must leave THAT window on top. On the base tree `press_at` raises by ASID alone, and
+///    `focus_changed` hands out `z` in table order, so the higher-id sibling always ends in front —
+///    the tile pressed and the window raised are not the same window. `wm::raise_one` is the fix and
+///    this is its gate.
+/// 5. **furniture is anchored** — the four pinned owners rank by [`fixed_rank`] and never by arrival,
+///    so a furniture tile is in the same place whether its window is open or closed. Checked against
+///    the ordered model rather than against the constants, so a future pin added to `settle` without
+///    a rank fails here.
+///
+/// Self-cleaning: every row it mints is closed and the focus owner is restored. Driven from the tail
+/// of [`selftest`] on `menubar::selftest`'s precedent — same `witness` gate, same real panel, same
+/// "after every one-shot per-window latch" ordering — because this module's call site lives in
+/// `arch/x86_64/syscall.rs`, which is outside this arc's lane.
+#[cfg(feature = "witness")]
+pub fn dockid_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    /// Six 8x8 ARGB8888 surfaces in rodata — read-only, because the compositor only reads.
+    static SURF: [[u32; 64]; 6] = [
+        [0x0020_40FF; 64], [0x0040_FF20; 64], [0x00FF_4020; 64],
+        [0x00FF_FF20; 64], [0x0020_FFFF; 64], [0x00FF_20FF; 64],
+    ];
+    /// Four distinct app owners for legs 1-3, then ONE owner shared by the last two rows for leg 4.
+    /// Ordinary ASIDs, deliberately outside the reserved kernel band: [`fixed_rank`] must rank these
+    /// by ARRIVAL, and a kernel-band owner would be ranked by constant and prove nothing.
+    const OWNERS: [u64; 6] = [0xD1D1, 0xD1D2, 0xD1D3, 0xD1D4, 0xD1D5, 0xD1D5];
+    const NAMES: [&[u8]; 6] = [b"idA", b"idB", b"idC", b"idD", b"idE", b"idF"];
+
+    let mint = |k: usize| {
+        wm::create(
+            OWNERS[k],
+            SURF[k].as_ptr() as usize,
+            core::mem::size_of_val(&SURF[k]),
+            8,
+            8,
+            // STRIDE IS IN BYTES — `create_inner`'s extent contract, exactly as `selftest` states it.
+            32,
+            NAMES[k],
+        )
+    };
+    /// The ordered strip model, and the index of `id` in it — the router's own view, assembled
+    /// EXACTLY the way [`press_at`] assembles it (scan, pins, `settle(.., false)`), so a leg cannot
+    /// pass against an order the router never computes.
+    ///
+    /// ⚠ **It drives `wm::composite()` first and reconciles NOTHING itself, and that is the point.**
+    /// The registry's writer on a shipped image is [`compose`]; if this fixture assembled the ranks
+    /// itself it would prove its own arithmetic and nothing about the path the operator's clicks take.
+    /// This cost one real defect before it was written this way: the three `settle` calls were folded
+    /// onto their lines to the RIGHT of an existing `//`, so every one of them was commented out —
+    /// `compose` and `press_at` shipped unfixed, `strings kernel.elf` found no `[dock] census` in the
+    /// artifact, and a fixture that assembled its own model reported PASS over the top of it. With the
+    /// reconcile left to `compose`, a dead fold empties the registry, every app tile falls back to
+    /// `RANK_UNSEEN + id`, the strip returns to WINDOW-ID order, and legs 2 and 3 go red.
+    fn strip_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> usize {
+        wm::composite();
+        let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0));
+        let n = pin_console(rows, n);
+        let n = pin_shell(rows, n);
+        let n = pin_quarry(rows, n);
+        let n = pin_pulse(rows, n);
+        settle(rows, n, false);
+        n
+    }
+
+    let saved_focus = focus_get();
+    let mut w = [wm::WIN_NONE; 6];
+    for k in 0..3 {
+        w[k] = mint(k);
+    }
+    if w[..3].iter().any(|&i| i == wm::WIN_NONE) {
+        for &i in w.iter() {
+            if i != wm::WIN_NONE {
+                wm::close(i);
+            }
+        }
+        serial_println!(":: DOCKID: fixture — table full, wins={:?} :: SKIP ::", &w[..3]);
+        return;
+    }
+    // Register the three arrivals before anything closes: the arrival ranks are what leg 2 reads.
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let _ = strip_model(&mut rows);
+
+    // Close the MIDDLE window and open another. This is Peter's sequence, and `create_inner` hands
+    // the new window the closed one's slot id.
+    wm::close(w[1]);
+    w[3] = mint(3);
+    if w[3] == wm::WIN_NONE {
+        for &i in [w[0], w[2]].iter() {
+            wm::close(i);
+        }
+        serial_println!(":: DOCKID: fixture — table full at the reopen :: SKIP ::");
+        return;
+    }
+    let recycle_ok = w[3] == w[1];
+
+    let n = strip_model(&mut rows);
+    let at = |rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize, id: wm::WinId| {
+        rows[..n].iter().position(|r| r.id == id)
+    };
+    // Leg 2 — arrival order: the survivor A, then the survivor C, then the NEW window D. On the base
+    // tree D carries B's recycled id and lands between A and C.
+    let order_ok = match (at(&rows, n, w[0]), at(&rows, n, w[2]), at(&rows, n, w[3])) {
+        (Some(a), Some(c), Some(d)) => a < c && c < d,
+        _ => false,
+    };
+    // Leg 3 — the registry and the table agree, in both directions.
+    let mut set_ok = true;
+    for s in 0..MAX_TILES {
+        let id = TILE_ID[s].load(Ordering::Relaxed);
+        if id == wm::WIN_NONE {
+            continue;
+        }
+        if wm::winid_gen(id) != TILE_GEN[s].load(Ordering::Relaxed) || wm::info(id).is_none() {
+            set_ok = false; // a tile that outlived its window, or names a recycled slot
+        }
+    }
+    for r in rows[..n].iter() {
+        if fixed_rank(r.owner_asid).is_some() {
+            continue;
+        }
+        if tile_slot(r.id, wm::winid_gen(r.id)).is_none() {
+            set_ok = false; // a live window with no tile
+        }
+    }
+    // Leg 5 — furniture is anchored: every pinned owner in the model carries its constant rank, and
+    // the model is sorted by it (so the tail really is the tail).
+    let mut furniture_ok = true;
+    let mut last = 0u64;
+    for r in rows[..n].iter() {
+        let k = order_key(r);
+        if k < last {
+            furniture_ok = false;
+        }
+        last = k;
+        if pin_word(r.id).is_some() && fixed_rank(r.owner_asid).is_none() {
+            furniture_ok = false; // a pin with no fixed rank would float on arrival order
+        }
+    }
+
+    // Leg 4 — the identity of the press, with TWO windows under ONE owner.
+    w[4] = mint(4);
+    w[5] = mint(5);
+    let press_ok = if w[4] == wm::WIN_NONE || w[5] == wm::WIN_NONE {
+        true // no room to run the leg; legs 1-3 and 5 still stand. Reported as `press=skip` below.
+    } else {
+        // Press the LOWER-id sibling's tile: `focus_changed`'s ASID raise walks the table in array
+        // order, so on the base tree the HIGHER id always ends on top and this leg is deterministic.
+        let (lo, hi) = if w[4] < w[5] { (w[4], w[5]) } else { (w[5], w[4]) };
+        let n2 = strip_model(&mut rows);
+        let (pw, ph) = {
+            let fb = *super::WRITER.lock();
+            (fb.width(), fb.height())
+        };
+        match (Layout::for_panel(n2, pw, ph), at(&rows, n2, lo)) {
+            (Some(l), Some(k)) => match l.tile(k) {
+                Some((tx, ty, tw, th)) => {
+                    let consumed = press_at((tx + tw / 2) as i32, (ty + th / 2) as i32);
+                    let z = |id| wm::info(id).map(|i| i.z).unwrap_or(0);
+                    consumed && z(lo) > z(hi)
+                }
+                None => false,
+            },
+            _ => false,
+        }
+    };
+    let press_ran = w[4] != wm::WIN_NONE && w[5] != wm::WIN_NONE;
+
+    for &i in [w[0], w[2], w[3], w[4], w[5]].iter() {
+        if i != wm::WIN_NONE {
+            wm::close(i);
+        }
+    }
+    focus_set(saved_focus);
+    wm::focus_changed(saved_focus);
+
+    let ok = recycle_ok && order_ok && set_ok && furniture_ok && press_ok;
+    serial_println!(
+        ":: DOCKID: tiles={} closed=win{} reopened=win{} recycle={} order={} set={} furniture={} press={} :: {} ::",
+        n,
+        w[1],
+        w[3],
+        recycle_ok,
+        order_ok,
+        set_ok,
+        furniture_ok,
+        if press_ran { if press_ok { "yes" } else { "no" } } else { "skip" },
+        if ok { "PASS" } else { "FAIL" }
+    );
 }

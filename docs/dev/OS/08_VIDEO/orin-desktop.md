@@ -3011,6 +3011,84 @@ now frees a File handle's descriptor as the x86 twin does (audit finding, live o
 boards; pi 6 granted the file). The Pi's knob-off `kernel8.img` byte-identity baseline moves
 (+29 lines in `arch/aarch64/syscall.rs`), stated in the commit for the next pi seat.
 
+### §3.15 LANDED (DOCKID, orin 23) — the taskbar's tiles are the windows, and they stop moving
+
+Peter, render11, verbatim: *"there's something weird going on with the opening and closing of
+windows who is who between what is open and what is showing in the taskbar. it's all crazy mixed
+up"*.
+
+**The tile SET was never wrong.** `wm::dock_scan` re-derives the model from the window table on
+every composite pass, so the set of tiles has always matched the set of live windows exactly, and
+the render11 wire carries a `[wm] close` line for every window Peter closed. What was wrong is the
+**tile ORDER**, which is what a hand knows a tile by, and the **press target**, which is what a
+click acts on. Three mechanisms, all measured on `boot-render11-B-full.log`:
+
+1. **A pin and its window occupied different positions.** `pin_quarry` PREPENDS; `pin_console`,
+   `pin_shell` and `pin_pulse` APPEND. But a LIVE furniture row comes out of the scan and sorts by
+   WINDOW ID, in the middle — so the settled strip `[quarry] [live rows…] [console] [shell]
+   [pulse]` those four headers describe was only true while all four furniture windows were
+   CLOSED. Opening one teleported its tile across the strip.
+2. **Live rows were ordered by a RECYCLED SLOT ALIAS.** `create_inner` mints `id = slot + 1` from
+   the lowest free slot, so closing a low-id window and opening another put the NEW window in the
+   MIDDLE of the strip and shifted every tile right of it.
+3. **A press raised by OWNER, not by window.** `dock::press_at` called `wm::focus_changed(owner)`
+   alone, which by design raises *every* window that owner has; with two windows under one owner
+   the topmost afterwards was whichever row sat later in the table, never necessarily the one whose
+   tile was pressed.
+
+The wire shows (1) and (2) in four consecutive lines. With only win 8 (an app) live, the strip was
+`[quarry] [win8] [console] [shell] [pulse]` and win 8's tile was index 1:
+
+```text
+[dock] press at (792,1166)  tile=1/6 win=8 owner=0x4 …
+[dock] press at (974,1157)  tile=2/5 console=pin -> reopen requested
+[dock] press at (1077,1165) tile=3/5 shell=pin   -> reopen requested
+[dock] press at (1181,1162) tile=4/5 pulse=pin   -> rearmed
+[dock] press at (1182,1161) tile=4/5 win=8 owner=0x4 …      <-- ONE PIXEL later
+```
+
+Reopening the three furniture windows moved win 8's tile from index 1 to index 4 without the
+operator touching it: **two presses one pixel apart resolved to two different windows.**
+
+**The model that replaces it** (`video/dock.rs`, DOCKID block at the file's tail). A tile has an
+IDENTITY and the identity fixes its position:
+
+* **Furniture** (quarry, console, shell, pulse) is identified by its OWNER, and the pin and the
+  live row are THE SAME TILE at a constant position (`fixed_rank`). The four pin headers' "settled
+  strip" claim becomes true in every state instead of only in the all-closed one.
+* **Everything else** is identified by `(win id, generation)` — `wm::winid_gen`'s per-slot reuse
+  counter, which exists precisely so a capture can tell the console that was win 1 from the quarry
+  that is win 1 now. Its position is its ARRIVAL RANK, allocated once when the tile is created and
+  held until the window closes, so a recycled slot id gets a NEW tile at the END of the app run.
+* **The press raises THAT window.** `wm::raise_one` (a z-bump and nothing else, appended at
+  `wm.rs`'s tail) runs after `focus_changed`, which keeps the owner-scoped focus, unhide and wake
+  semantics unchanged and settles only which of the owner's windows ends in front. Gated on the
+  generation: a stale tile raises nothing rather than the wrong thing.
+
+**The taskbar's belief is now on the wire beside the wm's**, which is what render11 could not be
+scored against: `[dock] tile add win=N gen=G owner=… seq=… label=…`,
+`[dock] tile remove win=N gen=G owner=… reason=close|reuse`,
+`[dock] census tiles=N win:gen=…` (strip order, one line, emitted only when the set changes) and
+`[dock] press tile=T/N -> win=N gen=G raised=yes|no`. `[wm] alloc`/`[wm] close` name windows by the
+same `(id, gen)` pair, so "does the dock agree with the window manager" is two lines of one
+capture instead of an inference from behaviour.
+
+**What did NOT change.** Membership is still `wm::dock_scan` plus the four pins, applied in the
+same order; `strip_rect` is untouched (the occlusion registry sizes the strip from the tile COUNT,
+which ordering cannot change); the signature, damage conditions, painter and geometry are
+unchanged. On a shipped image the registry's only writer is `dock::compose`, the
+pass-driven path — `press_at` sorts over the published ranks and mutates nothing, so the click
+router still allocates nothing and takes no panel lock (LOCKFIX). ⚠ The `witness` fixture drives
+the reconcile too, so the one-writer claim is scoped to the metal image and not made unconditionally.
+
+**Gate:** `dock::dockid_selftest` (`witness`, driven from `dock::selftest`'s tail on
+`menubar::selftest`'s precedent, because this module's call site is in `arch/x86_64/syscall.rs` and
+outside the arc's lane). It runs Peter's sequence — open three windows, close the MIDDLE one, open
+another — and asserts the recycle actually happened (or SKIPs), that the new window's tile is to
+the RIGHT of the survivor's, that the registry and the window table agree in both directions, that
+furniture ranks by constant, and that pressing the lower-id of two same-owner windows leaves THAT
+window on top. Every leg is red on the pre-DOCKID tree.
+
 ---
 
 ## §4 The GA10B boundary — stated once so nobody re-asks

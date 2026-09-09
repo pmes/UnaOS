@@ -25297,3 +25297,53 @@ fn winid_selftest() {
 fn winid_selftest() {
     serial_println!("[winid] selftest -> SKIP (no window furniture on this image: the five id caches WINID guards all live behind `wc` / `desktop_firmware`)");
 }
+
+// ------------------------------------------------------------------------------------------------
+// DOCKID — raise ONE window (TAIL-APPENDED: nothing above this line moved, so knob-off panic
+// `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+
+/// DOCKID — **give `id` a fresh `z` off the same allocator [`focus_changed`] uses, and nothing else.**
+///
+/// ### The defect it closes
+///
+/// [`focus_changed`] is keyed by ASID and raises EVERY window the owner has, deliberately (*"an app
+/// may own several windows and they focus together"*). That is the right rule for a focus change and
+/// the wrong one for a DOCK PRESS: a tile names ONE window, and the operator who pressed it expects
+/// THAT window in front. With two windows under one owner the raise loop hands out z in table order,
+/// so the topmost is whichever row sits later in the array — not the one whose tile was pressed. The
+/// tile and the window it brings forward disagree, which is the whole of Peter's *"who is who between
+/// what is open and what is showing in the taskbar"*.
+///
+/// ### What it is, and what it deliberately is NOT
+///
+/// It is the z-bump alone. It publishes no focus, unhides nobody, wakes no parked vug and speaks for
+/// no other row: the caller runs [`focus_changed`] FIRST (which does all of that for the owner) and
+/// then calls this to settle WHICH of that owner's windows ends on top. Splitting it this way is why
+/// it needs no second copy of the arrival/hidden/`vugmin` machinery and cannot drift from it.
+///
+/// Returns `false` for a non-row and for a `compat` row (which is not a focus target and has no tile).
+///
+/// Cost and locks: one `TABLE` acquisition, one `row_mut`, one `composite()` after the guard drops —
+/// [`minimise`]'s shape, without the erase (a raise vacates nothing).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn raise_one(id: WinId) -> bool {
+    let mut t = table();
+    let z = t.next_z;
+    let ok = match row_mut(&mut t, id) {
+        Some(r) if !r.compat => {
+            r.z = z;
+            r.damage_all();
+            true
+        }
+        _ => false,
+    };
+    if ok {
+        t.next_z = t.next_z.wrapping_add(1).max(1);
+    }
+    drop(t);
+    if ok {
+        composite();
+    }
+    ok
+}
