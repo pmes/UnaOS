@@ -148,12 +148,28 @@
 //! [`BlockSource::Usb`]). So on the Orin one card is reachable under two source names, and a walk
 //! that keyed on the source would count it as two disks and mount it beside itself.
 //!
-//! The key is therefore the DEVICE: [`DiskId`] = `(num_blocks, BS_VolID)` — the geometry
-//! [`crate::fs::fat::source_blocks`] reports, plus the mounted volume's own serial from
-//! `FatFs::volume_fingerprint`. Both are read from the MEDIUM, so two handles onto one card agree
-//! by construction. `drivers::block::BlockDeviceId` is deliberately NOT the key: its first field is
-//! `handle`, which is precisely what differs between the two names for the one card. A deduped
-//! source is named on the wire (`aliased=usb->global`), never dropped silently.
+//! [`DiskId`] = `(num_blocks, BS_VolID)` — the geometry [`crate::fs::fat::source_blocks`] reports,
+//! plus the mounted volume's own serial from `FatFs::volume_fingerprint` — is the CANDIDATE key,
+//! and it is a question, not an answer. Both fields are read from the MEDIUM, which is what makes
+//! two handles onto one card agree; it is also what makes two CLONES agree. A card imaged
+//! byte-for-byte from another carries the same `BS_VolID` and the same size, so a dedupe keyed on
+//! content alone merges two real devices into one, hides the second from `/volumes`, and prints a
+//! witness claiming — falsely — that one device wore two names (rmbp-ledger B98).
+//!
+//! **Identity therefore comes from the ENUMERATOR, never from the bytes.** The answer is
+//! [`crate::fs::fat::same_device`], the one predicate this kernel has for the question: two
+//! `drivers::block::BlockDeviceInfo` records name one device when the slot is LIVE (non-zero), the
+//! slots are EQUAL, and `num_blocks` agrees. `slot_id` is a registry fact — a replug lands on a new
+//! slot, and two live devices never share one — and a clone cannot forge it.
+//! `drivers::block::BlockDeviceId` is deliberately not the key: its first field is `handle`, which
+//! is precisely what differs between the two names for the one card.
+//!
+//! Two sources are ONE disk — walked once, mounted once, `aliased=usb->global` on the wire — only
+//! when that predicate PROVES it. Equal content WITHOUT the proof (two clones; or two zero-slot
+//! sources, since `register_sd`, `register_sdhc` and `register_tegra_sd` all stamp the `slot_id: 0`
+//! sentinel for a card that never enumerated on a bus) mounts BOTH disks and says so:
+//! `aliased=ambiguous:<other>?<this>`. Two friends who look alike are two friends. Nothing is
+//! dropped silently in either branch, and root stays first-found — mounting is not exclusive.
 //!
 //! # The other disks — home soil, at `/volumes/<NAME>`, with their OWN write posture
 //!
@@ -228,6 +244,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::drivers::block::BlockDeviceInfo;
 use crate::fs::fat::{self, BlockSource, DirEntry, FatFs};
 
 /// The comparison window: 4096 bytes of `.text` at `_start`. See the module docs for why the
@@ -389,6 +406,11 @@ pub struct Disk {
     /// The first source name this device answered to — the one its mount reads through.
     pub source: BlockSource,
     pub id: DiskId,
+    /// CLONEALIAS: the block registry's record for the device behind [`Disk::source`]
+    /// ([`crate::fs::fat::source_device`]), kept so a LATER source can be tested against this one
+    /// with [`crate::fs::fat::same_device`]. `None` when no device is registered on that handle —
+    /// which is a refusal to prove sameness, never a match.
+    pub dev: Option<BlockDeviceInfo>,
     /// The volume's label BYTES, exactly as they sit on the medium — a FIXED 11-byte field, never a
     /// length taken from the card. `sanitize_label` turns this into the mount-point name; the raw
     /// bytes are kept so the witness can print `label_raw=` when sanitizing had to alter one.
@@ -398,6 +420,11 @@ pub struct Disk {
     pub hits: Vec<Hit>,
     /// Other source names that resolved to this SAME device and were therefore not walked again.
     pub aliases: Vec<&'static str>,
+    /// CLONEALIAS: the ALREADY-ADMITTED source names whose [`DiskId`] equals this disk's while the
+    /// enumerator refused to prove them the same device — a clone, or a pair of `slot_id: 0`
+    /// sources. This disk was admitted and walked ANYWAY; the field exists so the witness can say
+    /// `aliased=ambiguous:<other>?<this>` instead of the walk silently losing one of them.
+    pub ambiguous: Vec<&'static str>,
 }
 
 /// Why the walk bound nothing. Spelled exactly as the `reason=` field prints it.
@@ -640,14 +667,88 @@ fn next_volume_point(used: &mut Vec<String>, name: &str) -> (String, String) {
 /// `true` ⇒ it is new and must be walked; `false` ⇒ this device has been walked already under
 /// another name and must not be walked, counted or mounted twice.
 ///
+/// CLONEALIAS (orin 24, rmbp-ledger B98): an equal [`DiskId`] is the QUESTION. It is answered by
+/// [`fat::same_device`] over the two sources' registry records — the enumerator's identity, which a
+/// byte-clone cannot forge — and ONLY a `true` there collapses two sources into one disk. Equal
+/// content with no such proof admits the second source as its OWN disk and records the first on its
+/// [`Disk::ambiguous`] list, so the witness names the pair rather than the walk losing a real card.
+/// `dev: None` (nothing registered on that handle) proves nothing and therefore aliases nothing.
+///
 /// Pure over its arguments, so `homesoil_selftest` can drive it with synthetic devices.
-fn admit(disks: &mut Vec<Disk>, src: BlockSource, id: DiskId, label: [u8; 11]) -> bool {
-    if let Some(d) = disks.iter_mut().find(|d| d.id == id) {
-        d.aliases.push(src.name());
-        return false;
+fn admit(
+    disks: &mut Vec<Disk>,
+    src: BlockSource,
+    id: DiskId,
+    dev: Option<BlockDeviceInfo>,
+    label: [u8; 11],
+) -> bool {
+    let mut twins: Vec<&'static str> = Vec::new();
+    for d in disks.iter_mut() {
+        if d.id != id {
+            continue;
+        }
+        let proven = match (d.dev.as_ref(), dev.as_ref()) {
+            (Some(a), Some(b)) => fat::same_device(a, b),
+            _ => false,
+        };
+        if proven {
+            d.aliases.push(src.name());
+            return false;
+        }
+        twins.push(d.source.name());
     }
-    disks.push(Disk { source: src, id, label, hits: Vec::new(), aliases: Vec::new() });
+    disks.push(Disk {
+        source: src,
+        id,
+        dev,
+        label,
+        hits: Vec::new(),
+        aliases: Vec::new(),
+        ambiguous: twins,
+    });
     true
+}
+
+/// HOMESOIL: render the `aliased=` field of the `[vfs] root …` witness. Pure over the disk list —
+/// split out for the same reason [`plan`] is, so the fixture can assert the wire text itself
+/// instead of the state behind it.
+///
+/// Three values, and the reader must be able to tell them apart:
+///  * `-` — nothing was deduped and nothing was ambiguous;
+///  * `usb->global` — the usb handle is the global handle's card, PROVEN by
+///    [`fat::same_device`]: walked once, mounted once;
+///  * `ambiguous:global?usb` — CLONEALIAS: identical content, no proof of one device, so BOTH were
+///    admitted, walked and mounted. Ambiguous entries come FIRST, so the field begins with the
+///    literal token `ambiguous` whenever any pair was ambiguous and a check keyed on `aliased=`
+///    fires on this case rather than reading green.
+fn aliased_field(disks: &[Disk]) -> String {
+    let mut out = String::new();
+    for d in disks.iter() {
+        for t in d.ambiguous.iter() {
+            if !out.is_empty() {
+                out.push(',');
+            } else {
+                out.push_str("ambiguous:");
+            }
+            out.push_str(t);
+            out.push('?');
+            out.push_str(d.source.name());
+        }
+    }
+    for d in disks.iter() {
+        for a in d.aliases.iter() {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(a);
+            out.push_str("->");
+            out.push_str(d.source.name());
+        }
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
+    out
 }
 
 /// HOMESOIL: pick the root and hand every other disk its `/volumes/<NAME>` point. Split out from the
@@ -699,7 +800,10 @@ fn walk_and_witness() -> Survey {
         let vol_id = fs.volume_fingerprint().0;
         // DEDUPE BY DEVICE, before the walk and before the mount: on the tegra build one card is
         // published under BOTH `Default` and `Usb` (module docs §"One disk can wear two names").
+        // CLONEALIAS: `id` is the CONTENT question; `dev` is the enumerator's answer to it, and
+        // only `dev` can tell one card under two names from two cards imaged off each other.
         let id = DiskId { num_blocks: fat::source_blocks(*src).unwrap_or(0), vol_id };
+        let dev = fat::source_device(*src);
         // HOMESOIL: the label is read HERE, off the volume that is already mounted for the walk —
         // one mount, one read, and the bytes travel with the disk rather than being fetched again
         // at bind time from a volume that may have been swapped underneath us.
@@ -707,7 +811,7 @@ fn walk_and_witness() -> Survey {
         // Admitted even when its root directory turns out to be unreadable below: it HAS a FAT
         // volume (the mount succeeded), so it is a disk this machine has, and home soil is a fact
         // about the disk, not about what could be walked on it.
-        if !admit(&mut disks, *src, id, label) {
+        if !admit(&mut disks, *src, id, dev, label) {
             continue;
         }
         unafs.push(unafs_present(*src));
@@ -744,22 +848,7 @@ fn walk_and_witness() -> Survey {
         home.push('-');
     }
 
-    // `aliased=` names every source that resolved to a device already walked — `usb->global` reads
-    // "the usb handle is the global handle's card". Deduped, never dropped silently.
-    let mut aliased = String::new();
-    for d in disks.iter() {
-        for a in d.aliases.iter() {
-            if !aliased.is_empty() {
-                aliased.push(',');
-            }
-            aliased.push_str(a);
-            aliased.push_str("->");
-            aliased.push_str(d.source.name());
-        }
-    }
-    if aliased.is_empty() {
-        aliased.push('-');
-    }
+    let aliased = aliased_field(&disks);
 
     if let Some(ix) = root_ix {
         let d = &disks[ix];
@@ -1187,6 +1276,12 @@ static MOUNTS_ANNOUNCED: core::sync::atomic::AtomicBool =
 // amendment 03 v4 names (`..`, NUL, `/`, DEL, and a byte ≥ 0x80) and asserts that what comes back
 // carries NO separator and NO byte outside the whitelist — the resolver never sees one.
 //
+// Leg 5 (CLONEALIAS) is the same idea one level up: this machine can present neither a byte-CLONE
+// of its own card nor a second xHCI slot, so it drives `admit` with synthetic `BlockDeviceInfo`
+// records that differ ONLY in `slot_id` and asserts that identical content is NOT enough to make
+// two sources one disk. It carries its own positive control on `fat::same_device`, because a
+// predicate that answered `false` to everything would satisfy the negative clauses for free.
+//
 // `witness`-gated, in the default-quiet idiom (`arroyo` arms `witness` for exactly the four battery
 // commands), and driven from the cached walk so it runs once, on the boot that builds the first
 // mount table. Uncounted `:: HOMESOIL: … PASS ::` lines, beside the `[vfs] root` witness.
@@ -1204,12 +1299,14 @@ fn homesoil_selftest() {
         &mut ds,
         BlockSource::Default,
         DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 },
+        Some(synth_dev(3, 100)),
         *b"UNAOS-BOOT ",
     );
     assert_admit(
         &mut ds,
         BlockSource::Usb,
         DiskId { num_blocks: 200, vol_id: 0xbbbb_0002 },
+        Some(synth_dev(4, 200)),
         L_SPARE,
     );
     ds[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
@@ -1232,11 +1329,14 @@ fn homesoil_selftest() {
 
     // --- leg 2: ONE device under TWO source names — walked once, mounted once. ------------------
     // This is the Orin's real shape: `publish_usb_geometry`'s non-baremetal variant stores one
-    // `BlockDeviceInfo` into both `BLOCK_DEVICE` and `USB_BLOCK_DEVICE`.
+    // `BlockDeviceInfo` into both `BLOCK_DEVICE` and `USB_BLOCK_DEVICE` — one record, so one LIVE
+    // slot on both sides. CLONEALIAS: that live slot is now what earns the dedupe; equal content
+    // alone no longer does, which is exactly what leg 5 below shows.
     let same = DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 };
+    let one_card = synth_dev(7, 100);
     let mut ad: Vec<Disk> = Vec::new();
-    let first = admit(&mut ad, BlockSource::Default, same, L_SPARE);
-    let second = admit(&mut ad, BlockSource::Usb, same, L_SPARE);
+    let first = admit(&mut ad, BlockSource::Default, same, Some(one_card), L_SPARE);
+    let second = admit(&mut ad, BlockSource::Usb, same, Some(one_card), L_SPARE);
     ad[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
     let (aroot, aothers) = plan(&ad, &[false]);
     let leg2 = first
@@ -1244,12 +1344,15 @@ fn homesoil_selftest() {
         && ad.len() == 1
         && ad[0].aliases.len() == 1
         && ad[0].aliases[0] == "usb"
+        && ad[0].ambiguous.is_empty()
+        && aliased_field(&ad) == "usb->global"
         && aroot == Some(0)
         && aothers.is_empty();
     serial_println!(
-        ":: HOMESOIL: alias disks={} aliases={} root_ix={:?} others={} :: {} ::",
+        ":: HOMESOIL: alias disks={} aliases={} aliased={} root_ix={:?} others={} :: {} ::",
         ad.len(),
         ad[0].aliases.len(),
+        aliased_field(&ad),
         aroot,
         aothers.len(),
         if leg2 { "PASS" } else { "FAIL" }
@@ -1339,13 +1442,83 @@ fn homesoil_selftest() {
         census,
         if leg4 { "PASS" } else { "FAIL" }
     );
+
+    // --- leg 5: CLONEALIAS — a byte-CLONE is two disks; one card under two names is still one. --
+    // The defect this leg exists for (rmbp-ledger B98): `admit` keyed on `DiskId`, which is pure
+    // CONTENT, so a card imaged byte-for-byte from another — same size, same `BS_VolID` — was
+    // deduped away. One real card vanished from `/volumes` and the witness asserted a false alias.
+    // A single-card QEMU machine can present neither a clone nor a second slot, so the whole
+    // predicate would otherwise be reasoned about and never executed.
+    //
+    // NEGATIVE: identical content, DIFFERENT live slots (a replug lands on a new slot, and two live
+    // devices never share one) -> BOTH admitted, and the wire says `ambiguous:global?usb`.
+    let clone_id = DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 };
+    let mut cl: Vec<Disk> = Vec::new();
+    let c_first = admit(&mut cl, BlockSource::Default, clone_id, Some(synth_dev(7, 100)), L_SPARE);
+    let c_second = admit(&mut cl, BlockSource::Usb, clone_id, Some(synth_dev(9, 100)), L_SPARE);
+    let neg = c_first
+        && c_second
+        && cl.len() == 2
+        && cl[0].aliases.is_empty()
+        && cl[1].ambiguous.len() == 1
+        && cl[1].ambiguous[0] == "global"
+        && aliased_field(&cl) == "ambiguous:global?usb";
+    // SLOT-0 SENTINEL, the Pi's shape: `register_sd` / `register_sdhc` / `register_tegra_sd` stamp
+    // `slot_id: 0` for a card that never enumerated on a bus, so it carries NO enumerator identity
+    // and two such sources are never PROVEN one device — the `slot_id != 0` clause refuses first,
+    // ahead of any comparison (pi 7's caveat, now a guard).
+    let mut z: Vec<Disk> = Vec::new();
+    let z_first = admit(&mut z, BlockSource::Default, clone_id, Some(synth_dev(0, 100)), L_SPARE);
+    let z_second = admit(&mut z, BlockSource::Usb, clone_id, Some(synth_dev(0, 100)), L_SPARE);
+    let zero = z_first && z_second && z.len() == 2 && aliased_field(&z) == "ambiguous:global?usb";
+    // POSITIVE CONTROL on the predicate itself, so a `same_device` that answered `false` to
+    // everything could not make the two clauses above pass vacuously.
+    let live = synth_dev(7, 100);
+    let pos = fat::same_device(&live, &synth_dev(7, 100))
+        && !fat::same_device(&live, &synth_dev(9, 100))
+        && !fat::same_device(&synth_dev(0, 100), &synth_dev(0, 100))
+        && !fat::same_device(&live, &synth_dev(7, 200));
+    let leg5 = neg && zero && pos;
+    serial_println!(
+        ":: HOMESOIL: clone disks={} aliased={} slot0_disks={} slot0_aliased={} \
+         same_device(live,live)={} (live,other)={} (0,0)={} :: {} ::",
+        cl.len(),
+        aliased_field(&cl),
+        z.len(),
+        aliased_field(&z),
+        fat::same_device(&live, &synth_dev(7, 100)),
+        fat::same_device(&live, &synth_dev(9, 100)),
+        fat::same_device(&synth_dev(0, 100), &synth_dev(0, 100)),
+        if leg5 { "PASS" } else { "FAIL" }
+    );
+}
+
+/// CLONEALIAS: a synthetic `BlockDeviceInfo` for the fixture — the two fields
+/// [`fat::same_device`] reads are the arguments; the rest are inert filler the predicate never
+/// looks at. The type expresses two devices that differ ONLY in slot, which is what the negative
+/// leg needs.
+#[cfg(feature = "witness")]
+fn synth_dev(slot_id: u8, num_blocks: u64) -> BlockDeviceInfo {
+    BlockDeviceInfo {
+        slot_id,
+        block_size: 512,
+        num_blocks,
+        vendor: *b"UNAOS   ",
+        product: *b"SYNTHETIC DISK  ",
+    }
 }
 
 /// Admit and say so on the wire if it unexpectedly aliased — a synthetic setup that silently
 /// collapsed would make the leg above vacuous.
 #[cfg(feature = "witness")]
-fn assert_admit(disks: &mut Vec<Disk>, src: BlockSource, id: DiskId, label: [u8; 11]) {
-    if !admit(disks, src, id, label) {
+fn assert_admit(
+    disks: &mut Vec<Disk>,
+    src: BlockSource,
+    id: DiskId,
+    dev: Option<BlockDeviceInfo>,
+    label: [u8; 11],
+) {
+    if !admit(disks, src, id, dev, label) {
         serial_println!(":: HOMESOIL: setup source={} aliased unexpectedly :: FAIL ::", src.name());
     }
 }
