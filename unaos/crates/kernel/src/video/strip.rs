@@ -863,16 +863,25 @@ const _: () = {
 // # What is deliberately NOT claimed
 //
 // `flat=` counts an uncovered span that WAS erased, successfully, to flat `wm::DESKTOP_BG` — which is
-// the only colour [`erase_rect`] paints — with no backdrop repaint requested. On a board whose
-// desktop is a SCENE (`super::desktop_scene_owns_backdrop()`, which is what
-// `[orinrender] census … strip=retired` reports) that is a flat slab where scene content belongs. It
-// is REPORTED and `scene=` says whether it can be seen; whether it is what Peter saw is a question
-// for the next capture, not for this comment. `super::crystal` and `super::winmenu` already call
-// their own `repaint_vacated` after an erase and are the precedent; `dock` and `menubar` do not.
+// the only colour [`erase_rect`] paints — with no backdrop repaint requested.
 //
-// **This module counts. It changes no paint order, no damage propagation and no return value.**
-// [`vacate`] returns exactly what [`erase_rect`] returned, and every caller uses it exactly as it
-// used the call it replaced.
+// # CURSORBG — the render11 capture answered the question this paragraph left open
+//
+// The sentence above used to end: *"whether it is what Peter saw is a question for the next capture,
+// not for this comment. `super::crystal` and `super::winmenu` already call their own
+// `repaint_vacated` after an erase and are the precedent; `dock` and `menubar` do not."*
+//
+// The next capture came (`boot-render11-B-full.log`, 2026-09-08) and it reads
+// `[strip] rollup tenant=dock scope=bar … scene=yes … uncovered=6 uncovered_px=33696 unerased=0
+// forgotten=0 flat=6 flat_px=33696 -> FLAT-VACATE`: six shrinks, every erase successful, 33 696
+// panel pixels painted flat desktop colour with nothing told. Peter, the same boot: *"tearing and
+// background drawing issue"*. So the two named tenants got the `repaint_vacated` the other two
+// already had — [`restore_vacated`], called from [`vacate`] — and `flat=` became the counter for a
+// span that could NOT be handed back rather than for one nobody tried to hand back.
+//
+// **This module still only counts on the paths it counted before.** [`vacate`] returns exactly what
+// [`erase_rect`] returned, and every caller uses it exactly as it used the call it replaced; what is
+// new is the damage propagation the erase always owed and never made.
 
 /// One 60 Hz frame, in microseconds — the constant `[wc-h]` and `[wc-k]` both print as `frame_us=`.
 ///
@@ -922,6 +931,10 @@ const SAID_STALE: u64 = 1;
 const SAID_UNERASED: u64 = 2;
 /// One-shot latch for a bar present that outran the beam.
 const SAID_TORN: u64 = 4;
+/// CURSORBG — one-shot latch for the first uncovered span this tenant handed back to its owners.
+/// The positive twin of [`SAID_STALE`], and it is on the wire for the same reason: the rollup is
+/// rate-limited, so the moment the mechanism first runs gets its own line.
+const SAID_RESTORE: u64 = 8;
 
 /// Per-tenant bar census.
 ///
@@ -945,6 +958,11 @@ struct BarCensus {
     forgotten: AtomicU64,
     flat: AtomicU64,
     flat_px: AtomicU64,
+    /// CURSORBG — uncovered spans handed back to their owners (window damage + a desktop present
+    /// request) rather than left standing as flat desktop colour. `restored + flat == uncovered`
+    /// over every span whose erase succeeded.
+    restored: AtomicU64,
+    restored_px: AtomicU64,
     rect: AtomicU64,
     emit: AtomicU64,
     t0: AtomicU64,
@@ -979,6 +997,8 @@ impl BarCensus {
             forgotten: AtomicU64::new(0),
             flat: AtomicU64::new(0),
             flat_px: AtomicU64::new(0),
+            restored: AtomicU64::new(0),
+            restored_px: AtomicU64::new(0),
             rect: AtomicU64::new(0),
             emit: AtomicU64::new(0),
             t0: AtomicU64::new(0),
@@ -1106,6 +1126,58 @@ fn bar_uncovered(old: Rect, new: Option<Rect>) -> u64 {
     area - ((x1 - x0) as u64) * ((y1 - y0) as u64)
 }
 
+/// CURSORBG — **hand a just-vacated span back to its OWNERS.** The pair every other `DESKTOP_BG`
+/// writer in this subsystem already makes, brought to the two strips that did not make it.
+///
+/// # What [`erase_rect`] cannot do, and why nobody noticed
+///
+/// `erase_rect` paints flat [`wm::DESKTOP_BG`] and returns. That is the right colour for the pixels a
+/// strip vacated **only if nothing was under the strip**, and on this arch something routinely is:
+/// `wm::occ_clip` is structurally `OccClip::none` on aarch64 (PARITY §6.2), so a window blit paints
+/// straight over the dock and a window may legitimately lie under the strip's ends. Painting those
+/// ends flat stamps a HOLE over that window, and no later pass is coming for it — `damage_intersecting`
+/// was never called, so the compositor does not know the row is dirty, and no desktop present was
+/// requested, so the backdrop layer does not know either.
+///
+/// This is not a new mechanism; it is the one three other sites already use, written down once:
+///
+/// ```text
+///   wm.rs        drain_deferred      stage_fill(DESKTOP_BG) -> damage_intersecting + request_present_rect
+///   crystal.rs   repaint_vacated     erase_rect             -> damage_intersecting + request_full_present
+///   winmenu.rs   repaint_vacated     erase_rect             -> damage_intersecting + request_full_present
+/// ```
+///
+/// `crystal`'s own header states the argument verbatim for its dropdown: *"`strip::erase_rect`'s
+/// `DESKTOP_BG` does not restore those windows or the desktop content beneath — it stamps a HOLE over
+/// them"*. A dock that shrinks uncovers its ends for exactly the same reason a dismissed dropdown
+/// uncovers its box, and this module's own census note named `dock` and `menubar` as the two tenants
+/// that had no such call.
+///
+/// # Rect, not flag
+///
+/// `request_present_rect` is DRAG-PI M1's narrow twin of `request_full_present`, and `drain_deferred`
+/// is the precedent that chose it: the desktop content that needs restoring is the content the erase
+/// just covered, which is this box and nothing outside it. The queue MERGES on overflow rather than
+/// dropping, so the desktop layer is always asked for a superset of the vacated span and never for
+/// less — no span can be lost to queue pressure.
+///
+/// Returns whether the handback was made. `false` only for a degenerate rect, and it is what keeps
+/// `flat=` a live counter rather than a field this arc retired: a span erased with no handback behind
+/// it is still reportable, and the rollup still fails it.
+fn restore_vacated(r: Rect) -> bool {
+    let (x, y, w, h) = r;
+    if w == 0 || h == 0 {
+        return false;
+    }
+    // Order is `drain_deferred`'s: the window layer first, then the backdrop. Neither call blocks on
+    // a lock this module holds — `SCRATCH` was released by `erase_rect` before it returned, and the
+    // two locks these take (`wm::TABLE`, `screen::PRESENT_RECTS`) are the same pair the compositor's
+    // own drain takes from inside a masked present.
+    wm::damage_intersecting(x, y, w, h);
+    super::screen::request_present_rect(x, y, w, h);
+    true
+}
+
 /// **Erase a rect a strip has VACATED, and say what became of the span it uncovered.**
 ///
 /// A thin accounting wrapper over [`erase_rect`]: it calls it, returns exactly what it returned, and
@@ -1159,10 +1231,34 @@ pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
         }
         return erased;
     }
-    // Erased — to flat `wm::DESKTOP_BG`, which is the only colour [`erase_rect`] paints. Whether that
-    // is the right colour for those pixels is the `scene=` question the rollup carries.
-    c.flat.fetch_add(1, Ordering::Relaxed);
-    c.flat_px.fetch_add(px, Ordering::Relaxed);
+    // Erased — to flat `wm::DESKTOP_BG`, which is the only colour [`erase_rect`] paints.
+    //
+    // CURSORBG — **and now HANDED BACK, which is what render10's census asked for and render11
+    // convicted.** `flat=` used to be the end of this path: the span was painted flat and nothing was
+    // told, so `[strip] rollup tenant=dock … flat_px=33696 -> FLAT-VACATE` on the render11 boot
+    // described 33 696 panel pixels of desktop colour standing where the layers underneath belong.
+    // [`restore_vacated`] is the pair every other `DESKTOP_BG` writer in this subsystem already makes
+    // (`wm::drain_deferred`, `crystal::repaint_vacated`, `winmenu::repaint_vacated`); the dock and the
+    // menu bar were the two that did not, which is exactly what this module's own census note said.
+    //
+    // The counters split on the ANSWER rather than on the board: `restored` is a span handed back,
+    // `flat` is a span left flat. So `flat=0` is the fixed state on every board, and `flat > 0` means
+    // a handback was asked for and could not be made — which is a defect the rollup must still be
+    // able to report, not a case this arc made unreachable.
+    if restore_vacated(old) {
+        c.restored.fetch_add(1, Ordering::Relaxed);
+        c.restored_px.fetch_add(px, Ordering::Relaxed);
+        if c.said.fetch_or(SAID_RESTORE, Ordering::Relaxed) & SAID_RESTORE == 0 {
+            serial_println!(
+                "[strip] vacate tenant={} box={}x{}+{}+{} uncovered_px={} erased=yes src={} -> SCENE-RESTORE",
+                name, ow, oh, ox, oy, px,
+                if super::desktop_scene_owns_backdrop() { "scene" } else { "flat" }
+            );
+        }
+    } else {
+        c.flat.fetch_add(1, Ordering::Relaxed);
+        c.flat_px.fetch_add(px, Ordering::Relaxed);
+    }
     erased
 }
 
@@ -1219,6 +1315,9 @@ fn bar_rollup_one(k: usize) {
     let unerased = c.unerased.load(Ordering::Relaxed);
     let torn = c.torn.load(Ordering::Relaxed);
     let flat = c.flat.load(Ordering::Relaxed);
+    // CURSORBG — the two halves of "what became of every uncovered span whose erase succeeded".
+    let restored = c.restored.load(Ordering::Relaxed);
+    let uncovered = c.uncovered.load(Ordering::Relaxed);
     let declines = c.declines.load(Ordering::Relaxed);
     // Whether a flat `DESKTOP_BG` slab is VISIBLE at all: on a scene-owned backdrop it stands where
     // scene content belongs, and on a flat one it is the same colour as its surroundings. A field
@@ -1245,7 +1344,14 @@ fn bar_rollup_one(k: usize) {
         "UNERASED"
     } else if torn > 0 {
         "AT-RISK"
-    } else if flat > 0 && scene {
+    } else if scene && restored < uncovered {
+        // CURSORBG — the term MOVED, and the move is the arc. It used to be `flat > 0 && scene`: an
+        // uncovered span erased to desktop colour on a scene board, reported and permitted. Now every
+        // successful erase either hands its span back (`restored`) or is counted `flat`, and the
+        // question the verdict asks is the one that matters — did EVERY uncovered span get an owner?
+        // `restored < uncovered` catches a flat leftover, a declined erase, and a forgotten span
+        // alike, and it is falsifiable by construction: revert `restore_vacated`'s call and the
+        // render11 dock reads `uncovered=6 restored=0 flat=6 -> FLAT-VACATE` again.
         "FLAT-VACATE"
     } else if declines > 0 {
         "DECLINED"
@@ -1254,7 +1360,7 @@ fn bar_rollup_one(k: usize) {
     };
     let minp = c.minpaint_us.load(Ordering::Relaxed);
     serial_println!(
-        "[strip] rollup tenant={} scope=bar emit={} age_ms={} rect={}x{}+{}+{} scene={} pop=all-paints paints={} paint_px={} torn={} maxpaint_us={} minpaint_us={} rectscan_us={} declines={} decl_lock={} decl_ready={} decl_word={} decl_geom={} pop=vacates vacates={} uncovered={} uncovered_px={} unerased={} unerased_px={} forgotten={} flat={} flat_px={} pop=constant frame_us={} -> {}",
+        "[strip] rollup tenant={} scope=bar emit={} age_ms={} rect={}x{}+{}+{} scene={} pop=all-paints paints={} paint_px={} torn={} maxpaint_us={} minpaint_us={} rectscan_us={} declines={} decl_lock={} decl_ready={} decl_word={} decl_geom={} pop=vacates vacates={} uncovered={} uncovered_px={} unerased={} unerased_px={} forgotten={} flat={} flat_px={} restored={} restored_px={} pop=constant frame_us={} -> {}",
         BAR_NAMES[k],
         emit,
         age_ms,
@@ -1282,6 +1388,8 @@ fn bar_rollup_one(k: usize) {
         forgotten,
         flat,
         c.flat_px.load(Ordering::Relaxed),
+        restored,
+        c.restored_px.load(Ordering::Relaxed),
         FRAME_US,
         verdict
     );
@@ -1300,3 +1408,109 @@ const _: () = {
     // arc exists to watch would report as `tenant=other`.
     assert!(BAR_SLOTS > STRIP_MAX);
 };
+
+// =================================================================================================
+// STRIPVAC — the fixture for [`restore_vacated`], and what it can and cannot claim
+// =================================================================================================
+//
+// # What it forces
+//
+// A real strip vacate on the real panel: an old rect, a new one that covers only part of it, and the
+// question the arc turns on — did the uncovered span get an OWNER, or was it painted flat and
+// forgotten? The census is the oracle, because the census is what the bench reads: `uncovered=1
+// restored=1 flat=0` is the fixed state and `uncovered=1 restored=0 flat=1` is the render11 state.
+// Revert [`vacate`]'s call to [`restore_vacated`] and this fixture goes RED on its own gate, which is
+// the property that makes it a gate rather than a printout.
+//
+// It runs under the CATCH-ALL census slot (`tenant=other`), never the dock's or the menu bar's, so it
+// cannot perturb the two counters an operator reads a boot by — and `bar_slot`'s fall-through is what
+// puts it there, so the isolation is a property of the naming rather than of a special case.
+//
+// # What it deliberately does NOT claim
+//
+// **It does not prove the handback reached the glass.** `damage_intersecting` marks and
+// `request_present_rect` queues; whether a present then runs is the render pump's business and a
+// different board's question (`screen::present_owed` and the Orin pump's `dirty` are that half). A
+// fixture that asserted panel pixels here would be asserting the QEMU desktop's cadence, not this
+// module's contract.
+//
+// **It does not exercise a CURSOR sweep**, and the reason is structural rather than an omission: on
+// the x86 QEMU gate there is no HID pointer, `pal::cursor::visible()` is false for the whole boot,
+// `video::cursor` writes zero pixels and `sp.drawn` is never set — so `undraw_locked` returns `None`
+// at its first line, `repair` is never handed a rect, and `restore_note` cannot be reached by any
+// gesture the gate can make. Synthesising one would mean driving `pal::cursor::set_abs` from a
+// fixture, which arms the sprite for the REST of the boot and puts an arrow into every `[wc-c]`
+// checksum and `[wc-d]` scan-out verdict downstream — the exact perturbation `cursor`'s own header
+// argues the module must never make on the gate. The cursor half's witness is `[cursor] restore
+// src=… -> HANDED-BACK` on the metal wire; this fixture gates the strip half, which is the half the
+// render11 capture convicted.
+
+/// STRIPVAC — force one vacate with a genuine uncovered span and score the census.
+///
+/// One-shot, `witness`-gated, driven from [`super::dock::selftest`] (the lane compromise that
+/// function already documents for `menubar::selftest`, on the same terms and for the same reason).
+#[cfg(feature = "witness")]
+pub fn vacate_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() || !fb.word4() {
+            serial_println!(":: STRIPVAC: fixture — no word4 surface :: SKIP ::");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    // The smallest honest gesture: a 16x8 box at the panel's bottom-left shrinking to its left half,
+    // so the uncovered span is the right 8x8 = 64 px. Bottom-left is chosen because it is outside
+    // every furniture rect on this panel (the dock is CENTRED, the menu bar is the top edge), so the
+    // erase cannot land on a live strip's pixels; and the handback this fixture is testing is itself
+    // what asks for those 64 px back.
+    if pw < 32 || ph < 16 {
+        serial_println!(":: STRIPVAC: fixture — panel {}x{} too small :: SKIP ::", pw, ph);
+        return;
+    }
+    let old: Rect = (0, ph - 8, 16, 8);
+    let new: Rect = (0, ph - 8, 8, 8);
+    let c = &BARS[BAR_OTHER];
+    let (u0, r0, f0) = (
+        c.uncovered.load(Ordering::Relaxed),
+        c.restored.load(Ordering::Relaxed),
+        c.flat.load(Ordering::Relaxed),
+    );
+    let erased = vacate("stripvac", old, Some(new), true);
+    // [`erase_rect`] opens the sprite bracket (`cursor::undraw`) and every caller in the compose seam
+    // closes it by returning `true` into `compose_all`'s cursor tail. This fixture is not in that
+    // seam, so it closes its own: `repaint` draws only while `pal::cursor::visible()`, so it is a
+    // no-op on the pointer-less QEMU gate and the correct restore anywhere else.
+    super::cursor::repaint();
+    let (du, dr, df) = (
+        c.uncovered.load(Ordering::Relaxed) - u0,
+        c.restored.load(Ordering::Relaxed) - r0,
+        c.flat.load(Ordering::Relaxed) - f0,
+    );
+    // A declined erase is not this fixture's subject and must not be scored as its failure: the span
+    // is then still OWED (`owed=true` above), which is a different, already-gated class. Said as SKIP
+    // so a contended scratch cannot read as the defect.
+    if !erased {
+        serial_println!(
+            ":: STRIPVAC: erase declined (owed, retried next pass) uncovered={} :: SKIP ::",
+            du
+        );
+        return;
+    }
+    // The claim, in one line: the span was uncovered, it was handed back, and NOTHING was left flat.
+    let pass = du == 1 && dr == 1 && df == 0;
+    serial_println!(
+        ":: STRIPVAC: box={}x{}+{}+{} -> {}x{}+{}+{} uncovered={} restored={} flat={} owed_px={} scene={} :: {} ::",
+        old.2, old.3, old.0, old.1,
+        new.2, new.3, new.0, new.1,
+        du, dr, df,
+        bar_uncovered(old, Some(new)),
+        if super::desktop_scene_owns_backdrop() { "yes" } else { "no" },
+        if pass { "PASS" } else { "FAIL" }
+    );
+}

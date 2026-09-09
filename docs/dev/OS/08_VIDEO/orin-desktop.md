@@ -3516,3 +3516,122 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
 - **The `[u7stk]` numbers quoted in §5 are Pi numbers.** The Orin's own render task was
   measured on 2026-09-05 (§3.14: `hw=22256` on the pulse-window pass, unsaturated); the
   boot-stack cascade §5 is about still has not been, and §5.2 stands until it is.
+
+---
+
+## CURSORBG — the vacate handback, and what render11's "background drawing" actually was
+
+*Arc `exec-orin23-cursorbg`, 2026-09-08, against the render11 image. Base `600887c2`.*
+
+### The report and the wire
+
+Peter, at the bench on the render11 flight: *"tearing and background drawing issue where mouse
+cursor updated background as it swept up past the focused window"*. Two claims, and they turned out
+to be two different mechanisms.
+
+The **background** half is convicted by the boot's own census
+(`~/unaos-bench/scratch/orin23/boot-render11-B-full.log`):
+
+```
+[strip] rollup tenant=dock scope=bar emit=40 rect=552x52+684+1136 scene=yes
+        vacates=13 uncovered=6 uncovered_px=33696 unerased=0 forgotten=0
+        flat=6 flat_px=33696 -> FLAT-VACATE
+```
+
+Six shrinks of the centred dock, every erase successful, **33 696 panel pixels painted flat
+`wm::DESKTOP_BG` with nothing told**.
+
+The competing hypothesis — that the desktop present was blitting background into a window's rows
+because the occluder snapshot was stale — is **refuted by the same boot**:
+`[wc-i] rollup scope=live windowed_flushes=5130 stale=0 intrusions=0 -> CLEAN`.
+
+### The mechanism: one class, two sites, three precedents
+
+Every `DESKTOP_BG` writer in this subsystem owes the pixels it covers to *two* layers — the window
+layer (`wm::damage_intersecting`) and the backdrop layer (`screen::request_present_rect` /
+`request_full_present`). Three sites already paid both:
+
+| site | write | handback |
+|---|---|---|
+| `wm::drain_deferred` (wm.rs:17660) | `stage_fill(DESKTOP_BG)` | `damage_intersecting` + `request_present_rect` |
+| `crystal::repaint_vacated` (crystal.rs:826) | `strip::erase_rect` | `damage_intersecting` + `request_full_present` |
+| `winmenu::repaint_vacated` (winmenu.rs:1616) | `strip::erase_rect` | `damage_intersecting` + `request_full_present` |
+| **`strip::erase_rect` (strip.rs:452)** | `DESKTOP_BG` row-blit | **neither** |
+| **`cursor::repair` (cursor.rs:1987)** | colour-guarded restore | **window half only** |
+
+`strip.rs`'s own census note had written this down before an instrument could see it — *"`crystal`
+and `winmenu` already call their own `repaint_vacated` after an erase and are the precedent; `dock`
+and `menubar` do not"* — and left the visibility question to the next capture. The capture came.
+
+Why it is visible rather than merely untidy: on aarch64 `wm::occ_clip` is structurally
+`OccClip::none` (PARITY §6.2), so a window blit paints straight over the dock and a window may
+legitimately lie **under** the strip's ends. A flat erase there is `crystal`'s documented
+"menu-dismiss hole", one layer down: it stamps over live window pixels and no pass is coming back.
+
+The cursor half is the same shape. `undraw_locked`'s restore is deliberately **colour-guarded** — a
+pixel goes back only while the panel still holds the colour the sprite painted there — and the
+module's own header names `repair` as what closes the residual the guard leaves. Over a *window*
+the close works, because `damage_intersecting` marks that window and the next composite re-blits it
+from its source surface. Over the **backdrop** — which is where a pointer sweeping up past a window
+arrives — nothing is marked and nothing owes those rows a repaint.
+
+### The fix
+
+* **`strip::restore_vacated(r)`** — the pair, per box, on `drain_deferred`'s terms (a *rect*, not the
+  whole-panel flag: DRAG-PI M1's argument, and the queue merges on overflow so the request is always
+  a superset and never less). Called from `vacate` after a successful erase.
+* **`cursor::restore_note(x,y,w,h)`** — the desktop half of `repair`, folded onto its existing line.
+  Termination is `TOUCHED_SINCE_DRAW`: a rect is queued only when a painter wrote inside the sprite
+  box since the sprite was drawn, `draw_locked` clears the flag and `undraw_locked` swaps it down, so
+  one trample buys one handback and the pass that serves the request cannot re-arm it.
+* **`screen::present_owed()`**, folded into `orin_render_service`'s `dirty`. `Screen::flush` is the
+  only consumer in this subsystem of *both* deferred queues and the only caller of
+  `wm::service_damage`, so a request reaches the glass only through a pass that predicate lets run.
+  This task's `dirty` was `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is
+  masked out forever (ui_status.rs:1285) — hence `[orinrender] census passes=13998251 presents=1`.
+  A peek, never a drain.
+
+### The instrument
+
+`flat=` and `restored=` now split on the **answer** rather than on the board: a span handed back is
+`restored`, a span left flat is `flat`. So `flat=0` is the fixed state everywhere, and the rollup's
+verdict moved from `flat > 0 && scene` to `scene && restored < uncovered` — which catches a flat
+leftover, a declined erase and a forgotten span alike, and reds by reverting one call.
+
+`[cursor] restore src=scene|flat rect=WxH+X+Y n=… -> HANDED-BACK` is new, and deliberately **not**
+`witness`-gated: the metal image is built without `witness`, and a claim absent from the only
+artifact that matters is not a claim.
+
+`[wc-h]`'s own numbers were also wrong and are fixed: `wch_recycle` (wcg.rs:2747) reset `H_DECLINE`
+on slot re-creation and never `H_DECLBY`, so `declines=` was measured over the current tenant while
+`decl_geom=`/`decl_cap=`/`decl_lock=`/`decl_alloc=` were measured over every tenant the slot had
+ever held. That is the whole of the render11 line's `declines=5 … decl_lock=73`. After the fix
+`declines == sum(decl_*)` is an invariant a reader may rely on.
+
+### The tearing half is NOT this arc's, and here is the conviction
+
+`[wc-h] rollup win=1 scope=window torn=2 stalls=6 longpres=2 decl_lock=73 maxpresent_us=117479`.
+A `DECL_LOCK` decline is `stage_for_core().try_lock()` failing (wm.rs:19733) and falling to
+`draw_window`'s **direct** path (wm.rs:18445) — per-pixel `put_pixel` straight into the scan-out,
+*and unclipped*, which is why the tree calls it the tearing regime.
+
+On this board that decline cannot be cross-core: a stock Jetson boot is single-core
+(`percpu.rs:148`), and 6 cores against `STAGE_CPUS = 8` means `stage_pool_index`'s `.min()` never
+folds two cores onto one entry. So it is **same-core compositor reentrancy**, and three facts make
+it the expected case rather than a race:
+
+1. aarch64 has no `COMP_GATE` — `wm.rs:4259` is a bare `composite_once()`; wm.rs:17792 says the
+   phase split that would serialise it is deliberately deferred.
+2. The console window's present path runs with **interrupts enabled** — `fbcon.rs:744` states it,
+   and `present_banded` reaches `composite()` at wm.rs:1348 under no guard of its own.
+3. `98213b7f` (ORIN-TICKDEFAULT), the commit immediately before this arc's base, made
+   `bsptick`+`bsprun` the tegra default — a **12 ms** preemption quantum — and `timer_preempt`
+   (`arch/aarch64/sched.rs:5143`) has no compositor guard. The `STAGE` guard is held across
+   wm.rs:19733–20052, measured at **117 ms**.
+
+The fix is a compose gate in `wm.rs` or a preempt guard in `arch/aarch64/sched.rs`; both are outside
+this arc's lane and the row is relayed (orin-ledger A46). **The falsifier is already in the tree and
+has never been read**: `BLIT_NET_CORE[0]` (wm.rs:9770) is an unconditional per-core net of live
+`BlitGuard`s, and on a single-core board any value > 1 *is* the reentrancy. `blitwho_report`
+(wm.rs:9806) prints it only from the two drain give-up arms, so a healthy-but-reentrant boot says
+nothing — which is why 73 declines went unexplained for a flight.

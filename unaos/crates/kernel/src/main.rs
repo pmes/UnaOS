@@ -8387,7 +8387,7 @@ fn orin_render_service(_: usize) {
         // it is now the pass that OPENED the window — the deepest chain this task has), and after it
         // `tick` is the only source of `dirty`, which on the cascaded scene is never. An un-cascaded
         // board is unchanged: `tick`'s arming pass returns dirty on pass 1 anyway.
-        dirty |= passes == 1;
+        dirty |= passes == 1 || unaos_kernel::video::screen::present_owed(); // CURSORBG — the THIRD source of `dirty`, and the one the two above cannot cover: a present another task OWES this layer. `Screen::flush` is the only consumer in this subsystem of both deferred queues (`present_background` drains `PRESENT_RECTS` and swaps `FULL_PRESENT`) and the only caller of `wm::service_damage`, so a request enqueued by `wm::drain_deferred`, `crystal`/`winmenu::repaint_vacated`, `cursor::repair` or `strip::restore_vacated` reaches the glass only through a pass this predicate lets run. Without it this task's `dirty` is `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is masked out forever (ui_status.rs:1285) — render11 measured the consequence, `[orinrender] census passes=13998251 presents=1`. A peek, never a drain (see `screen::present_owed`), so the pass that follows still finds the queue to publish; and it is a pure function of two already-live statics, so an image whose queues nobody fills presents exactly as often as it did before. ⚠ FOLDED onto this line, never added below it — panic `Location`s.
         if dirty {
             pal.render();
             presents += 1;
