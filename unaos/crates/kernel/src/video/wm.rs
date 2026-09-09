@@ -618,6 +618,312 @@ pub fn spawn_focus_forget(owner: u64) {
     let _ = spawn_focus_take(owner);
 }
 
+// ---- WINTITLE: the ONE rule that mints a window's title ------------------------------------------
+
+/// WINTITLE — **where a window title comes from.** Peter's ruling, render11 glass, 2026-09-08:
+/// *"VUG WINDOW NAMES ARE DUMB AND WINDOW TITLES NUMERICALLY SEQUENCED IS FOR UNTITLED DOCS ETC"*.
+///
+/// The defect he was reading: the two arch window seams (`arch/x86_64/syscall.rs` and
+/// `arch/aarch64/syscall.rs`, both in `mod wc_shim::create`) build a window's title out of their own
+/// table row index — `let title = [b'e', b'l', b'0', b' ', b'w', b'i', b'n', b' ', b'0' + (id % 10)]`
+/// — so every program the operator launched from the shell came up titled **`el0 win 0`**,
+/// **`el0 win 1`**, **`el0 win 2`**. That is a GENERATED LABEL with a sequence number on it, and it
+/// is wrong twice over: it is not the application's name, and the number is the one piece of
+/// typography macOS reserves for a DOCUMENT that has no name yet.
+///
+/// ### The rule
+///
+/// A window's title is **a name**, resolved in this order and nowhere else:
+///
+/// 1. **`program`** — the application's own name, when the launch knew it. Every launcher that
+///    resolves a path to an image arms [`app_name_arm`] with that path; the name is the path's
+///    BASENAME with its extension dropped, **in the case the operator wrote it** (`/apps/VUG.ELF`
+///    → `VUG`, `pulse.elf` → `pulse`). Nothing is invented and nothing is per-app: the only
+///    transformation is "drop the directory, drop the extension".
+/// 2. **`unnamed`** — an EL0 window whose launcher never armed a name, recognised by the seam label
+///    above. It gets the generic noun [`ANON_APP`] and NOT a number: several unnamed programs on the
+///    glass read the same word, which is exactly the ruling (an app window never carries a numeric
+///    suffix, however many instances are open).
+/// 3. **`document`** — a document window with no name, minted by [`untitled_document`]: `Untitled`,
+///    `Untitled 1`, `Untitled 2`. **This is the only place a number belongs in a title bar.**
+/// 4. **`declared`** — the name the creating module declared at its `create` / `create_at` call
+///    site. Built-in tenants are their own declarers: `Console`, `Shell`, `Pulse`, `Quarry`.
+///
+/// ### Is there an ELF-declared name to prefer over the basename?
+///
+/// **No — and no manifest format was invented to make one.** The ring-3 ABI is `crates/una-abi`, a
+/// single `lib.rs` of syscall numbers and info-page offsets; it carries no application-name field.
+/// `SYS_WIN_CREATE` takes `(w, h)` and nothing else — deliberately, and the two seams say so in the
+/// same breath: *"an app never supplies its window's title, because chrome is kernel-drawn, always,
+/// so a program cannot paint something that looks like another window's frame."* No ELF note, no
+/// section, no manifest is read on the load path. So clause 1 is the program's FILE NAME, which is
+/// the name the operator typed and therefore the name the operator expects to read back. If an ABI
+/// ever grows a declared-name field, it becomes clause 0 and reports `from=declared`; the witness
+/// vocabulary already has the word.
+///
+/// ### One site
+///
+/// [`mint_title`] is the whole rule and [`create_inner`] is its only caller, so a window cannot be
+/// titled by any other path. Nothing here is board-shaped and nothing is keyed to a particular
+/// program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TitleSource {
+    /// The creating module declared this name at its `create` call site (a built-in tenant), or a
+    /// future ABI declared it in the image.
+    Declared,
+    /// Derived from the launched program's own file name — clause 1.
+    Program,
+    /// A nameless document's sequenced title — clause 3, the ONLY numbered form.
+    Document,
+    /// An EL0 window whose launcher armed no name — clause 2.
+    Unnamed,
+}
+
+impl TitleSource {
+    /// The witness spelling (`from=`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TitleSource::Declared => "declared",
+            TitleSource::Program => "program",
+            TitleSource::Document => "document",
+            TitleSource::Unnamed => "unnamed",
+        }
+    }
+}
+
+/// WINTITLE — the GENERATED LABEL the two arch window seams mint from their own row index when the
+/// kernel knows nothing else about the caller (`wc_shim::create`, both arches). Recognised here so
+/// that a label is never mistaken for a name; see [`mint_title`] clause 2.
+///
+/// It is matched as a PREFIX because the seams append `'0' + (id % 10)`. Kept as a constant on this
+/// side of the seam rather than shared with `arch::*` because `wm` may not depend on the syscall
+/// layer (the layering invariant `sys_win_present` states); the coupling is one byte string and it
+/// is asserted by [`wintitle_selftest`].
+const SEAM_LABEL: &[u8] = b"el0 win ";
+
+/// WINTITLE — what an application window is called when nothing named it. A NOUN, never a number.
+const ANON_APP: &[u8] = b"Application";
+
+/// WINTITLE — the document form's stem. `Untitled`, then `Untitled 1`, `Untitled 2` — the macOS
+/// convention, and the only numbered titles in the system.
+const DOC_STEM: &[u8] = b"Untitled";
+
+/// WINTITLE — one launcher-armed program name. `owner == 0` means the row is free (owner 0 is the
+/// shell, which is never a launched program — the same "0 is never armed" rule [`SPAWN_FOCUS`] uses).
+#[derive(Clone, Copy)]
+struct AppName {
+    owner: u64,
+    len: u8,
+    name: [u8; MAX_TITLE],
+}
+
+impl AppName {
+    const EMPTY: AppName = AppName {
+        owner: 0,
+        len: 0,
+        name: [0u8; MAX_TITLE],
+    };
+}
+
+/// WINTITLE — the launcher-armed program names, keyed by compositor owner.
+///
+/// Sized to [`MAX_WINDOWS`] for [`SPAWN_FOCUS`]'s reason: a name is only ever READ by a window
+/// create, so the table can hold no more pending owners than the compositor can hold windows. Full
+/// is fail-closed — the launch still happens, its window simply falls to clause 2 and reads
+/// `Application`.
+///
+/// LOCK ORDER: this mutex is a LEAF. [`create_inner`] resolves the title before it takes `TABLE`,
+/// and nothing under it takes `WRITER`, so it can never participate in the WINDOWS ⊃ TABLE ⊃ WRITER
+/// order the rest of this module keeps.
+static APP_NAMES: Mutex<[AppName; MAX_WINDOWS]> = Mutex::new([AppName::EMPTY; MAX_WINDOWS]);
+
+/// WINTITLE — the compositor `owner_asid` for the launch handle the arch spawn entry points return.
+///
+/// ⚠ **The two arches return different things from `spawn_user_image_bg` and this is the only place
+/// that fact is written down.** x86 returns `mapped.slot` (0-based) and its window seam owns rows as
+/// `slot + 1`; aarch64 returns `mapped.ttbr0 >> 48`, which `boot::slot_asid` defines as `slot + 1`,
+/// and its window seam uses that value verbatim. So the same launch handle is off by one between
+/// them, and a launcher that armed the raw handle would name the WRONG TENANT on x86 — every title
+/// shifted one slot. Both seams are in `arch/`, out of this arc's lane; normalising them (have x86
+/// return `slot + 1`, or have both return the compositor owner) is the right fix and is owed to the
+/// arch seats. Until then, every launcher goes through this function.
+pub const fn owner_of_launch(handle: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        handle + 1
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        handle
+    }
+}
+
+/// WINTITLE — the program name in `path`: the basename, with a trailing extension dropped, in the
+/// operator's own case. `/apps/VUG.ELF` → `VUG`; `pulse.elf` → `pulse`; `/apps/x` → `x`.
+///
+/// The ONE derivation, so "what is this program called" has a single answer in the kernel. A path
+/// that ends in a separator has an empty basename and yields an empty slice, and [`app_name_arm`]
+/// refuses it — that window falls through to clause 2 rather than being titled with nothing. A
+/// LEADING dot is not an extension separator (`.profile` is a whole name, and so is `.ELF`), so a
+/// basename that is nothing but a dotted suffix survives intact rather than vanishing.
+pub fn program_name(path: &str) -> &str {
+    let base = match path.rfind(['/', '\\']) {
+        Some(i) => &path[i + 1..],
+        None => path,
+    };
+    // `rfind`, not `find`: `VUG.TEST.ELF` is the program `VUG.TEST`. A leading dot is not an
+    // extension separator (`.profile` is a whole name), so index 0 is excluded.
+    match base.rfind('.') {
+        Some(0) | None => base,
+        Some(i) => &base[..i],
+    }
+}
+
+/// WINTITLE — record the program `path` launched into compositor owner `owner`, so that owner's
+/// windows are titled with the program's name (clause 1) instead of the seam's generated label.
+///
+/// Called by every launcher that resolves a path to an image — the shell's `bg`, the shell's
+/// bare-name launch, and Quarry's double-click — with [`owner_of_launch`] applied to the handle the
+/// spawn returned. Re-arming an owner OVERWRITES its name rather than taking a second row, which is
+/// what keeps a recycled slot from wearing its predecessor's name after a relaunch.
+///
+/// Returns whether a row holds the name (`false` = the table was full, or the name was empty, or
+/// `owner == 0`) — fail-closed: the launch is never conditioned on this succeeding.
+pub fn app_name_arm(owner: u64, path: &str) -> bool {
+    let name = program_name(path).as_bytes();
+    if owner == 0 || name.is_empty() {
+        return false;
+    }
+    let len = name.len().min(MAX_TITLE);
+    let mut t = APP_NAMES.lock();
+    // Re-arm in place first: an owner already named must not occupy two rows, or `app_name_forget`
+    // would clear one and leave the other to title the next tenant.
+    let slot = t
+        .iter()
+        .position(|e| e.owner == owner)
+        .or_else(|| t.iter().position(|e| e.owner == 0));
+    match slot {
+        Some(i) => {
+            t[i].owner = owner;
+            t[i].len = len as u8;
+            t[i].name = [0u8; MAX_TITLE];
+            t[i].name[..len].copy_from_slice(&name[..len]);
+            true
+        }
+        None => false,
+    }
+}
+
+/// WINTITLE — drop `owner`'s program name.
+///
+/// Per TENANT, for [`spawn_focus_forget`]'s reason: owners are recycled slot aliases, so a name left
+/// behind by a program that exited would title the NEXT tenant of that slot. Called by the shell
+/// when it reaps or kills a job — the launches it armed are the launches it retires.
+///
+/// ⚠ The complete fix is a call from the arch slot-teardown seam
+/// (`arch::*::boot::teardown_user_slot`, beside where the hidden bit is cleared), which would cover
+/// tenants no shell ever tracked. That seam is in `arch/` and out of this arc's lane; it is owed,
+/// and until it lands the residual hazard is bounded to "a kernel-initiated launch into a slot a
+/// shell-launched program left, whose shell never reaped it" — which reads a stale NAME, never a
+/// wrong number, and is corrected by the next `app_name_arm` for that owner.
+pub fn app_name_forget(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    let mut t = APP_NAMES.lock();
+    for e in t.iter_mut() {
+        if e.owner == owner {
+            *e = AppName::EMPTY;
+        }
+    }
+}
+
+/// WINTITLE — clause 3's minter: the title of the `seq`-th nameless document. `Untitled`,
+/// `Untitled 1`, `Untitled 2`, … Returns the length written into `out`.
+///
+/// Public because the numbering rule belongs to the window system, not to whatever opens a document:
+/// a document window asks for its title here and passes the result as its DECLARED name, and
+/// [`mint_title`] recognises the form so the wire says `from=document`. Sequences past what
+/// [`MAX_TITLE`] can hold are clamped rather than truncated mid-number.
+pub fn untitled_document(seq: usize, out: &mut [u8; MAX_TITLE]) -> usize {
+    out[..DOC_STEM.len()].copy_from_slice(DOC_STEM);
+    if seq == 0 {
+        return DOC_STEM.len();
+    }
+    // Decimal, most significant digit first, into the space MAX_TITLE leaves after "Untitled ".
+    let mut digits = [0u8; MAX_TITLE];
+    let mut n = seq;
+    let mut nd = 0usize;
+    while n > 0 && nd < digits.len() {
+        digits[nd] = b'0' + (n % 10) as u8;
+        n /= 10;
+        nd += 1;
+    }
+    let room = MAX_TITLE - DOC_STEM.len() - 1;
+    if nd == 0 || nd > room {
+        return DOC_STEM.len();
+    }
+    out[DOC_STEM.len()] = b' ';
+    for k in 0..nd {
+        out[DOC_STEM.len() + 1 + k] = digits[nd - 1 - k];
+    }
+    DOC_STEM.len() + 1 + nd
+}
+
+/// WINTITLE — is `t` the document form [`untitled_document`] mints? `Untitled`, or `Untitled` +
+/// space + digits. Nothing else: `Untitled draft` is a NAME the module declared and is reported as
+/// such.
+fn is_document_title(t: &[u8]) -> bool {
+    if t == DOC_STEM {
+        return true;
+    }
+    if t.len() < DOC_STEM.len() + 2 || &t[..DOC_STEM.len()] != DOC_STEM {
+        return false;
+    }
+    t[DOC_STEM.len()] == b' ' && t[DOC_STEM.len() + 1..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// WINTITLE — **THE ONE SITE.** Resolve the title a new window is born with, from its owner and the
+/// name its creator declared. See [`TitleSource`] for the rule and the reasoning; this function is
+/// that rule and [`create_inner`] is its only caller.
+///
+/// Takes no lock but [`APP_NAMES`]'s, and is called BEFORE `TABLE` is taken.
+fn mint_title(owner_asid: u64, declared: &[u8], out: &mut [u8; MAX_TITLE]) -> (usize, TitleSource) {
+    // Clause 1 — a launcher armed this owner with the program's own name. Consulted first and
+    // unconditionally: an armed owner IS a launched program, whatever its creator passed.
+    {
+        let t = APP_NAMES.lock();
+        if let Some(e) = t.iter().find(|e| e.owner == owner_asid && e.owner != 0) {
+            let len = (e.len as usize).min(MAX_TITLE);
+            if len > 0 {
+                out[..len].copy_from_slice(&e.name[..len]);
+                return (len, TitleSource::Program);
+            }
+        }
+    }
+    // Clause 2 — a generated label reached us: an EL0 window nobody named. A noun, never a number.
+    if declared.len() >= SEAM_LABEL.len() && &declared[..SEAM_LABEL.len()] == SEAM_LABEL {
+        out[..ANON_APP.len()].copy_from_slice(ANON_APP);
+        return (ANON_APP.len(), TitleSource::Unnamed);
+    }
+    let len = declared.len().min(MAX_TITLE);
+    out[..len].copy_from_slice(&declared[..len]);
+    // Clause 3 — the nameless-document form, the one place a number is right.
+    if is_document_title(&declared[..len]) {
+        return (len, TitleSource::Document);
+    }
+    // Clause 4 — the creator's declared name, verbatim.
+    (len, TitleSource::Declared)
+}
+
+// WINTITLE — THE WIRE IS [`winid_alloc_witness`]'s LINE, and this note is where a second one was
+// refused. The provenance of every minted title (`owner=`, `title=`, `from=`) is APPENDED to the
+// `[wm] alloc` line that already fires once per create, on that witness's existing budget and behind
+// its existing furniture gate. A standalone `title_witness` was written first, ungated, with a
+// budget of its own — and it cost the compositor its furniture passes for the rest of the boot,
+// reddening two unrelated fixtures. The measurement, the A/B and the standing rule for the next arc
+// that wants a per-create fact on the wire are recorded at `winid_alloc_witness`.
+
 // ---- VUGMIN-B: hidden-owner plumbing -----------------------------------------------------------
 
 /// VUGMIN-B — `wm`'s SHADOW of the hidden bitmask `arch::aarch64::syscall` owns, one bit per ASID.
@@ -22113,6 +22419,12 @@ fn create_inner(
     if w.saturating_mul(4) > stride || h.saturating_mul(stride) > surf_len {
         return WIN_NONE;
     }
+    // WINTITLE — resolve the title HERE, before either lock. `mint_title` takes `APP_NAMES` (a leaf
+    // mutex) and `create_inner` goes on to take `WRITER` and then `TABLE`; resolving first keeps the
+    // leaf strictly outside both and out of the WINDOWS ⊃ TABLE ⊃ WRITER order entirely. The rule
+    // itself is stated once, in `TitleSource`; this is its only call site in the kernel.
+    let mut minted = [0u8; MAX_TITLE];
+    let (minted_len, title_src) = mint_title(owner_asid, title, &mut minted);
     // SPAWN-PLACE — resolve the caller's origin BEFORE the table lock (WRITER is never held across
     // it, which is what keeps the WRITER/TABLE order acyclic here as it is in `move_to` and `place`).
     // A framebuffer that is not ready leaves the row to the tiler, exactly as `move_to` declines.
@@ -22196,8 +22508,9 @@ fn create_inner(
     if !compat {
         row.scale = cluster_min_scale(w);
     }
-    row.title_len = title.len().min(MAX_TITLE);
-    row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
+    // WINTITLE — the row is born with the MINTED title, never the caller's bytes. See `TitleSource`.
+    row.title_len = minted_len;
+    row.title[..minted_len].copy_from_slice(&minted[..minted_len]);
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
     // and the `composite` below paints it exactly once, where it stays.
     if let Some((x, y, scale)) = placed {
@@ -22225,7 +22538,7 @@ fn create_inner(
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
     t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
-    drop(t); winid_alloc_witness(id, winid_generation); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`.
+    drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
     // where the id demonstrably names something new.
@@ -23828,7 +24141,7 @@ pub fn hittest_selftest() {
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
-    repaint(); closemin_selftest(); // CLOSEMIN — ⚠ SAME-LINE fold, line-NEUTRAL. Sited HERE, at the tail of the one window fixture BOTH arches drive (x86 `arch/x86_64/syscall.rs`'s battery and aarch64's alike), because the defect it pins is arch-neutral code reached from two arch routers and only one of them had the cure. After this battery's own teardown sweep, so no synthetic row of its can be inherited; it mints, reaps and restores its own three rows on the same terms.
+    repaint(); closemin_selftest(); wintitle_selftest(); // CLOSEMIN + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. Both fixtures are sited HERE, at the tail of the one window battery BOTH arches drive (x86 `arch/x86_64/syscall.rs` and aarch64 alike), because each pins arch-neutral code reached from two arch routers. `winid_selftest`'s chain was refused for WINTITLE for the same reason: it has exactly one external caller and it is `arch/aarch64`, so a fixture folded there would never run under `UNAOS_WC=1 ./arroyo test`. After this battery's own teardown sweep and focus restore, so neither inherits a synthetic row; each mints, reaps and restores its own.
 }
 
 /// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
@@ -25179,15 +25492,35 @@ fn winid_console_route(id: WinId) -> &'static str {
 /// WINID — the alloc half of the witness, folded into `create_inner` AFTER its table guard drops.
 /// Never called under the lock: a `serial_println!` on a routed console asks for a composite, and a
 /// composite takes `TABLE`.
+///
+/// WINTITLE — **and it carries the minted title, APPENDED to this line rather than printed on a
+/// second one.** That is not tidiness, it is the fix for a measured regression. The first cut of
+/// this arc added its own `title_witness` beside this call, and the extra `serial_println!` per
+/// create — one more routed-console print, one more composite driven from inside `create_inner` —
+/// cost the furniture its compose passes for the rest of the boot: `UNAOS_WC=1 ./arroyo test` went
+/// from `[dock] selftest passes=44` to `passes=4`, `[crystal] selftest passes=7` to `passes=0`, and
+/// **reddened two fixtures that have nothing to do with titles** (`:: DOCK: … vacate=false`,
+/// `:: WINMENU: … app_box=false`), while the WINTITLE fixture itself passed. Proven by A/B at the
+/// same sha: the pre-arc tree exits 0 on the same command, this tree exited 1. So the rule for the
+/// next arc that wants a per-create fact on the wire: **append it here.** A create is on the
+/// compositor's own path and the wire is not free at that point. Idiom: WCN-CAUSE's appended census
+/// fields, `FBCON-DMG`'s inserted `box_px_pp`.
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn winid_alloc_witness(id: WinId, generation: u32) {
+fn winid_alloc_witness(id: WinId, generation: u32, owner: u64, title: &[u8], src: TitleSource) {
     if WINID_ALLOC_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX {
         return;
     }
-    serial_println!("[wm] alloc win={} gen={}", id, generation);
+    serial_println!(
+        "[wm] alloc win={} gen={} owner={:#x} title=\"{}\" from={}",
+        id,
+        generation,
+        owner,
+        core::str::from_utf8(title).unwrap_or("?"),
+        src.as_str()
+    );
 }
 
 /// WINID — the erasing twin.
@@ -25196,7 +25529,7 @@ fn winid_alloc_witness(id: WinId, generation: u32) {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 )))]
 #[inline(always)]
-fn winid_alloc_witness(_id: WinId, _generation: u32) {}
+fn winid_alloc_witness(_id: WinId, _generation: u32, _owner: u64, _title: &[u8], _src: TitleSource) {}
 
 /// WINID — **the falsifier for SO1(b): does a closed window's id survive in a cache that held it?**
 ///
@@ -25288,6 +25621,146 @@ fn winid_selftest() {
         w2,
         g2,
         scoped_ok as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    composite();
+}
+
+/// WINTITLE — **the fixture that would have caught render11's title bars.**
+///
+/// It asserts the ONE rule ([`mint_title`]) clause by clause, and then asserts the WIRING once
+/// end-to-end, because a rule nothing calls is not a rule:
+///
+/// * **LEG 1** — [`program_name`], the one derivation: directory dropped, extension dropped, case
+///   left exactly as the operator wrote it.
+/// * **LEG 2** — [`untitled_document`]: `Untitled`, `Untitled 1`, `Untitled 12`. The ONLY numbered
+///   titles in the system.
+/// * **LEG 3** — **the defect.** A seam label (`el0 win 5`) resolves to a NOUN with no digit in it.
+///   RED on the render11 base, where the label reached the strip verbatim.
+/// * **LEG 4** — an armed owner is titled with its program's name.
+/// * **LEG 5** — **no numeric suffix for app windows, ever.** Two windows of the SAME program get
+///   the SAME title. This is the half of Peter's ruling a "just strip the label" fix would miss.
+/// * **LEG 6** — a declared name survives verbatim, and the document form is recognised as such.
+/// * **LEG 7** — the wiring: a real [`create`] over a seam label puts the minted title in the ROW
+///   the compositor draws from, not merely in a helper's return value.
+///
+/// `witness`-gated and NOTHING else — exactly like [`closemin_selftest`], whose call site it shares.
+/// The furniture cross-gate the first draft carried (`wc` on x86, `desktop_firmware` on aarch64) was
+/// wrong twice over: it was NARROWER than its caller ([`hittest_selftest`] is `witness`-only), so on
+/// a witness build without furniture the fixture became an empty stub that printed nothing — and the
+/// rule it pins lives in `create_inner`, which is compiled and reached on every build that can open
+/// a window at all, not only on ones that draw a desktop.
+#[cfg(feature = "witness")]
+fn wintitle_selftest() {
+    // One-shot, on `reopen_selftest`'s terms: the fixture mints and closes real rows, and a battery
+    // driver that ran it twice would spend a table slot for no second answer.
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    /// A synthetic EL0-style owner: outside the kernel band, so it takes the app clauses.
+    const ASID_T: u64 = 0xA771;
+    /// A second synthetic owner, never armed, for the declared/document clauses.
+    const ASID_D: u64 = 0xA772;
+    const _: () = assert!(!is_kernel_owner(ASID_T) && !is_kernel_owner(ASID_D));
+
+    let sa = &raw const FV_SURF_A as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+
+    // LEG 1 — the one derivation.
+    let pn_ok = program_name("/apps/VUG.ELF") == "VUG"
+        && program_name("PULSE.ELF") == "PULSE"
+        && program_name("/apps/pulse.elf") == "pulse"
+        && program_name("/apps/VUG.TEST.ELF") == "VUG.TEST"
+        && program_name("/apps/x") == "x"
+        && program_name("/apps/").is_empty();
+
+    // LEG 2 — the document sequence.
+    let (mut d0, mut d1, mut d2) = ([0u8; MAX_TITLE], [0u8; MAX_TITLE], [0u8; MAX_TITLE]);
+    let (n0, n1, n2) = (
+        untitled_document(0, &mut d0),
+        untitled_document(1, &mut d1),
+        untitled_document(12, &mut d2),
+    );
+    let doc_ok = &d0[..n0] == b"Untitled" && &d1[..n1] == b"Untitled 1" && &d2[..n2] == b"Untitled 12";
+
+    // The name table must be clean for this owner before the unnamed clause is asked.
+    app_name_forget(ASID_T);
+    let mut buf = [0u8; MAX_TITLE];
+
+    // LEG 3 — the defect: a generated label never reaches a title bar, and what replaces it has no
+    // digit in it. The digit test is the ruling itself, not a restatement of the string compare: a
+    // future noun is still forbidden from carrying a sequence number.
+    let (ln, ls) = mint_title(ASID_T, b"el0 win 5", &mut buf);
+    let label_ok = ls == TitleSource::Unnamed
+        && &buf[..ln] == ANON_APP
+        && !buf[..ln].iter().any(|b| b.is_ascii_digit());
+
+    // LEG 4 — the launcher's name wins, in the operator's case.
+    let armed = app_name_arm(ASID_T, "/apps/VUG.ELF");
+    let (pn, ps) = mint_title(ASID_T, b"el0 win 5", &mut buf);
+    let prog_ok = armed && ps == TitleSource::Program && &buf[..pn] == b"VUG";
+
+    // LEG 5 — a second instance of the same program is titled identically. No "VUG 1".
+    let mut buf2 = [0u8; MAX_TITLE];
+    let (pn2, ps2) = mint_title(ASID_T, b"el0 win 6", &mut buf2);
+    let noseq_ok = ps2 == TitleSource::Program && buf2[..pn2] == buf[..pn];
+
+    // LEG 6 — a declared name verbatim, and the document form recognised.
+    let (dn, ds) = mint_title(ASID_D, b"Console", &mut buf2);
+    let (qn, qs) = mint_title(ASID_D, &d1[..n1], &mut buf);
+    let decl_ok = ds == TitleSource::Declared
+        && &buf2[..dn] == b"Console"
+        && qs == TitleSource::Document
+        && &buf[..qn] == b"Untitled 1";
+
+    // LEG 7 — the wiring. A real create over the seam label, read back out of the ROW.
+    //
+    // A full table is a SKIP for this leg alone, never for the verdict: legs 1-6 have already been
+    // measured by the time the row is asked for, and returning here would throw six answers away and
+    // leave the wire silent — the shape LAWS.md forbids, where a missing PASS is indistinguishable
+    // from a fixture that never ran. `row=skip` says exactly which leg was not asked.
+    let w = create(ASID_T, sa, len, 8, 8, 32, b"el0 win 5");
+    // Read the ROW, not `info` — `WindowInfo` is a geometry snapshot and carries no caption. Scoped
+    // so the guard is dropped before the witness line below (a `serial_println!` on a routed console
+    // asks for a composite and a composite takes `TABLE`).
+    let row_ok: Option<bool> = if w == WIN_NONE {
+        None
+    } else {
+        let t = table();
+        let v = row(&t, w).is_some_and(|r| r.title[..r.title_len] == *b"VUG");
+        drop(t);
+        Some(v)
+    };
+    close(w);
+    app_name_forget(ASID_T);
+    // And the forget is real: the owner falls back to the unnamed clause it started at.
+    let (fn_, fs) = mint_title(ASID_T, b"el0 win 5", &mut buf);
+    let forget_ok = fs == TitleSource::Unnamed && &buf[..fn_] == ANON_APP;
+
+    let ok = pn_ok
+        && doc_ok
+        && label_ok
+        && prog_ok
+        && noseq_ok
+        && decl_ok
+        && row_ok != Some(false)
+        && forget_ok;
+    serial_println!(
+        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} {} ::",
+        pn_ok as u8,
+        doc_ok as u8,
+        label_ok as u8,
+        core::str::from_utf8(SEAM_LABEL).unwrap_or("?"),
+        prog_ok as u8,
+        noseq_ok as u8,
+        decl_ok as u8,
+        match row_ok {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "skip",
+        },
+        forget_ok as u8,
         if ok { "PASS" } else { "FAIL" }
     );
     composite();

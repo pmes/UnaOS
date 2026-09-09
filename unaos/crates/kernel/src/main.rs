@@ -6312,7 +6312,7 @@ fn open_shell_window(
         cw as u32,
         ch as u32,
         stride as u32,
-        b"shell",
+        b"Shell",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );
@@ -8767,7 +8767,7 @@ fn tegra_shell_window_open(panel: &mut unaos_kernel::video::Screen) -> Option<Te
         cw as u32,
         ch as u32,
         stride as u32,
-        b"shell",
+        b"Shell",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );
@@ -9348,7 +9348,7 @@ fn tegra_shell_remint() -> unaos_kernel::video::wm::WinId {
         w as u32,
         h as u32,
         TEGRA_SHELL_STRIDE.load(Ordering::Relaxed) as u32,
-        b"shell",
+        b"Shell",
         TEGRA_SHELL_X.load(Ordering::Relaxed),
         TEGRA_SHELL_Y.load(Ordering::Relaxed),
     );

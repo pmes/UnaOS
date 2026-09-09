@@ -1048,7 +1048,13 @@ compositor runs from syscall context on a non-coherent scan-out path, where a he
 be both a latency cost and a failure mode. Each row carries: id (`1..=12`; `0` is `WIN_NONE`, the
 fail-closed return of every operation), owner ASID (opaque here — `wm` never reads task state),
 content origin and source extent, integer scale, z-order, surface pointer + stride, a damage flag,
-and a title truncated to `MAX_TITLE = 16` bytes at create time.
+and a title truncated to `MAX_TITLE = 16` bytes at create time. **The title is MINTED, not copied** —
+`create_inner` resolves it through `mint_title` (WINTITLE, R36), so the caller's bytes are one of
+four inputs to a rule rather than the answer, and a numeric suffix belongs to nameless DOCUMENTS
+only. See [`ui_guidelines.md` §7](../05_USER_EXPERIENCE/ui_guidelines.md) for the rule, `[wm] alloc win= gen= owner=
+title= from=` for its wire (appended to the alloc witness, never a second print — see the
+guideline), and `wm::wintitle_selftest` (`:: WINTITLE: … PASS ::`, at the
+tail of `hittest_selftest`, both arches) for its fixture.
 
 **`MAX_WINDOWS` was 8 until HEADROOM (x86, Boot AL).** The original note argued for 8 from tiling —
 "far past what a 1920-wide panel can usefully tile at a legible integer scale" — which is still true
