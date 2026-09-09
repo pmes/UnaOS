@@ -545,7 +545,7 @@ def main():
                                     ("--no-coverage-gate", args.no_coverage_gate),
                                     ("--quiet-optional", args.quiet_optional)) if v]
         if _cap_side:
-            ap.error("--explain takes no capture-side flags; got " + ", ".join(_cap_side))
+            ap.error("--explain takes no capture or capture-side flags; got " + ", ".join(_cap_side))
 
     # ---- --explain: the effective directive list, and nothing else -------------------------
     #
