@@ -279,6 +279,37 @@ run: pi owns `kernel8-test` and all three virt legs, and R39 scopes the virt exc
 seat's OWN landing. **pi 10's step 3 is the real runtime verdict on this content, and a red there is
 a finding about landed code, not a regression from this landing.**
 
+### ⇒ ANSWERED AFTER THE LANDING: pi 10's step 3 came back GREEN
+
+The gap above is closed for the board leg. pi folded trunk into `hw-pi4` at **`2461094b`** — shape
+verified from this seat by reading, not by accepting: parents `bce9661d` + `084b79ac`, contains both
+`084b79ac` and `751cb816`, and **NOT PUSHED** at the time of writing (`git merge-base --is-ancestor
+2461094b origin/hw-pi4` fails; `origin/hw-pi4` is `bce9661d`). A locally readable object is not a
+pushed one, so this evidence lives on one box until pi's push lands.
+
+    pi4 kernel8-test    REAL_EXIT=0 · MBENCH PASS 126/126 required witnesses · 0 forbidden
+                        0 fault lines in the capture · CONTROL 168 PASS lines, so the scan can fire
+
+**They closed SR10's trap in the same command that made the evidence** — snapshotting the capture off
+the fixed path before anything could overwrite it, which is the row's stated fix arriving before its
+fix does. And they ran GATE-LEDGER with **strict forced by hand, citing SR13**, filed less than an
+hour earlier.
+
+Their floor prediction held exactly: 120 required witnesses at `247b1b95` → **126** here, predicted
++6 for orin's six new REQUIRE rows, measured +6 — while the absolute they had refused to let anyone
+quote (119) was indeed wrong. The delta was right and the caveat was right.
+
+**AND A PREDICTION OF THIS SEAT'S WAS WRONG, which pi named.** I told them to expect their first
+`./arroyo check` on the merged tree to be slower and to find things, because "a first run of a
+stronger gate over a tree it has never seen is where reds live". It found nothing: `REAL_EXIT=0`, 81
+legs green, 0 red, GATE-FAMILY 10, GATE-APPEND 162 files / 4 controls, GATE-KNOB 165, GATE-ROOTS 9,
+GATE-LEDGER 286 rows strict. Setting the expectation in advance was right; the expectation was wrong,
+and it is recorded here rather than quietly dropped now that it is convenient.
+
+**STILL OPEN at the time of writing:** the three arm virt legs. `kernel8-test` is the BCM2711 board;
+`virt` is the only runtime aarch64 proof for the shared-kernel surface that no board exercises. Until
+those close, the landing has board-level runtime evidence and not yet the generic-aarch64 kind.
+
 ### The mechanism hole the three seats left this morning
 
 pi 10 found it and it is the reason the landing did not wait on them. R39 settled **WHO** runs which
