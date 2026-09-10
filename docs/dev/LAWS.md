@@ -130,8 +130,15 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   **pi** — `kernel8-test`; **jetson** — `check (tegra)` and `esp-jetson`. `check` is NOT platform-scoped: it is a
   compile, one invocation type-checks both arches, and every seat runs it whole — a cfg-widen must compile the
   configuration it turns ON (pi 10's amendment). **A leg with no NAMED owner defaults to whoever is running, and
-  that is the landing seat — so `arm virt v2`, `arm virt v3` and the arm usb-write witness (a `cat` of the v2
-  capture) are named to one aarch64 seat, unconditionally, never "mine unless you want them".**
+  that is the landing seat, so every leg is named here unconditionally — never "mine unless you want it", which
+  is a conditional claim and defaults the same way (pi 10 made and then fixed exactly that error in the message
+  after diagnosing it).** SETTLED 2026-09-10: **`arm virt v2`, `arm virt v3 (CAPSTONE)` and the arm usb-write
+  witness belong to PI**, unconditionally. QEMU `virt` is neither board — not BCM2711, not Tegra234 — so both
+  aarch64 seats had standing; pi took them because pi holds one board leg while orin carries a bench-flight
+  cadence, and orin may claim them by saying so. The counter-argument is on record and is stronger than "nobody's
+  board": `virt` is the ONLY runtime aarch64 proof available without hardware, and therefore the only runtime
+  coverage the Jetson can ever get. The arm usb-write witness is not a boot at all — it is an assertion ON the v2
+  capture, the second-order orphan the unowned-leg mechanism produced.
   **A LANDING IS THREE GREENS AT ONE SHA, NOT ONE SEAT'S BATTERY** — each seat runs its own board in its own tree
   and acks with the command and the result.
   ⚠ **AND A BOARD'S SELF-PROOF IS ONLY WHAT THAT BOARD CAN PROVE ALONE** (orin 25's amendment, and it is load-
