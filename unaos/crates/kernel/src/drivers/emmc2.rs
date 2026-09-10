@@ -651,7 +651,7 @@ fn finish(card: SdCard) {
 /// `BlockHandle::Usb`. `register_sd` (called from [`finish`] above, synchronously on the BSP) flips
 /// `BACKEND` to `BACKEND_SD` long before xHCI enumerates, and the aarch64 `publish_usb_geometry`
 /// claims the global slot ONLY while `BACKEND != BACKEND_SD` — so a stick cannot displace the card
-/// in `/fat`. Every fixture that loads a program (ELF1, EXEC1, K2) mounts `BlockSource::Default`;
+/// in `/boot`. Every fixture that loads a program (ELF1, EXEC1, K2) mounts `BlockSource::Default`;
 /// K3/K4 read and write the native volume through `block::read_block`/`write_block`, i.e. the same
 /// card. The `/usb` mount is bound only when a stick is actually present (`shell::vfs_mount_table`).
 ///
@@ -686,7 +686,7 @@ pub fn onecard_witness() {
     let mib = dev.num_blocks.saturating_mul(dev.block_size as u64) / (1024 * 1024);
 
     // p1 — the FAT program volume. `mount()` is `BlockSource::Default`, which the `register_sd` above
-    // has just pointed at this card; it is the identical binding `/fat`, ELF1, EXEC1 and K2 use.
+    // has just pointed at this card; it is the identical binding `/boot`, ELF1, EXEC1 and K2 use.
     let fat = match crate::fs::fat::mount() {
         Ok(fs) => {
             let (vol_id, _clusters) = fs.volume_fingerprint();

@@ -340,7 +340,7 @@ pub fn usync_with_root_attrs(
     if index.len() >= SNAPSHOT_CAP {
         bail!(
             "snapshot index full ({}/{} retained roots): drop one first with \
-             `vaire usnapdrop`/`unafs snapdrop` — usync never auto-drops a retained root \
+             `vaire snapdrop`/`unafs snapdrop` — usync never auto-drops a retained root \
              (nothing was written)",
             index.len(),
             SNAPSHOT_CAP

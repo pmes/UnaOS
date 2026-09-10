@@ -1959,6 +1959,100 @@ REQUIRE :: TSTE: midden.resolve -> PASS ::
 REQUIRE :: TSTE: midden.precedence -> PASS ::
 FORBID :: TSTE: midden\.\w+ -> FAIL
 
+# --- LIVENESS ANCHORS (orin 19, 2026-09-07; pi 8's grant, scoped to these four directives) ---
+# --- WHY A REQUIRE AND NOT ANOTHER FORBID: mbench's builtin DEFAULT_FORBIDS (mbench.py:135)
+# --- catches a witness that FAILS. It cannot catch a witness that never RAN. Until these lines,
+# --- `shell.relics.*` (12 legs), `layout.*` (3) and `vfsroute.*` (11) had NO named directive in
+# --- ANY spec in this tree -- only `midden.*` above and `fatverb.*` in x86-fat did. So a witness
+# --- family that stopped executing (cfg drift, an early return, a fold that drops the call site)
+# --- was invisible to every spec, and the run still printed green. One anchor per family converts
+# --- that silent absence into a red. Only a REQUIRE catches absence.
+# --- ANCHORS CHOSEN BY OBSERVATION, NOT BY GUESS -- each was read emitting `-> PASS` in
+# --- target/serial-pi.log on this exact config before the directive was written, which is the same
+# --- observe-then-write discipline that stopped `mv.xvol` from asserting a bug (see below).
+# --- `layout.mv` is the deliberate one: it carries FOUR skip paths that print `layout.mv skipped`
+# --- and DO NOT red (rmbp 15). Anchoring on its PASS converts all four silent exits into
+# --- convictable ones. It does not skip on this config -- it moves between /boot and /apps, which
+# --- are ONE volume here -- so the anchor is honest rather than lucky.
+REQUIRE :: TSTE: shell\.relics\.mv -> PASS ::
+# ---   GUARDS the native-root rename path (receiving_dir -> "" -> native_abs -> "/" -> read_inode(root)).
+# ---   REDS WHEN: the destination ACL asks about the not-yet-existing LEAF instead of its PARENT —
+# ---   measured at c8eb4038: `mv: /RELIC3.TXT: -ENOENT`, MBENCH 118/119, forbid=2.
+REQUIRE :: TSTE: layout\.mv -> PASS ::
+# ---   GUARDS both executor branches of MountTable::rename (/boot->/apps and /apps->/boot) AND the
+# ---   four skip paths that print `layout.mv skipped` and do NOT red on their own (rmbp 15).
+# ---   REDS WHEN: either direction silently writes to the wrong mount root, or any skip fires here —
+# ---   it cannot legitimately skip on this config, /boot and /apps are ONE volume.
+REQUIRE :: TSTE: vfsroute\.route -> PASS ::
+# ---   GUARDS the vfsroute family's liveness (11 legs, no other named directive in any spec).
+# ---   REDS WHEN: the family stops executing — cfg drift, an early return, a fold that drops the
+# ---   call site. DEFAULT_FORBIDS cannot catch that: it sees a FAIL, never an absence.
+# --- mv.xvol: the cross-VOLUME refusal. `mv` between the native volume and the FAT program volume
+# --- is REFUSED BY VOLUME IDENTITY and must stay refused -- admitting it would relink an UnaFS
+# --- inode into a FAT directory on any board carrying both filesystems on one card. This leg was
+# --- written first to assert the MOVE, went red, and was rewritten to assert the REFUSAL; it reds
+# --- on the VOLID-C1 aliasing regression (make volume_id medium-derived and the move is admitted).
+REQUIRE :: TSTE: shell\.relics\.mv\.xvol -> PASS ::
+# ---   GUARDS the cross-VOLUME refusal: mv between the native volume and the FAT program volume is
+# ---   refused BY VOLUME IDENTITY and must stay refused. Admitting it relinks an UnaFS inode into a
+# ---   FAT directory on any board carrying both filesystems on one card — which the Pi does.
+# ---   REDS WHEN: the VOLID-C1 aliasing regression returns (make volume_id medium-derived and the
+# ---   two filesystems on one card compare EQUAL, the move is admitted, every fact in the leg flips).
+# ---   The leg was written first to assert the MOVE, went RED, and was rewritten to assert the REFUSAL.
+# --- ACLSYM (orin 19): the rename ACL is asked of BOTH mounts, and the check can FIRE ------------
+# `a62188c9` made `MountTable::rename` ask the SOURCE mount about the object that leaves it and the
+# DESTINATION mount about the receiving DIRECTORY. Its own closing paragraph named what it had not
+# done: *"no test EXERCISES the new refusal ... the gate above proves NO REGRESSION — not that the
+# fix fires."* Every mount the tree binds carries one principal, so deleting the destination call
+# changed nothing anywhere and all 119 witnesses stayed green. `shell::vfs_aclsym_witness` closes
+# that on a SCRATCH mount table with two postures over one volume, and the two rows below are here
+# because the default `-> FAIL` FORBID catches a leg that FAILS but not a leg that STOPS SPEAKING —
+# which is the same silence this pair exists to end.
+#
+#   vfs.aclsym.dir  — `receiving_dir` as a VALUE (`/APPS/X.ELF` -> `/APPS`, `/X.TXT` -> `""`, `""`
+#                     -> `""`, `/A/B/C` -> `/A/B`). Pure, no medium, NO SKIP BRANCH, so it is
+#                     required flatly: on any capture that reaches the TSTE battery it PASSes or it
+#                     FAILs, and absence is a defect.
+#   vfs.aclsym      — the destination mount's posture refusing a principal the SOURCE mount permits,
+#                     with a same-principal CONTROL beside it. It needs a writable FAT volume, so it
+#                     SKIPS (with a stated reason) on a board that has none. THE ROW THEREFORE
+#                     REQUIRES THAT IT SPOKE, not that it passed: `PASS` or a stated skip satisfies
+#                     it, a leg deleted from the battery does not, and a FAIL is convicted by the
+#                     FORBID below and by the built-in `-> FAIL`. Requiring `PASS` outright would
+#                     red an honest no-volume board, which is a spec asserting a fact about the
+#                     MEDIUM in a row about the ACL.
+#
+# Proven failable, not asserted: `a62188c9`'s two `authorize_write` lines removed in the worktree ->
+# `:: TSTE: vfs.aclsym -> FAIL (got ... refused=Err(NoSuchPath) want=Err(Denied) ... ) ::`,
+# `kernel8-test` EXIT=1, `MBENCH FAIL — 119/119 required witnesses, 1 forbidden hit(s)` — 119/119,
+# i.e. the pre-existing battery could not see the hole and this leg is the only thing that convicts.
+REQUIRE :: TSTE: vfs.aclsym.dir -> PASS ::
+# ---   GUARDS receiving_dir's SHAPE as a value ("/APPS/X.ELF"->"/APPS", "/X.TXT"->""). Pure, fires
+# ---   on every board. REDS WHEN: the leaf/parent decision is edited back to the leaf.
+REQUIRE :: (?:TSTE: vfs.aclsym -> PASS|aclsym: .*vfs.aclsym skipped) ::
+# ---   ⚠⚠ THE ROW A FUTURE SEAT SHOULD UNDERSTAND RATHER THAN OBEY (pi 8's words, and they are right).
+# ---   GUARDS that MountTable::rename asks the DESTINATION mount's posture at all.
+# ---   THE NUMBER THAT JUSTIFIES IT: with a62188c9's two `authorize_write` lines DELETED and nothing
+# ---   else, kernel8-test reported `MBENCH PASS — 119/119`. Every witness in the tree stayed GREEN
+# ---   while the fix it existed to protect was GONE. A green count can mean nothing was ever asked.
+# ---   REDS WHEN: those two lines go. By name: `refused=Err(NoSuchPath) want=Err(Denied)` with
+# ---   `control_ok=true` beside it — the control leg proves the REFUSAL leg alone flipped, so the
+# ---   pair is a DISCRIMINATOR and not merely a red. Measured twice before this rule was written.
+FORBID :: TSTE: vfs\.aclsym[\w.]* -> FAIL
+# ---   Catches the leg FAILING. The REQUIRE above catches it DISAPPEARING. Neither substitutes.
+# --- EIGHTH DIRECTIVE (pi 8's grant, 2026-09-07). The REQUIRE above accepts `PASS` OR a stated
+# --- skip, because requiring PASS outright would put a fact about the MEDIUM inside a row about the
+# --- ACL. That honesty leaves a hole rmbp 15 named: the leg can go quiet on the very board that HAS
+# --- the volume, and the run stays green. This closes it -- on pi's gate config the volume is
+# --- structurally present (measured `-> PASS`, corroborated by xvol's `:: ls1: /: ... apps/ boot/ ::`),
+# --- so a skip HERE means the ACL leg stopped testing on a board that can test it.
+# --- REQUIRE catches the family disappearing; FORBID catches it taking the wrong arm. Neither
+# --- substitutes for the other. ⚠ IF THIS REDS IT IS NOT A SPEC BUG -- do not relax the rule; that is
+# --- the same failure as writing a REQUIRE before observing.
+FORBID aclsym: .*vfs\.aclsym skipped
+# ---   Catches the leg taking the WRONG ARM — going quiet on a board that HAS the volume, which is
+# ---   the hole the "PASS or a stated skip" REQUIRE deliberately leaves open (rmbp 15 named it).
+
 REQUIRE \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
 #
 # ---    2. THE FIXTURE VERDICT is the stronger statement, and it is why the hash above is not
@@ -2279,8 +2373,8 @@ FORBID \[serfocus\] split .* :: FAIL ::
 # --- What it guards — ten legs, all pure functions over synthetic input, so none of them can be made
 # --- vacuous by a machine with no volume (QEMU raspi4b has no stick; x86 has no mount table at all):
 # ---   * geometry / scroll_follow / thumb / tree splice / press-to-row — M1's five, unchanged;
-# ---   * duplicate roots — `root_prefixes(["/", "/fat", "/usb"]) == ["/"]`, the EXACT live table that
-# ---                       produced the bench's double `/fat`, plus idempotence, order-independence,
+# ---   * duplicate roots — `root_prefixes(["/", "/boot", "/usb"]) == ["/"]`, the EXACT live table that
+# ---                       produced the bench's double `/boot`, plus idempotence, order-independence,
 # ---                       and the two negative claims that reject the lazy fix (it must not hide a
 # ---                       volume on a rootless table, nor drop a `/usbfoo` sibling);
 # ---   * name dedupe    — `dedupe_by_name` keeps the first of each name, in order;

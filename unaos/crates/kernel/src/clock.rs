@@ -2,7 +2,7 @@
 //!
 //! The boards have NO RTC the kernel reads (§JD16 documented the consequence: every kernel-written
 //! FAT entry carried an all-zero mtime). JD17 closes that gap honestly: the operator seeds the
-//! clock once per boot with the `setdate` shell verb, and the free-running architectural counter
+//! clock once per boot with the `date -s` shell verb, and the free-running architectural counter
 //! (aarch64 `CNTPCT_EL0` / `CNTFRQ_EL0` — the same JD3 timerless mechanism the BOT pump and the
 //! JD4 screen-on-boot deadline ride) extends it forward from the moment of setting. UNSET is a
 //! first-class state: `now()` is `None` and `fat_stamp()` is `(0, 0)` — exactly the all-zero
@@ -23,7 +23,7 @@
 
 use spin::Mutex;
 
-/// The anchor a `setdate` plants: the seeded wall-clock second paired with the counter reading at
+/// The anchor a `date -s` plants: the seeded wall-clock second paired with the counter reading at
 /// the moment of seeding. `now()` = `base_secs` + (ticks since `anchor_ticks`) / freq. One small
 /// lock (set is a rare operator action; reads are a couple of loads) keeps the pair consistent.
 struct Anchor {
@@ -175,7 +175,7 @@ pub fn set(t: WallTime) -> Result<(), ()> {
     let ticks = monotonic().map(|(p, _)| p).unwrap_or(0);
     *ANCHOR.lock() = Some(Anchor { base_secs, anchor_ticks: ticks });
     // CLOCK-1: an operator seed is also a civil-clock anchor — plant a `Manual` Unix anchor so `time`
-    // (and future log/mtime readers) reflect the setdate. Reads the SAME monotonic tick, so the two
+    // (and future log/mtime readers) reflect the seed. Reads the SAME monotonic tick, so the two
     // anchors advance in lock-step. This does NOT touch the FAT anchor above, so `date`/`fat_stamp`
     // witnesses are byte-identical to JD17.
     set_anchor(base_secs.saturating_add(UNIX_1980), ticks, ClockSource::Manual);
@@ -224,7 +224,7 @@ pub fn now() -> Option<WallTime> {
 
 /// Where the current Unix anchor came from. `Unset` is first-class (no anchor yet — the honest state
 /// the `time` verb prints as `unsynced`). `Sntp{stratum}` is a network sync (pi/genet PI-NET-16);
-/// `Manual` is an operator seed (the `setdate` verb also plants one, so `time` reflects it).
+/// `Manual` is an operator seed (the `date -s` form also plants one, so `time` reflects it).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClockSource {
     Unset,
@@ -325,7 +325,7 @@ pub fn unix_now() -> Option<u64> {
 /// The video compositor's furniture strips (`video/strip.rs`) compose at the tail of every present
 /// and take every lock with `try_lock`, declining rather than spinning, so a contended pass repaints
 /// on the next one. A clock read on that path must obey the same rule: `unix_now`'s `UNIX_ANCHOR.lock`
-/// would spin against a concurrent `set_anchor` (an SNTP sync or a `setdate`), and a spin inside a
+/// would spin against a concurrent `set_anchor` (an SNTP sync or a `date -s`), and a spin inside a
 /// composite is exactly what that subsystem forbids.
 ///
 /// Returns `None` for BOTH "never anchored" and "the anchor lock was momentarily contended", which
@@ -446,13 +446,13 @@ fn wall_from_unix_clamped(unix: u64) -> WallTime {
 /// The two packed FAT on-disk words `(time @0x16, date @0x18)` for "now".
 ///
 /// CLOCK-3 — the UNIFIED clock is the single source of truth. When a civil (Unix) anchor exists — an
-/// SNTP sync (pi/genet PI-NET-16) or a `setdate` Manual seed — the FAT stamp is DERIVED from it
+/// SNTP sync (pi/genet PI-NET-16) or a `date -s` Manual seed — the FAT stamp is DERIVED from it
 /// (`unix_now()` → `civil_from_unix` → FAT packing, clamped to the FAT span), so a networked board
 /// stamps REAL last-write times with zero operator action. It falls back to the legacy JD17 FAT anchor
 /// (`now()`) only when no Unix anchor is set, and to `(0, 0)` when neither is — byte-identical to the
 /// pre-JD17 zeroed field, which the `ls -l` renderer already shows as the dashed placeholder. (Because
-/// `setdate` plants BOTH anchors in the same breath from the same monotonic tick, the derivation
-/// round-trips: `setdate D` → `fat_stamp()` yields `D`.)
+/// `date -s` plants BOTH anchors in the same breath from the same monotonic tick, the derivation
+/// round-trips: `date -s D` → `fat_stamp()` yields `D`.)
 pub fn fat_stamp() -> (u16, u16) {
     if let Some(unix) = unix_now() {
         return fat_pack(&wall_from_unix_clamped(unix));

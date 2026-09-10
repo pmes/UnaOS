@@ -1663,7 +1663,7 @@ cpu-0-only `APIC_TICKS.fetch_add`, and issues the EOI, **before** calling
 1. **The pump and the render task must be on different cores.** `XHCI_CONTROLLER`
    is a raw `spin::Mutex`, not the sleeping one, and both take it (the render side
    through `fat` block reads, `pal::pump_and_poll` inside a full-screen app, and
-   `usbinfo`). Kernel tasks are preempted like any other, so two preemptible takers
+   `lsusb`). Kernel tasks are preempted like any other, so two preemptible takers
    of a raw spinlock on one core hard-deadlock it: the spinner cannot yield, so the
    holder it displaced is never redispatched. The handoff therefore **requires two
    distinct dispatching APs** and declines (staying on the inline loop, with a
@@ -1752,7 +1752,7 @@ The `rast` knob keeps the inline loop (its demo drives the BSP's local `screen`)
 ### Per-core busy-TIME accounting + the always-on load witness (x86_64, SCHEDLOAD-X86)
 
 Until this arc, **no serial line on any x86 boot reported per-core load.** The only
-feed was `CPU_BUSY`/`CPU_IDLE`, and reaching it needed an operator: the `sched`/`ps`
+feed was `CPU_BUSY`/`CPU_IDLE`, and reaching it needed an operator: the `ps`
 shell verb, or `PULSE.ELF` through `SYS_CPUPULSE(49)`. Every unattended capture in
 the archive is therefore silent about which cores were working — which is the reason
 this is the *first* arc of the SMP balancing campaign rather than a later one. A

@@ -8,6 +8,8 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
+#   ./arroyo state         One line: branch@HEAD, behind-trunk, ahead-of-trunk, owed-above-origin, dirty
+#                          (read-only; the four drifts a seat must never have to volunteer)
 #   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
 #                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
 #                          + the ring-3 user-* crates
@@ -343,7 +345,7 @@ _feats=""
 # INTERNAL slot, which makes that reader the ONLY program source on the machine — and with the knob
 # off there is no handle for it, so the default x86 image cannot reach its own boot volume. GR26
 # Boot D is the conviction: `[sdhc] … CARD IDENTIFIED`, three ADMA/PIO windows matched, MBR p0
-# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /fat/VUG.ELF`
+# type=0x0b verified — and then `handles=global=absent sdhc=unbuilt` at every consumer, `bg /apps/VUG.ELF`
 # with nothing to open. Default-on costs a third handle and no global-slot change.
 # REVIEW CORRECTION (GR26): "READ-ONLY at the FAT layer, unconditionally" above is GR20's property and
 # SDHC-4c SUPERSEDED it — `write_sector`/`write_sectors` now admit a span inside the reserved extent
@@ -538,9 +540,9 @@ _feats=""
 # builder/src/main.rs.
 [ -n "${UNAOS_INSTALLDEMO:-}" ] && _feats="${_feats}installdemo,"
 # SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17, Peter's ruling). The mature
-# smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/netinfo + the socket syscalls + the
+# smoltcp TCP/IP stack (ROADMAP §1b) carries the shell's ping/arp/ifconfig + the socket syscalls + the
 # boot witnesses; the hand-rolled `net` crate is RETIRED as the default (kept in tree, live, resumable
-# — it still backs connect/fetch/udpsend, the TCP echo listener, and driver DHCP). UNAOS_NOSMOLNET=1
+# — it still backs nc/curl, the TCP echo listener, and driver DHCP). UNAOS_NOSMOLNET=1
 # OPTS OUT => `smolnet` not pushed => the hand-rolled stack is the whole net path, byte-identical to
 # the pre-flip default. Mirrors the PORTSW-1/EHCI-4 default-ON/negative-knob policy. x86-only optional
 # dep + x86-gated module; the aarch64 kernel compiles STRIP it via `arm_features` (below) so aarch64
@@ -781,14 +783,22 @@ _feats=""
 # ORIN-BSPTICK (Candidate B arc 1): UNAOS_BSPTICK=1 arms the PERIODIC EL1 generic-timer tick on the
 # Orin boot core — timer.rs `el1_bsptick_start`, called from `tegra_early_stop`'s terminus line right
 # after the IRQEL-RT one-shot proof self-disarms. The boot core keeps a standing 250 Hz CNTP tick at
-# EL1 with IRQs unmasked across `run_capstone_boot_core`; dispatch is `on_tick` only (SCHED_ACTIVE
-# stays false, `timer_preempt` is baremetal-gated), so the terminus stays cooperative — this is the
-# clock, not the preemption (that is ORIN-BSPRUN, the next mapping). Standalone feature (does NOT
+# EL1 with IRQs unmasked across `run_capstone_boot_core`. ⚠ THE NEXT CLAUSE IS SCOPED TO A
+# BSPTICK-WITHOUT-BSPRUN BUILD, which since ORIN-TICKDEFAULT is the `UNAOS_NOBSPRUN=1` opt-out and
+# no longer the default: there dispatch is `on_tick` only (SCHED_ACTIVE stays false, no post-EOI
+# `timer_preempt` arm in the v3 dispatch) and the terminus stays cooperative — this feature is the
+# clock, not the preemption (that is ORIN-BSPRUN, the next mapping). The wire says which of the two
+# it got without anyone having to remember: `el1_bsptick_start`'s banner is `cfg!(feature =
+# "bsprun")`-split (timer.rs:713) and names the dispatch regime the image actually carries.
+# Standalone feature (does NOT
 # imply tegra, mirroring smpmark), but every site is tegra-gated, so arm it WITH tegra:
 # `UNAOS_TEGRA=1 UNAOS_BSPTICK=1 ./arroyo check`, or `UNAOS_BSPTICK=1 ./arroyo esp-jetson` (esp-jetson
-# forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson OBJCOPY'D
-# LOADABLE IMAGE is byte-identical to baseline (measured on `llvm-objcopy -O binary kernel.elf`, the
-# orindesk precedent). The ARMED build is type-checked by the `arm-tegra-bsptick` leg of
+# forces tegra). ⚠ NO LONGER DEFAULT OFF — as of ORIN-TICKDEFAULT (below) every tegra build arms this
+# feature unless `UNAOS_NOBSPTICK=1` opts out; this explicit knob is kept for back-compat and is
+# byte-identical to the new default. The knob-off byte-identity claim that used to live on this line
+# (`llvm-objcopy -O binary kernel.elf` vs baseline, the orindesk precedent) has MOVED to the opt-out:
+# it is `UNAOS_NOBSPTICK=1` that now reproduces the pre-flip image, not the absence of this knob.
+# The ARMED build is type-checked by the `arm-tegra-bsptick` leg of
 # KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `[orinbsptick]` — tick 1, then every
 # 250th tick, count + re-measured CurrentEL + cpu.
 [ -n "${UNAOS_BSPTICK:-}" ] && _feats="${_feats}bsptick,"
@@ -804,12 +814,53 @@ _feats=""
 # compile_error! in sched.rs rather than building silently inert. Standalone feature (does NOT
 # imply tegra, mirroring bsptick), but every site is tegra-gated, so arm it WITH tegra:
 # `UNAOS_TEGRA=1 UNAOS_BSPRUN=1 ./arroyo check`, or `UNAOS_BSPRUN=1 ./arroyo esp-jetson`
-# (esp-jetson forces tegra). Default OFF; when unset every site vanishes and the knob-off jetson
-# OBJCOPY'D LOADABLE IMAGE is byte-identical to baseline (measured, the bsptick/orindesk
-# precedent). The ARMED build is type-checked by the `arm-tegra-bsprun` leg of KERNEL_CFG_MATRIX,
+# (esp-jetson forces tegra). ⚠ NO LONGER DEFAULT OFF — see ORIN-TICKDEFAULT immediately below; the
+# opt-outs are `UNAOS_NOBSPRUN=1` (tick, cooperative terminus) and `UNAOS_NOBSPTICK=1` (neither, the
+# pre-flip image). This explicit knob is kept for back-compat and is byte-identical to the new
+# default. The ARMED build is type-checked by the `arm-tegra-bsprun` leg of KERNEL_CFG_MATRIX,
 # not by this mapping. Witness on the wire: `[orinbsprun]` — the terminus banner (then the load
 # train itself, whose emission IS the arc's payload).
 [ -n "${UNAOS_BSPRUN:-}" ] && { _feats="${_feats}bsprun,"; case ",${_feats}" in *",bsptick,"*) ;; *) _feats="${_feats}bsptick,";; esac; }
+# ORIN-TICKDEFAULT (orin 19, TICKDEFAULT — Peter's "OK" of 2026-09-07 to the decision-list question
+# "shall a stock Jetson build get a tick and preemption?"): `bsptick` + `bsprun` are DEFAULT-ON for
+# tegra builds. Until this flip a default Jetson image took exactly ONE EL1 interrupt in its whole
+# life (the IRQEL-RT one-shot at `timer.rs:486`, which self-disarms at `:532`), ran the entire
+# terminus with CNTP_CTL.ENABLE=0 — the JM6 drop zeroes it at `boot_tegra.rs:158` and `main.rs:2689`
+# marks the timer not-live — and reached the COOPERATIVE `run_capstone_boot_core(0)`. Nothing
+# periodic could be scheduled, nothing could sleep and wake, nothing involuntarily yielded, and
+# `arch::ticks()` was frozen from the drop onward. (Only the TICK-DERIVED clock froze: `arch::ms()`
+# reads CNTVCT and `clock::monotonic()` reads CNTPCT, and ENABLE=0 stops the comparator, not the
+# counter — so those kept running throughout and still do.)
+#
+# THIS IS NOT NEW CAPABILITY; IT IS MAKING FLOWN CAPABILITY THE DEFAULT. Both knobs have already
+# flown PASS on metal, individually: `bsptick` at tick1 (orin 16, `arm=1 tmax=33000 el2=0
+# exceptions=0 -> PASS`) and both together at render8 (orin 17, `orinbsprun_join=1 -> HOSTING`,
+# `el0_first_run=1` ACCEPTED) — orin-ledger A21, and A6's 2026-09-07 correction. The flip changes
+# WHICH POLARITY IS DEFAULT; it does not change one byte of `.rs`, so the source the metal compiled
+# is the source that ships.
+#
+# THE TWO WAYS BACK, because the old behaviour is the byte-identity baseline and must stay reachable:
+#   UNAOS_NOBSPRUN=1   -> `bsptick` only: the standing 250 Hz EL1 tick with the COOPERATIVE terminus.
+#                         This is exactly the tick1-flown configuration (orin 16) and is the useful
+#                         middle rung if a flight has to bisect tick vs preemption.
+#   UNAOS_NOBSPTICK=1  -> NEITHER feature: the pre-flip tickless image, byte-identical to baseline.
+#                         DOMINANT, and it has to be — `bsprun` without `bsptick` is a flag with no
+#                         clock and trips the `compile_error!` at `sched.rs:10465`, so dropping the
+#                         tick must drop the preemption with it. That is the exact inverse of the
+#                         UNAOS_BSPRUN mapping above, which arms both.
+# Negative-knob spelling per UNAOS_NOTEGRASMP / UNAOS_NOSDHCBLK; the SHAPE of this whole block is the
+# ORIN-SMP-DEFAULT precedent (arroyo:1051-1052 + esp_jetson) verbatim — a default-on line keyed on
+# UNAOS_TEGRA here, an idempotent force block in `esp_jetson` for the media path, and the explicit
+# positive knobs left in place. BOTH POLARITIES STAY TYPE-CHECKED WITHOUT A MATRIX EDIT: the armed
+# default's feature closure IS `arm-tegra-bsprun` (`arm-tegra`'s list verbatim + `bsptick,bsprun`),
+# and `arm-tegra` itself remains the disarmed polarity that `UNAOS_NOBSPTICK=1` still builds.
+# ⚠ TEGRA-ONLY, and that is structural, not a promise: the Pi compiles from `kernel8()`'s CURATED
+# $K8_FEATS, which never draws from `$_feats` (see the TOOLFIX/BANNER note at the `KERNEL_FEATURES`
+# choke point), and `arch/aarch64/boot.rs` has no `cntp_ctl` write at all; the QEMU-virt legs
+# (`arm`, `test-arm`) never set UNAOS_TEGRA. ⚠ QEMU models no Tegra234, so the armed default is
+# type-checked and reasoned here and PROVEN only by an attended bench flight.
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOBSPTICK:-}" ] && _feats="${_feats}bsptick,tegra,"
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOBSPTICK:-}" ] && [ -z "${UNAOS_NOBSPRUN:-}" ] && _feats="${_feats}bsprun,"
 # ORIN-WM1 (ORINDESK): UNAOS_ORINDESK=1 arms the Jetson Orin's FIRST real compositor window —
 # `arch/aarch64/display_tegra.rs::orin_wm1`, called from `tegra_early_stop`'s step-3c heap line. It
 # calls `wm::reserve_stage` (the Orin's missing half: this board seeds `video::WRITER` by hand and never
@@ -999,6 +1050,47 @@ _feats=""
 # the module + spawn block vanish, and the jetson media is byte-identical to baseline. QEMU models no
 # Tegra234, so the round-trip witness is metal-owed (attended bench). See arch_arm64.md §JETSON-EL0.
 [ -n "${UNAOS_TEGRA_EL0:-}" ] && _feats="${_feats}tegra_el0,tegra,"
+# JV1 (orin 17): UNAOS_VIRT_EL0=1 arms the EL0 regime on the QEMU `virt` target — the THIRD board term
+# behind the `aarch64_el0` capability, after `baremetal` (Pi 4) and `tegra_el0` (Orin), and the first one
+# QEMU can actually run. It reuses `arch/aarch64/mmu_tegra_el0.rs` UNCHANGED as the slot backend: that
+# module never touches `mmu_tegra`'s `L1_EL1` static, it latches the LIVE `TTBR0_EL1` in `install()`, so
+# it hangs its user window off whatever EL1 root the boot path installed — and `boot_virt::drop_to_el1`
+# installs one of exactly the shape `mmu_tegra` builds. Its single Tegra coupling (`carveout_overlaps`)
+# is cfg-split; on virt there is no SNOC firewall to ask about.
+#
+# Implies `aarch64_el0` ONLY — NOT `tegra` and NOT `pi`, so it drags in neither board UART and the virt
+# PL011 stays the console (`pi` + `tegra` is a hard `compile_error!`, `arch/aarch64/serial.rs:23`).
+# It needs `UNAOS_GICV3=1` alongside it to reach the JC3 EL2 -> EL1 drop the EL0 regime sits on:
+#   UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm 60
+# Default OFF => `mmu_tegra_el0` is not compiled, `uslots` has no virt arm, the `virt_el0_start_maybe`
+# call emits zero instructions, and every existing image (Pi, Orin, plain virt, x86) is byte-identical.
+# The ARMED polarity is type-checked by the `arm-virt-el0` leg of KERNEL_CFG_MATRIX, not by this mapping.
+# Witnesses on the wire: `:: VIRT-EL0: el0-hello spawned at EL0`, `:: VIRT-EL0: el0-hello round-trip ->`,
+# and `[el0]`/`SYS_WRITE` traffic from the demo itself.
+[ -n "${UNAOS_VIRT_EL0:-}" ] && _feats="${_feats}virt_el0,"
+# VIRTPREEMPT (orin 17): UNAOS_VIRT_TICK=1 arms EL1 TIMER PREEMPTION on the QEMU `virt` target — the
+# half JV1 named and deferred ("EL1 timer preemption on virt needs an EL1-non-banking `__vec_irq` and is
+# a SEPARATE arc"). Four gated pieces, none of which adds a source line to any knob-off path:
+#   * `exceptions.rs` — the `irq_bank!`/`irq_unbank!` gates widen so `virt_tick` selects the RUNTIME
+#     `CurrentEL` arm instead of the fixed `_EL2` one. THIS is the measured blocker: knob-off, a virt
+#     build's IRQ stub does `mrs x0, ELR_EL2`, which is UNDEFINED at EL1 and traps into __vec_sync.
+#   * `timer.rs` — `virt_tick_start()`, a 250 Hz periodic CNTP re-arm AT EL1 after the JC3 drop. The
+#     drop's own `msr cntp_ctl_el0, xzr` is kept; `boot_virt.rs` is not touched by this arc.
+#   * `gic.rs` — the post-EOI `timer_preempt` arm in `handle_irq_v3` (was `all(tegra,bsprun)`).
+#   * `sched.rs` — `SCHED_ACTIVE` + the three-task preemption proof, staged INSIDE the existing
+#     cooperative `run_capstone_boot_core` terminus, so CAPSTONE and the JV1 EL0 round-trip are kept
+#     (ORIN-BSPRUN swaps the terminus and gives both up; that trade is wrong for a QEMU gate).
+# Appends its own name ONLY — the `virt_tick = ["virt_el0"]` implication lives in Cargo.toml, so the
+# banner cannot double-print `virt_el0` when both knobs are set (the BANNER-DEDUP class below).
+# Needs `UNAOS_GICV3=1` alongside it, for the same reason UNAOS_VIRT_EL0 does — the whole regime sits on
+# the JC3 EL2 -> EL1 drop, which only the GICv3 path reaches:
+#   UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VIRT_TICK=1 ./arroyo test-arm 60
+# Default OFF => the compile-time `irq_bank!` arms are the pre-arc ones, no tick is armed, SCHED_ACTIVE
+# stays false, the dispatch has no preempt arm, and every existing image (Pi, Orin, plain virt, x86) is
+# byte-identical. The ARMED polarity is type-checked by the `arm-virt-tick` leg of KERNEL_CFG_MATRIX.
+# Witnesses on the wire: `:: [virttick] arming PERIODIC CNTP at EL1`, `:: [virttick] tick N taken at EL1`,
+# `:: [virttick] PREEMPTION PASS`. See arch_arm64.md §VIRTPREEMPT.
+[ -n "${UNAOS_VIRT_TICK:-}" ] && _feats="${_feats}virt_tick,"
 # ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries_tegra
 # + the fdt_tegra `/cpus` presence enumerator) is DEFAULT-ON for tegra builds — metal-proven across
 # SMP-1..8 (entry shape, concurrency, position, image layout, idle/busy heartbeats, count-based
@@ -1160,7 +1252,7 @@ _feats=""
 #
 # THE DEMONSTRATION FLIGHT is the §6.1 conjunction PLUS this knob:
 #     UNAOS_ORINTENANT=1 UNAOS_ORINCONWIN=1 UNAOS_ORINDESK=1 UNAOS_ORINCLICK=1 ./arroyo esp-jetson
-# then `run /fat/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
+# then `run /apps/vug.elf` at the shell — the census flips IDLE-NO-TENANTS -> TENANT-LIVE and the
 # create line names the window. `orintenant` alone is also sound (stage reserved, witnesses live,
 # tenants composited beside the raw console) but carries no dock and no click routing; the census
 # prints `desktop_firmware=`/knob fields so a capture names which image shape it ran on.
@@ -1624,12 +1716,12 @@ fi
 # type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by this mapping.
 [ -n "${UNAOS_SDMMCWRITE:-}" ] && _feats="${_feats}sdmmcwrite,sdmmc,"
 # ROOTFS (orin 16, ledger A28): UNAOS_SDMMCROOT=1 gives the VFS a ROOT the Orin actually has. On the
-# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/fat` to BlockSource::Default —
+# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/boot` to BlockSource::Default —
 # neither exists on this machine (the card carries only the FAT32 ESP; nothing registers a Default
 # block device on an Orin boot), so `ls /` and quarry both answered `/: backend error: unafs-mount`.
 # Armed, the table instead binds `/` to the card's FAT volume read through BlockSource::TegraSd (the
-# census-published CMD17 path, metal-proven by A23) and re-points `/fat` at that same volume — `/fat`
-# is `shell::EXEC_ROOT` and the literal prefix of `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF`
+# census-published CMD17 path, metal-proven by A23) and re-points `/boot` at that same volume — `/boot`
+# is `shell::EXEC_ROOT` and the literal prefix of `/apps/VUG.ELF`, `/apps/STAT.ELF`, `/apps/ELFHELLO.ELF`
 # and quarry's launch route, so it is what makes the desktop able to run anything, not decoration.
 # READ-ONLY twice over and NOT by this
 # knob's say-so: BlockSource::TegraSd::write_veto vetoes the source and block::write_block_tegra_sd
@@ -1684,6 +1776,7 @@ fi
 # in this block: several knobs append an implied feature alongside their own, unguarded —
 #   UNAOS_TEGRA      -> `tegra,`
 #   UNAOS_TEGRA_EL0  -> `tegra_el0,tegra,`
+#   (UNAOS_VIRT_EL0  -> `virt_el0,` — appends its own name ONLY, so it is not a member of this class)
 #   UNAOS_TEGRASMP   -> `tegrasmp,tegra,`   (and the NOTEGRASMP default-on line appends the same pair)
 #   UNAOS_NETTEST    -> `nettest,genet,`    (duplicates `genet` if UNAOS_GENET=1 is also set)
 # — so any two of them naming the same implied feature print it twice. It is a CLASS, not a tegra
@@ -2253,7 +2346,7 @@ build_kernel_aarch64() {
     # Build the blob FRESH here, unconditionally, for exactly those feature sets (kernel8 and the
     # armed esp-jetson already do their own unconditional build; this closes esp-arm/arm/test-arm).
     case ",${_af#--features }," in
-        *,baremetal,*|*,tegra_el0,*)
+        *,baremetal,*|*,tegra_el0,*|*,virt_el0,*|*,virt_tick,*)  # VIRTPREEMPT (orin 17): the virt terms added. JV1 made `virt_el0` a THIRD feature set that compiles syscall.rs's `include_bytes!`, but this case still listed only two — so `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm` baked whatever blob a prior `check`/`kernel8` had left, which is exactly the "image whose contents cannot be derived from its stated inputs" BLOBATOMIC exists to forbid (and in a fresh worktree with no blob at all it simply fails to compile). `virt_tick` is listed separately because arroyo appends knob NAMES and lets Cargo resolve the `virt_tick = ["virt_el0"]` implication, so the `--features` string for UNAOS_VIRT_TICK=1 alone does not contain `virt_el0`.
             local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
             ( cd "$WORKSPACE_DIR" && build_user_blob )
             cd "$WORKSPACE_DIR/crates/kernel"
@@ -3820,6 +3913,40 @@ KERNEL_CFG_MATRIX=(
   # `x86_cfg_universe` already dropped it and still does. Board legs +0; gate legs +0 — this widens
   # an existing row rather than adding one. `./arroyo check` prints the live counts every run.
   "arm-desk-noel0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,desktop_firmware,livecon,wcg-paygo,quarry,orinvpar"
+  # JV1 (orin 17) — THE EL0 REGIME ON `virt`, AND THE LEG THE `aarch64_el0` COMMENTS ASKED FOR BY NAME.
+  # Eleven `#[cfg]`s across five files carry the note "No gate leg builds that combination, which is the
+  # trap — a byte-identity check over the legs would PASS while the hazard shipped", about a build with
+  # `aarch64_el0` on and neither `baremetal` nor `tegra_el0`. This row IS that combination, so the
+  # negated-predicate family finally has a leg that would go red if a future edit widened one of the
+  # positive sites and forgot its negative twin (or the reverse: both arms live => duplicate definition).
+  #
+  # WHAT MAKES IT NON-VACUOUS, MEASURED rather than inferred (the EXECGATE precedent). Before the
+  # `virt_el0` term existed, this exact feature set with `aarch64_el0` in place of `virt_el0` exits 101
+  # on 329 errors — every one of them the `uslots` facade resolving to nothing, since the facade has an
+  # arm per BOARD and a bare capability selects none. It is the only aarch64 leg with an EL0 layer and
+  # NEITHER `pi` NOR `tegra`, so it fails independently of both board families.
+  #
+  # PRECONDITION: compiles `arch/aarch64/syscall.rs`, which `include_bytes!`s `target/user_blob.bin`.
+  # `ensure_user_blob` (see check_both) supplies it ahead of the matrix.
+  #
+  # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
+  # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
+  "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0"
+  # VIRTPREEMPT (orin 17) — THE PREEMPTIVE TWIN OF THE LEG ABOVE, and not redundant with it. `virt_tick`
+  # is the ONLY configuration in the tree where the `exceptions.rs` `irq_bank!`/`irq_unbank!` runtime
+  # `CurrentEL` arm is selected WITHOUT `tegra`, so it is the only leg that type-checks that arm against a
+  # virt (PL011, no GIC-600, no carveouts) build; it is likewise the only aarch64 leg that compiles the
+  # `gic.rs` post-EOI `timer_preempt` arm without `bsprun`, and the only one that compiles sched.rs's
+  # VIRTPREEMPT tail block and timer.rs's `virt_tick_start` at all. `virt_tick` implies `virt_el0`, so the
+  # leg above remains the NON-preemptive polarity of the same file set — both are needed or one of the two
+  # states ships unchecked.
+  #
+  # PRECONDITION, inherited from the leg above: compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  #
+  # UNIVERSE SIDE EFFECT: `virt_tick` is named by this arm-* leg and by no x86 leg, so
+  # `x86_cfg_universe` drops it exactly as it drops `virt_el0`/`tegra_el0`. Board legs +1.
+  "arm-virt-tick ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_tick"
 
 
   # FBCONPAR CROSS (appended 2026-08-26) — the same two knobs on the FULL `pidesk` conjunction.
@@ -4060,7 +4187,7 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
   # ROOTFS armed (appended 2026-09-06, orin 16) — `sdmmcroot` gates the VFS root bind at the tail of
   # `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_root_bind` + `root_probe` + the verdict cache), the same-line
-  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/fat` mount line
+  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/boot` mount line
   # in `shell::vfs_mount_table`, and the early-probe statement appended to the `sdmmc_census` call line
   # in `main.rs`. The file-tail `impl FatBackend::new_tegra_sd` in `fs/vfs.rs` is
   # gated `all(aarch64, tegra, sdmmc)` — every `arm-tegra*` leg already compiles THAT — but the CALLER
@@ -4664,7 +4791,7 @@ pack_source_along() {
 # WINX-7 PKG — WHY THIS SPLIT NOW. An attended rMBP boot reported
 #   `:: WINX-2: STAT.ELF absent from the boot volume — end-to-end witness skipped ::`
 # with STAT.ELF verifiably on the booted card: the firmware booted the SD-card ESP while xHCI
-# enumerated a USB stick, so the shell's `bg /fat/STAT.ELF` searched the stick for a file the build
+# enumerated a USB stick, so the shell's `bg /apps/STAT.ELF` searched the stick for a file the build
 # had put on the card. The old one-line instruction ("copy the contents to a FAT32 USB root") was
 # correct for a ONE-STICK boot and silently wrong for a two-device one; naming the two volumes is
 # the fix. On a single stick, write BOTH trees to that one root and everything behaves as before.
@@ -4694,7 +4821,7 @@ esp_x86() {
     echo -e "     DATA volume  <- target/x86_64_data/   (the kernel's FAT mount = the USB stick on storage_slot)"
     echo -e "   ONE stick:  write BOTH trees to that stick's FAT32 root — they do not collide."
     echo -e "   TWO devices (e.g. SD-card ESP + USB stick): esp tree -> the bootable device,"
-    echo -e "               data tree -> the USB stick, or \`bg /fat/VUG.ELF\` reports -ENOENT."
+    echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
 }
@@ -4883,19 +5010,26 @@ esp_arm() {
 stage_jetson_el0_images() {
     local staged=0
     echo -e "${COLOR_CYAN}⚡ Staging EL0 programs onto the Jetson boot volume...${COLOR_RESET}"
+    # LAYOUT (orin 18): into `APPS/`, the one place the loader looks (`fat::APPS_DIR` /
+    # `shell::EXEC_ROOT` = `/apps`). The ESP's own boot files (EFI/, the kernel) stay in the root
+    # where the firmware reads them.
+    local APPS_DIR_ARM="${ESP_DIR_ARM}/APPS"
+    mkdir -p "$APPS_DIR_ARM"
     # The five static-ELF64 images `build_user_el0_elf_images` just produced. Each already passed its
     # ELF-magic + 16 KiB slot-window assertions there; re-assert PRESENCE here, because the failure this
     # guards against is a staging step that silently copied nothing.
     for img in ELFHELLO.ELF VUG.ELF VUGK.ELF STAT.ELF PULSE.ELF; do
         local src="${WORKSPACE_DIR}/target/${img}"
         [ -s "$src" ] || { echo -e "${COLOR_RED}ERROR: ${img} missing/empty — cannot stage the jetson boot volume${COLOR_RESET}"; exit 1; }
-        cp "$src" "${ESP_DIR_ARM}/${img}"
+        cp "$src" "${APPS_DIR_ARM}/${img}"
         staged=$((staged + 1))
     done
     # HELLO.BIN: only when `tegra_el0` armed `build_user_blob` above (see the block header).
     if [ -s "${WORKSPACE_DIR}/target/user_blob.bin" ]; then
         case ",${_feats}" in
             *",tegra_el0,"*)
+                # LAYOUT: the ROOT, not APPS/ — EL0 opens this blob by name through `sys_open`,
+                # whose namespace is the flat 8.3 volume root (see the kernel8 block's note).
                 cp "${WORKSPACE_DIR}/target/user_blob.bin" "${ESP_DIR_ARM}/HELLO.BIN"
                 staged=$((staged + 1))
                 ;;
@@ -4903,11 +5037,17 @@ stage_jetson_el0_images() {
     fi
     # THE VALIDITY CHECK (this track's rule): an instrument that is not in the image proves nothing. Print
     # what actually landed, with sizes, so the build's own output is the evidence — not a claim about it.
-    echo -e "${COLOR_GREEN}✅ EL0 programs on the boot volume (${staged}):${COLOR_RESET}"
+    # It reads `APPS/` and NOT the root: a listing of the root would have kept printing the old,
+    # stale copies of these names if the move had silently failed to happen.
+    echo -e "${COLOR_GREEN}✅ EL0 programs in APPS/ on the boot volume (${staged}):${COLOR_RESET}"
     local f
-    for f in "${ESP_DIR_ARM}"/*.ELF "${ESP_DIR_ARM}"/*.BIN; do
+    for f in "${APPS_DIR_ARM}"/*.ELF; do
         [ -f "$f" ] || continue
-        printf '     %-14s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
+        printf '     APPS/%-14s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
+    done
+    for f in "${ESP_DIR_ARM}"/*.BIN; do
+        [ -f "$f" ] || continue
+        printf '     %-19s %8s B\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"
     done
     # PULSE.ELF's honest note, printed where the operator will read it. ABIFREEZE divergence D2:
     # SYS_CPUPULSE (49) is dispatched ONLY by the x86 kernel; the aarch64 dispatcher has no arm for it and
@@ -4936,6 +5076,26 @@ esp_jetson() {
             *",tegrasmp,"*) ;;
             *) _feats="${_feats}tegrasmp,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
         esac
+    fi
+    # ORIN-TICKDEFAULT: the standing EL1 tick + the preemptive terminus are default-on for the jetson
+    # IMAGE, not only for `UNAOS_TEGRA=1 ./arroyo check` — this is the block that reaches bench media,
+    # since `esp-jetson` forces `tegra` in the feature list without ever setting the UNAOS_TEGRA env
+    # var the knob-mapping line keys on. Opt out with UNAOS_NOBSPRUN=1 (tick only, cooperative
+    # terminus — the tick1-flown rung) or UNAOS_NOBSPTICK=1 (neither, the pre-flip byte-identity
+    # baseline). ORDER IS LOAD-BEARING: `bsprun` requires `bsptick` (`compile_error!` at
+    # sched.rs:10465), so the tick arms first and the preempt arm is nested inside its opt-out.
+    # Idempotent, the tegrasmp shape. See ORIN-TICKDEFAULT in the knob mapping for the full argument.
+    if [ -z "${UNAOS_NOBSPTICK:-}" ]; then
+        case ",${_feats}" in
+            *",bsptick,"*) ;;
+            *) _feats="${_feats}bsptick,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+        esac
+        if [ -z "${UNAOS_NOBSPRUN:-}" ]; then
+            case ",${_feats}" in
+                *",bsprun,"*) ;;
+                *) _feats="${_feats}bsprun,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+            esac
+        fi
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
@@ -5240,7 +5400,7 @@ build_one_vug_aarch64() {
 # the only channel a pin can travel down — hence three link products rather than one flag. All three names
 # are 8.3-clean and land in the FAT root beside STAT.ELF/PULSE.ELF, so each gets its own IMAGE_SHA256
 # principal and both reach paths work on them unchanged: Quarry's double-click (`.ELF` is launchable — see
-# video/quarry/live.rs) and `bg /fat/VUGX.ELF` at the shell.
+# video/quarry/live.rs) and `bg /apps/VUGX.ELF` at the shell.
 #
 # The aarch64 names carry no `-ARM` suffix (the x86 ones carry `-X86`) because the aarch64 build IS the
 # staged name: the x86 side stages target/VUG*-X86.ELF *as* VUG*.ELF via builder/make-fat-img, while kernel8
@@ -6262,7 +6422,7 @@ kernel8() {
     fi
     # FATFIX M2: UNAOS_FATPERF=1 adds the `fatperf` feature — the COST INSTRUMENT for the VFS listing
     # and file-read paths. One line per operation, raw words only:
-    #   [fatperf] op=list path=/fat sectors=222 us=13456
+    #   [fatperf] op=list path=/boot sectors=222 us=13456
     # `sectors` is counted at fat.rs's two read funnels (so a chunked multi-block transfer counts the
     # sectors it moved); `us` brackets the whole VFS operation including FatBackend's per-call
     # `mount_source` volume probe — the term quarry.md §11.1 convicted as the per-CALL cost. It is a
@@ -6308,10 +6468,28 @@ kernel8() {
     cp "$FW_CACHE/overlays/miniuart-bt.dtbo" "$KERNEL8_DIR/overlays/"
     echo -e "${COLOR_GREEN}✅ Boot files: ${KERNEL8_DIR} (firmware raspberrypi/firmware ${FW_TAG})${COLOR_RESET}"
 
+    # LAYOUT (orin 18): THE LAUNCHABLE PROGRAMS GO IN `APPS/`, NOT THE VOLUME ROOT. `fat::APPS_DIR`
+    # is the on-medium spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; the loader
+    # (`load_program_into_slot` -> `FatFs::find_app`) looks there first, and `run`/`bg`/quarry reach
+    # them through the `/apps` mount. 8.3 by construction — this FAT driver's create path writes
+    # short names only. make-pi-img.sh installs the staging dir RECURSIVELY (`mcopy -s` on Linux,
+    # `ditto` on macOS), so the directory rides along with no change there.
+    #
+    # WHAT STAYS IN THE ROOT, AND THE SECOND GROUP IS THE INTERESTING ONE:
+    #   * kernel8.img, config.txt, the Pi firmware + overlays/ — the firmware reads those by fixed
+    #     path, and SCRATCH.BIN / GROW.BIN, which the EL0 demos WRITE (data, not code).
+    #   * THE FLAT EL0 FIXTURE BLOBS — HELLO.BIN, K2OWN.BIN, K2IMP.BIN, MIDDEN.BIN. These are
+    #     spawned by the kernel AND opened BY EL0, by name, through `sys_open`, whose namespace is a
+    #     flat 8.3 volume root with no directory component at all. Staging them under APPS/ was
+    #     measured on kernel8-test: the kernel loaded them fine and every EL0 `SYS_OPEN` of
+    #     HELLO.BIN answered -ENOENT, taking U6b and the whole U7 chain behind it. Moving them needs
+    #     a syscall-ABI change, not a layout change, so they stay where EL0 can name them.
+    mkdir -p "$KERNEL8_DIR/APPS"
+
     # M6g: carry the EL0 user blob onto the boot media as HELLO.BIN, next to kernel8.img in the FAT32
-    # root (make-pi-img.sh ditto's the whole staging dir). On metal the kernel's M6g loader reads this
-    # very file back off the microSD it booted from; in QEMU it rides the same image attached via if=sd.
-    # Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
+    # root (see the note above: EL0 opens this one by name). On metal the kernel's M6g loader reads
+    # this very file back off the microSD it booted from; in QEMU it rides the same image attached
+    # via if=sd. Mirror of the x86 carry (make-fat-img.sh's HELLO_BIN block).
     cp "${WORKSPACE_DIR}/target/user_blob.bin" "$KERNEL8_DIR/HELLO.BIN"
 
     # K2: carry the two additional EL0 programs onto the boot media (make-pi-img.sh ditto's the whole
@@ -6330,39 +6508,39 @@ kernel8() {
     # ditto's the whole staging dir). The kernel's ELF1 witness reads it back off the SD, validates + maps
     # its two PT_LOAD segments, and runs it at EL0. Distinct 8.3 name => its own IMAGE_SHA256 principal via
     # the sole mint path. NEVER collides with the flat fixtures (HELLO/K2*/MIDDEN/SCRATCH/GROW .BIN).
-    cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/ELFHELLO.ELF"
+    cp "${WORKSPACE_DIR}/target/ELFHELLO.ELF" "$KERNEL8_DIR/APPS/ELFHELLO.ELF"
 
     # UVUG-1: carry the mini-vug static ELF64 onto the boot media as VUG.ELF (make-pi-img.sh ditto's the
     # whole staging dir). The kernel's UVUG witness reads it back off the SD through the VFS and runs it via
-    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /fat/VUG.ELF`
+    # the EXEC-1 `run_user_image` path (2 PT_LOAD segments, per-segment W^X); the panel `run /apps/VUG.ELF`
     # runs the same bytes live. Distinct 8.3 name => its own IMAGE_SHA256 principal; never collides with the
     # flat fixtures or ELFHELLO.ELF.
     #
     # VUGSTAGE (PARITY §6.6b): the two PINNED siblings ride along — VUGC.ELF (pinlo, the classic wireframe
     # baseline) and VUGX.ELF (pinhi, the full per-pixel shard). x86 media has carried all three since
     # VUGSCENE; this closes the last of that gap on the Pi. They are launched exactly like VUG.ELF —
-    # `bg /fat/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
+    # `bg /apps/VUGX.ELF` at the shell, or a double-click in Quarry's list, both of which take any `.ELF` on
     # the volume — so no kernel change is needed for them to be reachable, only these bytes on the FAT.
     # Cost against the 64 MiB image is the three sizes printed by build_user_vug_aarch64 above (~10 KiB
     # each): under 0.05% of the volume, and the UVUG witness still reads VUG.ELF, unchanged.
-    cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/VUG.ELF"
-    cp "${WORKSPACE_DIR}/target/VUGC.ELF" "$KERNEL8_DIR/VUGC.ELF"
-    cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/VUGX.ELF"
-    echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
+    cp "${WORKSPACE_DIR}/target/VUG.ELF" "$KERNEL8_DIR/APPS/VUG.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGC.ELF" "$KERNEL8_DIR/APPS/VUGC.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGX.ELF" "$KERNEL8_DIR/APPS/VUGX.ELF"
+    echo -e "${COLOR_GREEN}✅ vug images staged: VUG.ELF ($(wc -c < "$KERNEL8_DIR/APPS/VUG.ELF" | tr -d ' ') B, adaptive) + VUGC.ELF ($(wc -c < "$KERNEL8_DIR/APPS/VUGC.ELF" | tr -d ' ') B, pinlo) + VUGX.ELF ($(wc -c < "$KERNEL8_DIR/APPS/VUGX.ELF" | tr -d ' ') B, pinhi)${COLOR_RESET}"
 
-    # KVUG: the kernel-vug image beside it — `run /fat/VUGK.ELF` / `bg /fat/VUGK.ELF` on the panel. Its own
+    # KVUG: the kernel-vug image beside it — `run /apps/VUGK.ELF` / `bg /apps/VUGK.ELF` on the panel. Its own
     # 8.3 name, so its own IMAGE_SHA256 principal; never collides with VUG.ELF or the flat fixtures.
-    cp "${WORKSPACE_DIR}/target/VUGK.ELF" "$KERNEL8_DIR/VUGK.ELF"
+    cp "${WORKSPACE_DIR}/target/VUGK.ELF" "$KERNEL8_DIR/APPS/VUGK.ELF"
 
     # BGRUN-2: carry the persistence static ELF64 onto the boot media as STAT.ELF (make-pi-img.sh ditto's
     # the whole staging dir). The BGRUN-ST persistence leg reads it back off the SD through the VFS and
-    # spawns it detached; the operator drives the same bytes with `bg /fat/STAT.ELF`. Distinct 8.3 name =>
+    # spawns it detached; the operator drives the same bytes with `bg /apps/STAT.ELF`. Distinct 8.3 name =>
     # its own IMAGE_SHA256 principal; never collides with the flat fixtures, ELFHELLO.ELF or VUG.ELF.
-    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/STAT.ELF"
+    cp "${WORKSPACE_DIR}/target/STAT.ELF" "$KERNEL8_DIR/APPS/STAT.ELF"
 
     # PULSE-1: carry the cpu-pulse static ELF64 onto the boot media as PULSE.ELF, same reasoning as STAT
-    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /fat/PULSE.ELF`.
-    cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/PULSE.ELF"
+    # above — a distinct 8.3 name, its own IMAGE_SHA256 principal, driven by `bg /apps/PULSE.ELF`.
+    cp "${WORKSPACE_DIR}/target/PULSE.ELF" "$KERNEL8_DIR/APPS/PULSE.ELF"
 
     # U9: plant a DEDICATED writable scratch file (NEVER HELLO.BIN — other fixtures load that as EL0 code).
     # 1 KiB (> 512 so fat::probe_once never cats it) of a known 0xEE filler; the u9 File-write demo opens it
@@ -6836,7 +7014,7 @@ show_expectations_x86() {
     echo -e "    6. Tablet: mouse cursor tracks"
     echo ""
     echo -e "  ${COLOR_CYAN}IN THE SHELL (type in the QEMU window):${COLOR_RESET}"
-    echo -e "    diskinfo            show vendor/product, block size, capacity"
+    echo -e "    fdisk -l            show vendor/product, block size, capacity"
     echo -e "    read <lba>          read a sector and hexdump it"
     echo -e "    write <lba> <byte>  fill a sector with a byte (mutates usb.img)"
     echo ""
@@ -6943,7 +7121,7 @@ battery() {
     # already caught by the generic FAIL scan; these steps require the positive `ok` witness present.
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
-    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /fat/STAT.ELF` / `bg /fat/VUG.ELF` read off a
+    # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /apps/STAT.ELF` / `bg /apps/VUG.ELF` read off a
     # REAL attached FAT volume, through the ELF loader, into a compositor window. Same cheap re-grep
     # shape as the usb-write witnesses above (no extra QEMU run): the FAT-attached boot already
     # happened in the `test-fat` step, these two just require its POSITIVE verdicts to be present.
@@ -7008,6 +7186,39 @@ case "${1:-}" in
     test-arm|test-aarch64)
         test_aarch64 "${2:-20}"
         ;;
+    state)
+        # STATE (orin 23, 2026-09-09; pi 9 + rmbp 17): the four numbers a seat must never have to volunteer.
+        # Each measures a DIFFERENT silent failure: BEHIND trunk cost a false published measurement
+        # (rmbp-ledger B107: a 17-commit-stale shared ledger); AHEAD of trunk is an unlanded arc's price and
+        # was invisible for rounds because nobody said it aloud; OWED above origin/<branch> is the only one
+        # that answers "does Peter have a push waiting". A status line that prints two of the four just
+        # moves which drift is silent. Read-only; fetches first so the numbers are about NOW.
+        _br="$(git -C "$WORKSPACE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+        _head="$(git -C "$WORKSPACE_DIR" rev-parse --short HEAD 2>/dev/null)"
+        git -C "$WORKSPACE_DIR" fetch -q origin 2>/dev/null || echo "  (fetch failed — numbers below are as of the last fetch)"
+        # TRUNK is named on the line, not assumed silently: CLAUDE.md's ruling (2026-08-18) makes `main`
+        # the trunk but says to VERIFY while the UnaOS-gemini fast-forward is outstanding — the one drift an
+        # anti-drift verb cannot report is measuring against the wrong ref (rmbp 17's review). If the
+        # retired staging ref is AHEAD of origin/main, that is said aloud rather than silently measured past.
+        _trunk="origin/main"
+        _behind="$(git -C "$WORKSPACE_DIR" rev-list --count "HEAD..$_trunk" 2>/dev/null || echo '?')"
+        _ahead="$(git -C "$WORKSPACE_DIR" rev-list --count "$_trunk..HEAD" 2>/dev/null || echo '?')"
+        _gem_ahead=""
+        if git -C "$WORKSPACE_DIR" rev-parse --verify -q origin/UnaOS-gemini >/dev/null 2>&1; then
+            _g="$(git -C "$WORKSPACE_DIR" rev-list --count "$_trunk..origin/UnaOS-gemini" 2>/dev/null || echo 0)"
+            [ "$_g" != "0" ] && _gem_ahead="  ⚠ origin/UnaOS-gemini is ${_g} ahead of ${_trunk} — verify which ref is trunk (CLAUDE.md)"
+        fi
+        if git -C "$WORKSPACE_DIR" rev-parse --verify -q "origin/$_br" >/dev/null 2>&1; then
+            _owed="$(git -C "$WORKSPACE_DIR" rev-list --count "origin/$_br..HEAD" 2>/dev/null || echo '?')"
+        else
+            # A branch with no origin counterpart still has a MAGNITUDE (rmbp 17): say how much is new.
+            _owed="NEW(${_ahead} above ${_trunk}, no origin/$_br)"
+        fi
+        # awk, not `grep -c`: on a CLEAN tree grep's count is 0 and its exit is 1, which under errexit
+        # ended the verb silently before the line printed (found on the verb's second run, orin 23).
+        _dirty="$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null | awk '!index($0,"__pycache__"){n++} END{print n+0}')"
+        echo "state: ${_br}@${_head}  trunk=${_trunk}  behind-trunk=${_behind}  ahead-of-trunk=${_ahead}  owed-above-origin/${_br}=${_owed}  dirty=${_dirty}${_gem_ahead}"
+        ;;
     check)
         check_both
         ;;
@@ -7070,7 +7281,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
         exit 1
         ;;
 esac

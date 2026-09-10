@@ -1,0 +1,104 @@
+1,2c1,2
+< ÿá[ INFO]: crates/bootloader/src/main.rs@448: UnaOS UEFI Bootloader Started
+< [ INFO]: crates/bootloader/src/main.rs@483: CON cur=240x56 wide=240x56 n=6
+---
+> ÿá[2J[001;001H[=3h[2J[009D[2J[004D[005;018H/-------------------------------------------\[006;018H|                                           |[007;018H|-------------------------------------------|[008;018H|                                           |[009;018H|                                           |[010;018H|                                           |[011;018H|                                           |[012;018H|                                           |[013;018H|                                           |[014;018H|                                           |[015;018H|                                           |[016;018H|-------------------------------------------|[017;018H|                                           |[018;018H|                                           |[019;018H|                                           |[020;018H\-------------------------------------------/[006;027HPlease select boot device:[008;019HUEFI SanDisk SS32G A4BCF119 SD Device[009;019HUEFI USB Device[010;019HUEFI HTTPv4 (MAC:4CBB472549C8)[011;019HUEFI PXEv6 (MAC:4CBB472549C8)[012;019HUEFI PXEv4 (MAC:4CBB472549C8)[013;019HUEFI HTTPv6 (MAC:4CBB472549C8)[014;019HEnter Setup[015;019HUEFI Shell[017;028H^ and v to move selection[018;027HENTER to select boot device[019;035HESC to exit[008;019HUEFI SanDisk SS32G A4BCF119 SD Device[037DUEFI SanDisk SS32G A4BCF119 SD Device[009;019HUEFI USB Device[2J[001;001H[ INFO]: crates/bootloader/src/main.rs@448: UnaOS UEFI Bootloader Started
+> [ INFO]: crates/bootloader/src/main.rs@483: CON cur=80x25 wide=240x56 n=6
+19,22c19,21
+< [ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUA
+< RD)
+< oÿoätM mvIonlsutmael lsPerroitaolc=o0lxIdnet0e0r1faa1c3e :â €2”7 ADBeFf0a5u5l-tB-1wBr8i-t4eC 2s6u-b8s0t4i8t-u7t4i8oFn3 7gBuAaAr2dD FA R0ME
+< D ::
+---
+> [ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUARD)
+> tÿ ävMomlIunmset aslelrPiraolt=o0cxodleI0n0t1ear1f3a câe€:”  2D7eAfBaFu0l5t5--wBr1iBt8e- 4sCu2b6s-t8i0t4u8t-i7o4n8 Fg3u7aBrAdA 2ADRFM E0D 
+> ::
+24c23
+< :: tegra: dark-window guard â€” 89 byte(s) dropped pre-map ::
+---
+> tegra: dark-window guard â€” 89 byte(s) dropped pre-map ::
+26c25
+< :: tegra: mmu regs â€” SCTLR 0x30c5183d->0x30c5183d TCR=0x80823519 MAIR=0x4404ff TTBR0=0x25b0b0000 RAM-GiB-mask=0x3fc ::
+---
+> :: tegra: mmu regs â€” SCTLR 0x30c5183d->0x30c5183d TCR=0x80823519 MAIR=0x4404ff TTBR0=0x25acc0000 RAM-GiB-mask=0x3fc ::
+34c33
+< :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25afbb800) ::
+---
+> :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25abcb800) ::
+244c243
+< :: tegra: HEAP-GUARD â€” kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic â€” NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 153 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+---
+> :: tegra: HEAP-GUARD â€” kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic â€” NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 165 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+372c371
+< :: tegra: [net4w] FIX â€” arming stage-1 IDENTITY translate for PCIe stream 0x9 across 2 instance(s) (table @0x25ae7a000) ::
+---
+> :: tegra: [net4w] FIX â€” arming stage-1 IDENTITY translate for PCIe stream 0x9 across 2 instance(s) (table @0x25aa8a000) ::
+730,731c729,730
+< :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25afbc58c) ::
+< :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25afbb800) ::
+---
+> :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25abcc58c) ::
+> :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25abcb800) ::
+734c733
+< :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25afbb800) ::
+---
+> :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25abcb800) ::
+737,739c736,738
+< :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25afbc58c) ::
+< :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25afbc58c) ::
+< :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25afbb800) ::
+---
+> :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25abcc58c) ::
+> :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25abcc58c) ::
+> :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25abcb800) ::
+742c741
+< :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25afbb800) ::
+---
+> :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25abcb800) ::
+745,747c744,746
+< :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25afbc58c) ::
+< :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25afbc58c) ::
+< :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25afbb800) ::
+---
+> :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25abcc58c) ::
+> :: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25abcc58c) ::
+> :: AARCH64 exception vectors installed (VBAR_EL2 = 0x25abcb800) ::
+758c757
+< :: tegra: JM6b pre-drop â€” HCR_EL2=0xN MMFR1.VH=1 TTBR0_EL1=0x25b0b1000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x25b0a8003 ::
+---
+> :: tegra: JM6b pre-drop â€” HCR_EL2=0xN MMFR1.VH=1 TTBR0_EL1=0x25acc1000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x25acb8003 ::
+760c759
+< :: AARCH64 exception vectors installed (VBAR_EL1 = 0x25afbb800) ::
+---
+> :: AARCH64 exception vectors installed (VBAR_EL1 = 0x25abcb800) ::
+762c761
+< :: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0xN (I=1) | JM6 EL2 latch: HCR_EL2=0xN IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880869cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+---
+> :: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0xN (I=1) | JM6 EL2 latch: HCR_EL2=0xN IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880796cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+764c763
+< :: [irqel2a] armed cpu=0 CurrentEL=1 DAIF=0xN (I=1) | JM6 EL2 latch: HCR_EL2=0xN IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x1 ENABLE=1 IMASK=0 ISTATUS=0 CVAL-CNTPCT=124997cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+---
+> :: [irqel2a] armed cpu=0 CurrentEL=1 DAIF=0xN (I=1) | JM6 EL2 latch: HCR_EL2=0xN IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x1 ENABLE=1 IMASK=0 ISTATUS=0 CVAL-CNTPCT=124998cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+812c811
+< [quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,183) volumes=1 tree-rows=8 list-rows=30 cwd=/
+---
+> [quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,183) volumes=1 tree-rows=9 list-rows=26 cwd=/
+814c813
+< [quarry] open census cwd=/ entries=30 dirs=7 files=23 truncated=false names: .Spotlight-V100/ .Trashes/ APPS/ B43/ EFI/ apps/ boot/ BLOCK.TXT(197) CARD-LAYOUT.txt(742) HELLO.BIN*(51) IMAGE.SHA(295) MANIFEST(2256) ...
+---
+> [quarry] open census cwd=/ entries=26 dirs=8 files=18 truncated=false names: .Spotlight-V100/ .Trashes/ APPS/ B43/ EFI/ apps/ boot/ volumes/ BLOCK.TXT(197) CARD-LAYOUT.txt(742) HELLO.BIN*(51) IMAGE.SHA(295) ...
+855c854,860
+< [menubar] live passes=N paints=2 rate=N scan=N paint=N px/paint=N press=crystal crystal=16x22 clob=0 toggles=1 off_passes=N
+---
+> :: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+> :: PRTSCR: SCREEN6.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows â€” a boot cut before it leaves the entry short of that) ::
+> :: PRTSCR: slice n=1 bytes=0/6913793 ::
+> :: PRTSCR: slice n=2 bytes=32768/6913793 ::
+> :: PRTSCR: slice n=3 bytes=131072/6913793 ::
+> :: PRTSCR: slice n=4 bytes=229376/6913793 ::
+> :: PRTSCR: slice n=5 bytes=327680/6913793 ::
+856a862,864
+> :: PRTSCR: slice n=6 bytes=393216/6913793 ::
+> :: PRTSCR: slice n=7 bytes=491520/6913793 ::
+> :: PRTSCR: slice n=8 bytes=589824/6913793 ::
+== friend-diff judge: diff exit=1 (0 = EMPTY) ==

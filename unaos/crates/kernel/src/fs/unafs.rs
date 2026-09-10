@@ -1274,7 +1274,7 @@ pub fn native_acl_list() -> Vec<NativeAclRow> {
 // cannot read ANY snapshot of it. Snapshots preserve bytes, never authority.
 //
 // ONE evaluator at this layer ([`read_authz`]): every snapshot-read surface
-// (`usnapcat`, `usnapls`, [`snapshot_read`]) defers to it, keyed on the LIVE
+// (`snap cat`, `snap ls`, [`snapshot_read`]) defers to it, keyed on the LIVE
 // inode identity. HONESTY NOTE (lens A fold, 2026-07-16): this enforces the
 // same SEMANTICS as the live syscall path — current-ACL, CAP_READ-equivalent
 // grant rights (ONE decoder, [`rights_from_native`] below, which the syscall

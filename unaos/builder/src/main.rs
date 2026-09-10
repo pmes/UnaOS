@@ -462,7 +462,7 @@ fn main() {
     // VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
     if std::env::var("UNAOS_VIDEOCAP").is_ok() { feats.push("videocap"); }
     // SMOLNET-DEFAULT: smoltcp is the DEFAULT x86 net stack (2026-07-17). Push `smolnet` (shell
-    // ping/arp/netinfo + socket syscalls + boot witnesses) UNLESS opted out with UNAOS_NOSMOLNET=1,
+    // ping/arp/ifconfig + socket syscalls + boot witnesses) UNLESS opted out with UNAOS_NOSMOLNET=1,
     // which drops the feature => the hand-rolled `net` crate is the whole net path, byte-identical to
     // the pre-flip default (PORTSW-1/EHCI-4 default-ON/negative-knob policy). x86-only optional dep +
     // module. (The builder rebuilds the kernel, so this MUST mirror arroyo's mapping.)
@@ -524,6 +524,16 @@ fn main() {
     let _ = std::fs::remove_dir_all(&esp_dir);
     let boot_dir = esp_dir.join("EFI/BOOT");
     std::fs::create_dir_all(&boot_dir).unwrap();
+    // LAYOUT (orin 18): THE LAUNCHABLE PROGRAMS GO IN `APPS/`. `fat::APPS_DIR` is the on-medium
+    // spelling and `shell::EXEC_ROOT` (`/apps`) is the namespace one; WINX-2, WINX-8, PULSE-W and
+    // the desktop app launcher read through `FatFs::find_app`, which looks there.
+    //
+    // Two groups stay in the ROOT. The firmware's own files — EFI/BOOT/BOOTX64.EFI and kernel.elf —
+    // because UEFI reads those by fixed path. And HELLO.BIN, because the U2 program is ALSO opened
+    // by EL0, by name, through `sys_open`, whose namespace is a flat 8.3 volume root with no
+    // directory component at all — a syscall-ABI fact, not a layout preference.
+    let esp_apps = esp_dir.join("APPS");
+    std::fs::create_dir_all(&esp_apps).unwrap();
     
     std::fs::copy(&bootloader_bin, boot_dir.join("BOOTX64.EFI")).unwrap();
     std::fs::copy(&kernel_bin, esp_dir.join("kernel.elf")).unwrap();
@@ -544,7 +554,7 @@ fn main() {
     let hello_bin = target_dir.join("hello.bin");
     if hello_bin.exists() {
         std::fs::copy(&hello_bin, esp_dir.join("HELLO.BIN")).unwrap();
-        println!("   U2: copied HELLO.BIN onto the ESP");
+        println!("   U2: copied HELLO.BIN onto the ESP root (EL0 opens it by name; see APPS/ note)");
     } else {
         println!("   U2: target/hello.bin absent — ESP has no HELLO.BIN (run via ./arroyo esp-x86)");
     }
@@ -552,22 +562,22 @@ fn main() {
     // WINX-5: the x86 EL0 persistence program (crates/user-stat, built by arroyo's build_user_stat_x86
     // to target/STAT-X86.ELF). Copy it onto the ESP as STAT.ELF so the metal boot media carries it, the
     // same way HELLO.BIN reaches the volume just above; the x86 shell's `run`/`bg` read the FAT boot
-    // partition's root, so `bg /fat/STAT.ELF` finds it there. The name is un-suffixed ON the volume
+    // partition's root, so `bg /apps/STAT.ELF` finds it there. The name is un-suffixed ON the volume
     // (STAT.ELF, not STAT-X86.ELF) because the operator command should read the same on both arches —
     // the arch suffix exists only in target/, where both arches' images share one directory.
     // Absent when the program wasn't built (a bare `cargo run` in builder/) — then `run`/`bg` simply
     // report -ENOENT, harmless.
     let stat_elf = target_dir.join("STAT-X86.ELF");
     if stat_elf.exists() {
-        std::fs::copy(&stat_elf, esp_dir.join("STAT.ELF")).unwrap();
-        println!("   WINX: copied STAT.ELF onto the ESP (bg /fat/STAT.ELF)");
+        std::fs::copy(&stat_elf, esp_apps.join("STAT.ELF")).unwrap();
+        println!("   WINX: copied STAT.ELF into APPS/ on the ESP (bg /apps/STAT.ELF)");
     } else {
         println!("   WINX: target/STAT-X86.ELF absent — ESP has no STAT.ELF (run via ./arroyo esp-x86)");
     }
 
     // WINX-7: the x86 EL0 mini-vug (crates/user-vug, built by arroyo's build_user_vug_x86 to
     // target/VUG-X86.ELF), staged as VUG.ELF exactly like STAT.ELF above and for the same reasons —
-    // un-suffixed on the volume so `bg /fat/VUG.ELF` reads the same on both arches.
+    // un-suffixed on the volume so `bg /apps/VUG.ELF` reads the same on both arches.
     //
     // VUGSCENE: THREE images, not one. `crates/user-vug` is built three times from the same source —
     // adaptive (VUG.ELF), pinned to the classic wireframe (VUGC.ELF) and pinned to the full shard
@@ -585,8 +595,8 @@ fn main() {
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
-            std::fs::copy(&vug_elf, esp_dir.join(dst)).unwrap();
-            println!("   WINX: copied {dst} onto the ESP (bg /fat/{dst})");
+            std::fs::copy(&vug_elf, esp_apps.join(dst)).unwrap();
+            println!("   WINX: copied {dst} into APPS/ on the ESP (bg /apps/{dst})");
         } else {
             println!("   WINX: target/{src} absent — ESP has no {dst} (run via ./arroyo esp-x86)");
         }
@@ -594,11 +604,11 @@ fn main() {
 
     // PULSE-1: the x86 EL0 cpu-pulse monitor (crates/user-pulse, built by arroyo's build_user_pulse_x86 to
     // target/PULSE-X86.ELF), staged as PULSE.ELF exactly like STAT.ELF/VUG.ELF above and for the same
-    // reasons — un-suffixed on the volume so `bg /fat/PULSE.ELF` reads the same on both arches.
+    // reasons — un-suffixed on the volume so `bg /apps/PULSE.ELF` reads the same on both arches.
     let pulse_elf = target_dir.join("PULSE-X86.ELF");
     if pulse_elf.exists() {
-        std::fs::copy(&pulse_elf, esp_dir.join("PULSE.ELF")).unwrap();
-        println!("   PULSE: copied PULSE.ELF onto the ESP (bg /fat/PULSE.ELF)");
+        std::fs::copy(&pulse_elf, esp_apps.join("PULSE.ELF")).unwrap();
+        println!("   PULSE: copied PULSE.ELF into APPS/ on the ESP (bg /apps/PULSE.ELF)");
     } else {
         println!("   PULSE: target/PULSE-X86.ELF absent — ESP has no PULSE.ELF (run via ./arroyo esp-x86)");
     }
@@ -621,7 +631,7 @@ fn main() {
     //     carries no boot-device handle, so the kernel cannot learn what it booted from, let alone
     //     read it.
     //
-    // So `bg /fat/STAT.ELF` searches the USB stick while the build put STAT.ELF on the ESP. When the
+    // So `bg /apps/STAT.ELF` searches the USB stick while the build put STAT.ELF on the ESP. When the
     // operator boots a SINGLE stick that is both, the two coincide and everything works — which is
     // precisely why this went unnoticed: the `esp-x86` procedure assumed one stick, and the bench has
     // two devices. The kernel-side message even calls the mounted volume "the boot partition", which
@@ -639,9 +649,17 @@ fn main() {
     let data_dir = target_dir.join("x86_64_data");
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).unwrap();
+    // LAYOUT (orin 18): the DATA volume gets the same `APPS/` directory the ESP just got — it is
+    // the volume the RUNNING kernel reads, so it is the one whose layout the loader is looking at.
+    let data_apps = data_dir.join("APPS");
+    std::fs::create_dir_all(&data_apps).unwrap();
     let mut staged_data: Vec<&str> = Vec::new();
+    // HELLO.BIN first, and into the volume ROOT — see the ESP note above (EL0 names it directly).
+    if target_dir.join("hello.bin").exists() {
+        std::fs::copy(target_dir.join("hello.bin"), data_dir.join("HELLO.BIN")).unwrap();
+        staged_data.push("HELLO.BIN (root)");
+    }
     for (src, dst) in [
-        (target_dir.join("hello.bin"), "HELLO.BIN"),
         (target_dir.join("STAT-X86.ELF"), "STAT.ELF"),
         (target_dir.join("VUG-X86.ELF"), "VUG.ELF"),
         // VUGSCENE: the two PINNED vug images ride the data volume too — the pin exists for benchmarking,
@@ -649,12 +667,12 @@ fn main() {
         (target_dir.join("VUGC-X86.ELF"), "VUGC.ELF"),
         (target_dir.join("VUGX-X86.ELF"), "VUGX.ELF"),
         // KVUG: the kernel-vug image rides the data volume for the same reason the pins do — `bg
-        // /fat/VUGK.ELF` must reach the volume the kernel actually reads.
+        // /apps/VUGK.ELF` must reach the volume the kernel actually reads.
         (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
     ] {
         if src.exists() {
-            std::fs::copy(&src, data_dir.join(dst)).unwrap();
+            std::fs::copy(&src, data_apps.join(dst)).unwrap();
             staged_data.push(dst);
         }
     }
@@ -710,7 +728,7 @@ fn main() {
     ).unwrap();
 
     println!(
-        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (+ hello.txt, readme.txt, SCRATCH.BIN, GROW.BIN, S8W.BIN, BLOCK.TXT)",
+        "   WINX-7 PKG: data volume tree target/x86_64_data/ — {} (all but HELLO.BIN under APPS/; + hello.txt, readme.txt, SCRATCH.BIN, GROW.BIN, S8W.BIN, BLOCK.TXT in the root)",
         if staged_data.is_empty() { "no EL0 artifacts built".to_string() } else { staged_data.join(", ") }
     );
 

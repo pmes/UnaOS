@@ -575,7 +575,7 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   **Authority.** Snapshot drop is destructive and follows the BANDY owner-only-destructive ruling:
   `SnapshotEntry::drop_permitted(invoker, kernel_principal)` admits the recorded creator principal
   or the kernel. The library records the creator and exposes the decision; the enforcement point is
-  the ACL/verb layer. The only day-one drop surface is the kernel shell (`usnapdrop`), which runs at
+  the ACL/verb layer. The only day-one drop surface is the kernel shell (`snap drop`), which runs at
   kernel authority — the trivial `invoker == kernel_principal` case — so no new privileged path is
   opened; the creator is recorded (`"kernel"` from the shell) for when a per-principal surface
   arrives. v1 retention cap 16 is a clean policy refusal (`SnapshotCapReached`), not a format bound.
@@ -595,8 +595,8 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
   want high security"): a snapshot read is authorized by the **LIVE object's CURRENT ACL**,
   re-evaluated at read time — NOT by the ACL that was in force when the snapshot was taken.
   Snapshots preserve bytes, never authority. ONE evaluator at the verb layer
-  (`read_authz(fs, live_id, principal)` in `fs/unafs.rs`): EVERY snapshot-read surface (`usnapcat`,
-  `usnapls`, `snapshot_read`, the host mirror) defers to it, keyed on the stable logical inode id of
+  (`read_authz(fs, live_id, principal)` in `fs/unafs.rs`): EVERY snapshot-read surface (`snap cat`,
+  `snap ls`, `snapshot_read`, the host mirror) defers to it, keyed on the stable logical inode id of
   the LIVE object. **Honest scoping (lens A fold, 2026-07-16):** `read_authz` enforces the same
   SEMANTICS as the live syscall path — current-ACL; grant rights honored, not just grant presence (a
   `grants:<p>` row admits a read only if its `rw`/`r`/`w` value carries the READ right, decoded by

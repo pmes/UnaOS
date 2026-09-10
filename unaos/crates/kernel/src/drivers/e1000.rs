@@ -175,7 +175,7 @@ const UDP_LOCAL_PORT_BASE: u16 = 49152;
 const UDP_TX_CAP: usize = 256;
 /// Gateway UDP port the boot self-test sends to (the socket injector serves an echo here).
 const UDP_SELFTEST_PORT: u16 = 9998;
-/// Payload the UDP self-test / `udpsend` (no message) emits.
+/// Payload the UDP self-test / `nc -u` (no message) emits.
 const UDP_PROBE_PAYLOAD: &[u8] = b"unaos-udp";
 
 /// Legacy receive descriptor (16 bytes). Written by hardware via DMA, so every
@@ -1047,7 +1047,7 @@ pub fn raw_tx(frame: &[u8]) {
     }
 }
 
-/// SOCK-1: `(MAC, current IP, link-up)` for the smolnet interface config / `netinfo`. `None` if no NIC.
+/// SOCK-1: `(MAC, current IP, link-up)` for the smolnet interface config / `ifconfig`. `None` if no NIC.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
     NET_DEVICE.lock().as_ref().map(|n| (n.mac, n.our_ip_raw(), n.link_up()))
@@ -1269,7 +1269,7 @@ pub fn fetch(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<(ConnectOutcome, 
     NET_DEVICE.lock().as_mut().map(|nic| nic.fetch(ip, port, payload))
 }
 
-/// Outcome of a blocking [`udp_send`] (rendered by the `udpsend` shell command).
+/// Outcome of a blocking [`udp_send`] (rendered by the `nc -u` shell command).
 #[derive(Clone, Copy)]
 pub struct UdpOutcome {
     /// Whether the destination MAC resolved (an unreachable host fails here).
@@ -1288,7 +1288,7 @@ pub fn udp_send(ip: [u8; 4], port: u16, payload: &[u8]) -> Option<UdpOutcome> {
     NET_DEVICE.lock().as_mut().map(|nic| nic.udp_send(ip, port, payload))
 }
 
-/// Snapshot of the current NIC state, if any (used by the `netinfo` shell command).
+/// Snapshot of the current NIC state, if any (used by the `ifconfig` shell command).
 pub fn info() -> Option<NetInfo> {
     NET_DEVICE.lock().as_ref().map(|n| n.snapshot())
 }

@@ -46,7 +46,7 @@
 //! Every directory read goes through [`crate::shell::vfs_ls_collect`] — the ONE collector VFS-1
 //! (adoption) left behind when it deleted the per-volume ones. Quarry therefore inherits, for free and
 //! by construction: longest-prefix mount resolution, the VFS-4 `-ENODEV` guard for a reserved-but-
-//! unbound volume, the synthesized mount-point rows (`/fat`, `/usb`) below a listed path, and the
+//! unbound volume, the synthesized mount-point rows (`/boot`, `/usb`) below a listed path, and the
 //! `.`/`..` filter. It never names a backend, never calls `fat::mount()`, and never calls
 //! `unafs::with_unafs()`. The volume list on the left is [`MountTable::prefixes`], read from the same
 //! table the collector builds.
@@ -71,11 +71,11 @@
 //!    candidate partition) before a single directory sector is read. On top of that v1's model asked
 //!    for the SAME directory twice on every navigation: [`Model::expand`] collects a row's children
 //!    and [`Model::show`] then collects the identical path again for the list pane. Landing on
-//!    `/fat` therefore cost ~4 mount probes and 2 root-directory walks where 1 of each would do.
+//!    `/boot` therefore cost ~4 mount probes and 2 root-directory walks where 1 of each would do.
 //!    The fix is [`Model::collect_cached`] — see §Cost below.
-//! 2. **"/fat is LISTED TWICE."** Not a rendering bug and not a collector bug: v1 made *every* mount
-//!    prefix a tree ROOT (`mt.prefixes()` = `/`, `/fat`, `/usb`) and then expanded `/`, whose
-//!    listing carries the same mount points as synthesized child rows. `/fat` was a depth-0 root
+//! 2. **"/boot is LISTED TWICE."** Not a rendering bug and not a collector bug: v1 made *every* mount
+//!    prefix a tree ROOT (`mt.prefixes()` = `/`, `/boot`, `/usb`) and then expanded `/`, whose
+//!    listing carries the same mount points as synthesized child rows. `/boot` was a depth-0 root
 //!    AND a depth-1 child of `/`, both naming the same path. [`root_prefixes`] is the fix and it is
 //!    a statement about namespaces rather than about FAT: **a mount point claimed by another mount
 //!    point is not a root — it is reached through its parent.** `/` claims everything, so on this
@@ -88,10 +88,10 @@
 //!    [`DOUBLE_CLICK_MS`] for the honest derivation.
 //! 4. **"where is vug, where is the kernel."** True, and measurable: the native UnaFS root that v1
 //!    opened on holds exactly two files (`K3HELLO.TXT`, `K3PAT.BIN` — see `arroyo`'s staging step),
-//!    while the card a person means when they say "my card" is `/fat`, with `KERNEL8.IMG`,
+//!    while the card a person means when they say "my card" is `/boot`, with `KERNEL8.IMG`,
 //!    `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the firmware on it. v1 was not hiding anything; it
 //!    landed on the emptiest volume in the namespace. [`Model::landing`] fixes that with a rule
-//!    stated on the wire rather than a hardcoded `/fat`.
+//!    stated on the wire rather than a hardcoded `/boot`.
 //!
 //! ## Cost, measured rather than asserted
 //!
@@ -426,7 +426,7 @@ fn collect(_path: &str) -> Result<(bool, Vec<DirEnt>), String> {
 }
 
 /// Every mount prefix, sorted. NOT the tree's roots — see [`root_prefixes`], which is the fix for
-/// the duplicate `/fat`.
+/// the duplicate `/boot`.
 ///
 /// This is the one call that costs a `vfs_mount_table()`, and therefore a USB probe, so the model
 /// makes it exactly once per `reload_roots` and remembers the answer in `Model::mounts`.
@@ -477,12 +477,12 @@ fn prefix_claims(q: &str, p: &str) -> bool {
     p.len() == q.len() || p.as_bytes()[q.len()] == b'/'
 }
 
-/// **The `/fat`-listed-twice fix.** Reduce a mount prefix list to the prefixes that are genuinely
+/// **The `/boot`-listed-twice fix.** Reduce a mount prefix list to the prefixes that are genuinely
 /// ROOTS of the tree — those not claimed by some OTHER prefix in the same list.
 ///
-/// v1 made every prefix a depth-0 row and then expanded `/`, whose listing carries `/fat` and `/usb`
+/// v1 made every prefix a depth-0 row and then expanded `/`, whose listing carries `/boot` and `/usb`
 /// as synthesized mount-point rows (`shell::vfs_ls_collect`'s "mount points immediately below
-/// `path`" arm). So `/fat` was a root AND a child of the root — one path, two rows, which is what
+/// `path`" arm). So `/boot` was a root AND a child of the root — one path, two rows, which is what
 /// the bench saw. Dropping the row would have been the wrong repair: the CHILD row is the correct
 /// one, because it is where the path actually lives in the one namespace and it is what a person
 /// means by "inside my machine". So the ROOT row goes, and the rule that removes it is a statement
@@ -729,7 +729,7 @@ impl Model {
     /// gives the table itself, inherited rather than re-invented.
     ///
     /// The roots are [`root_prefixes`] of the mount list, NOT the mount list — that is the
-    /// duplicate-`/fat` fix, and the reason it lives here rather than in the painter is that the
+    /// duplicate-`/boot` fix, and the reason it lives here rather than in the painter is that the
     /// duplicate was a MODEL fact: two rows existed, both real, both naming one path.
     fn reload_roots(&mut self) {
         let keep = self.tree.get(self.tree_sel).map(|r| r.path.clone());
@@ -794,7 +794,7 @@ impl Model {
     ///
     /// The measurement that motivates it is in `arroyo`'s own staging step: the native UnaFS volume
     /// this machine mounts at `/` is built with exactly two files on it (`K3HELLO.TXT`, `K3PAT.BIN`),
-    /// while `/fat` is the boot card — `KERNEL8.IMG`, `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the
+    /// while `/boot` is the boot card — `KERNEL8.IMG`, `VUG.ELF`, `CONFIG.TXT`, `SRC.TGZ` and the
     /// firmware. v1 opened on `/`, saw two files, and was correctly called dumb. It was not hiding
     /// the kernel's own files from the owner; it had simply landed on the emptiest volume there was.
     ///
@@ -1053,7 +1053,7 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// ⚠ **"ARCH-NEUTRAL" WAS THE WRONG AXIS — THERE ARE THREE STATES, NOT TWO (rmbp-7 QUARRY2).**
 /// `arch::syscall` is not a property of the *arch*; it is a property of the **EL0 layer**. On x86 the
 /// module is unconditional (`arch/x86_64/mod.rs:11`), but `arch/aarch64/mod.rs:47` gates
-/// `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0")` — the rings, the
+/// `pub mod syscall;` behind `any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")` — the rings, the
 /// process table and `bg_poll` all belong to that layer. So an aarch64 build carrying
 /// `desktop_firmware` (this window's own gate) with NEITHER of those two features named a module that
 /// does not exist, and this function failed E0432/E0433 at the `use` and at the `bg_poll` call. No
@@ -1070,7 +1070,7 @@ static JOBS: spin::Mutex<Vec<Job>> = spin::Mutex::new(Vec::new());
 /// with a reason, in the arm below.
 #[cfg(any(
     target_arch = "x86_64",
-    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 ))]
 fn reap_jobs() {
     use crate::arch::syscall::BgPoll;
@@ -1110,7 +1110,7 @@ fn reap_jobs() {
 /// passes) and gating each of them would put the same conjunct in five places to drift out of step.
 #[cfg(not(any(
     target_arch = "x86_64",
-    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0"))
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 )))]
 fn reap_jobs() {}
 
@@ -1138,7 +1138,7 @@ fn reap_jobs() {}
 /// ⚠ **THE DISPATCH IS THREE-WAY, NOT TWO-WAY (rmbp-7 QUARRY2).** This body needs BOTH halves of the
 /// seam — `uslots::USER_REGION_SIZE` for the ceiling and `arch::syscall::spawn_user_image_bg` for the
 /// spawn — and `arch/aarch64/mod.rs` gates both modules behind
-/// `any(feature = "baremetal", feature = "tegra_el0")`, because the user address space and the
+/// `any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")`, because the user address space and the
 /// process table belong to the EL0 layer rather than to the chip. `target_arch = "aarch64"` alone
 /// therefore over-claimed: it named this body for a ringless `desktop_firmware` build that has
 /// neither module, and it failed E0433 at the `CAP` const and again at the spawn call. The conjunct
@@ -1149,7 +1149,7 @@ fn reap_jobs() {}
 /// that HAS an EL0 layer, and a wider one is the E0433 back again.
 #[cfg(all(
     target_arch = "aarch64",
-    any(feature = "baremetal", feature = "tegra_el0")
+    any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
 ))]
 fn launch(path: &str) -> String {
     use crate::fs::vfs::{NodeKind as NK, VfsError};
@@ -1263,14 +1263,14 @@ fn launch(path: &str) -> String {
 /// is also what [`super::super::dock`]'s focus seam does one file over (`ba3e9b62`).
 #[cfg(all(
     target_arch = "aarch64",
-    not(any(feature = "baremetal", feature = "tegra_el0"))
+    not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 ))]
 fn launch(path: &str) -> String {
     serial_println!(
-        "[quarry] launch REFUSED path={} reason=no-el0-layer (this aarch64 build has neither `baremetal` nor `tegra_el0`, so `arch::syscall`/`uslots` are not compiled)",
+        "[quarry] launch REFUSED path={} reason=no-el0-layer (this aarch64 build has none of `baremetal` / `tegra_el0` / `virt_el0`, so `arch::syscall`/`uslots` are not compiled)",
         path
     );
-    String::from("no EL0 layer in this build (needs `baremetal` or `tegra_el0`)")
+    String::from("no EL0 layer in this build (needs `baremetal`, `tegra_el0` or `virt_el0`)")
 }
 
 /// Perform an [`Act`] decided inside the model lock, with that lock RELEASED, then record its
@@ -1644,10 +1644,16 @@ pub fn is_open() -> bool {
 ///
 /// `wm` expresses "minimised" as a POSITION: the row's `z` drops below `SHELL_Z`, it stops
 /// compositing, and the dock is the way back. So [`is_open`] alone is the wrong question for the
-/// KEYBOARD — a parked Quarry that kept first refusal on arrows and `Esc` would be eating keys for a
+/// KEYBOARD — a parked Quarry that kept first refusal on arrows and `<Enter>` would be eating keys for a
 /// window the operator cannot see, which is the same defect in kind as typing into a hidden shell.
 /// The pointer needs no equivalent guard: `wm::hit_test` does not report a row that is not
 /// compositing, so [`press_route`] already declines a parked window by construction.
+///
+/// SO9: this is no longer the WHOLE keyboard gate, it is one conjunct of it. [`key_route`] binds a
+/// key only when Quarry also HOLDS FOCUS; being on the glass is necessary and was never sufficient.
+/// It is still asked, and still load-bearing, because [`close`] does not release focus — `FOCUS_ASID`
+/// can name [`OWNER`] with no row left to route to. The WHEEL keeps this as its only guard, for the
+/// reason [`key_route`]'s header gives.
 fn on_glass() -> bool {
     let id = WIN.load(Ordering::Relaxed);
     id != wm::WIN_NONE && wm::info(id).map(|i| i.z > wm::shell_z()).unwrap_or(false)
@@ -1815,7 +1821,7 @@ pub fn open() {
 /// every refresh. None of them is a verdict; they are measurements, and each one answers a bench
 /// complaint in the terms it was made in.
 ///
-///  * `volumes=` — the mount prefixes and the ROOT rows they reduced to. `/fat listed twice` is
+///  * `volumes=` — the mount prefixes and the ROOT rows they reduced to. `/boot listed twice` is
 ///    convicted or cleared by comparing the two lists, without a photograph.
 ///  * `reads=/hits=/cycles=` — the cost of the listing path. `reads` is seam calls actually made,
 ///    `hits` is the calls the cache answered; on this machine an open used to make four and now
@@ -1829,7 +1835,7 @@ fn census(when: &str) {
     };
     let roots: Vec<&str> = m.tree.iter().filter(|r| r.depth == 0).map(|r| r.path.as_str()).collect();
     serial_println!(
-        "[quarry] {} volumes mounts={:?} roots={:?} tree-rows={} (a mount claimed by another mount is not a root — that is the duplicate-/fat rule)",
+        "[quarry] {} volumes mounts={:?} roots={:?} tree-rows={} (a mount claimed by another mount is not a root — that is the duplicate-/boot rule)",
         when, m.mounts, roots, m.tree.len()
     );
     serial_println!(
@@ -1878,34 +1884,72 @@ pub fn close() {
 
 /// Keyboard. Returns `true` when the key was CONSUMED.
 ///
-/// The contract is `video::instgui`'s, for its reason: while Quarry's window is open it takes first
-/// refusal on the keys it binds, and `Esc` closes it and hands the keyboard straight back. It never
-/// swallows a key it does not bind, so the console keeps working underneath for everything else.
-///
 /// Arrow keys arrive as the C0 codes the HID map assigns (`0x1C..=0x1F`, right/left/down/up) — the
 /// same bytes `una_abi::KEY_RIGHT`..`KEY_UP` publish to ring 3, decoded once in the driver.
+///
+/// ### SO9 — THE GATE IS FOCUS, NOT PRESENCE
+///
+/// This used to say: *"the contract is `video::instgui`'s — while Quarry's window is OPEN it takes
+/// first refusal on the keys it binds, and it never swallows a key it does not bind, so the console
+/// keeps working underneath for everything else."* The second clause is true and practically empty.
+/// `<Enter>` and `<Backspace>` are the two keys a line editor cannot work without, and they are both
+/// bound here — so an open-but-unfocused Quarry did not leave "the console working underneath", it
+/// left a console that could not run a command or erase a character. Measured on the Orin, render8
+/// 2026-09-06: Quarry was on the glass from boot (`desktop_firmware::activate` step 6) and stayed
+/// there for the whole session, so `<Enter>` at the shell opened a FILE for every keystroke of the
+/// flight, while `[wc-fv] focus raise asid=0xffffff01` says focus was on the CONSOLE for long
+/// stretches of it (`docs/dev/LEDGER.md` SO9).
+///
+/// The remedy is the desktop model Peter asked for — **keys go to the FOCUSED window only.** Quarry
+/// binds a key when `wm::focus_asid()` names [`OWNER`], and at no other time; unfocused, every key
+/// falls straight through to the drain that called us. Focus arrives the way it does on a Mac: the
+/// operator CLICKS the window ([`press_route`] raises through `wm::focus_changed(OWNER)`), or Quarry
+/// mints/raises its own window ([`open`]). Focus LEAVES the same way — a click on the console's
+/// content is `arch/aarch64/syscall.rs`'s SHELLWIN-PI arm (`focus_changed(owner)`), a click on the
+/// bare desktop is `focus_changed(0)`.
+///
+/// [`on_glass`] stays in the conjunction and is not redundant: [`close`] does not release focus, so
+/// `FOCUS_ASID` can still name [`OWNER`] after the window is gone.
+///
+/// ### R24 — `<Esc>` NO LONGER CLOSES QUARRY
+///
+/// The `if c == 0x1B { close(); return true; }` arm that stood here is RETRACTED BY RULING, not
+/// fixed: *"esc should not close any app windows"* (Peter, 2026-09-06, `docs/dev/RULINGS.md` R24).
+/// Esc dismisses MENUS ONLY, and it already does — `strip::key_escape` is asked AHEAD of this
+/// function in all three routers (`main.rs:2948`, `main.rs:4578`, `arch/x86_64/syscall.rs:6740`), so
+/// the modal surface still gets it first and a bare Esc with nothing down now falls past Quarry
+/// untouched. The close disc and the dock tile are the ways out of this window.
+///
+/// ### The WHEEL is deliberately NOT focus-gated
+///
+/// [`wheel_route`] resolves the pointer against `wm::hit_test` and scrolls the window UNDER THE
+/// CURSOR, which is the same desktop model this gate is enforcing for the keyboard — scroll-under-
+/// pointer is not focus theft, and the hit test already stops Quarry taking a detent that belongs to
+/// a window above it. Gating it on focus would delete a working gesture no defect asks about. It
+/// keeps the [`on_glass`] guard only, exactly as before.
 pub fn key_route(ev: crate::pal::Event) -> bool {
-    if !on_glass() {
-        return false;
-    }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
     // handed the whole `pal::Event` rather than a keycode and `arch/aarch64/syscall.rs` is a
     // byte-identity-critical file no arc may add a line to (PARITY.md §5.3). The name is a keyboard
     // noun and the event is not one; that trade is stated in [`wheel_route`] and in `quarry.md` §14
     // rather than paid for with an edit to the router. Asked BEFORE the `Event::Key` test for the
     // ordinary reason: the arm below would otherwise decline it and the wheel would fall through to
-    // the focus ring, which has no consumer for it either.
+    // the focus ring, which has no consumer for it either. SO9 keeps it on [`on_glass`] alone — see
+    // this function's header, §"The WHEEL is deliberately NOT focus-gated".
     if let crate::pal::Event::Wheel(d) = ev {
-        return wheel_route(d);
+        return on_glass() && wheel_route(d);
     }
     let crate::pal::Event::Key(c) = ev else {
         return false;
     };
-    // ESC is answered before the model lock: closing must work even if a directory read left the
-    // model in a state the rest of this function would rather not be in.
-    if c == 0x1B {
-        close();
-        return true;
+    // SO9 — the two facts, read once each, in the order that makes the witness readable.
+    let live = is_open();
+    let focused = wm::focus_asid() == OWNER;
+    if !(focused && on_glass()) {
+        if live {
+            key_witness(c, focused, false);
+        }
+        return false;
     }
     let mut acted = true;
     let mut refreshed = false;
@@ -1914,6 +1958,9 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else {
+            // Focused, on the glass, and no model — the close that is mid-flight. Declined, and said
+            // so on the wire: an unwitnessed decline here would read as the SO9 gate firing.
+            key_witness(c, true, false);
             return false;
         };
         match c {
@@ -2016,7 +2063,36 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if acted {
         repaint();
     }
+    key_witness(c, true, acted);
     acted
+}
+
+/// SO9 — the routed-key witness's line budget. A per-EVENT family on the input band, so it is capped
+/// the way every other one in the tree is (`CLOSE_LOG_MAX` in both `syscall.rs` files is the idiom):
+/// enough lines to score a whole bench sitting's worth of gestures, few enough that a stuck key
+/// cannot bury the capture the rest of the flight is read from.
+const KEY_LOG_MAX: usize = 96;
+static KEY_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// SO9 — **one line per key this function was asked about while Quarry's window was live.**
+///
+/// `focus=1 took=0` is a bound key declined for a reason that is not focus (a close mid-flight);
+/// `focus=0 took=0` is the SO9 gate doing its job — the key is on its way to the shell drain;
+/// `focus=1 took=1` is Quarry consuming its own key. A capture that shows `focus=0 took=1` on any
+/// line is this fix regressed, which is the point of printing `took` beside `focus` rather than
+/// inferring one from the other.
+///
+/// Silent when the window is not live: a board with no file manager on the glass owes no line per
+/// keystroke, and the SO9 question is not being asked there.
+fn key_witness(c: u8, focus: bool, took: bool) {
+    if KEY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < KEY_LOG_MAX {
+        serial_println!(
+            "[quarry] key_route key={:#04x} focus={} took={}",
+            c,
+            focus as u8,
+            took as u8
+        );
+    }
 }
 
 /// Pointer press, in PANEL coordinates. Returns `true` when Quarry consumed it.
@@ -2506,7 +2582,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         status: None,
     };
     m.tree.push(TreeRow { path: String::from("/"), name: String::from("/"), depth: 0, expanded: false });
-    m.tree.push(TreeRow { path: String::from("/fat"), name: String::from("fat"), depth: 0, expanded: false });
+    m.tree.push(TreeRow { path: String::from("/boot"), name: String::from("fat"), depth: 0, expanded: false });
     let before = m.tree.len();
     // Splice a synthetic level under row 0 the way `expand` would, then prove `collapse` removes
     // exactly it — the property a hand-rolled index walk gets wrong when a sibling follows.
@@ -2525,15 +2601,15 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     if m.subtree_len(0) != 3 {
         return Err("subtree_len did not stop at the sibling");
     }
-    // The SELECTION follows the rows. Select the later sibling (`/fat`, now at index 4) and prove the
+    // The SELECTION follows the rows. Select the later sibling (`/boot`, now at index 4) and prove the
     // collapse leaves the highlight ON IT rather than dragging it back onto the row that closed — the
     // defect a bare `sel > i` test has, and the reason the arithmetic below has three cases.
     m.tree_sel = 4;
     m.collapse(0);
-    if m.tree.len() != before || m.tree[1].path != "/fat" {
+    if m.tree.len() != before || m.tree[1].path != "/boot" {
         return Err("collapse did not restore the tree exactly");
     }
-    if m.tree_sel != 1 || m.tree[m.tree_sel].path != "/fat" {
+    if m.tree_sel != 1 || m.tree[m.tree_sel].path != "/boot" {
         return Err("collapse moved the selection off the sibling it was on");
     }
     // And a selection INSIDE the subtree has nowhere to go but the row that closed over it. Spliced
@@ -2581,18 +2657,18 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("list press-to-row did not clear the header");
     }
 
-    // ── leg 6: the duplicate-root rule — the `/fat`-listed-twice fix, as a property ───────────────
+    // ── leg 6: the duplicate-root rule — the `/boot`-listed-twice fix, as a property ───────────────
     // `prefix_claims` first, because `root_prefixes` is only as good as the boundary rule under it.
-    if !prefix_claims("/", "/fat") || !prefix_claims("/usb", "/usb/a") || !prefix_claims("/usb", "/usb") {
+    if !prefix_claims("/", "/boot") || !prefix_claims("/usb", "/usb/a") || !prefix_claims("/usb", "/usb") {
         return Err("prefix_claims failed to claim a path its prefix owns");
     }
-    if prefix_claims("/usb", "/usbfoo") || prefix_claims("/fat", "/") || prefix_claims("/fat", "/usb") {
+    if prefix_claims("/usb", "/usbfoo") || prefix_claims("/boot", "/") || prefix_claims("/boot", "/usb") {
         return Err("prefix_claims claimed a path across a name boundary");
     }
     // THE DEFECT, in one assertion: this is exactly the live mount table of a Pi with a stick in it,
     // and v1 turned it into three depth-0 rows, two of which the expanded `/` then repeated.
     let live: Vec<String> =
-        alloc::vec![String::from("/"), String::from("/fat"), String::from("/usb")];
+        alloc::vec![String::from("/"), String::from("/boot"), String::from("/usb")];
     let rooted = root_prefixes(&live);
     if rooted.len() != 1 || rooted[0] != "/" {
         return Err("root_prefixes did not reduce a rooted namespace to its single root");
@@ -2603,14 +2679,14 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         return Err("root_prefixes is not idempotent");
     }
     let shuffled: Vec<String> =
-        alloc::vec![String::from("/usb"), String::from("/"), String::from("/fat")];
+        alloc::vec![String::from("/usb"), String::from("/"), String::from("/boot")];
     if root_prefixes(&shuffled) != rooted {
         return Err("root_prefixes depends on the order of the mount table");
     }
     // …and it must not HIDE a volume on a table with no root mount, which is the failure mode the
     // lazy fix ("just drop everything but `/`") would have had on an arch that has not adopted the
     // VFS root, or on a namespace assembled from peers.
-    let rootless: Vec<String> = alloc::vec![String::from("/fat"), String::from("/usb")];
+    let rootless: Vec<String> = alloc::vec![String::from("/boot"), String::from("/usb")];
     if root_prefixes(&rootless).len() != 2 {
         return Err("root_prefixes hid a volume on a table with no root mount");
     }
@@ -2698,7 +2774,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // Disk-free, exactly as leg 4's tree is: the list is hand-built, so the leg is honest on a
     // machine with no volume at all.
     m.cache.clear();
-    m.cwd = String::from("/fat");
+    m.cwd = String::from("/apps");
     m.list = alloc::vec![
         DirEnt { name: String::from("VUG.ELF"), kind: NodeKind::File, size: 12568, mtime: None },
         DirEnt { name: String::from("CONFIG.TXT"), kind: NodeKind::File, size: 842, mtime: None },
@@ -2725,7 +2801,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     }
     match (content_press(&mut m, px_x, row0_y), clock_live) {
         (Act::Launch(p), true) => {
-            if p != "/fat/VUG.ELF" {
+            if p != "/apps/VUG.ELF" {
                 return Err("the double-click launched the wrong path");
             }
         }
@@ -2749,7 +2825,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     let _ = content_press(&mut m, px_x, row1_y);
     match (content_press(&mut m, px_x, row1_y), clock_live) {
         (Act::NoOpener(p), true) => {
-            if p != "/fat/CONFIG.TXT" {
+            if p != "/apps/CONFIG.TXT" {
                 return Err("the unhandled double-click named the wrong path");
             }
         }
@@ -2891,7 +2967,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     // must still not eat the stamp.
     let _ = wheel_scroll(&mut m, list_x, list_y, -1);
     match (content_press(&mut m, px_x, row0_y), clock_live) {
-        (Act::Launch(p), true) if p == "/fat/VUG.ELF" => {}
+        (Act::Launch(p), true) if p == "/apps/VUG.ELF" => {}
         (Act::None, false) => {} // the zero-clock guard, as everywhere else in this battery
         (_, true) => return Err("a scroll between two presses broke the double-click"),
         (_, false) => return Err("a double-click fired on a zero clock"),
@@ -2929,8 +3005,14 @@ pub fn selftest() {
     }
 }
 
-/// QUARRYDOOR (KEYDOORS F1) — **<Esc> and an arrow reach Quarry through the SHELL DOOR, not through
-/// the seam.**
+/// QUARRYDOOR (KEYDOORS F1, then SO9/R24) — **an arrow reaches a FOCUSED Quarry through the SHELL
+/// DOOR, and `<Enter>`/`<Backspace>` reach the SHELL past an unfocused one.**
+///
+/// F1's original claim was reachability: `key_route` had one caller and it was the EL0 ring door.
+/// SO9 added the second half — reachability without a focus gate is key THEFT — and R24 deleted the
+/// escape hatch that made the theft survivable. Legs 3 and 4 below are those two, and they are the
+/// legs that GO RED on the pre-SO9 tree: leg 3 saw `Event::Unknown` for `<Enter>` (Quarry ate it) and
+/// leg 4 saw the window gone (Esc closed it).
 ///
 /// ### Which seam this drives, and why it is a different claim from [`selftest`]
 ///
@@ -2950,23 +3032,40 @@ pub fn selftest() {
 /// The other two doors F1 fixed are `main.rs` drain loops (`jd2_console_pump`,
 /// `pump_usb_into_gui`) — they are not functions a fixture can call, they only exist inside a running
 /// pump, and the aarch64 QEMU targets emulate no HID to feed one. Those two folds are scoreable only
-/// from a metal capture: `[quarry] closed win=…` following a `KEY 0x1b` in the transcript. This leg
-/// says so on the wire rather than reporting a silent PASS that covered one arch.
+/// from a metal capture, and SO9 gave that capture a better witness than the close line it used to
+/// name: every key `key_route` is asked about while the window is live now prints
+/// `[quarry] key_route key=0x.. focus=<0|1> took=<0|1>` ([`key_witness`]), so a bench seat scores the
+/// aarch64 doors by pairing each `KEY 0x..` echo with its route line — `focus=0 took=0` beside a
+/// shell keystroke is SO9 fixed, and any `took=1` with `focus=0` is SO9 back. This leg says so on the
+/// wire rather than reporting a silent PASS that covered one arch.
 ///
 /// ### Legs
 ///
-/// 1. `open` — Quarry is on the glass (`on_glass()`, i.e. a live row ABOVE `wm::shell_z()`).
+/// 1. `open` — Quarry is on the glass (`on_glass()`, i.e. a live row ABOVE `wm::shell_z()`) AND
+///    holds focus, because [`open`] raises through `wm::focus_changed(OWNER)`.
 ///    A DECLINE is a SKIP, not a FAIL: at 640x480 `open()` refuses by design so the pixel-exact video
 ///    battery is unperturbed, and that refusal is not this fixture's defect.
-/// 2. `arrow` — `wc_route_event(Key(0x1E))` is CONSUMED (`Event::Unknown`) while Quarry is open.
+/// 2. `arrow` — `wc_route_event(Key(0x1E))` is CONSUMED (`Event::Unknown`) while Quarry is FOCUSED.
 ///    Down-arrow, the key that fell through to `handle_key` on every board before F1.
-/// 3. `esc` — `wc_route_event(Key(0x1B))` is consumed AND the window is gone: `is_open()` false and
-///    `wm::info(win)` `None`. `close()` prints `[quarry] closed win=N paints=N` immediately above this
-///    line, which is the close witness a capture is scored on.
-/// 4. `shut` — THE CONTROL, and the leg that makes leg 2 mean something. With Quarry closed,
-///    `key_route(Key(0x1E))` must return FALSE: `on_glass()` is the guard that stops a closed file
+/// 3. `enter_blind` — **SO9, and the leg this fixture exists for now.** Focus is handed to the
+///    console owner (`wm::focus_changed(KERNEL_OWNER_CONSOLE)`, which raises the console's rows and
+///    leaves `SHELL_Z` alone, so Quarry is STILL ON THE GLASS — asserted, not assumed), and then
+///    `wc_route_event(Key(b'\r'))` must come back UNCHANGED. That is a shell `<Enter>` reaching the
+///    drain past an open file manager: the exact gesture that opened a FILE for the whole of the
+///    Orin's render8 flight. Backspace (`0x08`) is asserted in the same breath, because the two
+///    together are what a line editor cannot work without.
+/// 4. `esc_keeps` — **R24.** With focus handed back to Quarry, `wc_route_event(Key(0x1B))` must come
+///    back UNCHANGED and the window must still be there. Esc dismisses menus only; the `close()` arm
+///    that used to sit in `key_route` is retracted by ruling, and this leg is the tripwire against a
+///    reader restoring it (`docs/dev/RULINGS.md` R24).
+/// 5. `shut` — THE CONTROL, and the leg that makes leg 2 mean something. With Quarry closed,
+///    `key_route(Key(0x1E))` must return FALSE: `on_glass()` is the conjunct that stops a closed file
 ///    manager stealing the shell's arrows, and a fixture that only ever tested the open case could not
 ///    tell a working guard from a missing one.
+///
+/// Focus is snapshotted at entry and restored at exit, the discipline `winmenu::selftest` and
+/// `dock`'s fixture already keep: a witness that leaves `FOCUS_ASID` naming a row it invented is a
+/// witness that changes the boot it was measuring.
 #[cfg(feature = "witness")]
 pub fn door_selftest() {
     use core::sync::atomic::AtomicBool;
@@ -2977,42 +3076,61 @@ pub fn door_selftest() {
     #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
     {
         serial_println!(
-            ":: QUARRYDOOR: this arch's shell doors are main.rs drain loops (jd2_console_pump, pump_usb_into_gui) — not callable from a fixture, and no HID is emulated to drive one; score them from a metal capture as `[quarry] closed win=` after a `KEY 0x1b` :: SKIP ::"
+            ":: QUARRYDOOR: this arch's shell doors are main.rs drain loops (jd2_console_pump, pump_usb_into_gui) — not callable from a fixture, and no HID is emulated to drive one; score them from a metal capture by pairing each `KEY 0x..` echo with its `[quarry] key_route key= focus= took=` line (SO9: focus=0 took=0 is a key on its way to the shell; focus=0 took=1 anywhere is SO9 back) :: SKIP ::"
         );
     }
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     {
+        // Snapshot BEFORE the first `open()`, which raises through `focus_changed(OWNER)`.
+        let saved_focus = wm::focus_asid();
         if is_open() {
             close();
         }
         open();
         if !is_open() {
+            wm::focus_changed(saved_focus);
             serial_println!(
                 ":: QUARRYDOOR: quarry declined to open — see the `[quarry] DECLINE reason=` line above (640x480 refuses by design) :: SKIP ::"
             );
             return;
         }
         let win = WIN.load(Ordering::Relaxed);
-        let leg_open = on_glass();
-        // Leg 2 — an ARROW, through the door.
+        let leg_open = on_glass() && wm::focus_asid() == OWNER;
+        // Leg 2 — an ARROW, through the door, while Quarry is FOCUSED.
         let arrow = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1E));
         let leg_arrow = leg_open && matches!(arrow, crate::pal::Event::Unknown);
-        // Leg 3 — <Esc>, through the same door. This is the gesture that had no way home.
+        // Leg 3 (SO9) — focus to the CONSOLE, Quarry still on the glass, and the shell's two
+        // indispensable keys must come back UNCHANGED. `KERNEL_OWNER_CONSOLE` and not the shell slot
+        // `0`: the `asid == 0` arm of `focus_changed` gives `SHELL_Z` a fresh z, which would park
+        // Quarry and let `on_glass()` pass this leg for the wrong reason. `still_glass` is asserted
+        // so the leg can only be green because FOCUS declined the key.
+        wm::focus_changed(wm::KERNEL_OWNER_CONSOLE);
+        let still_glass = on_glass();
+        let enter = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(b'\r'));
+        let bsp = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x08));
+        let leg_blind = still_glass
+            && !matches!(enter, crate::pal::Event::Unknown)
+            && !matches!(bsp, crate::pal::Event::Unknown)
+            && is_open();
+        // Leg 4 (R24) — focus back to Quarry, and <Esc> must NOT close it.
+        wm::focus_changed(OWNER);
         let esc = crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Key(0x1B));
-        let leg_esc = matches!(esc, crate::pal::Event::Unknown)
-            && !is_open()
-            && wm::info(win).is_none();
-        // Leg 4 — the control: a CLOSED Quarry consumes nothing.
+        let leg_esc_keeps = !matches!(esc, crate::pal::Event::Unknown)
+            && is_open()
+            && wm::info(win).is_some();
+        // Leg 5 — the control: a CLOSED Quarry consumes nothing.
+        close();
         let leg_shut = !key_route(crate::pal::Event::Key(0x1E));
         // Restore: if a red leg left the row standing, take it back rather than leaving a file
-        // manager on the operator's desktop.
+        // manager on the operator's desktop — and give the focus owner back whatever held it.
         if wm::info(win).is_some() {
             close();
         }
-        let ok = leg_open && leg_arrow && leg_esc && leg_shut;
+        wm::focus_changed(saved_focus);
+        let ok = leg_open && leg_arrow && leg_blind && leg_esc_keeps && leg_shut;
         serial_println!(
-            ":: QUARRYDOOR: win={} seam=arch::x86_64::syscall::wc_route_event on_glass={} arrow_consumed={} esc_closes={} closed_consumes_nothing={} :: {} ::",
-            win, leg_open, leg_arrow, leg_esc, leg_shut,
+            ":: QUARRYDOOR: win={} seam=arch::x86_64::syscall::wc_route_event focused_on_glass={} arrow_consumed={} unfocused_enter_bsp_pass={} esc_keeps_window={} closed_consumes_nothing={} :: {} ::",
+            win, leg_open, leg_arrow, leg_blind, leg_esc_keeps, leg_shut,
             if ok { "PASS" } else { "FAIL" }
         );
     }

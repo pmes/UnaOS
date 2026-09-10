@@ -219,7 +219,7 @@ fn wxn_cores_report(cores: u32) {
 //     render core that is a stalled panel at best;
 //   * `irqstorage::start_service_once`, which places the PREEMPTIBLE `storage-svc` task — and
 //     `service_one` -> `block::read_block` takes the raw `XHCI_CONTROLLER` spin lock, which the
-//     render/shell task also takes (FAT reads, `pal::pump_and_poll`, `usbinfo`). Two preemptible
+//     render/shell task also takes (FAT reads, `pal::pump_and_poll`, `lsusb`). Two preemptible
 //     takers of a raw spinlock on ONE core is the hard deadlock SCHED-X86's own rule 1 forbids.
 //
 // So placement is stated HERE, once, and asked for by name. Two rules, two functions:

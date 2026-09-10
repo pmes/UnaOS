@@ -858,18 +858,18 @@ pub mod serialrx {
     // Everything from here to the module's closing brace is a TAIL APPEND inside the tail module:
     // knob-off it is `#[cfg]`-erased and no line above it moved, so every `panic::Location` in this
     // file — and the Pi's `kernel8.img`, which compiles `serial.rs` with `tegra` off — is untouched.
-    /// Drain the TCU RX mailbox: take + consume one byte per pass until the word reports empty, and
-    /// push each as the same `Event::Key` the RBR loop pushes. The consume-by-write-back protocol
-    /// and the ONLY register write the knob adds live in `arch::aarch64::hsp_tegra::rx_mbox_take`.
+    /// Drain the TCU RX mailbox: take WHOLE WORDS until it reports empty (RXBURST, A16 / orin 17),
+    /// then push each byte as the same `Event::Key` the RBR loop pushes. The consume-by-write-back
+    /// protocol and the ONLY register write the knob adds live in `arch::aarch64::hsp_tegra`.
     /// Called from `drain` OFF the `SERIAL_PORT` lock (the RBR `while` above has already released
     /// it), which is what makes the `[tcurx] took=` per-byte witness safe to print from in there.
-    /// Bounded by construction: every iteration clears bit 31 or decrements the count, and a FULL
-    /// word with nbytes == 0 is consumed as a flush tag — so the loop cannot spin on a stuck word.
+    /// THE PRINTS MUST STAY OUT HERE, AFTER THE SLOT IS CLEAR: render8 lost 2 of 5 burst bytes
+    /// because the old per-byte take printed ~160 characters — ~14 ms of polled 115200 transmit —
+    /// with bit 31 still asserted, and the SPE had nowhere to post `e` and CR (hsp_tegra §RXBURST).
     #[cfg(feature = "tcurx")]
     fn mbox_drain() {
-        while let Some(b) = crate::arch::hsp_tegra::rx_mbox_take() {
-            deliver(SRC_MBOX, b);
-        }
+        let burst = crate::arch::hsp_tegra::rx_mbox_drain();
+        for i in 0..burst.len() { burst.witness(i); deliver(SRC_MBOX, burst.byte(i)); }
     }
 
     // ═══ RXMERGE (A37, orin 16) — ONE OWNER, ONE ORDERED STREAM ══════════════════════════════════
