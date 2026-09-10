@@ -317,6 +317,34 @@ a track tip, not trunk. It does not change this landing's verdict: rmbp 19's leg
 worktree ON `main` and got the armed posture, and orin's forced fourth run confirmed 281 rows strict
 and clean from a second seat independently.
 
+## What this seat got wrong
+
+**1. Recommended the panel review, then reversed it on a measurement that was available first.**
+`merge-base` == trunk's tip was derivable before the recommendation and was not derived until after.
+Peter's answer was "skip land and report".
+
+**2. The first mutation control tested nothing.** Renaming the SO6 row's id to `SO6X` left the gate
+GREEN — the id extractor is unanchored by design, to admit the sanctioned suffix form, so `SO6X`
+still registers as `SO6`. Deleting the row is the mutation that removes the id. Caught only because
+the gate stayed silent where it HAD to fire. A control that cannot fail is not a control, and this
+lane has now nearly shipped one as evidence in two consecutive rounds.
+
+**3. A `git commit -m` in double quotes let the shell command-substitute a backticked command out of
+the message.** SR13's commit `56034937` says "compare c90b72a451fe… to the trunk ref's sha" where it
+should say "compare `git rev-parse HEAD`" — a sha that has nothing to do with the fix, reading as an
+instruction to compare one specific commit. **LAWS §3 already has the rule — a message carrying code
+goes through `git commit -F` — and this seat cited that rule earlier in the same session while
+breaking it.** The row and this report were written through a quoted heredoc and are intact;
+controls confirm zero 40-hex tokens injected into either. Not amended, so the slip stays legible —
+rmbp 18's precedent at `2a08bbb1`, for a commit message that ran ahead of its diff. **B88 records the
+identical mechanism biting a control fixture; that makes this the second instance in two rounds, and
+the general form is: any shell context that evaluates backticks will eat the command out of prose
+about commands.**
+
+**4. A `python3` edit asserted on a two-occurrence anchor and aborted mid-script.** No write happened
+only because the write came after the assert — luck of ordering, not design. Scope the anchor to the
+line and assert before mutating.
+
 ## Push owed
 
 ONE, batched: `git push origin main hw-rmbp`. At the time of writing `origin/main` is `751cb816` and
