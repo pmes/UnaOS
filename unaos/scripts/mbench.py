@@ -178,8 +178,16 @@ class Directive:
         """For REQUIRE/COUNT: threshold met. Others never gate completion.
 
         COMPLETE deliberately answers True here so it can never be counted into the
-        `got/len(req)` witness tally — the pi4 gate's PASS is 63/63 and adding an
-        end-of-run marker must not silently make it 64/64."""
+        `got/len(req)` witness tally: adding an end-of-run marker must not silently
+        inflate the required-witness count by one.
+
+        The number is deliberately NOT written here. It was `63/63` when this was
+        first documented and the floor is far above that now — and refreshing a
+        stale number only resets the clock on the same defect, because nothing
+        makes the prose follow the spec. The claim that has to be true is the
+        RELATION (a marker must not enter the tally), and that is true at any
+        floor. `awk '/^(REQUIRE|COUNT) /' <spec> | wc -l` is the number, always
+        current, from the spec itself."""
         if self.kind == "REQUIRE":
             return self.hits >= 1
         if self.kind == "COUNT":

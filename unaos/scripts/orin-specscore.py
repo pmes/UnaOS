@@ -501,7 +501,15 @@ def find_kernel(path):
 def main():
     ap = argparse.ArgumentParser(
         description="score a jetson capture and report, per rule, whether it could have fired")
-    ap.add_argument("capture", help="the serial capture to score (a finished log)")
+    # --explain (rmbp 17, rmbp-ledger B103): `capture` is OPTIONAL so the spec can be asked what
+    # it enforces WITHOUT a log. The gap this closes cost two seats an hour: a `[pstrip]`-style
+    # question -- "is there a FORBID for this?" -- was answered by grepping the .spec files, which
+    # returned a confident ZERO because `mbench.parse_spec` APPENDS `DEFAULT_FORBIDS` to every
+    # spec at parse time. The information existed only at RUNTIME (`Directive.label()` marks a
+    # builtin with `*`), so reading the spec file was the only thing either seat COULD do without
+    # a capture, and reading the spec file cannot see it. See the --explain block in main().
+    ap.add_argument("capture", nargs="?", default=None,
+                    help="the serial capture to score (a finished log); omit it with --explain")
     ap.add_argument("--spec", required=True, help="the witness spec")
     ap.add_argument("--image", help="staged flash dir, or the kernel.elf the capture came from")
     ap.add_argument("--source", default=None,
@@ -521,7 +529,88 @@ def main():
                          "command line rather than buried in the spec.")
     ap.add_argument("--quiet-optional", action="store_true",
                     help="omit OPTIONAL/PENDING rows that neither hit nor are DEAD")
+    ap.add_argument("--explain", action="store_true",
+                    help="print the EFFECTIVE directive list for --spec (builtins included, "
+                         "marked) and exit. No capture, no image, no scoring: it answers "
+                         "'what does this spec actually enforce' before a boot exists.")
     args = ap.parse_args()
+
+    if not args.explain and args.capture is None:
+        ap.error("a capture is required unless --explain is given")
+
+    # REFUSE LOUDLY (orin 23's ruling on this change): a capture-side flag passed beside
+    # `--explain` is IGNORED by construction, because the block below returns before any of them
+    # is read -- and "a flag that does nothing is a lie" in a tool whose whole reason to exist is
+    # that a rule which CANNOT FIRE looks identical to one that passed. Refusing costs three
+    # lines and removes a silent no-op from the one place a reader comes to stop being fooled.
+    #
+    # orin named `--image` and `--accept-dead`; the set below is all FIVE capture-side flags,
+    # because the principle does not distinguish them and refusing two of five would leave three
+    # lies standing. Named here rather than assumed silently: narrow it if that is not wanted.
+    if args.explain:
+        # The CAPTURE itself is on this list and it is the biggest instance: passing one beside
+        # `--explain` was silently ignored, and it is the likeliest slip of all (typing the log
+        # out of habit). orin named the two flags; this is the same lie wearing a positional.
+        _cap_side = [n for n, v in (("a capture", args.capture),
+                                    ("--image", args.image), ("--source", args.source),
+                                    ("--accept-dead", args.accept_dead),
+                                    ("--no-coverage-gate", args.no_coverage_gate),
+                                    ("--quiet-optional", args.quiet_optional)) if v]
+        if _cap_side:
+            ap.error("--explain takes no capture or capture-side flags; got " + ", ".join(_cap_side))
+
+    # ---- --explain: the effective directive list, and nothing else -------------------------
+    #
+    # READ-ONLY BY CONSTRUCTION and it lands HERE rather than in `mbench.py` on purpose: mbench
+    # IS the gate, its modes are the semantics of record, and this file already imports it and
+    # holds the parsed objects six lines before it opens a capture. Enlarging the gate to answer
+    # a question a consumer already holds would be the drift the header refuses.
+    #
+    # A FLAT LIST, deliberately. The failure was not knowing a directive EXISTED; ranking or
+    # explaining would invent a problem and collide with this tool's real one (could it fire).
+    # The one field that is load-bearing past the list is the BUILTIN MARK, because that is
+    # exactly the information a reader of the .spec file cannot see.
+    if args.explain:
+        try:
+            directives = mbench.parse_spec(args.spec)
+        except mbench.SpecError as e:
+            print(f"orin-specscore: spec error: {e}", file=sys.stderr)
+            return mbench.RC_ERROR
+        n_builtin = sum(1 for d in directives if d.builtin)
+        print(f"── orin-specscore --explain ── {os.path.basename(args.spec)}")
+        print(f"   {len(directives)} effective directive(s): "
+              f"{len(directives) - n_builtin} from the spec, {n_builtin} builtin "
+              f"(marked *, appended by mbench.parse_spec to EVERY spec)")
+        print()
+        for d in directives:
+            where = f"{os.path.basename(args.spec)}:{d.spec_line}" if not d.builtin else "mbench DEFAULT_FORBIDS"
+            # DELIMITED, not bare (pi 9, review of this change): `parse_spec` `.strip()`s the line
+            # (`mbench.py:256`), so a stored pattern cannot CARRY a trailing space -- which makes the
+            # reader who matters the one who WROTE `FORBID span_blocks=2048 ` and is asking why their
+            # bound does not bind. Bare, the space's ABSENCE reads past easily; delimited, it is
+            # unmistakable. That inversion is a real incident: a trailing space the parser deletes,
+            # turning a bound key into an unbounded one, and this tool is where it gets diagnosed.
+            #
+            # WHICH DELIMITER, measured over the corpus rather than chosen by taste -- 692
+            # spec-authored directives across 11 specs contain: single-quote 7, double-quote 3,
+            # BACKTICK 0. The first cut of this used single quotes and rendered
+            # `:: SCHED: task 'el0-midden' -> core` with four identical quote characters, which is
+            # precisely the ambiguity the delimiter was added to remove (pi 9 again, on a pattern in
+            # their own file that this tool's acceptance spec does not contain).
+            #
+            # AND THE CHOICE IS ASSERTED, NOT ASSUMED. "Zero collisions today" is a fact about
+            # today's corpus, and a delimiter nothing contains is a delimiter nothing TESTS. So a
+            # pattern carrying the delimiter is NAMED on its own row instead of rendering ambiguous
+            # output: the day a spec gains a backtick, this says so rather than quietly lying.
+            # `repr()` is NOT used for any of it -- it doubles the backslashes every regex here is
+            # made of, so the tool would misreport the pattern it exists to clarify.
+            DELIM = "`"
+            clash = " ⚠ pattern contains the delimiter — this row's quoting is ambiguous" if DELIM in d.pattern else ""
+            print(f"   {d.label():<12} {where:<28} {DELIM}{d.pattern}{DELIM}{clash}")
+        print()
+        print("   * = builtin: NOT in the spec file, enforced anyway. A grep over the spec "
+              "cannot see these.")
+        return mbench.RC_PASS
 
     try:
         directives = mbench.parse_spec(args.spec)

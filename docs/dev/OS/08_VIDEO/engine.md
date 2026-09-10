@@ -2492,6 +2492,111 @@ green both arches; `UNAOS_WC=1 ./arroyo esp-x86` then
 (reachable, not merely compiled). aarch64 / wc-off fold away: `dock.rs` is not compiled there and
 the reopen arm is `#[cfg(feature = "wc")]` inside the x86-only render service.
 
+#### SHELLWIN RE-MINT (WCSER-REMINT) — the shell window does not stay a corpse across a rehome (2026-08-27)
+
+**The gap (flight 3, rmbp7).** WCSER-REHOME's census accepted the trade *"the rescued desktop's
+shell window is a corpse — it composites, and nothing types into it."* Flight 3 priced it: five
+steals, five rehomes (c1→c2→c3→c4→c5→c6), and the shell was a corpse from the first steal at 95 s to
+power-off at 1144 s — the operator read it as "keyboard gone". The one shell re-mint that flight
+(`[shellwin] reopen win=2 route=dock`, 374 088 ms) proves the mint path works from a rescue
+instance, but that route needs the row CLOSED first (the wedge-abandon teardown had closed it;
+`pin_shell` offers the dock tile only when no live `KERNEL_OWNER_DESKTOP` row exists). A rehome
+leaves the corpse row LIVE — so after a rehome the operator had no route at all.
+
+* **Adoption, not close-and-recreate.** The rescue render instance repoints the corpse's own row at
+  a fresh store (`wm::shell_remint`: owner-fenced, dims-checked, whole-box damage, under one table
+  acquisition) and binds a fresh `Console`/`Screen::direct` tuple to it. Three reasons, all
+  load-bearing: `close` runs the F4 drain barrier, and the corpse's leaked `BlitGuard` is exactly
+  the debt flight 3's `[wedge1] DRAIN STALLED` spun 21 s against; adoption re-targets the SAME
+  singleton row every time, so five rehomes leave one shell window (the idempotence bar);
+  and D-7's corpse-window retirement lane (CORPSEGLASS) can later sweep dead-core windows without a
+  shell carve-out, because the shell row is live-owned again the moment the rescue comes up.
+* **The row-gone arm.** If the corpse row was already closed (wedge abandonment, operator close-box)
+  the rescue mints fresh through the SAME fallible `open_shell_window` path the dock reopen arm uses
+  — run at bring-up instead of waiting for an operator to find the dock tile.
+* **Focus (flight 3 D-7).** A successful re-mint hands the keyboard back —
+  `user_input_set_active(0)` + `focus_changed(KERNEL_OWNER_DESKTOP)`, the dock reopen pair — so
+  focus is never left parked on a corpse that consumes nothing. One focus steal per rehome, priced
+  against 17 minutes of dead shell.
+* **The corpse's old store is deliberately not reclaimed:** it lives in the dead task's locals, a
+  parked core frees nothing, and a superseded revenant retires by sleeping with its frame intact —
+  so in-flight composites that snapshotted the old pointer read valid bytes forever. One
+  surface-sized leak per rehome, same ledger entry as the parked core itself. A revenant resuming
+  mid-pass writes only its own off-glass store; its owner-fenced present passes benignly (same id,
+  same owner) until the epoch check retires it at the next pass top.
+* **QEMU exercisability (wedgeinj).** `desktop_uefi::activate` never runs under QEMU (no Kepler
+  takeover), so the gate would otherwise prove the re-mint by compiling. The wedgeinj injector
+  therefore mints a synthetic `KERNEL_OWNER_DESKTOP` row (static surface, on the render task, only
+  if none exists) immediately before parking the core — the park orphans it exactly as the metal
+  fault orphans the real one, and the rescue's adoption arm is the code under test, unmodified.
+* **Witness.** `:: [wcser] shell re-minted win=<id> — corpse row adopted in place … == witness ::`
+  (adoption), `… fresh row (the corpse was already closed before the rehome) == witness ::`
+  (row-gone arm), `[wcser] shell re-mint DECLINE reason=alloc|row-changed … == tripwire ::` on the
+  named declines; the rescue banner now reads *"the previous instance's shell window is owed a
+  re-mint"*.
+
+**Gate results (2026-08-27).** `./arroyo check` green both arches (including the wedgeinj-without-wc
+mix legs — the fixture is `wc`-gated on top of `wedgeinj`). `UNAOS_WC=1 UNAOS_WEDGEINJ=1
+./arroyo test 60`: the full chain on the wire, in order — fixture mint (`[wedgeinj] synthetic shell
+row win=1 minted on c1`), park, `GATE STOLEN from c1 by c5 after 4305ms`, `REHOMED … c1 to c2`,
+rescue banner, `[wcser] shell re-minted win=1 — corpse row adopted in place == witness ::` — with
+exactly ONE `create win … asid=0xffffff02` in the whole run (the fixture; the rescue created
+nothing, it adopted) and the row live and compositing after (`[wcn] win=1 asid=0xffffff02 live=yes`);
+73 PASS / 0 FAIL. `UNAOS_WC=1 ./arroyo test 150` (`wc` in the features banner): 68 PASS / 0 FAIL /
+0 panic, and no `[wedgeinj]`/re-mint lines — the knob-off build carries none of it.
+
+#### FURNITUREFOCUS — a furniture click never hands the keyboard to a sink that drains nothing (2026-08-27)
+
+**The gap (flight 3 D-7, rmbp7).** At 798 453 ms a real trackpad click landed on the shell-furniture
+window (win=2, `KERNEL_OWNER_DESKTOP` = 0xffffff02) and the postmortem read the resulting
+`[wc-fv] focus raise asid=0xffffff02` / `[vugmin] focus asid=0xffffff02` pair as *"focus parked on
+kernel furniture — keys went to a window that consumes nothing"*. The routing was in fact correct:
+the router's furniture arms already did `user_input_set_active(0)` (keyboard to the SHELL) +
+`focus_changed(owner)` (the raise — which never moves the keyboard). The dead half was the **slot-0
+sink itself**: four rehomes in, the live render instance ran with an EMPTY shell tuple
+(`shell_id == WIN_NONE`, the pre-REMINT rescue shape), and the SHELLWIN key arm in `main.rs` drops
+every slot-0 key when no tuple is bound. So the same `focus_changed(KERNEL_OWNER_DESKTOP)` has one
+meaning ("desktop focus = shell keyboard", the pair WCSER-REMINT deliberately runs after adoption,
+when the sink is live) and had another that flight ("keyboard re-routed into the void"). REMINT
+closes the common corpse case; still reachable without this arc were its own decline arms
+(`alloc`, `row-changed`, no-row-off-desktop) and the stale-tuple window after an operator/teardown
+close of the shell row — in each, a click on ANY kernel furniture (console included) yanked the
+keyboard from a working app into a sink that drains nothing.
+
+* **The sink is now published, then consulted.** The x86 render task declares where a slot-0
+  keystroke lands (`syscall::shell_key_sink_note`), computed FROM the tuple binding at task
+  bring-up (covering boot mint, its decline, and every REMINT arm by construction) and re-declared
+  at the dock reopen. Three states: backdrop console (always drains — the default, so wc-off and
+  pre-render behaviour is untouched), bound window (drains iff the `KERNEL_OWNER_DESKTOP` row is
+  still live — `shell_row_geometry()`, so a closed row needs no extra hook), unbound (drops).
+* **The deflection (`furniture_keyboard_to_shell`).** All three furniture keyboard-hand-off seams
+  in `wc_click_route_at` (chrome arm's kernel/exempt branch, the KERNEL FURNITURE content arm, the
+  DESKTOP-APP FURNITURE arm) route through one helper: sink live → `user_input_set_active(0)`
+  exactly as before; sink dead → the press is still consumed and the row still raised (the visible
+  half of the gesture), but `USER_INPUT_ACTIVE` is left untouched — the focused app keeps its
+  keystream. A no-op instead of a strand; never a state where keyboard input goes nowhere.
+* **REMINT's chain is untouched:** its `user_input_set_active(0)` + `focus_changed` pair is called
+  directly (not through the router helper), and a successful adoption re-binds the tuple, which is
+  exactly what makes the sink read "live" again.
+* **Witness.** `[clickroute] furniture deflect owner=<asid> keep=<asid> sink=dead — keyboard stays
+  put`, lifetime-budgeted at 4 lines (the selftest's leg burns one proving the line fires from the
+  live router, the CLICK-BAND rule).
+* **Fixture.** `clickroute_selftest` leg 7 (`deflect=` on the `[clickroute] route …` verdict):
+  declares the flight-3 state (desktop, unbound), presses the synthetic kernel row from a live app
+  focus, and asserts consumed + keyboard kept + the previous owner's ring still draining + the
+  release dropped; the real sink state is saved/restored around the probe.
+
+**Gate results (2026-08-27).** `./arroyo check` green both arches (all cfg legs). `UNAOS_WC=1
+./arroyo test 150` (`wc` in the features banner): 68 PASS / 0 FAIL / 0 panic;
+`[clickroute] route … deflect=true -> PASS` and exactly one
+`[clickroute] furniture deflect owner=0xffffff7f keep=0x1 sink=dead` line (the fixture's budget
+burn); CLICK-BAND, the wm-act family and the wc-d verify legs unchanged. `UNAOS_WC=1
+UNAOS_WEDGEINJ=1 ./arroyo test 60` (the rehome-focus seam this arc touches): 74 PASS / 0 FAIL /
+0 panic, the full REMINT chain on the wire — fixture mint, park, `GATE STOLEN`, `REHOMED`,
+`[wcser] shell re-minted win=1 — corpse row adopted in place … keyboard handed to the shell` —
+with exactly ONE `create win … asid=0xffffff02` in the run (the fixture's; the adoption created
+nothing), so REMINT's idempotence bar and its focus hand-back are intact under the deflection.
+
 #### SHELLWIN-PI — the same shell window, on the other chip (2026-08-13, landed 2026-08-17 on the CONSWIN-PI tip)
 
 **The ruling this closes.** *"THIS IS ONE OS. THE X86 PART IS NOT SEPARATE, IT JUST RUNS ON A
@@ -16967,6 +17072,63 @@ revenants"* from *"the reader is dead"*.
 > structurally stronger home for both counters is the `[deadman]` timer-ISR line**, the one emitter
 > this section has already established survives the wedge; `deadman.rs` was held by a concurrent
 > executor during this arc and the move is owed.
+
+### DEBTCLEAR — a dead core's blit debt is settled at rehome, not inherited by every later drain
+
+Flight 3 (rmbp7, 2026-08-27) closed the question of what the `[wedge1]` wedge actually waits on:
+`BLITWHO active=2 net=[0,1,1,0,0,0,0,0]` at the 363 s abandonment — the drain on c3 was waiting for
+blit-exits owed by **c1 and c2, dead since the 95 s / 100 s steals**. A parked core never runs its
+`BlitGuard` drop, so its `BLIT_ACTIVE` registration stands for the rest of the boot, and every F4
+drain that waits for `BLIT_ACTIVE == 0` spins its full bound (1 GiB of spins, measured) unwinnably
+by construction. Each steal plants the debt that wedges the next holder — the degradation
+staircase's amplifying feedback (postmortem §5 Q1).
+
+**The settle** (`wm::blit_debt_forgive`, called from `render_rehome_service` for every death the
+mailbox delivers, *before* the singleton-role check): the dead core's `BLIT_NET_CORE` slot is
+drained unit-by-unit into `BLIT_ACTIVE` decrements, and a **forgiveness credit** is banked per unit.
+The credit is the exactness mechanism against the migration caveat: a guard is charged by
+ENTER-core, so a holder that entered on the corpse may be live elsewhere — its later drop consumes a
+credit instead of decrementing a second time, and the same absorption re-balances the books if a
+revenant's stuck store ever retires and its guard drops seconds later. Credit is published before
+each net claim and retracted (guarded) on a failed claim, so every interleaving with concurrent
+drops balances; live cores' debt is untouched and every drain still waits on the full
+`BLIT_ACTIVE`, live guards included.
+
+**The zombie-store latch.** Forgiving the count must not certify quiescence the device cannot
+promise: the corpse's in-flight blit may be the stuck BAR1 store itself, and its writes can land
+whenever the store buffer drains. So a nonzero settle latches `BLIT_DEBT_TAINT`, and the next gate
+holder (`blit_debt_heal_maybe`, ahead of its `composite_once`) re-damages every live row and queues
+a whole-panel fill through the WC-K2 deferred-erase route — one full present, healing every zombie
+pixel that landed before it. A store landing later is bounded by the standing revenant discipline
+(one pass, clipped to its own box, then `comp_gate_release` declines and the role epoch retires it)
+and costs the same one-frame stale rectangle the DRAINSTALL abandon arm already prices. The WC-B
+revisit note on that arm applies to this path identically. The one shape this seam cannot reach,
+named: a core that dies *spinning in a drain* holds `DRAIN_PENDING`, not `COMP_GATE`, is never
+convicted by the steal, and remains DRAINRESCUE's business.
+
+**Witnesses** (own lines, one hit per steal — the `[wedge1]` tripwire report line is deliberately
+untouched):
+
+```
+:: [wcser] blit debt forgiven core=1 owed=1 active_now=0 taint=armed == debt-clear ::
+:: [wcser] blit debt heal: full present queued — every row re-damaged, whole-panel fill owed == debt-clear ::
+```
+
+**The gate** — the WEDGEINJ fixture now mints the debt the park strands (`BlitGuard::enter` +
+`mem::forget`, the software twin of the stuck store) and runs a **DEBT LEG** 15 s after the park: it
+reads the parked core's net (nonzero ⇒ `-> FAIL` without draining — a close against unsettled debt
+would spin the abandon bound past the end of the capture, a silent false green refused), then
+creates and closes a probe window, which runs the exact F4 drain flight 3 could only abandon.
+Measured on `UNAOS_WC=1 UNAOS_WEDGEINJ=1 ./arroyo test 60`:
+
+```
+:: [wedgeinj] blit debt minted on c1 active=1 — the ledger the steal must settle ::
+:: [wedgeinj] DEBT LEG core=1 net=0 close_ms=2 abandoned_delta=0 scskip_delta=0 active_now=0
+   — the drain that flight 3 could only abandon now completes -> PASS ::
+```
+
+`close_ms=2` against the pre-fix reading — the same drain spinning `spins=1073741824` for 21 s and
+abandoning — is the whole claim on the wire.
 
 ### WCDVALVE-LOOP — the valve measures a quantity that only exists while it is open
 

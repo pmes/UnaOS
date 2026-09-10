@@ -394,3 +394,73 @@ Flight-3 (`UNAOS_PRTSCRST=1`, 2026-08) settled the metal state of this bench:
   write, was decoded 46 ms after the first `OK`: chords are deferred by the freeze, not lost. The
   duration is the capture running inside the device-service pass; making it incremental is a separate
   arc, recorded here as the number to beat.
+
+## 10. PRTSCR-ASYNC — the capture runs in bounded slices
+
+> **Where this lives.** The behaviour below is on `hw-jetson` at `6128706f` (the state machine) and
+> `9905ddd7` (the Orin service cadence), granted by the rmbp seat 2026-09-06 and reaching this branch
+> at the rmbp landing. It is documented here, in the subsystem's own file, because `screenshot.md` is
+> this lane's and the alternative was two seats writing half a section each.
+
+§6 describes a capture as one pass: reserve the entry, encode, write. That is what makes Print Screen
+cost **70 s on the rMBP with the keyboard and mouse dead** (`A2`, promoted to `SR2` once Peter
+reproduced it on the Orin) — the whole 15.5 MB write happens inside the device-service pass, at
+~220 KB/s, with `[deadman] pmp=0` for its entire duration.
+
+`capture_inner`'s straight-line body is now a `Job` state machine parked in a `spin::Mutex<Option<Job>>`:
+
+| phase | unit of work | slice bound |
+|---|---|---|
+| `Phase::Encode` | scanlines pushed into the streaming encoder | `SLICE_ROWS` = 64 |
+| `Phase::Write` | bytes per `write_grow`, in order from offset 0 | `SLICE_WRITE` = 32 KiB |
+
+`Job::slice` runs units until `arch::hw_wait_budget()/64` cycles are spent — about 31 ms on x86 and
+75 ms on the Orin — so `service()` advances **one bounded slice per device-service pass** and returns
+to input polling. **No lock is held across a slice**: the job is taken out of the mutex, worked on
+unlocked, and stored back, so the mutex is acquired exactly twice per slice and never across the work.
+
+Two consequences worth stating because they are what a reader will check:
+
+- **A press during an open capture is now visible.** It yields the named `Refusal::InFlight` line *and*
+  the existing re-arm, so three fast presses produce three files and the collapse Peter reported ("3
+  presses did not yield 3 captures") is named on the wire rather than silent.
+- **`capture()` stays synchronous**, driving the same machine to completion. The `screenshot` verb and
+  `UNAOS_PRTSCRST=1` therefore keep their wire byte for byte — §8's boot-time witness is unchanged.
+
+**Service cadence is per-body, and that matters on the Orin.** `prtscr::service()` has five call sites:
+`main.rs:1206` (the `usbdebug` loop), `:1696` (the `kernel_main` tail), `:3021` (the ~250 ms tegra
+sweep), `:5957` (`x86_usb_pump`), and `:8358` in `orin_render_service`. The last two of those are
+`holocron`-gated — that knob is the repo's arming switch for "this boot may WRITE its boot medium", so
+an `orinrender` image that did not ask for a writer does not gain one. Without the `:8358` site the
+Orin advanced a capture only on the 250 ms sweep, which keeps it responsive but stretches a capture
+roughly fourfold.
+
+## 11. The volume that leaves mid-capture — `Refusal::Vanished`
+
+A sliced capture spans many service passes, and §8.1's rung 2 aims deliberately at *the operator's
+carry-away stick* — the medium most likely to be pulled while the capture is still running.
+
+**What happened before this existed, stated because it is what an old log will show:** nothing dangled
+and nothing panicked. `USB-UNPLUG`'s retraction clears the USB block device, and every block entry
+point re-reads the registry per call and bounds the LBA against that fresh snapshot, so the next
+`write_grow` failed as `BlockError::NotReady` and the capture reported the **generic**
+`Refusal::Fat("write", …)` line — a FAT errno that never names the disconnection. The failure was
+safe and unreadable.
+
+It is now named, and probed before `create_in_dir` and before **every** `write_grow`:
+
+```
+:: PRTSCR: SCREEN0.PNG — volume vanished mid-capture at 98304/3073098 bytes (usb geometry retracted or a newer publish replaced it; handles=…) — capture ABANDONED, nothing written through the stale handle ::
+```
+
+**The probe tests two facts, and the second is the load-bearing one.** It requires
+`usb_info().is_some()` **and** that `usb_publish_gen()` (`drivers/block.rs:761`) is unchanged since
+`begin`. Presence alone is not enough: a retract-then-replug refills the handle with a **different
+disk**, and the parked `FatFs`'s stale LBAs would pass that disk's bounds checks cleanly. A presence
+check would have been a check that cannot fire — it returns "alive" in exactly the case that most
+needs catching — and the generation counter is what distinguishes "still there" from "something is
+there".
+
+The encode step is probed for the same reason: it spends seconds of passes before the first
+volume-touching call, so an entry created on a disk that has left, or on a stranger's, is precisely
+the stale-handle write this refuses.

@@ -8,11 +8,17 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
+#   ./arroyo state         One line: branch@HEAD, behind-trunk, ahead-of-trunk, owed-above-origin, dirty
+#                          (read-only; the four drifts a seat must never have to volunteer)
 #   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
 #                          including the x86 pairwise-mix legs — see GATE-CFG-MIX below)
 #                          + the ring-3 user-* crates
 #                          UNAOS_CFG_SWEEP=1 adds the per-feature x86 sweep (+2N legs, 150 today)
 #   ./arroyo build         Build both targets (no QEMU)
+#   ./arroyo knoboff <feature> [baseline-ref]
+#                          Knob-off byte-identity: build the knob-OFF loadable image at the baseline
+#                          and at this tree IN ONE DIRECTORY and compare them, with an armed control
+#                          probe. Exit 0 identical / 1 moved / 2 no verdict. EXECUTOR-BRIEF §5.
 #   ./arroyo clean         Purge all build artifacts
 
 set -e
@@ -720,6 +726,20 @@ _feats=""
 # Needs UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach the activation seam.
 # Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm (design + evidence:
+# docs/dev/OS/08_VIDEO/phase31-root.md). ONE mode exists today: `uc` -> feature `bar1exp-uc`,
+# which retypes the panel-aperture leaves UC (PAT PA3) instead of WC (PAT PA4) at
+# `set_framebuffer_wc` — the M1-vs-{M2,M3} discriminator. Memory TYPE only; no permission bit,
+# no MTRR. Armed boots print `:: x86 bar1exp: UC arm ARMED ... ::` in place of the `fb-wc` line
+# (strings-verifiable) and run the panel ~6.8x slower by design. DEFAULT OFF => the armed tokens
+# are not compiled and the mapping is today's. Unknown modes are REFUSED here rather than
+# silently arming the wrong experiment. Kept in sync with builder/src/main.rs (the two-place
+# trap; the map line below is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it).
+if [ -n "${UNAOS_BAR1EXP:-}" ] && [ "${UNAOS_BAR1EXP}" != "uc" ]; then
+    echo "❌ UNAOS_BAR1EXP='${UNAOS_BAR1EXP}' is not a known mode (known: uc) — refusing to guess which experiment you meant." >&2
+    exit 1
+fi
+[ -n "${UNAOS_BAR1EXP:-}" ] && _feats="${_feats}bar1exp-uc,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -1141,11 +1161,11 @@ _feats=""
 # `orinwdt` feature implies `tegra` (the TKE is Tegra234 silicon), so the knob is self-sufficient
 # (`UNAOS_ORINWDT=1 ./arroyo esp-jetson` builds an armed jetson image). Default OFF => the module
 # + both call sites vanish (statements APPENDED to existing lines, so no Location shifts; the
-# knob-off image carries zero `[orinreboot] wdt` strings — the arc's power.rs VERBS ship
+# knob-off image carries zero `[orinwdt] wdt` strings — the arc's power.rs VERBS ship
 # unconditionally, so no byte-identity-to-pre-arc claim). The ARMED polarity is type-checked by the
 # `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX, never by this mapping. QEMU models no TKE, so the
-# reset verdict is metal-owed. Witness family: `[orinreboot]` (shared with the reboot VERB —
-# power.rs — which is always-compiled and needs no knob).
+# reset verdict is metal-owed. Witness family: `[orinwdt]` (its own since PWRNAME; the reboot VERB in
+# power.rs is `[pwrreboot]`, always-compiled, no knob).
 [ -n "${UNAOS_ORINWDT:-}" ] && _feats="${_feats}orinwdt,"
 # ── ORINDESK rung 1: the DESKTOP FAMILY reaches this map at all ────────────────────────────────────
 #
@@ -2225,6 +2245,21 @@ gate_x86_rodata_no_code() {
     echo -e "${COLOR_GREEN}✅ .rodata gate: no GLOBAL code symbol in .rodata (only the AP trampoline's own labels)${COLOR_RESET}"
 }
 
+# ⚠ EVERY KERNEL IMAGE IS BUILT `--release`, AND DIAGNOSTIC CODE RELIES ON IT (rmbp 14, 2026-09-06).
+# MEASURED, not assumed: `grep -n "cargo +nightly build" arroyo | grep -v -- "--release"` is EMPTY —
+# all 15 build legs in this file pass `--release`, and there is no debug leg anywhere. (The first
+# draft of this comment said "this leg and the three below it", which was wrong by a dozen; the check
+# that corrected it is the one written above, so run it rather than trusting this sentence.)
+# Code of the form `if cfg!(feature = "witness") { ... }` — as distinct from `#[cfg]`,
+# which deletes the block outright — is COMPILED in every configuration and depends on the optimizer
+# to drop it when the feature is off. At `--release` LLVM drops it whole, atomics and all, which is
+# why the form is allowed: it keeps the block type-checked so it cannot rot, at no cost.
+# THE INSTANCE: PRTSCLOST's `KBD_DRAIN_LAST` stamp sits inside `drain_event_ring_once`, a function
+# with 18 call sites several of which are tight spin loops, and one of them carries the rMBP's
+# FTDI-over-xHCI console. **Add a debug kernel build leg and that stamp becomes live cost on that
+# path** — a TSC read and three atomics per ring-drain attempt. If a debug leg is ever added here,
+# every `if cfg!` diagnostic block goes back to `#[cfg]` in the same commit, or the leg carries its
+# own note saying which ones were audited and why they are affordable.
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -3194,9 +3229,14 @@ KERNEL_CFG_MATRIX=(
   # `./arroyo check` prints the live board/mix counts every run — read them there, not here. The
   # aarch64 half needs no leg: `arm_features` strips `wcdvalve` from arm media builds (see the
   # -Cmetadata note there) precisely because it emits not one byte of aarch64 code.
+  # PHASE31ROOT (appended 2026-08-27): `bar1exp-uc` — the BAR1-wedge UC experiment arm
+  # (arch/x86_64/memory.rs, docs/dev/OS/08_VIDEO/phase31-root.md). x86-only cfg sites; this leg
+  # carries the ARMED polarity under type-check (every default leg carries the disarmed one), and
+  # naming it on a literal x86 leg is what puts the `UNAOS_BAR1EXP` knob under the KNOB→BUILDER
+  # WIRING CHECK below.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,facet"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -4835,10 +4875,29 @@ check_kernel_cfg() {
     # positional trap 2026-08-27; this comment is why the next reader doesn't.)
     local _kl_declared _kl_covered="," _kl_f _kl_miss=""
     _kl_declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$WORKSPACE_DIR/crates/kernel/Cargo.toml" | grep -v '^default$')"
-    for _row in "${_rows[@]}"; do
-        read -r _ _ _feats <<< "$_row"
-        _kl_covered="${_kl_covered}${_feats},"
-    done
+    # KNOBLEG (2026-08-31) — THIS CHECK HAD NEVER BEEN ABLE TO FAIL, and both halves of the reason
+    # are fixed here. It is the tree's only structural check, and it printed ✅ on every run.
+    #
+    # (1) It matched over `_rows`, which is MATRIX + MIX + SWEEP — and the `x86-mix-N` legs are
+    #     MANUFACTURED AT RUNTIME by `build_cfg_legs` from feature unions that include aarch64
+    #     features. Every feature was therefore "covered" and the ❌ branch below was unreachable.
+    #     Three seats produced three wrong explanations for the green by grepping THIS FILE's text —
+    #     and the text is innocent: `aarch64_el0` appears nowhere in it, because the value is
+    #     COMPUTED, not written. A probe on `_kl_covered` inside a running `check_kernel_cfg` named
+    #     x86-mix-1/2/5/6 as the legs carrying it, in one run. Read the note in
+    #     `scripts/knob-leg-covered.py`; the harness that settled it is a copy of this file with the
+    #     `cargo check` line stubbed to `true`.
+    #     ⚠ The legs are NAMED `x86-mix-N` while their unions carry aarch64 features — which is
+    #     exactly the vacuity the ❌ string below warns about. It was accurate about itself.
+    #
+    # (2) Iterating the board matrix ALONE is necessary and NOT sufficient: a literal match cannot
+    #     see Cargo implications. `aarch64_el0` is named by no leg, yet 11 board legs name
+    #     `tegra_el0`, and `tegra_el0 = ["tegra","aarch64_el0"]` (`baremetal` implies it too). So
+    #     (1) without (2) reds a feature that IS compiled — a false positive on the one gate whose
+    #     whole value is being believed. Coverage is the TRANSITIVE CLOSURE, and the helper computes it.
+    _kl_covered=",$(printf '%s\n' "${KERNEL_CFG_MATRIX[@]}" \
+        | python3 "$WORKSPACE_DIR/scripts/knob-leg-covered.py" "$WORKSPACE_DIR/crates/kernel/Cargo.toml" \
+        | tr '\n' ',')"
     case "$_kl_covered" in
         *",vugpar,"*) : ;;
         *) echo -e "${COLOR_RED}❌ knob→leg coverage: control probe FAILED — vugpar not seen on any leg; the leg parser itself is broken (uppercase/odd-char drop?). No coverage verdict from this run.${COLOR_RESET}"; return 1 ;;
@@ -4871,7 +4930,15 @@ check_kernel_cfg() {
         case "$_leg" in x86-mix-*) : ;; x86-*) _kb_x86="${_kb_x86}${_feats}," ;; esac
     done
     local _kb_map
-    _kb_map="$(sed -n 's/^\[ -n "\${\(UNAOS_[A-Z0-9_]*\):-}" \] && _feats="\${_feats}\([A-Za-z0-9_,-]*\),"$/\1 \2/p' "${BASH_SOURCE[0]}")"
+    # SO6 (orin 16 found it, rmbp 13 fixed it, 2026-09-06): `${BASH_SOURCE[0]}` is the path this script
+    # was INVOKED with, so `unaos/arroyo check` from the repo root makes it relative — and this function
+    # runs after arroyo has cd'd internally, where `unaos/arroyo` no longer resolves. `sed` then read
+    # nothing, the control probe correctly refused a verdict, and the run red-lined with no defect behind
+    # it (WINID lost a build to exactly this). $WORKSPACE_DIR is absolute by construction at the top of
+    # this file, so anchor to it; basename keeps the rename case working. THE CONTROL PROBE IS WHY THIS
+    # WAS A LOUD FAILURE RATHER THAN A SILENT PASS — it is the same design this file's other gates use,
+    # and it earned its keep here.
+    _kb_map="$(sed -n 's/^\[ -n "\${\(UNAOS_[A-Z0-9_]*\):-}" \] && _feats="\${_feats}\([A-Za-z0-9_,-]*\),"$/\1 \2/p' "$WORKSPACE_DIR/$(basename "${BASH_SOURCE[0]}")")"
     case "$_kb_map" in
         *"UNAOS_WC wc"*) : ;;
         *) echo -e "${COLOR_RED}❌ knob→builder wiring: control probe FAILED — UNAOS_WC->wc not parsed from this file's knob map; the map parser is broken. No wiring verdict from this run.${COLOR_RESET}"; return 1 ;;
@@ -4988,6 +5055,16 @@ check_both() {
       --features bootdiag,jb8lever \
       -Z build-std=core,compiler_builtins,alloc \
       -Z build-std-features=compiler-builtins-mem
+    # GATE-ROOTS leg 4 (rmbp, 2026-09-02) — NOT part of hw-jetson's block above; at the merge it stays
+    # here, below their third leg. `unaos_ivb`: $BOOTLOADER_FEATURES is built from UNAOS_BOOTDIAG and
+    # UNAOS_JB8_LEVER only, and the UNAOS_IVB knob appends `intel-ivb,unaos_ivb` to the KERNEL feature
+    # list only (the `builder` crate arms the loader side, on the x86 media path). So even under
+    # UNAOS_IVB=1 this gate type-checked the kernel half of the BootInfo ABI WITH the feature and the
+    # loader half WITHOUT it — the two halves of the shared struct were never checked in agreement by
+    # any leg. x86 target only: that is the path that ships it; an aarch64 cross reflects nothing that
+    # boots.
+    cargo +nightly check --release --target x86_64-unknown-uefi --features unaos_ivb \
+      -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
     cd "$WORKSPACE_DIR"
     echo -e "${COLOR_GREEN}✅ bootloader OK${COLOR_RESET}"
 
@@ -5041,14 +5118,28 @@ check_both() {
         _crc=1
     fi
 
-    if [ "$_urc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
-        return 1
+    # GATE-FAMILY: a ratchet on platform-split symbol families — `render_service` /
+    # `x86_render_service` / `orin_render_service` and the seven others like it.
+    #
+    # WHY IT IS A GATE AND NOT A CONVENTION. Every per-platform twin in this tree was individually
+    # defensible when it was written; the result is one job with N implementations sharing 40-60% of
+    # its callees. The lane rule is NOT what produces that — crossing a lane already works, by grant
+    # (PANELOWN, the wm/fbcon parity port, CONWINCLOSE). What is missing is a PRICE ON NOT SHARING:
+    # a cross-lane edit costs a negotiation, a recorded grant and a review, while a copy costs
+    # nothing and shows up in no measurement, so the cheapest correct move is the duplicating one.
+    # This is the bill, and it arrives when the NAME is chosen — the only moment when the fix is
+    # still a rename instead of an extraction.
+    #
+    # Growing a family stays ALLOWED. It just cannot be silent: update the ledger in the same commit
+    # with the reason, and the gate is green. The script's failure text asks the three questions the
+    # reason has to answer (what is shared, which axis truly differs, would a parameter have done).
+    local _frc=0
+    if "$WORKSPACE_DIR/scripts/arch-families.sh"; then
+        echo -e "${COLOR_GREEN}  ✅ arch families (no per-platform copy added silently)${COLOR_RESET}"
+    else
+        _frc=1
     fi
-    if [ "$_krc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
-        return 1
-    fi
+
     # GATE-KNOB: every `feature = "X"` in a cfg is declared, and every declared feature has a cfg.
     #
     # A cfg on an UNDECLARED feature is ALWAYS FALSE. It does not fail the build and it did not fail
@@ -5064,10 +5155,77 @@ check_both() {
     # prose. The script strips comments first and carries a fixture for exactly that case, because a
     # gate that reds on a sentence is a gate people turn off.
     local _nrc=0
+    # GATE-APPEND (rmbp 13, 2026-09-06): LEDGER P7's trap, checked by machine instead of by eye. A
+    # statement folded onto an existing line for byte identity must sit BEFORE that line's first `//`;
+    # after it, it is comment text that compiles nothing while every gate stays green. It bit ROOTFS's
+    # first build this round, and until now every seat reviewing a same-line append re-derived the check
+    # by inspection, per patch. See scripts/append-position.sh for why the naive form is unshippable
+    # (seven prose false positives in this tree) and what the discriminator is.
+    if "$WORKSPACE_DIR/scripts/append-position.sh"; then
+        echo -e "${COLOR_GREEN}  ✅ append position (no statement hiding after a comment marker)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ append-position gate FAILED${COLOR_RESET}"
+        return 1
+    fi
+
     if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
         echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"
     else
         _nrc=1
+    fi
+
+    # GATE-K8REACH (rmbp 14, 2026-09-06): LEDGER SR1's CLASS — build coverage is not operator
+    # reachability. `kernel8()` builds from a CURATED $K8_FEATS that deliberately does not draw from
+    # the general `_feats` map above, so a knob added there and never given an arm is UNREACHABLE in
+    # every Pi bare-metal image, with no error and no warning: the operator sets it, flashes, and the
+    # image is byte-identical. Two instances a week apart (`UNAOS_PRTSCRST`, pi 7 — the Print Screen
+    # gate greened about nothing for a week; `UNAOS_BOOTLOG`, orin 15). The gate does NOT decide which
+    # knobs BELONG in the Pi image — that is not mechanical and pi 7 was right to say so — it asserts
+    # that every knob is ACCOUNTED FOR: armed, or written down in scripts/k8-reach.registry as
+    # deliberately unarmed. A knob added tomorrow reds until someone rules on it.
+    local _k8rc=0
+    python3 "$WORKSPACE_DIR/scripts/k8-reach.py" || _k8rc=$?
+    if [ "$_k8rc" -ne 0 ]; then
+        [ "$_k8rc" -eq 2 ] && echo -e "${COLOR_RED}❌ k8-reach gate gave NO VERDICT — it did not run to a verdict, which is not a pass${COLOR_RESET}"
+        _nrc=1
+    fi
+
+    # GATE-ROOTS: every BINARY target in the tree is a named root of this gate.
+    #
+    # `check` covers the dependency graph reachable from the roots it NAMES. The libraries come free —
+    # boot-info, net, una-abi, rast and xusb-fw are all compiled because the kernel depends on them. A
+    # BINARY is nobody's dependency: it is its own root, so a binary no leg names is never type-checked,
+    # on any run, while the tree reads as "check green". `crates/bootloader` was that binary — the
+    # GATE-BOOTLOADER legs above are the instance fix. `builder` was the other, and the host leg here is
+    # its fix: 0.4 s, and it is the crate that builds every x86 boot medium.
+    #
+    # `scripts/check-roots.sh` closes the CLASS. It walks the functions reachable from check_both in
+    # THIS file, collects every crate directory a `cargo check`/`build` is run in (USER_CHECK_MATRIX
+    # expanded exactly as check_user_arch expands it), and reds on any crates/*/ or builder/ binary that
+    # none of them names. Media and launch commands are outside that walk by construction — a build
+    # `esp-arm` runs is not a check this gate runs. A commented-out leg is an absent leg to it. Control
+    # probe: crates/kernel must be enumerated AND resolved as a root of check_both, or exit 2, no verdict.
+    local _rrc=0
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: builder (host)...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/builder" && cargo +nightly check --release); then
+        echo -e "${COLOR_GREEN}  ✅ builder (host)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ builder (host) FAILED to compile${COLOR_RESET}"
+        _rrc=1
+    fi
+    if "$WORKSPACE_DIR/scripts/check-roots.sh"; then
+        echo -e "${COLOR_GREEN}  ✅ check roots (every binary target is named by a leg of this gate)${COLOR_RESET}"
+    else
+        _rrc=1
+    fi
+
+    if [ "$_urc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_krc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — cfg-gated kernel code did not compile (see above)${COLOR_RESET}"
+        return 1
     fi
     # GATE-LEDGER: the issue ledgers (docs/dev/LEDGER.md, docs/dev/OS/*-ledger.md) are a TRACKER, and a
     # tracker whose rows nothing checks is prose that rots — PCIE-RP-RECOVERY.md said "no reboot facility
@@ -5089,8 +5247,16 @@ check_both() {
         echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
         return 1
     fi
+    if [ "$_frc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a platform-split symbol family grew (see above)${COLOR_RESET}"
+        return 1
+    fi
     if [ "$_nrc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene (see above)${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene or k8 reachability (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_rrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a binary target is named by no check leg, or builder did not compile (see above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_lrc" -ne 0 ]; then
@@ -6095,6 +6261,21 @@ kernel8() {
     if [ -n "${UNAOS_LOGTS:-}" ]; then
         K8_FEATS="${K8_FEATS},logts"
         echo -e "${COLOR_YELLOW}  • UNAOS_LOGTS: kernel8 serial lines carry a timestamp prefix (monotonic ms → UTC after sync)${COLOR_RESET}"
+    fi
+    # SR1 — UNAOS_BOOTLOG=1 adds the `bootlog` feature. Without this arm the knob is UNREACHABLE for
+    # every Pi bare-metal image (K8_FEATS is curated; see the LOGTS note above), which since
+    # CONSOLEQUIET means a UNAOS_PIDESK=1 image has NO way to put the serial->panel mirror back.
+    # Found by orin 15 via CONSOLEQUIET; lane is rmbp (arroyo is a gate file). OFF => byte-identical.
+    if [ -n "${UNAOS_BOOTLOG:-}" ]; then
+        K8_FEATS="${K8_FEATS},bootlog"
+        echo -e "${COLOR_YELLOW}  • UNAOS_BOOTLOG: kernel8 keeps the full serial->panel mirror (the CONSOLEQUIET escape hatch)${COLOR_RESET}"
+    fi
+    # SR1 — UNAOS_PRTSCRST=1 adds the `prtscrst` feature. Absent this arm the Print Screen self-test
+    # gate greens about nothing on the Pi, which blocked LEDGER S14 for a week without a warning of
+    # any kind. Found by pi 7. OFF => the path is not compiled and the image is byte-identical.
+    if [ -n "${UNAOS_PRTSCRST:-}" ]; then
+        K8_FEATS="${K8_FEATS},prtscrst"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PRTSCRST: kernel8 carries the Print Screen self-test (PRTSCR-ST)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
         K8_FEATS="${K8_FEATS},k2_leave"
@@ -7599,6 +7780,367 @@ battery() {
     return $rc
 }
 
+# KNOBOFF (`./arroyo knoboff <feature> [baseline-ref]`) — the byte-identity check EXECUTOR-BRIEF §5
+# has been telling executors to run "when it exists". It exists now.
+#
+# THE QUESTION IT ANSWERS. An arc adds knob-gated code. Every knob comment in this file claims some
+# form of "default OFF => the sites vanish, media byte-identical to baseline". That claim is about the
+# DEFAULT image — the one every other board ships — and it is the claim a `#[cfg]` does NOT by itself
+# buy you: `panic::Location` embeds the source LINE, so inserting a line ABOVE existing code shifts
+# every panic site below it and moves bytes in an image that contains none of the new feature's code
+# (pi 7, 2026-09-06; memory `cfg-does-not-protect-byte-identity`). That is why the brief tells
+# executors to append onto an existing line or inside an existing cfg region — and why the append has
+# to be MEASURED rather than reasoned about.
+#
+# WHAT IT COMPARES, and why not the obvious things.
+#   * The `llvm-objcopy -O binary` LOADABLE IMAGE, never `kernel.elf` and never the ESP. The .elf
+#     carries build-path and debug metadata and LLVM's `.llvm.<hash>` internal-symbol suffixes in
+#     .strtab (JB11 measured a pair differing by exactly one loadable byte and a further 32 non-loaded
+#     ones); the ESP embeds SRC.TGZ, so it differs whenever the source differs, which is always.
+#   * BOTH builds run in the SAME directory — a throwaway worktree under
+#     ~/unaos-bench/scratch/knoboff/ — because a build's own path reaches the artifact (XUSBFW's
+#     measurement says "measured in ONE directory" for exactly this reason, and 38ae067e/`orindesk`
+#     says "same worktree path"). Comparing your tree against a baseline built somewhere else would
+#     put a path delta and a code delta in the same number.
+#   * NEVER `git stash` (the stack is shared across every worktree of this repo). The working diff is
+#     snapshotted to scratch with `git diff HEAD` and applied into the throwaway tree; this worktree is
+#     not touched, and the patch file is left behind so the run is reproducible.
+#
+# THE CONTROL PROBE, and why the check refuses a verdict without it. A comparison that cannot come out
+# unequal reports "byte-identical" for a feature whose name is misspelled, whose cfg sites are gated
+# on a second feature nobody armed, or whose knob this run never actually passed to cargo — and it
+# reports it in exactly the words a real pass uses (memory `a-check-that-cannot-fire`). So every run
+# also builds the CURRENT tree with `<feature>` ARMED and requires that image to differ from the
+# knob-off one on at least one arch. If arming the feature changes nothing anywhere, there is no
+# verdict to give and the exit status is 2, not 0.
+#
+# ENV HYGIENE. The default-image claim is only measured if the OFF build IS the default build, so a
+# run refuses to start with any `UNAOS_*` knob set unless `UNAOS_KNOBOFF_WITH_ENV=1` says the caller
+# means it. That escape is the right one for a feature whose sites are all gated on another feature
+# (`UNAOS_TEGRA=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff bsptick` measures "does bsptick move the
+# TEGRA knob-off image", which is the honest question for every tegra-gated knob) — the verdict line
+# then names the set it actually built, because "byte-identical" without the feature set beside it is
+# not a claim anyone can check.
+#
+# WHAT IT DOES NOT COVER, said here so a green run is not over-quoted. knoboff measures the x86_64 and
+# aarch64-virt KERNEL images. It does NOT measure `kernel8.img`: the Pi bare-metal image compiles from
+# `kernel8()`'s curated `K8_FEATS`, a separate list that deliberately does not draw from the knob map
+# above, so a feature's presence or absence here says nothing about whether it reaches a Pi image
+# (that is SR1's open class, and it is why a pi ack is still a pi ack). Nor does it measure the ESP or
+# any staged media. A PASS is exactly one claim: the two kernel loadable images did not move.
+#
+# THE PERMANENT-REFUSAL CASE, named so nobody "fixes" it (pi 7, 2026-09-06). The control requires
+# `armed != off` on at least ONE arch, and the arches built here are x86_64 and aarch64-VIRT. A feature
+# whose sites are `baremetal`-gated lives only in `kernel8.img` — `main.rs` alone carries 72 such sites —
+# so arming it moves NEITHER built image, the control cannot fire, and knoboff returns NO VERDICT every
+# time, forever. That is correct: the tool is declining a comparison it has no power to make. But a seat
+# meeting a permanent NO VERDICT cold will read it as a broken gate and reach for a workaround, and the
+# only available workaround is weakening the control — which is precisely the failure the control exists
+# to prevent. So the refusal says so at the point of use. For `baremetal`-gated features the pi ack IS
+# the instrument, and it is not something to route around.
+#
+# EXIT STATUS is the deliverable — the brief says "run it and quote the result":
+#   0  knob-off images identical to baseline on every arch checked, control fired
+#   1  the knob-off image MOVED (the answer the brief is trying to prevent)
+#   2  no verdict — undeclared feature, dirty env, untracked sources, build failure, or a control
+#      that did not fire. A 2 is never a pass.
+_knoboff_arm_csv() {
+    local _save="$KERNEL_FEATURES" _out
+    KERNEL_FEATURES="${1:+--features $1}"
+    _out="$(arm_features)"
+    KERNEL_FEATURES="$_save"
+    printf '%s' "${_out#--features }"
+}
+
+# Build one (arch, feature-set) in the throwaway tree and objcopy the loadable image out.
+# $1 tree  $2 target-dir  $3 x86|arm  $4 features-csv  $5 out-flat  $6 log
+_knoboff_flat() {
+    local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6"
+    local _tspec _elf _TOOLBIN
+    _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    case "$_arch" in
+        x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
+        arm) _tspec="../../aarch64-unaos.json"; _elf="$_tgt/aarch64-unaos/release/unaos-kernel" ;;
+        *)   echo "knoboff: bad arch $_arch" >&2; return 2 ;;
+    esac
+    local _fargs=""; [ -n "$_feats" ] && _fargs="--features $_feats"
+    if ! ( cd "$_tree/unaos/crates/kernel" \
+           && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
+              --target "$_tspec" $NIGHTLY_FLAGS $_fargs ) >>"$_log" 2>&1; then
+        return 1
+    fi
+    [ -f "$_elf" ] || return 1
+    "$_TOOLBIN/llvm-objcopy" -O binary "$_elf" "$_out" >>"$_log" 2>&1 || return 1
+    return 0
+}
+
+# sha256 + size of a flat image, "sha size" on one line.
+_knoboff_id() { printf '%s %s' "$(sha256_of "$1")" "$(wc -c < "$1" | tr -d ' ')"; }
+
+knoboff() {
+    local feat="${1:-}" baseline="${2:-}"
+    if [ -z "$feat" ]; then
+        echo -e "${COLOR_RED}usage: ./arroyo knoboff <feature> [baseline-ref]${COLOR_RESET}"
+        echo "       <feature>      a cargo feature declared in crates/kernel/Cargo.toml [features]"
+        echo "       [baseline-ref] default: HEAD when the tree is dirty, HEAD~1 when it is clean"
+        return 2
+    fi
+
+    local REPO; REPO="$(cd "$WORKSPACE_DIR/.." && pwd)"
+    local CARGO_TOML="$WORKSPACE_DIR/crates/kernel/Cargo.toml"
+
+    # (1) DECLARED. A cfg on an undeclared feature is always false — it builds, it passes `check`, and
+    # every site under it is dead while reading as live (GATE-KNOB / knob-hygiene.sh). Measuring
+    # byte-identity for a name cargo has never heard of is measuring nothing.
+    local declared
+    declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$CARGO_TOML" | sort -u)"
+    if ! printf '%s\n' "$declared" | grep -qx -- "$feat"; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — '$feat' is not declared in crates/kernel/Cargo.toml [features].${COLOR_RESET}"
+        echo -e "         A cfg on an undeclared feature is always false, so nothing here could be measured."
+        echo -e "         Declared: $(printf '%s' "$declared" | tr '\n' ' ')"
+        return 2
+    fi
+
+    # (2) ENV — asked as a FEATURE-SET question, not as an env-var-name question. The first cut of this
+    # check scanned for `UNAOS_*` in the environment and refused; it fired on every single run, because
+    # BUILD-SHA-1 fifty lines up EXPORTS `UNAOS_GIT_SHA` itself. A guard that trips on its own script is
+    # a guard everyone learns to pass `WITH_ENV=1` to, which is how the real condition stops being
+    # checked. So compare the set this run would build knob-off against the set a knob-free invocation
+    # composes, by re-entering this very script with every `UNAOS_*` stripped and reading the banner
+    # back — the mapping is 1400 lines of `[ -n "${UNAOS_X:-}" ] && _feats=`, and no second copy of it
+    # in this function would stay true for a week.
+    #
+    # ⚠ `UNAOS_GIT_SHA` is `option_env!`-embedded in the image (BUILD-SHA-1), so it is a byte the
+    # comparison would see. All three builds below inherit THIS process's value — one arroyo, one sha,
+    # constant across the three — which is the whole reason knoboff drives cargo itself instead of
+    # calling the baseline tree's own `./arroyo`, whose sha would be its own.
+    export UNAOS_GIT_SHA="${UNAOS_GIT_SHA:-unknown}"
+    local _u=() _v
+    for _v in $(env | sed -n 's/^\(UNAOS_[A-Za-z0-9_]*\)=.*/\1/p'); do _u+=( -u "$_v" ); done
+    local default_csv=""
+    default_csv="$( env "${_u[@]}" "$0" knoboff 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*m//g' \
+                    | sed -n 's/^⚡ kernel features: //p' | head -1 )" || true
+
+    # (3) SOURCES. An untracked .rs is part of the change and `git diff HEAD` cannot carry it, so a run
+    # that ignored it would compare a tree that does not exist.
+    local untracked
+    untracked="$(cd "$REPO" && git ls-files --others --exclude-standard -- unaos/crates unaos/*.json 2>/dev/null || true)"
+    if [ -n "$untracked" ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — untracked source files under unaos/ :${COLOR_RESET}"
+        printf '%s\n' "$untracked" | sed 's/^/         /'
+        echo -e "         'git diff HEAD' cannot carry them. Commit them, or move them out of the tree."
+        return 2
+    fi
+
+    # (4) BASELINE.
+    local head_sha; head_sha="$(cd "$REPO" && git rev-parse HEAD)"
+    local dirty=0; ( cd "$REPO" && git diff --quiet HEAD -- ) || dirty=1
+    if [ -z "$baseline" ]; then
+        if [ "$dirty" -eq 1 ]; then baseline="$head_sha"; else baseline="${head_sha}~1"; fi
+    fi
+    local base_sha
+    if ! base_sha="$(cd "$REPO" && git rev-parse --verify "${baseline}^{commit}" 2>/dev/null)"; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — '$baseline' is not a commit in this repo.${COLOR_RESET}"
+        return 2
+    fi
+    if [ "$base_sha" = "$head_sha" ] && [ "$dirty" -eq 0 ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — baseline == HEAD and the tree is clean: there is no change to measure.${COLOR_RESET}"
+        return 2
+    fi
+
+    # (5) FEATURE SETS. off = the set this run would build with `<feature>` removed; on = the same set
+    # with it present. Both are printed with the verdict: "byte-identical" without the set beside it is
+    # not a claim anyone can check.
+    local base_feats="" f acc=""
+    case "$KERNEL_FEATURES" in --features\ *) base_feats="${KERNEL_FEATURES#--features }" ;; esac
+    for f in ${base_feats//,/ }; do [ "$f" = "$feat" ] && continue; acc="$acc$f,"; done
+    local off_csv="${acc%,}"
+    local on_csv="${off_csv:+$off_csv,}$feat"
+    local off_arm on_arm
+    off_arm="$(_knoboff_arm_csv "$off_csv")"
+    on_arm="$(_knoboff_arm_csv "$on_csv")"
+
+    # The env verdict, now that both sets exist: this run's ARMED set (whatever knobs the caller had)
+    # against the set a knob-free invocation composes. Equal => the knob-off build below IS the default
+    # image and the classic "default OFF => byte-identical to baseline" claim is what gets measured.
+    # Unequal => still a legitimate measurement ("does <feature> move the TEGRA knob-off image"), and
+    # the right one for a feature whose every site is gated on a second feature — but it is a DIFFERENT
+    # claim, so it is opt-in and the verdict line names the set.
+    if [ -n "$default_csv" ] && [ "$base_feats" != "$default_csv" ] && [ "${UNAOS_KNOBOFF_WITH_ENV:-}" != "1" ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — this environment does not compose the DEFAULT feature set.${COLOR_RESET}"
+        echo -e "         armed here : ${base_feats:-<none>}"
+        echo -e "         default    : ${default_csv}"
+        echo -e "         The knob-off build would not be the default image, which is what"
+        echo -e "         'default OFF => byte-identical to baseline' is a claim about. Either run with a"
+        echo -e "         clean environment, or say you mean the other claim:"
+        echo -e "         ${COLOR_YELLOW}UNAOS_KNOBOFF_WITH_ENV=1 <your knobs> ./arroyo knoboff $feat${COLOR_RESET}"
+        return 2
+    fi
+    if [ -z "$default_csv" ]; then
+        echo -e "${COLOR_YELLOW}⚠ knoboff: could not read the default feature set back from a knob-free re-entry;${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  proceeding, but the 'is this the default image' half is UNCHECKED this run.${COLOR_RESET}"
+    fi
+    # A feature that is ON by default inverts the question — knob-off then means REMOVING shipped code,
+    # and the baseline it is compared against still contains it. Say so rather than printing a verdict
+    # whose words ("knob-off byte-identical") mean something else here.
+    case ",${default_csv}," in
+        *",${feat},"*) echo -e "${COLOR_YELLOW}⚠ '${feat}' is ON by default: this run measures REMOVING it, not adding it.${COLOR_RESET}" ;;
+    esac
+
+    local SCR="${HOME}/unaos-bench/scratch/knoboff"
+    local TREE="$SCR/knoboff-tree" TGT="$SCR/target"
+    local STAMP; STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
+    local LOG="$SCR/build-$STAMP.log"
+    local PATCHF="$SCR/worktree-$STAMP.patch"
+    mkdir -p "$SCR" "$TGT"
+    : > "$LOG"
+
+    echo -e "${COLOR_PURPLE}══ knoboff: $feat ══${COLOR_RESET}"
+    echo -e "   baseline   ${base_sha}  $(cd "$REPO" && git log --format=%s -1 "$base_sha" | cut -c1-64)"
+    echo -e "   current    ${head_sha}$([ "$dirty" -eq 1 ] && echo ' + uncommitted diff')"
+    echo -e "   knob-off   x86: [${off_csv:-<none>}]   arm: [${off_arm:-<none>}]"
+    echo -e "   knob-on    x86: [${on_csv}]   arm: [${on_arm:-<none>}]"
+    echo -e "   tree       $TREE   (both builds run HERE — one directory, no path delta)"
+    echo -e "   log        $LOG"
+
+    ( cd "$REPO" && git diff HEAD ) > "$PATCHF"
+
+    # (6) THROWAWAY WORKTREE. Cached across runs so a second measurement is incremental.
+    if [ ! -e "$TREE/.git" ]; then
+        ( cd "$REPO" && git worktree prune ) >/dev/null 2>&1 || true
+        if ! ( cd "$REPO" && git worktree add --detach "$TREE" "$base_sha" ) >>"$LOG" 2>&1; then
+            echo -e "${COLOR_RED}knoboff: NO VERDICT — could not create the throwaway worktree; see $LOG${COLOR_RESET}"
+            return 2
+        fi
+    fi
+
+    _knoboff_checkout() { # $1 = sha, $2 = patch-to-apply or ""
+        # ORDER IS THE WHOLE CORRECTNESS OF THIS FUNCTION, and the first cut had it wrong. A previous
+        # run leaves this tree carrying the applied working diff, so a plain `git checkout --detach`
+        # ABORTS ("local changes would be overwritten") and the `&&` chain never reaches the
+        # `reset --hard` that would have cleared them. It survived the early runs only because the
+        # baseline happened to equal the tree's current commit, where git lets the checkout no-op; the
+        # first run with a baseline that differs — i.e. every run after the first commit of a session —
+        # died at phase 1 with NO VERDICT. So: clear the tree FIRST, then move it, then clear again.
+        # `--force` on the checkout is the belt to that suspenders.
+        ( cd "$TREE" \
+          && git reset --hard -q HEAD \
+          && git clean -fdq \
+          && git checkout --force --detach -q "$1" \
+          && git reset --hard -q "$1" \
+          && git clean -fdq ) >>"$LOG" 2>&1 || return 1
+        if [ -n "${2:-}" ] && [ -s "$2" ]; then
+            ( cd "$TREE" && git apply --whitespace=nowarn "$2" ) >>"$LOG" 2>&1 || return 1
+        fi
+        return 0
+    }
+
+    local rc_base_x rc_base_a rc_cur_x rc_cur_a rc_on_x rc_on_a
+    local F_BX="$SCR/flat-base-x86.bin"  F_BA="$SCR/flat-base-arm.bin"
+    local F_CX="$SCR/flat-cur-x86.bin"   F_CA="$SCR/flat-cur-arm.bin"
+    local F_OX="$SCR/flat-armed-x86.bin" F_OA="$SCR/flat-armed-arm.bin"
+
+    echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF...${COLOR_RESET}"
+    if ! _knoboff_checkout "$base_sha" ""; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; return 2; fi
+    rc_base_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_BX" "$LOG" || rc_base_x=$?
+    rc_base_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_BA" "$LOG" || rc_base_a=$?
+
+    echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF...${COLOR_RESET}"
+    if ! _knoboff_checkout "$head_sha" "$PATCHF"; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; return 2; fi
+    rc_cur_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_CX" "$LOG" || rc_cur_x=$?
+    rc_cur_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_CA" "$LOG" || rc_cur_a=$?
+
+    echo -e "${COLOR_YELLOW}⚡ [3/3] current tree, knob ON (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
+    rc_on_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$on_csv" "$F_OX" "$LOG" || rc_on_x=$?
+    rc_on_a=0; _knoboff_flat "$TREE" "$TGT" arm "$on_arm" "$F_OA" "$LOG" || rc_on_a=$?
+
+    if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — a knob-OFF build failed (x86 base:$rc_base_x arm base:$rc_base_a x86 cur:$rc_cur_x arm cur:$rc_cur_a).${COLOR_RESET}"
+        echo -e "         tail of $LOG:"; tail -20 "$LOG" | sed 's/^/         /'
+        return 2
+    fi
+
+    # (7) CONTROL. Armed must differ from off on at least one arch. An x86-only feature legitimately
+    # leaves aarch64 alone (that is what `arm_features` is for), so the requirement is one arch, not
+    # both — but zero arches means this run could not have detected a difference at all.
+    local ctl_x=0 ctl_a=0
+    if [ $rc_on_x -eq 0 ] && ! cmp -s "$F_OX" "$F_CX"; then ctl_x=1; fi
+    if [ $rc_on_a -eq 0 ] && ! cmp -s "$F_OA" "$F_CA"; then ctl_a=1; fi
+    echo -e "   control    x86 armed≠off: $([ $ctl_x -eq 1 ] && echo YES || echo no)   arm armed≠off: $([ $ctl_a -eq 1 ] && echo YES || echo no)"
+    if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ]; then
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — arming '$feat' changed NEITHER image.${COLOR_RESET}"
+        if [ $rc_on_x -ne 0 ] || [ $rc_on_a -ne 0 ]; then
+            echo -e "         (the armed build itself failed: x86:$rc_on_x arm:$rc_on_a.) TWO causes, and the"
+            echo -e "         build log below says which. A feature with an IMPLIED PARTNER needs that partner's"
+            echo -e "         knob too — see this file's knob map. OR the feature is \`baremetal\`-gated and its"
+            echo -e "         code depends on Pi-only modules that do not exist on these targets, which is the"
+            echo -e "         SAME structural limit as the case below: an unresolved import of a Pi driver is what"
+            echo -e "         that looks like from here (\`piinstall\` reaches for crate::drivers::emmc2 and cannot"
+            echo -e "         find it). If so, the refusal is CORRECT AND PERMANENT and the pi ack is the"
+            echo -e "         instrument — do not chase a partner knob that does not exist."
+            tail -20 "$LOG" | sed 's/^/         /'
+        else
+            echo -e "         Either every site is gated on a SECOND feature nobody armed here (re-run as"
+            echo -e "         ${COLOR_YELLOW}UNAOS_<PARTNER>=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff $feat${COLOR_RESET}), or the"
+            echo -e "         feature emits no code at all. A comparison that cannot come out unequal is not a pass."
+            echo -e "         ${COLOR_YELLOW}⚠ IF '$feat' IS \`baremetal\`-GATED, THIS REFUSAL IS CORRECT AND PERMANENT.${COLOR_RESET}"
+            echo -e "         knoboff builds x86_64 and aarch64-VIRT only. A site gated on \`baremetal\` exists in"
+            echo -e "         kernel8.img and in NEITHER of those images, so arming the feature can never move one"
+            echo -e "         and this tool can never have power over it. That is the tool declining a comparison"
+            echo -e "         it cannot make — the pi ack is the instrument for those features. Do NOT weaken this"
+            echo -e "         control to get a verdict out of it; the control is the only reason the refusal is"
+            echo -e "         trustworthy in every OTHER case. (pi 7, SP2's neighbour, 2026-09-06.)"
+        fi
+        return 2
+    fi
+
+    # (8) VERDICT.
+    local rc=0
+    local a
+    for a in x86 arm; do
+        local base cur bfile cfile
+        if [ "$a" = x86 ]; then bfile="$F_BX"; cfile="$F_CX"; else bfile="$F_BA"; cfile="$F_CA"; fi
+        base="$(_knoboff_id "$bfile")"; cur="$(_knoboff_id "$cfile")"
+        if cmp -s "$bfile" "$cfile"; then
+            echo -e "${COLOR_GREEN}   ✅ $a knob-off image BYTE-IDENTICAL to baseline — ${base}${COLOR_RESET}"
+        else
+            local nbytes; nbytes="$(cmp -l "$bfile" "$cfile" 2>/dev/null | wc -l | tr -d ' ')"
+            echo -e "${COLOR_RED}   ❌ $a knob-off image MOVED${COLOR_RESET}"
+            echo -e "${COLOR_RED}      baseline ${base}${COLOR_RESET}"
+            echo -e "${COLOR_RED}      current  ${cur}${COLOR_RESET}"
+            echo -e "${COLOR_RED}      ${nbytes} byte(s) differ$([ "${base##* }" != "${cur##* }" ] && echo ' — and the SIZE changed, so this is code, not a line shift')${COLOR_RESET}"
+            rc=1
+        fi
+    done
+
+    if [ $rc -eq 0 ]; then
+        echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired.${COLOR_RESET}"
+        echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built"
+        echo -e "   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack."
+        # WHICH QUESTION THE SHA ANSWERS (pi 7's SP2, 2026-09-06). A before/after digest answers exactly
+        # one of two questions and they are not interchangeable: GUARDING A BASELINE (compare the artifact
+        # that EXCLUDES the change — identical means the baseline is safe) or PROVING THE CHANGE LANDED
+        # (score the artifact that CONTAINS it). For a knob-gated change the knob-off artifact is
+        # identical BY CONSTRUCTION, so reading it as proof the wiring works is a null result dressed as
+        # a pass — a check that cannot fire. knoboff answers the FIRST question, and the armed control
+        # probe above is why it cannot be mistaken for the second: it refuses a verdict outright unless
+        # arming the feature moves something, so a PASS here always carries a demonstration that the
+        # comparison had the power to fail.
+        echo -e "   This PASS GUARDS A BASELINE. It is not evidence the feature WORKS — score that on the"
+        echo -e "   armed artifact or by strings at the site (SP2). The control above is what keeps the two apart."
+    else
+        echo -e "${COLOR_RED}knoboff: FAIL — the knob-off image is not the baseline's. If nothing here is meant to be${COLOR_RESET}"
+        echo -e "${COLOR_RED}         armed by default, the usual cause is a LINE SHIFT: an inserted line moves every${COLOR_RESET}"
+        echo -e "${COLOR_RED}         panic::Location below it. Append onto an existing line (before its first //) or${COLOR_RESET}"
+        echo -e "${COLOR_RED}         put the statement inside an existing cfg region. EXECUTOR-BRIEF §5.${COLOR_RESET}"
+    fi
+    echo -e "   flat images kept in $SCR (flat-{base,cur,armed}-{x86,arm}.bin); patch $PATCHF"
+    return $rc
+}
+
 # --- Entry Point ---
 
 case "${1:-}" in
@@ -7614,6 +8156,39 @@ case "${1:-}" in
         ;;
     test-arm|test-aarch64)
         test_aarch64 "${2:-20}"
+        ;;
+    state)
+        # STATE (orin 23, 2026-09-09; pi 9 + rmbp 17): the four numbers a seat must never have to volunteer.
+        # Each measures a DIFFERENT silent failure: BEHIND trunk cost a false published measurement
+        # (rmbp-ledger B107: a 17-commit-stale shared ledger); AHEAD of trunk is an unlanded arc's price and
+        # was invisible for rounds because nobody said it aloud; OWED above origin/<branch> is the only one
+        # that answers "does Peter have a push waiting". A status line that prints two of the four just
+        # moves which drift is silent. Read-only; fetches first so the numbers are about NOW.
+        _br="$(git -C "$WORKSPACE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+        _head="$(git -C "$WORKSPACE_DIR" rev-parse --short HEAD 2>/dev/null)"
+        git -C "$WORKSPACE_DIR" fetch -q origin 2>/dev/null || echo "  (fetch failed — numbers below are as of the last fetch)"
+        # TRUNK is named on the line, not assumed silently: CLAUDE.md's ruling (2026-08-18) makes `main`
+        # the trunk but says to VERIFY while the UnaOS-gemini fast-forward is outstanding — the one drift an
+        # anti-drift verb cannot report is measuring against the wrong ref (rmbp 17's review). If the
+        # retired staging ref is AHEAD of origin/main, that is said aloud rather than silently measured past.
+        _trunk="origin/main"
+        _behind="$(git -C "$WORKSPACE_DIR" rev-list --count "HEAD..$_trunk" 2>/dev/null || echo '?')"
+        _ahead="$(git -C "$WORKSPACE_DIR" rev-list --count "$_trunk..HEAD" 2>/dev/null || echo '?')"
+        _gem_ahead=""
+        if git -C "$WORKSPACE_DIR" rev-parse --verify -q origin/UnaOS-gemini >/dev/null 2>&1; then
+            _g="$(git -C "$WORKSPACE_DIR" rev-list --count "$_trunk..origin/UnaOS-gemini" 2>/dev/null || echo 0)"
+            [ "$_g" != "0" ] && _gem_ahead="  ⚠ origin/UnaOS-gemini is ${_g} ahead of ${_trunk} — verify which ref is trunk (CLAUDE.md)"
+        fi
+        if git -C "$WORKSPACE_DIR" rev-parse --verify -q "origin/$_br" >/dev/null 2>&1; then
+            _owed="$(git -C "$WORKSPACE_DIR" rev-list --count "origin/$_br..HEAD" 2>/dev/null || echo '?')"
+        else
+            # A branch with no origin counterpart still has a MAGNITUDE (rmbp 17): say how much is new.
+            _owed="NEW(${_ahead} above ${_trunk}, no origin/$_br)"
+        fi
+        # awk, not `grep -c`: on a CLEAN tree grep's count is 0 and its exit is 1, which under errexit
+        # ended the verb silently before the line printed (found on the verb's second run, orin 23).
+        _dirty="$(git -C "$WORKSPACE_DIR" status --porcelain 2>/dev/null | awk '!index($0,"__pycache__"){n++} END{print n+0}')"
+        echo "state: ${_br}@${_head}  trunk=${_trunk}  behind-trunk=${_behind}  ahead-of-trunk=${_ahead}  owed-above-origin/${_br}=${_owed}  dirty=${_dirty}${_gem_ahead}"
         ;;
     check)
         check_both
@@ -7667,6 +8242,11 @@ case "${1:-}" in
         shift
         exec python3 "${WORKSPACE_DIR}/scripts/mbench.py" "$@"
         ;;
+    knoboff)
+        # KNOBOFF: byte-identity of the knob-OFF image against a baseline, measured in ONE directory.
+        # Exit status IS the result (0 identical / 1 moved / 2 no verdict) — see knoboff() above.
+        knoboff "${2:-}" "${3:-}" || exit $?
+        ;;
     clean)
         clean_all
         ;;
@@ -7677,7 +8257,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
         exit 1
         ;;
 esac

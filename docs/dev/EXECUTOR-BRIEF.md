@@ -18,8 +18,10 @@ MANDATORY HEAD (docs/dev/EXECUTOR-BRIEF.md):
 5. Knob-off byte-identity: new statements go inside an existing cfg region, or folded onto an
    existing line where the file carries a LINE-NEUTRAL rule (read the nearest "LINE-NEUTRAL append"
    comment and copy its shape). AN APPEND GOES BEFORE THE LINE'S FIRST `//` — after it, the statement is
-   a comment, compiles nothing, and the check stays green (LEDGER P7). Prove the position. When
-   `./arroyo knoboff <feature>` exists, run it and quote the result.
+   a comment, compiles nothing, and the check stays green (LEDGER P7). Prove the position, then
+   MEASURE it: `./arroyo knoboff <feature>` builds the knob-off loadable image at your baseline and
+   at your tree IN ONE DIRECTORY and compares them, with an armed control probe. Quote its EXIT
+   STATUS: 0 = byte-identical, 1 = the knob-off image MOVED, 2 = no verdict. A 2 is never a pass.
 6. GATE before commit: `cd unaos && ./arroyo check` exit 0 both arches; run the QEMU suite named by
    the brief. Quote exit codes and leg counts, never "green".
 7. LEDGER: your commit ticks <ledger-id> in docs/dev/LEDGER.md or docs/dev/OS/<track>-ledger.md

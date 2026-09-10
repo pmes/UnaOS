@@ -799,6 +799,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     unaos_kernel::arch::acpi::pm_timer_report(rsdp_addr);
 
+    // 4b''''. BOOTFADT: name the FADT RESET_REG / RESET_VALUE the `reboot` verb will write, while the
+    // console pump is still alive. On the rMBP the verb's own witnesses never reach the FTDI cable
+    // (the reset lands before the next device-service pass), so this line is the only record of what
+    // the ladder will do on this machine. Read-only.
+    #[cfg(target_arch = "x86_64")]
+    unaos_kernel::arch::acpi_power::reset_report();
+
     // BPACE: the whole ACPI phase — MADT topology discovery, the DMAR/IOMMU report and the PM-timer
     // liveness probe. Stamped HERE rather than immediately after `acpi::init` so the next stamp's
     // `d=` is the calibration alone and nothing else. x86-only, like the three calls it closes.
@@ -3172,9 +3179,12 @@ fn gui_try_send_x86(ev: unaos_kernel::pal::Event) -> Result<(), unaos_kernel::pa
 //     same line; nothing holds it across a blit.
 //   * The heap lock — NO. The phase-33 row loop allocates nothing.
 //
-// That is why the rescue instance is safe to start, and it is also why it does NOT re-mint the shell
-// window: `open_shell_window` allocates and takes the table, which is fine, but the row it would add
-// duplicates one the corpse's surface still backs. Skipping it is the narrower action.
+// That is why the rescue instance is safe to start. It also RE-MINTS the shell window (WCSER-REMINT,
+// flight 3's lesson — the corpse shell was the dominant operator-visible cost of five rehomes): the
+// mint path allocates and takes the table, both of which the census above clears. It does not CREATE
+// a second row — the corpse's row still backs one — it ADOPTS that row in place through
+// `wm::shell_remint` (see the WCSER-REMINT ledger in `wm.rs` for why adoption, not close-and-
+// recreate: the close path's drain barrier can spin 21 s against the corpse's leaked blit debt).
 //
 // KNOWN RESIDUAL, named rather than discovered later: the corpse's `BlitGuard` is never dropped, so
 // its `BLIT_ACTIVE` registration stands for the rest of the boot. Nothing here waits on that count
@@ -3224,9 +3234,11 @@ static RENDER_ROLE_EPOCH_X86: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 /// WCSER-REHOME — set across the spawn of a RESCUE render instance, and consumed by that instance on
-/// entry. A rescue instance skips `open_shell_window`: the dead instance's shell row is still
-/// registered and its surface memory is still mapped (a parked core frees nothing), so minting a
-/// second row would put two shell windows on the desktop and pay ~5 MB for the privilege.
+/// entry. A rescue instance RE-MINTS the shell window by ADOPTION (WCSER-REMINT): the dead
+/// instance's shell row is still registered and its surface memory is still mapped (a parked core
+/// frees nothing), so instead of minting a second row — two shell windows on the desktop, and a
+/// window count that grows by one per rehome — it repoints THAT row's surface at a fresh store and
+/// binds a fresh console to it. Five rehomes (flight 3's count) leave one shell window.
 #[cfg(target_arch = "x86_64")]
 static RENDER_RESCUE_X86: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -3250,6 +3262,16 @@ fn render_rehome_service() {
     if dead < 64 {
         DEAD_CORES_X86.fetch_or(1u64 << dead, Relaxed);
     }
+
+    // DEBTCLEAR (flight 3, Q1) — settle the corpse's blit ledger BEFORE the role check: every dead
+    // core owes its debt back, whether or not it carried a singleton role. A parked core never runs
+    // its `BlitGuard` drop, so without this every later F4 drain that waits for global blit-exit
+    // parity spins its full bound against a ledger nothing can ever pay down — flight 3's [wedge1]
+    // wedge (1 GiB of spins against blits owed by cores dead for ~250 s). The settle forgives the
+    // count, banks per-core credits so a migrated or revenant holder's late drop cannot double-book,
+    // and latches a taint that buys one full present against the zombie-store hazard. See the
+    // DEBTCLEAR ledger in `video/wm.rs`.
+    let _ = unaos_kernel::video::wm::blit_debt_forgive(dead);
 
     // Did this core carry the one role we re-home? A `no` is still worth a line: the census is the
     // deliverable, and a silent return would make "nothing was owed" and "we forgot" identical.
@@ -6363,14 +6385,16 @@ fn x86_render_service(cpu: usize) {
     // WCSER-REHOME — is this instance a REPLACEMENT for a render task that died with its core?
     //
     // Consumed (`swap`) rather than read, so the flag cannot leak into some later ordinary spawn.
-    // A rescue instance differs from the original in exactly one way, and only one: it does NOT mint
-    // a shell window. The dead instance's row is still registered in `wm`'s table and its surface
-    // memory is still mapped — a parked core frees nothing — so that window keeps compositing its
-    // last contents, and minting a second one would put two shell windows on the desktop and pay
-    // ~5 MB for the confusion. The trade is named rather than hidden: **the rescued desktop's shell
-    // window is a corpse — it composites, and nothing types into it.** Keys still reach ring-3 apps
-    // through `user_input_route` and the window system still gets its clicks, which is the whole of
-    // what "input works again" has to mean for this recovery to be worth having.
+    // A rescue instance differs from the original in exactly one way, and only one: instead of
+    // MINTING a shell window it RE-MINTS the dead instance's one (WCSER-REMINT, in the tuple init
+    // below). The dead instance's row is still registered in `wm`'s table and its surface memory is
+    // still mapped — a parked core frees nothing — so creating a second row would put two shell
+    // windows on the desktop, one per rehome (flight 3 had five). The rescue therefore ADOPTS that
+    // row: `wm::shell_remint` repoints its surface at this instance's fresh store, a fresh console
+    // binds to it, and the keyboard is handed back — the corpse-shell state ("it composites, and
+    // nothing types into it", the trade the first cut of this recovery accepted and flight 3
+    // repriced as the operator reading "keyboard gone" for 17 minutes) no longer survives the
+    // recovery. Keys additionally still reach ring-3 apps through `user_input_route`, as before.
     let rescue = RENDER_RESCUE_X86.swap(false, Ordering::SeqCst);
     // WCSER-REHOME — this instance's OWNER EPOCH, captured once. Re-checked every pass below; see
     // `RENDER_ROLE_EPOCH_X86` for why a role needs the same revenant discipline `comp_gate_release`
@@ -6379,7 +6403,7 @@ fn x86_render_service(cpu: usize) {
     if rescue {
         serial_println!(
             ":: SCHED-X86: render task is a REHOMED instance on core {} — draining GUI_CHANNEL_X86 \
-             again; the previous instance's shell window is a corpse and is not re-minted ::",
+             again; the previous instance's shell window is owed a re-mint (WCSER-REMINT, below) ::",
             cpu
         );
     }
@@ -6410,9 +6434,6 @@ fn x86_render_service(cpu: usize) {
                 unaos_kernel::video::wm::WIN_NONE,
             )
         };
-        // WCSER-REHOME — `!rescue`: a replacement instance does not re-mint the dead one's shell
-        // window (see the `rescue` latch above). `empty()` is the same declined-surface shape
-        // `open_shell_window` already returns on failure, so no path below needs a new case.
         if desktop && !rescue {
             let info = front_fb.info();
             match open_shell_window(info.width, info.height) {
@@ -6428,6 +6449,117 @@ fn x86_render_service(cpu: usize) {
                 }
                 None => empty(),
             }
+        } else if rescue {
+            // WCSER-REMINT — the rescue instance re-mints the dead instance's shell window, by
+            // ADOPTION (see the ledger in `wm.rs`). Three states, three arms:
+            //
+            //  * the corpse's row is LIVE (the ordinary rehome — a steal kills the render core and
+            //    touches no row): repoint that row's surface at a fresh store, bind a fresh console,
+            //    hand the keyboard back. Same id, same box — the window count does not grow, however
+            //    many rehomes a boot suffers (flight 3: five). This is the state the dock-reopen
+            //    route can NEVER reach: `dock::pin_shell` offers the shell tile only when no live
+            //    `KERNEL_OWNER_DESKTOP` row exists, and here one does.
+            //  * NO row, on the crispy desktop (the wedge-abandon teardown closed it, or the
+            //    operator did, before the core died): mint fresh through the SAME fallible path the
+            //    dock reopen arm uses — flight 3's `[shellwin] reopen win=2 route=dock` proves that
+            //    path works from a rescue instance; this runs it at bring-up instead of waiting for
+            //    an operator to find the dock tile.
+            //  * NO row, no desktop: nothing to re-mint and nowhere to put one — `empty()`, the
+            //    declined-surface shape every path below already handles.
+            //
+            // NOT gated on `desktop` for the adoption arm, deliberately: a `KERNEL_OWNER_DESKTOP`
+            // row exists iff something minted a shell window (the crispy desktop at bring-up, or
+            // the wedgeinj fixture on the QEMU gate, where `desktop_uefi::activate` never runs), and
+            // adopting whatever exists is precisely what makes the recovery exercisable headlessly.
+            //
+            // Focus, per flight 3's D-7 finding (focus parked on kernel furniture = keys consumed by
+            // nothing): the successful re-mint takes the keyboard for the shell —
+            // `user_input_set_active(0)` + `focus_changed(KERNEL_OWNER_DESKTOP)`, the exact pair the
+            // dock reopen arm uses — so focus is never left parked on a corpse. One focus steal per
+            // rehome, priced against 17 minutes of "keyboard gone".
+            use unaos_kernel::video::wm;
+            match wm::shell_row_geometry() {
+                Some((id, w, h, stride)) => {
+                    let len = h.saturating_mul(stride);
+                    let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                    if len == 0 || stride % 4 != 0 || store.try_reserve_exact(len).is_err() {
+                        // The corpse row stays on glass — the pre-REMINT behaviour, now a named
+                        // decline instead of a policy.
+                        serial_println!(
+                            ":: [wcser] shell re-mint DECLINE reason=alloc win={} len={} — the \
+                             corpse window stays == tripwire ::",
+                            id,
+                            len
+                        );
+                        empty()
+                    } else {
+                        store.resize(len, 0);
+                        let mut fb = unaos_kernel::video::FrameBuffer::new();
+                        // Same surface contract as `open_shell_window`: `Bgr` + 4 bytes, the
+                        // little-endian `0x00RRGGBB` word `wm::draw_window` reads.
+                        fb.init(
+                            store.as_mut_ptr() as usize,
+                            len,
+                            unaos_boot_info::FrameBufferInfo {
+                                width: w,
+                                height: h,
+                                stride: stride / 4,
+                                bytes_per_pixel: 4,
+                                pixel_format: unaos_boot_info::PixelFormat::Bgr,
+                            },
+                        );
+                        fb.fill_screen(wm::DESKTOP_BG);
+                        if wm::shell_remint(id, fb.base(), len, w, h, stride) {
+                            let mut con = unaos_kernel::console::Console::new();
+                            con.mark_in_window();
+                            // On glass now (BG fill; the prompt paint below follows on the crispy
+                            // desktop), owner-fenced like every present of this id.
+                            let _ = wm::present_outcome_owned(id, wm::KERNEL_OWNER_DESKTOP);
+                            unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                            wm::focus_changed(wm::KERNEL_OWNER_DESKTOP);
+                            serial_println!(
+                                ":: [wcser] shell re-minted win={} — corpse row adopted in place \
+                                 ({}x{} surface repointed, fresh console bound, keyboard handed to \
+                                 the shell) == witness ::",
+                                id,
+                                w,
+                                h
+                            );
+                            (store, unaos_kernel::video::Screen::direct(fb), con, id)
+                        } else {
+                            // The row closed or changed between the geometry read and the repoint
+                            // (a wedge-abandon teardown racing the rescue). Fail closed: the dock
+                            // tile now exists for exactly this state.
+                            serial_println!(
+                                ":: [wcser] shell re-mint DECLINE reason=row-changed win={} — the \
+                                 dock's shell tile is the reopen route == tripwire ::",
+                                id
+                            );
+                            empty()
+                        }
+                    }
+                }
+                None if desktop => {
+                    let info = front_fb.info();
+                    match open_shell_window(info.width, info.height) {
+                        Some((store, fb, id)) => {
+                            let mut con = unaos_kernel::console::Console::new();
+                            con.mark_in_window();
+                            unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                            serial_println!(
+                                ":: [wcser] shell re-minted win={} — fresh row (the corpse was \
+                                 already closed before the rehome) == witness ::",
+                                id
+                            );
+                            // SHELLWIN-OOM — `direct`, never `new`, as above.
+                            (store, unaos_kernel::video::Screen::direct(fb), con, id)
+                        }
+                        // `open_shell_window` named its decline on the wire.
+                        None => empty(),
+                    }
+                }
+                None => empty(),
+            }
         } else {
             empty()
         }
@@ -6436,6 +6568,17 @@ fn x86_render_service(cpu: usize) {
     let mut shell_pal = unaos_kernel::pal::TargetPal::new(&mut shell_screen);
     #[cfg(feature = "wc")]
     let mut shell_dirty = false;
+    // FURNITUREFOCUS — publish where a slot-0 keystroke LANDS as of this binding, so the click
+    // router's furniture arms can decline a keyboard hand-off into a dead sink (flight 3 D-7:
+    // the corpse shell read as "keyboard gone" because `user_input_set_active(0)` pointed at a
+    // tuple this task never bound). One line, computed FROM the tuple rather than alongside it,
+    // so every arm above — boot mint, its decline, the WCSER-REMINT adoption and each of its
+    // decline arms — is covered by construction and cannot drift from the truth it publishes.
+    #[cfg(feature = "wc")]
+    unaos_kernel::arch::x86_64::syscall::shell_key_sink_note(
+        desktop,
+        shell_id != unaos_kernel::video::wm::WIN_NONE,
+    );
 
     if desktop {
         serial_println!(
@@ -6804,6 +6947,10 @@ fn x86_render_service(cpu: usize) {
                             unaos_kernel::video::wm::KERNEL_OWNER_DESKTOP,
                         );
                         unaos_kernel::arch::x86_64::syscall::user_input_set_active(0);
+                        // FURNITUREFOCUS — the reopen re-binds the tuple, so the slot-0 sink is
+                        // live again: re-declare it so furniture clicks resume handing the
+                        // keyboard to the shell.
+                        unaos_kernel::arch::x86_64::syscall::shell_key_sink_note(true, true);
                         shell_dirty = false;
                         serial_println!("[shellwin] reopen win={} route=dock == witness ::", id);
                     }

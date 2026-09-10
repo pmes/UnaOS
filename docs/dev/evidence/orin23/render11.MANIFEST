@@ -1,0 +1,17 @@
+# render11-20260908T2321Z-600887c — orin 22/23 BOOTROOT flight (render11): FLIGHT-render11.md §1 fifteen-knob line (render10's minus the deleted UNAOS_SDMMCROOT); root is the disk this kernel is FOUND on by content, other UnaOS disks at /volumes/<LABEL>; built 2026-09-08 by orin 23 in a clean throwaway worktree at 600887c2. KNOWN GAP (baton orin-23): clone-vs-alias (integrate/BRIEF-AMENDMENT-01 item 5) NOT in — two cards sharing (num_blocks,BS_VolID) dedupe to one /volumes mount; root unaffected. Score with scratch/orin22/stage11/scorer11.sh on the FLASHED kernel.elf.
+# KNOBS: UNAOS_TEGRA=1 UNAOS_TEGRA_EL0=1 UNAOS_WITNESS=1 UNAOS_ORINRENDER=1 UNAOS_DESKCASCADE=1 UNAOS_ORINRX=1 UNAOS_HOLOCRON=1 UNAOS_ORINCLICK=1 UNAOS_TCUPROBE=1 UNAOS_TCURX=1 UNAOS_BSPTICK=1 UNAOS_BSPRUN=1 UNAOS_NET4=1 UNAOS_NET5=1 UNAOS_GA10B_PROBE3=2
+# effective-features: witness,ehcihid,holocron,tegra,bsptick,bsprun,ga10bprobe3,ga10bprobe3b,orinclick,tegra_el0,tegrasmp,orinrender,desktop_firmware,orinrx,tcuprobe,tcurx,deskcascade,net4,pcie3,pcie2,net5,sdmmc
+# ELF max_vaddr=0x34b748 (this boot's identity on the wire; score the boot by it FIRST — FLIGHT.md §C.1)
+# BUILD-STAMP: UNAOS-BUILD-STAMP-1:600887c2 (VERSIONWIN 907435cd: a -d<6hex> suffix would mean a dirty tree; none here)
+# built-from=exec-orin22-bootroot@600887c2347f7ba33da6d1c3a302be256eb74dec  esp-jetson EXIT=0  by=orin 23
+# UNFLOWN — QEMU models no Tegra234; this boot is the only verdict that exists.
+5385387b16bd5685ff97515340e5926aa657fa4fd0055e088db5145b1fa57a5d  APPS/ELFHELLO.ELF
+17c29b6a23d68e507ed217a796e1040ec98745ce5dc696f6763b250189eb38e3  APPS/PULSE.ELF
+21a4d16c61c6896000761b4273b0a30b328a4b77b97ef79a0d08b38c9bcce9ca  APPS/STAT.ELF
+1adbec3998826b92830e29d54d86929b6caa66f4518a2fa6b601f83e0b12f861  APPS/VUG.ELF
+d7892e319707e4f8b11a7050d79a10a19fc3085ea557169a5ae1a26a06937283  APPS/VUGK.ELF
+854969c422737dc55c595daf18f7df34b0e1ba065cf7ce59c6fccc8c7817dd85  EFI/BOOT/BOOTAA64.EFI
+5545d8b84fdf0b8c9a5a3f8938ec7e37b9d6a47961f7c746af0c50513b4dc127  HELLO.BIN
+23b60beee5e7c404e4dabc15e5d2d8139ea323d6d5d26e38a33bc7fb324da0bf  SRC.SHA
+cebf760c26014b45a032626cbb2c59f6926f4a17b00a9b9985957df1ef15246f  SRC.TGZ
+57ae5ec38b933e8eaddf7d218e8f66e86b81b49f65b3ca4c9d5d187a7286d765  kernel.elf

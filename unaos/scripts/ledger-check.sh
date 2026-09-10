@@ -33,6 +33,60 @@ import re, sys, os, subprocess, glob
 root = sys.argv[1]
 ENUM = ("open", "fixed-unflown", "flown", "landed", "dropped")
 OWNERS = {"orin", "pi", "rmbp", "shared-gate"}
+
+# GATE-LEDGER FIELD COUNT (rmbp-ledger B63, built rmbp 17 2026-09-08). A markdown row is its PIPES,
+# so a literal `|` inside a cell silently becomes a column boundary — and `\|` does NOT save it in
+# this parser. The failure is nasty because it is not silent in a useful way: the row keeps parsing,
+# the columns SHIFT, and what goes red is `owner` or `status` naming a fragment of somebody's prose.
+# That is a gate reporting a symptom two columns downstream of the defect. Assert the count directly,
+# name the sign, and STOP scoring the row — every later check on it would be reading the wrong cells.
+#
+# REGISTERED EXCEPTIONS, and they are registrations rather than a skip list: each is PRINTED on every
+# run, and one that no longer matches a real mismatch goes RED. An allowlist nothing can falsify is
+# the thing this lane keeps convicting (rmbp-ledger B95/B96/B98/B101), so this one is falsifiable in
+# both directions. Both entries must reach zero; neither is a decision to leave the row broken.
+# GATE-LEDGER ABSENCE FORM (rmbp-ledger B107, built rmbp 17 2026-09-09). A row that asserts a thing
+# is ABSENT FROM A POPULATION has to name the population and show it was ENUMERATED. Three times in
+# one round this seat wrote "nothing does X" after searching one FILE, and the claim was about a
+# CAPABILITY; each search was correct about its scope and confidence tracked thoroughness WITHIN the
+# scope, which is exactly what a scope error cannot show you. orin 23's form, adopted: an absence is
+# written `population=<the command that enumerates it>, hits=0`, or it is written "not found in
+# <scope>". The moment it fires is typing the word -- which is what makes it addressable at all.
+#
+# ⛔ WHAT THIS CHECK IS AND IS NOT, because overselling it would be the defect it exists for.
+# It is a LEXICAL SAMPLER over phrasings that were thought of, NOT proof that every absence claim in
+# the corpus is enumerated -- "all the ways English says nothing does X" is itself a population that
+# cannot be enumerated, so this gate has a blind spot BY CONSTRUCTION and its own summary says so.
+# A green here means "no row matched a known absence phrasing without an enumeration", never
+# "every absence claim is sound".
+#
+# MEASURED BEFORE IT SHIPPED, and the measurement chose the pattern list. A WIDE set (no such / is
+# not in / none of them / does not exist / zero hits / ...) matched 32 of 213 rows and would have RED-
+# LINED 10, of which roughly 8 were FALSE POSITIVES: quoted program output ("no such file or
+# directory" in an -ENOENT log line), a correction of a PEER's claim, a statement about a Rust type,
+# and rows whose proof was real but not command-shaped. A gate reding honest rows in two other seats'
+# files is worse than the defect, so the wide set was DROPPED rather than papered over with
+# exceptions. The TIGHT set below matched 9 rows, every one a genuine population-absence claim, and
+# all 9 are this lane's own -- zero in orin's or pi's ledgers today.
+ABSENCE_PHRASE = re.compile(
+    r"\b(no [a-z]+ verb|run by nothing|nothing (?:runs|invokes|opens|does) |exists? only on"
+    r"|on no other head|zero commits|no commits on any branch)\b", re.I)
+# An enumeration is a COMMAND that walks the population, or the honest downgrade "not found in".
+ABSENCE_ENUM = re.compile(
+    r"`[^`]*(grep|git log|git grep|git cat-file|git rev-list|ls |find |for [a-z] in|awk)[^`]*`"
+    r"|not found in", re.I)
+ABSENCE_REG = {
+    # Same falsifiable shape as FIELDCOUNT_REG: printed every run, and a registration whose row no
+    # longer matches goes RED. Empty today -- every matching row already carries its enumeration.
+}
+abs_seen = set()
+absence = []
+
+FIELDCOUNT_REG = {
+    "docs/dev/OS/rmbp-ledger.md:B24": "three injections put TWO rows' content on one line; splitting them is a CONTENT call, and the ledger-cell pipe convention it belongs to is Peter's open decision (rmbp-ledger J6). Registered 2026-09-08 by rmbp 17",
+}
+fc_seen = set()
+registered = []
 FETCHED = ("fixed-unflown", "flown", "landed")
 files = [p for p in ["docs/dev/LEDGER.md"] + sorted(glob.glob("docs/dev/OS/*-ledger.md")) if os.path.exists(p)]
 skipped = [p for p in ["docs/dev/LEDGER.md"] if not os.path.exists(p)]
@@ -67,6 +121,52 @@ HEADS = heads()
 def reachable(s):
     return any(subprocess.run(["git", "merge-base", "--is-ancestor", s, h], capture_output=True).returncode == 0 for h in HEADS)
 
+# STRICT — WIRED, NOT REMEMBERED (pi 7, 2026-09-06, turning rmbp 13's own criterion back on it).
+# The deferral above is only honest if something forces the deferred refs to resolve SOMEWHERE, and
+# the first cut left that to a landing seat exporting UNAOS_LEDGER_STRICT=1 by hand. There is exactly
+# ONE invocation of this script (arroyo's `check_both`, no environment), and no landing-specific gate
+# command for the export to live in -- so "the landing runs strict" was a remembered step, which is
+# the same shape as the norm-only exits this whole change was chosen over. A backstop nobody is wired
+# to run is a backstop that runs never.
+#
+# THE TRIGGER IS THE BRANCH, and it is semantic rather than heuristic: **the trunk enforces, track
+# branches defer.** On a track branch a reference to another seat's row is unresolvable by
+# construction and deferring is correct. On the TRUNK it is not: trunk is where everything lands, so a
+# trunk row pointing at something not on trunk IS a dangling reference, whoever wrote it. The landing
+# merges to trunk and runs the trunk battery there, so strict arrives exactly when and where the refs
+# became resolvable, with nobody remembering anything.
+#
+# REJECTED — pi 7's proposal, and it was close: auto-strict when the tree carries rows from two or
+# more distinct seat prefixes. It reads as structural but it keeps a false-red window: a track branch
+# that syncs trunk inherits another seat's prefix (hw-rmbp gains SO rows the moment orin lands), and a
+# reference to a THIRD seat's unlanded row then reds on a branch that could never have carried it. The
+# branch test has no such window because it does not try to infer the landing from the contents.
+#
+# ⚠ THE TRIGGER IS A BRANCH NAME, AND THIS REPO HAS RENAMED ITS TRUNK ONCE (pi 7's residual, taken).
+# CLAUDE.md carries a standing instruction to VERIFY which ref is trunk rather than trust it -- the
+# retired `UnaOS-gemini` staging name is still a live ref on origin and is NOT main's tip. If the trunk
+# is renamed again and nobody sets `UNAOS_LEDGER_TRUNK`, strict silently stops firing and every tree
+# defers forever: "a backstop that runs never", returning through the rename door. What keeps it merely
+# quiet rather than silent is the DEFERRED line naming the regime in force -- a seat standing on a
+# renamed trunk reads "branch `<newname>` is a track branch" and has the contradiction in front of them.
+# Whoever renames the trunk sets `UNAOS_LEDGER_TRUNK` here, or changes this default in the same commit.
+#
+# `UNAOS_LEDGER_STRICT=1` still forces strict anywhere (and `=0` suppresses it, trunk included, for a
+# trunk that is mid-landing and knows it). `UNAOS_LEDGER_TRUNK` names the trunk branch -- it defaults
+# to `main`, is the one knob the go-red proof turns, and is why that proof can run on a track branch.
+TRUNK = os.environ.get("UNAOS_LEDGER_TRUNK", "main")
+_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()
+_env_strict = os.environ.get("UNAOS_LEDGER_STRICT")
+if _env_strict == "0":
+    STRICT, STRICT_WHY = False, "suppressed by UNAOS_LEDGER_STRICT=0"
+elif _env_strict == "1":
+    STRICT, STRICT_WHY = True, "forced by UNAOS_LEDGER_STRICT=1"
+elif _branch == TRUNK:
+    STRICT, STRICT_WHY = True, f"automatic: on the trunk branch `{TRUNK}`, where every ref must resolve"
+else:
+    STRICT, STRICT_WHY = False, f"off: branch `{_branch}` is a track branch, cross-branch refs deferred"
+deferred = []
 ledger_ids = set()
 if "docs/dev/LEDGER.md" in files:
     for hdr, rows in tables(open("docs/dev/LEDGER.md").read()):
@@ -74,6 +174,26 @@ if "docs/dev/LEDGER.md" in files:
         for _, cells in rows:
             m = re.match(r"([A-Z]+[0-9]+)", cells[0])
             if m: ledger_ids.add(m.group(1))
+    # P-ROWS ARE BULLETS, NOT TABLE ROWS — and the resolver could not see them (rmbp 13, 2026-09-06).
+    # The cross-ref regex has always accepted `→ P<n>` as a reference, but `ledger_ids` was built ONLY
+    # from tables with a `status` column, and the protocol rows live in LEDGER.md as `- **P14** — …`
+    # bullets. So every `→ P<n>` that has ever been written resolved against an id set containing ZERO
+    # P ids and RED-LINED — a false red on a row that exists, in the gate whose job is telling those
+    # apart. Found by this gate reding a `→ P15` cross-ref to a P-row filed in the same commit. The
+    # id-space the gate accepts and the id-space it can resolve have to be the same one.
+    for _m in re.finditer(r"^-\s+\*\*([A-Z]+[0-9]+)\*\*", open("docs/dev/LEDGER.md").read(), re.M):
+        ledger_ids.add(_m.group(1))
+
+def _check_ref(ref, where, rid, red, deferred, ledger_ids, files, STRICT):
+    """One home for the resolve/defer/red decision, so the TABLE scan and the BULLET scan below
+    cannot drift apart — two copies of this logic is how one of them silently stops matching."""
+    if "docs/dev/LEDGER.md" not in files or ref in ledger_ids:
+        return
+    pfx = re.match(r"([A-Z]+)", ref).group(1)
+    if pfx in ("SR", "SO", "SP") and not STRICT:
+        deferred.append(f"{where}: {rid} cross-ref → {ref} DEFERRED — {pfx} rows are branch-local; resolves when that seat's ledger lands (UNAOS_LEDGER_STRICT=1 to require it now)")
+    else:
+        red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
 
 rows_seen = 0
 for path in files:
@@ -89,7 +209,29 @@ for path in files:
             if not m:
                 red.append(f"{where}: row id `{cells[0][:30]}` does not match ^[A-Z]+[0-9]+"); continue
             rid = m.group(1)
+            # FIELD COUNT first: every check below indexes cells by header position, so a shifted row
+            # makes all of them read the wrong text. Report the row, not its symptom, and move on.
+            if len(cells) != len(hdr):
+                _k = f"{path}:{rid}"
+                _d = len(cells) - len(hdr)
+                if _k in FIELDCOUNT_REG:
+                    fc_seen.add(_k)
+                    registered.append(f"{where}: {rid} fields={len(cells)} header={len(hdr)} ({_d:+d}) REGISTERED — {FIELDCOUNT_REG[_k]}")
+                else:
+                    _why = ("a literal `|` inside a cell splits the row (`\\|` does not save it) — reword it"
+                            if _d > 0 else "a cell is missing; every column needs one, `—` for empty")
+                    red.append(f"{where}: {rid} has {len(cells)} fields, header has {len(hdr)} ({_d:+d}) — {_why}")
+                continue
             if rid in ids: red.append(f"{where}: duplicate id {rid}")
+            _rowtext = " | ".join(cells)
+            _ap = ABSENCE_PHRASE.search(_rowtext)
+            if _ap and not ABSENCE_ENUM.search(_rowtext):
+                _k = f"{path}:{rid}"
+                if _k in ABSENCE_REG:
+                    abs_seen.add(_k)
+                    absence.append(f"{where}: {rid} absence claim {_ap.group(0)!r} REGISTERED — {ABSENCE_REG[_k]}")
+                else:
+                    red.append(f"{where}: {rid} asserts an absence ({_ap.group(0)!r}) and names no ENUMERATION — give the command that walks the population, or write \"not found in <scope>\"")
             ids.add(rid)
             status_raw = cells[st] if st < len(cells) else ""
             status = re.sub(r"[*_`]", "", status_raw).strip()
@@ -101,15 +243,103 @@ for path in files:
                 if not first or first[0].strip(",;") not in OWNERS:
                     red.append(f"{where}: {rid} owner `{cells[ow][:30]}` not in {sorted(OWNERS)}")
             rowtext = " | ".join(cells)
-            for ref in re.findall(r"→\s*([SP][0-9]+)", rowtext):
-                if "docs/dev/LEDGER.md" in files and ref not in ledger_ids and path != "docs/dev/LEDGER.md":
-                    red.append(f"{where}: {rid} cross-ref → {ref} does not resolve in docs/dev/LEDGER.md")
+            # SEAT-PREFIXED IDS (three-seat vote 2026-09-06: pi 7 proposed, orin 15 and rmbp 12
+            # agreed; S1-S32 freeze, new shared rows take SP<n> pi / SR<n> rmbp / SO<n> orin).
+            # Sequential allocation is STRUCTURALLY broken across unpushed branches -- a reserved
+            # gap only works if every seat can see it, and none can; two collisions in one night.
+            # The id check above already passes them (^[A-Z]+[0-9]+). THIS resolver did not: the
+            # old r"→\s*([SP][0-9]+)" could not match "→ SP32" (after S comes P, not a digit), so
+            # a prefixed cross-ref was SILENTLY NOT CHECKED -- not red, skipped. A check that
+            # cannot fire, in the gate whose whole job is that they can.
+            # MENTION vs REFERENCE (pi 7, 2026-09-06). A checker scanning free text cannot tell a
+            # MENTION of an id from a REFERENCE to one: fixtures, examples and quoted commit
+            # messages are all live input to this resolver. The escape is the ARROW GLYPH and it
+            # is now a CONTRACT, not an accident: the UNICODE arrow below is a reference the gate
+            # must resolve; an ASCII "->" is a mention and is invisible here. Cite fixtures and
+            # examples with "->". pi 7 hit this by quoting this gate's own SP99 go-red fixture
+            # ⚠ CORRECTED 2026-09-06 (pi 7, on their own claim; this seat had propagated it): that
+            # SP99 sat in LEDGER.md's header, and until the fix above LEDGER.md's own refs were
+            # EXEMPT — so it would have passed silently, forever, not red-lined. The mention-vs-
+            # reference hazard is real and the arrow contract stands, but the incident that
+            # illustrated it did not actually fire. It fires NOW, which is the better reason to keep
+            # citing fixtures with "->": the exemption that made it inert is gone.
+            # into a ledger header, where the sentence documenting the test became a failing
+            # input to the test.
+            # CROSS-BRANCH REFS ARE NOT DANGLING REFS (pi 7 found the collision, rmbp 13 settled it,
+            # 2026-09-06). A seat-prefixed row lives on ONE branch until the landing merges the
+            # ledgers, so a reference to it is unresolvable HERE by construction and resolvable
+            # THERE by construction. The live instance: `| A36 (→ SR2) |` on hw-jetson, where SR2
+            # lives on hw-rmbp -- zero SR rows in any of that tree's three ledger files.
+            #
+            # THE PART THAT MADE THIS A RULE CHANGE RATHER THAN A ONE-OFF: orin did nothing wrong.
+            # The id contract three lines up SANCTIONS the suffix form (`^[A-Z]+[0-9]+` "a cross-ref
+            # suffix `(→ S<n>)` is allowed after it"), while LEDGER P14 said a cross-ref to an
+            # unfolded row stays PROSE. An id-suffix cross-ref cannot be prose without breaking the
+            # id convention, so the two rules collided and the sanctioned one lost -- silently today
+            # (older resolver skipped it), RED tomorrow (this one finds it). Green now, red later, on
+            # a row whose author followed the documented form.
+            #
+            # THE SPLIT: shared ids (`S<n>`, `P<n>`) live in EVERY tree's LEDGER.md -- measured, 27
+            # to 31 S-rows on main, hw-jetson, hw-pi4 and hw-rmbp alike -- so a `→ S<n>` that does
+            # not resolve is a real dangling ref and stays RED. Seat-prefixed ids (`SR`/`SO`/`SP`)
+            # are branch-local by construction (SR appears only on hw-rmbp, SO only on hw-jetson),
+            # so an unresolved one is DEFERRED: printed, counted, named in the summary -- never
+            # silently skipped, which is the failure this gate exists to not repeat.
+            #
+            # REJECTED, and why, so nobody re-proposes it: "defer only when the prefix has ZERO rows
+            # in this tree" is a sharper discriminator and would still catch a typo like `→ SR99` on
+            # hw-rmbp. It false-reds in the PARTIAL FOLD window -- SR1 landed, SR2 not yet, a ref to
+            # SR2 from a tree that now has one SR row -- which is precisely the surprise-mid-landing
+            # this change exists to prevent. Never false-red; catch the typos where they are
+            # catchable instead:
+            #
+            # `UNAOS_LEDGER_STRICT=1` turns every DEFERRED into a RED. **The landing runs it.** After
+            # a merge all three seats' ledgers are in one tree, every seat-prefixed ref is resolvable,
+            # and a typo that rode along for a week surfaces there -- at the one moment it can be
+            # told apart from a legitimate cross-branch reference.
+            for ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", rowtext):  # see _check_ref below
+                # LEDGER.md'S OWN CROSS-REFS WERE NEVER RESOLVED (pi 7 found it, rmbp 13 fixed it,
+                # 2026-09-06). This condition used to carry `and path != "docs/dev/LEDGER.md"`, which
+                # exempted the over-arching ledger from the check every arch ledger is subjected to —
+                # the one file all three seats write to, and the one every arch ledger is resolved
+                # AGAINST. Proved by mutation on both trees, not by reading: `→ S777` injected into
+                # LEDGER.md passed at exit 0; the same ref in an arch ledger red at exit 1. Every
+                # `→ S<n>` written into LEDGER.md this session had been unchecked.
+                #
+                # The exemption was defensible when it was written: without seat prefixes there was no
+                # way to tell a self-reference from a cross-branch one, so resolving LEDGER.md would
+                # have red-lined legitimate refs to rows on other branches. `SR`/`SO`/`SP` plus the
+                # branch-triggered strict/deferred split solve exactly that, so the clause is now
+                # obsolete rather than load-bearing — a cross-branch ref from LEDGER.md defers like any
+                # other, and a dangling one reds like any other.
+                _check_ref(ref, where, rid, red, deferred, ledger_ids, files, STRICT)
             if "unaos-bench/scratch" in rowtext:
                 red.append(f"{where}: {rid} cites evidence outside git (unaos-bench/scratch)")
             for dp in re.findall(r"`?(docs/[A-Za-z0-9_./-]+\.md)", rowtext):
                 if not os.path.exists(dp):
                     red.append(f"{where}: {rid} evidence path {dp} does not exist in the tree")
-            for s in set(re.findall(r"(?<![0-9A-Za-z])([0-9a-f]{7,8})(?![0-9A-Za-z])", rowtext)):
+            # ARTIFACT DIGESTS ARE NOT COMMITS, and a row legitimately cites them: a BLOB sha
+            # (`git rev-parse <commit>:<path>`), an objcopy/sha256 of a built image, a kernel8.img
+            # digest. Two reddened this gate in one session and both "fixes" were to damage the
+            # evidence to satisfy the checker -- pad the token, or reword around it.
+            # The escape is EXPLICIT and author-declared: prefix the hash with a label and a colon
+            # (`sha256:731c8f5b`, `blob:311bccea`, `img:d73a8981`). An INFERRED label -- "skip if
+            # the word `img` appears nearby" -- was tried first and rejected: it would silently
+            # stop checking a real commit sha in any row that happened to mention an image, which
+            # is a check that cannot fire. An UNLABELLED hex token is still a short commit sha and
+            # must resolve.
+            # DEDUP: collect first, report each distinct sha ONCE. The escape check is
+            # per-OCCURRENCE (a sha may appear both declared and bare in one row, and the bare
+            # occurrence is still a reference), but the FINDING is per-sha. Switching this loop
+            # from set(findall) to finditer to add the escape silently dropped that dedup and a
+            # row citing one bad sha twice reported it twice -- duplicate findings are how a gate
+            # teaches people to skim its output.
+            bare = set()
+            for m in re.finditer(r"(?<![0-9A-Za-z])([0-9a-f]{7,8})(?![0-9A-Za-z])", rowtext):
+                if re.search(r"[A-Za-z][A-Za-z0-9_-]*:$", rowtext[max(0, m.start() - 24):m.start()]):
+                    continue   # author-declared artifact digest, not a commit
+                bare.add(m.group(1))
+            for s in sorted(bare):
                 if not sha_exists(s):
                     red.append(f"{where}: {rid} names sha {s} which is not a commit in this repo")
                 elif head in FETCHED and not reachable(s):
@@ -123,7 +353,7 @@ for lg in sorted(glob.glob("docs/dev/evidence/**/*.log", recursive=True)):
     try: body = open(lg, errors="replace").read()
     except OSError: body = ""
     if not re.search(r"size 0x[0-9a-fA-F]+|img=\[0x[0-9a-fA-F]+|KELF min=0x[0-9a-fA-F]+ max=0x[0-9a-fA-F]+", body):
-        red.append(f"{lg}: evidence excerpt carries no boot anchor (`size 0x…` or `img=[…`) — unidentifiable")
+        red.append(f"{lg}: evidence excerpt carries no boot anchor (`size 0x…`, `img=[…` or `KELF min=0x… max=0x…`) — unidentifiable")
 
 # RULINGS.md (pi 6, 2026-09-05): rulings get reversed (the cube, EVAC); an append-only quote file lets a
 # reader find only the dead one. Every R-row carries status ∈ {live, superseded, retracted} and, when
@@ -147,14 +377,56 @@ if os.path.exists("docs/dev/RULINGS.md"):
             if not tgt or any(t not in rids for t in tgt):
                 red.append(f"docs/dev/RULINGS.md:{ln}: {rid} is superseded but names no existing R<n> in superseded-by")
 
+# BULLET ROWS ARE ROWS TOO (pi 7's class, second half, 2026-09-06). The scan above walks TABLE rows,
+# so `docs/dev/LEDGER.md`'s protocol entries — `- **P14** — …` bullets, 15 of them — were never
+# scanned for cross-refs at all: a `→ S<n>` written inside a P-row has never been resolved. That is the
+# same shape as the two defects fixed today (a `→ P<n>` the resolver accepted but could never resolve;
+# LEDGER.md's own table refs exempted): **the id-space the gate accepts, the id-space it can resolve,
+# and the file-space it actually scans have to be the same three sets.** Routed through `_check_ref` so
+# this half and the table half cannot drift. Measured before enabling: the 15 bullets carry 2 refs, both
+# `→ SR1`, which resolves here and defers correctly on a branch without it.
+if "docs/dev/LEDGER.md" in files:
+    for _ln, _line in enumerate(open("docs/dev/LEDGER.md").read().split("\n"), 1):
+        _m = re.match(r"^-\s+\*\*([A-Z]+[0-9]+)\*\*", _line)
+        if not _m:
+            continue
+        for _ref in re.findall(r"→\s*((?:S[PRO]?|P)[0-9]+)", _line):
+            _check_ref(_ref, f"docs/dev/LEDGER.md:{_ln}", _m.group(1), red, deferred, ledger_ids, files, STRICT)
+
+# A REGISTRATION THAT NO LONGER MATCHES ANYTHING IS ITSELF A FINDING — the allowlist has to be
+# falsifiable or it becomes the place defects go to be forgotten. Skipped for a file not in this tree.
+for _k, _why in ABSENCE_REG.items():
+    if _k not in abs_seen and _k.split(":")[0] in files:
+        red.append(f"stale absence registration {_k} — the row enumerates now; delete the entry ({_why})")
+if absence:
+    say(f"ABSENCE — {len(absence)} registered exception(s); NOT findings, and each must reach zero:")
+    for a in absence: print("   ", a)
+
+for _k, _why in FIELDCOUNT_REG.items():
+    if _k not in fc_seen and _k.split(":")[0] in files:
+        red.append(f"stale field-count registration {_k} — the row parses correctly now; delete the entry ({_why})")
+
 for p in skipped: say(f"SKIP {p} — not in this tree (arrives at the trunk sync)")
 if rows_seen == 0:
     say("NO VERDICT — no ledger rows found in", files or "(no ledger files)"); sys.exit(2)
+if registered:
+    say(f"FIELD COUNT — {len(registered)} registered exception(s); NOT findings, and each must reach zero:")
+    for r in registered: print("   ", r)
+if deferred:
+    say(f"DEFERRED — {len(deferred)} cross-branch cross-ref(s); NOT findings. Strict is {STRICT_WHY};"
+        f" these become reds automatically when this lands on `{TRUNK}`:")
+    for d in deferred: print("   ", d)
+# DEDUPE, for the reason f9255b68 deduped shas: a row citing the same missing id three times printed
+# three identical findings, and duplicate findings are how a gate teaches people to skim its output.
+# Order-preserving so the first occurrence still reads in file order.
+red = list(dict.fromkeys(red))
+deferred = list(dict.fromkeys(deferred))
 if red:
     say(f"RED — {len(red)} finding(s) across {len(files)} file(s), {rows_seen} rows:")
     for r in red: print("   ", r)
     sys.exit(1)
-say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, status ∈ enum, owners known, cross-refs resolve, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
+_defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
+say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS: ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve{_defnote}, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>")
 PY
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
@@ -163,3 +435,11 @@ PY
 #   owner "peter"          -> RED                        `S99` in a PARAGRAPH  -> GREEN (prose control)
 #   evidence/*.log without `size 0x`/`img=[` -> RED      RULINGS R-row status `pending` -> RED
 #   RULINGS `superseded` with no R<n> in superseded-by -> RED
+#   a literal `|` added inside any cell -> RED naming the row, the counts and the sign (B63)
+#   a cell DELETED from a row              -> RED, the negative sign, "a cell is missing"
+#   a registered row (B24/C10) unchanged   -> printed as REGISTERED, exit 0, never silent
+#   a registration whose row is repaired   -> RED as a stale registration (the allowlist is falsifiable)
+#   `→ SO99` in a row      -> DEFERRED, exit 0, PRINTED (SO is branch-local; hw-jetson owns it)
+#   the same under UNAOS_LEDGER_STRICT=1 -> RED, exit 1   (the landing's setting)
+#   `→ SR2` on hw-rmbp     -> resolves, neither red nor deferred (the control: the check still fires
+#                             where the target is local, which is the half a blanket skip would lose)

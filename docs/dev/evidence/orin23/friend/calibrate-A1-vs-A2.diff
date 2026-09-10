@@ -1,0 +1,11 @@
+21,22c21,22
+< oÿoätM mvIonlsutmael lsPerroitaolc=o0lxIdnet0e0r1faa1c3e :â €2”7 ADBeFf0a5u5l-tB-1wBr8i-t4eC 2s6u-b8s0t4i8t-u7t4i8oFn3 7gBuAaAr2dD FA R0ME
+< D ::
+---
+> bÿoäoMtm Ivnosltuamlel Psreortioaclo=l0Ixndtee0r0f1aac1e3:  â2€7”A BDFe0f5a5u-lBt1-Bw8r-i4tCe2 6s-u8b0s4t8i-t7u4t8iFo3n7 BgAuAa2rDdF  A0RM
+> ED ::
+782c782
+< :: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0xN (I=1) | JM6 EL2 latch: HCR_EL2=0xN IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880869cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+---
+> :: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0xN (I=1) | JM6 EL2 latch: HCR_EL2=0xN IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880744cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+== friend-diff calibrate: diff exit=1 (0 = EMPTY) ==
