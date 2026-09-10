@@ -326,6 +326,60 @@ pub(crate) fn hid_print_screen_edge(cur_keys: &[u8; 6], prev_keys: &[u8; 6]) -> 
     cur_keys.contains(&HID_USAGE_PRINT_SCREEN) && !prev_keys.contains(&HID_USAGE_PRINT_SCREEN)
 }
 
+/// PRTSCRCHORD — HID usages `3` (0x20) and `4` (0x21), "Keyboard 3 and #" / "Keyboard 4 and $".
+pub(crate) const HID_USAGE_DIGIT_3: u8 = 0x20;
+pub(crate) const HID_USAGE_DIGIT_4: u8 = 0x21;
+
+/// PRTSCRCHORD — **did an Apple screenshot chord go DOWN in this report?** ⌘⇧3 (GUI+Shift+3) and
+/// ⌘⇧4 (GUI+Shift+4), judged at the same seam as [`hid_print_screen_edge`] and for the same reason:
+/// the rMBP's INTERNAL Apple keyboard never emits usage 0x46 — there is no Print Screen key on it —
+/// so the metal-proven capture (flight 5, `SCREEN2.PNG` 2880x1800) was bound to a key the bench
+/// machine cannot press. These two chords are what every Mac operator's hands already know.
+///
+/// WHY THIS LAYER. The chord is a MODIFIER BYTE plus a USAGE, and the boot report is the only place
+/// both are in one hand: above the driver `pal::Event::Key` is a bare `u8` with no modifier field,
+/// and [`hid_key_ascii`] folds every GUI-held key to 0, so above the driver ⌘⇧3 does not exist.
+/// Both decoders already have `modifiers` (report byte 0), `cur_keys` and `prev_keys` in scope at
+/// the 0x46 site; this predicate sits beside it and is asked right after it.
+///
+/// THE TEST. Both a GUI bit (bit 3 LGUI / bit 7 RGUI — `HID_MOD_GUI`) and a Shift bit (bit 1 / bit
+/// 5 — `HID_MOD_SHIFT`) held, and the digit present NOW and absent from the PREVIOUS report — an
+/// edge, diffed exactly as the lock keys and 0x46 are, so a chord held for half a second arms one
+/// capture and not one per restated report. Left and right of each modifier count alike. Extra
+/// modifiers (Ctrl, Alt) do not disqualify the chord: on macOS ⌃⌘⇧3 is still a screenshot.
+///
+/// THE CHORD TYPES NOTHING, BY CONSTRUCTION. [`hid_key_ascii`] returns 0 for any usage while a GUI
+/// bit is held (the "GUI and Alt suppress the key entirely" rule), so the character loops above the
+/// call site emit no `Key('3')` / `Key('#')` for the chord — the same suppression 0x46 gets from its
+/// `(0, 0)` table entry, reached through the modifier instead of the table. The release path
+/// (`hid_key_release_ascii`) deliberately ignores GUI and will emit a lone `KeyUp('#')` when the
+/// digit lifts; that is the documented "spurious release, safe" case and is left alone.
+///
+/// ⌘⇧4 is bound to the SAME whole-screen capture. On macOS it is region-select; region-select is
+/// reserved here (no pointer-driven selection exists yet) and the chord is honoured as a capture
+/// rather than ignored, so the witness names which chord fired.
+///
+/// Returns the chord's witness token, or `None`. The caller does exactly what the 0x46 caller does:
+/// one witness line and `prtscr::request()` — one atomic store, inside the controller's lock.
+#[inline]
+pub(crate) fn hid_screenshot_chord_edge(
+    cur_keys: &[u8; 6],
+    prev_keys: &[u8; 6],
+    modifiers: u8,
+) -> Option<&'static str> {
+    if modifiers & HID_MOD_GUI == 0 || modifiers & HID_MOD_SHIFT == 0 {
+        return None;
+    }
+    if cur_keys.contains(&HID_USAGE_DIGIT_3) && !prev_keys.contains(&HID_USAGE_DIGIT_3) {
+        return Some("cmd-shift-3");
+    }
+    if cur_keys.contains(&HID_USAGE_DIGIT_4) && !prev_keys.contains(&HID_USAGE_DIGIT_4) {
+        // Reserved: region-select for cmd-shift-4 — whole-screen capture until a selector exists.
+        return Some("cmd-shift-4");
+    }
+    None
+}
+
 
 /// Wall-clock budget for hardware handshakes, in `crate::arch::now_cycles()` units (rdtsc cycles on
 /// x86_64, CNTVCT ticks on aarch64). Resolved per-arch so the same ~wall-clock window holds despite
@@ -4927,6 +4981,17 @@ impl XhciController {
                                             if hid_print_screen_edge(&cur_keys, &prev_keys) {
                                                 serial_println!(
                                                     ":: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::"
+                                                );
+                                                crate::video::prtscr::request();
+                                            } else if let Some(chord) =
+                                                hid_screenshot_chord_edge(&cur_keys, &prev_keys, modifiers)
+                                            {
+                                                // PRTSCRCHORD: ⌘⇧3 / ⌘⇧4 — same request, same deferral;
+                                                // the witness names which chord fired. `else if` so a
+                                                // report carrying both 0x46 and a chord arms once.
+                                                serial_println!(
+                                                    ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on xHCI -> capture armed ::",
+                                                    chord
                                                 );
                                                 crate::video::prtscr::request();
                                             }

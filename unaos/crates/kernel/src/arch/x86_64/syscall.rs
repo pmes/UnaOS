@@ -3795,11 +3795,18 @@ fn sys_win_present(win: u64) -> i64 {
             // register read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
             pace_advance(id);
         } // `_wh` drops (before `t`), then WINDOWS released — the composite below runs without it.
+        // D-3 RESUMEPAINT: the present passed the ownership proof and is entering the composite —
+        // stamp it BEFORE the composite runs, so a wedge inside the pass leaves `present-entered`
+        // as the furthest rung rather than looking like the app never presented.
+        vugres_present_enter(slot, id);
         // WCPAR — the `+1`-biased slot is the wm `owner` this window was created under (`sys_win_create`
         // passes `slot + 1`); the compositor declines the present if the resolved row no longer carries
         // it, which is the recycled-id fence that makes releasing the lock above safe.
         (wc_shim::present(wm_id, (slot as u64) + 1), wm_id)
     };
+    // D-3 RESUMEPAINT: the outcome is in — a landing one claims the pending witness and prints the
+    // resume→first-present gap; a declined one only advances the loss ladder.
+    vugres_present_outcome(slot, id, outcome);
     // VSYNC-PACE: the witness rollup, OUTSIDE the guard — see `wpace_emit` for why a serial burst may not
     // run under the outermost compositor lock.
     wpace_tick();
@@ -4710,8 +4717,13 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
             // present consumes exactly one frame slot, as a whole-box one does.
             pace_advance(id);
         } // `_wh` drops (before `t`), then WINDOWS released.
+        // D-3 RESUMEPAINT: same pre-composite stamp as the whole-box verb — a banded present is a
+        // present, and the resume witness must not go blind on a client that switched to bands.
+        vugres_present_enter(slot, id);
         (wc_shim::present_rows(wm_id, y0 as usize, y1 as usize, (slot as u64) + 1), wm_id)
     };
+    // D-3 RESUMEPAINT: as the whole-box verb — the outcome decides positive line vs ladder rung.
+    vugres_present_outcome(slot, id, outcome);
     // VSYNC-PACE: as the whole-box verb, and outside the guard for the same reason.
     wpace_tick();
     // CLOSE-TEARDOWN — same terminal answer as `sys_win_present`, same headless carve-out: a banded
@@ -4921,6 +4933,439 @@ static USER_INPUT_WAKES: AtomicU64 = AtomicU64::new(0);
 static USER_INPUT_RESUMES: [AtomicU64; crate::arch::memory::USER_SLOTS] =
     [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
 
+// ---- RESUMEPAINT (D-3) — the resume-edge first-present witness --------------------------------
+//
+// FLIGHT-1 Q4 ended at a wall this block exists to remove: three tears landed inside a 2 s
+// `[vugpause2] resume` burst, the leading hypothesis was "the first present after a resume edge is
+// under-covered", and there was NO first-present instrument anywhere in the tree to convert that
+// from circumstantial to convicted — `first=` on `[wc-d] verify` is the first bad PIXEL, not the
+// first present. DRAGWIDE's present-accounting proof covered `drain_deferred`; the `edge=focus` /
+// `edge=unhide` resume path was never in it.
+//
+// WHAT THIS MEASURES, exactly: from the moment a NAMED resume edge actually releases a parked
+// waiter ([`user_input_wake_edge`], the only armer) to the moment a present from that slot next
+// REACHES THE COMPOSITOR AND LANDS (`Composited`/`Coalesced` at the present verbs' tail). One line
+// per resume episode:
+//
+//     [vugres] first present win=N asid=X gap_ms=M
+//
+// and — the arm that is the actual deliverable, because it converts silence into a named stage —
+// if no present lands within [`VUGRES_BOUND_MS`] of ACTIVE composition (see below), the backstop
+// emits the negative loudly, naming the FURTHEST stage the resume's story reached:
+//
+//     [vugres] NO PRESENT since resume win=N — request lost at <stage> asid=X gap_ms=M
+//
+// THE STAGE LADDER is the resume edge's loss map, one rung per place the first present can die:
+//   woken            the edge released a waiter and nothing was heard from the task again —
+//                    the wake was issued but the task never returned from the park (never
+//                    scheduled: dead core, rehome hole);
+//   park-return      the task came back through `sys_input_wait` and then went silent — it runs
+//                    but never drained input and never presented;
+//   input-polled     the app drained its ring (`sys_input_poll`) and then never presented — the
+//                    app-side render loop lost the request;
+//   re-parked        the app went BACK to sleep without presenting — it woke, re-read its flags,
+//                    and concluded it had nothing to do (the focus-before-unhide window, or a
+//                    stale hidden bit: the wake succeeded and the REASON was lost);
+//   present-entered  a present passed the ownership proof and entered the composite — and never
+//                    produced an outcome that lands (a wedge inside the pass);
+//   suppressed       the present reached wm and wm DECLINED it because the owner reads as hidden
+//                    — the unhide never became visible to the compositor (stale z / stale bit);
+//   no-row           the present resolved to no compositor row — the window died across the pause.
+//
+// "ACTIVE COMPOSITION": the 2 s bound is counted only against a present pipeline that is
+// demonstrably answering — [`VUGRES_ACTIVITY`] (presents from ANY slot reaching the verbs' tail)
+// must have advanced since the arm, or the backstop keeps waiting. A machine whose whole
+// compositor is wedged is Q1/D-1's business; blaming the resume path for it would be a lie.
+//
+// INSTRUMENT ONLY. No behaviour on the resume path changes; hot-path cost is O(1) atomics — one
+// relaxed load on every un-armed fast path, one CAS on the arm, one store + fetch_max on the
+// present tail. The sweep in [`vugres_backstop`] rides the existing ~256 ms backstop cadence.
+// x86-only; the aarch64 twin is untouched.
+
+/// D-3: stage ladder values. Monotone — [`vugres_stage`] advances with `fetch_max`, so the record
+/// is the FURTHEST rung, never the latest. `re-parked` deliberately outranks `input-polled`: an app
+/// that drained and then re-parked is further through the story than one that merely drained.
+const VUGRES_STAGE_NONE: u32 = 0;
+const VUGRES_STAGE_WOKEN: u32 = 1;
+const VUGRES_STAGE_PARK_RETURN: u32 = 2;
+const VUGRES_STAGE_POLLED: u32 = 3;
+const VUGRES_STAGE_REPARKED: u32 = 4;
+const VUGRES_STAGE_PRESENT_ENTERED: u32 = 5;
+const VUGRES_STAGE_SUPPRESSED: u32 = 6;
+const VUGRES_STAGE_NOROW: u32 = 7;
+
+/// D-3: how long a resumed slot may go without landing a present — measured against ACTIVE
+/// composition (see the block comment) — before the negative arm fires. Two seconds is ~8 backstop
+/// periods and two orders of magnitude above the measured resume→present gap, so a line here is a
+/// lost request, not a slow one.
+const VUGRES_BOUND_MS: u64 = 2000;
+
+/// D-3: ms timestamp of the resume edge, per slot. `0` = no witness pending — the whole state
+/// machine keys off this word, and both emit paths claim it with an atomic exchange so exactly one
+/// line is ever printed per arm.
+static VUGRES_RESUME_MS: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+/// D-3: the furthest stage the pending resume reached (the ladder above).
+static VUGRES_STAGE: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS];
+/// D-3: [`VUGRES_ACTIVITY`]'s value at the arm — the "has anyone presented since?" baseline.
+static VUGRES_ACTIVITY_AT: [AtomicU64; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
+/// D-3: the last window id this slot carried through a present verb's ownership proof —
+/// `u32::MAX` = never presented. Stamped unconditionally (one relaxed store per present) so the
+/// NEGATIVE line can name the window of a slot that never presents after its resume.
+static VUGRES_LAST_WIN: [AtomicU32; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicU32::new(u32::MAX) }; crate::arch::memory::USER_SLOTS];
+/// D-3: presents (any slot, any outcome) that reached the present verbs' tail — the "composition
+/// is answering" clock the negative arm's bound is measured against.
+static VUGRES_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+/// D-3: emit counters — positive / negative lines printed, cumulative. Read by the selftest so its
+/// verdict gates the lines actually printing, not merely the state machine cycling.
+static VUGRES_EMITTED_POS: AtomicU64 = AtomicU64::new(0);
+static VUGRES_EMITTED_NEG: AtomicU64 = AtomicU64::new(0);
+
+/// D-3: the stage's wire name, with the loss reading baked into the token — see the ladder in the
+/// block comment for the long form of each.
+fn vugres_stage_name(stage: u32) -> &'static str {
+    match stage {
+        VUGRES_STAGE_WOKEN => "woken (park never returned)",
+        VUGRES_STAGE_PARK_RETURN => "park-return (ran, never drained)",
+        VUGRES_STAGE_POLLED => "input-polled (drained, never presented)",
+        VUGRES_STAGE_REPARKED => "re-parked (slept again without presenting)",
+        VUGRES_STAGE_PRESENT_ENTERED => "present-entered (composite never landed)",
+        VUGRES_STAGE_SUPPRESSED => "suppressed (wm declined: owner reads hidden)",
+        VUGRES_STAGE_NOROW => "no-row (window died across the pause)",
+        _ => "unarmed",
+    }
+}
+
+/// D-3: arm the witness for `slot`. Returns whether THIS call armed it — a pending witness is
+/// never re-stamped, so a focus+unhide burst measures from its FIRST edge and the caller can
+/// retract an arm whose wake turned out to release nobody ([`vugres_disarm`]).
+///
+/// Called BEFORE the `futex_wake`, deliberately: the released task runs the moment the wake lands,
+/// and an arm issued after it could lose the race against the task's own first present — the
+/// witness would then wait 2 s for a present that already happened and print a false negative.
+/// Armed-then-nobody-woken is the cheap direction to retract; woken-then-not-yet-armed is not.
+fn vugres_arm(slot: usize) -> bool {
+    let now = crate::arch::ms().max(1); // 0 is the "not armed" sentinel
+    if VUGRES_RESUME_MS[slot]
+        .compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        VUGRES_STAGE[slot].store(VUGRES_STAGE_WOKEN, Ordering::Release);
+        VUGRES_ACTIVITY_AT[slot].store(VUGRES_ACTIVITY.load(Ordering::Relaxed), Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// D-3: retract an arm whose wake released nobody (`futex_wake` returned 0 — the waiter was
+/// evicted between the parked-flag check and the wake). Only the caller that armed may retract.
+fn vugres_disarm(slot: usize) {
+    VUGRES_RESUME_MS[slot].store(0, Ordering::Release);
+    VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
+}
+
+/// D-3: advance the pending witness's stage ladder. One relaxed load on the (overwhelmingly
+/// common) un-armed path; `fetch_max` keeps the FURTHEST rung when armed.
+fn vugres_stage(slot: usize, stage: u32) {
+    if VUGRES_RESUME_MS[slot].load(Ordering::Relaxed) != 0 {
+        VUGRES_STAGE[slot].fetch_max(stage, Ordering::AcqRel);
+    }
+}
+
+/// D-3: the present verbs' PRE-composite hook — a present from `slot` carrying window `id` passed
+/// the ownership proof and is about to enter the composite. The `last_win` stamp is unconditional
+/// so the negative line can name a window even for a slot whose post-resume present never happens.
+fn vugres_present_enter(slot: usize, id: usize) {
+    VUGRES_LAST_WIN[slot].store(id as u32, Ordering::Relaxed);
+    vugres_stage(slot, VUGRES_STAGE_PRESENT_ENTERED);
+}
+
+/// D-3: the present verbs' POST-composite hook — the outcome is in. A landing outcome
+/// (`Composited`/`Coalesced`) claims the pending witness and prints the ONE positive line; a
+/// non-landing outcome only advances the ladder, because the app may retry and land the next one.
+/// Every call bumps the activity clock, armed or not — that is the negative arm's evidence that
+/// composition was answering while this slot's present was not landing.
+fn vugres_present_outcome(slot: usize, id: usize, outcome: crate::video::wm::Presented) {
+    use crate::video::wm::Presented;
+    VUGRES_ACTIVITY.fetch_add(1, Ordering::Relaxed);
+    if VUGRES_RESUME_MS[slot].load(Ordering::Relaxed) == 0 {
+        return; // fast path: no witness pending on this slot
+    }
+    match outcome {
+        Presented::Composited | Presented::Coalesced => {
+            let t0 = VUGRES_RESUME_MS[slot].swap(0, Ordering::AcqRel);
+            if t0 != 0 {
+                VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
+                VUGRES_EMITTED_POS.fetch_add(1, Ordering::Relaxed);
+                serial_println!(
+                    "[vugres] first present win={} asid={} gap_ms={}",
+                    id,
+                    slot + 1,
+                    crate::arch::ms().saturating_sub(t0)
+                );
+            }
+        }
+        Presented::Suppressed => vugres_stage(slot, VUGRES_STAGE_SUPPRESSED),
+        Presented::NoRow => vugres_stage(slot, VUGRES_STAGE_NOROW),
+    }
+}
+
+/// D-3: the NEGATIVE arm — swept from [`user_input_wake_backstop`]'s existing ~256 ms cadence, so
+/// it costs the hot path nothing. A witness pending past [`VUGRES_BOUND_MS`] while the activity
+/// clock advanced (composition was answering) is a lost first present: claim it, print the furthest
+/// stage, and name the slot's last-known window.
+fn vugres_backstop() {
+    let now = crate::arch::ms();
+    let act = VUGRES_ACTIVITY.load(Ordering::Relaxed);
+    for slot in 0..crate::arch::memory::USER_SLOTS {
+        let t0 = VUGRES_RESUME_MS[slot].load(Ordering::Acquire);
+        if t0 == 0 || now.saturating_sub(t0) < VUGRES_BOUND_MS {
+            continue;
+        }
+        if act == VUGRES_ACTIVITY_AT[slot].load(Ordering::Relaxed) {
+            continue; // nobody has presented since the arm — composition idle/dead; not this lane's verdict
+        }
+        if VUGRES_RESUME_MS[slot]
+            .compare_exchange(t0, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            continue; // a present landed under us and claimed the witness — its line is the truth
+        }
+        let stage = VUGRES_STAGE[slot].swap(VUGRES_STAGE_NONE, Ordering::AcqRel);
+        let win = VUGRES_LAST_WIN[slot].load(Ordering::Relaxed);
+        VUGRES_EMITTED_NEG.fetch_add(1, Ordering::Relaxed);
+        if win == u32::MAX {
+            serial_println!(
+                "[vugres] NO PRESENT since resume win=? — request lost at {} asid={} gap_ms={}",
+                vugres_stage_name(stage),
+                slot + 1,
+                now.saturating_sub(t0)
+            );
+        } else {
+            serial_println!(
+                "[vugres] NO PRESENT since resume win={} — request lost at {} asid={} gap_ms={}",
+                win,
+                vugres_stage_name(stage),
+                slot + 1,
+                now.saturating_sub(t0)
+            );
+        }
+    }
+}
+
+/// D-3: teardown clear, beside the vugpause2 state it shadows — a dead slot's pending witness must
+/// not fire a NO PRESENT against the next tenant. Called from [`clear_input_parked`], the same
+/// funnel that clears the park flag.
+fn vugres_clear(slot: usize) {
+    VUGRES_RESUME_MS[slot].store(0, Ordering::Release);
+    VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
+    VUGRES_LAST_WIN[slot].store(u32::MAX, Ordering::Release);
+}
+
+// ---- D-3 RESUMEPAINT selftest — one real pause/resume cycle, both witness arms ----------------
+//
+// No QEMU leg drove `vugpause2` pause/resume at all before this (the resume edges were
+// metal-only by construction, exactly the hole x86-wc.spec's header describes for DMGOVLP), so the
+// fixture makes its own: a kernel task REALLY parks on a slot's input futex the way
+// `sys_input_wait` does, a REAL `set_hidden(asid, false)` unhide edge releases it (the same seam,
+// the same `[vugpause2] resume` line), and the released task then either walks the resumed vug's
+// present path (leg 1 — the positive line, with a genuine scheduler-and-composite gap in it) or
+// goes silent (leg 2 — the negative line, with the bound run down against bystander presents that
+// keep the activity clock honest). The compositor rows are minted on `clickroute_selftest`'s
+// static-surface idiom; the slot is the TOP one, which no other fixture in the battery occupies.
+
+/// The fixture's 8x8 ARGB surface — the `hittest_selftest` geometry, one static for both rows.
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[repr(align(4))]
+struct VugresSurf([u32; 64]);
+#[cfg(all(feature = "witness", feature = "wc"))]
+static VUGRES_SURF: VugresSurf = VugresSurf([0x0060_3020; 64]);
+
+/// wm id of the fixture's vug row, for the park task (spawn carries one `usize`, and that is the slot).
+#[cfg(all(feature = "witness", feature = "wc"))]
+static VUGRES_FIX_WMID: AtomicU32 = AtomicU32::new(0);
+/// Park-task lifecycle: bumped when a spawned park task finishes its leg, so the fixture never
+/// tears the rows down under a task still using them.
+#[cfg(all(feature = "witness", feature = "wc"))]
+static VUGRES_FIX_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// D-3 fixture stand-in for a parked vug. Replicates `sys_input_wait`'s park for `slot` (same
+/// futex key, same TAIL word, same PARKED discipline), RE-PARKING across the backstop's blind
+/// ~256 ms wakes until a NAMED edge releases it — the backstop does not arm the witness, so an
+/// armed witness is the proof the wake was the edge's. The PRESENT variant (`arg` bit 8) then
+/// walks the resumed vug's own path: park-return, drain, first present through the same
+/// `wc_shim`/witness tail the syscall verbs use. The bare variant goes silent instead — it IS the
+/// negative leg's lost request.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn vugres_park_task(arg: usize) {
+    let slot = arg & 0xFF;
+    let present = arg & 0x100 != 0;
+    let key = input_futex_key(slot);
+    let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[slot]) as u64;
+    for _ in 0..64 {
+        let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
+        USER_INPUT_PARKED[slot].store(true, Ordering::Release);
+        let _ = crate::arch::sched::futex_wait(key, uaddr, tail);
+        USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+        if VUGRES_RESUME_MS[slot].load(Ordering::Acquire) != 0 {
+            break; // a NAMED edge armed the witness before waking us; blind wakes never do
+        }
+    }
+    vugres_stage(slot, VUGRES_STAGE_PARK_RETURN);
+    if present {
+        // The resumed app drains its ring and re-renders before its first present — a few ms of
+        // real scheduler time, so the printed gap is a measured one, not an arranged zero.
+        crate::arch::sched::sleep_ms(3);
+        vugres_stage(slot, VUGRES_STAGE_POLLED);
+        let wmid = VUGRES_FIX_WMID.load(Ordering::Acquire);
+        vugres_present_enter(slot, wmid as usize);
+        let outcome = wc_shim::present(wmid, (slot as u64) + 1);
+        vugres_present_outcome(slot, wmid as usize, outcome);
+    }
+    VUGRES_FIX_DONE.fetch_add(1, Ordering::AcqRel);
+}
+
+/// D-3 RESUMEPAINT fixture — both arms of the resume-edge witness, driven end to end. One-shot,
+/// self-cleaning (rows closed, park/witness state cleared through the same funnels teardown uses).
+/// See the block comment above for the shape; the verdict line gates that both LINES printed, not
+/// merely that the state machine cycled.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn vugres_selftest(cpu: usize) {
+    use crate::video::wm;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[vugres] selftest -> SKIP (framebuffer not ready)");
+            return;
+        }
+    }
+    // The TOP slot and its neighbour: no other fixture in the battery occupies them, and both are
+    // pure static state — `set_hidden`'s doc says a slot with no live tenant is harmless to write.
+    let slot = crate::arch::memory::USER_SLOTS - 1;
+    let bslot = slot - 1;
+    let asid = (slot as u64) + 1;
+    let basid = (bslot as u64) + 1;
+    let s = &raw const VUGRES_SURF as usize;
+    let len = core::mem::size_of_val(&VUGRES_SURF);
+    let wv = wm::create(asid, s, len, 8, 8, 32, b"vr-vug");
+    let wb = wm::create(basid, s, len, 8, 8, 32, b"vr-by");
+    if wv == wm::WIN_NONE || wb == wm::WIN_NONE {
+        serial_println!("[vugres] selftest -> SKIP (window table full: v={} b={})", wv, wb);
+        wm::close(wv);
+        wm::close(wb);
+        return;
+    }
+    VUGRES_FIX_WMID.store(wv, Ordering::Release);
+
+    // ---- leg 1: the POSITIVE line — pause, park, unhide edge, first present ----
+    set_hidden(asid, true);
+    VUGRES_FIX_DONE.store(0, Ordering::Release);
+    crate::arch::sched::spawn(
+        "vugres-park",
+        vugres_park_task,
+        slot | 0x100,
+        cpu,
+        crate::arch::sched::PRIO_NORMAL,
+    );
+    let mut deadline = crate::arch::ticks() + 1000;
+    while !USER_INPUT_PARKED[slot].load(Ordering::Acquire) && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    let pos_before = VUGRES_EMITTED_POS.load(Ordering::Relaxed);
+    // Fire the unhide edge; retried because the blind backstop can race the park window (the task
+    // re-parks on a blind wake, but an edge landing IN that window wakes nobody and retracts).
+    'pos: for _ in 0..10 {
+        set_hidden(asid, false);
+        let until = crate::arch::ticks() + 300;
+        while crate::arch::ticks() < until {
+            if VUGRES_EMITTED_POS.load(Ordering::Relaxed) != pos_before {
+                break 'pos;
+            }
+            crate::arch::sched::yield_now();
+        }
+    }
+    let pos_ok = VUGRES_EMITTED_POS.load(Ordering::Relaxed) == pos_before + 1;
+    deadline = crate::arch::ticks() + 1000;
+    while VUGRES_FIX_DONE.load(Ordering::Acquire) == 0 && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+
+    // ---- leg 2: the NEGATIVE line — pause, park, unhide edge, and the present never comes ----
+    set_hidden(asid, true);
+    crate::arch::sched::spawn(
+        "vugres-park2",
+        vugres_park_task,
+        slot,
+        cpu,
+        crate::arch::sched::PRIO_NORMAL,
+    );
+    deadline = crate::arch::ticks() + 1000;
+    while !USER_INPUT_PARKED[slot].load(Ordering::Acquire) && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    let neg_before = VUGRES_EMITTED_NEG.load(Ordering::Relaxed);
+    'arm: for _ in 0..10 {
+        set_hidden(asid, false);
+        let until = crate::arch::ticks() + 300;
+        while crate::arch::ticks() < until {
+            if VUGRES_RESUME_MS[slot].load(Ordering::Acquire) != 0 {
+                break 'arm;
+            }
+            crate::arch::sched::yield_now();
+        }
+    }
+    let armed = VUGRES_RESUME_MS[slot].load(Ordering::Acquire) != 0;
+    // Run the bound down with the activity clock HONESTLY advancing: bystander presents from the
+    // neighbour slot, through the same witness tail, ~10/s — the "active composition" the negative
+    // arm's 2 s is measured against.
+    deadline = crate::arch::ticks() + 3500;
+    let mut next_by = 0u64;
+    while armed
+        && VUGRES_EMITTED_NEG.load(Ordering::Relaxed) == neg_before
+        && crate::arch::ticks() < deadline
+    {
+        let now = crate::arch::ticks();
+        if now >= next_by {
+            next_by = now + 100;
+            vugres_present_enter(bslot, wb as usize);
+            let o = wc_shim::present(wb, basid);
+            vugres_present_outcome(bslot, wb as usize, o);
+        }
+        crate::arch::sched::yield_now();
+    }
+    let neg_ok = VUGRES_EMITTED_NEG.load(Ordering::Relaxed) == neg_before + 1;
+
+    // ---- teardown: rows closed, park/witness state cleared through the same funnels ----
+    deadline = crate::arch::ticks() + 1000;
+    while VUGRES_FIX_DONE.load(Ordering::Acquire) < 2 && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    wm::close(wv);
+    wm::close(wb);
+    clear_input_parked(slot);
+    clear_hidden(slot);
+    vugres_clear(bslot);
+    if pos_ok && neg_ok {
+        serial_println!("[vugres] selftest pos={} neg={} -> PASS", pos_ok, neg_ok);
+    } else {
+        serial_println!(
+            "[vugres] selftest pos={} neg={} armed={} done={} -> FAIL",
+            pos_ok,
+            neg_ok,
+            armed,
+            VUGRES_FIX_DONE.load(Ordering::Acquire)
+        );
+    }
+}
+
 /// VUGPAUSE-2/x86: the synthetic futex key for `slot`'s input ring.
 ///
 /// `sched::futex_key` builds a user key as `((slot + 1) << 56) | (uaddr & 0x00FF_FFFF_FFFF_FFFF)`,
@@ -4978,6 +5423,10 @@ fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
     if !USER_INPUT_PARKED[slot].load(Ordering::Acquire) {
         return 0; // fast path: nobody has parked on this ring
     }
+    // D-3 RESUMEPAINT: arm the first-present witness BEFORE the wake, so the released task cannot
+    // outrun it — see `vugres_arm` for the race this ordering closes. Named edges only: the
+    // router's per-event wake is a running app being fed, not a resume.
+    let armed = if !edge.is_empty() { vugres_arm(slot) } else { false };
     let n = crate::arch::sched::futex_wake(input_futex_key(slot), usize::MAX);
     if n != 0 {
         USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
@@ -4990,6 +5439,10 @@ fn user_input_wake_edge(slot: usize, edge: &str) -> usize {
                 );
             }
         }
+    } else if armed {
+        // The waiter was evicted between the parked-flag check and the wake — nobody actually
+        // resumed, so there is no first present to wait for. Retract, never false-alarm.
+        vugres_disarm(slot);
     }
     n
 }
@@ -5012,6 +5465,9 @@ pub fn user_input_wake_backstop() {
             USER_INPUT_WAKES.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
+    // D-3 RESUMEPAINT: the negative arm rides this existing cadence — a pending witness past its
+    // bound (against active composition) is a lost first present, and this is where it says so.
+    vugres_backstop();
 }
 
 /// The slot currently designated to RECEIVE input, `+1`-BIASED: 0 means "no ring-3 target — the shell
@@ -5040,6 +5496,101 @@ static USER_INPUT_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// [`user_input_set_active`], for the router and the witnesses.
 pub fn user_input_active() -> u64 {
     USER_INPUT_ACTIVE.load(Ordering::Acquire)
+}
+
+// ── FURNITUREFOCUS — where does a slot-0 keystroke actually LAND? ────────────────────────────
+//
+// `user_input_set_active(0)` says "the shell owns the keyboard", and every furniture arm of the
+// click router says it on a press over a kernel-band row. But "the shell" is not always a live
+// key sink on this arch: on the crispy desktop the render task routes slot-0 keys into its shell
+// WINDOW tuple (`main.rs`, the SHELLWIN key arm), and that arm DROPS the key when no tuple is
+// bound (`shell_id == WIN_NONE`) or fences the present off when the row is gone. Flight 3 D-7 is
+// the priced consequence: four rehomes in, the live render instance ran with an empty tuple, a
+// real trackpad click on the corpse shell row (asid 0xffffff02) took the furniture arm, the
+// keyboard went to slot 0 — and slot 0 drained into nothing. The postmortem read "focus parked on
+// kernel furniture"; the parked half was really the slot-0 sink being dead. WCSER-REMINT closes
+// the common case (the rescue instance re-binds the tuple); what remains are its own decline arms
+// (`alloc`, `row-changed`, no-row-no-desktop) and the closed-shell-row window, in which the OLD
+// behaviour let a furniture click yank the keyboard from a working app into the void.
+//
+// So the render task now PUBLISHES the sink state, and the furniture arms consult it: when the
+// sink is dead the press is still consumed and the row still raised (the visible half of the
+// gesture), but the keyboard STAYS where it was — a no-op instead of a strand. Three states:
+const SHELL_SINK_BACKDROP: u8 = 0; // slot-0 keys go to the backdrop console — always drains (default; also every pre-render / wc-off state, which keeps the old behaviour there)
+const SHELL_SINK_WINDOW: u8 = 1; // desktop: keys go to the bound shell WINDOW — drains iff the KERNEL_OWNER_DESKTOP row is still live (an operator close or wedge-abandon teardown kills it with no extra hook)
+const SHELL_SINK_UNBOUND: u8 = 2; // desktop with NO bound tuple (a REMINT decline arm) — keys are dropped by the SHELLWIN key arm
+static SHELL_KEY_SINK: AtomicU8 = AtomicU8::new(SHELL_SINK_BACKDROP);
+
+/// FURNITUREFOCUS — the render task's declaration of where slot-0 keystrokes land, made wherever
+/// the shell tuple binding changes (task bring-up, the WCSER-REMINT arms via the same binding, the
+/// dock reopen). `desktop == false` means the backdrop console is the sink (always live).
+pub fn shell_key_sink_note(desktop: bool, bound: bool) {
+    let s = if !desktop {
+        SHELL_SINK_BACKDROP
+    } else if bound {
+        SHELL_SINK_WINDOW
+    } else {
+        SHELL_SINK_UNBOUND
+    };
+    SHELL_KEY_SINK.store(s, Ordering::Release);
+}
+
+/// FURNITUREFOCUS — raw state save/restore, for the selftest's deflect leg only (its one caller,
+/// hence its gate).
+#[cfg(feature = "witness")]
+fn shell_key_sink_raw() -> u8 {
+    SHELL_KEY_SINK.load(Ordering::Acquire)
+}
+#[cfg(feature = "witness")]
+fn shell_key_sink_set_raw(v: u8) {
+    SHELL_KEY_SINK.store(v, Ordering::Release);
+}
+
+/// FURNITUREFOCUS — can a keystroke handed to the shell (slot 0) actually be drained right now?
+fn shell_keys_reachable() -> bool {
+    match SHELL_KEY_SINK.load(Ordering::Acquire) {
+        SHELL_SINK_UNBOUND => false,
+        SHELL_SINK_WINDOW => {
+            // The row is the live half of the binding: the tuple can outlive the row (a stale
+            // `shell_id` after the operator's close box — the present is fenced to `NoRow` and the
+            // keys go nowhere visible), so "bound" alone is not "drains".
+            #[cfg(feature = "wc")]
+            {
+                crate::video::wm::shell_row_geometry().is_some()
+            }
+            #[cfg(not(feature = "wc"))]
+            {
+                true
+            }
+        }
+        _ => true,
+    }
+}
+
+/// FURNITUREFOCUS — bounded witness budget for the deflection line: operator-rate by nature (a
+/// hand on furniture), capped for the same reason every `[clickroute]` line is. The selftest's
+/// deflect leg burns exactly one proving the line fires from the live router (the CLICK-BAND
+/// rule); the rest are the metal's.
+static FURNDEFLECT_LOGGED: AtomicU32 = AtomicU32::new(0);
+const FURNDEFLECT_LOG_MAX: u32 = 4;
+
+/// FURNITUREFOCUS — the furniture arms' keyboard half. When the shell can drain keys, hand the
+/// keyboard over exactly as before (flight 3's D-7 lesson as WCSER-REMINT states it: desktop
+/// focus = shell keyboard). When it cannot, LEAVE THE KEYBOARD WHERE IT IS — the raise still
+/// happens (the caller's `focus_changed`), the press is still consumed, but a working app's
+/// keystream is never redirected into a sink that drains nothing. Named on the wire once per
+/// budget slot so a capture can tell a deflection from a routing miss.
+fn furniture_keyboard_to_shell(owner: u64, cur: u64) {
+    if shell_keys_reachable() {
+        user_input_set_active(0);
+    } else if cur != 0
+        && FURNDEFLECT_LOGGED.fetch_add(1, Ordering::Relaxed) < FURNDEFLECT_LOG_MAX
+    {
+        serial_println!(
+            "[clickroute] furniture deflect owner={:#x} keep={:#x} sink=dead — keyboard stays put",
+            owner, cur
+        );
+    }
 }
 
 /// WINX-7: `(delivered, dropped, focus_revokes)` — the router's own accounting, for the witness line.
@@ -5473,6 +6024,9 @@ fn clear_input_parked(slot: usize) {
     if slot < crate::arch::memory::USER_SLOTS {
         USER_INPUT_PARKED[slot].store(false, Ordering::Release);
         USER_INPUT_RESUMES[slot].store(0, Ordering::Relaxed);
+        // D-3 RESUMEPAINT: a dead slot's pending resume witness dies with it — the next tenant must
+        // not inherit a NO PRESENT clock it never armed.
+        vugres_clear(slot);
     }
 }
 
@@ -5540,8 +6094,15 @@ fn sys_input_wait() -> i64 {
     }
     let key = input_futex_key(slot);
     let uaddr = core::ptr::addr_of!(USER_INPUT_TAIL[slot]) as u64;
+    // D-3 RESUMEPAINT: an armed slot going BACK to sleep is a rung on the loss ladder — the app
+    // woke, concluded it had nothing to do, and never presented. One relaxed load when un-armed.
+    vugres_stage(slot, VUGRES_STAGE_REPARKED);
     let r = crate::arch::sched::futex_wait(key, uaddr, tail);
     USER_INPUT_PARKED[slot].store(false, Ordering::Release);
+    // D-3 RESUMEPAINT: the woken task made it back to ring 3's doorstep — `woken` is no longer the
+    // furthest rung. (A `Mismatch`/backstop return walks this too; harmless — the ladder is monotone
+    // and un-armed slots cost one relaxed load.)
+    vugres_stage(slot, VUGRES_STAGE_PARK_RETURN);
     match r {
         // Woken by a wake edge, or the ring moved under the compare (`Mismatch`) — either way the
         // caller's next drain is the thing that decides, so both are simply "go look".
@@ -5582,6 +6143,9 @@ fn sys_input_poll() -> i64 {
     let Some(slot) = crate::arch::x86_64::memory::current_slot() else {
         return EAGAIN;
     };
+    // D-3 RESUMEPAINT: the resumed app is draining its ring — the request survived to the app's own
+    // event loop. One relaxed load on every un-armed poll (the common case).
+    vugres_stage(slot, VUGRES_STAGE_POLLED);
     let head = USER_INPUT_HEAD[slot].load(Ordering::Relaxed); // sole consumer
     let tail = USER_INPUT_TAIL[slot].load(Ordering::Acquire);
     if head == tail {
@@ -6511,8 +7075,8 @@ fn drag_settle_disarm() {
 /// Self-cleaning: it empties the ring before it starts (witnessed, because on metal that discards
 /// whatever the hand was doing at boot), drains everything it pushed, and puts the producer's button
 /// mask and the release-edge count back where it found them.
-/// SELFTEST-QUIESCE — **experiment scaffolding for the intermittent x86 selftest family
-/// (`exec-r7-selftest`, 2026-08-27). Not a shipping seam; the control build has it OFF.**
+/// SELFTEST-RACE — **the ledger the intermittent x86 selftest family is judged against**
+/// (`exec-r7-selftest`, 2026-08-27).
 ///
 /// The falsification this arc runs asks whether `[ptrdead] order` and `[wm-act] settle`/`lead` fail
 /// because the CODE UNDER TEST is wrong or because the ASSERTIONS are racy. The mechanism under
@@ -6523,34 +7087,17 @@ fn drag_settle_disarm() {
 /// push→pop window therefore hands the fixture's own queued events to the input service, which
 /// forwards them down `GUI_CHANNEL_X86` and out of the fixture's reach.
 ///
-/// So the quiesce is a LOCAL interrupt mask, and it is sound only because of that placement: the
-/// competing drain is on THIS core, so masking `IF` here is enough to serialise the window. The
-/// global ms-clock is advanced by the BSP (see `apic::ticks`), so the bounded `ticks()` waits inside
-/// the legs still terminate with the mask held.
+/// A LOCAL INTERRUPT MASK IS NOT THE ANSWER, and that was measured rather than argued. The
+/// experiment on this branch wrapped each leg in `arch::without_interrupts` and ran 22 quiesced
+/// boots against 12 unquiesced ones; the red rate did not move (3/22 against 1/12) and the leak
+/// detector said why in one field: **`cpu=3->3` while `svc=Some(5)`**. The fixture ladder does not
+/// run on the service core, so masking `IF` where the fixture is says nothing about where the
+/// competing drain is. The mask itself held perfectly (`dtick=0 masked=true` on every run) — it was
+/// simply pointed at the wrong core. Suspending the drain instead would be `main.rs`/`pal.rs` work.
 ///
-/// Flipped by hand between the two builds of the experiment (control = `false`).
-///
-/// SAFE AGAINST THE OBVIOUS DEADLOCK, checked rather than assumed: the danger of masking around a
-/// span that takes a lock is a holder on THIS core that was preempted mid-critical-section and can
-/// no longer be rescheduled. `pal::push_event` / `pal::pop_event` both take `EVENT_QUEUE` INSIDE
-/// `arch::without_interrupts`, and `video::wm`'s table guard is an `arch::IrqMask`, so neither lock
-/// can be held across a preemption in the first place.
-#[cfg(feature = "witness")]
-const SFQ_QUIESCE: bool = false;
-
-/// SELFTEST-QUIESCE — run `f` with this core's interrupts masked on the quiesced build, and
-/// unchanged on the control build.
-#[cfg(feature = "witness")]
-#[inline]
-fn sfq<R>(f: impl FnOnce() -> R) -> R {
-    if SFQ_QUIESCE {
-        crate::arch::without_interrupts(f)
-    } else {
-        f()
-    }
-}
-
-/// SELFTEST-QUIESCE — total SUCCESSFUL pops from `pal::EVENT_QUEUE` since boot (the 5th field of
+/// So the legs below judge what they can and SKIP what the machine took from them, which is the
+/// idiom `wmdirect_selftest`'s own `settle`/`lead` legs already use.
+/// SELFTEST-RACE — total SUCCESSFUL pops from `pal::EVENT_QUEUE` since boot (the 5th field of
 /// `pal::event_queue_stats`). A fixture that knows how many pops it made itself can subtract, and
 /// the remainder is the number of its own events some OTHER drain took — the direct evidence the
 /// hypothesis needs, rather than an inference from a failed predicate.
@@ -6560,7 +7107,7 @@ fn evq_pops() -> u64 {
     crate::pal::event_queue_stats().4
 }
 
-/// SELFTEST-QUIESCE — total pushes into `pal::EVENT_QUEUE` since boot (pointer + key).
+/// SELFTEST-RACE — total pushes into `pal::EVENT_QUEUE` since boot (pointer + key).
 #[cfg(feature = "witness")]
 #[inline]
 fn evq_pushes() -> u64 {
@@ -6568,19 +7115,15 @@ fn evq_pushes() -> u64 {
     s.0 + s.1
 }
 
-/// SELFTEST-QUIESCE — this core's index and its LOCAL tick count, as one sample.
+/// SELFTEST-RACE — the core this fixture is actually running on.
 ///
-/// The local tick is the leak detector for the quiesce. `percpu::note_tick` is called from this
-/// core's own APIC timer ISR, so a span that believes it is masked and comes back with a nonzero
-/// tick delta was NOT masked for the whole span — either something inside re-enabled `IF`, or the
-/// task yielded and the mask was restored to whatever the next task's `RFLAGS` carried. The cpu
-/// index catches the other way the quiesce can be void: the fixture and the competing drain ending
-/// up on DIFFERENT cores, where a local mask means nothing at all.
+/// Printed beside `svc=` (the core `x86_input_service` was published on) because the two are NOT
+/// the same, and every reading of these fixtures that assumed they were has been wrong. Measured
+/// `cpu=3` against `svc=Some(5)` on 8/8 boots.
 #[cfg(feature = "witness")]
 #[inline]
-fn sfq_cpu_tick() -> (u32, u64) {
-    let p = crate::arch::percpu::this_cpu();
-    (p.cpu_index, p.ticks.load(Ordering::Relaxed))
+fn sfq_cpu() -> u32 {
+    crate::arch::percpu::this_cpu().cpu_index
 }
 
 #[cfg(feature = "witness")]
@@ -6589,7 +7132,7 @@ pub fn ptrdead_selftest() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    sfq(ptrdead_selftest_body);
+    ptrdead_selftest_body();
 }
 
 #[cfg(feature = "witness")]
@@ -6634,8 +7177,14 @@ fn ptrdead_selftest_body() {
     }
     let (_, _, drop1, _, _) = crate::pal::event_queue_stats();
     let foreign12 = (evq_pops() - pop0) as i64 - entries as i64;
-    let whole = entries == 1 && sx == n as i32 && sy == -(n as i32);
-    let nodrop = drop1 == drop0;
+    // SELFTEST-RACE — `None` means THIS RUN CANNOT JUDGE, not "passed". Both legs above assert an
+    // EXACT entry count and an EXACT sum over a ring this fixture does not own, so a pop by anybody
+    // else inside the window makes both readings arithmetic about somebody else's drain. Measured:
+    // `whole=false ... entries=1 travel=(47,-47) folded=191 fpop12=1` — the producer folded 191 of
+    // 192 reports perfectly and a competing drain took the accumulator, so the leg read the 47 that
+    // had piled up since. That is the machine, not the fold, and a red there is a false accusation.
+    let whole = (foreign12 == 0).then(|| entries == 1 && sx == n as i32 && sy == -(n as i32));
+    let nodrop = (foreign12 == 0).then(|| drop1 == drop0);
 
     // Leg 3 — the fold may not cross a `Button`. Pushed through the same producer seams a decoded
     // report uses: motion-only folds, a bare button does not, and the motion after the button starts
@@ -6645,7 +7194,7 @@ fn ptrdead_selftest_body() {
             break;
         }
     }
-    // SELFTEST-QUIESCE instrumentation: the four pops are taken UNCONDITIONALLY and judged
+    // SELFTEST-RACE instrumentation: the four pops are taken UNCONDITIONALLY and judged
     // afterwards, where the original `&&` chain short-circuited. Two reasons, neither of them a
     // change to what `order` MEANS: a short-circuited run leaves the events it never popped in the
     // ring for the next fixture, and — the point here — the observed shape cannot be reported if it
@@ -6664,19 +7213,23 @@ fn ptrdead_selftest_body() {
     ];
     let own3 = g.iter().filter(|e| e.is_some()).count() as u64;
     let foreign3 = (evq_pops() - pop2) as i64 - own3 as i64;
-    // This leg pushes four reports, each carrying exactly one event, so four is its own push count.
-    let fpush3 = (evq_pushes() - push2) as i64 - 4;
-    let order = matches!(g[0], Some(Event::Mouse { x: 1, y: 0 }))
-        && matches!(g[1], Some(Event::Button(1)))
-        && matches!(g[2], Some(Event::Mouse { x: 2, y: 0 }))
-        && g[3].is_none();
-    if !order {
+    // This leg pushes four reports carrying one event each, but the FOURTH folds into the third and
+    // `push_locked` charges `EVQ_PUSH_PTR` only on the non-coalesced path — so THREE is this leg's
+    // own push count and `fpush3 == 0` is the clean reading. (Measured: `-1` against a naive `4`,
+    // on runs whose `fpop` independently said no foreign producer was involved.)
+    let fpush3 = (evq_pushes() - push2) as i64 - 3;
+    let order = (foreign3 == 0).then(|| {
+        matches!(g[0], Some(Event::Mouse { x: 1, y: 0 }))
+            && matches!(g[1], Some(Event::Button(1)))
+            && matches!(g[2], Some(Event::Mouse { x: 2, y: 0 }))
+            && g[3].is_none()
+    });
+    if order != Some(true) {
         serial_println!(
-            "[ptrdead] order detail: got={:?} fpop={} fpush={} quiesced={}",
+            "[ptrdead] order detail: got={:?} fpop={} fpush={}",
             g,
             foreign3,
-            fpush3,
-            SFQ_QUIESCE
+            fpush3
         );
     }
 
@@ -6696,11 +7249,30 @@ fn ptrdead_selftest_body() {
         crate::pal::note_release_edge_drained();
     }
 
+    // A skip-or-bool leg renders `true`/`false`/`skip`, the idiom `wmdirect_selftest` already uses,
+    // and a skipped leg does not convict. The verdict stays `PASS`/`FAIL` — never a third token — so
+    // the harness DEFAULT-forbids rule that gates this fixture (`-> FAIL`; see `x86-fat.spec`) is
+    // unchanged and the spec's `COUNT n -> PASS` floor keeps its line.
+    let leg = |v: Option<bool>| match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "skip",
+    };
+    let judged = whole.unwrap_or(true) && nodrop.unwrap_or(true) && order.unwrap_or(true);
+    if whole.is_none() || order.is_none() {
+        serial_println!(
+            "[ptrdead] -> SKIP (window raced: fpop12={} fpop3={}) — a competing drain took this fixture's own queued events; cpu={} svc={:?}",
+            foreign12,
+            foreign3,
+            sfq_cpu(),
+            crate::arch::smp::service_cpu()
+        );
+    }
     serial_println!(
-        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} fpop12={} fpop3={} quiesced={} -> {}",
-        whole,
-        nodrop,
-        order,
+        "[ptrdead] backlog whole={} nodrop={} order={} pushed={} entries={} travel=({},{}) folded={} dropped={} fpop12={} fpop3={} cpu={} svc={:?} -> {}",
+        leg(whole),
+        leg(nodrop),
+        leg(order),
         n,
         entries,
         sx,
@@ -6709,8 +7281,9 @@ fn ptrdead_selftest_body() {
         drop1 - drop0,
         foreign12,
         foreign3,
-        SFQ_QUIESCE,
-        if whole && nodrop && order { "PASS" } else { "FAIL" }
+        sfq_cpu(),
+        crate::arch::smp::service_cpu(),
+        if judged { "PASS" } else { "FAIL" }
     );
 }
 
@@ -7035,9 +7608,11 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 // TITLE BAR / BORDER — raise and focus through the SAME primitives the content arms
                 // use (no second focus mechanism), then, on the title strip only, grab the window.
                 // Kernel furniture and focus-exempt rows keep their own rule: raise the row, but
-                // hand the KEYBOARD to the shell rather than to a program with no input ring.
+                // hand the KEYBOARD to the shell rather than to a program with no input ring —
+                // FURNITUREFOCUS: unless the shell cannot drain it, in which case the keyboard
+                // stays put (see `furniture_keyboard_to_shell`).
                 if crate::video::wm::is_kernel_owner(owner) || owner_is_focus_exempt(owner) {
-                    user_input_set_active(0);
+                    furniture_keyboard_to_shell(owner, cur);
                 } else if owner != cur {
                     user_input_set_active(owner);
                 }
@@ -7058,9 +7633,11 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         }
         match crate::video::wm::hit_test(x, y) {
             // KERNEL FURNITURE — raise it, hand the keyboard to the shell, consume the press.
+            // FURNITUREFOCUS: the hand-off happens only while the shell can drain a key; a dead
+            // slot-0 sink deflects it and the keyboard stays with the focused app (flight 3 D-7).
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
-                user_input_set_active(0);
+                furniture_keyboard_to_shell(owner, cur);
                 crate::video::wm::focus_changed(owner);
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
@@ -7088,7 +7665,9 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             // used to mean the opposite.
             Some((win, owner, _z)) if owner_is_focus_exempt(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
-                user_input_set_active(0);
+                // FURNITUREFOCUS — same deflection as the kernel arm above: the two arms are one
+                // rule ("furniture hands the keyboard to the shell") and share its exception.
+                furniture_keyboard_to_shell(owner, cur);
                 crate::video::wm::focus_changed(owner);
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
@@ -7232,6 +7811,11 @@ static CLICK_SURF: ClickSurf = ClickSurf([0x0020_4060; 64]);
 ///     the shell. Skipped, and said so, if the live panel leaves no unowned point to probe.
 ///  6. **nofab** — the release that follows a CONSUMED press is dropped rather than delivered. A
 ///     release in an app that never saw the press is a fabricated click; the sentinel forbids it.
+///  7. **deflect** — FURNITUREFOCUS: with the shell's slot-0 key sink declared dead (the flight 3
+///     post-rehome state — desktop, no bound shell tuple), a press over the same kernel row is
+///     still consumed and raised, but the keyboard STAYS with the focused app and its ring still
+///     drains a subsequent event. The direction the old shape failed: `user_input_set_active(0)`
+///     unconditionally, stranding the keystream in a sink that drops every key.
 ///
 /// Self-cleaning: the probe rows are closed, the input focus is restored to whatever held it, and
 /// `wm::focus_reset` un-names the synthetic focus owner.
@@ -7356,14 +7940,34 @@ pub fn clickroute_selftest() {
         None => None,
     };
 
+    // Leg 7 — FURNITUREFOCUS: the sink-dead deflection, driven through the LIVE router. The state
+    // is the one flight 3 D-7 recorded: a desktop whose render instance has no bound shell tuple
+    // (four rehomes in, pre-REMINT — and REMINT's own decline arms still reach it). A furniture
+    // press must then be a keyboard NO-OP: consumed, raised, but `USER_INPUT_ACTIVE` untouched and
+    // the previous owner's ring still draining. Saved/restored around the probe so the real
+    // machine state (and every later leg of the boot) is undisturbed.
+    let sink_saved = shell_key_sink_raw();
+    shell_key_sink_note(true, false);
+    user_input_set_active(OWNER_A);
+    wm::focus_changed(OWNER_A);
+    let d_consumed = wc_click_route_at(Event::Button(1), kpx, kpy);
+    let d_kept = user_input_active() == OWNER_A;
+    // The keystream still reaches the previous owner: one event routed into the ACTIVE ring lands
+    // in A's ring (the arrival reset it, so the depth read is exact).
+    let d_drains = user_input_enqueue(Event::Button(1)) && user_input_depth(OWNER_A) == 1;
+    let d_nofab = wc_click_route_at(Event::Button(0), kpx, kpy);
+    let deflect_ok = d_consumed && d_kept && d_drains && d_nofab;
+    shell_key_sink_set_raw(sink_saved);
+
     let ok = hit_ok
         && deliver_ok
         && depth_ok
         && kernel_ok
         && nofab_ok
+        && deflect_ok
         && desktop_ok.unwrap_or(true);
     serial_println!(
-        "[clickroute] route hit={} deliver={} depth={}/{} kernel={} desktop={} nofab={} -> {}",
+        "[clickroute] route hit={} deliver={} depth={}/{} kernel={} desktop={} nofab={} deflect={} -> {}",
         hit_ok,
         deliver_ok,
         depth_press,
@@ -7374,6 +7978,7 @@ pub fn clickroute_selftest() {
             None => "skip",
         },
         nofab_ok,
+        deflect_ok,
         if ok { "PASS" } else { "FAIL" }
     );
 
@@ -7772,7 +8377,7 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => sfq(|| {
+        Some(i) => {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
@@ -7814,7 +8419,7 @@ pub fn wmdirect_selftest() {
             // was taken by a competing drain, and any push beyond 3 was injected by one.
             let pop0 = evq_pops();
             let push0 = evq_pushes();
-            let (cpu0, tick0) = sfq_cpu_tick();
+            let cpu0 = sfq_cpu();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             // The PRESS goes through `push_event` too, and it has to: `pal` tracks its own previous
@@ -7874,8 +8479,7 @@ pub fn wmdirect_selftest() {
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 24, i.y + 24));
             let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
             let fpush = (evq_pushes() - push0) as i64 - 3;
-            let (cpu1, tick1) = sfq_cpu_tick();
-            let masked = crate::arch::irqs_masked();
+            let cpu1 = sfq_cpu();
             // This gesture has exactly one queued motion and it is the LIFT, which the reorder puts
             // BEHIND the edge — so a clean run steers no lead motions at all. A nonzero count means
             // the lift was routed while the edge was still counted as queued, i.e. two routers
@@ -7884,23 +8488,33 @@ pub fn wmdirect_selftest() {
             // makes the lift a lead motion too, so an ungated skip would swallow exactly the defect
             // this leg exists to catch. `swap=1` says the ring WAS reordered — only then is an
             // unexpected lead count evidence of the router interleave rather than of the fix.
+            // SELFTEST-RACE, NARROWED ON REVIEW — `fpop` is EVIDENCE on this leg, never a gate.
+            // This leg's claims are all OUTCOME-shaped (grabbed/swap/ended/rest), and the thief is
+            // not a shredder: `x86_input_service` routes what it takes through the same
+            // `wc_route_event` chain this leg drains through, so a stolen event still steers the
+            // same window table and the gesture still comes to rest at +24. Measured when the first
+            // cut of this arm gated on `fpop != 0`: 3 skips in 5 boots, the leg green and the row
+            // at its exact resting coordinate on every one — a skip keyed on `fpop` retires this
+            // leg on most boots and leaves a fixture that silently tests nothing, which is worse
+            // than the flake it was meant to absorb. The one steal that DOES perturb the outcome —
+            // the lift routed while the edge is still queued — is exactly what
+            // `drag_last_lead() != 0` already detects, so the arm below is the only race gate this
+            // leg needs. `fpop`/`fpush` stay on both lines as the attribution when it does go red.
             if swap_ok && drag_last_lead() != 0 {
                 serial_println!(
-                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
+                    "[wm-act] settle -> SKIP (routing interleaved: lead={} on a gesture with none) fpop={} fpush={} cpu={} svc={:?}",
                     drag_last_lead(),
                     fpop,
                     fpush,
-                    SFQ_QUIESCE,
-                    cpu0,
                     cpu1,
-                    tick1 - tick0
+                    crate::arch::smp::service_cpu()
                 );
                 None
             } else {
                 let verdict = grabbed && swap_ok && ended && rest;
                 if !verdict {
                     serial_println!(
-                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
+                        "[wm-act] settle detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} cpu={}->{} svc={:?}",
                         grabbed,
                         swap_ok,
                         ended,
@@ -7911,17 +8525,14 @@ pub fn wmdirect_selftest() {
                         drag_last_lead(),
                         fpop,
                         fpush,
-                        SFQ_QUIESCE,
                         cpu0,
                         cpu1,
-                        tick1 - tick0,
-                        masked,
                         crate::arch::smp::service_cpu()
                     );
                 }
                 Some(verdict)
             }
-        }),
+        }
         None => Some(false),
     };
 
@@ -7955,7 +8566,7 @@ pub fn wmdirect_selftest() {
         wm::move_to(w, ox, oy);
         wm::info(w)
     } {
-        Some(i) => sfq(|| {
+        Some(i) => {
             let (px, py) = ((i.x + 1) as i32, (i.y - wm::TITLE_H / 2 - wm::BORDER) as i32);
             user_input_set_active(OWNER_O);
             wm::focus_changed(OWNER_O);
@@ -7991,7 +8602,7 @@ pub fn wmdirect_selftest() {
             // +12 motion, then the lift+edge pair).
             let pop0 = evq_pops();
             let push0 = evq_pushes();
-            let (cpu0, tick0) = sfq_cpu_tick();
+            let cpu0 = sfq_cpu();
             crate::pal::cursor::set_abs(hid(px, pw), hid(py, ph), pw as i32, ph as i32);
             crate::pal::cursor::set_button_level(true);
             crate::pal::push_event(Event::Button(1));
@@ -8028,8 +8639,7 @@ pub fn wmdirect_selftest() {
             let rest = wm::info(w).map(|r| (r.x, r.y)) == Some((i.x + 12, i.y + 12));
             let fpop = (evq_pops() - pop0) as i64 - own_pops as i64;
             let fpush = (evq_pushes() - push0) as i64 - 4;
-            let (cpu1, tick1) = sfq_cpu_tick();
-            let masked = crate::arch::irqs_masked();
+            let cpu1 = sfq_cpu();
             crate::pal::cursor::set_button_level(false);
             // Exactly ONE lead motion is the shape this leg drives: the +12, with the +24 lift
             // behind the edge. Two means the lift was routed as a lead as well — the two-router
@@ -8037,23 +8647,35 @@ pub fn wmdirect_selftest() {
             // Zero means the +12 never steered, which IS the glide and is a real failure.
             // `swap_ok` gates the skip for the reason leg 9 states: without the reorder the lift is
             // a lead motion as well, and skipping on that would hide the producer half's failure.
-            if swap_ok && drag_last_lead() > 1 {
+            // SELFTEST-RACE, NARROWED ON REVIEW — this leg gets the `fpop` gate the `settle` leg
+            // must NOT have, and only on one shape. `lead > 1` is an event routed TWICE — the
+            // two-router interleave, the arm that was already here. `lead == 0 && fpop != 0` is
+            // this leg's steering motion routed by SOMEBODY ELSE before its own drain could steer
+            // with it, which is what both `lead=false` reds of the 34-boot experiment were:
+            // `lead=0` (not `>1`), `fpop=1..2`, `grabbed/swap/ended` all true, the row resting at
+            // the GRAB point. Both conjuncts are load-bearing: `lead == 0` with `fpop == 0` means
+            // nothing was stolen and the +12 truly never steered — the DRAGGLIDE regression this
+            // leg exists to catch, still a red. And `fpop` cannot be forged from inside this leg:
+            // `EVQ_POP` is charged per successful pop by whoever makes it, so a regression in this
+            // leg's own drain lowers its own count and the ledger's equally, leaving the
+            // difference alone. An UNGATED `fpop != 0` skip is the settle-leg mistake pointed the
+            // other way: benign steals (the press pop, post-edge routing) are common here too and
+            // would retire healthy `lead == 1` runs along with the raced ones.
+            if swap_ok && (drag_last_lead() > 1 || (drag_last_lead() == 0 && fpop != 0)) {
                 serial_println!(
-                    "[wm-act] lead -> SKIP (routing interleaved: lead={} on a one-lead gesture) fpop={} fpush={} quiesced={} cpu={}->{} dtick={}",
+                    "[wm-act] lead -> SKIP (routing interleaved: lead={} fpop={} fpush={}) cpu={} svc={:?}",
                     drag_last_lead(),
                     fpop,
                     fpush,
-                    SFQ_QUIESCE,
-                    cpu0,
                     cpu1,
-                    tick1 - tick0
+                    crate::arch::smp::service_cpu()
                 );
                 None
             } else {
                 let verdict = grabbed && swap_ok && ended && rest;
                 if !verdict {
                     serial_println!(
-                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} quiesced={} cpu={}->{} dtick={} masked={} svc={:?}",
+                        "[wm-act] lead detail: grabbed={} swap={} ended={} rest={} at={:?} want=({},{}) lead={} fpop={} fpush={} cpu={}->{} svc={:?}",
                         grabbed,
                         swap_ok,
                         ended,
@@ -8064,17 +8686,14 @@ pub fn wmdirect_selftest() {
                         drag_last_lead(),
                         fpop,
                         fpush,
-                        SFQ_QUIESCE,
                         cpu0,
                         cpu1,
-                        tick1 - tick0,
-                        masked,
                         crate::arch::smp::service_cpu()
                     );
                 }
                 Some(verdict)
             }
-        }),
+        }
         None => Some(false),
     };
 
@@ -16128,6 +16747,16 @@ pub enum BgPoll {
     Exited(i32),
     /// Killed by the fault-kill net (contained fault); if `reap` was set the row has been freed.
     Faulted,
+    /// CLOSE-CLEAN, shape parity with the aarch64 twin: closed by the operator via the window's
+    /// close box. **No x86 path constructs this today** — the x86 close box ([`wc_close_click`])
+    /// kills through [`bg_kill`], which claims and frees the Proc row itself, so a closed job's
+    /// next poll reads [`BgPoll::Gone`] (there is no x86 `EXEC_CLOSED_STATUS` and no settle path).
+    /// The variant exists so the two arches' `BgPoll` have the same shape and the arch-neutral
+    /// consumers (the shell's `jobs` verb, quarry's `reap_jobs`) can name the arm unconditionally
+    /// instead of `cfg`-gating it per arch; if x86 ever grows an aarch64-style close-settle (mark
+    /// the row `PEXITED` with a closed sentinel instead of reaping), [`bg_poll`] gains the producer
+    /// and every consumer is already wired.
+    Closed,
     /// No row holds this pid (already reaped, or never existed).
     Gone,
 }
@@ -16886,6 +17515,12 @@ fn winx_launcher(demo_cpu: usize) {
     // rule), and it MOVES the real pointer, which no earlier fixture may inherit either.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::video::wm::dmgovlp_selftest();
+    // VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness, both arms, and the
+    // ladder's new tail. After DMGOVLP because its negative leg deliberately runs a 2 s bound down
+    // (nothing after it should wait behind that), and it is otherwise the least disruptive fixture
+    // here: it moves no pointer, re-tiles nothing, and its two rows are its own and closed on exit.
+    #[cfg(all(feature = "witness", feature = "wc"))]
+    vugres_selftest(demo_cpu);
 }
 
 // =============================================================================================

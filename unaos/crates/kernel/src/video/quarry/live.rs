@@ -1084,14 +1084,13 @@ fn reap_jobs() {
             }
             BgPoll::Exited(st) => alloc::format!("exited status={}", st),
             BgPoll::Faulted => String::from("faulted (contained)"),
-            // The ONE genuinely per-arch line in this function, and it is not a hardware fact: the
-            // `BgPoll` enum itself differs. `arch/aarch64/syscall.rs` has a `Closed` variant
-            // (CLOSE-CLEAN — closed by the operator via a window's close box); `arch/x86_64/
-            // syscall.rs`'s `BgPoll` (declared near its `bg_poll`) has only Running/Exited/Faulted/
-            // Gone, so naming `Closed` unconditionally would not COMPILE on x86. Closing this
-            // properly means adding the variant to the x86 enum, which is outside this file's lane;
-            // until then the arm is gated so the aarch64 verdict text is not lost.
-            #[cfg(target_arch = "aarch64")]
+            // CLOSE-CLEAN — closed by the operator via a window's close box. Once the one
+            // genuinely per-arch line in this function: the x86 `BgPoll` had no `Closed` variant,
+            // so this arm was `cfg`-gated to aarch64. The x86 enum now carries the variant (shape
+            // parity), so the arm is unconditional; on x86 it is unreachable-by-value today (the
+            // x86 close box kills through `bg_kill`, which reaps the row itself, so a closed job
+            // polls `Gone` — see the variant's doc in `arch/x86_64/syscall.rs`), and the aarch64
+            // verdict text is unchanged.
             BgPoll::Closed => String::from("closed by its window"),
             BgPoll::Gone => String::from("gone (already reaped)"),
         };

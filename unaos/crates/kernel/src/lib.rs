@@ -73,8 +73,8 @@ pub mod selftest;
 // VERBS — `reboot` (warm) and `shutdown` (power off, cold-boot-ready). One word each on
 // every UnaOS; the per-platform mechanisms (aarch64: PSCI SYSTEM_RESET / SYSTEM_OFF via SMC
 // — invoke ATF/the firmware, never build power logic; x86 shutdown: the real ACPI S5;
-// unwired slots: honest witnesses) live behind them. Witness families `[orinreboot]` /
-// `[orinshutoff]`. See power.rs.
+// unwired slots: honest witnesses) live behind them. Witness families `[pwrreboot]` /
+// `[pwrshutoff]`. See power.rs.
 pub mod power;
 
 // INSTALL-CORE: the storage-agnostic installer engine (GPT writer + FAT32 formatter + extent
