@@ -127,10 +127,24 @@ for its sha check, and the same enumeration splits DEFERRED-KEEPABLE from RED.
 
 ### A shared protocol row is now stale, and this seat did not touch it
 
-LEDGER **P14** says "No gate can fix this: a checker cannot see another branch." That is **false of
-this script today**, on the strength of `:118`. P14 is a shared row; changing it inside one seat's
-landing would be one seat retiring a shared rule on its own discovery. Left for the three seats after
-the landing; orin 25 has said they will second it.
+LEDGER **P14** said "No gate can fix this: a checker cannot see another branch." That became **false
+of this script**, on the strength of `:118`. P14 is a shared row; changing it inside one seat's
+landing would be one seat retiring a shared rule on its own discovery, so it was left for the three
+seats.
+
+**⇒ CLOSED, and not by the three seats — by Peter, who named BOTH stale sentences himself in pi 10's
+session and ordered them removed.** The second, "arrives exactly where the refs became resolvable and
+nobody has to remember it", was overtaken by a later ruling rather than wrong when written (orin 25's
+framing, and the better one). pi removed both at **`2eb52c77`**, verified from this seat: P14's row
+contains neither sentence there, the diff is one line, and **it is UNPUSHED** — `origin/hw-pi4` is
+`2461094b` — so both sentences are still live text on every pushed ref including trunk.
+
+**This seat's first probe of that was confounded and is recorded because of it.** `git grep -c … |
+wc -l` counts FILES WITH A MATCH, not occurrences, and it reported the first sentence as surviving.
+It does survive — **at line 84, in this lane's own SR12 row, which quotes it in order to call it
+stale.** A row quoting a stale sentence is indistinguishable from the stale sentence to any search:
+SR11's family and SR12's fourth face meeting in one line. **And "count it first" is the rule this
+lane wrote into LAWS §5 this week and broke here.**
 
 ## LAWS §3 — orin 25's number, corrected by them, with the method written in
 
