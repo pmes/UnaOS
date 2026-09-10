@@ -3268,7 +3268,7 @@ mod metal {
     // `fs::unafs::with_unafs` to mount — so EVERY enumeration of `/` returns
     // `VfsError::Backend("unafs-mount")`, which is what `ls /` and quarry printed on render7
     // (`[quarry] open census ERROR cwd=/ "/: backend error: unafs-mount"`). The second half of the
-    // same fault is `/fat`: `FatBackend::new` reads through `BlockSource::Default`, the GLOBALLY
+    // same fault is `/boot`: `FatBackend::new` reads through `BlockSource::Default`, the GLOBALLY
     // registered block device, and nothing on an Orin boot ever registers one (`register_sd` is the
     // Pi's `baremetal` emmc2 arm). So the Orin had two mounts and zero volumes.
     //
@@ -3280,14 +3280,14 @@ mod metal {
     // only filesystem on the medium is the ESP's FAT32, so that is what the root binds to:
     //
     //   * `/`    -> the card's FAT volume through `BlockSource::TegraSd` (read-only).
-    //   * `/fat` -> the SAME volume, same source. Not decoration: `/fat` is `shell::EXEC_ROOT` and is
-    //     spelled literally in `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF` and quarry's
+    //   * `/boot` -> the SAME volume, same source. Not decoration: `/boot` is `shell::EXEC_ROOT` and is
+    //     spelled literally in `/apps/VUG.ELF`, `/apps/STAT.ELF`, `/apps/ELFHELLO.ELF` and quarry's
     //     double-click route, so re-pointing it is what makes those paths reach real files instead of
     //     `-ENOENT` off the new root.
     //
     // One volume, two prefixes, and the second one is why the desktop can launch anything. When the
     // UnaFS system partition exists this section is where `/` goes back to `NativeBackend` and the FAT
-    // returns to being the boot shim §3 says it is — at `/fat`, where it already is.
+    // returns to being the boot shim §3 says it is — at `/boot`, where it already is.
     //
     // READ-ONLY, AND NOT BECAUSE THIS FILE SAYS SO. `BlockSource::TegraSd::write_veto` is
     // `Some(TEGRA_SD_VETO)`, so `FatBackend::read_only()` is true and the VFS write verbs refuse
@@ -3406,8 +3406,9 @@ mod metal {
         }
     }
 
-    /// ROOTFS: the seam `shell::vfs_mount_table` calls — rebind `/` to the card's FAT volume and drop the
-    /// dead `/fat`. Called on every table build; does nothing but two `Vec` operations after the first.
+    /// ROOTFS: the seam `shell::vfs_mount_table` calls — rebind `/`, `/boot` and `/apps` (LAYOUT, orin 18)
+    /// to the card's FAT volume, which is the only volume this machine has. Called on every table build;
+    /// does nothing but three `Vec` operations after the first.
     ///
     /// It takes the table by `&mut` rather than returning a backend so the WHOLE namespace decision for
     /// this machine lives in one place instead of being spread across the shared builder: the caller's
@@ -3429,20 +3430,30 @@ mod metal {
         // synthesises any child row, so a root that errors makes every other mount unreachable from
         // the desktop and from quarry.
         //
-        // `/fat` because it is not decoration — it is `shell::EXEC_ROOT`, the second probe of
-        // `exec_resolve` (the reason a bare `vug` works from anywhere), and it is spelled literally in
-        // the launch paths `/fat/VUG.ELF`, `/fat/STAT.ELF`, `/fat/ELFHELLO.ELF` and quarry's own
-        // double-click route. Unmounting it (the first shape of this section) would have left every one
-        // of those resolving off the new root as `/fat/...`, i.e. `-ENOENT` — trading one dead
-        // namespace for another. Re-pointing it at the same card makes them all reach the real files,
-        // which is the whole point of having a root.
+        // `/boot` because the boot volume has a name an operator types, and unmounting it (the first
+        // shape of this section) would have traded one dead namespace for another.
+        //
+        // `/apps` (LAYOUT, orin 18) because it is not decoration — it is `shell::EXEC_ROOT`, the
+        // second probe of `exec_resolve` (the reason a bare `vug` works from anywhere), and it is
+        // spelled literally in the launch paths `/apps/VUG.ELF`, `/apps/STAT.ELF`,
+        // `/apps/ELFHELLO.ELF` and quarry's own double-click route. Leaving it bound to
+        // `BlockSource::Default` — a source no Orin boot registers — would leave every one of those
+        // answering `-ENODEV`. It is `.rooted(APPS_DIR)` over the same card, so `/apps/VUG.ELF`
+        // reaches `APPS/VUG.ELF` on the medium.
+        //
+        // IT CARRIES `/boot`'s VOLUME NAME, NOT A THIRD ONE. `MountTable::same_volume` compares the
+        // constructor strings, so a distinct name here would make one card read as two volumes —
+        // the aliasing defect (rmbp 15's C1) in a new spelling. The `card`/`fat` split BELOW is
+        // that same defect as it stands today, unmodified here on purpose: fixing volume identity
+        // is a separate arc (VOLID), and this one must not paper over it with a rename. The
+        // `layout.volid` fixture in `shell.rs` is what convicts it.
         //
         // Two adapters over one source is not a coherence risk: `FatBackend` re-mounts through
         // `fat::mount_source` on every call and holds no volume state (the stateless posture the shell's
         // FAT verbs have always had), so the two cannot disagree about the medium. The visible cost is
         // one synthesised `fat` row inside the listing of `/` — which is honest (it IS a mount point)
-        // and is exactly the case quarry's `root_prefixes` already handles: `/` claims `/fat`, so `/fat`
-        // is not a second root, it is a child reached through its parent (the "duplicate-/fat rule").
+        // and is exactly the case quarry's `root_prefixes` already handles: `/` claims `/boot`, so `/boot`
+        // is not a second root, it is a child reached through its parent (the "duplicate-/boot rule").
         mt.mount(
             "/",
             alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
@@ -3452,12 +3463,23 @@ mod metal {
             )),
         );
         mt.mount(
-            "/fat",
+            "/boot",
             alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
                 "fat",
                 crate::fs::vfs::KERNEL_PRINCIPAL,
                 true,
             )),
+        );
+        mt.mount(
+            "/apps",
+            alloc::boxed::Box::new(
+                crate::fs::vfs::FatBackend::new_tegra_sd(
+                    "fat",
+                    crate::fs::vfs::KERNEL_PRINCIPAL,
+                    true,
+                )
+                .rooted(crate::fs::fat::APPS_DIR),
+            ),
         );
         // One post-bind census, on the first bind only: the scorer's proof that the root now enumerates.
         if !ROOT_CENSUS.swap(true, Ordering::Relaxed) {
@@ -3470,12 +3492,12 @@ mod metal {
                         .filter(|r| matches!(r.kind, crate::fs::vfs::NodeKind::Dir))
                         .count();
                     serial_println!(
-                        "{} bound / and /fat = tegra-sd FAT read-only (both were dead: unafs has no volume here, Default has no device) entries={} dirs={} files={} list_us={} ::",
+                        "{} bound /, /boot and /apps = tegra-sd FAT read-only (all were dead: unafs has no volume here, Default has no device) entries={} dirs={} files={} list_us={} ::",
                         RPS, rows.len(), dirs, rows.len() - dirs, us
                     );
                 }
                 Err(e) => serial_println!(
-                    "{} bound / and /fat = tegra-sd FAT read-only but the first listing FAILED err={:?} ::",
+                    "{} bound /, /boot and /apps = tegra-sd FAT read-only but the first listing FAILED err={:?} ::",
                     RPS, e
                 ),
             }

@@ -360,11 +360,11 @@ pub struct Task {
     /// EL0 user-mode entry point + initial SP_EL0 (M6a). Non-zero only for `is_user` tasks made via
     /// `spawn_user`: such a task's initial frame lands in `user_task_trampoline`, which `eret`s to EL0
     /// at `user_entry` with SP_EL0 = `user_sp`. 0 / unused for ordinary kernel tasks. Read only by
-    /// `user_task_trampoline` (baremetal-only); on the `virt` build every task is a kernel thread, so
+    /// `user_task_trampoline` (`aarch64_el0`-gated); on a build with no EL0 regime every task is a kernel thread, so
     /// these stay 0 and unread (`spawn_inner` still initialises them for the shared struct layout).
-    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     user_entry: u64,
-    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     user_sp: u64,
     /// M6d: the TTBR0_EL1 value (`root_pa | asid << 48`) that installs this task's address space, or 0
     /// for a kernel task (no switch — kernel mappings are Global and byte-identical in every root, so a
@@ -1681,7 +1681,7 @@ extern "C" fn task_trampoline() -> ! {
 
 /// Placeholder `entry` for user tasks: `spawn_user` sets `Task.entry` to this, but `user_task_trampoline`
 /// never calls it (it `eret`s to EL0 instead). Panics loudly if a path ever reaches it. EL0/user machinery
-/// is baremetal-only (the `virt` JC3 path runs kernel-thread CAPSTONE, no EL0 — see the module gate).
+/// is `aarch64_el0`-gated: Pi `baremetal`, Orin `tegra_el0`, and — since JV1 — QEMU `virt` under `virt_el0`.
 #[cfg(feature = "aarch64_el0")]
 fn user_never(_: usize) {
     unreachable!("user task's kernel `entry` was called");
@@ -1699,7 +1699,7 @@ fn user_never(_: usize) {
 /// the stack the later `svc`/IRQ re-entry (`__vec_svc`/`__vec_irq`) runs on, so the 16 KiB Box must
 /// have headroom for the SVC/IRQ frame (256 GPR + 528 FP + 32 banked + the Rust handler) — it does;
 /// this trampoline uses only a shallow prologue. The msr+eret are one `noreturn` asm block so nothing
-/// runs after the drop. Baremetal-only (EL0/user machinery — the `virt` path has no EL0 this arc).
+/// runs after the drop. Gated on the `aarch64_el0` capability (Pi `baremetal`, Orin `tegra_el0`, JV1 `virt_el0`).
 #[cfg(feature = "aarch64_el0")]
 extern "C" fn user_task_trampoline() -> ! {
     let cpu = percpu::this_cpu().cpu_index as usize;
@@ -1931,8 +1931,8 @@ static EL0_RESIDENTS: [PaddedUsize; NUM_CPUS] =
 /// `pick_cpu` on another core can never place a second resident against a stale count. Returns the
 /// new (inclusive) resident count, which the placement witness prints.
 ///
-/// `allow(dead_code)`: the only callers are the two EL0 spawn paths, which are `baremetal`-gated (the
-/// `virt`/JC3 aarch64 build runs kernel threads only and creates no EL0 task). The RELEASE side stays
+/// `allow(dead_code)`: the only callers are the two EL0 spawn paths, which are `aarch64_el0`-gated (an
+/// aarch64 build with no board EL0 term runs kernel threads only, creating no EL0 task). The RELEASE side stays
 /// ungated because `exit()` is shared by both worlds — it simply never fires there (`user_entry == 0`).
 #[allow(dead_code)]
 #[inline]
@@ -3157,8 +3157,8 @@ pub fn mark_online(cpu: usize) {
 // `user_task_trampoline` writes ELR_EL1/SPSR_EL1 and `eret`s, and an `eret` executed at EL2 with
 // `HCR_EL2.E2H == 0` consumes ELR_EL2/SPSR_EL2 instead: the core returns to a stale EL2 PC with
 // every GPR just scrubbed to zero by the M6d hardening. On metal that is a wild fetch, a RAS
-// Uncorrectable, and a powered-off core — the observed `bg /fat/vug.elf` board kill. `run
-// /fat/vug.elf` survived only because it keeps `this_cpu()` (the BSP, at EL1) and its program
+// Uncorrectable, and a powered-off core — the observed `bg /apps/vug.elf` board kill. `run
+// /apps/vug.elf` survived only because it keeps `this_cpu()` (the BSP, at EL1) and its program
 // exited before any re-placement lane could move it off.
 //
 // THE RULE, until the APs are dropped to EL1 too: an EL0 task may be placed only on a core that is
@@ -3362,7 +3362,7 @@ static EL0_ROLLUP_NEXT: AtomicU64 = AtomicU64::new(0);
 /// per-event trace stops, and `EL0_REFUSALS` keeps the count, read out by `[el0core] rollup:`.
 ///
 /// Gated with `el0_refuse` itself on the EL0-machinery features, matching `SPREAD4_LOG_MAX`'s `pi`
-/// gate: the `virt`/JC3 legs build no EL0 spawn path at all, so on those the pair would be dead.
+/// gate: a leg with no EL0 spawn path at all (a knob-off `virt`/JC3 build) would find the pair dead.
 #[cfg(feature = "aarch64_el0")]
 const EL0_REFUSE_LOG_MAX: u32 = 16;
 #[cfg(feature = "aarch64_el0")]
@@ -3454,7 +3454,7 @@ fn el0_refuse(site: &str, name: &str, requested: usize) {
 /// COST ON THE HOT PATH: two relaxed loads and a compare per dispatch pass, which is noise beside the
 /// context switch that pass just performed. Everything else is behind the "the count changed" guard.
 ///
-/// SCOPED TO THE BUILDS THAT CAN REFUSE. `virt`/JC3 compiles no EL0 spawn path at all and its boot core
+/// SCOPED TO THE BUILDS THAT CAN REFUSE. A knob-off `virt`/JC3 leg compiles no EL0 spawn path and its core
 /// drops to EL1 through `boot_virt` (not this arc's lane, so it stamps nothing), so on that leg the
 /// line would report a counter nothing can increment beside an EL1 mask nothing populates — a false
 /// zero is worse than no line. `cfg!` rather than `#[cfg]` so both polarities keep type-checking on
@@ -3469,7 +3469,7 @@ fn el0_refuse(site: &str, name: &str, requested: usize) {
 /// than the thing it reads. But a reader diffing a DEFAULT-media capture against an ARMED one will go
 /// looking for the baseline `el0refuse=0` and not find it. Absent here means "not armed", NOT "dead".
 fn el0_refusal_rollup() {
-    if !cfg!(any(feature = "baremetal", feature = "tegra_el0")) { // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    if !cfg!(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")) { // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
         return;
     }
     let n = EL0_REFUSALS.load(Ordering::Relaxed);
@@ -3793,8 +3793,8 @@ pub fn spawn_auto(name: &'static str, entry: fn(usize), arg: usize) -> u64 {
 /// boot root (rather than 0) is load-bearing: if a per-slot task last ran on this core, `dispatch_next`
 /// must switch TTBR0 back to the boot root before this task's EL0 access hits the shared window VA.
 ///
-/// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`) is baremetal-only: it reaches
-/// into `super::boot` (the Pi-gated user MMU), and the `virt` JC3 path runs kernel-thread CAPSTONE only.
+/// EL0/user spawn machinery (this and `spawn_user_slot`/`spawn_user_inner`), gated on the `aarch64_el0`
+/// CAPABILITY: it reaches into `super::uslots`, the per-board user-MMU facade. Pi, Orin, and (JV1) virt.
 #[cfg(feature = "aarch64_el0")]
 pub fn spawn_user(name: &'static str, user_entry: u64, user_sp: u64, cpu: usize) -> u64 {
     spawn_user_inner(name, user_entry, user_sp, super::uslots::boot_ttbr0(), cpu, TASK_STACK_SIZE)
@@ -4679,7 +4679,7 @@ static ASID_THREADS: [AtomicU32; KILL_ASID_SLOTS] =
 /// Count a freshly spawned EL0 task against its slot. Called from both user-task spawn paths BEFORE the
 /// run-queue push, so the task is countable before it can ever be dispatched. Kernel tasks (ASID 0) and
 /// out-of-range ASIDs are ignored, which makes this inert on `virt` (every task there is a kernel thread).
-#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only — EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+#[cfg_attr(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")), allow(dead_code))] // both user-spawn paths are baremetal-only — EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
 fn asid_thread_enter(user_ttbr0: u64) {
     let asid = (user_ttbr0 >> 48) as usize;
     if asid != 0 && asid < KILL_ASID_SLOTS {
@@ -5732,7 +5732,7 @@ static INPUT_WAIT_BACKSTOP_DUE: AtomicU64 = AtomicU64::new(0);
 /// input ring, nothing can park on one, and the backstop has nothing to do.
 #[inline]
 fn input_wait_backstop() {
-    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg(not(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     return;
     #[cfg(feature = "aarch64_el0")]
     {
@@ -10237,7 +10237,7 @@ pub fn run_capstone_boot_core(cpu: usize) -> ! {
     // call compiles out without the feature, so a plain GICv3/tegra boot is byte-identical.
     #[cfg(feature = "simmer_test")]
     spawn("simmer-selftest", simmer_selftest, 0, cpu);
-    SCHED_GO.store(true, Ordering::Release); // harmless (no APs on this path)
+    SCHED_GO.store(true, Ordering::Release); #[cfg(feature = "virt_tick")] virt_preempt_arm(cpu); // harmless (no APs on this path). VIRTPREEMPT (orin 17) — the preemption arm is APPENDED ON THIS LINE, zero source lines added (the Location-shift convention this file already obeys). POSITION IS LOAD-BEARING, and it is why this arc does NOT copy ORIN-BSPRUN's terminus swap: everything above has already run cooperatively — `priority_aging_witness` and `prio_mix_witness` (whose strict-ordering claims are only valid un-preempted; skipped anyway on a pre-staged queue, but the guard must not depend on that), `parked_display_witness`, `sched_bal_witness`, and the `spawn("capstone", ...)` — while everything below is the drive loop, which becomes preemptive the instant `SCHED_ACTIVE` is set because `dispatch_next` ALREADY requeues a task that comes back READY. A preempt lands the loop back inside `dispatch_next` at exactly the point a `yield_now` does, so CAPSTONE, the JV1 EL0 round-trip and every baseline emit are kept rather than given up. See this file's tail §VIRTPREEMPT.
     // EL0-EL1CORE — the BASELINE emit of the refusal rollup, and the falsifier for the whole reader:
     // it prints `el0refuse=0` on a boot that refuses nothing, which is what proves the reader is
     // linked and reached on THIS platform. See `el0_refusal_rollup` for why the in-loop poll below sits
@@ -10732,7 +10732,7 @@ pub fn stk_probe_bounds(at: &str, name: &str, base: u64, len: u64) {
 // regime (never stamped into `EL1_CORE_MASK`), while core 0 IS stamped at EL1 by the JM6 drop
 // (`main.rs` EL0-EL1CORE stamp; `[el0core] el1 core MEASURED: cpu=0 mask=0x1`) but is NOT in
 // `ONLINE_MASK` — the cooperative terminus never calls `mark_online`. `run_bsp_tegra` calls it, so
-// the conjunction becomes satisfiable at core 0 for the first time and `bg /fat/vug.elf` should
+// the conjunction becomes satisfiable at core 0 for the first time and `bg /apps/vug.elf` should
 // stop printing "no core is at EL1 to host a background EL0 task on this platform (EL0-EL1CORE)".
 // "Should" is the problem. Nothing on the wire says so, and the two lines that DO exist are both
 // negative: `[el0core] rollup:` is emitted by `run_bsp_tegra` BEFORE `mark_online`, so it reports
@@ -10812,4 +10812,199 @@ fn bsprun_el0_first_run(cpu: usize, name: &str) {
             BSPRUN_EL0_FIRSTRUN_LOG_MAX
         );
     }
+}
+
+// ── VIRTPREEMPT (orin 17) — SCHED_ACTIVE + THE PREEMPTION PROOF ON QEMU `virt` ───────────────────
+//
+// Appended at the END of this file deliberately (the ORIN-BSPRUN / SHELLUP convention): the whole block
+// is `virt_tick`-gated, so the knob-off image contains none of it and no knob-off panic `Location`
+// line number shifts.
+//
+// THE HALF JV1 DEFERRED. `main.rs`'s JV1 header says it plainly: "the drop disables the physical timer,
+// `SCHED_ACTIVE` stays false, and the shared `__vec_irq` stub still banks EL2 state ... EL1 timer
+// preemption on virt needs an EL1-non-banking `__vec_irq` and is a SEPARATE arc". Three of those four
+// clauses are addressed elsewhere in this arc (the `irq_bank!` gate in `exceptions.rs`, the EL1 re-arm in
+// `timer.rs`, the post-EOI arm in `gic.rs`); `SCHED_ACTIVE` is this file's, and it is the last one.
+//
+// WHY THE TERMINUS IS NOT SWAPPED, unlike ORIN-BSPRUN. That arc replaced `run_capstone_boot_core` with
+// `run_bsp_tegra` and stated what it gave up: "an armed boot spawns NO CAPSTONE ... and skips the
+// cooperative terminus's baseline emits". On `virt` that price is unpayable — CAPSTONE and the JV1 EL0
+// round-trip ARE the regression this gate exists to protect, and a preemption arc that deletes them
+// proves preemption by removing the evidence it should have preserved. It is also unnecessary: read
+// `dispatch_next`'s tail, which already handles `STATE_READY` with the comment "READY (yielded or
+// preempted): re-enqueue at its BASE priority level". `timer_preempt` switches to
+// `SCHED[cpu].scheduler_sp` — the SP `dispatch_next` published on its way in — so a preempt returns the
+// drive loop to precisely where a cooperative `yield_now` returns it. The cooperative loop and the
+// preemptive loop are the same loop; only the flag differs.
+//
+// WHAT PREEMPTION CAN NOW INTERRUPT THAT IT NEVER COULD, hazard by hazard (the ORIN-BSPRUN accounting,
+// re-derived for this terminus rather than inherited): **serial** — `_print` masks IRQs around the port
+// lock and IRQ-context prints are try_lock + staging, so a tick cannot land mid-hold; **run queues** —
+// every rq section runs IRQ-masked (WEDGE-4 `rq` law) and `timer_preempt` carries the `IN_RQ_SECTION`
+// tripwire; **EL0** — the 0x480 lower-EL vector routes to the same now-runtime-banked `__vec_irq`, which
+// banks SP_EL0 unconditionally, so a preempted EL0 task resumes on its own user SP (the Pi's
+// metal-proven path, and the M6e spinner below is what exercises it here); **video/WM locks** — nothing
+// on this terminus touches video (the JC3 block detaches fbcon before the drop, precisely because the
+// EL1 map may not cover the framebuffer); **cross-core** — the three `virt` EL2 secondaries sit in
+// `run()` with empty queues, and `try_steal` skips any core whose `ONLINE_MASK` bit is clear, which
+// cpu 0's is: `run_capstone_boot_core` never calls `mark_online`, and this arc does not add it. So the
+// proof below runs on ONE core by construction, which is what makes its interleave mean anything.
+//
+// ── THE PROOF, and why it is a proof ────────────────────────────────────────────────────────────
+//
+// Three kernel tasks are staged on the boot core, all at PRIO_NORMAL, NONE of which ever calls
+// `yield_now`, `sleep_ticks`, or any blocking primitive:
+//
+//   * `vp-spinA` / `vp-spinB` — each spins for a fixed WALL-CLOCK window (CNTPCT, which advances whether
+//     or not any interrupt is ever delivered) and on every pass does `VP_LAST.swap(my_id)`, counting a
+//     HANDOVER whenever the previous occupant was the other spinner.
+//   * `vp-judge` — spawned third, also non-yielding; it waits for both spinners (and for the EL0
+//     spinner) and prints the verdict.
+//
+// THE DISCRIMINATOR IS THE HANDOVER COUNT, NOT THE LOOP COUNTS. Under a purely cooperative dispatcher
+// the schedule is forced: A is dispatched, runs its entire window without ever returning to the
+// scheduler, exits; B is dispatched, does the same; then the judge. `VP_ALT` therefore reads EXACTLY 2 —
+// one for A's first swap over the initial zero, one for B's first swap over A — and it can read nothing
+// else, because a handover requires a switch and cooperation offers none. Every count above 2 is an
+// involuntary switch that only the timer can have caused. The PASS floor is set at 6 (four real
+// handovers) so that a single stray switch could not carry the verdict; the measured value at
+// QUANTUM_TICKS=3 and 250 Hz over a 500 ms window is ~40x that.
+//
+// IT IS BOUNDED IN BOTH DIRECTIONS, which is the property a gate needs. The windows are wall-clock, so
+// the FAILURE mode (no tick is ever delivered) is not a hang: the spinners still finish, the judge still
+// runs, and it prints FAIL with `alternations=2` — the cooperative signature — instead of the boot going
+// quiet. That is deliberate: a proof whose negative outcome is a timeout tells a capture nothing.
+//
+// THE EL0 HALF is the brief's named example and is measured from `PRIO_EL0_DISPATCH`, not from
+// `aarch64_irq_handler`'s M6e counter (which stays Pi-only; the reason is in `exceptions.rs` at that
+// block — the virt boot also ticks at EL2 before the JC3 drop, where SPSR_EL1 is RESET-UNKNOWN, so a
+// zero there would be counted as an EL0 preempt that never happened). `virt_el0_start_maybe` stages TWO
+// EL0 tasks: `el0-hello`, which makes one non-blocking `sys_write` then `sys_exit`, and `el0-spin`
+// (`__user_prog_spin`), a register-only loop that makes NO syscall at all until its final exit. Neither
+// can yield, so a cooperative boot dispatches each exactly once and the counter reads exactly 2. A third
+// dispatch means an EL0 task was switched out and switched back — EL0 preemption through the 0x480
+// vector, with SP_EL0 banked correctly enough for the spinner to reach its `sys_exit` afterwards
+// (`EL0_SPIN_DONE`, which the judge waits for so that "not preempted" and "not finished" cannot be
+// confused).
+
+/// VIRTPREEMPT — the id of the spinner that most recently took a pass (0 = neither has run yet).
+#[cfg(feature = "virt_tick")]
+static VP_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// VIRTPREEMPT — A<->B handovers observed. Reads EXACTLY 2 under cooperative dispatch (see the block
+/// comment); every count above that is an involuntary switch.
+#[cfg(feature = "virt_tick")]
+static VP_ALT: AtomicU64 = AtomicU64::new(0);
+
+/// VIRTPREEMPT — per-spinner pass counts, reported for scale (they are NOT the discriminator).
+#[cfg(feature = "virt_tick")]
+static VP_LOOPS_A: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "virt_tick")]
+static VP_LOOPS_B: AtomicU64 = AtomicU64::new(0);
+
+/// VIRTPREEMPT — bit `id` set when spinner `id` has finished its window.
+#[cfg(feature = "virt_tick")]
+static VP_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// VIRTPREEMPT — the wall-clock window each spinner runs for, in milliseconds. 500 ms is ~125 ticks at
+/// TICK_HZ and ~40 quanta at QUANTUM_TICKS=3, so the expected handover count is two orders of magnitude
+/// clear of the PASS floor while the whole proof costs the gate under a second of its 60.
+#[cfg(feature = "virt_tick")]
+const VP_WINDOW_MS: u64 = 500;
+
+/// VIRTPREEMPT — handovers required to PASS. The cooperative schedule produces exactly 2 and cannot
+/// produce 3; 6 leaves four handovers of margin so no single stray switch decides the verdict.
+#[cfg(feature = "virt_tick")]
+const VP_ALT_FLOOR: u64 = 6;
+
+/// VIRTPREEMPT — one of the two non-yielding kernel spinners (`arg` is its id, 1 or 2). Register + two
+/// relaxed atomics per pass, no lock, no allocation, no print, and above all NO scheduler call: the only
+/// thing that can take this task off the CPU is a timer IRQ. The window is CNTPCT-bounded rather than
+/// iteration-bounded so the task's lifetime does not depend on the host's emulation speed, and rather
+/// than tick-bounded so it terminates even when the thing under test never fires.
+#[cfg(feature = "virt_tick")]
+fn vp_spin_body(id: usize) {
+    let freq = crate::arch::timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let deadline = now_cyc().wrapping_add(freq.saturating_mul(VP_WINDOW_MS) / 1000);
+    let me = id as u64;
+    let mut loops: u64 = 0;
+    while now_cyc() < deadline {
+        if VP_LAST.swap(me, Ordering::Relaxed) != me {
+            VP_ALT.fetch_add(1, Ordering::Relaxed);
+        }
+        loops = loops.wrapping_add(1);
+        core::hint::spin_loop();
+    }
+    if id == 1 {
+        VP_LOOPS_A.store(loops, Ordering::Relaxed);
+    } else {
+        VP_LOOPS_B.store(loops, Ordering::Relaxed);
+    }
+    VP_DONE.fetch_or(1 << id, Ordering::Release);
+}
+
+/// VIRTPREEMPT — the judge. Also non-yielding, and that is the third leg of the proof: under
+/// cooperative dispatch it could only ever run AFTER both spinners had exited, and it would then read
+/// the cooperative signature and say so. It waits (wall-clock bounded, so a dead spinner produces a FAIL
+/// line rather than silence) for both spinners AND for the EL0 spinner's `sys_exit`, then prints one
+/// self-checking line carrying the clock, the interleave, and the EL0 dispatch count.
+#[cfg(feature = "virt_tick")]
+fn vp_judge_body(_: usize) {
+    let freq = crate::arch::timer::cntfrq();
+    let freq = if freq == 0 { 62_500_000 } else { freq };
+    let deadline = now_cyc().wrapping_add(freq.saturating_mul(15));
+    while now_cyc() < deadline {
+        if VP_DONE.load(Ordering::Acquire) == 0b110
+            && crate::arch::syscall::el0_spin_done() != 0
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let alt = VP_ALT.load(Ordering::Relaxed);
+    let ticks = crate::arch::timer::virt_tick_count();
+    let el0_disp = PRIO_EL0_DISPATCH[cpu].load(Ordering::Relaxed);
+    let done = VP_DONE.load(Ordering::Acquire);
+    let spin_done = crate::arch::syscall::el0_spin_done();
+    let kernel_pass = done == 0b110 && alt >= VP_ALT_FLOOR;
+    let el0_pass = spin_done != 0 && el0_disp > 2;
+    serial_println!(
+        ":: [virttick] PREEMPTION {} — kernel={} (alternations={}, cooperative schedule produces EXACTLY 2; floor {}), el0={} (el0 dispatches on cpu{}={}, 2 EL0 tasks neither of which can yield; el0-spin exited={}), ticks={}, spinA={} spinB={} done={:#b}, 3 non-yielding kernel tasks + 1 non-yielding EL0 task on ONE core ::",
+        if kernel_pass && el0_pass { "PASS" } else { "FAIL" },
+        if kernel_pass { "PASS" } else { "FAIL" },
+        alt,
+        VP_ALT_FLOOR,
+        if el0_pass { "PASS" } else { "FAIL" },
+        cpu,
+        el0_disp,
+        spin_done,
+        ticks,
+        VP_LOOPS_A.load(Ordering::Relaxed),
+        VP_LOOPS_B.load(Ordering::Relaxed),
+        done
+    );
+}
+
+/// VIRTPREEMPT terminus arm, called from `run_capstone_boot_core`'s `SCHED_GO` line: stage the three
+/// proof tasks, then set `SCHED_ACTIVE` — the flag that turns `timer_preempt` (and with it the SCHED
+/// load / `[pulse5]` / `[spin1]` witness train) from a no-op into the preemption this arc is about.
+///
+/// ORDER IS THE POINT. The spawns happen FIRST and the store LAST, so the staging itself is provably
+/// un-preempted, and the banner prints before the store for the same reason `run_bsp_tegra`'s does: it
+/// must not be able to be the first thing preempted. `mark_online(cpu)` is deliberately NOT called —
+/// ORIN-BSPRUN wants the boot core in `ONLINE_MASK` because it is joining `run()`; here the core stays
+/// in its own drive loop, and keeping it out of the mask is what makes it un-stealable by the three EL2
+/// secondaries and the proof therefore single-core.
+#[cfg(feature = "virt_tick")]
+fn virt_preempt_arm(cpu: usize) {
+    serial_println!(
+        ":: [virttick] arming preemption on cpu {} — SCHED_ACTIVE=true, 3 non-yielding proof tasks staged ({} ms window, PASS floor {} handovers); terminus stays run_capstone_boot_core so CAPSTONE + the JV1 EL0 round-trip are KEPT ::",
+        cpu, VP_WINDOW_MS, VP_ALT_FLOOR
+    );
+    spawn("vp-spinA", vp_spin_body, 1, cpu);
+    spawn("vp-spinB", vp_spin_body, 2, cpu);
+    spawn("vp-judge", vp_judge_body, 0, cpu);
+    SCHED_ACTIVE.store(true, Ordering::Release);
 }

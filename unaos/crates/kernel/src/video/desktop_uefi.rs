@@ -731,13 +731,13 @@ pub fn desktop_app_service() {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root(DESKTOP_APP) else {
+    let Ok(de) = fs.find_app(DESKTOP_APP) else {
         // Name the VOLUME, not "the boot volume": `fat::mount()` binds the USB mass-storage device
         // xHCI enumerated, and the volume UEFI booted from is a different thing the kernel cannot
         // read after `ExitBootServices`. The WINX-2 witness learned this the hard way on an attended
         // rMBP boot and its message is the model for this one.
         serial_println!(
-            "[wc-x] desktop-app DECLINE reason=absent name=/{} — not on the mounted DATA volume (the USB mass-storage device, NOT the UEFI boot volume); stage target/x86_64_data/ onto it",
+            "[wc-x] desktop-app DECLINE reason=absent name=/apps/{} — not in APPS/ on the mounted DATA volume (the USB mass-storage device, NOT the UEFI boot volume); stage target/x86_64_data/ onto it",
             DESKTOP_APP
         );
         return;
@@ -747,7 +747,7 @@ pub fn desktop_app_service() {
     // for a bad volume instead of a bad name.
     if de.is_dir {
         serial_println!(
-            "[wc-x] desktop-app DECLINE reason=is-directory name=/{}", DESKTOP_APP
+            "[wc-x] desktop-app DECLINE reason=is-directory name=/apps/{}", DESKTOP_APP
         );
         return;
     }
@@ -761,12 +761,12 @@ pub fn desktop_app_service() {
     }
     let mut bytes = alloc::vec![0u8; de.size as usize];
     if fs.read_file(&de, &mut bytes, cap).is_err() {
-        serial_println!("[wc-x] desktop-app DECLINE reason=read-failed name=/{}", DESKTOP_APP);
+        serial_println!("[wc-x] desktop-app DECLINE reason=read-failed name=/apps/{}", DESKTOP_APP);
         return;
     }
     // SHORT READ. `read_file`'s own doc: a file whose cluster chain ends before `de.size` yields a
     // SHORT READ rather than an error. FATREAD-1 was exactly this class of silent mismatch — it is
-    // what blocked `bg /fat/STAT.ELF` on x86 — and the shell's `read_el0_image` carries this check
+    // what blocked `bg /apps/STAT.ELF` on x86 — and the shell's `read_el0_image` carries this check
     // for that reason. Without it the loader gets a truncated image and reports something unrelated.
     if bytes.len() != de.size as usize {
         serial_println!(

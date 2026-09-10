@@ -596,11 +596,25 @@
 //   * `STALE-ORIG`         an ORIGINAL ring buffer written although no descriptor holds a ring address
 //                          any more ⇒ the emitted address is held INSIDE the NIC and predates the
 //                          re-point. C2 CONVICTED, and convicted as a stale value, not a fetched one.
-//   * `PREFETCHED`         ring buffer s (its own original) written ⇒ desc[s] was already prefetched
-//                          when the re-point ran; measures prefetch depth (the max such s, +1).
+//   * `CONTROL-OK`         ring buffer 0 written on slot 0's completion ⇒ the ONE descriptor the
+//                          re-point deliberately leaves alone landed correctly. Not a prefetch datum
+//                          (desc[0] was never moved), so it is counted apart from `PREFETCHED`.
+//   * `PREFETCHED`         ring buffer s (its own original) written, s ≥ 1 ⇒ desc[s] was already
+//                          prefetched when the re-point ran; measures prefetch depth (the max s, +1).
 //   * `NOWHERE`            a real writeback length and NOT ONE tag lost in either block ⇒ the payload
 //                          never reached this DRAM. C1 CONVICTED.
 // `[net5V]` at window close tallies the arms and states the ranked answer.
+//
+// THE READ SIDE (`net5_read_src`, and the render8 fix). The probe's arms are a diagnosis; the frame the
+// driver hands smoltcp is the delivery. render8 separated the two: pops 1..3 completed slots 1, 2 and 3
+// and all three payloads landed in shadow[17] (`REFETCH-WRONGSLOT` ×3) — the address path is live (it
+// honoured a post-enable re-point) and the reuse is an INDEX defect. The read site asked only whether
+// `shadow[rx_cur]` had lost its tag, which was false on every one of those pops, so it fell through to
+// the untouched original buffer and delivered 16 bytes of landing tag as a frame. It now resolves the
+// slot the NIC actually wrote — the completing slot's shadow first, else the ONE shadow buffer that lost
+// its tag, else nothing — and records `slot_expected`/`slot_read` on `[net5T]` and `[net5V]`. It consumes
+// nothing: `net5_on_pop` runs after it and its scan is the instrument, and the RESTAMP-ALL there is the
+// consume. An ambiguous pop (two or more shadow buffers written) refuses rather than guess an index.
 //
 // ABSENCE IS A VERDICT, in three shapes: no `[net5R] ARMED` line (the probe refused — the `[net5R] NOT
 // ARMED` line names below4g=0 or a shadow outside the identity region: UNDECIDED, not FAIL); a
@@ -1388,6 +1402,25 @@ mod metal {
         net5_nowhere: u64,
         #[cfg(feature = "net5")]
         net5_depth: i64,
+        /// NET-5 (render8 fix) — slot 0 is deliberately NOT re-pointed (it is the probe's control), so a
+        /// landing in its ORIGINAL buffer is the control behaving correctly and can never be evidence of
+        /// descriptor prefetch. `net5_control` counts that case separately: scoring it as `PREFETCHED`
+        /// (render8 read `PREFETCHED=1 prefetch-depth=1`, both of them pop 0's control landing) also
+        /// disarmed § 5's "NOWHERE with no PREFETCHED ⇒ C1" rule with an artifact of the control itself.
+        #[cfg(feature = "net5")]
+        net5_control: u64,
+        /// NET-5 (render8 fix) — the READ-SIDE index witness, set on every pop that resolves a landing.
+        /// `net5_slot_expected` is the completing slot (where a correctly-addressed payload SHOULD be),
+        /// `net5_slot_read` is the shadow slot the frame was actually read from, and
+        /// `net5_read_divergent` counts the pops where the two differed. On render8 they differed on
+        /// every scored pop (expected 1, 2, 3 — read 17), which is why the driver handed smoltcp the
+        /// completing slot's landing-tag bytes instead of the payload already sitting in DRAM.
+        #[cfg(feature = "net5")]
+        net5_slot_expected: i64,
+        #[cfg(feature = "net5")]
+        net5_slot_read: i64,
+        #[cfg(feature = "net5")]
+        net5_read_divergent: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -2908,20 +2941,19 @@ mod metal {
                     len = d.max(60).min(RX_BUF_SIZE).min(out.len());
                 }
             }
-            // NET-5 — with the ring re-pointed, the completing slot's descriptor ADDRESS is its shadow
-            // buffer, so that is where a correctly-addressed payload lands. This is not the NET-4D
-            // harvest heuristic: it reads the frame from the address the descriptor actually carries.
-            // Falls through to the original buffer whenever the shadow buffer still holds its tag.
+            // NET-5 — read the frame from the shadow slot the NIC ACTUALLY wrote. This site used to read
+            // `shadow[rx_cur]` and nothing else, on the assumption that a re-pointed descriptor's payload
+            // lands at its OWN slot's address; render8 falsified that assumption on the wire. Pops 1..3
+            // completed slots 1, 2 and 3 and EVERY payload landed in shadow[17] (`[net5T] … verdict=
+            // REFETCH-WRONGSLOT` ×3), so the completing slot's shadow buffer still carried its landing
+            // tag at every one of them, this expression fell through to the (also untouched) original
+            // ring buffer, and smoltcp was handed 60 bytes of `NET4E_` tag while the DHCP OFFER sat
+            // unread in DRAM. `net5_read_src` resolves the real landing slot and records
+            // slot_expected/slot_read for `[net5V]`; it CONSUMES NOTHING, so the per-pop scan in
+            // `net5_on_pop` (which runs after this and owns the RESTAMP-ALL) still sees the landing it
+            // exists to score.
             #[cfg(feature = "net5")]
-            let buf = if self.net5_shadow != 0
-                && !net4g_tag_intact(
-                    self.net5_shadow + (self.rx_cur * RX_BUF_SIZE) as u64,
-                    NET5_SHADOW_TAGBASE + self.rx_cur,
-                ) {
-                (self.net5_shadow + (self.rx_cur * RX_BUF_SIZE) as u64) as *mut u8
-            } else {
-                buf
-            };
+            let buf = self.net5_read_src().unwrap_or(buf);
             let src: *const u8 = if !harvest.is_null() { harvest } else { buf };
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
@@ -3576,6 +3608,9 @@ mod metal {
             } else if shadow_mask != 0 {
                 self.net5_refetch_wrongslot += 1;
                 ("REFETCH-WRONGSLOT", "a SHADOW buffer other than the completing slot's was written — the NIC re-fetched a post-enable address but resolves payloads to another slot's: a genuine index/address reuse, measured with the address moved under it")
+            } else if own_ring && s == 0 {
+                self.net5_control += 1;
+                ("CONTROL-OK", "the CONTROL slot's own buffer was written — desc[0] is the one descriptor `net5_arm` deliberately leaves on its original address, so this is the control landing correctly and says NOTHING about prefetch depth (render8 scored it PREFETCHED, which both invented a prefetch depth of 1 and, by making PREFETCHED non-zero, disarmed the NOWHERE ⇒ C1 rule)")
             } else if own_ring {
                 self.net5_prefetched += 1;
                 if s as i64 > self.net5_depth {
@@ -3589,13 +3624,23 @@ mod metal {
                 self.net5_nowhere += 1;
                 ("NOWHERE", "a real writeback length completed and NOT ONE tag was lost in EITHER block — the payload never reached this DRAM at all; no address reuse can produce this, and the defect is inbound payload-write DELIVERY")
             };
+            let read_here = if self.net5_slot_expected == s as i64 {
+                self.net5_slot_read
+            } else {
+                -1
+            };
+            // `net5_read_src` only records a pair when it RESOLVED a landing, so a stale pair from an
+            // earlier pop must not be printed as this one's. It stamps `slot_expected = s`, and the ring
+            // cursor advances between pops, so "expected == s" is exactly "this pop's pair"; -1 means the
+            // read site found nothing to read (the NOWHERE / control / ambiguous cases).
             if self.net5_witnessed < NET5_WITNESS_N {
                 self.net5_witnessed += 1;
                 serial_println!(
-                    "{}   [net5T] rx[{}] slot={} len={} SINCE-LAST-POP shadow-mask={:#010x} (first={}) ring-mask={:#010x} (first={}) own-shadow={} own-ring={} verdict={} — {} ::",
+                    "{}   [net5T] rx[{}] slot={} len={} SINCE-LAST-POP shadow-mask={:#010x} (first={}) ring-mask={:#010x} (first={}) own-shadow={} own-ring={} slot_expected={} slot_read={} verdict={} — {} ::",
                     P4, self.rx_count.saturating_sub(1), s, len,
                     shadow_mask, shadow_first, ring_mask, ring_first,
-                    own_shadow as u8, own_ring as u8, arm, meaning
+                    own_shadow as u8, own_ring as u8,
+                    s, read_here, arm, meaning
                 );
             }
             // RESTAMP-ALL: the whole point. Every ring and shadow buffer gets its tag back, so the next
@@ -3610,6 +3655,83 @@ mod metal {
                 );
             }
             dma_wmb();
+        }
+
+        /// NET-5 (render8 fix) — resolve WHERE to read this completion's frame from, given that the NIC
+        /// provably does not always write it to the completing slot's address.
+        ///
+        /// render8 is the wire evidence. Three consecutive pops completed slots 1, 2 and 3 and all three
+        /// payloads landed in shadow[17] — the same INDEX, with the address moved under it after RxEnb,
+        /// so the address path is live and the reuse is an index defect. The old read site asked only
+        /// "did shadow[rx_cur] lose its tag?", which is false on every one of those pops, so it read the
+        /// untouched original ring buffer and delivered the landing tag as if it were a frame.
+        ///
+        /// Resolution order, strictest first:
+        ///   0. the CONTROL slot — slot 0 completing with `ring[0]` written. `desc[0]` is never
+        ///      re-pointed, so its payload belongs in its original buffer and the caller already has
+        ///      that pointer; resolving it into the shadow block could only hand it another frame.
+        ///   1. `shadow[rx_cur]` — the completing slot's own re-pointed address. Correct addressing; a
+        ///      `REFETCH-LIVE` pop reads here and `slot_read == slot_expected`.
+        ///   2. the ONE shadow slot that lost its tag — the `REFETCH-WRONGSLOT` case. Unambiguous only
+        ///      when exactly one did; two or more written shadow buffers cannot be attributed to this
+        ///      completion, so we refuse rather than deliver a frame from a guessed index.
+        ///   3. `None` — nothing in the shadow block was written (`PREFETCHED` / `STALE-ORIG` /
+        ///      `NOWHERE` / the control slot), and the caller keeps its original-buffer pointer.
+        ///
+        /// READ-ONLY on DRAM: it stamps no tag and zeroes no head, because `net5_on_pop` runs after this
+        /// on the same pop and its scan IS the instrument — consuming here would erase the landing the
+        /// probe exists to score, and the RESTAMP-ALL at the end of that scan is already the consume.
+        #[cfg(feature = "net5")]
+        fn net5_read_src(&mut self) -> Option<*mut u8> {
+            if self.net5_shadow == 0 {
+                return None;
+            }
+            let s = self.rx_cur;
+            dma_rmb();
+            if s == 0 && !net4g_tag_intact(self.rx_buffers as u64, 0) {
+                self.net5_slot_expected = 0;
+                self.net5_slot_read = 0;
+                return None;
+            }
+            // The CONTROL slot first. `desc[0]` is never re-pointed, so slot 0's payload belongs in
+            // `ring[0]` and the caller's own pointer already names it — resolving slot 0 to some other
+            // slot's SHADOW buffer would hand it a different frame, and would break the one slot whose
+            // correctness the whole probe is calibrated against.
+            let own = !net4g_tag_intact(
+                self.net5_shadow + (s * RX_BUF_SIZE) as u64,
+                NET5_SHADOW_TAGBASE + s,
+            );
+            let mut hit: i64 = -1;
+            let mut nhit = 0usize;
+            if !own {
+                for k in 0..NUM_RX {
+                    if !net4g_tag_intact(
+                        self.net5_shadow + (k * RX_BUF_SIZE) as u64,
+                        NET5_SHADOW_TAGBASE + k,
+                    ) {
+                        nhit += 1;
+                        if hit < 0 {
+                            hit = k as i64;
+                        }
+                    }
+                }
+            }
+            let read = if own {
+                s as i64
+            } else if nhit == 1 {
+                hit
+            } else {
+                -1
+            };
+            if read < 0 {
+                return None;
+            }
+            self.net5_slot_expected = s as i64;
+            self.net5_slot_read = read;
+            if read != s as i64 {
+                self.net5_read_divergent += 1;
+            }
+            Some((self.net5_shadow + (read as usize * RX_BUF_SIZE) as u64) as *mut u8)
         }
 
         /// NET-5 — the window-close tally and the ranked answer (header § NET-5). Printed on every armed
@@ -3628,7 +3750,8 @@ mod metal {
                 + self.net5_refetch_wrongslot
                 + self.net5_stale_orig
                 + self.net5_prefetched
-                + self.net5_nowhere;
+                + self.net5_nowhere
+                + self.net5_control;
             let answer = if scored == 0 {
                 "UNDECIDED: no RX completion reached the ring this window (link / cable / traffic) — the probe armed and measured nothing"
             } else if self.net5_refetch_live > 0 {
@@ -3643,10 +3766,12 @@ mod metal {
                 "MIXED: prefetched landings only, or prefetched + nowhere. The re-point never got ahead of the engine's prefetch — read `prefetch-depth` and re-fly with the shadow armed BEFORE RxEnb for the slots beyond it"
             };
             serial_println!(
-                "{}   [net5V] ring RE-FETCH verdict: pops-scored={} REFETCH-LIVE={} REFETCH-WRONGSLOT={} STALE-ORIG={} PREFETCHED={} NOWHERE={} prefetch-depth={} shadow={:#x} rx-bufs={:#x} below4g={} — {} ::",
+                "{}   [net5V] ring RE-FETCH verdict: pops-scored={} REFETCH-LIVE={} REFETCH-WRONGSLOT={} STALE-ORIG={} PREFETCHED={} NOWHERE={} CONTROL-OK={} prefetch-depth={} slot_expected={} slot_read={} divergent-reads={} shadow={:#x} rx-bufs={:#x} below4g={} — {} ::",
                 P4, scored, self.net5_refetch_live, self.net5_refetch_wrongslot,
                 self.net5_stale_orig, self.net5_prefetched, self.net5_nowhere,
-                self.net5_depth + 1, self.net5_shadow, self.rx_buffers as u64,
+                self.net5_control, self.net5_depth + 1,
+                self.net5_slot_expected, self.net5_slot_read, self.net5_read_divergent,
+                self.net5_shadow, self.rx_buffers as u64,
                 self.net4f_below4g as u8, answer
             );
         }
@@ -4863,6 +4988,14 @@ mod metal {
             net5_nowhere: 0,
             #[cfg(feature = "net5")]
             net5_depth: -1,
+            #[cfg(feature = "net5")]
+            net5_control: 0,
+            #[cfg(feature = "net5")]
+            net5_slot_expected: -1,
+            #[cfg(feature = "net5")]
+            net5_slot_read: -1,
+            #[cfg(feature = "net5")]
+            net5_read_divergent: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──

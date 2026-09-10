@@ -28,7 +28,7 @@ Cell values: **yes** (verified on that platform) · **no** (verified absent) · 
 | USB storage disk mint (incl. stuck-reader cure) | ? | partial | Pi: mint works after replug; hub-cycle rung refused port-shared once (ghost fix 7b87e045 unflown) |
 | Boots + runs from ONE card (no data card) | ? | yes | Pi: ONECARD witness + ELF1/EXEC1/K2/K3/K4 all off the internal card, no USB attached (QEMU raspi4b default) |
 | FAT read/write | ? | yes | Pi: midden write/rm/mv byte-exact on metal |
-| UnaFS mount + verbs (incl. umv/urmattr, snapshots) | ? | yes | Pi: fixtures green on metal boots; F2/F3 landed |
+| UnaFS mount + verbs (the plain file verbs reach it; `setfattr -x`, `snap`) | ? | yes | Pi: fixtures green on metal boots; F2/F3 landed |
 | One path namespace (ls/cat/run agree) | ? | yes | VFS seam 4cd87124; QEMU witnesses |
 | Wired network (DHCP/ping) | n/a | yes | Pi GENET on metal |
 | WiFi / Bluetooth | partial? | no | x86: GR27 b43 work in flight; Pi: needs bunker firmware, unstarted |

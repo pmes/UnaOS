@@ -17,6 +17,12 @@
 use alloc::vec::Vec;
 use alloc::string::String;
 use crate::console::Console;
+// VFSROUTE: the three FAT types this file used to name everywhere are down to ONE consumer — the
+// x86 exec probe (`fat_path_is_file` + `open_read_volume`), which must bind the program source
+// itself so `fatverb_storage_witness` has two independent producers to compare. Every verb sees
+// `crate::fs::vfs::{DirEnt, Stat, VfsError}` instead, which is the point: a listing row in this
+// shell is a NAMESPACE fact, not a FAT structure. aarch64 names none of them at all.
+#[cfg(target_arch = "x86_64")]
 use crate::fs::fat::{DirEntry, FatError, FatFs};
 // The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module, and since DECRUD-1 a
 // knob-gated one — see the `pub mod vug` note in `lib.rs`. The verbs that drive it carry the identical
@@ -75,46 +81,7 @@ fn normalize_path(base: &str, arg: &str) -> String {
     out
 }
 
-/// A resolved absolute path: the root itself, or a concrete directory entry (file or subdir)
-/// plus the CANONICAL absolute path it was found at (on-disk 8.3 spelling).
-enum Resolved {
-    Root,
-    Entry(DirEntry, String),
-}
 
-/// Walk a normalized absolute path from the root, component by component, via the read-only
-/// `FatFs::read_dir`. Case-insensitive 8.3 matching (short names are stored uppercase on disk).
-/// Errors carry the errno-style tag the caller prints — nothing is swallowed.
-fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
-    let mut cluster = 0u32; // 0 = the root (read_dir's convention)
-    let mut cur: Option<(DirEntry, String)> = None;
-    let mut canon = String::new();
-    for comp in path.split('/').filter(|c| !c.is_empty()) {
-        if let Some((de, _)) = &cur {
-            if !de.is_dir {
-                return Err(alloc::format!("{}: not a directory (-ENOTDIR)", canon));
-            }
-            cluster = de.first_cluster();
-        }
-        let entries = fs
-            .read_dir(cluster)
-            .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", canon, e))?;
-        match entries.iter().find(|de| de.name().eq_ignore_ascii_case(comp)) {
-            Some(de) => {
-                canon.push('/');
-                canon.push_str(de.name());
-                cur = Some((*de, canon.clone()));
-            }
-            None => {
-                return Err(alloc::format!("{}/{}: not found (-ENOENT)", canon, comp));
-            }
-        }
-    }
-    Ok(match cur {
-        None => Resolved::Root,
-        Some((de, canon)) => Resolved::Entry(de, canon),
-    })
-}
 
 // ---------------------------------------------------------------------------------------------
 // JD5/JD6 — the WRITE path: create / edit / delete files from the panel shell (JD6 extends it to
@@ -136,9 +103,11 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // (A future arc that runs user tasks and returns to the shell must re-establish ASID 0 before shell
 // FAT ops — today the shell is cooperative kernel and never installs a user-slot TTBR0.)
 //
-// SCOPE (JD6): the WHOLE tree the shell can `cd` into. `resolve_write_target` normalizes the path
-// against the cwd and walks to the PARENT directory via the read-only `resolve_path`, then the
-// writes ride the dir-aware `create_in_dir`/`locate_in_dir` twins (`first_cluster == 0` ⇒ root).
+// SCOPE (JD6): the WHOLE tree the shell can `cd` into. VFSROUTE (orin 17) replaced this paragraph's
+// machinery without changing its scope: the path is normalized against the cwd by `vfs_path` and the
+// PARENT walk now happens inside whichever backend the mount table resolved to — `FatBackend`'s
+// `resolve_parent` for a FAT volume (which rides the same dir-aware `create_in_dir`/`locate_in_dir`
+// twins, `first_cluster == 0` ⇒ root), `NativeBackend`'s `native_parent` for the native one.
 // A parent that is a plain file is `-ENOTDIR`; a missing parent `-ENOENT`; a FULL directory
 // `-ENOSPC` (extending a subdir's cluster chain is out of scope — the twins add a slot but never grow
 // the directory chain). JD7 layers `mkdir`/`rmdir` on top via the `fat::create_dir`/`remove_dir`
@@ -165,76 +134,20 @@ fn resolve_path(fs: &FatFs, path: &str) -> Result<Resolved, String> {
 // published last); a failed `rm`/truncate leaves lost clusters (benign, chkdsk-reclaimable), never
 // an aliasing or torn volume.
 
-/// JD5: errno tag for a `FatError`, for the write-command console messages.
-fn fat_errno(e: FatError) -> &'static str {
-    match e {
-        FatError::NotFound => "-ENOENT",
-        FatError::IsDirectory => "-EISDIR",
-        FatError::NoSpace => "-ENOSPC",
-        FatError::Unsupported => "-EINVAL", // not a representable 8.3 name
-        FatError::NoDisk | FatError::NotFat => "-ENODEV",
-        FatError::Io | FatError::BadChain => "-EIO",
-        // WEDGE-8 (F3): the storage driver's controller loan was busy past the bounded retry —
-        // the operation never started; running the command again is the honest remedy.
-        FatError::Busy => "-EAGAIN",
-        // Merge seam: the x86 trunk's fat.rs added OutOfVolume (a range check past the volume
-        // end); it is an addressing error, not a device fault, but -EIO is the closest errno
-        // this tagger's callers understand. Grafted at assembly.
-        FatError::OutOfVolume => "-EIO",
-    }
-}
 
-/// JD6: resolve a shell path argument to its write target `(parent_first_cluster, leaf_name,
-/// parent_canon)`. `.`/`..` normalize lexically against the cwd, then the read-only `resolve_path`
-/// walks to the PARENT directory (the root ⇒ `first_cluster` 0 and `parent_canon` ""). The final
-/// component is the leaf to create/locate — it need NOT exist yet. The root itself is not a writable
-/// target (`-EISDIR`); a parent that is a plain file is `-ENOTDIR`; a missing parent is `-ENOENT`
-/// (both surface from `resolve_path`). The dir-aware fat.rs twins (`create_in_dir`/`locate_in_dir`)
-/// take `parent_first_cluster` directly, so this reaches the whole tree the shell can `cd` into.
-fn resolve_write_target(fs: &FatFs, arg: &str) -> Result<(u32, String, String), String> {
-    let path = normalize_path(&cwd_path(), arg);
-    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    let (leaf, parent_comps) = match comps.split_last() {
-        Some((last, rest)) => (String::from(*last), rest),
-        None => return Err(String::from("/: is a directory (-EISDIR)")), // path == "/"
-    };
-    if parent_comps.is_empty() {
-        return Ok((0, leaf, String::new())); // parent is the volume root
-    }
-    let mut parent_path = String::new();
-    for c in parent_comps {
-        parent_path.push('/');
-        parent_path.push_str(c);
-    }
-    match resolve_path(fs, &parent_path)? {
-        Resolved::Root => Ok((0, leaf, String::new())), // unreachable for a non-empty parent, but honest
-        Resolved::Entry(de, canon) => {
-            if de.is_dir {
-                Ok((de.first_cluster(), leaf, canon))
-            } else {
-                Err(alloc::format!("{}: not a directory (-ENOTDIR)", canon))
-            }
-        }
-    }
-}
 
-/// JD6: an absolute display path for a write target's leaf under `parent_canon` ("" ⇒ the root),
-/// e.g. `("", "NOTE.TXT") → "/NOTE.TXT"`, `("/DOCS", "NOTE.TXT") → "/DOCS/NOTE.TXT"`.
-fn joined(parent_canon: &str, leaf: &str) -> String {
-    alloc::format!("{}/{}", parent_canon, leaf)
-}
 
 /// PI-UI-3: print a verb's output line to the panel AND mirror it to the serial console as a
 /// `:: ui3:<verb>: <line> ::` witness. On the Pi bench the verb output renders panel-only, so a
 /// headless capture cannot see it; the witness gives the same content on the wire so `date`/`time`/
-/// `netinfo` are verifiable from serial alone. Same content on both sinks, byte-for-byte.
+/// `ifconfig` are verifiable from serial alone. Same content on both sinks, byte-for-byte.
 fn ui3_say(console: &mut Console, verb: &str, line: &str) {
     console.println(line);
     serial_println!(":: ui3:{}: {} ::", verb, line);
 }
 
 /// PI-FS-5: panel-line + `:: fs5: <line> ::` serial mirror (the `ui3_say` idiom, dedicated tag) — the
-/// `diskinfo` verb renders panel-only on the bench, so the witness gives a headless capture the same content.
+/// `fdisk -l` verb renders panel-only on the bench, so the witness gives a headless capture the same content.
 #[cfg(target_arch = "aarch64")]
 fn fs5_say(console: &mut Console, line: &str) {
     console.println(line);
@@ -295,14 +208,22 @@ mod bind {
     pub const NONE: u8 = 0;
     /// Asked; nothing mounted (the decline path).
     pub const DECLINED: u8 = 1;
+    // VFSROUTE: the three HANDLE codes are stamped only where a program source is bound — the x86
+    // arm of `vfs_mount_table` and the x86 exec probe. aarch64 mounts NAMED volumes (`/`, `/boot`,
+    // `/usb`) and never asks the block layer "which handle holds the programs", so it stamps only
+    // the write gate's ADMITTED/REFUSED_RO/DECLINED.
+    #[cfg(target_arch = "x86_64")]
     pub const GLOBAL: u8 = 2;
+    #[cfg(target_arch = "x86_64")]
     pub const USB: u8 = 3;
+    #[cfg(target_arch = "x86_64")]
     pub const SDHC: u8 = 4;
     /// The write gate ADMITTED the volume.
     pub const ADMITTED: u8 = 5;
     /// The write gate REFUSED it as read-only.
     pub const REFUSED_RO: u8 = 6;
 
+    #[cfg(target_arch = "x86_64")]
     pub fn of(fs: &crate::fs::fat::FatFs) -> u8 {
         match fs.source_name() {
             "global" => GLOBAL,
@@ -330,7 +251,11 @@ mod bind {
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering as BindOrd};
 
 /// The handle the READ verbs' binding site last bound, and how many times it has bound anything.
+/// VFSROUTE: that site is now `vfs_mount_table`'s x86 arm — the ONE place a verb path binds a
+/// program source — so the instrument is x86-only, like the exec probe it is compared against.
+#[cfg(target_arch = "x86_64")]
 static READ_BIND: AtomicU8 = AtomicU8::new(bind::NONE);
+#[cfg(target_arch = "x86_64")]
 static READ_BIND_SEQ: AtomicU32 = AtomicU32::new(0);
 /// The handle the EXEC PROBE (`FatVolume::is_file`) last bound. Independent producer, independent
 /// call path — this is the pair `fatverb_storage_witness` compares. x86 only: aarch64 never sets
@@ -348,22 +273,12 @@ fn stamp(cell: &AtomicU8, seq: &AtomicU32, code: u8) {
     seq.fetch_add(1, BindOrd::Relaxed);
 }
 
-/// FATVERB: the write gate's answer, decided but not yet rendered. Split out from
-/// [`mount_write_volume`] so the witness can drive a real write verb and read the gate's recorded
-/// answer without a console, and so the rendering lives in exactly one place.
-enum WriteVolume {
-    /// The program source mounted and admits ordinary file mutation.
-    Admitted(FatFs),
-    /// It mounted and REFUSES: the handle's name, the volume label, the reason.
-    ReadOnly(&'static str, String, &'static str),
-    /// Nothing mounted at all.
-    NoVolume(FatError),
-}
 
 /// FATVERB: mount the volume a READ verb should act on — the program source, so `ls` and a bare
 /// name are looking at the same card. Stamps [`READ_BIND`] either way, including on the decline:
 /// "the read verbs asked and got nothing" is a different fact from "the read verbs never asked",
 /// and Boot AR's symptom was the first one.
+#[cfg(target_arch = "x86_64")]
 fn open_read_volume() -> Result<FatFs, FatError> {
     match crate::fs::fat::mount_program_source() {
         Ok(fs) => {
@@ -377,29 +292,6 @@ fn open_read_volume() -> Result<FatFs, FatError> {
     }
 }
 
-/// FATVERB: the WRITE gate. Mount the program source, then ask the BLOCK LAYER — through the one
-/// predicate `crate::fs::fat::BlockSource::write_veto`, which the VFS's `FatBackend::read_only`
-/// also forwards to — whether that source can be mutated at all. Runs before any directory entry,
-/// cluster chain or FAT sector has been touched.
-fn open_write_volume() -> WriteVolume {
-    let fs = match open_read_volume() {
-        Ok(fs) => fs,
-        Err(e) => {
-            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::DECLINED);
-            return WriteVolume::NoVolume(e);
-        }
-    };
-    match fs.write_veto() {
-        None => {
-            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::ADMITTED);
-            WriteVolume::Admitted(fs)
-        }
-        Some(why) => {
-            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::REFUSED_RO);
-            WriteVolume::ReadOnly(fs.source_name(), fs.label(), why)
-        }
-    }
-}
 
 // FATVERB: TWO SINKS, TWO LENGTHS — and that is deliberate, not laziness.
 //
@@ -410,51 +302,7 @@ fn open_write_volume() -> WriteVolume {
 // capture gets the forensics, and they carry the same verdict word (`REFUSED READ-ONLY`) so one is
 // greppable from the other.
 
-/// FATVERB: the read verbs' decline, on both sinks. Boot AR's symptom WAS a read decline — `ls`
-/// twice, nothing back — so the headless capture must carry it. Without the mirror a bench log
-/// cannot tell "the verb declined, and here is what it was offered" from "the keystroke never
-/// arrived", which is exactly the ambiguity that cost the first diagnosis.
-fn mount_read_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
-    match open_read_volume() {
-        Ok(fs) => Some(fs),
-        Err(e) => {
-            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
-            serial_println!(
-                ":: [fatverb] {} -> NO VOLUME ({:?}; handles={}) ::",
-                verb, e, crate::drivers::block::source_census()
-            );
-            None
-        }
-    }
-}
 
-/// FATVERB: the write verbs' gate, on both sinks. `None` means the caller has already been
-/// explained to and must return WITHOUT mutating anything.
-fn mount_write_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
-    match open_write_volume() {
-        WriteVolume::Admitted(fs) => Some(fs),
-        WriteVolume::ReadOnly(source, label, why) => {
-            console.println(&alloc::format!("{}: REFUSED READ-ONLY ({})", verb, source));
-            serial_println!(
-                ":: [fatverb] {} -> REFUSED READ-ONLY (source={} label={} reason={}; handles={}) ::",
-                verb,
-                source,
-                if label.is_empty() { "-" } else { &label },
-                why,
-                crate::drivers::block::source_census()
-            );
-            None
-        }
-        WriteVolume::NoVolume(e) => {
-            console.println(&alloc::format!("{}: no FAT filesystem ({:?})", verb, e));
-            serial_println!(
-                ":: [fatverb] {} -> NO VOLUME ({:?}; handles={}) ::",
-                verb, e, crate::drivers::block::source_census()
-            );
-            None
-        }
-    }
-}
 
 // ===================== FATVERB — THE SOURCE LAW, ENFORCED BY THE COMPILER ==========================
 //
@@ -478,6 +326,12 @@ fn mount_write_volume(console: &mut Console, verb: &str) -> Option<FatFs> {
 //
 // Prose elsewhere in this file deliberately names the function without parentheses for the same
 // reason.
+// RELICS (orin 17): the scan is O(len) over this file, and this file grew past the default
+// `long_running_const_eval` step budget with this arc. The lint is a guard against a const that may
+// never terminate; this one provably does (a single forward walk bounded by the file length), and
+// the lint's own help says an allow is the right answer for a const that is merely long. The ASSERT
+// is untouched — the law still fails the build, which is the protection.
+#[allow(long_running_const_eval)]
 const _: () = {
     const SRC: &[u8] = include_bytes!("shell.rs");
     const NEEDLE: [u8; 9] = [b':', b':', b'm', b'o', b'u', b'n', b't', b'(', b')'];
@@ -499,374 +353,1397 @@ const _: () = {
     }
     assert!(
         hits == 0,
-        "FATVERB source law: shell.rs must not bind the default FAT handle. A file verb reads and \
-         writes the PROGRAM SOURCE, through mount_read_volume / mount_write_volume — see the FATVERB \
-         section. If you are only naming the function in prose, spell it without parentheses."
+        "FATVERB source law: shell.rs must not bind the default FAT handle. VFSROUTE (orin 17) \
+         tightened this: a file verb does not bind a FAT handle AT ALL any more — it resolves its \
+         path through vfs_mount_table() and calls the VfsBackend trait, and the ONE call that still \
+         names a source is that builder's open_read_volume (the PROGRAM SOURCE, x86) plus the exec \
+         probe. If you are only naming the function in prose, spell it without parentheses."
     );
 };
 
-/// JD6 `touch`: ensure a 0-length file exists at `path` in ANY directory the shell can reach
-/// (create if absent; idempotent no-op if present). Rides the dir-aware `locate_in_dir` /
-/// `create_in_dir` twins — the parent may be the root or any subdirectory.
-fn fs_touch(console: &mut Console, arg: &str) {
-    let Some(fs) = mount_write_volume(console, "touch") else { return };
-    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("touch: {}", msg)),
-    };
-    match fs.locate_in_dir(parent, &name) {
-        Ok((de, _, _)) => console.println(&joined(&canon, de.name())), // already exists (canonical name)
-        Err(FatError::NotFound) => match fs.create_in_dir(parent, &name, 0x20) {
-            Ok((de, _, _)) => console.println(&joined(&canon, de.name())),
-            Err(e) => console.println(&alloc::format!(
-                "touch: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-        },
-        Err(e) => console.println(&alloc::format!(
-            "touch: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    }
-}
+// ===================== VFSROUTE (orin 17) — EVERY FILE VERB ASKS THE MOUNT TABLE ==================
+//
+// Peter, 2026-09-06: *"should UnaFS not support ls? I'm confused that ls has to be made to list a
+// dir. Should a mounted file system not be listable? Sounds like we'll be adding each filesystem to
+// ls so it lists."*
+//
+// He is describing the defect exactly. Before this arc a file verb CHOSE a filesystem: `ls` picked
+// unafs on aarch64 and FAT on x86, `cat` had two bodies, and every mutating verb ran a `/boot`/`/usb`
+// prefix test (RELICS's `native_target`) to decide whether to call `unafs_verb_*` or walk `fat.rs`.
+// That is "adding each filesystem to ls", and the next volume would have added a third arm to every
+// one of them.
+//
+// THE RULE THIS SECTION IMPLEMENTS. A verb resolves its argument to an absolute path in the ONE
+// namespace, hands that path to the mount table, and calls the trait. Which filesystem answers is
+// [`crate::fs::vfs::MountTable::resolve`]'s longest-prefix decision and nothing else. No verb names
+// a filesystem, no verb has a `target_arch` gate, and a backend that cannot perform an operation
+// returns a TYPED error the verb prints — never a silent fall-through to some other volume. `rmdir`
+// on the native volume is the worked example: the UnaFS crate has no directory removal, so
+// `NativeBackend` inherits the trait's default and the operator sees
+// `rmdir: /D: operation not supported on this volume (-ENOTSUP)` instead of a directory quietly
+// disappearing off the FAT boot partition, which is what the pre-VFSROUTE verb did.
+//
+// WHAT MOVED, AND WHAT THAT COST. The FAT-direct bodies these functions used to carry are gone from
+// this file, not deleted from the tree: `fat.rs`'s public API is untouched and the VFS's
+// `FatBackend` calls exactly the same primitives (`locate_in_dir`, `create_in_dir`, `write_grow`,
+// `delete_located`, `remove_dir`, `rename_entry`, `move_entry`) — the walk simply happens behind the
+// trait now. Three FAT-SPECIFIC facts stopped being printable, because a trait that could print them
+// would be a FAT trait: `rm`'s freed-cluster count, `stat`'s attr byte / first cluster / directory
+// slot LBA, and `ls`'s canonical 8.3 re-spelling of the typed name. The forensic pair is still
+// reachable — `hexdump` for bytes, `dd if=<lba>` for sectors — and the two verbs that answered
+// "which device is this" (`fdisk -l`, `mount`) are unchanged.
+//
+// THE ONE THING A VERB STILL ASKS THE VOLUME: whether it accepts mutation at all. That question is
+// `VfsBackend::write_veto`, which forwards to `fat::BlockSource::write_veto` — the single definition
+// FATVERB established. It is asked BEFORE a multi-step verb starts, so a read-only volume yields a
+// whole refusal instead of a half-finished mutation and an opaque I/O error several sectors in.
 
-/// JD6 `write`: create-or-TRUNCATE a file at `path` in ANY reachable directory and store `data`
-/// (the exact given bytes). Truncate of an existing file = free its chain + a fresh 0-length entry,
-/// then grow-write — the only create-or-truncate reachable through fat.rs's PUBLIC API (there is no
-/// in-place shrink primitive, and the directory-field publisher is private). A directory target is
-/// refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
-fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    let Some(fs) = mount_write_volume(console, "write") else { return };
-    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("write: {}", msg)),
-    };
-    // Locate in the parent dir. Present-as-file -> TRUNCATE (delete then recreate); directory ->
-    // refuse; absent -> create fresh. The result is the fresh entry's on-disk (dir_lba, dir_off).
-    let (dir_lba, dir_off) = match fs.locate_in_dir(parent, &name) {
-        Ok((de, dl, doff)) => {
-            if de.is_dir {
-                return console.println(&alloc::format!(
-                    "write: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
-            }
-            if let Err(e) = fs.delete_located(dl, doff, de.first_cluster()) {
-                return console.println(&alloc::format!(
-                    "write: {}: truncate failed {} ({:?})", joined(&canon, &name), fat_errno(e), e));
-            }
-            match fs.create_in_dir(parent, &name, 0x20) {
-                Ok((_, dl2, doff2)) => (dl2, doff2),
-                Err(e) => return console.println(&alloc::format!(
-                    "write: {}: recreate failed {} ({:?}) — old file removed", joined(&canon, &name), fat_errno(e), e)),
-            }
-        }
-        Err(FatError::NotFound) => match fs.create_in_dir(parent, &name, 0x20) {
-            Ok((_, dl, doff)) => (dl, doff),
-            Err(e) => return console.println(&alloc::format!(
-                "write: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-        },
-        Err(e) => return console.println(&alloc::format!(
-            "write: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    };
-    if data.is_empty() {
-        return console.println(&alloc::format!("wrote 0 bytes to {}", joined(&canon, &name)));
-    }
-    // The entry is a fresh 0-length file (first_cluster = 0, size = 0): grow from offset 0.
-    match fs.write_grow(0, 0, dir_lba, dir_off, 0, data) {
-        Ok((written, new_size, _)) => console.println(&alloc::format!(
-            "wrote {} bytes to {} ({} bytes)", written, joined(&canon, &name), new_size)),
-        Err(e) => console.println(&alloc::format!(
-            "write: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    }
-}
+/// The principal every shell verb acts as. The shell runs at kernel authority — it is the console
+/// of the machine, not a tenant — so it passes [`crate::fs::vfs::KERNEL_PRINCIPAL`] to every ACL
+/// check. Named once here rather than spelled at forty call sites.
+const SHELL_PRINCIPAL: &str = crate::fs::vfs::KERNEL_PRINCIPAL;
 
-/// JD6 `append`: append `data` at the end of a file at `path` in ANY reachable directory, creating
-/// it if absent (like `>>`). The append grows the file from its current EOF via `write_grow`
-/// (allocate + zero-fill + chain new clusters, directory `size` published LAST). A directory target
-/// is refused (`-EISDIR`). Rides the dir-aware create_in_dir/locate_in_dir twins.
-fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
-    let Some(fs) = mount_write_volume(console, "append") else { return };
-    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("append: {}", msg)),
-    };
-    let (first_cluster, size, dir_lba, dir_off) = match fs.locate_in_dir(parent, &name) {
-        Ok((de, dl, doff)) => {
-            if de.is_dir {
-                return console.println(&alloc::format!(
-                    "append: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
-            }
-            (de.first_cluster(), de.size, dl, doff)
-        }
-        Err(FatError::NotFound) => match fs.create_in_dir(parent, &name, 0x20) {
-            Ok((de, dl, doff)) => (de.first_cluster(), de.size, dl, doff), // fresh: 0, 0
-            Err(e) => return console.println(&alloc::format!(
-                "append: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-        },
-        Err(e) => return console.println(&alloc::format!(
-            "append: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    };
-    if data.is_empty() {
-        return console.println(&alloc::format!(
-            "appended 0 bytes to {} ({} bytes)", joined(&canon, &name), size));
-    }
-    // Seek to EOF (`start = size`) and grow: write_grow appends the new bytes past the current end.
-    match fs.write_grow(first_cluster, size, dir_lba, dir_off, size, data) {
-        Ok((written, new_size, _)) => console.println(&alloc::format!(
-            "appended {} bytes to {} ({} bytes)", written, joined(&canon, &name), new_size)),
-        Err(e) => console.println(&alloc::format!(
-            "append: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    }
-}
-
-/// JD6 `rm`: delete a file at `path` in ANY reachable directory — `delete_located` marks the
-/// directory slot `0xE5` FIRST, then frees the cluster chain (all FAT copies), the crash-safe order
-/// fat.rs guarantees. A directory target is refused (`-EISDIR` — use `rmdir` for directories, JD7);
-/// an absent name is `-ENOENT`, EXCEPT under `force` (the JD14 `-f` flag), which suppresses the
-/// missing-target error quietly (POSIX `rm -f`); a wrong-usage `-EISDIR` is still shown under `-f`.
-/// Rides the dir-aware locate_in_dir twin.
-fn fs_rm(console: &mut Console, arg: &str, force: bool) {
-    let Some(fs) = mount_write_volume(console, "rm") else { return };
-    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        // JD14: `-f` is lenient about a missing target (POSIX `rm -f NOSUCH` is quiet). A missing
-        // parent component means the target does not exist, so force suppresses the message.
-        Err(msg) => { if !force { console.println(&alloc::format!("rm: {}", msg)); } return; }
-    };
-    match fs.locate_in_dir(parent, &name) {
-        Ok((de, dl, doff)) => {
-            if de.is_dir {
-                // A wrong-usage error (a directory without `-r`), NOT a "missing target" — shown even
-                // under `-f`, exactly as POSIX `rm -f DIR` still complains.
-                return console.println(&alloc::format!(
-                    "rm: {}: is a directory (-EISDIR)", joined(&canon, de.name())));
-            }
-            match fs.delete_located(dl, doff, de.first_cluster()) {
-                Ok(freed) => console.println(&alloc::format!(
-                    "removed {} ({} cluster(s) freed)", joined(&canon, de.name()), freed.len())),
-                Err(e) => console.println(&alloc::format!(
-                    "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-            }
-        }
-        // JD14: a missing leaf is quiet under `-f`.
-        Err(FatError::NotFound) => { if !force { console.println(&alloc::format!(
-            "rm: {}: not found (-ENOENT)", joined(&canon, &name))); } }
-        Err(e) => console.println(&alloc::format!(
-            "rm: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    }
-}
-
-/// JD7 `mkdir`: create a new directory `path` in ANY reachable parent. Walks to the parent via
-/// `resolve_write_target` (JD6), locates the leaf FIRST (`fat::create_dir` does NOT de-duplicate —
-/// the inherited `create_in_dir` contract), then calls the `fat::create_dir` FATDIRS seam, which
-/// allocates + `.`/`..`-initializes a fresh directory cluster and links a DIR-attr entry in the
-/// parent. Honest errors: name already taken (file OR dir) → `-EEXIST`; parent missing → `-ENOENT`;
-/// parent is a plain file → `-ENOTDIR` (both from `resolve_write_target`); volume or parent-dir full
-/// → `-ENOSPC`; a non-8.3 name → `-EINVAL`. The root itself as a target → `-EISDIR` (it always exists).
-fn fs_mkdir(console: &mut Console, arg: &str) {
-    let Some(fs) = mount_write_volume(console, "mkdir") else { return };
-    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("mkdir: {}", msg)),
-    };
-    // create_dir does NOT de-duplicate — locate first so an existing name (file OR directory) is an
-    // honest -EEXIST, never a duplicate directory slot in the parent.
-    match fs.locate_in_dir(parent, &name) {
-        Ok((de, _, _)) => console.println(&alloc::format!(
-            "mkdir: {}: file exists (-EEXIST)", joined(&canon, de.name()))),
-        Err(FatError::NotFound) => match fs.create_dir(parent, &name) {
-            Ok((de, _, _)) => console.println(&alloc::format!(
-                "created directory {}", joined(&canon, de.name()))),
-            Err(e) => console.println(&alloc::format!(
-                "mkdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-        },
-        Err(e) => console.println(&alloc::format!(
-            "mkdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-    }
-}
-
-/// JD7 `rmdir`: remove an EMPTY directory `path` from ANY reachable parent. Walks to the parent via
-/// `resolve_write_target` (JD6), then calls the `fat::remove_dir` FATDIRS seam, which verifies the
-/// target holds only `.`/`..` and frees its single cluster. Errno fidelity is shell-side (the seam
-/// reuses existing `FatError` variants — see FATDIRS): the root is refused LOCALLY (`-EBUSY` — it is
-/// never nameable and cluster 0 is not freeable); a FILE target is `-ENOTDIR` (resolved from the
-/// parent walk BEFORE the call, so the seam's `Unsupported`-for-non-dir never surfaces here); an
-/// absent name is `-ENOENT`; a NON-EMPTY directory maps the seam's `IsDirectory` → `-ENOTEMPTY`.
-/// (`rm` stays file-only — a directory there is still `-EISDIR`; use `rmdir`.)
+/// VFSROUTE: build the live namespace and resolve ONE typed argument in it, for a READ verb.
 ///
-/// Note: removing the current working directory (e.g. `rmdir .` in an empty cwd, which normalizes to
-/// the cwd path) succeeds and leaves the JD4 cwd stale — the very next cwd-relative command re-resolves
-/// it and gets an honest `-ENOENT`, exactly the JD4 stale-cwd worst case (the cwd is a re-resolved path
-/// string, not a cached chain head). No corruption — `delete_located` is crash-safe.
+/// Returns the table (the caller keeps it, so a recursive walk builds it once) and the absolute
+/// path. `Err` is the operator line, already tagged with the reason: an unbound reserved volume
+/// (VFS-4's `-ENODEV`, the P44 misdirection) or a namespace with nothing mounted at all.
+fn vfs_read_target(verb: &str, arg: &str) -> Result<(crate::fs::vfs::MountTable, String), String> {
+    let mt = vfs_mount_table();
+    let path = vfs_path(arg);
+    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), &path) {
+        return Err(alloc::format!("{}: {}: volume {} not mounted (-ENODEV)", verb, path, vol));
+    }
+    if mt.prefixes().is_empty() {
+        // FATVERB's decline line, kept verbatim in content: a bench capture must be able to tell
+        // "the verb asked and there was no volume" from "the keystroke never arrived".
+        serial_println!(
+            ":: [fatverb] {} -> NO VOLUME (namespace empty; handles={}) ::",
+            verb, crate::drivers::block::source_census()
+        );
+        return Err(alloc::format!("{}: no filesystem mounted (-ENODEV)", verb));
+    }
+    Ok((mt, path))
+}
+
+/// VFSROUTE: the READ-verb front door — resolve, or print the refusal and give up.
+fn vfs_read_open(console: &mut Console, verb: &str, arg: &str)
+    -> Option<(crate::fs::vfs::MountTable, String)>
+{
+    match vfs_read_target(verb, arg) {
+        Ok(t) => Some(t),
+        Err(msg) => {
+            console.println(&msg);
+            None
+        }
+    }
+}
+
+/// VFSROUTE: the WRITE-verb front door — resolve, then ASK THE VOLUME whether it accepts mutation
+/// before anything is touched.
+///
+/// This is FATVERB's write gate, moved to the layer that owns the question. It still stamps
+/// [`WRITE_GATE`] and still writes the two-sink refusal (`REFUSED READ-ONLY` on the panel, the
+/// census on serial), because `fatverb_storage_witness` reads that instrument and a bench capture
+/// reads that line — but the predicate is now `VfsBackend::write_veto` on the volume the PATH
+/// resolves to, not `mount_program_source().write_veto()` on whatever the program source happens to
+/// be. On a machine with two writable volumes in one namespace that is the difference between
+/// gating the volume you are about to write and gating a different one.
+fn vfs_write_open(console: &mut Console, verb: &str, arg: &str)
+    -> Option<(crate::fs::vfs::MountTable, String)>
+{
+    let (mt, path) = match vfs_read_target(verb, arg) {
+        Ok(t) => t,
+        Err(msg) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::DECLINED);
+            console.println(&msg);
+            return None;
+        }
+    };
+    match mt.write_veto(&path) {
+        Ok(None) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::ADMITTED);
+            Some((mt, path))
+        }
+        Ok(Some(why)) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::REFUSED_RO);
+            let vol = mt.volume_name(&path).unwrap_or_else(|_| String::from("?"));
+            console.println(&alloc::format!("{}: REFUSED READ-ONLY ({})", verb, vol));
+            serial_println!(
+                ":: [fatverb] {} -> REFUSED READ-ONLY (volume={} path={} reason={}; handles={}) ::",
+                verb, vol, path, why, crate::drivers::block::source_census()
+            );
+            None
+        }
+        Err(e) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::DECLINED);
+            console.println(&alloc::format!("{}: {}: {}", verb, path, vfs_err(e)));
+            None
+        }
+    }
+}
+
+/// VFSROUTE: the one refusal renderer — `verb: path: reason`, the shell's errno house style.
+fn vfs_fail(console: &mut Console, verb: &str, path: &str, e: crate::fs::vfs::VfsError) {
+    vfs_say(console, &alloc::format!("{}: {}: {}", verb, path, vfs_err(e)));
+}
+
+/// VFSROUTE: the leaf of an absolute namespace path (`/A/B.TXT` -> `B.TXT`; the root -> `""`).
+fn vfs_leaf(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or("")
+}
+
+/// VFSROUTE: the parent of an absolute namespace path (`/A/B.TXT` -> `/A`; a root child -> `/`).
+fn vfs_parent(path: &str) -> String {
+    match path.rfind('/') {
+        None | Some(0) => String::from("/"),
+        Some(i) => String::from(&path[..i]),
+    }
+}
+
+/// VFSROUTE: join a directory path and a leaf into an absolute namespace path.
+fn vfs_join(dir: &str, leaf: &str) -> String {
+    if dir == "/" {
+        alloc::format!("/{}", leaf)
+    } else {
+        alloc::format!("{}/{}", dir, leaf)
+    }
+}
+
+/// VFSROUTE: is `path` a directory in the namespace? (`false` for anything that does not resolve —
+/// the callers that ask this are deciding a destination shape, not reporting an error.)
+fn vfs_is_dir(mt: &crate::fs::vfs::MountTable, path: &str) -> bool {
+    matches!(mt.stat(path), Ok(st) if matches!(st.kind, crate::fs::vfs::NodeKind::Dir))
+}
+
+/// JD6 `touch`: ensure a 0-length file exists at `path` (create if absent; idempotent no-op if
+/// present) — on WHICHEVER volume the namespace says `path` lives on. `touch <path>`.
+fn fs_touch(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, path)) = vfs_write_open(console, "touch", arg) else { return };
+    match mt.stat(&path) {
+        Ok(_) => vfs_say(console, &path), // already exists — idempotent, print the path
+        Err(VfsError::NoSuchPath) => match mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
+            Ok(_) => vfs_say(console, &path),
+            Err(e) => vfs_fail(console, "touch", &path, e),
+        },
+        Err(e) => vfs_fail(console, "touch", &path, e),
+    }
+}
+
+/// JD6 `write`: create-or-REPLACE the file at `path` with exactly `data`. A directory target is
+/// refused (`-EISDIR`).
+///
+/// Replace is unlink-then-create, not truncate-to-0: the native backend has no in-place shrink
+/// primitive (a native `truncate` to 0 on a non-empty file is `Unsupported` BY DESIGN, because
+/// shrink-by-recreate would drop the per-object ACL), so unlink+create is the one shape that works
+/// on both volumes. Said here rather than discovered later.
+fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
+    use crate::fs::vfs::NodeKind;
+    let Some((mt, path)) = vfs_write_open(console, "write", arg) else { return };
+    if vfs_is_dir(&mt, &path) {
+        return console.println(&alloc::format!("write: {}: is a directory (-EISDIR)", path));
+    }
+    let _ = mt.unlink(&path, SHELL_PRINCIPAL); // drop the old contents if the name was taken
+    if let Err(e) = mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
+        return vfs_fail(console, "write", &path, e);
+    }
+    if data.is_empty() {
+        return vfs_say(console, &alloc::format!("wrote 0 bytes to {}", path));
+    }
+    match mt.write(&path, 0, data, SHELL_PRINCIPAL) {
+        Ok(n) => vfs_say(console, &alloc::format!("wrote {} bytes to {} ({} bytes)", n, path, n)),
+        Err(e) => vfs_fail(console, "write", &path, e),
+    }
+}
+
+/// JD5 `append`: append `data` at EOF, creating the file if absent (like `>>`). A directory target
+/// is refused (`-EISDIR`).
+fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, path)) = vfs_write_open(console, "append", arg) else { return };
+    let offset = match mt.stat(&path) {
+        Ok(st) if matches!(st.kind, NodeKind::Dir) =>
+            return console.println(&alloc::format!("append: {}: is a directory (-EISDIR)", path)),
+        Ok(st) => st.size,
+        Err(VfsError::NoSuchPath) => {
+            if let Err(e) = mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
+                return vfs_fail(console, "append", &path, e);
+            }
+            0
+        }
+        Err(e) => return vfs_fail(console, "append", &path, e),
+    };
+    if data.is_empty() {
+        return vfs_say(console, &alloc::format!(
+            "appended 0 bytes to {} ({} bytes)", path, offset));
+    }
+    match mt.write(&path, offset, data, SHELL_PRINCIPAL) {
+        Ok(n) => vfs_say(console, &alloc::format!(
+            "appended {} bytes to {} ({} bytes)", n, path, offset + n as u64)),
+        Err(e) => vfs_fail(console, "append", &path, e),
+    }
+}
+
+/// JD6 `rm`: delete a FILE. A directory is `-EISDIR` (use `rmdir`, or `rm -r`); an absent name is
+/// `-ENOENT` EXCEPT under `force` (JD14 `-f`), which is quiet the way POSIX `rm -f` is. A
+/// wrong-usage `-EISDIR` is still shown under `-f`, exactly as POSIX `rm -f DIR` still complains.
+fn fs_rm(console: &mut Console, arg: &str, force: bool) {
+    use crate::fs::vfs::VfsError;
+    let Some((mt, path)) = vfs_write_open(console, "rm", arg) else { return };
+    match mt.unlink(&path, SHELL_PRINCIPAL) {
+        Ok(()) => vfs_say(console, &alloc::format!("removed {}", path)),
+        Err(VfsError::NoSuchPath) => {
+            if !force {
+                console.println(&alloc::format!("rm: {}: not found (-ENOENT)", path));
+            }
+        }
+        Err(e) => vfs_fail(console, "rm", &path, e),
+    }
+}
+
+/// JD7 `mkdir`: create a directory. An existing name (file OR directory) is `-EEXIST`; a missing
+/// parent `-ENOENT`; a parent that is a file `-ENOTDIR`.
+fn fs_mkdir(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, path)) = vfs_write_open(console, "mkdir", arg) else { return };
+    match mt.create(&path, NodeKind::Dir, SHELL_PRINCIPAL) {
+        Ok(_) => vfs_say(console, &alloc::format!("created directory {}", path)),
+        Err(VfsError::Backend("exists")) =>
+            console.println(&alloc::format!("mkdir: {}: file exists (-EEXIST)", path)),
+        Err(e) => vfs_fail(console, "mkdir", &path, e),
+    }
+}
+
+/// JD7 `rmdir`: remove an EMPTY directory. The root is refused locally (`-EBUSY` — it is unnameable
+/// on every volume); a file target is `-ENOTDIR`; a non-empty directory is `-ENOTEMPTY`.
+///
+/// **This is the verb that shows the rule working.** The native UnaFS backend implements no
+/// `remove_dir` (the crate has none), so `rmdir /SOMEDIR` on the native volume prints
+/// `-ENOTSUP` — the volume's own honest answer. Before VFSROUTE the verb was FAT-direct on both
+/// arches, so the same keystroke walked the FAT boot partition looking for a name that lives on a
+/// different volume: at best `-ENOENT`, at worst a directory removed off the wrong card.
 fn fs_rmdir(console: &mut Console, arg: &str) {
-    let Some(fs) = mount_write_volume(console, "rmdir") else { return };
-    // Refuse the root explicitly, with the honest errno. `resolve_write_target` would report the "/"
-    // path as `-EISDIR`, but the volume root is never a removable directory (it is unnameable and
-    // cluster 0 is not freeable). This also covers `rmdir .` at the root and `rmdir ..` that pops to it.
-    if normalize_path(&cwd_path(), arg) == "/" {
+    use crate::fs::vfs::VfsError;
+    let Some((mt, path)) = vfs_write_open(console, "rmdir", arg) else { return };
+    if path == "/" {
         return console.println("rmdir: /: cannot remove the root directory (-EBUSY)");
     }
-    let (parent, name, canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("rmdir: {}", msg)),
-    };
-    match fs.locate_in_dir(parent, &name) {
-        Ok((de, _, _)) => {
-            if !de.is_dir {
-                return console.println(&alloc::format!(
-                    "rmdir: {}: not a directory (-ENOTDIR)", joined(&canon, de.name())));
-            }
-            match fs.remove_dir(parent, &name) {
-                Ok(freed) => console.println(&alloc::format!(
-                    "removed directory {} ({} cluster(s) freed)", joined(&canon, de.name()), freed.len())),
-                // The seam maps a NON-EMPTY directory to `IsDirectory`; the shell owns the -ENOTEMPTY tag.
-                Err(FatError::IsDirectory) => console.println(&alloc::format!(
-                    "rmdir: {}: directory not empty (-ENOTEMPTY)", joined(&canon, de.name()))),
-                Err(e) => console.println(&alloc::format!(
-                    "rmdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
-            }
-        }
-        Err(FatError::NotFound) => console.println(&alloc::format!(
-            "rmdir: {}: not found (-ENOENT)", joined(&canon, &name))),
-        Err(e) => console.println(&alloc::format!(
-            "rmdir: {}: {} ({:?})", joined(&canon, &name), fat_errno(e), e)),
+    match mt.remove_dir(&path, SHELL_PRINCIPAL) {
+        Ok(()) => vfs_say(console, &alloc::format!("removed directory {}", path)),
+        Err(VfsError::Backend("not-empty")) =>
+            console.println(&alloc::format!("rmdir: {}: directory not empty (-ENOTEMPTY)", path)),
+        Err(e) => vfs_fail(console, "rmdir", &path, e),
     }
 }
 
-/// JD8 `cp <src> <dst>`: copy a FILE to a new location, composing the read path (`read_at`) with the
-/// JD6 create-or-truncate write path (`create_in_dir` + `write_grow`) — NO fat.rs mutation, exactly
-/// JD7's nature (it only CALLS existing public API). `src` must be a file (a directory source is
-/// `-EISDIR` — recursive `cp -r` is a JD9 candidate, out of scope this arc). If `dst` resolves to an
-/// existing DIRECTORY the copy lands as `dst/<src-leaf>` (the `cp FILE DIR/` idiom); otherwise `dst`
-/// names the destination file. JD14: no-clobber is the PANEL DEFAULT — an existing destination FILE is
-/// refused (`-EEXIST`) unless `force` (`-f`) is set, which opts into truncate-in-place overwrite; `-n`
-/// reasserts the default. (This aligns `cp` with `mv`'s pre-existing no-clobber default — a deliberate
-/// divergence from POSIX `cp`, which overwrites silently; the panel favours safety + cp/mv symmetry.)
-/// Honest errors:
-/// src missing → `-ENOENT`; src is a dir → `-EISDIR`; dst exists (no `-f`) → `-EEXIST`; dst parent
-/// missing → `-ENOENT`; dst parent is a file → `-ENOTDIR`; the volume/dir full → `-ENOSPC`; copying a
-/// file onto itself (same canonical path) → `-EINVAL`.
+/// VFSROUTE: copy one FILE's bytes from `src` to a freshly-created `dst`, streaming in fixed
+/// `CP_WINDOW` windows so a file of ANY size copies with a bounded heap footprint and no truncation.
+/// Returns the byte count, or a formatted error line.
 ///
-/// SIZE HANDLING (JD8-M2 decision): the copy STREAMS the bytes in fixed windows via the offset-aware
-/// `read_at` (existing public fat.rs API — the U9/read-path twin of `read_file`, so this reaches for
-/// no NEW primitive) feeding `write_grow`, so a file of ANY size copies with a bounded
-/// (`CP_WINDOW`-byte) heap footprint and NO truncation. There is deliberately no size ceiling. The
-/// per-window `write_grow` re-walks the growing destination chain (bounded, and every FAT/data access
-/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel
-/// core); a future single-pass primitive could tighten that, tracked as a JD9 note.
-fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let Some(fs) = mount_write_volume(console, "cp") else { return };
-    // --- Resolve the SOURCE to a concrete file (a directory source is out of scope). ---
-    let src_norm = normalize_path(&cwd_path(), src);
-    let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
-        Ok(Resolved::Root) => return console.println("cp: /: is a directory (-EISDIR)"),
-        Ok(Resolved::Entry(de, canon)) => {
-            if de.is_dir {
-                return console.println(&alloc::format!("cp: {}: is a directory (-EISDIR)", canon));
-            }
-            (de, canon)
+/// **A cross-volume copy now works**, and it works for free: the read side asks whichever backend
+/// owns `src` and the write side asks whichever owns `dst`, so `cp /K3HELLO.TXT /boot/HELLO.TXT`
+/// moves bytes between the native volume and the FAT card. The pre-VFSROUTE verb could not — it held
+/// ONE `FatFs` and both ends had to be on it.
+fn vfs_copy_bytes(
+    mt: &crate::fs::vfs::MountTable,
+    src: &str,
+    dst: &str,
+    size: u64,
+) -> Result<u64, String> {
+    const CP_WINDOW: usize = 32 * 1024;
+    let mut off: u64 = 0;
+    while off < size {
+        let want = core::cmp::min(CP_WINDOW as u64, size - off) as usize;
+        let buf = mt
+            .read(src, off, want)
+            .map_err(|e| alloc::format!("{}: {}", src, vfs_err(e)))?;
+        if buf.is_empty() {
+            break; // the source ended early (malformed) — copy what it holds, honestly
         }
-        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
-    };
-    // --- Decide the DESTINATION path (the `cp FILE DIR/` idiom): an existing directory receives the
-    //     copy under the source's canonical leaf name; anything else is the destination file itself. ---
-    let dst_norm = normalize_path(&cwd_path(), dst);
-    let dst_final = match resolve_path(&fs, &dst_norm) {
-        Ok(Resolved::Root) => normalize_path("/", de_src.name()), // into the volume root
-        Ok(Resolved::Entry(ref de, _)) if de.is_dir => normalize_path(&dst_norm, de_src.name()), // into a dir
-        _ => dst_norm.clone(), // an existing file (overwrite) or a new name — resolve_write_target validates the parent
-    };
-    let (dparent, dleaf, dcanon) = match resolve_write_target(&fs, &dst_final) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
-    };
-    let dest_disp = joined(&dcanon, &dleaf);
-    // --- Refuse copying a file onto itself. Canonical paths are unique per file, so a case-insensitive
-    //     full-path compare is complete (FAT 8.3 names are case-insensitive). ---
-    if src_canon.eq_ignore_ascii_case(&dest_disp) {
-        return console.println(&alloc::format!(
-            "cp: {} and {} are the same file (-EINVAL)", src_canon, dest_disp));
+        let wrote = mt
+            .write(dst, off, &buf, SHELL_PRINCIPAL)
+            .map_err(|e| alloc::format!("{}: {}", dst, vfs_err(e)))?;
+        off += wrote as u64;
+        if wrote < buf.len() {
+            break; // short write — report what landed rather than looping forever
+        }
     }
-    // --- Create-or-truncate the destination and stream the bytes (shared with the JD9 `cp -r` per-file
-    //     leg, so the streaming/errno logic lives in exactly one place). ---
-    match copy_file_into(&fs, &de_src, &src_canon, dparent, &dleaf, &dcanon, force) {
-        Ok(bytes) => console.println(&alloc::format!(
-            "copied {} -> {} ({} bytes)", src_canon, dest_disp, bytes)),
+    Ok(off)
+}
+
+/// JD8 `cp <src> <dst>`: copy a FILE. `cp FILE DIR/` lands as `DIR/<leaf>`. JD14: no-clobber is the
+/// DEFAULT — an existing destination FILE is `-EEXIST` unless `-f`; `-n` reasserts the default.
+/// A directory source is `-EISDIR` (use `cp -r`).
+fn fs_cp(console: &mut Console, src: &str, dst: &str, force: bool) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, spath)) = vfs_read_open(console, "cp", src) else { return };
+    let dpath_arg = match vfs_read_target("cp", dst) {
+        Ok((_, p)) => p,
+        Err(msg) => return console.println(&msg),
+    };
+    let st = match mt.stat(&spath) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "cp", &spath, e),
+    };
+    if matches!(st.kind, NodeKind::Dir) {
+        return console.println(&alloc::format!("cp: {}: is a directory (-EISDIR)", spath));
+    }
+    // The `cp FILE DIR/` idiom: an existing directory receives the copy under the source's leaf.
+    let dpath = if vfs_is_dir(&mt, &dpath_arg) {
+        vfs_join(&dpath_arg, vfs_leaf(&spath))
+    } else {
+        dpath_arg
+    };
+    if dpath.eq_ignore_ascii_case(&spath) {
+        return console.println(&alloc::format!(
+            "cp: {}: cannot copy a file onto itself (-EINVAL)", spath));
+    }
+    // The write gate is asked about the DESTINATION volume — the one that is about to be mutated.
+    if !vfs_gate_ok(console, &mt, "cp", &dpath) {
+        return;
+    }
+    match mt.stat(&dpath) {
+        Ok(d) if matches!(d.kind, NodeKind::Dir) =>
+            return console.println(&alloc::format!("cp: {}: is a directory (-EISDIR)", dpath)),
+        Ok(_) => {
+            if !force {
+                return console.println(&alloc::format!(
+                    "cp: {}: file exists (-EEXIST); use cp -f to overwrite", dpath));
+            }
+            if let Err(e) = mt.unlink(&dpath, SHELL_PRINCIPAL) {
+                return vfs_fail(console, "cp", &dpath, e);
+            }
+        }
+        Err(VfsError::NoSuchPath) => {}
+        Err(e) => return vfs_fail(console, "cp", &dpath, e),
+    }
+    if let Err(e) = mt.create(&dpath, NodeKind::File, SHELL_PRINCIPAL) {
+        return vfs_fail(console, "cp", &dpath, e);
+    }
+    match vfs_copy_bytes(&mt, &spath, &dpath, st.size) {
+        Ok(n) => vfs_say(console, &alloc::format!("copied {} -> {} ({} bytes)", spath, dpath, n)),
         Err(msg) => console.println(&alloc::format!("cp: {}", msg)),
     }
 }
 
-/// JD8/JD9: copy ONE file `de_src` into directory `dparent` under leaf name `dleaf`, create-or-truncating
-/// the destination. Returns the byte count copied, or a fully-formatted (path + errno) error string the
-/// caller prefixes with its command name. This is the streaming core shared by `fs_cp` (the file `cp`) and
-/// the JD9 `cp_tree` recursion — NO fat.rs mutation: it composes the offset-aware read `read_at` with the
-/// JD6 create-or-truncate write path (`locate_in_dir`/`delete_located`/`create_in_dir` + `write_grow`),
-/// all call-never-edit. `dcanon` is the destination parent's canonical path (for messages / the display).
-///
-/// SIZE HANDLING (the JD8-M2 decision, unchanged): STREAMS in fixed `CP_WINDOW`-byte windows, so a file of
-/// ANY size copies with a bounded heap footprint and NO truncation (no size ceiling). Every FAT/data access
-/// rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
-fn copy_file_into(
-    fs: &FatFs,
-    de_src: &DirEntry,
-    src_canon: &str,
-    dparent: u32,
-    dleaf: &str,
-    dcanon: &str,
-    force: bool,
-) -> Result<u64, String> {
-    let dest_disp = joined(dcanon, dleaf);
-    // --- Create-or-truncate the destination as a fresh 0-length file (the JD6 write prologue). ---
-    let (dir_lba, dir_off) = match fs.locate_in_dir(dparent, dleaf) {
-        Ok((de, dl, doff)) => {
-            if de.is_dir {
-                return Err(alloc::format!("{}: is a directory (-EISDIR)", joined(dcanon, de.name())));
-            }
-            // JD14: no-clobber is the panel default — an existing FILE destination is refused unless
-            // `-f` was given (which opts into the overwrite/truncate below). The `cp -r` recursion
-            // always writes into a freshly-created (empty) tree, so it passes `force = true` and this
-            // guard never trips there.
-            if !force {
-                return Err(alloc::format!(
-                    "{}: file exists (-EEXIST); use cp -f to overwrite", dest_disp));
-            }
-            fs.delete_located(dl, doff, de.first_cluster()).map_err(|e| {
-                alloc::format!("{}: truncate failed {} ({:?})", dest_disp, fat_errno(e), e)
-            })?;
-            match fs.create_in_dir(dparent, dleaf, 0x20) {
-                Ok((_, dl2, doff2)) => (dl2, doff2),
-                Err(e) => return Err(alloc::format!(
-                    "{}: recreate failed {} ({:?}) — old file removed", dest_disp, fat_errno(e), e)),
-            }
+/// VFSROUTE: the write gate asked about an already-resolved path (the multi-path verbs `cp`/`mv`
+/// gate their DESTINATION, which `vfs_write_open` cannot do because it resolves a typed argument).
+fn vfs_gate_ok(
+    console: &mut Console,
+    mt: &crate::fs::vfs::MountTable,
+    verb: &str,
+    path: &str,
+) -> bool {
+    match mt.write_veto(path) {
+        Ok(None) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::ADMITTED);
+            true
         }
-        Err(FatError::NotFound) => match fs.create_in_dir(dparent, dleaf, 0x20) {
-            Ok((_, dl, doff)) => (dl, doff),
-            Err(e) => return Err(alloc::format!("{}: {} ({:?})", dest_disp, fat_errno(e), e)),
-        },
-        Err(e) => return Err(alloc::format!("{}: {} ({:?})", dest_disp, fat_errno(e), e)),
-    };
-    // --- Stream the bytes: read_at windows -> write_grow appends. The destination entry starts as a
-    //     fresh 0-length file (first_cluster 0, size 0); write_grow allocates + publishes as it grows. ---
-    const CP_WINDOW: usize = 32 * 1024;
-    let src_fc = de_src.first_cluster();
-    let src_size = de_src.size;
-    let (mut dst_first, mut dst_size, mut off) = (0u32, 0u32, 0u32);
-    let mut buf: Vec<u8> = Vec::new();
-    while off < src_size {
-        buf.clear();
-        fs.read_at(src_fc, src_size, off, &mut buf, CP_WINDOW).map_err(|e| {
-            alloc::format!("{}: read failed {} ({:?})", src_canon, fat_errno(e), e)
-        })?;
-        if buf.is_empty() {
-            break; // the source chain ended before de.size (malformed) — copy what it holds, honestly
+        Ok(Some(why)) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::REFUSED_RO);
+            let vol = mt.volume_name(path).unwrap_or_else(|_| String::from("?"));
+            console.println(&alloc::format!("{}: REFUSED READ-ONLY ({})", verb, vol));
+            serial_println!(
+                ":: [fatverb] {} -> REFUSED READ-ONLY (volume={} path={} reason={}; handles={}) ::",
+                verb, vol, path, why, crate::drivers::block::source_census()
+            );
+            false
         }
-        match fs.write_grow(dst_first, dst_size, dir_lba, dir_off, off, &buf) {
-            Ok((_, new_size, new_first)) => {
-                dst_first = new_first;
-                dst_size = new_size;
-                off += buf.len() as u32;
-            }
-            Err(e) => return Err(alloc::format!(
-                "{}: write failed {} ({:?})", dest_disp, fat_errno(e), e)),
+        Err(e) => {
+            stamp(&WRITE_GATE, &WRITE_GATE_SEQ, bind::DECLINED);
+            vfs_fail(console, verb, path, e);
+            false
         }
     }
-    Ok(dst_size as u64)
 }
+
+/// JD9: recursively copy the CONTENTS of directory `src` INTO the already-created directory `dst`.
+/// `stats` accumulates across the whole tree so the caller can report an honest partial count.
+/// Depth-capped at [`CP_MAX_DEPTH`] (`-ELOOP`). SNAPSHOT per level: the listing is captured before
+/// any mutation, so copying as we go never invalidates the walk.
+fn cp_tree(
+    mt: &crate::fs::vfs::MountTable,
+    src: &str,
+    dst: &str,
+    depth: u32,
+    stats: &mut CpStats,
+) -> Result<(), String> {
+    use crate::fs::vfs::NodeKind;
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", src, CP_MAX_DEPTH));
+    }
+    let rows = mt
+        .read_dir(src)
+        .map_err(|e| alloc::format!("{}: {}", src, vfs_err(e)))?;
+    for r in &rows {
+        let child_src = vfs_join(src, &r.name);
+        let child_dst = vfs_join(dst, &r.name);
+        match r.kind {
+            NodeKind::Dir => {
+                mt.create(&child_dst, NodeKind::Dir, SHELL_PRINCIPAL)
+                    .map_err(|e| alloc::format!("{}: {}", child_dst, vfs_err(e)))?;
+                stats.dirs += 1;
+                cp_tree(mt, &child_src, &child_dst, depth + 1, stats)?;
+            }
+            NodeKind::File => {
+                mt.create(&child_dst, NodeKind::File, SHELL_PRINCIPAL)
+                    .map_err(|e| alloc::format!("{}: {}", child_dst, vfs_err(e)))?;
+                let n = vfs_copy_bytes(mt, &child_src, &child_dst, r.size)?;
+                stats.files += 1;
+                stats.bytes += n;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// JD9 `cp -r <src> <dst>`: recursively copy a directory tree. `cp -r DIR DEST/` lands the tree as
+/// `DEST/<leaf>`. A FILE source degrades to a plain `cp`. Refuses to copy a directory into its own
+/// subtree (`-EINVAL`). One summary line, or an honest partial count on the first failure.
+fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, spath)) = vfs_read_open(console, "cp", src) else { return };
+    let st = match mt.stat(&spath) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "cp", &spath, e),
+    };
+    if matches!(st.kind, NodeKind::File) {
+        return fs_cp(console, src, dst, force); // `-r` on a file is a plain copy
+    }
+    let dpath_arg = match vfs_read_target("cp", dst) {
+        Ok((_, p)) => p,
+        Err(msg) => return console.println(&msg),
+    };
+    let dpath = if vfs_is_dir(&mt, &dpath_arg) {
+        vfs_join(&dpath_arg, vfs_leaf(&spath))
+    } else {
+        dpath_arg
+    };
+    if dpath.eq_ignore_ascii_case(&spath) || is_descendant(&dpath, &spath) {
+        return console.println(&alloc::format!(
+            "cp: cannot copy directory {} into itself or its own subtree ({}) (-EINVAL)",
+            spath, dpath));
+    }
+    if !vfs_gate_ok(console, &mt, "cp", &dpath) {
+        return;
+    }
+    match mt.stat(&dpath) {
+        Ok(_) => return console.println(&alloc::format!(
+            "cp: {}: file exists (-EEXIST); remove it first", dpath)),
+        Err(VfsError::NoSuchPath) => {}
+        Err(e) => return vfs_fail(console, "cp", &dpath, e),
+    }
+    if let Err(e) = mt.create(&dpath, NodeKind::Dir, SHELL_PRINCIPAL) {
+        return vfs_fail(console, "cp", &dpath, e);
+    }
+    let mut stats = CpStats { dirs: 1, files: 0, bytes: 0 };
+    match cp_tree(&mt, &spath, &dpath, 1, &mut stats) {
+        Ok(()) => vfs_say(console, &alloc::format!(
+            "copied {} -> {} ({} file(s), {} dir(s), {} bytes)",
+            spath, dpath, stats.files, stats.dirs, stats.bytes)),
+        Err(msg) => {
+            console.println(&alloc::format!("cp: {}", msg));
+            console.println(&alloc::format!(
+                "cp: partial — {} file(s), {} dir(s), {} bytes copied",
+                stats.files, stats.dirs, stats.bytes));
+        }
+    }
+}
+
+/// JD13: recursively delete the CONTENTS of directory `dir` — child FILES then child DIRECTORIES,
+/// depth-first, so a directory is emptied before it is removed. Depth-capped at [`CP_MAX_DEPTH`].
+/// SNAPSHOT-then-delete: the listing is captured before any mutation and each child is addressed BY
+/// NAME, so deleting as we go never invalidates the walk.
+fn rm_tree(
+    mt: &crate::fs::vfs::MountTable,
+    dir: &str,
+    depth: u32,
+    stats: &mut RmStats,
+) -> Result<(), String> {
+    use crate::fs::vfs::NodeKind;
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", dir, CP_MAX_DEPTH));
+    }
+    let rows = mt
+        .read_dir(dir)
+        .map_err(|e| alloc::format!("{}: {}", dir, vfs_err(e)))?;
+    for r in rows.iter().filter(|r| matches!(r.kind, NodeKind::File)) {
+        let child = vfs_join(dir, &r.name);
+        mt.unlink(&child, SHELL_PRINCIPAL)
+            .map_err(|e| alloc::format!("{}: {}", child, vfs_err(e)))?;
+        stats.files += 1;
+    }
+    for r in rows.iter().filter(|r| matches!(r.kind, NodeKind::Dir)) {
+        let child = vfs_join(dir, &r.name);
+        rm_tree(mt, &child, depth + 1, stats)?;
+        mt.remove_dir(&child, SHELL_PRINCIPAL)
+            .map_err(|e| alloc::format!("{}: {}", child, vfs_err(e)))?;
+        stats.dirs += 1;
+    }
+    Ok(())
+}
+
+/// JD13 `rm -r <path>`: recursively delete a directory tree (files then directories, depth-first).
+/// The volume root is refused (`-EBUSY`); a FILE target degrades to a plain delete; a missing target
+/// is quiet under `-f`. One summary line, or an honest partial count on the first failure.
+fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, path)) = vfs_write_open(console, "rm", arg) else { return };
+    if path == "/" {
+        return console.println("rm: /: cannot remove the volume root (-EBUSY)");
+    }
+    let st = match mt.stat(&path) {
+        Ok(s) => s,
+        Err(VfsError::NoSuchPath) => {
+            if !force {
+                console.println(&alloc::format!("rm: {}: not found (-ENOENT)", path));
+            }
+            return;
+        }
+        Err(e) => return vfs_fail(console, "rm", &path, e),
+    };
+    if matches!(st.kind, NodeKind::File) {
+        return match mt.unlink(&path, SHELL_PRINCIPAL) {
+            Ok(()) => vfs_say(console, &alloc::format!("removed {}", path)),
+            Err(e) => vfs_fail(console, "rm", &path, e),
+        };
+    }
+    let mut stats = RmStats { dirs: 0, files: 0 };
+    match rm_tree(&mt, &path, 1, &mut stats) {
+        Ok(()) => match mt.remove_dir(&path, SHELL_PRINCIPAL) {
+            Ok(()) => {
+                stats.dirs += 1;
+                vfs_say(console, &alloc::format!(
+                    "removed {} ({} file(s), {} dir(s))", path, stats.files, stats.dirs));
+            }
+            Err(e) => {
+                vfs_fail(console, "rm", &path, e);
+                console.println(&alloc::format!(
+                    "rm: partial — {} file(s), {} dir(s) removed", stats.files, stats.dirs));
+            }
+        },
+        Err(msg) => {
+            console.println(&alloc::format!("rm: {}", msg));
+            console.println(&alloc::format!(
+                "rm: partial — {} file(s), {} dir(s) removed", stats.files, stats.dirs));
+        }
+    }
+}
+
+/// JD10 `mv`: move OR rename by relinking one directory entry — O(1), by reference, no data copy
+/// (so `mv DIR NEWNAME` needs no `-r`). The `mv SRC DIR/` idiom lands the entry under DIR as the
+/// source leaf. JD14: no-clobber is the DEFAULT — an existing destination is `-EEXIST` unless `-f`.
+///
+/// **A cross-volume move is refused by identity, and the refusal comes from the mount table**, not
+/// from a prefix test in this verb: relinking an entry is a within-volume operation, so
+/// [`crate::fs::vfs::MountTable::same_volume`] is asked and the operator is told to `cp` then `rm`.
+/// That is the same answer the pre-VFSROUTE verb gave for the native/FAT pair — but it now holds for
+/// every pair of volumes the machine ever mounts, including two it has not met yet.
+///
+/// # THE WRITE VETO IS ASKED FIRST, AND THE ORDER IS THE DIAGNOSIS (VOLID, orin 18, rmbp 15 N1)
+///
+/// This verb asked `same_volume` BEFORE [`vfs_gate_ok`], so on a READ-ONLY volume the operator was
+/// told *"cross-volume move is not supported"* — a sentence about the namespace — when the actual
+/// obstacle was that the medium refuses every mutation. Both refusals can be true at once and the
+/// operator only ever sees the first one, so the order decides which fact they are handed, and the
+/// veto is the fact that survives the suggested workaround: `cp` then `rm` cannot help on a volume
+/// that admits no writes, while it is exactly right for a genuine cross-volume move.
+///
+/// The gate is aimed at the **source**, not the destination as before. A relink gives up an entry on
+/// the volume the file is on, so that volume must accept mutation whatever the destination is; and
+/// once `same_volume` has passed, the destination IS that volume (equal
+/// [`crate::fs::vfs::VfsBackend::volume_id`] means one medium, hence one veto — `write_veto` is a
+/// pure function of the `BlockSource`, and the source is one of the terms the id mixes), so the
+/// destination gate the old order ran is not dropped, it is subsumed. One `WRITE_GATE` stamp per
+/// `mv`, before and after.
+///
+/// The final order is **argument validity → write veto → namespace**: `mv DIR DIR/sub` is a
+/// malformed request whatever the medium's posture and keeps its `-EINVAL`, so the only diagnosis
+/// this reorder changes is the one N1 names.
+fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
+    use crate::fs::vfs::{NodeKind, VfsError};
+    let Some((mt, spath)) = vfs_read_open(console, "mv", src) else { return };
+    if spath == "/" {
+        return console.println("mv: /: cannot move the volume root (-EBUSY)");
+    }
+    let dpath_arg = match vfs_read_target("mv", dst) {
+        Ok((_, p)) => p,
+        Err(msg) => return console.println(&msg),
+    };
+    let src_st = match mt.stat(&spath) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "mv", &spath, e),
+    };
+    let dpath = if vfs_is_dir(&mt, &dpath_arg) {
+        vfs_join(&dpath_arg, vfs_leaf(&spath))
+    } else {
+        dpath_arg
+    };
+    // ARGUMENT VALIDITY FIRST: a directory moved into itself is a malformed request whatever the
+    // volume's posture, so it keeps the answer it had. (It no longer sits BEHIND `same_volume`,
+    // which could only ever have answered `true` for it — both ends are the same path or one
+    // contains the other, so they are the same volume by construction.)
+    if matches!(src_st.kind, NodeKind::Dir)
+        && (dpath.eq_ignore_ascii_case(&spath) || is_descendant(&dpath, &spath))
+    {
+        return console.println(&alloc::format!(
+            "mv: cannot move directory {} into itself or its own subtree ({}) (-EINVAL)",
+            spath, dpath));
+    }
+    // VOLID N1: THE VETO BEFORE THE NAMESPACE QUESTION, and aimed at the SOURCE — see this verb's
+    // doc comment. A volume that refuses mutation refuses this move for a reason `cp` + `rm` cannot
+    // route around, so it is the refusal the operator needs to read; the cross-volume question is
+    // asked only once the medium has said it will accept a write at all.
+    if !vfs_gate_ok(console, &mt, "mv", &spath) {
+        return;
+    }
+    match mt.same_volume(&spath, &dpath) {
+        Ok(true) => {}
+        Ok(false) => return console.println(
+            "mv: cross-volume move is not supported (copy with `cp`, then `rm`)"),
+        Err(e) => return vfs_fail(console, "mv", &dpath, e),
+    }
+    // (The destination gate that stood here is subsumed by the source gate above: `same_volume` has
+    // passed, so `dpath` resolves to the SAME medium as `spath` and would answer the same veto —
+    // `FatBackend::write_veto` is a pure function of the `BlockSource`, and the source is one of the
+    // terms `volume_id` mixes, so equal identity implies equal veto.)
+    if !dpath.eq_ignore_ascii_case(&spath) {
+        match mt.stat(&dpath) {
+            Ok(d) => {
+                if !force {
+                    return console.println(&alloc::format!(
+                        "mv: {}: file exists (-EEXIST); use mv -f to overwrite", dpath));
+                }
+                // `-f`: remove the existing destination first, then relink into the freed name.
+                // A DIRECTORY destination is tree-replaced (JD15), which is only possible on a
+                // volume whose backend implements `remove_dir` — one that does not says so.
+                let removed = match d.kind {
+                    NodeKind::File => mt.unlink(&dpath, SHELL_PRINCIPAL),
+                    NodeKind::Dir => {
+                        let mut st = RmStats { dirs: 0, files: 0 };
+                        match rm_tree(&mt, &dpath, 1, &mut st) {
+                            Ok(()) => mt.remove_dir(&dpath, SHELL_PRINCIPAL),
+                            Err(msg) => {
+                                return console.println(&alloc::format!(
+                                    "mv: -f: overwrite (remove existing) failed: {}", msg));
+                            }
+                        }
+                    }
+                };
+                if let Err(e) = removed {
+                    return console.println(&alloc::format!(
+                        "mv: -f: overwrite (remove existing) failed: {}: {}", dpath, vfs_err(e)));
+                }
+            }
+            Err(VfsError::NoSuchPath) => {}
+            Err(e) => return vfs_fail(console, "mv", &dpath, e),
+        }
+    }
+    match mt.rename(&spath, &dpath, SHELL_PRINCIPAL) {
+        Ok(()) => vfs_say(console, &alloc::format!("moved {} -> {}", spath, dpath)),
+        Err(VfsError::Backend("exists")) =>
+            console.println(&alloc::format!("mv: {}: file exists (-EEXIST)", dpath)),
+        Err(e) => vfs_fail(console, "mv", &dpath, e),
+    }
+}
+
+/// VFSROUTE: `cat <path>` through the mount table. Bounded to `CAP` bytes so a huge file cannot
+/// flood the console, with the honest `[... n of m bytes shown]` tail note.
+///
+/// One body for every volume and both arches. Before VFSROUTE there were two: an aarch64 routed one
+/// and an x86 FAT-direct one, printing the same text from two places — the duplication Peter's
+/// ruling names.
+fn vfs_cat(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::NodeKind;
+    const CAP: u64 = 8192;
+    let Some((mt, path)) = vfs_read_open(console, "cat", arg) else { return };
+    let st = match mt.stat(&path) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "cat", &path, e),
+    };
+    if matches!(st.kind, NodeKind::Dir) {
+        return console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", path));
+    }
+    let want = core::cmp::min(st.size, CAP);
+    match mt.read(&path, 0, want as usize) {
+        Ok(data) => {
+            for line in render_text(&data).split('\n') {
+                console.println(line);
+            }
+            if st.size > data.len() as u64 {
+                console.println(&alloc::format!(
+                    "[... {} of {} bytes shown]", data.len(), st.size));
+            }
+        }
+        Err(e) => vfs_fail(console, "cat", &path, e),
+    }
+}
+
+/// VFSROUTE: resolve one argument to a readable FILE — the shared front half of `head`, `tail`,
+/// `hexdump`, `wc` and `grep`, wearing the caller's verb name so the error lines stay in house
+/// style. Returns the table, the absolute path and its size.
+fn vfs_file_target(console: &mut Console, verb: &str, arg: &str)
+    -> Option<(crate::fs::vfs::MountTable, String, u64)>
+{
+    use crate::fs::vfs::NodeKind;
+    let (mt, path) = vfs_read_open(console, verb, arg)?;
+    match mt.stat(&path) {
+        Ok(st) if matches!(st.kind, NodeKind::Dir) => {
+            console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
+            None
+        }
+        Ok(st) => Some((mt, path, st.size)),
+        Err(e) => {
+            vfs_fail(console, verb, &path, e);
+            None
+        }
+    }
+}
+
+/// JD12 `head <path> [n]`: print the FIRST `n` lines (default 10). Streams from offset 0 in bounded
+/// windows and STOPS as soon as `n` newlines are seen, so `head` of a huge file reads only the first
+/// window(s). A byte ceiling (`HEAD_MAX`) backstops a file with no newlines.
+fn fs_head(console: &mut Console, arg: &str, n: u32) {
+    const WINDOW: usize = 4096;
+    const HEAD_MAX: u64 = 64 * 1024;
+    let Some((mt, path, size)) = vfs_file_target(console, "head", arg) else { return };
+    let (mut off, mut lines) = (0u64, 0u32);
+    let mut cur = String::new();
+    let mut more = false;
+    'outer: while off < size && off < HEAD_MAX && lines < n {
+        let want = core::cmp::min(WINDOW as u64, size - off) as usize;
+        let buf = match mt.read(&path, off, want) {
+            Ok(b) => b,
+            Err(e) => return vfs_fail(console, "head", &path, e),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        for (i, &b) in buf.iter().enumerate() {
+            match b {
+                b'\n' => {
+                    console.println(&cur);
+                    cur.clear();
+                    lines += 1;
+                    if lines >= n {
+                        more = i + 1 < buf.len() || off + (buf.len() as u64) < size;
+                        break 'outer;
+                    }
+                }
+                b'\r' => {}
+                0x20..=0x7e => cur.push(b as char),
+                _ => cur.push('.'),
+            }
+        }
+        off += buf.len() as u64;
+    }
+    if lines < n && !cur.is_empty() {
+        console.println(&cur);
+        lines += 1;
+    }
+    if more || (lines < n && off < size) {
+        console.println(&alloc::format!("[... first {} line(s) shown]", lines));
+    }
+}
+
+/// JD12 `tail <path> [n]`: print the LAST `n` lines (default 10). Reads a bounded window ending at
+/// EOF, renders it, and prints the last `n` lines. A window that began mid-file drops its first
+/// (cut) line and notes the bound. An empty file prints nothing.
+fn fs_tail(console: &mut Console, arg: &str, n: u32) {
+    const TAIL_MAX: u64 = 64 * 1024;
+    let Some((mt, path, size)) = vfs_file_target(console, "tail", arg) else { return };
+    if size == 0 {
+        return;
+    }
+    let start = size.saturating_sub(TAIL_MAX);
+    let buf = match mt.read(&path, start, (size - start) as usize) {
+        Ok(b) => b,
+        Err(e) => return vfs_fail(console, "tail", &path, e),
+    };
+    let text = render_text(&buf);
+    if text.is_empty() {
+        return;
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if text.ends_with('\n') {
+        lines.pop(); // a trailing '\n' yields an empty final element, not a real line
+    }
+    let windowed = start > 0;
+    if windowed {
+        // The first line is a partial iff the byte just before `start` is not a newline — one extra
+        // byte read, and only when windowed, so essentially never in practice.
+        let cut = match mt.read(&path, start - 1, 1) {
+            Ok(p) => p.first() != Some(&b'\n'),
+            Err(_) => true,
+        };
+        if cut && !lines.is_empty() {
+            lines.remove(0);
+        }
+    }
+    let from = lines.len().saturating_sub(n as usize);
+    for l in &lines[from..] {
+        console.println(l);
+    }
+    if windowed {
+        console.println(&alloc::format!(
+            "[... last {} byte(s) scanned]", size - start));
+    }
+}
+
+/// JD19 `hexdump <path> [off] [len]`: bounded dump of a file's bytes. Default off=0, len=256; `len`
+/// is hard-capped at `HEXDUMP_MAX` (4096). Rows carry the absolute file offset. An `off` at or past
+/// EOF is an honest empty note; more bytes past the window get an honest tail note.
+fn fs_hexdump(console: &mut Console, arg: &str, off: u32, len: usize) {
+    const HEXDUMP_MAX: usize = 4096;
+    let Some((mt, path, size)) = vfs_file_target(console, "hexdump", arg) else { return };
+    if off as u64 >= size {
+        return console.println(&alloc::format!(
+            "hexdump: {}: offset {} at/past EOF ({} byte(s)) — nothing to dump", path, off, size));
+    }
+    let want = core::cmp::min(
+        core::cmp::min(len, HEXDUMP_MAX) as u64,
+        size - off as u64,
+    ) as usize;
+    let data = match mt.read(&path, off as u64, want) {
+        Ok(d) => d,
+        Err(e) => return vfs_fail(console, "hexdump", &path, e),
+    };
+    if data.is_empty() {
+        return console.println(&alloc::format!("hexdump: {}: 0 byte(s) read", path));
+    }
+    xd_rows(console, off as usize, &data);
+    let shown_end = off as u64 + data.len() as u64;
+    if size > shown_end {
+        console.println(&alloc::format!("[... {} more byte(s)]", size - shown_end));
+    }
+}
+
+/// JD19 `stat <path>`: one entry's detail, AS THE NAMESPACE KNOWS IT — the canonical absolute path,
+/// the VOLUME that answered, kind, size, and the last-write stamp when the medium carries one.
+///
+/// **What it no longer prints, and why that is the arc working rather than a loss.** The pre-VFSROUTE
+/// verb printed the FAT attribute byte, the first cluster and the directory-entry LBA + slot offset.
+/// Those are FAT on-disk facts: a `stat` that printed them for every volume would either be a FAT
+/// verb wearing a general name, or would need the trait to carry FAT's own on-disk layout into every backend.
+/// The forensic pair that answers the same questions is unchanged and volume-honest — `hexdump` for
+/// a file's bytes, `dd if=<lba>` for a raw sector.
+fn fs_stat(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::NodeKind;
+    let Some((mt, path)) = vfs_read_open(console, "stat", arg) else { return };
+    let st = match mt.stat(&path) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "stat", &path, e),
+    };
+    let volume = mt.volume_name(&path).unwrap_or_else(|_| String::from("?"));
+    // The stamp lives on the LISTING row, not on `Stat` (a medium with no timestamp answers `None`
+    // rather than fabricating one), so read the parent directory and find this leaf in it.
+    let mtime = if path == "/" {
+        None
+    } else {
+        mt.read_dir(&vfs_parent(&path)).ok().and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.name.eq_ignore_ascii_case(vfs_leaf(&path)))
+                .and_then(|r| r.mtime)
+        })
+    };
+    console.println(&alloc::format!("  path:   {}", path));
+    console.println(&alloc::format!("  volume: {}", volume));
+    console.println(&alloc::format!(
+        "  kind:   {}", if matches!(st.kind, NodeKind::Dir) { "dir" } else { "file" }));
+    console.println(&alloc::format!("  size:   {} byte(s)", st.size));
+    console.println(&alloc::format!("  mtime:  {}", vfs_mtime_field(mtime.as_ref()).trim()));
+    if path == "/" {
+        console.println("  entry:  the volume root has no directory entry of its own");
+    }
+}
+
+/// JD18 running tally for `find`: hits printed, and directories scanned.
+struct FindStats {
+    matches: u32,
+    dirs: u32,
+}
+
+/// JD18: recursively walk `dir`, matching each entry's name against `pat` with the JD12
+/// `glob_match`. A hit prints its full path — a directory with a trailing `/`. Depth-capped at
+/// [`CP_MAX_DEPTH`] (`-ELOOP`); a read error stops with an errno-tagged path and leaves the
+/// already-printed hits standing.
+fn find_walk(
+    console: &mut Console,
+    mt: &crate::fs::vfs::MountTable,
+    dir: &str,
+    pat: &str,
+    depth: u32,
+    stats: &mut FindStats,
+) -> Result<(), String> {
+    use crate::fs::vfs::NodeKind;
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", dir, CP_MAX_DEPTH));
+    }
+    stats.dirs += 1;
+    let rows = mt
+        .read_dir(dir)
+        .map_err(|e| alloc::format!("{}: {}", dir, vfs_err(e)))?;
+    for r in &rows {
+        let child = vfs_join(dir, &r.name);
+        if glob_match(pat, &r.name) {
+            stats.matches += 1;
+            if matches!(r.kind, NodeKind::Dir) {
+                console.println(&alloc::format!("{}/", child));
+            } else {
+                console.println(&child);
+            }
+        }
+        if matches!(r.kind, NodeKind::Dir) {
+            find_walk(console, mt, &child, pat, depth + 1, stats)?;
+        }
+    }
+    Ok(())
+}
+
+/// JD18 `find [root] <pattern>`: recursively search the tree under `<root>` (default the cwd) for
+/// entries whose name matches `<pattern>`, then an honest `N match(es), M dir(s) scanned` tally. A
+/// FILE root degrades to a single self-match test (the POSIX shape).
+fn fs_find(console: &mut Console, root_arg: &str, pat: &str) {
+    use crate::fs::vfs::NodeKind;
+    let Some((mt, path)) = vfs_read_open(console, "find", root_arg) else { return };
+    let st = match mt.stat(&path) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "find", &path, e),
+    };
+    let mut stats = FindStats { matches: 0, dirs: 0 };
+    if matches!(st.kind, NodeKind::File) {
+        if glob_match(pat, vfs_leaf(&path)) {
+            console.println(&path);
+            stats.matches += 1;
+        }
+        return console.println(&alloc::format!(
+            "{} match(es), 0 dir(s) scanned", stats.matches));
+    }
+    if let Err(msg) = find_walk(console, &mt, &path, pat, 1, &mut stats) {
+        console.println(&alloc::format!("find: {}", msg));
+    }
+    console.println(&alloc::format!(
+        "{} match(es), {} dir(s) scanned", stats.matches, stats.dirs));
+}
+
+/// JD18 running tally for `du`: files and directories counted across the whole subtree.
+struct DuStats {
+    files: u32,
+    dirs: u32,
+}
+
+/// JD18: total bytes of the subtree rooted at `dir` — the sum of every descendant FILE's size.
+/// Depth-capped at [`CP_MAX_DEPTH`]; a read error stops with an errno-tagged path.
+fn du_subtree(
+    mt: &crate::fs::vfs::MountTable,
+    dir: &str,
+    depth: u32,
+    stats: &mut DuStats,
+) -> Result<u64, String> {
+    use crate::fs::vfs::NodeKind;
+    if depth > CP_MAX_DEPTH {
+        return Err(alloc::format!(
+            "{}: maximum directory depth {} exceeded (-ELOOP)", dir, CP_MAX_DEPTH));
+    }
+    let rows = mt
+        .read_dir(dir)
+        .map_err(|e| alloc::format!("{}: {}", dir, vfs_err(e)))?;
+    let mut total: u64 = 0;
+    for r in &rows {
+        if matches!(r.kind, NodeKind::Dir) {
+            stats.dirs += 1;
+            total += du_subtree(mt, &vfs_join(dir, &r.name), depth + 1, stats)?;
+        } else {
+            stats.files += 1;
+            total += r.size;
+        }
+    }
+    Ok(total)
+}
+
+/// JD18 `du [dir]`: for each DIRECT child of `<dir>` print its total bytes (a file = its own size, a
+/// directory = the recursive sum of its subtree), then a `total:` line. `du FILE` is that file's
+/// single line. A directory entry itself contributes no bytes — only file bytes are real.
+fn fs_du(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::NodeKind;
+    let Some((mt, path)) = vfs_read_open(console, "du", arg) else { return };
+    let st = match mt.stat(&path) {
+        Ok(s) => s,
+        Err(e) => return vfs_fail(console, "du", &path, e),
+    };
+    if matches!(st.kind, NodeKind::File) {
+        console.println(&alloc::format!("  {:>10}  {}", st.size, path));
+        return console.println(&alloc::format!(
+            "total: {} byte(s) in 1 file(s), 0 dir(s)", st.size));
+    }
+    let rows = match mt.read_dir(&path) {
+        Ok(r) => r,
+        Err(e) => return vfs_fail(console, "du", &path, e),
+    };
+    let mut stats = DuStats { files: 0, dirs: 0 };
+    let mut grand: u64 = 0;
+    for r in &rows {
+        let child = vfs_join(&path, &r.name);
+        if matches!(r.kind, NodeKind::Dir) {
+            stats.dirs += 1;
+            match du_subtree(&mt, &child, 1, &mut stats) {
+                Ok(sz) => {
+                    grand += sz;
+                    console.println(&alloc::format!("  {:>10}  {}/", sz, child));
+                }
+                Err(msg) => {
+                    console.println(&alloc::format!("du: {}", msg));
+                    break; // stop the walk; the total below is honest for what was scanned
+                }
+            }
+        } else {
+            stats.files += 1;
+            grand += r.size;
+            console.println(&alloc::format!("  {:>10}  {}", r.size, child));
+        }
+    }
+    console.println(&alloc::format!(
+        "total: {} byte(s) in {} file(s), {} dir(s)", grand, stats.files, stats.dirs));
+}
+
+/// VFSROUTE: read a bounded run of a file in windows, feeding `sink` — the streaming core `wc` and
+/// `grep` share, so neither holds a whole file. Returns the number of bytes scanned.
+fn scan_file(
+    mt: &crate::fs::vfs::MountTable,
+    path: &str,
+    size: u64,
+    mut sink: impl FnMut(&[u8]),
+) -> Result<u64, crate::fs::vfs::VfsError> {
+    const WINDOW: usize = 4096;
+    let cap = core::cmp::min(size, SCAN_MAX as u64);
+    let mut off: u64 = 0;
+    while off < cap {
+        let want = core::cmp::min(WINDOW as u64, cap - off) as usize;
+        let buf = mt.read(path, off, want)?;
+        if buf.is_empty() {
+            break;
+        }
+        sink(&buf);
+        off += buf.len() as u64;
+    }
+    Ok(off)
+}
+
+/// BASICS: resolve one path argument to a readable FILE for `wc`/`grep`, wearing the caller's verb
+/// name so the error lines stay in house style.
+fn scan_target(console: &mut Console, verb: &str, arg: &str)
+    -> Option<(crate::fs::vfs::MountTable, String, u64)>
+{
+    vfs_file_target(console, verb, arg)
+}
+
+/// RELICS/VFSROUTE `df` and `mount`: what is attached, and how full it is.
+///
+/// **One row per MOUNT, and every field comes off the backend.** `df` used to mount the FAT program
+/// source and print that one volume's BPB fields; a machine with three volumes in one namespace got
+/// a report about whichever the program source happened to be. Now the table itself is the report:
+/// the prefix and volume name off [`crate::fs::vfs::MountTable::rows`], the capacity off
+/// `VfsBackend::volume_bytes` (a backend whose medium publishes none answers `None` and the column
+/// is a dash — never a fabricated figure), the access posture off `VfsBackend::write_veto`, and the
+/// per-volume geometry line, under `mount` only, off `VfsBackend::describe`.
+///
+/// **`used` is a file-byte tally, and the line says so.** No backend publishes a free-block count,
+/// so `used` is the recursive sum of every file's size — the number `du` prints for that volume's
+/// root, computed by the same walker — and `free` is derived from it. That undercounts by per-file
+/// slack, so the footer names the method rather than letting a reader assume a block-accurate figure.
+fn df_report(console: &mut Console, verb: &str) {
+    let mt = vfs_mount_table();
+    let rows = mt.rows();
+    if rows.is_empty() {
+        console.println(&alloc::format!("{}: no filesystem mounted (-ENODEV)", verb));
+        serial_println!(
+            ":: [fatverb] {} -> NO VOLUME (namespace empty; handles={}) ::",
+            verb, crate::drivers::block::source_census()
+        );
+        return;
+    }
+    console.println("Volume      Prefix      Size(KiB)  Used(KiB)  Free(KiB)  Access");
+    let mut descriptions: Vec<String> = Vec::new();
+    // One TALLY per distinct VOLUME, not per mount: a machine that binds one volume at two prefixes
+    // (x86's `/` + `/boot`, the Orin's ROOTFS pair) would otherwise walk the whole card twice to
+    // print the same number twice. The rows still list every mount — a mount point is a fact — they
+    // just share the walk.
+    let mut tallied: Vec<(String, u64, u32, u32)> = Vec::new();
+    for (prefix, name, veto, total, describe) in &rows {
+        let (used, files, dirs) = match tallied.iter().find(|(n, _, _, _)| n == name) {
+            Some((_, u, f, d)) => (*u, *f, *d),
+            None => {
+                let mut st = DuStats { files: 0, dirs: 0 };
+                let u = du_subtree(&mt, prefix, 0, &mut st).unwrap_or(0);
+                tallied.push((String::from(*name), u, st.files, st.dirs));
+                (u, st.files, st.dirs)
+            }
+        };
+        let stats = DuStats { files, dirs };
+        let size_col = match total {
+            Some(t) => alloc::format!("{}", t / 1024),
+            None => String::from("-"),
+        };
+        let free_col = match total {
+            Some(t) => alloc::format!("{}", t.saturating_sub(used) / 1024),
+            None => String::from("-"),
+        };
+        console.println(&alloc::format!(
+            "{:<11} {:<11} {:>9}  {:>9}  {:>9}  {}",
+            name, prefix, size_col, used / 1024, free_col,
+            veto.unwrap_or("read-write")));
+        console.println(&alloc::format!(
+            "            {} file(s), {} dir(s)", stats.files, stats.dirs));
+        // RELICS (R26 clause 1): the retired `fatinfo` verb was one line of volume GEOMETRY, and
+        // geometry is a property of a MOUNT — so it prints under `mount`, not under `df`, and it
+        // comes from the backend describing ITSELF. A volume that publishes no description simply
+        // contributes no line.
+        if verb == "mount" {
+            if let Some(d) = describe {
+                descriptions.push(alloc::format!("{}: {}", name, d));
+            }
+        }
+    }
+    console.println("used = recursive file-byte tally, slack not counted");
+    for d in &descriptions {
+        console.println(d);
+    }
+}
+
+/// VFSROUTE: expand ONE path argument's trailing glob against the namespace. `Literal` = no
+/// metacharacter in the leaf (the arg passes through unchanged); `Matched` = the leaf resolved
+/// against its parent DIRECTORY to zero or more rows, sorted so a listing or transcript is
+/// deterministic. A metacharacter in an earlier component is treated literally.
+///
+/// It walks [`crate::fs::vfs::MountTable::read_dir`], so a glob works on EVERY mounted volume. The
+/// pre-VFSROUTE expander took a `&FatFs`, which is why `cat *.TXT` was FAT-only and silently found
+/// nothing on the native volume.
+enum Glob {
+    Literal(String),
+    Matched { parent: String, rows: Vec<crate::fs::vfs::DirEnt> },
+}
+
+/// VFSROUTE: the glob expander (see [`Glob`]). `path` is already absolute and normalized.
+fn vfs_glob(mt: &crate::fs::vfs::MountTable, path: &str) -> Glob {
+    let leaf = vfs_leaf(path);
+    if leaf.is_empty() || !has_glob(leaf) {
+        return Glob::Literal(String::from(path));
+    }
+    let parent = vfs_parent(path);
+    let mut rows: Vec<crate::fs::vfs::DirEnt> = match mt.read_dir(&parent) {
+        Ok(rs) => rs.into_iter().filter(|r| glob_match(leaf, &r.name)).collect(),
+        Err(_) => Vec::new(),
+    };
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Glob::Matched { parent, rows }
+}
+
+/// VFSROUTE: render listing rows in the shell's table shape — size + name, `<DIR>` for a directory,
+/// and under `-l` the date column [`vfs_mtime_field`] renders. Returns `(files, dirs)`.
+fn vfs_print_rows(console: &mut Console, rows: &[crate::fs::vfs::DirEnt], long: bool) -> (u32, u32) {
+    use crate::fs::vfs::NodeKind;
+    let (mut files, mut dirs) = (0u32, 0u32);
+    for de in rows {
+        let date = vfs_mtime_field(de.mtime.as_ref());
+        if matches!(de.kind, NodeKind::Dir) {
+            dirs += 1;
+            if long {
+                console.println(&alloc::format!("  <DIR>        {}  {}/", date, de.name));
+            } else {
+                console.println(&alloc::format!("  <DIR>         {}", de.name));
+            }
+        } else {
+            files += 1;
+            if long {
+                console.println(&alloc::format!("  {:>10}  {}  {}", de.size, date, de.name));
+            } else {
+                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name));
+            }
+        }
+    }
+    (files, dirs)
+}
+
+/// VFSROUTE: `ls`/`dir` — ONE body, every volume, both arches.
+///
+/// Peter's question was about exactly this function: a mounted filesystem is listable because it
+/// implements [`crate::fs::vfs::VfsBackend::read_dir`], and `ls` walks whatever the mount table
+/// hands it. There is no unafs arm, no FAT arm and no `/usb` prefix test in here; `ls /` lists the
+/// root volume, `ls /boot` the boot FAT, `ls /usb` the stick, and a volume mounted tomorrow lists
+/// with no edit to this file at all.
+///
+/// Emits the per-invocation `:: ls1: <path>: <names> (N file, M dir) ::` serial witness unchanged —
+/// the verb renders panel-only on the bench, so a headless capture gets the same content.
+fn vfs_ls(console: &mut Console, arg: &str, long: bool) {
+    let path = vfs_path(arg);
+    match vfs_ls_collect(&path) {
+        Ok((is_dir, rows)) => {
+            let (files, dirs) = vfs_print_rows(console, &rows, long);
+            if is_dir {
+                console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+            }
+            let names: Vec<&str> = rows.iter().map(|d| d.name.as_str()).collect();
+            if long {
+                let sizes: Vec<String> = rows.iter().map(|d| alloc::format!("{}", d.size)).collect();
+                serial_println!(
+                    ":: ls1: {}: {} ({} file, {} dir) sizes: {} ::",
+                    path, names.join(" "), files, dirs, sizes.join(" ")
+                );
+            } else {
+                serial_println!(
+                    ":: ls1: {}: {} ({} file, {} dir) ::",
+                    path, names.join(" "), files, dirs
+                );
+            }
+        }
+        Err(msg) => {
+            console.println(&alloc::format!("ls: {}", msg));
+            serial_println!(":: ls1: {}: ERR {} ::", path, msg);
+        }
+    }
+}
+
+/// VFSROUTE: the single-path `ls` core under its FATVERB name — kept because
+/// `fatverb_storage_witness` drives THIS function as "the real read verb the `ls`/`dir` arm calls",
+/// and that leg's whole value is that it exercises the verb rather than a copy of it.
+#[cfg(target_arch = "x86_64")]
+fn ls_path(console: &mut Console, arg: &str, long: bool) {
+    vfs_ls(console, arg, long);
+}
+
+/// JD12 `ls *.EXT`: list every entry matching a wildcard, one table line each (sorted), with the
+/// file/dir tally. No match is an honest "no match".
+fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
+    let Some((mt, path)) = vfs_read_open(console, "ls", arg) else { return };
+    match vfs_glob(&mt, &path) {
+        Glob::Literal(_) => vfs_ls(console, arg, long),
+        Glob::Matched { rows, .. } if rows.is_empty() =>
+            console.println(&alloc::format!("ls: {}: no match", arg)),
+        Glob::Matched { rows, .. } => {
+            let (files, dirs) = vfs_print_rows(console, &rows, long);
+            console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
+        }
+    }
+}
+
+/// JD12 `cat *.EXT`: cat every FILE matching a wildcard (concatenate), in sorted order — reusing
+/// [`vfs_cat`] per file so the rendering and truncation note are identical to a single-path `cat`.
+fn cat_globbed(console: &mut Console, arg: &str) {
+    use crate::fs::vfs::NodeKind;
+    let Some((mt, path)) = vfs_read_open(console, "cat", arg) else { return };
+    match vfs_glob(&mt, &path) {
+        Glob::Literal(_) => vfs_cat(console, arg),
+        Glob::Matched { rows, .. } if rows.is_empty() =>
+            console.println(&alloc::format!("cat: {}: no match", arg)),
+        Glob::Matched { parent, rows } => {
+            for r in &rows {
+                let child = vfs_join(&parent, &r.name);
+                if matches!(r.kind, NodeKind::Dir) {
+                    console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", child));
+                } else {
+                    vfs_cat(console, &child);
+                }
+            }
+        }
+    }
+}
+
+/// JD12: expand the SOURCE args of a `cp`/`mv` into concrete absolute paths, printing a per-pattern
+/// "no match" note for any wildcard that matched nothing. SNAPSHOT: the whole list is taken before
+/// any mutation runs, so a wildcard operation never invalidates its own list.
+fn expand_sources(
+    console: &mut Console,
+    mt: &crate::fs::vfs::MountTable,
+    verb: &str,
+    sources: &[&str],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in sources {
+        match vfs_glob(mt, &vfs_path(s)) {
+            Glob::Literal(p) => out.push(p),
+            Glob::Matched { rows, .. } if rows.is_empty() =>
+                console.println(&alloc::format!("{}: {}: no match", verb, s)),
+            Glob::Matched { parent, rows } => {
+                for r in &rows {
+                    out.push(vfs_join(&parent, &r.name));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// JD12 `rm` with wildcards: each arg a target or a trailing glob. SNAPSHOT-then-delete. A
+/// no-match wildcard is quiet under `-f` (POSIX `rm -f *.none` is silent).
+fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool) {
+    let mt = vfs_mount_table();
+    for a in args {
+        match vfs_glob(&mt, &vfs_path(a)) {
+            Glob::Literal(p) =>
+                if recursive { fs_rm_recursive(console, &p, force) } else { fs_rm(console, &p, force) },
+            Glob::Matched { rows, .. } if rows.is_empty() => {
+                if !force {
+                    console.println(&alloc::format!("rm: {}: no match", a));
+                }
+            }
+            Glob::Matched { parent, rows } => {
+                for r in &rows {
+                    let path = vfs_join(&parent, &r.name);
+                    if recursive { fs_rm_recursive(console, &path, force) } else { fs_rm(console, &path, force) }
+                }
+            }
+        }
+    }
+}
+
+/// JD12 `cp` with wildcards / multiple sources. With more than one source the destination MUST be
+/// an existing directory (several files can only land INTO a directory). SNAPSHOT-then-copy.
+fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool, force: bool) {
+    let mt = vfs_mount_table();
+    let srcs = expand_sources(console, &mt, "cp", sources);
+    if srcs.is_empty() {
+        return; // every pattern was empty (each already reported "no match")
+    }
+    if srcs.len() > 1 && !vfs_is_dir(&mt, &vfs_path(dst)) {
+        return console.println(&alloc::format!("cp: target {}: not a directory (-ENOTDIR)", dst));
+    }
+    for s in &srcs {
+        if recursive {
+            fs_cp_recursive(console, s, dst, force);
+        } else {
+            fs_cp(console, s, dst, force);
+        }
+    }
+}
+
+/// JD12 `mv` with wildcards / multiple sources. With more than one source the destination MUST be
+/// an existing directory. SNAPSHOT-then-move.
+fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str, force: bool) {
+    let mt = vfs_mount_table();
+    let srcs = expand_sources(console, &mt, "mv", sources);
+    if srcs.is_empty() {
+        return;
+    }
+    if srcs.len() > 1 && !vfs_is_dir(&mt, &vfs_path(dst)) {
+        return console.println(&alloc::format!("mv: target {}: not a directory (-ENOTDIR)", dst));
+    }
+    for s in &srcs {
+        fs_mv(console, s, dst, force);
+    }
+}
+
+
+
+
+
+
+
+
+
 
 /// JD9: true if `path` lies strictly INSIDE `ancestor` — both are canonical absolute 8.3 paths, compared
 /// case-insensitively (short names are stored uppercase). `is_descendant("/DOCS/SUB", "/DOCS") == true`;
@@ -892,145 +1769,7 @@ struct CpStats {
 /// in practice; 32 is far past any real console tree.
 const CP_MAX_DEPTH: u32 = 32;
 
-/// JD9: recursively copy the CONTENTS of the source directory (cluster `src_cluster`, canonical path
-/// `src_canon`) INTO the already-created destination directory (cluster `dst_cluster`, canonical path
-/// `dst_canon`). `.`/`..` are filtered at every level; a child file rides `copy_file_into`, a child
-/// directory is freshly `create_dir`'d and recursed into. `stats` accumulates across the whole tree so the
-/// caller can report an honest partial count if a mid-tree op fails. Returns a fully-formatted error string
-/// (path + errno) on the FIRST failure — the copy stops there, no silent truncation. Every op rides the JD3
-/// BOT pump (bounded, never a hang). The destination subtree is created fresh by the caller's `-EEXIST`
-/// pre-check, so no child name can pre-exist — each `create_dir`/`copy_file_into` writes into empty space.
-fn cp_tree(
-    fs: &FatFs,
-    src_cluster: u32,
-    src_canon: &str,
-    dst_cluster: u32,
-    dst_canon: &str,
-    depth: u32,
-    stats: &mut CpStats,
-) -> Result<(), String> {
-    if depth > CP_MAX_DEPTH {
-        return Err(alloc::format!(
-            "{}: maximum directory depth {} exceeded (-ELOOP)", dst_canon, CP_MAX_DEPTH));
-    }
-    let entries = fs
-        .read_dir(src_cluster)
-        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", src_canon, e))?;
-    for de in &entries {
-        let nm = de.name();
-        if nm == "." || nm == ".." {
-            continue; // skip the self/parent links a subdirectory cluster carries
-        }
-        let child_src = joined(src_canon, nm);
-        let child_dst = joined(dst_canon, nm);
-        if de.is_dir {
-            let (cde, _, _) = fs.create_dir(dst_cluster, nm).map_err(|e| {
-                alloc::format!("{}: {} ({:?})", child_dst, fat_errno(e), e)
-            })?;
-            stats.dirs += 1;
-            cp_tree(fs, de.first_cluster(), &child_src, cde.first_cluster(), &child_dst, depth + 1, stats)?;
-        } else {
-            // The destination subtree is freshly created (empty), so no child name can pre-exist —
-            // pass `force = true` so the JD14 no-clobber guard never trips inside a fresh `cp -r` tree.
-            let bytes = copy_file_into(fs, de, &child_src, dst_cluster, nm, dst_canon, true)?;
-            stats.files += 1;
-            stats.bytes += bytes;
-        }
-    }
-    Ok(())
-}
 
-/// JD9 `cp -r <srcdir> <dstdir>`: recursively copy a directory tree. Composes the read walk (`read_dir`),
-/// directory creation (the FATDIRS `create_dir` seam, via the JD7 idiom), and the JD8 per-file streaming
-/// copy — all `shell.rs`-only, NO fat.rs mutation (call-never-edit). Guards, in order:
-///   * a ROOT source is refused (`-EINVAL`) — the volume root has no leaf name to copy AS, and any
-///     in-volume destination is a descendant of it (the next guard would refuse it anyway);
-///   * a FILE source degrades to a plain file copy (`fs_cp`) — POSIX-friendly, honest;
-///   * the destination path follows the `cp DIR DEST` idiom: an existing directory (or root) receives the
-///     tree AS `DEST/<src-leaf>`; a not-yet-existing DEST becomes the new tree; an existing FILE is
-///     `-ENOTDIR`;
-///   * copying a directory into itself or one of its own descendants is refused (`-EINVAL`,
-///     canonical-path prefix compare) — this is what stops an infinite `cp -r DOCS DOCS/SUB`;
-///   * the top-level target must NOT already exist — `-EEXIST` under the no-clobber default, so `cp -r`
-///     creates a FRESH tree and never silently merges into an existing one. JD15: `cp -rf` opts into
-///     TREE-REPLACE — the existing target (file or whole directory tree) is deleted first
-///     (delete-dst-first, crash-safe-partial per `force_remove_existing`) and the fresh tree is then
-///     built as normal. Because the top-level target is always fresh at build time, every directory
-///     `cp_tree` creates below it is inside freshly-created (so empty) parents — no child can collide.
-/// A mid-tree failure stops and reports the honest partial count (dirs/files/bytes copied so far) plus the
-/// failing path + errno; nothing is rolled back (a partial tree is left on disk, crash-safe per the
-/// FATDIRS/JD6 ordering — the operator can `rmdir`/`rm` it).
-fn fs_cp_recursive(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let Some(fs) = mount_write_volume(console, "cp") else { return };
-    // --- Resolve the SOURCE. Root is refused; a file degrades to the plain file copy. ---
-    let src_norm = normalize_path(&cwd_path(), src);
-    let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
-        Ok(Resolved::Root) => return console.println("cp: -r /: cannot copy the volume root (-EINVAL)"),
-        Ok(Resolved::Entry(de, canon)) => (de, canon),
-        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
-    };
-    if !de_src.is_dir {
-        return fs_cp(console, src, dst, force); // `cp -r FILE DST` == `cp FILE DST` (JD14: -f honoured)
-    }
-    // --- Decide the TARGET directory path (the `cp DIR DEST` idiom). ---
-    let dst_norm = normalize_path(&cwd_path(), dst);
-    let target = match resolve_path(&fs, &dst_norm) {
-        Ok(Resolved::Root) => normalize_path("/", de_src.name()), // into the volume root
-        Ok(Resolved::Entry(ref de, _)) if de.is_dir => normalize_path(&dst_norm, de_src.name()), // into a dir
-        Ok(Resolved::Entry(_, canon)) =>
-            return console.println(&alloc::format!("cp: {}: not a directory (-ENOTDIR)", canon)),
-        Err(_) => dst_norm.clone(), // does not exist yet — DEST itself becomes the new tree
-    };
-    // --- Guard: refuse copying a directory into itself or one of its own descendants. ---
-    if target.eq_ignore_ascii_case(&src_canon) || is_descendant(&target, &src_canon) {
-        return console.println(&alloc::format!(
-            "cp: cannot copy directory {} into itself or its own subtree ({}) (-EINVAL)",
-            src_canon, target));
-    }
-    // --- The top-level target must not already exist (fresh-tree rule → honest -EEXIST). JD15: `-f`
-    //     (`cp -rf`) now opts into TREE-REPLACE — delete whatever exists at the target first
-    //     (delete-dst-first, crash-safe-partial per `force_remove_existing`), then fall through to
-    //     create a FRESH tree. Without `-f` an existing target stays -EEXIST (no-clobber default). ---
-    if let Ok(existing) = resolve_path(&fs, &target) {
-        if !force {
-            return console.println(&alloc::format!(
-                "cp: {}: already exists (-EEXIST); use cp -rf to replace it, or rm -r it first", target));
-        }
-        let de_existing = match existing {
-            Resolved::Entry(de, _) => de,
-            // `target` is never the volume root (it is always a leaf under some parent), so this arm
-            // is unreachable — refuse defensively rather than clobber.
-            Resolved::Root => return console.println("cp: -rf /: refusing to replace the volume root (-EBUSY)"),
-        };
-        let (rp, rl, _rc) = match resolve_write_target(&fs, &target) {
-            Ok(t) => t,
-            Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
-        };
-        if let Err(msg) = force_remove_existing(&fs, &de_existing, rp, &rl, &target) {
-            return console.println(&alloc::format!("cp: -rf: replace failed: {}", msg));
-        }
-    }
-    // --- Create the top-level target directory (its parent must exist), then recurse into it. ---
-    let (tparent, tleaf, tcanon) = match resolve_write_target(&fs, &target) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("cp: {}", msg)),
-    };
-    let top = match fs.create_dir(tparent, &tleaf) {
-        Ok((de, _, _)) => de,
-        Err(e) => return console.println(&alloc::format!(
-            "cp: {}: {} ({:?})", joined(&tcanon, &tleaf), fat_errno(e), e)),
-    };
-    let target_canon = joined(&tcanon, top.name());
-    let mut stats = CpStats { dirs: 1, files: 0, bytes: 0 }; // the top dir counts
-    match cp_tree(&fs, de_src.first_cluster(), &src_canon, top.first_cluster(), &target_canon, 1, &mut stats) {
-        Ok(()) => console.println(&alloc::format!(
-            "copied {}/ -> {}/ ({} dir(s), {} file(s), {} bytes)",
-            src_canon, target_canon, stats.dirs, stats.files, stats.bytes)),
-        Err(msg) => console.println(&alloc::format!(
-            "cp: {} [partial: {} dir(s), {} file(s), {} bytes copied before the error]",
-            msg, stats.dirs, stats.files, stats.bytes)),
-    }
-}
 
 /// JD13: a running tally of a `rm -r` for the summary / partial-failure report (the delete twin of
 /// `CpStats`, no byte count — a delete moves no data).
@@ -1039,288 +1778,9 @@ struct RmStats {
     files: u32,
 }
 
-/// JD13: recursively delete the CONTENTS of the directory (cluster `dir_cluster`, canonical path
-/// `dir_canon`) — child FILES then child DIRECTORIES, depth-first, so a directory is emptied before it
-/// is removed. `.`/`..` are filtered at every level (the JD9 `cp_tree` walk shape, inverted for delete).
-/// A child file is unlinked via `locate_in_dir` + `delete_located` (the `fs_rm` primitives, run QUIET —
-/// no per-file console line, so a whole tree yields ONE summary like `cp -r`); a child directory is
-/// recursed into and then `remove_dir`'d (it now holds only `.`/`..`). `stats` accumulates across the
-/// whole tree so the caller reports an honest partial count if a mid-tree op fails. Returns a
-/// fully-formatted error string (path + errno) on the FIRST failure — the delete stops there, nothing
-/// is rolled back (crash-safe per the U10 `0xE5`-then-free ordering; the operator can re-run `rm -r`).
-///
-/// SNAPSHOT-then-delete (the JD12 glob-safety property, carried into the recursion): `read_dir` captures
-/// the entry list before any mutation, and each child is re-located BY NAME (`0xE5`-marking one sibling
-/// never moves another entry's slot), so deleting as we go never invalidates the walk. Every op rides
-/// the JD3 wall-clock BOT pump (bounded — a stalled transfer is `-EIO`, never a hang on the timerless
-/// kernel core). Depth is capped at `CP_MAX_DEPTH` (honest `-ELOOP`) — the JD9 belt-and-braces backstop
-/// against a malformed self-referential volume (`read_dir`'s own chain-loop guard is the first line).
-fn rm_tree(
-    fs: &FatFs,
-    dir_cluster: u32,
-    dir_canon: &str,
-    depth: u32,
-    stats: &mut RmStats,
-) -> Result<(), String> {
-    if depth > CP_MAX_DEPTH {
-        return Err(alloc::format!(
-            "{}: maximum directory depth {} exceeded (-ELOOP)", dir_canon, CP_MAX_DEPTH));
-    }
-    // SNAPSHOT the directory contents before any deletion (so a delete never invalidates the walk).
-    let entries = fs
-        .read_dir(dir_cluster)
-        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", dir_canon, e))?;
-    for de in &entries {
-        let nm = de.name();
-        if nm == "." || nm == ".." {
-            continue; // skip the self/parent links a subdirectory cluster carries
-        }
-        let child = joined(dir_canon, nm);
-        if de.is_dir {
-            // Empty the child directory first, THEN remove it (it now holds only `.`/`..`).
-            rm_tree(fs, de.first_cluster(), &child, depth + 1, stats)?;
-            fs.remove_dir(dir_cluster, nm)
-                .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
-            stats.dirs += 1;
-        } else {
-            // Unlink the child file BY NAME (re-locate its slot, then delete) — the `fs_rm` primitives.
-            let (fde, dl, doff) = fs
-                .locate_in_dir(dir_cluster, nm)
-                .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
-            fs.delete_located(dl, doff, fde.first_cluster())
-                .map_err(|e| alloc::format!("{}: {} ({:?})", child, fat_errno(e), e))?;
-            stats.files += 1;
-        }
-    }
-    Ok(())
-}
 
-/// JD15 `-f` tree-replace primitive — remove WHATEVER currently occupies a destination so a forced
-/// copy/move can then create a FRESH one. A FILE is unlinked via the `fs_rm` primitives
-/// (`locate_in_dir` + `delete_located`); a DIRECTORY is emptied by the JD13 `rm_tree` and then
-/// `remove_dir`'d (the same call-never-edit composition `rm -r` uses — zero fat.rs mutation). `de` is
-/// the already-resolved destination entry; `parent`/`leaf` locate its slot in the parent directory;
-/// `canon` is its canonical path (for honest error text). Returns Ok when the destination is now
-/// absent, or a formatted `path: reason (errno)` string on the first failure.
-///
-/// ⚠ CRASH-SAFE-PARTIAL (the JD13 honest-count discipline): this deletes the destination BEFORE the
-/// caller's fresh copy/move. A power cut in the delete→recreate window therefore leaves the
-/// destination ABSENT — never a half-overwritten or silently-merged tree. Nothing is rolled back; the
-/// operator re-runs the `cp -rf`/`mv -f` to complete it. `-f` tree-replace trades the plain `-EEXIST`
-/// refusal for this bounded, honest window; no-clobber stays the panel DEFAULT (only `-f` opts in).
-fn force_remove_existing(
-    fs: &FatFs,
-    de: &DirEntry,
-    parent: u32,
-    leaf: &str,
-    canon: &str,
-) -> Result<(), String> {
-    if de.is_dir {
-        // Empty the destination subtree (child files then child dirs, depth-first), then remove the
-        // now-empty directory itself — exactly the `fs_rm_recursive` composition, run QUIET here.
-        let mut stats = RmStats { dirs: 0, files: 0 };
-        rm_tree(fs, de.first_cluster(), canon, 1, &mut stats)?;
-        fs.remove_dir(parent, leaf)
-            .map_err(|e| alloc::format!("{}: {} ({:?})", canon, fat_errno(e), e))?;
-    } else {
-        // A plain FILE destination — re-locate its slot BY NAME (DirEntry carries no slot coords) and
-        // unlink it, the same `fs_rm` primitive pair.
-        let (fde, dl, doff) = fs
-            .locate_in_dir(parent, leaf)
-            .map_err(|e| alloc::format!("{}: {} ({:?})", canon, fat_errno(e), e))?;
-        fs.delete_located(dl, doff, fde.first_cluster())
-            .map_err(|e| alloc::format!("{}: {} ({:?})", canon, fat_errno(e), e))?;
-    }
-    Ok(())
-}
 
-/// JD13 `rm -r <path>` (also `rm -R`): recursively delete a directory tree — files then directories,
-/// depth-first, so every directory is emptied before it is removed. `shell.rs`-only, NO fat.rs mutation:
-/// it composes `read_dir` (the walk), the `fs_rm` file-delete primitives (`locate_in_dir` +
-/// `delete_located`), and the `rmdir` primitive (`remove_dir`) — all call-never-edit. Guards, in order:
-///   * the ROOT is refused (`-EBUSY`) — a recursive delete of the whole volume is a footgun, and the
-///     volume root is never a removable directory (cluster 0 is not freeable). Checked LOCALLY before any
-///     walk, mirroring `fs_rmdir`'s root refusal; also catches `rm -r .` at the root and `rm -r ..` that
-///     pops to it;
-///   * a FILE target degrades to a plain file delete (`fs_rm`) — POSIX-friendly (`rm -r FILE` == `rm FILE`);
-///   * a DIRECTORY target is emptied by `rm_tree`, then the now-empty top directory itself is removed
-///     (counted in the summary).
-/// A mid-tree failure stops and reports the honest partial count (dirs/files removed so far) plus the
-/// failing path + errno; nothing is rolled back (crash-safe per the U10 `0xE5`-then-free ordering — the
-/// operator can re-run `rm -r` to clear the remainder). Recursion is depth-capped (`CP_MAX_DEPTH`,
-/// honest `-ELOOP`).
-///
-/// PRINCIPAL — unchanged. The shell is kernel ASID 0, the PUBLIC principal; `rm -r` consults no U6/K-line
-/// `OWNED_FILES` ACL and composes the same F3-locked `read_dir`/`locate_in_dir`/`delete_located`/
-/// `remove_dir` primitives JD6/JD7/JD9 already exercise and ledger, so it inherits their locking
-/// analysis unchanged (no new fat.rs surface, no new lock, no new namespace interaction).
-fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
-    let Some(fs) = mount_write_volume(console, "rm") else { return };
-    // Refuse the root explicitly, with the honest errno, BEFORE any walk. `normalize_path` folds
-    // `rm -r .` at the root and `rm -r ..` that pops to it into "/". The root refusal stands even
-    // under `-f` — `rm -rf /` is a footgun the panel never honours (cluster 0 is unremovable).
-    let norm = normalize_path(&cwd_path(), arg);
-    if norm == "/" {
-        return console.println("rm: -r /: cannot remove the root directory (-EBUSY)");
-    }
-    // Resolve the target. A FILE degrades to a plain `rm`; a DIRECTORY is the recursive case. Under
-    // `-f`, a missing target is quiet (POSIX `rm -rf NOSUCH`).
-    let (de_src, src_canon) = match resolve_path(&fs, &norm) {
-        Ok(Resolved::Root) =>
-            return console.println("rm: -r /: cannot remove the root directory (-EBUSY)"),
-        Ok(Resolved::Entry(de, canon)) => (de, canon),
-        Err(msg) => { if !force { console.println(&alloc::format!("rm: {}", msg)); } return; }
-    };
-    if !de_src.is_dir {
-        return fs_rm(console, arg, force); // `rm -r FILE` == `rm FILE` (JD14: -f honoured)
-    }
-    // A directory: walk to its parent so the now-empty top directory can be removed after `rm_tree`.
-    let (parent, leaf, parent_canon) = match resolve_write_target(&fs, &norm) {
-        Ok(t) => t,
-        Err(msg) => { if !force { console.println(&alloc::format!("rm: {}", msg)); } return; }
-    };
-    let mut stats = RmStats { dirs: 0, files: 0 };
-    match rm_tree(&fs, de_src.first_cluster(), &src_canon, 1, &mut stats) {
-        Ok(()) => match fs.remove_dir(parent, &leaf) {
-            Ok(_) => {
-                stats.dirs += 1; // the top directory itself
-                console.println(&alloc::format!(
-                    "removed {}/ ({} dir(s), {} file(s))", src_canon, stats.dirs, stats.files));
-            }
-            Err(e) => console.println(&alloc::format!(
-                "rm: {}: {} ({:?}) [partial: {} dir(s), {} file(s) removed before the error]",
-                joined(&parent_canon, &leaf), fat_errno(e), e, stats.dirs, stats.files)),
-        },
-        Err(msg) => console.println(&alloc::format!(
-            "rm: {} [partial: {} dir(s), {} file(s) removed before the error]",
-            msg, stats.dirs, stats.files)),
-    }
-}
 
-/// JD10 `mv <src> <dst>` (aliases `move`/`ren`/`rename`): move OR rename a file or directory by
-/// RELINKING its directory entry — the file's data never moves (O(1), by reference), composing the
-/// FATMOVE `rename_entry`/`move_entry` seam with the JD6 path-resolution idioms (call-never-edit; no
-/// fat.rs mutation of our own). Two dispatches, decided by whether source and destination share a
-/// parent directory:
-///   * SAME parent → `rename_entry` (rewrites the 8.3 name in the existing directory entry in place;
-///     works on files AND directories — an in-place rename leaves `first_cluster` untouched, so a
-///     renamed directory's own `.`/`..` and its children's `..` stay correct: `mv DIR NEWNAME` is
-///     O(1), no `mv -r` needed unlike `cp -r`);
-///   * DIFFERENT parents → `move_entry` (re-publishes the entry over the SAME `first_cluster` in the
-///     new parent, then `0xE5`s the old name WITHOUT freeing the chain — the data moves by reference).
-///     FILES only: a directory across parents needs its `..` rewritten to the new parent (out of the
-///     seam's scope) → honest `-EISDIR` (rename it in place, or `cp -r` + `rm -r`).
-/// The `mv SRC DIR/` idiom lands the entry under DIR as the source's own leaf name; otherwise DST
-/// names the target directly (rename / move-with-new-name). Guards, in order: a DIRECTORY moved onto
-/// itself or into its own subtree is refused (`-EINVAL`, the JD9 `is_descendant` canonical-prefix
-/// compare); the destination must not already exist (no-clobber panel default → `-EEXIST`, mirroring
-/// the FATMOVE seam's own dest-exists refusal shell-side) — EXCEPT a rename to the source's own
-/// canonical name (same parent + same leaf), which the seam treats as a no-op success. JD14: `-f`
-/// (force) opts into overwriting an existing destination — the existing file (JD14) OR directory
-/// TREE (JD15: emptied via `rm_tree` + `remove_dir`) is deleted first (delete-dst-first,
-/// crash-safe-partial), then the entry is relinked into the freed slot. Honest errno
-/// surface: src missing → `-ENOENT`; root as src → `-EBUSY`; dst parent missing → `-ENOENT`; dst
-/// parent is a file → `-ENOTDIR`; dst dir full → `-ENOSPC`; a non-8.3 dst name → `-EINVAL`; a
-/// directory across parents → `-EISDIR`.
-///
-/// ACL NOTE: this shell is kernel ASID 0 = the PUBLIC principal, so a panel `mv` consults no U6/K-line
-/// `OWNED_FILES` ACL and is ACL-neutral by construction (the row re-key for a moved user-owned file is
-/// a future K-line seam, ledgered in the pi4 FATMOVE SECURITY note). CRASH SAFETY is the seam's job:
-/// `move_entry` publishes the destination BEFORE `0xE5`ing the source, so a power-cut mid-move leaves
-/// a benign duplicate (two names, one chain), never a lost chain.
-fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
-    let Some(fs) = mount_write_volume(console, "mv") else { return };
-    // --- Resolve the SOURCE to a concrete entry (file or dir). The volume root has no leaf name to
-    //     move AS, so it is refused. ---
-    let src_norm = normalize_path(&cwd_path(), src);
-    let (de_src, src_canon) = match resolve_path(&fs, &src_norm) {
-        Ok(Resolved::Root) => return console.println("mv: /: cannot move the volume root (-EBUSY)"),
-        Ok(Resolved::Entry(de, canon)) => (de, canon),
-        Err(msg) => return console.println(&alloc::format!("mv: {}", msg)),
-    };
-    // The source's parent directory (first-cluster id; 0 ⇒ root). Since SRC exists, its parent walk
-    // succeeds; the returned leaf is the user-typed spelling — we use the canonical `de_src.name()`.
-    let (src_parent, _src_leaf_typed, _src_parent_canon) = match resolve_write_target(&fs, &src_norm) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("mv: {}", msg)),
-    };
-    let src_leaf = de_src.name(); // the canonical on-disk 8.3 leaf
-    // --- Decide the DESTINATION (the `mv SRC DIR/` idiom): an existing directory (or the root)
-    //     receives the entry under the source's own leaf; anything else names the destination itself. ---
-    let dst_norm = normalize_path(&cwd_path(), dst);
-    let dst_final = match resolve_path(&fs, &dst_norm) {
-        Ok(Resolved::Root) => normalize_path("/", src_leaf), // into the volume root
-        Ok(Resolved::Entry(ref de, _)) if de.is_dir => normalize_path(&dst_norm, src_leaf), // into a dir
-        _ => dst_norm.clone(), // an existing file (→ -EEXIST below) or a new name — validated next
-    };
-    let (dparent, dleaf, dcanon) = match resolve_write_target(&fs, &dst_final) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("mv: {}", msg)),
-    };
-    let dest_disp = joined(&dcanon, &dleaf);
-    // --- Guard: refuse moving a DIRECTORY onto itself or into its own subtree (the JD9 prefix compare;
-    //     also the right message before the seam would otherwise refuse a cross-parent dir move). ---
-    if de_src.is_dir && (dest_disp.eq_ignore_ascii_case(&src_canon) || is_descendant(&dest_disp, &src_canon)) {
-        return console.println(&alloc::format!(
-            "mv: cannot move directory {} into itself or its own subtree ({}) (-EINVAL)",
-            src_canon, dest_disp));
-    }
-    // --- Guard: a DIRECTORY source that would cross parents cannot be moved (its `..` needs rewriting —
-    //     the seam refuses with IsDirectory). Surface that BEFORE any `-f` delete-dst-first below, so
-    //     force never removes the destination for a move that is going to fail anyway. ---
-    if de_src.is_dir && src_parent != dparent {
-        return console.println(&alloc::format!(
-            "mv: {}: cannot move a directory across directories (-EISDIR); rename it in place or use cp -r + rm -r",
-            src_canon));
-    }
-    // --- Dest pre-check (no-clobber). Skip it only when the destination IS the source (same parent +
-    //     same canonical leaf) — a rename to the same name, which `rename_entry` treats as a no-op. ---
-    let same_target = src_parent == dparent && dleaf.eq_ignore_ascii_case(src_leaf);
-    if !same_target {
-        match fs.locate_in_dir(dparent, &dleaf) {
-            Ok((de, dl, doff)) => {
-                // JD14: no-clobber is the default — an existing destination is `-EEXIST` unless `-f`.
-                if !force {
-                    return console.println(&alloc::format!(
-                        "mv: {}: file exists (-EEXIST); use mv -f to overwrite", joined(&dcanon, de.name())));
-                }
-                // `-f`: overwrite the existing destination by removing it first (delete-dst-first),
-                // then the rename/move below re-publishes the entry into the freed slot. JD15: a
-                // DIRECTORY destination is now TREE-REPLACED too (emptied via `rm_tree` + `remove_dir`
-                // by `force_remove_existing`), not just a plain FILE — crash-safe-partial per JD13
-                // (a power cut in the window leaves the destination absent, never merged). The `_ = dl,
-                // doff` slot coords are re-derived inside the helper by name.
-                let _ = (dl, doff);
-                let dest_leaf = de.name();
-                let dest_canon = joined(&dcanon, dest_leaf);
-                if let Err(msg) = force_remove_existing(&fs, &de, dparent, dest_leaf, &dest_canon) {
-                    return console.println(&alloc::format!(
-                        "mv: -f: overwrite (remove existing) failed: {}", msg));
-                }
-            }
-            Err(FatError::NotFound) => {}
-            Err(e) => return console.println(&alloc::format!(
-                "mv: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
-        }
-    }
-    // --- Dispatch by parent: same dir → rename in place (files AND dirs); across dirs → move (files
-    //     only — the seam refuses a directory source with IsDirectory). Both are O(1) entry relinks. ---
-    let (verb, result) = if src_parent == dparent {
-        ("renamed", fs.rename_entry(src_parent, src_leaf, &dleaf))
-    } else {
-        ("moved", fs.move_entry(src_parent, src_leaf, dparent, &dleaf))
-    };
-    match result {
-        Ok((de, _, _)) => console.println(&alloc::format!(
-            "{} {} -> {}", verb, src_canon, joined(&dcanon, de.name()))),
-        // move_entry returns IsDirectory when the SOURCE is a directory crossing parents.
-        Err(FatError::IsDirectory) => console.println(&alloc::format!(
-            "mv: {}: cannot move a directory across directories (-EISDIR); rename it in place or use cp -r + rm -r",
-            src_canon)),
-        Err(e) => console.println(&alloc::format!(
-            "mv: {}: {} ({:?})", dest_disp, fat_errno(e), e)),
-    }
-}
 
 /// JD12: render bytes as printable text for the console — LF is kept as a line break, CR is dropped,
 /// and any other non-printing byte renders as `.`. The single rendering rule shared by `cat`/`head`/
@@ -1335,199 +1795,14 @@ fn render_text(data: &[u8]) -> String {
     }).collect()
 }
 
-/// JD12: the `cat` core — read a resolved FILE entry (bounded to `CAP` bytes so a huge file can't
-/// flood the console) and print it as printable text, noting a byte-bounded short read. Shared by the
-/// single-path `cat <file>` and the wildcard `cat *.EXT` (JD12-M2), so the rendering + truncation note
-/// live in exactly one place. `de` must be a file — a directory surfaces `-EISDIR` from `read_file`.
-fn cat_render(console: &mut Console, fs: &FatFs, de: &DirEntry, canon: &str) {
-    const CAP: usize = 8192;
-    let mut data: Vec<u8> = Vec::new();
-    match fs.read_file(de, &mut data, CAP) {
-        Ok(()) => {
-            for line in render_text(&data).split('\n') {
-                console.println(line);
-            }
-            // Bound the read so a huge file (e.g. kernel.elf) can't flood the console.
-            if (de.size as usize) > data.len() {
-                console.println(&alloc::format!(
-                    "[... {} of {} bytes shown]", data.len(), de.size));
-            }
-        }
-        Err(FatError::IsDirectory) =>
-            console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", canon)),
-        Err(e) => console.println(&alloc::format!("cat: {}: {:?}", canon, e)),
-    }
-}
 
-/// VFS-1 (adoption): `cat` through the mount table — the routed twin of [`cat_render`].
-///
-/// Before this arc `cat` was the loudest hole in the namespace: it bound `mount_program_source()`
-/// directly, so on the Pi `/` meant the SD FAT root while `ls` had already been saying `/` means
-/// native UnaFS, and `cat /usb/FILE` could not work at all — the name resolved as a literal FAT
-/// directory called `usb` and returned `-ENOENT`. Routing it through the seam makes `cat` agree with
-/// `ls`, `run`, `bg` and `vfs` about what a path means, which is the coherence this layer is for.
-///
-/// Same 8 KiB console bound and the same `[... n of m bytes shown]` tail as the FAT renderer, so a
-/// capture cannot tell the two apart except by which volume answered.
-#[cfg(target_arch = "aarch64")]
-fn vfs_cat(console: &mut Console, arg: &str) {
-    use crate::fs::vfs::NodeKind;
-    const CAP: u64 = 8192;
-    let path = vfs_path(arg);
-    let mt = vfs_mount_table();
-    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), &path) {
-        console.println(&alloc::format!("cat: {}: volume {} not mounted (-ENODEV)", path, vol));
-        return;
-    }
-    let st = match mt.stat(&path) {
-        Ok(s) => s,
-        Err(e) => return console.println(&alloc::format!("cat: {}: {}", path, vfs_err(e))),
-    };
-    if matches!(st.kind, NodeKind::Dir) {
-        return console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", path));
-    }
-    let want = core::cmp::min(st.size, CAP);
-    match mt.read(&path, 0, want as usize) {
-        Ok(data) => {
-            for line in render_text(&data).split('\n') {
-                console.println(line);
-            }
-            if st.size > data.len() as u64 {
-                console.println(&alloc::format!(
-                    "[... {} of {} bytes shown]", data.len(), st.size));
-            }
-        }
-        Err(e) => console.println(&alloc::format!("cat: {}: {}", path, vfs_err(e))),
-    }
-}
 
-/// JD12 `head <path> [n]`: print the FIRST `n` lines of a file (default 10). Streams from offset 0 via
-/// the offset-aware `read_at` in bounded windows and STOPS as soon as `n` newlines are seen — so
-/// `head 10` of a huge file reads only the first window(s), never the whole file. A byte ceiling
-/// (`HEAD_MAX`) backstops a file with no (or too few) newlines so an unterminated giant line still
-/// bounds the read and the heap. A directory or the root is `-EISDIR`. Every access rides the JD3
-/// wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang on the timerless kernel core.
-fn fs_head(console: &mut Console, arg: &str, n: u32) {
-    let Some(fs) = mount_read_volume(console, "head") else { return };
-    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
-        Ok(Resolved::Root) => return console.println("head: /: is a directory (-EISDIR)"),
-        Ok(Resolved::Entry(de, canon)) => {
-            if de.is_dir {
-                return console.println(&alloc::format!("head: {}: is a directory (-EISDIR)", canon));
-            }
-            (de, canon)
-        }
-        Err(msg) => return console.println(&alloc::format!("head: {}", msg)),
-    };
-    const WINDOW: usize = 4096;
-    const HEAD_MAX: u32 = 64 * 1024; // ceiling: an unterminated giant line still bounds the read
-    let (fc, size) = (de.first_cluster(), de.size);
-    let (mut off, mut lines) = (0u32, 0u32);
-    let mut cur = String::new(); // the line under construction (rendered, per `render_text`'s rules)
-    let mut buf: Vec<u8> = Vec::new();
-    let mut more = false; // does content remain AFTER the nth line? — drives the truncation note
-    'outer: while off < size && off < HEAD_MAX && lines < n {
-        buf.clear();
-        if let Err(e) = fs.read_at(fc, size, off, &mut buf, WINDOW) {
-            return console.println(&alloc::format!("head: {}: {} ({:?})", canon, fat_errno(e), e));
-        }
-        if buf.is_empty() {
-            break; // chain ended before de.size (malformed) — show what we have, honestly
-        }
-        for (i, &b) in buf.iter().enumerate() {
-            match b {
-                b'\n' => {
-                    console.println(&cur);
-                    cur.clear();
-                    lines += 1;
-                    if lines >= n {
-                        // More remains iff any byte follows this newline — in this window, or the
-                        // file continues past it. (`off` still holds this window's start here.)
-                        more = i + 1 < buf.len() || off + (buf.len() as u32) < size;
-                        break 'outer;
-                    }
-                }
-                b'\r' => {}
-                0x20..=0x7e => cur.push(b as char),
-                _ => cur.push('.'),
-            }
-        }
-        off += buf.len() as u32;
-    }
-    // A final line with no trailing newline (we stopped before `n` full lines): print it.
-    if lines < n && !cur.is_empty() {
-        console.println(&cur);
-        lines += 1;
-    }
-    // Note when more lines exist than shown: content followed the nth line (`more`), or the byte
-    // ceiling cut a still-growing file before we reached `n` lines.
-    if more || (lines < n && off < size) {
-        console.println(&alloc::format!("[... first {} line(s) shown]", lines));
-    }
-}
 
-/// JD12 `tail <path> [n]`: print the LAST `n` lines of a file (default 10). Reads a bounded window at
-/// the END of the file (`TAIL_MAX` bytes ending at EOF) via the offset-aware `read_at`, renders it,
-/// and prints the last `n` lines. If the window began mid-file, its first (cut) line is dropped and a
-/// note records the bound. A directory or the root is `-EISDIR`; an empty file prints nothing. Every
-/// access rides the JD3 wall-clock BOT pump — a stalled transfer is `-EIO`, never a hang.
-fn fs_tail(console: &mut Console, arg: &str, n: u32) {
-    let Some(fs) = mount_read_volume(console, "tail") else { return };
-    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
-        Ok(Resolved::Root) => return console.println("tail: /: is a directory (-EISDIR)"),
-        Ok(Resolved::Entry(de, canon)) => {
-            if de.is_dir {
-                return console.println(&alloc::format!("tail: {}: is a directory (-EISDIR)", canon));
-            }
-            (de, canon)
-        }
-        Err(msg) => return console.println(&alloc::format!("tail: {}", msg)),
-    };
-    const TAIL_MAX: u32 = 64 * 1024; // bounded tail window: only the last TAIL_MAX bytes are scanned
-    let (fc, size) = (de.first_cluster(), de.size);
-    if size == 0 {
-        return; // empty file — tail shows nothing
-    }
-    let start = size.saturating_sub(TAIL_MAX);
-    let mut buf: Vec<u8> = Vec::new();
-    if let Err(e) = fs.read_at(fc, size, start, &mut buf, (size - start) as usize) {
-        return console.println(&alloc::format!("tail: {}: {} ({:?})", canon, fat_errno(e), e));
-    }
-    let text = render_text(&buf);
-    if text.is_empty() {
-        return;
-    }
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    // A file ending in '\n' yields a trailing "" element — it is not a real last line.
-    if text.ends_with('\n') {
-        lines.pop();
-    }
-    // A window that began mid-file usually cuts its first line — but not if it happens to start on a
-    // line boundary. Decide precisely: the first line is a partial iff the byte just before `start`
-    // is not a newline (one extra byte read; only when windowed, so essentially never in practice).
-    let windowed = start > 0;
-    if windowed {
-        let mut probe: Vec<u8> = Vec::new();
-        let cut = fs.read_at(fc, size, start - 1, &mut probe, 1).is_err()
-            || probe.first() != Some(&b'\n');
-        if cut && !lines.is_empty() {
-            lines.remove(0);
-        }
-    }
-    let from = lines.len().saturating_sub(n as usize);
-    if windowed {
-        console.println(&alloc::format!(
-            "[... tail of {} bytes; last {} line(s)]", size, lines.len() - from));
-    }
-    for line in &lines[from..] {
-        console.println(line);
-    }
-}
 
-/// JD17: parse the `setdate` argument pair — `YYYY-MM-DD HH:MM[:SS]`. Strict shapes (dash- and
+/// JD17: parse the `date -s` argument pair — `YYYY-MM-DD HH:MM[:SS]`. Strict shapes (dash- and
 /// colon-separated decimal fields, seconds optional and defaulting to 0); range validation is
 /// `clock::set`'s (`WallTime::is_valid`), so this only has to produce the numbers honestly.
-fn parse_setdate(args: &[&str]) -> Option<crate::clock::WallTime> {
+fn parse_wallclock(args: &[&str]) -> Option<crate::clock::WallTime> {
     if args.len() != 2 {
         return None;
     }
@@ -1554,69 +1829,26 @@ fn parse_setdate(args: &[&str]) -> Option<crate::clock::WallTime> {
     Some(crate::clock::WallTime { year, month, day, hour, min, sec })
 }
 
-/// JD16: format one entry's FAT last-write timestamp as a fixed-width `YYYY-MM-DD HH:MM:SS` field for
-/// the `ls -l` long listing. A zeroed on-disk stamp (a host tool that left it 0, or a kernel-written
-/// entry — the kernel has no RTC to stamp with; see §JD16) is shown honestly as a dashed placeholder of
-/// the same width rather than a bogus 1980 date. Precision is 2 seconds, no timezone (FAT stores local
-/// wall-clock; there is no offset to correct by).
-fn fmt_mtime(de: &DirEntry) -> String {
-    let ts = de.mtime();
-    if ts.is_zero() {
-        // 19 chars, same width as "YYYY-MM-DD HH:MM:SS"
-        return String::from("       -           ");
-    }
-    alloc::format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        ts.year, ts.month, ts.day, ts.hour, ts.min, ts.sec
-    )
-}
 
-/// Print one directory's entries in the `ls` table format, with the file/dir tally. `long` selects the
-/// JD16 `-l` long format (size + FAT last-write timestamp + name), otherwise the classic short table.
-/// PI-SHELL-LS: FAT-only (the x86 storage path); the Pi routes `ls` to unafs via `pi_ls`.
-#[cfg(not(target_arch = "aarch64"))]
-fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
-    let (mut files, mut dirs) = (0u32, 0u32);
-    for de in entries {
-        if de.is_dir {
-            dirs += 1;
-            if long {
-                console.println(&alloc::format!(
-                    "  <DIR>        {}  {}/", fmt_mtime(de), de.name()));
-            } else {
-                console.println(&alloc::format!("  <DIR>         {}", de.name()));
-            }
-        } else {
-            files += 1;
-            if long {
-                console.println(&alloc::format!(
-                    "  {:>10}  {}  {}", de.size, fmt_mtime(de), de.name()));
-            } else {
-                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
-            }
-        }
-    }
-    console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
-}
 
 // ---------------------------------------------------------------------------------------------
-// PI-SHELL-LS — `ls` on the Pi shell lists the NATIVE unafs volume (the SD-card partition), not FAT.
+// THE LISTING SEAM — `ls` lists WHATEVER IS MOUNTED, and knows nothing about filesystems.
 //
-// The shared `ls`/`dir` arm rides the FAT program source (FATVERB: `mount_read_volume`; before that
-// the default-handle `fat::mount`) — the x86 USB-storage backend, or the internal SD card when that is what booted us.
-// The Pi has no FAT
-// volume mounted (its native store is unafs; FAT on the SD card is only the firmware boot partition),
-// so on the board `ls` printed "ls: no FAT filesystem (...)". The unafs volume DOES work — it is the
-// very volume PI-NET-15 serves at `/fs/` (what Safari sees, K3HELLO.TXT et al.) via the same
-// `with_unafs` + `resolve_path`/`read_inode`/`ls` calls used here. So on aarch64 we route `ls` to
-// unafs and it lists exactly what `/fs/` shows. (x86 keeps the FAT path, unchanged.)
+// History, because it is the whole lesson. PI-SHELL-LS pointed the Pi's `ls` at the native unafs
+// volume while x86's stayed on FAT, which fixed the board and entrenched the defect: one verb, two
+// bodies, each naming a filesystem. VFS-1 replaced the aarch64 half's two per-volume collectors with
+// the mount table. VFSROUTE (orin 17) finished it — Peter: *"Should a mounted file system not be
+// listable? Sounds like we'll be adding each filesystem to ls so it lists."* There is now ONE
+// collector, on both arches, and it asks `MountTable::read_dir`; a volume is listable because its
+// backend implements the trait, and a volume mounted tomorrow lists with no edit here.
 // ---------------------------------------------------------------------------------------------
 
 /// VFS-1 (adoption): list `path` **through the mount table** — the ONE collector behind every
 /// `ls` on this arch, replacing the two per-volume collectors (`pi_ls_collect` against unafs and
 /// `pi_usb_ls_collect` against the USB FAT) that the verb used to choose between with a hand-rolled
 /// `/usb` prefix test. The volume is now decided by [`MountTable::resolve`] — the same longest-prefix
-/// rule `run`, `bg` and `vfs` already obey — so `ls /` lists native UnaFS, `ls /fat` the SD boot FAT
+/// rule `run`, `bg` and `mount` already obey — so `ls /` lists native UnaFS, `ls /boot` the SD boot FAT,
+/// `ls /apps` the programs on it
 /// and `ls /usb` the stick, with no verb-side dispatch and no volume the verb has to know about.
 ///
 /// Returns `(is_dir, rows)` sorted by name. A directory yields its entries; a plain file yields its
@@ -1627,13 +1859,12 @@ fn print_dir_listing(console: &mut Console, entries: &[DirEntry], long: bool) {
 ///
 /// Any resolve/mount failure surfaces as the errno-tagged message [`vfs_err`] renders, so the three
 /// volumes report failures in one vocabulary instead of three.
-#[cfg(target_arch = "aarch64")]
 #[allow(clippy::type_complexity)]
 pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::DirEnt>), String> {
     use crate::fs::vfs::{DirEnt, NodeKind};
     let mt = vfs_mount_table();
     // VFS-4: a path naming a reserved volume that is not currently bound reports the VOLUME as
-    // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `vfs`
+    // missing, not a bare -ENOENT off the native root. `ls` shares the guard the mutating `mount`
     // verb has had since VFS-4 rather than re-deriving it.
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
         return Err(alloc::format!("volume {} not mounted (-ENODEV)", vol));
@@ -1651,7 +1882,7 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     let mut rows = mt
         .read_dir(path)
         .map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
-    // Mount points immediately below `path` — `/fat` and `/usb` when listing `/`. Boundary-matched
+    // Mount points immediately below `path` — `/boot` and `/usb` when listing `/`. Boundary-matched
     // the way the resolver matches, and only for prefixes that are actually bound, so an absent
     // stick contributes no row (honest hot-plug, doc §6).
     let base = if path == "/" { "" } else { path };
@@ -1682,7 +1913,6 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
 /// placeholder rather than a fabricated 1980 date. ONE formatter for all three volumes: before this
 /// arc the FAT path had `fat_mtime_field` and the unafs path had a separate `UNAFS_NO_MTIME`
 /// constant, and the verb picked between them by knowing which volume it was on.
-#[cfg(target_arch = "aarch64")]
 fn vfs_mtime_field(ts: Option<&crate::fs::vfs::VfsTime>) -> String {
     match ts {
         None => String::from("       -           "),
@@ -1693,63 +1923,6 @@ fn vfs_mtime_field(ts: Option<&crate::fs::vfs::VfsTime>) -> String {
     }
 }
 
-/// VFS-1 (adoption): the Pi `ls`/`dir` core — now ONE function over the mount table instead of a
-/// `/usb` prefix test choosing between a unafs renderer and a USB-FAT renderer that printed the same
-/// table in two places. Resolves `arg` through the seam ([`vfs_path`], cwd-aware), collects through
-/// [`vfs_ls_collect`], and prints the table shape every volume has always used: size + name, `<DIR>`
-/// for directories, and under `-l` the date column [`vfs_mtime_field`] renders.
-///
-/// Emits the per-invocation `:: ls1: <path>: <names> (N file, M dir) ::` serial witness unchanged —
-/// the verb renders panel-only on the bench, so a headless capture gets the same content (the
-/// PI-UI-3 `ui3_say` idiom). The `-l` mirror keeps that shape and appends the per-entry sizes.
-#[cfg(target_arch = "aarch64")]
-fn pi_ls(console: &mut Console, arg: &str, long: bool) {
-    use crate::fs::vfs::NodeKind;
-    let path = vfs_path(arg);
-    match vfs_ls_collect(&path) {
-        Ok((is_dir, rows)) => {
-            let (mut files, mut dirs) = (0u32, 0u32);
-            for de in &rows {
-                let date = vfs_mtime_field(de.mtime.as_ref());
-                if matches!(de.kind, NodeKind::Dir) {
-                    dirs += 1;
-                    if long {
-                        console.println(&alloc::format!("  <DIR>        {}  {}/", date, de.name));
-                    } else {
-                        console.println(&alloc::format!("  <DIR>         {}", de.name));
-                    }
-                } else {
-                    files += 1;
-                    if long {
-                        console.println(&alloc::format!("  {:>10}  {}  {}", de.size, date, de.name));
-                    } else {
-                        console.println(&alloc::format!("  {:>10}  {}", de.size, de.name));
-                    }
-                }
-            }
-            if is_dir {
-                console.println(&alloc::format!("{} file(s), {} dir(s)", files, dirs));
-            }
-            let names: Vec<&str> = rows.iter().map(|d| d.name.as_str()).collect();
-            if long {
-                let sizes: Vec<String> = rows.iter().map(|d| alloc::format!("{}", d.size)).collect();
-                serial_println!(
-                    ":: ls1: {}: {} ({} file, {} dir) sizes: {} ::",
-                    path, names.join(" "), files, dirs, sizes.join(" ")
-                );
-            } else {
-                serial_println!(
-                    ":: ls1: {}: {} ({} file, {} dir) ::",
-                    path, names.join(" "), files, dirs
-                );
-            }
-        }
-        Err(msg) => {
-            console.println(&alloc::format!("ls: {}", msg));
-            serial_println!(":: ls1: {}: ERR {} ::", path, msg);
-        }
-    }
-}
 
 /// PI-SHELL-LS boot witness (`witness` battery only): exercise the exact `vfs_ls_collect` listing
 /// the shell verb uses, against the native root, and emit the `:: ls1: ... ::` line headlessly — so
@@ -1811,7 +1984,7 @@ fn vfs_ls_say(path: &str) {
 // A single TRAILING glob in a path's LAST component is expanded against the parent directory via the
 // read-only `read_dir` (case-insensitive 8.3 matching, already proven for `cd`/`cat`). Expansion is
 // invoked ONLY inside the fs-verb arms below — the shared arg-split at the top of `dispatch_command`
-// is unchanged, and the NET command region (netinfo/ping/arp/connect/udpsend/get — a sockets-arc
+// is unchanged, and the NET command region (ifconfig/ping/arp/nc/curl — a sockets-arc
 // lane) never sees a glob. A verb loops over the matches (SNAPSHOT-then-act: the match list is
 // captured before any mutation, so a `rm *.TXT` that deletes as it goes never invalidates its own
 // list). A glob with no match is an honest per-pattern "no match" note; a name with no metacharacter
@@ -1853,233 +2026,16 @@ fn glob_match(pat: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-/// The result of expanding ONE path argument. `Literal` = no metacharacter in the leaf — the arg
-/// passed through unchanged (byte-identical to pre-JD12; also covers a glob confined to a NON-trailing
-/// component, which resolves literally). `Matched` = a trailing-glob leaf resolved against
-/// `parent_canon`'s directory to zero or more entries; an empty `entries` (including a parent that
-/// does not resolve to a directory) is an honest "no match".
-enum Glob {
-    Literal(String),
-    Matched { parent_canon: String, entries: Vec<DirEntry> },
-}
 
-/// Expand a shell path arg for the fs-verb glob (JD12). A metacharacter is honored ONLY in the LAST
-/// path component; a glob in an earlier component is treated literally (its parent resolve fails ⇒ no
-/// match, an honest error at the verb). Case-insensitive; `.`/`..` filtered; matches sorted so a
-/// listing / serial transcript is deterministic.
-fn glob_expand(fs: &FatFs, arg: &str) -> Glob {
-    let norm = normalize_path(&cwd_path(), arg);
-    let comps: Vec<&str> = norm.split('/').filter(|c| !c.is_empty()).collect();
-    let leaf = match comps.last() {
-        Some(l) => *l,
-        None => return Glob::Literal(norm), // arg normalized to "/" — nothing to glob
-    };
-    if !has_glob(leaf) {
-        return Glob::Literal(String::from(arg)); // pass the ORIGINAL typed arg through unchanged
-    }
-    // Resolve the PARENT (everything but the leaf) to a directory cluster + its canonical path.
-    let (parent_cluster, parent_canon) = if comps.len() == 1 {
-        (0u32, String::new()) // the volume root
-    } else {
-        let mut parent_path = String::new();
-        for c in &comps[..comps.len() - 1] {
-            parent_path.push('/');
-            parent_path.push_str(c);
-        }
-        match resolve_path(fs, &parent_path) {
-            Ok(Resolved::Root) => (0u32, String::new()),
-            Ok(Resolved::Entry(de, canon)) if de.is_dir => (de.first_cluster(), canon),
-            _ => return Glob::Matched { parent_canon: parent_path, entries: Vec::new() }, // no dir → no match
-        }
-    };
-    let mut entries: Vec<DirEntry> = match fs.read_dir(parent_cluster) {
-        Ok(es) => es
-            .into_iter()
-            .filter(|de| {
-                let nm = de.name();
-                nm != "." && nm != ".." && glob_match(leaf, nm)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    entries.sort_by(|a, b| a.name().cmp(b.name()));
-    Glob::Matched { parent_canon, entries }
-}
 
-/// Resolve `path` and print it in the `ls` table format (the single-path `ls` core, shared by the
-/// `ls` arm and the wildcard `ls *.EXT` Literal fall-through). A directory lists its entries; a plain
-/// file prints its one table line (the DOS idiom); errors are errno-tagged.
-/// PI-SHELL-LS: FAT-only (x86); the Pi lists unafs via `pi_ls`.
-#[cfg(not(target_arch = "aarch64"))]
-fn ls_resolved(console: &mut Console, fs: &FatFs, path: &str, long: bool) {
-    match resolve_path(fs, path) {
-        Ok(Resolved::Root) => match fs.read_dir(0) {
-            Ok(entries) => print_dir_listing(console, &entries, long),
-            Err(e) => console.println(&alloc::format!("ls: /: read failed ({:?}, -EIO)", e)),
-        },
-        Ok(Resolved::Entry(de, canon)) => {
-            if de.is_dir {
-                match fs.read_dir(de.first_cluster()) {
-                    Ok(entries) => print_dir_listing(console, &entries, long),
-                    Err(e) => console.println(&alloc::format!(
-                        "ls: {}: read failed ({:?}, -EIO)", canon, e)),
-                }
-            } else if long {
-                console.println(&alloc::format!(
-                    "  {:>10}  {}  {}", de.size, fmt_mtime(&de), de.name()));
-            } else {
-                console.println(&alloc::format!("  {:>10}  {}", de.size, de.name()));
-            }
-        }
-        Err(msg) => console.println(&alloc::format!("ls: {}", msg)),
-    }
-}
 
-/// JD4 `ls`/`ls <dir>` (single path): mount + resolve + print. Extracted so the wildcard `ls *.EXT`
-/// can share the exact resolve/print behaviour for a non-trailing-glob fall-through.
-#[cfg(not(target_arch = "aarch64"))]
-fn ls_path(console: &mut Console, arg: &str, long: bool) {
-    if let Some(fs) = mount_read_volume(console, "ls") {
-        ls_resolved(console, &fs, &normalize_path(&cwd_path(), arg), long);
-    }
-}
 
-/// JD12 `ls *.EXT`: list every entry matching a wildcard, one `ls`-table line each (sorted), with the
-/// file/dir tally. A directory match shows as `<DIR>` (its contents are not expanded — that mirrors
-/// how a shell hands matched names to `ls`); no match is an honest "no match".
-#[cfg(not(target_arch = "aarch64"))]
-fn ls_globbed(console: &mut Console, arg: &str, long: bool) {
-    let Some(fs) = mount_read_volume(console, "ls") else { return };
-    match glob_expand(&fs, arg) {
-        Glob::Literal(p) => ls_resolved(console, &fs, &normalize_path(&cwd_path(), &p), long),
-        Glob::Matched { entries, .. } if entries.is_empty() =>
-            console.println(&alloc::format!("ls: {}: no match", arg)),
-        Glob::Matched { entries, .. } => print_dir_listing(console, &entries, long),
-    }
-}
 
-/// JD12 `cat *.EXT`: cat every FILE matching a wildcard (concatenate), in sorted order — reusing
-/// `cat_render` per file so the rendering + truncation note are identical to a single-path `cat`. A
-/// directory match is skipped with the classic `-EISDIR` note; no match is an honest "no match". A
-/// glob confined to a non-trailing component falls through to a literal resolve (honest error).
-fn cat_globbed(console: &mut Console, arg: &str) {
-    let Some(fs) = mount_read_volume(console, "cat") else { return };
-    match glob_expand(&fs, arg) {
-        Glob::Literal(p) => match resolve_path(&fs, &normalize_path(&cwd_path(), &p)) {
-            Ok(Resolved::Root) => console.println("cat: /: is a directory (-EISDIR)"),
-            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
-            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
-        },
-        Glob::Matched { entries, .. } if entries.is_empty() =>
-            console.println(&alloc::format!("cat: {}: no match", arg)),
-        Glob::Matched { parent_canon, entries } => {
-            for de in &entries {
-                let canon = joined(&parent_canon, de.name());
-                if de.is_dir {
-                    console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", canon));
-                } else {
-                    cat_render(console, &fs, de, &canon);
-                }
-            }
-        }
-    }
-}
 
-/// JD12: does `dst` (a shell path arg) resolve to an existing directory (or the root)? A multi-source
-/// `cp`/`mv` requires it — several sources can only land INTO a directory, not onto one target name.
-fn dst_is_dir(fs: &FatFs, dst: &str) -> bool {
-    match resolve_path(fs, &normalize_path(&cwd_path(), dst)) {
-        Ok(Resolved::Root) => true,
-        Ok(Resolved::Entry(de, _)) => de.is_dir,
-        Err(_) => false,
-    }
-}
 
-/// JD12: expand the SOURCE args of a `cp`/`mv` into concrete source paths, printing a per-pattern "no
-/// match" note (tagged with `verb`) for any wildcard that matched nothing. Literal args pass through
-/// unchanged. Returns the flattened, ordered list (SNAPSHOT: taken before any mutation runs).
-fn expand_sources(console: &mut Console, fs: &FatFs, verb: &str, sources: &[&str]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for s in sources {
-        match glob_expand(fs, s) {
-            Glob::Literal(p) => out.push(p),
-            Glob::Matched { entries, .. } if entries.is_empty() =>
-                console.println(&alloc::format!("{}: {}: no match", verb, s)),
-            Glob::Matched { parent_canon, entries } => {
-                for de in &entries {
-                    out.push(joined(&parent_canon, de.name()));
-                }
-            }
-        }
-    }
-    out
-}
 
-/// JD12 `rm` with wildcards: `rm [-r] <path...>` — each arg a file/dir target or a trailing glob.
-/// SNAPSHOT-then-delete (`glob_expand` captures the match list before any delete), so a wildcard
-/// delete never invalidates its own list. A wildcard with no match is an honest per-pattern note;
-/// each concrete target rides the existing per-target handler — `fs_rm` (file-only; a directory is
-/// `-EISDIR`, use `rmdir`) or, when `recursive` (JD13 `rm -r *`), `fs_rm_recursive` (a directory tree,
-/// a file degrades to a plain delete). SNAPSHOT-safety holds through the recursion too: each concrete
-/// match is re-resolved by its canonical path, and a completed `rm -r` never touches a sibling's slot.
-fn rm_globbed(console: &mut Console, args: &[&str], recursive: bool, force: bool) {
-    let Some(fs) = mount_write_volume(console, "rm") else { return };
-    for a in args {
-        match glob_expand(&fs, a) {
-            Glob::Literal(p) =>
-                if recursive { fs_rm_recursive(console, &p, force) } else { fs_rm(console, &p, force) },
-            // JD14: a no-match wildcard is quiet under `-f` (POSIX `rm -f *.none` is silent).
-            Glob::Matched { entries, .. } if entries.is_empty() =>
-                { if !force { console.println(&alloc::format!("rm: {}: no match", a)); } }
-            Glob::Matched { parent_canon, entries } => {
-                for de in &entries {
-                    let path = joined(&parent_canon, de.name());
-                    if recursive { fs_rm_recursive(console, &path, force) } else { fs_rm(console, &path, force) }
-                }
-            }
-        }
-    }
-}
 
-/// JD12 `cp` with wildcards / multiple sources: `cp [-r] <src...> <dst>`. Sources expand (globs +
-/// literals); with more than one source the destination MUST be an existing directory (several files
-/// can only land INTO a directory). Each source rides the existing `fs_cp` / `fs_cp_recursive` (the
-/// `FILE DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-copy.
-fn cp_globbed(console: &mut Console, sources: &[&str], dst: &str, recursive: bool, force: bool) {
-    let Some(fs) = mount_write_volume(console, "cp") else { return };
-    let srcs = expand_sources(console, &fs, "cp", sources);
-    if srcs.is_empty() {
-        return; // every pattern was empty (each already reported "no match")
-    }
-    if srcs.len() > 1 && !dst_is_dir(&fs, dst) {
-        return console.println(&alloc::format!("cp: target {}: not a directory (-ENOTDIR)", dst));
-    }
-    for s in &srcs {
-        if recursive {
-            fs_cp_recursive(console, s, dst, force);
-        } else {
-            fs_cp(console, s, dst, force);
-        }
-    }
-}
 
-/// JD12 `mv` with wildcards / multiple sources: `mv <src...> <dst>`. Sources expand; with more than
-/// one source the destination MUST be an existing directory. Each source rides the existing `fs_mv`
-/// (the `SRC DIR/` idiom lands each under `dst/<leaf>`). SNAPSHOT-then-move — a wildcard move never
-/// invalidates its own list.
-fn mv_globbed(console: &mut Console, sources: &[&str], dst: &str, force: bool) {
-    let Some(fs) = mount_write_volume(console, "mv") else { return };
-    let srcs = expand_sources(console, &fs, "mv", sources);
-    if srcs.is_empty() {
-        return;
-    }
-    if srcs.len() > 1 && !dst_is_dir(&fs, dst) {
-        return console.println(&alloc::format!("mv: target {}: not a directory (-ENOTDIR)", dst));
-    }
-    for s in &srcs {
-        fs_mv(console, s, dst, force);
-    }
-}
 
 /// JD14: split a `cp`/`mv`/`rm` argument list into `(recursive, force, no_clobber, positional paths)`.
 /// A FLAG arg is `-` followed by one or more ASCII letters — bundled short flags, so `-rf` == `-r -f`;
@@ -2120,283 +2076,27 @@ fn split_flags<'a>(args: &[&'a str]) -> (bool, bool, bool, Vec<&'a str>) {
 // so only file sizes contribute real bytes to a `du` tally — a directory's size is the sum of its
 // files, recursively.
 
-/// JD18 running tally for `find`: hits printed, and directories scanned (each `read_dir` level,
-/// the root included) — the honest denominator for the closing summary.
-struct FindStats {
-    matches: u32,
-    dirs: u32,
-}
 
-/// JD18: recursively walk the directory (cluster `dir_cluster`, canonical `dir_canon`), matching each
-/// entry's 8.3 name against `pat` with the JD12 `glob_match` (case-insensitive; a literal pattern is an
-/// exact-name match). A hit prints its full canonical path — a directory with a trailing `/`. `.`/`..`
-/// are skipped; every subdirectory is recursed into (whether or not its own name matched). SNAPSHOT
-/// per level (`read_dir` before any descent — a pure read never mutates, but the idiom stays uniform
-/// with the JD9/JD13 walkers). Depth-capped at `CP_MAX_DEPTH` (honest `-ELOOP`); a read error stops
-/// with a formatted `path: reason (-EIO)` and leaves the already-printed hits standing.
-fn find_walk(
-    console: &mut Console,
-    fs: &FatFs,
-    dir_cluster: u32,
-    dir_canon: &str,
-    pat: &str,
-    depth: u32,
-    stats: &mut FindStats,
-) -> Result<(), String> {
-    if depth > CP_MAX_DEPTH {
-        return Err(alloc::format!(
-            "{}: maximum directory depth {} exceeded (-ELOOP)", dir_canon, CP_MAX_DEPTH));
-    }
-    stats.dirs += 1; // this directory level is being scanned
-    let entries = fs
-        .read_dir(dir_cluster)
-        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", dir_canon, e))?;
-    for de in &entries {
-        let nm = de.name();
-        if nm == "." || nm == ".." {
-            continue;
-        }
-        let child = joined(dir_canon, nm);
-        if glob_match(pat, nm) {
-            stats.matches += 1;
-            if de.is_dir {
-                console.println(&alloc::format!("{}/", child));
-            } else {
-                console.println(&child);
-            }
-        }
-        if de.is_dir {
-            find_walk(console, fs, de.first_cluster(), &child, pat, depth + 1, stats)?;
-        }
-    }
-    Ok(())
-}
 
-/// JD18 `find <root> <pattern>`: recursively search the tree under `<root>` (a directory path;
-/// default `.` when only a pattern is given) for entries whose 8.3 name matches `<pattern>` (the JD12
-/// glob engine — `*`/`?`, case-insensitive; a literal is an exact match). Prints each hit as its full
-/// canonical path, then an honest `N match(es), M dir(s) scanned` tally. A missing root is `-ENOENT`;
-/// a FILE root degrades to a single self-match test (the POSIX shape — `find` a file tests that file);
-/// a mid-walk I/O error reports the path + errno with the partial hits/count already shown.
-fn fs_find(console: &mut Console, root_arg: &str, pat: &str) {
-    let Some(fs) = mount_read_volume(console, "find") else { return };
-    let norm = normalize_path(&cwd_path(), root_arg);
-    let mut stats = FindStats { matches: 0, dirs: 0 };
-    match resolve_path(&fs, &norm) {
-        Ok(Resolved::Root) => {
-            if let Err(msg) = find_walk(console, &fs, 0, "", pat, 1, &mut stats) {
-                console.println(&alloc::format!("find: {}", msg));
-            }
-            console.println(&alloc::format!(
-                "{} match(es), {} dir(s) scanned", stats.matches, stats.dirs));
-        }
-        Ok(Resolved::Entry(de, canon)) => {
-            if de.is_dir {
-                if let Err(msg) = find_walk(console, &fs, de.first_cluster(), &canon, pat, 1, &mut stats) {
-                    console.println(&alloc::format!("find: {}", msg));
-                }
-                console.println(&alloc::format!(
-                    "{} match(es), {} dir(s) scanned", stats.matches, stats.dirs));
-            } else {
-                // A file root: the POSIX self-match test — the root itself is the only candidate.
-                if glob_match(pat, de.name()) {
-                    console.println(&canon);
-                    stats.matches += 1;
-                }
-                console.println(&alloc::format!(
-                    "{} match(es), 0 dir(s) scanned", stats.matches));
-            }
-        }
-        Err(msg) => console.println(&alloc::format!("find: {}", msg)),
-    }
-}
 
-/// JD18 running tally for `du`: files and directories counted across the whole subtree.
-struct DuStats {
-    files: u32,
-    dirs: u32,
-}
 
-/// JD18: total bytes of the subtree rooted at (cluster `dir_cluster`, canonical `dir_canon`) — the
-/// sum of every descendant FILE's size (FAT directory entries report size 0, so directories add no
-/// bytes of their own). Accumulates file/dir counts into `stats`. `.`/`..` filtered; depth-capped at
-/// `CP_MAX_DEPTH` (honest `-ELOOP`); a read error stops with a formatted `path: reason (-EIO)`.
-fn du_subtree(
-    fs: &FatFs,
-    dir_cluster: u32,
-    dir_canon: &str,
-    depth: u32,
-    stats: &mut DuStats,
-) -> Result<u64, String> {
-    if depth > CP_MAX_DEPTH {
-        return Err(alloc::format!(
-            "{}: maximum directory depth {} exceeded (-ELOOP)", dir_canon, CP_MAX_DEPTH));
-    }
-    let entries = fs
-        .read_dir(dir_cluster)
-        .map_err(|e| alloc::format!("{}: read failed ({:?}, -EIO)", dir_canon, e))?;
-    let mut total: u64 = 0;
-    for de in &entries {
-        let nm = de.name();
-        if nm == "." || nm == ".." {
-            continue;
-        }
-        if de.is_dir {
-            stats.dirs += 1;
-            total += du_subtree(fs, de.first_cluster(), &joined(dir_canon, nm), depth + 1, stats)?;
-        } else {
-            stats.files += 1;
-            total += de.size as u64;
-        }
-    }
-    Ok(total)
-}
 
-/// JD18 `du <dir>`: for each DIRECT child of `<dir>` print its total bytes (a file = its own size, a
-/// directory = the recursive sum of its subtree), then a `total: N byte(s) in M file(s), K dir(s)`
-/// line. `du FILE` is that file's single line. FAT directory entries themselves report size 0 — only
-/// file bytes are real. A missing path is `-ENOENT`; a mid-walk read error reports the path + errno
-/// with the partial per-child lines and a total of what was tallied (honest partial).
-fn fs_du(console: &mut Console, arg: &str) {
-    let Some(fs) = mount_read_volume(console, "du") else { return };
-    let norm = normalize_path(&cwd_path(), arg);
-    let (cluster, canon) = match resolve_path(&fs, &norm) {
-        Ok(Resolved::Root) => (0u32, String::new()),
-        Ok(Resolved::Entry(de, canon)) => {
-            if de.is_dir {
-                (de.first_cluster(), canon)
-            } else {
-                // A plain file: its one line, then a total of one file.
-                console.println(&alloc::format!("  {:>10}  {}", de.size, canon));
-                return console.println(&alloc::format!(
-                    "total: {} byte(s) in 1 file(s), 0 dir(s)", de.size));
-            }
-        }
-        Err(msg) => return console.println(&alloc::format!("du: {}", msg)),
-    };
-    let entries = match fs.read_dir(cluster) {
-        Ok(es) => es,
-        Err(e) => return console.println(&alloc::format!(
-            "du: {}: read failed ({:?}, -EIO)", if canon.is_empty() { "/" } else { &canon }, e)),
-    };
-    let mut stats = DuStats { files: 0, dirs: 0 };
-    let mut grand: u64 = 0;
-    for de in &entries {
-        let nm = de.name();
-        if nm == "." || nm == ".." {
-            continue;
-        }
-        let child = joined(&canon, nm);
-        if de.is_dir {
-            stats.dirs += 1;
-            match du_subtree(&fs, de.first_cluster(), &child, 1, &mut stats) {
-                Ok(sz) => {
-                    grand += sz;
-                    console.println(&alloc::format!("  {:>10}  {}/", sz, child));
-                }
-                Err(msg) => {
-                    console.println(&alloc::format!("du: {}", msg));
-                    break; // stop the walk; the total below is honest for what was scanned
-                }
-            }
-        } else {
-            stats.files += 1;
-            grand += de.size as u64;
-            console.println(&alloc::format!("  {:>10}  {}", de.size, child));
-        }
-    }
-    console.println(&alloc::format!(
-        "total: {} byte(s) in {} file(s), {} dir(s)", grand, stats.files, stats.dirs));
-}
 
 // ---------------------------------------------------------------------------------------------
-// JD19 — read-only forensic verbs: `stat` (one entry's full on-disk detail) and `xd` (bounded
+// JD19 — read-only forensic verbs: `stat` (one entry's full on-disk detail) and `hexdump`
+// (bounded
 // hexdump). Both are `shell.rs`-only, ride the existing public fat.rs API call-never-edit, and never
 // mutate: `stat` composes resolve_path/locate_in_dir plus one raw `block::read_block` of the on-disk
-// directory sector for the true attr byte (the parsed DirEntry keeps only `is_dir`); `xd` streams a
+// directory sector for the true attr byte (the parsed DirEntry keeps only `is_dir`); `hexdump` streams a
 // bounded window through the offset-aware `read_at`. Neither is glob-wired (single path) — a
 // metacharacter resolves literally, an honest `-ENOENT`, the same as a mid-path glob today.
 
-/// JD19: decode a FAT attribute byte into its flag names, space-joined (RO/HIDDEN/SYS/DIR/ARCHIVE),
-/// or `-` when none are set. Bits per the FAT short-entry spec: 0x01 read-only, 0x02 hidden, 0x04
-/// system, 0x10 directory, 0x20 archive (0x08 volume-label / 0x0F long-file-name components never
-/// reach a parsed entry — `classify_dir_slot` skips them).
-fn decode_attr(a: u8) -> String {
-    let mut s = String::new();
-    for (bit, name) in [
-        (0x01u8, "RO"),
-        (0x02, "HIDDEN"),
-        (0x04, "SYS"),
-        (0x10, "DIR"),
-        (0x20, "ARCHIVE"),
-    ] {
-        if a & bit != 0 {
-            if !s.is_empty() {
-                s.push(' ');
-            }
-            s.push_str(name);
-        }
-    }
-    if s.is_empty() {
-        s.push('-');
-    }
-    s
-}
 
-/// JD19 `stat <path>`: one entry's full on-disk detail — the forensic view. Prints the canonical
-/// absolute path, kind (file/dir), size in bytes, the raw attr byte (hex + decoded flags), first
-/// cluster (hex; `0x0` honest for a 0-length file), the FAT last-write stamp (dash when zeroed, via
-/// `fmt_mtime`), and the on-disk location (directory-entry LBA + 32-byte slot offset). `stat /`
-/// reports the root honestly — it is a directory with NO directory entry of its own. Missing path is
-/// `-ENOENT`. Read-only; no glob (a metacharacter resolves literally → `-ENOENT`).
-fn fs_stat(console: &mut Console, arg: &str) {
-    let Some(fs) = mount_read_volume(console, "stat") else { return };
-    // The volume root has no directory entry of its own — report it honestly, no slot.
-    if normalize_path(&cwd_path(), arg) == "/" {
-        console.println("  path:  /");
-        console.println("  kind:  dir");
-        console.println("  size:  0 byte(s)");
-        console.println("  entry: root has no directory entry");
-        return;
-    }
-    // Walk to the parent, then locate the leaf's on-disk slot (for the attr byte + forensic LBA/offset).
-    let (parent, leaf, parent_canon) = match resolve_write_target(&fs, arg) {
-        Ok(t) => t,
-        Err(msg) => return console.println(&alloc::format!("stat: {}", msg)),
-    };
-    let (de, dir_lba, dir_off) = match fs.locate_in_dir(parent, &leaf) {
-        Ok(t) => t,
-        Err(FatError::NotFound) => return console.println(&alloc::format!(
-            "stat: {}: not found (-ENOENT)", joined(&parent_canon, &leaf))),
-        Err(e) => return console.println(&alloc::format!(
-            "stat: {}: {} ({:?})", joined(&parent_canon, &leaf), fat_errno(e), e)),
-    };
-    let canon = joined(&parent_canon, de.name());
-    // The raw attr byte lives at slot offset +11; the parsed DirEntry keeps only `is_dir`, so read the
-    // on-disk directory sector for the true byte via the same raw block path the `read` verb uses.
-    let attr = {
-        let mut buf = [0u8; 512];
-        match crate::drivers::block::read_block(dir_lba, &mut buf) {
-            Ok(_) if dir_off + 12 <= buf.len() => Some(buf[dir_off + 11]),
-            _ => None,
-        }
-    };
-    console.println(&alloc::format!("  path:  {}", canon));
-    console.println(&alloc::format!("  kind:  {}", if de.is_dir { "dir" } else { "file" }));
-    console.println(&alloc::format!("  size:  {} byte(s)", de.size));
-    match attr {
-        Some(a) => console.println(&alloc::format!("  attr:  0x{:02x}  [{}]", a, decode_attr(a))),
-        None => console.println("  attr:  (directory sector unreadable, -EIO)"),
-    }
-    console.println(&alloc::format!("  clus:  0x{:x}", de.first_cluster()));
-    // fmt_mtime pads a zeroed stamp to a dash within a 19-char field; trim to a bare `-` here.
-    console.println(&alloc::format!("  mtime: {}", fmt_mtime(&de).trim()));
-    console.println(&alloc::format!("  entry: LBA {} slot +{}", dir_lba, dir_off));
-}
 
 /// JD19: hexdump `data` with each row labelled by its ABSOLUTE file offset (`base` + row start), in
 /// the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout (non-printables render as `.`). Distinct
-/// from the `read`-verb `hexdump` (which labels rows from 0 and dumps a fixed 128 bytes): `xd` needs
+/// from the `dd`-verb `hexdump` (which labels rows from 0 and dumps a fixed 128 bytes): the file
+/// dump needs
 /// the true file offset and a variable length, and pads a short final row so the ASCII gutter aligns.
 fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
     for (i, chunk) in data.chunks(16).enumerate() {
@@ -2417,42 +2117,6 @@ fn xd_rows(console: &mut Console, base: usize, data: &[u8]) {
     }
 }
 
-/// JD19 `xd <path> [off] [len]`: bounded hexdump of a file's bytes via the offset-aware `read_at`.
-/// Default off=0, len=256; `len` is hard-capped at `XD_MAX` (4096). Rows carry the absolute file
-/// offset. An `off` at or past EOF is an honest empty note; a directory target is `-EISDIR`; the root
-/// is `-EISDIR`. When more bytes remain past the dumped window an honest `[... n more byte(s)]` tail
-/// note is printed. off/len are parsed decimal or `0x`-hex by the caller.
-fn fs_xd(console: &mut Console, arg: &str, off: u32, len: usize) {
-    const XD_MAX: usize = 4096;
-    let Some(fs) = mount_read_volume(console, "xd") else { return };
-    let (de, canon) = match resolve_path(&fs, &normalize_path(&cwd_path(), arg)) {
-        Ok(Resolved::Root) => return console.println("xd: /: is a directory (-EISDIR)"),
-        Ok(Resolved::Entry(de, canon)) => (de, canon),
-        Err(msg) => return console.println(&alloc::format!("xd: {}", msg)),
-    };
-    if de.is_dir {
-        return console.println(&alloc::format!("xd: {}: is a directory (-EISDIR)", canon));
-    }
-    let want = core::cmp::min(len, XD_MAX);
-    let mut data: Vec<u8> = Vec::new();
-    if let Err(e) = fs.read_at(de.first_cluster(), de.size, off, &mut data, want) {
-        return console.println(&alloc::format!("xd: {}: {} ({:?})", canon, fat_errno(e), e));
-    }
-    if data.is_empty() {
-        if off >= de.size {
-            return console.println(&alloc::format!(
-                "xd: {}: offset {} at/past EOF ({} byte(s)) — nothing to dump", canon, off, de.size));
-        }
-        return console.println(&alloc::format!("xd: {}: 0 byte(s) read", canon));
-    }
-    xd_rows(console, off as usize, &data);
-    // Honest tail note whenever the file holds more bytes past the dumped window (a cap hit, a short
-    // `len`, or both). `off + data.len()` never overflows the file: read_at delivered within `size`.
-    let shown_end = off as usize + data.len();
-    if (de.size as usize) > shown_end {
-        console.println(&alloc::format!("[... {} more byte(s)]", de.size as usize - shown_end));
-    }
-}
 
 pub struct History {
     entries: Vec<String>,
@@ -2496,7 +2160,7 @@ fn midden_facts() -> midden_core::Facts {
     // storm cap to name, and 0 is the honest stand-in because `proc_verbs` is false beside it.
     #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
     let (proc_verbs, proc_rows) = (true, crate::arch::syscall::proc_table_rows());
-    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+    #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
     let (proc_verbs, proc_rows) = (false, 0usize);
     midden_core::Facts {
         aarch64: cfg!(target_arch = "aarch64"),
@@ -2517,6 +2181,43 @@ fn midden_facts() -> midden_core::Facts {
         // probes the volume and never returns `Plan::Exec`.
         exec: proc_verbs,
     }
+}
+
+
+
+/// VFSROUTE (orin 17): does `path` name a plain FILE on the exec probe's OWN FAT mount?
+///
+/// **The one FAT-direct walk left in this file, and it is not a verb.** Every file verb goes through
+/// the mount table now; this predicate exists solely for [`FatVolume::is_file`], the x86 exec probe,
+/// which must bind `mount_program_source` ITSELF and stamp `EXEC_BIND` from that binding.
+/// `fatverb_storage_witness` compares that stamp with the one a real read verb leaves, and the leg's
+/// whole value is that the two are INDEPENDENT producers — route the probe through
+/// `vfs_mount_table()` as well and the comparison becomes an expression compared with itself, which
+/// is the defect FATVERB's own note records the first cut of that witness making.
+///
+/// Case-insensitive 8.3 matching, component by component, exactly as the resolver it replaces did;
+/// it returns a bool because a bool is the entire question `Volume::is_file` asks.
+#[cfg(target_arch = "x86_64")]
+fn fat_path_is_file(fs: &FatFs, path: &str) -> bool {
+    let mut cluster = 0u32; // 0 = the root (read_dir's convention)
+    let mut cur: Option<DirEntry> = None;
+    for comp in path.split('/').filter(|c| !c.is_empty()) {
+        if let Some(de) = &cur {
+            if !de.is_dir {
+                return false; // a component below a plain file is not a path
+            }
+            cluster = de.first_cluster();
+        }
+        let entries = match fs.read_dir(cluster) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        match entries.iter().find(|de| de.name().eq_ignore_ascii_case(comp)) {
+            Some(de) => cur = Some(*de),
+            None => return false,
+        }
+    }
+    matches!(cur, Some(de) if !de.is_dir) // the volume root is not a file
 }
 
 /// The core's one filesystem question, answered over the shell's real volume.
@@ -2566,10 +2267,21 @@ impl midden_core::Volume for FatVolume {
                 return false;
             }
         };
-        matches!(
-            resolve_path(&fs, &normalize_path(&cwd_path(), name)),
-            Ok(Resolved::Entry(de, _)) if !de.is_dir
-        )
+        // LAYOUT (orin 18): TWO probes, the cwd then the program directory — the aarch64 order
+        // ([`exec_resolve`]), transposed. It is written volume-relative rather than through the
+        // namespace because this probe must keep binding `mount_program_source()` and STAMPING
+        // [`EXEC_BIND`] (the FATVERB witness reads that stamp); x86's `/` IS the volume root, so
+        // `/APPS/VUG.ELF` on the volume and `/apps/VUG.ELF` in the namespace are one file.
+        let from_cwd = normalize_path(&cwd_path(), name);
+        if fat_path_is_file(&fs, &from_cwd) {
+            return true;
+        }
+        if name.starts_with('/') {
+            return false; // an absolute token means what it says; the second probe is for bare names
+        }
+        let from_apps = normalize_path(
+            &alloc::format!("/{}", crate::fs::fat::APPS_DIR), name);
+        from_apps != from_cwd && fat_path_is_file(&fs, &from_apps)
     }
     /// BARENAME (PARITY §6.6a): the aarch64 twin — the SAME question, asked of the namespace this
     /// arch actually has.
@@ -2577,7 +2289,7 @@ impl midden_core::Volume for FatVolume {
     /// aarch64 is not x86 with a different mnemonic set here: x86 has no VFS, so its whole path
     /// universe IS the program-source FAT and "resolve from the cwd" already means "resolve on the
     /// volume executables live on". On the Pi those are two different statements — `/` is native
-    /// UnaFS and the executables are on `/fat` — so the faithful port is not the x86 code with the
+    /// UnaFS and the executables are on `/apps` — so the faithful port is not the x86 code with the
     /// mount swapped, it is [`exec_resolve`]: the cwd first (so `ls`/`cat`/`run` and a bare name
     /// agree about what a name means, VFS-1's whole point), then the program-source root. See
     /// `exec_resolve` for the order and why it is the same order.
@@ -2610,6 +2322,527 @@ fn render_message(console: &mut Console, msg: &midden_core::Message) {
         console.println(line);
     }
 }
+
+// ==================== BASICS — the everyday verbs, back in the table ==============================
+//
+// Peter, 2026-09-06: *"what about the basic shell commands that were removed"* / *"some of the
+// commands were 1 off tests we need basic commands back"*.
+//
+// WHAT WAS ACTUALLY REMOVED, precisely, because it changes what the fix is. `c7b12e23` ("shell: one
+// interpreter, and it is midden's") did NOT delete `help`, `echo`, `ver` or `gneiss` — it MOVED them
+// out of this file's `match` and into `midden_core`, where the command table lives, and they have
+// answered from there ever since. What the shell has never had is the other half of a usable
+// prompt: no way to search a file, count it, see how full the volume is, ask what a word means, see
+// what was typed, or wait. Those are added here, and two verbs that WERE lost are restored: `umv`
+// and `urmattr` shipped `#[cfg(aarch64)]` match arms that no table entry ever pointed at, so the
+// operator got "Unknown command" about commands this kernel carries (MIDDEN_CONVERGENCE's
+// one-for-one contract, violated in the direction nobody was checking).
+//
+// WHERE EACH VERB LIVES, per MIDDEN_CONVERGENCE §1(c). A verb belongs in `midden_core` when the
+// core can answer it in full — `exit` is there, because the honest answer is a sentence about what
+// the shell IS. Everything added below needs the volume, the block layer, the timebase or the
+// shell's own state, so each is `Plan::Host`: midden owns the parse and the wording, this file
+// performs the call. That is the same split `ls`/`cat`/`head` already sit on.
+//
+// ARCH-NEUTRAL BY DEFAULT (LAWS), AND SINCE VFSROUTE THERE IS NO EXCEPTION LEFT. Not one of these
+// helpers carries a `target_arch` gate: they ride the MOUNT TABLE (`vfs_mount_table` — built on both
+// arches now), `crate::arch::ms()` (the arch-neutral timebase both arches publish), and
+// `midden_core` itself. The note that used to stand here claimed `crate::fs::vfs` was aarch64-only
+// and gated `df`'s namespace line on that; it was wrong about the module (`fs/mod.rs` declares
+// `pub mod vfs;` unconditionally — only `NativeBackend` is aarch64) and the gate is gone.
+
+/// BASICS: what the shell was told, oldest first. Bounded, drop-oldest, heap-only.
+///
+/// Recorded at the TOP of `dispatch_command`, before the line is planned, so the record is of what
+/// the operator typed and not of what the shell made of it — a typo is history too, which is the
+/// whole reason anyone reads a history. Empty lines are not recorded (they are not commands).
+///
+/// This is deliberately NOT `Console::history`, which is the SCROLLBACK (every output line the view
+/// is holding). Two different questions — "what did I type" vs "what is on screen" — and conflating
+/// them is why `history` could not simply read the console.
+static CMD_HISTORY: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// BASICS: how many command lines `history` retains. Small and fixed: this is a bench console, the
+/// store is heap, and a run-away paste must not be able to grow it without bound.
+const HISTORY_CAP: usize = 64;
+
+/// BASICS: the shell's variable store — `set` writes it, `env` reads it.
+///
+/// **Inert on purpose, and said so in `help`.** Nothing expands `$NAME` yet: expansion is a change
+/// to `midden_core`'s parser (M2), not to this file, and a store that silently did nothing while
+/// the help text implied substitution would be worse than no store. What it is good for today is
+/// what an operator at a bench actually uses it for — writing down a path, an address or a pid
+/// between commands, on a machine with no notepad.
+static ENV_VARS: spin::Mutex<Vec<(String, String)>> = spin::Mutex::new(Vec::new());
+
+/// BASICS: caps on the variable store. A shell variable is a convenience, not a database.
+const ENV_MAX_VARS: usize = 32;
+const ENV_MAX_NAME: usize = 32;
+const ENV_MAX_VALUE: usize = 256;
+
+/// BASICS: record one typed line in [`CMD_HISTORY`]. Called from `dispatch_command`'s first act.
+fn history_record(line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let mut h = CMD_HISTORY.lock();
+    if h.len() >= HISTORY_CAP {
+        h.remove(0);
+    }
+    h.push(String::from(line));
+}
+
+/// BASICS `history [n] [-c]`: the last `n` command lines (default: all retained), numbered from the
+/// oldest retained line so the numbers are stable while the ring is not full.
+///
+/// `history -c` clears the store and says how many it dropped — a count, not silence, because a
+/// clear that prints nothing is indistinguishable from a clear that did not run.
+fn history_cmd(console: &mut Console, args: &[&str]) {
+    if args.first() == Some(&"-c") {
+        let mut h = CMD_HISTORY.lock();
+        let n = h.len();
+        h.clear();
+        drop(h);
+        return console.println(&alloc::format!("history: cleared {} line(s)", n));
+    }
+    let want = args.first().and_then(|s| s.parse::<usize>().ok());
+    let h = CMD_HISTORY.lock().clone();
+    if h.is_empty() {
+        return console.println("history: nothing recorded yet");
+    }
+    let from = match want {
+        Some(n) => h.len().saturating_sub(n),
+        None => 0,
+    };
+    for (i, line) in h.iter().enumerate().skip(from) {
+        console.println(&alloc::format!("{:>5}  {}", i + 1, line));
+    }
+}
+
+/// BASICS `env`: the build's own facts first, then the shell variables.
+///
+/// The facts are READ LIVE at every call (cwd, uptime, the process cap) rather than snapshotted at
+/// boot, so `env` after a `cd` says where you are. The version string is not re-typed here — it is
+/// asked of `midden_core`, the one place that owns the shell's identity, so `ver` and `env` can
+/// never drift into printing two different versions of the same kernel.
+fn env_report(console: &mut Console) {
+    let facts = midden_facts();
+    let empty: &[&str] = &[];
+    let mut vol = midden_core::NameList(empty);
+    let ver = match midden_core::plan("ver", &facts, &mut vol) {
+        midden_core::Plan::Say(m) => String::from(m.text()),
+        _ => String::from("(unavailable)"),
+    };
+    let arch = if facts.aarch64 {
+        "aarch64"
+    } else if facts.x86 {
+        "x86_64"
+    } else {
+        "unknown"
+    };
+    console.println(&alloc::format!("ARCH={}", arch));
+    console.println(&alloc::format!("VER={}", ver));
+    console.println("SHELL=midden_core");
+    console.println(&alloc::format!("CWD={}", cwd_path()));
+    console.println(&alloc::format!("UPTIME_MS={}", crate::arch::ms()));
+    console.println(&alloc::format!("EXEC={}", if facts.exec { "on" } else { "off" }));
+    console.println(&alloc::format!(
+        "PROCS={}",
+        if facts.proc_verbs { facts.proc_rows } else { 0 }
+    ));
+    console.println(&alloc::format!("V3D={}", if facts.v3d { "on" } else { "off" }));
+    console.println(&alloc::format!("VUGDEMO={}", if facts.vugdemo { "on" } else { "off" }));
+    let vars = ENV_VARS.lock().clone();
+    if vars.is_empty() {
+        console.println("(no shell variables set — `set NAME VALUE` to add one)");
+        return;
+    }
+    for (k, v) in &vars {
+        console.println(&alloc::format!("{}={}", k, v));
+    }
+}
+
+/// BASICS `set [NAME [VALUE...]]` / `set -u NAME`: read, write and drop shell variables.
+///
+/// Shapes, all of them printing what happened rather than succeeding in silence:
+/// * `set` — list the variables (not the build facts; `env` is the one that shows both).
+/// * `set NAME` — print `NAME=value`, or say it is unset.
+/// * `set NAME VALUE...` — set it; the value is the rest of the line, spaces and all.
+/// * `set -u NAME` — remove it.
+///
+/// A name is restricted to ASCII alphanumerics and `_`, which is not fussiness: a name containing
+/// `=` or whitespace could never be read back unambiguously by the `$NAME` expansion M2 will add,
+/// so accepting one now would be writing a value nobody can ever reference.
+fn set_cmd(console: &mut Console, args: &[&str], rest: &str) {
+    if args.is_empty() {
+        let vars = ENV_VARS.lock().clone();
+        if vars.is_empty() {
+            return console.println("set: no shell variables (usage: set NAME VALUE)");
+        }
+        for (k, v) in &vars {
+            console.println(&alloc::format!("{}={}", k, v));
+        }
+        return;
+    }
+    if args[0] == "-u" {
+        let Some(name) = args.get(1) else {
+            return console.println("usage: set -u <NAME>");
+        };
+        let mut vars = ENV_VARS.lock();
+        let before = vars.len();
+        vars.retain(|(k, _)| k != name);
+        let gone = vars.len() != before;
+        drop(vars);
+        return console.println(&if gone {
+            alloc::format!("set: {} removed", name)
+        } else {
+            alloc::format!("set: {}: not set", name)
+        });
+    }
+    let name = args[0];
+    if name.len() > ENV_MAX_NAME
+        || name.is_empty()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return console.println(&alloc::format!(
+            "set: {}: bad name (ASCII letters, digits and _ only, max {})", name, ENV_MAX_NAME));
+    }
+    if args.len() == 1 {
+        let vars = ENV_VARS.lock().clone();
+        return match vars.iter().find(|(k, _)| k == name) {
+            Some((k, v)) => console.println(&alloc::format!("{}={}", k, v)),
+            None => console.println(&alloc::format!("set: {}: not set", name)),
+        };
+    }
+    // The value is the remainder of the line after the name, with its interior spacing preserved —
+    // the same rule `write`/`append` follow, so `set MSG hello  world` stores what was typed.
+    // `rest` arrives from `Plan::Host` already left-trimmed and `name` is its first token, so the
+    // slice below is exactly "everything after the name" and needs no search to find it.
+    let value = rest[core::cmp::min(name.len(), rest.len())..].trim();
+    if value.len() > ENV_MAX_VALUE {
+        return console.println(&alloc::format!(
+            "set: {}: value too long ({} > {} bytes)", name, value.len(), ENV_MAX_VALUE));
+    }
+    let mut vars = ENV_VARS.lock();
+    if let Some(slot) = vars.iter_mut().find(|(k, _)| k == name) {
+        slot.1 = String::from(value);
+    } else {
+        if vars.len() >= ENV_MAX_VARS {
+            drop(vars);
+            return console.println(&alloc::format!(
+                "set: refused — the variable store is full ({} max); `set -u NAME` frees a slot",
+                ENV_MAX_VARS));
+        }
+        vars.push((String::from(name), String::from(value)));
+    }
+    drop(vars);
+    console.println(&alloc::format!("{}={}", name, value));
+}
+
+/// BASICS `which <word>`: what does this word mean to the shell, right now, on THIS build?
+///
+/// It answers through `midden_core` rather than by looking at this file's `match`, and that is the
+/// point: verb-ness is per-build (`vug` is a verb on a `vugdemo` Pi and a program name everywhere
+/// else), so any second opinion assembled here would eventually disagree with the interpreter and
+/// send an operator hunting for a fault that is only in the help. Same table, same
+/// `Avail` filter, same resolver, same precedence — `which` cannot lie unless `plan` lies too.
+fn which_report(console: &mut Console, word: &str) {
+    let facts = midden_facts();
+    let canon = midden_core::canon_verb(word);
+    if midden_core::CORE_VERBS.contains(&canon.as_str()) {
+        return console.println(&alloc::format!("{}: shell built-in (answered by midden_core)", canon));
+    }
+    if midden_core::is_verb(&canon, &facts) {
+        return console.println(&alloc::format!("{}: kernel verb (serviced by the shell)", canon));
+    }
+    if facts.exec {
+        let mut vol = FatVolume;
+        if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
+            return console.println(&alloc::format!("{}: program {}", word, name));
+        }
+        return console.println(&alloc::format!("{}: not found (no verb, no program)", word));
+    }
+    console.println(&alloc::format!(
+        "{}: not a verb on this build (and this build cannot launch programs)", word));
+}
+
+/// BASICS `sleep <ms>`: wait, bounded twice over.
+///
+/// Two independent bounds, because either one alone is a hang. The DEADLINE (`arch::ms()`) is the
+/// one that normally ends the wait. The SPIN CAP is what ends it when the deadline never arrives:
+/// on x86 `ms()` is the local-APIC tick count, so a caller reached with interrupts masked would
+/// watch a frozen clock forever. When the cap is what fired, the verb SAYS SO rather than printing
+/// a plausible "slept 500 ms" — a sleep that silently did not sleep is the kind of thing a later
+/// timing bug gets blamed on for a week.
+///
+/// `core::hint::spin_loop()` and not `hlt`/`yield_now`: this runs in three different contexts
+/// (the x86 GUI inline loop, which is not a scheduled task; the Orin console pump; the Pi GUI
+/// channel task — see `selftest.rs` §context safety), and the spin hint is the only one of the
+/// three that is correct in all of them and needs no arch gate to say so.
+fn shell_sleep(console: &mut Console, ms: u64) {
+    const MAX_MS: u64 = 10_000;
+    const SPIN_CAP: u64 = 50_000_000;
+    let want = core::cmp::min(ms, MAX_MS);
+    if want != ms {
+        console.println(&alloc::format!("sleep: {} ms capped to {} ms", ms, MAX_MS));
+    }
+    let start = crate::arch::ms();
+    let mut spins: u64 = 0;
+    while crate::arch::ms().saturating_sub(start) < want && spins < SPIN_CAP {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let elapsed = crate::arch::ms().saturating_sub(start);
+    if elapsed < want {
+        return console.println(&alloc::format!(
+            "sleep: clock did not advance ({} of {} ms after {} spins) — no calibrated timebase here",
+            elapsed, want, spins));
+    }
+    console.println(&alloc::format!("slept {} ms", elapsed));
+}
+
+/// BASICS: how many bytes `grep` and `wc` will scan of one file before they stop and say so.
+///
+/// Sixteen times `head`'s ceiling: those verbs page a window, these ones answer a question ABOUT
+/// the whole file, and a count that quietly described the first 64 KiB would be a wrong answer
+/// rather than a short one. It is still a ceiling, and both verbs print the truncation note, so the
+/// reader is never left to assume.
+const SCAN_MAX: u32 = 1024 * 1024;
+
+
+
+/// BASICS: count lines, words and bytes over a byte run, carrying the word-boundary state across
+/// window edges.
+///
+/// `in_word` is an in/out parameter and not a local, which is the only interesting thing here: a
+/// word split across two 4 KiB reads must be counted ONCE, and a per-window counter would count it
+/// twice on every file larger than the window — a bug that never shows up on a small test file.
+///
+/// Definitions, matching `wc`: a LINE is a `\n` (so a file with no trailing newline reports one
+/// fewer line than it has visible rows, exactly as `wc` does); a WORD is a maximal run of
+/// non-whitespace; a BYTE is a byte, counted raw and never through `render_text` — the point of
+/// `wc -c` is the on-disk size, so a non-printable must not be normalised into a `.` first.
+fn wc_accumulate(data: &[u8], in_word: &mut bool, lines: &mut u64, words: &mut u64, bytes: &mut u64) {
+    for &b in data {
+        *bytes += 1;
+        if b == b'\n' {
+            *lines += 1;
+        }
+        let space = matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        if space {
+            *in_word = false;
+        } else if !*in_word {
+            *in_word = true;
+            *words += 1;
+        }
+    }
+}
+
+/// BASICS `wc [-l|-w|-c] <path>`: lines, words and bytes of one file.
+///
+/// With no flag all three are printed followed by the canonical path, the familiar layout. A single
+/// selector prints that one number and the path. Multiple selectors are accepted and print in the
+/// fixed l/w/c order rather than in the order typed — `wc` has never promised otherwise, and a
+/// column order that depended on the argument order would be unreadable in a capture.
+fn fs_wc(console: &mut Console, args: &[&str]) {
+    let mut want_l = false;
+    let mut want_w = false;
+    let mut want_c = false;
+    let mut path: Option<&str> = None;
+    for a in args {
+        if a.starts_with('-') && a.len() > 1 {
+            for ch in a[1..].chars() {
+                match ch {
+                    'l' => want_l = true,
+                    'w' => want_w = true,
+                    'c' => want_c = true,
+                    other => {
+                        return console.println(&alloc::format!(
+                            "wc: unknown flag -{} (usage: wc [-l|-w|-c] <path>)", other));
+                    }
+                }
+            }
+        } else if path.is_none() {
+            path = Some(a);
+        } else {
+            return console.println("usage: wc [-l|-w|-c] <path>  (one path)");
+        }
+    }
+    let Some(path) = path else {
+        return console.println("usage: wc [-l|-w|-c] <path>");
+    };
+    if !want_l && !want_w && !want_c {
+        want_l = true;
+        want_w = true;
+        want_c = true;
+    }
+    let Some((mt, canon, size)) = scan_target(console, "wc", path) else { return };
+    let (mut lines, mut words, mut bytes, mut in_word) = (0u64, 0u64, 0u64, false);
+    let res = scan_file(&mt, &canon, size, |chunk| {
+        wc_accumulate(chunk, &mut in_word, &mut lines, &mut words, &mut bytes)
+    });
+    let scanned = match res {
+        Ok(n) => n,
+        Err(e) => return vfs_fail(console, "wc", &canon, e),
+    };
+    let mut out = String::new();
+    for (on, n) in [(want_l, lines), (want_w, words), (want_c, bytes)] {
+        if on {
+            out.push_str(&alloc::format!("{:>8}", n));
+        }
+    }
+    console.println(&alloc::format!("{}  {}", out, canon));
+    if scanned < size {
+        console.println(&alloc::format!(
+            "[... counted {} of {} bytes; scan ceiling {}]", scanned, size, SCAN_MAX));
+    }
+}
+
+/// BASICS: does `line` match `pat`? FIXED STRING, with `^` and `$` as the only metacharacters.
+///
+/// **No regex, deliberately, and `help` says so in as many words.** There is no matcher in the tree
+/// to borrow (`glob_match` is a FILENAME glob — `*` there does not cross a `/`, and its semantics
+/// are wrong for line text), and a hand-rolled engine is not a shell verb, it is its own arc. The
+/// failure mode of pretending otherwise is silent and awful: a user types `grep 'foo.*bar'`, the
+/// shell matches it literally, finds nothing, and reports the file does not contain what it does
+/// contain. Two anchors cost four lines and cover most of what a bench operator wants; everything
+/// else is honestly absent.
+///
+/// A bare `^` is start-anchored-empty (every line matches, as `grep '^'` does); `^$` matches only
+/// empty lines. `ci` lower-cases both sides in ASCII only — the same rule `canon_verb` follows, and
+/// for the same reason: case folding must not change a string's length.
+fn grep_match(pat: &str, line: &str, ci: bool) -> bool {
+    let (pat, line) = if ci {
+        (pat.to_ascii_lowercase(), line.to_ascii_lowercase())
+    } else {
+        (String::from(pat), String::from(line))
+    };
+    let anchored_start = pat.starts_with('^');
+    let anchored_end = pat.ends_with('$') && pat.len() > 1;
+    let body = &pat[usize::from(anchored_start)..pat.len() - usize::from(anchored_end)];
+    match (anchored_start, anchored_end) {
+        (true, true) => line == body,
+        (true, false) => line.starts_with(body),
+        (false, true) => line.ends_with(body),
+        (false, false) => body.is_empty() || line.contains(body),
+    }
+}
+
+/// BASICS: the four `grep` flags, carried as one value so the emitter's signature stays readable
+/// and adding a fifth is one field rather than one more positional `bool` nobody can tell apart at
+/// the call site.
+struct GrepOpts {
+    ci: bool,
+    numbered: bool,
+    invert: bool,
+    count_only: bool,
+}
+
+/// BASICS: test one assembled line and print it if it counts. Split out of [`fs_grep`] so the
+/// streaming closure can call it while holding the console borrow — a closure that captured the
+/// console AND was called from inside another closure that captured it would not borrow-check.
+fn grep_emit(
+    console: &mut Console,
+    pat: &str,
+    line: &str,
+    lineno: u64,
+    opts: &GrepOpts,
+    hits: &mut u64,
+) {
+    if grep_match(pat, line, opts.ci) == opts.invert {
+        return;
+    }
+    *hits += 1;
+    if opts.count_only {
+        return;
+    }
+    if opts.numbered {
+        console.println(&alloc::format!("{}:{}", lineno, line));
+    } else {
+        console.println(line);
+    }
+}
+
+/// BASICS `grep [-i] [-n] [-v] [-c] <pattern> <path>`: print the lines of one file that match.
+///
+/// Flags are the four that earn their place at a bench: `-i` fold case, `-n` number the lines,
+/// `-v` invert the sense, `-c` print only the count. They combine (`-in`), and an unknown flag is a
+/// refusal rather than a silent literal — `grep -r foo F` must not quietly search for `foo` in one
+/// file and let the operator believe it recursed.
+///
+/// Lines are rendered by `head`'s rules (printable ASCII kept, everything else a `.`), so grepping
+/// a binary cannot corrupt the console and what is printed is what `cat` would have shown.
+fn fs_grep(console: &mut Console, args: &[&str]) {
+    let (mut ci, mut numbered, mut invert, mut count_only) = (false, false, false, false);
+    let mut positional: Vec<&str> = Vec::new();
+    for a in args {
+        if a.starts_with('-') && a.len() > 1 && positional.is_empty() {
+            for ch in a[1..].chars() {
+                match ch {
+                    'i' => ci = true,
+                    'n' => numbered = true,
+                    'v' => invert = true,
+                    'c' => count_only = true,
+                    other => {
+                        return console.println(&alloc::format!(
+                            "grep: unknown flag -{} (usage: grep [-i] [-n] [-v] [-c] <pattern> <path>)",
+                            other));
+                    }
+                }
+            }
+        } else {
+            positional.push(a);
+        }
+    }
+    if positional.len() != 2 {
+        return console.println("usage: grep [-i] [-n] [-v] [-c] <pattern> <path>");
+    }
+    let (pat, path) = (positional[0], positional[1]);
+    let opts = GrepOpts { ci, numbered, invert, count_only };
+    let Some((mt, canon, size)) = scan_target(console, "grep", path) else { return };
+    let mut cur = String::new();
+    let mut lineno: u64 = 0;
+    let mut hits: u64 = 0;
+    // STREAMED, not buffered. The obvious shape — collect every window into a `Vec<Vec<u8>>` and
+    // walk it afterwards — would hold a megabyte of file in the heap to print a handful of lines,
+    // on a kernel whose heap budget is the reason the console has a 256-line scrollback cap. The
+    // line assembly lives in this closure rather than in `scan_file` so `wc`, which never wants a
+    // `String`, does not pay for one.
+    let res = scan_file(&mt, &canon, size, |chunk| {
+        for &b in chunk {
+            match b {
+                b'\n' => {
+                    lineno += 1;
+                    grep_emit(console, pat, &cur, lineno, &opts, &mut hits);
+                    cur.clear();
+                }
+                b'\r' => {}
+                0x20..=0x7e => cur.push(b as char),
+                _ => cur.push('.'),
+            }
+        }
+    });
+    let scanned = match res {
+        Ok(n) => n,
+        Err(e) => return vfs_fail(console, "grep", &canon, e),
+    };
+    // A last line with no trailing newline is a line; `cat` shows it, so `grep` must consider it.
+    if !cur.is_empty() {
+        lineno += 1;
+        grep_emit(console, pat, &cur, lineno, &opts, &mut hits);
+    }
+    if count_only {
+        console.println(&alloc::format!("{}", hits));
+    } else if hits == 0 {
+        console.println(&alloc::format!("grep: {}: no match in {} line(s)", canon, lineno));
+    }
+    if scanned < size {
+        console.println(&alloc::format!(
+            "[... searched {} of {} bytes; scan ceiling {}]", scanned, size, SCAN_MAX));
+    }
+}
+
 
 /// MIDDEN-M1 WITNESS (witness battery): prove, headlessly and on BOTH arches, that the console's
 /// interpreter is the shared core and that extension-elided resolution works.
@@ -2687,6 +2920,1656 @@ pub fn midden_witness() {
     // publish, so every storage leg read `handles=global=absent sdhc=absent` and passed on all-false
     // inputs — vacuous on QEMU and on metal, forever. They now live in `fatverb_storage_witness`
     // below, called from the storage-ready service pass beside `fat::probe_once`.
+
+    // BASICS (orin 17): the everyday verbs get their own legs, in the same battery, on both arches.
+    shell_basics_witness();
+    // RELICS (orin 17, R26): the rename/retire legs, and — where there is a native volume — the
+    // transcript that proves each retired verb's plain replacement covers it.
+    shell_relics_witness();
+}
+
+// ==================== BASICS — the witness battery for the everyday verbs =========================
+//
+// WHY A FIXTURE AND NOT A TYPED TRANSCRIPT. The headless QEMU gates type nothing (`./arroyo test`,
+// `test-arm`, and `kernel8-test` without `UNAOS_K8_SCRIPT`), so a claim like "`help` prints" that
+// depends on a keystroke is not gated on any arch. These legs drive the SAME code the prompt drives
+// — `midden_core::plan`, `render_message`, and the verbs' own helpers — and assert what came out.
+//
+// WHAT MAKES THEM FALSIFIABLE. Not one leg compares an expression with itself. `basics.help` and
+// `basics.echo` capture REAL console output through a real `Console::set_output_sink`, so deleting
+// the `SHELL:` help line or breaking `render_message` reds them. `basics.wc` asserts counts against
+// literals AND asserts that a two-window split gives the same answer as one pass, which is the one
+// property a per-window counter would silently break. `basics.grep` asserts both senses of every
+// case, so a matcher stuck on `true` fails as loudly as one stuck on `false`. `basics.table`
+// compares the verb table against the words this file's `match` actually carries — the check whose
+// absence let `umv` and `urmattr` ship unreachable before they retired.
+
+/// BASICS: where a captured console's lines land. `Console::set_output_sink` takes a bare `fn`
+/// pointer (no captured state, by its own contract), so the buffer has to be a static.
+#[cfg(feature = "witness")]
+static WITNESS_CAPTURE: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+
+/// BASICS: the sink itself. Touches nothing but its own lock, which satisfies the sink contract's
+/// "must not call back into this `Console` and must hold no lock the call site could already hold".
+#[cfg(feature = "witness")]
+fn witness_sink(line: &str) {
+    WITNESS_CAPTURE.lock().push(String::from(line));
+}
+
+/// BASICS: run `f` against a throwaway console and return every line it printed.
+///
+/// The console is heap-only and dropped on return, exactly as `fatverb_storage_witness` does it, so
+/// the fixture's own output never reaches the operator's panel.
+#[cfg(feature = "witness")]
+fn witness_capture(f: impl FnOnce(&mut Console)) -> Vec<String> {
+    WITNESS_CAPTURE.lock().clear();
+    let mut c = Console::new();
+    c.set_output_sink(witness_sink);
+    f(&mut c);
+    let out = WITNESS_CAPTURE.lock().clone();
+    out
+}
+
+/// BASICS: the five legs. Called from `midden_witness`, so it runs wherever that runs — both
+/// arches, every headless gate — without a new call site in `main.rs`.
+#[cfg(feature = "witness")]
+fn shell_basics_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // --- table: the words this build's `match` carries are the words the table registers ---------
+    //
+    // Both directions. The basics must be verbs HERE (a table that forgot one sends the line to
+    // bare-name resolution and answers "Unknown command" about a verb the kernel carries), and the
+    // two unafs write verbs must be verbs on an aarch64 build (the defect this arc found: arms
+    // shipped, table silent). The aarch64 half is asserted against a SYNTHETIC fact set so the x86
+    // gate proves it too — the same trick `midden.resolve` uses to test elision on the Pi.
+    let facts = midden_facts();
+    let empty: &[&str] = &[];
+    let basics = ["grep", "wc", "df", "mount", "env", "set", "history", "sleep", "which"];
+    let mut missing = String::new();
+    for w in basics {
+        let mut vol = midden_core::NameList(empty);
+        if !matches!(midden_core::plan(w, &facts, &mut vol), midden_core::Plan::Host { .. }) {
+            missing.push(' ');
+            missing.push_str(w);
+        }
+    }
+    // RELICS (R26 clause 2): `umv`/`urmattr` were asserted here by BASICS, which had just restored
+    // their table entries. They are retired now — `mv` reaches the native volume itself and the
+    // attribute verb is `setfattr` — so what this half asserts is the SURVIVORS, on the same
+    // SYNTHETIC aarch64 fact set, so the x86 gate proves the aarch64 shape too.
+    let arm = midden_core::Facts { aarch64: true, ..midden_core::Facts::bare() };
+    for w in ["setfattr", "snap", "mv", "mount"] {
+        if !midden_core::is_verb(w, &arm) {
+            missing.push(' ');
+            missing.push_str(w);
+        }
+    }
+    verdict(
+        "shell.basics.table",
+        missing.is_empty(),
+        &alloc::format!("unregistered:{}", if missing.is_empty() { " none" } else { &missing }),
+    );
+
+    // --- help: the command table describes itself, and the new classes are in the description ----
+    let lines = witness_capture(|c| {
+        let mut vol = midden_core::NameList(empty);
+        match midden_core::plan("help", &facts, &mut vol) {
+            midden_core::Plan::Say(m) => render_message(c, &m),
+            other => c.println(&alloc::format!("help did not reach the core: {:?}", other)),
+        }
+    });
+    let has_shell = lines.iter().any(|l| l.starts_with("SHELL:"));
+    let has_text = lines.iter().any(|l| l.starts_with("TEXT:"));
+    let has_df = lines.iter().any(|l| l.contains("df | mount"));
+    verdict(
+        "shell.basics.help",
+        lines.len() > 20 && has_shell && has_text && has_df,
+        &alloc::format!("lines={} shell={} text={} df={}", lines.len(), has_shell, has_text, has_df),
+    );
+
+    // --- echo: the core answers, and the ring renders exactly what it answered ------------------
+    let lines = witness_capture(|c| {
+        let mut vol = midden_core::NameList(empty);
+        match midden_core::plan("echo hi there", &facts, &mut vol) {
+            midden_core::Plan::Say(m) => render_message(c, &m),
+            other => c.println(&alloc::format!("echo did not reach the core: {:?}", other)),
+        }
+    });
+    verdict(
+        "shell.basics.echo",
+        lines.len() == 1 && lines[0] == "hi there",
+        &alloc::format!("{:?}", lines),
+    );
+
+    // --- wc: the counts, and the window-split invariant ----------------------------------------
+    //
+    // `SAMPLE` is chosen so every field is a different number (2 lines, 4 words, 19 bytes) — three
+    // counters that all read 4 would let a wire-crossing pass. The split point falls INSIDE the
+    // word `two`, which is the case a per-window counter double-counts.
+    const SAMPLE: &[u8] = b"one two\nthree four\n";
+    let (mut l1, mut w1, mut b1, mut iw1) = (0u64, 0u64, 0u64, false);
+    wc_accumulate(SAMPLE, &mut iw1, &mut l1, &mut w1, &mut b1);
+    let (mut l2, mut w2, mut b2, mut iw2) = (0u64, 0u64, 0u64, false);
+    wc_accumulate(&SAMPLE[..5], &mut iw2, &mut l2, &mut w2, &mut b2);
+    wc_accumulate(&SAMPLE[5..], &mut iw2, &mut l2, &mut w2, &mut b2);
+    verdict(
+        "shell.basics.wc",
+        (l1, w1, b1) == (2, 4, 19) && (l2, w2, b2) == (l1, w1, b1),
+        &alloc::format!("one_pass={:?} split={:?}", (l1, w1, b1), (l2, w2, b2)),
+    );
+
+    // --- grep: substring, both anchors, case folding, and every one of them in both senses ------
+    let g = [
+        (grep_match("two", "one two three", false), true),
+        (grep_match("TWO", "one two three", false), false),
+        (grep_match("TWO", "one two three", true), true),
+        (grep_match("^one", "one two three", false), true),
+        (grep_match("^two", "one two three", false), false),
+        (grep_match("three$", "one two three", false), true),
+        (grep_match("two$", "one two three", false), false),
+        (grep_match("^one two three$", "one two three", false), true),
+        (grep_match("^one two$", "one two three", false), false),
+        (grep_match("", "anything", false), true),
+    ];
+    let bad = g.iter().filter(|(got, want)| got != want).count();
+    verdict("shell.basics.grep", bad == 0, &alloc::format!("{} of {} cases wrong", bad, g.len()));
+}
+
+// ==================== RELICS — the rename/retire transcript ======================================
+//
+// WHAT THIS BATTERY HAS TO PROVE, and why it is two halves.
+//
+// Peter's R26 has two claims that can rot in opposite directions. Clause 1 ("standard names REPLACE
+// ours") rots if a retired spelling creeps back as an alias — a table-level fact, provable on any
+// build, so `shell.relics.renamed` runs everywhere. Clause 2 ("the duplicated unafs verbs RETIRE
+// once a transcript proves the plain verb covers the unafs volume") rots if a plain verb quietly
+// stops reaching the native volume — a RUNTIME fact about a real volume, so `shell.relics.native`
+// runs only where there is one, which is the `kernel8-test` aarch64 gate.
+//
+// WHAT MAKES THEM FALSIFIABLE. `renamed` asserts BOTH senses of every pair: the old word must be a
+// non-verb AND the new word must be a verb, on three different fact sets, so a table stuck on
+// "yes" fails exactly as loudly as one stuck on "no". `native` never compares an expression with
+// itself: every leg WRITES through the plain verb's own helper and READS BACK through the mount
+// table — the seam `ls` and `cat` use — so pointing a write helper at the wrong volume reds it
+// even though the write itself succeeded.
+
+/// RELICS: the pairs R26 clause 1 renamed. `(retired spelling, the standard word that replaced it)`.
+///
+/// `read` is in this list and its entry is `dd` for the reason the `dd` arm records: POSIX `read`
+/// is a shell builtin that reads a line of INPUT, so ours was a standard word wearing a foreign
+/// meaning, which is the same defect clause 1 names — not merely a house spelling.
+#[cfg(feature = "witness")]
+const RELIC_RENAMES: &[(&str, &str)] = &[
+    ("bootlog", "dmesg"), ("vfs", "mount"), ("xd", "hexdump"), ("usbinfo", "lsusb"),
+    ("netinfo", "ifconfig"), ("diskinfo", "fdisk"), ("fatinfo", "mount"), ("setdate", "date"),
+    ("sched", "ps"), ("connect", "nc"), ("udpsend", "nc"), ("get", "curl"), ("read", "dd"),
+    ("uls", "ls"), ("ucat", "cat"), ("utouch", "touch"), ("uwrite", "write"),
+    ("umkdir", "mkdir"), ("urm", "rm"), ("umv", "mv"), ("urmattr", "setfattr"),
+    ("usnaps", "snap"), ("usnap", "snap"), ("usnapdrop", "snap"), ("usnapls", "snap"),
+    ("usnapcat", "snap"),
+];
+
+/// RELICS: the two arch-neutral legs plus, on a build with a native volume, the subsumption
+/// transcript. Called from [`midden_witness`], so it runs wherever that runs.
+#[cfg(feature = "witness")]
+fn shell_relics_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+
+    // --- renamed: the old word is gone, the new word is here, on three builds ------------------
+    let builds = [
+        midden_core::Facts::bare(),
+        midden_core::Facts { aarch64: true, ..midden_core::Facts::bare() },
+        midden_core::Facts { x86: true, exec: true, proc_verbs: true, ..midden_core::Facts::bare() },
+    ];
+    let mut bad = String::new();
+    for f in builds {
+        for (old, new) in RELIC_RENAMES {
+            if midden_core::is_verb(old, &f) {
+                bad.push_str(" alias:");
+                bad.push_str(old);
+            }
+            if !midden_core::is_verb(new, &f) {
+                bad.push_str(" missing:");
+                bad.push_str(new);
+            }
+        }
+    }
+    // PER-PAIR EVIDENCE. The leg above is one verdict over 26 pairs, which is the right shape for a
+    // gate but the wrong shape for a capture: a reader asking "was `usbinfo` really replaced, and by
+    // what?" should not have to trust an aggregate. One line per pair, on the strictest fact set (a
+    // bare build, where only `Avail::Always` verbs exist), so the line says both halves.
+    {
+        let f = midden_core::Facts::bare();
+        for (old, new) in RELIC_RENAMES {
+            serial_println!(
+                ":: [relics] {} -> {} :: retired={} registered={} ::",
+                old, new, !midden_core::is_verb(old, &f), midden_core::is_verb(new, &f)
+            );
+        }
+    }
+    verdict(
+        "shell.relics.renamed",
+        bad.is_empty(),
+        &alloc::format!("{}", if bad.is_empty() { " none" } else { &bad }),
+    );
+
+    // --- help: the description names the survivors and none of the relics, and has a BENCH class -
+    let facts = midden_facts();
+    let empty: &[&str] = &[];
+    let lines = witness_capture(|c| {
+        let mut vol = midden_core::NameList(empty);
+        match midden_core::plan("help", &facts, &mut vol) {
+            midden_core::Plan::Say(m) => render_message(c, &m),
+            other => c.println(&alloc::format!("help did not reach the core: {:?}", other)),
+        }
+    });
+    let text = lines.join("\n");
+    let has_bench = lines.iter().any(|l| l.starts_with("BENCH:"));
+    // Word-boundary-free `contains` would let `mount` match inside `unmounted`; the relics are
+    // checked as whole words the way the operator would type them, one per space-split token.
+    let stale = ["bootlog", "vfs", "xd", "usbinfo", "netinfo", "diskinfo", "fatinfo", "setdate",
+                 "sched", "udpsend", "uls", "ucat", "utouch", "uwrite", "umkdir", "urmattr",
+                 "usnap", "usnaps", "usnapls", "usnapcat", "usnapdrop"];
+    let mut leaked = String::new();
+    for w in stale {
+        if text.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == w) {
+            leaked.push(' ');
+            leaked.push_str(w);
+        }
+    }
+    let names_new = ["dmesg", "hexdump", "lsusb", "ifconfig", "fdisk", "dd", "nc", "curl",
+                     "snap", "setfattr", "ps"]
+        .iter()
+        .all(|w| text.split(|c: char| !c.is_ascii_alphanumeric()).any(|t| t == *w));
+    verdict(
+        "shell.relics.help",
+        has_bench && leaked.is_empty() && names_new,
+        &alloc::format!("bench={} new={} leaked:{}", has_bench, names_new,
+            if leaked.is_empty() { " none" } else { &leaked }),
+    );
+
+    // --- write: the retired raw overload cannot come back — `write 0 0` is a FILE write ----------
+    //
+    // rmbp 14's condition on RELICS (fold 8). Before R26 clause 1, `write <lba> <byte>` with exactly
+    // two numeric arguments was 512 bytes of that byte over that logical block (`wrote LBA 12
+    // (0x00 x512)`), so `write 12 0` at a bench prompt was a sector write, not a file named 12. This
+    // leg types the OLD spelling into the SAME dispatcher the prompt drives and reads what came out.
+    // Two-sided: it REQUIRES a file-verb line (a `write:` refusal, or `wrote N bytes to /0`) and
+    // FORBIDS the sector vocabulary (`LBA`, or the old arm's `write error:`). On the x86 battery
+    // there is no block device, so an overload that grew back would print `write error: NotReady`
+    // (forbidden) and no file line (required), and the leg reds on both counts. Proven failable at
+    // fold 8 by routing `write 0 0` to a stub that printed the old line.
+    {
+        // A throwaway pal over a 16x16 heap "framebuffer", the shape `video::witness::run` uses.
+        // `dispatch_command` needs a pal only for full-screen apps, which `write` is not. Built by
+        // struct literal so `TargetPal::new`'s once-per-surface `:: UI1:` line is not repeated.
+        let info = unaos_boot_info::FrameBufferInfo {
+            width: 16, height: 16, stride: 16, bytes_per_pixel: 4,
+            pixel_format: unaos_boot_info::PixelFormat::Bgr,
+        };
+        let mut store = alloc::vec![0u8; 16 * 16 * 4];
+        let mut fb = crate::video::FrameBuffer::new();
+        fb.init(store.as_mut_ptr() as usize, store.len(), info);
+        let mut screen = crate::video::Screen::new(fb);
+        let mut pal = TargetPal { surface: &mut screen };
+        let lines = witness_capture(|c| {
+            let _ = dispatch_command("write 0 0", c, &mut pal);
+        });
+        let file_line = lines.iter().any(|l| {
+            l.starts_with("write:") || (l.starts_with("wrote ") && l.contains(" bytes to /0"))
+        });
+        let sector_line = lines.iter().any(|l| l.contains("LBA") || l.starts_with("write error"));
+        // Self-clean: a volume that ACCEPTED the write now holds a file named `0`; remove it the
+        // same way, through the dispatcher, so the battery leaves the root as it found it.
+        if lines.iter().any(|l| l.starts_with("wrote ")) {
+            let _ = witness_capture(|c| { let _ = dispatch_command("rm 0", c, &mut pal); });
+        }
+        verdict(
+            "shell.relics.write_raw",
+            file_line && !sector_line,
+            &alloc::format!("file={} sector={} lines={:?}", file_line, sector_line, lines),
+        );
+    }
+
+    // ACLSYM (orin 19): the receiving-directory SHAPE leg. Deliberately NOT arch-gated — it is a
+    // string split over four literals and touches no medium, so it has no skip branch on any board
+    // this battery reaches. `vfs.aclsym.dir` is the half of this arc that runs on both gates.
+    vfs_aclsym_shape_witness();
+
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    shell_relics_native_witness();
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    vfsroute_native_witness();
+    // VFSROUTE: the arch-neutral routing transcript, here on aarch64 because this is the call site
+    // that runs AFTER `emmc2::probe()` — i.e. the first moment this board has volumes to route to.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    vfsroute_witness();
+    // LAYOUT (orin 18): the namespace transcript, on the same site and for the same reason.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    layout_witness();
+    // LAYOUT (orin 18): the cross-address-space `mv` transcript (B66). aarch64 bare-metal ONLY —
+    // see the fn's note: it is a write transcript, and the x86 witness site is the storage-ready
+    // pass whose timing this arc already measured breaking under added block I/O.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    layout_mv_witness();
+    // ACLSYM (orin 19): the two-posture REFUSAL leg — `a62188c9`'s own STILL OWED. aarch64
+    // bare-metal only, for `layout_mv_witness`'s measured reason (the x86 witness site is the
+    // storage-ready pass, whose timing orin 18 measured breaking under added block I/O). The code
+    // under test is arch-neutral, so this gate convicts it for both arches.
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+    vfs_aclsym_witness();
+}
+
+/// RELICS: THE SUBSUMPTION TRANSCRIPT — the leg R26 clause 2 makes the retirement conditional on.
+///
+/// One leg per retired pair, each in the `:: TSTE: shell.relics.<verb> -> PASS ::` shape, and each
+/// is a WRITE through the plain verb's own helper followed by a READ BACK through the mount table —
+/// `vfs_ls_collect` / `MountTable::read`, the seam `ls` and `cat` resolve through. That is what
+/// makes them a transcript of subsumption rather than a self-test of one helper: if `touch` were
+/// still FAT-direct on aarch64 the write would SUCCEED (on the FAT volume) and the read back off
+/// the native root would still find nothing, so the leg reds.
+///
+/// # IT SELF-CLEANS, AND THAT CONSTRAINT SHAPED THE `mkdir` LEG
+///
+/// `fs/unafs.rs`'s `k3_mount_selftest` bit5 requires the native root to hold the two staged
+/// fixtures and `acl-*` rows and NOTHING ELSE — its own doc: *"a leaked scratch fixture still fails
+/// the bit, so the fixtures' self-clean discipline stays protected."* Every file this transcript
+/// creates is deleted before it returns.
+///
+/// A DIRECTORY cannot be. The UnaFS crate has no directory removal at all (`unlink` returns
+/// `IsADirectory` unconditionally; ROADMAP §F2's own scope note: *"the crate has no `rmdir`"*), so a
+/// leg that created `/RELICD` would leave it there — invisible in QEMU, where the card is re-staged
+/// every run, and a permanent K3-mount red on any metal Pi from its second boot onward. So the
+/// `mkdir` leg proves the ROUTING without mutating: it aims `mkdir` at a name that exists ONLY on
+/// the native volume (the file the `write` leg just made) and requires the refusal to be the NATIVE
+/// crate's `FileExists`. A `mkdir` still riding fat.rs would not find that name on the FAT boot
+/// partition at all — it would CREATE a directory and report success — so the leg is two-sided
+/// against exactly the failure it exists to catch. **Residual, stated rather than hidden:** there is
+/// no POSITIVE native `mkdir` transcript, and there cannot be one until the crate can remove a
+/// directory. What carries the positive half meanwhile is `touch`/`write`, which reach the volume
+/// through the same `unafs_split` + `resolve_path(parent)` + create-in-parent path.
+///
+/// Runs after `emmc2::probe()` at the aarch64 `midden_witness` call site, so the volume is mounted —
+/// unlike the x86 call site, which is why the native half is gated to this arch and this feature.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+fn shell_relics_native_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+    /// Read a native path back through the MOUNT TABLE (never through the writer's own helper).
+    fn read_back(path: &str) -> Option<Vec<u8>> {
+        let mt = vfs_mount_table();
+        let st = mt.stat(path).ok()?;
+        mt.read(path, 0, st.size as usize).ok()
+    }
+    fn listed(dir: &str, name: &str) -> bool {
+        match vfs_ls_collect(dir) {
+            Ok((_, rows)) => rows.iter().any(|d| d.name == name),
+            Err(_) => false,
+        }
+    }
+
+    // Every leg drives the PLAIN verb's helper. `witness_capture` swallows the console line the
+    // verb prints (the fixture must not paint the operator's panel) and hands it back for the FAIL
+    // text, so a failure names what the verb actually said.
+    let say = |f: &dyn Fn(&mut Console)| -> String { witness_capture(|c| f(c)).join(" | ") };
+
+    const A: &str = "/RELIC1.TXT";
+    const B: &str = "/RELIC2.TXT";
+    const C: &str = "/RELIC3.TXT";
+
+    // 1. `write` (was `uwrite`) — read back through the mount table, byte for byte.
+    let got = say(&|c: &mut Console| fs_write(c, A, b"relics-one"));
+    let ok = read_back(A).as_deref() == Some(b"relics-one".as_slice());
+    verdict("shell.relics.write", ok, &alloc::format!("{} read={:?}", got, read_back(A)));
+
+    // 2. `append` (the native primitive the `u*` family never had) — EOF extend, not overwrite.
+    let got = say(&|c: &mut Console| fs_append(c, A, b"-two"));
+    let ok = read_back(A).as_deref() == Some(b"relics-one-two".as_slice());
+    verdict("shell.relics.append", ok, &alloc::format!("{} read={:?}", got, read_back(A)));
+
+    // 3. `cat` (was `ucat`) — the READ verb's own path, asserted against the same bytes.
+    let lines = witness_capture(|c| vfs_cat(c, A));
+    let ok = lines.iter().any(|l| l.contains("relics-one-two"));
+    verdict("shell.relics.cat", ok, &alloc::format!("{:?}", lines));
+
+    // 4. `touch` (was `utouch`) — and, through `vfs_ls_collect`, `ls` (was `uls`) as well.
+    let got = say(&|c: &mut Console| fs_touch(c, B));
+    verdict("shell.relics.touch", listed("/", "RELIC2.TXT"), &got);
+
+    // 5. `mkdir` (was `umkdir`) — the routing, proven without leaving a directory behind. See the
+    //    doc above for why this leg is shaped as a refusal. `A` exists on the NATIVE root only,
+    //    because leg 1 put it there, so a FAT-direct `mkdir` would create and report success.
+    let got = say(&|c: &mut Console| fs_mkdir(c, A));
+    let native_refusal = got.contains("-EEXIST");
+    let still_a_file = read_back(A).is_some();
+    verdict(
+        "shell.relics.mkdir",
+        native_refusal && still_a_file,
+        &alloc::format!("said={} native_refusal={} still_a_file={}", got, native_refusal, still_a_file),
+    );
+
+    // 6. `mv` (was `umv`) — the old name gone from the listing AND the new one in it, which a copy
+    //    would fail and a no-op would fail differently.
+    let got = say(&|c: &mut Console| fs_mv(c, B, C, false));
+    let ok = !listed("/", "RELIC2.TXT") && listed("/", "RELIC3.TXT");
+    verdict("shell.relics.mv", ok, &got);
+
+    // 6b. XVOL (orin 19) — `mv` BETWEEN TWO VOLUMES, and it asserts THE REFUSAL, because refusing is
+    //     what this move does and what it MUST do. Leg 6 above is native -> native (both operands at
+    //     `/`), so every `mv` witness in this tree stayed inside one backend; `layout.mv` crosses two
+    //     MOUNTS but they are one VOLUME by construction (it skips itself unless `same_volume` says
+    //     so). Nothing exercised the arm that decides between those two worlds.
+    //
+    //     # THE LEG WAS FIRST WRITTEN TO ASSERT THE MOVE, AND THE MEASUREMENT REFUTED IT
+    //
+    //     Written to assert `mv /XVOL.TXT /boot/XVOL.TXT` LANDS — gone from the native root, present
+    //     on the FAT side, bytes identical — it reds, and the capture says why in the verb's own
+    //     words: `mv: cross-volume move is not supported (copy with `cp`, then `rm`)`, with
+    //     `gone_here=false at_far=false`. That is not a defect to be fixed into a pass. `/` is UnaFS
+    //     and `/boot` is FAT on ONE physical card, `NativeBackend::volume_id` mixes the `vfs:unafs:`
+    //     domain tag BEFORE anything about the medium precisely so no FAT id can ever equal it, and
+    //     `fs_mv`'s `same_volume` guard plus `MountTable::rename`'s `same_storage` guard both refuse.
+    //     A rename relinks a directory entry; relinking an UnaFS inode into a FAT directory is the
+    //     corruption those guards exist to prevent. Copy-then-delete is a different operation and the
+    //     operator asks for it by typing `cp` then `rm`.
+    //
+    //     # SO THIS IS WHAT IT ASSERTS, AND IT IS TWO-SIDED
+    //
+    //     Not merely "the verb printed a refusal" — a leg that only reads the console would pass on a
+    //     verb that refused AFTER destroying the source. Four facts per direction, off the table:
+    //     the two volumes really are two (`same_volume` false, both ids `Some` and unequal — without
+    //     this the whole leg is vacuous, so it is asserted rather than assumed); `MountTable::rename`
+    //     ITSELF answers `Unsupported`, asked directly, so the guard is proven at the seam and not
+    //     only at the verb that happens to check first today; the source SURVIVES with its bytes
+    //     intact; and NOTHING appears at the destination.
+    //
+    //     What reds it is the aliasing regression the identity contract was built against (VOLID's
+    //     C1, one layer down): make `volume_id` medium-derived and the Pi's UnaFS root and FAT boot
+    //     volume — same card — compare EQUAL, the move is admitted, and every one of those facts
+    //     flips. Asserted in BOTH directions, because the two ends are two different backends and a
+    //     guard that held one way round has been the bug here before.
+    //
+    //     THE FAR PREFIX IS DERIVED, NEVER TYPED. It was `/fat` before LAYOUT and is `/boot` after
+    //     it; a literal that goes stale would silently become a within-FAT no-op — the exact defect
+    //     this leg exists to catch, hiding inside the test for it. Picking it by VOLUME IDENTITY is
+    //     stronger than any constant: the prefix chosen is by construction one whose `volume_id`
+    //     differs from `/`'s, so it cannot degrade into a same-volume move whatever gets renamed.
+    {
+        use crate::fs::vfs::VfsError;
+        const XV: &str = "XVOL.TXT"; // 8.3: FAT create on this driver writes short names only.
+        const BODY: &[u8] = b"xvol-bytes";
+        let mt = vfs_mount_table();
+        let here_id = mt.volume_id("/").ok().flatten();
+        let far_prefix = mt
+            .prefixes()
+            .into_iter()
+            .find(|p| {
+                let id = mt.volume_id(p).ok().flatten();
+                *p != "/" && id.is_some() && id != here_id
+            })
+            .map(String::from);
+        // A board with one volume (the Orin, whose ROOTFS knob re-points `/` and `/boot` at the one
+        // card) cannot exhibit the pair at all, and says so rather than passing silently.
+        match far_prefix {
+            None => serial_println!(
+                ":: relics: this board binds no volume beside / — shell.relics.mv.xvol skipped ::"),
+            Some(far_prefix) if matches!(mt.write_veto("/"), Ok(Some(_)))
+                || matches!(mt.write_veto(&far_prefix), Ok(Some(_))) => serial_println!(
+                ":: relics: / or {} refuses writes — shell.relics.mv.xvol skipped ::", far_prefix),
+            Some(far_prefix) => {
+                let native = vfs_join("/", XV);
+                let far = vfs_join(&far_prefix, XV);
+                let scrub = || {
+                    let _ = mt.unlink(&native, SHELL_PRINCIPAL);
+                    let _ = mt.unlink(&far, SHELL_PRINCIPAL);
+                };
+                scrub(); // a red earlier run may have left the probe on either side
+                // THE PREMISE, ASSERTED: two volumes, and the table says so. If this ever answers
+                // `true` the leg is testing a same-volume move and must red, not quietly pass.
+                let two_volumes = mt.same_volume(&native, &far) == Ok(false)
+                    && here_id.is_some()
+                    && mt.volume_id(&far_prefix).ok().flatten().is_some();
+
+                // ── direction 1: native root -> the far volume ──────────────────────────────────
+                let staged_out = say(&|c: &mut Console| fs_write(c, &native, BODY));
+                let out_seam = mt.rename(&native, &far, SHELL_PRINCIPAL) == Err(VfsError::Unsupported);
+                let said_out = say(&|c: &mut Console| fs_mv(c, &native, &far, false));
+                let out_refused = said_out.contains("cross-volume");
+                let out_src_intact =
+                    listed("/", XV) && read_back(&native).as_deref() == Some(BODY);
+                let out_dst_empty = !listed(&far_prefix, XV) && read_back(&far).is_none();
+                scrub();
+
+                // ── direction 2: the far volume -> the native root ─────────────────────────────
+                let staged_back = say(&|c: &mut Console| fs_write(c, &far, BODY));
+                let back_staged = read_back(&far).as_deref() == Some(BODY);
+                let back_seam = mt.rename(&far, &native, SHELL_PRINCIPAL) == Err(VfsError::Unsupported);
+                let said_back = say(&|c: &mut Console| fs_mv(c, &far, &native, false));
+                let back_refused = said_back.contains("cross-volume");
+                let back_src_intact =
+                    listed(&far_prefix, XV) && read_back(&far).as_deref() == Some(BODY);
+                let back_dst_empty = !listed("/", XV) && read_back(&native).is_none();
+                // SELF-CLEAN: `k3_mount_selftest` bit5 requires the native root to hold the staged
+                // fixtures and NOTHING else, so the probe leaves under both prefixes either way.
+                scrub();
+
+                // Said once, beside the verdict, so no reader of a bare `-> PASS ::` can take this
+                // leg for a claim that the move SUCCEEDS. It asserts that it is refused, intact.
+                serial_println!(
+                    ":: relics: mv between / and {} is REFUSED BY VOLUME IDENTITY (two filesystems, \
+                     one card); this leg asserts the refusal AND that both ends survive it ::",
+                    far_prefix);
+                verdict(
+                    "shell.relics.mv.xvol",
+                    two_volumes
+                        && out_seam && out_refused && out_src_intact && out_dst_empty
+                        && back_staged && back_seam && back_refused && back_src_intact
+                        && back_dst_empty,
+                    &alloc::format!(
+                        "far={} two_volumes={} | out: seam={} refused={} src_intact={} \
+                         dst_empty={} said=[{}] staged=[{}] | back: staged={} seam={} refused={} \
+                         src_intact={} dst_empty={} said=[{}] staged=[{}]",
+                        far_prefix, two_volumes, out_seam, out_refused, out_src_intact,
+                        out_dst_empty, said_out, staged_out, back_staged, back_seam, back_refused,
+                        back_src_intact, back_dst_empty, said_back, staged_back),
+                );
+            }
+        }
+    }
+
+    // 7. `setfattr -x` (was `urmattr`) — plant a typed attribute through the crate, drop it through
+    //    the VERB's helper, and prove it is gone by asking the crate again. Both ends are real.
+    let planted = crate::fs::unafs::with_unafs(|fs| {
+        let id = fs.resolve_path(C).ok()?;
+        fs.set_attribute(id, String::from("relic:tag"),
+                         ::unafs::AttributeValue::String(String::from("keep"))).ok()?;
+        fs.get_attribute(id, "relic:tag").ok().flatten().map(|_| ())
+    }).ok().flatten().is_some();
+    let got = say(&|c: &mut Console| setfattr_x(c, "relic:tag", C));
+    let gone = crate::fs::unafs::with_unafs(|fs| {
+        let id = fs.resolve_path(C).ok()?;
+        fs.get_attribute(id, "relic:tag").ok().flatten()
+    }).ok().flatten().is_none();
+    verdict("shell.relics.setfattr", planted && gone, &alloc::format!(
+        "planted={} gone={} said={}", planted, gone, got));
+
+    // 8. `snap` (was `usnaps` / `usnap` / `usnapdrop` / `usnapls` / `usnapcat`) — ALL FIVE
+    //    subcommands, through the one verb, in one round trip: create, see it in the index, list
+    //    and read AS OF it, then drop it and see it leave the index.
+    //
+    //    The `cat` half is asserted against the LIVE bytes of the same file rather than against the
+    //    absence of an error prefix: every one of `unafs_verb_snapcat`'s returns starts `snap cat:`,
+    //    successes included, so a prefix test would have been a check that cannot fail — and was,
+    //    in this leg's first cut. Snapshot-read == live-read is the property that actually matters
+    //    for a file no one modified between the two.
+    let live = read_back("/K3HELLO.TXT")
+        .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+        .unwrap_or_default();
+    let created = say(&|c: &mut Console| snap_cmd(c, &["create", "relics"]));
+    let index = unafs_verb_snaps().join(" | ");
+    let snap_gen = crate::fs::unafs::with_unafs(|fs| {
+        fs.snapshot_index().ok().and_then(|v| v.iter().find(|s| s.name == "relics").map(|s| s.generation))
+    }).ok().flatten();
+    let (ok, why) = match snap_gen {
+        Some(g) => {
+            let in_index = index.contains("relics");
+            let ls_ok = unafs_verb_snapls(g, "/").iter().any(|l| l.contains("K3HELLO.TXT"));
+            let cat_ok = !live.is_empty() && unafs_verb_snapcat(g, "/K3HELLO.TXT").contains(&live);
+            let _ = say(&|c: &mut Console| snap_cmd(c, &["drop", &alloc::format!("{}", g)]));
+            let dropped = crate::fs::unafs::with_unafs(|fs| {
+                fs.snapshot_index().ok().map(|v| !v.iter().any(|s| s.generation == g))
+            }).ok().flatten().unwrap_or(false);
+            (in_index && ls_ok && cat_ok && dropped,
+             alloc::format!("gen={} index={} ls={} cat={} dropped={}", g, in_index, ls_ok, cat_ok, dropped))
+        }
+        None => (false, alloc::format!("no generation created ({})", created)),
+    };
+    verdict("shell.relics.snap", ok, &why);
+
+    // 9. `rm` (was `urm`) — and the SELF-CLEAN. Both files go; the root must be back to exactly what
+    //    `k3_mount_selftest` bit5 requires, and this leg asserts that rather than assuming it.
+    let got_a = say(&|c: &mut Console| fs_rm(c, A, false));
+    let got_c = say(&|c: &mut Console| fs_rm(c, C, false));
+    let clean = match vfs_ls_collect("/") {
+        Ok((_, rows)) => !rows.iter().any(|d| d.name.starts_with("RELIC")),
+        Err(_) => false,
+    };
+    verdict(
+        "shell.relics.rm",
+        !listed("/", "RELIC1.TXT") && !listed("/", "RELIC3.TXT") && clean,
+        &alloc::format!("{} | {} | root_clean={}", got_a, got_c, clean),
+    );
+}
+
+// ===================== VFSROUTE — THE TRANSCRIPT ==================================================
+//
+// The legs Peter's ruling asks for, in the `:: TSTE: <name> -> PASS/FAIL ::` shape the boot-replay
+// ring and `tste` already read. Every one drives THE REAL VERB through `witness_capture` (a
+// heap-only console, dropped on return, so the fixture never paints the operator's panel) and
+// asserts against a fact read off the MOUNT TABLE — never against the verb's own return value, so
+// no leg compares an expression with itself.
+//
+// WHAT MAKES THEM TWO-SIDED. The failure this arc exists to prevent is a verb that ignores the
+// namespace and answers off whichever volume it happens to hold. So the legs are written against a
+// PROBE NAME taken off the root volume's own listing, and then require that name to appear under a
+// DIFFERENT volume's prefix if and only if the two prefixes resolve to the same volume. On aarch64
+// `/` is native UnaFS and `/boot` is the boot FAT, so a `ls`/`cat`/`stat` that had kept its old
+// FAT-direct body would show a native file under `/boot` and the leg reds. On x86 the two prefixes
+// ARE one volume, and the same expression requires the opposite answer — so neither arch's leg can
+// pass by being stuck.
+//
+// ARCH-NEUTRAL BY CONSTRUCTION: there is no `target_arch` in the assertions, only in the call sites
+// (aarch64 runs it after `emmc2::probe()`, x86 after the storage-ready pass — the two moments each
+// board actually has a volume).
+//
+// VOLID (orin 18) — THE SELF-ORACLE THAT WAS HERE. "The two prefixes resolve to the same volume"
+// was itself taken from `MountTable::same_volume`, the router being tested. That made the legs
+// agree with any bug IN that predicate: rmbp 15's condition C1 (one Orin card mounted twice under
+// two names and compared BY NAME, so it read as two volumes) would have moved the expectation and
+// the answer together and printed PASS. The transcript now computes that fact from the PROBE
+// OBJECT via `stat` — a different verb, consulting no volume identity — and adds
+// `vfsroute.samevol`, which convicts `same_volume` against it. See the oracle note at the probe.
+
+/// VFSROUTE: one-shot latch — the service loops call the x86 site every pass; it must speak once.
+#[cfg(feature = "witness")]
+static VFSROUTE_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// VFSROUTE (orin 17): the routing transcript — `ls`, `cat`, `stat` and a typed refusal, proven to
+/// go through the mount table on every mounted volume.
+#[cfg(feature = "witness")]
+pub fn vfsroute_witness() {
+    use core::sync::atomic::Ordering;
+    use crate::fs::vfs::{NodeKind, VfsError};
+    if VFSROUTE_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+    let mt = vfs_mount_table();
+
+    // --- leg 1: ROUTING. Every mounted prefix resolves to its own volume, and a name that merely
+    //     STARTS WITH a prefix does not (the boundary rule — a naive `starts_with`, which is what
+    //     the deleted per-verb prefix tests used, gets `/fatty.bin` wrong and sends a root-volume
+    //     file to the FAT card).
+    let rows = mt.rows();
+    let mut route_ok = !rows.is_empty();
+    let mut route_why = String::new();
+    for (prefix, name, _, _, _) in &rows {
+        let got = mt.volume_name(prefix).unwrap_or_else(|_| String::from("?"));
+        route_why.push_str(&alloc::format!("{}={} ", prefix, got));
+        if got != *name {
+            route_ok = false;
+        }
+    }
+    let root_vol = mt.volume_name("/").unwrap_or_else(|_| String::from("?"));
+    for probe in ["/fatty.bin", "/usbfoo"] {
+        let got = mt.volume_name(probe).unwrap_or_else(|_| String::from("?"));
+        route_why.push_str(&alloc::format!("{}={} ", probe, got));
+        if got != root_vol {
+            route_ok = false; // a prefix claimed a name that only shares its first bytes
+        }
+    }
+    verdict("vfsroute.route", route_ok, &route_why);
+
+    // --- VOLID (orin 18): THE IDENTITY CENSUS, PRINTED UNCONDITIONALLY -----------------------------
+    //
+    // `verdict` renders its `got` string only on FAIL, and the values this fix is SCORED on are the
+    // identities themselves — not the pass/fail of a predicate over them. So every mounted prefix
+    // publishes its `volume_id`, and `same_volume` is asked over every PAIR of mounted prefixes, on
+    // every board, on every boot of a witness build. That is what makes "is `/` the same volume as
+    // `/boot` here?" a reading off the wire instead of an argument, and it is the same line whether
+    // the board is the Orin (one card at two prefixes), x86 (one source at two prefixes), or the Pi
+    // (UnaFS and FAT on ONE card, which must still read as two volumes).
+    //
+    // `id=None` is a backend's honest "I cannot establish this volume's identity" and is NEVER equal
+    // to anything, including another `None` — so a pair printing two `None`s reads `same=false` for
+    // that reason and not because two media were compared.
+    for (i, (pa, na, _, _, _)) in rows.iter().enumerate() {
+        serial_println!(
+            ":: volid: mount {} name={} id={:?} ::", pa, na, mt.volume_id(pa).ok().flatten());
+        for (pb, nb, _, _, _) in rows.iter().skip(i + 1) {
+            serial_println!(
+                ":: volid: {} ({}) vs {} ({}) -> same={:?} ::",
+                pa, na, pb, nb, mt.same_volume(pa, pb));
+        }
+    }
+
+    // --- the probe: a real FILE on the root volume, read off the TABLE (not off a verb). Every
+    //     leg below hangs off it.
+    let probe = mt
+        .read_dir("/")
+        .ok()
+        .and_then(|rs| rs.into_iter().find(|r| matches!(r.kind, NodeKind::File)));
+
+    match probe {
+        None => serial_println!(
+            ":: vfsroute: the root volume ({}) lists no file — ls/cat/stat legs skipped ::", root_vol),
+        Some(p) => {
+            let root_path = vfs_join("/", &p.name);
+            let fat_path = vfs_join("/boot", &p.name);
+
+            // --- THE ORACLE, AND IT DOES NOT ASK `same_volume` (VOLID, orin 18) --------------
+            //
+            // "Are `/` and `/boot` one volume?" is the fact legs 2 and 3 assert against, and it
+            // used to be computed as `mt.same_volume("/", "/boot")` — the router asked about
+            // itself. A wrong `same_volume` moved the EXPECTATION the same way it moved the
+            // answer, so every leg agreed with the bug: exactly the shape that let rmbp 15's C1
+            // (one Orin card mounted twice under two names, read as two volumes) sit under a
+            // green transcript.
+            //
+            // The independent fact is THE OBJECT. `/` listed a file with a name and a byte
+            // count; the two prefixes address one volume exactly when `/boot` shows THAT object —
+            // same name, same kind, same size — reached by a plain `stat` through the resolver,
+            // which consults no identity at all. That is a different verb from the two legs it
+            // then feeds, so no leg compares an expression with itself.
+            //
+            // Two-sided on every board by construction: on the Pi `/` is UnaFS and `/boot` is the
+            // boot FAT and neither holds the other's files (observed FALSE); on x86 and on the
+            // Orin's card both prefixes address one directory (observed TRUE). A `same_volume`
+            // stuck at either constant therefore reds this leg on one of the two shapes.
+            let observed_same = matches!(
+                mt.stat(&fat_path),
+                Ok(s) if matches!(s.kind, NodeKind::File) && s.size == p.size);
+            let reported_same = mt.same_volume("/", "/boot").unwrap_or(false);
+            serial_println!(
+                ":: volid: oracle probe={} size={} stat(/boot/probe)_matches={} same_volume={} ::",
+                p.name, p.size, observed_same, reported_same);
+            verdict(
+                "vfsroute.samevol",
+                reported_same == observed_same,
+                &alloc::format!(
+                    "reported={} observed={} probe={} size={} id(/)={:?} id(/boot)={:?}",
+                    reported_same, observed_same, p.name, p.size,
+                    mt.volume_id("/").ok().flatten(),
+                    mt.volume_id("/boot").ok().flatten()),
+            );
+            // Legs 2 and 3 assert against the OBSERVED fact, never against the router's own
+            // claim — see the oracle note above.
+
+            // --- leg 2: `ls`. The probe appears under `/`, and under `/boot` IFF the two prefixes
+            //     are the same volume. A verb that ignored the prefix would show it under both.
+            let ls_root = witness_capture(|c| vfs_ls(c, "/", false)).join(" | ");
+            let ls_fat = witness_capture(|c| vfs_ls(c, "/boot", false)).join(" | ");
+            let in_root = ls_root.contains(p.name.as_str());
+            let in_fat = ls_fat.contains(p.name.as_str());
+            verdict(
+                "vfsroute.ls",
+                in_root && (in_fat == observed_same),
+                &alloc::format!(
+                    "probe={} in_root={} in_fat={} observed_same={} root=[{}] fat=[{}]",
+                    p.name, in_root, in_fat, observed_same, ls_root, ls_fat),
+            );
+
+            // --- leg 3: `cat`. The same shape on the read path: the probe reads under `/`, and
+            //     under `/boot` IFF one volume. "Reads" is asserted as "did not print an error
+            //     line", and the negative half as "did", so both directions are convictable.
+            let cat_root = witness_capture(|c| vfs_cat(c, &root_path)).join(" | ");
+            let cat_fat = witness_capture(|c| vfs_cat(c, &fat_path)).join(" | ");
+            let root_read = !cat_root.starts_with("cat: ");
+            let fat_read = !cat_fat.starts_with("cat: ");
+            verdict(
+                "vfsroute.cat",
+                root_read && (fat_read == observed_same),
+                &alloc::format!(
+                    "root_read={} fat_read={} observed_same={} fat_said=[{}]",
+                    root_read, fat_read, observed_same,
+                    // Bounded: a FAIL on a binary probe file would otherwise pour the whole 8 KiB
+                    // console cap onto the wire, and the serial transport is the evidence channel.
+                    &cat_fat[..core::cmp::min(cat_fat.len(), 96)]),
+            );
+
+            // --- leg 4: `stat`. It must NAME the volume that answered, and the size it reports
+            //     must equal the size the LISTING reported for the same object — two verbs, one
+            //     fact, so a `stat` reading a different volume disagrees with `ls`.
+            let st = witness_capture(|c| fs_stat(c, &root_path)).join(" | ");
+            let names_volume = st.contains(&alloc::format!("volume: {}", root_vol));
+            let names_size = st.contains(&alloc::format!("size:   {} byte(s)", p.size));
+            let st_root = witness_capture(|c| fs_stat(c, "/")).join(" | ");
+            let root_is_dir = st_root.contains("kind:   dir");
+            verdict(
+                "vfsroute.stat",
+                names_volume && names_size && root_is_dir,
+                &alloc::format!(
+                    "volume={} size={} root_dir={} said=[{}]",
+                    names_volume, names_size, root_is_dir, st),
+            );
+        }
+    }
+
+    // --- leg 5: THE TYPED REFUSAL, and no fallback.
+    //
+    // `remove_attr` is the clean case: typed attributes are a UnaFS feature, the FAT backend
+    // implements none, and it therefore inherits the trait's default. Asked THROUGH THE TABLE about
+    // a FAT path it must answer exactly `Unsupported` — which the verb renders `-ENOTSUP` — and it
+    // must NOT be answered by some other volume that does have attributes. Deterministic on every
+    // board: the refusal is a property of the backend, not of the media in the slot.
+    //
+    // The aarch64 half adds the one an operator meets: `rmdir` on the native volume. The UnaFS crate
+    // has no directory removal, so `NativeBackend` inherits the default there too. Before VFSROUTE
+    // that keystroke walked fat.rs looking for the name on the BOOT PARTITION — the silent
+    // fall-through this arc exists to delete.
+    let fat_attr = mt.remove_attr("/boot/VFSROUTE.TXT", "k", SHELL_PRINCIPAL);
+    let fat_refused = fat_attr == Err(VfsError::Unsupported);
+    let native_rmdir = mt.remove_dir("/VFSROUTE.DIR", SHELL_PRINCIPAL);
+    // On a board whose root volume IS a FAT mount, `remove_dir` is implemented and answers about the
+    // object (`NoSuchPath`) rather than about the capability; on a native root it is the capability
+    // refusal. Both are typed errors from the volume that owns the path, which is the property.
+    let native_typed = matches!(
+        native_rmdir,
+        Err(VfsError::Unsupported) | Err(VfsError::NoSuchPath) | Err(VfsError::NotADirectory)
+    );
+    verdict(
+        "vfsroute.refuse",
+        fat_refused && native_typed,
+        &alloc::format!(
+            "fat_remove_attr={:?} root_remove_dir={:?} root_vol={}",
+            fat_attr, native_rmdir, root_vol),
+    );
+
+    // --- leg 6: THE ALIASING SHAPE ITSELF (VOLID, orin 18 — rmbp 15 condition C1) -----------------
+    //
+    // C1 is not a property of any prefix a particular board happens to mount: it is ONE MEDIUM
+    // BOUND TWICE UNDER TWO DIFFERENT NAMES. `sdmmc_root_bind` does exactly that on the Orin —
+    // `FatBackend::new_tegra_sd("card", …)` at `/` and `new_tegra_sd("fat", …)` at `/boot` — and
+    // `same_volume` compared the two NAMES, so one physical card read as two volumes and
+    // `mv /A.TXT /boot/B.TXT` was refused as cross-volume on the exact configuration render9 flies.
+    //
+    // NO BOARD THIS GATE CAN BOOT MOUNTS THAT SHAPE. x86 binds both prefixes under the SAME name
+    // and therefore answered correctly by luck; the Pi's two prefixes are genuinely two volumes.
+    // So the transcript BUILDS the shape, on this board's own media, in a scratch mount table that
+    // is dropped on return — nothing in the live namespace moves.
+    //
+    // BOTH DIRECTIONS OF THE NAME'S WRONGNESS, IN ONE LEG:
+    //   * `/volid-a` "card" and `/volid-b` "fat" over ONE source must be the SAME volume. A name
+    //     comparison says false here — one medium typed two names.
+    //   * `/volid-c` "card" over a DIFFERENT source must NOT be the same volume as `/volid-a`,
+    //     which carries the identical name. A name comparison says true here — two media typed one
+    //     name, the corrupting direction.
+    // Neither half is passable by a predicate stuck at a constant, and the ids are printed so the
+    // reader sees the values, not only their equality. When the second source is absent its id
+    // prints `None` and the negative half is carried by "no established identity" rather than by
+    // "a different medium" — which the line says, rather than implying a stronger measurement.
+    {
+        use crate::fs::fat::BlockSource;
+        use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+        // EVERY source this build can name, the board-specific ones FIRST so an Orin boot measures
+        // the LITERAL C1 pair (`TegraSd` under two names) rather than a stand-in, and an x86 boot
+        // finds the staged card that `Default` does not name (the first cut of this leg listed only
+        // `Default`/`Usb` and skipped itself on x86 with `handles=global=absent sdhc=present`).
+        #[allow(unused_mut)]
+        let mut cands = alloc::vec![BlockSource::Default, BlockSource::Usb];
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        cands.insert(0, BlockSource::TegraSd);
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        cands.insert(0, BlockSource::Sdhc);
+        let src = cands
+            .iter()
+            .copied()
+            .find(|s| crate::fs::fat::mount_source(*s).is_ok());
+        match src {
+            None => serial_println!(
+                ":: volid: no mountable FAT source on this board — alias leg skipped (handles={}) ::",
+                crate::drivers::block::source_census()),
+            Some(src) => {
+                // A second source that ALSO mounts makes the negative half a comparison of two live
+                // volumes; failing that, any other source, whose id is then `None` and whose line
+                // says so rather than implying a stronger measurement.
+                let other = cands
+                    .iter()
+                    .copied()
+                    .find(|s| *s != src && crate::fs::fat::mount_source(*s).is_ok())
+                    .or_else(|| cands.iter().copied().find(|s| *s != src));
+                let mut t = MountTable::new();
+                t.mount("/volid-a", alloc::boxed::Box::new(
+                    FatBackend::new_source("card", KERNEL_PRINCIPAL, true, src)));
+                t.mount("/volid-b", alloc::boxed::Box::new(
+                    FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
+                let id_a = t.volume_id("/volid-a").ok().flatten();
+                let id_b = t.volume_id("/volid-b").ok().flatten();
+                let alias_same = t.same_volume("/volid-a", "/volid-b").unwrap_or(false);
+                let (cross_same, id_c) = match other {
+                    None => (false, None),
+                    Some(o) => {
+                        t.mount("/volid-c", alloc::boxed::Box::new(
+                            FatBackend::new_source("card", KERNEL_PRINCIPAL, true, o)));
+                        (t.same_volume("/volid-a", "/volid-c").unwrap_or(false),
+                         t.volume_id("/volid-c").ok().flatten())
+                    }
+                };
+                // Printed unconditionally, for the same reason the census above is: the VALUES are
+                // the measurement, and `verdict` shows them only on FAIL.
+                serial_println!(
+                    ":: volid: alias one_source={} names=card/fat alias_same={} | cross other={} \
+                     cross_same={} | id(a)={:?} id(b)={:?} id(c)={:?} ::",
+                    src.name(), alias_same, other.map(|o| o.name()).unwrap_or("none"),
+                    cross_same, id_a, id_b, id_c);
+                verdict(
+                    "vfsroute.alias",
+                    alias_same && !cross_same && id_a.is_some() && id_a == id_b,
+                    &alloc::format!(
+                        "one_source={} names=card/fat alias_same={} cross_same={} other={} \
+                         id(a)={:?} id(b)={:?} id(c)={:?}",
+                        src.name(), alias_same, cross_same,
+                        other.map(|o| o.name()).unwrap_or("none"), id_a, id_b, id_c),
+                );
+            }
+        }
+    }
+}
+
+/// LAYOUT (orin 18): one-shot latch — the x86 service loop calls this site every pass.
+#[cfg(feature = "witness")]
+static LAYOUT_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// LAYOUT (orin 18): **does the tree beneath this file derive volume identity from the MEDIUM
+/// rather than from the mount's constructor NAME?** Measured, never declared.
+///
+/// This is what makes `layout.volid`'s expected-red EXPIRE without anyone editing a comment. It
+/// builds the aliasing shape in a SCRATCH [`crate::fs::vfs::MountTable`] that no board mounts, and
+/// reads the mechanism's answer back:
+///
+/// * **A** — two mounts of ONE source under DIFFERENT names. Name-derived identity answers
+///   DIFFERENT; medium-derived identity answers SAME.
+/// * **B** — two mounts of ONE source under the SAME name. Name-derived identity answers SAME;
+///   medium-derived identity answers SAME when that source carries a volume and DIFFERENT when it
+///   does not (an identity that cannot be established is equal to nothing, not even to itself).
+///
+/// `A || !B` is therefore true under medium-derived identity **whether or not
+/// `BlockSource::Default` has a volume on this board**, and false under name-derived identity in
+/// both cases. That independence is the point: it is a probe of the MECHANISM, not of the medium,
+/// so it answers correctly on the Orin (where `Default` has no device at all) as well as on a board
+/// that boots from it.
+///
+/// COST: none on the green path. It is consulted only on the branch where `layout.volid` would
+/// otherwise fail, and a name-derived `same_volume` compares two `&str` and touches no block
+/// device. That matters because this file's x86 call site is the storage-ready pass, where added
+/// block I/O was measured shifting the window-manager battery into two fixture flakes.
+#[cfg(feature = "witness")]
+fn volume_identity_is_medium_derived() -> bool {
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    let probe = |na: &str, nb: &str| {
+        let mut mt = MountTable::new();
+        mt.mount("/a", alloc::boxed::Box::new(FatBackend::new(na, KERNEL_PRINCIPAL, true)));
+        mt.mount("/b", alloc::boxed::Box::new(FatBackend::new(nb, KERNEL_PRINCIPAL, true)));
+        mt.same_volume("/a", "/b").unwrap_or(false)
+    };
+    let a = probe("layout-probe-x", "layout-probe-y");
+    let b = probe("layout-probe", "layout-probe");
+    a || !b
+}
+
+/// LAYOUT (orin 18): **the namespace this arc establishes, asserted on the live table.**
+///
+/// Two legs, and they fail for different reasons on purpose:
+///
+/// * `layout.apps` — programs are reachable at `/apps` and the old `/fat` prefix is GONE. It is
+///   two-sided: the probe must resolve under `/apps`, and the SAME leaf must NOT resolve under
+///   `/fat`, so a build that merely added a mount without retiring the old one still reds. The
+///   third claim is the one that makes it a layout gate rather than a mount gate — a bare name
+///   resolves through [`EXEC_ROOT`] to the `/apps` path, which is what an operator typing `vug`
+///   actually depends on. Point `EXEC_ROOT` back at the boot volume and this leg reds.
+///
+/// * `layout.volid` — **the aliasing property, with an oracle that is not `same_volume`.** If `/`
+///   and `/boot` are ONE medium, `MountTable::same_volume("/", "/boot")` must say so. The oracle is
+///   `VfsBackend::describe()` — the backend's own FAT geometry line (`part_lba`, `vol_sectors`,
+///   `bytes_per_sec`, `sec_per_clus`, `fat_start`, `data_start`, `count_of_clusters`) — plus an
+///   entry-for-entry comparison of the two root listings. Two mounts that agree on all of that are
+///   reading one volume; `same_volume` compares constructor STRINGS and can disagree, which is
+///   exactly rmbp 15's blocking condition C1: the Orin binds one card as `card` at `/` and `fat` at
+///   `/boot`, so one card reads as two volumes. It is not red anywhere else: on the
+///   Pi `/` is native UnaFS and `/boot` is FAT, so the oracle says "different" and the implication
+///   is satisfied vacuously (the witness text says which); on x86 both prefixes carry one name and
+///   both sides say "same".
+///
+///   **THE EXPECTED RED EXPIRES BY ITSELF, AND THE LEG DETECTS THE CONDITION — it is not told by a
+///   comment.** This leg used to carry the sentence "EXPECTED RED on the Orin until the VOLID arc
+///   lands volume identity", and rmbp 15 was right that such a sentence is a MASK: while a leg is
+///   expected to fail it cannot report anything ELSE failing, and nobody re-reads the comment to
+///   find out when the excuse expired. So the excuse is now measured, on the branch where the leg
+///   would otherwise fail, by [`volume_identity_is_medium_derived`] — a probe of the MECHANISM in a
+///   scratch `MountTable` that no board mounts. Medium-derived identity beneath us and the claim
+///   still violated ⇒ `layout.volid -> FAIL`, a real defect. Identity still NAME-derived ⇒ the leg
+///   scores, **under the different name `layout.volid.pre`**, the only shape that is excusable
+///   without VOLID: one medium reported as two volumes *because the two constructor names differ*.
+///   Any other shape reds that leg too, so nothing is masked; and the day VOLID lands beneath this
+///   tree the probe flips, `layout.volid.pre` disappears from the transcript, and `layout.volid`
+///   must be GREEN. A `layout.volid -> PASS` therefore always means the full claim.
+///
+/// A board with no `/apps` mount, or one whose medium has no `APPS/` directory (a card staged
+/// before this layout), SKIPS with a stated line rather than failing — the honest answer, and the
+/// reason `./arroyo test` on the pattern-image default does not red.
+#[cfg(feature = "witness")]
+pub fn layout_witness() {
+    use core::sync::atomic::Ordering;
+    use crate::fs::vfs::NodeKind;
+    if LAYOUT_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+    let mt = vfs_mount_table();
+
+    // ── layout.volid: the aliasing property ─────────────────────────────────────────────────────
+    // Run FIRST, and independently of `/apps`, because it is a claim about `/` and `/boot` that
+    // holds (or does not) whatever the program directory looks like.
+    {
+        let prefixes = mt.prefixes();
+        let bound = |p: &str| prefixes.iter().any(|q| *q == p);
+        if !bound("/") || !bound("/boot") {
+            serial_println!(
+                ":: layout: this board binds no {} — layout.volid skipped ::",
+                if bound("/") { "/boot" } else { "/" });
+        } else {
+            let says_same = mt.same_volume("/", "/boot").unwrap_or(false);
+            // THE ORACLE IS CONSULTED ONLY WHEN THE ANSWER UNDER TEST IS "NO", and that is a
+            // consequence of the claim being an IMPLICATION rather than an equality: a
+            // `same_volume` that already says "one volume" satisfies it whatever the medium turns
+            // out to be. Asking anyway costs two FAT re-mounts (`describe()` mounts per call) and
+            // two full root walks, and that I/O is not free at this call site — it was measured
+            // shifting the x86 window-manager battery's timing into two different fixture flakes.
+            //
+            // When it IS consulted, it is deliberately not `same_volume`: the backends' own
+            // descriptions of the medium (the FAT geometry line each prints about ITSELF —
+            // `part_lba`, `vol_sectors`, `bytes_per_sec`, `sec_per_clus`, `fat_start`,
+            // `data_start`, `count_of_clusters`), and only if those agree, their root listings
+            // compared entry for entry.
+            let (oracle_one_volume, why) = if says_same {
+                (false, String::from("not consulted (same_volume already true)"))
+            } else {
+                let rows = mt.rows();
+                let at = |p: &str| rows.iter().position(|r| r.0 == p).unwrap_or(0);
+                let (i_root, i_boot) = (at("/"), at("/boot"));
+                let same_geometry = rows[i_root].4.is_some() && rows[i_root].4 == rows[i_boot].4;
+                let listings_match = same_geometry
+                    && match (mt.read_dir("/"), mt.read_dir("/boot")) {
+                        (Ok(a), Ok(b)) => {
+                            !a.is_empty()
+                                && a.len() == b.len()
+                                && a.iter().zip(b.iter()).all(|(x, y)| {
+                                    x.name == y.name && x.kind == y.kind && x.size == y.size
+                                })
+                        }
+                        _ => false,
+                    };
+                (
+                    same_geometry && listings_match,
+                    alloc::format!(
+                        "geometry_match={} listings_match={} root_vol={} boot_vol={}",
+                        same_geometry, listings_match, rows[i_root].1, rows[i_boot].1),
+                )
+            };
+            // The implication, not the equality: the oracle can only ever prove SAMENESS (two
+            // different media could in principle carry identical geometry AND identical listings),
+            // so "the oracle says different" is not a licence to demand `same_volume == false`.
+            let claim_holds = !oracle_one_volume || says_same;
+            let got = alloc::format!(
+                "oracle_one_volume={} same_volume={} oracle: {}",
+                oracle_one_volume, says_same, why);
+            // THE EXPECTED-RED EXPIRY (rmbp 15's non-blocking note), and the probe is reached ONLY
+            // here — on the branch that is already failing — so the green path costs nothing.
+            if claim_holds {
+                verdict("layout.volid", true, &got);
+            } else if volume_identity_is_medium_derived() {
+                verdict(
+                    "layout.volid",
+                    false,
+                    &alloc::format!(
+                        "{} identity=MEDIUM-derived (scratch-table probe) — the pre-VOLID excuse \
+                         has expired and this is a real defect",
+                        got),
+                );
+            } else {
+                // Identity is still the constructor NAME beneath us. Score the ONLY shape that is
+                // excusable without VOLID — one medium, two names — under a DIFFERENT LEG NAME, so
+                // no transcript can read this as the full claim and no spec can require it by
+                // mistake. Any other shape here still reds.
+                let names_differ = mt.volume_name("/").ok() != mt.volume_name("/boot").ok();
+                serial_println!(
+                    ":: layout: volume identity is still NAME-derived beneath this leg (probe: one \
+                     source mounted twice under two names compares unequal), so the aliasing claim \
+                     is scored as layout.volid.pre; it reverts to layout.volid the moment that \
+                     probe flips ::");
+                verdict(
+                    "layout.volid.pre",
+                    names_differ,
+                    &alloc::format!("{} names_differ={}", got, names_differ),
+                );
+            }
+        }
+    }
+
+    // ── layout.apps: programs are at /apps, and /fat is gone ────────────────────────────────────
+    // THE PREFIX IS SPELLED OUT, not read from [`EXEC_ROOT`]. This leg is the claim that programs
+    // live at `/apps`; taking the directory from the constant under test would make it say only
+    // "programs live wherever EXEC_ROOT points", which is true of every value of EXEC_ROOT and
+    // therefore convicts nothing. EXEC_ROOT appears once below, in the bare-name leg, where the
+    // whole point is that it must AGREE with this prefix.
+    const APPS_MOUNT: &str = "/apps";
+    let apps = match mt.read_dir(APPS_MOUNT) {
+        Ok(rows) => rows,
+        Err(e) => {
+            serial_println!(
+                ":: layout: {} does not list on this board ({:?}) — layout.apps skipped ::",
+                APPS_MOUNT, e);
+            return;
+        }
+    };
+    // Prefer the program the rest of the battery launches; fall back to whatever file IS staged, so
+    // the leg is a claim about the LAYOUT rather than about one image's presence.
+    let probe = apps
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case("VUG.ELF") && matches!(r.kind, NodeKind::File))
+        .or_else(|| apps.iter().find(|r| matches!(r.kind, NodeKind::File)));
+    let Some(probe) = probe else {
+        serial_println!(
+            ":: layout: {} lists {} entries but no file — layout.apps skipped ::",
+            APPS_MOUNT, apps.len());
+        return;
+    };
+    let in_apps = vfs_join(APPS_MOUNT, &probe.name);
+    let in_fat = vfs_join("/fat", &probe.name);
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, NodeKind::Dir));
+    let resolves = is_file(&in_apps);
+    // `/fat` must not be a mount prefix AND must not resolve as an object — it is retired, not
+    // aliased. (`/fat/<leaf>` is checked too: a leftover mount would answer for the leaf.)
+    // `prefixes()`, not `rows()`: `rows()` calls `describe()` on every mount, which re-mounts the
+    // volume once per row — a listing question must not cost a FAT mount per mount point.
+    let fat_prefix_gone = !mt.prefixes().iter().any(|p| *p == "/fat");
+    let fat_gone = fat_prefix_gone && mt.stat("/fat").is_err() && !is_file(&in_fat);
+    // THE LEG THAT MOVES WITH `EXEC_ROOT`: a bare name, from `/`, must land on the `/apps` path.
+    // This is what reds if `EXEC_ROOT` is pointed back at the boot volume.
+    #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
+    let (bare_ok, bare_got) = {
+        let got = exec_resolve(&probe.name);
+        (got.as_deref() == Some(in_apps.as_str()), alloc::format!("{:?}", got))
+    };
+    #[cfg(not(all(feature = "aarch64_el0", target_arch = "aarch64")))]
+    let (bare_ok, bare_got) = (true, String::from("n/a (no exec_resolve on this build)"));
+    verdict(
+        "layout.apps",
+        resolves && fat_gone && bare_ok,
+        &alloc::format!(
+            "probe={} apps_resolves={} fat_prefix_gone={} fat_gone={} bare={} exec_root={}",
+            probe.name, resolves, fat_prefix_gone, fat_gone, bare_got, EXEC_ROOT),
+    );
+}
+
+/// LAYOUT (orin 18): one-shot latch for [`layout_mv_witness`].
+#[cfg(feature = "witness")]
+static LAYOUT_MV_WITNESS_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// LAYOUT (orin 18): `layout.mv` — **a move across the TWO ADDRESS SPACES of ONE VOLUME, in both
+/// directions, scored by ABSENCE FROM THE SOURCE as well as presence at the destination.**
+///
+/// This is rmbp 15's blocking finding B66 made failable. `/boot` and `/apps` are one volume with
+/// two roots (`""` and `/APPS`), and `MountTable::rename` used to hand the DESTINATION's remainder
+/// to the SOURCE's backend. Both wrong outcomes reported success and left a file that exists
+/// SOMEWHERE:
+///
+/// * `mv /boot/A.TXT /apps/B.TXT` wrote `B.TXT` to the VOLUME ROOT, never inside `APPS/`;
+/// * `mv /apps/X.ELF /boot/Y.ELF` renamed `APPS/X.ELF` to `APPS/Y.ELF` — the program never left
+///   `/apps`.
+///
+/// **So a presence-only assertion passes on the bug in both directions**, and the absence half is
+/// the load-bearing one. Each direction asserts three things: the destination lists the new leaf,
+/// the source lists NEITHER the old leaf (it really moved) NOR the new one (it did not land in the
+/// source's own space under the destination's name).
+///
+/// The two directions each stage their OWN probe rather than one consuming the other's output.
+/// Chaining them would let direction 1's failure turn direction 2 into "not run" instead of
+/// convicted — an un-exercised half is exactly what this leg exists to rule out.
+///
+/// It also asserts `roots_differ` through [`crate::fs::vfs::VfsBackend::mount_root`], because
+/// without that the whole leg is vacuous: two mounts rooted at the same directory cannot exhibit
+/// the defect, so a build that quietly un-rooted `/apps` would turn this from a passing gate into
+/// a passing no-op. The leg says so instead.
+///
+/// It goes through `fs_mv`, the operator's own verb, so the verb's success line is on the wire next
+/// to the verdict — the defect's whole character is that it REPORTS SUCCESS.
+///
+/// # WHERE IT RUNS, AND WHY NOT ON x86
+///
+/// Only the aarch64 bare-metal witness site. The x86 site is the storage-ready pass, and added
+/// block I/O there was MEASURED (this arc's own commit `38b56dba`) shifting the window-manager
+/// battery into two different fixture flakes. This leg is create + rename + rename + two listings
+/// per direction + unlink, which is well past what that pass tolerates, and the code under test is
+/// arch-neutral (`fs/vfs.rs`), so the Pi bare-metal gate convicts it for both arches.
+///
+/// # IT SELF-CLEANS
+///
+/// Every name it makes is unlinked under BOTH prefixes before it returns — under both, because on
+/// the failing path the probe is in the space the fixture did not aim at, and a fixture that leaks
+/// a file on a red run poisons the next boot's `layout.apps` probe selection.
+///
+/// A board that binds only one of the two prefixes, that reports them as different volumes, or
+/// whose volume refuses writes (the Orin's read-only card) SKIPS with a stated line — the honest
+/// answer, and never a silent pass.
+#[cfg(feature = "witness")]
+pub fn layout_mv_witness() {
+    use core::sync::atomic::Ordering;
+    // `mount_root` is reached on a `&dyn VfsBackend`, whose trait methods are inherent candidates —
+    // no `use` of the trait is needed (and importing it warns as unused).
+    use crate::fs::vfs::NodeKind;
+    if LAYOUT_MV_WITNESS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    const BOOT: &str = "/boot";
+    const APPS: &str = "/apps";
+    // 8.3 short names: FAT create is 8.3-only on this driver (VFAT LFN write is out of scope).
+    const N1: &str = "LAYMV1.TMP";
+    const N2: &str = "LAYMV2.TMP";
+    const N3: &str = "LAYMV3.TMP";
+
+    let mt = vfs_mount_table();
+    let prefixes = mt.prefixes();
+    let bound = |p: &str| prefixes.iter().any(|q| *q == p);
+    if !bound(BOOT) || !bound(APPS) {
+        return serial_println!(
+            ":: layout: this board binds no {} — layout.mv skipped ::",
+            if bound(BOOT) { APPS } else { BOOT });
+    }
+    if !mt.same_volume(BOOT, APPS).unwrap_or(false) {
+        return serial_println!(
+            ":: layout: {} and {} are not one volume on this board — layout.mv skipped ::",
+            BOOT, APPS);
+    }
+    for p in [BOOT, APPS] {
+        if let Ok(Some(veto)) = mt.write_veto(p) {
+            return serial_println!(
+                ":: layout: {} refuses writes ({}) — layout.mv skipped ::", p, veto);
+        }
+    }
+    // The two mounts must really be two spaces, or the leg proves nothing.
+    let root_of = |p: &str| {
+        mt.resolve(p).map(|(b, _)| String::from(b.mount_root())).unwrap_or_default()
+    };
+    let (boot_root, apps_root) = (root_of(BOOT), root_of(APPS));
+    let roots_differ = !boot_root.eq_ignore_ascii_case(&apps_root);
+
+    let lists = |dir: &str, leaf: &str| {
+        matches!(mt.read_dir(dir), Ok(rs)
+            if rs.iter().any(|r| r.name.eq_ignore_ascii_case(leaf)
+                && matches!(r.kind, NodeKind::File)))
+    };
+    let scrub = || {
+        for dir in [BOOT, APPS] {
+            for leaf in [N1, N2, N3] {
+                let _ = mt.unlink(&vfs_join(dir, leaf), SHELL_PRINCIPAL);
+            }
+        }
+    };
+    scrub(); // a previous red run may have left one of these somewhere
+
+    // THE TWO DIRECTIONS ARE INDEPENDENT: each stages its OWN probe rather than consuming the
+    // other's output. Chaining them would make direction 1's failure hide direction 2's assertion
+    // entirely — the falsifier reds direction 1, and a chained direction 2 would then be "not run"
+    // rather than convicted, which is precisely the kind of un-exercised half this leg exists to
+    // rule out.
+    let stage = |dir: &str, leaf: &str| {
+        mt.create(&vfs_join(dir, leaf), NodeKind::File, SHELL_PRINCIPAL)
+    };
+
+    // ── direction 1: /boot -> /apps. The bug wrote the leaf to the VOLUME ROOT and said "moved".
+    if let Err(e) = stage(BOOT, N1) {
+        return serial_println!(
+            ":: layout: cannot stage {} on {} ({:?}) — layout.mv skipped ::", N1, BOOT, e);
+    }
+    let said_a = witness_capture(|c| fs_mv(c, &vfs_join(BOOT, N1), &vfs_join(APPS, N2), false))
+        .join(" | ");
+    let a_at_dst = lists(APPS, N2);
+    let a_src_clean = !lists(BOOT, N1) && !lists(BOOT, N2);
+    scrub();
+
+    // ── direction 2: /apps -> /boot. The bug renamed within APPS/ and said "moved".
+    if let Err(e) = stage(APPS, N2) {
+        return serial_println!(
+            ":: layout: cannot stage {} on {} ({:?}) — layout.mv skipped ::", N2, APPS, e);
+    }
+    let said_b = witness_capture(|c| fs_mv(c, &vfs_join(APPS, N2), &vfs_join(BOOT, N3), false))
+        .join(" | ");
+    let b_at_dst = lists(BOOT, N3);
+    let b_src_clean = !lists(APPS, N2) && !lists(APPS, N3);
+    scrub();
+
+    verdict_layout_mv(
+        roots_differ && a_at_dst && a_src_clean && b_at_dst && b_src_clean,
+        &alloc::format!(
+            "roots_differ={} ({:?} vs {:?}) a_at_dst={} a_src_clean={} b_at_dst={} \
+             b_src_clean={} said_a=[{}] said_b=[{}]",
+            roots_differ, boot_root, apps_root, a_at_dst, a_src_clean, b_at_dst, b_src_clean,
+            &said_a[..core::cmp::min(said_a.len(), 96)],
+            &said_b[..core::cmp::min(said_b.len(), 96)]),
+    );
+}
+
+/// LAYOUT (orin 18): [`layout_mv_witness`]'s verdict line, in the house `:: TSTE: <leg> ->` shape.
+#[cfg(feature = "witness")]
+fn verdict_layout_mv(ok: bool, got: &str) {
+    if ok {
+        serial_println!(":: TSTE: layout.mv -> PASS ::");
+    } else {
+        serial_println!(":: TSTE: layout.mv -> FAIL (got {}) ::", got);
+    }
+}
+
+// ============ ACLSYM (orin 19) — the two-posture witness `a62188c9` said it still owed ============
+//
+// `a62188c9` made `MountTable::rename` ask BOTH mounts — the source about the object that LEAVES it,
+// the destination about the RECEIVING DIRECTORY — and closed with the defect it had not closed:
+//
+//     "STILL OWED, and named so it cannot go quiet: no test EXERCISES the new refusal. Every mount
+//      in the tree is built with the identical principal and world_readable ... so the gate above
+//      proves NO REGRESSION — not that the fix fires."
+//
+// That is a check that cannot fire, and a check that cannot fire is theatre. These two legs are the
+// falsifier. They have DIFFERENT reachability on purpose, and each says which:
+//
+//   * `vfs.aclsym.dir` — the SHAPE, pure, no medium. It has no skip branch at all.
+//   * `vfs.aclsym` — the POSTURE, and it needs a FAT volume, so it SKIPS with a stated reason where
+//     there is none. A skip is never scored as a pass and never as a fail.
+//
+// MEASURED REACH, because "every board" is the kind of claim this arc exists to stop taking on
+// trust. `midden_witness` — the battery both legs hang off — is called from `main.rs` under
+// `all(aarch64, baremetal, witness)` and `all(x86_64, witness)`, so the TSTE family reaches the Pi
+// bare-metal gate and the x86 gate and NOT aarch64/virt: `./arroyo test-arm` prints
+// `witness=on` and zero `:: TSTE:` lines, before this arc as after it. `vfs.aclsym.dir` therefore
+// fires on every board the battery reaches, which is not the same sentence as "every board".
+
+/// ACLSYM (orin 19): one-shot latch for [`vfs_aclsym_shape_witness`] — the x86 service loop reaches
+/// its call site every pass.
+#[cfg(feature = "witness")]
+static VFS_ACLSYM_SHAPE_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// ACLSYM (orin 19): one-shot latch for [`vfs_aclsym_witness`].
+#[cfg(feature = "witness")]
+static VFS_ACLSYM_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// ACLSYM (orin 19): the two legs' verdict line, in the house `:: TSTE: <leg> ->` shape. One helper
+/// rather than a copy per function, because the two legs must be spelled identically or a spec row
+/// written against one would silently not match the other.
+#[cfg(feature = "witness")]
+fn verdict_aclsym(name: &str, ok: bool, got: &str) {
+    if ok {
+        serial_println!(":: TSTE: {} -> PASS ::", name);
+    } else {
+        serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+    }
+}
+
+/// ACLSYM (orin 19): **`vfs.aclsym.dir` — the receiving directory, asserted as a VALUE.**
+///
+/// [`crate::fs::vfs::receiving_dir`] encodes one decision: a rename's destination LEAF DOES NOT
+/// EXIST YET, so the destination mount is asked about the DIRECTORY that will receive it. That
+/// decision cost `exec-orin18-aclsym` a red gate (`MBENCH FAIL 118/119`, `mv: /RELIC3.TXT: -ENOENT`)
+/// before it was found, and a decision that lives only in a comment rots without a conflict. So the
+/// mapping is pinned here, all four shapes:
+///
+/// | `rel`          | receiving directory | what it pins                                  |
+/// |----------------|---------------------|-----------------------------------------------|
+/// | `/APPS/X.ELF`  | `/APPS`             | the leaf is dropped, the parent is kept        |
+/// | `/X.TXT`       | `""`                | a leaf at the mount root yields the MOUNT POINT|
+/// | `""`           | `""`                | total on the empty remainder — no panic on pop |
+/// | `/A/B/C`       | `/A/B`              | only the LAST component goes                   |
+///
+/// **It can fail.** Every case compares against a literal, and the FAIL line prints each input with
+/// what it got beside what was wanted. Make `receiving_dir` the identity and all four red; make it
+/// return `""` unconditionally and two red; drop the `""` case's guard and it panics rather than
+/// passing.
+///
+/// **It has no skip branch**: a `Vec` of `&str` and a `String` push, no block device, no mount. So
+/// wherever the TSTE battery runs at all — the Pi bare-metal gate and the x86 gate; see the module
+/// note above for the measured reach — this leg either PASSes or FAILs. It cannot go quiet.
+#[cfg(feature = "witness")]
+pub fn vfs_aclsym_shape_witness() {
+    use core::sync::atomic::Ordering;
+    if VFS_ACLSYM_SHAPE_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // (mount-relative destination, the directory that must receive its leaf)
+    const CASES: [(&str, &str); 4] = [
+        ("/APPS/X.ELF", "/APPS"),
+        ("/X.TXT", ""),
+        ("", ""),
+        ("/A/B/C", "/A/B"),
+    ];
+    let mut ok = true;
+    let mut got = String::new();
+    for (rel, want) in CASES {
+        let have = crate::fs::vfs::receiving_dir(rel);
+        if have != want {
+            ok = false;
+        }
+        if !got.is_empty() {
+            got.push(' ');
+        }
+        got.push_str(&alloc::format!("{:?}->{:?}(want {:?})", rel, have, want));
+    }
+    verdict_aclsym("vfs.aclsym.dir", ok, &got);
+}
+
+/// ACLSYM (orin 19): **`vfs.aclsym` — the DESTINATION mount's posture refusing a principal the
+/// SOURCE mount permits.** The refusal `a62188c9` added and nothing exercised.
+///
+/// # WHY NOTHING EXERCISED IT, AND WHY THIS TABLE IS LOCAL
+///
+/// Every mount the live table binds is constructed with the identical principal and
+/// `world_readable`. That is the unstated invariant rmbp 15 called load-bearing: while it holds, the
+/// destination's `authorize_write` answers exactly what the source's answered, so deleting the new
+/// call changes NOTHING on the live tree and the whole 119-witness battery stays green. A witness
+/// built on the live table therefore cannot convict, however it is written.
+///
+/// So this builds its OWN [`crate::fs::vfs::MountTable`] that no board mounts — the same scratch
+/// -table technique [`volume_identity_is_medium_derived`] uses — and binds ONE volume
+/// ([`crate::fs::vfs::FatBackend`] over `BlockSource::Default`, three times) under THREE POSTURES:
+///
+/// * `/aclsym-src`  — principal `alice`. The source.
+/// * `/aclsym-deny` — principal `bob`. The destination that must refuse.
+/// * `/aclsym-ok`   — principal `alice`. The CONTROL destination, identical to `-deny` in every
+///   field except the principal, so the two legs differ in exactly ONE variable.
+///
+/// # THE TWO LEGS, AND WHY THE CONTROL IS NOT OPTIONAL
+///
+/// * **refusal** — `rename("/aclsym-src/…", "/aclsym-deny/…", "alice")` must be
+///   [`VfsError::Denied`](crate::fs::vfs::VfsError::Denied). `alice` owns the SOURCE mount, so the
+///   source's `authorize_write` says yes; only the destination mount's posture can say no. Revert
+///   `a62188c9`'s `bt.authorize_write(&receiving_dir(relt), principal)?` and this leg reds — measured,
+///   not asserted (see this arc's PROGRESS note).
+/// * **control** — the SAME call with the destination built for `alice` must be anything BUT
+///   `Denied`. Without it the refusal leg is ambiguous three ways: a `Denied` could equally come from
+///   the SOURCE's posture, from a read-only medium, or from a rename that refuses everything. The
+///   control holds all three fixed and flips only the destination principal. It is deliberately NOT
+///   asserted to be `Ok`: the probe file does not exist, so the FAT backend answers a `NotFound`-class
+///   error from inside `rename` — which is past the ACL and is exactly what the leg needs to see.
+///
+/// **Neither leg needs a file to exist.** `MountTable::rename` runs both `authorize_write` calls
+/// BEFORE `b.rename`, and `FatBackend::authorize_write` ignores its `rel` entirely (it is a volume
+/// posture, not a per-object ACL) — verified in the code, not assumed. The refusal leg never reaches
+/// the backend at all; the control leg does, and finds nothing.
+///
+/// # WHERE IT SKIPS, AND WHY EACH SKIP IS THE HONEST ANSWER
+///
+/// Three conditions would make a leg say `Denied`/not-`Denied` for a reason that is not the posture.
+/// Each returns a STATED skip line rather than a verdict — never a FAIL, and never a silent pass:
+///
+/// 1. **No FAT volume behind the source.** `volume_id` is `None`, [`crate::fs::vfs::same_storage`]
+///    treats `None` as equal to nothing, and `rename` returns `Unsupported` BEFORE any ACL runs. This
+///    is asked through `same_volume`, the public spelling of the same predicate `rename` enforces.
+/// 2. **The medium refuses writes.** `FatBackend::authorize_write` checks `read_only()` FIRST and
+///    answers `Unsupported`, so the principal comparison is never reached and BOTH legs would pass
+///    vacuously (`Unsupported` is not `Denied`) — the exact shape of a check that cannot fire.
+/// 3. **The probe names already exist.** The control leg runs `b.rename` to completion; a real
+///    `ACLSYM1.TMP` on the volume would be MOVED by it. The leg refuses to run rather than mutate a
+///    file it did not stage. (It stages nothing and cleans nothing — it has nothing to clean.)
+///
+/// # WHERE IT RUNS
+///
+/// aarch64 bare-metal only, the same site and the same reason as [`layout_mv_witness`]: the x86
+/// witness site is the storage-ready pass, where added block I/O was MEASURED (orin 18's `38b56dba`)
+/// shifting the window-manager battery into two fixture flakes. The code under test is arch-neutral
+/// (`fs/vfs.rs`), so the Pi bare-metal gate convicts it for both arches. The SHAPE leg above carries
+/// no such cost and runs everywhere.
+#[cfg(feature = "witness")]
+pub fn vfs_aclsym_witness() {
+    use core::sync::atomic::Ordering;
+    use crate::fs::vfs::{FatBackend, MountTable, VfsError};
+    if VFS_ACLSYM_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    const SRC: &str = "/aclsym-src";
+    const DENY: &str = "/aclsym-deny";
+    const OK: &str = "/aclsym-ok";
+    // Neither is `KERNEL_PRINCIPAL` ("kernel"), which `authorize_write` admits unconditionally.
+    const OWNER: &str = "alice";
+    const STRANGER: &str = "bob";
+    // 8.3 short names: FAT create/rename is 8.3-only on this driver.
+    const N1: &str = "ACLSYM1.TMP";
+    const N2: &str = "ACLSYM2.TMP";
+
+    let mut mt = MountTable::new();
+    mt.mount(SRC, alloc::boxed::Box::new(FatBackend::new("fat", OWNER, true)));
+    mt.mount(DENY, alloc::boxed::Box::new(FatBackend::new("fat", STRANGER, false)));
+    mt.mount(OK, alloc::boxed::Box::new(FatBackend::new("fat", OWNER, false)));
+
+    // SKIP 1 — `rename` refuses on `same_storage` BEFORE it reaches either ACL, so without a volume
+    // both legs would read `Unsupported` and the refusal leg would fail for a reason that is not the
+    // posture. Asked in both directions: the control's destination is a third mount.
+    if !mt.same_volume(SRC, DENY).unwrap_or(false) || !mt.same_volume(SRC, OK).unwrap_or(false) {
+        return serial_println!(
+            ":: aclsym: this board binds no FAT volume on BlockSource::Default (volume_id={:?}) \
+             — vfs.aclsym skipped ::",
+            mt.volume_id(SRC).ok().flatten());
+    }
+    // SKIP 2 — a read-only medium answers `Unsupported` from `authorize_write`'s FIRST guard, before
+    // the principal is ever compared. Both legs would then "pass" without exercising a posture.
+    for p in [SRC, DENY, OK] {
+        if let Ok(Some(veto)) = mt.write_veto(p) {
+            return serial_println!(
+                ":: aclsym: {} refuses writes ({}) — vfs.aclsym skipped ::", p, veto);
+        }
+    }
+    let from = vfs_join(SRC, N1);
+    let to_deny = vfs_join(DENY, N2);
+    let to_ok = vfs_join(OK, N2);
+    // SKIP 3 — the control leg runs `b.rename` to completion. If these names were real files on the
+    // medium it would MOVE one. Refuse rather than mutate what this leg did not stage.
+    if mt.stat(&from).is_ok() || mt.stat(&to_deny).is_ok() {
+        return serial_println!(
+            ":: aclsym: {} or {} already exists on this volume — vfs.aclsym skipped ::", N1, N2);
+    }
+
+    // THE REFUSAL: `alice` owns the SOURCE, so the source's posture says yes and only the
+    // DESTINATION mount's can say no. This is the call that returned `Ok`-then-rename before
+    // `a62188c9`, on a tree where no gate could see it.
+    let refused = mt.rename(&from, &to_deny, OWNER);
+    // THE CONTROL: one variable changed — the destination mount's principal. Anything but `Denied`.
+    let control = mt.rename(&from, &to_ok, OWNER);
+    let refusal_ok = refused == Err(VfsError::Denied);
+    let control_ok = control != Err(VfsError::Denied);
+    verdict_aclsym(
+        "vfs.aclsym",
+        refusal_ok && control_ok,
+        &alloc::format!(
+            "src=({},{}) deny=({},{}) ok=({},{}) principal={} refused={:?} want=Err(Denied) \
+             control={:?} want=anything-but-Err(Denied) refusal_ok={} control_ok={}",
+            SRC, OWNER, DENY, STRANGER, OK, OWNER, OWNER, refused, control, refusal_ok, control_ok),
+    );
+}
+
+/// VFSROUTE (orin 17): the NATIVE-volume mutation transcript — `touch`, `ls`, `mkdir`, `rmdir`, `rm`
+/// through the plain verbs, on the volume the pre-VFSROUTE mutating verbs could not reach.
+///
+/// # IT SELF-CLEANS, AND THAT CONSTRAINT SHAPED TWO OF THE LEGS
+///
+/// `fs/unafs.rs`'s `k3_mount_selftest` bit5 requires the native root to hold the staged fixtures and
+/// `acl-*` rows and NOTHING ELSE. Every file this transcript creates is deleted before it returns; a
+/// DIRECTORY cannot be, because the UnaFS crate has no directory removal at all. So there is no
+/// positive `mkdir` leg here — instead `mkdir` is aimed at the file `touch` just made and must be
+/// refused `-EEXIST`, which is a ROUTING proof (a `mkdir` still riding fat.rs would not find that
+/// name on the boot partition and would create a directory and report success), and `rmdir` is aimed
+/// at the same name and must be refused `-ENOTSUP`, which is the CAPABILITY proof: the native
+/// backend implements no directory removal, so the verb prints the volume's own answer instead of
+/// falling through to the FAT walker — the exact silent fallback this arc deletes.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
+fn vfsroute_native_witness() {
+    fn verdict(name: &str, ok: bool, got: &str) {
+        if ok {
+            serial_println!(":: TSTE: {} -> PASS ::", name);
+        } else {
+            serial_println!(":: TSTE: {} -> FAIL (got {}) ::", name, got);
+        }
+    }
+    fn listed(name: &str) -> bool {
+        match vfs_ls_collect("/") {
+            Ok((_, rows)) => rows.iter().any(|d| d.name == name),
+            Err(_) => false,
+        }
+    }
+    let say = |f: &dyn Fn(&mut Console)| -> String { witness_capture(|c| f(c)).join(" | ") };
+    const F: &str = "/VFSR1.TXT";
+
+    // 1. `touch` lands on the NATIVE volume, and `ls` — the read verb, through the mount table —
+    //    sees it. Two different verbs, one fact.
+    let said = say(&|c: &mut Console| fs_touch(c, F));
+    let after = listed("VFSR1.TXT");
+    verdict("vfsroute.touch", after, &alloc::format!("said={} listed={}", said, after));
+
+    // 2. `mkdir` at the same name: refused -EEXIST, and the name is STILL A FILE afterwards.
+    let said = say(&|c: &mut Console| fs_mkdir(c, F));
+    let eexist = said.contains("-EEXIST");
+    let still_file = listed("VFSR1.TXT");
+    verdict("vfsroute.mkdir", eexist && still_file,
+        &alloc::format!("said={} eexist={} still_file={}", said, eexist, still_file));
+
+    // 3. `rmdir`: the CAPABILITY refusal — the native backend implements no directory removal, so
+    //    the verb prints `-ENOTSUP` and nothing anywhere is removed.
+    let said = say(&|c: &mut Console| fs_rmdir(c, F));
+    let enotsup = said.contains("-ENOTSUP");
+    let untouched = listed("VFSR1.TXT");
+    verdict("vfsroute.rmdir", enotsup && untouched,
+        &alloc::format!("said={} enotsup={} untouched={}", said, enotsup, untouched));
+
+    // 4. `rm`, and the SELF-CLEAN — asserted, not assumed (bit5 fails on a leaked fixture).
+    let said = say(&|c: &mut Console| fs_rm(c, F, false));
+    let gone = !listed("VFSR1.TXT");
+    let clean = match vfs_ls_collect("/") {
+        Ok((_, rows)) => !rows.iter().any(|d| d.name.starts_with("VFSR")),
+        Err(_) => false,
+    };
+    verdict("vfsroute.rm", gone && clean,
+        &alloc::format!("said={} gone={} root_clean={}", said, gone, clean));
 }
 
 // ===================== FATVERB — the storage witness, after storage exists =========================
@@ -2858,6 +4741,17 @@ pub fn fatverb_storage_witness() {
         ":: [fatverb] storage witness: exec={} read={} gate={} waited={}ms handles={} ::",
         bind::name(exec_bound), bind::name(read_bound), bind::name(gate), waited, census
     );
+
+    // VFSROUTE: the routing transcript rides THIS site on x86, and for the same reason the FATVERB
+    // legs do — `midden_witness` fires at main.rs step 5, before `pci::init` and the storage
+    // publish, so a routing leg there would assert against an empty namespace and be dead rather
+    // than quiet. By here `fat::probe_once()` / `sdhc_probe_once()` have run and the mount table has
+    // something in it.
+    #[cfg(feature = "witness")]
+    vfsroute_witness();
+    // LAYOUT (orin 18): the namespace transcript rides the same site, for the same reason.
+    #[cfg(feature = "witness")]
+    layout_witness();
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
@@ -2887,6 +4781,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // What is still deferred is stated plainly rather than implied: the FAT/VFS/net/process verbs
     // remain kernel-side implementations reached through `Plan::Host`. See
     // docs/dev/USERLAND/MIDDEN_CONVERGENCE.md §2 for the split and what M2 moves.
+    // BASICS: the history record is the FIRST act, ahead of the planner, so what is retained is
+    // what the operator typed — including the line the shell is about to refuse. A record taken
+    // after `plan` would hold only the commands that worked, which is the opposite of what anyone
+    // reads a history for.
+    history_record(cmd_line);
     let facts = midden_facts();
     let mut vol = FatVolume;
     let plan = midden_core::plan(cmd_line, &facts, &mut vol);
@@ -2930,7 +4829,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // this comment used to promise. What is left is the build with no process table at all,
             // which never sets `Facts::exec` and so is never handed this arm; the branch stays so
             // the match is total.
-            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
+            #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
             {
                 let _ = (&typed, &name);
                 console.println("Unknown command. Type 'help' for assistance.");
@@ -2962,8 +4861,23 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
 
     match command {
         "date" => {
+            // RELICS (R26 clause 1): `setdate` was ours; `date -s` is the standard, so the SEED is
+            // a flag on the verb that shows the clock and the second word is gone. Everything after
+            // `-s` is the old seed argument list, parsed by the same `parse_wallclock`.
+            if args.first().copied() == Some("-s") {
+                match parse_wallclock(&args[1..]) {
+                    Some(t) if crate::clock::set(t).is_ok() => {
+                        console.println(&alloc::format!(
+                            "clock set: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                            t.year, t.month, t.day, t.hour, t.min, t.sec));
+                    }
+                    _ => console.println(
+                        "date: usage: date -s YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
+                }
+                return took_screen;
+            }
             // JD17/CLOCK-3/PI-UI-3: show the kernel wall clock. The UNIFIED civil clock is the source of
-            // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `setdate` seed), so a
+            // truth: prefer the Unix anchor (an SNTP sync on the Pi — PI-NET-16 — or a `date -s` seed), so a
             // networked board shows the REAL date with no operator action. Historically `date` read only the
             // JD17 FAT anchor (`now()`), which the SNTP path never plants (it anchors the civil clock via
             // `set_anchor`), so a synced Pi still printed "clock not set" — the bug behind PI-UI-3. Fall back
@@ -2980,28 +4894,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             match ymd {
                 Some((y, mo, d, h, mi, s)) => ui3_say(console, "date", &alloc::format!(
                     "{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)),
-                None => ui3_say(console, "date", "date: clock not set (setdate YYYY-MM-DD HH:MM:SS)"),
-            }
-        },
-        "setdate" => {
-            // JD17: seed the wall clock — `setdate YYYY-MM-DD HH:MM:SS` (seconds optional). The
-            // architectural counter extends it forward from this moment; new/rewritten FAT
-            // entries are mtime-stamped from it. Re-seeding replaces the anchor.
-            match parse_setdate(&args) {
-                Some(t) if crate::clock::set(t).is_ok() => {
-                    console.println(&alloc::format!(
-                        "clock set: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        t.year, t.month, t.day, t.hour, t.min, t.sec));
-                }
-                _ => console.println(
-                    "setdate: usage: setdate YYYY-MM-DD HH:MM[:SS]  (year 1980-2107)"),
+                None => ui3_say(console, "date", "date: clock not set (date -s YYYY-MM-DD HH:MM:SS)"),
             }
         },
         "time" => {
             // CLOCK-1: the shared kernel civil clock — ISO-8601 UTC plus the source that set it.
             // UNSET is first-class and honest: `unsynced` until an SNTP sync (pi/genet PI-NET-16) or a
-            // `setdate` seeds it. x86 has no SNTP client yet, so `time` there reads `unsynced` until a
-            // manual `setdate` — the seam is what this arc delivers; x86 SNTP is a future rmbp arc.
+            // `date -s` seeds it. x86 has no SNTP client yet, so `time` there reads `unsynced` until a
+            // manual `date -s` — the seam is what this arc delivers; x86 SNTP is a future rmbp arc.
             let mut buf = [0u8; 24];
             match crate::clock::iso8601_now(&mut buf) {
                 Some(n) => {
@@ -3015,7 +4915,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     // PI-UI-3: mirror to serial (verb output is panel-only on the bench).
                     ui3_say(console, "time", &alloc::format!("{} ({})", iso, src));
                 }
-                None => ui3_say(console, "time", "time: unsynced (no SNTP sync or setdate yet)"),
+                None => ui3_say(console, "time", "time: unsynced (no SNTP sync or date -s yet)"),
             }
         },
         "clear" => {
@@ -3034,14 +4934,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // Test the Exception Handler
             panic!("Manual Panic Requested by Architect!");
         },
-        "usbinfo" => {
+        // RELICS (R26 clause 1): `usbinfo` was ours; `lsusb` is the standard word for exactly
+        // this output — the list of USB devices this bus enumerated.
+        "lsusb" => {
             for line in crate::drivers::xhci::usb_summary() {
                 console.println(&line);
-            }
-        },
-        "fatinfo" => {
-            if let Some(fs) = mount_read_volume(console, "fatinfo") {
-                console.println(&fs.describe());
             }
         },
         "ls" | "dir" => {
@@ -3058,39 +4955,36 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let path = args.iter().copied().find(|a|
                 !(a.len() > 1 && a.starts_with('-')
                   && a[1..].bytes().all(|b| b.is_ascii_alphabetic())));
-            // PI-SHELL-LS: on the Pi the native store is unafs (the volume `/fs/` serves), not FAT, so
-            // route `ls` there. `ls <path>` resolves subpaths; wildcards fall back to a literal resolve
-            // (unafs has no glob layer — an honest not-found if it isn't a real name). x86 keeps FAT.
-            #[cfg(target_arch = "aarch64")]
-            {
-                pi_ls(console, path.unwrap_or("."), long);
-            }
-            #[cfg(not(target_arch = "aarch64"))]
+            // VFSROUTE: ONE body. The arm used to split on `target_arch` — `pi_ls` (unafs) on
+            // aarch64, `ls_path`/`ls_globbed` (FAT) on x86 — which is precisely "adding each
+            // filesystem to ls". It now calls the routed lister for every volume on every board,
+            // and the wildcard path expands through `MountTable::read_dir`, so `ls *.TXT` works on
+            // the native volume too (it silently found nothing there before).
             match path {
                 Some(a) if has_glob(a) => ls_globbed(console, a, long),
-                other => ls_path(console, other.unwrap_or("."), long),
+                other => vfs_ls(console, other.unwrap_or("."), long),
             }
         },
         "cd" => {
-            // JD4: change the shell's working directory. No argument (or `/`) returns to the
-            // root. The stored cwd is the CANONICAL on-disk spelling of the resolved path.
-            let path = normalize_path(&cwd_path(), args.first().copied().unwrap_or("/"));
-            if let Some(fs) = mount_read_volume(console, "cd") {
-                match resolve_path(&fs, &path) {
-                    Ok(Resolved::Root) => {
-                        *CWD.lock() = None;
-                        console.println("/");
+            // JD4: change the shell's working directory. No argument (or `/`) returns to the root.
+            // VFSROUTE: resolved through the mount table, so `cd /boot` and `cd /usb` are ordinary
+            // directory changes rather than names that only one volume's walker understands. The
+            // stored cwd is the normalized namespace path — a path string, not a cached chain head,
+            // so a swapped card can only ever produce an honest `-ENOENT`.
+            let path = vfs_path(args.first().copied().unwrap_or("/"));
+            let mt = vfs_mount_table();
+            if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), &path) {
+                console.println(&alloc::format!(
+                    "cd: {}: volume {} not mounted (-ENODEV)", path, vol));
+            } else {
+                match mt.stat(&path) {
+                    Ok(st) if matches!(st.kind, crate::fs::vfs::NodeKind::Dir) => {
+                        console.println(&path);
+                        *CWD.lock() = if path == "/" { None } else { Some(path) };
                     }
-                    Ok(Resolved::Entry(de, canon)) => {
-                        if de.is_dir {
-                            console.println(&canon);
-                            *CWD.lock() = Some(canon);
-                        } else {
-                            console.println(&alloc::format!(
-                                "cd: {}: not a directory (-ENOTDIR)", canon));
-                        }
-                    }
-                    Err(msg) => console.println(&alloc::format!("cd: {}", msg)),
+                    Ok(_) => console.println(&alloc::format!(
+                        "cd: {}: not a directory (-ENOTDIR)", path)),
+                    Err(e) => vfs_fail(console, "cd", &path, e),
                 }
             }
         },
@@ -3099,30 +4993,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         "cat" | "type" => {
             // JD4: `cat` takes a path (absolute or cwd-relative), e.g. `cat DOCS/README.TXT`.
+            // VFSROUTE: ONE body for every volume and both arches (aarch64 had the routed one, x86 a
+            // FAT-direct twin printing the same text), and JD12 glob expansion now walks the mount
+            // table too — `cat *.TXT` reaches whichever volume the pattern's parent lives on.
             match args.first() {
                 None => console.println("usage: cat <path>"),
-                // JD12 glob expansion is still FAT-direct on both arches — it walks the parent
-                // directory through `fs.read_dir` to expand the pattern. Routing globbing through
-                // the mount table is the next adoption step and is named as such in the VFS doc;
-                // it is deliberately NOT smuggled into this arc, which is plumbing unification.
                 Some(name) if has_glob(name) => cat_globbed(console, name),
-                // VFS-1 (adoption): on aarch64 `cat` resolves through the seam, so it agrees with
-                // `ls`/`run`/`bg`/`vfs` about the namespace (`/` = native, `/fat`, `/usb`). x86 keeps
-                // the FAT-direct path unchanged: `fs/vfs.rs` gates both backends to aarch64, so that
-                // arch has no mount table to route through and exactly one FAT volume to confuse.
-                #[cfg(target_arch = "aarch64")]
                 Some(name) => vfs_cat(console, name),
-                #[cfg(not(target_arch = "aarch64"))]
-                Some(name) => {
-                    if let Some(fs) = mount_read_volume(console, "cat") {
-                        match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-                            Ok(Resolved::Root) =>
-                                console.println("cat: /: is a directory (-EISDIR)"),
-                            Ok(Resolved::Entry(de, canon)) => cat_render(console, &fs, &de, &canon),
-                            Err(msg) => console.println(&alloc::format!("cat: {}", msg)),
-                        }
-                    }
-                }
             }
         },
         "head" => {
@@ -3179,6 +5056,57 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("uptime: no calibrated counter on this arch"),
             }
         },
+        // ---- BASICS (orin 17) ------------------------------------------------------------------
+        // Peter, 2026-09-06: "we need basic commands back". Nine service arms, every one of them
+        // `Avail::Always` in `midden_core::HOST_VERBS` and free of a `target_arch` gate, so the
+        // words mean the same thing on the rMBP, the Pi and the Orin. The helpers they call live
+        // in the BASICS section above `midden_witness`.
+        "grep" => {
+            // Fixed-string search over one file, with ^/$ anchors and -i/-n/-v/-c. Deliberately
+            // not a regex — see `grep_match` for why a literal match of `.*` is worse than none.
+            fs_grep(console, &args);
+        },
+        "wc" => {
+            // Lines, words and bytes of one file; -l/-w/-c select, and they combine.
+            fs_wc(console, &args);
+        },
+        // RELICS (R26 clause 1): `vfs` folded in here. `mount` with no arguments answers "what is
+        // attached, and how full is it" (with the FAT geometry the retired `fatinfo` printed);
+        // `mount <op>` performs the op over the ONE namespace, which is the surface `vfs` was.
+        // `df` is the same table without the geometry — the capacity question, plainly.
+        "df" | "mount" => {
+            if verb == "mount" && !args.is_empty() {
+                vfs_cmd(console, &args);
+            } else {
+                df_report(console, command);
+            }
+        },
+        "env" => {
+            // The build's live facts, then the shell variables. No `$VAR` expansion yet (M2).
+            env_report(console);
+        },
+        "set" => {
+            // `set` / `set NAME` / `set NAME VALUE...` / `set -u NAME`.
+            set_cmd(console, &args, &rest);
+        },
+        "history" => {
+            // The last n typed lines, numbered; `history -c` clears and says how many it dropped.
+            history_cmd(console, &args);
+        },
+        "sleep" => {
+            // Bounded twice: a deadline on `arch::ms()` and a spin cap for a clock that is frozen.
+            match args.first().and_then(|s| parse_num(s)) {
+                Some(ms) => shell_sleep(console, ms),
+                None => console.println("usage: sleep <ms>  (decimal or 0x-hex, capped at 10000)"),
+            }
+        },
+        "which" => {
+            // Verb, program, or neither — answered through `midden_core`, never re-derived here.
+            match args.first() {
+                Some(word) => which_report(console, word),
+                None => console.println("usage: which <word>"),
+            }
+        },
         "stat" => {
             // JD19: one entry's full on-disk detail (canonical path, kind, size, attr byte + flags,
             // first cluster, FAT mtime, and the forensic dir-entry LBA + slot offset). Read-only; no
@@ -3188,221 +5116,38 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(path) => fs_stat(console, path),
             }
         },
-        "xd" => {
-            // JD19: bounded hexdump — `xd <path> [off] [len]` (default off=0, len=256; len capped at
-            // 4096). off/len accept decimal or 0x-hex. off past EOF = honest empty; a directory =
-            // -EISDIR; an honest `[... n more byte(s)]` tail note when the file is larger.
+        // RELICS (R26 clause 1): `xd` was ours; the standard spelling of a bounded file dump is
+        // `hexdump`, and it is what an operator coming from any other system will type.
+        "hexdump" => {
+            // JD19: bounded hexdump — `hexdump <path> [off] [len]` (default off=0, len=256; len
+            // capped at 4096). off/len accept decimal or 0x-hex. off past EOF = honest empty; a
+            // directory = -EISDIR; an honest `[... n more byte(s)]` tail note when the file is larger.
             match args.first() {
-                None => console.println("usage: xd <path> [off] [len]"),
+                None => console.println("usage: hexdump <path> [off] [len]"),
                 Some(path) => {
                     let off = args.get(1).and_then(|s| parse_num(s)).unwrap_or(0) as u32;
                     let len = args.get(2).and_then(|s| parse_num(s)).map(|n| n as usize).unwrap_or(256);
-                    fs_xd(console, path, off, len);
+                    fs_hexdump(console, path, off, len);
                 }
             }
         },
-        #[cfg(target_arch = "aarch64")]
-        "uls" => {
-            // BeFS-K3/K4: list a directory on the native unafs volume (absolute paths,
-            // case-sensitive names — unafs has no shell cwd). `uls` lists the root. Routes through
-            // the single coherent mount (`with_unafs`); a pure read never writes.
-            let path = args.first().copied().unwrap_or("/");
-            let out = crate::fs::unafs::with_unafs(|fs| match fs.resolve_path(path) {
-                Ok(id) => match fs.ls(id) {
-                    Ok(entries) => {
-                        let mut lines = alloc::vec::Vec::new();
-                        for de in &entries {
-                            let size = fs.read_inode(de.inode_id).map(|i| i.size).unwrap_or(0);
-                            if de.kind == ::unafs::FileKind::Directory {
-                                lines.push(alloc::format!("  <DIR>              {}", de.name));
-                            } else {
-                                lines.push(alloc::format!("  {:>10}  {}", size, de.name));
-                            }
-                        }
-                        lines.push(alloc::format!("  ({} entries)", entries.len()));
-                        lines
-                    }
-                    Err(e) => alloc::vec![alloc::format!("uls: {}: {:?}", path, e)],
-                },
-                Err(e) => alloc::vec![alloc::format!("uls: {}: {:?}", path, e)],
-            });
-            match out {
-                Ok(lines) => for line in &lines { console.println(line); },
-                Err(e) => console.println(&alloc::format!("uls: no unafs volume ({:?})", e)),
+        // RELICS (R26 clause 2): `urmattr` had no plain twin to retire into — nothing else in the
+        // shell removes a typed attribute — so it takes the STANDARD name for the job. Argument
+        // order follows `setfattr(1)`: the flag and its key first, the path last (`urmattr` had it
+        // the other way round, which is one more thing an operator had to remember).
+        // Always-registered (clause 3): the ring decides the answer, the word exists everywhere.
+        "setfattr" => {
+            match (args.first().copied(), args.get(1).copied(), args.get(2).copied()) {
+                (Some("-x"), Some(key), Some(path)) => setfattr_x(console, key, path),
+                _ => console.println("usage: setfattr -x <key> <path>  (drop one typed attribute)"),
             }
         },
-        #[cfg(target_arch = "aarch64")]
-        "ucat" => {
-            // BeFS-K3/K4: print a file off the native unafs volume (bounded like `cat`).
-            match args.first() {
-                None => console.println("usage: ucat <path>"),
-                Some(path) => {
-                    let out = crate::fs::unafs::with_unafs(|fs| match fs.resolve_path(path) {
-                        Ok(id) => match fs.read_inode(id) {
-                            Ok(inode) if inode.kind == ::unafs::FileKind::Directory =>
-                                alloc::vec![alloc::format!("ucat: {}: is a directory (-EISDIR)", path)],
-                            Ok(inode) => {
-                                const CAP: u64 = 8192;
-                                let want = inode.size.min(CAP);
-                                match fs.read_data(id, 0, want) {
-                                    Ok(data) => {
-                                        let text: String = data.iter().filter_map(|&b| match b {
-                                            b'\n' => Some('\n'),
-                                            b'\r' => None,
-                                            0x20..=0x7e => Some(b as char),
-                                            _ => Some('.'),
-                                        }).collect();
-                                        let mut lines: alloc::vec::Vec<String> =
-                                            text.split('\n').map(|s| s.into()).collect();
-                                        if inode.size > want {
-                                            lines.push(alloc::format!(
-                                                "[... {} of {} bytes shown]", want, inode.size));
-                                        }
-                                        lines
-                                    }
-                                    Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
-                                }
-                            }
-                            Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
-                        },
-                        Err(e) => alloc::vec![alloc::format!("ucat: {}: {:?}", path, e)],
-                    });
-                    match out {
-                        Ok(lines) => for line in &lines { console.println(line); },
-                        Err(e) => console.println(&alloc::format!("ucat: no unafs volume ({:?})", e)),
-                    }
-                }
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "utouch" => {
-            // BeFS-K4: create a 0-length file on the native unafs volume (error if it exists or the
-            // parent is missing). Absolute paths. Write-through + durable via the coherent mount.
-            match args.first().copied() {
-                None => console.println("usage: utouch <path>"),
-                Some(path) => console.println(&unafs_verb_touch(path)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "uwrite" => {
-            // BeFS-K4: create-or-replace a file on the native unafs volume with the given text
-            // (`uwrite <path> <text...>`). Durable write-through.
-            match args.first().copied() {
-                None => console.println("usage: uwrite <path> <text...>"),
-                Some(path) => {
-                    let text = args[1..].join(" ");
-                    console.println(&unafs_verb_write(path, text.as_bytes()));
-                }
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "umkdir" => {
-            // BeFS-K4: create a directory on the native unafs volume (`umkdir <path>`).
-            match args.first().copied() {
-                None => console.println("usage: umkdir <path>"),
-                Some(path) => console.println(&unafs_verb_mkdir(path)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "urm" => {
-            // BeFS-K4: delete a file on the native unafs volume (`urm <path>`). A directory is
-            // refused (the crate's `unlink` returns IsADirectory) — mirrors POSIX `rm` without -r.
-            match args.first().copied() {
-                None => console.println("usage: urm <path>"),
-                Some(path) => console.println(&unafs_verb_rm(path)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "umv" => {
-            // F2: rename or move a file/directory on the native unafs volume (`umv <src> <dst>`).
-            // `<dst>` names the target directly; an existing destination is refused (no implicit
-            // overwrite), as is moving a directory into its own descendant.
-            match (args.first().copied(), args.get(1).copied()) {
-                (Some(src), Some(dst)) => console.println(&unafs_verb_mv(src, dst)),
-                _ => console.println("usage: umv <src> <dst>"),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "urmattr" => {
-            // F2: remove one typed attribute (`urmattr <path> <key>`). Value + every catalog index
-            // entry go in one transaction; a missing key is refused with AttributeNotFound.
-            match (args.first().copied(), args.get(1).copied()) {
-                (Some(path), Some(key)) => console.println(&unafs_verb_rmattr(path, key)),
-                _ => console.println("usage: urmattr <path> <key>"),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnaps" => {
-            // K8b: list retained snapshots (the on-disk snapshot index) on the native unafs volume.
-            let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
-                Ok(snaps) => {
-                    let mut lines = alloc::vec::Vec::new();
-                    if snaps.is_empty() {
-                        lines.push(String::from("  (no retained snapshots)"));
-                    } else {
-                        for s in &snaps {
-                            lines.push(alloc::format!(
-                                "  gen {:>6}  {:<16}  by {:<12}  @{}",
-                                s.generation, s.name, s.creator, s.timestamp
-                            ));
-                        }
-                        lines.push(alloc::format!("  ({} of {} snapshots)", snaps.len(),
-                            ::unafs::SNAPSHOT_CAP));
-                    }
-                    lines
-                }
-                Err(e) => alloc::vec![alloc::format!("usnaps: {:?}", e)],
-            });
-            match out {
-                Ok(lines) => for line in &lines { console.println(line); },
-                Err(e) => console.println(&alloc::format!("usnaps: no unafs volume ({:?})", e)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnap" => {
-            // K8b: retain the current committed tree as a snapshot (`usnap <name>`). The shell runs
-            // at kernel authority, so the creator principal recorded is "kernel" (owner-or-kernel
-            // drop authority then admits any later usnapdrop from this surface).
-            match args.first().copied() {
-                None => console.println("usage: usnap <name>"),
-                Some(name) => console.println(&unafs_verb_snap(name)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnapdrop" => {
-            // K8b: drop a retained snapshot by its generation stamp (`usnapdrop <generation>`).
-            // Reclamation drains eagerly; only blocks no live/retained root still reaches are freed.
-            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: usnapdrop <generation>"),
-                Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnapls" => {
-            // K8c: list a retained snapshot's directory AS OF the snapshot (`usnapls <gen> [path]`).
-            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: usnapls <generation> [path]"),
-                Some(generation) => {
-                    let path = args.get(1).copied().unwrap_or("/");
-                    for line in &unafs_verb_snapls(generation, path) {
-                        console.println(line);
-                    }
-                }
-            }
-        },
-        #[cfg(target_arch = "aarch64")]
-        "usnapcat" => {
-            // K8c: read a file from a retained snapshot under the LIVE object's CURRENT ACL
-            // (`usnapcat <gen> <path>`). The shell is a kernel-authority surface, so it reads any
-            // LIVE object — but a file DELETED from the live tree fails closed (no current ACL row),
-            // the deleted-object edge of the high-security ruling.
-            match args.first().copied().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: usnapcat <generation> <path>"),
-                Some(generation) => match args.get(1).copied() {
-                    None => console.println("usage: usnapcat <generation> <path>"),
-                    Some(path) => console.println(&unafs_verb_snapcat(generation, path)),
-                },
-            }
+        // RELICS (R26 clause 2): five spellings (`usnaps` `usnap` `usnapdrop` `usnapls` `usnapcat`)
+        // become ONE verb with subcommands. They were never five commands: they were one noun with
+        // five operations, which is what a subcommand is for, and the `u` prefix said only "the
+        // native volume" — the volume every file verb now reaches by prefix.
+        "snap" => {
+            snap_cmd(console, &args);
         },
         "touch" => {
             // JD6: create a 0-length file if absent (idempotent), in any reachable dir. `touch <path>`.
@@ -3454,28 +5199,18 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(name) => fs_rmdir(console, name),
             }
         },
-        "vfs" => {
-            // SHELL-WRITE: the unified VFS write surface. Unlike the FAT-direct
-            // verbs above (`write`/`append`/`rm`/`mkdir`, which ride fat.rs on the
-            // boot partition at cwd-relative paths), this routes create / write /
-            // truncate / unlink through the VFS-2 `MountTable` over ONE namespace —
-            // the native UnaFS volume at `/`, the FAT boot partition at `/fat` — so
-            // a panel operator can exercise the per-object native ACL path and the
-            // foreign volume-level path from the same surface. `vfs <op> <path>`.
-            vfs_cmd(console, &args);
-        },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
         "run" => {
             // EXEC-1: load an ELF64 user program off the VFS namespace and execute it in user mode, reporting its
-            // exit status. Rides the SAME `MountTable` the `vfs` verb uses (`/fat` = FAT boot partition,
-            // `/usb` = USB stick, `/` = native UnaFS), so `run /fat/ELFHELLO.ELF` loads the boot-partition
-            // fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
+            // exit status. Rides the SAME `MountTable` the `mount` verb uses (`/boot` = the boot volume,
+            // `/apps` = its programs directory, `/usb` = USB stick, `/` = native UnaFS), so
+            // `run /apps/ELFHELLO.ELF` loads the staged fixture. The bytes are read here (kernel mode/ASID 0) and handed to the kernel loader
             // (`run_user_image`), which maps them into a fresh per-task slot with per-segment W^X pages and
             // runs them under user mode + the fault-kill net. `run <path>`.
             //
             // X86RUN (GR20): also on x86, where the read side differs (there is no VFS namespace on
             // this arch) but nothing else does — see `read_el0_image`'s x86 twin for the path rules.
-            // `run /fat/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's root there.
+            // `run /apps/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's `APPS/` there.
             match args.first() {
                 None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
@@ -3559,7 +5294,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
-        "diskinfo" => {
+        // RELICS (R26 clause 1): `diskinfo` was ours. Of the two spellings Peter offered, this
+        // output is `fdisk -l` and not `df -h`: every field is DEVICE geometry (vendor, product,
+        // block size, block count, capacity), and not one of them is about how full a filesystem
+        // is, which is what `df` answers and what `df`/`mount` already print. A bare `fdisk` is a
+        // usage line, not a listing — there is no partition EDITOR here, and a verb that silently
+        // did the read-only half of an interactive tool would be teaching the wrong reflex.
+        "fdisk" => {
+            if args.first().copied() != Some("-l") {
+                console.println("usage: fdisk -l  (list block devices; no partition editor here)");
+                return took_screen;
+            }
             // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
             // hosts unafs + the FAT boot partition) AND, when present, the USB stick (its own geometry from
             // `USB_BLOCK_DEVICE`, plus the FAT type/size/label read from the live read-only mount). x86 keeps the
@@ -3598,7 +5343,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                 // FATVERB: the posture is ASKED, not remembered. This line claimed
                                 // "(read-only)" from PIUSB-27, which USB-WRITE F3 retired when it
                                 // routed the `Usb` arm to the verified BOT WRITE(10) path — so
-                                // `diskinfo` had been telling the operator the stick could not be
+                                // `fdisk -l` had been telling the operator the stick could not be
                                 // written for as long as it could. One predicate now answers for the
                                 // VFS, the shell's write gate and this line.
                                 let posture = match fs.write_veto() {
@@ -3633,64 +5378,88 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
             }
         },
-        "read" => {
-            match args.first().and_then(|s| s.parse::<u64>().ok()) {
-                Some(lba) => {
+        // RELICS (R26): THE SHELLBASICS HAZARD, CLOSED. `write` carried a JD5 overload — two args
+        // that both parsed as `<u64 lba> <byte>` meant a RAW BLOCK WRITE rather than a file write,
+        // so `write 12 0` was not a file called `12` containing `0`, it was 512 bytes of zeros over
+        // logical block 12. The two operations now have two verbs, and the raw one is `dd`, which
+        // is what raw block I/O is called everywhere else.
+        //
+        // ARGUMENT SHAPE, and why it is `key=value` and not positional: `dd`'s whole convention is
+        // `if=`/`of=`, and the convention is load-bearing here — a positional `dd 12 0` would be
+        // exactly the ambiguity this arm exists to remove, because nothing in it says which way the
+        // bytes travel. So:
+        //
+        //   dd if=<lba>                  read ONE 512-byte block and dump the first 128 bytes
+        //   dd of=<lba> byte=<0xNN|n>    fill ONE 512-byte block with that byte value
+        //
+        // One block, always: `count=` is deliberately not accepted rather than accepted and capped,
+        // because a shell that takes `count=` from a bench operator and quietly does something else
+        // is worse than one that refuses the word. The retired `read <lba>` spelling is gone with
+        // the same reasoning as the rest of clause 1 — POSIX `read` is a shell builtin that reads a
+        // LINE OF INPUT into a variable, so our `read` was not merely non-standard, it was a
+        // standard word wearing someone else's meaning.
+        "dd" => {
+            let field = |k: &str| -> Option<&str> {
+                args.iter().find_map(|a| a.strip_prefix(k))
+            };
+            let lba_in = field("if=").and_then(|v| parse_num(v));
+            let lba_out = field("of=").and_then(|v| parse_num(v));
+            let byte = field("byte=").and_then(parse_byte);
+            match (lba_in, lba_out, byte) {
+                (Some(lba), None, _) => {
                     let mut buf = [0u8; 512];
                     match crate::drivers::block::read_block(lba, &mut buf) {
                         Ok(_) => {
                             console.println(&alloc::format!("LBA {}:", lba));
                             hexdump(console, &buf[0..128]);
                         }
-                        Err(e) => console.println(&alloc::format!("read error: {:?}", e)),
+                        Err(e) => console.println(&alloc::format!("dd: read error: {:?}", e)),
                     }
                 }
-                None => console.println("usage: read <lba>"),
+                (None, Some(lba), Some(b)) => {
+                    let buf = [b; 512];
+                    match crate::drivers::block::write_block(lba, &buf) {
+                        Ok(()) => console.println(&alloc::format!(
+                            "dd: wrote LBA {} (0x{:02x} x512)", lba, b)),
+                        Err(e) => console.println(&alloc::format!("dd: write error: {:?}", e)),
+                    }
+                }
+                (None, Some(_), None) => console.println("dd: of= needs byte=<0xNN>  (no source given)"),
+                (Some(_), Some(_), _) => console.println("dd: if= and of= together are not supported"),
+                _ => console.println("usage: dd if=<lba> | dd of=<lba> byte=<0xNN>  (ONE 512-byte block)"),
             }
         },
         "write" => {
-            // JD5 overload: `write <lba> <byte>` (raw block write) IFF exactly two args parse as a
-            // <u64 lba> <byte 0..=255> pair — byte-identical to the pre-JD5 behaviour. Any other
-            // shape is a FILE write `write <path> <text...>` (create-or-truncate; text = the rest of
-            // the line, whitespace-collapsed like `echo`). A numeric filename can still be reached as
-            // `/NAME` (an absolute path never parses as an LBA).
-            let raw = if args.len() == 2 {
-                match (args[0].parse::<u64>().ok(), parse_byte(args[1])) {
-                    (Some(lba), Some(b)) => Some((lba, b)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            match raw {
-                Some((lba, b)) => {
-                    let buf = [b; 512];
-                    match crate::drivers::block::write_block(lba, &buf) {
-                        Ok(()) => console.println(&alloc::format!("wrote LBA {} (0x{:02x} x512)", lba, b)),
-                        Err(e) => console.println(&alloc::format!("write error: {:?}", e)),
-                    }
-                }
-                None if args.is_empty() =>
-                    console.println("usage: write <path> <text>  |  write <lba> <byte>"),
-                None => fs_write(console, args[0], args[1..].join(" ").as_bytes()),
+            // RELICS (R26): a FILE write, and only ever a file write. `write <path> <text...>`
+            // (create-or-truncate; text = the rest of the line, whitespace-collapsed like `echo`).
+            // The raw-block overload that used to live here is `dd` — see that arm.
+            match args.first() {
+                None => console.println("usage: write <path> <text>"),
+                Some(name) => fs_write(console, name, args[1..].join(" ").as_bytes()),
             }
         },
-        "netinfo" => {
+        // RELICS (R26 clause 1): `netinfo` was ours, and of the two standard spellings Peter
+        // offered this is `ifconfig`, not `ip`. The reason is the OUTPUT: every line describes ONE
+        // interface's state — its MAC, whether the link is up, and this NIC's frame/IRQ counters —
+        // which is `ifconfig`'s shape exactly. `ip` prints ADDRESS OBJECTS over a set of links
+        // (`ip addr`, `ip route`, `ip link`), and this shell has neither a link set nor a routing
+        // table to print, so `ip` would be a name promising a subcommand tree that does not exist.
+        "ifconfig" => {
             // PI-UI-3: the Pi (GENET) has no e1000, so the x86 path below reports "no device" there. Give
             // the Pi shell an equivalent that reads the GENET interface snapshot — MAC / IP / gateway /
             // lease state — plus the civil-clock sync state, matching the x86 verb's line shape.
             #[cfg(all(target_arch = "aarch64", not(feature = "genet")))]
-            ui3_say(console, "netinfo", "No network device ready.");
+            ui3_say(console, "ifconfig", "No network device ready.");
             #[cfg(all(target_arch = "aarch64", feature = "genet"))]
             {
                 match crate::arch::aarch64::genet::netinfo() {
                     Some(n) => {
-                        ui3_say(console, "netinfo", &alloc::format!(
+                        ui3_say(console, "ifconfig", &alloc::format!(
                             "NIC: MAC {}  link {}",
                             crate::drivers::e1000::fmt_mac(&n.mac),
                             if n.link_up { "UP" } else { "DOWN" }
                         ));
-                        ui3_say(console, "netinfo", &alloc::format!(
+                        ui3_say(console, "ifconfig", &alloc::format!(
                             "IP {}.{}.{}.{} ({})  GW {}.{}.{}.{}",
                             n.ip[0], n.ip[1], n.ip[2], n.ip[3],
                             if n.leased { "dhcp" } else { "static" },
@@ -3711,9 +5480,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                             }
                             None => alloc::format!("unsynced"),
                         };
-                        ui3_say(console, "netinfo", &alloc::format!("time: {}", sync));
+                        ui3_say(console, "ifconfig", &alloc::format!("time: {}", sync));
                     }
-                    None => ui3_say(console, "netinfo", "No network device ready."),
+                    None => ui3_say(console, "ifconfig", "No network device ready."),
                 }
             }
             #[cfg(not(target_arch = "aarch64"))]
@@ -3790,9 +5559,41 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 None => console.println("usage: arp <a.b.c.d>"),
             }
         },
-        "connect" => {
-            let ip = args.first().and_then(|s| parse_ipv4(s));
-            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
+        // RELICS (R26 clause 1): `connect` and `udpsend` were TWO verbs for one job — open a
+        // socket to a host:port and exchange a message — differing only in the transport, which is
+        // exactly what `nc`'s `-u` flag selects. So they are one `nc`, and the semantics do match:
+        // `nc <ip> <port> [message]` connects, sends, reads, closes; `nc -u` sends one datagram and
+        // waits briefly for a reply. What `nc` does elsewhere and does NOT do here is stream stdin
+        // — there is no pipeline in this shell to stream from — so the message is an argument, and
+        // the usage line says so rather than implying a stdin that would hang.
+        "nc" => {
+            let udp = args.first().copied() == Some("-u");
+            let rest: &[&str] = if udp { &args[1..] } else { &args[..] };
+            let ip = rest.first().and_then(|s| parse_ipv4(s));
+            let port = rest.get(1).and_then(|s| s.parse::<u16>().ok());
+            if udp {
+                match (ip, port) {
+                    (Some(ip), Some(port)) => {
+                        let msg = if rest.len() > 2 { rest[2..].join(" ") } else { String::from("unaos-udp") };
+                        console.println(&alloc::format!(
+                            "UDP {}.{}.{}.{}:{} <- {:?}", ip[0], ip[1], ip[2], ip[3], port, msg));
+                        match crate::drivers::e1000::udp_send(ip, port, msg.as_bytes()) {
+                            Some(o) if o.sent => {
+                                if o.replied {
+                                    console.println(&alloc::format!("reply: {} bytes", o.rx_len));
+                                } else {
+                                    console.println("sent; no reply (UDP is best-effort)");
+                                }
+                            }
+                            Some(_) => console.println("host unreachable (no ARP reply)"),
+                            None => console.println("No network device ready."),
+                        }
+                    }
+                    _ => console.println("usage: nc -u <a.b.c.d> <port> [message]"),
+                }
+                return took_screen;
+            }
+            let args = rest;
             match (ip, port) {
                 (Some(ip), Some(port)) => {
                     // Optional message; if omitted, just open and immediately close.
@@ -3810,39 +5611,34 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                _ => console.println("usage: connect <a.b.c.d> <port> [message]"),
+                _ => console.println("usage: nc [-u] <a.b.c.d> <port> [message]"),
             }
         },
-        "udpsend" => {
-            let ip = args.first().and_then(|s| parse_ipv4(s));
-            let port = args.get(1).and_then(|s| s.parse::<u16>().ok());
-            match (ip, port) {
-                (Some(ip), Some(port)) => {
-                    let msg = if args.len() > 2 { args[2..].join(" ") } else { String::from("unaos-udp") };
-                    console.println(&alloc::format!(
-                        "UDP {}.{}.{}.{}:{} <- {:?}", ip[0], ip[1], ip[2], ip[3], port, msg));
-                    match crate::drivers::e1000::udp_send(ip, port, msg.as_bytes()) {
-                        Some(o) if o.sent => {
-                            if o.replied {
-                                console.println(&alloc::format!("reply: {} bytes", o.rx_len));
-                            } else {
-                                console.println("sent; no reply (UDP is best-effort)");
-                            }
-                        }
-                        Some(_) => console.println("host unreachable (no ARP reply)"),
-                        None => console.println("No network device ready."),
-                    }
-                }
-                _ => console.println("usage: udpsend <a.b.c.d> <port> [message]"),
-            }
-        },
-        "get" => {
+        // RELICS (R26 clause 1): `get` was ours; an HTTP/1.0 GET over a socket, printed to the
+        // terminal, is `curl` everywhere else. The semantics match the standard verb's DEFAULT
+        // behaviour exactly (fetch and print; no follow, no upload), so the name is honest. The
+        // argument becomes a URL rather than three positionals for the same reason `dd` takes
+        // `if=`: the URL IS the standard's argument, and `curl 10.0.2.2 8000 /x` would be a verb
+        // wearing a standard name over a private argument grammar.
+        "curl" => {
             // Minimal HTTP/1.0 GET over the streaming TCP client: connect, send the request,
             // read the whole response until the server closes, and print it.
-            match args.first().and_then(|s| parse_ipv4(s)) {
-                Some(ip) => {
-                    let port = args.get(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(80);
-                    let path = if args.len() > 2 { String::from(args[2]) } else { String::from("/") };
+            let url = args.first().copied().unwrap_or("");
+            let url = url.strip_prefix("http://").unwrap_or(url);
+            let (hostport, path) = match url.find('/') {
+                Some(i) => (&url[..i], String::from(&url[i..])),
+                None => (url, String::from("/")),
+            };
+            let (host, port_str) = match hostport.rfind(':') {
+                Some(i) => (&hostport[..i], Some(&hostport[i + 1..])),
+                None => (hostport, None),
+            };
+            let port = match port_str {
+                Some(v) => match v.parse::<u16>().ok() { Some(n) => Some(n), None => None },
+                None => Some(80),
+            };
+            match (parse_ipv4(host), port) {
+                (Some(ip), Some(port)) => {
                     let req = alloc::format!(
                         "GET {} HTTP/1.0\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n",
                         path, ip[0], ip[1], ip[2], ip[3]);
@@ -3868,7 +5664,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                None => console.println("usage: get <a.b.c.d> [port] [path]"),
+                _ => console.println("usage: curl [http://]<a.b.c.d>[:port][/path]  (HTTP/1.0 GET)"),
             }
         },
         // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
@@ -3931,7 +5727,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);
         },
-        "sched" | "ps" => {
+        // RELICS (R26 clause 1): `sched` retired. `ps` was already an alias for it, and Peter's
+        // ruling is that the standard word is THE name — so the alias became the verb and the
+        // house spelling is gone. (The scheduler MODULE is still `arch::sched`; a subsystem name
+        // is not a verb name, and clause 1 is about what the operator types.)
+        "ps" => {
             // SCHEDPAR: one table body for both arches. `current_task_id`/`run_queue_len` are
             // signature-matched twins (the aarch64 pair authored by the orin seat, folded under
             // the 2026-08-27 cross-lane grant); only the core census and the demo line stay
@@ -4061,7 +5861,11 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(not(all(target_arch = "x86_64", feature = "smc")))]
             console.println("batmon: SMC battery monitor is x86 UNAOS_SMC=1 only");
         },
-        "bootlog" => {
+        // RELICS (R26 clause 1): the verb is `dmesg`. What it prints IS the kernel's boot message
+        // ring, which is dmesg's subject on every other system. The RING itself stays
+        // `crate::bootlog` and so does the `UNAOS_BOOTLOG` knob: a module and an env knob are not
+        // words an operator types at a prompt, and clause 1 is about the verb table.
+        "dmesg" => {
             // GUI-WITNESS M2b: print the boot-milestone ring with timestamps — the operator's eyes at
             // the bench. On a GUI (non-usbdebug) build serial is silent and fbcon detached at the GUI
             // handoff, so this verb is the ONLY witness surface for whether PORTSW flipped, the FTDI
@@ -4071,9 +5875,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let mut buf = [(0u64, ""); 32]; // matches bootlog::capacity()
             let n = crate::bootlog::snapshot(&mut buf);
             if n == 0 {
-                console.println("bootlog: no boot milestones recorded");
+                console.println("dmesg: no boot milestones recorded");
             } else {
-                console.println(&alloc::format!("bootlog: {} milestone(s) (oldest first):", n));
+                console.println(&alloc::format!("dmesg: {} milestone(s) (oldest first):", n));
                 for (ms, tag) in &buf[..n] {
                     console.println(&alloc::format!("  [{:>8} ms] {}", ms, tag));
                 }
@@ -4119,7 +5923,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         #[cfg(any(all(feature = "baremetal", target_arch = "aarch64"), target_arch = "x86_64"))] // NOT widened to `tegra_el0` with its neighbours, DELIBERATELY — the one process verb that is not. `storm` is the only arm reaching past the process table into board hardware: it reads `storm_slots` (= `arch::boot`, the BCM2711 slot pool; `arch::uslots` is the facade an Orin port would use) and spawns `storm_fat_writer`, which drives `BlockSource::Usb` and is `#[cfg(feature = "baremetal")]` with no arch arm at all. Whether the Orin gets a FAT-writer leg under storm is a HW-JETSON question about that board's storage, not a gate typo — left to that seat rather than guessed at here. Folded onto this line to stay line-neutral (PARITY.md 5.3).
         "storm" => {
             // STORM-VERB (Peter, P77 sitting): launch a whole vug fleet in one command — `storm [n]`,
-            // default 6, so an operator can raise a load storm without typing `bg /fat/VUG.ELF` six
+            // default 6, so an operator can raise a load storm without typing `bg /apps/VUG.ELF` six
             // times. Each launch is EXACTLY the bg path (same spawn, same job table, same messages);
             // this verb adds the loop and, since STORM-HEADROOM, the MEASUREMENT around the loop. It
             // still decides nothing about how a vug is spawned or where it is placed. Stops honestly
@@ -4216,10 +6020,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::arch::sched::storm_census("pre");
             let mut launched = 0usize;
             for _ in 0..n {
-                if !bg_program(console, "/fat/VUG.ELF") {
+                if !bg_program(console, "/apps/VUG.ELF") {
                     // `bg_program` has already said WHY, but not uniformly on this wire: a SPAWN
                     // refusal also prints `:: BGRUN: bg … rejected (…)` to serial, while an
-                    // IMAGE-READ failure (missing, empty or oversized /fat/VUG.ELF) is console-only.
+                    // IMAGE-READ failure (missing, empty or oversized /apps/VUG.ELF) is console-only.
                     // A serial-only capture would therefore be unable to tell the fleet ceiling from
                     // a bad card, which is exactly the confusion this arc exists to remove — so this
                     // line re-reads the census rather than pointing at a neighbour that may not be
@@ -4373,7 +6177,7 @@ fn parse_byte(s: &str) -> Option<u8> {
     }
 }
 
-/// JD19: parse a `u64` offset/length accepting decimal or `0x`-hex (the `xd` off/len args).
+/// JD19: parse a `u64` offset/length accepting decimal or `0x`-hex (the `hexdump` off/len args).
 fn parse_num(s: &str) -> Option<u64> {
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
@@ -4382,91 +6186,52 @@ fn parse_num(s: &str) -> Option<u64> {
     }
 }
 
-// --- SHELL-WRITE: unified VFS write surface (`vfs <op> <path> [text]`) ---------
+// --- SHELL-WRITE: the one namespace's write surface (`mount <op> <path> [text]`) ---------
 //
 // The FIRST consumer of the VFS-2 write surface. Each invocation builds the
 // process namespace fresh (stateless, like the FAT verbs — a swapped card is
 // picked up on the next command) and drives the `MountTable` create / write /
 // truncate / unlink verbs. The shell is the trusted operator console, so it
 // writes as the kernel-authority principal (`KERNEL_PRINCIPAL`) — the same
-// posture the `u*` native verbs record. Namespace: native UnaFS at `/`, the FAT
-// boot partition at `/fat`, and the hot-plugged USB FAT stick at `/usb` when
+// posture the retired `u*` native verbs recorded. Namespace: native UnaFS at `/`, the FAT
+// boot volume at `/boot`, its programs directory at `/apps`, and the hot-plugged USB stick at `/usb` when
 // present (VFS-3, read-only). Both real backends are aarch64-only (the x86 build
 // has neither the unafs module nor a `VfsBackend for FatBackend` impl), so the
 // x86 arm is an honest "unsupported on this arch" line.
 
-/// Build the shell's VFS namespace: native UnaFS at `/`, FAT boot partition at
-/// `/fat`, and — when a USB stick is enumerated — the hot-plugged USB FAT at
-/// `/usb` (VFS-3). World-readable is a READ posture only (it does not confer
-/// write); the shell writes as `KERNEL_PRINCIPAL`, which both backends authorize.
+/// EXEC-1 / X86RUN / VFSROUTE: read an ELF64 user image off the VFS namespace, or explain why not.
 ///
-/// VFS-3: the `/usb` mount is bound only when the stick is actually present
-/// (`mount_source(Usb)` succeeds) — the presence check at build time is the
-/// honest hot-plug posture (doc §6): absent → `/usb` is simply not in the table,
-/// so a `/usb/...` path falls through to the native root and resolves to a clean
-/// `-ENOENT`, never a panic. The USB volume is read through the xHCI `Usb` source
-/// and is **writable** since USB-WRITE F3, which routed the `Usb` arm to the
-/// verified BOT WRITE(10) path and retired PIUSB-27's blanket refusal. Whether a
-/// `vfs write|append|rm|mkdir` at `/usb` is admitted is decided by exactly one
-/// predicate — `fat::BlockSource::write_veto`, which `FatBackend::read_only`
-/// forwards to — so this note cannot drift from the code again the way its
-/// PIUSB-27 predecessor did. Rebuilt per invocation, so a stick
-/// hot-plugged (or ejected) between commands is picked up on the next `vfs`.
-/// EXEC-1: `run <path>` — load an ELF64 (or flat) user program off the VFS namespace and execute it in user mode,
-/// reporting its exit status. Reads the whole file through the same `MountTable` the `vfs` verb uses,
-/// bounds it to the kernel's 16 KiB user window (an oversize file is rejected with a clear message — never
-/// silently truncated), pre-checks the ELF64 magic + aarch64 machine for an early operator-friendly reason,
-/// then hands the bytes to the kernel loader `run_user_image`, which maps them into a fresh per-task slot
-/// (per-segment W^X pages) and runs them under user mode + the fault-kill net. The kernel is the security
-/// authority: this pre-check only sharpens the error text; `run_user_image` re-validates from scratch.
+/// **One body, both arches.** It used to be two: an aarch64 twin that went through the mount table
+/// and an x86 twin that mounted the program source and walked `fat.rs` itself, with the boot-volume
+/// prefix hand-rolled as a string rewrite because x86 "has no VFS namespace". x86 has one now — the
+/// mount table binds the program source at `/`, `/boot` and `/apps` — so the prefix is a real mount
+/// and both arches ask the same resolver. Every check that could say NO still says it, and each in the same
+/// words as before.
 ///
-/// Witness (headless-capturable): `:: EXEC: run <path> — loaded <n> bytes, entry 0x<..>, exit=<code> ::`.
-/// EXEC-1/BGRUN-1: the shared read-and-precheck front of `run` and `bg` — stat + bound + read off the
-/// VFS, then the friendly ELF64/aarch64 pre-check (the kernel loader is the real gate; a flat blob
-/// passes through to the position-independent flat path). `verb` names the caller in every message.
+/// Two things genuinely differ and stay `cfg`-split, because they are hardware facts and not
+/// preferences: the size ceiling (the ring-3 window each arch maps) and the expected `e_machine`
+/// (183 = EM_AARCH64, 62 = EM_X86_64). The loader re-checks the machine from scratch either way —
+/// this pre-check only sharpens the operator's error text.
 ///
-/// # X86RUN (GR20) — why this is `baremetal`-OR-x86 rather than `baremetal`
-///
-/// `run`/`bg`/`jobs`/`kill` were written during the Pi arcs and their whole family — verbs, helpers,
-/// job table — carried `#[cfg(feature = "baremetal")]`, the **Pi-4 bare-metal** feature. On an x86
-/// build they were therefore absent from `dispatch_command`'s match and fell through to "Unknown
-/// command", so there was no operator-facing way to start a ring-3 program on the rMBP at all.
-///
-/// Nothing about that gate was load-bearing. The x86 kernel half was BUILT for these verbs and has
-/// been shipping for arcs: `arch::x86_64::syscall` carries `run_user_image`, `spawn_user_image_bg`,
-/// `bg_poll` and `bg_kill` (the WINX-2 twins of the aarch64 entries), whose own doc comments name
-/// "the synchronous shell `run <path>` entry", "the shell's `bg <path>` entry" and "run `jobs` to
-/// reap exited jobs". `arroyo` and `scripts/make-fat-img.sh` stage `STAT.ELF` / `VUG.ELF` /
-/// `PULSE.ELF` onto the x86 DATA volume with the comment "for `run`/`bg`", and the `esp-x86`
-/// operator text already warns that a mis-staged stick makes ``bg /fat/VUG.ELF`` report `-ENOENT`.
-/// The gate was an oversight of provenance, not a dependency.
-///
-/// TWO things genuinely differ on x86, and both are handled by the twin below rather than by
-/// forcing the aarch64 body to compile:
-///
-/// * **There is no VFS namespace.** `impl VfsBackend for FatBackend` and `NativeBackend` are
-///   `#[cfg(target_arch = "aarch64")]` (see `fs/vfs.rs`), which is why `vfs_cmd` already refuses on
-///   x86. So the x86 twin reads through the FAT-direct path the `cat` verb uses
-///   (FATVERB: `mount_read_volume` + `resolve_path` + the JD4 cwd — the same program-source handle
-///   this loader binds), which is the path Peter's `cat hello.txt`
-///   demonstrably exercises. `/fat/NAME` is accepted as an alias for that volume's root, because it
-///   is the form the packaging text tells the operator to type and the only FAT volume x86 mounts
-///   IS the DATA volume.
-/// * **The machine check.** The aarch64 body pre-checks `e_machine == 183`; x86 wants
-///   `EM_X86_64 = 62`. The kernel loader (`arch::x86_64::elf::validate_elf`) re-checks from scratch
-///   either way — this pre-check only sharpens the operator's error text.
-#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
+/// LAUNCHPACE (x86): the storage-phase breakdown is preserved, re-pointed at the routed phases —
+/// `mount_us` is now the namespace build (which still does the per-launch FAT re-mount inside
+/// `open_read_volume`), `dirwalk_us` the `stat` that resolves the entry, `read_us` the image read.
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
 fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::fs::vfs::NodeKind;
-    // Cap = the kernel user window; a file at or under it may still be rejected by the loader (a flat blob
-    // is re-bounded to one code page), but this is the hard read ceiling — we never read past it.
-    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
-    // VFS-1 (adoption): through the seam, so `run`/`bg` resolve a relative name against the cwd like
-    // every other verb (they used the raw argument before) and report an unbound volume as the
-    // VOLUME being absent rather than as a bare -ENOENT off the native root — the VFS-4 guard the
-    // mutating `vfs` verb has had since the P44 misdirection, now shared instead of re-derived.
+    // The hard read ceiling: a file at or under it may still be rejected by the loader, but we never
+    // read past it. JETSON-EL0: the aarch64 side goes through the `uslots` facade.
+    #[cfg(target_arch = "aarch64")]
+    let cap: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64;
+    #[cfg(not(target_arch = "aarch64"))]
+    let cap: u64 = crate::arch::syscall::user_window_size() as u64;
+    #[cfg(target_arch = "x86_64")]
+    let t_entry = crate::arch::now_cycles();
+
     let path = &vfs_path(path)[..];
     let mt = vfs_mount_table();
+    #[cfg(target_arch = "x86_64")]
+    let t_mount = crate::arch::now_cycles();
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
         console.println(&alloc::format!(
             "{}: {}: volume {} not mounted (-ENODEV)", verb, path, vol));
@@ -4479,6 +6244,8 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             return None;
         }
     };
+    #[cfg(target_arch = "x86_64")]
+    let t_resolve = crate::arch::now_cycles();
     if matches!(st.kind, NodeKind::Dir) {
         console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
         return None;
@@ -4487,10 +6254,10 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
         console.println(&alloc::format!("{}: {}: empty file", verb, path));
         return None;
     }
-    if st.size > CAP {
+    if st.size > cap {
         console.println(&alloc::format!(
             "{}: {}: {} bytes exceeds the {}-byte user window (-E2BIG)",
-            verb, path, st.size, CAP
+            verb, path, st.size, cap
         ));
         return None;
     }
@@ -4501,123 +6268,14 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             return None;
         }
     };
-    if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
-        if bytes[4] != 2 {
-            console.println(&alloc::format!("{}: {}: not an ELF64 image (EI_CLASS != 2)", verb, path));
-            return None;
-        }
-        if bytes[5] != 1 {
-            console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
-            return None;
-        }
-        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-        if machine != 183 {
-            console.println(&alloc::format!(
-                "{}: {}: not an aarch64 image (e_machine {} != 183)", verb, path, machine
-            ));
-            return None;
-        }
-    }
-    Some(bytes)
-}
-
-/// X86RUN (GR20): the x86 twin of `read_el0_image` — same contract, same message shapes, same
-/// "every check can say NO" discipline, over the only file surface this arch has.
-///
-/// x86 has no VFS namespace (`fs/vfs.rs` gates both backend impls to aarch64, which is why `vfs_cmd`
-/// refuses here), so this reads through the FAT-direct path `cat` uses: the PROGRAM SOURCE
-/// (FATVERB — `cat` now binds `mount_program_source` through `mount_read_volume`, exactly as this
-/// loader does), which on x86 is the USB mass-storage DATA volume, or the internal SD card on a
-/// machine booted from the reader — never the UEFI boot volume the kernel cannot reach — resolved
-/// through the JD4 cwd exactly like every other file verb.
-///
-/// **`/fat` is accepted as an alias for that volume's root.** It is the form the packaging text tells
-/// the operator to type (`esp-x86` prints "…or `bg /fat/VUG.ELF` reports -ENOENT"), the form
-/// `scripts/make-fat-img.sh` documents for the staged `STAT.ELF`/`VUG.ELF`, and it costs nothing to
-/// honour because x86 mounts exactly one FAT volume. Both `run /fat/VUG.ELF` and `run VUG.ELF` (or
-/// `run /VUG.ELF`) therefore reach the same file, and the witness reports the CANONICAL on-disk path
-/// so a capture never has to guess which spelling was typed.
-#[cfg(target_arch = "x86_64")]
-fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc::vec::Vec<u8>> {
-    // LAUNCHPACE: time each storage phase of a program launch (mount → directory walk → cluster-chain
-    // read) so a bench capture can CONVICT where a launch stall actually lives, rather than infer it
-    // from the coarse `BGRUN`/`BAREXEC` "loaded N bytes" line — that line prints only after all three
-    // phases and breaks out none of them. The operator's "~1 s pause when I start vug or pulse" runs
-    // exactly this path, and the three sub-costs have very different fixes (a re-mount cache, a
-    // directory-index cache, a batched read), so the witness has to separate them before any of them
-    // is touched. Emitted once, on the SUCCESSFUL read, in `now_cycles()` (rdtsc) units converted to µs.
-    let t_entry = crate::arch::now_cycles();
-    // Cap = the ring-3 window the loader will map into; a file at or under it may still be rejected by
-    // the loader, but this is the hard read ceiling — we never read past it.
-    let cap = crate::arch::syscall::user_window_size();
-    // `/fat/NAME` -> `/NAME` (see the doc note). Case-insensitive, because FAT short names are.
-    let rel = {
-        let p = path;
-        if p.len() >= 4 && p[..4].eq_ignore_ascii_case("/fat") {
-            match p.as_bytes().get(4) {
-                None => "/",              // a bare `/fat` IS the volume root
-                Some(b'/') => &p[4..],    // `/fat/VUG.ELF` -> `/VUG.ELF`
-                Some(_) => p,             // `/fatty.bin` is a real name, not the alias
-            }
-        } else {
-            p
-        }
-    };
-    // APPLOAD: `mount_program_source` — this function's ENTIRE job is finding an executable, which is
-    // the one question the global handle alone cannot answer on a machine booted from the internal SD
-    // reader. `bg /fat/VUG.ELF` reported `-ENOENT` there while the card was mounted and the file
-    // listed. `/fat` stays the alias for "the one FAT volume this arch mounts"; which handle serves
-    // that volume is now the block layer's decision, not this call site's assumption.
-    let fs = match crate::fs::fat::mount_program_source() {
-        Ok(fs) => fs,
-        Err(e) => {
-            console.println(&alloc::format!(
-                "{}: no FAT filesystem ({:?}; handles={})",
-                verb, e, crate::drivers::block::source_census()
-            ));
-            return None;
-        }
-    };
-    let t_mount = crate::arch::now_cycles();
-    let de = match resolve_path(&fs, &normalize_path(&cwd_path(), rel)) {
-        Ok(Resolved::Root) => {
-            console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
-            return None;
-        }
-        Ok(Resolved::Entry(de, _canon)) => de,
-        Err(msg) => {
-            console.println(&alloc::format!("{}: {}", verb, msg));
-            return None;
-        }
-    };
-    let t_resolve = crate::arch::now_cycles();
-    if de.is_dir {
-        console.println(&alloc::format!("{}: {}: is a directory (-EISDIR)", verb, path));
-        return None;
-    }
-    if de.size == 0 {
-        console.println(&alloc::format!("{}: {}: empty file", verb, path));
-        return None;
-    }
-    if de.size as usize > cap {
-        console.println(&alloc::format!(
-            "{}: {}: {} bytes exceeds the {}-byte user window (-E2BIG)",
-            verb, path, de.size, cap
-        ));
-        return None;
-    }
-    let mut bytes = alloc::vec::Vec::new();
-    if let Err(e) = fs.read_file(&de, &mut bytes, cap) {
-        console.println(&alloc::format!("{}: {}: read failed ({:?}, -EIO)", verb, path, e));
-        return None;
-    }
+    #[cfg(target_arch = "x86_64")]
     let t_read = crate::arch::now_cycles();
-    if bytes.len() != de.size as usize {
+    if bytes.len() as u64 != st.size {
         // FATREAD-1 was exactly this class of silent mismatch (a doubled read that pushed
         // STAT.ELF/VUG.ELF past the window). Say NO out loud rather than hand the loader a short or
         // long image and let it report an unrelated reason.
         console.println(&alloc::format!(
-            "{}: {}: short read — {} of {} bytes (-EIO)", verb, path, bytes.len(), de.size
+            "{}: {}: short read — {} of {} bytes (-EIO)", verb, path, bytes.len(), st.size
         ));
         return None;
     }
@@ -4630,24 +6288,26 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
             console.println(&alloc::format!("{}: {}: not little-endian (EI_DATA != 1)", verb, path));
             return None;
         }
+        #[cfg(target_arch = "aarch64")]
+        const WANT_MACHINE: u16 = 183; // EM_AARCH64
+        #[cfg(not(target_arch = "aarch64"))]
+        const WANT_MACHINE: u16 = 62; // EM_X86_64
+        #[cfg(target_arch = "aarch64")]
+        const WANT_NAME: &str = "aarch64";
+        #[cfg(not(target_arch = "aarch64"))]
+        const WANT_NAME: &str = "x86-64";
         let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-        if machine != 62 {
-            // 62 = EM_X86_64. An aarch64 image (183) staged on x86 media lands here with a reason an
-            // operator can act on, instead of the loader's bare "not EM_X86_64".
+        if machine != WANT_MACHINE {
+            // An image staged for the other architecture lands here with a reason an operator can
+            // act on, instead of the loader's bare "wrong e_machine".
             console.println(&alloc::format!(
-                "{}: {}: not an x86-64 image (e_machine {} != 62)", verb, path, machine
+                "{}: {}: not an {} image (e_machine {} != {})",
+                verb, path, WANT_NAME, machine, WANT_MACHINE
             ));
             return None;
         }
     }
-    // LAUNCHPACE: the storage-phase breakdown for this launch. `mount_us` is the per-launch FAT re-mount
-    // (sector-0 read + MBR/GPT decode + BPB parse — suspect: repeated every launch, never cached);
-    // `dirwalk_us` is the root-directory scan that `resolve_path` runs to find the entry; `read_us` is
-    // the cluster-chain read of the image itself (the MULTIBLK batched path). `total_us` is the whole
-    // synchronous cost this launch imposes on its caller's core — and on x86 the shell runs on the
-    // RENDER core (`x86_render_service`), so this total is time the panel is not composing. The window
-    // create and first present that follow are on the app's own core and carry their own `wc-a`/`wc-h`
-    // witnesses; this line owns the storage half.
+    #[cfg(target_arch = "x86_64")]
     serial_println!(
         "[launchpace] verb={} bytes={} mount_us={} dirwalk_us={} read_us={} total_us={}",
         verb,
@@ -4659,6 +6319,7 @@ fn read_el0_image(console: &mut Console, verb: &str, path: &str) -> Option<alloc
     );
     Some(bytes)
 }
+
 
 /// LAUNCHPACE: rdtsc cycle delta → microseconds, at the rate `apic::calibrate` measured against the
 /// ACPI PM timer. Mirrors `video::wcg::cycles_to_us` (private there); the fallback rate matches, so a
@@ -5193,23 +6854,29 @@ pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
     true
 }
 
-/// BARENAME (PARITY §6.6a): the aarch64 program-source root — the namespace spelling of x86's
-/// "the volume executables live on".
+/// BARENAME (PARITY §6.6a) / LAYOUT (orin 18): **the program root — `/apps`, and it is a place,
+/// not an alias.**
 ///
-/// x86 has no VFS: its whole path universe is the program-source FAT, so there "resolve from the
-/// cwd" and "resolve on the volume executables live on" are the same sentence, and `/fat` is
-/// carried only as an alias for that one volume's root. On the Pi the two come apart — `/` is
-/// native UnaFS and `arroyo`'s `kernel8` FAT staging puts `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/
-/// `STAT.ELF`/`PULSE.ELF` on the SD FAT, which `vfs_mount_table` binds at `/fat`. This constant is
-/// that half of the x86 sentence, named rather than inlined.
-#[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
-const EXEC_ROOT: &str = "/fat";
+/// Before LAYOUT this named the whole boot volume, because that is where the staging scripts
+/// dropped the images: a bare `vug` searched the volume root alongside `KERNEL8.IMG`,
+/// `CONFIG.TXT`, the firmware blobs and every fixture's scratch file. `/apps` is the directory
+/// `arroyo`, `builder` and `make-fat-img.sh` now stage `VUG.ELF`/`VUGC.ELF`/`VUGX.ELF`/`VUGK.ELF`/
+/// `STAT.ELF`/`PULSE.ELF`/`ELFHELLO.ELF`/`HELLO.BIN` into (`fat::APPS_DIR` = `APPS` on the medium),
+/// bound at its own prefix by `vfs_mount_table` through [`FatBackend::rooted`].
+///
+/// **It is no longer aarch64-only, and that is a consequence of the move, not a tidy-up.** x86 had
+/// no second probe because its cwd already sat on the volume the executables lived in — "resolve
+/// from the cwd" and "resolve where programs live" were the same sentence. Putting the programs in
+/// a DIRECTORY breaks that identity on x86 exactly as it was already broken on the Pi, so both
+/// arches now reach a program by the same second probe off the same prefix.
+#[allow(dead_code)] // a build with no loader (no x86_64, no aarch64_el0) never resolves a program
+const EXEC_ROOT: &str = "/apps";
 
 /// BARENAME (PARITY §6.6a): resolve a bare-name candidate to an absolute VFS path, or `None`.
 ///
 /// **Through the VFS seam, not a private path scheme.** [`vfs_path`] is what `ls`, `cat`, `run`,
-/// `bg` and `vfs` resolve through, so a bare name means exactly what those verbs say it means —
-/// `cd /fat` then `vug` works for the same reason `cd /fat` then `cat VUG.ELF` works, and a name
+/// `bg` and `mount` resolve through, so a bare name means exactly what those verbs say it means —
+/// `cd /apps` then `vug` works for the same reason `cd /apps` then `cat VUG.ELF` works, and a name
 /// that `ls` cannot show is a name this cannot launch.
 ///
 /// Order, and it is x86's order transposed rather than a new policy:
@@ -5219,7 +6886,7 @@ const EXEC_ROOT: &str = "/fat";
 ///    would repeat probe 1. On x86 this step is not absent, it is *implied*: its cwd already sits
 ///    on the program source, so its single probe covers both. Dropping it on the Pi would mean the
 ///    operator at `/` still could not type `vug` — the exact defect §6.6a names, with `bg
-///    /fat/VUG.ELF` still the only way in — so it is the step that makes the port a port.
+///    /apps/VUG.ELF` still the only way in — so it is the step that makes the port a port.
 ///
 /// A directory never resolves: a bare name launches a program.
 #[cfg(all(feature = "aarch64_el0", target_arch = "aarch64"))]
@@ -5286,19 +6953,33 @@ fn exec_canon(path: &str) -> String {
 /// the Boot AR failure was exactly what happens when they do not.
 #[cfg(target_arch = "x86_64")]
 fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option<(String, String)> {
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+    // VFSROUTE: the re-resolve asks the NAMESPACE, like every other verb path. The independent
+    // handle the FATVERB witness compares against is the exec PROBE (`FatVolume::is_file`), which is
+    // deliberately left binding `mount_program_source` directly — see its note.
+    let mt = vfs_mount_table();
+    if mt.prefixes().is_empty() {
         console.println(&alloc::format!("{}: the volume went away before it could be started", typed));
         serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: volume vanished after resolution ::", name, typed);
         return None;
-    };
-    match resolve_path(&fs, &normalize_path(&cwd_path(), name)) {
-        Ok(Resolved::Entry(de, canon)) if !de.is_dir => Some((String::from(name), canon)),
-        _ => {
-            console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
-            serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
-            None
+    }
+    // LAYOUT (orin 18): the same two probes the exec PROBE now makes, in the same order — the cwd,
+    // then [`EXEC_ROOT`]. Asked of the namespace here (the mount table is what `read_el0_image`
+    // will open through), so the path handed back is `/apps/VUG.ELF` and reaches `APPS/VUG.ELF` on
+    // the medium through the rooted mount.
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir));
+    let from_cwd = vfs_path(name);
+    if is_file(&from_cwd) {
+        return Some((String::from(name), from_cwd));
+    }
+    if !name.starts_with('/') {
+        let from_apps = normalize_path(EXEC_ROOT, name);
+        if from_apps != from_cwd && is_file(&from_apps) {
+            return Some((from_apps.clone(), from_apps));
         }
     }
+    console.println(&alloc::format!("{}: {} went away before it could be started", typed, name));
+    serial_println!(":: BAREXEC: {} (typed '{}') — REFUSED: resolved name no longer a file ::", name, typed);
+    None
 }
 
 /// BARENAME (PARITY §6.6a): the aarch64 twin — [`exec_resolve`] again (the same walk the probe
@@ -5349,9 +7030,9 @@ fn bare_exec_reresolve(console: &mut Console, typed: &str, name: &str) -> Option
 ///
 /// **On aarch64 (PARITY §6.6a)** the same two sentences hold with one substitution: the resolution
 /// is `exec_resolve` — the VFS seam `ls`/`cat`/`run`/`bg` share, cwd first and then the
-/// program-source root `/fat` — and `canon` is recovered by [`exec_canon`] from the parent listing
+/// program-source root `/boot` — and `canon` is recovered by [`exec_canon`] from the parent listing
 /// rather than from a FAT directory entry. Case behaves the same way for the same reason: the FAT
-/// backend behind `/fat` matches components case-insensitively, so arm 2 of the core's resolver
+/// backend behind `/boot` matches components case-insensitively, so arm 2 of the core's resolver
 /// (`vug` → `vug.elf`) already hits the on-disk `VUG.ELF` and the upper-cased arm 3 stays latent
 /// here too.
 ///
@@ -5442,36 +7123,84 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
 }
 
 /// VFS-1 (adoption): **the seam** — the ONE place a shell verb turns an operator-typed argument into
-/// an absolute VFS path. Every routed verb (`ls`, `cat`, `run`, `bg`, `vfs`) calls this and nothing
+/// an absolute VFS path. Every routed verb (`ls`, `cat`, `run`, `bg`, `mount`, and since RELICS the
+/// plain mutating verbs) calls this and nothing
 /// else; which volume the path lands on is then decided solely by `MountTable::resolve`'s
 /// longest-prefix rule, never by the verb.
 ///
 /// It is `normalize_path` against the cwd — purely lexical, so `.` collapses and `..` pops before any
 /// backend is consulted, and a relative `VUG.ELF` means what `pwd` says it means. That last part is a
-/// FIX, not just a move: `run`, `bg` and `vfs` used their argument VERBATIM, so after a `cd` they
+/// FIX, not just a move: `run`, `bg` and `mount` used their argument VERBATIM, so after a `cd` they
 /// silently resolved against the root while every other verb honoured the cwd. One seam means one
 /// answer to "what does this path name", which is the point of the layer.
-#[cfg(target_arch = "aarch64")]
 fn vfs_path(arg: &str) -> String {
     normalize_path(&cwd_path(), arg)
 }
 
-#[cfg(target_arch = "aarch64")]
+/// VFSROUTE (orin 17): **the namespace**, built once per verb, on BOTH arches.
+///
+/// It was `#[cfg(target_arch = "aarch64")]` from VFS-1 — not because a mount table is an aarch64
+/// idea, but because the Pi came first and x86's verbs were still FAT-direct. That gate is what made
+/// `ls` and `cat` carry two bodies, and Peter's ruling is that they should carry none: a mounted
+/// filesystem is listable because it implements the backend trait, whatever the board.
+///
+/// **aarch64** binds `/` = native UnaFS, `/boot` = the SD boot partition, and `/usb` = the stick when
+/// it is actually enumerated (honest hot-plug, doc §6). The Orin's ROOTFS knob re-points both `/` and
+/// `/boot` at the Tegra card, since this machine has neither of the first two volumes.
+///
+/// **x86** binds THE PROGRAM SOURCE — `crate::drivers::block::program_source`, resolved through
+/// [`open_read_volume`] so the READ_BIND instrument is stamped exactly as it was when each verb
+/// mounted for itself. That is FATVERB's law, unchanged: the verbs and the exec probe must bind the
+/// same handle, and on a machine booted from the internal SD reader the global slot is the wrong
+/// one. It is bound at BOTH `/` and `/boot`, because `/boot` is the spelling the packaging text, the
+/// staged-image script and `exec_resolve`'s second probe all use for that one volume — the same
+/// two-prefix shape `sdmmc_root_bind` already uses on the Orin, and honest for the same reason
+/// (`/boot` IS a mount point, so `ls /` showing it is a fact, not decoration).
+///
+/// An arch with no volume at all returns an EMPTY table, and the verbs report "no filesystem
+/// mounted (-ENODEV)" — which is a better answer than the pre-VFSROUTE `no FAT filesystem (NoDisk)`
+/// because it does not name a filesystem the operator never asked about.
 pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
-    use crate::fs::vfs::{FatBackend, MountTable, NativeBackend, KERNEL_PRINCIPAL};
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    #[allow(unused_mut)]
     let mut mt = MountTable::new();
-    mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
-    mt.mount("/fat", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/fat` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points BOTH at the card's FAT through BlockSource::TegraSd (`/fat` too, because it is EXEC_ROOT and the literal prefix of /fat/VUG.ELF etc). Appended to THIS line for knob-off byte identity (no line moves — panic::Location). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
-    // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
-    if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
-        mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::fs::vfs::NativeBackend;
+        mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
+        mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
+        // LAYOUT (orin 18): `/apps` is the SAME volume as `/boot`, rooted at its `APPS/` directory —
+        // so it carries `/boot`'s volume NAME, not a third one. A distinct name here would make
+        // `same_volume("/boot", "/apps")` answer false about one card, which is the aliasing defect
+        // (rmbp 15 C1) in a new spelling.
+        mt.mount("/apps", alloc::boxed::Box::new(
+            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points ALL THREE at the card's FAT through BlockSource::TegraSd (`/boot` and `/apps` too, because `/apps` is EXEC_ROOT and the literal prefix of /apps/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
+        // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
+        if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
+            mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // FATVERB: the program source, and its READ_BIND stamp, in the one place a verb now binds.
+        if let Ok(fs) = open_read_volume() {
+            let src = fs.source();
+            mt.mount("/", alloc::boxed::Box::new(
+                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
+            mt.mount("/boot", alloc::boxed::Box::new(
+                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
+            // LAYOUT (orin 18): the programs' directory on that same volume, at its own prefix and
+            // under the SAME volume name (see the aarch64 arm's note on aliasing).
+            mt.mount("/apps", alloc::boxed::Box::new(
+                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)
+                    .rooted(crate::fs::fat::APPS_DIR)));
+        }
     }
     mt
 }
 
 /// Render a `VfsError` as an errno-style operator line, matching the shell's
 /// `-ENOENT`/`-EISDIR` house style.
-#[cfg(target_arch = "aarch64")]
 fn vfs_err(e: crate::fs::vfs::VfsError) -> String {
     use crate::fs::vfs::VfsError::*;
     match e {
@@ -5488,32 +7217,29 @@ fn vfs_err(e: crate::fs::vfs::VfsError) -> String {
 /// Panel-line + `:: vfsw: <line> ::` serial mirror (the `ui3_say` idiom, dedicated
 /// tag) — the verb renders panel-only on the bench, so the witness gives a headless
 /// capture the same content.
-#[cfg(target_arch = "aarch64")]
 fn vfs_say(console: &mut Console, line: &str) {
     console.println(line);
     serial_println!(":: vfsw: {} ::", line);
 }
 
-/// VFS-4: the namespace prefixes the shell's `vfs` verb reserves for DISTINCT
+/// VFS-4: the namespace prefixes the shell's `mount` verb reserves for DISTINCT
 /// backing volumes that may be absent. A mutating verb aimed at one of these when
 /// it is NOT currently mounted must report "volume not mounted" — never fall
 /// through to the native root, which mis-reports a bare `-ENOENT`. On the P44
-/// sitting a `vfs write /usb/…` with the stick's FAT unreadable (its READ(10)
+/// sitting a `mount write /usb/…` with the stick's FAT unreadable (its READ(10)
 /// LBA0 returned all-zeros with a passing CSW, so `mount_source(Usb)` honestly
 /// found no FAT and `/usb` never bound) fell through to native-root create,
 /// which failed resolving the parent `/usb` as a native path and said
 /// "no such file or directory (-ENOENT)". That misdirection cost bench time; the
 /// honest answer is that the *volume* is not mounted. `/` (native) is excluded —
 /// it is always mounted and is the legitimate fall-through for un-prefixed paths.
-#[cfg(target_arch = "aarch64")]
-const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/fat"];
+const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/boot"];
 
 /// VFS-4: if `path` targets a reserved volume prefix (see
 /// [`RESERVED_VOLUME_PREFIXES`]) that is not present in the live `mounted`
 /// prefix set, return that prefix. Boundary-matched exactly as the resolver is
 /// (§4): `/usb` and `/usb/…` name the volume, but `/usbfoo` does NOT (it is a
 /// native-root name and legitimately resolves there).
-#[cfg(target_arch = "aarch64")]
 fn unmounted_reserved_volume(mounted: &[&str], path: &str) -> Option<&'static str> {
     for &pfx in RESERVED_VOLUME_PREFIXES {
         let claims = path == pfx
@@ -5527,112 +7253,127 @@ fn unmounted_reserved_volume(mounted: &[&str], path: &str) -> Option<&'static st
     None
 }
 
-/// SHELL-WRITE dispatcher: `vfs <write|append|rm|mkdir> <path> [text ...]`.
-#[cfg(target_arch = "aarch64")]
+/// RELICS (R26 clause 1) / VFSROUTE (orin 17): `mount <write|append|rm|mkdir> <path> [text ...]`.
+///
+/// **It is now an ALIAS, and that is the point.** Before VFSROUTE this was the ONLY write surface
+/// that spoke to the mount table — the plain verbs were FAT-direct, so `mount write /X hi` and
+/// `write /X hi` did different things on different volumes. Now the plain verbs ARE the routed
+/// surface, so keeping a second implementation here would be exactly the duplication Peter's ruling
+/// is about. The subcommands stay because the bench playbooks and `docs/dev/OS/09_FILESYSTEM/vfs.md`
+/// spell them, and they cost one line each to forward.
+///
+/// A bare `mount` (no arguments) is the TABLE — see [`df_report`], which renders one row per mount
+/// with each volume's own capacity, access posture and description.
 fn vfs_cmd(console: &mut Console, args: &[&str]) {
-    use crate::fs::vfs::{NodeKind, VfsError, KERNEL_PRINCIPAL};
     let op = match args.first() {
         Some(&o) => o,
         None => {
-            console.println("usage: vfs <write|append|rm|mkdir> <path> [text ...]");
-            // FATVERB: not "(read-only)" — USB-WRITE F3 made the stick writable; see `diskinfo`.
-            console.println("  namespace: / = native UnaFS, /fat = FAT boot partition, /usb = USB stick");
+            console.println("usage: mount <write|append|rm|mkdir> <path> [text ...]");
+            console.println("  bare `mount` lists the namespace: prefix, volume, capacity, access");
             return;
         }
     };
-    // VFS-1 (adoption): through the seam — the mutating verbs honour the cwd like the read verbs do.
     let path = match args.get(1) {
-        Some(&p) => vfs_path(p),
+        Some(&p) => p,
         None => {
-            console.println(&alloc::format!("usage: vfs {} <path> [text ...]", op));
+            console.println(&alloc::format!("usage: mount {} <path> [text ...]", op));
             return;
         }
     };
-    let path = &path[..];
-    let mt = vfs_mount_table();
-    // VFS-4: a mutating verb aimed at a reserved volume that is not mounted (the
-    // USB stick absent, or its FAT unreadable so `mount_source(Usb)` failed and
-    // `/usb` never bound) must say so plainly — NOT fall through to the native
-    // root and mis-report `-ENOENT` (the P44 misdirection). Applies to every op
-    // uniformly, before dispatch.
-    if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
-        vfs_say(console, &alloc::format!(
-            "vfs {}: {}: volume {} not mounted (-ENODEV)", op, path, vol));
-        return;
-    }
-    let principal = KERNEL_PRINCIPAL;
     match op {
         "write" => {
-            // Create-or-overwrite: replace an existing file's contents wholesale.
-            // We unlink-then-create rather than truncate-to-0 because the native
-            // backend has no in-place shrink primitive (truncate to 0 on a
-            // non-empty native file is `Unsupported` by design) — replace works on
-            // both backends. A directory target is refused up front.
-            if let Ok(st) = mt.stat(path) {
-                if matches!(st.kind, NodeKind::Dir) {
-                    vfs_say(console, &alloc::format!("vfs write: {}: is a directory (-EISDIR)", path));
-                    return;
-                }
-            }
             let mut data = args[2..].join(" ").into_bytes();
             data.push(b'\n');
-            let _ = mt.unlink(path, principal); // drop the old file if present
-            if let Err(e) = mt.create(path, NodeKind::File, principal) {
-                vfs_say(console, &alloc::format!("vfs write: {}: {}", path, vfs_err(e)));
-                return;
-            }
-            match mt.write(path, 0, &data, principal) {
-                Ok(n) => vfs_say(console, &alloc::format!("vfs write: {}: wrote {} bytes", path, n)),
-                Err(e) => vfs_say(console, &alloc::format!("vfs write: {}: {}", path, vfs_err(e))),
-            }
+            fs_write(console, path, &data);
         }
         "append" => {
-            let offset = match mt.stat(path) {
-                Ok(st) if matches!(st.kind, NodeKind::Dir) => {
-                    vfs_say(console, &alloc::format!("vfs append: {}: is a directory (-EISDIR)", path));
-                    return;
-                }
-                Ok(st) => st.size, // append at the current EOF
-                Err(VfsError::NoSuchPath) => {
-                    if let Err(e) = mt.create(path, NodeKind::File, principal) {
-                        vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e)));
-                        return;
-                    }
-                    0
-                }
-                Err(e) => {
-                    vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e)));
-                    return;
-                }
-            };
             let mut data = args[2..].join(" ").into_bytes();
             data.push(b'\n');
-            match mt.write(path, offset, &data, principal) {
-                Ok(n) => vfs_say(console, &alloc::format!(
-                    "vfs append: {}: wrote {} bytes at offset {}", path, n, offset)),
-                Err(e) => vfs_say(console, &alloc::format!("vfs append: {}: {}", path, vfs_err(e))),
-            }
+            fs_append(console, path, &data);
         }
-        "rm" => match mt.unlink(path, principal) {
-            Ok(()) => vfs_say(console, &alloc::format!("vfs rm: {}: removed", path)),
-            Err(e) => vfs_say(console, &alloc::format!("vfs rm: {}: {}", path, vfs_err(e))),
-        },
-        "mkdir" => match mt.create(path, NodeKind::Dir, principal) {
-            Ok(_) => vfs_say(console, &alloc::format!("vfs mkdir: {}: created", path)),
-            Err(VfsError::Backend("exists")) =>
-                vfs_say(console, &alloc::format!("vfs mkdir: {}: already exists (-EEXIST)", path)),
-            Err(e) => vfs_say(console, &alloc::format!("vfs mkdir: {}: {}", path, vfs_err(e))),
-        },
+        "rm" => fs_rm(console, path, false),
+        "mkdir" => fs_mkdir(console, path),
         other => console.println(&alloc::format!(
-            "vfs: unknown op '{}' (write|append|rm|mkdir)", other)),
+            "mount: unknown op '{}' (write|append|rm|mkdir)", other)),
     }
 }
 
-/// x86 has no writable VFS backend (no unafs module, no `VfsBackend for FatBackend`
-/// impl), so the unified write surface is aarch64-only. Honest refusal on x86.
+// --- RELICS (R26 clause 2): the two survivors of the `u*` family --------------
+//
+// `setfattr` and `snap` are the only members with no plain file verb to retire into: nothing else
+// in the shell drops a typed attribute, and nothing else retains a tree. Both take the STANDARD
+// spelling for the job rather than a `u`-prefixed one, and both are registered on EVERY build
+// (R26 clause 3) — the ring arm below says what THIS platform can do, which is what a platform is
+// allowed to decide. The x86 twins are honest refusals, the shape `vfs_cmd` already used.
+
+/// `setfattr -x <key> <path>` — drop one typed attribute from the object at `<path>`.
+///
+/// VFSROUTE: routed, and therefore ONE body on both arches. `remove_attr` is a backend capability:
+/// the native UnaFS backend implements it, the FAT backend inherits the trait's refusal, so
+/// `setfattr -x k /boot/F` prints `-ENOTSUP` — FAT's own honest answer — instead of the verb knowing
+/// in advance which volume has typed attributes. The previous shape was a `target_arch` split with
+/// an x86 body that refused by name; that refusal was right about x86 for the wrong reason (it is
+/// the VOLUME that has no attributes, not the architecture).
+fn setfattr_x(console: &mut Console, key: &str, path: &str) {
+    let Some((mt, path)) = vfs_write_open(console, "setfattr", path) else { return };
+    match mt.remove_attr(&path, key, SHELL_PRINCIPAL) {
+        Ok(()) => vfs_say(console, &alloc::format!("setfattr: removed '{}' from {}", key, path)),
+        Err(e) => vfs_say(console, &alloc::format!(
+            "setfattr: {}: {}: {}", path, key, vfs_err(e))),
+    }
+}
+
+/// `snap list|create|drop|ls|cat` — the retained-root family, one verb.
+///
+/// Subcommand shapes, and why each is what it is: `list` takes nothing (it is the index); `create
+/// <name>` names the new retained root; `drop <gen>` takes the GENERATION stamp `list` prints, not
+/// the name, because names are not unique and a generation is; `ls <gen> [path]` and `cat <gen>
+/// <path>` read AS OF a snapshot and enforce the LIVE object's current ACL (the K8c ruling — a file
+/// deleted from the live tree has no current ACL row and therefore fails closed).
+#[cfg(target_arch = "aarch64")]
+fn snap_cmd(console: &mut Console, args: &[&str]) {
+    let usage = "usage: snap list | snap create <name> | snap drop <gen> | snap ls <gen> [path] | snap cat <gen> <path>";
+    match args.first().copied() {
+        None | Some("list") => {
+            for line in &unafs_verb_snaps() {
+                console.println(line);
+            }
+        }
+        Some("create") => match args.get(1).copied() {
+            None => console.println("usage: snap create <name>"),
+            Some(name) => console.println(&unafs_verb_snap(name)),
+        },
+        Some("drop") => match args.get(1).copied().and_then(|s| s.parse::<u64>().ok()) {
+            None => console.println("usage: snap drop <generation>"),
+            Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
+        },
+        Some("ls") => match args.get(1).copied().and_then(|s| s.parse::<u64>().ok()) {
+            None => console.println("usage: snap ls <generation> [path]"),
+            Some(generation) => {
+                let path = args.get(2).copied().unwrap_or("/");
+                for line in &unafs_verb_snapls(generation, path) {
+                    console.println(line);
+                }
+            }
+        },
+        Some("cat") => match (
+            args.get(1).copied().and_then(|s| s.parse::<u64>().ok()),
+            args.get(2).copied(),
+        ) {
+            (Some(generation), Some(path)) => console.println(&unafs_verb_snapcat(generation, path)),
+            _ => console.println("usage: snap cat <generation> <path>"),
+        },
+        Some(other) => {
+            console.println(&alloc::format!("snap: unknown subcommand '{}'", other));
+            console.println(usage);
+        }
+    }
+}
+
+/// x86 has no native volume, so there is nothing to retain. Honest refusal, by name.
 #[cfg(not(target_arch = "aarch64"))]
-fn vfs_cmd(console: &mut Console, _args: &[&str]) {
-    console.println("vfs: unified VFS write surface is aarch64-only (no writable backend on this arch)");
+fn snap_cmd(console: &mut Console, _args: &[&str]) {
+    console.println("snap: no native volume on this build (retained roots are a UnaFS feature)");
 }
 
 // --- BeFS-K4 native unafs write verbs -----------------------------------------
@@ -5643,152 +7384,45 @@ fn vfs_cmd(console: &mut Console, _args: &[&str]) {
 // among the FAT-verb helpers above) so the pi4 unafs lane stays trivially
 // separable from the concurrent jetson FAT-verb work.
 
-/// Split an absolute unafs path into `(parent_dir, leaf)`. Rejects the bare
-/// root (nothing to create/remove). `"/A.TXT"` -> `("/", "A.TXT")`; `"/D/A"` ->
-/// `("/D", "A")`; a bare `"A"` is treated as root-relative -> `("/", "A")`.
+
+
+
+
+
+
+
+
+/// RELICS (R26 clause 2) / K8b: list retained snapshots (the on-disk snapshot index) on the native
+/// volume — the body the retired `usnaps` arm carried inline, lifted so `snap list` can call it and
+/// so the whole snapshot family sits together with its siblings.
 #[cfg(target_arch = "aarch64")]
-fn unafs_split(path: &str) -> Option<(&str, &str)> {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.rfind('/') {
-        Some(0) => Some(("/", &trimmed[1..])),
-        Some(i) => Some((&trimmed[..i], &trimmed[i + 1..])),
-        None => Some(("/", trimmed)),
+fn unafs_verb_snaps() -> alloc::vec::Vec<String> {
+    let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
+        Ok(snaps) => {
+            let mut lines = alloc::vec::Vec::new();
+            if snaps.is_empty() {
+                lines.push(String::from("  (no retained snapshots)"));
+            } else {
+                for s in &snaps {
+                    lines.push(alloc::format!(
+                        "  gen {:>6}  {:<16}  by {:<12}  @{}",
+                        s.generation, s.name, s.creator, s.timestamp
+                    ));
+                }
+                lines.push(alloc::format!("  ({} of {} snapshots)", snaps.len(),
+                    ::unafs::SNAPSHOT_CAP));
+            }
+            lines
+        }
+        Err(e) => alloc::vec![alloc::format!("snap list: {:?}", e)],
+    });
+    match out {
+        Ok(lines) => lines,
+        Err(e) => alloc::vec![alloc::format!("snap list: no unafs volume ({:?})", e)],
     }
 }
 
-/// `utouch <path>`: create a 0-length file (error if it exists / parent missing).
-#[cfg(target_arch = "aarch64")]
-fn unafs_verb_touch(path: &str) -> String {
-    let (parent, leaf) = match unafs_split(path) {
-        Some(pl) => pl,
-        None => return alloc::format!("utouch: {}: invalid path", path),
-    };
-    match crate::fs::unafs::with_unafs(|fs| {
-        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
-        fs.create_file(pid, leaf.into())
-            .map(|_| ())
-            .map_err(|e| alloc::format!("{:?}", e))
-    }) {
-        Ok(Ok(())) => alloc::format!("utouch: created {}", path),
-        Ok(Err(msg)) => alloc::format!("utouch: {}: {}", path, msg),
-        Err(e) => alloc::format!("utouch: no unafs volume ({:?})", e),
-    }
-}
-
-/// `uwrite <path> <text>`: create-or-replace a file with `bytes` (durable).
-#[cfg(target_arch = "aarch64")]
-fn unafs_verb_write(path: &str, bytes: &[u8]) -> String {
-    let (parent, leaf) = match unafs_split(path) {
-        Some(pl) => pl,
-        None => return alloc::format!("uwrite: {}: invalid path", path),
-    };
-    let n = bytes.len();
-    match crate::fs::unafs::with_unafs(|fs| {
-        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
-        // Replace semantics: drop an existing FILE of this name first (a
-        // directory is left intact, and create_file then reports FileExists).
-        let _ = fs.unlink(pid, leaf);
-        let id = fs
-            .create_file(pid, leaf.into())
-            .map_err(|e| alloc::format!("{:?}", e))?;
-        fs.write_data(id, 0, bytes)
-            .map_err(|e| alloc::format!("{:?}", e))
-    }) {
-        Ok(Ok(())) => alloc::format!("uwrite: wrote {} bytes to {}", n, path),
-        Ok(Err(msg)) => alloc::format!("uwrite: {}: {}", path, msg),
-        Err(e) => alloc::format!("uwrite: no unafs volume ({:?})", e),
-    }
-}
-
-/// `umkdir <path>`: create a directory.
-#[cfg(target_arch = "aarch64")]
-fn unafs_verb_mkdir(path: &str) -> String {
-    let (parent, leaf) = match unafs_split(path) {
-        Some(pl) => pl,
-        None => return alloc::format!("umkdir: {}: invalid path", path),
-    };
-    match crate::fs::unafs::with_unafs(|fs| {
-        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
-        fs.mkdir(pid, leaf.into())
-            .map(|_| ())
-            .map_err(|e| alloc::format!("{:?}", e))
-    }) {
-        Ok(Ok(())) => alloc::format!("umkdir: created {}/", path),
-        Ok(Err(msg)) => alloc::format!("umkdir: {}: {}", path, msg),
-        Err(e) => alloc::format!("umkdir: no unafs volume ({:?})", e),
-    }
-}
-
-/// `urm <path>`: delete a file (a directory is refused with IsADirectory).
-#[cfg(target_arch = "aarch64")]
-fn unafs_verb_rm(path: &str) -> String {
-    let (parent, leaf) = match unafs_split(path) {
-        Some(pl) => pl,
-        None => return alloc::format!("urm: {}: invalid path", path),
-    };
-    match crate::fs::unafs::with_unafs(|fs| {
-        let pid = fs.resolve_path(parent).map_err(|e| alloc::format!("{:?}", e))?;
-        fs.unlink(pid, leaf)
-            .map(|_| ())
-            .map_err(|e| alloc::format!("{:?}", e))
-    }) {
-        Ok(Ok(())) => alloc::format!("urm: removed {}", path),
-        Ok(Err(msg)) => alloc::format!("urm: {}: {}", path, msg),
-        Err(e) => alloc::format!("urm: no unafs volume ({:?})", e),
-    }
-}
-
-/// `umv <src> <dst>`: rename OR move a file or directory (F2). `<dst>` names
-/// the TARGET path directly — `umv /A.TXT /B.TXT` renames in place, and
-/// `umv /A.TXT /D/B.TXT` moves it under `/D` with a new leaf. Deliberate
-/// divergence from POSIX: an existing `<dst>` is REFUSED (`FileExists`), never
-/// silently overwritten, and moving a directory into its own descendant is
-/// refused (`DirectoryLoop`). Both directory rewrites land in ONE CoW
-/// transaction, so there is no "in neither directory" window to crash into.
-#[cfg(target_arch = "aarch64")]
-fn unafs_verb_mv(src: &str, dst: &str) -> String {
-    let (sparent, sleaf) = match unafs_split(src) {
-        Some(pl) => pl,
-        None => return alloc::format!("umv: {}: invalid path", src),
-    };
-    let (dparent, dleaf) = match unafs_split(dst) {
-        Some(pl) => pl,
-        None => return alloc::format!("umv: {}: invalid path", dst),
-    };
-    match crate::fs::unafs::with_unafs(|fs| {
-        let spid = fs.resolve_path(sparent).map_err(|e| alloc::format!("{:?}", e))?;
-        let dpid = fs.resolve_path(dparent).map_err(|e| alloc::format!("{:?}", e))?;
-        fs.rename(spid, sleaf, dpid, dleaf)
-            .map_err(|e| alloc::format!("{:?}", e))
-    }) {
-        Ok(Ok(())) => alloc::format!("umv: {} -> {}", src, dst),
-        Ok(Err(msg)) => alloc::format!("umv: {}: {}", src, msg),
-        Err(e) => alloc::format!("umv: no unafs volume ({:?})", e),
-    }
-}
-
-/// `urmattr <path> <key>`: remove one typed attribute from a file or directory
-/// (F2). The inline or spilled value AND every catalog index entry for the
-/// (inode, key) pair go in ONE CoW transaction, so a removed attribute can
-/// never be returned by a later query. A key that is not present is refused
-/// with `AttributeNotFound` — never a silent no-op.
-#[cfg(target_arch = "aarch64")]
-fn unafs_verb_rmattr(path: &str, key: &str) -> String {
-    match crate::fs::unafs::with_unafs(|fs| {
-        let id = fs.resolve_path(path).map_err(|e| alloc::format!("{:?}", e))?;
-        fs.remove_attribute(id, key)
-            .map_err(|e| alloc::format!("{:?}", e))
-    }) {
-        Ok(Ok(())) => alloc::format!("urmattr: removed '{}' from {}", key, path),
-        Ok(Err(msg)) => alloc::format!("urmattr: {}: {}: {}", path, key, msg),
-        Err(e) => alloc::format!("urmattr: no unafs volume ({:?})", e),
-    }
-}
-
-/// `usnap <name>`: retain the current committed tree as a snapshot. The shell
+/// `snap create <name>`: retain the current committed tree as a snapshot. The shell
 /// is a kernel-authority surface, so the creator principal is "kernel"
 /// (owner-or-kernel destructive authority — a later `usnapdrop` from this
 /// surface is always permitted). Returns the generation stamp.
@@ -5799,13 +7433,13 @@ fn unafs_verb_snap(name: &str) -> String {
         fs.snapshot_create(name.into(), "kernel".into(), ts)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(generation)) => alloc::format!("usnap: retained '{}' (generation {})", name, generation),
-        Ok(Err(msg)) => alloc::format!("usnap: {}: {}", name, msg),
-        Err(e) => alloc::format!("usnap: no unafs volume ({:?})", e),
+        Ok(Ok(generation)) => alloc::format!("snap create: retained '{}' (generation {})", name, generation),
+        Ok(Err(msg)) => alloc::format!("snap create: {}: {}", name, msg),
+        Err(e) => alloc::format!("snap create: no unafs volume ({:?})", e),
     }
 }
 
-/// `usnapdrop <generation>`: drop a retained snapshot; reclamation drains
+/// `snap drop <generation>`: drop a retained snapshot; reclamation drains
 /// eagerly, freeing only blocks no live/retained root still reaches.
 #[cfg(target_arch = "aarch64")]
 fn unafs_verb_snapdrop(generation: u64) -> String {
@@ -5813,13 +7447,13 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
         fs.snapshot_drop(generation)
             .map_err(|e| alloc::format!("{:?}", e))
     }) {
-        Ok(Ok(())) => alloc::format!("usnapdrop: dropped generation {} (blocks reclaimed)", generation),
-        Ok(Err(msg)) => alloc::format!("usnapdrop: generation {}: {}", generation, msg),
-        Err(e) => alloc::format!("usnapdrop: no unafs volume ({:?})", e),
+        Ok(Ok(())) => alloc::format!("snap drop: dropped generation {} (blocks reclaimed)", generation),
+        Ok(Err(msg)) => alloc::format!("snap drop: generation {}: {}", generation, msg),
+        Err(e) => alloc::format!("snap drop: no unafs volume ({:?})", e),
     }
 }
 
-/// `usnapls <gen> [path]`: list a retained snapshot's directory AS OF the
+/// `snap ls <gen> [path]`: list a retained snapshot's directory AS OF the
 /// snapshot (K8c) — a read-only [`SnapshotView`] listing; never perturbs the
 /// live tree, refcounts, or the reclaim queue. Gated by the SAME current-ACL
 /// evaluator as `usnapcat` ([`read_authz`] on the target directory's live id) —
@@ -5835,13 +7469,13 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
             let mut view = match fs.open_snapshot(generation) {
                 Ok(v) => v,
                 Err(::unafs::fs::FileSystemError::SnapshotNotFound(_)) => {
-                    return alloc::vec![alloc::format!("usnapls: no such snapshot generation {}", generation)];
+                    return alloc::vec![alloc::format!("snap ls: no such snapshot generation {}", generation)];
                 }
-                Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+                Err(e) => return alloc::vec![alloc::format!("snap ls: {:?}", e)],
             };
             match view.resolve_path(path) {
                 Ok(id) => id,
-                Err(_) => return alloc::vec![alloc::format!("usnapls: {}: not in snapshot", path)],
+                Err(_) => return alloc::vec![alloc::format!("snap ls: {}: not in snapshot", path)],
             }
         };
         // CURRENT-ACL on the live directory — the same evaluator as usnapcat.
@@ -5849,20 +7483,20 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
             ReadAuthz::Permit => {}
             ReadAuthz::DenyNoLiveObject => {
                 return alloc::vec![alloc::format!(
-                    "usnapls: {}: refused — directory deleted from live tree (no current ACL; fail-closed)",
+                    "snap ls: {}: refused — directory deleted from live tree (no current ACL; fail-closed)",
                     path
                 )];
             }
             ReadAuthz::DenyAcl => {
                 return alloc::vec![alloc::format!(
-                    "usnapls: {}: refused — current ACL denies this principal",
+                    "snap ls: {}: refused — current ACL denies this principal",
                     path
                 )];
             }
         }
         let mut view = match fs.open_snapshot(generation) {
             Ok(v) => v,
-            Err(e) => return alloc::vec![alloc::format!("usnapls: {:?}", e)],
+            Err(e) => return alloc::vec![alloc::format!("snap ls: {:?}", e)],
         };
         match view.ls(dir_id) {
             Ok(entries) => {
@@ -5875,16 +7509,16 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
                 }
                 lines
             }
-            Err(e) => alloc::vec![alloc::format!("usnapls: {:?}", e)],
+            Err(e) => alloc::vec![alloc::format!("snap ls: {:?}", e)],
         }
     });
     match out {
         Ok(lines) => lines,
-        Err(e) => alloc::vec![alloc::format!("usnapls: no unafs volume ({:?})", e)],
+        Err(e) => alloc::vec![alloc::format!("snap ls: no unafs volume ({:?})", e)],
     }
 }
 
-/// `usnapcat <gen> <path>`: read a file from a retained snapshot under the LIVE
+/// `snap cat <gen> <path>`: read a file from a retained snapshot under the LIVE
 /// object's CURRENT ACL (K8c high-security ruling). The shell runs at kernel
 /// authority, so it reads any LIVE object — but a file DELETED from the live
 /// tree fails closed (no current ACL row), and that refusal is reported plainly.
@@ -5895,27 +7529,27 @@ fn unafs_verb_snapcat(generation: u64, path: &str) -> String {
         Ok(SnapReadResult::Ok(bytes)) => {
             // Print the retained bytes as UTF-8 where possible, else a byte count.
             match core::str::from_utf8(&bytes) {
-                Ok(s) => alloc::format!("usnapcat: gen {} {} ({} bytes)\n{}", generation, path, bytes.len(), s),
-                Err(_) => alloc::format!("usnapcat: gen {} {} ({} bytes, binary)", generation, path, bytes.len()),
+                Ok(s) => alloc::format!("snap cat: gen {} {} ({} bytes)\n{}", generation, path, bytes.len(), s),
+                Err(_) => alloc::format!("snap cat: gen {} {} ({} bytes, binary)", generation, path, bytes.len()),
             }
         }
         Ok(SnapReadResult::NotInSnapshot) => {
-            alloc::format!("usnapcat: {}: not in snapshot gen {}", path, generation)
+            alloc::format!("snap cat: {}: not in snapshot gen {}", path, generation)
         }
         Ok(SnapReadResult::SnapshotMissing) => {
-            alloc::format!("usnapcat: no such snapshot generation {}", generation)
+            alloc::format!("snap cat: no such snapshot generation {}", generation)
         }
         Ok(SnapReadResult::Refused(ReadAuthz::DenyNoLiveObject)) => alloc::format!(
-            "usnapcat: {}: refused — object deleted from live tree (no current ACL; fail-closed)",
+            "snap cat: {}: refused — object deleted from live tree (no current ACL; fail-closed)",
             path
         ),
         Ok(SnapReadResult::Refused(ReadAuthz::DenyAcl)) => {
-            alloc::format!("usnapcat: {}: refused — current ACL denies this principal", path)
+            alloc::format!("snap cat: {}: refused — current ACL denies this principal", path)
         }
         Ok(SnapReadResult::Refused(ReadAuthz::Permit)) => {
             // Unreachable (Permit is not a refusal) — reported rather than panicked.
-            alloc::format!("usnapcat: {}: internal: permit reported as refusal", path)
+            alloc::format!("snap cat: {}: internal: permit reported as refusal", path)
         }
-        Err(e) => alloc::format!("usnapcat: no unafs volume ({:?})", e),
+        Err(e) => alloc::format!("snap cat: no unafs volume ({:?})", e),
     }
 }

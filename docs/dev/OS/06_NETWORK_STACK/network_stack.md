@@ -11,7 +11,7 @@
 > it remains in tree at [`unaos/crates/net`](../../../../unaos/crates/net/) (see its
 > `README.md` for the catalog entry), is **still live** (it backs the driver's
 > `service_net()` poll, DHCP, the TCP echo listener, and the shell's
-> `connect`/`fetch`/`udpsend`), and is the **complete opt-out stack** under
+> `nc`/`curl`), and is the **complete opt-out stack** under
 > `UNAOS_NOSMOLNET=1` — **available for resumption** if we choose to resume
 > hand-rolling our own. Build with `UNAOS_NOSMOLNET=1` to run everything below as
 > the whole net path. The material in this document remains accurate for that crate.

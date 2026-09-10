@@ -44,15 +44,22 @@ text, the flag conventions and the error wording are shell work; only the call i
 
 | Verbs | Kernel service behind them |
 | --- | --- |
-| `ls` `dir` `cd` `pwd` `cat` `type` `head` `tail` `find` `du` `stat` `xd` | `fs::fat::mount` + `resolve_path` / `normalize_path` (x86); `pi_ls_collect` over unafs (aarch64) |
-| `touch` `append` `rm` `del` `mkdir` `md` `rmdir` `rd` `cp` `copy` `mv` `move` `ren` `rename` `sync` | the same FAT walk plus the write-through path |
-| `vfs` | `MountTable` create/write/truncate/unlink (aarch64 only; x86 has no `VfsBackend` impl) |
-| `uls` `ucat` `utouch` `uwrite` `umkdir` `urm` `usnaps` `usnap` `usnapdrop` `usnapls` `usnapcat` | the native unafs volume + its retained-root/snapshot API (aarch64) |
-| `netinfo` `ping` `arp` `connect` `udpsend` `get` | the smoltcp socket layer |
-| `date` `setdate` `time` `uptime` | `crate::clock` (`unix_now` / `set` / `iso8601_now`) |
+| `ls` `dir` `cd` `pwd` `cat` `type` `head` `tail` `find` `du` `stat` `hexdump` | `fs::fat::mount` + `resolve_path` / `normalize_path` (x86); the `MountTable` over the one namespace (aarch64) |
+| `touch` `append` `rm` `del` `mkdir` `md` `rmdir` `rd` `cp` `copy` `mv` `move` `ren` `rename` `sync` `write` | the same FAT walk plus the write-through path; on aarch64 a native-namespace target routes to the UnaFS helpers (RELICS) |
+| `mount` | the volume table + `MountTable` create/write/truncate/unlink (aarch64 only; x86 has no `VfsBackend` impl) |
+| `setfattr` `snap` | the native unafs volume's typed attributes + its retained-root/snapshot API (aarch64 body, honest refusal elsewhere) |
+| `ifconfig` `ping` `arp` `nc` `curl` | the smoltcp socket layer |
+| `date` (`date -s`) `time` `uptime` | `crate::clock` (`unix_now` / `set` / `iso8601_now`) |
 | `run` `bg` `jobs` `kill` `storm` | `arch::syscall::{run_user_image, spawn_user_image_bg, bg_poll, bg_kill}` |
-| `diskinfo` `usbinfo` `fatinfo` `read` `write` | the block/USB/FAT geometry readers |
+| `fdisk` `lsusb` `dd` | the block/USB/FAT geometry readers and the raw block surface |
 | `shutdown` `off` | the platform power path |
+
+> **RELICS (R26, 2026-09-06).** The rows above are the CURRENT spelling. Peter's ruling replaced
+> the house names with the standard ones — `bootlog`→`dmesg`, `vfs`→`mount`, `xd`→`hexdump`,
+> `usbinfo`→`lsusb`, `netinfo`→`ifconfig`, `diskinfo`→`fdisk -l`, `fatinfo`→folded into `mount`,
+> `setdate`→`date -s`, `sched`→`ps`, `connect`/`udpsend`→`nc`, `get`→`curl`, `read`/`write <lba>`→`dd`
+> — and retired the duplicated `u*` family into the plain file verbs, which now reach the native
+> volume themselves. Replacements, not aliases: none of the old spellings is a verb any more.
 
 **Every one of these is a candidate for Peter's "translated directly into the system calls".** They
 are already syscall-shaped; what is missing is that the *caller* should be midden, in userspace,
@@ -512,9 +519,10 @@ attributes, where it can be done the way BeFS did it rather than faked.
   behind it (the match is over `&str`, so a missing arm is not a non-exhaustive-match error): add a
   verb to the table and forget its arm, or narrow an arm's `cfg` without narrowing its `Avail`, and
   the drift surfaces there as a named sentence on the panel instead of as a word that silently does
-  nothing. No example is given at the arm on purpose — the obvious candidates are all wrong (`uls`
-  on x86 is `Avail::Aarch64` and never becomes a `Host` plan; `top` has no `cfg` at all and prints
-  its own aarch64-only message from inside its arm; `vug`'s `Avail` tracks the v3d `cfg`) — and a
+  nothing. No example is given at the arm on purpose — the obvious candidates are all wrong (`top` and
+  `batmon` have no `cfg` at all and print their own per-platform message from inside their arms;
+  `vug`'s `Avail` tracks the v3d `cfg`; and since RELICS there is no `Avail::Aarch64` member left
+  to be the third example) — and a
   case that genuinely reaches it would be a **bug in the table**, not a documented behaviour.
 * **`help`, `echo`, `ver`/`version`, `gneiss` and the empty line moved into the core**, and their
   output reaches the panel through `render_message(console, &Message)` — Ring 0 rendering a

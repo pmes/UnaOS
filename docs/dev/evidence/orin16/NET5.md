@@ -198,3 +198,82 @@ Run in this worktree, base `37c78ad7`. Logs in `~/unaos-bench/scratch/orin16/net
 
 Unflown at commit time (metal-owed; QEMU models no Tegra234 RC, so this boot is the only verdict that
 will exist). Row A12 status: `fixed-unflown`, question re-posed.
+
+## 9. FLOWN — render8, 2026-09-06 (`~/unaos-bench/scratch/orin17/render8-boot.log`)
+
+The probe armed and answered. `[net5R] ARMED … [MATCH]`; the placement was unchanged from net4
+(`rx-ring phys=0x80000000 … below4g=1`, five `[net4s] … identity-covered, no alias`, no
+`[net4r] alias region 1`), so §4's precondition held and every arm below is readable.
+
+### 9.1 The five pops, landing by landing
+
+`shadow = 0x80050000`, `rx-bufs = 0x80010000`, stride 2048. "Landed" = the buffer that lost its
+landing tag SINCE THE PREVIOUS POP (the §4.2 cadence), read off the `[net5T]` masks.
+
+| pop | completing slot `s` | `desc[s].addr` after the re-point | tag lost at | landing index | arm |
+|---|---|---|---|---|---|
+| rx[0] | 0 | `0x80010000` — ring[0], the **control**, never re-pointed | `ring[0]` | 0 | `PREFETCHED` (**misfiled**, see §9.3) |
+| rx[1] | 1 | `0x80050800` — shadow[1] | `shadow[17]` = `0x80058800` | 17 | `REFETCH-WRONGSLOT` |
+| rx[2] | 2 | `0x80051000` — shadow[2] | `shadow[17]` | 17 | `REFETCH-WRONGSLOT` |
+| rx[3] | 3 | `0x80051800` — shadow[3] | `shadow[17]` | 17 | `REFETCH-WRONGSLOT` |
+| rx[4] | 4 | `0x80052000` — shadow[4] | *(nothing, either block)* | — | `NOWHERE` (len=342, OFFER-sized) |
+
+```
+[net5T] rx[1] slot=1 len=60  … shadow-mask=0x00020000 (first=17) ring-mask=0x00000000 (first=-1) own-shadow=0 own-ring=0 verdict=REFETCH-WRONGSLOT
+[net5T] rx[2] slot=2 len=60  … shadow-mask=0x00020000 (first=17) ring-mask=0x00000000 (first=-1) own-shadow=0 own-ring=0 verdict=REFETCH-WRONGSLOT
+[net5T] rx[3] slot=3 len=62  … shadow-mask=0x00020000 (first=17) ring-mask=0x00000000 (first=-1) own-shadow=0 own-ring=0 verdict=REFETCH-WRONGSLOT
+[net5V] … pops-scored=5 REFETCH-LIVE=0 REFETCH-WRONGSLOT=3 STALE-ORIG=0 PREFETCHED=1 NOWHERE=1 prefetch-depth=1
+```
+
+Two facts follow, and they are the ones the probe was built to separate. The landing index is
+**17 in the SHADOW block**, so the address the NIC emitted was fetched AFTER the re-point and after
+RxEnb — the address path is LIVE, and `STALE-ORIG` is refuted on the wire (0 hits). And the landing
+index does not move while the completing slot advances 1 → 2 → 3 — so the reuse is an **index**
+defect: the writeback pointer advances per-slot, the payload-address pointer does not.
+
+### 9.2 The read-side defect this exposed (fixed here)
+
+The diagnosis was correct and the DELIVERY was still lost, for a reason inside this driver. The NET-5
+read site asked one question — *did `shadow[rx_cur]` lose its tag?* — which is FALSE on every
+`REFETCH-WRONGSLOT` pop by that arm's own definition. So it fell through to the completing slot's
+original ring buffer, which was equally untouched, and handed smoltcp 60 bytes of `NET4E_` landing
+tag while the frame sat unread at `shadow[17]`. `Q3 NO LEASE` is partly this: pop rx[4] never reached
+DRAM at all, but rx[1..3] DID, and the driver read past them.
+
+`net5_read_src` replaces that test. Resolution order: `shadow[rx_cur]` (correct addressing) → the ONE
+shadow buffer that lost its tag (the wrong-slot landing) → refuse (`None`, keep the original pointer)
+when nothing was written or when two or more were, which cannot be attributed to this completion. It
+consumes nothing, because `net5_on_pop` runs after it on the same pop and its scan IS the instrument;
+the RESTAMP-ALL at the end of that scan is already the consume. `slot_expected=`/`slot_read=` now ride
+both `[net5T]` and `[net5V]`, with `divergent-reads=` counting the pops where they differed — so the
+next boot states the index defect as a number instead of leaving it to be reconstructed from masks.
+
+### 9.3 `PREFETCHED=1` was the control, not a prefetch
+
+Slot 0 is deliberately left on its own buffer (§4.1). A landing in `ring[0]` on slot 0's completion is
+therefore the control behaving correctly and can say nothing about how deep the engine had prefetched
+when the re-point ran — `desc[0]` was never moved. Scoring it `PREFETCHED` invented `prefetch-depth=1`
+AND, by making the counter non-zero, disarmed §5's `NOWHERE with no PREFETCHED ⇒ C1` rule with an
+artifact of the probe's own control. The arm is now split: `CONTROL-OK` counts slot 0's own-buffer
+landing, `PREFETCHED` keeps its meaning for `s ≥ 1`. On render8's numbers the corrected reading is
+`PREFETCHED=0 NOWHERE=1 CONTROL-OK=1`, so rx[4] stands as an unblocked C1 datum alongside the C2
+index conviction — the two are not exclusive, and §3's C1 and C2 both stay open (R19).
+
+### 9.4 `[net4G]` did NOT arm — the scorer's control leg is a false positive
+
+`A12 net4 control: net4G_lines=1 -> UNEXPECTED — [net4G] armed under the NET-5 cadence` counts LINES
+carrying the `[net4G]` tag, not the ARMED predicate. The one line present says the opposite:
+
+```
+[net4G] latch-site status: never ARMED — no [net4F] single-address-latch verdict fired this window
+        (the experiment self-gates on a tag-proven latch) (victim=-1 latched=-1 interim-pops=0 interim-L-hits=0)
+```
+
+The mechanism is §4.2's stated side effect, and it is now confirmed rather than predicted. `net4g_arm`
+is reached only from the `[net4F]` VERDICT, which needs `land >= 0 && !own` for four consecutive pops,
+and `land` is `written[0]` only when `total == 1`. Under RESTAMP-ALL the ring block is re-stamped on
+every pop, so pops 1..4 read `buffers-written(count=0)` → `total == 0` → `land = -1` → `net4f_run`
+never increments → no verdict → no arm. (The `[net4F] distinct buffers-written(count=1)=[0,…]` lines
+are a different accumulator, `net4f_distinct_mask`, which is a UNION over the first four completions
+and legitimately retains pop 0's control landing.) Read the control leg as `net4G armed=0`; the scorer
+predicate wants to be `/\[net4G\].*DECOY ARMED/`, not `/\[net4G\]/`.

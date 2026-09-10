@@ -1,12 +1,6 @@
-# DRAFT — orin 16 LANDING REPORT 4 (the orin 15 + orin 16 arc, 2026-09-06)
+# orin 16 LANDING REPORT 4 (the orin 15 + orin 16 arc, 2026-09-06)
 
-> **DRAFT — pre-merge final form.** Opened by executor CLOSEDOCS at 2026-09-06T15:0xZ; brought to its
-> pre-merge final form by executor LANDDOC (orin 17) against the arc tip `963516c8`, TRUNKPREVIEW2's
-> battery, and GRANTREC's F-1 reconciliation. **The merge has not happened.** §6's shape rows, §7's
-> announce/ack rows and §8's trunk battery are PENDING by design and stay that way until Peter pushes the
-> flight commit, the announce draws its acks, and the `--no-ff` merge runs in `../UnaOS`. The seat drops
-> this banner after the merge and fills those three tables in the same turn. Do not cite this file as a
-> landing record while the banner is here.
+> **FINAL — LANDED.** `main c7407753` = `--no-ff` merge of `hw-jetson c5048fe6` into `f49ea1e7`, made in `../UnaOS` at 2026-09-06T16:42Z by orin 17 and on origin at 16:50Z (fresh host `ls-remote`: `main c7407753`). Trunk battery on the merge commit: green, every leg by exit code (§8). Peer acks: pi 7 16:40Z, rmbp 14 ~17:2xZ (§7). Draft history: opened by executor CLOSEDOCS 15:0xZ, §3 reconciled by GRANTREC/LANDDOC, folded by orin 17.
 
 Companion: [`CLOSE-REPORT.md`](CLOSE-REPORT.md) (the round, the flights, the owed list).
 
@@ -464,7 +458,7 @@ run.
 
 ---
 
-## 6. Merge-shape rule (LAWS §Code and history, pi 6 at LANDING-2 `d11cd56e`) — PENDING
+## 6. Merge-shape rule (LAWS §Code and history, pi 6 at LANDING-2 `d11cd56e`) — PASS
 
 After the `--no-ff` landing, prove two facts with commands, **in this order**, and quote both here:
 
@@ -478,16 +472,16 @@ After the `--no-ff` landing, prove two facts with commands, **in this order**, a
 
 | # | fact | command | result |
 |---|---|---|---|
-| 1 | two parents | `git log --pretty=%p -1 <merge>` | **PENDING** |
-| 2a | diff vs arc parent | `git diff <arc-tip> <merge> \| wc -l` | **PENDING** |
-| 2b | trunk original work since base | `git log --no-merges --oneline 671a0334..<trunk-tip> \| wc -l` | **PENDING** |
+| 1 | two parents | `git log --pretty=%p -1 c7407753` | **PASS** — `f49ea1e7 c5048fe6` |
+| 2a | diff vs arc parent | `git diff c5048fe6 c7407753 \| wc -l` | **PASS** — `0`; tree `c6ce5ef4` both (pi 7: main^{tree} == merge-base^{tree} `1eb76454`; rmbp 14: `git merge-tree --write-tree` = `c6ce5ef4`) |
+| 2b | trunk original work since base | `git log --no-merges --oneline 671a0334..f49ea1e7 \| wc -l` | **PASS** — `0` (the three commits beyond the base are merges OF hw-jetson: orin 13, 13b, 14) |
 
 Both halves already PASS on the preview merge `d9bc1636` (§5.2). **That is not a substitute**: these
 rows are the same two commands re-run on the real merge commit.
 
 ---
 
-## 7. Landing-race rule, and the landing sequence — PENDING
+## 7. Landing-race rule, and the landing sequence — DONE
 
 There is no integrator seat. The landing track runs the independent adversarial review itself (the COI guard:
 the author seat never reviews alone), **announces the merge over ccd and obtains a peer ack from at least one
@@ -517,30 +511,30 @@ banner come off this file.
 
 | step | state |
 |---|---|
-| adversarial panel on the final tip | **PENDING** |
-| Peter's push of the flight commit | **PENDING** |
-| `ls-remote` at the announce | **PENDING** — value + UTC stamp |
-| peer ack #1 (rmbp 13) | **PENDING** — their `ls-remote`, their scope, and their answer to §3.4 |
-| peer ack #2 (pi 7) | **PENDING** — their `ls-remote`, their scope, and F-4 |
-| `ls-remote` immediately before the merge | **PENDING** |
-| `--no-ff` merge commit in `../UnaOS` | **PENDING** |
-| trunk battery on the merge commit (§8) | **PENDING** |
+| adversarial panel on the final tip | PANEL-REVIEW (orin 16, code at 963516c8; the two later commits are docs) + TRUNKPREVIEW2 §5 |
+| Peter's push of the flight commit | `hw-jetson c5048fe6` on origin at 16:39Z (host `ls-remote`) |
+| `ls-remote` at the announce | 16:39:11Z — `hw-jetson c5048fe6 · hw-pi4 f25f1601 · hw-rmbp 72fd1de3 · main f49ea1e7` |
+| peer ack #1 (rmbp 14; rmbp 13 was archived) | **GRANTED ~17:2xZ** — their `ls-remote`: `c5048fe6 · f49ea1e7 · bfcea17e · 36deacd6`; computed, not reviewed: `merge-base --is-ancestor f49ea1e7 c5048fe6` NO (real merge), 93 commits, `git merge-tree --write-tree f49ea1e7 c5048fe6` = `c6ce5ef4…` == `c5048fe6^{tree}` exit 0; `ledger-check` 111 rows exit 0 AND `UNAOS_LEDGER_STRICT=1` exit 0 on the tip; GATE-APPEND on 963516c8 OK (164 files, 4 controls). NOT verified by them: check/test/test-arm/kernel8/kernel8-test. §3.4 answered (a)–(d), see there. Their ledger row B37 |
+| peer ack #2 (pi 7) | **GRANTED 16:40:09Z** — their `ls-remote`: `c5048fe6 · bfcea17e · 36deacd6 · f49ea1e7`; proof by tree object: `main^{tree}` == `merge-base^{tree}` (`1eb76454…`), so the merged tree is hw-jetson's (`c6ce5ef4…`) by construction; every commit they granted verified in range by ancestry (`99c153ca`, `5f8f392f`, `0f6a12d2..6aef5227`, `fdbaeb87`, `c5048fe6`). NOT checked: any gate run, metal, the knob-off image, behaviour. F-4: acked (§3.4). Their observation: trunk carries no pi/rmbp work yet, so their first landings are real merges against 93 orin commits |
+| `ls-remote` immediately before the merge | 16:42:01Z — `main f49ea1e7` unmoved (hw-pi4 had moved to `bfcea17e`, irrelevant to this merge) |
+| `--no-ff` merge commit in `../UnaOS` | `c7407753`, 16:42Z, 94 commits (93 + merge); pushed by Peter, on origin at 16:50Z |
+| trunk battery on the merge commit (§8) | **GREEN**, 16:42–16:53Z |
 
 ---
 
-## 8. Trunk battery on the merge commit — PENDING
+## 8. Trunk battery on the merge commit `c7407753` — GREEN
 
 Runs in `../UnaOS` on the merge commit, **not** on the preview (§5) and **not** on the arc tip. No number
 below is filled in.
 
 | leg | exit | evidence |
 |---|---|---|
-| `./arroyo check` (both arches) | **PENDING** | red count; GATE-KNOB; GATE-LEDGER |
-| `UNAOS_WC=1 ./arroyo test 150` | **PENDING** | banner must show `wc`; PASS count; panic count; `[ptrdead]` count |
-| `./arroyo test-arm 60` | **PENDING** | line count; witnesses; panics |
-| `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` | **PENDING** | `MBENCH … N/N required witnesses, 0 forbidden hit(s)`; **host load at the run** |
-| `unaos/scripts/ledger-check.sh` | **PENDING** | row count; gate on the **exit code**, not the printed line |
-| `kernel8.img` sha256 | **PENDING** | taken with `sha256sum`, not read off the leg's summary line |
+| `./arroyo check` (both arches) | **exit 0** | 0 ❌; GATE-KNOB OK; GATE-LEDGER OK |
+| `./arroyo test` (x86; the `UNAOS_WC=1` form ran on the folded hw-jetson tip `d2e36929` in the same hour: exit 0, `wc` in the banner) | **exit 0** | `[ptrdead] … fpop12=0 fpop3=0 -> PASS` — no Class-3 flake this run |
+| `./arroyo test-arm 60` | **exit 0** | — |
+| `./arroyo kernel8` + `./arroyo kernel8-test` ×2 | **exit 0 / 0 / 0** | `MBENCH PASS — 119/119 required witnesses`, 0 forbidden, both runs; SO7 hits 0/0; host NOT quiet (nine executors and their gates live) — a quiet-box run stays owed to rmbp's SO7/B26 fixture item |
+| `unaos/scripts/ledger-check.sh` | **exit 0** | 111 rows, 2 files + RULINGS. ABSENT on trunk at this tip, not green: GATE-APPEND (`append-position.sh`), GATE-K8REACH (`k8-reach.py`) and the ledger STRICT/DEFERRED split — they arrive with rmbp's J1 (rmbp 14) |
+| `kernel8.img` sha256 | `ed258846c9d20887…` (1817704 B) | `sha256sum` on `../UnaOS/unaos/target/pi_baremetal/kernel8.img` after the battery; TRUNKPREVIEW2's build of the identical tree read `ed258846c9d20887…` — a per-tree chain, compare within one chain only |
 
 **Four conditions on this table before it can be quoted.**
 

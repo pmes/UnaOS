@@ -1,0 +1,144 @@
+21,23c21,23
+< [ INFO]: crates/bootloader/src/main.rs@N: JB6: dummy ACPI 2.0 table installed (RSDP @0xA, XSDT @0xA) ? XUSB Falcon teardown wil:l:  sFeRlGfU-AsRkDi:p b
+< oÿoätM mvIonlsutmael lsPerroitaolc=o0lxIdnet0e0r1faa1c3e :â €2”7 ADBeFf0a5u5l-tB-1wBr8i-t4eC 2s6u-b8s0t4i8t-u7t4i8oFn3 7gBuAaAr2dD FA R0ME
+< D ::
+---
+> [ INFO]: crates/bootloader/src/main.rs@N: JB6: dummy ACPI 2.0 table installed (RSDP @0xA, XSDT @0xA) ? XUSB Falcon teardown will: :s eFlRfG-UsAkRiDp: 
+> bÿoäoMtm Ivnosltuamlel Psreortioaclo=l0Ixndtee0r0f1aac1e3:  â2€7”A BDFe0f5a5u-lBt1-Bw8r-i4tCe2 Ns-u8b0s4t8i-t7u4t8iFo3n7 BgAuAa2rDdF  A0RM
+> ED ::
+950a951
+> [wc-g] prof win=N seq=N surf_bytes=N cks_blit_us=N civac_us=N cks_after_us=N probes=N readback_us=N
+954d954
+< [wc-g] prof win=N seq=N surf_bytes=N cks_blit_us=N civac_us=N cks_after_us=N probes=N readback_us=N
+989d988
+< :: [orinbsptick] tick 500 taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+990a990
+> :: [orinbsptick] tick 500 taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1005d1004
+< [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+1006a1006,1013
+> [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+> :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1015a1023,1027
+> [wcn] rollup scope=live wins=N att=N comp=N hid=N bel=N stale=N passes=N aborted=N att_rate=N/s comp_rate=N/s span=Nms -> LIVE
+> [comp2] rollup passes=N pass_us=N max_us=N sprite_us=N wait_us=N blit_us=N compose_us=N present_us=N cache_us=N bytes_pp=N dmg_px_pp=N box_px_pp=N straddle_us=N wcd_us=N util_pct=N rate=N/s span=Nms
+> [fluid3] parks=N park_us mean=N max=N p50<=N p90<=N p99<=N depth_max=N overlap=N span=Nms
+> [wc-tail] census stash=N cash=N stale=N inline=N -> INERT
+> [noatt] scope=live passes=N seeds=N noatt=N noatt_kpx=N rate=N/s taker=N span=Nms -> UNATTRIBUTED
+1024,1028d1035
+< [wcn] rollup scope=live wins=N att=N comp=N hid=N bel=N stale=N passes=N aborted=N att_rate=N/s comp_rate=N/s span=Nms -> LIVE
+< [comp2] rollup passes=N pass_us=N max_us=N sprite_us=N wait_us=N blit_us=N compose_us=N present_us=N cache_us=N bytes_pp=N dmg_px_pp=N box_px_pp=N straddle_us=N wcd_us=N util_pct=N rate=N/s span=Nms
+< [fluid3] parks=N park_us mean=N max=N p50<=N p90<=N p99<=N depth_max=N overlap=N span=Nms
+< [wc-tail] census stash=N cash=N stale=N inline=N -> INERT
+< [noatt] scope=live passes=N seeds=N noatt=N noatt_kpx=N rate=N/s taker=N span=Nms -> UNATTRIBUTED
+1038a1046,1047
+> [serialrx] rx=N (+0) polls=N refused=N ovrf=N lsr0=NxA mbox=N -> RX-LIVE (the UART answers; 0xA = THRE|TEMT is the idle N signature) (TCURX2: `mbox=` = bytes TAKEN from the TCU RX mailbox and consumed by write-back; `rx=` totals BOTH sources, UARTC RBR + mailbox)
+> [rxmerge] census policy=mbox-only seq=N uartc=N mbox=N dup=N reorder=N parked=N -> SINGLE-SOURCE (exactly-once, in-order: every byte came down one transport). EXPECTED SIDE EFFECTS under policy=mbox-only: `[serialrx] polls=N` beside this line is CORRECT, not a dead drain â€” the UARTC RBR is never read; `parked=` is the drain-liveness counter that replaces `polls=`. A16's `lsr=`/`iir=`/`fifo=` witness still prints (one direct LSR read, which does not pop the RBR) but `ovrf=` is now at most 1, because it counts POLLS that saw the flag and there is exactly one per boot
+1042,1044d1050
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+< [serialrx] rx=N (+0) polls=N refused=N ovrf=N lsr0=NxA mbox=N -> RX-LIVE (the UART answers; 0xA = THRE|TEMT is the idle N signature) (TCURX2: `mbox=` = bytes TAKEN from the TCU RX mailbox and consumed by write-back; `rx=` totals BOTH sources, UARTC RBR + mailbox)
+< [rxmerge] census policy=mbox-only seq=N uartc=N mbox=N dup=N reorder=N parked=N -> SINGLE-SOURCE (exactly-once, in-order: every byte came down one transport). EXPECTED SIDE EFFECTS under policy=mbox-only: `[serialrx] polls=N` beside this line is CORRECT, not a dead drain â€” the UARTC RBR is never read; `parked=` is the drain-liveness counter that replaces `polls=`. A16's `lsr=`/`iir=`/`fifo=` witness still prints (one direct LSR read, which does not pop the RBR) but `ovrf=` is now at most 1, because it counts POLLS that saw the flag and there is exactly one per boot
+1046c1052
+< [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+---
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1054,1055d1059
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+< [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1056a1061,1062
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1060c1066,1067
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+---
+> [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+> [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1069a1077
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1077a1086
+> [conquiet] census dropped=N win=N -> QUIET (lines the desktop's console window would have scrolled and did not; every one of them is on this wire above)
+1082,1083d1090
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+< [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+1086c1093,1099
+< [conquiet] census dropped=N win=N -> QUIET (lines the desktop's console window would have scrolled and did not; every one of them is on this wire above)
+---
+> :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1089a1103
+> [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+1091d1104
+< [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+1092a1106,1113
+> [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+> :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1098a1120
+> [tcu] rx-mbox raw=NxA full=N nbytes=N data=[00 00 00] flush=N hwflush=N | census=N polls=N full-edges=N changes=N last-full=NxA -> FULL-NEVER (nothing has arrived on the mailbox so far)
+1103d1124
+< [tcu] rx-mbox raw=NxA full=N nbytes=N data=[00 00 00] flush=N hwflush=N | census=N polls=N full-edges=N changes=N last-full=NxA -> FULL-NEVER (nothing has arrived on the mailbox so far)
+1114a1136
+> [serialrx] rx=N (+0) polls=N refused=N ovrf=N lsr0=NxA mbox=N -> RX-LIVE (the UART answers; 0xA = THRE|TEMT is the idle N signature) (TCURX2: `mbox=` = bytes TAKEN from the TCU RX mailbox and consumed by write-back; `rx=` totals BOTH sources, UARTC RBR + mailbox)
+1117c1139,1144
+< [serialrx] rx=N (+0) polls=N refused=N ovrf=N lsr0=NxA mbox=N -> RX-LIVE (the UART answers; 0xA = THRE|TEMT is the idle N signature) (TCURX2: `mbox=` = bytes TAKEN from the TCU RX mailbox and consumed by write-back; `rx=` totals BOTH sources, UARTC RBR + mailbox)
+---
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1118a1146
+> [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1129,1135c1157
+< [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+< [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+< [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+< [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+< [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+< [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+---
+> [menubar] live passes=N paints=N rate=N/1k scan=Ncyc/Nus paint=Ncyc/Nus px/paint=N press=crystal crystal=Nx22 clob=N toggles=N off_passes=N
+1142,1143d1163
+< [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+< [menubar] live passes=N paints=N rate=N/1k scan=Ncyc/Nus paint=Ncyc/Nus px/paint=N press=crystal crystal=Nx22 clob=N toggles=N off_passes=N
+1150a1171
+> [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+1153,1160d1173
+< :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+< [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+< [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+< [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+< [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+< [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1163a1177
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1175d1188
+< [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1177,1178c1190
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+< [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+---
+> [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1179a1192
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+== friend-diff calibrate: diff exit=1 (0 = EMPTY) ==

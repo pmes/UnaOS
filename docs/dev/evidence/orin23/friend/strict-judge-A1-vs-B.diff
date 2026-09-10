@@ -1,0 +1,142 @@
+1c1
+< ÿá[ INFO]: crates/bootloader/src/main.rs@448: UnaOS UEFI Bootloader Started
+---
+> ÿá[2J[001;001H[=Nh[2J[009D[2J[004D[005;018H/-------------------------------------------\[006;018H|                                           |[007;018H|-------------------------------------------|[008;018H|                                           |[009;018H|                                           |[010;018H|                                           |[011;018H|                                           |[012;018H|                                           |[013;018H|                                           |[014;018H|                                           |[015;018H|                                           |[016;018H|-------------------------------------------|[017;018H|                                           |[018;018H|                                           |[019;018H|                                           |[020;018H\-------------------------------------------/[006;027HPlease select boot device:[008;019HUEFI SanDisk SS32G A4BCF119 SD Device[009;019HUEFI USB Device[010;019HUEFI HTTPv4 (MAC:4CBB472549C8)[011;019HUEFI PXEv6 (MAC:4CBB472549C8)[012;019HUEFI PXEv4 (MAC:4CBB472549C8)[013;019HUEFI HTTPv6 (MAC:4CBB472549C8)[014;019HEnter Setup[015;019HUEFI Shell[017;028H^ and v to move selection[018;027HENTER to select boot device[019;035HESC to exit[008;019HUEFI SanDisk SS32G A4BCF119 SD Device[037DUEFI SanDisk SS32G A4BCF119 SD Device[009;019HUEFI USB Device[2J[001;001H[ INFO]: crates/bootloader/src/main.rs@448: UnaOS UEFI Bootloader Started
+19,23c19,22
+< [ INFO]: crates/bootloader/src/main.rs@N: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=NxA); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUA
+< RD)
+< [ INFO]: crates/bootloader/src/main.rs@N: JB6: dummy ACPI 2.0 table installed (RSDP @0xA, XSDT @0xA) ? XUSB Falcon teardown wil:l:  sFeRlGfU-AsRkDi:p b
+< oÿoätM mvIonlsutmael lsPerroitaolc=o0lxIdnet0e0r1faa1c3e :â €2”7 ADBeFf0a5u5l-tB-1wBr8i-t4eC 2s6u-b8s0t4i8t-u7t4i8oFn3 7gBuAaAr2dD FA R0ME
+< D ::
+---
+> [ INFO]: crates/bootloader/src/main.rs@N: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=NxA); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUARD)
+> [ INFO]: crates/bootloader/src/main.rs@N: JB6: dummy ACPI 2.0 table installed (RSDP @0xA, XSDT @0xA) ? XUSB Falcon teardown w:i:l lF RsGeUlAfR-Ds:k ibpoo
+> tÿ ävMomlIunmset aslelrPiraolt=o0cxodleI0n0t1ear1f3a câe€:”  2D7eAfBaFu0l5t5--wBr1iBt8e- 4sCu2bNs-t8i0t4u8t-i7o4n8 Fg3u7aBrAdA 2ADRFM E0D 
+> ::
+25c24
+< :: tegra: dark-window guard â€” 89 byte(s) dropped pre-map ::
+---
+> tegra: dark-window guard â€” 89 byte(s) dropped pre-map ::
+245c244
+< :: tegra: HEAP-GUARD â€” kernel heap [0xA, 0xA) (48 MiB), highest clean window (RAS-2 heuristic â€” NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 153 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+---
+> :: tegra: HEAP-GUARD â€” kernel heap [0xA, 0xA) (48 MiB), highest clean window (RAS-2 heuristic â€” NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 165 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+866c865
+< [quarry] open census cwd=/ entries=N dirs=N files=N truncated=false names: .Spotlight-V100/ .Trashes/ APPS/ B43/ EFI/ apps/ boot/ BLOCK.TXT(197) CARD-LAYOUT.txt(742) HELLO.BIN*(51) IMAGE.SHA(295) MANIFEST(N) ...
+---
+> [quarry] open census cwd=/ entries=N dirs=N files=N truncated=false names: .Spotlight-V100/ .Trashes/ APPS/ B43/ EFI/ apps/ boot/ volumes/ BLOCK.TXT(197) CARD-LAYOUT.txt(742) HELLO.BIN*(51) IMAGE.SHA(295) ...
+892a892
+> :: [orinbsptick] tick 250 taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+907d906
+< :: [orinbsptick] tick 250 taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+961d959
+< [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+962a961
+> [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+1039a1039
+> [conquiet] census dropped=N win=N -> QUIET (lines the desktop's console window would have scrolled and did not; every one of them is on this wire above)
+1042c1042,1048
+< [conquiet] census dropped=N win=N -> QUIET (lines the desktop's console window would have scrolled and did not; every one of them is on this wire above)
+---
+> :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1045a1052
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1048c1055,1061
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+---
+> :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1058d1070
+< :: tegra: JD2 â€” OUT | UnaOS â€” Jetson Orin Nano (Tegra234) ::
+1059a1072
+> :: tegra: JD2 â€” OUT | UnaOS â€” Jetson Orin Nano (Tegra234) ::
+1069a1083,1084
+> :: PRTSCR: PrintScreen (HID 0xA) down on xHCI -> capture armed ::
+> :: PRTSCR: SCREEN6.PNG 1920xA -> capturing (N bytes reserved; the verdict line follows â€” a boot cut before it leaves the entry short of that) ::
+1072a1088,1093
+> [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+> [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+> [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+> [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+> [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+> [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+1074a1096,1097
+> :: PRTSCR: slice n=N bytes=N/N ::
+> [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1085,1092d1107
+< [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+< [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+< [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+< [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+< [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+< [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1095c1110
+< :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+---
+> :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +51/win nofold=NxA) ::
+1098,1099d1112
+< [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+< [menubar] live passes=N paints=N rate=N/1k scan=Ncyc/Nus paint=Ncyc/Nus px/paint=N press=crystal crystal=Nx22 clob=N toggles=N off_passes=N
+1103a1117,1118
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+> :: PRTSCR: slice n=N bytes=N/N ::
+1104a1120
+> :: PRTSCR: slice n=N bytes=N/N ::
+1107d1122
+< [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1109,1117c1124,1125
+< :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+< [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+< [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+< [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+< [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+< [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+< [tcu] rx-mbox raw=NxA full=N nbytes=N data=[00 00 00] flush=N hwflush=N | census=N polls=N full-edges=N changes=N last-full=NxA -> FULL-NEVER (nothing has arrived on the mailbox so far)
+---
+> :: PRTSCR: slice n=N bytes=N/N ::
+> :: PRTSCR: slice n=N bytes=N/N ::
+1119a1128,1132
+> [tcu] rx-mbox raw=NxA full=N nbytes=N data=[00 00 00] flush=N hwflush=N | census=N polls=N full-edges=N changes=N last-full=NxA -> FULL-NEVER (nothing has arrived on the mailbox so far)
+> :: PRTSCR: slice n=N bytes=N/N ::
+> :: PRTSCR: slice n=N bytes=N/N ::
+> :: PRTSCR: slice n=N bytes=N/N ::
+> [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+1120a1134
+> :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+1123,1131d1136
+< [el0live] verdict=EXTINCT el0 runnable/parked/committed=N/0/0 last_disp=Nms last_wake=-- stall>=Nms | reaped exit=N kill_oncpu=N kill_offcpu=N corrupt=N nopark=N | totals el0_disp=N
+< :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+< [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+< [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+< [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+< [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+< [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+< [wc-b] rollup presents=N banded=N maxbands=N chrome_rows=N chrome_rows_used=N amp=Nx -> UNBANDED
+1133,1134d1137
+< :: [orinbsptick] tick N taken at EL1 on cpu 0 â€” periodic CNTP live across the terminus ::
+< [wc-h] rollup win=N scope=window emit=N age_ms=N pop=budgeted samples=N budget=N pop=all-presents torn=N stalls=N longpres=N declines=N decl_geom=N decl_cap=N decl_lock=N decl_alloc=N fixture=N whole=N banded=N lines=N minspan=N minspan_bytes=N maxpresent_us=N minpresent_us=N presspread=N presspop=N pop=constant frame_us=N stallbound_us=N -> TEAR-FREE
+1136,1142d1138
+< :: SCHED: load c0=N%/f=Nms c1=N%/f=Nms c2=N%/f=Nms c3=N%/f=Nms c4=N%/f=Nms c5=N%/f=Nms c6=--/f=never-folded c7=--/f=never-folded (ctx +N/win nofold=NxA) ::
+< [pulse5] live c0=Nms c1=Nms c2=Nms c3=Nms c4=Nms c5=Nms c6=Nms c7=Nms span_max=Nms window=Nms folds=N
+< [spread4] live c0=N/0 c1=N/0 c2=N/0 c3=N/0 rewake=N stay=N short=N refresh=N margin=N minpark=Nms steal=N d1=N remig=N cool=N pack=N rwstamp=N residn=N residmin=Nms residavg=Nms el0refuse=N
+< [spread7] quant=N trim=N wake2disp n=N mean=Nus max=Nus
+< [spread9] kick=N svc_lat n=N mean=Nus max=Nus
+< [spread10] slots 1c=N 2c=N 3c+=N co_moves=N ymoves=N recruit=N rstale=N spare=N khot=N hotref=N khotm=NxA sparem=NxA sparepct=N kstale=N split=N repack=N
+< [prio] svc=N el0=N defer=N agedin=N /win (band>=N, totals svc=N el0=N)
+== friend-diff judge: diff exit=1 (0 = EMPTY) ==

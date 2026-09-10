@@ -651,7 +651,9 @@ device:
 - `read_block(lba, &mut buf) -> Result<usize, BlockError>`
 - `write_block(lba, &buf) -> Result<(), BlockError>`
 
-The shell exposes these as `diskinfo`, `read <lba>`, and `write <lba> <byte>`.
+The shell exposes these as `fdisk -l`, `dd if=<lba>`, and `dd of=<lba> byte=<0xNN>`.
+(RELICS/R26: the raw-block pair used to be `read`/`write <lba> <byte>`; the second shared a verb
+with the file writer, so a mis-shaped `write` was a raw block write. They are `dd` now.)
 
 Boot evidence: `xHCI: READ(10) LBA0 CSW status=Passed residue=0`,
 `xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<`.
@@ -3709,7 +3711,7 @@ Surrender does three things and then stops:
    retraction cannot revive the stall.
 
 `storage_slot` is cleared and `storage_note` becomes `storage device FAILED (BOT rescue
-surrendered)`, which is what `diskinfo` shows on a serial-less machine.
+surrendered)`, which is what `fdisk -l` shows on a serial-less machine.
 
 **Reversal is physical.** The surrender is cleared when the slot is **disposed** (disconnect) or
 **re-enumerated** (`bring_up_storage`), so it binds to the disk that earned it and not to a recycled

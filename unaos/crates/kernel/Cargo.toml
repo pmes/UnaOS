@@ -213,7 +213,7 @@ skip_xhci = []
 bootlog = []
 # CLOCK-2: opt-in log timestamps on the kernel serial log. Prefixes each serial LINE with a compact
 # fixed-width timestamp — monotonic ms since boot (`[  12345ms] `) before a civil anchor exists,
-# flipping to UTC wall time (`[15:04:07Z] `) once SNTP/`setdate` anchors `crate::clock`. UART
+# flipping to UTC wall time (`[15:04:07Z] `) once SNTP/`date -s` anchors `crate::clock`. UART
 # byte-stream ONLY — the fbcon + capture-ring mirrors keep the raw text, so tste/UNAOS.LOG are
 # unchanged. DEFAULT OFF => module + prefix path vanish and serial is byte-identical (witness/mbench
 # specs parse serial lines and must be unaffected). Enable via `UNAOS_LOGTS=1`.
@@ -719,14 +719,14 @@ hcronst = ["holocron"]
 # every shipped image is byte-alike. Kept in sync with arroyo and builder/src/main.rs.
 prtscrst = []
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
-# path — the shell's ping/arp/netinfo, the socket syscall family (SOCK-2..7), the DNS sinkhole
+# path — the shell's ping/arp/ifconfig, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles
 # the `smolnet` Device adapter over the e1000e rings (the module is additionally
 # target_arch="x86_64"-gated, so aarch64 never pulls smoltcp and its binaries are byte-identical
 # whether or not the feature is pushed). This POSITIVE feature is pushed BY DEFAULT by arroyo/builder;
 # UNAOS_NOSMOLNET=1 opts out (the feature is not pushed) => the hand-rolled `net` crate is the whole
 # net path, byte-identical to the pre-flip default. The hand-rolled stack stays compiled and live
-# regardless (it still owns connect/fetch/udpsend, the TCP echo listener, and driver DHCP). Poll-driven,
+# regardless (it still owns nc/curl, the TCP echo listener, and driver DHCP). Poll-driven,
 # static buffers (no heap growth). See unaos/docs/dev/OS/08_NET/networking.md.
 smolnet = ["dep:smoltcp"]
 # Jetson Orin Nano (Tegra234) build: point the aarch64 serial at the Tegra UART — a 16550-style
@@ -762,9 +762,13 @@ smpmark = []
 # remain unmasked from the arm onward; dispatch is `on_tick` only (no `SCHED_ACTIVE`, no
 # preemption — the capstone loop stays cooperative). Witness: `[orinbsptick]` — tick 1, then every
 # 250th tick, carrying count + re-measured CurrentEL + cpu. Standalone (does NOT imply `tegra`,
-# mirroring `smpmark`) but every site is `all(tegra, bsptick)`-gated, so arm it WITH tegra. With the
-# feature OFF (default) every site vanishes and the tegra image is byte-identical to baseline.
-# Enable via `UNAOS_BSPTICK=1 ./arroyo esp-jetson`. See arch_arm64.md §ORIN-BSPTICK.
+# mirroring `smpmark`) but every site is `all(tegra, bsptick)`-gated, so arm it WITH tegra.
+# ⚠ DEFAULT-ON FOR TEGRA as of ORIN-TICKDEFAULT (orin 19, Peter 2026-09-07): every tegra build arms
+# this unless `UNAOS_NOBSPTICK=1` opts out, and it is that OPT-OUT — no longer the mere absence of
+# `UNAOS_BSPTICK=1` — that reproduces the tickless image byte-identical to baseline. `UNAOS_BSPTICK=1`
+# is kept for back-compat and is byte-identical to the new default. Metal-proven before the flip:
+# tick1 (orin 16) `arm=1 tmax=33000 el2=0 exceptions=0 -> PASS`; render8 (orin 17) 718 s of ticks
+# under the full desktop. See arch_arm64.md §ORIN-BSPTICK and arroyo's ORIN-TICKDEFAULT block.
 bsptick = []
 
 # ORIN-BSPRUN (Candidate B arc 2): the `UNAOS_BSPRUN=1` terminus swap — the Orin boot core joins
@@ -779,10 +783,15 @@ bsptick = []
 # leg's line IS the configuration it compiles (the standing matrix rule), and a hand-rolled list
 # that splits them should fail loudly at the compile_error!, not be silently widened. Standalone
 # otherwise (does NOT imply `tegra`, mirroring `bsptick`) but every site is `all(tegra, bsprun)`-
-# gated (the main.rs terminus is inside tegra-gated code), so arm it WITH tegra. With the feature
-# OFF (default) every site vanishes and the tegra image is byte-identical to baseline. Witness:
-# `[orinbsprun]` — the terminus banner. Enable via `UNAOS_BSPRUN=1 ./arroyo esp-jetson`.
-# See arch_arm64.md §ORIN-BSPRUN.
+# gated (the main.rs terminus is inside tegra-gated code), so arm it WITH tegra.
+# ⚠ DEFAULT-ON FOR TEGRA as of ORIN-TICKDEFAULT (orin 19, Peter 2026-09-07): every tegra build arms
+# this unless opted out. TWO opt-outs, because there are three configurations worth reaching:
+# `UNAOS_NOBSPRUN=1` drops preemption and keeps the tick (the tick1-flown rung, cooperative
+# terminus); `UNAOS_NOBSPTICK=1` drops BOTH — it has to, since `bsprun` without `bsptick` trips the
+# `compile_error!` below — and that is the one that reproduces the pre-flip image byte-identical to
+# baseline. Metal-proven before the flip: render8 (orin 17) `orinbsprun_join=1 -> HOSTING`,
+# `[bsprun] host core=0 el=1 -> HOSTING`, `el0 first-run … eret to EL0 ACCEPTED`. Witness:
+# `[orinbsprun]` — the terminus banner. See arch_arm64.md §ORIN-BSPRUN and arroyo's ORIN-TICKDEFAULT.
 bsprun = []
 
 # VUG-RAS-LOCALIZER: the `UNAOS_VUGRAS=1` RAS localizer (vugras.rs) — a knob-gated DC CIVAC writeback
@@ -842,6 +851,67 @@ orinwdt = ["tegra"]
 # (the `tegra` feature has no QEMU model — the virt gate is a different machine), so the round-trip
 # witness is metal-owed/attended. See arch_arm64.md §JETSON-EL0.
 tegra_el0 = ["tegra", "aarch64_el0"]
+
+# JV1 (orin 17) — THE EL0 REGIME ON THE QEMU `virt` TARGET, so EL0 regressions are catchable without a
+# board. The THIRD board term behind `aarch64_el0` (after `baremetal`/Pi and `tegra_el0`/Orin), and the
+# one the capability comment above predicted would "add one line here instead of editing a predicate in
+# fifty-one places" — that is exactly what this is.
+#
+# WHY IT NEEDS NO NEW MMU BACKEND, WHICH IS THE WHOLE REASON THIS IS ONE LINE AND NOT A MODULE.
+# `arch/aarch64/mmu_tegra_el0.rs` was written as the Tegra234 slot backend, but it is coupled to Tegra
+# in exactly TWO live call sites (`mmu_tegra::MMU_MAX_HOLES` / `carveout_holes`, both inside
+# `carveout_overlaps`), and it does NOT reference `mmu_tegra`'s `L1_EL1` static at all: `install()`
+# latches the LIVE `TTBR0_EL1` (`live_ttbr0_root`), so it hangs its user window off whatever EL1 root
+# the boot path actually installed. `boot_virt::drop_to_el1` installs an L1 of the SAME SHAPE
+# `mmu_tegra` builds (`L1[0]` = the low-1-GiB Device window, every RAM GiB = a Normal-WB block, the
+# rest invalid), so `USER_GIB` (480) is as unmapped on `virt` as it is on the Orin and `install()`'s
+# "verify the entry is invalid before claiming it" check passes for the same reason. The carveout arm
+# is INERT rather than wrong on virt: `carveout_holes` reads `HOLE_N`, which only the `tegra`-gated
+# `resolve_carveout_holes` ever writes, so it returns 0 and `carveout_overlaps` is `false` — which is
+# the correct answer on a machine with no SNOC firewall. `mmu_tegra` itself already compiles off-tegra
+# (ORIN-NET-3 carries it on the `pcie3` virt witness), so this reuses a build that exists.
+#
+# It therefore implies `aarch64_el0` ONLY — NOT `tegra`, and NOT `pi`. `pi` + `tegra` is a hard
+# `compile_error!` (`arch/aarch64/serial.rs:23`), so a board term that dragged either in could not
+# coexist with the other board; this one drags in neither and the virt PL011 stays the console.
+#
+# DEFAULT OFF => `mmu_tegra`/`mmu_tegra_el0` are not compiled on virt, `uslots` has no virt arm, and
+# every existing configuration (Pi `baremetal`, Orin `tegra_el0`, plain virt, x86) is byte-identical to
+# baseline. Enable via `UNAOS_VIRT_EL0=1` (`./arroyo test-arm`, `check`); type-checked by the
+# `arm-virt-el0` leg of KERNEL_CFG_MATRIX. Unlike `tegra_el0`, this one IS QEMU-exercisable — that is
+# the point of it.
+virt_el0 = ["aarch64_el0"]
+
+# VIRTPREEMPT (orin 17) — EL1 TIMER PREEMPTION ON THE QEMU `virt` TARGET, the half JV1 deferred by name
+# ("EL1 timer preemption on virt remains a separate arc"; `main.rs` tail: "EL1 timer preemption on virt
+# needs an EL1-non-banking `__vec_irq`"). Four things, all `virt_tick`-gated:
+#
+#   1. `exceptions.rs` `irq_bank!`/`irq_unbank!` — off `tegra` the shared IRQ stub picks its bank
+#      registers at COMPILE time (`baremetal` => ELR/SPSR_EL1, everything else => _EL2), and `virt` is
+#      "everything else". An IRQ taken at EL1 would `mrs x0, ELR_EL2`, which UNDEFs at EL1 straight into
+#      the halting `__vec_sync`. This feature selects the RUNTIME `CurrentEL` arm that `tegra` already
+#      uses and that IRQEL-RT proved live at EL1 on Orin metal — the same asm, no new sequence.
+#   2. `timer.rs` — a periodic 250 Hz CNTP_EL0 re-arm at EL1 (`virt_tick_start`), the `virt` twin of
+#      ORIN-BSPTICK's `el1_bsptick_start`, armed AFTER the post-drop `exceptions::install()`. The JC3
+#      drop's `msr cntp_ctl_el0, xzr` is kept exactly as it is: this re-arms from EL1, which the same
+#      drop's CNTHCTL_EL2.EL1PCEN|EL1PCTEN is what makes legal.
+#   3. `gic.rs` — the post-EOI `timer_preempt` arm in `handle_irq_v3`, previously `all(tegra, bsprun)`.
+#   4. `sched.rs` — `SCHED_ACTIVE` + the three-task preemption proof, staged inside the EXISTING
+#      cooperative `run_capstone_boot_core` terminus rather than replacing it (ORIN-BSPRUN swaps the
+#      terminus and thereby gives up CAPSTONE; this arc keeps CAPSTONE, the JV1 EL0 round-trip and every
+#      baseline emit, because `dispatch_next` already requeues a task that comes back READY — a preempt
+#      lands the drive loop back in `dispatch_next` exactly where a `yield_now` does).
+#
+# Implies `virt_el0`, deliberately and not for convenience: the EL0 half of the proof (the M6e
+# register-only spinner preempted at EL0 through the 0x480 lower-EL vector, counted by
+# `aarch64_irq_handler`'s SPSR.M test) needs the EL0 regime, and a `virt_tick` without it would ship an
+# untested second configuration of every predicate JV1 widened. One knob, one shape.
+#
+# DEFAULT OFF => the `irq_bank!` arms are the pre-arc compile-time ones, no tick is armed, `SCHED_ACTIVE`
+# stays false, the dispatch has no preempt arm, and the Pi/Orin/plain-virt/x86 images are byte-identical.
+# Enable via `UNAOS_VIRT_TICK=1` alongside `UNAOS_GICV3=1` (the JC3 EL2 -> EL1 drop this all sits on);
+# type-checked by the `arm-virt-tick` leg of KERNEL_CFG_MATRIX. See arch_arm64.md §VIRTPREEMPT.
+virt_tick = ["virt_el0"]
 
 # JETSON-XCARVE M2: the `UNAOS_XCARVE=1` inherited-xHCI-pointer instrumentation
 # (arch/aarch64/xusb_tegra.rs::jbxc_inherited_dump), fired at the top of `jb2b_attach` BEFORE the
@@ -1076,9 +1146,9 @@ sdmmcwrite = ["sdmmc"]
 # carries no UnaFS volume, so `ls /` and quarry both answer `/: backend error: unafs-mount`. This
 # feature makes `shell::vfs_mount_table` REBIND `/` to the card's FAT volume, read through
 # `BlockSource::TegraSd` (the census-published `read_block_tegra_sd` path — CMD17 single-block, 1-bit
-# default speed, PROVEN on metal by A23), and re-point `/fat` at the SAME volume — its `Default`
-# source is registered by no Orin boot, and `/fat` is `shell::EXEC_ROOT` and the literal prefix of
-# `/fat/VUG.ELF`, `/fat/STAT.ELF` and `/fat/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
+# default speed, PROVEN on metal by A23), and re-point `/boot` at the SAME volume — its `Default`
+# source is registered by no Orin boot, and `/boot` is `shell::EXEC_ROOT` and the literal prefix of
+# `/apps/VUG.ELF`, `/apps/STAT.ELF` and `/apps/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
 # launch anything at all. READ-ONLY BY CONSTRUCTION and not by policy stated here:
 # `BlockSource::TegraSd::write_veto` is `Some(TEGRA_SD_VETO)` and `write_block_tegra_sd` refuses in
 # every cfg, so no VFS verb can reach the medium. The vendor pad block stays DISABLED (the FWALL
@@ -1892,7 +1962,7 @@ quarry = []
 # `fs/fatperf.rs` and turns the two `#[inline(always)]` shims in `fs/mod.rs` from no-ops into a
 # sector counter (at `fat.rs`'s two read funnels) and a microsecond bracket (around
 # `MountTable::read_dir` / `MountTable::read`), which together print one line per operation:
-#   [fatperf] op=list path=/fat sectors=222 us=13456
+#   [fatperf] op=list path=/boot sectors=222 us=13456
 # Raw words only — no rates, no ratios, no verdict. It changes NO behaviour: the fix (cluster-chain
 # caching, or migration onto ORIN's UnaFS) is a later arc, because the baton forbids building on the
 # FAT namespace twice and a repair chosen before the cost is measured is a guess.
