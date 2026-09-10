@@ -148,7 +148,9 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   OWN LANDING when no aarch64 peer is available, and says so in the ack. Running them for another seat's board
   stays banned outright.** What is at stake is measured, not asserted: across `c7407753..751cb816`, virt cannot
   execute the 696 changed lines of tegra-named files but does execute the other 617 of the aarch64 arch surface
-  and all ~7,700 changed lines of shared kernel (`shell.rs` 7256, `main.rs` 405). **The virt legs are the only
+  and all 8,477 changed lines of shared kernel (`shell.rs` 7256, `fs/vfs.rs` 816, `main.rs` 405 — added plus
+  deleted, `git diff --numstat c7407753..751cb816`, paths under `unaos/crates/kernel/src/`; the first cut said
+  ~7,700 and omitted `fs/vfs.rs`, corrected by orin 25 who made the original measurement). **The virt legs are the only
   runtime evidence that exists for most of what an aarch64 landing changes.**
   **A LANDING IS THREE GREENS AT ONE SHA, NOT ONE SEAT'S BATTERY** — each seat runs its own board in its own tree
   and acks with the command and the result.
