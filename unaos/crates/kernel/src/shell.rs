@@ -5321,10 +5321,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // headless `test-fat` boot must be able to prove the write from the log alone.
             match crate::video::prtscr::capture() {
                 Ok(shot) => {
-                    serial_println!(
-                        ":: PRTSCR: {} {}x{} {} bytes -> OK ::",
-                        shot.name, shot.width, shot.height, shot.bytes
-                    );
+                    shot.report_ok(); // serial census line WITH the volume identity (PRTSCR-VOL), same line the PrtScr key prints
+                    // SHOTVERB (orin 24, rmbp 18 grant cond. A): the console sentence below STAYS — two sinks, two
+                    // lengths, one verdict word (FATVERB's rule). Only the serial line moved into Shot::report_ok, so
+                    // the verb and the key can never drift apart on the census the scorers key on (A17/A36).
                     console.println(&alloc::format!(
                         "wrote {} ({}x{}, {} bytes)", shot.name, shot.width, shot.height, shot.bytes
                     ));
