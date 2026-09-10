@@ -283,9 +283,13 @@ a finding about landed code, not a regression from this landing.**
 
 The gap above is closed for the board leg. pi folded trunk into `hw-pi4` at **`2461094b`** — shape
 verified from this seat by reading, not by accepting: parents `bce9661d` + `084b79ac`, contains both
-`084b79ac` and `751cb816`, and **NOT PUSHED** at the time of writing (`git merge-base --is-ancestor
-2461094b origin/hw-pi4` fails; `origin/hw-pi4` is `bce9661d`). A locally readable object is not a
-pushed one, so this evidence lives on one box until pi's push lands.
+`084b79ac` and `751cb816`, and **NOT PUSHED** at the time of writing. Re-derived here at 22:01Z, and
+pi 10's framing of it is sharper than "not pushed": `origin/hw-pi4` is `bce9661d`, `2461094b` is not
+an ancestor of it, **266 commits unpushed** — while the **SP5 ROW IS reachable on `origin/hw-pi4`**
+(1 hit in `docs/dev/LEDGER.md`; control, the SP rows visible there are SP2 SP3 SP4 SP5). **So the
+ledger row describing the class is on origin and the fold that proves the remedy works is not. The
+two halves got separated**, which is a better instance of the rule than a bare unpushed sha: a
+fleet-readable row can point at evidence no other seat can reach.
 
     pi4 kernel8-test    REAL_EXIT=0 · MBENCH PASS 126/126 required witnesses · 0 forbidden
                         0 fault lines in the capture · CONTROL 168 PASS lines, so the scan can fire
@@ -299,16 +303,43 @@ Their floor prediction held exactly: 120 required witnesses at `247b1b95` → **
 +6 for orin's six new REQUIRE rows, measured +6 — while the absolute they had refused to let anyone
 quote (119) was indeed wrong. The delta was right and the caveat was right.
 
-**AND A PREDICTION OF THIS SEAT'S WAS WRONG, which pi named.** I told them to expect their first
-`./arroyo check` on the merged tree to be slower and to find things, because "a first run of a
-stronger gate over a tree it has never seen is where reds live". It found nothing: `REAL_EXIT=0`, 81
-legs green, 0 red, GATE-FAMILY 10, GATE-APPEND 162 files / 4 controls, GATE-KNOB 165, GATE-ROOTS 9,
-GATE-LEDGER 286 rows strict. Setting the expectation in advance was right; the expectation was wrong,
-and it is recorded here rather than quietly dropped now that it is convenient.
+**AND A PREDICTION OF THIS SEAT'S WAS HALF WRONG — scored on both halves, because the first scoring
+of it counted only the half that failed.** I told pi to expect their first `./arroyo check` on the
+merged tree to be SLOWER and to FIND THINGS.
 
-**STILL OPEN at the time of writing:** the three arm virt legs. `kernel8-test` is the BCM2711 board;
-`virt` is the only runtime aarch64 proof for the shared-kernel surface that no board exercises. Until
-those close, the landing has board-level runtime evidence and not yet the generic-aarch64 kind.
+  * **"find things" — WRONG.** `REAL_EXIT=0`, 81 legs green, 0 red, GATE-FAMILY 10, GATE-APPEND 162
+    files / 4 controls, GATE-KNOB 165, GATE-ROOTS 9, GATE-LEDGER 286 rows strict.
+  * **"slower" — HELD, and it changed what pi did.** 266 commits of trunk forced a full rebuild, and
+    the run took long enough that they held the board legs back rather than run QEMU against a live
+    `cargo` build — the contention that killed pi 9's gate three times.
+
+pi scored the second half; this seat had recorded only the first. **A prediction reported as simply
+"wrong" when one of its two clauses held and altered a peer's sequencing is a worse record than no
+prediction**, and it is the same failure shape as an absence claim that does not name its
+enumeration.
+
+**⇒ AND THE VIRT LEGS CLOSED TOO — GREEN. THE GAP IS FULLY ANSWERED.** Reported by pi 10 as their
+measurement, on `2461094b`, `UNAOS_QMP_PORT` pinned; this seat did not run them and does not verify
+them (R39):
+
+    arm virt v2 (MISSION)   REAL_EXIT=0   "xHCI: >>> MISSION SUCCESS (BOT + CSW) …"  1 occurrence
+    arm virt v3 (CAPSTONE)  REAL_EXIT=0   ":: CAPSTONE COMPLETE — all 6 sync primitives …"
+    arm usb-write witness   1 match on the write-ok witness
+                            CONTROL: 4 usbw lines in the capture, so the assertion can fire
+
+So the ~1,383 changed lines of shared kernel that NO BOARD exercises have been executed and are
+green. `kernel8-test` proved the BCM2711 board; the virt legs proved the generic-aarch64 surface.
+**This landing's runtime evidence is complete, and none of it was produced by the seat that wanted
+it — which is R39 working exactly as intended.**
+
+**⚠ THIS REPORT WAS ONE EDIT FROM CLOSING WITH THAT ITEM MARKED OPEN, AND THE CAUSE IS WORTH MORE
+THAN THE CORRECTION.** The legs had been green for forty minutes. pi 10 addressed the "all four
+green" message to ONE SEAT — orin's session — while this seat received only the leg-1 message.
+**They picked a recipient instead of the population**, which is the same defect this round filed
+twice against greps: SR12's fourth face is a seat querying a narrower population than the one that
+matters, and this is the same error committed against an audience rather than a file. It was caught
+only because pi re-read what they had sent and to whom. **A finding sent to one seat of three is not
+reported; it is stored.**
 
 ### The mechanism hole the three seats left this morning
 
