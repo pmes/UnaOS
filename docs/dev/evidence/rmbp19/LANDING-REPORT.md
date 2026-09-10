@@ -289,6 +289,34 @@ session that day and killed a run over, merging a track into a track is not one 
 kinds, and the tip was unpushed regardless. **A precondition that no permitted action can satisfy is
 not a precondition.** Filed here as a hole in what the three seats settled, not as pi's refusal.
 
+## Found after the merge, from orin 25's fourth run: SR13
+
+orin gated every announced sha from a DETACHED worktree, and on their fourth run — at the merge
+result — they forced `UNAOS_LEDGER_STRICT=1` by hand rather than relying on the branch name. Their
+reason is the finding: **every prior run of theirs was the deferring posture, which is why they could
+watch SO6 defer and never watch it red.**
+
+Verified here by execution, with a control:
+
+    detached worktree  (x2)   git rev-parse --abbrev-ref HEAD  ->  HEAD
+    trunk worktree, on main   ->  main          this worktree  ->  hw-rmbp
+
+`ledger-check.sh:165` arms strict on `_branch == TRUNK`. **In a detached checkout that is never true,
+even at trunk's own sha** — and a detached worktree is the sanctioned shape for gating another seat's
+sha. orin used one all session; pi 10 was told to use one.
+
+**The gate's own argument convicts it.** `ledger-check.sh:124` reads "STRICT — WIRED, NOT
+REMEMBERED… a backstop nobody is wired to run is a backstop that runs never". The wiring works only
+for a seat sitting on the trunk BRANCH — the landing seat verifying its own merge result, which is
+the one case that already had it. **Every peer verifying that same sha gets the weaker posture
+silently.**
+
+Filed as SR13 with the exact fix: when `_branch` is HEAD, compare `git rev-parse HEAD` to the trunk
+ref's sha and arm on EQUALITY, never on ancestry — a detached checkout that merely contains trunk is
+a track tip, not trunk. It does not change this landing's verdict: rmbp 19's legs ran in the trunk
+worktree ON `main` and got the armed posture, and orin's forced fourth run confirmed 281 rows strict
+and clean from a second seat independently.
+
 ## Push owed
 
 ONE, batched: `git push origin main hw-rmbp`. At the time of writing `origin/main` is `751cb816` and
