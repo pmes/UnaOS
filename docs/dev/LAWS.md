@@ -236,6 +236,15 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 - **A pipe launders the verdict** (rmbp 18 2026-09-08): never score a gate through `| tail`,
   `| head`, `| grep`; `cmd > log 2>&1; echo rc=$?`, then filter the file. When text and exit code
   disagree, the text wins until proven otherwise. Say which channel you read.
+  **A pipe also launders a POPULATION** (orin 25 + rmbp 18, 2026-09-10, one instance each in one
+  day): `| head` turned `grep -n 'UNAOS_NOBSP' unaos/arroyo` into a ten-line sample — the file had
+  exactly ten matches before the two that refuted the conclusion — and the universal "read ONLY
+  inside a `UNAOS_TEGRA` guard" was then written off the capped list. The same hour, `sort -u` in a
+  union check hid four duplicated ledger rows while the id SET still matched. **Never quantify over
+  a filtered list: count it first (`| wc -l`), or run it unfiltered.** A set-equality check is
+  necessary and not sufficient — it needs "and no member appears twice". Enforcer: warning only;
+  the standing tools are `wc -l` before any "all"/"only" claim, and GATE-LEDGER's duplicate-id
+  check, which is what caught the `sort -u` case.
 - **Logs:** `awk`, never bare `grep`, on serial logs; bracketed witness tags need
   `awk 'index($0,"[tag]")'` (a bare `[tag]` is a character class; gawk warns of nothing);
   `grep -a -c` on a bracket token needs `-F` and a known-absent control. Artifact certification uses
