@@ -80,11 +80,11 @@ du                               # the cwd (whole card root)
 ## 5. `uptime` — seconds since boot, monotonic, plus the wall clock when set
 ```
 uptime                           # up 00:0x:xx  (no clock set yet)
-setdate 2026-07-15 14:30:00      # seed the JD17 wall clock
+date -s 2026-07-15 14:30:00      # seed the JD17 wall clock
 uptime                           # up 00:0x:xx (clock: 2026-07-15 14:3x:xx)
 uptime                           # a few seconds later — the up-time has advanced
 ```
-- **PASS:** the first `uptime` prints `up HH:MM:SS` with no clock suffix; after `setdate`, `uptime` appends
+- **PASS:** the first `uptime` prints `up HH:MM:SS` with no clock suffix; after `date -s`, `uptime` appends
   `(clock: 2026-07-15 14:3x:xx)`; a later `uptime` shows a **larger** elapsed time (the arch counter is
   free-running and monotonic). A ±1 s granularity is expected (whole-second counter division), not a bug.
 

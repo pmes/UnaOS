@@ -501,7 +501,7 @@ pub fn start_service_once() -> bool {
     // WITCORE: `xhci_worker_cpu`, NOT `online_aps().first()`. `service_one` -> `block::read_block`
     // takes the raw `XHCI_CONTROLLER` spin lock, and this task is PREEMPTIBLE — so it is exactly the
     // class SCHED-X86's rule 1 forbids co-locating with another preemptible taker. `.first()` named
-    // the RENDER core (which takes the lock through FAT reads / `pal::pump_and_poll` / `usbinfo`),
+    // the RENDER core (which takes the lock through FAT reads / `pal::pump_and_poll` / `lsusbo`),
     // and `.last()` is the pump's core, which takes it directly. `None` means no core is free of
     // both: DECLINE rather than start into a deadlock — the syscall layer's staged fallback covers a
     // missing service task (`service_ready()` gates every live route).

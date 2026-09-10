@@ -1,0 +1,37 @@
+# FLIGHTID — render11-20260908T2321Z-600887c
+# written 2026-09-08T23:52:25Z by media-writer.sh onto /dev/mmcblk0 (mount:/dev/mmcblk0p1@/run/mediawriter.sUTjBk)
+#
+# SCORE THE BOOT BY THESE LINES, IN THIS ORDER, BEFORE ANY QUESTION IS SCORED.
+# Each is printed by a component that is not this script.
+
+IMAGE_SHA256   57ae5ec38b933e8eaddf7d218e8f66e86b81b49f65b3ca4c9d5d187a7286d765
+ELF_MAX_VADDR  0x34b748
+BOOT_VOL_LABEL UNAOS-ORIN
+BOOT_VOL_ID    0xde001a13
+MEDIA_GEOM     1:0b:2048:63401984
+FILES_VERIFIED 10
+
+# 1. THE IMAGE THAT LOADED — crates/bootloader/src/main.rs, fn main (the #[entry]),
+#    the KELF image-identity witness. The flight log MUST show:
+#      KELF min=0x0 max=0x34b748 pg=<n>
+#    A different max = a different kernel. This is FLIGHT.md §C.1 and it is scored FIRST.
+
+# 2. THE MEDIUM IT LOADED FROM — crates/bootloader/src/main.rs, fn read_boot_volume_serial,
+#    printed at the log::info! four lines below the KELF line. The flight log MUST show:
+#      boot volume FAT serial 0xde001a13 (extended BPB BS_VolID)
+#    A different serial = the board booted a DIFFERENT PHYSICAL MEDIUM than this write.
+
+# 3. THE MEDIUM MOUNTED AT / — arch/aarch64/sdmmc_tegra.rs, fn root_probe (RPS witness).
+#    ⚠ THIS IS A SECOND, PHYSICALLY DIFFERENT CARD: the Orin's NATIVE SD slot, which
+#    sdmmc_root_bind binds to /, /boot AND /apps. THIS SCRIPT DOES NOT WRITE IT.
+#    The flight log will show:
+#      [sdmmc] root mount source=tegra-sd card_blocks=<n> -> OK label="<L>" vol_id=0x<V>
+#    REQUIRED BEFORE SCORING ANY FILESYSTEM QUESTION: <L> must be "UNAOS-ORIN".
+#    On render9 it read label="UNAOS-PI" vol_id=0xabfbdefa — a stale Pi card — while the
+#    boot volume serial was 0xde001a13. TWO MEDIA. Nothing in the kernel compares them
+#    (see PROGRESS.md §5: drivers/block.rs::set_boot_volume_serial is x86_64-only), so
+#    THE COMPARISON IS THE SCORER'S JOB UNTIL THAT cfg IS WIDENED.
+#    ⚠ render11 onward (BOOTROOT, exec-orin22-bootroot): the [sdmmc] root family is DELETED.
+#    Its ABSENCE is expected; the root witness is instead
+#      [vfs] root = boot volume serial=0xde001a13 source=<usb|global|tegra-sd> ... ::
+#    and any other UnaOS disk mounts at /volumes/<LABEL>. Score with scorer11.sh.

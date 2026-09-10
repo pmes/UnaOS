@@ -5,22 +5,29 @@ This closes the gap the spine left open: VFS-1 built the resolver but marked its
 shell/syscall adoption is follow-up", and §4 named that follow-up outright ("wiring the shell … onto
 it is the follow-up adoption arc"). Until now the Pi ran **three disjoint path universes** — `ls`
 resolved against native UnaFS with a hand-rolled `/usb` prefix branch, `cat` (and the other
-FAT-direct verbs) resolved `/` as the SD FAT root, and only `run`/`bg`/`vfs` used the table. The
+FAT-direct verbs) resolved `/` as the SD FAT root, and only `run`/`bg`/`mount` used the table. The
 same typed path meant three different files depending on which verb read it. See §12.
 
 On top of:
 
 **VFS-3** — the USB FAT stick is in the VFS namespace at `/usb`, alongside the SD boot FAT at
-`/fat` and the native UnaFS root at `/` (see §11). The `FatBackend` is parametrized by its block
+`/boot` and the native UnaFS root at `/` (see §11). The `FatBackend` is parametrized by its block
 source, so ONE `MountTable` reaches both FAT volumes at once; the USB mount is bound only when the
 stick is present. On top of:
 
 **VFS-2** — the write surface is implemented for both backends
 (`unaos/crates/kernel/src/fs/vfs.rs`), on top of VFS-1's read/resolve/authorize spine.
-First consumer landed (**SHELL-WRITE**): the panel shell's `vfs` verb
+> **RELICS (R26, 2026-09-06).** The verb was `vfs` until Peter's ruling replaced the house
+> names with the standard ones; it is now `mount`, which also answers the volume table
+> (`mount` with no arguments) and the FAT geometry the retired `fatinfo` printed. The MODULE
+> is still `fs/vfs.rs` and every `vfs_*` helper keeps its name — a module is not a verb.
+> On aarch64 the plain mutating verbs (`touch`/`write`/`append`/`mkdir`/`rm`/`mv`) now resolve
+> through this same namespace, which is what let the `u*` family retire.
+
+First consumer landed (**SHELL-WRITE**): the panel shell's `mount` verb
 (`unaos/crates/kernel/src/shell.rs`) routes create / write / truncate / unlink
 through the `MountTable` over one namespace — the native UnaFS volume at `/`, the
-FAT boot partition at `/fat`. `vfs write|append|rm|mkdir <path> [text]`, writing as
+FAT boot partition at `/boot`. `mount write|append|rm|mkdir <path> [text]`, writing as
 `KERNEL_PRINCIPAL` (the shell's trusted-operator posture). `SYS_OPEN` and the
 `genet`/net paths remain follow-up adoptions. VFS-2's write path is also proven by
 two self-verifying on-card witnesses (§9).
@@ -117,19 +124,25 @@ wants case-folding across a heterogeneous namespace layers it above the VFS, not
 
 ## 4. The namespace of record
 
-The forward-looking namespace the VFS enables:
+**The names now have their own file: [`layout.md`](layout.md)** (LAYOUT, orin 18). This section
+owns the *shape*; that file owns the *names*, per platform, as measured — plus what was
+deliberately not created, and the open questions.
+
+The live boot-time mount set:
 
 ```
-/          → native UnaFS   (the native root; per-object ACL)
-/usb       → FAT            (hot-plugged stick; volume-level ACL)
+/          → the native root  (UnaFS on the Pi; the card's FAT on the Orin and on x86)
+/boot      → the volume this machine booted from
+/apps      → the programs on that volume  (= /boot's APPS/ directory, a `FatBackend::rooted` mount)
+/usb       → FAT              (hot-plugged stick; volume-level ACL)
 ```
 
 This is the "do it right" shape: the **native** filesystem is the root of the namespace, and
 foreign (FAT) volumes hang off named mount points. It generalizes the metal-proven `/` vs `/usb`
-split the shell hand-rolled — the on-SD FAT card and any future volume become additional named
-mounts (`/sd`, `/net/…`) without new dispatch code. The VFS-1 spine can host this table today;
-wiring the shell and `SYS_OPEN` onto it (and choosing the exact boot-time mount set) is the
-follow-up adoption arc.
+split the shell hand-rolled — any future volume becomes an additional named mount (`/net/…`)
+without new dispatch code. VFSROUTE (§13) wired the shell onto it; `SYS_OPEN` is **not** wired
+onto it and remains a flat 8.3 volume-root namespace, which is why the EL0 fixture blobs stay in
+the root ([`layout.md`](layout.md) §2.1, §5.2).
 
 ## 5. How the ACL check composes across native and foreign volumes
 
@@ -389,7 +402,7 @@ once, each reaching its own device:
 
 ```
 /          → native UnaFS   (BlockSource::Default via unafs; per-object ACL)
-/fat       → FAT boot part   (BlockSource::Default; the SD card; writable)
+/boot       → FAT boot part   (BlockSource::Default; the SD card; writable)
 /usb       → FAT USB stick   (BlockSource::Usb; the xHCI stick; READ-ONLY)
 ```
 
@@ -409,22 +422,22 @@ one. Writing a USB stick's contents onto a writable volume is the installer's co
 job (§5.2), not an in-place `/usb` write.
 
 **Honest hot-plug (doc §6).** The `/usb` mount is bound only when the stick is actually
-enumerated *and its FAT is mountable* — `vfs_mount_table()` (rebuilt per shell `vfs` invocation)
+enumerated *and its FAT is mountable* — `vfs_mount_table()` (rebuilt per shell `mount` invocation)
 and the witness both do a `mount_source(Usb)` presence check at build time. Absent (or the medium
 unreadable) → `/usb` is simply not in the table. A stick plugged (or ejected) between commands is
-picked up on the next `vfs`. See §11.2 for how a mutating verb reports an unbound `/usb`.
+picked up on the next `mount`. See §11.2 for how a mutating verb reports an unbound `/usb`.
 
-**The shell `vfs` verb picks it up automatically.** `vfs_mount_table()` gained the conditional
-`/usb` mount, so `vfs write|append|rm|mkdir /usb/...` route through the same four verbs — read
+**The shell `mount` verb picks it up automatically.** `vfs_mount_table()` gained the conditional
+`/usb` mount, so `mount write|append|rm|mkdir /usb/...` route through the same four verbs — read
 paths work, writes return `-ENOTSUP` (the read-only posture). No new dispatch code.
 
 ### 11.1 The VFS-3 USB-mount witness
 
-`vfs::vfs3_usb_mount_witness()` (aarch64) builds a `MountTable` with `/fat` (Default) and `/usb`
+`vfs::vfs3_usb_mount_witness()` (aarch64) builds a `MountTable` with `/boot` (Default) and `/usb`
 (Usb) and proves through the table that the USB volume is reachable (its root lists, a file reads
 back), that the read-only guard is enforced (a `create` at `/usb/...` returns `Unsupported`, no
-panic), and that `/fat` coexists (its root still lists) — emitting
-`:: VFS3: usb-mount test — /usb root <n> entries, read <m> bytes, read-only enforced, /fat coexists=<b> :: PASS ::`.
+panic), and that `/boot` coexists (its root still lists) — emitting
+`:: VFS3: usb-mount test — /usb root <n> entries, read <m> bytes, read-only enforced, /boot coexists=<b> :: PASS ::`.
 
 This is a **metal** proof, honest-skip under QEMU: the stick is reached through the xHCI `Usb`
 source, which needs the BCM2711 PCIe RC + VL805 xHCI. QEMU raspi4b models no PCIe RC and attaches
@@ -440,8 +453,8 @@ wiring lands as a deferred diff, and a temporary proof captured the QEMU skip li
 ### 11.2 VFS-4 — unbound `/usb` reports "volume not mounted", not `-ENOENT`
 
 The P44 metal sitting exposed a **misdirecting error message**. With the USB stick fully
-enumerated (`storage enumerated … 30436 MiB`), `vfs write /usb/test123.txt hi` returned
-`vfs write: /usb/test123.txt: no such file or directory (-ENOENT)`. Root cause was **upstream of
+enumerated (`storage enumerated … 30436 MiB`), `mount write /usb/test123.txt hi` returned
+`mount write: /usb/test123.txt: no such file or directory (-ENOENT)`. Root cause was **upstream of
 the VFS** (PIUSB-34): the stick's `READ(10)` of LBA 0 returned all-zeros with a *passing* CSW, so
 `fat::mount_source(Usb)` honestly found no FAT volume, and `vfs_mount_table()`'s presence check
 therefore never bound `/usb`. The path then fell through the longest-prefix resolver to the native
@@ -450,11 +463,11 @@ root (`/` claims everything), where `NativeBackend::create` tried to resolve the
 whole **volume** was not mounted. That misdirection cost bench time.
 
 VFS-4 fixes the reporting half (the block-layer read fault is PIUSB-34's lane). The shell reserves
-the volume prefixes that may be absent (`RESERVED_VOLUME_PREFIXES = ["/usb", "/fat"]`), and
+the volume prefixes that may be absent (`RESERVED_VOLUME_PREFIXES = ["/usb", "/boot"]`), and
 `vfs_cmd` checks — before dispatch, for *every* verb — whether the target path names a reserved
 volume that is not in the live mount table (`unmounted_reserved_volume`, boundary-matched exactly
 as the resolver: `/usb` and `/usb/…` match, `/usbfoo` does not). If so it reports
-`vfs <op>: <path>: volume /usb not mounted (-ENODEV)` and stops, instead of letting the path fall
+`mount <op>: <path>: volume /usb not mounted (-ENODEV)` and stops, instead of letting the path fall
 through to the native root. The honest-absent posture of §6 is preserved — an unbound `/usb` is
 still simply not in the table — but the *message* now names the real condition. `/` is deliberately
 excluded from the reserved set: it is always mounted and is the legitimate fall-through for
@@ -490,16 +503,16 @@ the namespace the shell implemented.
 
 Three path universes coexisted on aarch64:
 
-1. **FAT-direct + cwd** — `cat`, `stat`, `cp`, `mv`, `rm`, `head`, `tail`, `find`, `du`, `xd`, `cd`
+1. **FAT-direct + cwd** — `cat`, `stat`, `cp`, `mv`, `rm`, `head`, `tail`, `find`, `du`, `hexdump`, `cd`
    and friends bound `fat::mount_program_source()` and treated `/` as the **SD FAT root**.
 2. **unafs + an inline `/usb` branch** — `ls` alone, resolving against **native UnaFS**, with a
    hand-rolled `if path == "/usb" || path.starts_with("/usb/")` test choosing a second, duplicate
    listing renderer.
-3. **the `MountTable`** — `run`, `bg`, `vfs`, where `/`, `/fat` and `/usb` meant what §4 says.
+3. **the `MountTable`** — `run`, `bg`, `mount`, where `/`, `/boot` and `/usb` meant what §4 says.
 
-Consequences: `ls /fat` failed (no `/fat` branch existed in `ls`); `cat /usb/FILE` failed (the name
+Consequences: `ls /boot` failed (no `/boot` branch existed in `ls`); `cat /usb/FILE` failed (the name
 resolved as a literal FAT directory called `usb`); `cat /X` and `ls /X` named **different files**;
-and `run`/`bg`/`vfs` ignored the cwd entirely, so a relative name after a `cd` resolved against the
+and `run`/`bg`/`mount` ignored the cwd entirely, so a relative name after a `cd` resolved against the
 root. The `/usb` prefix test was also the exact `starts_with` bug §3.1's boundary rule exists to
 prevent — it was correct only because it was hand-checked, not because it used the resolver.
 
@@ -510,22 +523,22 @@ One function, `shell::vfs_path(arg)`, turns an operator-typed argument into an a
 backend is consulted). Every routed verb calls it and nothing else. **Which volume the path lands
 on is then decided solely by `MountTable::resolve`'s longest-prefix rule — never by the verb.**
 
-Adopted this arc: `ls`/`dir` (via the new `vfs_ls_collect`), `cat`/`type`, `run`, `bg`, `vfs`. All
-five now agree on `/` = native UnaFS, `/fat` = SD boot FAT, `/usb` = the stick.
+Adopted this arc: `ls`/`dir` (via the new `vfs_ls_collect`), `cat`/`type`, `run`, `bg`, `mount`. All
+five now agree on `/` = native UnaFS, `/boot` = SD boot FAT, `/usb` = the stick.
 
 Two per-volume listing collectors (`pi_ls_collect` against unafs, `pi_usb_ls_collect` against the
 USB FAT) and their two renderers collapsed into one collector and one renderer — the duplication
 existed *only* to serve the prefix branch. `ls /` also stopped probing `usb_info()` for its `usb/`
 pseudo-row: mount points immediately below the listed path are now synthesized **from the mount
-table**, so `/fat` appears the same way `/usb` does, and an absent stick contributes no row (the
+table**, so `/boot` appears the same way `/usb` does, and an absent stick contributes no row (the
 honest hot-plug posture of §6, unchanged).
 
 Two guards that existed on one verb became shared rather than re-derived:
 
 * the VFS-4 `-ENODEV` guard (a path naming a reserved-but-unbound volume reports the *volume* as
   missing, not a bare `-ENOENT` off the native root) now covers `ls`, `cat`, `run` and `bg` as well
-  as `vfs`. `run /usb/X` with the stick absent previously reproduced the exact P44 misdirection
-  VFS-4 fixed for `vfs`;
+  as `mount`. `run /usb/X` with the stick absent previously reproduced the exact P44 misdirection
+  VFS-4 fixed for `mount`;
 * the cwd, which the mount-table verbs did not honour at all.
 
 ### 12.3 `DirEnt` gained `size` and `mtime`
@@ -545,14 +558,14 @@ place that owns it rather than disappearing.
 ### 12.4 Deliberately NOT in this arc
 
 This was plumbing unification, not new filesystem features. No new on-disk format, no new mount
-grammar (the `/`, `/fat`, `/usb` convention already in the tree is followed, not replaced), and **no
+grammar (the `/`, `/boot`, `/usb` convention already in the tree is followed, not replaced), and **no
 write-enablement anywhere**: the read-only postures stay exactly as ruled, and §12.5's `ro` leg
 asserts that a backend which implements no write methods refuses every mutating verb through the
 table.
 
 Still FAT-direct, and named here so the remaining gap is visible rather than implied: the JD12
 **glob** expansion (`cat *.MD`), and the mutating/inspecting FAT verbs `stat`, `cp`, `mv`, `rm`,
-`mkdir`, `head`, `tail`, `find`, `du`, `xd`, `touch`, `append`, `write`, plus `cd` (whose cwd is
+`mkdir`, `head`, `tail`, `find`, `du`, `hexdump`, `touch`, `append`, `write`, plus `cd` (whose cwd is
 still a FAT 8.3 path). `SYS_OPEN` and the `genet` `/fs/usb` route remain follow-up adoptions as
 before. x86 is unchanged by design: `fs/vfs.rs` gates both backends to aarch64, so that arch has no
 mount table to route through and exactly one FAT volume to confuse.
@@ -564,7 +577,7 @@ shell builds, in the uncounted `:: VFS-1: … ::` idiom of the VFS-2/VFS-3 witne
 
 | leg | claim |
 | --- | --- |
-| `route /fat/VUG.ELF` | resolves to the **FAT** backend, mount prefix stripped (`rel=/VUG.ELF`) |
+| `route /boot/VUG.ELF` | resolves to the **FAT** backend, mount prefix stripped (`rel=/VUG.ELF`) |
 | `route /K3HELLO.TXT` | resolves to the **native UnaFS** backend, path intact |
 | `boundary` | `/fatty.bin` and `/usbfoo` are **native** names, verbatim — a prefix claims a path only at a component boundary (§3.1). The negative a naive `starts_with` gets wrong |
 | `ro-seam` | a backend implementing no write methods refuses `create`/`write`/`truncate`/`unlink` through the table with `Unsupported`, **and still reads** — read-only is the trait's *default* posture, not something a backend must remember to assert |
@@ -573,7 +586,7 @@ Measured on `./arroyo kernel8-test 210` (QEMU raspi4b, no stick attached, so the
 reports `usb bound=false` honestly):
 
 ```
-:: VFS-1: route /fat/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::
+:: VFS-1: route /boot/VUG.ELF -> vol=fat rel=/VUG.ELF :: PASS ::
 :: VFS-1: route /K3HELLO.TXT -> vol=native rel=/K3HELLO.TXT :: PASS ::
 :: VFS-1: boundary /fatty.bin,/usbfoo -> vol=native verbatim (usb bound=false) :: PASS ::
 :: VFS-1: ro-seam create/write/truncate/unlink -> Unsupported, read still ok=true :: PASS ::
@@ -585,3 +598,217 @@ the table synthesizes rather than a `usb_info()` probe:
 ```
 :: ls1: /: K3HELLO.TXT K3PAT.BIN fat/ (2 file, 1 dir) ::
 ```
+
+## 13. VFSROUTE (orin 17) — every file verb asks the mount table
+
+**Authority.** Peter, 2026-09-06, on being shown that `ls` had been *made* to list the native
+volume: *"should UnaFS not support ls? I'm confused that ls has to be made to list a dir. Should a
+mounted file system not be listable? Sounds like we'll be adding each filesystem to ls so it
+lists."*
+
+That is the defect §12.4 had left standing, named precisely. §12 routed five verbs and listed the
+rest as follow-ups; this arc routes **all** of them, on **both** arches, and deletes the per-verb
+filesystem dispatch entirely.
+
+### 13.1 The rule
+
+A verb resolves its argument to an absolute path in the ONE namespace, hands that path to the mount
+table, and calls the trait. Which filesystem answers is `MountTable::resolve`'s longest-prefix
+decision and nothing else.
+
+* **No verb names a filesystem.** `with_unafs` and `mount_read_volume` no longer appear in any verb
+  or verb helper (census in §13.6).
+* **No verb carries a `target_arch` gate.** `vfs_mount_table()` is arch-neutral; the two `cat`
+  bodies, the two `ls` bodies and the two `read_el0_image` bodies collapsed to one each.
+* **A backend that cannot perform an operation returns a typed error the verb prints** — never a
+  silent fall-through to another volume. `rmdir` on the native volume is the worked example: the
+  UnaFS crate carries no directory removal, so `NativeBackend` inherits the trait's default and the
+  operator sees `-ENOTSUP`. Before this arc that keystroke walked `fat.rs` looking for the name on
+  the **boot partition**.
+
+### 13.2 What the trait gained
+
+VFS-2 shaped a write surface for a *syscall*; a *shell* needs four more questions answered, and each
+is a question about a VOLUME, so each belongs to the backend. All four default to a refusal, so a
+backend opts in to a capability rather than remembering to refuse.
+
+| method | default | FAT | native UnaFS |
+| --- | --- | --- | --- |
+| `write_veto() -> Option<&'static str>` | refuse | forwards to `BlockSource::write_veto` (the ONE definition FATVERB established) | `None` (journaled, read-write since K4) |
+| `rename(from_rel, to_rel, principal)` | `Unsupported` | `rename_entry` in-parent, `move_entry` across | one CoW transaction (`unafs::rename`) |
+| `remove_dir(rel, principal)` | `Unsupported` | `fat::remove_dir`; non-empty → `Backend("not-empty")` | **not implemented** — the crate has none |
+| `remove_attr(rel, key, principal)` | `Unsupported` | **not implemented** — FAT has no typed attributes | `remove_attribute` |
+| `volume_bytes() -> Option<u64>` | `None` | the BPB's volume size | `None` (no published total) |
+| `describe() -> Option<String>` | `None` | the geometry line the retired `fatinfo` printed | `None` |
+| `volume_id() -> Option<u64>` | **no default — required** (VOLID) | `Some(fnv("vfs:fat:" ‖ source ‖ BS_VolID ‖ cluster count))`; `None` if the volume will not mount | `Some(fnv("vfs:unafs:"))` — one global mount per machine |
+
+`MountTable` gained the matching resolve-then-dispatch conveniences plus `volume_name(path)`,
+`same_volume(a, b)`, `volume_id(path)` and `rows()` (one tuple per mount: prefix, volume, veto,
+capacity, description — the five facts `df`/`mount` render and the only five they know).
+
+**A cross-volume `rename` is refused by the TABLE, not by a verb.** A backend receives
+volume-relative paths and cannot tell that the other end lives elsewhere, so `MountTable::rename`
+compares the two resolved backends and returns `Unsupported` when they differ. `mv` prints
+*"cross-volume move is not supported (copy with `cp`, then `rm`)"* — the same answer the old verb
+gave for the native/FAT pair, now true for every pair of volumes the machine will ever mount.
+
+#### 13.2.1 What "the same volume" means (VOLID, orin 18 — rmbp 15 condition C1)
+
+That comparison has been three different things, and only the third is an identity:
+
+1. **the two backend POINTERS** — too fine. One medium bound at two prefixes is two objects, so a
+   plain in-volume relink read as a cross-volume move.
+2. **the two VOLUME NAMES** — wrong in *both* directions, and the reason this section exists.
+   `sdmmc_root_bind` binds the Orin's card as `"card"` at `/` and as `"fat"` at `/boot`, so one
+   physical card read as two volumes and `mv /A.TXT /boot/B.TXT` was refused on exactly the
+   configuration the bench flies. The converse is worse: two different media typed one name would
+   read as ONE volume, and a rename between them relinks a directory entry to a name that means
+   nothing on its volume. A name is an argument the mount site typed, never a fact about the medium.
+3. **`volume_id()` — the backend's own STORAGE IDENTITY**, which is what the question always meant.
+
+**Identity is over `(DEVICE, FILESYSTEM)`, never the device alone.** The device alone fails on the
+Pi, which mounts UnaFS at `/` and the FAT program volume at `/boot` off *the one physical card*
+(`drivers/emmc2.rs` registers it as `BlockSource::Default` and sizes the UnaFS volume from the same
+geometry). So every implementor mixes a **domain tag** naming its filesystem before it mixes
+anything about the medium, and two filesystems on one card are unequal by construction. The FAT
+adapter then adds the block source *and* the mounted volume's own fingerprint —
+`FatFs::volume_fingerprint()`, `(BS_VolID, count_of_clusters)`, the same primitive the aarch64
+`UNAFS.ATR` ACL store binds to. It deliberately does **not** use `fat::volume_serials()`: that is a
+device-wide census, a deliberate superset for the boot-device guard, so two partitions on one device
+would share its id set — the same defect one layer down.
+
+**`Option`, and no default.** A constant default would make every non-overriding backend the same
+volume as every other, which is the corrupting direction; a name-derived default is defect 2 again.
+So the method is required, and `None` means *"I cannot establish this volume's identity"* — **never
+equal to anything, including another `None`.** `fs::vfs::same_storage(a, b)` is the one
+interpretation of the contract (`same_volume` reports it, `rename` enforces it, so the two cannot
+drift): object identity first — the same backend object is the same storage, which keeps the
+relation reflexive and keeps a `None`-answering backend usable inside its own mount — then
+`Some(a) == Some(b)`.
+
+**Where it is measured.** The `vfsroute` transcript prints `:: volid: … ::` census lines
+unconditionally — each mount's `id=`, and `same=` for every pair of mounted prefixes — and carries
+two legs. `vfsroute.samevol` convicts `same_volume` against an oracle taken from the probe file's
+`stat` under both prefixes, never from `same_volume` itself (which is what the transcript did
+before, so a wrong router moved the expectation and the answer together). `vfsroute.alias` *builds*
+the C1 shape in a scratch mount table — one block source under two names, which must be the same
+volume, and a different source under the identical name, which must not be — because no board the
+QEMU gates can boot mounts that shape.
+
+**`mv` asks the write veto BEFORE the namespace question** (rmbp 15 N1). The order is the diagnosis:
+on a read-only card both refusals are true and the operator sees only the first, and *"cross-volume
+move is not supported (copy with `cp`, then `rm`)"* recommends a workaround that cannot help on a
+volume admitting no writes. The final order is **argument validity → write veto (on the source) →
+namespace**. The destination gate the old order ran is subsumed, not dropped: once `same_volume` has
+passed, the destination is the same medium, and `write_veto` is a pure function of the `BlockSource`,
+which is one of the terms `volume_id` mixes.
+
+**Two bounds on `same_storage`, recorded so neither is rediscovered (rmbp 15, 2026-09-06).**
+
+*The `addr_eq` floor assumes NON-ZERO-SIZED backends.* It is sound for every backend that exists,
+because distinct live non-ZST objects have distinct addresses. A future zero-sized backend breaks it:
+two ZST instances can share an address, and `same_storage` would then answer TRUE for two genuinely
+different volumes. A ZST backend must therefore either carry a real `volume_id()` or not rely on the
+floor.
+
+*Cost.* `volume_id()` calls `fat::mount_source`, so one `same_storage` costs up to two mounts, and a
+mount is about three sector reads (LBA 0, the GPT header, one BPB sector per MBR partition — the
+figure measured for the C15 knob-cost question). Bounded and irrelevant for `mv`, which asks once. It
+would matter if anything ever asked inside a loop; nothing does today.
+
+### 13.3 x86 has a namespace now
+
+`vfs_mount_table()` was `#[cfg(target_arch = "aarch64")]` from VFS-1 — because the Pi came first, not
+because a mount table is an aarch64 idea. That gate is what forced every verb to carry two bodies.
+
+On x86 the table binds **the program source** (`block::program_source`, resolved through
+`open_read_volume` so the FATVERB `READ_BIND` instrument is stamped exactly as it was when each verb
+mounted for itself) at `/` and `/boot`, and — since LAYOUT — at `/apps`, that volume's `APPS/`
+directory. This is the multi-prefix shape `sdmmc_root_bind` already uses on the Orin, honest for the
+same reason: `/boot` and `/apps` ARE mount points, so `ls /` showing them is a fact, not decoration.
+All three carry the SAME volume name: `same_volume` compares constructor strings, so a distinct name
+would make one medium read as several volumes ([`layout.md`](layout.md) §5.1).
+
+An arch with no volume returns an EMPTY table and the verbs say `no filesystem mounted (-ENODEV)` —
+better than the old `no FAT filesystem (NoDisk)`, which named a filesystem the operator never asked
+about.
+
+### 13.4 FATVERB is preserved, and moved to the layer that owns the question
+
+FATVERB's law is that a file verb binds the PROGRAM SOURCE and that a write verb consults a gate
+before it starts. Both still hold; the gate simply asks the right thing now.
+
+* The write gate is `MountTable::write_veto(path)` — the veto of the volume **the path resolves
+  to**, asked before any multi-step verb begins. On a machine with two writable volumes in one
+  namespace that is the difference between gating the volume you are about to write and gating a
+  different one. It still stamps `WRITE_GATE` and still writes the two-sink refusal
+  (`REFUSED READ-ONLY` on the panel, the census on serial), so `fatverb_storage_witness` reads the
+  same instrument.
+* The **exec probe** (`FatVolume::is_file`) deliberately keeps binding `mount_program_source()`
+  itself and walking FAT directly (`fat_path_is_file`, the one FAT-direct walk left in `shell.rs`).
+  That is not an oversight: the witness compares the probe's stamp with a read verb's, and its value
+  is that the two are INDEPENDENT producers. Route the probe through the table as well and the leg
+  becomes an expression compared with itself — the exact defect FATVERB's own note records the first
+  cut of that witness making.
+
+### 13.5 What stopped being printable, and why that is the arc working
+
+Three FAT-specific facts left the output, because a trait that could carry them would be a FAT
+trait: `rm`'s freed-cluster count, `stat`'s attr byte / first cluster / directory-slot LBA, and
+`ls`'s canonical 8.3 re-spelling of a typed name. `stat` prints `volume:` instead — which volume
+answered, the fact the old output could not express. The forensic pair is unchanged and
+volume-honest: `hexdump` for a file's bytes, `dd if=<lba>` for a raw sector, `fdisk -l` for device
+geometry.
+
+Gains, for the same reason: **glob works on every volume** (the expander walks
+`MountTable::read_dir`, so `cat *.TXT` reaches the native volume, which it silently could not
+before), and **`cp` works across volumes** (the read side asks one backend, the write side another —
+the old verb held one `FatFs` and both ends had to be on it).
+
+### 13.6 The census
+
+`unaos/crates/kernel/src/shell.rs`, base `dc683c40` → this arc:
+
+| predicate | before | after | where the survivors live |
+| --- | --- | --- | --- |
+| `mount_read_volume` | 19 | **0** | — (the helper is deleted) |
+| `with_unafs` | 17 | **9** | the `snap` verb family (snapshots are a UnaFS FEATURE, not a file verb) and the RELICS transcript |
+| `fs::fat::mount*` | 10 | **8** | the x86 table builder's program-source mount, the exec probe, the FATVERB witness's independent veto read, the `/usb` presence probe in the table builder, `fdisk -l` (device geometry), the `storm` stress writer, 2 comments |
+
+Inside `dispatch_command`'s own match body: `with_unafs` 0, `mount_read_volume` 0,
+`fs::fat::mount*` 1 — the `fdisk -l` arm, which prints DEVICE geometry and is entitled to name a
+block source.
+
+### 13.7 The VFSROUTE transcript
+
+Arch-neutral legs, in the `:: TSTE: <name> -> PASS/FAIL ::` shape. Each drives the REAL verb through
+`witness_capture` (a heap-only console, dropped on return) and asserts against a fact read off the
+mount table — never against the verb's own return value.
+
+**What makes them two-sided.** The failure this arc prevents is a verb answering off whichever
+volume it happens to hold. So the legs take a PROBE NAME off the root volume's own listing and then
+require it to appear under a different prefix **iff** the two prefixes resolve to the same volume.
+On aarch64 `/` is native and `/boot` is the boot FAT, so a verb that kept its FAT-direct body shows a
+native file under `/boot` and the leg reds; on x86 the two prefixes ARE one volume and the same
+expression demands the opposite answer. Neither arch's leg can pass by being stuck.
+
+| leg | claim |
+| --- | --- |
+| `vfsroute.route` | every mounted prefix resolves to its own volume, and `/fatty.bin` / `/usbfoo` resolve to the ROOT volume — the boundary rule a naive `starts_with` gets wrong |
+| `vfsroute.ls` | the probe appears under `/`, and under `/boot` iff same volume |
+| `vfsroute.cat` | the probe reads under `/`, and under `/boot` iff same volume |
+| `vfsroute.stat` | `stat` NAMES the volume that answered, and its size equals the size `ls` reported for the same object — two verbs, one fact |
+| `vfsroute.refuse` | `remove_attr` on a FAT path is exactly `Unsupported` through the table (typed attributes are a UnaFS feature the FAT backend does not implement), and `remove_dir` on the root volume is a typed error from the volume that owns the path |
+| `vfsroute.touch` (aarch64) | `touch` lands on the native volume and `ls` — a different verb — sees it |
+| `vfsroute.mkdir` (aarch64) | `mkdir` at that name is `-EEXIST` and the name is still a FILE: the ROUTING proof (a `mkdir` riding `fat.rs` would not find the name on the boot partition and would create a directory and report success) |
+| `vfsroute.rmdir` (aarch64) | `-ENOTSUP`, and nothing anywhere is removed: the CAPABILITY proof |
+| `vfsroute.rm` (aarch64) | both gone AND the root carries no `VFSR*` entry — the self-clean, asserted rather than assumed (`k3_mount_selftest` bit5 fails on a leaked fixture) |
+
+The aarch64 legs work only in root-level FILES and never create a directory, for the reason RELICS
+recorded: the UnaFS crate cannot remove one, so a leaked `/VFSRD` would be a permanent K3-mount red
+on any metal Pi from its second boot onward.
+
+Call sites: aarch64 after `emmc2::probe()` (the `midden_witness` tail), x86 from
+`fatverb_storage_witness` — the two moments each board actually has volumes to route to.
+`midden_witness`'s own x86 site is at boot step 5, before `pci::init` and the storage publish, where
+a routing leg would assert against an empty namespace and be dead rather than quiet.

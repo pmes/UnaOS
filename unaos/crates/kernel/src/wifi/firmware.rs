@@ -615,7 +615,7 @@ fn stage_volume(src: fat::BlockSource, dirs: &str, label: &str) -> VolOutcome {
 /// The block layer's [`crate::drivers::block::program_source`] now prefers the handle carrying the
 /// BOOT VOLUME serial, so on the bench machine (boot volume = the internal SD card) a USB stick
 /// inserted merely to carry files no longer becomes the program source. That is the right rule for
-/// `/fat`, for every exec, and for every write — and it would be the WRONG rule applied alone here,
+/// `/boot`, for every exec, and for every write — and it would be the WRONG rule applied alone here,
 /// because the b43 blobs are USER-SUPPLIED files that the user carries on exactly such a stick.
 /// UnaOS ships no firmware (`CLEAN_ROOM_POLICY.md` §4); the honest reading of "the user placed the
 /// files on the media" is that the media is whichever one they plugged in.

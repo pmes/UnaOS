@@ -1,4 +1,13 @@
 # UnaOS Roadmap
+> **RELICS (R26, 2026-09-06) — the verb names below are the ones that SHIPPED at the dates
+> given, and several have since been replaced.** Peter's ruling switched the shell to the
+> standard spellings: `bootlog`→`dmesg`, `vfs`→`mount`, `xd`→`hexdump`, `usbinfo`→`lsusb`,
+> `netinfo`→`ifconfig`, `diskinfo`→`fdisk -l`, `fatinfo`→folded into `mount`,
+> `setdate`→`date -s`, `sched`→`ps`, `connect`/`udpsend`→`nc`, `get`→`curl`,
+> `read`/`write <lba> <byte>`→`dd`; the duplicated `u*` unafs family retired into the plain
+> file verbs (which now reach the native volume), `urmattr`→`setfattr -x`, and the five
+> `usnap*` spellings became `snap list|create|drop|ls|cat`. Replacements, not aliases.
+
 
 > Working document — updated as arcs land. Session ground rules live in
 > [`CLAUDE.md`](../CLAUDE.md); the security model and hardening ledger in

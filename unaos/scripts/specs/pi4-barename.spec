@@ -49,7 +49,7 @@
 # --- 1. THE BARE NAME LAUNCHES ---------------------------------------------------------
 # `shell.rs:5225`. Every field is pinned rather than presence-checked, because each one is a
 # different claim and they fail separately:
-#   /fat/VUG.ELF   — the ABSOLUTE path, i.e. probe 2 of `exec_resolve` (the program-source
+#   /apps/VUG.ELF  — the ABSOLUTE path, i.e. probe 2 of `exec_resolve` (the program-source
 #                    root) fired. Typed from `/`, cwd-relative resolution CANNOT find this
 #                    image, so a build that lost the second probe leaves the operator at `/`
 #                    unable to type `vug` — the original defect, exactly.
@@ -60,7 +60,7 @@
 #                    `overlay = detached || interactive`, so this word is the drawing path.
 #   left RUNNING   — the shell did NOT wait on it; step 3 below is what proves that claim.
 # `— REFUSED:` and `— rejected` lines from the same site cannot satisfy this pattern.
-REQUIRE :: BAREXEC: /fat/VUG\.ELF \(typed 'vug'\) — loaded [0-9]+ bytes, entry 0x[0-9a-f]+, pid=[0-9]+ slot=[0-9]+ DETACHED, left RUNNING ::
+REQUIRE :: BAREXEC: /apps/VUG\.ELF \(typed 'vug'\) — loaded [0-9]+ bytes, entry 0x[0-9a-f]+, pid=[0-9]+ slot=[0-9]+ DETACHED, left RUNNING ::
 
 # The dispatch that must precede it: the core planned an Exec, not a verb. Kept as a FORBID
 # on the wrong dispositions rather than a fourth REQUIRE — if `vug` were ever re-advertised

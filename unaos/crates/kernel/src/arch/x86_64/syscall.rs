@@ -6735,7 +6735,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event {
     // R21 gave the panel a SECOND modal surface (a window's menus, in the bar), so the question goes to the shared `strip::key_escape` seam — beside `strip::press_route`, asked by BOTH arch routers,
     // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
     // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
-    // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` self-guards on `on_glass()`, so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
+    // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
     #[cfg(feature = "wc")]
     if crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) {
         return crate::pal::Event::Unknown;
@@ -16086,7 +16086,7 @@ fn u8_kernel_check() -> bool {
 // preemption boundary. So both `run` and `bg` spawn preemptible here.
 //
 // That is not a downgrade, it is the only correct choice: `STAT.ELF` has NO exit path by design ("runs
-// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /fat/STAT.ELF` would wedge
+// until it is killed" — BGRUN-2's whole contract), so a cooperative x86 `run /apps/STAT.ELF` would wedge
 // the shell task forever with no way back. Preemptible ring 3 (RFLAGS.IF set) is the proven U3.5 path,
 // and the scheduler's reap tears the address space down through `free_user_space_by_cr3` — which, since
 // WINX-1, also retires the task's compositor windows and drops its FB leaves. A killed windowed app
@@ -16930,7 +16930,7 @@ fn winx2_launcher(_demo_cpu: usize) {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root("STAT.ELF") else {
+    let Ok(de) = fs.find_app("STAT.ELF") else {
         // WINX-7 PKG — the message names the VOLUME, because the previous wording ("the boot volume")
         // was not merely vague, it was WRONG in the case that actually fired. `fat::mount()` binds the
         // global block device, which on x86 is always the USB mass-storage device xHCI enumerated;
@@ -18682,7 +18682,7 @@ fn winx8_launcher(_demo_cpu: usize) {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root("VUG.ELF") else {
+    let Ok(de) = fs.find_app("VUG.ELF") else {
         // The same volume-naming the WINX-2 skip carries, and for the same reason: on x86 the mounted
         // volume is the USB mass-storage device, never the UEFI boot volume, and staging into
         // `target/x86_64_esp/` alone puts the artifact where the running kernel has no path to it.
@@ -18820,7 +18820,7 @@ fn pulsew_launcher(_demo_cpu: usize) {
         );
         return;
     };
-    let Ok(de) = fs.find_in_root("PULSE.ELF") else {
+    let Ok(de) = fs.find_app("PULSE.ELF") else {
         // The same volume-naming the WINX-2/8 skips carry, and for the same reason: on x86 the mounted
         // volume is the USB mass-storage device, never the UEFI boot volume.
         serial_println!(

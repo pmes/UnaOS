@@ -278,7 +278,7 @@ Expected metal witnesses:
 then per request e.g.
 `:: PI-GENET: [net15] GET /fs/K3HELLO.TXT => 200 37 bytes (with_unafs hold <t> ticks / <n> ms) ::`.
 
-### PI-FS-5 — the shell shares the HTTP namespace (`ls /usb`, `diskinfo`)
+### PI-FS-5 — the shell shares the HTTP namespace (`ls /usb`, `fdisk -l`)
 
 The Pi shell's storage verbs are wired to the **same two volumes the HTTP `/fs` tree
 exposes**, so the browser and the console never disagree about what is mounted:
@@ -293,7 +293,7 @@ exposes**, so the browser and the console never disagree about what is mounted:
   When the USB stick is mounted, bare `ls /` appends a `usb/` pseudo-entry, mirroring the
   `/fs/` HTML listing's `usb/` link. `ls -l` keeps PI-FS-4's size + FAT last-write date
   columns on FAT paths (a dashed date on unafs, which carries no mtime).
-* **`diskinfo`** on the Pi reports **both** storage devices: the **SD card** (emmc2
+* **`fdisk -l`** on the Pi reports **both** storage devices: the **SD card** (emmc2
   geometry from `block::info()` — the global device that hosts unafs + the FAT boot
   partition) and, when present, the **USB stick** (its own geometry from
   `block::usb_info()`, plus the FAT **type / volume size / label** read from the live
@@ -302,7 +302,7 @@ exposes**, so the browser and the console never disagree about what is mounted:
 
 Both verbs render panel-only on the bench, so each mirrors its output to serial: `ls`
 paths (unafs and `/usb`) witness as `:: ls1: <path>: <names> (N file, M dir) ::`;
-`diskinfo` lines mirror as `:: fs5: <line> ::`. The `pi_usb_ls_witness` fires from the
+`fdisk -l` lines mirror as `:: fs5: <line> ::`. The `pi_usb_ls_witness` fires from the
 PIUSB-27 mount witness (once per bring-up + every hot-plug), so `UNAOS_FATIMG=1 ./arroyo
 test-arm` proves `ls /usb` headlessly, e.g.
 `:: ls1: /usb: … Long Filename Example.txt MixedCaseName.md … SUBDIR/ (10 file, 2 dir) ::`
@@ -392,7 +392,7 @@ re-sync prints `[net16] resync <ip> -> <iso> (stratum N)`. On the status page Pe
 new `time (UTC): 2026-07-22T14:03:07Z` line (or `unsynced (no SNTP yet)` before the first
 sync).
 
-### PI-UI-3 — `date` / `time` / `netinfo` at the Pi shell
+### PI-UI-3 — `date` / `time` / `ifconfig` at the Pi shell
 
 The SNTP sync above anchors the *civil* (Unix-epoch) clock via `clock::set_anchor` — it does
 **not** plant the JD17 FAT anchor (`clock::set`). The `date` verb historically read only the FAT
@@ -402,13 +402,13 @@ anchor (`clock::now()`), so on a synced Pi — lease + SNTP both logged — `dat
 the FAT anchor, then to the honest UNSET state. `date` and `time` now agree, and a networked board
 shows the real date with zero operator action.
 
-`netinfo` on the Pi previously reached for `drivers::e1000::info()` (the x86 Intel NIC) and always
+`ifconfig` on the Pi previously reached for `drivers::e1000::info()` (the x86 Intel NIC) and always
 printed "No network device ready." PI-UI-3 gives it a GENET backend — `genet::netinfo()` reads the
 settled IPv4 + lease flag from `net_phy::settled_ipv4()`, the registered MAC from `GENET_DEVICE`,
 and the gateway recorded at `bind_smoltcp` (a new `NET_GW` atomic) — printing MAC/link, IP(dhcp|
 static)/gateway, and the civil-clock sync state, matching the x86 verb's line shape.
 
-Verb output renders panel-only on the bench, so each of `date`/`time`/`netinfo` also emits a
+Verb output renders panel-only on the bench, so each of `date`/`time`/`ifconfig` also emits a
 `:: ui3:<verb>: <line> ::` serial witness with identical content (via the shell's `ui3_say`
 helper) — a headless capture can verify the values without the panel.
 

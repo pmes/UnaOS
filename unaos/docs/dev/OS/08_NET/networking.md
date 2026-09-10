@@ -9,22 +9,22 @@ heap-optional) is the **default** x86 TCP/IP stack. It got here through the SOCK
 
 ## Today's stack (smoltcp default, hand-rolled opt-out)
 
-smoltcp owns the shell's `ping`/`arp`/`netinfo`, the ring-3 socket syscall family (SOCK-2..7), the
+smoltcp owns the shell's `ping`/`arp`/`ifconfig`, the ring-3 socket syscall family (SOCK-2..7), the
 DNS sinkhole (zeolite), and the boot connectivity witnesses — **by default**. The hand-rolled
 `crates/net` line is **retired as the default** but stays in tree, live, and resumable (see
 [The retired hand-rolled line](#the-retired-hand-rolled-line-resumable) below).
 
 | | Default (smoltcp) | Opt-out (`UNAOS_NOSMOLNET=1`) |
 | :--- | :--- | :--- |
-| `ping` / `arp` / `netinfo` | **smoltcp** ICMP socket + interface (`smolnet.rs`) | hand-rolled `net::` engines (`drivers/e1000.rs`) |
+| `ping` / `arp` / `ifconfig` | **smoltcp** ICMP socket + interface (`smolnet.rs`) | hand-rolled `net::` engines (`drivers/e1000.rs`) |
 | ring-3 socket syscalls (SOCK-2..7) + zeolite | **smoltcp** (persistent `STACK`) | absent (feature not compiled) |
-| `connect` / `fetch` / `udpsend` | hand-rolled `net::tcp` / `net::udp` (smoltcp has no shell equivalent yet — SOCK-9+) | hand-rolled |
+| `nc` / `nc -u` / `curl` | hand-rolled `net::tcp` / `net::udp` (smoltcp has no shell equivalent yet — SOCK-9+) | hand-rolled |
 | DHCP, TCP echo listener, boot connectivity self-test | hand-rolled (still runs alongside smoltcp) | hand-rolled |
 | aarch64 | **smoltcp is never compiled** (x86-only dep + arm_features strip) | identical — hand-rolled only |
 
 Note the hand-rolled `crates/net` crate is a **live dependency regardless of the knob**: even when
 smoltcp is the default, the driver's `service_net()` poll, the boot self-test, DHCP, the TCP echo
-listener, `connect`/`fetch`/`udpsend`, and the `net::arp::learn` reuse the smoltcp `Device` snoops for
+listener, `nc`/`nc -u`/`curl`, and the `net::arp::learn` reuse the smoltcp `Device` snoops for
 MAC surfacing all run through it. The `smolnet` feature is purely **additive**.
 
 ## The knob
@@ -76,7 +76,7 @@ existing `poll()` / `transmit()` paths are untouched:
 - `e1000::raw_tx(&[u8])` — thin wrapper over the driver's private `transmit` (shares the TX ring +
   `tx_count`).
 - `e1000::hw_addr() -> Option<([u8;6],[u8;4],bool)>` — `(MAC, current IP, link-up)` for the
-  interface config and `netinfo`.
+  interface config and `ifconfig`.
 
 All three briefly lock `NET_DEVICE` per call. The `E1000Phy` owns its own RX/TX scratch buffers so
 smoltcp's RX and TX tokens borrow disjoint fields (smoltcp hands out both from one `receive()` to
@@ -955,7 +955,7 @@ alongside `sntp_x86_gate` (x86 + `witness` + `smolnet`). No new syscall.
 
 | Arc | Content |
 | :--- | :--- |
-| SOCK-1 | smoltcp dep + `Device` adapter + `ping`/`arp`/`netinfo` + ICMP witness, knob-gated |
+| SOCK-1 | smoltcp dep + `Device` adapter + `ping`/`arp`/`ifconfig` (`netinfo` at the time) + ICMP witness, knob-gated |
 | SOCK-2 | the UDP socket syscall family (`sys_socket`/`bind`/`sendto`/`recvfrom`, #40–43 — see SOCKNUM; #19–22 as landed) + persistent `SocketSet`, ring 3 reaches the network |
 | SOCK-3 | TCP client sockets (`sys_connect`/`sys_send`/`sys_sock_recv`, #44–46 — see SOCKNUM; #23–25 as landed) + gen-fenced socket handles + chunked-lock TCP pump, ring 3 gets a byte stream |
 | SOCK-4 | transferable sockets — `sys_socket` mints `CAP_GRANT`, `sys_recv` migrates socket ownership, a socket cap moves cross-row (gen-fenced, single-owner); no new syscall |

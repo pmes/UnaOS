@@ -22,7 +22,7 @@ no new plumbing.
 
 ### FAT wall clock (JD17) — `set` / `now` / `fat_stamp` / `uptime_secs`
 
-Operator-seeded (`setdate`), whole seconds since the **FAT epoch (1980-01-01)**, range
+Operator-seeded (`date -s`), whole seconds since the **FAT epoch (1980-01-01)**, range
 1980..=2107, 2-second `fat_stamp` resolution. Serves the FAT filesystem's mtime fields. `UNSET`
 is first-class: `now()` is `None` and `fat_stamp()` is `(0, 0)` — the all-zero on-disk value
 `ls -l` renders as dashes. The kernel never fabricates a reading. `uptime_secs()` reads the raw
@@ -35,8 +35,8 @@ and a subdir's `.`/`..`). As of CLOCK-3 it derives from the **Civil (Unix) ancho
 `unix_now()` → `civil_from_unix` → FAT packing. So an **SNTP-synced boot stamps REAL last-write
 times with zero operator action** — the visible payoff of unifying the two anchors. It falls back to
 the legacy JD17 FAT anchor (`now()`) only when no Unix anchor is set, and to `(0, 0)` when neither is
-(the honest UNSET → dashed placeholder). Because `setdate` plants BOTH anchors from the same
-monotonic tick, the derivation round-trips (`setdate D` → `fat_stamp()` yields `D`).
+(the honest UNSET → dashed placeholder). Because `date -s` plants BOTH anchors from the same
+monotonic tick, the derivation round-trips (`date -s D` → `fat_stamp()` yields `D`).
 
 * **Timezone.** FAT stores wall-clock time with no offset; the civil clock is UTC, so CLOCK-3 stamps
   **UTC** (`civil_from_unix` is UTC). A boot synced under a non-UTC operator shows UTC in `ls -l`.
@@ -69,16 +69,16 @@ days→civil algorithm (float-free, proven exact), moved here from PI-NET-16.
 
 **Writers.** On the pi, the genet **SNTP client** (PI-NET-16, RFC 4330) anchors it as
 `Sntp{stratum}` on each sync via forwarders (`wall_set` → `set_anchor`). On both arches, the
-`setdate` verb also plants a `Manual` anchor (it does **not** touch the FAT anchor, so `date`
+the `date -s` form also plants a `Manual` anchor (it does **not** touch the FAT anchor, so `date`
 and `fat_stamp` are unchanged). x86 has no SNTP client yet, so `time` there reads `unsynced`
-until a manual `setdate` — the seam is what CLOCK-1 delivers; x86 SNTP is a future rmbp arc.
+until a manual `date -s` — the seam is what CLOCK-1 delivers; x86 SNTP is a future rmbp arc.
 
 ## Shell
 
-* `date` / `setdate YYYY-MM-DD HH:MM[:SS]` — the FAT wall clock (seeds mtime stamps).
+* `date` / `date -s YYYY-MM-DD HH:MM[:SS]` — the FAT wall clock (seeds mtime stamps).
 * `uptime` — seconds since boot from the counter; appends the FAT wall clock when set.
 * `time` — the civil clock: ISO-8601 UTC + source, e.g. `2026-07-22T15:30:45Z (sntp, stratum 2)`
-  or `(manual)`; `unsynced` until an SNTP sync or `setdate`.
+  or `(manual)`; `unsynced` until an SNTP sync or `date -s`.
 
 ## Follow-ups (named, out of CLOCK-1 scope)
 
@@ -87,7 +87,7 @@ until a manual `setdate` — the seam is what CLOCK-1 delivers; x86 SNTP is a fu
   the UART byte-stream; CLOCK-2b extends it to the two capture taps. See "Opt-in serial log
   timestamps" below.
 * **fs-mtime adoption** — ✅ LANDED (CLOCK-3): `fat_stamp()` derives from the Unix anchor when set
-  (SNTP or `setdate` Manual), falling back to the JD17 FAT anchor, so a networked board stamps real
+  (SNTP or `date -s` Manual), falling back to the JD17 FAT anchor, so a networked board stamps real
   mtimes from the SNTP sync. See "FAT mtimes ride the unified clock" above.
 * **x86 SNTP client** (SNTP-X86, ✅ landed) — the x86 smolnet stack now has its own SNTP client
   (`crate::smolnet::sntp_sync_once` / `witness_tick_sntp`), so the x86 civil clock gets a network
@@ -121,7 +121,7 @@ are unaffected.
   or before the counter is calibrated (x86 TSC pre-calibration, or a machine with no invariant
   TSC — where **every** line reads `?` and the null result is visible instead of a fabricated
   `0ms` masquerading as a fast boot).
-* post-sync (a civil anchor exists — SNTP, or a `setdate` Manual): `[15:04:07Z] ` — UTC wall time
+* post-sync (a civil anchor exists — SNTP, or a `date -s` Manual): `[15:04:07Z] ` — UTC wall time
   `HH:MM:SS`. The prefix flips the instant `set_anchor` plants the anchor.
 
 **Where it hooks.** The prefix is inserted in `crate::logts::PrefixWriter`, a `fmt::Write` adapter the

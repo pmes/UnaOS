@@ -25,7 +25,7 @@
     *   *USB 3.0 (xHCI):* **interrupt-driven** (MSI-X → local APIC). Enumeration, single-tier hubs, Bulk-Only Transport mass storage (read/write).
     *   *Network:* Intel e1000/e1000e (MSI RX) + a hand-rolled TCP/IP stack (`crates/net`): ARP / ICMP / DHCP / UDP / full TCP.
     *   *Video:* UEFI-GOP framebuffer → `FrameBuffer` + double-buffered damage-tracked `Screen` + `fbcon` boot/panic console.
-*   **Shell:** Ring 0 CLI (`ver`, `help`, `diskinfo`/`read`/`write`, `ping`/`connect`/`get`, `sched`, `vug`).
+*   **Shell:** Ring 0 CLI (`ver`, `help`, `fdisk -l`/`dd`/`write`, `ping`/`nc`/`curl`, `ps`, `vug`).
 *   **Status:** the three tracks (USB+SMP, network, video) are **merged on `c01-int_combined`** and verified booting together. Subsystem docs live in `docs/dev/OS/`. Beyond `main`, three hardware worktrees run in parallel: **`hw-rmbp`** (x86_64 on the 2012 rMBP — metal-confirmed USB input + SuperSpeed mass storage + FAT read), **`hw-pi4`** (bare-metal aarch64 — GICv2 interrupts, 4-core SMP scheduler, mailbox GUI, and **EL0 userspace**: SVC syscalls, per-page permissions, fault→task-kill, all metal-confirmed), **`hw-jetson`** (Tegra serial bring-up). Integration of the hw tracks back to `main` is pending.
 
 ## 🏛️ RING 3: THE USERLAND (THE TRINITY)

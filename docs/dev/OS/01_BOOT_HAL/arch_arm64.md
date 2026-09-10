@@ -2615,7 +2615,7 @@ tegra image links. The attended-bench risks to watch: (a) hub-MSC **power/timing
 reader (does its SCSI bring-up complete inside the 8 s settle window?); (b) the wall-clock budget
 sizing for a real USB-MSC read latency (bump `hw_wait_budget()`'s BOT multiple if a real read
 marginally times out); (c) `set_not_live()` + the busy-poll pump actually completing a read on the
-timerless EL1 core. Bench proof = flash, then on the panel shell: `diskinfo` (geometry), `ls` (the
+timerless EL1 core. Bench proof = flash, then on the panel shell: `fdisk -l` (geometry), `ls` (the
 card's root), `cat <known file>` (its bytes).
 
 **Metal verdict — ✅ METAL-CONFIRMED (2026-07-10, attended bench; Peter at the Orin).** Serial
@@ -2626,7 +2626,7 @@ hub** enumerated on the retry boot — `HUB downstream slot 5 device … vid=058
 block_size=512 num_blocks=60800 (29 MiB)` → `READ(10) LBA0 CSW status=Passed residue=0` →
 `JD3 — mass storage ready (slot 5); panel shell ls/cat live` (the disk was up well inside the 8 s
 settle window, so the pump returned keyboard-armed + storage-ready). Then post-drop, on the panel
-shell, `diskinfo` / `ls` / `cat` read the FAT card — the M2 crux: **synchronous BOT reads completing on
+shell, `fdisk -l` / `ls` / `cat` read the FAT card — the M2 crux: **synchronous BOT reads completing on
 the timerless EL1 core** via `set_not_live()` + the wall-clock `pump_until_bot_done`. Peter's verdict:
 **PASS**, and **zero `BOT pump TIMEOUT` lines** across the whole session — the ×3 `hw_wait_budget`
 budget was ample for the real USB-MSC read latency. The first real filesystem content on the Orin
@@ -2706,7 +2706,7 @@ milestones in one session across three boots:
 - **M2 — every boot**: zero `JB2c`/`JB9b` serial lines; keyboard + storage enumeration unaffected.
 - **M1 — boot 3** (a **FAT16** card — `UNAOSRW`, the 29 MiB pi4 fixture card with a fresh
   `DOCS/README.TXT`, in the Alcor reader behind the hub, slot 5): the full navigation sequence on
-  the panel — `diskinfo` → `ls` (root: `<DIR> DOCS` + the pi4 fixtures) → `cd docs` → `ls` →
+  the panel — `fdisk -l` → `ls` (root: `<DIR> DOCS` + the pi4 fixtures) → `cd docs` → `ls` →
   `cat readme.txt` → `pwd` → `cd ..` → `cat /docs/readme.txt` → honest-error probes `cd nosuch`
   (`-ENOENT`) and `cat docs` (`-EISDIR`). Bonus proofs beyond the QEMU gates: the whole sequence
   was typed **lowercase** (case-insensitive 8.3 matching on silicon) and the card is FAT16 (the
@@ -3335,7 +3335,7 @@ its parent directory via the read-only `read_dir` (the JD4 case-insensitive 8.3 
 run and `?` = one char, via a small iterative star-backtrack matcher — no recursion, no allocation). Matches
 are `.`/`..`-filtered and sorted for a deterministic listing / serial transcript. The engine is invoked ONLY
 inside the fs-verb arms — the shared arg-split at the top of `dispatch_command` is UNCHANGED, and the NET
-command region (`netinfo`/`ping`/`arp`/`connect`/`udpsend`/`get` — a sockets-arc lane) never sees a glob. A
+command region (`ifconfig`/`ping`/`arp`/`nc`/`curl` — a sockets-arc lane) never sees a glob. A
 leaf with no metacharacter, or a glob confined to a non-trailing component, passes through literally
 (byte-identical to pre-JD12; a mid-path wildcard resolves to an honest `-ENOENT`). The verbs it lifts:
 
@@ -3759,7 +3759,7 @@ the shell-level `ls -l` verdict is **✅ METAL-CONFIRMED (2026-07-15 attended Or
 file's stamp showed through to the exact second (09:20:34), every kernel-written entry showed the honest
 dash (bench card `unaos/scripts/jd16-bench.md`).
 
-### JD17 — the KERNEL CLOCK: `setdate`-seeded wall time that stamps FAT mtime
+### JD17 — the KERNEL CLOCK: `date -s`-seeded wall time that stamps FAT mtime
 
 §JD16 exposed the honest gap: with no RTC the kernel reads, every kernel-written FAT entry carried an all-zero
 mtime and `ls -l` showed a dashed placeholder. JD17 closes that gap **without inventing a clock**: the operator
@@ -3786,11 +3786,11 @@ exactly as §JD16 documented on the read side.
 
 **The frozen-x86 note — stated honestly.** No calibrated invariant-frequency counter is plumbed on x86_64 in
 this kernel (the TSC frequency is measured nowhere), so `monotonic()` returns `None` there and a set clock is
-**frozen at its seeded second** (elapsed = 0). No x86 caller sets the clock today; the `date`/`setdate` verbs
+**frozen at its seeded second** (elapsed = 0). No x86 caller sets the clock today; the `date` / `date -s` verb
 merely compile. x86 monotonic calibration is explicitly **out of scope** (a named future arc).
 
 **The shell (`shell.rs`).** Two additive arms: `date` prints the current wall clock or `date: clock not set`
-when unset; `setdate YYYY-MM-DD HH:MM[:SS]` (seconds optional, default 0) seeds it. `parse_setdate` enforces
+when unset; `date -s YYYY-MM-DD HH:MM[:SS]` (seconds optional, default 0) seeds it. `parse_wallclock` enforces
 the strict field shapes (dash/colon-separated decimals) and hands the numbers to `clock::set`, which owns the
 range validation. A `CLOCK:` help line was added.
 
@@ -3825,7 +3825,7 @@ already stamped at create.
 `UNAOS_HUBSTORAGE=1 ./arroyo test 25` → `MISSION SUCCESS` (x86, shared shell/fat guard). The wall-clock stamp
 is not headless-reachable in-lane, so the shell-level verdict rode the card — now **✅ METAL-CONFIRMED
 (2026-07-15 attended Orin bench)**: unset-honest both boots, seed counter-extended across live `date` reads,
-out-of-range `setdate` rejected without disturbing the set clock, post-seed files stamped at the FAT
+out-of-range `date -s` rejected without disturbing the set clock, post-seed files stamped at the FAT
 2-second resolution while a pre-seed file kept its dash, the stamp byte-identical across a genuine power
 cut, and the next boot up unset again (bench card `unaos/scripts/jd17-bench.md`).
 
@@ -3847,13 +3847,13 @@ the full tree, scoped and no-match forms honest), `du` tallied a seeded tree exa
 1 dir), `uptime` counter-derived both without and with the seeded-clock parenthetical (bench card
 `unaos/scripts/jd18-bench.md`).
 
-### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail) + `xd` (bounded hexdump)
+### JD19 — read-only FORENSIC verbs: `stat` (full on-disk detail) + `hexdump` (bounded)
 
 Two read-only inspection verbs that expose the on-disk truth of a FAT entry — **`shell.rs`-only, zero mutation, `fat.rs` call-never-edit, NET arms + unafs verbs untouched.** Both ride primitives the read path already ships (`resolve_path`/`locate_in_dir`/`read_at`) plus, for `stat`'s attr byte, one raw `block::read_block` of the on-disk directory sector — the same raw block path the `read <lba>` verb uses. Neither is glob-wired: a metacharacter in the path resolves literally, an honest `-ENOENT`, exactly as a mid-path glob does today.
 
 **`stat <path>`.** Prints one directory entry's full detail: the canonical absolute path, kind (file/dir), size in bytes, the raw FAT **attr byte** (hex + decoded `RO`/`HIDDEN`/`SYS`/`DIR`/`ARCHIVE` flags, `-` when none set), first cluster (hex; `0x0` honest for a 0-length file), the FAT last-write stamp (a bare `-` when the on-disk pair is zeroed, via the §JD16 `fmt_mtime`/`FatTimestamp::is_zero`), and the **on-disk location** — the directory-entry LBA + 32-byte slot offset. The parsed `DirEntry` keeps only `is_dir` (not the whole attr byte), so `stat` reads the true byte back from slot offset `+11` of the on-disk directory sector returned by `locate_in_dir` (which yields `(DirEntry, dir_lba, dir_off)`). **`stat /` reports the root honestly** — a directory with **no directory entry of its own** (the FAT root has no parent slot), so the `entry:` line says so rather than inventing an LBA. A missing path is `-ENOENT`.
 
-**`xd <path> [off] [len]`.** A bounded hexdump of a file's bytes via the offset-aware `read_at`: default `off=0`, `len=256`, with `len` **hard-capped at 4096**. Rows are the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout, labelled with the **absolute file offset** (starting at `off`, not from 0 like the raw `read`-verb dump) and non-printables rendered as `.`; a short final row is padded so the ASCII gutter stays aligned. When the file holds more bytes past the dumped window — a cap hit, a short `len`, or both — an honest `[... n more byte(s)]` tail note is printed. An `off` at or past EOF is an honest `offset N at/past EOF` note (no rows); a directory target (and the root) is `-EISDIR`. `off`/`len` accept decimal or `0x`-hex.
+**`hexdump <path> [off] [len]`.** A bounded dump of a file's bytes via the offset-aware `read_at`: default `off=0`, `len=256`, with `len` **hard-capped at 4096**. Rows are the canonical `OFFSET: <16 hex bytes> | <ascii> |` layout, labelled with the **absolute file offset** (starting at `off`, not from 0 like the raw `read`-verb dump) and non-printables rendered as `.`; a short final row is padded so the ASCII gutter stays aligned. When the file holds more bytes past the dumped window — a cap hit, a short `len`, or both — an honest `[... n more byte(s)]` tail note is printed. An `off` at or past EOF is an honest `offset N at/past EOF` note (no rows); a directory target (and the root) is `-EISDIR`. `off`/`len` accept decimal or `0x`-hex.
 
 **Not in scope:** any mutation, glob expansion for these two verbs, raw-LBA dumps (the `read <lba>` verb already covers that), and any FAT-internal walk beyond the public API.
 
@@ -4711,7 +4711,7 @@ the 6-core part. Two independent root causes, both tegra-only.
 physical timer (`CNTP_CTL=0`, JD3; `timer::set_not_live`), so the timer IRQ never fires at EL1 and
 `timer::ticks()` is frozen at 0. `arch::ms()` was `ticks()*4` → stuck at 0, so `vug`'s 200 ms readout
 window (`dt >= 200`) never elapsed (the fps/ms readout, the load fraction, AND the demo-core pulse
-fallback all sit behind that window) and the render loop had no pacing. `setdate`/JD17 is a *separate*
+fallback all sit behind that window) and the render loop had no pacing. `date -s`/JD17 is a *separate*
 clock service and was correctly disproven as the culprit.
 
 *Fix:* a `tegra`-gated `ms()` fallback. When the timer is not live (`!timer::is_live()`, always the
@@ -9615,6 +9615,172 @@ carries `REQUIRE SCHED: load c0=(--|[0-9]+%)/f=` on the baseline's reachability 
 `[el0core] rollup:` precedent verbatim), go-red-proven against boot7g's slice, which predates the
 arc and reds on exactly that row.
 
+## JV1 — EL0 on the QEMU `virt` target (`UNAOS_VIRT_EL0`)
+
+### Why: EL0 regressions were catchable only at a bench
+
+`arch/aarch64/mod.rs` gates `syscall`, `bus` and the `uslots` facade on the **capability** feature
+`aarch64_el0`, which nothing sets directly — it is implied by `baremetal` (Pi 4) and `tegra_el0`
+(Orin). Both are board features for boards QEMU does not model: `baremetal` implies `pi`, and `pi` +
+`tegra` is a hard `compile_error!` (`arch/aarch64/serial.rs:23`). The `virt` legs (`./arroyo test-arm`,
+with or without `UNAOS_GICV3=1`) carry neither, so before this arc **`test-arm` exercised zero lines of
+EL0 code** — measured, not assumed: `awk` over a plain `test-arm` capture returns no `el0`, `eret` or
+`user mode` line at all. Every EL0/BSPRUN regression was therefore metal-owed, on hardware that stays
+at the bench.
+
+`virt_el0` is the third board term behind `aarch64_el0`, and the first one QEMU can run.
+
+### The finding: `mmu_tegra_el0.rs` is board-NAMED, not board-COUPLED
+
+The obvious reading of the gate is that the obstacle is the `#[cfg]` — add a term to it and the virt
+kernel compiles the user machinery. That is false, and the measurement says so loudly: a build with
+`aarch64_el0` on and no board term exits 101 on **329 errors, every one of them the `uslots` facade
+resolving to nothing** (77 × `USER_SLOTS`, 50 × `USER_CODE_SIZE`, 29 × `slot_ttbr0`, …). The facade has
+one arm per board and a bare capability selects none. The Cargo.toml comment on `aarch64_el0` had
+already said this in prose — "arming the capability without a board to back it compiles code whose slot
+backend does not exist."
+
+So the arc's real question was where the third slot backend comes from. The parked brief budgeted a new
+~900-line `boot_virt_user.rs`. It is not needed, and the reason is worth stating precisely because the
+file's own name hides it:
+
+* **`mmu_tegra_el0.rs` never names `mmu_tegra`'s `L1_EL1` static.** `install()` calls
+  `live_ttbr0_root()` — a `mrs TTBR0_EL1` with the ASID stripped — and hangs the user window off
+  *whatever EL1 root the boot path installed*. The module is regime-generic by construction.
+* **`boot_virt::drop_to_el1` installs an L1 of exactly the shape `mmu_tegra` builds**: `L1[0]` = the
+  low-1-GiB Device window (GICv3 distributor at `0x0800_0000`, GICR at `0x080A_0000`, PL011 at
+  `0x0900_0000`), every RAM GiB a Normal-WB block, the rest invalid — same `TCR_EL1.T0SZ = 25`, same
+  39-bit VA. So divergence (1) of the JETSON-EL0 section — *the user window cannot live in GiB 0, it
+  goes in the otherwise-unused `USER_GIB = 480`* — holds on `virt` for the same reason, and `install`'s
+  "verify the entry is invalid before claiming it" check passes on its own evidence.
+* **The whole Tegra coupling is one predicate.** `carveout_overlaps` asks `mmu_tegra` for the
+  SNOC-firewalled window set; `carveout_holes` is `#[cfg(feature = "tegra")]`, so it is cfg-split. QEMU
+  `virt` has no SNOC firewall and no `/reserved-memory` carveouts, so the virt arm answers `false` on
+  those grounds rather than as a stub. (Note the tegra arm would compute `false` there anyway:
+  `carveout_holes` reads `HOLE_N`, which only the `tegra`-gated `resolve_carveout_holes` writes.)
+
+`virt_el0 = ["aarch64_el0"]` therefore implies **neither** `tegra` nor `pi` — it drags in no board UART
+and the virt PL011 stays the console.
+
+### The trap this arc was standing in, and the leg that now guards it
+
+Eleven `#[cfg]`s across five files carry a verbatim note: *"Cargo feature implication is ONE-WAY:
+`baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from
+this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is
+the trap — a byte-identity check over the legs would PASS while the hazard shipped."*
+
+**JV1 is that combination.** Every negated site left longhand for that reason would have gone live
+*alongside* its positive twin on a `virt_el0` build — duplicate definitions, not a silent hazard, but
+only because someone wrote the longhand down. All 21 board-pair predicates
+(`exceptions.rs` ×2, `sched.rs` ×5, `shell.rs` ×2, `video/quarry/live.rs` ×6, `video/dock.rs` ×5,
+comments included) are widened line-neutrally to name `virt_el0`, and the new `arm-virt-el0` leg of
+`KERNEL_CFG_MATRIX` is the leg those comments asked for by name — it is the only aarch64 leg with an
+EL0 layer and neither `pi` nor `tegra`, so the family now fails independently of both boards.
+
+Two things make the widening **complete** rather than merely careful:
+
+* `arch/aarch64/mod.rs` now carries a `compile_error!` rejecting `aarch64_el0` with no board term. The
+  configuration was never buildable (329 errors); saying so turns a documented drift risk into a
+  diagnosable message.
+* With that guard, the three board terms are exhaustive over `aarch64_el0`, so
+  `not(any(baremetal, tegra_el0, virt_el0))` and `not(aarch64_el0)` are now **provably** the same
+  predicate. Collapsing all 21 sites to the single-name spelling `aarch64_el0` exists for is therefore
+  now safe — deliberately left as follow-on work, since it is a five-file edit with no behaviour in it.
+
+### The bring-up and the witness
+
+`main.rs::virt_el0_start_maybe()` is the `virt` twin of `tegra_el0_start_maybe`, the same five steps in
+the same order: `mmu_tegra_el0::install()` → `syscall::setup()` → `syscall::protect()` →
+`spawn_user("el0-hello", …)` pinned to the boot core → `spawn("virt-el0-verdict", …)`. It is folded onto
+the `exceptions::install();` line in the JC3 GICv3 block, which is the only correct home: after
+`boot_virt::drop_to_el1` (the user window hangs off the *live* `TTBR0_EL1`, which is not the EL1 root
+until the drop), after `exceptions::install()` (that is what puts the real `VBAR_EL1` in place for the
+`SVC`), and before `run_capstone_boot_core`, which never returns. Pre-staging onto the queue is the
+supported shape rather than a workaround: `capstone_queue_pre_staged` exists precisely so the two
+priority witnesses — which *drain* the queue — stand down when tasks are already staged.
+
+The boot-core pin is load-bearing for one more reason than on the Orin: the JC2 `virt` secondaries are
+still parked at EL2, so an EL0 task placed on one would hit `user_task_trampoline`'s `CurrentEL` guard
+and be refused (EL0-EL1CORE).
+
+### `EL1_CORE_MASK` — the one real defect, and the tree had already named it
+
+The first armed boot installed the window, loaded the blob, passed the W^X AT probe — and then refused
+to place the task:
+
+```
+:: SCHED: EL0 placement REFUSED (spawn) 'el0-hello' req=0 — no core at EL1 is a candidate ... n=1 ::
+:: SCHED: [el0core] rollup: el0refuse=1 el1cores=0x0 (EL0-EL1CORE) ::
+```
+
+`spawn_user` filters placement through `EL1_CORE_MASK`, which a core writes **only** by measuring its own
+`CurrentEL` in `sched::mark_el1_core()`. `boot_tegra` stamps on the JM6 drop; `boot_virt` never has — and
+`sched.rs`'s own comment said exactly that: *"drops to EL1 through `boot_virt` (not this arc's lane, so it
+stamps nothing)"*. So the EL0-EL1CORE guard was doing its job perfectly: on virt, no core had ever
+**proved** it was at EL1, and the guard fails closed.
+
+The fix is one folded, line-neutral statement at the tegra site verbatim — after `percpu::init(0)` (the
+stamp needs `cpu_index`, and TPIDR_EL1 is RESET-UNKNOWN on this core until that re-seed) and above
+`virt_el0_start_maybe()` (an unstamped mask refuses the pinned spawn). It is **gated `virt_el0`, not
+unconditional**: on a knob-off virt boot the stamp would flip the `[el0core]` rollup from `el1cores=0x0`
+to `0x1` with no EL0 spawn path in the build to justify it, changing a line in a run this arc must leave
+byte-identical.
+
+With the stamp, the same boot reads:
+
+```
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: VIRT-EL0: user window installed — VA 0x7800000000 (L1_EL1[480]), backing PA 0x40017000, 8 slots ::
+:: M6c: user blob loaded (51 bytes) ::
+:: M6b: user code page EL0-RX/EL1-RO (AT probe: EL0-read OK, EL1-write denied) ::
+:: VIRT-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x7800000000 sp 0x7800004000 ::
+:: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
+:: VIRT-EL0: el0-hello round-trip -> PASS ::
+```
+
+with `CAPSTONE COMPLETE — all 6 sync primitives verified in one boot` and both SMP heartbeat PASSes
+still on the same boot.
+
+**The witness tag.** `install()`'s six witnesses were hard-coded `TEGRA-EL0:`, so the first PASS boot
+printed `:: TEGRA-EL0: user window installed ::` **on QEMU virt** — naming a board absent from the build.
+They now route through an `EL0TAG` const: `"TEGRA-EL0"` under `tegra_el0`, so every existing Orin
+capture, spec and `awk` pattern matches the identical string, and `"VIRT-EL0"` under `virt_el0`.
+
+**Cooperative, exactly as JC3 leaves things.** The drop disables the physical timer, `SCHED_ACTIVE`
+stays false, and the shared `__vec_irq` stub still banks EL2 state (`irq_el!()` == `"2"`), so there is
+no IRQ source and the EL0 task runs to its next `svc`. **EL1 timer preemption on virt is a separate
+arc** — it needs an EL1-non-banking `__vec_irq`, and nothing here touches `irq_el!()`.
+
+Run it with:
+
+```
+UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 ./arroyo test-arm 60
+```
+
+Witnesses on the wire — `VIRT-EL0`, never `TEGRA-EL0`, because `test-arm` captures and Orin metal
+captures are read by the same eyes and the same `awk` patterns, and a `TEGRA-EL0` line emitted by a QEMU
+`virt` boot would be an actively misleading artifact:
+
+```
+:: VIRT-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x... sp 0x...
+:: VIRT-EL0: el0-hello round-trip -> PASS ::
+```
+
+`virt_el0_verdict` is a tail-defined twin of `tegra_el0_verdict` with the same four-counter assertion
+(`exited_ok == 1`, everything else 0) and the same CNTPCT bound, so a wedged EL0 task reports FAIL with
+its counts instead of hanging the boot dark. It is a twin rather than a widened `#[cfg]` so that the
+Orin's live, metal-flown path keeps this arc's fingerprints off it entirely.
+
+### Non-regression
+
+`virt_el0` default OFF ⇒ `mmu_tegra_el0` is not compiled on `virt`, `uslots` has no virt arm, the folded
+`virt_el0_start_maybe()` call emits zero instructions (`#[inline(always)]` empty body), and all 21
+widened predicates read exactly as they did. Every new source line is either `virt_el0`-gated or at a
+file tail, per this tree's standing `panic::Location` rule — `syscall.rs` and `main.rs` compile into the
+knob-off Pi `kernel8.img`, and a line inserted above an existing `panic!`/`assert!`/bounds-check site
+shifts its baked `Location` and moves the image hash.
+
+
 ## DARKWIN-GUARD — the 2026-08-18 trunk-merge boot hang, and the dark-window serial latch
 
 ### The failure
@@ -10600,7 +10766,7 @@ ran again with every NEXTTOUCH read survived and the same verdict —
 `JX2-VERDICT=EFI-OWNED-LIVE — CHNSTATUS_CORE=0x20070000, STATE=0x07 -> EFI_OPERATION` (capture
 line 14273), `JX2-SWEEPDISABLED` (14274) and the `DECODES-NOMATCH` retraction (14276) beside it.
 The channel census is a two-flight result; both non-establishment bullets above stand unchanged.
-## ORIN-BSPTICK — a periodic EL1 tick on the boot core (`UNAOS_BSPTICK`, default OFF)
+## ORIN-BSPTICK — a periodic EL1 tick on the boot core (**default ON for tegra**; `UNAOS_NOBSPTICK` opts out)
 
 **Candidate B arc 1** of the SMP redesign (Peter's 2026-08-25 ruling: highest performance, which
 orders B first among the code arcs). The Orin boot core post-JM6 has taken exactly ONE interrupt at
@@ -10670,7 +10836,7 @@ advancing while the JD2 console stays interactive (the tick must not perturb the
 arc deliberately does not do (arc 2, gated on the sched.rs peer grant): no `run_bsp` swap, no
 `run()` entry on the boot core, no `SCHED_ACTIVE`, no preemption, no placement change.
 
-## ORIN-BSPRUN — the boot core joins `run()` (`UNAOS_BSPRUN`, default OFF)
+## ORIN-BSPRUN — the boot core joins `run()` (**default ON for tegra**; `UNAOS_NOBSPRUN` opts out)
 
 **Candidate B arc 2** of the SMP redesign (Peter's 2026-08-25 highest-performance ruling; arc 1 =
 §ORIN-BSPTICK, `72d3d36e`). Arc 1 gave the post-JM6 boot core a standing 250 Hz EL1 clock and
@@ -10846,6 +11012,174 @@ esp-jetson` — its own boot, never folded into the render line while Peter's SM
 pending.
 What this arc deliberately does not do: no AP EL1 drop (Candidate C), no `steal_ok` change
 (F1 stays empty by design until C), no supervisor (Candidate A), no change to how many cores wake.
+
+
+## ORIN-TICKDEFAULT — the tick and the preemptive terminus become the tegra DEFAULT
+
+Landed orin 19 (executor TICKDEFAULT) on **Peter's "OK" of 2026-09-07** to the decision-list
+question *"shall a stock Jetson build get a tick and preemption?"*. This section is the record of
+what changed, what it costs, and what a flight has to show; §ORIN-BSPTICK and §ORIN-BSPRUN above
+remain the record of the mechanisms themselves, which this arc does not touch.
+
+### What a default Jetson build did until this flip
+
+Exactly one EL1 interrupt in the whole life of the boot core, and then silence:
+
+* the JM6 drop asm zeroes the timer condition — `msr cntp_ctl_el0, xzr`, `boot_tegra.rs:158`,
+  reached ungated from `main.rs`'s `drop_to_el1` call;
+* `timer::set_not_live()` immediately after it records that the reading `verify_live` took at EL2
+  is now stale;
+* the IRQEL-RT one-shot proof (`timer::el1_oneshot_proof`, `timer.rs:486`) re-arms CNTP for a
+  single ~100 ms window and **disarms again on every path** at `timer.rs:532`;
+* nothing re-arms it. `el1_bsptick_start` was the only post-drop re-arm in the tree and its call
+  site was `#[cfg(feature = "bsptick")]`, erased by default;
+* the terminus was the cooperative `run_capstone_boot_core(0)`, and preemption was off three
+  independent ways over: no clock, no `timer_preempt` caller (`gic.rs`'s post-EOI arm is
+  `all(tegra, bsprun)`-gated), and `timer_preempt`'s own `!SCHED_ACTIVE` early return.
+
+Consequence: nothing periodic could be scheduled, nothing could sleep and wake, nothing
+involuntarily yielded, and `arch::ticks()` was frozen from the drop onward.
+
+**One correction worth keeping, because the shorter phrasing is wrong.** Only the TICK-DERIVED
+clock froze. `arch::ms()` reads CNTVCT directly and `clock::monotonic()` reads CNTPCT directly, and
+both stay legal at EL1 because the same drop asm sets `CNTHCTL_EL2.EL1PCTEN|EL1PCEN`.
+`CNTP_CTL.ENABLE=0` stops the **comparator**, never the counter — so `clock::mono_ticks()`,
+`logts` and the civil `unix_now()` anchor kept running throughout and still do. The load-bearing
+consequence survives the correction; the phrase "frozen monotonic clock" does not.
+
+### This is not new capability — it is making flown capability the default
+
+Both knobs had already flown PASS on Orin silicon, individually and together, before the flip:
+
+* `bsptick` — tick1, 2026-09-06 (orin 16): `arm=1 tick_lines=133 tmax=33000 el2=0 exceptions=0
+  -> PASS`;
+* both — render8, 2026-09-06 (orin 17): `orinbsprun_join=1 -> HOSTING`, `[bsprun] host core=0
+  el=1 -> HOSTING`, `el0 first-run … eret to EL0 ACCEPTED`, with 718 s of ticks under the full
+  desktop (`tmax=179500`).
+
+See `orin-ledger.md` A21, and A6's 2026-09-07 correction. The flip therefore changes **which
+polarity is default**, not what the code does when armed.
+
+### The mechanism, and why this one
+
+`bsptick` + `bsprun` are pushed into the feature list for tegra builds by the build scripts — the
+**ORIN-SMP-DEFAULT (`tegrasmp` / `UNAOS_NOTEGRASMP`) precedent, verbatim in shape**: a default-on
+line in `arroyo`'s knob mapping keyed on `UNAOS_TEGRA`, an idempotent force block in
+`esp_jetson()` for the media path, and the explicit positive knobs left in place for back-compat.
+
+**Not one line of `.rs` changed.** The eighteen `cfg` sites keep their predicates exactly as the
+metal compiled them, so the flown source is the shipped source. The alternative — deleting the
+gates — was rejected: it removes the way back to the baseline, it cannot be done line-neutrally
+across four files (and `sched.rs:1746` sits above ~9200 `panic::Location`s), it would leave
+`bsptick`/`bsprun` declared with no `cfg` site and red GATE-KNOB, and it would produce a source
+tree the bench has never compiled.
+
+### The three configurations, and the way back
+
+| build | features | terminus | what it is |
+|---|---|---|---|
+| default tegra / `esp-jetson` | `bsptick,bsprun` | `run_bsp_tegra(0)` | tick + preemption — **new default** |
+| `UNAOS_NOBSPRUN=1` | `bsptick` | `run_capstone_boot_core(0)` | tick only; the tick1-flown rung |
+| `UNAOS_NOBSPTICK=1` | neither | `run_capstone_boot_core(0)` | the pre-flip image; **the byte-identity baseline** |
+
+`UNAOS_NOBSPTICK` is dominant and has to be: `bsprun` without `bsptick` is a flag with no clock and
+trips the `compile_error!` at `sched.rs:10465`, so dropping the tick must drop preemption with it.
+That is the exact inverse of the `UNAOS_BSPRUN` mapping, which arms both. Where a positive and a
+negative knob are both set the positive wins, matching `UNAOS_TEGRASMP` / `UNAOS_NOTEGRASMP`.
+
+Both polarities stay type-checked **without a matrix edit**: the armed default's feature closure
+*is* `arm-tegra-bsprun` (`arm-tegra`'s list verbatim + `bsptick,bsprun`), the EL0 cross that is the
+flight image is `arm-tegra-bsprun-el0`, and `arm-tegra` itself remains the disarmed polarity that
+`UNAOS_NOBSPTICK=1` still builds.
+
+### Scope: tegra only, and structurally so
+
+The Pi is untouched — `kernel8()` compiles from a **curated `K8_FEATS`** that never draws from
+`$_feats`, and `arch/aarch64/boot.rs` (the Pi drop) contains no `cntp_ctl` write at all; the Pi's
+`timer_preempt` arm is `baremetal`-gated and was already live. The QEMU-virt legs (`arm`,
+`test-arm`) never set `UNAOS_TEGRA`, and x86 never sees an aarch64 feature. `unaos/builder`
+needs no change: it never mapped `UNAOS_BSPTICK`/`UNAOS_BSPRUN` (they are aarch64-only), exactly as
+it maps `UNAOS_TEGRASMP` for parity but not `UNAOS_NOTEGRASMP`.
+
+### ⚠ What this flip costs, stated rather than waved through
+
+**It ends the tegra knob-off byte-identity proof as a property of the DEFAULT build.** The
+invariant is not destroyed — it moves to the opt-out: `UNAOS_NOBSPTICK=1 ./arroyo esp-jetson` is
+what now reproduces the pre-flip image. Every recorded baseline that keyed on "the default jetson
+image" instead of "the disarmed polarity" is stale by construction and must be re-derived against
+the opt-out, starting with the objcopy sha256 pair recorded under §ORIN-BSPRUN above.
+
+### ⚠ What a bench flight must show — the predicate
+
+QEMU models no Tegra234, so the armed default is type-checked and reasoned, never QEMU-proven.
+Nothing below has been observed on a default image; this is the predicate, not a result. It is
+written to distinguish three outcomes that a careless read would conflate — **armed and
+preempting**, **armed but idle**, and **the old tickless behaviour** — on a bare
+`./arroyo esp-jetson` with no `UNAOS_BSPTICK` / `UNAOS_BSPRUN` in the command line:
+
+1. **The build is the armed one.** `⚡ kernel features (jetson):` contains `bsptick` AND `bsprun`,
+   and `strings kernel.elf` finds `[orinbsptick]` and `[orinbsprun]` — banner AND artifact, per the
+   full-knob law.
+2. **The tick is armed** — `[orinbsptick] arming PERIODIC CNTP at EL1 on cpu 0`.
+3. **The tick is DELIVERED and ADVANCING**, which is the line that separates armed-and-ticking from
+   armed-but-idle: `[orinbsptick] tick N taken at EL1 on cpu 0` for **at least two distinct N**.
+   `bsptick_witness` emits at `n == 1` and then every `TICK_HZ`th tick, so the second emission is
+   `tick 250`; a lone `tick 1` is indistinguishable from the one-shot's signature and must NOT be
+   scored as a pass. `EL1`, not `EL2`, on every emission — an EL2 reading means `HCR_EL2.IMO`
+   regressed, and the pattern deliberately matches any EL digit so a regressed line still lands in
+   the table where a reader sees it.
+4. **The terminus is the preemptive one** — `[orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true,
+   mark_online(0)`, and `CAPSTONE COMPLETE` **absent** (it is printed by `capstone_body`, which only
+   `run_capstone_boot_core` spawns; its presence on a default boot means the flip did not reach the
+   image). Then `[bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x1)` — `el=1`, and
+   `HOSTING` rather than `REFUSING`.
+5. **Preemption actually DELIVERED, not merely became legal — the `load_witness_tick` train.** This
+   is what separates "armed and preempting" from "armed but idle", and the reason is link-time:
+   `load_witness_tick` (`sched.rs:8404`) has **exactly one** caller, `timer_preempt`
+   (`sched.rs:5150`), which returns at its first line unless `SCHED_ACTIVE` — and `run_bsp_tegra` is
+   the only thing on tegra that ever sets it. Before ORIN-BSPRUN these strings were not merely
+   absent from the wire, they were **absent from the linked image**: `sched.rs:3312` records the
+   `LC_ALL=C grep -a` over the linked `arm-tegra-el0` kernel that found no `[spread4] live`, because
+   every caller was unreachable. Score two lines, and mind which is suppressible:
+   * `[el0live] verdict=` — chained at `sched.rs:8414` **before** the change-suppression, so it
+     prints on every window regardless of whether load moved. **This is the primary predicate**: an
+     armed-but-idle machine still emits it, so its absence is a real failure rather than a quiet
+     machine.
+   * `[spread4] live c0=N/M` and `[prio] svc=` — chained at `:8418`/`:8419`, i.e. only when
+     `load_witness_emit()` returned true (the packed per-core busy signature CHANGED). Expect them
+     on a render8-shaped boot with the desktop, quarry and pulse live; their absence on a genuinely
+     idle boot is not by itself a failure.
+
+   ⚠ All of these are **cross-platform** strings the Pi prints constantly (tens of thousands of hits
+   tree-wide, overwhelmingly Pi). Score a per-flight LINE RANGE of the Orin capture, never the
+   shared `raw.log` — reading another board's preemption as this board's is the standing trap.
+6. **An EL0 tenant is admitted and runs under it** — `[bsprun] el0 first-run … eret to EL0 ACCEPTED`,
+   with the JD2 console still answering a keystroke and a click afterwards. Interactivity surviving
+   quantum expiry is the point of the flip; a tenant accepted onto a wedged console is not a pass.
+7. **Nothing regressed** — `exceptions=0`, `el2=0`, and zero hits of the `[wedge4]
+   preempt-in-section` tripwire (`sched.rs:5157`), which lives inside `timer_preempt` and becomes
+   reachable on tegra only under this configuration.
+8. **The way back still works** — `UNAOS_NOBSPTICK=1 ./arroyo esp-jetson` produces an image whose
+   objcopy sha256 matches the pre-flip default, and whose wire carries zero `[orinbsptick]` and zero
+   `[orinbsprun]` lines and `CAPSTONE COMPLETE` present. Without this leg the flight proves the new
+   default works but not that the baseline is still reachable.
+
+**⚠ Lines that look like discriminators and are not.** `:: SCHED: load ::` does **not** distinguish
+the preemptive terminus from the cooperative one: its emitter `load_witness_emit` has two callers,
+`load_witness_tick` (from `timer_preempt`) and `load_witness_poll` (`sched.rs:8455`), and the poll
+is called from **`run_capstone_boot_core` itself** at `sched.rs:10201` — the *old* default's drive
+loop, at a CNTPCT-rate-limited ~1/s. A tickless boot prints the load train too, and `[pulse5]` /
+`[spin1]` ride the same emit. That is precisely why (5) keys on `[spread4]`, which the poll path
+does not chain, and not on the load line it sits beside.
+
+**The instrument for (2)-(4) is not yet armed.** `scripts/specs/jetson-sync1.spec:1063-1064` carry
+the two `[orinbsptick]` rows as `PENDING`, and PENDING is not failable in `orin-specscore.py`
+(`failable = d.kind in ("REQUIRE","COUNT","FORBID")`). On a default image those rows must become
+`REQUIRE` + a `COUNT`, and `:269`'s `REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] …)` alternation must
+collapse to the `[orinbsprun]` arm — otherwise a silently tickless default boot scores green. That
+inversion belongs to the flight arc, with the synthetic `jetson-sync1-green.capture` gaining the
+same lines in the same commit, and is deliberately NOT made here: a REQUIRE that no capture in the
+tree satisfies is a red gate with no flight behind it.
 
 
 ## §ORIN-STKDEPTH — a boot-core stack DEPTH at the tegra terminus (`orinfurn`, DEFAULT OFF)
@@ -11228,3 +11562,120 @@ the jetson media and the Pi `kernel8.img` are both byte-identical to baseline. V
 * Disarmed `esp-jetson` (`tegra_el0` aboard, `orininput` off): **zero** matches for `orininput`,
   `rollup passes=`, `NEVER-RAN`, `ROUTER-DROP`, `QUEUE-INERT` — the strings are absent from the image,
   not merely unreached.
+
+## VIRTPREEMPT — EL1 timer preemption on the QEMU `virt` target (`UNAOS_VIRT_TICK`)
+
+The half [§JV1](#jv1--el0-on-the-qemu-virt-target-unaos_virt_el0) named and deferred. JV1's own header
+states the parked work exactly:
+
+> COOPERATIVE, exactly as the JC3 drop leaves things … the drop disables the physical timer,
+> `SCHED_ACTIVE` stays false, and the shared `__vec_irq` stub still banks EL2 state (`irq_el!()` == "2")
+> … EL1 timer preemption on virt needs an EL1-non-banking `__vec_irq` and is a SEPARATE arc.
+
+Arm with `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VIRT_TICK=1 ./arroyo test-arm 60`. The feature is
+`virt_tick`, and it implies `virt_el0`.
+
+### 1. The measurement: does `__vec_irq` bank EL1 today?
+
+No. `exceptions.rs` selects the IRQ stub's bank/unbank sequence at **compile** time off `tegra`:
+
+```rust
+#[cfg(all(not(feature = "tegra"), feature = "baremetal"))]      irq_bank! => "mrs x0, ELR_EL1 / mrs x1, SPSR_EL1"
+#[cfg(all(not(feature = "tegra"), not(feature = "baremetal")))] irq_bank! => "mrs x0, ELR_EL2 / mrs x1, SPSR_EL2"
+#[cfg(feature = "tegra")]                                       irq_bank! => runtime CurrentEL branch
+```
+
+A `virt` build is `not(tegra), not(baremetal)`, so it takes the **second** arm. `mrs x0, ELR_EL2`
+executed at EL1 is UNDEFINED: it traps as a synchronous exception into `__vec_sync`, which logs and
+halts. That is the blocker, and it is the reason `boot_virt::drop_to_el1`'s asm ends with
+`msr cntp_ctl_el0, xzr` — its own module comment says so in as many words.
+
+Two independent corroborations that the diagnosis is the whole of it: `__vec_sync` already carries the
+runtime `CurrentEL` test (`mrs x2, CurrentEL / cmp x2, #0x8 / b.eq 2f`) for the identical reason, and
+`tegra` has run that same three-instruction test in `__vec_irq` since `0a60e260`, with IRQEL-RT proving
+it live at EL1 on Orin metal.
+
+**The minimal change is therefore a gate widening, not a rewrite.** `virt_tick` joins the tegra arm:
+
+```rust
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), feature = "baremetal"))]      … _EL1
+#[cfg(all(not(feature = "tegra"), not(feature = "virt_tick"), not(feature = "baremetal")))] … _EL2
+#[cfg(any(feature = "tegra", feature = "virt_tick"))]                                       … runtime CurrentEL
+```
+
+Not one byte of new assembly exists in this arc. The three arms stay mutually exclusive and exhaustive,
+and the comment above them is kept line-neutral (6 lines in, 6 out) because `exceptions::install`'s
+`assert!`/`panic!` sit below it and this file compiles into the knob-off `kernel8.img`.
+
+`boot_virt.rs` is **not touched**. The drop still disarms CNTP; `timer::virt_tick_start` re-arms it from
+EL1 afterwards — the JM6 / ORIN-BSPTICK pairing, made legal by the same drop's
+`CNTHCTL_EL2.EL1PCTEN|EL1PCEN` (`orr x0, x0, #0x3`) and `HCR_EL2 = 1<<31` with IMO/FMO/AMO clear.
+
+### 2. What the arc changes
+
+| File | Change | Shape |
+|---|---|---|
+| `exceptions.rs` | `irq_bank!`/`irq_unbank!` gates; the stale "(tegra/virt run cooperatively)" note on the M6e counter corrected | line-neutral, in place |
+| `timer.rs` | `virt_tick_start()` + `virttick_witness()` + `virt_tick_count()`; witness call folded onto `on_tick`'s existing tail line | tail append + 1 line-neutral fold |
+| `gic.rs` | the `handle_irq_v3` post-EOI preempt arm: `all(tegra,bsprun)` → `any(all(tegra,bsprun), virt_tick)` | line-neutral, in place |
+| `sched.rs` | `SCHED_ACTIVE` + the proof (`vp-spinA`/`vp-spinB`/`vp-judge`); arm folded onto the existing `SCHED_GO` line | tail append + 1 line-neutral fold |
+| `syscall.rs` | `el0_spin_done()` accessor over the existing `EL0_SPIN_DONE` | tail append |
+| `main.rs` | `virt_tick_start()` and the `el0-spin` `spawn_user` folded onto existing lines | line-neutral |
+
+GIC state is **not** re-programmed at EL1: `gic::init_cpu_interface_v3` set ICC_SRE_EL2.SRE,
+ICC_SRE_EL1.SRE, ICC_PMR_EL1=0xFF, ICC_CTLR_EL1.EOImode=0 and ICC_IGRPEN1_EL1=1 at EL2, and in the
+non-VHE physical interface those ICC_*_EL1 registers are not EL-banked, so EL1 inherits a live Group-1
+interface. `smp_virt.rs`'s ORIN-EL1AP comment already depends on exactly this property.
+
+### 3. Why the terminus is kept, unlike ORIN-BSPRUN
+
+ORIN-BSPRUN swaps `run_capstone_boot_core(0)` for `run_bsp_tegra(0)` and states its price: "an armed
+boot spawns NO CAPSTONE … and skips the cooperative terminus's baseline emits". On `virt` that price is
+unpayable — CAPSTONE and the JV1 EL0 round-trip *are* the regression this gate protects.
+
+It is also unnecessary. `dispatch_next`'s tail already handles a task that comes back READY —
+*"READY (yielded or preempted): re-enqueue at its BASE priority level"* — and `timer_preempt` switches
+to `SCHED[cpu].scheduler_sp`, the SP `dispatch_next` published on its way in. A preempt therefore returns
+the drive loop to precisely where a cooperative `yield_now` returns it. **The cooperative loop and the
+preemptive loop are the same loop; only `SCHED_ACTIVE` differs.** So the arm is folded onto the existing
+`SCHED_GO.store(...)` line: after every cooperative witness (`priority_aging_witness`, `prio_mix_witness`,
+`parked_display_witness`, `sched_bal_witness`) and after `spawn("capstone", …)`, before the loop.
+
+`mark_online(0)` is deliberately **not** called. The three `virt` EL2 secondaries sit in `run()`, and
+`try_steal` skips any core whose `ONLINE_MASK` bit is clear — cpu 0's is, so the proof below is
+single-core by construction and the interleave it measures means something.
+
+### 4. The proof, and why it is a proof
+
+Three kernel tasks on the boot core, all `PRIO_NORMAL`, **none of which ever calls `yield_now`,
+`sleep_ticks`, or any blocking primitive**:
+
+* `vp-spinA` / `vp-spinB` — each spins for a fixed 500 ms **wall-clock** window (CNTPCT, which advances
+  whether or not any interrupt is ever delivered), doing `VP_LAST.swap(my_id)` on every pass and counting
+  a **handover** whenever the previous occupant was the other spinner.
+* `vp-judge` — spawned third, also non-yielding; waits for both spinners and for the EL0 spinner, then
+  prints one self-checking line.
+
+**The discriminator is the handover count, not the loop counts.** Under a purely cooperative dispatcher
+the schedule is forced: A is dispatched, runs its whole window without ever returning to the scheduler,
+exits; then B; then the judge. `VP_ALT` therefore reads **exactly 2** — one for A's first swap over the
+initial zero, one for B's first swap over A — and it can read nothing else, because a handover requires a
+switch and cooperation offers none. Every count above 2 is an involuntary switch only the timer can have
+caused. The PASS floor is 6 (four real handovers) so no single stray switch decides the verdict; at
+`QUANTUM_TICKS = 3` and 250 Hz the measured value is two orders of magnitude clear of it.
+
+**It is bounded in both directions**, which is what a gate needs: the windows are wall-clock, so the
+*failure* mode (no tick ever delivered) is not a hang — the spinners still finish, the judge still runs,
+and it prints FAIL carrying `alternations=2`, the cooperative signature. A proof whose negative outcome
+is a timeout tells a capture nothing.
+
+**The EL0 half** is `el0-spin` (`__user_prog_spin`, the M6e register-only spinner), spawned by
+`virt_el0_start_maybe` under `virt_tick` and preempted through the 0x480 lower-EL vector — the same
+now-runtime-banked `__vec_irq`, which banks SP_EL0 unconditionally, so it resumes on its own user SP and
+reaches its `sys_exit` (`EL0_SPIN_DONE`, which the judge waits for so "not preempted" and "not finished"
+cannot be confused). It is measured from `PRIO_EL0_DISPATCH`, **not** from `aarch64_irq_handler`'s M6e
+`EL0_IRQS_AT_EL0`: the virt boot also ticks at EL2 before the JC3 drop, where SPSR_EL1 is RESET-UNKNOWN,
+so a zero there would be counted as an EL0 preempt that never happened. `virt_el0_start_maybe` stages
+exactly two EL0 tasks, `el0-hello` (one non-blocking `sys_write`, then `sys_exit`) and `el0-spin` (no
+syscall at all before its exit); neither can yield, so a cooperative boot dispatches each exactly once
+and the counter reads exactly 2. A third dispatch is EL0 preemption.

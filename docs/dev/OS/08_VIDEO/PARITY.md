@@ -473,7 +473,7 @@ is that number on the wire.
 
 **What has no windowed home, stated rather than orphaned.** The menu bar carries UTC `HH:MM`; the
 retired info bar also carried the **mDNS hostname**, the **settled lease IPv4** and the **date +
-seconds**. All three remain reachable from the shell window (`netinfo`, `date`, `time`) and on the
+seconds**. All three remain reachable from the shell window (`ifconfig`, `date`, `time`) and on the
 serial wire, but there is no longer an always-on indicator for host/IP. A network status tenant — a
 menu-bar item or a small window — is **OWED** and is the natural companion to §6.2.
 

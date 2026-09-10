@@ -1,0 +1,160 @@
+== render9 scorers over /home/pmes/unaos-bench/scratch/orin23/boot-render11-A1.log (3593 lines) ==
+A15 smp: cpu_on_success=5 cpu_on_error=0 el3_abort=0 poweroff=0 online_line=1 -> PASS (A15 pass 5)
+A1 u7stk: arming=1 post_cascade=1 len=32768 hw=15048 (render6=15552 delta=-504) headroom=17720 -> PASS-SHALLOWER (504 bytes below render6 — check the quarry actually opened)
+[u7stk] at=boot-core:pre-cascade task=0:boot-core sp=0x26b3fd730 low=0x26b3f5820 top=0x26b3fd820 len=32768 used=240 hw=240 headroom=32528
+[u7stk] at=boot-core:post-cascade task=0:boot-core sp=0x26b3fd730 low=0x26b3f5820 top=0x26b3fd820 len=32768 used=240 hw=15048 headroom=17720
+A18 cascade: cascaded=1 refuse=0 pulsewin_open=1 pulsewin_decline=0 strip_kept=0 census_strip=retired census_pulsewin=3 -> PASS
+[deskcascade] -> CASCADED windows=2 bar=1 owns_pixels=1 route=ROUTED activate=false (the console is windowed when route=ROUTED; the render pass ahead presents t
+[pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+A19 band: band_cleared=1 shell_present=1 jd2_probe=1 -> WIRE PASS (now A19-pngband.py SCREEN0.PNG must read non-bg=0/60200)
+A20 clicks: arm_click1=1 orinclick_armed=1 clickroute_press=2 consumed=2 routing_census=0 -> PASS (A20 flown)
+   [clickroute] press chrome win=2 owner=4294967043 at (761,201) -> drag
+A22 tcu: arm=1 stop=0 census=97 full_final=0 nbytes=0 full_edges=0 changes=0 data=[00 00 00] -> ROW3: FULL-NEVER — forwarding not on unprompted
+HEALTH: heartbeat=1 el1=1 arm=1 armed=1 live=94 redzone=0 exceptions=0 -> PASS
+-- render7 additions --
+A16 tcurx2: tcurx_took=0 took_total=0 serialrx_census=94 rx_final=0 mbox_final=ABSENT ovrf=0 tcu_full_final=0 keys=0 -> CONSUMER NEVER FIRED (mbox=0, no [tcurx] took=) — no byte ever reached the mailbox on this boot
+[serialrx] rx=0 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+[serialrx] rx=0 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+[serialrx] rx=0 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 signature) (TCURX2: `mbox=` = bytes 
+[serialrx] rx=0 (+0) polls=0 refused=0 ovrf=0 lsr0=0x00000200 mbox=0 -> RX-LIVE (the UART answers; 0x60 = THRE|TEMT is the idle 16550 
+A16 leg burst/paced: windows not supplied -> NOT-SCORED (pass burstA burstB pacedA pacedB)
+A27 drag: wired=1 control_absent=0 arm=2 end=2 steered=2 fed-no-move=0 no-feed=0 | wm_drag_begin=2 wm_drag_end=2 placed=2 no-move=0 -> PASS A27 (steered 2 gesture(s), wm placed 2)
+   [dragroute] wired panel=1920x1200 desktop_firmware=1 -> READY
+   [dragroute] end win=2 via=release fed=303 applied=197 at (756,143) -> STEERED
+   [wm-act] drag-end win=2 owner=0xffffff03 at (379,164) -> placed
+A8 quarry: quarry_open=1 skip=0 decline=0 pidesk_true=1 deskquarry_seat=1 compiled=1 open=1 relatched=0 -> PASS A8 (compiled=1 open=1, the window is on the wire; now count 4 dock tiles on the glass)
+   [quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,183) volumes=1 tree-rows=9 list-rows=26 cwd=/
+   [pidesk] quarry open=true — the file manager is a desktop tenant (arrows/Enter/Backspace move it ONLY WHILE IT
+   [deskquarry] seat compiled=1 open=1 windows=2 relatched=0 (QUARRY-ORIN A8 — desktop_firmware::activate() step 
+A25 winmenu: publish=1 publish_refuse=0 contend_refuse=0 open=0 last_title=n/a pick=0 dismiss=0 (esc=0 outside=0 pick=0) -> PUBLISHED, NEVER OPENED (the bar title was not clicked)
+A25 negative: in-window title_press=0 in-window menu-dismiss=0 (winmenu pick callback=0, expected>=0) -> PASS (no in-window View strip token — R21 holds)
+A26 conquiet: console_route=1 console_window=1 mirror_off=1 (at line 1) census=1 dropped=256 -> PASS A26 (mirror=off once, then 256 census lines dropped and named — the console window is quiet)
+   [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
+   [conquiet] mirror=off since=console-window-route win=1 lines_dropped=1 knob=bootlog (the full serial stream stops mirror
+   [conquiet] census dropped=256 win=1 -> QUIET (lines the desktop's console window would have scrolled and did not; every 
+A20 ptrpoll: lines=3 first_rearm=3 first_dup=0 first_nobuf=0 | final rearm=589 dup=0 nobuf=0 reports=589 | verdicts STREAMING=2 BASELINE=1 GUARD-REARM=0 DUP-DROP=0 NOBUF-DROP=0 ARMED-NO-COMPLETION=0 -> RE-ARMED (rearm=3 > 2 at census 1 — the pipeline is moving; a dead click is a ROUTING fault)
+   first:  [ptrpoll] t=71 rearm=3 discard=0 errrearm=0 dup=0 nobuf=0 reports=3 base=3 decoded=0 folded=0 foldnew=0 -> BASELINE (the enumeration arms; every later
+   last:   [ptrpoll] t=351 rearm=589 discard=0 errrearm=0 dup=0 nobuf=0 reports=589 base=3 decoded=586 folded=11 foldnew=9 -> STREAMING (the pointer read is comp
+A17 prtscr: armed=6 capturing=4 ok=4 inflight_refusals=1 other_refusals=0 names=[ SCREEN6.PNG SCREEN7.PNG SCREEN8.PNG SCREEN9.PNG ] -> PASS A17 (two files and 1 NAMED InFlight refusal(s) — the render6 gap is closed)
+   :: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN6.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=0/6913793 ::
+:: PRTSCR: slice n=2 bytes=32768/6913793 ::
+:: PRTSCR: slice n=3 bytes=131072/6913793 ::
+:: PRTSCR: slice n=4 bytes=229376/6913793 ::
+:: PRTSCR: slice n=5 bytes=327680/6913793 ::
+:: PRTSCR: slice n=6 bytes=393216/6913793 ::
+:: PRTSCR: slice n=7 bytes=491520/6913793 ::
+:: PRTSCR: slice n=8 bytes=589824/6913793 ::
+:: PRTSCR: SCREEN6.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN7.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=0/6913793 ::
+:: PRTSCR: slice n=2 bytes=65536/6913793 ::
+:: PRTSCR: slice n=3 bytes=163840/6913793 ::
+:: PRTSCR: slice n=4 bytes=262144/6913793 ::
+:: PRTSCR: slice n=5 bytes=327680/6913793 ::
+:: PRTSCR: slice n=6 bytes=425984/6913793 ::
+:: PRTSCR: slice n=7 bytes=491520/6913793 ::
+:: PRTSCR: slice n=8 bytes=589824/6913793 ::
+:: PRTSCR: SCREEN7.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: SCREEN8.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=32768/6913793 ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: slice n=2 bytes=131072/6913793 ::
+:: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::
+:: PRTSCR: slice n=3 bytes=229376/6913793 ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: slice n=4 bytes=327680/6913793 ::
+:: PRTSCR: slice n=5 bytes=425984/6913793 ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::
+:: PRTSCR: slice n=6 bytes=524288/6913793 ::
+:: PRTSCR: slice n=7 bytes=622592/6913793 ::
+:: PRTSCR: slice n=8 bytes=720896/6913793 ::
+:: PRTSCR: SCREEN8.PNG 1920x1200 6913793 bytes -> OK ::
+:: PRTSCR: SCREEN9.PNG 1920x1200 -> capturing (6913793 bytes reserved; the verdict line follows — a boot cut before it leaves the entry sh
+:: PRTSCR: slice n=1 bytes=32768/6913793 ::
+:: PRTSCR: slice n=2 bytes=131072/6913793 ::
+:: PRTSCR: slice n=3 bytes=229376/6913793 ::
+:: PRTSCR: slice n=4 bytes=327680/6913793 ::
+:: PRTSCR: slice n=5 bytes=425984/6913793 ::
+:: PRTSCR: slice n=6 bytes=491520/6913793 ::
+:: PRTSCR: slice n=7 bytes=589824/6913793 ::
+:: PRTSCR: slice n=8 bytes=688128/6913793 ::
+:: PRTSCR: SCREEN9.PNG 1920x1200 6913793 bytes -> OK ::
+-- render8-line blocks (carried over verbatim) --
+A21 tick: arm=1 ticklines=76 tmax=18750 census=94 passes=1->10929000 exceptions=0 -> PASS
+A21 run: host=1 hosting=1 refusing=0 bgrun=0 detached=0 rejected=0 el0_first_run=1 capped=0 orinbsprun_join=1 -> HOSTING, NO SPAWN (no BGRUN line — nothing was launched to host)
+   :: [bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x1; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses o
+   :: [bsprun] el0 first-run 'el0-hello' on core 0 — CurrentEL EL1 checked, eret to EL0 ACCEPTED (n=1) ::
+   :: [orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true, mark_online(0), preemptive terminus (clock: ORIN-BSPTICK); 
+A12 net5 Q0: net5R_lines=1 armed=1 not_armed=0 match=1 mismatch=0 (net4F rx-ring seen=1) -> ARMED + MATCH — live; read Q2
+   :: PCIE4:   [net5R] ARMED: rx-desc[1..31].addr re-pointed from rx-bufs 0x80010000 to SHADOW 0x80050000 (NC window +0x50000, 65536 B, tag idx 0x80..) AFTER RxEnb; slot 0 l
+A12 net5 Q1: rx_ring_lines=1 below4g=1 net4s=15 identity_covered=5 alias_region1=0 -> PASS placement (sub-4GiB, identity-covered, no alias in the path)
+   :: PCIE4:   [net4F] rx-ring phys=0x80000000 buffers=32 rx-bufs=[0x80010000..0x80020000) tx-ring phys=0x80020000 below4g=1 — every DMA object is < 4 GiB inside the NET-4h 
+A12 net5 Q2: net5T=5 (with slot_expected/slot_read 4, divergent 3) net5V=1 pops_scored=5 | REFETCH-LIVE=0 REFETCH-WRONGSLOT=3 STALE-ORIG=0 NOWHERE=1 PREFETCHED=0 CONTROL-OK=1 | last slot_expected=3 slot_read=17 divergent-reads=3 -> FAIL Q2 — REFETCH-WRONGSLOT=3 still non-zero: the index defect render8 located is NOT closed by the read-side fix. divergent-reads=3. The address path is live; the reuse is still an index defect.
+   :: PCIE4:   [net5V] ring RE-FETCH verdict: pops-scored=5 REFETCH-LIVE=0 REFETCH-WRONGSLOT=3 STALE-ORIG=0 PREFETCHED=0 NOWHERE=1 CONTROL-OK=1 prefetch-depth=0 slot_expected=3 slot_read=17 divergent-reads=3 shadow=0x800500
+A12 net5 Q3: dhcp_lines=1 lease=0 -> NO LEASE (meaningful only on a REFETCH-LIVE Q2)
+   :: PCIE4:   [net4V no-lease verdict] dhcp-tx: discover=1 request=0 | dhcp-rx: offer=0 ack=0 nak=0 | ring: popped=5/32 wraps=0 zero-payload=4 [ring died MID-PASS (window c
+:: PCIE4:   [net4F] rx[2] slot=2 len=60 own-buffer-written=no buffers-written(count=0)=[-1,-1,-1,-1] — the completed slot advanced with a real length and NOT ONE ring b
+:: PCIE4:   [net4F] distinct buffers-written(count=1)=[0,-1,-1,-1] across the first 4 RX completion(s) at=completion-4 below4g=1 rx-ring=0x80000000 — a single-address l
+:: PCIE4:   [net4F] rx[3] slot=3 len=62 own-buffer-written=no buffers-written(count=0)=[-1,-1,-1,-1] — the completed slot advanced with a real length and NOT ONE ring b
+:: PCIE4:   [net4F] rx[4] slot=4 len=342 own-buffer-written=no buffers-written(count=0)=[-1,-1,-1,-1] — the completed slot advanced with a real length and NOT ONE ring 
+:: PCIE4:   [net4F] RX ring pass verdict: pops=5 NUM_RX=32 wraps=0 RDU-clears=0 RXOVW-clears=0 CR=0x0c RxEnb=1 ISR=0x0084 — one pass only, and RDU NEVER latched: the ha
+:: PCIE4:   [net4F] distinct buffers-written(count=1)=[0,-1,-1,-1] across the first 4 RX completion(s) at=window-close below4g=1 rx-ring=0x80000000 — a single-address l
+A12 net4 control: net4G_lines=1 never_armed=1 actually_armed=0 -> EXPECTED (the line is present and says `never ARMED` — the self-gate held; render8's scorer read this as an arming, which was the defect)
+   :: PCIE4:   [net4G] latch-site status: never ARMED — no [net4F] single-address-latch verdict fired this window (the experiment self-gates on a tag-proven latch) (victim=-1 latched=
+A24 rung3: lines=93 complete=1 refused=0 rung3_complete=1 unreadable=9 bcr_lock=1 opt_wpr=1 cascaded_after_probe=1 -> PASS A24-rung3 (COMPLETE, rung 3 complete, both rung-4 inputs present, and [deskcascade] -> CASCADED after it — the boot continued behind the rung) WITH A FINDING: 9 register(s) UNREADABLE, which is itself the answer rung 4 needs
+   [ga10bprobe3] pg=0x1 clk=2/3 regs=16 of 25 readable, 9 UNREADABLE -> COMPLETE
+   [ga10bprobe3] bcr_dmacfg lock_locked=0 (raw=0x00000000) — 1 means the BCR is locked for this power cycle and rung 4 CANNOT reprogram it without a cold
+   [ga10bprobe3] opt_wpr_enabled=0x00000001
+A24 rung3b: lines=13 armed=1 write_announces=3 read_announces=2 mailbox_lines=1 wrote=0x5a5aa5a5 read=0x5a5aa5a5 held=1 mismatch=0 skipped=0 terminus=1 -> PASS A24-rung3b MAILBOX-HELD — a GA10B engine register accepted a write from this kernel and held it; the CCPLEX can drive this engine scratch state with the GSP halted
+   [ga10bprobe3b] mailbox0 wrote=0x5a5aa5a5 read=0x5a5aa5a5
+A24 STOP-CHECK: last announce at line 1125 of 3593 -> OK (the boot continued past it)
+   [ga10bprobe3b] about-to-read gsp_falcon_mailbox0 reg=0x17110040 (the scratch readback) — if this is the LAST line, THAT read was EL3-fatal
+A28 rootfs: mount=0 ok=0 bound=0 entries=0 refused=0 unafs_mount_errors=0 bootvol_enodev=0 (/fat 0, /boot 0) -> NOT-SCORED (no [sdmmc] root line — the ROOTFS fold is not aboard, or UNAOS_SDMMCROOT is off)
+A30 a30fix: pulsewin_open=1 close=0 close_final=0 app_menu_quit=0 (closed=true 0) dock_rearm=0 | latch_cleared_before_close: fields=0 zeros=0 | SPURIOUS RE-MINTS (open with no dock press since the close)=0 -> A30FIX NOT ABOARD — no close line carries `latch_cleared_before_close=`; this is the PRE-fold witness. Score the effective-features banner and the staged image before reading anything else here; the counts below are the render8 baseline, not a verdict on the fix.
+SO5 sprite: lines=5 same=0 cap=n=5/8 -> EXPECTED-TODAY (same=0 — the pal.rs one-liner is FILED UNAPPLIED pending the rmbp grant; the divergence is now on the wire, which is the fix's point)
+   [sprite] size=9x9 scale=1 over=window at (311,123) panel=1920x1200 compositor=9x9 backbuffer=18x18 same=0 n=5/8 (SO5 — two arrow sprites, two block sc
+A37 rxmerge: arm=1 census=93 policy=mbox-only dup=0 reorder=0 parked=10829432 per_byte=0 | side-effects [serialrx] polls=0 ovrf=0 -> PASS A37 SINGLE-SOURCE (exactly-once, in-order; parked=10829432 is the drain-liveness counter — polls=0 beside it is CORRECT, not a dead drain)
+   [rxmerge] policy=mbox-only armed=1 uartc-rbr=parked -> A37: one owner, one ordered stream (the parked reader is NOT read — an RBR read pops the byte a
+   [rxmerge] census policy=mbox-only seq=0 uartc=0 mbox=0 dup=0 reorder=0 parked=10829432 -> SINGLE-SOURCE (exactly-once, in-order: every byte came down one transport). EXPECTED SIDE EFFECTS un
+A34 crystal verb: restart_announce=0 restart_RETURNED=0 shutdown_announce=0 shutdown_RETURNED=0 | menubar geometry lines=1 -> GEOMETRY ONLY — A34 NOT EXERCISED: the Restart verb was never picked. It is the LAST step of the FLIGHT SEQUENCE and it reboots the board. (SO4/A33 is scored separately below.)
+A33/SO4 crystalfix: menubar_lines=1 anchor=left-flush=0 | menu_X=0 menu_Y=34 glyph_X=12 gap_left=0 bar_w=1920 | PRE-FOLD gap_right=/anchor=right-flush hits=0 -> FAIL — anchor= does not say left-flush-under-crystal; the rect may be right by accident but the RULE the code states is still the old one: [menubar] crystal menu=170x121+0+34 anchor=panel-left glyph=16x22+12 bar_w=1920 menu_x=0 glyph_x=12 gap_left=0 glyph_gap_left=12 ::
+   [menubar] crystal menu=170x121+0+34 anchor=panel-left glyph=16x22+12 bar_w=1920 menu_x=0 glyph_x=12 gap_left=0 glyph_gap_left=12 ::
+SR2/A36 prtscr3: armed=6 capturing=4 ok=4 slices=32 (last n=8) inflight_refusals=1 vanished=0 -> PASS SR2/A36 (sliced encode on the wire, 1 NAMED InFlight refusal(s), 4 files written — the render7 silent-drop gap is CLOSED)
+   :: PRTSCR: slice n=8 bytes=688128/6913793 ::
+   :: PRTSCR: refused — capture in flight (another task holds the capture door; a key request is re-armed and runs after it) ::
+SO1/A29 winid: wm_alloc=4 wm_close=0 holders_cleared_closes=0 register_REFUSED=0 | close-furniture=0 route-dropped=true=0 (last dropped id=n/a) quarry_open=1 (last id=2) wcgseam=4 -> INSTRUMENT PRESENT, GESTURE NOT MADE (no close-furniture on this boot)
+   [quarry] open win=2 surf=1152x720 ts=2 box=1162x764 at (379,183) volumes=1 tree-rows=9 list-rows=26 cwd=/
+   A29 wcgseam: present (4 line(s)) — the seam ran and is registered
+SO10/S4 shell-reopen: shell_pin_presses=0 drains=0 (target=shell 0, MISSING target= 0) minted=1 0 already-live 0 (id is a live shell 0, id is NOT 0) declined=0 | [wc-a] create asid=0xffffff02 (SHELL surfaces)=1 asid=0xffffff01 (console)=1 | drains resolving to a CONSOLE id=0 -> NOT-EXERCISED — the pinned SHELL tile was never pressed (FLIGHT SEQUENCE: close the console AND the shell, then press the dock's shell tile three times)
+A10/SO2/SO3 menubar2: open=0 (title-x=0 font=0) publish=1 with_app_menu=1 pick=0 quit_picks=0 app_menu_quit=0 closed=0 | dismiss=0 esc=0 outside=0 (KEY 0x1b seen=0) -> A10 NOT-EXERCISED — no KEY 0x1b on the wire; open a bar menu and press Esc (FLIGHT SEQUENCE step 7)
+   [winmenu] publish owner=3 titles=1 items=2 slot=0 replaced=false app-menu=default
+V-1..V-4 fixpanel: v3_contended_declines=0 winmenu_successes=1 (after a decline=0) winmenu_family_lines=24 -> PASS by survival (V-1/V-2/V-4): the bar published/opened 1x and the boot continued past the composite pass. V-3 UNEXERCISED — no lock contention occurred, which is the common case.
+-- render9 additions --
+SO11 chrome: pulsewin_open=1 chrome_w fields=0 (zero=0) | last surf_w=1280 box_w=1290 chrome_w=ABSENT | chrome_w-surf_w range=n/a..n/a | chrome_w != box_w on 0 line(s) -> SO11FIX NOT ABOARD — [pulsewin] open carries no `chrome_w=` field. This is the PRE-fold line, which is exactly what render8 flew: SO11 stays GLASS-ONLY and must be measured in the capture, not scored here.
+   [pulsewin] open win=3 panel=1920x1200 surf=1280x168 box=1290x212 at (10,914) view=Pi LED lamps (menu: `View` is in the MENU BAR — first option is the Pi's)
+PRTSCLOST kbdpoll: kbdpoll_lines=3 | PRTSCR down-edges on the wire=6 prtscr edges=6 ok=2 refused=0 (PRTSCR OK lines=4 refused lines=1) | restated=0 dup=0 nobuf=0 reports=13 armgap_us=72431 gapmax_us=1813369 | XHCINTD fields: rearm_before_decode on 0 line(s) outstanding=absent (EXPECTED on render9) skipped=absent (EXPECTED on render9) | verdicts REPORT-LOST=0 ARMGAP-WIDE=1 DUP-DROP=0 NOBUF-DROP=0 GUARD-REARM=0 ERROR-REARM=0 STREAMING=1 BASELINE=1 ARMED-NO-COMPLETION=0 -> FAIL — ARMGAP-WIDE (armgap_us=72431 gapmax_us=1813369): no report is lost YET, but the keyboard endpoint sat unarmed longer than a human press, so a press landing in that window would vanish with no line anywhere. The fault is the PUMP CADENCE. [kbdpoll] t=151 rearm=13 discard=0 errrearm=0 dup=0 nobuf=0 reports=13 base=3 decoded=10 restated=0 armgap_us=72431 gapmax_us=1813369 prtscr edges=6 o
+   [kbdpoll] t=151 rearm=13 discard=0 errrearm=0 dup=0 nobuf=0 reports=13 base=3 decoded=10 restated=0 armgap_us=72431 gapmax_us=1813369 prtscr edges=6 ok=2 refused=0 -> ARMGAP-WIDE (no report was lost YET, but the keyboard
+KEYDOORS (R24): DATUMS ONLY — KEY 0x09=0 tab-cycle=0 | KEY 0x1b=0 quarry_open=1 quarry_closed(esc token)=0 app-menu quit closes=0 winmenu dismiss reason=esc=0 -> NOT A VERDICT BY RULING R24. F0 (Tab focus-cycle) is RETIRED — the leg is dropped, and zero tab-cycle lines is a CORRECT decline (syscall.rs:13381, n=0 while every window is kernel-band furniture), never a defect. F1 (Esc closes Quarry) is RETRACTED — Esc dismisses MENUS only, and `quarry_closed` here counts ONLY the esc-close token: Quarry closing by app-menu Quit does not appear in it (render8 misread exactly that). Neither number can produce a FAIL. Score Esc-on-a-menu in the A10/SO2/SO3 block above, where reason=esc is the live question.
+   DRAGREL-A64 (A11 — STILL OPEN, a different question from the retired focus cycle): NOT-EXERCISED (grab a title bar and press TAB without releasing)
+   ⚠ SO9 IS FIXED AND HAS ITS OWN LEG NOW (63b109f6, `SO9 quarry key_route` below) — this note is kept only so a render8-era reading is not repeated here. The PRE-fold defect was: while Quarry is merely on the glass it takes the shells ENTER and BACKSPACE (key_route gated on on_glass(), quarry/live.rs:1887 = OPEN not FOCUSED), a shell Enter opened a FILE, and R24 withdrew the Esc workaround. THE RESIDUE IS SO14 AND IT IS NOT A DEFECT: a boot-opened Quarry HOLDS the keyboard until a click takes it, so `focus=1 took=1` before the shell window is CLICKED is correct. Score it on the SO9 leg, not here, and read that leg NOT-ANSWERABLE rather than FAIL if no click was made.
+SO12 cascadefit: fit lines=1 (FIT 1, OVERLAP 0, pulse=none 0) | console rect=1305x780+307+42 (DIFFERS between lines on 0) | pulse rect=1290x212+10+874 on 1 line(s) (DIFFERS on 0) | overlap_rows max=0, >0 on 0 line(s) | RELAXED lines=0 | [deskcascade] -> CASCADED=1 -> PASS SO12 ON THE BOOT LINE ONLY (overlap_rows=0, console=1305x780+307+42) — but the CONSOLE WAS NEVER RE-MINTED, so the second reading rmbp 14 asked for does not exist. THE COMPARISON IS THE MEASUREMENT AND IT HAS ONLY ONE OPERAND. Do sequence step 9 (close the console, press its tile) and read the fit line it emits.
+   [wc-x] console-window win=1 panel=1920x1200 surf=1295x736 box=1305x780 at (307,42) cell=7x16 cols=185 rows=46
+   [deskcascade] fit console=1305x780+307+42 pulse=1290x212+10+874 overlap_rows=0 -> FIT
+SO13 pinconsole: console=pin presses=0 | console-reopen drains=0 (minted=1 0, already-live 0, declined 0) | mints NOT backed by an asid=0xffffff01 create=0 | drains resolving to a SHELL id=0 | [wc-a] console surfaces=1 shell surfaces=1 | DOCK strip tiles=ABSENT (range n/a..n/a over 0 census line(s)) -> NOT-EXERCISED — the console pin was never pressed AND no drain ran. If the tile was not THERE to press, that is SO13 unfixed and it is a GLASS reading: say the strip fell by one on the console close (render8 shape) rather than scoring this line.
+   [wc-a] create win=1 asid=0xffffff01 surf=1295x736 stride=5180 scale=1x at (312,81) z=1
+SO17 consoletext: remint lines=1 (from=none 1, from=cells 0) | first mint from=none (CORRECT) | re-mints that RESTORED rows=0 (rows total 0) | re-mints reading repainted_rows=0=0 | from=none on a LATER mint=0 | retain=declined=0 -> PASS-WEAK ON THE FIRST MINT ONLY (from=none repainted_rows=0, which is the CORRECT first-mint shape) — but the console was NEVER RE-MINTED, so the question this fold exists for is UNANSWERED. Do sequence step 9: close the console with its disc, press its tile, and take a Print Screen straight after.
+   [fbcon] remint win=1 repainted_rows=0 from=none grid=185x46 was=0x0 cursor=0,0 retain=ok
+SHELLBASICS: [midden] cmd= dispatches=0 (TerminalOutput 0, Host 0, Exec 0) | of the SEVEN step-12 legs, dispatched: <none> | MISSING: help echo wc grep df which history | len=0 answers=0 | cmd word != Host verb on 0 | `not a verb on this build`=0 | probe spellings seen: OLD(bootlog/vfs/xd/usbinfo/netinfo/sched)=0 NEW(dmesg/mount/hexdump/lsusb/ifconfig/ps/dd)=0 -> NOT-EXERCISED — not one `:: [midden] cmd=` line on the wire. Either nothing was typed at the shell, or nothing typed reached dispatch. THAT SECOND CASE IS SO9/SO10/SO14 AND NOT A SHELL DEFECT: check for a shell window (SO10, `[wc-a] create … asid=0xffffff02`), then for `[quarry] key_route … focus=0 took=1` (SO9), then for whether the shell window was ever CLICKED (SO14). Score NOT-ANSWERABLE, never FAIL.
+SHELLRELICS R26c2: TSTE shell.relics.* legs=0 (PASS 0, FAIL 0) | shell.relics.help=0 (PASS 0) | help transcript lines captured=0 | STANDARD names MISSING from help: dmesg mount hexdump lsusb ifconfig ps | RETIRED names LEAKED into help: <none> | `not a verb on this build`=0 -> SHELLRELICS NOT ABOARD, OR `help` WAS NEVER TYPED — the two are not distinguishable from this wire and the leg will not guess. Read `# FOLDS ABOARD:` for SHELLRELICS/SHELLRELICS2 first: if it is aboard this reads NOT-EXERCISED and the stimulus is sequence step 12 (`help`, then one retired name). If it is NOT aboard, this ABSENT arm IS the answer.
+VFSROUTE fold8: TSTE vfsroute.* legs=0 (PASS 0, FAIL 0) | root-lists-no-file SKIP=0 | ls1 lines=0 (root=0, boot-prefix=0 as n/a) | ls1 ERR=0 | backend named in a verb answer=0 | u* duplicate verb dispatches=0 | same_volume=unread -> VFSROUTE NOT ABOARD, OR NOTHING WAS TYPED — no `vfsroute.` token and no `ls1` line on this wire. Check `# FOLDS ABOARD:` for VFSROUTE/VFSROUTE2: NOT ABOARD means this ABSENT arm IS the answer; ABOARD means the boot witness did not run AND step 12b was skipped, which is NOT-EXERCISED and not a FAIL.
+FSLAYOUT rename: BGRUN lines=0 (path=n/a; /apps 0, /fat 0; DETACHED 0, rejected 0) | ls1 /boot=0 (EFI 0, kernel.elf 0, APPS 0) | ls1 /fat=0 | ls1 /apps=0 | ENODEV: /fat 0, /boot|/apps 0 | sdmmc bind line: new(/boot) 0 old(/fat) 0 -> NOT-EXERCISED — no `run`, no `ls` of a boot prefix, AND no sdmmc bind line on this wire. Both typed readings are step 12b; the bind line is the only passive one and it is absent too, so score A28 first — if the root never mounted, the layout question has no ground to stand on.
+SO9 quarry key_route: lines=0 | focus=1 took=1 (Quarry has focus and bound it — CORRECT, and the SO14 pre-click shape)=0 | focus=1 took=0=0 | focus=0 took=0 (key on its way to the shell — the FIX working)=0 | focus=0 took=1 (SO9 BACK)=0 -> SO9FIX NOT ABOARD, OR NO KEY WAS PRESSED WHILE QUARRY WAS LIVE — the two are not distinguishable from this line alone and the leg will not guess. Check `# FOLDS ABOARD:` for SO9FIX; if it is aboard, this reads NOT-EXERCISED and the stimulus is sequence steps 11-12 (click the shell window, then type).
+SO16 wcgseam census: census lines=4 (armed=yes 4, armed=no 0) | glyphs max=2025 | routed yes/no=4/0 | rollup win != seam_win on 3 line(s) (last 4 vs 1) | verdicts CHARGED=4 QUIET=0 UNARMED=0 | [wc-g] rollup lines=4 | per-conviction [wcgseam] win= lines=0 -> CHARGED — FIRST RUNTIME READING ON THIS BOARD (4 line(s), glyphs max 2025): the seam is armed AND glyphs went through it. Every Orin boot to date read the per-conviction line as ABSENT, so this is new evidence, not a regression. Record the numbers in the flight result.
+   [wcgseam] census win=4 armed=yes glyphs=2025 locked=2025 seam_win=1 routed=yes -> CHARGED
+A43 supprtscr: `effective features` lines=0 (naming supstate=0) | [supstate] sweep services= lines=0 (prtscr:true 0, prtscr:false 0) | [supstate] roles=0 | pump path witness: jd2-supstate-phase2=0 jd2-console-pump=1 -> NOT-SCORED — no `effective features` banner on this wire, so which image booted cannot be established here. FLIGHT.md §C.1: score the banner and the ELF max_vaddr before any question in this file.
+-- end render9 scorers --

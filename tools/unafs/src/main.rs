@@ -135,7 +135,7 @@ enum Commands {
         img: String,
     },
     /// Read a file from a retained snapshot (K8c) under the LIVE object's
-    /// CURRENT ACL — the host mirror of the kernel `usnapcat` verb. The bytes
+    /// CURRENT ACL — the host mirror of the kernel `snap cat` verb. The bytes
     /// are served AS OF the snapshot, but authority is re-evaluated against the
     /// live object of the same logical id: a principal that cannot read it live
     /// cannot read the snapshot, and a live-DELETED object fails closed.

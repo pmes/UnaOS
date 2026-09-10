@@ -113,6 +113,13 @@ pub enum FatKind {
 /// on the presentation callers); a name whose UTF-8 would not fit falls back to its 8.3 short name.
 const LNAME_MAX: usize = 768;
 
+/// LAYOUT (orin 18): the on-medium directory that holds the launchable programs — the ESP's
+/// `APPS/`, bound in the namespace at `/apps` (`shell::EXEC_ROOT`). An 8.3 SHORT name by
+/// construction: this driver's create path writes 8.3 names only (VFAT LFN write is out of scope,
+/// see `fat_create_err`), the staging scripts (`arroyo`, `builder`, `make-fat-img.sh`) spell it the
+/// same way, and every lookup is case-insensitive, so `apps`/`Apps`/`APPS` on the wire all reach it.
+pub const APPS_DIR: &str = "APPS";
+
 /// A parsed directory entry. Carries the on-disk short (8.3) name (uppercase, e.g. `KERNEL.ELF`) and,
 /// when VFAT long-file-name (LFN) entries preceded it and validated (PI-FS-3), the decoded UTF-8 long
 /// name. `name()` returns the long name when present, else the short; `eq_name` matches EITHER, so a
@@ -534,7 +541,7 @@ pub struct FatFs {
     /// tampering is out of scope).
     vol_id: u32,
     /// PI-FS-5: `BS_VolLab`, the 11-byte volume label the formatter stamped into the boot sector (offset 0x2B on
-    /// FAT16, 0x47 on FAT32). Read-only; space-padded on disk, surfaced trimmed by [`FatFs::label`] for `diskinfo`.
+    /// FAT16, 0x47 on FAT32). Read-only; space-padded on disk, surfaced trimmed by [`FatFs::label`] for `fdiskfo`.
     /// A blank/`NO NAME    ` field renders as empty (the caller shows a `-` then).
     vol_label: [u8; 11],
     /// PIUSB-27: which block device every sector read of this volume routes to. `Default` for the
@@ -1917,7 +1924,7 @@ impl FatFs {
         self.kind
     }
 
-    /// One-line human summary of the parsed geometry (for `fatinfo` / boot log).
+    /// One-line human summary of the parsed geometry (for `mount` / boot log).
     pub fn describe(&self) -> String {
         let head = alloc::format!(
             "FAT{} vol@LBA{} volsec={} bps={} spc={} nfat={} fatsz={}sec reserved={} fat@LBA{} data@LBA{} clusters={}",
@@ -2104,14 +2111,14 @@ impl FatFs {
     }
 
     /// PI-FS-5: the volume's formatted usable capacity in bytes (`count_of_clusters * cluster_size`) — the
-    /// data-region size a `diskinfo` line reports for the FAT volume. Not the raw device size (which the block
+    /// data-region size a `fdisk -l` line reports for the FAT volume. Not the raw device size (which the block
     /// geometry gives): this is what the filesystem actually addresses.
     pub fn volume_bytes(&self) -> u64 {
         self.count_of_clusters as u64 * self.cluster_size() as u64
     }
 
     /// PI-FS-5: the trimmed `BS_VolLab` volume label (ASCII, space-padded on disk). Returns an empty string when
-    /// the field is blank or the conventional `NO NAME` placeholder, so `diskinfo` can show a `-` instead.
+    /// the field is blank or the conventional `NO NAME` placeholder, so `fdisk -l` can show a `-` instead.
     pub fn label(&self) -> String {
         let raw = core::str::from_utf8(&self.vol_label).unwrap_or("").trim_end_matches([' ', '\0']);
         if raw.is_empty() || raw == "NO NAME" {
@@ -2540,6 +2547,27 @@ impl FatFs {
         Err(FatError::NotFound)
     }
 
+    /// LAYOUT (orin 18): find a PROGRAM by name — an entry of the volume's [`APPS_DIR`] directory
+    /// (case-insensitive on both components). This is the FAT-direct twin of the namespace's
+    /// `/apps` mount (`shell::EXEC_ROOT`): the loaders and witnesses that bind a `FatFs` themselves
+    /// rather than the mount table (the EL0 slot loader, the U2/M6g flat loader, the desktop's
+    /// app launcher, the WINX/PULSE end-to-end witnesses) ask THIS, so the one definition of
+    /// "where programs live on the medium" is `APPS_DIR` and nothing else. A volume with no
+    /// `APPS/` directory answers `NotFound`, the same answer a missing program gives — there is
+    /// no fallback to the root, because a program the layout does not know is not a program.
+    pub fn find_app(&self, name: &str) -> Result<DirEntry, FatError> {
+        let dir = self.find_in_root(APPS_DIR)?;
+        if !dir.is_dir {
+            return Err(FatError::NotFound);
+        }
+        for de in self.read_dir(dir.first_cluster())? {
+            if de.eq_name(name) {
+                return Ok(de);
+            }
+        }
+        Err(FatError::NotFound)
+    }
+
     /// Read up to `max_bytes` of a file into `out` by following its cluster chain. Stops at
     /// `de.size`, `max_bytes`, or end-of-chain (whichever comes first). Guards against bad/free
     /// clusters and chain loops. Rejects a directory. A file whose chain ends before `de.size` (a
@@ -2551,7 +2579,7 @@ impl FatFs {
     /// contents with the file appended after them. Every caller that pre-sized its buffer from the
     /// directory (`vec![0u8; de.size]` — a natural reading of "read the file into this") therefore got
     /// a result of exactly `2 * de.size`, silently, with the file's real bytes sitting behind a run of
-    /// zeros. That is the doubling that blocked `bg /fat/STAT.ELF` and `bg /fat/VUG.ELF` on x86: the
+    /// zeros. That is the doubling that blocked `bg /apps/STAT.ELF` and `bg /apps/VUG.ELF` on x86: the
     /// directory said 8472 / 12568 and the loader was handed 16944 / 25136 — past the 16 KiB user
     /// window, so both were rejected as oversize. It read as time-dependent (early boot fine, later
     /// broken) only because the doubling is invisible until `2 * size` crosses a caller's cap: U2's
@@ -3837,7 +3865,7 @@ impl FatFs {
 
 /// One-shot boot probe: the first time a block device is present, mount the FAT volume and log its
 /// geometry to serial (captured on QEMU; visible on a serial-less metal boot only in bootlog /
-/// usbdebug builds — the interactive `fatinfo`/`ls`/`cat` commands are the metal evidence). Safe to
+/// usbdebug builds — the interactive `mount`/`ls`/`cat` commands are the metal evidence). Safe to
 /// call every main-loop iteration: it no-ops until storage is up, then runs exactly once.
 pub fn probe_once() {
     static PROBED: AtomicBool = AtomicBool::new(false);
@@ -4810,5 +4838,31 @@ pub fn fatgrow_witness_once() {
             ":: FATGROW: directory chain growth on slot exhaustion ({:?}) FAIL ::",
             e
         ),
+    }
+}
+
+// =========================================================================================
+// VFSROUTE (orin 17) — the mounted volume's own block source, appended at the FILE TAIL.
+//
+// A separate `impl FatFs` block rather than a method beside `source_name`, for the reason the rest
+// of this tree gives for tail appends: `fat.rs` is compiled into the knob-off `kernel8.img` and
+// `panic::Location` embeds source line numbers, so a method inserted mid-file moves every panic
+// site below it. A tail append moves nothing.
+//
+// WHY IT IS NEEDED. `mount_program_source()` resolves the block handle THE SHELL'S FILE VERBS MUST
+// USE (FATVERB's law: a verb and the exec probe bind the same handle), but it hands back a mounted
+// `FatFs` and keeps which handle it chose to itself. The shell's `vfs_mount_table()` has to rebuild
+// that same volume as a `crate::fs::vfs::FatBackend`, which is parametrized by `BlockSource` — so it
+// needs to ASK the mount which source it came from rather than re-deriving the precedence rule at a
+// second call site, which is exactly how `read_only` and the shell's write gate drifted apart
+// before `BlockSource::write_veto` became the one definition.
+// =========================================================================================
+
+impl FatFs {
+    /// VFSROUTE: the block source this volume is mounted through. The typed twin of
+    /// [`FatFs::source_name`], for a caller that must REBUILD the same mount through another
+    /// surface instead of merely printing which one it is.
+    pub fn source(&self) -> BlockSource {
+        self.source
     }
 }
