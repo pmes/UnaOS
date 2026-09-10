@@ -468,6 +468,22 @@ struct SchedCpu {
     /// on switch-back. Read (best-effort, Acquire) by a waker/spawner on another CPU to decide
     /// whether the newly-ready task outranks what's running and should preempt it.
     current_prio: AtomicU8,
+    /// SCHEDUAF (2026-08-27) — the ID of the task currently running here, or 0 for "no task" (task
+    /// ids start at 1, so 0 is never a live id). The tid twin of [`Self::current_prio`], and the x86
+    /// mirror of aarch64's `CUR_TID`: published by the OWNING core at the dispatch site beside the
+    /// `current_prio` store, cleared beside the `PRIO_IDLE` reset — BEFORE the `Box::from_raw` +
+    /// drop that may follow — so a cross-core reader can name the running task WITHOUT dereferencing
+    /// `current`.
+    ///
+    /// WHY: [`current_task_id`] originally loaded `current` and dereferenced `.id` from an arbitrary
+    /// caller-named CPU. `current` is a raw `*mut Task` whose Box `run()` reclaims on switch-back;
+    /// nothing synchronizes a foreign reader against that free, and the `sched`/`ps` shell caller
+    /// runs preemptible — a use-after-free read with a preemption-widened window, found by the
+    /// 2026-08-27 adversarial landing panel (the aarch64 twin had the identical defect). Racy by
+    /// construction and benign, exactly as `current_prio` is: at worst a reader catches a core
+    /// between dispatch and clear and reports a tid that has just stopped running — a bounded wrong
+    /// number in one operator table, never a read of freed memory.
+    current_tid: AtomicU64,
     /// "Park action" for a task switching back BLOCKED: `PARK_*`. Set by the blocking primitive
     /// before its switch, read-and-cleared by `run()` after. Same-CPU sequential, so `Relaxed`
     /// is sufficient (`switch_context` is the memory barrier between writer and reader).
@@ -533,6 +549,7 @@ impl SchedCpu {
             quantum: AtomicU32::new(0),
             need_resched: AtomicBool::new(false),
             current_prio: AtomicU8::new(PRIO_IDLE),
+            current_tid: AtomicU64::new(0),
             park_kind: AtomicU8::new(PARK_NONE),
             park_waiters: AtomicU64::new(0),
             park_lock: AtomicU64::new(0),
@@ -1094,6 +1111,124 @@ pub fn core_load(cpu: usize) -> CoreLoad {
         tracked,
         pegged,
         fold_age_ms,
+    }
+}
+
+/// One row of [`load_table`], snapshotted under IF=0 and formatted after. Separate from [`LoadRow`]
+/// on purpose: that one is the witness LINE's row — it carries the queue depth, which the witness
+/// prints and the table does not, and it drops the fold age and the task id, which the table prints
+/// and the witness does not. Fusing them would force one renderer to carry the other's columns.
+#[derive(Clone, Copy)]
+struct TopRow {
+    pct: u32,
+    tracked: bool,
+    pegged: bool,
+    sw: u64,
+    name: &'static str,
+    tid: u64,
+    age_ms: u64,
+}
+
+impl TopRow {
+    const fn blank() -> Self {
+        TopRow {
+            pct: 0,
+            tracked: false,
+            pegged: false,
+            sw: 0,
+            name: "-",
+            tid: 0,
+            age_ms: ACCT_MS_NEVER,
+        }
+    }
+}
+
+/// TOPPORT — the `top` shell verb's body on x86: the signature-matched twin of aarch64's
+/// `load_table`. One row per core — recent busy percent over the rolling window, cumulative context
+/// switches, how long since the core last folded a span, and the last task dispatched on it. Reads
+/// [`core_load`] per core: introspection only, allocation kept outside the interrupt-off snapshot,
+/// and nothing here is consulted on a scheduling path. Callable from any core.
+///
+/// SCHED-8's honesty rule is aarch64's, and is kept in behaviour rather than merely in spirit: a core
+/// with no live measurement renders `--`, never a percent and never a `0` a reader could take for
+/// idle.
+///
+/// THREE THINGS DIFFER FROM THE AARCH64 TABLE, AND EACH IS THE ARCH SPEAKING RATHER THAN DRIFT. The
+/// two tables are NOT symmetric, and this one must not pretend they are:
+///
+///   * THE PERCENT CARRIES A `*` WHEN IT WAS INFERRED. [`CoreLoad::pegged`] is documented as "read
+///     the two together or not at all" — the percent's provenance is part of the percent. A table
+///     printing `100%` for a measured window and `100%` for a deduced one would be exactly the blind
+///     instrument that field exists to prevent. The marker is [`emit_load_witness`]'s, chosen over a
+///     new column so that `top` and `[schedx86] load` say `100%*` with ONE meaning. aarch64 has no
+///     such column because it has no such field.
+///   * THE FRESHNESS COLUMN IS MILLISECONDS, because `fold_age_ms` is milliseconds — the ms clock is
+///     globally coherent on this arch and `rdtsc` is not (see the module note at `CoreAccount`).
+///     aarch64's field is cycles and its table would print cycles. NEITHER SIDE CONVERTS: the
+///     conversion needs a rate this code does not honestly hold, and inventing one is how a plausible
+///     number becomes a wrong one. The header names the unit, so a reader never has to infer which
+///     arch's table is on screen.
+///   * THE CENSUS IS [`meter_cpu_count`] — `min(acpi::cpu_count(), MAX_CPUS)`, the same span the
+///     shell's `sched`/`ps` arm walks and the same one `emit_load_witness` walks, so the three views
+///     of this machine agree on how many cores it has. When ACPI reports more than the table can
+///     hold, the cap is stated: a table that silently dropped its last cores would read as a shorter
+///     machine (R1/L4, the reason the witness line reports it too).
+pub fn load_table(mut line: impl FnMut(&str)) {
+    let seen = crate::arch::acpi::cpu_count().max(1);
+    let n = meter_cpu_count();
+
+    // Snapshot under IF=0, format afterwards — [`emit_load_witness`]'s discipline, for its reason:
+    // every column of a row must describe ONE instant, or a reader diffing a percent against the
+    // switch count beside it is diffing two different machines. Formatting allocates and paints, so
+    // it stays outside the mask.
+    let mut rows = [TopRow::blank(); MAX_CPUS];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for (c, row) in rows.iter_mut().enumerate().take(n) {
+            let ld = core_load(c);
+            *row = TopRow {
+                pct: ld.busy_pct_recent,
+                tracked: ld.tracked,
+                pegged: ld.pegged,
+                sw: ld.ctx_switches,
+                name: ld.last_task,
+                tid: ld.last_task_id,
+                age_ms: ld.fold_age_ms,
+            };
+        }
+    });
+
+    line("core   busy%   ctx-switches   fold-age(ms)   last-task");
+    for (c, row) in rows.iter().enumerate().take(n) {
+        let busy = if !row.tracked {
+            // SCHED-8: no live measurement -> the absence token. Not a percent, not a zero.
+            alloc::string::String::from("--")
+        } else if row.pegged {
+            // R1/H2: deduced, not counted — the same `*`, with the same meaning, as the witness line.
+            alloc::format!("{}%*", row.pct)
+        } else {
+            alloc::format!("{}%", row.pct)
+        };
+        // `ACCT_MS_NEVER` is a sentinel, not a duration: print what it MEANS rather than a
+        // 584-million-year age that would read, and sort, as a number.
+        let age = if row.age_ms == ACCT_MS_NEVER {
+            alloc::string::String::from("never")
+        } else {
+            alloc::format!("{}", row.age_ms)
+        };
+        line(&alloc::format!(
+            "{:>4}   {:>5}   {:>12}   {:>12}   {} (tid {})",
+            c, busy, row.sw, age, row.name, row.tid
+        ));
+    }
+    // The two non-numeric tokens the columns above can produce, spelled out once. Both are claims
+    // ABOUT the measurement rather than measurements, and a reader who does not know that reads `--`
+    // as idle and `100%*` as counted.
+    line("-- = no live measurement (core not dispatching); * = inferred, not measured");
+    if seen > n {
+        line(&alloc::format!(
+            "cores {}/{} shown — the table is capped at MAX_CPUS ({})",
+            n, seen, MAX_CPUS
+        ));
     }
 }
 
@@ -6024,6 +6159,11 @@ fn run() -> ! {
                 SCHED[cpu].current_prio.store(sched_prio(&task), Ordering::Release);
                 #[cfg(not(feature = "rtpi"))]
                 SCHED[cpu].current_prio.store(task.priority, Ordering::Release);
+                // SCHEDUAF: publish the running task's ID beside its priority, from the core that
+                // owns it, so a cross-core reader never has to touch `current`. See
+                // [`SchedCpu::current_tid`]. (The rtpi mid-run re-publishes above touch only the
+                // priority; the tid never changes while a task runs, so this single site suffices.)
+                SCHED[cpu].current_tid.store(task.id, Ordering::Relaxed);
                 // SPREADSETTLE: this core has work, so its continuous-idle clock stops. Cleared here
                 // — the single dispatch site — rather than in the empty-queue arm's success path, so
                 // a task arriving by ANY route (own pop, wake, spawn, or a steal that fell through
@@ -6153,6 +6293,10 @@ fn run() -> ! {
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
                 SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);
+                // SCHEDUAF: clear the published ID in the same breath, and BEFORE the
+                // `Box::from_raw` below whose drop may free the Task — so no cross-core reader can
+                // name a task this core is about to free. See [`SchedCpu::current_tid`].
+                SCHED[cpu].current_tid.store(0, Ordering::Relaxed);
                 // Consume the park action exactly once: read it and immediately reset to NONE, so a
                 // stale action can never leak into the next task's switch-back. Only a task that
                 // switched back BLOCKED has a meaningful action.
@@ -6577,15 +6721,34 @@ pub fn current_user_cr3() -> Option<u64> {
 }
 
 /// Id of the task currently running on a CPU, if any (best-effort; for introspection only).
+///
+/// SCHEDUAF (2026-08-27) — THIS FUNCTION WAS A USE-AFTER-FREE READ. It loaded `SCHED[cpu].current`
+/// and dereferenced `.id` — but `cpu` is caller-named, so this ran as a cross-core dereference of a
+/// raw `*mut Task` whose Box the owning core's `run()` reclaims on switch-back, with nothing
+/// synchronizing the foreign reader against that free. The `sched`/`ps` shell caller runs
+/// preemptible, so a timer preempt between the load and the deref stretched the window from two
+/// instructions to milliseconds. Found by the 2026-08-27 adversarial landing panel; the aarch64
+/// twin (`arch::aarch64::sched::current_task_id`) had the identical defect and carries the same
+/// fix, authored by the orin seat.
+///
+/// Now reads [`SchedCpu::current_tid`], the word the owning core publishes at dispatch and clears
+/// before the free — **zero pointer chase, zero `unsafe`**. Unlike [`current_name`] and
+/// [`current_user_cr3`], which stay on the deref because they are keyed to the CALLING cpu (a
+/// same-core read cannot race its own scheduler's IF=0 reclaim), this function's whole purpose is
+/// the foreign read, so it must go through the published word.
+///
+/// STILL RACY, AND THAT IS FINE — bounded, not eliminated: a reader can catch a core between
+/// dispatch and clear and get an id that has just stopped running, a stale tid in one operator
+/// table. `Relaxed` is the right strength for exactly that reason — there is no publication to
+/// order against any more, only a word to sample. 0 means "no task" and is never a live id
+/// (`NEXT_TID` starts at 1), so the `None` contract is unchanged.
 pub fn current_task_id(cpu: usize) -> Option<u64> {
     if cpu >= MAX_CPUS {
         return None;
     }
-    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
-    if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { (*raw).id })
+    match SCHED[cpu].current_tid.load(Ordering::Relaxed) {
+        0 => None,
+        id => Some(id),
     }
 }
 

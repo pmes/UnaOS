@@ -42,6 +42,29 @@
 REQUIRE \[wm-act\] direct .* -> PASS
 REQUIRE \[clickroute\] route .* -> PASS
 
+# --- PTRDEAD (SELFTEST-RACE, 2026-08-27) ------------------------------------------------------
+# --- WHY IT BELONGS HERE AND NOT IN x86-fat.spec. `ptrdead_selftest` is `witness`-gated, not
+# --- `wc`-gated, so it runs on the plain `./arroyo test` boot too — but this file's SCOPE is
+# --- `UNAOS_WC=1 ./arroyo test`, which is the gate the line was actually MEASURED on: 34 captures
+# --- across the SELFTEST-RACE experiment (`~/unaos-bench/scratch/rmbp7/selftest/runs/`), present
+# --- and well-formed on every one. Putting a REQUIRE where it has been executed is the rule
+# --- x86-fat.spec's own DMG-REFUSE note asks for and could not follow (no `mtools` on that host).
+# --- WHAT IT GATES that the default FORBIDs cannot: ABSENCE. `[ptrdead] ... -> FAIL` was already
+# --- caught by the harness default-forbids rule (x86-fat.spec:55 is where those defaults are
+# --- written down), but a fixture that stops running prints nothing and passes silently — the exact
+# --- hole the storage witnesses and DMG-REFUSE each had to close.
+# --- `skip` is an accepted value for the three legs and is the point of the SELFTEST-RACE change:
+# --- `pal::EVENT_QUEUE` is shared and this fixture does not own it, so a run whose window was
+# --- raided by a competing drain says so and declines to judge rather than convicting the fold.
+# --- The VERDICT token stays PASS/FAIL — never a third value — so this REQUIRE gates presence AND
+# --- health, and a `-> FAIL` still reds through the default rule. Measured: 4 raced windows in 34
+# --- runs, each carrying a nonzero `fpop`; 30 clean runs with `fpop12=0 fpop3=0`.
+REQUIRE \[ptrdead\] backlog whole=(true|skip) nodrop=(true|skip) order=(true|skip) .* fpop12=-?[0-9]+ fpop3=-?[0-9]+ .* -> PASS
+# --- The one shape a skip must never hide: a run that skipped EVERY leg tested nothing. `fpop` is
+# --- charged per stolen event, so all three legs skipping at once is a machine this fixture cannot
+# --- be run in at all, and that should be looked at rather than passed.
+FORBID \[ptrdead\] backlog whole=skip nodrop=skip order=skip
+
 # --- DMGOVLP: the one verdict line, in its exact grammar --------------------------------------
 # passes: presents that ran; drained: passes whose damage set CLOSED within K extra composites;
 # drag_evt/drag_px (RAW pixels — dkpx would round the slivers to 0): the closure's promotion arm
@@ -62,6 +85,23 @@ FORBID \[dmgovlp\] DRAIN-STUCK
 # there is no honest SKIP, so one appearing means the fixture lost its panel or its geometry —
 # a red, not a shrug.
 FORBID \[dmgovlp\].*SKIP
+
+# --- VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness ------------------------
+# The ladder's tail after DMGOVLP. Flight-1 Q4's gap: nothing witnessed that a vug's FIRST present
+# after a `[vugpause2]` resume edge actually happened. The fixture drives one real pause/resume
+# cycle per arm: a task parked on the input futex, released by a real `set_hidden` unhide edge.
+# Leg 1 must print the positive line (a measured resume→first-present gap); leg 2 arms the witness
+# and never presents, so the backstop must print the negative naming the furthest stage — for the
+# fixture's silent task that stage is deterministic: park-return. The verdict gates that both LINES
+# printed (emit counters), not merely that the state machine cycled. No numerics pinned: gap_ms is
+# scheduler time under TCG and varies run to run.
+REQUIRE \[vugres\] first present win=\d+ asid=\d+ gap_ms=\d+
+REQUIRE \[vugres\] NO PRESENT since resume win=\d+ — request lost at park-return .* asid=\d+ gap_ms=\d+
+REQUIRE \[vugres\] selftest pos=true neg=true -> PASS
+FORBID \[vugres\] selftest.* -> FAIL
+# A SKIP here is a fixture that lost its panel or its window rows — on this spec's own gate there
+# is no honest SKIP (same rule as DMGOVLP above).
+FORBID \[vugres\] selftest -> SKIP
 
 # TILEFIT — two windows handed the same box. PULSE-2's last-resort clamp is idempotent, so once the
 # greedy flow overflows the work area every later row pins to the same y and restarts cx at GAP: the

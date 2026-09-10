@@ -190,6 +190,17 @@ wcg-paygo = []
 # Requires `witness` (the WC-D machinery it throttles is witness-gated); x86_64 only. DEFAULT OFF =>
 # every valve item is compiled out and the build is byte-identical. Enable via `UNAOS_WCDVALVE=1`.
 wcdvalve = []
+# PHASE31ROOT (BAR1 wedge experiment, arm 1): retype the panel-aperture leaves UC (PAT PA3,
+# PCD=1 PWT=1 PAT=0) instead of WC (PAT PA4) at the one site that types them
+# (`arch/x86_64/memory.rs set_framebuffer_wc`). Memory TYPE only — no permission bit, no MTRR.
+# The M1-vs-{M2,M3} discriminator of docs/dev/OS/08_VIDEO/phase31-root.md §6: a wedge-free armed
+# flight (>=32M retired blits) convicts the WC drain; a strike under UC exonerates memory type and
+# points at PCIe credits / the GPU window path. Expected cost while armed: ~6.8x slower aperture
+# writes (1.11 GB/s -> ~162 MB/s measured), single-digit fps — an experiment, not a shipping mode.
+# x86_64 only (its sole cfg sites are in arch/x86_64/memory.rs). DEFAULT OFF => the armed tokens
+# are not compiled and the baseline path is the pre-arc bytes. Enable via `UNAOS_BAR1EXP=uc`.
+# Kept in sync with arroyo and builder/src/main.rs (both refuse unknown modes loudly).
+bar1exp-uc = []
 # Skip xHCI/USB bring-up entirely (`pci::init`). For real-hardware video bring-up where the
 # firmware/SMM may still own the xHCI controller (this branch has no BIOS->OS handoff) and wedge
 # its reset handshake — the controller's status bits never flip, so the bounded-but-slow timeout
@@ -810,11 +821,11 @@ tegrasmp = ["tegra"]
 # Tegra234 silicon — the xcarve/tegrasmp precedent), so `UNAOS_ORINWDT=1 ./arroyo check` is
 # self-sufficient. DEFAULT OFF => the module + both call sites vanish (both are statements
 # APPENDED to existing `tegra_early_stop` lines, so no panic Location shifts; the knob-off
-# image carries ZERO `[orinreboot] wdt` strings — measured — while the arc's UNCONDITIONAL
+# image carries ZERO `[orinwdt] wdt` strings — measured — while the arc's UNCONDITIONAL
 # half, the power.rs verbs, ships in every image by design, so knob-off is NOT byte-identical
 # to the pre-arc baseline and does not claim to be). The ARMED polarity is type-checked by the
 # `arm-tegra-orinwdt` leg of KERNEL_CFG_MATRIX in `arroyo`, never by the knob mapping.
-# Witness family: `[orinreboot]` (the arch-neutral reboot VERB in power.rs shares it).
+# Witness family: `[orinwdt]` — its own since PWRNAME; the arch-neutral reboot VERB in power.rs is `[pwrreboot]`.
 orinwdt = ["tegra"]
 
 # JETSON-EL0 (M1b): the Jetson Orin (Tegra234) EL0/userspace chain. Through M1a the tegra path reached

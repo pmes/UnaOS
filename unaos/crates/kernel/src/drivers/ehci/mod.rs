@@ -827,10 +827,20 @@ pub struct Controller {
     /// `Target`, its HCI interface number, and the event endpoint's max packet size. The event QH
     /// itself was spliced into the periodic list exactly once (`bt_arm_events`/`bt_evt_armed`) and
     /// is REUSED, not re-armed — so nothing here needs to describe it beyond the mps a fresh read
-    /// is sized from. `None` until `bt_probe` claims a radio; a controller with no radio never
-    /// re-triggers, and the drain in `service_ehci_hid` skips it.
+    /// is sized from. `None` until `bt_probe` claims a radio; a controller with no radio and no
+    /// pended candidate (`bt_pending`, BTCLAIM D-4) never re-triggers, and the drain in
+    /// `service_ehci_hid` skips it.
     #[cfg(feature = "bt")]
     bt_radio: Option<BtRadio>,
+    /// BTCLAIM (D-4) — a Bluetooth CANDIDATE whose phase-0 full-descriptor re-read failed even
+    /// after `BT_CFG_REREAD_ATTEMPTS`, so NO radio was claimed this boot: the device `Target`
+    /// and its `config_value`, which is everything `bt_probe` needs to be re-driven from the
+    /// top. This is what makes the recovery hatch reachable — before it, `bt_radio = None`
+    /// meant the re-trigger drain skipped the controller and the failure was permanent by
+    /// construction. Written on the re-read's final failure; cleared at `bt_probe`'s claim, so
+    /// a later successful re-drive retires it. `None` on every boot where phase 0 succeeds.
+    #[cfg(feature = "bt")]
+    bt_pending: Option<(Target, u8)>,
     /// BT-RETRY — a bring-up chain is running on this controller RIGHT NOW. `bt_retrigger` checks
     /// it and DECLINES rather than starting a second overlapping chain. Under the current
     /// synchronous service model a chain runs to completion inside one `service_ehci_hid` pass, so
@@ -2671,6 +2681,19 @@ const BT_CENSUS_MAX: usize = 12;
 /// BT-L0B — bound on endpoints listed per interface in the census line.
 #[cfg(feature = "bt")]
 const BT_EP_MAX: usize = 8;
+/// BTCLAIM (D-4) — attempts for the phase-0 FULL config re-read. Flight 1 boot 1 showed one
+/// failed control-IN here permanently voiding the radio for the whole boot: no retry existed,
+/// and the failure line said "claimed and stopped" when nothing was claimed. The re-read is a
+/// GET_DESCRIPTOR on EP0 — idempotent by definition — so re-issuing it is bring-up hygiene,
+/// not new protocol. Three attempts, each already bounded by `control`'s own wait budgets.
+#[cfg(feature = "bt")]
+const BT_CFG_REREAD_ATTEMPTS: u32 = 3;
+/// BTCLAIM (D-4) — settle between re-read attempts, milliseconds. Short on purpose: the
+/// failure mode being retried is a transient control-IN miss during enumeration, not a device
+/// that needs recovery time; 10 ms is ~2 full-speed frames of breathing room and costs a
+/// worst case of 20 ms per boot, only on the failure path.
+#[cfg(feature = "bt")]
+const BT_CFG_REREAD_DELAY_MS: u64 = 10;
 
 /// BT-L0B — one interface descriptor as the census/selection walk sees it.
 ///
@@ -4995,8 +5018,45 @@ impl Controller {
         let have = cfg.len() as u16;
         // The parameter `cfg` is DEAD past this point; the shadow is the only descriptor read.
         let cfg: &[u8] = if want > have {
-            match self.control(t, 0x80, 6, 0x0200, 0, want, true) {
-                Ok(n) if n >= 9 => {
+            // BTCLAIM (D-4) — bounded retry. Flight 1 boot 1: ONE failed control-IN here voided
+            // the radio for the whole boot, because this read had no second chance and its
+            // failure line claimed a claim that never happened. GET_DESCRIPTOR on EP0 is
+            // idempotent, so re-issuing it changes no protocol state; each attempt is already
+            // bounded inside `control`, and the inter-attempt settle is `BT_CFG_REREAD_DELAY_MS`.
+            let mut got: Option<u32> = None;
+            for attempt in 1..=BT_CFG_REREAD_ATTEMPTS {
+                match self.control(t, 0x80, 6, 0x0200, 0, want, true) {
+                    Ok(n) if n >= 9 => {
+                        if attempt > 1 {
+                            serial_println!(
+                                ":: bt-l0: [{}] addr {} full config re-read RECOVERED on attempt {}/{} — the transient miss below cost only its own settle == witness ::",
+                                self.idx, t.addr, attempt, BT_CFG_REREAD_ATTEMPTS
+                            );
+                        }
+                        got = Some(n);
+                        break;
+                    }
+                    r => {
+                        serial_println!(
+                            ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) attempt {}/{} failed ({}) ::",
+                            self.idx, t.addr, wtotal, attempt, BT_CFG_REREAD_ATTEMPTS,
+                            match r {
+                                Ok(_) => "runt reply: fewer than the 9 bytes even a bare config header needs",
+                                Err(e) => e,
+                            }
+                        );
+                        if attempt < BT_CFG_REREAD_ATTEMPTS {
+                            let start = crate::arch::now_cycles();
+                            let budget = Self::bt_l3_budget(BT_CFG_REREAD_DELAY_MS);
+                            while crate::arch::now_cycles().wrapping_sub(start) < budget {
+                                core::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+            }
+            match got {
+                Some(n) => {
                     // A short control IN (9 <= n < want) is a TRUNCATED census, not a complete one —
                     // review C4: without this the walk would read fewer bytes than the descriptor
                     // declares and the census would claim the whole device silently.
@@ -5006,10 +5066,19 @@ impl Controller {
                     }
                     core::slice::from_raw_parts(self.data_buf, (n as usize).min(BT_CFG_MAX as usize))
                 }
-                _ => {
+                None => {
+                    // BTCLAIM (D-4) — the honest terminal line. The old text said "claimed and
+                    // stopped": FALSE — no census ran, no interface was selected, no
+                    // SET_CONFIGURATION was issued, `bt_radio` stayed `None`. All this path ever
+                    // did (and still does) is WITHHOLD the device from the HID path, which is
+                    // correct — it wears a Bluetooth candidate class and has no HID interface to
+                    // arm — and the line now says exactly that. Pending the candidate is what
+                    // makes `bt_retrigger` reachable: the drain used to skip a radio-less
+                    // controller, so this failure was permanent by construction.
+                    self.bt_pending = Some((*t, config_value));
                     serial_println!(
-                        ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) FAILED — only the 64-byte HID-path view exists; claimed and stopped ::",
-                        self.idx, t.addr, wtotal
+                        ":: bt-l0: [{}] addr {} full config re-read (wTotalLength={}) FAILED {}x — NO RADIO THIS BOOT: nothing was claimed (no census, no SET_CONFIGURATION, no HCI); the device is only WITHHELD from the HID path (Bluetooth candidate class, no HID interface). Candidate PENDED — a bt-retry chord re-drives the full probe without a reboot == witness ::",
+                        self.idx, t.addr, wtotal, BT_CFG_REREAD_ATTEMPTS
                     );
                     return true;
                 }
@@ -5273,6 +5342,9 @@ impl Controller {
         // boot path, after selection claimed the radio and the event endpoint is up — the one
         // place all four facts are known and true.
         self.bt_radio = Some(BtRadio { target: *t, intf, evt_ep, evt_mps });
+        // BTCLAIM (D-4): a claim retires any pended candidate — relevant only when this probe
+        // was re-driven by `bt_retrigger` after a boot whose phase-0 re-read failed out.
+        self.bt_pending = None;
         self.bt_bringup_wire(t, intf, &e);
         true
     }
@@ -5708,8 +5780,15 @@ impl Controller {
     /// (`bt_bringup_wire`: scan -> select -> page -> C1 -> C2 -> teardown) against the radio this
     /// controller claimed at boot, on demand rather than only once. Declines, each witnessed and
     /// each falsifiable:
-    ///   * no radio claimed on this controller -> nothing to run (the drain skips it before here);
+    ///   * no radio claimed AND no candidate pended -> nothing to run (the drain skips it);
     ///   * a chain already in flight (`bt_chain_busy`) -> do not start a second.
+    /// BTCLAIM (D-4): no radio but a PENDED candidate (`bt_pending` = `Some`) is the third case —
+    /// the boot probe found a Bluetooth candidate whose phase-0 full-descriptor re-read failed
+    /// out, so nothing was ever claimed. That used to be permanent: the drain skipped a
+    /// radio-less controller and this function's own guard returned silently, so the hatch was
+    /// unreachable in exactly the failure it existed for. Now the pended coordinates re-drive
+    /// the WHOLE probe — stub read, full re-read (with its retry), census, claim, bring-up —
+    /// which is the boot path re-run, not a new path.
     /// A classic link left up from an earlier run (`bt_left_link` = `Some`) is NOT a permanent
     /// decline — that would be the very "reboot to pair a speaker" this arc exists to abolish (a
     /// speaker powered off ungracefully leaves the disconnect unconfirmed, so the latch would wedge
@@ -5722,6 +5801,45 @@ impl Controller {
     #[cfg(feature = "bt")]
     unsafe fn bt_retrigger(&mut self, source: u32) {
         let Some(radio) = self.bt_radio else {
+            // BTCLAIM (D-4): the reachable hatch. No radio was claimed this boot; if a candidate
+            // is pended, re-drive the full probe against it. The stub read below is the same
+            // capped GET_DESCRIPTOR view `configure_hid` hands the boot-path probe, so
+            // `bt_probe` runs its own gate, full re-read (retry included), census, and claim
+            // exactly as at boot; on a claim it clears `bt_pending` itself.
+            let Some((t, config_value)) = self.bt_pending else {
+                return;
+            };
+            if self.bt_chain_busy {
+                serial_println!(
+                    ":: bt-retry: [{}] src={} DECLINED — a bring-up chain is already in flight on this controller; not starting a second == witness ::",
+                    self.idx, source
+                );
+                return;
+            }
+            serial_println!(
+                ":: bt-retry: [{}] src={} PENDED CANDIDATE addr={} — boot phase-0 re-read failed out and no radio was claimed; re-driving the FULL probe (stub -> full re-read -> census -> claim -> bring-up) == witness ::",
+                self.idx, source, t.addr
+            );
+            match self.control(&t, 0x80, 6, 0x0200, 0, 64, true) {
+                Ok(n) if n >= 4 => {
+                    let cfg: &[u8] =
+                        core::slice::from_raw_parts(self.data_buf, (n as usize).min(64));
+                    let claimed = self.bt_probe(&t, cfg, config_value);
+                    serial_println!(
+                        ":: bt-retry: [{}] src={} PENDED CANDIDATE outcome — probe returned, radio {} == witness ::",
+                        self.idx, source,
+                        if claimed && self.bt_radio.is_some() {
+                            "CLAIMED; the bring-up chain above is its first"
+                        } else {
+                            "still NOT claimed; the candidate stays pended and the lines above say why"
+                        }
+                    );
+                }
+                _ => serial_println!(
+                    ":: bt-retry: [{}] src={} PENDED CANDIDATE addr={} — the 64-byte stub read itself failed; the candidate stays pended and nothing ran == witness ::",
+                    self.idx, source, t.addr
+                ),
+            }
             return;
         };
         if self.bt_chain_busy {
@@ -13440,6 +13558,14 @@ impl Controller {
         // still records each one.
         let mut clear_halts: [Option<(usize, Target, u8)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
         let mut n_clr = 0usize;
+        // DEADKBD5: endpoints RETIRED during this pass, deferred for the same borrow reason as the
+        // two arrays above — the consequence line needs a scan over the SIBLING endpoints ("what
+        // does input ride now?"), which the `iter_mut()` walk rules out. Entries are `(the halted
+        // endpoint's device address, its endpoint number, is-it-a-keyboard)`; both retire sites
+        // feed it (the in-walk unrecoverable halt, and the post-walk refused §9.4.5 clear), so the
+        // one witness covers every way an endpoint leaves this boot.
+        let mut retired: [Option<(u8, u8, bool)>; MAX_INT_EPS] = [None; MAX_INT_EPS];
+        let mut n_ret = 0usize;
         #[cfg(feature = "mtraw")]
         let mut mt_dumped = if self.mt_probe.is_some() { Some(self.mt_dumped) } else { None };
         // EHCIDARK — ONE clock read for the whole pass, shared by every endpoint. The census is about
@@ -13644,6 +13770,13 @@ impl Controller {
                                 break;
                             }
                             e.dead = true;
+                            // DEADKBD5: record the retire for the post-walk consequence line. The
+                            // STOP-NOTE above says WHAT died; the deferred line says what that
+                            // MEANS — which surviving endpoint input rides now, or that none does.
+                            if n_ret < retired.len() {
+                                retired[n_ret] = Some((h_addr as u8, h_ep as u8, e.is_kbd));
+                                n_ret += 1;
+                            }
                             // EHCI-KEYUP F2: the endpoint is retired for the rest of the boot — this loop
                             // `continue`s past a `dead` entry forever after — so any key down at this instant
                             // would NEVER receive its release. Flush them. See `flush_held_releases` for why
@@ -14053,8 +14186,68 @@ impl Controller {
                     let ctl = self.idx;
                     let e = &mut self.int_eps[ep_i];
                     e.dead = true;
+                    // DEADKBD5: this is the second retire site — a device that refused §9.4.5's
+                    // own recovery leaves the boot exactly as an unrecoverable halt does, so it
+                    // owes the same consequence line (emitted just below, after this borrow ends).
+                    if n_ret < retired.len() {
+                        retired[n_ret] = Some((t.addr, ep, e.is_kbd));
+                        n_ret += 1;
+                    }
                     flush_held_releases(e, ctl);
                 }
+            }
+        }
+        // DEADKBD5 (flight-3 postmortem, 2026-08-27) — the retire CONSEQUENCE, stated at retire
+        // time. Flight 3 retired `addr=5 ep=IN1 kind=kbd` at 26410 ms with an `xact-err-burn`, and
+        // the postmortem had to reconstruct from the 1743 ms census that this was `05ac:820a` — the
+        // Broadcom card's BT HID-proxy keyboard, carrying NO bonded peer and therefore no input —
+        // and that the internal keyboard (`05ac:0262`, addr=8) still carried the flight. That
+        // join should not need an analyst: the driver knows, in the same pass, which same-role
+        // endpoints are still alive. One line per retire says so. Role is keyboard vs pointer
+        // (`is_kbd` — the split `flush_held_releases` and the decoders already live by); the
+        // survivor's address is its EP0 tuple captured at arm time, its endpoint number the QH's
+        // own `ep_chars`, decoded the same way the halt walk decodes the corpse's. The scan runs
+        // AFTER both retire sites so two same-role endpoints dying in one pass each truthfully
+        // report the other gone. Retires are once-per-endpoint-per-boot, so this prints at most
+        // `MAX_INT_EPS` lines a boot — on the bench, exactly the two BT-proxy lines (see BTPROXY:
+        // the proxies' burn is expected and their loss costs nothing, which is precisely what
+        // `pointer input rides addr=8 ...` now says out loud instead of leaving it to the corpus).
+        for slot in retired.iter().take(n_ret) {
+            let Some((r_addr, r_ep, r_kbd)) = *slot else { continue };
+            let role = if r_kbd { "keyboard" } else { "pointer" };
+            let mut survivors = 0u32;
+            let (mut s_addr, mut s_ep) = (0u8, 0u32);
+            for s in self.int_eps.iter() {
+                if s.dead {
+                    continue;
+                }
+                // Same INPUT ROLE only: a live trackpad is no consolation for a dead keyboard.
+                // `unknown`-kind endpoints (no boot protocol, no parsed layout) are counted as
+                // pointers here because that is the side `flush_held_releases` ignores them on.
+                if (r_kbd && !s.is_kbd) || (!r_kbd && s.is_kbd) {
+                    continue;
+                }
+                if survivors == 0 {
+                    s_addr = s.kbd_target.addr;
+                    s_ep = (core::ptr::read_volatile(&(*s.qh).ep_chars) >> 8) & 0xF;
+                }
+                survivors += 1;
+            }
+            if survivors == 0 {
+                serial_println!(
+                    ":: EHCI-HID: [{}] RETIRE-CONSEQUENCE addr={} ep=IN{} role={} is out for the rest of this boot — NO live {} endpoint remains on this controller at this pass (a later M2 arm supersedes this line) == witness ::",
+                    self.idx, r_addr, r_ep, role, role
+                );
+            } else if survivors == 1 {
+                serial_println!(
+                    ":: EHCI-HID: [{}] RETIRE-CONSEQUENCE addr={} ep=IN{} role={} is out for the rest of this boot — {} input rides addr={} ep=IN{} only == witness ::",
+                    self.idx, r_addr, r_ep, role, role, s_addr, s_ep
+                );
+            } else {
+                serial_println!(
+                    ":: EHCI-HID: [{}] RETIRE-CONSEQUENCE addr={} ep=IN{} role={} is out for the rest of this boot — {} input rides {} live endpoints (first addr={} ep=IN{}) == witness ::",
+                    self.idx, r_addr, r_ep, role, role, survivors, s_addr, s_ep
+                );
             }
         }
         // MT-INVESTIGATION (IVY): the endpoint borrow is released here, so the EP0 restore is safe
@@ -15024,6 +15217,20 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 // out they now emit `SILENCE-CUT-BY-HALT ... class=xact-err-burn` plus a `dead=1` roster dump; on
 // the 3 boots they sit Active they already emitted the ordinary dump. Either way `reports_prior=0`
 // is on the line, and this comment says what that zero means.
+//
+// DEADKBD5 (flight-3 postmortem, 2026-08-27) — the identification above CONFIRMED against flights
+// 3 and 4, and the usage-0x46 book closed on it. All three boots in the two captures
+// (`rmbp7-flight3` @ 26410 ms; `rmbp8-flight4` @ 16224 ms and @ 12612 ms) retire the pair with the
+// SAME tokens as the 37-boot corpus — `0x00088141` / `0x00048141`, CERR burned, TT ERR,
+// `reports_prior=0` — so the burn is deterministic, not a flight-3 event. `addr=5 05ac:820a` is
+// NOT a second interface of the internal keyboard (`05ac:0262`, addr=8 — a different physical
+// device on a different TT port): it is the HID proxy, and a proxy relaying a bonded BT boot
+// keyboard COULD in principle emit any boot-protocol usage, 0x46 included. But it has never
+// carried a byte, its death precedes any chance to, and UnaOS drives the card through raw HCI
+// (reading (b) above), so no 0x46 — and no usage at all — was ever available on this path. The
+// 0x46 question is answered by addr=8 alone. What retire now says out loud is the CONSEQUENCE:
+// see RETIRE-CONSEQUENCE in `service`, which names the surviving same-role endpoint at the moment
+// the corpse is retired, so the next postmortem does not have to re-derive "input rides addr=8".
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -16194,6 +16401,19 @@ unsafe fn decode_boot_keyboard(
     // seconds, which is the argument `holocron`'s deferred write already makes at its call site.
     if super::xhci::hid_print_screen_edge(&cur_keys, prev_keys) {
         serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::");
+        crate::video::prtscr::request();
+    } else if let Some(chord) =
+        super::xhci::hid_screenshot_chord_edge(&cur_keys, prev_keys, modifiers)
+    {
+        // PRTSCRCHORD: ⌘⇧3 / ⌘⇧4 — the Apple chords, because the rMBP's internal keyboard has no
+        // Print Screen key and so never puts 0x46 on this wire. Same shared predicate shape, same
+        // request, same deferral; `modifiers` is this report's byte 0, already in scope. `else if`
+        // so a report carrying both 0x46 and a chord arms exactly once. The chord types nothing:
+        // `ascii_of` above folds any GUI-held usage to 0 (see `hid_screenshot_chord_edge`).
+        serial_println!(
+            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on EHCI -> capture armed ::",
+            chord
+        );
         crate::video::prtscr::request();
     }
 
@@ -17386,6 +17606,9 @@ pub fn init() {
                         // boot-path `bt_probe` (and, for the link, `bt_c1_page`) says otherwise.
                         #[cfg(feature = "bt")]
                         bt_radio: None,
+                        // BTCLAIM (D-4): no candidate pended until a phase-0 re-read fails out.
+                        #[cfg(feature = "bt")]
+                        bt_pending: None,
                         #[cfg(feature = "bt")]
                         bt_chain_busy: false,
                         #[cfg(feature = "btc")]
@@ -17862,7 +18085,10 @@ pub fn service_ehci_hid() {
         if src != 0 {
             let mut serviced = false;
             for c in ctrls.iter_mut() {
-                if c.bt_radio.is_some() {
+                // BTCLAIM (D-4): a pended candidate (phase-0 re-read failed out at boot, no
+                // radio claimed) is as much a re-trigger target as a claimed radio — it is the
+                // case the hatch exists for. `bt_retrigger` tells the two apart itself.
+                if c.bt_radio.is_some() || c.bt_pending.is_some() {
                     unsafe { c.bt_retrigger(src) };
                     serviced = true;
                     break;
@@ -17870,7 +18096,7 @@ pub fn service_ehci_hid() {
             }
             if !serviced {
                 serial_println!(
-                    ":: bt-retry: request src={} but NO controller claimed a radio at boot — there is no chain to re-run == witness ::",
+                    ":: bt-retry: request src={} but NO controller claimed a radio at boot and none holds a pended candidate — there is no chain to re-run == witness ::",
                     src
                 );
             }
