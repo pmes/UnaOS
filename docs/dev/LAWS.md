@@ -139,6 +139,17 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   board": `virt` is the ONLY runtime aarch64 proof available without hardware, and therefore the only runtime
   coverage the Jetson can ever get. The arm usb-write witness is not a boot at all — it is an assertion ON the v2
   capture, the second-order orphan the unowned-leg mechanism produced.
+  ⚠ **`virt` IS NOT A BOARD, and that distinction closes a hole R39 would otherwise open** (orin 25, 2026-09-10,
+  who measured the coverage and then declined the legs anyway). It is a generic QEMU machine no seat owns
+  hardware for, so it is nobody's PLATFORM and R39's words are about one platform debugging another. The case:
+  jetson lands shared aarch64 code, no aarch64 peer is awake, jetson's own legs are build-only — and the landing
+  carries ZERO runtime evidence. Both peers were dormant for hours on 2026-09-10, so it is not hypothetical.
+  **Therefore: the virt legs are PI's to run and ack in the normal case; ANY aarch64 seat may run them FOR ITS
+  OWN LANDING when no aarch64 peer is available, and says so in the ack. Running them for another seat's board
+  stays banned outright.** What is at stake is measured, not asserted: across `c7407753..751cb816`, virt cannot
+  execute the 696 changed lines of tegra-named files but does execute the other 617 of the aarch64 arch surface
+  and all ~7,700 changed lines of shared kernel (`shell.rs` 7256, `main.rs` 405). **The virt legs are the only
+  runtime evidence that exists for most of what an aarch64 landing changes.**
   **A LANDING IS THREE GREENS AT ONE SHA, NOT ONE SEAT'S BATTERY** — each seat runs its own board in its own tree
   and acks with the command and the result.
   ⚠ **AND A BOARD'S SELF-PROOF IS ONLY WHAT THAT BOARD CAN PROVE ALONE** (orin 25's amendment, and it is load-
