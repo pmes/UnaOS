@@ -235,4 +235,8 @@ REQUIRE :: WINX-8: VUG\.ELF end-to-end — loaded \(entry 0x[0-9a-fA-F]+\) \+ wi
 # --- and everything else convicts. RX-FINALPAGE's refused clone faults at LOAD time
 # --- (`:: elf: REFUSED rx-crosses-final-window-page ... ::`), never in ring 3, so it contributes
 # --- nothing here. Kept narrow deliberately: a blanket FORBID would red the fixture every boot.
-FORBID :: RING-3 FAULT: task '(?!u1b-)[^']*' KILLED
+# --- Lookahead-free by the SPECFIX portability rule (2026-08-18): foreman's Rust regex refuses
+# --- look-around and its preflight is all-or-nothing — one lookahead here would silently disarm
+# --- the whole spec if this file is ever fed to it. Prefix-factored alternation, unit-tested
+# --- 8/8 against the original `(?!u1b-)` semantics (rmbp 8, 2026-08-27).
+FORBID :: RING-3 FAULT: task '(?:u1b[^-'][^']*|u1[^b'][^']*|u[^1'][^']*|[^u'][^']*|u1b|u1|u|)' KILLED

@@ -5774,13 +5774,24 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("simmer: per-core load animator is aarch64 only");
         },
         "top" => {
-            // SCHED-2: per-core scheduler load table (aarch64). Recent busy% (rolling window),
-            // cumulative context switches, and the last task dispatched on each core. On-demand read
-            // of `sched::core_load` — introspection only, no scheduling-path effect.
-            #[cfg(target_arch = "aarch64")]
+            // TOPPORT: per-core scheduler load table, BOTH arches. `load_table` is a signature-matched
+            // twin on each side (SCHEDPAR's shape for `sched`/`ps`), so there is one body here and no
+            // `#[cfg]` at all: the apology this arm used to print on x86 was never about missing data
+            // — `arch::x86_64::sched::core_load` has been returning a richer struct than aarch64's the
+            // whole time — it was a missing FORMATTER.
+            //
+            // The census and the columns stay inside each arch's `load_table`, which is where they
+            // genuinely differ and where each can be documented against its own accounting: x86 walks
+            // `min(acpi::cpu_count(), MAX_CPUS)` and prints two columns aarch64 does not have — a `*`
+            // marking a percent that was INFERRED rather than measured (its `CoreLoad::pegged`, which
+            // its own docs say must be read together with the percent or not at all), and a fold-age
+            // in MILLISECONDS; aarch64 walks the full `percpu::NUM_CPUS` range and its fold age is in
+            // cycles. Neither table converts into the other's unit — each header names its own — and
+            // neither pretends to a symmetry the two schedulers do not have.
+            //
+            // On-demand read of `sched::core_load` on both sides: introspection only, no
+            // scheduling-path effect.
             crate::arch::sched::load_table(|row| console.println(row));
-            #[cfg(not(target_arch = "aarch64"))]
-            console.println("top: aarch64 only");
         },
         "batmon" => {
             // NATIVE-MIDDEN M1b: one honest SMC battery line. A one-shot human command, so it does a
@@ -6687,9 +6698,11 @@ fn bg_jobs(console: &mut Console) {
                 serial_println!(":: BGRUN: jobs — pid={} exit=FAULT reaped ::", job.pid);
                 *slot = None;
             }
-            // CLOSE-CLEAN is an aarch64-only `BgPoll` variant (the x86 WINX-2 enum has four:
-            // Running / Exited / Faulted / Gone), so this arm is arch-gated rather than invented.
-            #[cfg(target_arch = "aarch64")]
+            // CLOSE-CLEAN. Both arches carry the `Closed` variant now (the x86 WINX-2 enum gained
+            // it for shape parity), so the arm is unconditional. On x86 it is currently
+            // unreachable-by-value rather than dead-by-cfg: the x86 close box kills through
+            // `bg_kill`, which reaps the row itself, so a closed x86 job polls `Gone` — see the
+            // variant's own doc in `arch/x86_64/syscall.rs`.
             BgPoll::Closed => {
                 // CLOSE-CLEAN: the operator clicked the window's close box — a clean, asked-for
                 // exit. Reads like a normal completed job, never like a fault.

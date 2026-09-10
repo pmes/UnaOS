@@ -95,7 +95,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 ## 3. Arcs, git, lanes
 
 - **One arc per session, multi-milestone,** each green and committed before the next; no adjacent
-  improvements. DONE gate: the brief's outputs, `./arroyo check` both arches, the track's QEMU suite
+  improvements. DONE gate: the brief's outputs, `./arroyo check` both arches, the track's OWN-BOARD QEMU suite
   once per staged image, the named doc update.
 - **Commit only on your own track or executor branch.** Message `subsystem: imperative summary`
   plus the model's `Co-Authored-By`; a message carrying code goes through `git commit -F`.
@@ -120,9 +120,47 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   both seats that turn; obtain an ack from at least one other track (silence is not consent; an
   unresolved objection goes to Peter with both positions); immediately before the merge announce
   again and re-check trunk, merging it in and re-running the battery if it moved; merge `--no-ff`;
-  run the trunk battery; then prove the shape: `git log --pretty=%p -1 <merge>` shows two parents,
+  run **the landing seat's OWN-BOARD legs, never the trunk battery** (R39, 2026-09-10 — the cross-platform
+  battery is what made every landing proof all three boards, so the rule that required it is the rule that
+  had to change); then prove the shape: `git log --pretty=%p -1 <merge>` shows two parents,
   and a zero `git diff <arc-tip> <merge>` is safe only if `git log --no-merges --oneline
   <merge-base>..<trunk-tip>` is empty (pi 6 2026-09-05). Doc and `arroyo` conflicts resolve by union.
+- **NO SEAT PROOFS, GATES OR DEBUGS ANOTHER SEAT'S BOARD** (R39, Peter 2026-09-10). Each board's legs are run
+  by the seat that owns it: **x86** — `test`, `test-fat`, the ELF-off-FAT legs and the x86 usb-write witness;
+  **pi** — `kernel8-test`; **jetson** — `check (tegra)` and `esp-jetson`. `check` is NOT platform-scoped: it is a
+  compile, one invocation type-checks both arches, and every seat runs it whole — a cfg-widen must compile the
+  configuration it turns ON (pi 10's amendment). **A leg with no NAMED owner defaults to whoever is running, and
+  that is the landing seat, so every leg is named here unconditionally — never "mine unless you want it", which
+  is a conditional claim and defaults the same way (pi 10 made and then fixed exactly that error in the message
+  after diagnosing it).** SETTLED 2026-09-10: **`arm virt v2`, `arm virt v3 (CAPSTONE)` and the arm usb-write
+  witness belong to PI**, unconditionally. QEMU `virt` is neither board — not BCM2711, not Tegra234 — so both
+  aarch64 seats had standing; pi took them because pi holds one board leg while orin carries a bench-flight
+  cadence, and orin may claim them by saying so. The counter-argument is on record and is stronger than "nobody's
+  board": `virt` is the ONLY runtime aarch64 proof available without hardware, and therefore the only runtime
+  coverage the Jetson can ever get. The arm usb-write witness is not a boot at all — it is an assertion ON the v2
+  capture, the second-order orphan the unowned-leg mechanism produced.
+  ⚠ **`virt` IS NOT A BOARD, and that distinction closes a hole R39 would otherwise open** (orin 25, 2026-09-10,
+  who measured the coverage and then declined the legs anyway). It is a generic QEMU machine no seat owns
+  hardware for, so it is nobody's PLATFORM and R39's words are about one platform debugging another. The case:
+  jetson lands shared aarch64 code, no aarch64 peer is awake, jetson's own legs are build-only — and the landing
+  carries ZERO runtime evidence. Both peers were dormant for hours on 2026-09-10, so it is not hypothetical.
+  **Therefore: the virt legs are PI's to run and ack in the normal case; ANY aarch64 seat may run them FOR ITS
+  OWN LANDING when no aarch64 peer is available, and says so in the ack. Running them for another seat's board
+  stays banned outright.** What is at stake is measured, not asserted: across `c7407753..751cb816`, virt cannot
+  execute the 696 changed lines of tegra-named files but does execute the other 617 of the aarch64 arch surface
+  and all 8,477 changed lines of shared kernel (`shell.rs` 7256, `fs/vfs.rs` 816, `main.rs` 405 — added plus
+  deleted, `git diff --numstat c7407753..751cb816`, paths under `unaos/crates/kernel/src/`; the first cut said
+  ~7,700 and omitted `fs/vfs.rs`, corrected by orin 25 who made the original measurement). **The virt legs are the only
+  runtime evidence that exists for most of what an aarch64 landing changes.**
+  **A LANDING IS THREE GREENS AT ONE SHA, NOT ONE SEAT'S BATTERY** — each seat runs its own board in its own tree
+  and acks with the command and the result.
+  ⚠ **AND A BOARD'S SELF-PROOF IS ONLY WHAT THAT BOARD CAN PROVE ALONE** (orin 25's amendment, and it is load-
+  bearing): there is NO QEMU model for the Jetson — `arroyo` launches `q35`, `raspi4b` and generic `virt`, and
+  zero tegra machines. x86 self-proves on q35, pi on raspi4b, **jetson cannot self-prove at runtime at all.** So
+  a jetson green certifies that it COMPILES AND LINKS, not that it runs; Orin runtime is proven by a render
+  flight, which is a scheduled bench event and NEVER a landing gate. Any reader of a jetson ack must know that is
+  all it is — and any scheme that demands more would block every landing on Peter's calendar.
+  Enforcer: R39; the platform selector on `battery()`; and this list, which names every leg's owner.
 - **Lanes:** the rmbp seat owns shared kernel core; pi and jetson touch the files their brief names.
   An out-of-lane need is negotiated over ccd with the owning seat and the grant is recorded in both
   transcripts; a grant in one transcript is a preference, not a grant. An ack given to one shape is
@@ -236,6 +274,15 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 - **A pipe launders the verdict** (rmbp 18 2026-09-08): never score a gate through `| tail`,
   `| head`, `| grep`; `cmd > log 2>&1; echo rc=$?`, then filter the file. When text and exit code
   disagree, the text wins until proven otherwise. Say which channel you read.
+  **A pipe also launders a POPULATION** (orin 25 + rmbp 18, 2026-09-10, one instance each in one
+  day): `| head` turned `grep -n 'UNAOS_NOBSP' unaos/arroyo` into a ten-line sample — the file had
+  exactly ten matches before the two that refuted the conclusion — and the universal "read ONLY
+  inside a `UNAOS_TEGRA` guard" was then written off the capped list. The same hour, `sort -u` in a
+  union check hid four duplicated ledger rows while the id SET still matched. **Never quantify over
+  a filtered list: count it first (`| wc -l`), or run it unfiltered.** A set-equality check is
+  necessary and not sufficient — it needs "and no member appears twice". Enforcer: warning only;
+  the standing tools are `wc -l` before any "all"/"only" claim, and GATE-LEDGER's duplicate-id
+  check, which is what caught the `sort -u` case.
 - **Logs:** `awk`, never bare `grep`, on serial logs; bracketed witness tags need
   `awk 'index($0,"[tag]")'` (a bare `[tag]` is a character class; gawk warns of nothing);
   `grep -a -c` on a bracket token needs `-F` and a known-absent control. Artifact certification uses
@@ -335,6 +382,36 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   title is the app's name; numbering is for untitled documents only (R36). Crispy is a theme, never a
   lock-in; two GUI modes only (self-drawn, or real host widgets). The bench loop is a scaffold and
   serial is a dev hack; self-hosting is the goal; it is UnaOS, not OrinOS (Peter 2026-08-25).
+
+- **RESTORED BY THE rmbp 18 FOLD (2026-09-10).** The two rules below were on `hw-rmbp`'s LAWS.md and are
+  absent from the 2026-09-09 consolidation — dropped by accident, not retired. Both name an enforcer, which is
+  why they are restored rather than reported: the first is enforced every run by the SERWIT-1 fixture, the
+  second by holding the image-identity witness under 80 columns. Verified absent from the consolidated file
+  before restoring: a grep for each rule's distinctive wire token returned 0 on the consolidated file. That
+  check is deliberately not quoted here — a verification note that contains its own search terms answers a later
+  grep from the note instead of from the rule, which is a false positive by construction.
+- **The wire may not lose lines** (2026-07-29). Serial output is the evidence
+  every gate is counted from, so the transport is held to a stricter standard
+  than what it reports on: a line that cannot be written is DEFERRED, and a
+  line that is genuinely lost is COUNTED and announced on the wire
+  (`[serial] dropped N lines`). Silent loss is forbidden — a missing `PASS`
+  must never be indistinguishable from a fixture that never ran, and a
+  regression's `FAIL` must never be able to evaporate. Enforced every run by
+  the SERWIT-1 fixture; see
+  [`docs/dev/OS/02_KERNEL_CORE/serial_transport.md`](OS/02_KERNEL_CORE/serial_transport.md).
+- **A wrapped record is not a truncated one** (2026-08-31). The UEFI console
+  the bootloader logs to is sometimes 80 columns wide — the loader never calls
+  `SetMode`, so the width is inherited firmware state — and at 80 columns the
+  firmware hard-wraps every write with a real CRLF. No bytes are lost, but a
+  line-oriented read loses the tail, so `awk '/pattern/'` reports a witness
+  that is present as a witness that was cut off. Orin 11 spent a session on
+  an identity line that appeared to end at the word `max_vaddr` while the
+  value was on the wire throughout. Read bootloader-window captures through
+  `~/unaos-bench/tools/unwrap80.sh` (bench-side, outside the repo)
+  — it is a no-op on a wide-console capture, so there is no cost to always
+  using it. The image-identity witness itself is held under 80 columns so it
+  never needs the tool; see
+  [`docs/dev/OS/01_BOOT_HAL/bootloader_spec.md`](OS/01_BOOT_HAL/bootloader_spec.md) §4.
 
 ## 7. Coordination between seats
 

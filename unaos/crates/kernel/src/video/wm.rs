@@ -1022,11 +1022,18 @@ pub const KERNEL_OWNER_BASE: u64 = 0xFFFF_FF00;
 /// CLICK-X86: the panel console's row (`fbcon::panel_console_window_open`).
 pub const KERNEL_OWNER_CONSOLE: u64 = KERNEL_OWNER_BASE + 1;
 
-/// CLICK-X86: the desktop furniture's row. **No producer since the kernel-apps eviction** — it named
-/// `desktop_uefi::activate`'s kernel-drawn demo window, which is now a ring-3 process (`STAT.ELF`) owning an
-/// ordinary user row. Kept as a RESERVED value rather than deleted: [`is_kernel_owner`] is a range
-/// test over the whole band, the console row above still uses it, and the next piece of kernel-owned
-/// desktop furniture should take this number rather than mint a third one.
+/// CLICK-X86: the desktop furniture's row — since SHELLWIN, **the LIVE SHELL's own window** (the
+/// singleton row `open_shell_window`/`dock::pin_shell` mint and WCSER-REMINT adopts; see the
+/// singleton ledger at [`shell_row_geometry`]). Its first tenancy — `desktop_uefi::activate`'s
+/// kernel-drawn demo window — was evicted to a ring-3 process (`STAT.ELF`) owning an ordinary user
+/// row, and the value was then re-used for the shell window rather than a third number minted.
+///
+/// FURNITUREFOCUS (flight 3 D-7): "unreachable as a user focus TARGET" means no input ring exists
+/// behind this ASID — the click router's furniture arms hand the KEYBOARD to the shell (slot 0)
+/// instead, and `focus_changed(KERNEL_OWNER_DESKTOP)` is only the visible half (raise + chrome
+/// highlight). Whether slot 0 actually drains is the render task's shell-tuple binding, published
+/// through `syscall::shell_key_sink_note` — the flight-3 strand was this value focused while that
+/// sink was dead, which the router's deflection now forbids.
 pub const KERNEL_OWNER_DESKTOP: u64 = KERNEL_OWNER_BASE + 2;
 
 /// CLICK-X86 — is `asid` in the reserved kernel-owner band? `false` for `0`, which still means
@@ -4447,9 +4454,20 @@ pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::not
                     {
                         COMP_STEALS.fetch_add(1, Relaxed);
                         COMP_OVERDUE_REPORTED.store(false, Relaxed);
+                        // WEDGESRC — latch the death for the blit-debt ledger. Never cleared: the
+                        // parked core stays parked, and `[wedge1] BLITAIM dead=[..]` beside a
+                        // still-owing `net=[..]` is DEBTCLEAR's unwinnable debt, named on the wire.
+                        COMP_DEAD_EVER.fetch_or(1u32 << dead.min(31), Relaxed);
+                        // WEDGESRC — D-1's stamp: how far the machine's flush odometer had turned
+                        // when the holder died, whether the dead core's last BAR1 store issued
+                        // without retiring (`blit_inflight=1` — flight-1's stuck-store shape, and
+                        // then `blit_aim` is the BAR1 byte offset it is stuck at), or retired with
+                        // only the guard's drop owed (`=0` — flight-3's bookkeeping-debt shape).
+                        let bc = dead.min(7);
                         serial_println!(
                             ":: [wcser] GATE STOLEN from c{} by c{} after {}ms — the holder was in \
-                             phase {} row {} and had not moved. The acquirer was CHOSEN, not next in \
+                             phase {} row {} and had not moved. blits_retired={} blit_aim={:#x} \
+                             blit_inflight={} The acquirer was CHOSEN, not next in \
                              line: pick={} render={} svc={}; desktop resumes on this core, c{} is \
                              DEAD and its singleton roles are owed a re-home == tripwire ::",
                             dead,
@@ -4457,6 +4475,10 @@ pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::not
                             held,
                             COMP_PASS_PHASE.load(Relaxed),
                             COMP_PASS_ROW.load(Relaxed),
+                            blits_retired_total(),
+                            BLIT_AIM_CORE[bc].load(Relaxed),
+                            (BLIT_ISSUED_CORE[bc].load(Relaxed) != BLIT_DONE_CORE[bc].load(Relaxed))
+                                as u32,
                             pick.map_or("-", StealPick::name),
                             crate::arch::smp::render_cpu().map_or(-1, |c| c as isize),
                             crate::arch::smp::service_cpu().map_or(-1, |c| c as isize),
@@ -4520,6 +4542,9 @@ pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::not
         // service's clock, not here.
         COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
         COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
+        // DEBTCLEAR — consume the zombie-store taint before the pass, so the pass this holder is
+        // about to run IS the full present the settle promised. One swap when clean.
+        blit_debt_heal_maybe();
         composite_once();
         // Service what was declined while we held the gate. Each round is a FULL pass — its own
         // snapshot, its own upward closure, its own back-to-front order and its own cursor tail — so
@@ -5905,7 +5930,7 @@ fn composite_inner() -> CursorTail {
         if let Some(p) = wcg_probe {
             let r = &rw;
             // GR21/WCD-OCC — the read-back-time occluder set, unioned in `end` with the pre-blit set
-            // carried in the probe. PARITY §6.2 — ONE nine-argument call on both arches.
+            // carried in the probe. PARITY §6.2 — ONE ten-argument call on both arches (OCC62 added `occ_after`; counted at `wcg::end`'s signature, wcg.rs:3395).
             // OCC62 M1 — the read-back-time excuse, owned in THIS block so it leaves the frame the
             // moment the bracket closes, and handed over by reference beside the pre-blit one.
             let occ_post = occ_excuse(r.z, r.id, &clip);
@@ -9321,6 +9346,47 @@ pub fn wedgeinj_park_maybe() {
     if WEDGEINJ_FIRED.swap(true, SeqCst) {
         return;
     }
+    // WCSER-REMINT fixture — give the park a SHELL WINDOW to orphan, so the re-mint has a corpse to
+    // adopt. On metal the row exists (the crispy desktop minted it at bring-up); on the QEMU gate
+    // `desktop_uefi::activate` never runs (no Kepler takeover), so without this the rescue instance
+    // would find no `KERNEL_OWNER_DESKTOP` row and the re-mint arm would be exercised by no gate
+    // anywhere — a recovery proven by compiling, which the standing law rejects. Minted HERE, on the
+    // render task at fire time, because that is exactly where the real row's owner dies: the row this
+    // creates is orphaned by the very park below, the state the re-mint is a function of. Skipped if
+    // a row already exists (metal, or a future QEMU desktop route), so the band's singleton invariant
+    // holds in every configuration. The surface is a static — nothing ever writes it, the compositor
+    // only reads it, and after the re-mint repoints the row it is off-glass entirely. `wc`-gated on
+    // top of the enclosing fn's `wedgeinj`: the re-mint arm lives in the `wc` tuple init, so on a
+    // wedgeinj-without-wc mix leg the fixture would mint a corpse nothing ever adopts.
+    #[cfg(feature = "wc")]
+    if shell_row_geometry().is_none() {
+        static WEDGEINJ_SHELL_SURF: [u32; 64 * 40] = [DESKTOP_BG; 64 * 40];
+        let surf = WEDGEINJ_SHELL_SURF.as_ptr() as usize;
+        let len = core::mem::size_of_val(&WEDGEINJ_SHELL_SURF);
+        let wid = create_at(KERNEL_OWNER_DESKTOP, surf, len, 64, 40, 64 * 4, b"shell", 24, 64);
+        serial_println!(
+            ":: [wedgeinj] synthetic shell row win={} minted on c{} — the corpse-to-be the re-mint \
+             must adopt ::",
+            wid,
+            me
+        );
+    }
+    // DEBTCLEAR fixture — mint the BLIT DEBT the park strands. On metal the parked core dies inside
+    // `stage_window`'s blit with a live `BlitGuard` on its stack; the guard's drop never runs and
+    // `BLIT_ACTIVE`/`BLIT_NET_CORE[me]` stay charged forever — flight 3's `net=[0,1,1,...]` wedge.
+    // The synthetic park never enters a blit, so without this the fixture proves the steal and the
+    // rehome but leaves the debt-clear path exercised by no gate anywhere. `mem::forget` is the
+    // software twin of the stuck store: entered, never exits.
+    {
+        let g = BlitGuard::enter();
+        core::mem::forget(g);
+        WEDGEINJ_DEBT_CORE.store(me, Relaxed);
+        serial_println!(
+            ":: [wedgeinj] blit debt minted on c{} active={} — the ledger the steal must settle ::",
+            me,
+            BLIT_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+        );
+    }
     // Take the gate exactly as `composite` does. Spin rather than decline: an injector that gave up
     // because some other core happened to be mid-pass would fire on some boots and not others, and a
     // gate that is only sometimes armed is worse than none. The wait is bounded by one honest pass.
@@ -9351,6 +9417,82 @@ pub fn wedgeinj_park_maybe() {
 /// WEDGEINJ — throttle stamp for [`wedgeinj_drive_maybe`].
 #[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
 static WEDGEINJ_DRIVE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WEDGEINJ/DEBTCLEAR — the core the fixture minted its blit debt on (the parked render core), so
+/// the DEBT LEG can read exactly that slot's net. `usize::MAX` until the mint.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+static WEDGEINJ_DEBT_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// WEDGEINJ/DEBTCLEAR — one-shot latch for the DEBT LEG.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+static WEDGEINJ_DEBT_LEG_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// WEDGEINJ/DEBTCLEAR — THE DEBT LEG: prove a teardown drain COMPLETES post-steal where it would
+/// have spun its full bound before. Runs once, 15 s after the park (park 30 s → steal ~34 s →
+/// rehome + settle on the next pump pass → leg at 45 s, inside the 60 s gate window):
+///
+///  1. reads the parked core's `BLIT_NET_CORE` slot — nonzero means the settle never ran, and the
+///     leg says FAIL WITHOUT closing (a close would spin the multi-second abandon bound and could
+///     push the verdict past the end of the capture — a silent false green, refused);
+///  2. creates a probe window (kernel-band owner, off the desktop singleton band) and CLOSES it —
+///     `close` runs the F4 drain barrier, the exact wait flight 3 measured at 1 GiB of spins
+///     against dead cores' debt;
+///  3. verdicts on: debt settled, drain returned promptly, and neither `abandoned=` nor `scskip=`
+///     moved. `-> FAIL` reds the run through the harness fault scan.
+#[cfg(all(target_arch = "x86_64", feature = "wedgeinj"))]
+fn wedgeinj_debt_leg_maybe(now: u64) {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    if now < WEDGEINJ_AT_MS + 15_000 || WEDGEINJ_DEBT_LEG_DONE.swap(true, Relaxed) {
+        return;
+    }
+    let parked = WEDGEINJ_DEBT_CORE.load(Relaxed).min(7);
+    let debt = BLIT_NET_CORE[parked].load(Relaxed);
+    if debt != 0 {
+        serial_println!(
+            ":: [wedgeinj] DEBT LEG core={} net={} — the settle never ran; a close here would spin \
+             the abandon bound, so the leg refuses to drain -> FAIL ::",
+            parked,
+            debt
+        );
+        return;
+    }
+    let pre_ab = DRAIN_ABANDONED.load(Relaxed);
+    let pre_sc = DRAIN_SAMECORE_SKIPS.load(Relaxed);
+    static WEDGEINJ_PROBE_SURF: [u32; 64 * 40] = [DESKTOP_BG; 64 * 40];
+    let id = create_at(
+        KERNEL_OWNER_BASE + 0x40,
+        WEDGEINJ_PROBE_SURF.as_ptr() as usize,
+        core::mem::size_of_val(&WEDGEINJ_PROBE_SURF),
+        64,
+        40,
+        64 * 4,
+        b"probe",
+        200,
+        200,
+    );
+    if id == WIN_NONE {
+        serial_println!(":: [wedgeinj] DEBT LEG probe window refused (table full?) -> FAIL ::");
+        return;
+    }
+    let t0 = crate::arch::ms();
+    let closed = close(id);
+    let close_ms = crate::arch::ms().saturating_sub(t0);
+    let d_ab = DRAIN_ABANDONED.load(Relaxed).saturating_sub(pre_ab);
+    let d_sc = DRAIN_SAMECORE_SKIPS.load(Relaxed).saturating_sub(pre_sc);
+    let ok = closed && d_ab == 0 && d_sc == 0;
+    serial_println!(
+        ":: [wedgeinj] DEBT LEG core={} net=0 close_ms={} abandoned_delta={} scskip_delta={} \
+         active_now={} — the drain that flight 3 could only abandon now completes -> {} ::",
+        parked,
+        close_ms,
+        d_ab,
+        d_sc,
+        BLIT_ACTIVE.load(Acquire),
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
 
 /// WEDGEINJ — keep a LIVE core asking for the gate after the park, so the steal has a caller.
 ///
@@ -9385,6 +9527,8 @@ pub fn wedgeinj_drive_maybe() {
     // An ordinary unmasked composite from a live core — the identical call `pace_service` and the
     // paygo taker already make from this lane. Nothing about the steal is special-cased for it.
     composite();
+    // DEBTCLEAR — the post-steal drain proof, once, after the settle has had time to run.
+    wedgeinj_debt_leg_maybe(now);
 }
 
 /// WEDGEINJ — the knob-off shims, so the render loop's and pump's call sites need no `#[cfg]`.
@@ -9433,6 +9577,102 @@ pub fn comp_dead_core_take() -> Option<usize> {
         .compare_exchange(dead, usize::MAX, AcqRel, Relaxed)
         .ok()
         .map(|_| dead)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WCSER-REMINT — THE SHELL WINDOW DOES NOT STAY A CORPSE ACROSS A REHOME.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// WCSER-REHOME's census named the trade out loud: *"the rescued desktop's shell window is a corpse
+// — it composites, and nothing types into it."* Flight 3 (rmbp7, 2026-08-27) priced that trade:
+// FIVE steals, five rehomes, and the operator's shell was a corpse from the first steal at 95 s to
+// power-off at 1144 s — read from the chair as "keyboard gone". The one shell re-mint that DID
+// happen that flight (`[shellwin] reopen win=2 route=dock` at 374 088 ms) proves the mint machinery
+// works from a rescue instance — but that route is reachable ONLY after something CLOSES the row
+// (`dock::pin_shell` appends the pinned shell tile iff no live `KERNEL_OWNER_DESKTOP` row exists),
+// and a rehome leaves the corpse row LIVE. So after a rehome the operator has no route at all:
+// the corpse composites, the dock shows no shell tile, and every keystroke lands in a console whose
+// task is parked on a dead core.
+//
+// The fix is ADOPTION, not close-and-recreate, and the difference is load-bearing three ways:
+//
+//  * **The drain barrier.** `close` runs the F4 drain barrier, and the corpse's `BlitGuard` is the
+//    KNOWN RESIDUAL that never drops — flight 3's `[wedge1] DRAIN STALLED` spun 21 s against blit
+//    debt owed by cores dead for ~250 s before ABANDONING. A close from the rescue path could buy
+//    that same unwinnable spin at bring-up. The repoint below takes the table lock for a few loads
+//    and stores and touches no blit accounting.
+//  * **Idempotence by construction.** Five rehomes must not stack five windows. Adoption re-targets
+//    the SAME singleton row every time — the `KERNEL_OWNER_DESKTOP` band has exactly one producer
+//    (`open_shell_window`, plus the wedgeinj fixture below on QEMU), and this path never creates —
+//    so N rehomes leave exactly one shell row, whatever N is.
+//  * **CORPSEGLASS compatibility (D-7).** The corpse-window retirement lane can sweep dead-core
+//    windows by owner/task without a carve-out: after adoption the shell row is live-owned by the
+//    incumbent render instance, so it is simply not in that sweep's set.
+//
+// What is deliberately NOT reclaimed: the corpse's old surface store. It lives in the dead render
+// task's locals, a parked core frees nothing, and a superseded revenant retires by sleeping with its
+// frame intact for exactly this reason — so an in-flight composite that snapshotted the old pointer
+// reads valid bytes forever. One ~surface-sized allocation leaks per rehome, which is the same
+// already-accepted price the parked core itself costs. A revenant that resumes mid-pass writes into
+// its OWN old store (off-glass after the repoint — its pixels can no longer reach the panel) and its
+// owner-fenced present still passes (same id, same owner), costing one benign extra composite of the
+// NEW surface before the epoch check retires it at the next pass top.
+
+/// WCSER-REMINT — identity and geometry of the live shell-window row: `(id, w, h, stride)` of the
+/// unique [`KERNEL_OWNER_DESKTOP`] row, or `None` when no such row exists (never minted, or closed
+/// by the wedge-abandon teardown / the operator's close box — the dock-reopen states).
+///
+/// By OWNER, not by a published id: ids are slot aliases with no generation (the F2 lesson), so a
+/// cached id could name a recycled row, while an owner scan under the lock is current truth — and
+/// the band has one row by construction (see the WCSER-REMINT ledger above).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn shell_row_geometry() -> Option<(WinId, usize, usize, usize)> {
+    let t = table();
+    t.rows
+        .iter()
+        .find(|r| r.used && r.owner_asid == KERNEL_OWNER_DESKTOP)
+        .map(|r| (r.id, r.w, r.h, r.stride))
+}
+
+/// WCSER-REMINT — repoint the shell row's surface to the rescue instance's fresh store, in place.
+///
+/// The row keeps its id, box, z and title; only the surface binding changes, plus a whole-box
+/// damage mark so the fresh content composites. Verified under the table lock against everything
+/// [`shell_row_geometry`] reported — owner (the recycled-id fence, [`present_outcome_owned`]'s
+/// rule), dimensions, and the same pixels-fit-stride / rows-fit-slot bounds [`create`] enforces —
+/// so a row that closed or changed in the gap declines (`false`) instead of being clobbered. The
+/// caller owns `surf` for the row's remaining life, exactly as it would after [`create_at`].
+///
+/// Deliberately does NOT composite, raise, or focus: the caller presents through the owner-fenced
+/// verb and decides focus policy itself (`main.rs` hands the keyboard back, the same pair the dock
+/// reopen arm uses).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn shell_remint(
+    id: WinId,
+    surf: usize,
+    surf_len: usize,
+    w: usize,
+    h: usize,
+    stride: usize,
+) -> bool {
+    let mut t = table();
+    let Some(r) = row_mut(&mut t, id) else {
+        return false;
+    };
+    if r.owner_asid != KERNEL_OWNER_DESKTOP
+        || r.w != w
+        || r.h != h
+        || r.stride != stride
+        || w.saturating_mul(4) > stride
+        || h.saturating_mul(stride) > surf_len
+    {
+        return false;
+    }
+    r.surf = surf;
+    r.surf_len = surf_len;
+    r.damage_all();
+    r.presented = true;
+    true
 }
 
 /// WCSER-STEAL — cores that came back from the dead and correctly declined to release. Zero is the
@@ -9762,8 +10002,20 @@ pub fn wcser_overdue_probe() {
     // fields derived from that one load, so the number and the name can never describe two
     // different samples of a gauge another core is still stamping.
     let phase = COMP_PASS_PHASE.load(Relaxed);
+    // WEDGESRC (D-1) — the three fields that decide flight-1's Q1 from the wire. `blits_retired`
+    // is the machine-wide flush odometer: FROZEN across the standing 1 s repeats = no blit is
+    // retiring anywhere (the backpressure reading); CLIMBING while `row=` is frozen = the panel is
+    // being fed by other cores and only the holder is wedged. `blit_aim` is the BAR1 byte offset
+    // of the HOLDER's last-issued blit, and `blit_inflight=1` says that store issued and never
+    // retired — the holder is inside `fb.blit`, and `blit_aim` names where in the aperture the
+    // stuck store was aimed. `blit_inflight=0` on a wedged holder says the stall is DOWNSTREAM of
+    // a retired blit (flight-1's wedge-1 shape: WB store wedged by WC backpressure — beside
+    // `at=pw-content`/`pw-face`) or not a store at all. Same one-load-per-field discipline as
+    // `phase` above; all slow-path, 1 Hz at most, while already wedged.
+    let bc = holder.min(7);
     serial_println!(
-        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} at={} row={} == tripwire ::",
+        ":: [wcser] PASS OVERDUE holder=c{} age_ms={} pending={} win={} phase={} at={} row={} \
+         blits_retired={} blit_aim={:#x} blit_inflight={} == tripwire ::",
         holder,
         age,
         COMP_PENDING.load(core::sync::atomic::Ordering::Acquire),
@@ -9771,6 +10023,9 @@ pub fn wcser_overdue_probe() {
         phase,
         comp_phase_name(phase),
         COMP_PASS_ROW.load(Relaxed),
+        blits_retired_total(),
+        BLIT_AIM_CORE[bc].load(Relaxed),
+        (BLIT_ISSUED_CORE[bc].load(Relaxed) != BLIT_DONE_CORE[bc].load(Relaxed)) as u32,
     );
     // PCIH — root-port-at-wedge sampler, on the same cadence as the tripwire line (first
     // crossing + each 5 s standing repeat). ROOT PORT registers only: its config space
@@ -9914,7 +10169,113 @@ fn blitwho_pack_name(n: Option<&'static str>) -> u64 {
     w
 }
 
-/// BLITWHO — one line, printed only from the two give-up arms (never the hot path): the raw
+// ---- WEDGESRC (flight-1 D-1 / flight-3 Q1) — the per-core blit-progress ledger ----------------
+//
+// THE QUESTION THIS ANSWERS. Flight-1's wedge 1 stalled one instruction DOWNSTREAM of the
+// convicted BAR1 store (a WB heap store at `pw-content`, wedged by store-buffer backpressure from
+// a stuck write-combining store into the Kepler aperture) — and the wire could not say WHERE in
+// BAR1 the stuck store was aimed nor HOW MANY blits had retired before it. Flight-3 then produced
+// the same `[wedge1]` tripwire from a DIFFERENT mechanism entirely: `BLITWHO net=[0,1,1,..]` with
+// c1/c2 dead for ~250 s — a bookkeeping wedge (dead cores' blit debt is never cleared), not a
+// stuck store at all. The two mechanisms print identically today. This ledger is what tells them
+// apart on one line:
+//
+//   * `aim[c]`   — the BAR1 byte offset of the blit core `c` last ISSUED (stored BEFORE the copy).
+//   * `issued[c]`/`done[c]` — per-core sequence counters bracketing the copy. `issued != done`
+//     means core `c` is INSIDE `fb.blit` right now (or died there): the store was issued and never
+//     retired, and `aim[c]` names its target — flight-1's reading. `issued == done` with the
+//     BLITWHO net still owing that core means the blit RETIRED and the guard's drop never ran —
+//     flight-3's dead-core-debt reading, DEBTCLEAR's lane.
+//   * `blits_retired` (the sum of `done[]`) — the pass-progress odometer D-1 asked for.
+//
+// COST, AND WHY IT DOES NOT PERTURB WHAT IT MEASURES. Three relaxed atomic ops per FLUSHED ROW
+// (two uncontended per-core RMWs + one per-core store), x86_64 + `witness` only, riding the same
+// per-row cadence `comp_mark_row` already pays in the same loop — against a row body whose real
+// work is a 2 KiB+ `copy_nonoverlapping` into write-combining BAR1. The PRINT side runs only on
+// the tripwire/give-up/steal paths, which are once-per-boot or once-per-second-while-wedged. On
+// every other build the wrapper is `fb.blit` verbatim.
+//
+// ORDERING. x86 TSO retires stores in program order out of the store buffer, so when a core wedges
+// mid-blit the `aim` store (older, WB) has drained and is globally visible while `done` (younger,
+// never executed) is not — which is exactly the reading the tripwire takes. Last-writer-wins per
+// core; a task-context holder that migrates mid-pass smears one sample across two slots, the same
+// accepted caveat `BLIT_NET_CORE`'s own doc records.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static BLIT_ISSUED_CORE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static BLIT_DONE_CORE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+/// WEDGESRC — the panel byte offset (`py * fb_row + x0 * bpp`, i.e. the BAR1-relative aim of the
+/// `copy_nonoverlapping`) of the blit each core last issued. 0 until a core's first blit —
+/// disambiguated from a real offset-0 aim by `issued[c] == 0`.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static BLIT_AIM_CORE: [core::sync::atomic::AtomicU64; 8] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
+
+/// WEDGESRC — cores the WCSER steal has EVER declared dead, as a bitmask. Latched at the steal
+/// (never cleared — a parked core does not come back this boot; a revenant is `COMP_REVENANTS`'s
+/// story and would read here as a stale bit beside a healthy net, which is itself legible). This is
+/// what turns flight-3's forensic reconstruction — "the owed cores had been dead for 250 s" — into
+/// one field on the next flight's tripwire line: `net[c] > 0 && dead[c]` is DEBTCLEAR's unwinnable
+/// debt, named at the moment it wedges someone instead of a session of log archaeology later.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static COMP_DEAD_EVER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// WEDGESRC — the flush-loop blit, instrumented. On the armed build: aim + issued before the copy,
+/// done after, all relaxed, all per-core. On every other build this IS `fb.blit`, verbatim.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+#[inline]
+fn blit_traced(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8]) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = crate::arch::sched::meter_current_cpu().min(7);
+    BLIT_AIM_CORE[c].store(byte_offset as u64, Relaxed);
+    BLIT_ISSUED_CORE[c].fetch_add(1, Relaxed);
+    fb.blit(byte_offset, src);
+    BLIT_DONE_CORE[c].fetch_add(1, Relaxed);
+}
+#[cfg(not(all(target_arch = "x86_64", feature = "witness")))]
+#[inline(always)]
+fn blit_traced(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8]) {
+    fb.blit(byte_offset, src);
+}
+
+/// WEDGESRC — the odometer: blits retired machine-wide, summed from the per-core ledger on the
+/// slow path rather than paid for as a ninth shared-line RMW on the hot one.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn blits_retired_total() -> u64 {
+    let mut t = 0u64;
+    for d in BLIT_DONE_CORE.iter() {
+        t = t.wrapping_add(d.load(core::sync::atomic::Ordering::Relaxed));
+    }
+    t
+}
+
+/// BLITWHO — one line, printed only from the give-up/tripwire arms (never the hot path): the raw
 /// `BLIT_ACTIVE` word beside everything derived from it, the per-core net, and the last enterer.
 #[cfg(feature = "witness")]
 fn blitwho_report(spin_core: usize) {
@@ -9933,6 +10294,41 @@ fn blitwho_report(spin_core: usize) {
         BLIT_LAST_ENTER_CORE.load(core::sync::atomic::Ordering::Relaxed),
         spin_core
     );
+    // WEDGESRC — the discriminator BLITWHO could not carry. For each core the net can owe:
+    // `inflight[c] = 1` (issued != done) says the core is INSIDE `fb.blit` — its store issued and
+    // never retired, and `aim[c]` is the BAR1 byte offset it is stuck at (flight-1's stuck-store
+    // reading). `inflight[c] = 0` with `net[c] > 0` says the blit RETIRED and only the guard's
+    // drop is owed (flight-3's dead-core bookkeeping debt). `dead[c]` marks cores the steal has
+    // declared dead, so `net[c] > 0 && dead[c] = 1` reads directly as DEBTCLEAR's unwinnable debt.
+    // `win/phase/at/row` are WCSER-H's pass gauges — the same fields flight-1's PASS OVERDUE lines
+    // carried (`at=` names every PW site: `pw-face`, `pw-content`, `span-flush`, …), stamped here
+    // so a drain-side wedge names its stall site without needing the gate tripwire to also fire.
+    // x86-only: the ledger instruments the Kepler BAR1 flush; an aarch64 BLITWHO is unchanged.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let inflight: [u32; 8] = core::array::from_fn(|i| {
+            (BLIT_ISSUED_CORE[i].load(Relaxed) != BLIT_DONE_CORE[i].load(Relaxed)) as u32
+        });
+        let aim: [u64; 8] = core::array::from_fn(|i| BLIT_AIM_CORE[i].load(Relaxed));
+        let dead = COMP_DEAD_EVER.load(Relaxed);
+        let phase = COMP_PASS_PHASE.load(Relaxed);
+        serial_println!(
+            ":: [wedge1] BLITAIM blits_retired={} inflight=[{},{},{},{},{},{},{},{}] \
+             aim=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] \
+             dead=[{},{},{},{},{},{},{},{}] win={} phase={} at={} row={} ::",
+            blits_retired_total(),
+            inflight[0], inflight[1], inflight[2], inflight[3],
+            inflight[4], inflight[5], inflight[6], inflight[7],
+            aim[0], aim[1], aim[2], aim[3], aim[4], aim[5], aim[6], aim[7],
+            dead & 1, (dead >> 1) & 1, (dead >> 2) & 1, (dead >> 3) & 1,
+            (dead >> 4) & 1, (dead >> 5) & 1, (dead >> 6) & 1, (dead >> 7) & 1,
+            COMP_PASS_WIN.load(Relaxed),
+            phase,
+            comp_phase_name(phase),
+            COMP_PASS_ROW.load(Relaxed),
+        );
+    }
 }
 
 impl BlitGuard {
@@ -9956,9 +10352,175 @@ impl BlitGuard {
 
 impl Drop for BlitGuard {
     fn drop(&mut self) {
+        // DEBTCLEAR — a drop whose enter was already SETTLED by [`blit_debt_forgive`] consumes one
+        // forgiveness credit and decrements NOTHING: the settle performed this guard's decrements at
+        // steal/rehome time. This is what keeps the ledger exact across every late arrival —
+        //  * a MIGRATED holder (entered on the core that later died, running live elsewhere): its
+        //    drop lands after the settle, finds the credit, and is absorbed instead of driving
+        //    `BLIT_ACTIVE` below the truth;
+        //  * a REVENANT (the stuck BAR1 store finally retires and the corpse finishes its pass):
+        //    its own guard's drop consumes its own forgiveness credit, so a core coming back from
+        //    the dead re-balances the books instead of corrupting them.
+        // Credits are per enter-core and guarded (`> 0`), so a drop on a core that was never
+        // forgiven takes the normal path below unchanged.
+        #[cfg(target_arch = "x86_64")]
+        if BLIT_FORGIVEN_CORE[self.core]
+            .fetch_update(
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+                |f| if f > 0 { Some(f - 1) } else { None },
+            )
+            .is_ok()
+        {
+            return;
+        }
         BLIT_NET_CORE[self.core].fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
         BLIT_ACTIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
     }
+}
+
+// ---- DEBTCLEAR — a dead core's blit debt is settled, not inherited ------------------------------
+//
+// Flight 3 (rmbp7, 2026-08-27) proved the mechanism of the [wedge1] wedge: `BLITWHO
+// net=[0,1,1,0,0,0,0,0]` at the 363 s abandonment — the drain on c3 was waiting for blit-exits owed
+// by c1 and c2, DEAD since the 95 s / 100 s steals. A parked core never runs its `BlitGuard` drop,
+// so its `BLIT_ACTIVE` registration stands forever, and every later drain that waits for
+// `BLIT_ACTIVE == 0` spins its full bound (1 GiB of spins, measured) UNWINNABLY BY CONSTRUCTION.
+// Each steal plants the debt that wedges the next holder — the staircase's amplifying feedback.
+//
+// THE SETTLE. At rehome time (`render_rehome_service`, the once-per-death mailbox consumer) the
+// dead core's ledger is forgiven: every unretired enter charged to it is decremented out of
+// `BLIT_NET_CORE[dead]` and `BLIT_ACTIVE`, and a FORGIVENESS CREDIT is banked per unit. The credit
+// is the exactness mechanism: `BLIT_NET_CORE` counts guards by ENTER-core, and a holder that
+// entered on the corpse may have migrated and be running live elsewhere — its later drop must not
+// decrement a second time. So the drop path consumes a credit instead (see [`BlitGuard::drop`]),
+// and the interleavings all balance:
+//  * credit published BEFORE the net claim, so a concurrent drop either consumes the credit (and
+//    skips its decrements — the settle already did them) or beats the claim (and the claim loop
+//    sees the reduced net and stops sooner);
+//  * a claim that finds the net exhausted retracts its speculative credit (guarded, never below
+//    zero);
+//  * a credit left dangling belongs to a guard that is genuinely stuck on the parked core; the one
+//    party that can ever consume it is that guard's own revenant drop, which is exactly the drop
+//    it pre-pays.
+//
+// WHAT FORGIVING DOES NOT CLAIM — the zombie-store argument. The corpse's in-flight blit may be the
+// stuck BAR1 store itself, and its writes can still land whenever the store buffer drains. Settling
+// the COUNT must not let a later drain believe the panel is quiescent forever, so the settle also
+// latches [`BLIT_DEBT_TAINT`]: the next composite pass that takes the gate re-damages EVERY live
+// row and queues a whole-panel background fill (the WC-K2 deferred-erase route — `drain_deferred`
+// re-damages everything the fill touches), i.e. one full present. That heals every zombie pixel
+// that landed before it. A store landing later is bounded by the revenant discipline that already
+// exists: a woken corpse finishes at most its current pass (writes clipped to its own window box),
+// `comp_gate_release` declines its release, and the role epoch retires it — leaving at worst the
+// same one-frame stale rectangle the DRAINSTALL abandon arm's ledger already prices and accepts
+// ("self-healing at the next present"). The corpse's surface READS stay valid for the same reason
+// the WCSER-REMINT ledger states: nothing reclaims a parked core's surface store today. ⚠ WC-B:
+// when per-ASID surface mappings land, the abandon arm's revisit note applies to this path too —
+// a forgiven drain's caller may unmap what a revenant still reads.
+//
+// WHAT IS NOT WEAKENED. Live cores' debt is untouched: the settle claims only units recorded
+// against the DEAD core's slot, under a `> 0` guard, and every drain still waits on the full
+// `BLIT_ACTIVE` — including every live guard on every live core — exactly as before. The one shape
+// this seam cannot reach, named rather than discovered later: a core that dies while SPINNING IN A
+// DRAIN (holding `DRAIN_PENDING`, not `COMP_GATE`) is never declared dead by the steal — the steal
+// only convicts the gate holder — so its raise is DRAINRESCUE's business (task death), not this
+// seam's (core death).
+
+/// DEBTCLEAR — forgiveness credits per enter-core: the number of settled enters whose drops, if
+/// they ever arrive (migrated holders, revenants), must be absorbed instead of decremented.
+#[cfg(target_arch = "x86_64")]
+static BLIT_FORGIVEN_CORE: [core::sync::atomic::AtomicI64; 8] = [
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+    core::sync::atomic::AtomicI64::new(0),
+];
+
+/// DEBTCLEAR — a settle forgave nonzero debt and the panel is owed one FULL present before it may
+/// be believed quiescent again (the zombie-store latch; see the ledger above). Consumed by
+/// [`blit_debt_heal_maybe`] on the next gate-holding pass.
+#[cfg(target_arch = "x86_64")]
+static BLIT_DEBT_TAINT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// DEBTCLEAR — settle the blit ledger of a core the steal has declared dead. Returns the number of
+/// enters forgiven. Called once per death from the WCSER-REHOME mailbox consumer, BEFORE the
+/// singleton-role check, so a corpse that carried no role still has its debt retired.
+///
+/// Safe against every late drop by the credit protocol stated in the ledger above; safe against a
+/// false steal because a live "dead" core's guards all drop eventually and each such drop consumes
+/// the credit its settle banked. Takes no lock; atomics only, so it is callable from any service
+/// pass.
+#[cfg(target_arch = "x86_64")]
+pub fn blit_debt_forgive(dead: usize) -> u64 {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    let slot = dead.min(7); // the same clamp `BlitGuard::enter` charges by
+    let mut owed = 0u64;
+    loop {
+        // Credit FIRST, claim second — the order the balance proof needs (ledger above).
+        BLIT_FORGIVEN_CORE[slot].fetch_add(1, AcqRel);
+        if BLIT_NET_CORE[slot]
+            .fetch_update(AcqRel, Relaxed, |n| if n > 0 { Some(n - 1) } else { None })
+            .is_err()
+        {
+            // Net exhausted: retract the speculative credit (guarded — a concurrent drop may have
+            // consumed it, and then the enter it absorbed was one this loop had already settled).
+            let _ = BLIT_FORGIVEN_CORE[slot]
+                .fetch_update(AcqRel, Relaxed, |f| if f > 0 { Some(f - 1) } else { None });
+            break;
+        }
+        BLIT_ACTIVE.fetch_sub(1, AcqRel);
+        owed += 1;
+    }
+    if owed > 0 {
+        BLIT_DEBT_TAINT.store(true, Release);
+        // Make sure a pass actually comes to heal it: `service_damage`'s ~1 s cadence consumes
+        // `COMP_PENDING` even on an otherwise static desktop.
+        COMP_PENDING.store(true, Release);
+    }
+    // The witness — one hit per steal by construction (the rehome mailbox hands each death to
+    // exactly one caller). Its OWN line, deliberately: the [wedge1] tripwire report line belongs to
+    // the stall instrumentation and is under concurrent edit (WEDGESRC).
+    serial_println!(
+        ":: [wcser] blit debt forgiven core={} owed={} active_now={} taint={} == debt-clear ::",
+        dead,
+        owed,
+        BLIT_ACTIVE.load(core::sync::atomic::Ordering::Acquire),
+        if owed > 0 { "armed" } else { "none" }
+    );
+    owed
+}
+
+/// DEBTCLEAR — the heal: if a settle latched the taint, spend this pass making the panel honest
+/// again. Re-damages every live row and queues a whole-panel background fill through the ordinary
+/// WC-K2 deferred-erase route, then lets the pass that called us composite it all — one full
+/// present. Runs on the gate holder (exactly one core), before its `composite_once`.
+#[cfg(target_arch = "x86_64")]
+fn blit_debt_heal_maybe() {
+    use core::sync::atomic::Ordering::AcqRel;
+    if !BLIT_DEBT_TAINT.swap(false, AcqRel) {
+        return;
+    }
+    {
+        let mut t = table();
+        for r in t.rows.iter_mut() {
+            if r.used {
+                r.damage_all();
+            }
+        }
+    }
+    // `erase` clips to the live panel geometry and queues via `defer_erase`; `drain_deferred`
+    // re-damages whatever the fill reaches, which is what makes this a FULL present rather than a
+    // background wipe under stale windows.
+    erase(&[(0, 0, usize::MAX, usize::MAX)]);
+    serial_println!(
+        ":: [wcser] blit debt heal: full present queued — every row re-damaged, whole-panel fill \
+         owed == debt-clear ::"
+    );
 }
 
 /// F4 — number of teardowns currently draining. Non-zero closes the barrier: a composite that sees
@@ -10927,6 +11489,14 @@ impl DrainBarrier {
                     DRAIN_PENDING.load(Ordering::Acquire),
                     spins
                 );
+                // WEDGESRC — name the debt AT THE TRIPWIRE, not 21 s later at the abandon arm.
+                // Flight-3's first `DRAIN STALLED` (342043 ms) carried no BLITWHO; the net that
+                // convicted the dead cores only printed with `DRAIN ABANDONED` at 363075 ms. Same
+                // once-per-boot latch as the line above, same slow path, and the BLITAIM sibling it
+                // now carries is the issued-vs-retired / dead-core discriminator this stall needs
+                // read at the moment the bound STARTS being paid.
+                #[cfg(feature = "witness")]
+                blitwho_report(crate::arch::sched::meter_current_cpu());
             }
             // DRAINSTALL (PA38 metal) — **THE WAIT ENDS.** Past this point the loop stops being a
             // wait and becomes a hang, and PA38 measured what that costs: a core pinned at 99% with
@@ -20219,7 +20789,9 @@ fn stage_window(
             let py = by + band + y;
             comp_mark_row(py);
             if clip.n == 0 {
-                fb.blit(py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+                // WEDGESRC — `blit_traced` IS `fb.blit` plus the per-core aim/issued/done ledger
+                // (three relaxed ops, x86+witness only; the shim is `fb.blit` verbatim elsewhere).
+                blit_traced(fb, py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
                 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     wrote_px += bw as u64;
@@ -20238,7 +20810,7 @@ fn stage_window(
             for &(sx0, sx1) in spans[..ns].iter() {
                 let off = (sx0 - bx) * bpp;
                 let len = (sx1 - sx0) * bpp;
-                fb.blit(py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
+                blit_traced(fb, py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
                 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     row_written += (sx1 - sx0) as u64;
