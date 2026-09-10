@@ -222,29 +222,75 @@ It cannot form on this merge, and the predicate says why rather than an assuranc
 branch for a semantic conflict to form against. This lane's exposure to that class was at the fold
 `85bc4769`, which was gated.
 
-## §7 — WHY THE MERGE HAS NOT BEEN MADE
+## §7 — THE MERGE
 
-Two decisions belong to Peter and both are open at the time of writing.
+`084b79ac`, `--no-ff`, parents `751cb816` + `a51a0396`. **Peter cleared the panel skip in his own
+session and said "skip land and report".**
 
-**1. The panel review.** §3 puts an adversarial agent-panel review first in the landing sequence,
-scoped `origin/main..<tip>`. §4's manual-mode clause says that until `.claude/settings.json` carries
-`Agent` rules the seat asks before launching any executor, and there is no `.claude/` directory in
-this worktree. Scope: 78 files, +10443/−414, 261 commits, 256 non-merge. **The last `Merge hw-rmbp:`
-on trunk is `0ed6fee2`, rmbp 7, 2026-08-27 — this landing is not one arc, it is rounds 8 through 18.**
+The panel review §3 names first was SKIPPED, on his explicit word, and the case put to him was the
+merge shape: `git merge-base origin/main hw-rmbp` = `751cb816` = trunk's tip, so trunk was entirely
+inside the branch and the merge combines NOTHING NEW. A panel would have reviewed content already
+gated in its own round, at a merge that produces no new configuration. This seat recommended the
+panel four turns earlier and reversed on that measurement — **the measurement was available before
+the recommendation and was not made first**, which is the round's clearest process error.
 
-**2. Two greens or three.** §3's two clauses disagree and this is the first landing under the newer
-one: the landing sequence asks for "an ack from at least one other track", which orin satisfies,
-while R39's bullet says "A LANDING IS THREE GREENS AT ONE SHA". What pi's absence costs, measured
-rather than argued — the landing's `.rs` surface is 19 files, 2733 changed lines:
+### Shape, proven, with the control that makes the zero readable
 
-| surface | lines | runtime evidence |
-|---|---|---|
-| `arch/x86_64/*` | 1254 | this seat's six x86 legs, green |
-| shared kernel + `arch/aarch64/*` | 1479 | **none** |
+    git log --pretty=%p -1 084b79ac         ->  751cb816 a51a0396     two parents
+    git log --no-merges 751cb816..751cb816  ->  0                     zero-diff is safe to read
+    git diff a51a0396 084b79ac              ->  0 lines               the arc tip landed whole
+    CONTROL: git diff cd905dbf 084b79ac     ->  269 lines             so the zero is about the trees
 
-`check` proves those 1479 lines COMPILE for aarch64 and orin's legs prove they LINK for Tegra.
-Nothing proves they RUN: pi owns `kernel8-test` and all three arm virt legs, and R39 scopes the virt
-exception to an aarch64 seat's OWN landing, so neither orin nor this seat may run them here.
+pi 6's landing-shape check used as a FORWARD predicate rather than an after-the-fact proof, which is
+a better use of it than the one it was written for (pi 10's reading).
 
-Both peers have said "land it". **A peer's go is not Peter's**, and the rule tension is his or the
-three seats' to settle, not this seat's to resolve in its own favour inside its own landing.
+### Own-board legs ON THE MERGE RESULT — `REAL_EXIT=0`
+
+Run in the TRUNK WORKTREE on `main`, not in this seat's tree, and that is not pedantry about where
+"the merge result" lives: **GATE-LEDGER's strict mode auto-arms on the branch name, so this is the
+only place it runs in the landing posture rather than being forced with an env var.**
+
+    check (both arches)                    rc=0
+    x86 test 25 (MISSION)                  rc=0
+    x86 test-fat sf 300                    rc=0
+    x86 usb-write witness                  rc=0
+    x86 STAT.ELF off FAT (WINX-2)          rc=0
+    x86 VUG.ELF off FAT (WINX-8)           rc=0
+    x86 PULSE.ELF off FAT (PULSE-W)        rc=0
+
+`GATE-LEDGER: OK — 281 rows in 3 ledger file(s) + RULINGS … cross-refs resolve`, **with no deferred
+clause at all**, where the same gate on the track branch before the fix carried `2 cross-branch
+ref(s) deferred`. That absence is the proof strict was armed and clean — the trunk red this round
+existed to find is gone from the tree it would have appeared on.
+
+### One honesty note on the ack shas
+
+orin 25's third and final ack is at `cd905dbf`; the merged arc tip is `a51a0396`. The delta is
+`docs/dev/LEDGER.md` (SR12's fourth face) and this file, two files, zero `.rs`. **It was not counted
+as covering `a51a0396` and orin was told so rather than left to assume** — they re-ran three times
+across the session specifically to avoid a carried-over green, and the round should not end by
+quietly doing to them what they refused to do to themselves.
+
+### What did NOT land with it
+
+**1,479 changed lines of shared kernel and `arch/aarch64` are on trunk with ZERO aarch64 RUNTIME
+evidence.** `check` proves they compile, orin's legs prove they link for Tegra, nothing proves they
+run: pi owns `kernel8-test` and all three virt legs, and R39 scopes the virt exception to an aarch64
+seat's OWN landing. **pi 10's step 3 is the real runtime verdict on this content, and a red there is
+a finding about landed code, not a regression from this landing.**
+
+### The mechanism hole the three seats left this morning
+
+pi 10 found it and it is the reason the landing did not wait on them. R39 settled **WHO** runs which
+legs; Peter's sequence says **WHEN** — orin lands, rmbp merges trunk and lands, pi merges and gates —
+and R39 never re-ordered it. **And no lawful move exists by which a peer produces a board green at
+an unlanded peer sha:** a worktree at another seat's branch is what Peter ruled against in pi's
+session that day and killed a run over, merging a track into a track is not one of the two sanctioned
+kinds, and the tip was unpushed regardless. **A precondition that no permitted action can satisfy is
+not a precondition.** Filed here as a hole in what the three seats settled, not as pi's refusal.
+
+## Push owed
+
+ONE, batched: `git push origin main hw-rmbp`. At the time of writing `origin/main` is `751cb816` and
+the landing exists on this box only. Peter pushed `3f0045de` and later `cd905dbf` mid-session without
+announcing either, so any successor re-fetches rather than trusting a line in a document.
