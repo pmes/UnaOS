@@ -95,7 +95,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 ## 3. Arcs, git, lanes
 
 - **One arc per session, multi-milestone,** each green and committed before the next; no adjacent
-  improvements. DONE gate: the brief's outputs, `./arroyo check` both arches, the track's QEMU suite
+  improvements. DONE gate: the brief's outputs, `./arroyo check` both arches, the track's OWN-BOARD QEMU suite
   once per staged image, the named doc update.
 - **Commit only on your own track or executor branch.** Message `subsystem: imperative summary`
   plus the model's `Co-Authored-By`; a message carrying code goes through `git commit -F`.
@@ -120,9 +120,27 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   both seats that turn; obtain an ack from at least one other track (silence is not consent; an
   unresolved objection goes to Peter with both positions); immediately before the merge announce
   again and re-check trunk, merging it in and re-running the battery if it moved; merge `--no-ff`;
-  run the trunk battery; then prove the shape: `git log --pretty=%p -1 <merge>` shows two parents,
+  run **the landing seat's OWN-BOARD legs, never the trunk battery** (R39, 2026-09-10 — the cross-platform
+  battery is what made every landing proof all three boards, so the rule that required it is the rule that
+  had to change); then prove the shape: `git log --pretty=%p -1 <merge>` shows two parents,
   and a zero `git diff <arc-tip> <merge>` is safe only if `git log --no-merges --oneline
   <merge-base>..<trunk-tip>` is empty (pi 6 2026-09-05). Doc and `arroyo` conflicts resolve by union.
+- **NO SEAT PROOFS, GATES OR DEBUGS ANOTHER SEAT'S BOARD** (R39, Peter 2026-09-10). Each board's legs are run
+  by the seat that owns it: **x86** — `test`, `test-fat`, the ELF-off-FAT legs and the x86 usb-write witness;
+  **pi** — `kernel8-test`; **jetson** — `check (tegra)` and `esp-jetson`. `check` is NOT platform-scoped: it is a
+  compile, one invocation type-checks both arches, and every seat runs it whole — a cfg-widen must compile the
+  configuration it turns ON (pi 10's amendment). **A leg with no NAMED owner defaults to whoever is running, and
+  that is the landing seat — so `arm virt v2`, `arm virt v3` and the arm usb-write witness (a `cat` of the v2
+  capture) are named to one aarch64 seat, unconditionally, never "mine unless you want them".**
+  **A LANDING IS THREE GREENS AT ONE SHA, NOT ONE SEAT'S BATTERY** — each seat runs its own board in its own tree
+  and acks with the command and the result.
+  ⚠ **AND A BOARD'S SELF-PROOF IS ONLY WHAT THAT BOARD CAN PROVE ALONE** (orin 25's amendment, and it is load-
+  bearing): there is NO QEMU model for the Jetson — `arroyo` launches `q35`, `raspi4b` and generic `virt`, and
+  zero tegra machines. x86 self-proves on q35, pi on raspi4b, **jetson cannot self-prove at runtime at all.** So
+  a jetson green certifies that it COMPILES AND LINKS, not that it runs; Orin runtime is proven by a render
+  flight, which is a scheduled bench event and NEVER a landing gate. Any reader of a jetson ack must know that is
+  all it is — and any scheme that demands more would block every landing on Peter's calendar.
+  Enforcer: R39; the platform selector on `battery()`; and this list, which names every leg's owner.
 - **Lanes:** the rmbp seat owns shared kernel core; pi and jetson touch the files their brief names.
   An out-of-lane need is negotiated over ccd with the owning seat and the grant is recorded in both
   transcripts; a grant in one transcript is a preference, not a grant. An ack given to one shape is
