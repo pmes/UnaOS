@@ -33,3 +33,8 @@ cargo_check.log
 jetson-serial.log
 pi-serial.log
 aether-ledger.txt
+
+# Python bytecode from the scripts/ helpers (mbench is imported by path from
+# qemu_await.py, which makes CPython drop a __pycache__ beside it).
+__pycache__/
+*.pyc

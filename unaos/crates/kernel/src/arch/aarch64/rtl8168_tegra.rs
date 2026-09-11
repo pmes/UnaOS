@@ -583,9 +583,12 @@
 //      a single aligned 8-byte volatile write to a 16-byte descriptor on a 256-byte-aligned NC ring, so
 //      a concurrent fetch sees the old or the new address WHOLE — both are named arms.
 //      **After the re-point NO descriptor anywhere carries buffer 17's address.**
-//   2. **RESTAMP-ALL** (`net5_on_pop`): scan ring AND shadow for lost tags, print, then re-stamp EVERY
-//      tag in both blocks. Each pop's set is then "written since the previous pop" — the sticky-tag
-//      artifact is removed by construction, and a repeated landing has to be re-proven every time.
+//   2. **CONSUME-ON-READ** (`net5_on_pop`; was RESTAMP-ALL until orin 23): scan ring AND shadow for
+//      lost tags, print, then re-stamp EXACTLY the one buffer this pop delivered from. A tag therefore
+//      means "this buffer is free", and a missing tag means "this buffer holds a frame no pop has read
+//      yet" — the sticky-tag artifact stays gone (a landing is cleared when, and only when, it is
+//      delivered) and a landing the driver has not yet consumed can no longer be destroyed. See
+//      § THE RENDER11 FOLD below for why the old RESTAMP-ALL was the no-lease.
 //
 // VERDICT ARMS (`[net5T] … verdict=`; mutually exclusive, decided in this order):
 //   * `REFETCH-LIVE`       shadow[s] written, s = the completing slot ⇒ the NIC re-fetched desc[s]
@@ -615,6 +618,43 @@
 // its tag, else nothing — and records `slot_expected`/`slot_read` on `[net5T]` and `[net5V]`. It consumes
 // nothing: `net5_on_pop` runs after it and its scan is the instrument, and the RESTAMP-ALL there is the
 // consume. An ambiguous pop (two or more shadow buffers written) refuses rather than guess an index.
+//
+// ## THE RENDER11 FOLD (orin 23) — the no-lease was TWO defects in the read path, both ours
+//
+// render11 flew the read side above with the cable in and scored `REFETCH-WRONGSLOT=3 NOWHERE=1
+// CONTROL-OK=1`, `divergent-reads=3`, and still `dhcp-rx: offer=0 ack=0 => NO LEASE`. The wire names
+// both causes, and neither is the NIC:
+//
+//   **(1) THE LENGTH DID NOT MOVE WITH THE FRAME.** `len` comes from the COMPLETING descriptor's
+//   writeback; the bytes come from wherever the NIC wrote them. On a divergent read those are two
+//   different frames. Pop 3 completed slot 3 with `len=62` and read the buffer the NIC had filled with
+//   a 342-byte frame, so smoltcp was handed its first 62 bytes — and the wire says exactly what that
+//   frame was: `[net4d] rx[4] len=62 dst=4c:bb:47:25:49:c8 src=9c:69:d3:28:6e:f4 et=0x0800
+//   class=udp-other`, i.e. UNICAST TO OUR STATION MAC, from the router, IPv4/UDP. That is the DHCP
+//   OFFER. `decode_dhcp` needs the 236-byte BOOTP header plus the magic cookie, so at 62 bytes it
+//   cannot match and the frame files as `udp-other` with `offer=0`. FIX: on a divergent read, derive
+//   the length from the frame's own L2/L3 headers (`net5_frame_len_from_headers`).
+//
+//   **(2) RESTAMP-ALL DESTROYED THE UNCONSUMED LANDING.** `net5_on_pop` re-stamped all 64 buffer heads
+//   at the END of every pop — roughly 100 µs of uncached scanning after the read site had already
+//   chosen its frame. Anything the NIC delivered inside that window had its Ethernet header overwritten
+//   with a landing tag and became indistinguishable from an untouched buffer. That is pop 4: `slot=4
+//   len=342` (the OFFER's own writeback, one descriptor behind its payload) over a shadow block whose
+//   tags were ALL intact ⇒ `NOWHERE`, `net5_read_src` returned `None`, the caller fell back to the
+//   completing slot's untouched original buffer, and 342 bytes of `net4f_tag(4)` went to smoltcp —
+//   visible on the wire as `[net4t] other[0] len=342 first32B=4e455434455f04fb4e455434455f04fb0000…`,
+//   which is `"NET4E_" + 0x04 + 0xfb` twice, verbatim. FIX: consume-on-read (arm 2 above), plus refuse
+//   to deliver at all when no buffer in either block holds an unread frame.
+//
+// What is NOT ours, and is NOT fixed here: the NIC resolves EVERY re-pointed descriptor's payload to
+// descriptor 17's buffer address — the SAME INDEX at every placement the driver has ever used:
+// 0x268018800 in the boot7h high window and 0x80018800 on the net4-only low boot are both
+// `window+0x18800`, two GiB of layout apart (NET5.md §3 C2), and with the shadow armed it resolves to
+// 0x80058800 = `shadow+0x8800` — while its OWN/len writeback advances 0,1,2,3,4
+// in ring order. So `REFETCH-LIVE` is expected to stay 0 and `REFETCH-WRONGSLOT` to stay high; the
+// driver's job is to deliver correctly THROUGH that reuse, which is what the two fixes above do.
+// `zero-payload=` also stopped lying: on a net5 boot the original buffer of every slot ≥ 1 is
+// unwritable by construction, so the old counter reported 4/5 as an artifact of the probe itself.
 //
 // ABSENCE IS A VERDICT, in three shapes: no `[net5R] ARMED` line (the probe refused — the `[net5R] NOT
 // ARMED` line names below4g=0 or a shadow outside the identity region: UNDECIDED, not FAIL); a
@@ -652,6 +692,9 @@ pub fn net4_bringup(dtb_addr: u64, dtb_size: usize, _ram_gib_mask: u64) {
         "{} ORIN-NET-4 RTL8168 driver compiled; no Tegra234 RC on this build (QEMU virt) — bring-up is metal-only (UNAOS_NET4=1 UNAOS_TEGRA=1) ::",
         P4
     );
+    // NET-5 (orin 23): the QEMU-runnable half of the render11 fix. See `net5_fixture`.
+    #[cfg(feature = "net5")]
+    net5_fixture();
     // ORIN-DMA-WINDOW (virt witness): exercise the `dma-ranges` derivation against the live DTB. QEMU
     // virt exposes a generic (non-Tegra) `pcie@`, so the Tegra-RC-gated parse yields 0 windows and the
     // heap-guard degrades to the RAS-2 highest-clean heuristic — this line witnesses that fallback path
@@ -671,6 +714,187 @@ pub fn net4_bringup(dtb_addr: u64, dtb_size: usize, _ram_gib_mask: u64) {
     }
 }
 
+/// NET-5 (orin 23) — derive a frame's TRUE length from its own L2/L3 headers, reading the buffer
+/// directly (volatile NC-DRAM reads; the caller owns the `dma_rmb`).
+///
+/// This exists because the C+ writeback length and the payload landing site are DECOUPLED on this
+/// board: the descriptor writeback advances slot-by-slot correctly while every payload for a
+/// re-pointed descriptor is DMA'd to ONE latched address. When the frame is therefore read from a
+/// slot OTHER than the completing one, the completing descriptor's length belongs to a DIFFERENT
+/// frame and using it truncates (or over-runs) the one actually in the buffer. render11 is the
+/// proof: pop 3 completed slot 3 with `len=62` while the buffer held the 342-byte DHCP OFFER, so
+/// smoltcp was handed the OFFER's first 62 bytes — `decode_dhcp` needs the 236-byte BOOTP header
+/// plus the magic cookie, so a 62-byte OFFER classifies `udp-other` and the lease never starts.
+///
+/// Returns `None` when the header shape is not one we can measure (the caller then keeps the
+/// descriptor length, which is still the best available estimate). Every read is bounds-free by
+/// construction — offsets are fixed and far inside the smallest buffer any caller passes — and
+/// every derived value is
+/// range-checked against `max` before it is believed, so a garbage buffer can never produce an
+/// out-of-range len. File scope (outside `mod metal`) on purpose: it depends on no device state, so
+/// the QEMU-virt `net5_fixture` below can drive it on a build with no Tegra RC at all.
+#[cfg(feature = "net5")]
+fn net5_frame_len_from_headers(p: *const u8, max: usize) -> Option<usize> {
+    let rd = |off: usize| -> u8 { unsafe { core::ptr::read_volatile(p.add(off)) } };
+    let be16 = |off: usize| -> u16 { u16::from_be_bytes([rd(off), rd(off + 1)]) };
+    // Peel up to two 802.1Q/802.1ad tags, exactly as `eth_effective_type` does for the classifier.
+    let mut off = 12usize;
+    let mut et = be16(off);
+    for _ in 0..2 {
+        if et == 0x8100 || et == 0x88a8 {
+            off += 4;
+            et = be16(off);
+        } else {
+            break;
+        }
+    }
+    let l3 = off + 2;
+    let total = match et {
+        // ARP: fixed 28-byte payload for the IPv4-over-Ethernet shape (and any other hlen/plen the
+        // header itself declares — 8 fixed bytes + 2*(hlen+plen)).
+        0x0806 => {
+            let hlen = rd(l3 + 4) as usize;
+            let plen = rd(l3 + 5) as usize;
+            l3 + 8 + 2 * (hlen + plen)
+        }
+        0x0800 => {
+            if rd(l3) >> 4 != 4 {
+                return None;
+            }
+            let ip_total = be16(l3 + 2) as usize;
+            if ip_total < 20 {
+                return None;
+            }
+            l3 + ip_total
+        }
+        0x86dd => {
+            if rd(l3) >> 4 != 6 {
+                return None;
+            }
+            l3 + 40 + be16(l3 + 4) as usize
+        }
+        _ => return None,
+    };
+    if total < 14 || total > max {
+        return None;
+    }
+    Some(total)
+}
+
+/// NET-5 (orin 23) — the QEMU-RUNNABLE half of the render11 no-lease fix (`[net5F]`).
+///
+/// QEMU virt cannot model the defect itself: the pop path lives in `mod metal`, which is
+/// `#[cfg(feature = "tegra")]`, and it needs a Tegra234 root complex, the DesignWare inbound iATU and
+/// an RTL8168 that resolves every re-pointed descriptor's payload to one latched address. Neither
+/// `virtio-net` nor `e1000` reproduces any of that — their payloads land in the descriptor's own
+/// buffer, which is precisely the case the bug does NOT occur in — so a virtio/e1000 leg would be
+/// green on the broken code and green on the fixed code alike, i.e. a check that cannot fire.
+///
+/// What IS portable is the half of the fix that turns the wire evidence into a lease:
+/// `net5_frame_len_from_headers` — the rule that on a divergent read the LENGTH must come from the
+/// frame in hand, not from the completing descriptor. That is a pure function over a buffer, so this
+/// fixture drives it on QEMU with the exact render11 shapes and goes red if it regresses:
+///
+///   * the 342-byte DHCP OFFER that render11 delivered as 62 bytes (the whole no-lease),
+///   * the same OFFER 802.1Q-tagged (the `eth_effective_type` peel, mirrored here),
+///   * a 60-byte ARP (pops 1 and 2 on render11) and an IPv6 frame,
+///   * a buffer of landing-tag bytes, which MUST refuse (`None`) rather than invent a length.
+///
+/// GATE COMMAND, and it needs THREE knobs, not two:
+///     `UNAOS_GICV3=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo test-arm`
+/// `UNAOS_GICV3` is not decoration. `net4_bringup`'s virt call site sits inside `main.rs`'s
+/// `if unaos_kernel::arch::gic::is_v3()` block, and `./arroyo test-arm` boots the `virt` board at
+/// gic-version=2 unless that knob is set — so WITHOUT it this fixture never runs, the run is green,
+/// and the green means nothing. Measured, not assumed: the two-knob run exits 0 with no `[net5F]`
+/// line anywhere on the wire. Go-red proven the same way (orin 23): mutating the IPv4 arm to return
+/// a fixed length reproduces render11's own number — `[net5F] MISMATCH: derived=Some(62)
+/// expected=Some(342)` — and takes `test-arm` itself to exit 1.
+///
+/// The consume-on-read half of the fix is NOT covered here: it is a method on the tegra driver struct
+/// and needs the ring, the shadow block and the NC window, none of which exist on virt. Metal is its
+/// only gate, and the `[net5T] … unread=` / `[net5V] … dropped-nopayload=` tokens are what score it.
+#[cfg(all(feature = "net5", not(feature = "tegra")))]
+fn net5_fixture() {
+    let mut b = [0u8; 96];
+    let mut fails = 0u32;
+    let mut checks = 0u32;
+    let chk = |got: Option<usize>, want: Option<usize>, fails: &mut u32, checks: &mut u32| {
+        *checks += 1;
+        if got != want {
+            *fails += 1;
+            serial_println!(
+                "{}   [net5F] MISMATCH: derived={:?} expected={:?} ::",
+                P4, got, want
+            );
+        }
+    };
+    // (1) The render11 frame: IPv4/UDP, ip.total_length = 328 => 14 + 328 = 342.
+    b[12] = 0x08;
+    b[13] = 0x00;
+    b[14] = 0x45;
+    b[16] = (328u16 >> 8) as u8;
+    b[17] = (328u16 & 0xff) as u8;
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), Some(342), &mut fails, &mut checks);
+
+    // (2) The same frame under one 802.1Q tag: L3 moves to 18, so 18 + 328 = 346.
+    b = [0u8; 96];
+    b[12] = 0x81;
+    b[13] = 0x00;
+    b[16] = 0x08;
+    b[17] = 0x00;
+    b[18] = 0x45;
+    b[20] = (328u16 >> 8) as u8;
+    b[21] = (328u16 & 0xff) as u8;
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), Some(346), &mut fails, &mut checks);
+
+    // (3) ARP over Ethernet/IPv4: 14 + 8 + 2*(6+4) = 42 (the caller floors it at the 60-byte minimum).
+    b = [0u8; 96];
+    b[12] = 0x08;
+    b[13] = 0x06;
+    b[18] = 6; // hlen
+    b[19] = 4; // plen
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), Some(42), &mut fails, &mut checks);
+
+    // (4) IPv6: 14 + 40 + payload(16) = 70.
+    b = [0u8; 96];
+    b[12] = 0x86;
+    b[13] = 0xdd;
+    b[14] = 0x60;
+    b[19] = 16;
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), Some(70), &mut fails, &mut checks);
+
+    // (5) A buffer holding nothing but a landing tag MUST refuse. This is the case the old read site
+    //     delivered as a 342-byte frame; a helper that invented a length here would re-open it. The
+    //     bytes are `net4f_tag(4)` verbatim — the ones render11 put on the wire as
+    //     `[net4t] other[0] len=342 first32B=4e455434455f04fb4e455434455f04fb…` — written out here
+    //     rather than called, because the tag helper is private to the tegra-only `metal` module and
+    //     this fixture has to build on a QEMU-virt image that has no such module.
+    b = [0u8; 96];
+    b[..16].copy_from_slice(&[
+        0x4e, 0x45, 0x54, 0x34, 0x45, 0x5f, 0x04, 0xfb,
+        0x4e, 0x45, 0x54, 0x34, 0x45, 0x5f, 0x04, 0xfb,
+    ]);
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), None, &mut fails, &mut checks);
+
+    // (6) A declared IPv4 total-length shorter than an IPv4 header, and one longer than the buffer,
+    //     both refuse rather than hand the copy an out-of-range length.
+    b = [0u8; 96];
+    b[12] = 0x08;
+    b[13] = 0x00;
+    b[14] = 0x45;
+    b[17] = 8;
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), None, &mut fails, &mut checks);
+    b[16] = 0xff;
+    b[17] = 0xff;
+    chk(net5_frame_len_from_headers(b.as_ptr(), 2048), None, &mut fails, &mut checks);
+
+    serial_println!(
+        "{}   [net5F] divergent-read length derivation: checks={} failures={} => {} — on a divergent read the length comes from the frame in hand, never from the completing descriptor (render11 delivered the 342-byte DHCP OFFER as 62 bytes and never leased) ::",
+        P4, checks, fails,
+        if fails == 0 { "PASS" } else { "FAIL" }
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 // The metal driver (`net4` + `tegra`) — device claim, BAR map, MAC read (M1); rings (M2); bind (M3).
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -681,6 +905,11 @@ pub use metal::net4_bringup;
 #[cfg(feature = "tegra")]
 mod metal {
     use super::P4;
+    /// NET-5 (orin 23): the divergent-read length rule lives at file scope so the QEMU-virt
+    /// `net5_fixture` can drive it on a build with no Tegra RC at all; the pop path in here is
+    /// its production caller.
+    #[cfg(feature = "net5")]
+    use super::net5_frame_len_from_headers;
     use crate::arch::aarch64::fdt_tegra::Fdt;
     use crate::arch::aarch64::mmu_tegra::{
         install_nc_window, install_net4b_nc, map_mmio_window, net4a_low_nc_window, net4b_nc_window,
@@ -1421,6 +1650,39 @@ mod metal {
         net5_slot_read: i64,
         #[cfg(feature = "net5")]
         net5_read_divergent: u64,
+        /// NET-5 (orin 23) — CONSUME-ON-READ bookkeeping. `net5_consumed` names the buffer the read
+        /// site actually delivered from this pop, encoded as `idx` for a SHADOW buffer and
+        /// `idx + NUM_RX` for an ORIGINAL ring buffer (`-1` = nothing delivered). `net5_on_pop`
+        /// re-stamps EXACTLY that buffer and no other, which is what makes a landing tag mean "this
+        /// buffer holds an UNREAD frame" instead of "written at some point since the last pop".
+        #[cfg(feature = "net5")]
+        net5_consumed: i64,
+        /// NET-5 (orin 23) — how many buffers held an unread landing when the read site resolved, and
+        /// the length it delivered (header-derived on a divergent read). Both ride `[net5T]` so the
+        /// truncation half of the defect is measurable on the wire and not only inferable.
+        #[cfg(feature = "net5")]
+        net5_dirty_n: usize,
+        /// NET-5 (orin 23) — the unread-landing masks AS THE READ SITE SAW THEM, before the consume.
+        /// The consume now happens immediately after the frame copy (a few microseconds), not at the
+        /// end of `net5_on_pop` a hundred-odd microseconds of uncached scanning later, so a frame the
+        /// NIC delivers into the latched address during the witnesses cannot be erased by our own
+        /// re-stamp. `net5_on_pop` ORs these into its own scan so the verdict arm still describes what
+        /// this completion landed, not what survived until the witness ran. Zeroed at the top of every
+        /// completion, so the RES path — which never reaches the read site — scans fresh.
+        #[cfg(feature = "net5")]
+        net5_read_shadow_mask: u32,
+        #[cfg(feature = "net5")]
+        net5_read_ring_mask: u32,
+        #[cfg(feature = "net5")]
+        net5_read_len: i64,
+        /// NET-5 (orin 23) — one-shot latch for the `[net5N]` non-cacheable-source witness.
+        #[cfg(feature = "net5")]
+        net5_nc_witnessed: bool,
+        /// NET-5 (orin 23) — completions dropped because NOTHING was written in either block. The
+        /// old code delivered `len` bytes of landing TAG to smoltcp in this case (render11's
+        /// `[net4t] other[0] len=342 first32B=4e455434455f04fb…` is `net4f_tag(4)` verbatim).
+        #[cfg(feature = "net5")]
+        net5_dropped_nopayload: u64,
     }
 
     // The driver owns raw DMA pointers; on the single-CPU main-loop/poll discipline it is only ever
@@ -2729,6 +2991,13 @@ mod metal {
                 return None;
             }
             self.net4f_empty_polls = 0;
+            // NET-5 (orin 23): a fresh completion carries no read-time masks yet. The RES path below
+            // returns without ever reaching the read site, so `net5_on_pop` must scan for itself there.
+            #[cfg(feature = "net5")]
+            {
+                self.net5_read_shadow_mask = 0;
+                self.net5_read_ring_mask = 0;
+            }
             // NET-4e: DMA READ BARRIER between observing OWN-clear and reading the buffer — the fix
             // for the DHCP no-lease. The NIC commits a received frame by writing the payload FIRST and
             // clearing OWN LAST; on weakly-ordered aarch64 the CPU may observe the OWN-clear without yet
@@ -2853,13 +3122,28 @@ mod metal {
                 }
                 same
             };
+            // NET-5 (orin 23) — RESOLVE THE FRAME'S SOURCE FIRST, because every reading below depends
+            // on it. `net5_read_src` is read-only; it names the buffer that holds an UNREAD landing for
+            // this completion, or `None` when there is provably no payload to deliver anywhere.
+            #[cfg(feature = "net5")]
+            let net5_src = self.net5_read_src();
             // NET-4V: tally the completing descriptor's OWN-buffer un-writtenness on EVERY pop.
             // `rx_zero_payload` vs `rx_count` is the rate the window-close verdict quotes. Fold
             // resolution (NET-4V + NET-4F): the original all-zero-head test is the SAME ambiguous
             // match that produced the phantom [net4z] landing, so this counter now rides NET-4F's
             // landing TAG — a buffer still carrying its tag was provably not written, which is the
             // quantity NET-4V always meant to count.
-            if slot_untouched {
+            //
+            // orin 23: on a `net5` boot the completing slot's ORIGINAL buffer can never be written for
+            // any slot ≥ 1 — `net5_arm` re-points those descriptors at the shadow block by construction
+            // — so this counter read `zero-payload=4/5` on render11 as an ARTIFACT of the probe, not as
+            // a finding. Under net5 it counts the quantity it was always meant to: completions for which
+            // NO buffer in EITHER block held a frame.
+            #[cfg(feature = "net5")]
+            let no_payload = slot_untouched && net5_src.is_none();
+            #[cfg(not(feature = "net5"))]
+            let no_payload = slot_untouched;
+            if no_payload {
                 self.rx_zero_payload += 1;
             }
             let mut harvest: *mut u8 = core::ptr::null_mut();
@@ -2952,11 +3236,56 @@ mod metal {
             // slot_expected/slot_read for `[net5V]`; it CONSUMES NOTHING, so the per-pop scan in
             // `net5_on_pop` (which runs after this and owns the RESTAMP-ALL) still sees the landing it
             // exists to score.
+            //
+            // orin 23 — THE LENGTH MOVES WITH THE FRAME. The writeback length belongs to the COMPLETING
+            // descriptor; the bytes come from wherever the NIC actually wrote them. When those are
+            // different slots the two describe DIFFERENT FRAMES, and using the descriptor's length
+            // truncates or over-runs the one in hand. render11 pop 3: `slot=3 len=62` over a buffer
+            // holding the 342-byte DHCP OFFER ⇒ smoltcp got the OFFER's first 62 bytes, `decode_dhcp`
+            // needs the 236-byte BOOTP header plus the magic cookie, and the frame classified
+            // `udp-other` with `offer=0`. On a divergent read, take the length from the frame's own
+            // headers and fall back to the descriptor's only when the headers cannot be measured.
             #[cfg(feature = "net5")]
-            let buf = self.net5_read_src().unwrap_or(buf);
+            let buf = match net5_src {
+                Some(p) => {
+                    if self.net5_slot_read != self.net5_slot_expected {
+                        if let Some(d) = net5_frame_len_from_headers(p as *const u8, RX_BUF_SIZE) {
+                            len = d.max(60).min(RX_BUF_SIZE).min(out.len());
+                        }
+                    }
+                    self.net5_read_len = len as i64;
+                    p
+                }
+                None => buf,
+            };
+            // orin 23 — NOTHING TO DELIVER is not the same as a zero-length frame. When no buffer in
+            // either block holds an unread landing, `buf` still points at the completing slot's own
+            // buffer, which carries only its 16-byte landing TAG; copying `len` bytes of it handed
+            // smoltcp a frame made of instrument bytes (render11: `[net4t] other[0] len=342
+            // first32B=4e455434455f04fb…`, which is `net4f_tag(4)` repeated). Recycle the descriptor and
+            // report nothing — the same discipline the RES error path above already uses — but only
+            // AFTER every witness below has scored this completion.
+            #[cfg(feature = "net5")]
+            let deliverable = net5_src.is_some() || !slot_untouched || !harvest.is_null();
+            #[cfg(not(feature = "net5"))]
+            let deliverable = true;
             let src: *const u8 = if !harvest.is_null() { harvest } else { buf };
+            // NET-4e/orin 23: order the payload read AFTER the tag scan that selected this buffer. NC
+            // loads reorder on weakly-ordered aarch64, so without this the copy could be hoisted above
+            // the resolution and read the buffer as it stood before the NIC's write.
+            dma_rmb();
             unsafe {
                 core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
+            }
+            // NET-5 (orin 23) — CONSUME NOW, microseconds after the copy, not at the end of the witness
+            // sweep. The masks the read site recorded are what `net5_on_pop` scores its arm from, so
+            // freeing the buffer here costs the instrument nothing and shrinks the window in which our
+            // own re-stamp could erase a landing that arrived while the witnesses were running from
+            // ~150 µs of uncached scanning to the length of one `copy_nonoverlapping`. Skipped when the
+            // BUF1 harvest supplied the bytes — that path consumes its own buffer below.
+            #[cfg(feature = "net5")]
+            if harvest.is_null() {
+                self.net5_consume();
             }
             if !harvest.is_null() {
                 // Consume: NET-4F re-stamps the harvested buffer's landing TAG (was: zero the head) so
@@ -2982,7 +3311,12 @@ mod metal {
             self.rx_count += 1;
             // NET-4d: classify this frame (bounded, read-only) while the DHCP discover window is live.
             // Borrows `out` (not `self`), so the &mut self counter updates do not alias.
-            self.net4d_classify(&out[..len]);
+            // orin 23: only a frame we are actually going to deliver is classified — an undeliverable
+            // completion's `out` holds landing-tag bytes, and classifying those inflated the window's
+            // `other=` bucket with an instrument artifact.
+            if deliverable {
+                self.net4d_classify(&out[..len]);
+            }
             // NET-4m: the DECISIVE per-pop discriminator (knob-gated, read-only). The zeros survived
             // NET-4l's correct OWN-last re-arm AND the per-pop `dc ivac` above (the copy at line ~1107
             // is ALREADY a post-invalidate DRAM read), so "more invalidate" is a no-op — the open
@@ -3309,6 +3643,16 @@ mod metal {
             #[cfg(feature = "net5")]
             self.net5_on_pop(len);
             self.rearm_current_rx();
+            // orin 23 — the honest empty return. Every witness above has scored this completion; the
+            // descriptor is recycled by the same publish discipline as a delivered frame. What we refuse
+            // to do is manufacture a frame out of landing-tag bytes.
+            if !deliverable {
+                #[cfg(feature = "net5")]
+                {
+                    self.net5_dropped_nopayload += 1;
+                }
+                return None;
+            }
             Some(len)
         }
 
@@ -3566,12 +3910,16 @@ mod metal {
             }
         }
 
-        /// NET-5 — the honest per-pop landing scan (header § NET-5). Scans the ring AND the shadow block
-        /// for lost landing tags, emits ONE mutually-exclusive verdict arm, then RE-STAMPS EVERY tag in
-        /// both blocks so the next pop's set means "written SINCE THE PREVIOUS POP" — which is the
-        /// sticky-tag defect that made `[net4F]`'s "4 consecutive completions" run vacuous. Runs AFTER
-        /// `net4g_on_pop` (so the NET-4G attribution reads pre-restamp state) and BEFORE the re-arm.
-        /// Read-only except for the tag re-stamps.
+        /// NET-5 — the honest per-pop landing scan (header § NET-5). Emits ONE mutually-exclusive
+        /// verdict arm over the buffers holding an UNREAD landing. Runs AFTER `net4g_on_pop` (whose
+        /// attribution reads the ring for itself) and BEFORE the re-arm.
+        ///
+        /// orin 23: FULLY READ-ONLY now. It no longer re-stamps anything — `net5_consume`, called by
+        /// the pop path immediately after the frame copy, owns the consume — and it takes the masks
+        /// `net5_read_src` recorded at read time (`net5_read_*_mask`) as its floor, so a landing this
+        /// pop delivered still shows in the arm even though it has already been freed. It re-scans on
+        /// top of that floor so a landing that arrived since the read (or the RES path, which never
+        /// reaches the read site and leaves the floor at zero) is still counted.
         #[cfg(feature = "net5")]
         fn net5_on_pop(&mut self, len: usize) {
             if self.net5_shadow == 0 {
@@ -3579,27 +3927,23 @@ mod metal {
             }
             let s = self.rx_cur;
             dma_rmb(); // one read barrier per probe pass; every site read below is NC direct DRAM
-            let mut ring_mask: u32 = 0;
-            let mut shadow_mask: u32 = 0;
-            let mut ring_first: i64 = -1;
-            let mut shadow_first: i64 = -1;
+            let mut ring_mask: u32 = self.net5_read_ring_mask;
+            let mut shadow_mask: u32 = self.net5_read_shadow_mask;
             for k in 0..NUM_RX {
                 if !net4g_tag_intact((self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64, k) {
                     ring_mask |= 1u32 << k;
-                    if ring_first < 0 {
-                        ring_first = k as i64;
-                    }
                 }
                 if !net4g_tag_intact(
                     self.net5_shadow + (k * RX_BUF_SIZE) as u64,
                     NET5_SHADOW_TAGBASE + k,
                 ) {
                     shadow_mask |= 1u32 << k;
-                    if shadow_first < 0 {
-                        shadow_first = k as i64;
-                    }
                 }
             }
+            // Derive the firsts from the FINAL masks, so the seeded read-time landings are not invisible
+            // to `first=` just because the consume already freed them.
+            let ring_first: i64 = if ring_mask == 0 { -1 } else { ring_mask.trailing_zeros() as i64 };
+            let shadow_first: i64 = if shadow_mask == 0 { -1 } else { shadow_mask.trailing_zeros() as i64 };
             let own_shadow = shadow_mask & (1u32 << s) != 0;
             let own_ring = ring_mask & (1u32 << s) != 0;
             let (arm, meaning) = if own_shadow {
@@ -3636,25 +3980,51 @@ mod metal {
             if self.net5_witnessed < NET5_WITNESS_N {
                 self.net5_witnessed += 1;
                 serial_println!(
-                    "{}   [net5T] rx[{}] slot={} len={} SINCE-LAST-POP shadow-mask={:#010x} (first={}) ring-mask={:#010x} (first={}) own-shadow={} own-ring={} slot_expected={} slot_read={} verdict={} — {} ::",
+                    "{}   [net5T] rx[{}] slot={} len={} UNREAD-LANDINGS shadow-mask={:#010x} (first={}) ring-mask={:#010x} (first={}) own-shadow={} own-ring={} slot_expected={} slot_read={} unread={} read_len={} verdict={} — {} ::",
                     P4, self.rx_count.saturating_sub(1), s, len,
                     shadow_mask, shadow_first, ring_mask, ring_first,
                     own_shadow as u8, own_ring as u8,
-                    s, read_here, arm, meaning
+                    s, read_here, self.net5_dirty_n, self.net5_read_len, arm, meaning
                 );
             }
-            // RESTAMP-ALL: the whole point. Every ring and shadow buffer gets its tag back, so the next
-            // pop's masks carry only what the NIC wrote between the two pops. (The ring re-stamp also
-            // de-stickies the [net4F] scan on an armed boot, which is why its `buffers-written` sets
-            // read per-pop here and cumulatively on the unarmed net4 boot.)
-            for k in 0..NUM_RX {
-                net4g_stamp_tag((self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64, k);
+        }
+
+        /// NET-5 (orin 23) — THE CONSUME. Re-stamp EXACTLY the buffer this pop delivered from, and
+        /// nothing else, the moment the frame has been copied out.
+        ///
+        /// This used to be a RESTAMP-ALL over all 64 buffers at the END of `net5_on_pop`, so that each
+        /// pop's mask meant "written since the previous pop". It was a correct instrument and a
+        /// DESTRUCTIVE one: it ran a hundred-odd microseconds of uncached scanning after the read site
+        /// had already chosen this pop's frame, and it overwrote the first 16 bytes of every buffer —
+        /// including a buffer the NIC had filled inside that window and that no pop had read yet.
+        /// render11 shows the loss in two lines: pop 3 delivered the DHCP OFFER's first 62 bytes (slot
+        /// 3's writeback length) and the restamp then erased the rest of it, so pop 4 completed with
+        /// `len=342` over a shadow block whose tags were all intact, scored NOWHERE, and handed smoltcp
+        /// 342 bytes of `net4f_tag(4)`.
+        ///
+        /// With the consume here the landing tag carries a stronger and more useful meaning: TAG INTACT
+        /// = the buffer is free; TAG GONE = the buffer holds a frame NO POP HAS DELIVERED YET. The
+        /// sticky-tag artifact RESTAMP-ALL was invented to kill cannot come back, because a landing is
+        /// now cleared exactly when — and only when — it is delivered. The completing slot's own ring
+        /// buffer is re-stamped by `rearm_current_rx` (and its shadow buffer with it), which is the
+        /// descriptor hand-back and therefore the right place for that one.
+        #[cfg(feature = "net5")]
+        fn net5_consume(&mut self) {
+            if self.net5_shadow == 0 || self.net5_consumed < 0 {
+                return;
+            }
+            let c = self.net5_consumed as usize;
+            if c < NUM_RX {
                 net4g_stamp_tag(
-                    self.net5_shadow + (k * RX_BUF_SIZE) as u64,
-                    NET5_SHADOW_TAGBASE + k,
+                    self.net5_shadow + (c * RX_BUF_SIZE) as u64,
+                    NET5_SHADOW_TAGBASE + c,
                 );
+            } else {
+                let k = c - NUM_RX;
+                net4g_stamp_tag((self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64, k);
             }
             dma_wmb();
+            self.net5_consumed = -1;
         }
 
         /// NET-5 (render8 fix) — resolve WHERE to read this completion's frame from, given that the NIC
@@ -3672,66 +4042,130 @@ mod metal {
         ///      that pointer; resolving it into the shadow block could only hand it another frame.
         ///   1. `shadow[rx_cur]` — the completing slot's own re-pointed address. Correct addressing; a
         ///      `REFETCH-LIVE` pop reads here and `slot_read == slot_expected`.
-        ///   2. the ONE shadow slot that lost its tag — the `REFETCH-WRONGSLOT` case. Unambiguous only
-        ///      when exactly one did; two or more written shadow buffers cannot be attributed to this
-        ///      completion, so we refuse rather than deliver a frame from a guessed index.
-        ///   3. `None` — nothing in the shadow block was written (`PREFETCHED` / `STALE-ORIG` /
-        ///      `NOWHERE` / the control slot), and the caller keeps its original-buffer pointer.
+        ///   2. the LOWEST-INDEX shadow slot holding an unread landing — the `REFETCH-WRONGSLOT` case.
+        ///      orin 23: this used to REFUSE whenever two or more shadow buffers were dirty. Under
+        ///      consume-on-read (below) a dirty buffer is an UNREAD FRAME, so refusing would strand it
+        ///      permanently; picking the lowest index drains the backlog one frame per completion, in
+        ///      a deterministic order, and the count rides `[net5T]` as `unread=`.
+        ///   3. the lowest ORIGINAL ring buffer holding an unread landing, other than the completing
+        ///      slot's — the `STALE-ORIG` case, which the render8/render11 read site could not deliver
+        ///      at all. Encoded `idx + NUM_RX` in `net5_consumed`.
+        ///   4. `None` — nothing anywhere holds an unread frame, and the caller must NOT deliver: the
+        ///      completing slot's own buffer carries only its landing tag.
         ///
-        /// READ-ONLY on DRAM: it stamps no tag and zeroes no head, because `net5_on_pop` runs after this
-        /// on the same pop and its scan IS the instrument — consuming here would erase the landing the
-        /// probe exists to score, and the RESTAMP-ALL at the end of that scan is already the consume.
+        /// READ-ONLY on DRAM: it stamps no tag and zeroes no head. The consume is `net5_consume`, which
+        /// the caller runs IMMEDIATELY after the frame copy; the masks this scan records are what
+        /// `net5_on_pop` reports its verdict arm from, so moving the consume earlier costs the
+        /// instrument nothing and closes the window in which our own re-stamp could erase a landing
+        /// that arrived while the witnesses were running.
         #[cfg(feature = "net5")]
         fn net5_read_src(&mut self) -> Option<*mut u8> {
+            self.net5_consumed = -1;
+            self.net5_dirty_n = 0;
+            self.net5_read_len = -1;
             if self.net5_shadow == 0 {
                 return None;
             }
             let s = self.rx_cur;
             dma_rmb();
             if s == 0 && !net4g_tag_intact(self.rx_buffers as u64, 0) {
+                // The CONTROL slot. `desc[0]` is never re-pointed, so slot 0's payload belongs in
+                // `ring[0]` and the caller's own pointer already names it — resolving slot 0 to some
+                // other slot's SHADOW buffer would hand it a different frame, and would break the one
+                // slot whose correctness the whole probe is calibrated against. `rearm_current_rx`
+                // re-stamps `ring[0]`, so the control landing is consumed by that and not here.
                 self.net5_slot_expected = 0;
                 self.net5_slot_read = 0;
                 return None;
             }
-            // The CONTROL slot first. `desc[0]` is never re-pointed, so slot 0's payload belongs in
-            // `ring[0]` and the caller's own pointer already names it — resolving slot 0 to some other
-            // slot's SHADOW buffer would hand it a different frame, and would break the one slot whose
-            // correctness the whole probe is calibrated against.
             let own = !net4g_tag_intact(
                 self.net5_shadow + (s * RX_BUF_SIZE) as u64,
                 NET5_SHADOW_TAGBASE + s,
             );
+            // ONE scan of both blocks per pop, here, and `net5_on_pop` reads its verdict off the masks
+            // this scan recorded. It used to scan again for itself ~150 µs later, after the [net4F]
+            // sweep — and by then a landing this pop consumed is gone and a landing that arrived since
+            // is indistinguishable from it.
             let mut hit: i64 = -1;
             let mut nhit = 0usize;
-            if !own {
-                for k in 0..NUM_RX {
-                    if !net4g_tag_intact(
-                        self.net5_shadow + (k * RX_BUF_SIZE) as u64,
-                        NET5_SHADOW_TAGBASE + k,
-                    ) {
-                        nhit += 1;
-                        if hit < 0 {
-                            hit = k as i64;
+            let mut ring_hit: i64 = -1;
+            let mut ring_n = 0usize;
+            self.net5_read_shadow_mask = 0;
+            self.net5_read_ring_mask = 0;
+            for k in 0..NUM_RX {
+                if !net4g_tag_intact(
+                    self.net5_shadow + (k * RX_BUF_SIZE) as u64,
+                    NET5_SHADOW_TAGBASE + k,
+                ) {
+                    self.net5_read_shadow_mask |= 1u32 << k;
+                    nhit += 1;
+                    if hit < 0 {
+                        hit = k as i64;
+                    }
+                }
+                // A STALE-ORIG landing is a real frame in an original ring buffer that no descriptor
+                // points at any more. It is rare, but when it happens the frame is as deliverable as
+                // any other and the render8/render11 read site dropped it on the floor.
+                if !net4g_tag_intact((self.rx_buffers as u64) + (k * RX_BUF_SIZE) as u64, k) {
+                    self.net5_read_ring_mask |= 1u32 << k;
+                    if k != s {
+                        ring_n += 1;
+                        if ring_hit < 0 {
+                            ring_hit = k as i64;
                         }
                     }
                 }
             }
-            let read = if own {
-                s as i64
-            } else if nhit == 1 {
-                hit
-            } else {
-                -1
-            };
-            if read < 0 {
-                return None;
+            if nhit > 0 {
+                // A shadow landing outranks an original-buffer one: the shadow IS where a re-pointed
+                // descriptor's payload belongs, so an original buffer is only ever the fallback.
+                ring_hit = -1;
+                ring_n = 0;
             }
+            self.net5_dirty_n = nhit + ring_n;
+            // `read` is the plain buffer INDEX (what `slot_read=` quotes); `net5_consumed` is the same
+            // index encoded with the block it lives in (`+ NUM_RX` = an original ring buffer), because
+            // the re-stamp in `net5_on_pop` has to name a block as well as an index.
+            let (read, consumed, addr) = if own {
+                (s as i64, s as i64, self.net5_shadow + (s * RX_BUF_SIZE) as u64)
+            } else if hit >= 0 {
+                (hit, hit, self.net5_shadow + (hit as usize * RX_BUF_SIZE) as u64)
+            } else if ring_hit >= 0 {
+                (
+                    ring_hit,
+                    ring_hit + NUM_RX as i64,
+                    (self.rx_buffers as u64) + (ring_hit as usize * RX_BUF_SIZE) as u64,
+                )
+            } else {
+                return None;
+            };
             self.net5_slot_expected = s as i64;
             self.net5_slot_read = read;
+            self.net5_consumed = consumed;
             if read != s as i64 {
                 self.net5_read_divergent += 1;
             }
-            Some((self.net5_shadow + (read as usize * RX_BUF_SIZE) as u64) as *mut u8)
+            // NON-CACHEABLE SOURCE, proven rather than asserted (brief item 2). Both candidate blocks
+            // are 64 KiB sub-slices of the SAME Normal-NC window `[net4B]` names: the shadow at
+            // `nc_base + NET5_SHADOW_OFF` and the original buffers at `nc_base + NC_OFF_RX_BUFS`. A
+            // read outside both would be a read of ordinary cacheable RAM, which is exactly the stale
+            // shadow the whole NET-4B arena exists to remove, so say which one this boot reads from.
+            if !self.net5_nc_witnessed {
+                self.net5_nc_witnessed = true;
+                let sh_lo = self.net5_shadow;
+                let sh_hi = sh_lo + (NUM_RX * RX_BUF_SIZE) as u64;
+                let bf_lo = self.rx_buffers as u64;
+                let bf_hi = bf_lo + (NUM_RX * RX_BUF_SIZE) as u64;
+                let in_sh = addr >= sh_lo && addr < sh_hi;
+                let in_bf = addr >= bf_lo && addr < bf_hi;
+                serial_println!(
+                    "{}   [net5N] frame source {:#x} — shadow-block=[{:#x}..{:#x}) orig-buffers=[{:#x}..{:#x}) nc-window-base={:#x} in-shadow={} in-orig={} [{}] — both blocks are 64 KiB sub-slices of the Normal-NC DMA window, so this read is uncached DRAM and no resident line can shadow the payload ::",
+                    P4, addr, sh_lo, sh_hi, bf_lo, bf_hi, self.nc_base,
+                    in_sh as u8, in_bf as u8,
+                    if in_sh || in_bf { "NC-SOURCED" } else { "OUTSIDE THE NC WINDOW — distrust every frame this boot" }
+                );
+            }
+            Some(addr as *mut u8)
         }
 
         /// NET-5 — the window-close tally and the ranked answer (header § NET-5). Printed on every armed
@@ -3766,11 +4200,12 @@ mod metal {
                 "MIXED: prefetched landings only, or prefetched + nowhere. The re-point never got ahead of the engine's prefetch — read `prefetch-depth` and re-fly with the shadow armed BEFORE RxEnb for the slots beyond it"
             };
             serial_println!(
-                "{}   [net5V] ring RE-FETCH verdict: pops-scored={} REFETCH-LIVE={} REFETCH-WRONGSLOT={} STALE-ORIG={} PREFETCHED={} NOWHERE={} CONTROL-OK={} prefetch-depth={} slot_expected={} slot_read={} divergent-reads={} shadow={:#x} rx-bufs={:#x} below4g={} — {} ::",
+                "{}   [net5V] ring RE-FETCH verdict: pops-scored={} REFETCH-LIVE={} REFETCH-WRONGSLOT={} STALE-ORIG={} PREFETCHED={} NOWHERE={} CONTROL-OK={} prefetch-depth={} slot_expected={} slot_read={} divergent-reads={} dropped-nopayload={} shadow={:#x} rx-bufs={:#x} below4g={} — {} ::",
                 P4, scored, self.net5_refetch_live, self.net5_refetch_wrongslot,
                 self.net5_stale_orig, self.net5_prefetched, self.net5_nowhere,
                 self.net5_control, self.net5_depth + 1,
                 self.net5_slot_expected, self.net5_slot_read, self.net5_read_divergent,
+                self.net5_dropped_nopayload,
                 self.net5_shadow, self.rx_buffers as u64,
                 self.net4f_below4g as u8, answer
             );
@@ -4996,6 +5431,20 @@ mod metal {
             net5_slot_read: -1,
             #[cfg(feature = "net5")]
             net5_read_divergent: 0,
+            #[cfg(feature = "net5")]
+            net5_consumed: -1,
+            #[cfg(feature = "net5")]
+            net5_dirty_n: 0,
+            #[cfg(feature = "net5")]
+            net5_read_shadow_mask: 0,
+            #[cfg(feature = "net5")]
+            net5_read_ring_mask: 0,
+            #[cfg(feature = "net5")]
+            net5_read_len: -1,
+            #[cfg(feature = "net5")]
+            net5_nc_witnessed: false,
+            #[cfg(feature = "net5")]
+            net5_dropped_nopayload: 0,
         };
 
         // ── M2/M3 GUARD: poison-honest readback through the NEW window BEFORE any register write ──

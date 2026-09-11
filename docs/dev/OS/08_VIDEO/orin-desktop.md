@@ -3011,6 +3011,215 @@ now frees a File handle's descriptor as the x86 twin does (audit finding, live o
 boards; pi 6 granted the file). The Pi's knob-off `kernel8.img` byte-identity baseline moves
 (+29 lines in `arch/aarch64/syscall.rs`), stated in the commit for the next pi seat.
 
+### §3.15 LANDED (DOCKID, orin 23) — the taskbar's tiles are the windows, and they stop moving
+
+Peter, render11, verbatim: *"there's something weird going on with the opening and closing of
+windows who is who between what is open and what is showing in the taskbar. it's all crazy mixed
+up"*.
+
+**The tile SET was never wrong.** `wm::dock_scan` re-derives the model from the window table on
+every composite pass, so the set of tiles has always matched the set of live windows exactly, and
+the render11 wire carries a `[wm] close` line for every window Peter closed. What was wrong is the
+**tile ORDER**, which is what a hand knows a tile by, and the **press target**, which is what a
+click acts on. Three mechanisms, all measured on `boot-render11-B-full.log`:
+
+1. **A pin and its window occupied different positions.** `pin_quarry` PREPENDS; `pin_console`,
+   `pin_shell` and `pin_pulse` APPEND. But a LIVE furniture row comes out of the scan and sorts by
+   WINDOW ID, in the middle — so the settled strip `[quarry] [live rows…] [console] [shell]
+   [pulse]` those four headers describe was only true while all four furniture windows were
+   CLOSED. Opening one teleported its tile across the strip.
+2. **Live rows were ordered by a RECYCLED SLOT ALIAS.** `create_inner` mints `id = slot + 1` from
+   the lowest free slot, so closing a low-id window and opening another put the NEW window in the
+   MIDDLE of the strip and shifted every tile right of it.
+3. **A press raised by OWNER, not by window.** `dock::press_at` called `wm::focus_changed(owner)`
+   alone, which by design raises *every* window that owner has; with two windows under one owner
+   the topmost afterwards was whichever row sat later in the table, never necessarily the one whose
+   tile was pressed.
+
+The wire shows (1) and (2) in four consecutive lines. With only win 8 (an app) live, the strip was
+`[quarry] [win8] [console] [shell] [pulse]` and win 8's tile was index 1:
+
+```text
+[dock] press at (792,1166)  tile=1/6 win=8 owner=0x4 …
+[dock] press at (974,1157)  tile=2/5 console=pin -> reopen requested
+[dock] press at (1077,1165) tile=3/5 shell=pin   -> reopen requested
+[dock] press at (1181,1162) tile=4/5 pulse=pin   -> rearmed
+[dock] press at (1182,1161) tile=4/5 win=8 owner=0x4 …      <-- ONE PIXEL later
+```
+
+Reopening the three furniture windows moved win 8's tile from index 1 to index 4 without the
+operator touching it: **two presses one pixel apart resolved to two different windows.**
+
+**The model that replaces it** (`video/dock.rs`, DOCKID block at the file's tail). A tile has an
+IDENTITY and the identity fixes its position:
+
+* **Furniture** (quarry, console, shell, pulse) is identified by its OWNER, and the pin and the
+  live row are THE SAME TILE at a constant position (`fixed_rank`). The four pin headers' "settled
+  strip" claim becomes true in every state instead of only in the all-closed one.
+* **Everything else** is identified by `(win id, generation)` — `wm::winid_gen`'s per-slot reuse
+  counter, which exists precisely so a capture can tell the console that was win 1 from the quarry
+  that is win 1 now. Its position is its ARRIVAL RANK, allocated once when the tile is created and
+  held until the window closes, so a recycled slot id gets a NEW tile at the END of the app run.
+* **The press raises THAT window.** `wm::raise_one` (a z-bump and nothing else, appended at
+  `wm.rs`'s tail) runs after `focus_changed`, which keeps the owner-scoped focus, unhide and wake
+  semantics unchanged and settles only which of the owner's windows ends in front. Gated on the
+  generation: a stale tile raises nothing rather than the wrong thing.
+
+**The taskbar's belief is now on the wire beside the wm's**, which is what render11 could not be
+scored against: `[dock] tile add win=N gen=G owner=… seq=… label=…`,
+`[dock] tile remove win=N gen=G owner=… reason=close|reuse`,
+`[dock] census tiles=N win:gen=…` (strip order, one line, emitted only when the set changes) and
+`[dock] press tile=T/N -> win=N gen=G raised=yes|no`. `[wm] alloc`/`[wm] close` name windows by the
+same `(id, gen)` pair, so "does the dock agree with the window manager" is two lines of one
+capture instead of an inference from behaviour.
+
+**Why `(win id, generation)` and not a generation IN the id.** `WinId` is a recycled slot alias by
+decision, taken three times and not reopened here; `wm::winid_gen` is documented as EVIDENCE, and
+this block makes it the second half of a sort key, which is a promotion that has to be argued
+rather than assumed. The argument has two parts, and the second is the limit of it.
+
+* **Safety does not rest on it.** The registry never dereferences a `WinId`. `TILE_ID` is only ever
+  COMPARED — in `tile_slot`, against a row the caller has just scanned out of the live table — and
+  is never handed back to `wm`. So the SO1(b) hazard the `winid_register_holder` teardown exists to
+  close (a cached id acted on after the slot is re-issued) cannot arise here: a stale entry can only
+  fail to match, which is exactly the retire arm. The one place the dock does act on an id,
+  `press_at`'s raise, is separately gated on the generation and raises NOTHING on a mismatch.
+* **ORDERING does rest on it, and that is stated rather than hidden.** If `winid_gen` stopped
+  distinguishing generations the tile key would collapse to the id alone, a recycled slot would
+  inherit the closed window's arrival rank, and the strip would return to the exact instability
+  §3.15 is about. That dependency is GATED, not documented: fixture legs 1 and 2 assert the recycle
+  happened and that the new window's tile is to the RIGHT of the survivor's, and both go red the
+  moment the generation stops separating the two windows.
+
+**PINCOUNT — four pins, one count, five readers.** Found in this arc's review, in `wm.rs`. Each of
+the four pin headers promises it is *"applied by every reader of the model, so painter, router and
+occlusion registry cannot disagree about the tile count."* Four readers kept it — `compose`,
+`press_at`, `strip_rect` and the fixture. The FIFTH, `wm::dock_tiles`, mirrored **`pin_shell`
+alone**, by hand, with its own transcription of that pin's condition and its own `+ 1`. It feeds
+`wm::occ_clip`'s per-window-blit dock term and `wm::erase_clip`'s strip rect, so on any desktop
+where the console, Quarry or the pulse instrument was CLOSED the occlusion clip was sized for a
+strip up to **two tiles narrower** than the one the painter drew, and a window dragged across the
+uncovered tail clobbered it until the next damage pass. That is the same defect the `SHELLPIN`
+`+ 1` was added to fix, re-entered once per pin added after it.
+
+The fix is one pure fold, `dock::pins_applied(n, present)`, which is the single definition of the
+pin arithmetic — the four conditions in application order under the same per-pin
+`n < MAX_WINDOWS` cap. Each pin's condition now lives once, in a `*_wanted` predicate the pin
+itself consults, `cfg`-gated in both polarities exactly as `pin_quarry` is, so a pin and the count
+cannot drift. `wm::dock_tiles` calls it on the rows its caller already holds — it may NOT call
+`wm::dock_scan`, whose `TABLE` lock its callers (`occ_clip` inside the blit loop, `erase_clip`) are
+already inside, which is why the row census is passed in as a closure and why `pins_applied` is
+pure. `strip_rect`, which wants the count and nothing else, now asks for the count instead of
+assembling a pinned model it then discards. The three readers that need the pinned ROWS keep the
+mutating chain; it is the same fold and it shares the predicates.
+
+**What did NOT change.** Membership is still `wm::dock_scan` plus the four pins, applied in the
+same order; the signature, damage conditions, painter and geometry are unchanged, and neither
+`strip_rect` nor `dock_tiles` returns a different number in any state the old code got right. On a
+shipped image the registry's only writer is `dock::compose`, the
+pass-driven path — `press_at` sorts over the published ranks and mutates nothing, so the click
+router still allocates nothing and takes no panel lock (LOCKFIX). ⚠ The `witness` fixture drives
+the reconcile too, so the one-writer claim is scoped to the metal image and not made unconditionally.
+
+**Gate:** `dock::dockid_selftest` (`witness`, driven from `dock::selftest`'s tail on
+`menubar::selftest`'s precedent, because this module's call site is in `arch/x86_64/syscall.rs` and
+outside the arc's lane). It runs Peter's sequence — open three windows, close the MIDDLE one, open
+another — and asserts, in six legs, that the recycle actually happened (or SKIPs), that the new
+window's tile is to the RIGHT of the survivor's, that the registry and the window table agree in
+both directions, that furniture ranks by constant, that the two count-only readers agree with the
+pin chain, and that pressing the lower-id of two same-owner windows leaves THAT window on top.
+Legs 1-5 are red on the pre-DOCKID tree.
+
+Leg 6 is two halves, and the split is a limitation stated rather than papered over. `count=` is the
+LIVE agreement (`wm::dock_tiles` and `strip_rect` against the chain's count) and is only
+conviction-bearing where a SECOND pin is up — which on the x86 `witness` desktop none can be: the
+leg carries no `quarry` feature, the console is routed so its pin is suppressed by design, and
+`pulsewin::ever_armed()` is false on every `desktop_uefi` boot. So the count path is also gated
+STRUCTURALLY: `pins=` runs the mutating pin chain and the `pins_applied` fold over the same empty
+census and requires the same answer, which reds on any board the moment a pin is added to one and
+not the other. Go-red measured, not asserted: dropping the shell term from `pins_applied` gives
+`count=false/3 pins=false/1 :: FAIL ::` and `UNAOS_WC=1 ./arroyo test` exits 1.
+
+---
+
+### §3.15 CLOSEMIN — closing one window minimised the others (render11, 2026-09-08)
+
+**Peter, on the glass, render11: "closing one window minimizes others."** The wire carries the whole
+mechanism three times over (`boot-render11-B-full.log`, bench-side capture):
+
+```text
+9501: [wc-a] close_owner asid=0x3 closed=1 ids=[7] refused=0
+9504: [wm-act] park win=5 owner=0x1 at (0,0) -> cause=shell-raise
+9505: [wm-act] park win=8 owner=0x4 at (0,0) -> cause=shell-raise
+9506: [wm-act] park win=9 owner=0x5 at (0,0) -> cause=shell-raise
+9507: [wc-fv] focus shell z=45 hidden=3 exempt=0 furniture=4
+9512: [orinclick] edge=press ... win=7 owner=0x3 focus 0x3->0x0 consumed=1 -> CONSUMED
+```
+
+One close disc pressed; ONE row reaped (`ids=[7]`, `close_owner` behaving exactly as CLOSEISO
+specifies); and three OTHER programs' windows parked at `PARKED_Z` by the same gesture.
+
+**The mechanism, one line.** `arch/aarch64/syscall.rs`'s `wc_close_click` returned the orphaned focus
+to the shell with `wm::focus_changed(0)` — the SHELL ARM, which mints a fresh `SHELL_Z` above every
+SURVIVING window, erases their boxes to `DESKTOP_BG`, stops them compositing, and has `vugmin_scan`
+publish `hidden=true` to every owner. That is the correct semantics for TAB-to-the-shell and the
+wrong semantics for a close: **a close is a WINDOW gesture and may not speak for the table.**
+
+**It was a known defect with a cure this arch never took.** `wm::focus_release` was written for
+exactly this (GR27 Boot A, same operator words), x86's `wc_close_click` took it at CLOSE-TEARDOWN,
+and aarch64 did not — `focus_release` had ONE aarch64 caller, `wc_close_furniture` (§3.12.4
+CONWINCLOSE), and the app close path was not it.
+
+**Why no battery caught it in nine boots.** The arm fires only when the closed window's owner already
+held `FOCUS_ASID`, i.e. only when the operator had clicked INTO the window before closing it — the
+"SOMETIMES" in the original report, exact. The same render11 wire holds the control: the one close
+that did not trip it (`9364: close_owner asid=0x2` at `focus 0x3->0x3`) emits no `[wc-fv] focus
+shell` line at all. Worse, `wm::closeiso_selftest` encoded the buggy sequence as *"the gesture,
+exactly as `wc_close_click` performs it"* and asserted the sibling's disappearance as CORRECT — a
+fixture pinned to the defect. It is relabelled: its shell raise is now driven as the deliberate
+TAB-to-shell gesture its legs are actually about.
+
+**The fix.** `wm::focus_after_close(win, owner, route)` is the close routers' one focus verb on both
+arches:
+
+1. `focus_release` — drop the departing owner's highlight, CAS-guarded, **no shell raise**. Survivors
+   keep their `z`, keep compositing, keep their hidden bits.
+2. Promote `top_visible_owner` through `focus_changed`'s RAISE arm, which since CLICK-PLAIN is purely
+   additive. Only when the closed owner HELD focus. Kernel furniture is excluded: the console is not
+   a keyboard focus target (`user_input_set_active` refuses the reserved band), and a highlight the
+   keystrokes cannot follow is the one state focus must never be in.
+3. `[wm] close-scope` on the wire.
+
+**The witnesses, because both halves of this were silent.** The render11 capture was a witness build
+and still could not answer "what did that close do to everything else" in one read:
+
+* `[wm] close-scope win=N owner=0x.. next_focus=0x.. shell_z=N visible_after=[..] hidden_after=[..]`
+  — unconditional (not `witness`-gated), its own 64-line lifetime budget, emitted at the moment the
+  close's focus handback completes. `hidden_after` is the field the defect prints in.
+* `[wm-act] hide|unhide win=0 owner=0x.. -> cause=shell-raise|focus-raise|minimise` — one line per
+  hidden-bit TRANSITION, naming the caller. Every set and clear of that bit was previously visible
+  only as a count in a `[vugmin] wm` rollup.
+
+**The fixture, and it went red on demand.** `wm::closemin_selftest` runs on BOTH arches (tail of
+`hittest_selftest`, which x86's and aarch64's batteries both drive), needs no HID, and carries its
+own control leg — after asserting the close left both siblings on the glass it drives `focus_changed(0)`
+deliberately and asserts they DO park, so the instrument is proven able to read both values.
+Go-red measured, not asserted: with `focus_after_close`'s body replaced by the pre-CLOSEMIN
+`focus_changed(0)`, `UNAOS_WC=1 ./arroyo test` exits **1** on
+
+```text
+[closemin] close-scope base=1 closed=1 siblings_visible=0 shell_moved=1 next_focus=0x0 focus=0 unhidden=0 shell_arm_control=1 -> FAIL
+[wm] close-scope win=1 owner=0xc30 next_focus=0x0 shell_z=14 visible_after=[] hidden_after=[2, 3]
+```
+
+and with the fix in place exits **0** on `siblings_visible=1 shell_moved=0 next_focus=0xc32 -> PASS`.
+
+**What is still owed: the glass.** QEMU cannot press a disc on the Orin panel. The bench check is one
+gesture: open two or more program windows, CLICK INTO one of them (the precondition — without it the
+old arm never fired either), close it with its disc, and confirm the others stay where they are.
+The wire answers it in one line per close — `[wm] close-scope … hidden_after=[]` is the pass, any id
+in `hidden_after` is the defect returning.
+
 ---
 
 ## §4 The GA10B boundary — stated once so nobody re-asks
@@ -3436,3 +3645,220 @@ before rung 2 if the seam is to be type-checked by anything). Rung 5 is gated on
 - **The `[u7stk]` numbers quoted in §5 are Pi numbers.** The Orin's own render task was
   measured on 2026-09-05 (§3.14: `hw=22256` on the pulse-window pass, unsaturated); the
   boot-stack cascade §5 is about still has not been, and §5.2 stands until it is.
+
+---
+
+## CURSORBG — the vacate handback, and what render11's "background drawing" actually was
+
+*Arc `exec-orin23-cursorbg`, 2026-09-08, against the render11 image. Base `600887c2`.*
+
+### The report and the wire
+
+Peter, at the bench on the render11 flight: *"tearing and background drawing issue where mouse
+cursor updated background as it swept up past the focused window"*. Two claims, and they turned out
+to be two different mechanisms.
+
+The **background** half is convicted by the boot's own census
+(`~/unaos-bench/scratch/orin23/boot-render11-B-full.log`):
+
+```
+[strip] rollup tenant=dock scope=bar emit=40 rect=552x52+684+1136 scene=yes
+        vacates=13 uncovered=6 uncovered_px=33696 unerased=0 forgotten=0
+        flat=6 flat_px=33696 -> FLAT-VACATE
+```
+
+Six shrinks of the centred dock, every erase successful, **33 696 panel pixels painted flat
+`wm::DESKTOP_BG` with nothing told**.
+
+The competing hypothesis — that the desktop present was blitting background into a window's rows
+because the occluder snapshot was stale — is **refuted by the same boot**:
+`[wc-i] rollup scope=live windowed_flushes=5130 stale=0 intrusions=0 -> CLEAN`.
+
+### The mechanism: one class, two sites, three precedents
+
+Every `DESKTOP_BG` writer in this subsystem owes the pixels it covers to *two* layers — the window
+layer (`wm::damage_intersecting`) and the backdrop layer (`screen::request_present_rect` /
+`request_full_present`). Three sites already paid both:
+
+| site | write | handback |
+|---|---|---|
+| `wm::drain_deferred` (wm.rs:17660) | `stage_fill(DESKTOP_BG)` | `damage_intersecting` + `request_present_rect` |
+| `crystal::repaint_vacated` (crystal.rs:826) | `strip::erase_rect` | `damage_intersecting` + `request_full_present` |
+| `winmenu::repaint_vacated` (winmenu.rs:1616) | `strip::erase_rect` | `damage_intersecting` + `request_full_present` |
+| **`strip::erase_rect` (strip.rs:452)** | `DESKTOP_BG` row-blit | **neither** |
+| **`cursor::repair` (cursor.rs:1987)** | colour-guarded restore | **window half only** |
+
+`strip.rs`'s own census note had written this down before an instrument could see it — *"`crystal`
+and `winmenu` already call their own `repaint_vacated` after an erase and are the precedent; `dock`
+and `menubar` do not"* — and left the visibility question to the next capture. The capture came.
+
+Why it is visible rather than merely untidy: on aarch64 `wm::occ_clip` is structurally
+`OccClip::none` (PARITY §6.2), so a window blit paints straight over the dock and a window may
+legitimately lie **under** the strip's ends. A flat erase there is `crystal`'s documented
+"menu-dismiss hole", one layer down: it stamps over live window pixels and no pass is coming back.
+
+The cursor half is the same shape. `undraw_locked`'s restore is deliberately **colour-guarded** — a
+pixel goes back only while the panel still holds the colour the sprite painted there — and the
+module's own header names `repair` as what closes the residual the guard leaves. Over a *window*
+the close works, because `damage_intersecting` marks that window and the next composite re-blits it
+from its source surface. Over the **backdrop** — which is where a pointer sweeping up past a window
+arrives — nothing is marked and nothing owes those rows a repaint.
+
+### The fix
+
+* **`strip::restore_vacated(r)`** — the pair, per box, on `drain_deferred`'s terms (a *rect*, not the
+  whole-panel flag: DRAG-PI M1's argument, and the queue merges on overflow so the request is always
+  a superset and never less). Called from `vacate` after a successful erase.
+* **`cursor::restore_note(x,y,w,h)`** — the desktop half of `repair`, folded onto its existing line.
+  Termination is `TOUCHED_SINCE_DRAW`: a rect is queued only when a painter wrote inside the sprite
+  box since the sprite was drawn, `draw_locked` clears the flag and `undraw_locked` swaps it down, so
+  one trample buys one handback and the pass that serves the request cannot re-arm it.
+* **`screen::present_owed()`**, folded into `orin_render_service`'s `dirty`. `Screen::flush` is the
+  only consumer in this subsystem of *both* deferred queues and the only caller of
+  `wm::service_damage`, so a request reaches the glass only through a pass that predicate lets run.
+  This task's `dirty` was `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is
+  masked out forever (ui_status.rs:1285) — hence `[orinrender] census passes=13998251 presents=1`.
+  A peek, never a drain.
+
+### The instrument
+
+`flat=` and `restored=` now split on the **answer** rather than on the board: a span handed back is
+`restored`, a span left flat is `flat`. So `flat=0` is the fixed state everywhere, and the rollup's
+verdict moved from `flat > 0 && scene` to `scene && restored < uncovered` — which catches a flat
+leftover, a declined erase and a forgotten span alike, and reds by reverting one call.
+
+`[cursor] restore src=scene|flat rect=WxH+X+Y n=… -> HANDED-BACK` is new, and deliberately **not**
+`witness`-gated: the metal image is built without `witness`, and a claim absent from the only
+artifact that matters is not a claim.
+
+`[wc-h]`'s own numbers were also wrong and are fixed: `wch_recycle` (wcg.rs:2747) reset `H_DECLINE`
+on slot re-creation and never `H_DECLBY`, so `declines=` was measured over the current tenant while
+`decl_geom=`/`decl_cap=`/`decl_lock=`/`decl_alloc=` were measured over every tenant the slot had
+ever held. That is the whole of the render11 line's `declines=5 … decl_lock=73`. After the fix
+`declines == sum(decl_*)` is an invariant a reader may rely on.
+
+### The tearing half is NOT this arc's, and here is the conviction
+
+`[wc-h] rollup win=1 scope=window torn=2 stalls=6 longpres=2 decl_lock=73 maxpresent_us=117479`.
+A `DECL_LOCK` decline is `stage_for_core().try_lock()` failing (wm.rs:19733) and falling to
+`draw_window`'s **direct** path (wm.rs:18445) — per-pixel `put_pixel` straight into the scan-out,
+*and unclipped*, which is why the tree calls it the tearing regime.
+
+On this board that decline cannot be cross-core: a stock Jetson boot is single-core
+(`percpu.rs:148`), and 6 cores against `STAGE_CPUS = 8` means `stage_pool_index`'s `.min()` never
+folds two cores onto one entry. So it is **same-core compositor reentrancy**, and three facts make
+it the expected case rather than a race:
+
+1. aarch64 has no `COMP_GATE` — `wm.rs:4259` is a bare `composite_once()`; wm.rs:17792 says the
+   phase split that would serialise it is deliberately deferred.
+2. The console window's present path runs with **interrupts enabled** — `fbcon.rs:744` states it,
+   and `present_banded` reaches `composite()` at wm.rs:1348 under no guard of its own.
+3. `98213b7f` (ORIN-TICKDEFAULT), the commit immediately before this arc's base, made
+   `bsptick`+`bsprun` the tegra default — a **12 ms** preemption quantum — and `timer_preempt`
+   (`arch/aarch64/sched.rs:5143`) has no compositor guard. The `STAGE` guard is held across
+   wm.rs:19733–20052, measured at **117 ms**.
+
+The fix is a compose gate in `wm.rs` or a preempt guard in `arch/aarch64/sched.rs`; both are outside
+this arc's lane and the row is relayed (orin-ledger A46). **The falsifier is already in the tree and
+has never been read**: `BLIT_NET_CORE[0]` (wm.rs:9770) is an unconditional per-core net of live
+`BlitGuard`s, and on a single-core board any value > 1 *is* the reentrancy. `blitwho_report`
+(wm.rs:9806) prints it only from the two drain give-up arms, so a healthy-but-reentrant boot says
+nothing — which is why 73 declines went unexplained for a flight.
+
+## COMPGATE — the aarch64 compositor gate against preempt and cross-core re-entrancy (A46)
+
+### The defect, from the wire
+
+render11's rollup reads `[wc-h] rollup win=1 torn=2 decl_lock=73 maxpresent_us=117479`, and the
+three numbers are one mechanism. `decl_lock` is `stage_window`'s `DECL_LOCK` arm —
+`stage_for_core().try_lock()` returned `None` — and that is same-core re-entrancy *by construction*:
+`stage_for_core` indexes `STAGE` by `meter_current_cpu()`, so two different cores never contend for
+one entry. A present that loses the lock falls into `draw_window`'s `if !staged` arm, the pre-WC-H
+DIRECT path: per pixel, through `put_pixel`, straight into the FRONT buffer, and unclipped. That is
+the tear.
+
+`maxpresent_us=117479` is why it happens. This arch composites with interrupts ENABLED — the console
+reaches the compositor through `fbcon::route_present_banded` → `wm::present_banded` →
+`wm::composite` with no mask on the path — and since ORIN-TICKDEFAULT (`98213b7f`) the preemption
+quantum is ~12 ms. A 117 ms present therefore contains about nine involuntary switches, and any task
+dispatched in one of them may start its own present on the same core. With `exec-orin23-apsrun` all
+six cores host EL0 (`el1cores=0x3f`), so the population that can arrive mid-pass is larger still,
+though the DECLINE stays same-core because the buffer is.
+
+### The fix, in two parts
+
+**1. The gate (`video/wm.rs`).** `composite()`'s non-x86 arm was a bare `composite_once()`. It now
+runs `comp_gate_pass()`, x86's `COMP_GATE` shape with three deliberate differences: a cross-core
+entrant may take a bounded 250 µs spin before folding (a console present deferred a whole frame is
+worse on a machine whose panel is the only output); the SAME-CORE entrant never waits, because the
+holder cannot make progress while we own the core; and a held pass is bracketed by a preemption
+hold. There is no arm that reaches `composite_once` without the gate, which is the whole property —
+`draw_window`'s direct unclipped path is now unreachable from a second entrant. A fold clears
+nothing (it returns before the table snapshot, so its damage flags survive) and defers the sprite
+duty through `cursor::owe_repaint`; an unmasked holder then runs up to two extra full passes for its
+folders.
+
+**2. The preemption hold (`arch/aarch64/sched.rs`).** A per-core counter. While it is non-zero the
+two involuntary switch paths — `timer_preempt` and `ipi_preempt` — decline to switch and return.
+Interrupts stay ENABLED: the tick is taken and EOI'd, `arch::ms()` still advances, every other
+interrupt is delivered. Masking interrupts for a 117 ms present was considered and refused — this
+tree has already convicted that shape once (`[comp2] max_us=302134`). Both checks sit ABOVE
+`kill_check_current`, because that function never returns for a killed task and a kill taken inside
+a hold would retire the holder without running its guard's drop, leaving the core unable to preempt
+for the rest of the boot.
+
+### Lock order
+
+`comp_gate_pass` takes, in this order: the `COMPGATE` flag (an `AtomicBool`, not a lock) → the
+per-core preemption hold → and only then, inside the pass, `TABLE` (via `table()`, which masks IRQs
+before it locks) and the panel writers. The reverse order is what would deadlock — a caller holding
+the window table spinning for the gate while the gate's holder waits for the table — and it is
+excluded structurally: `table()` masks IRQs before acquiring, so a TABLE-holding entrant always
+reads `irqs_masked() == true`, and the wait arm is guarded on `!irqs_masked()`. Such an entrant
+folds immediately instead of spinning. The same guard is what keeps `dock_tiles`' table-holding
+callers off the spin.
+
+### The fixture
+
+`wm::compgate_selftest` prints one line, `:: COMPGATE: … PASS ::`. It is driven once per boot from
+the tail of `comp_gate_pass` — after the release and after the hold is dropped, the only point in
+that function where the gate is free — rather than from the window battery, because the aarch64
+battery (`hittest_selftest` ← `wcb_launcher` ← `u7_launcher`) lives inside `main.rs`'s
+`all(target_arch = "aarch64", feature = "baremetal")` block and is compiled out of every UEFI
+aarch64 image. Riding the compositor means the fixture is present wherever the code it gates is
+present.
+
+Waiting for a preempt tick to produce a nested present by accident would make the fixture a lottery,
+so the stimulus is driven: `compgate_fixture` calls `composite()` again from INSIDE a held pass, on
+this core, with the hold standing and interrupts unmasked — the machine state a tick produces, minus
+the wait. Four legs:
+
+1. **GATED** — the nested present did not composite (`nested_passes=0`), was actually refused rather
+   than skipped (`nested_folds + nested_waits > 0`), and never reached the panel's direct path
+   (`nested_decl_lock=0`). This is the leg that reds against the pre-gate build.
+2. **HOLD** — no hold standing before, one standing inside the guard's scope, none after the drop,
+   read through the same predicate the tick path reads.
+3. **CONTROL** — an uncontended present must move `COMPGATE_PASSES` by at least one, so leg 1's zero
+   is a measurement and not a dead counter.
+4. **BLITNET** — every `BLIT_NET_CORE` slot at or below 1: no core holds two composite blits.
+
+A probe that never fired scores `nested_ran=0` and the verdict is FAIL, so a fixture that did not run
+cannot read as a pass.
+
+### What the render12 wire should say
+
+`[wc-h] rollup … decl_lock=0 … blitnet=[…]` with every slot at or below 1, and
+`[compgate] rollup entered=… folds=… waits=… maxhold_us=… preempt_deferred=…`. `folds=` is the
+reading: composites that would previously have interleaved their blits with a pass already on the
+glass. `torn>0` while every `blitnet` slot is at or below 1 says the tear has a different source and
+the diagnosis restarts.
+
+### Limit of the QEMU coverage, stated plainly
+
+No aarch64 QEMU verb in this tree composites on the UEFI virt path: `./arroyo test-arm` builds a
+non-`baremetal` image, so neither the EL0/window battery nor `desktop_firmware` is linked and
+`wm::composite` has no caller on that boot. `strings` confirms the gate and its fixture are IN that
+image; the log carries no `[compgate]` line because the compositor never runs. The verbs whose
+aarch64 image does composite are `kernel8-test` (QEMU raspi4b, `baremetal`) and the Orin metal
+`esp-jetson` flight. The fixture's go-red therefore has not been executed on a run; it is the one
+outstanding item on this arc.

@@ -618,6 +618,312 @@ pub fn spawn_focus_forget(owner: u64) {
     let _ = spawn_focus_take(owner);
 }
 
+// ---- WINTITLE: the ONE rule that mints a window's title ------------------------------------------
+
+/// WINTITLE — **where a window title comes from.** Peter's ruling, render11 glass, 2026-09-08:
+/// *"VUG WINDOW NAMES ARE DUMB AND WINDOW TITLES NUMERICALLY SEQUENCED IS FOR UNTITLED DOCS ETC"*.
+///
+/// The defect he was reading: the two arch window seams (`arch/x86_64/syscall.rs` and
+/// `arch/aarch64/syscall.rs`, both in `mod wc_shim::create`) build a window's title out of their own
+/// table row index — `let title = [b'e', b'l', b'0', b' ', b'w', b'i', b'n', b' ', b'0' + (id % 10)]`
+/// — so every program the operator launched from the shell came up titled **`el0 win 0`**,
+/// **`el0 win 1`**, **`el0 win 2`**. That is a GENERATED LABEL with a sequence number on it, and it
+/// is wrong twice over: it is not the application's name, and the number is the one piece of
+/// typography macOS reserves for a DOCUMENT that has no name yet.
+///
+/// ### The rule
+///
+/// A window's title is **a name**, resolved in this order and nowhere else:
+///
+/// 1. **`program`** — the application's own name, when the launch knew it. Every launcher that
+///    resolves a path to an image arms [`app_name_arm`] with that path; the name is the path's
+///    BASENAME with its extension dropped, **in the case the operator wrote it** (`/apps/VUG.ELF`
+///    → `VUG`, `pulse.elf` → `pulse`). Nothing is invented and nothing is per-app: the only
+///    transformation is "drop the directory, drop the extension".
+/// 2. **`unnamed`** — an EL0 window whose launcher never armed a name, recognised by the seam label
+///    above. It gets the generic noun [`ANON_APP`] and NOT a number: several unnamed programs on the
+///    glass read the same word, which is exactly the ruling (an app window never carries a numeric
+///    suffix, however many instances are open).
+/// 3. **`document`** — a document window with no name, minted by [`untitled_document`]: `Untitled`,
+///    `Untitled 1`, `Untitled 2`. **This is the only place a number belongs in a title bar.**
+/// 4. **`declared`** — the name the creating module declared at its `create` / `create_at` call
+///    site. Built-in tenants are their own declarers: `Console`, `Shell`, `Pulse`, `Quarry`.
+///
+/// ### Is there an ELF-declared name to prefer over the basename?
+///
+/// **No — and no manifest format was invented to make one.** The ring-3 ABI is `crates/una-abi`, a
+/// single `lib.rs` of syscall numbers and info-page offsets; it carries no application-name field.
+/// `SYS_WIN_CREATE` takes `(w, h)` and nothing else — deliberately, and the two seams say so in the
+/// same breath: *"an app never supplies its window's title, because chrome is kernel-drawn, always,
+/// so a program cannot paint something that looks like another window's frame."* No ELF note, no
+/// section, no manifest is read on the load path. So clause 1 is the program's FILE NAME, which is
+/// the name the operator typed and therefore the name the operator expects to read back. If an ABI
+/// ever grows a declared-name field, it becomes clause 0 and reports `from=declared`; the witness
+/// vocabulary already has the word.
+///
+/// ### One site
+///
+/// [`mint_title`] is the whole rule and [`create_inner`] is its only caller, so a window cannot be
+/// titled by any other path. Nothing here is board-shaped and nothing is keyed to a particular
+/// program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TitleSource {
+    /// The creating module declared this name at its `create` call site (a built-in tenant), or a
+    /// future ABI declared it in the image.
+    Declared,
+    /// Derived from the launched program's own file name — clause 1.
+    Program,
+    /// A nameless document's sequenced title — clause 3, the ONLY numbered form.
+    Document,
+    /// An EL0 window whose launcher armed no name — clause 2.
+    Unnamed,
+}
+
+impl TitleSource {
+    /// The witness spelling (`from=`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TitleSource::Declared => "declared",
+            TitleSource::Program => "program",
+            TitleSource::Document => "document",
+            TitleSource::Unnamed => "unnamed",
+        }
+    }
+}
+
+/// WINTITLE — the GENERATED LABEL the two arch window seams mint from their own row index when the
+/// kernel knows nothing else about the caller (`wc_shim::create`, both arches). Recognised here so
+/// that a label is never mistaken for a name; see [`mint_title`] clause 2.
+///
+/// It is matched as a PREFIX because the seams append `'0' + (id % 10)`. Kept as a constant on this
+/// side of the seam rather than shared with `arch::*` because `wm` may not depend on the syscall
+/// layer (the layering invariant `sys_win_present` states); the coupling is one byte string and it
+/// is asserted by [`wintitle_selftest`].
+const SEAM_LABEL: &[u8] = b"el0 win ";
+
+/// WINTITLE — what an application window is called when nothing named it. A NOUN, never a number.
+const ANON_APP: &[u8] = b"Application";
+
+/// WINTITLE — the document form's stem. `Untitled`, then `Untitled 1`, `Untitled 2` — the macOS
+/// convention, and the only numbered titles in the system.
+const DOC_STEM: &[u8] = b"Untitled";
+
+/// WINTITLE — one launcher-armed program name. `owner == 0` means the row is free (owner 0 is the
+/// shell, which is never a launched program — the same "0 is never armed" rule [`SPAWN_FOCUS`] uses).
+#[derive(Clone, Copy)]
+struct AppName {
+    owner: u64,
+    len: u8,
+    name: [u8; MAX_TITLE],
+}
+
+impl AppName {
+    const EMPTY: AppName = AppName {
+        owner: 0,
+        len: 0,
+        name: [0u8; MAX_TITLE],
+    };
+}
+
+/// WINTITLE — the launcher-armed program names, keyed by compositor owner.
+///
+/// Sized to [`MAX_WINDOWS`] for [`SPAWN_FOCUS`]'s reason: a name is only ever READ by a window
+/// create, so the table can hold no more pending owners than the compositor can hold windows. Full
+/// is fail-closed — the launch still happens, its window simply falls to clause 2 and reads
+/// `Application`.
+///
+/// LOCK ORDER: this mutex is a LEAF. [`create_inner`] resolves the title before it takes `TABLE`,
+/// and nothing under it takes `WRITER`, so it can never participate in the WINDOWS ⊃ TABLE ⊃ WRITER
+/// order the rest of this module keeps.
+static APP_NAMES: Mutex<[AppName; MAX_WINDOWS]> = Mutex::new([AppName::EMPTY; MAX_WINDOWS]);
+
+/// WINTITLE — the compositor `owner_asid` for the launch handle the arch spawn entry points return.
+///
+/// ⚠ **The two arches return different things from `spawn_user_image_bg` and this is the only place
+/// that fact is written down.** x86 returns `mapped.slot` (0-based) and its window seam owns rows as
+/// `slot + 1`; aarch64 returns `mapped.ttbr0 >> 48`, which `boot::slot_asid` defines as `slot + 1`,
+/// and its window seam uses that value verbatim. So the same launch handle is off by one between
+/// them, and a launcher that armed the raw handle would name the WRONG TENANT on x86 — every title
+/// shifted one slot. Both seams are in `arch/`, out of this arc's lane; normalising them (have x86
+/// return `slot + 1`, or have both return the compositor owner) is the right fix and is owed to the
+/// arch seats. Until then, every launcher goes through this function.
+pub const fn owner_of_launch(handle: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        handle + 1
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        handle
+    }
+}
+
+/// WINTITLE — the program name in `path`: the basename, with a trailing extension dropped, in the
+/// operator's own case. `/apps/VUG.ELF` → `VUG`; `pulse.elf` → `pulse`; `/apps/x` → `x`.
+///
+/// The ONE derivation, so "what is this program called" has a single answer in the kernel. A path
+/// that ends in a separator has an empty basename and yields an empty slice, and [`app_name_arm`]
+/// refuses it — that window falls through to clause 2 rather than being titled with nothing. A
+/// LEADING dot is not an extension separator (`.profile` is a whole name, and so is `.ELF`), so a
+/// basename that is nothing but a dotted suffix survives intact rather than vanishing.
+pub fn program_name(path: &str) -> &str {
+    let base = match path.rfind(['/', '\\']) {
+        Some(i) => &path[i + 1..],
+        None => path,
+    };
+    // `rfind`, not `find`: `VUG.TEST.ELF` is the program `VUG.TEST`. A leading dot is not an
+    // extension separator (`.profile` is a whole name), so index 0 is excluded.
+    match base.rfind('.') {
+        Some(0) | None => base,
+        Some(i) => &base[..i],
+    }
+}
+
+/// WINTITLE — record the program `path` launched into compositor owner `owner`, so that owner's
+/// windows are titled with the program's name (clause 1) instead of the seam's generated label.
+///
+/// Called by every launcher that resolves a path to an image — the shell's `bg`, the shell's
+/// bare-name launch, and Quarry's double-click — with [`owner_of_launch`] applied to the handle the
+/// spawn returned. Re-arming an owner OVERWRITES its name rather than taking a second row, which is
+/// what keeps a recycled slot from wearing its predecessor's name after a relaunch.
+///
+/// Returns whether a row holds the name (`false` = the table was full, or the name was empty, or
+/// `owner == 0`) — fail-closed: the launch is never conditioned on this succeeding.
+pub fn app_name_arm(owner: u64, path: &str) -> bool {
+    let name = program_name(path).as_bytes();
+    if owner == 0 || name.is_empty() {
+        return false;
+    }
+    let len = name.len().min(MAX_TITLE);
+    let mut t = APP_NAMES.lock();
+    // Re-arm in place first: an owner already named must not occupy two rows, or `app_name_forget`
+    // would clear one and leave the other to title the next tenant.
+    let slot = t
+        .iter()
+        .position(|e| e.owner == owner)
+        .or_else(|| t.iter().position(|e| e.owner == 0));
+    match slot {
+        Some(i) => {
+            t[i].owner = owner;
+            t[i].len = len as u8;
+            t[i].name = [0u8; MAX_TITLE];
+            t[i].name[..len].copy_from_slice(&name[..len]);
+            true
+        }
+        None => false,
+    }
+}
+
+/// WINTITLE — drop `owner`'s program name.
+///
+/// Per TENANT, for [`spawn_focus_forget`]'s reason: owners are recycled slot aliases, so a name left
+/// behind by a program that exited would title the NEXT tenant of that slot. Called by the shell
+/// when it reaps or kills a job — the launches it armed are the launches it retires.
+///
+/// ⚠ The complete fix is a call from the arch slot-teardown seam
+/// (`arch::*::boot::teardown_user_slot`, beside where the hidden bit is cleared), which would cover
+/// tenants no shell ever tracked. That seam is in `arch/` and out of this arc's lane; it is owed,
+/// and until it lands the residual hazard is bounded to "a kernel-initiated launch into a slot a
+/// shell-launched program left, whose shell never reaped it" — which reads a stale NAME, never a
+/// wrong number, and is corrected by the next `app_name_arm` for that owner.
+pub fn app_name_forget(owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    let mut t = APP_NAMES.lock();
+    for e in t.iter_mut() {
+        if e.owner == owner {
+            *e = AppName::EMPTY;
+        }
+    }
+}
+
+/// WINTITLE — clause 3's minter: the title of the `seq`-th nameless document. `Untitled`,
+/// `Untitled 1`, `Untitled 2`, … Returns the length written into `out`.
+///
+/// Public because the numbering rule belongs to the window system, not to whatever opens a document:
+/// a document window asks for its title here and passes the result as its DECLARED name, and
+/// [`mint_title`] recognises the form so the wire says `from=document`. Sequences past what
+/// [`MAX_TITLE`] can hold are clamped rather than truncated mid-number.
+pub fn untitled_document(seq: usize, out: &mut [u8; MAX_TITLE]) -> usize {
+    out[..DOC_STEM.len()].copy_from_slice(DOC_STEM);
+    if seq == 0 {
+        return DOC_STEM.len();
+    }
+    // Decimal, most significant digit first, into the space MAX_TITLE leaves after "Untitled ".
+    let mut digits = [0u8; MAX_TITLE];
+    let mut n = seq;
+    let mut nd = 0usize;
+    while n > 0 && nd < digits.len() {
+        digits[nd] = b'0' + (n % 10) as u8;
+        n /= 10;
+        nd += 1;
+    }
+    let room = MAX_TITLE - DOC_STEM.len() - 1;
+    if nd == 0 || nd > room {
+        return DOC_STEM.len();
+    }
+    out[DOC_STEM.len()] = b' ';
+    for k in 0..nd {
+        out[DOC_STEM.len() + 1 + k] = digits[nd - 1 - k];
+    }
+    DOC_STEM.len() + 1 + nd
+}
+
+/// WINTITLE — is `t` the document form [`untitled_document`] mints? `Untitled`, or `Untitled` +
+/// space + digits. Nothing else: `Untitled draft` is a NAME the module declared and is reported as
+/// such.
+fn is_document_title(t: &[u8]) -> bool {
+    if t == DOC_STEM {
+        return true;
+    }
+    if t.len() < DOC_STEM.len() + 2 || &t[..DOC_STEM.len()] != DOC_STEM {
+        return false;
+    }
+    t[DOC_STEM.len()] == b' ' && t[DOC_STEM.len() + 1..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// WINTITLE — **THE ONE SITE.** Resolve the title a new window is born with, from its owner and the
+/// name its creator declared. See [`TitleSource`] for the rule and the reasoning; this function is
+/// that rule and [`create_inner`] is its only caller.
+///
+/// Takes no lock but [`APP_NAMES`]'s, and is called BEFORE `TABLE` is taken.
+fn mint_title(owner_asid: u64, declared: &[u8], out: &mut [u8; MAX_TITLE]) -> (usize, TitleSource) {
+    // Clause 1 — a launcher armed this owner with the program's own name. Consulted first and
+    // unconditionally: an armed owner IS a launched program, whatever its creator passed.
+    {
+        let t = APP_NAMES.lock();
+        if let Some(e) = t.iter().find(|e| e.owner == owner_asid && e.owner != 0) {
+            let len = (e.len as usize).min(MAX_TITLE);
+            if len > 0 {
+                out[..len].copy_from_slice(&e.name[..len]);
+                return (len, TitleSource::Program);
+            }
+        }
+    }
+    // Clause 2 — a generated label reached us: an EL0 window nobody named. A noun, never a number.
+    if declared.len() >= SEAM_LABEL.len() && &declared[..SEAM_LABEL.len()] == SEAM_LABEL {
+        out[..ANON_APP.len()].copy_from_slice(ANON_APP);
+        return (ANON_APP.len(), TitleSource::Unnamed);
+    }
+    let len = declared.len().min(MAX_TITLE);
+    out[..len].copy_from_slice(&declared[..len]);
+    // Clause 3 — the nameless-document form, the one place a number is right.
+    if is_document_title(&declared[..len]) {
+        return (len, TitleSource::Document);
+    }
+    // Clause 4 — the creator's declared name, verbatim.
+    (len, TitleSource::Declared)
+}
+
+// WINTITLE — THE WIRE IS [`winid_alloc_witness`]'s LINE, and this note is where a second one was
+// refused. The provenance of every minted title (`owner=`, `title=`, `from=`) is APPENDED to the
+// `[wm] alloc` line that already fires once per create, on that witness's existing budget and behind
+// its existing furniture gate. A standalone `title_witness` was written first, ungated, with a
+// budget of its own — and it cost the compositor its furniture passes for the rest of the boot,
+// reddening two unrelated fixtures. The measurement, the A/B and the standing rule for the next arc
+// that wants a per-create fact on the wire are recorded at `winid_alloc_witness`.
+
 // ---- VUGMIN-B: hidden-owner plumbing -----------------------------------------------------------
 
 /// VUGMIN-B — `wm`'s SHADOW of the hidden bitmask `arch::aarch64::syscall` owns, one bit per ASID.
@@ -698,7 +1004,7 @@ fn owner_hidden(t: &Table, asid: u64, shell: u32) -> bool {
 /// [`VUGMIN_SHADOW`] would let one stale shadow bit (ASID recycle clears the real bit behind `wm`'s
 /// back) leave a fresh tenant permanently idling. Republishing a bit that is already right costs one
 /// `u32` store on a path that runs at operator speed.
-fn vugmin_publish(asid: u64, hidden: bool) {
+fn vugmin_publish(asid: u64, hidden: bool, _reason: &'static str) {
     if asid == 0 || asid >= 64 {
         return;
     }
@@ -731,9 +1037,9 @@ fn vugmin_publish(asid: u64, hidden: bool) {
         };
         if (before & bit != 0) != hidden {
             if hidden {
-                VUGMIN_HIDES.fetch_add(1, Relaxed);
+                VUGMIN_HIDES.fetch_add(1, Relaxed); wm_act("hide", WIN_NONE, asid, _reason, 0, 0); // CLOSEMIN — ⚠ SAME-LINE fold, line-NEUTRAL. The hidden bit is the thing an operator SEES as "minimised", and until this line every set and clear of it was silent: the render11 wire carried four hides and four unhides in `[vugmin] wm` ROLLUPS with no per-edge line, so "closing one window minimised the others" could only be inferred from `[wm-act] park` (the z half) and never read off the hide half at all. On the `wm_act` budget deliberately — same 256-line lifetime cap, same tag — so a hide storm cannot flood the wire, and the reason is the CALLER's static token, which is what makes an unexplained hide impossible to confuse with an explained one.
             } else {
-                VUGMIN_UNHIDES.fetch_add(1, Relaxed);
+                VUGMIN_UNHIDES.fetch_add(1, Relaxed); wm_act("unhide", WIN_NONE, asid, _reason, 0, 0); // CLOSEMIN — ⚠ SAME-LINE fold, line-NEUTRAL. See the hide arm above; the unhide edge is the one VUGPAUSE-2 delivers as a wake, so naming its cause is what distinguishes "the operator raised this window" from "something republished a bit".
             }
         }
     }
@@ -2838,8 +3144,12 @@ pub fn focus_changed(asid: u64) {
     // lock (atomics + one `u32` info-page store), so this is a convention rather than a necessity, but
     // it is the file's convention. The shell arm hides every owner at once; a raise publishes at most
     // two rows, the owner arriving and the owner leaving, and says nothing at all about the rest.
+    // CLOSEMIN — the REASON travels with the bit. The two arms are different events on the glass (a
+    // whole-table park the operator asked for, versus one window arriving), and until the reason was
+    // carried here the wire could not tell them apart at the point the bit actually moved.
+    let vreason = if asid == 0 { "cause=shell-raise" } else { "cause=focus-raise" };
     for &(asid, hid) in marks[..nmarks].iter() {
-        vugmin_publish(asid, hid);
+        vugmin_publish(asid, hid, vreason);
     }
 
     // WEDGE-2 `<F5>` — the z-bump is done and the table guard is dropped; the immediate REPAINT half
@@ -4264,7 +4574,7 @@ fn owedtail_emit() {
 
 pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::composite"); return; } // PANELREFUSE Tier 1 — THE WHOLE PASS DECLINES once the machine is dying. Sited at the TOP OF THE FUNCTION, above the arch split on the two lines below, and that siting is the design's central finding rather than convenience: `composite_pass_half` calls `strip::compose_all` AFTER `composite_inner` returns, and the furniture (dock/menubar/crystal) reaches the glass through its OWN blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal placed at `panel_snapshot` instead would therefore produce a PARTIAL PAINT — windows suppressed, furniture stamped across the panic backdrop — a screen state no boot has ever produced and no capture in the corpus describes. Refusing above the fork declines `composite_once` -> `composite_pass_half` -> `composite_inner` AND `strip::compose_all` in one place, on both arches: the non-x86 arm below is a bare `composite_once()` with no gate and no decline path of its own, so a check inside the x86 `COMP_GATE` block would leave aarch64 uncovered. It takes NO gate (this is before `COMP_GATE`), holds nothing, clears nothing, and deliberately does NOT set `COMP_PENDING` — nothing is coming to service the damage, and arming a re-drive on a dying machine is a futile wake, not tidiness. Damage stays on the table. LOCKFIX: two atomic loads, no acquire of any kind, so a refused pass cannot leak a hold into a preemption. ⚠ SAME-LINE fold, line-NEUTRAL — `wm.rs` is ~21k lines and a line added here would renumber every panic `Location` below it; the reviewing seat required that cost be CHOSEN, and this is the choice not to pay it. Idiom: `video/fbcon.rs`'s `⚠ SAME-LINE fold` markers.
     #[cfg(not(target_arch = "x86_64"))]
-    composite_once();
+    comp_gate_pass(); // COMPGATE — NO LONGER A BARE PASS. The non-x86 arm now runs under this module's own gate: a second entrant on any core FOLDS (its damage stays on the table and is serviced by the holder's re-run) or WAITS bounded, and can never reach `draw_window`'s direct, unclipped, per-pixel front-buffer path. The gate, its preemption hold, its witnesses and its nested-present fixture are at the FILE TAIL — see the COMPGATE ledger there for the mechanism (`decl_lock=73` is same-core re-entrancy by construction, because `STAGE` is per core) and for why the hold is a switch decline rather than an interrupt mask. ⚠ SAME-LINE fold, line-NEUTRAL, on the identical argument the PANELREFUSE fold above states: `wm.rs` is ~25k lines and a line added here renumbers every panic `Location` below it. x86 is untouched — the arm below is byte-for-byte what it was.
     #[cfg(target_arch = "x86_64")]
     {
         use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -15042,7 +15352,7 @@ pub fn minimise(id: WinId) -> &'static str {
     // gesture; this one names the park itself, uniformly with the incidental kind.)
     wm_act("park", id, owner, "cause=minimise", 0, 0);
     // VUGMIN-B — outside the guard, on this module's standing convention for this seam.
-    vugmin_publish(owner, hid);
+    vugmin_publish(owner, hid, "cause=minimise");
     // The vacate epilogue, identical to `move_to_inner`'s and load-bearing for the same reasons:
     // barrier first so an in-flight blit of the old geometry cannot land after the erase, then
     // desktop colour, then re-damage the neighbours the erase reached, then force the desktop's next
@@ -22237,12 +22547,16 @@ fn closeiso_selftest() {
     let sample = |id: WinId| -> u32 { probe(id).map(|(x, y)| read(x, y)).unwrap_or(0) };
 
     // The app holds focus, as it does after the operator drags or clicks its title bar — this is what
-    // makes `wc_close_click` take the `focus_changed(0)` arm at all.
+    // made `wc_close_click` take the `focus_changed(0)` arm at all. CLOSEMIN: that arm is GONE from
+    // both close routers (they take [`focus_after_close`] now), so the shell raise below is driven
+    // DELIBERATELY here, as the TAB-to-shell gesture it always was — which is the gesture these legs
+    // are actually about (furniture survives it; an ordinary row does not). The claim that a CLOSE
+    // does not raise the shell is [`closemin_selftest`]'s, not this fixture's.
     focus_changed(ASID_APP);
     let base_k = sample(wk) == k_col;
     let base_f = sample(wf) == f_col;
 
-    // ── THE GESTURE, exactly as `wc_close_click` performs it ────────────────────────────────────
+    // ── THE CLOSE, then the SHELL RAISE as its own deliberate gesture (see above) ───────────────
     let closed = close_owner(ASID_APP);
     focus_changed(0);
 
@@ -22677,6 +22991,12 @@ fn create_inner(
     if w.saturating_mul(4) > stride || h.saturating_mul(stride) > surf_len {
         return WIN_NONE;
     }
+    // WINTITLE — resolve the title HERE, before either lock. `mint_title` takes `APP_NAMES` (a leaf
+    // mutex) and `create_inner` goes on to take `WRITER` and then `TABLE`; resolving first keeps the
+    // leaf strictly outside both and out of the WINDOWS ⊃ TABLE ⊃ WRITER order entirely. The rule
+    // itself is stated once, in `TitleSource`; this is its only call site in the kernel.
+    let mut minted = [0u8; MAX_TITLE];
+    let (minted_len, title_src) = mint_title(owner_asid, title, &mut minted);
     // SPAWN-PLACE — resolve the caller's origin BEFORE the table lock (WRITER is never held across
     // it, which is what keeps the WRITER/TABLE order acyclic here as it is in `move_to` and `place`).
     // A framebuffer that is not ready leaves the row to the tiler, exactly as `move_to` declines.
@@ -22760,8 +23080,9 @@ fn create_inner(
     if !compat {
         row.scale = cluster_min_scale(w);
     }
-    row.title_len = title.len().min(MAX_TITLE);
-    row.title[..row.title_len].copy_from_slice(&title[..row.title_len]);
+    // WINTITLE — the row is born with the MINTED title, never the caller's bytes. See `TitleSource`.
+    row.title_len = minted_len;
+    row.title[..minted_len].copy_from_slice(&minted[..minted_len]);
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
     // and the `composite` below paints it exactly once, where it stays.
     if let Some((x, y, scale)) = placed {
@@ -22789,7 +23110,7 @@ fn create_inner(
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
     t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
-    drop(t); winid_alloc_witness(id, winid_generation); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`.
+    drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
     // where the id demonstrably names something new.
@@ -24392,7 +24713,7 @@ pub fn hittest_selftest() {
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
-    repaint();
+    repaint(); closemin_selftest(); wintitle_selftest(); // CLOSEMIN + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. Both fixtures are sited HERE, at the tail of the one window battery BOTH arches drive (x86 `arch/x86_64/syscall.rs` and aarch64 alike), because each pins arch-neutral code reached from two arch routers. `winid_selftest`'s chain was refused for WINTITLE for the same reason: it has exactly one external caller and it is `arch/aarch64`, so a fixture folded there would never run under `UNAOS_WC=1 ./arroyo test`. After this battery's own teardown sweep and focus restore, so neither inherits a synthetic row; each mints, reaps and restores its own.
 }
 
 /// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
@@ -24557,18 +24878,18 @@ fn dock_addressable(r: &Window) -> bool {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn dock_tiles(rows: &[Window; MAX_WINDOWS]) -> usize {
     let n = rows.iter().filter(|r| dock_addressable(r)).count();
-    // SHELLPIN (integrator, GR27) — mirror `dock::pin_shell`: with no live KERNEL_OWNER_DESKTOP
-    // row the dock paints one extra pinned `shell` tile, and this count is what `occ_clip` sizes
-    // the strip's blit clip from — one tile narrow and a drag across the pin clobbers it for a
-    // pass. Same cap as `pin_shell`: a full table pins nothing, so no +1 (a +1 there would make
-    // the clip one tile WIDER than the painted strip — the inverse defect).
-    if n < MAX_WINDOWS
-        && !rows.iter().any(|r| r.used && r.owner_asid == KERNEL_OWNER_DESKTOP)
-    {
-        n + 1
-    } else {
-        n
-    }
+    // PINCOUNT — mirror ALL FOUR pins, not `dock::pin_shell` alone. This count sizes `occ_clip`'s
+    // per-blit dock term and `erase_clip`'s strip rect, so a count short of the painted strip leaves
+    // the strip's tail unclipped and a drag across it clobbers the strip for a pass. The hand-written
+    // `pin_shell` mirror that used to live here was correct while the shell pin was the only pin and
+    // wrong the day the console, Quarry and pulse pins landed — up to TWO tiles short. It is now the
+    // same `dock::pins_applied` fold `dock::strip_rect` reads, over a census of the rows THIS caller
+    // already holds: `dock_tiles` must NOT call `dock_scan`, whose TABLE lock its callers are inside.
+    // The census uses `dock_addressable` rather than the old bare `r.used`, so this count and the
+    // scan the pins actually run against admit the same rows (a `compat` row is in neither).
+    super::dock::pins_applied(n, |o| {
+        rows.iter().any(|r| dock_addressable(r) && r.owner_asid == o)
+    })
 }
 
 // ---- CTRLWIT fixture ---------------------------------------------------------------------------
@@ -25743,15 +26064,35 @@ fn winid_console_route(id: WinId) -> &'static str {
 /// WINID — the alloc half of the witness, folded into `create_inner` AFTER its table guard drops.
 /// Never called under the lock: a `serial_println!` on a routed console asks for a composite, and a
 /// composite takes `TABLE`.
+///
+/// WINTITLE — **and it carries the minted title, APPENDED to this line rather than printed on a
+/// second one.** That is not tidiness, it is the fix for a measured regression. The first cut of
+/// this arc added its own `title_witness` beside this call, and the extra `serial_println!` per
+/// create — one more routed-console print, one more composite driven from inside `create_inner` —
+/// cost the furniture its compose passes for the rest of the boot: `UNAOS_WC=1 ./arroyo test` went
+/// from `[dock] selftest passes=44` to `passes=4`, `[crystal] selftest passes=7` to `passes=0`, and
+/// **reddened two fixtures that have nothing to do with titles** (`:: DOCK: … vacate=false`,
+/// `:: WINMENU: … app_box=false`), while the WINTITLE fixture itself passed. Proven by A/B at the
+/// same sha: the pre-arc tree exits 0 on the same command, this tree exited 1. So the rule for the
+/// next arc that wants a per-create fact on the wire: **append it here.** A create is on the
+/// compositor's own path and the wire is not free at that point. Idiom: WCN-CAUSE's appended census
+/// fields, `FBCON-DMG`'s inserted `box_px_pp`.
 #[cfg(any(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn winid_alloc_witness(id: WinId, generation: u32) {
+fn winid_alloc_witness(id: WinId, generation: u32, owner: u64, title: &[u8], src: TitleSource) {
     if WINID_ALLOC_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX {
         return;
     }
-    serial_println!("[wm] alloc win={} gen={}", id, generation);
+    serial_println!(
+        "[wm] alloc win={} gen={} owner={:#x} title=\"{}\" from={}",
+        id,
+        generation,
+        owner,
+        core::str::from_utf8(title).unwrap_or("?"),
+        src.as_str()
+    );
 }
 
 /// WINID — the erasing twin.
@@ -25760,7 +26101,7 @@ fn winid_alloc_witness(id: WinId, generation: u32) {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 )))]
 #[inline(always)]
-fn winid_alloc_witness(_id: WinId, _generation: u32) {}
+fn winid_alloc_witness(_id: WinId, _generation: u32, _owner: u64, _title: &[u8], _src: TitleSource) {}
 
 /// WINID — **the falsifier for SO1(b): does a closed window's id survive in a cache that held it?**
 ///
@@ -25857,6 +26198,146 @@ fn winid_selftest() {
     composite();
 }
 
+/// WINTITLE — **the fixture that would have caught render11's title bars.**
+///
+/// It asserts the ONE rule ([`mint_title`]) clause by clause, and then asserts the WIRING once
+/// end-to-end, because a rule nothing calls is not a rule:
+///
+/// * **LEG 1** — [`program_name`], the one derivation: directory dropped, extension dropped, case
+///   left exactly as the operator wrote it.
+/// * **LEG 2** — [`untitled_document`]: `Untitled`, `Untitled 1`, `Untitled 12`. The ONLY numbered
+///   titles in the system.
+/// * **LEG 3** — **the defect.** A seam label (`el0 win 5`) resolves to a NOUN with no digit in it.
+///   RED on the render11 base, where the label reached the strip verbatim.
+/// * **LEG 4** — an armed owner is titled with its program's name.
+/// * **LEG 5** — **no numeric suffix for app windows, ever.** Two windows of the SAME program get
+///   the SAME title. This is the half of Peter's ruling a "just strip the label" fix would miss.
+/// * **LEG 6** — a declared name survives verbatim, and the document form is recognised as such.
+/// * **LEG 7** — the wiring: a real [`create`] over a seam label puts the minted title in the ROW
+///   the compositor draws from, not merely in a helper's return value.
+///
+/// `witness`-gated and NOTHING else — exactly like [`closemin_selftest`], whose call site it shares.
+/// The furniture cross-gate the first draft carried (`wc` on x86, `desktop_firmware` on aarch64) was
+/// wrong twice over: it was NARROWER than its caller ([`hittest_selftest`] is `witness`-only), so on
+/// a witness build without furniture the fixture became an empty stub that printed nothing — and the
+/// rule it pins lives in `create_inner`, which is compiled and reached on every build that can open
+/// a window at all, not only on ones that draw a desktop.
+#[cfg(feature = "witness")]
+fn wintitle_selftest() {
+    // One-shot, on `reopen_selftest`'s terms: the fixture mints and closes real rows, and a battery
+    // driver that ran it twice would spend a table slot for no second answer.
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    /// A synthetic EL0-style owner: outside the kernel band, so it takes the app clauses.
+    const ASID_T: u64 = 0xA771;
+    /// A second synthetic owner, never armed, for the declared/document clauses.
+    const ASID_D: u64 = 0xA772;
+    const _: () = assert!(!is_kernel_owner(ASID_T) && !is_kernel_owner(ASID_D));
+
+    let sa = &raw const FV_SURF_A as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+
+    // LEG 1 — the one derivation.
+    let pn_ok = program_name("/apps/VUG.ELF") == "VUG"
+        && program_name("PULSE.ELF") == "PULSE"
+        && program_name("/apps/pulse.elf") == "pulse"
+        && program_name("/apps/VUG.TEST.ELF") == "VUG.TEST"
+        && program_name("/apps/x") == "x"
+        && program_name("/apps/").is_empty();
+
+    // LEG 2 — the document sequence.
+    let (mut d0, mut d1, mut d2) = ([0u8; MAX_TITLE], [0u8; MAX_TITLE], [0u8; MAX_TITLE]);
+    let (n0, n1, n2) = (
+        untitled_document(0, &mut d0),
+        untitled_document(1, &mut d1),
+        untitled_document(12, &mut d2),
+    );
+    let doc_ok = &d0[..n0] == b"Untitled" && &d1[..n1] == b"Untitled 1" && &d2[..n2] == b"Untitled 12";
+
+    // The name table must be clean for this owner before the unnamed clause is asked.
+    app_name_forget(ASID_T);
+    let mut buf = [0u8; MAX_TITLE];
+
+    // LEG 3 — the defect: a generated label never reaches a title bar, and what replaces it has no
+    // digit in it. The digit test is the ruling itself, not a restatement of the string compare: a
+    // future noun is still forbidden from carrying a sequence number.
+    let (ln, ls) = mint_title(ASID_T, b"el0 win 5", &mut buf);
+    let label_ok = ls == TitleSource::Unnamed
+        && &buf[..ln] == ANON_APP
+        && !buf[..ln].iter().any(|b| b.is_ascii_digit());
+
+    // LEG 4 — the launcher's name wins, in the operator's case.
+    let armed = app_name_arm(ASID_T, "/apps/VUG.ELF");
+    let (pn, ps) = mint_title(ASID_T, b"el0 win 5", &mut buf);
+    let prog_ok = armed && ps == TitleSource::Program && &buf[..pn] == b"VUG";
+
+    // LEG 5 — a second instance of the same program is titled identically. No "VUG 1".
+    let mut buf2 = [0u8; MAX_TITLE];
+    let (pn2, ps2) = mint_title(ASID_T, b"el0 win 6", &mut buf2);
+    let noseq_ok = ps2 == TitleSource::Program && buf2[..pn2] == buf[..pn];
+
+    // LEG 6 — a declared name verbatim, and the document form recognised.
+    let (dn, ds) = mint_title(ASID_D, b"Console", &mut buf2);
+    let (qn, qs) = mint_title(ASID_D, &d1[..n1], &mut buf);
+    let decl_ok = ds == TitleSource::Declared
+        && &buf2[..dn] == b"Console"
+        && qs == TitleSource::Document
+        && &buf[..qn] == b"Untitled 1";
+
+    // LEG 7 — the wiring. A real create over the seam label, read back out of the ROW.
+    //
+    // A full table is a SKIP for this leg alone, never for the verdict: legs 1-6 have already been
+    // measured by the time the row is asked for, and returning here would throw six answers away and
+    // leave the wire silent — the shape LAWS.md forbids, where a missing PASS is indistinguishable
+    // from a fixture that never ran. `row=skip` says exactly which leg was not asked.
+    let w = create(ASID_T, sa, len, 8, 8, 32, b"el0 win 5");
+    // Read the ROW, not `info` — `WindowInfo` is a geometry snapshot and carries no caption. Scoped
+    // so the guard is dropped before the witness line below (a `serial_println!` on a routed console
+    // asks for a composite and a composite takes `TABLE`).
+    let row_ok: Option<bool> = if w == WIN_NONE {
+        None
+    } else {
+        let t = table();
+        let v = row(&t, w).is_some_and(|r| r.title[..r.title_len] == *b"VUG");
+        drop(t);
+        Some(v)
+    };
+    close(w);
+    app_name_forget(ASID_T);
+    // And the forget is real: the owner falls back to the unnamed clause it started at.
+    let (fn_, fs) = mint_title(ASID_T, b"el0 win 5", &mut buf);
+    let forget_ok = fs == TitleSource::Unnamed && &buf[..fn_] == ANON_APP;
+
+    let ok = pn_ok
+        && doc_ok
+        && label_ok
+        && prog_ok
+        && noseq_ok
+        && decl_ok
+        && row_ok != Some(false)
+        && forget_ok;
+    serial_println!(
+        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} {} ::",
+        pn_ok as u8,
+        doc_ok as u8,
+        label_ok as u8,
+        core::str::from_utf8(SEAM_LABEL).unwrap_or("?"),
+        prog_ok as u8,
+        noseq_ok as u8,
+        decl_ok as u8,
+        match row_ok {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "skip",
+        },
+        forget_ok as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    composite();
+}
+
 /// WINID — the SKIP twin, so the fixture's call site needs no gate of its own and a reader of a
 /// knob-off capture is told the fixture did not run rather than left to infer it from silence.
 #[cfg(all(
@@ -25868,4 +26349,1134 @@ fn winid_selftest() {
 ))]
 fn winid_selftest() {
     serial_println!("[winid] selftest -> SKIP (no window furniture on this image: the five id caches WINID guards all live behind `wc` / `desktop_firmware`)");
+}
+
+// ---- CLOSEMIN — a close is a WINDOW gesture, and it may not speak for the table ----------------
+//
+// Peter, Jetson Orin Nano, render11, 2026-09-08, on the glass: **"closing one window minimizes
+// others"**. The wire says exactly how, three times in one boot
+// (`~/unaos-bench/scratch/orin23/boot-render11-B-full.log`):
+//
+// ```text
+// 9501: [wc-a] close_owner asid=0x3 closed=1 ids=[7] refused=0
+// 9504: [wm-act] park win=5 owner=0x1 at (0,0) -> cause=shell-raise
+// 9505: [wm-act] park win=8 owner=0x4 at (0,0) -> cause=shell-raise
+// 9506: [wm-act] park win=9 owner=0x5 at (0,0) -> cause=shell-raise
+// 9507: [wc-fv] focus shell z=45 hidden=3 exempt=0 furniture=4
+// 9512: [orinclick] edge=press ... win=7 owner=0x3 focus 0x3->0x0 consumed=1 -> CONSUMED
+// ```
+//
+// One close disc, one row reaped — and three OTHER programs' windows parked at [`PARKED_Z`] by the
+// same gesture. The cause is the focus handback: `arch::aarch64::syscall::wc_close_click` returned
+// the orphaned focus to the shell with [`focus_changed`]`(0)`, which is the SHELL ARM — a fresh
+// [`SHELL_Z`] above every survivor, their boxes erased to [`DESKTOP_BG`], and [`vugmin_scan`]
+// publishing `hidden=true` fleet-wide. That is the correct semantics for TAB-to-the-shell and the
+// wrong semantics for a close.
+//
+// It is the SAME defect [`focus_release`]'s doc block already records from GR27 Boot A, and the same
+// cure: x86 took it (`arch::x86_64::syscall::wc_close_click`, CLOSE-TEARDOWN), aarch64 never did —
+// `focus_release` had exactly one aarch64 caller (`wc_close_furniture`, CONWINCLOSE) and the app
+// close path was not it. **"SOMETIMES" is exact and is why it survived a QEMU battery**: the arm
+// fires only when the closed window's owner already held `FOCUS_ASID`, i.e. only when the operator
+// had clicked INTO the window before closing it. In the render11 capture the one close that did NOT
+// trip it is visible on the same wire (`9364: close_owner asid=0x2` with `focus 0x3->0x3`, no
+// `[wc-fv] focus shell` line) — a perfect control, recorded by accident.
+//
+// [`focus_after_close`] is the whole cure and this is the module's one close-focus verb from here:
+// release without the raise, then promote the top-most survivor, then SAY what happened.
+
+/// CLOSEMIN — lifetime cap on the `[wm] close-scope` line. Its own budget rather than `wm_act`'s
+/// 256, because this line must survive a boot in which the gesture vocabulary has already spent that
+/// budget: it is the ONE line that answers "did this close take anything else off the glass".
+const CLOSE_SCOPE_LOG_MAX: u32 = 64;
+static CLOSE_SCOPE_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// CLOSEMIN — **the top-most window that is still ON THE GLASS, as an owner ASID.** `0` when there
+/// is none.
+///
+/// Scoped exactly like the thing it is for. Skipped: `exclude` (the owner that just departed — belt
+/// and braces, its rows are already reaped by the time this runs), compat rows (the full-screen
+/// present path, never a focus target — see [`focus_ring`]), owner 0 (the shell/desktop row, which
+/// is not a window), rows below the shell ([`above_shell`], so a parked window is never promoted
+/// back onto the glass by someone else's close), and KERNEL FURNITURE.
+///
+/// Furniture is excluded deliberately and it is the only judgement call here. The console window is
+/// the machine's own surface, not a program's: `user_input_set_active` refuses the reserved band, so
+/// promoting it would name a focus holder the KEYBOARD can never follow — the highlight and the
+/// keystrokes would disagree, which is the one state focus must never be in. When the only survivors
+/// are furniture the answer is `0` and focus stays released at the shell, which is precisely the
+/// state x86's close path has had since CLOSE-TEARDOWN.
+fn top_visible_owner(exclude: u64) -> u64 {
+    use core::sync::atomic::Ordering;
+    let shell = SHELL_Z.load(Ordering::Acquire);
+    let t = table();
+    let mut best_z = 0u32;
+    let mut best = 0u64;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.owner_asid == 0 || r.owner_asid == exclude {
+            continue;
+        }
+        if is_kernel_owner(r.owner_asid) || !above_shell(r, shell) {
+            continue;
+        }
+        if r.z > best_z {
+            best_z = r.z;
+            best = r.owner_asid;
+        }
+    }
+    best
+}
+
+/// CLOSEMIN — **the `[wm] close-scope` line: what a close did to every OTHER window.**
+///
+/// Unconditional (not `witness`-gated) and budgeted at [`CLOSE_SCOPE_LOG_MAX`]. The render11 boot
+/// was a witness build and still could not answer this question in one read: `[wc-a] close win=N`
+/// named the row, `[wm-act] park` named the collateral, `[wc-fv] focus shell` named the raise, and
+/// nothing tied the three together or said what focus landed on. One line, at the moment the close's
+/// focus handback completes, naming the closed window, its owner, where focus went, and the ids that
+/// are OFF THE GLASS afterwards. `hidden_after` is the field the defect would have shown up in: a
+/// close that parks siblings prints their ids here.
+fn close_scope_witness(win: WinId, owner: u64, next_focus: u64) {
+    use core::sync::atomic::Ordering;
+    if CLOSE_SCOPE_LOG.fetch_add(1, Ordering::Relaxed) >= CLOSE_SCOPE_LOG_MAX {
+        return;
+    }
+    let mut hidden = [WIN_NONE; MAX_WINDOWS];
+    let mut nhidden = 0usize;
+    let mut visible = [WIN_NONE; MAX_WINDOWS];
+    let mut nvisible = 0usize;
+    {
+        let shell = SHELL_Z.load(Ordering::Acquire);
+        let t = table();
+        for r in t.rows.iter() {
+            if !r.used {
+                continue;
+            }
+            if above_shell(r, shell) {
+                visible[nvisible] = r.id;
+                nvisible += 1;
+            } else {
+                hidden[nhidden] = r.id;
+                nhidden += 1;
+            }
+        }
+    }
+    serial_println!(
+        "[wm] close-scope win={} owner={:#x} next_focus={:#x} shell_z={} visible_after={:?} hidden_after={:?}",
+        win,
+        owner,
+        next_focus,
+        SHELL_Z.load(Ordering::Acquire),
+        &visible[..nvisible],
+        &hidden[..nhidden]
+    );
+}
+
+/// CLOSEMIN — **the whole focus handback a CLOSE owes, and the only one a close router may make.**
+/// Returns the owner focus landed on (`0` = the shell, i.e. nothing was promoted).
+///
+/// Three steps, and the ORDER is the argument:
+///
+/// 1. [`focus_release`] — drop the departing owner's highlight, CAS-guarded, **no shell raise**.
+///    Survivors keep their `z`, keep compositing, keep their hidden bits. This is the step whose
+///    absence on aarch64 was the defect (see this section's header block).
+/// 2. **Promote the top-most survivor** ([`top_visible_owner`]) through [`focus_changed`]'s RAISE
+///    arm — which since CLICK-PLAIN is purely ADDITIVE: it starts the window it names and stops
+///    nothing. The promoted row is by construction already the top-most one on the glass, so the
+///    fresh `z` moves no pixel; what it does is put the focus highlight and the `hidden=false` wake
+///    edge on a window the operator can actually see. Only when the closed owner HELD focus: a close
+///    aimed at a background window must not steal focus from the window the operator is working in.
+/// 3. [`close_scope_witness`] — say it on the wire, once, in one line.
+///
+/// The keyboard half (`user_input_set_active`) stays with the syscall layer on both arches, exactly
+/// as [`focus_release`]'s contract says; this verb is the wm half only. `win` is the id the operator
+/// pressed, carried for the witness alone — pass [`WIN_NONE`] from an owner-scoped caller that no
+/// longer knows it.
+///
+/// ### The `held` read, and why a plain load is enough
+/// `held` is read before the release rather than returned by the CAS inside it. Both are on the
+/// operator's own input path — one pump, one core, at click rate — and the failure mode of losing
+/// the race is one skipped promotion, i.e. focus resting at the shell, which is the state this whole
+/// path had before CLOSEMIN. It cannot park a sibling under any interleaving, which is the property
+/// that matters.
+pub fn focus_after_close(win: WinId, owner: u64, route: &'static str) -> u64 {
+    let held = owner != 0 && focus_asid() == owner;
+    focus_release(owner, route);
+    let next = if held { top_visible_owner(owner) } else { 0 };
+    if next != 0 {
+        focus_changed(next);
+    }
+    close_scope_witness(win, owner, next);
+    next
+}
+
+/// CLOSEMIN — **the fixture: closing one window may not take another off the glass.**
+///
+/// Runs on BOTH arches (called from [`hittest_selftest`], which x86 and aarch64 both drive), needs
+/// no pointer and no HID: it drives the two verbs the close routers call, in the order they call
+/// them, against three rows it mints itself.
+///
+/// ### The legs
+/// * **1 — the close reaps exactly its own row.** `close_owner` returns 1 and the siblings' rows live.
+/// * **2 — THE DEFECT.** Both siblings are still [`above_shell`] after the close's focus handback,
+///   and [`SHELL_Z`] has not moved. This is the leg that REDS against the pre-CLOSEMIN aarch64
+///   router: substitute `focus_changed(0)` for [`focus_after_close`] and both siblings park at
+///   [`PARKED_Z`], `shell_z` jumps, and this leg reports `siblings_visible=false shell_moved=true`.
+/// * **3 — focus lands on the top-most survivor**, not on the shell and not on the reaped owner.
+/// * **4 — the CONTROL, and it is what makes leg 2 a measurement rather than a tautology.** The
+///   shell arm is then driven DELIBERATELY (`focus_changed(0)`) and both siblings MUST park. A
+///   fixture that can only ever see "visible" would pass over a build in which nothing can hide at
+///   all; this leg proves the instrument can read the other value.
+///
+/// Self-cleaning on [`focusvis_selftest`]'s terms: every row it mints is reaped and
+/// [`SHELL_Z`]/[`FOCUS_ASID`] are restored by its caller's own epilogue.
+#[cfg(feature = "witness")]
+pub fn closemin_selftest() {
+    use core::sync::atomic::Ordering;
+
+    /// The owner whose window the operator closes — it HOLDS focus, which is the precondition that
+    /// made the defect fire "sometimes" (see this section's header block).
+    const ASID_CLOSER: u64 = 0xC30;
+    /// The two survivors. `HI` is created last, so it holds the higher `z` and is the row leg 3 says
+    /// focus must land on.
+    const ASID_LO: u64 = 0xC31;
+    const ASID_HI: u64 = 0xC32;
+
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!("[closemin] close-scope -> SKIP (framebuffer not ready)");
+        return;
+    }
+    let info = fb.info();
+    if info.width < 256 || info.height < 128 {
+        serial_println!(
+            "[closemin] close-scope -> SKIP (panel {}x{} too small)",
+            info.width, info.height
+        );
+        return;
+    }
+
+    let sa = &raw const FV_SURF_A as usize;
+    let sb = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let wc = create(ASID_CLOSER, sa, len, 8, 8, 32, b"cm-c");
+    let wl = create(ASID_LO, sb, len, 8, 8, 32, b"cm-l");
+    let wh = create(ASID_HI, sa, len, 8, 8, 32, b"cm-h");
+    if wc == WIN_NONE || wl == WIN_NONE || wh == WIN_NONE {
+        serial_println!(
+            "[closemin] close-scope -> SKIP (window table full: c={} l={} h={})",
+            wc, wl, wh
+        );
+        close(wc);
+        close(wl);
+        close(wh);
+        close_owner(ASID_CLOSER);
+        close_owner(ASID_LO);
+        close_owner(ASID_HI);
+        return;
+    }
+
+    // The survivors take their z in order, so `HI` is unambiguously the top-most one on the glass;
+    // then the CLOSER takes focus, which is what a click into a window before closing it does and
+    // what makes the old shell arm reachable at all.
+    focus_changed(ASID_LO);
+    focus_changed(ASID_HI);
+    focus_changed(ASID_CLOSER);
+
+    let onglass = |id: WinId| -> bool {
+        let shell = SHELL_Z.load(Ordering::Acquire);
+        let t = table();
+        row(&t, id).map(|r| above_shell(r, shell)).unwrap_or(false)
+    };
+    let shell_before = SHELL_Z.load(Ordering::Acquire);
+    let base_ok = onglass(wl) && onglass(wh) && focus_asid() == ASID_CLOSER;
+
+    // ── THE GESTURE, exactly as the close routers now perform it ────────────────────────────────
+    let closed = close_owner(ASID_CLOSER);
+    let next = focus_after_close(wc, ASID_CLOSER, "route=closemin-selftest");
+
+    let closed_ok = closed == 1 && info_box(wc).is_none();
+    let siblings_visible = onglass(wl) && onglass(wh);
+    let shell_moved = SHELL_Z.load(Ordering::Acquire) != shell_before;
+    let focus_ok = next == ASID_HI && focus_asid() == ASID_HI;
+    // The hidden half, read through the predicate every present-suppression path reads.
+    let unhidden_ok = {
+        let t = table();
+        let shell = SHELL_Z.load(Ordering::Acquire);
+        !owner_hidden(&t, ASID_LO, shell) && !owner_hidden(&t, ASID_HI, shell)
+    };
+
+    // ── LEG 4: the CONTROL — the shell arm still parks, so leg 2 is a measurement ────────────────
+    focus_changed(0);
+    let control_ok = !onglass(wl) && !onglass(wh);
+
+    let ok = base_ok && closed_ok && siblings_visible && !shell_moved && focus_ok && unhidden_ok && control_ok;
+    serial_println!(
+        "[closemin] close-scope base={} closed={} siblings_visible={} shell_moved={} next_focus={:#x} focus={} unhidden={} shell_arm_control={} -> {}",
+        base_ok as u8,
+        closed_ok as u8,
+        siblings_visible as u8,
+        shell_moved as u8,
+        next,
+        focus_ok as u8,
+        unhidden_ok as u8,
+        control_ok as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+
+    // Teardown on `hittest_selftest`'s own terms: a sweep, not an assertion, and a leak is loud.
+    let mut leaked = 0usize;
+    for a in [ASID_CLOSER, ASID_LO, ASID_HI] {
+        leaked += close_owner(a);
+    }
+    if leaked > 3 {
+        serial_println!("[closemin] close-scope teardown LEAK — {} row(s) reaped -> FAIL", leaked);
+    }
+    SHELL_Z.store(0, Ordering::Release);
+    FOCUS_ASID.store(0, Ordering::Release);
+    repaint();
+}
+
+// ------------------------------------------------------------------------------------------------
+// DOCKID — raise ONE window (TAIL-APPENDED: nothing above this line moved, so knob-off panic
+// `Location` line numbers are untouched; PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+
+/// DOCKID — **give `id` a fresh `z` off the same allocator [`focus_changed`] uses, and nothing else.**
+///
+/// ### The defect it closes
+///
+/// [`focus_changed`] is keyed by ASID and raises EVERY window the owner has, deliberately (*"an app
+/// may own several windows and they focus together"*). That is the right rule for a focus change and
+/// the wrong one for a DOCK PRESS: a tile names ONE window, and the operator who pressed it expects
+/// THAT window in front. With two windows under one owner the raise loop hands out z in table order,
+/// so the topmost is whichever row sits later in the array — not the one whose tile was pressed. The
+/// tile and the window it brings forward disagree, which is the whole of Peter's *"who is who between
+/// what is open and what is showing in the taskbar"*.
+///
+/// ### What it is, and what it deliberately is NOT
+///
+/// It is the z-bump alone. It publishes no focus, unhides nobody, wakes no parked vug and speaks for
+/// no other row: the caller runs [`focus_changed`] FIRST (which does all of that for the owner) and
+/// then calls this to settle WHICH of that owner's windows ends on top. Splitting it this way is why
+/// it needs no second copy of the arrival/hidden/`vugmin` machinery and cannot drift from it.
+///
+/// Returns `false` for a non-row and for a `compat` row (which is not a focus target and has no tile).
+///
+/// Cost and locks: one `TABLE` acquisition, one `row_mut`, one `composite()` after the guard drops —
+/// [`minimise`]'s shape, without the erase (a raise vacates nothing).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn raise_one(id: WinId) -> bool {
+    let mut t = table();
+    let z = t.next_z;
+    let ok = match row_mut(&mut t, id) {
+        Some(r) if !r.compat => {
+            r.z = z;
+            r.damage_all();
+            true
+        }
+        _ => false,
+    };
+    if ok {
+        t.next_z = t.next_z.wrapping_add(1).max(1);
+    }
+    drop(t);
+    if ok {
+        composite();
+    }
+    ok
+}
+
+// ---- PINCOUNT probe ----------------------------------------------------------------------------
+//
+// TAIL-APPENDED, `witness`-only, on the CTRLWIT block's argument: a definition inserted higher up
+// renumbers every `core::panic::Location` below it and those records live in the loadable image.
+// With the knob off this does not compile and both targets stay byte-identical.
+
+/// PINCOUNT — **[`dock_tiles`]'s answer, for the fixture.**
+///
+/// [`dock_tiles`] is private and takes a table SNAPSHOT its callers already hold; `dock::dockid_selftest`
+/// holds nothing, so this takes the table for it. That is the whole of the probe: it adds no
+/// arithmetic of its own, because a probe that recomputed the count would gate its own copy rather
+/// than the number `occ_clip` and `erase_clip` actually size their clips from.
+///
+/// Read under no other lock — `dock::dockid_selftest` calls it between composites, never inside one.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+pub fn dock_tiles_probe() -> usize {
+    let t = table();
+    dock_tiles(&t.rows)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// COMPGATE — ONE COMPOSITE PASS ON THE PANEL AT A TIME, ON THE NON-x86 ARM TOO.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ## THE DEFECT, from the wire and not from an argument
+//
+// Peter's render11 glass tore. The rollup that scores it reads
+//
+//     [wc-h] rollup win=1 torn=2 decl_lock=73 maxpresent_us=117479
+//
+// and the three numbers are one mechanism, in this order.
+//
+// `decl_lock=73` is `stage_window`'s [`super::wcg::DECL_LOCK`] arm: `stage_for_core().try_lock()`
+// returned `None`. **That is same-core re-entrancy BY CONSTRUCTION, not cross-core contention**, and
+// the proof is one line of this module — [`stage_for_core`] indexes [`STAGE`] by
+// `meter_current_cpu()`, so two DIFFERENT cores never contend for the same entry and can never
+// produce this decline. A core can only lose that `try_lock` to ITSELF: to a present it started, was
+// interrupted inside, and then started again on top of.
+//
+// What loses the lock lands in `draw_window`'s `if !staged` arm — `paint_window`, the pre-WC-H
+// DIRECT path. That path is per-pixel through `put_pixel`, straight into the FRONT buffer, and (its
+// own note says so) UNCLIPPED. A present that takes it publishes half-composited rows to the glass
+// while another present is writing the same rows. That is the tear, and `torn=2` is the tear test
+// catching two of them.
+//
+// `maxpresent_us=117479` is why it happens at all. This arch composites with INTERRUPTS ENABLED —
+// the console reaches the compositor through `fbcon::route_present_banded` -> `present_banded` ->
+// `composite` with no mask anywhere on the path — and the preemption quantum is ~12 ms
+// (ORIN-TICKDEFAULT; `arch/aarch64/sched.rs`'s `QUANTUM_TICKS` at the 250 Hz tick). A 117 ms present
+// therefore contains about NINE involuntary switches, and every task dispatched in one of those
+// windows may start its own present on the same core. With the six-core `apsrun` in this base the
+// same preempt path runs on five more cores, so the population that can arrive mid-pass is larger
+// still — but the DECLINE remains same-core, because the buffer is.
+//
+// **The falsifier was already in the tree and had never been read.** [`BLIT_NET_CORE`] is a signed
+// per-enter-core net of live [`BlitGuard`]s, maintained unconditionally on every build. `net[c] > 1`
+// IS the re-entrancy: two composite blits entered on core `c` and neither has retired. Until this
+// arc it was printed ONLY from [`blitwho_report`], which runs from the two drain GIVE-UP arms — a
+// boot that tears without ever stalling a drain never prints it. It is now on every `[wc-h] rollup`
+// (`blitnet=[...]`, `video/wcg.rs`), so the reading that convicts is on the same line as the verdict.
+//
+// ## THE SHAPE OF THE FIX, which is x86's
+//
+// x86 has had the answer since WCSER: [`COMP_GATE`], a non-blocking `AtomicBool` around the whole
+// pass. A second entrant does not composite; it publishes `COMP_PENDING`, discharges the sprite duty
+// by DEFERRAL (`cursor::owe_repaint`, never a draw from inside another pass's bracket), and returns
+// having CLEARED NOTHING — its damage is still on the table and the holder's re-run loop absorbs it.
+// The aarch64 arm was a bare `composite_once()` with no gate and no decline path of its own, and the
+// module ledger above `COMP_GATE` says why in as many words: the gate was landed from the x86 seat,
+// with no aarch64 boot to verify it on, and this tree's verification law forbids changing another
+// platform's compositor blind. The Orin boot that verifies it is now on the wire, so the argument
+// that held it back is discharged and the arm is closed.
+//
+// This block is that arm. It is x86's SHAPE, not a copy of x86's code, and the three differences are
+// deliberate:
+//
+//   1. **A BOUNDED WAIT, not only a fold.** x86 declines and leaves. Here a cross-core entrant that
+//      can afford to spin waits up to [`COMPGATE_WAIT_US`] for the holder to finish and then
+//      composites for real, because the alternative on this arch is a console present deferred a
+//      whole frame on a machine whose panel is the only output. It is a spin, so it is priced in
+//      microseconds and not milliseconds; on expiry it FOLDS, which is x86's behaviour exactly.
+//   2. **THE SAME-CORE ARM NEVER WAITS.** If the gate's holder is THIS core, the holder cannot make
+//      progress while we spin on it — we own the core. Waiting there is a deadlock against the very
+//      preempt tick that produced the re-entrancy, so the same-core entrant folds IMMEDIATELY, and
+//      the holder is re-read inside the wait loop in case it migrates onto us mid-spin. This is
+//      `blit_samecore_futile`'s argument, applied to the gate instead of to the drain.
+//   3. **A PREEMPTION HOLD AROUND THE PASS** ([`crate::arch::sched::preempt_hold`]). The gate alone
+//      already makes the tear impossible — a re-entrant present folds instead of taking the direct
+//      path — but it leaves the pass STRETCHED across every task the quantum hands the core to,
+//      which is what turned a present into 117 ms in the first place. The hold declines the
+//      involuntary switch and nothing else: interrupts stay ENABLED, the tick is still taken and
+//      EOI'd, `arch::ms()` still advances (it reads CNTVCT, not a tick count), and every other
+//      interrupt is delivered normally. **Masking interrupts for 100 ms was considered and refused
+//      outright** — this tree has already convicted that shape once (`[comp2] max_us=302134` under a
+//      masked reopening present). If a pass is ever long enough that a hold of its length is itself
+//      the problem, the answer is x86's: SPLIT THE PHASE (the deferred `COMP_GATE` narrowing, design
+//      §8 step 3), not a longer mask.
+//
+// ## WHAT A FOLD COSTS, AND WHO PAYS THE DAMAGE BACK
+//
+// Nothing is dropped. A fold returns BEFORE the table snapshot, so every `damaged` flag it would
+// have consumed is still set; it publishes [`COMPGATE_PENDING`], and the holder — if it is unmasked
+// — runs up to [`COMPGATE_RERUN_MAX`] extra full passes for exactly the folders, each one its own
+// snapshot and its own back-to-front order. A MASKED holder does one pass and leaves, on x86's
+// review-condition-1 argument (extra masked rounds are global latency charged to the wrong caller);
+// its folders are picked up by the next present or by `service_damage`, which `screen.rs` drives.
+//
+// ## THE FAIL SHAPES, named in advance
+//
+//   * `[compgate] wait core=N us=…` that never returns => a deadlock against the tick. Structurally
+//     excluded twice over (the same-core arm never waits; the wait is bounded by a free-running
+//     counter read, not by a lock), so an occurrence falsifies this block and not the panel.
+//   * `torn>0` while `blitnet=` shows no core above 1 => the tear has a DIFFERENT source; this gate
+//     is not the fix for it and the diagnosis restarts.
+//   * `deferred=` (the preempt-hold count) rising without bound on an idle desktop => a LEAKED hold.
+//     The guard's core index is captured at acquisition for exactly this reason; see the ledger in
+//     `arch/aarch64/sched.rs`.
+
+/// COMPGATE — the gate. `true` = a composite pass owns the panel.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// COMPGATE — which core holds [`COMPGATE`]. `usize::MAX` = free. Written by the acquire winner and
+/// cleared before the release store, so a reader that sees a core sees a live holder or a stale one,
+/// never a wrong one. Read by the wait arm's futility test.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_HOLDER_CORE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// COMPGATE — when the current held epoch began, in [`crate::arch::now_cycles`] units.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_T0_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// COMPGATE — a pass folded and its damage is still on the table. `COMP_PENDING`'s twin.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// COMPGATE — passes that took the gate.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_ENTERED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — passes that FOLDED into an in-progress pass. THE reading: this is the number of
+/// composites that would previously have interleaved their blits with another pass on the same
+/// glass, and (for the same-core population) the number that would have fallen to the direct path.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_FOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — entrants that took the bounded wait, and those the wait actually admitted.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_WAIT_OK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — the longest wait and the longest held epoch, both in microseconds. Gauges: a wedged
+/// holder leaves them standing, which is the point.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_MAXWAIT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_MAXHOLD_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — extra rounds a holder ran for its folders.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_RERUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — [`composite_once`] invocations that actually ran. The fixture's instrument: a nested
+/// present that FOLDS leaves this unmoved, and one that RAN moves it by exactly one.
+#[cfg(not(target_arch = "x86_64"))]
+static COMPGATE_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// COMPGATE — the bounded wait, in microseconds.
+///
+/// Priced as a SPIN, which is what it is: this arm is taken only with interrupts unmasked and only
+/// against a holder on another core, and it burns the core for its whole length. 250 µs is two
+/// orders under the 12 ms quantum (so a waiter can never eat a scheduling slice), an order under the
+/// ~3 ms typical composite pass this track has measured (`[comp2] pass_us=3294`) — i.e. it is NOT
+/// sized to outlast a whole pass, deliberately, because a waiter that outlasts a pass is a waiter
+/// that should have folded — and comfortably above the tail of a pass that is nearly finished, which
+/// is the population it exists to admit.
+#[cfg(not(target_arch = "x86_64"))]
+const COMPGATE_WAIT_US: u64 = 250;
+
+/// COMPGATE — extra passes an UNMASKED holder runs for its folders. Two, on `COMP_RERUN_MAX`'s
+/// argument and for the same population: enough to absorb the overlap one contended desktop
+/// produces, cheap where it applies, and never taken by a masked holder at all.
+#[cfg(not(target_arch = "x86_64"))]
+const COMPGATE_RERUN_MAX: u32 = 2;
+
+/// COMPGATE — cadence of the `[compgate] rollup` census, in ms.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+const COMPGATE_ROLLUP_MS: u64 = 5_000;
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_ROLLUP_LAST_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — per-core one-shot latch for the `[compgate] enter` line. Bounded at one line per core
+/// per boot: the enter event happens hundreds of times a second and the interesting fact about it is
+/// WHICH CORES composite, not how often.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_ENTER_SEEN: [core::sync::atomic::AtomicBool; COMPGATE_CORES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; COMPGATE_CORES];
+/// COMPGATE — how many `fold` / `wait` lines to print before the rollup carries the census alone.
+/// The events are per-present, so an unbounded print would be a serial write on the hot path.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+const COMPGATE_EVENT_PRINT_MAX: u64 = 8;
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FOLD_PRINTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_WAIT_PRINTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// COMPGATE — the width of every per-core array in this block. NOT a claim about how many cores the
+/// machine has: it is [`BLIT_NET_CORE`]'s width, so the census this gate prints and the net it prints
+/// beside it are indexed the same way and a reader can lay one on the other. Cores at or beyond it
+/// fold onto the last slot exactly as [`stage_pool_index`] folds them, which costs those cores a
+/// shared counter and never an out-of-bounds. Lives here, in the video module, and NOT in
+/// `arch/aarch64/sched.rs`, which is shared with the Pi track and carries no literal core counts.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+const COMPGATE_CORES: usize = 8;
+
+/// COMPGATE — [`BLIT_NET_CORE`], as a plain array, for the witnesses that print it.
+///
+/// The NET itself is unconditional — every build maintains it — but every READER is a witness: the
+/// `[wc-h] rollup`'s `blitnet=` field lives in the `witness`-gated `video/wcg.rs`, and this module's
+/// `[compgate] rollup` and [`compgate_selftest`] carry the same gate. The snapshot therefore carries
+/// it too; without it a `witness`-off build compiles a function nothing can call.
+///
+/// Deliberately NOT behind `blitwho_report`: that function is reachable only from the two drain
+/// give-up arms, so a boot that TEARS without ever stalling a drain never prints the one reading
+/// that convicts the tear. `[wc-h] rollup blitnet=` is the fix for that blind spot; see the COMPGATE
+/// ledger.
+#[cfg(feature = "witness")]
+pub(super) fn blit_net_snapshot() -> [i64; 8] {
+    core::array::from_fn(|i| BLIT_NET_CORE[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// COMPGATE — the preemption hold that brackets a held pass. See the ledger in
+/// `arch/aarch64/sched.rs` for the contract and the three hazards it closes.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn compgate_preempt_hold() -> crate::arch::sched::PreemptHold {
+    crate::arch::sched::preempt_hold()
+}
+/// COMPGATE — the hold is an aarch64 facility. Any other non-x86 arch gets the gate without it: the
+/// TEAR is closed by the gate alone (a re-entrant present folds), and the hold is the LATENCY half.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn compgate_preempt_hold() {}
+
+/// COMPGATE — is anything OWED to a folder? The re-run loop's guard, and `any_damaged` +
+/// `deferred_owed` in one function because on this arch neither has a caller of its own.
+///
+/// A fold says a pass was refused, not that it had anything to do: the holder's own round is
+/// generous (the occlusion closure repaints more than the decliner asked for) and usually absorbs
+/// it. There is no menu term — this arch compiles no SHARD menu, which is why `service_damage`'s
+/// own menu arm is `x86_64`-gated too.
+#[cfg(not(target_arch = "x86_64"))]
+fn comp_gate_owed() -> bool {
+    if DEFER_N.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let t = table();
+    t.rows.iter().any(|r| r.used && r.damaged)
+}
+
+/// COMPGATE — THE GATE. Every non-x86 `composite()` runs through here and nowhere else.
+///
+/// Three outcomes and no fourth: ENTER (took the gate, ran the pass, absorbed its folders), WAIT
+/// (spun bounded for a holder on another core, then entered or folded), FOLD (published the pending
+/// flag, deferred the sprite duty, cleared nothing, returned). **There is no arm that proceeds to
+/// `composite_once` without the gate**, which is the whole property: `draw_window`'s direct,
+/// unclipped, per-pixel path is now unreachable from a second entrant.
+#[cfg(not(target_arch = "x86_64"))]
+fn comp_gate_pass() {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+    let me = crate::arch::sched::meter_current_cpu();
+    let mut got = COMPGATE.compare_exchange(false, true, AcqRel, Relaxed).is_ok();
+    if !got {
+        // SECOND ENTRANT. The wait is offered only where it can terminate and only where it can be
+        // afforded: a holder that is NOT this core (a holder that IS this core cannot run while we
+        // spin — we own the core — so waiting on it is a deadlock against the preempt tick that put
+        // us here), and interrupts unmasked (a masked caller is on `sys_win_present`'s path holding
+        // the window table, and a spin there is latency charged to the whole machine).
+        let holder = COMPGATE_HOLDER_CORE.load(Relaxed);
+        if holder != me && holder != usize::MAX && !crate::arch::irqs_masked() {
+            let t0 = crate::arch::now_cycles();
+            let budget = compgate_wait_budget_cyc();
+            loop {
+                core::hint::spin_loop();
+                if COMPGATE.compare_exchange(false, true, AcqRel, Relaxed).is_ok() {
+                    got = true;
+                    break;
+                }
+                // The holder can MIGRATE onto this core mid-spin, at which point the wait becomes
+                // the futile same-core one and must end. Re-read rather than trusted from above.
+                if COMPGATE_HOLDER_CORE.load(Relaxed) == me {
+                    break;
+                }
+                if crate::arch::now_cycles().saturating_sub(t0) >= budget {
+                    break;
+                }
+            }
+            let us = compgate_cyc_to_us(crate::arch::now_cycles().saturating_sub(t0));
+            COMPGATE_WAITS.fetch_add(1, Relaxed);
+            if got {
+                COMPGATE_WAIT_OK.fetch_add(1, Relaxed);
+            }
+            COMPGATE_MAXWAIT_US.fetch_max(us, Relaxed);
+            compgate_note_wait(me, us, got);
+        }
+        if !got {
+            // FOLDED. This pass composites nothing and CLEARS NOTHING — it never reached the table
+            // snapshot, so every `damaged` flag it would have consumed is still set and belongs to
+            // the holder's next round. The pending flag is the only thing published.
+            COMPGATE_PENDING.store(true, Release);
+            COMPGATE_FOLDS.fetch_add(1, Relaxed);
+            compgate_note_fold(me);
+            // The sprite duty is DEFERRED, not discharged. We are inside another pass's CURSOR-1
+            // bracket by definition: the holder took the sprite down before its first window pixel
+            // and puts it back in its tail. Drawing here would be an unserialised sprite writer into
+            // a half-composited stack, and it would capture its save-under from those same
+            // half-composited pixels. `owe_repaint` writes nothing and hands the whole-sprite
+            // refresh to the holder's tail, which runs on a finished stack holding `SPRITE`. This is
+            // x86's REVIEW CONDITION 3 verbatim; see the decline arm of `composite`.
+            super::cursor::owe_repaint();
+            return;
+        }
+    }
+    // HELD. Stamp t0 first, then the core, so a set holder always carries a current age.
+    COMPGATE_T0_CYC.store(crate::arch::now_cycles(), Relaxed);
+    COMPGATE_HOLDER_CORE.store(me, Relaxed);
+    COMPGATE_ENTERED.fetch_add(1, Relaxed);
+    compgate_note_enter(me);
+    // The hold covers the pass AND its re-runs, and is released after the gate below.
+    let hold = compgate_preempt_hold();
+    COMPGATE_PASSES.fetch_add(1, Relaxed);
+    // The nested-present fixture, inside the hold and inside the gate — the one place a nested
+    // present is a controlled experiment rather than an accident. One-shot, witness-only.
+    #[cfg(feature = "witness")]
+    compgate_fixture(me);
+    composite_once();
+    // Service what folded while we held. Each round is a FULL pass — its own snapshot, its own
+    // upward closure, its own back-to-front order, its own cursor tail — so no tail is skipped and
+    // the coalesced damage is composited in one correct stack. A MASKED holder takes none of them:
+    // it is on the present syscall's path holding the window table, and extra masked rounds are
+    // global latency charged to a caller that did not ask for them (x86's review condition 1). Its
+    // folders are not lost — the flag stays set for the next present or for `service_damage`.
+    let masked = crate::arch::irqs_masked();
+    let mut rounds = 0u32;
+    while !masked && rounds < COMPGATE_RERUN_MAX && COMPGATE_PENDING.swap(false, AcqRel) {
+        if !comp_gate_owed() {
+            break; // the folder's damage was already absorbed by the round above
+        }
+        rounds += 1;
+        COMPGATE_RERUNS.fetch_add(1, Relaxed);
+        // Re-base the epoch clock per pass: a legal multi-pass storm must not read as one overlong
+        // hold. A wedged pass stops re-basing by definition, so the gauge's real target is unharmed.
+        COMPGATE_T0_CYC.store(crate::arch::now_cycles(), Relaxed);
+        COMPGATE_PASSES.fetch_add(1, Relaxed);
+        composite_once();
+    }
+    let held_us =
+        compgate_cyc_to_us(crate::arch::now_cycles().saturating_sub(COMPGATE_T0_CYC.load(Relaxed)));
+    COMPGATE_MAXHOLD_US.fetch_max(held_us, Relaxed);
+    // Clear the holder BEFORE the release, so a core that wins the gate next never reads a stale
+    // holder and mistakes a live wait for the futile same-core one.
+    COMPGATE_HOLDER_CORE.store(usize::MAX, Relaxed);
+    COMPGATE.store(false, Release);
+    // The hold outlives the release by exactly these two statements: a switch between the release
+    // and the drop is harmless (the gate is already free), while a switch before the release is the
+    // stretched pass this whole block exists to stop.
+    drop(hold);
+    // The selftest, ONCE per boot, from OUTSIDE the gate it tests — after the release and after the
+    // hold is dropped, which is the only point in this function where the gate is free and a
+    // control present can actually enter. Sited here rather than in a battery on a finding, not a
+    // preference: the aarch64 window battery (`hittest_selftest` <- `wcb_launcher` <- `u7_launcher`)
+    // lives inside `main.rs`'s `all(target_arch = "aarch64", feature = "baremetal")` block, so a
+    // call site there is compiled out of every UEFI aarch64 image — `./arroyo test-arm` included —
+    // and the fixture would be a check that cannot fire on the only aarch64 QEMU verb that runs
+    // this arch's UEFI path. Riding the compositor instead means the fixture is present wherever
+    // the thing it gates is present, and on a boot that never composites it costs nothing and
+    // honestly says nothing.
+    #[cfg(feature = "witness")]
+    compgate_selftest_once();
+    #[cfg(feature = "witness")]
+    compgate_rollup();
+}
+
+/// COMPGATE — [`COMPGATE_WAIT_US`] in [`crate::arch::now_cycles`] units, computed from the live
+/// timebase rather than assumed. A zero or unreadable frequency degrades to a budget of zero, i.e.
+/// to an immediate fold — the conservative direction, since a fold is always correct and only a
+/// wait can be too long.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn compgate_wait_budget_cyc() -> u64 {
+    // One µs of cycles, times the budget. `wcg_cycles_to_us` is the inverse and the two are read
+    // against each other on the wire (`maxwait_us=` must never exceed `COMPGATE_WAIT_US`).
+    let one_us = compgate_cyc_per_us();
+    one_us.saturating_mul(COMPGATE_WAIT_US)
+}
+
+/// COMPGATE — `[compgate] enter core=N`, once per core per boot. See [`COMPGATE_ENTER_SEEN`].
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_note_enter(core: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let i = core.min(COMPGATE_CORES - 1);
+    if COMPGATE_ENTER_SEEN[i].swap(true, Relaxed) {
+        return;
+    }
+    serial_println!(
+        ":: [compgate] enter core={} — this core has taken the composite gate for the first time; \
+         while it holds it no other core and no preempting task on this one can reach the panel, \
+         and its preemption hold is standing ::",
+        core
+    );
+}
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "witness")))]
+#[inline]
+fn compgate_note_enter(_core: usize) {}
+
+/// COMPGATE — `[compgate] fold core=N reason=in-progress`, capped at
+/// [`COMPGATE_EVENT_PRINT_MAX`] lines; the census continues on the rollup.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_note_fold(core: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if COMPGATE_FOLD_PRINTS.fetch_add(1, Relaxed) >= COMPGATE_EVENT_PRINT_MAX {
+        return;
+    }
+    serial_println!(
+        ":: [compgate] fold core={} reason=in-progress holder=c{} — this present did NOT composite \
+         and did NOT clear its damage; it published the pending flag and deferred the sprite \
+         repaint, and the holder's re-run absorbs it. Before this gate it would have fallen to \
+         draw_window's direct unclipped path ::",
+        core,
+        {
+            let h = COMPGATE_HOLDER_CORE.load(Relaxed);
+            if h == usize::MAX { -1 } else { h as isize }
+        }
+    );
+}
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "witness")))]
+#[inline]
+fn compgate_note_fold(_core: usize) {}
+
+/// COMPGATE — `[compgate] wait core=N us=…`, same cap and same reason as the fold line.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_note_wait(core: usize, us: u64, admitted: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if COMPGATE_WAIT_PRINTS.fetch_add(1, Relaxed) >= COMPGATE_EVENT_PRINT_MAX {
+        return;
+    }
+    serial_println!(
+        ":: [compgate] wait core={} us={} bound_us={} outcome={} — a bounded spin for a holder on \
+         another core. It cannot fail to return: the same-core arm never waits and the bound is a \
+         free-running counter read, not a lock ::",
+        core,
+        us,
+        COMPGATE_WAIT_US,
+        if admitted { "entered" } else { "fold" }
+    );
+}
+#[cfg(all(not(target_arch = "x86_64"), not(feature = "witness")))]
+#[inline]
+fn compgate_note_wait(_core: usize, _us: u64, _admitted: bool) {}
+
+/// COMPGATE — the standing census, every [`COMPGATE_ROLLUP_MS`], from the release path.
+///
+/// `folds=` is THE reading: composites that would previously have interleaved their blits with a
+/// pass already on the glass. `blitnet=` is the falsifier laid beside it — a slot above 1 is live
+/// re-entrancy, and `torn>0` with every slot at or below 1 says the tear has another source.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_rollup() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::ms();
+    let last = COMPGATE_ROLLUP_LAST_MS.load(Relaxed);
+    if now.saturating_sub(last) < COMPGATE_ROLLUP_MS {
+        return;
+    }
+    if COMPGATE_ROLLUP_LAST_MS
+        .compare_exchange(last, now, core::sync::atomic::Ordering::AcqRel, Relaxed)
+        .is_err()
+    {
+        return; // another core is printing this period's line
+    }
+    let net = blit_net_snapshot();
+    let entered = COMPGATE_ENTERED.load(Relaxed);
+    let folds = COMPGATE_FOLDS.load(Relaxed);
+    let verdict = if folds > 0 || COMPGATE_WAITS.load(Relaxed) > 0 {
+        "GATED"
+    } else if entered > 0 {
+        "UNCONTENDED"
+    } else {
+        "IDLE"
+    };
+    serial_println!(
+        "[compgate] rollup entered={} folds={} waits={} waitok={} maxwait_us={} reruns={} passes={} maxhold_us={} preempt_deferred={} blitnet=[{},{},{},{},{},{},{},{}] -> {}",
+        entered,
+        folds,
+        COMPGATE_WAITS.load(Relaxed),
+        COMPGATE_WAIT_OK.load(Relaxed),
+        COMPGATE_MAXWAIT_US.load(Relaxed),
+        COMPGATE_RERUNS.load(Relaxed),
+        COMPGATE_PASSES.load(Relaxed),
+        COMPGATE_MAXHOLD_US.load(Relaxed),
+        compgate_preempt_deferrals(),
+        net[0], net[1], net[2], net[3], net[4], net[5], net[6], net[7],
+        verdict
+    );
+}
+
+/// COMPGATE — involuntary switches the preemption hold declined, or 0 where there is no hold.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn compgate_preempt_deferrals() -> u64 {
+    crate::arch::sched::preempt_deferrals()
+}
+#[cfg(all(not(target_arch = "x86_64"), not(target_arch = "aarch64"), feature = "witness"))]
+#[inline]
+fn compgate_preempt_deferrals() -> u64 {
+    0
+}
+
+/// COMPGATE — THE NESTED-PRESENT FIXTURE, and what makes it a gate rather than a print.
+///
+/// One-shot per boot, armed on the first pass to take the gate, and it runs from INSIDE that pass —
+/// so the machine state it tests is exactly the defect's: a present in progress, on this core, with
+/// the gate held. It then does the thing the preempt tick does by accident, deliberately: it calls
+/// [`composite`] again.
+///
+/// **The assertion is measured, never asserted.** [`COMPGATE_PASSES`] counts `composite_once`
+/// invocations that actually ran. With the gate, the nested call folds and the delta is ZERO. With
+/// the gate removed — the falsifier is one edit, replacing the acquire block with an unconditional
+/// entry — the nested call runs a whole second pass concurrently with the first and the delta is
+/// ONE. `decl_lock_delta` is the same question asked of the panel instead of the gate: on a machine
+/// with windows on the glass (metal; QEMU virt composites but stages no window) an ungated nested
+/// present loses `stage_for_core().try_lock()` to the outer one and falls to the direct path, which
+/// is `[wc-h]`'s `decl_lock` moving. Zero on virt is the honest reading there and not a pass by
+/// default — the passes delta is what virt actually scores, and it is the one that is red.
+///
+/// The verdict is DERIVED from the two deltas and the fold count, never printed from an intention.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// COMPGATE — completed probe runs. The selftest's PRECONDITION, not a decoration: a run that did
+/// not move this number never got inside a held pass, and a verdict scored off stale deltas would be
+/// a check that cannot fire.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_RUNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// COMPGATE — the last probe's four deltas, published for [`compgate_selftest`] to score. Written
+/// only by the probe, which is one-shot per arming, so a reader that has confirmed
+/// [`COMPGATE_FIXTURE_RUNS`] moved is reading that arming's numbers.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_PASSES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_FOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+static COMPGATE_FIXTURE_DECL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_fixture(core: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Spent BEFORE the nested call, so the nested pass cannot re-arm the experiment on itself —
+    // that is what bounds the recursion at depth two on every build, gated or not.
+    if !COMPGATE_FIXTURE_ARMED.swap(false, Relaxed) {
+        return;
+    }
+    let passes0 = COMPGATE_PASSES.load(Relaxed);
+    let folds0 = COMPGATE_FOLDS.load(Relaxed);
+    let waits0 = COMPGATE_WAITS.load(Relaxed);
+    let decl0 = super::wcg::decl_lock_total();
+    composite();
+    let passes = COMPGATE_PASSES.load(Relaxed).saturating_sub(passes0);
+    let folds = COMPGATE_FOLDS.load(Relaxed).saturating_sub(folds0);
+    let waits = COMPGATE_WAITS.load(Relaxed).saturating_sub(waits0);
+    let decl = super::wcg::decl_lock_total().saturating_sub(decl0);
+    let outcome = if passes > 0 {
+        "ran"
+    } else if folds > 0 {
+        "fold"
+    } else if waits > 0 {
+        "wait"
+    } else {
+        "none"
+    };
+    // GATED requires BOTH halves: the nested pass did not run, AND it did not reach the panel's
+    // direct path. `none` is not a pass — a nested call that neither ran nor folded means the gate
+    // was never consulted, which is a broken fixture and reads as UNGATED.
+    let verdict = if passes == 0 && decl == 0 && (folds + waits) > 0 { "GATED" } else { "UNGATED" };
+    // Publish BEFORE the serial write and bump the run counter LAST, so a reader that has seen the
+    // counter move is guaranteed to see this arming's four deltas and never the previous one's.
+    COMPGATE_FIXTURE_PASSES.store(passes, Relaxed);
+    COMPGATE_FIXTURE_FOLDS.store(folds, Relaxed);
+    COMPGATE_FIXTURE_WAITS.store(waits, Relaxed);
+    COMPGATE_FIXTURE_DECL.store(decl, Relaxed);
+    COMPGATE_FIXTURE_RUNS.fetch_add(1, core::sync::atomic::Ordering::Release);
+    serial_println!(
+        "[compgate] fixture core={} nested=1 outcome={} passes_delta={} folds_delta={} waits_delta={} decl_lock_delta={} -> {}",
+        core,
+        outcome,
+        passes,
+        folds,
+        waits,
+        decl,
+        verdict
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// COMPGATE — THE SELFTEST. The battery's line, and the one a render12 flight is read against.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// COMPGATE — is a preemption hold standing on this core? See [`compgate_selftest`] leg 2.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+#[inline]
+fn compgate_hold_standing() -> bool {
+    crate::arch::sched::preempt_hold_standing()
+}
+
+/// COMPGATE — `:: COMPGATE: … PASS ::`, driven from the window battery both arches run.
+///
+/// ## What it is testing, and why a nested present is the right stimulus
+///
+/// The defect is re-entrancy into a composite pass: on this arch the pass runs with interrupts
+/// ENABLED and the quantum is ~12 ms (ORIN-TICKDEFAULT), so a 117 ms present contains about nine
+/// involuntary switches and any task dispatched in one of them may start its own present. Waiting
+/// for that to happen by accident would make the fixture a lottery — it would pass on a quiet boot
+/// whether or not the gate existed, which is the shape of a check that cannot fire. So the stimulus
+/// is DRIVEN: [`compgate_fixture`] calls [`composite`] again from INSIDE a held pass, on this core,
+/// with the hold standing and interrupts unmasked. That is byte-for-byte the machine state a preempt
+/// tick produces, minus the wait.
+///
+/// ## The four legs, and the control that makes them measurements
+///
+/// * **1 — GATED.** The nested present did not composite (`nested_passes=0`), it was actually
+///   refused rather than skipped (`nested_folds + nested_waits > 0`), and it never reached the
+///   panel's direct, unclipped, per-pixel path (`nested_decl_lock=0`). This is the leg that REDS
+///   against the pre-gate build: with the fold arm removed the nested call runs a second
+///   `composite_once` concurrently with the first and `nested_passes` is 1.
+/// * **2 — THE PREEMPTION HOLD ARMS AND RELEASES.** No hold standing before, one standing inside the
+///   guard's scope, none standing after the drop. This is the leaked-hold hazard — a core that never
+///   preempts again — read directly rather than inferred from the absence of a symptom.
+/// * **3 — THE CONTROL, and it is what makes leg 1 a measurement rather than a tautology.** An
+///   UNCONTENDED present, driven with the gate free, must move [`COMPGATE_PASSES`] by at least one.
+///   Without it a build whose pass counter was dead would report `nested_passes=0` and pass leg 1
+///   while compositing nothing at all.
+/// * **4 — NO LIVE RE-ENTRANCY ON THE GLASS.** Every [`BLIT_NET_CORE`] slot at or below 1 after the
+///   drive: no core holds two composite blits at once. This is the falsifier `[wc-h] rollup`'s
+///   `blitnet=` publishes on the wire, asserted here instead of merely printed.
+///
+/// `preempt_deferred=` and `blitnet_max=` ride the line as OBSERVABLES — the numbers the render12
+/// wire is read against — and `drive_ms=` says how long the gated window actually was, so a reader
+/// can see whether a quantum could have elapsed inside it rather than take the claim on trust.
+///
+/// Self-cleaning: it mints no rows and touches no window state. It composites three extra times,
+/// which is what the desktop does anyway.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub fn compgate_selftest() {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+
+    // ── LEG 3: THE CONTROL, taken FIRST and on a free gate, so it cannot be contaminated by the
+    // experiment and so a dead pass counter is caught before anything is scored against it.
+    let p0 = COMPGATE_PASSES.load(Relaxed);
+    composite();
+    let control_passes = COMPGATE_PASSES.load(Relaxed).saturating_sub(p0);
+    let control_ok = control_passes >= 1;
+
+    // ── LEG 2: the preemption hold, read in all three states.
+    let held_before = compgate_hold_standing();
+    let held_during = {
+        let _hold = compgate_preempt_hold();
+        compgate_hold_standing()
+    };
+    let held_after = compgate_hold_standing();
+    let hold_ok = !held_before && held_during && !held_after;
+
+    // ── LEG 1: the nested present, driven from inside a held pass by the probe.
+    let runs0 = COMPGATE_FIXTURE_RUNS.load(Acquire);
+    let deferred0 = compgate_preempt_deferrals();
+    let t0_ms = crate::arch::ms();
+    COMPGATE_FIXTURE_ARMED.store(true, Release);
+    composite();
+    let drive_ms = crate::arch::ms().saturating_sub(t0_ms);
+    let ran = COMPGATE_FIXTURE_RUNS.load(Acquire) != runs0;
+    let n_passes = COMPGATE_FIXTURE_PASSES.load(Relaxed);
+    let n_folds = COMPGATE_FIXTURE_FOLDS.load(Relaxed);
+    let n_waits = COMPGATE_FIXTURE_WAITS.load(Relaxed);
+    let n_decl = COMPGATE_FIXTURE_DECL.load(Relaxed);
+    // `ran` is a precondition of the leg, not a leg of its own: deltas from a probe that never fired
+    // this run are stale, and scoring them would be the check that cannot fire.
+    let gated_ok = ran && n_passes == 0 && n_decl == 0 && (n_folds + n_waits) > 0;
+
+    // ── LEG 4: no core is holding two composite blits.
+    let net = blit_net_snapshot();
+    let mut netmax: i64 = 0;
+    let mut i = 0usize;
+    while i < net.len() {
+        if net[i] > netmax {
+            netmax = net[i];
+        }
+        i += 1;
+    }
+    let net_ok = netmax <= 1;
+
+    let deferred = compgate_preempt_deferrals().saturating_sub(deferred0);
+    let ok = control_ok && hold_ok && gated_ok && net_ok;
+    serial_println!(
+        ":: COMPGATE: nested_ran={} nested_passes={} nested_folds={} nested_waits={} \
+         nested_decl_lock={} gated={} hold_arm={} control_passes={} control={} blitnet_max={} \
+         blitnet={} drive_ms={} preempt_deferred={} wait_bound_us={} -> {} ::",
+        ran as u8,
+        n_passes,
+        n_folds,
+        n_waits,
+        n_decl,
+        gated_ok as u8,
+        hold_ok as u8,
+        control_passes,
+        control_ok as u8,
+        netmax,
+        net_ok as u8,
+        drive_ms,
+        deferred,
+        COMPGATE_WAIT_US,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// COMPGATE — the selftest is an aarch64 `witness` fixture; on every other arch the call site is a
+/// no-op. Declared rather than `#[cfg]`-ed at the call site, so the gate's tail reads the same on
+/// every arch it compiles for.
+#[cfg(not(all(target_arch = "aarch64", feature = "witness")))]
+#[inline]
+pub fn compgate_selftest() {}
+
+/// COMPGATE — [`compgate_selftest`], once per boot, driven from the tail of [`comp_gate_pass`].
+///
+/// The latch is spent BEFORE the call, so the three presents the selftest drives reach this same
+/// tail, find it spent and return: the recursion is bounded at the depth the fixture itself needs
+/// and can never become a per-pass fixture on a compositing desktop.
+#[cfg(all(not(target_arch = "x86_64"), feature = "witness"))]
+fn compgate_selftest_once() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    compgate_selftest();
+}
+
+/// COMPGATE — cycles of [`crate::arch::now_cycles`] per microsecond, read from the live timebase on
+/// every call rather than cached. `wcg::cycles_to_us` is the same reader; it is duplicated here
+/// rather than reused because that module is `witness`-gated and this gate is BEHAVIOUR — it must
+/// exist, and be correctly bounded, on the image Peter actually boots.
+///
+/// A firmware that left `CNTFRQ_EL0` at zero degrades to the Pi's 54 MHz rather than dividing by
+/// zero, which is `wcg`'s own fallback and the same number, so the two readings of one clock never
+/// disagree.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn compgate_cyc_per_us() -> u64 {
+    let frq: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+    }
+    let frq = if frq == 0 { 54_000_000 } else { frq };
+    (frq / 1_000_000).max(1)
+}
+
+/// COMPGATE — the inverse. Division rather than [`u64::saturating_mul`] by a million, so a long hold
+/// cannot saturate the numerator and read back as a wrong (rather than merely coarse) duration.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn compgate_cyc_to_us(dt: u64) -> u64 {
+    dt / compgate_cyc_per_us()
+}
+
+/// COMPGATE — no timebase on an arch this kernel does not build for. A per-µs rate of zero makes
+/// [`compgate_wait_budget_cyc`] zero, i.e. the wait arm never spins and every second entrant folds:
+/// correct, just less parallel, and the direction a missing clock must fail in.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn compgate_cyc_per_us() -> u64 {
+    0
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn compgate_cyc_to_us(_dt: u64) -> u64 {
+    0
 }

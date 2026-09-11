@@ -851,6 +851,11 @@ pub fn desktop_app_service() {
             // Unlike BARE-EXEC this does NOT kill the job when the table is full — the table is
             // empty at boot so it cannot happen, and killing the desktop's only window over a
             // bookkeeping failure would be the worse outcome if it somehow did. Say so instead.
+            // WINTITLE — and its NAME, under the same rule a typed launch gets: this is a launch,
+            // so its window is titled `STAT` rather than the window seam's generated `el0 win N`.
+            // The focus exemption above is about the KEYBOARD and says nothing about the caption:
+            // furniture the operator did not ask for still has to be identifiable on the glass.
+            crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), DESKTOP_APP);
             let tracked = crate::shell::adopt_bg_job(pid, slot, "/STAT.ELF");
             serial_println!(
                 "[wc-x] desktop-app LAUNCH name=/{} bytes={} entry={:#x} pid={} slot={} DETACHED, left RUNNING, tracked={}",

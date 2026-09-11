@@ -1663,7 +1663,12 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
 /// enums are deliberately separate types (one names a FAT read path, the other a registry slot);
 /// this is the single place they are related, so the census can never be attributed to the wrong
 /// device.
-fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
+///
+/// BOOTROOT (orin 22): made `pub` — `fs::bootdisk` has to ask the same question when it decides what
+/// `/` is (the FAT volume it matched the kernel on rides a handle, and whether the native UnaFS mount
+/// rides THAT handle is what separates a native root from a FAT one). It is still the single place
+/// the two enums are related.
+pub fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
     match source {
         BlockSource::Default => crate::drivers::block::BlockHandle::Global,
         BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
@@ -1794,6 +1799,76 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
     }
     out
 }
+
+/// BOOTROOT (orin 22): does a DEVICE exist behind this [`BlockSource`] at all?
+///
+/// The distinction this answers is the one a root witness has to make and [`mount_source`] cannot:
+/// "no disk here" and "a disk with no FAT volume on it" are different facts about a machine, and a
+/// boot that mounts nothing is owed the one that is true. `mount_source(src).is_err()` collapses
+/// them; this does not. Same registry lookups [`volume_serials`] uses, in the same order, so the two
+/// can never disagree about which slot a source names.
+pub fn source_present(source: BlockSource) -> bool {
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
+    };
+    dev.is_some()
+}
+
+/// BOOTROOT (orin 22): which compiled-in [`BlockSource`] carries the FAT volume whose `BS_VolID` is
+/// `serial` — the loader's answer to "where did I come from", resolved against the disks this kernel
+/// can actually reach.
+///
+/// ⚠ **This is a SEAM, not the root rule, and the distinction is the whole point of the arc.**
+/// `shell::vfs_mount_table` does NOT call it. Peter's direction (2026-09-08) is that the kernel is
+/// told nothing about its provenance — "WTF does it matter what method I choose to boot? You are
+/// assuming too much" — so `crate::fs::bootdisk` picks the root by CONTENT: it compares this running
+/// kernel's own `.text` window against candidate files on every enumerated volume, and a serial the
+/// firmware handed over never enters that decision. What DOES need this lookup is the pair of
+/// consumers that must not touch the medium they booted from: INSTALL-SELF (do not offer it as an
+/// erase target) and FRGUARD (do not substitute writes onto it). Both used to reach the datum through
+/// x86-shaped code; rmbp 16 asked for one arch-neutral lookup, and this is it.
+///
+/// `serial == 0` is the disarmed sentinel `drivers::block::set_boot_volume_serial` publishes when the
+/// loader could not identify its medium (and on every board with no loader at all), so it never
+/// matches: the answer is `None`, which is the honest "the loader named nothing" rather than a guess.
+///
+/// Bounded exactly as [`volume_serials`] is, because it IS `volume_serials` — one call per compiled-in
+/// source, in `BlockSource` declaration order, first source carrying the serial wins. Two disks
+/// bearing one serial is a formatter collision, not a boot question, and a caller that must not guess
+/// between them should be asking `bootdisk` instead.
+pub fn locate_boot_volume(serial: u32) -> Option<BlockSource> {
+    if serial == 0 {
+        return None;
+    }
+    for src in ALL_SOURCES {
+        if volume_serials(*src).iter().any(|v| *v == serial) {
+            return Some(*src);
+        }
+    }
+    None
+}
+
+/// BOOTROOT (orin 22): every [`BlockSource`] THIS BUILD compiled, in declaration order.
+///
+/// One list, because two walkers over "all the disks" that can disagree is the defect this arc is
+/// removing in another spelling. `locate_boot_volume` above and `crate::fs::bootdisk::locate` both
+/// iterate it, so a board whose driver set grows gains the disk in both places or in neither. The
+/// cfg pattern is `BlockSource`'s own (`fs/fat.rs:599`), copied deliberately rather than abstracted:
+/// the enum is the declaration site, and a variant that exists only under a feature must appear here
+/// under the same feature or the array will not compile — which is exactly the check we want.
+pub const ALL_SOURCES: &[BlockSource] = &[
+    BlockSource::Default,
+    BlockSource::Usb,
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    BlockSource::Sdhc,
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    BlockSource::TegraSd,
+];
 
 /// Append `v` only if absent. The serial list is at most a handful of entries, so a linear scan is
 /// both the simplest and the fastest thing here.
@@ -4498,4 +4573,209 @@ impl FatFs {
     pub fn source(&self) -> BlockSource {
         self.source
     }
+}
+
+// =========================================================================================
+// HOMESOIL (orin 22) — the DEVICE's block count, appended at the FILE TAIL.
+//
+// Same tail-append reason the two blocks above give: `fat.rs` is compiled into the knob-off
+// `kernel8.img` and `panic::Location` embeds source line numbers, so anything inserted mid-file
+// moves every panic site below it. A tail append moves nothing.
+//
+// WHY IT IS NEEDED. Peter's home-soil rule counts matches per DISK, and on the tegra build one disk
+// wears two `BlockSource` names: `drivers::block::publish_usb_geometry`'s
+// `#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]` variant stores the SAME
+// `BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and `USB_BLOCK_DEVICE` (read as
+// `Usb`). Without a device-level key the walk would visit that one card twice, count it as two
+// disks, and mount it a second time as "home soil" beside itself.
+//
+// WHY NOT `crate::drivers::block::BlockDeviceId` (its declaration site is the `pub struct
+// BlockDeviceId` in `drivers/block.rs`): its FIRST FIELD IS `handle`, and the handle is exactly
+// what differs between the two names for the one card — two `BlockDeviceId`s for one device is the
+// alias, not a key for it. `crate::fs::bootdisk` therefore keys on `(num_blocks, BS_VolID)`: the
+// geometry this function returns, plus the mounted volume's own serial from
+// [`FatFs::volume_fingerprint`]. Both are read from the MEDIUM rather than from the registry slot,
+// so aliased handles agree by construction.
+// =========================================================================================
+
+/// HOMESOIL (orin 22): how many blocks the DEVICE behind this source reports, or `None` when no
+/// device is registered on that handle.
+///
+/// The same registry lookups [`source_present`] and [`volume_serials`] use, in the same order — one
+/// vocabulary for "which slot is this source", so a dedupe key and a presence census can never
+/// disagree about which device a source names.
+pub fn source_blocks(source: BlockSource) -> Option<u64> {
+    let dev = match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
+    };
+    dev.map(|d| d.num_blocks)
+}
+
+// =========================================================================================
+// HOMESOIL (orin 22) — the volume LABEL, as BYTES.
+//
+// `FatFs::label()` above is the `fdisk`-facing spelling: trimmed, `NO NAME` folded to empty, a
+// `String`. A MOUNT POINT cannot be built from it, for two reasons that are not style:
+//
+//  * it has already thrown away WHICH bytes were there, so `/volumes/<name>` could not report that
+//    it had altered any of them; and
+//  * it is a `String`, i.e. a length derived from the medium's content. The mount-point builder must
+//    never take a length from a card. Both functions below hand back a FIXED `[u8; 11]` — the field
+//    is 11 bytes by the FAT specification, the buffer is 11 bytes by the type, and the copy is a
+//    `copy_from_slice` over an exactly-11-byte slice, so a truncated, over-long or unterminated
+//    field on a hostile card cannot make the copy write past the buffer. There is no length to
+//    trust, so there is nothing to get wrong.
+//
+// WHICH FIELD. A FAT volume can carry the label in two places and formatters disagree about which
+// one they update: `BS_VolLab` in the extended BPB (offset 0x2B on FAT12/16, 0x47 on FAT32) and a
+// root-directory entry with `ATTR_VOLUME_ID` (0x08) set. `mkfs.fat -n`, `mlabel`, Windows' format
+// and macOS all write the ROOT-DIRECTORY entry and most also mirror it into the BPB, while a
+// RENAME typically updates only the directory entry. So the directory entry is preferred and the
+// BPB is the fallback — see [`FatFs::label_raw`].
+// =========================================================================================
+
+impl FatFs {
+    /// HOMESOIL: the extended BPB's `BS_VolLab`, exactly as it sits on the medium — 11 bytes, no
+    /// trimming, no interpretation. Already a fixed-size field in [`FatFs`] (`vol_label`), read once
+    /// at mount from the boot sector.
+    pub fn label_raw_bpb(&self) -> [u8; 11] {
+        self.vol_label
+    }
+
+    /// HOMESOIL: the FIRST root-directory entry carrying `ATTR_VOLUME_ID` (0x08) and NOT the
+    /// long-file-name marker (0x0F, which has 0x08 set and is not a label), or `None` when the root
+    /// directory has no such entry — the ordinary case on a volume that was never named.
+    ///
+    /// Walks the root's own sectors through [`FatFs::walk_dir_sectors`], the same reader every other
+    /// directory walk uses, and stops at the 0x00 end-of-directory terminator exactly as
+    /// [`classify_dir_slot`] does. The label entry is one of the slots that function classifies as
+    /// `Skip`, which is why it cannot be found through the entry walkers and needs its own scan.
+    ///
+    /// A read error yields `None`, and the BPB fallback then applies: a volume whose root directory
+    /// cannot be read is not a volume whose label is knowable, and refusing to mount home soil over
+    /// an unreadable NAME would be the wrong trade — the name is a convenience, the mount is not.
+    pub fn label_raw_rootdir(&self) -> Option<[u8; 11]> {
+        let start = match self.kind {
+            FatKind::Fat32 => Some(self.root_cluster),
+            FatKind::Fat16 => None,
+        };
+        let mut found: Option<[u8; 11]> = None;
+        let r = self.walk_dir_sectors(start, |_lba, sec| {
+            let mut i = 0usize;
+            while i + 32 <= SECTOR_SIZE {
+                let e = &sec[i..i + 32];
+                if e[0] == 0x00 {
+                    return true; // end of directory — this volume has no label entry
+                }
+                let attr = e[11];
+                if e[0] != 0xE5 && attr & 0x0F != 0x0F && attr & 0x08 != 0 {
+                    let mut b = [0u8; 11];
+                    // EXACTLY 11 bytes, out of a slice that is exactly 11 bytes long. No length is
+                    // read from the medium anywhere on this path.
+                    b.copy_from_slice(&e[0..11]);
+                    found = Some(b);
+                    return true;
+                }
+                i += 32;
+            }
+            false
+        });
+        if r.is_err() {
+            return None;
+        }
+        found
+    }
+
+    /// HOMESOIL: the volume's label BYTES — the root-directory `ATTR_VOLUME_ID` entry when the
+    /// volume has one, else the BPB's `BS_VolLab`. See the block comment above for why the directory
+    /// entry wins.
+    ///
+    /// ALWAYS 11 bytes. An unnamed volume is not an ABSENCE here: it comes back as 11 spaces, or as
+    /// the conventional `NO NAME    ` placeholder — both KNOWN values, which is what lets the caller
+    /// say `Untitled` rather than invent something.
+    pub fn label_raw(&self) -> [u8; 11] {
+        match self.label_raw_rootdir() {
+            Some(b) => b,
+            None => self.label_raw_bpb(),
+        }
+    }
+}
+
+// =========================================================================================
+// CLONEALIAS (orin 24, rmbp-ledger B98) — ONE same-device predicate. Two callers, never a copy.
+//
+// Tail-appended for the reason the two blocks above give: `fat.rs` is compiled into the knob-off
+// `kernel8.img`, `panic::Location` embeds source line numbers, and anything inserted mid-file moves
+// every panic site below it.
+//
+// THE DEFECT THIS CLOSES. `fs::bootdisk::admit` deduped disks on `DiskId = (num_blocks, BS_VolID)`
+// — pure CONTENT. Both fields are read from the MEDIUM, which is what makes two handles onto ONE
+// card agree; it is also what makes two CLONES agree. A card imaged byte-for-byte from another
+// carries the same `BS_VolID` and the same size, so a content key merges two real devices into one,
+// hides the second from `/volumes`, and prints a witness claiming — falsely — that one device wore
+// two names.
+//
+// WHERE IDENTITY ACTUALLY LIVES: the ENUMERATOR, never the bytes. `drivers::block` publishes a
+// `BlockDeviceInfo` per handle, and two of its fields are registry facts rather than medium facts:
+// `slot_id` (the xHCI slot the device enumerated on — a replug lands on a NEW slot, and two live
+// devices never share one) and `num_blocks`. Those are the same two fields
+// `drivers::block::lookup` resolves an INSTALL-SEL identity by, minus `handle` — and `handle` is
+// precisely what differs between the two names for one card, which is why
+// `drivers::block::BlockDeviceId` cannot serve as the key.
+//
+// THE SLOT-0 GUARD IS NOT AN EDGE CASE, IT IS THE PI. `register_sd`, `register_sdhc` and
+// `register_tegra_sd` all stamp `slot_id: 0`, the xHCI "no slot" sentinel: a card that never
+// enumerated on a bus has no enumerator identity at all. Two zero-slot sources are therefore never
+// PROVEN to be one device, and this predicate says so by refusing first, before any comparison.
+// =========================================================================================
+
+use crate::drivers::block::BlockDeviceInfo;
+
+/// CLONEALIAS: the block REGISTRY's own record for the device behind this source, or `None` when no
+/// device is registered on that handle.
+///
+/// The same lookups, in the same order, that [`source_present`], [`source_blocks`] and
+/// [`volume_serials`] use — one vocabulary for "which slot is this source", so a dedupe, a presence
+/// census and an identity check can never disagree about which device a source names.
+pub fn source_device(source: BlockSource) -> Option<BlockDeviceInfo> {
+    match source {
+        BlockSource::Default => crate::drivers::block::info(),
+        BlockSource::Usb => crate::drivers::block::usb_info(),
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => crate::drivers::block::tegra_sd_info(),
+    }
+}
+
+/// CLONEALIAS: do these two registry records name the SAME PHYSICAL DEVICE, published twice?
+///
+/// `true` only when the enumerator PROVES it: a LIVE slot (non-zero — see the block comment above
+/// for why zero is a refusal rather than a match), the SAME slot on both sides, and the same
+/// `num_blocks` to close the residual slot-id-reuse window (a freed slot handed to some other,
+/// differently sized device will not match).
+///
+/// It is deliberately a proof of SAMENESS and never a proof of difference: `false` means "not
+/// proven the same", which is the safe direction for both callers. `fs::bootdisk::admit` mounts
+/// BOTH sources on `false` and says `aliased=ambiguous` on the wire rather than silently dropping
+/// a disk; `video::prtscr::usb_backed` declines to call a mount hot-unpluggable on `false` rather
+/// than refusing a capture.
+///
+/// Named cases:
+///  * **Pi** — the microSD holds the global handle with the `slot_id: 0` sentinel while a USB stick
+///    holds the USB handle. The `slot_id != 0` clause fails FIRST, so the answer is `false`
+///    explicitly, by the guard, not incidentally by a slot mismatch that a future sentinel change
+///    could invert (pi 7's caveat on `prtscr.rs`, now a guard). With NO microSD registered, the
+///    stick is published into BOTH handles with its own LIVE non-zero slot, and live-slot equality
+///    dedupes it correctly.
+///  * **x86** — `publish_usb_geometry` claims the global handle as well as the dedicated one, so
+///    one card is reachable under two names with the same live slot and the same size: `true`,
+///    unchanged from the comparison this replaced.
+pub fn same_device(a: &BlockDeviceInfo, b: &BlockDeviceInfo) -> bool {
+    a.slot_id != 0 && a.slot_id == b.slot_id && a.num_blocks == b.num_blocks
 }

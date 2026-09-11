@@ -1140,30 +1140,6 @@ install_target = ["sdmmc_arm"]
 # the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
 sdmmcwrite = ["sdmmc"]
 
-# ROOTFS (orin 16, ledger A28): the `UNAOS_SDMMCROOT=1` VFS ROOT BIND for the Tegra234 microSD card's
-# FAT volume (arch/aarch64/sdmmc_tegra.rs, the `sdmmcroot` tail section). A28's fault is that on the
-# desktop line the VFS root has NO backend — `/` is `NativeBackend` (native UnaFS) and the Orin card
-# carries no UnaFS volume, so `ls /` and quarry both answer `/: backend error: unafs-mount`. This
-# feature makes `shell::vfs_mount_table` REBIND `/` to the card's FAT volume, read through
-# `BlockSource::TegraSd` (the census-published `read_block_tegra_sd` path — CMD17 single-block, 1-bit
-# default speed, PROVEN on metal by A23), and re-point `/boot` at the SAME volume — its `Default`
-# source is registered by no Orin boot, and `/boot` is `shell::EXEC_ROOT` and the literal prefix of
-# `/apps/VUG.ELF`, `/apps/STAT.ELF` and `/apps/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
-# launch anything at all. READ-ONLY BY CONSTRUCTION and not by policy stated here:
-# `BlockSource::TegraSd::write_veto` is `Some(TEGRA_SD_VETO)` and `write_block_tegra_sd` refuses in
-# every cfg, so no VFS verb can reach the medium. The vendor pad block stays DISABLED (the FWALL
-# SError conviction) — this feature adds no controller write of any kind. READ-only over an already
-# published card, so it is a SIBLING of `sdmmcwrite`, never an implier: it pulls only `sdmmc`, and a
-# boot whose census did not reach M3 gets one named refusal and the unchanged (broken) root. Every
-# site is `sdmmcroot`-gated: the section is a file tail inside the wholly `sdmmc`-gated
-# `sdmmc_tegra.rs`, and the `pub use`, the `vfs_mount_table` call and the `main.rs` early probe are
-# same-line appends, and
-# `FatBackend::new_tegra_sd` is a tail-appended `impl` block in `fs/vfs.rs` — so DEFAULT OFF => no
-# line moves and the Pi `kernel8.img` and the default jetson image are byte-identical to baseline.
-# The ARMED polarity is type-checked by the `arm-tegra-sdmmcroot` leg of KERNEL_CFG_MATRIX, never by
-# the knob mapping. Witness family: `[sdmmc] root` (subsystem-named). UNFLOWN.
-sdmmcroot = ["sdmmc"]
-
 # SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
 # (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
 # `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
@@ -2398,6 +2374,48 @@ orintenant = ["tegra_el0"]
 # polarity is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by the knob
 # mapping. Witness on the wire: every line carries `[el1ap]` — see arroyo's UNAOS_ORINEL1AP block.
 orinel1ap = ["tegrasmp", "tegra_el0"]
+# ORIN-APSRUN (orin 23): every PSCI-woken Orin secondary drops EL2 -> EL1, stamps itself into
+# `EL1_CORE_MASK`, arms its own 250 Hz CNTP at EL1 and enters `sched::run()` — so `el1cores` reads
+# `0x3f` and an EL0 thread is placeable on any of the six cores.
+#
+# THE DEFECT, Peter, 2026-09-08: "WE ARE STILL ONLY ON ONE CORE". The render11 wire is the evidence and
+# it ACQUITS the tick: all five APs print `c<N> timer PPI live (tick 1)` and all five enter `run()`, so
+# `online=0x3f`. The field that pinned userspace to the boot core is `el1cores=0x1` on the same
+# `[bsprun] host` line — the APs replay the BSP's EL2 regime and stay there, so `el0_placement_possible`
+# (the predicate `spawn_user_image_bg` refuses on) had exactly one candidate and the shell, the render
+# pump, the pointer poll and every `bg` shared it. That is the sluggish pointer.
+#
+# WHAT IT COMPILES, AND HOW LITTLE OF IT IS NEW. The AP drop mechanism is ORIN-EL1AP's, unchanged
+# statement for statement — the seat claim, the bounded wait for the BSP-published EL1 root, the
+# ICC_SRE_EL2.Enable grant, the latch save/restore, and the verbatim reuse of `enable_el1_regime` +
+# `drop_el2_to_el1_tegra`. This feature widens its `#[cfg]`s to `any(orinel1ap, apsrun)` and changes
+# ONE constant: `boot_tegra::EL1AP_SEATS`, from 1 to unbounded. It adds three things of its own:
+# `boot_tegra::publish_el1_root` (publish the EL1 root BEFORE the first `CPU_ON`, so five APs never
+# spin through the probe stretch — the boot-12 interconnect-starvation shape), `capture_bsp_latch_once`
+# (a per-core latch snapshot is a corruption once there are five claimants), and the two `[apsrun]`
+# witnesses in `smp_virt::__secondary_rust_virt`.
+#
+# WHY IT IMPLIES `tegrasmp` AND NOTHING ELSE. `tegrasmp` because the drop happens on a PSCI-woken AP
+# and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]` — without it there are no APs.
+# It does NOT imply `tegra_el0` (unlike `orinel1ap`, which does): an EL1 AP is a better scheduler
+# participant whether or not the image carries an EL0 surface, and implying it would flip a second
+# default polarity from inside this one. `tegrasmp` implies `tegra`, so the knob is self-sufficient.
+#
+# NO PROTECTION IS RELAXED. Each AP installs `mmu_tegra`'s EL1-precise twin `L1_EL1` — RAM at
+# AP[2:1]=0b00 (EL1 RW, NO EL0 access, EL1-executable), Device UXN|PXN|nGnRE — and the same absolute
+# SCTLR_EL1 `M|C|I|RES1` literal the BSP uses. WXN, the page permissions and the EL0 window's own
+# tables are untouched; the behavioural change is arithmetic on a seat counter.
+#
+# FAIL-CLOSED, PER CORE. Every exit that does not complete a drop leaves THAT core at EL2 and
+# UNSTAMPED, so it simply stays an EL2 scheduler participant exactly as today and `el1cores` keeps the
+# bits it has. A partial success is a legal outcome: `el1cores=0x7` hosts EL0 on three cores.
+#
+# DEFAULT-ON for tegra builds (arroyo's ORIN-APSRUN mapping + the `esp_jetson` force block, the
+# ORIN-TICKDEFAULT shape), opt out with `UNAOS_NOAPSRUN=1` => the pre-flip image. QEMU models no
+# Tegra234, so both polarities are TYPE-CHECKED here and PROVEN only by an attended bench flight; the
+# armed polarity is type-checked by the `arm-tegra-apsrun` leg of KERNEL_CFG_MATRIX. Witness on the
+# wire: `[apsrun]` — see arroyo's UNAOS_APSRUN block.
+apsrun = ["tegrasmp"]
 # ORIN-INPUT: `UNAOS_ORININPUT=1` — make HID input actually REACH an EL0 tenant on the Orin. Adds the
 # pump/route/rollup in `arch/aarch64/xusb_tegra.rs` (`oi_pump`/`oi_reset`/`oi_rollup`) and its three
 # call sites inside `run_user_image`'s wait loop in `arch/aarch64/syscall.rs`.
@@ -2630,7 +2648,7 @@ orinrender = ["desktop_firmware", "tegra_el0"]
 # learn to). The banner term is not needed as arming proof: `main.rs::tegra_quarry_seat` prints
 # `[deskquarry] seat compiled=…` from `cfg!(feature = "quarry")` inside the built image, which is what
 # the next flight is scored on. See the arroyo block above the mapping.
-deskcascade = ["desktop_firmware", "tegra_el0", "quarry"]
+deskcascade = ["desktop_firmware", "tegra_el0", "quarry", "facet"] # ORIN-FACET: `facet` joins the cascade through the IMPLICATION, never through an `UNAOS_DESKCASCADE -> facet,` term in arroyo — the same admissibility argument QUARRY-ORIN made one line up, and the reason the fifteen-knob jetson build carries the viewer with no sixteenth knob.
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
 # ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
 #
@@ -2808,6 +2826,36 @@ tcuprobe = ["tegra"]
 # The ARMED polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX in `arroyo`,
 # never by the knob mapping. FIXED-UNFLOWN — flies on render7.
 tcurx = ["tegra", "orinrx", "tcuprobe"]
+# FACET (ORIN-FACET, Peter 2026-09-08): `UNAOS_FACET=1` arms UnaOS's IMAGE VIEWER — `video::facet`,
+# `docs/CODEX.md` §2's **Facet — Images — "The Canvas"** — as a KERNEL DESKTOP TENANT of exactly
+# `quarry`'s shape. The ask was *"i believe we already have an image viewer in the vessels can we
+# compile it for UnaOS?"*, and the answer is no, twice over and both times measurably:
+#   * `vessels/facet` is host-native — Tokio (`libs/quartzite`), WGPU (`libs/euclase`) and the `png`
+#     crate (`libs/lux`) are three `std` dependency trees with no freestanding target;
+#   * and no EL0 program in this kernel can host a PNG decoder at all: DEFLATE's history window is
+#     32 KiB by definition (RFC 1951 §3.2.1 = `selfhost::inflate::WINDOW`), while every EL0 task gets
+#     the blanket 16 KiB (`sched.rs`). The decoder's mandatory working set is twice the whole window
+#     it would have to live in, before one pixel is stored. That is a fact about the ring.
+# So it is a `wm` row over a surface it owns, opened by a double-click or `<Enter>` on a `.PNG` row in
+# the file manager. It holds no decoded image: the file streams through the VFS and every scanline is
+# unfiltered and box-reduced straight into the window surface at target scale, so a 1920x1200
+# screenshot costs ~2.3 MB of heap rather than ~21 MB.
+#
+# IMPLIES `quarry`, and that is a DEPENDENCY fact rather than a policy one: Facet's only door is the
+# file manager (`quarry::live::run_act`'s `Act::View` arm) and its pointer routing is chained from
+# `quarry::live::press_route` — the two router files that name every other tenant are the knob-off
+# `kernel8.img`'s `arch/aarch64/syscall.rs` (byte-identity, PARITY.md §5.3) and the x86 half another
+# lane owns, so neither may gain a line. No file manager, no viewer, and the feature says so.
+#
+# It also pulls in `selfhost::inflate` ALONE (see `lib.rs`'s `not(feature = "selfhost")` inline
+# declaration): the RFC 1951 decoder is shared with SELFHOST-2 through `deflate_body`, with
+# `zlib_inflate` as the RFC 1950 sibling of `gunzip`, so this arc adds no second decompressor.
+#
+# DEFAULT OFF => `video/facet.rs` is not compiled, every hook in `quarry`/`desktop_firmware` is
+# `#[cfg]`-erased, and the image is byte-identical to baseline. Witness tokens are subsystem-named
+# (`[facet]`, `FACETPNG`). Carried by the `deskcascade` implication below so the fifteen-knob jetson
+# build reaches it with no sixteenth knob.
+facet = ["quarry"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

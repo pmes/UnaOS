@@ -257,16 +257,30 @@ const CRYSTAL_SLOT: usize = strip::PAD + CRYSTAL_W + strip::PAD;
 /// app menus to its right; the caption takes that same slot here.
 const TITLE_X0: usize = CRYSTAL_SLOT;
 
-/// WINMENU (R21) — **the caption's SLOT, which is fixed-width, and where the window's menus begin.**
+/// WINMENU (R21) — **where the window's menus begin WHEN THE BAR NAMES NO APP.**
 ///
-/// The caption is drawn at [`TITLE_X0`] and is between 0 and [`wm::MAX_TITLE`] glyphs long. If the
-/// menu titles began after the caption's RENDERED width they would slide left and right every time
-/// the focused window changed — and a press would then be judged against a layout the operator was
-/// not looking at when they aimed. So the caption gets a slot of its full stored width plus one
-/// glyph of gap, and the menus start at a constant offset whatever is in it. macOS's bar has the same
-/// property for the same reason (its app name is bold and its menus do not reflow under it); the
-/// difference is only that this kernel's caption is bounded, so the slot can be a `const`.
-const MENUS_X0: usize = TITLE_X0 + (wm::MAX_TITLE + 1) * CELL_W;
+/// MENUOWN (Peter, 2026-09-07: *"spaced incorrectly"*). This was a FIXED COLUMN —
+/// `TITLE_X0 + (MAX_TITLE + 1) * CELL_W`, which on the bench's panel is 181 px — and the menus were
+/// laid out there whatever the caption's rendered width. `render9` measured the consequence: `View`
+/// began at x=187 under `console` (ink ending at 89) and at x=187 under `quarry` (ink ending at 81),
+/// so the visible gap between the app name and its first menu was 97 px in one frame and 105 in the
+/// other. A gap that changes size with the length of the word before it is the definition of
+/// spaced wrong, and macOS has no such property: an app's menus sit one fixed gap after its name.
+///
+/// **The argument that produced the fixed column was sound, and was answered elsewhere.** It read:
+/// *"if the menu titles began after the caption's RENDERED width they would slide left and right
+/// every time the focused window changed — and a press would then be judged against a layout the
+/// operator was not looking at when they aimed"*. But the titles ALREADY move under the operator on
+/// every focus change, because which titles exist at all is a property of the focused window; a
+/// stationary column bought no stability, it only bought a variable gap. The press/paint agreement
+/// the argument actually wanted is a different property, and `bar_boxes` has it by construction:
+/// one layout feeds the painter, the hit test and the dropdown anchor.
+///
+/// So the menus now follow the APP TITLE BOX ([`super::winmenu::bar_boxes`]), and this constant is
+/// what is left of the old one: the anchor for a bar with no caption to follow. It is [`TITLE_X0`] —
+/// where the name WOULD have been — so a window with menus and no name puts them where a named
+/// window's name starts, rather than 153 px into empty chrome.
+const MENUS_X0: usize = TITLE_X0;
 
 /// The panel height below which the bar declines.
 ///
@@ -711,24 +725,37 @@ struct Model {
     title_len: usize,
     /// `HH:MM`, or `None` while the civil clock has never been anchored this boot.
     clock: Option<[u8; CLOCK_GLYPHS]>,
-    /// WINMENU (R21) — **the window whose menus this bar is showing**: the FRONTMOST VISIBLE row that
-    /// has published a tree, or [`wm::WIN_NONE`].
+    /// WINMENU (R21) — **the window whose menus this bar is showing**, or [`wm::WIN_NONE`].
     ///
-    /// ⚠ It is deliberately NOT the same reduction as the caption's, and the difference is a fact
-    /// about this kernel rather than a taste call. The caption's `focused` flag is an OWNER-ASID
-    /// match, and the click router hands SHELL focus (asid `0`) to a press on kernel furniture
-    /// (`is_kernel_owner`) — so the first publisher this arc has, [`super::pulsewin`], can never be
-    /// `focused` by that test and an owner-keyed menu selection would show nothing for the one window
-    /// it exists to serve. "Frontmost visible publisher" is what an operator means by *the window in
-    /// front*, is computed from the same single [`wm::dock_scan`] the caption already runs, and is
-    /// stated on the wire (`[winmenu] publish owner=`) so the two readings can be compared rather
-    /// than confused.
+    /// MENUOWN (Peter, 2026-09-07): **it is the row the CAPTION names**, when that row has published
+    /// a tree. The bar shows ONE app's menus and names ONE app, and on a Mac those are the same app;
+    /// a bar that names `console` over `pulse`'s `View` is showing two apps at once.
+    ///
+    /// ⚠ **It used to be "the frontmost VISIBLE PUBLISHER", which ignored focus entirely, and the
+    /// premise that justified that is FALSE.** The claim recorded here was: *"the caption's `focused`
+    /// flag is an OWNER-ASID match, and the click router hands SHELL focus (asid `0`) to a press on
+    /// kernel furniture (`is_kernel_owner`) — so [`super::pulsewin`] can never be `focused` by that
+    /// test"*. It conflates the two things the router's furniture arm does on ONE line
+    /// (`arch/aarch64/syscall.rs`, the SHELLWIN-PI arm): `user_input_set_active(0)` hands the
+    /// KEYBOARD to the shell, and `wm::focus_changed(owner)` — called with the furniture's OWN owner
+    /// — sets `FOCUS_ASID`, which is what `dock_scan`'s `focused` reads. Kernel furniture therefore
+    /// DOES take focus by that test, and `render9` proves it from the glass: the caption read
+    /// `console` in one frame and `quarry` in the next, which is only reachable if `FOCUS_ASID` had
+    /// become `KERNEL_OWNER_CONSOLE` and then quarry's `OWNER`. Under the old reduction that same
+    /// pair of frames carried pulse's `View` in the bar the whole time, because pulse was the only
+    /// publisher and "frontmost publisher" cannot see a window that is in front of it without menus.
+    ///
+    /// Keeping the two reductions apart cost exactly that defect, so they are now ONE reading:
+    /// [`cap_owner`](Self::cap_owner), filtered by whether it publishes.
     menu_owner: wm::WinId,
-    /// SO3 — **the window the CAPTION names**, i.e. the row [`title`](Self::title) was taken from.
-    /// Distinct from [`menu_owner`](Self::menu_owner) on purpose: that one is the frontmost
-    /// PUBLISHER and this one is the frontmost FOCUSED row, and they differ whenever a window with
-    /// menus sits behind a window without them. The app menu belongs to the name the operator is
-    /// reading, so `Quit` must reap THIS row and not the publisher's.
+    /// SO3 — **the window the CAPTION names**, i.e. the row [`title`](Self::title) was taken from:
+    /// the frontmost FOCUSED VISIBLE row. The app menu belongs to the name the operator is reading,
+    /// so `Quit` reaps THIS row.
+    ///
+    /// MENUOWN — it is now also what [`menu_owner`](Self::menu_owner) is derived from, so the bar
+    /// cannot name one app and drop another's menus. The two fields remain separate because the
+    /// second is this one FILTERED by `winmenu::has_tree`: a focused window with no menus of its own
+    /// still has a name, and still gets its `Quit`.
     cap_owner: wm::WinId,
     /// WINMENU — the title boxes, laid out once per compose and handed to the row painter. Filled in
     /// by [`compose`] after the rect is settled, because the layout is a function of the bar rect.
@@ -765,31 +792,23 @@ impl Model {
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
         let (n, clobbered) = wm::dock_scan(&mut rows, painted);
         let mut best_z = 0u32;
-        // WINMENU — the SECOND reduction, over the SAME scan: the frontmost visible PUBLISHER. It is
-        // separate from the caption's because `focused` is an owner match and kernel furniture takes
-        // shell focus; see [`Model::menu_owner`]. `winmenu::has_tree` is lock-free
-        // (`WINMENU_MAX` relaxed loads, short-circuited to nothing when nothing has published), so
-        // this costs a boot with no menus one atomic and no second table walk.
-        let (mut menu_z, mut menu_owner) = (0u32, wm::WIN_NONE);
+        // MENUOWN — ONE reduction, not two. The frontmost FOCUSED VISIBLE row is the app the bar
+        // names, and it is now also the app whose menus the bar shows: `menu_owner` is taken from
+        // `cap_owner` below rather than computed here from a separate "frontmost publisher" walk.
+        // See [`Model::menu_owner`] for the premise that walk rested on and why it is false.
+        //
+        // PANEL V-4 — `wm::info` is LAZY, below the guard. It takes `wm::TABLE` with IRQs masked
+        // (`wm::table`, and `wm.rs`'s standing rule about that critical section), so hoisting it
+        // above the guard turned one masked acquisition per bar compose into up to `MAX_WINDOWS` of
+        // them, on every composite, on every gated build. The guard is now STRICTLY tighter than it
+        // was — the old `publisher ||` arm let every published row past it — so this reduction takes
+        // no more of those acquisitions than before, and on a desktop with a background publisher it
+        // takes fewer.
         for r in rows[..n].iter() {
-            // PANEL V-4 — `wm::info` is LAZY, below both guards. It takes `wm::TABLE` with IRQs
-            // masked (`wm::table`, and `wm.rs`'s standing rule about that critical section), so
-            // hoisting it above the guards turned one masked acquisition per bar compose into up to
-            // `MAX_WINDOWS` of them, on every composite, on every gated build — a regression against
-            // trunk, and it silently falsified the claim three lines up: the `has_tree`
-            // short-circuit cannot save a boot with no menus if `z` is computed before it is asked.
-            let publisher = r.visible && super::winmenu::has_tree(r.id);
-            if !publisher && (!r.focused || !r.visible) {
-                continue;
-            }
-            let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
-            if publisher && (menu_owner == wm::WIN_NONE || z >= menu_z) {
-                menu_z = z;
-                menu_owner = r.id;
-            }
             if !r.focused || !r.visible {
                 continue;
             }
+            let z = wm::info(r.id).map(|i| i.z).unwrap_or(0);
             if z >= best_z {
                 best_z = z;
                 m.title_len = r.title_len.min(wm::MAX_TITLE);
@@ -797,7 +816,14 @@ impl Model {
                 m.cap_owner = r.id; // SO3 — the app menu's owner is the row the caption came from
             }
         }
-        m.menu_owner = menu_owner;
+        // MENUOWN — the bar shows the FOCUSED app's menus, and no one else's. `winmenu::has_tree` is
+        // lock-free (`WINMENU_MAX` relaxed loads, short-circuited to nothing when nothing has
+        // published), and it is asked ONCE here rather than once per row, so this is cheaper than
+        // the walk it replaces as well as correct. A focused window that published nothing answers
+        // `WIN_NONE`: the bar keeps its app-menu box (SO3 gives every window a name-menu) and lays
+        // out no tenant titles, which is exactly what a Mac shows for an app with no menus of its
+        // own — and is what `render9` should have shown while `console` and `quarry` held focus.
+        m.menu_owner = if super::winmenu::has_tree(m.cap_owner) { m.cap_owner } else { wm::WIN_NONE };
         m.clock = clock_hhmm();
         (m, clobbered)
     }
@@ -889,7 +915,10 @@ pub fn compose() -> bool {
         if SLOT.packed() != 0 {
             let r = SLOT.rect();
             SLOT.clear();
-            return strip::erase_rect(r);
+            // TEARSCOPE — `strip::vacate` IS `strip::erase_rect` plus the census; same return, same
+            // behaviour. `new=None` (the bar is going away, so all of `r` is uncovered) and
+            // `owed=false` (the slot is already cleared, so a decline is forgotten).
+            return strip::vacate("menubar", r, None, false);
         }
         return false;
     }
@@ -945,6 +974,8 @@ pub fn compose() -> bool {
     if model.menus.busy {
         return false;
     }
+    // MENUOWN — **WHOSE menus the bar is showing, and WHERE it put them.** See [`MENUROW_KEY`].
+    menurow_witness(&model);
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
@@ -972,7 +1003,8 @@ pub fn compose() -> bool {
     let Some(r) = rect else {
         SLOT.clear();
         return match vacated {
-            Some(v) => strip::erase_rect(v),
+            // TEARSCOPE — accounted, not changed. `owed=false`: the slot is cleared above.
+            Some(v) => strip::vacate("menubar", v, None, false),
             None => false,
         };
     };
@@ -980,7 +1012,12 @@ pub fn compose() -> bool {
     let t1 = crate::arch::now_cycles();
     if let Some(v) = vacated {
         // Erase FIRST, then paint, so the two never race to own an overlapping pixel.
-        strip::erase_rect(v);
+        //
+        // TEARSCOPE — accounted, not changed. `owed=false` because `SLOT.store` below re-publishes
+        // this tenant's rect whatever the erase returned. The bar is `frame_flush(Top)` and so is
+        // full-panel-width, which means a content change alone does not move it; this arm is reached
+        // when the RECT itself changes (a panel resize, or the bar crossing its floor).
+        strip::vacate("menubar", v, Some(r), false);
     }
     if !strip::paint("menubar", r, |out, j| compose_row(out, &model, r, j)) {
         return false;
@@ -988,6 +1025,46 @@ pub fn compose() -> bool {
     LEDGER.paint(crate::arch::now_cycles().saturating_sub(t1), (r.2 * r.3) as u64);
     SLOT.store(sig, Some(r));
     true
+}
+
+/// MENUOWN — the last item row this bar announced, as [`super::winmenu::BarSnapshot::owner_key`].
+/// `0` is "never announced", so the FIRST composed row always speaks: a boot whose bar never says
+/// whose menus it is showing must be distinguishable from one whose row never changed.
+static MENUROW_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// MENUOWN — **the bar's ownership and layout, ON THE WIRE, on change.**
+///
+/// Peter, at the bench on `render9` (2026-09-07): *"pulse view menu item still showing across all
+/// apps and spaced incorrectly"*. Both halves of that reading were GLASS-ONLY facts. The bar's
+/// existing instruments could not have caught either: `[winmenu] publish owner=` fires once when a
+/// tenant registers and never again, the `[menubar]` cost ledger carries `press=`/`clob=`/`toggles=`
+/// and no layout at all, and `bar_owner=` on the `[winmenu]` rollup is a bare id with nothing to
+/// compare it to. So a flight could show `View` sitting under the word `console` at a column the
+/// caption never moved, and every line on the wire read green. This is the line that makes both
+/// falsifiable:
+///
+///  * `cap_owner=`/`cap=` — the app the bar NAMES. `menu_owner=` — the app whose menus it SHOWS.
+///    **They must be the same window**, and a capture where they differ is defect one, stated.
+///  * `items=` — every box's label at its panel-absolute column. A tenant title whose `x` does not
+///    move when `cap=` changes length is defect two, stated.
+///
+/// UNGATED, deliberately. The metal image is built without `witness` and Peter's captures come off
+/// metal; an instrument that is absent from the artifact he flies is not an instrument. It is
+/// affordable because it is EDGE-TRIGGERED on [`MENUROW_KEY`] — one relaxed load per composite in
+/// the steady state, and a line only when the row genuinely moved.
+fn menurow_witness(m: &Model) {
+    let key = m.menus.owner_key(m.cap_owner);
+    if MENUROW_KEY.swap(key, Ordering::Relaxed) == key {
+        return;
+    }
+    serial_println!(
+        "[menubar] menus cap_owner={} cap={} menu_owner={} boxes={} items={}",
+        m.cap_owner,
+        core::str::from_utf8(&m.title[..m.title_len]).unwrap_or("?"),
+        m.menu_owner,
+        m.menus.n,
+        m.menus.items()
+    );
 }
 
 /// The crystal's box-relative top-left in the bar: **one [`strip::PAD`] from the left**, centred
@@ -1051,8 +1128,11 @@ pub fn crystal_corner_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
     Some((bx, by, CRYSTAL_SLOT.min(bw), bh))
 }
 
-/// WINMENU (R21) — **where the focused window's menu titles begin**, as an offset from the bar's own
-/// origin. See [`MENUS_X0`]: a fixed slot, so the titles do not slide when the caption changes.
+/// WINMENU (R21) / MENUOWN — **where the focused window's menu titles begin when the bar names no
+/// app**, as an offset from the bar's own origin. See [`MENUS_X0`].
+///
+/// This is the FALLBACK anchor, not the usual one: with a caption on the bar the titles follow the
+/// app title box, one box gap after the name, and never a fixed column.
 #[inline]
 pub fn menus_x0() -> usize {
     MENUS_X0

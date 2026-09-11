@@ -105,7 +105,7 @@ pub mod install;
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
-    feature = "holocron", feature = "selfup" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file
+    feature = "holocron", feature = "selfup", feature = "facet" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved.
 ))]
 pub mod hash;
 
@@ -117,6 +117,24 @@ pub mod hash;
 // packaged fixture is the x86 usb-storage image. DEFAULT OFF => module + call site vanish.
 #[cfg(feature = "selfhost")]
 pub mod selfhost;
+
+// FACET (`facet` / UNAOS_FACET=1, also implied by `deskcascade`): the image viewer needs the RFC 1951
+// DECODER and nothing else SELFHOST-2 owns — not the FAT source walk, not the tar walker, not
+// `verify_source_once`. So with `selfhost` off this declares the ONE submodule, inline, and the file
+// it names is the same `src/selfhost/inflate.rs` (a non-inline module inside an inline one resolves
+// against the inline module's directory). Two properties this shape buys and the alternatives do not:
+//
+//   * the DECODER IS NOT COPIED. `video/facet.rs` calls `selfhost::inflate::zlib_inflate`, the
+//     sibling of `gunzip` over the shared `deflate_body` — one back-reference implementation in the
+//     tree, one place to audit, and SELFHOST-2's own fixture keeps covering the half FACET leans on.
+//   * `UNAOS_SELFHOST=1` is unaffected in every configuration. The `not(feature = "selfhost")` guard
+//     means the two declarations are mutually exclusive rather than duplicate, so an image with both
+//     knobs armed gets the full module exactly as it does today, and an image with neither gets
+//     nothing at all.
+#[cfg(all(feature = "facet", not(feature = "selfhost")))]
+pub mod selfhost {
+    pub mod inflate;
+}
 
 // FLIGHT-RECORDER: capture the serial boot log into a bounded ring and flush it to UNAOS.LOG on the
 // FAT boot volume, so a consumer who boots the vm-image with no serial capture can copy the log off

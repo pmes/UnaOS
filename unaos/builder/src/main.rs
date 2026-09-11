@@ -120,6 +120,13 @@ fn main() {
     // OFF => byte-identical either way.
     if std::env::var("UNAOS_LIVECON").is_ok() { feats.push("livecon"); }
     if std::env::var("UNAOS_QUARRY").is_ok() { feats.push("quarry"); }
+    // FACET (ORIN-FACET): the image viewer — `video/facet.rs`, opened by a double-click on a `.PNG`
+    // row in the file manager. Mapped HERE as well as in `arroyo` because `facet` is named by the
+    // literal `x86-all` type-check leg, which is exactly the condition arroyo's KNOB→BUILDER check
+    // polices: a knob this map does not read arms the banner on x86 media carrying none of the code
+    // (the `rastmc` failure that check was written for). Cargo's `facet = ["quarry"]` pulls the file
+    // manager in behind it, so this one line is the whole wiring. Default OFF => byte-identical.
+    if std::env::var("UNAOS_FACET").is_ok() { feats.push("facet"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }

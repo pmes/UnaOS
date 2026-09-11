@@ -53,7 +53,43 @@ esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
 # This makes the build ID available to all cargo invocations (check/test/kernel8/esp targets).
-export UNAOS_GIT_SHA="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+#
+# VERSIONWIN (orin 22, rmbp 16's item 6'): the value is now part of the KERNEL'S OWN IDENTITY, not
+# just a label. `fs/bootdisk.rs` places it in `.text` as `UNAOS_BUILD_STAMP` and compares it as a
+# second range when it decides which disk this kernel was found on, so two builds that differ only
+# outside the 4 KiB `.text` window can no longer match each other's card.
+#
+# THE DIRTY SUFFIX and its two limits, both deliberate:
+#   * A CLEAN TREE KEEPS EXACT BYTES. `_sha_suffix` stays empty, so every same-commit clean build is
+#     byte-identical to the one before it — which the fleet's identity gates (knob-off/knob-on
+#     comparisons, staged-media shas) depend on. That is why there is no per-build nonce here.
+#   * ONE VALUE PER PROCESS. Computed ONCE, on this line, before any build runs — so the knoboff
+#     guard, which composes three builds inside a single `arroyo` invocation, sees one sha across
+#     all three and its comparison stays meaningful. Recomputing per build would break it.
+#   * UNTRACKED-ONLY DIFFERENCES ARE INVISIBLE, by design: `git diff HEAD` covers TRACKED changes,
+#     and hashing untracked paths would sweep in build noise, editor droppings and scratch files,
+#     which would defeat the clean-build identity above rather than sharpen it.
+# `git rev-parse` failing (not a repo) yields `unknown` and NO suffix — a failed `git diff` must not
+# be read as "dirty".
+#
+# THE REBUILD IS REAL, AND IT WAS MEASURED, not assumed — a cached stale stamp would make the second
+# compared range in `fs/bootdisk.rs` a lie, and this crate has NO `build.rs` to declare the
+# dependency. Three cargo builds of a one-file crate using `option_env!("UNAOS_GIT_SHA")`, source
+# untouched between them: `aaaaaaaa` -> `aaaaaaaa-dbeef01` -> env unset -> `unstamped`, each read
+# back OUT OF THE BINARY. Cargo picks the env-dep up from rustc's dep-info, so changing this value
+# re-fingerprints the crate on its own.
+#
+# THE SCOPE OF `git diff HEAD` WAS MEASURED TOO, in a throwaway repo, seven probes: clean twice (same
+# value), an UNTRACKED file added (unchanged — the documented blind spot, by design), a tracked edit
+# (suffix appears), the SAME edit staged (identical suffix — `diff HEAD` covers the index, so `git
+# add` does not silently change a build's identity), a DIFFERENT edit (different suffix), reverted
+# (back to clean with the untracked file still there), and outside any repo (`unknown`, no suffix).
+_sha_base="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
+_sha_suffix=""
+if [ "$_sha_base" != "unknown" ]; then
+    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | sha256sum | cut -c1-6)"
+fi
+export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
 # Build flags shared by both targets
 NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem -Z json-target-spec"
@@ -1187,6 +1223,22 @@ fi
 # it landed. Corrected here 2026-08-25 (this comment had gone stale by three commits; the leg below
 # already carried `,quarry`).
 [ -n "${UNAOS_QUARRY:-}" ] && _feats="${_feats}quarry,"
+# FACET (ORIN-FACET, Peter 2026-09-08): UNAOS_FACET=1 arms UnaOS's IMAGE VIEWER (`video/facet.rs`) —
+# `docs/CODEX.md` §2's **Facet — Images — "The Canvas"**. Pair it with UNAOS_QUARRY (Cargo does that
+# for you: `facet = ["quarry"]`) and with the desktop knob that opens the file manager — `facet`
+# compiles the viewer, `quarry` is its ONLY door (double-click or <Enter> on a `.PNG` row), and
+# `desktop_firmware`/`wc` is what routes the press to either of them.
+#
+# YOU DO NOT NEED THIS KNOB ON THE JETSON. `deskcascade = [..., "facet"]` carries it, exactly as it
+# carries `quarry` (QUARRY-ORIN's ruling one block down: the IMPLICATION is admissible, appending a
+# `facet,` term to the UNAOS_DESKCASCADE line is not, because `facet` is named by the `x86-all` leg
+# and a knob mapping cannot be un-set by an operator). The knob exists for the OTHER two boards and
+# for `UNAOS_FACET=1 ./arroyo check`, which type-checks the viewer alone.
+#
+# Arming proof is not the banner: `[pidesk] facet ARMED` is printed by `desktop_firmware::activate`
+# inside the built image, and `strings -a target/aarch64_esp/kernel.elf | grep -c '\[facet\]'` is the
+# artifact-side check the full-knob-gate law asks for.
+[ -n "${UNAOS_FACET:-}" ] && _feats="${_feats}facet,"
 # ORINDESK RUNG 2 (TEGRADESK): UNAOS_TEGRADESK=1 arms the Orin's DESKTOP SEAM — `main.rs`'s
 # `tegra_desk_arm`, called as an appended statement on `tegra_early_stop`'s terminus line (the last
 # instruction before `run_capstone_boot_core(0)`, which never returns). It is the tegra-shaped
@@ -1334,6 +1386,37 @@ fi
 #
 # NOT PROVEN ON HARDWARE. Nothing in this arc has been on the bench.
 [ -n "${UNAOS_ORINEL1AP:-}" ] && _feats="${_feats}orinel1ap,tegrasmp,tegra_el0,tegra,"
+# ORIN-APSRUN (orin 23): every Orin secondary drops EL2 -> EL1, arms its own 250 Hz CNTP at EL1, stamps
+# itself into `EL1_CORE_MASK` and enters `sched::run()` — so `el1cores` reads 0x3f instead of 0x1 and an
+# EL0 thread is placeable on any of the six cores.
+#
+# THE DEFECT, Peter 2026-09-08: "WE ARE STILL ONLY ON ONE CORE". render11's wire ACQUITS the tick and
+# the run loop — `c1..c5 timer PPI live (tick 1)` five times, `online=0x3f` on the `[bsprun] host` line.
+# The field that pinned userspace to the boot core is `el1cores=0x1` on that same line: the APs replay
+# the BSP's EL2 regime and never leave it, so the EL0 placement filter had one candidate and the shell,
+# the render pump, the pointer poll and every `bg` shared it.
+#
+# DEFAULT-ON, and the shape is ORIN-TICKDEFAULT's verbatim: a default-on line keyed on UNAOS_TEGRA
+# here, an idempotent force block in `esp_jetson` for the media path (which forces `tegra` into the
+# feature list without ever setting the UNAOS_TEGRA env var these lines key on), and the explicit
+# positive knob left in place. NESTED INSIDE THE `tegrasmp` OPT-OUT, and that nesting is load-bearing:
+# `apsrun` drops PSCI-woken APs and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]`,
+# so `UNAOS_NOTEGRASMP=1` must drop `apsrun` with it — a knob whose cores do not exist is a flag with
+# nothing behind it, the exact `bsprun`-without-`bsptick` shape.
+#
+# THE WAY BACK: UNAOS_NOAPSRUN=1 -> the pre-flip image (five APs at EL2, `el1cores=0x1`), which is the
+# render11 configuration and the bisect rung if a flight has to separate "APs at EL1" from everything
+# else in this arc. UNAOS_ORINEL1AP=1 without this is the intermediate rung: ONE AP at EL1.
+#
+# BOTH POLARITIES STAY TYPE-CHECKED WITHOUT A MATRIX EDIT BEING OPTIONAL: the armed closure is
+# `arm-tegra`'s list + `apsrun` (the `arm-tegra-apsrun` leg below), and `arm-tegra` itself remains the
+# disarmed polarity — which has real code behind it (`smp_virt::__secondary_rust_virt` with no drop
+# block at all), so it is not a vacuous twin.
+#
+# ⚠ QEMU MODELS NO Tegra234. Every site is `tegra`-gated, so `test-arm`/`arm` exercise none of it; the
+# armed default is type-checked and reasoned here and PROVEN only by an attended bench flight.
+[ -n "${UNAOS_APSRUN:-}" ] && _feats="${_feats}apsrun,tegrasmp,tegra,"
+[ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && [ -z "${UNAOS_NOAPSRUN:-}" ] && _feats="${_feats}apsrun,tegrasmp,tegra,"
 # ORIN-INPUT: UNAOS_ORININPUT=1 arms the tegra input pump + route inside `run_user_image`'s wait loop
 # (arch/aarch64/xusb_tegra.rs `oi_*` + three call sites in arch/aarch64/syscall.rs), so HID actually
 # REACHES an EL0 tenant on the Orin. The chain itself is already compiled in on `tegra_el0` (per-process
@@ -1713,8 +1796,18 @@ fi
 # READ-ONLY to the card by construction (no CMD24/write path). Standalone (does NOT imply tegra, mirroring
 # pcieprobe): the recon runs on BOTH the metal tegra path (combine with UNAOS_TEGRA=1) and the QEMU virt
 # GICv3 path, where — QEMU modelling no Tegra234 SDMMC — the tegra-gated MMIO is compiled out and it prints
-# one honest compiled-present witness line (zero MMIO). Default OFF => module + call sites vanish,
-# byte-identical to baseline. See arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
+# one honest compiled-present witness line (zero MMIO).
+#
+# ⚠ BOOTROOT (orin 22): "Default OFF" IS NO LONGER TRUE OF THE JETSON IMAGE, and this line is not
+# where that is decided. `esp_jetson()` now forces `sdmmc` the way it forces `tegrasmp` and
+# `bsptick` (opt out with UNAOS_NOSDMMC=1) — see the block there for the argument. It has to:
+# `BlockSource::TegraSd` exists ONLY under `sdmmc` (fs/fat.rs:599), so without it the boot-disk
+# walk cannot enumerate the Orin's onboard slot at all, and "boot dumb, presume nothing about the
+# machine" means every disk driver the board has is aboard, not behind an opt-in. THIS knob is
+# still what arms the recon on OTHER paths (virt GICv3 `test-arm`, `UNAOS_TEGRA=1 ./arroyo check`),
+# where it remains default OFF and byte-identical to baseline.
+#
+# See arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_SDMMC:-}" ] && _feats="${_feats}sdmmc,"
 # ORIN-SDMMC-2: UNAOS_SDMMC_ARM=1 is the SEPARATE explicit write ARM on top of UNAOS_SDMMC (double-gating —
 # writes require BOTH the sdmmc feature AND this arm; the recon knob alone never writes the card). It pulls
@@ -1749,29 +1842,6 @@ fi
 # to baseline (no line moves; see docs/dev/evidence/orin14/SDMMCWRITE.md). The ARMED polarity is
 # type-checked by the `arm-tegra-sdmmcwrite` leg of KERNEL_CFG_MATRIX, never by this mapping.
 [ -n "${UNAOS_SDMMCWRITE:-}" ] && _feats="${_feats}sdmmcwrite,sdmmc,"
-# ROOTFS (orin 16, ledger A28): UNAOS_SDMMCROOT=1 gives the VFS a ROOT the Orin actually has. On the
-# desktop line `shell::vfs_mount_table` binds `/` to native UnaFS and `/boot` to BlockSource::Default —
-# neither exists on this machine (the card carries only the FAT32 ESP; nothing registers a Default
-# block device on an Orin boot), so `ls /` and quarry both answered `/: backend error: unafs-mount`.
-# Armed, the table instead binds `/` to the card's FAT volume read through BlockSource::TegraSd (the
-# census-published CMD17 path, metal-proven by A23) and re-points `/boot` at that same volume — `/boot`
-# is `shell::EXEC_ROOT` and the literal prefix of `/apps/VUG.ELF`, `/apps/STAT.ELF`, `/apps/ELFHELLO.ELF`
-# and quarry's launch route, so it is what makes the desktop able to run anything, not decoration.
-# READ-ONLY twice over and NOT by this
-# knob's say-so: BlockSource::TegraSd::write_veto vetoes the source and block::write_block_tegra_sd
-# refuses in every cfg — the vendor pad block stays DISABLED (the FWALL SError conviction) and no
-# controller register is touched. Pulls `sdmmc` for a lone knob; a SIBLING of UNAOS_SDMMCWRITE, never
-# an implier of it (this is a read path only). Metal-only in effect: the call site is `tegra`-gated,
-# and on virt the census publishes no card so the bind prints one named refusal. Witness on the wire:
-# `[sdmmc] root mount source=tegra-sd … -> OK …`, then `[sdmmc] root bound / = tegra-sd FAT read-only
-# … entries=N …`, or `[sdmmc] root -> REFUSED reason=…`. The cost terms are IN those lines: `probe_us`
-# (the volume scan) and `list_us` (the first full listing of the new root). UNAOS_FATPERF=1 would add
-# the per-operation SECTOR term, but it is wired only into the Pi `kernel8` leg (`K8_FEATS`) and not
-# into this mapping, so it is NOT available on a jetson image — extending it is a named follow-up, not
-# something to assume works. Default OFF => byte-identical to baseline (no line moves; the shared hunks
-# in shell.rs and fs/vfs.rs are a same-line append and a file-tail impl block). The ARMED polarity is
-# type-checked by the `arm-tegra-sdmmcroot` leg of KERNEL_CFG_MATRIX, never by this mapping.
-[ -n "${UNAOS_SDMMCROOT:-}" ] && _feats="${_feats}sdmmcroot,sdmmc,"
 # AARCH64-VNET: UNAOS_VNET=1 arms the virtio-net-mmio driver + smoltcp bind on the QEMU `virt` machine
 # (arch/aarch64/virtio_net.rs) — the QEMU-testable proof of the aarch64 smoltcp seam NET-4 built. Scans
 # the fixed virtio-mmio window, drives the LEGACY transport, and runs an ICMP-ping witness against the
@@ -2559,6 +2629,178 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
     ' "$logf"
 }
 
+# ── QEMU-FAST: a QEMU verb ends when the RUN ends, not when the clock does ──────────────────────
+# ONE mechanism, in the shared runner, for every QEMU verb this script has. No verb is named as
+# special and none is exempt: `test`, `test-arm`, `install-pi` and `kernel8-test` all sat out the
+# SAME blind wall — `sleep "$secs"` here, and `qmp_shoot.py --wait` -> an unconditional `time.sleep`
+# over in test_kernel8 — with no predicate evaluated on the path, so the wall was paid in full
+# whether the run finished in eleven seconds or never started at all.
+#
+# MEASURED, not assumed (orin 21, ~/unaos-bench/scratch/orin21/buildperf/REPORT.md §2 — three
+# `kernel8-test 300` runs on this box): the run was OVER at +11.0 / +45.3 / +13.7 s and QEMU then
+# idled for 288 / 254 / 285 s, i.e. 85-96% of the QEMU span proving nothing. The ~4x spread across
+# those three is HOST LOAD, which is what the grace window is sized against.
+#
+# THE PREDICATE IS DERIVED, NEVER INVENTED. Each verb's completion source is whatever that verb's
+# OWN CHECKER already asserts, and nothing else:
+#   kernel8-test   scripts/specs/pi4-regression.spec — the spec `test_kernel8` replays through
+#                  mbench, which declares two COMPLETE end-of-run markers.
+#   test-arm       NONE. Its checker is `scan_serial_faults` above: negative-only, no notion of the
+#   test           run having finished, and no spec anywhere replays target/serial-arm.log or is
+#   install-pi     what `./arroyo test` asserts. They therefore KEEP THE FULL WALL and say so.
+#                  (docs/dev/LEDGER.md row S33 carries this as owed; S8 already names `test`/
+#                  `test-arm` as negative-only GATE-BLINDNESS. Declaring a completion source for an
+#                  x86 spec is rmbp's call, not this lane's — an invented marker would be a gate
+#                  asserting a line nobody chose.)
+# `scripts/qemu_await.py` drives mbench's OWN shipped predicate — `Matcher.complete()`, the one
+# `run_follow()` stops on ("Follow-mode EARLY EXIT") — which fires only once EVERY REQUIRE and
+# COUNT in the spec is satisfied AND an end-of-run marker has been seen. So a fast capture can
+# never be short of a required witness, and a run carrying a real regression never shortens at all
+# (the predicate simply never fires, the cap is reached, and the full window is preserved for the
+# replay). `mbench.py --replay` remains the SINGLE verdict authority; this path decides only WHEN
+# to stop reading.
+#
+# THE GRACE WINDOW, and its default. `complete()` says every witness we assert has landed; it says
+# nothing about a fault that has not happened yet. After completion QEMU is kept alive and read for
+# UNAOS_QEMU_GRACE seconds with every FORBID still live — mbench's three phase-unbound builtins
+# (`PANIC`, `-> FAIL`, `FAIL ::`) and every FORBID the verb's spec declares — so anything they match
+# in that window lands in the capture exactly as it would have on the full wall. THE DEFAULT IS 20 s
+# AND IT COMES FROM THE MARKER SPREAD ABOVE: completion at +11.0 quiet vs +45.3 at load 21 is a ~4x
+# load-driven swing, so a grace sized on a quiet box is not a grace under nine executors; 20 s is
+# that spread with room, and it is a fixed window AFTER completion, so the load that moves the
+# marker moves the exit with it.
+#
+# WHAT FAST MODE COSTS, stated rather than buried. A grace is not a soak. `[pstrip] rollup` fires
+# once per 10 s for the whole window, so a 300 s wall is a de-facto 28-window soak of that one
+# instrument and a graced fast exit keeps 2-3 of them; and any MONOTONIC ACCUMULATOR read out of a
+# fast capture (`[u7stk] hw=` high-water marks and their kind) is a FLOOR, not a final value.
+# UNAOS_QEMU_FULL=1 restores the full wall for exactly this reason and IS WHAT THE ARC'S DONE GATE
+# RUNS. Hard cap is the verb's own `secs` in BOTH modes.
+QEMU_GRACE_DEFAULT=20
+
+# ── THE RUN STAMP GOES IN A SIDECAR, AND THE SERIAL LOG STAYS PURE GUEST BYTES ──────────────────
+# An earlier shape of this appended a `:: qemu-run … ::` TRAILER to the capture itself, and it was
+# wrong for a reason that outranks how carefully the trailer was worded: the harness would be
+# writing into the very evidence mbench and `scan_serial_faults` then judge. That needs a whole gate
+# (a spec-vocabulary check across every directive of every spec) to stay safe, and a gate is not a
+# fix — it is a standing tax on every future spec author, who has no reason to think about a line
+# the shell appends. The tree's own principle at `test_kernel8` already said the answer: "the
+# guest's bytes still land in exactly $logf and mbench still replays exactly that file."
+#
+# So the run metadata is written BESIDE the log, at `<logfile>.run`, and no harness text can reach a
+# directive by construction. Capture conventions already carry manifests, so the sidecar travels
+# with the capture the same way.
+#
+# ORDERING IS THE SHARP EDGE, and it is why this is one function called at ONE point. The sidecar
+# carries the LOG'S IDENTITY (its size and sha256) so that a sidecar sitting beside a log it does
+# not describe is reported STALE rather than believed — confidently wrong beats obviously absent.
+# That identity is therefore computed over the log AS THE VERDICT WILL READ IT: AFTER QEMU has been
+# killed AND `wait`ed (no further bytes can land), immediately before the replay. The mode, grace,
+# completion and wall values are decided EARLIER and carried in shell variables; only the FILE is
+# written last. A sidecar written at the exit decision would mismatch on every single run — late
+# flush, teardown — and turn `stale` into a systematic false result, and a check that fires every
+# time gets deleted within the week.
+qemu_run_sidecar() { # $1 = log file  $2..= key=value pairs, already decided
+    local logf="$1"; shift
+    [ -f "$logf" ] || return 0
+    {
+        printf '%s\n' "$@"
+        printf 'log_bytes=%s\n' "$(wc -c < "$logf" | tr -d ' ')"
+        printf 'log_sha256=%s\n' "$(sha256sum "$logf" | cut -d' ' -f1)"
+    } > "${logf}.run"
+}
+
+# Wait out a QEMU run and end it. FAST by default (completion + grace); UNAOS_QEMU_FULL=1 keeps the
+# whole wall. Hard cap is `secs` in both modes.
+#   $1 qpid   $2 logfile   $3 secs (hard cap)   $4 completion source (spec path, or "" for none)
+#   $5 label  $6.. optional command run while QEMU is STILL ALIVE, just before the kill
+#             (kernel8-test's QMP screendump; `|| true`-guarded, never fails the run)
+qemu_wait_or_complete() {
+    local qpid="$1" logf="$2" secs="$3" src="$4" label="${5:-qemu-run}"
+    shift 5
+    local grace="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}"
+    local t0 wall mode awaited="" arc=0 status="" cat_="-" fh="0"
+    t0=$(date +%s.%N)
+    if [ "${UNAOS_QEMU_FULL:-0}" = "1" ]; then
+        mode=full
+        echo -e "${COLOR_YELLOW}⚡ ${label}: UNAOS_QEMU_FULL=1 — the full ${secs}s wall (the DONE-gate form).${COLOR_RESET}"
+        sleep "$secs"
+    elif [ -z "$src" ] || [ ! -f "$src" ]; then
+        mode=full
+        echo -e "${COLOR_YELLOW}⚡ ${label}: no completion signal declared for this verb — the full ${secs}s wall stands.${COLOR_RESET}"
+        sleep "$secs"
+    else
+        mode=fast
+        # `|| arc=$?` rather than a bare call: this script runs under `set -e`, and rc 3 (cap
+        # reached without completion) is an ORDINARY outcome here, not an error.
+        awaited=$(python3 "${WORKSPACE_DIR}/scripts/qemu_await.py" --log "$logf" --spec "$src" \
+                      --cap "$secs" --grace "$grace" --label "$label") || arc=$?
+        status=$(printf '%s\n' "$awaited" | awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="status")print a[2]}}')
+        cat_=$(printf '%s\n' "$awaited" | awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="complete_at")print a[2]}}')
+        fh=$(printf '%s\n' "$awaited" | awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="forbid_hits")print a[2]}}')
+        # EVERY NON-`complete` OUTCOME PAYS THE REST OF THE WALL. This is the branch a unit run
+        # caught getting it wrong (helper-unit H5, 2026-09-08): `nosignal` came back in 0.0 s, the
+        # code set `mode=full` and fell straight through to the kill, and a 3 s gate ran for 0.0 s
+        # while its own stdout said "FULL wall 0.0s". The same shape as the broken-waiter case
+        # below, one branch over — so the wall payment is written ONCE, after the case, keyed on
+        # `mode`, instead of once per arm where an arm can forget it.
+        case "$status" in
+          complete) ;;                     # the fast exit was earned
+          cap)      mode=fastcap ;;        # ran to the verb's own wall; identical to before
+          nosignal)
+            # The spec has no COMPLETE marker (it lost one, or the caller named a spec that never
+            # had one). An honest answer, not a failure — but it is NOT permission to stop early.
+            mode=full
+            cat_="-"
+            echo -e "${COLOR_YELLOW}⚡ ${label}: the named spec declares no COMPLETE marker — nothing can say when this run is over, so the full ${secs}s wall stands.${COLOR_RESET}"
+            ;;
+          *)
+            # THE ONE OUTCOME THAT MUST NOT BE SILENT. If the waiter died (a crash, a bad
+            # interpreter, a moved import) `$status` is empty and the naive code would fall
+            # straight through to the kill — turning a 300 s gate into a 0 s one and reporting
+            # whatever fragment of a boot happened to be on disk. Say so loudly, so a broken
+            # helper degrades to TODAY'S behaviour rather than to a false verdict.
+            echo -e "${COLOR_RED}✖ ${label}: the completion waiter produced no verdict line (rc ${arc}) — falling back to the full wall. The fast path is BROKEN, not merely unlucky; fix scripts/qemu_await.py.${COLOR_RESET}"
+            mode=full
+            cat_="-"
+            ;;
+        esac
+        if [ "$mode" = full ]; then
+            local spent
+            spent=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.0f", b-a}')
+            if [ "$spent" -lt "$secs" ]; then sleep "$((secs - spent))"; fi
+        fi
+    fi
+    # The pre-kill hook runs with QEMU still alive (screendump); never allowed to fail the run.
+    if [ "$#" -gt 0 ]; then "$@" || true; fi
+    # `if`, not `[ … ] && …`: under `set -e` a bare `test && cmd` whose test FAILS is a failed
+    # command at statement level and aborts the script. (Same trap as the k8_script guard below.)
+    if [ -n "$qpid" ]; then
+        kill "$qpid" 2>/dev/null || true
+        wait "$qpid" 2>/dev/null || true
+    fi
+    wall=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')
+    # AFTER the kill AND the wait — see the ORDERING note above. `fast` and `full` are the only two
+    # modes a reader is offered; `fastcap` is recorded as `full` because that is what it PAID, with
+    # the distinction kept in `note=` for a human.
+    case "$mode" in
+      fast)    qemu_run_sidecar "$logf" "mode=fast" "completion_at=${cat_}" "grace=${grace}" \
+                   "wall=${wall}" "cap=${secs}" "spec=${src}" "sha=${UNAOS_GIT_SHA:-unstamped}" \
+                   "label=${label}" "forbid_hits_in_grace=${fh:-0}" ;;
+      fastcap) qemu_run_sidecar "$logf" "mode=full" "completion_at=-" "grace=${grace}" \
+                   "wall=${wall}" "cap=${secs}" "spec=${src}" "sha=${UNAOS_GIT_SHA:-unstamped}" \
+                   "label=${label}" "note=fast-requested-no-completion-inside-cap" ;;
+      *)       qemu_run_sidecar "$logf" "mode=full" "completion_at=-" "grace=${grace}" \
+                   "wall=${wall}" "cap=${secs}" "spec=${src:--}" "sha=${UNAOS_GIT_SHA:-unstamped}" \
+                   "label=${label}" ;;
+    esac
+    case "$mode" in
+      fast)    echo -e "${COLOR_GREEN}⚡ ${label}: FAST exit — completion at +${cat_}s + ${grace}s grace; wall ${wall}s of a ${secs}s cap (saved $(awk -v s="$secs" -v w="$wall" 'BEGIN{printf "%.0f", s-w}')s). UNAOS_QEMU_FULL=1 for the whole wall.${COLOR_RESET}" ;;
+      fastcap) echo -e "${COLOR_YELLOW}⚡ ${label}: no completion inside the ${secs}s cap — full wall paid (${wall}s), saved 0s.${COLOR_RESET}" ;;
+      *)       echo -e "${COLOR_YELLOW}⚡ ${label}: FULL wall ${wall}s of a ${secs}s cap, saved 0s.${COLOR_RESET}" ;;
+    esac
+}
+
 # Headless aarch64 run: serial -> target/serial-arm.log, self-terminates after N secs.
 test_aarch64() {
     local secs="${1:-20}"
@@ -2580,9 +2822,12 @@ test_aarch64() {
         -no-reboot -no-shutdown \
         ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!
-    sleep "$secs"
-    kill "$qpid" 2>/dev/null || true
-    wait "$qpid" 2>/dev/null || true
+    # QEMU-FAST: the shared runner ends this run. `test-arm`'s checker is `scan_serial_faults` —
+    # negative-only, with no notion of the run having finished — and no spec replays
+    # target/serial-arm.log, so the completion source is EMPTY and this verb keeps the full wall.
+    # It is wired here anyway, and NOT exempted, so the day an aarch64-virt spec declares a
+    # COMPLETE marker this leg gets the fast exit by naming that spec and nothing else.
+    qemu_wait_or_complete "$qpid" "$logf" "$secs" "" "test-arm"
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${logf}) ════════════${COLOR_RESET}"
@@ -2638,9 +2883,25 @@ test_x86_64() {
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
     rm -f "$SERIAL_LOG"
     cd "$WORKSPACE_DIR/builder"
+    local xt0 xwall
+    xt0=$(date +%s.%N)
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
+    # QEMU-FAST: `test` is NOT exempt — it has no COMPLETION SIGNAL, which is a different thing.
+    # Its checker is `scan_serial_faults` below: negative-only, with no notion of the run having
+    # finished, and nothing in scripts/specs/ is what this verb asserts (x86-witness.spec DOES carry
+    # two structural COMPLETE markers, but it is scoped to a paygo/witness/logts-armed METAL
+    # capture, so adopting it here would be asserting a spec this verb does not run — and x86 specs
+    # are rmbp's lane). So the full wall stands, and the capture's SIDECAR says so rather than
+    # leaving a reader to guess. The wall itself lives in builder/src/main.rs's `thread::sleep`
+    # (the builder owns this QEMU, not this script), so when rmbp declares a completion source the
+    # wait has to be plumbed through there — recorded as owed in LEDGER S33, not silently skipped.
+    xwall=$(awk -v a="$xt0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')
+    echo -e "${COLOR_YELLOW}⚡ test: no completion signal declared for this verb — full wall ${xwall}s, saved 0s.${COLOR_RESET}"
+    qemu_run_sidecar "$SERIAL_LOG" "mode=full" "completion_at=-" \
+        "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" "spec=-" \
+        "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test"
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
@@ -2991,7 +3252,7 @@ KERNEL_CFG_MATRIX=(
   # WIRING CHECK below.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -3007,7 +3268,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3087,6 +3348,21 @@ KERNEL_CFG_MATRIX=(
   # `orinel1ap`-OFF compiled by nothing on this arch, which is the "gate whose knob cannot satisfy it"
   # defect in the other direction. Two legs type-check both polarities.
   "arm-tegra-el1ap ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinel1ap"
+  # ORIN-APSRUN armed (orin 23) — the `arm-tegra-el1ap` row + `apsrun`, and it carries `orinel1ap` too
+  # ON PURPOSE: `apsrun` widens seven of that feature's `#[cfg]`s to `any(orinel1ap, apsrun)`, so the
+  # BOTH-ARMED closure is the one combination in which `EL1AP_SEATS` has two candidate definitions and
+  # the `#[cfg(all(orinel1ap, not(apsrun)))]` arm must be proven to lose. A row with `apsrun` alone
+  # would type-check the interesting half and leave the collision uncompiled — the "gate whose knob
+  # cannot satisfy it" defect. `apsrun`-alone IS covered: it is the DEFAULT for every tegra build, so
+  # `esp-jetson` and `UNAOS_TEGRA=1 ./arroyo check` compile it on every run of either.
+  #
+  # The DISARMED polarity keeps its own legs (`arm-tegra`, `arm-tegra-el0`, `arm-tegra-el1ap`), and it
+  # is not a vacuous twin: with `apsrun` off, `smp_virt::__secondary_rust_virt` has no drop block, the
+  # two `[apsrun]` witnesses do not exist, and `boot_tegra` has neither `publish_el1_root` nor
+  # `capture_bsp_latch_once`. Same x86 universe side effect as its neighbours': `apsrun` is aarch64-only
+  # in effect (every site is under `src/arch/aarch64/`), so naming it here removes it from the x86 mix
+  # universe, where it emitted nothing.
+  "arm-tegra-apsrun ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,orinel1ap,apsrun"
   # SIMMER armed (appended 2026-08-21) — closes one of the two "real holes wearing a green verdict"
   # the RE-COUNTED 2026-08-19 note above records. `simmer_test = []` is board-neutral aarch64: its
   # four cfg sites all live in `arch/aarch64/sched.rs` (three self-test fns + the boot-core spawn in
@@ -3242,7 +3518,7 @@ KERNEL_CFG_MATRIX=(
   #
   # PRECONDITION: like `arm-tegra-el0`, this leg compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
-  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry"
+  "arm-tegra-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet"
   # ORINDESK RUNG 2 — the DESKTOP SEAM armed (appended 2026-08-25). `tegradesk` gates `main.rs`'s
   # `tegra_desk_arm` (the wrapper, its latch, its two stop-line consts) plus the one statement
   # appended to `tegra_early_stop`'s terminus line. BOTH sites sit behind `tegra` as well
@@ -3286,7 +3562,7 @@ KERNEL_CFG_MATRIX=(
   # set it — the disarmed twin for BOTH knobs — and there is no `#[cfg(not(feature = "orinclick"))]`
   # site in src/, so no disarmed asymmetry is created. TYPE-CHECK only: booting `desktop_firmware` + the cascade
   # is rung 5 and stays blocked by orin-desktop.md §5.2 (the seam's second stop-line is still `false`).
-  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,tegradesk,orinclick"
+  "arm-tegra-seam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,tegradesk,orinclick,facet"
 
   # ORIN-CLICK rung 3 armed (appended 2026-08-25) — `orinclick` wires `jd2_console_pump`'s
   # `Event::Button` arm into `arch/aarch64/syscall.rs::wc_click_route` and adds the `[orinclick]`
@@ -4252,29 +4528,94 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
-  # ROOTFS armed (appended 2026-09-06, orin 16) — `sdmmcroot` gates the VFS root bind at the tail of
-  # `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_root_bind` + `root_probe` + the verdict cache), the same-line
-  # `pub use` on that file's TEGRA-SDBLK export line, the statement appended to the `/boot` mount line
-  # in `shell::vfs_mount_table`, and the early-probe statement appended to the `sdmmc_census` call line
-  # in `main.rs`. The file-tail `impl FatBackend::new_tegra_sd` in `fs/vfs.rs` is
-  # gated `all(aarch64, tegra, sdmmc)` — every `arm-tegra*` leg already compiles THAT — but the CALLER
-  # is `sdmmcroot`-gated, and without this leg the armed polarity would be compiled by nothing (the
-  # orinrx / bsptick / sdmmcwrite shape, and the standing law that a knob's gates must compile the
-  # configuration the knob turns ON).
+  # ── WITNESSGAP (appended 2026-09-07, orin 20) — the WITNESS-FREE polarity, which is the polarity
+  # every piece of BOOT MEDIA actually ships ──────────────────────────────────────────────────────
   #
-  # WHY ITS OWN TAIL LEG rather than `,sdmmcroot` appended to `arm-tegra`: `arm-tegra` is the DISARMED
-  # twin and the only leg that compiles the SHIPPED default jetson image, whose byte-identity to
-  # baseline this arc measures. Hosted on `arm-tegra`'s list verbatim + `sdmmcroot` (the sdmmcwrite
-  # shape: the knob's sites need nothing beyond `tegra` + `sdmmc`, which that list already carries).
-  # The resolved set grows by EXACTLY {sdmmcroot} over a leg that is already green, so a red here names
-  # the knob and nothing else. It is a SEPARATE leg from `arm-tegra-sdmmcwrite` because the two knobs
-  # are siblings, not a ladder: neither implies the other and a build may arm either alone.
+  # THE HOLE. `witness` is DEFAULT-QUIET: arroyo arms it for exactly the four battery commands
+  # (`test`, `test-fat`, `test-arm`, `kernel8-test` — the case at arroyo:44) and leaves it OFF for
+  # every boot/media command. Three independent places read that one env var and none of them is
+  # reached by `check`: the general knob mapping (arroyo:153, feeding `esp-arm`/`esp-jetson`/`arm`),
+  # `kernel8()`'s curated K8_FEATS (arroyo:5676, feeding `kernel8`/`kernel8-run`/`install-pi`), and
+  # `builder/src/main.rs:48` (feeding `esp-x86`/`vm-image`/`x86`). So `esp-jetson`, `esp-arm`,
+  # `esp-x86`, `kernel8` and `vm-image` all build `witness` OFF.
   #
-  # UNIVERSE SIDE EFFECT: none that moves a mix count. `sdmmcroot` is a NEW `[features]` entry named
-  # only on this arm-* leg, so `x86_cfg_universe` drops it (`sdmmc_tegra.rs` is wholly `sdmmc`-gated
-  # and the `shell.rs` statement is inside `all(tegra, sdmmcroot)`) and the derived mix-leg count is
-  # unchanged. Board legs +1; gate +1. `./arroyo check` prints the live counts every run.
-  "arm-tegra-sdmmcroot ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcroot"
+  # Before this block, every one of the 47 board legs above carried `witness` — measured, not
+  # assumed. The two DEFAULT legs in `check_both` do compile witness-OFF, but they compile the
+  # OPERATOR'S OWN knob set, which on a bare `./arroyo check` is `ehcihid,kbdwit,sdhcblk,smolnet`:
+  # no `tegra`, no `pi`, no `baremetal`, no `tegra_el0`, no `bsptick`/`bsprun`. And `tegra`,
+  # `baremetal`, `pi` and `tegra_el0` are arm-only, so `x86_cfg_universe` drops them and no derived
+  # x86 mix leg carries them either. Net: NO leg anywhere compiled a BOARD feature set with
+  # `witness` OFF, which is every configuration that reaches a card.
+  #
+  # NOT HYPOTHETICAL. orin 19's BATTERY1S1 nearly shipped a break through exactly this hole: gating
+  # the aarch64 fixture asm on `witness` would have left `setup()`'s eight `__fault_blob_*` /
+  # `__eret_prog_*` / `__user_prog_*` symbols undefined on a `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson`
+  # link, because `main.rs`'s `tegra_el0_start_maybe` and `virt_el0_start_maybe` call `setup()`
+  # WITHOUT a `witness` gate. It was caught by hand, by a reader, in the review — not by the gate.
+  # (Evidence: ~/unaos-bench/scratch/orin19/battery1s1/PROGRESS.md §2b.)
+  #
+  # THE SHAPE OF THE FIX. One witness-free TWIN per SHIPPED media configuration — not a twin per
+  # board leg, which would have doubled a 56-leg gate for coverage nothing ships. Each twin is an
+  # existing GREEN leg's list VERBATIM MINUS the single token `witness`, so a red here names the
+  # polarity and nothing else (the `arm-tegra-sdmmcwrite` discipline, run in reverse).
+  #
+  # WHY THESE FOUR, AND WHY NOT FEWER:
+  #   arm-tegra-bsprun-nowitness      the DEFAULT jetson image. `esp_jetson()` forces `tegra` +
+  #                                   `tegrasmp` + `bsptick` + `bsprun` into the feature list
+  #                                   (arroyo:5065-5096) regardless of env, so `arm-tegra-bsprun`
+  #                                   is the leg whose list matches the card, and this is its
+  #                                   witness-free twin.
+  #   arm-tegra-bsprun-el0-nowitness  the ARMED (`UNAOS_TEGRA_EL0=1`) jetson image — the exact
+  #                                   configuration BATTERY1S1 §2b named as compiled by nothing.
+  #                                   It is NOT redundant with the row above even though its
+  #                                   feature set is a strict superset: `main.rs`'s
+  #                                   `#[cfg(all(feature = "tegra", not(feature = "tegra_el0"),
+  #                                   target_arch = "aarch64"))]` item is compiled ONLY by the
+  #                                   non-el0 build, so dropping the first row would leave the
+  #                                   SHIPPED default image's own code uncovered. Both, or neither
+  #                                   polarity of that `not(...)` is checked.
+  #   arm-pi-nowitness                `kernel8` — the Pi bare-metal image. K8_FEATS is
+  #                                   `baremetal,skip_xhci` plus knobs; `arm-pi` is a superset of
+  #                                   it, so its witness-free twin covers the media build and the
+  #                                   whole Pi knob family with it.
+  #   x86-all-nowitness               `esp-x86` / `vm-image` at full knob width. The 9 derived mix
+  #                                   legs already put x86 witness-OFF under SOME coverage (5 of
+  #                                   them draw `witness` OFF by mask), but a mask subset is not
+  #                                   the full-knob build, and the brief's requirement is both
+  #                                   arches by construction rather than by accident of a mask.
+  #
+  # NO `esp-arm` ROW. `esp-arm` (QEMU virt aarch64) builds `$(arm_features)` — the operator's own
+  # knob set — which is precisely what the DEFAULT aarch64 leg in `check_both` already compiles,
+  # witness OFF. A fifth row would be that leg again.
+  #
+  # UNIVERSE SIDE EFFECT: none. Every feature named here is already named by the parent leg it was
+  # copied from, so `x86_cfg_universe`'s arm-only set is unchanged and the derived mix-leg count
+  # stays where it was. Board legs +4; gate +4. `./arroyo check` prints the live board/mix counts
+  # AND (since this arc) their witness polarity every run — read them there, not here.
+  #
+  # PROVEN BY GO-RED, not by reading: two deliberate type errors gated
+  # `all(feature = "tegra", not(feature = "witness"))` and
+  # `all(feature = "baremetal", not(feature = "witness"))` in `arch/aarch64/timer.rs` left
+  # `./arroyo check` at EXIT 0 on the 56-leg gate while `./arroyo kernel8` and `./arroyo esp-jetson`
+  # both failed to compile; with these four rows in place the same mutation reds
+  # `arm-tegra-bsprun-nowitness`, `arm-tegra-bsprun-el0-nowitness` and `arm-pi-nowitness` and the
+  # gate returns 1. Evidence: ~/unaos-bench/scratch/orin20/witnessgap/PROGRESS.md §M2/§M3.
+  "arm-tegra-bsprun-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun"
+  "arm-tegra-bsprun-el0-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,bsptick,bsprun,tegra_el0"
+  "arm-pi-nowitness ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst"
+  # ── NET5VIRT (appended 2026-09-08, orin 23) — `net5` WITHOUT `tegra`, the only leg that has it ──
+  #
+  # THE HOLE, MEASURED. Before this row, `net5` was carried by exactly ONE row of this matrix —
+  # `arm-tegra-tcurx` — and that row carries `tegra` too. `rtl8168_tegra.rs` splits at `mod metal`
+  # (`#[cfg(feature = "tegra")]`), so every `cfg(all(net5, not(tegra)))` site compiled on NO leg of
+  # this gate: the QEMU-virt witness half, where orin 23 put the `[net5F]` length-derivation fixture —
+  # the only part of the render11 no-lease fix a board-less machine can run. Code compiled by no leg
+  # is code that rots unseen, and that fixture would have rotted first.
+  #
+  # No universe side effect: `net4` and `net5` are already named by `arm-tegra-*` rows, so
+  # `x86_cfg_universe` drops them exactly as it did before. Board legs +1.
+  "arm-net5-virt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,net4,net5"
+  "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -4474,6 +4815,43 @@ check_kernel_cfg() {
     if [ "${UNAOS_CFG_SWEEP:-0}" != "1" ]; then
         echo -e "${COLOR_CYAN}  (${#KERNEL_CFG_MATRIX[@]} board + ${#KERNEL_CFG_MIX[@]} x86 pairwise-mix; UNAOS_CFG_SWEEP=1 adds the per-feature sweep)${COLOR_RESET}"
     fi
+    # GATE-CENSUS (orin 20, WITNESSGAP): print the leg list's `witness` POLARITY every run.
+    #
+    # THE DEFECT THIS ANSWERS IS NOT A MISSING LEG — it is that a whole polarity could go
+    # unchecked for months and nothing said so. `witness` is DEFAULT-QUIET: the four battery
+    # commands arm it (the `case` at the head of this file) and every boot/media command leaves it
+    # OFF, so the polarity `esp-jetson` / `esp-arm` / `esp-x86` / `kernel8` / `vm-image` actually
+    # ship is the OFF one. Until the WITNESSGAP rows above, all 47 board legs carried it ON and the
+    # only witness-free legs anywhere were x86 mix legs that drew it OFF BY ACCIDENT OF A MASK. The
+    # counts were already printed; the POLARITY was not, so the gap was invisible in the log and
+    # discoverable only by a near-miss (orin 19 BATTERY1S1 §2b — caught by a reader in review, not
+    # by any instrument).
+    #
+    # This block PRINTS and does not gate: it changes no exit code and compiles no leg. A zero in
+    # the aarch64 column is meant to be read as the finding it is, and the witness-free legs are
+    # NAMED rather than merely counted because a name survives being pasted into a report.
+    #
+    # Reading $KERNEL_FEATURES here does NOT breach the "deliberately does NOT consult
+    # $KERNEL_FEATURES" note below: that rule governs what these legs COMPILE, which must be the
+    # same fixed matrix for every operator. The two DEFAULT legs in check_both do compile the
+    # operator's own set, they are part of the gate's real coverage, and stating their polarity
+    # beside the matrix's is the only way this census describes the whole gate rather than most of
+    # it.
+    local _wON=0 _wOFF=0 _wOFFarm=0 _wOFFx86=0 _wNAMES="" _wDEF="OFF"
+    for _row in "${_rows[@]}"; do
+        read -r _leg _tgt _feats <<< "$_row"
+        case ",${_feats}," in
+            *,witness,*) _wON=$((_wON + 1)) ;;
+            *)  _wOFF=$((_wOFF + 1)); _wNAMES="${_wNAMES} ${_leg}"
+                case "$_tgt" in
+                    *aarch64*) _wOFFarm=$((_wOFFarm + 1)) ;;
+                    *)         _wOFFx86=$((_wOFFx86 + 1)) ;;
+                esac ;;
+        esac
+    done
+    case ",${KERNEL_FEATURES#--features }," in *,witness,*) _wDEF="ON" ;; esac
+    echo -e "${COLOR_CYAN}  witness census — legs ON ${_wON} / OFF ${_wOFF} (OFF: aarch64 ${_wOFFarm}, x86_64 ${_wOFFx86}); the 2 default legs are witness ${_wDEF}${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}  witness-free legs (the polarity every media build ships):${_wNAMES:- NONE — no leg compiles what esp-jetson/esp-arm/esp-x86/kernel8/vm-image build}${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
     for _row in "${_rows[@]}"; do
         read -r _leg _tgt _feats <<< "$_row"
@@ -5269,6 +5647,18 @@ esp_jetson() {
             *",tegrasmp,"*) ;;
             *) _feats="${_feats}tegrasmp,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
         esac
+        # ORIN-APSRUN (orin 23): with the secondaries started, DROP THEM TO EL1 — each arms its own
+        # 250 Hz CNTP at EL1, stamps `EL1_CORE_MASK` and enters `run()`, so `el1cores` reads 0x3f and
+        # EL0 threads are placeable on all six cores instead of only the boot core (Peter: "WE ARE
+        # STILL ONLY ON ONE CORE"). NESTED INSIDE the tegrasmp opt-out on purpose: `apsrun` drops
+        # PSCI-woken APs, so `UNAOS_NOTEGRASMP=1` (no APs at all) must drop it too. Opt out on its own
+        # with UNAOS_NOAPSRUN=1 => the render11 image. Idempotent, the tegrasmp/TICKDEFAULT shape.
+        if [ -z "${UNAOS_NOAPSRUN:-}" ]; then
+            case ",${_feats}" in
+                *",apsrun,"*) ;;
+                *) _feats="${_feats}apsrun,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+            esac
+        fi
     fi
     # ORIN-TICKDEFAULT: the standing EL1 tick + the preemptive terminus are default-on for the jetson
     # IMAGE, not only for `UNAOS_TEGRA=1 ./arroyo check` — this is the block that reaches bench media,
@@ -5289,6 +5679,27 @@ esp_jetson() {
                 *) _feats="${_feats}bsprun,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
             esac
         fi
+    fi
+    # BOOTROOT (orin 22): `sdmmc` is DEFAULT-ON for the jetson image. Opt out with UNAOS_NOSDMMC=1
+    # (the pre-flip baseline: no onboard-slot driver in the image at all). Idempotent, the tegrasmp
+    # shape, and in this block rather than the knob mapping for the reason ORIN-TICKDEFAULT gives —
+    # `esp-jetson` forces `tegra` into the feature list without ever setting the UNAOS_* env var the
+    # mapping lines key on, so a knob-mapping entry would never reach bench media.
+    #
+    # WHY IT IS NOT OPTIONAL ANY MORE. Peter, 2026-09-08: "boot cold, boot dumb, presume nothing about
+    # the machine." The kernel is no longer told where it came from — `fs::bootdisk` enumerates every
+    # disk the board has and binds the one carrying THIS kernel's own bytes. That walk can only see a
+    # disk whose driver is IN THE IMAGE, and `BlockSource::TegraSd` exists only under `sdmmc`
+    # (`fs/fat.rs:599`), so a plain `./arroyo esp-jetson` could not enumerate the Orin's onboard slot
+    # AT ALL — the type does not exist to name it (rmbp 16's type-level blocker). Boot dumb means
+    # every disk driver the board has is aboard; a card-resident root behind an opt-in knob is the
+    # presumption this arc removes. The card stays READ-ONLY: `BlockSource::TegraSd::write_veto` and
+    # `block::write_block_tegra_sd` both refuse in every cfg, so arming the driver arms no writer.
+    if [ -z "${UNAOS_NOSDMMC:-}" ]; then
+        case ",${_feats}" in
+            *",sdmmc,"*) ;;
+            *) _feats="${_feats}sdmmc,"; KERNEL_FEATURES="--features ${_feats%,}" ;;
+        esac
     fi
     echo -e "${COLOR_YELLOW}⚡ kernel features (jetson): ${_feats%,}${COLOR_RESET}"
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
@@ -6964,9 +7375,25 @@ test_kernel8() {
         if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; fi
         return 4
     fi
-    python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait "$((secs - 1))" --out "$png" 2>/dev/null || sleep "$secs"
-    kill "$qpid" 2>/dev/null || true
-    wait "$qpid" 2>/dev/null || true
+    # QEMU-FAST: the wait, the screendump and the kill all go through the shared runner now. What
+    # used to be here was `qmp_shoot.py --wait $((secs-1))` — whose `--wait` is an unconditional
+    # `time.sleep` (scripts/qmp_shoot.py) — with `|| sleep "$secs"` behind it, i.e. a blind wall
+    # either way and a full EXTRA wall if the QMP connect ever failed. The completion source is the
+    # spec THIS FUNCTION ALREADY REPLAYS forty lines below, named once and used for both:
+    # pi4-regression.spec's two COMPLETE markers, via mbench's own `Matcher.complete()`. The shot
+    # is taken by the pre-kill hook, so it still happens with QEMU alive, now at the end of the
+    # grace instead of at `secs-1`; a shot failure no longer costs a second wall.
+    # TYPED MODE IS NOT FAST-ELIGIBLE, and the reason is a real hazard rather than caution: the
+    # completion source is the BASE spec, which knows nothing about the typed battery, while
+    # `k8_type.py` is still typing on its own `--budget "$secs"` schedule. A fast exit computed
+    # from the base spec would kill QEMU out from under the typist and red pi4-barename.spec on a
+    # healthy boot. Typed runs therefore declare no completion source and keep the full wall until
+    # a source that accounts for the inject script exists (pi's lane — pi4-barename.spec declares
+    # no COMPLETE line today).
+    local k8_spec_main="${WORKSPACE_DIR}/scripts/specs/pi4-regression.spec"
+    if [ -n "$k8_script" ]; then k8_spec_main=""; fi
+    qemu_wait_or_complete "$qpid" "$logf" "$secs" "$k8_spec_main" "kernel8-test" \
+        python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait 0 --out "$png"
     if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
     echo -e "${COLOR_GREEN}✅ Serial:${COLOR_RESET} ${logf}    ${COLOR_GREEN}Screen:${COLOR_RESET} ${png}"
 
@@ -7074,9 +7501,13 @@ install_pi() {
         -qmp tcp:127.0.0.1:${qmp_port},server,nowait \
         ${UNAOS_QEMU_EXTRA:-} &
     local qpid=$!
-    sleep "$secs"
-    kill "$qpid" 2>/dev/null || true
-    wait "$qpid" 2>/dev/null || true
+    # QEMU-FAST: the FOURTH blind wall in this script, wired to the same shared runner so no verb is
+    # an exception. `install-pi`'s checker is the in-kernel `:: INSTALL: …` awk below plus the host
+    # re-read — there is no spec and therefore no completion source, so this takes the identical
+    # full-wall path `test-arm` takes (sleep the wall, kill, write the sidecar) and its behaviour is
+    # unchanged. Nothing is written into `$logf`, so this function's `/PIINSTALL|:: INSTALL:/` scan
+    # and its PASS regex see exactly the bytes they saw before.
+    qemu_wait_or_complete "$qpid" "$logf" "$secs" "" "install-pi"
 
     # ── In-kernel verdict ──
     echo -e "${COLOR_YELLOW}── INSTALL-PI serial verdict ──${COLOR_RESET}"

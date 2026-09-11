@@ -465,7 +465,7 @@ pub fn open() -> wm::WinId {
         cw as u32,
         ch as u32,
         stride as u32,
-        b"pulse",
+        b"Pulse",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );

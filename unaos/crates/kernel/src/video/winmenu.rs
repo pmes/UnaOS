@@ -39,10 +39,10 @@
 //!    `menubar`'s protocol design ledger already fixed for the eventual ring-3 wire form
 //!    ([`MENU_LABEL_MAX`] 24, [`MENU_DEPTH_MAX`] 2, [`MENU_ITEMS_MAX`] 64), so a tree that is legal
 //!    here is legal on the wire later and the bus arc adds a decoder rather than a second model.
-//! 2. **A BAR COMPOSE.** [`bar_boxes`] reports the title boxes of the frontmost publishing window,
-//!    right of the caption slot; [`super::menubar::compose_row`] overlays them into the bar's own
-//!    face. No focused window, or a focused window with no tree, means no boxes and a bar that looks
-//!    exactly as it did before this arc.
+//! 2. **A BAR COMPOSE.** [`bar_boxes`] reports the title boxes of the FOCUSED window — the same row
+//!    the bar's caption names (MENUOWN) — right of that caption; [`super::menubar::compose_row`]
+//!    overlays them into the bar's own face. No focused window, or a focused window with no tree,
+//!    means no tenant boxes and a bar that looks exactly as it did before this arc.
 //! 3. **A DROPDOWN.** [`compose`] paints it through [`super::strip::paint`] and erases it through
 //!    [`super::strip::erase_rect`] — the SHARD dropdown's own discipline, with the SHARD dropdown's own
 //!    row metrics, imported from [`super::crystal`] rather than re-derived here.
@@ -226,8 +226,13 @@ static BAR_OWNER: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 /// input path — so a press on the app title never takes the window table's lock to find out which
 /// row `Quit` must reap.
 ///
-/// NOT the same window as [`BAR_OWNER`]: that is the frontmost PUBLISHER and this is the frontmost
-/// FOCUSED row, and they differ whenever a window with menus sits behind a window without them.
+/// MENUOWN — since 2026-09-07 this is the SAME window as [`BAR_OWNER`] whenever that one is set:
+/// both are the frontmost focused row, and `BAR_OWNER` is additionally filtered by whether the row
+/// publishes. The two statics stay separate because they answer different questions — *which name
+/// is on the bar* and *whose menus are on the bar* — and a window with a name but no menus makes
+/// the second [`wm::WIN_NONE`] while the first is live. They can no longer name DIFFERENT windows.
+/// (They used to: `BAR_OWNER` was the frontmost PUBLISHER, so a window with menus sitting BEHIND a
+/// window without them put one app's `View` beside another app's name. That is the render9 defect.)
 static APP_OWNER: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 /// SO3 — the caption's bytes, as two words. [`wm::MAX_TITLE`] is 16 (asserted at the file's foot),
 /// so the whole name fits in a pair of atomics and the app title box is laid out, hit-tested and
@@ -659,7 +664,9 @@ pub struct BarSnapshot {
     pub busy: bool,
     /// The open title, 1-based; `0` is closed.
     pub open: usize,
-    /// The window the TENANT boxes belong to (the frontmost publisher).
+    /// The window the TENANT boxes belong to: the FOCUSED window, when it publishes a tree
+    /// (MENUOWN). [`wm::WIN_NONE`] when the focused window has no menus of its own, which lays out
+    /// the app box and nothing else.
     pub owner: wm::WinId,
     /// SO3 — box `0` is the APP MENU (the bar's own caption), so the tenant's published titles start
     /// at box 1. `false` when there is no focused window to name one for, in which case box 0 is the
@@ -734,6 +741,76 @@ impl BarSnapshot {
         &self.label[k][..self.label_len[k]]
     }
 
+    /// MENUOWN — **the item row, rendered for the wire.** See [`BarItems`].
+    #[inline]
+    pub fn items(&self) -> BarItems<'_> {
+        BarItems(self)
+    }
+}
+
+/// MENUOWN — **the bar's item row as one wire field**: `app:console@22+75,View@97+48`, or `none`.
+///
+/// A borrowing [`core::fmt::Display`] wrapper rather than a formatted buffer, because the whole
+/// point of this field is that it costs a quiet desktop NOTHING: [`super::menubar::compose`] emits
+/// it only when the row actually changes, and until then no glyph of it is ever produced. A
+/// `[u8; N]` scratch would have to be filled on every pass to be available on the rare one.
+///
+/// Each entry is `LABEL@X+W` with `X`/`W` panel-ABSOLUTE, so a capture states where every menu item
+/// was laid out without a pixel measurement — which is the whole reason this exists. Before MENUOWN
+/// the bar's layout was GLASS-ONLY: `render9` put `View` at a fixed `x=187` under two different app
+/// names and the wire said nothing at all, so the defect survived a flight and had to be decoded off
+/// a PNG. The app box carries an `app:` prefix because it is the WM's box, not a tenant's, and the
+/// two are laid out by different rules.
+pub struct BarItems<'a>(&'a BarSnapshot);
+
+impl core::fmt::Display for BarItems<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.0;
+        if s.n == 0 {
+            return f.write_str("none");
+        }
+        for k in 0..s.n {
+            if k > 0 {
+                f.write_str(",")?;
+            }
+            if s.is_app_box(k) {
+                f.write_str("app:")?;
+            }
+            // ASCII by construction — `publish` refuses a label this registry did not vet, and the
+            // caption is the kernel's own copy of the title. A stray high byte prints as its escape
+            // rather than as a malformed UTF-8 sequence on the wire.
+            for &b in s.label_of(k) {
+                f.write_str(core::str::from_utf8(core::slice::from_ref(&b)).unwrap_or("?"))?;
+            }
+            write!(f, "@{}+{}", s.x[k], s.w[k])?;
+        }
+        Ok(())
+    }
+}
+
+impl BarSnapshot {
+    /// MENUOWN — the layout's own change key: the two owners and the boxes, folded to one word.
+    ///
+    /// DELIBERATELY NOT [`signature`](Self::signature): that one drives the bar's REPAINT and folds
+    /// in `open`, so it moves every time a menu is dropped or dismissed and would make this witness
+    /// speak on gestures that changed no layout. This key moves when — and only when — the bar
+    /// starts showing a different app's menus or lays an item out at a different column, which is
+    /// exactly the pair of defects it exists to report.
+    pub fn owner_key(&self, cap_owner: wm::WinId) -> u64 {
+        let mut h = strip::FNV_BASIS;
+        h = strip::fnv1a_u64(h, cap_owner as u64);
+        h = strip::fnv1a_u64(h, self.owner as u64);
+        h = strip::fnv1a_u64(h, self.n as u64);
+        for k in 0..self.n {
+            h = strip::fnv1a_u64(h, self.x[k] as u64);
+            h = strip::fnv1a_u64(h, self.w[k] as u64);
+            for &b in self.label_of(k) {
+                h = strip::fnv1a(h, b);
+            }
+        }
+        strip::seal(h)
+    }
+
     /// The snapshot reduced to one integer, for the bar's damage test. The bar repaints when a title
     /// appears, moves, is relabelled, or opens — and on nothing else.
     pub fn signature(&self) -> u64 {
@@ -754,10 +831,12 @@ impl BarSnapshot {
 
 /// **THE accessor**: the title boxes on a `pw` x `ph` panel.
 ///
-/// Laid out left to right from [`super::menubar::menus_x0`] — a FIXED offset past the caption slot,
-/// not past the caption's rendered width. A caption changing length must not make the menus dance
-/// under the operator's hand, and a fixed slot is the only layout in which the box a press lands in
-/// is the box the previous frame drew.
+/// Laid out left to right from the APP TITLE BOX's right edge (MENUOWN), so an app's menus sit one
+/// constant gap after its name however long the name is — macOS's rule, and the fix for Peter's
+/// *"spaced incorrectly"* on `render9`. [`super::menubar::menus_x0`] is the fallback for a bar with
+/// no caption to follow. The box a press lands in is the box the previous frame drew because THIS
+/// function is the single source for the painter, the hit test and the dropdown anchor alike — not
+/// because the column is a constant.
 ///
 /// A title that would collide with the clock is DROPPED, not squeezed: the strip constructors'
 /// decline rule. So a narrow panel shows the titles that fit and says so through `n`.
@@ -813,7 +892,22 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     };
     if let Some(tree) = tree {
         s.owner = owner;
-        let mut x = bx + menubar::menus_x0();
+        // MENUOWN — **the titles follow the APP TITLE BOX, not a fixed column.** Peter, render9:
+        // *"spaced incorrectly"*. `menus_x0()` was an absolute offset (181 px on the bench panel),
+        // so the visible gap between the app name and its first menu was a function of how long the
+        // name happened to be — 97 px after `console`, 105 after `quarry`, measured off the capture.
+        // Anchoring on the app box's RIGHT EDGE makes that gap `2 * TPAD` always: this box's own
+        // left padding plus the app box's right padding, which is `strip::PAD` — the same gap the
+        // crystal already keeps from the caption. One spacing rule across the whole bar, and it is
+        // derived from the kit's existing constant rather than a new number.
+        //
+        // The fallback is the app box's own origin, for a window with menus and no name: the titles
+        // then start where a caption would have, not 153 px into empty chrome.
+        let mut x = if s.app {
+            s.x[0] + s.w[0]
+        } else {
+            (bx + menubar::menus_x0()).saturating_sub(TPAD)
+        };
         for t in tree.titles.iter().take(MENU_TITLES_MAX) {
             let l = t.label.as_bytes();
             let w = l.len() * CELL_W + 2 * TPAD;
@@ -1271,7 +1365,8 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return false;
     }
     // SO3 — **the BRAND MARK keeps its corner.** Before this arc the title boxes began at
-    // `menus_x0()` (193 px in) and could not reach the crystal; the app box begins one `TPAD` before
+    // `menus_x0()`, then an absolute 193 px in (MENUOWN has since made that accessor the no-caption
+    // FALLBACK anchor and the titles follow the app box), and could not reach the crystal; the app box begins one `TPAD` before
     // the caption's glyphs (22 px — 28 − TPAD 6, since CRYSTALFIX 1046f81c; was 34 under bb513370), and `crystal_corner_abs` runs to `TITLE_X0` (28 = CRYSTAL_SLOT, since 1046f81c; was 40) — so six pixels
     // now belong to two surfaces, and `strip::press_route` asks THIS arm first. Declining them keeps
     // the SHARD menu reachable at every pixel it has always been reachable at; what is lost is six

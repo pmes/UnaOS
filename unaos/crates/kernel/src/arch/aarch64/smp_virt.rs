@@ -341,7 +341,14 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     //   * BEFORE `sched::secondary_run(core)`, which never returns.
     //
     // Knob-off this whole block does not exist and the AP path is the untouched EL2 one.
-    #[cfg(feature = "orinel1ap")]
+    //
+    // ORIN-APSRUN (orin 23) — the same block, no longer capped at one claimant. Peter: "WE ARE STILL
+    // ONLY ON ONE CORE". Everything above this point already worked on all five (`AP N online`, then
+    // `c{N} timer PPI live`, then `run()`); what pinned every EL0 tenant to core 0 was that only the
+    // BSP was ever MEASURED at EL1, so `el1cores=0x1` and `el0_placement_possible` had one candidate.
+    // Lifting `boot_tegra::EL1AP_SEATS` from 1 to unbounded is the whole behavioural change; this
+    // call site is byte-for-byte the ORIN-EL1AP one apart from its `#[cfg]` and its witnesses.
+    #[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
     if unsafe { super::boot_tegra::drop_ap_to_el1(core) } {
         // At EL1 now, DAIF masked, TPIDR_EL1 UNKNOWN, VBAR_EL1 unset. These four statements are the
         // BSP's own post-drop terminus (`main.rs`), for the same reasons and in the same order.
@@ -364,6 +371,26 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
         );
     }
     timer::arm_this_core_ap();
+    // ORIN-APSRUN witness 1 of 2 — THIS core's own periodic CNTP is armed, and the line says at which
+    // EL, so a capture can tell an EL1 participant from an EL2 one without cross-referencing the
+    // `[el1ap] LANDED` line above. Emitted AFTER `arm_this_core_ap` returns, so it reports the arm
+    // rather than predicting it: `enable_ppi` has written this core's own redistributor
+    // `GICR_ISENABLER0` (resolved live from MPIDR, which the drop re-seeded through VMPIDR_EL2) and
+    // `CNTP_CTL_EL0.ENABLE` is set — legal at EL1 only because the drop set CNTHCTL_EL2.EL1PCEN.
+    //
+    // FAIL SHAPE, stated here because this is where a capture will stop: a boot that prints this line
+    // for cpu N and then goes silent means the PPI fired into a core that was not ready for it. The
+    // ordering that prevents it is three statements up — `percpu::init` (TPIDR_EL1) then
+    // `exceptions::install` (VBAR_EL1) then `enable_irq`, all strictly before this arm — so a hang
+    // here indicts one of those three, not the timer.
+    #[cfg(feature = "apsrun")]
+    serial_println!(
+        ":: [apsrun] cpu {} tick armed — periodic CNTP at EL{} ({} Hz, PPI{}), own redistributor, local-only clock ::",
+        core,
+        exceptions::current_el(),
+        timer::TICK_HZ,
+        timer::TIMER_INTID
+    );
 
     // ORIN-SMP-RUN: enter the preemptive scheduler `run()` loop instead of the old `note_core_idle`
     // + WFI park. `secondary_run` sets `ONLINE[core]` first thing, so this formerly-parked secondary
@@ -377,6 +404,19 @@ extern "C" fn __secondary_rust_virt(_advisory: u64) -> ! {
     // counts it): inside `run()` it breaks the idle WFI so newly-placed/stealable work is picked up.
     // With JC3 the AP's own tick is now a SECOND, self-driven wake (belt and braces with the poke),
     // so work is picked up within a tick even if a cross-core poke is slow/lost. Never returns.
+    //
+    // ORIN-APSRUN witness 2 of 2 — the join, printed on the statement BEFORE the one that never
+    // returns, so its absence is as informative as its presence: a core that printed `tick armed` and
+    // never printed this one died between the two. It carries `el1cores` as the running total, so the
+    // capture reads the mask GROWING (0x3, 0x7, 0xf, 0x1f, 0x3f) instead of only its final value on a
+    // line printed by a different core minutes later.
+    #[cfg(feature = "apsrun")]
+    serial_println!(
+        ":: [apsrun] cpu {} joins run() at EL{} — el1cores={:#x} (EL0 placement candidate; ORIN-APSRUN) ::",
+        core,
+        exceptions::current_el(),
+        sched::el1_core_mask()
+    );
     sched::secondary_run(core)
 }
 
@@ -972,12 +1012,24 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
         bsp_ipi_after
     );
 
-    // AP periodic ticks stay DEFERRED here for the same reason as the virt path (a second core arming
-    // the shared tick clock would double-count the wall-clock budgets; JC3). The APs park on SGIs, and
-    // the boot core proceeds to the JM6 EL1 drop + CAPSTONE below.
+    // STALE-PROSE REPAIR (ORIN-APSRUN, orin 23). This line used to end "AP timer PPI stretch deferred
+    // (JC3)" and the accompanying comment said the APs park on SGIs. BOTH WERE FALSE AT THE TIME THEY
+    // WERE READ, and the falsehood cost a diagnosis: the render11 baton reasoned from this very line
+    // that the secondaries were parked tickless after CPU_ON. They are not. JC3 PROMOTED the stretch —
+    // `__secondary_rust_virt` calls `timer::arm_this_core_ap`, which registers the core in
+    // `AP_LOCAL_TICK` (so it advances only its own `percpu.ticks`, never the shared `TICKS`/`ms()`
+    // clock the deferral was ever about) and then enters `sched::secondary_run`. The SAME render11
+    // capture that carries this line also carries `:: AARCH64 SMP: c1..c5 timer PPI live (tick 1) ::`,
+    // five times, which is `on_tick`'s own first-tick witness on each of those cores.
+    //
+    // The BSP cannot honestly report the AP state here in any case — it prints this before the APs
+    // have reached their arm — so the line now says only what the BSP knows (how many checked in) and
+    // NAMES the witnesses that answer the rest. "The wire may not lose lines" cuts both ways: a line
+    // that asserts a state it did not measure is worse than no line, because it is believed.
     serial_println!(
-        ":: AARCH64 SMP: ORIN-SMP-3 {}/{} secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP \
-         timer PPI stretch deferred (JC3) ::",
+        ":: AARCH64 SMP: ORIN-SMP-3 {}/{} secondaries online via PSCI CPU_ON (DTB /cpus oracle); each AP \
+         arms its OWN local-only tick + enters run() on its own path — see `c<N> timer PPI live` and \
+         `[apsrun] cpu <N> joins run()` ::",
         online,
         n_secondaries
     );

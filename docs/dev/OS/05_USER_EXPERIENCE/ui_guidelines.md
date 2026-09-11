@@ -48,3 +48,86 @@ USB HID keeps `EVENT_QUEUE` and every line of its focus routing untouched — th
 **Witnesses.**
 * `[serfocus] serial-in accepted=… delivered=… dropped=… held=… high=… cap=… focus=… app=…` — the live census, ~2 Hz, printed only when a byte is actually delivered. `accepted == delivered + held` always. `focus=<non-zero>` with `delivered` climbing *is* the claim, stated on the wire. Deliberately **not** `witness`-gated: it is silent by construction on every boot nobody is typing on, and the flashable `./arroyo kernel8` image an attended bench boots must carry the strings the bench is there to read.
 * `[serfocus] split … :: PASS ::` — the QEMU fixture (`witness`-gated, `main::serial_focus_selftest`). raspi4b's `-serial file:` chardev is write-only, so nothing can be typed under QEMU; the fixture drives the pipeline from the `shell_inbox::offer` seam `input_service` calls, exactly as `input_router_selftest` drives the router from `push_event` rather than from a USB keypress. Four legs: focus does not divert (the real router routes 0), order preserved across a ring wrap, the storm bounded at `CAP` with a `GUI_SENT` delta of **zero**, and what survives a storm is the first `CAP` bytes in order.
+
+## 7. A window title is a NAME (WINTITLE)
+
+Peter's ruling at the glass, render11, 2026-09-08: *"VUG WINDOW NAMES ARE DUMB AND WINDOW TITLES
+NUMERICALLY SEQUENCED IS FOR UNTITLED DOCS ETC"*.
+
+**The defect.** Both arch window seams (`arch/x86_64/syscall.rs` and `arch/aarch64/syscall.rs`, in
+`mod wc_shim`'s `create`) built a title out of their own table row index:
+
+```rust
+let title = [b'e', b'l', b'0', b' ', b'w', b'i', b'n', b' ', b'0' + (id as u8 % 10)];
+```
+
+So every program launched from the shell came up titled `el0 win 0`, `el0 win 1`, `el0 win 2`. That
+is a generated label carrying a sequence number — not the application's name, and wearing the one
+piece of typography reserved for a nameless document.
+
+**The rule.** A title is a name, resolved in this order at exactly one site
+(`video::wm::mint_title`, whose only caller is `create_inner`, so a window cannot be titled by any
+other path):
+
+| # | `from=` | title |
+|---|---|---|
+| 1 | `program` | the launched program's own name: the launch path's basename with its extension dropped, in the case the operator wrote it (`/apps/VUG.ELF` → `VUG`) |
+| 2 | `unnamed` | `Application` — an EL0 window whose launcher armed no name. A noun, **never** a number, so several unnamed programs read the same word |
+| 3 | `document` | `Untitled`, `Untitled 1`, `Untitled 2` (`wm::untitled_document`) — **the only numbered titles in the system**, and only for a document with no name |
+| 4 | `declared` | the name the creating module declared at its `create` / `create_at` call site. Built-in tenants are their own declarers: `Console`, `Shell`, `Pulse`, `Quarry`, `Install UnaOS` |
+
+**An app window never carries a numeric suffix**, however many instances of that program are open:
+two VUG windows are both `VUG`. Numbering belongs to documents.
+
+**There is no ELF-declared name, and no manifest format was invented to make one.** The ring-3 ABI
+(`crates/una-abi/src/lib.rs`) carries syscall numbers and info-page offsets and nothing else;
+`SYS_WIN_CREATE` takes `(w, h)` — an app never supplies its own title, deliberately, so a program
+cannot paint something that looks like another window's frame. No ELF note or section is read on the
+load path. Clause 1 is therefore the program's FILE name, which is the name the operator typed. If
+an ABI ever grows a declared-name field it becomes clause 0 and reports `from=declared`; the witness
+vocabulary already has the word.
+
+**Naming a launch.** A launcher that resolves a path to an image calls
+`wm::app_name_arm(wm::owner_of_launch(handle), path)` immediately after the spawn returns, and
+`wm::app_name_forget(...)` when it retires the job. Armed today: the shell's `bg` and its bare-name
+launch (`shell.rs`), Quarry's double-click (`video/quarry/live.rs`), and the x86 desktop app
+(`video/desktop_uefi.rs`). ⚠ `owner_of_launch` exists because **the two arches return different
+things from `spawn_user_image_bg`** — x86 returns `mapped.slot` (0-based) while aarch64 returns
+`ttbr0 >> 48`, which is `slot + 1` — so the same handle is off by one against the compositor's owner
+namespace. Normalising the two seams is owed (LEDGER SO22).
+
+**The wire.** The source of every title on the glass is readable from a capture rather than believed
+from a screenshot — and it rides the `[wm] alloc` line the window system already prints once per
+create, appended to it:
+
+```
+[wm] alloc win=1 gen=4 owner=0x1 title="VUG" from=program
+```
+
+⚠ **Appended, not printed beside it, and that is a measured constraint rather than a preference.**
+The first cut of this arc added a second `serial_println!` next to the alloc witness. One extra
+routed-console print per create is one extra composite driven from inside `wm::create_inner`, and it
+cost the furniture its compose passes for the rest of the boot: on `UNAOS_WC=1 ./arroyo test`,
+`[dock] selftest passes=44` fell to `passes=4` and `[crystal] selftest passes=7` to `passes=0`,
+reddening `:: DOCK: … vacate=false` and `:: WINMENU: … app_box=false` — two fixtures with nothing to
+do with titles — while the title fixture itself passed. A/B at the same sha: the pre-arc tree exits
+0 on that command, the two-print tree exits 1. **A per-create fact goes on that line, never on a new
+one.** It therefore inherits that witness's terms: the first `WINID_LOG_MAX` (32) creates of a boot,
+and only on a build that has window furniture (`wc` on x86, `desktop_firmware` on aarch64) — which is
+every build that has a title bar for a title to appear in.
+
+**The fixture.** `wm::wintitle_selftest`, `witness`-gated and folded at the tail of
+`hittest_selftest` — the one `wm` battery both arch selftest drivers run, so one fold covers x86 and
+aarch64. Seven legs: the `program_name` derivation; the document sequence; the seam label resolving
+to a noun with **no digit in it**; an armed owner taking its program's name; **two windows of one
+program carrying the same title**; a declared name surviving verbatim with the document form still
+recognised; and the wiring end-to-end — a real `create` over a seam label, read back out of the
+window ROW rather than out of a helper's return value. `app_name_forget` is asserted too: the owner
+falls back to the unnamed clause it started at. Its verdict:
+
+```
+:: WINTITLE: program_name=1 document=1 label=1 seam="el0 win " program=1 no-seq=1 declared=1 row=1 forget=1 PASS ::
+```
+
+A full window table makes `row=skip` — that leg alone, never the verdict, so the six legs already
+measured are not thrown away and the wire is never silent about a fixture that ran.

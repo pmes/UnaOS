@@ -342,8 +342,15 @@ Quarry moves to EL0 the day these are true. Nothing here is Quarry's own work.
 
 M2 adds two, both of which are about what a double-click on a NON-program should do:
 
-7. **An opener registry**, and something to open a document WITH. There is none of either today: no
-   association table, no viewer, no editor. A double-click on `CONFIG.TXT` therefore does nothing and
+7. **An opener registry**, and something to open a document WITH. ~~There is none of either today: no
+   association table, no viewer, no editor.~~ **HALF LANDED (ORIN-FACET, 2026-09-08).** There is now a
+   VIEWER — [`facet.md`](facet.md), UnaOS's image viewer, `UNAOS_FACET=1` — and a double-click or
+   `<Enter>` on a `.PNG` row opens it: `activate_row` yields `Act::View(path)` and `run_act` latches
+   it for `facet::service()`. What has NOT landed is the **registry**: the routing test is one
+   `cfg`-gated arm asking `facet::is_png_name`, which is the right shape for the first opener and the
+   wrong shape for the second. An association table is what item 7 still means, and it is owed the
+   moment a `.TXT` viewer or a second image format exists.
+   Every other extension is unchanged: a double-click on `CONFIG.TXT` still does nothing and still
    says so on the wire (`[quarry] open UNHANDLED path=… — no opener exists in this tree`), which is
    the honest posture — "broken" and "not built yet" must be tellable apart.
 8. **`SYS_EXEC` with an argv**, so an opener could be *handed* the path it is meant to open.

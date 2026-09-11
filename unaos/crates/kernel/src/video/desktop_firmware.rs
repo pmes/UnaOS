@@ -417,6 +417,18 @@ pub fn activate() -> bool {
             super::quarry::is_open()
         );
     }
+    // 7. FACET — the image viewer, when `UNAOS_FACET=1` (or `deskcascade`) armed it. It is ANNOUNCED
+    //    here and OPENED by a gesture, and that difference from every tenant above is deliberate: a
+    //    viewer with no document is not a window, it is an empty frame. So `activate` mints no row
+    //    and the desktop states that an OPENER now exists — the first one this tree has ever had
+    //    (`quarry::run_act`'s `Act::NoOpener` census line was, until this arc, the whole truth about
+    //    double-clicking a document). The door is Quarry's list pane; `facet::open_path` is reached
+    //    from `Act::View`, outside the model lock. LAST, after Quarry, because the sentence below is
+    //    about a window that one has to be open to reach.
+    #[cfg(feature = "facet")]
+    serial_println!(
+        "[pidesk] facet ARMED — double-click (or press <Enter> on) a .PNG in the file manager and the image opens in its own window, titled with the FILE's name (R36); the close disc frees the surface"
+    );
 
     // ── THE LIVE-CONSOLE DECISION, and the measurement that settled it ──────────────────────────
     //

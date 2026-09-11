@@ -1983,7 +1983,7 @@ pub fn panel_console_window_open() -> wm::WinId {
         cw as u32,
         ch as u32,
         stride as u32,
-        b"console",
+        b"Console",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );

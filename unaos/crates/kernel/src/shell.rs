@@ -1869,7 +1869,56 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     if let Some(vol) = unmounted_reserved_volume(&mt.prefixes(), path) {
         return Err(alloc::format!("volume {} not mounted (-ENODEV)", vol));
     }
-    let st = mt.stat(path).map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
+    // HOMESOIL (orin 22): the CHILD NAMES `path` gets purely from the mount table — the first
+    // component of every mount prefix that lives strictly below it. `/boot` and `/volumes` when
+    // listing `/`; `UNAOS-PI` and `Untitled` when listing `/volumes`. Boundary-matched the way the
+    // resolver matches (the prefix must end where a `/` begins, so `/vol` never claims `/volumes`),
+    // and only for prefixes that are actually bound, so an absent stick contributes no row (honest
+    // hot-plug, doc §6).
+    //
+    // Before HOMESOIL a mount point was always ONE component deep, so this took the whole tail.
+    // `/volumes/<NAME>` is two, and taking the whole tail would have produced a row literally named
+    // `volumes/UNAOS-PI` under `/` and nothing at all under `/volumes`.
+    let base = if path == "/" { "" } else { path.trim_end_matches('/') };
+    let mut synth: Vec<String> = Vec::new();
+    for pfx in mt.prefixes() {
+        if pfx == "/" {
+            continue;
+        }
+        let Some(tail) = pfx.strip_prefix(base) else { continue };
+        if !tail.starts_with('/') {
+            continue; // `/vol` is not a parent of `/volumes` — the boundary must be a separator
+        }
+        let name = tail.trim_start_matches('/');
+        let head = name.split('/').next().unwrap_or(name);
+        if !head.is_empty() && !synth.iter().any(|s| s == head) {
+            synth.push(String::from(head));
+        }
+    }
+
+    let st = match mt.stat(path) {
+        Ok(st) => st,
+        // HOMESOIL: `/volumes` is an ANCESTOR of mount points and not a mount itself, so no backend
+        // can stat it — and answering `-ENOENT` for a directory whose children are mounted and
+        // browsable would be a lie. A path that no backend has but that at least one mount hangs
+        // under lists exactly those mounts, and nothing else.
+        Err(e) => {
+            if synth.is_empty() {
+                return Err(alloc::format!("{}: {}", path, vfs_err(e)));
+            }
+            let mut rows: Vec<DirEnt> = synth
+                .iter()
+                .map(|n| DirEnt {
+                    name: n.clone(),
+                    kind: NodeKind::Dir,
+                    size: 0,
+                    mtime: None,
+                })
+                .collect();
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
+            return Ok((true, rows));
+        }
+    };
     if !matches!(st.kind, NodeKind::Dir) {
         let leaf = String::from(path.rsplit('/').next().unwrap_or(path));
         return Ok((false, alloc::vec![DirEnt {
@@ -1882,24 +1931,14 @@ pub(crate) fn vfs_ls_collect(path: &str) -> Result<(bool, Vec<crate::fs::vfs::Di
     let mut rows = mt
         .read_dir(path)
         .map_err(|e| alloc::format!("{}: {}", path, vfs_err(e)))?;
-    // Mount points immediately below `path` — `/boot` and `/usb` when listing `/`. Boundary-matched
-    // the way the resolver matches, and only for prefixes that are actually bound, so an absent
-    // stick contributes no row (honest hot-plug, doc §6).
-    let base = if path == "/" { "" } else { path };
-    for pfx in mt.prefixes() {
-        if pfx == "/" {
-            continue;
-        }
-        if let Some(tail) = pfx.strip_prefix(base) {
-            let name = tail.trim_start_matches('/');
-            if !name.is_empty() && !name.contains('/') && !rows.iter().any(|r| r.name == name) {
-                rows.push(DirEnt {
-                    name: String::from(name),
-                    kind: NodeKind::Dir,
-                    size: 0,
-                    mtime: None,
-                });
-            }
+    for name in synth.iter() {
+        if !rows.iter().any(|r| &r.name == name) {
+            rows.push(DirEnt {
+                name: name.clone(),
+                kind: NodeKind::Dir,
+                size: 0,
+                mtime: None,
+            });
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3793,10 +3832,12 @@ pub fn vfsroute_witness() {
     // --- leg 6: THE ALIASING SHAPE ITSELF (VOLID, orin 18 — rmbp 15 condition C1) -----------------
     //
     // C1 is not a property of any prefix a particular board happens to mount: it is ONE MEDIUM
-    // BOUND TWICE UNDER TWO DIFFERENT NAMES. `sdmmc_root_bind` does exactly that on the Orin —
-    // `FatBackend::new_tegra_sd("card", …)` at `/` and `new_tegra_sd("fat", …)` at `/boot` — and
-    // `same_volume` compared the two NAMES, so one physical card read as two volumes and
-    // `mv /A.TXT /boot/B.TXT` was refused as cross-volume on the exact configuration render9 flies.
+    // BOUND TWICE UNDER TWO DIFFERENT NAMES. The retired per-board root knob did exactly that on
+    // the Orin — the card typed `"card"` at `/` and `"fat"` at `/boot` — and `same_volume` compared
+    // the two NAMES, so one physical card read as two volumes and `mv /A.TXT /boot/B.TXT` was
+    // refused as cross-volume on the exact configuration render9 flies. BOOTROOT (orin 22) mounts
+    // the found boot disk under ONE name at every prefix it binds, so no live table types that
+    // shape today — which is precisely why this leg still has to build it.
     //
     // NO BOARD THIS GATE CAN BOOT MOUNTS THAT SHAPE. x86 binds both prefixes under the SAME name
     // and therefore answered correctly by luck; the Pi's two prefixes are genuinely two volumes.
@@ -6671,7 +6712,7 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
     };
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, asid, entry)) => {
+        Ok((pid, asid, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
             // reports the table full — a close-box press retires the kernel row without telling this
@@ -6799,7 +6840,7 @@ fn bg_kill_cmd(console: &mut Console, pid: u64) {
     drop(jobs); // bg_kill yields while confirming; never hold the table lock across that.
     let verdict = crate::arch::syscall::bg_kill(job.pid, job.asid);
     console.println(&alloc::format!("kill: pid {}: {}", pid, verdict));
-    if verdict.starts_with("killed") {
+    if verdict.starts_with("killed") { crate::video::wm::app_name_forget(crate::video::wm::owner_of_launch(job.asid)); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The shell armed this name (`bg_program` / `bare_exec`), so the shell retires it: owners are recycled slot aliases, and a name left behind by a killed program would title the slot's NEXT tenant. The complete cover is a call from the arch slot-teardown seam, which is out of this arc's lane and owed — see `wm::app_name_forget`.
         // The kernel reaped the row; the shell's entry is now the only stale handle. Drop it.
         let mut jobs = BG_JOBS.lock();
         for slot in jobs.iter_mut() {
@@ -7092,7 +7133,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // loader re-validates from scratch regardless.
     let n = bytes.len();
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, slot, entry)) => {
+        Ok((pid, slot, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
             if !adopt_bg_job(pid, slot, &canon) {
                 // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
                 // and `kill` could never name. Same rule `bg` follows, same reason.
@@ -7144,9 +7185,19 @@ fn vfs_path(arg: &str) -> String {
 /// `ls` and `cat` carry two bodies, and Peter's ruling is that they should carry none: a mounted
 /// filesystem is listable because it implements the backend trait, whatever the board.
 ///
-/// **aarch64** binds `/` = native UnaFS, `/boot` = the SD boot partition, and `/usb` = the stick when
-/// it is actually enumerated (honest hot-plug, doc §6). The Orin's ROOTFS knob re-points both `/` and
-/// `/boot` at the Tegra card, since this machine has neither of the first two volumes.
+/// **aarch64** (BOOTROOT, orin 22 — ONE body for both aarch64 boards, and no board `cfg` in it)
+/// asks [`crate::fs::bootdisk`] which disk this kernel is RUNNING FROM, and binds THAT one. The
+/// finder is told nothing: it enumerates every disk the board has and compares the running kernel's
+/// own `.text` window against candidate files until it finds itself. `/boot` is the FAT volume it
+/// was found in, `/apps` is that same volume rooted at `APPS/` under the same volume NAME, and `/`
+/// is that disk's native UnaFS volume when it has one, else the same FAT volume. Nothing found ⇒
+/// the table stays EMPTY and the verbs answer `-ENODEV`; two disks carrying this kernel ⇒ REFUSE.
+/// `/usb` is still bound after it, and still only when the stick is actually enumerated.
+///
+/// This replaced two answers written down in advance: an unconditional `NativeBackend` at `/`
+/// (right for the Pi, a dead mount on the Orin — ledger A28) and the Orin's `sdmmcroot` knob, which
+/// named the Tegra card. Peter, 2026-09-08: "boot cold, boot dumb, presume nothing about the
+/// machine, even though we keep booting the same machine."
 ///
 /// **x86** binds THE PROGRAM SOURCE — `crate::drivers::block::program_source`, resolved through
 /// [`open_read_volume`] so the READ_BIND instrument is stamped exactly as it was when each verb
@@ -7154,34 +7205,38 @@ fn vfs_path(arg: &str) -> String {
 /// same handle, and on a machine booted from the internal SD reader the global slot is the wrong
 /// one. It is bound at BOTH `/` and `/boot`, because `/boot` is the spelling the packaging text, the
 /// staged-image script and `exec_resolve`'s second probe all use for that one volume — the same
-/// two-prefix shape `sdmmc_root_bind` already uses on the Orin, and honest for the same reason
+/// two-prefix shape the aarch64 arm uses on the Orin, and honest for the same reason
 /// (`/boot` IS a mount point, so `ls /` showing it is a fact, not decoration).
 ///
 /// An arch with no volume at all returns an EMPTY table, and the verbs report "no filesystem
 /// mounted (-ENODEV)" — which is a better answer than the pre-VFSROUTE `no FAT filesystem (NoDisk)`
 /// because it does not name a filesystem the operator never asked about.
 pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
-    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    use crate::fs::vfs::MountTable;
     #[allow(unused_mut)]
     let mut mt = MountTable::new();
     #[cfg(target_arch = "aarch64")]
     {
-        use crate::fs::vfs::NativeBackend;
-        mt.mount("/", alloc::boxed::Box::new(NativeBackend::new("native")));
-        mt.mount("/boot", alloc::boxed::Box::new(FatBackend::new("fat", KERNEL_PRINCIPAL, true)));
-        // LAYOUT (orin 18): `/apps` is the SAME volume as `/boot`, rooted at its `APPS/` directory —
-        // so it carries `/boot`'s volume NAME, not a third one. A distinct name here would make
-        // `same_volume("/boot", "/apps")` answer false about one card, which is the aliasing defect
-        // (rmbp 15 C1) in a new spelling.
-        mt.mount("/apps", alloc::boxed::Box::new(
-            FatBackend::new("fat", KERNEL_PRINCIPAL, true).rooted(crate::fs::fat::APPS_DIR))); #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmcroot"))] crate::arch::aarch64::sdmmc_tegra::sdmmc_root_bind(&mut mt); // ROOTFS (orin 16, A28): on the Orin `/` (native UnaFS) and `/boot` (BlockSource::Default) BOTH name volumes this machine does not have, so `ls /` answered `backend error: unafs-mount`; this re-points ALL THREE at the card's FAT through BlockSource::TegraSd (`/boot` and `/apps` too, because `/apps` is EXEC_ROOT and the literal prefix of /apps/VUG.ELF etc). See arch/aarch64/sdmmc_tegra.rs §ROOTFS.
-        // VFS-3: bind the USB stick at /usb only when it is present (honest hot-plug).
-        if crate::fs::fat::mount_source(crate::fs::fat::BlockSource::Usb).is_ok() {
-            mt.mount("/usb", alloc::boxed::Box::new(FatBackend::new_usb("usb", KERNEL_PRINCIPAL)));
-        }
+        // BOOTROOT (orin 22): `/`, `/boot` and `/apps` over the disk this kernel was FOUND on. The
+        // LAYOUT (orin 18) rule that `/apps` carries `/boot`'s volume NAME lives inside `bind` with
+        // the rest of the layout — one place, so `same_volume("/boot", "/apps")` cannot drift.
+        // Binds no ROOT when the walk found no kernel: that is the honest answer and the verbs say
+        // `-ENODEV`.
+        //
+        // HOMESOIL (orin 22): the same call also mounts EVERY OTHER enumerated disk that carries a
+        // FAT volume, at `/volumes/<the volume's own label>` with that source's OWN write posture.
+        // VFS-3's separate `/usb` bind USED TO STAND HERE and is gone — not deleted, absorbed: the
+        // same volume, the same posture and the same present-only condition, under the name the
+        // person holding the card gave it instead of the bus it happens to hang off (Peter: "/usb0
+        // and /usb1 are meaningless outside the kernel"). It moved inside `bind` because the name
+        // assignment has to see every disk at once to break collisions, and because a disk deduped
+        // away as an alias of the root's device (the Orin's card, published under both `Default` and
+        // `Usb`) must not be mounted beside itself.
+        crate::fs::bootdisk::bind(&mut mt);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
         // FATVERB: the program source, and its READ_BIND stamp, in the one place a verb now binds.
         if let Ok(fs) = open_read_volume() {
             let src = fs.source();
@@ -7231,9 +7286,29 @@ fn vfs_say(console: &mut Console, line: &str) {
 /// found no FAT and `/usb` never bound) fell through to native-root create,
 /// which failed resolving the parent `/usb` as a native path and said
 /// "no such file or directory (-ENOENT)". That misdirection cost bench time; the
-/// honest answer is that the *volume* is not mounted. `/` (native) is excluded —
-/// it is always mounted and is the legitimate fall-through for un-prefixed paths.
-const RESERVED_VOLUME_PREFIXES: &[&str] = &["/usb", "/boot"];
+/// honest answer is that the *volume* is not mounted.
+///
+/// ⚠ **`/` IS NOT ON THIS LIST, AND "it is always mounted" IS NO LONGER WHY.**
+/// That sentence stood here until BOOTROOT (orin 22) and is now false: the
+/// aarch64 arm of [`vfs_mount_table`] binds `/` only when
+/// [`crate::fs::bootdisk`] actually FOUND the disk this kernel is running from,
+/// and a boot that finds nothing gets an EMPTY table on purpose — never a guess
+/// at another disk. `/` stays off the list because the honest answer for that
+/// case is already produced one step later and is a BETTER sentence:
+/// [`vfs_read_target`] and its write twin test `mt.prefixes().is_empty()` and
+/// return `"<verb>: no filesystem mounted (-ENODEV)"` (with the `[fatverb] …
+/// NO VOLUME` witness beside it, carrying the handle census). Naming `/` here
+/// would answer "volume / not mounted" for the same condition — narrower, and
+/// wrong about which thing is missing, since what is missing is every volume.
+/// The list keeps exactly the prefixes that can be absent while OTHERS are
+/// present, which is the case this mechanism was built for.
+// HOMESOIL (orin 22): `/usb` LEAVES this list, because the path no longer exists in the vocabulary.
+// A non-root disk mounts at `/volumes/<its own label>`, so there is no fixed path for "the stick"
+// to be reported missing at — `ls /usb` on a machine with a stick in it would have answered "volume
+// /usb not mounted (-ENODEV)" about a volume that IS mounted, one directory over. `/volumes` does
+// NOT take its place: it is an ancestor `vfs_ls_collect` lists synthetically, and putting it here
+// would make it report ENODEV whenever it is not itself a mount, which is always.
+const RESERVED_VOLUME_PREFIXES: &[&str] = &["/boot"];
 
 /// VFS-4: if `path` targets a reserved volume prefix (see
 /// [`RESERVED_VOLUME_PREFIXES`]) that is not present in the live `mounted`

@@ -653,6 +653,19 @@ compares the two resolved backends and returns `Unsupported` when they differ. `
 gave for the native/FAT pair, now true for every pair of volumes the machine will ever mount.
 
 #### 13.2.1 What "the same volume" means (VOLID, orin 18 — rmbp 15 condition C1)
+> **SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** The per-board root knob this
+> section describes — `UNAOS_SDMMCROOT=1` / cargo `sdmmcroot`, its file-tail section in
+> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::TegraSd` constructor in `fs/vfs.rs`
+> and its statement in `shell::vfs_mount_table` — is DELETED. Nothing below is edited away: the rows
+> record what was true and why, and remain the history of how the fault was found. What replaces it
+> is `fs/bootdisk.rs`: the kernel is told nothing about where it came from, brings up every disk
+> driver the board has, enumerates every FAT volume on every source, and finds the ONE file whose
+> bytes are this running kernel's own `.text` window. That disk is the hard drive; `/`, `/boot` and
+> `/apps` bind to it. Zero disks or no match prints one witness naming what was looked for and what
+> was found, and the mount table is EMPTY (the verbs answer `-ENODEV`); two or more matches REFUSE
+> rather than guess. No board, slot, bus, serial, card geometry, boot method or knob is in the
+> decision.
+
 
 That comparison has been three different things, and only the third is an identity:
 
@@ -812,3 +825,285 @@ Call sites: aarch64 after `emmc2::probe()` (the `midden_witness` tail), x86 from
 `fatverb_storage_witness` — the two moments each board actually has volumes to route to.
 `midden_witness`'s own x86 site is at boot step 5, before `pci::init` and the storage publish, where
 a routing leg would assert against an empty namespace and be dead rather than quiet.
+
+
+## 14. BOOTROOT (orin 22) — what `/` IS, and why the kernel is not told
+
+§4's namespace of record answered "what is mounted where" with a per-board table. This section
+replaces the aarch64 half of that answer with a question the kernel asks the machine at run time.
+
+### 14.1 The direction
+
+Peter, 2026-09-08: *"It is an OS booting off an SD card. The card is the hard drive. Every boot is
+stone cold — no prefs, no special checks. Boot cold, boot dumb, presume nothing about the machine,
+even though we keep booting the same machine."* The Pi/Orin difference *"should not matter in either
+case."* And on being handed the boot medium's identity by a loader: *"WTF does it matter what method
+I choose to boot? You are assuming too much."*
+
+So: the kernel is **not told** where it came from. It brings up every disk driver the board has
+(none behind a knob), enumerates the disks, and finds the one that has THIS KERNEL on it, by
+content. That disk is the hard drive. **No board, slot, bus, serial, card geometry, boot method or
+knob is in the decision**, and `crates/kernel/src/fs/bootdisk.rs` carries no board `cfg` anywhere.
+
+What it replaced was two answers written down in advance: an unconditional `NativeBackend` at `/`
+(right for the Pi, a dead mount on the Orin — ledger A28, `ls /` answering `backend error:
+unafs-mount`) and the Orin's `sdmmcroot` knob, which named the Tegra card. Both are deleted.
+
+### 14.2 The window, and why it is `.text` at `_start`
+
+`WINDOW` is **4096 bytes starting at the symbol `_start`**, and the two things compared are the
+bytes at `_start` in the running kernel's memory and the bytes at the corresponding file offset in a
+candidate file. Three properties make that symbol the right one, each measured rather than assumed:
+
+* **It exists on all three link layouts** — x86 UEFI, aarch64 UEFI, and the Pi's flat bare-metal
+  image, where `global_asm!` places it in `.text.boot` and `pi-baremetal.ld` puts that first at the
+  load address. It is `#[unsafe(no_mangle)]` in every one, which is how a LIBRARY module names a
+  symbol defined in the BINARY crate.
+* **It IS the image entry point**, so it doubles as the anchor that maps runtime addresses to file
+  offsets with no second assumption. On the aarch64 image `readelf -h` reports entry `0x64790` and
+  `readelf -s` reports `_start` at `0x64790`.
+* **`.text` is the only section whose bytes are the same in the file and in RAM.** Never
+  `.bss`/`.data`: on the Pi the VideoCore firmware loads `kernel8.img` FLAT and early boot zeroes
+  BSS and writes into the image region long before any VFS work. And it survives PIE relocation:
+  the aarch64 kernel is `Type: DYN`, and `readelf -r` reports ZERO relocations whose offset falls in
+  the `R E` segment `[0x61000, 0x150fb4)`.
+
+### 14.3 The test, per candidate file
+
+Every file with `size >= WINDOW` is a candidate; nothing about its name, extension, size or
+directory is consulted. Its first bytes classify it:
+
+* **ELF** (`\x7fELF`, 64-bit LE): parse `e_entry`, `e_phoff`, `e_phentsize`, `e_phnum`, read the
+  program-header table (bounded, from further sectors when it does not sit in the first), and find
+  the `PT_LOAD` containing the window. With `bias = _start_runtime - e_entry`, a segment's runtime
+  base is `p_vaddr + bias` and the window's file offset is
+  `p_offset + (window_runtime - (p_vaddr + bias))`, bounds-checked against `p_filesz`.
+* **flat image**: entry at file offset 0 by the convention this OS's own build uses for one, so
+  `file_off = window_runtime - _start_runtime`.
+
+`WINDOW` bytes are then read with `FatFs::read_at` — a BOUNDED range read, never a whole file — and
+compared. A candidate that is some *other* program (`VUG.ELF`, `STAT.ELF`) parses fine and yields an
+offset computed from ITS entry; the bytes there are not this kernel's `.text`, so it does not match.
+
+### 14.4 Counting — per DISK, and another one is HOME SOIL (HOMESOIL)
+
+Peter, 2026-09-08: *"booting dumb means booting dumb. If it sees another UnaOS disk it is home soil
+and nothing more."* And, on why the two must not be tied together: *"not making assumptions and not
+tying them together, possibly staining the testing of the newer version."*
+
+The walk visits every source and does not stop at the first hit. What it counts is **DISKS — block
+DEVICES — not files**.
+
+| what the machine has | outcome |
+|----------------------|---------|
+| one disk carries this kernel | bind it, `matches=1` |
+| several disks carry it | the **FIRST in enumeration order is root**; every other one is HOME SOIL, mounted like any other non-root disk (§14.5a). `matches=N home=<src:path,…>` names them all. **No refusal.** |
+| two copies on ONE disk | one disk ⇒ bind, and the witness says `files=2`. A decoy beside the real image changes nothing about which medium this kernel came off. |
+| none | `[vfs] root -> NONE reason=…`, no `/`, `/boot` or `/apps` — the verbs answer `-ENODEV` (`vfs_read_target`, `shell.rs`). Never a guess at another disk. The non-root disks are still mounted: they are home soil whether or not a root was found, which is also what carries VFS-3's hot-plug behaviour forward. |
+
+`reason` is one of `no-disk-enumerated`, `kernel-not-found-on-any-volume`, `walk-cap-hit` — so "no
+disk at all", "disks but not this kernel" and "the walk ran out of budget before it could say" are
+three different sentences, not one. **`reason=multiple-kernels` was this module's answer for one
+afternoon and is DELETED from the vocabulary**, in the code and here: refusing to boot because a
+second UnaOS card is plugged in is an assumption about the machine, which is the thing §14.1 exists
+not to make. The loader's serial is not consulted by any of this (§14.7).
+
+#### 14.4a One disk can wear two names — dedupe by DEVICE
+
+`drivers::block::publish_usb_geometry`'s `#[cfg(not(all(target_arch = "aarch64", feature =
+"baremetal")))]` variant — the one the **tegra** build compiles — stores the *same*
+`BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and `USB_BLOCK_DEVICE` (read as
+`Usb`). One card, two source names. A walk keyed on the source would count it as two disks and mount
+it beside itself.
+
+`bootdisk::DiskId` = `(num_blocks, BS_VolID)` — the geometry `fat::source_blocks` reports plus the
+mounted volume's own serial from `FatFs::volume_fingerprint` — is the CANDIDATE key, and it is a
+question rather than an answer. Both fields are read from the *medium*, which is what makes two
+handles onto one card agree; it is also what makes two **clones** agree. A card imaged byte-for-byte
+from another carries the same `BS_VolID` and the same size, so a dedupe keyed on content alone
+merges two real devices into one, hides the second from `/volumes`, and prints a witness claiming —
+falsely — that one device wore two names.
+
+**Identity comes from the ENUMERATOR, never from the bytes.** The answer is `fat::same_device`, the
+one predicate the kernel has for this question:
+
+```rust
+pub fn same_device(a: &BlockDeviceInfo, b: &BlockDeviceInfo) -> bool {
+    a.slot_id != 0 && a.slot_id == b.slot_id && a.num_blocks == b.num_blocks
+}
+```
+
+`slot_id` is a registry fact — the xHCI slot the device enumerated on. A replug lands on a new slot,
+two live devices never share one, and a clone cannot forge one. `num_blocks` closes the residual
+slot-id-reuse window (a freed slot handed to some other, differently sized device does not match).
+`drivers::block::BlockDeviceId` is deliberately **not** the key: its first field is `handle`, which
+is exactly what differs between the two names for the one card.
+
+The `slot_id != 0` clause is not an edge case, it is the Pi. `register_sd`, `register_sdhc` and
+`register_tegra_sd` all stamp `slot_id: 0`, the xHCI "no slot" sentinel: a card that never
+enumerated on a bus carries no enumerator identity at all, so two zero-slot sources are never
+*proven* to be one device and the predicate refuses first, ahead of any comparison.
+
+`bootdisk::admit` therefore collapses two sources into one disk — walked once, mounted once,
+`aliased=usb->global` on the wire — only when that predicate proves it. Equal content **without**
+the proof admits BOTH and says so: the `aliased=` field takes a third value,
+`aliased=ambiguous:global?usb`. Two friends who look alike are two friends. Nothing is dropped
+silently in either branch, and root stays first-found — mounting is not exclusive.
+
+`video::prtscr::usb_backed` is the predicate's second caller. It compared `slot_id` inline until the
+same arc; routing it through `fat::same_device` is a deliberate tightening (it gains the
+`num_blocks` check and the explicit slot-0 guard), and it is the point of having one predicate:
+two same-device tests that can drift apart is the defect class this closes.
+
+`fs/bootdisk.rs`'s `homesoil_selftest` leg 5 executes all of it on synthetic `BlockDeviceInfo`
+records that differ only in `slot_id` — a single-card QEMU machine can present neither a clone nor a
+second slot — and carries a positive control on `same_device`, because a predicate that answered
+`false` to everything would satisfy the negative clauses for free.
+
+### 14.5 The layout over that disk
+
+`/boot` is the FAT volume the kernel was found in. `/apps` is the SAME volume rooted at `APPS/`,
+under the **same volume NAME** — a distinct name would make `same_volume("/boot", "/apps")` answer
+false about one card, which is §13.2.1's C1 aliasing defect in a new spelling. `/` is that disk's
+native UnaFS volume when it has one *and* the shared `unafs::MOUNT` is riding that disk; otherwise
+`/boot`'s volume, so a card carrying only a FAT volume still has a root.
+
+#### 14.5a The other disks — home soil, at `/volumes/<NAME>`, with their OWN write posture
+
+Peter, 2026-09-08: *"what if the disk has a label? here again you are hard coding — `/usb0` and
+`/usb1` are meaningless outside the kernel."*
+
+Every enumerated disk that carries a FAT volume and is not the root is mounted at
+**`/volumes/<NAME>`**, where NAME is the volume's own label read off the medium. **No bus, slot or
+index appears in any path.** Which controller a card hangs off is the kernel's business; the witness
+still carries `source=`, which is where that fact belongs. `/`, `/boot` and `/apps` are unchanged.
+
+`/volumes` itself is **not a mount** — it is an ancestor of mounts. `shell::vfs_ls_collect` lists
+such a path synthetically from the mount table (the first component of every prefix strictly below
+it), so `ls /` shows `volumes` and `ls /volumes` shows the cards, and quarry gets the same rows
+through the same seam. `/usb` therefore leaves `RESERVED_VOLUME_PREFIXES`: it named a path nothing
+mounts any more, and reporting `-ENODEV` for it while the stick sits mounted one directory over
+would be a false statement.
+
+##### The NAME rule (Peter, 2026-09-08: *"joe user might get scared by some crazy disk name … a name containing illegal possibly even harmful volume name meant to overflow memory"*)
+
+* **Source** — `FatFs::label_raw`: the root directory's `ATTR_VOLUME_ID` entry when the volume has
+  one, else the BPB's `BS_VolLab` (formatters write the directory entry and a rename updates only
+  that one, so the directory entry wins). Both are **fixed 11-byte fields** and both come back as
+  `[u8; 11]`. **No length is ever read from the medium**, so an overflow is impossible by
+  construction rather than by check — there is no length to get wrong.
+* **Unnamed is a KNOWN VALUE, not an absence** — all-spaces, or the conventional `NO NAME`
+  placeholder, mount as `/volumes/Untitled`. **The serial never appears in a path**; it is on the
+  witness line, where an operator who wants it will look and a file manager cannot alarm anyone with
+  it.
+* **Sanitize by WHITELIST** — `A`–`Z`, `a`–`z`, `0`–`9`, space, and the punctuation FAT permits in a
+  label (`` ! # $ % & ' ( ) - @ ^ _ ` { } ~ ``). Every other byte becomes `_`: control bytes, `/`,
+  `\`, NUL, `:`, `*`, `?`, `"`, `<`, `>`, `|`, and everything ≥ 0x80. Trailing pad (space or NUL) is
+  trimmed first, so `UNAOS` does not become `UNAOS______`. `.` is **not** in the charset, so `..`
+  sanitizes to `__` and no `.`/`..` special case is written — a guard for it could not fire, and the
+  live predicate is asserted instead (leg 3 below).
+* **Collisions get a numeric suffix** — `Untitled`, `Untitled 1`, `Untitled 2` (the macOS shape), in
+  enumeration order. A suffix is a fact about this machine, not about the card, so it is not an
+  alteration.
+* **`label_raw=<22 hex>` appears only when a byte was altered.** Its PRESENCE is the signal: an
+  honest card's line stays short, a card whose label is trying something shows all 11 bytes,
+  un-interpreted.
+
+##### A friend's UnaFS volume
+
+Checked at the declaration site (`unaos/libs/fs/unafs/src/superblock.rs`, `pub struct Superblock`):
+the fields are `magic`, `version`, `block_size`, `block_count`, `root_inode`, `catalog_inode` —
+**UnaFS carries no volume label**. So there is no name to mount a friend's UnaFS volume under, and
+inventing one is what the rule above forbids. It is announced and left alone:
+`[vfs] unafs volume on global — unnamed, not mounted ::`. When UnaFS grows a volume name, the same
+naming rules apply and this becomes a mount.
+
+The posture is **the source's own**, sampled from the very `FatBackend` that gets mounted —
+`rw = !FatBackend::read_only()`, which forwards to `BlockSource::write_veto`:
+
+* `Usb` is **writable** (the Pi's verified BOT WRITE(10) path). Forcing a read-only mount here would
+  be a behaviour change on the Pi, so it is not done.
+* `TegraSd` is vetoed in every cfg, so the Orin's slot card is read-only **by the veto**, not by
+  this mount.
+* `Default` is **conditional** on FRGUARD's `default_writable()` — a RUNTIME state, not a property
+  of the volume. So there is no fixed `rw=` expectation for a `Default`-sourced mount anywhere, in
+  code or in a spec row; the assertion available is consistency *within one call*.
+
+One witness line per mount: `[vfs] volume mounted /volumes/UNAOS-PI source=global rw=yes ::`.
+**Nothing on a non-root disk influences root.** VFS-3's separate `/usb` bind in
+`shell::vfs_mount_table` is gone — not deleted, absorbed: same volume, same posture, same
+present-only condition, under the name the person holding the card gave it, and now a second stick
+or the Orin's slot card gets one too.
+
+The middle clause is not a formality. `unafs::MOUNT` is handle-DISCOVERING (UNAFSBIND): it probes
+`bind_probe_candidates()` in enum order and `Global` wins outright whenever it holds a volume. On a
+machine where two disks carry UnaFS volumes the shared mount may therefore be riding a *different*
+disk from the one the kernel booted off, and binding `NativeBackend` at `/` there would root the
+system on a medium it did not come from. Building a second live mount to avoid that is exactly what
+`unafs::mount_on`'s own doc forbids (a K4 write-coherence hazard). So it is neither: the witness
+says `unafs=present-on-other-handle` and `/` falls back to the FAT volume.
+
+### 14.6 The witness, and what it proved
+
+One line, on the first build of the mount table (the result is cached — the mount table is rebuilt
+per verb, the walk is not). Measured on `./arroyo kernel8-test 300`:
+
+```
+[vfs] root = boot volume serial=0x8b657eb1 source=global match=/KERNEL8.IMG unafs=present
+  matches=1 home=- files=1 aliased=- window_off=0x80000 window_len=4096 file_off=0x0
+  candidates=12 disks=global=present usb=absent sdhc=unbuilt tegra-sd=unbuilt ::
+```
+
+Fields may be INSERTED, never renamed — the flight scorer parses `serial=`, `source=` and `reason=`.
+
+Mutations, each reverted, establish that the comparison is the thing deciding:
+
+| mutation | result |
+|----------|--------|
+| flip ONE byte of `KERNEL8.IMG` on the card, inside the window | `NONE reason=kernel-not-found-on-any-volume matches=0` |
+| add `DECOY.IMG`, a byte-identical copy, to the same volume | binds, `matches=1 files=2` — one disk is one disk (HOMESOIL; this mutation REFUSED before §14.4 was rewritten) |
+| corrupt the MEMORY side (`window_addr() + 1`) and rebuild | `NONE reason=kernel-not-found-on-any-volume`, and `pi4-regression.spec` fell to 121/125 with 15 forbidden hits |
+
+The third is also the proof that the clean 125/125 is not vacuous: the Pi battery genuinely gates on
+a bound root.
+
+**What QEMU cannot show, and how it is covered instead.** The `raspi4b` machine models NO PCI bus
+(`-device qemu-xhci` ⇒ *"No 'PCI' bus found"*) and the Pi image is built `skip_xhci`, so a SECOND
+disk cannot be attached to the leg that exercises the finder end to end — and `test-arm`, which does
+have xHCI, never builds a mount table at all. Nor can that machine present a card whose LABEL is
+hostile. So those legs are executed at unit level instead of reasoned about: `bootdisk::admit`,
+`plan`, `sanitize_label` and `next_volume_point` are pure over their inputs, and a `witness`-gated
+`homesoil_selftest` drives them with SYNTHETIC devices and SYNTHETIC label bytes on the real call
+path, printing four uncounted lines beside the root witness:
+
+```
+:: HOMESOIL: two-disks root_ix=Some(0) matches=2 others=1 point=/volumes/SPARE :: PASS ::
+:: HOMESOIL: alias disks=1 aliases=1 root_ix=Some(0) others=0 :: PASS ::
+:: HOMESOIL: names UNAOS-PI blank=Untitled noname=Untitled dots=__ evil=______ AB \
+   raw=2e2e002f7fff4142202020 points /volumes/Untitled /volumes/Untitled 1 \
+   /volumes/UNAOS-PI /volumes/UNAOS-PI 1 :: PASS ::
+:: HOMESOIL: posture global=rw usb=rw (rw == !read_only, one sample per source) :: PASS ::
+```
+
+Leg 3 is the RED-first one: it feeds the exact byte sequence the amendment names (`..`, NUL, `/`,
+DEL, and a byte ≥ 0x80) and asserts on the PRODUCED string that every byte is in the whitelist and
+no separator survived — the resolver never sees one. It also asserts the live predicate
+`!label_byte_ok(b'.')`, which is what lets `sanitize_label` carry no `.`/`..` case: if the whitelist
+ever admits `.`, this fails here rather than in a path resolver. Leg 4 asserts CONSISTENCY WITHIN
+ONE CALL and prints what it read — never a fixed expectation per source, for the
+`default_writable()` reason in §14.5a.
+
+> ⚠ **The four lines above are the shapes this build emits, NOT a capture.** The `/volumes` rewrite
+> landed under the frozen-design rule (one `./arroyo check` gate, no QEMU legs), so `kernel8-test`
+> has not been re-run since §14.5a changed. The root-witness capture and the mutation table above it
+> are from the `/usb`-era build and remain valid for everything they name except the mount line's
+> spelling. Re-running `kernel8-test` and re-quoting these four lines is on the post-metal list.
+
+### 14.7 The seam that is NOT the root key
+
+`drivers::block::BOOT_VOLUME_SERIAL` and its accessors are un-gated for every arch in this arc, and
+`fat::locate_boot_volume(serial) -> Option<BlockSource>` is the one arch-neutral lookup over them.
+Neither decides anything about `/`. They exist for INSTALL-SELF and FRGUARD, which must know which
+volume the loader came off so they can refuse to erase or substitute it. `shell::vfs_mount_table`
+deliberately does not call `locate_boot_volume`: a serial the firmware handed over is precisely the
+assumption §14.1 exists to avoid making.

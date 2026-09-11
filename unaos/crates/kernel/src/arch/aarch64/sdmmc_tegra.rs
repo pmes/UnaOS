@@ -34,7 +34,7 @@
 // ## The Tegra vendor-quirk assumptions this READ-ONLY recon relies on (documented; metal-pending)
 //
 //  1. The firmware/BPMP has already ENABLED the sdmmc1 module clock + pad power and left the slot's
-//     rails up (the bootloader read the card to boot). We do NOT program the CAR/BPMP clock, and we
+//     rails up — a statement about the SLOT at handover, implying NOTHING about which medium the loader READ; the parenthetical that used to stand here said otherwise and the wire contradicts it (see LOADER-MEDIUM at this file's tail). We do NOT program the CAR/BPMP clock, and we
 //     AUTHOR no Tegra vendor pad-control value (>= 0x100) — we drive ONLY the standard SDHCI
 //     internal-clock divider (CONTROL1) off whatever base clock the controller already has running. If
 //     metal shows the internal clock never stabilises (CLK_STABLE never sets), the diagnosis is "the
@@ -73,6 +73,149 @@
 /// block, exactly as NET-4 uses `:: PCIE4:`.
 const PS: &str = ":: SDMMC:";
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// CSD capacity decode — PURE, and deliberately outside `mod metal`.
+//
+// QEMU models no Tegra234 SDHCI, so nothing in the identification ladder can be exercised off metal
+// — except this. The CSD arithmetic is the one part of the ladder that is a function of bits rather
+// than of a controller, and it is also the part where a wrong answer is a plausible-looking capacity
+// instead of a visible failure. Factored out here so `csd_capacity_selftest` can gate it under QEMU.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Extract bit range `[hi:lo]` from a 136-bit R2 response (CID or CSD). SDHCI strips the CRC byte and
+/// shifts the 120-bit content right 8, so register bit `b` (b >= 8) lands at overall response bit
+/// `b-8` (the classic off-by-8 — identical for CID and CSD). `resp[i]` holds response bits
+/// `[32i+31 : 32i]`.
+fn r2_bits(resp: &[u32; 4], hi: u32, lo: u32) -> u64 {
+    let mut val = 0u64;
+    let mut b = hi;
+    loop {
+        let r = b - 8;
+        let bit = (resp[(r / 32) as usize] >> (r % 32)) & 1;
+        val = (val << 1) | bit as u64;
+        if b == lo {
+            break;
+        }
+        b -= 1;
+    }
+    val
+}
+
+/// Decode a card's capacity in 512-byte blocks from its CMD9 CSD (the four SDHCI response registers),
+/// returning `(blocks, csd_version)`.
+///
+/// * **CSD v2** (`CSD_STRUCTURE = 1`; SDHC/SDXC) — capacity is one field:
+///   `blocks = (C_SIZE[69:48] + 1) * 1024`. READ_BL_LEN is fixed at 9 and takes no part.
+/// * **CSD v1** (`CSD_STRUCTURE = 0`; SDSC) — capacity is a product of three:
+///   `blocks = (C_SIZE[73:62] + 1) * 2^(C_SIZE_MULT[49:47] + 2) * 2^READ_BL_LEN[83:80] / 512`.
+///   READ_BL_LEN is legally 9, 10 or 11 (512/1024/2048), and the ordinary 2 GB SDSC spelling uses
+///   **10** — which is why a v1 CSD read with the v2 formula does not come out visibly broken, it
+///   comes out as a different plausible card.
+///
+/// Returns `None` — never a guess — for a CSD that names no usable layout or capacity: a reserved
+/// `CSD_STRUCTURE` (2 or 3), an out-of-range READ_BL_LEN, an overflowing product, or a decoded zero.
+/// This is deliberately stricter than the "anything that is not 1 is v1" spelling it replaces: a
+/// reserved structure means the field offsets are unknown, and decoding unknown offsets is how a
+/// census invents a card. The caller prints the refusal with the raw `CSD_STRUCTURE` beside it, so
+/// the operator sees the card the driver could not read rather than a silent absence.
+fn csd_capacity_blocks(csd: &[u32; 4]) -> Option<(u64, u8)> {
+    match r2_bits(csd, 127, 126) {
+        1 => {
+            let c_size = r2_bits(csd, 69, 48);
+            let blocks = (c_size + 1).checked_mul(1024)?;
+            if blocks == 0 {
+                return None;
+            }
+            Some((blocks, 2u8))
+        }
+        0 => {
+            let read_bl_len = r2_bits(csd, 83, 80) as u32;
+            if !(9..=11).contains(&read_bl_len) {
+                return None;
+            }
+            let c_size = r2_bits(csd, 73, 62);
+            let c_size_mult = r2_bits(csd, 49, 47) as u32;
+            let mult = 1u64 << (c_size_mult + 2);
+            let block_len = 1u64 << read_bl_len;
+            let blocks = (c_size + 1).checked_mul(mult)?.checked_mul(block_len)? / 512;
+            if blocks == 0 {
+                return None;
+            }
+            Some((blocks, 1u8))
+        }
+        _ => None,
+    }
+}
+
+/// SDCSD fixture: the CSD capacity decode's known-answer tests. Runs on ANY `sdmmc` build — metal or
+/// QEMU virt — because it touches no controller, which is the whole reason the decode was factored
+/// out. One uncounted `:: SDCSD: … ::` line; no MMIO, no allocation, no card.
+///
+/// Both vectors are built FIELD BY FIELD through `put`, which uses the same off-by-8 addressing
+/// `r2_bits` reads through, so the fixture exercises the production extractor rather than a second
+/// copy of it. Built rather than pasted as opaque words so a reader can check each field placement
+/// against the spec table without a decoder:
+///
+/// * **v1 (SDSC)** — `READ_BL_LEN=10, C_SIZE=3813, C_SIZE_MULT=7` ⇒ 3905536 blocks (1907 MiB). That
+///   is the ordinary 2 GB SDSC spelling, and the class of card in the Orin's slot on render12 boot 2
+///   (a 1.9 GB FAT volume labelled `UNAOS-DATA`) — the boot that exposed the ladder's v1.x stop.
+/// * **v2 (SDHC)** — `C_SIZE=121811` ⇒ 124735488 blocks. The C_SIZE is BACK-DERIVED from a capacity
+///   this bench actually measured (`[sdhc] verify mbr … CSD capacity 124735488 blocks`, Pi 4 capture
+///   `~/unaos-bench/capture/pi4-r23s1u/ttyACM0.log`). No capture on this bench has ever printed the
+///   raw CSD response words, so the surrounding bits are CONSTRUCTED per the spec and only the
+///   capacity field is bench-sourced. Said out loud rather than presented as a captured vector.
+///
+/// Two negative controls ride with them — a reserved `CSD_STRUCTURE` and an illegal `READ_BL_LEN`,
+/// both of which must be REFUSED. Without them a decode that returned a number for every input would
+/// pass: the corpus has to be able to produce more than one outcome.
+#[cfg(feature = "witness")]
+pub fn csd_capacity_selftest() {
+    /// Place `val` into response bits `[hi:lo]` of a 136-bit R2 image. ORs, never clears — the vectors
+    /// below start from zero, and the negative controls deliberately widen a field they inherit.
+    fn put(resp: &mut [u32; 4], hi: u32, lo: u32, val: u64) {
+        let mut b = lo;
+        let mut i = 0u32;
+        while b <= hi {
+            if (val >> i) & 1 != 0 {
+                let r = b - 8;
+                resp[(r / 32) as usize] |= 1 << (r % 32);
+            }
+            b += 1;
+            i += 1;
+        }
+    }
+
+    let mut v1 = [0u32; 4];
+    put(&mut v1, 127, 126, 0); // CSD_STRUCTURE = 0 (v1.0)
+    put(&mut v1, 83, 80, 10); // READ_BL_LEN = 10 => 1024-byte read block
+    put(&mut v1, 73, 62, 3813); // C_SIZE
+    put(&mut v1, 49, 47, 7); // C_SIZE_MULT = 7 => mult 2^9
+
+    let mut v2 = [0u32; 4];
+    put(&mut v2, 127, 126, 1); // CSD_STRUCTURE = 1 (v2.0)
+    put(&mut v2, 83, 80, 9); // READ_BL_LEN fixed at 9; takes no part in the v2 formula
+    put(&mut v2, 69, 48, 121_811); // C_SIZE
+
+    // Negative controls, each a one-field mutation of the v1 vector.
+    let mut bad_struct = v1;
+    put(&mut bad_struct, 127, 126, 3); // reserved CSD_STRUCTURE
+    let mut bad_bl = v1;
+    put(&mut bad_bl, 83, 80, 15); // READ_BL_LEN outside the legal 9..=11
+
+    let a = csd_capacity_blocks(&v1);
+    let b = csd_capacity_blocks(&v2);
+    let refused = csd_capacity_blocks(&bad_struct).is_none() as u32
+        + csd_capacity_blocks(&bad_bl).is_none() as u32;
+    let pass = a == Some((3_905_536, 1)) && b == Some((124_735_488, 2)) && refused == 2;
+    serial_println!(
+        ":: SDCSD: v1={} v2={} refused={}/2 -> {} ::",
+        a.map(|(n, _)| n).unwrap_or(0),
+        b.map(|(n, _)| n).unwrap_or(0),
+        refused,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
 // ── The witness half (virt / non-tegra build): one honest line, zero MMIO ──────────────────────────
 
 /// The QEMU-safe witness: on a `sdmmc`-but-not-`tegra` build (QEMU models no Tegra234 SDMMC controller),
@@ -85,6 +228,10 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
         "{} ORIN-SDMMC-1 Tegra234 microSD recon compiled; no Tegra234 SDMMC on this build (QEMU virt) — recon is metal-only (UNAOS_SDMMC=1 UNAOS_TEGRA=1) ::",
         PS
     );
+    // SDCSD: the one part of the identification ladder that needs no controller. It runs HERE, on the
+    // virt build, because this is the only place the ladder's arithmetic can be gated off metal.
+    #[cfg(feature = "witness")]
+    csd_capacity_selftest();
     // ORIN-SDMMC-2: when the write ARM is compiled in on a virt build, one honest metal-only line — the
     // paranoia ladder touches a real Tegra234 SDMMC controller QEMU does not model, so there is nothing to
     // write here and we do zero MMIO. Mirrors the census witness above.
@@ -122,11 +269,13 @@ pub use metal::sdmmc_install_from_usb;
 // single-sector read, and its counted loop. Nothing here can write — the write path stays exclusively
 // behind the `sdmmc_arm` ladder further down this file, untouched by this seam.
 #[cfg(feature = "tegra")]
-pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; #[cfg(all(feature = "tegra", feature = "sdmmcroot"))] pub use metal::{sdmmc_root_bind, sdmmc_root_probe_early}; // SDMMCWRITE: the gap-#3 write probe (file tail), and ROOTFS (orin 16, A28): the VFS root bind over the card FAT (file tail) — both appended to THIS line for knob-off byte identity (no line moves). Every item precedes the one comment: a cfg placed AFTER a // compiles nothing (the A9/PRTSCR-ORIN lesson; knob-hygiene.sh probes for it).
+pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; // SDMMCWRITE: the gap-#3 write probe (file tail), appended to THIS line for knob-off byte identity (no line moves). BOOTROOT (orin 22) removed the second export that stood on this line — the ROOTFS knob's card-at-`/` bind and its early probe, both deleted with the file-tail section they came from. The root is no longer bound by a per-board knob: `fs::bootdisk` finds the disk that carries THIS kernel and binds that one, on every board. Every item precedes the one comment: a cfg placed AFTER a // compiles nothing (the A9/PRTSCR-ORIN lesson; knob-hygiene.sh probes for it).
 
 #[cfg(feature = "tegra")]
 mod metal {
-    use super::PS;
+    // `r2_bits` and `csd_capacity_blocks` live at FILE scope, not here: the CSD arithmetic is the only
+    // part of the ladder QEMU can execute, so it had to leave the `tegra`-gated module to be gatable.
+    use super::{csd_capacity_blocks, r2_bits, PS};
     use crate::arch::aarch64::fdt_tegra::{Fdt, PropWords};
 
     // ── SDHCI register offsets (32-bit views — identical to the Pi `emmc2` model, standard SDHCI) ──
@@ -183,6 +332,12 @@ mod metal {
     const ST_CMD_INHIBIT: u32 = 1 << 0;
     const ST_DAT_INHIBIT: u32 = 1 << 1;
     const ST_CARD_INSERTED: u32 = 1 << 16;
+    /// DAT[3:0] Line Signal Level and CMD Line Signal Level. An idle SD bus pulls all five HIGH, which
+    /// is how SDHCI 3.00 §3.10.1 defines "error recovery complete" after a command timeout: the SRST
+    /// bits self-clearing says the HOST finished resetting, not that the CARD let go of the bus.
+    const ST_DAT30_LEVEL: u32 = 0xf << 20;
+    const ST_CMD_LEVEL: u32 = 1 << 24;
+    const ST_BUS_IDLE: u32 = ST_DAT30_LEVEL | ST_CMD_LEVEL;
 
     // ── CONTROL1 (0x2C) bits. ──
     const C1_CLK_INTLEN: u32 = 1 << 0;
@@ -314,25 +469,6 @@ mod metal {
     #[inline]
     fn read_resp(base: u64) -> [u32; 4] {
         [read32(base, RESP0), read32(base, RESP1), read32(base, RESP2), read32(base, RESP3)]
-    }
-
-    /// Extract bit range `[hi:lo]` from a 136-bit R2 response (CID or CSD). SDHCI strips the CRC byte and
-    /// shifts the 120-bit content right 8, so register bit `b` (b >= 8) lands at overall response bit
-    /// `b-8` (the classic off-by-8 — identical for CID and CSD). `resp[i]` holds response bits
-    /// `[32i+31 : 32i]`.
-    fn r2_bits(resp: &[u32; 4], hi: u32, lo: u32) -> u64 {
-        let mut val = 0u64;
-        let mut b = hi;
-        loop {
-            let r = b - 8;
-            let bit = (resp[(r / 32) as usize] >> (r % 32)) & 1;
-            val = (val << 1) | bit as u64;
-            if b == lo {
-                break;
-            }
-            b -= 1;
-        }
-        val
     }
 
     /// Resolve the SD base clock in Hz: CAPABILITIES[15:8] MHz if nonzero, else the documented assumed
@@ -509,21 +645,68 @@ mod metal {
                 false
             }
         };
+        // 7b. SDV1: RE-IDLE before the ACMD41 loop when CMD8 went unanswered.
+        //
+        //     render12 boot 2 is the wire this exists for. A 1.9 GB SDSC card (label UNAOS-DATA) in the
+        //     Orin's slot: CMD0 ok, CMD8 timed out exactly as an SD v1.x card requires — and then the
+        //     very next command, CMD55, timed out too, with the SAME INTERRUPT (0x00018000) and an
+        //     otherwise healthy Present State. The card had gone quiet, not absent.
+        //
+        //     A card is not obliged to be responsive on the command AFTER one it does not implement, and
+        //     the fix every mature host applies is to put it back in idle before starting over: U-Boot's
+        //     `sd_send_op_cond()` opens with `mmc_go_idle(mmc)` under the comment "Some cards seem to
+        //     need this". CMD0 is broadcast, needs no response, and costs one command — so this is
+        //     unconditional recovery, not a guess about which card is in the slot. It runs only on the
+        //     v1.x branch, leaving the v2 path (which reached ACMD41 on this bench for two rounds of
+        //     boots) byte-for-byte the sequence it already flew.
+        if !sdhc_capable {
+            serial_println!(
+                "{}   M2: SD v1.x recovery — re-idling before ACMD41 (a card that has just been handed a command it does not implement need not answer the next one) ::",
+                PS
+            );
+            cmd_step(base, "CMD0 GO_IDLE (v1.x re-idle)", cmd(0) | CMD_RESP_NONE, 0)?;
+            delay_ms(2);
+        }
+
         // 8. ACMD41 loop (bounded ~1 s): CMD55 (APP_CMD) then ACMD41 (SD_SEND_OP_COND) with HCS + the
         //    3.3 V window, until power-up-busy (RESP0[31]) clears. ccs = RESP0[30].
         //    HCS (bit 30) is asserted ONLY when CMD8 was answered — a v1.x card must not be told the host
         //    supports high capacity. The loop paces itself (the card is allowed to stay busy for up to a
         //    second; hammering it back-to-back is not required and upsets some cards) and counts its
         //    rounds so the witness says how long power-up actually took.
+        //
+        //    SDV1: an unanswered CMD55 or ACMD41 is a RETRY, not the end of the ladder. The loop used to
+        //    `?` out of `cmd_step_at` on the first timeout, throwing away the ~1000 ms of power-up budget
+        //    it had just declared — so "STOP" was printed for a card that had been asked once. Both
+        //    commands now go through `cmd_retry`, and only the loop decides the ladder is over: when the
+        //    budget expires, or when the card has ignored `ACMD41_NAK_LIMIT` consecutive attempts, which
+        //    is the honest "nothing on this bus is answering the SD application-command protocol".
+        const ACMD41_NAK_LIMIT: u32 = 8;
         let acmd41_arg = if sdhc_capable { 0x40ff_8000 } else { 0x00ff_8000 };
         let acmd41_deadline = deadline_ms(ACMD41_TIMEOUT_MS);
         let mut ocr;
         let mut rounds = 0u32;
+        let mut naks = 0u32;
         loop {
             rounds += 1;
             let first = rounds == 1; // one witness for the first round; the rest are summarised below
-            cmd_step_at(base, "CMD55 APP_CMD (before ACMD41)", cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0, first)?;
-            cmd_step_at(base, "ACMD41 SD_SEND_OP_COND", cmd(41) | CMD_RESP_48, acmd41_arg, first)?;
+            // The pair is atomic by protocol: ACMD41 is only an ACMD because CMD55 immediately preceded
+            // it, so a CMD55 that went unanswered must NOT be followed by the CMD41 — that would issue
+            // the standard CMD41, which is reserved. Short-circuit `&&` is what enforces that ordering.
+            if !cmd_retry(base, "CMD55 APP_CMD (before ACMD41)", cmd(55) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK, 0, first)
+                || !cmd_retry(base, "ACMD41 SD_SEND_OP_COND", cmd(41) | CMD_RESP_48, acmd41_arg, first)
+            {
+                naks += 1;
+                if naks >= ACMD41_NAK_LIMIT || expired(acmd41_deadline) {
+                    serial_println!(
+                        "{}   M2: APP_CMD/ACMD41 unanswered on {} of {} round(s) within the {} ms power-up budget — nothing on this bus is speaking the SD application-command protocol (an MMC card answers CMD1, not ACMD41; a 1.8 V-signalling card answers neither at 3.3 V) — STOP ::",
+                        PS, naks, rounds, ACMD41_TIMEOUT_MS
+                    );
+                    return None;
+                }
+                delay_ms(10);
+                continue;
+            }
             ocr = read32(base, RESP0);
             if ocr & (1 << 31) != 0 {
                 break;
@@ -556,24 +739,17 @@ mod metal {
         // 11. CMD9 SEND_CSD (R2) — card must be in stand-by (post-CMD3, pre-CMD7). Parse capacity.
         cmd_step(base, "CMD9 SEND_CSD", cmd(9) | CMD_RESP_136 | CMD_CRCCHK, rca_arg)?;
         let csd = read_resp(base);
-        let csd_structure = r2_bits(&csd, 127, 126);
-        let (num_blocks, csd_version) = if csd_structure == 1 {
-            // CSD v2 (SDHC/SDXC): C_SIZE = CSD[69:48]; blocks = (C_SIZE+1)*1024.
-            let c_size = r2_bits(&csd, 69, 48);
-            ((c_size + 1) * 1024, 2u8)
-        } else {
-            // CSD v1 (SDSC): blocks(512) = (C_SIZE+1) * 2^(C_SIZE_MULT+2) * 2^READ_BL_LEN / 512.
-            let read_bl_len = r2_bits(&csd, 83, 80) as u32;
-            let c_size = r2_bits(&csd, 73, 62);
-            let c_size_mult = r2_bits(&csd, 49, 47) as u32;
-            let mult = 1u64 << (c_size_mult + 2);
-            let block_len = 1u64 << read_bl_len;
-            ((c_size + 1) * mult * block_len / 512, 1u8)
-        };
-        if num_blocks == 0 {
-            serial_println!("{}   M2: CSD decoded 0 capacity — STOP (won't census a zero-size card) ::", PS);
+        // SDV1: the decode is `super::csd_capacity_blocks` — one pure function, gated off metal by the
+        // SDCSD fixture, refusing rather than guessing (see its contract). The `None` arm prints the raw
+        // CSD_STRUCTURE, because "the driver could not read this card's CSD" and "there is no card" are
+        // different facts and only one of them is true here.
+        let Some((num_blocks, csd_version)) = csd_capacity_blocks(&csd) else {
+            serial_println!(
+                "{}   M2: CSD names no usable capacity (CSD_STRUCTURE={}, raw {:#010x}{:08x}{:08x}{:08x}) — STOP (won't census a card whose layout we cannot read) ::",
+                PS, r2_bits(&csd, 127, 126), csd[3], csd[2], csd[1], csd[0]
+            );
             return None;
-        }
+        };
         let mib = num_blocks * 512 / (1024 * 1024);
         serial_println!(
             "{}   M2: capacity {} blocks ({} MiB, CSD v{}), addressing {}, {} ::",
@@ -581,6 +757,16 @@ mod metal {
             if block_addressing { "block (SDHC/SDXC)" } else { "byte (SDSC)" },
             if sdhc_capable { "v2 (CMD8 ok)" } else { "legacy" }
         );
+        // SDV1: name the CLASS on its own line. The capacity line above says four things at once and a
+        // reader has to assemble the verdict from them; this says which of the two card generations the
+        // ladder just identified, in the words the bench runbook and the ledger use. The v2 arm keeps
+        // the line it always printed — this is an addition beside it, not a replacement.
+        if csd_version == 1 && !block_addressing {
+            serial_println!(
+                "{}   M2: identified SDSC v1.x card capacity={} MiB byte-addressed ::",
+                PS, mib
+            );
+        }
 
         // 12. CMD7 SELECT_CARD (R1b) -> transfer state.
         cmd_step(base, "CMD7 SELECT_CARD", cmd(7) | CMD_RESP_48_BUSY | CMD_CRCCHK | CMD_IXCHK, rca_arg)?;
@@ -2563,6 +2749,10 @@ mod metal {
             "{} ORIN-SDMMC-1 Tegra234 microSD READ-ONLY recon (DTB @{:#x} size={:#x}) ::",
             PS, dtb_addr, dtb_size
         );
+        // SDCSD: the CSD decode's KATs, run on metal too. The fixture is the SAME function the ladder
+        // below calls, so an armed metal boot certifies its own arithmetic before it touches a card.
+        #[cfg(feature = "witness")]
+        super::csd_capacity_selftest();
 
         // ── M1: resolve the microSD-slot controller from the live DTB ──
         let Some((base, size, clk_ids, n_clks)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
@@ -2778,6 +2968,20 @@ mod metal {
             serial_println!("{}   M2: CMD/DAT line reset did not self-clear (controller wedged) ::", PS);
         }
         write32(base, INTERRUPT, 0xffff_ffff);
+        // SDHCI 3.00 §3.10.1 finishes the command-timeout recovery here, not at the self-clear: the bus
+        // has recovered only when CMD and DAT[3:0] have all returned HIGH. A reset whose bits cleared
+        // while the card is still driving a line is a reset that did NOT recover the bus, and the NEXT
+        // command's timeout is then a symptom of this one rather than a fact about the card. Witnessed
+        // because that distinction is unrecoverable from a capture otherwise — render12 boot 2 showed a
+        // CMD8 timeout followed by a CMD55 timeout and there was no line saying which of the two states
+        // the bus was in between them.
+        let st = read32(base, STATUS);
+        if st & ST_BUS_IDLE != ST_BUS_IDLE {
+            serial_println!(
+                "{}   M2: CMD/DAT reset left the bus NON-IDLE (Present State {:#010x}: CMD level {}, DAT[3:0] {:#x}) — the card is still driving it ::",
+                PS, st, (st >> 24) & 1, (st >> 20) & 0xf
+            );
+        }
     }
 
     /// Issue one NAMED identification command, witnessing both outcomes. `None` (which `?` turns into the
@@ -2785,6 +2989,34 @@ mod metal {
     /// what the controller had latched — the thing boot 3 could not tell us.
     fn cmd_step(base: u64, name: &str, cmdtm: u32, arg: u32) -> Option<()> {
         cmd_step_at(base, name, cmdtm, arg, true)
+    }
+
+    /// `cmd_step` for a command that is ALLOWED to fail and be retried, returning `bool` rather than the
+    /// `Option` whose `?` ends the ladder.
+    ///
+    /// The distinction is load-bearing (SDV1, render12 boot 2): the ACMD41 power-up poll owns a whole
+    /// second of budget for the card to leave busy, but every command inside it used to go through
+    /// `cmd_step_at`, whose `?` abandoned the ladder on the FIRST unanswered CMD55 — discarding the
+    /// remaining ~1000 ms and printing "STOP" for a card that had not been given a second chance to
+    /// answer anything. A command timeout during power-up is a retry, not a verdict; the verdict is the
+    /// loop's, once the budget is spent, and it is the loop that prints it.
+    fn cmd_retry(base: u64, name: &str, cmdtm: u32, arg: u32, verbose: bool) -> bool {
+        match send_command(base, cmdtm, arg) {
+            Ok(()) => {
+                if verbose {
+                    serial_println!("{}   M2: {} ok ::", PS, name);
+                }
+                true
+            }
+            Err(int) => {
+                serial_println!(
+                    "{}   M2: {} unanswered — INTERRUPT={:#010x} PresentState={:#010x} — retrying inside the power-up budget ::",
+                    PS, name, int, read32(base, STATUS)
+                );
+                reset_cmd_dat(base);
+                false
+            }
+        }
     }
 
     /// `cmd_step` with the success line suppressed — for the ACMD41 poll, whose rounds are summarised
@@ -3258,249 +3490,30 @@ mod metal {
             );
         }
     }
-
-    // ══════════════════════════════════════════════════════════════════════════════════════════════════
-    // ROOTFS (orin 16, ledger A28) — `sdmmcroot`: give the VFS a ROOT the Orin actually has.
-    //
-    // THE FAULT. On the desktop line `shell::vfs_mount_table` binds `/` to `NativeBackend` (native
-    // UnaFS) unconditionally, because that is what the Pi has: a real UnaFS system volume on its card.
-    // The Orin's card carries only the FAT32 `UNAOS` ESP — there is no UnaFS volume for
-    // `fs::unafs::with_unafs` to mount — so EVERY enumeration of `/` returns
-    // `VfsError::Backend("unafs-mount")`, which is what `ls /` and quarry printed on render7
-    // (`[quarry] open census ERROR cwd=/ "/: backend error: unafs-mount"`). The second half of the
-    // same fault is `/boot`: `FatBackend::new` reads through `BlockSource::Default`, the GLOBALLY
-    // registered block device, and nothing on an Orin boot ever registers one (`register_sd` is the
-    // Pi's `baremetal` emmc2 arm). So the Orin had two mounts and zero volumes.
-    //
-    // THE BIND. This section is the fourth work item of `docs/dev/OS/10_INSTALL/orin-unafs-root.md`
-    // §3 ("mount + witness, behind a knob"), taken at the layer the card can actually serve TODAY:
-    // items 1 and 2 landed (the census publishes the card through `register_tegra_sd`, and
-    // `BlockSource::TegraSd` routes `fat.rs` at `read_block_tegra_sd`), item 3 — a UnaFS-formatted
-    // partition 2 — is a DESTRUCTIVE installer arc that has not run on this card. Until it does, the
-    // only filesystem on the medium is the ESP's FAT32, so that is what the root binds to:
-    //
-    //   * `/`    -> the card's FAT volume through `BlockSource::TegraSd` (read-only).
-    //   * `/boot` -> the SAME volume, same source. Not decoration: `/boot` is `shell::EXEC_ROOT` and is
-    //     spelled literally in `/apps/VUG.ELF`, `/apps/STAT.ELF`, `/apps/ELFHELLO.ELF` and quarry's
-    //     double-click route, so re-pointing it is what makes those paths reach real files instead of
-    //     `-ENOENT` off the new root.
-    //
-    // One volume, two prefixes, and the second one is why the desktop can launch anything. When the
-    // UnaFS system partition exists this section is where `/` goes back to `NativeBackend` and the FAT
-    // returns to being the boot shim §3 says it is — at `/boot`, where it already is.
-    //
-    // READ-ONLY, AND NOT BECAUSE THIS FILE SAYS SO. `BlockSource::TegraSd::write_veto` is
-    // `Some(TEGRA_SD_VETO)`, so `FatBackend::read_only()` is true and the VFS write verbs refuse
-    // before touching the block path; below that, `block::write_block_tegra_sd` refuses in EVERY cfg.
-    // Two independent refusals, neither of them this section's. The vendor pad block stays DISABLED
-    // (the FWALL SError conviction) — nothing here touches `base+0x100` or beyond, and no controller
-    // register at all: the whole section is `fat.rs` calls over the already-published read surface.
-    //
-    // COST. Every sector reaches the card as one polled CMD17 at 1-bit default speed (<= 25 MHz);
-    // `tegra_sd_read_blocks_512` is a LOOP over that primitive, because no unarmed CMD18 exists in
-    // this file (multi-block is `install_target`-gated and unproven). 512 B of payload is ~164 us of
-    // bus time at 25 MHz, so the term that decides a listing is the SECTOR COUNT, not the clock:
-    // `FatBackend::read_dir` re-probes the volume on every call (LBA 0, the MBR/GPT census, a BPB
-    // sector per accepted partition — ~4-6 sectors) and then walks the root directory chain (one FAT
-    // sector per cluster hop plus `sec_per_clus` data sectors per cluster). A 32 KiB-cluster FAT32 ESP
-    // with a single-cluster root is therefore ~70 sectors, and a listing should land in the low tens
-    // of milliseconds. `UNAOS_FATPERF=1` prints the two raw terms per operation
-    // (`[fatperf] op=list path=/ sectors=… us=…`) — measure there, do not argue from this comment.
-    // If the measured `us` makes the desktop feel slow, the fix is a CMD18 multi-block primitive
-    // behind the same seam (`tegra_sd_read_blocks_512`'s body, no change above it) or the cluster-chain
-    // cache FATFIX already names — NOT a bus-width or high-speed negotiation, which is a separate
-    // metal question on unproven Tegra pad settings.
-    // ══════════════════════════════════════════════════════════════════════════════════════════════════
-
-    /// ROOTFS: stable serial prefix for the root-bind witness family (the `WPS` idiom — subsystem-named,
-    /// never board-named, per LAWS §"Name by subsystem").
-    #[cfg(feature = "sdmmcroot")]
-    const RPS: &str = "[sdmmc] root";
-
-    /// ROOTFS verdict cache. `vfs_mount_table()` is rebuilt on EVERY routed verb (and twice per quarry
-    /// reload), and the probe below costs a full FAT volume scan in CMD17s, so the answer is computed
-    /// once and remembered. Three states so "not asked yet" is distinguishable from "asked, refused".
-    #[cfg(feature = "sdmmcroot")]
-    const ROOT_UNKNOWN: u8 = 0;
-    #[cfg(feature = "sdmmcroot")]
-    const ROOT_BOUND: u8 = 1;
-    #[cfg(feature = "sdmmcroot")]
-    const ROOT_REFUSED: u8 = 2;
-
-    #[cfg(feature = "sdmmcroot")]
-    static ROOT_VERDICT: core::sync::atomic::AtomicU8 =
-        core::sync::atomic::AtomicU8::new(ROOT_UNKNOWN);
-
-    /// ROOTFS: has the one-shot post-bind census already run? The bind itself is silent after the first
-    /// call — a per-verb witness would put a line on the wire for every `ls`, and the serial transport
-    /// is the evidence channel every gate is counted from.
-    #[cfg(feature = "sdmmcroot")]
-    static ROOT_CENSUS: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// ROOTFS: elapsed microseconds since a `now_cycles()` reading, at the virtual counter's own rate.
-    /// The `fatperf::cycles_to_us` shape (delta only — an absolute counter overflows the multiply), and
-    /// `CNTFRQ_EL0 == 0` answers 0 rather than dividing by it.
-    #[cfg(feature = "sdmmcroot")]
-    fn root_us_since(c0: u64) -> u64 {
-        let hz = crate::arch::aarch64::timer::cntfrq();
-        if hz == 0 {
-            return 0;
-        }
-        crate::arch::now_cycles().saturating_sub(c0).saturating_mul(1_000_000) / hz
-    }
-
-    /// ROOTFS: can the card's FAT volume be mounted this boot? Runs at most once. Refuses, NAMED, when
-    /// the census did not publish a card (M1/M2/M3 did not all pass, or `UNAOS_SDMMC=1` was not armed on
-    /// metal) and when the medium carries no FAT volume the driver accepts.
-    #[cfg(feature = "sdmmcroot")]
-    fn root_probe() -> u8 {
-        let blocks = tegra_sd_card_blocks();
-        if blocks == 0 {
-            serial_println!(
-                "{} -> REFUSED reason=no-published-card (the census did not reach M3 this boot; needs UNAOS_SDMMC=1 on metal) ::",
-                RPS
-            );
-            return ROOT_REFUSED;
-        }
-        let c0 = crate::arch::now_cycles();
-        match crate::fs::fat::mount_source(crate::fs::fat::BlockSource::TegraSd) {
-            Ok(fs) => {
-                let us = root_us_since(c0);
-                let (vol_id, clusters) = fs.volume_fingerprint();
-                let label = fs.label();
-                serial_println!(
-                    "{} mount source=tegra-sd card_blocks={} -> OK label=\"{}\" vol_id={:#010x} clusters={} cluster_bytes={} probe_us={} ::",
-                    RPS, blocks, label, vol_id, clusters, fs.cluster_size(), us
-                );
-                ROOT_BOUND
-            }
-            Err(e) => {
-                serial_println!(
-                    "{} -> REFUSED reason=fat-mount-failed source=tegra-sd card_blocks={} err={:?} ::",
-                    RPS, blocks, e
-                );
-                ROOT_REFUSED
-            }
-        }
-    }
-
-    /// ROOTFS: run the probe EARLY — from the `sdmmc_census` call line in `main.rs`, in exactly the
-    /// context the census has just proved good (EL2, boot core, JM4 timer live, the SDHCI window mapped
-    /// one instruction ago). The bind itself cannot run here — the mount table is rebuilt per verb, far
-    /// later, inside the desktop's service pass — so this call exists for ONE reason: it splits a first
-    /// flight's two failure modes apart on the wire. `[sdmmc] root mount … -> OK` here and a desktop that
-    /// still cannot list means the card read is unreachable from the LATER context (a mapping question,
-    /// not a filesystem one); no line here at all means the census never published a card; a `REFUSED
-    /// reason=fat-mount-failed` here means the medium carries no FAT volume this driver accepts. Without
-    /// it, all three arrive as one silent desktop.
-    ///
-    /// Idempotent and cheap after the first call (a relaxed load); the probe's own cost is the volume
-    /// scan, ~4-6 CMD17s.
-    #[cfg(feature = "sdmmcroot")]
-    pub fn sdmmc_root_probe_early() {
-        use core::sync::atomic::Ordering;
-        if ROOT_VERDICT.load(Ordering::Relaxed) == ROOT_UNKNOWN {
-            let v = root_probe();
-            ROOT_VERDICT.store(v, Ordering::Relaxed);
-        }
-    }
-
-    /// ROOTFS: the seam `shell::vfs_mount_table` calls — rebind `/`, `/boot` and `/apps` (LAYOUT, orin 18)
-    /// to the card's FAT volume, which is the only volume this machine has. Called on every table build;
-    /// does nothing but three `Vec` operations after the first.
-    ///
-    /// It takes the table by `&mut` rather than returning a backend so the WHOLE namespace decision for
-    /// this machine lives in one place instead of being spread across the shared builder: the caller's
-    /// half is a single cfg-gated statement appended to a line that already existed.
-    #[cfg(feature = "sdmmcroot")]
-    pub fn sdmmc_root_bind(mt: &mut crate::fs::vfs::MountTable) {
-        use core::sync::atomic::Ordering;
-        let mut verdict = ROOT_VERDICT.load(Ordering::Relaxed);
-        if verdict == ROOT_UNKNOWN {
-            verdict = root_probe();
-            ROOT_VERDICT.store(verdict, Ordering::Relaxed);
-        }
-        if verdict != ROOT_BOUND {
-            return; // the refusal was named once; leave the table exactly as the shared builder left it
-        }
-        // BOTH prefixes, onto the one volume this machine has.
-        //
-        // `/` because the root has to work at all: `vfs_ls_collect` stats the path before it
-        // synthesises any child row, so a root that errors makes every other mount unreachable from
-        // the desktop and from quarry.
-        //
-        // `/boot` because the boot volume has a name an operator types, and unmounting it (the first
-        // shape of this section) would have traded one dead namespace for another.
-        //
-        // `/apps` (LAYOUT, orin 18) because it is not decoration — it is `shell::EXEC_ROOT`, the
-        // second probe of `exec_resolve` (the reason a bare `vug` works from anywhere), and it is
-        // spelled literally in the launch paths `/apps/VUG.ELF`, `/apps/STAT.ELF`,
-        // `/apps/ELFHELLO.ELF` and quarry's own double-click route. Leaving it bound to
-        // `BlockSource::Default` — a source no Orin boot registers — would leave every one of those
-        // answering `-ENODEV`. It is `.rooted(APPS_DIR)` over the same card, so `/apps/VUG.ELF`
-        // reaches `APPS/VUG.ELF` on the medium.
-        //
-        // IT CARRIES `/boot`'s VOLUME NAME, NOT A THIRD ONE. `MountTable::same_volume` compares the
-        // constructor strings, so a distinct name here would make one card read as two volumes —
-        // the aliasing defect (rmbp 15's C1) in a new spelling. The `card`/`fat` split BELOW is
-        // that same defect as it stands today, unmodified here on purpose: fixing volume identity
-        // is a separate arc (VOLID), and this one must not paper over it with a rename. The
-        // `layout.volid` fixture in `shell.rs` is what convicts it.
-        //
-        // Two adapters over one source is not a coherence risk: `FatBackend` re-mounts through
-        // `fat::mount_source` on every call and holds no volume state (the stateless posture the shell's
-        // FAT verbs have always had), so the two cannot disagree about the medium. The visible cost is
-        // one synthesised `fat` row inside the listing of `/` — which is honest (it IS a mount point)
-        // and is exactly the case quarry's `root_prefixes` already handles: `/` claims `/boot`, so `/boot`
-        // is not a second root, it is a child reached through its parent (the "duplicate-/boot rule").
-        mt.mount(
-            "/",
-            alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
-                "card",
-                crate::fs::vfs::KERNEL_PRINCIPAL,
-                true,
-            )),
-        );
-        mt.mount(
-            "/boot",
-            alloc::boxed::Box::new(crate::fs::vfs::FatBackend::new_tegra_sd(
-                "fat",
-                crate::fs::vfs::KERNEL_PRINCIPAL,
-                true,
-            )),
-        );
-        mt.mount(
-            "/apps",
-            alloc::boxed::Box::new(
-                crate::fs::vfs::FatBackend::new_tegra_sd(
-                    "fat",
-                    crate::fs::vfs::KERNEL_PRINCIPAL,
-                    true,
-                )
-                .rooted(crate::fs::fat::APPS_DIR),
-            ),
-        );
-        // One post-bind census, on the first bind only: the scorer's proof that the root now enumerates.
-        if !ROOT_CENSUS.swap(true, Ordering::Relaxed) {
-            let c0 = crate::arch::now_cycles();
-            match mt.read_dir("/") {
-                Ok(rows) => {
-                    let us = root_us_since(c0);
-                    let dirs = rows
-                        .iter()
-                        .filter(|r| matches!(r.kind, crate::fs::vfs::NodeKind::Dir))
-                        .count();
-                    serial_println!(
-                        "{} bound /, /boot and /apps = tegra-sd FAT read-only (all were dead: unafs has no volume here, Default has no device) entries={} dirs={} files={} list_us={} ::",
-                        RPS, rows.len(), dirs, rows.len() - dirs, us
-                    );
-                }
-                Err(e) => serial_println!(
-                    "{} bound /, /boot and /apps = tegra-sd FAT read-only but the first listing FAILED err={:?} ::",
-                    RPS, e
-                ),
-            }
-        }
-    }
 }
+
+// =====================================================================================
+// LOADER-MEDIUM (orin 22) — the parenthetical assumption 1 used to carry, and why it is gone.
+//
+// Assumption 1 above read: "the firmware/BPMP has already ENABLED the sdmmc1 module clock + pad
+// power and left the slot's rails up (THE BOOTLOADER READ THE CARD TO BOOT)". The parenthetical was
+// offered as the REASON the rails are up, and it is a claim about which MEDIUM the loader read —
+// which the wire contradicts on this very board.
+//
+// MEASURED, render9 on the Orin: the loader reported boot volume serial `0xde001a13`, while the
+// card in the sdmmc1 slot carries `vol_id 0xabfbdefa`, with `:: PSRC: … global=present
+// tegra_sd=present` on the same boot. Two different media. So the loader did NOT read the slot
+// card, and the slot's rails were up anyway.
+//
+// WHAT IS ACTUALLY KNOWN, and all that assumption 1 needs: the firmware leaves sdmmc1's module
+// clock, pad power and rails UP at handover. That is a statement about the SLOT's state, and it is
+// what the recon depends on. Which medium the loader READ is a separate fact, it is not implied by
+// this one, and nothing in this driver needs it.
+//
+// The cost of the old wording is on the record: it misled the rmbp seat within an hour of being
+// read. A comment that asserts a machine fact the wire denies is worse than no comment — the wire
+// beats the comment (`docs/dev/LAWS.md`), and a comment that cannot lose to it should not be
+// written. The rewrite above is LINE-NEUTRAL (one line replaced by one line, this block appended at
+// the FILE TAIL) so no `panic::Location` in this file moves and the tegra knob-off byte-identity
+// gates are untouched.
+// =====================================================================================

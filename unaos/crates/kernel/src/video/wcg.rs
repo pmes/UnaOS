@@ -783,6 +783,11 @@ pub fn stage_decline(id: u32, reason: u32) {
     if (reason as usize) < DECL_KINDS {
         H_DECLBY[i][reason as usize].fetch_add(1, Ordering::Relaxed);
     }
+    // COMPGATE — and the lifetime lock-decline meter, which the per-tenant array cannot serve
+    // because `stage_reset` zeroes it. See [`DECL_LOCK_LIFE`].
+    if reason == DECL_LOCK {
+        DECL_LOCK_LIFE.fetch_add(1, Ordering::Relaxed);
+    }
     let n = H_TAKEN[i].fetch_add(1, Ordering::Relaxed) + 1;
     if n > SAMPLES {
         H_TAKEN[i].store(SAMPLES + 1, Ordering::Relaxed);
@@ -793,6 +798,35 @@ pub fn stage_decline(id: u32, reason: u32) {
     H_KIND[i].store(reason, Ordering::Relaxed);
     H_PEND[i].store(n, Ordering::Release);
 }
+
+/// COMPGATE — every [`DECL_LOCK`] this boot has taken, across every window id, NEVER RESET.
+///
+/// **Deliberately not the sum of [`H_DECLBY`]`[..][DECL_LOCK]`, and the difference is the whole
+/// point.** That array travels with the SLOT'S TENANT — `stage_reset` zeroes it when a window id is
+/// re-let, which is correct for the `[wc-h] rollup` verdict (a new tenant must not inherit the
+/// previous one's declines) and WRONG for a differential instrument. A fixture that reads the sum
+/// before an experiment and after it would see a reset as a DECREASE, `saturating_sub` would floor
+/// that at zero, and zero is the fixture's PASS value — i.e. the one reachable corruption of that
+/// reading turns a real re-entrancy into a green light. A monotonic lifetime counter cannot fail
+/// that way: it only ever rises, so a delta of zero is always the honest statement that no
+/// `stage_for_core().try_lock()` was lost in the window measured.
+///
+/// Incremented on the present path, so: one relaxed add, and only on the decline arm that already
+/// pays for two.
+static DECL_LOCK_LIFE: AtomicU64 = AtomicU64::new(0);
+
+/// COMPGATE — the lifetime [`DECL_LOCK`] count. See [`DECL_LOCK_LIFE`] for why this is not
+/// `sum(H_DECLBY[..][DECL_LOCK])`.
+///
+/// `DECL_LOCK` is the compositor falling out of the staged path into `draw_window`'s direct,
+/// unclipped, per-pixel front-buffer write — the tear itself. Because [`super::wm::STAGE`] is
+/// indexed per core, a lost `try_lock` can only ever have been lost to the SAME core, which makes
+/// this number a same-core re-entrancy meter and the panel-side half of the COMPGATE fixture's
+/// verdict (the gate-side half is `passes_delta`).
+pub fn decl_lock_total() -> u64 {
+    DECL_LOCK_LIFE.load(Ordering::Relaxed)
+}
+
 static H_BOX: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_BYTES: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
 static H_COMPOSE: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
@@ -1513,8 +1547,32 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     //
     // SYNC-FOLD 2026-08-22 — `presspop=` sits DIRECTLY after `presspread=`: the pi4 spec's AT-RISK
     // FORBID and the re-armed x86-witness FORBID both key on that adjacency. Arity is 27 = 27.
+    //
+    // COMPGATE — `blitnet=` is an INSERTION, and its position is chosen against both live FORBIDs
+    // rather than for tidiness. It sits directly after `decl_alloc=`, i.e. at the END of the decline
+    // decomposition and INSIDE `pop=all-presents`, because that is the one place in this line where
+    // no spec keys on an adjacency: `x86-witness.spec:1234` requires `presspread=… presspop=… \
+    // pop=constant` to stay contiguous (an insertion there would make that FORBID unable to fire,
+    // which is a worse defect than the one this arc is fixing), and `pi4-regression.spec:970`
+    // matches `declines=.*-> TEAR-FREE` with a wildcard that an insertion cannot break. Arity is now
+    // 35 = 35 (27 + eight per-core nets).
+    //
+    // WHAT IT IS. `wm::BLIT_NET_CORE`, the signed per-enter-core net of live `BlitGuard`s that the
+    // compositor has maintained unconditionally since DRAGFIX M1. A slot above 1 means two composite
+    // blits entered on that core and neither has retired — i.e. RE-ENTRANCY, which is the mechanism
+    // behind `decl_lock=` (the staging buffer is per core, so no two cores can contend for one
+    // entry, and a lost `try_lock` can only have been lost to the same core). It was already in the
+    // tree and it was unreadable in practice: the only printer was `wm::blitwho_report`, reachable
+    // from the two drain GIVE-UP arms alone, so a boot that tore without ever stalling a drain never
+    // printed the number that convicts its tear. It now rides the verdict line itself. `torn>0` with
+    // every slot at or below 1 is the statement that the tear has a DIFFERENT source.
+    //
+    // Read ONCE into a local rather than eight loads placed inline among the format arguments: the
+    // eight slots have to be one snapshot of one moment, or a reader laying `blitnet=` against the
+    // `decl_lock=` on the same line is comparing eight different moments to a ninth.
+    let blitnet = super::wm::blit_net_snapshot();
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} blitnet=[{},{},{},{},{},{},{},{}] fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,
         scope,
         emit,
@@ -1529,6 +1587,14 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         declby(DECL_CAP),
         declby(DECL_LOCK),
         declby(DECL_ALLOC),
+        blitnet[0],
+        blitnet[1],
+        blitnet[2],
+        blitnet[3],
+        blitnet[4],
+        blitnet[5],
+        blitnet[6],
+        blitnet[7],
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
@@ -2772,6 +2838,22 @@ pub(super) fn wch_recycle(i: usize) {
     H_MINRATE[i].store(u64::MAX, Ordering::Relaxed);
     H_MAXRATE[i].store(0, Ordering::Relaxed);
     H_DECLINE[i].store(0, Ordering::Relaxed);
+    // CURSORBG — **the BREAKDOWN travels with the tenant too, and until now it did not.**
+    // `H_DECLINE` (the `declines=` total) was reset here and `H_DECLBY` (the `decl_geom=`/`decl_cap=`/
+    // `decl_lock=`/`decl_alloc=` split) was not, so the two halves of one line were measured over
+    // different populations: the total over THIS tenant, the split over every tenant the slot has
+    // ever held. A reader comparing them read a contradiction and had no way to know it was the
+    // instrument. The render11 Jetson capture is the case that found it — `[wc-h] rollup win=1 …
+    // declines=5 decl_geom=0 decl_cap=0 decl_lock=73 decl_alloc=0`, a breakdown fifteen times its own
+    // total, which is not a decline pattern but the accumulated declines of the slot's earlier
+    // tenants. `H_DECLBY` was simply missed when WCHUN added the split; this function's own header
+    // already lists `H_DECLINE` among the measurements that travel with the tenant, and this is the
+    // rest of that set. After it, `declines == sum(decl_*)` is an invariant a reader may rely on.
+    let mut k = 0;
+    while k < DECL_KINDS {
+        H_DECLBY[i][k].store(0, Ordering::Relaxed);
+        k += 1;
+    }
     H_FIXTURE[i].store(0, Ordering::Relaxed);
     H_PEND[i].store(0, Ordering::Relaxed);
     H_KIND[i].store(0, Ordering::Relaxed);

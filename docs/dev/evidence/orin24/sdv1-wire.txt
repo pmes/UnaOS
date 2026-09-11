@@ -1,0 +1,33 @@
+ORIN-SDMMC-1 / SDV1 — the render12 boot 2 wire (ledger A49)
+
+Source: the Orin metal serial capture of render12 boot 2, 2026-09-09, with a 1.9 GB FAT card
+(label UNAOS-DATA, plain FAT, no UnaOS content) in the Orin's microSD slot. Extracted verbatim by
+`awk 'index($0,"SDMMC")'` plus the `[vfs] root =` line; nothing else is changed, elided or reordered.
+
+The defect is the CMD55 line: CMD8 going unanswered is the CORRECT answer from an SD v1.x (SDSC)
+card, and the ladder says so and continues — but the very next command times out too, and the run
+ends there with `tegra-sd=absent`. Analysis and fix: docs/dev/OS/01_BOOT_HAL/arch_arm64.md,
+section ORIN-SDMMC-1 / SDV1.
+
+---
+
+:: SDMMC: ORIN-SDMMC-1 Tegra234 microSD READ-ONLY recon (DTB @0x25f501000 size=0xcc90c) ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3400000 reg=0x03400000(size 0x20000) status=okay removable cd-gpios compat='nvidia,tegra234-sdhci|nvidia,tegra186-sdhci|' ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3460000 reg=0x03460000(size 0x20000) status=disabled removable no-cd compat='nvidia,tegra234-sdhci|nvidia,tegra186-sdhci|' ::
+:: SDMMC:   M1: picked /bus@0/mmc@3400000 @ 0x03400000 (size 0x20000) as the microSD slot ::
+:: SDMMC:   M1: controller window 0x03400000(+0x20000) is in the GiB-0 device window (already Device-nGnRE) ::
+:: SDMMC:   M1: live SDHCI — CAPABILITIES=0x3f6ccc8c (base-clk 204 MHz, 8-bit=1, ADMA2=1), spec-version reg=0x05 (SDHCI ?) ::
+:: SDMMC:   CLKPROOF: CLK 120 IS_ENABLED = 1 ::
+:: SDMMC:   CLKPROOF: CLK 219 IS_ENABLED = 1 ::
+:: SDMMC:   CLKPROOF: all 2 node clock(s) proven enabled ::
+:: SDMMC:   FWALL: vendor block DISABLED — metal conviction: SError with clocks proven on (boots 4e+5); ladder runs without pad snapshot/restore ::
+:: SDMMC:   M2: vendor snapshot SKIPPED — core clock not proven (CLKPROOF); ladder runs without pad snapshot/restore ::
+:: SDMMC:   M2: SRST_ALL (controller software reset) ::
+:: SDMMC:   M2: bus power 3.3 V applied (CONTROL0=0x00000f00) ::
+:: SDMMC:   M2: card detected (Present State 0x01fb00f0) ::
+:: SDMMC:   M2: 400 kHz identification clock running (CONTROL1=0x000eff07, base 204 MHz) ::
+:: SDMMC:   M2: CMD0 GO_IDLE ok ::
+:: SDMMC:   M2: CMD8 no response (INTERRUPT=0x00018000) — SD v1.x card or no v2 support; continuing without HCS ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) FAILED — INTERRUPT=0x00018000 PresentState=0x01fb0000 CONTROL0=0x00000f00 CONTROL1=0x000eff07 — STOP ::
+:: SDMMC: ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop) ::
+[vfs] root = boot volume serial=0xde001a13 source=global match=/kernel.elf sha=1b50376a unafs=absent matches=1 home=- files=1 aliased=usb->global window_off=0x25a9afc4c window_len=4096 file_off=0x8ec4c candidates=72 disks=global=present usb=present sdhc=unbuilt tegra-sd=absent ::
