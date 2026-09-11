@@ -983,6 +983,22 @@ fi
 # `[ga10bprobe3b]`.
 [ -n "${UNAOS_GA10B_PROBE3:-}" ] && _feats="${_feats}ga10bprobe3,"
 [ "${UNAOS_GA10B_PROBE3:-}" = "2" ] && _feats="${_feats}ga10bprobe3b,"
+# GA10B-PROBE4 (GA10BPROBE4): ONE env knob with TWO values, driving rungs 4a and 4b of the GA10B
+# ladder (brief: docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md — the blob-free boot-ROM ignition).
+#   UNAOS_GA10B_PROBE4=1  -> feature `ga10bprobe4a`                     — rung 4a alone: the BCR
+#                            writability census, no ignition, reversible, boot RETURNS to the desktop
+#   UNAOS_GA10B_PROBE4=2  -> features `ga10bprobe4a` + `ga10bprobe4b`   — 4a, then 4b's IGNITION;
+#                            spends the power cycle and ENDS IN SYSTEM_OFF (attended only)
+# Any other non-empty value arms 4a alone: an unexpected value never buys an ignition (the PROBE3
+# shape, verbatim). `arch/aarch64/ga10b_probe.rs::ga10bprobe4_run`, an appended statement in
+# `tegra_early_stop`'s BPMP block between rung 3's call and rung 1's. A FOURTH sibling of the probe
+# knobs, never their dependent. IMPLIES `tegra`, so `UNAOS_GA10B_PROBE4=2 ./arroyo check` and
+# `UNAOS_GA10B_PROBE4=2 ./arroyo esp-jetson` both arm it. Fly it WITHOUT UNAOS_GA10B_PROBE1/2/3.
+# Default OFF => tail + call site vanish, no panic Location moves, knob-off images byte-identical.
+# ARMED polarities type-checked by the `arm-tegra-ga10bprobe4a` / `arm-tegra-ga10bprobe4b` legs of
+# KERNEL_CFG_MATRIX. Witness families: `[ga10bprobe4a]`, `[ga10bprobe4b]`.
+[ -n "${UNAOS_GA10B_PROBE4:-}" ] && _feats="${_feats}ga10bprobe4a,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "2" ] && _feats="${_feats}ga10bprobe4b,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -3814,6 +3830,19 @@ KERNEL_CFG_MATRIX=(
   # gate +2 — read the live counts from `./arroyo check`, never from the numbers in the block comment
   # above (they have gone stale twice and this arc does not re-count them).
   "arm-tegra-ga10bprobe3b ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe3b"
+
+  # GA10B-PROBE4A armed (orin 26, 2026-09-11) — `ga10bprobe4a` gates the rung-4 tail of `ga10b_probe.rs`,
+  # its `seat_ga10b4_nc` window seater in `mmu_tegra.rs`, and the appended call in `tegra_early_stop`.
+  # The ga10bprobe3 leg's shape: `arm-tegra`'s list + `ga10bprobe4a` ALONE — the `UNAOS_GA10B_PROBE4=1`
+  # flight polarity, with every `ga10bprobe4b` item (the `ignite_w32` helper and the `rung4b` body)
+  # cfg-erased, which is the dead-code trap a 4b-only leg would hide.
+  "arm-tegra-ga10bprobe4a ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4a"
+
+  # GA10B-PROBE4B armed (same arc) — the ONLY leg that type-checks rung 4b's armed polarity (the
+  # `UNAOS_GA10B_PROBE4=2` flight). `ga10bprobe4b` IMPLIES `ga10bprobe4a`. No `not(feature =
+  # "ga10bprobe4*")` site exists in src/, so no disarmed asymmetry. Board legs +2; gate +2 — read the
+  # live counts from `./arroyo check`.
+  "arm-tegra-ga10bprobe4b ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4b"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of

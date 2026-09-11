@@ -2145,6 +2145,36 @@ ga10bprobe3 = ["tegra"]
 # `arm-tegra-ga10bprobe3b` leg of KERNEL_CFG_MATRIX. Witness family: `[ga10bprobe3b]`.
 ga10bprobe3b = ["ga10bprobe3"]
 
+# GA10B-PROBE4A (`UNAOS_GA10B_PROBE4=1`): rung 4a of the GA10B ladder — the BCR WRITABILITY CENSUS.
+# Brief (frozen design): docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §3.2. The tail of
+# `arch/aarch64/ga10b_probe.rs` (`ga10bprobe4_run`) and one appended call site in `tegra_early_stop`,
+# placed BETWEEN rung 3's call and rung 1's. Inside rung 3's PROVEN power+clock bracket (re-proven on
+# this boot, never inherited), it re-reads the two rung-4 inputs (`bcr_dmacfg` lock bit, `bcr_ctrl`
+# baseline), seats the rung's OWN 2 MiB Normal-NC DMA window (mmu_tegra `seat_ga10b4_nc`, the NET4A
+# law, never the NIC's block), fills it with a non-signature pattern, then writes the six BCR DMA
+# address registers and `bcr_dmacfg` WITHOUT the lock bit, reading each back, and restores all seven
+# to zero. `bcr_ctrl` is NOT written (that bit is 4b's). RETURNS to the desktop on every path except
+# BCR-SELFLOCKED and BCR-STICKY, which spend the power cycle and end in SYSTEM_OFF. Owns its own
+# write helper (`w32_4`, `#[cfg(feature = "ga10bprobe4a")]`), so no other configuration compiles a
+# BCR write path. IMPLIES `tegra`. Every offset/bit cites the ACKED facts file. Default OFF => the
+# tail + call site vanish, no panic `Location` moves (every call is appended to an existing line),
+# knob-off images byte-identical to baseline (measured on the esp-jetson kernel.elf binary). ARMED
+# polarity type-checked by the `arm-tegra-ga10bprobe4a` leg of KERNEL_CFG_MATRIX. Witness family:
+# `[ga10bprobe4a]`.
+ga10bprobe4a = ["tegra"]
+
+# GA10B-PROBE4B (`UNAOS_GA10B_PROBE4=2`): the SUB-KNOB that adds RUNG 4b — the blob-free boot-ROM
+# IGNITION — on top of rung 4a. IMPLIES `ga10bprobe4a`. Armed ONLY by the knob AND a same-boot
+# `BCR-ALLHELD` from 4a. Re-writes the six addresses, writes `bcr_dmacfg` = noncoherent|lock_locked
+# (THIS SPENDS THE POWER CYCLE), `bcr_ctrl` = 0x111 (the ACKED SEQ brom_config value), and then the
+# ignition `priscv_cpuctl` = startcpu; polls `br_retcode` (bounded, every sample printed), reads the
+# post-ignition state block, and ENDS THE MACHINE in SYSTEM_OFF on every reachable path (the cold-boot
+# bench law). Its PASS is a FAIL verdict from the ROM (`br_result=0x2`): the first observable execution
+# of GA10B silicon under UnaOS, needing no vendor blob. Brief §3.3, §5 fail shapes. The ignition write
+# helper (`ignite_w32`) is `#[cfg(feature = "ga10bprobe4b")]`. Default OFF. ARMED polarity type-checked
+# by the `arm-tegra-ga10bprobe4b` leg. Witness family: `[ga10bprobe4b]`.
+ga10bprobe4b = ["ga10bprobe4a"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

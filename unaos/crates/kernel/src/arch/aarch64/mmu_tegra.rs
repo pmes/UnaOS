@@ -1993,7 +1993,7 @@ fn seat_net4a_low_nc(
     }
     match best {
         Some(b) => {
-            NET4A_LOW_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed);
+            NET4A_LOW_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed); #[cfg(feature = "ga10bprobe4a")] seat_ga10b4_nc(regions, carveouts, heap_lo, heap_hi, windows, b);
             serial_println!(
                 ":: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [{:#x}, {:#x}) ({} KiB) — lowest clean L2-split block in [{:#x}, {:#x}); low-DRAM census: {} Usable region(s) / {} MiB usable, {} carveout(s) below 4 GiB, {} candidate block(s) scanned (rejected: carveout={} heap/nc={} window={} unsplit={}) ::",
                 b, b + BLK2, BLK2 >> 10, LOW_LO, LOW_HI,
@@ -2003,6 +2003,96 @@ fn seat_net4a_low_nc(
         None => serial_println!(
             ":: tegra: [net4A] NO sub-4GiB Normal-NC DMA window: no clean L2-split 2 MiB block in [{:#x}, {:#x}); low-DRAM census: {} Usable region(s) / {} MiB usable, {} carveout(s) below 4 GiB, {} candidate block(s) scanned (rejected: carveout={} heap/nc={} window={} unsplit={}) — the NIC falls back to the high window + inbound-iATU alias (NET-4s) ::",
             LOW_LO, LOW_HI, usable_regions, usable_bytes >> 20, carve_low, cand, rej_carve, rej_heap, rej_win, rej_split
+        ),
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// GA10B-PROBE4 (orin 26, `ga10bprobe4a`; brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §2.2): the
+// rung's OWN 2 MiB Normal-NC DMA window for the boot-ROM's non-coherent fetch. Same placement law as
+// NET4A (lowest carveout-clean, L2-split, 2 MiB-aligned block inside ONE Usable region below 4 GiB,
+// clear of the heap and both NC windows), seated in the SAME scan from the SAME inputs, EXCLUDING the
+// block NET4A just took — the rung never borrows the NIC's window (a NIC ring and a GPU boot fetch in one
+// block is a race with no witness). Called from `seat_net4a_low_nc`'s success arm, appended to that line
+// so knob-off no `Location` moves. The rung maps it NC itself with `install_nc_window` at flight time.
+#[cfg(feature = "ga10bprobe4a")]
+static GA10B4_NC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GA10B-PROBE4: the rung's reserved sub-4 GiB DMA window `(base, size)`, or `(0, 0)` when none seated.
+#[cfg(feature = "ga10bprobe4a")]
+pub fn ga10b4_nc_window() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    let base = GA10B4_NC_BASE.load(Ordering::Relaxed);
+    (base, if base != 0 { NET4B_NC_SIZE } else { 0 })
+}
+
+#[cfg(feature = "ga10bprobe4a")]
+fn seat_ga10b4_nc(
+    regions: &[MemoryRegion],
+    carveouts: &[(u64, u64)],
+    heap_lo: u64,
+    heap_hi: u64,
+    windows: &[(u64, u64)],
+    net4a_base: u64,
+) {
+    const LOW_LO: u64 = 0x8000_0000;
+    const LOW_HI: u64 = 0x1_0000_0000;
+    const BLK2: u64 = NET4B_NC_SIZE;
+    let (ncb, ncs) = net4b_nc_window();
+    let l1 = &raw const L1 as *const u64;
+    let overlaps = |a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64| -> bool { a_lo < b_hi && b_lo < a_hi };
+    let mut best: Option<u64> = None;
+    let mut cand = 0u64;
+    let mut rej = 0u64;
+    for r in regions {
+        if r.kind != MemoryRegionKind::Usable {
+            continue;
+        }
+        let r_lo = r.phys_start.max(LOW_LO);
+        let r_hi = r.phys_start.wrapping_add(r.page_count * 4096).min(LOW_HI);
+        if r_hi <= r_lo {
+            continue;
+        }
+        let mut s = (r_lo + BLK2 - 1) & !(BLK2 - 1);
+        while s + BLK2 <= r_hi {
+            let e = s + BLK2;
+            cand += 1;
+            let mut ok = s != net4a_base;
+            for &(cb, cs) in carveouts {
+                if cs != 0 && overlaps(s, e, cb, cb.wrapping_add(cs)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && (overlaps(s, e, heap_lo, heap_hi) || (ncs != 0 && overlaps(s, e, ncb, ncb + ncs))) {
+                ok = false;
+            }
+            if ok && !windows.is_empty() && !windows.iter().any(|&(wb, ws)| s >= wb && e <= wb.wrapping_add(ws)) {
+                ok = false;
+            }
+            if ok && !is_table_desc(unsafe { l1.add((s >> 30) as usize).read_volatile() }) {
+                ok = false;
+            }
+            if ok {
+                best = Some(best.map_or(s, |b| b.min(s)));
+                break;
+            }
+            rej += 1;
+            s = e;
+        }
+    }
+    match best {
+        Some(b) => {
+            GA10B4_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed);
+            serial_println!(
+                ":: tegra: [ga10b4nc] rung-4 DMA window reserved [{:#x}, {:#x}) ({} KiB) — the NEXT clean L2-split block after NET4A's [{:#x}, +{} KiB); {} candidate(s) scanned, {} rejected ::",
+                b, b + BLK2, BLK2 >> 10, net4a_base, BLK2 >> 10, cand, rej
+            );
+        }
+        None => serial_println!(
+            ":: tegra: [ga10b4nc] NO rung-4 DMA window: no second clean L2-split 2 MiB block in [{:#x}, {:#x}) besides NET4A's; {} candidate(s) scanned, {} rejected — rung 4 will REFUSE reason=no-dma-window ::",
+            LOW_LO, LOW_HI, cand, rej
         ),
     }
 }
