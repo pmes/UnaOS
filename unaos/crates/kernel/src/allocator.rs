@@ -103,3 +103,55 @@ pub unsafe fn init_heap_raw(heap_start: *mut u8, heap_size: usize) {
     HEAP_HI.store(heap_start as usize + heap_size, Ordering::Relaxed);
     unsafe { ALLOCATOR.lock().init(heap_start, heap_size) };
 }
+
+// EL0MEM (orin 26) — the heap census. Until this arc the kernel had NO heap used/free counter on any
+// arch, so a refused allocation on metal (`TEGRA-EL0: slot 4 backing allocation FAILED`, `PRTSCR:
+// encoder declined (OutOfMemory)`, `[facet] refuse … alloc(2304000)`, all in one render12 sitting)
+// could not be told apart as EXHAUSTION (free < need) or FIRST-FIT FRAGMENTATION (free >= need but no
+// single run holds it). `used`/`free` are the allocator's own counters. `largest_run` is MEASURED,
+// not derived: `linked_list_allocator` keeps its hole list private, so the largest 4 KiB-aligned run
+// is found by trial — a binary search over `allocate_first_fit` at `align` with an immediate
+// `deallocate` of every hit. That leaves the heap exactly as found (the hole list is address-ordered
+// and re-merges on free; a miss does not mutate it) and costs ~log2(heap/4 KiB) walks, so it is a
+// launch-path instrument, not a hot-path one. It takes the heap lock itself: never call it from
+// inside an allocation.
+#[derive(Clone, Copy)]
+pub struct HeapCensus {
+    pub used: usize,
+    pub free: usize,
+    /// Largest single `align`-aligned run a first-fit request could be granted right now.
+    pub largest_run: usize,
+}
+
+pub fn heap_census(align: usize) -> HeapCensus {
+    let mut c = HeapCensus { used: 0, free: 0, largest_run: 0 };
+    arch::without_interrupts(|| {
+        let mut heap = ALLOCATOR.lock();
+        c.used = heap.used();
+        c.free = heap.free();
+        let step = align.max(1);
+        let mut lo = 0usize;
+        let mut hi = c.free / step * step;
+        while lo < hi {
+            // Round the midpoint UP to a step so the search always makes progress toward `hi`.
+            let mid = (lo + (hi - lo + step) / 2 + step - 1) / step * step;
+            let fits = match Layout::from_size_align(mid, step) {
+                Ok(l) => match heap.allocate_first_fit(l) {
+                    Ok(p) => {
+                        unsafe { heap.deallocate(p, l) };
+                        true
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if fits {
+                lo = mid;
+            } else {
+                hi = mid - step;
+            }
+        }
+        c.largest_run = lo;
+    });
+    c
+}

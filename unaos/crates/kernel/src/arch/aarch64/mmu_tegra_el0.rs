@@ -366,6 +366,7 @@ fn alloc_backing() -> u64 {
     };
     let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
     if p.is_null() {
+        el0heap_refused(USER_STATIC_SIZE);
         return 0;
     }
     let pa = p as u64;
@@ -425,6 +426,7 @@ pub fn install() -> bool {
         return false;
     }
     SHARED_BACKING.store(backing, Ordering::Release);
+    reserve_slot_pool();
 
     unsafe {
         let l2 = &raw mut L2_USER as *mut u64;
@@ -528,6 +530,7 @@ pub fn alloc_user_slot() -> Option<usize> {
     }
     for s in 0..USER_SLOTS {
         if SLOT_USED[s].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let mut source = "pool";
             if SLOT_BACKING[s].load(Ordering::Acquire) == 0 {
                 let pa = alloc_backing();
                 if pa == 0 {
@@ -536,7 +539,9 @@ pub fn alloc_user_slot() -> Option<usize> {
                     return None;
                 }
                 SLOT_BACKING[s].store(pa, Ordering::Release);
+                source = "lazy";
             }
+            el0heap_granted(s, SLOT_BACKING[s].load(Ordering::Acquire), source);
             // Seed the live-task refcount for the initial owner. The store precedes `build_slot`'s
             // publishing barrier and any dispatch onto this slot, so a `slot_thread_retain` (reachable
             // only once a task runs on the slot) always observes >= 1.
@@ -997,3 +1002,88 @@ pub unsafe fn probe_slot_isolation(
     }
     r_a == expect_a && r_b == expect_b && expect_a != expect_b
 }
+
+// ── EL0MEM (orin 26) — the heap census on the wire, and the boot-time slot pool ──────────────────────
+//
+// render12 boot A3 (2026-09-09): four VUGs took slots 0..3, then `slot 4 backing allocation FAILED`
+// seven times over two launch waves while the SAME heap refused 2.3 MiB (`[facet]`), 3.3 MiB (`[wc-d]`
+// snapshot) and 6.9 MiB (`PRTSCR`). The wire could not say whether the 48 MiB heap was EMPTY or merely
+// FRAGMENTED, because nothing in the kernel counted it. Every reaped ASID came back (asid 1 was reused
+// by ELFHELLO, PULSE and STAT; 2..4 by the second VUG wave), so the slot path returns slots and the
+// backing is retained by design — the famine is the heap itself: the aarch64 `HEAP_SIZE` is sized for
+// the Pi's hand-placed region, which the Orin never uses (`memory.rs` routes tegra to
+// `mmu_tegra::select_heap_region`), and the desktop's known consumers on a 6-core 1920x1200 board
+// (the panel mirror, per-core stage pools, window surfaces, these backings) sum to about all of it.
+//
+// Two things fix it, and the census is what proves which one did on metal:
+//   * `select_heap_region` now climbs a request ladder (256..48 MiB) and keeps the flown 48 MiB span
+//     inside whatever it seats, so the heap grows DOWNWARD from the proven seat or stays exactly as
+//     flown — never relocates.
+//   * `install` reserves every slot's backing HERE, while the heap is fresh and contiguous, so a launch
+//     never competes with the compositor's lazy growth for a 1.29 MiB run. A slot whose reservation
+//     fails stays lazy (today's path), so nothing regresses on a heap the ladder could not raise.
+//
+// Witness tag `[el0heap]` (9 bytes: LLVM immediate-encodes shorter tokens out of `.rodata`).
+
+/// One `[el0heap]` line naming the refusal, with the verdict the census supports: EXHAUSTED when the
+/// heap has fewer free bytes than the request, FRAGMENTED when it has enough but no single run.
+#[inline(never)]
+fn el0heap_refused(need: usize) {
+    let c = crate::allocator::heap_census(0x1000);
+    let verdict = if c.free < need { "EXHAUSTED" } else if c.largest_run < need { "FRAGMENTED" } else { "RACED" };
+    serial_println!(
+        "[el0heap] backing REFUSED need={:#x} heap used={} KiB free={} KiB largest4k={} KiB -> {}",
+        need,
+        c.used >> 10,
+        c.free >> 10,
+        c.largest_run >> 10,
+        verdict
+    );
+}
+
+/// One `[el0heap]` line per slot grant: which slot, where its backing is, whether it came from the
+/// boot-time pool or a lazy allocation, and the heap's state at that moment.
+#[inline(never)]
+fn el0heap_granted(s: usize, pa: u64, source: &str) {
+    let c = crate::allocator::heap_census(0x1000);
+    serial_println!(
+        "[el0heap] slot {} granted backing={:#x} src={} heap used={} KiB free={} KiB largest4k={} KiB",
+        s,
+        pa,
+        source,
+        c.used >> 10,
+        c.free >> 10,
+        c.largest_run >> 10
+    );
+}
+
+/// Reserve every slot's backing at install time. Each block goes through `alloc_backing` (zeroed,
+/// page-aligned, carveout-checked) exactly as a lazy claim would; a block that cannot be had is left
+/// at 0 and `alloc_user_slot` claims it lazily later. One census line either way.
+fn reserve_slot_pool() {
+    let mut got = 0usize;
+    for s in 0..USER_SLOTS {
+        if SLOT_BACKING[s].load(Ordering::Acquire) != 0 {
+            got += 1;
+            continue;
+        }
+        let pa = alloc_backing();
+        if pa == 0 {
+            break;
+        }
+        SLOT_BACKING[s].store(pa, Ordering::Release);
+        got += 1;
+    }
+    let c = crate::allocator::heap_census(0x1000);
+    serial_println!(
+        "[el0heap] pool reserved {}/{} slot backings ({} KiB each, {} KiB total) at install; heap used={} KiB free={} KiB largest4k={} KiB",
+        got,
+        USER_SLOTS,
+        USER_STATIC_SIZE >> 10,
+        (got * USER_STATIC_SIZE) >> 10,
+        c.used >> 10,
+        c.free >> 10,
+        c.largest_run >> 10
+    );
+}
+
