@@ -4,7 +4,7 @@ One file, fixed path, not per-round. Kept current AS WORK HAPPENS, never "at clo
 a list written only at close is never written at all by a session that does not reach one,
 and a session ends when the work is done or when it is not worth continuing.
 `✓` = verified in this tree.  `·` = inherited, NOT re-checked.  Re-derive every sha before acting.
-Last touched 2026-09-10 by orin 25, after the two-level sync.
+Last touched 2026-09-11 by orin 26, rung 4 built and staged, four defect executors running.
 
 ## STATE — re-derived 2026-09-11T16:36Z against origin, not relayed
 ✓ origin/main 084b79ac · origin/hw-jetson 44218ab4 · origin/hw-rmbp 02a6896a · origin/hw-pi4 98914795
@@ -18,7 +18,12 @@ Last touched 2026-09-10 by orin 25, after the two-level sync.
 ✓ Specified as fold + core0 + el0slot + mem + tear + unafsroot. Measured: core0/el0slot/mem are at
   ZERO commits, tear is diagnosis-only, unafsroot incomplete. It would have fixed NONE of the four
   glass defects. Held rather than fly a number implying progress it does not have.
-✓ orin 26 builds the four defects. The GA10B 4a/4b boots fly with orin 25 and Peter.
+✓ orin 26: Peter 2026-09-11 "do the 4 boots". Rung 4a/4b BUILT (exec-orin26-ga10b4 a39fd32d, A45), two images STAGED
+  (`ga10b4a-20260911T1809Z-a39fd32` max_vaddr 0x23cae8 → `ga10b4b-20260911T1809Z-a39fd32` 0x23f120), card line dry-run
+  refuses only on device readability (needs sudo) and geometry (`--expect-geom 1:0b:2048:63401984`, from render12's FLIGHTID).
+  Butler on ttyACM0, MARK ga10b4a written, waker armed. Boot 1 = 4a; boot 2 = 4b only on `-> BCR-ALLHELD`.
+✓ Four defect executors spawned 2026-09-11 off the fold 63654d93 in ~/unaos-bench/scratch/orin26/{core0,el0mem,tear,unafsroot}
+  on branches exec-orin26-*; tear carries 7b0a9804 merged, unafsroot carries a81f38c7 merged (one spec conflict, the executor resolves).
 
 ## THE FOLD'S FIRST GATE — seven findings, none of them code
 ✓ 3 malformed ledger rows (SR11: `raised=yes|no`, `src=scene\|flat`, a `|` where an em-dash belongs)
