@@ -6,16 +6,27 @@ and a session ends when the work is done or when it is not worth continuing.
 `✓` = verified in this tree.  `·` = inherited, NOT re-checked.  Re-derive every sha before acting.
 Last touched 2026-09-10 by orin 25, after the two-level sync.
 
-## STATE — re-derived 2026-09-10T21:38Z against origin, not relayed
-✓ origin/main 084b79ac · origin/hw-rmbp a51a0396 · origin/hw-jetson a7a33de1 · origin/hw-pi4 247b1b95
-✓ hw-jetson  266 BEHIND trunk, 0 ahead   · hw-pi4 340 behind / 37 ahead · hw-rmbp 1 behind
+## STATE — re-derived 2026-09-11T16:36Z against origin, not relayed
+✓ origin/main 084b79ac · origin/hw-jetson 44218ab4 · origin/hw-rmbp 02a6896a · origin/hw-pi4 98914795
+✓ hw-jetson 0 behind trunk, 0 unpushed. The three-way sync is DONE (it needed four steps, not three).
+⚠ **exec-orin24-fold `63654d93` is GATED GREEN and UNPUSHED** — 54 above hw-jetson: the render13 base
+  merged with both landings, four conflicts resolved by provenance, and the first gate that branch
+  has ever had. Also unpushed: exec-orin25-shotverb `edf8483a` (WIP, does not compile, preserved).
+  Push line: `git push origin hw-jetson exec-orin24-fold exec-orin25-shotverb`
 
-## ⚠ THE SYNC IS NOT FINISHED AND THE PLAN DID NOT SAY SO
-The sequence was (1) orin lands, (2) rmbp lands, (3) pi merges — "END: all three tracks == trunk."
-✓ Steps 1 and 2 are landed and pushed. But rmbp's landing put **orin 266 behind trunk**, and no step
-  covers that. ORIN OWES A TRUNK SYNC (merge origin/main into hw-jetson, gate, no landing needed).
-  Expect reds: seven rmbp gates and a 446-line ledger-check.sh meet this tree for the first time.
-  rmbp 19's word on it: that is a finding, not a regression.
+## RENDER13 IS HELD — Peter 2026-09-11
+✓ Specified as fold + core0 + el0slot + mem + tear + unafsroot. Measured: core0/el0slot/mem are at
+  ZERO commits, tear is diagnosis-only, unafsroot incomplete. It would have fixed NONE of the four
+  glass defects. Held rather than fly a number implying progress it does not have.
+✓ orin 26 builds the four defects. The GA10B 4a/4b boots fly with orin 25 and Peter.
+
+## THE FOLD'S FIRST GATE — seven findings, none of them code
+✓ 3 malformed ledger rows (SR11: `raised=yes|no`, `src=scene\|flat`, a `|` where an em-dash belongs)
+✓ 3 unregistered knobs, all orin's, all NA — `kernel8()` builds its own K8_FEATS and never reads
+  the `_feats` block they write (arroyo:6249)
+✓ 1 STALE registry row (UNAOS_SDMMCROOT) visible only with UNAOS_K8REACH_STRICT=1 forced — SR13,
+  and it was orin 25's own cleared SP5 hit coming back: a feature lives in THREE places
+  (declaration, cfg sites, registry) and only two were enumerated.
 
 ## NEEDS PETER
 · "One file is the rulebook, EVERYTHING ELSE DELETED" — the absorbing half ran at 3cfe28ad; the
