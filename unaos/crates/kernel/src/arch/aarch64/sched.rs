@@ -9149,12 +9149,12 @@ fn spread4_witness() {
         // EL0-EL1CORE — `el0refuse` is appended at the END so every existing consumer's prefix match is
         // untouched. Where this line is emitted at all it carries the running refusal total un-capped,
         // which the per-event refusal lines cannot (they are rate-limited by `EL0_REFUSE_LOG_MAX`).
-        // READ THE CAVEAT AT `EL0_REFUSALS` BEFORE RELYING ON IT: this whole witness is link-time dead
-        // on a tegra build — no caller of `spread4_witness` is reachable there — so on the Orin the
-        // field does not appear and is not the readout. Structurally 0 on `pi` (no core is ever
-        // filtered out) and 0 on any build with no EL0 tasks, exactly as `[spread4]`'s zero baseline
-        // already proves its own wiring.
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms el0refuse={}",
+        // The `EL0_REFUSALS` caveat ("link-time dead on a tegra build") EXPIRED with ORIN-BSPRUN/APSRUN:
+        // `load_witness_tick` chains this from `timer_preempt`, and render12 A1 carries `[spread4] live`
+        // every window. ORIN-CORE0 (orin 26): the census was FOUR columns wide on a six-core board, so
+        // c4/c5 had no reader on this line; `c4..c7` are APPENDED AFTER `el0refuse` (every existing
+        // field keeps its position; `el0_active`/`.get(c)` read 0/0 past `NUM_CPUS`, the `[wcpar] c0..c7` shape).
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms el0refuse={} c4={}/{} c5={}/{} c6={}/{} c7={}/{}",
         el0_active(0),
         EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
         el0_active(1),
@@ -9180,7 +9180,7 @@ fn spread4_witness() {
         // the honest reading of that beside `residn=0` (which is what makes it interpretable).
         if resid_n == 0 { 0 } else { SPREAD15_RESID_MIN.load(Ordering::Relaxed) },
         if resid_n == 0 { 0 } else { SPREAD15_RESID_SUM.load(Ordering::Relaxed) / resid_n },
-        EL0_REFUSALS.load(Ordering::Relaxed),
+        EL0_REFUSALS.load(Ordering::Relaxed), el0_active(4), EL0_RESIDENTS.get(4).map_or(0, |r| r.0.load(Ordering::Relaxed)), el0_active(5), EL0_RESIDENTS.get(5).map_or(0, |r| r.0.load(Ordering::Relaxed)), el0_active(6), EL0_RESIDENTS.get(6).map_or(0, |r| r.0.load(Ordering::Relaxed)), el0_active(7), EL0_RESIDENTS.get(7).map_or(0, |r| r.0.load(Ordering::Relaxed)), // ORIN-CORE0 — c4..c7 on this line: zero source lines added (Location rule).
     );
     spread7_witness();
     spread10_witness();

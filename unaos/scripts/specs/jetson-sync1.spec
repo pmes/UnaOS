@@ -548,9 +548,16 @@ PENDING \[vfs\] unafs volume on .*not mounted
 # and the only knob anywhere in the chain is `tegra_el0` — which `REQUIRE TEGRA-EL0 ..
 # round-trip -> PASS` above ALREADY demands. Any image that can satisfy that row spawns this
 # task and prints this line; any image that cannot was already going to red on that row. So
-# this is NOT the knob-gated trap the SMPMARK block argues against. The pin to `core 0` is
-# main.rs:6108's deliberate `spawn_user("el0-hello", .., 0)`.
-REQUIRE SCHED: task 'el0-hello' -> core 0 \(policy: caller-pinned EL0 residents=[0-9]+, no-migrate\)
+# this is NOT the knob-gated trap the SMPMARK block argues against.
+# ORIN-CORE0 (orin 26, exec-orin26-core0): THE PIN IS GONE. `tegra_el0_start_maybe` now spawns
+# `el0-hello` CPU_AUTO whenever `el0_placement_possible(CPU_AUTO)` holds (an apsrun boot: five
+# EL1 APs are online before this spawn, the boot core is not), and keeps the old pin to core 0
+# ONLY on the `UNAOS_NOAPSRUN=1` opt-out shape, where CPU_AUTO would be refused. render12 A1/A2
+# read `el0cpus=0x1` every window because the smoke blob was the only EL0 task all boot and it
+# was pinned; A3's `bg-user` landed on cores 1, 3, 4 through the same key chain. Both arms are
+# honest, so the row admits both policies and any core; the SPAWN witness beneath names the arm.
+REQUIRE SCHED: task 'el0-hello' -> core [0-9]+ \(policy: (load-balanced|caller-pinned) EL0 residents=[0-9]+, no-migrate\)
+REQUIRE TEGRA-EL0: el0-hello spawned at EL0 \(placement=(auto|boot-core) core=-?[0-9]+ tid=[0-9]+\)
 OPTIONAL SCHED: EL0 placement REFUSED \([a-z]+\) '[^']*' req=-?[0-9]+
 # The LAST-INSTANT backstop in `user_task_trampoline`, and this one IS a fault signature —
 # the only FORBID in this file that is not a hardware fault. It prints when an EL0 task
@@ -1656,6 +1663,10 @@ FORBID dispatch is on_tick ONLY \(no timer_preempt arm
 # read. The correction makes the rows stronger, and the way it was found is the point —
 # the citation was to a call site, not to the gate above it.)
 REQUIRE \[spread4\] live c0=[0-9]+/[0-9]+
+# ORIN-CORE0 (orin 26): the census is EIGHT columns now (`c4..c7` appended after `el0refuse=`),
+# because on render12 the Orin's six cores were censused four wide. `c5=` present means the line
+# is the widened one; the values are readings, never a verdict.
+REQUIRE \[spread4\] live c0=[0-9]+/[0-9]+ .* c5=[0-9]+/[0-9]+
 # THE TWO COMPANIONS THE SAME TICK CHAINS. `[el0live]` is chained UNCONDITIONALLY from
 # `load_witness_tick` (before the change-suppression, deliberately — sched.rs:8342 says why);
 # `[prio]` is chained only when the load line actually printed.
@@ -1678,6 +1689,14 @@ REQUIRE \[spread4\] live c0=[0-9]+/[0-9]+
 # absence now says PREEMPTION NEVER DELIVERED — which is exactly the failure this half exists
 # for and must be failable.
 REQUIRE \[el0live\] verdict=[A-Z]+ el0 runnable/parked/committed=
+# ORIN-CORE0 (orin 26): WHERE, not just whether — R35 ("six cores online means six cores
+# hosting") scored on the line an operator reads every window. `el0cpus=` is the set of cores
+# whose EL0 dispatch clock was ever stamped; this row demands a mask with MORE than bit 0 set
+# (`0x1` alone does not match; `0x2`, `0x3f`, `0x10` do). On the synced flight line (apsrun
+# default-ON) the CPU_AUTO `el0-hello` spawn lands on an AP before the boot core joins run(),
+# so an idle boot already satisfies it. A `UNAOS_NOAPSRUN=1` boot reds it BY DESIGN — that
+# image hosts on one core, which is exactly the shape R35 rejects.
+REQUIRE \[el0live\] verdict=[A-Z]+ .* el0cpus=0x([2-9a-f]|[0-9a-f]{2,})
 #   GUARDS (C8) — THE PRIMARY DELIVERY PREDICATE, and the one to read first when this block
 #   reds. `el0live_tick` is chained from `load_witness_tick` BEFORE the load line's
 #   change-suppression, and its own suppression is liveness-shaped and CANNOT SWALLOW THE

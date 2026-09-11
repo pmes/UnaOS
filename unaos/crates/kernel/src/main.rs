@@ -7181,10 +7181,10 @@ fn tegra_el0_start_maybe() {
     }
     let demo = unaos_kernel::arch::syscall::setup();
     unaos_kernel::arch::syscall::protect();
-    // Pinned to the boot core (cpu 0, not CPU_AUTO): `pick_cpu_slot` short-circuits a non-AUTO request,
-    // so the EL0 task cannot be placed on a secondary. That pin is load-bearing — the boot core is the
-    // one this function has just proven is at EL1 with the real `VBAR_EL1` installed.
-    unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, 0);
+    // ORIN-CORE0 (orin 26) — CPU_AUTO, not a pin to core 0. The pin's reason ("the boot core is the one this function has just proven is at EL1 with the real VBAR_EL1") EXPIRED with ORIN-APSRUN: every AP re-runs `exceptions::install` and stamps `EL1_CORE_MASK` before this line runs (render12 A1 wire: `[apsrun] cpu 1..5 joins run() at EL1` at lines 1671-1715, `el0-hello spawned` at 1741), and the boot core is NOT in `ONLINE_MASK` yet (`mark_online(0)` is the terminus's, line 1880). So the pin parked the ONLY EL0 task of an idle boot behind five idle EL1 hosts, and `[el0live] el0cpus=0x1` read as a placement defect it was not: A3's CPU_AUTO `bg-user` landed on cores 1, 3, 4 through this same key chain (`el0cpus=0x3f`). Line-neutral edit: this file's panic-Location rule.
+    // FALLBACK keeps the `UNAOS_NOAPSRUN=1` opt-out boot alive: with no EL1 host online yet, CPU_AUTO is REFUSED (task id 0, no first-run, verdict FAIL), so that shape keeps the pin — core 0 is at EL1 and dispatches the queue when it joins run(). `el0_placement_possible` is the loader's own advisory predicate (`spawn_user_image_bg` asks it), so both arms are the scheduler's answer, not this function's guess. The witness prints which arm ran and the core the scheduler chose (`last_user_placement`, read at once from this same task, the contract its doc names); `core=-1` is a refusal.
+    let cpu = if unaos_kernel::arch::sched::el0_placement_possible(unaos_kernel::arch::sched::CPU_AUTO) { unaos_kernel::arch::sched::CPU_AUTO } else { 0 };
+    let tid = unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, cpu);
     unaos_kernel::arch::sched::spawn(
         "tegra-el0-verdict",
         unaos_kernel::arch::syscall::tegra_el0_verdict,
@@ -7192,8 +7192,8 @@ fn tegra_el0_start_maybe() {
         0,
     );
     serial_println!(
-        ":: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry {:#x} sp {:#x} ::",
-        demo.hello,
+        ":: TEGRA-EL0: el0-hello spawned at EL0 (placement={} core={} tid={}), verdict armed — entry {:#x} sp {:#x} ::",
+        if cpu == unaos_kernel::arch::sched::CPU_AUTO { "auto" } else { "boot-core" }, if tid == 0 { -1 } else { unaos_kernel::arch::sched::last_user_placement() as isize }, tid, demo.hello,
         demo.sp
     );
 }
