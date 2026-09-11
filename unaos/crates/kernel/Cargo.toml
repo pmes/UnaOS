@@ -2148,7 +2148,9 @@ ga10bprobe3b = ["ga10bprobe3"]
 # GA10B-PROBE4A (`UNAOS_GA10B_PROBE4=1`): rung 4a of the GA10B ladder — the BCR WRITABILITY CENSUS.
 # Brief (frozen design): docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §3.2. The tail of
 # `arch/aarch64/ga10b_probe.rs` (`ga10bprobe4_run`) and one appended call site in `tegra_early_stop`,
-# placed BETWEEN rung 3's call and rung 1's. Inside rung 3's PROVEN power+clock bracket (re-proven on
+# on the post-heap-init line (AFTER `memory::init`, which seats the rung's DMA window — not in the BPMP
+# block, where boot 1 of 2026-09-11 read REFUSED reason=no-dma-window); the channel is re-derived by
+# `bpmp_tegra::chan_reopen`, addresses only, no second IVC sync. Inside rung 3's PROVEN power+clock bracket (re-proven on
 # this boot, never inherited), it re-reads the two rung-4 inputs (`bcr_dmacfg` lock bit, `bcr_ctrl`
 # baseline), seats the rung's OWN 2 MiB Normal-NC DMA window (mmu_tegra `seat_ga10b4_nc`, the NET4A
 # law, never the NIC's block), fills it with a non-signature pattern, then writes the six BCR DMA

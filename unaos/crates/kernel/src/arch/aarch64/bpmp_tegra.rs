@@ -570,3 +570,21 @@ pub fn jb7_clocks_query(chan: &Chan, ids: &super::fdt_tegra::XusbIds) {
 pub fn pg_get_state(chan: &Chan, id: u32) -> Option<(i32, u32)> {
     chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]).map(|(err, out)| (err, out[0]))
 }
+
+/// GA10B-PROBE4 (orin 26): re-derive a `Chan` from the DTB geometry WITHOUT a second IVC handshake.
+/// `Chan` is addresses only (txq, rxq, doorbell trigger); the frame counters live in SYSRAM and the
+/// channel `jb1b_ping` established earlier in the boot stays established. Used by the rung-4 call after
+/// heap-guard, where the ping's `chan` is out of scope. Returns `None` only if the doorbell block cannot
+/// be derived — the same refusal `jb1b_ping` makes. Touches no new MMIO class: the SYSRAM and HSP
+/// addresses were both proven by the ping on this boot.
+#[cfg(feature = "ga10bprobe4a")]
+pub fn chan_reopen(geom: &BpmpGeom) -> Option<Chan> {
+    let db = doorbell(geom.hsp_base)?;
+    let txq = geom.shmem_tx + CPU_TX_CH * CH_STRIDE;
+    let rxq = geom.shmem_rx + CPU_TX_CH * CH_STRIDE;
+    serial_println!(
+        ":: tegra: [ga10bprobe4a] BPMP channel reopened from DTB geometry (no IVC re-sync): txq={:#x} rxq={:#x} state tx={:#x} rx={:#x} ::",
+        txq, rxq, r32(txq + OFF_W_STATE), r32(rxq + OFF_W_STATE)
+    );
+    Some(Chan { txq, rxq, trigger: db.trigger })
+}
