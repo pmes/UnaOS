@@ -6266,8 +6266,8 @@ fn clickband_witness(x: i32, y: i32, band: &str, outcome: &str) {
 ///    outcome `dismiss`. This is also what keeps the fixture side-effect-free: the press that would
 ///    otherwise hit a window is spent dismissing.
 /// 3. **the dock strip's bottom-left corner** — the dock band, whatever outcome the tile layout gives
-///    that pixel (`background`/`raise`/`shell-reopen`). A `shell-reopen` latch is drained so a later
-///    desktop loop cannot service a reopen no operator asked for.
+///    that pixel (`background`/`raise`/`launch-shell`/`launch-console`). A posted LAUNCH is drained
+///    so a later render pass cannot mint a pinned app's window no operator asked for (APPPIN).
 ///
 /// Every press is paired with its release through the same router, so the mask latch leaves as it
 /// arrived; the bar is restored to its prior state.
@@ -6307,18 +6307,18 @@ fn clickband_selftest() {
     let out_hit = press((pw - 1) as i32, (ph / 2) as i32);
     let out_out = crate::video::crystal::last_press_outcome();
 
-    // Leg 3 — the dock band, at the strip's CENTRE. On an emptied dock the one tile there is the
-    // PINNED shell tile (the console's way back), so this press latches `SHELL_REOPEN` — and the
-    // SCHED-X86 render loop's `take_shell_reopen` (main.rs) races this selftest on another core and
-    // could win that latch mid-ladder, reopening a shell and moving focus before `wmdirect_selftest`
-    // runs: deterministic arming, probabilistic flake. So the latch is drained UNCONDITIONALLY the
-    // instant the press edge returns — before the outcome read and before the release — closing the
-    // window to nothing the render loop can service. The `band=dock` line and the outcome word
-    // (`shell-reopen`, the true routing result) are unaffected; only the side effect is disarmed.
+    // Leg 3 — the dock band, at the strip's CENTRE. On an emptied dock the tiles there are the
+    // PINNED APP tiles (APPPIN: console, shell), so this press POSTS a launch for whichever one the
+    // centre lands on — and the SCHED-X86 render loop (main.rs) drains the shell's post on another
+    // core and could mint a shell window mid-ladder, moving focus before `wmdirect_selftest` runs:
+    // deterministic arming, probabilistic flake. So the posts are drained UNCONDITIONALLY the
+    // instant the press edge returns — before the outcome read and before the release — leaving
+    // nothing the loop can service (`dock::apppin_selftest`, the ladder's tail, lets it service one).
+    // The `band=dock` line and the outcome word (`launch-shell` / `launch-console`) are unaffected.
     let (dock_hit, dock_out) = match crate::video::dock::strip_rect(pw, ph) {
         Some((dx, dy, dw, dh)) => {
             let hit = wc_click_route_at(crate::pal::Event::Button(1), (dx + dw / 2) as i32, (dy + dh / 2) as i32);
-            let _ = crate::video::dock::take_shell_reopen();
+            let _ = crate::video::dock::take_launch(crate::video::dock::PinnedApp::Shell); let _ = crate::video::dock::take_launch(crate::video::dock::PinnedApp::Console);
             let _ = wc_click_route_at(crate::pal::Event::Button(0), (dx + dw / 2) as i32, (dy + dh / 2) as i32);
             (hit, crate::video::dock::last_press_outcome())
         }
@@ -17520,7 +17520,7 @@ fn winx_launcher(demo_cpu: usize) {
     // (nothing after it should wait behind that), and it is otherwise the least disruptive fixture
     // here: it moves no pointer, re-tiles nothing, and its two rows are its own and closed on exit.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    vugres_selftest(demo_cpu);
+    { vugres_selftest(demo_cpu); crate::video::dock::apppin_selftest(); } // APPPIN — the pinned-app round trip, LAST: it drives the REAL render body (press -> launch, close -> quit, press -> fresh launch), parks the real pointer over the relaunched shell window for the sprite leg, and closes what it opened. A block under the line above's cfg, so no line is added and `apppin_selftest` compiles only where `dock` does.
 }
 
 // =============================================================================================
