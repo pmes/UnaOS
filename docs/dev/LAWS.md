@@ -71,14 +71,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 ## 2. Batons and handoff
 
-- **The handoff is adversarial, not a rule list** (R48, Peter 2026-09-11: "give each new session a new point of
-  view... here's what you're taking over. here's what i did and it was this or that but maybe something is being
-  missed"). Each close writes ONE handoff (`~/.claude/plans/unaos/batons/<track>-<n>.md`, corpus kept) with four
-  sections: what you are taking over (tree state with shas, what flew, what is half done per branch); what I did
-  and why; what I chose between and what I picked; **what I may have missed** (the two or three things this
-  session could not verify, each with the command that would). The next session attacks that last section before
-  it starts new work. The three-line header this replaced (read LAWS, read the baton and the resume, one arc per
-  session) stays true and is no longer the point of the document. Enforcer: R48; `baton-check.sh` warning only.
+- **The queues are the handoff; there are no batons and no numbered sessions** (Peter 2026-09-12: "there is no more orin 28 or rmbp 19 or pi 11"; "one session after the next with whatever focus I tell you"). What a session learns goes into the queue it belongs to THE TURN IT IS LEARNED: metal-specific facts and jobs into that platform's `docs/dev/OS/<track>-queue.md`, everything else into `docs/dev/QUEUE.md` on main — including the other platforms' queues when a finding touches them. R48's challenge ("maybe something is being missed") is written as open questions in those queue entries, not in a separate file. The focus is what Peter says at the start of a session and nothing else; it is not a place to store state. Enforcer: R48, R45; warning only.
 - **Every baton fact is a claim.** Verify each sha with `git log --oneline -1` and reachability with
   `ls-remote`; an inherited open question is checked in the peer's ledger at their head (`git show
   <peer-head>:<ledger>`) before re-asking; a wrong instruction in a baton is executed, not reviewed,

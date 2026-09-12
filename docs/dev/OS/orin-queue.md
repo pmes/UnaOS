@@ -4,8 +4,15 @@ One file, fixed path, not per-round. Kept current AS WORK HAPPENS, never "at clo
 a list written only at close is never written at all by a session that does not reach one,
 and a session ends when the work is done or when it is not worth continuing.
 `✓` = verified in this tree.  `·` = inherited, NOT re-checked.  Re-derive every sha before acting.
-Last touched 2026-09-12 ~04:3xZ by orin 27 at CLOSE (Peter: context full). READ `~/.claude/plans/unaos/batons/orin-28.md` — the R48 handoff.
+Last touched 2026-09-12 ~04:4xZ at close (Peter: context full). THIS FILE and docs/dev/QUEUE.md ARE the handoff; there are no batons and no numbered sessions (Peter 2026-09-12).
 ## CLOSE STATE — orin 27, 2026-09-12 ~04:3xZ
+· ORIN-METAL, from render13 (Peter on the glass; the shared-code items are in docs/dev/QUEUE.md §1 and §5):
+  – Shut Down NOT done: the deferred GPU rung (4a/4b/4c, `UNAOS_GA10B_PROBE4=4`) has not fired. Next: re-arm the waker on `DEFERRED RUN|BROM-VERDICT|CENSUS-COMPLETE|PSCI SYSTEM_OFF` (`sh ~/unaos-bench/tools/waker.sh`, fresh anchors), have Peter Shut Down (crystal, or `shutdown` in the shell — the pointer is gone), score with docs/dev/evidence/orin27/scorer-ga10b4.sh 4a|4b|4c, commit the capture as docs/dev/evidence/orin27/render13-boot1.log, tick A51/A55 and every flown row. Partial wire: ~/unaos-bench/scratch/orin27/render13-wire-partial.txt (raw.log from byte 40765064).
+  – A49: bit18 is NOT the card-detect signal (OVERRIDDEN with the card seated) → the gate moves to the DTB `cd-gpios` GPIO; needs a Tegra GPIO driver (none under arch/aarch64).
+  – A53: first native root, `rw=no` — tegra-sd is read-only; writes to `/` fail on a slot boot; the write path is its own arc.
+  – A54 BEAM: `NO-RASTER` — none of the candidate registers behaved as a raster line counter (the BEAM RAW lines in the capture say which test each failed); the tearing fix is inert until a counter locks; Peter saw no tearing anyway.
+  – A56: the multi-slot reader works (4 LUNs, data card at lun 0, mounted rw at /volumes/UNAOS-DATA). Two readers at once is still a coin flip (trunk queue).
+  – A58: card-v2 (FATCLUST) BOOTS from the native slot; the guard/number objections are in the trunk queue §5. hw-jetson carries FATCLUST unlanded.
 ✓ render13 IS UP on the Orin (native slot, card-v2, KELF max=0x34f820); Shut Down NOT yet done → the deferred GPU rung (4a/4b/4c) has not fired. The waker of this session dies with it: the next session re-arms on `DEFERRED RUN|BROM-VERDICT|CENSUS-COMPLETE|PSCI SYSTEM_OFF` and scores with docs/dev/evidence/orin27/scorer-ga10b4.sh; the partial wire is ~/unaos-bench/scratch/orin27/render13-wire-partial.txt (30,962 lines, from raw.log byte 40765064).
 ✓ Glass (Peter): apps launched (core 1); some titles/menus say "Application" (A59 owed); console could not reopen after close; shell reopened but the POINTER VANISHED; no tearing (BEAM NO-RASTER — inert); mousing/dragging NOT smooth (`[comp2] max_us` up to 588 ms). R49/R50 rule the fix shape: console+shell = pinned APPS, Quarry = Finder.
 ✓ Branches CUT, executors NOT spawned (close = stop starting): exec-orin27-appname, exec-orin27-conreopen (→ APPPIN per R49), exec-orin27-dragstall, exec-orin27-cursorlost (unused) — all at 2f6adcc4. Briefs are in the baton.
