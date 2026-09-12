@@ -576,6 +576,59 @@ REQUIRE \[wc-c\] side-by-side windows=2 drawn=2
 REQUIRE \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
 FORBID \[wc-d\] verify .*-> FAIL
 
+# --- 4a-band. CHROMEBAND (2026-08-25): chrome row fills are clipped to the band, like content.
+# ---    `fill_rect_ceramic` walked the WHOLE box height on every call; on a banded stage (WC-M,
+# ---    row_bytes past MAX_STAGE_BYTES / box rows) every band re-walked every chrome rect and the
+# ---    out-of-band rows were discarded only at the bottom of the call chain, after paying a
+# ---    ceramic shade + call + bounds work PER ROW. GEOMETRY-GATED DEFECT: 640x480 never bands
+# ---    (chunk_rows=1638 covers any box) so THIS battery could never see it; at 1920x1200
+# ---    (chunk_rows=546) a full-height window is 3 bands and a composite paid ~2,400 wasted
+# ---    per-row fills inside `[comp2] compose_us`. The `[chromeband]` rollup prints on `[comp2]`'s
+# ---    cadence: `rows_pp` is the per-pass chrome row count, `waste=` the span's rows issued
+# ---    outside the destination — zero BY CONSTRUCTION after the clamp, at every geometry, so the
+# ---    pair below holds at 640x480 AND under `UNAOS_FBW=1920 UNAOS_FBH=1200`, and the FORBID is
+# ---    the tripwire that reds ANY banding geometry the moment an unclipped chrome walk returns.
+# ---    Measured pre-fix at 1920x1200: `waste=980` on the banded rollup span (this battery bands
+# ---    one console present per span; a full-height window on the bench pays ~2,400 per
+# ---    composite); post-fix the same span reads `waste=0`, and this leg replayed against the
+# ---    pre-fix capture reds on exactly the FORBID below (118/118, 1 forbidden).
+# ---    Ledger: docs/dev/OS/08_VIDEO/engine.md §CHROMEBAND.
+# ---    RE-ANCHORED AT THE 0ed6fee2 FOLD: trunk landed its own band clamp (6eba58f7) carrying the
+# ---    `[wc-b]` witness family, and pi's `[chromeband]` emitter was retired with pi's parallel
+# ---    implementation — the counters it read no longer exist, so the old pair below would have
+# ---    passed VACUOUSLY (rows_pp=0 waste=0) if it compiled at all. The same quantity is now
+# ---    `chrome_rows` vs `chrome_rows_used`: waste=0 IS amp=1.00x. Metal reference (rmbp
+# ---    flight-3, x86): rollup chrome_rows=101049239 chrome_rows_used=101049239 amp=1.00x CLEAN
+# ---    across 87,140 presents. ⚠ THE FORBID BELOW IS NOT YET FALSIFIED ON THIS BENCH — the
+# ---    `[wc-b] fixture` line deliberately exercises banding geometry, so if the fixture emits an
+# ---    AMPLIFIED reading BY DESIGN this FORBID reds honestly and must be narrowed to the rollup.
+# ---    First battery run after the fold IS the falsification; do not call this leg proven before it.
+# ---    FALSIFIED AND CORRECTED on the first post-fold battery, as the line above promised: the
+# ---    REQUIRE first demanded `-> CLEAN` and read 0 hits (117/118). The verdict WORD is
+# ---    geometry-dependent — at 640x480 nothing bands, so the rollup honestly says
+# ---    `banded=0 ... amp=1.00x -> UNBANDED`; `CLEAN` appears only once banding occurs, and the
+# ---    per-window line says `WHOLE`. The INVARIANT that encodes the defect's absence is
+# ---    chrome_rows == chrome_rows_used, i.e. amp=1.00x, so that is what is asserted and the
+# ---    verdict word is deliberately NOT.
+# ---    ⚠⚠ WHAT THIS LEG DOES AND DOES NOT PROVE, measured post-fold and stated so no successor
+# ---    reads a green as a guarantee: the banded path IS NOT ENTERED BY THIS BATTERY AT EITHER
+# ---    GEOMETRY. Both runs read `banded=0` — 640x480 AND `UNAOS_FBW=1920 UNAOS_FBH=1200`
+# ---    (chunk_rows = 4 MiB / 7680 B = 546 rows, and no window in this battery is taller than that;
+# ---    the panel being 1200 tall does not band a 332-row window). Trunk's deliberate band exercise,
+# ---    `chromeband_fixture`, is `cfg(target_arch = "x86_64")` and so never runs here at all.
+# ---    CONSEQUENCE: the REQUIRE passes on unbanded presents where amp=1.00x is trivially true, and
+# ---    the FORBID has never had the OPPORTUNITY to fire on this bench — it is UNFALSIFIED, not
+# ---    proven. It remains a real tripwire for the day banding does occur, and that is its whole
+# ---    present value. OWED, to give the leg teeth on aarch64: make the band fixture reachable on
+# ---    this arch (it is arch-neutral arithmetic behind an x86-only cfg), or drive one window past
+# ---    546 rows at 1920 wide in this battery. Until then an absence here is not evidence.
+REQUIRE \[wc-b\] rollup presents=[0-9]+ banded=[0-9]+ maxbands=[0-9]+ chrome_rows=[0-9]+ chrome_rows_used=[0-9]+ amp=1\.00x
+# ---    NOTE the FORBID is written look-around-free per the PORTABILITY RULE at the head of this
+# ---    file: `foreman` (Rust regex) refuses look-around and its preflight is all-or-nothing, so a
+# ---    single `(?!…)` here would make that evaluator reject the WHOLE spec and check nothing.
+# ---    Chain below is the documented prefix-factored form of "not followed by 1.00x".
+FORBID \[wc-b\] rollup .* amp=(?:$|[^1]|1(?:$|[^.]|\.(?:$|[^0]|0(?:$|[^0]|0(?:$|[^x])))))
+
 # --- 4a-bis. DRAINSTALL (PA38 metal, 2026-08-12): the drain barrier's wait is BOUNDED, and reaching
 # ---    the bound is a FAULT, not a mode. `DrainBarrier::drain` abandons at DRAIN_ABANDON_SPINS and
 # ---    says so; abandoning means a composite may still be blitting from a row the teardown cleared,

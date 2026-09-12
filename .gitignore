@@ -33,3 +33,7 @@ cargo_check.log
 jetson-serial.log
 pi-serial.log
 aether-ledger.txt
+
+# Compiled Python — STACKPOOL (71671423) tracked one by accident; the fold scout caught it.
+__pycache__/
+*.pyc

@@ -8455,18 +8455,18 @@ fn load_columns(snap: &[CoreSnap; NUM_CPUS]) -> alloc::string::String {
 /// SCHED-2 periodic load heartbeat: called once per `timer_preempt` (per core, per tick, metal-only).
 /// The core whose atomic increment lands exactly on the `LOAD_WITNESS_INTERVAL` boundary is the sole
 /// emitter for that window (fetch_add hands each multiple to exactly one core), so there is no
-/// double-print and no reader lock. Change-only: it prints only when the packed per-core busy-percents
-/// differ from the last emission. Cheap on the non-boundary passes (one relaxed fetch_add + a modulo).
+/// double-print and no reader lock. Change-only, and STORM-R3 `witness`-gates the emit itself — a
+/// media build keeps only the cadence and `el0live_tick`. See `scheduler.md` §2 (STORM-R3).
 fn load_witness_tick() {
     let n = LOAD_WITNESS_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if n % LOAD_WITNESS_INTERVAL != 0 {
         return;
     }
-    // EL0-LIVE: taken BEFORE the change-suppression below, deliberately. Every other line on this
-    // train is suppressed while the LOAD signature is unchanged — and a machine whose EL0 fleet has
-    // just died is precisely a machine whose load has gone flat and stopped changing. Gating the
-    // liveness census on load movement would mute it exactly when it is the only line worth having.
-    // It carries its own (liveness-shaped) suppression instead; see `el0live_tick`.
+    // EL0-LIVE: taken BEFORE the change-suppression below, and deliberately OUTSIDE STORM-R3's gate.
+    // Every other line on this train is suppressed while the LOAD signature is unchanged — and a
+    // machine whose EL0 fleet has just died is precisely a machine whose load has gone flat. It is the
+    // one line worth having on a MEDIA boot that freezes (PA41, dsktp boot 8), and it carries its own
+    // liveness-shaped suppression instead: silent while healthy. See `el0live_tick`, `scheduler.md` §2.
     el0live_tick();
     if !load_witness_emit() {
         return; // unchanged since the last window — stay quiet

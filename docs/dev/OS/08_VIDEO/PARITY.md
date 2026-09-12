@@ -655,6 +655,101 @@ boot's verdict, not this one's. What is established here is that the arming stat
 with headroom to spare in QEMU, that the reason it was not is measured rather than inferred, and
 that a future boot which loses a kernel task mid-cascade reds the gate instead of passing quietly.
 
+### 6.1c SHELLUP — the SECOND U7STK casualty, and why boot 10 had no shell to type into
+
+**Status: the render task's overflow is FIXED and instrumented in the tree; the metal verdict belongs
+to the next boot. One half of boot 10's failure is explicitly NOT fixed here — see the last block.**
+
+**THE QUESTION.** dsktp boot 10 came up with no usable shell window and with input that nothing
+consumed. Captures: `~/unaos-bench/capture/line-acm0/pi.log`, flight 1 at byte 804342, flight 2 at
+1243297 (both re-derived complete; a partial read of flight 1 produced an early, false "no EL0 world
+came up" reading, which the full capture refutes — `EXEC1`, `EXEC-UVUG` and the whole BGRUN suite
+PASS in flight 1).
+
+**THE CONVICTION — ONE event, both flights.** §6.1b's instrument convicted `u7-launch`. The *same*
+refusal, on the *same* blanket 16 KiB, has a second victim:
+
+```
+flight 1   :: UI2: status strip armed ::                                    log line 1018
+           [spin6] cpu=1 REFUSING corrupt switch-in: task=103:render
+           ctx_sp=0x2089f80 outside its stack [0x208a000,0x208e000)         log line 1115
+flight 2   :: UI2: ... ::  1057  →  [spin6] ... task=98:render  1074        — dead in 17 lines
+```
+
+`ctx_sp` 96–128 bytes *below* the task's own low bound is §6.1b's signature exactly: the render
+task's own frame chain, not a neighbour. The corroborating number was already on the same wire —
+`[u7stk] at=after:pidesk_arm task=70:u7-launch … hw=16496` says the desktop-arming subtree *alone*
+carries a high-water 112 bytes past 16 KiB.
+
+**WHY ONE DEATH IS THE WHOLE DESKTOP.** `render_service` is not one tenant among several. It is the
+sole `GUI_CHANNEL.recv()` in the tree, the sole drain of `serial::shell_inbox` (the SERIAL-FOCUS
+seam), the only site that mints the shell window, and the only caller of `pulsewin::service()`. So
+boot 10's four symptoms are four projections of one fault:
+
+| symptom, both flights | what it actually is |
+|---|---|
+| `[click2] depth gui_chan=65 (sent=66 recv=1)`, `recv` frozen at 1 from the drop on | the only consumer is dead |
+| no `[shellwin-pi]` line at all | the only site that mints the shell window is dead |
+| no `[pulsewin] open` line at all | `[pidesk] pulse-window ARMED` is the cascade *announcing* the arm; the render pass is what *opens* it |
+| RX interrupt live on injected bytes, no shell answer on the wire | bytes reach `shell_inbox` and sit there unconsumed |
+
+**THE FIX.** `sched::spawn_prio_stack` — the `spawn_stack` × `spawn_prio` cross, which did not exist
+(one takes a size at `PRIO_NORMAL`, the other a band at the blanket size; the render task needs
+both) — and `RENDER_STACK_SIZE = 32 KiB`, the same bound §6.1b measured for the same cascade.
+
+**THE INSTRUMENTS.** Two, both `witness`-gated on §6.1b's rule:
+
+* `[u7stk] at=render:pass`, folded onto the `[sched6]` ~5 s cadence, so the size never becomes a
+  guess again — a future arc that deepens a render pass watches headroom shrink on the gate.
+* `[shellup] census` — one line per boot naming every desktop tenant's launch outcome, the render
+  task's liveness, and the GUI channel's books. Driven from the **input** core (`status_tick` on
+  metal, `input_service`'s poll-nap twin under QEMU, where `status-tick` is timer-gated and never
+  spawned) and deliberately *not* from the render pass: `[sched6]` never fired once in either flight
+  of boot 10, so a census hung off the render task would have been silent on exactly the boot it
+  exists for. It reports `desktop=UNARMED` too, because a desktop that never arms is the finding.
+
+Live on the battery, and the healthy reading is the direct falsifier of boot 10's sick one:
+
+```
+[u7stk] at=render:pass task=71:render … len=32768 used=1536 hw=3264 headroom=29504
+[shellup] census t=12856ms desktop=UNARMED render=live passes=+48 shell=none:unminted win=0
+          pulse=0 quarry=closed gui=sent48/recv48 depth=0 app_active=false == witness ::
+```
+
+`gui=sent48/recv48 depth=0` with `render=live`, against boot 10's `sent=66 recv=1 depth=65` with the
+render task dead. That contrast is the whole point of the witness.
+
+**NOT REPRODUCIBLE ON THE GATE, structurally.** The overflow needs a preemption frame on top of an
+already-deep pass, and timer delivery on this path is metal-only — QEMU raspi4b takes no Group-1 IRQ,
+so the render task is never preempted there. `kernel8-test` green does not exonerate the 16 KiB,
+which is why the size ships with an instrument rather than alone.
+
+**KNOB-OFF IDENTITY — measured, not reasoned (§5.3), and a §5.2 sanctioned delta.** Every wire-in is
+folded onto a pre-existing source line with its `#[cfg]` on the *statement*; all new items are
+appended at their file's tail. `git diff -U0` shows eight `-N +N` hunks and two tail appends, so no
+panic `Location` moves. Three knob-off `./arroyo kernel8` builds:
+
+| build | sha256 of `target/pi_baremetal/kernel8.img` |
+|---|---|
+| B — baseline `b2471fec` | `a41e2e5ec9bdb835530e2d8622f66bb22ffc738ee5f1baff1a67e9deb25a3de2` |
+| C — baseline + stack fix ONLY | `6513c0b640b9a4053dc8c4ebf99e8822f9990ddc012bbcfaf76f8d136c3eb672` |
+| A — this arc, complete | `6513c0b640b9a4053dc8c4ebf99e8822f9990ddc012bbcfaf76f8d136c3eb672` |
+
+**C == A**: the census, the probe, the heartbeat and the whole tail block contribute *exactly zero
+bytes* to the knob-off image — line-neutral and MIR-neutral, measured. **A ≠ B** is the declared
+delta, and it is the stack fix alone: a correctness fix on a path that ships in the knob-off image,
+which is the §5.2 exception. (C was built in a different directory from A, so the match doubles as
+the path-independence control engine.md asks for.)
+
+**WHAT THIS ARC DOES NOT FIX, stated so it is not re-litigated.** In flight 1
+`:: PI-DESK: desktop armed ::` lands at log line **1496** — 381 lines *after* the render task was
+already dead. In flight 2 it never lands at all. So flight 2 carries a **second, independent**
+defect: the witness cascade never released the panel (its `[el0live] verdict=STARVED` run and the
+core-2 wedge are the visible end of it), and a render task with a bigger stack would still have found
+no desktop to furnish there. This arc fixes the render task; it does not fix the cascade. The census
+is written to tell the two apart on the next boot instead of guessing — `desktop=UNARMED` with
+`render=live` is the cascade's fault, `desktop=armed` with `render=DEAD` is this one's.
+
 ### 6.6 THE VUG UPGRADE — the real answer to "where is the upgraded vug"
 
 **This is the replacement for the pacer work, and it is where Peter's direction actually points.** The

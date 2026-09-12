@@ -9199,3 +9199,556 @@ take explicitly, because the pre-written gate is silent on it.
 *Fold discipline note:* boot 14 flew and was read the same sitting; this fold was written by the
 successor session from the capture, per the standing no-folds-at-close order — the capture, not this
 prose, is the evidence of record.
+
+#### 49.25.9 `v3dalloc` — the allocation/consumer audit against the measured part, the TMU-under-V5 decision, and the SINGLESEG rung designed (PI-V3D-104, desk arc, 2026-08-21/22)
+
+`OUTCOME V5`'s residue (§49.25.8) named two undone jobs: read the allocation trio against the part
+boot 14 measured, and take the TMU-under-V5 decision §49.25.7e's gate is silent on. This arc is
+**desk work only** — no boot flew, no kernel behavior changed. Its products are the audit below, the
+decision argued in §49.25.9c, and one designed-not-flown rung (§49.25.9d).
+
+##### 49.25.9a The producer trio, recomputed against the measured part
+
+The part (boot 14's `VPMSIZE` rows): **8 KB VPM, `NSLC=2` slices, `QUPS=4` QPUs/slice, `NTMU=1`
+TMU/slice, `NSEM=0`**. The sector unit does not depend on the VPM's size: 1 sector =
+`V3D_CHANNELS(16) × 4 B × 8 rows` = **512 B**, so the measured VPM is **16 sectors**.
+
+| field | driver value | recomputed against 8 KB / 2 slices | law source | verdict |
+|---|---|---|---|---|
+| `cs_output_vpm_segment_size` | 1 | 6 coord words → `align(6,8)/8` = 1 sector = 512 B ≪ 8 KB | Mesa `v3d_vs_set_prog_data` (vir.c), **and the in-tree Mesa artifact** `scripts/pi-v3d26-mesa-compile.out.txt` line 3: `vpm_output_size=1` for the real ver-4.2 `v3d_compile()` coord run | **SANE** |
+| `cs_input_vpm_segment_size` | 0 | input folded into output (`separate_segments=0`), per the same artifact line | Mesa vir.c fold (PI-V3D-25), artifact-confirmed | **SANE** |
+| `vs_output` / `vs_input_vpm_segment_size` | 1 / 0 | same law, render variant; artifact's `is_coord=0` section prints the same quartet | artifact line 39 | **SANE** (unexercised on armed boots — the ladder returns before `probe_job`) |
+| `VCM_CACHE_SIZE` (packet 71) | 4 / 4 | 8192/512 = 16 sectors → half = 8 → `vpm_output_batches` = 8/1 = 8 → `CLAMP(7,2,4)` = **4** | Mesa `CLAMP(vpm_output_batches−1, 2, 4)` (vir.c, PI-V3D-23); artifact prints `vcm_cache_size=4` from Mesa's own run | **SANE** |
+
+**Every place the trio is set was walked, not just the M4 path.** The four shader-record builders in
+`v3d.rs` — `build_shader_record` (the real draw), `build_probe_shader_record` (PI-V3D-27's TMU probe),
+`build_bisect_null_shader_record` (the `PrimsNullShader` rung) and `build_shader_record_at`
+(PI-V3D-71's mainline-geometry record) — write the **identical** quartet `1 / 0 / 1 / 0`, and the two
+`VCM_CACHE_SIZE` emitters (the ladder's bin CL and PI-V3D-71's) both write `VCM_CACHE_BATCHES` into
+both nibbles from the one constant. There is no second, divergent allocation anywhere in the file, so
+the audit above covers the whole surface rather than one caller of it.
+
+Two notes the table compresses:
+
+- **The PI-V3D-23 comment's "16 KiB VPM" figure was stale** — written before any physical read
+  existed, it derived 32 sectors → `CLAMP(15,2,4)=4`. The measured 8 KB derives 16 → `CLAMP(7,2,4)=4`:
+  **the same value**, because the clamp ceiling absorbs every part ≥ 8 KB (and even the unit caveat —
+  if `VPM_SIZE=8`'s unit were larger than KB, the batch count only grows and the clamp still returns
+  4). The comment in `v3d.rs` is corrected in place this arc; **no packed byte changes**.
+- The GFXH-1744 floor (`Vc ≥ 2`) is respected; nothing in the trio is out of range for a 16-sector
+  part, zero-where-nonzero-needed, or above the field's 4-bit width.
+
+**Verdict on the trio: SANE against the measured part.** `OUTCOME V1`'s three numbers, had it fired,
+are now checked and would not have convicted. The allocation is not the wall's address.
+
+##### 49.25.9b The consumer side, field by field
+
+The **register-side** consumer arming is settled by prior arcs and is not re-litigated: the kick
+writes `CT0QMA` (pool base) → `CT0QMS` (pool size) → `CT0QTS|ENABLE` (tile-state array) →
+`CT0QBA`/`CT0QEA` in Linux `v3d_bin_job_run`'s exact order, P53/P54 proved the latch sound, V3D-57
+writes `BPOS=0` kernel-exact first, and **leg E's empty frame closes and writes pool 20 words +
+tile-state 48 words** — the PTB provably drains a frame it is handed. What remains auditable is the
+**CL-side** state the consumer runs under:
+
+| packet / field | value | law source | verdict |
+|---|---|---|---|
+| `NUMBER_OF_LAYERS` | 0 (minus_one, 1 layer) | Mesa `v3dX(start_binning)` | **SANE** |
+| the two memory extents the consumer is handed — `CT0QMS` pool size / `CT0QTS` tile-state array | 32 KiB pool (**compile-asserted** ≥ Mesa's 12 KiB minimum for this frame) / 256 B TSDA (`tiles × 256`, PI-V3D-57's corrected law) | Mesa `v3d_tile_alloc_sizes` (`v3d_util.c`), both encoded as `const _: () = assert!(…)` so a regression is a build error, not a boot | **SANE** — and both are **flight-proven live**: leg E writes 20 pool words and 48 tile-state words into exactly these regions |
+| `TILE_BINNING_MODE_CFG` initial/overflow block | 128 B / 64 B | `v3d_limits.h` (PI-V3D-14, Mesa's only silicon-exercised pair) | **SANE** |
+| `TILE_BINNING_MODE_CFG` nRT / max-bpp / w / h | 1 (minus_one 0) / 32-bit / minus-one geometry | `v3d_packet.xml` v42 transcription; **flight-proven consumer-live** (empty closes bin into the pool under exactly this config) | **SANE** |
+| `TILE_BINNING_MODE_CFG` MSAA / double-buffer fields | **0 by omission** — the builder writes bits 2/4/8/12/32/48 and nothing else | correct for a single-sample, single-buffered frame; and leg E closes under the **byte-identical** config word, so the omission is consumer-accepted, not merely plausible | **SANE** |
+| prologue `FLUSH_VCD_CACHE` → OQ addr 0 → `START_TILE_BINNING` | — | Mesa prologue verbatim (PI-V3D-23) | **SANE** |
+| `CFG_BITS` | fwd=1, rev=1, rest 0 | no cull either facing | **SANE** |
+| `CLIP_WINDOW` / `VIEWPORT_OFFSET` / `CLIPPER_XY` / `CLIPPER_Z` | 0,0,64,64 / centre 32,32 / 8192.0f / 0.5,0.5 | Mesa `v3dx_emit.c` (PI-V3D-17) — and `V5` says nothing ever *reached* the clipper, so these cannot be this wall | **SANE** |
+| `GL_SHADER_STATE` | 1 attr, record addr ≫ 5 (`OFF_SHADREC` 32-B aligned) | packet.xml code 64, length-5 (PI-V3D-10) | **SANE** |
+| `VERTEX_ARRAY_PRIMS` | TRIANGLES(4), 3 verts, first 0 | packet.xml code 36 | **SANE** |
+| attribute record | vec4 float, reads CS=4/VS=4, stride 16, max index `0xFFFF` | Mesa `v3dx_draw.c`; Mesa writes max index `0xFFFFFF`, ours is smaller but ≫ the max index used (2) | **SANE** (with note) |
+| record flag bits 0–3, 4–23 | clipping=1, rest 0 | `separate_input_and_output_vpm_blocks=0` **matches** `separate_segments=0`; point-size/vid/iid genuinely unused | **SANE** |
+| record `fs_number_of_varyings` (bits 24–31) | 0 | our FS is the PI-V3D-9 solid-colour program — it reads **no** varyings, so 0 is the true count whichever pass consumes the field; a bin frame runs no FS at all | **SANE** |
+
+**The one divergence found — and it does NOT convict.** Record bits **97 / 161 / 225** — the
+per-shader **"start in final thread section"** flags (the slot between "4-way threadable" and
+"propagate NaNs") — are packed **0** for all three shaders, while every program we ship is
+**single-segment**: terminal-only `thrsw`, no mid-shader thread switch (the artifact's own coord
+listing, word [19], and §49.25.7e's description of the good program class). Mesa packs this field
+from `prog_data->single_seg` (`v3dx_draw.c` / `v3dvx_pipeline.c`). Whether `single_seg` is **1** for
+a no-TMU, terminal-thrsw-only, `threads=4` program could **not** be pinned at this desk: the in-tree
+artifact does not print `single_seg`, and the vir.c assignment (`single_seg = !c->last_thrsw`, with
+the open question of whether the always-emitted final `thrsw` counts as `last_thrsw`) is exactly the
+kind of half-remembered law §5's fabricated-constant rule exists to stop. **Verdict: SUSPECT
+(the producer surface's sole Mesa-divergence candidate), polarity UNKNOWN, conviction withheld — no
+code packed.** Resolving the polarity from a fresh Mesa checkout is the designed rung's gate task
+(§49.25.9d, task 0); this arc ships **no** knob because an unverified constant is not a fix, it is
+the fourth conviction waiting to happen.
+
+**A second finding, print-only, recorded so task 0 sweeps it up.** `witness_shadrec_diff`'s field
+table (the `[v3d38]` record diff in `v3d.rs`) names bit **97** `fs_single_seg` and bit **161**
+`vs_2way_threadable` — **the same slot in two different shader blocks, under two different names**,
+so at least one of the two labels is wrong, and the table names neither 225 nor 226 at all. Nothing
+is packed from these labels: they decorate a diff print, and both bits are written 0 either way, so
+**no image byte depends on the answer**. But the name is the same question the paragraph above just
+refused to answer from memory, so it is **UNKNOWN** here too, and it belongs to the same task 0 — one fresh
+read of `v3d_packet.xml` v42 settles the polarity, the name, and this label in one sitting. Fixing
+the print label before that read would only move the guess from one place in the file to another.
+
+##### 49.25.9c TMU under `V5`: argued, and the answer is NO
+
+**The conclusion, in the two sentences the decision is owed.** A TMU store leaves the QPU through
+`tmud`/`tmua` into the TMU → L2T → memory path and never touches the VPM write FIFO, so the landmark
+does **not** ride the same drain: it genuinely discriminates "the VPM port back-pressures this
+thread" from "this thread cannot land a store anywhere" (§49.25.8's two phrasings). But that is not
+the question `V5` leaves open — the undelivered hand-off sits **downstream of a thread that boot 14
+already showed issuing 53 valid instructions and reaching program end** — so the landmark would
+spend a boot re-partitioning the QPU side while the VCM→PSE→PTB chain, the only station `V5`
+accuses, stays uninstrumented: **it stays gated on `V6`.**
+
+The argument at length, and honestly about its one soft edge. What survives on the QPU side after
+boot 14 is an *issue* witness, not a *landing* witness: `QPU_CYCLES_VALID_INSTR d=53` says the
+instructions were issued, and §49.25.8 itself re-read `INT_STS` bit16 as a thread **RELEASED rather
+than FINISHED**, so "all six `STVPMV` stores completed" is *not* something this campaign has proven
+and this section does not claim it. That crack is exactly what a TMU landmark would close — and
+closing it would still leave the wall where `V5` put it, because a landmark that lands in memory
+proves only that a *different port* works, and a landmark that does not land indicts a QPU-wide
+store block that would have to explain, without a single latched error bit, how the same thread
+reached program end at all. Either way the next question is identical: **why does nothing drain the
+VPM toward the PTB** — and that is a station a QPU-side landmark cannot see, because it happens
+after the thread the landmark instruments has ended.
+
+**Decision, recorded: the TMU landmark does NOT fly under `V5`.** §49.25.7e's gate stays exactly as
+written — the landmark (and its blocking artifact, the fresh `v3d_compile()` harness) is built on
+`V6` and only on `V6`. The gap §49.25.8 flagged in the pre-written gate is hereby closed: `V5` joins
+`V1`–`V4` on the "save the work" side. And the residue is named rather than buried: **the day the
+consumer-side instrumentation dead-ends, the "did any store LAND" doubt is the landmark's, and it is
+the tool for that day** — boot 14's bit16 + 53-instruction witness makes it the second question, not
+the first.
+
+##### 49.25.9d The next rung, designed and not flown: `singleseg` (PI-V3D-104)
+
+**One variable.** Shader-record **bit 225** — `coordinate shader start in final thread section` —
+packed 1 instead of 0. Nothing else: bits 97 (FS) and 161 (VS) stay 0 because the armed ladder's bin
+frames dispatch only the coordinate shader (the boot returns before `probe_job`), and widening the
+delta to unexercised bits widens the variable for nothing. Every list, region, digest, slot source
+and poison collar stays byte-for-byte PA51's; the baseline the boot is read against is **boot 14
+itself**.
+
+**Knob: `UNAOS_V3D_SINGLESEG=1`**, family discipline throughout — cargo feature
+`v3d_singleseg = ["v3d_vpmprobe"]` so the whole chain arms from one env var, an arm-pi feature-list
+entry for cfg coverage, a kernel8 knob block, and a `[v3d104]` serial line naming the packed bit so
+the capture self-describes (strings-proofed at build time like every armed line).
+
+**Task 0, at the desk, before any packing — the rung's gate.** Pin the field's polarity from a fresh
+Mesa checkout: `v3d_set_prog_data`'s `single_seg` assignment (vir.c), `vir_emit_last_thrsw`'s
+handling of the terminal `thrsw` (nir_to_vir.c), and the `v3dx_draw.c` packing that copies it into
+the record. §49.25.9b refused to pack this bit from memory; the rung must not either. The same read
+settles §49.25.9b's second finding — the `[v3d38]` witness table's disagreeing labels at bits 97 and
+161 — and that correction lands with task 0 whichever way the polarity falls, because it is
+print-only and changes no packed byte. The polarity answer is itself the first pre-written row:
+
+| observed | verdict | what it means |
+|---|---|---|
+| task 0 resolves `single_seg = 0` for this program class | **`OUTCOME S0`** | **the rung dies at the desk, no boot spent.** The record was right all along; the producer surface is fully Mesa-parallel *and* part-checked, and the campaign's next build is consumer-side instrumentation, not another producer field |
+| leg E diverges from `OUTCOME E1` in any way | **INCONCLUSIVE** | the empty frame never fetches the shader record, so an E change convicts the **arm** (a build that leaked wider than one bit), not the field — outranks every S row, same law as §49.25.7d's guards |
+| frame **closed** (`BFC` Δ1, retired=1) and/or `PTB_PRIMS_BINNED` moved, pool words > empty's 20 | **`OUTCOME S1`** | **the bit was the drain wall.** A mis-declared thread-section shape left the batch-complete handshake unsatisfied; the fix graduates from knob to default and the campaign moves to the render side |
+| boot-14's leg H shape **to the digit** (stall ≈ active, no PTB slot, no new ERR bit, no close) | **`OUTCOME S2`** | **the bit is exonerated** and the producer surface is closed: every field Mesa-parallel, part-checked, and now flight-tested both ways. The wall is purely the consumer, and the next rung must instrument the VCM/PSE side, not the record |
+| stall collapses (d ≈ 0 against active ≈ 28) but still no PTB movement and no close | **`OUTCOME S3`** | the bit changes the **thread's port behavior** without buying delivery — the stall and the drain are two stations, not one; fold carefully before naming the next |
+| any **newly-latched** `ERR_STAT` bit | **`OUTCOME S4`** | the bit is illegal for this program class on this part — the silicon itself answers task 0's polarity question in the negative; revert and record |
+
+One boot, cold, short capture, read in §49.25.7h's order with `[v3d104]`'s line read first (it is
+desk work on the wire, like `VPMSTATIC` before it).
+
+*Adjudicated:* boot 15 flew 2026-08-22 and **no row of this table fired as written** — the boot is
+scored, the VPMPROBE admissibility guard's PTB-flat clause is ruled on and rewritten for this boot
+class, and the verdict (**`S1-EMPTY`**, post-hoc) is recorded in **§49.25.11**.
+
+##### 49.25.9e Measured, this arc
+
+Worktree `exec-v3dalloc`, baseline `b2471fec`. Doc + one stale-comment correction in `v3d.rs`
+(PI-V3D-23's "16 KiB VPM" → the measured 8 KB derivation, §49.25.9a); no packed byte, no knob, no
+new serial line — the SINGLESEG knob is **designed here, not built**, gated on its task 0.
+
+| gate | result |
+|---|---|
+| `./arroyo check` | **green, both arches** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ kernel cfg coverage OK (12 legs)`, `✅ midden_core tests OK` |
+| `./arroyo test-arm` | **clean** — headless aarch64 QEMU to completion, `BOT-PARK … -> PASS` and `SERWIT-2 … -> PASS`, **0** `FAIL`/`PANIC`/`❌` lines in `target/serial-arm.log` |
+| `./arroyo kernel8-test` | **MBENCH PASS — 117/117 required witnesses, 0 forbidden hit(s), 10480 lines scanned**; image `4eeb3f935d7151b0…` |
+| code-change extent | `git diff -U0` on `v3d.rs` = **10 changed lines, 0 of them non-comment** (machine-checked, not asserted) — the arc's only kernel edit is prose inside `//`, so no instruction, constant or packed byte moves; no separate baseline image was built and none is claimed |
+| strings-proof | **none owed** — no knob, no feature, no new serial line was added this arc; the `[v3d104]` line named in §49.25.9d is part of the *design*, and it is proofed the day it is built, not here |
+
+*Provenance, per the file's honesty discipline.* This arc was opened by one session and **finished by a
+successor** after the first was halted by a usage limit mid-flight: §§49.25.9a–d's audit, decision and
+rung design are the predecessor's work, read against the code and the boot-14 capture and kept; the
+successor added §49.25.9a's every-place sweep, §49.25.9b's two extra rows and the `[v3d38]` label
+finding, sharpened §49.25.9c to stop short of claiming the `STVPMV` stores *completed* (§49.25.8 reads
+bit16 as RELEASED, not FINISHED — the two sections now agree), and ran the gates above. No boot flew
+for either half.
+
+#### 49.25.10 `v3dseg` task 0 — the polarity pinned from Mesa, the mislabel corrected, and SINGLESEG built (PI-V3D-104, desk arc, 2026-08-22)
+
+§49.25.9d made one thing the SINGLESEG rung's precondition: **pin the polarity of shader-record bit 225
+from authority, or do not pack it.** §49.25.9b had found the bit SUSPECT with **POLARITY UNKNOWN** and
+deliberately shipped nothing. This arc is that task 0, and it is again desk work only — no boot flew.
+The answer is that **Mesa packs 1 where we pack 0**, so `OUTCOME S0` does not fire and the rung lives;
+it is built here, default OFF, one bit wide.
+
+##### 49.25.10a The polarity, pinned
+
+There is no Mesa checkout on this host (the PI-V3D-26 harness was built on another machine, against a
+sparse checkout under a scratch path that no longer exists), so the four sources below were fetched raw
+from `gitlab.freedesktop.org/mesa/mesa` `main` on 2026-08-22. Line numbers are that snapshot's; the
+field and function names are the load-bearing part and are quoted exactly.
+
+| # | source | what it says, verbatim in its load-bearing part |
+|---|---|---|
+| 1 | `src/broadcom/cle/v3d_packet.xml` (`<vcxml gen="4.2" min_ver="42" max_ver="71">`), `<struct name="GL Shader State Record" max_ver="42">` | each shader group carries exactly **three** flags: `Fragment/Vertex/Coordinate Shader 4-way threadable` at bits **96/160/224**, `… start in final thread section` at **97/161/225**, `… Propagate NaNs` at **98/162/226** |
+| 2 | `src/gallium/drivers/v3d/v3dx_draw.c` | `shader.coordinate_shader_start_in_final_thread_section = v3d->prog.cs->prog_data.vs->base.single_seg;` (and the VS/FS pair beside it; `src/broadcom/vulkan/v3dvx_pipeline.c` writes the identical three assignments) |
+| 3 | `src/broadcom/compiler/vir.c`, `v3d_set_prog_data` | `prog_data->single_seg = !c->last_thrsw;` |
+| 4 | `src/broadcom/compiler/nir_to_vir.c` + `qpu_schedule.c` | `vir_emit_thrsw` is reached only from `ntq_flush_tmu`, the fragment-shader TLB-read path and the barrier intrinsic; `vir_emit_last_thrsw` injects one **artificially** so that spilling lands ahead of it; `v3d_nir_to_vir_finish` then runs `if (!c->spills && c->last_thrsw != c->restore_last_thrsw) vir_restore_last_thrsw(…)`, which for a program that had none of its own **removes the injected instruction and sets `c->last_thrsw = NULL`**. The terminal `thrsw` every V3D program carries is emitted later still — `qpu_schedule.c`: "*Emit the program-end THRSW instruction*" — unconditionally, and is **not** `c->last_thrsw` |
+
+**Chained: `single_seg = 1` for a shader that has no thread switch of its own**, and it means what its
+v42 name says — the hardware spawns the thread **already in the final thread section**, because no
+section transition is coming. `nir_to_vir.c` says so in its own words at the one place it treats
+non-fragment stages differently: *"For V3D 4.x, we can spawn the non-fragment shaders already in the
+post-last-THRSW state"*. The same flag reaches compute through a different door —
+`v3dx_draw.c`: `if (…->single_seg) submit.cfg[5] |= V3D_CSD_CFG5_SINGLE_SEG;` — so this is a hardware
+notion with a hardware name, not a driver bookkeeping bit.
+
+**Our coordinate shader is exactly that shape, and this is machine-checked in-tree, not asserted.**
+`CS_VS_WORDS`'s 27 words were decoded on their `sig` field (bits [57:53], `SIG_THRSW == 1`, the same
+decode `cs_tail_witness` prints): words 0–10 carry `sig=12` (`ldunifrf`), **word [24] carries `sig=1`
+(`SIG_THRSW`) and no other word carries any signal at all**. The program is **TMU-free**, and on the
+round-tripped artifact's authority rather than our own comments': `scripts/pi-v3d20-qpu-gen.out.txt`'s
+"COORDINATE/VERTEX shader body (`OFF_CS_CODE` / `OFF_VS_CODE`)" section disassembles these exact words
+through Mesa's own packer/disassembler and contains **no `tmu` mnemonic of any kind** — the TMU probe is
+a *different* program in a *different* record. It is declared
+`threads=4` (record bit 224 = 1), and Mesa's own ver-4.2 `v3d_compile()` run over the same draw
+(`scripts/pi-v3d26-mesa-compile.out.txt` line 3) prints `threads=4` with no spill instructions in its
+listing. No TMU op, no barrier, no TLB read, no spill, four threads ⇒ `c->last_thrsw == NULL` ⇒
+**`single_seg = 1` ⇒ bit 225 = 1. We have always packed 0.**
+
+**The trap this task existed to avoid, named.** The tempting shortcut — "Mesa's compiled coord shader
+ends in `thrsw` (artifact word [19]), so it *has* a last thrsw, so `single_seg = 0`, so our packing is
+already right" — is **wrong**, and it would have produced `OUTCOME S0` and killed a live rung at the
+desk. That terminal `thrsw` is `qpu_schedule.c`'s program-end instruction, inserted after
+`v3d_set_prog_data`'s input has already been decided; `vir_remove_thrsw`'s own comment says it out
+loud ("*one will still be inserted at `v3d_vir_to_qpu()` for the program end*"). The artifact's
+disassembly can distinguish the two cases anyway, and does: the **probe** variant (TMU store,
+`threads=2`) shows `thrsw` at **[18], [19] and [22]** — a real last-thrsw emitted as the pair Mesa
+flags for it, *plus* the program end — while the coord and render variants show exactly **one**,
+terminal, with two `nop`s behind it. One `thrsw` = no `last_thrsw` = `single_seg = 1`.
+
+**What the in-tree artifact could not settle, stated for the record:** it does not print `single_seg`
+(the harness dumps `threads`, `vpm_input_size`, `vpm_output_size`, `vcm_cache_size`,
+`separate_segments`, `vattr_sizes`, `uses_vid/iid`, `tmu_count`), so §49.25.9b's refusal to pack from
+it was correct. It supplies the two *inputs* the rule needs — thread count and program shape — and the
+rule itself had to come from the compiler sources above.
+
+##### 49.25.10b The `[v3d38]` label, corrected — and one line of campaign history re-read
+
+§49.25.9b's second finding is settled by the same read. The witness table named bit **97**
+`fs_single_seg` and bit **161** `vs_2way_threadable`; the v42 record's field list says **there is no
+"2-way threadable" field at all** — a 2-way shader is declared by *clearing* the 4-way bit
+(Mesa: `…_4_way_threadable = prog_data->base.threads == 4`) and by nothing else. So bit 97's label was
+right in substance (`single_seg` is Mesa's name for the value packed there) and **bit 161's was wrong**.
+Both are now named for the field: `fs/vs/cs_start_in_final_thread_section`, and the three flags the
+table never named at all — **162, 225 and 226** — are added, so a record diff can no longer be silent
+about the very bit this rung flips. The same correction lands on `[v3d30]`'s decode line (which printed
+`2way=` for bits 225 and 161) and on `build_probe_shader_record`'s flag-group comment (which stated the
+false law "bit1 = 2-way threadable = (threads == 2)"). **No packed byte moves for any of it**: every one
+of these bits is written 0 on the records concerned, and the labels decorate prints.
+
+The correction re-reads one piece of history rather than erasing it. **V3D-32** (§17) flipped what it
+called "the 2-WAY bit" on the *probe* record — bit 225 set, bit 224 cleared — for the `threads=2`,
+TMU-storing probe program, and the P34 capture read that coord shader as **never dispatching**
+(`valid_instr=0` against the M4 shader's 55 on the same boot); **V3D-36** restored 224=1/225=0 and
+dispatch returned. Under the correct field name, what V3D-32 actually told the hardware was that a
+program **with a mid-shader thread switch** starts in its final thread section — a declaration Mesa
+would never make for it (`single_seg = 0` there, because a TMU shader has a real `last_thrsw`) — and
+the pipeline stopped. That is not proof of anything about *our* coord shader, but it is this campaign's
+own evidence that **this bit is dispatch-potent on this silicon**, which is why the rung is worth a
+boot and why it is one bit wide.
+
+##### 49.25.10c What was built (`v3d_singleseg`, default OFF)
+
+Exactly §49.25.9d's design, no wider:
+
+- **Knob `UNAOS_V3D_SINGLESEG=1`** → cargo feature `v3d_singleseg = ["v3d_vpmprobe"]` (family
+  discipline: one env var arms the whole chain down to `v3d`), an `arm-pi` feature-list entry for cfg
+  coverage, and a kernel8 knob block carrying the polarity citation in the arming banner itself.
+- **One bit of one DRAM byte:** `build_shader_record` gains a `#[cfg(feature = "v3d_singleseg")]`
+  `sf(&mut rec, 225, 1, 1)`. **The default packing is unchanged.** Bits 97 (FS) and 161 (VS) stay 0 —
+  the armed ladder's bin frames dispatch only the coordinate shader — and
+  `build_bisect_null_shader_record`'s leg-G record is untouched, so leg G stays byte-identical to
+  boot 14's.
+- **Two `[v3d104]` lines.** The desk line (read **first**, as `[v3d103] VPMSTATIC` is) carries the
+  whole citation chain onto the wire so the capture argues for itself; and a **readback** emitted right
+  after each publish prints the record's word@byte28 with bits 224/225/226 decoded, so a capture in
+  which the bit did **not** reach DRAM kills every S row before it is read. A knob-gated line that
+  cannot prove its own bit landed is decoration.
+- No leg, no kick, no shader word, no register read or write, no page-table edit, no list change.
+
+##### 49.25.10d Is a boot 15 owed, and what is its one question
+
+**Yes — and it is the only V3D boot this verdict owes.** `OUTCOME S0` (the row that would have ended
+the campaign's producer surface at the desk) **did not fire**: the record diverges from Mesa on exactly
+one field, and that field describes the thread-section shape of the very thread `OUTCOME V5` caught
+stalling. §49.25.9d's remaining rows stand as written and are not re-litigated here: **S1** (frame
+closes / `PTB_PRIMS_BINNED` moves — the bit was the drain wall), **S2** (boot 14's leg-H shape to the
+digit — the bit is exonerated and the producer surface closes for good), **S3** (stall collapses, still
+no delivery — stall and drain are two stations), **S4** (any newly-latched `ERR_STAT` bit — the silicon
+answers the polarity question in the negative), all behind the INCONCLUSIVE guard that leg E must still
+return `OUTCOME E1`.
+
+**Boot 15's one question: with the coordinate shader's record declaring the thread-section shape the
+program actually has, does the VPM drain?** One cold boot, short capture,
+`UNAOS_V3D_SINGLESEG=1 UNAOS_PI=1`, read in §49.25.7h's order with `[v3d104]`'s two lines first,
+against **boot 14 itself** as the baseline.
+
+And the succession is already named, whichever way it falls. If the bit is exonerated (`S2`), the
+producer surface is **closed** — every field Mesa-parallel (§49.25.9b), part-checked (§49.25.9a) and
+now flight-tested both ways — and the next rung must instrument the **VCM → PSE → PTB** chain, which is
+the station `V5` accuses and the one part of the path this campaign has never watched: today the entire
+consumer side is read only through `PTB_PRIMS_BINNED`, `PTB_PRIM_CLIP` and `PTB_PRIM_VIEWPOINT_DISCARD`,
+all of which report on primitives that have **already arrived**, and none of which can see a hand-off
+that never happens. §49.25.9c's decision holds under that too: the TMU landmark stays gated on `V6`,
+and becomes the tool for the "did any store LAND" doubt only when the consumer-side instrumentation
+dead-ends.
+
+##### 49.25.10e Measured, this arc
+
+Worktree `exec-v3dseg`, baseline `e8dcb09c`.
+
+| gate | result |
+|---|---|
+| `./arroyo check` | **green, both arches** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ kernel cfg coverage OK (12 legs)` (the `arm-pi` leg now carries `v3d_singleseg`), `✅ midden_core tests OK` |
+| `./arroyo test-arm` | **clean** — headless aarch64 QEMU to completion, `BOT-PARK … -> PASS` and `SERWIT-2 … -> PASS`, **0** `FAIL`/`PANIC`/`❌` verdict lines in `target/serial-arm.log` |
+| `./arroyo kernel8-test` | **MBENCH PASS — 117/117 required witnesses, 0 forbidden hit(s), 10141 lines scanned** |
+| strings-proof, **positive** | `UNAOS_V3D_SINGLESEG=1 UNAOS_PI=1 ./arroyo kernel8` → `kernel8.img` `451a461b0d0727d9…` contains **2** `[v3d104]` strings (`SINGLESEG` desk line + `SHADREC READBACK`), and the implied chain is compiled in with it (13 `[v3d103]`, 11 `[v3d102]` strings) |
+| strings-proof, **negative (matched)** | the same command **without** the knob → `kernel8.img` `4f24da565cc327da…` contains **0** `[v3d104]` strings, **0** `[v3d103]`, **0** `[v3d102]`; the `kernel8-test` image (`6794630056519b62…`) likewise **0** |
+| default packing | unchanged — the only unconditional edits to `v3d.rs` are print labels and comments; the one `sf(…, 225, 1, 1)` is behind `#[cfg(feature = "v3d_singleseg")]` |
+
+*Provenance:* the Mesa sources cited in §49.25.10a were read this arc from `mesa/main` (2026-08-22),
+not from memory and not from this repository's own code — the value on trial was ours, so ours could
+not be the witness.
+
+#### 49.25.11 `singleseg`, read on metal — the VPM drains, the frame closes, one primitive bins, and the bin's LIST is empty (PI-V3D-104 verdict, boot 15, 2026-08-22; adjudicated desk arc 2026-08-25)
+
+Capture: the master line capture `~/unaos-bench/capture/line-acm0/pi.log`, **v3d boot 15**, the span
+opened by the firmware line `Loaded 'kernel8.img' to 0x80000 size 0x16c830` (fp = 1493040, capture
+lines 28747–32089), flown on metal 2026-08-22, `UNAOS_V3D_SINGLESEG=1 UNAOS_PI=1`. Baseline: **boot 14
+itself**, per §49.25.9d. Every load-bearing number below was re-read from the capture for this
+adjudication (`awk`, per the control-byte law), not carried from the flight sitting's prose.
+
+##### 49.25.11a The precondition and the guards, on the wire
+
+- **The one variable provably flew, and only it.** `[v3d104] SHADREC READBACK — GL Shader State
+  Record word@byte28 (bits 224..255) = 0x00234007 | cs_4way_threadable(bit224)=1
+  cs_start_in_final_thread_section(bit225)=1 cs_propagate_nans(bit226)=1 | CS code address
+  (bits 227..255, resolved) = 0x00234000` — printed three times across the ladder, identical each
+  time. Bit 225 = 1 reached DRAM; 224/226 and the code address are the standing values.
+- **Leg E returned `OUTCOME E1`, verbatim:** `frame-closed=1 (retired=1 FRDONE=0 BFC
+  0x00000004->0x00000005 Δ1)`, `real-ts=48/64 real-pool=20/8192 (drain completed=1) — OUTCOME E1 —
+  THE ARMED EMPTY CLOSE IS HEALTHY`, with the `[v3d101]` bank all-flat except the src32 control.
+- **The ERR block is three-way identical:** `ERRSTAT (PRE-ARM) raw=0x00001000` (the standing `VCDI`
+  bit12 alone), `ERRSTAT (E) raw=0x00001000`, `ERRSTAT (H) raw=0x00001000` — leg H's
+  `NEWLY-LATCHED=0x00000000 (VPM-write-pair=0x0000 VPM-any=0x0000 VPA=0x0000 PIPE=0x0000)`.
+- **Bank control intact on leg H:** `PCTR_EN-intact=1 src32-moved=1`, `OVERFLOW=0x00000000`.
+
+##### 49.25.11b Leg H, the delta line verbatim — and boot 14's wall does not reproduce
+
+`[v3d101] DISPATCHDISC … LEG H — slot0 src1 FEP_VALID_PRIMS raw=0 d=0 · slot1 src14
+QPU_ACTIVE_CYCLES_VERTEX_COORD_USER raw=27 d=27 · slot3 src16 QPU_CYCLES_VALID_INSTR raw=52 d=52 ·
+slot4 src33 QPU_CYCLES_STALLED_VERTEX_COORD_USER raw=25 d=25 · slot5 src11 PTB_PRIM_CLIP raw=0 d=0 ·
+slot6 src10 PTB_PRIM_VIEWPOINT_DISCARD raw=0 d=0 · slot7 src35 PTB_PRIMS_BINNED raw=1 d=1 |
+derived: FEP-moved=0 QPU-moved=1 … PTB-moved=1 · pool words=20 tile-state words=48`.
+
+Against boot 14's leg H, everything the bit was flipped to change, changed, and nothing else did:
+
+| witness | boot 14 (bit225=0) | boot 15 (bit225=1) |
+|---|---|---|
+| frame closed / retired | 0 / 0 — wedge, F/G stood down | **1 / 1** — `BFC 0x00000005->0x00000006 Δ1`, F and G ran behind it |
+| `INT_STS` (H) | `0x00010000` — QPU 0 program-end host interrupt, no `FLDONE` | **`0x00000002` — `FLDONE` alone, per-QPU vector 0x0000** — leg E's healthy-close signature |
+| `PTB_PRIMS_BINNED` | 0 | **`raw=1 d=1` — the first movement of this counter in the campaign's history** |
+| QPU active / valid instr | 28 / 53 | 27 / 52 — the real shader's magnitude class (leg G's null shader burned 5 on this same boot) |
+| stall (src33) | 25 — against a frame that never closed | 25 — **unchanged**, against a frame that closed |
+| newly-latched `ERR_STAT` | 0x00000000 | 0x00000000 |
+| pool / tile-state words | untouched (no close) | **20 / 48 — the empty close's exact counts** |
+
+**`OUTCOME V5` is dead.** "The coord thread spends its life stalled against a VPM that never drains"
+does not survive a boot on which the only changed byte is the thread-section declaration and the VPM
+drains, the batch handshake completes, `FLDONE` latches, the frame closes and retires, and the PTB
+counts a primitive binned. §49.25.8's fold stands as history — it was the correct reading of boot 14
+— but its wall statement is retired: the wall was **the record lying about the thread-section shape**
+(bit 225 = 0 on a single-segment program), exactly the dispatch-potency §49.25.10b's re-read of
+V3D-32/36 said this bit carries on this silicon, with the sign reversed.
+
+##### 49.25.11c The admissibility ruling — the PTB-flat clause is rewritten, not waved and not applied literally
+
+The wire's own `[v3d103] VPMPROBE VERDICT` line printed: `continuity vs boot 13 (slots 0/1/3/7 must
+reproduce): FEP-moved=0 QPU-moved=1 PTB_PRIMS_BINNED-moved=1 shape-ok=0 … — INCONCLUSIVE — THE
+CONTINUITY SLOTS DID NOT REPRODUCE BOOT 13.` The question this arc adjudicates: does that guard
+(§49.25.7d bullet 2, §49.25.7h) gate §49.25.9d's S table too?
+
+**Ruling: option (c) — the guard needs a rewritten form for post-bit225 boots — carried by option
+(b)'s argument, and the distinction matters.** The clause is not "satisfied in spirit" (it is
+plainly, literally unmet: PTB moved) and the boot is not INCONCLUSIVE (that reading would be wrong in
+substance). The clause is **inapplicable as written** to this boot class, for two reasons that must
+both hold:
+
+1. **What the guard was written to catch is "you are measuring a different leg"** — its own text:
+   "the new slots would be measuring a leg that is not the leg §49.25.6 folded." On boots 14-class
+   flights the arming knob is instrument-only (`NO SHADER WORD, NO REGISTER WRITE` — the `[v3d103]`
+   header's words), so *any* behavioural divergence can only mean the arm leaked or the wrong leg
+   ran, and PTB-flat is a valid proxy for leg identity. Boot 15's knob changes exactly one
+   **behavioural** bit, and §49.25.9d's own `S1` row pre-authorizes "`PTB_PRIMS_BINNED` moved" as
+   verdict-bearing evidence. Applied literally, the clause makes `S1` unreachable in principle: any
+   boot on which the bit **was** the drain wall necessarily moves PTB and would be ruled
+   INCONCLUSIVE. A guard that can only pass when the experiment fails is not a guard; the S table
+   already superseded the clause for this boot class, and the doc simply never said so.
+2. **The guard's purpose is independently proven held**, slot by slot, which is why this is not a
+   wave-through: FEP stayed flat (slot0 d=0); QPU moved at the real shader's magnitude (27/52 against
+   boot 14's 28/53, against the null shader's 5 on the same boot's leg G); the bank survived
+   (`PCTR_EN-intact=1 src32-moved=1`, no overflow); leg E returned `OUTCOME E1` with
+   `ERRSTAT (E)` == PRE-ARM, so the arm leaked nothing into the control (the empty frame never
+   fetches the shader record, so E1 is precisely the proof that everything except the intended bit
+   is unchanged); and the `SHADREC READBACK` proves the intended bit — and no other record change —
+   reached DRAM. Same leg, same program, sound bank, one declared variable.
+
+The line's self-printed INCONCLUSIVE **stands for the V table** — correctly, since no V row is read
+off boot 15: the V rows describe boot-14-class behaviour, and boot 15 retired `V5` by observation,
+not by claiming a row. For the **S table** the guard is rewritten as follows, and boot 15 is
+admissible under it.
+
+**The guard, rewritten for single-variable behavioural rungs of this family (bit225 and any
+successor that flips one declared record bit):**
+
+- the bank lost its enable mask, or slot 2's `src32 CYCLE_COUNT` never moved ⇒ **INCONCLUSIVE**;
+- leg E diverged from `OUTCOME E1` in any way, or `ERRSTAT (E)` ≠ PRE-ARM ⇒ **INCONCLUSIVE** — the
+  arm leaked wider than the declared bit; outranks every S row (unchanged from §49.25.9d);
+- the armed readback (`[v3d104] SHADREC READBACK` or its successor) does not show the declared bit
+  set in DRAM, **or** shows any *other* record bit changed ⇒ **INCONCLUSIVE** — the variable never
+  flew, or more than one variable flew;
+- leg H's continuity slots must reproduce boot 13's shape **except along the flipped bit's declared
+  effect channel**: FEP flat, QPU moved at the real-shader magnitude (order of 27–28 active / 52–53
+  valid, not the null shader's ~5). Frame-close, `PTB_PRIMS_BINNED`, pool/tile-state movement and
+  `INT_STS` shape are **measurands on this boot class, not continuity** — divergence there is the
+  experiment's output and is read against the outcome rows;
+- a newly-latched `ERR_STAT` bit is `S4`'s row, not the guard's.
+
+##### 49.25.11d The S rows, scored honestly — none fires, and the boot decides anyway
+
+- **`S0`** — settled at the desk before flight (§49.25.10a); did not fire.
+- **`S1` — half-fired, and the half that failed is load-bearing.** Its triggers held: frame closed
+  (`BFC Δ1`, `retired=1`) *and* `PTB_PRIMS_BINNED` moved. Its qualifying clause failed: **pool words
+  = 20 — exactly leg E's empty count, not "> empty's 20"**, and the pool head is byte-identical to
+  leg E's (§49.25.11e).
+- **`S2` — dead.** It required boot 14's shape to the digit; close, retirement, PTB movement and the
+  `INT_STS` word all diverged.
+- **`S3` — dead as written.** Its row requires "still no PTB movement and no close"; both happened.
+  Its *insight* survives inverted: the stall did **not** collapse (25 vs active 27, boot 14's ratio)
+  yet delivery happened — the stall and the drain are indeed two stations, and the stall is now
+  known to be survivable rather than terminal.
+- **`S4` — dead.** Newly-latched `ERR_STAT` = 0x00000000.
+
+**Verdict, named post hoc and flagged as such per the campaign's own discipline: `OUTCOME S1-EMPTY`
+— the bit was the drain wall, and the drained bin's LIST is empty.** The S table's gap was that it
+never wrote a row for "closes, PTB moves, bin list stays at the empty count" — the exact outcome
+that flew. The wire's other two verdict lines took it in their own pre-written tables and they are
+the honest anchors: `[v3d102] HFIRST VERDICT` fired **`OUTCOME H2` — THE FRAME CLOSES EMPTY**
+(§49.25.5's table), and `[v3d97] LEG H VERDICT` fired **`OUTCOME C2` — CLOSED-EMPTY**, whose own text
+already names the campaign's next question: "the primitives were consumed and binned to nothing …
+the candidates are the VCD's attribute DMA, the coord shader's VPM output, and the clipper state."
+
+**On `S1`'s graduation clause** ("the fix graduates from knob to default"): the *mechanism* half of
+`S1` is proven — the mis-declared thread-section shape left the batch handshake unsatisfied, and
+declaring it truthfully (Mesa's polarity, pinned from source, §49.25.10a) unblocks the drain with
+zero newly-latched errors across three boots' worth of ERR reads. Graduation is therefore **earned
+on the merits but not taken here**: `S1` did not fire as written, this adjudication is a doc arc, and
+flipping the default is one `cfg` line that belongs to the next code-bearing brief with its own
+gates. Recorded as **owed**.
+
+##### 49.25.11e What the counters could not see, the head dumps did — the bin is empty in the LIST and NOT in the STATE
+
+Both legs' real windows were dumped on this boot, and the diff is the sharpest fact boot 15 bought:
+
+- **Real tile-alloc pool @0x00228000 (leg E vs leg H): byte-identical.** Both read
+  `00000012 00000000 …` at +0x000, the same poison survivals at +0x040/+0x060, and the `[v3d56]`
+  whole-pool poison sweep says leg H touched the same 20 words spanning [0..31] and nothing deeper
+  (`INTACT=8172 ZEROED=19 OVERWRITTEN=1`). The primitive list received **nothing** the empty close
+  did not write.
+- **Real tile-state array @0x00227000: NOT byte-identical.** Leg E, +0x000:
+  `00000000 00000000 00000000 00000000 00000000 00000000 80001800 00000022`. Leg H, +0x000:
+  `00000000 00000001 00000002 00000001 00000000 00000000 80001800 00000022` — **words 1–3 read
+  1, 2, 1 where the empty close reads zeros**, under the same 48-words-touched count. The close
+  carried a per-tile record of the primitive into the tile state while emitting no primitive-list
+  bytes.
+
+So "binned to nothing" is one word too strong: **binned to state, not to list.** One primitive was
+counted (`PTB_PRIMS_BINNED d=1`), not clipped (`PTB_PRIM_CLIP d=0`), not viewport-discarded
+(`PTB_PRIM_VIEWPOINT_DISCARD d=0`), left three nonzero words in the tile-state record — and produced
+zero tile-list bytes. No decode of the 1/2/1 triple is claimed here (§49.24.3's law: the bytes
+honestly, no invented layout); decoding it from authority is the next rung's task 0.
+
+##### 49.25.11f The next rung, designed and not built: `emptybin` (PI-V3D-105)
+
+**The campaign question:** one primitive binned, zero new list bytes, three nonzero tile-state
+words — where between the VCM's vertex fetch and tile-list emission does the primitive's *content*
+evaporate? The producer surface is closed the day this rung's guard holds (every record field
+Mesa-parallel §49.25.9b, part-checked §49.25.9a, and the sole divergence flight-tested both ways);
+the open station is the front end the campaign has never watched from the fetch side.
+
+**Task 0, at the desk, before any build — the rung's gate, in the family's discipline:**
+
+1. decode leg H's tile-state delta (words 1–3 = 1, 2, 1 at +0x004..+0x00f) against an authoritative
+   per-tile-state layout (Mesa/kernel sources or the v42 packet/register material) — no layout from
+   memory; if no authority reaches those bytes, record that and stop decoding;
+2. pin from mainline's `v3d_performance_counters[]` the source numbers task 1 re-sources — the
+   campaign's own record supplies `src58 L2T_VCD_READS` (retired by §49.25.7's re-sourcing while the
+   pipeline was still walled; its question is live again now that the drain works), and task 0 must
+   pin a second, front-end/primitive-setup-side source from the same table rather than from memory.
+
+**Task 1, one boot (boot 16), knob `UNAOS_V3D_EMPTYBIN=1`, feature
+`v3d_emptybin = ["v3d_singleseg"]`** (family discipline: one env var arms the whole chain, bit 225
+stays declared): re-source slots 5 and 6 — `PTB_PRIM_CLIP` and `PTB_PRIM_VIEWPOINT_DISCARD`, both
+flight-proven 0 with their question answered — to `src58 L2T_VCD_READS` and task 0's second source.
+Slots 0/1/2/3/4/7 are **untouched**: they are boot 15's shape and the new guard reads leg identity
+off them. No leg, no kick, no shader word, no register write beyond the PCTR re-sourcing the bank
+already performs.
+
+**The outcomes, pre-written before the boot flies.** Guards first, none yields a B row:
+
+- the rewritten guard of §49.25.11c, verbatim (bank intact; leg E = `OUTCOME E1` with
+  `ERRSTAT (E)` = PRE-ARM; readback shows bit 225 = 1 and nothing else changed) ⇒ else
+  **INCONCLUSIVE**;
+- leg H must reproduce **boot 15's** shape on the untouched slots — closed (`BFC` Δ1, retired=1),
+  `PTB_PRIMS_BINNED d=1`, QPU at the real-shader magnitude, FEP flat, pool words = 20 — boot 15 is
+  the new baseline; divergence there ⇒ **INCONCLUSIVE** (a re-sourcing that changed leg behaviour
+  convicts the arm);
+- any newly-latched `ERR_STAT` bit ⇒ **`OUTCOME B4`** below, not the guard's.
+
+| leg H reads | verdict | what it means |
+|---|---|---|
+| `L2T_VCD_READS` **flat** (d=0) | **`OUTCOME B1`** | **the attribute DMA never fetched the vertices** — the binned primitive was assembled without its data, and the wall moves to the attribute-record surface (address, stride, max-index, the one §49.25.9b row carrying a note). The strongest row: it names three checkable numbers |
+| `L2T_VCD_READS` **moved**, task 0's front-end source **flat** | **`OUTCOME B2`** | vertices were fetched and the primitive never entered setup — the evaporation sits between the VCM and primitive setup; the -106 instrument is chosen at the fold, from what task 0's source table offers for that span |
+| **both moved** | **`OUTCOME B3`** | the primitive traversed the full front end and what is missing is the list **emission** itself — a tile-coverage question, and PI-V3D-17's clipper/viewport room reopens from the other side: a triangle whose transformed coverage is empty bins to state and to no list bytes without being "discarded". The next variable is the vertex **data** (one desk-derived full-tile triangle), not more instruments |
+| any **newly-latched** `ERR_STAT` bit | **`OUTCOME B4`** | name the bit off the decode and chase it before reasoning — same law as `S4` |
+
+One boot, cold, short capture, read in §49.25.7h's order, `[v3d104]`'s lines first, then the new
+slots' line, against boot 15 as baseline. Every one of the four outcomes is progress: `B1` and `B2`
+each name a station, `B3` reduces the wall to a data question with a desk-derivable fix, `B4` ends
+the silence of the ERR block.
+
+##### 49.25.11g Measured, this arc
+
+Worktree `exec-v3dverdict`, baseline `d6ed3024`. **Doc-only**: no `.rs` file, no knob, no packed
+byte, no serial line changed — the `emptybin` rung is *designed* here, not built, gated on its
+task 0.
+
+| gate | result |
+|---|---|
+| evidence verification | every §49.25.11a–e line re-read from `~/unaos-bench/capture/line-acm0/pi.log` lines 28747–32089 (`awk`, not `grep`) during this adjudication: `SHADREC READBACK` ×3 @29084/29199/29311, `ERRSTAT` PRE-ARM/E/H @28988/29062/29179, leg E `DISPATCHDISC` @29060 and `LEG E VERDICT` (E1) @29079, leg H `[v3d41]` BFC @29172, `DISPATCHDISC` @29176, `HFIRST VERDICT` (H2) @29178, `LEG H VERDICT` (C2) @29197, `VPMPROBE VERDICT` (self-printed INCONCLUSIVE, shape-ok=0) @29196, head dumps @29042–29055 (leg E) and @29143–29155 (leg H) |
+| `./arroyo check` | **green, both arches** — `✅ x86_64 OK`, `✅ aarch64 OK`, `✅ kernel cfg coverage OK (12 legs)`, `✅ midden_core tests OK` |
+
+*Provenance:* the flight sitting recorded the capture 2026-08-22; this ruling was written 2026-08-25
+by a successor session from the capture, per the standing no-folds-at-close order — the capture, not
+the baton prose, is the evidence of record, and the one place the baton's summary was too strong
+("binned to nothing") is corrected by §49.25.11e's byte diff.

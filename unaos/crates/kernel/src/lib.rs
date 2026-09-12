@@ -148,32 +148,20 @@ pub mod bootpace;
 pub mod pal;
 pub mod ui;
 pub mod ui_status;
-// The in-kernel 3D sculptor and the full-screen `pulse` monitor — the `vug`, `vug bebox`, `vug wire`
-// and `pulse` shell verbs. A DEMO, and now gated as one.
+// DECRUD-2 (Peter, 2026-08-28: "i want that stuff out of the kernel") — `vug.rs` is GONE, and with
+// it the `vug` / `vug wire` / `vug bebox` / `pulse` shell verbs and the `vugdemo` feature. DECRUD-1
+// had put the module behind a default-OFF knob rather than deleting it, on the stated grounds that
+// retiring three shell verbs was "a product call, not a cleanup call" (kernel-decrud.md §3.1 item 4).
+// The product owner has now made that call. Ring 3 keeps the real implementations — `VUG.ELF`
+// (crates/user-vug) and `PULSE.ELF` (crates/user-pulse), both staged into every kernel8 image, and
+// both what the bench has actually been running. What the kernel loses is ~1.3 kloc of Ring-0
+// fixed-point software renderer no boot path ever called.
 //
-// Aarch64 only, because the x86 trunk deleted vug.rs deliberately and the R23 merge took the pi4 body
-// wholesale, restoring the verbs on x86 as a side effect; the arch gate is what puts x86 back where it
-// meant to be. Nothing outside aarch64 needs the module: the pieces that ARE shared — the meter palette
-// (`METER_DIM`/`METER_BREATH`/`METER_PARKED`), the `PARKED` sentinel and the VUG-HONESTY
-// `classify_load_scaled` rule the instrument strip reads — live in `ui_status`, which owns them
-// outright and compiles on both arches; `vug` imports them back.
-//
-// DECRUD-1 — and now `feature = "vugdemo"` as well, DEFAULT OFF. The arch gate said WHERE the demo may
-// compile; it never asked WHETHER a default image should carry it, and the answer is no. The three
-// verbs have shipped EL0 replacements the Pi actually runs (`VUG.ELF`, `PULSE.ELF`, both staged into
-// every kernel8 image), no boot path calls into this module on either arch, and the operator reaches it
-// only by typing at the console — so a default kernel8.img was carrying ~1.3 kloc of Ring-0 software
-// renderer that nothing on the machine could ever reach without a keystroke. `shell.rs` gates its `vug`
-// and `pulse` arms on the same feature, so knob-off those words reach the ordinary unknown-command
-// reply exactly as they already do on x86. `parked_display_witness` moved to `ui_status` ahead of this
-// gate: it is a metal-earned falsifier and must not be hostage to a demo's knob.
-//
-// (An earlier comment here justified keeping the module with "`run_bsp` is why user vugs run".
-// `run_bsp` appears nowhere in vug.rs — it lives in `arch/{aarch64,x86_64}/sched.rs`, and the EL0 vug
-// is the `VUG.ELF` vessel, not this module. Only the classifier half of that claim was ever true, and
-// it points at `ui_status`.)
-#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))]
-pub mod vug;
+// The shared pieces were never in this module by the time it went: the meter constants, the `PARKED`
+// sentinel and the VUG-HONESTY `classify_load_scaled` rule live in `ui_status`, and DECRUD-1
+// deliberately moved `parked_display_witness` there FIRST so a metal-earned falsifier could not ride
+// a demo's knob. That move is why this deletion costs no witness.
+// (`vugras`, declared below, is a separate hw-jetson instrument and is NOT part of this retirement.)
 pub mod video;
 pub mod clock;
 #[cfg(feature = "logts")]
