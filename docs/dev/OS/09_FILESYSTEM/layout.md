@@ -121,6 +121,39 @@ flat-image arm: the first 4096 bytes of `KERNEL8.IMG` are the first 4096 bytes o
 kernel. An Orin whose card carries only the FAT ESP gets `/`, `/boot` and `/apps` over that one
 volume, which is the outcome §1.2's knob produced, reached without naming the board.
 
+### 1.5 The WRITE POSTURE on each of those mounts (`rw=`) — SDWRITE, A60, 2026-09-12
+
+Every mount the binder makes announces `rw=`, and the rule is one sentence: **`rw=` is sampled from
+the thing being mounted, and it says `yes` only when the BLOCK LAYER admits the write.** Not from a
+second derivation, not from the `BlockSource` when a `NativeBackend` is what gets bound.
+
+| mount | posture read from |
+|---|---|
+| `/volumes/<NAME>` | `!FatBackend::read_only()` on the very backend handed to `mt.mount` |
+| `/boot`, and `/` when it is the FAT volume | the same, on that mount's own backend |
+| `/` when it is the NATIVE volume | `NativeBackend::write_veto()`, which forwards `block::native_mount_write_veto()` — the block layer's answer for the handle the shared unafs mount is riding |
+
+The native row is the one that changed. It used to read `BlockSource::write_veto()` — a question
+about a different object — while `NativeBackend::write_veto` itself returned a flat `None`, i.e. "this
+volume is always writable", a claim no layer had checked. On the Orin that produced the only outcome
+that actually mattered: the block layer refused **every** write to the microSD in every cfg
+(`write_block_tegra_sd`), so a native root on the card could not be written and `rw=` was reporting a
+refusal decided two layers below it.
+
+`sdwrite` (DEFAULT ON, `UNAOS_NOSDWRITE=1` to opt out) lifts that refusal — see
+`docs/dev/OS/01_BOOT_HAL/arch_arm64.md` §ORIN-SDMMC-5 / SDWRITE for the mechanism and the card-safety
+statement — and the posture plumbing above is what keeps the wire honest in BOTH polarities:
+
+```
+[vfs] root mount / = native unafs volume source=tegra-sd rw=yes ::     # sdwrite ON  (shipped)
+[vfs] root mount / = native unafs volume source=tegra-sd rw=no  ::     # UNAOS_NOSDWRITE=1
+```
+
+Leg 8 (`fs::bootdisk::sdwrite_posture_selftest`, `witness`) drives the mapping both ways and asserts
+that the FAT-layer veto and the block-layer posture agree for every source in `fat::ALL_SOURCES`, so
+the two views of one answer cannot drift apart again. It runs on QEMU `virt` and on x86; no QEMU
+machine models the Tegra SDHCI, so it tests the REPORT and never the medium.
+
 ## 2. The namespace this arc establishes
 
 ```
@@ -401,8 +434,9 @@ the verdict.
 A board with no `/apps` mount, or one whose medium has no `APPS/` directory (a card staged before
 this layout), **skips with a stated line** rather than failing — the honest answer, and the reason
 `./arroyo test` on the default pattern image does not red. `layout.mv` skips the same way when a
-board binds only one of the two prefixes, reports them as different volumes, or vetoes writes (the
-Orin's read-only card).
+board binds only one of the two prefixes, reports them as different volumes, or vetoes writes (before
+SDWRITE, §1.5, that was the Orin's read-only card; with `sdwrite` on, the card admits the write and
+the skip is reached only by a genuine veto).
 
 ---
 

@@ -1890,6 +1890,41 @@ fi
 # the read census. UNAOS_SDMMC=1 WITHOUT this is byte-identical to the ORIN-SDMMC-1 recon. See
 # arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_SDMMC_ARM:-}" ] && _feats="${_feats}sdmmc_arm,sdmmc,"
+# SDWRITE (A60, 2026-09-12) — the Orin card's ORDINARY-WRITE posture, and it is DEFAULT ON.
+#
+# WHAT IT LIFTS. Before A60 `drivers/block.rs`'s `write_block_tegra_sd` returned `NotReady`
+# UNCONDITIONALLY, in every cfg — so `fs/fat.rs`'s `BlockSource::TegraSd` veto and `fs/bootdisk.rs`'s
+# `rw=` witness were reporting a refusal decided two layers below them, and a slot-booted Orin could
+# not have a writable `/` at all. `sdwrite` routes those two entry points to the driver's UNARMED
+# CMD24 primitive instead. It does NOT open a second door past the `sdmmc_arm` paranoia ladder or the
+# `install_target` flow: those keep their own gates and their own scratch-and-restore discipline, and
+# this path writes only the sector a FILESYSTEM named, which is the layer that decided and authorized
+# it. See `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` §ORIN-SDMMC / SDWRITE.
+#
+# WHY DEFAULT ON, spelled out because the default polarity is the whole safety argument. The shipped
+# configuration is the one that has to be right (LAWS §5, orin 20: "for a knob whose OFF state is the
+# shipped state, coverage of the ON state is coverage of a build nobody boots") — a writable root that
+# exists only behind a knob is a root nobody boots, and the veto it lifts guards nothing the
+# filesystem's own authorization does not already guard. `UNAOS_NOSDWRITE=1` takes it back out and the
+# build is the pre-A60 refusal, verbatim and byte-identical (`./arroyo knoboff sdwrite <baseline>`).
+# Negative-knob spelling per UNAOS_NOTEGRASMP / UNAOS_NOSDHCBLK / UNAOS_NOKBDWIT above.
+#
+# NOT stripped by `arm_features`: `sdwrite` emits REAL aarch64 code (`fs/vfs.rs`'s `NativeBackend`
+# write-veto forward is `target_arch = "aarch64"`-gated and reaches every aarch64 build, virt
+# included), so stripping it would change behaviour and not merely a fingerprint. It is NOT in
+# `kernel8()`'s curated `K8_FEATS` either: it is the microSD-through-SDHCI posture, the Pi's card
+# rides emmc2 through the global slot, and the Pi's FRGUARD `default_writable` posture is untouched
+# by this arc by construction.
+[ -z "${UNAOS_NOSDWRITE:-}" ] && _feats="${_feats}sdwrite,"
+# SDWRITE FIXTURE: UNAOS_SDWRITE=1 arms the metal proof — `sdwritefx`, a SEPARATE feature, because
+# `sdwrite` above is default ON and a knob that armed it would arm nothing. On the root
+# `fs::bootdisk::bind` just bound it creates `/SDWRITE.TXT`, writes one 512-byte stamped block, reads
+# it back, deletes it, and prints `:: SDWRITE: root=<source> wrote=1 readback=match deleted=1 -> PASS
+# ::` (a FAIL names the step). It writes that ONE path and nothing else on the card. Implies `sdwrite`
+# and `sdmmc` in Cargo.toml, both named here too so the `⚡ kernel features:` banner is the truth about
+# the build. For a card boot combine with UNAOS_TEGRA=1. The ARMED polarity is type-checked by the
+# `arm-tegra-sdwritefx` leg of KERNEL_CFG_MATRIX, never by this mapping.
+[ -n "${UNAOS_SDWRITE:-}" ] && _feats="${_feats}sdwritefx,sdwrite,sdmmc,"
 # ORIN-INSTALL-1: UNAOS_INSTALL_TARGET_SD=1 is the THIRD (destructive-confirmation) gate on top of the
 # double-arm above — it compiles in the first real installer flow (an InstallTarget over the rung-2 armed
 # SD write path driving the install:: engine's GPT + FAT32 + sha extent-verify onto the SEATED microSD;
@@ -4683,6 +4718,38 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
+  # ── SDWRITE (appended 2026-09-12, A60) — three rows, and the FIRST of them is the point ────────
+  #
+  # THE POLARITY THAT SHIPS IS ON. `sdwrite` is DEFAULT-ON in the knob map above, so LAWS §5's
+  # default-quiet rule (orin 20) runs the usual way round here: the OFF polarity is what every
+  # pre-existing `arm-tegra-*` leg already compiles — none of them names `sdwrite`, so all of them
+  # type-check the pre-A60 refusal — and it is the ON polarity, the one a card actually boots, that
+  # was named by nothing. Hence `arm-tegra-sdwrite`, and it carries NO `witness` on purpose: that is
+  # the exact set `esp-jetson` builds (the boot/media commands leave `witness` off), which is the
+  # image that goes on the card.
+  #
+  # `arm-tegra-sdwritefx` adds the armed fixture and `witness` together, because the fixture
+  # (`fs::bootdisk::sdwrite_fixture`, `sdwritefx`) and leg 8 (`sdwrite_posture_selftest`,
+  # `witness`+`sdwrite`) are two different gates on the same seam and a leg that compiles one says
+  # nothing about the other. It is also the only leg that type-checks `sdwritefx`'s Cargo implication
+  # chain (`sdwritefx` ⇒ `sdwrite` + `sdmmc`) with the board features present.
+  #
+  # `arm-virt-sdwrite` is the one that would be easiest to leave out and is the one the knoboff
+  # control depends on: `fs/vfs.rs`'s `NativeBackend` is `target_arch = "aarch64"`-gated and NOT
+  # tegra-gated, so the write-veto FORWARD this arc adds compiles on generic aarch64 — and leg 8's
+  # `not(tegra)` half (`card=absent`) exists only there. Without this row the virt configuration
+  # `./arroyo test-arm` actually runs would be type-checked by no leg of this gate.
+  #
+  # UNIVERSE SIDE EFFECT: none. `sdwrite`/`sdwritefx` are named by arm-* legs only and by no x86-*
+  # leg, so `x86_cfg_universe` classes them aarch64-only and subtracts them exactly as it does
+  # `tegra`; the derived mix-leg count is unchanged. Board legs +3. Read the live counts off
+  # `./arroyo check`, which prints them every run. NOT named on an x86 leg deliberately: that would
+  # put `sdwrite` under the KNOB→BUILDER WIRING CHECK and demand a `builder/src/main.rs` entry for a
+  # feature whose every site is aarch64. The x86 half of leg 8 is compiled and EXECUTED by
+  # `./arroyo test`, which arms `witness` and carries `sdwrite` by default.
+  "arm-tegra-sdwrite ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite"
+  "arm-tegra-sdwritefx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite,sdwritefx"
+  "arm-virt-sdwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,sdwrite"
   # ── WITNESSGAP (appended 2026-09-07, orin 20) — the WITNESS-FREE polarity, which is the polarity
   # every piece of BOOT MEDIA actually ships ──────────────────────────────────────────────────────
   #

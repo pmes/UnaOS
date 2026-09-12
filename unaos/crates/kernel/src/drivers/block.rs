@@ -1919,7 +1919,7 @@ pub fn register_tegra_sd(num_blocks: u64, block_addressing: bool) -> bool {
     };
     *TEGRA_SD_BLOCK_DEVICE.lock() = Some(dev);
     if !TEGRA_SD_PUBLISHED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        serial_println!(
+        #[cfg(feature = "sdwrite")] serial_println!(":: TEGRA-SD: block backend published — {} sectors (read-write — the block layer admits ordinary writes; SDWRITE) ::", num_blocks); #[cfg(not(feature = "sdwrite"))] serial_println!(
             ":: TEGRA-SD: block backend published — {} sectors (read-only) ::",
             num_blocks
         );
@@ -1970,7 +1970,7 @@ static TEGRA_SD_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atom
 /// as a readable block device must not become a fourth way past that ladder, so this entry point exists
 /// so the seam is total and fails CLOSED, not so that anything writes through it.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> { #[cfg(feature = "sdwrite")] { return tegra_sd_write_through(_lba, _buf); } #[cfg(not(feature = "sdwrite"))] { // SDWRITE (A60): the knob-off arm below is the pre-A60 body, byte-for-byte; the route above is the only addition.
     if !TEGRA_SD_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         serial_println!(
             ":: TEGRA-SD: WRITE refused at the block layer — the Orin card's only writer is the armed \
@@ -1981,13 +1981,13 @@ pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
     // "this build has no writer for this device" — and `BlockError` gains no variant here, so no match
     // anywhere in the tree changes shape.
     Err(BlockError::NotReady)
-}
+} }
 
 /// TEGRA-SDBLK: the counted twin of [`write_block_tegra_sd`], refusing for the same reason. Present so
 /// that a future `BlockHandle::TegraSd` dispatch has a total set of four entry points to name.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
 pub fn write_blocks_tegra_sd(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-    write_block_tegra_sd(lba, buf)
+    #[cfg(feature = "sdwrite")] { return tegra_sd_write_blocks_through(lba, buf); } #[cfg(not(feature = "sdwrite"))] { write_block_tegra_sd(lba, buf) }
 }
 
 // ===================== PARTITION — MBR decode + bounded partition ranges =====================
@@ -2477,3 +2477,158 @@ impl PartitionRange {
         Ok((len / bs) as u64)
     }
 }
+
+// ===================== SDWRITE (A60, 2026-09-12) — the card's write POSTURE, in one place =====================
+//
+// WHAT THIS SECTION IS FOR. Until A60 the Orin microSD had no writer outside the armed `sdmmc_arm`
+// ladder, and `write_block_tegra_sd` above said so by refusing in EVERY cfg. `fs/fat.rs`'s
+// `BlockSource::TegraSd` veto and `fs/bootdisk.rs`'s `rw=` witness only REPORTED that refusal; neither
+// was the refusal. LOGIN M2 needs a writable `/` on a slot-booted Orin, so the refusal has to be
+// liftable — and the one thing that must not happen while lifting it is the wire saying `rw=yes` over
+// a path that still cannot write a byte. Hence: ONE posture, decided here, forwarded everywhere.
+//
+// THE POLARITY, and why it is this way round. `sdwrite` is DEFAULT-ON (`unaos/arroyo` composes it into
+// every build unless `UNAOS_NOSDWRITE=1`), so the SHIPPED configuration is the one that writes and the
+// knob-off configuration is the pre-A60 refusal kept verbatim. LAWS §5's default-quiet rule is about
+// the polarity a board actually boots: the shipped polarity here is ON, and `KERNEL_CFG_MATRIX` gains
+// `arm-tegra-sdwrite` / `arm-tegra-sdwritefx` so the shipped polarity is type-checked WITH the board
+// features, while every pre-existing `arm-tegra-*` leg already type-checks the OFF polarity.
+//
+// THE APPEND IS AT THE FILE TAIL, not in the middle of the file, so no `core::panic::Location` line in
+// `block.rs` moves and `./arroyo knoboff sdwrite <baseline>` can come out byte-identical. Every edit
+// this arc made ABOVE this line is line-for-line in place, for the same reason.
+
+/// SDWRITE: does the block layer admit an ORDINARY write (a file mutation, not the armed ladder) to
+/// the Orin microSD? The single definition of that answer. `fs/fat.rs`'s `BlockSource::TegraSd` veto
+/// arm forwards to it instead of stating a second policy, so the report and the behaviour cannot
+/// drift — which is exactly how the pre-A60 tree came to have a veto in `fat.rs` that only ECHOED a
+/// refusal living two layers down.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+pub const fn tegra_sd_writes_admitted() -> bool {
+    cfg!(feature = "sdwrite")
+}
+
+/// SDWRITE: one 512-byte sector to the card, through the driver's unarmed CMD24 primitive.
+///
+/// Bounds are checked HERE against the published geometry (as [`read_block_tegra_sd`] does) and again
+/// in the driver against the card's own capacity, because this function names an LBA to a medium and
+/// must not depend on a caller's care. The one-shot witness uses the SAME latch the refusal used, so a
+/// boot says once, on the wire, which posture it is running — and an operator reading a capture never
+/// has to infer the posture from the absence of a line.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc", feature = "sdwrite"))]
+pub fn tegra_sd_write_through(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    if !TEGRA_SD_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: TEGRA-SD: WRITE admitted at the block layer — ordinary file mutation routes to the \
+             unarmed CMD24 primitive (SDWRITE; first, once) ::"
+        );
+    }
+    let dev = tegra_sd_info().ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    if buf.len() < SECTOR_BYTES {
+        return Err(BlockError::Io);
+    }
+    crate::arch::aarch64::sdmmc_tegra::tegra_sd_write_block_512(lba, &buf[..SECTOR_BYTES])
+}
+
+/// SDWRITE: the counted twin — `buf.len() / block_size` consecutive sectors, bounded by the shared
+/// [`span_blocks`] rules so the cap cannot drift from the read side's. The driver has no unarmed CMD25
+/// primitive (the counted write in `sdmmc_tegra.rs` is `sdmmc_arm`-gated and stays there), so this
+/// LOOPS the proven CMD24 exactly as [`read_blocks_tegra_sd`] loops CMD17 — same order, same traffic a
+/// per-sector caller would produce. A partial run returns the FIRST error: the sectors before it are
+/// on the medium, which is the same truth a per-sector caller would have had.
+#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc", feature = "sdwrite"))]
+pub fn tegra_sd_write_blocks_through(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let dev = tegra_sd_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    for i in 0..count {
+        let off = i * SECTOR_BYTES;
+        tegra_sd_write_through(lba + i as u64, &buf[off..off + SECTOR_BYTES])?;
+    }
+    Ok(())
+}
+
+/// SDWRITE: why the NATIVE root refuses ordinary file mutation, or `None` if it accepts it — the
+/// answer [`crate::fs::vfs::NativeBackend::write_veto`] forwards.
+///
+/// **The second finding of ledger row A60, in code.** `fs/bootdisk.rs`'s native arm used to sample
+/// `BlockSource::write_veto()` — a question about a `BlockSource` — for a mount it binds as a
+/// `NativeBackend`, two different objects; and `NativeBackend::write_veto` itself returned a flat
+/// `None`, i.e. "this volume is always writable", which is a claim no layer had checked. This function
+/// is the check: it asks the block layer about the handle the shared unafs mount is ACTUALLY riding
+/// (`fs::unafs::mount_bound_handle`, the UNAFSBIND discovery's own answer), so `rw=yes` on the root
+/// mount is a statement about the disk under it.
+///
+/// EXHAUSTIVE on `BlockHandle` on purpose: a new handle is an E0004 here, which drags whoever adds it
+/// to the one place the root's posture is decided.
+///
+/// THE UNBOUND CASE, stated rather than hidden. `None` from `mount_bound_handle` means nothing has
+/// mounted the native volume yet, so no disk has been chosen and there is no handle to ask about. It
+/// answers `None` (admit), which is EXACTLY what this code path answered before A60 in every state —
+/// so the unbound answer cannot be a regression — and the block layer's own refusal still stands one
+/// layer down, where the write would meet it. It is reachable only for a handle whose bound answer
+/// would have been `Some`, and in every configuration that compiles this function the only such
+/// handles are `Global` under a false `default_writable()` (FRGUARD / USBFALL F1, which the Pi's
+/// bare-metal media do not carry `sdwrite` to reach) and x86's `Sdhc` (where `NativeBackend` does not
+/// exist at all). Forcing the bind here to close it would run `with_unafs` from inside a predicate —
+/// a side effect, and a lock this function has no business taking on a caller's behalf.
+/// `target_arch = "aarch64"`-gated because `fs::unafs` is (`fs/mod.rs:43`), and `NativeBackend` —
+/// the only caller — is gated the same way.
+#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+pub fn native_mount_write_veto() -> Option<&'static str> {
+    let Some(handle) = crate::fs::unafs::mount_bound_handle() else {
+        return None;
+    };
+    handle_write_veto(handle)
+}
+
+/// SDWRITE: may an ORDINARY file mutation reach the medium behind `handle`? The block layer's own
+/// answer, per handle, with no volume and no filesystem in it — so it can be driven over every handle
+/// by a fixture instead of only observed on whichever one a boot happens to have bound.
+///
+/// This is the predicate `fs/fat.rs`'s `BlockSource::write_veto` is a per-SOURCE view of, and leg 8
+/// (`fs::bootdisk::sdwrite_posture_selftest`) asserts the two agree for every source in
+/// `fat::ALL_SOURCES`. Two views of one answer is the shape that drifts; the fixture is what stops it.
+#[cfg(feature = "sdwrite")]
+pub fn handle_write_veto(handle: BlockHandle) -> Option<&'static str> {
+    match handle {
+        // USBFALL F1 / FRGUARD: the same predicate `write_block` itself enforces, asked of the same
+        // slot — never a second copy of the policy.
+        BlockHandle::Global => {
+            if default_writable() {
+                None
+            } else {
+                Some(NATIVE_GLOBAL_VETO)
+            }
+        }
+        // USB-WRITE (F3): the stick's BOT WRITE(10) path is verified and routed, for every registry
+        // index (`write_block_usb_ix`), so there is one answer and it is yes.
+        BlockHandle::Usb => None,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockHandle::Sdhc => Some(NATIVE_SDHC_VETO),
+        // A60: the posture this arc exists to make liftable, forwarded from its one definition.
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockHandle::TegraSd => {
+            if tegra_sd_writes_admitted() {
+                None
+            } else {
+                Some(NATIVE_TEGRA_SD_VETO)
+            }
+        }
+    }
+}
+
+/// SDWRITE: the native root's refusal when the global slot is not writable. Named separately from
+/// `fs/fat.rs`'s `DEFAULT_VETO` because it is printed about a DIFFERENT mount (the native volume, not
+/// a FAT one) and a reader chasing it needs to land on this function, not on that one.
+#[cfg(feature = "sdwrite")]
+const NATIVE_GLOBAL_VETO: &str = "the native root rides the global slot and the block layer refuses \
+                                  writes through it (FRGUARD / USBFALL F1)";
+#[cfg(all(feature = "sdwrite", target_arch = "x86_64", feature = "sdhcblk"))]
+const NATIVE_SDHC_VETO: &str = "the native root rides the internal SD reader, which admits a write \
+                                only inside the reserved flight-recorder extent (SDHC-4c)";
+#[cfg(all(feature = "sdwrite", target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+const NATIVE_TEGRA_SD_VETO: &str = "the native root rides the microSD and this build refuses every \
+                                    write to it (UNAOS_NOSDWRITE=1 / no `sdwrite` feature)";
