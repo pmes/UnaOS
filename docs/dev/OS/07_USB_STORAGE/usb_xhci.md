@@ -1251,6 +1251,61 @@ Support: `EventRing.popped` (drivers/xhci/event.rs), a monotonic consumed-TRB co
 Ledger note: the numbers PIUSB-41/42 were already spent on the P60 default-quiet dump (5h above), so
 this instrument is PIUSB-43 with serial tag `[piusb43]`.
 
+### 5j. USBLUN — the LUN census, and publishing the slot that holds a card
+
+A multi-slot card reader is ONE USB mass-storage device. Its card slots are not devices, ports or
+endpoints: they are SCSI **logical units**, selected by `bCBWLUN` (byte 13 of the Command Block
+Wrapper, USB MSC Bulk-Only Transport 1.0 §5.1). Until this arc `build_cbw` wrote a literal `0` into
+that byte and the driver asked no question about how many units existed, so exactly one slot of a
+reader was reachable. render12 boot 2 shows the consequence in one line: a single
+`xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' …` for the 32 GB boot card, while a second card sat in
+another slot of the same reader and never appeared on the wire, in `/volumes/`, or anywhere else
+(`docs/dev/evidence/orin24/boot-render12-A2.log`).
+
+**The census (M1).** Once the device is open and TEST UNIT READY has passed, and before the
+bring-up's first INQUIRY, `bring_up_storage` runs `usblun_census`. It issues **Get Max LUN** (§3.2:
+`bmRequestType 0xA1`, `bRequest 0xFE`, `wValue 0`, `wIndex` = the mass-storage interface,
+`wLength 1`), whose reply byte is the HIGHEST valid LUN — so a single-unit device answers 0. §3.2
+also permits such a device to STALL the request, and a stall is therefore an answer, read as
+`max_lun=0`; because a control stall halts EP0 and this driver has no automatic control-endpoint
+recovery, the non-success path runs `ep0_resync` (Reset Endpoint + Set TR Dequeue on DCI 1) before
+returning, so asking the question cannot break a device that declines to answer it. Each LUN
+`0..=max_lun` then gets an INQUIRY and a READ CAPACITY(10) carrying that LUN, and one line:
+
+```
+:: USBLUN: lun=<n>/<max> inquiry="<vendor>" "<product>" capacity=<blocks>x<bs> verdict=<v> reason=<r> ::
+```
+
+with `verdict` one of `PRESENT`, `NO-MEDIUM` or `FAILED`. An empty card slot answers READ CAPACITY
+with CHECK CONDITION / sense key 0x2 (NOT READY) / ASC 0x3A (MEDIUM NOT PRESENT); that is the normal
+state of a reader, not a device error, and it is decoded into `NO-MEDIUM` through the same
+`bot_sense_fetch` the runtime CHECK CONDITION handler uses. The census holds `BOT_SENSE_ACTIVE` for
+its duration, exactly as the TEST UNIT READY loop above it does, so a CHECK CONDITION reaches the
+census verbatim instead of being consumed and retried by that handler. The verdict is spelled
+`verdict=FAILED` rather than the project's `-> FAILED` idiom deliberately: `-> FAIL` is a FORBID
+`scripts/mbench.py` installs into every spec and a pattern `arroyo`'s `scan_serial_faults` reds
+`test` / `test-arm` on, so the arrow form would red every battery run with a dead card slot plugged
+in.
+
+**The selection (M2).** `publish_usb_geometry` is then called with the geometry of the FIRST LUN the
+census scored `PRESENT` — LUN 0 when LUN 0 holds a card, which is every single-LUN device and
+therefore the old behaviour unchanged, and otherwise the first slot that does. The chosen unit is
+stored once, in the slot's `bot_lun`, and `build_cbw` is the single place any CBW is built, so the
+INQUIRY and READ CAPACITY that produce the published geometry, the `xHCI: Disk` line, and every
+later READ(10) / WRITE(10) all address the same card. With no card anywhere the choice falls back to
+LUN 0 and the existing READ CAPACITY failure path runs, unchanged.
+
+**One disk, by design, for now.** If more than one LUN is PRESENT the driver says so
+(`:: USBLUN: <k> present, publishing lun=<n>; the block registry holds one USB disk ::`) and
+publishes the first. It does not publish the second: `drivers/block.rs` holds ONE USB device
+(`USB_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>>`, plus the global `BLOCK_DEVICE` handle), and
+`fs/bootdisk.rs` walks that registry to name volumes under `/volumes/`, so a second simultaneous USB
+disk is a registry design change rather than a driver change. `BlockDeviceInfo` needs no `lun` field
+for any of this — the LUN is driver state on the slot, and the block layer reaches the device
+through `storage_read10` / `storage_write10`, which use that same slot.
+
+---
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)
