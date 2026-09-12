@@ -12,7 +12,8 @@ Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51
   (f2794266 rung 4 flown + the unafsroot fold) · hw-pi4 3c102d2a (pi-queue.md) · hw-rmbp dc1cc3a2 (rmbp-queue.md) ·
   exec-orin26-unafsroot 5984c69c (merged) · exec-orin27-ga10b4c (cut at f2794266, executor live) · exec-orin26-tear (executor live).
   Push line: `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin24-fold exec-orin25-shotverb`
-✓ Fold gate on 059db935 running (check tegra / check plain / esp-jetson → ~/unaos-bench/scratch/orin27/fold-059db935/rc.txt).
+✓ Fold gate on 059db935 GREEN: `UNAOS_TEGRA=1 UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0 · plain strict check rc=0 · `./arroyo esp-jetson` rc=0.
+✓ A49 premise refuted by Peter (no v1 microSD ever): reopened, cause unknown; the v1-card item is OFF the render13 list.
 ✓ Landing order (R45, plan of 2026-09-11): rmbp → pi → jetson into main, then main into all three. Review panels for rmbp and pi are running.
 ✓ R46: one focus (orin), ALL LANES, no owner, no support seat, no lane grants. R47: Opus executors, Fable for key tasks only. R48: adversarial handoff.
 
