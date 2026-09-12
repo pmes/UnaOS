@@ -354,6 +354,10 @@ mod metal {
     /// The witness line below prints bits 16/17/18 together precisely so that ONE seated boot settles it
     /// either way; if bit 18 turns out to read 0 with a card in, the authority is the `cd-gpios` GPIO and
     /// this gate must move there (which needs a Tegra GPIO driver this kernel does not yet have).
+    ///
+    /// SDCMD8b: because that is unproven, THIS BIT CANNOT END THE LADDER BY ITSELF. From render13 the Orin
+    /// boots from the native slot, so a wrong bit here would cost every mount. bit18=0 no longer skips; it
+    /// defers to one CMD8, and only the card's own silence stops the ladder (step 4b / rung 7).
     const ST_CARD_DETECT_PIN: u32 = 1 << 18;
     /// DAT[3:0] Line Signal Level and CMD Line Signal Level. An idle SD bus pulls all five HIGH, which
     /// is how SDHCI 3.00 §3.10.1 defines "error recovery complete" after a command timeout: the SRST
@@ -651,13 +655,27 @@ mod metal {
                 PS
             );
         }
-        if !cd_pin {
-            // The ladder ends HERE, before the identification clock and before CMD0. An empty slot is not
-            // a failure to diagnose — it is nothing to do — so it gets its own word, `SKIP`, and not the
-            // `STOP` that every real defect on this ladder prints.
-            serial_println!("{}   M2: no card in the native slot -> SKIP ::", PS);
-            return None;
-        }
+        // SDCMD8b — A SEATED CARD CAN NEVER BE GATED OUT, and that outranks skipping an empty slot early.
+        //
+        //     Peter, 2026-09-12: the Orin BOOTS FROM THE NATIVE SLOT from render13 on, so this ladder now
+        //     stands between the board and every mount it has. SDCMD8 returned None here on bit18=0, and
+        //     "bit 18 reads 1 when a card is seated" is UNPROVEN on this board (no capture in evidence
+        //     shows it with a card in — see `ST_CARD_DETECT_PIN`). An unproven bit that can refuse the
+        //     boot card is not a gate, it is a hazard: if bit 18 is wrong the SKIP costs every mount.
+        //
+        //     So the verdict on the contradictory case is DEFERRED to the card itself. Note that bit 16 is
+        //     necessarily 1 here — step 4 already returned for bit16=0, with its own witness, and that is
+        //     the "nothing claims a card" SKIP. The case left is bit16=1 with bit18=0: the two detect bits
+        //     disagreeing, which is exactly what the EMPTY slot showed on render12. Rather than trust
+        //     either bit, run the ladder as far as CMD0 and ONE CMD8 at the normal timeout and let the
+        //     ANSWER decide, at rung 7 below:
+        //       * CMD8 answers (any R7, echo matching or not) -> a card is really there, bit 18 is not this
+        //         board's signal, and the ladder continues exactly as it did before SDCMD8 touched it.
+        //       * CMD8 times out -> nothing is there. SKIP, with no CMD55 and no retries — which is the one
+        //         thing the old ladder got wrong, and the whole of A49's "wire".
+        //     Cost on a truly empty slot: one CMD8 timeout, milliseconds by the render12 capture. Risk to a
+        //     seated card: zero, because no bit can end the ladder any more — only silence from the card.
+        let cd_probe = !cd_pin;
 
         // 5. 400 kHz identification clock.
         let base_hz = base_clock(base);
@@ -693,6 +711,17 @@ mod metal {
                 if echo != 0x1aa {
                     serial_println!("{}   M2: CMD8 echo mismatch — legacy/SDSC card (or no v2 support) ::", PS);
                 }
+                // SDCMD8b: the deferred verdict from step 4b, ACQUITTING the slot. Any R7 at all — echo
+                // matching or not — is a card on the wire, so bit 18 was wrong and is not this board's
+                // card-detect signal. Say so once, loudly, because this line is the metal evidence that
+                // decides whether the gate stays on bit 18 or has to move to the `cd-gpios` GPIO. Nothing
+                // else changes: the ladder goes on exactly as it did before SDCMD8.
+                if cd_probe {
+                    serial_println!(
+                        "{}   M2: card-detect OVERRIDDEN — bit18=0 but CMD8 answered; bit18 is not this board's signal ::",
+                        PS
+                    );
+                }
                 echo == 0x1aa
             }
             Err(int) => {
@@ -701,6 +730,19 @@ mod metal {
                     PS, int
                 );
                 reset_cmd_dat(base);
+                // SDCMD8b: the deferred verdict from step 4b, CONVICTING the slot. Both detect sources now
+                // agree with the card's own silence — bit 18 said empty, and nothing answered a command
+                // that any card must answer or ignore from a live bus. The line above is the generic
+                // CMD8-timeout witness (kept verbatim, and its "continuing without HCS" is what happens
+                // when a card IS seated); this is the verdict, and it ends the ladder here. No CMD55, no
+                // retries: asking an empty slot eight more times is precisely what A49 recorded as a wire.
+                if cd_probe {
+                    serial_println!(
+                        "{}   M2: no card in the native slot (bit18=0, CMD8 unanswered) -> SKIP ::",
+                        PS
+                    );
+                    return None;
+                }
                 false
             }
         };
