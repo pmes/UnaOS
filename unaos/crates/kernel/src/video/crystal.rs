@@ -115,7 +115,7 @@ pub enum Verb {
     /// Restart — a warm reboot. REAL where PSCI answers (aarch64 non-Pi); an honest STUB elsewhere.
     Restart,
     /// Shut Down — ACPI S5 (x86) or PSCI SYSTEM_OFF (aarch64 non-Pi). The one action that halts the box.
-    ShutDown,
+    ShutDown, #[cfg(feature = "login")] #[doc = "Log Out (LOGIN M4, R21 + R51) — tear the session down and put the login screen back. REAL: `login::reopen_after_logout` is the action."] LogOut, // LOGIN M4 — the crystal is where Log Out lives (R21: menus belong in the MENU BAR). ⚠ LINE-NEUTRAL append; an inline `#[doc]` because a `///` must PRECEDE its item and a new line would move every panic::Location below it.
 }
 
 impl Verb {
@@ -125,14 +125,14 @@ impl Verb {
             Verb::About => "About",
             Verb::Sleep => "Sleep",
             Verb::Restart => "Restart",
-            Verb::ShutDown => "ShutDown",
+            Verb::ShutDown => "ShutDown", #[cfg(feature = "login")] Verb::LogOut => "LogOut", // LOGIN M4. ⚠ LINE-NEUTRAL append.
         }
     }
 
     /// `true` when the verb is BACKED by a real action, `false` when it is an honest stub. On the
     /// witness so a capture reads `action=real` or `action=stub` beside the pick.
     const fn real(self) -> bool {
-        matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
+        #[cfg(not(feature = "login"))] { return matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))); } #[cfg(feature = "login")] { matches!(self, Verb::About) || matches!(self, Verb::LogOut) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) } // LOGIN M4 — Log Out is REAL wherever the knob is on (the screen it returns to is built by the DESKTOP gate, but the teardown runs headless too), and A34's rule is why this is not left at `stub`: a verb announcing `real` and doing nothing spends the operator's trust, and so does the reverse. The knob-off arm is the original expression VERBATIM, early-returned so no line moves. ⚠ LINE-NEUTRAL fold. // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
     }
 
     /// The verb's stable ordinal for the witness (`u8`), independent of its row index.
@@ -141,7 +141,7 @@ impl Verb {
             Verb::About => 0,
             Verb::Sleep => 1,
             Verb::Restart => 2,
-            Verb::ShutDown => 3,
+            Verb::ShutDown => 3, #[cfg(feature = "login")] Verb::LogOut => 4, // LOGIN M4. ⚠ LINE-NEUTRAL append.
         }
     }
 }
@@ -153,13 +153,13 @@ struct Row {
 }
 
 /// **The SHARD tree.** Order is Peter's, LOCKED: About first, a separator, then the power verbs.
-const ROWS: [Row; 5] = [
+#[cfg(not(feature = "login"))] const ROWS: [Row; 5] = [
     Row { label: "About This Shard", verb: Some(Verb::About) },
     Row { label: "", verb: None },
     Row { label: "Sleep", verb: Some(Verb::Sleep) },
     Row { label: "Restart", verb: Some(Verb::Restart) },
     Row { label: "Shut Down", verb: Some(Verb::ShutDown) },
-];
+]; #[cfg(feature = "login")] const ROWS: [Row; 7] = [ Row { label: "About This Shard", verb: Some(Verb::About) }, Row { label: "", verb: None }, Row { label: "Sleep", verb: Some(Verb::Sleep) }, Row { label: "Restart", verb: Some(Verb::Restart) }, Row { label: "Shut Down", verb: Some(Verb::ShutDown) }, Row { label: "", verb: None }, Row { label: "Log Out", verb: Some(Verb::LogOut) }, ]; // LOGIN M4 — the whole knob-on tree on ONE line beside the knob-off one, because a `const ROWS` cannot be extended in place and a SECOND ARRAY ON ITS OWN LINES WOULD MOVE EVERY panic::Location BELOW IT (LEDGER P7). Peter's LOCKED order is kept and only appended to: About, separator, the power verbs, then a separator and Log Out — the Mac shard menu's own shape. Every derived metric (`MENU_W`, `MENU_H`, `row_top`, `row_at`) walks `ROWS` in a const loop, so the menu grows by itself; `selftest` leg 3 walks it too, so the new row is resolved on every witness boot with no fixture change. ⚠ LINE-NEUTRAL fold.
 
 // ---------------------------------------------------------------------------
 // Metrics — all derived, none guessed
@@ -693,7 +693,7 @@ fn fire(verb: Verb) {
             crate::power::crystal_shutdown();
             #[cfg(all(target_arch = "aarch64", feature = "pi"))]
             serial_println!(":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::");
-        }
+        } #[cfg(feature = "login")] Verb::LogOut => { serial_println!(":: SHARD: log out — the session closes and the login screen returns ::"); login::reopen_after_logout(); } // LOGIN M4 — the ACTION, not a print: `reopen_after_logout` calls `fs::users::logout()` (the session principal is dropped, so every later launch is anonymous and every owned file is refused it) and puts the screen back up, where a second login opens a NEW session. ⚠ LINE-NEUTRAL append.
     }
 }
 
@@ -1326,3 +1326,39 @@ pub fn routed_selftest() {
 #[cfg(feature = "login")]
 #[path = "login.rs"]
 pub mod login;
+
+/// **LOGIN M4's route under test: the crystal's Log Out ROW.** Handed to [`login::screen_fixture`] as
+/// its `logout`, so the fixture's teardown leg is driven by THE MENU, not by a bare call to the
+/// teardown function. The row is found in the SHARD tree, resolved through the PURE [`item_at`] at the
+/// row's own centre — the same resolver a live press routes by, on a synthetic rect so the fixture
+/// needs no panel, no menu bar and no glass (the row's real PLACEMENT is [`selftest`] leg 3, which
+/// walks `ROWS` and therefore walks this row on every witness boot) — and only then [`fire`]d. So the
+/// wire proves ROW -> VERB -> ACTION. Answers `true` when the session is gone and the screen is back.
+#[cfg(all(feature = "login", feature = "loginst"))]
+pub fn logout_row_fire() -> bool {
+    let mut found: Option<usize> = None;
+    for i in 0..ROWS.len() {
+        if ROWS[i].verb == Some(Verb::LogOut) {
+            found = Some(i);
+        }
+    }
+    let Some(row) = found else {
+        serial_println!(":: LOGIN-LOGOUT: no Log Out row in the SHARD tree -> FAIL — ::");
+        return false;
+    };
+    let r: strip::Rect = (0, 0, MENU_W, MENU_H);
+    let resolves = item_at(r, MENU_W / 2, row_top(row) + ITEM_H / 2) == Some(Verb::LogOut);
+    let real = Verb::LogOut.real();
+    let sep_above = row > 0 && ROWS[row - 1].verb.is_none();
+    fire(Verb::LogOut);
+    let mut nb = [0u8; crate::fs::users::NAME_MAX];
+    let session_closed = crate::fs::users::whoami(&mut nb).is_none();
+    let screen_up = login::is_open();
+    let ok = resolves && real && sep_above && session_closed && screen_up;
+    serial_println!(
+        ":: LOGIN-LOGOUT: row={}/{} label={} resolves={} action={} sep_above={} session_closed={} screen_up={} -> {} ::",
+        row, ROWS.len(), ROWS[row].label, resolves, if real { "real" } else { "stub" }, sep_above, session_closed, screen_up,
+        if ok { "PASS" } else { "FAIL —" }
+    );
+    ok
+}

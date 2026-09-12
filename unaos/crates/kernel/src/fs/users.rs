@@ -781,7 +781,7 @@ pub fn service() {
             #[cfg(feature = "loginst")]
             login_fixture();
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::login::logout_direct);
+            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire); // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it.
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;

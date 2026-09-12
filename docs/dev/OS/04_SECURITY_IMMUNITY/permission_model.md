@@ -117,12 +117,21 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   routes reach it through `fs::users::screen_key` / `screen_open_once`, which are inert where no desktop
   is built. Residual, LEDGER SO36: the screen owns the KEYBOARD only — the dock and the menu bar still
   answer the pointer before a session exists.
+* **Log Out (M4):** a row in the CRYSTAL menu (`crystal::Verb::LogOut`, R21 — menus belong in the menu
+  bar), at the foot of the SHARD tree behind its own separator, knob-on only. The pick drops the session
+  principal (`fs::users::logout`) and puts the login screen back up, where a second login opens a NEW
+  session under the same or another principal — each with its own `/home/<name>`. What Log Out does NOT
+  do is stop the programs the session already launched: they keep the stamp they were launched with
+  (the boundary is the launch, not the clock — the bullet above), so an owned file stays reachable to a
+  process the logged-out user started. LEDGER SO37. The row is proven ROW -> VERB -> ACTION through the
+  menu's own pure resolver (`crystal::logout_row_fire`, fixture `loginst`), and its placement on the
+  real panel by `crystal::selftest` leg 3, which walks every row of the tree.
 * **Status (M1, `exec-orin-login`):** record store, session principal on both arches, `login`/
   `logout` shell arms and the fixture landed; measured while landing: the typed verbs wait on one
   `HOST_VERBS` row in `libs/sys/midden_core`, the x86 QEMU build waits on one `UNAOS_LOGIN` map
   line in `builder/src/main.rs`, and x86 EL0 opens a static root name table (SO20) so the home-file
   proof is aarch64-first. `/home/<name>` at first login (M2), the login screen (M3) and Log Out in
-  the crystal (M4) follow in the same arc. LEDGER SO32.
+  the crystal (M4) all landed in the same arc. LEDGER SO32.
 
 See `docs/SECURITY.md` (the hardening ledger) and `docs/dev/OS/02_KERNEL_CORE/userspace.md`
 (the syscall-level detail) for the exact mechanism and evidence.

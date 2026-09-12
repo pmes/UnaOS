@@ -16,7 +16,8 @@
 
 //! LOGIN M3 — the login screen (`login` knob, RULINGS R51): the desktop boots to it, a successful
 //! login opens the session under `user:<name>` (`fs::users::login`, which also makes `/home/<name>`),
-//! and Log Out (M4, the crystal menu) returns to it. Self-drawn, the Mac model: a name field, a
+//! and Log Out (M4: the crystal menu's own row, `crystal::Verb::LogOut`) returns to it, where a second
+//! login opens a NEW session under the same or another principal. Self-drawn, the Mac model: a name field, a
 //! password field, Enter = log in — in the shape of `video/instgui.rs`: one cached-RAM surface, one
 //! `wm` window, and every key route in `main.rs` offers the key to [`consume_key`] BEFORE its own
 //! serial echo and before the console's `handle_key`, so while the screen is up the keyboard belongs
@@ -366,9 +367,11 @@ fn submit() {
 /// M3 fixture: the screen is driven by keys exactly as a route offers them. Esc must leave the form up;
 /// a wrong password must leave it up with a message and the session closed; the right password must
 /// open the session and take the screen down; with the screen down a key must pass through; Log Out
-/// must put the screen back with the session closed. Headless throughout (module doc); leaves the
+/// must put the screen back with the session closed; and (M4) a SECOND login through the same form
+/// must open a NEW session. Headless throughout (module doc); leaves the
 /// screen CLOSED and no session open, so the rest of the boot is exactly the pre-fixture world.
-/// `logout` is the Log Out route under test (M3: the screen's own; M4: the crystal's row).
+/// `logout` is the Log Out route under test — M4 hands in `crystal::logout_row_fire`, which finds the
+/// **Log Out row** in the SHARD tree, resolves it through the menu's own pure `item_at`, and fires it.
 #[cfg(feature = "loginst")]
 pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -> bool) -> bool {
     HEADLESS.store(true, Ordering::Relaxed);
@@ -392,21 +395,26 @@ pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -
     let passes_through = !consume_key(b'x'); // with the screen down, keys reach the console again
     let logout_ok = logout();
     let back = is_open() && users::whoami(&mut nb).is_none();
+    // M4 — a SECOND login opens a NEW session. Driven through the SAME form the first one used:
+    // Log Out left the fields cleared and the focus on Name (`open`), so this is exactly what a
+    // person does. Another principal is the same path — `submit` re-reads `users::count()` and calls
+    // the same `users::login`, which stamps the session principal and ensures that name's home.
+    feed(name);
+    let _ = consume_key(b'\t');
+    feed(password);
+    let _ = consume_key(b'\n');
+    let second = !is_open()
+        && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == name)
+        && LOGINS.load(Ordering::Relaxed) >= 2;
+    users::logout();
     // teardown: the screen closed, nothing open, the once-latch left for the real ignition
     take_down();
     FORM.lock().state = State::Closed;
     HEADLESS.store(false, Ordering::Relaxed);
-    let ok = esc_kept && wrong_kept && opened && passes_through && logout_ok && back;
+    let ok = esc_kept && wrong_kept && opened && passes_through && logout_ok && back && second;
     serial_println!(
-        ":: LOGIN-SCREEN: window=no esc_kept={} wrong_kept={} opened={} passes_through={} logout={} back_after_logout={} -> {} ::",
-        esc_kept, wrong_kept, opened, passes_through, logout_ok, back, if ok { "PASS" } else { "FAIL —" }
+        ":: LOGIN-SCREEN: window=no esc_kept={} wrong_kept={} opened={} passes_through={} logout={} back_after_logout={} second_login={} logins={} -> {} ::",
+        esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL —" }
     );
     ok
-}
-
-/// M3's Log Out route for the fixture: the screen's own reopen (M4 hands the crystal's row in instead).
-#[cfg(feature = "loginst")]
-pub fn logout_direct() -> bool {
-    reopen_after_logout();
-    true
 }
