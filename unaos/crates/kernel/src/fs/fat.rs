@@ -749,7 +749,7 @@ impl BlockSource {
             // an exception for — the block layer's `write_block_tegra_sd` refuses in EVERY cfg. This
             // arm is a forward to that standing answer, not a second policy.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockSource::TegraSd => Some(TEGRA_SD_VETO),
+            BlockSource::TegraSd => if crate::drivers::block::tegra_sd_writes_admitted() { None } else { Some(TEGRA_SD_VETO) }, // SDWRITE (A60): still a FORWARD, never a second policy — the block layer decides, this arm reports.
         }
     }
 }

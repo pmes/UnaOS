@@ -357,7 +357,7 @@ pub use metal::sdmmc_install_from_usb;
 // single-sector read, and its counted loop. Nothing here can write — the write path stays exclusively
 // behind the `sdmmc_arm` ladder further down this file, untouched by this seam.
 #[cfg(feature = "tegra")]
-pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; // SDMMCWRITE: the gap-#3 write probe (file tail), appended to THIS line for knob-off byte identity (no line moves). BOOTROOT (orin 22) removed the second export that stood on this line — the ROOTFS knob's card-at-`/` bind and its early probe, both deleted with the file-tail section they came from. The root is no longer bound by a per-board knob: `fs::bootdisk` finds the disk that carries THIS kernel and binds that one, on every board. Every item precedes the one comment: a cfg placed AFTER a // compiles nothing (the A9/PRTSCR-ORIN lesson; knob-hygiene.sh probes for it).
+pub use metal::{tegra_sd_card_blocks, tegra_sd_read_block_512, tegra_sd_read_blocks_512}; #[cfg(all(feature = "tegra", feature = "sdmmcwrite"))] pub use metal::sdmmc_write_probe; #[cfg(all(feature = "tegra", feature = "sdwrite"))] pub use metal::tegra_sd_write_block_512; // SDMMCWRITE: the gap-#3 write probe (file tail), appended to THIS line for knob-off byte identity (no line moves). BOOTROOT (orin 22) removed the second export that stood on this line — the ROOTFS knob's card-at-`/` bind and its early probe, both deleted with the file-tail section they came from. The root is no longer bound by a per-board knob: `fs::bootdisk` finds the disk that carries THIS kernel and binds that one, on every board. Every item precedes the one comment: a cfg placed AFTER a // compiles nothing (the A9/PRTSCR-ORIN lesson; knob-hygiene.sh probes for it).
 
 #[cfg(feature = "tegra")]
 mod metal {
@@ -465,7 +465,7 @@ mod metal {
     // ── INTERRUPT (0x30) bits (W1C). ──
     const INT_CMD_DONE: u32 = 1 << 0;
     const INT_DATA_DONE: u32 = 1 << 1;
-    #[cfg(any(feature = "sdmmc_arm", feature = "sdmmcwrite"))]
+    #[cfg(any(feature = "sdmmc_arm", feature = "sdmmcwrite", feature = "sdwrite"))]
     const INT_WRITE_RDY: u32 = 1 << 4; // Buffer Write Ready (host may push the PIO FIFO)
     const INT_READ_RDY: u32 = 1 << 5;
     const INT_ERR: u32 = 1 << 15;
@@ -3721,6 +3721,117 @@ mod metal {
             );
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════════════
+    // SDWRITE (A60, 2026-09-12) — the WRITE twin of the TEGRA-SDBLK read surface.
+    //
+    // APPENDED AT THE END OF `mod metal`, deliberately: every line above is where it was, so no
+    // `core::panic::Location` in this file moves and the tegra knob-off byte-identity gates are
+    // untouched (the same rule the LOADER-MEDIUM block at the file tail states for its own rewrite).
+    //
+    // ### Why a private CMD24 here instead of un-gating `write_block_at`
+    // Exactly the argument the read section makes one screen up, and A60 restates it as law:
+    // `write_block_at` lives INSIDE the `sdmmc_arm` region and is gated on it, because the paranoia
+    // ladder deliberately owns the only armed writer — it stashes, writes, verifies and restores
+    // under `install_target`. Un-gating it would edit the armed ladder for the convenience of an
+    // unarmed consumer, which is the direction that section's law forbids. `write_block_rw` below is
+    // its unarmed twin: same command, same bounded waits, same W1C discipline, same DAT0 busy wait,
+    // reached only from this section. The duplication is the price of leaving the ladder alone, and
+    // it is named rather than hidden.
+    //
+    // ### What it is NOT
+    // It is not a second door past the ladder's gates: the ladder writes to a SCRATCH region it chose
+    // and stashed. This one writes the sector a filesystem named, which is the whole point — the
+    // filesystem is the thing that decided, journaled and authorized it.
+
+    /// Write one arbitrary block `lba` via polled single-block CMD24 (WRITE_SINGLE_BLOCK), host->card
+    /// (DAT_DIR clear). Returns whether the block was written AND the card left the programming (busy)
+    /// state cleanly — a write that has not cleared DAT0 is not durable, and a read-back racing it
+    /// would read the OLD block. The unarmed twin of `write_block_at` (see the section header).
+    #[cfg(feature = "sdwrite")]
+    fn write_block_rw(base: u64, block_addressing: bool, lba: u64, buf: &[u8; 512]) -> bool {
+        // A57: the shared checked argument builder — a byte-addressed card tops out at a 32-bit BYTE
+        // offset (4 GiB), and a wrapped write argument overwrites a sector nothing connects back to
+        // this call. Refuse loudly; never issue the command.
+        let Some(arg) = super::sd_block_arg(block_addressing, lba) else {
+            serial_println!(
+                "{}   SDBLK: CMD24 (WRITE LBA {}) REFUSED — not addressable on this card ({}) ::",
+                PS,
+                lba,
+                if block_addressing { "sector arg > u32::MAX" } else { "byte arg past the 4 GiB ceiling" }
+            );
+            return false;
+        };
+
+        write32(base, INTERRUPT, 0xffff_ffff);
+        write32(base, BLKSIZECNT, (1 << 16) | 512); // one block, 512 bytes
+        if send_command(
+            base,
+            cmd(24) | CMD_RESP_48 | CMD_CRCCHK | CMD_IXCHK | CMD_ISDATA,
+            arg,
+        )
+        .is_err()
+        {
+            serial_println!("{}   SDBLK: CMD24 (WRITE LBA {}) failed at the link layer ::", PS, lba);
+            return false;
+        }
+        let r1 = read32(base, RESP0);
+        if r1 & R1_ERROR_MASK != 0 {
+            serial_println!("{}   SDBLK: CMD24 LBA {} R1 error status {:#010x} ::", PS, lba, r1);
+            return false;
+        }
+        if !wait_set(base, INTERRUPT, INT_WRITE_RDY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: LBA {} write buffer never became ready (WRITE_RDY timeout) ::", PS, lba);
+            return false;
+        }
+        write32(base, INTERRUPT, INT_WRITE_RDY); // W1C
+        for i in 0..128usize {
+            let off = i * 4;
+            let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            write32(base, DATA, word);
+        }
+        if !wait_set(base, INTERRUPT, INT_DATA_DONE | INT_ERR_ANY, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: LBA {} transfer-complete timeout after buffer write ::", PS, lba);
+            return false;
+        }
+        let int = read32(base, INTERRUPT);
+        write32(base, INTERRUPT, int); // W1C everything we saw
+        if int & INT_ERR_ANY != 0 {
+            serial_println!("{}   SDBLK: LBA {} data-transfer error status {:#010x} ::", PS, lba, int);
+            return false;
+        }
+        // The card holds DAT0 low while it programs the flash. Wait for the release before calling the
+        // write done: `send_command` would wait DAT_INHIBIT on the NEXT command, but a filesystem's
+        // read-back is not guaranteed to be the next command on this controller.
+        if !wait_clear(base, STATUS, ST_DAT_INHIBIT, DATA_TIMEOUT_MS) {
+            serial_println!("{}   SDBLK: card stayed busy (DAT0) after writing LBA {} — programming did not complete ::", PS, lba);
+            return false;
+        }
+        true
+    }
+
+    /// Write one 512-byte sector — the primitive `drivers::block::tegra_sd_write_through` calls.
+    /// Bounds are re-checked HERE against the card's own published capacity as well as at the block
+    /// layer, for the reason `tegra_sd_read_block_512` gives: this is what names an LBA to the card.
+    #[cfg(feature = "sdwrite")]
+    pub fn tegra_sd_write_block_512(lba: u64, buf: &[u8]) -> Result<(), crate::drivers::block::BlockError> {
+        use crate::drivers::block::BlockError;
+        if buf.len() < 512 {
+            return Err(BlockError::Io);
+        }
+        let guard = SD_BLK.lock();
+        let card = guard.ok_or(BlockError::NotReady)?;
+        if lba >= card.num_blocks {
+            return Err(BlockError::BadLba);
+        }
+        let mut sec = [0u8; 512];
+        sec.copy_from_slice(&buf[..512]);
+        if !write_block_rw(card.base, card.block_addressing, lba, &sec) {
+            return Err(BlockError::Io);
+        }
+        Ok(())
+    }
+
 }
 
 // =====================================================================================

@@ -1302,7 +1302,7 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     }
 
     let Some(found) = s.root else { return };
-    bind_root(mt, found.source, unafs_state(found.source), announce);
+    bind_root(mt, found.source, unafs_state(found.source), announce); #[cfg(feature = "sdwritefx")] sdwrite_fixture(mt, found.source); // SDWRITE (A60): the metal fixture, armed by UNAOS_SDWRITE=1, on the root this call just bound.
 }
 
 /// UNAFSROOT (orin 24): the ROOT DISK's three mounts, as a function of ONE fact — the
@@ -1356,7 +1356,7 @@ pub(crate) fn bind_root(
         false
     };
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "sdwrite")))] // SDWRITE (A60): knob-off keeps this arm verbatim; the twin that samples the BACKEND is folded onto the closing line below.
     if native_root {
         mt.mount("/", alloc::boxed::Box::new(crate::fs::vfs::NativeBackend::new("native")));
         if announce {
@@ -1369,7 +1369,7 @@ pub(crate) fn bind_root(
                 if src.write_veto().is_none() { "yes" } else { "no" }
             );
         }
-    }
+    } #[cfg(all(target_arch = "aarch64", feature = "sdwrite"))] if native_root { native_root_mount(mt, src, announce); } // SDWRITE (A60), second finding: the native arm samples the backend it MOUNTS, not the BlockSource. See `native_root_mount` at the file tail.
     if !native_root {
         let be = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
         let rw = !be.read_only();
@@ -1795,7 +1795,7 @@ pub fn unafsroot_selftest() {
     // USBREG (SO33): leg 7 rides the same boot-path entry point, for the same reason — see
     // [`usbreg_selftest`]. It carries its own latch, so calling it here and from
     // `homesoil_selftest` prints it exactly once.
-    usbreg_selftest();
+    usbreg_selftest(); #[cfg(feature = "sdwrite")] sdwrite_posture_selftest(); // SDWRITE (A60) leg 8: the posture/polarity matrix, latched like its siblings.
     // --- leg 6: UNAFSROOT — the root disk's LAYOUT RULE, driven with every answer it takes. -----
     // `bind_root` is the one place `/`, `/boot` and `/apps` are decided, and until this leg the
     // `present` answer had never executed anywhere (render12: `unafs=absent`, no card carried a
@@ -1889,4 +1889,221 @@ fn assert_admit(
     if !admit(disks, src, id, dev, label, unit) {
         serial_println!(":: HOMESOIL: setup source={} aliased unexpectedly :: FAIL ::", src.name());
     }
+}
+
+// ===================== SDWRITE (A60, 2026-09-12) — the root's write POSTURE on the wire =====================
+//
+// APPENDED AT THE FILE TAIL so no `core::panic::Location` in this file moves; every edit above is
+// line-for-line in place. See `drivers/block.rs`'s SDWRITE section for the posture itself.
+
+/// SDWRITE: the `rw=` WORD, from a veto. One mapping, used by the native root's announce and driven
+/// BOTH WAYS by leg 8 — so inverting it is a red fixture and not a quiet lie on the wire.
+#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+fn native_root_rw_word(veto: Option<&'static str>) -> &'static str {
+    if veto.is_none() { "yes" } else { "no" }
+}
+
+/// SDWRITE (A60, second finding): bind `/` to the native volume and announce it with a posture
+/// sampled from THE BACKEND BEING MOUNTED.
+///
+/// The pre-A60 arm mounted a `NativeBackend` and then printed `rw=` from `BlockSource::write_veto()`
+/// — a question about a different object. That is the same defect `HOMESOIL` had already fixed for
+/// `/volumes/` and `/boot` ("ONE sample, from the backend being mounted — not a second derivation of
+/// the posture"), left standing on the one mount where it mattered most. Here the sample comes off
+/// the very backend handed to `mt.mount`, and `NativeBackend::write_veto` forwards the block layer's
+/// answer for the handle the shared unafs mount is riding — so `rw=yes` on `/` is a statement about
+/// the disk, not a hope about it.
+#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+fn native_root_mount(mt: &mut crate::fs::vfs::MountTable, src: BlockSource, announce: bool) {
+    use crate::fs::vfs::VfsBackend;
+    let be = crate::fs::vfs::NativeBackend::new("native");
+    let rw = native_root_rw_word(be.write_veto());
+    mt.mount("/", alloc::boxed::Box::new(be));
+    if announce {
+        // The discriminating words stay LITERALS in the format string — the `/volumes/` lesson: an
+        // artifact census (`LC_ALL=C grep -a -o -F`) must be able to find the sentence it certifies.
+        serial_println!(
+            "[vfs] root mount / = native unafs volume source={} rw={} ::",
+            src.name(),
+            rw
+        );
+    }
+}
+
+/// SDWRITE leg 8 — THE POSTURE/POLARITY MATRIX, and it runs on QEMU `virt`.
+///
+/// WHAT IT CAN AND CANNOT PROVE, said first. **No QEMU machine models the Tegra234 SDHCI** — `arroyo`
+/// launches `q35`, `raspi4b` and generic `virt`, and zero tegra machines — so nothing here issues a
+/// CMD24 or touches a card. What IS testable without the controller is the thing A60 was opened
+/// about: the REPORT. The pre-A60 tree could print `rw=yes` over a path that could not write one
+/// byte, because the veto was decided in `drivers/block.rs` and re-stated in `fs/fat.rs`, and two
+/// statements of one answer drift. This leg asserts they are one answer.
+///
+/// Three claims, each driven rather than read:
+///  1. **The mapping, both ways.** `native_root_rw_word(None) == "yes"` and `…(Some(_)) == "no"` —
+///     the same function the native root's announce uses. Invert it and this reds.
+///  2. **One answer per source.** For EVERY source in `fat::ALL_SOURCES`, the FAT layer's
+///     `BlockSource::write_veto()` and the block layer's `handle_write_veto(handle_of(src))` agree on
+///     whether a write is admitted. A second policy in either layer reds this the moment it differs —
+///     which is exactly the drift the `TegraSd` arm was (a veto that only ECHOED one two layers down).
+///  3. **The polarity that SHIPS.** `posture=` is `cfg!(feature = "sdwrite")`, printed so a capture
+///     says which build it came from; and on a build that HAS the card handle, `TegraSd`'s veto is
+///     asserted to match it in both directions. On a build without `tegra`+`sdmmc` the field reads
+///     `card=absent` — the leg says what it did not test instead of passing quietly.
+#[cfg(all(feature = "witness", feature = "sdwrite"))]
+pub fn sdwrite_posture_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let posture = cfg!(feature = "sdwrite");
+
+    // (1) the mapping, driven both ways.
+    #[cfg(target_arch = "aarch64")]
+    let map_ok = native_root_rw_word(None) == "yes" && native_root_rw_word(Some("refused")) == "no";
+    // `NativeBackend` and its announce are aarch64-only, so on x86 there is no mapping to drive and
+    // the leg says so rather than asserting a function that does not exist.
+    #[cfg(not(target_arch = "aarch64"))]
+    let map_ok = true;
+    #[cfg(target_arch = "aarch64")]
+    const MAP_FIELD: &str = "yes/no";
+    #[cfg(not(target_arch = "aarch64"))]
+    const MAP_FIELD: &str = "n/a(x86)";
+
+    // (2) one answer per source — the FAT view and the block view, compared for every source.
+    let mut agree = true;
+    let mut census = String::new();
+    for src in fat::ALL_SOURCES {
+        let fat_admits = src.write_veto().is_none();
+        let blk_admits =
+            crate::drivers::block::handle_write_veto(fat::handle_of(*src)).is_none();
+        if fat_admits != blk_admits {
+            agree = false;
+        }
+        if !census.is_empty() {
+            census.push(' ');
+        }
+        census.push_str(src.name());
+        census.push('=');
+        census.push_str(if fat_admits { "rw" } else { "ro" });
+        if fat_admits != blk_admits {
+            census.push_str("!DISAGREES");
+        }
+    }
+
+    // (3) the polarity that ships, on a build that has the card handle.
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    let (card_field, card_ok) = (
+        if crate::fs::fat::BlockSource::TegraSd.write_veto().is_none() { "admits" } else { "refuses" },
+        crate::fs::fat::BlockSource::TegraSd.write_veto().is_none() == posture
+            && crate::drivers::block::tegra_sd_writes_admitted() == posture,
+    );
+    #[cfg(not(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc")))]
+    let (card_field, card_ok) = ("absent", true);
+
+    let leg8 = map_ok && agree && card_ok;
+    serial_println!(
+        ":: SDWRITE-POSTURE: posture={} map={} sources {} card={} (no QEMU machine models Tegra SDHCI — this leg tests the REPORT, never the medium) :: {} ::",
+        if posture { "on" } else { "off" },
+        MAP_FIELD,
+        census,
+        card_field,
+        if leg8 { "PASS" } else { "FAIL" }
+    );
+}
+
+/// SDWRITE — THE METAL FIXTURE (`UNAOS_SDWRITE=1` → the `sdwritefx` feature).
+///
+/// One file, one block, four steps, on the root this boot actually bound: create `/SDWRITE.TXT`,
+/// write one 512-byte stamped block into it, read it back, delete it. The verdict line is
+/// `:: SDWRITE: root=<source> wrote=1 readback=match deleted=1 -> PASS ::`; a FAIL names the STEP
+/// that refused, because "it failed" about a four-step sequence is not a diagnosis.
+///
+/// **CARD SAFETY, stated because this is the first code in this OS that writes an operator's card
+/// outside the armed ladder.** The fixture names exactly ONE path, `/SDWRITE.TXT`, at the root of
+/// the mounted volume, and it creates it, writes it, reads it and unlinks it. It never opens, moves,
+/// truncates or deletes anything else, it never touches `/boot` or `/apps`, it never addresses an
+/// LBA itself, and every sector it does reach is one the filesystem chose for that file. The only
+/// other bytes that change on the medium are the filesystem metadata a create-plus-delete of one
+/// file necessarily rewrites (the FAT/directory entry, or UnaFS's journal and CoW root) — that is
+/// inherent to creating a file at all, and it is the whole of the delta. Any write outside that is a
+/// DEFECT, and the boot that shows one is evidence against this code, not against the card.
+///
+/// It is DEFAULT OFF and it is not witness-gated: it is an explicitly armed experiment, so it prints
+/// on the boot that armed it and does not exist on any other.
+#[cfg(feature = "sdwritefx")]
+fn sdwrite_fixture(mt: &crate::fs::vfs::MountTable, src: BlockSource) {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    const PATH: &str = "/SDWRITE.TXT";
+    const N: usize = 512;
+    // A stamped block: position-varying, so a short or shifted read-back cannot match by accident.
+    let mut want: Vec<u8> = Vec::with_capacity(N);
+    for i in 0..N {
+        want.push((i as u8).wrapping_mul(31) ^ 0x5a);
+    }
+    let fail = |step: &str, why: &str| {
+        serial_println!(
+            ":: SDWRITE: root={} step={} why={} -> FAIL ::",
+            src.name(),
+            step,
+            why
+        );
+    };
+    // The posture the root reports, read back from the mount table so the fixture and the wire agree.
+    let veto = match mt.write_veto(PATH) {
+        Ok(v) => v,
+        Err(_) => {
+            fail("veto", "no backend resolves the root");
+            return;
+        }
+    };
+    if let Some(why) = veto {
+        fail("veto", why);
+        return;
+    }
+    if mt.create(PATH, NodeKind::File, KERNEL_PRINCIPAL).is_err() {
+        fail("create", "the root refused to create SDWRITE.TXT");
+        return;
+    }
+    let wrote = match mt.write(PATH, 0, &want, KERNEL_PRINCIPAL) {
+        Ok(n) if n == N => 1u32,
+        Ok(_) => {
+            fail("write", "short write");
+            let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+            return;
+        }
+        Err(_) => {
+            fail("write", "the write was refused");
+            let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let back = match mt.read(PATH, 0, N) {
+        Ok(b) => b,
+        Err(_) => {
+            fail("readback", "the read-back was refused");
+            let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let matched = back.len() == N && back.as_slice() == want.as_slice();
+    if !matched {
+        fail("readback", "the bytes that came back are not the bytes that went down");
+        let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+        return;
+    }
+    if mt.unlink(PATH, KERNEL_PRINCIPAL).is_err() {
+        fail("delete", "SDWRITE.TXT could not be removed — IT IS STILL ON THE CARD");
+        return;
+    }
+    if mt.stat(PATH).is_ok() {
+        fail("delete", "SDWRITE.TXT still resolves after unlink");
+        return;
+    }
+    serial_println!(
+        ":: SDWRITE: root={} wrote={} readback=match deleted=1 -> PASS ::",
+        src.name(),
+        wrote
+    );
 }

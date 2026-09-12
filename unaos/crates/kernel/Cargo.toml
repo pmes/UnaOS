@@ -1139,6 +1139,38 @@ install_target = ["sdmmc_arm"]
 # the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
 sdmmcwrite = ["sdmmc"]
 
+# SDWRITE (A60, 2026-09-12): LIFT THE TegraSd WRITE VETO — the block layer admits an ORDINARY file
+# mutation to the Orin microSD, so a slot-booted Orin can have a writable `/` (R51 "home folder",
+# LOGIN M2). DEFAULT ON — `unaos/arroyo` composes it into every build and `UNAOS_NOSDWRITE=1` takes it
+# back out — because the shipped configuration is the one that has to be right, and a writable root
+# that only exists behind a knob is a root nobody boots. What it turns on: `drivers/block.rs`'s
+# `write_block_tegra_sd` / `write_blocks_tegra_sd` route to the driver's UNARMED CMD24 primitive
+# (`sdmmc_tegra::tegra_sd_write_block_512`, the twin of `read_block_ro`, appended at the end of
+# `mod metal`) instead of refusing; `register_tegra_sd`'s publish line says `read-write`;
+# `fs/fat.rs`'s `BlockSource::TegraSd` veto forwards `block::tegra_sd_writes_admitted()` instead of a
+# flat refusal; `fs/vfs.rs`'s `NativeBackend::write_veto` FORWARDS `block::native_mount_write_veto()`
+# instead of asserting `None`; and `fs/bootdisk.rs`'s native root samples the BACKEND it mounts for
+# `rw=`. It does NOT touch the armed `sdmmc_arm` ladder, the `install_target` flow, the Pi's FRGUARD
+# `default_writable` posture, or any x86 arm. Knob OFF => every one of those sites is the pre-A60
+# source verbatim, every edit above them is line-for-line in place, and the knob-off images are
+# byte-identical (`./arroyo knoboff sdwrite <baseline>`). The OFF polarity is type-checked by every
+# pre-existing `arm-tegra-*` leg; the SHIPPED (ON) polarity by `arm-tegra-sdwrite` and
+# `arm-tegra-sdwritefx` of KERNEL_CFG_MATRIX. Witness families: `:: TEGRA-SD: WRITE admitted` and
+# `:: SDWRITE-POSTURE:` (leg 8, `witness`). Kept in sync with arroyo.
+sdwrite = []
+# SDWRITE FIXTURE (`UNAOS_SDWRITE=1`): the METAL proof, and it is a separate feature from the veto
+# lift on purpose — `sdwrite` is DEFAULT ON, so a knob that armed it would arm nothing and the
+# artifact census "`:: SDWRITE:` present with the knob, absent without it" could not be run. At boot,
+# on the root `fs::bootdisk::bind` just bound, it creates `/SDWRITE.TXT`, writes one 512-byte stamped
+# block, reads it back, deletes it, and prints
+# `:: SDWRITE: root=<source> wrote=1 readback=match deleted=1 -> PASS ::` (a FAIL names the step).
+# It writes exactly that ONE path and nothing else. Implies `sdwrite` (there is no point proving a
+# write the build refuses) and `sdmmc` (without the card's block backend the fixture would prove the
+# write on some other volume and say PASS, which is the trap this implication closes). DEFAULT OFF =>
+# the call site and the function do not exist. NOT witness-gated: it is an explicitly armed
+# experiment, so it speaks on the boot that armed it. Kept in sync with arroyo.
+sdwritefx = ["sdwrite", "sdmmc"]
+
 # SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
 # (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
 # `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
