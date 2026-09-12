@@ -84,6 +84,8 @@ the shared userspace port.
 | **K1+K2** | Reboot-surviving ACL: the U6 owner/grants persist to an on-disk `UNAFS.ATR` file (kernel-stamped `PrincipalRecord`, volume-fingerprint bound). Foundation + persistence landed (K1); **K2 turned cross-reboot enforcement LIVE** — three distinct launchable named programs on the card, the gate flipped, grow-repersist, and an end-to-end proof through REAL programs (`K2OWN.BIN` re-admitted by name after rebuild, `K2IMP.BIN` denied). **✅ METAL-CONFIRMED on real Pi 4 (2026-07-11): one-boot MBENCH 25/25, and a genuine two-boot power-cycle (`UNAOS_K2_LEAVE`) — the owned file's ACL survived a real power-cut and was enforced on the next boot** | pi4 |
 | **UI/gfx** | Scale-aware UI metrics (no absolute pixel sizes), the in-kernel `pulse` monitor + `vessels/pulse` host vessel, the `vug` software-rendered crystal engine, and the fbcon cached-RAM shadow that kills the uncached-VRAM scroll on x86 | rmbp/ux |
 
+**LOGIN (direction, Peter, 2026-09-12, RULINGS R51: "keep working on multi-user so i can login, get a home folder and all").** A human user is a named principal on the same `owner`/`grants:*` attributes the U-chain and K1/K2 built (SECURITY.md's POSIX hedge, now taken): the desktop boots to a login screen, a successful login opens a session under that principal, `/home/<user>` is created on the root volume at first login and owned by it, every program launched in the session runs as it, logout returns to the login screen. Executor LOGIN (2026-09-12) carries the design and the first milestones; the row lands in §1a when it lands.
+
 ## 1b. Networking: sockets on the mature stack (direction, 2026-07-12)
 
 **Decision (Peter): adopt the mature TCP/IP crate — [smoltcp](https://github.com/smoltcp-rs/smoltcp)
