@@ -335,12 +335,28 @@ Wire shape:
 
 ```
 :: NET6: stack UP over virtio-net: 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 lease-owner=smoltcp-dhcpv4 [dhcp] sockets=4 ::
-:: NET6: sock udp round-trip 40 bytes from 10.0.2.3:53 -> PASS ::
-:: NET6: sock tcp round-trip 10.0.2.3:53 sent=26 recv=42 -> PASS ::
+:: NET6: fixture: shared socket surface over virtio-net (lease-owner=smoltcp-dhcpv4) ::
+:: NET6: sock udp round-trip 99 bytes from 10.0.2.3:53 -> PASS ::
+:: NET6: sock tcp round-trip 10.0.2.3:53 sent=26 recv=101 -> PASS ::
 :: NET6: ping 10.0.2.2 seq=1 rtt_ms=0 -> REPLY ::
-:: NET6: dns una.os -> A 10.0.2.3 (server 10.0.2.3) ::
+:: NET6: ping 10.0.2.2 seq=2 rtt_ms=1 -> REPLY ::
+:: NET6: ping 10.0.2.2 seq=3 rtt_ms=0 -> REPLY ::
+:: NET6: ping 10.0.2.2 seq=4 rtt_ms=0 -> REPLY ::
+:: NET6: ping 10.0.2.2 4/4 replies over virtio-net peer 52:55:0a:00:02:02 -> REPLY ::
+:: NET6: dns una.os -> SERVER ERROR rcode=3 (server 10.0.2.3) ::
+:: NET6: fixture: 3/3 legs passed -> PASS ::
 :: NET6: el0 socket family over virtio-net — socket=true bind=true sendto=true recvfrom=true socket-tcp=true connect=true send=true sock_recv=true -> PASS ::
 ```
+
+That block is the CAPTURE, not a sketch: it is `awk 'index($0,":: NET6:")'` over the gate-3 log of
+the merged tree (§8.7), all twelve lines it emitted, in order. Two of them read differently from
+what an author would guess and are quoted BECAUSE they do. `dns una.os` answers **SERVER ERROR
+rcode=3** — slirp's resolver is real and `una.os` is a name it does not have, so NXDOMAIN is the
+correct answer and the round trip is what the leg proves: the query was built, sent, matched by
+transaction id and parsed. A resolver that invented an address here would be the defect. And
+`fixture: 3/3 legs passed` counts UDP, TCP and ICMP — the `dns` verb runs beside the fixture and is
+not one of its three legs, which is why 3/3 and an NXDOMAIN sit in the same capture without
+contradiction.
 
 Compile coverage of the ARMED polarity is two KERNEL_CFG_MATRIX legs, not one: `arm-virt-net6`
 (`virt_el0,vnet,net6` — the only leg that compiles the EL0 fixture launcher, and deliberately carries
@@ -355,6 +371,79 @@ of whichever a gate happened to build.
 * `NSOCK = 4` concurrent sockets, 1 KiB datagrams, 2 KiB stream rings — all BSS, no heap.
 * No `listen`/`accept` on aarch64 yet (x86's SOCK-6/7 server side); the client halves are here.
 * Live ICMP/ARP on the Orin's real link remains **attended-metal** (orin-ledger A59).
+
+### 8.7 Re-gated on the `hw-jetson` merge (2026-09-12)
+
+NET6 was first written at `cc3ca3e8` and committed at a spend wall with its gates incomplete. The
+track then moved 36 commits (APPNAME, DRAGSTALL, SDARG/SDWRITE, APPPIN, GA10B5/5B, the WCDFLOOD cfg
+fix `83ee4653`), so the tree the gates had to certify is the MERGE, not the arc. A fold of two green
+commits is a new configuration and is re-gated whole (LAWS §3). All five ran on `d48292af`:
+
+| # | command (from `unaos/`) | rc | log |
+|---|---|---|---|
+| 1 | `./arroyo check` | 0 | `1.log` — 94 legs green, `kernel cfg coverage OK (69 legs)` |
+| 2 | `UNAOS_TEGRA=1 ./arroyo check` | 0 | `2.log` — 94 legs green |
+| 3 | `UNAOS_QEMU_FULL=1 UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VNET=1 UNAOS_NET6=1 ./arroyo test-arm 60` | 0 | `3.log` — the twelve `:: NET6:` lines of §8.5 |
+| 4 | `env -u UNAOS_TEGRA ./arroyo knoboff net4 2c4e7a73` | 0 | `4b.log` — both arches byte-identical, control fired |
+| 5 | `UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo esp-jetson` | 0 | `5.log` — the tegra ESP, certified below |
+
+(Logs under `~/unaos-bench/scratch/orin-0912b/net6/`.) Gate 3 runs under `UNAOS_QEMU_FULL=1` because
+LAWS §5 says the full wall is the form an arc's DONE gate takes: a fault emitted inside the grace reds
+both modes, but one emitted beyond it reds only the full wall.
+
+**Gate 4's baseline is the SECOND parent, and that is not a detail.** `knoboff` defaults to `HEAD~1`
+(`arroyo:8435`), which on a merge commit is the FIRST parent — here `bd3d0113`, this arc's own pre-merge
+tip. Run that way it reports `MOVED` on both arches and is RIGHT to: the two images differ by all 36
+commits of track code (x86 grew 640 bytes, so "the SIZE changed, this is code, not a line shift" — and
+it was). That answer is true and useless, because the question knoboff exists to ask is whether THIS
+ARC's knob-off image moved. On a merge tree the tree-without-the-arc is the other parent, so the
+baseline is named: `knoboff net4 2c4e7a73`. It then reports byte-identical on both arches with the
+control fired (`arm armed≠off: YES`), and the current-tree hashes are the same two values the
+first run printed — the same measurement, read against the right baseline.
+
+**Artifact certification** of the gate-5 ESP kernel, `LC_ALL=C grep -a -o -F` on
+`target/aarch64_esp/kernel.elf` (2,335,632 B) — never `strings`, per LAWS §5:
+
+```
+:: NET6:                              1     lease-owner=                        2
+ -> is-at                             1     smoltcp-dhcpv4                      2
+ seq=                                 3     stack UP over                       2
+ rtt_ms=                              2      -> A                               1
+-> REPLY ::                           1     NO RESOLVER (no lease, no gateway)  1
+-> NO REPLY ::                        1
+:: NET7:                              0  (control, must be 0)
+ZZ-NOT-IN-THIS-BUILD                  0  (control, must be 0)
+```
+
+`:: NET6:` is **1**, not twelve: `P6` is one `pub const &str` (`net_phy.rs:817`) that every witness
+formats against, so `.rodata` holds a single copy and a count of 1 is the whole family present. The
+per-verb fragments above are what a reader should actually grep, and they are listed because a count
+of one on a deduplicated constant cannot distinguish "all the verbs shipped" from "one of them did".
+The two zero rows are the controls: ten tokens in the same invocation come back non-zero, so a zero
+is a fact about the artifact and not about the pattern.
+
+Three witness strings are **absent from this artifact, correctly**: `sock udp round-trip`,
+`sock tcp round-trip` and `el0 socket family over` all read 0. They belong to `net6::fixture()` and to
+`virt_el0_verdict`, which are `virt_el0`-gated; `esp-jetson` builds `tegra_el0` and builds witness-FREE
+(`arroyo:44` arms `witness` for exactly the four battery commands). A card is not supposed to carry the
+fixtures — it carries the verbs.
+
+**The card knob line, measured rather than assumed:**
+
+```
+UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo esp-jetson
+```
+
+**`UNAOS_NET6=1` is NOT needed on it.** The knob map appends `net6` to the feature set from the NIC
+knobs themselves (`arroyo:1847`, `:1862`), and the run's own banner is the proof, not the mapping:
+
+```
+⚡ kernel features (jetson): ehcihid,kbdwit,sdhcblk,smolnet,tegra,bsptick,bsprun,tegrasmp,apsrun,net4,pcie3,pcie2,net6,net5,sdmmc
+```
+
+`net6` is in that set with no fourth knob on the line, and the certification above is of the artifact
+that set built. The standalone `UNAOS_NET6=1` knob still exists for the `virt` runtime gate, where no
+NIC knob would otherwise arm the surface.
 
 ---
 
