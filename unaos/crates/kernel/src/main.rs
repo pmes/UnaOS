@@ -1746,7 +1746,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
         // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
         #[cfg(target_arch = "aarch64")]
-        unaos_kernel::fs::fat::piusb27_service();
+        unaos_kernel::fs::fat::piusb27_service(); #[cfg(all(target_arch = "aarch64", feature = "ga10bprobe5", feature = "witness"))] unaos_kernel::arch::ga10b_fw::fixture_service(); // GA10B-PROBE5 fixture (orin-0912b, `UNAOS_GA10B_PROBE5=1 ./arroyo test-arm`, witness only): the rung-5 firmware LOADER run on QEMU virt against the SYNTHETIC `GA10B/` + `GA10BBAD/` FAT image arroyo builds — GA10B/ must print `[ga10bfw] -> LOADED`, GA10BBAD/ must print `-> REFUSED reason=digest`. HERE because this is the storage-ready pass a headless test-arm boot reaches (the SELFHOST-2 note above) and the loader reads the stick through the VFS; the latch inside speaks once. Appended to THIS line, before the comment: knob-off it is cfg-erased and no panic `Location` below moves.
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial whenever it grows.
         // On QEMU (serial live) this makes the recorded ring — including the FTDI/block milestones that
         // land from inside this loop — verifiable in serial.log without keyboard input, the M3 proof

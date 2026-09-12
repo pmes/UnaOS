@@ -2233,6 +2233,24 @@ ga10bprobe4c = ["ga10bprobe4b"]
 # type-checked by the `arm-tegra-ga10bprobe4d` leg. Witness family: `[ga10bprobe4d]`.
 ga10bprobe4d = ["ga10bprobe4c"]
 
+# GA10B-PROBE5 (`UNAOS_GA10B_PROBE5=<any non-empty>`): the FIRMWARE LOADER for rung 5a of the GA10B ladder —
+# `arch/aarch64/ga10b_fw.rs`. Design: docs/dev/OS/08_VIDEO/GA10B-RUNG5-BRIEF.md §5 (P6/P7/P8, §5.2.1,
+# §5.6, §5.7); ledger A63. Reads NVIDIA's `acr-gsp` triple as THREE ORDINARY FILES from the boot volume's
+# `GA10B/` directory through the VFS (`MountTable::stat`/`read` over `fs::fat`, VFAT long names, PI-FS-3),
+# verifies each file's size and sha256 against compiled-in constants (A61: digests are facts, not the
+# blob — no vendor byte is in the tree, R52), and places the three sections 256-byte-aligned in a window
+# the CALLER hands it (text at +0, data next, manifest next), digesting what LANDED. ZERO MMIO by
+# construction — the module has no register, no BAR0 pointer, no write primitive — so every refusal
+# (`-> REFUSED reason=<absent|size|digest|window> name=<f>`) is a zero-MMIO refusal. Implies NOTHING (not
+# `tegra`): the loader is arch-neutral data handling, and the QEMU-virt fixture (`UNAOS_GA10B_PROBE5=1
+# ./arroyo test-arm`, `witness` on) runs it from `kernel_main`'s storage-ready loop against a FAT image
+# arroyo builds with three SYNTHETIC files of the vendor's names and sizes (`GA10B/`, must LOAD) and a
+# one-byte-flipped twin (`GA10BBAD/`, must REFUSE reason=digest) — the go-red proof from a file, every
+# run. Default OFF => module + the two folded call sites vanish, knob-off images byte-identical. ARMED
+# polarities type-checked by the `arm-ga10bprobe5` (virt, witness) and `arm-tegra-ga10bprobe5a` legs of
+# KERNEL_CFG_MATRIX. Witness family: `[ga10bfw]`.
+ga10bprobe5 = []
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

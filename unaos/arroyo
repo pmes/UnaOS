@@ -1073,6 +1073,30 @@ fi
 [ "${UNAOS_GA10B_PROBE4:-}" = "2" ] && _feats="${_feats}ga10bprobe4b,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "3" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "4" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,ga10bprobe4d,"
+# GA10B-PROBE5 (GA10BPROBE5): ONE env knob driving the rung-5 line of the GA10B ladder (brief:
+# docs/dev/OS/08_VIDEO/GA10B-RUNG5-BRIEF.md §5 as built; RUNG6 brief for 5b; ledger A63/A64).
+#   any non-empty value    -> feature `ga10bprobe5`   — the firmware LOADER (`arch/aarch64/ga10b_fw.rs`):
+#                             the acr-gsp triple read from `GA10B/` on the boot volume through the VFS,
+#                             sized + sha256-verified against compiled-in digests, placed 256-aligned.
+#                             Arch-neutral, implies nothing; on `test-arm` (witness) it runs the QEMU
+#                             FIXTURE against a synthetic FAT image this script builds (see test_aarch64).
+#   ON A TEGRA BUILD (UNAOS_TEGRA=1, or the esp-jetson verb, which forces tegra) the value selects the rung:
+#   UNAOS_GA10B_PROBE5=1   -> + `ga10bprobe5a`                  — RUNG 5a: the VENDOR IGNITION, addresses RAW
+#   UNAOS_GA10B_PROBE5=5   -> + `ga10bprobe5a` + `ga10bprobe5e` — rung 5a with the addresses `pa >> 8`
+#                             (`5` is rung 4e's value, UNAOS_GA10B_PROBE4=5 — the same delta, the same digit)
+#   UNAOS_GA10B_PROBE5=2   -> + `ga10bprobe5a` + `ga10bprobe5b` — 5a RAW, then rung 5b's read-only PMU oracles
+#   UNAOS_GA10B_PROBE5=7   -> + `ga10bprobe5a` + `ga10bprobe5e` + `ga10bprobe5b` — 5a shifted, then 5b
+#   any other value        -> the loader alone: an unexpected value never buys an ignition (the PROBE3/4 shape)
+# WHY the tegra condition: `ga10bprobe5a` implies `tegra` (through `ga10bprobe4a`), and a `tegra` kernel
+# diverges into `tegra_early_stop` at boot — on QEMU virt that is a dead boot, so `UNAOS_GA10B_PROBE5=1
+# ./arroyo test-arm` must arm the LOADER ONLY. `ga10bprobe5a` runs from ONE folded call on the
+# `sdmmc_census` line of `tegra_early_stop` (after the card is published — the loader reads /boot/GA10B/).
+# 5a implies 4a, so rung 4a's own census also runs at post-heap-init and RETURNS; 5a re-proves it inside.
+# Default OFF => modules + call sites vanish, no panic Location moves, knob-off images byte-identical.
+# ARMED polarities type-checked by the `arm-ga10bprobe5` (virt, witness), `arm-tegra-ga10bprobe5a`,
+# `arm-tegra-ga10bprobe5e` and `arm-tegra-ga10bprobe5b` legs of KERNEL_CFG_MATRIX. Witness families:
+# `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`. Fly WITHOUT UNAOS_GA10B_PROBE1/2/3/4.
+[ -n "${UNAOS_GA10B_PROBE5:-}" ] && _feats="${_feats}ga10bprobe5,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -2878,6 +2902,29 @@ test_aarch64() {
     local secs="${1:-20}"
     prepare_aarch64
 
+    # GA10B-PROBE5 fixture (orin-0912b): with the knob set, the usb-storage stick is a FAT32 superfloppy
+    # this script builds carrying `GA10B/` — three SYNTHETIC files with the vendor triple's NAMES and SIZES
+    # (`yes <line> | head -c <size>`: our bytes, never a vendor byte; their sha256s are the `witness` table
+    # in `ga10b_fw.rs`) — and `GA10BBAD/`, the same three with ONE byte of the data section flipped. The
+    # kernel's fixture must LOAD the first and REFUSE reason=digest the second. mkfs.vfat + mcopy (the
+    # tools make-fat-img.sh's Linux backend already requires); 64 MiB, 512-byte clusters, label UNAOS.
+    if [ -n "${UNAOS_GA10B_PROBE5:-}" ]; then
+        local fx="${WORKSPACE_DIR}/target/ga10b5-fixture" fximg="${WORKSPACE_DIR}/target/ga10b5-fixture.img" _t
+        for _t in mkfs.vfat mcopy; do command -v "$_t" >/dev/null 2>&1 || { echo -e "${COLOR_RED}test-arm: GA10B-PROBE5 fixture needs '$_t' (dosfstools + mtools)${COLOR_RESET}"; return 2; }; done
+        rm -rf "$fx" "$fximg"; mkdir -p "$fx/GA10B" "$fx/GA10BBAD"
+        yes 'UNAOS GA10B5 SYNTHETIC text section (not a vendor byte)'     | head -c 28672 > "$fx/GA10B/acr-gsp.text.encrypt.bin.prod"
+        yes 'UNAOS GA10B5 SYNTHETIC data section (not a vendor byte)'     | head -c 9472  > "$fx/GA10B/acr-gsp.data.encrypt.bin.prod"
+        yes 'UNAOS GA10B5 SYNTHETIC manifest section (not a vendor byte)' | head -c 2048  > "$fx/GA10B/acr-gsp.manifest.encrypt.bin.out.bin.prod"
+        cp "$fx/GA10B/"* "$fx/GA10BBAD/"
+        printf 'X' | dd of="$fx/GA10BBAD/acr-gsp.data.encrypt.bin.prod" bs=1 seek=100 conv=notrunc status=none
+        truncate -s $((64 * 1024 * 1024)) "$fximg"
+        mkfs.vfat -F 32 -s 1 -n UNAOS "$fximg" >/dev/null
+        mcopy -s -b -o -Q -i "$fximg" "$fx/GA10B" "$fx/GA10BBAD" "::/"
+        STICK_IMG="$fximg"
+        echo -e "${COLOR_YELLOW}⚡ GA10B-PROBE5 fixture stick: ${fximg} (GA10B/ + GA10BBAD/, synthetic triple, sha256s below)${COLOR_RESET}"
+        (cd "$fx" && sha256sum GA10B/* GA10BBAD/*)
+    fi
+
     local logf="${WORKSPACE_DIR}/target/serial-arm.log"
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
@@ -4211,6 +4258,12 @@ KERNEL_CFG_MATRIX=(
   # site exists in src/ (the 4d/non-4d split is an early `return` inside a cfg block, not a `not(...)`), so
   # no disarmed asymmetry. Board legs +2; gate +2 — read the live counts from `./arroyo check`.
   "arm-tegra-ga10bprobe4d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4d"
+
+  # GA10B-PROBE5 armed (orin-0912b, 2026-09-12; ledger A63) — `ga10bprobe5` gates `arch/aarch64/ga10b_fw.rs`
+  # (the rung-5 firmware LOADER, arch-neutral) and the folded fixture call in `kernel_main`'s storage-ready
+  # loop, which is `witness`-gated. The VIRT polarity: the `UNAOS_GA10B_PROBE5=1 ./arroyo test-arm` build
+  # (witness + the loader, NO tegra) — the leg that type-checks the QEMU fixture without a tegra image.
+  "arm-ga10bprobe5 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,ga10bprobe5"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
