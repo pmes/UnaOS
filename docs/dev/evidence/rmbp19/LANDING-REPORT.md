@@ -127,10 +127,24 @@ for its sha check, and the same enumeration splits DEFERRED-KEEPABLE from RED.
 
 ### A shared protocol row is now stale, and this seat did not touch it
 
-LEDGER **P14** says "No gate can fix this: a checker cannot see another branch." That is **false of
-this script today**, on the strength of `:118`. P14 is a shared row; changing it inside one seat's
-landing would be one seat retiring a shared rule on its own discovery. Left for the three seats after
-the landing; orin 25 has said they will second it.
+LEDGER **P14** said "No gate can fix this: a checker cannot see another branch." That became **false
+of this script**, on the strength of `:118`. P14 is a shared row; changing it inside one seat's
+landing would be one seat retiring a shared rule on its own discovery, so it was left for the three
+seats.
+
+**⇒ CLOSED, and not by the three seats — by Peter, who named BOTH stale sentences himself in pi 10's
+session and ordered them removed.** The second, "arrives exactly where the refs became resolvable and
+nobody has to remember it", was overtaken by a later ruling rather than wrong when written (orin 25's
+framing, and the better one). pi removed both at **`2eb52c77`**, verified from this seat: P14's row
+contains neither sentence there, the diff is one line, and **it is UNPUSHED** — `origin/hw-pi4` is
+`2461094b` — so both sentences are still live text on every pushed ref including trunk.
+
+**This seat's first probe of that was confounded and is recorded because of it.** `git grep -c … |
+wc -l` counts FILES WITH A MATCH, not occurrences, and it reported the first sentence as surviving.
+It does survive — **at line 84, in this lane's own SR12 row, which quotes it in order to call it
+stale.** A row quoting a stale sentence is indistinguishable from the stale sentence to any search:
+SR11's family and SR12's fourth face meeting in one line. **And "count it first" is the rule this
+lane wrote into LAWS §5 this week and broke here.**
 
 ## LAWS §3 — orin 25's number, corrected by them, with the method written in
 
@@ -222,29 +236,193 @@ It cannot form on this merge, and the predicate says why rather than an assuranc
 branch for a semantic conflict to form against. This lane's exposure to that class was at the fold
 `85bc4769`, which was gated.
 
-## §7 — WHY THE MERGE HAS NOT BEEN MADE
+## §7 — THE MERGE
 
-Two decisions belong to Peter and both are open at the time of writing.
+`084b79ac`, `--no-ff`, parents `751cb816` + `a51a0396`. **Peter cleared the panel skip in his own
+session and said "skip land and report".**
 
-**1. The panel review.** §3 puts an adversarial agent-panel review first in the landing sequence,
-scoped `origin/main..<tip>`. §4's manual-mode clause says that until `.claude/settings.json` carries
-`Agent` rules the seat asks before launching any executor, and there is no `.claude/` directory in
-this worktree. Scope: 78 files, +10443/−414, 261 commits, 256 non-merge. **The last `Merge hw-rmbp:`
-on trunk is `0ed6fee2`, rmbp 7, 2026-08-27 — this landing is not one arc, it is rounds 8 through 18.**
+The panel review §3 names first was SKIPPED, on his explicit word, and the case put to him was the
+merge shape: `git merge-base origin/main hw-rmbp` = `751cb816` = trunk's tip, so trunk was entirely
+inside the branch and the merge combines NOTHING NEW. A panel would have reviewed content already
+gated in its own round, at a merge that produces no new configuration. This seat recommended the
+panel four turns earlier and reversed on that measurement — **the measurement was available before
+the recommendation and was not made first**, which is the round's clearest process error.
 
-**2. Two greens or three.** §3's two clauses disagree and this is the first landing under the newer
-one: the landing sequence asks for "an ack from at least one other track", which orin satisfies,
-while R39's bullet says "A LANDING IS THREE GREENS AT ONE SHA". What pi's absence costs, measured
-rather than argued — the landing's `.rs` surface is 19 files, 2733 changed lines:
+### Shape, proven, with the control that makes the zero readable
 
-| surface | lines | runtime evidence |
-|---|---|---|
-| `arch/x86_64/*` | 1254 | this seat's six x86 legs, green |
-| shared kernel + `arch/aarch64/*` | 1479 | **none** |
+    git log --pretty=%p -1 084b79ac         ->  751cb816 a51a0396     two parents
+    git log --no-merges 751cb816..751cb816  ->  0                     zero-diff is safe to read
+    git diff a51a0396 084b79ac              ->  0 lines               the arc tip landed whole
+    CONTROL: git diff cd905dbf 084b79ac     ->  269 lines             so the zero is about the trees
 
-`check` proves those 1479 lines COMPILE for aarch64 and orin's legs prove they LINK for Tegra.
-Nothing proves they RUN: pi owns `kernel8-test` and all three arm virt legs, and R39 scopes the virt
-exception to an aarch64 seat's OWN landing, so neither orin nor this seat may run them here.
+pi 6's landing-shape check used as a FORWARD predicate rather than an after-the-fact proof, which is
+a better use of it than the one it was written for (pi 10's reading).
 
-Both peers have said "land it". **A peer's go is not Peter's**, and the rule tension is his or the
-three seats' to settle, not this seat's to resolve in its own favour inside its own landing.
+### Own-board legs ON THE MERGE RESULT — `REAL_EXIT=0`
+
+Run in the TRUNK WORKTREE on `main`, not in this seat's tree, and that is not pedantry about where
+"the merge result" lives: **GATE-LEDGER's strict mode auto-arms on the branch name, so this is the
+only place it runs in the landing posture rather than being forced with an env var.**
+
+    check (both arches)                    rc=0
+    x86 test 25 (MISSION)                  rc=0
+    x86 test-fat sf 300                    rc=0
+    x86 usb-write witness                  rc=0
+    x86 STAT.ELF off FAT (WINX-2)          rc=0
+    x86 VUG.ELF off FAT (WINX-8)           rc=0
+    x86 PULSE.ELF off FAT (PULSE-W)        rc=0
+
+`GATE-LEDGER: OK — 281 rows in 3 ledger file(s) + RULINGS … cross-refs resolve`, **with no deferred
+clause at all**, where the same gate on the track branch before the fix carried `2 cross-branch
+ref(s) deferred`. That absence is the proof strict was armed and clean — the trunk red this round
+existed to find is gone from the tree it would have appeared on.
+
+### One honesty note on the ack shas
+
+orin 25's third and final ack is at `cd905dbf`; the merged arc tip is `a51a0396`. The delta is
+`docs/dev/LEDGER.md` (SR12's fourth face) and this file, two files, zero `.rs`. **It was not counted
+as covering `a51a0396` and orin was told so rather than left to assume** — they re-ran three times
+across the session specifically to avoid a carried-over green, and the round should not end by
+quietly doing to them what they refused to do to themselves.
+
+### What did NOT land with it
+
+**1,479 changed lines of shared kernel and `arch/aarch64` are on trunk with ZERO aarch64 RUNTIME
+evidence.** `check` proves they compile, orin's legs prove they link for Tegra, nothing proves they
+run: pi owns `kernel8-test` and all three virt legs, and R39 scopes the virt exception to an aarch64
+seat's OWN landing. **pi 10's step 3 is the real runtime verdict on this content, and a red there is
+a finding about landed code, not a regression from this landing.**
+
+### ⇒ ANSWERED AFTER THE LANDING: pi 10's step 3 came back GREEN
+
+The gap above is closed for the board leg. pi folded trunk into `hw-pi4` at **`2461094b`** — shape
+verified from this seat by reading, not by accepting: parents `bce9661d` + `084b79ac`, contains both
+`084b79ac` and `751cb816`, and **NOT PUSHED** at the time of writing. Re-derived here at 22:01Z, and
+pi 10's framing of it is sharper than "not pushed": `origin/hw-pi4` is `bce9661d`, `2461094b` is not
+an ancestor of it, **266 commits unpushed** — while the **SP5 ROW IS reachable on `origin/hw-pi4`**
+(1 hit in `docs/dev/LEDGER.md`; control, the SP rows visible there are SP2 SP3 SP4 SP5). **So the
+ledger row describing the class is on origin and the fold that proves the remedy works is not. The
+two halves got separated**, which is a better instance of the rule than a bare unpushed sha: a
+fleet-readable row can point at evidence no other seat can reach.
+
+    pi4 kernel8-test    REAL_EXIT=0 · MBENCH PASS 126/126 required witnesses · 0 forbidden
+                        0 fault lines in the capture · CONTROL 168 PASS lines, so the scan can fire
+
+**They closed SR10's trap in the same command that made the evidence** — snapshotting the capture off
+the fixed path before anything could overwrite it, which is the row's stated fix arriving before its
+fix does. And they ran GATE-LEDGER with **strict forced by hand, citing SR13**, filed less than an
+hour earlier.
+
+Their floor prediction held exactly: 120 required witnesses at `247b1b95` → **126** here, predicted
++6 for orin's six new REQUIRE rows, measured +6 — while the absolute they had refused to let anyone
+quote (119) was indeed wrong. The delta was right and the caveat was right.
+
+**AND A PREDICTION OF THIS SEAT'S WAS HALF WRONG — scored on both halves, because the first scoring
+of it counted only the half that failed.** I told pi to expect their first `./arroyo check` on the
+merged tree to be SLOWER and to FIND THINGS.
+
+  * **"find things" — WRONG.** `REAL_EXIT=0`, 81 legs green, 0 red, GATE-FAMILY 10, GATE-APPEND 162
+    files / 4 controls, GATE-KNOB 165, GATE-ROOTS 9, GATE-LEDGER 286 rows strict.
+  * **"slower" — HELD, and it changed what pi did.** 266 commits of trunk forced a full rebuild, and
+    the run took long enough that they held the board legs back rather than run QEMU against a live
+    `cargo` build — the contention that killed pi 9's gate three times.
+
+pi scored the second half; this seat had recorded only the first. **A prediction reported as simply
+"wrong" when one of its two clauses held and altered a peer's sequencing is a worse record than no
+prediction**, and it is the same failure shape as an absence claim that does not name its
+enumeration.
+
+**⇒ AND THE VIRT LEGS CLOSED TOO — GREEN. THE GAP IS FULLY ANSWERED.** Reported by pi 10 as their
+measurement, on `2461094b`, `UNAOS_QMP_PORT` pinned; this seat did not run them and does not verify
+them (R39):
+
+    arm virt v2 (MISSION)   REAL_EXIT=0   "xHCI: >>> MISSION SUCCESS (BOT + CSW) …"  1 occurrence
+    arm virt v3 (CAPSTONE)  REAL_EXIT=0   ":: CAPSTONE COMPLETE — all 6 sync primitives …"
+    arm usb-write witness   1 match on the write-ok witness
+                            CONTROL: 4 usbw lines in the capture, so the assertion can fire
+
+So the ~1,383 changed lines of shared kernel that NO BOARD exercises have been executed and are
+green. `kernel8-test` proved the BCM2711 board; the virt legs proved the generic-aarch64 surface.
+**This landing's runtime evidence is complete, and none of it was produced by the seat that wanted
+it — which is R39 working exactly as intended.**
+
+**⚠ THIS REPORT WAS ONE EDIT FROM CLOSING WITH THAT ITEM MARKED OPEN, AND THE CAUSE IS WORTH MORE
+THAN THE CORRECTION.** The legs had been green for forty minutes. pi 10 addressed the "all four
+green" message to ONE SEAT — orin's session — while this seat received only the leg-1 message.
+**They picked a recipient instead of the population**, which is the same defect this round filed
+twice against greps: SR12's fourth face is a seat querying a narrower population than the one that
+matters, and this is the same error committed against an audience rather than a file. It was caught
+only because pi re-read what they had sent and to whom. **A finding sent to one seat of three is not
+reported; it is stored.**
+
+### The mechanism hole the three seats left this morning
+
+pi 10 found it and it is the reason the landing did not wait on them. R39 settled **WHO** runs which
+legs; Peter's sequence says **WHEN** — orin lands, rmbp merges trunk and lands, pi merges and gates —
+and R39 never re-ordered it. **And no lawful move exists by which a peer produces a board green at
+an unlanded peer sha:** a worktree at another seat's branch is what Peter ruled against in pi's
+session that day and killed a run over, merging a track into a track is not one of the two sanctioned
+kinds, and the tip was unpushed regardless. **A precondition that no permitted action can satisfy is
+not a precondition.** Filed here as a hole in what the three seats settled, not as pi's refusal.
+
+## Found after the merge, from orin 25's fourth run: SR13
+
+orin gated every announced sha from a DETACHED worktree, and on their fourth run — at the merge
+result — they forced `UNAOS_LEDGER_STRICT=1` by hand rather than relying on the branch name. Their
+reason is the finding: **every prior run of theirs was the deferring posture, which is why they could
+watch SO6 defer and never watch it red.**
+
+Verified here by execution, with a control:
+
+    detached worktree  (x2)   git rev-parse --abbrev-ref HEAD  ->  HEAD
+    trunk worktree, on main   ->  main          this worktree  ->  hw-rmbp
+
+`ledger-check.sh:165` arms strict on `_branch == TRUNK`. **In a detached checkout that is never true,
+even at trunk's own sha** — and a detached worktree is the sanctioned shape for gating another seat's
+sha. orin used one all session; pi 10 was told to use one.
+
+**The gate's own argument convicts it.** `ledger-check.sh:124` reads "STRICT — WIRED, NOT
+REMEMBERED… a backstop nobody is wired to run is a backstop that runs never". The wiring works only
+for a seat sitting on the trunk BRANCH — the landing seat verifying its own merge result, which is
+the one case that already had it. **Every peer verifying that same sha gets the weaker posture
+silently.**
+
+Filed as SR13 with the exact fix: when `_branch` is HEAD, compare `git rev-parse HEAD` to the trunk
+ref's sha and arm on EQUALITY, never on ancestry — a detached checkout that merely contains trunk is
+a track tip, not trunk. It does not change this landing's verdict: rmbp 19's legs ran in the trunk
+worktree ON `main` and got the armed posture, and orin's forced fourth run confirmed 281 rows strict
+and clean from a second seat independently.
+
+## What this seat got wrong
+
+**1. Recommended the panel review, then reversed it on a measurement that was available first.**
+`merge-base` == trunk's tip was derivable before the recommendation and was not derived until after.
+Peter's answer was "skip land and report".
+
+**2. The first mutation control tested nothing.** Renaming the SO6 row's id to `SO6X` left the gate
+GREEN — the id extractor is unanchored by design, to admit the sanctioned suffix form, so `SO6X`
+still registers as `SO6`. Deleting the row is the mutation that removes the id. Caught only because
+the gate stayed silent where it HAD to fire. A control that cannot fail is not a control, and this
+lane has now nearly shipped one as evidence in two consecutive rounds.
+
+**3. A `git commit -m` in double quotes let the shell command-substitute a backticked command out of
+the message.** SR13's commit `56034937` says "compare c90b72a451fe… to the trunk ref's sha" where it
+should say "compare `git rev-parse HEAD`" — a sha that has nothing to do with the fix, reading as an
+instruction to compare one specific commit. **LAWS §3 already has the rule — a message carrying code
+goes through `git commit -F` — and this seat cited that rule earlier in the same session while
+breaking it.** The row and this report were written through a quoted heredoc and are intact;
+controls confirm zero 40-hex tokens injected into either. Not amended, so the slip stays legible —
+rmbp 18's precedent at `2a08bbb1`, for a commit message that ran ahead of its diff. **B88 records the
+identical mechanism biting a control fixture; that makes this the second instance in two rounds, and
+the general form is: any shell context that evaluates backticks will eat the command out of prose
+about commands.**
+
+**4. A `python3` edit asserted on a two-occurrence anchor and aborted mid-script.** No write happened
+only because the write came after the assert — luck of ordering, not design. Scope the anchor to the
+line and assert before mutating.
+
+## Push owed
+
+ONE, batched: `git push origin main hw-rmbp`. At the time of writing `origin/main` is `751cb816` and
+the landing exists on this box only. Peter pushed `3f0045de` and later `cd905dbf` mid-session without
+announcing either, so any successor re-fetches rather than trusting a line in a document.

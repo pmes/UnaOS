@@ -181,6 +181,17 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # own v3d_debugfs.c scopes to V3D_GEN_33..V3D_GEN_71 — bracketing this part's 4.2). It implies
 # `v3d_hfirst` (declared in Cargo.toml and armed here), so `UNAOS_V3D_VPMPROBE=1` alone is sufficient.
 # See the kernel8 knob block below and v3d.md §49.25.7.
+#
+# PI-V3D-104: UNAOS_V3D_SINGLESEG=1 is a plain arming knob (no value) for the `v3d_singleseg` feature —
+# the SINGLESEG rung, v3d.md §49.25.9d/§49.25.10, the one-variable successor to boot 14's `OUTCOME V5`.
+# It adds NO leg, NO kick, NO shader word, NO register read or write and NO page-table edit. It changes
+# exactly ONE BIT OF ONE DRAM BYTE: bit 225 of the published GL Shader State Record — "Coordinate Shader
+# start in final thread section" — 0 -> 1, which is what Mesa packs for a TMU-free, no-spill, threads=4
+# coord shader (v3dx_draw.c <- prog_data->single_seg <- vir.c `!c->last_thrsw`; our CS_VS_WORDS carries
+# SIG_THRSW on word [24] only, and that terminal one is qpu_schedule.c's program-end THRSW, not
+# `c->last_thrsw`). It implies `v3d_vpmprobe` (declared in Cargo.toml and armed here), so
+# `UNAOS_V3D_SINGLESEG=1` alone is sufficient, and it is read against BOOT 14 as its baseline.
+# See the kernel8 knob block below and v3d.md §49.25.9d.
 KERNEL_FEATURES=""
 _feats=""
 # DEFAULT-QUIET: UNAOS_WITNESS=1 arms the `witness` fixture-battery feature (auto-set above for the battery
@@ -3169,20 +3180,20 @@ check_user_arch() {
 #
 #   REAL HOLES — swept onto the x86 mix legs by the "assume x86" rule, where every site is behind an
 #   aarch64 qualifier and compiles GREEN and VACUOUS; named by no arm-* leg either, so the armed
-#   polarity is type-checked by NOTHING (4):
-#     * `vugdemo` — the worst of them, because the gate is a MODULE declaration:
-#       `#[cfg(all(target_arch = "aarch64", feature = "vugdemo"))] pub mod vug;` (lib.rs), with the
-#       matching `use` and the two shell verb arms in `shell.rs`. No leg compiles `src/vug.rs` at all
-#       — roughly 1.3 kloc of Ring-0 renderer, plus its `vugras::frame_sweep` call, checked by no
-#       gate in this repo. (Its `cfg!(feature = "vugdemo")` EXPRESSION sites in `shell.rs` are fine,
-#       for the same reason `vugras` is.) Pi lane.
-#       (`orinvpar` WAS listed here and is not a hole — see the RECLASSIFIED note above. Its sites are
+#   polarity is type-checked by NOTHING (3):
+#     (`vugdemo` WAS the worst of them, because the gate was a MODULE declaration — `pub mod vug;` in
+#       lib.rs — and it is GONE. pi's DECRUD-2 (`24937b32`) deleted `src/vug.rs` (1,471 lines) with
+#       the feature, the two shell verb arms, this knob entry and the coverage allowlist row, on
+#       Peter's ruling. VERIFIED AT THIS FOLD: no `src/vug.rs`; `vugdemo` absent from Cargo.toml;
+#       no `pub mod vug;`. The one surviving mention is the DECRUD-1 history note at `lib.rs:152`,
+#       which is prose. Kept as a marker so the next reader does not re-derive the hole from the
+#       stale text in an older revision of this file.)
+#     (`orinvpar` WAS listed here and is not a hole — see the RECLASSIFIED note above. Its sites are
 #       `all(target_arch = "aarch64", feature = "witness", feature = "orinvpar")` in
 #       `video/menubar.rs` and `all(feature = "orinvpar", target_arch = "aarch64")` in
 #       `video/screen.rs`, and `arm-tegra-fbconpar-cross` + `arm-desk-noel0` both carry `witness` and
-#       name the knob, so the armed polarity is compiled twice over. Nothing is owed the jetson lane
-#       here; the entry above is kept as a marker so the next reader does not re-derive the hole from
-#       the stale text in an older revision of this file.)
+#       name the knob, so the armed polarity is compiled twice over. VERIFIED AT THIS FOLD: both legs
+#       present. Nothing is owed the jetson lane here; kept as a marker for the same reason.)
 #     * `v3d_hubcm`, `v3d_pmcycle`, `v3d_ptbbracket` — all sites in `arch/aarch64/v3d.rs`, which is
 #       `all(feature = "baremetal", feature = "v3d")`. `arm-pi` carries both, so the DISARMED
 #       polarity of all three is checked; the ARMED polarity is not. Pi lane.
@@ -3287,7 +3298,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -4912,7 +4923,6 @@ check_kernel_cfg() {
     # wearing a green verdict). Those FAIL here unless allowlisted below.
     #
     # Allowlist — KNOWN holes, each pre-assigned to the track that owns it (census block above):
-    #   vugdemo                          Pi lane   (module-decl gate; ~1.3 kloc compiled by no leg)
     #   v3d_hubcm v3d_pmcycle v3d_ptbbracket  Pi lane   (armed polarity checked by no leg)
     # Removing an entry here without adding the leg reintroduces a silent hole — don't.
     #
@@ -4958,7 +4968,7 @@ check_kernel_cfg() {
     esac
     for _kl_f in $_kl_declared; do
         case "$_kl_covered" in *",${_kl_f},"*) continue ;; esac
-        case "$_kl_f" in vugdemo|v3d_hubcm|v3d_pmcycle|v3d_ptbbracket) continue ;; esac
+        case "$_kl_f" in v3d_hubcm|v3d_pmcycle|v3d_ptbbracket) continue ;; esac
         if grep -rlq "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/arch/aarch64/" 2>/dev/null \
            || grep -rn "feature = \"${_kl_f}\"" "$WORKSPACE_DIR/crates/kernel/src/" 2>/dev/null | grep -q 'target_arch = "aarch64"'; then
             _kl_miss="${_kl_miss} ${_kl_f}"
@@ -7150,6 +7160,42 @@ kernel8() {
         K8_FEATS="${K8_FEATS},v3d_vpmprobe,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
         echo -e "${COLOR_YELLOW}  • UNAOS_V3D_VPMPROBE: the [v3d103] vpmprobe discriminator rung — NO new leg, NO new kick, NO new shader word and NO new register WRITE; it re-sources PCTR slots 4/5/6 to QPU_CYCLES_STALLED_VERTEX_COORD_USER / PTB_PRIM_CLIP / PTB_PRIM_VIEWPOINT_DISCARD (leaving the five slots boot 13 read OUTCOME H4 off untouched as an admissibility guard) and adds four READ-ONLY error registers (V3D_ERR_STAT/FDBGO/FDBGB/FDBGS, scoped to this silicon by mainline's own v3d_core_reg_defs), with §49.25.7's V1..V6 outcomes pre-written on leg H's own verdict line (⚠ implies UNAOS_V3D_HFIRST; short capture — do not diff against a deep boot)${COLOR_RESET}"
     fi
+    # PI-V3D-104: UNAOS_V3D_SINGLESEG=1 adds the `v3d_singleseg` feature — v3d.md §49.25.9d's SINGLESEG
+    # rung, the one-variable successor to boot 14's OUTCOME V5. It IMPLIES UNAOS_V3D_VPMPROBE (and
+    # through it HFIRST, DISPATCHDISC, BINCONTENT, ARMEDCLOSE, TSAIM, BASEDAIM, UNARMCLOSE, V3D): the
+    # cargo feature declares `v3d_singleseg = ["v3d_vpmprobe"]` so the implication cannot be forgotten,
+    # and this block arms the whole chain itself. UNAOS_V3D_SINGLESEG=1 ALONE is sufficient.
+    # IT ADDS NO LEG, NO KICK, NO SHADER WORD, NO REGISTER READ OR WRITE AND NO PAGE-TABLE EDIT. The
+    # instrument bank is boot 14's to the slot, the ladder order is E -> H -> F -> G, CT0 is fed a BIN
+    # list on every leg, and the boot returns before probe_job. ONE BIT OF ONE DRAM BYTE MOVES: bit 225
+    # of the 36-byte GL Shader State Record `build_shader_record` publishes — "Coordinate Shader start
+    # in final thread section" — 0 -> 1.
+    # WHY, AND WHERE THE POLARITY CAME FROM. §49.25.9b found this bit SUSPECT with POLARITY UNKNOWN and
+    # deliberately packed NOTHING; §49.25.9d made pinning it from a fresh Mesa read the rung's task 0.
+    # That read is done (§49.25.10): v3d_packet.xml's "GL Shader State Record" (max_ver=42) gives each
+    # shader group exactly three flags — 4-way threadable / start in final thread section / Propagate
+    # NaNs — and has NO "2-way threadable" field at all; v3dx_draw.c packs bit 225 from
+    # prog_data->single_seg; vir.c sets `single_seg = !c->last_thrsw`; and nir_to_vir.c leaves
+    # c->last_thrsw NULL for a TMU-free, no-spill, threads=4 program (the artificial last-thrsw is
+    # injected for spilling and REMOVED again in v3d_nir_to_vir_finish), because the terminal thrsw such
+    # a program carries is qpu_schedule.c's program-end THRSW, which is not c->last_thrsw. CS_VS_WORDS
+    # is exactly that shape — SIG_THRSW on word [24] and nowhere else — so MESA PACKS 1 AND WE PACK 0.
+    # OUTCOME V5 (the coord thread STALLED against a VPM that never drained, no error latched, nothing
+    # reaching the PTB) is the shape a mis-declared thread section would produce, and V3D-32 already
+    # demonstrated on metal that this bit is dispatch-potent — it set bit 225 on the threads=2 TMU probe
+    # (a program Mesa would pack 0 for) and that coord shader stopped dispatching entirely.
+    # ONE VARIABLE: bits 97 (FS) and 161 (VS) stay 0 (the armed bin frames dispatch only the coordinate
+    # shader) and leg G's null-shader record is untouched. §49.25.9d's S0..S4 rows are pre-written and
+    # the leg-E guard outranks all of them. Two [v3d104] lines are added: the desk line (read FIRST) and
+    # a per-publish readback of the record word, so a capture proves the bit reached DRAM.
+    # ⚠ an armed boot deliberately produces a SHORT capture missing every banked witness: label it and
+    # NEVER diff it line-for-line against a full deep boot. QEMU raspi4b models no V3D at all, so
+    # [v3d95] prints its hub-absent SKIPPED line and returns before any leg is reached — kernel8-test
+    # green means no regression and nothing more; the verdict is attended metal.
+    if [ -n "${UNAOS_V3D_SINGLESEG:-}" ]; then
+        K8_FEATS="${K8_FEATS},v3d_singleseg,v3d_vpmprobe,v3d_hfirst,v3d_dispatchdisc,v3d_bincontent,v3d_armedclose,v3d_tsaim,v3d_basedaim,v3d_unarmclose,v3d"
+        echo -e "${COLOR_YELLOW}  • UNAOS_V3D_SINGLESEG: the [v3d104] singleseg rung — NO new leg, NO new kick, NO new shader word, NO new register access; ONE BIT of ONE DRAM byte moves (shader-record bit 225, 'Coordinate Shader start in final thread section', 0 -> 1), which is what Mesa packs for our TMU-free threads=4 coord shader (v3d_packet.xml v42 field name + v3dx_draw.c <- single_seg <- vir.c !c->last_thrsw), against boot 14 as baseline and with §49.25.9d's S0..S4 rows pre-written (⚠ implies UNAOS_V3D_VPMPROBE; short capture — do not diff against a deep boot)${COLOR_RESET}"
+    fi
     # VUG-PAR: UNAOS_VUGPAR=1 adds the `vugpar` feature — band-parallel Screen::flush that splits the
     # damaged row-copy blit into disjoint scanline bands dispatched to free secondary cores (sched::
     # spawn_joinable + JoinHandle join barrier), falling back to the single-core serial flush when no
@@ -7258,24 +7304,6 @@ kernel8() {
     if [ -n "${UNAOS_PIRAST:-}" ]; then
         K8_FEATS="${K8_FEATS},pirast"
         echo -e "${COLOR_YELLOW}  • UNAOS_PIRAST: software-rasterizer spinning cube on the BCM2711 panel (first 3D pixels on the Pi; 90 paced frames, then the shell repaints)${COLOR_RESET}"
-    fi
-    # DECRUD-1: UNAOS_VUGDEMO=1 adds the `vugdemo` feature — the IN-KERNEL `vug` / `vug wire` /
-    # `vug bebox` / `pulse` shell demos (crates/kernel/src/vug.rs, ~1.3 kloc of fixed-point software
-    # renderer, BeOS-Pulse-homage monitor and BeBox tribute screen). DEFAULT OFF, and this is the
-    # DEFAULT-QUIET law applied to a demo rather than to a witness family: the three verbs have shipped
-    # EL0 replacements that this very image already stages into its FAT root — VUG.ELF (crates/user-vug)
-    # and PULSE.ELF (crates/user-pulse) — and the bench runs those (`UVUG:` streams while the in-kernel
-    # `[vugfps]` counter reads 0). No boot path on either arch calls into the module; the only way in is
-    # an operator typing at the console. So OFF unlinks the whole demo and every default kernel8.img
-    # stops carrying a Ring-0 3D renderer that nothing on the machine can reach. NOT a witness gate:
-    # `parked_display_witness` (VUG-HONESTY) moved to `ui_status` first, precisely so this knob cannot
-    # take a metal-earned falsifier off a boot. K8_FEATS is CURATED (like UNAOS_PIRAST above), so the arm
-    # must be here or the feature never reaches the Pi image; `builder/src/main.rs` is deliberately NOT
-    # touched — builder makes the x86/virt ESP media, and vug.rs is aarch64-only.
-    # See docs/dev/OS/kernel-decrud.md §3.1.
-    if [ -n "${UNAOS_VUGDEMO:-}" ]; then
-        K8_FEATS="${K8_FEATS},vugdemo"
-        echo -e "${COLOR_YELLOW}  • UNAOS_VUGDEMO: the in-kernel vug/pulse/bebox shell demos (default OFF — VUG.ELF/PULSE.ELF in ring 3 are the real ones)${COLOR_RESET}"
     fi
     # PI-DESK: UNAOS_PIDESK=1 adds the `desktop_firmware` feature — the desktop FURNITURE family on the Pi panel.
     # Compiles `video::strip` (the furniture-strip primitive), `video::dock` (the window switcher),

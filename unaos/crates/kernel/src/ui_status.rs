@@ -283,9 +283,10 @@ pub(crate) fn classify_load_scaled(db: u64, di: u64, is_demo: bool, own_load: u3
 /// are stated once above; this is the ten-segment view of the same decision, and
 /// [`parked_display_witness`] covers every branch of it through this entry point.
 ///
-/// DECRUD-1 — moved here from `vug` with its witness. `pub(crate)` rather than private because the
-/// `vugdemo` build's per-core meter still reads the rule at percent scale through this one entry
-/// point, so the two views of the decision keep exactly one definition.
+/// DECRUD-1 moved this here from `vug` together with `parked_display_witness`, deliberately, so a
+/// metal-earned falsifier would not be hostage to a demo's knob — and DECRUD-2 then retired that
+/// demo outright, which is why this rule survived its original caller. `pub(crate)` because the
+/// strip and the percent-scale view keep exactly one definition of the decision.
 pub(crate) fn classify_load(db: u64, di: u64, is_demo: bool, own_load: u32) -> u32 {
     classify_load_scaled(db, di, is_demo, own_load, 100)
 }

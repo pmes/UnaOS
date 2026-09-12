@@ -2929,11 +2929,19 @@ pub fn hit_test(x: i32, y: i32) -> Option<(WinId, u64, u32)> {
 ///   the same allocator `create` uses, so it lands above every other window *and* above the shell. All
 ///   of the owner's windows are raised, not just one: the focus ring is keyed by ASID (an app may own
 ///   several windows and they focus together), so raising a subset would leave an app half in front.
-/// * **The shell is raised the same way.** `asid == 0` gives [`SHELL_Z`] the fresh z, which puts every
-///   existing window BELOW the shell; those windows stop compositing, their boxes are erased to the
-///   desktop colour immediately, and the desktop is asked for a whole-panel present so the console's
-///   text comes back over the erase. That is the "TAB to the shell, then read your command's output"
-///   case, and it is a z-order fact rather than a special case.
+/// * **The shell is raised the same way — VUGTAB, and this is what changed.** `asid == 0` raises the
+///   shell's OWN rows (kernel furniture, `KERNEL_OWNER_CONSOLE` and friends) to fresh top z's, exactly
+///   as an app's rows are raised above, and then sets [`SHELL_Z`] to a FLOOR one below the lowest live
+///   row. The console lands in front and the desktop is asked for a whole-panel present, so "TAB to the
+///   shell, then read your command's output" still works — but the windows behind it stay composited
+///   and OVERLAPPED instead of being deleted out from under it.
+///
+///   Until VUGTAB this arm gave `SHELL_Z` a fresh z ABOVE everything, so every window stopped
+///   compositing and was published `hidden=true`. That was defended as a deliberate whole-table
+///   gesture; the TAB ring makes the shell slot `n` of an `n + 1` rotation, so it is not deliberate and
+///   cannot be avoided. See the arm itself for boot 12's arithmetic. **`focus_changed(0)` is therefore
+///   no longer a fleet-idle gesture** — `minimise` is the only route off the glass, and `hidden=0` on
+///   every `[wc-fv] focus shell` line is the standing assertion of it.
 /// * **VUGMIN-C — a raise publishes an ARRIVAL, not a census.** The arriving owner is unhidden (the wake
 ///   edge that restarts a parked vug); every other owner's hidden bit is left alone. Only the shell arm
 ///   speaks for the whole table. Before this, a raise re-published `hidden=false` for every owner above
@@ -3008,18 +3016,113 @@ pub fn focus_changed(asid: u64) {
             }
         }
         if asid == 0 {
-            // The SHELL takes the top of the stack. Every window is now below it; collect the boxes so
-            // the panel stops showing them at once rather than at the desktop's next flush.
-            let z = t.next_z;
-            t.next_z = t.next_z.wrapping_add(1).max(1);
+            // VUGTAB — **THE SHELL ARM RAISES THE SHELL. IT DOES NOT BURY THE DESKTOP.**
+            //
+            // Peter, dsktp boot 12, on glass: *"all vugs are minimized instead of being overlapped
+            // when tabbing through windows."*
+            //
+            // This arm used to mint `SHELL_Z` off `next_z` — a LID above every window — so every app
+            // row fell below it, stopped compositing (see [`above_shell`]), had its box erased to
+            // `DESKTOP_BG`, and was published `hidden=true` by [`vugmin_scan`]. The doc above called
+            // that "the arm that genuinely speaks for the whole table", justified by the claim that
+            // focusing the shell is *a whole-table statement the operator makes deliberately*.
+            //
+            // **That claim is false on this arch, and boot 12 is the arithmetic.** `wc_focus_key`
+            // (`arch/aarch64/syscall.rs`) builds the rotation as `n` window slots PLUS ONE — slot `n`
+            // is the shell — so a TAB rotation cannot return to the first window without passing
+            // through it. The capture shows `[wc-c] focus tab-cycle 6 -> 0` once per rotation and
+            // `[wc-fv] focus shell ... hidden=6` eleven times, at z = 77, 88, 99 … 187: a step of
+            // exactly 11 = 10 ring windows + 1 shell raise. Every rotation parked all six user vugs,
+            // and since a raise is additive (CLICK-PLAIN) they came back only one press at a time —
+            // so the operator's STEADY STATE while tabbing is "most vugs minimised". That is the
+            // report verbatim, and it is not a deliberate gesture: it is a seat the ring walks over.
+            //
+            // The fix is [`above_shell`]'s own INCIDENTAL/DELIBERATE distinction, applied one level
+            // up. That predicate already refuses to let a shell raise sweeping past take FURNITURE
+            // off the glass, on the stated ground that nobody aimed at it. Nobody aims at the six
+            // vugs either. A window leaves the glass when it is AIMED at — [`minimise`], the
+            // operator's own disc — and by no other route.
+            //
+            // So this arm keeps the half P59 demanded (the shell becomes VISIBLE) and drops the half
+            // that was never asked for (everything else becomes invisible):
+            //
+            //  1. **The shell's own rows take the top of the stack**, exactly as the raise arm does
+            //     for an app's rows. This is the part that was missing: the console row is
+            //     `KERNEL_OWNER_CONSOLE` at z=1 and was never raised, so TAB-to-shell "showed" the
+            //     console only by DELETING everything drawn over it. Raising it puts it IN FRONT,
+            //     which is what "overlapped" means and what every other focus target already gets.
+            //  2. **`SHELL_Z` becomes a FLOOR under the live rows, not a LID over them** — one below
+            //     the lowest live row, so nothing the operator did not park can fall beneath it.
+            //
+            // Consequence, stated rather than discovered: `focus_changed(0)` is no longer a
+            // fleet-idle gesture. `hidden=0` on every shell raise is the standing assertion of that,
+            // and a future arc that wants "minimise everything" must wire a control the operator can
+            // aim at, rather than borrowing a waypoint they cannot avoid.
+            //
+            // (1) The shell's furniture rows take fresh z's off the same allocator `create` uses.
+            let mut shell_top = 0u32;
+            for i in 0..MAX_WINDOWS {
+                if !t.rows[i].used || t.rows[i].compat {
+                    continue;
+                }
+                // A DELIBERATELY parked console stays parked — the same `PARKED_Z` qualification
+                // CONSOLEWIN put on the exemption in `above_shell`, for the same reason: focusing
+                // the shell may not overrule the operator's own minimise disc.
+                if !is_kernel_owner(t.rows[i].owner_asid) || t.rows[i].z == PARKED_Z {
+                    continue;
+                }
+                let z = t.next_z;
+                t.next_z = t.next_z.wrapping_add(1).max(1);
+                t.rows[i].z = z;
+                t.rows[i].damage_all();
+                shell_top = z;
+                // CLOSEISO's counter, re-sited. It still means "rows this shell raise treated as
+                // furniture"; what changed is the treatment — passed OVER before, RAISED now — so a
+                // regression that stops finding the console still shows up as `furniture=` moving.
+                furniture += 1;
+                if first_id == WIN_NONE {
+                    first_id = t.rows[i].id;
+                }
+            }
+            // (2) The FLOOR: one below the lowest live, non-parked row that is not furniture.
+            // Furniture is excluded because `above_shell` exempts it anyway AND because it was just
+            // raised in (1); compat rows are INCLUDED even though they are also exempt, so that the
+            // FV-EXEMPT contradiction below stays at zero by construction rather than by luck.
+            let mut floor = u32::MAX;
+            for i in 0..MAX_WINDOWS {
+                let r = &t.rows[i];
+                if !r.used || r.z == PARKED_Z || is_kernel_owner(r.owner_asid) {
+                    continue;
+                }
+                if r.z < floor {
+                    floor = r.z;
+                }
+            }
+            // Live z's are `wrapping_add(1).max(1)` and therefore `>= 1`, so `floor - 1` cannot
+            // underflow. With no live row to protect, the shell takes the top outright — the old
+            // arm's value, and there is nothing under it to bury.
+            let z = if floor == u32::MAX {
+                let z = t.next_z;
+                t.next_z = t.next_z.wrapping_add(1).max(1);
+                z
+            } else {
+                floor - 1
+            };
             // CLOSE-TEARDOWN r2 — the OLD shell z, taken in the same swap that publishes the new one:
             // the park witness below names only rows THIS raise takes off the glass, and "was on the
             // glass" is a claim against the shell position the operator was just looking at. A plain
             // store would lose it.
             let prev_shell = SHELL_Z.swap(z, Ordering::AcqRel);
-            newz = z;
+            // The wire reports where the SHELL landed, which is now its row's z rather than the
+            // plane's. With no furniture row in the table the plane is still the honest answer.
+            newz = if shell_top != 0 { shell_top } else { z };
             for r in t.rows.iter_mut() {
-                if r.used && r.z < z {
+                // VUGTAB — a row the operator ALREADY put away vacates nothing now, and re-erasing
+                // its box would pay `erase`'s deferred-fill hazard (WC-L) on every shell TAB for
+                // pixels that are already desktop colour. Skipping it is also what makes `hidden=0`
+                // exact: the field now counts rows THIS gesture took off the glass, which under the
+                // floor is the empty set unless something has gone wrong.
+                if r.used && r.z != PARKED_Z && r.z < z {
                     // CLOSEISO — KERNEL FURNITURE IS NOT COLLECTED, AND THEREFORE NOT ERASED.
                     //
                     // `above_shell` already exempts it, so the row keeps compositing; the question
@@ -3048,8 +3151,15 @@ pub fn focus_changed(asid: u64) {
                     // whole point of this arc: it IS an ordinary window now. The exemption applies
                     // to furniture that is ON the glass, which is the only furniture the Boot AR
                     // verdict was ever about.
+                    //
+                    // VUGTAB — this arm is now a BACKSTOP rather than the live path. Furniture that
+                    // is on the glass was raised above the floor a few lines up, so it cannot satisfy
+                    // `r.z < z`; furniture the operator parked is skipped by the `PARKED_Z` guard on
+                    // the loop. It is kept because the invariant it protects (furniture is never
+                    // erased by a shell raise) must hold however the floor is computed, and it no
+                    // longer increments `furniture` — the raise above is what counts those rows, and
+                    // double-counting here would make the field lie the moment this arm ran.
                     if is_kernel_owner(r.owner_asid) && above_shell(r, z) {
-                        furniture += 1;
                         r.damage_all();
                         continue;
                     }
@@ -3177,6 +3287,8 @@ pub fn focus_changed(asid: u64) {
         erase(&hidden[..nhidden]);
     }
     if asid == 0 {
+        #[cfg(feature = "witness")]
+        DW_FULL_FOCUS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         super::screen::request_full_present();
     }
     #[cfg(feature = "witness")]
@@ -12673,6 +12785,37 @@ fn vugmin_rollup(scope: &str) {
 #[cfg(feature = "witness")]
 const WCN_ROLLUP_MS: u64 = 5000;
 
+/// STORM-R2 — per-window `[wcn]` lines to print per block. The AGGREGATE is unbudgeted and always
+/// printed; this caps only the itemisation beneath it.
+///
+/// ### Why a cap was needed at a cadence that was already correct
+///
+/// `[wcn]`'s cadence is global and was measured correct on pi boot 11: [`WCN_ROLLUP_MS`] is 5000 and
+/// the capture's blocks are 5.16 s apart. What is NOT capped by a cadence is the size of a block.
+/// [`wcn_emit`] enumerates every slot in [`WCN`], so a block costs (live windows + 1) lines, and boot
+/// 11's ten-window desktop paid 471 lines / 84,527 B for it — 9.30% of a 908 KB capture that was
+/// itself 22.1% average serial duty against a 356 s boot, with the desktop visibly buried behind the
+/// transmit. The split within that: 402 per-window lines / 74,742 B (88%) against 69 rollup lines /
+/// 9,785 B (12%). The itemisation is essentially the whole cost, and the aggregate — which carries
+/// exact, summable totals over every slot, capped or not — is nearly free.
+///
+/// ### Why three, and why the number is not the interesting part
+///
+/// Three is enough to see a fleet's shape: the busiest window, and two others to say whether it is
+/// an outlier or the top of a distribution. A reader who needs the fourth has `att=`/`comp=` on the
+/// rollup and can tell exactly how much traffic the itemisation did not name.
+///
+/// What matters more than the number is that the truncation is ANNOUNCED. `shown=` on the rollup
+/// line is not decoration: a per-window line's ABSENCE already meant something specific in this
+/// witness — the block's skip test is `att == 0 && comp == 0 && bel == 0`, so no line has always read
+/// as "this window had no traffic at all". Dropping busy windows silently would overload that
+/// absence with a second, opposite meaning and make the two indistinguishable, which is the reading
+/// that costs a boot. `shown=3/10` says a truncation happened and how deep it went; `shown=10/10`
+/// says the itemisation is complete, and it is printed on every block so the line's shape does not
+/// depend on its values.
+#[cfg(feature = "witness")]
+const WCN_LINES_MAX: usize = 3;
+
 /// WC-N — an inter-present gap longer than this is a PARK, not a slow frame. VUGPAUSE-2's backstop
 /// period is ~256 ms and a parked vug's next present waits on operator input, so anything past a
 /// quarter second is provably not the render loop pacing itself. The slowest rate this can misread
@@ -13226,6 +13369,11 @@ fn comp2_emit(span: u64) {
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
     );
+    // CHROMEBAND — pi's `[chromeband]` ledger was RETIRED at the 0ed6fee2 fold: trunk's own
+    // band-clamp landed with the `[wc-b]` witness family (per-window, rollup and fixture lines
+    // carrying chrome_rows/chrome_rows_used/amp), which measures the same quantity as the
+    // retired rows_pp/waste pair — amp=1.00x IS waste=0. Keeping both would have left pi's
+    // counters defined nowhere and read here, so this drained a pair that could no longer move.
 }
 
 // ---- FLUID-3 — the vug-side wait ledger ----------------------------------------------------------
@@ -13540,9 +13688,17 @@ fn wedge1_dwell_emit(span: u64) {
 //
 // ### Wire cost
 //
-// The appended run is ~54 bytes per per-window line. At the `[wcn]` rollup cadence with a full table
-// that is ~86 KB over an 800 s boot — a fraction of a percent of a capture of this size, and paid
-// only on `witness` builds.
+// The appended run is ~54 bytes per per-window line, and STORM-R2 replaces this paragraph's estimate
+// with the measurement that overtook it. The estimate was ~86 KB over an 800 s boot, "a fraction of a
+// percent of a capture of this size". Pi boot 11 ran 356.3 s with ten windows and spent 74,742 B on
+// 402 per-window lines (mean 186 B), of which this run is ~21.7 KB — 2.4% of a 908,583 B capture, not
+// a fraction of one. The per-line figure was right; what was wrong was reading it against a
+// hypothetical capture rather than against the wire, which at 115200 8N1 busy-wait was 22.1% occupied
+// for the whole boot. `[wcn]` as a whole was 9.30% of it.
+//
+// The bound that now holds is [`WCN_LINES_MAX`]: at most three per-window lines per block, so this
+// run's cost stops scaling with the table and the paragraph above cannot go stale the same way again.
+// Still paid only on `witness` builds.
 
 /// WCN-CAUSE — the panel frame period `q=` is stated in, in microseconds.
 ///
@@ -13882,8 +14038,13 @@ fn wcn_note_pass(drew: bool) {
 /// Cadence follows `[pstrip]`/`[sched6]`: a fixed rollup period, one claim per period, and NOTHING
 /// printed for a period in which no window attempted or completed a present. Two consequences worth
 /// stating, because both are deliberate:
-///  * the line volume is bounded by construction — at most one block (live windows + one aggregate)
-///    per [`WCN_ROLLUP_MS`], however many cores are compositing;
+///  * the line volume is bounded by construction — at most one block per [`WCN_ROLLUP_MS`], however
+///    many cores are compositing. **STORM-R2 — the block's own SIZE is bounded too, and was not.**
+///    A block used to cost one line per slot with traffic plus the aggregate, so its cost scaled with
+///    the desktop: boot 11's ten windows spent 84,527 B (9.30% of the wire) on this witness, 88% of
+///    it in the itemisation. [`WCN_LINES_MAX`] caps the itemisation at the busiest few and the
+///    aggregate says how many were left out (`shown=`); a bounded cadence over an unbounded block was
+///    only ever half a bound;
 ///  * a fleet that has wholly parked goes SILENT rather than printing a wall of zeros. The witness is
 ///    driven by the traffic it measures, so "no `[wcn]` lines" reads as "nobody is presenting", which
 ///    is the same thing the absence of the lines would have meant anyway.
@@ -14023,7 +14184,54 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     if !force && t_att == 0 && t_comp == 0 {
         return; // dirty-paced: a period with no present traffic prints nothing at all.
     }
-    for l in lines.iter().flatten() {
+    // STORM-R2 — pick the [`WCN_LINES_MAX`] busiest of the drained slots. The DRAIN above already
+    // happened for every slot and is unaffected by this: a window left out of the itemisation still
+    // has its counters folded into `t_att`/`t_comp`/`t_hid`/`t_bel`, so the aggregate below remains
+    // an exact total over the whole table and the capping cannot make the block's arithmetic lie.
+    //
+    // The weight is `att + comp + bel` and not `att + comp`, because those three are exactly the
+    // fields the skip test above admits a slot on. Ranking by a narrower sum would make a window that
+    // is eligible ONLY through `bel` — dirty every pass and declined every pass for sitting below the
+    // shell, which is a real and worth-seeing state — rank at zero and lose to any window with a
+    // single present, however quiet the block.
+    let mut eligible = 0usize;
+    let mut top: [(u64, usize); WCN_LINES_MAX] = [(0, usize::MAX); WCN_LINES_MAX];
+    let mut ntop = 0usize;
+    for (idx, l) in lines.iter().enumerate() {
+        let Some(l) = l else { continue };
+        eligible += 1;
+        let w = l.att.saturating_add(l.comp).saturating_add(l.bel);
+        // Insertion into a fixed-size descending top-K. `<` and not `<=` so ties keep the lower slot
+        // index, which makes the choice a function of the counters alone — two blocks with identical
+        // traffic itemise the same windows, and a reader comparing two blocks is never looking at a
+        // difference the selection invented.
+        let mut p = ntop;
+        while p > 0 && top[p - 1].0 < w {
+            p -= 1;
+        }
+        if p >= WCN_LINES_MAX {
+            continue;
+        }
+        let mut q = ntop.min(WCN_LINES_MAX - 1);
+        while q > p {
+            top[q] = top[q - 1];
+            q -= 1;
+        }
+        top[p] = (w, idx);
+        if ntop < WCN_LINES_MAX {
+            ntop += 1;
+        }
+    }
+    let mut shown = 0usize;
+    for (idx, l) in lines.iter().enumerate() {
+        let Some(l) = l else { continue };
+        // Printed in SLOT order, not in rank order: the ranking decides which lines survive, and the
+        // reader's `win=` ordering is left exactly as it was so an existing harvest sees a subset of
+        // the block it used to see rather than a reordering of it.
+        if !top[..ntop].iter().any(|t| t.1 == idx) {
+            continue;
+        }
+        shown += 1;
         // WCN-CAUSE — the census fields are APPENDED after `gap=`, which every existing `[wcn]`
         // harvest in the bench scripts anchors on. Nothing above this point moved, so an awk that
         // reads `att=`/`comp=`/`gap=` off this line keeps working unchanged. `comp=` keeps its exact
@@ -14083,10 +14291,24 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     } else {
         "LIVE"
     };
+    // STORM-R2 — `shown=` is an INSERTION directly after `wins=`, the field whose population it
+    // qualifies, and everything after it keeps its name, its order and its meaning. Nothing in any
+    // spec matches `[wcn]` (verified against every file in `scripts/specs/`), and the bench harvests
+    // that do read this family anchor on the PER-WINDOW line's `att=`/`comp=`/`gap=`, none of which
+    // moved.
+    //
+    // Its denominator is NOT `wins=`, and the two are different on purpose. `wins=` counts rows live
+    // in the table at the identity snapshot; `shown=`'s denominator counts SLOTS WITH TRAFFIC this
+    // span, which includes a window that closed inside the span (it still earns a line, `live=no`)
+    // and excludes a live window that was idle through it. `shown=3/10` therefore reads "ten slots
+    // had traffic, three of them are itemised above" — and `shown=n/n` means the itemisation is
+    // complete, whatever `wins=` says beside it.
     serial_println!(
-        "[wcn] rollup scope={} wins={} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
+        "[wcn] rollup scope={} wins={} shown={}/{} att={} comp={} hid={} bel={} stale={} passes={} aborted={} att_rate={}.{}/s comp_rate={}.{}/s span={}ms -> {}",
         scope,
         wins,
+        shown,
+        eligible,
         t_att,
         t_comp,
         t_hid,
@@ -15360,6 +15582,8 @@ pub fn minimise(id: WinId) -> &'static str {
     let barrier = DrainBarrier::drain();
     erase(&[vacated]);
     damage_intersecting(vacated.0, vacated.1, vacated.2, vacated.3);
+    #[cfg(feature = "witness")]
+    DW_FULL_PARK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     super::screen::request_full_present();
     drop(barrier);
     // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
@@ -15501,6 +15725,8 @@ pub fn zoom(id: WinId) -> &'static str {
         let barrier = DrainBarrier::drain();
         erase(&[b]);
         damage_intersecting(b.0, b.1, b.2, b.3);
+        #[cfg(feature = "witness")]
+        DW_FULL_ZOOM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         super::screen::request_full_present();
         drop(barrier);
         // WC-K2 — no CURSOR-14 bracket-closer here any more. `erase` paints nothing and takes the sprite
@@ -16808,6 +17034,10 @@ pub fn drag_begin(id: WinId, x: i32, y: i32) -> bool {
     // this a grab that follows a recent gesture inside one frame period would sit still for up to
     // `DRAG_MOTION_MS` before the window began to move — the pacer's one chance to be visible as lag.
     DRAG_PACE_LAST_MS.store(0, Ordering::Relaxed);
+    // DRAG-ADMIT — the adaptive floor resets with the pacing clock and for the same reason: a fresh
+    // grab must not sit out the previous gesture's measured compositor weather.
+    #[cfg(target_arch = "aarch64")]
+    DRAG_LAST_MOVE_MS.store(0, Ordering::Relaxed);
     DRAG_PACE_ADMITTED.store(0, Ordering::Relaxed);
     DRAG_PACE_COALESCED.store(0, Ordering::Relaxed);
     // Review condition (dragflick adoption): a superseding `begin` is the THIRD way a gesture
@@ -16884,6 +17114,44 @@ pub const DRAG_MOTION_MS: u64 = 16;
 /// have to wait out a frame before the window starts following the hand.
 static DRAG_PACE_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// DRAG-ADMIT — **what the LAST admitted reposition actually cost, in ms** (0 = fresh gesture, no
+/// admitted move measured yet), and the aarch64 half of the pacer's admission floor.
+///
+/// [`DRAG_MOTION_MS`]'s own doc predicts the failure this closes: the constant paces admission at
+/// ~60 Hz on the argument that one reposition retires faster than the next report arrives — and on
+/// the bench panel it does not. A 1920x1200 shell drag retires composites at ~11/s while the 16 ms
+/// gate admits 62/s, so the pacer over-admits 5.7x and the queue grows for as long as the hand
+/// moves, which is the "can barely drag a window across the screen" shape M2 was built against,
+/// reproduced at bench geometry by the `[dragperf]` fixture itself (`admitted=9..11 coalesced=0`
+/// over a 320 ms 125 Hz sweep: every report admitted, nothing folded, because each admitted move
+/// consumed more than the whole 16 ms window before the next report was judged).
+///
+/// So the floor ADAPTS: admission is spaced by `max(DRAG_MOTION_MS, cost of the last admitted
+/// move)`. A compositor faster than 60 Hz is paced exactly as before (the measurement is below the
+/// constant and the `max` discards it); one slower stops being asked for work faster than it can
+/// retire it, and the gesture degrades to "the window steps at the rate the panel can actually
+/// paint" instead of to a growing backlog. Coalescing semantics are unchanged — nothing is dropped,
+/// a folded report's travel is applied by the next admitted move, exactly as M2 argues.
+///
+/// **aarch64 only, deliberately and narrowly.** [`DRAG_MOTION_MS`] is arch-neutral and read beyond
+/// this arch, so the constant is untouched; the adaptive term lives inside [`drag_motion_paced`]
+/// behind `target_arch = "aarch64"` and every other arch's admission arithmetic is literally the
+/// expression it was before this arc. x86's own throttle (`wc_drag_motion`, its own private
+/// `DRAG_MOTION_MS`) is another lane's file and is not touched.
+///
+/// The measurement is CAPPED ([`DRAG_ADMIT_CAP_MS`]) so one pathological pass — a stalled barrier's
+/// bounded give-up, a wedge fixture's deliberate stall — cannot freeze the gesture: the floor may
+/// reach 4 Hz, never lower. Reset to 0 by [`drag_begin`] with the rest of the pacing clock, so a
+/// fresh grab inherits nothing from the last gesture's compositor weather.
+#[cfg(target_arch = "aarch64")]
+static DRAG_LAST_MOVE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// DRAG-ADMIT — ceiling on the measured admission floor, in ms. See [`DRAG_LAST_MOVE_MS`]: the
+/// bench's slow regime is ~92 ms per retire, so 250 keeps every honest measurement while bounding
+/// the damage of a pathological one at four admissions a second.
+#[cfg(target_arch = "aarch64")]
+const DRAG_ADMIT_CAP_MS: u64 = 250;
+
 /// DRAG-PI M2 — **steer the live drag to `(x, y)`, at most once per [`DRAG_MOTION_MS`].**
 ///
 /// The COALESCING seam, and the whole of the arc's input-side saving. Without it every pointer
@@ -16907,13 +17175,33 @@ pub fn drag_motion_paced(x: i32, y: i32) -> bool {
     }
     let now = crate::arch::ms();
     let last = DRAG_PACE_LAST_MS.load(Relaxed);
-    if last != 0 && now.wrapping_sub(last) < DRAG_MOTION_MS {
+    // DRAG-ADMIT — the admission floor: the constant everywhere, raised on aarch64 to what the last
+    // admitted move measurably cost, so admission can never outrun retirement. See
+    // [`DRAG_LAST_MOVE_MS`] for the whole argument and the scoping rule.
+    #[cfg(target_arch = "aarch64")]
+    let floor = DRAG_MOTION_MS.max(DRAG_LAST_MOVE_MS.load(Relaxed));
+    #[cfg(not(target_arch = "aarch64"))]
+    let floor = DRAG_MOTION_MS;
+    if last != 0 && now.wrapping_sub(last) < floor {
         DRAG_PACE_COALESCED.fetch_add(1, Relaxed);
         return false;
     }
     DRAG_PACE_LAST_MS.store(now.max(1), Relaxed);
     DRAG_PACE_ADMITTED.fetch_add(1, Relaxed);
-    drag_motion(x, y)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        drag_motion(x, y)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let moved = drag_motion(x, y);
+        // Measured across the whole admitted reposition (table lock, deferred erase, damage pass,
+        // composite) and stored unconditionally: a move that declined cheaply stores a small number
+        // and the floor decays back toward the constant on its own.
+        DRAG_LAST_MOVE_MS
+            .store(crate::arch::ms().wrapping_sub(now).min(DRAG_ADMIT_CAP_MS), Relaxed);
+        moved
+    }
 }
 
 /// DRAG-PI M3 — **what a pointer report owes the window system after a drain's own arms have run:**
@@ -16969,6 +17257,24 @@ pub fn drag_route_tail(ev: crate::pal::Event) -> bool {
     let (x, y) = crate::pal::cursor::pos(pw, ph);
     drag_motion_paced(x, y)
 }
+
+/// DRAGWIDE — per-site census of the whole-panel present requests, so the `[dragwide]` line can NAME
+/// the widener instead of inferring it. One counter per `request_full_present` call site in this
+/// module; the drain's WAS the only one a drag could reach once per admitted move, which is what
+/// made it the 4.2x — its counter stays on the wire as the regression witness (`drain=` must read 0
+/// now that the drain requests per-box rects; see `drain_deferred`'s tail). Witness-only, swapped by
+/// the `[dragperf]` fixture.
+#[cfg(feature = "witness")]
+#[allow(dead_code)] // kept on the [dragwide] wire as the structural-zero regression witness
+static DW_FULL_DRAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_PARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_ZOOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_FOCUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "witness")]
+static DW_FULL_RECLAIM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// DRAG-PI M4 — the MOVE PATH's desktop-repaint bill: how many moves asked, and for how many pixels.
 /// Charged at the two `request_present_rect` calls in [`move_to_inner`] and nowhere else, so the
@@ -21387,12 +21693,15 @@ static FV_SURF_B: [u32; 64] = [0x0020_FF20; 64];
 /// 1. **stack** — B created after A, so B is in front: the pixel is B's colour. (Baseline; if this fails
 ///    the other three prove nothing about focus.)
 /// 2. **raise** — `focus_changed(A)`: the pixel becomes A's colour. This is defect 1 of the arc.
-/// 3. **shell** — `focus_changed(0)`: the pixel is neither window's colour. The shell took the top of
-///    the z-order, both windows dropped below it and their boxes were erased. This is the "TAB to the
-///    shell and READ your output" case, reduced to the one thing a headless gate can check — that the
-///    window layer stopped owning those pixels.
-/// 4. **reraise** — `focus_changed(B)`: B comes back from under the shell. Proves the shell is a
-///    POSITION in the rotation and not a terminus for the window layer.
+/// 3. **shell** — `focus_changed(0)`: the pixel is STILL A's colour. VUGTAB inverted this leg. It used
+///    to require that the window layer stop owning the pixel — the shell took the top of the z-order,
+///    both windows dropped below it and their boxes were erased — and that whole-table park is the
+///    defect Peter reported from the glass ("all vugs are minimized instead of being overlapped when
+///    tabbing through windows"), because the TAB ring cannot rotate without landing on the shell. The
+///    leg now falsifies it: a shell raise may not park a window nobody aimed at, so A stays exactly
+///    where leg 2 put it. See the shell arm of [`focus_changed`] for boot 12's arithmetic.
+/// 4. **reraise** — `focus_changed(B)`: B comes back over A. Proves the shell is a POSITION in the
+///    rotation and that the raise arm still reorders the layer after a shell raise has passed through.
 ///
 /// Self-cleaning: both windows are closed at the end, which erases their boxes to the desktop colour and
 /// recomposites, so the panel is left as it was found. Placement is explicit (`move_to`, which pins the
@@ -21465,7 +21774,35 @@ pub fn focusvis_selftest() {
 
     let stack_ok = got_stack == b_col;
     let raise_ok = got_raise == a_col;
-    let shell_ok = got_shell != a_col && got_shell != b_col;
+    // VUGTAB — **LEG 3 IS INVERTED, BECAUSE THE BEHAVIOUR IT PINNED IS THE DEFECT.**
+    //
+    // It used to read `got_shell != a_col && got_shell != b_col`: after `focus_changed(0)` the
+    // window layer must have STOPPED owning this pixel. That is exactly what Peter reported from
+    // the glass on boot 12 — *"all vugs are minimized instead of being overlapped when tabbing
+    // through windows"* — and the shell arm's own note carries the arithmetic: the TAB ring makes
+    // the shell slot `n` of an `n + 1` rotation, so every rotation fired this whole-table park.
+    //
+    // The leg is not silenced, it is re-aimed at the requirement that replaced it: **a shell raise
+    // leaves the windows where they were.** A raised in leg 2 stays raised through leg 3, so the
+    // pixel is still A's — the same tolerance-free equality the other three legs use, now falsifying
+    // "the shell raise parked a window the operator did not aim at" instead of asserting it.
+    //
+    // TWO HALVES, because one panel cannot carry the claim alone.
+    //
+    //  * The PIXEL half keeps this witness's reason for existing — it asks the framebuffer, not the
+    //    table, which is what caught the panel that never moved while `[wc-c]` printed correctly
+    //    (P59). On a bare panel that is `a_col`. On an ARMED desktop it may not be: the shell raise
+    //    now legitimately brings the console furniture FORWARD, and the Pi's console box covers this
+    //    probe origin at 640x480 — so a kernel-owned hit is accepted there, the same allowance
+    //    `hittest_selftest`'s leg 5 makes for the same reason (FURNITURE-OCC). What NEITHER arm
+    //    accepts is the point going unowned, which is exactly what the whole-table park did.
+    //  * The TABLE half is panel-independent and is the crisp falsifier: A is still above the shell.
+    //    Under the old arm A's z went below `SHELL_Z` on every shell raise, so this reads false on
+    //    any panel, with no dependence on what happens to be painted at one pixel.
+    let shell_hit = hit_test(px as i32, py as i32);
+    let shell_px_ok =
+        got_shell == a_col || shell_hit.map(|(_, o, _)| is_kernel_owner(o)).unwrap_or(false);
+    let shell_ok = shell_px_ok && self::info(wa).map(|i| i.z > shell_z()).unwrap_or(false); // VUGTAB: `self::` — the enclosing fn binds `let info = fb.info()` above, which shadows the module fn.
     let reraise_ok = got_reraise == b_col;
     let ok = stack_ok && raise_ok && shell_ok && reraise_ok;
     serial_println!(
@@ -22039,6 +22376,30 @@ pub fn dragperf_selftest() {
     let (reqs_b, px_b) = move_present_take();
     let pm_a = (pinfo.width as u64).saturating_mul(pinfo.height as u64);
     let pm_b = if reqs_b > 0 { px_b / reqs_b } else { 0 };
+    // DRAGWIDE — the widening census over the same sweep. Settle ~1.3 s first so the render task's
+    // presents against the sweep's requests land (its floor is the 1 Hz strip tick), then print what
+    // the desktop PUBLISHED beside what the move path REQUESTED, with every whole-panel request
+    // named by its site. `px_per_present` beside `px_per_move` (the `mode=rects` line above) is the
+    // 4.2x divergence, on one wire.
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let t0 = crate::arch::ms();
+        while crate::arch::ms().wrapping_sub(t0) < 1300 {
+            core::hint::spin_loop();
+        }
+        let (freqs, pres, fulls, dpx) = super::screen::dragwide::take();
+        serial_println!(
+            "[dragwide] moves={} full_reqs={} by_site drain={} park={} zoom={} focus={} reclaim={} desk_presents={} desk_fulls={} desk_px={} px_per_present={}",
+            moves_b, freqs,
+            DW_FULL_DRAIN.swap(0, Relaxed),
+            DW_FULL_PARK.swap(0, Relaxed),
+            DW_FULL_ZOOM.swap(0, Relaxed),
+            DW_FULL_FOCUS.swap(0, Relaxed),
+            DW_FULL_RECLAIM.swap(0, Relaxed),
+            pres, fulls, dpx,
+            if pres > 0 { dpx / pres } else { 0 }
+        );
+    }
     serial_println!(
         "[dragperf] mode=whole analytic px_per_move={} (one panel, what request_full_present charged)",
         pm_a
@@ -22563,15 +22924,24 @@ fn closeiso_selftest() {
     let got_k = sample(wk);
     let got_f = sample(wf);
     let iso_ok = got_k == k_col;
-    // FURNITURE-OCC (CHROMESPEC, 2026-08-17) — the FORCED row is hidden by the shell raise, so its
-    // content origin must stop being ITS pixels. Desktop is what that means on a bare panel and what
-    // this leg asserted; on the armed Pi desktop the console window under it is correctly repainted
-    // there instead (`forced=0xf3f3f5` — a title-strip shade, not a stale `f_col`), which the old
-    // equality convicted. Same rule the vacate legs now keep: see [`vacated_points`].
-    let forced_ok = match probe(wf) {
-        Some(pt) => vacated_points(&[pt], f_col).0,
-        None => got_f == DESKTOP_BG,
-    };
+    // VUGTAB — **THIS LEG IS INVERTED, AND THE CONTRAST IT DREW HAS MOVED.**
+    //
+    // It read: the FORCED (non-furniture) row is hidden by the shell raise, so its content origin
+    // must stop being ITS pixels — the counterpart to leg 1, where the furniture row survives.
+    // CLOSEISO's contrast was FURNITURE vs ORDINARY.
+    //
+    // The shell arm no longer parks anything on an incidental raise (Peter, boot 12: the TAB ring
+    // makes the shell an unavoidable waypoint, so "the operator asked for a clear glass" was never
+    // true), so an ordinary row survives it exactly as furniture does. The old equality now convicts
+    // the compositor for doing the right thing — the same way FURNITURE-OCC found it convicting a
+    // correctly repainted console.
+    //
+    // The contrast the fixture is really about did not disappear, it moved to where `above_shell`'s
+    // own doc puts it: INCIDENTAL vs DELIBERATE. Legs 1-2 are now BOTH the incidental case (nothing a
+    // shell raise sweeps past goes down, furniture or not), and legs 4-6 below are the deliberate one
+    // (`minimise` puts a row down and the exemption does not overrule it). A build that started
+    // parking siblings on a shell raise again fails here on `f_col` no longer being there.
+    let forced_ok = got_f == f_col;
     // The table's own answer, beside the panel's: `above_shell` must still call the furniture row
     // visible. (`owner_hidden` is the predicate every present-suppression path reads.)
     let table_ok = {
@@ -23787,6 +24157,8 @@ fn reclaim(vacated: &[(usize, usize, usize, usize)]) {
     for &(x, y, w, h) in vacated.iter() {
         damage_intersecting(x, y, w, h);
     }
+    #[cfg(feature = "witness")]
+    DW_FULL_RECLAIM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     super::screen::request_full_present();
 }
 
@@ -24045,12 +24417,16 @@ const _: () = assert!(FIX_W >= CLUSTER_MIN_SRC_W);
 /// leaves this file: it drives the ARCH router (`wc_click_route`), which exists only on the baremetal
 /// aarch64 build, through the same `#[cfg]` seam [`vugmin_publish`] already uses for `set_hidden`.
 ///
-/// The fixture, in order: raise `asid` back above the shell (leg 5 buried everything) and give it
-/// focus; read the REAL cursor; bail out (`None` — asserted nothing) if the pointer happens to be over
-/// a live window, since then the press is a HIT and this leg has no fixture; otherwise drive one PRESS
-/// edge and check the three things P71 asks for — the press is CONSUMED, focus is now the SHELL
-/// (`user_input_active() == 0`), and the previously focused window is BELOW the shell, which is what
-/// makes the shell focus the same state VUGMIN idles the fleet from.
+/// The fixture, in order: raise `asid` and give it focus; read the REAL cursor; bail out (`None` —
+/// asserted nothing) if the pointer happens to be over a live window, since then the press is a HIT and
+/// this leg has no fixture; otherwise drive one PRESS edge and check the three things it asks for — the
+/// press is CONSUMED, focus is now the SHELL (`user_input_active() == 0`), and the previously focused
+/// window is STILL ON THE GLASS.
+///
+/// VUGTAB inverted that third claim. P71 wrote it as "the window is BELOW the shell, which is what
+/// makes the shell focus the same state VUGMIN idles the fleet from" — and idling the fleet off a
+/// gesture nobody aimed at the fleet is the defect Peter reported from boot 12. A desktop click moves
+/// the KEYBOARD; it does not clear the glass. See the shell arm of [`focus_changed`].
 ///
 /// One RELEASE edge follows, so the router's press/release tracker is left exactly as it was found: a
 /// witness that left a phantom press outstanding would make the operator's next real release drop.
@@ -24065,9 +24441,17 @@ fn clickshell_leg(asid: u64, ix: i32, iy: i32, w: i32, h: i32) -> Option<bool> {
     sc::user_input_set_active(asid);
     let consumed = sc::wc_click_route(crate::pal::Event::Button(1));
     let refocused = sc::user_input_active() == 0;
-    let buried = hit_test(ix, iy).is_none();
+    // VUGTAB — **INVERTED: the window must SURVIVE the desktop click, not be buried by it.**
+    //
+    // This read `hit_test(ix, iy).is_none()` — the previously focused window must have gone under the
+    // shell. That is the third statement of the same defect (leg 5 of this fixture and leg 3 of
+    // `focusvis_selftest` are the other two), and Peter's boot-12 report is the verdict on it: a
+    // gesture aimed at the SHELL may not park the window the operator was using. A desktop click
+    // hands over the KEYBOARD — `refocused`, the leg above, is that claim and it is untouched — and
+    // nothing more. `is_some()` is the same assertion with the sign the panel actually wants.
+    let kept = hit_test(ix, iy).is_some();
     let _ = sc::wc_click_route(crate::pal::Event::Button(0));
-    Some(consumed && refocused && buried)
+    Some(consumed && refocused && kept)
 }
 
 /// CLICK-SHELL, DORMANT half: no arch router in this build, so leg 6 asserts nothing.
@@ -24610,9 +24994,20 @@ pub fn hittest_selftest() {
     // hit-test correctly resolves to the FURNITURE the shell raise has no business burying, and the
     // leg convicted the compositor for being right. The owner is on the wire beside the verdict, so a
     // reader can see WHAT the point resolved to rather than only that it resolved to something.
+    //
+    // VUGTAB — **AND THE LEG IS INVERTED, FOR THE SECOND TIME AND THE LAST.** FURNITURE-OCC already
+    // found this leg convicting the compositor for being right; the reason generalises. A shell raise
+    // is a WAYPOINT the TAB ring cannot avoid (boot 12: `[wc-c] focus tab-cycle 6 -> 0` once per
+    // rotation, `hidden=6` every time), so it parks nothing at all now, and "did the shell raise bury
+    // the probe rows?" has one correct answer: NO.
+    //
+    // What the point may legitimately resolve to is therefore A — raised a few lines up and left
+    // there — or the console FURNITURE where the Pi desktop has a console window over the origin.
+    // What it may NOT resolve to is `None`: that is the burial this leg exists to catch, and it is
+    // also what the old assertion accepted. `hidden_owner == 0` (the `unwrap_or`) fails both arms.
     let hidden_hit = hit_test(ix, iy);
     let hidden_owner = hidden_hit.map(|(_, a, _)| a).unwrap_or(0);
-    let hidden_ok = hidden_owner != ASID_A && hidden_owner != ASID_B;
+    let hidden_ok = hidden_owner == ASID_A || is_kernel_owner(hidden_owner);
 
     // Leg 6 — CLICK-SHELL. Re-raise A (leg 5 left every window under the shell) and give it focus,
     // then drive one PRESS edge through the router with the pointer wherever it actually is. The

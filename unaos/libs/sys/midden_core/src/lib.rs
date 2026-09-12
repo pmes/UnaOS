@@ -153,18 +153,11 @@ pub struct Facts {
     /// never returns [`Plan::Exec`] and never probes the volume, so a build
     /// without a loader behaves exactly as it did before this crate existed.
     pub exec: bool,
-    /// The in-kernel demo verbs (`vug`, `pulse`) are compiled into this build.
-    ///
-    /// BARENAME (PARITY §6.6a): a KNOB, and it has to be one. Those two `match`
-    /// arms carry `feature = "vugdemo"`, **DEFAULT OFF** (DECRUD-1), while this
-    /// table advertised them on every aarch64 build. So on the image users
-    /// actually flash, `vug` was claimed as a verb, routed to a `match` with no
-    /// such arm, and answered "the verb exists; this kernel does not carry it".
-    /// Worse: verb-ness is absolute over bare-name launch, so that phantom verb
-    /// was ALSO what stood between the operator and `VUG.ELF` — turning on
-    /// [`Facts::exec`] alone would have changed nothing for the one word Peter
-    /// typed. A verb the build does not carry is not a verb.
-    pub vugdemo: bool,
+    // DECRUD-2 (2026-08-28): the `vugdemo` fact is GONE with the in-kernel demos it described.
+    // Its BARENAME lesson outlived it and still governs this table: a verb the build does not carry
+    // is not a verb, and claiming one stands between the operator and the ring-3 program of the same
+    // name — verb-ness is absolute over bare-name launch. `vug` and `pulse` are now ALWAYS bare-name
+    // launches of VUG.ELF / PULSE.ELF on every build and every arch, which is what the bench ran.
 }
 
 impl Facts {
@@ -178,7 +171,6 @@ impl Facts {
             proc_verbs: false,
             proc_rows: 0,
             exec: false,
-            vugdemo: false,
         }
     }
 }
@@ -203,9 +195,10 @@ pub const CORE_VERBS: &[&str] = &["help", "echo", "ver", "version", "gneiss", "e
 /// When a host verb exists.
 ///
 /// Verb-ness is **not** a global fact, and getting that wrong is the one way
-/// this refactor could have broken the shell: `vug` is a registered verb only
-/// on a `vugdemo` build, and everywhere else the same word must fall through to
-/// bare-name launch and start `VUG.ELF`. A flat name list would have turned
+/// this refactor could have broken the shell: `v3d` is a registered verb only
+/// on an aarch64 `v3d` build, and a word that is not a verb here must fall
+/// through to bare-name launch — which is how `vug` starts `VUG.ELF` on every
+/// build now that DECRUD-2 has retired the in-kernel demo. A flat name list would have turned
 /// that launch into a refusal. So each host verb carries the condition under
 /// which the ring actually registers it, and those conditions mirror the
 /// `#[cfg]` on the kernel's match arms one for one — **one for one is the whole
@@ -222,13 +215,6 @@ pub enum Avail {
     Aarch64,
     /// aarch64 + `v3d` (the GPU battery replay).
     V3d,
-    /// aarch64 + `vugdemo` (the in-kernel `vug` / `pulse` demos, DEFAULT OFF).
-    ///
-    /// BARENAME (PARITY §6.6a): these two were `Aarch64`, which over-claimed
-    /// them on every Pi build — see [`Facts::vugdemo`] for what that cost. The
-    /// arch half stays because the demos draw through `crate::vug`, which is
-    /// aarch64-only source; the knob half is the part that was missing.
-    VugDemo,
     /// The process verbs: aarch64-baremetal or x86.
     Proc,
 }
@@ -240,7 +226,6 @@ impl Avail {
             Avail::Always => true,
             Avail::Aarch64 => facts.aarch64,
             Avail::V3d => facts.v3d,
-            Avail::VugDemo => facts.aarch64 && facts.vugdemo,
             Avail::Proc => facts.proc_verbs,
         }
     }
@@ -289,7 +274,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("ifconfig", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
     ("nc", Avail::Always), ("curl", Avail::Always),
     // apps + scheduler + power + witnesses
-    ("vug", Avail::VugDemo), ("pulse", Avail::VugDemo), ("v3d", Avail::V3d),
+    ("v3d", Avail::V3d),
     // RELICS (R26 clause 3, Peter: "you must stop trying to pin everything down and lock it in
     // this is one OS not a bunch of separate ones"). `burst` and `simmer` were `Avail::Aarch64`
     // for no hardware reason - both ring arms already carry a `#[cfg(not(aarch64))]` line that
@@ -352,8 +337,8 @@ pub fn canon_verb(word: &str) -> String {
 /// a completion engine and a help renderer all ask this one function. A word
 /// that is a verb somewhere else but not here is honestly NOT a verb here, and
 /// is free to become a program name — which is exactly how `vug` starts
-/// `VUG.ELF` on the shipped build of either arch while staying the in-kernel 3D
-/// sculptor verb on a `vugdemo` one.
+/// `VUG.ELF` on every build of either arch, the in-kernel sculptor verb having
+/// been retired by DECRUD-2.
 ///
 /// Case-insensitive via [`canon_verb`]: `LS`, `Ls` and `lS` are all the verb
 /// `ls`.
@@ -613,9 +598,7 @@ pub fn help(facts: &Facts) -> String {
     } else {
         say!("SMP:      ps (per-CPU run queues)");
     }
-    if facts.v3d && facts.vugdemo {
-        say!("APPS:     vug (3D sculptor), v3d (replay the visible GPU graphics battery)");
-    } else if facts.v3d {
+    if facts.v3d {
         say!("APPS:     v3d (replay the visible GPU graphics battery)");
     }
     if facts.proc_verbs {
@@ -657,14 +640,10 @@ pub fn help(facts: &Facts) -> String {
         ));
     }
     say!("          batmon  (battery snapshot; the platform that has one answers)");
-    // BARENAME (PARITY 6.6a): `vug` and `pulse` are the in-kernel DEMOS, and they are verbs only
-    // on a `vugdemo` build. Off the knob - which is every image users flash - the same two words
-    // name the ring-3 programs `VUG.ELF` / `PULSE.ELF` and belong to the bare-name lines above, so
-    // advertising them here would be advertising a verb this build cannot dispatch: the exact rule
-    // the `Facts` doc opens with.
-    if facts.aarch64 && facts.vugdemo {
-        say!("          pulse  (full-screen CPU monitor), vug  (in-kernel 3D sculptor)");
-    }
+    // BARENAME (PARITY 6.6a), post-DECRUD-2: `vug` and `pulse` are NOT advertised on any build.
+    // The in-kernel demos are gone and the `vugdemo` fact with them, so the two words name only
+    // the ring-3 programs `VUG.ELF` / `PULSE.ELF` and belong to the bare-name lines above.
+    // Advertising them here would advertise a verb no build can dispatch: the rule `Facts` opens with.
     l.join("\n")
 }
 
@@ -752,8 +731,8 @@ mod tests {
 
     #[test]
     fn help_tracks_the_facts() {
-        // The SHIPPED Pi: v3d on, `vugdemo` off (DECRUD-1's default), bare-name launch on
-        // (PARITY §6.6a). `vug`/`pulse` must NOT be advertised as verbs — they are programs here —
+        // The SHIPPED Pi: v3d on, bare-name launch on (PARITY §6.6a). Post-DECRUD-2 there is no
+        // build on which `vug`/`pulse` are verbs — they are ring-3 programs on every image —
         // and the bare-name lines must be present, since aarch64 now carries the capability.
         let arm = Facts {
             aarch64: true, v3d: true, proc_verbs: true, proc_rows: 6, exec: true, ..Facts::bare()
@@ -769,12 +748,6 @@ mod tests {
         assert!(h.contains("n>6 is refused"));
         assert!(h.contains("the .elf is optional"), "bare-name help is gated on exec, not on x86");
 
-        // The same Pi with the demo knob ON: the two verbs exist, so they are advertised again.
-        let armdemo = Facts { vugdemo: true, ..arm };
-        let h = help(&armdemo);
-        assert!(h.contains("pulse  (full-screen CPU monitor)"));
-        assert!(h.contains("APPS:     vug (3D sculptor), v3d ("));
-
         let x86 = Facts { x86: true, proc_verbs: true, proc_rows: 10, ..Facts::bare() };
         let h = help(&x86);
         // RELICS (R26 clause 3): NATIVE is on every build now - the plain verbs are the verbs.
@@ -789,7 +762,10 @@ mod tests {
     /// BARENAME (PARITY §6.6a): the regression this arc exists to prevent — a verb that the build
     /// does NOT carry standing between the operator and the program of the same name.
     #[test]
-    fn vug_is_a_verb_only_on_a_vugdemo_build() {
+    fn vug_is_never_a_verb_and_always_reaches_the_program() {
+        // DECRUD-2 made this unconditional: the in-kernel demos are gone, so on NO build and NO arch
+        // are `vug`/`pulse` verbs, and the words must always reach the ring-3 program. This is the
+        // strong form of what the knob-off half of this test used to assert.
         let shipped = Facts { aarch64: true, proc_verbs: true, exec: true, ..Facts::bare() };
         assert!(!is_verb("vug", &shipped));
         assert!(!is_verb("pulse", &shipped));
@@ -797,12 +773,9 @@ mod tests {
             plan("vug", &shipped, &mut vol()),
             Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string() }
         );
-        let demo = Facts { vugdemo: true, ..shipped };
-        assert!(is_verb("vug", &demo));
-        assert!(matches!(plan("vug", &demo, &mut vol()), Plan::Host { .. }));
-        // The knob is not a licence to leak onto x86: `crate::vug` is aarch64 source.
-        let x86demo = Facts { x86: true, vugdemo: true, exec: true, ..Facts::bare() };
-        assert!(!is_verb("vug", &x86demo));
+        let x86 = Facts { x86: true, proc_verbs: true, exec: true, ..Facts::bare() };
+        assert!(!is_verb("vug", &x86));
+        assert!(!is_verb("pulse", &x86));
     }
 
     #[test]
@@ -895,7 +868,7 @@ mod tests {
         ];
         let builds = [
             Facts::bare(),
-            Facts { aarch64: true, v3d: true, vugdemo: true, proc_verbs: true, exec: true, ..Facts::bare() },
+            Facts { aarch64: true, v3d: true, proc_verbs: true, exec: true, ..Facts::bare() },
             Facts { x86: true, proc_verbs: true, exec: true, ..Facts::bare() },
         ];
         for f in builds {
@@ -945,7 +918,7 @@ mod tests {
         }
         // The three that remain are knobs/capabilities, and they are the ones documented as such.
         for (n, a) in HOST_VERBS {
-            if matches!(a, Avail::V3d | Avail::VugDemo) {
+            if matches!(a, Avail::V3d) {
                 assert!(["v3d", "vug", "pulse"].contains(n), "unexpected knob-gated verb `{}`", n);
             }
         }
@@ -971,14 +944,15 @@ mod tests {
 
     #[test]
     fn verb_ness_follows_the_build() {
-        let arm = Facts { aarch64: true, vugdemo: true, ..Facts::bare() };
+        let arm = Facts { aarch64: true, v3d: true, ..Facts::bare() };
         let x86 = Facts { x86: true, exec: true, ..Facts::bare() };
-        // `vug` is the 3D sculptor verb on a `vugdemo` Pi build ...
-        assert!(is_verb("vug", &arm));
-        assert!(matches!(plan("vug", &arm, &mut vol()), Plan::Host { .. }));
-        // ... and on x86 it is not a verb at all, so it starts VUG.ELF. A flat
-        // name list would have turned this launch into a refusal.
-        assert!(!is_verb("vug", &x86));
+        // `v3d` is a registered verb on an aarch64 `v3d` build ...
+        assert!(is_verb("v3d", &arm));
+        assert!(matches!(plan("v3d", &arm, &mut vol()), Plan::Host { .. }));
+        // ... and on x86 it is not a verb at all. `vug` is now a verb on NEITHER (DECRUD-2), so it
+        // starts VUG.ELF everywhere; a flat name list would have turned that launch into a refusal.
+        assert!(!is_verb("v3d", &x86));
+        assert!(!is_verb("vug", &arm));
         assert_eq!(
             plan("vug", &x86, &mut vol()),
             Plan::Exec { typed: "vug".to_string(), name: "VUG.ELF".to_string() }
