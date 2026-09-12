@@ -655,3 +655,7 @@ None block the build. One decision rides on the knob line:
 `LC_ALL=C grep -a -o -F '[ga10bprobe4c]' target/aarch64_esp/kernel.elf | wc -l` (the witness family reachable
 in the flight artifact, not merely compiled); the scorer selftest above. No QEMU models the Jetson; a green
 here certifies that it compiles and links (LAWS §Gates). Exit codes are in the commit and ledger A55.
+
+## 11. Rung 5 — the sequel brief
+
+Everything §6 and §7 left open — the FMC/BCR descriptor layout from public sources, why a `0x2` cannot be read as a statement about signatures, the honest fork on whether any blob-free GPU engine path exists on GA10B, the L4T firmware facts for Peter's ruling, and rung 5's conditional design — is in [`GA10B-RUNG5-BRIEF.md`](GA10B-RUNG5-BRIEF.md) (ledger [`orin-ledger.md`](../orin-ledger.md) A61, open).
