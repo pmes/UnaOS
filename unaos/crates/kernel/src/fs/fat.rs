@@ -616,6 +616,27 @@ fn u64le(b: &[u8], off: usize) -> u64 {
 pub enum BlockSource {
     Default,
     Usb,
+    /// USBREG (SO33): the USB block registry's SECOND and later disks — `UsbN(1)` is registry index
+    /// 1, `UsbN(2)` index 2, and so on up to `drivers::block::MAX_USB_DISKS - 1`.
+    ///
+    /// ### Why an extra variant and not an index on `Usb`
+    /// [`BlockSource::Usb`] means registry INDEX 0 and it means it everywhere — `read_block_usb`,
+    /// [`crate::drivers::block::BlockHandle::Usb`], `/fs/usb`, the installer's USB row, the capture
+    /// ladder's rung 2, every `mount_source(BlockSource::Usb)` in the tree. On the one-disk machine
+    /// that is every x86 bench, every Pi bench and every QEMU leg, index 0 IS the disk, so those
+    /// callers keep their exact pre-USBREG behaviour by keeping their exact spelling. Turning `Usb`
+    /// into `Usb(0)` would have rewritten two dozen call sites to say the same thing, and each
+    /// rewrite is a chance to say it wrong.
+    ///
+    /// ### What it costs, stated rather than hidden
+    /// `handle_of(UsbN(_))` is [`crate::drivers::block::BlockHandle::Usb`], because `BlockHandle` is
+    /// matched EXHAUSTIVELY in four modules outside this arc's lane and a fifth variant there is a
+    /// build error in each. So a `UsbN` volume's `PartitionRange` and its `mbr_census` line are
+    /// attributed to the USB handle without the index. That is a REPORTING limit, not a routing one:
+    /// every sector of a `UsbN(n)` volume is read and written through this file's own dispatch, which
+    /// carries the index into `drivers::block::read_block_usb_ix(n, …)`. Giving `BlockHandle` an
+    /// index is the next arc, and `PartitionRange` is the reason to want it.
+    UsbN(u8),
     /// SDHC-4b (x86, `sdhcblk` knob): the internal SD card, READ-ONLY. See the note above.
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     Sdhc,
@@ -644,6 +665,19 @@ impl BlockSource {
         match self {
             BlockSource::Default => "global",
             BlockSource::Usb => "usb",
+            // USBREG: `usb1`, `usb2`, `usb3` — the registry index, which is the only thing that
+            // separates two cards in one reader by a name a person can read. A `&'static str` table
+            // rather than a formatted string because this function's contract is `&'static str` and
+            // an allocation in a witness path is a boot hazard; the table is indexed by the SAME
+            // number the source carries, and an out-of-range index (impossible from
+            // `live_sources`, which only emits live registry entries) renders as `usb?` instead of
+            // panicking — a witness must never be the thing that stops a boot.
+            BlockSource::UsbN(n) => match n {
+                1 => "usb1",
+                2 => "usb2",
+                3 => "usb3",
+                _ => "usb?",
+            },
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => "sdhc",
             // Spelled exactly as `mbr_census` spells the same handle, for the same one-vocabulary
@@ -700,7 +734,10 @@ impl BlockSource {
                 }
             }
             // USB-WRITE (F3): the stick's BOT WRITE(10) path is verified and routed.
-            BlockSource::Usb => None,
+            // USBREG: and it is the SAME path for every registry entry — `write_block_usb_ix` is
+            // what `write_block_usb` calls with index 0 — so a second card cannot have a different
+            // write posture from the first by accident. One arm, both spellings.
+            BlockSource::Usb | BlockSource::UsbN(_) => None,
             // SDHC-4b/4c: the internal reader admits CMD24 only inside the reserved flight-recorder
             // extent, which no file verb can name. See [`crate::fs::sdhc4c`].
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
@@ -768,6 +805,9 @@ fn read_sector(source: BlockSource, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Re
     let r = match source {
         BlockSource::Default => crate::drivers::block::read_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::read_block_usb(lba, buf),
+        // USBREG: the index travels with the source into the block layer, which addresses the
+        // transfer at that registry entry's own (slot, LUN). See `BlockSource::UsbN`.
+        BlockSource::UsbN(n) => crate::drivers::block::read_block_usb_ix(n as usize, lba, buf),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -801,6 +841,8 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
     let r = match source {
         BlockSource::Default => crate::drivers::block::write_block(lba, buf),
         BlockSource::Usb => crate::drivers::block::write_block_usb(lba, buf),
+        // USBREG: see `read_sector` — the index is the address, not a hint.
+        BlockSource::UsbN(n) => crate::drivers::block::write_block_usb_ix(n as usize, lba, buf),
         // Reachable ONLY with the permit armed and this exact LBA inside the reserved extent — the
         // guard above returned otherwise.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
@@ -869,6 +911,7 @@ fn read_sectors(source: BlockSource, lba: u64, buf: &mut [u8]) -> Result<(), Fat
         let r = match source {
             BlockSource::Default => crate::drivers::block::read_blocks(at, chunk),
             BlockSource::Usb => crate::drivers::block::read_blocks_usb(at, chunk),
+            BlockSource::UsbN(n) => crate::drivers::block::read_blocks_usb_ix(n as usize, at, chunk),
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::read_blocks_sdhc(at, chunk),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -917,6 +960,7 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
         let r = match source {
             BlockSource::Default => crate::drivers::block::write_blocks(at, chunk),
             BlockSource::Usb => crate::drivers::block::write_blocks_usb(at, chunk),
+            BlockSource::UsbN(n) => crate::drivers::block::write_blocks_usb_ix(n as usize, at, chunk),
             // Reachable ONLY with the permit armed and this chunk inside the reserved extent.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::write_blocks_sdhc(at, chunk),
@@ -1212,7 +1256,10 @@ static USBFALL_MASKED_USB_HOLD: core::sync::atomic::AtomicBool =
 #[cfg(all(target_arch = "aarch64", feature = "witness"))]
 #[inline]
 fn note_masked_usb_hold(source: BlockSource, site: &str) {
-    if source != BlockSource::Usb {
+    // USBREG: every registry entry rides the same BOT transport and pays the same masked hold, so
+    // the witness fires for all of them. A second card stalling under `PSTATE.I` while the first one
+    // did not is exactly the observation this line exists to make.
+    if !matches!(source, BlockSource::Usb | BlockSource::UsbN(_)) {
         return;
     }
     if !USBFALL_MASKED_USB_HOLD.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -1612,6 +1659,9 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        // USBREG: the indexed registry entry. `usb_info()` is entry 0 by definition, so the two
+        // arms read the same lookup through the same array and cannot drift apart.
+        BlockSource::UsbN(n) => crate::drivers::block::usb_info_ix(n as usize),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -1688,7 +1738,9 @@ pub fn mount_source(source: BlockSource) -> Result<FatFs, FatError> {
 pub fn handle_of(source: BlockSource) -> crate::drivers::block::BlockHandle {
     match source {
         BlockSource::Default => crate::drivers::block::BlockHandle::Global,
-        BlockSource::Usb => crate::drivers::block::BlockHandle::Usb,
+        // USBREG: every USB registry entry answers to the USB HANDLE. The index is carried by the
+        // source, not by the handle — see `BlockSource::UsbN` for what that costs and why.
+        BlockSource::Usb | BlockSource::UsbN(_) => crate::drivers::block::BlockHandle::Usb,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::BlockHandle::Sdhc,
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -1773,6 +1825,9 @@ pub fn volume_serials(source: BlockSource) -> alloc::vec::Vec<u32> {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        // USBREG: the indexed registry entry. `usb_info()` is entry 0 by definition, so the two
+        // arms read the same lookup through the same array and cannot drift apart.
+        BlockSource::UsbN(n) => crate::drivers::block::usb_info_ix(n as usize),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -1828,6 +1883,9 @@ pub fn source_present(source: BlockSource) -> bool {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        // USBREG: the indexed registry entry. `usb_info()` is entry 0 by definition, so the two
+        // arms read the same lookup through the same array and cannot drift apart.
+        BlockSource::UsbN(n) => crate::drivers::block::usb_info_ix(n as usize),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -1862,9 +1920,13 @@ pub fn locate_boot_volume(serial: u32) -> Option<BlockSource> {
     if serial == 0 {
         return None;
     }
-    for src in ALL_SOURCES {
-        if volume_serials(*src).iter().any(|v| *v == serial) {
-            return Some(*src);
+    // USBREG: the LIVE source list, not the compiled-in one — a second card in a reader is a volume
+    // this lookup must be able to name, and `ALL_SOURCES` cannot enumerate it (the registry index is
+    // a runtime fact). `live_sources` is `ALL_SOURCES` with the USB rung expanded over the registry,
+    // so on a one-disk machine it yields the identical list in the identical order.
+    for src in live_sources() {
+        if volume_serials(src).iter().any(|v| *v == serial) {
+            return Some(src);
         }
     }
     None
@@ -1886,6 +1948,73 @@ pub const ALL_SOURCES: &[BlockSource] = &[
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
     BlockSource::TegraSd,
 ];
+
+/// USBREG: `BlockSource::name`'s `usb<n>` table covers indices 0..3, so the registry may not be
+/// wider than that without the table growing with it. A const assertion rather than a comment
+/// because the two live in different files and a drifted pair renders a real disk as `usb?`.
+const _: () = assert!(
+    crate::drivers::block::MAX_USB_DISKS <= 4,
+    "BlockSource::name covers usb indices 0..3 — widen its table with MAX_USB_DISKS"
+);
+
+/// USBREG (SO33): every source that is LIVE right now — [`ALL_SOURCES`] with the USB rung expanded
+/// over the block registry's occupied entries.
+///
+/// `ALL_SOURCES` answers "which sources did this BUILD compile", which is a compile-time question and
+/// is still the right one for the posture census and for any walk over source KINDS. It cannot answer
+/// "which disks does this machine have", because the number of USB disks is a runtime fact about what
+/// is plugged in — and that is the question `fs::bootdisk`'s walk and [`locate_boot_volume`] are
+/// actually asking. Both now ask it here, so a board that grows a disk gains it in both places or in
+/// neither, which is the invariant `ALL_SOURCES`' own doc comment states.
+///
+/// Order is `ALL_SOURCES`' order with the extra USB entries immediately after `Usb`, ascending by
+/// index. That matters: `fs::bootdisk` picks root by first-found among the disks carrying this
+/// kernel, so the enumeration order is part of the answer, and putting the extra cards straight after
+/// the primary keeps a one-disk machine's list byte-for-byte what it was.
+///
+/// Index 0 is spelled [`BlockSource::Usb`], never `UsbN(0)` — one spelling per disk, so a `==`
+/// between two sources naming the same disk can never read false.
+pub fn live_sources() -> alloc::vec::Vec<BlockSource> {
+    let mut out: alloc::vec::Vec<BlockSource> = alloc::vec::Vec::new();
+    for src in ALL_SOURCES {
+        out.push(*src);
+        if matches!(src, BlockSource::Usb) {
+            for ix in 1..crate::drivers::block::MAX_USB_DISKS {
+                if crate::drivers::block::usb_disk_present(ix) {
+                    out.push(BlockSource::UsbN(ix as u8));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// USBREG: which USB registry entry does this source name? `None` for a source that is not a USB
+/// registry entry at all.
+///
+/// `Default` is the interesting arm and it is the reason this function exists rather than a
+/// `matches!`. On x86 and on tegra the primary USB disk claims the GLOBAL slot as well as its own, so
+/// `Default` and `Usb` are two names for one card — which is what `fs::bootdisk`'s `aliased=usb->global`
+/// records. But the global is claimed by registry index 0 and ONLY by index 0 (see
+/// `drivers::block::publish_usb_geometry_lun`), so `Default` names entry 0 when it holds a USB disk
+/// and names nothing when it holds the Pi's microSD or nothing at all. `fs::bootdisk::admit` uses that
+/// to refuse to alias two DIFFERENT cards of one reader onto each other — two entries of the registry
+/// are two devices by the enumerator's own bookkeeping, whatever their content says.
+pub fn source_unit(source: BlockSource) -> Option<u8> {
+    match source {
+        BlockSource::Usb => Some(0),
+        BlockSource::UsbN(n) => Some(n),
+        BlockSource::Default => {
+            let glob = crate::drivers::block::info()?;
+            let primary = crate::drivers::block::usb_info_ix(0)?;
+            if same_device(&glob, &primary) { Some(0) } else { None }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BlockSource::Sdhc => None,
+        #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+        BlockSource::TegraSd => None,
+    }
+}
 
 /// Append `v` only if absent. The serial list is at most a handful of entries, so a linear scan is
 /// both the simplest and the fastest thing here.
@@ -4952,7 +5081,7 @@ impl FatFs {
 // WHY IT IS NEEDED. Peter's home-soil rule counts matches per DISK, and on the tegra build one disk
 // wears two `BlockSource` names: `drivers::block::publish_usb_geometry`'s
 // `#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]` variant stores the SAME
-// `BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and `USB_BLOCK_DEVICE` (read as
+// `BlockDeviceInfo` into BOTH `BLOCK_DEVICE` (read as `Default`) and USB registry entry 0 (read as
 // `Usb`). Without a device-level key the walk would visit that one card twice, count it as two
 // disks, and mount it a second time as "home soil" beside itself.
 //
@@ -4975,6 +5104,9 @@ pub fn source_blocks(source: BlockSource) -> Option<u64> {
     let dev = match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        // USBREG: the indexed registry entry. `usb_info()` is entry 0 by definition, so the two
+        // arms read the same lookup through the same array and cannot drift apart.
+        BlockSource::UsbN(n) => crate::drivers::block::usb_info_ix(n as usize),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
@@ -5113,6 +5245,9 @@ pub fn source_device(source: BlockSource) -> Option<BlockDeviceInfo> {
     match source {
         BlockSource::Default => crate::drivers::block::info(),
         BlockSource::Usb => crate::drivers::block::usb_info(),
+        // USBREG: the indexed registry entry. `usb_info()` is entry 0 by definition, so the two
+        // arms read the same lookup through the same array and cannot drift apart.
+        BlockSource::UsbN(n) => crate::drivers::block::usb_info_ix(n as usize),
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockSource::Sdhc => crate::drivers::block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
