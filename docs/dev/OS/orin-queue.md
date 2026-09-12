@@ -10,7 +10,7 @@ Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51
 ✓ origin/main 084b79ac · origin/hw-jetson 277e2cab · origin/hw-rmbp 73d9d361 · origin/hw-pi4 153c78dd
 ✓ LOCAL, UNPUSHED: main 50d35cbf (R45-R48 + LAWS + docs/dev/QUEUE.md, the trunk queue) · hw-jetson 059db935
   (f2794266 rung 4 flown + the unafsroot fold) · hw-pi4 3c102d2a (pi-queue.md) · hw-rmbp dc1cc3a2 (rmbp-queue.md) ·
-  exec-orin26-unafsroot 5984c69c (merged) · exec-orin27-ga10b4c (cut at f2794266, Fable executor live: 4c + the deferred Shut Down trigger) · exec-orin26-tear (Opus executor live: BEAM) · exec-orin27-cmd8 (cut at 5cf8a9a3, Opus executor live, REFRAMED: A49's wire was an EMPTY native slot — Peter 2026-09-12: the data card was in the multi-slot USB reader; the ladder must gate on card-detect and say "no card") · exec-orin27-usblun (cut at 0a22ae40, Opus executor live: the USB mass-storage path addresses LUN 0 only, so a multi-slot reader hides every slot but one — Get Max LUN census, publish the slot that holds a card).
+  exec-orin26-unafsroot 5984c69c (merged) · exec-orin27-ga10b4c (cut at f2794266, Fable executor live: 4c + the deferred Shut Down trigger) · exec-orin26-tear 3e9d5625 DONE and FOLDED (hw-jetson 7ff0aa9d): BEAM — gates check/knoboff 0/esp-jetson/test-arm green; A54 · exec-orin27-cmd8 (cut at 5cf8a9a3, Opus executor live, REFRAMED: A49's wire was an EMPTY native slot — Peter 2026-09-12: the data card was in the multi-slot USB reader; the ladder must gate on card-detect and say "no card") · exec-orin27-usblun (cut at 0a22ae40, Opus executor live: the USB mass-storage path addresses LUN 0 only, so a multi-slot reader hides every slot but one — Get Max LUN census, publish the slot that holds a card).
   Push line: `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin27-cmd8 exec-orin27-usblun exec-orin24-fold exec-orin25-shotverb`
 ✓ Fold gate on 059db935 GREEN: `UNAOS_TEGRA=1 UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0 · plain strict check rc=0 · `./arroyo esp-jetson` rc=0.
 ✓ A49: three readings in one night — "v1 card" (orin 24) → "driver CMD8 defect on a 2.00 card" (orin 27, from the card's registers) → "EMPTY native slot, card was in the USB reader" (Peter). The executor rewrites the row to the third. render13: native slot EMPTY must print the SKIP line; UNAOS-DATA card in the reader's second slot must appear in the USBLUN census.
@@ -26,7 +26,8 @@ Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51
   (`ga10b4a-20260911T1809Z-a39fd32` max_vaddr 0x23cae8 → `ga10b4b-20260911T1809Z-a39fd32` 0x23f120), card line dry-run
   refuses only on device readability (needs sudo) and geometry (`--expect-geom 1:0b:2048:63401984`, from render12's FLIGHTID).
   Butler on ttyACM0, MARK ga10b4a written, waker armed. Boot 1 = 4a; boot 2 = 4b only on `-> BCR-ALLHELD`.
-✓ Four defect executors spawned 2026-09-11 off the fold 63654d93 in ~/unaos-bench/scratch/orin26/{core0,el0mem,tear,unafsroot}
+✓ tear: DONE (BEAM, A54, folded 7ff0aa9d) · unafsroot: DONE (A53, folded 059db935) · core0/el0mem: folded 277e2cab. Trap for the next image: `./arroyo test-arm` REBUILDS target/aarch64_esp/kernel.elf — build esp-jetson LAST and grep the artifact before any QEMU leg.
+· (history) Four defect executors spawned 2026-09-11 off the fold 63654d93 in ~/unaos-bench/scratch/orin26/{core0,el0mem,tear,unafsroot}
   on branches exec-orin26-*; tear carries 7b0a9804 merged, unafsroot carries a81f38c7 merged (one spec conflict, the executor resolves).
 
 ## THE FOLD'S FIRST GATE — seven findings, none of them code
