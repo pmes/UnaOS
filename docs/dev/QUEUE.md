@@ -14,7 +14,7 @@ corrected by the landing review — the commands live in each track queue). rmbp
 file lists JOBS, ranked, and a ledger row that is a record rather than a job stays in the ledger.
 
 ## STATE — 2026-09-12T03:5xZ (orin 27)
-✓ main 0aa3afe6 = the jetson landing (parents d28e701e + 6ed2be1a; three review panels; landing legs on 5acf6d16: check tegra/plain strict rc=0, UNAOS_WC=1 test rc=0, test-arm rc=0; ledger-check rc=0 on the result; `./arroyo check` on main recorded below when done). Before it: rmbp 267bd49d and pi e10d9e4e landings.
+✓ main 0aa3afe6 = the jetson landing (parents d28e701e + 6ed2be1a; three review panels; landing legs on 5acf6d16: check tegra/plain strict rc=0, UNAOS_WC=1 test rc=0, test-arm rc=0; ledger-check rc=0 on the result; `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` on main 0aa3afe6 rc=0). Before it: rmbp 267bd49d and pi e10d9e4e landings.
 ✓ ALL THREE TRACKS LEVEL WITH MAIN after this commit (hw-jetson, hw-pi4, hw-rmbp fast-forwarded). R45's property holds: any track can merge to main at any time.
 ✓ Push line (Peter): `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin27-cmd8 exec-orin27-usblun exec-orin27-closefold exec-orin24-fold exec-orin25-shotverb`
 ✓ Orin bench: render13 (`render13-20260912T0259Z-f4b4bf3`, KELF max=0x34f820) written to the old 32 GB card; the UEFI does not list our MBR card in the native slot (GPT card image is the job, orin-queue) so it flies from the USB reader; waker armed on the loader line.
@@ -69,6 +69,7 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 · B95  the x86 spec files are run by no `arroyo` verb; `orin-specscore.py` and `mbench --self-test` likewise
 · S16  106 ordering invariants, 99 in comments enforced by nothing — check them in code, one file per arc
 · S13  `[u7stk]` probe has no reachable caller outside `u7_launcher`
+· `media-writer.sh --image`: no check that the image's FAT32 volume is FAT32 BY CLUSTER COUNT (≥ 65,525) — a 32,440-cluster "FAT32" passed C4/C5/C8 and the Orin UEFI refused to boot it (orin-ledger A58; the Linux vfat driver trusts the BPB, EDK2 and our kernel do not) — add C15 on the image and on `--src` targets
 · `media-writer.sh --src`: no preflight that the staged tree FITS the target FAT, and a failed copy leaves the card mounted with a partial file (orin 27, 2026-09-12: a 640 MiB card image staged inside the tree filled the 127 MiB volume) — add C14 fits-the-volume and unmount-on-failure
 · scorer STAMP-MATCH leg (wire `sha=` == card elf stamp); `media-writer.sh` is un-versioned (B97)
 · SR5  R24/R25/R26 double-booked across seats and the gate cannot see it (seat-prefix RULINGS ids)
