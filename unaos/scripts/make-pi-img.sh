@@ -315,13 +315,16 @@ else
     # -F 32 forced: mkfs.fat would pick FAT16 at this size, and the Pi GPU ROM wants FAT32.
     # -s 1 forced (orin 27, 2026-09-12, FATCLUST): at 127 MiB mkfs.fat chose 8 sectors per cluster,
     # which leaves 32,440 clusters — and a volume under 65,525 clusters IS FAT16 by the spec, whatever
-    # the BPB says. mkfs.fat prints "WARNING: Not enough clusters for a 32 bit FAT!" and proceeds; the
-    # >/dev/null below hid it. Linux mounts such a volume (it trusts the BPB); EDK2's FAT driver and
-    # our own fs/fat.rs classify by cluster count and refuse it — the Orin UEFI listed no bootable
-    # disk in the native slot, and the kernel would have read the FAT as 16-bit. One sector per
-    # cluster yields 259,520 clusters at 127 MiB and 112k at the Pi's 55 MiB: FAT32 on both.
-    # The warning is no longer discarded: a future size that trips it fails loudly here.
-    mkfs.fat -F 32 -s 1 -n "$FAT_LABEL" -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) 2>&1 | { ! grep -i "WARNING: Not enough clusters" ; } || { echo "make-pi-img: mkfs.fat says the FAT32 volume has too few clusters — refuse" >&2; exit 3; }
+    # the BPB says. mkfs.fat prints "WARNING: Not enough clusters for a 32 bit FAT!" and proceeds.
+    # Linux mounts such a volume (it trusts the BPB); EDK2's FAT driver classifies by cluster count
+    # and refuses it — the Orin UEFI listed no bootable disk in the native slot — and our own
+    # fs/fat.rs classifies it FAT16 and reads the 32-bit FAT as 16-bit (a misread, not a refusal).
+    # One sector per cluster yields 256,030 clusters at 127 MiB and 110,874 at the Pi's 55 MiB
+    # (measured off the written BPB, docs/dev/evidence/orin27/CARD-FAT-CLUSTERS.txt): FAT32 on both.
+    # C15 (review of FATCLUST, 2026-09-12): the guard is the WRITTEN BPB, parsed and asserted by
+    # fat-clusters.sh — not mkfs.fat's warning text, which changed wording between dosfstools 4.1
+    # and 4.2 and so matched nothing on this host. mkfs.fat's stderr is no longer captured.
+    mkfs.fat -F 32 -s 1 -n "$FAT_LABEL" -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 ))
     mcopy -s -i "$OUT@@$(( P1_START * 512 ))" "$SRC"/* ::/
     # SOURCE-ALONG (see the Darwin branch note): copied explicitly, not via $SRC.
     if [ -n "$SRC_TGZ" ]; then
@@ -334,6 +337,11 @@ fi
 # The Pi GPU ROM wants the FAT32 partition typed 0x0C (LBA); diskutil makes 0x0B (CHS). Patch the MBR
 # partition-1 type byte at offset 450. (The Linux branch already wrote 0x0C; idempotent there.)
 printf '\x0c' | dd of="$OUT" bs=1 seek=450 count=1 conv=notrunc 2>/dev/null
+# FATCLUST C15 (both host branches): the WRITTEN BPB of partition 1 must be a FAT32 record whose
+# cluster count makes it FAT32 (>= 65,525). fat-clusters.sh reads p1's start from the MBR entry
+# just patched; a FAT16-by-count volume refuses the build here, loudly, with the numbers.
+FATCLUST_LINE="$(bash "$(dirname "$0")/fat-clusters.sh" "$OUT")" || { echo "make-pi-img: FATCLUST C15 REFUSED — partition 1 is not FAT32 by cluster count: $FATCLUST_LINE" >&2; exit 1; }
+echo "make-pi-img: $FATCLUST_LINE"
 
 # BeFS-K3: write the unafs partition — MBR entry 2 (type 0x7f, offset 462) pointing at the
 # reserved tail, then the raw volume bytes at that LBA. Done entirely by byte offset into the
