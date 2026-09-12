@@ -1060,6 +1060,14 @@ fi
 #   UNAOS_GA10B_PROBE4=4  -> + `ga10bprobe4d`  — 4a+4b+4c DEFERRED to the shutdown path: the boot runs
 #                            the FULL desktop, and the rung fires when a PSCI SYSTEM_OFF is requested
 #                            (shell `shutdown`/`off`, crystal Shut Down), then the OFF (Peter 2026-09-12)
+#   UNAOS_GA10B_PROBE4=5  -> `ga10bprobe4a` + `4b` + `ga10bprobe4e` — RUNG 4e, the SHIFT arm: the flown
+#                            `=2` rung with ONE delta, the six BCR DMA addresses written `pa >> 8`
+#                            (256-byte units, the MIT Hopper encoding); SYSTEM_OFF as `=2` (brief §12)
+#   UNAOS_GA10B_PROBE4=6  -> `ga10bprobe4a` + `4b` + `ga10bprobe4f` — RUNG 4f, the BRFETCH arm: the flown
+#                            `=2` rung with ONE delta, `bcr_ctrl` written 0x011 (BRFETCH FALSE) instead
+#                            of 0x111; SYSTEM_OFF as `=2` (brief §12). NEITHER arm adds a write class, a
+#                            register or an address class, and NEITHER carries rung 4c: `=5`/`=6` are the
+#                            `=2` wire plus one tag (`shift=8` / `brfetch=false`) on the verdict lines.
 # Any other non-empty value arms 4a alone: an unexpected value never buys an ignition (the PROBE3
 # shape, verbatim). `arch/aarch64/ga10b_probe.rs::ga10bprobe4_run`, an appended statement in
 # `tegra_early_stop`'s BPMP block between rung 3's call and rung 1's. A FOURTH sibling of the probe
@@ -1067,12 +1075,17 @@ fi
 # `UNAOS_GA10B_PROBE4=2 ./arroyo esp-jetson` both arm it. Fly it WITHOUT UNAOS_GA10B_PROBE1/2/3.
 # Default OFF => tail + call site vanish, no panic Location moves, knob-off images byte-identical.
 # ARMED polarities type-checked by the `arm-tegra-ga10bprobe4a` / `arm-tegra-ga10bprobe4b` /
-# `arm-tegra-ga10bprobe4c` / `arm-tegra-ga10bprobe4d` legs of KERNEL_CFG_MATRIX. Witness families:
-# `[ga10bprobe4a]`, `[ga10bprobe4b]`, `[ga10bprobe4c]`, `[ga10bprobe4d]`.
+# `arm-tegra-ga10bprobe4c` / `arm-tegra-ga10bprobe4d` / `arm-tegra-ga10bprobe4e` /
+# `arm-tegra-ga10bprobe4f` legs of KERNEL_CFG_MATRIX — the last two are REQUIRED, not optional: this
+# gate's own knob→leg coverage check reds on a declared feature with aarch64-qualified `#[cfg]` sites
+# that no leg names. Witness families: `[ga10bprobe4a]`, `[ga10bprobe4b]`, `[ga10bprobe4c]`,
+# `[ga10bprobe4d]`, `[ga10bprobe4e]`, `[ga10bprobe4f]`.
 [ -n "${UNAOS_GA10B_PROBE4:-}" ] && _feats="${_feats}ga10bprobe4a,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "2" ] && _feats="${_feats}ga10bprobe4b,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "3" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "4" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,ga10bprobe4d,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "5" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4e,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "6" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4f,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -4211,6 +4224,20 @@ KERNEL_CFG_MATRIX=(
   # site exists in src/ (the 4d/non-4d split is an early `return` inside a cfg block, not a `not(...)`), so
   # no disarmed asymmetry. Board legs +2; gate +2 — read the live counts from `./arroyo check`.
   "arm-tegra-ga10bprobe4d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4d"
+
+  # GA10B-PROBE4E / GA10B-PROBE4F armed (orin-0912b, 2026-09-12, ledger A62) — the `=5` and `=6` flight
+  # polarities: rung 4e writes the six BCR DMA addresses `pa >> 8`, rung 4f writes `bcr_ctrl` 0x011
+  # (BRFETCH FALSE). Both IMPLY `ga10bprobe4b` and neither carries `ga10bprobe4c`, which is exactly the
+  # `=2` shape plus one arm — so these two legs are what type-check the arms' own sites, and the FLOWN
+  # `arm-tegra-ga10bprobe4b` leg above still type-checks the not-4e/not-4f side of every cfg-selected
+  # statement they introduce. THESE LEGS ARE NOT OPTIONAL and the brief that ordered the arms did not
+  # foresee them: `check`'s own KNOB→LEG COVERAGE gate reds on any declared feature with aarch64-qualified
+  # `#[cfg]` sites that no leg names, because the manufactured `x86-mix-N` legs would compile them GREEN
+  # AND VACUOUS. Measured, not assumed — without these two rows that gate printed
+  # `❌ knob→leg coverage: ga10bprobe4e ga10bprobe4f` and `check` exited 1.
+  "arm-tegra-ga10bprobe4e ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4e"
+
+  "arm-tegra-ga10bprobe4f ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4f"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of

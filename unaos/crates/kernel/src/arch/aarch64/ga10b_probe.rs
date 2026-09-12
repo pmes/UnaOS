@@ -6,7 +6,7 @@
 // GA10B-PROBE3, rungs 3 and 3b — the read-only pass over what the platform firmware left behind, and the
 // ladder's first GA10B MMIO writes — lives after it under `ga10bprobe3` / `ga10bprobe3b`;
 // see the ladder docs/dev/evidence/orin14/GA10B-LADDER.md and the as-built spec
-// docs/dev/evidence/orin16/GA10B-RUNG3.md. Everything above the rung-2 marker is rung 1. GA10B-PROBE4, rungs 4a and 4b — the BCR writability census and the blob-free boot-ROM ignition — is the LAST block of this file under `ga10bprobe4a` / `ga10bprobe4b`; brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md. GA10B-PROBE4C, rung 4c — the read-only post-ignition CENSUS — and GA10B-PROBE4D, the DEFERRED arm that runs 4a+4b+4c from the shutdown path after a full desktop session, are the tail after it under `ga10bprobe4c` / `ga10bprobe4d`; brief §10.)
+// docs/dev/evidence/orin16/GA10B-RUNG3.md. Everything above the rung-2 marker is rung 1. GA10B-PROBE4, rungs 4a and 4b — the BCR writability census and the blob-free boot-ROM ignition — is the LAST block of this file under `ga10bprobe4a` / `ga10bprobe4b`; brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md. GA10B-PROBE4C, rung 4c — the read-only post-ignition CENSUS — and GA10B-PROBE4D, the DEFERRED arm that runs 4a+4b+4c from the shutdown path after a full desktop session, are the tail after it under `ga10bprobe4c` / `ga10bprobe4d`; brief §10. GA10B-PROBE4E and GA10B-PROBE4F, rungs 4e and 4f — the SHIFT arm and the BRFETCH arm, each the flown rung with exactly ONE value changed — are the VERY LAST block of this file under `ga10bprobe4e` / `ga10bprobe4f`; brief §12.)
 // (`ga10bprobe1`, DEFAULT OFF; implies `tegra`). One attended cold-boot flight that answers, without
 // booting one byte of GPU firmware or writing one GPU register: is the GA10B power rail on, has its
 // GSP RISC-V boot ROM ever reached a verdict, and is the block priv-locked? See the design note
@@ -1186,7 +1186,7 @@ fn rung3b(base: u64) {
 /// The non-signature fill pattern: neither all-zero nor all-ones, not a plausible header.
 #[cfg(feature = "ga10bprobe4a")] const DMABUF_PATTERN: u32 = 0x4A10_B4A5;
 // facts (b) SEQ step 1: brom_config bcr_ctrl = 0x111 (rung 3 read the baseline as 0x110 — the delta is bit 0).
-#[cfg(feature = "ga10bprobe4b")] const BCR_CTRL_BROM_CONFIG: u32 = 0x111;
+#[cfg(all(feature = "ga10bprobe4b", not(feature = "ga10bprobe4f")))] const BCR_CTRL_BROM_CONFIG: u32 = 0x111; #[cfg(feature = "ga10bprobe4f")] const BCR_CTRL_BROM_CONFIG: u32 = 0x011; // RUNG 4f folds its value onto THIS line (line-neutral: =1/=2/=3/=4 keep 0x111 and their bytes). 0x011 is the ACKED SEQ's ALTERNATE set_bcr value — BRFETCH FALSE, CORE_SELECT RISCV, VALID TRUE — decoded exactly in GA10B-RUNG5-BRIEF.md §2.2 against the MIT GA102 dev_riscv_pri.h field map.
 // facts (b): priscv cpuctl 0x388 startcpu_true = 0x1 — THE IGNITION.
 #[cfg(feature = "ga10bprobe4b")] const PRISCV_CPUCTL_STARTCPU: u32 = 0x1;
 /// Bounded br_retcode poll: N samples, fixed settle between them, every sample printed with its index.
@@ -1241,12 +1241,12 @@ const BCR_ADDR_REGS: [(&str, u64); 6] = [
 ];
 
 /// The six address VALUES for a window at `pa`: fmccode at +0, fmcdata at +DMABUF_FMCDATA_OFF, pkcparam
-/// at +DMABUF_PKC_OFF, each as its lo/hi 32-bit halves in BCR_ADDR_REGS order.
+/// at +DMABUF_PKC_OFF, lo/hi halves in BCR_ADDR_REGS order, >> `R4_ADDR_SHIFT` (0 flown, 8 on rung 4e).
 #[cfg(feature = "ga10bprobe4a")]
 fn bcr_addr_values(pa: u64) -> [u32; 6] {
-    let fc = pa;
-    let fd = pa + DMABUF_FMCDATA_OFF;
-    let pk = pa + DMABUF_PKC_OFF;
+    let fc = pa >> R4_ADDR_SHIFT;
+    let fd = (pa + DMABUF_FMCDATA_OFF) >> R4_ADDR_SHIFT;
+    let pk = (pa + DMABUF_PKC_OFF) >> R4_ADDR_SHIFT;
     [fc as u32, (fc >> 32) as u32, fd as u32, (fd >> 32) as u32, pk as u32, (pk >> 32) as u32]
 }
 
@@ -1302,7 +1302,7 @@ fn ga10bprobe4_body(
     const FAM: &str = "ga10bprobe4a";
     serial_println!(
         "[ga10bprobe4a] rung 4a (BCR WRITABILITY CENSUS inside rung 3's PROVEN power+clock bracket, re-proven THIS boot; no ignition; symmetric restore; RETURNS) — six BCR DMA address writes + one dmacfg write WITHOUT the lock bit, each announced and read back, stop at first mismatch, restore all seven to zero. bcr_ctrl is NOT written by 4a. Summary vocabulary: BCR-ALLHELD | BCR-SOMEHELD | BCR-NONEHELD | BCR-SELFLOCKED | BCR-STICKY | REFUSED reason=<no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable|no-dma-window>. SELFLOCKED and STICKY spend the power cycle and end in SYSTEM_OFF."
-    );
+    ); #[cfg(feature = "ga10bprobe4e")] r4e_banner(); #[cfg(feature = "ga10bprobe4f")] r4f_banner(); // RUNGS 4e/4f announce their ONE delta HERE, folded onto this line so the flown arms keep their bytes.
     #[cfg(feature = "ga10bprobe4b")]
     serial_println!(
         "[ga10bprobe4b] rung 4b ARMED (UNAOS_GA10B_PROBE4=2) — after a same-boot BCR-ALLHELD this boot performs the blob-free boot-ROM IGNITION: addresses re-written -> bcr_dmacfg = noncoherent|lock_locked (SPENDS THE POWER CYCLE) -> bcr_ctrl = 0x111 -> priscv_cpuctl = startcpu -> bounded br_retcode poll -> post-ignition state block -> SYSTEM_OFF on EVERY path. The rung's PASS is a FAIL verdict (br_result=0x2): the ROM executed and rejected an unsigned pattern. F2 warning: a GPU-side fabric RAS after the ignition may need a manual power cut."
@@ -1470,7 +1470,7 @@ fn ga10bprobe4_body(
             for i in 0..6 {
                 let (name, off) = BCR_ADDR_REGS[i];
                 written[i] = true;
-                match bcr_write_verify(FAM, name, f2, off, vals[i], "BCR DMA address, A-step") {
+                #[cfg(feature = "ga10bprobe4e")] match bcr_write_verify_shift(FAM, name, f2, off, vals[i], bcr_addr_raw(wb, i), "BCR DMA address, A-step") { Ok(true) => held += 1, Ok(false) => { stopped = true; } Err(_) => { n_unreadable += 1; stopped = true; } } #[cfg(not(feature = "ga10bprobe4e"))] match bcr_write_verify(FAM, name, f2, off, vals[i], "BCR DMA address, A-step") {
                     Ok(true) => held += 1,
                     Ok(false) => { stopped = true; }
                     Err(_) => { n_unreadable += 1; stopped = true; }
@@ -1522,7 +1522,7 @@ fn ga10bprobe4_body(
             } else {
                 "BCR-SOMEHELD"
             };
-            serial_println!("[ga10bprobe4a] bcrheld={}/7 dmabuf_pa={:#010x} lock_after={} unreadable={} -> {}{}", held, wb, lock_after, n_unreadable, arm, match sticky { Some(n) => { let _ = n; " (a register did not clear to zero — see its restore line; the board is NOT left as found)" } None => "" });
+            #[cfg(not(any(feature = "ga10bprobe4e", feature = "ga10bprobe4f")))] serial_println!("[ga10bprobe4a] bcrheld={}/7 dmabuf_pa={:#010x} lock_after={} unreadable={} -> {}{}", held, wb, lock_after, n_unreadable, arm, match sticky { Some(n) => { let _ = n; " (a register did not clear to zero — see its restore line; the board is NOT left as found)" } None => "" }); #[cfg(feature = "ga10bprobe4e")] serial_println!("[ga10bprobe4a] bcrheld={}/7 dmabuf_pa={:#010x} shift=8 lock_after={} unreadable={} -> {}{}", held, wb, lock_after, n_unreadable, arm, match sticky { Some(n) => { let _ = n; " (a register did not clear to zero — see its restore line; the board is NOT left as found)" } None => "" }); #[cfg(feature = "ga10bprobe4f")] serial_println!("[ga10bprobe4a] bcrheld={}/7 dmabuf_pa={:#010x} brfetch=false lock_after={} unreadable={} -> {}{}", held, wb, lock_after, n_unreadable, arm, match sticky { Some(n) => { let _ = n; " (a register did not clear to zero — see its restore line; the board is NOT left as found)" } None => "" });
             if arm == "BCR-SELFLOCKED" {
                 serial_println!("[ga10bprobe4a] the lock latched on a config write that did not ask for it: 4a is NOT free on this die — the power cycle is spent and the next boot must be COLD (F6)");
                 finish4(FAM);
@@ -1606,7 +1606,7 @@ fn rung4b(base: u64, f2: u64, dmabuf_pa: u64, allheld: bool, ctrl_baseline: u32)
     let vals = bcr_addr_values(dmabuf_pa);
     for i in 0..6 {
         let (name, off) = BCR_ADDR_REGS[i];
-        let ok = matches!(bcr_write_verify(FAM, name, f2, off, vals[i], "BCR DMA address, B0 re-write"), Ok(true));
+        #[cfg(not(feature = "ga10bprobe4e"))] let ok = matches!(bcr_write_verify(FAM, name, f2, off, vals[i], "BCR DMA address, B0 re-write"), Ok(true)); #[cfg(feature = "ga10bprobe4e")] let ok = matches!(bcr_write_verify_shift(FAM, name, f2, off, vals[i], bcr_addr_raw(dmabuf_pa, i), "BCR DMA address, B0 re-write"), Ok(true));
         if !ok {
             serial_println!("[ga10bprobe4b] B0 mismatch at {} — restoring the addresses to zero and skipping the ignition", name);
             for j in 0..=i {
@@ -1627,7 +1627,7 @@ fn rung4b(base: u64, f2: u64, dmabuf_pa: u64, allheld: bool, ctrl_baseline: u32)
     serial_println!("[ga10bprobe4b] priscv_bcr_dmacfg @{:#x} wrote={:#010x} read={:#010x} lock_latched={} ({})", PRISCV_BCR_DMACFG_OFF, lockval, got, lock_latched, if lock_latched == 1 { "the lock took" } else { "the lock did NOT latch — a datum; the SEQ asks for it, whether the ROM requires it is UNKNOWN; continuing" });
     // B2 — bcr_ctrl = brom_config.
     let a = f2 + PRISCV_BCR_CTRL_OFF;
-    serial_println!("[ga10bprobe4b] about-to-WRITE priscv_bcr_ctrl reg={:#x} val={:#010x} (the ACKED SEQ brom_config value; baseline was {:#010x}) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it", a, BCR_CTRL_BROM_CONFIG, ctrl_baseline);
+    #[cfg(not(feature = "ga10bprobe4f"))] serial_println!("[ga10bprobe4b] about-to-WRITE priscv_bcr_ctrl reg={:#x} val={:#010x} (the ACKED SEQ brom_config value; baseline was {:#010x}) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it", a, BCR_CTRL_BROM_CONFIG, ctrl_baseline); #[cfg(feature = "ga10bprobe4f")] serial_println!("[ga10bprobe4b] about-to-WRITE priscv_bcr_ctrl reg={:#x} val={:#010x} brfetch=false (RUNG 4f: the ACKED SEQ's ALTERNATE set_bcr value — BRFETCH FALSE, CORE_SELECT RISCV, VALID TRUE. The flown arm wrote 0x00000111, BRFETCH TRUE; baseline was {:#010x}) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it", a, BCR_CTRL_BROM_CONFIG, ctrl_baseline);
     ignite_w32(a, BCR_CTRL_BROM_CONFIG);
     let ctrl = r32(a);
     serial_println!("[ga10bprobe4b] priscv_bcr_ctrl @{:#x} wrote={:#010x} read={:#010x} held={}", PRISCV_BCR_CTRL_OFF, BCR_CTRL_BROM_CONFIG, ctrl, (ctrl == BCR_CTRL_BROM_CONFIG) as u32);
@@ -1667,7 +1667,7 @@ fn rung4b(base: u64, f2: u64, dmabuf_pa: u64, allheld: bool, ctrl_baseline: u32)
     } else {
         "BROM-NOVERDICT"
     };
-    serial_println!("[ga10bprobe4b] br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} -> {}", retcode, result, samples, n, lock_latched, lockdown, v1r, arm);
+    #[cfg(not(any(feature = "ga10bprobe4e", feature = "ga10bprobe4f")))] serial_println!("[ga10bprobe4b] br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} -> {}", retcode, result, samples, n, lock_latched, lockdown, v1r, arm); #[cfg(feature = "ga10bprobe4e")] serial_println!("[ga10bprobe4b] br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} shift=8 -> {}", retcode, result, samples, n, lock_latched, lockdown, v1r, arm); #[cfg(feature = "ga10bprobe4f")] serial_println!("[ga10bprobe4b] br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} brfetch=false -> {}", retcode, result, samples, n, lock_latched, lockdown, v1r, arm);
     match arm {
         "BROM-VERDICT-FAIL" => serial_println!("[ga10bprobe4b] THE RUNG'S PASS: the GSP boot ROM executed, read our payload and rejected it — the first execution of GA10B silicon under UnaOS, with no vendor blob. AMBIGUITY, inline by design (brief §2.3): FAIL proves EXECUTION, not the cause — unsigned payload, malformed manifest, NSDRAM-encryption confound (the GPU may have read different bytes than the CPU wrote), or a DMA timeout into FAIL are indistinguishable here; no later rung may read this as a statement about signatures"),
         "BROM-VERDICT-PASS" => serial_println!("[ga10bprobe4b] EXTRAORDINARY: a pattern we authored verified against the vendor key — treat as a MEASUREMENT ERROR until independently re-flown from a cold boot; build nothing on it this session (F8)"),
@@ -2098,4 +2098,90 @@ pub fn ga10bprobe4_deferred_run() {
     };
     ga10bprobe4_body(&c, dtb_addr, dtb_size, ram_gib_mask);
     serial_println!("[ga10bprobe4d] deferred rung RETURNED (a 4a path that did not reach 4b's SYSTEM_OFF) — falling through to the SYSTEM_OFF it interrupted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// GA10B-PROBE4E / GA10B-PROBE4F — RUNGS 4e and 4f: two ONE-BOOT arms of the SAME rung 4
+// (`ga10bprobe4e` / `ga10bprobe4f`, DEFAULT OFF, each IMPLIES `ga10bprobe4b`; `UNAOS_GA10B_PROBE4=5`
+// and `=6`). Design: docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §12, from GA10B-RUNG5-BRIEF.md §1.2
+// (the encoding finding), §2.3 cause 5, §2.6 (the experiment) and §6 Q4/Q5. Ledger A62.
+//
+// Each arm is the FLOWN `=2` rung with exactly ONE value changed, and nothing else:
+//   * 4e SHIFT   — the six BCR DMA address registers are written `pa >> 8` (the register holds the
+//     physical address in 256-byte units per NVIDIA's published MIT Hopper bootstrap) instead of raw.
+//     The `lo` half is the low 32 bits of `pa >> 8`, the `hi` half the rest (the HI registers are 12
+//     bits wide — rung-5 brief §1.1 — so a sub-4 GiB window puts zero there either way, and the delta
+//     is entirely in `lo`). Every announce carries BOTH the raw address and the value written.
+//   * 4f BRFETCH — `bcr_ctrl` is written 0x011 instead of 0x111: same register, same address class,
+//     one bit of the decoded field map (BRFETCH TRUE -> FALSE), the SEQ's alternate `set_bcr` value.
+//
+// NO NEW WRITE CLASS, NO NEW REGISTER, NO NEW ADDRESS CLASS. 4b's seven BCR writes, the lock, the
+// trigger and the ignition remain the only GA10B writes in the boot; the flight ends in `SYSTEM_OFF`
+// on every path exactly as `=2` does; rung 4c is NOT carried by either arm.
+//
+// WITNESS FAMILIES `[ga10bprobe4e]` / `[ga10bprobe4f]` (15 bytes bracketed, over the 8-byte LLVM
+// immediate-encode floor). The arm ALSO tags the 4a and 4b SUMMARY lines — `shift=8` on 4e,
+// `brfetch=false` on 4f — so a capture says which arm flew without the scorer reading placement, and
+// so `docs/dev/evidence/orin27/scorer-ga10b4.sh 4e|4f` can tell one wire from the other (that scorer's
+// 4e/4f legs go RED on a capture without the tag, which is how the `=2` wires already on disk score).
+//
+// BYTE IDENTITY OF THE FLOWN ARMS. Every site these two features touch above is an EXISTING line
+// rewritten in place — the numstat for this change is 11 added / 11 deleted in this file, no hunk
+// changing a line count — and everything new lives in THIS block, which is the last thing in the
+// file, so nothing compiled sits below it and no `panic::Location` moves. Measured, not argued: the
+// `=2` and `=4` loadable images (`llvm-objcopy -O binary`, one directory, one pinned `UNAOS_GIT_SHA`)
+// are byte-identical across this change, and `./arroyo knoboff ga10bprobe4a` covers the default one.
+
+/// The right shift applied to a BCR DMA address before it is split into its LO/HI halves.
+/// 0 on every arm that has flown; 8 under rung 4e, which is the whole of that arm.
+#[cfg(all(feature = "ga10bprobe4a", not(feature = "ga10bprobe4e")))] const R4_ADDR_SHIFT: u32 = 0;
+#[cfg(feature = "ga10bprobe4e")] const R4_ADDR_SHIFT: u32 = 8;
+
+/// The RAW physical address behind `BCR_ADDR_REGS[i]` — the thing 4e's announce prints beside the
+/// shifted value it writes. A `match`, never an index: an index would add a bounds check, and a
+/// bounds check is a `panic::Location` this file must not grow.
+#[cfg(feature = "ga10bprobe4e")]
+fn bcr_addr_raw(pa: u64, i: usize) -> u64 {
+    match i {
+        0 | 1 => pa,
+        2 | 3 => pa + DMABUF_FMCDATA_OFF,
+        _ => pa + DMABUF_PKC_OFF,
+    }
+}
+
+/// 4e's announced write + readback for the six ADDRESS registers. `bcr_write_verify`'s shape exactly —
+/// one announce line, then exactly one result line, so `write_announces == write_results` still holds
+/// (brief §4 row C) — with `raw_pa=` and `shift=8` added to both, so the wire carries the address the
+/// rung MEANT and the number it actually put in the register, and a scorer can check the arithmetic
+/// instead of trusting a tag. `bcr_write_verify` itself is untouched: the flown arms call it, and the
+/// restore writes (value 0, no address behind them) call it here too.
+#[cfg(feature = "ga10bprobe4e")]
+fn bcr_write_verify_shift(fam: &str, name: &str, f2: u64, off: u64, val: u32, raw: u64, why: &str) -> Result<bool, &'static str> {
+    let addr = f2 + off;
+    serial_println!("[{}] about-to-WRITE {} reg={:#x} val={:#010x} raw_pa={:#010x} shift=8 ({}) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it", fam, name, addr, val, raw, why);
+    w32_4(addr, val);
+    let got = r32(addr);
+    match unreadable_reason(got) {
+        Some(r) => {
+            serial_println!("[{}] {} @{:#x} wrote={:#010x} read=-UNREADABLE reason={} val={:#010x} raw_pa={:#010x} shift=8 — the register stopped answering after the write; NOT folded into held or not-held (F4)", fam, name, off, val, r, got, raw);
+            Err(r)
+        }
+        None => {
+            let held = got == val;
+            serial_println!("[{}] {} @{:#x} wrote={:#010x} read={:#010x} raw_pa={:#010x} shift=8 held={}", fam, name, off, val, got, raw, held as u32);
+            Ok(held)
+        }
+    }
+}
+
+/// 4e's ARMED banner, printed from the fold on rung 4a's opening line.
+#[cfg(feature = "ga10bprobe4e")]
+fn r4e_banner() {
+    serial_println!("[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — the FLOWN 4a+4b rung with ONE delta: the six BCR DMA address registers are written shift=8, i.e. pa >> 8, because NVIDIA's published MIT Hopper GSP-FMC bootstrap writes them in 256-byte units. The flown arms wrote them RAW, so if this die's boot ROM shares that encoding the ignition pointed it about 512 GiB above DRAM and the signature wall was never reached (rung-5 brief §1.2, §2.3 cause 5). NOTHING else changes: same registers, same bcr_dmacfg, same bcr_ctrl=0x00000111, same ignition, same bounded poll, same SYSTEM_OFF on every path, no rung 4c. Every address announce carries raw_pa= beside the value written, and the 4a/4b summary lines carry shift=8. WHAT THIS CANNOT DECIDE: br_retcode is not an oracle — a correctly encoded but UNSIGNED payload returns the same 0x00000002 (rung-5 brief §2.5). The oracles that discriminate are post_lockdown, v1_readable and the DMA-window scan, and all three read the negative side on the flown wire");
+}
+
+/// 4f's ARMED banner, printed from the same fold.
+#[cfg(feature = "ga10bprobe4f")]
+fn r4f_banner() {
+    serial_println!("[ga10bprobe4f] rung 4f ARMED (UNAOS_GA10B_PROBE4=6) — the FLOWN 4a+4b rung with ONE delta: bcr_ctrl is written 0x00000011 instead of 0x00000111, brfetch=false. The MIT GA102 dev_riscv_pri.h decomposes that register exactly — BRFETCH bit 8, CORE_SELECT bit 4, VALID bit 0 — so the platform firmware's leftover 0x00000110 is BRFETCH TRUE + RISCV + NOT VALID, 4b's flown 0x00000111 marked it valid, and 0x00000011 is the ACKED SEQ's alternate set_bcr value: configure the BCR but do not have the boot ROM fetch through it (rung-5 brief §2.2, §6 Q5 — a door named by that brief and taken by nobody). Same register, same address class, no new write. NOTHING else changes: addresses raw as flown, same bcr_dmacfg, same ignition, same bounded poll, same SYSTEM_OFF on every path, no rung 4c. The 4a/4b summary lines carry brfetch=false. NO THEORY IS OFFERED about what the ROM does with BRFETCH FALSE: this arm spends one power cycle to find out, and BCR-CTRL-REFUSED is a real outcome — the register may simply not take the value");
 }

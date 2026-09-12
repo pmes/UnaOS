@@ -659,3 +659,164 @@ here certifies that it compiles and links (LAWS §Gates). Exit codes are in the 
 ## 11. Rung 5 — the sequel brief
 
 Everything §6 and §7 left open — the FMC/BCR descriptor layout from public sources, why a `0x2` cannot be read as a statement about signatures, the honest fork on whether any blob-free GPU engine path exists on GA10B, the L4T firmware facts for Peter's ruling, and rung 5's conditional design — is in [`GA10B-RUNG5-BRIEF.md`](GA10B-RUNG5-BRIEF.md) (ledger [`orin-ledger.md`](../orin-ledger.md) A61, open).
+
+---
+
+## 12. Rungs 4e and 4f — the shift arm and the BRFETCH arm
+
+**Status: built by orin-0912b (2026-09-12), ledger [`orin-ledger.md`](../orin-ledger.md) A62, from
+[`GA10B-RUNG5-BRIEF.md`](GA10B-RUNG5-BRIEF.md) §2.6 and its §6 Q4/Q5 — the two questions on that page
+that need no ruling from Peter, because neither spends anything but a power cycle and neither goes
+near a vendor blob.** Each arm is ONE BOOT. Each is the flown `=2` rung with exactly ONE value
+changed. Neither adds a write class, a register, an address class or a new fact; both end in
+`SYSTEM_OFF` on every reachable path, as `=2` does.
+
+### 12.1 What changes, and what does not
+
+| | rung 4e — SHIFT | rung 4f — BRFETCH |
+|---|---|---|
+| knob | `UNAOS_GA10B_PROBE4=5` (`ga10bprobe4e`) | `UNAOS_GA10B_PROBE4=6` (`ga10bprobe4f`) |
+| the one delta | the six BCR DMA address registers are written `pa >> 8`: LO = low 32 bits of `pa >> 8`, HI = the rest | `bcr_ctrl` is written `0x00000011` instead of `0x00000111` |
+| why | NVIDIA's published MIT Hopper GSP-FMC bootstrap writes those registers in 256-byte units (rung-5 brief §1.2); rung 4b wrote them RAW, so under that encoding the flown ignition pointed the ROM about 512 GiB above a machine whose NSDRAM ends near 9.7 GiB | the MIT GA102 `dev_riscv_pri.h` decomposes the register exactly — BRFETCH bit 8, CORE_SELECT bit 4, VALID bit 0 — and `0x011` is the ACKED SEQ's alternate `set_bcr` value: BRFETCH FALSE (rung-5 brief §2.2) |
+| the tag on the wire | `shift=8` | `brfetch=false` |
+| unchanged | `bcr_dmacfg`, `bcr_ctrl` = `0x00000111`, the ignition, the 16-sample poll, the post-ignition block, `SYSTEM_OFF` | the six addresses (raw, as flown), `bcr_dmacfg`, the ignition, the poll, the post-ignition block, `SYSTEM_OFF` |
+
+Both arms carry rung 4a's census unchanged, both are armed only by a same-boot `BCR-ALLHELD`, and
+**neither carries rung 4c** — `=5` and `=6` compose `ga10bprobe4a` + `4b` + the arm, and nothing else,
+so a `=5`/`=6` wire is the `=2` wire plus a tag. That is deliberate: the arm's question is one value,
+and adding the census would put a second variable on the same power cycle.
+
+⚠ **One thing on the wire reads oddly and is correct.** Rung 4b's own ARMED banner still says
+`(UNAOS_GA10B_PROBE4=2)` on a `=5` or `=6` boot. It is the same rung, running the same code, and the
+banner is the line whose bytes hold the flown images identical; the arm announces itself and the knob
+value that armed it on its own `[ga10bprobe4e]` / `[ga10bprobe4f]` banner immediately above 4b's.
+
+### 12.2 The registers, raw and shifted, for the window this board seats
+
+The rung's own 2 MiB Normal-NC window has come up at `dmabuf_pa = 0x80200000` on every flight so far
+(`[ga10b4nc] rung-4 DMA window reserved [0x80200000, 0x80400000)`). For that window:
+
+| register | off | raw (flown `=2`, `=4`) | `pa >> 8` (rung 4e) |
+|---|---|---|---|
+| `fmccode_lo` | `0x678` | `0x80200000` | `0x00802000` |
+| `fmccode_hi` | `0x67c` | `0x00000000` | `0x00000000` |
+| `fmcdata_lo` | `0x680` | `0x80280000` | `0x00802800` |
+| `fmcdata_hi` | `0x684` | `0x00000000` | `0x00000000` |
+| `pkcparam_lo` | `0x670` | `0x80300000` | `0x00803000` |
+| `pkcparam_hi` | `0x674` | `0x00000000` | `0x00000000` |
+
+All three buffer addresses are 256-byte aligned (their low byte is zero), so the shift is lossless —
+which is the precondition §1.2 of the rung-5 brief names, satisfied here by accident of the window's
+2 MiB alignment and NOT by a rule this rung installs. A real FMC image would need its own.
+
+The HI halves stay zero either way: the window is below 4 GiB, and shifting a sub-4 GiB address right
+by 8 cannot reach bit 32. **So the whole of rung 4e's delta is in the three LO registers**, and the
+`hi` lines are on the wire to say so, not to carry information.
+
+### 12.3 What is measured
+
+Every write is announced before it is issued and read back immediately after, as rung 4 has always
+done. Rung 4e's announce and result lines carry BOTH numbers — `raw_pa=` beside `val=`/`wrote=`, plus
+`shift=8` — so the capture states the address the rung meant and the number it actually put in the
+register, and a scorer can check the arithmetic instead of trusting a label.
+
+The oracles are rung 4's, unchanged and already flown reading the negative side (rung-5 brief §2.6):
+`post_lockdown` (falcon `hwcfg2` bit 13), `v1_readable` (the legacy `gsp_falcon_cpuctl_v1` mirror),
+and `br_retcode` — **which is not an oracle for either arm.** A correctly encoded but unsigned payload
+returns the same `0x00000002` (§2.5 of that brief). What a `=5` boot can settle is narrower and real:
+whether the registers take the shifted values at all, and whether the two execution witnesses move.
+
+`docs/dev/evidence/orin27/scorer-ga10b4.sh` gains a `4e` and a `4f` leg. They score the same oracles,
+key on the tag, and in 4e's case recompute `wrote == raw_pa >> 8` for every address write from the
+capture itself. Both legs are RED — never NO VERDICT — on a capture without the tag, which is how the
+two `=2` wires already in `evidence/orin27/` score: a leg that answered NO VERDICT on the wires we
+have could never come out red on a wire we fly. Two wires each, run from files by
+`scorer-ga10b4.sh --selftest`: the expected `4e` wire scores 0 and the expected `4f` wire scores 1 on
+the `4e` leg, and the other way round; the untagged flown wire scores 1 on both; a `4e` wire with one
+written value off by one scores 1 (the arithmetic, not the tag); a `4f` wire with `bcr_ctrl` back at
+`0x00000111` scores 1; and the flown `4a` and `4b` legs still score 0 on the new wires.
+
+### 12.3b The wire each boot should show
+
+Rung 4e (`=5`), on a board that seats the window at `0x80200000` — every other line is the flown
+`=2` wire, unchanged and in the same order:
+
+```
+[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — … shift=8, i.e. pa >> 8 …
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_lo  reg=0x17111678 val=0x00802000 raw_pa=0x80200000 shift=8 (BCR DMA address, A-step) — …
+[ga10bprobe4a] priscv_bcr_fmccode_lo  @0x678 wrote=0x00802000 read=0x00802000 raw_pa=0x80200000 shift=8 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_hi  reg=0x1711167c val=0x00000000 raw_pa=0x80200000 shift=8 (BCR DMA address, A-step) — …
+[ga10bprobe4a] priscv_bcr_fmccode_hi  @0x67c wrote=0x00000000 read=0x00000000 raw_pa=0x80200000 shift=8 held=1
+        … fmcdata_lo val=0x00802800 raw_pa=0x80280000 · fmcdata_hi val=0x00000000 raw_pa=0x80280000 …
+        … pkcparam_lo val=0x00803000 raw_pa=0x80300000 · pkcparam_hi val=0x00000000 raw_pa=0x80300000 …
+[ga10bprobe4a] about-to-WRITE priscv_bcr_dmacfg reg=0x1711166c val=0x00000002 (…)      ← no raw_pa: not an address
+[ga10bprobe4a] … the seven restore writes to 0x00000000, unchanged …                   ← no raw_pa: no address behind them
+[ga10bprobe4a] bcrheld=7/7 dmabuf_pa=0x80200000 shift=8 lock_after=0 unreadable=0 -> BCR-ALLHELD
+[ga10bprobe4b] … the same six addresses re-written, raw_pa= and shift=8, "BCR DMA address, B0 re-write" …
+[ga10bprobe4b] priscv_bcr_ctrl @0x668 wrote=0x00000111 read=0x00000111 held=1          ← 4e does NOT touch bcr_ctrl
+[ga10bprobe4b] br_retcode=0x######## br_result=0x# samples=<i>/16 lock_latched=1 post_lockdown=<0|1> v1_readable=<0|1> shift=8 -> BROM-VERDICT-FAIL | BROM-VERDICT-PASS | BROM-NOVERDICT | BCR-CTRL-REFUSED | IGNITION-SKIPPED
+[ga10bprobe4b] flight done — powering OFF …      [pwrshutoff] PSCI SYSTEM_OFF (0x84000008) via SMC
+```
+
+Rung 4f (`=6`) is the flown `=2` wire with four lines different and nothing else:
+
+```
+[ga10bprobe4f] rung 4f ARMED (UNAOS_GA10B_PROBE4=6) — … brfetch=false …
+[ga10bprobe4a] bcrheld=7/7 dmabuf_pa=0x80200000 brfetch=false lock_after=0 unreadable=0 -> BCR-ALLHELD
+[ga10bprobe4b] about-to-WRITE priscv_bcr_ctrl reg=0x17111668 val=0x00000011 brfetch=false (RUNG 4f: the ACKED SEQ's ALTERNATE set_bcr value — BRFETCH FALSE, CORE_SELECT RISCV, VALID TRUE. The flown arm wrote 0x00000111, BRFETCH TRUE; baseline was 0x00000110) — …
+[ga10bprobe4b] priscv_bcr_ctrl @0x668 wrote=0x00000011 read=0x00000011 held=1
+[ga10bprobe4b] br_retcode=0x######## br_result=0x# samples=<i>/16 lock_latched=1 post_lockdown=<0|1> v1_readable=<0|1> brfetch=false -> BROM-VERDICT-FAIL | …
+```
+
+### 12.4 Fail shapes, named ahead (R19: each is "failed under \<conditions\>", knob and code KEPT)
+
+| # | shape | reading |
+|---|---|---|
+| F27 | 4e: an address write does not read back — `held=0`, the write list STOPS, `-> BCR-SOMEHELD`, no ignition | New information about the registers, not a broken arm: a shifted value is SMALLER than the raw one the same register already accepted, so a refusal here would say the field is not what §1.1 says it is. Report; do not retry warm |
+| F28 | 4e: `br_retcode=0x00000002 -> BROM-VERDICT-FAIL` again, with `post_lockdown=1` and `v1_readable=0` | **The expected outcome, and a RESULT rather than a failure.** The encoding was not the blocker: cause 5 of rung-5 brief §2.3 is retired and causes 1–4 stand undisturbed |
+| F29 | 4e: `-> BROM-NOVERDICT` with post-ignition `halted=0` | The core is RUNNING — the first non-FAIL on this die. STOP and report; build nothing on it in the same session, and re-fly cold before it is believed (the 4b `BROM-VERDICT-PASS` discipline, F8) |
+| F30 | 4f: `-> BCR-CTRL-REFUSED read=0x########` | The register did not take BRFETCH FALSE. The ignition write is NOT issued and the flight ends in `SYSTEM_OFF` — a complete answer about the register, and the end of Q5 |
+| F31 | 4f: the ignition returns the same `0x00000002` | BRFETCH is not the door. Q5 is answered negatively and the arm is spent |
+| F32 | either arm: a GPU-side fabric RAS after the ignition | §5's F2, restated because these arms issue the SAME ignition write. May need a manual power cut; fly attended |
+| F33 | either arm: the capture carries no tag | The image was not the arm you think it was. Certify the artifact before the flight, not the diff: `LC_ALL=C grep -a -o -F 'shift=8' target/aarch64_esp/kernel.elf` and its `brfetch=false` sibling, and the `[ga10bprobe4e]`/`[ga10bprobe4f]` families |
+
+### 12.5 What rungs 4e and 4f do NOT attempt
+
+- **No vendor blob and no real FMC image.** The payload is still rung 4a's fill pattern `0x4a10b4a5`;
+  nothing here touches Q1 of the rung-5 brief, and neither arm needs it answered.
+- **No new register, address class or write class.** `bcr_ctrl` and the six DMA addresses are already
+  4b's; the only thing that differs is the value put in them.
+- **No rung 4c census**, so `POSTBCR`, `MAPDIFF` and `DMABUF` do not appear on a `=5`/`=6` wire. The
+  `4e`/`4f` scorer legs report those oracles always and require them only where a capture carries 4c.
+- **No `MAILBOX0`/`MAILBOX1` boot-parameters channel** (rung-5 brief §1.4). That is a second, separate
+  unverified Hopper behaviour and putting it on the same boot would confound this one.
+- **Nothing about signatures.** `br_retcode` cannot distinguish an unsigned payload from a
+  misencoded one; §2.5 applies to these arms exactly as it applies to 4b.
+- **No alignment rule.** The shift is lossless here because the window happens to be 2 MiB aligned.
+  Rung 5 would have to install a real 256-byte alignment contract for an image it does not choose.
+
+### 12.6 The knob lines, one per boot
+
+```
+UNAOS_TEGRA=1 UNAOS_GA10B_PROBE4=5 ./arroyo esp-jetson     # rung 4e, the SHIFT arm
+UNAOS_TEGRA=1 UNAOS_GA10B_PROBE4=6 ./arroyo esp-jetson     # rung 4f, the BRFETCH arm
+```
+
+Each is one attended cold boot ending with the board dark. They are the `=2` line with one digit
+changed, which is the point: everything the flight does differently is in the one value the arm names.
+
+### 12.7 Verification posture of this section
+
+Per §9 and §10.8. What this arc changes: one `.rs` file (twelve lines rewritten in
+place, no hunk changing a line count, plus an 86-line block appended at the END of the file), two feature declarations, the knob's
+value parse, two `KERNEL_CFG_MATRIX` legs, the scorer, this section and one ledger row. The assertions the kernel batteries make are
+about compiled images: `./arroyo check` type-checks both arches with the ledger and k8reach gates
+armed; the two armed polarities are type-checked by the new `arm-tegra-ga10bprobe4e` and
+`arm-tegra-ga10bprobe4f` legs — which are not optional, since `check`'s knob→leg coverage gate reds
+on a declared feature with aarch64-qualified `#[cfg]` sites that no leg names — and compiled again by
+the `=5` and `=6` `esp-jetson` builds, with their witnesses proven present in the artifact with `LC_ALL=C grep -a -o -F` (and proven ABSENT from the
+`=2` artifact, which is the control); `./arroyo knoboff ga10bprobe4a` measures the default image;
+and the `=2` and `=4` loadable images are measured byte-identical across the change by knoboff's own
+method — one directory, one pinned `UNAOS_GIT_SHA`, `llvm-objcopy -O binary`, baseline reached by
+`git apply -R` of the snapshotted diff. No QEMU models the Jetson: a green here certifies that it
+compiles and links. Exit codes are in the commit and in ledger A62.

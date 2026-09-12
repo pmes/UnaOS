@@ -2233,6 +2233,31 @@ ga10bprobe4c = ["ga10bprobe4b"]
 # type-checked by the `arm-tegra-ga10bprobe4d` leg. Witness family: `[ga10bprobe4d]`.
 ga10bprobe4d = ["ga10bprobe4c"]
 
+# GA10B-PROBE4E (`UNAOS_GA10B_PROBE4=5`): RUNG 4e — the SHIFT arm. IMPLIES `ga10bprobe4b`, and is
+# otherwise the flown `=2` rung unchanged: same six BCR DMA address registers, same `bcr_dmacfg`, same
+# `bcr_ctrl` = 0x111, same ignition, same bounded poll, same SYSTEM_OFF on every path. The ONE delta is
+# the ENCODING of the six addresses: they are written `pa >> 8` (lo = the low 32 bits of `pa >> 8`, hi =
+# the rest) instead of raw. NVIDIA's published MIT Hopper GSP-FMC bootstrap writes them that way — the
+# register holds the physical address in 256-byte units — so if GA10B's boot ROM shares the encoding, the
+# flown ignitions pointed it about 512 GiB above DRAM and never reached the signature wall (rung-5 brief
+# §1.2, §2.3 cause 5, §2.6; rung-4 brief §12). Adds ZERO write classes and ZERO registers. Every address
+# announce carries BOTH the raw physical address and the shifted value written; the 4a and 4b verdict
+# lines carry `shift=8` so a capture says which arm flew. Default OFF; every site is folded onto an
+# existing line or lives in the file's LAST block, so `=1`/`=2`/`=3`/`=4` images do not move. ARMED
+# polarity compiled by the `UNAOS_GA10B_PROBE4=5 ./arroyo esp-jetson` build of the DONE gate. Witness
+# family: `[ga10bprobe4e]`.
+ga10bprobe4e = ["ga10bprobe4b"]
+
+# GA10B-PROBE4F (`UNAOS_GA10B_PROBE4=6`): RUNG 4f — the BRFETCH arm. IMPLIES `ga10bprobe4b`, and is the
+# flown `=2` rung unchanged but for ONE VALUE: `bcr_ctrl` is written 0x011 instead of 0x111. The MIT
+# GA102 `dev_riscv_pri.h` decomposes that register exactly — BRFETCH bit 8, CORE_SELECT bit 4, VALID
+# bit 0 — so 0x111 is BRFETCH TRUE + RISCV + VALID and 0x011 is the ACKED SEQ's alternate `set_bcr`
+# value, BRFETCH FALSE, a door named in the rung-5 brief §2.2 and taken by nobody (§6 Q5). Same
+# register, same address class, no new write: only the bit pattern differs. The 4a and 4b verdict lines
+# carry `brfetch=false`. Default OFF, same line-neutral discipline as 4e. ARMED polarity compiled by the
+# `UNAOS_GA10B_PROBE4=6 ./arroyo esp-jetson` build of the DONE gate. Witness family: `[ga10bprobe4f]`.
+ga10bprobe4f = ["ga10bprobe4b"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:
