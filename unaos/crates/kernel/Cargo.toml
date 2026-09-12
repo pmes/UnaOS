@@ -2153,6 +2153,36 @@ ga10bprobe4a = ["tegra"]
 # by the `arm-tegra-ga10bprobe4b` leg. Witness family: `[ga10bprobe4b]`.
 ga10bprobe4b = ["ga10bprobe4a"]
 
+# GA10B-PROBE4C (`UNAOS_GA10B_PROBE4=3`): the SUB-KNOB that adds RUNG 4c — the read-only POST-IGNITION
+# CENSUS — on top of 4a+4b. IMPLIES `ga10bprobe4b`. Brief §10 (orin 27, 2026-09-12; Peter: "can you add
+# more GPU probes to the next boot"). ZERO new write classes: inside 4a's bracket, after 4a's restore and
+# before 4b, a PRE-ignition census of 30 registers (rung 3's 25 + top_num_gpcs, gsp_falcon_hwcfg2,
+# gsp_falcon_mailbox0, priscv_cpuctl, priscv_br_retcode — every offset the ACKED facts file names, MAILBOX0
+# metal-proven by rung 3b), each announced before it is read; after 4b's verdict and before its SYSTEM_OFF,
+# a 20-sample br_retcode SERIES (distinct values with index and time; the upper bits printed as a reason
+# field), the same 30 POST-ignition diffed register-by-register against PRE (the 8 BCR registers judged
+# against what 4b wrote), and a CPU read of the rung's own DMA window (did the ROM write into it). Summary
+# arms: PRECENSUS-DONE|SKIPPED, BRSERIES-STABLE|CHANGED|UNREADABLE, POSTBCR-INTACT|ALTERED|UNREADABLE,
+# MAPDIFF-SAME|CHANGED, DMABUF-UNTOUCHED|ALTERED, CENSUS-COMPLETE. The flight still ends in 4b's SYSTEM_OFF
+# on every path. Widens the rung-3/3b/1 offset constants' cfgs in place (`any(ga10bprobe3, ga10bprobe4c)`)
+# so "same offsets as rung 3" holds by construction. Default OFF. ARMED polarity type-checked by the
+# `arm-tegra-ga10bprobe4c` leg. Witness family: `[ga10bprobe4c]`.
+ga10bprobe4c = ["ga10bprobe4b"]
+
+# GA10B-PROBE4D (`UNAOS_GA10B_PROBE4=4`): the DEFERRED arm — 4a+4b+4c run from the SHUTDOWN PATH after a
+# full desktop session (Peter 2026-09-12: the next boot runs the full desktop first and the GPU probe LAST,
+# so one boot carries the render glass checks AND the rung). IMPLIES `ga10bprobe4c`. With it, the
+# post-heap-init call in `tegra_early_stop` does NOT run the rung: `ga10bprobe4_run` stashes dtb_addr /
+# dtb_size / ram_gib_mask + a DTB checksum in statics, arms an AtomicBool and RETURNS; `power::psci_call`
+# calls `ga10b_probe::ga10bprobe4_deferred_run()` (no arguments) on EVERY PSCI SYSTEM_OFF request — shell
+# `shutdown`/`off`, crystal Shut Down, a probe's own finish — which consumes the arm, masks DAIF on the
+# calling core, re-verifies the DTB checksum, re-derives the BPMP channel with `chan_reopen`, and runs
+# 4a -> 4b -> 4c exactly as at boot (bracket re-proven, nothing inherited), ending in 4b's SYSTEM_OFF; a
+# refusal prints why and falls through to the OFF it interrupted. SYSTEM_RESET never triggers it. Default
+# OFF; the power.rs call is appended to an existing line (knob-off byte-identical). ARMED polarity
+# type-checked by the `arm-tegra-ga10bprobe4d` leg. Witness family: `[ga10bprobe4d]`.
+ga10bprobe4d = ["ga10bprobe4c"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

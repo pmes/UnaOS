@@ -71,7 +71,7 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 /// not be reordered around the witness prints.
 #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
 fn psci_call(func: u64) -> i64 {
-    let mut x0 = func;
+    let mut x0 = func; #[cfg(feature = "ga10bprobe4d")] if func == PSCI_SYSTEM_OFF { crate::arch::ga10b_probe::ga10bprobe4_deferred_run(); } // GA10B-PROBE4D (orin 27, 2026-09-12; Peter: the desktop first, the GPU probe LAST): under `ga10bprobe4d` (UNAOS_GA10B_PROBE4=4) EVERY PSCI SYSTEM_OFF request — shell `shutdown`/`off` via `shutdown()`, crystal Shut Down via `crystal_shutdown()`, a probe's own finish — passes through this ONE call before the SMC; it is a no-op unless the rung armed itself at boot, and it CONSUMES the arm on entry so the rung's own finish4 -> shutdown re-entry falls straight through to the OFF. SYSTEM_RESET does not trigger it (after 4b's lock the next boot must be cold). Appended to THIS line for knob-off byte identity: cfg-erased, no `Location` below moves.
     unsafe {
         core::arch::asm!(
             "smc #0",

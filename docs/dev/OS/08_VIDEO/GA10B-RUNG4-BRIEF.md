@@ -462,3 +462,196 @@ the gate asserts**, and the assertion must be **named**.
 - **The four-row table in §4 is a design, not a run.** Its two-wire executions are owed by the
   implementing seat **before the flight**, per BULLETIN §14 (21:55Z) — "a check being CORRECT and a
   check being RUN are different questions."
+
+---
+
+## 10. Rung 4c — the post-ignition census (and the deferred arm)
+
+**Status: designed and built by exec-orin27-ga10b4c (2026-09-12), from two rulings the same day — Peter:
+"can you add more GPU probes to the next boot", then "the next boot has a huge list of things to test?" —
+the second of which makes the next boot a FULL desktop session first and the GPU probe LAST.** Rungs 4a+4b
+flew once (2026-09-12T00:21Z, ledger A51, `docs/dev/evidence/orin27/ga10b4ab-boot1.log`) and answered the one
+question they asked. Each further boot spends a power cycle on the ignition, so the next boot repeats 4a+4b
+unchanged and wraps them in **rung 4c: more READ-ONLY probes around the ignition**, so one boot answers more
+of §7's open questions and pre-surveys rung 5. 4c adds **zero write classes**: 4b's seven BCR writes, the
+lock, the trigger and the ignition remain the only GA10B writes in the boot, and the flight still ends in
+`SYSTEM_OFF` on every path (4c implies 4b, and 4b ends the machine).
+
+### 10.1 Knob shape
+
+One env knob, now four values (`unaos/arroyo`; Cargo features `ga10bprobe4c = ["ga10bprobe4b"]`,
+`ga10bprobe4d = ["ga10bprobe4c"]`, both DEFAULT OFF):
+
+| `UNAOS_GA10B_PROBE4=` | features | what the boot does |
+|---|---|---|
+| `1` | `4a` | 4a alone, RETURNS to the desktop (unchanged) |
+| `2` | `4a 4b` | 4a then the ignition, `SYSTEM_OFF` before the desktop (unchanged — the flown shape) |
+| `3` | `4a 4b 4c` | 4a, 4c pass 1, 4b, 4c pass 2, `SYSTEM_OFF` before the desktop |
+| `4` | `4a 4b 4c 4d` | **DEFERRED**: the post-heap-init call arms a flag and RETURNS; the whole desktop session runs; the rung (4a → 4c-1 → 4b → 4c-2) fires when a PSCI `SYSTEM_OFF` is requested, then the OFF |
+| anything else | `4a` | 4a alone — an unexpected value never buys an ignition (the PROBE3 shape) |
+
+**The knob line for the next boot** (Peter's ruling: the fifteen-knob flight line of the last render
+MANIFEST, `~/unaos-bench/flash/orin/render12-20260909T1556Z-1b50376/MANIFEST`, plus `UNAOS_GA10B_PROBE4=4`):
+
+```
+UNAOS_TEGRA=1 UNAOS_TEGRA_EL0=1 UNAOS_WITNESS=1 UNAOS_ORINRENDER=1 UNAOS_DESKCASCADE=1 UNAOS_ORINRX=1 UNAOS_HOLOCRON=1 UNAOS_ORINCLICK=1 UNAOS_TCUPROBE=1 UNAOS_TCURX=1 UNAOS_BSPTICK=1 UNAOS_BSPRUN=1 UNAOS_NET4=1 UNAOS_NET5=1 UNAOS_GA10B_PROBE3=2 UNAOS_GA10B_PROBE4=4 ./arroyo esp-jetson
+```
+
+That line carries `UNAOS_GA10B_PROBE3=2` because render12's did — see §10.7, the one decision this section
+puts to Peter.
+
+### 10.2 The probes — taken, and dropped with the reason
+
+Candidates (a)–(f) from the executor brief, each judged by one test: **can the ACKED facts file bound every
+offset it reads?** (§0; the ladder's provenance table names that file as the source every register offset
+must trace to).
+
+| # | probe | verdict | what it reads | facts-file citation |
+|---|---|---|---|---|
+| (a) | `br_retcode` over TIME | **taken** | 20 samples, 10 ms apart, after 4b's poll exited; every DISTINCT value with its sample index and elapsed ms; bits[31:2] printed as `reason_bits` and OR-ed across the series | §(b) RISC-V boot-ROM interface: `br_retcode 0x65c`, result bits[1:0] |
+| (b) | the full BCR readback AFTER ignition | **taken, folded into (c)'s post pass** | `bcr_ctrl`, `bcr_dmacfg`, the six DMA address registers — each judged `intact=` against the value 4b WROTE (`0x111`, `0x80000002`, the six halves of the window addresses), never against the pre pass | §(b): `bcr_ctrl 0x668`, `bcr_dmacfg 0x66c`, addrs `0x670..0x684` |
+| (c) | the rung-3 readability map re-run post-ignition | **taken, as TWO passes** | rung 3's 25 registers (built from the SAME offset constants rung 3 reads — the cfgs were widened in place, so "same offsets" holds by construction) **plus five**: `top_num_gpcs` (rung 1's), `gsp_falcon_hwcfg2` (rung 1's, 4b's), `priscv_cpuctl` and `priscv_br_retcode` (rung 1's, 4b's), `gsp_falcon_mailbox0` (rung 3b's) — 30 in all, in rung 3's risk order, PRE-ignition (after 4a's restore, before 4b, same bracket) and POST-ignition, each post line carrying `diff=same | changed | became-readable | became-unreadable | written-by-4b` beside its pre value | §(b) Security-state fuses; §(b) Die-characterization; §(b) Legacy Falcon regs; §(b) RISC-V boot-ROM interface; §Aperture framing (PMU falcon2 base). **`mailbox0` is the one non-facts-file offset**: PUBLIC-RECALLED (nouveau `nvkm/falcon`, open-gpu-kernel-modules `dev_falcon_v4.h`, MIT), metal-proven on this die by rung 3b (render11 `MAILBOX-HELD` — a WRITE and a read of that exact address). A read is strictly less than what 3b already did there; the recalled status is printed on its announce line, as 3b printed it |
+| (d) | mailbox0/mailbox1 and ROM-written status registers | **mailbox0 taken (in (c)); mailbox1 DROPPED; "status/debuginfo" DROPPED** | — | The facts file names NO mailbox and NO ROM status/debuginfo register. `mailbox1` (+0x044) is recalled only and has never been touched on this die: no metal proof, no facts-file line — dropped. The only ROM-written word the facts file names is `br_retcode` itself, which (a) covers |
+| (e) | our DMA window post-ignition | **taken** | a CPU read (through the rung's own Normal-NC mapping — DRAM, not a GPU register) of the first four words at `fmccode` (+0), `fmcdata` (+512 KiB) and `pkcparam` (+1 MiB), then a scan of every word of the 2 MiB window against the fill pattern `0x4a10b4a5`: `words_changed=`, `first_changed_off=`, `first_changed_val=` | not a register; the window is 4a's own block (`[ga10b4nc]`), `dsb sy` before the read, no cache games beyond 4a's |
+| (f) | a PRE-ignition census of rung 5's apertures | **taken only where the facts file reaches; the rest DROPPED** | `mc_enable`, `mc_elpg_enable`, `top_device_info_cfg`, `top_num_gpcs` — all in (c)'s pre pass, before 4b, inside the bracket, so an F2 fabric fault after the ignition cannot take them with it | §(b) Die-characterization. **Host FIFO / PBDMA / CE / runlist registers: DROPPED** — the facts file has no offset for any of them (ladder §Rung 5: "UNKNOWN facts — Group A pass"). `mc_device_enable(i)` is named by the facts file as an indexed register but with NO offset — dropped for the same reason |
+| — | `pgsp_falcon_engine` (0x1103c0), `falcon bootvec` (0x104) | **DROPPED** | — | both are in the facts file, but the engine-reset register is a WRITE-class register whose read semantics the file does not state, and `bootvec` was never read by any rung; neither answers a §7 question. Named here so the omission reads as a choice |
+
+**One datum already on the wire that 4c is built to settle.** Rung 1 read `falcon_hwcfg2 = 0x0001b733`;
+4b's post-ignition read (same register, one boot later) was `0x0001a733`: **bit 12 differs.** The facts file
+decodes only bit 13 (priv-lockdown), so bit 12 is unnamed, and whether it moved across the ignition or across
+the weeks between the flights is unmeasured. 4c reads `hwcfg2` in both passes of the same boot; its `diff=`
+answers that directly.
+
+### 10.3 Placement and order on the wire
+
+```
+[ga10bprobe4a] rung 4a … (unchanged)            [ga10bprobe4b] rung 4b ARMED …
+[ga10bprobe4c] rung 4c ARMED … vocabulary …
+[ga10bprobe4a] … bcrheld=7/7 … -> BCR-ALLHELD          (4a, unchanged)
+[ga10bprobe4c] pass 1 — PRE-ignition census …
+[ga10bprobe4c] about-to-read pre-ignition <name> reg=0x… — if this is the LAST line, THAT read was EL3-fatal …
+[ga10bprobe4c] pre-ignition <name> @0x<off> = 0x######## | -UNREADABLE reason=<all-ones|pri-error> val=0x########
+        … ×30 (each address class announced once: pre-ignition address class <class> (KNOWN …)) …
+[ga10bprobe4c] pre-ignition census: readable=<n>/30 unreadable=<n> -> PRECENSUS-DONE
+[ga10bprobe4b] rung 4b — the IGNITION … (unchanged: B0 … B7, the summary, the PASS text)
+[ga10bprobe4c] pass 2 — POST-ignition …
+[ga10bprobe4c] about-to-read series priscv_br_retcode reg=0x1711165c samples=20 settle_ms=10 …
+[ga10bprobe4c] series sample=<i>/20 t_ms=<t> br_retcode=0x######## br_result=0x# reason_bits=0x######## (distinct #<k>)   … one per DISTINCT value
+[ga10bprobe4c] series priscv_br_retcode @0x65c = distinct=<k> first=0x########@<i> last=0x########@<i> reason_bits_or=0x######## samples=20 elapsed_ms=<t> -> BRSERIES-STABLE | BRSERIES-CHANGED | BRSERIES-UNREADABLE
+[ga10bprobe4c] about-to-read post-ignition <name> reg=0x… — …
+[ga10bprobe4c] post-ignition <name> @0x<off> = 0x######## diff=<same|changed|became-readable|became-unreadable|written-by-4b> pre=0x########[ intact=<0|1>]
+[ga10bprobe4c] post-ignition <bcr name> expected=0x######## intact=<0|1>          (the eight 4b wrote)
+        … ×30 …
+[ga10bprobe4c] bcr post-ignition: intact=<n>/8 altered=<n> unreadable=<n> -> POSTBCR-INTACT | POSTBCR-ALTERED | POSTBCR-UNREADABLE
+[ga10bprobe4c] post-ignition census: readable=<n>/30 unreadable=<n> became_readable=<n> became_unreadable=<n> changed=<n> changed_ex_bcr_retcode=<n> pre_done=1 -> MAPDIFF-SAME | MAPDIFF-CHANGED
+[ga10bprobe4c] about-to-read post-ignition dmabuf fmccode pa=0x80200000 … / fmcdata / pkcparam
+[ga10bprobe4c] post-ignition dmabuf fmccode @0x80200000 = 0x######## ×4 (first 4 words; fill pattern=0x4a10b4a5)
+[ga10bprobe4c] about-to-read post-ignition dmabuf-scan pa=0x80200000 size=0x200000 …
+[ga10bprobe4c] post-ignition dmabuf-scan @0x80200000 = words_changed=<n>/524288 first_changed_off=<0x…|none> [first_changed_val=0x########] -> DMABUF-UNTOUCHED | DMABUF-ALTERED
+[ga10bprobe4c] rung 4c complete: reads_announced=<n> reads_answered=<n> (zero writes) -> CENSUS-COMPLETE
+[ga10bprobe4b] flight done — powering OFF …          [pwrshutoff] PSCI SYSTEM_OFF (0x84000008) via SMC …
+```
+
+Pass 1 runs on the rail the explicit `pg` readback proved ON, whatever 4a's census arm was (a read needs
+only the rail; the two 4a arms that end the machine, SELFLOCKED and STICKY, do so before pass 1 and are
+recorded as such). If the rail was not proven ON, pass 1 prints `-> PRECENSUS-SKIPPED reason=pg-not-on` and
+reads nothing. Pass 2 runs only on the path where the ignition was issued; on `IGNITION-SKIPPED` and
+`BCR-CTRL-REFUSED` 4b ends the machine as before and there is nothing to census. `MAPDIFF-SAME` means: no
+register changed readability and no value moved except the eight 4b wrote and the verdict register.
+
+**Vocabulary** (every 4c summary line ends in one; no arm is a prefix or substring of another or of any
+4a/4b arm, and no 4c line carries ` wrote=0x` or `about-to-WRITE ` — the 4a/4b scorer's write-accounting
+tokens, so the flown rungs score exactly as before on a 4c capture):
+`PRECENSUS-DONE | PRECENSUS-SKIPPED ; BRSERIES-STABLE | BRSERIES-CHANGED | BRSERIES-UNREADABLE ;
+POSTBCR-INTACT | POSTBCR-ALTERED | POSTBCR-UNREADABLE ; MAPDIFF-SAME | MAPDIFF-CHANGED ;
+DMABUF-UNTOUCHED | DMABUF-ALTERED ; CENSUS-COMPLETE`.
+
+### 10.4 The deferred arm (`=4`): the desktop first, the rung last
+
+Peter, 2026-09-12: the next boot must run the full desktop first and the GPU probe last, so one boot carries
+the render13 glass checks and rungs 4a+4b+4c. Mechanism (`ga10bprobe4d`):
+
+- **Arm.** The post-heap-init call (`main.rs`, unchanged) still calls `ga10b_probe::ga10bprobe4_run`; under
+  `ga10bprobe4d` that entry stashes `dtb_addr`, `dtb_size`, `ram_gib_mask` and a whole-blob DTB checksum in
+  statics, sets an `AtomicBool`, prints `[ga10bprobe4d] DEFERRED ARM …` and RETURNS. Nothing else changes at
+  boot: no BPMP transaction, no BAR0 touch, the desktop comes up.
+- **Trigger.** `power::psci_call` — the ONE function every PSCI `SYSTEM_OFF` on this board goes through
+  (`power::shutdown()` for the shell's `shutdown`/`off`, `power::crystal_shutdown()` for the crystal menu's
+  Shut Down, and a probe's own `finish4`) — calls `ga10b_probe::ga10bprobe4_deferred_run()` (no arguments)
+  when the function id is `SYSTEM_OFF`, before the SMC. The call is appended to an existing line, cfg-gated,
+  so knob-off it is erased and no `panic::Location` moves. The crystal route does **not** pass through
+  `power::shutdown()` (A34's fix gave it its own `[crystal]`-family terminus), which is why the hook sits in
+  `psci_call` and not in `shutdown()`. `SYSTEM_RESET` (Restart / `reboot`) does NOT trigger it: after 4b's
+  lock the next boot must be cold, and a warm reset would hand the next boot a locked BCR.
+- **Run.** The flag is CONSUMED on entry (so the rung's own `finish4 → shutdown → psci_call` re-entry falls
+  straight through to the OFF). DAIF is masked on the calling core. The first line names the arm and the
+  trigger (`[ga10bprobe4d] DEFERRED RUN — triggered by a PSCI SYSTEM_OFF request reaching power::psci_call
+  …`; the `[pwrshutoff]`/`[crystal]` line above it names the route). The DTB checksum is re-taken and
+  compared (`REFUSED reason=dtb-changed`, zero MMIO, on a mismatch); the BPMP channel is re-derived with
+  `bpmp_geometry` + `chan_reopen` from the same DTB geometry as at boot; then `ga10bprobe4_body` runs
+  4a → 4c-1 → 4b → 4c-2 exactly as at boot — 4a's bracket (pg pre-state, explicit ON readback, clock census)
+  is re-proven from BPMP at that moment; nothing is inherited from boot except the three DTB coordinates —
+  and 4b's `finish4` ends the machine. Any refusal prints why and RETURNS so the OFF it interrupted proceeds.
+- **Stated assumptions (concurrency).** At shutdown time the other cores are hosting (apsrun). The design
+  assumes (1) nothing after boot uses the BPMP channel — every in-tree BPMP user (`sdmmc_tegra` CLKPROOF,
+  `xusb_tegra`, `display_tegra`, the probe rungs) runs during init, `population=grep -rln 'bpmp_tegra::'
+  unaos/crates/kernel/src`, and none holds a channel afterwards; (2) nothing touches the GPU aperture at
+  all — `population=grep -rn '0x1700_0000\|0x17000000' unaos/crates/kernel/src --include=*.rs` outside
+  `ga10b_probe.rs`, `hits=0`; (3) the DTB blob is untouched after boot — the aarch64 path has no frame
+  allocator (the heap is a fixed window) and the checksum turns this from an assumption into a measurement;
+  (4) the serial lock and `chan.transfer`'s 100 ms bound behave under DAIF-masked polling as they do at
+  boot. The other cores are not stopped: a PSCI `SYSTEM_OFF` is a whole-system OFF whatever they are doing,
+  and the rung's ~3 s of announced reads on one core changes nothing they touch.
+
+### 10.5 The bounding table (§4 form: the sibling each new witness must exclude, two wires each)
+
+| # | new witness | the SIBLING it must exclude | the naive bound and why it FAILS | the bound that HOLDS | how each is proven to fire |
+|---|---|---|---|---|---|
+| **E** | `[ga10bprobe4c] post-ignition gsp_falcon_cpuctl_v1 @0x110100 = …` (the generalised oracle) | `[ga10bprobe4b] post-ignition gsp_falcon_cpuctl_v1` (4b's own D-row line, same capture) and `[ga10bprobe4c] pre-ignition gsp_falcon_cpuctl_v1` | `index($0,"post-ignition gsp_falcon_cpuctl_v1")` hits 4b's line too and breaks the D row's "exactly one" | the family token is INSIDE the bound: `index($0,"[ga10bprobe4c] post-ignition …")`; 4b's D-row bound already carries `[ga10bprobe4b]` and is untouched — measured: the orin26 scorer's `4b` still reports `post-ignition v1 lines = 1` on the expected-4c wire | **sibling wire:** the real 4a+4b capture → the 4c rung returns NO VERDICT (exit 2), and `4b` still PASSes. **real wire:** the expected-4c wire → `4c` exit 0, `4a`/`4b` exit 0 |
+| **F** | 4c read accounting: `[ga10bprobe4c] about-to-read ` vs its result lines | 4a/4b's `about-to-read ` (the same token, other families) and 4c's own non-result lines (class announces, distinct-sample lines, `expected= intact=` lines) | counting `about-to-read ` alone conflates the three families; counting ` = ` alone hits the ARMED prose | announces: `index($0,"[ga10bprobe4c] about-to-read ")`; results: `index($0,"[ga10bprobe4c]") && index($0," @0x") && index($0," = ")` — every 4c read prints exactly one line of that shape and no other 4c line has ` @0x` | **sibling:** delete one result line (fixture `m1-no-result`) → exit 1. **real:** expected-4c wire → `read_announces == read_results`, exit 0 |
+| **G** | `-> CENSUS-COMPLETE` (the rung's terminal) | a truncated capture whose last 4c line is an announce (the F1 hang), and a capture missing the line | "any 4c line present" would pass a hang | exactly one `[ga10bprobe4c] … -> CENSUS-COMPLETE`, AND the orin26 STOP-check (last `[ga10bprobe4*]` line is not an announce — it already matches the 4c family by its `[ga10bprobe4` prefix), AND ≥1 `PSCI SYSTEM_OFF (0x84000008) via SMC` | **sibling:** `m3-hang` (truncated at a 4c announce) → exit 1; `m4-no-complete` → exit 1; `m2-no-off` → exit 1. **real:** exit 0 |
+| **H** | the ` wrote=0x` write-accounting token of the 4a/4b scorer | 4c's BCR readback lines, which print what 4b wrote | printing `wrote=0x…` on a 4c line would inflate `write_results` and red the flown rungs' STOP-check | 4c prints `expected=0x…` and never ` wrote=0x` or `about-to-WRITE ` | measured: `4a`/`4b` exit 0 on the expected-4c wire (`write_announces=23 = write_results=23`) |
+
+Executed before the flight, from files, capturing the scorer's own exit code (never a pipeline's last stage):
+`docs/dev/evidence/orin27/scorer-ga10b4.sh --selftest docs/dev/evidence/orin27/ga10b4ab-boot1.log` builds
+the expected-4c wire by splicing the §10.3 lines into a copy of the real capture before its `[pwrshutoff]`
+lines, mutates it four ways, and scores six cases: `real-4a4b-only → 2`, `expected-4c → 0`, `m1-no-result
+→ 1`, `m2-no-off → 1`, `m3-hang → 1`, `m4-no-complete → 1`. The orin26 scorer is untouched.
+
+### 10.6 Fail shapes, named ahead (R19: each is "failed under \<conditions\>", knob and code kept)
+
+| id | shape on the wire | reading | what happens |
+|---|---|---|---|
+| **F10** | the last `[ga10bprobe4c]` line is `about-to-read pre-ignition <name> …` | a register readable on render11 became EL3-fatal in the post-4a state (rung 3's classes are all KNOWN; the only register never read pre-reset on this die is `mailbox0`, and its announce says so) | STOP; the announce names the register; re-run with it removed (the removal is the datum). 4b never ran: the power cycle is NOT spent |
+| **F11** | the last line is a `post-ignition` announce | the register became fatal after the ignition — the F2 family at register granularity | STOP; record the register; the ignition already spent the cycle, so the next boot is cold either way |
+| **F12** | `PRECENSUS-DONE` with `unreadable≠9` (of the 25) | the readability map differs from render11's before anything was ignited (a firmware update, or 4a's writes changed the map) | a datum, not a stop; the per-register lines are the product |
+| **F13** | `BRSERIES-CHANGED` | the verdict moved after 4b read it (the ROM re-ran, or the upper bits latched later) | a datum: the distinct lines carry index and time |
+| **F14** | `POSTBCR-ALTERED` | the ROM (or the lock) rewrote its own descriptor — the BCR is not a passive mailbox | a datum for rung 5's design; `MAPDIFF` still scores the rest |
+| **F15** | `DMABUF-ALTERED` | something wrote into the window: the ROM DMA'd INTO it (a status block, a manifest echo), or the NSDRAM-encryption confound (§2.3) surfaces as scrambled bytes | `first_changed_off`/`_val` locate it; the next rung reads the whole changed span |
+| **F16** | `[ga10bprobe4d] DEFERRED ARM` printed, no `DEFERRED RUN` ever printed | the session ended without a `SYSTEM_OFF` request (power cut, a `reboot`, a hang elsewhere) | the rung did not run and nothing was spent; the next boot is warm-safe |
+| **F17** | `DEFERRED RUN` then `REFUSED reason=dtb-changed` | the DTB blob moved after boot | zero MMIO; the OFF proceeds; the assumption in §10.4 (3) is falsified and becomes the finding |
+| **F18** | `DEFERRED RUN` then 4a `REFUSED reason=pg-*` | BPMP would not answer or prove the rail at shutdown time (the channel state after a full session differs from boot) | zero BAR0 touch; the OFF proceeds; the `=3` immediate shape is the fallback for the boot after |
+
+### 10.7 Questions only Peter can answer
+
+None block the build. One decision rides on the knob line:
+
+1. **`UNAOS_GA10B_PROBE3=2` in the fifteen-knob line.** render12's line carries it, so the line ruled for the
+   next boot runs rungs 3 and **3b** at boot — 3b asserts and deasserts a GSP engine reset and writes
+   `MAILBOX0` — hours before the deferred rung 4 runs. The flown 4a+4b boot ran WITHOUT `PROBE3` (§3's
+   recipe, `# KNOBS: UNAOS_GA10B_PROBE4=2`), and no rung-4 flight has been measured from a post-reset engine
+   state. Recommendation: **drop `UNAOS_GA10B_PROBE3=2` from the line** — rung 3's data are already in hand
+   (render8, render11) and 4c's pass 1 re-reads all 25 of its registers in the same boot, so nothing is lost,
+   and 4c's diff is then measured against the same pre-ignition state the flown boot had. Keeping it is
+   also defensible (one boot, more data) — but then the 4c baseline is "post-3b-reset", and the report must
+   say so. The line in §10.1 is Peter's ruling as given; the executor changed nothing in it.
+
+### 10.8 Verification posture of this section
+
+`UNAOS_TEGRA=1 UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` and the same without `UNAOS_TEGRA`
+(the `arm-tegra-ga10bprobe4c` / `arm-tegra-ga10bprobe4d` legs type-check the two new polarities; the
+`arm-tegra-ga10bprobe3` leg still compiles the widened constants without 4c); `./arroyo knoboff ga10bprobe4c`
+(the knob-off loadable images against the baseline); `UNAOS_GA10B_PROBE4=3` and `=4 ./arroyo esp-jetson` with
+`LC_ALL=C grep -a -o -F '[ga10bprobe4c]' target/aarch64_esp/kernel.elf | wc -l` (the witness family reachable
+in the flight artifact, not merely compiled); the scorer selftest above. No QEMU models the Jetson; a green
+here certifies that it compiles and links (LAWS §Gates). Exit codes are in the commit and ledger A55.
