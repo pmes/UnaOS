@@ -1068,6 +1068,17 @@ fi
 #                            of 0x111; SYSTEM_OFF as `=2` (brief §12). NEITHER arm adds a write class, a
 #                            register or an address class, and NEITHER carries rung 4c: `=5`/`=6` are the
 #                            `=2` wire plus one tag (`shift=8` / `brfetch=false`) on the verdict lines.
+#   UNAOS_GA10B_PROBE4=7  -> `ga10bprobe4a` + `4b` + `4c` + `ga10bprobe4d` + `ga10bprobe4e` — RUNG 4e
+#                            DEFERRED to the shutdown path: `=4`'s deferral around `=5`'s body, so ONE
+#                            glass boot runs the FULL desktop and ENDS in the GPU test on Shut Down,
+#                            with the six BCR DMA addresses written `pa >> 8` and 4c's census carried.
+#                            It is `=4`'s feature set plus `ga10bprobe4e` and NOT a third code path:
+#                            `ga10bprobe4_run` is what defers, `ga10bprobe4_body` is what it defers,
+#                            and `ga10bprobe4e` re-encodes the body. The immediate `=5` arm STAYS —
+#                            `=7` does not replace it (brief §12.8). Boot prints `[ga10bprobe4d]
+#                            DEFERRED ARM` (which names `=4`, being `=4`'s own line byte for byte) and
+#                            then `[ga10bprobe4e] rung 4e DEFERRED (UNAOS_GA10B_PROBE4=7)`, which is
+#                            the correction a reader keys on.
 # Any other non-empty value arms 4a alone: an unexpected value never buys an ignition (the PROBE3
 # shape, verbatim). `arch/aarch64/ga10b_probe.rs::ga10bprobe4_run`, an appended statement in
 # `tegra_early_stop`'s BPMP block between rung 3's call and rung 1's. A FOURTH sibling of the probe
@@ -1078,7 +1089,9 @@ fi
 # `arm-tegra-ga10bprobe4c` / `arm-tegra-ga10bprobe4d` / `arm-tegra-ga10bprobe4e` /
 # `arm-tegra-ga10bprobe4f` legs of KERNEL_CFG_MATRIX — the last two are REQUIRED, not optional: this
 # gate's own knob→leg coverage check reds on a declared feature with aarch64-qualified `#[cfg]` sites
-# that no leg names. Witness families: `[ga10bprobe4a]`, `[ga10bprobe4b]`, `[ga10bprobe4c]`,
+# that no leg names. `=7` needs NO seventh leg: it declares no new feature, so that gate has nothing new
+# to cover, and its 4d+4e COMBINATION is type-checked by its own `esp-jetson` build (brief §12.8).
+# Witness families: `[ga10bprobe4a]`, `[ga10bprobe4b]`, `[ga10bprobe4c]`,
 # `[ga10bprobe4d]`, `[ga10bprobe4e]`, `[ga10bprobe4f]`.
 [ -n "${UNAOS_GA10B_PROBE4:-}" ] && _feats="${_feats}ga10bprobe4a,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "2" ] && _feats="${_feats}ga10bprobe4b,"
@@ -1086,6 +1099,7 @@ fi
 [ "${UNAOS_GA10B_PROBE4:-}" = "4" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,ga10bprobe4d,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "5" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4e,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "6" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4f,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "7" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,ga10bprobe4d,ga10bprobe4e,"
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —

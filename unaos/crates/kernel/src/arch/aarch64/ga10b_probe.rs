@@ -6,7 +6,7 @@
 // GA10B-PROBE3, rungs 3 and 3b — the read-only pass over what the platform firmware left behind, and the
 // ladder's first GA10B MMIO writes — lives after it under `ga10bprobe3` / `ga10bprobe3b`;
 // see the ladder docs/dev/evidence/orin14/GA10B-LADDER.md and the as-built spec
-// docs/dev/evidence/orin16/GA10B-RUNG3.md. Everything above the rung-2 marker is rung 1. GA10B-PROBE4, rungs 4a and 4b — the BCR writability census and the blob-free boot-ROM ignition — is the LAST block of this file under `ga10bprobe4a` / `ga10bprobe4b`; brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md. GA10B-PROBE4C, rung 4c — the read-only post-ignition CENSUS — and GA10B-PROBE4D, the DEFERRED arm that runs 4a+4b+4c from the shutdown path after a full desktop session, are the tail after it under `ga10bprobe4c` / `ga10bprobe4d`; brief §10. GA10B-PROBE4E and GA10B-PROBE4F, rungs 4e and 4f — the SHIFT arm and the BRFETCH arm, each the flown rung with exactly ONE value changed — are the VERY LAST block of this file under `ga10bprobe4e` / `ga10bprobe4f`; brief §12.)
+// docs/dev/evidence/orin16/GA10B-RUNG3.md. Everything above the rung-2 marker is rung 1. GA10B-PROBE4, rungs 4a and 4b — the BCR writability census and the blob-free boot-ROM ignition — is the LAST block of this file under `ga10bprobe4a` / `ga10bprobe4b`; brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md. GA10B-PROBE4C, rung 4c — the read-only post-ignition CENSUS — and GA10B-PROBE4D, the DEFERRED arm that runs 4a+4b+4c from the shutdown path after a full desktop session, are the tail after it under `ga10bprobe4c` / `ga10bprobe4d`; brief §10. GA10B-PROBE4E and GA10B-PROBE4F, rungs 4e and 4f — the SHIFT arm and the BRFETCH arm, each the flown rung with exactly ONE value changed — are the VERY LAST block of this file under `ga10bprobe4e` / `ga10bprobe4f`; brief §12. `UNAOS_GA10B_PROBE4=7` is rung 4e DEFERRED — `ga10bprobe4d` and `ga10bprobe4e` together, one all-in-one glass boot that ends in the GPU test on Shut Down, and NO third code path; brief §12.8.)
 // (`ga10bprobe1`, DEFAULT OFF; implies `tegra`). One attended cold-boot flight that answers, without
 // booting one byte of GPU firmware or writing one GPU register: is the GA10B power rail on, has its
 // GSP RISC-V boot ROM ever reached a verdict, and is the block priv-locked? See the design note
@@ -2052,7 +2052,7 @@ fn dtb_sum(addr: u64, size: usize) -> u32 {
     b.iter().fold(0u32, |s, &x| s.wrapping_mul(31).wrapping_add(x as u32))
 }
 
-/// Arm the deferred run (the `=4` boot-time entry): stash the DTB coordinates, print the arm, RETURN.
+/// Arm the deferred run (the `=4` and `=7` boot-time entry): stash the DTB coordinates, print the arm, RETURN.
 #[cfg(feature = "ga10bprobe4d")]
 fn arm_deferred(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     use core::sync::atomic::Ordering;
@@ -2062,7 +2062,7 @@ fn arm_deferred(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     DEF_RAM_MASK.store(ram_gib_mask, Ordering::Relaxed);
     DEF_DTB_SUM.store(sum, Ordering::Relaxed);
     DEFERRED_ARMED.store(true, Ordering::SeqCst);
-    serial_println!("[ga10bprobe4d] DEFERRED ARM (UNAOS_GA10B_PROBE4=4): rungs 4a+4b+4c are ARMED for the shutdown path and do NOT run now — the boot continues into the desktop. The rung runs when a PSCI SYSTEM_OFF is requested (shell `shutdown`/`off`, crystal Shut Down), on the requesting core, before the OFF. Stashed dtb={:#x} size={:#x} ram_gib_mask={:#x} dtb_sum={:#010x} (re-verified at flight time; a mismatch REFUSES with zero MMIO). A SYSTEM_RESET (restart) does NOT trigger it; nothing else in the boot touches the GPU aperture or the BPMP channel after this line", dtb_addr, dtb_size, ram_gib_mask, sum);
+    serial_println!("[ga10bprobe4d] DEFERRED ARM (UNAOS_GA10B_PROBE4=4): rungs 4a+4b+4c are ARMED for the shutdown path and do NOT run now — the boot continues into the desktop. The rung runs when a PSCI SYSTEM_OFF is requested (shell `shutdown`/`off`, crystal Shut Down), on the requesting core, before the OFF. Stashed dtb={:#x} size={:#x} ram_gib_mask={:#x} dtb_sum={:#010x} (re-verified at flight time; a mismatch REFUSES with zero MMIO). A SYSTEM_RESET (restart) does NOT trigger it; nothing else in the boot touches the GPU aperture or the BPMP channel after this line", dtb_addr, dtb_size, ram_gib_mask, sum); #[cfg(feature = "ga10bprobe4e")] r4e_deferred_note(); // RUNG 4e DEFERRED (`=7`) names its own value HERE, folded onto this line so the flown `=4` image keeps every byte. Statement first, comment last.
 }
 
 /// The deferred run. Called by `power::psci_call` on every PSCI SYSTEM_OFF request; a no-op unless armed,
@@ -2177,11 +2177,25 @@ fn bcr_write_verify_shift(fam: &str, name: &str, f2: u64, off: u64, val: u32, ra
 /// 4e's ARMED banner, printed from the fold on rung 4a's opening line.
 #[cfg(feature = "ga10bprobe4e")]
 fn r4e_banner() {
-    serial_println!("[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — the FLOWN 4a+4b rung with ONE delta: the six BCR DMA address registers are written shift=8, i.e. pa >> 8, because NVIDIA's published MIT Hopper GSP-FMC bootstrap writes them in 256-byte units. The flown arms wrote them RAW, so if this die's boot ROM shares that encoding the ignition pointed it about 512 GiB above DRAM and the signature wall was never reached (rung-5 brief §1.2, §2.3 cause 5). NOTHING else changes: same registers, same bcr_dmacfg, same bcr_ctrl=0x00000111, same ignition, same bounded poll, same SYSTEM_OFF on every path, no rung 4c. Every address announce carries raw_pa= beside the value written, and the 4a/4b summary lines carry shift=8. WHAT THIS CANNOT DECIDE: br_retcode is not an oracle — a correctly encoded but UNSIGNED payload returns the same 0x00000002 (rung-5 brief §2.5). The oracles that discriminate are post_lockdown, v1_readable and the DMA-window scan, and all three read the negative side on the flown wire");
+    serial_println!("[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5 immediate, =7 deferred to the shutdown path) — the FLOWN 4a+4b rung with ONE delta: the six BCR DMA address registers are written shift=8, i.e. pa >> 8, because NVIDIA's published MIT Hopper GSP-FMC bootstrap writes them in 256-byte units. The flown arms wrote them RAW, so if this die's boot ROM shares that encoding the ignition pointed it about 512 GiB above DRAM and the signature wall was never reached (rung-5 brief §1.2, §2.3 cause 5). NOTHING else changes: same registers, same bcr_dmacfg, same bcr_ctrl=0x00000111, same ignition, same bounded poll, same SYSTEM_OFF on every path, no rung 4c. Every address announce carries raw_pa= beside the value written, and the 4a/4b summary lines carry shift=8. WHAT THIS CANNOT DECIDE: br_retcode is not an oracle — a correctly encoded but UNSIGNED payload returns the same 0x00000002 (rung-5 brief §2.5). The oracles that discriminate are post_lockdown, v1_readable and the DMA-window scan, and all three read the negative side on the flown wire");
 }
 
 /// 4f's ARMED banner, printed from the same fold.
 #[cfg(feature = "ga10bprobe4f")]
 fn r4f_banner() {
     serial_println!("[ga10bprobe4f] rung 4f ARMED (UNAOS_GA10B_PROBE4=6) — the FLOWN 4a+4b rung with ONE delta: bcr_ctrl is written 0x00000011 instead of 0x00000111, brfetch=false. The MIT GA102 dev_riscv_pri.h decomposes that register exactly — BRFETCH bit 8, CORE_SELECT bit 4, VALID bit 0 — so the platform firmware's leftover 0x00000110 is BRFETCH TRUE + RISCV + NOT VALID, 4b's flown 0x00000111 marked it valid, and 0x00000011 is the ACKED SEQ's alternate set_bcr value: configure the BCR but do not have the boot ROM fetch through it (rung-5 brief §2.2, §6 Q5 — a door named by that brief and taken by nobody). Same register, same address class, no new write. NOTHING else changes: addresses raw as flown, same bcr_dmacfg, same ignition, same bounded poll, same SYSTEM_OFF on every path, no rung 4c. The 4a/4b summary lines carry brfetch=false. NO THEORY IS OFFERED about what the ROM does with BRFETCH FALSE: this arm spends one power cycle to find out, and BCR-CTRL-REFUSED is a real outcome — the register may simply not take the value");
+}
+
+/// RUNG 4e DEFERRED (`UNAOS_GA10B_PROBE4=7`) — the one line the boot prints for the value that has no
+/// banner of its own. `=7` is `=4`'s deferral around `=5`'s body: `ga10bprobe4_run` defers under
+/// `ga10bprobe4d`, `ga10bprobe4_body` is the thing deferred, and `ga10bprobe4e` re-encodes the body's six
+/// address writes — three features that never meet, which is why this value needed no third code path.
+/// The line ABOVE this one on the wire is 4d's own `DEFERRED ARM` announce, and it says `=4` because it
+/// IS `=4`'s line, byte for byte: that string lives inside the flown `=4` image, which this arc must not
+/// move. So the correction is printed BESIDE it rather than into it, from a call folded onto the end of
+/// that same physical line — line-neutral, `ga10bprobe4e`-gated, and compiled by no image but `=7`'s.
+/// Rung 4e's own ARMED banner still fires from `ga10bprobe4_body`, i.e. at SHUTDOWN time on this value.
+#[cfg(all(feature = "ga10bprobe4d", feature = "ga10bprobe4e"))]
+fn r4e_deferred_note() {
+    serial_println!("[ga10bprobe4e] rung 4e DEFERRED (UNAOS_GA10B_PROBE4=7) — the rung this boot armed for the shutdown path is the SHIFT arm: when it fires, the six BCR DMA address registers are written shift=8, i.e. pa >> 8, and the 4a/4b verdict lines carry shift=8. The [ga10bprobe4d] line above names =4 because it is =4's own line unchanged; THE VALUE THAT BUILT THIS IMAGE IS 7, and it carries rung 4c's census exactly as =4 does. The immediate arm is =5; this is that same arm after a full desktop session, and if the two disagree the disagreement is the finding (brief §12.8)");
 }

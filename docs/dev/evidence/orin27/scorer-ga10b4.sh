@@ -15,6 +15,11 @@
 # by the tag the rung prints on its own summary lines: `shift=8` (4e) and `brfetch=false` (4f). 4e also
 # checks the ARITHMETIC — every address write carries `raw_pa=` and the value written must be that address
 # shifted right by 8 — so the leg measures the encoding, not the label.
+# orin-0912b (2026-09-12, ledger A62): `UNAOS_GA10B_PROBE4=7` defers rung 4e to the shutdown path the way
+# `=4` defers the unshifted rung. The `4e` leg needs no new code for it — it keys on tags and arithmetic,
+# never on position, and requires 4c's oracles exactly where the capture carries them — but "needs no new
+# code" is a claim, so the selftest now builds a DEFERRED `=7` wire by composition and scores it on 4a, 4b,
+# 4c and 4e, with an (m8) mutation that must go red on the deferred shape alone. 22 cases.
 # Bounds are the §4 table's: full 10-char `br_retcode=0x########` literals (row A), substring-exclusive
 # arm names (row B), case-sensitive `about-to-WRITE ` / `about-to-read ` with the trailing space (row C),
 # and the `post-ignition ` phase token inside the bound (row D). awk only, LC_ALL=C: control bytes.
@@ -63,7 +68,10 @@ if [ "${1:-}" = "--selftest" ]; then
   # own delta and nothing else. The rung's own dmabuf_pa on that capture is 0x80200000, so the shifted
   # values are the ones a =5 boot of the same board must print.
   E4E="$SCR/expected-4e.log"; E4F="$SCR/expected-4f.log"
-  awk -v BAN="[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — fixture wire: the flown =2 capture with the six BCR DMA addresses re-encoded pa >> 8 and the 4a/4b summary lines tagged shift=8" '
+  # The 4e transformation is a FUNCTION because it is applied TWICE: once to the real `=2` capture,
+  # giving the immediate `=5` wire, and once to the 4c wire on the way to the DEFERRED `=7` wire below.
+  mk4e() { # $1 = the arm's ARMED banner, $2 = the capture to transform
+  awk -v BAN="$1" '
     BEGIN{ raw["fmccode"]="0x80200000"; sh["fmccode"]="0x00802000";
            raw["fmcdata"]="0x80280000"; sh["fmcdata"]="0x00802800";
            raw["pkcparam"]="0x80300000"; sh["pkcparam"]="0x00803000"; pend=0; ban=0 }
@@ -82,7 +90,9 @@ if [ "${1:-}" = "--selftest" ]; then
       if (index(L,"[ga10bprobe4a]") && index(L,"-> BCR-ALLHELD")) sub(/ lock_after=/, " shift=8 lock_after=", L)
       if (index(L,"[ga10bprobe4b]") && index(L,"v1_readable=") && index(L,"samples=")) sub(/ -> /, " shift=8 -> ", L)
       print L
-    }' "$REAL" > "$E4E"
+    }' "$2"
+  }
+  mk4e "[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — fixture wire: the flown =2 capture with the six BCR DMA addresses re-encoded pa >> 8 and the 4a/4b summary lines tagged shift=8" "$REAL" > "$E4E"
   awk -v BAN="[ga10bprobe4f] rung 4f ARMED (UNAOS_GA10B_PROBE4=6) — fixture wire: the flown =2 capture with bcr_ctrl written 0x00000011 and the 4a/4b summary lines tagged brfetch=false" '
     BEGIN{ ban=0 }
     {
@@ -102,6 +112,36 @@ if [ "${1:-}" = "--selftest" ]; then
   awk '{ if (index($0,"[ga10bprobe4b]") && index($0,"v1_readable=") && index($0,"samples=")) sub(/ shift=8 -> /, " -> "); print }' "$E4E" > "$SCR/m5-4e-untagged.log"
   awk '{ if (index($0,"[ga10bprobe4b] priscv_bcr_fmccode_lo @")) sub(/wrote=0x00802000/, "wrote=0x00802001"); print }' "$E4E" > "$SCR/m6-4e-badshift.log"
   awk '{ if (index($0,"[ga10bprobe4b] priscv_bcr_ctrl @")) gsub(/0x00000011/, "0x00000111"); print }' "$E4F" > "$SCR/m7-4f-noctrl.log"
+  # ── The DEFERRED 4e wire (`UNAOS_GA10B_PROBE4=7`, brief §12) ───────────────────────────────────────
+  # `=7` is `=4`'s DEFERRAL wrapped around `=5`'s body: the same shifted rung, plus 4c's census, armed at
+  # boot and fired from the shutdown path after a full desktop session. Everything the 4e leg reads — the
+  # ARMED banner, the `shift=8` tags, the six `raw_pa=` writes and their arithmetic, the post-ignition
+  # reads, SYSTEM_OFF — is the same; only its POSITION in the capture moves. This fixture exists so that
+  # "the 4e leg is position-free" is MEASURED rather than asserted, which is the same reason the 4c leg's
+  # deferred claim is written down at its own case. Built by composition, never hand-typed: the 4e
+  # transformation applied to the 4c wire, then the [pwrshutoff] route lines re-placed BEFORE the rung
+  # with 4d's ARM and RUN lines around them, exactly where a `=7` boot prints them.
+  D4E="$SCR/expected-4g-deferred.log"
+  mk4e "[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5 immediate, =7 deferred to the shutdown path) — fixture wire: the 4c wire with the six BCR DMA addresses re-encoded pa >> 8 and the 4a/4b summary lines tagged shift=8" "$W" > "$SCR/w4e-deferred-body.log"
+  # The capture's OWN two [pwrshutoff] lines are re-used, never re-typed: the verb line moves to just
+  # before the rung (it is what triggered it) and the SMC line to the very end (the OFF the rung
+  # interrupted, taken after it returns). That ordering — route, rung, OFF — is the whole difference
+  # between a `=7` wire and a `=5` one.
+  PWVERB="$(awk 'index($0,"[pwrshutoff]") && index($0,"via SMC")==0 { print; exit }' "$REAL")"
+  PWSMC="$(awk 'index($0,"[pwrshutoff]") && index($0,"via SMC") { print; exit }' "$REAL")"
+  awk -v ARM="[ga10bprobe4d] DEFERRED ARM (UNAOS_GA10B_PROBE4=4): rungs 4a+4b+4c are ARMED for the shutdown path and do NOT run now — the boot continues into the desktop (fixture wire: the =7 value arms this same deferral with rung 4e's encoding)" \
+      -v VERB="$PWVERB" -v SMC="$PWSMC" \
+      -v RUN="[ga10bprobe4d] DEFERRED RUN — triggered by a PSCI SYSTEM_OFF request reaching power::psci_call (the shutdown verb; the [pwrshutoff] or [crystal] line above names the route). Running 4a -> 4b -> 4c NOW, then the SYSTEM_OFF this interrupted" '
+    BEGIN{ armed=0; ran=0 }
+    index($0,"[pwrshutoff]") { next }
+    { if (armed==0) { print ARM; armed=1 }
+      if (ran==0 && index($0,"[ga10bprobe4a]")) { print VERB; print RUN; ran=1 }
+      print }
+    END{ print SMC }' "$SCR/w4e-deferred-body.log" > "$D4E"
+  # (m8) the deferred wire with 4c's CENSUS-COMPLETE removed. 4c IS armed in a `=7` capture, so the 4e
+  #      leg's "armed here, therefore required here" branch must fire — the branch a `=5` wire, which
+  #      carries no 4c at all, can never exercise.
+  awk 'index($0,"-> CENSUS-COMPLETE")==0' "$D4E" > "$SCR/m8-4g-nocensus.log"
   bad=0
   run() { local name="$1" file="$2" rung="$3" want="$4" got; "$ME" "$file" "$rung" > "$SCR/$name.out" 2>&1; got=$?; echo "$name rung=$rung expect=$want got=$got $([ "$got" = "$want" ] && echo OK || echo MISMATCH)"; [ "$got" = "$want" ] || bad=1; }
   run real-4a4b-only "$REAL" 4c 2
@@ -123,6 +163,12 @@ if [ "${1:-}" = "--selftest" ]; then
   # and the flown legs must still score the new wires: an arm is a tag on the SAME rung, not a new rung.
   run expected-4e-as-4a "$E4E" 4a 0
   run expected-4e-as-4b "$E4E" 4b 0
+  # and the DEFERRED `=7` wire scores exactly as the immediate one does, on every leg that can see it.
+  run expected-4g-deferred "$D4E" 4e 0
+  run expected-4g-deferred-as-4c "$D4E" 4c 0
+  run expected-4g-deferred-as-4a "$D4E" 4a 0
+  run expected-4g-deferred-as-4b "$D4E" 4b 0
+  run m8-4g-nocensus "$SCR/m8-4g-nocensus.log" 4e 1
   echo "fixtures: $SCR"; [ $bad = 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"; exit $bad
 fi
 LOG="${1:-}"; RUNG="${2:-4a}"

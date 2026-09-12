@@ -800,10 +800,14 @@ Rung 4f (`=6`) is the flown `=2` wire with four lines different and nothing else
 ```
 UNAOS_TEGRA=1 UNAOS_GA10B_PROBE4=5 ./arroyo esp-jetson     # rung 4e, the SHIFT arm
 UNAOS_TEGRA=1 UNAOS_GA10B_PROBE4=6 ./arroyo esp-jetson     # rung 4f, the BRFETCH arm
+UNAOS_TEGRA=1 UNAOS_GA10B_PROBE4=7 ./arroyo esp-jetson     # rung 4e DEFERRED to the shutdown path (§12.8)
 ```
 
-Each is one attended cold boot ending with the board dark. They are the `=2` line with one digit
-changed, which is the point: everything the flight does differently is in the one value the arm names.
+The first two are each one attended cold boot ending with the board dark. They are the `=2` line with
+one digit changed, which is the point: everything the flight does differently is in the one value the
+arm names. `=7` is the one that goes on the ALL-IN-ONE glass card — the render13 knob line with its
+`UNAOS_GA10B_PROBE4=4` becoming `=7` and nothing else on that line moving — because on that value the
+desktop comes up first and the rung fires on Shut Down.
 
 ### 12.7 Verification posture of this section
 
@@ -820,3 +824,85 @@ and the `=2` and `=4` loadable images are measured byte-identical across the cha
 method — one directory, one pinned `UNAOS_GIT_SHA`, `llvm-objcopy -O binary`, baseline reached by
 `git apply -R` of the snapshotted diff. No QEMU models the Jetson: a green here certifies that it
 compiles and links. Exit codes are in the commit and in ledger A62.
+
+### 12.8 Rung 4e DEFERRED (`=7`) — the one all-in-one glass boot
+
+`UNAOS_GA10B_PROBE4=7` is rung 4e **on the shutdown path**: the boot comes all the way up into the
+desktop, the glass round happens first, and the rung fires when a PSCI `SYSTEM_OFF` is requested — the
+shell `shutdown`/`off` verb, or the crystal's Shut Down item — and the board is dark at the end of it.
+It is §10.4's deferral wrapped around §12.1's encoding, and it exists for one reason: so a single
+attended boot can carry BOTH the glass round and the GPU test, instead of spending a cold boot on each.
+
+**It is not new probe code, and that is the design claim.** The deferral and the encoding were already
+orthogonal, and this value is what proves it: `ga10bprobe4_run` is the thing that defers (under
+`ga10bprobe4d` it stashes the DTB coordinates, arms the flag and RETURNS), `ga10bprobe4_body` is the
+thing deferred, and `ga10bprobe4e` re-encodes the body's six address writes. So `=7` is `=4`'s feature
+set plus `ga10bprobe4e`, with no third code path to keep true:
+
+| value | features | placement | the six BCR DMA addresses | 4c census |
+|---|---|---|---|---|
+| `=2` | 4a+4b | immediate, in `tegra_early_stop` | raw `pa` | no |
+| `=4` | 4a+4b+4c+4d | shutdown path | raw `pa` | yes |
+| `=5` | 4a+4b+4e | immediate, in `tegra_early_stop` | `pa >> 8` | no |
+| `=7` | 4a+4b+4c+4d+4e | shutdown path | `pa >> 8` | yes |
+
+**The immediate `=5` arm STAYS.** `=7` does not replace it. A board that will not survive a desktop
+session, or a sitting where the desktop itself is suspect, still flies the shift arm alone on `=5`, and
+the two wires are scored by the same scorer leg.
+
+**What the wire shows, in order.** Early in the boot, one line from the deferral and one from the arm:
+
+```
+[ga10bprobe4d] DEFERRED ARM (UNAOS_GA10B_PROBE4=4): rungs 4a+4b+4c are ARMED for the shutdown path …
+[ga10bprobe4e] rung 4e DEFERRED (UNAOS_GA10B_PROBE4=7) — the deferred rung is the SHIFT arm …
+```
+
+The first of those two names `=4` because it is `=4`'s own line, byte for byte — the flown deferral is
+not re-worded to make `=7` read better, because that line is inside the `=4` image whose bytes this arc
+must not move. The second line is the correction, and it is the one a reader keys on. Then the desktop
+runs, and nothing else in the boot touches the GPU aperture or the BPMP channel. On Shut Down:
+
+```
+[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism
+[ga10bprobe4d] DEFERRED RUN — triggered by a PSCI SYSTEM_OFF request reaching power::psci_call …
+[ga10bprobe4a] rung 4a (BCR WRITABILITY CENSUS …)
+[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5 immediate, =7 deferred to the shutdown path) …
+[ga10bprobe4c] pass 1 — PRE-ignition census of 30 registers …
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111660 val=0x00802000 raw_pa=0x80200000 shift=8 …
+…
+[ga10bprobe4a] bcrheld=7/7 dmabuf_pa=0x80200000 shift=8 lock_after=0 … -> BCR-ALLHELD
+[ga10bprobe4b] … br_retcode=0x???????? … post_lockdown=? v1_readable=? shift=8 -> BROM-VERDICT-…
+[ga10bprobe4c] … -> POSTBCR-… / MAPDIFF-… / DMABUF-… / CENSUS-COMPLETE
+[pwrshutoff] PSCI SYSTEM_OFF (0x84000008) via SMC — firmware owns the machine from here
+```
+
+which is §12.3b's `=5` wire with 4c's census folded in and the whole block moved behind the shutdown
+verb. Everything the scorer reads — the ARMED banner, the `shift=8` tags on the 4a and 4b summary
+lines, the six `raw_pa=` writes and their arithmetic, the two post-ignition reads, `SYSTEM_OFF` — is
+unchanged; only its POSITION moves.
+
+**Scoring.** `scorer-ga10b4.sh <log> 4e` scores a `=7` capture exactly as it scores a `=5` one: the leg
+keys on tags and arithmetic, never on position, and it requires 4c's oracles precisely where the
+capture carries them — which on `=7`, unlike `=5`, is everywhere. That is a claim, so the selftest
+measures it: a DEFERRED wire is built by composition (the 4e transformation applied to the 4c wire,
+then the capture's own `[pwrshutoff]` verb line re-placed before the rung and its SMC line after it,
+with 4d's ARM and RUN lines around them) and scored on `4a`, `4b`, `4c` and `4e`, all four expecting 0,
+with an `m8` mutation — the same wire with `CENSUS-COMPLETE` removed — that must come out RED on the
+`4e` leg, exercising a branch a `=5` wire can never reach. 22 cases.
+
+**Fail shapes, named ahead** (R19: each is "failed under \<conditions\>", knob and code KEPT).
+
+| shape | what the wire shows | what it means, and what it does not |
+|---|---|---|
+| The deferred run never fires | `DEFERRED ARM` present, no `DEFERRED RUN`, board off | the SYSTEM_OFF did not route through `power::psci_call` — a shutdown path question, not a GPU one; `=5` still answers the encoding question |
+| `REFUSED reason=dtb-changed` | the arm's stashed checksum and the shutdown-time one differ | the desktop session moved or reused the firmware DTB; zero MMIO, the OFF proceeds; re-fly as `=5` |
+| `REFUSED reason=no-bpmp-geometry` / `no-doorbell` | the channel could not be re-derived at shutdown time | the same, from the BPMP side |
+| 4a reaches anything but `BCR-ALLHELD` here, having reached it on `=5` | the census fails only after a desktop session | the desktop DID touch the aperture or the domain — a finding about §10.4's stated assumption, and the reason this value is scored on `4a` as well as `4e` |
+| the rung runs and the board never goes dark | `DEFERRED RUN` present, no SYSTEM_OFF | F2's fabric-RAS shape (§5), now inside the shutdown path; a manual power cut may be needed |
+
+**What `=7` does NOT attempt.** It does not change one register, one value or one bound of rung 4 —
+§12.5's list stands unaltered. It does not make the desktop safe for the GPU aperture; it INHERITS
+§10.4's assumption that nothing between the arm and the shutdown touches it, and the 4a census is what
+would catch that assumption breaking. It does not replace the `=5` boot as the clean answer to the
+encoding question: `=5` is one rung on a quiet machine, `=7` is the same rung after a full session, and
+if the two disagree the disagreement is the finding.
