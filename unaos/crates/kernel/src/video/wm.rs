@@ -26914,14 +26914,14 @@ pub fn focus_after_close(win: WinId, owner: u64, route: &'static str) -> u64 {
 /// ### The legs
 /// * **1 — the close reaps exactly its own row.** `close_owner` returns 1 and the siblings' rows live.
 /// * **2 — THE DEFECT.** Both siblings are still [`above_shell`] after the close's focus handback,
-///   and [`SHELL_Z`] has not moved. This is the leg that REDS against the pre-CLOSEMIN aarch64
-///   router: substitute `focus_changed(0)` for [`focus_after_close`] and both siblings park at
-///   [`PARKED_Z`], `shell_z` jumps, and this leg reports `siblings_visible=false shell_moved=true`.
+///   and [`SHELL_Z`] has not moved. CLOSEFOLD: VUGTAB's shell arm parks nothing, so a close router
+///   that took `focus_changed(0)` now reds on leg 3, not here — this leg is the standing invariant.
 /// * **3 — focus lands on the top-most survivor**, not on the shell and not on the reaped owner.
-/// * **4 — the CONTROL, and it is what makes leg 2 a measurement rather than a tautology.** The
-///   shell arm is then driven DELIBERATELY (`focus_changed(0)`) and both siblings MUST park. A
-///   fixture that can only ever see "visible" would pass over a build in which nothing can hide at
-///   all; this leg proves the instrument can read the other value.
+///   CLOSEFOLD — post-VUGTAB this is the leg that convicts a close router taking the shell arm.
+/// * **4 — the CONTROL, re-aimed at the shell arm VUGTAB actually left behind.** [`SHELL_Z`] is
+///   stored to a LID over both survivors (the shape the pre-VUGTAB arm minted): they must read OFF
+///   the glass — the other value, so legs 2-3 are measurements — and then `focus_changed(0)` must
+///   pull the shell down to a FLOOR under them and bring them BACK. A dead arm leaves the lid.
 ///
 /// Self-cleaning on [`focusvis_selftest`]'s terms: every row it mints is reaped and
 /// [`SHELL_Z`]/[`FOCUS_ASID`] are restored by its caller's own epilogue.
@@ -27001,13 +27001,13 @@ pub fn closemin_selftest() {
         !owner_hidden(&t, ASID_LO, shell) && !owner_hidden(&t, ASID_HI, shell)
     };
 
-    // ── LEG 4: the CONTROL — the shell arm still parks, so leg 2 is a measurement ────────────────
-    focus_changed(0);
-    let control_ok = !onglass(wl) && !onglass(wh);
+    // ── LEG 4: the CONTROL — the shell arm, driven DELIBERATELY from a LID, must UN-bury ─────────
+    let lid = self::info(wl).map(|i| i.z).unwrap_or(0).max(self::info(wh).map(|i| i.z).unwrap_or(0)); SHELL_Z.store(lid, Ordering::Release); let lid_buried = !onglass(wl) && !onglass(wh); // CLOSEFOLD — ⚠ SAME-LINE fold, line-NEUTRAL. `self::` because the enclosing fn binds `let info = fb.info()` above, which shadows the module fn (VUGTAB hit the same shadow in `focusvis_selftest`). The LID is exactly the TOP survivor's own z, so `above_shell`'s strict `r.z > shell` reads BOTH survivors OFF the glass: that is the other value, and reading it is the whole job the pre-VUGTAB `focus_changed(0)`-must-park control used to do. It is seeded here rather than produced by a gesture because no gesture produces it any more — VUGTAB deleted the only one that did.
+    focus_changed(0); let unbury_ok = onglass(wl) && onglass(wh) && shell_z() < lid && { let t = table(); let s = shell_z(); !owner_hidden(&t, ASID_LO, s) && !owner_hidden(&t, ASID_HI, s) }; // CLOSEFOLD — ⚠ SAME-LINE fold, line-NEUTRAL. VUGTAB's arm written as an assertion: the shell becomes a FLOOR one below the lowest live row instead of a LID over them, so the survivors come BACK on the glass with their hidden bits clear. Three ways to red, which is what makes this a control and not a restatement of leg 2: an arm that never ran leaves the lid in place; the pre-VUGTAB arm mints a fresh z ABOVE everything (`shell_z() < lid` fails and both siblings stay buried); an arm that raised but kept publishing `hidden=true` fails `owner_hidden`.
 
-    let ok = base_ok && closed_ok && siblings_visible && !shell_moved && focus_ok && unhidden_ok && control_ok;
+    let ok = base_ok && closed_ok && siblings_visible && !shell_moved && focus_ok && unhidden_ok && lid_buried && unbury_ok;
     serial_println!(
-        "[closemin] close-scope base={} closed={} siblings_visible={} shell_moved={} next_focus={:#x} focus={} unhidden={} shell_arm_control={} -> {}",
+        "[closemin] close-scope base={} closed={} siblings_visible={} shell_moved={} next_focus={:#x} focus={} unhidden={} lid_buried={} shell_arm_unbury={} -> {}",
         base_ok as u8,
         closed_ok as u8,
         siblings_visible as u8,
@@ -27015,7 +27015,7 @@ pub fn closemin_selftest() {
         next,
         focus_ok as u8,
         unhidden_ok as u8,
-        control_ok as u8,
+        lid_buried as u8, unbury_ok as u8, // CLOSEFOLD — ⚠ SAME-LINE fold, line-NEUTRAL: leg 4 now reports TWO readings, and folding the second onto this line keeps `video/wm.rs` at the line count it had at the fold, so no `panic::Location` below this point moves.
         if ok { "PASS" } else { "FAIL" }
     );
 
