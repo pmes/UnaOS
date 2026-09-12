@@ -216,6 +216,89 @@ pub fn csd_capacity_selftest() {
     );
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// SDARG — the card ARGUMENT builder, PURE, and deliberately outside `mod metal` for the same reason
+// the CSD decode is (ledger A57).
+//
+// Every data command in this file (CMD17, CMD18, CMD24, CMD25) carries one 32-bit argument, and what
+// that argument MEANS depends on the card: a block-addressed (SDHC/SDXC) card is addressed in SECTORS,
+// a byte-addressed (SDSC) card in BYTES. SIX sites built it, and four of them built it as
+// `(lba * 512) as u32` — which does not fail when the byte offset leaves 32 bits, it WRAPS. LBA
+// 8,388,608 (exactly 4 GiB) times 512 is 2^32, and `as u32` turns that into 0: a read that returns the
+// boot sector as if it were the requested sector, and a write that overwrites the boot sector with no
+// error anywhere. The other two (`read_block_ro` and the `sdmmcwrite` probe's `write_block_probe`)
+// already did it checked — and that they are two identical CORRECT copies is the same defect one step
+// earlier, because a seventh caller would have had three shapes to copy from. This is that checked
+// shape, hoisted to ONE definition all six call, and gatable off metal so QEMU can execute it.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The 32-bit card argument for a data command at `lba`, or `None` if this card cannot address that
+/// sector at all. A refusal, never a wrap — see the section header for what the wrap did.
+///
+/// * **Byte addressing (SDSC)** — the argument is a BYTE offset, so the addressable range tops out at
+///   `u32::MAX` bytes: the last expressible sector is LBA 8,388,607 (argument `0xffff_fe00`) and LBA
+///   8,388,608 is 4 GiB, which is off the end. `checked_mul` also covers the `u64` overflow an absurd
+///   LBA would otherwise produce, so there is no input that reaches the multiply unguarded.
+/// * **Block addressing (SDHC/SDXC)** — the argument IS the sector number, so the ceiling is
+///   `u32::MAX` sectors (2 TiB). Above that the truncation would be just as silent.
+///
+/// Pure: no MMIO, no allocation, no card. `sd_block_arg_selftest` is its known-answer test and runs on
+/// QEMU virt, which is the only place any of this file's arithmetic can be executed off metal.
+fn sd_block_arg(block_addressing: bool, lba: u64) -> Option<u32> {
+    if block_addressing {
+        if lba > u32::MAX as u64 {
+            return None;
+        }
+        Some(lba as u32)
+    } else {
+        match lba.checked_mul(512) {
+            Some(b) if b <= u32::MAX as u64 => Some(b as u32),
+            _ => None,
+        }
+    }
+}
+
+/// SDARG fixture (ledger A57): the card-argument builder's known-answer tests. Runs on ANY `sdmmc`
+/// build — metal or QEMU virt — because it touches no controller, which is the whole reason the
+/// builder was factored out. One uncounted `:: SDARG: … ::` line; no MMIO, no allocation, no card.
+///
+/// Two positive vectors, each the LAST value its arm can express, because an off-by-one at the ceiling
+/// is exactly the defect class here:
+///
+/// * **byte-last** — LBA 8,388,607 on a byte-addressed card ⇒ `0xffff_fe00`. One sector further is the
+///   4 GiB ceiling.
+/// * **blk-last** — LBA 4,294,967,295 on a block-addressed card ⇒ `0xffff_ffff`.
+///
+/// Four negative controls, and they are the point of the fixture rather than ballast: LBA 8,388,608
+/// byte-addressed (exactly 4 GiB — the value whose wrap is `0`, i.e. THE BOOT SECTOR), one beyond it,
+/// a `u64` that overflows the multiply outright, and LBA 2^32 block-addressed. Without them a builder
+/// that returned a number for every input would pass: the corpus has to be able to produce more than
+/// one outcome.
+///
+/// The wrap is also SHOWN, not merely refused: `wrapto=` prints what the old `(lba * 512) as u32`
+/// expression would have handed the controller for the 4 GiB case, computed here with an explicit
+/// `wrapping_mul` so the number on the wire is the defect itself and not a claim about it.
+#[cfg(feature = "witness")]
+pub fn sd_block_arg_selftest() {
+    let byte_last = sd_block_arg(false, 8_388_607);
+    let blk_last = sd_block_arg(true, u32::MAX as u64);
+    let refused = sd_block_arg(false, 8_388_608).is_none() as u32
+        + sd_block_arg(false, 8_388_609).is_none() as u32
+        + sd_block_arg(false, u64::MAX).is_none() as u32
+        + sd_block_arg(true, 1u64 << 32).is_none() as u32;
+    // What the four unchecked sites used to compute for the first refused vector.
+    let wrapto = (8_388_608u64.wrapping_mul(512)) as u32;
+    let pass = byte_last == Some(0xffff_fe00) && blk_last == Some(0xffff_ffff) && refused == 4;
+    serial_println!(
+        ":: SDARG: byte-last={:#010x} blk-last={:#010x} refused={}/4 wrapto={:#010x} -> {} ::",
+        byte_last.unwrap_or(0),
+        blk_last.unwrap_or(0),
+        refused,
+        wrapto,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
 // ── The witness half (virt / non-tegra build): one honest line, zero MMIO ──────────────────────────
 
 /// The QEMU-safe witness: on a `sdmmc`-but-not-`tegra` build (QEMU models no Tegra234 SDMMC controller),
@@ -232,6 +315,11 @@ pub fn sdmmc_census(_dtb_addr: u64, _dtb_size: usize, _ram_gib_mask: u64) {
     // virt build, because this is the only place the ladder's arithmetic can be gated off metal.
     #[cfg(feature = "witness")]
     csd_capacity_selftest();
+    // SDARG (A57): the card-argument builder's KATs — the SECOND piece of this file's arithmetic that
+    // is a function of bits rather than of a controller, and the one whose wrong answer is a silent
+    // read or write of the wrong sector. Same reason, same place.
+    #[cfg(feature = "witness")]
+    sd_block_arg_selftest();
     // ORIN-SDMMC-2: when the write ARM is compiled in on a virt build, one honest metal-only line — the
     // paranoia ladder touches a real Tegra234 SDMMC controller QEMU does not model, so there is nothing to
     // write here and we do zero MMIO. Mirrors the census witness above.
@@ -1063,17 +1151,17 @@ mod metal {
     fn read_block_ro(base: u64, block_addressing: bool, lba: u64, buf: &mut [u8; 512]) -> bool {
         // SDSC (byte addressing) can only express a 32-bit byte offset, so it tops out at 4 GiB; the
         // multiply is checked rather than wrapped, and an out-of-range LBA is a refusal, not a read of
-        // some other sector.
-        let arg = if block_addressing {
-            if lba > u32::MAX as u64 {
-                return false;
-            }
-            lba as u32
-        } else {
-            match lba.checked_mul(512) {
-                Some(b) if b <= u32::MAX as u64 => b as u32,
-                _ => return false,
-            }
+        // some other sector. A57: this used to be the ONLY checked site and it is now the shared one —
+        // `super::sd_block_arg` is this very expression, hoisted so the other five cannot diverge from
+        // it (they had, and the refusal is no longer silent either).
+        let Some(arg) = super::sd_block_arg(block_addressing, lba) else {
+            serial_println!(
+                "{}   SDBLK: LBA {} is not addressable on this card ({}) -> REFUSED, no command issued ::",
+                PS,
+                lba,
+                if block_addressing { "sector arg > u32::MAX" } else { "byte arg past the 4 GiB ceiling" }
+            );
+            return false;
         };
 
         write32(base, INTERRUPT, 0xffff_ffff);
@@ -1204,7 +1292,11 @@ mod metal {
     /// arm-gated so the rung-1 read path is untouched). READ-ONLY. Returns whether the block was read.
     #[cfg(feature = "sdmmc_arm")]
     fn read_block_at(base: u64, card: &Card, lba: u64, buf: &mut [u8; 512]) -> bool {
-        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        // A57: checked, shared with the other five sites. See `super::sd_block_arg`.
+        let Some(arg) = super::sd_block_arg(card.block_addressing, lba) else {
+            serial_println!("{}   ladder: CMD17 (READ LBA {}) REFUSED — not addressable on this card (A57) ::", PS, lba);
+            return false;
+        };
         write32(base, INTERRUPT, 0xffff_ffff);
         write32(base, BLKSIZECNT, (1 << 16) | 512);
         if send_command(
@@ -1275,7 +1367,13 @@ mod metal {
     /// only under `sdmmc_arm`, only against a stashed scratch region.
     #[cfg(feature = "sdmmc_arm")]
     fn write_block_at(base: u64, card: &Card, lba: u64, buf: &[u8; 512]) -> bool {
-        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        // A57: checked, shared with the other five sites. This is the site the row is ABOUT — a wrapped
+        // write argument overwrites a sector nothing will connect back to this call. See
+        // `super::sd_block_arg`.
+        let Some(arg) = super::sd_block_arg(card.block_addressing, lba) else {
+            serial_println!("{}   ladder: CMD24 (WRITE LBA {}) REFUSED — not addressable on this card (A57) ::", PS, lba);
+            return false;
+        };
         write32(base, INTERRUPT, 0xffff_ffff);
         write32(base, BLKSIZECNT, (1 << 16) | 512);
         // CMD24 WRITE_SINGLE_BLOCK: R1 + data present, host->card (DAT_DIR_READ clear).
@@ -1547,7 +1645,12 @@ mod metal {
     #[cfg(feature = "install_target")]
     fn read_blocks_at(base: u64, card: &Card, lba: u64, buf: &mut [u8], count: u32) -> bool {
         debug_assert!(buf.len() == count as usize * 512);
-        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        // A57: checked, shared with the other five sites. The COUNTED forms address the FIRST sector of
+        // the run here; the controller walks the rest, so a refusal at the head refuses the whole run.
+        let Some(arg) = super::sd_block_arg(card.block_addressing, lba) else {
+            serial_println!("{}   mb: CMD18 (READ {} blk @LBA {}) REFUSED — not addressable on this card (A57) ::", PS, count, lba);
+            return false;
+        };
         write32(base, INTERRUPT, 0xffff_ffff);
         write32(base, BLKSIZECNT, (count << 16) | 512);
         if send_command(
@@ -1607,7 +1710,12 @@ mod metal {
     #[cfg(feature = "install_target")]
     fn write_blocks_at(base: u64, card: &Card, lba: u64, buf: &[u8], count: u32) -> bool {
         debug_assert!(buf.len() == count as usize * 512);
-        let arg = if card.block_addressing { lba as u32 } else { (lba * 512) as u32 };
+        // A57: checked, shared with the other five sites. The counted WRITE is the worst of the four —
+        // a wrapped head argument walks `count` sectors of someone else's data. See `super::sd_block_arg`.
+        let Some(arg) = super::sd_block_arg(card.block_addressing, lba) else {
+            serial_println!("{}   mb: CMD25 (WRITE {} blk @LBA {}) REFUSED — not addressable on this card (A57) ::", PS, count, lba);
+            return false;
+        };
         write32(base, INTERRUPT, 0xffff_ffff);
         write32(base, BLKSIZECNT, (count << 16) | 512);
         // CMD25 WRITE_MULTIPLE_BLOCK: host->card (DAT_DIR_READ clear) + block-count + multi-block + auto-CMD12.
@@ -2875,6 +2983,11 @@ mod metal {
         // below calls, so an armed metal boot certifies its own arithmetic before it touches a card.
         #[cfg(feature = "witness")]
         super::csd_capacity_selftest();
+        // SDARG (A57): likewise, and for a stronger reason — every data command this census and every
+        // path below it issues gets its argument from `super::sd_block_arg`, so a metal boot certifies
+        // the addressing arithmetic before the first CMD17 rather than after a wrong sector comes back.
+        #[cfg(feature = "witness")]
+        super::sd_block_arg_selftest();
 
         // ── M1: resolve the microSD-slot controller from the live DTB ──
         let Some((base, size, clk_ids, n_clks)) = resolve_microsd(dtb_addr, dtb_size, ram_gib_mask) else {
@@ -3468,16 +3581,12 @@ mod metal {
     /// No DMA, no bus-width change, no clock change, no vendor register.
     #[cfg(feature = "sdmmcwrite")]
     fn write_block_probe(base: u64, blk: bool, lba: u64, buf: &[u8; 512]) -> Result<u64, (&'static str, u32)> {
-        let arg = if blk {
-            if lba > u32::MAX as u64 {
-                return Err(("lba-out-of-range", 0));
-            }
-            lba as u32
-        } else {
-            match lba.checked_mul(512) {
-                Some(b) if b <= u32::MAX as u64 => b as u32,
-                _ => return Err(("lba-out-of-range", 0)),
-            }
+        // A57: the SIXTH copy of this expression, and it was already checked — folded onto the one
+        // definition anyway, because the row's own instruction was to make a sixth caller impossible and
+        // a correct duplicate is still a duplicate. The refusal STRING is unchanged, so the probe's wire
+        // shape does not move.
+        let Some(arg) = super::sd_block_arg(blk, lba) else {
+            return Err(("lba-out-of-range", 0));
         };
         let t0 = crate::arch::timer::cntpct();
         write32(base, INTERRUPT, 0xffff_ffff);
