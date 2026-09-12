@@ -502,6 +502,34 @@ PENDING \bmatches=1\b
 PENDING \bfiles=1\b
 PENDING \[vfs\] volume mounted /volumes/
 PENDING \[vfs\] unafs volume on .*not mounted
+# --- UNAFSROOT (orin 24/26): what `/`, `/boot` and `/apps` MOUNTED AS -----------------------
+# The three lines `fs::bootdisk::bind_root` prints once, with the home-soil announcement, on
+# the first mount table built. Their discriminating words are LITERALS in the format string
+# (the `/volumes/` lesson), so each key below is a contiguous run of that literal and stops
+# before the first runtime field (`source=`):
+#
+#   [vfs] root mount / = native unafs volume source=… rw=… ::     <- the boot disk carries a
+#                                                                    UnaFS partition and the
+#                                                                    shared mount rides it
+#   [vfs] root mount / = fat boot volume source=… rw=… ::         <- fail-open: no native volume
+#   [vfs] boot mount /boot = fat boot volume source=… rw=… ::     <- always, root native or not
+#   [vfs] apps mount /apps = fat boot volume source=… rooted=/APPS ::
+#
+# ALL PENDING, each for a stated reason. `boot mount` and `apps mount` fire on every boot that
+# reaches a filesystem verb — the same moment as `window_len=4096` above, and pending for
+# exactly its reason (a bring-up flight that never builds the table prints none of them). The
+# native `root mount` line and `unafs=present` are decided by the MEDIUM: a card imaged with
+# `media-writer.sh --image` (target/UnaOS-orin-card.img, CARDREADY-GEOM.md) carries the volume
+# and reads ✅; the pre-orin24 card (one FAT partition, render12 `unafs=absent`) does not, and
+# that is a fact about the card, not a defect in the boot. The FAT fallback line is deliberately
+# NOT forbidden for the same reason: it is the honest answer on that card. Promotion of the
+# native row to REQUIRE is a decision for the round that flies the re-imaged card and reads it.
+# BOUNDING as above: the keys end at `volume` (a word boundary follows on the wire, `\b` would
+# be redundant and a trailing space is stripped by `parse_spec`).
+PENDING \[vfs\] root mount / = native unafs volume
+PENDING \[vfs\] boot mount /boot = fat boot volume
+PENDING \[vfs\] apps mount /apps = fat boot volume
+PENDING \bunafs=present\b
 # --- UNAFSGROW: the card's NATIVE-VOLUME GEOMETRY, and the posture it is mounted in -----
 # 2026-09-07 (orin 20). Until this block the card's geometry lived in NOBODY'S memory but the
 # card's own. Every Orin write in this tree's history is a FILE-LEVEL copy into an

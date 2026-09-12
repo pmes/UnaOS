@@ -1571,6 +1571,86 @@ fn homesoil_selftest() {
         if leg5 { "PASS" } else { "FAIL" }
     );
 
+    unafsroot_selftest();
+}
+
+/// UNAFSROOT (orin 26): HOMESOIL leg 6 as its own entry point, because the QEMU boots that host the
+/// fixtures (`test`, `test-arm`) never reach a filesystem verb, so nothing under
+/// [`walk_and_witness`] executes there — measured on this arc's own captures: `[vfs]` 0 lines,
+/// `HOMESOIL` 0 lines on both `target/serial.log` and `target/serial-arm.log`. A leg that only
+/// runs when an operator types `ls` on metal is a leg that ships unexecuted, which is the defect
+/// class the split in [`bind_root`] exists to end. So the boot path calls this once, under
+/// `witness`, on both arches (main.rs, same-line appends), and [`homesoil_selftest`] calls it too
+/// so the metal wire keeps all six legs together; the latch makes the second call a no-op.
+#[cfg(feature = "witness")]
+pub fn unafsroot_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // --- leg 6: UNAFSROOT — the root disk's LAYOUT RULE, driven with every answer it takes. -----
+    // `bind_root` is the one place `/`, `/boot` and `/apps` are decided, and until this leg the
+    // `present` answer had never executed anywhere (render12: `unafs=absent`, no card carried a
+    // native volume). Table shape ONLY: `NativeBackend::new` and `FatBackend::new_source` hold a
+    // name, a principal and a source and touch no disk until resolved for I/O; `volume_name`,
+    // `mount_root` and `prefixes` are accessors. `same_volume` is deliberately NOT asked here —
+    // `FatBackend::volume_id` mounts the source to fingerprint it, and a fixture that runs AHEAD
+    // of the walk must not be the first thing to touch the card. `announce=false`: no wire line
+    // is owed by a table nothing will ever resolve through.
+    //
+    // The four answers `unafs_state` can give, each with the root it must produce:
+    //   present                  -> `/` native (aarch64) — on a build without `NativeBackend` the
+    //                               FAT, and the leg asserts THAT, so an x86 boot proves the same
+    //                               function honestly instead of skipping it;
+    //   absent, present-on-other-handle, unbuilt -> `/` FAT, on every build.
+    // `/boot` is the FAT volume `boot` and `/apps` is the same name rooted at `APPS_DIR`, in all
+    // four tables — a native `/` moves neither.
+    #[cfg(target_arch = "aarch64")]
+    const ROOT_WHEN_PRESENT: &str = "native";
+    #[cfg(not(target_arch = "aarch64"))]
+    const ROOT_WHEN_PRESENT: &str = "boot";
+    let shape = |state: &str| -> (String, String, String, String, usize) {
+        let mut mt = crate::fs::vfs::MountTable::new();
+        bind_root(&mut mt, BlockSource::Default, state, false);
+        let name = |p: &str| mt.volume_name(p).unwrap_or_else(|_| String::from("-"));
+        let apps_root = mt
+            .resolve("/apps")
+            .map(|(b, _)| String::from(b.mount_root()))
+            .unwrap_or_else(|_| String::from("-"));
+        (name("/"), name("/boot"), name("/apps"), apps_root, mt.prefixes().len())
+    };
+    let sp = shape("present");
+    let sa = shape("absent");
+    let so = shape("present-on-other-handle");
+    let su = shape("unbuilt");
+    // `FatBackend::rooted` stores the root in canonical `/`-led component form, so the expectation
+    // is derived the same way from the same constant rather than compared to the bare name.
+    let apps_root_want = alloc::format!("/{}", crate::fs::fat::APPS_DIR);
+    let fat_rooted = |s: &(String, String, String, String, usize)| {
+        s.1 == "boot" && s.2 == "boot" && s.3 == apps_root_want && s.4 == 3
+    };
+    let leg6 = sp.0 == ROOT_WHEN_PRESENT
+        && fat_rooted(&sp)
+        && sa.0 == "boot"
+        && fat_rooted(&sa)
+        && so.0 == "boot"
+        && fat_rooted(&so)
+        && su.0 == "boot"
+        && fat_rooted(&su);
+    serial_println!(
+        ":: HOMESOIL: root rule present=/:{} /boot:{} /apps:{}@{} absent=/:{} other=/:{} unbuilt=/:{} \
+         mounts={} :: {} ::",
+        sp.0,
+        sp.1,
+        sp.2,
+        sp.3,
+        sa.0,
+        so.0,
+        su.0,
+        sp.4,
+        if leg6 { "PASS" } else { "FAIL" }
+    );
 }
 
 /// CLONEALIAS: a synthetic `BlockDeviceInfo` for the fixture — the two fields

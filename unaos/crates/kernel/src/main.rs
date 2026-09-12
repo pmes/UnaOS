@@ -293,7 +293,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
-    serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::unafsroot_selftest(); // UNAFSROOT (orin 26): HOMESOIL leg 6 on the boot path — the ONE heap-up line x86, virt and the Pi all pass through, so `test`/`test-arm` execute the root layout rule (nothing under walk_and_witness runs on a headless boot: measured `[vfs]` 0 lines on both captures). Same-line append, code before the comment; witness-free media compile none of it. The tegra path has its own heap line (tegra_early_stop) and is untouched.
     unaos_kernel::bootpace::record("heap");
 
     // VPERF M3 EARLY-ATTACH (bench QoL, Peter's word 2026-07-16): usbdebug builds attach the
