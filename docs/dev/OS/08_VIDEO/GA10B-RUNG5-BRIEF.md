@@ -831,6 +831,54 @@ tooling need no special case.
 - **Nothing here enters git.** The staged directory is outside the repository; the repository gains
   a ledger row of names and digests, which is text.
 
+
+### 5.8 As built (orin-0912b, 2026-09-12 — GA10B5A M1+M2)
+
+Rung 5a is built. §5.1–§5.7 above are the design; this is what the code and the wire actually are.
+
+- **The loader** is `arch/aarch64/ga10b_fw.rs` (`ga10bprobe5`, arch-neutral). It reads the triple
+  from `/boot/GA10B/` through the VFS, verifies each file's size and sha256 against the A61 constants
+  compiled in (`ceeae9ec…`, `e5cd6c6a…`, `03f3ecc6…`), places them 256-aligned at **off `0x0`
+  (fmccode), `0x7000` (fmcdata), `0x9500` (pkcparam)**, digests what landed, and prints
+  `[ga10bfw] -> LOADED total=40192 window=<pa>..<pa+0x9d00>` — or `-> REFUSED
+  reason=<absent|size|digest|window> name=<f>` with **zero MMIO**. `window_need=0x9d00`.
+- **The ignition** is `arch/aarch64/ga10b_ignite.rs` (`ga10bprobe5a`, implies `ga10bprobe5` +
+  `ga10bprobe4a`). It reuses rung 4a's helpers (`r32`/`w32_4`/`bcr_write_verify`/`unreadable_reason`/
+  `finish4`/`resolve_gpu_node`/`pg_state`/`clk`/`settle_ms`/`BCR_ADDR_REGS`, made `pub(crate)`), and
+  is rung 4b's seven writes with only the payload changed: the six BCR addresses at the three
+  placements, `bcr_dmacfg` = noncoherent|lock, `bcr_ctrl` = 0x111, `priscv_cpuctl` = startcpu, the
+  bounded `br_retcode` poll, then the oracles (series, POSTBCR, MAPDIFF over 30 registers, the window
+  re-digested and first-words-sampled per section, MAILBOX0 read back). Verdict:
+  `ACR-ACCEPTED | BROM-VERDICT-FAIL code= | BROM-VERDICT-PASS-UNWITNESSED code= | BROM-NOVERDICT`
+  and a fielded `oracles_agree=` (F29); `SYSTEM_OFF` on every path past the lock.
+- **The seam.** The 5a call is folded onto the ORIN-SELFUP line of `tegra_early_stop` (`main.rs`),
+  not §5.6's `sdmmc_census` line — because the loader reads `/boot/GA10B/` through the VFS and `/boot`
+  binds over the disk this kernel was found on only once the SD census (slot card) **and** the JB2b
+  USB window (a card in a USB reader) have both published their block backend (render13:
+  `[vfs] boot mount /boot = fat … source=tegra-sd`). Phase 0 (the loader) runs at boot on every
+  polarity; the ignition follows at once, or is deferred under `=<n>d`.
+- **The knob shape as built** (wider than §5.6's single value, so 5a can fly whichever encoding rung
+  4e settles and can defer like rung 4d): on a tegra build, `UNAOS_GA10B_PROBE5=` `1` raw · `5`
+  `pa >> 8` (`ga10bprobe5e`, `ADDR_SHIFT` 0→8, `shift=8` on the wire) · `2`/`7` add rung 5b (M3) ·
+  a `d` suffix (`1d`/`5d`/`2d`/`7d`, `ga10bprobe5d`) defers the ignition to the shutdown path. Every
+  other value arms the loader alone. On QEMU virt (`UNAOS_GA10B_PROBE5=1 ./arroyo test-arm`,
+  `witness`) only `ga10bprobe5` arms — the loader fixture, never the tegra ignition.
+- **The addresses about to be written**, for the flown window `dmabuf_pa=0x80200000`
+  (`[ga10b4nc]`, the same 2 MiB Normal-NC block rung 4 used), with placements at
+  `+0x0`/`+0x7000`/`+0x9500` → **fmccode `0x80200000`, fmcdata `0x80207000`, pkcparam `0x80209500`**:
+  - **raw (`=1`, `shift=0`):** `priscv_bcr_fmccode_lo = 0x80200000` hi `0`, `fmcdata_lo = 0x80207000`
+    hi `0`, `pkcparam_lo = 0x80209500` hi `0`.
+  - **shift8 (`=5`, `shift=8`):** each address `>> 8` — `fmccode_lo = 0x00802000`, `fmcdata_lo =
+    0x00802070`, `pkcparam_lo = 0x00802095`, all hi `0`.
+- **The staging recipe** is §5.7 exactly, with the files already staged at
+  `~/unaos-bench/flash/orin/ga10b-fw-36.4.3/` (the triple + `LICENCE.txt` + `MANIFEST`, R52). `GA10B/`
+  is a directory at the FAT root; `stage-orin.sh` copies `$SRC/.` wholesale, so a `GA10B/` placed in
+  the built ESP tree before staging is carried and MANIFEST-hashed with no tool change — **but the
+  ESP tree `./arroyo esp-jetson` builds does not contain `GA10B/`**, so the operator (or a builder
+  step) must drop the four files into `target/aarch64_esp/GA10B/` before `stage-orin.sh` runs. A
+  dedicated `--with-dir <path>` arm on `stage-orin.sh` would make that a first-class step; it is a
+  bench-tool change (outside this arc's files) and is **reported, not made** here.
+
 ---
 
 ## 6. Questions only Peter can answer

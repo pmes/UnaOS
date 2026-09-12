@@ -1086,6 +1086,9 @@ fi
 #                             (`5` is rung 4e's value, UNAOS_GA10B_PROBE4=5 — the same delta, the same digit)
 #   UNAOS_GA10B_PROBE5=2   -> + `ga10bprobe5a` + `ga10bprobe5b` — 5a RAW, then rung 5b's read-only PMU oracles
 #   UNAOS_GA10B_PROBE5=7   -> + `ga10bprobe5a` + `ga10bprobe5e` + `ga10bprobe5b` — 5a shifted, then 5b
+#   UNAOS_GA10B_PROBE5=<n>d (1d|5d|2d|7d) -> the same set + `ga10bprobe5d` — the ignition DEFERRED to the
+#                             shutdown path (rung 4d's shape): the loader still runs at boot, the desktop
+#                             comes up, Shut Down ignites (needs the power::psci_call hook, see Cargo.toml)
 #   any other value        -> the loader alone: an unexpected value never buys an ignition (the PROBE3/4 shape)
 # WHY the tegra condition: `ga10bprobe5a` implies `tegra` (through `ga10bprobe4a`), and a `tegra` kernel
 # diverges into `tegra_early_stop` at boot — on QEMU virt that is a dead boot, so `UNAOS_GA10B_PROBE5=1
@@ -1094,9 +1097,13 @@ fi
 # 5a implies 4a, so rung 4a's own census also runs at post-heap-init and RETURNS; 5a re-proves it inside.
 # Default OFF => modules + call sites vanish, no panic Location moves, knob-off images byte-identical.
 # ARMED polarities type-checked by the `arm-ga10bprobe5` (virt, witness), `arm-tegra-ga10bprobe5a`,
-# `arm-tegra-ga10bprobe5e` and `arm-tegra-ga10bprobe5b` legs of KERNEL_CFG_MATRIX. Witness families:
-# `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`. Fly WITHOUT UNAOS_GA10B_PROBE1/2/3/4.
+# `arm-tegra-ga10bprobe5e`, `arm-tegra-ga10bprobe5b` and `arm-tegra-ga10bprobe5d` legs of KERNEL_CFG_MATRIX.
+# Witness families: `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`, `[ga10bprobe5d]`. Fly WITHOUT
+# UNAOS_GA10B_PROBE1/2/3/4. The ORIN-SELFUP line of `tegra_early_stop` is the 5a call's seam (main.rs).
 [ -n "${UNAOS_GA10B_PROBE5:-}" ] && _feats="${_feats}ga10bprobe5,"
+_p5_metal=""; { [ -n "${UNAOS_TEGRA:-}" ] || [ "${1:-}" = "esp-jetson" ]; } && _p5_metal=1
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; esac
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1d|5d|2d|7d) _feats="${_feats}ga10bprobe5d," ;; esac
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -4264,6 +4271,17 @@ KERNEL_CFG_MATRIX=(
   # loop, which is `witness`-gated. The VIRT polarity: the `UNAOS_GA10B_PROBE5=1 ./arroyo test-arm` build
   # (witness + the loader, NO tegra) — the leg that type-checks the QEMU fixture without a tegra image.
   "arm-ga10bprobe5 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,ga10bprobe5"
+  # GA10B-PROBE5A armed (same arc) — `ga10bprobe5a` gates `arch/aarch64/ga10b_ignite.rs` (rung 5a, the
+  # vendor ignition) and its folded call on the ORIN-SELFUP line of `tegra_early_stop`; IMPLIES
+  # `ga10bprobe5` and `ga10bprobe4a`. The `UNAOS_TEGRA=1 UNAOS_GA10B_PROBE5=1` flight polarity, with every
+  # `ga10bprobe5e`/`ga10bprobe5b`/`ga10bprobe5d` item cfg-erased (the raw-address, immediate, no-5b trap a
+  # wider leg would hide). The `arm-tegra` list + the feature, the ga10bprobe4a leg's shape.
+  "arm-tegra-ga10bprobe5a ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5a"
+  # GA10B-PROBE5E armed (same arc) — the `=5` polarity: rung 5a with `ADDR_SHIFT = 8`. IMPLIES `ga10bprobe5a`.
+  "arm-tegra-ga10bprobe5e ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5e"
+  # GA10B-PROBE5D armed (same arc) — the `=1d` polarity: 5a's loader at boot, the ignition armed for the
+  # shutdown path (`ga10bprobe5_deferred_run`, statics, the DTB + window re-verify). IMPLIES `ga10bprobe5a`.
+  "arm-tegra-ga10bprobe5d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5d"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of

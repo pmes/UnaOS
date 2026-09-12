@@ -1,13 +1,16 @@
 //! GA10B-PROBE5A — RUNG 5a of the GA10B ladder: the VENDOR IGNITION (`ga10bprobe5a`, DEFAULT OFF;
 //! `UNAOS_GA10B_PROBE5=1` raw addresses, `=5` addresses `pa >> 8` under `ga10bprobe5e`; `=2`/`=7` add rung
-//! 5b under `ga10bprobe5b`). Design: docs/dev/OS/08_VIDEO/GA10B-RUNG5-BRIEF.md §5 (as built); rung 4's
-//! brief §3/§4/§10 for the writes and the oracles this reuses; ledger A63 (5a) and A64 (5b).
+//! 5b under `ga10bprobe5b`; a `d` suffix — `=1d`/`=5d`/`=2d`/`=7d` — DEFERS the ignition to the shutdown path
+//! under `ga10bprobe5d`, rung 4d's shape). Design: docs/dev/OS/08_VIDEO/GA10B-RUNG5-BRIEF.md §5 (as built);
+//! rung 4's brief §3/§4/§10 for the writes and the oracles this reuses; ledger A63 (5a) and A64 (5b).
 //!
 //! THE RUNG, in order, on ONE boot:
-//!   0. ZERO-MMIO PHASE — the rung-4 Normal-NC window (seated at heap-guard, `[ga10b4nc]`) is re-mapped
-//!      NC and filled with the rung-4 pattern; `ga10b_fw::load` reads the three vendor files from
-//!      `/boot/GA10B/` through the VFS, sizes them, places them 256-byte-aligned, digests what landed.
-//!      ANY refusal here RETURNS with zero MMIO and the boot continues into the desktop (brief §5.6).
+//!   0. ZERO-MMIO PHASE (`phase0_load`, runs at BOOT on every polarity) — the rung-4 Normal-NC window
+//!      (seated at heap-guard, `[ga10b4nc]`) is re-mapped NC and filled with the rung-4 pattern; `ga10b_fw::load`
+//!      reads the three vendor files from `/boot/GA10B/` through the VFS, sizes them, places them 256-byte-
+//!      aligned, digests what landed. ANY refusal here RETURNS with zero MMIO and the boot continues into the
+//!      desktop (brief §5.6). Under `ga10bprobe5d` the placements are STASHED here and the boot continues; the
+//!      ignition below runs from `ga10bprobe5_deferred_run` after the window is re-digested.
 //!   1. P0–P2 — rung 4a's bracket re-proven in this family: gpu@ node from the DTB, BPMP MRQ_PG with an
 //!      explicit readback, the clocks, `bcr_dmacfg` lock bit 0, `bcr_ctrl` baseline.
 //!   2. P5 — rung 4a's seven-write census + restore, re-run here (BCR-ALLHELD this boot or no ignition).
@@ -23,6 +26,11 @@
 //!      unsigned payload has ever produced) | `BROM-VERDICT-FAIL code=` | `BROM-VERDICT-PASS-UNWITNESSED
 //!      code=` (F20: the code says PASS and no oracle moved — a measurement error until re-flown) |
 //!      `BROM-NOVERDICT`; then rung 5b if armed; then SYSTEM_OFF (the lock made the BCR final; cold boot next).
+//!
+//! WHERE IT RUNS. One folded call on the ORIN-SELFUP line of `tegra_early_stop` — AFTER the SD census
+//! (`publish_block_backend` for the slot card) AND the JB2b USB window (a card in a USB reader), so `/boot`
+//! binds over the disk this kernel was found on whichever slot it sits in (render13: `source=tegra-sd`).
+//! The `sdmmc_census` line would have been too early for a reader-booted card. Still EL2, before JM6.
 //!
 //! WHAT IT REUSES. Rung 4a's helpers from `ga10b_probe.rs` — `r32`, `w32_4`, `bcr_write_verify`,
 //! `unreadable_reason`, `finish4`, `resolve_gpu_node`, `pg_state`, `clk`, `settle_ms`, `BCR_ADDR_REGS` —
@@ -97,7 +105,6 @@ const BR_SERIES_SETTLE_MS: u64 = 10;
 const DMABUF_PATTERN: u32 = 0x4A10_B4A5;
 // BPMP (rung 2/3/4's shape).
 const MRQ_PG: u32 = 66;
-const CMD_PG_GET_STATE: u32 = 2;
 const CMD_PG_SET_STATE: u32 = 1;
 const PG_STATE_ON: u32 = 1;
 const PG_STATE_OFF: u32 = 0;
@@ -312,22 +319,57 @@ fn digest_at(p: &Placed) -> [u8; 32] {
     h.finalize()
 }
 
-/// RUNG 5a — the entry, one folded call on the `sdmmc_census` line of `tegra_early_stop` (after the card
-/// is published; the loader reads it). RETURNS on every zero-MMIO refusal; ends in SYSTEM_OFF once the lock
-/// is written.
-pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
-    serial_println!("[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5={}) — the VENDOR IGNITION: rung 4b's seven writes with ONLY THE PAYLOAD changed. Order: zero-MMIO phase (window, pattern, the three vendor files read from /boot/GA10B/ through the VFS, sized, placed 256-aligned, digested in the window — any refusal RETURNS with zero MMIO) -> rung 4a's bracket and BCR census re-proven -> rung 4c's pre-ignition census -> addresses at the three placements (form={} shift={}) -> bcr_dmacfg noncoherent|lock (SPENDS THE POWER CYCLE) -> bcr_ctrl 0x111 -> priscv_cpuctl startcpu -> bounded br_retcode poll -> the oracles -> verdict -> SYSTEM_OFF. Verdict vocabulary: ACR-ACCEPTED | BROM-VERDICT-FAIL code=<retcode> | BROM-VERDICT-PASS-UNWITNESSED code=<retcode> | BROM-NOVERDICT | IGNITION-SKIPPED reason=<bcr-not-allheld|bcr-addr-refused> | BCR-CTRL-REFUSED | REFUSED reason=<image-absent|image-size|image-digest|image-window|image-unaligned|no-dma-window|no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable>. F21 warning: a fabric RAS from a real image whose DMA reach we do not bound may need a manual power cut", if ADDR_SHIFT == 8 { "5" } else { "1" }, ADDR_FORM, ADDR_SHIFT);
-    serial_println!("[ga10bprobe5a] addr_encoding={} from={} (P5x: rung 4e, UNAOS_GA10B_PROBE4=5, is the flight that settles the encoding; until its verdict is in docs/dev/evidence/ this build carries the form its knob value named and says so here)", ADDR_FORM, if ADDR_SHIFT == 8 { "unflown(4e; rung-5 brief §1.2 Hopper MIT source)" } else { "flown(4b raw; A51/A55)" });
+/// What phase 0 leaves behind for the ignition: the window and the three placements (ROLE order).
+#[derive(Clone, Copy)]
+struct Loaded5 {
+    wb: u64,
+    ws: u64,
+    placed: [Placed; 3],
+}
 
-    // ── 0. ZERO-MMIO PHASE ─────────────────────────────────────────────────────────────────────────────
+/// The knob value this build answers to, for the wire: the digit picks the rung set (1 raw, 5 shift8,
+/// 2 raw+5b, 7 shift8+5b), the `d` suffix defers the ignition to the shutdown path.
+#[cfg(all(not(feature = "ga10bprobe5e"), not(feature = "ga10bprobe5b")))]
+const KNOB_DIGIT: &str = "1";
+#[cfg(all(feature = "ga10bprobe5e", not(feature = "ga10bprobe5b")))]
+const KNOB_DIGIT: &str = "5";
+#[cfg(all(not(feature = "ga10bprobe5e"), feature = "ga10bprobe5b"))]
+const KNOB_DIGIT: &str = "2";
+#[cfg(all(feature = "ga10bprobe5e", feature = "ga10bprobe5b"))]
+const KNOB_DIGIT: &str = "7";
+#[cfg(not(feature = "ga10bprobe5d"))]
+const KNOB_SUFFIX: &str = "";
+#[cfg(feature = "ga10bprobe5d")]
+const KNOB_SUFFIX: &str = "d";
+
+/// RUNG 5a — the ENTRY (see the module doc for the seam). Phase 0 runs now on every polarity, so the
+/// loader lines are on the wire before the desktop; immediate builds then ignite at once; `ga10bprobe5d`
+/// builds stash the placements, print the arm and RETURN — `ga10bprobe5_deferred_run` ignites later.
+/// RETURNS on every zero-MMIO refusal; an ignition path ends in SYSTEM_OFF.
+#[allow(unreachable_code)]
+pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+    serial_println!("[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5={}{}) — the VENDOR IGNITION: rung 4b's seven writes with ONLY THE PAYLOAD changed. Order: zero-MMIO phase (window, pattern, the three vendor files read from /boot/GA10B/ through the VFS, sized, placed 256-aligned, digested in the window — any refusal RETURNS with zero MMIO) -> rung 4a's bracket and BCR census re-proven -> rung 4c's pre-ignition census -> addresses at the three placements (form={} shift={}) -> bcr_dmacfg noncoherent|lock (SPENDS THE POWER CYCLE) -> bcr_ctrl 0x111 -> priscv_cpuctl startcpu -> bounded br_retcode poll -> the oracles -> verdict -> SYSTEM_OFF. Verdict vocabulary: ACR-ACCEPTED | BROM-VERDICT-FAIL code=<retcode> | BROM-VERDICT-PASS-UNWITNESSED code=<retcode> | BROM-NOVERDICT | IGNITION-SKIPPED reason=<bcr-not-allheld|bcr-addr-refused> | BCR-CTRL-REFUSED | REFUSED reason=<image-absent|image-size|image-digest|image-window|image-unaligned|no-dma-window|no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable>. F21 warning: a fabric RAS from a real image whose DMA reach we do not bound may need a manual power cut", KNOB_DIGIT, KNOB_SUFFIX, ADDR_FORM, ADDR_SHIFT);
+    serial_println!("[ga10bprobe5a] addr_encoding={} shift={} from={} (P5x: rung 4e, UNAOS_GA10B_PROBE4=5, is the flight that settles the encoding; until its verdict is in docs/dev/evidence/ this build carries the form its knob value named and says so here)", ADDR_FORM, ADDR_SHIFT, if ADDR_SHIFT == 8 { "unflown(4e; rung-5 brief §1.2 Hopper MIT source)" } else { "flown(4b raw; A51/A55)" });
+    let Some(ld) = phase0_load() else { return; };
+    #[cfg(feature = "ga10bprobe5d")]
+    {
+        arm_deferred5(&ld, dtb_addr, dtb_size, ram_gib_mask);
+        return;
+    }
+    ignite(&ld, dtb_addr, dtb_size, ram_gib_mask)
+}
+
+/// Phase 0 — ZERO MMIO: the window, the pattern, the three files, the placements. `None` = REFUSED (said
+/// on the wire, exactly one `->` line), and nothing has been spent.
+fn phase0_load() -> Option<Loaded5> {
     let (wb, ws) = super::mmu_tegra::ga10b4_nc_window();
     if wb == 0 || ws == 0 {
         serial_println!("[ga10bprobe5a] -> REFUSED reason=no-dma-window — no rung-4 2 MiB block was seated below 4 GiB (see the [ga10b4nc] census at heap-guard); zero MMIO; RETURNING");
-        return;
+        return None;
     }
     if wb + ws > 0x1_0000_0000 || !super::mmu_tegra::install_nc_window(wb, ws) {
         serial_println!("[ga10bprobe5a] -> REFUSED reason=no-dma-window — the seated block could not be mapped Normal-NC (or is not below 4 GiB); zero MMIO; RETURNING");
-        return;
+        return None;
     }
     {
         let mut off = 0u64;
@@ -346,11 +388,11 @@ pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
         }
         Outcome::Refused { reason, name } => {
             serial_println!("[ga10bprobe5a] -> REFUSED reason=image-{} name={} — a media fault, not a GPU one; zero MMIO; the boot RETURNS and continues", reason, name);
-            return;
+            return None;
         }
     };
     // P7 — the placements, one line per section, with the register value each becomes.
-    let (vals, raws) = addr_values(&placed);
+    let (vals, _raws) = addr_values(&placed);
     let mut unaligned = false;
     for i in 0..3 {
         let p = &placed[i];
@@ -359,8 +401,17 @@ pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     }
     if unaligned {
         serial_println!("[ga10bprobe5a] -> REFUSED reason=image-unaligned — a placement is not 256-byte aligned; zero MMIO; RETURNING");
-        return;
+        return None;
     }
+    Some(Loaded5 { wb, ws, placed })
+}
+
+/// The IGNITION and its oracles: rung 4a's bracket re-proven, P5, the pre-census, the seven writes at the
+/// placed sections, the poll, the oracles, the verdict, SYSTEM_OFF. RETURNS only on a zero-MMIO refusal or
+/// a `-> IGNITION-SKIPPED` (nothing spent); every path past the lock ends in `finish4`.
+fn ignite(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+    let (wb, ws, placed) = (ld.wb, ld.ws, ld.placed);
+    let (vals, raws) = addr_values(&placed);
     let pre_words = [words4(placed[0].pa), words4(placed[1].pa), words4(placed[2].pa)];
     for i in 0..3 {
         serial_println!("[ga10bprobe5a] pre-ignition dmabuf {} @{:#x} = {:#010x} {:#010x} {:#010x} {:#010x} (first 4 words of the placed section, CPU side)", ROLE[i], placed[i].pa, pre_words[i][0], pre_words[i][1], pre_words[i][2], pre_words[i][3]);
@@ -698,6 +749,8 @@ pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     // ── 6. THE VERDICT ─────────────────────────────────────────────────────────────────────────────────
     let result = if unreadable_reason(retcode).is_some() { 0xf } else { retcode & 0x3 };
     let accepted = lockdown == 0 || v1r == 1;
+    // F29 (brief §5.4): the two oracles disagreeing is its own finding — printed as a field, not a new arm.
+    let oracles_agree = (lockdown == 0 && v1r == 1) as u32;
     let verdict = if accepted {
         "ACR-ACCEPTED"
     } else if result == BR_RETCODE_FAIL {
@@ -707,75 +760,114 @@ pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     } else {
         "BROM-NOVERDICT"
     };
-    serial_println!("[ga10bprobe5a] verdict br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} halted={} form={} image_sections=3 image_digests_ok=3 -> {} code={:#010x}", retcode, result, samples, BR_POLL_SAMPLES, lock_latched, lockdown, v1r, halted, ADDR_FORM, verdict, retcode);
+    serial_println!("[ga10bprobe5a] verdict br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} halted={} oracles_agree={} form={} shift={} image_sections=3 image_digests_ok=3 -> {} code={:#010x}", retcode, result, samples, BR_POLL_SAMPLES, lock_latched, lockdown, v1r, halted, oracles_agree, ADDR_FORM, ADDR_SHIFT, verdict, retcode);
     match verdict {
         "ACR-ACCEPTED" => serial_println!("[ga10bprobe5a] THE ROM ACCEPTED NVIDIA'S IMAGE: a GPU-side observable moved that no unsigned payload ever moved (lockdown={}, v1_readable={}). The signature wall is behind the ladder; what runs now is the ACR/FMC, and rung 5b's oracles (if armed) say what it did next", lockdown, v1r),
         "BROM-VERDICT-FAIL" => serial_println!("[ga10bprobe5a] F19: a real signed image, digests verified in the window, addresses form={}, and the ROM still says FAIL. Do not iterate images this session: record the identity, then decide between the other address form, the second triple (safety-scheduler) and the mapping inference (§4.1.2) — one boot each", ADDR_FORM),
         "BROM-VERDICT-PASS-UNWITNESSED" => serial_println!("[ga10bprobe5a] F20: the code says PASS and neither oracle moved — a measurement error until re-flown from a cold boot; build nothing on it this session"),
         _ => serial_println!("[ga10bprobe5a] no verdict in {} samples: halted={} — halted=1 means the core never started or halted again; halted=0 means it is RUNNING and the poll was short (F5)", BR_POLL_SAMPLES, halted),
     }
-    #[cfg(feature = "ga10bprobe5b")]
-    super::ga10b_ignite::rung5b(base, verdict);
     let _ = (series_arm, bcr_arm, map_arm, dma_arm);
     finish4(FAM);
 }
 
-/// RUNG 5b — the ACR->PMU handshake, READ-ONLY oracles (`ga10bprobe5b`; design GA10B-RUNG6-BRIEF.md §3;
-/// ledger A64). Only after `ACR-ACCEPTED`; otherwise prints why it did not run.
-#[cfg(feature = "ga10bprobe5b")]
-pub fn rung5b(base: u64, verdict: &str) {
-    const F5B: &str = "ga10bprobe5b";
-    /// PUBLIC-RECALLED, NOT ACKED: the PMU's legacy falcon aperture base (open-gpu-kernel-modules
-    /// `dev_pwr_pri.h`, MIT: NV_PPWR_FALCON_* at 0x10a000 + falcon offset). Rung 3 read the PMU's falcon2
-    /// (priscv) block at 0x10b000 on this die without fault; this v1 block is one page below it and has
-    /// never been touched here — every read is announced, every value printed raw.
-    const PMU_FALCON_BASE: u64 = 0x0010_a000;
-    /// PUBLIC-RECALLED (dev_falcon_v4.h, MIT): MAILBOX1 at +0x044, one word above the metal-proven MAILBOX0.
-    const FALCON_MAILBOX1_OFF: u64 = 0x044;
-    const SAMPLES: u32 = 10;
-    const SETTLE_MS: u64 = 20;
-    serial_println!("[ga10bprobe5b] rung 5b ARMED (UNAOS_GA10B_PROBE5=2|7) — the ACR->PMU handshake, READ-ONLY: after ACR-ACCEPTED the ACR (FMC) is expected to carve the WPR and boot the PMU (GA10B-RUNG6-BRIEF.md §2, from nvgpu's public sequence); this rung ADDS ZERO WRITES and samples the channels that would show it — GSP mailbox0/1 (the FMC's status/error words), the PMU legacy-falcon block (cpuctl, hwcfg2, mailbox0/1; PUBLIC-RECALLED base 0x10a000, first touch on this die) and the PMU falcon2 cpuctl rung 3 read — {} samples {} ms apart. Vocabulary: PMU-RUNNING | PMU-HALTED | PMU-UNREADABLE | PMU-NOT-ATTEMPTED reason=<not-accepted>", SAMPLES, SETTLE_MS);
-    if verdict != "ACR-ACCEPTED" {
-        serial_println!("[ga10bprobe5b] -> PMU-NOT-ATTEMPTED reason=not-accepted (5a verdict {}): nothing past the ROM ran, so there is no handshake to observe; zero reads", verdict);
+// ── GA10B-PROBE5D — the DEFERRED arm (rung 4d's shape; ledger A63) ───────────────────────────────────────
+// `=<n>d`: phase 0 ran at boot (the files are IN the window, digests verified, nothing spent), the
+// placements are stashed here, and the ignition runs from `power::psci_call` on a PSCI SYSTEM_OFF request —
+// shell `shutdown`/`off`, crystal Shut Down, a probe's own finish — after the DTB checksum and the three
+// placed sections are RE-VERIFIED. No VFS read happens on the shutdown path (DAIF is masked there; the SD
+// path's waits are boot-time-proven only), which is why the load is not deferred with the ignition.
+// THE HOOK: `power::psci_call` must carry, appended to its existing `ga10bprobe4d` line before the `//`,
+//   `#[cfg(feature = "ga10bprobe5d")] if func == PSCI_SYSTEM_OFF { crate::arch::ga10b_ignite::ga10bprobe5_deferred_run(); }`
+// — power.rs is outside this arc's file list, so the statement is REPORTED, not made (EXECUTOR-BRIEF head 3);
+// until it is folded a `d` build arms and says so, and the boot ends in a plain SYSTEM_OFF (F5d-0).
+
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_DTB_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_DTB_SIZE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_RAM_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_DTB_SUM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_WB: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_WS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "ga10bprobe5d")]
+static DEF5_PA: [core::sync::atomic::AtomicU64; 3] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+
+/// Rung 4d's whole-blob DTB checksum (its own copy: that one is private to its rung), taken at the arm and
+/// re-taken before the deferred run walks the DTB.
+#[cfg(feature = "ga10bprobe5d")]
+fn dtb_sum5(addr: u64, size: usize) -> u32 {
+    if addr == 0 || size == 0 {
+        return 0;
+    }
+    let b = unsafe { core::slice::from_raw_parts(addr as *const u8, size) };
+    b.iter().fold(0u32, |s, &x| s.wrapping_mul(31).wrapping_add(x as u32))
+}
+
+/// Arm the deferred ignition: stash the DTB coordinates + checksum and the three placements, say so, RETURN.
+#[cfg(feature = "ga10bprobe5d")]
+fn arm_deferred5(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+    use core::sync::atomic::Ordering;
+    let sum = dtb_sum5(dtb_addr, dtb_size);
+    DEF5_DTB_ADDR.store(dtb_addr, Ordering::Relaxed);
+    DEF5_DTB_SIZE.store(dtb_size, Ordering::Relaxed);
+    DEF5_RAM_MASK.store(ram_gib_mask, Ordering::Relaxed);
+    DEF5_DTB_SUM.store(sum, Ordering::Relaxed);
+    DEF5_WB.store(ld.wb, Ordering::Relaxed);
+    DEF5_WS.store(ld.ws, Ordering::Relaxed);
+    for i in 0..3 {
+        DEF5_PA[i].store(ld.placed[i].pa, Ordering::Relaxed);
+    }
+    DEF5_ARMED.store(true, Ordering::SeqCst);
+    serial_println!("[ga10bprobe5d] DEFERRED ARM (UNAOS_GA10B_PROBE5={}d): the image is IN the window (dmabuf_pa={:#010x} fmccode={:#x} fmcdata={:#x} pkcparam={:#x}, digests verified, nothing spent) and rung 5a's ignition is ARMED for the shutdown path — the boot continues into the desktop. It runs when a PSCI SYSTEM_OFF is requested (shell shutdown/off, crystal Shut Down) IF power::psci_call carries the ga10bprobe5d hook; the DTB checksum ({:#010x}) and the three sections are re-verified first. F5d-0: a plain SYSTEM_OFF with no [ga10bprobe5d] DEFERRED RUN line means the hook is not folded", KNOB_DIGIT, ld.wb, ld.placed[0].pa, ld.placed[1].pa, ld.placed[2].pa, sum);
+}
+
+/// The deferred run. Called by `power::psci_call` on every PSCI SYSTEM_OFF request (once the hook is
+/// folded); a no-op unless armed, and the arm is consumed on entry so the rung's own finish4 -> shutdown ->
+/// psci_call is a no-op too. Masks DAIF on the calling core, re-verifies the DTB and the three placed
+/// sections IN THE WINDOW (sha256 against the A61 constants — the same P6 test the loader made at boot),
+/// then runs the ignition exactly as the immediate build would. Returns (falling through to the SYSTEM_OFF
+/// it interrupted) only on a refusal or a path that did not reach the lock.
+#[cfg(feature = "ga10bprobe5d")]
+pub fn ga10bprobe5_deferred_run() {
+    use core::sync::atomic::Ordering;
+    if !DEF5_ARMED.swap(false, Ordering::SeqCst) {
         return;
     }
-    let regs: [(&str, u64); 8] = [
-        ("gsp_falcon_mailbox0", base + GSP_FALCON_BASE + FALCON_MAILBOX0_OFF),
-        ("gsp_falcon_mailbox1", base + GSP_FALCON_BASE + FALCON_MAILBOX1_OFF),
-        ("gsp_falcon_hwcfg2", base + GSP_FALCON_BASE + FALCON_HWCFG2_OFF),
-        ("pmu_falcon_cpuctl_v1", base + PMU_FALCON_BASE + FALCON_CPUCTL_OFF),
-        ("pmu_falcon_hwcfg2", base + PMU_FALCON_BASE + FALCON_HWCFG2_OFF),
-        ("pmu_falcon_mailbox0", base + PMU_FALCON_BASE + FALCON_MAILBOX0_OFF),
-        ("pmu_falcon_mailbox1", base + PMU_FALCON_BASE + FALCON_MAILBOX1_OFF),
-        ("pmu_falcon2_cpuctl", base + PMU_FALCON2_BASE + PRISCV_CPUCTL_OFF),
-    ];
-    let mut last = [0u32; 8];
-    let mut changed = [0u32; 8];
-    let mut unread = [0u32; 8];
-    for s in 1..=SAMPLES {
-        for (k, (name, addr)) in regs.iter().enumerate() {
-            serial_println!("[ga10bprobe5b] about-to-read handshake {} reg={:#x} sample={}/{} — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it", name, addr, s, SAMPLES);
-            let v = r32(*addr);
-            let u = unreadable_reason(v);
-            if u.is_some() { unread[k] += 1; }
-            if s > 1 && v != last[k] { changed[k] += 1; }
-            match u {
-                Some(why) => serial_println!("[ga10bprobe5b] handshake {} @{:#x} = -UNREADABLE reason={} val={:#010x} sample={}", name, addr, why, v, s),
-                None => serial_println!("[ga10bprobe5b] handshake {} @{:#x} = {:#010x} sample={} changed_since_last={}", name, addr, v, s, (s > 1 && v != last[k]) as u32),
-            }
-            last[k] = v;
-        }
-        if s < SAMPLES { settle_ms(SETTLE_MS); }
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack, preserves_flags)) };
+    let dtb_addr = DEF5_DTB_ADDR.load(Ordering::Relaxed);
+    let dtb_size = DEF5_DTB_SIZE.load(Ordering::Relaxed);
+    let ram_gib_mask = DEF5_RAM_MASK.load(Ordering::Relaxed);
+    let sum0 = DEF5_DTB_SUM.load(Ordering::Relaxed);
+    let wb = DEF5_WB.load(Ordering::Relaxed);
+    let ws = DEF5_WS.load(Ordering::Relaxed);
+    serial_println!("[ga10bprobe5d] DEFERRED RUN — triggered by a PSCI SYSTEM_OFF request reaching power::psci_call (the [pwrshutoff] or [crystal] line above names the route). DAIF masked on this core; the DTB and the window are re-verified before one register is touched; the ignition then ends in its own SYSTEM_OFF");
+    let sum = dtb_sum5(dtb_addr, dtb_size);
+    if sum != sum0 {
+        serial_println!("[ga10bprobe5d] -> REFUSED reason=dtb-changed stashed_sum={:#010x} now={:#010x} — the firmware DTB is not the blob the arm read; zero MMIO; falling through to SYSTEM_OFF", sum0, sum);
+        return;
     }
-    // The PMU verdict from its own cpuctl, the two apertures agreeing or not.
-    let v1 = last[3];
-    let f2 = last[7];
-    let pmu_arm = if unreadable_reason(v1).is_some() && unreadable_reason(f2).is_some() {
-        "PMU-UNREADABLE"
-    } else if (unreadable_reason(v1).is_none() && (v1 >> PRISCV_CPUCTL_HALTED_BIT) & 1 == 0) || (unreadable_reason(f2).is_none() && (f2 >> PRISCV_CPUCTL_HALTED_BIT) & 1 == 0) {
-        "PMU-RUNNING"
-    } else {
-        "PMU-HALTED"
-    };
-    serial_println!("[ga10bprobe5b] handshake summary: pmu_cpuctl_v1={:#010x} pmu_falcon2_cpuctl={:#010x} gsp_mailbox0={:#010x} gsp_mailbox1={:#010x} pmu_mailbox0={:#010x} pmu_mailbox1={:#010x} changes=[{} {} {} {} {} {} {} {}] unreadable=[{} {} {} {} {} {} {} {}] samples={} -> {}", v1, f2, last[0], last[1], last[5], last[6], changed[0], changed[1], changed[2], changed[3], changed[4], changed[5], changed[6], changed[7], unread[0], unread[1], unread[2], unread[3], unread[4], unread[5], unread[6], unread[7], SAMPLES, pmu_arm);
+    let mut placed = [Placed { off: 0, pa: 0, size: 0 }; 3];
+    let mut intact = 0u32;
+    for i in 0..3 {
+        let pa = DEF5_PA[i].load(Ordering::Relaxed);
+        placed[i] = Placed { off: pa.wrapping_sub(wb), pa, size: ACR_GSP[i].size };
+        let d = digest_at(&placed[i]);
+        let ok = d == ACR_GSP[i].sha;
+        if ok { intact += 1; }
+        serial_println!("[ga10bprobe5d] window re-verify section={} pa={:#010x} size={} sha256={} (a CPU read of this kernel's OWN window, not a register)", ROLE[i], pa, placed[i].size, if ok { "match" } else { "MISMATCH" });
+    }
+    if intact != 3 || wb == 0 || ws == 0 {
+        serial_println!("[ga10bprobe5d] -> REFUSED reason=image-digest-at-shutdown intact={}/3 window={:#x}..{:#x} — something wrote the window during the session (or it was never seated); zero MMIO; falling through to SYSTEM_OFF", intact, wb, wb + ws);
+        return;
+    }
+    serial_println!("[ga10bprobe5d] dtb re-verified sum={:#010x} dtb={:#x} size={:#x}; window re-verified 3/3 — igniting from the shutdown path", sum, dtb_addr, dtb_size);
+    ignite(&Loaded5 { wb, ws, placed }, dtb_addr, dtb_size, ram_gib_mask);
+    serial_println!("[ga10bprobe5d] deferred rung RETURNED (a refusal or an IGNITION-SKIPPED path — nothing spent) — falling through to the SYSTEM_OFF it interrupted");
 }

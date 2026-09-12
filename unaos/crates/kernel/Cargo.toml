@@ -2251,6 +2251,52 @@ ga10bprobe4d = ["ga10bprobe4c"]
 # KERNEL_CFG_MATRIX. Witness family: `[ga10bfw]`.
 ga10bprobe5 = []
 
+# GA10B-PROBE5A (`UNAOS_GA10B_PROBE5=1`, on a tegra build): RUNG 5a — the VENDOR IGNITION.
+# `arch/aarch64/ga10b_ignite.rs::ga10bprobe5_run`, one folded call on the ORIN-SELFUP line of
+# `tegra_early_stop` (AFTER the SD census AND the JB2b USB window: the loader reads `/boot/GA10B/` through the
+# VFS, and `/boot` binds over the disk this kernel was found on — slot card or reader card — only once both
+# are published; rung 4's post-heap-init line has no block backend at all). IMPLIES `ga10bprobe5` (the
+# loader) and `ga10bprobe4a` (rung 4a's helpers, constants, the seated 2 MiB Normal-NC window and rung 4a
+# itself, which runs first at post-heap-init and RETURNS — P5 "rung 4a re-run to BCR-ALLHELD this boot" is
+# then re-proven a second time INSIDE this rung, in its own family, before the lock). The rung: zero-MMIO
+# phase (window, pattern fill, the three reads, sizes, digests, placements — any refusal RETURNS with zero
+# MMIO and the boot continues), then rung 4a's bracket and BCR census re-proven, then rung 4b's SEVEN
+# writes with ONLY THE PAYLOAD changed (brief §5.2: BCR addresses at the three placements, `bcr_dmacfg` =
+# noncoherent|lock — SPENDS THE POWER CYCLE — `bcr_ctrl` = 0x111, `priscv_cpuctl` = startcpu), the
+# bounded `br_retcode` poll, then rung 4c's read-only oracles (the br_retcode series, priv-lockdown, the
+# v1 mirror, POSTBCR, MAPDIFF over the 30-register census, the DMA window re-digested and first-words-
+# sampled per section, MAILBOX0 read back with its meaning decided in code), the verdict (`ACR-ACCEPTED` |
+# `BROM-VERDICT-FAIL code=` | `BROM-VERDICT-PASS-UNWITNESSED code=` | `BROM-NOVERDICT` | `REFUSED
+# reason=`), and SYSTEM_OFF on every path past the lock. Address encoding: RAW (the flown 4b form) unless
+# `ga10bprobe5e` is also on. Its own write helper (`ignite5_w32`) is compiled by this feature alone; no
+# other configuration compiles it. Default OFF. ARMED polarity type-checked by the `arm-tegra-ga10bprobe5a`
+# leg. Witness family: `[ga10bprobe5a]`.
+ga10bprobe5a = ["ga10bprobe5", "ga10bprobe4a"]
+
+# GA10B-PROBE5E (`UNAOS_GA10B_PROBE5=5`): rung 5a with the SIX BCR DMA addresses written `pa >> 8`
+# (256-byte units, the encoding NVIDIA's published MIT Hopper GSP-FMC bootstrap uses — rung-5 brief §1.2),
+# the value rung 4e (`UNAOS_GA10B_PROBE4=5`, A62) flies to settle. IMPLIES `ga10bprobe5a`; changes ONE
+# constant (`ADDR_SHIFT` 0 -> 8) and tags every address announce and the verdict line `shift=8`. Both
+# forms exist so 5a can fly whichever 4e proved; when 4e's verdict is on the wire the unproven form is
+# retired. Default OFF. ARMED polarity type-checked by the `arm-tegra-ga10bprobe5e` leg. Witness family:
+# `[ga10bprobe5a]` (a tag, not a new family).
+ga10bprobe5e = ["ga10bprobe5a"]
+
+
+# GA10B-PROBE5D (`UNAOS_GA10B_PROBE5=<n>d` — `1d`, `5d`, `2d`, `7d`): the DEFERRED arm of rung 5a, rung 4d's
+# shape (Peter 2026-09-12: the desktop first, the GPU probe LAST). IMPLIES `ga10bprobe5a`. Phase 0 (the
+# loader) still runs at BOOT — the files are in the window and digest-verified before the desktop, and a
+# refusal there arms nothing — then `ga10bprobe5_run` stashes the placements + the DTB coordinates and
+# checksum and RETURNS; `ga10b_ignite::ga10bprobe5_deferred_run()` (no arguments) on a PSCI SYSTEM_OFF
+# request consumes the arm, masks DAIF, re-verifies the DTB checksum AND re-digests the three placed
+# sections in the window (no VFS read on the shutdown path), re-derives the BPMP channel and runs the
+# ignition exactly as at boot, ending in its SYSTEM_OFF; a refusal prints why and falls through to the OFF
+# it interrupted. THE HOOK in `power::psci_call` (the one-statement append beside the `ga10bprobe4d` call)
+# is OUTSIDE this arc's file list and is reported, not made; until it is folded a `d` build arms, says so,
+# and the boot ends in a plain SYSTEM_OFF. Default OFF. ARMED polarity type-checked by the
+# `arm-tegra-ga10bprobe5d` leg. Witness family: `[ga10bprobe5d]`.
+ga10bprobe5d = ["ga10bprobe5a"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:
