@@ -686,6 +686,19 @@ btdir = ["btc"]
 # DEFAULT OFF => `fs/holocron.rs`, `drivers/ehci/btbond.rs` and every call site vanish, and both
 # arches are byte-identical to a build without the knob. Kept in sync with arroyo.
 holocron = []
+# LOGIN (RULINGS R51, 2026-09-12: "keep working on multi-user so i can login, get a home folder and all").
+# UNAOS_LOGIN=1 arms the human-user line: `fs/users.rs` (the `USERS.DAT` record store at the root of
+# the root volume — name, salted SHA-256 credential, home path — and the `login`/`logout` session),
+# the SESSION PRINCIPAL in both `arch/*/syscall.rs` (a program launched while a session is open is
+# stamped `user:<name>` — the SAME per-slot principal the loader stamps and the SAME SYS_OPEN
+# owner/grants check enforces; no parallel identity), the `login`/`logout` shell arms, and the M1
+# fixture (`:: LOGIN: users+session … -> PASS ::`) on the storage-ready passes. Arch-neutral seam:
+# NOT stripped by `arm_features`, for the reason `holocron` is not (real aarch64 code; stripping
+# would disarm the knob, not preserve identity). DEFAULT OFF => `fs/users.rs` is not compiled, every
+# call site is a `#[cfg]`-erased statement folded onto an existing line (LINE-NEUTRAL, panic
+# `Location` untouched), and both arches are byte-identical (`./arroyo knoboff login`). Kept in sync
+# with arroyo; builder/src/main.rs carries no `UNAOS_LOGIN` mapping (see the LOGIN report).
+login = []
 # BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
 # `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
 # `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates

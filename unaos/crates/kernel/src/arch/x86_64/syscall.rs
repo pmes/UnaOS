@@ -13010,7 +13010,7 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
             let requested = if mode & 1 != 0 || create { CAP_READ | CAP_WRITE } else { CAP_READ };
             let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
-            if !owned_access_ok(nameid as usize, row, caller_gen, requested) {
+            if !owned_access_ok(nameid as usize, row, caller_gen, requested) { #[cfg(feature = "login")] if owned_user_ok(nameid as usize, row) { return open_created_sibling(row, srcrow, existing, nameid as usize, requested); } // LOGIN M1 — by-USER admission on a live-incarnation deny (file tail). ⚠ LINE-NEUTRAL fold.
                 return EACCES;
             }
             return open_created_sibling(row, srcrow, existing, nameid as usize, requested);
@@ -13102,7 +13102,7 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
     // them (byte-identical); it closes the create-races-create window on true SMP.
     if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
         let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
-        if !owned_access_ok(nameid as usize, row, caller_gen, CAP_READ | CAP_WRITE) {
+        if !owned_access_ok(nameid as usize, row, caller_gen, CAP_READ | CAP_WRITE) { #[cfg(feature = "login")] if owned_user_ok(nameid as usize, row) { return open_created_sibling(row, srcrow, existing, nameid as usize, CAP_READ | CAP_WRITE); } // LOGIN M1 — by-USER admission (file tail). ⚠ LINE-NEUTRAL fold.
             return EACCES;
         }
         return open_created_sibling(row, srcrow, existing, nameid as usize, CAP_READ | CAP_WRITE);
@@ -13121,7 +13121,7 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
     // install; direct-index, so it cannot fail (no fail-closed unwind). A created file is always on a private row
     // (SHARED_ROW is refused at `sys_open_dynamic`), so slot 0..USER_SLOTS is a valid gen-fenced owner.
     if !public {
-        owned_set_owner(nameid as usize, row, SLOT_GEN[row].load(Ordering::Acquire));
+        owned_set_owner(nameid as usize, row, SLOT_GEN[row].load(Ordering::Acquire)); #[cfg(feature = "login")] owned_user_stamp(nameid as usize, row); // LOGIN M1 — the creator's USER (0 = none) rides the owner row so a same-user program on another slot is admitted (file tail). ⚠ LINE-NEUTRAL append.
     }
     // U11x M2: incref AFTER the created identity is stamped and BEFORE `install_file_handle` — its EAGAIN unwind
     // routes through `files_free`, which decrefs by that identity, so every failure path pairs exactly once (an
@@ -14958,7 +14958,7 @@ pub fn clear_handle_row(slot: usize) {
     // deposit stamped for the dying tenant is dead-on-arrival for the slot's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7x-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
-    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel);
+    SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel); #[cfg(feature = "login")] slot_user_clear(slot); // LOGIN M1 — the dying tenant's user stamp goes with its generation (file tail). ⚠ LINE-NEUTRAL append.
     // WINX-7: revoke input focus if this dying slot held it, and reset its input ring — BEFORE the
     // rest of the teardown, and for the same reason the generation bump comes first: from this point
     // on nothing addressed to the old tenant may reach the slot's next one. Without the revoke, focus
@@ -16855,7 +16855,7 @@ pub fn run_user_image(
     deadline_ms: u64,
 ) -> Result<(RunOutcome, u64), &'static str> {
     let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
-    let (mapped, pi) = load_program_common(bytes)?;
+    let (mapped, pi) = load_program_common(bytes)?; #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // SPAWN-FOCUS: a foreground `run` is an operator-typed launch by construction — this entry point
     // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
@@ -16960,7 +16960,7 @@ fn spawn_user_image_bg_inner(
     no_autofocus: bool,
 ) -> Result<(u64, u64, u64), &'static str> {
     let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
-    let (mapped, pi) = load_program_common(bytes)?;
+    let (mapped, pi) = load_program_common(bytes)?; #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the
@@ -23737,4 +23737,110 @@ pub fn u7x_probe_once() {
 
     let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
     crate::arch::sched::spawn("u7x-launch", u7x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+// =====================================================================================================
+// LOGIN M1 (`login` knob, RULINGS R51) — THE SESSION PRINCIPAL, x86 twin. File tail: nothing above moves.
+// =====================================================================================================
+//
+// x86 keys its ACL by `(slot, gen)` and carries NO persistent principal (U6x, above) — there is no
+// `PrincipalRecord` on this arch to stamp `user:<name>` into. The twin therefore carries the user as its
+// users-table ID: `SESSION_USER` (0 = no session) is copied into `SLOT_USER[slot]` at the two loader
+// returns (`spawn_user_image_bg_inner`, `run_user_image` — the callers of `load_program_common`), cleared
+// with the slot's generation in `clear_handle_row`, recorded on the owner row at a private create
+// (`OWNED_USER[nameid]`), and consulted ONLY on a live-incarnation DENY in `sys_open`'s two ACL sites: a
+// caller whose slot carries the same non-zero user as the row's creator is admitted. Same seam, same
+// two call sites, one extra equality — the x86 analogue of the aarch64 by-name branch. A row wiped at
+// owner teardown reverts to PUBLIC exactly as before (the user stamp is then never consulted), and a
+// re-create re-stamps it, so no stale admission survives a name's reuse.
+//
+// HONEST RESIDUAL (reported, not hidden): x86 EL0 opens a STATIC 5-name table at the volume root
+// (`U10_NAMES`, SO20), so the M2 home-directory proof cannot run on this arch until the path-taking
+// open lands; M1's x86 proof is the session stamp + admission, driven by the shared `fs::users` fixture.
+
+/// LOGIN M1: the open session's users-table id (0 = none).
+#[cfg(feature = "login")]
+static SESSION_USER: AtomicU32 = AtomicU32::new(0);
+/// LOGIN M1: per-slot user stamp, taken at load from `SESSION_USER` (0 = anonymous).
+#[cfg(feature = "login")]
+static SLOT_USER: [AtomicU32; crate::arch::memory::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+/// LOGIN M1: the creator's user per owned name-id (0 = none), written beside `owned_set_owner`.
+#[cfg(feature = "login")]
+static OWNED_USER: [AtomicU32; N_U10_NAMES] = [const { AtomicU32::new(0) }; N_U10_NAMES];
+/// LOGIN M1: the session's name, for `session_name` (x86 has no principal string to read it from).
+#[cfg(feature = "login")]
+static SESSION_NAME: SpinMutex<([u8; 24], u8)> = SpinMutex::new(([0u8; 24], 0));
+
+/// LOGIN M1: open the session as user `id` named `name` (bounded to 24 bytes, `fs::users::name_ok`).
+#[cfg(feature = "login")]
+pub fn session_login(id: u32, name: &[u8]) -> bool {
+    if id == 0 || name.is_empty() || name.len() > 24 {
+        return false;
+    }
+    crate::arch::without_interrupts(|| {
+        let mut n = SESSION_NAME.lock();
+        n.0[..name.len()].copy_from_slice(name);
+        n.1 = name.len() as u8;
+    });
+    SESSION_USER.store(id, Ordering::Release);
+    true
+}
+
+/// LOGIN M1: close the session. Idempotent.
+#[cfg(feature = "login")]
+pub fn session_logout() {
+    SESSION_USER.store(0, Ordering::Release);
+    crate::arch::without_interrupts(|| { SESSION_NAME.lock().1 = 0; });
+}
+
+/// LOGIN M1: the open session's user name into `out` (its length), `None` with no session.
+#[cfg(feature = "login")]
+pub fn session_name(out: &mut [u8]) -> Option<usize> {
+    if SESSION_USER.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    crate::arch::without_interrupts(|| {
+        let n = SESSION_NAME.lock();
+        let len = n.1 as usize;
+        if len == 0 || len > out.len() {
+            return None;
+        }
+        out[..len].copy_from_slice(&n.0[..len]);
+        Some(len)
+    })
+}
+
+/// LOGIN M1: stamp `slot` with the session user at load (0 with no session — the pre-LOGIN behaviour).
+#[cfg(feature = "login")]
+fn slot_user_stamp(slot: usize) {
+    if slot <= crate::arch::memory::USER_SLOTS {
+        SLOT_USER[slot].store(SESSION_USER.load(Ordering::Acquire), Ordering::Release);
+    }
+}
+
+/// LOGIN M1: clear `slot`'s user stamp at teardown, beside its generation bump.
+#[cfg(feature = "login")]
+fn slot_user_clear(slot: usize) {
+    if slot <= crate::arch::memory::USER_SLOTS {
+        SLOT_USER[slot].store(0, Ordering::Release);
+    }
+}
+
+/// LOGIN M1: record the creating slot's user on the owner row (0 = none), beside `owned_set_owner`.
+#[cfg(feature = "login")]
+fn owned_user_stamp(nameid: usize, slot: usize) {
+    if nameid < N_U10_NAMES && slot <= crate::arch::memory::USER_SLOTS {
+        OWNED_USER[nameid].store(SLOT_USER[slot].load(Ordering::Acquire), Ordering::Release);
+    }
+}
+
+/// LOGIN M1: by-user admission — the caller's slot carries the same NON-ZERO user as the row's creator.
+#[cfg(feature = "login")]
+fn owned_user_ok(nameid: usize, slot: usize) -> bool {
+    if nameid >= N_U10_NAMES || slot > crate::arch::memory::USER_SLOTS {
+        return false;
+    }
+    let u = SLOT_USER[slot].load(Ordering::Acquire);
+    u != 0 && u == OWNED_USER[nameid].load(Ordering::Acquire)
 }

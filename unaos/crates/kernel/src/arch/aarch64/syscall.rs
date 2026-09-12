@@ -7786,7 +7786,7 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
     // any 8.3 name — the SOLE mint path, kernel-derived from the untrusted image, never EL0-set. Two
     // byte-identical images share a principal; two different images do not. Hashed over the WHOLE file image
     // (flat or ELF) identically.
-    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(bytes));
+    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(bytes)); #[cfg(feature = "login")] session_restamp(ttbr0 >> 48); // LOGIN M1 — with a session open the slot runs AS THE USER (`user:<name>`, the session principal `users::login` opened) instead of as its image; knob-off the statement is `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     Ok(Mapped {
         base: entry,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
@@ -16970,7 +16970,7 @@ fn principal_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usiz
             let w = hex_lower_into(&rec.value, &mut out[PFX.len()..]);
             Some(PFX.len() + w)
         }
-        _ => None, // PRIN_KERNEL_PID (reserved) / unknown -> un-projectable, fail-closed
+        _ => { #[cfg(feature = "login")] if rec.kind == PRIN_USER { return user_native_string(rec, out); } None } // PRIN_KERNEL_PID (reserved) / unknown -> un-projectable, fail-closed. LOGIN M1: the `user:<name>` kind projects verbatim (file tail). ⚠ LINE-NEUTRAL fold.
     }
 }
 
@@ -17046,7 +17046,7 @@ fn principal_from_native(s: &[u8]) -> Option<PrincipalRecord> {
         }
         return Some(PrincipalRecord { kind: PRIN_IMAGE_SHA256, len: PRIN_VALUE_LEN as u8, value });
     }
-    if s.starts_with(b"prog:") {
+    #[cfg(feature = "login")] if let Some(r) = user_from_native(s) { return Some(r); } if s.starts_with(b"prog:") { // LOGIN M1: the `user:` reverse arm, tried first (file tail). ⚠ LINE-NEUTRAL fold.
         // `program` stores the verbatim bytes (truncated to 30) with kind PROGRAM_NAME — the exact
         // inverse of `principal_native_string`'s verbatim copy for a PROGRAM_NAME principal.
         if s.len() > PRIN_VALUE_LEN {
@@ -23923,4 +23923,106 @@ pub fn virt_el0_verdict(_: usize) {
 #[cfg(feature = "virt_tick")]
 pub fn el0_spin_done() -> u32 {
     EL0_SPIN_DONE.load(Ordering::Acquire)
+}
+
+// =====================================================================================================
+// LOGIN M1 (`login` knob, RULINGS R51) — THE SESSION PRINCIPAL. File tail: nothing above moves.
+// =====================================================================================================
+//
+// A human user is a principal of kind `PRIN_USER`, canonical string `user:<name>` (SECURITY.md's POSIX
+// hedge, taken: a named bundle of capabilities on the SAME `owner`/`grants:*` attributes). The session is
+// ONE record, opened by `fs::users::login` after the credential verified and closed by `logout`. While it
+// is open, `map_image_into_slot`'s stamp line (the SOLE mint path) is followed by `session_restamp`, so
+// every program launched in the session carries the user principal in `SLOT_PPID` — the same slot the
+// loader stamps, read by the same `current_principal()` at SYS_OPEN, compared by the same
+// `owned_access_ok` by-name branch, persisted through the same K4 codec (`user:` arms below). There is no
+// second table and no second check: a user's file is owned by `user:<name>` exactly as a program's file is
+// owned by `sha256:<digest>`, and an open by any other principal is the existing -EACCES.
+//
+// FAIL-CLOSED ALREADY: `owned_set_owner`/`owned_grant`/`owned_access_ok` refuse only `PRIN_KERNEL_REPLY`
+// explicitly and admit every other kind by VALUE equality, so `PRIN_USER` is enforced with no change to
+// them. Programs already running when the session closes keep their stamp (a stamp is per slot, taken at
+// load; teardown clears it as before) — the session boundary is the LAUNCH, not the clock.
+
+/// LOGIN M1: the human-user principal kind — `user:<name>`. Value = the verbatim canonical string.
+#[cfg(feature = "login")]
+const PRIN_USER: u8 = 5;
+
+/// LOGIN M1: the open session's principal (NONE = no session). Written by `session_login`/`session_logout`
+/// from ordinary context; read under the IRQ-masked lock at every restamp.
+#[cfg(feature = "login")]
+static SESSION: SpinMutex<PrincipalRecord> = SpinMutex::new(PrincipalRecord::NONE);
+
+/// LOGIN M1: the `user:<name>` principal for a validated name (`fs::users::name_ok` bounds it to 24 bytes,
+/// so 5 + 24 = 29 <= the 30-byte value field; a longer name is refused, never truncated).
+#[cfg(feature = "login")]
+fn user_principal(name: &[u8]) -> Option<PrincipalRecord> {
+    if name.is_empty() || 5 + name.len() > PRIN_VALUE_LEN {
+        return None;
+    }
+    let mut value = [0u8; PRIN_VALUE_LEN];
+    value[..5].copy_from_slice(b"user:");
+    value[5..5 + name.len()].copy_from_slice(name);
+    Some(PrincipalRecord { kind: PRIN_USER, len: (5 + name.len()) as u8, value })
+}
+
+/// LOGIN M1: open the session as `name`. `_id` is the users-table id the x86 twin carries; aarch64 carries
+/// the name itself. `false` = the name does not fit a principal (no session change).
+#[cfg(feature = "login")]
+pub fn session_login(_id: u32, name: &[u8]) -> bool {
+    let Some(p) = user_principal(name) else { return false };
+    let _irq = IrqGuard::mask_save();
+    *SESSION.lock() = p;
+    true
+}
+
+/// LOGIN M1: close the session. Idempotent.
+#[cfg(feature = "login")]
+pub fn session_logout() {
+    let _irq = IrqGuard::mask_save();
+    *SESSION.lock() = PrincipalRecord::NONE;
+}
+
+/// LOGIN M1: the open session's user name into `out` (its length), `None` with no session.
+#[cfg(feature = "login")]
+pub fn session_name(out: &mut [u8]) -> Option<usize> {
+    let p = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
+    if p.kind != PRIN_USER || (p.len as usize) < 5 {
+        return None;
+    }
+    let n = p.len as usize - 5;
+    if n > out.len() {
+        return None;
+    }
+    out[..n].copy_from_slice(&p.value[5..5 + n]);
+    Some(n)
+}
+
+/// LOGIN M1: after the loader's image stamp, restamp `asid` with the session principal when a session is
+/// open. Appended on the stamp line in `map_image_into_slot`; a no-op with no session, so every fixture
+/// that runs before a login (the whole battery) is byte-for-byte the pre-LOGIN behaviour.
+#[cfg(feature = "login")]
+fn session_restamp(asid: u64) {
+    let p = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
+    if p.kind == PRIN_USER {
+        slot_ppid_stamp(asid, p);
+    }
+}
+
+/// LOGIN M1: the K4 codec's forward arm for `PRIN_USER` — the value IS the canonical string (like `prog:`).
+#[cfg(feature = "login")]
+fn user_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
+    let n = core::cmp::min(rec.len as usize, PRIN_VALUE_LEN);
+    if n > out.len() {
+        return None;
+    }
+    out[..n].copy_from_slice(&rec.value[..n]);
+    Some(n)
+}
+
+/// LOGIN M1: the K4 codec's reverse arm — `user:<name>` (bounded, verbatim) or `None`.
+#[cfg(feature = "login")]
+fn user_from_native(s: &[u8]) -> Option<PrincipalRecord> {
+    let rest = s.strip_prefix(b"user:")?;
+    user_principal(rest)
 }

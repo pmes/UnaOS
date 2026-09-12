@@ -305,6 +305,10 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("grep", Avail::Always), ("wc", Avail::Always), ("df", Avail::Always),
     ("mount", Avail::Always), ("env", Avail::Always), ("set", Avail::Always),
     ("history", Avail::Always), ("sleep", Avail::Always), ("which", Avail::Always),
+    // LOGIN (RULINGS R51): `login <name> <password>` / `logout` — the human-user session. Host verbs
+    // because only the ring holds the record store and the session principal (fs/users.rs); ONE-OS
+    // words, `Avail::Always`: the platform decides the answer, never whether the word exists.
+    ("login", Avail::Always), ("logout", Avail::Always),
 ];
 
 /// The canonical (lower-case) spelling of a typed word.

@@ -105,7 +105,7 @@ pub mod install;
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
-    feature = "holocron", feature = "selfup", feature = "facet" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved.
+    feature = "holocron", feature = "selfup", feature = "facet", feature = "login" // LOGIN: fs/users.rs CRC-32s its store and SHA-256s the credential. ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved.
 ))]
 pub mod hash;
 

@@ -5072,7 +5072,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // only file bytes are real; a directory's size is the recursive sum of its files.
             fs_du(console, args.first().copied().unwrap_or("."));
         },
-        "uptime" => {
+        #[cfg(feature = "login")] "login" | "logout" => { crate::fs::users::shell_verb(command, &args, console); } "uptime" => { // LOGIN M1 — `login <name> <password>` / `logout` (fs/users.rs); reachable once midden_core's HOST_VERBS knows the two words (reported, not edited here). ⚠ LINE-NEUTRAL fold.
             // JD18: seconds since boot from the architectural counter (aarch64 CNTPCT/CNTFRQ),
             // rendered `up HH:MM:SS`; when the JD17 wall clock is set, the current time is appended.
             // x86 has no calibrated counter plumbed → an honest note.

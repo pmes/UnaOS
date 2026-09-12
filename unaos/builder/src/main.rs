@@ -376,6 +376,10 @@ fn main() {
     // banner. M1 issues no HCI command and touches no radio. Default OFF => modules and call sites
     // unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_HOLOCRON").is_ok() { feats.push("holocron"); }
+    // LOGIN (RULINGS R51): UNAOS_LOGIN=1 arms the human-user line — fs/users.rs (the USERS.DAT record
+    // store), the session principal in both syscall.rs, the login/logout shell arms and the M1 fixture.
+    // Kept in sync with arroyo's map (the knob→builder wiring gate holds this line to it).
+    if std::env::var("UNAOS_LOGIN").is_ok() { feats.push("login"); }
     // BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests
     // (`holocron::selftest_once`, `btbond::selftest_once`). Its own knob and NOT part of
     // UNAOS_HOLOCRON, by the same rule that gives `sdw` a knob apart from `sdhcblk`: a boot that did

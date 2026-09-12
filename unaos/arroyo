@@ -569,6 +569,16 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (s42/INSTGUI, WXN-M3b).
 [ -n "${UNAOS_HCRONST:-}" ] && _feats="${_feats}hcronst,"
+# LOGIN (RULINGS R51): UNAOS_LOGIN=1 arms the human-user line — `fs/users.rs` (the `/USERS.DAT`
+# record store: name, salted SHA-256 credential, home path; `login`/`logout`), the SESSION PRINCIPAL
+# in both `arch/*/syscall.rs` (a program launched in a session is stamped `user:<name>` into the SAME
+# per-slot principal the loader stamps; the SAME SYS_OPEN owner/grants check enforces it), the shell
+# arms, and the M1 fixture `:: LOGIN: users+session … -> PASS ::` on the storage-ready passes. NOT
+# stripped by `arm_features`, for the reason `holocron` is not. Default OFF => module and every call
+# site vanish, both arches byte-identical (`./arroyo knoboff login`). NOTE: builder/src/main.rs
+# carries NO `UNAOS_LOGIN` mapping (outside the LOGIN executor's files) — until it does, `./arroyo
+# test` (x86, built by the builder) cannot compile the knob; `test-arm` builds from this map and can.
+[ -n "${UNAOS_LOGIN:-}" ] && _feats="${_feats}login,"
 # PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — one real capture
 # to SCREEN<n>.PNG at the volume root, then a read-back of what landed on the medium. Its own knob,
 # and NOT part of any other, by the rule stated for UNAOS_HCRONST above: a boot that did not ask to
@@ -3324,7 +3334,7 @@ KERNEL_CFG_MATRIX=(
   # WIRING CHECK below.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -3340,7 +3350,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3749,7 +3759,7 @@ KERNEL_CFG_MATRIX=(
   # widest tegra desk cross, so the armed key path is type-checked against every desk knob it flies
   # with. Universe side effect: NONE — `holocron` is named on `x86-all`, so it was never "aarch64-only"
   # and `x86_cfg_universe` is unchanged.
-  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron"
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron,login"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
@@ -4366,7 +4376,7 @@ KERNEL_CFG_MATRIX=(
   #
   # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
   # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
-  "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0"
+  "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,login"
   # VIRTPREEMPT (orin 17) — THE PREEMPTIVE TWIN OF THE LEG ABOVE, and not redundant with it. `virt_tick`
   # is the ONLY configuration in the tree where the `exceptions.rs` `irq_bank!`/`irq_unbank!` runtime
   # `CurrentEL` arm is selected WITHOUT `tegra`, so it is the only leg that type-checks that arm against a
@@ -7454,6 +7464,14 @@ kernel8() {
     # coordinate with orin 0's UnaFS layout — the baton forbids building on FAT twice).
     # OFF => fs/fatperf.rs is not compiled, both fs/mod.rs shims inline to nothing, and kernel8.img
     # is byte-identical to baseline (the call sites are line-neutral edits to fat.rs/vfs.rs).
+    # LOGIN (RULINGS R51): UNAOS_LOGIN=1 adds the `login` feature — the human-user record store,
+    # the session principal, the shell arms and the M1 fixture (see the knob's block near the top of
+    # this file). OFF => fs/users.rs is not compiled, every call site is a `#[cfg]`-erased statement
+    # folded onto an existing line, and kernel8.img is byte-identical to baseline.
+    if [ -n "${UNAOS_LOGIN:-}" ]; then
+        K8_FEATS="${K8_FEATS},login"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOGIN: human users — /USERS.DAT record store, login/logout session principal (user:<name>), M1 fixture${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"
         echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"

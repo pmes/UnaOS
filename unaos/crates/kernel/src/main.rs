@@ -1211,7 +1211,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
             // because which pass a given build reaches depends on its knobs.
             #[cfg(feature = "holocron")]
-            unaos_kernel::fs::holocron::service();
+            unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // LOGIN M1 — the user store loads once the root volume answers and the M1 fixture runs once; same pass, same reason as holocron. ⚠ LINE-NEUTRAL append.
             // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
             // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
             // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -1701,7 +1701,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service();
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -5962,7 +5962,7 @@ fn x86_usb_pump(cpu: usize) {
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service();
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
