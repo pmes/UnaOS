@@ -111,6 +111,10 @@ Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51
 · media-writer.sh is un-versioned (rmbp B97).
 · winmenu APP_OWNER unregistered WinId holder (pi 10's question) — prove or refute.
 
+## BENCH FACTS THIS ROUND (orin 27, 2026-09-12)
+· A whole-card image NEVER lives inside a `--src` staged tree: `media-writer.sh --src` copies the entire tree onto the 127 MiB FAT, so the 640 MiB `UnaOS-orin-card.img` filled the volume mid-copy ("No space left on device", 1 of 11 files differ, card left mounted). Stage it BESIDE the tree as `<name>.card.img` and list it in the top-level MANIFEST only. Writer gap to close (trunk queue): a C14 "the staged tree fits the target FAT" preflight, and an unmount-on-failure that does not leave a partial file behind.
+· The idle Debug Probe port drips single NUL bytes: a GROWTH waker can false-fire on one byte; re-anchor and re-arm.
+
 ## STANDING — how this seat reads, after a day of getting it wrong
     git log --all --not HEAD -- <file>                    # what I lack: an enumeration, not a pick
     git ls-tree -r --name-only <ref> -- docs/ | comm -23 - <mine>   # files I don't know exist
