@@ -128,6 +128,8 @@ volume, which is the outcome §1.2's knob produced, reached without naming the b
 /boot      → the volume this machine booted from
 /apps      → the programs on that volume   (= /boot's APPS/ directory)
 /usb       → the hot-plugged FAT stick, when it enumerates
+/home      → the users' home directories on the EL0 FAT volume (LOGIN M2, 2026-09-12): `HOME/<NAME>`
+             is created at that user's FIRST LOGIN, never laid out empty
 ```
 
 **`/boot`, not `/fat`.** Peter's ruling: `/fat` names a *filesystem*, which is an implementation
@@ -233,11 +235,26 @@ that is not a change to make under a boot deadline. The defaulted accessors abov
 
 ---
 
+### 2.4 `/home` — from the day a user exists (LOGIN M2)
+
+RULINGS R51 ("login, get a home folder and all"). `HOME/` at the root of the EL0 FAT volume — the
+volume `SYS_OPEN` names files on, so a user's programs can reach their files — and `HOME/<NAME>` inside
+it, created by `fs::users::ensure_home` at that user's first login (`[users] home=/home/<name> created
+volume=el0-fat`) and idempotent after (`exists`). Nothing is created for a user who has never logged
+in, and `HOME/` itself appears with the first one. User names are 8.3 leaves (1-8 bytes, `[a-z0-9_-]`,
+first a letter) because the directory is. FAT carries no owner attribute: the DIRECTORY has no ACL row
+(LEDGER SO35); the FILES a program creates inside it are owned by `user:<name>` through the SYS_OPEN
+owner/grants rows like any private create, and the knob-on aarch64 `sys_open` walks a `/`-separated
+path (`HOME/UNA/NOTES.TXT`) to reach them — the first step on SO20 (x86 still opens its static root
+table). On a Pi whose `/` is native UnaFS the home still lives on the FAT boot volume for the same
+reason (EL0 opens FAT); the native, owner-attributed home moves with the native-EL0 namespace.
+
 ## 3. Nothing empty was created
 
-Peter's ruling: lay out only what exists. There is **no** `/etc`, `/home`, `/tmp`, `/var`,
+Peter's ruling: lay out only what exists. There is **no** `/etc`, `/tmp`, `/var`,
 `/bin`, `/lib`, `/dev` or `/proc` — not as directories, not as mount points, not as reserved
-prefixes. Every one of those would be a promise about a subsystem that does not exist yet, and an
+prefixes. (`/home` joined the namespace on 2026-09-12 under the same rule: it exists only once a user
+does, §2.4.) Every one of those would be a promise about a subsystem that does not exist yet, and an
 empty directory in a listing is a question the operator cannot answer.
 
 `/apps` is created because programs exist and were already being staged somewhere; `/boot` is a

@@ -101,9 +101,11 @@ const USERS_HDR_CRC_SPAN: usize = 12;
 /// One row's stride on disk and the span its CRC covers.
 pub const USERS_ROW_LEN: usize = 128;
 const USERS_ROW_CRC_SPAN: usize = 106;
-/// Bounds. `NAME_MAX` keeps `user:<name>` inside the 30-byte principal value field (5 + 24 = 29).
+/// Bounds. `NAME_MAX` is 8 since M2: the home directory is a FAT 8.3 leaf (`HOME/<NAME>`) on the EL0
+/// volume, so a name is at most 8 bytes (the on-disk row keeps its 24-byte field; `user:<name>` is at
+/// most 13, inside the 30-byte principal value field).
 pub const MAX_USERS: usize = 8;
-pub const NAME_MAX: usize = 24;
+pub const NAME_MAX: usize = 8;
 pub const HOME_MAX: usize = 32;
 const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
@@ -114,7 +116,8 @@ pub const USERS_PATH: &str = "/USERS.DAT";
 pub const USERS_TMP_PATH: &str = "/USERS.NEW";
 /// The image bound: header + a full table.
 pub const USERS_IMAGE_MAX: usize = USERS_HDR_LEN + USERS_ROW_LEN * MAX_USERS;
-/// Where a home lands: `/home/<name>` (LOGIN M2 creates it; M1 only records the path).
+/// Where a home lands: `/home/<name>` — `HOME/<NAME>` on the EL0 FAT volume, created at the first login
+/// ([`ensure_home`], M2).
 pub const HOME_ROOT: &str = "/home";
 
 // =========================================================================================
@@ -187,7 +190,7 @@ impl UserRec {
     }
 }
 
-/// A user name: 1..=24 bytes of `[a-z0-9_-]`, first byte a letter. Lower-case only so the
+/// A user name: 1..=8 bytes of `[a-z0-9_-]`, first byte a letter. Lower-case only so the
 /// principal string is canonical without a fold, and so a name is a valid 8.3 leaf on a FAT home.
 pub fn name_ok(n: &[u8]) -> bool {
     if n.is_empty() || n.len() > NAME_MAX {
@@ -539,6 +542,12 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     if !arch_session_login(id, name) {
         return Err(UsersError::Refused);
     }
+    // M2: `/home/<name>` exists from the first login on — created here, on the EL0 FAT volume. A volume
+    // that cannot take the write (read-only, vetoed) still opens the session: the home is owed, not the
+    // login, and the witness line names the refusal.
+    if let Err(e) = ensure_home(name) {
+        serial_println!("[users] home=/home/{} NOT created reason={} volume=el0-fat", core::str::from_utf8(name).unwrap_or("?"), users_reason(e));
+    }
     {
         let mut s = SESSION_LOCAL.lock();
         s.0[..name.len()].copy_from_slice(name);
@@ -554,6 +563,67 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         core::str::from_utf8(&nb[..name.len()]).unwrap_or("?")
     );
     Ok(())
+}
+
+/// M2: make `/home/<name>` exist on the EL0 FAT volume — `HOME/` at the root, `<NAME>` inside it —
+/// idempotent. Returns `"created"` or `"exists"`. FAT carries no owner attribute: the DIRECTORY has no
+/// ACL row (LEDGER SO35); the FILES a program creates inside it are owned through the SYS_OPEN
+/// owner/grants rows exactly as any private create, and that is what the home ACL proof exercises.
+pub fn ensure_home(name: &[u8]) -> Result<&'static str, UsersError> {
+    let fs = crate::fs::fat::mount().map_err(|_| UsersError::Volume)?;
+    let home_fc = match fs.locate_in_dir(0, "HOME") {
+        Ok((de, _, _)) if de.is_dir => de.first_cluster(),
+        Ok(_) => return Err(UsersError::Volume),
+        Err(FatError::NotFound) => {
+            if fs.write_veto().is_some() {
+                return Err(UsersError::Volume);
+            }
+            fs.create_dir(0, "HOME").map_err(map_fat)?.0.first_cluster()
+        }
+        Err(e) => return Err(map_fat(e)),
+    };
+    let leaf = core::str::from_utf8(name).map_err(|_| UsersError::BadName)?;
+    let verdict = match fs.locate_in_dir(home_fc, leaf) {
+        Ok((de, _, _)) if de.is_dir => "exists",
+        Ok(_) => return Err(UsersError::Volume),
+        Err(FatError::NotFound) => {
+            if fs.write_veto().is_some() {
+                return Err(UsersError::Volume);
+            }
+            fs.create_dir(home_fc, leaf).map_err(map_fat)?;
+            "created"
+        }
+        Err(e) => return Err(map_fat(e)),
+    };
+    serial_println!("[users] home=/home/{} {} volume=el0-fat", leaf, verdict);
+    Ok(verdict)
+}
+
+/// M2 fixture: the home ACL proof where the syscall layer exists (see [`arch_session_login`]);
+/// `"unlinked"` on an image with no EL0 regime.
+#[cfg(feature = "loginst")]
+fn home_acl_proof(name: &[u8]) -> &'static str {
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))]
+    {
+        let mut p = [0u8; 32];
+        let pre = b"HOME/";
+        p[..5].copy_from_slice(pre);
+        p[5..5 + name.len()].copy_from_slice(name);
+        let tail = b"/NOTES.TXT";
+        p[5 + name.len()..5 + name.len() + tail.len()].copy_from_slice(tail);
+        let path = core::str::from_utf8(&p[..5 + name.len() + tail.len()]).unwrap_or("HOME/X/NOTES.TXT");
+        return if crate::arch::syscall::home_acl_fixture(path) { "ok" } else { "FAIL" };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let id = id_of(name).unwrap_or(0);
+        return if crate::arch::syscall::home_acl_fixture(id) { "ok" } else { "FAIL" };
+    }
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0"))))]
+    {
+        let _ = name;
+        "unlinked"
+    }
 }
 
 /// Log out: close the session. Programs already running keep the principal they were stamped
@@ -682,6 +752,7 @@ pub fn service() {
     match try_load() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
+            #[cfg(feature = "loginst")]
             login_fixture();
         }
         Err(e) => {
@@ -695,6 +766,7 @@ pub fn service() {
                 // registered disk (`Io`, `BadChain`, `Unsupported`, …) IS a defect and takes the FAIL form.
                 SERVICED.store(true, Ordering::Relaxed);
                 serial_println!("[users] el0-fat volume did not mount after {} passes — last={:?} — store unavailable this boot", n, e);
+                #[cfg(feature = "loginst")]
                 if matches!(e, FatError::NotFat | FatError::NoDisk) {
                     serial_println!(":: LOGIN: users+session -> SKIPPED — no FAT volume in this harness (last={:?}; UNAOS_FATIMG=sf attaches one) ::", e);
                 } else {
@@ -711,11 +783,12 @@ static MOUNT_REFUSALS: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 /// QEMU virt the loan clears within a handful of passes, so 4096 is a wall, not a wait.
 const MOUNT_REFUSAL_BOUND: u32 = 4096;
 
-/// LOGIN M1 fixture — the one QEMU-hosted proof the executor brief names for this milestone:
+/// LOGIN fixture (`loginst` — a BOOT-TIME WRITE: user `una` with a KNOWN password) — the one QEMU-hosted proof the executor brief names for this milestone:
 /// create a user, verify ok, wrong password refused, login opens the session under `user:<name>`,
 /// logout closes it. Prints ONE verdict line; the `-> FAIL —` form is a `scan_serial_faults`
 /// forbid, so a red run reds the leg with no spec needed. Idempotent across boots that share a
 /// card: an existing `una` is re-used (`create=exists`), and the record's own hash is what verifies.
+#[cfg(feature = "loginst")]
 pub fn login_fixture() {
     const NAME: &[u8] = b"una";
     const PW: &[u8] = b"correct-horse";
@@ -735,20 +808,24 @@ pub fn login_fixture() {
     let none_before = whoami(&mut nb).is_none();
     let login_ok = login(NAME, PW).is_ok();
     let principal_ok = matches!(whoami(&mut nb), Some(n) if &nb[..n] == NAME);
+    let home = match ensure_home(NAME) { Ok(v) => v, Err(_) => "FAIL" };
+    let acl = home_acl_proof(NAME);
     logout();
     let none_after = whoami(&mut nb).is_none();
-    let all = verify_ok && wrong_refused && wrong_login_refused && none_before && login_ok && principal_ok && none_after;
+    let all = verify_ok && wrong_refused && wrong_login_refused && none_before && login_ok && principal_ok && none_after && home != "FAIL" && acl != "FAIL";
     if all {
         serial_println!(
-            ":: LOGIN: users+session create={} verify=ok wrong=refused login=ok principal=user:una linked={} logout=ok users={} volume={} -> PASS ::",
+            ":: LOGIN: users+session create={} verify=ok wrong=refused login=ok principal=user:una linked={} home={} acl={} logout=ok users={} volume={} -> PASS ::",
             create,
             principal_linked(),
+            home,
+            acl,
             count(),
             vol
         );
     } else {
         serial_println!(
-            ":: LOGIN: users+session -> FAIL — create={} verify={} wrong_refused={} wrong_login_refused={} none_before={} login={} principal={} none_after={} volume={} ::",
+            ":: LOGIN: users+session -> FAIL — create={} verify={} wrong_refused={} wrong_login_refused={} none_before={} login={} principal={} none_after={} home={} acl={} volume={} ::",
             create,
             verify_ok,
             wrong_refused,
@@ -757,6 +834,8 @@ pub fn login_fixture() {
             login_ok,
             principal_ok,
             none_after,
+            home,
+            acl,
             vol
         );
     }

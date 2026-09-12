@@ -697,8 +697,18 @@ holocron = []
 # would disarm the knob, not preserve identity). DEFAULT OFF => `fs/users.rs` is not compiled, every
 # call site is a `#[cfg]`-erased statement folded onto an existing line (LINE-NEUTRAL, panic
 # `Location` untouched), and both arches are byte-identical (`./arroyo knoboff login`). Kept in sync
-# with arroyo; builder/src/main.rs carries no `UNAOS_LOGIN` mapping (see the LOGIN report).
-login = []
+# with arroyo and builder/src/main.rs. Forwards `midden_core/login` so the two host-verb rows exist
+# only knob-on (M2: the rows were the whole knob-off movement, 64 B arm / 128 B x86).
+login = ["midden_core/login"]
+# LOGIN SELFTESTS: UNAOS_LOGINST=1 arms the LOGIN fixtures — the M1 users+session proof (which CREATES a
+# user `una` with a KNOWN password in `USERS.DAT`, a BOOT-TIME WRITE of the boot medium), the M2 home
+# proof (`HOME/UNA` + a private file created and deleted) and the M3 screen proof (the login screen driven
+# by keys). Its own knob and NOT part of `login`, by the rule that gives `hcronst` a knob apart from
+# `holocron` and `prtscrst` its own: a boot that did not ask to WRITE its boot medium must be incapable
+# of doing so, and a shipping `login` boot must never carry a fixture credential (a known password on
+# the card IS a plaintext credential on disk). Implies `login`. DEFAULT OFF => the fixtures and their
+# call sites vanish.
+loginst = ["login"]
 # BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
 # `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
 # `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates

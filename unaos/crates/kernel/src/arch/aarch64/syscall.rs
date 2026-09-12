@@ -8991,7 +8991,7 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
 
 /// The longest name `sys_open` accepts: a FAT 8.3 short name is at most "NAMENAME.EXT" = 8 + '.' + 3 = 12
 /// bytes. A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
-const MAX_NAME: usize = 12;
+#[cfg(not(feature = "login"))] const MAX_NAME: usize = 12; #[cfg(feature = "login")] const MAX_NAME: usize = 40; // LOGIN M2 — SO20's first ABI step: knob-on a PATH (`HOME/UNA/NOTES.TXT`, at most 5+8+1+12 = 26) fits; knob-off the bound is the original 12, verbatim. ⚠ LINE-NEUTRAL fold.
 
 /// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
 /// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
@@ -9072,7 +9072,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // create writes only one directory sector (no cluster/FAT touched) and is still a "fallible lookup before
     // any resource claim" — its own failures (name / no-space) return cleanly.
     let mut created = false; // U6: did THIS open create a NEW name (-> the caller becomes its owner)?
-    let (de, dir_lba, dir_off) = match fs.find_located(name) {
+    #[cfg(feature = "login")] let (de, dir_lba, dir_off) = match open_locate(&fs, name, mode, &mut created) { Ok(t) => t, Err(e) => return e }; #[cfg(not(feature = "login"))] let (de, dir_lba, dir_off) = match fs.find_located(name) { // LOGIN M2 — knob-on the name may carry `/` components (a directory walk from the root, the leaf found or O_CREAT-created in its parent; a bare leaf walks exactly this statement's path); knob-off this statement is the original root-only find/create, verbatim. ⚠ LINE-NEUTRAL fold.
         Ok(t) => t,
         Err(crate::fs::fat::FatError::NotFound) => {
             if mode & O_CREAT == 0 {
@@ -9171,7 +9171,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // `native_acl_write`'s own with_unafs MOUNT hold is the serializer). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
     // the disk here, so the 23-fixture path stays byte-identical. A persist failure is non-fatal: the in-RAM
     // ACL still enforces THIS boot; only cross-reboot survival is lost (fails closed to PUBLIC at next mount).
-    if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE {
+    #[cfg(feature = "login")] if name.contains('/') { return h as i64; } if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE { // LOGIN M2 — a PATH-opened file is not persisted by name (the native rebuild key is an 8.3 ROOT name, LEDGER SO35): its owner row lives for the boot. ⚠ LINE-NEUTRAL fold.
         let _ = native_persist_create(name, de.first_cluster(), dir_lba, dir_off as u32, caller_ppid);
     }
     h as i64
@@ -24025,4 +24025,127 @@ fn user_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
 fn user_from_native(s: &[u8]) -> Option<PrincipalRecord> {
     let rest = s.strip_prefix(b"user:")?;
     user_principal(rest)
+}
+
+// =====================================================================================================
+// LOGIN M2 (`login` knob) — THE PATH OPEN and the HOME ACL PROOF. File tail: nothing above moves.
+// =====================================================================================================
+//
+// SO20 said the EL0 namespace is a flat 8.3 volume root because `sys_open` takes a LEAF. This is the ABI
+// step that ruling asked for, taken only as far as `/home/<user>` needs: knob-on, a name may carry `/`
+// components; every component but the last must resolve to a DIRECTORY (`locate_in_dir` from the root,
+// cluster 0), and the leaf is found — or with O_CREAT created — in the LEAF'S PARENT. A bare leaf walks
+// exactly the old path (`locate_in_dir(0, leaf)` IS `find_located`, `create_in_dir(0, ..)` IS
+// `create_in_root`), so every existing fixture is untouched. The file's ACL identity stays
+// `(dir_lba, dir_off)` — the slot of the entry wherever it sits — so `owned_set_owner`/`owned_access_ok`
+// are unchanged. Error mapping is the original's, plus `-ENOTDIR` for a component that is a file.
+
+/// LOGIN M2: a path component that is a file (sys_open had no directory vocabulary before this).
+#[cfg(feature = "login")]
+const ENOTDIR: i64 = -20;
+
+/// LOGIN M2: resolve `name` (a leaf or a `/`-separated path) on the EL0 FAT volume; create the leaf in
+/// its parent on O_CREAT. `Ok((entry, dir_lba, dir_off))`, `Err(errno)` in `sys_open`'s own vocabulary.
+#[cfg(feature = "login")]
+fn open_locate(
+    fs: &crate::fs::fat::FatFs,
+    name: &str,
+    mode: u64,
+    created: &mut bool,
+) -> Result<(crate::fs::fat::DirEntry, u64, usize), i64> {
+    use crate::fs::fat::FatError;
+    let mut parent: u32 = 0; // the root
+    let mut it = name.split('/').filter(|c| !c.is_empty()).peekable();
+    let mut leaf: &str = "";
+    while let Some(c) = it.next() {
+        if it.peek().is_none() {
+            leaf = c;
+            break;
+        }
+        match fs.locate_in_dir(parent, c) {
+            Ok((de, _, _)) if de.is_dir => parent = de.first_cluster(),
+            Ok(_) => return Err(ENOTDIR),
+            Err(FatError::NotFound) => return Err(ENOENT),
+            Err(FatError::Busy) => return Err(EAGAIN),
+            Err(_) => return Err(EIO),
+        }
+    }
+    if leaf.is_empty() {
+        return Err(EINVAL);
+    }
+    if leaf.eq_ignore_ascii_case(ATR_NAME) {
+        return Err(EACCES); // the kernel's own ACL store, wherever it is named (K1 M4's rule, path form)
+    }
+    match fs.locate_in_dir(parent, leaf) {
+        Ok(t) => Ok(t),
+        Err(FatError::NotFound) => {
+            if mode & O_CREAT == 0 {
+                return Err(ENOENT);
+            }
+            match fs.create_in_dir(parent, leaf, 0x20 /* ATTR_ARCHIVE — a plain file */) {
+                Ok(t) => {
+                    *created = true;
+                    Ok(t)
+                }
+                Err(FatError::Unsupported) => Err(EINVAL),
+                Err(FatError::NoSpace) => Err(ENOSPC),
+                Err(FatError::Busy) => Err(EAGAIN),
+                Err(_) => Err(EIO),
+            }
+        }
+        Err(FatError::Busy) => Err(EAGAIN),
+        Err(_) => Err(EIO),
+    }
+}
+
+/// LOGIN M2 fixture (`loginst`): the HOME ACL PROOF, kernel-side, on the real ACL tables and the real
+/// path resolver (the K3 idiom — scratch ASIDs, no EL0 blob). `path` is `HOME/<NAME>/NOTES.TXT`. With a
+/// session open: ASID 6 is restamped `user:<name>` (what a program launched in the session carries) and
+/// creates the file PRIVATE; ASID 7 is anonymous (the pre-login world) and is REFUSED; ASID 8, restamped
+/// `user:<name>` as a LATER launch (a different incarnation), is ADMITTED by name — "another app under
+/// the principal". Cleaned up: row cleared, file deleted, stamps cleared. Prints one detail line.
+#[cfg(feature = "loginst")]
+pub fn home_acl_fixture(path: &str) -> bool {
+    const A_USER: u64 = 6;
+    const A_ANON: u64 = 7;
+    const A_USER2: u64 = 8;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(e) => {
+            serial_println!("[users] home-acl: el0-fat mount refused ({:?})", e);
+            return false;
+        }
+    };
+    slot_ppid_clear(A_ANON);
+    session_restamp(A_USER);
+    session_restamp(A_USER2);
+    let p_user = slot_ppid_of(A_USER);
+    let p_anon = slot_ppid_of(A_ANON);
+    let p_user2 = slot_ppid_of(A_USER2);
+    let mut created = false;
+    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+        Ok(t) => t,
+        Err(e) => {
+            serial_println!("[users] home-acl: open_locate({}) -> errno {}", path, e);
+            slot_ppid_clear(A_USER);
+            slot_ppid_clear(A_USER2);
+            return false;
+        }
+    };
+    let g_user = ASID_GEN[A_USER as usize].load(Ordering::Acquire);
+    let g_anon = ASID_GEN[A_ANON as usize].load(Ordering::Acquire);
+    let g_user2 = ASID_GEN[A_USER2 as usize].load(Ordering::Acquire);
+    let owned = owned_set_owner(lba, off as u32, A_USER, g_user, p_user);
+    let anon_refused = !owned_access_ok(lba, off as u32, A_ANON, g_anon, CAP_READ, p_anon);
+    let owner_ok = owned_access_ok(lba, off as u32, A_USER, g_user, CAP_READ | CAP_WRITE, p_user);
+    let same_user_ok = owned_access_ok(lba, off as u32, A_USER2, g_user2, CAP_READ, p_user2);
+    owned_clear(lba, off as u32);
+    let deleted = fs.delete_located(lba, off, de.first_cluster()).is_ok();
+    slot_ppid_clear(A_USER);
+    slot_ppid_clear(A_USER2);
+    serial_println!(
+        "[users] home-acl path={} created={} owned={} anon_refused={} owner_ok={} same_user_ok={} deleted={} principal_kind={}",
+        path, created, owned, anon_refused, owner_ok, same_user_ok, deleted, p_user.kind
+    );
+    created && owned && anon_refused && owner_ok && same_user_ok && p_user.kind == PRIN_USER
 }

@@ -101,6 +101,14 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   by `user:<name>`; a later open by that user (any program, any slot, after reboot on aarch64 via
   the by-name branch) is admitted; any other principal is the existing `-EACCES`. Programs already
   running when the session closes keep their stamp — the boundary is the launch, not the clock.
+* **`/home/<name>` (M2):** created on the EL0 FAT volume at the user's first login (`HOME/<NAME>`, an
+  8.3 leaf, so a user name is 1-8 bytes). The directory carries no owner (FAT has none; LEDGER SO35);
+  the files a session's programs create inside are owned by `user:<name>` through the SYS_OPEN rows,
+  reached on aarch64 by the knob-on path-taking open (`HOME/UNA/NOTES.TXT`, SO20's first step). Proven
+  on the real ACL tables (fixture `loginst`): the owner and a later launch under the same user are
+  admitted, an anonymous principal is refused (aarch64 by name on the EL0 regime; x86 by users-table
+  id on its static name table). The fixtures — which write a KNOWN credential to the medium — ride
+  their own knob `UNAOS_LOGINST=1`, never `UNAOS_LOGIN=1` (the `hcronst` rule).
 * **Status (M1, `exec-orin-login`):** record store, session principal on both arches, `login`/
   `logout` shell arms and the fixture landed; measured while landing: the typed verbs wait on one
   `HOST_VERBS` row in `libs/sys/midden_core`, the x86 QEMU build waits on one `UNAOS_LOGIN` map

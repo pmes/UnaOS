@@ -23844,3 +23844,40 @@ fn owned_user_ok(nameid: usize, slot: usize) -> bool {
     let u = SLOT_USER[slot].load(Ordering::Acquire);
     u != 0 && u == OWNED_USER[nameid].load(Ordering::Acquire)
 }
+
+/// LOGIN M2 fixture (`loginst`): the x86 HOME ACL PROOF on the real ACL tables. x86 has no path open
+/// (SO20's static name table) so the proof is the by-USER admission on an existing creatable name, with
+/// no disk I/O: slot A, carrying the session user, creates the name PRIVATE (`owned_set_owner` +
+/// `owned_user_stamp`); slot B, a DIFFERENT incarnation carrying the SAME user, is refused by the live
+/// check and ADMITTED by user; slot C, anonymous, is refused by both. Slots 10..12 — the top of the
+/// table, away from the battery's first-fit launches. Cleaned up: row cleared, stamps cleared.
+#[cfg(feature = "loginst")]
+pub fn home_acl_fixture(user_id: u32) -> bool {
+    const A: usize = crate::arch::memory::USER_SLOTS - 2;
+    const B: usize = crate::arch::memory::USER_SLOTS - 1;
+    const C: usize = crate::arch::memory::USER_SLOTS;
+    let Some(nameid) = u10_name_id(U6GX_NAME) else { return false };
+    let nameid = nameid as usize;
+    SLOT_USER[A].store(user_id, Ordering::Release);
+    SLOT_USER[B].store(user_id, Ordering::Release);
+    SLOT_USER[C].store(0, Ordering::Release);
+    let ga = SLOT_GEN[A].load(Ordering::Acquire);
+    let gb = SLOT_GEN[B].load(Ordering::Acquire);
+    let gc = SLOT_GEN[C].load(Ordering::Acquire);
+    owned_set_owner(nameid, A, ga);
+    owned_user_stamp(nameid, A);
+    let owner_ok = owned_access_ok(nameid, A, ga, CAP_READ | CAP_WRITE);
+    let b_live_refused = !owned_access_ok(nameid, B, gb, CAP_READ);
+    let b_user_ok = owned_user_ok(nameid, B);
+    let c_refused = !owned_access_ok(nameid, C, gc, CAP_READ) && !owned_user_ok(nameid, C);
+    owned_clear(nameid);
+    OWNED_USER[nameid].store(0, Ordering::Release);
+    for s in [A, B, C] {
+        SLOT_USER[s].store(0, Ordering::Release);
+    }
+    serial_println!(
+        "[users] home-acl name={} user={} owner_ok={} same_user_live_refused={} same_user_admitted={} anon_refused={}",
+        U6GX_NAME, user_id, owner_ok, b_live_refused, b_user_ok, c_refused
+    );
+    user_id != 0 && owner_ok && b_live_refused && b_user_ok && c_refused
+}
