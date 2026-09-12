@@ -42,7 +42,7 @@
 // remains additionally gated on its own feature (and, for smolnet, `target_arch = "x86_64"`), so this
 // module compiles under any combination without dead-code warnings.
 
-#![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet"))]
+#![cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet", feature = "net6"))] // NET6 joins the gate: the shared socket surface lives at this file's tail. LINE-NEUTRAL edit of the existing attribute — no line is added above any code, so no `panic::Location` moves and the knob-off images cannot.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -283,8 +283,8 @@ static NET_LEASED: AtomicBool = AtomicBool::new(false);
 /// each bring-up (both the lease and the static-fallback paths).
 fn record_settled(cfg: &NetConfig) {
     NET_IP.store(u32::from_be_bytes(cfg.ip), Ordering::Relaxed);
-    NET_LEASED.store(cfg.leased, Ordering::Relaxed);
-    NET_IP_PRESENT.store(true, Ordering::Release); // publishes the two fields above
+    NET_LEASED.store(cfg.leased, Ordering::Relaxed); record_settled_net6(cfg); // NET6 — the prefix/gateway/DNS half of the SAME snapshot, so the shared socket stack can ADOPT this bring-up's config instead of running a second DHCP client over one wire. ⚠ LINE-NEUTRAL append (body at the file tail, `#[inline(always)]`-empty knob-off, so this statement emits nothing and no line in this file moves).
+    NET_IP_PRESENT.store(true, Ordering::Release); // publishes every field above
 }
 
 /// PI-UI-2: the settled interface IPv4 and whether it was DHCP-leased (`true`) or the static fallback
@@ -700,4 +700,1146 @@ pub fn fmt_mac(mac: &[u8; 6]) -> [u8; 17] {
         out[i * 3 + 1] = HEX[(mac[i] & 0xf) as usize];
     }
     out
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// NET6 (ROADMAP §1b SOCK-7) — the SHARED socket surface on the aarch64 smoltcp seam.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ## What this is, and why it lives HERE
+//
+// ORIN-NET-4 and AARCH64-VNET each bring a NIC up, bind a THROWAWAY `Interface` over its rings, lease
+// an address, ping once, and drop the interface on the floor. That proves the seam and leaves the
+// network unusable: the shell's `ping`/`arp` fall through to the x86 `e1000` path and print
+// "No network device ready", and EL0 has no socket at all. NET6 is the surface above the seam —
+// ONE persistent `Interface` + `SocketSet`, the shell verbs, and the EL0 socket family — written ONCE
+// and shared by every aarch64 NIC (ONE OS, Peter 2026-08-13). The arch-specific half is the DEVICE
+// ADAPTER and nothing else: a driver registers a [`NicOps`] and is done.
+//
+// It lives at the tail of `net_phy.rs` — the file that already exists to host exactly this, the
+// arch-neutral part of the smoltcp seam — for two reasons. (1) `smolnet.rs` is the x86 DEFAULT stack:
+// widening it would put new lines in a file that compiles into the shipped x86 image, and
+// `panic::Location` embeds the source line, so `./arroyo knoboff` would (correctly) report the x86
+// knob-off image MOVED. (2) A new file is a new module in `lib.rs`, which is the same problem one
+// level up. A TAIL append inside an existing module gate adds no line above any existing code, and
+// every item here is `all(feature = "net6", target_arch = "aarch64")` — so on x86, and on every
+// aarch64 image built without the knob, this block compiles to nothing at all.
+//
+// ## WHICH STACK OWNS THE LEASE (the SOCK-7 question, answered on the wire)
+//
+// There is exactly ONE DHCP client on the aarch64 seam: smoltcp 0.13's `dhcpv4::Socket`, driven by
+// `dhcp_or_static` above, which every aarch64 bring-up funnels through. The hand-rolled `crates/net`
+// DHCP engine (`net::dhcp::DhcpClient`) has NO aarch64 caller — its only call sites are in
+// `drivers/e1000.rs`, whose `NET_DEVICE` registry is populated by the x86 PCI bring-up alone, so on
+// aarch64 it is compiled, never constructed against a NIC, and leases nothing. That is why
+// [`LEASE_OWNER`] is a constant rather than a runtime choice, and why every NET6 witness prints it:
+// a reader of a boot log should not have to infer which of two stacks produced an address.
+//
+// NET6 does NOT run a second DHCP client. `ensure()` ADOPTS the config `dhcp_or_static` settled on
+// (`settled_config()`), so the address the sockets use is the address the bring-up witness printed.
+//
+// ## Storage and blocking discipline (inherited from SOCK-2/3, deliberately)
+//
+// Everything is static / BSS: the socket-set storage, every socket's packet buffers, and the device
+// RX/TX scratch (inside the `Stack` field, not on a caller's stack). No heap. Every operation is
+// NON-BLOCKING and ITERATION-BOUNDED: a syscall handler runs IF-masked and cannot sleep, so a recv
+// drives a bounded poll pump and returns `-EAGAIN` if nothing landed. The `STACK` lock is released
+// between pump chunks so a second CPU's socket syscall is never starved, and it is NEVER held across
+// a driver's own device-registry lock for longer than one ring op (the `raw_rx`/`raw_tx` discipline).
+
+/// NET6: which stack owns the lease, as a token for the wire. See the module header. UNGATED (it is a
+/// string constant; an arch that never references it emits no bytes for it) so every aarch64 bring-up
+/// witness can print the owner whether or not the socket surface itself is built.
+pub const LEASE_OWNER: &str = "smoltcp-dhcpv4";
+
+/// NET6: the whole settled config of the last bring-up, or `None` before any completed. The shared
+/// socket stack adopts this rather than running a DHCP client of its own (module header).
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+pub fn settled_config() -> Option<NetConfig> {
+    if !NET_IP_PRESENT.load(Ordering::Acquire) {
+        return None;
+    }
+    let dns = NET_DNS_SRV.load(Ordering::Relaxed);
+    Some(NetConfig {
+        leased: NET_LEASED.load(Ordering::Relaxed),
+        ip: NET_IP.load(Ordering::Relaxed).to_be_bytes(),
+        prefix_len: NET_PREFIX.load(Ordering::Relaxed) as u8,
+        gw: NET_GW.load(Ordering::Relaxed).to_be_bytes(),
+        dns: if dns == 0 { None } else { Some(dns.to_be_bytes()) },
+    })
+}
+
+/// NET6: the rest of the settled config, beside `NET_IP`/`NET_LEASED` above. Written by the SAME
+/// `record_settled` call (folded onto its existing statements, so no line moves), read by
+/// `settled_config`. Prefix length, default gateway and leased DNS server (0 = none), octets
+/// packed big-endian like `NET_IP`.
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+static NET_PREFIX: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+static NET_GW: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+static NET_DNS_SRV: AtomicU32 = AtomicU32::new(0);
+
+/// NET6: record the three extra fields. Called from `record_settled` (a LINE-NEUTRAL fold onto its
+/// existing body), `#[inline(always)]` and empty knob-off so the folded call emits nothing.
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+#[inline(always)]
+pub(crate) fn record_settled_net6(cfg: &NetConfig) {
+    NET_PREFIX.store(cfg.prefix_len as u32, Ordering::Relaxed);
+    NET_GW.store(u32::from_be_bytes(cfg.gw), Ordering::Relaxed);
+    NET_DNS_SRV.store(cfg.dns.map(u32::from_be_bytes).unwrap_or(0), Ordering::Relaxed);
+}
+/// Knob-off twin: the folded call compiles to zero instructions.
+#[cfg(not(all(feature = "net6", target_arch = "aarch64")))]
+#[inline(always)]
+pub(crate) fn record_settled_net6(_cfg: &NetConfig) {}
+
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+pub mod net6 {
+    //! The shared NET6 socket surface. See the block comment above this module.
+
+    use super::{fmt_mac, RawNic, SmoltcpPhy, LEASE_OWNER};
+    // `serial_println!` reaches this nested module through the crate-root textual scope the
+    // `#[macro_export]` in `arch/*/serial.rs` installs — no `use` (an absolute path to a
+    // macro-expanded `macro_export` macro is not nameable from inside the same crate).
+    use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, Ordering};
+    use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+    use smoltcp::phy::Device;
+    use smoltcp::socket::{icmp, tcp, udp};
+    use smoltcp::time::Instant;
+    use smoltcp::wire::{
+        EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint,
+        IpListenEndpoint, Ipv4Address,
+    };
+
+    /// The serial prefix every NET6 witness carries. SUBSYSTEM-named, never board-named (R16): the
+    /// same tag is emitted by the QEMU `virt` fixture and by an Orin metal boot.
+    pub const P6: &str = ":: NET6:";
+
+    // ── The device adapter seam ───────────────────────────────────────────────────────────────────
+
+    /// The seam an aarch64 NIC driver registers so the shared stack can move L2 frames through its
+    /// rings. Function POINTERS, not methods: each driver reaches its one registered NIC through its
+    /// own module-static registry behind a short-held lock — the `raw_rx`/`raw_tx` discipline, never
+    /// held across a smoltcp poll.
+    pub struct NicOps {
+        /// Pop one raw RX Ethernet frame into `out` (recycling the descriptor), `None` if empty.
+        pub rx: fn(&mut [u8]) -> Option<usize>,
+        /// Transmit one raw L2 frame (smoltcp builds the full Ethernet frame).
+        pub tx: fn(&[u8]),
+        /// The station MAC, or `None` if the driver never registered a NIC.
+        pub mac: fn() -> Option<[u8; 6]>,
+        /// PHY link state, for the witness lines.
+        pub link_up: fn() -> bool,
+        /// A SUBSYSTEM name for the wire (`"virtio-net"`, `"rtl8168"`) — never a board name (R16).
+        pub name: &'static str,
+    }
+
+    /// The registered adapter (null = none). Lock-free: published Release at bring-up, read Acquire
+    /// on the datapath, so a reader that sees the pointer sees the ops behind it.
+    static NIC_OPS: AtomicPtr<NicOps> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Register the live NIC adapter — called ONCE from a driver's bring-up, after its rings are up
+    /// and its own registry is populated, and before [`init`].
+    pub fn register_nic(ops: &'static NicOps) {
+        NIC_OPS.store(ops as *const NicOps as *mut NicOps, Ordering::Release);
+    }
+
+    /// The registered adapter, or `None` before any driver registered.
+    #[inline]
+    fn nic() -> Option<&'static NicOps> {
+        let p = NIC_OPS.load(Ordering::Acquire);
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: `register_nic` only ever stores a `&'static NicOps`; nothing clears it.
+            Some(unsafe { &*(p as *const NicOps) })
+        }
+    }
+
+    /// The SUBSYSTEM name of the NIC the stack is bound over, for the wire.
+    pub fn nic_name() -> &'static str {
+        match nic() {
+            Some(n) => n.name,
+            None => "none",
+        }
+    }
+
+    /// The shared [`RawNic`] the NET6 phy binds: every hop routed to whichever adapter registered.
+    pub struct Net6Nic;
+    impl RawNic for Net6Nic {
+        fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+            match nic() {
+                Some(n) => (n.rx)(out),
+                None => None,
+            }
+        }
+        fn transmit(frame: &[u8]) {
+            if let Some(n) = nic() {
+                (n.tx)(frame)
+            }
+        }
+        fn mac() -> Option<[u8; 6]> {
+            (nic()?.mac)()
+        }
+    }
+
+    /// Monotonic milliseconds from the architectural counter. Readable at EL1 and EL2 (both NIC
+    /// bring-ups already depend on CNTPCT being live), so it is the one clock every NET6 witness uses
+    /// — and it is REAL time, which is why an RTT printed here is a duration and not an iteration
+    /// count. `0` if CNTFRQ reads zero (no trustworthy counter), which renders as `rtt_ms=0`.
+    #[inline]
+    pub fn now_ms() -> i64 {
+        let (cnt, frq): (u64, u64);
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) cnt, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack, preserves_flags));
+        }
+        if frq == 0 { 0 } else { (cnt.wrapping_mul(1_000) / frq) as i64 }
+    }
+
+    // ── Static storage for the persistent stack (BSS; no heap anywhere in this module) ────────────
+
+    /// Concurrent sockets the persistent set holds. A slot backs EITHER a UDP or a TCP socket — the
+    /// id space is shared so one handle value word names one registry row and one generation.
+    pub const NSOCK: usize = 4;
+    const UDP_PKTS: usize = 8;
+    const UDP_BUF: usize = 1024;
+    /// The largest datagram `sendto`/`recvfrom` will move (the syscall clamps to this).
+    pub const UDP_MAX_PAYLOAD: usize = UDP_BUF;
+    const TCP_BUF: usize = 2048;
+    /// The largest chunk `send`/`recv` will move in one call.
+    pub const TCP_MAX_CHUNK: usize = TCP_BUF;
+
+    static mut SOCK_STORAGE: [SocketStorage<'static>; NSOCK] = [SocketStorage::EMPTY; NSOCK];
+    static mut UDP_RX_META: [[udp::PacketMetadata; UDP_PKTS]; NSOCK] =
+        [[udp::PacketMetadata::EMPTY; UDP_PKTS]; NSOCK];
+    static mut UDP_RX_DATA: [[u8; UDP_BUF]; NSOCK] = [[0u8; UDP_BUF]; NSOCK];
+    static mut UDP_TX_META: [[udp::PacketMetadata; UDP_PKTS]; NSOCK] =
+        [[udp::PacketMetadata::EMPTY; UDP_PKTS]; NSOCK];
+    static mut UDP_TX_DATA: [[u8; UDP_BUF]; NSOCK] = [[0u8; UDP_BUF]; NSOCK];
+    static mut TCP_RX_DATA: [[u8; TCP_BUF]; NSOCK] = [[0u8; TCP_BUF]; NSOCK];
+    static mut TCP_TX_DATA: [[u8; TCP_BUF]; NSOCK] = [[0u8; TCP_BUF]; NSOCK];
+
+    /// Per-slot generation counter — bumped on every close, so a stale handle carrying the old
+    /// `(gen, sid)` can never rebind to a first-fit-reused slot (the SOCK-3 fence, U11x discipline).
+    static SOCK_GEN: [AtomicU32; NSOCK] = [const { AtomicU32::new(0) }; NSOCK];
+    /// Monotonic poll clock fed to `iface.poll`, bumped per poll across ALL callers so smoltcp's
+    /// neighbour/retransmit timers advance consistently. Iteration-driven (the real clock is only
+    /// used for RTTs), exactly as SOCK-2's is.
+    static POLL_CLOCK: AtomicI64 = AtomicI64::new(1);
+    /// Next ephemeral source port for an active open.
+    static EPHEMERAL: AtomicU32 = AtomicU32::new(49152);
+
+    fn next_ephemeral() -> u16 {
+        let v = EPHEMERAL.fetch_add(1, Ordering::Relaxed);
+        49152u16.wrapping_add((v % 16_000) as u16)
+    }
+
+    /// Which transport a registry slot backs. A UDP handle handed to a stream syscall (or the
+    /// reverse) is rejected on this tag BEFORE any typed `get_mut::<T>` — smoltcp's typed accessor
+    /// PANICS on a mismatch, so the tag is a fail-closed guard, not a convenience.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Udp,
+        Tcp,
+    }
+
+    /// The persistent stack singleton. Its fields — including the ~3 KiB device RX/TX scratch — live
+    /// in BSS through the static below, so nothing large lands on a syscall stack.
+    struct Stack {
+        iface: Interface,
+        sockets: SocketSet<'static>,
+        dev: SmoltcpPhy<Net6Nic>,
+        /// socket-id → (smoltcp handle, owning address-space id, transport). `None` = free.
+        reg: [Option<(SocketHandle, u64, Kind)>; NSOCK],
+    }
+
+    static STACK: spin::Mutex<Option<Stack>> = spin::Mutex::new(None);
+
+    /// Pump budgets, in poll iterations. Iteration- not clock-bounded (the SOCK-2 discipline): a reply
+    /// on a local link lands in a handful of iterations, so these only cap how long an unreachable
+    /// peer stalls the caller, and every one of them terminates by construction.
+    const SEND_PUMP: i64 = 20_000;
+    const RECV_PUMP: i64 = 400_000;
+    const CONNECT_PUMP: i64 = 400_000;
+    /// Iterations per lock hold — the lock is released between chunks so a concurrent socket syscall
+    /// on another core is never starved for a whole pump.
+    const CHUNK: i64 = 4_000;
+
+    /// Build the persistent stack once (idempotent), ADOPTING the config the bring-up settled on.
+    /// `false` if no adapter registered yet. Called under the `STACK` lock.
+    fn ensure(guard: &mut Option<Stack>) -> bool {
+        if guard.is_some() {
+            return true;
+        }
+        let Some(mac) = Net6Nic::mac() else { return false };
+        let mut dev = SmoltcpPhy::<Net6Nic>::new();
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        config.random_seed = 0x4e45_5436; // ASCII "NET6"
+        let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+        // ADOPT, never re-lease: `dhcp_or_static` already ran smoltcp's dhcpv4 socket over this NIC
+        // and printed the address. A second client for the same MAC could land a different one, and
+        // then the sockets and the wire witness would disagree about where this machine lives.
+        if let Some(cfg) = super::settled_config() {
+            iface.update_ip_addrs(|addrs| {
+                addrs.clear();
+                let _ = addrs.push(IpCidr::new(
+                    IpAddress::v4(cfg.ip[0], cfg.ip[1], cfg.ip[2], cfg.ip[3]),
+                    cfg.prefix_len,
+                ));
+            });
+            iface.routes_mut().remove_default_ipv4_route();
+            let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
+                cfg.gw[0], cfg.gw[1], cfg.gw[2], cfg.gw[3],
+            ));
+        }
+        // SAFETY: the storage static is borrowed `&'static mut` EXACTLY ONCE, here, under the `STACK`
+        // lock with `guard` proven `None` — no aliasing. `SocketSet::new` retains the borrow for the
+        // singleton's life; per-socket buffers are borrowed disjointly in `open` (a free `reg` slot
+        // ⇒ its buffer set is unborrowed).
+        let storage: &'static mut [SocketStorage<'static>] =
+            unsafe { &mut *core::ptr::addr_of_mut!(SOCK_STORAGE) };
+        *guard = Some(Stack { iface, sockets: SocketSet::new(storage), dev, reg: [None; NSOCK] });
+        true
+    }
+
+    /// Build the persistent stack now (idempotent) and report the shape on the wire. Called from a
+    /// driver's bring-up — a large-stack, shallow-chain context — so the one-time construction
+    /// transient never lands on a ring-3 task's syscall stack. `false` if no NIC registered.
+    pub fn init() -> bool {
+        let ok = {
+            let mut g = STACK.lock();
+            ensure(&mut g)
+        };
+        let cfg = super::settled_config();
+        match (ok, cfg) {
+            (true, Some(c)) => serial_println!(
+                "{} stack UP over {}: {}.{}.{}.{}/{} gw {}.{}.{}.{} dns {}.{}.{}.{} lease-owner={} [{}] sockets={} ::",
+                P6,
+                nic_name(),
+                c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.prefix_len,
+                c.gw[0], c.gw[1], c.gw[2], c.gw[3],
+                c.dns.unwrap_or(c.gw)[0], c.dns.unwrap_or(c.gw)[1],
+                c.dns.unwrap_or(c.gw)[2], c.dns.unwrap_or(c.gw)[3],
+                LEASE_OWNER,
+                if c.leased { "dhcp" } else { "static" },
+                NSOCK
+            ),
+            (true, None) => serial_println!(
+                "{} stack UP over {} but NO bring-up config settled — no address, no route ::",
+                P6, nic_name()
+            ),
+            (false, _) => serial_println!(
+                "{} stack NOT up — no NIC adapter registered (the driver never called register_nic) ::",
+                P6
+            ),
+        }
+        ok
+    }
+
+    /// The address + prefix the persistent interface carries, or `None` before `init`.
+    pub fn ipv4() -> Option<([u8; 4], u8)> {
+        let g = STACK.lock();
+        let stack = g.as_ref()?;
+        match stack.iface.ip_addrs().first() {
+            Some(IpCidr::Ipv4(c)) => Some((c.address().octets(), c.prefix_len())),
+            _ => None,
+        }
+    }
+
+    /// The default gateway the bring-up settled on (`None` before any bring-up).
+    pub fn gateway() -> Option<[u8; 4]> {
+        super::settled_config().map(|c| c.gw)
+    }
+
+    /// The resolver to query: the DHCP-offered nameserver when the lease carried one, else the
+    /// gateway (a home router answers DNS; slirp's 10.0.2.3 arrives in the lease).
+    pub fn resolver() -> Option<[u8; 4]> {
+        let c = super::settled_config()?;
+        Some(c.dns.unwrap_or(c.gw))
+    }
+
+    /// Drive `iters` poll iterations against the persistent interface. Split-borrows the fields so
+    /// `iface.poll` gets `&mut dev` + `&mut sockets` disjointly. Reads the RX ring directly through
+    /// the adapter, so it drives ARP, egress and inbound delivery with no interrupt required.
+    fn pump(stack: &mut Stack, iters: i64) {
+        let Stack { iface, sockets, dev, .. } = stack;
+        for _ in 0..iters {
+            let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
+            iface.poll(Instant::from_millis(now), dev, sockets);
+        }
+    }
+
+    // ── The shell verbs: ping / arp / dns, each with a witness line the next boot scores ──────────
+
+    /// An inbound ARP reply for `target` carries the peer MAC that smoltcp hides behind its neighbour
+    /// cache. The blocking verbs snoop the wire for it so `arp` has something to print. Mirrors the
+    /// x86 `smolnet::snoop_arp` (a read-only reuse of `net::arp::learn`), spelled out here because
+    /// the crate-level `net` dependency is not in scope for this module.
+    fn snoop_arp(frame: &[u8], target: [u8; 4], out: &mut Option<[u8; 6]>) {
+        if out.is_some() || frame.len() < 42 {
+            return;
+        }
+        if u16::from_be_bytes([frame[12], frame[13]]) != 0x0806 {
+            return; // not ARP
+        }
+        let a = &frame[14..42];
+        // htype=1 ethernet, ptype=0x0800 IPv4, hlen=6, plen=4, oper=2 (reply)
+        if a[0] != 0 || a[1] != 1 || a[2] != 0x08 || a[3] != 0 || a[4] != 6 || a[5] != 4 || a[7] != 2
+        {
+            return;
+        }
+        if a[14..18] == target[..] {
+            *out = Some([a[8], a[9], a[10], a[11], a[12], a[13]]);
+        }
+    }
+
+    /// The RX observer the blocking verbs bind: ARP-snoop for one target.
+    struct Snoop {
+        target: [u8; 4],
+        mac: Option<[u8; 6]>,
+    }
+    impl super::RxObserver for Snoop {
+        fn observe(&mut self, frame: &[u8]) {
+            snoop_arp(frame, self.target, &mut self.mac)
+        }
+    }
+
+    /// Outcome of a [`ping`].
+    pub struct PingOutcome {
+        /// Echo requests emitted and echo replies matched.
+        pub sent: u16,
+        pub received: u16,
+        /// The peer MAC, if an ARP reply for the target crossed the wire.
+        pub mac: Option<[u8; 6]>,
+        /// Round-trip of the FIRST reply, in real milliseconds (`0` if none / no counter).
+        pub first_rtt_ms: i64,
+    }
+
+    /// ICMP identifier stamped on every echo we originate. ASCII "N6".
+    const PING_IDENT: u16 = 0x4e36;
+    const PING_PAYLOAD: &[u8] = b"unaos-net6";
+    /// Real-time bound on a blocking verb, in milliseconds. A verb is a SHELL command and an operator
+    /// is waiting on it, so the bound is wall-clock rather than an iteration count: an unreachable
+    /// target costs the operator this much and no more, on any clock speed.
+    const VERB_BUDGET_MS: i64 = 2_000;
+
+    /// Blocking ICMP ping over the persistent interface's configuration, on a THROWAWAY interface +
+    /// ICMP socket (the SOCK-1 shape: a blocking op must not park a socket in the persistent set,
+    /// where it would count against ring 3's `NSOCK` budget). Emits one witness line PER SEQUENCE —
+    ///
+    /// `:: NET6: ping 10.42.0.1 seq=1 rtt_ms=0 -> REPLY ::`
+    ///
+    /// — so the next boot can score reachability per packet rather than from a summary, then a
+    /// closing summary line. All storage is stack-local; no heap growth.
+    pub fn ping(target: [u8; 4], count: u16) -> Option<PingOutcome> {
+        let mac = Net6Nic::mac()?;
+        let (our_ip, plen) = ipv4()?;
+        let gw = gateway()?;
+        let count = count.clamp(1, 16);
+
+        let mut dev = SmoltcpPhy::<Net6Nic, Snoop>::with_observer(Snoop { target, mac: None });
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        config.random_seed = 0x4e36_5049; // "N6PI"
+        let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::v4(our_ip[0], our_ip[1], our_ip[2], our_ip[3]),
+                plen,
+            ));
+        });
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3]));
+
+        let mut rx_meta = [icmp::PacketMetadata::EMPTY; 8];
+        let mut rx_payload = [0u8; 256];
+        let mut tx_meta = [icmp::PacketMetadata::EMPTY; 8];
+        let mut tx_payload = [0u8; 256];
+        let socket = icmp::Socket::new(
+            icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_payload[..]),
+            icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_payload[..]),
+        );
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let handle = sockets.add(socket);
+        if sockets
+            .get_mut::<icmp::Socket>(handle)
+            .bind(icmp::Endpoint::Ident(PING_IDENT))
+            .is_err()
+        {
+            return None;
+        }
+
+        let remote = IpAddress::v4(target[0], target[1], target[2], target[3]);
+        let (mut sent, mut received, mut seq) = (0u16, 0u16, 0u16);
+        let mut first_rtt = 0i64;
+        let mut clock = 0i64;
+        let t0 = now_ms();
+        // One outstanding echo at a time, so a reply's RTT belongs to a KNOWN request. `sent_at` is
+        // the real-time stamp of the request in flight; `0` = nothing outstanding.
+        let mut sent_at = 0i64;
+        while now_ms().saturating_sub(t0) < VERB_BUDGET_MS && received < count {
+            clock += 1;
+            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+            let sock = sockets.get_mut::<icmp::Socket>(handle);
+            if sent_at == 0 && seq < count && sock.can_send() {
+                seq += 1;
+                let repr =
+                    Icmpv4Repr::EchoRequest { ident: PING_IDENT, seq_no: seq, data: PING_PAYLOAD };
+                if let Ok(buf) = sock.send(repr.buffer_len(), remote) {
+                    let caps = dev.capabilities().checksum;
+                    repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &caps);
+                    sent += 1;
+                    sent_at = now_ms().max(1);
+                }
+            }
+            let sock = sockets.get_mut::<icmp::Socket>(handle);
+            if sock.can_recv() {
+                if let Ok((payload, _addr)) = sock.recv() {
+                    if let Ok(pkt) = Icmpv4Packet::new_checked(payload) {
+                        let caps = dev.capabilities().checksum;
+                        if let Ok(Icmpv4Repr::EchoReply { seq_no, .. }) =
+                            Icmpv4Repr::parse(&pkt, &caps)
+                        {
+                            let rtt = now_ms().saturating_sub(sent_at.max(t0));
+                            received += 1;
+                            if received == 1 {
+                                first_rtt = rtt;
+                            }
+                            serial_println!(
+                                "{} ping {}.{}.{}.{} seq={} rtt_ms={} -> REPLY ::",
+                                P6, target[0], target[1], target[2], target[3], seq_no, rtt
+                            );
+                            sent_at = 0; // the next echo may go out
+                        }
+                    }
+                }
+            }
+            // The outstanding echo timed out: say so on the wire (an ABSENCE is only evidence when
+            // the producing path ran, so a lost sequence gets its own line) and let the next go.
+            if sent_at != 0 && now_ms().saturating_sub(sent_at) > VERB_BUDGET_MS / count as i64 {
+                serial_println!(
+                    "{} ping {}.{}.{}.{} seq={} rtt_ms=- -> TIMEOUT ::",
+                    P6, target[0], target[1], target[2], target[3], seq
+                );
+                sent_at = 0;
+            }
+        }
+        let peer = dev.obs.mac;
+        // `fmt_mac` writes ASCII hex into a fixed stack buffer; an unresolved peer renders as dashes
+        // rather than being omitted, so the summary line has the same shape either way.
+        let pb = match peer {
+            Some(m) => fmt_mac(&m),
+            None => [b'-'; 17],
+        };
+        serial_println!(
+            "{} ping {}.{}.{}.{} {}/{} replies over {} peer {} -> {} ::",
+            P6,
+            target[0], target[1], target[2], target[3],
+            received, sent, nic_name(),
+            core::str::from_utf8(&pb).unwrap_or("<mac>"),
+            if received > 0 { "REPLY" } else { "NO REPLY" }
+        );
+        Some(PingOutcome { sent, received, mac: peer, first_rtt_ms: first_rtt })
+    }
+
+    /// Blocking ARP resolve: one echo forces smoltcp to ARP the target; the observer returns the MAC
+    /// off the wire. Emits `:: NET6: arp <ip> -> is-at <mac> ::` / `-> NO REPLY ::`.
+    pub fn arp(target: [u8; 4]) -> Option<[u8; 6]> {
+        let mac = Net6Nic::mac()?;
+        let (our_ip, plen) = ipv4()?;
+        let gw = gateway()?;
+        let mut dev = SmoltcpPhy::<Net6Nic, Snoop>::with_observer(Snoop { target, mac: None });
+        let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+        config.random_seed = 0x4e36_4152; // "N6AR"
+        let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(
+                IpAddress::v4(our_ip[0], our_ip[1], our_ip[2], our_ip[3]),
+                plen,
+            ));
+        });
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(gw[0], gw[1], gw[2], gw[3]));
+        let mut rx_meta = [icmp::PacketMetadata::EMPTY; 4];
+        let mut rx_payload = [0u8; 128];
+        let mut tx_meta = [icmp::PacketMetadata::EMPTY; 4];
+        let mut tx_payload = [0u8; 128];
+        let socket = icmp::Socket::new(
+            icmp::PacketBuffer::new(&mut rx_meta[..], &mut rx_payload[..]),
+            icmp::PacketBuffer::new(&mut tx_meta[..], &mut tx_payload[..]),
+        );
+        let mut storage: [SocketStorage; 1] = Default::default();
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let handle = sockets.add(socket);
+        let _ = sockets
+            .get_mut::<icmp::Socket>(handle)
+            .bind(icmp::Endpoint::Ident(PING_IDENT));
+        let remote = IpAddress::v4(target[0], target[1], target[2], target[3]);
+        let mut clock = 0i64;
+        let t0 = now_ms();
+        let mut armed = false;
+        while now_ms().saturating_sub(t0) < VERB_BUDGET_MS && dev.obs.mac.is_none() {
+            clock += 1;
+            iface.poll(Instant::from_millis(clock), &mut dev, &mut sockets);
+            if !armed {
+                let sock = sockets.get_mut::<icmp::Socket>(handle);
+                if sock.can_send() {
+                    let repr =
+                        Icmpv4Repr::EchoRequest { ident: PING_IDENT, seq_no: 1, data: PING_PAYLOAD };
+                    if let Ok(buf) = sock.send(repr.buffer_len(), remote) {
+                        let caps = dev.capabilities().checksum;
+                        repr.emit(&mut Icmpv4Packet::new_unchecked(buf), &caps);
+                        armed = true;
+                    }
+                }
+            }
+        }
+        match dev.obs.mac {
+            Some(m) => {
+                let b = fmt_mac(&m);
+                serial_println!(
+                    "{} arp {}.{}.{}.{} -> is-at {} ::",
+                    P6, target[0], target[1], target[2], target[3],
+                    core::str::from_utf8(&b).unwrap_or("<mac>")
+                );
+                Some(m)
+            }
+            None => {
+                serial_println!(
+                    "{} arp {}.{}.{}.{} -> NO REPLY ::",
+                    P6, target[0], target[1], target[2], target[3]
+                );
+                None
+            }
+        }
+    }
+
+    /// Blocking DNS A-record lookup over the persistent stack's own UDP socket, through the SHARED
+    /// `crate::net_dns` builder/parser (SOCK-8's arch-neutral half — no second wire format). Queries
+    /// the DHCP-offered nameserver where the lease carried one, else the gateway. Emits
+    /// `:: NET6: dns <host> -> A a.b.c.d (server s.s.s.s) ::` or a typed failure line.
+    pub fn dns(host: &str) -> Option<[u8; 4]> {
+        let Some(server) = resolver() else {
+            serial_println!("{} dns {} -> NO RESOLVER (no lease, no gateway) ::", P6, host);
+            return None;
+        };
+        let mut qbuf = [0u8; 320];
+        // The transaction id is the poll clock's low half: two lookups in one boot never collide, and
+        // `parse_a` REJECTS a datagram whose id does not match, so a late reply to a previous query
+        // can never be read as the answer to this one.
+        let txid = (POLL_CLOCK.load(Ordering::Relaxed) as u16) ^ 0x4e36;
+        let Some(qlen) = crate::net_dns::build_query(&mut qbuf, txid, host) else {
+            serial_println!("{} dns {} -> BAD NAME (unencodable) ::", P6, host);
+            return None;
+        };
+        // A kernel-side lookup borrows a ring-3 socket slot for the duration and gives it straight
+        // back; `open`'s owner is the SHELL's address space, which no EL0 teardown will sweep.
+        let Some(sid) = open(u64::MAX, false) else {
+            serial_println!("{} dns {} -> NO SOCKET (all {} slots in use) ::", P6, host, NSOCK);
+            return None;
+        };
+        let mut answer = None;
+        if bind(sid, next_ephemeral()).is_ok()
+            && sendto(sid, server, crate::net_dns::DNS_PORT, &qbuf[..qlen]).is_ok()
+        {
+            let mut rbuf = [0u8; 512];
+            if let Some((_src, _sport, n)) = recvfrom(sid, &mut rbuf) {
+                match crate::net_dns::parse_a(&rbuf[..n], txid) {
+                    crate::net_dns::Dns::Resolved(a) => {
+                        serial_println!(
+                            "{} dns {} -> A {}.{}.{}.{} (server {}.{}.{}.{}) ::",
+                            P6, host, a[0], a[1], a[2], a[3],
+                            server[0], server[1], server[2], server[3]
+                        );
+                        answer = Some(a);
+                    }
+                    crate::net_dns::Dns::ServerErr(rc) => serial_println!(
+                        "{} dns {} -> SERVER ERROR rcode={} (server {}.{}.{}.{}) ::",
+                        P6, host, rc, server[0], server[1], server[2], server[3]
+                    ),
+                    crate::net_dns::Dns::NoAnswer => serial_println!(
+                        "{} dns {} -> NO A RECORD (server {}.{}.{}.{}) ::",
+                        P6, host, server[0], server[1], server[2], server[3]
+                    ),
+                    crate::net_dns::Dns::Malformed => serial_println!(
+                        "{} dns {} -> MALFORMED REPLY (server {}.{}.{}.{}) ::",
+                        P6, host, server[0], server[1], server[2], server[3]
+                    ),
+                }
+            } else {
+                serial_println!(
+                    "{} dns {} -> NO ANSWER within budget (server {}.{}.{}.{}) ::",
+                    P6, host, server[0], server[1], server[2], server[3]
+                );
+            }
+        } else {
+            serial_println!("{} dns {} -> SEND FAILED (socket unusable) ::", P6, host);
+        }
+        close(sid);
+        answer
+    }
+
+    // ── The socket registry: what the EL0 syscall family drives ───────────────────────────────────
+
+    /// Allocate a socket owned by address space `owner`. `tcp` selects the transport. Returns the
+    /// socket-id (the `reg` index), or `None` if every slot is in use / no NIC.
+    pub fn open(owner: u64, tcp_sock: bool) -> Option<usize> {
+        let mut g = STACK.lock();
+        if !ensure(&mut g) {
+            return None;
+        }
+        let stack = g.as_mut().unwrap();
+        let sid = stack.reg.iter().position(|s| s.is_none())?;
+        // SAFETY: `sid` is a FREE `reg` slot, so buffer set `sid` is borrowed by no live socket.
+        // `addr_of_mut!(STATIC[sid])` names the element as a PLACE (no intermediate reference), then
+        // `from_raw_parts_mut` re-forms the slice — no autoref through a raw deref. The socket OWNS
+        // the borrows until it is removed in `close`, which frees the slot in the same breath.
+        let handle = if tcp_sock {
+            let (rx, tx): (&'static mut [u8], &'static mut [u8]) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(TCP_RX_DATA[sid]) as *mut u8,
+                        TCP_BUF,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(TCP_TX_DATA[sid]) as *mut u8,
+                        TCP_BUF,
+                    ),
+                )
+            };
+            stack
+                .sockets
+                .add(tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx)))
+        } else {
+            let (rm, rd, tm, td): (
+                &'static mut [udp::PacketMetadata],
+                &'static mut [u8],
+                &'static mut [udp::PacketMetadata],
+                &'static mut [u8],
+            ) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(UDP_RX_META[sid]) as *mut udp::PacketMetadata,
+                        UDP_PKTS,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(UDP_RX_DATA[sid]) as *mut u8,
+                        UDP_BUF,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(UDP_TX_META[sid]) as *mut udp::PacketMetadata,
+                        UDP_PKTS,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(UDP_TX_DATA[sid]) as *mut u8,
+                        UDP_BUF,
+                    ),
+                )
+            };
+            stack.sockets.add(udp::Socket::new(
+                udp::PacketBuffer::new(rm, rd),
+                udp::PacketBuffer::new(tm, td),
+            ))
+        };
+        stack.reg[sid] = Some((handle, owner, if tcp_sock { Kind::Tcp } else { Kind::Udp }));
+        Some(sid)
+    }
+
+    /// The slot's generation, for the handle value word's gen fence.
+    pub fn sock_gen(sid: usize) -> u32 {
+        if sid < NSOCK { SOCK_GEN[sid].load(Ordering::Acquire) } else { 0 }
+    }
+
+    /// Is `(owner, sid, generation)` still the LIVE registry row? The single staleness CHECK: a
+    /// handle to a freed+reused slot, or one resolved from another address space, fails here and is
+    /// never rebound (the SOCK-3/U11x fence).
+    pub fn sock_valid(owner: u64, sid: usize, generation: u32) -> bool {
+        if sid >= NSOCK || SOCK_GEN[sid].load(Ordering::Acquire) != generation {
+            return false;
+        }
+        let g = STACK.lock();
+        match g.as_ref().and_then(|s| s.reg.get(sid)).and_then(|s| s.as_ref()) {
+            Some((_, o, _)) => *o == owner,
+            None => false,
+        }
+    }
+
+    /// Remove socket `sid`, free its slot and BUMP its generation so no stale handle can rebind.
+    pub fn close(sid: usize) {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return };
+        if let Some(Some((handle, _, _))) = stack.reg.get(sid).copied() {
+            stack.sockets.remove(handle);
+            stack.reg[sid] = None;
+            SOCK_GEN[sid].fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Close every socket owned by `owner` — the address space's teardown hook, so a process that
+    /// exits with sockets open never leaks a registry slot.
+    pub fn free_owner(owner: u64) {
+        let doomed: [bool; NSOCK] = {
+            let g = STACK.lock();
+            let mut m = [false; NSOCK];
+            if let Some(stack) = g.as_ref() {
+                for (i, s) in stack.reg.iter().enumerate() {
+                    if let Some((_, o, _)) = s {
+                        m[i] = *o == owner;
+                    }
+                }
+            }
+            m
+        };
+        for (i, d) in doomed.iter().enumerate() {
+            if *d {
+                close(i);
+            }
+        }
+    }
+
+    /// Look up a registry row of the expected transport. `None` = free slot or wrong kind — checked
+    /// BEFORE smoltcp's typed accessor, which panics on a mismatch.
+    fn row(stack: &Stack, sid: usize, want: Kind) -> Option<SocketHandle> {
+        match stack.reg.get(sid).and_then(|s| s.as_ref()) {
+            Some((h, _, k)) if *k == want => Some(*h),
+            _ => None,
+        }
+    }
+
+    /// Bind UDP socket `sid` to a local port.
+    pub fn bind(sid: usize, port: u16) -> Result<(), ()> {
+        if port == 0 {
+            return Err(());
+        }
+        let mut g = STACK.lock();
+        let stack = g.as_mut().ok_or(())?;
+        let handle = row(stack, sid, Kind::Udp).ok_or(())?;
+        stack.sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| ())
+    }
+
+    /// Queue `payload` to `ip:port` on UDP socket `sid`, then a short egress pump to kick ARP + TX.
+    pub fn sendto(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Result<usize, ()> {
+        let mut g = STACK.lock();
+        let stack = g.as_mut().ok_or(())?;
+        let handle = row(stack, sid, Kind::Udp).ok_or(())?;
+        let ep = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
+        {
+            let sock = stack.sockets.get_mut::<udp::Socket>(handle);
+            if !sock.can_send() {
+                return Err(());
+            }
+            sock.send_slice(payload, ep).map_err(|_| ())?;
+        }
+        pump(stack, SEND_PUMP);
+        Ok(payload.len())
+    }
+
+    /// Non-blocking receive on UDP socket `sid`: pump a bounded loop, then return the first datagram
+    /// `(src_ip, src_port, len)` copied into `out`, or `None` (→ `-EAGAIN`). NEVER blocks.
+    pub fn recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+        let mut spent = 0i64;
+        while spent < RECV_PUMP {
+            let mut g = STACK.lock();
+            let stack = g.as_mut()?;
+            let handle = row(stack, sid, Kind::Udp)?;
+            pump(stack, CHUNK);
+            let sock = stack.sockets.get_mut::<udp::Socket>(handle);
+            if sock.can_recv() {
+                if let Ok((data, meta)) = sock.recv() {
+                    let n = data.len().min(out.len());
+                    out[..n].copy_from_slice(&data[..n]);
+                    let IpAddress::Ipv4(v4) = meta.endpoint.addr;
+                    return Some((v4.octets(), meta.endpoint.port, n));
+                }
+            }
+            drop(g); // release BETWEEN chunks — never spin another core for a whole pump
+            spent += CHUNK;
+        }
+        None
+    }
+
+    /// The ring-3 poll model for an active open.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum ConnectOutcome {
+        Established,
+        InProgress,
+        Refused,
+    }
+
+    /// The ring-3 poll model for a stream read.
+    pub enum RecvOutcome {
+        Data(usize),
+        WouldBlock,
+        Eof,
+    }
+
+    /// Active-open TCP socket `sid` to `ip:port`. NON-BLOCKING: issues the SYN if the socket is
+    /// closed (a re-call while SYN-SENT just pumps), then chases the handshake within a bounded
+    /// budget, releasing the lock between chunks.
+    pub fn connect(sid: usize, ip: [u8; 4], port: u16) -> ConnectOutcome {
+        {
+            let mut g = STACK.lock();
+            let Some(stack) = g.as_mut() else { return ConnectOutcome::Refused };
+            let Some(handle) = row(stack, sid, Kind::Tcp) else { return ConnectOutcome::Refused };
+            let local = next_ephemeral();
+            let Stack { iface, sockets, .. } = stack;
+            let sock = sockets.get_mut::<tcp::Socket>(handle);
+            if !sock.is_open() {
+                let remote = IpEndpoint::new(IpAddress::v4(ip[0], ip[1], ip[2], ip[3]), port);
+                let le = IpListenEndpoint { addr: None, port: local };
+                if sock.connect(iface.context(), remote, le).is_err() {
+                    return ConnectOutcome::Refused;
+                }
+            }
+        }
+        let mut spent = 0i64;
+        while spent < CONNECT_PUMP {
+            let mut g = STACK.lock();
+            let Some(stack) = g.as_mut() else { return ConnectOutcome::Refused };
+            let Some(handle) = row(stack, sid, Kind::Tcp) else { return ConnectOutcome::Refused };
+            pump(stack, CHUNK);
+            let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+            if sock.state() == tcp::State::Established {
+                return ConnectOutcome::Established;
+            }
+            if !sock.is_active() {
+                return ConnectOutcome::Refused; // fell out of SYN-SENT (RST / refused)
+            }
+            drop(g);
+            spent += CHUNK;
+        }
+        ConnectOutcome::InProgress
+    }
+
+    /// Stream-send on TCP socket `sid`. `Ok(n)` = bytes queued; `Err(true)` = would-block (tx ring
+    /// full — ring 3 retries, `-EAGAIN`); `Err(false)` = not connected / wrong kind (`-ENOTCONN`).
+    pub fn send(sid: usize, data: &[u8]) -> Result<usize, bool> {
+        let queued = {
+            let mut g = STACK.lock();
+            let stack = g.as_mut().ok_or(false)?;
+            let handle = row(stack, sid, Kind::Tcp).ok_or(false)?;
+            let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+            if !sock.may_send() {
+                return Err(false);
+            }
+            match sock.send_slice(data) {
+                Ok(0) => return Err(true),
+                Ok(n) => n,
+                Err(_) => return Err(false),
+            }
+        };
+        let mut spent = 0i64;
+        while spent < SEND_PUMP {
+            let mut g = STACK.lock();
+            let Some(stack) = g.as_mut() else { break };
+            if row(stack, sid, Kind::Tcp).is_none() {
+                break;
+            }
+            pump(stack, CHUNK);
+            drop(g);
+            spent += CHUNK;
+        }
+        Ok(queued)
+    }
+
+    /// Non-blocking stream-recv on TCP socket `sid`.
+    pub fn recv(sid: usize, out: &mut [u8]) -> RecvOutcome {
+        let mut spent = 0i64;
+        loop {
+            {
+                let mut g = STACK.lock();
+                let Some(stack) = g.as_mut() else { return RecvOutcome::Eof };
+                let Some(handle) = row(stack, sid, Kind::Tcp) else { return RecvOutcome::Eof };
+                let sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+                match sock.recv_slice(out) {
+                    Ok(0) => {
+                        if !sock.is_open() {
+                            return RecvOutcome::Eof;
+                        }
+                    }
+                    Ok(n) => return RecvOutcome::Data(n),
+                    Err(tcp::RecvError::Finished) => return RecvOutcome::Eof,
+                    Err(tcp::RecvError::InvalidState) => {
+                        if !sock.is_open() {
+                            return RecvOutcome::Eof;
+                        }
+                    }
+                }
+                if spent >= RECV_PUMP {
+                    return RecvOutcome::WouldBlock;
+                }
+                pump(stack, CHUNK);
+            }
+            spent += CHUNK;
+        }
+    }
+
+    // ── The QEMU `virt` fixture: the runtime proof that this surface works ────────────────────────
+
+    /// Drive the shared socket surface end-to-end against QEMU user-mode networking (slirp) and emit
+    /// the scored witnesses. This is the RUNNABLE half of NET6: the Orin has no QEMU model, so a
+    /// jetson green certifies only that this COMPILES AND LINKS — the behaviour is proven here, on
+    /// `virt`, over `virtio_net.rs`, through the IDENTICAL shared code an Orin boot runs.
+    ///
+    /// Three legs, each its own witness line:
+    ///   1. `dns`   — a UDP round-trip through the persistent set (`open`/`bind`/`sendto`/`recvfrom`,
+    ///                exactly the syscall bodies) to the leased resolver.
+    ///   2. `tcp`   — an active open to the slirp gateway's DNS-over-TCP port, a write and a read
+    ///                (`open`/`connect`/`send`/`recv`), i.e. the stream half of the family.
+    ///   3. `ping`  — ICMP to the gateway, which also prints the per-sequence RTT lines.
+    ///
+    /// Every leg is bounded; a silent backend makes them print a FAIL line, never hang.
+    pub fn fixture() {
+        serial_println!(
+            "{} fixture: shared socket surface over {} (lease-owner={}) ::",
+            P6, nic_name(), LEASE_OWNER
+        );
+        let Some(gw) = gateway() else {
+            serial_println!("{} fixture -> FAIL — no bring-up config (no gateway to talk to) ::", P6);
+            return;
+        };
+        let mut legs = 0u32;
+        let mut pass = 0u32;
+
+        // Leg 1 — UDP through the persistent set: the sys_socket/bind/sendto/recvfrom bodies, driven
+        // as EL0 drives them. What it measures is the datagram ROUND-TRIP, not the answer's content:
+        // an address, NXDOMAIN and SERVFAIL all prove the packet went out and came back.
+        legs += 1;
+        if udp_echo_leg(gw) {
+            pass += 1;
+        }
+
+        // Leg 2 — TCP client: connect, send, read.
+        legs += 1;
+        if tcp_leg(gw) {
+            pass += 1;
+        }
+
+        // Leg 3 — ICMP, with the per-sequence RTT witnesses.
+        legs += 1;
+        match ping(gw, 4) {
+            Some(o) if o.received > 0 => pass += 1,
+            _ => {}
+        }
+
+        // The `dns` VERB itself, on the same wire — the shell verb an operator types, exercised here
+        // so the boot log carries its witness shape even on a headless run.
+        let _ = dns("una.os");
+        serial_println!(
+            "{} fixture: {}/{} legs passed -> {} ::",
+            P6, pass, legs,
+            if pass == legs { "PASS" } else { "FAIL" }
+        );
+    }
+
+    /// Fixture leg 1: a real UDP round-trip on a persistent-set socket, to the leased resolver (slirp
+    /// answers DNS from 10.0.2.3:53 with no injector and no netdev change). Drives the EXACT
+    /// functions `sys_socket`/`sys_bind`/`sys_sendto`/`sys_recvfrom` call.
+    fn udp_echo_leg(gw: [u8; 4]) -> bool {
+        let server = resolver().unwrap_or(gw);
+        let Some(sid) = open(u64::MAX, false) else {
+            serial_println!("{} fixture udp -> FAIL — no free socket slot ::", P6);
+            return false;
+        };
+        let mut q = [0u8; 320];
+        let txid = 0x4e36u16;
+        let ok = match crate::net_dns::build_query(&mut q, txid, "una.os") {
+            Some(qlen) => {
+                let bound = bind(sid, 49_252).is_ok();
+                let sent = bound
+                    && sendto(sid, server, crate::net_dns::DNS_PORT, &q[..qlen]).is_ok();
+                let mut r = [0u8; 512];
+                match (sent, recvfrom(sid, &mut r)) {
+                    (true, Some((src, sport, n))) => {
+                        serial_println!(
+                            "{} sock udp round-trip {} bytes from {}.{}.{}.{}:{} -> PASS ::",
+                            P6, n, src[0], src[1], src[2], src[3], sport
+                        );
+                        true
+                    }
+                    (true, None) => {
+                        serial_println!(
+                            "{} sock udp round-trip to {}.{}.{}.{}:{} -> FAIL (no reply in budget) ::",
+                            P6, server[0], server[1], server[2], server[3],
+                            crate::net_dns::DNS_PORT
+                        );
+                        false
+                    }
+                    (false, _) => {
+                        serial_println!("{} sock udp round-trip -> FAIL (bind/send refused) ::", P6);
+                        false
+                    }
+                }
+            }
+            None => {
+                serial_println!("{} sock udp round-trip -> FAIL (query build) ::", P6);
+                false
+            }
+        };
+        close(sid);
+        ok
+    }
+
+    /// Fixture leg 2: the TCP client half — `open`/`connect`/`send`/`recv` against the slirp
+    /// resolver's DNS-over-TCP port (the one inbound-capable stream service user-mode networking
+    /// offers without an injector). A byte-stream round-trip is the proof; the answer's content is
+    /// the resolver's business, not this leg's.
+    fn tcp_leg(gw: [u8; 4]) -> bool {
+        let server = resolver().unwrap_or(gw);
+        let Some(sid) = open(u64::MAX, true) else {
+            serial_println!("{} fixture tcp -> FAIL — no free socket slot ::", P6);
+            return false;
+        };
+        let mut ok = false;
+        match connect(sid, server, crate::net_dns::DNS_PORT) {
+            ConnectOutcome::Established => {
+                // DNS-over-TCP frames the query with a 2-byte big-endian length prefix.
+                let mut q = [0u8; 320];
+                if let Some(qlen) = crate::net_dns::build_query(&mut q[2..], 0x4e37, "una.os") {
+                    q[0] = (qlen >> 8) as u8;
+                    q[1] = (qlen & 0xff) as u8;
+                    match send(sid, &q[..qlen + 2]) {
+                        Ok(n) => {
+                            let mut r = [0u8; 512];
+                            match recv(sid, &mut r) {
+                                RecvOutcome::Data(got) => {
+                                    serial_println!(
+                                        "{} sock tcp round-trip {}.{}.{}.{}:{} sent={} recv={} -> PASS ::",
+                                        P6, server[0], server[1], server[2], server[3],
+                                        crate::net_dns::DNS_PORT, n, got
+                                    );
+                                    ok = true;
+                                }
+                                RecvOutcome::Eof => serial_println!(
+                                    "{} sock tcp round-trip -> FAIL (peer closed with no data) ::",
+                                    P6
+                                ),
+                                RecvOutcome::WouldBlock => serial_println!(
+                                    "{} sock tcp round-trip -> FAIL (no data in budget) ::",
+                                    P6
+                                ),
+                            }
+                        }
+                        Err(_) => {
+                            serial_println!("{} sock tcp round-trip -> FAIL (send refused) ::", P6)
+                        }
+                    }
+                }
+            }
+            ConnectOutcome::InProgress => serial_println!(
+                "{} sock tcp connect {}.{}.{}.{}:{} -> FAIL (still SYN-SENT at budget) ::",
+                P6, server[0], server[1], server[2], server[3], crate::net_dns::DNS_PORT
+            ),
+            ConnectOutcome::Refused => serial_println!(
+                "{} sock tcp connect {}.{}.{}.{}:{} -> FAIL (refused) ::",
+                P6, server[0], server[1], server[2], server[3], crate::net_dns::DNS_PORT
+            ),
+        }
+        close(sid);
+        ok
+    }
 }

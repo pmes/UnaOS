@@ -5675,12 +5675,67 @@ mod metal {
             P4, txn, arp_reply, dhcp
         );
         serial_println!(
-            "{}   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, {}.{}.{}.{}/{} + default gw {}.{}.{}.{} [{}], medium=ethernet, polled OK; link {} — live ICMP/ARP is attended-metal ::",
+            "{}   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, {}.{}.{}.{}/{} + default gw {}.{}.{}.{} [{} lease-owner={}], medium=ethernet, polled OK; link {} — live ICMP/ARP is attended-metal ::",
             P4,
             netcfg.ip[0], netcfg.ip[1], netcfg.ip[2], netcfg.ip[3], netcfg.prefix_len,
             netcfg.gw[0], netcfg.gw[1], netcfg.gw[2], netcfg.gw[3],
             if netcfg.leased { "dhcp" } else { "static" },
+            // SOCK-7: NAME the stack that owns the lease rather than leaving a reader to infer it.
+            // There is exactly ONE DHCP client on this path — smoltcp's `dhcpv4::Socket`, driven by
+            // `net_phy::dhcp_or_static` — because the hand-rolled `crates/net` engine has no aarch64
+            // caller at all: its only call sites are in `drivers/e1000.rs`, whose `NET_DEVICE`
+            // registry is populated by the x86 PCI bring-up and by nothing on this arch. Retiring it
+            // HERE is therefore a no-op by construction; what SOCK-7 owed aarch64 was the WITNESS,
+            // and this is it. (The x86 half of SOCK-7's retirement stays owed: on x86 the
+            // hand-rolled client is live, drives `nc`/`curl`'s listener, and is a separate arc.)
+            crate::net_phy::LEASE_OWNER,
             if up { "UP" } else { "DOWN" }
         );
+
+        // NET6: hand this NIC to the SHARED socket surface — the persistent Interface + SocketSet the
+        // shell verbs and the EL0 socket family ride. The address is ADOPTED from `netcfg` above
+        // (`net_phy::settled_config`), so no second DHCP client ever touches this wire.
+        net6_start();
     }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    // NET6 — the DEVICE ADAPTER, and the whole of this driver's share of the shared socket surface.
+    // ═════════════════════════════════════════════════════════════════════════════════════
+    //
+    // Four function pointers and a name — the SAME shape `virtio_net.rs` registers on QEMU `virt`.
+    // Everything above the seam (the persistent stack, `ping`/`arp`/`dns`, the EL0 socket syscalls) is
+    // shared code in `net_phy::net6` and is byte-for-byte the code the virt fixture RUNS. That is what
+    // makes the Orin's compile-and-link green mean something: QEMU models no Tegra234, so this driver
+    // can never self-prove at runtime, but the surface on top of it is proven on virt every gate.
+    #[cfg(feature = "net6")]
+    static NET6_OPS: crate::net_phy::net6::NicOps = crate::net_phy::net6::NicOps {
+        rx: raw_rx,
+        tx: raw_tx,
+        mac: net6_mac,
+        link_up: link_up,
+        // SUBSYSTEM-named, never board-named (R16): this string reaches shared witness lines.
+        name: "rtl8168",
+    };
+
+    /// The station MAC for the NET6 adapter (`None` if bring-up never registered a NIC).
+    #[cfg(feature = "net6")]
+    fn net6_mac() -> Option<[u8; 6]> {
+        NET4_DEVICE.lock().as_ref().map(|n| n.mac)
+    }
+
+    /// Register this driver with the shared NET6 surface and bring the persistent stack up on the
+    /// address the bring-up leased. No fixture here: this code path exists only on Tegra234 silicon,
+    /// which QEMU does not model, so its behavioural proof is an attended bench flight — the runtime
+    /// proof of the SHARED surface is the virt fixture. Knob-off this is an empty `#[inline(always)]`
+    /// call and emits zero instructions.
+    #[cfg(feature = "net6")]
+    fn net6_start() {
+        crate::net_phy::net6::register_nic(&NET6_OPS);
+        crate::net_phy::net6::init();
+    }
+
+    /// Knob-off twin: NET6 is not built, so the call site above emits nothing.
+    #[cfg(not(feature = "net6"))]
+    #[inline(always)]
+    fn net6_start() {}
 }

@@ -5554,7 +5554,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                         { crate::smolnet::ping(ip, count) }
                         #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
-                        { crate::drivers::e1000::ping(ip, count) }
+                        { net6_shell_ping(ip, count) } // NET6 — on aarch64 this reaches the SHARED smoltcp stack over whichever NIC registered (virtio-net on virt, RTL8168 on Orin) and emits the `:: NET6: ping … seq=N rtt_ms=… -> REPLY ::` witnesses; knob-off it is `crate::drivers::e1000::ping` verbatim, so x86 and every existing aarch64 image are untouched. ⚠ LINE-NEUTRAL substitution — body at the FILE TAIL.
                     };
                     match outcome {
                         Some(o) if o.resolved => {
@@ -5580,7 +5580,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                         { crate::smolnet::arp_resolve(ip) }
                         #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
-                        { crate::drivers::e1000::arp_resolve(ip) }
+                        { net6_shell_arp(ip) } // NET6 — aarch64 reaches the shared stack's neighbour discovery and emits `:: NET6: arp <ip> -> is-at <mac> ::`; knob-off it is `crate::drivers::e1000::arp_resolve` verbatim. ⚠ LINE-NEUTRAL substitution — body at the FILE TAIL.
                     };
                     match resolved {
                         Some(mac) => console.println(&alloc::format!(
@@ -5591,7 +5591,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
                 None => console.println("usage: arp <a.b.c.d>"),
             }
-        },
+        }, #[cfg(all(feature = "net6", target_arch = "aarch64"))] "dns" => net6_shell_dns(console, args.first().copied()), // NET6 — the third verb the arc owes: an A-record lookup through the SHARED `crate::net_dns` builder/parser over the stack's own UDP socket, at the DHCP-offered nameserver (the gateway when the lease carried none). Emits `:: NET6: dns <host> -> A a.b.c.d (server s.s.s.s) ::` or a TYPED failure (SERVER ERROR rcode / NO A RECORD / MALFORMED REPLY / NO ANSWER), so a boot log distinguishes "the resolver said no" from "nothing came back". The ARM is `net6`+aarch64-gated rather than universal, and that is a deliberate, measured compromise, not an oversight: `knoboff` compares the x86 image too, and a new verb there would add a string and a call to the SHIPPED x86 build for a resolver x86 reaches another way (`smolnet::resolve`, used by the SNTP client). An x86 `dns` verb is owed and is a one-line arc. ⚠ LINE-NEUTRAL append — an arm on the existing closing line, body at the FILE TAIL.
         // RELICS (R26 clause 1): `connect` and `udpsend` were TWO verbs for one job — open a
         // socket to a host:port and exchange a message — differing only in the transport, which is
         // exactly what `nc`'s `-u` flag selects. So they are one `nc`, and the semantics do match:
@@ -7586,3 +7586,83 @@ fn unafs_verb_snapcat(generation: u64, path: &str) -> String {
         Err(e) => alloc::format!("snap cat: no unafs volume ({:?})", e),
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// NET6 (ROADMAP §1b SOCK-7) — the shell's three network verbs on the SHARED aarch64 socket stack.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `ping` and `arp` already existed and, off x86, resolved to `drivers::e1000::*` — which on an Orin
+// or a Pi means "No network device ready" on a machine whose NIC is up and leased. These three
+// helpers are the aarch64 arm: they route to `net_phy::net6`, the ONE socket surface every aarch64
+// NIC registers with, and each emits a `:: NET6: …` witness line the next boot scores. `dns` is new.
+//
+// FILE TAIL + LINE-NEUTRAL call sites (the three verb arms above are substitutions and one folded
+// match arm, never new source lines) because `shell.rs` compiles into EVERY image on both arches:
+// `panic::Location` embeds the source line, so a line added here would move the knob-off images and
+// `./arroyo knoboff` would say so. Knob-off, each helper is `#[inline(always)]` over exactly the
+// expression the arm carried before, so the emitted code is the pre-arc code.
+
+/// NET6: `ping` on aarch64 with the shared stack — the per-sequence RTT witnesses are printed by
+/// `net_phy::net6::ping` itself; this maps its outcome into the shape the shell renderer already
+/// draws, so the console output is unchanged in form.
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+fn net6_shell_ping(ip: [u8; 4], count: u16) -> Option<crate::drivers::e1000::PingOutcome> {
+    let o = crate::net_phy::net6::ping(ip, count)?;
+    Some(crate::drivers::e1000::PingOutcome {
+        // "resolved" keeps the hand-rolled semantics the renderer reads: an unreachable host (no ARP
+        // reply AND no echo reply) prints "host unreachable" rather than "0/4 replies".
+        resolved: o.mac.is_some() || o.received > 0,
+        mac: o.mac,
+        sent: o.sent,
+        received: o.received,
+    })
+}
+
+/// Knob-off / x86: exactly the expression the `ping` arm carried before this arc.
+#[cfg(not(all(feature = "net6", target_arch = "aarch64")))]
+#[inline(always)]
+fn net6_shell_ping(ip: [u8; 4], count: u16) -> Option<crate::drivers::e1000::PingOutcome> {
+    crate::drivers::e1000::ping(ip, count)
+}
+
+/// NET6: `arp` on aarch64 with the shared stack (smoltcp hides the resolved neighbour MAC, so the
+/// shared verb snoops the ARP reply off the wire and prints it).
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+fn net6_shell_arp(ip: [u8; 4]) -> Option<[u8; 6]> {
+    crate::net_phy::net6::arp(ip)
+}
+
+/// Knob-off / x86: exactly the expression the `arp` arm carried before this arc.
+#[cfg(not(all(feature = "net6", target_arch = "aarch64")))]
+#[inline(always)]
+fn net6_shell_arp(ip: [u8; 4]) -> Option<[u8; 6]> {
+    crate::drivers::e1000::arp_resolve(ip)
+}
+
+/// NET6: the `dns <host>` verb. Prints to the console AND to the wire (the shared verb emits the
+/// `:: NET6: dns …` witness), so an operator at the panel and a serial capture see the same answer.
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+fn net6_shell_dns(console: &mut Console, host: Option<&str>) {
+    match host {
+        None => console.println("usage: dns <hostname>"),
+        Some(h) => {
+            let server = crate::net_phy::net6::resolver();
+            match server {
+                None => console.println("dns: no resolver (no lease and no gateway)"),
+                Some(s) => {
+                    console.println(&alloc::format!(
+                        "DNS {} @ {}.{}.{}.{}", h, s[0], s[1], s[2], s[3]));
+                    // Blocks while the query goes out and the reply is pumped in (bounded).
+                    match crate::net_phy::net6::dns(h) {
+                        Some(a) => console.println(&alloc::format!(
+                            "{} has address {}.{}.{}.{}", h, a[0], a[1], a[2], a[3])),
+                        // The shared verb already said WHICH failure on the wire (server rcode /
+                        // no A record / malformed / nothing back); the console gets the summary.
+                        None => console.println(&alloc::format!("{}: no address found", h)),
+                    }
+                }
+            }
+        }
+    }
+}
+

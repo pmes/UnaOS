@@ -218,6 +218,146 @@ directly from the kernel today).
 
 ---
 
+## 8. NET6 — the SHARED socket surface on aarch64 (ROADMAP §1b, SOCK-7)
+
+Sections 1–7 describe the hand-rolled `crates/net` line and its x86 home. This section describes what
+sits above the **aarch64** smoltcp seam, which is a different thing and is shared.
+
+### 8.1 What existed before, and what was missing
+
+`ORIN-NET-4` (`arch/aarch64/rtl8168_tegra.rs`) and `AARCH64-VNET`
+(`arch/aarch64/virtio_net.rs`) each bring a NIC up, bind a **throwaway** `smoltcp::Interface` over its
+rings, acquire a DHCP lease, ping once, and drop the interface. That proved the seam — render13 boot 2
+leased `10.42.0.171/24 gw 10.42.0.1` on real Orin silicon — and left the network **unusable**: the
+shell's `ping`/`arp` resolved to `drivers::e1000::*` off x86 and printed *"No network device ready"* on
+a machine whose NIC was up and leased; there was no resolver verb; and EL0 had no socket at all
+(`KIND_SOCKET` had sat in `arch/aarch64/syscall.rs` since U6 with the comment *"no net syscall routes
+yet"*).
+
+### 8.2 The shape: one surface, many adapters
+
+NET6 (`net6`, default OFF and armed by whichever NIC knob is set — `UNAOS_NET4` / `UNAOS_NET5` /
+`UNAOS_VNET` each append it, and `UNAOS_NET6=1` arms it standalone) is that surface, and it is
+written **once**:
+
+| Layer | Where | Arch-specific? |
+| :--- | :--- | :--- |
+| Persistent `Interface` + `SocketSet`, socket registry, gen fence | `net_phy.rs`, tail module `net6` | no |
+| Shell verbs `ping` / `arp` / `dns` | same module; `shell.rs` tail routes to them | no |
+| EL0 socket family `SYS_SOCKET`(40) … `SYS_SOCK_RECV`(46) | `arch/aarch64/syscall.rs` tail | the arm only |
+| **The device adapter** | `virtio_net.rs`, `rtl8168_tegra.rs` | **yes — and only this** |
+
+An adapter is four function pointers and a subsystem name:
+
+```rust
+pub struct NicOps {
+    pub rx: fn(&mut [u8]) -> Option<usize>,
+    pub tx: fn(&[u8]),
+    pub mac: fn() -> Option<[u8; 6]>,
+    pub link_up: fn() -> bool,
+    pub name: &'static str,   // "virtio-net" / "rtl8168" — SUBSYSTEM-named, never board-named (R16)
+}
+```
+
+registered once at bring-up (`net6::register_nic`) into a lock-free `AtomicPtr`. Nothing above the seam
+knows which chip it is running on — which is the point: **`virt` RUNS the code the Orin will run.**
+
+**Why not `smolnet`.** `smolnet.rs` is the x86 DEFAULT stack. New lines in it would move the shipped
+x86 image's `panic::Location` records (`./arroyo knoboff` measures exactly that), and `arm_features()`
+strips `smolnet` from every aarch64 cargo invocation to hold the aarch64 media byte-identity contract.
+`net6` is therefore the aarch64 name for the same idea, and every one of its call sites is a
+LINE-NEUTRAL fold onto an existing line or a file-tail item.
+
+### 8.3 Which stack owns the lease (SOCK-7's question, answered on the wire)
+
+There is exactly **one** DHCP client on the aarch64 seam: smoltcp 0.13's `dhcpv4::Socket`, driven by
+`net_phy::dhcp_or_static`, which every aarch64 bring-up funnels through. The hand-rolled
+`net::dhcp::DhcpClient` has **no aarch64 caller at all** — its only call sites are in
+`drivers/e1000.rs`, whose `NET_DEVICE` registry is populated by the x86 PCI bring-up and by nothing on
+this arch — so on aarch64 it is compiled, never bound to a NIC, and leases nothing. SOCK-7's *"retire
+the hand-rolled … `crates/net` DHCP"* is therefore already true here **by construction**; what was owed
+was the WITNESS, and both bring-ups now print it:
+
+```
+:: PCIE4:   smoltcp 0.13 Interface BOUND over RTL8168: MAC set, 10.42.0.171/24 + default gw
+            10.42.0.1 [dhcp lease-owner=smoltcp-dhcpv4], medium=ethernet, polled OK; link UP …
+:: AARCH64 VNET: lease-owner=smoltcp-dhcpv4 (hand-rolled crates/net DHCP has no aarch64 caller) ::
+```
+
+The x86 half of the retirement stays owed: there the hand-rolled engine is live and owns `nc` / `nc -u`
+/ `curl` and the TCP echo listener. That is a separate arc.
+
+**One lease, one client.** `net6::init` ADOPTS the config `dhcp_or_static` settled on
+(`net_phy::settled_config()`) rather than running a DHCP client of its own — two clients for one MAC
+could land two different addresses and then the sockets and the wire witness would disagree about
+where the machine lives. Exactly one DISCOVER/REQUEST pair ever leaves the NIC.
+
+### 8.4 The EL0 socket family on aarch64
+
+SOCKNUM (WINX-1) moved the family to 40..48 so that *a number names the same verb on every arch*. x86
+has answered 40..46 since SOCK-2/SOCK-3; aarch64 now answers the same seven, over the same shared
+stack, with the same capability model — not a second one:
+
+* a socket handle is `KIND_SOCKET` whose value word is the gen-fenced `(gen << 32) | (sid + 1)`;
+* the generation is validated against the live registry at **every** use, so a stale handle to a
+  freed-and-reused slot is refused and never rebinds (the SOCK-3 / U11x fence);
+* send needs `CAP_WRITE`, recv needs `CAP_READ` (so `SYS_CAP` GRANT can still attenuate a socket to
+  send-only or recv-only), and the mint carries `CAP_GRANT`;
+* every user buffer is range-checked through `copy_from_user` / `copy_to_user` before any dereference;
+* every verb is NON-BLOCKING and iteration-bounded, because the handler runs IF-masked: `recvfrom` /
+  `sock_recv` return `-EAGAIN`, `connect` returns `0` / `-EINPROGRESS` / `-ECONNREFUSED`;
+* `clear_handle_row` closes every socket a dying address space still owns, so an exiting program frees
+  its registry slots.
+
+### 8.5 What proves it
+
+QEMU models **no** Tegra234, so an Orin build can never self-prove at runtime — a jetson green
+certifies that the code COMPILES AND LINKS. The behaviour is proven on QEMU `virt`, over
+`virtio_net.rs`, through byte-for-byte the same shared code:
+
+```
+UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VNET=1 UNAOS_NET6=1 ./arroyo test-arm 60
+```
+
+which runs, in order:
+
+1. `net6::fixture()` at bring-up — a UDP round-trip through the persistent set (`open`/`bind`/`sendto`/
+   `recvfrom`: the exact syscall bodies), a TCP client round-trip (`open`/`connect`/`send`/`recv`) to
+   slirp's DNS-over-TCP port, and an ICMP echo to the gateway with per-sequence RTT lines;
+2. the `dns` verb;
+3. `net6_el0_witness()` from `virt_el0_verdict` — a flat, position-independent, one-code-page **EL0**
+   program (the KILLBOUND shape, `spawn_user_image_bg`, no fixture file on any card) that walks all
+   seven syscalls and reports a bitmask, then parks in `SYS_FUTEX`. It parks rather than exits because
+   the VIRT-EL0 verdict requires `exited_ok == 1` (exactly `el0-hello`); a second clean exit would red
+   a leg that has nothing to do with this arc.
+
+Wire shape:
+
+```
+:: NET6: stack UP over virtio-net: 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 lease-owner=smoltcp-dhcpv4 [dhcp] sockets=4 ::
+:: NET6: sock udp round-trip 40 bytes from 10.0.2.3:53 -> PASS ::
+:: NET6: sock tcp round-trip 10.0.2.3:53 sent=26 recv=42 -> PASS ::
+:: NET6: ping 10.0.2.2 seq=1 rtt_ms=0 -> REPLY ::
+:: NET6: dns una.os -> A 10.0.2.3 (server 10.0.2.3) ::
+:: NET6: el0 socket family over virtio-net — socket=true bind=true sendto=true recvfrom=true socket-tcp=true connect=true send=true sock_recv=true -> PASS ::
+```
+
+Compile coverage of the ARMED polarity is two KERNEL_CFG_MATRIX legs, not one: `arm-virt-net6`
+(`virt_el0,vnet,net6` — the only leg that compiles the EL0 fixture launcher, and deliberately carries
+no board term, so the surface is proven board-free) and `arm-tegra-net6` (`tegra,net4,net5,net6` — the
+metal adapter). Both adapters must type-check against the one surface or the ONE OS claim is only true
+of whichever a gate happened to build.
+
+### 8.6 Limits, stated
+
+* The `virt` EL0 fixture's peer address is **baked** (`10.0.2.3:53`): QEMU user-mode networking always
+  serves DNS there. It is a `virt` instrument; an Orin's peers come from the lease.
+* `NSOCK = 4` concurrent sockets, 1 KiB datagrams, 2 KiB stream rings — all BSS, no heap.
+* No `listen`/`accept` on aarch64 yet (x86's SOCK-6/7 server side); the client halves are here.
+* Live ICMP/ARP on the Orin's real link remains **attended-metal** (orin-ledger A59).
+
+---
+
 ## See also
 - [`docs/dev/OS/`](../) — other kernel subsystem documentation.
 - `unaos/crates/net/` — the implementation.
