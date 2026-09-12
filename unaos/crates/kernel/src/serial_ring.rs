@@ -746,6 +746,73 @@ const _: () = assert!(
     "the uncapped spelling (panic, power verbs) is not bounded by bytes at all"
 );
 
+// ── PWRDRAIN (SO31 part 3, trunk queue §1 (f)) — the power verbs flush the ring before the SMC ──
+//
+// ### The defect
+// `power.rs`'s verbs printed their announce line and then called the firmware: PSCI `SYSTEM_OFF` /
+// `SYSTEM_RESET` through the SMC on aarch64, ACPI S5 on x86. Both announce through `_print`, which on a
+// contended lock DEFERS into this ring — and then the power call takes the machine. **A deferred line
+// is not a lost one only for as long as there is a next print.** A power verb is the one context where
+// there is not: the ring dies with the power, and on a flooded ring (render13 boot 1 was dropping
+// 5 331 lines) the last lines before `SYSTEM_OFF` — including the verb's own witness — go with it.
+//
+// ### The fix
+// One uncapped full drain, through the arch's raw lock-free bounded UART primitive, immediately before
+// the firmware call, and then a witness saying what it flushed. Three properties, each load-bearing:
+//
+//   * **Uncapped.** [`DRAIN_BYTE_BUDGET`] exists so a COMPOSITE PASS cannot be stretched by the wire;
+//     a machine that is powering off has no frame to protect and no next print to defer to. It owes
+//     its reader every staged byte. This is the same reason the panic path keeps [`drain`].
+//   * **Bounded anyway.** `drain_into`'s slot guard bounds the LOOP at [`SLOTS`] + 1 iterations, so
+//     "every staged line" is a finite statement, and the arch's TX-ready poll under `raw_write_str` is
+//     itself bounded — a machine whose UART never drains degrades instead of hanging the shutdown.
+//   * **Raw, not `serial_println!`.** The witness must not be able to take the very branch it is
+//     reporting on. `raw_write_str` acquires nothing (it is the WEDGE-2 / panic primitive), so the
+//     line is synchronously on the wire before the next instruction runs — which, at these call
+//     sites, is the SMC.
+//
+// The witness is `[pwrreboot]` / `[pwrshutoff]`, `power.rs`'s own families, subsystem-named and never
+// board-named (`docs/dev/LAWS.md` §3). Both tokens are 11+ bytes with their brackets, so they survive
+// LLVM's <=8-byte immediate encoding and `LC_ALL=C grep -a -o -F 'ring drained'` finds them in the
+// artifact — which is how `UNAOS_TEGRA=1 ./arroyo esp-jetson` certifies this half.
+
+/// Flush the whole staging ring at a power verb, then say what was flushed. `tag` is the caller's
+/// witness family without brackets (`"pwrshutoff"`, `"pwrreboot"`).
+///
+/// Emits `[<tag>] ring drained lines=N bytes=M` through the same raw writer, so the reader of a
+/// capture can tell "the ring was empty" (`lines=0`) from "the ring held 61 lines and they made it"
+/// — and, if that line is itself missing from a capture, that the machine died before this point.
+///
+/// Returns the same `(lines, bytes)` it printed, so [`pwrdrain_selftest`] can assert on the numbers
+/// rather than on the shape of a string. The power verbs ignore it: past their call site there is no
+/// code left to react.
+pub fn power_drain(tag: &str) -> (u64, usize) {
+    let mut lines = 0u64;
+    let mut bytes = 0usize;
+    drain(|s| {
+        lines += 1;
+        bytes += s.len();
+        crate::arch::serial::raw_write_str(s);
+    });
+    // Marker-sized scratch, not slot-sized: the same reasoning as [`MARKER_LEN`], and this frame sits
+    // on the stack of a verb that is about to hand the machine to the firmware.
+    let mut buf = [0u8; MARKER_LEN];
+    let mut w = BoundedWriter {
+        buf: buf.as_mut_ptr(),
+        cap: MARKER_LEN,
+        n: 0,
+        truncated: false,
+    };
+    let _ = write!(w, "[{}] ring drained lines={} bytes={}\n", tag, lines, bytes);
+    let n = w.n;
+    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+        // Deliberately NOT counted in `EMITTED`, for the same reason `report_losses`' marker is not:
+        // nobody submitted it, and counting it would corrupt the conservation law.
+        crate::arch::serial::raw_write_str(s);
+    }
+    (lines, bytes)
+}
+
 /// SERWIT-1D — empty the staging ring on a machine that has NO 16550, charging every line to
 /// [`DECLINED`] instead of [`EMITTED`].
 ///
@@ -1625,6 +1692,10 @@ pub fn mirror_service() {
     // SERWIT-1B PARITY — the shared contended-producer policy, exercised on whichever arch is
     // running. Same one-shot call site and same contract as the two fixtures above it.
     backpressure_selftest();
+    // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
+    // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
+    // a fixture that leaves the ring as it found it should not do so before one that reads it.
+    pwrdrain_selftest();
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -1976,6 +2047,144 @@ fn backpressure_selftest() {
             spins,
             freed,
             rest,
+            lost
+        );
+    }
+}
+
+// ── PWRDRAIN — the fixture: a full drain empties the ring, and the witness counts BYTES ──────────
+//
+// ### What it exercises
+// The live ring and the live [`power_drain`], in the order a power verb runs them, minus the SMC —
+// which is the one line of a shutdown a fixture may not execute, because the next instruction would
+// take the machine and there would be no verdict to read. So the fixture proves everything up to it:
+// fill the ring to [`SLOTS`], call `power_drain` exactly as `platform_shutdown` does, and assert that
+// at least every staged line left, that at least every staged byte left, and — strictly — that the ring
+// is EMPTY afterwards. The two `>=` are the direction the property points and not a hedge; the reason
+// is at the predicate. The SMC's position relative to this call is the compiler's: there is one call
+// and it is the statement before `psci_call` (`power.rs`).
+//
+//     ring filled to SLOTS x PWRDRAIN_LINE_LEN = 64 x 68 B = 4 352 B   (SO29's whole ring)
+//     power_drain("pwrshutoff")  ->  lines = 64, bytes = 4 352
+//     a following drain          ->  residue = 0
+//
+// 4 352 B is 22.6x [`DRAIN_BYTE_BUDGET`] (192 B) on purpose: the gap between "uncapped" and "capped"
+// has to be wide enough that the fixture cannot pass by accident on a tree where the two spellings
+// were swapped.
+//
+// ### The go-red
+// Two, and the first is the regression this deliverable exists to prevent:
+//   * RUNTIME, the realistic one — change `power_drain`'s `drain(...)` to `drain_capped(...)` (the
+//     plausible "reuse the other spelling" edit). It compiles. The budget stops the drain after 3
+//     lines of 68 B (68, 136, 204 — `drain_may_continue` is strictly `<`), so the fixture reads
+//     `lines=3 residue=61` and prints `-> FAIL`, which `FAULT_PATTERNS` (`FAIL — `) turns into a
+//     non-zero exit from `./arroyo test-arm`.
+//   * RUNTIME, the blunt one — delete the `drain(...)` call from `power_drain` entirely: `lines=0
+//     bytes=0 residue=64`, same `-> FAIL`.
+// Both are runtime rather than compile-time by construction: `drain` and `drain_capped` have the same
+// signature, which is exactly why a fixture and not a type is what holds this property.
+//
+// ### What it does NOT prove
+// Stated rather than implied. It does not prove that the firmware call is reached, that `raw_write_str`
+// outruns the SMC on real silicon, or that the Jetson's UART has flushed its own FIFO when power drops
+// — none of those is observable from inside the machine. It proves the ring is empty and the bytes
+// were handed to the port before the verb continues. The artifact half of the claim is
+// `LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf`.
+
+static PWRDRAIN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Width of one fixture fill line, `"[pwrdrain] fill NN " + DRAINCAP_PAD + "\n"`: 19 + 48 + 1. Named
+/// so the byte assertion below is arithmetic the compiler can check rather than a magic number.
+const PWRDRAIN_LINE_LEN: usize = 19 + 48 + 1;
+
+const _: () = assert!(
+    PWRDRAIN_LINE_LEN <= SLOT_LEN,
+    "a fixture fill line must not truncate, or the byte count it asserts on is not the one staged"
+);
+const _: () = assert!(
+    SLOTS * PWRDRAIN_LINE_LEN > DRAIN_BYTE_BUDGET * 8,
+    "the fixture's ring must be many budgets wide, or capped and uncapped are indistinguishable"
+);
+
+/// PWRDRAIN, once per boot. Called from [`mirror_service`].
+fn pwrdrain_selftest() {
+    if PWRDRAIN_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        // SERWIT-1D's machine stages nothing and drains nothing; `power_drain` there is a pair of
+        // zeroes and a witness into a port that is not present. Nothing to exercise.
+        serial_println!(
+            ":: PWRDRAIN: SKIP — no 16550 on this machine, so there is no staged line for a power \
+             verb to lose (SERWIT-1D); the budget arithmetic is asserted at compile time ::"
+        );
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    // Start from an empty ring AND from a cleared loss-pending count: `drain` runs `report_losses`,
+    // whose marker would otherwise ride the measured drain below and inflate its byte total.
+    drain(draincap_wire);
+
+    let mut filled = 0u64;
+    for i in 0..SLOTS {
+        if try_stage(format_args!("[pwrdrain] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            note_submitted();
+            filled += 1;
+        } else {
+            break;
+        }
+    }
+
+    // The measured call — the same one `platform_shutdown` makes, with the SMC left off.
+    let (lines, bytes) = power_drain("pwrshutoff");
+
+    // "Empty" is a claim about the ring, so ask the ring, not the counter.
+    let mut residue = 0u64;
+    drain(|s| {
+        residue += 1;
+        draincap_wire(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let want_bytes = filled as usize * PWRDRAIN_LINE_LEN;
+    // The comparisons on `lines`/`bytes` are `>=`, and that is a statement about the machine, not a
+    // hedge: this fixture runs on a live kernel with other cores printing, so a foreign line can be
+    // staged between the fill loop and the drain. Foreign traffic can only ADD to what a full drain
+    // emits — it can never subtract — so `>=` is exactly the direction the property points, while a
+    // capped or absent drain lands FAR below `filled` and is caught. `residue == 0` is the strict
+    // half and is the claim itself: the ring is empty when the verb continues.
+    let pass = filled >= SLOTS as u64 / 2
+        && lines >= filled
+        && bytes >= want_bytes
+        && residue == 0
+        && lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: PWRDRAIN: a power verb drains the WHOLE ring before it calls the firmware — ring \
+             filled to {} line(s) / {} B ({}x DRAIN_BYTE_BUDGET={}), one power_drain() put every \
+             line on the wire (lines={} bytes={}) and left the ring EMPTY (residue={}), 0 dropped; \
+             the witness `[pwrshutoff] ring drained lines={} bytes={}` is on the wire above this \
+             verdict, and in `power.rs` the statement after it is the SMC -> PASS ::",
+            filled,
+            bytes,
+            bytes / DRAIN_BYTE_BUDGET,
+            DRAIN_BYTE_BUDGET,
+            lines,
+            bytes,
+            residue,
+            lines,
+            bytes
+        );
+    } else {
+        serial_println!(
+            ":: PWRDRAIN: FAIL — filled={} lines={} bytes={} want_bytes={} residue={} dropped={} ::",
+            filled,
+            lines,
+            bytes,
+            want_bytes,
+            residue,
             lost
         );
     }

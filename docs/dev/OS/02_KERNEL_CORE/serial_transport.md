@@ -749,6 +749,107 @@ Two go-reds, failing at different stages:
   lost one). It compiles; the fixture reads `dropped=2` and prints `-> FAIL`, which `FAULT_PATTERNS`
   (`FAIL — `) turns into a non-zero exit from `./arroyo test-arm`.
 
+## The power verbs drain first — a deferred line needs a NEXT print, and a power verb has none
+
+Trunk queue §1 (f); `LEDGER.md` SO31. Every guarantee in this document rests on one sentence: *a
+contended line is deferred, and the next holder of the UART emits it.* That sentence has a
+precondition nobody had written down — **there has to be a next holder.**
+
+`power.rs`'s verbs announce through `_print` and then hand the machine to the firmware:
+
+| verb | mechanism |
+| --- | --- |
+| `platform_shutdown` / `crystal_shutdown` (aarch64, non-Pi) | PSCI `SYSTEM_OFF` via `smc #0` |
+| `platform_reboot` / `crystal_restart` (aarch64, non-Pi) | PSCI `SYSTEM_RESET` via `smc #0` |
+| `platform_shutdown` (x86) | ACPI S5, `acpi_power::poweroff` |
+| `platform_reboot` (x86) | FADT RESET_REG ladder, `acpi_power::reboot` |
+| both (Pi 4) | honest witness, then `hlt_loop` |
+
+The announce is the line most likely to be staged — a desktop Shut Down press happens with the
+compositor printing — and the firmware call is microseconds behind it. On a flooded ring (render13
+boot 1 was dropping 5 331 lines) everything still staged when `SYSTEM_OFF` lands dies with the power,
+**including the verb's own witness**, and the operator who pressed the button is left with a dark
+board and a capture that never says the verb ran.
+
+### The fix
+
+One uncapped full drain through the arch's raw lock-free writer, immediately before the firmware call,
+then a witness. `serial_ring::power_drain(tag) -> (lines, bytes)`:
+
+```
+[pwrshutoff] ring drained lines=61 bytes=4148
+```
+
+Three properties, each load-bearing:
+
+* **Uncapped.** `DRAIN_BYTE_BUDGET` (192 B) exists so a *composite pass* cannot be stretched by the
+  wire. A machine that is powering off has no frame to protect and no next print to defer to; it owes
+  its reader every staged byte. Same reason the panic path keeps the uncapped `drain`.
+* **Bounded anyway.** `drain_into`'s slot guard bounds the loop at `SLOTS` + 1 iterations, so "every
+  staged line" is a finite statement, and `raw_write_str`'s TX-ready poll is itself bounded — a machine
+  whose UART never drains degrades rather than hanging the shutdown.
+* **Raw, not `serial_println!`.** The witness must not be able to take the very branch it reports on.
+  `raw_write_str` acquires nothing (it is the WEDGE-2 / panic primitive), so the bytes are on the wire
+  before the next instruction, which at these call sites is the SMC.
+
+`lines=0` and a missing line are different facts, which is the point of printing the count: an empty
+ring says so, and a capture with no `ring drained` line at all says the machine died before this point.
+
+The Pi arms get the drain too. They do not power anything off — they print an honest refusal and park
+in `hlt_loop` — and a park is likewise a context with no next print.
+
+### The fixture
+
+`serial_ring::pwrdrain_selftest`, one-shot on `mirror_service`, so it runs on both arches at the same
+call site as DRAINCAP's and SERWIT-1B's. It runs everything a power verb runs **except the SMC** —
+which is the one line of a shutdown a fixture may not execute, since the next instruction would take
+the machine and leave no verdict to read:
+
+```
+ring filled to SLOTS x PWRDRAIN_LINE_LEN = 64 x 68 B = 4 352 B     (SO29's whole ring)
+power_drain("pwrshutoff")  ->  lines = 64, bytes = 4 352           (22x DRAIN_BYTE_BUDGET)
+a following drain          ->  residue = 0
+:: PWRDRAIN: … -> PASS ::
+```
+
+4 352 B is 22x the byte budget on purpose: the gap between *uncapped* and *capped* has to be wide
+enough that the fixture cannot pass by accident on a tree where the two spellings were swapped. The
+`lines` and `bytes` comparisons are `>=` and `residue == 0` is strict — a live kernel can stage a
+foreign line between the fill loop and the drain, and foreign traffic can only ADD to what a full
+drain emits, never subtract, so `>=` is the direction the property actually points.
+
+**Go-red, both at runtime**, because `drain` and `drain_capped` share a signature and no type can
+separate them:
+
+* the realistic one — swap `power_drain`'s `drain(...)` for `drain_capped(...)`: the budget stops it
+  after 3 lines of 68 B (68, 136, 204; `drain_may_continue` is strictly `<`), the fixture reads
+  `lines=3 residue=61` and prints `-> FAIL`, and `FAULT_PATTERNS` turns that into a non-zero
+  `./arroyo test-arm`;
+* the blunt one — delete the `drain(...)` call: `lines=0 bytes=0 residue=64`, same `-> FAIL`.
+
+What the fixture does **not** prove, stated rather than implied: that the firmware call is reached,
+that `raw_write_str` outruns the SMC on real silicon, or that the Jetson's UART has flushed its own
+FIFO when power drops. None of those is observable from inside the machine. It proves the ring is
+empty and the bytes were handed to the port before the verb continues.
+
+### Certification
+
+The witness tokens are `[pwrreboot]` / `[pwrshutoff]`, `power.rs`'s own families: subsystem-named,
+never board-named, and 11+ bytes with their brackets, so LLVM cannot immediate-encode them out of
+`.rodata`. `UNAOS_TEGRA=1 ./arroyo esp-jetson` followed by
+
+```
+LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf | wc -l
+```
+
+is the artifact proof — the presence of an instrument is proven in the artifact, never in the diff.
+
+> ⚠ **SCOPE, stated rather than implied.** On x86 this covers the `power::shutdown` route only.
+> `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` **directly**
+> and still reach S5 with the ring unflushed. The one-line fix belongs at the top of `poweroff()`
+> itself, in `arch/x86_64/acpi_power.rs` — a file this arc's brief does not name, so it is reported and
+> not made. `acpi_power::reboot` already drains (since LOCKFIX) and now carries the witness too.
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,
