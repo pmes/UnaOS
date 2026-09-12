@@ -11995,6 +11995,31 @@ impl XhciController {
             ":: USBLUN: census slot={} max_lun={} luns={} present={} first_present={} ::",
             slot, max_lun, max_lun as u16 + 1, present, LunField(first_present));
 
+        // USBLUN M2 — THE SELECTION. Publish the unit that actually holds a card.
+        //
+        // LUN 0 when LUN 0 has one — which is every single-LUN device (every stick on the x86 and
+        // Pi benches, and QEMU's `usb-storage`), so those publish exactly what they published
+        // before. Otherwise the FIRST unit the census scored PRESENT, so a reader whose first slot
+        // is empty stops publishing an empty slot. With nothing present anywhere the choice falls
+        // back to LUN 0 and the bring-up proceeds into its existing READ CAPACITY failure path:
+        // "no card in any slot" is not a reason to invent a different unit to fail on.
+        //
+        // Set HERE, before the INQUIRY below, because everything downstream reads it: the INQUIRY
+        // and READ CAPACITY that produce the geometry, the `xHCI: Disk` line, `publish_usb_geometry`
+        // — and every later READ(10)/WRITE(10), which reach `build_cbw` through this same slot. One
+        // field, one write, and the whole command stream moves to the chosen card together.
+        let chosen = first_present.unwrap_or(0);
+        self.slots[slot as usize].bot_lun = chosen;
+        if present > 1 {
+            serial_println!(
+                ":: USBLUN: {} present, publishing lun={}; the block registry holds one USB disk ::",
+                present, chosen);
+        }
+        serial_println!(
+            ":: USBLUN: publish lun={}/{} present={} source={} — every CBW for this device now carries this LUN ::",
+            chosen, max_lun, present,
+            if first_present.is_some() { "first-present" } else { "fallback-lun0" });
+
         self.storage_note = "INQUIRY";
         let t_inq = crate::arch::now_cycles();
         let inq = self.scsi_inquiry(slot);
