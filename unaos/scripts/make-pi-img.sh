@@ -313,7 +313,15 @@ else
         | dd of="$OUT" bs=1 seek=446 count=16 conv=notrunc 2>/dev/null
     printf '\x55\xaa' | dd of="$OUT" bs=1 seek=510 count=2 conv=notrunc 2>/dev/null
     # -F 32 forced: mkfs.fat would pick FAT16 at this size, and the Pi GPU ROM wants FAT32.
-    mkfs.fat -F 32 -n "$FAT_LABEL" -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) >/dev/null
+    # -s 1 forced (orin 27, 2026-09-12, FATCLUST): at 127 MiB mkfs.fat chose 8 sectors per cluster,
+    # which leaves 32,440 clusters — and a volume under 65,525 clusters IS FAT16 by the spec, whatever
+    # the BPB says. mkfs.fat prints "WARNING: Not enough clusters for a 32 bit FAT!" and proceeds; the
+    # >/dev/null below hid it. Linux mounts such a volume (it trusts the BPB); EDK2's FAT driver and
+    # our own fs/fat.rs classify by cluster count and refuse it — the Orin UEFI listed no bootable
+    # disk in the native slot, and the kernel would have read the FAT as 16-bit. One sector per
+    # cluster yields 259,520 clusters at 127 MiB and 112k at the Pi's 55 MiB: FAT32 on both.
+    # The warning is no longer discarded: a future size that trips it fails loudly here.
+    mkfs.fat -F 32 -s 1 -n "$FAT_LABEL" -S 512 --offset "$P1_START" "$OUT" $(( P1_COUNT / 2 )) 2>&1 | { ! grep -i "WARNING: Not enough clusters" ; } || { echo "make-pi-img: mkfs.fat says the FAT32 volume has too few clusters — refuse" >&2; exit 3; }
     mcopy -s -i "$OUT@@$(( P1_START * 512 ))" "$SRC"/* ::/
     # SOURCE-ALONG (see the Darwin branch note): copied explicitly, not via $SRC.
     if [ -n "$SRC_TGZ" ]; then
