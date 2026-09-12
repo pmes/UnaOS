@@ -37,7 +37,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 - **One trunk, `main`. Three tracks:** `hw-rmbp` (`../UnaOS-rmbp`, x86 2012 rMBP), `hw-pi4`
   (`../UnaOS-hw-pi4`, Pi 4), `hw-jetson` (`../UnaOS-orin`, Jetson Orin Nano). Trunk worktree
-  `../UnaOS`. No integrator seat (Peter 2026-08-18); the tracks coordinate over ccd.
+  `../UnaOS`. **ONE SESSION AT A TIME** (Peter 2026-09-12: "there will only be the one session"): no seats, no
+  peers, no ccd coordination, no integrator. The order of a session is [PLAYBOOK.md](PLAYBOOK.md).
 - **One focus per session, named by Peter; the session is ALL LANES** (R46, Peter 2026-09-11: "you are all
   lanes. there is no owner of anything. it's just work on the OS" / "there will still be a overarching focus per
   session such as orin for this one"). The focus names the board whose metal this session flies and the track
@@ -71,14 +72,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 ## 2. Batons and handoff
 
-- **The handoff is adversarial, not a rule list** (R48, Peter 2026-09-11: "give each new session a new point of
-  view... here's what you're taking over. here's what i did and it was this or that but maybe something is being
-  missed"). Each close writes ONE handoff (`~/.claude/plans/unaos/batons/<track>-<n>.md`, corpus kept) with four
-  sections: what you are taking over (tree state with shas, what flew, what is half done per branch); what I did
-  and why; what I chose between and what I picked; **what I may have missed** (the two or three things this
-  session could not verify, each with the command that would). The next session attacks that last section before
-  it starts new work. The three-line header this replaced (read LAWS, read the baton and the resume, one arc per
-  session) stays true and is no longer the point of the document. Enforcer: R48; `baton-check.sh` warning only.
+- **The queues are the handoff; there are no batons and no numbered sessions** (Peter 2026-09-12: "there is no more orin 28 or rmbp 19 or pi 11"; "one session after the next with whatever focus I tell you"). What a session learns goes into the queue it belongs to THE TURN IT IS LEARNED: metal-specific facts and jobs into that platform's `docs/dev/OS/<track>-queue.md`, everything else into `docs/dev/QUEUE.md` on main — including the other platforms' queues when a finding touches them. R48's challenge ("maybe something is being missed") is written as open questions in those queue entries, not in a separate file. The focus is what Peter says at the start of a session and nothing else; it is not a place to store state. Enforcer: R48, R45; warning only.
 - **Every baton fact is a claim.** Verify each sha with `git log --oneline -1` and reachability with
   `ls-remote`; an inherited open question is checked in the peer's ledger at their head (`git show
   <peer-head>:<ledger>`) before re-asking; a wrong instruction in a baton is executed, not reviewed,
@@ -115,10 +109,9 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   (a merge, never a rebase of a pushed tip) at arc boundaries, and reviewed, peer-acked arc into trunk
   with `--no-ff`.
 - **Landing an arc:** adversarial review by an agent panel (the author never reviews alone), scoped
-  `origin/main..<tip>` and attributed per commit; announce over ccd with a fresh `ls-remote` run by
-  both seats that turn; obtain an ack from at least one other track (silence is not consent; an
-  unresolved objection goes to Peter with both positions); immediately before the merge announce
-  again and re-check trunk, merging it in and re-running the battery if it moved; merge `--no-ff`;
+  `origin/main..<tip>` and attributed per commit; the panel is the review — there is no peer and no ack (one session, 2026-09-12); an
+  objection the session cannot answer in code goes to Peter; immediately before the merge re-check trunk,
+  merging it in and re-running the legs if it moved; merge `--no-ff`;
   run **the landing seat's OWN-BOARD legs, never the trunk battery** (R39, 2026-09-10 — the cross-platform
   battery is what made every landing proof all three boards, so the rule that required it is the rule that
   had to change); then prove the shape: `git log --pretty=%p -1 <merge>` shows two parents,
@@ -453,7 +446,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   never by relocation; the desktop is a Mac clone and any placement contradicting the Mac layout is
   wrong by default; a fixture move to another edge is a one-line question before code (R25 as
   heard by orin 17). Menus
-  live in the menu bar, never inside a window (R21). Esc dismisses menus only; the Tab focus cycle is
+  live in the menu bar, never inside a window (R21). **The console and the shell are apps with pinned taskbar tiles; closing is a quit and
+  the tile launches a fresh instance — no furniture route or re-mint (R49, 2026-09-12).** Esc dismisses menus only; the Tab focus cycle is
   retired (R24 as heard by orin 17, 2026-09-06). Shell verbs use standard names and are not pinned to a platform (R26). A window's
   title is the app's name; numbering is for untitled documents only (R36). Crispy is a theme, never a
   lock-in; two GUI modes only (self-drawn, or real host widgets). The bench loop is a scaffold and
@@ -489,30 +483,11 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   never needs the tool; see
   [`docs/dev/OS/01_BOOT_HAL/bootloader_spec.md`](OS/01_BOOT_HAL/bootloader_spec.md) §4.
 
-## 7. Coordination between seats
+## 7. Coordination between seats — RETIRED 2026-09-12
 
-- **Peers are live sessions:** a finding or ask for another seat goes over ccd in the same turn,
-  never "noted for the arc" (Peter 2026-09-03). `list_sessions` every time; never trust an inherited
-  session id; ccd is for logistics, never roles. **Comms are never the waste** (R24 as heard by rmbp 16, Peter
-  2026-09-08, the ruling that names orin 21 as its subject; R24/R25 are double-booked across tracks, so cite the seat with the id until Peter
-  renumbers): never clamp peer coordination for budget; look at the fleet.
-- **Messages carry predicates, not values** (pi 6 2026-09-05): a claim carries the command that
-  produced it; a sha is a timestamped predicate; status lives in the ledger; a message leads with
-  the ask. Two rounds of disagreement about a mechanism means stop writing and build the falsifier.
-  A contradiction between two of your own checks is the detector: resolve it before relaying.
-- **Relaying upgrades claims:** keep the peer's verb (committed, pushed, green, landed are four facts
-  with four instruments); relay a ruling at its stated scope and mark it as a relay; before sending,
-  ask whether it would be news to them (restating a peer's own finding manufactures a reason to
-  talk). Route a claim to the seat that can see it.
-- **Route work to the focus track** (Peter 2026-08-25): at every landing, relay the sha and a
-  portability call; the focus seat takes over peers' portable owed work and tells the owner.
-- **A support seat verifies before accepting and before challenging:** re-derive in your own tree
-  from the cited construct, and read the peer's sha before calling anything nonexistent. Name the
-  property, never the mechanism (pi 9 2026-09-08); never require a witness that asserts a limitation.
-- **Reply to Peter first** (Peter 2026-08-18): while he is interacting with a seat, it answers him
-  before any ccd side-check, and confirms facts itself the same turn.
-- **Executors are not ccd sessions:** they report by final message; a seat's agents never look for a
-  seat session.
+- There is one session at a time (Peter: "there will only be the one session"). Peers, ccd messages, relays,
+  seat-to-seat grants and acks do not exist. The section that stood here is in git history. What a session
+  must tell the next one goes into the queues (§3 Queues). Executors report by final message only.
 
 ## 8. Communication with Peter
 
@@ -522,8 +497,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   never ending in a question.
 - **No dramatic prose** (Peter 2026-08-13): no coined phrases, no metaphors, no em-dash chains; facts,
   shas, gate results. Mid-sitting replies are one line in bench terms. No handholding, no reassurance.
-- **You report your own track, never another seat's** (Peter 2026-08-25); the only thing that
-  crosses tracks upward is a conflict or blocker he must rule on, stated as the decision needed.
+- **Report the focus you were given** (one session); a conflict or blocker he must rule on is stated as
+  the decision needed.
 - **Decisions lead,** as `DECISION NEEDED` with numbered one-line options, and only for destructive,
   first-of-kind, strategy-pivot or genuinely balanced forks; otherwise decide, do it, state it. Never
   ask a question you can answer; a decision being important does not make it his; a question he has

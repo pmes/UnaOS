@@ -1,6 +1,9 @@
 # CLAUDE.md — UnaOS
 
 **The rules live in one file: [`docs/dev/LAWS.md`](docs/dev/LAWS.md). Read it before acting.
+The ORDER of a session, with the commands, is [`docs/dev/PLAYBOOK.md`](docs/dev/PLAYBOOK.md). ONE session at a
+time; the handoff between sessions is the queues: [`docs/dev/QUEUE.md`](docs/dev/QUEUE.md) (shared code) and
+`docs/dev/OS/<platform>-queue.md` (that metal).
 Binding in this repo and every worktree of it.** Peter's verbatim rulings are in
 [`docs/dev/RULINGS.md`](docs/dev/RULINGS.md), cited by R-id. Nothing in this file is a rule.
 
