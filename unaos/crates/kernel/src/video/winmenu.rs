@@ -506,6 +506,16 @@ pub fn publish_app(owner: wm::WinId, items: &'static [MenuItem]) -> bool {
 /// INSIDE `strip::compose_all`, so an owner change clears menu STATE through [`dismiss_state`] on
 /// PANEL V-1's rule, exactly as [`set_bar_owner`] does, and [`compose`] discharges the erase later
 /// in the same pass.
+///
+/// WINTITLE-LATE — the witness now also says **WHY the bar is showing that name**, as
+/// `from=declared|program|document|unnamed` ([`wm::TitleSource`]). Without it the line cannot
+/// distinguish the two states render13 put side by side: `name=Application` is what an EL0 window
+/// reads when no launcher name reached it (`from=unnamed`) and the fix is that a launched program
+/// reads `name=VUG from=program` — and "Application" is, by construction, also a perfectly legal
+/// DECLARED name, so the caption alone can never convict. The source is read through
+/// [`wm::title_source_of`], which is a relaxed atomic load and NOT a table acquisition: this
+/// function's "no lock, no composite" contract above is unchanged, and it is load-bearing, because
+/// this runs inside `strip::compose_all`.
 pub fn set_app_window(id: wm::WinId, name: &[u8]) {
     let n = name.len().min(wm::MAX_TITLE);
     let (mut lo, mut hi) = (0u64, 0u64);
@@ -531,9 +541,10 @@ pub fn set_app_window(id: wm::WinId, name: &[u8]) {
     if id != wm::WIN_NONE {
         let (buf, len) = app_name();
         serial_println!(
-            "[winmenu] app-menu owner={} name={} kind={}",
+            "[winmenu] app-menu owner={} name={} {} kind={}",
             id,
             core::str::from_utf8(&buf[..len]).unwrap_or("?"),
+            wm::title_source_of(id).as_from_str(), // WINTITLE-LATE — the field name rides INSIDE the literal (`from=program`), so `LC_ALL=C grep -a -o -F 'from=program'` certifies the shape on the artifact; a `from={}` split leaves nothing longer than five bytes to grep for. See `wm::TitleSource::as_from_str`.
             if app_menu_is_custom(id) { "custom" } else { "default" }
         );
     }
@@ -1708,8 +1719,8 @@ pub fn rollup(scope: &str) {
 /// uses to reach `menubar::selftest`: the x86 battery calls one furniture fixture and the family
 /// chains, so a new surface does not need a line in a file another lane owns.
 ///
-/// Five legs, each able to red on its own. It mints its own window, so nothing the operator's boot
-/// put on the panel is at risk, and it closes that window itself if `Quit` did not.
+/// Six legs, each able to red on its own. It mints its own windows, so nothing the operator's boot
+/// put on the panel is at risk, and it closes them itself if `Quit` did not.
 ///
 /// 1. **every window has an app menu** (SO3) — a window that has published NOTHING lays out a title
 ///    box carrying its own name. This is the ruling's whole claim, and it is the leg that reds if
@@ -1727,6 +1738,12 @@ pub fn rollup(scope: &str) {
 ///    `wm::info` answers `None` and `[wc-a] close win=` is on the wire beside `[winmenu] pick …
 ///    label=Quit -> close win=`. A `Quit` that dismissed the menu and did nothing else would pass
 ///    legs 1-4 and red here.
+/// 6. **the bar names a LAUNCHED PROGRAM, and the wire says where the name came from** (R36,
+///    WINTITLE-LATE) — legs 1-5 all run on a kernel window that declared itself, so none of them can
+///    see the EL0 case. This one mints an EL0-band window over the arch seam's generated label,
+///    arms the launcher name AFTER it exists (the order the metal produces), and requires the bar to
+///    read `VUG` with `[winmenu] app-menu … from=program` beside it. RED on this arc's base, where
+///    the caption stays `Application` — which render13 boot 1 put on four of six launched windows.
 #[cfg(feature = "witness")]
 pub fn selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -1826,17 +1843,63 @@ pub fn selftest() {
     if wm::info(win).is_some() {
         wm::close(win);
     }
+
+    // Leg 6 — **APPNAME (WINTITLE-LATE): the bar names a LAUNCHED PROGRAM, and says so.**
+    //
+    // Legs 1-5 run on a KERNEL-owned window that declared itself `gate`, so every one of them is a
+    // `from=declared` story. The case render13 convicted is the other one: an EL0 tenant whose
+    // window was minted from the arch seam's generated label (`el0 win N`) and whose name arrives
+    // from the launcher — LATE, because `spawn_user_image_bg` makes the task runnable before it
+    // returns. So this leg drives the LOSING order on purpose (create, THEN arm) and requires the
+    // BAR to end up reading `VUG`, through the same focus-then-composite path leg 1 uses rather
+    // than a forced `set_app_window` (see leg 1's note for why a forced value proves nothing).
+    //
+    // It is a measurement and not a tautology: `unnamed_first` asserts the window really did take
+    // the unnamed clause before the arm landed. On this arc's base the caption stays `Application`
+    // and the line says `from=unnamed`.
+    //
+    // An EL0-BAND owner, outside the kernel reserve, because `mint_title`'s app clauses are what is
+    // under test — asserted against `KERNEL_OWNER_BASE` rather than assumed.
+    const PROG_OWNER: u64 = 0xA9F1;
+    const _: () = assert!(PROG_OWNER < wm::KERNEL_OWNER_BASE);
+    let wprog = wm::create(
+        PROG_OWNER,
+        SURF.as_ptr() as usize,
+        core::mem::size_of_val(&SURF),
+        FIX_W as u32,
+        FIX_W as u32,
+        FIX_STRIDE as u32,
+        b"el0 win 3",
+    );
+    let leg_prog = wprog != wm::WIN_NONE && {
+        let unnamed_first = wm::title_source_of(wprog) == wm::TitleSource::Unnamed;
+        let armed_late = wm::app_name_arm(PROG_OWNER, "/apps/VUG.ELF");
+        wm::focus_changed(PROG_OWNER);
+        wm::composite();
+        let s2 = bar_boxes(pw, ph);
+        let v = unnamed_first
+            && armed_late
+            && s2.app
+            && s2.app_owner == wprog
+            && s2.label_of(0) == b"VUG"
+            && APP_OWNER.load(Ordering::Relaxed) == wprog
+            && wm::title_source_of(wprog) == wm::TitleSource::Program;
+        wm::close(wprog);
+        wm::app_name_forget(PROG_OWNER);
+        v
+    };
+
     dismiss("selftest");
     wm::focus_changed(saved_focus);
     menubar::set_enabled(saved_bar);
 
     let (rx, ry, rw, rh) = r.map(|(x, y, w, h)| (x, y, w, h)).unwrap_or((0, 0, 0, 0));
-    let ok = leg_box && leg_open && leg_geom && leg_esc && leg_quit;
+    let ok = leg_box && leg_open && leg_geom && leg_esc && leg_quit && leg_prog;
     serial_println!(
         ":: WINMENU: win={} name=gate box={}x{}+{} title-x={} drop={}x{}+{}+{} font={} panel={}x{} \
-         app_box={} routed_open={} geometry={} escape={} quit_closes={} :: {} ::",
+         app_box={} routed_open={} geometry={} escape={} quit_closes={} app_name_late={} :: {} ::",
         win, s.w[0], bh, s.x[0], s.text_x(0), rw, rh, rx, ry, menubar::BAR_FONT_NAME, pw, ph,
-        leg_box, leg_open, leg_geom, leg_esc, leg_quit,
+        leg_box, leg_open, leg_geom, leg_esc, leg_quit, leg_prog,
         if ok { "PASS" } else { "FAIL" }
     );
     rollup("selftest");

@@ -689,6 +689,46 @@ impl TitleSource {
             TitleSource::Unnamed => "unnamed",
         }
     }
+
+    /// WINTITLE-LATE — the same spelling with its FIELD NAME joined on, as ONE literal:
+    /// `from=program`. Not cosmetic. A witness token is certified in the built artifact with
+    /// `LC_ALL=C grep -a -o -F` (LAWS §5), and a `"… from={}"` format string leaves only `from=`
+    /// (5 bytes) and `program` (7) in `.rodata` — neither is the token a reader greps for, and both
+    /// are short enough for LLVM to immediate-encode out. Printed through this accessor the 12-byte
+    /// token exists in the image, so *"is the wire shape reachable in this build?"* is answerable
+    /// without booting. The BYTES ON THE WIRE are identical either way: `from={}` + [`as_str`] and
+    /// `{}` + this print the same characters.
+    pub const fn as_from_str(self) -> &'static str {
+        match self {
+            TitleSource::Declared => "from=declared",
+            TitleSource::Program => "from=program",
+            TitleSource::Document => "from=document",
+            TitleSource::Unnamed => "from=unnamed",
+        }
+    }
+
+    /// WINTITLE-LATE — the code this source is stored as in [`TITLE_SRC`]. Private and arbitrary:
+    /// it never reaches a wire, an ABI or another module.
+    const fn code(self) -> u32 {
+        match self {
+            TitleSource::Unnamed => 0,
+            TitleSource::Declared => 1,
+            TitleSource::Program => 2,
+            TitleSource::Document => 3,
+        }
+    }
+
+    /// WINTITLE-LATE — [`TitleSource::code`]'s inverse, TOTAL because it reads an atomic cell:
+    /// anything unwritten answers `Unnamed`, which is the fail-closed direction (a window never
+    /// claims a provenance nobody gave it).
+    const fn from_code(v: u32) -> Self {
+        match v {
+            1 => TitleSource::Declared,
+            2 => TitleSource::Program,
+            3 => TitleSource::Document,
+            _ => TitleSource::Unnamed,
+        }
+    }
 }
 
 /// WINTITLE — the GENERATED LABEL the two arch window seams mint from their own row index when the
@@ -789,6 +829,23 @@ pub fn program_name(path: &str) -> &str {
 ///
 /// Returns whether a row holds the name (`false` = the table was full, or the name was empty, or
 /// `owner == 0`) — fail-closed: the launch is never conditioned on this succeeding.
+///
+/// ⚠ **WINTITLE-LATE — ARMING IS NOT ORDERED BEFORE THE PROGRAM'S FIRST `SYS_WIN_CREATE`, so this
+/// call is RETROACTIVE.** Every launcher arms AFTER `spawn_user_image_bg` returns, and that call
+/// makes the task runnable before it returns (`sched::spawn_user_slot` with `CPU_AUTO` places it on
+/// another core, then the launcher still stores the pid and unwinds) — so on a multi-core board the
+/// child can reach its window create first and be titled by [`mint_title`] clause 2 before clause 1
+/// has anything to find. Render13 boot 1 is the measurement: six `QUARRY-LAUNCH` of the same two
+/// ELFs down the same seam, and only two of the six windows carried a name
+/// (`[winmenu] app-menu owner=8/9 name=VUG`, the other four `name=Application` —
+/// `docs/dev/evidence/orin27/render13-boot1-comp.log`). That is a race, not a missing arm: the arm
+/// has been on the quarry seam since `6915c256`, the six ASIDs were distinct, and
+/// [`owner_of_launch`] is the identity on aarch64, so neither the key nor the table can explain a
+/// 2-of-6 split. Ordering it properly would mean arming INSIDE the arch spawn, between the slot
+/// mapping and `spawn_user_slot` — `arch/*/syscall.rs`, and still only a narrower window. So the
+/// name is made to catch up instead: [`app_name_adopt`] re-titles the owner's windows that are
+/// already open and still `Unnamed`, which closes the race from the other end and needs no arch
+/// change at all. Late or early, the operator reads the program's name.
 pub fn app_name_arm(owner: u64, path: &str) -> bool {
     let name = program_name(path).as_bytes();
     if owner == 0 || name.is_empty() {
@@ -802,7 +859,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
         .iter()
         .position(|e| e.owner == owner)
         .or_else(|| t.iter().position(|e| e.owner == 0));
-    match slot {
+    let armed = match slot {
         Some(i) => {
             t[i].owner = owner;
             t[i].len = len as u8;
@@ -811,6 +868,72 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
             true
         }
         None => false,
+    };
+    drop(t); if armed { app_name_adopt(owner, &name[..len]); } armed // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The APP_NAMES guard is DROPPED first and by name: that mutex is a LEAF (see its doc), `app_name_adopt` takes `TABLE`, and a leaf held across the table acquisition would put APP_NAMES into the WINDOWS ⊃ TABLE ⊃ WRITER order that `create_inner` deliberately keeps it out of. Only on a successful arm — a full name table has nothing to adopt WITH, and re-titling rows to a name that is not in the registry would leave a caption no `mint_title` could ever reproduce.
+}
+
+/// WINTITLE-LATE — **the catch-up half of [`app_name_arm`]: title the windows `owner` ALREADY
+/// opened.** Returns how many rows took the name.
+///
+/// Only rows whose provenance is still [`TitleSource::Unnamed`] — i.e. the ones that took
+/// [`mint_title`] clause 2 because the arm had not landed when they were created. A `Declared` row
+/// is a built-in tenant naming itself and a `Document` row is a nameless document's sequence; both
+/// out-rank a launcher's guess and are left alone, so this can only ever REPLACE the generic noun
+/// [`ANON_APP`]. Compat rows are skipped for the reason they are skipped everywhere (owner 0, no
+/// chrome, nothing to caption).
+///
+/// The row is damaged whole so the chrome repaints with the new caption on the next compositor pass
+/// — the pass the program's own first present is about to drive anyway. No composite is issued from
+/// here: this runs on the launcher's stack, a print or a composite under `TABLE` is what the guard's
+/// standing rule forbids, and `winid_alloc_witness` records what an extra print on this path costs.
+fn app_name_adopt(owner: u64, name: &[u8]) -> usize {
+    let n = name.len().min(MAX_TITLE);
+    let mut adopted = 0usize;
+    let mut t = table();
+    for r in t.rows.iter_mut() {
+        if !r.used || r.compat || r.owner_asid != owner || title_source_of(r.id) != TitleSource::Unnamed {
+            continue;
+        }
+        r.title = [0u8; MAX_TITLE];
+        r.title[..n].copy_from_slice(&name[..n]);
+        r.title_len = n;
+        r.damage_all();
+        title_source_store(r.id, TitleSource::Program);
+        adopted += 1;
+    }
+    adopted
+}
+
+/// WINTITLE-LATE — **where a live window's title PROVENANCE lives**, one cell per window id
+/// (`id = slot + 1`, [`create_inner`]'s minting rule, so cell `id - 1`).
+///
+/// Beside the table rather than in them, and LOCK-FREE, for one caller's sake:
+/// [`super::winmenu::set_app_window`] prints the bar's app title and now prints its `from=` with it,
+/// and it runs INSIDE `strip::compose_all` under the contract "lock-free stores only, no composite".
+/// A `TABLE` acquisition there would be a new lock on the compose path — the exact shape PANEL V-1
+/// and that function's own doc refuse. An atomic cell is written where the caption is written (under
+/// the table guard, in [`create_inner`] and [`app_name_adopt`]) and read with a relaxed load by
+/// anyone, which is what the witness needs and all it needs.
+///
+/// A closed id's cell is left as it was: it is rewritten by the next [`create_inner`] into that slot
+/// — the same "the id demonstrably names something new" point `controls_declined_rearm` and WC-D's
+/// latch use — so no reader can see a dead tenant's provenance under a live one's id.
+static TITLE_SRC: [core::sync::atomic::AtomicU32; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS];
+
+/// WINTITLE-LATE — publish `id`'s title provenance. Called only where `id`'s caption is written.
+fn title_source_store(id: WinId, src: TitleSource) {
+    if let Some(cell) = TITLE_SRC.get((id as usize).wrapping_sub(1)) {
+        cell.store(src.code(), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WINTITLE-LATE — **why window `id` is called what it is called.** Lock-free; see [`TITLE_SRC`].
+/// An id outside `1..=MAX_WINDOWS` (including [`WIN_NONE`]) answers `Unnamed`, the fail-closed value.
+pub fn title_source_of(id: WinId) -> TitleSource {
+    match TITLE_SRC.get((id as usize).wrapping_sub(1)) {
+        Some(cell) => TitleSource::from_code(cell.load(core::sync::atomic::Ordering::Relaxed)),
+        None => TitleSource::Unnamed,
     }
 }
 
@@ -23452,7 +23575,7 @@ fn create_inner(
     }
     // WINTITLE — the row is born with the MINTED title, never the caller's bytes. See `TitleSource`.
     row.title_len = minted_len;
-    row.title[..minted_len].copy_from_slice(&minted[..minted_len]);
+    row.title[..minted_len].copy_from_slice(&minted[..minted_len]); title_source_store(id, title_src); // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The provenance is published WITH the caption and under the same guard, so `title_source_of` can never name a clause the row's bytes did not come from. It is stored for EVERY create, including a recycled slot, which is what keeps a dead tenant's `from=` from surviving under a live id.
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
     // and the `composite` below paints it exactly once, where it stays.
     if let Some((x, y, scale)) = placed {
@@ -26610,6 +26733,10 @@ fn winid_selftest() {
 /// * **LEG 6** — a declared name survives verbatim, and the document form is recognised as such.
 /// * **LEG 7** — the wiring: a real [`create`] over a seam label puts the minted title in the ROW
 ///   the compositor draws from, not merely in a helper's return value.
+/// * **LEG 8** — **the defect render13 measured.** The arm lands AFTER the window exists — the
+///   order `spawn_user_image_bg` actually produces — and the window must STILL end up named.
+///   RED on the base of this arc, where four of six launched windows kept `Application` for the
+///   whole boot. See [`app_name_arm`] for why the race exists and [`app_name_adopt`] for the catch-up.
 ///
 /// `witness`-gated and NOTHING else — exactly like [`closemin_selftest`], whose call site it shares.
 /// The furniture cross-gate the first draft carried (`wc` on x86, `desktop_firmware` on aarch64) was
@@ -26705,6 +26832,38 @@ fn wintitle_selftest() {
     let (fn_, fs) = mint_title(ASID_T, b"el0 win 5", &mut buf);
     let forget_ok = fs == TitleSource::Unnamed && &buf[..fn_] == ANON_APP;
 
+    // LEG 8 — **WINTITLE-LATE: the render13 ORDER.** Legs 4 and 7 arm and then create, which is the
+    // order the code was written for and NOT the order the metal produced: `spawn_user_image_bg`
+    // makes the task runnable before it returns, so the child can reach `SYS_WIN_CREATE` while the
+    // launcher is still unwinding to its `app_name_arm`. Four of six launches lost that race on
+    // render13 boot 1 and their windows read `Application` for the rest of the boot. This leg drives
+    // the LOSING order deliberately — create first, arm second — and requires the window to end up
+    // with the program's name anyway. It is a MEASUREMENT and not a tautology because the pre-state
+    // is asserted: the row must actually be `Unnamed` before the arm, or the leg is proving nothing.
+    //
+    // A full table is a SKIP, on LEG 7's rule and for its reason.
+    let wl = create(ASID_T, sa, len, 8, 8, 32, b"el0 win 7");
+    let late_ok: Option<bool> = if wl == WIN_NONE {
+        None
+    } else {
+        let unnamed_first = title_source_of(wl) == TitleSource::Unnamed && {
+            let t = table();
+            let v = row(&t, wl).is_some_and(|r| r.title[..r.title_len] == *ANON_APP);
+            drop(t);
+            v
+        };
+        // The arm lands LATE — after the window exists. Nothing else is done to the row.
+        let armed_late = app_name_arm(ASID_T, "/apps/VUG.ELF");
+        let t = table();
+        let named = row(&t, wl).is_some_and(|r| r.title[..r.title_len] == *b"VUG");
+        drop(t);
+        // And the PROVENANCE catches up with the caption, or `[winmenu] app-menu … from=` would go
+        // on saying `unnamed` under a name that is anything but.
+        Some(unnamed_first && armed_late && named && title_source_of(wl) == TitleSource::Program)
+    };
+    close(wl);
+    app_name_forget(ASID_T);
+
     let ok = pn_ok
         && doc_ok
         && label_ok
@@ -26712,9 +26871,10 @@ fn wintitle_selftest() {
         && noseq_ok
         && decl_ok
         && row_ok != Some(false)
-        && forget_ok;
+        && forget_ok
+        && late_ok != Some(false);
     serial_println!(
-        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} {} ::",
+        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} late-arm={} {} ::",
         pn_ok as u8,
         doc_ok as u8,
         label_ok as u8,
@@ -26728,6 +26888,11 @@ fn wintitle_selftest() {
             None => "skip",
         },
         forget_ok as u8,
+        match late_ok {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "skip",
+        },
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
