@@ -109,6 +109,14 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   admitted, an anonymous principal is refused (aarch64 by name on the EL0 regime; x86 by users-table
   id on its static name table). The fixtures — which write a KNOWN credential to the medium — ride
   their own knob `UNAOS_LOGINST=1`, never `UNAOS_LOGIN=1` (the `hcronst` rule).
+* **The login screen (M3):** the desktop boots to a self-drawn screen (`video/login.rs`, declared beside
+  the crystal under its gate; the Mac model: name, password, Enter; the first boot with no users is the
+  create-first-user form) that takes every key on every route BEFORE the route's serial echo — so a
+  typed password never reaches the wire — and before the shell console; a successful login opens the
+  session (and the home) and takes the screen down; Esc dismisses nothing here (R24: menus only). The
+  routes reach it through `fs::users::screen_key` / `screen_open_once`, which are inert where no desktop
+  is built. Residual, LEDGER SO36: the screen owns the KEYBOARD only — the dock and the menu bar still
+  answer the pointer before a session exists.
 * **Status (M1, `exec-orin-login`):** record store, session principal on both arches, `login`/
   `logout` shell arms and the fixture landed; measured while landing: the typed verbs wait on one
   `HOST_VERBS` row in `libs/sys/midden_core`, the x86 QEMU build waits on one `UNAOS_LOGIN` map

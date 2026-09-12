@@ -1902,7 +1902,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
                     if unaos_kernel::video::instgui::consume_key(c) {
                         continue;
-                    }
+                    } #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(c) { continue; } // LOGIN M3 — the login screen takes the key next, like the installer dialog above it. ⚠ LINE-NEUTRAL append.
                     // `handle_key` returns true if the command took over the whole screen (e.g.
                     // `vug`); stop draining this frame so a keystroke already queued behind Enter
                     // can't paint the console back over the full-screen output — present it alone,
@@ -2916,7 +2916,7 @@ fn jd2_console_pump(_arg: usize) {
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-            handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
+            #[cfg(not(feature = "login"))] handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); #[cfg(feature = "login")] if !unaos_kernel::fs::users::screen_key(c) { handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); } // LOGIN M3 — the wake key goes to the screen while it is up (knob-off the original statement, verbatim). ⚠ LINE-NEUTRAL fold. // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
             tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
         }
         None => serial_println!(
@@ -2962,7 +2962,7 @@ fn jd2_console_pump(_arg: usize) {
                 Event::Key(c) => {
                     // Erase the cursor BEFORE the console repaints, so the save-under stash never
                     // captures cursor pixels and a later restore can't paint stale glyphs back.
-                    cursor::restore(&mut pal);
+                    cursor::restore(&mut pal); #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(c) { needs_render = true; key_repainted = true; continue; } // LOGIN M3 — the screen takes the key BEFORE the serial echo below (a typed password never reaches the wire) and before the shell. ⚠ LINE-NEUTRAL append.
                     // Serial echo: the bench evidence line (panel + serial must agree).
                     if (32..=126).contains(&c) {
                         serial_println!(":: tegra: JD2 — KEY '{}' ::", c as char);
@@ -5339,7 +5339,7 @@ fn render_service(_: usize) {
     #[cfg(not(feature = "desktop_firmware"))]
     let desktop = false;
 
-    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen);
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen); #[cfg(feature = "login")] if desktop { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
     let mut console = unaos_kernel::console::Console::new();
 
     // SHELLWIN-PI — the live shell's OWN compositor window. Flat locals for the service's life, for
@@ -5433,7 +5433,7 @@ fn render_service(_: usize) {
         #[cfg(not(feature = "desktop_firmware"))]
         let windowed = false;
         match ev {
-            unaos_kernel::pal::Event::Key(c) => {
+            unaos_kernel::pal::Event::Key(c) => { #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(c) { continue; } // LOGIN M3 — the screen takes the key before the shell window or the panel. ⚠ LINE-NEUTRAL append.
                 // SHELLWIN-PI — route the keystroke to its home. A key reaches this task only when
                 // `pump_usb_into_gui` found `user_input_active() == 0`, i.e. the keyboard belongs to
                 // the SHELL. On the Pi desktop the shell is a WINDOW, so it is dispatched into that
@@ -6377,7 +6377,7 @@ fn x86_render_service(cpu: usize) {
     // the first present — and the live text shell is kept off the glass (it survives in serial and
     // `TERM_RING` for the Console app, per the facade law). Off the crispy desktop (a pre-takeover
     // boot, a `wc`-off x86 build) the shell is still the desktop and draws exactly as it always did.
-    let desktop = desktop_owns_backdrop();
+    let desktop = desktop_owns_backdrop(); #[cfg(feature = "login")] if desktop { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
     if desktop {
         screen.paint_desktop_scene();
     }
@@ -6800,7 +6800,7 @@ fn x86_render_service(cpu: usize) {
                     #[cfg(all(feature = "wc", feature = "instgui"))]
                     let consumed = unaos_kernel::video::instgui::consume_key(c);
                     #[cfg(not(all(feature = "wc", feature = "instgui")))]
-                    let consumed = false;
+                    let consumed = false; #[cfg(feature = "login")] let consumed = consumed || unaos_kernel::fs::users::screen_key(c); // LOGIN M3 — after the installer dialog, the login screen; a consumed key never reaches the shell. ⚠ LINE-NEUTRAL append (an unconditional statement beside the cfg'd pair).
                     // SHELLWIN — route the keystroke to its home. A key reaches this arm only when
                     // `wc_route_event` did NOT hand it to a focused ring-3 window (that app has no key
                     // here) and the installer dialog did not consume it — i.e. the keyboard belongs to
@@ -7941,7 +7941,7 @@ fn tegra_desk_arm() -> bool {
     // call's own return CROSSED with `fbcon::console_is_routed()` read back afterwards — `activate`
     // already reads the route back rather than inferring it, and this line disagreeing with it would
     // itself be the finding.
-    let activated = desktop_firmware::activate();
+    let activated = desktop_firmware::activate(); #[cfg(feature = "login")] if activated { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
     let routed_after = fbcon::console_is_routed();
     let verdict = match (activated, routed_after) {
         (true, true) => "ROUTED",
@@ -8092,7 +8092,7 @@ fn jd2_supstate_phase2(
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-            handle_key(c, &mut console, &mut pal);
+            #[cfg(not(feature = "login"))] handle_key(c, &mut console, &mut pal); #[cfg(feature = "login")] if !unaos_kernel::fs::users::screen_key(c) { handle_key(c, &mut console, &mut pal); } // LOGIN M3 — the wake key goes to the screen while it is up (knob-off the original statement, verbatim). ⚠ LINE-NEUTRAL fold.
             pal.render();
         }
         None => serial_println!(
@@ -8141,7 +8141,7 @@ fn jd2_supstate_phase2(
                 match ev {
                     Event::Key(c) => {
                         // Cannot fail: the seam's bound was checked before the pop above.
-                        #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } let _ = unaos_kernel::arch::display_tegra::sup_key_push(c); // SUPDOOR (KEYDOORS F2) — THIS WAS A WHOLE SHELL DOOR WITH NO INTERCEPTION AT ALL. `jd2_supstate_phase2` is `jd2_console_pump`'s phase 2 with the surface lifted out of task-local storage, and it was cloned from the legacy pump BEFORE TABKEY and BEFORE A10. Neither `strip::key_escape` nor `wc_shell_focus_key` appeared anywhere in it or in `jd2_supstate_dispatcher`: `git grep -n` for either name in main.rs returned only :2948, :4524 and :4578/:4579. So on a `feature = "supstate"` Orin image A10, TABKEY and F1 were all three undone — <Esc> could not dismiss a menu, <TAB> could not cycle focus, and Quarry ate nothing — while the legacy pump three thousand lines up had all three. Latent rather than live only because the knob is default-off; the day supstate becomes the boot path it re-opens every one of them at once. THE CALL GOES HERE AND NOT IN THE DISPATCHER, and that is forced, not chosen: these three seams take a whole `pal::Event`, and `jd2_supstate_dispatcher` (:7681) is handed a bare `u8` through `sup_key_push`/`sup_key_pop` — by the time the dispatcher sees a keystroke the event is gone. This drain is the last place `ev` still exists. Ordered strip -> quarry -> focus ring, the same order :2948 carries and the same order both arch routers use. `continue` continues THIS `while`, dropping a consumed key before it reaches the seam's ring, which is what the legacy pump's `continue` does with the same events. No discard accounting is owed: these come off the COUNTED `next_event`, as at :4578 and unlike the uncounted peek at :4524. ⚠ FOLDED onto the `let`, CODE BEFORE COMMENT per F0's rule.
+                        #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(c) { continue; } let _ = unaos_kernel::arch::display_tegra::sup_key_push(c); // SUPDOOR (KEYDOORS F2) — THIS WAS A WHOLE SHELL DOOR WITH NO INTERCEPTION AT ALL. `jd2_supstate_phase2` is `jd2_console_pump`'s phase 2 with the surface lifted out of task-local storage, and it was cloned from the legacy pump BEFORE TABKEY and BEFORE A10. Neither `strip::key_escape` nor `wc_shell_focus_key` appeared anywhere in it or in `jd2_supstate_dispatcher`: `git grep -n` for either name in main.rs returned only :2948, :4524 and :4578/:4579. So on a `feature = "supstate"` Orin image A10, TABKEY and F1 were all three undone — <Esc> could not dismiss a menu, <TAB> could not cycle focus, and Quarry ate nothing — while the legacy pump three thousand lines up had all three. Latent rather than live only because the knob is default-off; the day supstate becomes the boot path it re-opens every one of them at once. THE CALL GOES HERE AND NOT IN THE DISPATCHER, and that is forced, not chosen: these three seams take a whole `pal::Event`, and `jd2_supstate_dispatcher` (:7681) is handed a bare `u8` through `sup_key_push`/`sup_key_pop` — by the time the dispatcher sees a keystroke the event is gone. This drain is the last place `ev` still exists. Ordered strip -> quarry -> focus ring, the same order :2948 carries and the same order both arch routers use. `continue` continues THIS `while`, dropping a consumed key before it reaches the seam's ring, which is what the legacy pump's `continue` does with the same events. No discard accounting is owed: these come off the COUNTED `next_event`, as at :4578 and unlike the uncounted peek at :4524. ⚠ FOLDED onto the `let`, CODE BEFORE COMMENT per F0's rule.
                     }
                     Event::Mouse { x, y } => {
                         let (ax, ay) = pending_rel.unwrap_or((0, 0));
@@ -9126,7 +9126,7 @@ fn tegra_desk_cascade() -> bool {
 
     #[cfg(feature = "witness")]
     let window_low = tegra_cascade_stk_pre();
-    let activated = desktop_firmware::activate();
+    let activated = desktop_firmware::activate(); #[cfg(feature = "login")] if activated { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
     #[cfg(feature = "witness")]
     tegra_cascade_stk_post(window_low);
 

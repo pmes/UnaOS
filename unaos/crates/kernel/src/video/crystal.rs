@@ -1319,3 +1319,10 @@ pub fn routed_selftest() {
 // until that machinery exists. When each lands, its `Verb::_::real()` flips to `true` and its `fire`
 // arm calls the op; the menu, the routing, and this fixture are unchanged.
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// LOGIN M3 (`login` knob, RULINGS R51): the login screen — declared from this file's tail under the
+/// crystal's own gate (x86 `wc` or aarch64 `desktop_firmware`), so no line of `video/mod.rs` moves;
+/// `#[path]` resolves beside this file, so the module is `video/login.rs`. `#[cfg]`-erased knob-off.
+#[cfg(feature = "login")]
+#[path = "login.rs"]
+pub mod login;

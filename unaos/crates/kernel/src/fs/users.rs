@@ -724,6 +724,32 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
 }
 
 // =========================================================================================
+// THE SCREEN'S ENTRY POINTS (M3) — what the key routes and the desktop ignition call
+// =========================================================================================
+
+/// M3: offer a key to the login screen; `true` = consumed (the screen is up). Gated where the screen is
+/// built (the crystal's gate: x86 `wc`, aarch64 `desktop_firmware`); `false` elsewhere, so a route
+/// compiled without a desktop is the pre-M3 route. Every route calls this BEFORE its serial echo.
+pub fn screen_key(c: u8) -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        return crate::video::crystal::login::consume_key(c);
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let _ = c;
+        false
+    }
+}
+
+/// M3: the desktop boots to the login screen — called once at desktop ignition; a no-op where no
+/// screen is built, and idempotent (the screen keeps its own once-latch).
+pub fn screen_open_once() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::open_once();
+}
+
+// =========================================================================================
 // SERVICE + FIXTURE
 // =========================================================================================
 
@@ -754,6 +780,8 @@ pub fn service() {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
             login_fixture();
+            #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::login::logout_direct);
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
