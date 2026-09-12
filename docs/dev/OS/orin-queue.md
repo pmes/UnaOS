@@ -4,7 +4,7 @@ One file, fixed path, not per-round. Kept current AS WORK HAPPENS, never "at clo
 a list written only at close is never written at all by a session that does not reach one,
 and a session ends when the work is done or when it is not worth continuing.
 `✓` = verified in this tree.  `·` = inherited, NOT re-checked.  Re-derive every sha before acting.
-Last touched 2026-09-11 by orin 26, rung 4 built and staged, four defect executors running.
+Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51); tear and unafsroot still uncommitted in their orin26 worktrees.
 
 ## STATE — re-derived 2026-09-11T16:36Z against origin, not relayed
 ✓ origin/main 084b79ac · origin/hw-jetson 44218ab4 · origin/hw-rmbp 02a6896a · origin/hw-pi4 98914795
@@ -18,7 +18,8 @@ Last touched 2026-09-11 by orin 26, rung 4 built and staged, four defect executo
 ✓ Specified as fold + core0 + el0slot + mem + tear + unafsroot. Measured: core0/el0slot/mem are at
   ZERO commits, tear is diagnosis-only, unafsroot incomplete. It would have fixed NONE of the four
   glass defects. Held rather than fly a number implying progress it does not have.
-✓ orin 26: Peter 2026-09-11 "do the 4 boots". Rung 4a/4b BUILT (exec-orin26-ga10b4 a39fd32d, A51), two images STAGED
+✓ orin 27 2026-09-12: RUNG 4 FLOWN, ONE BOOT (Peter 2026-09-11: combine 4a and 4b). Image ga10b4ab-20260912T0019Z-277e2ca at hw-jetson 277e2cab, KELF max=0x238368. 4a `bcrheld=7/7 -> BCR-ALLHELD`; 4b `br_retcode=0x00000002 -> BROM-VERDICT-FAIL` (the PASS), SYSTEM_OFF. Scorer PASS 4a exit 0, PASS 4b exit 0. Evidence docs/dev/evidence/orin27/ga10b4ab-boot1.log; A51 flown. Boot 1 (2026-09-11) REFUSED no-dma-window, fixed by 1629d449. Next rung is a clean-room question (what the ROM wants at fmccode/fmcdata/pkcparam), brief §7.
+· (history) orin 26: Peter 2026-09-11 "do the 4 boots". Rung 4a/4b BUILT (exec-orin26-ga10b4 a39fd32d, A51), two images STAGED
   (`ga10b4a-20260911T1809Z-a39fd32` max_vaddr 0x23cae8 → `ga10b4b-20260911T1809Z-a39fd32` 0x23f120), card line dry-run
   refuses only on device readability (needs sudo) and geometry (`--expect-geom 1:0b:2048:63401984`, from render12's FLIGHTID).
   Butler on ttyACM0, MARK ga10b4a written, waker armed. Boot 1 = 4a; boot 2 = 4b only on `-> BCR-ALLHELD`.
@@ -78,8 +79,7 @@ Last touched 2026-09-11 by orin 26, rung 4 built and staged, four defect executo
 · Glass checks never evidenced: cursor sweep (no `restore src=` has fired), taskbar order across
   quarry open/close, EL0 placement off core 0 (blocked by core0/el0slot/mem).
 · render13 = the fold + core0 + el0slot + mem + tear + unafsroot, one gate, one card line.
-✓ GA10B rung 4: Peter ruled "do the boots". 4a is free and answers the gate; 4b spends the power
-  cycle and ends in SYSTEM_OFF — attended only. Brief at exec-orin23-ga10b4 e7c8eb24.
+✓ GA10B rung 4: FLOWN 2026-09-12, PASS both rungs in one boot (A51). Nothing owed on this rung.
 
 ## SMALL FIXES — none started
 · shell.rs `screenshot` prints OK with no device (shared core — ask rmbp).
