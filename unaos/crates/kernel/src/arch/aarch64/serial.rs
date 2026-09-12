@@ -216,7 +216,11 @@ pub fn _print(args: fmt::Arguments) {
                         let _ = guard.write_str(s);
                     }
                 };
-                crate::serial_ring::drain(&mut sink);
+                // SO29/DRAINCAP: the CAPPED spelling, identical to x86's — one serial transport, one
+                // budget. This is the drain SO29 measured at 377.8 ms inside a composite pass on the
+                // Orin; `drain_capped` bounds it by BYTES (the currency the UART charges), and the
+                // remainder rides the next print. The panic path above keeps the uncapped `drain`.
+                crate::serial_ring::drain_capped(&mut sink);
             }
             // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic ms →
             // UTC after a civil anchor exists). Only the UART byte-stream is touched; the fbcon +

@@ -576,6 +576,107 @@ Finally: **the archive offers no before/after on a pre-2026-07-21 state.** The e
 marker); every other copy is from 2026-08-02 or later. Any question of the form "what did this line read
 before the regression landed?" cannot be answered from this channel.
 
+## DRAINCAP — one drain has a BYTE budget, because the UART charges in bytes
+
+This section is SO29's, and SO29 is the one finding in this file that was measured on the GLASS rather
+than on the wire. Peter, render13: *"mousing/dragging not smooth"*.
+
+### The defect
+
+The holder of the UART drains the staging ring **before** writing its own line. That ordering is
+correct and stays (see *Ordering* above). What was wrong is that the drain was bounded by SLOT COUNT
+only — `guard > SLOTS` in `drain_into` — and a slot count is not a cost.
+
+The cost is bytes, because the consumer moves one byte at a time. 115200 8N1 is ten bits per byte:
+
+```
+    11 520 B/s  ->  86.8 us per byte
+    64 slots x 68 B (the measured width of a witness line) = 4 352 B  ->  377.8 ms
+```
+
+377.8 ms of **IRQ-masked, UART-locked, inline** work, charged to whichever core happened to print
+next. On render13 boot 1 that core was the compositing core, and the drag-stall band reads
+
+```
+    [comp2] rollup pass_us≈1835 max_us=375061..617554      (121 spike rollups of 166)
+```
+
+`375 061 us` is 4 321 bytes and `617 554 us` is 7 114 bytes: the whole spike band is one ring-drain
+wide, to 0.7 %. The compositor was not slow. It was paying for the wire. Four other suspects were
+excluded arithmetically first — see `docs/dev/LEDGER.md` SO29 and commit `0fc32a4c`.
+
+### The fix, and why it is a byte budget and not a smaller ring
+
+`DRAIN_BYTE_BUDGET = 192` bytes, in `serial_ring.rs`, applied by `drain_capped` — the spelling both
+arches' `_print` now use.
+
+**Why bytes.** Shrinking `SLOTS` would trade the stall for loss, and SERWIT-1B already settled that
+depth is not load-bearing for correctness (scratch B: ring cut to 4, still `dropped=0`). It would not
+bound the cost anyway: one 1536-byte line costs more than twenty 68-byte ones, so a slot bound says
+nothing about time. The budget is the honest unit.
+
+**Why 192.** One frame of UART at the cadence the compositor is trying to hold: a 60 Hz frame is
+16.667 ms, and 11 520 B/s x 0.016667 s = **192.0 B**. That is the *whole* frame, so it is a ceiling
+and not a target — a pass that spends its entire frame on the wire has composited nothing.
+
+> ⚠ The SO29 row's parenthetical *"~16 ms = ~1,900 bytes"* is an arithmetic slip: 1 900 B at
+> 86.8 us/B is 164.9 ms, ten frames, not one. 192 B is the figure the row's own rate produces. Both
+> numbers are stated here so the next reader does not have to re-derive which is right.
+
+**The bound it actually gives.** The loop emits while `bytes_so_far < DRAIN_BYTE_BUDGET`, so the last
+line taken may straddle the budget: one drain pays at most `budget - 1 + <widest line drained>`. It
+has to be that way round. A drain that refused to start a line it could not finish inside the budget
+would never emit a line wider than the budget at all, and `SLOT_LEN` is 1536 — the widest evidence
+lines in the tree would sit in the ring forever. **At least one line always leaves.** In render13's
+shape that is `192 + 68 = 260 B = 22.6 ms` against `377.8 ms`: a **16.7x** cut, and what is left is a
+property of the line width rather than of the ring depth.
+
+### Nothing is lost by capping
+
+The remainder stays in the ring, in order, and rides the next print — and the ring is drained on
+every print, by every core, so "next" is soon and is conditional on nothing. **A capped drain changes
+WHEN a staged line reaches the wire, never WHETHER.** That is the SERWIT-1 law restated, not an
+exception to it, and it is checked two independent ways:
+
+* the DRAINCAP fixture accounts for every line its fill staged across the capped drain plus the next
+  one, with `DROPPED` unmoved;
+* SERWIT-1's conservation law is the outside check — a byte cap that lost a line would break
+  `SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()` and turn that verdict red on its own.
+
+**Only the two `_print` hot paths take the cap.** The panic path and the power verbs call the uncapped
+`drain`, and must: a dying machine owes its reader every staged byte and there is no next print to
+ride. `arch/x86_64/acpi_power.rs`'s reboot ladder likewise keeps the uncapped spelling it already had.
+
+### The fixture and its go-red
+
+`serial_ring::draincap_selftest`, one-shot, riding `mirror_service` — the same call site the SERWIT-2
+verdict uses, for the same stated reason (IRQs unmasked, no locks held, not a print context) and
+reached on **both** arches. It empties the ring, fills it with 68-byte lines, takes one capped drain
+and one uncapped drain, and asserts: bounded, capped, and lossless.
+
+```
+:: DRAINCAP: one drain is bounded by BYTES — staged 64 x 68 B, the capped drain paid 204 B in 3
+   line(s) (budget 192 B, ceiling 260 B = budget + one line), the remaining 61 line(s) / 4148 B rode
+   the next drain, 0 lost. Uncapped this ring is 4352 B = 377753 us of IRQ-masked UART at 86.8 us/B
+   (SO29) -> PASS ::
+```
+
+Go-red: give `drain_capped` a `usize::MAX` budget and the fill drains whole in one pass —
+`capped_paid=4352B (ceiling 260B) capped_lines=64` — and both the byte clause and the
+cap-took-effect clause fire.
+
+**Every PASS clause is one-sided on purpose.** The fixture uses the LIVE ring, because the live ring
+is the thing under test; a private `LineRing` would test a copy of the code. The price is that another
+core can win the UART between the two drains and take lines the fixture staged. So interference can
+only make the measured byte count *smaller* and the capped line count *fewer* — it can hide a
+regression on an unlucky run, and can never invent one. That direction is deliberate: a gate that can
+false-fail gets deleted the week it flakes.
+
+The budget predicate itself is `const`-evaluable, so its go-red rows are pinned in the build like
+SERWIT-1's law — five `const _: () = assert!(…)` rows, both arches, every `./arroyo check`, emitting
+not one byte of code. The first row is the load-bearing one: *an empty drain must always take its
+first line, whatever its width.*
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,

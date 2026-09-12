@@ -123,7 +123,13 @@ pub fn _print(args: ::core::fmt::Arguments) {
                                 let _ = uart.write_str(s);
                             }
                         };
-                        crate::serial_ring::drain(&mut sink);
+                        // SO29/DRAINCAP: the CAPPED spelling. This drain runs IRQ-masked, UART-locked
+                        // and inline on whichever core printed next — on render13 that was the
+                        // compositing core, paying 64 x 68 B = 377.8 ms inside one composite pass.
+                        // `drain_capped` bounds it at `DRAIN_BYTE_BUDGET` bytes; the remainder rides
+                        // the next print, which every core makes on every line. The panic path above
+                        // keeps the UNCAPPED `drain` on purpose: a dying machine has no next print.
+                        crate::serial_ring::drain_capped(&mut sink);
                     }
                     // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic
                     // ms → UTC after a civil anchor exists). CLOCK-2b: the FTDI capture ring and the
