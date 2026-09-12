@@ -13,10 +13,12 @@ branch's file at its tip that hour; the rmbp figure was first written as 88 from
 corrected by the landing review — the commands live in each track queue). rmbp 19's verdict stands: "88 open rows is a graveyard, not a queue" — so this
 file lists JOBS, ranked, and a ledger row that is a record rather than a job stays in the ledger.
 
-## STATE — 2026-09-12 (orin 27)
-✓ main 95888db4 (R45-R48 + LAWS) · hw-jetson f2794266 (rung 4 flown) · hw-pi4 153c78dd · hw-rmbp 73d9d361
-✓ Distances to main: rmbp +8/−1 (docs), pi +46/−0, jetson +67/−0 (+1 local). Landing order: rmbp, pi, jetson, then fold main into all three.
-✓ In flight: exec-orin26-tear (BEAM, Opus finishing), exec-orin27-ga10b4c (rung 4c, Fable), exec-orin26-unafsroot 5984c69c (gated, folding).
+## STATE — 2026-09-12T01:3xZ (orin 27)
+✓ main 267bd49d = the rmbp landing (two parents f880ed6e + 022836be; panel ACK; ledger-check rc=0; `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0 on the merge result). hw-rmbp fast-forwarded to it: 0/0.
+✓ hw-jetson 059db935 local (rung 4 flown + unafsroot fold; fold gate running) · hw-pi4 3c102d2a local (pi-queue.md; landing review running).
+✓ Landing order (R45): rmbp DONE → pi → jetson, then fold main into pi and jetson.
+✓ In flight: exec-orin26-tear (BEAM, Opus finishing), exec-orin27-ga10b4c (rung 4c + the deferred Shut Down trigger, Fable).
+✓ Next Orin boot = render13: the fold of core0 + el0mem + unafsroot + BEAM + 4c on the render12 fifteen-knob line minus PROBE3 plus `UNAOS_GA10B_PROBE4=4` (+ `UNAOS_BEAM=1`); card re-imaged with `media-writer.sh --image` (Peter's go 2026-09-12); a v1 SD card in the Orin's native slot.
 
 ## 1. THE DESKTOP — glass defects Peter has seen, all in shared `video/` (fix once, every board)
 · SO3  no application menu, no Quit anywhere (menubar press map + winmenu app tree)
