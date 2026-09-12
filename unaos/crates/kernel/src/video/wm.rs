@@ -28224,3 +28224,18 @@ pub fn wcd_oom_latch_selftest() {
         if ok { "PASS" } else { "FAIL" }
     );
 }
+/// APPPIN — the compose-through offer counters as `dock::apppin_selftest` reads them:
+/// `(passes, planned, nohit)`, cumulative from boot (the raw cells `cursor12_rollup` windows). The
+/// fixture takes a snapshot, parks the sprite over the relaunched shell window, presents it, and
+/// reads the deltas — `planned` must move and `nohit` must not, which is the LOST POINTER of render13
+/// boot 1 (`[cursor12] offer … -> nohit` after the old shell re-mint) stated as a gate. Witness-only,
+/// like the cells it reads; appended at the file tail so nothing above it moves.
+#[cfg(feature = "witness")]
+pub fn cursor12_offer_counts() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        CUR12_PASSES.load(Relaxed),
+        CUR3_PLANNED.load(Relaxed),
+        CUR12_NOHIT.load(Relaxed),
+    )
+}
