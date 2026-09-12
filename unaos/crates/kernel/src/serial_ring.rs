@@ -114,7 +114,7 @@
 //!
 //! ### Why nothing here can deadlock the panic or breadcrumb paths
 //! * **No lock is introduced.** The ring is three atomics plus per-slot atomics. There is no `Mutex`,
-//!   no `RwLock`, no allocation, and no reentrancy: [`stage`] and [`drain`] never call `serial_println!`.
+//!   no `RwLock`, no allocation, and no reentrancy: [`try_stage`] and [`drain`] never call `serial_println!`.
 //! * **WEDGE-2 / WEDGE-4 are untouched.** Those breadcrumb primitives write single bytes through
 //!   `arch::serial::wedge2_raw_byte` / the raw UART sequence and deliberately acquire NOTHING. They do
 //!   not enter this module at all, and this module adds no lock they could ever contend for. That
@@ -192,6 +192,63 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, 
 /// holds the UART for a full line (~1 ms of 115200-baud polling): every other core can queue several
 /// lines and still not reach the end.
 pub const SLOTS: usize = 64;
+
+/// SO29/DRAINCAP — **the byte ceiling on ONE drain**, and the whole of this arc's first deliverable.
+///
+/// ### The defect
+/// The holder of the UART drains the staging ring BEFORE writing its own line (see [`drain`]), and
+/// until this constant existed that drain was bounded by SLOT COUNT only — `guard > SLOTS` in
+/// [`drain_into`]. A slot count is not a cost. The cost is BYTES, because the consumer is a UART that
+/// moves one byte at a time: 115200 8N1 is 10 bits per byte = 11 520 B/s = **86.8 us per byte**
+/// (`arch/aarch64/serial.rs`'s baud note). A full ring of ordinary 68-byte witness lines is therefore
+///
+/// ```text
+///     64 slots x 68 B = 4 352 B  x  86.8 us/B  =  377.8 ms
+/// ```
+///
+/// of IRQ-masked, lock-held, inline work charged to whichever core happened to print next. On
+/// render13 boot 1 that core was the COMPOSITING core, and the measured drag-stall band —
+/// `[comp2] max_us = 375 061 .. 617 554` over 121 spike rollups — is one ring-drain wide to 0.7 %
+/// (`docs/dev/LEDGER.md` SO29, commit `0fc32a4c`). The compositor was not slow; it was paying for the
+/// wire.
+///
+/// ### Why a BYTE budget and not a smaller ring
+/// Shrinking `SLOTS` would trade the stall for loss — SERWIT-1B already proved (scratch B, ring = 4)
+/// that depth is not load-bearing for correctness, only for how often a producer must push back — and
+/// it would not bound the cost anyway, because one 1536-byte line costs more than twenty 68-byte ones.
+/// The budget is the honest unit: it bounds what a drain can COST, in the currency the UART charges.
+///
+/// ### Why 192
+/// One frame of UART at the cadence the compositor is trying to hold. At 60 Hz a frame is 16.667 ms,
+/// and 11 520 B/s x 0.016667 s = **192.0 B**. That is the whole frame, so it is a ceiling and not a
+/// target: a pass that spends its entire frame budget on the wire has composited nothing, and the
+/// number is chosen so that a drain can never do worse than that.
+///
+/// ⚠ The SO29 row's parenthetical "~16 ms = ~1,900 bytes" is an arithmetic slip — 1 900 B at
+/// 86.8 us/B is 164.9 ms, ten frames, not one. 192 B is the figure the row's OWN rate produces, and
+/// the two are stated together here so the next reader does not have to re-derive which is right.
+///
+/// ### The bound this actually gives
+/// The loop emits while `bytes_so_far < DRAIN_BYTE_BUDGET`, so the LAST line it takes may straddle the
+/// budget: one drain pays at most `DRAIN_BYTE_BUDGET - 1 + <longest line drained>`. It must be written
+/// that way round. A drain that refused to start a line it could not finish inside the budget would
+/// never emit a line wider than the budget at all — and [`SLOT_LEN`] is 1536 — so the widest evidence
+/// lines in the tree would sit in the ring forever. **At least one line always leaves.** In the
+/// render13 shape that is 192 + 68 = 260 B = 22.6 ms, against 377.8 ms: a 16.7x cut, and the residue
+/// is a property of the line width rather than of the ring depth.
+///
+/// ### Nothing is lost by capping
+/// The remainder stays in the ring, in order, and rides the NEXT print — and the ring is drained on
+/// every print, by every core, so "next" is soon and is not conditional on anything. A capped drain
+/// changes WHEN a staged line reaches the wire, never WHETHER. The DRAINCAP fixture asserts exactly
+/// that (`l1 + l2` accounts for every line the fill staged, `dropped == 0`), and SERWIT-1's
+/// conservation law is the independent second check: a byte cap that lost a line would break
+/// `SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()` and turn that verdict red.
+///
+/// Only the two `_print` hot paths take the cap ([`drain_capped`]). The panic path and the power
+/// verbs call [`drain`], which is uncapped and must stay uncapped: a machine that is dying owes its
+/// reader every staged byte, and there is no next print to ride.
+pub const DRAIN_BYTE_BUDGET: usize = 192;
 
 /// Maximum staged line length. Longer lines are truncated at a UTF-8 char boundary, SEALED with a
 /// visible marker, and COUNTED — a shortened line must never masquerade as a whole one.
@@ -458,7 +515,7 @@ impl Write for SlotWriter {
 }
 
 /// Count one line as genuinely lost: cumulatively, and as not-yet-announced so the next drain puts it
-/// on the wire. Split out of [`stage`] by SERWIT-1B so a caller that means to RETRY a full ring can do
+/// on the wire. Split out of the old `stage` by SERWIT-1B so a caller that means to RETRY a full ring can do
 /// so without the first attempt having already written the line off.
 #[inline]
 pub fn note_dropped() {
@@ -473,18 +530,116 @@ pub fn note_stalled(spins: u32) {
     STALL_SPINS_MAX.fetch_max(spins, Ordering::Relaxed);
 }
 
-/// Defer one line into the ring. Returns `false` if the ring was full, in which case the loss has
-/// already been counted and will be announced by the next drain.
+// ── SERWIT-1B PARITY: ONE contended-producer policy, shared by both arches ───────────────────────
+//
+// ### The defect this removes
+// `pub fn stage(args) -> bool` used to live here: try the ring once, and on a full ring write the line
+// off on the spot (`note_dropped`). x86's `_print` never called it — it had the bounded retry loop
+// SERWIT-1B installed — but **aarch64's `_print` called nothing else**, so on that arch a full ring was
+// terminal on the first turn. That is the whole of render13 boot 1's
+// `[serial] dropped 5331 lines in 192 events` with a stall count of zero: the accounting was honest,
+// the marker was on the wire, and 5 331 lines were still gone that x86 would have kept.
+//
+// `stage` is DELETED rather than deprecated. The go-red for "an arch regresses to drop-instantly" must
+// not be a reviewer noticing; it is the compiler refusing to resolve the name. There is now exactly one
+// spelling of the contended path, [`defer_contended`], and exactly one policy behind it,
+// [`defer_policy`] — whose rows are pinned in the build below.
+
+/// SERWIT-1B — what a contended producer does with ONE turn. Three outcomes, and the distinction
+/// between the first two is the law this module exists for: **a deferred line is not a lost one.**
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Defer {
+    /// The line is in the ring. The next UART holder emits it intact and in order. NOT a loss, and
+    /// not an error — this is the overwhelmingly common outcome and the wait-free one.
+    Staged,
+    /// The ring was full and the bound has NOT expired. Go round: re-try the UART (winning it drains
+    /// the ring and writes this line intact), then re-try the stage. The wait is progress-bearing.
+    Retry,
+    /// The ring was full and the bound expired. The line is genuinely lost — counted in [`DROPPED`],
+    /// announced by the next drain as `[serial] dropped N lines`, and a SERWIT-1 FAIL.
+    Lost,
+}
+
+/// The policy itself: pure, `const`-evaluable, and the ONLY place either arch decides what a contended
+/// line's fate is. `staged` is whether [`try_stage`] found room this turn; `spins` is how many turns
+/// this line has already spent; `limit` is [`BACKPRESSURE_SPINS`].
 ///
-/// [`try_stage`] plus the write-off. Callers that apply SERWIT-1B backpressure use `try_stage` and
-/// call [`note_dropped`] themselves once their bound expires; this spelling is the one for a caller
-/// with nowhere to retry to.
-pub fn stage(args: fmt::Arguments) -> bool {
-    if try_stage(args) {
-        return true;
+/// The bound is a correctness requirement and not a tuning knob — a print arriving from an exception
+/// handler that interrupted THIS core inside its own UART-locked region would otherwise spin on a
+/// holder that can never release, and an unbounded wait there is a hang. See the module docs.
+#[inline]
+pub const fn defer_policy(staged: bool, spins: u32, limit: u32) -> Defer {
+    if staged {
+        Defer::Staged
+    } else if spins >= limit {
+        Defer::Lost
+    } else {
+        Defer::Retry
     }
-    note_dropped();
-    false
+}
+
+// ── THE BACKPRESSURE TRUTH TABLE: checked by the compiler, both arches, every `./arroyo check` ───
+// Same idiom and the same reason as SERWIT-LAW's table below: the go-red paths of a policy must be
+// demonstrable without booting the machine it runs on, and a table re-typed into a scratch file proves
+// nothing about the policy that ships. Pure integer arithmetic; not one byte of code is emitted.
+//
+// Row 2 is the aarch64 defect, stated as an assertion. Before this arc, a full ring on the FIRST turn
+// meant `Lost` on that arch; here it is `Retry`, and the row fails to compile if that is ever undone.
+const _: () = assert!(
+    matches!(defer_policy(true, 0, BACKPRESSURE_SPINS), Defer::Staged),
+    "a line that fit the ring is DEFERRED, never lost"
+);
+const _: () = assert!(
+    matches!(defer_policy(false, 0, BACKPRESSURE_SPINS), Defer::Retry),
+    "THE aarch64 DEFECT: a full ring on the first turn must back-pressure, never drop"
+);
+const _: () = assert!(
+    matches!(
+        defer_policy(false, BACKPRESSURE_SPINS - 1, BACKPRESSURE_SPINS),
+        Defer::Retry
+    ),
+    "one turn left under the bound is still a turn"
+);
+const _: () = assert!(
+    matches!(
+        defer_policy(false, BACKPRESSURE_SPINS, BACKPRESSURE_SPINS),
+        Defer::Lost
+    ),
+    "the bound is a CEILING: past it the line is lost, and must be counted"
+);
+const _: () = assert!(
+    matches!(
+        defer_policy(true, BACKPRESSURE_SPINS, BACKPRESSURE_SPINS),
+        Defer::Staged
+    ),
+    "a line that fit is never lost, however long it waited — room beats the bound"
+);
+const _: () = assert!(
+    matches!(defer_policy(false, 0, 0), Defer::Lost),
+    "a ZERO bound is the pre-SERWIT-1B transport, and it is what `stage()` used to be"
+);
+
+/// SERWIT-1B — one turn of the contended path, effects included. **Both arches' `_print` call this and
+/// nothing else**; it is what makes the two transports one transport.
+///
+/// Returns [`Defer::Retry`] when the caller must go round — and the caller's next turn re-tries the
+/// UART first, which is what makes the wait progress-bearing rather than a sleep on another core's
+/// goodwill. `spins` is the caller's own counter so it can feed [`note_stalled`] afterwards.
+pub fn defer_contended(args: fmt::Arguments, spins: &mut u32) -> Defer {
+    match defer_policy(try_stage(args), *spins, BACKPRESSURE_SPINS) {
+        Defer::Staged => Defer::Staged,
+        Defer::Lost => {
+            // Counted in `DROPPED`, announced by the next drain, and still a SERWIT-1 FAIL. The law
+            // does not bend for the fix that was supposed to satisfy it.
+            note_dropped();
+            Defer::Lost
+        }
+        Defer::Retry => {
+            *spins += 1;
+            core::hint::spin_loop();
+            Defer::Retry
+        }
+    }
 }
 
 /// Defer one line into the ring. Returns `false` if the ring was FULL, having counted nothing — the
@@ -542,7 +697,120 @@ pub fn try_stage(args: fmt::Arguments) -> bool {
 /// would reorder the wire, and the staging writer is a handful of instructions from publishing, so the
 /// next drain picks it up. Bounded by [`SLOTS`] iterations, so this cannot lengthen a print unboundedly.
 pub fn drain<F: FnMut(&str)>(emit: F) {
-    drain_into(emit, &EMITTED, true);
+    drain_into(emit, &EMITTED, true, usize::MAX);
+}
+
+/// SO29/DRAINCAP — [`drain`] with the [`DRAIN_BYTE_BUDGET`] byte ceiling applied. **This is the
+/// spelling both arches' `_print` use**, and the only one that runs inside a composite pass.
+///
+/// Same contract, same order, same accounting as [`drain`]; the single difference is that the loop
+/// stops once it has emitted `DRAIN_BYTE_BUDGET` bytes, leaving the remainder in the ring for the next
+/// print. See [`DRAIN_BYTE_BUDGET`] for the arithmetic and for why the cap cannot lose a line.
+pub fn drain_capped<F: FnMut(&str)>(emit: F) {
+    drain_into(emit, &EMITTED, true, DRAIN_BYTE_BUDGET);
+}
+
+/// The budget predicate, split out so it is `const`-evaluable and its go-red rows can be pinned in the
+/// build like [`SerwitTally`]'s. `bytes` is what this drain has already emitted.
+///
+/// Strictly `<`, so the budget is spent BEFORE the test rather than after it: the first line always
+/// leaves (`0 < budget` for any budget >= 1), which is the property that keeps a line wider than the
+/// budget from being stuck in the ring forever.
+#[inline]
+pub const fn drain_may_continue(bytes: usize, budget: usize) -> bool {
+    bytes < budget
+}
+
+// ── THE BUDGET TRUTH TABLE: checked by the compiler, both arches, every `./arroyo check` ─────────
+// Pure integer arithmetic, so the rows cost not one byte of code. The first row is the one that
+// matters: a drain that has emitted nothing may ALWAYS take a line, however wide, or the widest
+// evidence lines in the tree never leave the ring.
+const _: () = assert!(
+    drain_may_continue(0, DRAIN_BYTE_BUDGET),
+    "an empty drain must always take its first line, whatever its width"
+);
+const _: () = assert!(
+    drain_may_continue(DRAIN_BYTE_BUDGET - 1, DRAIN_BYTE_BUDGET),
+    "one byte of budget left is still budget"
+);
+const _: () = assert!(
+    !drain_may_continue(DRAIN_BYTE_BUDGET, DRAIN_BYTE_BUDGET),
+    "the budget spent exactly is the budget spent: stop"
+);
+const _: () = assert!(
+    !drain_may_continue(4352, DRAIN_BYTE_BUDGET),
+    "SO29's whole ring (64 x 68 B = 4352 B = 377.8 ms) is far past the budget: stop"
+);
+const _: () = assert!(
+    drain_may_continue(4352, usize::MAX),
+    "the uncapped spelling (panic, power verbs) is not bounded by bytes at all"
+);
+
+// ── PWRDRAIN (SO31 part 3, trunk queue §1 (f)) — the power verbs flush the ring before the SMC ──
+//
+// ### The defect
+// `power.rs`'s verbs printed their announce line and then called the firmware: PSCI `SYSTEM_OFF` /
+// `SYSTEM_RESET` through the SMC on aarch64, ACPI S5 on x86. Both announce through `_print`, which on a
+// contended lock DEFERS into this ring — and then the power call takes the machine. **A deferred line
+// is not a lost one only for as long as there is a next print.** A power verb is the one context where
+// there is not: the ring dies with the power, and on a flooded ring (render13 boot 1 was dropping
+// 5 331 lines) the last lines before `SYSTEM_OFF` — including the verb's own witness — go with it.
+//
+// ### The fix
+// One uncapped full drain, through the arch's raw lock-free bounded UART primitive, immediately before
+// the firmware call, and then a witness saying what it flushed. Three properties, each load-bearing:
+//
+//   * **Uncapped.** [`DRAIN_BYTE_BUDGET`] exists so a COMPOSITE PASS cannot be stretched by the wire;
+//     a machine that is powering off has no frame to protect and no next print to defer to. It owes
+//     its reader every staged byte. This is the same reason the panic path keeps [`drain`].
+//   * **Bounded anyway.** `drain_into`'s slot guard bounds the LOOP at [`SLOTS`] + 1 iterations, so
+//     "every staged line" is a finite statement, and the arch's TX-ready poll under `raw_write_str` is
+//     itself bounded — a machine whose UART never drains degrades instead of hanging the shutdown.
+//   * **Raw, not `serial_println!`.** The witness must not be able to take the very branch it is
+//     reporting on. `raw_write_str` acquires nothing (it is the WEDGE-2 / panic primitive), so the
+//     line is synchronously on the wire before the next instruction runs — which, at these call
+//     sites, is the SMC.
+//
+// The witness is `[pwrreboot]` / `[pwrshutoff]`, `power.rs`'s own families, subsystem-named and never
+// board-named (`docs/dev/LAWS.md` §3). Both tokens are 11+ bytes with their brackets, so they survive
+// LLVM's <=8-byte immediate encoding and `LC_ALL=C grep -a -o -F 'ring drained'` finds them in the
+// artifact — which is how `UNAOS_TEGRA=1 ./arroyo esp-jetson` certifies this half.
+
+/// Flush the whole staging ring at a power verb, then say what was flushed. `tag` is the caller's
+/// witness family without brackets (`"pwrshutoff"`, `"pwrreboot"`).
+///
+/// Emits `[<tag>] ring drained lines=N bytes=M` through the same raw writer, so the reader of a
+/// capture can tell "the ring was empty" (`lines=0`) from "the ring held 61 lines and they made it"
+/// — and, if that line is itself missing from a capture, that the machine died before this point.
+///
+/// Returns the same `(lines, bytes)` it printed, so [`pwrdrain_selftest`] can assert on the numbers
+/// rather than on the shape of a string. The power verbs ignore it: past their call site there is no
+/// code left to react.
+pub fn power_drain(tag: &str) -> (u64, usize) {
+    let mut lines = 0u64;
+    let mut bytes = 0usize;
+    drain(|s| {
+        lines += 1;
+        bytes += s.len();
+        crate::arch::serial::raw_write_str(s);
+    });
+    // Marker-sized scratch, not slot-sized: the same reasoning as [`MARKER_LEN`], and this frame sits
+    // on the stack of a verb that is about to hand the machine to the firmware.
+    let mut buf = [0u8; MARKER_LEN];
+    let mut w = BoundedWriter {
+        buf: buf.as_mut_ptr(),
+        cap: MARKER_LEN,
+        n: 0,
+        truncated: false,
+    };
+    let _ = write!(w, "[{}] ring drained lines={} bytes={}\n", tag, lines, bytes);
+    let n = w.n;
+    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
+        // Deliberately NOT counted in `EMITTED`, for the same reason `report_losses`' marker is not:
+        // nobody submitted it, and counting it would corrupt the conservation law.
+        crate::arch::serial::raw_write_str(s);
+    }
+    (lines, bytes)
 }
 
 /// SERWIT-1D — empty the staging ring on a machine that has NO 16550, charging every line to
@@ -559,13 +827,23 @@ pub fn drain<F: FnMut(&str)>(emit: F) {
 /// cumulative and is what the verdict asserts on, so nothing is lost by leaving the pending count
 /// standing.
 pub fn discard_staged() {
-    drain_into(|_| {}, &DECLINED, false);
+    drain_into(|_| {}, &DECLINED, false, usize::MAX);
 }
 
-fn drain_into<F: FnMut(&str)>(mut emit: F, ledger: &AtomicU64, announce: bool) {
+fn drain_into<F: FnMut(&str)>(mut emit: F, ledger: &AtomicU64, announce: bool, budget: usize) {
     let mut guard = 0usize;
+    // SO29/DRAINCAP: what this drain has already put on the wire, in BYTES — the currency the UART
+    // charges (86.8 us each at 115200 8N1). The slot guard below bounds the LOOP; this bounds the COST.
+    let mut paid = 0usize;
     loop {
         if guard > SLOTS {
+            break;
+        }
+        if !drain_may_continue(paid, budget) {
+            // Budget spent. The remainder stays staged, IN ORDER, and rides the next print — the ring
+            // is drained by every print on every core, so nothing here is lost, only deferred. The
+            // loss marker below is deliberately still emitted: a pending drop must not wait on a
+            // budget, because the reader who needs it is reading a run that is already short.
             break;
         }
         guard += 1;
@@ -584,6 +862,9 @@ fn drain_into<F: FnMut(&str)>(mut emit: F, ledger: &AtomicU64, announce: bool) {
         if let Ok(s) = core::str::from_utf8(bytes) {
             emit(s);
         }
+        // Charged whether or not the line was valid UTF-8: the slot is consumed either way, and the
+        // budget is a statement about what this drain COST the holder, not about what a reader got.
+        paid += n.min(SLOT_LEN);
         ledger.fetch_add(1, Ordering::Relaxed);
         slot.state.store(EMPTY, Ordering::Release);
         TAIL.store(tail.wrapping_add(1), Ordering::Release);
@@ -1402,6 +1683,19 @@ pub fn mirror_service() {
         }
     }
     mirror_verdict_once();
+    // SO29/DRAINCAP — the drain-cap fixture, one-shot, riding this poll for the same reason the
+    // SERWIT-2 verdict does: `mirror_service`'s stated contract is IRQs unmasked, no locks held, not
+    // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first
+    // statement, aarch64 via the BSP main loop and `pump_usb_into_gui` on baremetal). Placed AFTER the
+    // verdict so the fixture's own traffic cannot move the tap tallies that verdict snapshots.
+    draincap_selftest();
+    // SERWIT-1B PARITY — the shared contended-producer policy, exercised on whichever arch is
+    // running. Same one-shot call site and same contract as the two fixtures above it.
+    backpressure_selftest();
+    // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
+    // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
+    // a fixture that leaves the ring as it found it should not do so before one that reads it.
+    pwrdrain_selftest();
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -1471,6 +1765,427 @@ fn mirror_verdict_once() {
             ":: SERWIT-2: FAIL — balanced={} evidence_lost={} ::",
             balanced,
             evidence_lost
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// DRAINCAP — the fixture for [`DRAIN_BYTE_BUDGET`]: one drain never pays more than a frame of UART,
+// and the remainder is DEFERRED, never lost.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ### What it asserts, and why in these terms
+// SO29's finding is arithmetic on BYTES, so the fixture measures bytes. It fills the staging ring to
+// [`SLOTS`], takes ONE capped drain, and asserts that drain paid no more than
+// `DRAIN_BYTE_BUDGET + <one line>`; then it takes an uncapped drain and asserts the remainder came out
+// there, with `DROPPED` unmoved. Those two together are the whole contract: **bounded, and lossless**.
+//
+// ### Why it does not measure microseconds
+// It runs under TCG, where a wall-clock reading of a UART write is a fact about the host's load and
+// not about the machine. Bytes are the invariant; SO29's own conversion (86.8 us/B at 115200 8N1)
+// turns them into time at the bench, and the gate's job is to hold the byte count, not to re-measure
+// QEMU. `260 B x 86.8 us = 22.6 ms` against `4352 B x 86.8 us = 377.8 ms` is the claim, and the fixture
+// pins the 260.
+//
+// ### Why every PASS clause is ONE-SIDED
+// This fixture uses the LIVE ring, because the live ring is the thing under test — a private
+// [`LineRing`] would test a copy of the code, which is the failure `docs/dev/LAWS.md` §5 names ("a
+// re-derivation launders provenance"). The price is that another core can win the UART between the two
+// drains and take lines the fixture staged. So every clause is chosen to be one-sided: interference can
+// only make `paid` SMALLER and `drained_capped` FEWER, i.e. it can hide a regression on an unlucky run
+// but can never invent one. A gate that cannot false-fail is worth more here than one that cannot
+// false-pass, because the second kind gets deleted the week it flakes (LAWS §5, "wrong-strict is worse
+// than wrong-lenient").
+//
+// ### The go-red
+// Remove the budget — `drain_capped` calling `drain_into(.., usize::MAX)` — and the filler fill drains
+// whole in one pass: `paid = 4352`, `drained_capped = 64`. Both the byte clause (4352 > 260) and the
+// cap-took-effect clause (64 < 64 is false) fire. Quoted in the commit.
+
+/// Exactly 68 bytes with its newline — SO29's measured witness-line width, so the fixture's arithmetic
+/// is the ledger's arithmetic and not a new one. `"[draincap] fill NN "` is 19 bytes, the pad is 48,
+/// the newline is 1.
+const DRAINCAP_PAD: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+/// The filler line's width in bytes, including the newline. 19 + 48 + 1.
+const DRAINCAP_LINE_B: usize = 68;
+/// One capped drain's ceiling: the budget, plus the one line that may straddle it. See
+/// [`DRAIN_BYTE_BUDGET`]'s "the bound this actually gives".
+const DRAINCAP_BOUND_B: usize = DRAIN_BYTE_BUDGET + DRAINCAP_LINE_B;
+
+static DRAINCAP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The arch's raw, lock-free, bounded UART writer — the same primitive the panic path and the WEDGE
+/// breadcrumbs use. The fixture writes its drained lines through this rather than through `_print`,
+/// because `_print` would drain the ring itself and there would be nothing left to measure.
+#[inline]
+fn draincap_wire(s: &str) {
+    crate::arch::serial::raw_write_str(s);
+}
+
+/// DRAINCAP, once per boot. Called from [`mirror_service`].
+fn draincap_selftest() {
+    if DRAINCAP_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        // SERWIT-1D's machine: nothing is ever staged (nobody would drain it) and `EMITTED` must stay
+        // 0, so a fixture that filled the ring and charged `EMITTED` would break that configuration's
+        // own law. The cap is still compiled and its truth table still ran at `./arroyo check`.
+        serial_println!(
+            ":: DRAINCAP: SKIP — no 16550 on this machine, nothing is ever staged (SERWIT-1D); \
+             budget={} B still compiled and its truth table still asserted ::",
+            DRAIN_BYTE_BUDGET
+        );
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+
+    // Empty the ring FIRST, uncapped. Now that `_print` drains with a budget the ring legitimately
+    // carries residue, and a fill that started on a part-full ring would leave `filled` too small for
+    // the cap clause to mean anything. This is also the only uncapped drain in the fixture's own
+    // fill path, so it cannot be confused with the measurement below.
+    drain(draincap_wire);
+
+    // Fill the ring. `note_submitted` on each line that actually landed, so the conservation law covers
+    // them: these lines are staged directly rather than through `_print`, and a line that charges
+    // `EMITTED` without a matching `SUBMITTED` is exactly the accounting lie SERWIT-1D closed. A failed
+    // stage is NOT counted as a drop — the fixture simply stops filling; it never manufactures loss.
+    let mut filled = 0u64;
+    for i in 0..SLOTS {
+        if try_stage(format_args!("[draincap] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            note_submitted();
+            filled += 1;
+        } else {
+            break;
+        }
+    }
+
+    // ONE capped drain — the measurement.
+    let mut paid = 0usize;
+    let mut capped_lines = 0u64;
+    drain_capped(|s| {
+        paid += s.len();
+        capped_lines += 1;
+        draincap_wire(s);
+    });
+
+    // The remainder, uncapped: this is the "it rides the next print" half, done here explicitly so the
+    // fixture leaves the ring exactly as it found it.
+    let mut rest = 0usize;
+    let mut rest_lines = 0u64;
+    drain(|s| {
+        rest += s.len();
+        rest_lines += 1;
+        draincap_wire(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let bounded = paid <= DRAINCAP_BOUND_B;
+    let capped = capped_lines < filled;
+    // `filled >= 8` is the clause that keeps the cap clause honest rather than a tautology: with the
+    // budget at 192 B and 68 B lines a capped drain takes 3, so the fill must be comfortably deeper
+    // than 3 for `capped_lines < filled` to be evidence. A fill shorter than that means another core
+    // beat the fixture to the ring, and the run says so instead of passing on a technicality.
+    let pass = filled >= 8 && bounded && capped && lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: DRAINCAP: one drain is bounded by BYTES — staged {} x {} B, the capped drain paid {} B \
+             in {} line(s) (budget {} B, ceiling {} B = budget + one line), the remaining {} line(s) / \
+             {} B rode the next drain, 0 lost. Uncapped this ring is {} B = {} us of IRQ-masked UART at \
+             86.8 us/B (SO29) -> PASS ::",
+            filled,
+            DRAINCAP_LINE_B,
+            paid,
+            capped_lines,
+            DRAIN_BYTE_BUDGET,
+            DRAINCAP_BOUND_B,
+            rest_lines,
+            rest,
+            filled as usize * DRAINCAP_LINE_B,
+            filled as usize * DRAINCAP_LINE_B * 868 / 10
+        );
+    } else {
+        serial_println!(
+            ":: DRAINCAP: FAIL — filled={} capped_paid={}B (ceiling {}B) capped_lines={} rest_lines={} \
+             rest={}B dropped={} bounded={} capped={} ::",
+            filled,
+            paid,
+            DRAINCAP_BOUND_B,
+            capped_lines,
+            rest_lines,
+            rest,
+            lost,
+            bounded,
+            capped
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// SERWIT-1B PARITY — the fixture for [`defer_policy`]: a contended producer on a FULL ring
+// back-pressures and then defers. It never drops on the first turn, on either arch.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ### What it exercises
+// The live ring and the live policy, in the order `_print` runs them: fill the ring to [`SLOTS`], then
+// take three turns of [`defer_contended`] with one capped drain in the middle. The drain is the
+// fixture standing in for "the producer won the UART and became the consumer" — SERWIT-1B's *it waits
+// by working*, which is the property that keeps the retry from livelocking at the tail of a burst.
+//
+//     turn 1   ring full, bound not reached   ->  Retry   (spins 1)
+//     turn 2   ring full, bound not reached   ->  Retry   (spins 2)
+//     [one capped drain: room appears]
+//     turn 3   room                           ->  Staged  (spins still 2)
+//
+// **Nothing is lost, and that is deliberate.** The `Lost` leg is NOT exercised at runtime: firing it
+// would leave `DROPPED` non-zero and `[serial] dropped 1 lines` on the wire of a HEALTHY boot, and
+// `docs/dev/LAWS.md` §5 is explicit that a permanently-non-zero instrument is camouflage for a real
+// one. The `Lost` rows are asserted by the compiler instead, in [`defer_policy`]'s truth table, which
+// is where the go-red paths of this module's predicates have always lived.
+//
+// ### The go-red
+// Two, on purpose, because they fail at different stages:
+//   * COMPILE — flip `defer_policy`'s `Retry` arm to `Defer::Lost` and the truth table's row 2 refuses
+//     to compile ("THE aarch64 DEFECT: a full ring on the first turn must back-pressure, never drop").
+//     `./arroyo check` goes red on both arches; nothing boots.
+//   * RUNTIME — add `note_dropped()` to `defer_contended`'s `Retry` arm (a retried line counted as a
+//     lost one). It compiles; the fixture reads `dropped=2` and prints `-> FAIL`, which
+//     `FAULT_PATTERNS` (`FAIL — `) turns into a non-zero exit from `./arroyo test-arm`.
+//
+// ### Why this proves the ARCH and not just the function
+// Because `stage()` is deleted. There is no other spelling of the contended path left in the tree, so
+// aarch64's `_print` either calls [`defer_contended`] or does not compile. The fixture proves the
+// policy; the compiler proves the call.
+
+static BACKPRESSURE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The probe line the fixture pushes through the contended path. 68 bytes with its newline, the same
+/// width [`DRAINCAP_PAD`] uses, so both fixtures speak SO29's arithmetic.
+const BPRESS_PROBE: &str =
+    "[bpress] probe 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123\n";
+
+/// SERWIT-1B PARITY, once per boot. Called from [`mirror_service`].
+fn backpressure_selftest() {
+    if BACKPRESSURE_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        // SERWIT-1D's machine never stages at all — `_print` takes the DECLINED branch BEFORE the
+        // contended path, deliberately, so it never back-pressures against a ring with no consumer.
+        // There is nothing here to exercise; the truth table still ran at `./arroyo check`.
+        serial_println!(
+            ":: SERWIT-1B: SKIP — no 16550 on this machine, the contended path is DECLINED before it \
+             is reached (SERWIT-1D); the policy truth table is asserted at compile time ::"
+        );
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    drain(draincap_wire);
+
+    let mut filled = 0u64;
+    for i in 0..SLOTS {
+        if try_stage(format_args!("[bpress] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            note_submitted();
+            filled += 1;
+        } else {
+            break;
+        }
+    }
+
+    // The probe takes the contended path. `note_submitted` once: the first two turns stage nothing —
+    // that is the whole point — and the third is the one that lands.
+    note_submitted();
+    let mut spins: u32 = 0;
+    let t1 = defer_contended(format_args!("{}", BPRESS_PROBE), &mut spins);
+    let t2 = defer_contended(format_args!("{}", BPRESS_PROBE), &mut spins);
+    // "It waits by working": the stalled producer wins the UART and becomes the consumer. One capped
+    // drain is exactly what `_print`'s next turn would do, so this is the real sequence and not a
+    // simulation of it.
+    let mut freed = 0u64;
+    drain_capped(|s| {
+        freed += 1;
+        draincap_wire(s);
+    });
+    let t3 = defer_contended(format_args!("{}", BPRESS_PROBE), &mut spins);
+
+    // Empty the ring so the fixture leaves it as it found it; the probe goes out here.
+    let mut rest = 0u64;
+    drain(|s| {
+        rest += 1;
+        draincap_wire(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let backpressured = matches!(t1, Defer::Retry) && matches!(t2, Defer::Retry);
+    let deferred = matches!(t3, Defer::Staged);
+    let pass = filled >= 8 && backpressured && deferred && spins == 2 && lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: SERWIT-1B: the contended producer BACK-PRESSURES, it does not drop — ring filled to {} \
+             line(s), 2 turns on a full ring returned Retry (spins={} of {}), one capped drain freed {} \
+             slot(s), the next turn DEFERRED the line intact, {} line(s) out, 0 dropped. One policy \
+             (`defer_policy`) on both arches; `stage()` is deleted, so drop-instantly cannot be \
+             written -> PASS ::",
+            filled,
+            spins,
+            BACKPRESSURE_SPINS,
+            freed,
+            freed + rest
+        );
+    } else {
+        serial_println!(
+            ":: SERWIT-1B: FAIL — filled={} t1_retry={} t2_retry={} t3_staged={} spins={} freed={} \
+             rest={} dropped={} ::",
+            filled,
+            matches!(t1, Defer::Retry),
+            matches!(t2, Defer::Retry),
+            matches!(t3, Defer::Staged),
+            spins,
+            freed,
+            rest,
+            lost
+        );
+    }
+}
+
+// ── PWRDRAIN — the fixture: a full drain empties the ring, and the witness counts BYTES ──────────
+//
+// ### What it exercises
+// The live ring and the live [`power_drain`], in the order a power verb runs them, minus the SMC —
+// which is the one line of a shutdown a fixture may not execute, because the next instruction would
+// take the machine and there would be no verdict to read. So the fixture proves everything up to it:
+// fill the ring to [`SLOTS`], call `power_drain` exactly as `platform_shutdown` does, and assert that
+// at least every staged line left, that at least every staged byte left, and — strictly — that the ring
+// is EMPTY afterwards. The two `>=` are the direction the property points and not a hedge; the reason
+// is at the predicate. The SMC's position relative to this call is the compiler's: there is one call
+// and it is the statement before `psci_call` (`power.rs`).
+//
+//     ring filled to SLOTS x PWRDRAIN_LINE_LEN = 64 x 68 B = 4 352 B   (SO29's whole ring)
+//     power_drain("pwrshutoff")  ->  lines = 64, bytes = 4 352
+//     a following drain          ->  residue = 0
+//
+// 4 352 B is 22.6x [`DRAIN_BYTE_BUDGET`] (192 B) on purpose: the gap between "uncapped" and "capped"
+// has to be wide enough that the fixture cannot pass by accident on a tree where the two spellings
+// were swapped.
+//
+// ### The go-red
+// Two, and the first is the regression this deliverable exists to prevent:
+//   * RUNTIME, the realistic one — change `power_drain`'s `drain(...)` to `drain_capped(...)` (the
+//     plausible "reuse the other spelling" edit). It compiles. The budget stops the drain after 3
+//     lines of 68 B (68, 136, 204 — `drain_may_continue` is strictly `<`), so the fixture reads
+//     `lines=3 residue=61` and prints `-> FAIL`, which `FAULT_PATTERNS` (`FAIL — `) turns into a
+//     non-zero exit from `./arroyo test-arm`.
+//   * RUNTIME, the blunt one — delete the `drain(...)` call from `power_drain` entirely: `lines=0
+//     bytes=0 residue=64`, same `-> FAIL`.
+// Both are runtime rather than compile-time by construction: `drain` and `drain_capped` have the same
+// signature, which is exactly why a fixture and not a type is what holds this property.
+//
+// ### What it does NOT prove
+// Stated rather than implied. It does not prove that the firmware call is reached, that `raw_write_str`
+// outruns the SMC on real silicon, or that the Jetson's UART has flushed its own FIFO when power drops
+// — none of those is observable from inside the machine. It proves the ring is empty and the bytes
+// were handed to the port before the verb continues. The artifact half of the claim is
+// `LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf`.
+
+static PWRDRAIN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Width of one fixture fill line, `"[pwrdrain] fill NN " + DRAINCAP_PAD + "\n"`: 19 + 48 + 1. Named
+/// so the byte assertion below is arithmetic the compiler can check rather than a magic number.
+const PWRDRAIN_LINE_LEN: usize = 19 + 48 + 1;
+
+const _: () = assert!(
+    PWRDRAIN_LINE_LEN <= SLOT_LEN,
+    "a fixture fill line must not truncate, or the byte count it asserts on is not the one staged"
+);
+const _: () = assert!(
+    SLOTS * PWRDRAIN_LINE_LEN > DRAIN_BYTE_BUDGET * 8,
+    "the fixture's ring must be many budgets wide, or capped and uncapped are indistinguishable"
+);
+
+/// PWRDRAIN, once per boot. Called from [`mirror_service`].
+fn pwrdrain_selftest() {
+    if PWRDRAIN_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        // SERWIT-1D's machine stages nothing and drains nothing; `power_drain` there is a pair of
+        // zeroes and a witness into a port that is not present. Nothing to exercise.
+        serial_println!(
+            ":: PWRDRAIN: SKIP — no 16550 on this machine, so there is no staged line for a power \
+             verb to lose (SERWIT-1D); the budget arithmetic is asserted at compile time ::"
+        );
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    // Start from an empty ring AND from a cleared loss-pending count: `drain` runs `report_losses`,
+    // whose marker would otherwise ride the measured drain below and inflate its byte total.
+    drain(draincap_wire);
+
+    let mut filled = 0u64;
+    for i in 0..SLOTS {
+        if try_stage(format_args!("[pwrdrain] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            note_submitted();
+            filled += 1;
+        } else {
+            break;
+        }
+    }
+
+    // The measured call — the same one `platform_shutdown` makes, with the SMC left off.
+    let (lines, bytes) = power_drain("pwrshutoff");
+
+    // "Empty" is a claim about the ring, so ask the ring, not the counter.
+    let mut residue = 0u64;
+    drain(|s| {
+        residue += 1;
+        draincap_wire(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let want_bytes = filled as usize * PWRDRAIN_LINE_LEN;
+    // The comparisons on `lines`/`bytes` are `>=`, and that is a statement about the machine, not a
+    // hedge: this fixture runs on a live kernel with other cores printing, so a foreign line can be
+    // staged between the fill loop and the drain. Foreign traffic can only ADD to what a full drain
+    // emits — it can never subtract — so `>=` is exactly the direction the property points, while a
+    // capped or absent drain lands FAR below `filled` and is caught. `residue == 0` is the strict
+    // half and is the claim itself: the ring is empty when the verb continues.
+    let pass = filled >= SLOTS as u64 / 2
+        && lines >= filled
+        && bytes >= want_bytes
+        && residue == 0
+        && lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: PWRDRAIN: a power verb drains the WHOLE ring before it calls the firmware — ring \
+             filled to {} line(s) / {} B ({}x DRAIN_BYTE_BUDGET={}), one power_drain() put every \
+             line on the wire (lines={} bytes={}) and left the ring EMPTY (residue={}), 0 dropped; \
+             the witness `[pwrshutoff] ring drained lines={} bytes={}` is on the wire above this \
+             verdict, and in `power.rs` the statement after it is the SMC -> PASS ::",
+            filled,
+            bytes,
+            bytes / DRAIN_BYTE_BUDGET,
+            DRAIN_BYTE_BUDGET,
+            lines,
+            bytes,
+            residue,
+            lines,
+            bytes
+        );
+    } else {
+        serial_println!(
+            ":: PWRDRAIN: FAIL — filled={} lines={} bytes={} want_bytes={} residue={} dropped={} ::",
+            filled,
+            lines,
+            bytes,
+            want_bytes,
+            residue,
+            lost
         );
     }
 }

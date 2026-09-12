@@ -31,6 +31,14 @@
 //   * x86_64 shutdown: REAL — routed to the existing `crate::arch::acpi_power::poweroff()`
 //     (ACPI S5, the crystal.rs Shut-Down path), which carries its own honest fallback.
 //
+// PWRDRAIN (SO31, trunk queue §1 (f)): EVERY verb below flushes the serial staging ring — uncapped,
+// through the arch's raw lock-free writer — immediately before it hands the machine to the firmware,
+// and emits `[<family>] ring drained lines=N bytes=M`. The reason is the one property the transport
+// cannot give here: a contended line is DEFERRED, and a deferred line is safe only while a next print
+// exists. A power verb is the context where there is none, so the ring dies with the power and the
+// verb's own announce can die with it. See `serial_ring::power_drain` and
+// `docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §"The power verbs drain first".
+//
 // Witness families: `[pwrreboot]` / `[pwrshutoff]` (tokens > 8 bytes by construction —
 // each bracket prefix alone is 11+ bytes — so `strings` on the artifact finds them; the LLVM
 // ≤8-byte immediate-encoding trap cannot swallow them).
@@ -93,6 +101,11 @@ fn platform_reboot() -> ! {
         "[pwrreboot] PSCI SYSTEM_RESET ({:#010x}) via SMC — firmware owns the machine from here",
         PSCI_SYSTEM_RESET
     );
+    // PWRDRAIN (SO31, trunk queue §1 (f)): the announce above may have been DEFERRED into the serial
+    // staging ring by a contended lock, and the reset takes the machine microseconds from here — a
+    // deferred line is not a lost one only while a next print exists, and past this call there is
+    // none. Flush the whole ring, uncapped, through the raw lock-free writer, then say so.
+    crate::serial_ring::power_drain("pwrreboot");
     let ret = psci_call(PSCI_SYSTEM_RESET);
     // A returning SYSTEM_RESET is a refusal (NOT_SUPPORTED and friends are negative per PSCI).
     serial_println!(
@@ -108,6 +121,10 @@ fn platform_shutdown() -> ! {
         "[pwrshutoff] PSCI SYSTEM_OFF ({:#010x}) via SMC — firmware owns the machine from here",
         PSCI_SYSTEM_OFF
     );
+    // PWRDRAIN (SO31, trunk queue §1 (f)): render13 boot 1 was dropping 5 331 lines into a saturated
+    // ring; on that boot every line still staged when SYSTEM_OFF landed died with the power, this
+    // verb's own witness included. Flush the ring whole, uncapped, before the SMC.
+    crate::serial_ring::power_drain("pwrshutoff");
     let ret = psci_call(PSCI_SYSTEM_OFF);
     serial_println!(
         "[pwrshutoff] PSCI SYSTEM_OFF RETURNED ({}) — firmware refused the off; parking in hlt",
@@ -125,6 +142,10 @@ fn platform_reboot() -> ! {
     serial_println!(
         "[pwrreboot] no reboot mechanism wired on this platform (Pi: no PSCI; the BCM2711 PM/WDOG path is the pi lane's) — parking in hlt"
     );
+    // PWRDRAIN: `hlt_loop` is also a context with no next print — a staged line would sit in the ring
+    // until something else printed, and nothing will. Flush it here for the same reason the SMC paths
+    // do, and the witness says the refusal really reached the wire.
+    crate::serial_ring::power_drain("pwrreboot");
     crate::hlt_loop();
 }
 
@@ -133,6 +154,8 @@ fn platform_shutdown() -> ! {
     serial_println!(
         "[pwrshutoff] no shutdown mechanism wired on this platform (Pi: no PSCI; the mailbox power path is the pi lane's) — parking in hlt"
     );
+    // PWRDRAIN: same as the reboot twin above — a park is a context with no next print.
+    crate::serial_ring::power_drain("pwrshutoff");
     crate::hlt_loop();
 }
 
@@ -144,6 +167,10 @@ fn platform_shutdown() -> ! {
 #[cfg(target_arch = "x86_64")]
 fn platform_reboot() -> ! {
     serial_println!("[pwrreboot] x86 mechanism: FADT RESET_REG ladder (acpi_power::reboot)");
+    // PWRDRAIN: `acpi_power::reboot` already drains (it has since LOCKFIX), but it does so with no
+    // witness, so a capture could not tell a flushed ring from a ring that was never reached. The
+    // count goes on the wire here; the second drain downstream then finds the ring empty.
+    crate::serial_ring::power_drain("pwrreboot");
     crate::arch::acpi_power::reboot();
 }
 
@@ -153,6 +180,13 @@ fn platform_reboot() -> ! {
 #[cfg(target_arch = "x86_64")]
 fn platform_shutdown() -> ! {
     serial_println!("[pwrshutoff] x86 mechanism: ACPI S5 (acpi_power::poweroff)");
+    // PWRDRAIN: x86's S5 path does NOT share the reboot ladder's drain — `acpi_power::poweroff` masks
+    // interrupts and writes PM1_CNT with whatever is still staged. It shares this ring, so it owes the
+    // same flush. ⚠ SCOPE: this covers the shell/`power::shutdown` route only. `video/crystal.rs`'s
+    // Shut Down and `video/instgui.rs` call `acpi_power::poweroff()` DIRECTLY and still bypass it; the
+    // one-line fix belongs at the top of `poweroff()` itself, in `arch/x86_64/acpi_power.rs`, which
+    // this arc's brief does not name. Reported, not made.
+    crate::serial_ring::power_drain("pwrshutoff");
     crate::arch::acpi_power::poweroff();
 }
 
@@ -185,6 +219,11 @@ fn platform_shutdown() -> ! {
 #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
 pub fn crystal_restart() -> ! {
     serial_println!("[crystal] verb=restart -> PSCI SYSTEM_RESET");
+    // PWRDRAIN: the announce above is the operator's evidence that the menu verb acted, and it is the
+    // line most likely to be staged — a desktop press happens with the compositor printing. Flush
+    // before the SMC. The witness rides the `[pwrreboot]` family, not `[crystal]`: it is a statement
+    // about the TRANSPORT, and a reader grepping `ring drained` wants both verbs in one tally.
+    crate::serial_ring::power_drain("pwrreboot");
     let ret = psci_call(PSCI_SYSTEM_RESET);
     serial_println!(
         "[crystal] verb=restart -> PSCI SYSTEM_RESET RETURNED ret={} — a returning PSCI power call is a REFUSAL; parking in hlt",
@@ -199,6 +238,8 @@ pub fn crystal_restart() -> ! {
 #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
 pub fn crystal_shutdown() -> ! {
     serial_println!("[crystal] verb=shutdown -> PSCI SYSTEM_OFF");
+    // PWRDRAIN: trunk queue §1 (f) names this call site by name. Flush the ring whole before the SMC.
+    crate::serial_ring::power_drain("pwrshutoff");
     let ret = psci_call(PSCI_SYSTEM_OFF);
     serial_println!(
         "[crystal] verb=shutdown -> PSCI SYSTEM_OFF RETURNED ret={} — a returning PSCI power call is a REFUSAL; parking in hlt",
