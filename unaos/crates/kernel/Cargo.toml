@@ -2936,6 +2936,23 @@ tcurx = ["tegra", "orinrx", "tcuprobe"]
 # (`[facet]`, `FACETPNG`). Carried by the `deskcascade` implication below so the fifteen-knob jetson
 # build reaches it with no sixteenth knob.
 facet = ["quarry"]
+# USBLUN-M3 (F2): the WAY BACK from the USB multi-LUN census. `UNAOS_NOUSBLUN=1` => this feature =>
+# `drivers/xhci/mod.rs` compiles no census at all: Get Max LUN (class request 0xFE) is never asked,
+# `usblun_census`/`usblun_probe`/`bot_get_max_lun`/`ep0_resync` and the three census field types are
+# not compiled, `DeviceSlot::bot_lun` stays 0 for the life of every slot, and `build_cbw` therefore
+# writes the same `bCBWLUN = 0` it wrote before USBLUN-M1 — LUN 0 is published exactly as it was.
+#
+# THE POLARITY IS BACKWARDS FROM MOST OF THIS TABLE, and that is the point: the census is DEFAULT-ON
+# because it is the driver doing its job (a multi-slot card reader is one BOT device whose slots are
+# logical units, and addressing only LUN 0 hides every card but one), so the feature that needs a
+# named leg is this one, the DISARMED shape an operator falls back to. It is type-checked by the
+# `x86-nousblun` leg of KERNEL_CFG_MATRIX; every other leg in the table covers the census-ON default.
+# The `UNAOS_NOAPSRUN=1` shape exactly, and for the same reason: a default-on behaviour change in a
+# driver both arches compile, whose only runtime evidence is QEMU's single-LUN `usb-storage`.
+# Mapped in BOTH arroyo (the `_feats` map) and builder/src/main.rs (the x86 media build re-derives
+# its own feature list from env and never reads `$KERNEL_FEATURES`). Witness on the wire:
+# `:: USBLUN: census SKIPPED ::` in place of the `:: USBLUN: ... ::` family.
+nousblun = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

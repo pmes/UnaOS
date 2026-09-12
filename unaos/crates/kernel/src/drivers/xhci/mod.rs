@@ -2065,10 +2065,12 @@ impl core::fmt::Display for ResidueField {
     }
 }
 
+#[cfg(not(feature = "nousblun"))]
 /// USBLUN: the `capacity=` field of a census line. A LUN whose READ CAPACITY(10) did not answer has
 /// no geometry at all, and `0x0` would be a number where there is no reading — spelled `none`, for
 /// the same reason `ResidueField` above spells its own absence.
 struct CapField(Option<(u64, u32)>);
+#[cfg(not(feature = "nousblun"))]
 impl core::fmt::Display for CapField {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
@@ -2078,9 +2080,11 @@ impl core::fmt::Display for CapField {
     }
 }
 
+#[cfg(not(feature = "nousblun"))]
 /// USBLUN: a LUN number that may not exist — `first_present=none` on a reader with every slot
 /// empty. Spelled, because `first_present=0` is a real and different reading.
 struct LunField(Option<u8>);
+#[cfg(not(feature = "nousblun"))]
 impl core::fmt::Display for LunField {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
@@ -2090,6 +2094,7 @@ impl core::fmt::Display for LunField {
     }
 }
 
+#[cfg(not(feature = "nousblun"))]
 /// USBLUN: the `reason=` field of a census line — WHY a logical unit reads the way it does, always
 /// naming the STAGE that produced the reading, because "no medium" from INQUIRY and "no medium"
 /// from READ CAPACITY are different facts about a card reader.
@@ -2106,6 +2111,7 @@ enum LunReason {
     /// The transaction never produced a CSW: a transport-level error from `bot_transfer`.
     Bot(&'static str, BotError),
 }
+#[cfg(not(feature = "nousblun"))]
 impl core::fmt::Display for LunReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -2489,6 +2495,32 @@ pub static BOT_WRAP_DB: AtomicU64 = AtomicU64::new(0);
 /// first thing a metal capture wants to divide `timeouts=` against.
 pub static BOT_TX_RD_SECTORS: AtomicU64 = AtomicU64::new(0);
 pub static BOT_TX_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
+
+/// USBLUN-M3 (F3): **the census owns its own error policy, and the ladder consults this to know it.**
+///
+/// THE DEFECT THIS CLOSES, from this arc's own go-red wire. With `max_lun` forced to 1 on QEMU's
+/// single-LUN `usb-storage`, LUN 1 answered READ CAPACITY with `TransferError(13)`. That is an
+/// ordinary transport error, so `bot_transfer_body` did the ordinary thing: `recover_bot_full`, one
+/// retry, then `bot_rescue_escalate` — which charged a ladder entry, opened a park account and
+/// SURRENDERED THE SLOT. The bring-up that followed found `NoDevice` and printed no `xHCI: Disk`
+/// line at all. **A probe of one logical unit had destroyed a disk that ANOTHER logical unit had
+/// already proved PRESENT two lines earlier** — and on the bench the boot card is LUN 0 of exactly
+/// such a reader, so this is the arc's own feature losing the boot disk.
+///
+/// The census is a QUESTION, not I/O. A LUN that does not answer is a fact to record, never a
+/// transport to rescue: nothing downstream depends on that transfer, the answer is already "this
+/// unit is not usable", and the recovery ladder's whole justification — a disk the system needs is
+/// wedged and must be recovered or given up on — does not hold for it. So while this is set,
+/// `bot_transfer_body` takes exactly ONE attempt per command and returns the error: no
+/// `recover_bot_full`, no retry, no `bot_rescue_escalate`, no ladder charge, no surrender. The
+/// chokepoint's `bot_clean_rings` still runs on the way out, so the rings are left resynchronised
+/// for the next probe and for the bring-up — that is hygiene, not the ladder.
+///
+/// What it deliberately does NOT suppress: the pump's dead-ring park accounting (`bot_park_charge`
+/// from `bot_transfer_once`'s timeout arm), which is an identity's standing record of ring-idle
+/// time and not an escalation. It cannot park the device mid-bring-up either way: the park gate is
+/// read once, at `bring_up_storage`'s entry, before the census runs.
+static USBLUN_CENSUS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// REQUEST SENSE fetches issued from the runtime `Failed`-CSW path (one per Failed CSW handled).
 pub static BOT_SENSE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -7563,6 +7595,22 @@ impl XhciController {
             Err(BotError::NoDevice) => return Err(BotError::NoDevice),
             Err(e) => e,
         };
+        // USBLUN-M3 (F3): the census's transfers stop here. ONE attempt, the error returned to the
+        // probe that asked for it, and NOTHING below this line runs — no recovery, no retry, no
+        // ladder entry, no surrender. Placed AFTER the `Ok` arms above on purpose: a census probe
+        // that succeeds, or that comes back CHECK CONDITION, takes exactly the paths it always did
+        // (and `BOT_SENSE_ACTIVE`, which the census also holds, is what keeps a CHECK CONDITION
+        // verbatim). `bot_failed` is consumed rather than left standing, because the record belongs
+        // to a recovery that is not going to happen and the next transaction must not inherit it.
+        // The chokepoint above still cleans both rings on this Err, which is what leaves the device
+        // usable for the next LUN and for the bring-up.
+        if USBLUN_CENSUS_ACTIVE.load(Ordering::Relaxed) {
+            let _ = self.bot_failed.take();
+            serial_println!(
+                ":: USBLUN: census-transfer slot={} cdb0={:#04x} err={:?} — one attempt, no recovery ladder, no surrender: probing one logical unit must never cost a disk another unit already proved ::",
+                slot_id, cdb.first().copied().unwrap_or(0), cause);
+            return Err(cause);
+        }
         // BOT-RESCUE M3 witness 6: the failed stage's own pending record, taken out of
         // `run_bot_stage` instead of dropped, handed to recovery so its evidence line can carry the
         // truth about which pipe the stranded TRB sat on.
@@ -11880,6 +11928,7 @@ impl XhciController {
         self.scsi_write10(slot, lba, blocks)
     }
 
+    #[cfg(not(feature = "nousblun"))]
     /// USBLUN: **Get Max LUN** (USB MSC Bulk-Only Transport 1.0 §3.2) — how many logical units this
     /// BOT device has, asked of the device instead of assumed.
     ///
@@ -11930,6 +11979,7 @@ impl XhciController {
         }
     }
 
+    #[cfg(not(feature = "nousblun"))]
     /// USBLUN: bring EP0 back from a control-pipe STALL. The bulk twin of this is `resync_bulk_ep`,
     /// which cannot be reused: it reads its ring out of `bulk_in_ring`/`bulk_out_ring`, and EP0 has
     /// neither. Same two commands, same state-aware ordering (xHCI 1.2 §4.6.8 Reset Endpoint is
@@ -11939,6 +11989,19 @@ impl XhciController {
     /// pipe's protocol stall self-clearing at the next SETUP, so the only halt left to clear is the
     /// controller's. Best-effort and witnessed — a failure here is reported, never silently assumed
     /// away, because the next control transfer on this slot is the thing it decides.
+    ///
+    /// **USBLUN-M3 (F1): all THREE of `resync_bulk_ep`'s arms, not one.** The first cut ran Reset
+    /// Endpoint for Halted/Error and then Set TR Dequeue Pointer UNCONDITIONALLY, which is wrong in
+    /// both directions and for the reason that function's own arms exist. Set TR Dequeue is legal
+    /// only from Stopped or Error (xHCI 1.2 §4.6.10): issued at a RUNNING endpoint it returns
+    /// Context State Error (19), and `dequeue_reset_target()` hands back the driver's ENQUEUE
+    /// index — so on the one shape that reaches here with EP0 still Running, a control transfer
+    /// that timed out rather than stalled, the command would either be refused or would step the
+    /// controller PAST a TD still in flight. Stop Endpoint first (§4.6.9, legal only from Running)
+    /// is what makes the dequeue write legal and the skip impossible. The `cc == 19` reading on the
+    /// Stop arm is `resync_bulk_ep`'s too, and carried for its reason (boot23/PA32): Stop Endpoint
+    /// refused from a non-Running state means the endpoint is ALREADY out of Running, which is this
+    /// arm's whole goal, so the refusal IS the goal state and the resync proceeds.
     fn ep0_resync(&mut self, slot_id: u8) -> bool {
         if self.slots[slot_id as usize].output_context.is_null() {
             serial_println!(":: USBLUN: ep0-resync slot={} ok=no why=no-output-context ::", slot_id);
@@ -11946,13 +12009,46 @@ impl XhciController {
         }
         let ep_state = self.ep_state_of(slot_id, 1) as u32;
         let ctx = (1u32 << 16) | ((slot_id as u32) << 24);
-        if ep_state == 2 || ep_state == 4 {
-            let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx });
-            let after = self.ep_state_of(slot_id, 1);
-            serial_println!(
-                ":: USBLUN: ep0-resync slot={} stage=reset-ep ok={} cc={} why={} epstate={}->{} ::",
-                slot_id, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
-            if !ok { return false; }
+        match ep_state {
+            2 | 4 => {
+                // Reset Endpoint (TRB type 14): Halted/Error -> Stopped.
+                let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx });
+                let after = self.ep_state_of(slot_id, 1);
+                serial_println!(
+                    ":: USBLUN: ep0-resync slot={} stage=reset-ep ok={} cc={} why={} epstate={}->{} ::",
+                    slot_id, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
+                if !ok { return false; }
+            }
+            1 => {
+                // Stop Endpoint (TRB type 15): Running -> Stopped. THE ARM THE FIRST CUT WAS
+                // MISSING, and the only one that makes the Set TR Dequeue below legal for a
+                // control transfer that timed out with a TD still in flight.
+                let (ok, cc, why) = self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx });
+                let after = self.ep_state_of(slot_id, 1);
+                serial_println!(
+                    ":: USBLUN: ep0-resync slot={} stage=stop-ep ok={} cc={} why={} epstate={}->{} ::",
+                    slot_id, if ok { "yes" } else { "no" }, cc, why, ep_state, after);
+                if !ok {
+                    if cc == 19 {
+                        serial_println!(
+                            ":: USBLUN: ep0-resync slot={} stage=stop-ep cc=19 treated as already-stopped (stale context read={} now={}) — proceeding to set-deq ::",
+                            slot_id, ep_state, after);
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            3 => {
+                serial_println!(
+                    ":: USBLUN: ep0-resync slot={} stage=skip ok=yes cc=0 why=already-stopped epstate={}->{} ::",
+                    slot_id, ep_state, ep_state);
+            }
+            _ => {
+                serial_println!(
+                    ":: USBLUN: ep0-resync slot={} stage=read-state ok=no why=ep-unusable epstate={}->{} ::",
+                    slot_id, ep_state, ep_state);
+                return false;
+            }
         }
         while self.drain_event_ring_once() {}
         let deq = match self.slots[slot_id as usize].ep0_ring.as_ref() {
@@ -11969,6 +12065,7 @@ impl XhciController {
         ok
     }
 
+    #[cfg(not(feature = "nousblun"))]
     /// USBLUN: probe ONE logical unit and print its census line. Returns true iff the unit holds
     /// readable media (`PRESENT`).
     ///
@@ -12060,6 +12157,7 @@ impl XhciController {
         verdict == "PRESENT"
     }
 
+    #[cfg(not(feature = "nousblun"))]
     /// USBLUN: **the census** — ask the device how many logical units it has, then look at every one
     /// of them. Returns `(bMaxLUN, how many are PRESENT, the first PRESENT one)`.
     ///
@@ -12077,6 +12175,10 @@ impl XhciController {
         let max_lun = self.bot_get_max_lun(slot_id);
         self.slots[slot_id as usize].bot_max_lun = max_lun;
         let sense_was = BOT_SENSE_ACTIVE.swap(true, Ordering::Relaxed);
+        // USBLUN-M3 (F3): armed across the whole census, including the sense fetches its probes
+        // make, and restored on the one exit below — a probe's REQUEST SENSE must not escalate
+        // either. See `USBLUN_CENSUS_ACTIVE` for what it suppresses and what it deliberately does not.
+        let census_was = USBLUN_CENSUS_ACTIVE.swap(true, Ordering::Relaxed);
         let entry_lun = self.slots[slot_id as usize].bot_lun;
         let mut present = 0u8;
         let mut first_present: Option<u8> = None;
@@ -12091,6 +12193,7 @@ impl XhciController {
         }
         // The census leaves the slot exactly as it found it; SELECTION is the caller's decision.
         self.slots[slot_id as usize].bot_lun = entry_lun;
+        USBLUN_CENSUS_ACTIVE.store(census_was, Ordering::Relaxed);
         BOT_SENSE_ACTIVE.store(sense_was, Ordering::Relaxed);
         (max_lun, present, first_present)
     }
@@ -12173,42 +12276,55 @@ impl XhciController {
         }
         BOT_SENSE_ACTIVE.store(false, Ordering::Relaxed);
 
-        // USBLUN M1 — THE CENSUS. The device is open and answering; before the bring-up commits to
-        // one logical unit, ask how many it has and look at each. Placed after TEST UNIT READY
-        // because a unit that is still becoming ready would answer the census with NOT READY and be
-        // scored empty; placed before the INQUIRY below because that INQUIRY is the bring-up's
-        // first command against the unit it is going to PUBLISH, and which unit that is, is what
-        // the census decides. On a single-LUN device this prints one line and changes nothing.
-        self.storage_note = "LUN census";
-        let (max_lun, present, first_present) = self.usblun_census(slot);
-        serial_println!(
-            ":: USBLUN: census slot={} max_lun={} luns={} present={} first_present={} ::",
-            slot, max_lun, max_lun as u16 + 1, present, LunField(first_present));
-
-        // USBLUN M2 — THE SELECTION. Publish the unit that actually holds a card.
-        //
-        // LUN 0 when LUN 0 has one — which is every single-LUN device (every stick on the x86 and
-        // Pi benches, and QEMU's `usb-storage`), so those publish exactly what they published
-        // before. Otherwise the FIRST unit the census scored PRESENT, so a reader whose first slot
-        // is empty stops publishing an empty slot. With nothing present anywhere the choice falls
-        // back to LUN 0 and the bring-up proceeds into its existing READ CAPACITY failure path:
-        // "no card in any slot" is not a reason to invent a different unit to fail on.
-        //
-        // Set HERE, before the INQUIRY below, because everything downstream reads it: the INQUIRY
-        // and READ CAPACITY that produce the geometry, the `xHCI: Disk` line, `publish_usb_geometry`
-        // — and every later READ(10)/WRITE(10), which reach `build_cbw` through this same slot. One
-        // field, one write, and the whole command stream moves to the chosen card together.
-        let chosen = first_present.unwrap_or(0);
-        self.slots[slot as usize].bot_lun = chosen;
-        if present > 1 {
+        // USBLUN-M3 (F2) — THE WAY BACK. This is a DEFAULT-ON behaviour change in a driver both
+        // arches compile, and its only runtime evidence is QEMU's single-LUN `usb-storage` on two
+        // boards that are not the board it was written for. `UNAOS_NOUSBLUN=1` (cargo feature
+        // `nousblun`) is the opt-out, the `UNAOS_NOAPSRUN=1` shape: the census and Get Max LUN are
+        // not compiled and not asked, `bot_lun` stays 0 for the life of the slot, and LUN 0
+        // publishes exactly as it did before USBLUN-M1 existed. An operator who meets a device that
+        // dislikes being asked has one env var between them and the known-good image.
+        #[cfg(not(feature = "nousblun"))]
+        {
+            // USBLUN M1 — THE CENSUS. The device is open and answering; before the bring-up commits to
+            // one logical unit, ask how many it has and look at each. Placed after TEST UNIT READY
+            // because a unit that is still becoming ready would answer the census with NOT READY and be
+            // scored empty; placed before the INQUIRY below because that INQUIRY is the bring-up's
+            // first command against the unit it is going to PUBLISH, and which unit that is, is what
+            // the census decides. On a single-LUN device this prints one line and changes nothing.
+            self.storage_note = "LUN census";
+            let (max_lun, present, first_present) = self.usblun_census(slot);
             serial_println!(
-                ":: USBLUN: {} present, publishing lun={}; the block registry holds one USB disk ::",
-                present, chosen);
+                ":: USBLUN: census slot={} max_lun={} luns={} present={} first_present={} ::",
+                slot, max_lun, max_lun as u16 + 1, present, LunField(first_present));
+
+            // USBLUN M2 — THE SELECTION. Publish the unit that actually holds a card.
+            //
+            // LUN 0 when LUN 0 has one — which is every single-LUN device (every stick on the x86 and
+            // Pi benches, and QEMU's `usb-storage`), so those publish exactly what they published
+            // before. Otherwise the FIRST unit the census scored PRESENT, so a reader whose first slot
+            // is empty stops publishing an empty slot. With nothing present anywhere the choice falls
+            // back to LUN 0 and the bring-up proceeds into its existing READ CAPACITY failure path:
+            // "no card in any slot" is not a reason to invent a different unit to fail on.
+            //
+            // Set HERE, before the INQUIRY below, because everything downstream reads it: the INQUIRY
+            // and READ CAPACITY that produce the geometry, the `xHCI: Disk` line, `publish_usb_geometry`
+            // — and every later READ(10)/WRITE(10), which reach `build_cbw` through this same slot. One
+            // field, one write, and the whole command stream moves to the chosen card together.
+            let chosen = first_present.unwrap_or(0);
+            self.slots[slot as usize].bot_lun = chosen;
+            if present > 1 {
+                serial_println!(
+                    ":: USBLUN: {} present, publishing lun={}; the block registry holds one USB disk ::",
+                    present, chosen);
+            }
+            serial_println!(
+                ":: USBLUN: publish lun={}/{} present={} source={} — every CBW for this device now carries this LUN ::",
+                chosen, max_lun, present,
+                if first_present.is_some() { "first-present" } else { "fallback-lun0" });
         }
+        #[cfg(feature = "nousblun")]
         serial_println!(
-            ":: USBLUN: publish lun={}/{} present={} source={} — every CBW for this device now carries this LUN ::",
-            chosen, max_lun, present,
-            if first_present.is_some() { "first-present" } else { "fallback-lun0" });
+            ":: USBLUN: census SKIPPED — built with `nousblun` (UNAOS_NOUSBLUN=1); Get Max LUN is not asked, every CBW carries bCBWLUN=0 and LUN 0 is published, exactly as before USBLUN-M1 ::");
 
         self.storage_note = "INQUIRY";
         let t_inq = crate::arch::now_cycles();

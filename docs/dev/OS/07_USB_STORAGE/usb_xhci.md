@@ -1295,6 +1295,48 @@ INQUIRY and READ CAPACITY that produce the published geometry, the `xHCI: Disk` 
 later READ(10) / WRITE(10) all address the same card. With no card anywhere the choice falls back to
 LUN 0 and the existing READ CAPACITY failure path runs, unchanged.
 
+**The census cannot lose the disk (M3, F3).** The first cut could, and its own go-red proved it: with
+`max_lun` forced to 1 on QEMU's single-LUN `usb-storage`, LUN 1 answered READ CAPACITY with a
+transport error, `bot_transfer_body` did the ordinary thing — `recover_bot_full`, one retry,
+`bot_rescue_escalate` — and the ladder SURRENDERED the slot. The bring-up that followed printed
+`xHCI: storage bring-up failed: NoDevice` and no `xHCI: Disk` line, two lines after LUN 0 had been
+scored `PRESENT`. On the bench the boot card is LUN 0 of exactly such a reader, so that is the
+feature losing the boot disk. The fix is a policy statement, not a retry tweak: **a census is a
+question, not I/O.** A LUN that does not answer is a fact to record; nothing downstream depends on
+that transfer, and the recovery ladder's justification — a disk the system needs is wedged and must
+be recovered or given up on — does not hold for it. `USBLUN_CENSUS_ACTIVE` is an `AtomicBool` held
+across the census (including the REQUEST SENSE its probes make), and while it is set
+`bot_transfer_body` takes exactly one attempt per command and returns the error: no recovery, no
+retry, no ladder entry, no surrender. The chokepoint's `bot_clean_rings` still runs on the way out,
+so the rings are resynchronised for the next probe and for the bring-up — that is hygiene, not the
+ladder. A LUN that fails is therefore scored `FAILED` and the census moves on; if any LUN is
+`PRESENT` the device publishes exactly as the selection rule says, and only if every LUN failed does
+the pre-existing bring-up path decide. Deliberately NOT suppressed: the pump's dead-ring park
+accounting, which records ring-idle time for a device identity and is not an escalation — and which
+cannot park the device mid-bring-up either way, since the park gate is read once at
+`bring_up_storage`'s entry, before the census.
+
+**EP0 after a refused Get Max LUN (M3, F1).** `ep0_resync` mirrors all three of `resync_bulk_ep`'s
+arms, and the missing one mattered: Set TR Dequeue Pointer is legal only from Stopped or Error
+(xHCI 1.2 §4.6.10), so issuing it at a still-RUNNING EP0 — the shape a control transfer that timed
+out rather than stalled leaves behind — either returns Context State Error (19) or, since
+`dequeue_reset_target()` hands back the driver's *enqueue* index, steps the controller past a TD
+still in flight. Running now takes Stop Endpoint (§4.6.9) first, with the same `cc == 19` reading
+`resync_bulk_ep` carries (a refusal from a non-Running state IS the goal state); Halted/Error takes
+Reset Endpoint; Stopped takes neither; anything else refuses and says so.
+
+**The way back (M3, F2).** The census is default-on — it is the driver doing its job, and a knob to
+turn it on would be a knob to leave the bug in place — but it is a default-on behaviour change in a
+file both arches compile, whose only runtime evidence is QEMU's single-LUN `usb-storage`. So
+`UNAOS_NOUSBLUN=1` (cargo feature `nousblun`, the `UNAOS_NOAPSRUN=1` shape) compiles no census at
+all: Get Max LUN is never asked, `bot_lun` stays 0 for the life of every slot, `build_cbw` writes the
+same `bCBWLUN = 0` it wrote before, and the wire says `:: USBLUN: census SKIPPED ::`. It is mapped in
+`arroyo` **and** in `builder/src/main.rs` — the x86 media build re-derives its feature list from the
+environment and never reads `$KERNEL_FEATURES`, so a knob mapped in one place only ships the banner
+without the code (the `rastmc` failure); `check`'s KNOB→BUILDER WIRING CHECK enforces that for any
+feature a literal `x86-*` leg names. The armed polarity is type-checked by the `x86-nousblun` leg of
+`KERNEL_CFG_MATRIX`; every other leg covers the census-on default.
+
 **One disk, by design, for now.** If more than one LUN is PRESENT the driver says so
 (`:: USBLUN: <k> present, publishing lun=<n>; the block registry holds one USB disk ::`) and
 publishes the first. It does not publish the second: `drivers/block.rs` holds ONE USB device
