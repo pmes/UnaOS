@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scorer-ga10b4.sh — score a GA10B rung-4 capture (brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §3, §4, §10).
-#   usage: scorer-ga10b4.sh <log> [4a|4b|4c]  exit 0 = the rung's PASS arm present and STOP-check clean
+#   usage: scorer-ga10b4.sh <log> [4a|4b|4c|5a]  exit 0 = the rung's PASS arm present and STOP-check clean
 #                                             exit 1 = not present / STOP-check red   exit 2 = no verdict
 #          scorer-ga10b4.sh --selftest <real-4a+4b-log> [scratch-dir]
 #                                             the 4c go-red proof, from files: builds an expected-4c wire by
@@ -13,6 +13,12 @@
 # Bounds are the §4 table's: full 10-char `br_retcode=0x########` literals (row A), substring-exclusive
 # arm names (row B), case-sensitive `about-to-WRITE ` / `about-to-read ` with the trailing space (row C),
 # and the `post-ignition ` phase token inside the bound (row D). awk only, LC_ALL=C: control bytes.
+# orin-0912b (2026-09-12, GA10B5A): the `5a` leg — rung 5a, the vendor ignition (GA10B-RUNG5-BRIEF §5 as
+# built). PASS = `[ga10bfw] -> LOADED` exactly once, ONE `[ga10bprobe5a] verdict` line and it reads
+# `-> ACR-ACCEPTED`, announces == results, SYSTEM_OFF reached, no F1 hang. A capture with NO 5a lines is RED
+# (exit 1), not NO VERDICT: the two flown rung-4 captures are the leg's standing control and must score red.
+# The selftest gains the 5a cases (expected wire -> 0; FAIL verdict, LOADED missing, a truncated
+# about-to-WRITE -> 1; the real 4a+4b capture -> 1). The STOP check now reads all three families.
 set -u
 if [ "${1:-}" = "--selftest" ]; then
   REAL="${2:-}"; SCR="${3:-$HOME/unaos-bench/scratch/orin27/ga10b4c-logs/scorer-selftest}"
@@ -60,13 +66,37 @@ if [ "${1:-}" = "--selftest" ]; then
   run m2-no-off "$SCR/m2-no-off.log" 1
   run m3-hang "$SCR/m3-hang.log" 1
   run m4-no-complete "$SCR/m4-no-complete.log" 1
+  # The expected 5a wire (rung-5 brief §5 as built): the loader's LOADED, the two address forms' announce shape,
+  # one matched WRITE announce/result pair, the verdict; spliced before [pwrshutoff] like the 4c wire.
+  W5="$SCR/expected-5a.log"
+  awk 'index($0,"[pwrshutoff]")==0' "$REAL" > "$W5"
+  {
+    echo "[ga10bfw] file=acr-gsp.text.encrypt.bin.prod bytes=28672 sha=match pa=0x80200000 off=0x0 role=fmccode got=ceeae9ec72ef80f24c70473f9fff02588d1ab56a30d18b688469c331370ce12a"
+    echo "[ga10bfw] -> LOADED total=40192 window=0x80200000..0x80209d00 sections=3 digests_ok=3 fmccode_off=0x0 fmcdata_off=0x7000 pkcparam_off=0x9500"
+    echo "[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111678 val=0x80200000 raw_pa=0x80200000 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it"
+    echo "[ga10bprobe5a] priscv_bcr_fmccode_lo @0x678 wrote=0x80200000 read=0x80200000 raw_pa=0x80200000 form=raw held=1"
+    echo "[ga10bprobe5a] about-to-read post-ignition falcon_hwcfg2 reg=0x171100f4 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it"
+    echo "[ga10bprobe5a] post-ignition hwcfg2 lockdown=0 (raw=0x00000000) -> POSTLOCK-DROPPED"
+    echo "[ga10bprobe5a] verdict br_retcode=0x00000003 br_result=0x3 samples=2/16 lock_latched=1 post_lockdown=0 v1_readable=1 halted=0 form=raw shift=0 image_sections=3 image_digests_ok=3 -> ACR-ACCEPTED code=0x00000003"
+  } >> "$W5"
+  awk 'index($0,"[pwrshutoff]")' "$REAL" >> "$W5"
+  # Mutations: (m5) the ROM says FAIL; (m6) the loader never LOADED; (m7) the capture truncated at a 5a WRITE announce.
+  sed 's/-> ACR-ACCEPTED code=0x00000003/-> BROM-VERDICT-FAIL code=0x00000002/' "$W5" > "$SCR/m5-verdict-fail.log"
+  awk 'index($0,"[ga10bfw] -> LOADED")==0' "$W5" > "$SCR/m6-no-loaded.log"
+  awk '{print} index($0,"[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_lo"){exit}' "$W5" > "$SCR/m7-hang.log"
+  run5() { local name="$1" file="$2" want="$3" got; "$ME" "$file" 5a > "$SCR/$name.out" 2>&1; got=$?; echo "$name rung=5a expect=$want got=$got $([ "$got" = "$want" ] && echo OK || echo MISMATCH)"; [ "$got" = "$want" ] || bad=1; }
+  run5 real-4a4b-as-5a "$REAL" 1
+  run5 expected-5a "$W5" 0
+  run5 m5-verdict-fail "$SCR/m5-verdict-fail.log" 1
+  run5 m6-no-loaded "$SCR/m6-no-loaded.log" 1
+  run5 m7-hang "$SCR/m7-hang.log" 1
   echo "fixtures: $SCR"; [ $bad = 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"; exit $bad
 fi
 LOG="${1:-}"; RUNG="${2:-4a}"
 [ -s "$LOG" ] || { echo "NO VERDICT: no log"; exit 2; }
 export LC_ALL=C
 cnt() { awk -v p="$1" 'index($0,p){n++} END{print n+0}' "$LOG"; }
-last_announce() { awk '/\[ga10bprobe4/{l=$0} END{ if (index(l,"about-to-WRITE ")||index(l,"about-to-read ")) print "RED last [ga10bprobe4*] line is an announce (F1 hang): " substr(l,1,160); else print "ok" }' "$LOG"; }
+last_announce() { awk 'index($0,"[ga10bprobe4")||index($0,"[ga10bprobe5")||index($0,"[ga10bfw]"){l=$0} END{ if (index(l,"about-to-WRITE ")||index(l,"about-to-read ")) print "RED last [ga10bprobe4*|5*|fw] line is an announce (F1 hang): " substr(l,1,160); else print "ok" }' "$LOG"; }
 wa=$(cnt "about-to-WRITE "); ra=$(cnt "about-to-read "); wr=$(cnt " wrote=0x")
 echo "write_announces=$wa read_announces=$ra write_results=$wr"
 stop=$(last_announce); echo "STOP-CHECK: $stop"
@@ -101,7 +131,22 @@ case "$RUNG" in
     [ "$ra4c" -gt 0 ] && [ "$ra4c" = "$rr4c" ] || { echo "RED 4c read_announces != read_results (an announced read has no result line)"; red=1; }
     [ "$done4c" = 1 ] || { echo "RED 4c did not reach CENSUS-COMPLETE exactly once"; red=1; }
     [ "$off" -ge 1 ] || { echo "RED the flight did not reach PSCI SYSTEM_OFF"; red=1; } ;;
-  *) echo "NO VERDICT: rung must be 4a, 4b or 4c"; exit 2 ;;
+  5a)
+    loaded=$(cnt "[ga10bfw] -> LOADED"); refused=$(cnt "[ga10bfw] -> REFUSED")
+    n5a=$(cnt "[ga10bprobe5a]")
+    echo "loader: LOADED=$loaded REFUSED=$refused; [ga10bprobe5a] lines=$n5a"
+    for arm in "-> ACR-ACCEPTED" "-> BROM-VERDICT-FAIL" "-> BROM-VERDICT-PASS-UNWITNESSED" "-> BROM-NOVERDICT" "-> BCR-CTRL-REFUSED" "-> IGNITION-SKIPPED" "-> REFUSED reason="; do
+      n=$(awk -v p="$arm" 'index($0,"[ga10bprobe5a]") && index($0,p){n++} END{print n+0}' "$LOG"); echo "arm $arm = $n"; done
+    vl=$(awk 'index($0,"[ga10bprobe5a] verdict ") && index($0," -> "){n++} END{print n+0}' "$LOG")
+    acc=$(awk 'index($0,"[ga10bprobe5a] verdict ") && index($0,"-> ACR-ACCEPTED"){n++} END{print n+0}' "$LOG")
+    form=$(awk 'index($0,"[ga10bprobe5a] verdict ") && match($0,/form=[a-z0-9]+ shift=[0-9]+/){print substr($0,RSTART,RLENGTH); exit}' "$LOG")
+    off=$(cnt "PSCI SYSTEM_OFF (0x84000008) via SMC")
+    echo "5a verdict lines = $vl (must be exactly 1); ACR-ACCEPTED = $acc (must be 1); ${form:-form=? shift=?}; SYSTEM_OFF lines = $off (must be >= 1)"
+    [ "$loaded" = 1 ] || { echo "RED the loader did not print LOADED exactly once (the image is not in the window: nothing was ignited)"; red=1; }
+    [ "$vl" = 1 ] || { echo "RED no single [ga10bprobe5a] verdict line (5a not armed, refused before the ignition, or hung)"; red=1; }
+    [ "$acc" = 1 ] || { echo "RED the verdict is not ACR-ACCEPTED (a FAIL/NOVERDICT is a recorded result, not the rung's PASS; R19: failed under these conditions)"; red=1; }
+    [ "$off" -ge 1 ] || { echo "RED the flight did not reach PSCI SYSTEM_OFF"; red=1; } ;;
+  *) echo "NO VERDICT: rung must be 4a, 4b, 4c or 5a"; exit 2 ;;
 esac
 [ "$wa" = "$wr" ] || { echo "RED write_announces != write_results"; red=1; }
 [ "$stop" = ok ] || red=1

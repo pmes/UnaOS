@@ -90,21 +90,21 @@ const PG_STATE_ON: u32 = 1;
 /// `ga10bprobe3b`, the ladder's designated first-write rung; in every other configuration this is
 /// the module's only GA10B MMIO primitive.
 #[inline]
-fn r32(pa: u64) -> u32 {
+pub(crate) fn r32(pa: u64) -> u32 {
     unsafe { core::ptr::read_volatile(pa as *const u32) }
 }
 
 /// The `gpu@` node's two DTB facts this rung needs (EXT — resolved from the Orin FDT, never guessed):
 /// BAR0 physical base (`reg` entry[0]) and the BPMP power-domain id (`power-domains` [phandle, id]).
-struct GpuNode {
-    bar0: u64,
+pub(crate) struct GpuNode {
+    pub(crate) bar0: u64,
     /// The power-domain id (odd word of the [phandle, id] pair), or `None` if the node lists none —
     /// in which case the rail cannot be proven ON and NO BAR0 register may be read.
-    pd_id: Option<u32>,
+    pub(crate) pd_id: Option<u32>,
     /// The BPMP clock ids of the node's `clocks` = <&bpmp ID>... pairs (odd words), in DTB order; rung 2's
     /// MRQ_CLK list. Rung 1 ignores them.
-    clocks: [u32; 8],
-    n_clocks: usize,
+    pub(crate) clocks: [u32; 8],
+    pub(crate) n_clocks: usize,
 }
 
 /// Resolve the `gpu@` node from the live firmware DTB — a pure RAM walk, ZERO MMIO. Matches the node
@@ -112,7 +112,7 @@ struct GpuNode {
 /// (addr:2, size:2 cells) and the odd word of `power-domains` as the domain id. `None` = no usable
 /// `gpu@` node (the rung refuses rather than guessing an aperture — verify-don't-assume, the JX1
 /// rule that a wrong aperture is fatal).
-fn resolve_gpu_node(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<GpuNode> {
+pub(crate) fn resolve_gpu_node(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) -> Option<GpuNode> {
     if dtb_addr == 0 || dtb_size == 0 {
         return None;
     }
@@ -438,7 +438,7 @@ const PRI_ERROR_MASK: u32 = 0xFFF0_0000;
 /// the settle time between a power/clock MRQ and the BAR0 read. BPMP acks synchronously, so this is
 /// margin, not a protocol requirement.
 #[cfg(any(feature = "ga10bprobe2", feature = "ga10bprobe3", feature = "ga10bprobe4a"))]
-fn settle_ms(ms: u64) {
+pub(crate) fn settle_ms(ms: u64) {
     let freq: u64;
     let start: u64;
     unsafe {
@@ -460,13 +460,13 @@ fn settle_ms(ms: u64) {
 
 /// MRQ_PG GET_STATE for one domain: `Some((err, state))`, `None` = 100 ms timeout. Pure query.
 #[cfg(any(feature = "ga10bprobe2", feature = "ga10bprobe3", feature = "ga10bprobe4a"))]
-fn pg_state(chan: &super::bpmp_tegra::Chan, id: u32) -> Option<(i32, u32)> {
+pub(crate) fn pg_state(chan: &super::bpmp_tegra::Chan, id: u32) -> Option<(i32, u32)> {
     chan.transfer(MRQ_PG, &[CMD_PG_GET_STATE, id]).map(|(err, out)| (err, out[0]))
 }
 
 /// MRQ_CLK with one subcommand for one clock id: `Some((err, payload[0]))`, `None` = timeout.
 #[cfg(any(feature = "ga10bprobe2", feature = "ga10bprobe3", feature = "ga10bprobe4a"))]
-fn clk(chan: &super::bpmp_tegra::Chan, cmd: u32, id: u32) -> Option<(i32, u32)> {
+pub(crate) fn clk(chan: &super::bpmp_tegra::Chan, cmd: u32, id: u32) -> Option<(i32, u32)> {
     chan.transfer(MRQ_CLK, &[(cmd << 24) | (id & 0x00ff_ffff)]).map(|(err, out)| (err, out[0]))
 }
 
@@ -1197,7 +1197,7 @@ fn rung3b(base: u64) {
 /// configuration without rung 4 compiles a BCR write path; rung 3b's `w32` stays 3b's.
 #[cfg(feature = "ga10bprobe4a")]
 #[inline]
-fn w32_4(pa: u64, v: u32) {
+pub(crate) fn w32_4(pa: u64, v: u32) {
     unsafe { core::ptr::write_volatile(pa as *mut u32, v) }
 }
 
@@ -1211,7 +1211,7 @@ fn ignite_w32(pa: u64, v: u32) {
 
 /// End a rung-4 flight the cold-boot way (PSCI SYSTEM_OFF via `power::shutdown`). Never returns.
 #[cfg(feature = "ga10bprobe4a")]
-fn finish4(fam: &str) -> ! {
+pub(crate) fn finish4(fam: &str) -> ! {
     serial_println!("[{}] flight done — powering OFF; the dark board is the ready-for-cold-boot signal", fam);
     crate::power::shutdown()
 }
@@ -1219,7 +1219,7 @@ fn finish4(fam: &str) -> ! {
 /// `Some(reason)` when a readback is not a value: all-ones or the PRI fabric's 0xBADxxxxx pattern.
 /// Such a readback is reported `-UNREADABLE reason=…` and NEVER folded into held or not-held (brief F4).
 #[cfg(feature = "ga10bprobe4a")]
-fn unreadable_reason(v: u32) -> Option<&'static str> {
+pub(crate) fn unreadable_reason(v: u32) -> Option<&'static str> {
     if v == 0xFFFF_FFFF {
         Some("all-ones")
     } else if v & PRI_ERROR_MASK == PRI_ERROR_PATTERN {
@@ -1231,7 +1231,7 @@ fn unreadable_reason(v: u32) -> Option<&'static str> {
 
 /// The six BCR DMA address registers, in the brief's A1..A6 order (facts (b) BCR DMA addrs).
 #[cfg(feature = "ga10bprobe4a")]
-const BCR_ADDR_REGS: [(&str, u64); 6] = [
+pub(crate) const BCR_ADDR_REGS: [(&str, u64); 6] = [
     ("priscv_bcr_fmccode_lo", PRISCV_BCR_FMCCODE_LO_OFF),
     ("priscv_bcr_fmccode_hi", PRISCV_BCR_FMCCODE_HI_OFF),
     ("priscv_bcr_fmcdata_lo", PRISCV_BCR_FMCDATA_LO_OFF),
@@ -1254,7 +1254,7 @@ fn bcr_addr_values(pa: u64) -> [u32; 6] {
 /// `Ok(held)` (readback == value) or `Err(reason)` when the readback was not a value at all. Prints the
 /// announce line, then exactly one result line — so `write_announces == write_results` (brief §4 row C).
 #[cfg(feature = "ga10bprobe4a")]
-fn bcr_write_verify(fam: &str, name: &str, f2: u64, off: u64, val: u32, why: &str) -> Result<bool, &'static str> {
+pub(crate) fn bcr_write_verify(fam: &str, name: &str, f2: u64, off: u64, val: u32, why: &str) -> Result<bool, &'static str> {
     let addr = f2 + off;
     serial_println!("[{}] about-to-WRITE {} reg={:#x} val={:#010x} ({}) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it", fam, name, addr, val, why);
     w32_4(addr, val);

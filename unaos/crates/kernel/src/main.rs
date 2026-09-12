@@ -1746,7 +1746,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
         // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
         #[cfg(target_arch = "aarch64")]
-        unaos_kernel::fs::fat::piusb27_service();
+        unaos_kernel::fs::fat::piusb27_service(); #[cfg(all(target_arch = "aarch64", feature = "ga10bprobe5", feature = "witness"))] unaos_kernel::arch::ga10b_fw::fixture_service(); // GA10B-PROBE5 fixture (orin-0912b, `UNAOS_GA10B_PROBE5=1 ./arroyo test-arm`, witness only): the rung-5 firmware LOADER run on QEMU virt against the SYNTHETIC `GA10B/` + `GA10BBAD/` FAT image arroyo builds — GA10B/ must print `[ga10bfw] -> LOADED`, GA10BBAD/ must print `-> REFUSED reason=digest`. HERE because this is the storage-ready pass a headless test-arm boot reaches (the SELFHOST-2 note above) and the loader reads the stick through the VFS; the latch inside speaks once. Appended to THIS line, before the comment: knob-off it is cfg-erased and no panic `Location` below moves.
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial whenever it grows.
         // On QEMU (serial live) this makes the recorded ring — including the FTDI/block milestones that
         // land from inside this loop — verifiable in serial.log without keyboard input, the M3 proof
@@ -2539,7 +2539,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // waits still have the JM4 timer as their wake source. Metal + tegra-gated; compiled out knob-off =>
     // byte-identical to baseline. See arch_arm64.md §ORIN-INSTALL-2 and scripts/orin-sdmmc1-bench.md.
     #[cfg(all(feature = "install_target", feature = "tegra"))]
-    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb(); #[cfg(all(feature = "tegra", feature = "selfup"))] unaos_kernel::arch::selfup_tegra::selfup_service(); // ORIN-SELFUP: self-update service — same preconditions as ORIN-INSTALL-2, AFTER it so an install and an update on one boot see the media final; appended to THIS line for knob-off byte-identity (no line moves). See docs/dev/OS/10_INSTALL/orin-selfupdate.md.
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb(); #[cfg(all(feature = "tegra", feature = "selfup"))] unaos_kernel::arch::selfup_tegra::selfup_service(); #[cfg(feature = "ga10bprobe5a")] unaos_kernel::arch::ga10b_ignite::ga10bprobe5_run(dtb_addr, dtb_size, mmu.ram_gib_mask); // ORIN-SELFUP: self-update service — same preconditions as ORIN-INSTALL-2, AFTER it so an install and an update on one boot see the media final; appended to THIS line for knob-off byte-identity (no line moves). See docs/dev/OS/10_INSTALL/orin-selfupdate.md. GA10B-PROBE5A (orin-0912b): rung 5a, the VENDOR IGNITION, appended to THIS line before the comment (knob-off cfg-erased, no panic Location below moves) — HERE and not on the `sdmmc_census` line because the loader reads `/boot/GA10B/` through the VFS and `/boot` binds over the disk this kernel was found on, which is published by the SD census (slot card) OR the JB2b USB window above (reader card); after both, still EL2 (JM6 is below). Phase 0 runs now on every polarity; `=<n>d` arms the ignition for the shutdown path instead.
 
     // ORIN-UNAFS-ROOT rung 4 (arc M4): probe-mount the microSD's NATIVE unafs volume on its OWN
     // block handle — `unafs::mount_on(BlockHandle::TegraSd)`, the consumer the SDSEAM arms in
