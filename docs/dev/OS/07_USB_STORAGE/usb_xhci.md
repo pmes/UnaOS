@@ -1311,10 +1311,27 @@ retry, no ladder entry, no surrender. The chokepoint's `bot_clean_rings` still r
 so the rings are resynchronised for the next probe and for the bring-up — that is hygiene, not the
 ladder. A LUN that fails is therefore scored `FAILED` and the census moves on; if any LUN is
 `PRESENT` the device publishes exactly as the selection rule says, and only if every LUN failed does
-the pre-existing bring-up path decide. Deliberately NOT suppressed: the pump's dead-ring park
-accounting, which records ring-idle time for a device identity and is not an escalation — and which
-cannot park the device mid-bring-up either way, since the park gate is read once at
-`bring_up_storage`'s entry, before the census.
+the pre-existing bring-up path decide.
+
+**And the park, which M3 left out and M4 adds (G1).** M3's version of this section ended by saying
+the pump's dead-ring park accounting was deliberately not suppressed, because "the park gate is read
+once, at `bring_up_storage`'s entry, before the census". That was wrong in its load-bearing half,
+and the second addendum review caught it before a flight did. The gate is read at **two** sites:
+`bring_up_storage`'s own call, which does run before the census and is what refuses a device already
+parked from an earlier failure — and `bot_transfer_body`'s call at its ENTRY, i.e. on every transfer
+the census makes. That second site reads `verdict()` and ends in `bot_park_device` +
+`bot_surrender`: the exact outcome F3 exists to prevent, by a path F3 never touched. And the census
+can FEED the clause it then trips over, because a probe whose wait times out with a dead ring is
+charged to the identity's account and the number of probes is `bMaxLUN` — a device-supplied number
+up to 16, so nine unreadable slots is `dead_total = 9` against a `BOT_PARK_DEAD_MAX` of 8. Both
+halves are therefore suppressed while `USBLUN_CENSUS_ACTIVE` is set: `bot_park_gate` returns `Ok`
+without reading a verdict, and `bot_park_charge` neither opens an account nor charges one. The
+account is left exactly as real I/O left it; the bring-up's first transfer after the census consults
+it exactly as it always did. Measured, not argued: with `bMaxLUN` forced to 9 and LUNs 1..9
+dead-ringing on the QEMU stick, the pre-M4 driver printed `park account-open`, `parked=yes … dead=9`
+and `BOT: SURRENDER slot=1`, then `xHCI: storage bring-up failed: NoDevice` with no disk; the same
+mutation after M4 publishes `xHCI: Disk 'QEMU' …` from LUN 0 with zero `BOT: park` or `SURRENDER`
+tokens anywhere in the capture.
 
 **EP0 after a refused Get Max LUN (M3, F1).** `ep0_resync` mirrors all three of `resync_bulk_ep`'s
 arms, and the missing one mattered: Set TR Dequeue Pointer is legal only from Stopped or Error

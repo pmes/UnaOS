@@ -2516,10 +2516,21 @@ pub static BOT_TX_WR_SECTORS: AtomicU64 = AtomicU64::new(0);
 /// chokepoint's `bot_clean_rings` still runs on the way out, so the rings are left resynchronised
 /// for the next probe and for the bring-up — that is hygiene, not the ladder.
 ///
-/// What it deliberately does NOT suppress: the pump's dead-ring park accounting (`bot_park_charge`
-/// from `bot_transfer_once`'s timeout arm), which is an identity's standing record of ring-idle
-/// time and not an escalation. It cannot park the device mid-bring-up either way: the park gate is
-/// read once, at `bring_up_storage`'s entry, before the census runs.
+/// **AND THE PARK, which M3 wrongly left out and M4 adds (G1).** The sentence that used to stand
+/// here — "the pump's dead-ring park accounting is not an escalation, and the park gate is read
+/// once, at `bring_up_storage`'s entry, before the census runs" — was wrong in its load-bearing
+/// half, and a review caught it before a flight did. The gate is read at TWO sites, not one:
+/// `bring_up_storage`'s own call (which does run before the census, and is the one that refuses a
+/// device already parked from an earlier boot-time failure), and `bot_transfer_body`'s call at its
+/// ENTRY — i.e. on EVERY transfer the census makes. That second site reads `verdict()` and ends in
+/// `bot_park_device` + `bot_surrender`, so the park could deliver the exact outcome F3 exists to
+/// prevent by a path F3 never touched. Worse, the census FEEDS it: a probe whose wait times out
+/// with a dead ring is charged to the identity's account, and the number of probes is `bMaxLUN` —
+/// a DEVICE-SUPPLIED number up to 16. Nine unreadable slots is `dead_total = 9` against a
+/// `BOT_PARK_DEAD_MAX` of 8. So both halves are suppressed while this is set: `bot_park_gate`
+/// returns `Ok` without reading a verdict, and `bot_park_charge` neither opens an account nor
+/// charges one. The account is left exactly as real I/O left it, and the bring-up's first transfer
+/// after the census consults it exactly as it always did.
 static USBLUN_CENSUS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// REQUEST SENSE fetches issued from the runtime `Failed`-CSW path (one per Failed CSW handled).
@@ -10583,6 +10594,26 @@ impl XhciController {
     ///     makes the back-off cooperative: the caller returns to the main loop, the frame paints,
     ///     and the retry happens on a later pass instead of inside a `settle_ms` spin.
     fn bot_park_gate(&mut self, slot_id: u8) -> Result<(), BotError> {
+        // USBLUN-M4 (G1): THE CENSUS DOES NOT CONSULT THIS GATE, and this is the half of F3 that was
+        // missed. `bot_transfer_body` calls this at its ENTRY — 76 lines above the census bypass M3
+        // added — so suppressing the recovery ladder did not suppress the PARK, and the park's own
+        // `verdict()` ends in `bot_park_device` + `bot_surrender`, which is the identical outcome
+        // F3 exists to prevent: every later transfer `NoDevice`, the disk gone. The census can even
+        // FEED the clause it then trips over — `pump_until_bot_done`'s timeout arm charges a
+        // dead-ring wait per non-answering probe, and how many probes there are is `bMaxLUN`, a
+        // DEVICE-SUPPLIED number up to 16. A reader with nine unreadable slots parks itself on the
+        // eighth and loses the card in the first.
+        //
+        // Returning Ok here is not "ignore the park": it is "do not read a verdict on the evidence
+        // of a census". The account is not consulted, not updated and not cleared; the moment the
+        // census ends, the bring-up's own first transfer consults it exactly as it always did, on
+        // an account containing only what real I/O put there (see `bot_park_charge`, which stops
+        // the census putting anything there at all). A device already PARKED before the census is
+        // refused before the census ever starts — `bring_up_storage` opens with its own
+        // `bot_park_gate` call, which runs outside this flag.
+        if USBLUN_CENSUS_ACTIVE.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let id = match self.bot_ident(slot_id) { Some(i) => i, None => return Ok(()) };
         let idx = match bot_park_find(&self.bot_park, id) { Some(i) => i, None => return Ok(()) };
         if self.bot_park[idx].parked {
@@ -10765,6 +10796,20 @@ impl XhciController {
     /// ledger entry, so a healthy boot pays one 4-entry scan of `used` flags per stage and nothing
     /// else.
     fn bot_park_charge(&mut self, slot_id: u8, used: u64, dead: bool) {
+        // USBLUN-M4 (G1): a census probe never charges this account, and never OPENS one. The
+        // `dead = true` arm of `bot_park_charge` opens an account on first use, so before this the
+        // census could manufacture an identity's entire park record out of its own probing: ten
+        // LUNs, ten unanswered waits, `dead_total = 10` against a `BOT_PARK_DEAD_MAX` of 8, and a
+        // verdict waiting for the next transfer to read it. The account is meant to record what the
+        // DEVICE did to real I/O; a question the driver chose to ask is not that.
+        //
+        // The budget for the census is the census's own, and it is tighter than the park's: one
+        // INQUIRY and one READ CAPACITY per LUN, one attempt each, no retry and no ladder (see
+        // `USBLUN_CENSUS_ACTIVE`). Bounded by `bMaxLUN` <= 15 by construction, so the work this
+        // declines to meter is bounded whether or not it is metered.
+        if USBLUN_CENSUS_ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
         let id = match self.bot_ident(slot_id) { Some(i) => i, None => return };
         let idx = if dead {
             match bot_park_open(&mut self.bot_park, id) { Some(i) => i, None => return }
