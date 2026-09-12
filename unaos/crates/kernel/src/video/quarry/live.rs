@@ -1231,6 +1231,16 @@ fn launch(path: &str) -> String {
             // WINTITLE — a double-click launch names its windows exactly as `bg` does; the file
             // manager knows the path, so the window it opens carries the program's name rather than
             // the window seam's generated label. See `wm::app_name_arm`.
+            //
+            // WINTITLE-LATE — and this arm is RETROACTIVE, which is what makes it correct here at
+            // all. `spawn_user_image_bg` has already made the task runnable when it returns
+            // (`sched::spawn_user_slot` with `CPU_AUTO` — another core), so the child reaches
+            // `SYS_WIN_CREATE` before this line as often as not: render13 boot 1 sent six launches
+            // down this exact seam and only two of the six windows came out named
+            // (`docs/dev/evidence/orin27/render13-boot1-comp.log`). `app_name_arm` therefore also
+            // re-titles the windows this owner has ALREADY opened, so the launcher is not made to
+            // win a race it has no way to win from out here. Arming inside the arch spawn would
+            // narrow that window, never close it, and it is `arch/*/syscall.rs`.
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
             JOBS.lock().push(Job { pid, asid, name: String::from(path) });
             serial_println!(

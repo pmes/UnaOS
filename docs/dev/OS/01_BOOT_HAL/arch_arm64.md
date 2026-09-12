@@ -6884,6 +6884,53 @@ evidence: the tegra `sdmmc_arm` binary contains **zero** `ORIN-SDMMC-3` / `mb: C
 multi-block SD path is part of the attended Orin sitting (QEMU models no Tegra234 SDMMC). Landing:
 `review/unaos-orin-sdmmc3-LANDING.md`.
 
+#### ORIN-SDMMC-4 / SDARG — the card ARGUMENT is built checked, and a sector the card cannot express is REFUSED (ledger A57)
+
+**The defect.** Every data command in `sdmmc_tegra.rs` — CMD17, CMD18, CMD24, CMD25 — carries one 32-bit
+argument whose UNITS depend on the card: sectors on a block-addressed (SDHC/SDXC) card, **bytes** on a
+byte-addressed (SDSC) one. **Six** sites built it. Four built it as `(lba * 512) as u32`, which does not fail
+when the byte offset leaves 32 bits — it **wraps**. LBA 8,388,608 is exactly 4 GiB; times 512 that is 2^32,
+and `as u32` makes it **0**. The controller is then handed sector 0: a read returns the boot sector as if it
+were the sector asked for, and a write overwrites the boot sector, with no error at any layer. The sites were
+`read_block_at` (CMD17, `sdmmc_arm`), `write_block_at` (CMD24, `sdmmc_arm`), `read_blocks_at` (CMD18,
+`install_target`) and `write_blocks_at` (CMD25, `install_target`). The other two — `read_block_ro` (the unarmed
+CMD17 the block layer consumes) and `write_block_probe` (CMD24, the `sdmmcwrite` gap-#3 probe at the file
+tail) — already did it **checked**: the correct shape was present in the same file, twice, and had simply not
+been propagated. Two identical correct copies is the same defect one step earlier, since a seventh caller
+would have had three shapes to copy from.
+
+**The fix.** One definition: `sd_block_arg(block_addressing, lba) -> Option<u32>`, at FILE scope beside the
+CSD decode and for the same reason (`mod metal` is `tegra`-gated; this is not, so QEMU can execute it). It is
+`read_block_ro`'s expression verbatim — `lba > u32::MAX` refuses the block-addressed arm, `lba.checked_mul(512)`
+with a `<= u32::MAX` bound refuses the byte-addressed one — and **all six** sites now call it (the probe's
+own refusal string is unchanged, so its wire shape does not move). **A refusal is
+never silent:** each site prints its own `REFUSED — not addressable on this card (A57)` line naming the
+command and the LBA, so an operator sees a stop rather than wrong data. The counted forms (CMD18/CMD25)
+address the FIRST sector of the run, so a refusal at the head refuses the whole run.
+
+**The fixture, and why it runs on `virt`.** `sd_block_arg_selftest` (`witness`-gated, `:: SDARG: … ::`, one
+uncounted line, no MMIO / allocation / card) is the sibling of `csd_capacity_selftest` and runs from the same
+two places: the `not(tegra)` census witness (QEMU virt) and the metal census, so an armed metal boot certifies
+its addressing arithmetic **before** the first CMD17 rather than after a wrong sector comes back. Two positive
+vectors are each the LAST value their arm can express (`byte-last` LBA 8,388,607 ⇒ `0xffff_fe00`; `blk-last`
+LBA 4,294,967,295 ⇒ `0xffff_ffff`), because an off-by-one at the ceiling is precisely this defect class. Four
+negative controls carry the fixture: 4 GiB byte-addressed, one past it, a `u64` that overflows the multiply
+outright, and 2^32 block-addressed — without them a builder that returned a number for every input would pass.
+The wrap is **shown**, not merely refused: `wrapto=0x00000000` is what the old expression would have handed
+the controller for the 4 GiB case, computed in the fixture with an explicit `wrapping_mul`, so the number on
+the wire is the defect itself rather than a claim about it. Wire shape:
+
+```
+:: SDARG: byte-last=0xfffffe00 blk-last=0xffffffff refused=4/4 wrapto=0x00000000 -> PASS ::
+```
+
+**Scope, said plainly.** QEMU models no Tegra234 SDHCI, so nothing else in this file is runtime-testable off
+metal; the ARGUMENT MATH is, and that is the whole of what `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm`
+proves here. Go-red is by mutation of the production builder (restore the wrapping expression → `refused`
+drops → `-> FAIL`, which mbench's `DEFAULT_FORBIDS` reds). No flown boot has executed the wrapping branch —
+the bench's SS32G is SDHC and the SD02G is 2 GB, both under the ceiling — so this is a code-read fix and the
+row is ticked as such, never as flown.
+
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
 **Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's

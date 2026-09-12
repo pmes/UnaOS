@@ -689,6 +689,46 @@ impl TitleSource {
             TitleSource::Unnamed => "unnamed",
         }
     }
+
+    /// WINTITLE-LATE — the same spelling with its FIELD NAME joined on, as ONE literal:
+    /// `from=program`. Not cosmetic. A witness token is certified in the built artifact with
+    /// `LC_ALL=C grep -a -o -F` (LAWS §5), and a `"… from={}"` format string leaves only `from=`
+    /// (5 bytes) and `program` (7) in `.rodata` — neither is the token a reader greps for, and both
+    /// are short enough for LLVM to immediate-encode out. Printed through this accessor the 12-byte
+    /// token exists in the image, so *"is the wire shape reachable in this build?"* is answerable
+    /// without booting. The BYTES ON THE WIRE are identical either way: `from={}` + [`as_str`] and
+    /// `{}` + this print the same characters.
+    pub const fn as_from_str(self) -> &'static str {
+        match self {
+            TitleSource::Declared => "from=declared",
+            TitleSource::Program => "from=program",
+            TitleSource::Document => "from=document",
+            TitleSource::Unnamed => "from=unnamed",
+        }
+    }
+
+    /// WINTITLE-LATE — the code this source is stored as in [`TITLE_SRC`]. Private and arbitrary:
+    /// it never reaches a wire, an ABI or another module.
+    const fn code(self) -> u32 {
+        match self {
+            TitleSource::Unnamed => 0,
+            TitleSource::Declared => 1,
+            TitleSource::Program => 2,
+            TitleSource::Document => 3,
+        }
+    }
+
+    /// WINTITLE-LATE — [`TitleSource::code`]'s inverse, TOTAL because it reads an atomic cell:
+    /// anything unwritten answers `Unnamed`, which is the fail-closed direction (a window never
+    /// claims a provenance nobody gave it).
+    const fn from_code(v: u32) -> Self {
+        match v {
+            1 => TitleSource::Declared,
+            2 => TitleSource::Program,
+            3 => TitleSource::Document,
+            _ => TitleSource::Unnamed,
+        }
+    }
 }
 
 /// WINTITLE — the GENERATED LABEL the two arch window seams mint from their own row index when the
@@ -789,6 +829,23 @@ pub fn program_name(path: &str) -> &str {
 ///
 /// Returns whether a row holds the name (`false` = the table was full, or the name was empty, or
 /// `owner == 0`) — fail-closed: the launch is never conditioned on this succeeding.
+///
+/// ⚠ **WINTITLE-LATE — ARMING IS NOT ORDERED BEFORE THE PROGRAM'S FIRST `SYS_WIN_CREATE`, so this
+/// call is RETROACTIVE.** Every launcher arms AFTER `spawn_user_image_bg` returns, and that call
+/// makes the task runnable before it returns (`sched::spawn_user_slot` with `CPU_AUTO` places it on
+/// another core, then the launcher still stores the pid and unwinds) — so on a multi-core board the
+/// child can reach its window create first and be titled by [`mint_title`] clause 2 before clause 1
+/// has anything to find. Render13 boot 1 is the measurement: six `QUARRY-LAUNCH` of the same two
+/// ELFs down the same seam, and only two of the six windows carried a name
+/// (`[winmenu] app-menu owner=8/9 name=VUG`, the other four `name=Application` —
+/// `docs/dev/evidence/orin27/render13-boot1-comp.log`). That is a race, not a missing arm: the arm
+/// has been on the quarry seam since `6915c256`, the six ASIDs were distinct, and
+/// [`owner_of_launch`] is the identity on aarch64, so neither the key nor the table can explain a
+/// 2-of-6 split. Ordering it properly would mean arming INSIDE the arch spawn, between the slot
+/// mapping and `spawn_user_slot` — `arch/*/syscall.rs`, and still only a narrower window. So the
+/// name is made to catch up instead: [`app_name_adopt`] re-titles the owner's windows that are
+/// already open and still `Unnamed`, which closes the race from the other end and needs no arch
+/// change at all. Late or early, the operator reads the program's name.
 pub fn app_name_arm(owner: u64, path: &str) -> bool {
     let name = program_name(path).as_bytes();
     if owner == 0 || name.is_empty() {
@@ -802,7 +859,7 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
         .iter()
         .position(|e| e.owner == owner)
         .or_else(|| t.iter().position(|e| e.owner == 0));
-    match slot {
+    let armed = match slot {
         Some(i) => {
             t[i].owner = owner;
             t[i].len = len as u8;
@@ -811,6 +868,72 @@ pub fn app_name_arm(owner: u64, path: &str) -> bool {
             true
         }
         None => false,
+    };
+    drop(t); if armed { app_name_adopt(owner, &name[..len]); } armed // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The APP_NAMES guard is DROPPED first and by name: that mutex is a LEAF (see its doc), `app_name_adopt` takes `TABLE`, and a leaf held across the table acquisition would put APP_NAMES into the WINDOWS ⊃ TABLE ⊃ WRITER order that `create_inner` deliberately keeps it out of. Only on a successful arm — a full name table has nothing to adopt WITH, and re-titling rows to a name that is not in the registry would leave a caption no `mint_title` could ever reproduce.
+}
+
+/// WINTITLE-LATE — **the catch-up half of [`app_name_arm`]: title the windows `owner` ALREADY
+/// opened.** Returns how many rows took the name.
+///
+/// Only rows whose provenance is still [`TitleSource::Unnamed`] — i.e. the ones that took
+/// [`mint_title`] clause 2 because the arm had not landed when they were created. A `Declared` row
+/// is a built-in tenant naming itself and a `Document` row is a nameless document's sequence; both
+/// out-rank a launcher's guess and are left alone, so this can only ever REPLACE the generic noun
+/// [`ANON_APP`]. Compat rows are skipped for the reason they are skipped everywhere (owner 0, no
+/// chrome, nothing to caption).
+///
+/// The row is damaged whole so the chrome repaints with the new caption on the next compositor pass
+/// — the pass the program's own first present is about to drive anyway. No composite is issued from
+/// here: this runs on the launcher's stack, a print or a composite under `TABLE` is what the guard's
+/// standing rule forbids, and `winid_alloc_witness` records what an extra print on this path costs.
+fn app_name_adopt(owner: u64, name: &[u8]) -> usize {
+    let n = name.len().min(MAX_TITLE);
+    let mut adopted = 0usize;
+    let mut t = table();
+    for r in t.rows.iter_mut() {
+        if !r.used || r.compat || r.owner_asid != owner || title_source_of(r.id) != TitleSource::Unnamed {
+            continue;
+        }
+        r.title = [0u8; MAX_TITLE];
+        r.title[..n].copy_from_slice(&name[..n]);
+        r.title_len = n;
+        r.damage_all();
+        title_source_store(r.id, TitleSource::Program);
+        adopted += 1;
+    }
+    adopted
+}
+
+/// WINTITLE-LATE — **where a live window's title PROVENANCE lives**, one cell per window id
+/// (`id = slot + 1`, [`create_inner`]'s minting rule, so cell `id - 1`).
+///
+/// Beside the table rather than in them, and LOCK-FREE, for one caller's sake:
+/// [`super::winmenu::set_app_window`] prints the bar's app title and now prints its `from=` with it,
+/// and it runs INSIDE `strip::compose_all` under the contract "lock-free stores only, no composite".
+/// A `TABLE` acquisition there would be a new lock on the compose path — the exact shape PANEL V-1
+/// and that function's own doc refuse. An atomic cell is written where the caption is written (under
+/// the table guard, in [`create_inner`] and [`app_name_adopt`]) and read with a relaxed load by
+/// anyone, which is what the witness needs and all it needs.
+///
+/// A closed id's cell is left as it was: it is rewritten by the next [`create_inner`] into that slot
+/// — the same "the id demonstrably names something new" point `controls_declined_rearm` and WC-D's
+/// latch use — so no reader can see a dead tenant's provenance under a live one's id.
+static TITLE_SRC: [core::sync::atomic::AtomicU32; MAX_WINDOWS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_WINDOWS];
+
+/// WINTITLE-LATE — publish `id`'s title provenance. Called only where `id`'s caption is written.
+fn title_source_store(id: WinId, src: TitleSource) {
+    if let Some(cell) = TITLE_SRC.get((id as usize).wrapping_sub(1)) {
+        cell.store(src.code(), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WINTITLE-LATE — **why window `id` is called what it is called.** Lock-free; see [`TITLE_SRC`].
+/// An id outside `1..=MAX_WINDOWS` (including [`WIN_NONE`]) answers `Unnamed`, the fail-closed value.
+pub fn title_source_of(id: WinId) -> TitleSource {
+    match TITLE_SRC.get((id as usize).wrapping_sub(1)) {
+        Some(cell) => TitleSource::from_code(cell.load(core::sync::atomic::Ordering::Relaxed)),
+        None => TitleSource::Unnamed,
     }
 }
 
@@ -5272,7 +5395,7 @@ fn cash_tail(owed: Owed) {
     // serial line here cannot inflate `pass_us`. Spends itself on the first pass that finds a staged
     // buffer (see `physwit_once`); every pass after that is one relaxed load.
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-    physwit_once();
+    physwit_once(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_oom_latch_selftest(); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -7873,10 +7996,10 @@ fn verify_reference(
     // restructuring — the owed-tail milestone's scope, not this one's.
     let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want.try_reserve_exact((row1 - row0) * cols).is_err() {
-        serial_println!(
+        if wcd_oom_say(i) { serial_println!(
             "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
             r.id, cols, row1 - row0
-        );
+        ); } // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL rewrite, 4 lines in and 4 out. LATCHED per window id: the FIRST OOM skip a window takes speaks, every later one only COUNTS, into `[comp2] wcd_skips=`. The hand-back four lines down is correct and is kept — but it is also what turned this from "one line per window, ever" into one line per PASS, and render13 boot 1 put 46 161 copies of it on a 115 200-baud wire (68 B each = 3.14 MB = ~36 % of that boot's entire 767 s UART budget). A producer that outruns the UART fills the 64-slot staging ring (`serial_ring::SLOTS`), and the ring is drained IRQ-MASKED and INLINE by whichever core prints next — here, the compositing core itself, from inside the blit loop. That is the drag stall: see the WCDFLOOD block at this file's tail for the byte arithmetic and the wire that convicts it.
         // RECORDED FOR THE PI4 WIRE: this changes aarch64 LINE COUNT even though no format changes.
         // Before, the OOM path claimed and the SKIP was terminal — one line per window, ever. Now the
         // window is handed back, so a window that hits this transiently emits a `-> SKIP (no memory)`
@@ -13337,7 +13460,7 @@ fn comp2_emit(span: u64) {
             .saturating_div(span_us)
     };
     serial_println!(
-        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} wcd_us={} util_pct={} rate={}.{}/s span={}ms",
+        "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} wcd_us={} wcd_skips={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
         super::wcg::cycles_to_us(max_cyc),
@@ -13363,7 +13486,7 @@ fn comp2_emit(span: u64) {
         super::wcg::cycles_to_us(straddle_cyc),
         // COMP2-WCD — also a TOTAL: the field exists to name a one-pass spike, and a mean would
         // dilute it by the span's healthy passes. See [`C2_WCD_CYC`].
-        super::wcg::cycles_to_us(wcd_cyc),
+        super::wcg::cycles_to_us(wcd_cyc), C2_WCD_SKIPS.swap(0, Relaxed), // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL fold onto the `wcd_us=` argument, beside the field whose BLINDNESS this one repairs. A span TOTAL, like `wcd_us=` and for the same reason. It sits next to `wcd_us=` deliberately: `wcd_us` is charged by a drop guard inside `verify_window` ONLY, so it is structurally blind to `verify_reference` — which is where the OOM skip is taken, inside the blit loop, charged to `blit_us`. render13 boot 1 therefore read `wcd_us=0` against `max_us=617554` on 121 of 166 rollups and the ledger's own rule ("`wcd_us` ≈ 0 with the same spike convicts the compositor") acquitted the real culprit. `wcd_skips=` is what makes that reading falsifiable from the line itself.
         util_pct,
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
@@ -23452,7 +23575,7 @@ fn create_inner(
     }
     // WINTITLE — the row is born with the MINTED title, never the caller's bytes. See `TitleSource`.
     row.title_len = minted_len;
-    row.title[..minted_len].copy_from_slice(&minted[..minted_len]);
+    row.title[..minted_len].copy_from_slice(&minted[..minted_len]); title_source_store(id, title_src); // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The provenance is published WITH the caption and under the same guard, so `title_source_of` can never name a clause the row's bytes did not come from. It is stored for EVERY create, including a recycled slot, which is what keeps a dead tenant's `from=` from surviving under a live id.
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
     // and the `composite` below paints it exactly once, where it stays.
     if let Some((x, y, scale)) = placed {
@@ -23497,7 +23620,7 @@ fn create_inner(
         // WC-D — the STATE cell is the one that actually re-arms the window; the two bitmasks above
         // are published flags derived from it. Reset last, so no core can observe a cleared mask
         // against a stale state.
-        WCD_STATE[id as usize].store(WCD_ST_FIRST, core::sync::atomic::Ordering::Release);
+        WCD_STATE[id as usize].store(WCD_ST_FIRST, core::sync::atomic::Ordering::Release); WCD_OOM_SAID[id as usize].store(0, core::sync::atomic::Ordering::Relaxed); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The OOM-skip latch travels with the verdict latches for the reason the block's own header gives: a recycled id names a DIFFERENT window, and a new tenant that cannot allocate its snapshot must be able to say so once. The ODOMETER (`C2_WCD_SKIPS`) is deliberately NOT reset — it is a span total drained by `comp2_emit`, not a per-id one, and the same "budget is per boot, verdict is per tenant" split `WCD_ABORTS` is left un-cleared for.
         // WC-D/PAYGO — `WCD_SAID` travels with them. It is the "this window's census-opening line has
         // been spoken" latch, and leaving it set would let a NEW tenant's first decline fall through
         // to the 2 s cadence gate — silently breaking the guarantee `WCD_SAID`'s own note makes, that
@@ -26610,6 +26733,10 @@ fn winid_selftest() {
 /// * **LEG 6** — a declared name survives verbatim, and the document form is recognised as such.
 /// * **LEG 7** — the wiring: a real [`create`] over a seam label puts the minted title in the ROW
 ///   the compositor draws from, not merely in a helper's return value.
+/// * **LEG 8** — **the defect render13 measured.** The arm lands AFTER the window exists — the
+///   order `spawn_user_image_bg` actually produces — and the window must STILL end up named.
+///   RED on the base of this arc, where four of six launched windows kept `Application` for the
+///   whole boot. See [`app_name_arm`] for why the race exists and [`app_name_adopt`] for the catch-up.
 ///
 /// `witness`-gated and NOTHING else — exactly like [`closemin_selftest`], whose call site it shares.
 /// The furniture cross-gate the first draft carried (`wc` on x86, `desktop_firmware` on aarch64) was
@@ -26705,6 +26832,38 @@ fn wintitle_selftest() {
     let (fn_, fs) = mint_title(ASID_T, b"el0 win 5", &mut buf);
     let forget_ok = fs == TitleSource::Unnamed && &buf[..fn_] == ANON_APP;
 
+    // LEG 8 — **WINTITLE-LATE: the render13 ORDER.** Legs 4 and 7 arm and then create, which is the
+    // order the code was written for and NOT the order the metal produced: `spawn_user_image_bg`
+    // makes the task runnable before it returns, so the child can reach `SYS_WIN_CREATE` while the
+    // launcher is still unwinding to its `app_name_arm`. Four of six launches lost that race on
+    // render13 boot 1 and their windows read `Application` for the rest of the boot. This leg drives
+    // the LOSING order deliberately — create first, arm second — and requires the window to end up
+    // with the program's name anyway. It is a MEASUREMENT and not a tautology because the pre-state
+    // is asserted: the row must actually be `Unnamed` before the arm, or the leg is proving nothing.
+    //
+    // A full table is a SKIP, on LEG 7's rule and for its reason.
+    let wl = create(ASID_T, sa, len, 8, 8, 32, b"el0 win 7");
+    let late_ok: Option<bool> = if wl == WIN_NONE {
+        None
+    } else {
+        let unnamed_first = title_source_of(wl) == TitleSource::Unnamed && {
+            let t = table();
+            let v = row(&t, wl).is_some_and(|r| r.title[..r.title_len] == *ANON_APP);
+            drop(t);
+            v
+        };
+        // The arm lands LATE — after the window exists. Nothing else is done to the row.
+        let armed_late = app_name_arm(ASID_T, "/apps/VUG.ELF");
+        let t = table();
+        let named = row(&t, wl).is_some_and(|r| r.title[..r.title_len] == *b"VUG");
+        drop(t);
+        // And the PROVENANCE catches up with the caption, or `[winmenu] app-menu … from=` would go
+        // on saying `unnamed` under a name that is anything but.
+        Some(unnamed_first && armed_late && named && title_source_of(wl) == TitleSource::Program)
+    };
+    close(wl);
+    app_name_forget(ASID_T);
+
     let ok = pn_ok
         && doc_ok
         && label_ok
@@ -26712,9 +26871,10 @@ fn wintitle_selftest() {
         && noseq_ok
         && decl_ok
         && row_ok != Some(false)
-        && forget_ok;
+        && forget_ok
+        && late_ok != Some(false);
     serial_println!(
-        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} {} ::",
+        ":: WINTITLE: program_name={} document={} label={} seam=\"{}\" program={} no-seq={} declared={} row={} forget={} late-arm={} {} ::",
         pn_ok as u8,
         doc_ok as u8,
         label_ok as u8,
@@ -26728,6 +26888,11 @@ fn wintitle_selftest() {
             None => "skip",
         },
         forget_ok as u8,
+        match late_ok {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "skip",
+        },
         if ok { "PASS" } else { "FAIL" }
     );
     composite();
@@ -27874,4 +28039,203 @@ fn compgate_cyc_per_us() -> u64 {
 #[inline]
 fn compgate_cyc_to_us(_dt: u64) -> u64 {
     0
+}
+
+// ---- WCDFLOOD (SO29/SO30) — the drag stall is a BYTE COUNT, and this is where its bytes came from --
+//
+// ## The reading that convicts it, from render13 boot 1 (docs/dev/evidence/orin27/render13-boot1-comp.log)
+//
+// Peter: "mousing/dragging not smooth". The wire, over 166 `[comp2]` rollups spanning 766.9 s and
+// 277 570 composite passes, 121 of them carrying a pass over 100 ms:
+//
+// ```text
+//   [comp2] rollup passes=2564 pass_us=1835 max_us=617554 sprite_us=55 wait_us=3 blit_us=1483
+//           compose_us=836 present_us=190 cache_us=96 … wcd_us=0 util_pct=86 span=5001ms
+//   [wc-h]  … torn=0 stalls=0 longpres=0 declines=0 decl_lock=0 blitnet=[…no slot above 1…]
+//           maxpresent_us≤7667  (all 329 rollups)
+//   [pstrip] rollup … gapmax=2959ms  (against period=250ms)
+//   [serial] dropped 5331 lines in 192 events (staging ring full, depth 64)
+// ```
+//
+// Four exclusions, each arithmetic rather than argued, and all four from the numbers above:
+//
+//   1. **Not the present.** `[wc-h] maxpresent_us` never exceeded 7 667 us on any of 329 rollups and
+//      `longpres` was 0 on every one. The half of the pass that actually moves pixels to the panel is
+//      bounded at 1.2 % of `max_us`.
+//   2. **Not the sprite tail.** `sprite_us` is a per-pass MEAN, so the span's WHOLE sprite cost is
+//      `sprite_us * passes` = 55 x 2564 = 141 020 us — less than `max_us` alone. A single 617 ms pass
+//      cannot fit inside it.
+//   3. **Not the compositor gate (A46/COMPGATE).** `torn=0`, `declines=0`, `decl_lock=0`,
+//      `blitnet` with no slot above 1, on all 329 rollups: the gate held and no pass fell to
+//      `draw_window`'s direct path. A46's own falsifier reads clean.
+//   4. **Not WC-D's read-back either — and `wcd_us=0` is NOT evidence that it was not.** `C2_WCD_CYC`
+//      is charged by a drop guard inside [`verify_window`] and nowhere else. The OOM skip is taken in
+//      [`verify_reference`], which runs INSIDE the blit loop, before `wcg::begin` — so its cost lands
+//      in `blit_us` and its LINE COUNT lands nowhere at all. The ledger rule at [`C2_WCD_CYC`]
+//      ("`wcd_us` ≈ 0 with the same spike convicts the compositor") was therefore reading a field
+//      that is structurally blind to the site that was printing. `wcd_skips=` closes that.
+//
+// ## What is left, and it fits to within 1 %
+//
+// `max_us` is a BYTE COUNT. The Jetson's UART is 115 200 8N1 = 11 520 B/s = 86.8 us per byte
+// (`arch/aarch64/serial.rs`, "we INHERIT that setup"; the 11 520 B/s figure is that file's own).
+// `_print` there runs its whole body inside `crate::arch::without_interrupts`, and the core that wins
+// `SERIAL_PORT.try_lock()` first DRAINS the staging ring — up to `serial_ring::SLOTS` = 64 whole
+// lines, bounded by `drain_into`'s `guard > SLOTS` — byte by byte, IRQ-MASKED, before it writes its
+// own line. Nothing in that path is deferred and nothing is asynchronous.
+//
+// ```text
+//   64 slots x 68 B (this line, exactly) = 4 352 B  ->  377.8 ms
+//   observed steady-drag minimum  max_us = 375 061 us  ->  4 321 B      (0.7 % low)
+//   observed maximum              max_us = 617 554 us  ->  7 114 B      (a ring holding a few of
+//                                                                        the ~700 B [wc-h] rollups)
+// ```
+//
+// The whole observed spike band 375 061..617 554 us is one ring-drain wide. `[pstrip] gapmax=2959ms`
+// against a 250 ms period is the same wall seen from the timer's side: the strip's tick cannot land
+// while a core sits IRQ-masked in that drain, and it missed up to twelve periods.
+//
+// ## Why the ring was full: this line, 46 161 times
+//
+// WCD-TEARDOWN made the OOM skip hand the window BACK (`wcd_unwind`) instead of sealing it, which is
+// correct — an allocation failure is a property of one instant, not of the row — but it also turned a
+// terminal one-line SKIP into one line per PASS. Boot 1 emitted 46 161 of them: 68 B each = 3.14 MB
+// against a 766.9 s x 11 520 B/s = 8.83 MB total wire budget for the entire boot. **One witness line
+// consumed ~36 % of everything the machine could say.** That is what fills a 64-slot ring, and a full
+// ring is what makes the next print a 378 ms IRQ-masked drain on whatever core issues it — which,
+// from [`verify_reference`], is the compositing core, inside its own blit loop, inside the pass
+// `[comp2] max_us` is measuring.
+//
+// ## What this block does, and what it deliberately does NOT
+//
+// It latches the LINE, per window id: first skip speaks, the rest count into `[comp2] wcd_skips=`.
+// That removes ~36 % of the boot's UART load and with it the only producer in the tree fast enough to
+// keep a 64-slot ring saturated. It does NOT bound `max_us`: any sufficiently chatty span can still
+// assemble a full ring, because the transport's drain is unbounded-by-design at the point of use.
+// Bounding it means changing `arch/aarch64/serial.rs` or `serial_ring.rs` — neither of which this
+// brief names — and the shape is recorded on LEDGER SO29 rather than shipped here.
+
+/// WCDFLOOD (SO30) — per-id: "this window has already spoken its OOM `-> SKIP`". Re-armed with the
+/// other per-tenant WC-D latches at the recycle site, never at close; see the append there.
+///
+/// A separate cell from [`WCD_STATE`] on purpose: the state machine says what verdict the window
+/// still OWES, and the answer to that is legitimately "the full one, still" on every pass an
+/// allocation fails — that is exactly what `wcd_unwind` is for. This says only whether the FACT has
+/// been put on the wire once, which is a different question and must not be answered by re-purposing
+/// a cell the battery needs.
+#[cfg(feature = "witness")]
+static WCD_OOM_SAID: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WCDFLOOD (SO30) — the ODOMETER the latch replaces the lines with: OOM skips taken this span, drained
+/// by [`comp2_emit`] onto `[comp2] wcd_skips=`. A span total, like `wcd_us=` and `straddle_us=`.
+///
+/// Drained rather than cumulative because the question it answers is "was this span's `max_us` spike
+/// accompanied by the flood" — a lifetime total cannot be read against one rollup's spike, and every
+/// other alarm field on that line is already a span quantity.
+#[cfg(feature = "witness")]
+static C2_WCD_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// WCDFLOOD (SO30) — count one OOM skip; answer whether this one is the window's first, i.e. whether
+/// it may speak.
+///
+/// The odometer is bumped on EVERY call including the spoken one, so `wcd_skips=` is the honest count
+/// of the event and not of the silences: a reader must be able to add the line and the field and get
+/// the total, which is the property the census fields elsewhere in this file are built on.
+///
+/// `compare_exchange`, not a load-then-store: two cores can be inside `verify_reference` for two
+/// different windows at once, and on aarch64 presents demonstrably overlap (`[fluid3] depth_max`), so
+/// a read-modify-write here would let one id speak twice.
+#[cfg(feature = "witness")]
+fn wcd_oom_say(i: usize) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    C2_WCD_SKIPS.fetch_add(1, Relaxed);
+    if i >= WCD_IDS {
+        return false;
+    }
+    WCD_OOM_SAID[i]
+        .compare_exchange(0, 1, core::sync::atomic::Ordering::AcqRel, Relaxed)
+        .is_ok()
+}
+
+/// WCDLATCH (SO30) — the fixture, and it proves the property on the WIRE as well as in the counters.
+///
+/// Two synthetic ids are driven through [`wcd_oom_say`] `CALLS` times each, emitting the REAL literal
+/// through the latch every time it grants. Three claims, and the verdict carries all three:
+///
+///   * `said == ids` — the latch granted exactly once per window id. This is the claim; everything
+///     else is the denominator it is read against.
+///   * `counted == ids * CALLS` — the odometer took every skip, spoken and silent. A latch that
+///     silenced the line AND lost the count would pass the first claim and be worthless.
+///   * the wire itself — `awk 'index($0,"SKIP (no memory")'` over the run's `target/serial.log`
+///     tallies exactly one line per `win=`, which is the gate's own wording and is checkable from the
+///     log without trusting any counter in this file.
+///
+/// Ids 30 and 31 are used because `WCD_IDS` is 32 and the test boot's live rows occupy the low ids;
+/// the latch cells are cleared first so a recycle that already touched them cannot flatter the run.
+///
+/// go-red: make [`wcd_oom_say`] answer `true` unconditionally (the pre-latch behaviour) and this reads
+/// `said=48 want_said=2 -> FAIL`, with 24 copies of the literal per `win=` on the wire. `-> FAIL` is in
+/// `arroyo`'s `FAULT_PATTERNS`, so the run reds on the text as well as on the verdict.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
+pub fn wcd_oom_latch_selftest() {
+    use core::sync::atomic::Ordering::Relaxed;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    const IDS: [usize; 2] = [30, 31];
+    const CALLS: u32 = 24;
+    let before = C2_WCD_SKIPS.load(Relaxed);
+    let mut said = 0u32;
+    for &i in IDS.iter() {
+        WCD_OOM_SAID[i].store(0, Relaxed);
+        for n in 0..CALLS {
+            if wcd_oom_say(i) {
+                said += 1;
+                // The literal, character for character with `verify_reference`'s, so the wire tally
+                // in the doc block above is a tally of the SHIPPING line and not of a fixture's copy.
+                serial_println!(
+                    "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
+                    i,
+                    8 * (n + 1),
+                    8
+                );
+            }
+        }
+    }
+    let counted = C2_WCD_SKIPS.load(Relaxed).saturating_sub(before);
+    let want_said = IDS.len() as u32;
+    let want_counted = IDS.len() as u64 * CALLS as u64;
+    // The fixture's own skips are given back so they do not ride a live `[comp2] wcd_skips=` and read
+    // as a real flood to anyone scoring the boot. `fetch_sub` and not a `store` of `before`: a store
+    // would also discard any increment a concurrent compositor took while this loop ran, which is the
+    // instrument corrupting the quantity it reports.
+    C2_WCD_SKIPS.fetch_sub(counted, Relaxed);
+    let ok = said == want_said && counted == want_counted;
+    serial_println!(
+        ":: WCDLATCH: ids={} calls={} said={} want_said={} counted={} want_counted={} -> {} ::",
+        IDS.len(),
+        CALLS,
+        said,
+        want_said,
+        counted,
+        want_counted,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+/// APPPIN — the compose-through offer counters as `dock::apppin_selftest` reads them:
+/// `(passes, planned, nohit)`, cumulative from boot (the raw cells `cursor12_rollup` windows). The
+/// fixture takes a snapshot, parks the sprite over the relaunched shell window, presents it, and
+/// reads the deltas — `planned` must move and `nohit` must not, which is the LOST POINTER of render13
+/// boot 1 (`[cursor12] offer … -> nohit` after the old shell re-mint) stated as a gate. Witness-only,
+/// like the cells it reads; appended at the file tail so nothing above it moves.
+#[cfg(feature = "witness")]
+pub fn cursor12_offer_counts() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        CUR12_PASSES.load(Relaxed),
+        CUR3_PLANNED.load(Relaxed),
+        CUR12_NOHIT.load(Relaxed),
+    )
 }
