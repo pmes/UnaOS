@@ -245,7 +245,10 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   census yourself or name it as the executor's. Absence of signal is not "still running": inspect
   before reporting agent status.
 - **Approval:** new lines, lanes, campaigns and design verdicts need Peter's go, asked the moment
-  they arise. The natural next arc within an approved direction spawns by default. In a metal tight
+  they arise. The natural next arc within an approved direction spawns by default. **On the GPU
+  line (R53, Peter 2026-09-12) the session never stops to ask: it builds the next rung and the one
+  after, and halts only where a download or a metal boot is needed — those are Peter's.**
+  Enforcer: R53. In a metal tight
   loop the loop is the approval (fixes, instruments, next rungs); destructive boots and new lanes
   need a fresh go. Direction sketched in conversation is captured as ideas for his review, never
   operationalised into sessions or briefs he did not ask for (Peter 2026-08-25). Budget discipline:
