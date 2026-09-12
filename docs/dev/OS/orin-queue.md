@@ -6,13 +6,15 @@ and a session ends when the work is done or when it is not worth continuing.
 `✓` = verified in this tree.  `·` = inherited, NOT re-checked.  Re-derive every sha before acting.
 Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51); tear and unafsroot still uncommitted in their orin26 worktrees.
 
-## STATE — re-derived 2026-09-11T16:36Z against origin, not relayed
-✓ origin/main 084b79ac · origin/hw-jetson 44218ab4 · origin/hw-rmbp 02a6896a · origin/hw-pi4 98914795
-✓ hw-jetson 0 behind trunk, 0 unpushed. The three-way sync is DONE (it needed four steps, not three).
-⚠ **exec-orin24-fold `63654d93` is GATED GREEN and UNPUSHED** — 54 above hw-jetson: the render13 base
-  merged with both landings, four conflicts resolved by provenance, and the first gate that branch
-  has ever had. Also unpushed: exec-orin25-shotverb `edf8483a` (WIP, does not compile, preserved).
-  Push line: `git push origin hw-jetson exec-orin24-fold exec-orin25-shotverb`
+## STATE — re-derived 2026-09-12T01:0xZ by orin 27 (local), not relayed
+✓ origin/main 084b79ac · origin/hw-jetson 277e2cab · origin/hw-rmbp 73d9d361 · origin/hw-pi4 153c78dd
+✓ LOCAL, UNPUSHED: main 50d35cbf (R45-R48 + LAWS + docs/dev/QUEUE.md, the trunk queue) · hw-jetson 059db935
+  (f2794266 rung 4 flown + the unafsroot fold) · hw-pi4 3c102d2a (pi-queue.md) · hw-rmbp dc1cc3a2 (rmbp-queue.md) ·
+  exec-orin26-unafsroot 5984c69c (merged) · exec-orin27-ga10b4c (cut at f2794266, executor live) · exec-orin26-tear (executor live).
+  Push line: `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin24-fold exec-orin25-shotverb`
+✓ Fold gate on 059db935 running (check tegra / check plain / esp-jetson → ~/unaos-bench/scratch/orin27/fold-059db935/rc.txt).
+✓ Landing order (R45, plan of 2026-09-11): rmbp → pi → jetson into main, then main into all three. Review panels for rmbp and pi are running.
+✓ R46: one focus (orin), ALL LANES, no owner, no support seat, no lane grants. R47: Opus executors, Fable for key tasks only. R48: adversarial handoff.
 
 ## RENDER13 IS HELD — Peter 2026-09-11
 ✓ Specified as fold + core0 + el0slot + mem + tear + unafsroot. Measured: core0/el0slot/mem are at
