@@ -705,9 +705,9 @@ pub fn onecard_witness() {
         Err(e) => alloc::format!("absent ({:?})", e),
     };
 
-    // The USB census. `usb_info()` is one mutex read of `USB_BLOCK_DEVICE` — no probe, no wait. At
-    // this point in the boot xHCI has not enumerated, so `absent` here is a statement about the boot
-    // SEQUENCE (nothing USB was needed to get this far), not a claim that none will ever appear.
+    // The USB census. `usb_info()` is one mutex read of USBREG entry 0 (`USB_DISKS[0]`) — no probe,
+    // no wait; a second card is reached with `usb_info_ix`. At this point in the boot xHCI has not
+    // enumerated, so `absent` is about the boot SEQUENCE, not a claim that none will ever appear.
     let usb = match crate::drivers::block::usb_info() {
         Some(u) => alloc::format!("present ({} blocks)", u.num_blocks),
         None => alloc::string::String::from("absent"),

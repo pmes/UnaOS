@@ -5340,8 +5340,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
             // hosts unafs + the FAT boot partition) AND, when present, the USB stick (its own geometry from
-            // `USB_BLOCK_DEVICE`, plus the FAT type/size/label read from the live read-only mount). x86 keeps the
-            // single-device report below (its one block device IS the USB stick).
+            // `usb_info()` = USBREG entry 0, plus the FAT type/size/label read from the live read-only mount).
+            // x86 keeps the single-device report below (its one block device IS the USB stick).
             #[cfg(target_arch = "aarch64")]
             {
                 match crate::drivers::block::info() {
