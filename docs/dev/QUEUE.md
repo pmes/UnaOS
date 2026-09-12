@@ -37,6 +37,7 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 ## 2. INPUT AND USB — shared xHCI/EHCI
 · A41 / B44  keyboard report loss: SET_IDLE 0 + one outstanding interrupt-IN TRB (both arches; the N-TD fix is the real one)
 · S1 / S2  hubs fail status-change endpoint configure; hub-attached pointers print vid:pid 0000:0000
+· USB mass storage holds ONE device: `drivers/xhci/mod.rs` keeps a single `storage_slot`, overwritten by whichever mass-storage device configures LAST (`Endpoints Configured … Storage ready`), and every render12 boot configured exactly one even with two readers attached (S1 class: hub enumeration). Two readers on the bench = a coin flip for which one is the disk. Fix shape: per-slot storage state and the registry array below; until then ONE reader per boot (Peter's bench, 2026-09-12)
 · USB mass storage: the multi-LUN census and first-present selection are DONE (USBLUN, orin-ledger A56, on hw-jetson for the next landing). LEFT: the block registry holds ONE USB disk (`drivers/block.rs` `USB_BLOCK_DEVICE`/`BLOCK_DEVICE` are single slots; `fs/bootdisk.rs` walks them) so a reader with two cards publishes one — a registry design change: a small array with per-device handles, unpublish keyed on (slot, lun), the bootdisk walk iterating it
 · S30  pointer path has no press-recovery accounting
 · S29  no board owns a serial RECEIVE path (Orin: SPE/TCU mailbox; x86: FTDI bulk IN never driven — the x86 half is rmbp's)
