@@ -71,6 +71,7 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 · B95  the x86 spec files are run by no `arroyo` verb; `orin-specscore.py` and `mbench --self-test` likewise
 · S16  106 ordering invariants, 99 in comments enforced by nothing — check them in code, one file per arc
 · S13  `[u7stk]` probe has no reachable caller outside `u7_launcher`
+· `media-writer.sh --src`: no preflight that the staged tree FITS the target FAT, and a failed copy leaves the card mounted with a partial file (orin 27, 2026-09-12: a 640 MiB card image staged inside the tree filled the 127 MiB volume) — add C14 fits-the-volume and unmount-on-failure
 · scorer STAMP-MATCH leg (wire `sha=` == card elf stamp); `media-writer.sh` is un-versioned (B97)
 · SR5  R24/R25/R26 double-booked across seats and the gate cannot see it (seat-prefix RULINGS ids)
 · Queues into `ledger-check.sh`: this file and the three track queues are gated by nothing yet (LAWS §3 Queues, warning only)
