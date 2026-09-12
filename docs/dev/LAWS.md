@@ -38,23 +38,19 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 - **One trunk, `main`. Three tracks:** `hw-rmbp` (`../UnaOS-rmbp`, x86 2012 rMBP), `hw-pi4`
   (`../UnaOS-hw-pi4`, Pi 4), `hw-jetson` (`../UnaOS-orin`, Jetson Orin Nano). Trunk worktree
   `../UnaOS`. No integrator seat (Peter 2026-08-18); the tracks coordinate over ccd.
-- **One track holds the focus each week; only Peter says whose week it is.** The focus track is the
-  only track running executors. Within a week the focus pivots to `hw-rmbp` whenever Peter leaves the
-  bench, because the rMBP is a laptop and travels: x86 metal is live wherever he is, the Orin and Pi
-  stay home. A trip round is the full x86 track including metal plus the platform-agnostic backlog.
-  On his return all platforms resync; land merge-ready, never boot-pending (Peter 2026-08-26).
+- **One focus per session, named by Peter; the session is ALL LANES** (R46, Peter 2026-09-11: "you are all
+  lanes. there is no owner of anything. it's just work on the OS" / "there will still be a overarching focus per
+  session such as orin for this one"). The focus names the board whose metal this session flies and the track
+  branch it commits on; it does not fence files, subsystems or the other tracks' queues. Retired by R46 on
+  2026-09-11: the weekly focus track, the travel pivot to `hw-rmbp`, and the support seat. Enforcer: R46.
 - **The focus is inherited, never re-asked** (Peter 2026-09-06). A new session reads its own last
   close and the bench; if they agree, start on turn one. Ask only when they conflict. The focus comes
   from Peter in your own session; a baton is an owed list, never an assignment and never evidence
   about another seat (Peter 2026-08-25; R37). **Never read another seat's baton, for anything**
   (Peter 2026-09-08). Enforcer: R37; `orin-open.sh` ends in START.
-- **A support seat spawns nothing and reports nothing** (Peter 2026-08-25, 2026-09-06). Zero
-  executors, arcs, gates, batteries, measurements; its whole product is grants, verification and
-  answers, and those never pause. Producing work in order to relay it is starting jobs. Something
-  that needs an executor goes to Peter, never to the focus seat for authorisation. A stop on starting
-  jobs is not a stop on being support; leaving a peer blocked is a second failure. A support seat
-  syncs trunk in post-metal windows and prints `rev-list --count HEAD..origin/main` in its state line
-  (pi 9 2026-09-08: two thirds of the fleet drifts by construction otherwise).
+- **There is no support seat** (R46, 2026-09-11). The bullet that stood here ("a support seat spawns nothing and
+  reports nothing", Peter 2026-08-25/2026-09-06) is retired, not deleted: its history is in git. A session syncs
+  trunk at arc boundaries and prints `rev-list --count HEAD..origin/main` in its state line. Enforcer: R46.
 - **Only Peter closes a seat.** `isArchived` is the flag; `isRunning:false` and a baton's "closed"
   are not evidence (2026-08-31).
 - **Never set the session title, and never tell an executor to** (Peter 2026-08-21).
@@ -75,11 +71,14 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 ## 2. Batons and handoff
 
-- **Baton header, three lines, replacing the old self-replicating block:** (1) read
-  `docs/dev/LAWS.md`; (2) read this baton, then the track resume it names, then the doc it names;
-  (3) one arc per session. Everything else in a baton is arc content: scope, state with shas, the
-  job in order, the batched push line, peers, what went wrong. The title is the truth at the moment
-  of writing and is marked STALE the moment its plan changes (R37 incident).
+- **The handoff is adversarial, not a rule list** (R48, Peter 2026-09-11: "give each new session a new point of
+  view... here's what you're taking over. here's what i did and it was this or that but maybe something is being
+  missed"). Each close writes ONE handoff (`~/.claude/plans/unaos/batons/<track>-<n>.md`, corpus kept) with four
+  sections: what you are taking over (tree state with shas, what flew, what is half done per branch); what I did
+  and why; what I chose between and what I picked; **what I may have missed** (the two or three things this
+  session could not verify, each with the command that would). The next session attacks that last section before
+  it starts new work. The three-line header this replaced (read LAWS, read the baton and the resume, one arc per
+  session) stays true and is no longer the point of the document. Enforcer: R48; `baton-check.sh` warning only.
 - **Every baton fact is a claim.** Verify each sha with `git log --oneline -1` and reachability with
   `ls-remote`; an inherited open question is checked in the peer's ledger at their head (`git show
   <peer-head>:<ledger>`) before re-asking; a wrong instruction in a baton is executed, not reviewed,
@@ -161,14 +160,12 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   flight, which is a scheduled bench event and NEVER a landing gate. Any reader of a jetson ack must know that is
   all it is — and any scheme that demands more would block every landing on Peter's calendar.
   Enforcer: R39; the platform selector on `battery()`; and this list, which names every leg's owner.
-- **Lanes:** the rmbp seat owns shared kernel core; pi and jetson touch the files their brief names.
-  An out-of-lane need is negotiated over ccd with the owning seat and the grant is recorded in both
-  transcripts; a grant in one transcript is a preference, not a grant. An ack given to one shape is
-  not spent on another. No agreement means Peter, with both positions. Lane grants are seat-to-seat,
-  never a Peter decision (Peter 2026-08-22). Lanes make merges safe; they are not cross-checks: a lane
-  is a duty to read your own files, never a right to withhold, and findings need no owner.
+- **No lanes** (R46, 2026-09-11). The lane rule that stood here (rmbp owns shared kernel core; pi and jetson touch
+  the files their brief names; out-of-lane needs negotiated over ccd) is retired: any session edits any file, and
+  the gates, not an owner, decide whether the edit lands. What survives of it: read your own diff; a finding needs
+  no owner; a change to a shared file is announced in the commit message by the files it touches. Enforcer: R46.
 - **STOP tripwires** (record what you saw, report, do not improvise): behaviour diverges from the
-  brief; a fix needs an out-of-lane file; a workaround would weaken a protection (SMEP, NXE, WXN,
+  brief; a workaround would weaken a protection (SMEP, NXE, WXN,
   page permissions, checksums); any urge to force-push, rewrite or merge outside the two kinds.
 - **Name by subsystem, never by board,** in any file both arches compile (R16, Peter 2026-09-03).
   ONE OS (Peter 2026-08-13): the desktop is the same product on every chip; experience-layer code
@@ -195,6 +192,14 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   finding goes on `LEDGER.md` with an owner and to that seat the same turn. Ids are seat-prefixed
   (`SO`, `SP`, `SR`; S1–S32 frozen). A cross-seat "is it landed" row tracks content, not shas (folds
   cherry-pick). Never re-derive an audit; re-derivation is the waste, the audit is the value.
+- **Queues** (R45, Peter 2026-09-11): ONE trunk queue, `docs/dev/QUEUE.md` on `main`, holds every job that does
+  not need a specific board ("the primary queue for all platform agnostic jobs"); each track queue,
+  `docs/dev/OS/<track>-queue.md`, holds ONLY the jobs that need that board's metal or that board's own files. A
+  job is cut down to its metal-specific part and the rest is routed to the trunk queue ("isolate down to the
+  specific metal requirement as far as possible so as to maximize shared code"). A queue is kept current as work
+  happens, never at close, and lives in git, never in a plans directory (rmbp 19, 2026-09-11: 16 items existed only
+  outside the repo). All four branches stay level so any track can merge to main at any time. Enforcer: warning
+  only until `ledger-check.sh` learns the queue files.
 - **Nothing durable lives in a round's scratch** (R32): tools go to `~/unaos-bench/tools/`, records
   to `docs/dev/evidence/<round>/`. A tool's name carries no round number; a record's does (R33).
   **Never write to `/tmp`** (Peter, standing since 2026-08-19: 3-day clear and RAM-backed; it
@@ -211,7 +216,9 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 - **Executors run Opus,** `model:"opus"` explicit on every Agent call; never inherit the seat's
   model, never spawn on another model when Opus is limited, never present a downgrade as an option
-  (Peter 2026-09-08).
+  (Peter 2026-09-08). **A Fable executor is for the few key tasks only** (R47, 2026-09-11: "use whatever level
+  opus model rated high enough for the job at hand. fable executors for only the most key tasks"); the seat names
+  the task as key in the brief and in the report.
 - **An executor builds and proves its own fixture; it runs no battery** (R38, Peter 2026-09-09).
   Allowed: `./arroyo check` and one QEMU run that hosts its fixture, with go-red proven by mutation.
   One battery runs once, on the fold, by the seat, before the card. Batteries belong to the staged
@@ -220,7 +227,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 - **Fleet size:** the focus seat keeps its floor of three executors while undone work exists (a
   pending question blocks only its dependents; "standing by" and "awaiting your go" are banned
   phrases; an empty floor is proven that turn or is Peter's explicit hold) and never exceeds nine
-  (Peter 2026-08-27: a ceiling, queue past it). A support seat's floor is zero. While Peter is
+  (Peter 2026-08-27: a ceiling, queue past it). While Peter is
   steering conversationally, no fan-outs without asking. A capacity or model-fallback notice is a
   spend emergency: pause heavy loops.
 - **Never stop running work; Peter has a stop button** (Peter 2026-08-22). "Pause", "hold", "no more
