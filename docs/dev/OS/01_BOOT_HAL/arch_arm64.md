@@ -6529,6 +6529,116 @@ arches; knob-off `UNAOS_GICV3=1 ./arroyo test-arm 40` CAPSTONE 6/6, `./arroyo te
 22` + `./arroyo kernel8-test` 0 FAIL; knob-on `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm 40` prints the
 witness line + CAPSTONE 6/6 intact. Landing: `review/unaos-orin-sdmmc1-LANDING.md`.
 
+##### SDV1 — identifying an SD v1.x (SDSC) card (orin 24, ledger A49)
+
+**What the bench showed.** render12 boot 2, with a 1.9 GB FAT card (label `UNAOS-DATA`, a plain FAT volume
+with no UnaOS content) in the Orin's slot — the full extract is
+[`docs/dev/evidence/orin24/sdv1-wire.txt`](../../evidence/orin24/sdv1-wire.txt):
+
+```
+:: SDMMC:   M2: card detected (Present State 0x01fb00f0) ::
+:: SDMMC:   M2: CMD0 GO_IDLE ok ::
+:: SDMMC:   M2: CMD8 no response (INTERRUPT=0x00018000) — SD v1.x card or no v2 support; continuing without HCS ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) FAILED — INTERRUPT=0x00018000 PresentState=0x01fb0000 … — STOP ::
+:: SDMMC: ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop) ::
+```
+
+and `tegra-sd=absent` on the `[vfs] root =` line. A 1.9 GB card is standard-capacity (SDSC), so the CMD8
+timeout is the *correct* answer — CMD8 is a v2 command and an SD v1.x card does not implement it. The
+failure is the line after it: CMD55 timed out too, with `INTERRUPT=0x00018000` (bit 15 error summary +
+bit 16 Command Timeout) and a Present State showing the controller un-inhibited and the card still seated.
+Every card this ladder had identified on metal before this boot was CSD v2; the v1.x branch had never run.
+
+**Two defects, both in `identify`, neither a data-path defect.** The v1.x DATA path was already correct and
+is unchanged by this fix — ACMD41 with HCS=0 (`0x00ff_8000`), CCS taken from OCR[30], the CSD v1
+`C_SIZE`/`C_SIZE_MULT`/`READ_BL_LEN` product, CMD16 SET_BLOCKLEN 512, and `lba * 512` byte addressing in
+CMD17. The ladder simply never reached any of it.
+
+1. **No re-idle after the unanswered CMD8.** A card that has just been handed a command it does not
+   implement is not obliged to answer the next one. The recovery every mature host applies is to put it
+   back in idle before starting over: U-Boot's `sd_send_op_cond()` opens with `mmc_go_idle(mmc)` under the
+   comment "Some cards seem to need this". CMD0 is broadcast, needs no response, and costs one command, so
+   the fix is unconditional recovery on the v1.x branch rather than a guess about which card is seated. The
+   v2 path — which reached ACMD41 on this bench across two rounds of boots — is untouched.
+2. **The ACMD41 loop spent none of its own budget.** It declares `ACMD41_TIMEOUT_MS = 1000` for the card to
+   leave power-up busy, and then went through `cmd_step_at`, whose `?` ends the ladder. The FIRST
+   unanswered CMD55 therefore printed "STOP" and discarded the remaining ~1000 ms, after asking the card
+   exactly once. Both commands now go through `cmd_retry`, which witnesses the timeout, resets the CMD/DAT
+   lines and returns `false`; only the loop ends the ladder, when the budget expires or after
+   `ACMD41_NAK_LIMIT` (8) consecutive unanswered rounds. Its verdict line names the alternatives a reader
+   needs (an MMC card answers CMD1, not ACMD41; a 1.8 V-signalling card answers neither at 3.3 V). The
+   CMD55/ACMD41 pair is issued under short-circuit `&&`, because ACMD41 is only an *application* command by
+   virtue of the CMD55 immediately before it — a CMD41 issued after a lost CMD55 is the reserved standard
+   command, not the one intended.
+
+**There was no silent `None`.** The stop was witnessed at every step: `cmd_step_at` prints its `FAILED —
+INTERRUPT=… PresentState=… CONTROL0=… CONTROL1=…` line on *every* `Err`, including the rounds whose success
+line is suppressed (`verbose` gates only the `ok` line). All twelve `None` sites in `identify` — SRST
+self-clear, no card seated, 400 kHz clock never stable, the seven `cmd_step` `?`s, the ACMD41 verdicts, the
+CSD refusal, and the 25 MHz raise — print their cause before returning, and did so before this change too.
+The audit is recorded here rather than as a code change because the property already held; a future edit
+that adds a `None` without a line is what this paragraph exists to make visible.
+
+**Three supporting changes.**
+
+- **`csd_capacity_blocks` is now a pure function at file scope**, outside the `tegra`-gated `mod metal`,
+  with `r2_bits` beside it. QEMU models no Tegra234 SDHCI, so the CSD arithmetic is the *only* part of the
+  identification ladder that can be gated off metal, and it is also the part where a wrong answer is a
+  plausible-looking capacity rather than a visible failure — a v1 CSD read with the v2 formula returns a
+  different believable card, not an error. It also now **refuses** a reserved `CSD_STRUCTURE` (2 or 3) and
+  an out-of-range `READ_BL_LEN` instead of decoding them with v1 field offsets, and the caller prints the
+  raw `CSD_STRUCTURE` and the four response words on refusal: "the driver could not read this card's CSD"
+  and "there is no card" are different facts, and only the first was true on that boot.
+- **`reset_cmd_dat` verifies SDHCI 3.00 §3.10.1 recovery.** The SRST bits self-clearing says the *host*
+  finished resetting; the bus has recovered only when CMD and DAT[3:0] have all returned high. A reset that
+  cleared while the card was still driving a line makes the next command's timeout a symptom of the reset
+  rather than a fact about the card — a distinction that was unrecoverable from the render12 capture, which
+  is why it is now a line: `M2: CMD/DAT reset left the bus NON-IDLE (Present State …)`.
+- **The card class is named on its own line**, beside (never replacing) the capacity line the v2 arm has
+  always printed: `M2: identified SDSC v1.x card capacity=<N> MiB byte-addressed`.
+
+**The SDCSD fixture** (`csd_capacity_selftest`, `witness`-gated) runs from both census entry points — the
+virt witness half and the metal recon head — so an armed metal boot certifies its own arithmetic before it
+touches a card, and `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm` gates it off metal:
+
+```
+:: SDCSD: v1=3905536 v2=124735488 refused=2/2 -> PASS ::
+```
+
+Both vectors are built field by field through the same off-by-8 addressing `r2_bits` reads through, so the
+fixture exercises the production extractor rather than a second copy of it. The v1 vector
+(`READ_BL_LEN=10, C_SIZE=3813, C_SIZE_MULT=7` ⇒ 3905536 blocks, 1907 MiB) is the ordinary 2 GB SDSC
+spelling and the class of card that produced this defect. The v2 vector's `C_SIZE=121811` is **back-derived
+from a capacity this bench actually measured** (`[sdhc] verify mbr … CSD capacity 124735488 blocks`, Pi 4
+capture `~/unaos-bench/capture/pi4-r23s1u/ttyACM0.log`); no capture on this bench has ever printed raw CSD
+response words, so the surrounding bits are constructed per the SD Physical Layer spec and only the capacity
+field is bench-sourced. Two negative controls ride with the pair — a reserved `CSD_STRUCTURE` and an illegal
+`READ_BL_LEN`, both of which must be refused — because a decode that returned a number for every input would
+otherwise pass. Go-red proven by mutating the v1 shift (`c_size_mult + 2` → `+ 3`): `v1=7811072 … -> FAIL`,
+`test-arm` rc=1; restored and re-run green.
+
+**What the next armed boot should show**, with the same card in the slot — the SDSC branch is
+**fixed-unflown**, and only metal can say whether the re-idle is what that card wanted:
+
+```
+:: SDCSD: v1=3905536 v2=124735488 refused=2/2 -> PASS ::
+:: SDMMC:   M2: CMD8 no response (INTERRUPT=0x00018000) — SD v1.x card or no v2 support; continuing without HCS ::
+:: SDMMC:   M2: SD v1.x recovery — re-idling before ACMD41 (a card that has just been handed a command it does not implement need not answer the next one) ::
+:: SDMMC:   M2: CMD0 GO_IDLE (v1.x re-idle) ok ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) ok ::
+:: SDMMC:   M2: ACMD41 power-up complete in … round(s) — OCR 0x……… (CCS=0) ::
+:: SDMMC:   M2: capacity 3905536 blocks (1907 MiB, CSD v1), addressing byte (SDSC), legacy ::
+:: SDMMC:   M2: identified SDSC v1.x card capacity=1907 MiB byte-addressed ::
+:: SDMMC: ORIN-SDMMC-1 DONE — microSD censused: … (READ-ONLY; no card write) ::
+[vfs] volume mounted /volumes/UNAOS-DATA source=tegra-sd rw=no ::
+```
+
+with `tegra-sd=present` on the `[vfs] root =` line. **The stranger card is HOMESOIL's business, not this
+driver's, and HOMESOIL does mount it** — read-only, at `/volumes/<its own label>`, with its posture sampled
+from the backend being mounted (`fs/bootdisk.rs::bind`). It is never a root candidate and never written:
+`BlockSource::TegraSd` is write-vetoed in every cfg. If the re-idle is not enough, the retry loop's verdict
+line now says how many of how many rounds went unanswered, which is the datum the next arc needs.
+
 #### ORIN-SDMMC-2 — the write path behind the paranoia ladder (`UNAOS_SDMMC_ARM`, a SEPARATE arm on top of `UNAOS_SDMMC`)
 
 **Double-gating (the seated card is sacred).** The write path is gated on a **second, separate** explicit arm
@@ -9105,6 +9215,83 @@ Spec rows for `[net4F]`/`[net4V]`/`ORIN-NET-4 DONE` were added to
 `unaos/scripts/specs/jetson-sync1.spec` in this fold (PENDING/OPTIONAL — `net4` is knob-gated, so
 the healthy-terminus rows must never become REQUIREs; the argument is at the rows).
 
+### NET-5 render11 fold (orin 23, 2026-09-08) — the no-lease was TWO defects in OUR read path
+
+render11 flew the NET5IDX read site with the RJ45 cabled and still did not lease. The wire named both
+causes, and neither is the NIC:
+
+```
+[net5T] rx[3] slot=3 len=62  … shadow-mask=0x00020000 (first=17) slot_expected=3 slot_read=17 verdict=REFETCH-WRONGSLOT
+[net4d] rx[4] len=62  dst=4c:bb:47:25:49:c8 src=9c:69:d3:28:6e:f4 et=0x0800 class=udp-other
+[net5T] rx[4] slot=4 len=342 … shadow-mask=0x00000000 (first=-1)  slot_expected=4 slot_read=-1 verdict=NOWHERE
+[net4t] other[0] len=342 … first32B=4e455434455f04fb4e455434455f04fb0000…
+```
+
+1. **The length did not move with the frame.** `len` comes from the COMPLETING descriptor's writeback;
+   the bytes come from wherever the NIC wrote them. On a divergent read those describe two different
+   frames. Pop 3 completed slot 3 with `len=62` over the buffer that held a 342-byte frame — and that
+   frame is unicast **to our station MAC**, from the router, IPv4/UDP: the DHCP OFFER. `decode_dhcp`
+   needs the 236-byte BOOTP header plus the magic cookie, so a 62-byte OFFER files as `udp-other` and
+   `offer=0`. **Fix:** `net5_frame_len_from_headers` — on a divergent read the length is derived from
+   the frame's own L2/L3 headers (VLAN peeled), with the descriptor length as the fallback.
+
+2. **RESTAMP-ALL destroyed the unconsumed landing.** `net5_on_pop` re-stamped all 64 buffer heads at
+   the end of every pop, ~100 µs of uncached scanning AFTER the read site had already chosen its frame.
+   Anything the NIC delivered inside that window had its Ethernet header overwritten with a landing tag
+   and became indistinguishable from an untouched buffer — which is pop 4 above: the OFFER's own
+   writeback (`len=342`) over a shadow block whose tags were all intact, so the read site returned
+   nothing, the caller fell back to the completing slot's untouched original buffer, and 342 bytes of
+   `net4f_tag(4)` (`"NET4E_" + 0x04 + 0xfb`, twice — the `[net4t]` line above, verbatim) went to
+   smoltcp. **Fix:** consume-on-read. A landing tag now means "this buffer is FREE"; a missing tag
+   means "this buffer holds a frame no pop has delivered yet". `net5_consume`, called by the pop path
+   immediately after the frame copy, re-stamps exactly the one buffer this pop delivered from and
+   nothing else — `net5_on_pop` is read-only now and scores its arm off the masks the read site
+   recorded — so the sticky-tag artifact stays gone (a landing is cleared when,
+   and only when, it is read) while an unread landing can no longer be destroyed. A completion with
+   nothing to deliver anywhere now recycles the descriptor and reports `None`, the same discipline the
+   RES error path already used, instead of manufacturing a frame out of instrument bytes.
+
+Two instrument corrections ride with it. `zero-payload=` stopped lying: on a `net5` boot the original
+buffer of every slot ≥ 1 is unwritable by construction (`net5_arm` re-points those descriptors), so the
+old counter reported `4/5` as an artifact of the probe itself; it now counts completions for which no
+buffer in EITHER block held a frame. And `net5_read_src` no longer refuses a pop with two or more
+unread landings — under consume-on-read a refusal would strand a frame permanently, so it takes the
+lowest index and publishes the backlog as `[net5T] … unread=`.
+
+**What is NOT fixed, and is not ours.** The NIC resolves every re-pointed descriptor's payload to
+descriptor **17**'s buffer address — the same INDEX at every placement the driver has used: `0x268018800`
+in the boot7h high window and `0x80018800` on the net4-only low boot are both `window+0x18800`, two GiB
+of layout apart (`docs/dev/evidence/orin16/NET5.md` §3, C2), and with the shadow armed it resolves to
+`0x80058800` = `shadow+0x8800` — while its OWN/len writeback advances
+0,1,2,3,4 in ring order. `REFETCH-LIVE` is therefore expected to stay 0 and `REFETCH-WRONGSLOT` high;
+the driver's job is to deliver correctly THROUGH that reuse, which is what the two fixes above do.
+`STALE-ORIG=0` still acquits the NIC's DMA of holding a pre-re-point address.
+
+**Gates.** `[net5F]` (new) needs THREE knobs:
+
+```
+UNAOS_GICV3=1 UNAOS_NET4=1 UNAOS_NET5=1 ./arroyo test-arm
+```
+
+`UNAOS_GICV3` is not decoration. `net4_bringup`'s virt call site sits inside `main.rs`'s
+`if unaos_kernel::arch::gic::is_v3()` block and `./arroyo test-arm` boots `virt` at gic-version=2
+unless that knob is set, so the two-knob run exits 0 with **no `[net5F]` line anywhere on the wire** —
+a green that means nothing. That was measured, not assumed, and it is why this paragraph names the
+command. Go-red is proven the same way: mutating the IPv4 arm to return a fixed length reproduces
+render11's own number, `[net5F] MISMATCH: derived=Some(62) expected=Some(342)`, and takes `test-arm`
+itself to exit 1; reverting returns `checks=7 failures=0 => PASS`.
+
+It drives `net5_frame_len_from_headers` on QEMU virt with the render11 shapes —
+the 342-byte OFFER, the same frame 802.1Q-tagged, ARP, IPv6, a landing-tag buffer that must refuse, and
+two out-of-range IPv4 total-lengths — and prints `checks=N failures=0 => PASS`. It is the only part of
+the fix a board-less machine can run: the pop path is in `mod metal` (`cfg(tegra)`) and needs a Tegra234
+RC, the DesignWare inbound iATU and an RTL8168 that latches one payload address; virtio-net and e1000
+land every payload in the completing descriptor's own buffer, i.e. exactly the case the defect does not
+occur in, so a virtio/e1000 leg would be green on the broken code and the fixed code alike. The matrix
+row `arm-net5-virt` was added because `net5` was carried by exactly one leg (`arm-tegra-tcurx`) and that
+leg carries `tegra` too, so every `cfg(all(net5, not(tegra)))` site — the fixture included — compiled on
+no leg of `./arroyo check`.
+
 ## PH-3 — is the aarch64 block-write path "fully polled emmc2"? (verdict: **premise FALSE**)
 
 An answer owed to the pi4 lane, which was deciding on the `fs/fat.rs` `FAT_MUTATION` span
@@ -11172,14 +11359,77 @@ loop, at a CNTPCT-rate-limited ~1/s. A tickless boot prints the load train too, 
 `[spin1]` ride the same emit. That is precisely why (5) keys on `[spread4]`, which the poll path
 does not chain, and not on the load line it sits beside.
 
-**The instrument for (2)-(4) is not yet armed.** `scripts/specs/jetson-sync1.spec:1063-1064` carry
-the two `[orinbsptick]` rows as `PENDING`, and PENDING is not failable in `orin-specscore.py`
-(`failable = d.kind in ("REQUIRE","COUNT","FORBID")`). On a default image those rows must become
-`REQUIRE` + a `COUNT`, and `:269`'s `REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] …)` alternation must
-collapse to the `[orinbsprun]` arm — otherwise a silently tickless default boot scores green. That
-inversion belongs to the flight arc, with the synthetic `jetson-sync1-green.capture` gaining the
-same lines in the same commit, and is deliberately NOT made here: a REQUIRE that no capture in the
-tree satisfies is a red gate with no flight behind it.
+### The instrument is now armed — ORIN-SPECARM (orin 20, 2026-09-07)
+
+The paragraph that stood here said the instrument was **not** armed: `jetson-sync1.spec` carried the
+`[orinbsptick]` rows as `PENDING`, and PENDING is not failable in `orin-specscore.py`
+(`failable = d.kind in ("REQUIRE","COUNT","FORBID")`). That was true and it was worse than it read —
+**nine** rows, not two, and the hole was measured rather than argued: a **real pre-flip TICKLESS Orin
+flight** (`capture/line-acm0/orin.log:41451-46241` — zero `orinbsptick`, zero `orinbsprun`, the
+cooperative terminus banner present) scored `PASS — 17/17 required witnesses, 0 forbidden hit(s)`,
+exit 0, against the spec at `98213b7f`.
+
+All nine are now failable, each with a per-rule provenance block at the row naming what it guards and
+what mutation reds it, and `jetson-sync1-green.capture` gained the witnesses in the same commit:
+
+| # | row | was | is |
+|---|---|---|---|
+| C1 | `[orinbsptick] arming PERIODIC CNTP` | PENDING | REQUIRE |
+| C2 | `[orinbsptick] tick N taken` | PENDING | **COUNT 2** |
+| C3 | `[orinbsprun] boot core N joins run()` | PENDING | REQUIRE |
+| C4 | `running the full M4 CAPSTONE cooperatively` | OPTIONAL | FORBID |
+| C5 | `dispatch is on_tick + post-EOI timer_preempt` | PENDING | REQUIRE |
+| C6 | `dispatch is on_tick ONLY (no timer_preempt arm` | OPTIONAL | FORBID |
+| C7 | `[spread4] live c0=N/M` | PENDING | REQUIRE |
+| C8 | `[el0live] verdict=` | OPTIONAL | REQUIRE |
+| C9 | `[prio] svc=` | OPTIONAL | REQUIRE |
+
+**C2 is a `COUNT 2` and not a `REQUIRE`, which is predicate (3) made mechanical**: `bsptick_witness`
+emits at `n == 1` and then every `TICK_HZ`-th tick, so a `REQUIRE` on the bare pattern would be
+satisfied by a lone `tick 1` — the IRQEL-RT one-shot's signature, i.e. the old behaviour. `BSPTICK_COUNT`
+is monotonic and boot-core-scoped, so two matched lines are two distinct N.
+
+**The scored floor moves 17/17 → 24/24** (REQUIRE 17 → 23, COUNT 0 → 1, spec-declared FORBID 16 → 18;
+spec-declared failable rules 33 → 42, or 45 counting mbench's three built-in default FORBIDs). The
+spec-declared directive total is unchanged at 131 — nine rows changed kind, none was added. A reader
+who sees 24/24 where 17/17 stood is looking at a bigger denominator, not a regression.
+
+**`:269`'s alternation was deliberately NOT collapsed**, and the earlier instruction to collapse it is
+withdrawn as unnecessary rather than wrong: with C3 a `REQUIRE` and C4 a `FORBID`, a boot that
+satisfies `:269` through its `CAPSTONE COMPLETE` arm reds twice below, so the alternation is now
+redundant rather than a hole. Narrowing it would be a second, unrelated rule change to the file's
+"did this boot reach a terminus at all" anchor.
+
+**What ORIN-SPECARM also had to correct in the predicate above**: the `[el0live]` bullet's *"chained
+… before the change-suppression, so it prints on every window"* is right about the LOAD suppression
+and silent about `el0live_tick`'s own liveness-shaped one (`sched.rs`), which does mute a healthy
+unchanged window. It remains the primary predicate for a stronger reason: that guard is
+`last_sig == sig && healthy`, and on the first window either the signature differs from the initial
+zero (it carries the `healthy` bit, so a healthy first window packs 1) or `healthy` is false — both
+arms print, so the FIRST window can never be suppressed and an armed board that takes even one
+preemption emits it. And one thing the predicate leaves implicit that C7/C8/C9 now depend on: the
+three witnesses have exactly **three** call sites in the tree, and on tegra only one of them can
+exist. `load_accounting_witness` is `#[cfg(feature = "pi")]` and `pi`+`tegra` is a hard
+`compile_error!`; `storm_census` is reached only from `shell.rs`'s `storm` verb, whose arm is
+`#[cfg(any(all(baremetal, aarch64), x86_64))]` — deliberately *not* widened to `tegra_el0` with its
+neighbours, because `storm` reaches into BCM2711 slot state and the baremetal-only FAT writer. So on
+this board `load_witness_tick` is the only reachable emitter, and its only caller is `timer_preempt`.
+⚠ Widening that shell arm to tegra would give these rows a second emitter and cost them their status
+as pure preemption evidence; re-derive the spec's paragraph in the same commit that widens it.
+
+**⚠ How to score predicate (8), the way-back leg, now that these rows are failable.** A
+`UNAOS_NOBSPTICK=1 ./arroyo esp-jetson` capture is *supposed* to carry zero `[orinbsptick]`, zero
+`[orinbsprun]` and `CAPSTONE COMPLETE` present, so replaying `jetson-sync1.spec` against it will red
+C1-C9 by construction. **That red is the leg passing, not failing** — and it is what predicate (8)
+asks for. Score the way-back leg by its own three facts (the objcopy sha256 matching the pre-flip
+default, zero `[orinbsptick]`, `CAPSTONE COMPLETE` present), not by this spec's verdict; if a
+scored run is wanted, `--accept-dead` names the rows in the command line where a reviewer can see
+them, which is exactly why that exemption is a harness argument and not spec syntax. Do NOT soften
+the rows to make the opt-out green: that would put the default boot back where ORIN-SPECARM found it.
+
+`orin-specscore.py` now also prints a **FAILABILITY** line under every tally — how many of a spec's
+rules can move the exit code and how many cannot — so this class of hole is visible on every run
+rather than discoverable. It is reporting only; no scoring semantics changed.
 
 
 ## §ORIN-STKDEPTH — a boot-core stack DEPTH at the tegra terminus (`orinfurn`, DEFAULT OFF)
@@ -11679,3 +11929,159 @@ so a zero there would be counted as an EL0 preempt that never happened. `virt_el
 exactly two EL0 tasks, `el0-hello` (one non-blocking `sys_write`, then `sys_exit`) and `el0-spin` (no
 syscall at all before its exit); neither can yield, so a cooperative boot dispatches each exactly once
 and the counter reads exactly 2. A third dispatch is EL0 preemption.
+
+## ORIN-APSRUN — every secondary joins at EL1 (**default ON for tegra**; `UNAOS_NOAPSRUN` opts out)
+
+**Peter, 2026-09-08, verbatim: "WE ARE STILL ONLY ON ONE CORE."** This section records what the
+render11 wire actually said, because the obvious reading of it was wrong and the correction is the
+whole arc.
+
+### The diagnosis the wire refutes
+
+The render11 capture (`boot-render11-B-full.log`) ends its SMP block with
+
+```
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+```
+
+and that line invites exactly one conclusion: the five secondaries were woken by `CPU_ON` and then
+parked tickless, so they never entered the scheduler. **That conclusion is false, and the same
+capture falsifies it.** Between the `CPU_ON` successes and the line above, the log carries
+
+```
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+```
+
+five times over, once per AP. `c<N> timer PPI live` is `timer::on_tick`'s own first-tick witness,
+emitted from the AP's own timer IRQ — it cannot be printed by a core whose PPI never fired. JC3
+promoted the deferred stretch long ago: `smp_virt::__secondary_rust_virt` calls
+`timer::arm_this_core_ap()` (which registers the core in `AP_LOCAL_TICK`, so it advances its own
+`percpu.ticks` and never the shared `TICKS`/`ms()` clock — the double-count the deferral was ever
+about) and then `sched::secondary_run(core)`, which `mark_online`s it and enters `run()`. The
+`[bsprun] host` line agrees: `online=0x3f`.
+
+**The line was stale prose.** It is printed by the BSP inside `start_secondaries_tegra`, before any
+AP has reached its arm, so the BSP was asserting a state it had not measured — and a line that
+asserts an unmeasured state is worse than no line, because it is believed. It cost this arc's first
+diagnosis. It now reports only what the BSP knows (how many checked in) and names the witnesses that
+answer the rest.
+
+### The actual park site
+
+`smp_virt.rs:344` (pre-arc), the `#[cfg(feature = "orinel1ap")]` block in `__secondary_rust_virt`:
+compiled out. Every AP therefore ran the path immediately around it — bring-up, tick, `run()` — at
+**EL2**, replaying the BSP's EL2 regime, and never called `sched::mark_el1_core()`.
+
+The consequence is one field on the `[bsprun] host` line: `el1cores=0x1`.
+
+`sched.rs`'s EL0-EL1CORE filter admits an EL0 task only onto a core that has MEASURED itself at EL1
+(`EL1_CORE_MASK`, `sched.rs:3218`), because an `eret` at EL2 with `HCR_EL2.E2H==0` banks `ELR_EL2` —
+the convicted board-killer. The filter was always right. What was missing is that only the boot core
+was ever made ELIGIBLE, so `el0_placement_possible(CPU_AUTO)` (`sched.rs:3372`) had exactly one
+candidate and the shell, the render pump, the pointer poll and every `bg` shared core 0 while five
+ticking cores steal nothing but kernel tasks. **That is "only one core" as the operator experiences
+it, and it is why the pointer goes sluggish when programs run.**
+
+sched.rs had already named this as its own disposal condition, in the EL0-EL1CORE block: *"WHEN TO
+DELETE THIS: when the `smp_virt` secondaries drop to EL1 before entering `secondary_run`."*
+
+### What changed
+
+The AP drop mechanism is **ORIN-EL1AP's, unchanged statement for statement** — the seat claim, the
+bounded wait for the BSP-published EL1 root, the `ICC_SRE_EL2.Enable` grant, the latch save/restore,
+and the verbatim reuse of `enable_el1_regime` + `drop_el2_to_el1_tegra` on the AP (every register
+that sequence writes is per-core banked, so running it on an AP programs that AP's copy and nothing
+else). `apsrun` widens seven of its `#[cfg]`s to `any(orinel1ap, apsrun)` and changes **one
+constant**: `boot_tegra::EL1AP_SEATS`, from `1` to unbounded. Three things are genuinely new:
+
+* **`boot_tegra::publish_el1_root`** — publish `mmu_tegra`'s EL1-precise twin (`mmu.ttbr0_el1`)
+  BEFORE the first `CPU_ON`, folded onto the line that carries `start_secondaries_tegra`'s attribute
+  in `main.rs` (code-before-attribute; zero source lines added, so no `panic::Location` in that file
+  moves and the knob-off `kernel8.img` keeps its hash). ORIN-EL1AP's single claimant waited for
+  `drop_to_el1` to publish, which is past the entire PCIe/xHCI/SD probe stretch. With one AP that is
+  a curiosity; with five it is **the boot-12 shape** — five Orin cores spinning against shared state
+  starved the boot core's cooperative xHCI HID poll into "keyboard+mouse armed but ZERO deliveries"
+  (`timer.rs`, `this_core_has_local_tick`). Deleting the wait is the fix; tuning it is not. It is the
+  same value from the same expression `drop_to_el1` is handed below, so nothing can drift, and
+  `drop_to_el1` still stores it (idempotent).
+* **`boot_tegra::capture_bsp_latch_once`** — the one place where five seats is not the same code as
+  one. "Load `JM6_EL2_LATCH`, drop, store it back" is exact for a single claimant. With five racing
+  claimants, AP2 can snapshot in the window after AP1's `eret` has overwritten the latch and before
+  AP1's restore, and would then faithfully "restore" AP1's DROP values as the BSP's — making
+  `timer.rs`'s `[irqel2a]` witness print an AP's `HCR_EL2` while calling it the BSP's. The BSP's four
+  values are now captured exactly once, before any drop, behind a three-state gate; every restore
+  writes the same four values and is idempotent.
+* **The `[apsrun]` witnesses** (below).
+
+**No protection is relaxed.** Each AP installs `L1_EL1` — RAM at `AP[2:1]=0b00` (EL1 RW, no EL0
+access, EL1-executable), Device `UXN|PXN|nGnRE` — and the same absolute `SCTLR_EL1` `M|C|I|RES1`
+literal the BSP uses. WXN, the page permissions and the EL0 window's own tables are untouched.
+
+### What the wire should say on the next boot
+
+Per AP, in this order (the `[el1ap]` lines are ORIN-EL1AP's, now printed five times):
+
+```
+:: tegra: [apsrun] EL1 root published EARLY (TTBR0_EL1=0x…) — APs drop without waiting on the BSP ::
+:: tegra: [el1ap] seat claimed by cpu=1 — waiting up to 30 s for the BSP EL1 root ::
+:: tegra: [el1ap] cpu=1 dropping EL2 -> EL1 (TTBR0_EL1=0x…, the BSP-installed L1_EL1) ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=1 mask=0x3 (EL0-EL1CORE) ::
+:: AARCH64 SMP: [el1ap] cpu=1 LANDED at EL1 — stamped=true el1cores=0x3 irq=unmasked (EL0-EL1CORE) ::
+:: [apsrun] cpu 1 tick armed — periodic CNTP at EL1 (250 Hz, PPI30), own redistributor, local-only clock ::
+:: [apsrun] cpu 1 joins run() at EL1 — el1cores=0x3 (EL0 placement candidate; ORIN-APSRUN) ::
+```
+
+with the mask growing `0x3, 0x7, 0xf, 0x1f, 0x3f` across cores 1..5 (in whatever order they race),
+and then, at the terminus:
+
+```
+:: [bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x3f hosts=0x3f; …) ::
+[el0live] … | where hosts=0x3f el0cpus=0x… lastcpu=N | …
+```
+
+`hosts` and the `[el0live]` `where` group are new and exist because **`HOSTING` was true on
+render11**: the bool says only that SOME core can host, so a machine with one candidate printed the
+same word as a healthy one. `hosts` is that predicate's witness SET (`online & el1cores`, per core),
+`el0cpus` the set of cores an EL0 thread has actually run on, and `lastcpu` the core that ran one
+most recently (`-1` = never). `hosts=0x1` is the defect itself, on a line the operator already reads
+every window.
+
+### FAIL shapes, stated in advance
+
+* **A hang after `[apsrun] cpu N tick armed` with no `joins run()` from that core** — the PPI fired
+  into a core that was not ready for it. The ordering that prevents it is three statements earlier:
+  `percpu::init` (TPIDR_EL1) → `exceptions::install` (VBAR_EL1) → `enable_irq`, all strictly before
+  the arm. A hang there indicts one of those three, not the timer.
+* **An exception on an AP** names the missing per-core state directly: a data abort resolving
+  `this_cpu()` is TPIDR_EL1 (the `percpu::init` re-seed), a fetch abort or a silent death right after
+  the `eret` is VBAR_EL1 (`exceptions::install`), and an UNDEF on `msr CNTP_CTL_EL0` is
+  `CNTHCTL_EL2.EL1PCEN` (which the drop asm sets — so it would indict the drop, not the arm).
+* **`[el1ap] REFUSED cpu=N — post-eret CurrentEL=…`** — fail-closed per core: that core stays an EL2
+  scheduler participant exactly as today and `el1cores` keeps the bits it has. A partial success is a
+  legal outcome; `el1cores=0x7` hosts EL0 on three cores.
+* **No `[apsrun]` line at all** — the feature is not in the image. `strings -a kernel.elf | grep -c
+  '\[apsrun\]'` before blaming the board.
+
+### Preemption on an AP — the audit whose premise this arc changes
+
+`gic.rs`'s post-EOI `timer_preempt` arm carries an IRQEL-CORE audit that ends *"on this board nothing
+is placeable there (EL1 filter) and AP queues are empty by construction."* **Both clauses stop being
+true here** — that is the point of the arc — so the audit's remaining half is what carries: an AP's
+preemption rides the EL-neutral `switch_context` through `__vec_irq`, whose `irq_bank!`/`irq_unbank!`
+are RUNTIME `CurrentEL` branches on `tegra` (`exceptions.rs`), so an IRQ taken at EL1 on an AP banks
+`ELR_EL1`/`SPSR_EL1` correctly — the identical mechanism ORIN-BSPRUN flew on core 0 at render8. This
+is the arc's principal metal risk and it is named here rather than discovered at the bench.
+
+### Gate reach
+
+⚠ **QEMU models no Tegra234.** Every site is `tegra`-gated: `boot_tegra.rs` is
+`#[cfg(all(target_arch = "aarch64", feature = "tegra"))]` (`arch/aarch64/mod.rs:29`),
+`start_secondaries_tegra` is `#[cfg(feature = "tegrasmp")]`, and `apsrun` implies `tegrasmp` implies
+`tegra`. The `arm`/`test-arm` QEMU-`virt` legs compile **none** of it, so **no `foreman` spec row can
+red-without / green-with this change** — a row keyed on `[apsrun]` would be a check that cannot fire.
+Both polarities are TYPE-CHECKED (`arm-tegra-apsrun` arms it alongside `orinel1ap`, which is the one
+closure where `EL1AP_SEATS` has two candidate definitions and the `not(apsrun)` arm must be proven to
+lose; `arm-tegra` / `arm-tegra-el0` / `arm-tegra-el1ap` keep the disarmed polarity, which is not a
+vacuous twin — knob-off there is no drop block, no witnesses, and neither new `boot_tegra` fn). The
+behaviour is PROVEN only by an attended bench flight.

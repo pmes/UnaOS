@@ -1,0 +1,12 @@
+# UNAOS-DATA card — the 1.9 GB card from render12 boot 2 (orin-ledger A49), read on the host 2026-09-12T02:0xZ by orin 27
+# command: flatpak-spawn --host bash -c 'd=/sys/block/mmcblk0/device; for f in name date csd scr; do printf "%-5s %s\n" $f "$(cat $d/$f)"; done'
+# boot anchor: none — this is a host register read, not a boot. It is cited by A49, whose boot capture is render12 boot 2.
+lsblk  mmcblk0 1.9G, mmcblk0p1 1.9G label UNAOS-DATA
+name  SD02G
+date  11/2007
+csd   002600325f5a83c93efbcfff92804000
+scr   0225000000000000
+# Decode: CSD byte0 0x00 -> CSD_STRUCTURE=0 (CSD v1.0, the byte-addressed SDSC capacity encoding: C_SIZE/C_SIZE_MULT).
+#         SCR byte0 0x02 -> SCR_STRUCTURE=0, SD_SPEC=2 = Physical Layer Specification Version 2.00; SCR byte2 bit7 (SD_SPEC3)=0.
+#         SCR byte1 0x25 -> SD_SECURITY=2 (SDSC), SD_BUS_WIDTHS=0101 (1-bit and 4-bit).
+# Verdict: an SD 2.00 SDSC card. A 2.00 card MUST answer CMD8 (SEND_IF_COND). On render12 boot 2 it did not — the Orin driver's CMD8 step is the suspect.

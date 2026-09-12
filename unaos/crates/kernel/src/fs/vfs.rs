@@ -359,9 +359,11 @@ pub trait VfsBackend {
     /// ever wanted.
     ///
     /// **Deliberately NOT the volume name.** A name is an argument the mount site typed;
-    /// identity is a fact about the medium. One machine binds ONE volume at two prefixes
-    /// under two different names — `sdmmc_root_bind` mounts the Orin card as `"card"` at
-    /// `/` and as `"fat"` at `/boot` — and a name comparison calls those two volumes,
+    /// identity is a fact about the medium. One machine binds ONE volume at SEVERAL
+    /// prefixes — BOOTROOT's `shell::vfs_mount_table` binds the disk the kernel was found
+    /// on at `/`, `/boot` and `/apps` — and the retired ROOTFS bind that first exposed this
+    /// typed the same card `"card"` at `/` and `"fat"` at `/boot`. A name comparison calls
+    /// one medium two volumes (and, worse, two media one volume),
     /// refusing `mv /A.TXT /boot/B.TXT` as "cross-volume" when it is a plain in-volume
     /// relink (rmbp 15, condition C1). That is the inverse of the pointer comparison the
     /// name replaced, arriving through the other door: a pointer is too FINE (two adapters
@@ -710,9 +712,10 @@ impl MountTable {
     /// a rename and an honest cross-volume refusal.
     ///
     /// **Compared by [`VfsBackend::volume_id`] — the volume's STORAGE identity — and the difference
-    /// is load-bearing (VOLID, orin 18, rmbp 15 condition C1).** A machine may bind ONE volume at two
-    /// prefixes under two different NAMES: `sdmmc_root_bind` mounts the Orin card as `"card"` at `/`
-    /// and as `"fat"` at `/boot`. This compared the two NAMES until VOLID and therefore answered
+    /// is load-bearing (VOLID, orin 18, rmbp 15 condition C1).** A machine may bind ONE volume at
+    /// several prefixes, and may name them differently: BOOTROOT binds the found boot disk at `/`,
+    /// `/boot` and `/apps`, and the retired ROOTFS bind that exposed this defect typed one Orin card
+    /// `"card"` at `/` and `"fat"` at `/boot`. This compared the two NAMES until VOLID and answered
     /// `false` for one physical card, refusing `mv /A.TXT /boot/B.TXT` on exactly the configuration
     /// the render9 boot disk flies. A pointer comparison (the shape before that) fails the same way;
     /// the name merely moved the failure one door over. Identity is a fact about the medium, so the
@@ -928,11 +931,19 @@ impl FatBackend {
     }
 
     /// VFS-3: mount the hot-plugged USB FAT stick into the VFS, read through the
-    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the same mount
-    /// `ls /usb` and the `/fs/usb` HTTP route already use. World-readable (its
+    /// xHCI [`Usb`](crate::fs::fat::BlockSource::Usb) source — the mount `ls /usb`
+    /// and the `/fs/usb` HTTP route used. World-readable (its
     /// contents are meant to be read) and **writable** since USB-WRITE: the
     /// write verbs route to the verified BOT WRITE(10) path (`write_block_usb`,
     /// MISSION RMW+restore witnessed), which superseded the PIUSB-27 guard.
+    ///
+    /// ⚠ **HOMESOIL (orin 22): `vfs_mount_table` no longer calls this.** `/usb` is now one instance
+    /// of the general home-soil rule — every enumerated non-root disk gets an indexed, bus-named
+    /// point with its SOURCE's own posture — so `fs::bootdisk::bind` builds it through
+    /// [`FatBackend::new_source`], which is this constructor with the source spelled out instead of
+    /// baked in. The posture is identical (`Usb`'s `write_veto` is `None` either way), which is
+    /// what made the fold safe on the Pi. Kept, not deleted: it is the honest one-argument spelling
+    /// for a caller that means the stick and nothing else.
     pub fn new_usb(volume: &str, principal: &str) -> Self {
         Self {
             volume: volume.to_string(),
@@ -965,7 +976,7 @@ impl FatBackend {
     /// free to drift, on a target where the `Default` arm is the difference between a write that
     /// lands and a write that fails closed several sectors in. `BlockSource::write_veto` is the
     /// single definition; the VFS reports its presence as a boolean and the shell prints its text.
-    fn read_only(&self) -> bool {
+    pub(crate) fn read_only(&self) -> bool { // HOMESOIL (orin 22): `pub(crate)` on the SAME LINE (no line moves) so `fs::bootdisk` can print `rw=` from the SAME sample that built the mount, instead of re-deriving the posture at a second site — which is the drift `write_veto` was made the one definition to end.
         self.source.write_veto().is_some()
     }
 
@@ -1133,8 +1144,9 @@ impl VfsBackend for FatBackend {
     ///   selector at all (`volume`/`principal`/`world_readable` are a label and a posture),
     ///   and every method reaches the medium through `fat::mount_source(self.source)`. Two
     ///   adapters with equal `source` therefore address the same bytes whatever their mounts
-    ///   were NAMED — which is exactly the C1 aliasing, since `sdmmc_root_bind` types `"card"`
-    ///   at `/` and `"fat"` at `/boot` over one `TegraSd`. `BlockSource::name()` is the
+    ///   were NAMED — which is exactly the C1 aliasing: BOOTROOT binds the found boot disk at
+    ///   `/`, `/boot` and `/apps` over one source, and the retired ROOTFS bind typed one `TegraSd`
+    ///   `"card"` at `/` and `"fat"` at `/boot`. `BlockSource::name()` is the
     ///   spelling `SourceCensus` publishes, so no second vocabulary is invented here.
     /// * The **fingerprint** is the volume's own identity, and it is what makes this an
     ///   identity rather than a device address: the serial is fixed at format time and the
@@ -2427,62 +2439,29 @@ pub fn vfs1_routing_witness() {
 }
 
 // =========================================================================================
-// ROOTFS (orin 16, ledger A28) — the `BlockSource::TegraSd` constructor, appended at the FILE TAIL.
-//
-// A SECOND `impl FatBackend` block rather than a method inside the first: this file is compiled into
-// the knob-off `kernel8.img`, and `panic::Location` embeds source line numbers, so a method inserted
-// mid-file would move every panic site below it and break the byte-identity measurement the Pi track
-// takes on every arc. A tail append moves nothing.
-//
-// The adapter itself needs no other change — it has been parametrized by `BlockSource` since VFS-3,
-// `fat.rs` is already TOTAL over `BlockSource::TegraSd` (`read_sector`, `read_sectors`,
-// `mount_source`, `volume_serials`, `name`, `write_veto`), and `read_only()` forwards to
-// `write_veto()`, which answers `Some(TEGRA_SD_VETO)` for this source. So the volume arrives
-// read-only by construction with nothing here saying so.
-// =========================================================================================
-
-#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-impl FatBackend {
-    /// ROOTFS: mount the Tegra microSD card's FAT volume, read through
-    /// [`TegraSd`](crate::fs::fat::BlockSource::TegraSd) — the census-published
-    /// `read_block_tegra_sd` path (polled CMD17, 1-bit default speed, proven on metal by ledger A23).
-    ///
-    /// READ-ONLY, and not by a decision taken here: [`FatBackend::read_only`] forwards to
-    /// [`crate::fs::fat::BlockSource::write_veto`], which vetoes this source, and beneath that
-    /// `block::write_block_tegra_sd` refuses in every cfg. The card's only writer remains the
-    /// explicitly armed ladder in `arch/aarch64/sdmmc_tegra.rs`.
-    ///
-    /// Its one caller is `arch::aarch64::sdmmc_tegra::sdmmc_root_bind` (the `sdmmcroot` knob), which
-    /// binds it at `/` on a machine whose native UnaFS root does not exist yet — see
-    /// `docs/dev/OS/10_INSTALL/orin-unafs-root.md` §3 item 4.
-    pub fn new_tegra_sd(volume: &str, principal: &str, world_readable: bool) -> Self {
-        Self {
-            volume: volume.to_string(),
-            principal: principal.to_string(),
-            world_readable,
-            source: crate::fs::fat::BlockSource::TegraSd,
-            root: String::new(),
-        }
-    }
-}
-
-// =========================================================================================
 // VFSROUTE (orin 17) — the source-parametrized constructor, appended at the FILE TAIL.
 //
-// A THIRD `impl FatBackend` block for the reason the ROOTFS block above gives: this file is
-// compiled into the knob-off `kernel8.img` and `panic::Location` embeds source line numbers, so a
-// method inserted mid-file moves every panic site below it. A tail append moves nothing.
+// A SECOND `impl FatBackend` block, appended at the file tail rather than inserted as a method in
+// the first: this file is compiled into the knob-off `kernel8.img` and `panic::Location` embeds
+// source line numbers, so a method inserted mid-file moves every panic site below it. A tail append
+// moves nothing. (It was the THIRD such block until BOOTROOT (orin 22) deleted the ROOTFS one that
+// stood above it: a constructor that hard-coded ONE source (the Orin card) and whose only caller
+// was the retired per-board root knob. A caller that has resolved a source names it here instead,
+// whatever the source is.)
 // =========================================================================================
 
 impl FatBackend {
     /// VFSROUTE: mount a FAT volume through an EXPLICIT block source.
     ///
-    /// Its caller is the shell's `vfs_mount_table()` on x86, which must bind THE PROGRAM SOURCE —
+    /// Its callers are the shell's `vfs_mount_table()` on BOTH arms. On x86 it must bind THE
+    /// PROGRAM SOURCE —
     /// the handle `crate::drivers::block::program_source` names — and not the global slot. On a
     /// machine booted from the internal SD reader those are different devices, and FATVERB's whole
     /// argument is that a shell where `ls` and `run` disagree about which volume is the volume is
-    /// not a shell. [`FatBackend::new`] hard-codes `Default`, so a caller that has already resolved
-    /// the handle needs this constructor to say so.
+    /// not a shell. On aarch64 it binds the source `fs::bootdisk::locate` matched — the disk this
+    /// kernel's own image was found on — which is `Default` on the Pi's card and `TegraSd` or `Usb`
+    /// on an Orin, decided by content and never by a board cfg. [`FatBackend::new`] hard-codes
+    /// `Default`, so a caller that has already resolved the handle needs this constructor to say so.
     ///
     /// Read-only posture is not decided here: [`FatBackend::read_only`] and the trait's
     /// `write_veto` both forward to [`crate::fs::fat::BlockSource::write_veto`], which answers for

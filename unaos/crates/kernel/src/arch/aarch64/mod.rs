@@ -114,7 +114,7 @@ pub mod display_tegra;
 // Tegra-only AND `smpprobe`-gated, so it is compiled out of every default image (the `smpprobe`-off
 // tegra binary stays byte-identical to baseline). Wired into `tegra_early_stop` after JM4.
 #[cfg(all(feature = "tegra", feature = "smpprobe"))]
-pub mod smpprobe; #[cfg(all(feature = "tegra", feature = "selfup"))] pub mod selfup_tegra; #[cfg(all(feature = "tegra", any(feature = "ga10bprobe1", feature = "ga10bprobe2", feature = "ga10bprobe3")))] pub mod ga10b_probe; #[cfg(all(feature = "tegra", feature = "tcuprobe"))] pub mod hsp_tegra; // ORIN-SELFUP: the self-update core (staged whole-ESP payload -> sha256 verify -> proven FAT write -> warm-reboot hook), wired into tegra_early_stop after ORIN-INSTALL-2; appended to THIS line for knob-off byte-identity (inline fns with Location-bearing ops live below). GA10B-PROBE1: the first read-only GA10B iGPU probe rung (BPMP rail gate -> risk-ordered announce-first BAR0 reads -> SYSTEM_OFF), its own gated pub mod also appended to THIS line for knob-off byte-identity (its Location-bearing ops live in the module). TCURX (orin 14): the Tegra234 HSP shared-mailbox / TCU RX read-only probe (`tcuprobe`, implies `tegra`), its gated pub mod appended to THIS line before the comment for the same knob-off byte-identity (P7: the attribute goes BEFORE the first `//`; after it the mod is prose). GA10B-PROBE3 (orin 16): rungs 3/3b of the GA10B ladder live in the SAME `ga10b_probe.rs`, so the module gate's `any(...)` gained `ga10bprobe3` in place — no new line, no `Location` shift; `ga10bprobe3b` implies `ga10bprobe3` and therefore needs no term of its own here.
+pub mod smpprobe; #[cfg(all(feature = "tegra", feature = "selfup"))] pub mod selfup_tegra; #[cfg(all(feature = "tegra", any(feature = "ga10bprobe1", feature = "ga10bprobe2", feature = "ga10bprobe3", feature = "ga10bprobe4a")))] pub mod ga10b_probe; #[cfg(all(feature = "tegra", feature = "tcuprobe"))] pub mod hsp_tegra; // ORIN-SELFUP: the self-update core (staged whole-ESP payload -> sha256 verify -> proven FAT write -> warm-reboot hook), wired into tegra_early_stop after ORIN-INSTALL-2; appended to THIS line for knob-off byte-identity (inline fns with Location-bearing ops live below). GA10B-PROBE1: the first read-only GA10B iGPU probe rung (BPMP rail gate -> risk-ordered announce-first BAR0 reads -> SYSTEM_OFF), its own gated pub mod also appended to THIS line for knob-off byte-identity (its Location-bearing ops live in the module). TCURX (orin 14): the Tegra234 HSP shared-mailbox / TCU RX read-only probe (`tcuprobe`, implies `tegra`), its gated pub mod appended to THIS line before the comment for the same knob-off byte-identity (P7: the attribute goes BEFORE the first `//`; after it the mod is prose). GA10B-PROBE3 (orin 16): rungs 3/3b of the GA10B ladder live in the SAME `ga10b_probe.rs`, so the module gate's `any(...)` gained `ga10bprobe3` in place — no new line, no `Location` shift; `ga10bprobe3b` implies `ga10bprobe3` and therefore needs no term of its own here. GA10B-PROBE4 (orin 26): rungs 4a/4b live in the same file; `ga10bprobe4a` added to the `any(...)` in place, `ga10bprobe4b` implies it.
 // ORIN-REBOOT (watchdog half): the `UNAOS_ORINWDT=1` Tegra234 TKE boot watchdog — a wedged
 // Orin boot self-resets (POR on the 5th WDT0 expiration) instead of sitting dark for bench
 // hands. Tegra-only AND `orinwdt`-gated (`orinwdt` implies `tegra`), so it is compiled out
@@ -546,3 +546,25 @@ compile_error!(
      `tegra_el0` (Jetson Orin) or `virt_el0` (QEMU virt), and enabling it alone compiles the EL0 \
      chain with no `uslots` slot backend behind it. Enable one of those three instead."
 );
+
+/// BEAM — the scan-out's current raster line and the frame's line count, when this platform can
+/// read one. Tegra with `beam` armed: `display_tegra::beam_position`, which answers `Some` only
+/// after `beam_probe` LOCKED a raster counter at boot (under JD1-DC's BPMP power guard, read-only)
+/// and `None` for the whole boot otherwise. Every other aarch64 target answers `None`: the Pi's
+/// HVS publishes no raster position this kernel reads, and QEMU has no beam. `video::beam` folds to
+/// a no-op on `None`, so those panel paths are unchanged.
+///
+/// APPENDED AT THE FILE TAIL: this module is compiled into the knob-off `kernel8.img` whose
+/// byte-identity is a standing proof, and panic `Location` records embed line numbers; nothing is
+/// below this, so nothing moves.
+#[inline]
+pub fn scanout_beam() -> Option<(u32, u32)> {
+    #[cfg(all(feature = "tegra", feature = "beam"))]
+    {
+        display_tegra::beam_position()
+    }
+    #[cfg(not(all(feature = "tegra", feature = "beam")))]
+    {
+        None
+    }
+}

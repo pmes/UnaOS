@@ -1139,30 +1139,6 @@ install_target = ["sdmmc_arm"]
 # the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
 sdmmcwrite = ["sdmmc"]
 
-# ROOTFS (orin 16, ledger A28): the `UNAOS_SDMMCROOT=1` VFS ROOT BIND for the Tegra234 microSD card's
-# FAT volume (arch/aarch64/sdmmc_tegra.rs, the `sdmmcroot` tail section). A28's fault is that on the
-# desktop line the VFS root has NO backend — `/` is `NativeBackend` (native UnaFS) and the Orin card
-# carries no UnaFS volume, so `ls /` and quarry both answer `/: backend error: unafs-mount`. This
-# feature makes `shell::vfs_mount_table` REBIND `/` to the card's FAT volume, read through
-# `BlockSource::TegraSd` (the census-published `read_block_tegra_sd` path — CMD17 single-block, 1-bit
-# default speed, PROVEN on metal by A23), and re-point `/boot` at the SAME volume — its `Default`
-# source is registered by no Orin boot, and `/boot` is `shell::EXEC_ROOT` and the literal prefix of
-# `/apps/VUG.ELF`, `/apps/STAT.ELF` and `/apps/ELFHELLO.ELF`, so re-pointing it is what lets the desktop
-# launch anything at all. READ-ONLY BY CONSTRUCTION and not by policy stated here:
-# `BlockSource::TegraSd::write_veto` is `Some(TEGRA_SD_VETO)` and `write_block_tegra_sd` refuses in
-# every cfg, so no VFS verb can reach the medium. The vendor pad block stays DISABLED (the FWALL
-# SError conviction) — this feature adds no controller write of any kind. READ-only over an already
-# published card, so it is a SIBLING of `sdmmcwrite`, never an implier: it pulls only `sdmmc`, and a
-# boot whose census did not reach M3 gets one named refusal and the unchanged (broken) root. Every
-# site is `sdmmcroot`-gated: the section is a file tail inside the wholly `sdmmc`-gated
-# `sdmmc_tegra.rs`, and the `pub use`, the `vfs_mount_table` call and the `main.rs` early probe are
-# same-line appends, and
-# `FatBackend::new_tegra_sd` is a tail-appended `impl` block in `fs/vfs.rs` — so DEFAULT OFF => no
-# line moves and the Pi `kernel8.img` and the default jetson image are byte-identical to baseline.
-# The ARMED polarity is type-checked by the `arm-tegra-sdmmcroot` leg of KERNEL_CFG_MATRIX, never by
-# the knob mapping. Witness family: `[sdmmc] root` (subsystem-named). UNFLOWN.
-sdmmcroot = ["sdmmc"]
-
 # SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
 # (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
 # `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
@@ -2101,6 +2077,22 @@ orindesk = []
 # `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
 jd1dc = []
 
+# BEAM (`UNAOS_BEAM=1`, orin 26): the tearing fix. Locks the nvdisplay raster-generator position
+# register (`NV_PDISP_RG_DPCA`, +0x6330 + head*0x800, READ-ONLY) at boot from inside `jd1_dc_probe`'s
+# guarded section — the same BPMP MRQ_PG GET_STATE guard, the same announce-before-read discipline,
+# the same DTB-bounded aperture as JX2 — and validates it BEHAVIOURALLY (a counter that climbs
+# monotonically to at least the panel height and wraps at ~60 Hz) before `arch::scanout_beam()` will
+# answer at all. With it locked, every panel present (`wm::stage_window` bands, `wm::stage_fill`,
+# the direct `paint_window` fallback, `strip::paint`) is HELD until the beam is clear of the rows it
+# writes and cache-cleaned inside the bracket, and `[wc-h]`/`[wc-k]`/`[strip]` `torn=` become the
+# OBSERVED beam crossing (`beam=obs`) instead of the duration predicate that read 0 while the panel
+# tore (TEAR-DIAG). Implies `jd1dc` because the guard and the aperture are that rung's; arm it with
+# `UNAOS_TEGRA=1 UNAOS_BEAM=1 ./arroyo check` or `UNAOS_BEAM=1 ./arroyo esp-jetson`. Default OFF:
+# `scanout_beam()` is a constant `None`, `video::beam` folds away, and the jetson image's panel path
+# is what it was. The ARMED build is type-checked by `arm-tegra-jd1dc-beam` in KERNEL_CFG_MATRIX.
+# Witness on the wire: `:: tegra: BEAM VERDICT=LOCKED|NO-RASTER|DECLINED`.
+beam = ["jd1dc"]
+
 # GA10B-PROBE1 (`UNAOS_GA10B_PROBE1=1`): the FIRST read-only probe rung for the Orin Nano's Ampere
 # GA10B iGPU (`arch/aarch64/ga10b_probe.rs`, one appended call site in `tegra_early_stop`). One
 # attended cold-boot flight, zero MMIO writes: a BPMP MRQ_PG rail-state gate FIRST (a read of a
@@ -2178,6 +2170,68 @@ ga10bprobe3 = ["tegra"]
 # halted and never-booted after. Default OFF. The ARMED polarity is type-checked by the
 # `arm-tegra-ga10bprobe3b` leg of KERNEL_CFG_MATRIX. Witness family: `[ga10bprobe3b]`.
 ga10bprobe3b = ["ga10bprobe3"]
+
+# GA10B-PROBE4A (`UNAOS_GA10B_PROBE4=1`): rung 4a of the GA10B ladder — the BCR WRITABILITY CENSUS.
+# Brief (frozen design): docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §3.2. The tail of
+# `arch/aarch64/ga10b_probe.rs` (`ga10bprobe4_run`) and one appended call site in `tegra_early_stop`,
+# on the post-heap-init line (AFTER `memory::init`, which seats the rung's DMA window — not in the BPMP
+# block, where boot 1 of 2026-09-11 read REFUSED reason=no-dma-window); the channel is re-derived by
+# `bpmp_tegra::chan_reopen`, addresses only, no second IVC sync. Inside rung 3's PROVEN power+clock bracket (re-proven on
+# this boot, never inherited), it re-reads the two rung-4 inputs (`bcr_dmacfg` lock bit, `bcr_ctrl`
+# baseline), seats the rung's OWN 2 MiB Normal-NC DMA window (mmu_tegra `seat_ga10b4_nc`, the NET4A
+# law, never the NIC's block), fills it with a non-signature pattern, then writes the six BCR DMA
+# address registers and `bcr_dmacfg` WITHOUT the lock bit, reading each back, and restores all seven
+# to zero. `bcr_ctrl` is NOT written (that bit is 4b's). RETURNS to the desktop on every path except
+# BCR-SELFLOCKED and BCR-STICKY, which spend the power cycle and end in SYSTEM_OFF. Owns its own
+# write helper (`w32_4`, `#[cfg(feature = "ga10bprobe4a")]`), so no other configuration compiles a
+# BCR write path. IMPLIES `tegra`. Every offset/bit cites the ACKED facts file. Default OFF => the
+# tail + call site vanish, no panic `Location` moves (every call is appended to an existing line),
+# knob-off images byte-identical to baseline (measured on the esp-jetson kernel.elf binary). ARMED
+# polarity type-checked by the `arm-tegra-ga10bprobe4a` leg of KERNEL_CFG_MATRIX. Witness family:
+# `[ga10bprobe4a]`.
+ga10bprobe4a = ["tegra"]
+
+# GA10B-PROBE4B (`UNAOS_GA10B_PROBE4=2`): the SUB-KNOB that adds RUNG 4b — the blob-free boot-ROM
+# IGNITION — on top of rung 4a. IMPLIES `ga10bprobe4a`. Armed ONLY by the knob AND a same-boot
+# `BCR-ALLHELD` from 4a. Re-writes the six addresses, writes `bcr_dmacfg` = noncoherent|lock_locked
+# (THIS SPENDS THE POWER CYCLE), `bcr_ctrl` = 0x111 (the ACKED SEQ brom_config value), and then the
+# ignition `priscv_cpuctl` = startcpu; polls `br_retcode` (bounded, every sample printed), reads the
+# post-ignition state block, and ENDS THE MACHINE in SYSTEM_OFF on every reachable path (the cold-boot
+# bench law). Its PASS is a FAIL verdict from the ROM (`br_result=0x2`): the first observable execution
+# of GA10B silicon under UnaOS, needing no vendor blob. Brief §3.3, §5 fail shapes. The ignition write
+# helper (`ignite_w32`) is `#[cfg(feature = "ga10bprobe4b")]`. Default OFF. ARMED polarity type-checked
+# by the `arm-tegra-ga10bprobe4b` leg. Witness family: `[ga10bprobe4b]`.
+ga10bprobe4b = ["ga10bprobe4a"]
+
+# GA10B-PROBE4C (`UNAOS_GA10B_PROBE4=3`): the SUB-KNOB that adds RUNG 4c — the read-only POST-IGNITION
+# CENSUS — on top of 4a+4b. IMPLIES `ga10bprobe4b`. Brief §10 (orin 27, 2026-09-12; Peter: "can you add
+# more GPU probes to the next boot"). ZERO new write classes: inside 4a's bracket, after 4a's restore and
+# before 4b, a PRE-ignition census of 30 registers (rung 3's 25 + top_num_gpcs, gsp_falcon_hwcfg2,
+# gsp_falcon_mailbox0, priscv_cpuctl, priscv_br_retcode — every offset the ACKED facts file names, MAILBOX0
+# metal-proven by rung 3b), each announced before it is read; after 4b's verdict and before its SYSTEM_OFF,
+# a 20-sample br_retcode SERIES (distinct values with index and time; the upper bits printed as a reason
+# field), the same 30 POST-ignition diffed register-by-register against PRE (the 8 BCR registers judged
+# against what 4b wrote), and a CPU read of the rung's own DMA window (did the ROM write into it). Summary
+# arms: PRECENSUS-DONE|SKIPPED, BRSERIES-STABLE|CHANGED|UNREADABLE, POSTBCR-INTACT|ALTERED|UNREADABLE,
+# MAPDIFF-SAME|CHANGED, DMABUF-UNTOUCHED|ALTERED, CENSUS-COMPLETE. The flight still ends in 4b's SYSTEM_OFF
+# on every path. Widens the rung-3/3b/1 offset constants' cfgs in place (`any(ga10bprobe3, ga10bprobe4c)`)
+# so "same offsets as rung 3" holds by construction. Default OFF. ARMED polarity type-checked by the
+# `arm-tegra-ga10bprobe4c` leg. Witness family: `[ga10bprobe4c]`.
+ga10bprobe4c = ["ga10bprobe4b"]
+
+# GA10B-PROBE4D (`UNAOS_GA10B_PROBE4=4`): the DEFERRED arm — 4a+4b+4c run from the SHUTDOWN PATH after a
+# full desktop session (Peter 2026-09-12: the next boot runs the full desktop first and the GPU probe LAST,
+# so one boot carries the render glass checks AND the rung). IMPLIES `ga10bprobe4c`. With it, the
+# post-heap-init call in `tegra_early_stop` does NOT run the rung: `ga10bprobe4_run` stashes dtb_addr /
+# dtb_size / ram_gib_mask + a DTB checksum in statics, arms an AtomicBool and RETURNS; `power::psci_call`
+# calls `ga10b_probe::ga10bprobe4_deferred_run()` (no arguments) on EVERY PSCI SYSTEM_OFF request — shell
+# `shutdown`/`off`, crystal Shut Down, a probe's own finish — which consumes the arm, masks DAIF on the
+# calling core, re-verifies the DTB checksum, re-derives the BPMP channel with `chan_reopen`, and runs
+# 4a -> 4b -> 4c exactly as at boot (bracket re-proven, nothing inherited), ending in 4b's SYSTEM_OFF; a
+# refusal prints why and falls through to the OFF it interrupted. SYSTEM_RESET never triggers it. Default
+# OFF; the power.rs call is appended to an existing line (knob-off byte-identical). ARMED polarity
+# type-checked by the `arm-tegra-ga10bprobe4d` leg. Witness family: `[ga10bprobe4d]`.
+ga10bprobe4d = ["ga10bprobe4c"]
 
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
@@ -2400,6 +2454,48 @@ orintenant = ["tegra_el0"]
 # polarity is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by the knob
 # mapping. Witness on the wire: every line carries `[el1ap]` — see arroyo's UNAOS_ORINEL1AP block.
 orinel1ap = ["tegrasmp", "tegra_el0"]
+# ORIN-APSRUN (orin 23): every PSCI-woken Orin secondary drops EL2 -> EL1, stamps itself into
+# `EL1_CORE_MASK`, arms its own 250 Hz CNTP at EL1 and enters `sched::run()` — so `el1cores` reads
+# `0x3f` and an EL0 thread is placeable on any of the six cores.
+#
+# THE DEFECT, Peter, 2026-09-08: "WE ARE STILL ONLY ON ONE CORE". The render11 wire is the evidence and
+# it ACQUITS the tick: all five APs print `c<N> timer PPI live (tick 1)` and all five enter `run()`, so
+# `online=0x3f`. The field that pinned userspace to the boot core is `el1cores=0x1` on the same
+# `[bsprun] host` line — the APs replay the BSP's EL2 regime and stay there, so `el0_placement_possible`
+# (the predicate `spawn_user_image_bg` refuses on) had exactly one candidate and the shell, the render
+# pump, the pointer poll and every `bg` shared it. That is the sluggish pointer.
+#
+# WHAT IT COMPILES, AND HOW LITTLE OF IT IS NEW. The AP drop mechanism is ORIN-EL1AP's, unchanged
+# statement for statement — the seat claim, the bounded wait for the BSP-published EL1 root, the
+# ICC_SRE_EL2.Enable grant, the latch save/restore, and the verbatim reuse of `enable_el1_regime` +
+# `drop_el2_to_el1_tegra`. This feature widens its `#[cfg]`s to `any(orinel1ap, apsrun)` and changes
+# ONE constant: `boot_tegra::EL1AP_SEATS`, from 1 to unbounded. It adds three things of its own:
+# `boot_tegra::publish_el1_root` (publish the EL1 root BEFORE the first `CPU_ON`, so five APs never
+# spin through the probe stretch — the boot-12 interconnect-starvation shape), `capture_bsp_latch_once`
+# (a per-core latch snapshot is a corruption once there are five claimants), and the two `[apsrun]`
+# witnesses in `smp_virt::__secondary_rust_virt`.
+#
+# WHY IT IMPLIES `tegrasmp` AND NOTHING ELSE. `tegrasmp` because the drop happens on a PSCI-woken AP
+# and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]` — without it there are no APs.
+# It does NOT imply `tegra_el0` (unlike `orinel1ap`, which does): an EL1 AP is a better scheduler
+# participant whether or not the image carries an EL0 surface, and implying it would flip a second
+# default polarity from inside this one. `tegrasmp` implies `tegra`, so the knob is self-sufficient.
+#
+# NO PROTECTION IS RELAXED. Each AP installs `mmu_tegra`'s EL1-precise twin `L1_EL1` — RAM at
+# AP[2:1]=0b00 (EL1 RW, NO EL0 access, EL1-executable), Device UXN|PXN|nGnRE — and the same absolute
+# SCTLR_EL1 `M|C|I|RES1` literal the BSP uses. WXN, the page permissions and the EL0 window's own
+# tables are untouched; the behavioural change is arithmetic on a seat counter.
+#
+# FAIL-CLOSED, PER CORE. Every exit that does not complete a drop leaves THAT core at EL2 and
+# UNSTAMPED, so it simply stays an EL2 scheduler participant exactly as today and `el1cores` keeps the
+# bits it has. A partial success is a legal outcome: `el1cores=0x7` hosts EL0 on three cores.
+#
+# DEFAULT-ON for tegra builds (arroyo's ORIN-APSRUN mapping + the `esp_jetson` force block, the
+# ORIN-TICKDEFAULT shape), opt out with `UNAOS_NOAPSRUN=1` => the pre-flip image. QEMU models no
+# Tegra234, so both polarities are TYPE-CHECKED here and PROVEN only by an attended bench flight; the
+# armed polarity is type-checked by the `arm-tegra-apsrun` leg of KERNEL_CFG_MATRIX. Witness on the
+# wire: `[apsrun]` — see arroyo's UNAOS_APSRUN block.
+apsrun = ["tegrasmp"]
 # ORIN-INPUT: `UNAOS_ORININPUT=1` — make HID input actually REACH an EL0 tenant on the Orin. Adds the
 # pump/route/rollup in `arch/aarch64/xusb_tegra.rs` (`oi_pump`/`oi_reset`/`oi_rollup`) and its three
 # call sites inside `run_user_image`'s wait loop in `arch/aarch64/syscall.rs`.
@@ -2632,7 +2728,7 @@ orinrender = ["desktop_firmware", "tegra_el0"]
 # learn to). The banner term is not needed as arming proof: `main.rs::tegra_quarry_seat` prints
 # `[deskquarry] seat compiled=…` from `cfg!(feature = "quarry")` inside the built image, which is what
 # the next flight is scored on. See the arroyo block above the mapping.
-deskcascade = ["desktop_firmware", "tegra_el0", "quarry"]
+deskcascade = ["desktop_firmware", "tegra_el0", "quarry", "facet"] # ORIN-FACET: `facet` joins the cascade through the IMPLICATION, never through an `UNAOS_DESKCASCADE -> facet,` term in arroyo — the same admissibility argument QUARRY-ORIN made one line up, and the reason the fifteen-knob jetson build carries the viewer with no sixteenth knob.
 # ORIN-FACE (FBCONPAR item 1): UNAOS_ORINFACE=1 — arm the shared anti-aliased console face on an
 # ORDINARY Orin boot, at `video::fbcon::init`, with no desktop and no compositor window involved.
 #
@@ -2810,6 +2906,53 @@ tcuprobe = ["tegra"]
 # The ARMED polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX in `arroyo`,
 # never by the knob mapping. FIXED-UNFLOWN — flies on render7.
 tcurx = ["tegra", "orinrx", "tcuprobe"]
+# FACET (ORIN-FACET, Peter 2026-09-08): `UNAOS_FACET=1` arms UnaOS's IMAGE VIEWER — `video::facet`,
+# `docs/CODEX.md` §2's **Facet — Images — "The Canvas"** — as a KERNEL DESKTOP TENANT of exactly
+# `quarry`'s shape. The ask was *"i believe we already have an image viewer in the vessels can we
+# compile it for UnaOS?"*, and the answer is no, twice over and both times measurably:
+#   * `vessels/facet` is host-native — Tokio (`libs/quartzite`), WGPU (`libs/euclase`) and the `png`
+#     crate (`libs/lux`) are three `std` dependency trees with no freestanding target;
+#   * and no EL0 program in this kernel can host a PNG decoder at all: DEFLATE's history window is
+#     32 KiB by definition (RFC 1951 §3.2.1 = `selfhost::inflate::WINDOW`), while every EL0 task gets
+#     the blanket 16 KiB (`sched.rs`). The decoder's mandatory working set is twice the whole window
+#     it would have to live in, before one pixel is stored. That is a fact about the ring.
+# So it is a `wm` row over a surface it owns, opened by a double-click or `<Enter>` on a `.PNG` row in
+# the file manager. It holds no decoded image: the file streams through the VFS and every scanline is
+# unfiltered and box-reduced straight into the window surface at target scale, so a 1920x1200
+# screenshot costs ~2.3 MB of heap rather than ~21 MB.
+#
+# IMPLIES `quarry`, and that is a DEPENDENCY fact rather than a policy one: Facet's only door is the
+# file manager (`quarry::live::run_act`'s `Act::View` arm) and its pointer routing is chained from
+# `quarry::live::press_route` — the two router files that name every other tenant are the knob-off
+# `kernel8.img`'s `arch/aarch64/syscall.rs` (byte-identity, PARITY.md §5.3) and the x86 half another
+# lane owns, so neither may gain a line. No file manager, no viewer, and the feature says so.
+#
+# It also pulls in `selfhost::inflate` ALONE (see `lib.rs`'s `not(feature = "selfhost")` inline
+# declaration): the RFC 1951 decoder is shared with SELFHOST-2 through `deflate_body`, with
+# `zlib_inflate` as the RFC 1950 sibling of `gunzip`, so this arc adds no second decompressor.
+#
+# DEFAULT OFF => `video/facet.rs` is not compiled, every hook in `quarry`/`desktop_firmware` is
+# `#[cfg]`-erased, and the image is byte-identical to baseline. Witness tokens are subsystem-named
+# (`[facet]`, `FACETPNG`). Carried by the `deskcascade` implication below so the fifteen-knob jetson
+# build reaches it with no sixteenth knob.
+facet = ["quarry"]
+# USBLUN-M3 (F2): the WAY BACK from the USB multi-LUN census. `UNAOS_NOUSBLUN=1` => this feature =>
+# `drivers/xhci/mod.rs` compiles no census at all: Get Max LUN (class request 0xFE) is never asked,
+# `usblun_census`/`usblun_probe`/`bot_get_max_lun`/`ep0_resync` and the three census field types are
+# not compiled, `DeviceSlot::bot_lun` stays 0 for the life of every slot, and `build_cbw` therefore
+# writes the same `bCBWLUN = 0` it wrote before USBLUN-M1 — LUN 0 is published exactly as it was.
+#
+# THE POLARITY IS BACKWARDS FROM MOST OF THIS TABLE, and that is the point: the census is DEFAULT-ON
+# because it is the driver doing its job (a multi-slot card reader is one BOT device whose slots are
+# logical units, and addressing only LUN 0 hides every card but one), so the feature that needs a
+# named leg is this one, the DISARMED shape an operator falls back to. It is type-checked by the
+# `x86-nousblun` leg of KERNEL_CFG_MATRIX; every other leg in the table covers the census-ON default.
+# The `UNAOS_NOAPSRUN=1` shape exactly, and for the same reason: a default-on behaviour change in a
+# driver both arches compile, whose only runtime evidence is QEMU's single-LUN `usb-storage`.
+# Mapped in BOTH arroyo (the `_feats` map) and builder/src/main.rs (the x86 media build re-derives
+# its own feature list from env and never reads `$KERNEL_FEATURES`). Witness on the wire:
+# `:: USBLUN: census SKIPPED ::` in place of the `:: USBLUN: ... ::` family.
+nousblun = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

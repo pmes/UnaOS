@@ -215,6 +215,18 @@ here touches the display, the fabric or any block outside BAR0. Restore: none po
 
 ## Rung 4 — the licence gate: booting NVIDIA's signed ACR/GSP image
 
+> **FLOWN 2026-09-12 (orin 27) — RUNG 4 IS PASSED, AS THE BLOB-FREE IGNITION, NOT AS THE LICENCE GATE BELOW.** The design below
+> (stage NVIDIA's signed images) was superseded by `docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md` (exec-orin23-ga10b4, ratified by
+> Peter 2026-09-11 "do the boots"; combined into one boot 2026-09-11). Rung 4a: the six BCR DMA address registers and `bcr_dmacfg`
+> accept and hold a CCPLEX write (`bcrheld=7/7 -> BCR-ALLHELD`), restore verified. Rung 4b, same boot: `bcr_dmacfg` lock latched,
+> `bcr_ctrl` 0x110→0x111, `priscv_cpuctl`=startcpu, `br_retcode=0x00000002 br_result=0x2 -> BROM-VERDICT-FAIL` on the first sample —
+> the GSP boot ROM ran under our direction and rejected a non-signature payload. Post-ignition: `cpuctl halted=1`, `hwcfg2 lockdown=1`,
+> `gsp_falcon_cpuctl_v1` still unreadable. Ended in PSCI SYSTEM_OFF. Boot 1 (2026-09-11) refused with `no-dma-window` because the
+> rung ran before `memory::init` seated its window; `1629d449` moved it. Ledger A51; evidence `docs/dev/evidence/orin27/ga10b4ab-boot1.log`
+> (scored PASS/PASS by `docs/dev/evidence/orin26/scorer-ga10b4.sh`). The licence question is therefore NOT on the path to rung 5:
+> what the ROM wants at `fmccode`/`fmcdata`/`pkcparam` (layout, sizes, reason codes in `br_retcode`'s upper bits) is the open
+> question, and it is a clean-room question, not a blob question (brief §7).
+
 **The wall, measured.** `opt_priv_sec_en = 1` (rung 1): production secure boot. The RISC-V boot ROM
 only runs an image whose signature verifies against NVIDIA's key; the images are AES-encrypted and
 PKC-signed (`orin-3d.md` §3, ga10b-clean-room.md §4). **No unsigned code can run on the GSP, PMU,

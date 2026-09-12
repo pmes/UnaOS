@@ -1,0 +1,984 @@
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x23cae8 pg=573
+[ INFO]: crates/bootloader/src/main.rs@805: Allocated kernel at 0x25b073000
+[ INFO]: crates/bootloader/src/main.rs@925: Found DTB at 0x25f501000, size: 837900 bytes
+[ INFO]: crates/bootloader/src/main.rs@961: boot volume FAT serial 0xde001a13 (extended BPB BS_VolID)
+[ INFO]: crates/bootloader/src/main.rs@1208: JB8[pre-EBS]: FPCI CFG_0=0x01200020 CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@1235: JB8[pre-EBS]: FALCON CPUCTL=0xffffffff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x0000c85f
+[ INFO]: crates/bootloader/src/main.rs@1248: JB8[pre-EBS]: xHC cap=0x01200020 USBSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUA
+RD)
+[ INFO]: crates/bootloader/src/main.rs@1165: JB6: dummy ACPI 2.0 table installed (RSDP @0x25e53f000, XSDT @0x25e53f040) ? XUSB Falcon teardown will s:e:l ft-esgkriap: 
+m�m�uM mlIinvset a(lElLP2r)o t�o�c�o lRIAnMt eNroframcael:- W2B7 A+B FT0e5g5r-aB 1DBe8v-i4cCe2-6n-G8n0R4E8 -m7a4p8pFe3d7 B:A:A
+2:D:F  t0eg
+ra: dark-window guard — 89 byte(s) dropped pre-map ::
+:: video: edid present=1 hdr=OK sum=OK native=1920x1200 pclk_khz=154120 ext=1 len=256 ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4404ff TTBR0=0x25b2a2000 RAM-GiB-mask=0x3fc ::
+:: tegra: XCARVE-6 carveout exclusion — 6 protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::
+:: tegra:   window[0] [0x26b800000,0x26c180000) 9728 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[1] [0xbe000000,0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[2] [0x26c400000,0x279e00000) 223232 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[3] [0x26c180000,0x26c400000) 2560 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[4] [0x26b5f0000,0x26b7f0000) 2048 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[5] [0x279e00000,0x27a760000) 9600 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25b169800) ::
+:: tegra: JM7 — GOP fb addr=0x0 size=0x0 1920x1200 stride=2048 bpp=4 ::
+:: tegra: JD1 — simple-fb /chosen/framebuffer: 1920x1200 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 — resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x960000] ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x960000 1920x1200 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: fb L2 repair — 5 block(s) re-mapped in GiB 9 [0x279e00000,0x27a760000) ::
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d — MIDR=0x410fd421 (r0p1) — reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d — CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a — DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a — /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a — ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 — PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 — handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 — minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 — witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 — BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 — BAR2[0x004] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x008] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 — CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB11 [raw-handoff] — Falcon fw-header census: BAR2+0x1000 (IOCTL_CFGTBL_READ) -> BAR2+0x01c; no xHCI operational register is written ::
+:: tegra: JB11 [raw-handoff] — CNR gate: USBSTS=0x00000011 CNR=0 after 1 poll(s) / ~1 us — READY (mainline waits for exactly this before reading the header) ::
+:: tegra: JB11 [raw-handoff] — fw ident: magic="XUSBFW.." (0x0000574642535558) version_id=0x80050003 (Version: 80.05) ::
+:: tegra: JB11 [raw-handoff] — fw built: created=1676000890 (epoch) = 2023-02-10T03:48:10Z UTC ::
+:: tegra: JB11 [raw-handoff] — fw image: boot_codetag=0x00000000 boot_codesize=51295 B rodata_img_offset=0x00000000 fwimg_len=196608 B cksum=0x000094ba ::
+:: tegra: JB11 [raw-handoff] — fw L2 IMEM: start=0x00000000 end=0x00000000 (span=0 B) ::
+:: tegra: JB11 [raw-handoff] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::
+:: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 — CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 — touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c — XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c — PG 12 ON -> err=0 ::
+:: tegra: JB1c — PG 10 ON -> err=0 ::
+:: tegra: JB1c — CLK 267 enable -> err=0 ::
+:: tegra: JB1c — CLK 269 enable -> err=0 ::
+:: tegra: JB1c — CLK 268 enable -> err=0 ::
+:: tegra: JB1c — CLK 275 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 272 enable -> err=0 ::
+:: tegra: JB1c — CLK 103 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 100 enable -> err=0 ::
+:: tegra: JB1c — probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a — port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a — port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a — port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a — port survey done (8 ports scanned) ::
+[ga10bprobe4a] rung 4a (BCR WRITABILITY CENSUS inside rung 3's PROVEN power+clock bracket, re-proven THIS boot; no ignition; symmetric restore; RETURNS) — six BCR DMA address writes + one dmacfg write WITHOUT the lock bit, each announced and read back, stop at first mismatch, restore all seven to zero. bcr_ctrl is NOT written by 4a. Summary vocabulary: BCR-ALLHELD | BCR-SOMEHELD | BCR-NONEHELD | BCR-SELFLOCKED | BCR-STICKY | REFUSED reason=<no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable|no-dma-window>. SELFLOCKED and STICKY spend the power cycle and end in SYSTEM_OFF.
+[ga10bprobe4a] gpu@ node: BAR0=0x17000000 (DTB reg[0], EXT) power-domain-id=35 (DTB power-domains, EXT) clocks=3 (DTB clocks, EXT): 304 41 236 0 0 0 0 0
+[ga10bprobe4a] BPMP MRQ_PG GET_STATE (read-only) id=35 — the pre-state, before anything is driven
+[ga10bprobe4a] pg-before id=35 err=0 state=0x1
+[ga10bprobe4a] pg-readback id=35 err=0 state=0x1
+[ga10bprobe4a] clk 304 IS_ENABLED (before) err=0 = 0
+[ga10bprobe4a] clk 304 ENABLE — BPMP request; if this is the LAST line the transaction hung the boot
+[ga10bprobe4a] clk 304 ENABLE err=0
+[ga10bprobe4a] clk 41 IS_ENABLED (before) err=0 = 0
+[ga10bprobe4a] clk 41 ENABLE — BPMP request; if this is the LAST line the transaction hung the boot
+[ga10bprobe4a] clk 41 ENABLE err=0
+[ga10bprobe4a] clk 236 IS_ENABLED (before) err=-22 = 0
+[ga10bprobe4a] clk 304 IS_ENABLED (after) err=0 = 1
+[ga10bprobe4a] clk 41 IS_ENABLED (after) err=0 = 1
+[ga10bprobe4a] clk 236 IS_ENABLED (after) err=-22 = 1
+[ga10bprobe4a] clocks: 2 of 3 running after this rung's enables (236 answering err=-22 is the rung-3 datum, expected)
+[ga10bprobe4a] about-to-read priscv_bcr_dmacfg reg=0x1711166c (P1: lock_locked bit31 must be 0) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe4a] priscv_bcr_dmacfg @0x66c = 0x00000000 lock_locked=0
+[ga10bprobe4a] about-to-read priscv_bcr_ctrl reg=0x17111668 (P2: baseline; rung 3 read 0x00000110) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe4a] bcr_ctrl_before=0x00000110 bcr_ctrl_baseline_changed=0 (a value other than 0x00000110 is a datum, not a stop)
+[ga10bprobe4a] bcrheld=0/7 dmabuf_pa=0x00000000 lock_after=0 -> REFUSED reason=no-dma-window — no second clean L2-split 2 MiB block was seated below 4 GiB (see the [ga10b4nc] census at heap-guard); zero writes
+[ga10bprobe4a] clk 41 DISABLE (restore) err=0
+[ga10bprobe4a] clk 304 DISABLE (restore) err=0
+[ga10bprobe4a] restored: pg=0x1 (was 1) clocks-disabled=2 of 2 enabled here — BCR registers verified back to zero above
+[ga10bprobe4a] rung 4a complete — RETURNING to the boot (no SYSTEM_OFF; the flight is a full boot)
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD — DTB /reserved-memory contributed 3 carveout range(s) (cap 48) to the exclusion set ::
+:: tegra: DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property = 0x0 / 0x0; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::
+:: tegra: [ga10b4nc] rung-4 DMA window reserved [0x80200000, 0x80400000) (2048 KiB) — the NEXT clean L2-split block after NET4A's [0x80000000, +2048 KiB); 3 candidate(s) scanned, 1 rejected ::
+:: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [0x80000000, 0x80200000) (2048 KiB) — lowest clean L2-split block in [0x80000000, 0x100000000); low-DRAM census: 2 Usable region(s) / 1983 MiB usable, 1 carveout(s) below 4 GiB, 2 candidate block(s) scanned (rejected: carveout=0 heap/nc=0 window=0 unsplit=0) ::
+:: tegra: HEAP-GUARD — kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 153 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: tegra: [net4B] Normal-NC DMA window reserved [0x268000000, 0x268200000) (2048 KiB), carved just below the heap in the same clean+DMA span ::
+:: KERNEL HEAP ALLOCATED ::
+:: tegra: JB3 — DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 — census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b — usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b — attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g — no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b — programming interrupter + rings (runtime regs) ::
+:: X200: xhci pointer-programming begins t=593474736 (cntpct) ::
+xHCI: CNR cleared after 1 polls
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+[xhciint] ERDP initialized to 0x00000002683cd540 (hi-first, EHB clear)
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2683ce580
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2683cf000 (heap PA in [0x2683ca000,0x26b3ca000))
+xHCI: CRCR set to 0x2683cc541
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: [aarch64] RS=1 witness: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 CNR=0 HCE=0) CRCR=0x0000000000000000(CRR=0 CS=0 CA=0 RCS=0) DCBAAP=0x00000002683ce580 DCBAAP_raw64=0x00000002683ce580
+xHCI: [aarch64] RS=1 witness: IR0=0x3630020 IMAN=0x3(IP=1 IE=1) ERSTSZ=1 ERSTBA=0x00000002683ce540 ERDP=0x00000002683cd548(EHB=1) ERST[0].ring=0x00000002683cd540
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan (settle_ms=150)
+xHCI: ccs-margin settle_ms=150 ppc=0 ports=8 first_assert_ms=[p1:0/pre p2:none/pre p3:none/on p4:none/on p5:none/pre p6:0/pre p7:0/pre p8:none/pre] latest=0 margin_ms=150 result=CCSMARGIN
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+:: X200: xhci RS=1 (controller may DMA from here) t=603301512 (cntpct) ::
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 11 (was not enabled — fine).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled — fine).
+:: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc5c0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2683d3000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683cf040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc5d0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: HUB slot 1 port 1: device connected; enumerating...
+xHCI: HUB port 1 SS link trained (status 0x300203 PLS=0 U0, 1 polls, 2625583 cyc, attempt 0)
+xHCI: HUB port 1 reset OK (status 0x300203, warm reset, xHCI speed 4)
+xHCI: HUB slot 1 port 1 is a SuperSpeed port (speed forced to SS).
+xHCI: HUB downstream slot 2 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 2, bulk in 0x82/1024 out 0x1/1024) <<<
+xHCI: Configuring Bulk Endpoints for Slot 2 (IN 0x82 dci5 mps1024, OUT 0x1 dci2 mps1024)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 2). Storage ready.
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc630, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: Proceeding to Address Device (Slot 3, Port 6)...
+xHCI: Addressing Device (Slot 3, Port 6)...
+xHCI: DCBAAP[3] linked to 0x2683df3c0
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683deb80
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc640, Slot=3, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 3
+xHCI: >>> SLOT 3 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 3...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 3
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 3) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 3) ===
+xHCI: HUB slot 3 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 3 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 3 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 3 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+xHCI: HUB slot 3 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1c4f pid=0034 (route 0x2 tier 1)
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x81, MPS: 4, Interval: 10, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (mouse(rel)) in one Configure-Endpoint (max DCI 3).
+xHCI: [Event] Command Completion. Ptr=0x2683cc680, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x81 mps=4 interval=10 == witness ::
+xHCI: HUB slot 3 port 4: device connected; enumerating...
+:: MOUSE-1: 1 reports, last dx=0 dy=0 buttons=0x00 == witness ::
+xHCI: HUB port 4 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 5 device class=0x0 vid=1c4f pid=0002 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 3, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 5 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc6b0, Slot=5, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 5
+xHCI: HID Endpoints Configured (Slot 5). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 5
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=3 interval=10 == witness ::
+xHCI: HUB slot 3 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 3 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 5, iface 0).
+[hidkeys] set-idle ok slot=5 iface=0
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 4, iface 0).
+xHCI: [enum port 7] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 7...
+xHCI: [enum port 7] stage -> enable-slot
+:: tegra: JB2b — keyboard ARMED (slot 5, root port 6) -> PASS ::
+xHCI: [Event] Command Completion. Ptr=0x2683cc6d0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: Proceeding to Address Device (Slot 6, Port 7)...
+xHCI: Addressing Device (Slot 6, Port 7)...
+xHCI: DCBAAP[6] linked to 0x2683ea8c0
+xHCI: Port 7 speed 1 -> EP0 MPS 8
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683ea080
+xHCI: [enum port 7] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc6e0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: >>> SLOT 6 ENABLED & ADDRESSED <<<
+xHCI: [tegra fs-mps] slot 6 (FS port 7): learning MPS0 before full descriptor.
+xHCI: [enum port 7] stage -> fs-mps-learn
+xHCI: [tegra fs-mps] slot 6 bMaxPacketSize0 = 64
+xHCI: [tegra fs-mps] slot 6 EP0 MPS0 -> 64 (Evaluate Context OK)
+xHCI: Requesting Device Descriptor for Slot 6...
+xHCI: [enum port 7] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 6
+>>> VENDOR ID : [13d3]
+>>> PRODUCT ID: [3549]
+xHCI: Device Found. Class=0xe0 Sub=0x1 Proto=0x1
+xHCI: no driver for device class 0xe0 (slot 6, 13d3:3549); releasing port.
+xHCI: Port enumeration queue drained.
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 2)
+:: BOT: pump budget=450000000 used=420 peak=420 route=0x1 depth=1 slot=2 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: pump budget=450000000 used=36874308 peak=36874308 route=0x1 depth=1 slot=2 n=2 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: deqprobe slot=2 dci=5 enq=6 running_epstate=1 running_ctxdeq=0x2683cec81 -> stopped_epstate=3 stopped_ctxdeq=0x2683cece1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position) ::
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+:: BOT: portreg why=bringup port=1 usb3 portsc=0x00001603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=5 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=6 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=7 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+xHCI: storage ready.
+:: SPACE: [wait=1490ms(n=1) setcfg=3ms(n=1) tur=1200ms(n=2) sense=3ms(n=1) inq=27ms(n=1) rdcap=3ms(n=1) pub=75ms(n=1) resid=14ms] {cbw=0ms(n=5) data=11ms(n=3) csw=1180ms(n=5) peak=1179ms@csw} ftdi=0ms(n=0) total=2815ms sum=2801ms per_ms=31250 result=SPACE ::
+:: PIUSB: [piusb35] databuf phys=0x2683e0000 in_trb=0x2683cec80 cbw=0x2683cee80 csw=0x2683ceec0 | rc-inbound=[0x0,0x100000000) offset=0 (1:1) | databuf in_window=false below_3G=false — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool ::
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE: 
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+:: PIUSB: [piusb25] storage enumerated: slot 2 bulk_in=0x82 bulk_out=0x01 block_size=512 num_blocks=63404032 (30959 MiB) ::
+:: PIUSB: [piusb25] READ(10) LBA0 CSW=Passed residue=0 — first 16 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PIUSB: [piusb25] boot-sector sanity: 0x55AA=true type=unrecognized/raw ::
+:: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW=Passed residue=0 — 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+:: tegra: JB2b — HID: 1 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 — mass storage ready (slot 2); panel shell ls/cat live ::
+:: tegra: JB5 — witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 — inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x1f3d6_05dd28af SYNR0=0x00000002 SYNR1=0x0000410a (sid=0x410a) ::
+:: tegra: JB3 — inst0 CB0: SCTLR=0x0bb8c700 FSR=0x00000000 FAR=0x16fff_d693d07e ::
+:: tegra: JB3 — inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x12e75_b6585fda SYNR0=0x0000000a SYNR1=0x00001be3 (sid=0x1be3) ::
+:: tegra: JB3 — inst1 CB0: SCTLR=0x29bdc708 FSR=0x00000000 FAR=0x179d9_b6befdf4 ::
+:: tegra: JB3 — MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JD2 — EL1 console pump task spawned (boot core) ::
+:: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or newer); CPU_ON known-good on this firmware per the SMP-2 bench ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 0 aff=0x00000000 (BSP) (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 1 aff=0x00000100 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 2 aff=0x00000200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 3 aff=0x00000300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 4 aff=0x00010200 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 enumerated core 5 aff=0x00010300 (source=DTB /cpus) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 1 (aff=0x00000100) -> SUCCESS (entry=0x25b143cc0) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25b169800) ::
+:: AARCH64 SMP: AP 1 online (aff=0x00000100) ::
+:: AARCH64 SMP: c1 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25b169800) ::
+:: AARCH64 SMP: AP 2 online (aff=0x00000200) ::
+:: AARCH64 SMP: c2 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 2 (aff=0x00000200) -> SUCCESS (entry=0x25b143cc0) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 3 (aff=0x00000300) -> SUCCESS (entry=0x25b143cc0) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25b169800) ::
+:: AARCH64 SMP: AP 3 online (aff=0x00000300) ::
+:: AARCH64 SMP: c3 timer PPI live (tick 1) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25b169800) ::
+:: AARCH64 SMP: AP 4 online (aff=0x00010200) ::
+:: AARCH64 SMP: c4 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 4 (aff=0x00010200) -> SUCCESS (entry=0x25b143cc0) ::
+:: AARCH64 SMP: ORIN-SMP-3 CPU_ON AP 5 (aff=0x00010300) -> SUCCESS (entry=0x25b143cc0) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25b169800) ::
+:: AARCH64 SMP: AP 5 online (aff=0x00010300) ::
+:: AARCH64 SMP: c5 timer PPI live (tick 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 1 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 2 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 3 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 4 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 BSP -> AP 5 SGI OK (count 0 -> 1) ::
+:: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI OK (5 online APs pinged, 5 delivered; BSP ipi 1 -> 6) ::
+:: AARCH64 SMP: ORIN-SMP-3 5/5 secondaries online via PSCI CPU_ON (DTB /cpus oracle); AP timer PPI stretch deferred (JC3) ::
+:: tegra: JM6 — dropping the Orin boot core EL2 -> EL1 for the scheduler + CAPSTONE ::
+:: tegra: JM6b pre-drop — HCR_EL2=0x88000038 MMFR1.VH=1 TTBR0_EL1=0x25b2a3000 L1_EL1[0]=0x60000000000405 L1_EL1[9]=0x25b29a003 ::
+:: tegra: JM6b — EL1 landing: CurrentEL=1 SCTLR_EL1=0x30d01805 ::
+:: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: AARCH64 exception vectors installed (VBAR_EL1 = 0x25b169800) ::
+:: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 on cpu 0 (~100 ms window; CORE-LOCAL, other cores' periodic PPI30 is NOT this proof) ::
+:: [irqel2a] pre-arm cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x0 ENABLE=0 IMASK=0 ISTATUS=0 CVAL-CNTPCT=-880893cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] pre-arm GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=0 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=1023 ::
+:: [irqel2a] armed cpu=0 CurrentEL=1 DAIF=0x3c0 (I=1) | JM6 EL2 latch: HCR_EL2=0x80000000 IMO=0 FMO=0 AMO=0 TGE=0 E2H=0 RW=1 | CNTHCTL_EL2=0x3 EL1PCTEN=1 EL1PCEN=1 | ICC_SRE_EL1=0x7 ICC_SRE_EL2=0xf | CNTP_CTL=0x1 ENABLE=1 IMASK=0 ISTATUS=0 CVAL-CNTPCT=124996cyc CNTFRQ=31250000 :: (IMO=0 is what makes an IRQ taken at EL1 target EL1)
+:: [irqel2b] armed GICD_CTLR=0x12 | this core's banked PPI30: enab=1 pend=1 act=0 | ICC_IGRPEN1_EL1=0x1 ICC_PMR_EL1=0xf0 ICC_RPR_EL1=0xff ICC_HPPIR1_EL1=30 ::
+:: IRQEL-RT: first IRQ taken at EL1 on cpu 0 — banked vector path live (ELR_EL1 bank) ::
+:: [orinbsptick] arming PERIODIC CNTP at EL1 on cpu 0 (250 Hz, PPI30) — IRQs stay UNMASKED across the terminus; dispatch is on_tick + post-EOI timer_preempt (ORIN-BSPRUN: SCHED_ACTIVE is set at the terminus — the run() loop is PREEMPTIVE) ::
+:: [orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true, mark_online(0), preemptive terminus (clock: ORIN-BSPTICK); sleeper drain + steal + idle fold + the SCHED load/[pulse5]/[spin1] train are live on tegra for the first time ::
+:: [orinbsptick] tick 1 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=never-folded c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=5
+:: [bsprun] host core=0 el=1 -> HOSTING (online=0x3f el1cores=0x1; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses on — EL0-EL1CORE) ::
+:: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+[el0live] verdict=NONE el0 runnable/parked/committed=0/0/0 last_disp=-- last_wake=-- stall>=2000ms | reaped exit=0 kill_oncpu=0 kill_offcpu=0 corrupt=0 nopark=0 | totals el0_disp=0
+:: SCHED: load c0=75%/f=0ms c1=0%/f=0ms c2=0%/f=16ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +732823/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=0ms window=250ms folds=21
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003a sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 1000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 1250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 1500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 1750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 2000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: UI1: scale=1 cell=8x8 line=12 ::
+:: tegra: JD2 — OUT | UnaOS — Jetson Orin Nano (Tegra234) ::
+:: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
+:: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::
+:: SCHED: load c0=77%/f=0ms c1=0%/f=0ms c2=0%/f=2ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +8108800/win nofold=0x0) ::
+[pulse5] live c0=11ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=199
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=5 khot=0 hotref=0 khotm=0x0000 sparem=0x003e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=2ms c2=0%/f=4ms c3=0%/f=2ms c4=0%/f=0ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +700072/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=215
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003a sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 2250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 2500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 2750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 3000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 3250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 3500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 3750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 4000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 4250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 4500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 4750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 5000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 5250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 5500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 5750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=4ms c2=0%/f=3ms c3=0%/f=0ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +15939218/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=557
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003c sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=2ms c2=0%/f=0ms c3=0%/f=0ms c4=0%/f=2ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +773901/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=575
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x001e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 6000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 6250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 6500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=0ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3044904/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=641
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x002e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 6750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=1ms c2=0%/f=3ms c3=0%/f=4ms c4=0%/f=1ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768253/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=656
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x0036 sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 7000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 7250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 7500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 7750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 8000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=3ms c2=0%/f=2ms c3=0%/f=0ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5320774/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=770
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 8250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=2ms c3=0%/f=0ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1530841/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=804
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 8500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=3ms c2=0%/f=4ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769198/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=820
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003a sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +773663/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=836
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 8750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 9000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=never-folded c1=0%/f=4ms c2=0%/f=0ms c3=0%/f=1ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2287397/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=884
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 9250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=4ms c4=0%/f=3ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769974/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=902
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x0036 sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 9500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 9750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 10000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=3ms c2=0%/f=3ms c3=0%/f=1ms c4=0%/f=4ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3806341/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=984
+:: [orinbsptick] tick 10250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=3ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +775407/win nofold=0x0) ::
+[pulse5] live c0=11ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1002
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=5 khot=0 hotref=0 khotm=0x0000 sparem=0x003e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 10500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 10750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 11000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 11250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=4ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3725866/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1081
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x0036 sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +775235/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1098
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 11500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 11750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 12000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 12250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 12500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=1ms c3=0%/f=0ms c4=0%/f=1ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5318373/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1212
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 12750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=1ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +770075/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1230
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x002e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 13000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 13250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 13500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 13750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 14000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 14250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=0ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=4ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +6836617/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1375
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x002e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 14500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=2ms c2=0%/f=0ms c3=0%/f=4ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768508/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1392
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x0036 sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=2ms c3=0%/f=3ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +775119/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1410
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 14750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 15000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 15250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 15500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 15750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 16000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=0ms c2=0%/f=1ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +6838860/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1555
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 16250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=4ms c4=0%/f=0ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768787/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1573
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x0036 sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 16500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 16750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 17000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 17250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 17500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 17750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=4ms c2=0%/f=0ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +6077334/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1703
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=1ms c2=0%/f=1ms c3=0%/f=4ms c4=0%/f=2ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +773756/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1719
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x0036 sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 18000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=3ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=4ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768900/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1735
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x002e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 18250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=0ms c2=0%/f=4ms c3=0%/f=0ms c4=0%/f=1ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768382/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1753
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003a sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 18500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 18750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 19000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 19250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 19500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=3ms c3=0%/f=1ms c4=0%/f=2ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +6083033/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1882
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 19750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=1ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=2ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1530891/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1915
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+:: [orinbsptick] tick 20000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 20250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 20500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=3ms c2=0%/f=4ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2290331/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1963
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003a sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=3ms c2=0%/f=2ms c3=0%/f=3ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +773975/win nofold=0x0) ::
+[pulse5] live c0=11ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=1981
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=5 khot=0 hotref=0 khotm=0x0000 sparem=0x003e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 20750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 21000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 21250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 21500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=3ms c4=0%/f=4ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +4490042/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2079
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x002e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 21750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=0ms c2=0%/f=2ms c3=0%/f=4ms c4=0%/f=1ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768030/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2095
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x0036 sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 22000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 22250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=0ms c4=0%/f=4ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2288437/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2144
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 22500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=0ms c4=0%/f=4ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1531122/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2177
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 22750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=1ms c2=0%/f=3ms c3=0%/f=2ms c4=0%/f=3ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769370/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2193
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x001e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 23000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=1ms c2=0%/f=0ms c3=0%/f=2ms c4=0%/f=4ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +767833/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2210
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 23250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=1ms c2=0%/f=4ms c3=0%/f=2ms c4=0%/f=1ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +1531111/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2242
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003a sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 23500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=3ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769839/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2259
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 23750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 24000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 24250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=3ms c3=0%/f=1ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3808156/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2342
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 24500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=2ms c2=0%/f=4ms c3=0%/f=2ms c4=0%/f=1ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768189/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2358
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003a sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 24750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 25000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 25250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=1ms c2=0%/f=4ms c3=0%/f=0ms c4=0%/f=3ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3046209/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2422
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003a sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=0ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +773991/win nofold=0x0) ::
+[pulse5] live c0=11ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2439
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=5 khot=0 hotref=0 khotm=0x0000 sparem=0x003e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 25500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 25750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 26000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 26250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=0ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3728326/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2522
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=0ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +774415/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2538
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x003c sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 26500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=3ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769647/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2555
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 26750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=0ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=0ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +767816/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2570
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 27000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 27250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 27500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 27750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 28000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=75%/f=0ms c1=0%/f=2ms c2=0%/f=1ms c3=0%/f=0ms c4=0%/f=3ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5323331/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2684
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x001e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=0ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +774485/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2702
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 28250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=0ms c3=0%/f=3ms c4=0%/f=2ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769080/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2718
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x001e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 28500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=1ms c3=0%/f=0ms c4=0%/f=3ms c5=0%/f=1ms c6=--/f=never-folded c7=--/f=never-folded (ctx +768267/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2735
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 28750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 29000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 29250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=4ms c5=0%/f=2ms c6=--/f=never-folded c7=--/f=never-folded (ctx +3809153/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2816
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x002e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 29500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=0ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769026/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2832
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=1 hotref=0 khotm=0x0001 sparem=0x001e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 29750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 30000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 30250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 30500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 30750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=2ms c3=0%/f=1ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +5321150/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2946
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: SCHED: load c0=74%/f=0ms c1=0%/f=3ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=1ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +773944/win nofold=0x0) ::
+[pulse5] live c0=11ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=2963
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=5 khot=0 hotref=0 khotm=0x0000 sparem=0x003e sparepct=0 kstale=1 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 31000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 31250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=2ms c2=0%/f=1ms c3=0%/f=1ms c4=0%/f=4ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +2213921/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=3012
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x002e sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 31500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=74%/f=0ms c1=0%/f=4ms c2=0%/f=3ms c3=0%/f=3ms c4=0%/f=1ms c5=0%/f=0ms c6=--/f=never-folded c7=--/f=never-folded (ctx +769009/win nofold=0x0) ::
+[pulse5] live c0=0ms c1=0ms c2=0ms c3=0ms c4=0ms c5=0ms c6=0ms c7=0ms span_max=11ms window=250ms folds=3029
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=0 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[spread7] quant=0 trim=0 wake2disp n=0 mean=0us max=0us
+[spread9] kick=0 svc_lat n=0 mean=0us max=0us
+[spread10] slots 1c=0 2c=0 3c+=0 co_moves=0 ymoves=0 recruit=0 rstale=0 spare=4 khot=0 hotref=0 khotm=0x0000 sparem=0x003c sparepct=0 kstale=2 split=0 repack=0
+[prio] svc=0 el0=0 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=0)
+:: [orinbsptick] tick 31750 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 32000 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 32250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: [orinbsptick] tick 32500 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+:: SCHED: load c0=--/f=590295810358705ms c1=0%/f=0ms c2=0%/f=2ms c3=0%/f=2ms c4=0%/f=0ms c5=0%/f=4ms c6=--/f=never-folded c7=--/f=never-folded (ctx +4564555/w
+=== line-butler holds /dev/ttyACM0 @ 2026-09-11T21:12:24Z ===

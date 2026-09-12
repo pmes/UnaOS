@@ -111,3 +111,21 @@ FORBID \[vugres\] selftest -> SKIP
 # the colliding pair by win id and asid, and it is read off the same `placed` array the fix consults,
 # so the verdict and the fix cannot silently disagree.
 FORBID \[wm\] tile-fit.* -> ALIASED
+
+# --- STRIPVAC: the furniture strip hands back what it vacates (CURSORBG) -----------------------
+# A strip that shrinks paints its uncovered ends flat `wm::DESKTOP_BG` through `strip::erase_rect`,
+# and until CURSORBG it told NOBODY — no `wm::damage_intersecting`, no desktop present request —
+# while `crystal`, `winmenu` and `wm::drain_deferred` all pair their `DESKTOP_BG` write with both.
+# On aarch64 `wm::occ_clip` is `OccClip::none`, so a window can lie under the dock's ends and the
+# flat erase stamps a hole nothing repaints: render11 measured `[strip] rollup tenant=dock …
+# flat_px=33696 -> FLAT-VACATE` against Peter's "background drawing issue" on the same boot.
+#
+# The fixture forces one vacate with a genuine uncovered span and scores the census. It reds by
+# reverting one call: without `restore_vacated` the line reads `uncovered=1 restored=0 flat=1`.
+# No numerics are pinned that the fixture does not itself fold into PASS/FAIL — the three counts
+# below are the claim, so they are literal rather than \d+.
+REQUIRE :: STRIPVAC: .* uncovered=1 restored=1 flat=0 .* :: PASS ::
+FORBID :: STRIPVAC: .* :: FAIL ::
+# A SKIP here is a fixture that did not run: on this spec's own gate (QEMU 1280x800, word4 surface)
+# neither skip arm is honest, so one appearing means the panel or the scratch was lost — a red.
+FORBID :: STRIPVAC: .* :: SKIP ::

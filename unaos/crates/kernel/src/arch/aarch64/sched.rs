@@ -3317,7 +3317,7 @@ pub fn mark_el1_core() -> bool {
 /// Read-only, and deliberately so: the mask is written in exactly one place ([`mark_el1_core`], by a
 /// core measuring its OWN `CurrentEL`), which is the property that makes it evidence instead of
 /// configuration. Nothing here can set a bit.
-#[cfg(feature = "orinel1ap")]
+#[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 pub fn el1_core_mask() -> u64 {
     EL1_CORE_MASK.load(Ordering::Acquire)
 }
@@ -5206,6 +5206,17 @@ pub fn timer_preempt() {
     if raw.is_null() {
         return; // scheduler/idle context, or an unscheduled core (the BSP)
     }
+    // COMPGATE — a standing preemption hold declines this boundary. Placed ABOVE the kill check on
+    // purpose: `kill_check_current` NEVER RETURNS for a killed task, so a kill taken at a tick that
+    // landed inside a hold would retire the holder without ever running its guard's drop, and this
+    // core would never preempt again. Above it, a held core simply declines and the task dies at the
+    // first tick after the release. The quantum is deliberately NOT counted down here either — the
+    // held task resumes with what it had rather than being granted a fresh slice. See the COMPGATE
+    // ledger at the file tail for why this is a switch decline and not an interrupt mask.
+    if nopreempt_held(cpu) {
+        NOPREEMPT_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     // SKILL-1 on-CPU kill boundary — the load-bearing one. The quantum tick is the ONLY involuntary
     // boundary a spinning EL0 task ever reaches (it makes no syscalls and never yields), so this is what
     // turns "parked PORPHANED but still burning a core at 100%" into an actual death. Checked BEFORE the
@@ -5274,6 +5285,15 @@ pub fn ipi_preempt() {
     }
     if IN_RQ_SECTION[cpu].load(Ordering::Acquire) != 0 {
         return; // discipline breach (never expected): decline; the quantum trim still bounds the wake
+    }
+    // COMPGATE — the SECOND involuntary switch path, and it needs the same decline for the same
+    // reason: a wake-at-IPI-receipt that lands inside a compositor pass switches the holder out just
+    // as a quantum tick would. Above `kill_check_current` on the identical argument made in
+    // `timer_preempt`. The wake is not lost — the woken task is on the run queue and the quantum
+    // trim `preempt_hint` already applied still bounds when it runs.
+    if nopreempt_held(cpu) {
+        NOPREEMPT_DEFERRED.fetch_add(1, Ordering::Relaxed);
+        return;
     }
     // SKILL-1 on-CPU kill boundary, exactly as at the top of `timer_preempt`'s switch arm: this is a
     // legitimate involuntary boundary, so a killed incumbent dies here rather than running on.
@@ -8773,13 +8793,13 @@ pub fn el0live_witness() {
     let mut runnable = 0usize;
     let mut parked = 0usize;
     let mut last_disp = 0u64;
-    let mut last_wake = 0u64;
+    let mut last_wake = 0u64; let mut el0_cpus = 0u64; let mut last_cpu = usize::MAX; // ORIN-APSRUN — WHERE, not just when. Every field on this line was machine-wide (a max over cores, a sum over cores), so a render11 capture in which all six cores were online and only core 0 ever dispatched an EL0 thread reads IDENTICALLY to a healthy six-core spread. `el0cpus` is the set of cores whose EL0 dispatch clock was ever stamped and `lastcpu` is the core holding the most recent stamp; both come from the per-core arrays this loop already reads, so nothing new is tracked and no lock is taken. APPENDED to this line — zero source lines added.
     for cpu in 0..NUM_CPUS {
         committed += el0_committed(cpu);
         runnable += el0_active(cpu);
         parked += el0_parked_raw(cpu);
         last_disp = last_disp.max(EL0_LAST_DISPATCH_CYC[cpu].0.load(Ordering::Relaxed));
-        last_wake = last_wake.max(EL0_LAST_WAKE_CYC[cpu].0.load(Ordering::Relaxed));
+        last_wake = last_wake.max(EL0_LAST_WAKE_CYC[cpu].0.load(Ordering::Relaxed)); { let d = EL0_LAST_DISPATCH_CYC[cpu].0.load(Ordering::Relaxed); if d != 0 { el0_cpus |= 1u64 << cpu; if last_cpu == usize::MAX || d == last_disp { last_cpu = cpu; } } } // ORIN-APSRUN. `d == last_disp` after the `max` above holds for the core that JUST supplied the running maximum, so the winner is the last core to satisfy it — a single pass, no second loop, and re-reading the same relaxed word is honest here because a stamp that advanced between the two loads only names a core that dispatched EL0 even more recently.
     }
     // Age against `now` rather than against each other: CNTPCT is monotonic and machine-wide, and
     // `saturating_sub` makes a stamp taken microseconds ago on another core read 0 rather than wrap.
@@ -8821,12 +8841,12 @@ pub fn el0live_witness() {
         }
     };
     serial_println!(
-        "[el0live] verdict={} el0 runnable/parked/committed={}/{}/{} last_disp={} last_wake={} stall>={}ms | reaped exit={} kill_oncpu={} kill_offcpu={} corrupt={} nopark={} | totals el0_disp={}",
+        "[el0live] verdict={} el0 runnable/parked/committed={}/{}/{} last_disp={} last_wake={} stall>={}ms | where hosts={:#x} el0cpus={:#x} lastcpu={} | reaped exit={} kill_oncpu={} kill_offcpu={} corrupt={} nopark={} | totals el0_disp={}",
         verdict,
         runnable, parked, committed,
         age(last_disp, disp_ms),
         age(last_wake, wake_ms),
-        EL0_STALL_MS,
+        EL0_STALL_MS, el0_host_mask(), el0_cpus, if last_cpu == usize::MAX { -1 } else { last_cpu as isize }, // ORIN-APSRUN — the `where` group. `hosts` is the set of cores an EL0 task MAY run on right now (`online & el1cores`), `el0cpus` the set it HAS run on, `lastcpu` the core that ran it most recently (-1 = never, the same `--`-for-untracked discipline the age fields use). `hosts` wider than `el0cpus` is a placement question; `hosts` == 0x1 is the ORIN-APSRUN defect itself, on the line an operator already reads every window.
         reap_exit, reap_kill_on, reap_kill_off, reap_corrupt, reap_nopark,
         el0_disp,
     );
@@ -9129,12 +9149,12 @@ fn spread4_witness() {
         // EL0-EL1CORE — `el0refuse` is appended at the END so every existing consumer's prefix match is
         // untouched. Where this line is emitted at all it carries the running refusal total un-capped,
         // which the per-event refusal lines cannot (they are rate-limited by `EL0_REFUSE_LOG_MAX`).
-        // READ THE CAVEAT AT `EL0_REFUSALS` BEFORE RELYING ON IT: this whole witness is link-time dead
-        // on a tegra build — no caller of `spread4_witness` is reachable there — so on the Orin the
-        // field does not appear and is not the readout. Structurally 0 on `pi` (no core is ever
-        // filtered out) and 0 on any build with no EL0 tasks, exactly as `[spread4]`'s zero baseline
-        // already proves its own wiring.
-        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms el0refuse={}",
+        // The `EL0_REFUSALS` caveat ("link-time dead on a tegra build") EXPIRED with ORIN-BSPRUN/APSRUN:
+        // `load_witness_tick` chains this from `timer_preempt`, and render12 A1 carries `[spread4] live`
+        // every window. ORIN-CORE0 (orin 26): the census was FOUR columns wide on a six-core board, so
+        // c4/c5 had no reader on this line; `c4..c7` are APPENDED AFTER `el0refuse` (every existing
+        // field keeps its position; `el0_active`/`.get(c)` read 0/0 past `NUM_CPUS`, the `[wcpar] c0..c7` shape).
+        "[spread4] live c0={}/{} c1={}/{} c2={}/{} c3={}/{} rewake={} stay={} short={} refresh={} margin={} minpark={}ms steal={} d1={} remig={} cool={} pack={} rwstamp={} residn={} residmin={}ms residavg={}ms el0refuse={} c4={}/{} c5={}/{} c6={}/{} c7={}/{}",
         el0_active(0),
         EL0_RESIDENTS[0].0.load(Ordering::Relaxed),
         el0_active(1),
@@ -9160,7 +9180,7 @@ fn spread4_witness() {
         // the honest reading of that beside `residn=0` (which is what makes it interpretable).
         if resid_n == 0 { 0 } else { SPREAD15_RESID_MIN.load(Ordering::Relaxed) },
         if resid_n == 0 { 0 } else { SPREAD15_RESID_SUM.load(Ordering::Relaxed) / resid_n },
-        EL0_REFUSALS.load(Ordering::Relaxed),
+        EL0_REFUSALS.load(Ordering::Relaxed), el0_active(4), EL0_RESIDENTS.get(4).map_or(0, |r| r.0.load(Ordering::Relaxed)), el0_active(5), EL0_RESIDENTS.get(5).map_or(0, |r| r.0.load(Ordering::Relaxed)), el0_active(6), EL0_RESIDENTS.get(6).map_or(0, |r| r.0.load(Ordering::Relaxed)), el0_active(7), EL0_RESIDENTS.get(7).map_or(0, |r| r.0.load(Ordering::Relaxed)), // ORIN-CORE0 — c4..c7 on this line: zero source lines added (Location rule).
     );
     spread7_witness();
     spread10_witness();
@@ -10771,12 +10791,12 @@ fn bsprun_hosting_witness(cpu: usize) {
     }
     let hosting = el0_placement_possible(CPU_AUTO);
     serial_println!(
-        ":: [bsprun] host core={} el={} -> {} (online={:#x} el1cores={:#x}; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses on — EL0-EL1CORE) ::",
+        ":: [bsprun] host core={} el={} -> {} (online={:#x} el1cores={:#x} hosts={:#x}; predicate = el0_placement_possible(CPU_AUTO), the one spawn_user_image_bg refuses on — EL0-EL1CORE) ::",
         cpu,
         el,
         if hosting { "HOSTING" } else { "REFUSING" },
         online_bits,
-        EL1_CORE_MASK.load(Ordering::Acquire)
+        EL1_CORE_MASK.load(Ordering::Acquire), el0_host_mask() // ORIN-APSRUN — `hosts` is the SET behind the bool: `online & el1cores`, per core. `HOSTING` says only that SOME core can host, which on render11 was true with a single candidate and read exactly like a healthy machine; `hosts=0x1` vs `hosts=0x3f` is the difference Peter's "we are still only on one core" was about, and no field on this line could express it. APPENDED to this line (zero source lines added; the file's Location-shift convention).
     );
 }
 
@@ -11007,4 +11027,162 @@ fn virt_preempt_arm(cpu: usize) {
     spawn("vp-spinB", vp_spin_body, 2, cpu);
     spawn("vp-judge", vp_judge_body, 0, cpu);
     SCHED_ACTIVE.store(true, Ordering::Release);
+}
+
+// ── ORIN-APSRUN (orin 23) — the WHERE half of the EL0 witnesses ──────────────────────────────────
+//
+// Appended at the FILE TAIL, after every existing item, so not one panic `Location` line number above
+// moves and the Pi `kernel8.img` keeps its bytes; both call sites are expressions APPENDED to lines
+// that already existed. Ungated for the same reason `el0live_witness` itself is ungated — the
+// counters it reads exist on every aarch64 build and read the empty baseline where there is no EL0.
+//
+// WHY A SET AND NOT A BOOL. `el0_placement_possible(CPU_AUTO)` is `any(c) { ONLINE_MASK[c] &&
+// el1_core(c) }`. It answers "can this machine host an EL0 task at all", and on render11 it answered
+// YES — truthfully — with exactly one candidate, so `[bsprun] host … -> HOSTING` printed on a boot
+// whose whole userspace was pinned to core 0. `hosts` is that predicate's WITNESS SET rather than its
+// verdict: same conjunction, evaluated per core and published as a mask, so `0x1` and `0x3f` are
+// distinguishable on the wire. It is a strict generalisation — `hosts != 0` iff
+// `el0_placement_possible(CPU_AUTO)` — which is what lets it be read beside the bool without a second
+// definition of "host" existing anywhere.
+
+/// ORIN-APSRUN — the set of cores an EL0 task may be dispatched from RIGHT NOW: `ONLINE_MASK[c] &&
+/// el1_core(c)`, one bit per `cpu_index`. The per-core expansion of
+/// [`el0_placement_possible`]`(CPU_AUTO)`, and deliberately expressed in the same two terms so the
+/// two can never disagree about what a host is.
+///
+/// Reads only, lock-free, safe from any core and from IRQ context — it takes no run-queue lock, which
+/// is what lets it ride the same timer-IRQ witness train `[el0live]` rides. `NUM_CPUS` is 8 on tegra
+/// and 4 elsewhere, so a `u64` covers the machine with room to spare.
+///
+/// On `pi` this reads back as the online set: `el1_core` folds to `true` there (every Pi core is at
+/// EL1 before the scheduler exists), which is the right answer and the reason the Pi's line is
+/// unchanged in meaning.
+fn el0_host_mask() -> u64 {
+    let mut mask = 0u64;
+    let mut c = 0usize;
+    while c < NUM_CPUS {
+        if ONLINE_MASK[c].load(Ordering::Acquire) && el1_core(c) {
+            mask |= 1u64 << c;
+        }
+        c += 1;
+    }
+    mask
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// COMPGATE — A BOUNDED, PER-CORE PREEMPTION HOLD, AND WHY IT IS NOT AN INTERRUPT MASK.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT THIS SERVES (`video/wm.rs`'s COMPGATE ledger has the full statement). A composite pass
+// on this arch runs with interrupts ENABLED — the console present reaches it through
+// `fbcon::route_present_banded` -> `wm::present_banded` -> `wm::composite` with no mask — and the
+// preemption quantum is `QUANTUM_TICKS` ticks (~12 ms at the 250 Hz tick, this file's own
+// arithmetic). A present measured at 117 ms on the Orin panel therefore takes ~9 involuntary
+// switches inside itself, and every task that runs in those windows is free to start its own
+// present on the same core. The compositor's staging buffer is PER CORE (`wm::STAGE`, indexed by
+// `meter_current_cpu`), so a re-entrant present on the SAME core is the only way its `try_lock` can
+// fail — and it did, 73 times in one Orin flight (`[wc-h] rollup … decl_lock=73`), each one falling
+// through to the direct, unclipped, per-pixel front-buffer path that tears.
+//
+// WHAT THIS IS. A per-core counter. While it is non-zero, the two INVOLUNTARY switch paths on this
+// arch — `timer_preempt` (the quantum tick) and `ipi_preempt` (SPREAD-9's wake-at-IPI-receipt) —
+// decline to switch and return. Nothing else changes: the tick is still taken, the GIC still EOIs,
+// `load_witness_tick` still runs, `arch::ms()` still advances (it reads CNTVCT, not a tick count),
+// and every other interrupt on the machine is delivered normally. The ONLY thing deferred is the
+// context switch, on the one core that asked, for the length of one bounded critical section.
+//
+// WHY NOT `IrqGuard` / a mask. Masking interrupts for the length of a 117 ms present is the cure
+// that is worse than the disease: it stops the timer, the GIC, the UART and the interconnect
+// witnesses on that core for a tenth of a second, and this tree has already convicted exactly that
+// shape once (`[comp2] max_us=302134` under a masked reopening present, `video/wm.rs`). A
+// preemption hold costs the scheduler a deferred switch and costs the hardware nothing.
+//
+// THE THREE HAZARDS, and how each is closed.
+//
+//   1. **A LEAKED HOLD DISABLES PREEMPTION ON A CORE FOREVER.** The hold is an RAII guard whose drop
+//      is the only decrement, and the check below is placed ABOVE `kill_check_current()` in both
+//      switch paths — deliberately. `kill_check_current` NEVER RETURNS for a killed task, so a
+//      kill taken at a tick that landed inside a hold would retire the task without ever running
+//      its guard's drop, and the core would never preempt again. Above the kill check, a held core
+//      simply declines the boundary; the task dies at the first tick after the release, which is at
+//      most one quantum later and is the same death.
+//   2. **A HOLDER THAT YIELDS.** A guard is released by the core that took it (the index is stored
+//      IN the guard, `BlitGuard`'s idiom in `video/wm.rs`), so a migration cannot decrement a
+//      stranger's counter. A holder that blocks would still leave the hold standing on its old core
+//      until it resumes — which is why the compositor's critical section is verified yield-free:
+//      every lock it takes inside the pass is a `spin::Mutex`, and every `DrainBarrier` (the one
+//      structure in that module that can yield) is taken by the MOVE and TEARDOWN paths, outside
+//      `composite_once`.
+//   3. **STARVATION.** The hold is bounded by the pass, and a pass is bounded by the panel: the
+//      quantum is not consumed while the hold stands (this returns before the countdown), so the
+//      held task resumes with its remaining quantum and is preempted at the very next tick after
+//      the release rather than being granted a fresh one.
+//
+// The count of declined boundaries is published rather than assumed — see [`preempt_deferrals`].
+// `deferred=0` on a boot that composited is the statement that no involuntary switch ever landed
+// inside a pass; a rising `deferred=` is the mechanism working, and it is the number to read
+// against `[compgate] rollup maxhold_us=` when the two disagree about how long a pass really is.
+
+/// COMPGATE — per-core preemption-hold depth. Non-zero on core `c` = the two involuntary switch
+/// paths decline on `c`. Nested holds are counted, not flagged, so an inner section cannot release
+/// an outer one's hold.
+static NOPREEMPT: [AtomicU32; NUM_CPUS] = [const { AtomicU32::new(0) }; NUM_CPUS];
+
+/// COMPGATE — involuntary switch boundaries declined because a hold was standing. Gauge, never
+/// drained; published by [`preempt_deferrals`].
+static NOPREEMPT_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// COMPGATE — is a preemption hold standing on `cpu`? One relaxed load on the tick path.
+#[inline]
+fn nopreempt_held(cpu: usize) -> bool {
+    cpu < NUM_CPUS && NOPREEMPT[cpu].load(Ordering::Relaxed) != 0
+}
+
+/// COMPGATE — a standing preemption hold on the core that took it. Drop releases it.
+///
+/// The core index is captured at acquisition and used at release, so a task that MIGRATES between
+/// the two decrements the counter it incremented. That is the same reason `wm::BlitGuard` stores its
+/// enter-core rather than re-reading it at drop.
+pub struct PreemptHold {
+    core: usize,
+}
+
+/// COMPGATE — take a preemption hold on this core. See the ledger above for the contract; the caller
+/// must keep the section BOUNDED and free of voluntary yields.
+#[inline]
+pub fn preempt_hold() -> PreemptHold {
+    let core = meter_current_cpu().min(NUM_CPUS - 1);
+    NOPREEMPT[core].fetch_add(1, Ordering::AcqRel);
+    PreemptHold { core }
+}
+
+impl Drop for PreemptHold {
+    fn drop(&mut self) {
+        // Saturating rather than a bare `fetch_sub`: an underflow would wrap to `u32::MAX` and
+        // disable preemption on this core for the rest of the boot, which is the one failure mode
+        // this whole block exists to make impossible.
+        let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
+    }
+}
+
+/// COMPGATE — how many involuntary switch boundaries have been declined by a standing hold.
+pub fn preempt_deferrals() -> u64 {
+    NOPREEMPT_DEFERRED.load(Ordering::Relaxed)
+}
+
+/// COMPGATE — is a hold standing on THIS core, read through the SAME predicate the two switch paths
+/// read?
+///
+/// It calls [`nopreempt_held`] rather than re-deriving the test, deliberately: a fixture that asked
+/// the question its own way could report a hold the tick path does not honour, which is exactly the
+/// failure it exists to detect. `video/wm.rs`'s `compgate_selftest` leg 2 reads it in all three
+/// states — before, inside, after — so the leaked-hold hazard (a core that never preempts again) is
+/// measured rather than inferred from the absence of a symptom.
+pub fn preempt_hold_standing() -> bool {
+    // The SAME clamp [`preempt_hold`] applies, so the slot read is the slot written. Without it a
+    // core index at or beyond `NUM_CPUS` would take its hold on the last slot and then read `false`
+    // from this function, and the fixture would red on a machine whose gate was working.
+    nopreempt_held(meter_current_cpu().min(NUM_CPUS - 1))
 }

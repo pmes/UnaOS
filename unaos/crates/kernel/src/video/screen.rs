@@ -2250,3 +2250,39 @@ pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
         );
     }
 }
+
+// ── CURSORBG — "is the compositor owed a pass?", for a render pump that only presents on change ──
+//
+// THE DEFECT THIS CLOSES, stated as the measurement that found it. The Orin's render service
+// (`main.rs::orin_render_service`) presents at most once per pass and only when something set
+// `dirty`. On the cascaded scene its two sources of `dirty` both go permanently false — `passes == 1`
+// fires once and `ui_status::tick` is masked out by `desktop_scene_owns_backdrop()` — so the
+// render11 capture reads `[orinrender] census passes=13998251 presents=1`: ONE desktop present in a
+// 466-second boot.
+//
+// [`Screen::flush`] is the only consumer of BOTH deferred queues in this subsystem: it drains
+// [`PRESENT_RECTS`] and [`FULL_PRESENT`] in `present_background`, and it is the caller of
+// `wm::service_damage()`. So on that board every cross-task request either queue carries was
+// enqueued and never served, for the life of the boot — `drain_deferred`'s per-box
+// `request_present_rect` (wm.rs), `crystal::repaint_vacated`, `winmenu::repaint_vacated`, and
+// `focus_changed`'s `request_full_present` alike. Each of those sites pairs a `DESKTOP_BG` write
+// with a request to put the scene back underneath it; on the Orin only the first half ever reached
+// the glass, which is why `[strip] rollup tenant=dock … flat_px=33696 -> FLAT-VACATE` describes 33k
+// panel pixels of flat desktop colour standing PERMANENTLY where scene content belongs.
+//
+// This is the predicate that lets such a pump ask the question. It is a peek, never a drain: the
+// flag is `load`ed (not swapped) and the queue is `try_lock`ed and only counted, exactly as
+// [`present_rects_meet`] does and for its reason — consuming either is `present_background`'s job,
+// and a peek that consumed would make the present that followed publish nothing.
+//
+// A contended queue answers `true`. That is the safe direction for a caller that is deciding
+// whether to present: a spurious present costs one pass, a missed one is the defect above.
+pub fn present_owed() -> bool {
+    if FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    match PRESENT_RECTS.try_lock() {
+        Some(q) => q.1 > 0,
+        None => true,
+    }
+}

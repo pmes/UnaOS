@@ -1,9 +1,38 @@
 ### SYNTHETIC. THIS IS NOT A METAL GREEN REFERENCE AND MUST NEVER BE CITED AS ONE.
 ### It is a hand-built capture whose only job is to prove that jetson-sync1.spec CAN
-### go green -- that its 17 REQUIREs and its end-of-run marker are simultaneously
-### satisfiable, and that a clean boot trips none of its 18 FORBIDs. A scorer that
-### has only ever been run against captures that red has not been tested; this file
-### is the other direction.
+### go green -- that its 23 REQUIREs, its one COUNT and its end-of-run marker are
+### simultaneously satisfiable, and that a clean boot trips none of its 20 spec-declared
+### FORBIDs nor any of mbench's three default ones. A scorer that has only ever been run
+### against captures that red has not been tested; this file is the other direction.
+### (20, not SPECARM's 18: the render10 INTEGRATE fold puts UNAFSROOT's one FORBID and
+### EVQPRINT's one FORBID into the same spec as SPECARM's two, and this number is DERIVED
+### from `orin-specscore.py`'s FAILABILITY line at the integrated tip -- `44 of the 135
+### rule(s) THIS SPEC DECLARES can fail it`, i.e. 23 REQUIRE + 1 COUNT + 20 FORBID -- not
+### carried by hand across a merge, which is exactly the failure the note below records.)
+### (The line that stood here said "18 FORBIDs" without saying which set it counted; what
+### the OLD number was measuring has not been re-derived and is not asserted here. Every
+### number in this header is now `mbench.parse_spec` filtered on `not d.builtin` -- the
+### split `orin-specscore.py`'s FAILABILITY line prints on every run, added because two
+### different wrong answers to "how many FORBIDs" were available for this file on
+### 2026-09-07: a stale tally reading 15 and a naive parse reading 19.)
+###
+### 2026-09-07 (exec-orin20-specarm), ORIN-SPECARM -- THIS FILE NOW DEPICTS AN ARMED
+### DEFAULT BOOT, and the change rides in the same commit as the spec's, by necessity:
+### a promoted REQUIRE whose green reference lacks the witness is a spec that reds its
+### own proof. Seven lines GAINED (the ORIN-BSPTICK arming banner, `tick 1`, `tick 250`,
+### the ORIN-BSPRUN terminus banner, `[el0live]`, `[spread4]`, `[prio]`) and ONE LOST:
+### `:: CAPSTONE COMPLETE ... ::`. Losing it is not a weakening. On an armed image
+### `run_bsp_tegra` REPLACES `run_capstone_boot_core`, which is the only thing that ever
+### spawns `capstone_body`, so a capture carrying BOTH the ORIN-BSPRUN banner and
+### `CAPSTONE COMPLETE` is a boot no image can produce -- and the spec's own ORIN-BSPRUN
+### half-1 note says exactly that ("BOTH -- IMPOSSIBLE on one boot from one image"). The
+### head-of-file `REQUIRE (CAPSTONE COMPLETE|[orinbsprun] ...)` is satisfied here by its
+### other arm. All eight lines are VERBATIM wire text from ONE armed metal flight,
+### `capture/line-acm0/orin.log:132872-133705`, in that flight's own emission order
+### (arming + tick 1 immediately after the IRQEL-RT one-shot, the terminus banner ahead
+### of the rollup/load pair `run_bsp_tegra` re-emits, and the tick train after the JD2
+### pump), so this file continues to obey the provenance rule below rather than
+### excepting itself from it.
 ###
 ### PROVENANCE, line by line: every witness below is the VERBATIM wire text of the
 ### first line that satisfied that rule in the boot5b/desk sitting
@@ -18,6 +47,24 @@
 ### BOOT B (supstate1) capture will not carry them, and that asymmetry is legitimate;
 ### see the COVERAGE section of scripts/orin-specscore.py for which rules each image
 ### can and cannot fire.
+###
+### 2026-09-07 (orin 20, EVQPRINT): a `[ptrpoll]` line is added at the foot, and it is the
+### SECOND rewritten line in this file, for the same reason as the JD2/JD4 pair. The tail
+### block is a BOOT A shape and carries `[orinfurn] arm click=1`, so `orinclick` is armed
+### and a real capture of this shape WOULD carry `[ptrpoll]` — this file simply predated
+### the row. The text is NOT harvested wire: it is the byte-for-byte output of
+### `ptrpoll_witness`'s CURRENT format string (arch/aarch64/display_tegra.rs), obtained by
+### EXECUTING that literal rather than transcribing it, with the field values taken from
+### the BASELINE line of render9 (~/unaos-bench/scratch/orin19/pointerlag/bootB-render9.log)
+### plus the two terms EVQPRINT added. Every real capture predating EVQPRINT reds on the
+### EVQPRINT FORBID row in jetson-sync1.spec -- correct, not a regression: a spec
+### adjudicates the NEXT flight, and render9 is measured at 27 hits on that row.
+###
+### ⚠ THE ROW'S REGEX IS DELIBERATELY NOT QUOTED IN THIS FILE, and neither should any other
+### spec pattern be. mbench scans EVERY line of a capture, `###` prose included (this file
+### reads 60 lines scanned, not 21), so a pattern written out here is a line the scorer can
+### match. The escaped form happened to be safe by one backslash; that is luck, not design.
+### Name rows here, never quote them.
 :: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
 :: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
 :: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
@@ -28,14 +75,20 @@
 :: IRQEL-RT: first IRQ taken at EL1 on cpu 0 — banked vector path live (ELR_EL1 bank) ::
 :: IRQEL-RT: EL1 one-shot proof — arming CNTP for a single tick at EL1 (~100 ms window) ::
 :: IRQEL-RT: EL1 one-shot proof IRQ taken at EL1 on cpu 0 (the ARMING core) ::
+:: [orinbsptick] arming PERIODIC CNTP at EL1 on cpu 0 (250 Hz, PPI30) — IRQs stay UNMASKED across the terminus; dispatch is on_tick + post-EOI timer_preempt (ORIN-BSPRUN: SCHED_ACTIVE is set at the terminus — the run() loop is PREEMPTIVE) ::
+:: [orinbsptick] tick 1 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
 :: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::
 :: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x40000000 sp 0x40010000 ::
 :: TEGRA-EL0: el0-hello round-trip -> PASS ::
 :: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
+:: [orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true, mark_online(0), preemptive terminus (clock: ORIN-BSPTICK); sleeper drain + steal + idle fold + the SCHED load/[pulse5]/[spin1] train are live on tegra for the first time ::
 :: SCHED: [el0core] rollup: el0refuse=0 el1cores=0x1 (EL0-EL1CORE) ::
 :: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
-:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
 :: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
+:: [orinbsptick] tick 250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
+[el0live] verdict=EXTINCT el0 runnable/parked/committed=0/0/0 last_disp=668ms last_wake=-- stall>=2000ms | reaped exit=1 kill_oncpu=0 kill_offcpu=0 corrupt=0 nopark=0 | totals el0_disp=1
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=843 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[prio] svc=0 el0=1 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=1)
 [orinfurn] arm click=1 conwin=1 desk=1
 [orinconwin] gate panel=1920x1200x32
 [orinconwin] win=1 panel=1920x1200 cell=8x16 stage=1 table=1 present=Composited route=true live=LIVE -> ROUTED
@@ -43,3 +96,4 @@
 [orinrast] census seq=1 t=120 post=1 late=0 console-owns=1 conwin=1 pidesk=0 final=1 -> RAST-SUPERSEDED-BY-CONSOLE
 [orinstkdepth] depth-consumed=3184 bytes anchor-sp=0xffff000040200000 seam-sp=0xffff0000401ff390 at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
 :: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
+[ptrpoll] t=71 rearm=3 discard=0 errrearm=0 dup=0 nobuf=0 reports=3 base=3 decoded=0 folded=0 foldnew=0 -> BASELINE (the enumeration arms; every later line is measured against this one)

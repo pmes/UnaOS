@@ -120,6 +120,13 @@ fn main() {
     // OFF => byte-identical either way.
     if std::env::var("UNAOS_LIVECON").is_ok() { feats.push("livecon"); }
     if std::env::var("UNAOS_QUARRY").is_ok() { feats.push("quarry"); }
+    // FACET (ORIN-FACET): the image viewer — `video/facet.rs`, opened by a double-click on a `.PNG`
+    // row in the file manager. Mapped HERE as well as in `arroyo` because `facet` is named by the
+    // literal `x86-all` type-check leg, which is exactly the condition arroyo's KNOB→BUILDER check
+    // polices: a knob this map does not read arms the banner on x86 media carrying none of the code
+    // (the `rastmc` failure that check was written for). Cargo's `facet = ["quarry"]` pulls the file
+    // manager in behind it, so this one line is the whole wiring. Default OFF => byte-identical.
+    if std::env::var("UNAOS_FACET").is_ok() { feats.push("facet"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
@@ -176,6 +183,16 @@ fn main() {
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
+    // USBLUN (orin 27, M3/F2): the way back from the USB multi-LUN census in `drivers/xhci/mod.rs`.
+    // The census is DEFAULT-ON (it is the driver doing its job — a multi-slot card reader is one BOT
+    // device whose card slots are logical units), so this knob only ever turns it OFF:
+    // UNAOS_NOUSBLUN=1 => no census compiled, Get Max LUN never asked, `bCBWLUN = 0` and LUN 0
+    // published exactly as before. MUST be listed here and not only in `arroyo`: THIS list is the one
+    // the x86 kernel that actually boots is built from, and a knob mapped there alone is the rastmc
+    // failure — the banner says the feature is on and the image carries none of it. Arch-neutral
+    // feature; the x86 image is the one `./arroyo test` boots and the one the rMBP bench boots.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOUSBLUN").is_ok() { feats.push("nousblun"); }
     // WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk and
     // its one-line summary are always-on under `smc`; this buys back the 493-line inventory dump that
     // Boot V measured at ~3.5 s of displaced storage bring-up. Does NOT imply `smc` — inert without

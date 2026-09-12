@@ -252,14 +252,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(any(feature = "installdemo", feature = "install_target", feature = "piinstall"))]
     unaos_kernel::install::selfguard::set_boot_volume_serial(boot_info.boot_volume_serial);
 
-    // FRGUARD (GR21): the SAME field, published a second time — into the block layer's Default-write
-    // substitution guard. Deliberately not sharing INSTALL-SELF's copy above: that one is gated on the
-    // installer features, which no bench or boot build carries, and that is exactly why its
+    // BOOTROOT (orin 22, was FRGUARD/GR21): the SAME field, published a second time — into the block
+    // layer. Deliberately not sharing INSTALL-SELF's copy above: that one is gated on the installer
+    // features, which no bench or boot build carries, and that is exactly why its
     // `:: install: boot volume serial …` witness appears ZERO times across the 30-boot capture at
     // capture/rmbp-gr16-s73. A guard whose own input is invisible on the wire can be neither trusted
-    // nor falsified, so this arm carries its own publication and its own witness. Gated to the builds
-    // that compile the guard, so every other target is untouched.
-    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    // nor falsified, so this arm carries its own publication and its own witness.
+    //
+    // UN-GATED, on every target. It used to be `cfg(x86_64 + sdhcblk)` with the note "gated to the
+    // builds that compile the guard, so every other target is untouched" — true while the only
+    // reader was the x86 Default-write substitution guard, and FALSE the moment the datum became a
+    // shared seam. That sentence is the one rmbp 16 asked be rewritten rather than left to rot, and
+    // this is the rewrite.
+    //
+    // ⚠ WHAT IT IS NOT: it is not how `/` is chosen. BOOTROOT's root walk (`fs::bootdisk`) takes NO
+    // hint from the loader — Peter, 2026-09-08: "WTF does it matter what method I choose to boot?
+    // You are assuming too much." The kernel brings up every disk driver the board has, enumerates
+    // every FAT volume on every source, and binds the disk carrying the file whose bytes ARE this
+    // kernel's `.text` window. A serial the firmware handed over is precisely the assumption that
+    // walk exists to avoid making.
+    //
+    // WHAT IT IS: the seam its two real consumers need — INSTALL-SELF and FRGUARD both have to know
+    // which volume the loader came off so they can refuse to erase or substitute it, and rmbp asked
+    // that the seam be arch-neutral rather than x86-shaped. `fat::locate_boot_volume` is its one
+    // lookup. A build with no loader (Pi bare-metal `kernel8`, which synthesizes its own BootInfo)
+    // publishes nothing here and roots perfectly well without it; a loader that could not identify
+    // its medium publishes 0, the disarmed sentinel, and nothing about the root changes either.
     unaos_kernel::drivers::block::set_boot_volume_serial(boot_info.boot_volume_serial);
 
     // JC3 (virt/UEFI, GICv3 only): capture the firmware RAM-GiB map from boot_info BEFORE memory::init
@@ -275,7 +293,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // 4. Global Heap Allocation (Phase 3 Memory Translation)
     unaos_kernel::arch::memory::init(boot_info);
-    serial_println!(":: KERNEL HEAP ALLOCATED ::");
+    serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::unafsroot_selftest(); // UNAFSROOT (orin 26): HOMESOIL leg 6 on the boot path — the ONE heap-up line x86, virt and the Pi all pass through, so `test`/`test-arm` execute the root layout rule (nothing under walk_and_witness runs on a headless boot: measured `[vfs]` 0 lines on both captures). Same-line append, code before the comment; witness-free media compile none of it. The tegra path has its own heap line (tegra_early_stop) and is untouched.
     unaos_kernel::bootpace::record("heap");
 
     // VPERF M3 EARLY-ATTACH (bench QoL, Peter's word 2026-07-16): usbdebug builds attach the
@@ -2037,7 +2055,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // 1. Install the kernel's own MMU FIRST — SILENT. Nothing has printed yet (fbcon::init is
     //    print-free when fb_addr == 0), and the serial path cannot touch UARTC until this maps the
     //    Tegra device window. The FIRST serial byte of the whole kernel is the `mmu live` line below.
-    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info); unaos_kernel::arch::serial::mark_mmio_ready(); // DARKWIN-GUARD arm — window mapped; see tegra_darkwin_witness (tail)
+    let mmu = unaos_kernel::arch::mmu_tegra::init(boot_info); unaos_kernel::arch::serial::mark_mmio_ready(); unaos_kernel::drivers::block::set_boot_volume_serial(boot_info.boot_volume_serial); // DARKWIN-GUARD arm — window mapped; see tegra_darkwin_witness (tail). BOOTROOT (orin 22): the boot-volume-serial publish, folded onto THIS line. `kernel_main` calls `tegra_early_stop(boot_info)` at :190 and this fn is `-> !`, so the publish at :281 is DEAD CODE on a tegra image — a cfg widening alone would compile a seam nothing ever writes (ORIN-BOOTID, 72e2ecff, made the same fold for the same reason). It rides this line because `mark_mmio_ready()` immediately before it is what lets the witness reach UARTC at all, and because a same-line append moves no panic::Location. Every statement precedes the first `//` (the A9/PRTSCR-ORIN lesson). It does NOT decide the root: `fs::bootdisk` finds that by content — see the block at :255.
     serial_println!(
         ":: tegra: mmu live (EL{}) — RAM Normal-WB + Tegra Device-nGnRE mapped ::",
         mmu.el
@@ -2258,7 +2276,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                         // the pads down, so they arrive live and the RMW was dead code.)
                     }
                     None => serial_println!(":: tegra: JB1c — no usb@3610000 ids in DTB; SKIP ::"),
-                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe2")] unaos_kernel::arch::ga10b_probe::ga10bprobe2_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe3")] unaos_kernel::arch::ga10b_probe::ga10bprobe3_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe1")] unaos_kernel::arch::ga10b_probe::ga10bprobe1_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE1 (UNAOS_GA10B_PROBE1=1, default OFF) — the first read-only GA10B iGPU probe rung: it borrows the SAME `chan` `jb1b_ping` established (BPMP-first: the rail gate that earns the first BAR0 read cannot be asked without it), reads the risk-ordered register list announce-first, and ENDS THE BOOT in PSCI SYSTEM_OFF (`power::shutdown`) per the cold-boot bench law — so it never returns and no later boot phase runs on a probe flight. Its own media by design (co-arming with other tegra knobs is not a supported flight). Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE2 (UNAOS_GA10B_PROBE2=1, default OFF; a SIBLING knob, not a dependent) — rung 2 of the GA10B ladder (docs/dev/evidence/orin14/GA10B-LADDER.md): BPMP power-on + clock-enable of the gpu@ node's domain and clocks, one PMC_BOOT_0 read behind an explicit pg=ON readback, symmetric restore, and it RETURNS — so it sits BEFORE rung 1's call (a co-armed image runs rung 2 then rung 1's SYSTEM_OFF; the rung-2 flight arms rung 2 alone and boots through to the desktop). Appended to this line, never a new one. GA10B-PROBE3 (UNAOS_GA10B_PROBE3=1 for rung 3 alone, =2 for rung 3 + rung 3b; default OFF; a THIRD sibling knob) — rungs 3 and 3b of the same ladder: the SAME BPMP power+clock bracket rung 2 proved, then the read-only pass over what the platform firmware left behind (fuses -> MC -> TOP -> GSP falcon v1 -> GSP priscv BCR -> PMU falcon2, the one new read aperture, LAST), and under `ga10bprobe3b` the ladder's FIRST GA10B MMIO WRITES (GSP engine reset assert/deassert, then one MAILBOX0 scratch write) — then symmetric restore and it RETURNS, like rung 2. It sits between rung 2's call and rung 1's for the same reason rung 2 does: rung 1's SYSTEM_OFF must never run in front of a rung that has to reach the desktop.
+                } #[cfg(feature = "jd1dc")] unaos_kernel::arch::display_tegra::jd1_dc_probe(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe2")] unaos_kernel::arch::ga10b_probe::ga10bprobe2_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe3")] unaos_kernel::arch::ga10b_probe::ga10bprobe3_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); #[cfg(feature = "ga10bprobe1")] unaos_kernel::arch::ga10b_probe::ga10bprobe1_run(&chan, boot_info.dtb_addr, boot_info.dtb_size, mmu.ram_gib_mask); // JD1-DC (UNAOS_JD1DC=1, default OFF) — the BPMP-guarded, READ-ONLY nvdisplay register probe; see the JD1-DC tail block in display_tegra.rs. THIS instruction is the only point in the boot where both of its ordering constraints hold: BPMP-FIRST (the `chan` this borrows was established by `jb1b_ping` ~60 lines up, and without it the MRQ_PG GET_STATE guard that earns the first read cannot be asked — which is why the probe could NOT stay at its old site inside `jd1_survey`), and JD1-FIRST (the scanout resolution, `map_fb_region`, `fbcon::init` and the `WRITER` seed are ~90 lines up, so panel + serial + shell are already live on a framebuffer resolved by a pure DTB RAM walk and a probe that goes wrong costs the experiment, not the boot). Last in the BPMP block so every other diagnostic has already reached the wire before the one read that could end it. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE1 (UNAOS_GA10B_PROBE1=1, default OFF) — the first read-only GA10B iGPU probe rung: it borrows the SAME `chan` `jb1b_ping` established (BPMP-first: the rail gate that earns the first BAR0 read cannot be asked without it), reads the risk-ordered register list announce-first, and ENDS THE BOOT in PSCI SYSTEM_OFF (`power::shutdown`) per the cold-boot bench law — so it never returns and no later boot phase runs on a probe flight. Its own media by design (co-arming with other tegra knobs is not a supported flight). Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves. GA10B-PROBE2 (UNAOS_GA10B_PROBE2=1, default OFF; a SIBLING knob, not a dependent) — rung 2 of the GA10B ladder (docs/dev/evidence/orin14/GA10B-LADDER.md): BPMP power-on + clock-enable of the gpu@ node's domain and clocks, one PMC_BOOT_0 read behind an explicit pg=ON readback, symmetric restore, and it RETURNS — so it sits BEFORE rung 1's call (a co-armed image runs rung 2 then rung 1's SYSTEM_OFF; the rung-2 flight arms rung 2 alone and boots through to the desktop). Appended to this line, never a new one. GA10B-PROBE3 (UNAOS_GA10B_PROBE3=1 for rung 3 alone, =2 for rung 3 + rung 3b; default OFF; a THIRD sibling knob) — rungs 3 and 3b of the same ladder: the SAME BPMP power+clock bracket rung 2 proved, then the read-only pass over what the platform firmware left behind (fuses -> MC -> TOP -> GSP falcon v1 -> GSP priscv BCR -> PMU falcon2, the one new read aperture, LAST), and under `ga10bprobe3b` the ladder's FIRST GA10B MMIO WRITES (GSP engine reset assert/deassert, then one MAILBOX0 scratch write) — then symmetric restore and it RETURNS, like rung 2. It sits between rung 2's call and rung 1's for the same reason rung 2 does: rung 1's SYSTEM_OFF must never run in front of a rung that has to reach the desktop. GA10B-PROBE4 does NOT run here: its DMA window is seated by heap-guard (`memory::init`, ~60 lines below), which this board runs AFTER the BPMP block — the 4a boot 1 of 2026-09-11 read REFUSED reason=no-dma-window with the [ga10b4nc] census printing after the rung. Its call is appended to the post-heap-init line below, on a channel reopened from the same geometry without a second IVC sync.
             }
         }
         None => serial_println!(":: tegra: JB1b — geometry unresolved from DTB; SKIP ::"),
@@ -2319,7 +2337,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     serial_println!(":: KERNEL HEAP ALLOCATED ::"); #[cfg(feature = "orindesk")] unaos_kernel::arch::display_tegra::orin_wm1(); // ORIN-WM1 — one wm window on the JD1 scanout (tail block)
     // XCARVE-2 temporal bracket: heap carved + span-B top published (`select_heap_region`). span-B now
     // covers the 0x26b900000 target, so this is the first bracket whose bisect can fire on the target.
-    unaos_kernel::vugras::phase("post-heap-init");
+    unaos_kernel::vugras::phase("post-heap-init"); #[cfg(feature = "ga10bprobe4a")] if let Some(g) = unaos_kernel::arch::fdt_tegra::bpmp_geometry(dtb_addr, dtb_size, mmu.ram_gib_mask) { if let Some(c) = unaos_kernel::arch::bpmp_tegra::chan_reopen(&g) { unaos_kernel::arch::ga10b_probe::ga10bprobe4_run(&c, dtb_addr, dtb_size, mmu.ram_gib_mask); } } // GA10B-PROBE4 (UNAOS_GA10B_PROBE4=1 for rung 4a alone, =2 for 4a then 4b; default OFF; a FOURTH sibling of the probe knobs) — rungs 4a/4b of the GA10B ladder, brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md. HERE, not in the BPMP block above, because the rung's own 2 MiB Normal-NC DMA window is seated by `select_heap_region` inside `memory::init` two lines up (the NET4A law; `[ga10b4nc]` census) — boot 1 of 2026-09-11 ran the rung in the BPMP block and read REFUSED reason=no-dma-window with the census printing after it. The BPMP channel is re-derived from the same DTB geometry by `chan_reopen` (addresses only; the IVC channel `jb1b_ping` established stays established — no second SYNC). 4a RETURNS (desktop behind it) unless the BCR self-locks or sticks (SYSTEM_OFF); 4b ends the machine in SYSTEM_OFF on every path. Appended to this line, never a new one: knob-off it is cfg-erased and no panic `Location` below moves.
 
     // ORIN-NET-1 (read-only PCIe/NIC census, `UNAOS_PCIEPROBE=1`): with the `pcieprobe` feature
     // armed, run the census HERE on the metal Orin — after JM4 (serial/heap live) and the mmu is up
@@ -2375,7 +2393,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // (QEMU models no Tegra234 SDMMC). Compiled out knob-off => byte-identical to baseline. See
     // arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
     #[cfg(all(feature = "sdmmc", feature = "tegra"))]
-    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask); #[cfg(all(feature = "sdmmcwrite", feature = "tegra"))] unaos_kernel::arch::sdmmc_tegra::sdmmc_write_probe(); #[cfg(all(feature = "sdmmcroot", feature = "tegra"))] unaos_kernel::arch::sdmmc_tegra::sdmmc_root_probe_early(); // SDMMCWRITE (orin 14): the gap-#3 write probe — ONE CMD24 to a proven-free scratch sector + CMD17 read-back, directly after the census that published the card; appended to THIS line for knob-off byte identity (no line moves). See docs/dev/evidence/orin14/SDMMCWRITE.md. AND ROOTFS (orin 16, A28): the VFS-root probe, appended to the same line for the same reason — it mounts nothing (the mount table is built per verb, in shell::vfs_mount_table), it only asks HERE, where the census has just proved the window, whether the card carries a FAT volume, so a first flight can tell an unmountable medium from a later context that cannot reach the card.
+    unaos_kernel::arch::sdmmc_tegra::sdmmc_census(dtb_addr, dtb_size, mmu.ram_gib_mask); #[cfg(all(feature = "sdmmcwrite", feature = "tegra"))] unaos_kernel::arch::sdmmc_tegra::sdmmc_write_probe(); // SDMMCWRITE (orin 14): the gap-#3 write probe — ONE CMD24 to a proven-free scratch sector + CMD17 read-back, directly after the census that published the card; appended to THIS line for knob-off byte identity (no line moves). See docs/dev/evidence/orin14/SDMMCWRITE.md. BOOTROOT (orin 22) removed the second statement that stood here — the ROOTFS knob's early VFS-root probe. The root is not probed early and is not a per-board knob any more: `fs::bootdisk::locate` runs inside `shell::vfs_mount_table`, where the mount table is actually built, and finds the disk that carries THIS kernel by comparing the kernel's own .text against every candidate file on every enumerated volume.
 
     // ORIN-SMP-7 (boot-state-context bisect) — the PRE-xHCI-takeover dispatch site. With `smpprobe`
     // armed to leg 25, the real 5-core wake fires HERE — after JM4 (GIC/timer/SMC/serial live) and
@@ -2624,7 +2642,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // §ORIN-SMP-DEFAULT: `tegrasmp` is DEFAULT-ON for every tegra build (arroyo arms it for
     // `UNAOS_TEGRA=1` and `esp-jetson` alike, metal-proven across SMP-1..8) unless `UNAOS_NOTEGRASMP=1`
     // opts out, dropping call + enumerator => pre-flip baseline. Flip record: arch_arm64.md §ORIN-SMP-DEFAULT.
-    #[cfg(feature = "tegrasmp")]
+    #[cfg(feature = "apsrun")] unaos_kernel::arch::boot_tegra::publish_el1_root(mmu.ttbr0_el1); /* ORIN-APSRUN (orin 23) — publish the EL1 root BEFORE the first CPU_ON. Every AP that drops needs `mmu_tegra`'s EL1-PRECISE twin (`L1_EL1`), never the live EL2 `L1` (boot_tegra's AP[1]-forces-PXN lesson, five dark boots), and ORIN-EL1AP's ONE claimant waited for `drop_to_el1` to publish it — which is eighty lines below, past the entire PCIe/xHCI/SD probe stretch. With FIVE claimants that wait becomes the boot-12 shape: five Orin cores spinning against shared state starved the boot core's cooperative xHCI HID poll into "keyboard+mouse armed but ZERO deliveries" (timer.rs `this_core_has_local_tick`). Deleting the wait is the fix; tuning it is not. IT IS THE SAME VALUE FROM THE SAME EXPRESSION — `mmu.ttbr0_el1` is the literal argument `drop_to_el1` is handed below — so this is not a second reference that could drift, and `drop_to_el1` still stores it (idempotent, same value). Position: AFTER `mmu_tegra::init` built the twin (`mmu` is in hand) and BEFORE `start_secondaries_tegra` issues any CPU_ON. FOLDED ONTO THE LINE THAT CARRIES THE NEXT STATEMENT'S ATTRIBUTE, code-before-attribute, so not one source line is added and no `panic::Location` in this file moves — the knob-off `kernel8.img` keeps its hash. */ #[cfg(feature = "tegrasmp")]
     unaos_kernel::arch::smp_virt::start_secondaries_tegra(dtb_addr, dtb_size, mmu.ram_gib_mask);
 
     // 4. JM6: drop the Orin BOOT CORE EL2 -> EL1 and run the scheduler + full M4 CAPSTONE at EL1 — the
@@ -6316,7 +6334,7 @@ fn open_shell_window(
         cw as u32,
         ch as u32,
         stride as u32,
-        b"shell",
+        b"Shell",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );
@@ -7163,10 +7181,10 @@ fn tegra_el0_start_maybe() {
     }
     let demo = unaos_kernel::arch::syscall::setup();
     unaos_kernel::arch::syscall::protect();
-    // Pinned to the boot core (cpu 0, not CPU_AUTO): `pick_cpu_slot` short-circuits a non-AUTO request,
-    // so the EL0 task cannot be placed on a secondary. That pin is load-bearing — the boot core is the
-    // one this function has just proven is at EL1 with the real `VBAR_EL1` installed.
-    unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, 0);
+    // ORIN-CORE0 (orin 26) — CPU_AUTO, not a pin to core 0. The pin's reason ("the boot core is the one this function has just proven is at EL1 with the real VBAR_EL1") EXPIRED with ORIN-APSRUN: every AP re-runs `exceptions::install` and stamps `EL1_CORE_MASK` before this line runs (render12 A1 wire: `[apsrun] cpu 1..5 joins run() at EL1` at lines 1671-1715, `el0-hello spawned` at 1741), and the boot core is NOT in `ONLINE_MASK` yet (`mark_online(0)` is the terminus's, line 1880). So the pin parked the ONLY EL0 task of an idle boot behind five idle EL1 hosts, and `[el0live] el0cpus=0x1` read as a placement defect it was not: A3's CPU_AUTO `bg-user` landed on cores 1, 3, 4 through this same key chain (`el0cpus=0x3f`). Line-neutral edit: this file's panic-Location rule.
+    // FALLBACK keeps the `UNAOS_NOAPSRUN=1` opt-out boot alive: with no EL1 host online yet, CPU_AUTO is REFUSED (task id 0, no first-run, verdict FAIL), so that shape keeps the pin — core 0 is at EL1 and dispatches the queue when it joins run(). `el0_placement_possible` is the loader's own advisory predicate (`spawn_user_image_bg` asks it), so both arms are the scheduler's answer, not this function's guess. The witness prints which arm ran and the core the scheduler chose (`last_user_placement`, read at once from this same task, the contract its doc names); `core=-1` is a refusal.
+    let cpu = if unaos_kernel::arch::sched::el0_placement_possible(unaos_kernel::arch::sched::CPU_AUTO) { unaos_kernel::arch::sched::CPU_AUTO } else { 0 };
+    let tid = unaos_kernel::arch::sched::spawn_user("el0-hello", demo.hello, demo.sp, cpu);
     unaos_kernel::arch::sched::spawn(
         "tegra-el0-verdict",
         unaos_kernel::arch::syscall::tegra_el0_verdict,
@@ -7174,8 +7192,8 @@ fn tegra_el0_start_maybe() {
         0,
     );
     serial_println!(
-        ":: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry {:#x} sp {:#x} ::",
-        demo.hello,
+        ":: TEGRA-EL0: el0-hello spawned at EL0 (placement={} core={} tid={}), verdict armed — entry {:#x} sp {:#x} ::",
+        if cpu == unaos_kernel::arch::sched::CPU_AUTO { "auto" } else { "boot-core" }, if tid == 0 { -1 } else { unaos_kernel::arch::sched::last_user_placement() as isize }, tid, demo.hello,
         demo.sp
     );
 }
@@ -8876,7 +8894,7 @@ fn orin_render_service(_: usize) {
         // it is now the pass that OPENED the window — the deepest chain this task has), and after it
         // `tick` is the only source of `dirty`, which on the cascaded scene is never. An un-cascaded
         // board is unchanged: `tick`'s arming pass returns dirty on pass 1 anyway.
-        dirty |= passes == 1;
+        dirty |= passes == 1 || unaos_kernel::video::screen::present_owed(); // CURSORBG — the THIRD source of `dirty`, and the one the two above cannot cover: a present another task OWES this layer. `Screen::flush` is the only consumer in this subsystem of both deferred queues (`present_background` drains `PRESENT_RECTS` and swaps `FULL_PRESENT`) and the only caller of `wm::service_damage`, so a request enqueued by `wm::drain_deferred`, `crystal`/`winmenu::repaint_vacated`, `cursor::repair` or `strip::restore_vacated` reaches the glass only through a pass this predicate lets run. Without it this task's `dirty` is `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is masked out forever (ui_status.rs:1285) — render11 measured the consequence, `[orinrender] census passes=13998251 presents=1`. A peek, never a drain (see `screen::present_owed`), so the pass that follows still finds the queue to publish; and it is a pure function of two already-live statics, so an image whose queues nobody fills presents exactly as often as it did before. ⚠ FOLDED onto this line, never added below it — panic `Location`s.
         if dirty {
             pal.render();
             presents += 1;
@@ -9256,7 +9274,7 @@ fn tegra_shell_window_open(panel: &mut unaos_kernel::video::Screen) -> Option<Te
         cw as u32,
         ch as u32,
         stride as u32,
-        b"shell",
+        b"Shell",
         ox + wm::BORDER,
         oy + wm::TITLE_H + wm::BORDER,
     );
@@ -9837,7 +9855,7 @@ fn tegra_shell_remint() -> unaos_kernel::video::wm::WinId {
         w as u32,
         h as u32,
         TEGRA_SHELL_STRIDE.load(Ordering::Relaxed) as u32,
-        b"shell",
+        b"Shell",
         TEGRA_SHELL_X.load(Ordering::Relaxed),
         TEGRA_SHELL_Y.load(Ordering::Relaxed),
     );

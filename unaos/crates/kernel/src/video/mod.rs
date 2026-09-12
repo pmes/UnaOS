@@ -901,3 +901,48 @@ pub(crate) fn note_panel_write_refused(_tier: u8, _term: &'static str, _site: &'
 // family's does — together, in one place.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod winmenu;
+
+// ── FACET (`facet` / UNAOS_FACET=1, implied by `deskcascade`) — the IMAGE VIEWER ────────────────
+//
+// Peter, 2026-09-08: *"i was tempted to double click on one of the screenshots … i believe we
+// already have an image viewer in the vessels can we compile it for UnaOS?"* — `docs/CODEX.md` §2's
+// **Facet — Images — "The Canvas"**, as a kernel desktop tenant. The host-native `vessels/facet`
+// cannot be compiled for this target (Tokio + WGPU + the `png` crate are three `std` trees) and an
+// EL0 program cannot host the decoder either — DEFLATE's history window is 32 KiB and every EL0 task
+// in this kernel gets 16 KiB — so it takes `quarry`'s shape: a `wm` row over a cached-RAM ARGB8888
+// surface it owns. `video/facet.rs`'s header carries both measurements.
+//
+// DECLARED AT THE TAIL, below `winmenu`, for `winmenu`'s own reason restated because it is the trap:
+// this file is compiled into EVERY image including the knob-off Pi `kernel8.img`, and a `mod` line
+// inserted anywhere above renumbers `panel_info_nonblocking` and its neighbours, which
+// `core::panic::Location` embeds. An APPEND moves nothing.
+//
+// The gate is `quarry`'s furniture gate AND the module's own knob. Both halves are load-bearing:
+// the furniture gate because Facet is a client of `wm` and of `quarry` (its only door is a
+// double-click in the file manager — no file manager, no viewer, which is why Cargo has
+// `facet = ["quarry"]`), and the knob because the DECODER is real code (`selfhost::inflate` plus
+// this module's unfilter and box filter) that a desktop build should not carry unasked.
+// DEFAULT OFF => the module is not compiled, `quarry`'s two hook lines are `#[cfg]`-erased, and
+// every image is byte-identical to baseline.
+#[cfg(all(
+    feature = "facet",
+    any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
+))]
+pub mod facet;
+
+// ── BEAM (orin 26) — presents ordered against the scan-out's raster position ────────────────────
+//
+// Peter, render11 and render12 (2026-09-09): "THERE'S A LOT OF TEARING", while every `torn=` on
+// the wire read 0. TEAR-DIAG (`docs/dev/evidence/orin24/TEAR-DIAG.md`) showed why: the four tear
+// counters ask a DURATION question of a PHASE defect. `video/beam.rs` is the phase half — a hold
+// around every panel present until the beam is clear of the rows it is about to write, and the
+// observation of whether the beam crossed them anyway, which is what `torn=` now reads where a
+// beam source exists. UNCONDITIONAL, because it is the MECHANISM and not an instrument; on a
+// platform whose `arch::scanout_beam()` is `None` (x86, Pi, QEMU — every image but an Orin with
+// `UNAOS_BEAM=1`) every entry point folds to a no-op and the panel writes are what they were.
+//
+// DECLARED AT THE TAIL, below `facet`, for `facet`'s reason: this file is compiled into every
+// image including the knob-off Pi `kernel8.img`, and a `mod` line inserted anywhere above
+// renumbers `panel_info_nonblocking` and its neighbours, which `core::panic::Location` embeds.
+// An append moves nothing.
+pub mod beam;

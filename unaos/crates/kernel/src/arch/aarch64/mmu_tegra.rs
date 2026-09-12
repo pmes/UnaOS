@@ -1612,7 +1612,8 @@ pub fn select_heap_region(
     // proven-reachable placement); the NC block is contiguous just below, so it is equally clean and
     // equally inside the (degraded or derived) inbound-DMA window. `install_net4b_nc` maps it NC.
     const NC_BYTES: u64 = NET4B_NC_SIZE;
-    let need = heap_need + 2 * NC_BYTES;
+    let need_of = |heap: u64| heap + 2 * NC_BYTES;
+    let need = need_of(heap_need);
 
     // Collect carveouts to avoid: every non-Usable region the UEFI map declares, plus the DTB
     // `/reserved-memory` carveouts (the firewall ones UEFI hides inside Conventional descriptors).
@@ -1684,8 +1685,8 @@ pub fn select_heap_region(
     // of every range in `carveouts`, so no carveout can straddle `heap_hi`; the LOWEST carveout base
     // at/above `heap_hi` therefore bounds a provably carveout-free `[heap_hi, top)`. Span B must never
     // DC-CIVAC a carveout (cleaning a firewalled line IS the RAS), so the localizer clips to this.
-    let publish_above_heap_top = |heap_base: u64| {
-        let heap_hi = heap_base + heap_need;
+    let publish_above_heap_top = |heap_base: u64, heap_sz: u64| {
+        let heap_hi = heap_base + heap_sz;
         let mut top = crate::vugras::TEGRA_DRAM_TOP as u64;
         for &(cb, cs) in carveouts {
             if cs != 0 && cb >= heap_hi && cb < top {
@@ -1699,11 +1700,11 @@ pub fn select_heap_region(
     // window (2 MiB-aligned, just below). Latches `NET4B_NC_BASE`, publishes the span-B top for the HEAP
     // (which now tops the window), and returns the heap base. The NC window sits in `[s, heap_base)`,
     // fully inside the proven-clean, proven-in-DMA-window span `[s, s+need)`.
-    let seat = |s: u64| -> u64 {
+    let seat = |s: u64, heap_sz: u64| -> u64 {
         let heap_base = s + 2 * NC_BYTES;
         let nc_base = (s + NC_BYTES - 1) & !(NC_BYTES - 1);
         NET4B_NC_BASE.store(nc_base, core::sync::atomic::Ordering::Relaxed);
-        publish_above_heap_top(heap_base);
+        publish_above_heap_top(heap_base, heap_sz);
         heap_base
     };
 
@@ -1736,7 +1737,7 @@ pub fn select_heap_region(
     // Scans DOWN from `hi - need`, sliding strictly below the highest overlapping carveout each step
     // (O(carveouts), terminating — each slide strictly decreases `s`). Shared by the unconstrained
     // (heuristic) and the window-constrained searches below.
-    let highest_clean_in = |lo: u64, hi: u64| -> Option<u64> {
+    let highest_clean_in = |lo: u64, hi: u64, need: u64| -> Option<u64> {
         if hi < need || hi - need < lo {
             return None; // range can't hold a window
         }
@@ -1764,40 +1765,101 @@ pub fn select_heap_region(
     // best_uncon: highest clean base across ALL usable regions (the RAS-2 heuristic — the fallback and
     // the "what we'd have picked" diagnostic). best_in_win: the highest clean base that ALSO lies
     // fully inside a derived inbound window (the intersection of each usable region with each window).
-    let mut best_uncon: Option<u64> = None;
-    let mut best_in_win: Option<u64> = None;
-    for r in regions {
-        if r.kind != MemoryRegionKind::Usable {
-            continue;
-        }
-        let region_end = r.phys_start.wrapping_add((r.page_count * 4096) as u64);
-        let region_base = (r.phys_start + PAGE - 1) & !(PAGE - 1);
-        if let Some(s) = highest_clean_in(region_base, region_end) {
-            best_uncon = Some(best_uncon.map_or(s, |b| b.max(s)));
-        }
-        for &(wb, ws) in windows {
-            let lo = region_base.max(wb);
-            let hi = region_end.min(wb.wrapping_add(ws));
-            if hi <= lo {
+    // EL0MEM (orin 26): the scan is a function of the heap size so the ladder below can ask it more
+    // than once; `pick(heap_need)` is byte-for-byte the pre-ladder selection.
+    let pick = |heap_sz: u64| -> (Option<u64>, Option<u64>) {
+        let need = need_of(heap_sz);
+        let mut best_uncon: Option<u64> = None;
+        let mut best_in_win: Option<u64> = None;
+        for r in regions {
+            if r.kind != MemoryRegionKind::Usable {
                 continue;
             }
-            if let Some(s) = highest_clean_in(lo, hi) {
-                best_in_win = Some(best_in_win.map_or(s, |b| b.max(s)));
+            let region_end = r.phys_start.wrapping_add((r.page_count * 4096) as u64);
+            let region_base = (r.phys_start + PAGE - 1) & !(PAGE - 1);
+            if let Some(s) = highest_clean_in(region_base, region_end, need) {
+                best_uncon = Some(best_uncon.map_or(s, |b| b.max(s)));
+            }
+            for &(wb, ws) in windows {
+                let lo = region_base.max(wb);
+                let hi = region_end.min(wb.wrapping_add(ws));
+                if hi <= lo {
+                    continue;
+                }
+                if let Some(s) = highest_clean_in(lo, hi, need) {
+                    best_in_win = Some(best_in_win.map_or(s, |b| b.max(s)));
+                }
+            }
+        }
+        (best_uncon, best_in_win)
+    };
+    let (best_uncon, best_in_win) = pick(heap_need);
+
+    // EL0MEM (orin 26) — THE REQUEST LADDER. `HEAP_SIZE` (48 MiB on aarch64) is sized for the Pi's
+    // hand-placed heap region, which this board never uses: the Orin's heap is seated HERE, from the
+    // UEFI Usable map, on an 8 GiB board. render12 boot A3 ran that 48 MiB dry — `slot 4 backing
+    // allocation FAILED` x7, `PRTSCR … OutOfMemory`, `[facet] refuse … alloc(2304000)`, `[wc-d] … no
+    // memory` in one sitting — the same famine x86 measured at GR27 and answered with 256 MiB. This
+    // asks for the x86 regime and steps down until a window fits, and it never RELOCATES the heap: the
+    // 48 MiB window `pick(heap_need)` returns is the span every flight since ORIN-RAS-2 has proven
+    // xHCI-reachable (`[0x2683ca000, 0x26b3ca000)` on 21 recorded boots), so a larger rung is accepted
+    // only if its window CONTAINS that span — the heap grows downward from the proven seat, top fixed.
+    // A rung whose window lies elsewhere is refused by name; the last rung is the flown size and the
+    // flown seat, so the ladder can never do worse than render12. Each rung prints one `[el0heap]` line
+    // (the heap does not exist yet, so no String — one line per rung, not a built census).
+    const LADDER_MIB: [u64; 5] = [256, 192, 128, 96, 64];
+    let flown = if nd == 0 { best_uncon } else { best_in_win };
+    let mut chosen: Option<(u64, u64)> = flown.map(|s| (s, heap_need));
+    if let Some(s48) = flown {
+        let lo48 = s48;
+        let hi48 = s48 + need;
+        for &mib in LADDER_MIB.iter() {
+            let heap_sz = mib << 20;
+            let (u, w) = pick(heap_sz);
+            let cand = if nd == 0 { u } else { w };
+            match cand {
+                None => serial_println!(
+                    "[el0heap] heap ladder rung {} MiB: no clean window (flown span [{:#x}, {:#x}) kept as the floor)",
+                    mib, lo48, hi48
+                ),
+                Some(sb) => {
+                    let hib = sb + need_of(heap_sz);
+                    if sb <= lo48 && hib >= hi48 {
+                        serial_println!(
+                            "[el0heap] heap ladder rung {} MiB: SEATED — window [{:#x}, {:#x}) contains the flown span [{:#x}, {:#x})",
+                            mib, sb, hib, lo48, hi48
+                        );
+                        chosen = Some((sb, heap_sz));
+                        break;
+                    }
+                    serial_println!(
+                        "[el0heap] heap ladder rung {} MiB: REFUSED — window [{:#x}, {:#x}) does not contain the flown span [{:#x}, {:#x}) (would relocate the heap)",
+                        mib, sb, hib, lo48, hi48
+                    );
+                }
+            }
+        }
+        if let Some((cs, csz)) = chosen {
+            if csz == heap_need {
+                serial_println!(
+                    "[el0heap] heap ladder: every rung refused; seating the flown {} MiB window at base {:#x}",
+                    heap_need >> 20, cs
+                );
             }
         }
     }
 
     if nd == 0 {
         // No derivable inbound window: keep the RAS-2 highest-clean heuristic, but witness the degrade.
-        if let Some(s) = best_uncon {
-            let heap_base = seat(s);
-            seat_net4a_low_nc(regions, carveouts, heap_base, heap_base + heap_need, windows);
+        if let Some((s, heap_sz)) = chosen {
+            let heap_base = seat(s, heap_sz);
+            seat_net4a_low_nc(regions, carveouts, heap_base, heap_base + heap_sz, windows);
             let (ncb, ncs) = net4b_nc_window();
             serial_println!(
                 ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
                 heap_base,
-                heap_base + heap_need,
-                heap_need >> 20,
+                heap_base + heap_sz,
+                heap_sz >> 20,
                 nc
             );
             serial_println!(
@@ -1806,7 +1868,7 @@ pub fn select_heap_region(
                 ncb + ncs,
                 ncs >> 10
             );
-            return Some((heap_base as usize, heap_need as usize));
+            return Some((heap_base as usize, heap_sz as usize));
         }
         serial_println!(
             ":: tegra: HEAP-GUARD — FAIL-CLOSED: no {} MiB DRAM window clear of {} carveout(s) ::",
@@ -1824,15 +1886,15 @@ pub fn select_heap_region(
         windows[0].0.wrapping_add(windows[0].1),
         windows[0].1 >> 20
     );
-    if let Some(s) = best_in_win {
-        let heap_base = seat(s);
-        seat_net4a_low_nc(regions, carveouts, heap_base, heap_base + heap_need, windows);
+    if let Some((s, heap_sz)) = chosen {
+        let heap_base = seat(s, heap_sz);
+        seat_net4a_low_nc(regions, carveouts, heap_base, heap_base + heap_sz, windows);
         let (ncb, ncs) = net4b_nc_window();
         serial_println!(
             ":: tegra: HEAP-GUARD — kernel heap [{:#x}, {:#x}) ({} MiB), highest clean window INSIDE the derived PCIe inbound-DMA window(s) (RAS-2 boundary now DERIVED, not folklore), clear of {} carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::",
             heap_base,
-            heap_base + heap_need,
-            heap_need >> 20,
+            heap_base + heap_sz,
+            heap_sz >> 20,
             nc
         );
         serial_println!(
@@ -1841,7 +1903,7 @@ pub fn select_heap_region(
             ncb + ncs,
             ncs >> 10
         );
-        return Some((heap_base as usize, heap_need as usize));
+        return Some((heap_base as usize, heap_sz as usize));
     }
 
     // A carveout-clean window exists but NONE inside the derived inbound window ⇒ any pick would
@@ -1993,7 +2055,7 @@ fn seat_net4a_low_nc(
     }
     match best {
         Some(b) => {
-            NET4A_LOW_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed);
+            NET4A_LOW_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed); #[cfg(feature = "ga10bprobe4a")] seat_ga10b4_nc(regions, carveouts, heap_lo, heap_hi, windows, b);
             serial_println!(
                 ":: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [{:#x}, {:#x}) ({} KiB) — lowest clean L2-split block in [{:#x}, {:#x}); low-DRAM census: {} Usable region(s) / {} MiB usable, {} carveout(s) below 4 GiB, {} candidate block(s) scanned (rejected: carveout={} heap/nc={} window={} unsplit={}) ::",
                 b, b + BLK2, BLK2 >> 10, LOW_LO, LOW_HI,
@@ -2003,6 +2065,96 @@ fn seat_net4a_low_nc(
         None => serial_println!(
             ":: tegra: [net4A] NO sub-4GiB Normal-NC DMA window: no clean L2-split 2 MiB block in [{:#x}, {:#x}); low-DRAM census: {} Usable region(s) / {} MiB usable, {} carveout(s) below 4 GiB, {} candidate block(s) scanned (rejected: carveout={} heap/nc={} window={} unsplit={}) — the NIC falls back to the high window + inbound-iATU alias (NET-4s) ::",
             LOW_LO, LOW_HI, usable_regions, usable_bytes >> 20, carve_low, cand, rej_carve, rej_heap, rej_win, rej_split
+        ),
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// GA10B-PROBE4 (orin 26, `ga10bprobe4a`; brief docs/dev/OS/08_VIDEO/GA10B-RUNG4-BRIEF.md §2.2): the
+// rung's OWN 2 MiB Normal-NC DMA window for the boot-ROM's non-coherent fetch. Same placement law as
+// NET4A (lowest carveout-clean, L2-split, 2 MiB-aligned block inside ONE Usable region below 4 GiB,
+// clear of the heap and both NC windows), seated in the SAME scan from the SAME inputs, EXCLUDING the
+// block NET4A just took — the rung never borrows the NIC's window (a NIC ring and a GPU boot fetch in one
+// block is a race with no witness). Called from `seat_net4a_low_nc`'s success arm, appended to that line
+// so knob-off no `Location` moves. The rung maps it NC itself with `install_nc_window` at flight time.
+#[cfg(feature = "ga10bprobe4a")]
+static GA10B4_NC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// GA10B-PROBE4: the rung's reserved sub-4 GiB DMA window `(base, size)`, or `(0, 0)` when none seated.
+#[cfg(feature = "ga10bprobe4a")]
+pub fn ga10b4_nc_window() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    let base = GA10B4_NC_BASE.load(Ordering::Relaxed);
+    (base, if base != 0 { NET4B_NC_SIZE } else { 0 })
+}
+
+#[cfg(feature = "ga10bprobe4a")]
+fn seat_ga10b4_nc(
+    regions: &[MemoryRegion],
+    carveouts: &[(u64, u64)],
+    heap_lo: u64,
+    heap_hi: u64,
+    windows: &[(u64, u64)],
+    net4a_base: u64,
+) {
+    const LOW_LO: u64 = 0x8000_0000;
+    const LOW_HI: u64 = 0x1_0000_0000;
+    const BLK2: u64 = NET4B_NC_SIZE;
+    let (ncb, ncs) = net4b_nc_window();
+    let l1 = &raw const L1 as *const u64;
+    let overlaps = |a_lo: u64, a_hi: u64, b_lo: u64, b_hi: u64| -> bool { a_lo < b_hi && b_lo < a_hi };
+    let mut best: Option<u64> = None;
+    let mut cand = 0u64;
+    let mut rej = 0u64;
+    for r in regions {
+        if r.kind != MemoryRegionKind::Usable {
+            continue;
+        }
+        let r_lo = r.phys_start.max(LOW_LO);
+        let r_hi = r.phys_start.wrapping_add(r.page_count * 4096).min(LOW_HI);
+        if r_hi <= r_lo {
+            continue;
+        }
+        let mut s = (r_lo + BLK2 - 1) & !(BLK2 - 1);
+        while s + BLK2 <= r_hi {
+            let e = s + BLK2;
+            cand += 1;
+            let mut ok = s != net4a_base;
+            for &(cb, cs) in carveouts {
+                if cs != 0 && overlaps(s, e, cb, cb.wrapping_add(cs)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && (overlaps(s, e, heap_lo, heap_hi) || (ncs != 0 && overlaps(s, e, ncb, ncb + ncs))) {
+                ok = false;
+            }
+            if ok && !windows.is_empty() && !windows.iter().any(|&(wb, ws)| s >= wb && e <= wb.wrapping_add(ws)) {
+                ok = false;
+            }
+            if ok && !is_table_desc(unsafe { l1.add((s >> 30) as usize).read_volatile() }) {
+                ok = false;
+            }
+            if ok {
+                best = Some(best.map_or(s, |b| b.min(s)));
+                break;
+            }
+            rej += 1;
+            s = e;
+        }
+    }
+    match best {
+        Some(b) => {
+            GA10B4_NC_BASE.store(b, core::sync::atomic::Ordering::Relaxed);
+            serial_println!(
+                ":: tegra: [ga10b4nc] rung-4 DMA window reserved [{:#x}, {:#x}) ({} KiB) — the NEXT clean L2-split block after NET4A's [{:#x}, +{} KiB); {} candidate(s) scanned, {} rejected ::",
+                b, b + BLK2, BLK2 >> 10, net4a_base, BLK2 >> 10, cand, rej
+            );
+        }
+        None => serial_println!(
+            ":: tegra: [ga10b4nc] NO rung-4 DMA window: no second clean L2-split 2 MiB block in [{:#x}, {:#x}) besides NET4A's; {} candidate(s) scanned, {} rejected — rung 4 will REFUSE reason=no-dma-window ::",
+            LOW_LO, LOW_HI, cand, rej
         ),
     }
 }

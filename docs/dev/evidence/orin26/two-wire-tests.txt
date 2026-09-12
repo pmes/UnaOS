@@ -1,0 +1,6 @@
+4a-real rung=4a expect=0 got=0 OK
+4a-sib rung=4a expect=1 got=1 OK
+4a-hang rung=4a expect=1 got=1 OK
+4b-real rung=4b expect=0 got=0 OK
+4b-sib rung=4b expect=1 got=1 OK
+4b-sib2 rung=4b expect=1 got=1 OK

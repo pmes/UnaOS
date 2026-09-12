@@ -1986,7 +1986,7 @@ pub fn undraw() {
 /// See [`TOUCHED_SINCE_DRAW`] for the predicate and for the painters it does not hear from.
 fn repair(restored: Option<(usize, usize, usize, usize)>) {
     if let Some((x, y, w, h)) = restored {
-        super::wm::damage_intersecting(x, y, w, h);
+        super::wm::damage_intersecting(x, y, w, h); restore_note(x, y, w, h); // CURSORBG — the DESKTOP half of the handback, in the same breath as the window half, exactly as `wm::drain_deferred` and both `repaint_vacated`s pair them. Without it a pixel the colour guard declined to mend over the BACKDROP stands on the glass with nothing owing it a repaint — the trail Peter watched sweep up past the focused window. ⚠ FOLDED onto this line: this file is compiled into the knob-off `kernel8.img` and panic `Location` records embed line numbers. Block at the file tail.
     }
 }
 
@@ -3954,4 +3954,258 @@ fn sprite_panel() -> Option<super::FrameBuffer> {
         return None;
     }
     super::panel_snapshot()
+}
+
+// =================================================================================================
+// CURSORBG — THE OTHER HALF OF [`repair`]: the DESKTOP layer's handback.
+// =================================================================================================
+//
+// # The defect, in Peter's words and then in the code's
+//
+// Bench, render11 flight, 2026-09-08: *"tearing and background drawing issue where mouse cursor
+// updated background as it swept up past the focused window"*. On the glass the swept span came back
+// as flat desktop colour instead of the scene and the window content that belong there.
+//
+// [`repair`] hands a restored rect to `wm::damage_intersecting` — the WINDOW layer — and to nothing
+// else. That is one of the two halves every other painter in this subsystem hands back, and the
+// three precedents all pair them in the same breath:
+//
+// ```text
+//   wm.rs        drain_deferred      stage_fill(DESKTOP_BG) -> damage_intersecting + request_present_rect
+//   crystal.rs   repaint_vacated     erase_rect            -> damage_intersecting + request_full_present
+//   winmenu.rs   repaint_vacated     erase_rect            -> damage_intersecting + request_full_present
+//   cursor.rs    repair              colour-guarded restore -> damage_intersecting          <-- ONLY HALF
+// ```
+//
+// The missing half is exactly the span Peter watched. [`undraw_locked`]'s restore is COLOUR-GUARDED:
+// a pixel goes back only while the panel still holds the colour the sprite painted there, so a pixel
+// another painter has since taken is deliberately left alone — the module's own header calls that
+// residual out and names `repair` as what closes it. Over a WINDOW the close works, because
+// `damage_intersecting` marks that window and the next composite re-blits it from its source
+// surface. Over the DESKTOP — which is where a pointer sweeping UP PAST a window arrives —
+// `damage_intersecting` marks nothing, no composite owes those rows anything, and whatever the
+// guard declined to mend stands on the glass until something unrelated repaints it. On a board whose
+// backdrop is a SCENE that residue reads as background drawn over the scene, which is the report.
+//
+// # Why a rect and not the flag
+//
+// [`super::screen::request_present_rect`] is DRAG-PI M1's narrow twin of `request_full_present`, and
+// the sprite box is the narrowest request in the system — one glyph cell plus a shadow block. A
+// whole-panel request at pointer-report rate is the pessimisation M1 was written to remove; the box
+// is what actually changed, and the queue merges rather than dropping, so the desktop layer is asked
+// for a superset of the swept span and never for less.
+//
+// # Termination — why this cannot become a present storm
+//
+// The rect is queued only when [`repair`] was handed `Some`, and that is `TOUCHED_SINCE_DRAW`: a
+// painter wrote inside the sprite's box since the sprite was drawn. `draw_locked` clears the flag,
+// and `undraw_locked` SWAPS it down, so one painter's trample buys exactly one handback. The
+// desktop present this queues runs `Screen::flush`, whose bracket is undraw → `present_background`
+// → `repaint`; the `repaint` ends in a `draw_locked` that clears the flag again, so the pass that
+// serves the request cannot re-arm it. A quiescent panel arms it zero times and queues nothing.
+//
+// # The witness
+//
+// `[cursor] restore src=scene|flat rect=…` — emitted on the FIRST handback of each `src` and then
+// rate-limited, so a flat restore standing over a scene can never be silent. `src` is a property of
+// the BOARD (`scene_backdrop`), not of the rect: `scene` means the desktop layer owns real content
+// under this box and the handback is what re-derives it; `flat` means the backdrop is the desktop
+// COLOUR, where the guarded restore and a repaint agree and the handback is merely cheap insurance.
+// NOT `witness`-gated, on `strip::Ledger`'s rule: the metal image is built without `witness`, and a
+// claim absent from the only artifact that matters is not a claim.
+
+/// CURSORBG — does the desktop SCENE own the backdrop on this build?
+///
+/// `super::desktop_scene_owns_backdrop` carries the furniture-family gate and this module does not,
+/// so the question is asked through a shim with a compile-time `false` twin. A build with no
+/// furniture family has no scene to restore and the `flat` arm is the whole truth there.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn scene_backdrop() -> bool {
+    super::desktop_scene_owns_backdrop()
+}
+
+/// CURSORBG — the knob-off twin. See [`scene_backdrop`].
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn scene_backdrop() -> bool {
+    false
+}
+
+/// CURSORBG — handbacks queued with a SCENE under them.
+static CB_SCENE: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — handbacks queued over a flat desktop backdrop.
+static CB_FLAT: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — requests the [`REPAIR_MIN_MS`] floor deferred into [`CB_PENDING`] rather than queued.
+static CB_DEFERRED: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — requests taken on a machine with no readable monotonic counter, where the floor cannot
+/// be applied. [`C8_UNCLOCKED`]'s twin, and it exists for that counter's reason: a board with no
+/// clock is not silently on a different policy.
+static CB_UNCLOCKED: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — which `src` values have already had their first line. Bit 0 = scene, bit 1 = flat.
+static CB_SAID: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — the monotonic reading at the last QUEUED handback, in [`mono_now_hz`]'s units.
+static CB_LAST: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — the monotonic reading at the last emitted `[cursor] restore` line.
+static CB_SAID_AT: AtomicU64 = AtomicU64::new(0);
+/// CURSORBG — a deferred request's rect, packed `x|y|w|h` at 16 bits each and UNIONED with every
+/// later deferral, so a floor that defers loses latency and never a pixel. `0` = nothing pending.
+///
+/// 16 bits a field is the panel bound this kernel drives (`MAX_STRIP_W` is 4096 and the widest panel
+/// in the fleet is 2880); a coordinate that would not fit is dropped by [`cb_pack`] rather than
+/// wrapped into a rect that describes somewhere else.
+static CB_PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// CURSORBG — how often the rate-limited `[cursor] restore` line repeats. 5 s, `strip`'s cadence, so
+/// a capture carries it beside `[strip] rollup` and `[wc-h] rollup` and the three read as one.
+const CB_ROLLUP_MS: u64 = 5_000;
+
+/// CURSORBG — pack a rect for [`CB_PENDING`]. `None` when any field exceeds 16 bits.
+fn cb_pack(x: usize, y: usize, w: usize, h: usize) -> Option<u64> {
+    if x > 0xFFFF || y > 0xFFFF || w > 0xFFFF || h > 0xFFFF || w == 0 || h == 0 {
+        return None;
+    }
+    Some(((x as u64) << 48) | ((y as u64) << 32) | ((w as u64) << 16) | h as u64)
+}
+
+/// CURSORBG — unpack a [`CB_PENDING`] word. `0` is the "nothing pending" sentinel and cannot collide
+/// with a real rect, because [`cb_pack`] refuses a zero width or height.
+fn cb_unpack(v: u64) -> (usize, usize, usize, usize) {
+    (
+        ((v >> 48) & 0xFFFF) as usize,
+        ((v >> 32) & 0xFFFF) as usize,
+        ((v >> 16) & 0xFFFF) as usize,
+        (v & 0xFFFF) as usize,
+    )
+}
+
+/// CURSORBG — the bounding union of two packed rects, so a deferral can never shrink what is owed.
+fn cb_union(a: u64, b: u64) -> u64 {
+    if a == 0 {
+        return b;
+    }
+    if b == 0 {
+        return a;
+    }
+    let (ax, ay, aw, ah) = cb_unpack(a);
+    let (bx, by, bw, bh) = cb_unpack(b);
+    let (x0, y0) = (ax.min(bx), ay.min(by));
+    let (x1, y1) = ((ax + aw).max(bx + bw), (ay + ah).max(by + bh));
+    cb_pack(x0, y0, x1 - x0, y1 - y0).unwrap_or(b)
+}
+
+/// CURSORBG — hand a restored sprite rect back to the DESKTOP layer, and say so on the wire.
+///
+/// Called from [`repair`], with the sprite lock RELEASED and immediately after
+/// `wm::damage_intersecting` over the same rect — the pair, in the order `drain_deferred` uses.
+///
+/// # The floor, and the loop it is here to bound
+///
+/// There is a closed loop through this function, it predates this arc, and CURSOR-9's own header
+/// describes it: `repair` marks every window under the pointer damaged, the next composite re-blits
+/// them, `draw_window` calls [`note_present_over_sprite`] which arms [`TOUCHED_SINCE_DRAW`], and the
+/// next undraw therefore hands `repair` another rect. Before this arc the loop was paid out at
+/// COMPOSITE cadence by whatever happened to be presenting. Queuing a desktop present here adds a
+/// second way for the loop to keep itself fed — `screen::present_owed` wakes the Orin's render pump,
+/// whose poll rate is ~30 kHz, not 20 Hz — so it needs the same bound CURSOR-8 put on the other leg.
+///
+/// [`REPAIR_MIN_MS`] is that bound, deliberately the same constant: 8 ms is one HID pointer report,
+/// so a moving pointer's handback is never deferred and a self-feeding chain cannot run faster than
+/// the operator's hand.
+///
+/// **A deferral is not a drop.** The rect is UNIONED into [`CB_PENDING`] and the next call past the
+/// floor queues the union, so no pixel is ever lost to rate limiting — `request_present_rect`'s own
+/// discipline, applied one level up. The residual, stated: two repairs less than 8 ms apart where the
+/// SECOND is the last of the gesture leave the union pending until the next repair, which is the
+/// CURSOR-HIDE takedown's `repaint` at the 1.5 s auto-hide. `deferred=` on the witness line is what
+/// makes that visible rather than assumed.
+fn restore_note(x: usize, y: usize, w: usize, h: usize) {
+    let Some(packed) = cb_pack(x, y, w, h) else {
+        return; // a rect no 16-bit field can describe; the window half above still ran
+    };
+    let scene = scene_backdrop();
+    // The floor. `None` from the clock means the floor cannot be applied at all, and the policy there
+    // is CURSOR-8's `unclocked` arm verbatim: take the request rather than defer it forever.
+    let now = match mono_now_hz() {
+        Some((now, hz)) if hz >= 1000 => {
+            let last = CB_LAST.load(Ordering::Relaxed);
+            if last != 0 && now.saturating_sub(last) / (hz / 1000) < REPAIR_MIN_MS {
+                // Deferred: union in and leave. Nothing is queued, nothing is printed, and the debt
+                // is visible in `CB_PENDING` until a later call past the floor discharges it.
+                let mut cur = CB_PENDING.load(Ordering::Relaxed);
+                loop {
+                    let merged = cb_union(cur, packed);
+                    match CB_PENDING.compare_exchange_weak(
+                        cur,
+                        merged,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(seen) => cur = seen,
+                    }
+                }
+                CB_DEFERRED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            CB_LAST.store(now, Ordering::Relaxed);
+            Some(now)
+        }
+        _ => {
+            CB_UNCLOCKED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    };
+    // Discharge anything the floor deferred, in the SAME request: the union is a superset of every
+    // rect that was held back, and `request_present_rect` merges it with this one.
+    let owed = CB_PENDING.swap(0, Ordering::AcqRel);
+    let send = cb_union(owed, packed);
+    let (qx, qy, qw, qh) = cb_unpack(send);
+    super::screen::request_present_rect(qx, qy, qw, qh);
+    let n = if scene {
+        CB_SCENE.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        CB_FLAT.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    // First line of each `src`, then rate-limited to [`CB_ROLLUP_MS`]. The first is unconditional so
+    // a board that takes this path ONCE still says so — which is the whole requirement: a flat
+    // restore standing over a scene may never be silent.
+    let bit = if scene { 1u64 } else { 2u64 };
+    let first = CB_SAID.fetch_or(bit, Ordering::Relaxed) & bit == 0;
+    if !first {
+        let (Some(now), Some((_, hz))) = (now, mono_now_hz()) else {
+            return;
+        };
+        if hz < 1000 {
+            return;
+        }
+        let said = CB_SAID_AT.load(Ordering::Relaxed);
+        if said != 0 && now.saturating_sub(said) / (hz / 1000) < CB_ROLLUP_MS {
+            return;
+        }
+        if CB_SAID_AT.compare_exchange(said, now, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return; // another core is printing this interval's line; one is enough
+        }
+    } else if let Some(now) = now {
+        CB_SAID_AT.store(now, Ordering::Relaxed);
+    }
+    serial_println!(
+        "[cursor] restore src={} rect={}x{}+{}+{} n={} scene={} flat={} deferred={} unclocked={} floor_ms={} -> HANDED-BACK",
+        if scene { "scene" } else { "flat" },
+        qw,
+        qh,
+        qx,
+        qy,
+        n,
+        CB_SCENE.load(Ordering::Relaxed),
+        CB_FLAT.load(Ordering::Relaxed),
+        CB_DEFERRED.load(Ordering::Relaxed),
+        CB_UNCLOCKED.load(Ordering::Relaxed),
+        REPAIR_MIN_MS
+    );
 }

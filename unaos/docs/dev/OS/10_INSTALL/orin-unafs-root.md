@@ -117,6 +117,19 @@ both arches + `./arroyo test-arm` + tegra media strings-validation. Metal proof 
 the mount is attended bench work, not this arc's job.
 
 ## 5a. Item-4 status: the root binds to the card's FAT until the UnaFS volume exists (ROOTFS, orin 16, 2026-09-06)
+> **SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** The per-board root knob this
+> section describes — `UNAOS_SDMMCROOT=1` / cargo `sdmmcroot`, its file-tail section in
+> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::TegraSd` constructor in `fs/vfs.rs`
+> and its statement in `shell::vfs_mount_table` — is DELETED. Nothing below is edited away: the rows
+> record what was true and why, and remain the history of how the fault was found. What replaces it
+> is `fs/bootdisk.rs`: the kernel is told nothing about where it came from, brings up every disk
+> driver the board has, enumerates every FAT volume on every source, and finds the ONE file whose
+> bytes are this running kernel's own `.text` window. That disk is the hard drive; `/`, `/boot` and
+> `/apps` bind to it. Zero disks or no match prints one witness naming what was looked for and what
+> was found, and the mount table is EMPTY (the verbs answer `-ENODEV`); two or more matches REFUSE
+> rather than guess. No board, slot, bus, serial, card geometry, boot method or knob is in the
+> decision.
+
 
 Items 1 and 2 landed (TEGRA-SDBLK: `sdmmc_census` publishes the card through
 `block::register_tegra_sd`, `BlockSource::TegraSd` routes `fat.rs` at
