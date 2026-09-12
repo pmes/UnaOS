@@ -1417,6 +1417,40 @@ fi
 # armed default is type-checked and reasoned here and PROVEN only by an attended bench flight.
 [ -n "${UNAOS_APSRUN:-}" ] && _feats="${_feats}apsrun,tegrasmp,tegra,"
 [ -n "${UNAOS_TEGRA:-}" ] && [ -z "${UNAOS_NOTEGRASMP:-}" ] && [ -z "${UNAOS_NOAPSRUN:-}" ] && _feats="${_feats}apsrun,tegrasmp,tegra,"
+# USBLUN (orin 27, M3/F2) — THE WAY BACK from the USB multi-LUN census.
+#
+# What is default-on and why it has no positive knob: `drivers/xhci/mod.rs` now asks a BOT device how
+# many logical units it has (Get Max LUN, class request 0xFE), looks at each, and publishes the first
+# that holds media. That is the driver doing its job — a multi-slot card reader is ONE mass-storage
+# device whose card slots are LUNs, and a driver that can only spell `bCBWLUN = 0` hides every card
+# but one (render12 boot 2: one `xHCI: Disk` from a reader holding two cards). A knob to turn the job
+# ON would be a knob to leave the bug in place, so there is none.
+#
+# What DOES get a knob is the way back, and the argument for it is the argument for UNAOS_NOAPSRUN
+# above: a DEFAULT-ON behaviour change, in a file BOTH arches compile, whose only runtime evidence is
+# QEMU's single-LUN `usb-storage` on two boards that are not the board it was written for. Every USB
+# stick on the x86 and Pi benches answers `bMaxLUN = 0` and behaves identically either way, but a
+# device that dislikes being asked at all is a bench discovery, not a review finding, and the
+# operator meeting one needs an env var rather than a rebuild from a revert.
+#
+# UNAOS_NOUSBLUN=1 -> feature `nousblun` -> no census is compiled and none is asked: `bot_lun` stays
+# 0 for the life of every slot and LUN 0 publishes exactly as it did before USBLUN-M1. Wire:
+# `:: USBLUN: census SKIPPED ::` instead of the `:: USBLUN:` census family.
+#
+# NO `esp_jetson` FORCE BLOCK, and none is owed: the shipped state of this knob is OFF (census ON),
+# so the media path needs nothing forced into its list — the opposite of ORIN-APSRUN, whose default
+# is the FEATURE and therefore had to be re-forced where UNAOS_TEGRA is never set. `esp_jetson`
+# builds from `_feats`, so an operator who sets UNAOS_NOUSBLUN=1 gets it on the Jetson media too.
+#
+# WIRED IN TWO PLACES, and the second is not optional: `builder/src/main.rs` re-derives the x86
+# media feature list from the environment and never reads `$KERNEL_FEATURES`, so a knob mapped here
+# alone would light the banner on an image carrying none of the code (the `rastmc` failure). The
+# KNOB→BUILDER WIRING CHECK in `check_kernel_cfg` enforces exactly that for any feature a literal
+# x86 leg names, and `x86-nousblun` below is such a leg.
+#
+# BOTH POLARITIES TYPE-CHECKED: the census-ON default is compiled by every other leg of
+# KERNEL_CFG_MATRIX; the disarmed shape is `x86-nousblun`.
+[ -n "${UNAOS_NOUSBLUN:-}" ] && _feats="${_feats}nousblun,"
 # ORIN-INPUT: UNAOS_ORININPUT=1 arms the tegra input pump + route inside `run_user_image`'s wait loop
 # (arch/aarch64/xusb_tegra.rs `oi_*` + three call sites in arch/aarch64/syscall.rs), so HID actually
 # REACHES an EL0 tenant on the Orin. The chain itself is already compiled in on `tegra_el0` (per-process
@@ -4615,6 +4649,27 @@ KERNEL_CFG_MATRIX=(
   # No universe side effect: `net4` and `net5` are already named by `arm-tegra-*` rows, so
   # `x86_cfg_universe` drops them exactly as it did before. Board legs +1.
   "arm-net5-virt ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,net4,net5"
+  # ── USBLUN (appended 2026-09-12, orin 27 M3/F2) — `nousblun`, the DISARMED census ─────────────
+  #
+  # THE POLARITY THIS ROW EXISTS FOR is the one orin 20's default-quiet lesson names: for a knob whose
+  # OFF state is the shipped state, coverage of the ON state is coverage of a build nobody boots. Here
+  # it runs the other way round — `nousblun` is DEFAULT-OFF, so the state every leg of this matrix
+  # already compiles is the census turned ON, and the configuration `UNAOS_NOUSBLUN=1` actually
+  # produces — four functions and three field types erased, the census call site replaced by its
+  # SKIPPED witness — was type-checked by NOTHING until this row. That is a real body of code, not a
+  # vacuous twin: a `#[cfg(not(...))]` block containing the only callers of the erased items, which is
+  # exactly the shape that compiles clean on the default leg and fails to compile when it is armed.
+  #
+  # x86 ON PURPOSE, though the driver is shared and either arch would type-check it. `drivers/xhci/`
+  # is the x86/Pi benches' storage path, `UNAOS_NOUSBLUN=1 ./arroyo test` is the gate that PROVES the
+  # way back at runtime, and a literal x86-* leg is also what puts this feature under the KNOB→BUILDER
+  # WIRING CHECK — which is the check that catches the knob being mapped in `arroyo` while the x86
+  # media builder ignores it. An arm-* leg would type-check the same lines and buy neither.
+  #
+  # UNIVERSE SIDE EFFECT: `nousblun` is named by no arm-* leg, so it was never in the arm-only set and
+  # `x86_cfg_universe` gains it from the `[features]` table itself, not from this row. Board legs +1.
+  # Read the live board/mix counts off `./arroyo check`, which prints them every run.
+  "x86-nousblun ../../x86_64-unaos.json witness,logts,wedge2,sched_demo,skip_xhci,nousblun"
   "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
 )
 

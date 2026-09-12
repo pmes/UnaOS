@@ -182,6 +182,16 @@ fn main() {
     // BATMON-1: the Apple SMC battery monitor (x86_64). UNAOS_SMC=1 arms the polled SMC key/value
     // driver; the QEMU isa-applesmc device is attached below under the same knob so the protocol
     // machinery is gated by a known-key read. Kept in sync with arroyo's mapping.
+    // USBLUN (orin 27, M3/F2): the way back from the USB multi-LUN census in `drivers/xhci/mod.rs`.
+    // The census is DEFAULT-ON (it is the driver doing its job — a multi-slot card reader is one BOT
+    // device whose card slots are logical units), so this knob only ever turns it OFF:
+    // UNAOS_NOUSBLUN=1 => no census compiled, Get Max LUN never asked, `bCBWLUN = 0` and LUN 0
+    // published exactly as before. MUST be listed here and not only in `arroyo`: THIS list is the one
+    // the x86 kernel that actually boots is built from, and a knob mapped there alone is the rastmc
+    // failure — the banner says the feature is on and the image carries none of it. Arch-neutral
+    // feature; the x86 image is the one `./arroyo test` boots and the one the rMBP bench boots.
+    // Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_NOUSBLUN").is_ok() { feats.push("nousblun"); }
     if std::env::var("UNAOS_SMC").is_ok() { feats.push("smc"); }
     // WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk and
     // its one-line summary are always-on under `smc`; this buys back the 493-line inventory dump that
