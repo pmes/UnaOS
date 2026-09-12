@@ -453,7 +453,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   never by relocation; the desktop is a Mac clone and any placement contradicting the Mac layout is
   wrong by default; a fixture move to another edge is a one-line question before code (R25 as
   heard by orin 17). Menus
-  live in the menu bar, never inside a window (R21). Esc dismisses menus only; the Tab focus cycle is
+  live in the menu bar, never inside a window (R21). **The console and the shell are apps with pinned taskbar tiles; closing is a quit and
+  the tile launches a fresh instance — no furniture route or re-mint (R49, 2026-09-12).** Esc dismisses menus only; the Tab focus cycle is
   retired (R24 as heard by orin 17, 2026-09-06). Shell verbs use standard names and are not pinned to a platform (R26). A window's
   title is the app's name; numbering is for untitled documents only (R36). Crispy is a theme, never a
   lock-in; two GUI modes only (self-drawn, or real host widgets). The bench loop is a scaffold and
