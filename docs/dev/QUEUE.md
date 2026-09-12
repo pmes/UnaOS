@@ -13,13 +13,11 @@ branch's file at its tip that hour; the rmbp figure was first written as 88 from
 corrected by the landing review — the commands live in each track queue). rmbp 19's verdict stands: "88 open rows is a graveyard, not a queue" — so this
 file lists JOBS, ranked, and a ledger row that is a record rather than a job stays in the ledger.
 
-## STATE — 2026-09-12T01:3xZ (orin 27)
-✓ main 267bd49d = the rmbp landing (two parents f880ed6e + 022836be; panel ACK; ledger-check rc=0; `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0 on the merge result). hw-rmbp fast-forwarded to it: 0/0.
-✓ main e10d9e4e = the pi landing (parents 4a03404f + 7cf53346; panel ACK; RULINGS union with R44 superseded-by R46; LEDGER keeps main's SR12; ledger-check rc=0 309 rows; on e10d9e4e: `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0, `./arroyo test` rc=0, `./arroyo test-arm` rc=0 — the x86 leg run by the orin seat under R46). hw-pi4 and hw-rmbp fast-forwarded level.
-✓ hw-jetson 19164a26 local (rung 4 flown, unafsroot fold gated green, A49 reframed; landing review running at f0dc8058).
-✓ Landing order (R45): rmbp DONE → pi DONE → jetson (fold main into hw-jetson first: merge-tree conflicts in .gitignore, LEDGER.md, arroyo).
-✓ In flight: exec-orin26-tear (BEAM, Opus finishing), exec-orin27-ga10b4c (rung 4c + the deferred Shut Down trigger, Fable).
-✓ Next Orin boot = render13: the fold of core0 + el0mem + unafsroot + BEAM + 4c on the render12 fifteen-knob line minus PROBE3 plus `UNAOS_GA10B_PROBE4=4` (+ `UNAOS_BEAM=1`); card re-imaged with `media-writer.sh --image` (Peter's go 2026-09-12); a v1 SD card in the Orin's native slot.
+## STATE — 2026-09-12T03:5xZ (orin 27)
+✓ main 0aa3afe6 = the jetson landing (parents d28e701e + 6ed2be1a; three review panels; landing legs on 5acf6d16: check tegra/plain strict rc=0, UNAOS_WC=1 test rc=0, test-arm rc=0; ledger-check rc=0 on the result; `./arroyo check` on main recorded below when done). Before it: rmbp 267bd49d and pi e10d9e4e landings.
+✓ ALL THREE TRACKS LEVEL WITH MAIN after this commit (hw-jetson, hw-pi4, hw-rmbp fast-forwarded). R45's property holds: any track can merge to main at any time.
+✓ Push line (Peter): `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin27-cmd8 exec-orin27-usblun exec-orin27-closefold exec-orin24-fold exec-orin25-shotverb`
+✓ Orin bench: render13 (`render13-20260912T0259Z-f4b4bf3`, KELF max=0x34f820) written to the old 32 GB card; the UEFI does not list our MBR card in the native slot (GPT card image is the job, orin-queue) so it flies from the USB reader; waker armed on the loader line.
 
 ## 1. THE DESKTOP — glass defects Peter has seen, all in shared `video/` (fix once, every board)
 · SO3  no application menu, no Quit anywhere (menubar press map + winmenu app tree)
