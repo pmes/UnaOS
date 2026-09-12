@@ -332,6 +332,29 @@ mod metal {
     const ST_CMD_INHIBIT: u32 = 1 << 0;
     const ST_DAT_INHIBIT: u32 = 1 << 1;
     const ST_CARD_INSERTED: u32 = 1 << 16;
+    /// Card State Stable (bit 17): the card-detect signal has finished debouncing, so bit 18 below is a
+    /// reading rather than a transient. Only meaningful beside it.
+    const ST_CARD_STATE_STABLE: u32 = 1 << 17;
+    /// SDHCI Card Detect Pin Level (bit 18): 1 = a card is physically in the slot, 0 = the slot is EMPTY.
+    ///
+    /// SDCMD8: this bit — NOT bit 16 — is the one that told the truth on render12 boot 2. That capture
+    /// was read as "a 2 GB card in the native slot would not answer CMD8"; the card was in fact in the
+    /// second slot of the USB reader and THE NATIVE SLOT WAS EMPTY. The Present State on that boot's STOP
+    /// line says so outright: `0x01fb0000` carries bit 16 (Card Inserted) = 1 and bit 18 (Card Detect Pin
+    /// Level) = 0. The two bits contradict each other, and the empty slot is what actually was. On the
+    /// same line `CONTROL0=0x00000f00` puts Host Control 1 at 0x00, so Card Detect Signal Selection
+    /// (bit 7) and Card Detect Test Level (bit 6) are both CLEAR — bit 16 was not being held high by a
+    /// test override, this controller simply reports Card Inserted = 1 with nothing in the slot. That is
+    /// also why the DTB gives this node a `cd-gpios` property (witnessed on the M1 candidate line:
+    /// `mmc@3400000 … removable cd-gpios`) rather than trusting the controller's own block. Gating the
+    /// ladder on bit 16 is gating on a constant, and that is how CMD0 came to be issued into an empty
+    /// slot — after which every command that needs a response times out, which is the whole of A49's
+    /// "wire". NOTE the residual unknown, stated because only metal can close it: no capture in evidence
+    /// shows this bit with a card actually seated, so "bit 18 reads 1 when a card is in" is UNPROVEN.
+    /// The witness line below prints bits 16/17/18 together precisely so that ONE seated boot settles it
+    /// either way; if bit 18 turns out to read 0 with a card in, the authority is the `cd-gpios` GPIO and
+    /// this gate must move there (which needs a Tegra GPIO driver this kernel does not yet have).
+    const ST_CARD_DETECT_PIN: u32 = 1 << 18;
     /// DAT[3:0] Line Signal Level and CMD Line Signal Level. An idle SD bus pulls all five HIGH, which
     /// is how SDHCI 3.00 §3.10.1 defines "error recovery complete" after a command timeout: the SRST
     /// bits self-clearing says the HOST finished resetting, not that the CARD let go of the bus.
@@ -600,6 +623,42 @@ mod metal {
         }
         serial_println!("{}   M2: card detected (Present State {:#010x}) ::", PS, present);
 
+        // 4b. SDCMD8 — the gate that was missing, and the reason A49 had a "wire" at all.
+        //
+        //     Step 4 above asks bit 16 (Card Inserted) whether a card is seated. On THIS controller bit 16
+        //     is a constant 1 (see `ST_CARD_DETECT_PIN`), so step 4 has never once refused: the ladder ran
+        //     CMD0 into the slot whatever was or was not in it. CMD0 is the one command that expects no
+        //     response, so it "succeeds" against an empty slot — and every command after it that needs a
+        //     response times out. That sequence (CMD0 ok, CMD8 timeout, CMD55 timeout, all with
+        //     INTERRUPT=0x00018000 = bit 16 command-timeout + bit 15 error) is not a card refusing to
+        //     speak. It is the shape of an empty slot, and it was read as a card defect for a year.
+        //
+        //     So ask the pin, not the constant, and say out loud which source answered and what all three
+        //     detect bits read — one seated boot then settles the residual unknown noted on the constant.
+        let cd_pin = present & ST_CARD_DETECT_PIN != 0;
+        serial_println!(
+            "{}   M2: card-detect present={} src=sdhci-bit18 raw={:#010x} (bit16 Card-Inserted={}, bit17 State-Stable={}, bit18 CD-pin-level={}; DTB cd-gpios on the M1 line is the board's own detect and needs a GPIO driver to read) ::",
+            PS,
+            cd_pin as u8,
+            present,
+            (present >> 16) & 1,
+            (present >> 17) & 1,
+            (present >> 18) & 1
+        );
+        if present & ST_CARD_STATE_STABLE == 0 {
+            serial_println!(
+                "{}   M2: card-detect NOT stable (bit 17 clear) — the detect signal is still debouncing, so bit 18 is a transient and not a reading ::",
+                PS
+            );
+        }
+        if !cd_pin {
+            // The ladder ends HERE, before the identification clock and before CMD0. An empty slot is not
+            // a failure to diagnose — it is nothing to do — so it gets its own word, `SKIP`, and not the
+            // `STOP` that every real defect on this ladder prints.
+            serial_println!("{}   M2: no card in the native slot -> SKIP ::", PS);
+            return None;
+        }
+
         // 5. 400 kHz identification clock.
         let base_hz = base_clock(base);
         if !set_clock(base, base_hz, 400_000) {
@@ -766,6 +825,27 @@ mod metal {
                 "{}   M2: identified SDSC v1.x card capacity={} MiB byte-addressed ::",
                 PS, mib
             );
+        }
+        // SDCMD8: the cross-check the removal of the v1 premise makes necessary.
+        //
+        //     An unanswered CMD8 now sends ACMD41 with HCS=0 (rung 8). That is right for a card that
+        //     genuinely does not implement CMD8 — but with "this card is simply v1.x" no longer a safe
+        //     reading of silence, a CMD8 LOST for a driver or signalling reason takes the same branch, and
+        //     an SDHC/SDXC card told HCS=0 can answer CCS=0. We would then set byte addressing on a card
+        //     whose CSD says v2, and every argument built from it is a 32-bit BYTE offset that wraps at
+        //     4 GiB (`(lba * 512) as u32`, four sites — see ledger A57).
+        //
+        //     CSD_STRUCTURE is read from the card and owes nothing to CMD8, so it is the independent
+        //     witness: a v2 CSD with byte addressing is a CONTRADICTION, and the two readings of it
+        //     (a lost CMD8, or a card misreporting CCS) both end the same way — we do not know this
+        //     card's address units. Refuse it. Addressing a card wrongly is silent corruption at an
+        //     offset nothing will connect back to here, which is strictly worse than not using the card.
+        if csd_version == 2 && !block_addressing {
+            serial_println!(
+                "{}   M2: CONTRADICTION csd_v2 with byte addressing (CMD8 lost?) -> STOP ::",
+                PS
+            );
+            return None;
         }
 
         // 12. CMD7 SELECT_CARD (R1b) -> transfer state.
