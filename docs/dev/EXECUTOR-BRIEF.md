@@ -28,8 +28,9 @@ MANDATORY HEAD (docs/dev/EXECUTOR-BRIEF.md):
    (status begins with open|fixed-unflown|flown|landed|dropped). The seat folds the COMMIT, never
    re-types your report.
 8. COMMIT on your worktree branch: `<subsystem>: <NAME> — <imperative summary>`; body = mechanism
-   with file:line evidence and the command that measured each claim; end with
-   `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. If the seat folds your diff by
+   with file:line evidence and the command that measured each claim; end with the
+   `Co-Authored-By:` line of the MODEL THAT DID THE WORK (the harness names it; an Opus executor
+   writes Opus, never the seat's model — attribution is a fact). If the seat folds your diff by
    hand, the seat adds `Folded-by: <seat>` above the Co-Authored-By line.
 9. REPORT (short): sha and its parent, `git show --stat`, gate exit codes, the knob line to build
    with, and the exact wire shape the next boot should show. Do not end your turn waiting on your
