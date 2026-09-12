@@ -7,9 +7,10 @@ the shared half is a row here, the metal half is a row there, each citing the ot
 down to the specific metal requirement as far as possible so as to maximize shared code").
 Every row cites its ledger id — the ledger holds the finding, this file holds the ORDER. `✓` =
 verified in this tree this session · `·` = inherited, not re-checked. Re-derive every sha.
-Created 2026-09-12 by orin 27 from the union of the four branches' ledgers (80 open shared rows,
-27 open orin rows, 88 open rmbp rows, 8 open pi rows — counted by awk over each branch's file at
-its tip that hour). rmbp 19's verdict stands: "88 open rows is a graveyard, not a queue" — so this
+Created 2026-09-12T00:3xZ (UTC; 2026-09-11 local) by orin 27 from the union of the four branches' ledgers (80 non-landed shared rows,
+27 open orin rows, 93 open rmbp A/B rows, 8 open pi rows — counted by awk over the status column of each
+branch's file at its tip that hour; the rmbp figure was first written as 88 from a narrower filter and
+corrected by the landing review — the commands live in each track queue). rmbp 19's verdict stands: "88 open rows is a graveyard, not a queue" — so this
 file lists JOBS, ranked, and a ledger row that is a record rather than a job stays in the ledger.
 
 ## STATE — 2026-09-12 (orin 27)
