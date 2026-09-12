@@ -556,6 +556,16 @@ fn bind_and_ping() {
         if netcfg.leased { "dhcp" } else { "static" },
         if pass { "PASS" } else { "FAIL" }
     );
+    // SOCK-7: NAME the stack that owns the lease. Two DHCP implementations exist in this tree and a
+    // reader of a boot log could not tell which produced an address; on aarch64 there is exactly one
+    // — smoltcp's `dhcpv4::Socket`, driven by `dhcp_or_static` — because the hand-rolled
+    // `crates/net` client has no aarch64 caller at all (its only call sites are in `drivers/e1000.rs`,
+    // whose registry the x86 PCI bring-up alone populates). Printed, not inferred.
+    serial_println!(
+        "{} lease-owner={} (hand-rolled crates/net DHCP has no aarch64 caller) ::",
+        PV,
+        crate::net_phy::LEASE_OWNER
+    );
 }
 
 /// AARCH64-VNET entry point: probe the virtio-mmio window for a virtio-net transport, bring it up
@@ -586,5 +596,57 @@ pub fn vnet_bringup() {
     );
     *VNET_DEVICE.lock() = Some(dev);
     bind_and_ping();
+    net6_start();
     serial_println!("{} AARCH64-VNET DONE — virtio-net driver up + smoltcp bound ::", PV);
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// NET6 — the DEVICE ADAPTER, and the whole of this driver's share of the shared socket surface.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Four function pointers and a name. Everything else NET6 does — the persistent `Interface` +
+// `SocketSet`, the shell verbs, the EL0 socket syscalls, the fixture below — is shared code in
+// `net_phy::net6`, identical on this QEMU device and on the Orin's RTL8168. That is the ONE OS shape
+// the arc is for: `virt` RUNS the code the Orin will run, which matters because QEMU models no
+// Tegra234, so a jetson build is compile-and-link evidence and this is the only runtime evidence the
+// aarch64 socket family can ever have off the bench.
+#[cfg(feature = "net6")]
+static NET6_OPS: crate::net_phy::net6::NicOps = crate::net_phy::net6::NicOps {
+    rx: raw_rx,
+    tx: raw_tx,
+    mac: net6_mac,
+    link_up: net6_link_up,
+    // SUBSYSTEM-named, never board-named (R16): this string reaches shared witness lines.
+    name: "virtio-net",
+};
+
+/// The station MAC for the NET6 adapter (`None` before `probe_and_init` registered a device).
+#[cfg(feature = "net6")]
+fn net6_mac() -> Option<[u8; 6]> {
+    VNET_DEVICE.lock().as_ref().map(|n| n.mac)
+}
+
+/// Link state for the NET6 witness lines. virtio-net has no PHY to interrogate: the transport either
+/// negotiated and is attached to a backend or it is not, and `probe_and_init` only registers a device
+/// once `DRIVER_OK` is set — so a registered device IS an up link, and saying so is honest rather
+/// than inventing a register read QEMU does not model.
+#[cfg(feature = "net6")]
+fn net6_link_up() -> bool {
+    VNET_DEVICE.lock().is_some()
+}
+
+/// Register this driver with the shared NET6 surface, bring the persistent stack up on the address
+/// `bind_and_ping` just leased, and run the fixture that PROVES the surface end-to-end on real
+/// packets. Knob-off (`net6` absent) this is an empty `#[inline(always)]` call — zero instructions.
+#[cfg(feature = "net6")]
+fn net6_start() {
+    crate::net_phy::net6::register_nic(&NET6_OPS);
+    if crate::net_phy::net6::init() {
+        crate::net_phy::net6::fixture();
+    }
+}
+
+/// Knob-off twin: NET6 is not built, so the call site above emits nothing.
+#[cfg(not(feature = "net6"))]
+#[inline(always)]
+fn net6_start() {}

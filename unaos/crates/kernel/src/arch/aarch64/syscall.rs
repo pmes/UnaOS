@@ -4465,7 +4465,7 @@ pub fn clear_handle_row(asid: u64) {
     // deposit stamped for the dying tenant is dead-on-arrival for the ASID's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
-    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel);
+    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel); net6_free_owner(asid); // NET6 — close every socket this dying address space still owns, so an EL0 program that exits with sockets open frees its registry slots instead of leaking them for the boot's life. Placed with the generation bump, before the handle sweep, for the same reason that bump is first: past this point nothing the dying tenant held can be resolved. ⚠ LINE-NEUTRAL append — `#[inline(always)]`-empty knob-off, body at the FILE TAIL.
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind), then
         // the rights and kind — so no intermediate state is ever a live handle with wrong rights/kind.
@@ -6872,7 +6872,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u8_report(a0);
             u9_report(a0);
             u10_report(a0);
-            u10c_report(a0);
+            u10c_report(a0); #[cfg(feature = "net6")] net6_report(a0); // NET6 — the EL0 socket fixture's verdict word. Like every reporter in this list it ignores what is not its own; the discriminator is the `0x4e36` tag the fixture stamps in the word's top half, not the task name — a tag travels IN the datum, so it cannot be defeated by a rename or by a second task borrowing the name, and it is the only thing here a scorer can check. ⚠ LINE-NEUTRAL append — body at the FILE TAIL.
             u10d_report(a0);
             u11_report(a0);
             u11defer_report(a0);
@@ -6901,7 +6901,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_UNLINK => sys_unlink(a0),
         SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
-        SYS_RECV => sys_recv(),
+        SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
         SYS_FGRANT => sys_fgrant(a0, a1, a2),
         SYS_MSEND => sys_msend(a0, a1),
         SYS_MRECV => sys_mrecv(a0, a1),
@@ -23900,7 +23900,7 @@ pub fn virt_el0_verdict(_: usize) {
     let exp = EL0_KILLED_EXPECTED.load(Ordering::Acquire);
     let unexp = EL0_KILLED_UNEXPECTED.load(Ordering::Acquire);
     if ok == 1 && err == 0 && exp == 0 && unexp == 0 {
-        serial_println!(":: VIRT-EL0: el0-hello round-trip -> PASS ::");
+        serial_println!(":: VIRT-EL0: el0-hello round-trip -> PASS ::"); net6_el0_witness(); // NET6 — the EL0 SOCKET fixture runs HERE and nowhere else: at EL1, inside an existing kernel task, AFTER `el0-hello` has been judged (so neither leg disturbs the other's counters) and after the user window is installed. Staged from this file rather than from `main.rs`'s `virt_el0_start_maybe` because the brief scopes `main.rs` out — and because this task already owns the bounded-CNTPCT wait discipline the fixture needs. It is on the PASS arm only: a boot where `el0-hello` did not round-trip has no working EL0 regime, and running a socket fixture on top of that would report a network failure for a userspace cause. ⚠ LINE-NEUTRAL append — `#[inline(always)]`-empty without `net6`+`virt_el0`, body at the FILE TAIL.
     } else {
         serial_println!(
             ":: VIRT-EL0: el0-hello round-trip -> FAIL — exited_ok={} exited_err={} killed_expected={} killed_unexpected={} (want 1/0/0/0) ::",
@@ -23924,3 +23924,553 @@ pub fn virt_el0_verdict(_: usize) {
 pub fn el0_spin_done() -> u32 {
     EL0_SPIN_DONE.load(Ordering::Acquire)
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// NET6 (ROADMAP §1b SOCK-7) — the EL0 SOCKET FAMILY on aarch64: `SYS_SOCKET`(40) .. `SYS_SOCK_RECV`(46).
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// SOCKNUM (WINX-1) moved the family to 40..48 precisely so a number names the same verb on every arch.
+// x86 has answered 40..46 since SOCK-2/SOCK-3; aarch64 answered none of them — `KIND_SOCKET` has sat in
+// this file since U6 with the comment "no net syscall routes yet". These arms are those routes, and
+// they are the SAME verbs over the SAME shared stack (`net_phy::net6`), which is the whole point: ONE
+// OS means a ring-3 program that opens a UDP socket does not care which chip it is running on.
+//
+// THE CAPABILITY MODEL IS THE x86 ONE, NOT A SECOND ONE. A socket handle is `KIND_SOCKET` whose value
+// word is the GEN-FENCED `(gen << 32) | (sid + 1)`: the `+1` keeps it clear of the `0`(Empty) and
+// `u64::MAX`(RESERVING) sentinels, and the generation half is checked against the live registry at
+// every use, so a stale handle to a freed-and-reused slot is refused and never rebinds (the SOCK-3 /
+// U11x fence). Send needs `CAP_WRITE`, recv needs `CAP_READ`, so `SYS_CAP` GRANT can still attenuate a
+// socket to send-only or recv-only, and the mint carries `CAP_GRANT` so an owner may delegate its own.
+// Every user buffer is bound-checked through `copy_from_user`/`copy_to_user` — the whole range, before
+// any dereference — exactly as `sys_write` and `sys_read` do.
+//
+// NON-BLOCKING, because a syscall handler here runs IF-masked and cannot sleep: `recvfrom`/`sock_recv`
+// drive a bounded poll pump and return `-EAGAIN` if nothing landed; `connect` returns
+// `0`/`-EINPROGRESS`/`-ECONNREFUSED` and ring 3 re-drives. Identical contract to x86's.
+//
+// FILE TAIL, and the four call sites are LINE-NEUTRAL folds (the dispatch arms, the `SYS_REPORT`
+// route, the handle-row teardown, and the virt verdict). `syscall.rs` compiles into EVERY aarch64
+// image, so a source line added above existing code would move `panic::Location` and the knob-off
+// `kernel8.img`/jetson images with it.
+
+/// `-EAGAIN` for a socket verb: nothing arrived inside the bounded pump, or the tx ring is momentarily
+/// full. Ring 3 re-drives. (Distinct name from `EAGAIN` above, which documents the process table.)
+#[cfg(feature = "net6")]
+const NET6_EAGAIN: i64 = -11;
+/// `-EMFILE`: the persistent socket set is full, or no NIC adapter has registered.
+#[cfg(feature = "net6")]
+const NET6_EMFILE: i64 = -24;
+/// `-EINPROGRESS`: the active open is still in SYN-SENT; ring 3 polls `SYS_CONNECT` again.
+#[cfg(feature = "net6")]
+const NET6_EINPROGRESS: i64 = -115;
+/// `-ECONNREFUSED`: the peer refused (RST) or the socket fell out of SYN-SENT.
+#[cfg(feature = "net6")]
+const NET6_ECONNREFUSED: i64 = -111;
+/// `-ENOTCONN`: a stream verb on a socket that is not established.
+#[cfg(feature = "net6")]
+const NET6_ENOTCONN: i64 = -107;
+
+/// Pack a socket registry slot into its handle value word `(gen << 32) | (sid + 1)`.
+#[cfg(feature = "net6")]
+fn net6_pack(sid: usize) -> u64 {
+    ((crate::net_phy::net6::sock_gen(sid) as u64) << 32) | ((sid + 1) as u64)
+}
+
+/// Decode a socket HANDLE carrying ALL of `req` into its live socket-id, or an errno. THE single
+/// enforcement point: wrong kind / missing right / no handle all fail closed as `-EACCES`, and after
+/// that CHECK the packed `(gen, sid)` is validated against the live registry (present, owner-matched,
+/// generation-matched) so a stale or foreign handle is refused rather than rebound.
+#[cfg(feature = "net6")]
+fn net6_sid_of(asid: u64, handle: u64, req: u32) -> Result<usize, i64> {
+    match handle_resolve(asid, handle, req) {
+        Ok(HandleTarget::Socket(raw)) => {
+            let sid = ((raw & 0xFFFF_FFFF) as usize).checked_sub(1).ok_or(EACCES)?;
+            let generation = (raw >> 32) as u32;
+            if crate::net_phy::net6::sock_valid(asid, sid, generation) {
+                Ok(sid)
+            } else {
+                Err(EACCES) // stale (freed+reused), foreign, or a free registry slot
+            }
+        }
+        _ => Err(EACCES),
+    }
+}
+
+/// SYS_SOCKET(domain, type, proto) -> a socket HANDLE index, or a negative errno. `domain` must be
+/// AF_INET(2); `type` selects the transport — SOCK_STREAM(1) = TCP, SOCK_DGRAM(2) = UDP; `proto` is
+/// 0 / IPPROTO_TCP(6) / IPPROTO_UDP(17). Mints `KIND_SOCKET` with `CAP_READ|CAP_WRITE|CAP_GRANT`.
+#[cfg(feature = "net6")]
+fn net6_sys_socket(domain: u64, ty: u64, proto: u64) -> i64 {
+    if domain != 2 || (ty != 1 && ty != 2) || (proto != 0 && proto != 6 && proto != 17) {
+        return EINVAL;
+    }
+    let asid = current_asid();
+    let Some(sid) = crate::net_phy::net6::open(asid, ty == 1) else {
+        return NET6_EMFILE;
+    };
+    let Some(h) = handle_install(asid, HANDLE_RESERVING) else {
+        crate::net_phy::net6::close(sid); // no handle slot — release the socket, never leak it
+        return EAGAIN;
+    };
+    // Publish kind + rights FIRST, the live value LAST (Release), so a resolver that observes the
+    // value also observes both — the U5/U6 install discipline this file enforces everywhere.
+    handle_set_kind(asid, h, KIND_SOCKET);
+    handle_set_rights(asid, h, CAP_READ | una_abi::CAP_WRITE | una_abi::CAP_GRANT);
+    handle_set(asid, h, net6_pack(sid));
+    h as i64
+}
+
+/// SYS_BIND(handle, port) -> 0 / -errno. Names a local UDP port. Needs `CAP_WRITE` (binding is a
+/// configuring authority). No I/O — descriptor state only, so it is IF-masked-handler safe.
+#[cfg(feature = "net6")]
+fn net6_sys_bind(handle: u64, port: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, una_abi::CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if port == 0 || port > u16::MAX as u64 {
+        return EINVAL;
+    }
+    match crate::net_phy::net6::bind(sid, port as u16) {
+        Ok(()) => 0,
+        Err(()) => EINVAL,
+    }
+}
+
+/// Read the `SOCKADDR_HDR_LEN`-byte address header `[ip[4]][port u16 LE][pad u16]` out of a user
+/// message, returning `(ip, port, header_len)`. The WHOLE user range is validated before any read.
+#[cfg(feature = "net6")]
+fn net6_sockaddr(msg_ptr: u64, msg_len: u64) -> Result<([u8; 4], u16), i64> {
+    let hdr = una_abi::SOCKADDR_HDR_LEN;
+    if (msg_len as usize) < hdr {
+        return Err(EINVAL);
+    }
+    let mut h = [0u8; 8];
+    if copy_from_user(&mut h, msg_ptr, hdr).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(([h[0], h[1], h[2], h[3]], u16::from_le_bytes([h[4], h[5]])))
+}
+
+/// SYS_SENDTO(handle, msg_ptr, msg_len) -> bytes sent / -errno. `msg` is the 8-byte address header
+/// followed by the payload. Needs `CAP_WRITE`; the payload is clamped to the stack's datagram cap.
+#[cfg(feature = "net6")]
+fn net6_sys_sendto(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, una_abi::CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let (ip, port) = match net6_sockaddr(msg_ptr, msg_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let hdr = una_abi::SOCKADDR_HDR_LEN;
+    let plen = (msg_len as usize - hdr).min(crate::net_phy::net6::UDP_MAX_PAYLOAD);
+    let mut buf = [0u8; 1024];
+    if copy_from_user(&mut buf[..plen], msg_ptr + hdr as u64, plen).is_err() {
+        return EFAULT;
+    }
+    match crate::net_phy::net6::sendto(sid, ip, port, &buf[..plen]) {
+        Ok(n) => n as i64,
+        Err(()) => NET6_EAGAIN,
+    }
+}
+
+/// SYS_RECVFROM(handle, buf, len) -> total bytes written (the same 8-byte header, now the SOURCE
+/// address, followed by the payload) / `-EAGAIN`. Needs `CAP_READ`. Never blocks.
+#[cfg(feature = "net6")]
+fn net6_sys_recvfrom(handle: u64, buf: u64, len: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, CAP_READ) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let hdr = una_abi::SOCKADDR_HDR_LEN;
+    if (len as usize) <= hdr {
+        return EINVAL; // no room for even an empty datagram's source header
+    }
+    let cap = ((len as usize) - hdr).min(crate::net_phy::net6::UDP_MAX_PAYLOAD);
+    let mut kbuf = [0u8; 1024];
+    let Some((src, sport, n)) = crate::net_phy::net6::recvfrom(sid, &mut kbuf[..cap]) else {
+        return NET6_EAGAIN;
+    };
+    let h = [src[0], src[1], src[2], src[3], sport as u8, (sport >> 8) as u8, 0, 0];
+    if copy_to_user(buf, &h, hdr).is_err() {
+        return EFAULT;
+    }
+    if copy_to_user(buf + hdr as u64, &kbuf[..n], n).is_err() {
+        return EFAULT;
+    }
+    (hdr + n) as i64
+}
+
+/// SYS_CONNECT(handle, msg_ptr, msg_len) -> 0 (ESTABLISHED) / `-EINPROGRESS` / `-ECONNREFUSED`.
+/// `msg` is the 8-byte address header. Needs `CAP_WRITE`. Non-blocking poll model: ring 3 re-drives
+/// on `-EINPROGRESS`.
+#[cfg(feature = "net6")]
+fn net6_sys_connect(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, una_abi::CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let (ip, port) = match net6_sockaddr(msg_ptr, msg_len) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match crate::net_phy::net6::connect(sid, ip, port) {
+        crate::net_phy::net6::ConnectOutcome::Established => 0,
+        crate::net_phy::net6::ConnectOutcome::InProgress => NET6_EINPROGRESS,
+        crate::net_phy::net6::ConnectOutcome::Refused => NET6_ECONNREFUSED,
+    }
+}
+
+/// SYS_SEND(handle, buf, len) -> bytes queued / `-EAGAIN` / `-ENOTCONN`. Needs `CAP_WRITE`.
+#[cfg(feature = "net6")]
+fn net6_sys_send(handle: u64, buf: u64, len: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, una_abi::CAP_WRITE) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let n = (len as usize).min(crate::net_phy::net6::TCP_MAX_CHUNK).min(2048);
+    if n == 0 {
+        return 0;
+    }
+    let mut kbuf = [0u8; 2048];
+    if copy_from_user(&mut kbuf[..n], buf, n).is_err() {
+        return EFAULT;
+    }
+    match crate::net_phy::net6::send(sid, &kbuf[..n]) {
+        Ok(q) => q as i64,
+        Err(true) => NET6_EAGAIN,
+        Err(false) => NET6_ENOTCONN,
+    }
+}
+
+/// SYS_SOCK_RECV(handle, buf, len) -> bytes read / `-EAGAIN` / `0` at clean end-of-stream. Needs
+/// `CAP_READ`. Named `SOCK_RECV` because `SYS_RECV`(14) is the capability-transfer inbox.
+#[cfg(feature = "net6")]
+fn net6_sys_sock_recv(handle: u64, buf: u64, len: u64) -> i64 {
+    let asid = current_asid();
+    let sid = match net6_sid_of(asid, handle, CAP_READ) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let n = (len as usize).min(crate::net_phy::net6::TCP_MAX_CHUNK).min(2048);
+    if n == 0 {
+        return 0;
+    }
+    let mut kbuf = [0u8; 2048];
+    match crate::net_phy::net6::recv(sid, &mut kbuf[..n]) {
+        crate::net_phy::net6::RecvOutcome::Data(got) => {
+            if copy_to_user(buf, &kbuf[..got], got).is_err() {
+                return EFAULT;
+            }
+            got as i64
+        }
+        crate::net_phy::net6::RecvOutcome::WouldBlock => NET6_EAGAIN,
+        crate::net_phy::net6::RecvOutcome::Eof => 0,
+    }
+}
+
+/// Close every socket an address space still owns, at handle-row teardown — so a process that exits
+/// with sockets open frees its registry slots instead of leaking them for the boot's life. Folded
+/// onto `clear_handle_row`'s first statement; `#[inline(always)]`-empty knob-off.
+#[cfg(feature = "net6")]
+#[inline(always)]
+fn net6_free_owner(asid: u64) {
+    crate::net_phy::net6::free_owner(asid);
+}
+/// Knob-off twin: the folded call emits nothing.
+#[cfg(not(feature = "net6"))]
+#[inline(always)]
+fn net6_free_owner(_asid: u64) {}
+
+// ── The EL0 fixture: the RUNTIME proof, on QEMU `virt`, that ring 3 can reach the network ─────────
+//
+// A flat, position-independent, one-code-page EL0 program — the KILLBOUND/BGSPREAD shape, which rides
+// `spawn_user_image_bg` with no fixture file on any card — that walks the WHOLE family in order:
+//
+//   SYS_SOCKET(AF_INET, SOCK_DGRAM) -> SYS_BIND -> SYS_SENDTO -> SYS_RECVFROM      (the datagram half)
+//   SYS_SOCKET(AF_INET, SOCK_STREAM) -> SYS_CONNECT -> SYS_SEND -> SYS_SOCK_RECV   (the stream half)
+//
+// and reports a BITMASK of which verbs succeeded through `SYS_REPORT`, then PARKS in `SYS_FUTEX` on a
+// word nobody ever wakes. The park is load-bearing and is why this fixture does NOT call `SYS_EXIT`:
+// the VIRT-EL0 verdict requires `exited_ok == 1` (exactly `el0-hello`), so a second EL0 task exiting
+// cleanly would red a leg that has nothing to do with this arc. Parked, it is off every run queue,
+// burns no core, and `bg_kill` reaps it — the documented KILLBOUND discipline.
+//
+// The report word is TAGGED `0x4e36` ("N6") in its top half so `net6_report` cannot mistake another
+// fixture's report for this one (the `SYS_REPORT` route calls every reporter and each ignores what is
+// not its own — here the tag is the discriminator rather than a task name).
+//
+// THE PEER IS SLIRP, and that is stated rather than discovered: QEMU user-mode networking always
+// serves DNS at 10.0.2.3:53 over both UDP and TCP, so the fixture's address header is baked. This
+// program is a `virt` instrument; an Orin has a real DHCP server and its peers come from the lease.
+//
+// The two payloads are minimal DNS A-queries for `una.os` (24 bytes on the wire; the TCP copy carries
+// the 2-byte big-endian length prefix DNS-over-TCP requires). What is measured is the ROUND TRIP —
+// whether the answer is an address, NXDOMAIN or SERVFAIL is the resolver's business, not this leg's.
+#[cfg(feature = "net6")]
+core::arch::global_asm!(
+    r#"
+    .balign 4
+    .globl __net6_blob_start
+__net6_blob_start:
+    adr  x20, __net6_blob_start           // x20 = window base (PC-relative; the blob is copied here)
+    add  x21, x20, #0x1000                // x21 = the RW data page (futex word + receive buffers)
+    str  xzr, [x21]                       // zero the futex word: slot backings are RECYCLED and the
+    dmb  ish                              //   flat loader does not zero the data page (KILLBOUND's trap)
+    movz x23, #0x4e36, lsl #16            // x23 = the tagged result word ("N6" << 16), bits 0..7 = verbs
+
+    mov  x0, #2                           // SYS_SOCKET(AF_INET=2, SOCK_DGRAM=2, proto=0)
+    mov  x1, #2
+    mov  x2, #0
+    mov  x8, #40
+    svc  #0
+    cmp  x0, #0
+    b.lt 9f
+    orr  x23, x23, #1
+    mov  x22, x0                          // x22 = the UDP socket handle
+
+    mov  x0, x22                          // SYS_BIND(handle, 49300)
+    movz x1, #49300
+    mov  x8, #41
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #2
+
+    mov  x0, x22                          // SYS_SENDTO(handle, msg, 8 + 24)
+    adr  x1, __net6_udp_msg
+    mov  x2, #32
+    mov  x8, #42
+    svc  #0
+    cmp  x0, #0
+    b.le 9f
+    orr  x23, x23, #4
+
+    mov  x0, x22                          // SYS_RECVFROM(handle, buf, 512) — > 8 means header+payload
+    add  x1, x21, #0x40
+    mov  x2, #512
+    mov  x8, #43
+    svc  #0
+    cmp  x0, #8
+    b.le 9f
+    orr  x23, x23, #8
+
+    mov  x0, #2                           // SYS_SOCKET(AF_INET=2, SOCK_STREAM=1, proto=0)
+    mov  x1, #1
+    mov  x2, #0
+    mov  x8, #40
+    svc  #0
+    cmp  x0, #0
+    b.lt 9f
+    orr  x23, x23, #16
+    mov  x24, x0                          // x24 = the TCP socket handle
+
+    mov  x0, x24                          // SYS_CONNECT(handle, addr-header, 8)
+    adr  x1, __net6_udp_msg
+    mov  x2, #8
+    mov  x8, #44
+    svc  #0
+    cmp  x0, #0
+    b.ne 9f
+    orr  x23, x23, #32
+
+    mov  x0, x24                          // SYS_SEND(handle, len-prefixed query, 26)
+    adr  x1, __net6_tcp_q
+    mov  x2, #26
+    mov  x8, #45
+    svc  #0
+    cmp  x0, #0
+    b.le 9f
+    orr  x23, x23, #64
+
+    mov  x0, x24                          // SYS_SOCK_RECV(handle, buf, 512)
+    add  x1, x21, #0x300
+    mov  x2, #512
+    mov  x8, #46
+    svc  #0
+    cmp  x0, #0
+    b.le 9f
+    orr  x23, x23, #128
+
+9:  mov  x0, x23                          // SYS_REPORT(tagged mask) — the verdict, however far we got
+    mov  x8, #3
+    svc  #0
+    mov  x0, x21                          // SYS_FUTEX(uaddr, FUTEX_WAIT=0, expect=0) -> parks forever
+    mov  x1, #0
+    mov  x2, #0
+    mov  x8, #26
+    svc  #0
+1:  b 1b                                  // a wake would be a bug; spin rather than fall off the page
+
+    .balign 4
+__net6_udp_msg:                           // [dst ip 4][dst port u16 LE][pad u16] then the DNS query
+    .byte 10, 0, 2, 3
+    .byte 53, 0, 0, 0
+    .byte 0x4e, 0x36, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0
+    .byte 3
+    .ascii "una"
+    .byte 2
+    .ascii "os"
+    .byte 0
+    .byte 0, 1, 0, 1
+
+    .balign 4
+__net6_tcp_q:                             // DNS-over-TCP: a 2-byte big-endian length, then the query
+    .byte 0, 24
+    .byte 0x4e, 0x37, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0
+    .byte 3
+    .ascii "una"
+    .byte 2
+    .ascii "os"
+    .byte 0
+    .byte 0, 1, 0, 1
+
+    .balign 4
+    .globl __net6_blob_end
+__net6_blob_end:
+"#
+);
+
+#[cfg(feature = "net6")]
+unsafe extern "C" {
+    static __net6_blob_start: u8;
+    static __net6_blob_end: u8;
+}
+
+/// The EL0 fixture's reported verdict word (`0` = it has not reported yet). Tagged `0x4e36` ("N6") in
+/// its top half by the program itself, so this reporter takes only its own; the low byte is one bit
+/// per syscall, in the order the fixture calls them.
+#[cfg(feature = "net6")]
+static NET6_EL0_REPORT: AtomicU32 = AtomicU32::new(0);
+
+/// The `SYS_REPORT` route for the NET6 EL0 fixture. Folded onto the existing reporter list; like every
+/// other reporter there it ignores what is not its own — here by the `0x4e36` tag the program stamps
+/// in the word's top half rather than by task name. The tag travels IN the datum, so it survives a
+/// rename and cannot be spoofed by another fixture reporting a bare small integer.
+#[cfg(feature = "net6")]
+fn net6_report(a0: u64) {
+    if (a0 >> 16) & 0xFFFF == 0x4e36 {
+        NET6_EL0_REPORT.store(a0 as u32, Ordering::Release);
+    }
+}
+
+/// Launch the EL0 socket fixture, wait a bounded time for its report, print the scored witness, and
+/// reap it. Runs from the virt EL0 verdict task — EL1, after the user window is installed and after
+/// `el0-hello` has been judged, so neither leg can disturb the other.
+///
+/// Bounded by CNTPCT (free-running under QEMU, where no timer IRQ is delivered on this path), so a
+/// wedged fixture prints FAIL with whatever it managed rather than hanging the boot dark.
+#[cfg(all(feature = "net6", feature = "virt_el0"))]
+fn net6_el0_witness() {
+    let bstart = &raw const __net6_blob_start as usize;
+    let bend = &raw const __net6_blob_end as usize;
+    let blob = unsafe { core::slice::from_raw_parts(bstart as *const u8, bend - bstart) };
+    if blob.len() > super::uslots::USER_CODE_SIZE {
+        serial_println!(
+            ":: NET6: el0 socket fixture blob {} B > one code page — SKIPPED ::",
+            blob.len()
+        );
+        return;
+    }
+    let (pid, asid) = match net6_spawn_pinned(blob) {
+        Ok(v) => v,
+        Err(why) => {
+            serial_println!(":: NET6: el0 socket fixture NOT SPAWNED — {} -> FAIL ::", why);
+            return;
+        }
+    };
+    let t0 = super::timer::cntpct();
+    let budget = super::timer::cntfrq().saturating_mul(20);
+    let mut word = 0u32;
+    loop {
+        word = NET6_EL0_REPORT.load(Ordering::Acquire);
+        if word != 0 {
+            break;
+        }
+        if super::timer::cntpct().wrapping_sub(t0) >= budget {
+            break;
+        }
+        super::sched::yield_now();
+    }
+    let m = word & 0xFF;
+    // Each bit is one verb, in the order the fixture calls them. Printed INDIVIDUALLY rather than as
+    // a count, because "which verb stopped it" is the whole diagnostic value of a partial run.
+    serial_println!(
+        ":: NET6: el0 socket family over {} — socket={} bind={} sendto={} recvfrom={} socket-tcp={} connect={} send={} sock_recv={} -> {} ::",
+        crate::net_phy::net6::nic_name(),
+        m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0,
+        m & 16 != 0, m & 32 != 0, m & 64 != 0, m & 128 != 0,
+        if m == 0xFF { "PASS" } else if word == 0 { "FAIL (no report in budget)" } else { "FAIL" }
+    );
+    // Reap the parked fixture: nothing can wake it (the word it waits on is written only by itself,
+    // before the park), so the kill is the only way its slot comes back.
+    let _ = bg_kill(pid, asid);
+}
+
+/// Load `blob` into a fresh address-space slot and dispatch it at EL0 **pinned to the boot core**,
+/// returning `(pid, asid)`. This is `spawn_user_image_bg` with one term changed, and the term is the
+/// whole reason it exists: that launcher places with `CPU_AUTO`, whose candidate set is
+/// `ONLINE_MASK[c] && el1_core(c)` — and on QEMU `virt` that set is EMPTY. Measured, not assumed: the
+/// first run of this fixture printed
+/// `:: NET6: el0 socket fixture NOT SPAWNED — no core is at EL1 to host a background EL0 task on this
+/// platform (EL0-EL1CORE) -> FAIL ::` on a boot whose very next lines were
+/// `[el0core] el1 core MEASURED: cpu=0 mask=0x1` and `:: VIRT-EL0: el0-hello round-trip -> PASS ::`.
+/// Both are true at once: core 0 IS at EL1, and core 0 is NOT in `ONLINE_MASK` (the JC3 virt drop
+/// leaves the boot core outside the scheduler's online set, and the secondaries are parked at EL2).
+///
+/// `virt_el0_start_maybe` already meets this by pinning `el0-hello` to cpu 0 rather than asking for
+/// AUTO, and for the identical documented reason. `el0_placement_possible(0)` — which for a pinned
+/// request is exactly `el1_core(0)` — is the pre-check, so the refusal still costs no unwinding, and
+/// `spawn_user_slot` re-checks and refuses on its own if this ever goes stale.
+///
+/// Everything else is `spawn_user_image_bg` verbatim (detached mark before dispatch, `futex_init` for
+/// the park, the console cap, and the EXEC1-M publish order: the ASID is stored BEFORE the spawn so a
+/// child that runs to completion on another core is still reachable by the SYS_EXIT rescue arm).
+#[cfg(all(feature = "net6", feature = "virt_el0"))]
+fn net6_spawn_pinned(bytes: &[u8]) -> Result<(u64, u64), &'static str> {
+    if bytes.len() > super::uslots::USER_REGION_SIZE {
+        return Err("image larger than the 16 KiB user window");
+    }
+    if !super::sched::el0_placement_possible(0) {
+        return Err("the boot core is not at EL1 — no host for the fixture (EL0-EL1CORE)");
+    }
+    let Some(pi) = proc_reserve() else {
+        return Err(proc_table_full_reason());
+    };
+    let mapped = match map_image_into_slot(bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            proc_free(pi);
+            return Err(match e {
+                MapErr::Empty => "empty image",
+                MapErr::BadSize(_) => "flat blob larger than one code page",
+                MapErr::BadElf(why) => why,
+                MapErr::NoSlot => "no free address-space slot",
+            });
+        }
+    };
+    let asid = mapped.ttbr0 >> 48;
+    set_detached(asid, true);
+    super::sched::futex_init();
+    install_console_cap(asid);
+    PROCS[pi].asid.store(asid, Ordering::Release);
+    let pid = super::sched::spawn_user_slot("el0-net6", mapped.base, mapped.sp, mapped.ttbr0, 0);
+    PROCS[pi].pid.store(pid, Ordering::Release);
+    if pid == 0 {
+        proc_free(pi);
+        return Err("spawn_user_slot refused the pinned EL0 placement");
+    }
+    Ok((pid, asid))
+}
+
+/// Knob-off (or a build with no EL0 regime on virt): the folded call emits nothing.
+#[cfg(not(all(feature = "net6", feature = "virt_el0")))]
+#[inline(always)]
+fn net6_el0_witness() {}

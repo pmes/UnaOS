@@ -1272,6 +1272,27 @@ bcmaS1 = ["bcmarecon"]
 # `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm`. See arch_arm64.md §AARCH64-VNET.
 vnet = ["dep:smoltcp"]
 
+# NET6 (ROADMAP §1b SOCK-7): the SHARED aarch64 socket surface over whichever NIC is up — one
+# persistent smoltcp `Interface` + `SocketSet`, the shell verbs `ping`/`arp`/`dns`, and the EL0 socket
+# syscall family (`SYS_SOCKET` 40 .. `SYS_SOCK_RECV` 46) on aarch64. ONE OS: the surface is written
+# once (the tail module of `net_phy.rs`) and every arch-specific byte is the DEVICE ADAPTER — a driver
+# registers a `net6::NicOps` and is done. `virtio_net.rs` registers it on QEMU `virt` (where the whole
+# thing is RUNTIME-proven, `./arroyo test-arm`) and `rtl8168_tegra.rs` on Orin metal.
+#
+# It is NOT `smolnet` widened: `smolnet` is the x86 DEFAULT stack, so new lines in it would move the
+# shipped x86 image's `panic::Location`s, and `arm_features()` strips `smolnet` from every aarch64
+# cargo invocation to hold the aarch64 media byte-identity contract. `net6` is the aarch64 name, and
+# it is DEFAULT OFF — every item is `all(feature = "net6", target_arch = "aarch64")` and every one of
+# them is at a file TAIL or folded onto an existing line, so knob-off both arches are byte-identical.
+#
+# Armed BY the NIC knobs (`arroyo`: UNAOS_NET4 / UNAOS_NET5 / UNAOS_VNET each append `net6`), so a
+# board that has a NIC gets the surface over it; `UNAOS_NET6=1` also arms it standalone — without an
+# adapter no driver ever registers
+# and every entry point reports "no NIC adapter registered" honestly rather than faulting. Pulls the
+# smoltcp dep (the same optional dep net4/vnet/genet use). The ARMED polarity is type-checked by the
+# `arm-virt-net6` and `arm-tegra-net6` legs of KERNEL_CFG_MATRIX, never by the knob map in `arroyo`.
+net6 = ["dep:smoltcp"]
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware

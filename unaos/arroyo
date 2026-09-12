@@ -1844,7 +1844,7 @@ fi
 # net4-standalone virt build only prints one honest witness line; the metal build combines
 # UNAOS_TEGRA=1. Default OFF => module + call sites vanish, smoltcp not pulled, byte-identical to
 # baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
-[ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,"
+[ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,net6,"
 # ORIN-NET-5: UNAOS_NET5=1 arms the RING RE-FETCH PROBE on top of the net4 driver — one knob, one boot,
 # one question (arch/aarch64/rtl8168_tegra.rs § NET-5). AFTER `CR = RxEnb|TxEnb` it re-points RX
 # descriptors 1..31 at a tagged SHADOW block in the same Normal-NC window (slot 0 kept as the control),
@@ -1859,7 +1859,7 @@ fi
 # every field, site and string vanishes and the image is byte-identical to a net4 build. The ARMED
 # polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX, never by this mapping.
 # Design: docs/dev/evidence/orin16/NET5.md. UNFLOWN — flies on net5.
-[ -n "${UNAOS_NET5:-}" ] && _feats="${_feats}net5,net4,pcie3,pcie2,"
+[ -n "${UNAOS_NET5:-}" ] && _feats="${_feats}net5,net4,pcie3,pcie2,net6,"
 # ORIN-SDMMC-1: UNAOS_SDMMC=1 arms the Tegra234 microSD-slot SDMMC controller READ-ONLY recon — the
 # installer line's first rung (arch/aarch64/sdmmc_tegra.rs). Resolves the controller from the live DTB
 # (compatible/name match, no hardcoded base; the enabled removable instance = the microSD slot), maps
@@ -1921,7 +1921,48 @@ fi
 # it runs on the plain virt GICv3 path (UNAOS_VNET=1 UNAOS_GICV3=1 test-arm). The knob ALSO adds the
 # `-netdev user -device virtio-net-device` QEMU args below (VNET_ARG); knob-off leaves BOTH the feature
 # and the QEMU invocation byte-identical to baseline. See arch_arm64.md §AARCH64-VNET.
-[ -n "${UNAOS_VNET:-}" ] && _feats="${_feats}vnet,"
+[ -n "${UNAOS_VNET:-}" ] && _feats="${_feats}vnet,net6,"
+# NET6 (ROADMAP §1b SOCK-7): UNAOS_NET6=1 arms the SHARED aarch64 socket surface — one persistent
+# smoltcp `Interface` + `SocketSet` over whichever NIC registered, the shell verbs `ping`/`arp`/`dns`,
+# and the EL0 socket syscall family (`SYS_SOCKET` 40 .. `SYS_SOCK_RECV` 46) on aarch64. The code is
+# written ONCE (the tail module of `crates/kernel/src/net_phy.rs`) and every arch-specific byte is a
+# DEVICE ADAPTER: `virtio_net.rs` registers one on QEMU `virt`, `rtl8168_tegra.rs` one on Orin metal.
+#
+# It is a STANDALONE knob that pairs with a NIC knob — it implies neither `vnet` nor `net4`, because
+# the two are different boards' devices and implying either would arm a driver the caller did not ask
+# for. With no adapter registered every entry point says so honestly and does no MMIO.
+#
+#   runtime  (the ONLY runtime proof this family can have off the bench — QEMU models no Tegra234):
+#     UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VNET=1 UNAOS_NET6=1 ./arroyo test-arm 60
+#   metal:
+#     UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1 UNAOS_NET6=1 ./arroyo esp-jetson
+#
+# Default OFF => the `net_phy` tail module, the seven syscall arms, the three shell-verb bodies and the
+# EL0 fixture blob all vanish, and EVERY call site is a LINE-NEUTRAL fold onto an existing line or a
+# file-tail item — so no `panic::Location` moves and the knob-off images are byte-identical
+# (`./arroyo knoboff net6`, and `knoboff net4` measures the same claim from the other side).
+# Witnesses on the wire: `:: NET6: stack UP over …`, `:: NET6: ping <ip> seq=N rtt_ms=… -> REPLY ::`,
+# `:: NET6: arp <ip> -> is-at <mac> ::`, `:: NET6: dns <host> -> A a.b.c.d ::`,
+# `:: NET6: sock udp round-trip … -> PASS ::`, `:: NET6: sock tcp round-trip … -> PASS ::`,
+# `:: NET6: el0 socket family over <nic> — socket=true bind=true … -> PASS ::`.
+# See docs/dev/OS/06_NETWORK_STACK/network_stack.md §NET6.
+#
+# NET6 RIDES THE NIC KNOBS, and that is deliberate: `UNAOS_NET4=1` (or `UNAOS_NET5=1`, or
+# `UNAOS_VNET=1`) appends `net6` on its own line above, so arming a NIC arms the surface over it and
+# the Orin flight line stays `UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1` with no fourth knob to
+# remember. `UNAOS_NET6=1` below still arms it standalone (the surface compiles with no adapter and
+# says so honestly), which is what the `arm-virt-net6` leg uses.
+#
+# It is NOT a Cargo implication (`net4 = [..., "net6"]`) for a reason worth keeping: KERNEL_CFG_MATRIX
+# passes feature strings STRAIGHT to cargo and never through this map, so the existing `arm-tegra*`
+# rows keep compiling net4 with net6 OFF while the two `*-net6` rows compile it ON. A Cargo
+# implication would delete that second polarity from every leg in the file — the exact shape of the
+# default-quiet-knob hole LAWS §5 names (orin 20: "read the polarity, not the leg count").
+#
+# Byte identity is unaffected and MEASURED from the other side: with no NIC knob set there is no
+# `net6`, so `./arroyo knoboff net4` compares a knob-off image that contains neither — exit 0 on both
+# arches, control fired.
+[ -n "${UNAOS_NET6:-}" ] && _feats="${_feats}net6,"
 # PI-GENET: UNAOS_GENET=1 arms the BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) driver +
 # smoltcp bind — the Pi's FIRST network path (arch/aarch64/genet.rs). DTB-resolves the GENET register
 # base, poison-honest probes SYS_REV_CTRL to classify whether the build models GENET, brings up UMAC +
@@ -3410,6 +3451,13 @@ KERNEL_CFG_MATRIX=(
   # pairwise guarantee is unaffected either way: it is a property of the mask construction, not of
   # which features are in the set.
   "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
+  # NET6 on the METAL adapter — the `rtl8168_tegra.rs` half of the shared socket surface (its `NicOps`
+  # static, `net6_mac`, `net6_start` and the lease-owner witness), which the `arm-virt-net6` leg above
+  # does not compile because that driver is `net4`-gated. Both adapters must type-check against the one
+  # shared surface or the ONE OS claim is only true of whichever one a gate happened to build; this row
+  # and that one are the two halves of that claim. `net5` rides along so the armed ring re-fetch probe
+  # is compiled beside it (the combination an Orin bench flight actually carries).
+  "arm-tegra-net6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,net5,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,net6"
   # ORIN-EL1AP armed (baton orin-8 item 1) — the arm-tegra-el0 row verbatim + `orinel1ap`, the literal
   # precedent one leg above (the feature implies `tegrasmp` + `tegra_el0` -> `tegra`; every site is
   # under `src/arch/aarch64/`, so it is aarch64-only in effect and inherits onto the x86 mix legs as
@@ -4367,6 +4415,21 @@ KERNEL_CFG_MATRIX=(
   # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
   # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
   "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0"
+  # NET6 (SOCK-7) — the ARMED polarity of the shared aarch64 socket surface, and the ONLY leg that
+  # compiles it. It carries `vnet` + `net6` + `virt_el0` together because that triple is exactly what
+  # the runtime gate runs and because each term reaches code the others do not: `vnet` supplies the
+  # device adapter (`virtio_net.rs`'s `NicOps` + the `net6_start` call), `net6` the whole `net_phy`
+  # tail module and the seven `syscall.rs` socket arms, and `virt_el0` the EL0 fixture launcher folded
+  # into `virt_el0_verdict` — which is `#[cfg(all(net6, virt_el0))]` and therefore compiled by NO other
+  # leg in this matrix. Without this row the armed polarity of all three would be type-checked by
+  # nothing, which is the `default-quiet knob` hole LAWS §5 names.
+  #
+  # NOT `tegra`: the point is that the socket surface is BOARD-FREE. If it ever stops compiling without
+  # a board term, this leg says so before any image is cut.
+  #
+  # PRECONDITION, inherited from the `virt_el0` leg above: compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  "arm-virt-net6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,vnet,net6"
   # VIRTPREEMPT (orin 17) — THE PREEMPTIVE TWIN OF THE LEG ABOVE, and not redundant with it. `virt_tick`
   # is the ONLY configuration in the tree where the `exceptions.rs` `irq_bank!`/`irq_unbank!` runtime
   # `CurrentEL` arm is selected WITHOUT `tegra`, so it is the only leg that type-checks that arm against a
