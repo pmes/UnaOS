@@ -929,3 +929,20 @@ pub mod winmenu;
     any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))
 ))]
 pub mod facet;
+
+// ── BEAM (orin 26) — presents ordered against the scan-out's raster position ────────────────────
+//
+// Peter, render11 and render12 (2026-09-09): "THERE'S A LOT OF TEARING", while every `torn=` on
+// the wire read 0. TEAR-DIAG (`docs/dev/evidence/orin24/TEAR-DIAG.md`) showed why: the four tear
+// counters ask a DURATION question of a PHASE defect. `video/beam.rs` is the phase half — a hold
+// around every panel present until the beam is clear of the rows it is about to write, and the
+// observation of whether the beam crossed them anyway, which is what `torn=` now reads where a
+// beam source exists. UNCONDITIONAL, because it is the MECHANISM and not an instrument; on a
+// platform whose `arch::scanout_beam()` is `None` (x86, Pi, QEMU — every image but an Orin with
+// `UNAOS_BEAM=1`) every entry point folds to a no-op and the panel writes are what they were.
+//
+// DECLARED AT THE TAIL, below `facet`, for `facet`'s reason: this file is compiled into every
+// image including the knob-off Pi `kernel8.img`, and a `mod` line inserted anywhere above
+// renumbers `panel_info_nonblocking` and its neighbours, which `core::panic::Location` embeds.
+// An append moves nothing.
+pub mod beam;

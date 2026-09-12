@@ -410,6 +410,9 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     // It brackets exactly what reaches the SCAN-OUT and nothing else: the compose of each row happens
     // inside it because a strip composes row-by-row INTO the panel, which is the whole reason a bar's
     // present can outrun the beam where a window's staged blit cannot. See [`bar_painted`].
+    // BEAM (orin 26) — hold clear of the beam BEFORE the present clock opens (the wait is the
+    // hold's, not the paint's), publish inside the bracket, release after the clean below.
+    let hb = super::beam::hold(y, y + h, info.height, false, true);
     let tp0 = crate::arch::now_cycles();
     let stride_b = info.stride * 4;
     for j in 0..h {
@@ -434,6 +437,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
         fb.blit(off, bytes);
     }
     fb.flush_rect(x, y, w, h);
+    let _ = super::beam::settle(hb);
     // TEARSCOPE — record what this present cost against what the beam spends on the same rows.
     bar_painted(name, r, crate::arch::now_cycles().saturating_sub(tp0), info.height);
     true
@@ -474,6 +478,9 @@ pub fn erase_rect(r: Rect) -> bool {
         s.raw[i] = raw;
     }
     let stride_b = info.stride * 4;
+    // BEAM (orin 26) — bracketed like `paint`, UNRECORDED: no witness reads this erase, and a
+    // recorded observation nobody takes would be handed to the next `bar_painted` on this core.
+    let hb = super::beam::hold(y, y + h, info.height, false, false);
     for j in 0..h {
         // SAFETY: as in `paint` — `raw` is a live `[u32; MAX_STRIP_W]`, `w <= MAX_STRIP_W`, and
         // `blit` bounds-checks its destination.
@@ -481,6 +488,7 @@ pub fn erase_rect(r: Rect) -> bool {
         fb.blit((y + j) * stride_b + x * 4, bytes);
     }
     fb.flush_rect(x, y, w, h);
+    let _ = super::beam::settle(hb);
     true
 }
 
@@ -963,6 +971,11 @@ struct BarCensus {
     /// over every span whose erase succeeded.
     restored: AtomicU64,
     restored_px: AtomicU64,
+    /// BEAM (orin 26) — paints with a beam observation, microseconds the hold spun for them, and
+    /// the exposure census `wcg` keeps for windows (see `H_BEAMCROSS`), here for the bars.
+    beamobs: AtomicU64,
+    beamwait_us: AtomicU64,
+    beamcross_ppk: AtomicU64,
     rect: AtomicU64,
     emit: AtomicU64,
     t0: AtomicU64,
@@ -999,6 +1012,9 @@ impl BarCensus {
             flat_px: AtomicU64::new(0),
             restored: AtomicU64::new(0),
             restored_px: AtomicU64::new(0),
+            beamobs: AtomicU64::new(0),
+            beamwait_us: AtomicU64::new(0),
+            beamcross_ppk: AtomicU64::new(0),
             rect: AtomicU64::new(0),
             emit: AtomicU64::new(0),
             t0: AtomicU64::new(0),
@@ -1089,18 +1105,44 @@ fn bar_painted(name: &str, r: Rect, cyc: u64, panel_h: usize) {
     c.minpaint_us.fetch_min(present_us, Ordering::Relaxed);
     c.scan_us.store(rectscan_us, Ordering::Relaxed);
     c.rect.store(pack_rect(Some(r)), Ordering::Relaxed);
-    if present_us > rectscan_us {
+    // BEAM (orin 26) — the exposure on every paint, and the observation `paint`'s bracket
+    // recorded, which decides `torn=` where it exists; the duration predicate only where it does
+    // not. The same split `wcg::stage_note` makes, for the same reason (TEAR-DIAG).
+    c.beamcross_ppk.fetch_add(super::beam::exposure_ppk(present_us, rectscan_us), Ordering::Relaxed);
+    let obs = super::beam::take_last();
+    let torn = match obs {
+        Some(o) => {
+            c.beamobs.fetch_add(1, Ordering::Relaxed);
+            c.beamwait_us.fetch_add(o.waited_us as u64, Ordering::Relaxed);
+            o.torn
+        }
+        None => present_us > rectscan_us,
+    };
+    if torn {
         let n = c.torn.fetch_add(1, Ordering::Relaxed) + 1;
         if c.said.fetch_or(SAID_TORN, Ordering::Relaxed) & SAID_TORN == 0 {
             serial_println!(
-                "[strip] paint tenant={} box={}x{} present_us={} rectscan_us={} torn={} -> AT-RISK",
+                "[strip] paint tenant={} box={}x{} present_us={} rectscan_us={} beam={} torn={} -> AT-RISK",
                 name,
                 w,
                 h,
                 present_us,
                 rectscan_us,
+                match obs { Some(o) => BeamFmt(Some((o.vs, o.ve, o.vt))), None => BeamFmt(None) },
                 n
             );
+        }
+    }
+}
+
+/// BEAM — `beam=` for the strip's lines: `vs..ve/vt` observed, `blind` otherwise.
+struct BeamFmt(Option<(u32, u32, u32)>);
+
+impl core::fmt::Display for BeamFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some((vs, ve, vt)) => write!(f, "{}..{}/{}", vs, ve, vt),
+            None => f.write_str("blind"),
         }
     }
 }
@@ -1360,7 +1402,7 @@ fn bar_rollup_one(k: usize) {
     };
     let minp = c.minpaint_us.load(Ordering::Relaxed);
     serial_println!(
-        "[strip] rollup tenant={} scope=bar emit={} age_ms={} rect={}x{}+{}+{} scene={} pop=all-paints paints={} paint_px={} torn={} maxpaint_us={} minpaint_us={} rectscan_us={} declines={} decl_lock={} decl_ready={} decl_word={} decl_geom={} pop=vacates vacates={} uncovered={} uncovered_px={} unerased={} unerased_px={} forgotten={} flat={} flat_px={} restored={} restored_px={} pop=constant frame_us={} -> {}",
+        "[strip] rollup tenant={} scope=bar emit={} age_ms={} rect={}x{}+{}+{} scene={} pop=all-paints paints={} paint_px={} torn={} beam={} beamobs={} beamwait_us={} beamcross_ppk={} maxpaint_us={} minpaint_us={} rectscan_us={} declines={} decl_lock={} decl_ready={} decl_word={} decl_geom={} pop=vacates vacates={} uncovered={} uncovered_px={} unerased={} unerased_px={} forgotten={} flat={} flat_px={} restored={} restored_px={} pop=constant frame_us={} -> {}",
         BAR_NAMES[k],
         emit,
         age_ms,
@@ -1372,6 +1414,10 @@ fn bar_rollup_one(k: usize) {
         c.paints.load(Ordering::Relaxed),
         c.paint_px.load(Ordering::Relaxed),
         torn,
+        if c.beamobs.load(Ordering::Relaxed) > 0 { "obs" } else { "blind" },
+        c.beamobs.load(Ordering::Relaxed),
+        c.beamwait_us.load(Ordering::Relaxed),
+        c.beamcross_ppk.load(Ordering::Relaxed),
         c.maxpaint_us.load(Ordering::Relaxed),
         if minp == u64::MAX { 0 } else { minp },
         c.scan_us.load(Ordering::Relaxed),

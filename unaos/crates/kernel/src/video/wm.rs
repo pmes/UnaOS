@@ -18627,7 +18627,7 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
 /// one whose SINGLE ROW does not fit, which is unreachable on any panel this kernel can address (4
 /// MiB is a 1 048 576-pixel row). See [`stage_window`] for the banding and for the visibility window
 /// it costs.
-const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STAGE_BYTES: usize = 4 * 1024 * 1024; #[cfg(feature = "beam")] const STAGE_MIN_ROWS: usize = 16; // STAGESHRINK (orin 26) — the smallest band an allocator decline shrinks a present to before it declines outright: 16 rows of a panel-wide box is ~123 KB, five halvings under the 3.9 MB ask that starved render12 into 1965 direct paints. SAME-LINE fold: a new line here renumbers every panic `Location` below it.
 
 /// WC-H — the window back-layer's memory: one buffer, allocated on first use at the size the largest
 /// window needs and reused by every composite thereafter. WC-M: "what the window needs" is capped at
@@ -19269,7 +19269,7 @@ fn draw_window(
     // WC-H — compose off-screen and present the box as contiguous rows. Returns false when the
     // back-layer is unavailable (compat row, over-cap geometry, another core holding it, or the
     // allocator declining), in which case the direct path below runs exactly as it always has.
-    let mut overlaid = false;
+    let mut overlaid = false; let mut hbd: Option<super::beam::Hold> = None; // BEAM (orin 26) — the DIRECT fallback's bracket (staged presents bracket per band inside `stage_window`); opened at the `paint_window` call below, released after the tail clean, and its observation handed to `wcg::direct_obs` rather than parked, because no `stage_note` follows a declined present.
     let offer = if may_overlay { cur } else { None };
     // FBCON-DMG — the band, as BOX-RELATIVE rows. `damaged_box` does the source→panel conversion and
     // the clip to the box; subtracting `by` puts it in the coordinate `stage_window`'s loop counts in.
@@ -19324,7 +19324,7 @@ fn draw_window(
         if dragocc_target(r).is_some() {
             DO_DIRECT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
-        comp_mark(r.id, 34);
+        comp_mark(r.id, 34); hbd = super::beam::hold(by, by + bh, ph, true, false);
         paint_window(fb, r, 0, 0, bx, by, bw, bh, pw, ph, focused, false);
     }
     // CURSOR-4 — this window has just painted its clipped outer box. If it did NOT compose the
@@ -19461,7 +19461,7 @@ fn draw_window(
     };
     if y1 > y0 {
         fb.flush_rect(bx, y0, bw, y1 - y0);
-    }
+    } #[cfg(feature = "witness")] super::wcg::direct_obs(r.id, super::beam::settle(hbd)); #[cfg(not(feature = "witness"))] let _ = super::beam::settle(hbd); // BEAM (orin 26) — the direct path's bracket closes here, AFTER the clean that publishes its pixels; `None` on every staged present and on every platform without a beam source.
     // COMPOSITE-2 — the cache term is band-correct without arithmetic of its own: it brackets a
     // `flush_rect` over `[y0, y1)`, the same rows charged above, so a banded present pays a banded
     // sweep and the interval measures it.
@@ -20609,7 +20609,7 @@ fn stage_window(
     if chunk_rows == 0 {
         decline!(super::wcg::DECL_CAP);
     }
-    let need = row_bytes * chunk_rows;
+    let need = row_bytes * chunk_rows; #[cfg(feature = "beam")] let (mut need, mut chunk_rows) = (need, chunk_rows); // STAGESHRINK (orin 26) — rebound mutable on the ARMED polarity only, so the knob-off line is the baseline's character for character (knoboff §5).
     let mut stage = match stage_for_core().try_lock() {
         Some(g) => g,
         None => decline!(super::wcg::DECL_LOCK),
@@ -20618,7 +20618,7 @@ fn stage_window(
     // acquire→release span (the stage fill/flush). No-op inline shim when `rtwit` is off.
     let _sh = crate::rtwit::hold(crate::rtwit::Lock::Stage);
     if stage.len() < need {
-        let add = need - stage.len();
+        let add = need - stage.len(); #[cfg(feature = "beam")] let add = { if stage.try_reserve(add).is_err() { while chunk_rows / 2 >= STAGE_MIN_ROWS.min(span) { chunk_rows /= 2; need = row_bytes * chunk_rows; #[cfg(feature = "witness")] super::wcg::stage_shrunk(r.id); let want = need.saturating_sub(stage.len()); if stage.try_reserve(want).is_ok() { break; } } } need.saturating_sub(stage.len()) }; // STAGESHRINK (orin 26, TEAR-DIAG §3.1) — on a refusal the band is HALVED and asked again, down to [`STAGE_MIN_ROWS`], before the `if` below declines. render12 A3 declined 1818+147 presents on `decl_alloc` — every one a `paint_window` straight into the live scan-out at P(tear)~0.88, the largest unmeasured tear population on that wire — because a 3.9 MB band was asked of a heap that could give a fraction of it. A smaller band is the WC-M machinery this loop already runs, one more turn; the direct path is the tearing regime. Counted per halving as `[wc-h] shrunk=`. The reserve the loop won is still standing, so the baseline's `try_reserve(add)` on the next line succeeds and the baseline's `decline!` fires only when the floor was reached — which is why the shrink rides on THIS line and the tearing-era lines below are untouched.
         // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
         // context. The buffer only ever grows, so a steady window size allocates exactly once.
         if stage.try_reserve(add).is_err() {
@@ -20773,7 +20773,7 @@ fn stage_window(
             }
         }
 
-        #[cfg(feature = "witness")]
+        let hb = super::beam::hold(by + band, by + band + rows, ph, false, true); #[cfg(feature = "witness")]
         let b1 = crate::arch::now_cycles();
 
         // Present: one bulk copy per row. This is the whole of what the scan-out can catch
@@ -20834,11 +20834,11 @@ fn stage_window(
                 odock_px += span_occ(odockb, py, bx, bx + bw).saturating_sub(row_dock_pub);
                 obar_px += span_occ(obarb, py, bx, bx + bw).saturating_sub(row_bar_pub);
             }
-        }
+        } let _hbw = super::beam::waited_cycles(&hb); if super::beam::held(&hb) { fb.flush_rect(bx, by + band, bw, rows); } let _ = super::beam::settle(hb); // BEAM (orin 26) — the band is published (cache-cleaned) INSIDE the bracket, because on the Orin the scan-out reads DRAM and the rows reach it at the `DC CVAC`, not at the memcpy; `settle` then samples the beam and records whether it crossed these rows. Held only when a beam source exists, so the Pi/x86/knob-off path still publishes at `draw_window`'s tail exactly as before (that tail clean still runs here too — clean lines cost a tag lookup each). `present_us` on a held present therefore includes the band's clean; the hold's own wait is subtracted from `compose_us` below and printed as `beamwait_us=`.
 
         #[cfg(feature = "witness")]
         {
-            compose_cyc += b1.saturating_sub(b0);
+            compose_cyc += b1.saturating_sub(b0).saturating_sub(_hbw);
             present_cyc += crate::arch::now_cycles().saturating_sub(b1);
         }
         band += rows;
@@ -21177,7 +21177,7 @@ fn stage_fill(
     let mut spans = [(0usize, 0usize); OCC_MAX + 1];
     // WCK4-D2 (integrator): the true `fb.blit` call count, fed to `erase_note` as `spans=` so the
     // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
-    let mut blit_calls: usize = 0;
+    let mut blit_calls: usize = 0; let hb = super::beam::hold(y, y + h, info.height, false, true); // BEAM (orin 26) — the fill's bracket: opened here, after the compose and after every `defer!`/`drop_fill!` exit (a declined fill writes no pixel and must not wait for a beam), closed after the rows are cleaned below.
     for r in 0..h {
         let py = y + r;
         let off = py * fb_row + x * bpp;
@@ -21237,7 +21237,7 @@ fn stage_fill(
             clip_px += w as u64 - row_pub;
             dock_px += span_occ(dockb, py, x, x + w).saturating_sub(row_dock_pub);
         }
-    }
+    } if super::beam::held(&hb) { fb.flush_rect(x, y, w, h); } let _hbw = super::beam::waited_cycles(&hb); let _ = super::beam::settle(hb); // BEAM (orin 26) — publish (clean) inside the bracket and close it; `drain_deferred`'s own clean after this call still runs and finds clean lines. The wait is taken back out of `erase_note`'s present clock below.
     #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -21290,7 +21290,7 @@ fn stage_fill(
         row_bytes,
         blit_calls,
         contig,
-        crate::arch::now_cycles(),
+        crate::arch::now_cycles().saturating_sub(_hbw),
         t0,
         t1,
         info.height,

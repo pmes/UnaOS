@@ -906,7 +906,7 @@ pub fn jd1_dc_probe(chan: &super::bpmp_tegra::Chan, dtb_addr: u64, dtb_size: usi
         ":: tegra: JD1-DC — FIRST READ SURVIVED: {}={:#010x} — the CCPLEX decodes this aperture without an EL3 abort ::",
         if have_cap { "DISPLAY_FE_SW_SYS_CAP" } else { "head+0x0 win0 WIN_OPTIONS" },
         first,
-    ); jd1_dc_model(base, size, have_cap, first); jx2_nvc67d_status(base, size); // JD1-DC-MODEL — the WHICH-CHIP discriminator, four more read-only reads, appended here because this is the first instruction at which an nvdisplay read is known non-fatal and the long window sweep has not yet risked the boot. Without it `VERDICT=DECODES-NOMATCH` is AMBIGUOUS between "the aperture is not live" and "our register map is Tegra194's and this silicon is Tegra234" — two answers that send the display arc in opposite directions. See the JD1-DC-MODEL block at this file's tail. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves. || AND JX2-NVC67D, appended to the same line for the same two reasons: this is still the first instruction at which an nvdisplay read is KNOWN non-fatal on this boot, and appending rather than adding a statement line keeps every `core::panic::Location` below unmoved. It runs AFTER the discriminator because it CONSUMES the discriminator's answer — boot7f's `MODEL-VERDICT=NVDISPLAY-CLASS-C670` / `FE_CLASSES=0xc6700410` is the entire licence for its offsets — and it SUPERSEDES the JX1-gated Tegra194 window sweep immediately below, which is left in place as the record of why. See the JX2-NVC67D block at this file's tail.
+    ); jd1_dc_model(base, size, have_cap, first); jx2_nvc67d_status(base, size); #[cfg(feature = "beam")] beam_probe(base, size); // BEAM (orin 26) — appended to this line after JX2 for the same two reasons JX2 was: this is still the first instruction at which an nvdisplay read is KNOWN non-fatal on this boot (and now 26 reads deep), and an appended statement moves no `core::panic::Location`. See the BEAM block at this file's tail. || JD1-DC-MODEL — the WHICH-CHIP discriminator, four more read-only reads, appended here because this is the first instruction at which an nvdisplay read is known non-fatal and the long window sweep has not yet risked the boot. Without it `VERDICT=DECODES-NOMATCH` is AMBIGUOUS between "the aperture is not live" and "our register map is Tegra194's and this silicon is Tegra234" — two answers that send the display arc in opposite directions. See the JD1-DC-MODEL block at this file's tail. APPENDED to this line, never a new one: knob-off it is cfg-erased and not one `core::panic::Location` below moves. || AND JX2-NVC67D, appended to the same line for the same two reasons: this is still the first instruction at which an nvdisplay read is KNOWN non-fatal on this boot, and appending rather than adding a statement line keeps every `core::panic::Location` below unmoved. It runs AFTER the discriminator because it CONSUMES the discriminator's answer — boot7f's `MODEL-VERDICT=NVDISPLAY-CLASS-C670` / `FE_CLASSES=0xc6700410` is the entire licence for its offsets — and it SUPERSEDES the JX1-gated Tegra194 window sweep immediately below, which is left in place as the record of why. See the JX2-NVC67D block at this file's tail.
 
     // 5. THE WINDOW SWEEP — read-only, every field, every window, EMPTY WINDOWS INCLUDED. The legacy
     //    `jd1_dc_survey` skips all-zero windows to keep its log short; this rung prints them, because
@@ -5704,3 +5704,223 @@ fn kbdpoll_witness(tick: u64) {
 /// stream and no new cadence — the same line count on the wire, keyed to the right pipeline.
 #[cfg(feature = "orinclick")]
 static PTRPOLL_FOLD_LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// BEAM (orin 26, `UNAOS_BEAM=1`, default OFF) — the raster position the compositor's presents are
+// ordered against. THE TEARING FIX's platform half; the platform-neutral half is `video/beam.rs`.
+//
+// WHY. Peter, render11 and render12 (2026-09-09): "THERE'S A LOT OF TEARING", while every `torn=`
+// on the wire read 0. TEAR-DIAG (`docs/dev/evidence/orin24/TEAR-DIAG.md`) named the mechanism: the
+// present row-copies into the firmware's single live scan-out at a uniformly random phase, no back
+// buffer, no flip, no vblank, so `P(tear) = min(1, (present_us + rectscan_us) / FRAME_US)` — 0.7 for
+// a 780-row window however fast the copy — and the counters asked a DURATION question that only
+// fires once P has been pinned at 1.0. A duration cannot see a phase; only the beam's position can,
+// and the diagnosis recorded that "there is no readable raster position on the Tegra path". This
+// block is that position, and it is read under exactly the discipline JX2 flew with.
+//
+// THE REGISTER. `NV_PDISP_RG_DPCA(i)` at +0x6330 + i*0x800: the raster generator's current line.
+// Provenance is nouveau, `nvkm/engine/disp/headgv100.c::gv100_head_rgpos` — `vline = rd32(0x616330
+// + head*0x800) & 0xffff`, `hline = rd32(0x616334 + ...)` — on every NVD-class display since GV100,
+// and Tegra234's block is NVD_40 / class NVC67D (boot7f, `FE_CLASSES=0xc6700410`). NV_PDISP sits at
+// 0x610000 on a dGPU, and this aperture's FE registers already decode at their PDISP-relative
+// offsets (+0x630 CHNSTATUS_CORE, +0x4e0 CHNCTL_CORE, +0x1c00 HEAD_TIMING — JX2, boot7g/boot7h,
+// 26/26 reads survived), so the head block is expected at the same relative offset. EXPECTED, not
+// known: which is why the probe VALIDATES the register by behaviour before anything consumes it.
+//
+// SAME GUARD, SAME APERTURE, SAME DISCIPLINE. `beam_probe` is appended to the guarded section of
+// `jd1_dc_probe`, after `jx2_nvc67d_status`, so it runs only after every display@ power domain
+// answered ON over BPMP (a read of a gated block is EL3-FATAL, JX1) and only after 26 reads of this
+// aperture have already survived this boot. Its first touch goes through `jx2_read` — bounded
+// against the DTB-declared reg size, NEXTTOUCH announced before, READSURVIVED after — because the
+// 0x616xxx page is a page JX2 never touched and "inside the DTB aperture" does not retire the JX1
+// risk on a new page. NOT ONE REGISTER IS WRITTEN; `read_volatile` only, here and in the runtime
+// reader. The DCE R5 on the far side of this aperture is never a second writer's problem.
+//
+// VALIDATION, so a wrong offset is a printed NO-RASTER and never a locked lie. For each head and
+// for each 16-bit half of the word, ~45 ms of tight-loop sampling (2.7 frames at 60 Hz) must show:
+// the value never steps DOWN except by a wrap from at or above the panel height; at least two
+// wraps; a wrap-to-wrap period between 8 and 25 ms (40-125 Hz); a maximum at or above the panel
+// height minus 8 and below four times it; and at least 100 upward steps. A constant, a garbage
+// word, a frame counter in the wrong half, or a line counter of some other head all fail at least
+// one of those, and the RAW line says which. Only a LOCKED verdict lets `beam_position` answer.
+//
+// WHAT THE RUNTIME READER COSTS AND RISKS. `beam_position` is one `read_volatile` of Device-nGnRE
+// memory in GiB 0 (mapped unconditionally, both regimes, so it survives the JM6 EL2->EL1 drop), a
+// few hundred ns, polled by `video::beam::hold` while a present waits for the beam to clear its
+// rows. The display@ domain is ON for as long as the panel is lit — the DC scanning the carveout
+// IS that domain — and nothing in this kernel issues SET_STATE on it, so the guard that held at
+// boot holds for the boot. The `BEAM_ADDR == 0` gate makes every read conditional on the probe's
+// LOCKED verdict, so a boot whose probe declined never touches the register again.
+//
+// APPENDED AT THE FILE TAIL and gated on `beam`: knob-off, every item below is cfg-erased, the one
+// edit to already-compiled code is a statement APPENDED to the `jd1_dc_probe` line that already
+// carries `jx2_nvc67d_status`, and not one `core::panic::Location` in this file moves.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// BEAM — VA of the LOCKED raster-position register; 0 until `beam_probe` locks one, and for the
+/// whole boot on a boot whose probe declined. The only gate the runtime reader needs.
+#[cfg(feature = "beam")]
+static BEAM_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// BEAM — lines per frame as the probe measured it (the highest line seen, plus one).
+#[cfg(feature = "beam")]
+static BEAM_VTOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// BEAM — which 16-bit half of the word carries the line count: 0 or 16.
+#[cfg(feature = "beam")]
+static BEAM_SHIFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// BEAM — `NV_PDISP_RG_DPCA(0)`, PDISP-relative. See the block comment for provenance.
+#[cfg(feature = "beam")]
+const BEAM_OFF_RG_DPCA: u64 = 0x0000_6330;
+/// BEAM — the per-head stride of the RG register bank.
+#[cfg(feature = "beam")]
+const BEAM_HEAD_STRIDE: u64 = 0x800;
+/// BEAM — heads to try. The census says two; the panel is on one of them.
+#[cfg(feature = "beam")]
+const BEAM_HEADS: u64 = 2;
+/// BEAM — sampling window per candidate, in milliseconds: 2.7 frames at 60 Hz, enough for two
+/// wraps with a whole period between them at any rate down to 40 Hz.
+#[cfg(feature = "beam")]
+const BEAM_SAMPLE_MS: u64 = 45;
+
+/// BEAM — find and LOCK the raster-position register. Called from `jd1_dc_probe`'s guarded section
+/// only; prints exactly one `BEAM VERDICT=` line. Read-only.
+#[cfg(feature = "beam")]
+pub fn beam_probe(base: u64, size: u64) {
+    use core::sync::atomic::Ordering;
+    // The panel's row count, from the WRITER JD1 seeded ~90 lines up in `tegra_early_stop`. The
+    // lock is dropped on the same line: `serial_println!` fans into fbcon, which takes it.
+    let panel_h = crate::video::WRITER.lock().info().height as u32;
+    if panel_h == 0 {
+        serial_println!(
+            ":: tegra: BEAM VERDICT=DECLINED reason=no-panel — JD1 seeded no scanout this boot, so there are no rows for a present to be ordered against and no height to validate a raster counter with; NOT ONE RG register was read ::"
+        );
+        return;
+    }
+    let frq = super::timer::cntfrq();
+    let frq = if frq == 0 { 31_250_000 } else { frq };
+    let budget = frq.saturating_mul(BEAM_SAMPLE_MS) / 1000;
+    for head in 0..BEAM_HEADS {
+        let off = BEAM_OFF_RG_DPCA + head * BEAM_HEAD_STRIDE;
+        // The FIRST touch of the 0x616xxx page: bounded, announced, survived-or-silent.
+        let Some(first) = jx2_read(
+            base,
+            size,
+            off,
+            "NV_PDISP_RG_DPCA(i) (+0x06330 + i*0x800, FIRST TOUCH OF THE 0x616xxx PAGE — the raster generator's line position, per nouveau gv100_head_rgpos)",
+            head as i32,
+        ) else {
+            continue;
+        };
+        let addr = base + off;
+        for shift in [0u32, 16u32] {
+            let mut prev = (first >> shift) & 0xFFFF;
+            let (mut min, mut max) = (prev, prev);
+            let (mut adv, mut back, mut wraps, mut samples) = (0u32, 0u32, 0u32, 0u32);
+            let (mut last_wrap, mut period_sum, mut period_n) = (0u64, 0u64, 0u64);
+            let t0 = super::now_cycles();
+            loop {
+                let now = super::now_cycles();
+                if now.saturating_sub(t0) > budget {
+                    break;
+                }
+                // SAFETY: `addr` is inside the DTB-declared display@ aperture (bounded by
+                // `jx2_read` above, whose read of this very word survived), Device-nGnRE mapped
+                // in GiB 0, and this is a read.
+                let v = (unsafe { core::ptr::read_volatile(addr as *const u32) } >> shift) & 0xFFFF;
+                samples = samples.saturating_add(1);
+                if v > prev {
+                    adv = adv.saturating_add(1);
+                } else if v < prev {
+                    // A line counter steps down only by wrapping from the frame's last line,
+                    // which is at or above the panel's last active row. Anything else is a
+                    // counter that is not a raster.
+                    if prev + 8 >= panel_h {
+                        wraps = wraps.saturating_add(1);
+                        if last_wrap != 0 {
+                            period_sum = period_sum.saturating_add(now.saturating_sub(last_wrap));
+                            period_n += 1;
+                        }
+                        last_wrap = now;
+                    } else {
+                        back = back.saturating_add(1);
+                    }
+                }
+                if v > max {
+                    max = v;
+                }
+                if v < min {
+                    min = v;
+                }
+                prev = v;
+                core::hint::spin_loop();
+            }
+            let period_us = if period_n > 0 {
+                (period_sum / period_n).saturating_mul(1_000_000) / frq
+            } else {
+                0
+            };
+            serial_println!(
+                ":: tegra: BEAM RAW head={} half={} @{:#x} first={:#010x} samples={} min={} max={} adv={} back={} wraps={} period_us={} panel_h={} — a raster line counter climbs monotonically (back=0) to at least the panel height, wraps at least twice in {} ms, and its wrap-to-wrap period is one frame (8000..25000 us) ::",
+                head,
+                if shift == 0 { "lo" } else { "hi" },
+                addr,
+                first,
+                samples,
+                min,
+                max,
+                adv,
+                back,
+                wraps,
+                period_us,
+                panel_h,
+                BEAM_SAMPLE_MS,
+            );
+            let ok = back == 0
+                && wraps >= 2
+                && adv >= 100
+                && max + 8 >= panel_h
+                && max < panel_h.saturating_mul(4)
+                && (8_000..=25_000).contains(&period_us);
+            if ok {
+                BEAM_VTOTAL.store(max + 1, Ordering::Relaxed);
+                BEAM_SHIFT.store(shift, Ordering::Relaxed);
+                // The address is published LAST, with Release: it is the gate `beam_position`
+                // reads, and a reader that sees it must see the two fields above.
+                BEAM_ADDR.store(addr, Ordering::Release);
+                serial_println!(
+                    ":: tegra: BEAM VERDICT=LOCKED head={} half={} @{:#x} vtotal={} period_us={} panel_h={} — arch::scanout_beam() now answers, every panel present is held clear of the beam and cache-cleaned inside the bracket, and [wc-h]/[wc-k]/[strip] torn= is the OBSERVED crossing (beam=obs). Read-only: writes=0 ::",
+                    head,
+                    if shift == 0 { "lo" } else { "hi" },
+                    addr,
+                    max + 1,
+                    period_us,
+                    panel_h,
+                );
+                return;
+            }
+        }
+    }
+    serial_println!(
+        ":: tegra: BEAM VERDICT=NO-RASTER — no candidate word behaved as a raster line counter (see the BEAM RAW lines above for which test each failed); arch::scanout_beam() stays None for this boot, no present is held, and torn= stays the duration predicate (beam=blind, beamcross_ppk= carries the exposure). This is 'failed under +0x6330/+0x6b30, lo/hi halves, {} ms per candidate' — not 'ruled out'. Read-only: writes=0 ::",
+        BEAM_SAMPLE_MS,
+    );
+}
+
+/// BEAM — the raster position, `(line, lines_per_frame)`, or `None` until (unless) the probe
+/// LOCKED a register this boot. One read-only `read_volatile`, no lock, no print: this is called
+/// from the compositor's IRQ-masked present path at polling rate.
+#[cfg(feature = "beam")]
+#[inline]
+pub fn beam_position() -> Option<(u32, u32)> {
+    use core::sync::atomic::Ordering;
+    let addr = BEAM_ADDR.load(Ordering::Acquire);
+    if addr == 0 {
+        return None;
+    }
+    let vt = BEAM_VTOTAL.load(Ordering::Relaxed);
+    let sh = BEAM_SHIFT.load(Ordering::Relaxed);
+    // SAFETY: `addr` was validated and published by `beam_probe` (inside the DTB-declared
+    // aperture, Device-nGnRE, domain proven ON), and this is a read.
+    let v = (unsafe { core::ptr::read_volatile(addr as *const u32) } >> sh) & 0xFFFF;
+    Some((v.min(vt.saturating_sub(1)), vt))
+}
