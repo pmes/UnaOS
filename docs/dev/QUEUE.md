@@ -15,8 +15,9 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 
 ## STATE — 2026-09-12T01:3xZ (orin 27)
 ✓ main 267bd49d = the rmbp landing (two parents f880ed6e + 022836be; panel ACK; ledger-check rc=0; `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0 on the merge result). hw-rmbp fast-forwarded to it: 0/0.
-✓ hw-jetson 059db935 local (rung 4 flown + unafsroot fold; fold gate running) · hw-pi4 3c102d2a local (pi-queue.md; landing review running).
-✓ Landing order (R45): rmbp DONE → pi → jetson, then fold main into pi and jetson.
+✓ main e10d9e4e = the pi landing (parents 4a03404f + 7cf53346; panel ACK; RULINGS union with R44 superseded-by R46; LEDGER keeps main's SR12; ledger-check rc=0 309 rows; on e10d9e4e: `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0, `./arroyo test` rc=0, `./arroyo test-arm` rc=0 — the x86 leg run by the orin seat under R46). hw-pi4 and hw-rmbp fast-forwarded level.
+✓ hw-jetson 19164a26 local (rung 4 flown, unafsroot fold gated green, A49 reframed; landing review running at f0dc8058).
+✓ Landing order (R45): rmbp DONE → pi DONE → jetson (fold main into hw-jetson first: merge-tree conflicts in .gitignore, LEDGER.md, arroyo).
 ✓ In flight: exec-orin26-tear (BEAM, Opus finishing), exec-orin27-ga10b4c (rung 4c + the deferred Shut Down trigger, Fable).
 ✓ Next Orin boot = render13: the fold of core0 + el0mem + unafsroot + BEAM + 4c on the render12 fifteen-knob line minus PROBE3 plus `UNAOS_GA10B_PROBE4=4` (+ `UNAOS_BEAM=1`); card re-imaged with `media-writer.sh --image` (Peter's go 2026-09-12); a v1 SD card in the Orin's native slot.
 
