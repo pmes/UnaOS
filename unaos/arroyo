@@ -954,6 +954,25 @@ fi
 # jetson image is byte-identical to baseline. The ARMED build is type-checked by the `arm-tegra-jd1dc`
 # leg of KERNEL_CFG_MATRIX, not by this mapping. Witness on the wire: `JD1-DC VERDICT=`.
 [ -n "${UNAOS_JD1DC:-}" ] && _feats="${_feats}jd1dc,"
+# BEAM (BEAM): UNAOS_BEAM=1 arms the Orin's TEARING FIX (orin 26; Peter render11/render12 2026-09-09
+# "THERE'S A LOT OF TEARING" while every `torn=` read 0 — TEAR-DIAG, docs/dev/evidence/orin24/).
+# `arch/aarch64/display_tegra.rs::beam_probe`, appended to `jd1_dc_probe`'s guarded section: inside
+# the SAME BPMP MRQ_PG GET_STATE guard and the SAME DTB-bounded aperture as JX2 it reads the
+# nvdisplay raster-generator position register (`NV_PDISP_RG_DPCA(i)`, +0x6330 + i*0x800 — the
+# offset nouveau's `gv100_head_rgpos` reads on every NVD-class display, on a register file whose
+# FE offsets already decode at their PDISP-relative values here), announce-before-read, READ-ONLY,
+# and LOCKS it only after ~45 ms of sampling shows a counter that climbs monotonically to at least
+# the panel height and wraps at ~60 Hz. Then `arch::scanout_beam()` answers, `video::beam` HOLDS
+# every panel present (`wm::stage_window` bands, `wm::stage_fill`, the direct `paint_window`
+# fallback, `strip::paint`) until the beam is clear of the rows it is about to write, cleans the
+# rows inside the bracket, and RECORDS whether the beam crossed them anyway — which is what
+# `[wc-h]`/`[wc-k]`/`[strip]` `torn=` now report (`beam=obs`). Implies `jd1dc` (Cargo: `beam =
+# ["jd1dc"]`), does NOT imply tegra; every site is tegra-gated, so arm it WITH tegra:
+# `UNAOS_TEGRA=1 UNAOS_BEAM=1 ./arroyo check`, or `UNAOS_BEAM=1 ./arroyo esp-jetson`. Default OFF:
+# `scanout_beam()` is a constant `None` and the panel path is what it was. The ARMED build is
+# type-checked by the `arm-tegra-jd1dc-beam` leg of KERNEL_CFG_MATRIX. Witness on the wire:
+# `:: tegra: BEAM VERDICT=` (LOCKED / NO-RASTER / DECLINED), then `beam=obs` on the rollups.
+[ -n "${UNAOS_BEAM:-}" ] && _feats="${_feats}beam,"
 # GA10B-PROBE1 (GA10BPROBE1): UNAOS_GA10B_PROBE1=1 arms the FIRST read-only probe rung for the Orin
 # Nano's Ampere GA10B iGPU — `arch/aarch64/ga10b_probe.rs::ga10bprobe1_run`, called as an appended
 # statement in `tegra_early_stop`'s BPMP block (it borrows the `chan` `jb1b_ping` proved). One
@@ -3472,6 +3491,12 @@ KERNEL_CFG_MATRIX=(
   # tracks append tail legs concurrently, and a hardcoded "N -> N+1" in a comment is stale the moment
   # a peer lands one. `./arroyo check` prints the live board/mix counts every run — read it there.)
   "arm-tegra-jd1dc ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,jd1dc"
+  # BEAM (orin 26) — `arm-tegra-jd1dc`'s list verbatim + `beam`: a ONE-TOKEN delta on a proven-green
+  # row, so a red here names the tearing fix's armed polarity and nothing else. `beam` implies `jd1dc`
+  # (Cargo), so the token after resolution is one too. This is the leg that compiles the configuration
+  # the flight line `UNAOS_BEAM=1 ./arroyo esp-jetson` ships; `arm-tegra` (below, no `beam`) is the
+  # OFF polarity, which is the shipped state of every other jetson image.
+  "arm-tegra-jd1dc-beam ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,jd1dc,beam"
   # ORINDESK rung 1 — the DESKTOP FAMILY on tegra (appended 2026-08-22). Until this leg, NOTHING in
   # this tree compiled `tegra` together with `desktop_firmware`/`livecon`: `arm-pi` carries the desktop family
   # but also `pi,baremetal` (mutually exclusive with `tegra` by `compile_error!`), the five tegra legs

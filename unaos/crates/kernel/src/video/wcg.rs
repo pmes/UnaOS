@@ -956,6 +956,87 @@ pub(super) const CENSUS_PERIOD_US: u64 = 2_000_000;
 /// on. The latch reads the budget counter instead, which no overwrite can disturb, so the rollup
 /// fires on whichever flush first observes the budget spent.
 static H_ROLLED: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+// ---- BEAM (orin 26) — the OBSERVED tear, and the exposure the duration predicate could not see ----
+//
+// TEAR-DIAG (`docs/dev/evidence/orin24/TEAR-DIAG.md`): `torn=` asked `present_us > rectscan_us`, a
+// DURATION question whose threshold sat 9x-20x above every present on render12's wire and which by
+// construction gets HARDER to satisfy as the torn rect gets taller, while Peter watched the panel
+// tear. Two things change here, and they are separable on the wire by `beam=`:
+//
+// * `beam=obs` — a beam source exists (`video::beam`, the Orin with `UNAOS_BEAM=1`): every staged
+//   present was HELD clear of the beam and its rows cleaned inside the bracket, and `torn=` counts
+//   the presents whose bracket the beam crossed anyway — an OBSERVATION, taken by sampling the
+//   raster line before the first byte and after the clean. It is 0 because the hold made it 0, and
+//   it goes non-zero on a torn frame because it was there when the frame tore. `beamwaits=`,
+//   `beamwait_us=`, `beammaxwait_us=` and `beamgiveup=` are what the hold cost.
+// * `beam=blind` — no source (x86, Pi, QEMU, knob-off). `torn=` stays the duration predicate,
+//   unchanged for every gate that reads it, and `beamcross_ppk=` carries what the predicate cannot:
+//   the per-present exposure `min(1, (present_us + rectscan_us) / FRAME_US)` in per-mille, summed —
+//   the EXPECTED torn-present count, times a thousand. A blind Orin boot that prints `torn=0` beside
+//   `beamcross_ppk=1500000` has said, on one line, both what it measured and what it could not.
+static H_BEAMOBS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BEAMWAITS: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BEAMWAIT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_BEAMMAXWAIT: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_BEAMGIVEUP: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+static H_BEAMCROSS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+/// STAGESHRINK — presents whose band was halved at least once because the allocator refused the
+/// full band (each halving counts). The population that used to be `decl_alloc=` and the direct path.
+static H_SHRUNK: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+/// The pending sample's beam observation, packed: bits 0..16 `vs`, 16..32 `ve`, 32..48 `vt`,
+/// 48 observed, 49 torn; and `H_OBSWAIT` its wait. Zero = blind.
+static H_OBS: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_OBSWAIT: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// BEAM — fold one observation into window `i`'s censuses. Shared by [`stage_note`] (staged
+/// presents) and [`direct_obs`] (the direct fallback). Returns whether the present was torn.
+fn beam_fold(i: usize, obs: Option<super::beam::Obs>) -> Option<bool> {
+    let o = obs?;
+    H_BEAMOBS[i].fetch_add(1, Ordering::Relaxed);
+    if o.waited_us > 0 {
+        H_BEAMWAITS[i].fetch_add(1, Ordering::Relaxed);
+    }
+    H_BEAMWAIT[i].fetch_add(o.waited_us as u64, Ordering::Relaxed);
+    H_BEAMMAXWAIT[i].fetch_max(o.waited_us as u64, Ordering::Relaxed);
+    if o.gaveup {
+        H_BEAMGIVEUP[i].fetch_add(1, Ordering::Relaxed);
+    }
+    if o.torn {
+        H_TORN[i].fetch_add(1, Ordering::Relaxed);
+    }
+    Some(o.torn)
+}
+
+/// BEAM — the direct fallback's observation, handed over by `draw_window` after its tail clean.
+/// A declined present has no `stage_note`, so its tear would otherwise be counted by nobody: it
+/// lands in the same `torn=` as a staged present's, because a tear is a tear.
+pub fn direct_obs(id: u32, obs: Option<super::beam::Obs>) {
+    let i = id as usize;
+    if i >= IDS {
+        return;
+    }
+    let _ = beam_fold(i, obs);
+}
+
+/// STAGESHRINK — one halving of a present's band under allocator pressure. See [`H_SHRUNK`].
+pub fn stage_shrunk(id: u32) {
+    let i = id as usize;
+    if i < IDS {
+        H_SHRUNK[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// BEAM — pack an observation for the pending sample line (0 = blind).
+fn pack_obs(obs: Option<super::beam::Obs>) -> (u64, u32) {
+    match obs {
+        None => (0, 0),
+        Some(o) => (
+            (o.vs as u64 & 0xFFFF) | ((o.ve as u64 & 0xFFFF) << 16) | ((o.vt as u64 & 0xFFFF) << 32) | (1 << 48) | ((o.torn as u64) << 49),
+            o.waited_us,
+        ),
+    }
+}
 const ROLL_WHOLE: u32 = 1 << 0;
 const ROLL_BAND: u32 = 1 << 1;
 
@@ -1043,13 +1124,21 @@ pub fn stage_note(
     // stop reporting as a steady state.
     let present_us = cycles_to_us(t_end.saturating_sub(t1));
     let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * span as u64 / panel_h as u64 };
+    // BEAM (orin 26) — the exposure is a census on EVERY present, blind or observed, and it is the
+    // number that would have convicted render12: 716 ppk on the console window, 400 expected torn
+    // presents on a line that read `torn=0`. Then the observation, if a beam source recorded one:
+    // it decides `torn=` outright and the duration predicate below is not consulted. WCH-STALL's
+    // diversion stays on the blind arm only — an observed crossing is a tear whatever the rate.
+    H_BEAMCROSS[i].fetch_add(super::beam::exposure_ppk(present_us, rectscan_us), Ordering::Relaxed);
+    let obs = super::beam::take_last();
+    let observed = beam_fold(i, obs);
     // WCH-STALL — classify BEFORE this present folds into the floor below: the comparison must be
     // against the floor the window had EARNED, or a slow first present would be judged against
     // itself. `lo == u64::MAX` (no floor yet) and `bytes == 0` (no rate exists) both decline the
     // conviction and leave the present to `torn=`, which is the conservative direction: the guard
     // may only ever DIVERT a tear count, never invent one, and only when the window itself has
     // proven it can present an order of magnitude faster.
-    if present_us > rectscan_us {
+    if observed.is_none() && present_us > rectscan_us {
         let stalled = bytes != 0 && {
             let rate_ns_4k = present_us.saturating_mul(4_096_000) / bytes as u64;
             let lo = H_MINRATE[i].load(Ordering::Relaxed);
@@ -1120,6 +1209,9 @@ pub fn stage_note(
     H_COMPOSE[i].store(compose_us, Ordering::Relaxed);
     H_PRESENT[i].store(present_us, Ordering::Relaxed);
     H_RECTSCAN[i].store(rectscan_us, Ordering::Relaxed);
+    let (ob, ow) = pack_obs(obs);
+    H_OBS[i].store(ob, Ordering::Relaxed);
+    H_OBSWAIT[i].store(ow, Ordering::Relaxed);
     H_PEND[i].store(n, Ordering::Release);
 }
 
@@ -1345,8 +1437,13 @@ fn emit_sample(id: u32, i: usize) {
         // or near the box height through a boot burst and single-line only when printing is slower
         // than a frame. It is still exactly the rows this present wrote — the definition did not
         // move, the producer did. See `fbcon::route_present_banded`.
+        // BEAM — `beam=` is `vs..ve/vt` (raster line before the first byte, after the clean, lines
+        // per frame) on an observed present and `blind` otherwise; `torn=` is then the observation.
+        // Both INSERTED before `torn=`: the five keys another track's gate matches keep their order.
+        let ob = H_OBS[i].load(Ordering::Relaxed);
+        let torn = if ob & (1 << 48) != 0 { ob & (1 << 49) != 0 } else { present_us > rectscan_us };
         serial_println!(
-            "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+            "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} beam={} beamwait_us={} torn={} -> BUFFERED",
             id,
             bx >> 32,
             bx & 0xFFFF_FFFF,
@@ -1356,7 +1453,9 @@ fn emit_sample(id: u32, i: usize) {
             H_COMPOSE[i].load(Ordering::Relaxed),
             present_us,
             rectscan_us,
-            if present_us > rectscan_us { "yes" } else { "no" }
+            BeamFmt(ob),
+            H_OBSWAIT[i].load(Ordering::Relaxed),
+            if torn { "yes" } else { "no" }
         );
     } else {
         // A composite that ran on the pre-WC-H direct path. `-> DIRECT` deliberately does NOT carry
@@ -1567,12 +1666,17 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // printed the number that convicts its tear. It now rides the verdict line itself. `torn>0` with
     // every slot at or below 1 is the statement that the tear has a DIFFERENT source.
     //
+    // BEAM (orin 26) — `shrunk=` is INSERTED directly after `decl_alloc=` (it is that population's
+    // successor: a halved band is a present that used to be a `decl_alloc`), and the seven `beam*`
+    // keys directly after `blitnet=[...]`, all inside `pop=all-presents` and all at the one place
+    // no spec keys on an adjacency (see the COMPGATE paragraph above). Arity is now 43 = 43.
+    //
     // Read ONCE into a local rather than eight loads placed inline among the format arguments: the
     // eight slots have to be one snapshot of one moment, or a reader laying `blitnet=` against the
     // `decl_lock=` on the same line is comparing eight different moments to a ninth.
     let blitnet = super::wm::blit_net_snapshot();
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} blitnet=[{},{},{},{},{},{},{},{}] fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} shrunk={} blitnet=[{},{},{},{},{},{},{},{}] beam={} beamobs={} beamwaits={} beamwait_us={} beammaxwait_us={} beamgiveup={} beamcross_ppk={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,
         scope,
         emit,
@@ -1587,6 +1691,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         declby(DECL_CAP),
         declby(DECL_LOCK),
         declby(DECL_ALLOC),
+        H_SHRUNK[i].load(Ordering::Relaxed),
         blitnet[0],
         blitnet[1],
         blitnet[2],
@@ -1595,6 +1700,13 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         blitnet[5],
         blitnet[6],
         blitnet[7],
+        if H_BEAMOBS[i].load(Ordering::Relaxed) > 0 { "obs" } else { "blind" },
+        H_BEAMOBS[i].load(Ordering::Relaxed),
+        H_BEAMWAITS[i].load(Ordering::Relaxed),
+        H_BEAMWAIT[i].load(Ordering::Relaxed),
+        H_BEAMMAXWAIT[i].load(Ordering::Relaxed),
+        H_BEAMGIVEUP[i].load(Ordering::Relaxed),
+        H_BEAMCROSS[i].load(Ordering::Relaxed),
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
@@ -1744,6 +1856,11 @@ static E_DECL_LINES_OUT: AtomicU32 = AtomicU32::new(0);
 static E_MAXPRES: AtomicU64 = AtomicU64::new(0);
 /// Total panel rows presented by staged fills — the size of what this discipline now covers.
 static E_ROWS: AtomicU64 = AtomicU64::new(0);
+/// BEAM (orin 26) — the erase path's observation censuses; see the `H_BEAM*` block for the reading.
+static E_BEAMOBS: AtomicU32 = AtomicU32::new(0);
+static E_BEAMWAIT: AtomicU64 = AtomicU64::new(0);
+static E_BEAMGIVEUP: AtomicU32 = AtomicU32::new(0);
+static E_BEAMCROSS: AtomicU64 = AtomicU64::new(0);
 
 /// WC-L — record a desktop fill that could not reach the back layer on this attempt and was queued
 /// as DEFERRED DAMAGE rather than written straight to the front buffer.
@@ -1902,7 +2019,21 @@ pub fn erase_note(
     let compose_us = cycles_to_us(t1.saturating_sub(t0));
     let present_us = cycles_to_us(t_end.saturating_sub(t1));
     let rectscan_us = if panel_h == 0 { 0 } else { FRAME_US * h as u64 / panel_h as u64 };
-    let torn = present_us > rectscan_us;
+    // BEAM (orin 26) — exposure on every fill; the observation, when one was recorded by the
+    // bracket `stage_fill` opened around its rows, decides `torn=` instead of the duration.
+    E_BEAMCROSS.fetch_add(super::beam::exposure_ppk(present_us, rectscan_us), Ordering::Relaxed);
+    let obs = super::beam::take_last();
+    let torn = match obs {
+        Some(o) => {
+            E_BEAMOBS.fetch_add(1, Ordering::Relaxed);
+            E_BEAMWAIT.fetch_add(o.waited_us as u64, Ordering::Relaxed);
+            if o.gaveup {
+                E_BEAMGIVEUP.fetch_add(1, Ordering::Relaxed);
+            }
+            o.torn
+        }
+        None => present_us > rectscan_us,
+    };
     if torn {
         E_TORN.fetch_add(1, Ordering::Relaxed);
     }
@@ -1924,7 +2055,7 @@ pub fn erase_note(
         // `spans=` is the number of `blit` calls actually issued — on x86 an occlusion-clipped fill
         // fragments rows, so `spans > runs` is the fragmentation tell. WCK4-D2: the two fields keep
         // one meaning on both arches precisely because they are two fields.
-        "[wc-k] erase box={}x{} staged=yes rowbytes={} runs={} spans={} contig={} compose_us={} present_us={} rectscan_us={} torn={} -> BUFFERED",
+        "[wc-k] erase box={}x{} staged=yes rowbytes={} runs={} spans={} contig={} compose_us={} present_us={} rectscan_us={} beam={} beamwait_us={} torn={} -> BUFFERED",
         w,
         h,
         row_bytes,
@@ -1934,6 +2065,8 @@ pub fn erase_note(
         compose_us,
         present_us,
         rectscan_us,
+        BeamFmt(pack_obs(obs).0),
+        pack_obs(obs).1,
         if torn { "yes" } else { "no" }
     );
     if n == E_SAMPLES {
@@ -1985,10 +2118,15 @@ pub fn erase_note(
             "TEAR-FREE"
         };
         serial_println!(
-            "[wc-k] rollup scope=fills samples={} rows={} torn={} noncontig={} declines={} outside={} defers={} redefers={} coalesced={} rescues={} maxpresent_us={} frame_us={} -> {}",
+            "[wc-k] rollup scope=fills samples={} rows={} torn={} beam={} beamobs={} beamwait_us={} beamgiveup={} beamcross_ppk={} noncontig={} declines={} outside={} defers={} redefers={} coalesced={} rescues={} maxpresent_us={} frame_us={} -> {}",
             n,
             E_ROWS.load(Ordering::Relaxed),
             torn_n,
+            if E_BEAMOBS.load(Ordering::Relaxed) > 0 { "obs" } else { "blind" },
+            E_BEAMOBS.load(Ordering::Relaxed),
+            E_BEAMWAIT.load(Ordering::Relaxed),
+            E_BEAMGIVEUP.load(Ordering::Relaxed),
+            E_BEAMCROSS.load(Ordering::Relaxed),
             nc,
             decl,
             outside,
@@ -2000,6 +2138,20 @@ pub fn erase_note(
             FRAME_US,
             verdict
         );
+    }
+}
+
+/// BEAM — `beam=` as the sample lines print it: `vs..ve/vt` for an observed present, `blind` for
+/// one no source recorded. Takes the packed word so the pending-slot copy and the live copy print
+/// through one formatter.
+struct BeamFmt(u64);
+
+impl core::fmt::Display for BeamFmt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 & (1 << 48) == 0 {
+            return f.write_str("blind");
+        }
+        write!(f, "{}..{}/{}", self.0 & 0xFFFF, (self.0 >> 16) & 0xFFFF, (self.0 >> 32) & 0xFFFF)
     }
 }
 

@@ -2043,6 +2043,22 @@ orindesk = []
 # `JD1-DC VERDICT=`. See arch_arm64.md §JD1-DC.
 jd1dc = []
 
+# BEAM (`UNAOS_BEAM=1`, orin 26): the tearing fix. Locks the nvdisplay raster-generator position
+# register (`NV_PDISP_RG_DPCA`, +0x6330 + head*0x800, READ-ONLY) at boot from inside `jd1_dc_probe`'s
+# guarded section — the same BPMP MRQ_PG GET_STATE guard, the same announce-before-read discipline,
+# the same DTB-bounded aperture as JX2 — and validates it BEHAVIOURALLY (a counter that climbs
+# monotonically to at least the panel height and wraps at ~60 Hz) before `arch::scanout_beam()` will
+# answer at all. With it locked, every panel present (`wm::stage_window` bands, `wm::stage_fill`,
+# the direct `paint_window` fallback, `strip::paint`) is HELD until the beam is clear of the rows it
+# writes and cache-cleaned inside the bracket, and `[wc-h]`/`[wc-k]`/`[strip]` `torn=` become the
+# OBSERVED beam crossing (`beam=obs`) instead of the duration predicate that read 0 while the panel
+# tore (TEAR-DIAG). Implies `jd1dc` because the guard and the aperture are that rung's; arm it with
+# `UNAOS_TEGRA=1 UNAOS_BEAM=1 ./arroyo check` or `UNAOS_BEAM=1 ./arroyo esp-jetson`. Default OFF:
+# `scanout_beam()` is a constant `None`, `video::beam` folds away, and the jetson image's panel path
+# is what it was. The ARMED build is type-checked by `arm-tegra-jd1dc-beam` in KERNEL_CFG_MATRIX.
+# Witness on the wire: `:: tegra: BEAM VERDICT=LOCKED|NO-RASTER|DECLINED`.
+beam = ["jd1dc"]
+
 # GA10B-PROBE1 (`UNAOS_GA10B_PROBE1=1`): the FIRST read-only probe rung for the Orin Nano's Ampere
 # GA10B iGPU (`arch/aarch64/ga10b_probe.rs`, one appended call site in `tegra_early_stop`). One
 # attended cold-boot flight, zero MMIO writes: a BPMP MRQ_PG rail-state gate FIRST (a read of a

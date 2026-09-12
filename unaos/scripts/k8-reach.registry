@@ -13,6 +13,7 @@
 UNAOS_BAR1EXP              TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BCMARECON            TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BCMAS1               TODO  seeded 2026-09-06; no Pi-live cfg site
+UNAOS_BEAM   NA   --evidence: beam 12 sites 11 Pi-live 1 NEG [implies: jd1dc]; Cargo.toml `beam = ["jd1dc"]` (the guard and the aperture are that rung's; UNAOS_JD1DC is the TODO row above). Ten of the eleven Pi-live sites are in arch/aarch64/display_tegra.rs, a module declared `#[cfg(feature = "tegra")] pub mod display_tegra` (arch/aarch64/mod.rs:111) — a Pi image never lexes the file; the eleventh is arch/aarch64/mod.rs:562, conjoined `all(feature = "tegra", feature = "beam")`, whose `not(...)` twin is the NEG. The consumer, video/beam.rs, is unconditional and arch-neutral on purpose (it is the MECHANISM, not a knob site) and folds to a no-op wherever `arch::scanout_beam()` is the constant `None` — which on the Pi it is: the BCM2711 HVS publishes no raster-line register this kernel reads, so there is nothing for the knob to arm there. The register it locks is Tegra234 nvdisplay `NV_PDISP_RG_DPCA` under the display@ BPMP power guard.
 UNAOS_BOTFAULT             TODO  seeded 2026-09-06; 6 Pi-live cfg site(s)
 UNAOS_BOTRING64            TODO  seeded 2026-09-06; 4 Pi-live cfg site(s)
 UNAOS_BOTWEDGE             TODO  seeded 2026-09-06; 3 Pi-live cfg site(s)

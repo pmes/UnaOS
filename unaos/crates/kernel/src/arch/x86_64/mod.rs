@@ -247,3 +247,16 @@ pub fn flush_framebuffer_rows(_addr: usize, _row_len: usize, _rows: usize, _stri
     // SAFETY: SFENCE has no preconditions; it only orders/drains stores.
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 }
+
+/// BEAM — the scan-out's current raster line and the frame's line count, when this platform can
+/// read one. x86 answers `None`: the Kepler path has a live `VERT` (vline, vblank_count) register
+/// (`drivers/gpu/kepler_display.rs`) that nothing consumes yet, and wiring it is that track's own
+/// arc — `video::beam` folds to a no-op on `None`, so the x86 present path is byte-for-byte what
+/// it was. The signature is the arch-neutral question ("where is the beam"); only the answer is
+/// per-arch, which is why it lives here and not behind a `target_arch` gate in `video/`.
+///
+/// Appended at the file tail for the reason `flush_framebuffer_rows` states.
+#[inline]
+pub fn scanout_beam() -> Option<(u32, u32)> {
+    None
+}

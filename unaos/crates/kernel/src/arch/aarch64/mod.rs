@@ -546,3 +546,25 @@ compile_error!(
      `tegra_el0` (Jetson Orin) or `virt_el0` (QEMU virt), and enabling it alone compiles the EL0 \
      chain with no `uslots` slot backend behind it. Enable one of those three instead."
 );
+
+/// BEAM — the scan-out's current raster line and the frame's line count, when this platform can
+/// read one. Tegra with `beam` armed: `display_tegra::beam_position`, which answers `Some` only
+/// after `beam_probe` LOCKED a raster counter at boot (under JD1-DC's BPMP power guard, read-only)
+/// and `None` for the whole boot otherwise. Every other aarch64 target answers `None`: the Pi's
+/// HVS publishes no raster position this kernel reads, and QEMU has no beam. `video::beam` folds to
+/// a no-op on `None`, so those panel paths are unchanged.
+///
+/// APPENDED AT THE FILE TAIL: this module is compiled into the knob-off `kernel8.img` whose
+/// byte-identity is a standing proof, and panic `Location` records embed line numbers; nothing is
+/// below this, so nothing moves.
+#[inline]
+pub fn scanout_beam() -> Option<(u32, u32)> {
+    #[cfg(all(feature = "tegra", feature = "beam"))]
+    {
+        display_tegra::beam_position()
+    }
+    #[cfg(not(all(feature = "tegra", feature = "beam")))]
+    {
+        None
+    }
+}
