@@ -1102,7 +1102,7 @@ fi
 # UNAOS_GA10B_PROBE1/2/3/4. The ORIN-SELFUP line of `tegra_early_stop` is the 5a call's seam (main.rs).
 [ -n "${UNAOS_GA10B_PROBE5:-}" ] && _feats="${_feats}ga10bprobe5,"
 _p5_metal=""; { [ -n "${UNAOS_TEGRA:-}" ] || [ "${1:-}" = "esp-jetson" ]; } && _p5_metal=1
-[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; esac
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; 2|2d) _feats="${_feats}ga10bprobe5a,ga10bprobe5b," ;; 7|7d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e,ga10bprobe5b," ;; esac
 [ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1d|5d|2d|7d) _feats="${_feats}ga10bprobe5d," ;; esac
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
@@ -4279,6 +4279,9 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-ga10bprobe5a ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5a"
   # GA10B-PROBE5E armed (same arc) — the `=5` polarity: rung 5a with `ADDR_SHIFT = 8`. IMPLIES `ga10bprobe5a`.
   "arm-tegra-ga10bprobe5e ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5e"
+  # GA10B-PROBE5B armed (same arc; ledger A64) — the `=2` polarity: 5a then rung 5b's read-only PMU oracles.
+  # IMPLIES `ga10bprobe5a`.
+  "arm-tegra-ga10bprobe5b ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5b"
   # GA10B-PROBE5D armed (same arc) — the `=1d` polarity: 5a's loader at boot, the ignition armed for the
   # shutdown path (`ga10bprobe5_deferred_run`, statics, the DTB + window re-verify). IMPLIES `ga10bprobe5a`.
   "arm-tegra-ga10bprobe5d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5d"

@@ -767,6 +767,8 @@ fn ignite(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
         "BROM-VERDICT-PASS-UNWITNESSED" => serial_println!("[ga10bprobe5a] F20: the code says PASS and neither oracle moved — a measurement error until re-flown from a cold boot; build nothing on it this session"),
         _ => serial_println!("[ga10bprobe5a] no verdict in {} samples: halted={} — halted=1 means the core never started or halted again; halted=0 means it is RUNNING and the poll was short (F5)", BR_POLL_SAMPLES, halted),
     }
+    #[cfg(feature = "ga10bprobe5b")]
+    rung5b(base, verdict);
     let _ = (series_arm, bcr_arm, map_arm, dma_arm);
     finish4(FAM);
 }
@@ -870,4 +872,64 @@ pub fn ga10bprobe5_deferred_run() {
     serial_println!("[ga10bprobe5d] dtb re-verified sum={:#010x} dtb={:#x} size={:#x}; window re-verified 3/3 — igniting from the shutdown path", sum, dtb_addr, dtb_size);
     ignite(&Loaded5 { wb, ws, placed }, dtb_addr, dtb_size, ram_gib_mask);
     serial_println!("[ga10bprobe5d] deferred rung RETURNED (a refusal or an IGNITION-SKIPPED path — nothing spent) — falling through to the SYSTEM_OFF it interrupted");
+}
+
+/// RUNG 5b — the ACR->PMU handshake, READ-ONLY oracles (`ga10bprobe5b`; design GA10B-RUNG6-BRIEF.md §3;
+/// ledger A64). Only after `ACR-ACCEPTED`; otherwise prints why it did not run.
+#[cfg(feature = "ga10bprobe5b")]
+pub fn rung5b(base: u64, verdict: &str) {
+    const F5B: &str = "ga10bprobe5b";
+    /// PUBLIC-RECALLED, NOT ACKED: the PMU's legacy falcon aperture base (open-gpu-kernel-modules
+    /// `dev_pwr_pri.h`, MIT: NV_PPWR_FALCON_* at 0x10a000 + falcon offset). Rung 3 read the PMU's falcon2
+    /// (priscv) block at 0x10b000 on this die without fault; this v1 block is one page below it and has
+    /// never been touched here — every read is announced, every value printed raw.
+    const PMU_FALCON_BASE: u64 = 0x0010_a000;
+    /// PUBLIC-RECALLED (dev_falcon_v4.h, MIT): MAILBOX1 at +0x044, one word above the metal-proven MAILBOX0.
+    const FALCON_MAILBOX1_OFF: u64 = 0x044;
+    const SAMPLES: u32 = 10;
+    const SETTLE_MS: u64 = 20;
+    serial_println!("[ga10bprobe5b] rung 5b ARMED (UNAOS_GA10B_PROBE5=2|7) — the ACR->PMU handshake, READ-ONLY: after ACR-ACCEPTED the ACR (FMC) is expected to carve the WPR and boot the PMU (GA10B-RUNG6-BRIEF.md §2, from nvgpu's public sequence); this rung ADDS ZERO WRITES and samples the channels that would show it — GSP mailbox0/1 (the FMC's status/error words), the PMU legacy-falcon block (cpuctl, hwcfg2, mailbox0/1; PUBLIC-RECALLED base 0x10a000, first touch on this die) and the PMU falcon2 cpuctl rung 3 read — {} samples {} ms apart. Vocabulary: PMU-RUNNING | PMU-HALTED | PMU-UNREADABLE | PMU-NOT-ATTEMPTED reason=<not-accepted>", SAMPLES, SETTLE_MS);
+    if verdict != "ACR-ACCEPTED" {
+        serial_println!("[ga10bprobe5b] -> PMU-NOT-ATTEMPTED reason=not-accepted (5a verdict {}): nothing past the ROM ran, so there is no handshake to observe; zero reads", verdict);
+        return;
+    }
+    let regs: [(&str, u64); 8] = [
+        ("gsp_falcon_mailbox0", base + GSP_FALCON_BASE + FALCON_MAILBOX0_OFF),
+        ("gsp_falcon_mailbox1", base + GSP_FALCON_BASE + FALCON_MAILBOX1_OFF),
+        ("gsp_falcon_hwcfg2", base + GSP_FALCON_BASE + FALCON_HWCFG2_OFF),
+        ("pmu_falcon_cpuctl_v1", base + PMU_FALCON_BASE + FALCON_CPUCTL_OFF),
+        ("pmu_falcon_hwcfg2", base + PMU_FALCON_BASE + FALCON_HWCFG2_OFF),
+        ("pmu_falcon_mailbox0", base + PMU_FALCON_BASE + FALCON_MAILBOX0_OFF),
+        ("pmu_falcon_mailbox1", base + PMU_FALCON_BASE + FALCON_MAILBOX1_OFF),
+        ("pmu_falcon2_cpuctl", base + PMU_FALCON2_BASE + PRISCV_CPUCTL_OFF),
+    ];
+    let mut last = [0u32; 8];
+    let mut changed = [0u32; 8];
+    let mut unread = [0u32; 8];
+    for s in 1..=SAMPLES {
+        for (k, (name, addr)) in regs.iter().enumerate() {
+            serial_println!("[ga10bprobe5b] about-to-read handshake {} reg={:#x} sample={}/{} — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it", name, addr, s, SAMPLES);
+            let v = r32(*addr);
+            let u = unreadable_reason(v);
+            if u.is_some() { unread[k] += 1; }
+            if s > 1 && v != last[k] { changed[k] += 1; }
+            match u {
+                Some(why) => serial_println!("[ga10bprobe5b] handshake {} @{:#x} = -UNREADABLE reason={} val={:#010x} sample={}", name, addr, why, v, s),
+                None => serial_println!("[ga10bprobe5b] handshake {} @{:#x} = {:#010x} sample={} changed_since_last={}", name, addr, v, s, (s > 1 && v != last[k]) as u32),
+            }
+            last[k] = v;
+        }
+        if s < SAMPLES { settle_ms(SETTLE_MS); }
+    }
+    // The PMU verdict from its own cpuctl, the two apertures agreeing or not.
+    let v1 = last[3];
+    let f2 = last[7];
+    let pmu_arm = if unreadable_reason(v1).is_some() && unreadable_reason(f2).is_some() {
+        "PMU-UNREADABLE"
+    } else if (unreadable_reason(v1).is_none() && (v1 >> PRISCV_CPUCTL_HALTED_BIT) & 1 == 0) || (unreadable_reason(f2).is_none() && (f2 >> PRISCV_CPUCTL_HALTED_BIT) & 1 == 0) {
+        "PMU-RUNNING"
+    } else {
+        "PMU-HALTED"
+    };
+    serial_println!("[ga10bprobe5b] handshake summary: pmu_cpuctl_v1={:#010x} pmu_falcon2_cpuctl={:#010x} gsp_mailbox0={:#010x} gsp_mailbox1={:#010x} pmu_mailbox0={:#010x} pmu_mailbox1={:#010x} changes=[{} {} {} {} {} {} {} {}] unreadable=[{} {} {} {} {} {} {} {}] samples={} -> {}", v1, f2, last[0], last[1], last[5], last[6], changed[0], changed[1], changed[2], changed[3], changed[4], changed[5], changed[6], changed[7], unread[0], unread[1], unread[2], unread[3], unread[4], unread[5], unread[6], unread[7], SAMPLES, pmu_arm);
 }

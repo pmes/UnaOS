@@ -2282,6 +2282,15 @@ ga10bprobe5a = ["ga10bprobe5", "ga10bprobe4a"]
 # `[ga10bprobe5a]` (a tag, not a new family).
 ga10bprobe5e = ["ga10bprobe5a"]
 
+# GA10B-PROBE5B (`UNAOS_GA10B_PROBE5=2`, `=7` with the shift): RUNG 5b — the ACR->PMU handshake, READ-ONLY
+# oracles first (docs/dev/OS/08_VIDEO/GA10B-RUNG6-BRIEF.md §3; ledger A64). Runs ONLY after rung 5a's
+# `ACR-ACCEPTED`: samples the GSP mailboxes (the FMC's status/error channel), the PMU falcon (v1 base
+# 0x10a000, PUBLIC-RECALLED from the MIT `dev_pwr_pri.h`, NOT in the ACKED facts file — every read announced,
+# every value printed raw) and the PMU falcon2 cpuctl rung 3 already read on this die, over a bounded
+# series, and prints `PMU-RUNNING | PMU-HALTED | PMU-UNREADABLE | PMU-NOT-ATTEMPTED reason=`. Adds ZERO
+# write classes. IMPLIES `ga10bprobe5a`. Default OFF. ARMED polarity type-checked by the
+# `arm-tegra-ga10bprobe5b` leg. Witness family: `[ga10bprobe5b]`.
+ga10bprobe5b = ["ga10bprobe5a"]
 
 # GA10B-PROBE5D (`UNAOS_GA10B_PROBE5=<n>d` — `1d`, `5d`, `2d`, `7d`): the DEFERRED arm of rung 5a, rung 4d's
 # shape (Peter 2026-09-12: the desktop first, the GPU probe LAST). IMPLIES `ga10bprobe5a`. Phase 0 (the
