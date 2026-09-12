@@ -168,22 +168,20 @@ pub fn _print(args: ::core::fmt::Arguments) {
                 // against a ring that has no consumer.
                 crate::serial_ring::note_declined();
                 break;
-            } else if crate::serial_ring::try_stage(args) {
-                // Contended, and the ring had room. Deferred rather than dropped; the next holder emits it
-                // intact and in order. This is the wait-free path and the overwhelmingly common one.
+            } else if !matches!(
+                crate::serial_ring::defer_contended(args, &mut spins),
+                crate::serial_ring::Defer::Retry
+            ) {
+                // SERWIT-1B PARITY (SO31): the three branches that used to be spelled out here —
+                // `try_stage` succeeded / the bound expired / go round — are now ONE call, because
+                // aarch64 needed the identical decision and two copies of a policy is how two
+                // divergent policies happen (it is exactly how this arch ended up with backpressure
+                // while the other one dropped). `serial_ring::defer_policy` is the single pure
+                // decision and its rows are asserted at compile time on both arches. Behaviour here
+                // is unchanged, branch for branch: Staged is the wait-free common case, Lost is
+                // counted in `DROPPED` and announced by the next drain, and Retry is the bounded,
+                // progress-bearing turn whose next iteration re-tries the UART first.
                 break;
-            } else if spins >= crate::serial_ring::BACKPRESSURE_SPINS {
-                // SERWIT-1B: the bound expired — a UART holder that has not released in a million turns is
-                // wedged or is this very core, and no amount of further waiting can help. Drop LOUDLY:
-                // counted in `DROPPED`, announced by the next drain as `[serial] dropped N lines`, and a
-                // SERWIT-1 FAIL. The law does not bend for the fix that was supposed to satisfy it.
-                crate::serial_ring::note_dropped();
-                break;
-            } else {
-                // The ring is FULL. Go round: the next turn re-tries the UART (winning it drains all of it)
-                // and then the stage. `spin_loop` is a hint only — it takes nothing and yields nothing.
-                spins += 1;
-                core::hint::spin_loop();
             }
         }
         if spins > 0 {

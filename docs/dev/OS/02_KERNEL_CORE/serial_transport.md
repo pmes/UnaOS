@@ -677,6 +677,78 @@ SERWIT-1's law — five `const _: () = assert!(…)` rows, both arches, every `.
 not one byte of code. The first row is the load-bearing one: *an empty drain must always take its
 first line, whatever its width.*
 
+## SERWIT-1B PARITY — the backpressure was x86-only, and aarch64 dropped on the first turn
+
+SERWIT-1B (above) installed the bounded, progress-bearing retry that stopped a full ring from being
+terminal. It was installed in **x86's `_print` only**. `arch/aarch64/serial.rs`'s `_print` called
+`serial_ring::stage`, which tried the ring once and, on a full ring, wrote the line off on the spot.
+
+That asymmetry is visible on the wire, and it went unread for weeks because the accounting was
+*correct*. render13 boot 1, on the Orin:
+
+```
+    [serial] dropped 5331 lines in 192 events          — counted, announced, law balanced
+    stall count: 0                                     — the mechanism that would have saved them
+```
+
+Five thousand three hundred and thirty-one lines that the other arch would have kept. Nothing lied;
+the transport simply had two different contracts wearing one name, which is the failure this whole
+document exists to close. (The producer that filled the ring is a separate finding, SO30, and is
+fixed — but a transport is not allowed to depend on its producers being polite.)
+
+### One policy, and the old spelling is deleted
+
+Both arches' `_print` now call `serial_ring::defer_contended`, and behind it sits one pure decision:
+
+```rust
+pub const fn defer_policy(staged: bool, spins: u32, limit: u32) -> Defer {
+    if staged { Defer::Staged } else if spins >= limit { Defer::Lost } else { Defer::Retry }
+}
+```
+
+`Staged` / `Retry` / `Lost` are the three outcomes, and the distinction between the first two *is* the
+law: **a deferred line is not a lost one.** `stage()` is **deleted**, not deprecated. The go-red for
+"an arch regresses to drop-instantly" must not be a reviewer noticing — it is the compiler refusing to
+resolve the name. There is one spelling of the contended path left in the tree, so aarch64's `_print`
+either calls it or does not compile.
+
+Six `const _: () = assert!(…)` rows pin the policy in the build, both arches, every `./arroyo check`.
+Row 2 is the defect, stated as an assertion: *a full ring on the first turn must back-pressure, never
+drop.*
+
+### The fixture
+
+`serial_ring::backpressure_selftest`, one-shot on `mirror_service`, fills the ring and takes three
+turns of the real `defer_contended` with one capped drain in the middle — the drain standing in for
+SERWIT-1B's *it waits by working*, where the stalled producer wins the UART and becomes the consumer:
+
+```
+    turn 1   ring full, bound not reached   ->  Retry   (spins 1)
+    turn 2   ring full, bound not reached   ->  Retry   (spins 2)
+    [one capped drain: room appears]
+    turn 3   room                           ->  Staged
+```
+
+```
+:: SERWIT-1B: the contended producer BACK-PRESSURES, it does not drop — ring filled to 64 line(s),
+   2 turns on a full ring returned Retry (spins=2 of 1000000), one capped drain freed 3 slot(s), the
+   next turn DEFERRED the line intact, 65 line(s) out, 0 dropped. One policy (`defer_policy`) on both
+   arches; `stage()` is deleted, so drop-instantly cannot be written -> PASS ::
+```
+
+**The `Lost` leg is not exercised at runtime, on purpose.** Firing it would leave `DROPPED` non-zero
+and `[serial] dropped 1 lines` on the wire of a *healthy* boot, and this tree has already lost a real
+`[wc-d]` verdict and a two-week panel regression to readers trained by a permanently-noisy instrument
+(`docs/dev/LAWS.md` §5). The `Lost` rows are the compiler's.
+
+Two go-reds, failing at different stages:
+
+* **compile** — flip the `Retry` arm to `Defer::Lost`: truth-table row 2 refuses to compile and
+  `./arroyo check` reds on both arches before anything boots;
+* **runtime** — add `note_dropped()` to `defer_contended`'s `Retry` arm (a retried line counted as a
+  lost one). It compiles; the fixture reads `dropped=2` and prints `-> FAIL`, which `FAULT_PATTERNS`
+  (`FAIL — `) turns into a non-zero exit from `./arroyo test-arm`.
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,

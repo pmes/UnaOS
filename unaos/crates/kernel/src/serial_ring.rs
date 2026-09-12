@@ -114,7 +114,7 @@
 //!
 //! ### Why nothing here can deadlock the panic or breadcrumb paths
 //! * **No lock is introduced.** The ring is three atomics plus per-slot atomics. There is no `Mutex`,
-//!   no `RwLock`, no allocation, and no reentrancy: [`stage`] and [`drain`] never call `serial_println!`.
+//!   no `RwLock`, no allocation, and no reentrancy: [`try_stage`] and [`drain`] never call `serial_println!`.
 //! * **WEDGE-2 / WEDGE-4 are untouched.** Those breadcrumb primitives write single bytes through
 //!   `arch::serial::wedge2_raw_byte` / the raw UART sequence and deliberately acquire NOTHING. They do
 //!   not enter this module at all, and this module adds no lock they could ever contend for. That
@@ -515,7 +515,7 @@ impl Write for SlotWriter {
 }
 
 /// Count one line as genuinely lost: cumulatively, and as not-yet-announced so the next drain puts it
-/// on the wire. Split out of [`stage`] by SERWIT-1B so a caller that means to RETRY a full ring can do
+/// on the wire. Split out of the old `stage` by SERWIT-1B so a caller that means to RETRY a full ring can do
 /// so without the first attempt having already written the line off.
 #[inline]
 pub fn note_dropped() {
@@ -530,18 +530,116 @@ pub fn note_stalled(spins: u32) {
     STALL_SPINS_MAX.fetch_max(spins, Ordering::Relaxed);
 }
 
-/// Defer one line into the ring. Returns `false` if the ring was full, in which case the loss has
-/// already been counted and will be announced by the next drain.
+// ── SERWIT-1B PARITY: ONE contended-producer policy, shared by both arches ───────────────────────
+//
+// ### The defect this removes
+// `pub fn stage(args) -> bool` used to live here: try the ring once, and on a full ring write the line
+// off on the spot (`note_dropped`). x86's `_print` never called it — it had the bounded retry loop
+// SERWIT-1B installed — but **aarch64's `_print` called nothing else**, so on that arch a full ring was
+// terminal on the first turn. That is the whole of render13 boot 1's
+// `[serial] dropped 5331 lines in 192 events` with a stall count of zero: the accounting was honest,
+// the marker was on the wire, and 5 331 lines were still gone that x86 would have kept.
+//
+// `stage` is DELETED rather than deprecated. The go-red for "an arch regresses to drop-instantly" must
+// not be a reviewer noticing; it is the compiler refusing to resolve the name. There is now exactly one
+// spelling of the contended path, [`defer_contended`], and exactly one policy behind it,
+// [`defer_policy`] — whose rows are pinned in the build below.
+
+/// SERWIT-1B — what a contended producer does with ONE turn. Three outcomes, and the distinction
+/// between the first two is the law this module exists for: **a deferred line is not a lost one.**
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Defer {
+    /// The line is in the ring. The next UART holder emits it intact and in order. NOT a loss, and
+    /// not an error — this is the overwhelmingly common outcome and the wait-free one.
+    Staged,
+    /// The ring was full and the bound has NOT expired. Go round: re-try the UART (winning it drains
+    /// the ring and writes this line intact), then re-try the stage. The wait is progress-bearing.
+    Retry,
+    /// The ring was full and the bound expired. The line is genuinely lost — counted in [`DROPPED`],
+    /// announced by the next drain as `[serial] dropped N lines`, and a SERWIT-1 FAIL.
+    Lost,
+}
+
+/// The policy itself: pure, `const`-evaluable, and the ONLY place either arch decides what a contended
+/// line's fate is. `staged` is whether [`try_stage`] found room this turn; `spins` is how many turns
+/// this line has already spent; `limit` is [`BACKPRESSURE_SPINS`].
 ///
-/// [`try_stage`] plus the write-off. Callers that apply SERWIT-1B backpressure use `try_stage` and
-/// call [`note_dropped`] themselves once their bound expires; this spelling is the one for a caller
-/// with nowhere to retry to.
-pub fn stage(args: fmt::Arguments) -> bool {
-    if try_stage(args) {
-        return true;
+/// The bound is a correctness requirement and not a tuning knob — a print arriving from an exception
+/// handler that interrupted THIS core inside its own UART-locked region would otherwise spin on a
+/// holder that can never release, and an unbounded wait there is a hang. See the module docs.
+#[inline]
+pub const fn defer_policy(staged: bool, spins: u32, limit: u32) -> Defer {
+    if staged {
+        Defer::Staged
+    } else if spins >= limit {
+        Defer::Lost
+    } else {
+        Defer::Retry
     }
-    note_dropped();
-    false
+}
+
+// ── THE BACKPRESSURE TRUTH TABLE: checked by the compiler, both arches, every `./arroyo check` ───
+// Same idiom and the same reason as SERWIT-LAW's table below: the go-red paths of a policy must be
+// demonstrable without booting the machine it runs on, and a table re-typed into a scratch file proves
+// nothing about the policy that ships. Pure integer arithmetic; not one byte of code is emitted.
+//
+// Row 2 is the aarch64 defect, stated as an assertion. Before this arc, a full ring on the FIRST turn
+// meant `Lost` on that arch; here it is `Retry`, and the row fails to compile if that is ever undone.
+const _: () = assert!(
+    matches!(defer_policy(true, 0, BACKPRESSURE_SPINS), Defer::Staged),
+    "a line that fit the ring is DEFERRED, never lost"
+);
+const _: () = assert!(
+    matches!(defer_policy(false, 0, BACKPRESSURE_SPINS), Defer::Retry),
+    "THE aarch64 DEFECT: a full ring on the first turn must back-pressure, never drop"
+);
+const _: () = assert!(
+    matches!(
+        defer_policy(false, BACKPRESSURE_SPINS - 1, BACKPRESSURE_SPINS),
+        Defer::Retry
+    ),
+    "one turn left under the bound is still a turn"
+);
+const _: () = assert!(
+    matches!(
+        defer_policy(false, BACKPRESSURE_SPINS, BACKPRESSURE_SPINS),
+        Defer::Lost
+    ),
+    "the bound is a CEILING: past it the line is lost, and must be counted"
+);
+const _: () = assert!(
+    matches!(
+        defer_policy(true, BACKPRESSURE_SPINS, BACKPRESSURE_SPINS),
+        Defer::Staged
+    ),
+    "a line that fit is never lost, however long it waited — room beats the bound"
+);
+const _: () = assert!(
+    matches!(defer_policy(false, 0, 0), Defer::Lost),
+    "a ZERO bound is the pre-SERWIT-1B transport, and it is what `stage()` used to be"
+);
+
+/// SERWIT-1B — one turn of the contended path, effects included. **Both arches' `_print` call this and
+/// nothing else**; it is what makes the two transports one transport.
+///
+/// Returns [`Defer::Retry`] when the caller must go round — and the caller's next turn re-tries the
+/// UART first, which is what makes the wait progress-bearing rather than a sleep on another core's
+/// goodwill. `spins` is the caller's own counter so it can feed [`note_stalled`] afterwards.
+pub fn defer_contended(args: fmt::Arguments, spins: &mut u32) -> Defer {
+    match defer_policy(try_stage(args), *spins, BACKPRESSURE_SPINS) {
+        Defer::Staged => Defer::Staged,
+        Defer::Lost => {
+            // Counted in `DROPPED`, announced by the next drain, and still a SERWIT-1 FAIL. The law
+            // does not bend for the fix that was supposed to satisfy it.
+            note_dropped();
+            Defer::Lost
+        }
+        Defer::Retry => {
+            *spins += 1;
+            core::hint::spin_loop();
+            Defer::Retry
+        }
+    }
 }
 
 /// Defer one line into the ring. Returns `false` if the ring was FULL, having counted nothing — the
@@ -1524,6 +1622,9 @@ pub fn mirror_service() {
     // statement, aarch64 via the BSP main loop and `pump_usb_into_gui` on baremetal). Placed AFTER the
     // verdict so the fixture's own traffic cannot move the tap tallies that verdict snapshots.
     draincap_selftest();
+    // SERWIT-1B PARITY — the shared contended-producer policy, exercised on whichever arch is
+    // running. Same one-shot call site and same contract as the two fixtures above it.
+    backpressure_selftest();
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -1747,6 +1848,135 @@ fn draincap_selftest() {
             lost,
             bounded,
             capped
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// SERWIT-1B PARITY — the fixture for [`defer_policy`]: a contended producer on a FULL ring
+// back-pressures and then defers. It never drops on the first turn, on either arch.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ### What it exercises
+// The live ring and the live policy, in the order `_print` runs them: fill the ring to [`SLOTS`], then
+// take three turns of [`defer_contended`] with one capped drain in the middle. The drain is the
+// fixture standing in for "the producer won the UART and became the consumer" — SERWIT-1B's *it waits
+// by working*, which is the property that keeps the retry from livelocking at the tail of a burst.
+//
+//     turn 1   ring full, bound not reached   ->  Retry   (spins 1)
+//     turn 2   ring full, bound not reached   ->  Retry   (spins 2)
+//     [one capped drain: room appears]
+//     turn 3   room                           ->  Staged  (spins still 2)
+//
+// **Nothing is lost, and that is deliberate.** The `Lost` leg is NOT exercised at runtime: firing it
+// would leave `DROPPED` non-zero and `[serial] dropped 1 lines` on the wire of a HEALTHY boot, and
+// `docs/dev/LAWS.md` §5 is explicit that a permanently-non-zero instrument is camouflage for a real
+// one. The `Lost` rows are asserted by the compiler instead, in [`defer_policy`]'s truth table, which
+// is where the go-red paths of this module's predicates have always lived.
+//
+// ### The go-red
+// Two, on purpose, because they fail at different stages:
+//   * COMPILE — flip `defer_policy`'s `Retry` arm to `Defer::Lost` and the truth table's row 2 refuses
+//     to compile ("THE aarch64 DEFECT: a full ring on the first turn must back-pressure, never drop").
+//     `./arroyo check` goes red on both arches; nothing boots.
+//   * RUNTIME — add `note_dropped()` to `defer_contended`'s `Retry` arm (a retried line counted as a
+//     lost one). It compiles; the fixture reads `dropped=2` and prints `-> FAIL`, which
+//     `FAULT_PATTERNS` (`FAIL — `) turns into a non-zero exit from `./arroyo test-arm`.
+//
+// ### Why this proves the ARCH and not just the function
+// Because `stage()` is deleted. There is no other spelling of the contended path left in the tree, so
+// aarch64's `_print` either calls [`defer_contended`] or does not compile. The fixture proves the
+// policy; the compiler proves the call.
+
+static BACKPRESSURE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The probe line the fixture pushes through the contended path. 68 bytes with its newline, the same
+/// width [`DRAINCAP_PAD`] uses, so both fixtures speak SO29's arithmetic.
+const BPRESS_PROBE: &str =
+    "[bpress] probe 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123\n";
+
+/// SERWIT-1B PARITY, once per boot. Called from [`mirror_service`].
+fn backpressure_selftest() {
+    if BACKPRESSURE_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        // SERWIT-1D's machine never stages at all — `_print` takes the DECLINED branch BEFORE the
+        // contended path, deliberately, so it never back-pressures against a ring with no consumer.
+        // There is nothing here to exercise; the truth table still ran at `./arroyo check`.
+        serial_println!(
+            ":: SERWIT-1B: SKIP — no 16550 on this machine, the contended path is DECLINED before it \
+             is reached (SERWIT-1D); the policy truth table is asserted at compile time ::"
+        );
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    drain(draincap_wire);
+
+    let mut filled = 0u64;
+    for i in 0..SLOTS {
+        if try_stage(format_args!("[bpress] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            note_submitted();
+            filled += 1;
+        } else {
+            break;
+        }
+    }
+
+    // The probe takes the contended path. `note_submitted` once: the first two turns stage nothing —
+    // that is the whole point — and the third is the one that lands.
+    note_submitted();
+    let mut spins: u32 = 0;
+    let t1 = defer_contended(format_args!("{}", BPRESS_PROBE), &mut spins);
+    let t2 = defer_contended(format_args!("{}", BPRESS_PROBE), &mut spins);
+    // "It waits by working": the stalled producer wins the UART and becomes the consumer. One capped
+    // drain is exactly what `_print`'s next turn would do, so this is the real sequence and not a
+    // simulation of it.
+    let mut freed = 0u64;
+    drain_capped(|s| {
+        freed += 1;
+        draincap_wire(s);
+    });
+    let t3 = defer_contended(format_args!("{}", BPRESS_PROBE), &mut spins);
+
+    // Empty the ring so the fixture leaves it as it found it; the probe goes out here.
+    let mut rest = 0u64;
+    drain(|s| {
+        rest += 1;
+        draincap_wire(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let backpressured = matches!(t1, Defer::Retry) && matches!(t2, Defer::Retry);
+    let deferred = matches!(t3, Defer::Staged);
+    let pass = filled >= 8 && backpressured && deferred && spins == 2 && lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: SERWIT-1B: the contended producer BACK-PRESSURES, it does not drop — ring filled to {} \
+             line(s), 2 turns on a full ring returned Retry (spins={} of {}), one capped drain freed {} \
+             slot(s), the next turn DEFERRED the line intact, {} line(s) out, 0 dropped. One policy \
+             (`defer_policy`) on both arches; `stage()` is deleted, so drop-instantly cannot be \
+             written -> PASS ::",
+            filled,
+            spins,
+            BACKPRESSURE_SPINS,
+            freed,
+            freed + rest
+        );
+    } else {
+        serial_println!(
+            ":: SERWIT-1B: FAIL — filled={} t1_retry={} t2_retry={} t3_staged={} spins={} freed={} \
+             rest={} dropped={} ::",
+            filled,
+            matches!(t1, Defer::Retry),
+            matches!(t2, Defer::Retry),
+            matches!(t3, Defer::Staged),
+            spins,
+            freed,
+            rest,
+            lost
         );
     }
 }

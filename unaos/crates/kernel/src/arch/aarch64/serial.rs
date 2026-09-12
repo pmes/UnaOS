@@ -204,6 +204,21 @@ pub fn _print(args: fmt::Arguments) {
         // fault handler or an exception-level print can no longer stall behind another core's line.
         // Nothing is dropped: a contended line goes into the lock-free staging ring and the next
         // holder emits it intact, in order. See `crate::serial_ring`.
+        //
+        // SERWIT-1B PARITY (SO31). The `else` below used to be a bare `serial_ring::stage(args)`,
+        // which writes the line off the instant the ring is full — x86 has back-pressured since
+        // SERWIT-1B and this arch never did. That asymmetry is render13 boot 1's
+        // `[serial] dropped 5331 lines in 192 events` with a stall count of ZERO: honest accounting,
+        // marker on the wire, and 5 331 lines gone that the other arch would have kept. The loop is
+        // now the same bounded, progress-bearing retry x86 runs, through the same one policy
+        // (`serial_ring::defer_policy`, whose rows are asserted at compile time): each turn re-tries
+        // the UART — winning it drains the ring and writes this line intact — then re-tries the stage,
+        // and only a line that outlives `BACKPRESSURE_SPINS` turns is lost, counted and announced.
+        // `stage()` is deleted from `serial_ring`, so the old spelling cannot be written back.
+        // The loop body below keeps its ORIGINAL indentation: re-indenting 45 unchanged lines would
+        // bury a twelve-line change under a wall of whitespace in every review of this commit.
+        let mut spins: u32 = 0;
+        loop {
         if let Some(mut guard) = SERIAL_PORT.try_lock() {
             {
                 let mut sink = |s: &str| {
@@ -234,8 +249,18 @@ pub fn _print(args: fmt::Arguments) {
                 let _ = guard.write_fmt(args);
             }
             crate::serial_ring::note_emitted();
-        } else {
-            crate::serial_ring::stage(args);
+            break;
+        } else if !matches!(
+            crate::serial_ring::defer_contended(args, &mut spins),
+            crate::serial_ring::Defer::Retry
+        ) {
+            // Staged (the common case) or lost past the bound (counted, announced). Either way this
+            // line's fate is settled and the loop is done.
+            break;
+        }
+        }
+        if spins > 0 {
+            crate::serial_ring::note_stalled(spins);
         }
     });
     // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
