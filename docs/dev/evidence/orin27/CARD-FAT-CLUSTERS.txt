@@ -19,3 +19,6 @@ the harvest and the read-back all passed. EDK2 classifies by count, finds no FAT
 boot option. The rung-4 boot card (one FAT32 partition of 63,401,984 sectors) is FAT32 by count either way.
 
 Fix: make-pi-img.sh FATCLUST (-s 1), 3225b5b0 on hw-jetson. AFTER (appended by the rebuild):
+render13-20260912T0259Z-f4b4bf3.card-v2.img (built by esp-jetson-img at 3225b5b0+, same knob line):
+BPB spc=1 tot=260064 fatsz=2001 clusters=256030 kind=FAT32
+CARDREADY-GEOM: 1:0c:2048:260096,2:7f:262144:1048576 (unchanged)
