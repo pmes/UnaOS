@@ -58,7 +58,7 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 · SR8  `BLIT_NET_CORE` is `[AtomicU64; 8]` at module scope with no cfg
 
 ## 5. GATES AND TOOLING — shared `arroyo`, scripts, specs
-· NEW 2026-09-12: `make-pi-img.sh` (formats EVERY card image, Pi and Orin) — FATCLUST (`-s 1`, on hw-jetson 3225b5b0) fixed a FAT32 volume that was FAT16 by cluster count (orin-ledger A58), but its review OBJECTED: the warning guard greps dosfstools ≤4.1 wording (this host is 4.2: "Number of clusters for 32 bit FAT is less then suggested minimum") so it never fires; `2>&1 |` discards mkfs stderr; A58's numbers are wrong (256,030 clusters at 127 MiB, 110,874 at the Pi's 55 MiB); fs/fat.rs MISREADS such a volume as FAT16 (does not refuse). Fix shape: assert the cluster count off the written BPB (the C15 check), restore stderr, correct A58. Unflown on the Pi.
+✓ DONE 2026-09-12T16:xxZ (orin session, on hw-jetson): `make-pi-img.sh` FATCLUST review objections answered — the guard is now `unaos/scripts/fat-clusters.sh`, which parses the WRITTEN BPB and asserts FAT32 by cluster count (go-red proven on the refused render13 image: `clusters=32440 kind=FAT16 -> FAIL`; green on card-v2 `256030`; NOT-A-BPB control rc=2), mkfs stderr is no longer captured, the numbers are corrected (256,030 at 127 MiB; 110,874 at 55 MiB), and A58 says fs/fat.rs MISREADS (FAT16 by count, no refusal). Lands with hw-jetson.
 · R39 battery selector: `battery()` runs the landing seat's OWN-BOARD legs — the selector is not written
 · SR13  GATE-LEDGER's strict trigger cannot fire in a detached worktree (the shape every executor gates from)
 · SR1  a `UNAOS_*` knob with no `K8_FEATS` arm is unreachable for every Pi image, silently — the CLASS needs a gate
@@ -72,7 +72,7 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 · B95  the x86 spec files are run by no `arroyo` verb; `orin-specscore.py` and `mbench --self-test` likewise
 · S16  106 ordering invariants, 99 in comments enforced by nothing — check them in code, one file per arc
 · S13  `[u7stk]` probe has no reachable caller outside `u7_launcher`
-· `media-writer.sh --image`: no check that the image's FAT32 volume is FAT32 BY CLUSTER COUNT (≥ 65,525) — a 32,440-cluster "FAT32" passed C4/C5/C8 and the Orin UEFI refused to boot it (orin-ledger A58; the Linux vfat driver trusts the BPB, EDK2 and our kernel do not) — add C15 on the image and on `--src` targets
+✓ DONE 2026-09-12T16:xxZ: `media-writer.sh` C15-FAT32-BY-COUNT on the `--image` p1 and on the `--src` target volume (probe_medium prints VOL_CLUSTERS/VOL_FATKIND; selftest fixture `spc8.img` = the A58 shape, red arms in both modes). Bench tool, un-versioned (B97 stands): backup `media-writer.sh.bak-c15-<UTC>` beside it.
 · `media-writer.sh --src`: no preflight that the staged tree FITS the target FAT, and a failed copy leaves the card mounted with a partial file (orin 27, 2026-09-12: a 640 MiB card image staged inside the tree filled the 127 MiB volume) — add C14 fits-the-volume and unmount-on-failure
 · scorer STAMP-MATCH leg (wire `sha=` == card elf stamp); `media-writer.sh` is un-versioned (B97)
 · SR5  R24/R25/R26 double-booked across seats and the gate cannot see it (seat-prefix RULINGS ids)
