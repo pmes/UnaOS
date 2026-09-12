@@ -14,7 +14,7 @@ corrected by the landing review — the commands live in each track queue). rmbp
 file lists JOBS, ranked, and a ledger row that is a record rather than a job stays in the ledger.
 
 ## STATE — 2026-09-12T03:5xZ (orin 27)
-✓ main 0aa3afe6 = the jetson landing (parents d28e701e + 6ed2be1a; three review panels; landing legs on 5acf6d16: check tegra/plain strict rc=0, UNAOS_WC=1 test rc=0, test-arm rc=0; ledger-check rc=0 on the result; `./arroyo check` on main recorded below when done). Before it: rmbp 267bd49d and pi e10d9e4e landings.
+✓ main 0aa3afe6 = the jetson landing (parents d28e701e + 6ed2be1a; three review panels; landing legs on 5acf6d16: check tegra/plain strict rc=0, UNAOS_WC=1 test rc=0, test-arm rc=0; ledger-check rc=0 on the result; `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` on main 0aa3afe6 rc=0). Before it: rmbp 267bd49d and pi e10d9e4e landings.
 ✓ ALL THREE TRACKS LEVEL WITH MAIN after this commit (hw-jetson, hw-pi4, hw-rmbp fast-forwarded). R45's property holds: any track can merge to main at any time.
 ✓ Push line (Peter): `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin27-cmd8 exec-orin27-usblun exec-orin27-closefold exec-orin24-fold exec-orin25-shotverb`
 ✓ Orin bench: render13 (`render13-20260912T0259Z-f4b4bf3`, KELF max=0x34f820) written to the old 32 GB card; the UEFI does not list our MBR card in the native slot (GPT card image is the job, orin-queue) so it flies from the USB reader; waker armed on the loader line.
