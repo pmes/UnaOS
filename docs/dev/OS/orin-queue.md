@@ -10,11 +10,11 @@ Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51
 ✓ origin/main 084b79ac · origin/hw-jetson 277e2cab · origin/hw-rmbp 73d9d361 · origin/hw-pi4 153c78dd
 ✓ LOCAL, UNPUSHED: main 50d35cbf (R45-R48 + LAWS + docs/dev/QUEUE.md, the trunk queue) · hw-jetson 059db935
   (f2794266 rung 4 flown + the unafsroot fold) · hw-pi4 3c102d2a (pi-queue.md) · hw-rmbp dc1cc3a2 (rmbp-queue.md) ·
-  exec-orin26-unafsroot 5984c69c (merged) · exec-orin27-ga10b4c (cut at f2794266, executor live) · exec-orin26-tear (executor live).
-  Push line: `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin24-fold exec-orin25-shotverb`
+  exec-orin26-unafsroot 5984c69c (merged) · exec-orin27-ga10b4c (cut at f2794266, Fable executor live: 4c + the deferred Shut Down trigger) · exec-orin26-tear (Opus executor live: BEAM) · exec-orin27-cmd8 (cut at 5cf8a9a3, Opus executor live: SDCMD8 — the UNAOS-DATA card is SD 2.00, CMD8 timeout is the driver).
+  Push line: `git push origin main hw-jetson hw-pi4 hw-rmbp exec-orin26-unafsroot exec-orin26-tear exec-orin27-ga10b4c exec-orin27-cmd8 exec-orin24-fold exec-orin25-shotverb`
 ✓ Fold gate on 059db935 GREEN: `UNAOS_TEGRA=1 UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` rc=0 · plain strict check rc=0 · `./arroyo esp-jetson` rc=0.
 ✓ A49 premise refuted by Peter (no v1 microSD ever): reopened, cause unknown; the v1-card item is OFF the render13 list.
-✓ Landing order (R45, plan of 2026-09-11): rmbp → pi → jetson into main, then main into all three. Review panels for rmbp and pi are running.
+✓ Landing order (R45): rmbp LANDED (main 267bd49d) → pi LANDED (main e10d9e4e; hw-pi4 and hw-rmbp level with main) → jetson (review panel running at f0dc8058; main folds into hw-jetson first — merge-tree shows conflicts in .gitignore, LEDGER.md, arroyo).
 ✓ R46: one focus (orin), ALL LANES, no owner, no support seat, no lane grants. R47: Opus executors, Fable for key tasks only. R48: adversarial handoff.
 
 ## RENDER13 IS HELD — Peter 2026-09-11
