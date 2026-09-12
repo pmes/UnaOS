@@ -1220,23 +1220,90 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     }
 
     let Some(found) = s.root else { return };
-    let src = found.source;
+    bind_root(mt, found.source, unafs_state(found.source), announce);
+}
 
-    let native_root = unafs_state(src) == "present";
+/// UNAFSROOT (orin 24): the ROOT DISK's three mounts, as a function of ONE fact — the
+/// [`unafs_state`] string for the disk this kernel was found on.
+///
+/// It is a separate function from [`bind`] for a reason that is not tidiness. Everything above it
+/// needs real hardware: a survey, a FAT mount per source, a shared-mount bind. This does not — it
+/// needs a state string and a table — so the OS's own layout rule can be driven with both answers
+/// at the real call, on the real code path, by [`homesoil_selftest`] leg 6. Before this split the
+/// rule was reachable only by booting a card that HAD a native volume, which is precisely the card
+/// nobody had (render12, 2026-09-09: `unafs=absent`, so `/` had never once been the native volume
+/// on this board and the branch had never executed).
+///
+/// * `/`     — the disk's native UnaFS volume when `unafs` is `present`, else the FAT boot volume.
+///             `present` already means BOTH "this disk carries a volume" AND "the shared mount is
+///             riding this disk" (see [`unafs_state`]); the other three values
+///             (`absent`, `present-on-other-handle`, `unbuilt`) all mean the FAT, each for its own
+///             stated reason, and collapsing them here is what keeps that reasoning in one place.
+/// * `/boot` — the FAT volume the kernel was found in, always, native root or not. The kernel is
+///             loaded by firmware out of FAT, so it can never live at the root of the native
+///             volume; `/boot` is where it does live and that is the whole of this line's content.
+/// * `/apps` — the SAME FAT volume rooted at `APPS/`, under the SAME volume NAME as `/boot` so
+///             `same_volume("/boot", "/apps")` stays true about one card. Programs resolve from the
+///             FAT boot volume whether or not `/` is native — a native `/` does not move them.
+///
+/// THE POSTURE ON THE WIRE. Each mount says `rw=`, and each `rw=` is sampled from the thing being
+/// mounted rather than derived a second time: the FAT mounts read `FatBackend::read_only()` off the
+/// very backend handed to `mt.mount`, and the native root reads `BlockSource::write_veto()` — the
+/// single definition both of those forward to, and the same predicate `block::write_block` itself
+/// enforces. For a `Default`-sourced root that resolves to FRGUARD's `default_writable()`, a
+/// RUNTIME state, so there is deliberately no fixed expectation for it anywhere: the wire reports
+/// what it read. Nothing here weakens, bypasses or re-implements that gate.
+pub(crate) fn bind_root(
+    mt: &mut crate::fs::vfs::MountTable,
+    src: BlockSource,
+    unafs: &str,
+    announce: bool,
+) {
+    use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
+
+    #[cfg(target_arch = "aarch64")]
+    let native_root = unafs == "present";
+    // `NativeBackend` is `#[cfg(target_arch = "aarch64")]` in fs/vfs.rs, so on a build that does not
+    // have the type there is no native root to bind whatever the state string says. This cannot
+    // change a real boot's answer — [`unafs_state`] returns `"unbuilt"` on those targets — but it
+    // makes leg 6's `present` case HONEST on x86_64 (it asserts the FAT fallback there, and says so
+    // on the wire) instead of asking for a mount the type system does not have.
+    #[cfg(not(target_arch = "aarch64"))]
+    let native_root = {
+        let _ = unafs;
+        false
+    };
+
     #[cfg(target_arch = "aarch64")]
     if native_root {
         mt.mount("/", alloc::boxed::Box::new(crate::fs::vfs::NativeBackend::new("native")));
+        if announce {
+            // The discriminating words are LITERALS in the format string, not a `{}` carrying a
+            // runtime kind — the `/volumes/` lesson three screens up, same reason: an artifact
+            // census (`LC_ALL=C grep -a -o -F`) must be able to find the sentence it certifies.
+            serial_println!(
+                "[vfs] root mount / = native unafs volume source={} rw={} ::",
+                src.name(),
+                if src.write_veto().is_none() { "yes" } else { "no" }
+            );
+        }
     }
     if !native_root {
-        mt.mount(
-            "/",
-            alloc::boxed::Box::new(FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src)),
-        );
+        let be = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
+        let rw = !be.read_only();
+        mt.mount("/", alloc::boxed::Box::new(be));
+        if announce {
+            serial_println!(
+                "[vfs] root mount / = fat boot volume source={} rw={} ::",
+                src.name(),
+                if rw { "yes" } else { "no" }
+            );
+        }
     }
-    mt.mount(
-        "/boot",
-        alloc::boxed::Box::new(FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src)),
-    );
+
+    let boot = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
+    let boot_rw = !boot.read_only();
+    mt.mount("/boot", alloc::boxed::Box::new(boot));
     mt.mount(
         "/apps",
         alloc::boxed::Box::new(
@@ -1244,6 +1311,18 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
                 .rooted(crate::fs::fat::APPS_DIR),
         ),
     );
+    if announce {
+        serial_println!(
+            "[vfs] boot mount /boot = fat boot volume source={} rw={} ::",
+            src.name(),
+            if boot_rw { "yes" } else { "no" }
+        );
+        serial_println!(
+            "[vfs] apps mount /apps = fat boot volume source={} rooted={} ::",
+            src.name(),
+            crate::fs::fat::APPS_DIR
+        );
+    }
 }
 
 /// HOMESOIL: 11 label bytes as 22 lowercase hex digits, un-interpreted. Fixed width by the type, so
@@ -1490,6 +1569,87 @@ fn homesoil_selftest() {
         fat::same_device(&live, &synth_dev(9, 100)),
         fat::same_device(&synth_dev(0, 100), &synth_dev(0, 100)),
         if leg5 { "PASS" } else { "FAIL" }
+    );
+
+    unafsroot_selftest();
+}
+
+/// UNAFSROOT (orin 26): HOMESOIL leg 6 as its own entry point, because the QEMU boots that host the
+/// fixtures (`test`, `test-arm`) never reach a filesystem verb, so nothing under
+/// [`walk_and_witness`] executes there — measured on this arc's own captures: `[vfs]` 0 lines,
+/// `HOMESOIL` 0 lines on both `target/serial.log` and `target/serial-arm.log`. A leg that only
+/// runs when an operator types `ls` on metal is a leg that ships unexecuted, which is the defect
+/// class the split in [`bind_root`] exists to end. So the boot path calls this once, under
+/// `witness`, on both arches (main.rs, same-line appends), and [`homesoil_selftest`] calls it too
+/// so the metal wire keeps all six legs together; the latch makes the second call a no-op.
+#[cfg(feature = "witness")]
+pub fn unafsroot_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // --- leg 6: UNAFSROOT — the root disk's LAYOUT RULE, driven with every answer it takes. -----
+    // `bind_root` is the one place `/`, `/boot` and `/apps` are decided, and until this leg the
+    // `present` answer had never executed anywhere (render12: `unafs=absent`, no card carried a
+    // native volume). Table shape ONLY: `NativeBackend::new` and `FatBackend::new_source` hold a
+    // name, a principal and a source and touch no disk until resolved for I/O; `volume_name`,
+    // `mount_root` and `prefixes` are accessors. `same_volume` is deliberately NOT asked here —
+    // `FatBackend::volume_id` mounts the source to fingerprint it, and a fixture that runs AHEAD
+    // of the walk must not be the first thing to touch the card. `announce=false`: no wire line
+    // is owed by a table nothing will ever resolve through.
+    //
+    // The four answers `unafs_state` can give, each with the root it must produce:
+    //   present                  -> `/` native (aarch64) — on a build without `NativeBackend` the
+    //                               FAT, and the leg asserts THAT, so an x86 boot proves the same
+    //                               function honestly instead of skipping it;
+    //   absent, present-on-other-handle, unbuilt -> `/` FAT, on every build.
+    // `/boot` is the FAT volume `boot` and `/apps` is the same name rooted at `APPS_DIR`, in all
+    // four tables — a native `/` moves neither.
+    #[cfg(target_arch = "aarch64")]
+    const ROOT_WHEN_PRESENT: &str = "native";
+    #[cfg(not(target_arch = "aarch64"))]
+    const ROOT_WHEN_PRESENT: &str = "boot";
+    let shape = |state: &str| -> (String, String, String, String, usize) {
+        let mut mt = crate::fs::vfs::MountTable::new();
+        bind_root(&mut mt, BlockSource::Default, state, false);
+        let name = |p: &str| mt.volume_name(p).unwrap_or_else(|_| String::from("-"));
+        let apps_root = mt
+            .resolve("/apps")
+            .map(|(b, _)| String::from(b.mount_root()))
+            .unwrap_or_else(|_| String::from("-"));
+        (name("/"), name("/boot"), name("/apps"), apps_root, mt.prefixes().len())
+    };
+    let sp = shape("present");
+    let sa = shape("absent");
+    let so = shape("present-on-other-handle");
+    let su = shape("unbuilt");
+    // `FatBackend::rooted` stores the root in canonical `/`-led component form, so the expectation
+    // is derived the same way from the same constant rather than compared to the bare name.
+    let apps_root_want = alloc::format!("/{}", crate::fs::fat::APPS_DIR);
+    let fat_rooted = |s: &(String, String, String, String, usize)| {
+        s.1 == "boot" && s.2 == "boot" && s.3 == apps_root_want && s.4 == 3
+    };
+    let leg6 = sp.0 == ROOT_WHEN_PRESENT
+        && fat_rooted(&sp)
+        && sa.0 == "boot"
+        && fat_rooted(&sa)
+        && so.0 == "boot"
+        && fat_rooted(&so)
+        && su.0 == "boot"
+        && fat_rooted(&su);
+    serial_println!(
+        ":: HOMESOIL: root rule present=/:{} /boot:{} /apps:{}@{} absent=/:{} other=/:{} unbuilt=/:{} \
+         mounts={} :: {} ::",
+        sp.0,
+        sp.1,
+        sp.2,
+        sp.3,
+        sa.0,
+        so.0,
+        su.0,
+        sp.4,
+        if leg6 { "PASS" } else { "FAIL" }
     );
 }
 
