@@ -4,7 +4,13 @@ One file, fixed path, not per-round. Kept current AS WORK HAPPENS, never "at clo
 a list written only at close is never written at all by a session that does not reach one,
 and a session ends when the work is done or when it is not worth continuing.
 `✓` = verified in this tree.  `·` = inherited, NOT re-checked.  Re-derive every sha before acting.
-Last touched 2026-09-12 by orin 27: rung 4a+4b FLOWN in one boot, PASS/PASS (A51); tear and unafsroot still uncommitted in their orin26 worktrees.
+Last touched 2026-09-12 ~04:3xZ by orin 27 at CLOSE (Peter: context full). READ `~/.claude/plans/unaos/batons/orin-28.md` — the R48 handoff.
+## CLOSE STATE — orin 27, 2026-09-12 ~04:3xZ
+✓ render13 IS UP on the Orin (native slot, card-v2, KELF max=0x34f820); Shut Down NOT yet done → the deferred GPU rung (4a/4b/4c) has not fired. The waker of this session dies with it: the next session re-arms on `DEFERRED RUN|BROM-VERDICT|CENSUS-COMPLETE|PSCI SYSTEM_OFF` and scores with docs/dev/evidence/orin27/scorer-ga10b4.sh; the partial wire is ~/unaos-bench/scratch/orin27/render13-wire-partial.txt (30,962 lines, from raw.log byte 40765064).
+✓ Glass (Peter): apps launched (core 1); some titles/menus say "Application" (A59 owed); console could not reopen after close; shell reopened but the POINTER VANISHED; no tearing (BEAM NO-RASTER — inert); mousing/dragging NOT smooth (`[comp2] max_us` up to 588 ms). R49/R50 rule the fix shape: console+shell = pinned APPS, Quarry = Finder.
+✓ Branches CUT, executors NOT spawned (close = stop starting): exec-orin27-appname, exec-orin27-conreopen (→ APPPIN per R49), exec-orin27-dragstall, exec-orin27-cursorlost (unused) — all at 2f6adcc4. Briefs are in the baton.
+⚠ FATCLUST (3225b5b0) review OBJECTED: the warning guard greps dosfstools ≤4.1 wording (this host is 4.2: "Number of clusters for 32 bit FAT is less then suggested minimum") so it never fires; `2>&1 |` now discards mkfs stderr; ">/dev/null hid it" is false (stderr was never redirected); A58 says 259,520/112k clusters but the truth is 256,030/110,874; fs/fat.rs MISREADS such a volume as FAT16, it does not refuse. Fix shape: assert the cluster count off the written BPB (the queued C15). Not landed to main; hw-jetson is 6 ahead of main because of it.
+
 
 ## STATE — re-derived 2026-09-12T01:0xZ by orin 27 (local), not relayed
 ✓ origin/main 084b79ac · origin/hw-jetson 277e2cab · origin/hw-rmbp 73d9d361 · origin/hw-pi4 153c78dd
