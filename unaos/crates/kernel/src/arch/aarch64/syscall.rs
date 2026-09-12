@@ -7786,7 +7786,7 @@ fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
     // any 8.3 name — the SOLE mint path, kernel-derived from the untrusted image, never EL0-set. Two
     // byte-identical images share a principal; two different images do not. Hashed over the WHOLE file image
     // (flat or ELF) identically.
-    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(bytes));
+    slot_ppid_stamp(ttbr0 >> 48, PrincipalRecord::image_of(bytes)); #[cfg(feature = "login")] session_restamp(ttbr0 >> 48); // LOGIN M1 — with a session open the slot runs AS THE USER (`user:<name>`, the session principal `users::login` opened) instead of as its image; knob-off the statement is `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     Ok(Mapped {
         base: entry,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = initial SP_EL0
@@ -8991,7 +8991,7 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
 
 /// The longest name `sys_open` accepts: a FAT 8.3 short name is at most "NAMENAME.EXT" = 8 + '.' + 3 = 12
 /// bytes. A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
-const MAX_NAME: usize = 12;
+#[cfg(not(feature = "login"))] const MAX_NAME: usize = 12; #[cfg(feature = "login")] const MAX_NAME: usize = 40; // LOGIN M2 — SO20's first ABI step: knob-on a PATH (`HOME/UNA/NOTES.TXT`, at most 5+8+1+12 = 26) fits; knob-off the bound is the original 12, verbatim. ⚠ LINE-NEUTRAL fold.
 
 /// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
 /// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
@@ -9072,7 +9072,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // create writes only one directory sector (no cluster/FAT touched) and is still a "fallible lookup before
     // any resource claim" — its own failures (name / no-space) return cleanly.
     let mut created = false; // U6: did THIS open create a NEW name (-> the caller becomes its owner)?
-    let (de, dir_lba, dir_off) = match fs.find_located(name) {
+    #[cfg(feature = "login")] let (de, dir_lba, dir_off) = match open_locate(&fs, name, mode, &mut created) { Ok(t) => t, Err(e) => return e }; #[cfg(not(feature = "login"))] let (de, dir_lba, dir_off) = match fs.find_located(name) { // LOGIN M2 — knob-on the name may carry `/` components (a directory walk from the root, the leaf found or O_CREAT-created in its parent; a bare leaf walks exactly this statement's path); knob-off this statement is the original root-only find/create, verbatim. ⚠ LINE-NEUTRAL fold.
         Ok(t) => t,
         Err(crate::fs::fat::FatError::NotFound) => {
             if mode & O_CREAT == 0 {
@@ -9171,7 +9171,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // `native_acl_write`'s own with_unafs MOUNT hold is the serializer). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
     // the disk here, so the 23-fixture path stays byte-identical. A persist failure is non-fatal: the in-RAM
     // ACL still enforces THIS boot; only cross-reboot survival is lost (fails closed to PUBLIC at next mount).
-    if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE {
+    #[cfg(feature = "login")] if name.contains('/') { return h as i64; } if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE { // LOGIN M2 — a PATH-opened file is not persisted by name (the native rebuild key is an 8.3 ROOT name, LEDGER SO35): its owner row lives for the boot. ⚠ LINE-NEUTRAL fold.
         let _ = native_persist_create(name, de.first_cluster(), dir_lba, dir_off as u32, caller_ppid);
     }
     h as i64
@@ -16970,7 +16970,7 @@ fn principal_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usiz
             let w = hex_lower_into(&rec.value, &mut out[PFX.len()..]);
             Some(PFX.len() + w)
         }
-        _ => None, // PRIN_KERNEL_PID (reserved) / unknown -> un-projectable, fail-closed
+        _ => { #[cfg(feature = "login")] if rec.kind == PRIN_USER { return user_native_string(rec, out); } None } // PRIN_KERNEL_PID (reserved) / unknown -> un-projectable, fail-closed. LOGIN M1: the `user:<name>` kind projects verbatim (file tail). ⚠ LINE-NEUTRAL fold.
     }
 }
 
@@ -17046,7 +17046,7 @@ fn principal_from_native(s: &[u8]) -> Option<PrincipalRecord> {
         }
         return Some(PrincipalRecord { kind: PRIN_IMAGE_SHA256, len: PRIN_VALUE_LEN as u8, value });
     }
-    if s.starts_with(b"prog:") {
+    #[cfg(feature = "login")] if let Some(r) = user_from_native(s) { return Some(r); } if s.starts_with(b"prog:") { // LOGIN M1: the `user:` reverse arm, tried first (file tail). ⚠ LINE-NEUTRAL fold.
         // `program` stores the verbatim bytes (truncated to 30) with kind PROGRAM_NAME — the exact
         // inverse of `principal_native_string`'s verbatim copy for a PROGRAM_NAME principal.
         if s.len() > PRIN_VALUE_LEN {
@@ -24474,3 +24474,227 @@ fn net6_spawn_pinned(bytes: &[u8]) -> Result<(u64, u64), &'static str> {
 #[cfg(not(all(feature = "net6", feature = "virt_el0")))]
 #[inline(always)]
 fn net6_el0_witness() {}
+// =====================================================================================================
+// LOGIN M1 (`login` knob, RULINGS R51) — THE SESSION PRINCIPAL. File tail: nothing above moves.
+// =====================================================================================================
+//
+// A human user is a principal of kind `PRIN_USER`, canonical string `user:<name>` (SECURITY.md's POSIX
+// hedge, taken: a named bundle of capabilities on the SAME `owner`/`grants:*` attributes). The session is
+// ONE record, opened by `fs::users::login` after the credential verified and closed by `logout`. While it
+// is open, `map_image_into_slot`'s stamp line (the SOLE mint path) is followed by `session_restamp`, so
+// every program launched in the session carries the user principal in `SLOT_PPID` — the same slot the
+// loader stamps, read by the same `current_principal()` at SYS_OPEN, compared by the same
+// `owned_access_ok` by-name branch, persisted through the same K4 codec (`user:` arms below). There is no
+// second table and no second check: a user's file is owned by `user:<name>` exactly as a program's file is
+// owned by `sha256:<digest>`, and an open by any other principal is the existing -EACCES.
+//
+// FAIL-CLOSED ALREADY: `owned_set_owner`/`owned_grant`/`owned_access_ok` refuse only `PRIN_KERNEL_REPLY`
+// explicitly and admit every other kind by VALUE equality, so `PRIN_USER` is enforced with no change to
+// them. Programs already running when the session closes keep their stamp (a stamp is per slot, taken at
+// load; teardown clears it as before) — the session boundary is the LAUNCH, not the clock.
+
+/// LOGIN M1: the human-user principal kind — `user:<name>`. Value = the verbatim canonical string.
+#[cfg(feature = "login")]
+const PRIN_USER: u8 = 5;
+
+/// LOGIN M1: the open session's principal (NONE = no session). Written by `session_login`/`session_logout`
+/// from ordinary context; read under the IRQ-masked lock at every restamp.
+#[cfg(feature = "login")]
+static SESSION: SpinMutex<PrincipalRecord> = SpinMutex::new(PrincipalRecord::NONE);
+
+/// LOGIN M1: the `user:<name>` principal for a validated name (`fs::users::name_ok` bounds it to 24 bytes,
+/// so 5 + 24 = 29 <= the 30-byte value field; a longer name is refused, never truncated).
+#[cfg(feature = "login")]
+fn user_principal(name: &[u8]) -> Option<PrincipalRecord> {
+    if name.is_empty() || 5 + name.len() > PRIN_VALUE_LEN {
+        return None;
+    }
+    let mut value = [0u8; PRIN_VALUE_LEN];
+    value[..5].copy_from_slice(b"user:");
+    value[5..5 + name.len()].copy_from_slice(name);
+    Some(PrincipalRecord { kind: PRIN_USER, len: (5 + name.len()) as u8, value })
+}
+
+/// LOGIN M1: open the session as `name`. `_id` is the users-table id the x86 twin carries; aarch64 carries
+/// the name itself. `false` = the name does not fit a principal (no session change).
+#[cfg(feature = "login")]
+pub fn session_login(_id: u32, name: &[u8]) -> bool {
+    let Some(p) = user_principal(name) else { return false };
+    let _irq = IrqGuard::mask_save();
+    *SESSION.lock() = p;
+    true
+}
+
+/// LOGIN M1: close the session. Idempotent.
+#[cfg(feature = "login")]
+pub fn session_logout() {
+    let _irq = IrqGuard::mask_save();
+    *SESSION.lock() = PrincipalRecord::NONE;
+}
+
+/// LOGIN M1: the open session's user name into `out` (its length), `None` with no session.
+#[cfg(feature = "login")]
+pub fn session_name(out: &mut [u8]) -> Option<usize> {
+    let p = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
+    if p.kind != PRIN_USER || (p.len as usize) < 5 {
+        return None;
+    }
+    let n = p.len as usize - 5;
+    if n > out.len() {
+        return None;
+    }
+    out[..n].copy_from_slice(&p.value[5..5 + n]);
+    Some(n)
+}
+
+/// LOGIN M1: after the loader's image stamp, restamp `asid` with the session principal when a session is
+/// open. Appended on the stamp line in `map_image_into_slot`; a no-op with no session, so every fixture
+/// that runs before a login (the whole battery) is byte-for-byte the pre-LOGIN behaviour.
+#[cfg(feature = "login")]
+fn session_restamp(asid: u64) {
+    let p = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
+    if p.kind == PRIN_USER {
+        slot_ppid_stamp(asid, p);
+    }
+}
+
+/// LOGIN M1: the K4 codec's forward arm for `PRIN_USER` — the value IS the canonical string (like `prog:`).
+#[cfg(feature = "login")]
+fn user_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
+    let n = core::cmp::min(rec.len as usize, PRIN_VALUE_LEN);
+    if n > out.len() {
+        return None;
+    }
+    out[..n].copy_from_slice(&rec.value[..n]);
+    Some(n)
+}
+
+/// LOGIN M1: the K4 codec's reverse arm — `user:<name>` (bounded, verbatim) or `None`.
+#[cfg(feature = "login")]
+fn user_from_native(s: &[u8]) -> Option<PrincipalRecord> {
+    let rest = s.strip_prefix(b"user:")?;
+    user_principal(rest)
+}
+
+// =====================================================================================================
+// LOGIN M2 (`login` knob) — THE PATH OPEN and the HOME ACL PROOF. File tail: nothing above moves.
+// =====================================================================================================
+//
+// SO20 said the EL0 namespace is a flat 8.3 volume root because `sys_open` takes a LEAF. This is the ABI
+// step that ruling asked for, taken only as far as `/home/<user>` needs: knob-on, a name may carry `/`
+// components; every component but the last must resolve to a DIRECTORY (`locate_in_dir` from the root,
+// cluster 0), and the leaf is found — or with O_CREAT created — in the LEAF'S PARENT. A bare leaf walks
+// exactly the old path (`locate_in_dir(0, leaf)` IS `find_located`, `create_in_dir(0, ..)` IS
+// `create_in_root`), so every existing fixture is untouched. The file's ACL identity stays
+// `(dir_lba, dir_off)` — the slot of the entry wherever it sits — so `owned_set_owner`/`owned_access_ok`
+// are unchanged. Error mapping is the original's, plus `-ENOTDIR` for a component that is a file.
+
+/// LOGIN M2: a path component that is a file (sys_open had no directory vocabulary before this).
+#[cfg(feature = "login")]
+const ENOTDIR: i64 = -20;
+
+/// LOGIN M2: resolve `name` (a leaf or a `/`-separated path) on the EL0 FAT volume; create the leaf in
+/// its parent on O_CREAT. `Ok((entry, dir_lba, dir_off))`, `Err(errno)` in `sys_open`'s own vocabulary.
+#[cfg(feature = "login")]
+fn open_locate(
+    fs: &crate::fs::fat::FatFs,
+    name: &str,
+    mode: u64,
+    created: &mut bool,
+) -> Result<(crate::fs::fat::DirEntry, u64, usize), i64> {
+    use crate::fs::fat::FatError;
+    let mut parent: u32 = 0; // the root
+    let mut it = name.split('/').filter(|c| !c.is_empty()).peekable();
+    let mut leaf: &str = "";
+    while let Some(c) = it.next() {
+        if it.peek().is_none() {
+            leaf = c;
+            break;
+        }
+        match fs.locate_in_dir(parent, c) {
+            Ok((de, _, _)) if de.is_dir => parent = de.first_cluster(),
+            Ok(_) => return Err(ENOTDIR),
+            Err(FatError::NotFound) => return Err(ENOENT),
+            Err(FatError::Busy) => return Err(EAGAIN),
+            Err(_) => return Err(EIO),
+        }
+    }
+    if leaf.is_empty() {
+        return Err(EINVAL);
+    }
+    if leaf.eq_ignore_ascii_case(ATR_NAME) {
+        return Err(EACCES); // the kernel's own ACL store, wherever it is named (K1 M4's rule, path form)
+    }
+    match fs.locate_in_dir(parent, leaf) {
+        Ok(t) => Ok(t),
+        Err(FatError::NotFound) => {
+            if mode & O_CREAT == 0 {
+                return Err(ENOENT);
+            }
+            match fs.create_in_dir(parent, leaf, 0x20 /* ATTR_ARCHIVE — a plain file */) {
+                Ok(t) => {
+                    *created = true;
+                    Ok(t)
+                }
+                Err(FatError::Unsupported) => Err(EINVAL),
+                Err(FatError::NoSpace) => Err(ENOSPC),
+                Err(FatError::Busy) => Err(EAGAIN),
+                Err(_) => Err(EIO),
+            }
+        }
+        Err(FatError::Busy) => Err(EAGAIN),
+        Err(_) => Err(EIO),
+    }
+}
+
+/// LOGIN M2 fixture (`loginst`): the HOME ACL PROOF, kernel-side, on the real ACL tables and the real
+/// path resolver (the K3 idiom — scratch ASIDs, no EL0 blob). `path` is `HOME/<NAME>/NOTES.TXT`. With a
+/// session open: ASID 6 is restamped `user:<name>` (what a program launched in the session carries) and
+/// creates the file PRIVATE; ASID 7 is anonymous (the pre-login world) and is REFUSED; ASID 8, restamped
+/// `user:<name>` as a LATER launch (a different incarnation), is ADMITTED by name — "another app under
+/// the principal". Cleaned up: row cleared, file deleted, stamps cleared. Prints one detail line.
+#[cfg(feature = "loginst")]
+pub fn home_acl_fixture(path: &str) -> bool {
+    const A_USER: u64 = 6;
+    const A_ANON: u64 = 7;
+    const A_USER2: u64 = 8;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(e) => {
+            serial_println!("[users] home-acl: el0-fat mount refused ({:?})", e);
+            return false;
+        }
+    };
+    slot_ppid_clear(A_ANON);
+    session_restamp(A_USER);
+    session_restamp(A_USER2);
+    let p_user = slot_ppid_of(A_USER);
+    let p_anon = slot_ppid_of(A_ANON);
+    let p_user2 = slot_ppid_of(A_USER2);
+    let mut created = false;
+    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+        Ok(t) => t,
+        Err(e) => {
+            serial_println!("[users] home-acl: open_locate({}) -> errno {}", path, e);
+            slot_ppid_clear(A_USER);
+            slot_ppid_clear(A_USER2);
+            return false;
+        }
+    };
+    let g_user = ASID_GEN[A_USER as usize].load(Ordering::Acquire);
+    let g_anon = ASID_GEN[A_ANON as usize].load(Ordering::Acquire);
+    let g_user2 = ASID_GEN[A_USER2 as usize].load(Ordering::Acquire);
+    let owned = owned_set_owner(lba, off as u32, A_USER, g_user, p_user);
+    let anon_refused = !owned_access_ok(lba, off as u32, A_ANON, g_anon, CAP_READ, p_anon);
+    let owner_ok = owned_access_ok(lba, off as u32, A_USER, g_user, CAP_READ | CAP_WRITE, p_user);
+    let same_user_ok = owned_access_ok(lba, off as u32, A_USER2, g_user2, CAP_READ, p_user2);
+    owned_clear(lba, off as u32);
+    let deleted = fs.delete_located(lba, off, de.first_cluster()).is_ok();
+    slot_ppid_clear(A_USER);
+    slot_ppid_clear(A_USER2);
+    serial_println!(
+        "[users] home-acl path={} created={} owned={} anon_refused={} owner_ok={} same_user_ok={} deleted={} principal_kind={}",
+        path, created, owned, anon_refused, owner_ok, same_user_ok, deleted, p_user.kind
+    );
+    created && owned && anon_refused && owner_ok && same_user_ok && p_user.kind == PRIN_USER
+}

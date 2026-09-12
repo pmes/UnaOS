@@ -686,6 +686,29 @@ btdir = ["btc"]
 # DEFAULT OFF => `fs/holocron.rs`, `drivers/ehci/btbond.rs` and every call site vanish, and both
 # arches are byte-identical to a build without the knob. Kept in sync with arroyo.
 holocron = []
+# LOGIN (RULINGS R51, 2026-09-12: "keep working on multi-user so i can login, get a home folder and all").
+# UNAOS_LOGIN=1 arms the human-user line: `fs/users.rs` (the `USERS.DAT` record store at the root of
+# the root volume — name, salted SHA-256 credential, home path — and the `login`/`logout` session),
+# the SESSION PRINCIPAL in both `arch/*/syscall.rs` (a program launched while a session is open is
+# stamped `user:<name>` — the SAME per-slot principal the loader stamps and the SAME SYS_OPEN
+# owner/grants check enforces; no parallel identity), the `login`/`logout` shell arms, and the M1
+# fixture (`:: LOGIN: users+session … -> PASS ::`) on the storage-ready passes. Arch-neutral seam:
+# NOT stripped by `arm_features`, for the reason `holocron` is not (real aarch64 code; stripping
+# would disarm the knob, not preserve identity). DEFAULT OFF => `fs/users.rs` is not compiled, every
+# call site is a `#[cfg]`-erased statement folded onto an existing line (LINE-NEUTRAL, panic
+# `Location` untouched), and both arches are byte-identical (`./arroyo knoboff login`). Kept in sync
+# with arroyo and builder/src/main.rs. Forwards `midden_core/login` so the two host-verb rows exist
+# only knob-on (M2: the rows were the whole knob-off movement, 64 B arm / 128 B x86).
+login = ["midden_core/login"]
+# LOGIN SELFTESTS: UNAOS_LOGINST=1 arms the LOGIN fixtures — the M1 users+session proof (which CREATES a
+# user `una` with a KNOWN password in `USERS.DAT`, a BOOT-TIME WRITE of the boot medium), the M2 home
+# proof (`HOME/UNA` + a private file created and deleted) and the M3 screen proof (the login screen driven
+# by keys). Its own knob and NOT part of `login`, by the rule that gives `hcronst` a knob apart from
+# `holocron` and `prtscrst` its own: a boot that did not ask to WRITE its boot medium must be incapable
+# of doing so, and a shipping `login` boot must never carry a fixture credential (a known password on
+# the card IS a plaintext credential on disk). Implies `login`. DEFAULT OFF => the fixtures and their
+# call sites vanish.
+loginst = ["login"]
 # BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
 # `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
 # `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates

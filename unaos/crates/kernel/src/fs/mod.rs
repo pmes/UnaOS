@@ -96,3 +96,11 @@ pub fn perf_op<T>(_op: &str, _path: &str, f: impl FnOnce() -> T) -> T {
     #[cfg(not(all(feature = "fatperf", target_arch = "aarch64")))]
     f()
 }
+
+/// LOGIN M1 (`login` knob, RULINGS R51): the human-user record store (`/USERS.DAT`) and the
+/// login session — name, salted SHA-256 credential, home path; `login`/`logout`; the M1 fixture.
+/// Arch-neutral: it drives the VFS mount table + [`crate::hash`] only. DEFAULT OFF => the module
+/// and every call site vanish; both arches byte-identical. Declared at the file tail so the
+/// knob-off `fs/mod.rs` line numbering above is untouched.
+#[cfg(feature = "login")]
+pub mod users;

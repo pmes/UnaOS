@@ -304,7 +304,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // registered under) - the platform decides what the answer is, never whether the word exists.
     ("grep", Avail::Always), ("wc", Avail::Always), ("df", Avail::Always),
     ("mount", Avail::Always), ("env", Avail::Always), ("set", Avail::Always),
-    ("history", Avail::Always), ("sleep", Avail::Always), ("which", Avail::Always),
+    ("history", Avail::Always), ("sleep", Avail::Always), ("which", Avail::Always), #[cfg(feature = "login")] ("login", Avail::Always), #[cfg(feature = "login")] ("logout", Avail::Always), // LOGIN (RULINGS R51): `login <name> <password>` / `logout`, the human-user session — host verbs (only the ring holds the record store and the principal, fs/users.rs), `Avail::Always` on every platform, built only where the LOGIN line is (this crate's `login` feature, forwarded by the kernel's knob). ⚠ LINE-NEUTRAL fold: seven added lines here moved two panic::Location bytes in the knob-off image (LOGIN M2 knoboff vs hw-jetson); the rows ride this line.
 ];
 
 /// The canonical (lower-case) spelling of a typed word.
