@@ -36,6 +36,7 @@ file lists JOBS, ranked, and a ledger row that is a record rather than a job sta
 ## 2. INPUT AND USB — shared xHCI/EHCI
 · A41 / B44  keyboard report loss: SET_IDLE 0 + one outstanding interrupt-IN TRB (both arches; the N-TD fix is the real one)
 · S1 / S2  hubs fail status-change endpoint configure; hub-attached pointers print vid:pid 0000:0000
+· USB mass storage addresses LUN 0 only (no Get Max LUN), so a multi-slot card reader hides every slot but one — Peter's bench reader, 2026-09-12; executor USBLUN on hw-jetson (orin-ledger A56), the shared `drivers/xhci` fix lands for every board
 · S30  pointer path has no press-recovery accounting
 · S29  no board owns a serial RECEIVE path (Orin: SPE/TCU mailbox; x86: FTDI bulk IN never driven — the x86 half is rmbp's)
 
