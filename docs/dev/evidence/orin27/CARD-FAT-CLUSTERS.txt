@@ -1,0 +1,21 @@
+# CARD-FAT-CLUSTERS — why the Orin UEFI listed no bootable disk in the native slot (orin 27, 2026-09-12)
+# boot anchor: none — this is a parse of the staged card image, not a boot. Cited by orin-ledger A58.
+# command: python3 parse of the MBR (byte 0) and the p1 boot sector (byte 2048*512) of
+#   ~/unaos-bench/flash/orin/render13-20260912T0259Z-f4b4bf3.card.img (sha a771b546…, built by esp-jetson-img at f4b4bf3e)
+
+BEFORE (the image the UEFI refused):
+MBR sig 0xaa55
+p1: boot=0x00 type=0x0c start=2048 count=260096 (127 MiB)
+p2: boot=0x00 type=0x7f start=262144 count=1048576 (512 MiB)
+BPB jmp eb5890 oem mkfs.fat bps 512 spc 8 rsvd 32 nfats 2 rootent 0 tot16 0 media 0xf8 fatsz16 0 tot32 260064 fatsz32 256
+    fsver 0 rootclus 2 fsinfo 1 bkboot 6 drv 0x80 bootsig 0x29 volid 0xfec9726a label UNAOS-ORIN fstype FAT32 sig 0xaa55
+data sectors 259520  clusters 32440  -> FAT type by cluster count (Microsoft FAT spec, EDK2 FatDxe, fs/fat.rs:1457): FAT16
+FSInfo lead 52526141 struct 72724161 trail 000055aa ; backup boot sector identical: True
+
+Reading: the BPB is a FAT32 record (fatsz16=0, rootent=0, 4-byte FAT entries) on a volume whose cluster count
+makes it FAT16 by definition. mkfs.fat emits "WARNING: Not enough clusters for a 32 bit FAT!" and proceeds;
+make-pi-img.sh discarded the warning. Linux's vfat trusts the BPB and mounts it, so media-writer's checks,
+the harvest and the read-back all passed. EDK2 classifies by count, finds no FAT32 it can mount, creates no
+boot option. The rung-4 boot card (one FAT32 partition of 63,401,984 sectors) is FAT32 by count either way.
+
+Fix: make-pi-img.sh FATCLUST (-s 1), 3225b5b0 on hw-jetson. AFTER (appended by the rebuild):
