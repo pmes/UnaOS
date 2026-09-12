@@ -11973,6 +11973,51 @@ impl XhciController {
         self.scsi_write10(slot, lba, blocks)
     }
 
+    // ---- USBREG: the ADDRESSED storage API — one transfer, one (slot, LUN) -------------------
+    //
+    // The three calls above take their target from `self.storage_slot` and their logical unit from
+    // whatever `slots[slot].bot_lun` holds. That is correct for ONE disk and silently wrong for two:
+    // USBLUN's selection writes `bot_lun` once, at bring-up, so a read of the second card in a
+    // multi-slot reader would leave the field pointing at that card and the NEXT read of the boot
+    // card would return the wrong medium — no error, no witness, wrong bytes. The block registry is
+    // an array now (`drivers::block::USB_DISKS`), each entry keyed on exactly this pair, so every
+    // USB block entry point addresses its transfer explicitly through the three calls below and the
+    // ordering hazard has nowhere to live.
+    //
+    // `bot_lun` is SET, not saved-and-restored. It is the slot's "which unit are we addressing"
+    // field, every issuer now states its own answer before issuing, and the xHCI loan serialises the
+    // whole transaction — so a restore would only preserve a value no later reader consults. The
+    // bring-up still leaves it on the published unit, which keeps a `nousblun` build and every
+    // single-LUN device byte-identical in behaviour.
+
+    /// USBREG: pointer to `slot`'s SCSI data buffer. The addressed twin of [`Self::storage_data_ptr`].
+    pub fn storage_data_ptr_on(&self, slot: u8) -> Option<*mut u8> {
+        if slot == 0 || slot as usize >= self.slots.len() { return None; }
+        self.slots[slot as usize].scsi_data_buffer
+    }
+
+    /// USBREG: READ(10) against `slot`'s logical unit `lun`.
+    pub fn storage_read10_on(&mut self, slot: u8, lun: u8, lba: u32, blocks: u16)
+        -> Result<BotResult, BotError>
+    {
+        if slot == 0 || slot as usize >= self.slots.len() { return Err(BotError::NoDevice); }
+        self.slots[slot as usize].bot_lun = lun;
+        // BOTSEQ: see `storage_read10` — this is the same block-layer API and the same post-publish
+        // traffic, marked at issue time.
+        if self.storage_diag_pending { self.storage_postpublish_io = true; }
+        self.scsi_read10(slot, lba, blocks)
+    }
+
+    /// USBREG: WRITE(10) against `slot`'s logical unit `lun`.
+    pub fn storage_write10_on(&mut self, slot: u8, lun: u8, lba: u32, blocks: u16)
+        -> Result<BotResult, BotError>
+    {
+        if slot == 0 || slot as usize >= self.slots.len() { return Err(BotError::NoDevice); }
+        self.slots[slot as usize].bot_lun = lun;
+        if self.storage_diag_pending { self.storage_postpublish_io = true; }
+        self.scsi_write10(slot, lba, blocks)
+    }
+
     #[cfg(not(feature = "nousblun"))]
     /// USBLUN: **Get Max LUN** (USB MSC Bulk-Only Transport 1.0 §3.2) — how many logical units this
     /// BOT device has, asked of the device instead of assumed.
@@ -12216,7 +12261,15 @@ impl XhciController {
     /// above uses and for the same reason: an empty slot answers CHECK CONDITION, and the runtime
     /// sense-and-retry handler would otherwise fetch sense, swallow the verdict and retry a command
     /// whose answer is already the reading the census wants.
-    fn usblun_census(&mut self, slot_id: u8) -> (u8, u8, Option<u8>) {
+    ///
+    /// USBREG: it also returns the PRESENT SET as a bitmask (bit `n` = LUN `n` holds readable
+    /// media). Before USBREG the census's only consumer was the SELECTION — one unit out of the set —
+    /// so `first_present` was the whole answer; the block registry is an array now and the bring-up
+    /// publishes every present unit, which needs the set rather than its minimum. `bMaxLUN` is a
+    /// `u8` the DEVICE supplies and BOT 1.0 §3.2 caps the addressable range at 16 units, so a `u16`
+    /// mask covers every LUN this driver can address and a device claiming more is bounded by that
+    /// cap rather than by the mask's width.
+    fn usblun_census(&mut self, slot_id: u8) -> (u8, u8, Option<u8>, u16) {
         let max_lun = self.bot_get_max_lun(slot_id);
         self.slots[slot_id as usize].bot_max_lun = max_lun;
         let sense_was = BOT_SENSE_ACTIVE.swap(true, Ordering::Relaxed);
@@ -12227,10 +12280,19 @@ impl XhciController {
         let entry_lun = self.slots[slot_id as usize].bot_lun;
         let mut present = 0u8;
         let mut first_present: Option<u8> = None;
+        // USBREG: the present SET. Bounded at 16 units — BOT 1.0 §3.2's addressable range — so a
+        // device answering `bMaxLUN` above 15 is censused up to 15 and the ones past it are neither
+        // probed nor claimed. A cap that is reached is a bound, not a truncation nobody can see: the
+        // `census` line prints `max_lun=` verbatim beside `luns=`, so the two disagree on the wire.
+        let mut present_mask = 0u16;
         for lun in 0..=max_lun {
+            if lun >= 16 {
+                break;
+            }
             self.slots[slot_id as usize].bot_lun = lun;
             if self.usblun_probe(slot_id, lun, max_lun) {
                 present = present.saturating_add(1);
+                present_mask |= 1u16 << lun;
                 if first_present.is_none() {
                     first_present = Some(lun);
                 }
@@ -12240,7 +12302,7 @@ impl XhciController {
         self.slots[slot_id as usize].bot_lun = entry_lun;
         USBLUN_CENSUS_ACTIVE.store(census_was, Ordering::Relaxed);
         BOT_SENSE_ACTIVE.store(sense_was, Ordering::Relaxed);
-        (max_lun, present, first_present)
+        (max_lun, present, first_present, present_mask)
     }
 
     /// Full SCSI bring-up: TEST UNIT READY (with retry) -> INQUIRY -> READ CAPACITY,
@@ -12321,6 +12383,13 @@ impl XhciController {
         }
         BOT_SENSE_ACTIVE.store(false, Ordering::Relaxed);
 
+        // USBREG: the census's present SET, carried past the `nousblun` cfg block so the publish tail
+        // below reads one variable in every build. A `nousblun` image runs no census, so the mask
+        // stays 0, `publish_extra_luns` sees nothing to do, and exactly one disk publishes — the
+        // pre-USBLUN shape, unchanged by this arc as well.
+        #[allow(unused_mut, unused_assignments)]
+        let mut present_mask: u16 = 0;
+
         // USBLUN-M3 (F2) — THE WAY BACK. This is a DEFAULT-ON behaviour change in a driver both
         // arches compile, and its only runtime evidence is QEMU's single-LUN `usb-storage` on two
         // boards that are not the board it was written for. `UNAOS_NOUSBLUN=1` (cargo feature
@@ -12337,7 +12406,8 @@ impl XhciController {
             // first command against the unit it is going to PUBLISH, and which unit that is, is what
             // the census decides. On a single-LUN device this prints one line and changes nothing.
             self.storage_note = "LUN census";
-            let (max_lun, present, first_present) = self.usblun_census(slot);
+            let (max_lun, present, first_present, mask) = self.usblun_census(slot);
+            present_mask = mask;
             serial_println!(
                 ":: USBLUN: census slot={} max_lun={} luns={} present={} first_present={} ::",
                 slot, max_lun, max_lun as u16 + 1, present, LunField(first_present));
@@ -12358,8 +12428,12 @@ impl XhciController {
             let chosen = first_present.unwrap_or(0);
             self.slots[slot as usize].bot_lun = chosen;
             if present > 1 {
+                // USBREG: this line used to end "the block registry holds one USB disk" and that was
+                // the defect, stated by the driver about itself. The registry is an array now: the
+                // chosen unit is published FIRST (it takes index 0 and, with it, the global slot the
+                // boot volume rides) and the rest follow through `publish_extra_luns` below.
                 serial_println!(
-                    ":: USBLUN: {} present, publishing lun={}; the block registry holds one USB disk ::",
+                    ":: USBLUN: {} present, publishing lun={} first; the remaining units publish as their own USB disks ::",
                     present, chosen);
             }
             serial_println!(
@@ -12455,6 +12529,9 @@ impl XhciController {
         let dev_info = crate::drivers::block::BlockDeviceInfo {
             slot_id: slot, block_size, num_blocks, vendor, product,
         };
+        // USBREG: the unit this geometry belongs to. `bot_lun` is what the INQUIRY and the READ
+        // CAPACITY above were addressed at, so it is the only honest key for what they measured.
+        let published_lun = self.slots[slot as usize].bot_lun;
         // PIUSB-28: publish geometry through the backend-aware helper. It ALWAYS records the stick under
         // the dedicated USB handle (so the read-only /fs/usb mount reaches it via `read_block_usb`) and
         // raises the storage-ready edge (re-arming on every hot-plug re-enum, consumed OUTSIDE this
@@ -12462,7 +12539,16 @@ impl XhciController {
         // only when USB is the active backend: on the Pi the microSD registered at BSP probe, so a later
         // USB stick must NOT clobber the SD's geometry (PI-FS-2: a 14 MiB card reader bounded fresh unafs
         // mounts → OutOfBounds(63)); on x86 the stick is the boot backend and still claims the global.
-        crate::drivers::block::publish_usb_geometry(dev_info);
+        // USBREG: the same call, now carrying the LUN and answering with the registry INDEX it took.
+        let ix = crate::drivers::block::publish_usb_geometry_lun(dev_info, published_lun);
+        serial_println!(
+            ":: USBREG: publish slot={} lun={} ix={} block_size={} num_blocks={} disks={} ::",
+            slot, published_lun, ix, block_size, num_blocks,
+            crate::drivers::block::usb_disk_count());
+        // USBREG: every OTHER unit the census scored PRESENT becomes its own USB disk. Runs AFTER the
+        // chosen unit is published, so the chosen one holds index 0 and the global slot with it —
+        // the boot card cannot be displaced by a data card in the next slot of the same reader.
+        self.publish_extra_luns(slot, published_lun, present_mask);
         // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");
@@ -12492,6 +12578,80 @@ impl XhciController {
             BOT_RING_TRBS, BOT_RING_KNOB_TAG, BOT_CBWIOC_KNOB_TAG, BOT_ORDER_TAG, BOT_PUMP_TAG);
         space_add(SP_PUB, t_pub);
         Ok(())
+    }
+
+    /// USBREG: publish every PRESENT logical unit of `slot` except `chosen`, which the bring-up has
+    /// already published as the primary disk.
+    ///
+    /// This is the half of USBLUN that had nowhere to go. The census scored each card slot of a
+    /// multi-slot reader and the driver then published one of them, because `USB_BLOCK_DEVICE` was a
+    /// single `Option`. It is an array now, so each PRESENT unit gets its own INQUIRY, its own READ
+    /// CAPACITY, its own `xHCI: Disk` line and its own registry entry keyed `(slot, lun)`.
+    ///
+    /// ### Why re-running INQUIRY + READ CAPACITY here is not a second census
+    /// The census's probes are deliberately low-level (`usblun_probe` builds its own CDBs) because
+    /// they must be able to meet an EMPTY card slot without manufacturing bring-up evidence. These
+    /// units are not empty — the census PROVED each of them answers both commands — so the ordinary
+    /// `scsi_inquiry` / `scsi_read_capacity10` are the right calls: one decode site, the same one the
+    /// primary disk's geometry came through, so two disks from one reader cannot be measured by two
+    /// different readers of the same reply.
+    ///
+    /// `bot_geom_reject` / `bot_fold_seen` are snapshotted and restored around the loop. They are
+    /// BRING-UP evidence — `[piusb41]`'s widened port-cycle trigger reads them — and an extra unit's
+    /// reply must neither manufacture that signature nor erase one the primary's bring-up left.
+    ///
+    /// A unit that fails here is NAMED and SKIPPED: one bad card in slot 3 of a reader is not a
+    /// reason to fail a boot whose root is the card in slot 1. The loop always restores `bot_lun` to
+    /// `chosen`, so the slot is left addressing the primary disk exactly as the bring-up left it.
+    fn publish_extra_luns(&mut self, slot: u8, chosen: u8, present_mask: u16) {
+        if present_mask & !(1u16 << chosen) == 0 {
+            return;
+        }
+        let geom_was = self.bot_geom_reject;
+        let fold_was = self.bot_fold_seen;
+        for lun in 0u8..16 {
+            if lun == chosen || present_mask & (1u16 << lun) == 0 {
+                continue;
+            }
+            self.slots[slot as usize].bot_lun = lun;
+            let (vendor, product) = match self.scsi_inquiry(slot) {
+                Ok(v) => v,
+                Err(e) => {
+                    serial_println!(
+                        ":: USBREG: extra lun={} slot={} stage=inquiry err={:?} — NOT published; the \
+                         disks already registered are untouched ::", lun, slot, e);
+                    continue;
+                }
+            };
+            let (block_size, last_lba) = match self.scsi_read_capacity10(slot) {
+                Ok(v) => v,
+                Err(e) => {
+                    serial_println!(
+                        ":: USBREG: extra lun={} slot={} stage=read-capacity err={:?} — NOT published ::",
+                        lun, slot, e);
+                    continue;
+                }
+            };
+            let num_blocks = last_lba as u64 + 1;
+            let vendor_s = core::str::from_utf8(&vendor).unwrap_or("?").trim_end();
+            let product_s = core::str::from_utf8(&product).unwrap_or("?").trim_end();
+            // The SAME line shape the primary disk prints, so a reader counting `xHCI: Disk` lines
+            // counts DISKS. A two-card reader is two of them; that is the wire shape this arc owes.
+            serial_println!("xHCI: Disk '{}' '{}' block_size={} num_blocks={} ({} MiB)",
+                vendor_s, product_s, block_size, num_blocks,
+                (num_blocks * block_size as u64) / (1024 * 1024));
+            let dev_info = crate::drivers::block::BlockDeviceInfo {
+                slot_id: slot, block_size, num_blocks, vendor, product,
+            };
+            let ix = crate::drivers::block::publish_usb_geometry_lun(dev_info, lun);
+            serial_println!(
+                ":: USBREG: publish slot={} lun={} ix={} block_size={} num_blocks={} disks={} ::",
+                slot, lun, ix, block_size, num_blocks,
+                crate::drivers::block::usb_disk_count());
+        }
+        self.slots[slot as usize].bot_lun = chosen;
+        self.bot_geom_reject = geom_was;
+        self.bot_fold_seen = fold_was;
     }
 
     /// SPACE: print the one-line split of the storage bring-up. Called on BOTH exits of
@@ -12791,7 +12951,10 @@ impl XhciController {
                             // (244250 MiB) under a "storage enumerated" label on P57, two lines below
                             // the true READ CAPACITY of 29120 blocks (14 MiB) — the mix-up that sent
                             // the write self-test off the end of the reader.
-                            let (bs, nb, mib) = match crate::drivers::block::USB_BLOCK_DEVICE.lock().as_ref() {
+                            // USBREG: the single-slot static is retired; `usb_info()` is registry
+                            // entry 0, which is the disk this bring-up just published on a
+                            // one-disk machine — the same record this line read before.
+                            let (bs, nb, mib) = match crate::drivers::block::usb_info().as_ref() {
                                 Some(d) => (d.block_size, d.num_blocks,
                                             (d.num_blocks.saturating_mul(d.block_size as u64)) / (1024 * 1024)),
                                 None => (0, 0, 0),

@@ -1354,14 +1354,99 @@ without the code (the `rastmc` failure); `check`'s KNOB→BUILDER WIRING CHECK e
 feature a literal `x86-*` leg names. The armed polarity is type-checked by the `x86-nousblun` leg of
 `KERNEL_CFG_MATRIX`; every other leg covers the census-on default.
 
-**One disk, by design, for now.** If more than one LUN is PRESENT the driver says so
-(`:: USBLUN: <k> present, publishing lun=<n>; the block registry holds one USB disk ::`) and
-publishes the first. It does not publish the second: `drivers/block.rs` holds ONE USB device
-(`USB_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>>`, plus the global `BLOCK_DEVICE` handle), and
-`fs/bootdisk.rs` walks that registry to name volumes under `/volumes/`, so a second simultaneous USB
-disk is a registry design change rather than a driver change. `BlockDeviceInfo` needs no `lun` field
-for any of this — the LUN is driver state on the slot, and the block layer reaches the device
-through `storage_read10` / `storage_write10`, which use that same slot.
+**One disk, by design, for now.** ⚠ **SUPERSEDED by §5k.** USBLUN published the first PRESENT LUN and
+named the rest on the wire without publishing them, because `drivers/block.rs` held ONE USB device
+(`USB_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>>`). This section said so, and said `BlockDeviceInfo`
+needed no `lun` field because "the LUN is driver state on the slot". Both statements were true of a
+one-disk registry and are retired by USBREG below; the paragraph is kept, marked, so a capture from
+before that arc can still be read against the driver that produced it.
+
+---
+
+### 5k. USBREG — the block registry is an ARRAY, keyed on (xHCI slot, LUN)
+
+USBLUN could SEE every card in a reader and could publish exactly one of them. The reason was one
+line of `drivers/block.rs`: `USB_BLOCK_DEVICE` was a `Mutex<Option<BlockDeviceInfo>>`, one slot, and
+`publish_usb_geometry` overwrote it. The global `BLOCK_DEVICE` handle was worse than that — it was
+claimed UNCONDITIONALLY by every publish, so with two mass-storage devices the LAST one to configure
+owned the boot volume. Peter's bench rule for this was "one reader per boot; a coin flip otherwise"
+(trunk `QUEUE.md` §2).
+
+**The registry.** `USB_DISKS: Mutex<[Option<UsbDisk>; MAX_USB_DISKS]>` — four entries, each an
+`UsbDisk { info: BlockDeviceInfo, lun: u8 }`. The key is the pair the ENUMERATOR supplies, the xHCI
+slot id and the logical unit; never the content, because two cards imaged off each other carry the
+same `BS_VolID` and the same size, which is the defect orin-ledger A48 / rmbp-ledger B98 records.
+`publish_usb_geometry_lun(dev, lun)` replaces the entry holding that key, or takes the lowest free
+index, and answers with the index it used; `publish_usb_geometry(dev)` is that call with `lun = 0`,
+so every non-LUN publisher and every `nousblun` build is unchanged. `unpublish_usb_geometry(slot,
+gen)` clears EVERY entry whose slot matches — a disconnect takes all of a device's units with it —
+and keeps the PA35 publish-generation guard exactly as it was.
+
+**Indices are addresses, so the array is never compacted.** Index `n` is what
+`fs::fat::BlockSource::UsbN(n)` names, so shuffling live disks down to fill a hole would re-point a
+mounted volume at a different card. A retraction leaves a hole and the next publish fills the lowest
+free index. Entry 0 is the PRIMARY disk and keeps every meaning it had: `block::usb_info()`,
+`read_block_usb`, `BlockHandle::Usb`, `BlockSource::Usb`, `/fs/usb`, the installer's USB row and the
+capture ladder's rung 2 all resolve to it, so a one-disk machine — every x86 bench, every Pi bench,
+every QEMU leg — behaves exactly as it did before this arc.
+
+**The global slot is the primary's, and only the primary's.** `publish_usb_geometry_lun` claims
+`BLOCK_DEVICE` only when the disk took index 0. On a one-disk machine that is the same device
+claiming it by the same call in the same order; on a two-card reader the data card can no longer take
+the boot card's global handle. The Pi's rule is untouched: the `baremetal` arm still declines the
+global whenever `register_sd` has flipped the backend selector.
+
+**Addressed transfers.** `storage_read10` / `storage_write10` took their LUN from whatever
+`slots[slot].bot_lun` held, which the bring-up wrote once. With two disks that is a silent mis-route:
+a read of the second card leaves the field pointing at it and the next read of the boot card returns
+the wrong medium, with no error and no witness. `storage_read10_on(slot, lun, …)` and
+`storage_write10_on` state the target per transfer, `storage_data_ptr_on(slot)` goes with them, and
+every USB block entry point in `drivers/block.rs` funnels through the `_ix` forms that read the target
+out of the registry entry. `read_block_usb(lba, buf)` is `read_block_usb_ix(0, lba, buf)`.
+
+**Publishing the rest.** `usblun_census` now also returns the PRESENT SET as a bitmask (bounded at
+16 units, BOT 1.0 §3.2's addressable range). After the chosen unit publishes — first, so it holds
+index 0 and the global with it — `publish_extra_luns` walks the remaining present units, runs the
+ordinary `scsi_inquiry` + `scsi_read_capacity10` against each, prints the SAME `xHCI: Disk` line the
+primary prints, and publishes it under its own `(slot, lun)`. A unit that fails there is named and
+skipped: one bad card in slot 3 is not a reason to fail a boot whose root is the card in slot 1.
+`bot_geom_reject` / `bot_fold_seen` are snapshotted and restored around the loop, because they are
+BRING-UP evidence that `[piusb41]`'s port-cycle trigger reads and an extra card's reply must neither
+manufacture that signature nor erase one.
+
+**The walk, and the dedupe that had to grow.** `fs::fat::live_sources()` is `ALL_SOURCES` with the USB
+rung expanded over the registry's occupied entries, in the same order; `fs::bootdisk`'s walk and
+`fat::locate_boot_volume` both iterate it, so a machine that grows a disk gains it in both places or
+in neither. `fat::same_device` is unchanged and is still the ONE predicate for "are these two registry
+records the same physical device" — but it compares `(slot_id, num_blocks)`, and two cards in ONE
+reader share a slot id and can share a size, so on same-size cards it answers TRUE. `bootdisk::admit`
+therefore asks it only of pairs that `units_agree` admits: two DIFFERENT registry entries are two
+devices by the registry's own key, whatever their content says. `None` on either side (the Pi's
+microSD in the global, an `Sdhc` card) proves nothing and falls through to `same_device` alone, so
+`aliased=usb->global` on x86/tegra and the `slot_id != 0` refusal on the Pi are both unchanged.
+
+**The wire, with two cards in one reader.** Two `xHCI: Disk` lines, one per card, each with its own
+geometry; a `:: USBREG: publish slot=<s> lun=<n> ix=<i> … disks=<k> ::` beside each; the `[vfs] root`
+line's `disks=` census carrying `usb=present usb1=present`; and two `[vfs] volume mounted /volumes/…`
+lines with distinct points taken from the two cards' own labels.
+
+**What is still open.** ONE READER, not two. `drivers/xhci/mod.rs` keeps a single `storage_slot` and a
+hub-attached second mass-storage device is still refused with `xHCI: storage slot N already active;
+ignoring the hubbed device`. The registry is keyed on `(slot, lun)` and holds devices from different
+slots perfectly well, so the remaining work is per-slot bring-up state in the driver, not in the block
+layer. And `BlockHandle` still has no index — `handle_of(UsbN(_))` is `BlockHandle::Usb` — because
+that enum is matched exhaustively in `fs/unafs.rs`, `install/mod.rs` and `wifi/firmware.rs`. That is a
+REPORTING limit (a `UsbN` volume's `PartitionRange` and `mbr_census` line are attributed to the USB
+handle without the index), never a routing one: every sector of a `UsbN(n)` volume is read and written
+through `fs/fat.rs`'s dispatch, which carries the index into `block::read_block_usb_ix(n, …)`.
+
+**Executed, not reasoned about.** No machine in this fleet can present a multi-LUN reader — QEMU's
+`usb-storage` is single-LUN on both arches — so the two-disk path is driven at the real
+`admit`/`plan` call by `homesoil_selftest` leg 7, with two synthetic disks made deliberately
+INDISTINGUISHABLE by content AND by slot, which is the case where `same_device` answers TRUE. The leg
+carries its own controls: the same setup with EQUAL units must still merge to one disk, `units_agree`
+is asked directly in both directions, and `same_device` is asserted TRUE for the pair so a leg that
+passed because the predicate broke would fail instead.
 
 ---
 

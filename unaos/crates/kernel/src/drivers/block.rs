@@ -2,8 +2,10 @@
 // Copyright (C) 2026 The Architect & Una
 //
 // Minimal block-device abstraction over the USB Mass Storage (xHCI BOT) driver.
-// A single device is supported (the QEMU usb-storage target); geometry is published
-// here after SCSI bring-up, and read/write are serviced by locking the xHCI controller.
+// USBREG (SO33): the USB side is a REGISTRY ARRAY keyed on (xHCI slot, LUN) — see the USBREG section
+// below — so a multi-slot card reader publishes one disk per card instead of one disk per reader.
+// Geometry is published here after SCSI bring-up, and read/write are serviced by locking the xHCI
+// controller.
 
 use spin::Mutex;
 use crate::drivers::xhci::{self, CswStatus, XhciClaimError, XhciLoan};
@@ -142,15 +144,93 @@ pub fn info() -> Option<BlockDeviceInfo> {
     *BLOCK_DEVICE.lock()
 }
 
-/// PIUSB-27: geometry of the USB mass-storage stick, published by the xHCI storage bring-up ALONGSIDE
-/// `BLOCK_DEVICE`. Kept separate so it survives `register_sd` flipping the global device to the microSD:
-/// on the Pi the SD backend owns `BLOCK_DEVICE`, but the USB stick's geometry stays available here so it
-/// can be mounted read-only through [`read_block_usb`]. `None` until a USB stick enumerates.
-pub static USB_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+// ===================== USBREG (SO33) — the USB block registry is an ARRAY =====================
+//
+// PIUSB-27 gave the USB mass-storage path ONE slot, `USB_BLOCK_DEVICE`, and that slot is what this
+// section replaces. The defect it carried is not subtle and it was measured on Peter's bench
+// (orin-ledger A56, trunk QUEUE §2): a multi-slot card reader is ONE BOT device whose card slots are
+// LOGICAL UNITS, USBLUN taught the driver to census every LUN — and then the bring-up published
+// exactly one of them, because there was exactly one place to put it. A second card in the same
+// reader was NAMED on the wire (`USBLUN: 2 present, publishing lun=0`) and then dropped: no
+// geometry, no `/volumes/` point, invisible to `fs::bootdisk`'s walk.
+//
+// ### The key is (xHCI slot, LUN), and it comes from the ENUMERATOR
+//
+// Each entry is keyed on the pair the enumerator hands us — the xHCI slot id the device addressed on,
+// and the logical unit inside it. Never on bytes: two cards imaged off each other carry the same
+// `BS_VolID` and the same size, and rmbp-ledger B98 records what content-keyed identity costs (a real
+// card merged into its clone and hidden from `/volumes`). A publish for a key already held REPLACES
+// that entry; a publish for a new key takes the LOWEST FREE index; a retraction clears every entry
+// whose SLOT matches the torn-down slot, because a disconnect takes all of a device's units with it.
+//
+// ### Indices are STABLE, and holes are honest
+//
+// The index is what [`crate::fs::fat::BlockSource::UsbN`] names, so it is an ADDRESS: compacting the
+// array on a retraction would silently re-point a mounted volume at a different card, which is the
+// mis-route this arc exists to stop. A retraction therefore leaves a HOLE, and the next publish fills
+// the lowest free index. Entry 0 is the PRIMARY disk: it is what [`usb_info`], [`read_block_usb`],
+// [`BlockHandle::Usb`] and `BlockSource::Usb` have always meant and still mean, so every consumer that
+// never learned about the array keeps its exact pre-USBREG behaviour on the one-disk machine that is
+// every x86 bench, every Pi bench and every QEMU leg.
+//
+// ### Why the global slot is no longer a coin flip
+//
+// `publish_usb_geometry` used to claim [`BLOCK_DEVICE`] unconditionally on every non-baremetal target,
+// so with two mass-storage disks the LAST one to configure won the boot volume. The global is now
+// claimed only by the disk that took INDEX 0 — the first USB disk published since the slot was last
+// empty. On a one-disk machine that is the same device claiming it by the same call in the same order:
+// byte-identical behaviour. On a two-card reader the second card can no longer take the boot disk's
+// global handle away from it.
+pub const MAX_USB_DISKS: usize = 4;
 
-/// PIUSB-27: snapshot of the USB stick geometry, if one enumerated.
+/// USBREG: one USB disk in the registry — its geometry plus the LOGICAL UNIT it lives on.
+///
+/// The LUN is registry state, not a field of [`BlockDeviceInfo`], and that is deliberate: a
+/// `BlockDeviceInfo` is a GEOMETRY record that four unrelated backends construct (the Pi's microSD,
+/// the rMBP's internal reader, the Orin's card, the stick), and only one of them has logical units.
+/// Keeping the LUN here means the one publisher that has it carries it, and the block entry points
+/// read it back out of the registry when they address the device — which is also what makes
+/// `(slot, lun)` the key rather than something every caller must remember and re-supply.
+#[derive(Clone, Copy)]
+pub struct UsbDisk {
+    pub info: BlockDeviceInfo,
+    pub lun: u8,
+}
+
+/// USBREG: the USB block registry. `MAX_USB_DISKS` entries, index-addressed, holes permitted.
+pub static USB_DISKS: Mutex<[Option<UsbDisk>; MAX_USB_DISKS]> = Mutex::new([None; MAX_USB_DISKS]);
+
+/// USBREG: the registry entry at `ix`, if any.
+pub fn usb_disk(ix: usize) -> Option<UsbDisk> {
+    if ix >= MAX_USB_DISKS {
+        return None;
+    }
+    USB_DISKS.lock()[ix]
+}
+
+/// USBREG: geometry of the USB disk at `ix` — the indexed form of [`usb_info`].
+pub fn usb_info_ix(ix: usize) -> Option<BlockDeviceInfo> {
+    usb_disk(ix).map(|d| d.info)
+}
+
+/// USBREG: how many registry entries hold a disk. Counts OCCUPANCY, not the highest index — a hole
+/// left by a retraction is not a disk, and a census that said otherwise would count addresses.
+pub fn usb_disk_count() -> usize {
+    USB_DISKS.lock().iter().filter(|e| e.is_some()).count()
+}
+
+/// USBREG: is `ix` a live registry entry? The predicate `fs::fat::live_sources` walks.
+pub fn usb_disk_present(ix: usize) -> bool {
+    usb_disk(ix).is_some()
+}
+
+/// PIUSB-27 / USBREG: snapshot of the PRIMARY USB disk's geometry — registry entry 0.
+///
+/// Unchanged in meaning from the single-slot `USB_BLOCK_DEVICE` it replaces: on every machine with one
+/// USB disk, entry 0 IS that disk and every pre-USBREG caller reads exactly what it read before. A
+/// machine with a second card reaches it through [`usb_info_ix`].
 pub fn usb_info() -> Option<BlockDeviceInfo> {
-    *USB_BLOCK_DEVICE.lock()
+    usb_info_ix(0)
 }
 
 // ===================== APPLOAD — "is there storage I can load a PROGRAM from?" =====================
@@ -514,14 +594,14 @@ pub fn source_census() -> SourceCensus {
 /// INSTALL-SEL: which of the two registry handles a device row was read from. The block layer keeps
 /// two `Option<BlockDeviceInfo>` slots — the GLOBAL [`BLOCK_DEVICE`] (whatever the active backend is:
 /// the xHCI stick on x86, the microSD once `register_sd` has run on the Pi) and the dedicated USB
-/// handle [`USB_BLOCK_DEVICE`] — and the graphical installer's chooser can show BOTH as separate rows
+/// handle [`USB_DISKS`] — and the graphical installer's chooser can show BOTH as separate rows
 /// when they name different devices. "Row 1" is therefore not a property of the device; it is a
 /// property of one frame's list. Naming the handle makes the row's identity independent of the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockHandle {
     /// The global [`BLOCK_DEVICE`] entry — read/written through [`read_block`] / [`write_block`].
     Global,
-    /// The dedicated [`USB_BLOCK_DEVICE`] entry — read/written through [`read_block_usb`] /
+    /// The dedicated [`USB_DISKS`] entry — read/written through [`read_block_usb`] /
     /// [`write_block_usb`], which bypass the backend selector.
     Usb,
     /// SDHC-4b (x86, `sdhcblk` knob): the dedicated [`SDHC_BLOCK_DEVICE`] entry — the card in the
@@ -585,6 +665,19 @@ impl BlockDeviceInfo {
 /// as from the engine's bind. Both callers going through this one function is what makes the erase
 /// warning on glass and the device the engine actually binds provably the same device.
 pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
+    // USBREG: the USB handle is now an ARRAY, so resolving an identity against it means asking every
+    // live entry rather than only entry 0. This is strictly more truthful than what it replaces: an
+    // identity captured while a second card was the chooser's row used to resolve to `None` (entry 0
+    // is a different disk) and the installer would refuse a target that is in fact still present.
+    // The match clauses below are unchanged, so a resolution that succeeded before still succeeds.
+    if id.handle == BlockHandle::Usb {
+        let reg = *USB_DISKS.lock();
+        return reg
+            .iter()
+            .flatten()
+            .map(|d| d.info)
+            .find(|d| d.slot_id == id.slot_id && d.num_blocks == id.num_blocks);
+    }
     let cur = match id.handle {
         BlockHandle::Global => info(),
         BlockHandle::Usb => usb_info(),
@@ -619,23 +712,37 @@ pub fn take_usb_ready() -> bool {
 /// PIUSB-27: read one block (`lba`) from the USB mass-storage stick DIRECTLY through the xHCI controller,
 /// bypassing the backend selector — so the stick is readable even when the global block device is the
 /// microSD (BACKEND_SD on the Pi). Strictly read-only. Geometry (block size, bound) comes from
-/// [`USB_BLOCK_DEVICE`]; the transfer is the same xHCI BOT READ(10) the default path has always used, and
+/// [`USB_DISKS`]; the transfer is the same xHCI BOT READ(10) the default path has always used, and
 /// it takes only the xHCI controller lock (the SD/emmc2 path is untouched). Returns bytes copied.
 pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
-    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    read_block_usb_ix(0, lba, buf)
+}
+
+/// USBREG: read one block from the USB disk at registry index `ix`.
+///
+/// Every USB read in this file funnels through here, [`read_block_usb`] included, and that is the
+/// point: the transfer is addressed at the entry's OWN `(slot_id, lun)` rather than at whichever LUN
+/// the driver's per-slot `bot_lun` field happens to hold. Before USBREG that field was written once
+/// by the bring-up and read by every later transfer, which is sound for one disk and a silent
+/// mis-route for two — a read of disk 1 would leave `bot_lun` pointing at disk 1's card and the next
+/// read of disk 0 would return disk 1's sectors, with no error anywhere. Addressing per call removes
+/// the ordering hazard instead of documenting it.
+pub fn read_block_usb_ix(ix: usize, lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let disk = usb_disk(ix).ok_or(BlockError::NotReady)?;
+    let dev = disk.info;
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
     // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
     let mut xhci = claim_xhci_for_io()?;
-    match xhci.storage_read10(lba as u32, 1) {
+    match xhci.storage_read10_on(dev.slot_id, disk.lun, lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
             io_cause_witness("read-usb", lba, other);
             return Err(BlockError::Io);
         }
     }
-    let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    let src = xhci.storage_data_ptr_on(dev.slot_id).ok_or(BlockError::Io)?;
     let n = (dev.block_size as usize).min(buf.len());
     unsafe {
         core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
@@ -646,26 +753,33 @@ pub fn read_block_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 /// USB-WRITE: write one block (`lba`) to the USB mass-storage stick DIRECTLY through the xHCI
 /// controller — the write twin of [`read_block_usb`]. Bypasses the backend selector, so the stick
 /// is writable even when the global block device is the microSD (BACKEND_SD on the Pi). Geometry
-/// (block size, bound) comes from [`USB_BLOCK_DEVICE`]; the transfer is the same xHCI BOT WRITE(10)
+/// (block size, bound) comes from [`USB_DISKS`]; the transfer is the same xHCI BOT WRITE(10)
 /// the default path uses, taking only the xHCI controller lock (the SD/emmc2 path is untouched).
 /// The caller's `buf` is staged (zero-padded to the block size) into the controller's DMA buffer,
 /// then WRITE(10) is issued; a non-`Passed` CSW propagates as [`BlockError::Io`] — the write NEVER
 /// reports a false success. This is the block-layer half of a writable `/usb`: the FAT layer's
 /// `write_sector` routes its `Usb` source here in place of the PIUSB-27 read-only refusal.
 pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    write_block_usb_ix(0, lba, buf)
+}
+
+/// USBREG: write one block to the USB disk at registry index `ix`. The write twin of
+/// [`read_block_usb_ix`], addressed at the entry's own `(slot_id, lun)` for the same reason.
+pub fn write_block_usb_ix(ix: usize, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let disk = usb_disk(ix).ok_or(BlockError::NotReady)?;
+    let dev = disk.info;
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
     // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
     let mut xhci = claim_xhci_for_io()?;
-    let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    let dst = xhci.storage_data_ptr_on(dev.slot_id).ok_or(BlockError::Io)?;
     let n = (dev.block_size as usize).min(buf.len());
     unsafe {
         core::ptr::write_bytes(dst, 0, dev.block_size as usize);
         core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
     }
-    match xhci.storage_write10(lba as u32, 1) {
+    match xhci.storage_write10_on(dev.slot_id, disk.lun, lba as u32, 1) {
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
         other => {
             io_cause_witness("write-usb", lba, other);
@@ -675,7 +789,7 @@ pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 }
 
 /// PIUSB-28: publish the geometry of a freshly enumerated USB mass-storage device. Always records it
-/// under the dedicated [`USB_BLOCK_DEVICE`] handle (so `read_block_usb`/`/fs/usb` can reach the stick),
+/// under the dedicated [`USB_DISKS`] handle (so `read_block_usb`/`/fs/usb` can reach the stick),
 /// then raises the storage-ready edge. The global [`BLOCK_DEVICE`] is only claimed when USB is the ACTIVE
 /// backend — i.e. no SD card has flipped the selector to `BACKEND_SD`. On the Pi the microSD registers at
 /// BSP probe (long before xHCI enum), so a later-enumerated USB stick must NOT overwrite the SD geometry:
@@ -685,14 +799,27 @@ pub fn write_block_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 /// the pre-PIUSB-28 behavior there. Must run OUTSIDE the xHCI controller lock's storage callers as before.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
-    *USB_BLOCK_DEVICE.lock() = Some(dev);
+    publish_usb_geometry_lun(dev, 0);
+}
+
+/// USBREG: the LUN-carrying form. `publish_usb_geometry` is this call with `lun = 0`, which is what
+/// every non-LUN publisher means and what a `nousblun` build always means.
+///
+/// Returns the registry INDEX the disk landed on — the xHCI bring-up prints it, and the caller needs
+/// it to know whether this disk is the primary (index 0) or one of the extra cards.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+pub fn publish_usb_geometry_lun(dev: BlockDeviceInfo, lun: u8) -> usize {
+    let ix = registry_place(dev, lun);
     // Claim the global only while USB is still the active backend; once the SD has registered, leave
-    // BLOCK_DEVICE (the SD's geometry) untouched — the stick stays reachable via USB_BLOCK_DEVICE.
-    if BACKEND.load(Ordering::Acquire) != BACKEND_SD {
+    // BLOCK_DEVICE (the SD's geometry) untouched — the stick stays reachable through the registry.
+    // USBREG: and only for the PRIMARY disk (index 0). A second card in the same reader is a disk,
+    // not a candidate for the global slot.
+    if ix == 0 && BACKEND.load(Ordering::Acquire) != BACKEND_SD {
         *BLOCK_DEVICE.lock() = Some(dev);
     }
     USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // PA35 race: every publish is a new generation
     set_usb_ready();
+    ix
 }
 
 /// PIUSB-28: x86 / non-SD-capable targets — the USB stick is the default (boot) block backend, so it
@@ -703,19 +830,68 @@ pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
 /// re-derives it against whatever now occupies the slot. See [`BOOT_MEDIUM_VERDICT`].
 #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
 pub fn publish_usb_geometry(dev: BlockDeviceInfo) {
-    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-    BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
-    *BLOCK_DEVICE.lock() = Some(dev);
-    *USB_BLOCK_DEVICE.lock() = Some(dev);
+    publish_usb_geometry_lun(dev, 0);
+}
+
+/// USBREG: the LUN-carrying form — see the `baremetal` twin above. Returns the registry index.
+#[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+pub fn publish_usb_geometry_lun(dev: BlockDeviceInfo, lun: u8) -> usize {
+    let ix = registry_place(dev, lun);
+    // USBREG: the global is the PRIMARY disk's, and only the primary's. Before this, every publish
+    // claimed it, so the last mass-storage unit to configure owned the boot volume — the coin flip
+    // trunk QUEUE §2 records. Index 0 is the first disk published since the slot was last empty, so
+    // on a one-disk machine this is the same claim by the same call in the same order.
+    if ix == 0 {
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        BOOT_MEDIUM_VERDICT.store(BM_UNKNOWN, core::sync::atomic::Ordering::Release);
+        *BLOCK_DEVICE.lock() = Some(dev);
+    }
     USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // PA35 race: every publish is a new generation
     set_usb_ready();
+    ix
+}
+
+/// USBREG: put `dev` in the registry under the key `(dev.slot_id, lun)` and return its index.
+///
+/// Three cases, in order, and the order is the whole rule:
+///  1. **the key is already held** — REPLACE it in place. A re-enumeration of the same unit must not
+///     consume a second address, and a mounted volume that named this index keeps naming the same
+///     card. This is also what a `publish` after a failed-and-retried bring-up does.
+///  2. **a free index exists** — take the LOWEST one, so a machine that has retracted everything
+///     refills index 0 and the primary-disk meaning of entry 0 is restored.
+///  3. **full** — refuse, loudly, and answer `MAX_USB_DISKS` (which no `usb_disk` call resolves). A
+///     registry that silently evicted a live disk to make room would be the single-slot defect again
+///     with more steps.
+fn registry_place(dev: BlockDeviceInfo, lun: u8) -> usize {
+    let mut reg = USB_DISKS.lock();
+    for (i, e) in reg.iter_mut().enumerate() {
+        if let Some(cur) = e {
+            if cur.info.slot_id == dev.slot_id && cur.lun == lun {
+                *e = Some(UsbDisk { info: dev, lun });
+                return i;
+            }
+        }
+    }
+    for (i, e) in reg.iter_mut().enumerate() {
+        if e.is_none() {
+            *e = Some(UsbDisk { info: dev, lun });
+            return i;
+        }
+    }
+    drop(reg);
+    serial_println!(
+        ":: BLK: usb registry FULL ({} disks) — slot={} lun={} not published; the disks already \
+         registered are untouched ::",
+        MAX_USB_DISKS, dev.slot_id, lun
+    );
+    MAX_USB_DISKS
 }
 
 /// USB-UNPLUG: retract the geometry a USB mass-storage device published, when its xHCI slot is torn
 /// down on a physical disconnect. This is the missing half of [`publish_usb_geometry`]: before it, the
 /// xHCI layer handled removal correctly at ITS level (slot bindings cleared, DISABLE_SLOT queued —
 /// the metal wire shows `[Port 1] slot 1 torn down on disconnect` / `DISABLE_SLOT slot 1 -> code 1`)
-/// but nothing downstream ever heard about it, so `BLOCK_DEVICE` / `USB_BLOCK_DEVICE` kept a dead
+/// but nothing downstream ever heard about it, so `BLOCK_DEVICE` / the USB registry kept a dead
 /// device forever. Every consumer that re-reads the registry each pass — the graphical installer's
 /// per-frame disk list (`video::instgui::devices`), the shell's `df`, the FAT mounts — therefore went
 /// on offering an unplugged disk as a live install target, and a replug (which lands on a NEW slot
@@ -785,11 +961,22 @@ pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
     // block layer. Clearing is guarded per handle by its own slot match, because on the Pi the global
     // may legitimately be the microSD while the USB handle is the stick, and only the latter must go.
     let mut departing: Option<BlockDeviceInfo> = None;
+    // USBREG: a disconnect takes EVERY logical unit of the device with it, so the retraction clears
+    // every registry entry whose SLOT matches — the same `(slot, lun)` key the publish used, asked
+    // with the lun wild. Indices are NOT compacted: an index is the address
+    // `fs::fat::BlockSource::UsbN` names, and shuffling live disks down to fill a hole would
+    // re-point a mounted volume at a different card, which is the mis-route this arc removes.
+    let mut units = 0u8;
     {
-        let mut usb = USB_BLOCK_DEVICE.lock();
-        if (*usb).map(|d| d.slot_id) == Some(slot_id) {
-            departing = *usb;
-            *usb = None;
+        let mut reg = USB_DISKS.lock();
+        for e in reg.iter_mut() {
+            if (*e).map(|d| d.info.slot_id) == Some(slot_id) {
+                if departing.is_none() {
+                    departing = (*e).map(|d| d.info);
+                }
+                units = units.saturating_add(1);
+                *e = None;
+            }
         }
     }
     {
@@ -813,8 +1000,8 @@ pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
     let product = core::str::from_utf8(&dev.product).unwrap_or("?").trim_end();
     let vendor = core::str::from_utf8(&dev.vendor).unwrap_or("?").trim_end();
     serial_println!(
-        ":: BLK: removed '{}' '{}' (xhci slot {} disconnect) ::",
-        vendor, product, slot_id
+        ":: BLK: removed '{}' '{}' (xhci slot {} disconnect) units={} remaining={} ::",
+        vendor, product, slot_id, units, usb_disk_count()
     );
     true
 }
@@ -1374,21 +1561,27 @@ pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 /// controller, bypassing the backend selector, so a `Usb`-sourced FAT mount coalesces on the Pi too
 /// (where the global block device is the microSD). Strictly read-only, as that path has always been.
 pub fn read_blocks_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
-    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    read_blocks_usb_ix(0, lba, buf)
+}
+
+/// USBREG: the counted read, addressed at registry entry `ix`'s own `(slot_id, lun)`.
+pub fn read_blocks_usb_ix(ix: usize, lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let disk = usb_disk(ix).ok_or(BlockError::NotReady)?;
+    let dev = disk.info;
     let count = span_blocks(&dev, lba, buf.len())?;
     // WEDGE-8: claim the controller as a LOAN — no lock is held across the BOT transaction below.
     // `claim_xhci_for_io` returns `Busy` immediately to a masked caller (a masked wait on a driver
     // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
     let mut loan = claim_xhci_for_io()?;
     let xhci = &mut *loan;
-    match xhci.storage_read10(lba as u32, count as u16) {
+    match xhci.storage_read10_on(dev.slot_id, disk.lun, lba as u32, count as u16) {
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
             io_cause_witness("read-usb", lba, other);
             return Err(BlockError::Io);
         }
     }
-    let src = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    let src = xhci.storage_data_ptr_on(dev.slot_id).ok_or(BlockError::Io)?;
     unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), buf.len()); }
     Ok(buf.len())
 }
@@ -1397,16 +1590,22 @@ pub fn read_blocks_usb(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 /// geometry re-read on every call, span bounded against `num_blocks`, a non-`Passed` CSW propagated
 /// as [`BlockError::Io`] so a write NEVER reports a false success.
 pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-    let dev = usb_info().ok_or(BlockError::NotReady)?;
+    write_blocks_usb_ix(0, lba, buf)
+}
+
+/// USBREG: the counted write, addressed at registry entry `ix`'s own `(slot_id, lun)`.
+pub fn write_blocks_usb_ix(ix: usize, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let disk = usb_disk(ix).ok_or(BlockError::NotReady)?;
+    let dev = disk.info;
     let count = span_blocks(&dev, lba, buf.len())?;
     // WEDGE-8: claim the controller as a LOAN — no lock is held across the BOT transaction below.
     // `claim_xhci_for_io` returns `Busy` immediately to a masked caller (a masked wait on a driver
     // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
     let mut loan = claim_xhci_for_io()?;
     let xhci = &mut *loan;
-    let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
+    let dst = xhci.storage_data_ptr_on(dev.slot_id).ok_or(BlockError::Io)?;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
-    match xhci.storage_write10(lba as u32, count as u16) {
+    match xhci.storage_write10_on(dev.slot_id, disk.lun, lba as u32, count as u16) {
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
         other => {
             io_cause_witness("write-usb", lba, other);
@@ -1480,7 +1679,7 @@ pub fn write_blocks_usb(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 
 /// SDHC-4b: geometry of the card in the machine's internal SD slot, published by [`register_sdhc`]
 /// once `sdhc::bring_up` has identified it AND its read witnesses have run. Deliberately a THIRD slot
-/// alongside [`BLOCK_DEVICE`] and [`USB_BLOCK_DEVICE`]: nothing here ever claims the global, so the
+/// alongside [`BLOCK_DEVICE`] and [`USB_DISKS`]: nothing here ever claims the global, so the
 /// boot volume every existing caller reads through `info()` is untouched. `None` until registration.
 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
 pub static SDHC_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
@@ -1674,7 +1873,7 @@ pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 
 /// TEGRA-SDBLK: geometry of the card in the Orin's microSD slot, published by [`register_tegra_sd`]
 /// once `sdmmc_census` has identified it AND read sector 0 from it. A THIRD slot alongside
-/// [`BLOCK_DEVICE`] and [`USB_BLOCK_DEVICE`]: nothing here ever claims the global, so the boot volume
+/// [`BLOCK_DEVICE`] and [`USB_DISKS`]: nothing here ever claims the global, so the boot volume
 /// every existing caller reads through `info()` is untouched. `None` until registration.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
 pub static TEGRA_SD_BLOCK_DEVICE: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
