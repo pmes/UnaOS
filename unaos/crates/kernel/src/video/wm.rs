@@ -5395,7 +5395,7 @@ fn cash_tail(owed: Owed) {
     // serial line here cannot inflate `pass_us`. Spends itself on the first pass that finds a staged
     // buffer (see `physwit_once`); every pass after that is one relaxed load.
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-    physwit_once(); #[cfg(all(feature = "witness", target_arch = "x86_64"))] wcd_oom_latch_selftest(); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
+    physwit_once(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_oom_latch_selftest(); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -28223,4 +28223,19 @@ pub fn wcd_oom_latch_selftest() {
         want_counted,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+/// APPPIN — the compose-through offer counters as `dock::apppin_selftest` reads them:
+/// `(passes, planned, nohit)`, cumulative from boot (the raw cells `cursor12_rollup` windows). The
+/// fixture takes a snapshot, parks the sprite over the relaunched shell window, presents it, and
+/// reads the deltas — `planned` must move and `nohit` must not, which is the LOST POINTER of render13
+/// boot 1 (`[cursor12] offer … -> nohit` after the old shell re-mint) stated as a gate. Witness-only,
+/// like the cells it reads; appended at the file tail so nothing above it moves.
+#[cfg(feature = "witness")]
+pub fn cursor12_offer_counts() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        CUR12_PASSES.load(Relaxed),
+        CUR3_PLANNED.load(Relaxed),
+        CUR12_NOHIT.load(Relaxed),
+    )
 }
