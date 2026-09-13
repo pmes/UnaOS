@@ -1902,7 +1902,7 @@ pub fn selftest() {
         leg_box, leg_open, leg_geom, leg_esc, leg_quit, leg_prog,
         if ok { "PASS" } else { "FAIL" }
     );
-    rollup("selftest");
+    rollup("selftest"); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pulsequit_selftest(); // PULSEQUIT (A30) — the pulse window's close gate, at this fixture's tail and for this fixture's own reason: `crystal::selftest` calls ONE furniture fixture and the family chains, so A30's gate needs no line in `arch/x86_64/syscall.rs`. LAST, because it is the only leg here that touches a window the BOOT owns — it takes a standing pulse window down, arms the latch twice and puts both back — so no leg above may inherit its panel. ⚠ FOLDED onto this line rather than added below it: `winmenu.rs` is a bare `pub mod` and IS lexed into the knob-off image — PARITY.md §5.3. The fixture BODY is tail-appended past the compile-time asserts, where nothing below it can move.
 }
 
 // ---------------------------------------------------------------------------
@@ -1936,3 +1936,219 @@ const _: () = {
     // SO3 — `Quit` and `About` must be distinguishable, or `app_pick` cannot route.
     assert!(APP_ITEM_QUIT != APP_ITEM_ABOUT);
 };
+
+// ---------------------------------------------------------------------------
+// PULSEQUIT — A30's gate (TAIL-APPENDED: nothing above this line moved)
+// ---------------------------------------------------------------------------
+
+/// PULSEQUIT fixture — **A30: closing the pulse window CLOSES it, by EITHER gesture.**
+///
+/// Peter, render7: *"closing pulse reopens it immediately"*; render8 then resolved that complaint
+/// into TWO defects, and `a84464fe` fixed both — the `ARMED` disarm moved to the head of
+/// [`super::pulsewin::close`] (cause 1, the close-box race), and this file's `Quit` arm routed
+/// through that same close instead of a bare [`wm::close`] (cause 2, the bypass). **Neither fix had
+/// a gate.** The only instrument either one ever had was a bench flight, so the fold could be
+/// re-proved only by another sitting on the Orin — which is exactly the class of fix that comes
+/// back. This is the QEMU gate the fold went in without.
+///
+/// ## Where it lives and why
+///
+/// Appended at the TAIL of `winmenu.rs`, reached by one folded statement at the foot of
+/// [`selftest`], which is itself reached from `crystal::selftest`'s tail — `dock::selftest` ->
+/// `menubar::selftest` is the same arrangement, and the reason for it is the same: **a new surface
+/// does not need a line in a file another lane owns.** The A30 fix spans `pulsewin.rs` and this
+/// file, and so does its gate; the x86 witness ladder in `arch/x86_64/syscall.rs` is not touched.
+///
+/// ## The rounds, and what each one can actually falsify
+///
+/// **THE LATCH IS ARMED FIRST, and that is not a convenience.** `disarm_before_swap` is a constant
+/// `1` on any close that entered with the latch already clear, so a fixture that closes an unarmed
+/// window is scoring a check that cannot fire. [`super::pulsewin::arm`] is therefore called before
+/// every round — and its STICKY half is saved and handed back at the end
+/// ([`super::pulsewin::ever_armed_restore`]), because a gate may not change the desktop it measures.
+///
+/// **`remint_live=` — WHAT THE RENDER PASS CAN AND CANNOT PROVE ON THIS BOOT, said on the wire
+/// instead of assumed.** The window is minted by asking for it the way the desktop does: `arm()`,
+/// then one [`super::pulsewin::service`] pass. On the Orin that pass mints, and the service passes
+/// after each close are then a real falsification of A30 — the pre-fix tree re-opened the window on
+/// exactly such a pass, five lines later on the render8 wire. **On the x86 `wc` boot it does not
+/// mint, and the fixture says so rather than passing quietly**: `service`'s open arm needs
+/// `ui_status::loads` to report a live instrument, `ui_status::tick` is the only thing that arms
+/// that, and it never runs on this path — measured, `[pstrip]` appears zero times in a
+/// `UNAOS_WC=1 ./arroyo test` capture. There the fixture mints with [`super::pulsewin::open`]
+/// directly, prints `remint_live=false`, and the service legs are inert while every leg that
+/// DECIDES the verdict — the seal bits and the close counter below — stays falsifiable. No window
+/// at all (no panel, or `create` declined) is `SKIP`.
+///
+/// **ROUND 1 — the close disc**, pressed at the centre of the rect the compositor actually drew
+/// ([`wm::close_box_rect`], which exists for this), through [`super::pulsewin::press_route`] — the
+/// seam the arch click routers call, not `close()` directly. Then ONE service pass, which on the
+/// pre-fix tree is the pass that re-opened the window five lines later on the render8 wire.
+///
+/// **ROUND 2 — the app-menu `Quit`**, driven the way [`selftest`]'s leg 5 drives it: a routed press
+/// on the bar's app box, then a routed press on the `Quit` row, both through
+/// [`super::strip::press_route`]. Then one service pass.
+///
+/// ## The three bits that make the ORDER falsifiable, not just the end state
+///
+/// An end-state test — "after `close()` returns, the latch is clear" — passes on A30's ORIGINAL
+/// tree, where the disarm sat one statement below `wm::close`. That tree is the one render8
+/// convicted. So each round also scores `seal`, the three bits
+/// [`super::pulsewin::close_census`] returns from the close itself:
+///
+/// | bit | name                  | reds when                                                      |
+/// |-----|-----------------------|----------------------------------------------------------------|
+/// |  0  | `disarm_before_swap`  | the disarm is anywhere below the `WIN` swap (A30 cause 1's position) |
+/// |  1  | `sealed`              | the close ended with a window or a latch still standing          |
+/// |  2  | `surf_freed`          | `SURF` survived — the id cell was cleared by A29's holder registry from inside `wm::close` and this module's teardown never ran (A30 cause 2's exact signature) |
+///
+/// `seal=7` is the only passing value. Round 2 additionally requires the close COUNTER to have
+/// advanced: a `Quit` that took the bare `wm::close(win)` never reaches `pulsewin::close`, so the
+/// counter stands still and the bit-2 value it would have written is stale.
+///
+/// ## The wire
+///
+/// One line, in A30's own flight vocabulary so a QEMU verdict and a render-flight verdict read the
+/// same: `pulsewin_open=` mints charged to this fixture, `close=` closes taken, `close_final=`
+/// closes that were still closed after a render pass, `dock_rearm=` deliberate re-arms. The passing
+/// shape is `pulsewin_open=2 close=2 close_final=2 dock_rearm=2`, and `pulsewin_open` above 2 is
+/// A30 itself — one window opened N times, which is how `A18 cascade: pulsewin_open=8` read for a
+/// single window on render8.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+pub fn pulsequit_selftest() {
+    use super::pulsewin;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = panel();
+    if pw == 0 || ph == 0 {
+        serial_println!(":: PULSEQUIT: no panel :: SKIP ::");
+        return;
+    }
+    let saved_bar = menubar::enabled();
+    let saved_focus = wm::focus_asid();
+    let saved_sticky = pulsewin::ever_armed();
+    menubar::set_enabled(true);
+    // Start from a known state. If the boot left a pulse window standing it is taken down through
+    // the module's own close, so every count below is charged to this fixture and to nothing else.
+    if pulsewin::is_open() {
+        pulsewin::close();
+    }
+    let (opens0, closes0, _) = pulsewin::close_census();
+
+    // --- MINT, and MEASURE whether the render pass can mint on this boot --------------------
+    pulsewin::arm();
+    pulsewin::service();
+    let remint_live = pulsewin::is_open();
+    if !remint_live {
+        // `service`'s open arm declined (see the header's `remint_live=` note). Mint directly so
+        // the two gestures still have a real window to be delivered to, and let the verdict line
+        // carry the fact that the service legs below are inert on this board.
+        pulsewin::open();
+    }
+    if !pulsewin::is_open() {
+        // No window by EITHER route: no panel of a usable size, or `wm::create_at` declined. That
+        // is a fixture that could not set up, not a close that failed. `close()` here is the
+        // DISARM rather than a teardown, so the latch this fixture set does not outlive it.
+        pulsewin::close();
+        pulsewin::ever_armed_restore(saved_sticky);
+        menubar::set_enabled(saved_bar);
+        wm::focus_changed(saved_focus);
+        serial_println!(
+            ":: PULSEQUIT: no pulse window — neither service() nor open() minted one on this panel, so there is no close to gate :: SKIP ::"
+        );
+        return;
+    }
+
+    // --- ROUND 1: THE CLOSE DISC (A30 cause 1) ---------------------------------------------
+    let w1 = pulsewin::win();
+    wm::focus_changed(pulsewin::OWNER);
+    wm::composite();
+    let (r1_routed, r1_seal, r1_closes) = match wm::close_box_rect(w1) {
+        Some((cx, cy, d)) => {
+            let hit = pulsewin::press_route((cx + d / 2) as i32, (cy + d / 2) as i32);
+            let (_, c, s) = pulsewin::close_census();
+            (hit, s, c)
+        }
+        // No control cluster on the row is a fixture that could not deliver the gesture, not a
+        // defect in the close — named, and it reds, because on this gate's own panel every kernel
+        // row is drawn with a close disc.
+        None => (false, 0, closes0),
+    };
+    pulsewin::service();
+    let r1_final = !pulsewin::is_open() && !pulsewin::armed() && wm::info(w1).is_none();
+    let r1 = r1_routed && r1_final && r1_seal == 7 && r1_closes == closes0 + 1;
+
+    // --- ROUND 2: THE APP-MENU QUIT (A30 cause 2) ------------------------------------------
+    pulsewin::arm();
+    pulsewin::service();
+    if !pulsewin::is_open() {
+        pulsewin::open();
+    }
+    let w2 = pulsewin::win();
+    wm::focus_changed(pulsewin::OWNER);
+    wm::composite();
+    let s = bar_boxes(pw, ph);
+    let (_bx, by, _bw, bh) = s.bar;
+    let bar_named = w2 != wm::WIN_NONE && s.app && s.app_owner == w2 && s.n >= 1;
+    let menu_down = bar_named
+        && strip::press_route((s.x[0] + s.w[0] / 2) as i32, (by + bh / 2) as i32)
+        && is_open()
+        && OPEN_APP.load(Ordering::Relaxed)
+        && OPEN_OWNER.load(Ordering::Relaxed) == w2;
+    let (r2_routed, r2_seal, r2_closes) = match (menu_down, open_rect(pw, ph)) {
+        (true, Some((mx, my, mw, _mh))) => {
+            // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
+            // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
+            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H / 2;
+            let hit = strip::press_route((mx + mw / 2) as i32, qy as i32);
+            let (_, c, sl) = pulsewin::close_census();
+            (hit, sl, c)
+        }
+        _ => (false, 0, r1_closes),
+    };
+    pulsewin::service();
+    let r2_final = !pulsewin::is_open() && !pulsewin::armed() && wm::info(w2).is_none();
+    // THE BYPASS TEST. A bare `wm::close(win)` reaps the row and A29's holder registry clears
+    // `pulsewin::WIN` from inside it, so `is_open()` answers false and `wm::info` answers `None`
+    // on the broken tree too — for one pass. What the bypass CANNOT do is reach this module's
+    // close, so the counter is the discriminator and the latch is the consequence.
+    let r2_owned = r2_closes == closes0 + 2;
+    let r2 = r2_routed && r2_final && r2_owned && r2_seal == 7;
+
+    // Restore. No fixture leaves a window on the operator's desktop, and this one armed the latch
+    // twice, so the latch goes back the way it was found even if a leg red left a window standing.
+    if pulsewin::is_open() {
+        pulsewin::close();
+    }
+    dismiss("pulsequit");
+    wm::focus_changed(saved_focus);
+    menubar::set_enabled(saved_bar);
+    pulsewin::ever_armed_restore(saved_sticky);
+
+    let (opens, closes, _) = pulsewin::close_census();
+    let ok = r1 && r2;
+    serial_println!(
+        ":: PULSEQUIT: pulsewin_open={} close={} close_final={} dock_rearm={} remint_live={} \
+         close_box_routed={} close_box_seal={} close_box_final={} \
+         quit_bar_named={} quit_menu_down={} quit_routed={} quit_seal={} quit_owner_close={} quit_final={} \
+         win1={} win2={} panel={}x{} :: {} ::",
+        opens.wrapping_sub(opens0),
+        closes.wrapping_sub(closes0),
+        (r1_final as u32) + (r2_final as u32),
+        2,
+        remint_live,
+        r1_routed, r1_seal, r1_final,
+        bar_named, menu_down, r2_routed, r2_seal, r2_owned, r2_final,
+        w1, w2, pw, ph,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    pulsewin::rollup("pulsequit");
+}

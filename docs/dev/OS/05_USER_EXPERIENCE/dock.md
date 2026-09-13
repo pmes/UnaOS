@@ -80,6 +80,38 @@ gone on its next pass and tears the instance down:
 The tile stays: the pin appears in the same slot on the next composite, because no live row carries the
 owner. Nothing remembers that a window existed.
 
+### 3.1 The exception a window's OWN `close()` makes — and it is an exception by measurement (A30)
+
+"All three go through `wm::close`" is the rule and it is not the whole contract. A window whose owning
+module keeps state of its own outside the window table needs that module's `close()` to run, and
+`wm::close` cannot call it: the holder registry clears an **id cell**, it cannot free a `Vec`, drop a
+model or resume a suspended present. The pulse instrument is the case that was measured. Its `ARMED`
+latch means *"the desktop wants this window"*, so a quit that left the latch set was not a quit at all —
+the next render pass re-minted the window, which is orin-ledger **A30** (Peter, render7: *"closing pulse
+reopens it immediately"*). Two separate defects produced that: the disarm sat below the `WIN` swap, so a
+render pass on another core could mint into the gap; and the app-menu **Quit** arm called bare
+`wm::close(win)` and never reached `pulsewin::close()` at all. Both are fixed — the disarm is now the
+first statement of `pulsewin::close()`, and `winmenu`'s `Quit` arm runs the owning module's close first
+(`pulsewin::win() == win && pulsewin::close()`) and falls through to `wm::close` for every other window,
+so the disc and the menu are ONE path.
+
+So the contract reads: **the red disc, the app menu's Quit and `wc_close_furniture` all end in
+`wm::close`, and for a window whose module owns state they reach it THROUGH that module's `close()`.**
+
+It is gated rather than asserted. `winmenu::pulsequit_selftest` (tail of `video/winmenu.rs`, reached from
+`winmenu::selftest`, itself reached from `crystal::selftest`) drives both gestures through the real press
+seams on a `UNAOS_WC=1 ./arroyo test` boot and scores each close by three bits the close latches about
+itself — the disarm happened before the swap, the close ended with no window and no latch, and the
+surface was actually freed — plus the module's own close counter, which a bypassed Quit cannot advance.
+Its verdict is one line, `:: PULSEQUIT: pulsewin_open=2 close=2 close_final=2 dock_rearm=2 … :: PASS ::`.
+
+**Two windows still take the bare path, and they are named here rather than left to be re-derived:**
+`quarry` (`quarry::close()` drops `MODEL` and clears `SURF`) and `instgui` (`instgui::close()` also calls
+`fbcon::console_present_suspend(false)`). Neither has an `ARMED` latch, so neither REOPENS — that is why
+the same Quit on a Quarry window looked correct on render8 — but each leaks its own teardown when the
+quit arrives from the app menu, and `instgui`'s leaves the console's presents suspended. Closing that
+needs a public `win()`/`close()` pair on both modules; until then this paragraph is the record.
+
 ## 4. The wire — one grammar, both apps, all three bodies
 
 ```text
