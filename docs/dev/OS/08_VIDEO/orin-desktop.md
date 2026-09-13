@@ -3875,8 +3875,12 @@ It is **not** SO27's road: `shell-remint` is 0 across the whole render14 wire, s
 > *"went to open quarry the machine froze for a minute and when it came back the mouse cursor was
 > gone"* — twice, both times ending in a reboot.
 
-The wire's reading of that state, from the live Orin capture (`~/unaos-bench/capture/line-acm0/orin.log`,
-read with `LC_ALL=C awk 'index($0,"[cursor12]")'`), is four consecutive rollups:
+The wire's reading of that state — **in git as
+[`docs/dev/evidence/orin28/render14-boot5-ptrlost-nohit-latched.log`](../../evidence/orin28/render14-boot5-ptrlost-nohit-latched.log)**,
+a whole contiguous boot cut from `~/unaos-bench/capture/line-acm0/orin.log` lines 342308-356403 and
+anchored on its own first line `KELF min=0x0 max=0x3fe708 pg=1023`, which matches the render14 flash
+MANIFEST's `ELF max_vaddr=0x3fe708`, so the image identity is verified rather than assumed — read with
+`LC_ALL=C awk 'index($0,"[cursor12]")'`, is four consecutive rollups:
 
 ```
 [cursor12] offer scope=live adm=window passes=3158 nosprite=15  hidden=0   nohit=3143 … planned=0 -> nohit
@@ -4047,3 +4051,28 @@ With the pointer moved from the backdrop, across a window, onto a dock tile and 
   they now mean only "no window was under the arrow", which is what the counter's name says.
 * `[flick2] down_max` back to single-digit ms with `down_slow` flat, since the arrow is re-established
   at report rate rather than at composite rate.
+
+### §12.8 A correction to SO46's own headline number, and what is NOT in git
+
+The SO46 queue line headlines *"`[cursor12]` carries `nohit=186` at the end of boot2"*. That number is
+real and it is in boot 2 — the boot beginning at capture line 326454 — but **it is not the lost-pointer
+signature**, and this arc does not rest on it:
+
+```
+[cursor12] offer scope=live adm=window passes=2294 nosprite=29 hidden=0 nohit=186 reserved=0 nosession=0 planned=2079 … -> below-session
+```
+
+91% of that window's passes PLANNED an overlay; `nohit` is 8% of it, and the verdict token is
+`below-session`, not `nohit`. The signature this section is written from is the LATCHED block — `nohit`
+approaching `passes` with `planned=0`, sustained across four rollups — and that is in **boot 5**, which
+is the excerpt now in git.
+
+Boot ordinals were derived, not assumed: the four boots of the `0x3fe708` image in that capture start at
+lines 326454, 331681, 336654 and 342308, and the already-committed
+[`render14-boot3-shutdown-rung4e.log`](../../evidence/orin28/render14-boot3-shutdown-rung4e.log) pins the
+second of those as boot 3 (its `[cursor12] … cum=873` tail falls inside it) — which makes 326454 boot 2
+and 342308 boot 5.
+
+**Not in git:** boot 2's capture. The one line above is quoted here and in orin-ledger A74 so a reader can
+locate it in the same source; if the boot-2 window is ever needed as evidence for a claim, it has to be
+cut and committed the way boot 5 was.
