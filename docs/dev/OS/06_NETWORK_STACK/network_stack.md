@@ -377,10 +377,10 @@ of whichever a gate happened to build.
 * Live ICMP/ARP on the Orin's real link remains **attended-metal** (orin-ledger A59).
 * The NET6 neighbour table (§8.8) is 8 entries, TTL 120 s, learned only from ARP frames this boot. It
   is not smoltcp's cache and does not feed it — smoltcp re-resolves per interface as it always did.
-* **OWED, and outside this arc's file list:** `dns` is still absent from midden_core's `HOST_VERBS`
-  (`libs/sys/midden_core/src/lib.rs:274-275`), so the verb is unreachable from the shell on every
-  build. One line: `("dns", Avail::Always),` in the `// network` group. Until it lands, the `dns`
-  witnesses of §8.8 are reachable only from `net6::fixture()`.
+* ~~OWED: `dns` is absent from midden_core's `HOST_VERBS`.~~ **LANDED** — `("dns", Avail::Always)`
+  is in the `// network` group (`libs/sys/midden_core/src/lib.rs:336`) and the verb is reachable from
+  the shell; §8.8.1 argues the `Avail` and records what it costs `shell.rs`. Still owed, one word: the
+  help NETWORK line (`lib.rs:622`) lists ifconfig/ping/arp and not `dns`.
 
 ### 8.7 Re-gated on the `hw-jetson` merge (2026-09-12)
 
@@ -519,8 +519,8 @@ is a different defect from "this one address is unknown", and the wire must be a
 midden_core's `HOST_VERBS`; its `// network` group registers `ifconfig`, `ping`, `arp`, `nc`, `curl`
 (`lib.rs:274-275`) and **not `dns`**. The `"dns" => net6_shell_dns(…)` arm at `shell.rs:5594` has
 therefore never been reachable on any build, which is why a bare `dns` with no arguments returns the
-same 44-byte error as `dns google.com`. **The one-line fix lives outside this arc's file list and is
-reported, not made:** add `("dns", Avail::Always),` to that `// network` group.
+same 44-byte error as `dns google.com`. **The one-line fix — `("dns", Avail::Always),` in that
+`// network` group — has since LANDED; §8.8.1 is the argument for it and §8.6 the current state.**
 
 What this arc lands instead is the half that made the boot unreadable. The verb already printed on
 every path, but by ten separate `serial_println!` calls that a future arm could silently skip, and
@@ -608,13 +608,19 @@ directly, exit 0 with the control fired), and so does the track's own movement (
 entire +128/+64 is one `(&str, Avail)` row plus a 3-byte string plus `.rodata` alignment: data, not
 code, and growth by exactly one table entry.
 
-⚠ **What this costs, and it is owed in `shell.rs`.** `shell.rs:6103-6122` documents the `other =>`
-drift net as unreachable by construction — "that set is empty today, because every `Avail` in
-`HOST_VERBS` mirrors the `#[cfg]` on its arm below exactly". With `dns` registered that is no longer
-true: on a build without `all(net6, aarch64)` the word reaches the net and prints `dns: not available
-on this build (the verb exists; this kernel does not carry it)`. The BEHAVIOUR is right — that is R26
-clause 3's honest refusal, arriving through the net instead of a dedicated arm — but the COMMENT now
-overstates and must be corrected in the same fold.
+⚠ **What this cost `shell.rs`, and it is PAID (WIREHYG, A72).** `shell.rs:6103-6122` documented the
+`other =>` drift net as unreachable by construction — "that set is empty today, because every `Avail`
+in `HOST_VERBS` mirrors the `#[cfg]` on its arm below exactly". With `dns` registered that was no
+longer true: on a build without `all(net6, aarch64)` the word reaches the net and prints `dns: not
+available on this build (the verb exists; this kernel does not carry it)`. The BEHAVIOUR is right —
+that is R26 clause 3's honest refusal, arriving through the net instead of a dedicated arm — and only
+the COMMENT overstated. It now names `dns` as the one member of that set and why. The rewrite is
+LINE-NEUTRAL (20 lines in, 20 out, `shell.rs` 7668 lines both sides): a comment that changes the line
+count shifts every `panic::Location` below it and moves the knob-off image (LAWS §5). Measured rather
+than argued — `env -u UNAOS_TEGRA ./arroyo knoboff net6 <this branch's merge commit>` is **exit 0,
+byte-identical on both arches, control fired**. The baseline is the MERGE commit, not `knoboff`'s
+`HEAD~1` default and not a track tip: the tree-without-this-commit is the only baseline that can
+isolate a comment rewrite.
 
 #### 8.8.2 The retired wire strings, and the one that is not retired at all
 
@@ -631,7 +637,7 @@ The prose that would mis-score, each with its file:line:
 
 | where | what it says | status |
 |---|---|---|
-| `docs/dev/OS/orin-ledger.md:90` (A59's status cell) | the next-flight go-red: "`arp 10.42.0.1` -> `:: NET6: arp 10.42.0.1 -> is-at <router mac> ::`", and "A `-> NO REPLY ::` … on the gateway with `link UP` is the next question" | **STALE — outside this arc's file list, reported not edited.** The arp line now carries ` via=… age_ms=…` after the MAC, and arp's failure line is `-> NO REPLY (cache miss, …)`. |
+| `docs/dev/OS/orin-ledger.md:90` (A59's status cell) | the next-flight go-red: "`arp 10.42.0.1` -> `:: NET6: arp 10.42.0.1 -> is-at <router mac> ::`", and "A `-> NO REPLY ::` … on the gateway with `link UP` is the next question" | **FIXED — WIREHYG (A72).** The arp line now carries ` via=… age_ms=…` after the MAC, arp's failure is `-> NO REPLY (cache miss, …)`, and the cell says which verb owns the bare fragment. |
 | `unaos/arroyo:2054` (the `net6` knob's own doc block) | "`:: NET6: arp <ip> -> is-at <mac> ::`, `:: NET6: dns <host> -> A a.b.c.d ::`" | **STALE — `arroyo` is a gate file outside this arc's list, reported not edited.** Missing `via=`/`age_ms=`, and `dns` now always carries the `(server …)` suffix. |
 | `network_stack.md:423` (§8.7's certification table) | `-> NO REPLY ::  1` | historical record of the 2026-09-12 ELF; annotated in place at §8.7. |
 
@@ -658,6 +664,48 @@ So the hazard is worse than "the string is gone", and it cuts both ways:
 A fragment that survives in one channel and dies in the other is the worst version of this class,
 because the scorer keeps producing plausible output. **Score `arp`'s failure on
 `NO REPLY (cache miss,`** — a token no other verb can reach.
+
+#### 8.8.3 WIREHYG — the sweep widened, and three more tokens that do not mean what they say
+
+§8.8.2's sweep was re-run wider (A72, 2026-09-13) and its two negative results are **confirmed
+independently, not inherited**:
+
+* **No executable scorer keys on any NET6 token.** `LC_ALL=C grep -rn -a -F` for `-> NO REPLY ::`,
+  `is-at`, ` -> A `, `:: NET6:`, ` rtt_ms=`, `lease-owner=`, `via=cache`, `-> TIMEOUT ::`,
+  `NO RESOLVER` and `SEND FAILED (socket unusable)` over every `*.spec`, `*.sh`, `*.py`,
+  `unaos/arroyo` and `~/unaos-bench/tools/` returns **zero directives**. The only hits inside an
+  executable file are the four comment lines `unaos/arroyo:2053-2056`, which are documentation, not
+  a check. The NET6 family's scoring surface is entirely PROSE.
+* **`pi4-regression.spec:1868` is a substring false positive**, read at the line: it is a `# ---`
+  prose line whose word is *mis-**at**tributes*. Nothing there scores `is-at`.
+
+**Three tokens, found by measurement, that an asserter gets wrong** — output of
+`docs/dev/evidence/orin28/scorer-token-uniqueness.sh --list <tokens>`, which maps a token to every
+kernel site that can emit it and to the VERB each of those sites names:
+
+| token | asserted by | measured | why it matters |
+|---|---|---|---|
+| `-> NO REPLY ::` | A59's go-red, as `arp`'s failure | **1 emitter, verb `ping`** (`net_phy.rs:1360` formats ` -> {} ::` against `:1365`'s `"NO REPLY"`; tag `arg` — composed at runtime) | the headline of §8.8.2, now mechanised: the bytes did not disappear, they changed verbs |
+| `-> TIMEOUT ::` | A59's go-red, as the gateway question | **SHARED: `ping` (`net_phy.rs:1345`), `JB5` (`bpmp_tegra.rs:501`), `JB7` (`bpmp_tegra.rs:537`)** | on a `UNAOS_TEGRA=1` boot the BPMP prints it during bring-up, hundreds of lines BEFORE the shell exists — a scorer keyed on it reads a power-gate or clock timeout as a network answer |
+| ` (server ` | §8.7's own annotation, as `dns`'s replacement discriminator for the retired ` -> A ` | **SHARED: `dns` (`net_phy.rs:1484`, `:1491`), `NET: DHCP lease … (server …)` (`net_phy.rs:366`), `[net4j] … (server identifier)` (`rtl8168_tegra.rs:2727`)** | **this is a correction to the prescription §8.7 made one day earlier.** On a leased Orin boot `net_phy.rs:366` fires first, so ` (server ` counts >= 1 on a boot where `dns` was never typed |
+
+` -> A ` measures **0 emitters**, which confirms §8.7's annotation: the resolved arm now renders
+through `DnsSay` (`net_phy.rs:1540`, `write!(f, "A {}.{}.{}.{}")`), so the space-`A`-space run is no
+longer contiguous anywhere. The sound replacements are the DnsSay phrases, each of which is unique
+and contiguous: `NO A RECORD`, `BAD NAME (unencodable)`, `NO ANSWER within budget`,
+`SERVER ERROR rcode=`, `MALFORMED REPLY`, `BIND FAILED (no ephemeral port)`,
+`SEND FAILED (sendto refused)`. For the WIRE, `dns`'s own discriminator is the whole prefix
+`:: NET6: dns ` — and note it is DEAD as an ARTIFACT token, because `:: NET6:` is the `P6` constant
+in a `{}` hole and never adjoins ` dns ` in `.rodata`. Wire token and artifact token are different
+objects and this family needs both named.
+
+**The rule that comes out of it** is one line in `LAWS.md` §5, with
+`docs/dev/evidence/orin28/scorer-token-uniqueness.sh` as its enforcer: a scorer keys on a token
+UNIQUE to the verdict it scores, never on a fragment another emitter can reach. The script's
+`--selftest` carries three controls (the composed `ping` case must read 1, the prescribed `arp`
+token must read 1, an invented token must read 0) and its go-red is `--verb arp '-> NO REPLY ::'`,
+which exits 1 with `WRONG-VERB(want arp) … verbs=ping`.
+
 
 ---
 

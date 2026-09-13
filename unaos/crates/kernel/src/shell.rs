@@ -6100,26 +6100,26 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 Some(pid) => bg_kill_cmd(console, pid),
             }
         },
-        // MIDDEN-M1: this arm is a DRIFT NET, and as of this arc it is unreachable — deliberately.
+        // MIDDEN-M1: this arm is a DRIFT NET. It is REACHABLE as of NETVERB (SO47) — by exactly
+        // one verb, deliberately — and it was unreachable by construction before that.
         //
-        // It no longer means "unknown word": the core already ruled on that, and an unknown word
-        // comes back as `Plan::Say(TerminalError)` and never arrives here. What could arrive is a
-        // word midden's table calls a verb that THIS build does not compile the machinery for —
-        // and that set is empty today, because every `Avail` in `HOST_VERBS` mirrors the `#[cfg]`
-        // on its arm below exactly (the review checked all 78 spellings arm by arm). So the table
-        // and the match agree, and nothing reaches this arm.
+        // It does not mean "unknown word": the core already ruled on that, and an unknown word
+        // comes back as `Plan::Say(TerminalError)` and never arrives here. What arrives is a word
+        // midden's table calls a verb that THIS build does not compile the machinery for. That set
+        // is no longer empty: `("dns", Avail::Always)` is registered against an arm gated
+        // `all(feature = "net6", target_arch = "aarch64")`, so on every build missing either, `dns`
+        // lands here and prints the by-name refusal below. That is R26 clause 3's honest answer
+        // (ONE OS: the word exists everywhere, the arm decides), not a drift — `network_stack.md`
+        // §8.8.1 has why `Avail::Aarch64` was refused by a TEST (`lib.rs:969-976`), not by taste.
         //
-        // It is kept because that agreement is a HAND-MAINTAINED invariant across two files. Add a
-        // verb to `HOST_VERBS` and forget its arm, or `#[cfg]`-narrow an arm without narrowing its
-        // `Avail`, and the drift lands HERE — as a sentence naming the verb, on the panel — rather
-        // than as a word that silently does nothing. Deleting the arm would make that same drift a
-        // non-exhaustive-match compile error only if the match were over an enum, and it is over
-        // `&str`; there is no compiler check to fall back on. Hence: unreachable by construction,
-        // retained as the net for the construction breaking.
+        // It is kept because the table/arm agreement is a HAND-MAINTAINED invariant across two
+        // files. Add a verb to `HOST_VERBS` and forget its arm, or `#[cfg]`-narrow an arm without
+        // narrowing its `Avail`, and the drift lands HERE — as a sentence naming the verb, on the
+        // panel — rather than as a word that silently does nothing. Deleting the arm would make
+        // that same drift a non-exhaustive-match compile error only if the match were over an
+        // enum, and it is over `&str`; there is no compiler check to fall back on.
         //
-        // (No example is given on purpose. Every plausible one is wrong: `uls`/`top` on x86 are
-        // `Avail::Aarch64`/an arm that prints its own aarch64-only message, and `vug`'s `Avail`
-        // tracks the v3d cfg. If a real reachable case ever appears, it is a BUG in the table.)
+        // (`uls`/`top` on x86 are NOT examples: `Avail::Aarch64` / an arm with its own message.)
         other => {
             console.println(&alloc::format!(
                 "{}: not available on this build (the verb exists; this kernel does not carry it)",
