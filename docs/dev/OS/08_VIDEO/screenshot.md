@@ -1,7 +1,9 @@
 # Screen capture — PRTSCR
 
-Print Screen, and the `screenshot` verb, write the panel to `SCREEN<n>.PNG` at the root of the FAT
-volume. This document states what the mechanism is, where each piece runs, and what it refuses.
+Print Screen, and the `screenshot` verb, write the panel to `SCREEN<n>.PNG` **in the logged-in
+user's own `Pictures/Screenshots` folder** — and refuse, writing nothing, when nobody is logged in
+(§12, PRTSCR-HOME; it was the volume root until 2026-09-13). This document states what the mechanism
+is, where each piece runs, and what it refuses.
 
 Source: [`video/png.rs`](../../../../unaos/crates/kernel/src/video/png.rs) (the encoder),
 [`video/prtscr.rs`](../../../../unaos/crates/kernel/src/video/prtscr.rs) (capture, naming, write,
@@ -110,8 +112,10 @@ the kernel compiles and decode the result with a real zlib.
 
 ## 5. Naming, and the no-overwrite rule
 
-`SCREEN0.PNG` .. `SCREEN99.PNG` at the volume root, first free index wins. **An existing capture is
-never overwritten**: the search asks `locate_in_dir(0, name)` per candidate and takes the first
+`SCREEN0.PNG` .. `SCREEN99.PNG` **in the capture directory** (§12 — the volume root until
+2026-09-13), first free index wins. The index therefore counts **per user**: two users each get their
+own `SCREEN0.PNG`, and neither can exhaust the other's hundred names. **An existing capture is
+never overwritten**: the search asks `locate_in_dir(dir, name)` per candidate and takes the first
 `NotFound`; when all hundred are present the capture refuses and says so rather than wrapping around
 onto `SCREEN0.PNG`. The lookup goes through the filesystem rather than a directory listing because
 `locate_in_dir` matches on both the 8.3 short name and any long name, and `create_in_dir` does not
@@ -464,3 +468,154 @@ there".
 The encode step is probed for the same reason: it spends seconds of passes before the first
 volume-touching call, so an entry created on a disk that has left, or on a stranger's, is precisely
 the stale-handle write this refuses.
+
+## 12. PRTSCR-HOME — a capture belongs to a user, and lands in that user's own folder
+
+Peter, 2026-09-13: *"screenshots should be saved to a user's ~/Pictures/Screenshots"*, and on the
+no-session half, *"do not hack screenshots to make it work right before multi-user is in."* This is a
+consequence of R51 (multi-user as a line: a human logs in and gets a home folder). What it settles is
+**whose** folder — which makes the no-session case the load-bearing half, not an edge.
+
+### 12.1 The destination
+
+`fs::users::whoami` names the open session; `fs::users::home_of` turns that name into the user's home
+path (`/home/<name>` — the same path `ensure_home` creates at first login). The capture directory is
+that home plus `Pictures` plus `Screenshots`. `prtscr::ensure_capture_dir` walks it and creates what
+is absent, component by component, on the volume the PRTSCR-VOL ladder (§6) settled on. **This module
+reads `fs/users.rs` and writes nothing there**: `whoami` and `home_of` were already public and are
+the whole of the interface.
+
+Note which volume that is, because the two can differ and the difference is not a defect: the home
+`ensure_home` makes lives on the EL0 volume, while a capture goes to the ladder's answer — which on a
+read-only-boot bench is the operator's own USB stick. On that stick the same shaped path is created
+under the same user name. That is right for a carry-away medium — still that user's screenshot, in
+that user's folder, on that user's disk — and the `source=`/`serial=` fields on every verdict say
+which disk it was.
+
+Directory creation needs no new crash-consistency machinery. `create_dir` (`fs/fat.rs:3558`)
+zero-fills and `.`/`..`-initialises the child **before** linking the parent, and publishes the child
+cluster into the parent entry **last** — the same shape as `write_grow`'s SAFE ORDER. A boot cut
+inside it leaves either no entry or a valid empty directory, never an entry pointing at an
+uninitialised cluster.
+
+### 12.2 The 8.3 question, answered from the code that decides it
+
+**This FAT layer reads long file names and writes 8.3 only.** Both halves matter here:
+
+| half | what the code does | where it is decided |
+|---|---|---|
+| **read** | VFAT long names ARE parsed (PI-FS-3): `LfnBuf` accumulates the 0x0F-attribute component slots preceding a short entry and checksum-validates the run; `DirEntry::eq_name` then matches **either** the long name or the 8.3 short name, ASCII-case-insensitively | `fs/fat.rs:190`, `fs/fat.rs:365`–`460` |
+| **write** | 8.3 ONLY — *"this driver's create path writes 8.3 names only (VFAT LFN write is out of scope)"*. `format_83` is the decider: base `1..=8`, extension `0..=3`, each a legal short-name byte, else `None`. `create_dir` validates through it before allocating anything, so a rejected name returns `FatError::Unsupported` and leaks no cluster | `fs/fat.rs:118`, `fs/fat.rs:325`, `fs/fat.rs:3562` |
+
+`"Screenshots"` is **eleven** characters. `format_83` returns `None` for it. **We cannot create a
+directory called `Screenshots` on this filesystem.** So the rule is *look up long, create short*:
+
+| the user asked for | looked up as | created as | why |
+|---|---|---|---|
+| `Pictures` | `Pictures` | `PICTURES` | 8 characters — a legal 8.3 base exactly as written, no compromise at all. Uppercase because short names are stored uppercase. |
+| `Screenshots` | `Screenshots` | `SCRSHOTS` | 11 characters — impossible as a short name. |
+
+Both lookups run before either create, so a volume that **already** carries a real
+`Pictures/Screenshots` — a stick formatted and filled on a host — is adopted verbatim and nothing new
+is made. Only a genuinely absent folder is created, and then in 8.3.
+
+**`SCRSHOTS`, not `SCREENSH`.** A truncation to the first eight characters reads as a corrupted word,
+and it is not even the alias a real VFAT driver would write (that would be `SCREEN~1`, beside a long
+entry we have no way to author). `SCRSHOTS` is visibly an abbreviation, so an operator reading the
+stick on another machine sees a deliberate name rather than damage.
+
+**So what is really on disk, and what does the user see?** On a volume we created the folder on:
+`/home/<name>/Pictures/SCRSHOTS`, and the witness line prints exactly that. On a volume where the
+folder already existed with a long name: `/home/<name>/Pictures/Screenshots`, spelled as the user
+spelled it. The mapping is on the wire for every capture, so it is never something a reader has to
+infer. `DIR_SHOTS` in `video/prtscr.rs` is the single place that changes should the create path ever
+learn to write LFN component slots.
+
+### 12.3 No session means no capture — and that is the answer, not a gap
+
+There is usually no logged-in user on these boards, and on an ordinary build there is not even the
+machinery for one: `fs/users.rs` is `#[cfg(feature = "login")]` (`fs/mod.rs:105`), `login` is not a
+default feature, and the login screen does not open at boot even when it is built (SO43, in flight on
+a parallel branch).
+
+A capture with no session is **REFUSED** — `Refusal::NoSession`, one bounded line naming the reason,
+**zero bytes written**. Not the volume root, not a shared folder, not a temporary landing place under
+a new name. Three things that refusal deliberately is **not**:
+
+* **not a fallback.** A shared destination would make the feature *look* finished on a machine where
+  multi-user is not, and would have to be torn out and re-argued the moment sessions open.
+* **not an error path.** It is a first-class outcome with its own witness, its own reason token and
+  its own fixture, green from the boot it ships on.
+* **not deferred work.** The code is complete as written; what it waits for is a session to exist,
+  and nothing here changes when one does.
+
+Two reason tokens, because they are different facts cured by different things:
+
+| token | means | cured by |
+|---|---|---|
+| `no-login-built` | this image has no user store at all — `whoami`/`home_of` do not exist to call | building with `UNAOS_LOGIN=1` |
+| `no-session` | the store is built and nobody is logged in | logging in (SO43's boot login screen, or the `login` verb) |
+| `unknown-user` | a session names a user the store has no row for | — (a store defect; refused rather than invented around) |
+| `bad-home` | the row's home path is empty or deeper than the walk's bound | — |
+
+**The check is first**, ahead of the panel and ahead of the volume (`Job::begin` step 0). A capture
+that can never belong to anyone must not spin up the PRTSCR-VOL ladder, must not choose a name, and
+must not create a directory entry — so the check that guarantees all three sits ahead of all three.
+That is what makes "zero bytes written" a structural property rather than a claim. On a no-session
+boot a capture costs one lock and one line.
+
+`PRTSCR-ST` (§8) treats it the same way its two existing waits are treated: announced once, **never
+latched**, not a FAIL. A permanent red meaning "the feature is correct and nothing has exercised it"
+is a broken instrument. It runs on the first pass after a login.
+
+### 12.4 The wire
+
+```
+:: PRTSCR-DIR: user=una home=/home/una path=HOME/UNA/PICTURES/SCRSHOTS created=2 reason=session -> RESOLVED ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 6912345 bytes -> OK :: source=usb serial=0x1A2B3C4D dir=HOME/UNA/PICTURES/SCRSHOTS ::
+```
+
+and, on every board today:
+
+```
+:: PRTSCR: no user session (reason=no-login-built) — a capture belongs to a user's Pictures/Screenshots and there is none; NOTHING WRITTEN (no name chosen, no volume touched) — capture skipped ::
+```
+
+`dir=` is appended to the verdict line's **second** `::`-delimited segment, never folded into the
+first: `scorers-render9.sh` keys on `bytes -> OK ::` being contiguous (A17 at :320 and :888, A36 at
+:702), and a field inserted before that `::` would silently zero three census counters — a check that
+cannot fire, produced by a witness change. The failure line names the component the walk stopped at:
+
+```
+:: PRTSCR-DIR: user=una home=/home/una path=HOME/UNA at=Pictures -> REFUSED (-ENOSPC) — nothing written ::
+```
+
+The resolved path is clipped at `DIR_PATH_MAX` (120 bytes) for printing only — an adopted long name
+can be up to `LNAME_MAX` (768) bytes, and two of those would put ~1.5 KB on one serial line against
+this module's standing rule that a capture's witness is bounded. The walk itself is never truncated;
+components are appended whole, so a clipped path ends at a component boundary.
+
+### 12.5 The fixture, and its go-reds
+
+`prtscr::dir_fixture()` runs once per boot from `service()` — not behind a knob, because the
+no-session refusal is what **every** board does today and a gate that runs only when someone
+remembers a knob would not have measured the ordinary case once. It costs one relaxed load per
+service pass after the first.
+
+| arm | asserts | go red by |
+|---|---|---|
+| A — a resolved user home | `path_for_home("/home/una") == "HOME/UNA/PICTURES/SCRSHOTS"` — the 8.3 mapping stated as a mapping, volume-free so it runs on a board with no filesystem | changing `DIR_SHOTS`'s create spelling (to the truncation `SCREENSH`, say), or dropping the upcase in `path_for_home` |
+| B — no session refuses, writing nothing | `plan_dir(None)` is `Err(NoSession)`, **and** the real `capture()` refuses with that variant while the `CAPTURES` census does not move | giving `plan_dir` a fallback destination for `None` — the shared-folder hack — which turns the `Err` false and the capture into an attempted write |
+
+Arm B drives the real `capture()` only when the machine genuinely has no session. If one is open, a
+boot-time fixture must not help itself to the operator's panel and write a file nobody asked for, so
+the live leg is skipped and **says** it was skipped; arm B's pure assertion still holds the refusal
+contract.
+
+### 12.6 What is exercisable today
+
+Honestly: **nothing on the happy path.** With `login` off by default and no boot login screen, every
+capture on every current build takes the refusal. Arm A proves the 8.3 mapping and arm B proves the
+refusal and its silence, and those are real gates that run on every boot — but the resolved-home
+write is proven by construction and by `UNAOS_LOGIN=1` compilation, not by a booted capture. It
+becomes exercisable the moment SO43's login screen lands, with nothing here to unwind.
