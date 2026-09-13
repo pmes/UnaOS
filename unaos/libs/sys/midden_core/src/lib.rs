@@ -212,6 +212,22 @@ pub enum Avail {
     /// retired into the plain file verbs, which are `Always`. Kept because it is the honest
     /// availability for a verb whose ring arm genuinely does not compile off aarch64, and a
     /// future one may need it - but a new member needs a hardware reason written down beside it.
+    ///
+    /// ⚠ CORRECTION (SO47, 2026-09-13): the line above says "a future one may need it", and A GATE
+    /// IN THIS FILE SAYS OTHERWISE. `no_verb_is_pinned_to_a_platform_without_a_capability` asserts
+    /// `!matches!(a, Avail::Aarch64)` over EVERY member of `HOST_VERBS`, so this variant is empty BY
+    /// TEST, not by convention - a new member reds `cargo test -p midden_core` before it ever reaches
+    /// a reviewer. MEASURED, not read: registering SO47's `dns` here failed 2 of 16 tests
+    /// (`lib.rs:972` and `lib.rs:940`, "`dns` must be a verb on Facts { aarch64: false, .. }").
+    /// Whoever wants a member must amend that test and argue with R26 clause 3 in the same breath;
+    /// the "hardware reason" above is the bar to clear. An invitation this file's own gate refuses is
+    /// worse than no invitation, so the two paragraphs are read together or not at all.
+    ///
+    /// SO47's `dns` is the first verb since RELICS whose ring arm is genuinely aarch64-gated
+    /// (`#[cfg(all(feature = "net6", target_arch = "aarch64"))]`) and it is registered `Always`
+    /// anyway; the full reasoning sits beside that registration in `HOST_VERBS`. The short of it:
+    /// this variant would not have been narrower (the arm is `net6` AND `aarch64`, this is only
+    /// `aarch64`), and on the x86 half it does not make a verb absent - it makes it look like a typo.
     Aarch64,
     /// aarch64 + `v3d` (the GPU battery replay).
     V3d,
@@ -273,6 +289,51 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // network
     ("ifconfig", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
     ("nc", Avail::Always), ("curl", Avail::Always),
+    // SO47 (NETVERB, 2026-09-13): `dns` was MISSING from this group, so `dns google.com` fell to the
+    // `Plan::Say(TerminalError)` at the bottom of `plan` and the shell's own `"dns"` arm
+    // (`shell.rs:5594`, `#[cfg(all(feature = "net6", target_arch = "aarch64"))]`) had never been
+    // reachable on ANY build. The tell on the render14 wire is that a BARE `dns` with no arguments
+    // returned the same 44-byte error as `dns google.com` — a verb that parsed its argument could not
+    // do that, and 44 is exactly the length of this file's "Unknown command." refusal.
+    //
+    // `Avail::Always`, and NOT `Avail::Aarch64`, and the reason is not a preference:
+    //
+    //  * `Aarch64` is not NARROWER here, it is the SAME looseness with a worse failure. The arm is
+    //    `all(net6, aarch64)`; `Aarch64` is `aarch64`. On an aarch64 build with `net6` off the word
+    //    is still a verb with no arm, so BOTH spellings land in the drift net either way. What
+    //    `Aarch64` changes is only the x86 half — and there it does not make the verb absent, it
+    //    makes it indistinguishable from a typo: `facts.exec` is true on x86, `resolve_exec("dns")`
+    //    finds no DNS.ELF, and the shell answers with the very 44-byte `TerminalError` this fix
+    //    exists to delete. Trading a sentence that names the verb for one that denies it is a
+    //    regression wearing the shape of precision.
+    //  * R26 clause 3 already ruled this exact case. `burst` and `simmer` were `Avail::Aarch64` "for
+    //    no hardware reason" and were moved HERE, to `Always`, with the ring arm left to refuse
+    //    honestly and by name. The `Aarch64` variant's own comment asks a new member for a HARDWARE
+    //    reason, and `dns` has none: a resolver is not a device, x86 already resolves names through
+    //    `smolnet::resolve` (the SNTP client's), and the missing x86 `dns` verb is an UNWRITTEN ARM,
+    //    not an absent capability. Peter's words on the clause: "this is one OS not a bunch of
+    //    separate ones."
+    //  * The test at the bottom of this file already encodes that ruling as a rule — every standard
+    //    word in the `// network` group is asserted `is_verb` on ALL THREE fact sets, x86 included.
+    //    `dns` is a standard word in that group; registering it any other way would make it the one
+    //    member of its own group that the rule does not hold for.
+    //
+    // EXACT was considered and is out of reach from this file alone: `Facts` carries no `net6` fact,
+    // and inventing `Avail::Net6` + `Facts::net6` needs a PRODUCER in `midden_facts()` (shell.rs) to
+    // set it. Added here without that producer the field is false on every build and the verb
+    // registers NOWHERE, which is strictly worse than today. It is worth doing when someone holds
+    // both files — one field, one variant, one line in `midden_facts()` — and it is overkill for any
+    // smaller reason than closing the drift below.
+    //
+    // ⚠ WHAT THIS COSTS, stated rather than left for a reader to trip over: `shell.rs:6103-6122`
+    // documents the `other =>` drift net as UNREACHABLE BY CONSTRUCTION — "that set is empty today,
+    // because every `Avail` in `HOST_VERBS` mirrors the `#[cfg]` on its arm below exactly". With
+    // this line that is no longer true: typing `dns` on a build without `all(net6, aarch64)` reaches
+    // the net and prints "dns: not available on this build (the verb exists; this kernel does not
+    // carry it)". The BEHAVIOUR is right — that sentence is exactly R26 clause 3's honest refusal —
+    // but the COMMENT overstates and must be corrected in the same fold (reported, not edited here:
+    // shell.rs is outside this arc's file list).
+    ("dns", Avail::Always),
     // apps + scheduler + power + witnesses
     ("v3d", Avail::V3d),
     // RELICS (R26 clause 3, Peter: "you must stop trying to pin everything down and lock it in
@@ -877,8 +938,12 @@ mod tests {
             }
             // ... and the standard word that replaced it is a verb on EVERY build (clause 3: no
             // verb is pinned to a platform; the ring arm decides the answer, not the word).
+            // SO47: `dns` joins this list deliberately. It is the one verb here whose ring arm is
+            // genuinely aarch64-gated, so it is the case that proves the rule rather than an
+            // exception to it — if a later hand narrows its `Avail`, THIS assertion reds on the x86
+            // fact set instead of the shell quietly answering "Unknown command" on a real build.
             for w in ["dmesg", "mount", "hexdump", "lsusb", "ifconfig", "fdisk", "dd", "ps",
-                      "nc", "curl", "snap", "setfattr", "burst", "simmer", "batmon", "top"] {
+                      "nc", "curl", "snap", "setfattr", "burst", "simmer", "batmon", "top", "dns"] {
                 assert!(is_verb(w, &f), "`{}` must be a verb on {:?}", w, f);
                 assert!(
                     matches!(plan(w, &f, &mut vol()), Plan::Host { .. }),
