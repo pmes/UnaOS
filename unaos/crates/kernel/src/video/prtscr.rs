@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! PRTSCR — the screen capture: panel pixels to `SCREEN<n>.PNG` at the root of the FAT volume.
+//! PRTSCR — the screen capture: panel pixels to `SCREEN<n>.PNG` in the LOGGED-IN USER'S OWN
+//! `Pictures/Screenshots` folder (PRTSCR-HOME below), and nowhere at all when nobody is logged in.
 //!
 //! Two ways in, one mechanism:
 //!
@@ -52,10 +53,97 @@
 //!
 //! ## Naming
 //!
-//! `SCREEN0.PNG` .. `SCREEN99.PNG` at the volume root, first free index wins. **An existing capture
-//! is never overwritten**: the search asks the filesystem for each candidate and takes the first
-//! `NotFound`. When all hundred are taken the verb refuses and says so — it does not wrap around and
-//! clobber `SCREEN0.PNG`. The names are deliberately 8.3-clean so they need no long-name entry.
+//! `SCREEN0.PNG` .. `SCREEN99.PNG` **in the capture directory** (PRTSCR-HOME, next section — it was
+//! the volume root until this arc), first free index wins. **An existing capture is never
+//! overwritten**: the search asks the filesystem for each candidate and takes the first `NotFound`.
+//! When all hundred are taken the verb refuses and says so — it does not wrap around and clobber
+//! `SCREEN0.PNG`. The names are deliberately 8.3-clean so they need no long-name entry.
+//!
+//! ## PRTSCR-HOME — a capture belongs to A USER, and lands in that user's own folder
+//!
+//! Peter, 2026-09-13: *"screenshots should be saved to a user's ~/Pictures/Screenshots"*. This is a
+//! consequence of R51 (multi-user as a line: a human logs in and gets a home folder), and the whole
+//! of what it settles is WHOSE folder — which makes the no-session case the load-bearing half, not
+//! an edge.
+//!
+//! ### The destination
+//!
+//! [`fs::users::whoami`](crate::fs::users::whoami) names the open session; [`home_of`] turns that
+//! name into the user's home path — `crate::fs::users::home_of`, the accessor that already exists;
+//! `/home/<name>`, the same path `ensure_home` creates on the EL0
+//! FAT volume at first login). The capture directory is that home plus `Pictures` plus
+//! `Screenshots`, and [`ensure_capture_dir`] creates any of those that are absent, in order, on the
+//! volume [`mount_capture_target`] settled on.
+//!
+//! Note which volume that is, because the two can differ and the difference is not a bug: the home
+//! `ensure_home` makes lives on the EL0 volume, while a capture goes to the PRTSCR-VOL ladder's
+//! answer — which on a read-only-boot bench is the operator's own USB stick. On that stick we create
+//! the SAME shaped path under the SAME user name. That is the right answer for a carry-away medium
+//! (it is still that user's screenshot, in that user's folder, on that user's disk) and the
+//! `source=`/`serial=` fields on every verdict say which disk it was.
+//!
+//! ### ⚠ THE 8.3 QUESTION, ANSWERED FROM THE CODE THAT DECIDES IT
+//!
+//! **This FAT layer READS long file names and WRITES 8.3 only.** Both halves are load-bearing here:
+//!
+//!  * **Read** — PI-FS-3. `fs/fat.rs`'s `LfnBuf` accumulates the 0x0F-attribute VFAT component slots
+//!    that precede a short entry, checksum-validates the run against the short name, and decodes it;
+//!    `DirEntry::eq_name` (`fs/fat.rs:190`) then matches EITHER the long name or the 8.3 short name,
+//!    ASCII-case-insensitively. So `locate_in_dir(pictures, "Screenshots")` **does** find a folder a
+//!    real VFAT driver created, spelled exactly as the user spelled it.
+//!  * **Write** — `fs/fat.rs:118` states it outright: *"this driver's create path writes 8.3 names
+//!    only (VFAT LFN write is out of scope)"*. `format_83` (`fs/fat.rs:325`) is the decider: base
+//!    `1..=8` characters, extension `0..=3`, each a legal short-name byte, or `None`. `create_dir`
+//!    validates through it before it allocates anything (`fs/fat.rs:3562`), so a name it rejects
+//!    comes back `FatError::Unsupported` and no cluster leaks.
+//!
+//! `"Screenshots"` is ELEVEN characters. `format_83` returns `None` for it. **We cannot create a
+//! directory called `Screenshots` on this filesystem, and pretending otherwise would be the lie.**
+//! So the rule here is *look up long, create short*:
+//!
+//! | what the user asked for | looked up as | created as | why |
+//! |---|---|---|---|
+//! | `Pictures`    | `Pictures`    | `PICTURES` | 8 characters — a legal 8.3 base, no compromise at all. Stored uppercase because short names are. |
+//! | `Screenshots` | `Screenshots` | `SCRSHOTS` | 11 characters — impossible as a short name. [`DIR_SHOTS`] |
+//!
+//! Both lookups run BEFORE either create, so a volume that already carries a real `Pictures/
+//! Screenshots` (a stick formatted and filled on a host) is adopted verbatim and nothing new is
+//! made. Only when the folder is genuinely absent do we write our own, and then it is `SCRSHOTS`.
+//!
+//! **`SCRSHOTS`, not `SCREENSH`.** A truncation to the first eight characters reads as a corrupted
+//! word, and it is also the shape a real VFAT alias would NOT take (Windows would write `SCREEN~1`
+//! beside a long entry). `SCRSHOTS` is visibly an abbreviation, so an operator looking at the stick
+//! on another machine sees a deliberate name rather than damage. What the user sees is therefore
+//! `/home/<name>/Pictures/SCRSHOTS` on a volume we created it on, and
+//! `/home/<name>/Pictures/Screenshots` on one where the folder already existed. The mapping is
+//! printed on the PRTSCR-DIR witness line of every capture, so it is never something a reader has to
+//! infer. Should the create path ever learn to write LFN component slots, [`DIR_SHOTS`]'s second
+//! field is the one place that changes.
+//!
+//! ### ⚠ NO SESSION MEANS NO CAPTURE — and that is the answer, not a gap
+//!
+//! There is usually no logged-in user on these boards, and on an ordinary build there is not even
+//! the machinery for one — `fs/users.rs` is `#[cfg(feature = "login")]` (`fs/mod.rs:105`), `login`
+//! is not a default feature, and the login screen does not open at boot even when it is built
+//! (SO43). Those are two different facts and the wire keeps them apart: [`WHY_NO_LOGIN`] for an
+//! image with no user store, [`WHY_NO_SESSION`] for one that has it and nobody logged in.
+//! Peter, 2026-09-13: *"do not hack screenshots to make it work right before multi-user is in."*
+//!
+//! So a capture with no session is **REFUSED** — [`Refusal::NoSession`], one bounded line naming the
+//! reason, **zero bytes written**. Not the volume root, not a shared folder, not a temporary landing
+//! place under a new name. The three things that refusal deliberately is NOT:
+//!
+//!  * it is not a fallback. A shared destination would make the feature LOOK finished on a machine
+//!    where multi-user is not, and would have to be torn out and re-argued the moment sessions open;
+//!  * it is not an error path. It is a first-class outcome with its own witness, its own reason
+//!    token and its own fixture ([`dir_fixture`]), gone green from the boot it ships on;
+//!  * it is not deferred work. The code is complete and correct as written; what it waits for is a
+//!    session to exist, and nothing here changes when one does.
+//!
+//! **The refusal is checked FIRST**, before the panel and before the volume — see [`Job::begin`].
+//! A capture that can never belong to anyone must not spin up the PRTSCR-VOL ladder, must not choose
+//! a name, and must not create a directory entry, so the check that guarantees all three sits ahead
+//! of all three. On a no-session boot a capture therefore costs one lock and one line.
 //!
 //! ## Where a capture may land — PRTSCR-VOL, the two-rung target ladder
 //!
@@ -316,9 +404,15 @@ pub fn request() {
 /// returns so its caller can poll the keyboard again. It used to run the whole encode-and-write —
 /// 6–9 s on the Orin, 70 s on the rMBP — from inside the pass that services input, which is SR2.
 ///
-/// Costs two relaxed loads per call when idle, which is why it can sit unconditionally beside
-/// `fat::probe_once()` at every storage-ready pass this kernel carries.
+/// Costs THREE relaxed loads per call when idle (two until PRTSCR-HOME added [`dir_fixture`]'s
+/// one-shot latch below), which is why it can still sit unconditionally beside `fat::probe_once()`
+/// at every storage-ready pass this kernel carries.
 pub fn service() {
+    // PRTSCR-HOME: the destination fixture, once per boot. It is here rather than behind a knob
+    // because the no-session refusal it measures is what EVERY board does today — a gate that only
+    // runs when someone remembers a knob would never have measured the ordinary case even once.
+    // One relaxed load per pass after the first; see `dir_fixture` for both arms and their go-reds.
+    dir_fixture();
     if !PENDING.load(Ordering::Relaxed) && !SLICING.load(Ordering::Relaxed) {
         return;
     }
@@ -406,11 +500,26 @@ pub struct Shot {
     pub bytes: usize,
     /// PRTSCR-VOL — WHICH volume the file landed on. See [`VolId`] at this file's tail.
     pub vol: VolId,
+    /// PRTSCR-HOME — the capture directory as it is spelled ON DISK (e.g.
+    /// `HOME/UNA/PICTURES/SCRSHOTS`), for the verdict line's `dir=` field.
+    pub dir: String,
+    /// PRTSCR-HOME — that directory's first cluster, so a reader (PRTSCR-ST) can find the file
+    /// again without re-walking the path.
+    pub dir_cluster: u32,
 }
 
 /// Why a capture did not happen. Every variant carries what it inspected, not just what was
 /// missing — the WINX-8 refusal discipline.
 pub enum Refusal {
+    /// PRTSCR-HOME — **there is no user to save this capture for.** The reason token says which of
+    /// the three shapes it is: `no-session` (nobody is logged in — the ordinary case on every board
+    /// until SO43's login screen opens at boot), `unknown-user` (a session names a user the store
+    /// has no row for), `bad-home` (the row's home path is not one this FAT layer can walk).
+    ///
+    /// A first-class outcome, not an error path: nothing is written, no name is chosen, no volume is
+    /// touched, and the wire says so in one line. See the module note's NO SESSION section for why
+    /// this is a refusal and not a shared-folder fallback.
+    NoSession(&'static str),
     /// No framebuffer attached, or the panel lock was contended while masked.
     NoPanel,
     /// The panel's pixel layout has no colour inverse (`U8` greyscale, or an unknown format).
@@ -446,6 +555,15 @@ impl Refusal {
     /// lines: a guard with a `return`, never a panic, never silence.
     pub fn report(&self) {
         match self {
+            // PRTSCR-HOME: the ONE line a no-session capture costs. It names the reason token, says
+            // plainly that nothing was written, and names what would end the refusal — so an
+            // operator reading a boot log is never left to wonder where the file went.
+            Refusal::NoSession(why) => serial_println!(
+                ":: PRTSCR: no user session (reason={}) — a capture belongs to a user's {}/{} and there is none; NOTHING WRITTEN (no name chosen, no volume touched) — capture skipped ::",
+                why,
+                DIR_PICTURES.0,
+                DIR_SHOTS.0
+            ),
             Refusal::NoPanel => serial_println!(
                 ":: PRTSCR: no panel attached (or the panel lock was contended while masked) — capture skipped ::"
             ),
@@ -465,7 +583,7 @@ impl Refusal {
                 why
             ),
             Refusal::AllTaken(v) => serial_println!(
-                ":: PRTSCR: SCREEN0.PNG..SCREEN{}.PNG all present at the volume root — capture skipped (nothing overwritten) :: source={} serial=0x{:08X} ::",
+                ":: PRTSCR: SCREEN0.PNG..SCREEN{}.PNG all present in the capture directory — capture skipped (nothing overwritten) :: source={} serial=0x{:08X} ::",
                 MAX_CAPTURES - 1,
                 v.source,
                 v.serial
@@ -507,6 +625,10 @@ impl Refusal {
     /// (FATVERB's two-sinks-two-lengths rule).
     pub fn sentence(&self) -> String {
         match self {
+            Refusal::NoSession(why) => alloc::format!(
+                "screenshot: refused ({}) — a screenshot is saved to a user's {}/{} and nobody is logged in",
+                why, DIR_PICTURES.0, DIR_SHOTS.0
+            ),
             Refusal::NoPanel => String::from("screenshot: no panel attached"),
             Refusal::NoFormat(f) => alloc::format!("screenshot: panel layout {:?} has no RGB inverse", f),
             Refusal::NoVolume(e) => alloc::format!("screenshot: no FAT filesystem ({:?})", e),
@@ -664,23 +786,28 @@ fn usb_backed(fs: &FatFs) -> bool {
     false
 }
 
-/// The first `SCREEN<n>.PNG` the volume root does not already hold.
+/// The first `SCREEN<n>.PNG` the CAPTURE DIRECTORY does not already hold.
 ///
 /// Asks the filesystem per candidate rather than scanning a directory listing, because
 /// `locate_in_dir` matches on BOTH the 8.3 short name and any long name — a file whose long name
 /// differs from its short name would slip past a listing scan and then be duplicated by
-/// `create_in_dir`, which does not de-duplicate. Cluster `0` is the root on every FAT kind here.
-fn next_free_name(fs: &FatFs) -> Result<String, Refusal> {
+/// `create_in_dir`, which does not de-duplicate.
+///
+/// PRTSCR-HOME: `dir` is [`ensure_capture_dir`]'s answer — the user's `Pictures/Screenshots` — where
+/// it used to be a hardcoded `0` (the volume root). The index therefore counts PER USER, which is
+/// what an operator expects: two users each get their own `SCREEN0.PNG`, and neither can exhaust the
+/// other's hundred names.
+fn next_free_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
     for n in 0..MAX_CAPTURES {
         let name = alloc::format!("SCREEN{}.PNG", n);
-        match busy_retry(|| match fs.locate_in_dir(0, &name) {
+        match busy_retry(|| match fs.locate_in_dir(dir, &name) {
             Ok(hit) => Ok(Some(hit)),
             Err(FatError::NotFound) => Ok(None),
             Err(e) => Err(e),
         }) {
             Ok(None) => return Ok(name),
             Ok(Some(_)) => continue,
-            Err(e) => return Err(Refusal::Fat(vol_id(fs), "root lookup", e)),
+            Err(e) => return Err(Refusal::Fat(vol_id(fs), "capture directory lookup", e)),
         }
     }
     Err(Refusal::AllTaken(vol_id(fs)))
@@ -741,6 +868,11 @@ struct Job {
     panel: FrameBuffer,
     /// `SCREEN<n>.PNG`. Moved out into the [`Shot`] at the verdict.
     name: String,
+    /// PRTSCR-HOME — the resolved capture directory's first cluster (the user's
+    /// `Pictures/Screenshots`), and its on-disk spelling for the witness. Settled in [`Job::begin`],
+    /// before a pixel is read, so a sliced capture cannot change its mind about where it is going.
+    dir_cluster: u32,
+    dir: String,
     width: u32,
     height: u32,
     /// The reserved length the `-> capturing` line published. Denominator of the slice witness.
@@ -790,6 +922,13 @@ impl Job {
     /// to run inline. The panel and the volume are settled, the name is chosen and announced, and
     /// the output buffer is reserved, all before a single pixel is read.
     fn begin() -> Result<Job, Refusal> {
+        // 0. PRTSCR-HOME — **WHOSE capture is this?** First of all the refusals, ahead of the panel
+        //    and ahead of the volume, because a capture that can belong to nobody must not spin up
+        //    the PRTSCR-VOL ladder, must not choose a name, and must not create a directory entry.
+        //    Putting the check here is what makes "zero bytes written" a structural property rather
+        //    than a claim: on a no-session boot this returns before any of the three can happen.
+        let plan = live_plan()?;
+
         // 1. The panel — through the sanctioned door, and only for the HANDLE. See the module note.
         let panel = crate::video::panel_snapshot().ok_or(Refusal::NoPanel)?;
         if !panel.is_ready() {
@@ -811,8 +950,12 @@ impl Job {
         let usb_backed = usb_backed(&fs);
         let vol_gen = crate::drivers::block::usb_publish_gen();
 
-        // 3. A name nothing else owns.
-        let name = next_free_name(&fs)?;
+        // 3. PRTSCR-HOME — the user's own folder, created if absent, on THIS volume. One witness
+        //    line per capture (`ensure_capture_dir` prints it), never one per slice.
+        let (dir_cluster, dir) = ensure_capture_dir(&fs, &plan)?;
+
+        // 4. A name nothing else owns, IN THAT DIRECTORY.
+        let name = next_free_name(&fs, dir_cluster)?;
 
         // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is
         // one of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture.
@@ -824,7 +967,7 @@ impl Job {
             name, width, height, need
         );
 
-        // 4. The encoder. `PngEncoder::new` reserves the whole output up front, so an allocator
+        // 5. The encoder. `PngEncoder::new` reserves the whole output up front, so an allocator
         //    refusal arrives here — before any pixel is read — rather than halfway down the screen.
         let enc =
             PngEncoder::new(width, height).map_err(|e| Refusal::Encode(e, width, height, need))?;
@@ -837,6 +980,8 @@ impl Job {
             fs,
             panel,
             name,
+            dir_cluster,
+            dir,
             width,
             height,
             need,
@@ -941,8 +1086,10 @@ impl Job {
                 }
                 // The entry is created only now, with the pixels already in hand: the same
                 // four-step recipe `shell::fs_write` uses, minus the truncate branch, which cannot
-                // apply — `next_free_name` only ever returns a name the root does not hold.
-                let (dir_lba, dir_off) = match busy_retry(|| self.fs.create_in_dir(0, &self.name, 0x20)) {
+                // apply — `next_free_name` only ever returns a name that directory does not hold.
+                // PRTSCR-HOME: into `dir_cluster`, the user's own folder, where this was `0`.
+                let dc = self.dir_cluster;
+                let (dir_lba, dir_off) = match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
                     Ok((_, lba, off)) => (lba, off),
                     Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
                 };
@@ -1000,6 +1147,8 @@ impl Job {
                         height: self.height,
                         bytes: done,
                         vol: vol_id(&self.fs),
+                        dir: core::mem::take(&mut self.dir),
+                        dir_cluster: self.dir_cluster,
                     }))
                 }
             }
@@ -1054,7 +1203,27 @@ pub fn selftest_once() {
     static DONE: AtomicBool = AtomicBool::new(false);
     static SAID_NO_VOLUME: AtomicBool = AtomicBool::new(false);
     static SAID_READ_ONLY: AtomicBool = AtomicBool::new(false);
+    static SAID_NO_SESSION: AtomicBool = AtomicBool::new(false);
     if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    // PRTSCR-HOME: a capture belongs to a user, so this selftest cannot run before one exists. That
+    // is a WAIT of exactly the shape the two below already are — announced once, never latched, and
+    // it ends the moment a session opens (SO43's login screen at boot, or the `login` verb). It is
+    // deliberately NOT a FAIL: on every board today there is no session at boot, and a permanent red
+    // that means "the feature is correct and nothing has exercised it" is a broken instrument.
+    //
+    // It is also FIRST, ahead of the mount, so a no-session boot leaves one line and never churns
+    // the PRTSCR-VOL ladder's decline witness on every storage-ready pass.
+    if let Err(why) = live_plan() {
+        if !SAID_NO_SESSION.swap(true, Ordering::Relaxed) {
+            why.report();
+            serial_println!(
+                ":: PRTSCR-ST: SKIPPED — no user session yet, so there is no {}/{} to capture into; still waiting, and this selftest runs on the first pass after a login ::",
+                DIR_PICTURES.0,
+                DIR_SHOTS.0
+            );
+        }
         return;
     }
     let fs = match mount_capture_target() {
@@ -1116,11 +1285,14 @@ pub fn selftest_once() {
     // file's own first and last bytes. Head and tail rather than the whole file: at 2880x1800 the
     // whole file is 15.5 MiB, and the three facts that matter are structural. A truncated write
     // cannot pass all three, because the size is the directory's own and the IEND is at the end.
-    let (de, _, _) = match fs.locate_in_dir(0, &shot.name) {
+    // PRTSCR-HOME: read back from the CAPTURE DIRECTORY the shot names, not the root — which is
+    // itself part of what this selftest now proves. A file that landed anywhere else fails here.
+    let (de, _, _) = match fs.locate_in_dir(shot.dir_cluster, &shot.name) {
         Ok(hit) => hit,
         Err(e) => {
             serial_println!(
-                ":: PRTSCR-ST: FAIL — {} is not in the root after the write ({:?}) ::", shot.name, e
+                ":: PRTSCR-ST: FAIL — {} is not in {} after the write ({:?}) ::",
+                shot.name, shot.dir, e
             );
             return;
         }
@@ -1150,8 +1322,8 @@ pub fn selftest_once() {
 
     if sig_ok && ihdr_ok && colour_ok && dims_ok && iend_ok {
         serial_println!(
-            ":: PRTSCR-ST: {} on the medium — {} bytes, PNG signature OK, IHDR {}x{} depth 8 colour 2 non-interlaced, IEND OK -> PASS ::",
-            shot.name, de.size, w, h
+            ":: PRTSCR-ST: {}/{} on the medium — {} bytes, PNG signature OK, IHDR {}x{} depth 8 colour 2 non-interlaced, IEND OK -> PASS ::",
+            shot.dir, shot.name, de.size, w, h
         );
     } else {
         serial_println!(
@@ -1216,15 +1388,20 @@ impl Shot {
     /// ::/` (A17, :320 and :888) and `/:: PRTSCR: .* bytes -> OK ::/` (A36, :702), and both need
     /// `bytes -> OK ::` CONTIGUOUS. A field inserted before that `::` would have silently zeroed
     /// three census counters — a check that cannot fire, produced by a witness change.
+    /// PRTSCR-HOME appends `dir=` to that SECOND segment for exactly the reason the paragraph above
+    /// gives: the destination is now the interesting half of the verdict, and it still may not sit
+    /// between `bytes` and `-> OK ::`. A reader gets the full on-disk path — the user's own folder,
+    /// in the 8.3 spelling the medium actually holds — beside the disk it landed on.
     pub fn report_ok(&self) {
         serial_println!(
-            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} ::",
+            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} dir={} ::",
             self.name,
             self.width,
             self.height,
             self.bytes,
             self.vol.source,
-            self.vol.serial
+            self.vol.serial,
+            self.dir
         );
     }
 }
@@ -1299,5 +1476,436 @@ fn vol_declined(r1: VolReason, r2: VolReason) {
         ":: PRTSCR-VOL: rung=none rung1={} rung2={} -> NO TARGET ::",
         r1.1,
         r2.1
+    );
+}
+
+// ======================= PRTSCR-HOME — A CAPTURE BELONGS TO A USER (SCRSHOT) =======================
+//
+// Peter, 2026-09-13: "screenshots should be saved to a user's ~/Pictures/Screenshots", and — on the
+// no-session half — "do not hack screenshots to make it work right before multi-user is in."
+//
+// The module note at this file's head carries the argument in full: the 8.3 table, why `Screenshots`
+// is written `SCRSHOTS`, and why a capture with no session is REFUSED rather than given a shared
+// folder. This block is the mechanism, appended at the TAIL for the reason PRTSCR-VOL states — a
+// definition inserted higher up shifts every `panic::Location` below it.
+//
+// ⚠ THIS BLOCK READS `fs::users` AND WRITES NOTHING THERE. `whoami` and `home_of` are already public
+// and are the whole of the interface; the user store, the session record and `/home/<name>`'s
+// creation at first login all stay `fs/users.rs`'s business.
+
+/// PRTSCR-HOME — a directory this capture path needs, in BOTH spellings the FAT layer requires:
+/// `(what we LOOK UP, what we CREATE)`. See the module note's 8.3 table for why they differ.
+///
+/// The lookup spelling is what a human wrote, and `DirEntry::eq_name` (`fs/fat.rs:190`) matches it
+/// against a VFAT long name as readily as against an 8.3 short name — so a folder made on another
+/// machine is found and adopted with its own spelling intact. The create spelling is only ever used
+/// when the lookup came back `NotFound`, and it must satisfy `format_83` (`fs/fat.rs:325`) or
+/// `create_dir` refuses it with `FatError::Unsupported`.
+type DirName = (&'static str, &'static str);
+
+/// `Pictures` is EIGHT characters — a legal 8.3 base exactly as written. Stored uppercase because
+/// short names are stored uppercase; no information is lost and the lookup finds it either way.
+const DIR_PICTURES: DirName = ("Pictures", "PICTURES");
+
+/// `Screenshots` is ELEVEN characters and `format_83` returns `None` for it, so it CANNOT be created
+/// on this filesystem. `SCRSHOTS` is the honest short name: eight characters, visibly an
+/// abbreviation rather than the truncation `SCREENSH`, which reads as a damaged word and is not even
+/// the alias a real VFAT driver would write (that would be `SCREEN~1`, beside a long entry we have
+/// no way to author). **This constant is the single place that changes** if the create path ever
+/// learns to write LFN component slots — nothing else in the module encodes the short spelling.
+const DIR_SHOTS: DirName = ("Screenshots", "SCRSHOTS");
+
+/// PRTSCR-HOME — nobody is logged in. The ordinary state of every board today: the login screen does
+/// not open at boot (SO43).
+const WHY_NO_SESSION: &str = "no-session";
+/// PRTSCR-HOME — **this image has no user store at all.** `fs/users.rs` is `#[cfg(feature = "login")]`
+/// (`fs/mod.rs:105`) and `login` is not a default feature, so on an ordinary build there is not only
+/// no session — there is no machinery that could ever open one, and `whoami`/`home_of` do not exist
+/// to be called. A separate token from `no-session` because they are genuinely different facts and
+/// an operator reading the wire deserves to know which one they have: `no-session` is answered by
+/// logging in, `no-login-built` is answered by building with `UNAOS_LOGIN=1`.
+const WHY_NO_LOGIN: &str = "no-login-built";
+/// PRTSCR-HOME — a session names a user the store has no row for. `home_of` answers `None`; we
+/// refuse rather than invent a home for a principal the store does not know.
+const WHY_UNKNOWN_USER: &str = "unknown-user";
+/// PRTSCR-HOME — the row's home path is not one this FAT layer can walk: empty, or deeper than
+/// [`DIR_DEPTH_MAX`] leaves room for. Refused for the same reason as the other two — a destination
+/// we cannot state exactly is one we must not write to.
+const WHY_BAD_HOME: &str = "bad-home";
+
+/// PRTSCR-HOME — the most directory components a capture path may have, home and the two leaves
+/// together. A home is `/home/<name>` (two components) on every row this store can hold, so eight is
+/// slack, not a limit anyone meets; it exists so the walk is bounded by construction rather than by
+/// the shape of data read off a disk.
+const DIR_DEPTH_MAX: usize = 8;
+
+/// PRTSCR-HOME — how many bytes of the resolved path the witness line prints.
+///
+/// The walk itself is never truncated; only the RENDERING is. An adopted long name can be up to
+/// `LNAME_MAX` (768) bytes (`fs/fat.rs:114`), and two of those would put ~1.5 KB on one serial line —
+/// against this module's standing rule that a capture's witness is bounded (the SLICE_LINES_MAX
+/// discipline: evidence, not a progress bar). Components are appended whole, so a clipped path
+/// always ends at a component boundary and never mid-character.
+const DIR_PATH_MAX: usize = 120;
+
+/// PRTSCR-HOME — the destination a capture has been resolved to, before any volume is touched.
+///
+/// Holds the session's user name and that user's home path by VALUE (inline arrays, no allocation),
+/// so the `fs::users` locks are taken once, at the top of [`Job::begin`], and never again for the
+/// seconds a sliced capture runs. A logout mid-capture therefore cannot move a capture already in
+/// flight — it lands in the folder it was opened for, which is the only answer that is not a race.
+struct DirPlan {
+    user: [u8; USER_NAME_MAX],
+    user_len: usize,
+    home: [u8; USER_HOME_MAX],
+    home_len: usize,
+}
+
+/// PRTSCR-HOME — `fs::users::NAME_MAX` and `HOME_MAX`, MIRRORED, and the mirror is not a choice.
+///
+/// `fs/users.rs` is `#[cfg(feature = "login")]` (`fs/mod.rs:105`), so on an ordinary build the
+/// module does not exist and its constants cannot be named — while [`DirPlan`] has to have a size in
+/// every build. Mirroring is the only way to write the type down.
+///
+/// A mirror is a drift hazard, so it carries its own enforcer: the `const` block below fails the
+/// BUILD — not a test, not a gate someone has to remember — the moment a `login` image's real
+/// constants stop matching these. That is the whole cost of the mirror paid at compile time, on
+/// exactly the configuration where the two are both visible.
+const USER_NAME_MAX: usize = 8;
+const USER_HOME_MAX: usize = 32;
+
+#[cfg(feature = "login")]
+const _: () = {
+    assert!(USER_NAME_MAX == crate::fs::users::NAME_MAX);
+    assert!(USER_HOME_MAX == crate::fs::users::HOME_MAX);
+};
+
+/// PRTSCR-HOME — the open session's user name, or `None`. The `not(login)` arm is not a stub that
+/// fakes an answer: an image with no user store HAS no session, and saying `None` is the truth.
+#[cfg(feature = "login")]
+fn session_user(out: &mut [u8; USER_NAME_MAX]) -> Option<usize> {
+    crate::fs::users::whoami(out)
+}
+#[cfg(not(feature = "login"))]
+fn session_user(_out: &mut [u8; USER_NAME_MAX]) -> Option<usize> {
+    None
+}
+
+/// PRTSCR-HOME — that user's home path from the store, or the reason there is not one.
+#[cfg(feature = "login")]
+fn home_lookup(name: &[u8], out: &mut [u8; USER_HOME_MAX]) -> Result<usize, Refusal> {
+    crate::fs::users::home_of(name, out).ok_or(Refusal::NoSession(WHY_UNKNOWN_USER))
+}
+#[cfg(not(feature = "login"))]
+fn home_lookup(_name: &[u8], _out: &mut [u8; USER_HOME_MAX]) -> Result<usize, Refusal> {
+    Err(Refusal::NoSession(WHY_NO_LOGIN))
+}
+
+impl DirPlan {
+    /// The session user's name. Always valid UTF-8: `users::name_ok` admits only `[a-z0-9_-]`.
+    fn user_str(&self) -> &str {
+        core::str::from_utf8(&self.user[..self.user_len]).unwrap_or("?")
+    }
+
+    /// The user's home path as the store spells it (`/home/<name>`).
+    fn home_str(&self) -> &str {
+        core::str::from_utf8(&self.home[..self.home_len]).unwrap_or("/")
+    }
+}
+
+/// PRTSCR-HOME — **decide the destination, touching nothing.**
+///
+/// Pure with respect to the machine: no volume, no panel, no I/O, no globals beyond the user store
+/// this reads through its own accessor. That is deliberate and it is what lets [`dir_fixture`] prove
+/// both arms on a board with no filesystem attached at all.
+///
+/// `None` is the ordinary case and it is a REFUSAL, not a default. See the module note.
+fn plan_dir(user: Option<&[u8]>) -> Result<DirPlan, Refusal> {
+    let name = user.ok_or(Refusal::NoSession(WHY_NO_SESSION))?;
+    if name.is_empty() || name.len() > USER_NAME_MAX {
+        return Err(Refusal::NoSession(WHY_UNKNOWN_USER));
+    }
+    let mut home = [0u8; USER_HOME_MAX];
+    // `home_of` is the store's own accessor for this and it is already public — the brief's
+    // instruction and the right seam: the home a capture uses is the home the login created, read
+    // from the row rather than re-derived here from a convention that could drift.
+    let home_len = home_lookup(name, &mut home)?;
+    if home_len == 0 {
+        return Err(Refusal::NoSession(WHY_BAD_HOME));
+    }
+    let mut user = [0u8; USER_NAME_MAX];
+    user[..name.len()].copy_from_slice(name);
+    Ok(DirPlan { user, user_len: name.len(), home, home_len })
+}
+
+/// PRTSCR-HOME — [`plan_dir`] for the session that is actually open right now.
+///
+/// An image built WITHOUT the user store answers [`WHY_NO_LOGIN`] rather than [`WHY_NO_SESSION`] —
+/// the same refusal, a different and more useful sentence, because the two are cured by different
+/// things (logging in, versus building with `UNAOS_LOGIN=1`).
+fn live_plan() -> Result<DirPlan, Refusal> {
+    if !cfg!(feature = "login") {
+        return Err(Refusal::NoSession(WHY_NO_LOGIN));
+    }
+    let mut nb = [0u8; USER_NAME_MAX];
+    match session_user(&mut nb) {
+        Some(n) => plan_dir(Some(&nb[..n])),
+        None => plan_dir(None),
+    }
+}
+
+/// PRTSCR-HOME — the on-disk path a home resolves to, in the spelling the CREATE path would use.
+///
+/// `/home/una` -> `HOME/UNA/PICTURES/SCRSHOTS`. Uppercase because `format_83` upcases every byte it
+/// stores, so this is what a reader of the medium sees — not a presentation choice made here.
+///
+/// Pure and volume-free, which is the point: it is the 8.3 mapping stated as a function, so the
+/// fixture can assert the mapping itself rather than assert that a directory appeared somewhere.
+fn path_for_home(home: &str) -> String {
+    let mut out = String::new();
+    for c in home.split('/') {
+        if c.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        for b in c.bytes() {
+            out.push(b.to_ascii_uppercase() as char);
+        }
+    }
+    if !out.is_empty() {
+        out.push('/');
+    }
+    out.push_str(DIR_PICTURES.1);
+    out.push('/');
+    out.push_str(DIR_SHOTS.1);
+    out
+}
+
+/// PRTSCR-HOME — append one resolved component to the witness path, respecting [`DIR_PATH_MAX`].
+///
+/// Returns nothing and can fail at nothing: a path too long to print is still a path we walked
+/// correctly, so the ONLY consequence is an elision mark on the witness line.
+fn path_push(path: &mut String, comp: &str) {
+    // The elision mark is its own terminator: once it is there the path is final, so a deeper
+    // component cannot append after it and the mark is printed exactly once.
+    if path.ends_with('…') {
+        return;
+    }
+    if path.len() + 1 + comp.len() > DIR_PATH_MAX {
+        path.push_str("/…");
+        return;
+    }
+    if !path.is_empty() {
+        path.push('/');
+    }
+    path.push_str(comp);
+}
+
+/// PRTSCR-HOME — **walk to the user's `Pictures/Screenshots` on `fs`, creating what is absent.**
+///
+/// Returns the leaf directory's first cluster (what [`next_free_name`] and `create_in_dir` take) and
+/// its path as the medium actually spells it.
+///
+/// Three properties this is built for, in the order they matter:
+///
+///  * **Look up before you create, every component.** The lookup uses the LONG spelling, and
+///    `eq_name` matches a VFAT long name as happily as an 8.3 short name — so a stick that already
+///    carries a real `Pictures/Screenshots` is ADOPTED, with its own spelling, and nothing new is
+///    written. Only a genuinely absent component is created, and then in 8.3.
+///  * **`create_dir`'s crash order is the one we want and we do not second-guess it.** It zero-fills
+///    and `.`/`..`-initialises the child BEFORE linking the parent, and publishes the child cluster
+///    into the parent entry LAST (`fs/fat.rs:3558`) — the same shape as `write_grow`'s SAFE ORDER.
+///    A boot cut inside this leaves either no entry or a valid empty directory, never an entry
+///    pointing at an uninitialised cluster. That is why creating directories here needs no new
+///    crash-consistency machinery: the FAT layer already owns it.
+///  * **A non-directory in the way is a refusal, not a surprise.** A FILE called `Pictures` makes the
+///    path unwalkable; we say so and write nothing rather than picking somewhere else to put the
+///    capture. Same for a directory entry whose first cluster is 0 — a malformed or root-like entry
+///    the walk cannot descend into.
+///
+/// Cost: one `locate_in_dir` per component on the common path (three or four bounded directory
+/// walks) and nothing at all after the first capture, once the folders exist.
+fn ensure_capture_dir(fs: &FatFs, plan: &DirPlan) -> Result<(u32, String), Refusal> {
+    // The components, home first and the two fixed leaves last. Built into a fixed array rather than
+    // chained iterators so the depth bound is visible and enforced before the walk starts.
+    // The element type is `(&str, &str)` and NOT [`DirName`] on purpose: the home components are
+    // borrowed out of `plan`, which outlives this walk, while the two leaves are `'static`. Letting
+    // the array take the SHORTER lifetime is what lets both kinds sit in it with no cast at all.
+    let mut comps: [(&str, &str); DIR_DEPTH_MAX] = [("", ""); DIR_DEPTH_MAX];
+    let mut n = 0usize;
+    for c in plan.home_str().split('/') {
+        if c.is_empty() {
+            continue;
+        }
+        if n + 2 >= DIR_DEPTH_MAX {
+            dir_refused(plan, "", c, "home too deep");
+            return Err(Refusal::NoSession(WHY_BAD_HOME));
+        }
+        comps[n] = (c, c);
+        n += 1;
+    }
+    if n == 0 {
+        dir_refused(plan, "", "", "empty home path");
+        return Err(Refusal::NoSession(WHY_BAD_HOME));
+    }
+    comps[n] = DIR_PICTURES;
+    comps[n + 1] = DIR_SHOTS;
+    n += 2;
+
+    let mut cluster = 0u32; // the volume root, on every FAT kind here
+    let mut created = 0u32;
+    let mut path = String::new();
+    for i in 0..n {
+        let (look, make) = comps[i];
+        let found = busy_retry(|| match fs.locate_in_dir(cluster, look) {
+            Ok(hit) => Ok(Some(hit)),
+            Err(FatError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        });
+        match found {
+            Ok(Some((de, _, _))) => {
+                if !de.is_dir {
+                    dir_refused(plan, &path, look, "a file is in the way");
+                    return Err(Refusal::Fat(
+                        vol_id(fs),
+                        "capture directory (a file of that name is in the way)",
+                        FatError::Unsupported,
+                    ));
+                }
+                if de.first_cluster() == 0 {
+                    dir_refused(plan, &path, look, "0-cluster directory entry");
+                    return Err(Refusal::Fat(
+                        vol_id(fs),
+                        "capture directory (malformed 0-cluster entry)",
+                        FatError::BadChain,
+                    ));
+                }
+                cluster = de.first_cluster();
+                // The spelling the MEDIUM holds — the long name when there is one, else the 8.3
+                // short name. So the witness reports what an operator will actually see on the disk.
+                path_push(&mut path, de.name());
+            }
+            Ok(None) => {
+                match busy_retry(|| fs.create_dir(cluster, make)) {
+                    Ok((de, _, _)) => {
+                        cluster = de.first_cluster();
+                        created += 1;
+                        path_push(&mut path, make);
+                    }
+                    Err(e) => {
+                        dir_refused(plan, &path, make, fat_errno(e));
+                        return Err(Refusal::Fat(vol_id(fs), "capture directory create", e));
+                    }
+                }
+            }
+            Err(e) => {
+                dir_refused(plan, &path, look, fat_errno(e));
+                return Err(Refusal::Fat(vol_id(fs), "capture directory lookup", e));
+            }
+        }
+    }
+
+    // THE witness: one bounded line per capture, naming the destination and why it was chosen.
+    // Printed from `Job::begin`'s call, so it is once per capture and never once per slice.
+    serial_println!(
+        ":: PRTSCR-DIR: user={} home={} path={} created={} reason=session -> RESOLVED ::",
+        plan.user_str(),
+        plan.home_str(),
+        path,
+        created
+    );
+    Ok((cluster, path))
+}
+
+/// PRTSCR-HOME — the witness line for a destination that could NOT be resolved, naming the component
+/// the walk stopped at. The caller still returns a [`Refusal`], whose own line carries the errno and
+/// the volume identity; this one carries the PATH, which no `Refusal` variant has room for.
+fn dir_refused(plan: &DirPlan, path: &str, at: &str, why: &str) {
+    serial_println!(
+        ":: PRTSCR-DIR: user={} home={} path={} at={} -> REFUSED ({}) — nothing written ::",
+        plan.user_str(),
+        plan.home_str(),
+        if path.is_empty() { "-" } else { path },
+        if at.is_empty() { "-" } else { at },
+        why
+    );
+}
+
+/// PRTSCR-HOME — **the fixture, and it proves BOTH paths.**
+///
+/// One-shot, from [`service`], on a pass where nothing else is happening. It costs one relaxed load
+/// per service pass once it has run, which is why it sits beside `PENDING`'s own load rather than
+/// behind a knob: the no-session refusal is the behaviour EVERY board has today, and a gate that
+/// only runs when someone remembers a knob would not have measured it once.
+///
+/// **Arm A — a resolved user home.** The 8.3 mapping, asserted as a mapping: `/home/una` must
+/// resolve to `HOME/UNA/PICTURES/SCRSHOTS`. Volume-free, so it runs on a board with no filesystem —
+/// which is exactly the board `./arroyo test` gives us. GO RED by changing [`DIR_SHOTS`]'s create
+/// spelling (to the truncation `SCREENSH`, say), or by dropping the upcase in [`path_for_home`]:
+/// either makes the rendered path differ from `FIX_WANT` and the arm prints FAIL.
+///
+/// **Arm B — no session refuses, and writes nothing.** Two assertions, because the line and the
+/// silence are different claims: [`plan_dir`]`(None)` must be `Err(NoSession)` with the `no-session`
+/// token, AND — when this machine genuinely has no session, the case today — the REAL [`capture`]
+/// must refuse with that same variant while the capture census does not move. The second is what
+/// makes "zero bytes written" measured rather than argued: `CAPTURES` is incremented only on a
+/// written file, and the refusal is returned from `Job::begin`'s first statement, ahead of the name,
+/// the volume and any directory entry. GO RED by giving `plan_dir` a fallback destination for
+/// `None` — the shared-folder hack Peter refused — which turns the `Err` assertion false and the
+/// capture into an attempted write; that is the mutation this arm exists to catch.
+pub fn dir_fixture() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    // A relaxed load in steady state; the RMW happens exactly once, on the first pass.
+    if DONE.load(Ordering::Relaxed) || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    // --- Arm A: a resolved user home, and the 8.3 mapping it goes through --------------------
+    const FIX_HOME: &str = "/home/una";
+    const FIX_WANT: &str = "HOME/UNA/PICTURES/SCRSHOTS";
+    let got = path_for_home(FIX_HOME);
+    serial_println!(
+        ":: PRTSCR-DIR-FIX: home={} -> {} (want {}; \"{}\" is {} chars and the FAT create path is 8.3 only, so it is written \"{}\" and found by either spelling) -> {} ::",
+        FIX_HOME,
+        got,
+        FIX_WANT,
+        DIR_SHOTS.0,
+        DIR_SHOTS.0.len(),
+        DIR_SHOTS.1,
+        if got == FIX_WANT { "PASS" } else { "FAIL" }
+    );
+
+    // --- Arm B: no session refuses, and nothing is written ------------------------------------
+    let planned_none = match plan_dir(None) {
+        Err(Refusal::NoSession(w)) => w == WHY_NO_SESSION,
+        _ => false,
+    };
+    let (_, before, _) = census();
+    // Only drive a REAL capture when this machine has no session. If one is open — LOGINBOOT's
+    // screen has landed and someone logged in — a boot-time fixture must not help itself to the
+    // operator's panel and write a file nobody asked for, so the live leg is skipped and said to be
+    // skipped. The pure assertion above still holds the refusal contract in that case.
+    let live = live_plan();
+    let (live_refused, live_token) = match live {
+        Err(Refusal::NoSession(why)) => match capture() {
+            Err(Refusal::NoSession(w2)) => (true, w2),
+            Err(_) => (false, why),
+            Ok(_) => (false, why),
+        },
+        Err(_) => (false, "other-refusal"),
+        Ok(_) => (true, "session-open-live-leg-skipped"),
+    };
+    let (_, after, _) = census();
+    let wrote_nothing = after == before;
+    serial_println!(
+        ":: PRTSCR-DIR-FIX: no session -> REFUSED reason={} plan_none={} live={} captures {}->{} bytes=0 (no name chosen, no volume touched, no directory entry made) -> {} ::",
+        WHY_NO_SESSION,
+        planned_none,
+        live_token,
+        before,
+        after,
+        if planned_none && live_refused && wrote_nothing { "PASS" } else { "FAIL" }
     );
 }
