@@ -8915,15 +8915,19 @@ impl XhciController {
             // as a clean success — a silent short write, or a read whose buffer keeps whatever was
             // in it. The device's residue is its own claim about how many bytes did not move; the
             // Transfer Event residue is the CONTROLLER's. Two independent witnesses of one quantity:
-            // if they disagree, one of the two state machines is a phase out, and that is exactly
-            // the condition this arc refuses to call success.
-            if data_len > 0 && !data_stalled {
+            // if they disagree on a command the device says it PASSED, one of the two state machines
+            // is a phase out, and that is exactly the condition this arc refuses to call success.
+            // BOTRESIDUE (SO49, A72): the verdict is `bot_residue_phase_fault` and the witness is
+            // `bot_residue_disagrees` — see the tail block for the LUN-1 wire this split closes.
+            if !data_stalled && bot_residue_disagrees(data_len, data_moved, residue) {
                 let device_moved = data_len.saturating_sub(residue.min(data_len));
-                if residue > data_len || device_moved != data_moved {
-                    serial_println!(
-                        ":: BOT: residue_disagree slot={} dir={} dtl={} host_moved={} dev_residue={} dev_moved={} bstatus={} ::",
-                        slot_id, if data_out { "out" } else { "in" }, data_len,
-                        data_moved, residue, device_moved, bstatus);
+                let fault = bot_residue_phase_fault(data_len, data_moved, residue, bstatus);
+                serial_println!(
+                    ":: BOT: residue_disagree slot={} dir={} dtl={} host_moved={} dev_residue={} dev_moved={} bstatus={} verdict={} ::",
+                    slot_id, if data_out { "out" } else { "in" }, data_len,
+                    data_moved, residue, device_moved, bstatus,
+                    if fault { "phase-fault" } else { "advisory-on-failed-csw" });
+                if fault {
                     serial_println!(
                         "xHCI: BOT CSW residue disagrees with the transfer event (dtl {}, host moved {}, device says {} moved) — phase fault",
                         data_len, data_moved, device_moved);
@@ -15849,4 +15853,106 @@ impl XhciController {
             xdbg!("xHCI: Keyboard Read Queued.");
         }
     }
+}
+
+// =========================================================================================
+// BOTRESIDUE (SO49, orin-ledger A72) — the CSW residue cross-check is a check about a PASSED
+// command, and running it on a FAILED one is what turned an honest CHECK CONDITION into a
+// fabricated transport fault and cost a card reader a whole logical unit.
+//
+// Tail-appended: this file is compiled into the knob-off `kernel8.img` and `panic::Location` embeds
+// source line numbers, so the predicate goes here and the ONE call site inside the CSW validator is
+// folded, not grown.
+//
+// THE DEFECT, measured. Orin bench, `capture/line-acm0/orin.log`, the boot whose reader is the
+// two-LUN `Generic- USB3.0 CRW   -SD`. The census probes LUN 1; INQUIRY SUCCEEDS (the wire carries
+// real vendor and product strings for it, so the unit is there and answering); READ CAPACITY(10)
+// then produces, in this order:
+//
+//   :: BOT: dtl_vs_moved slot=3 dir=in dtl=8 moved=0 residue=8 cc=13 verdict=short-in-allowed ::
+//   :: BOT: residue_disagree slot=3 dir=in dtl=8 host_moved=0 dev_residue=0 dev_moved=8 bstatus=1 ::
+//   :: BOT: csw_bytes slot=3 why=residue-disagree tag_want=0x00000007
+//      b=55 53 42 53 07 00 00 00 00 00 00 00 01 ::
+//   :: USBLUN: census-transfer slot=3 cdb0=0x25 err=TransferError(13) … ::
+//   :: USBLUN: lun=1/1 inquiry="Generic-" "USB3.0 CRW   -SD" capacity=none verdict=FAILED
+//      reason=cap-bot:TransferError(13) ::
+//
+// Read the CSW: `55 53 42 53` is `USBS`, the tag is 7 and matches, `dCSWDataResidue` (bytes 8..12)
+// is ZERO, and `bCSWStatus` (byte 12) is `01` — **Failed**. Nothing is wrong with the pipe. The
+// completion code was 13 (Short Packet), not 6 (Stall), so `data_stalled` stayed false and the
+// cross-check ran; the device returned no data at all for a command it was declining, and it
+// reports its residue on a declined command as 0 rather than as the full 8. Host moved 0, the
+// device's field implies 8, they disagree, and the check called that a phase fault — completion
+// code 13's synthetic twin, `BotError::TransferError(13)`, raised at the `residue-disagree` site.
+//
+// WHY LUN 1 AND NOT LUN 0, which is the question the whole arc turns on: **it is not about the LUN
+// at all.** LUN 0 holds a card, so its READ CAPACITY PASSES — 8 bytes move, residue 0, host and
+// device agree, the check is silent. LUN 1 is the unit that has to DECLINE, and the same check that
+// agrees on every success disagrees on the honest failure. There is nothing wrong with the CBW's
+// LUN field (`bCBWLUN` carried 1 — the INQUIRY on the same LUN came back with the device's real
+// strings), nothing wrong with the endpoint or toggle state shared between the units, no stall left
+// uncleared (cc=13 is not a stall), and no Reset Recovery owed (there was no transport fault to
+// recover from). The four-slot `Generic USB SD Reader` on the same bench scores its three EMPTY
+// slots `NO-MEDIUM reason=cap-sense:02/3a/00` through this identical code path — because THAT
+// reader reports the spec-conforming residue on a CHECK CONDITION and this one reports 0.
+//
+// So the transfer never returned `Ok(Failed)` to `usblun_probe`, its `Ok(_)` arm — the arm that
+// fetches sense and decodes 02/3A into `NO-MEDIUM` — could not run, and the census recorded a
+// transport error where the device had given it a SCSI answer to read.
+//
+// THE RULE. The cross-check exists for a defect its own comment states exactly: a transaction that
+// moved zero bytes and came back **`bStatus=0`** with a full residue was reported to the FAT layer
+// as a clean success. That is a Passed-CSW defect in its entirety, so gating the FAULT on
+// `bstatus == 0` takes nothing from it — every case it was built to catch still red-lines, and the
+// silent-short-read it closes stays closed. On a non-Passed CSW the device is reporting a COMMAND
+// failure, not a transport disagreement: no data was promised, the reason lives in the sense data
+// the caller goes on to fetch, and `dCSWDataResidue` on a failed command is advisory in practice.
+//
+// The disagreement is still PRINTED on a failed CSW, with `verdict=advisory-on-failed-csw`, because
+// discarding it would be the other half of the same mistake — it is a real fact about a real
+// device, and the next reader of this wire should see it. It is an observation, not a verdict on
+// the pipe. Nothing is silently lost; only the FAULT is withdrawn.
+//
+// GENERAL, not special-cased: this is one predicate over four numbers in the shared BOT status
+// path. It knows nothing about LUNs, about how many a device declares, or about which board is
+// running — a device declaring N units gets N honest answers by the same rule.
+//
+// Asserted live in `fs::bootdisk::homesoil_selftest` leg 8, on this predicate, with the bench's own
+// numbers as the case that must pass and the original `bStatus=0` short-read as the control that
+// must still be a fault.
+// =========================================================================================
+
+/// BOTRESIDUE (SO49): is a CSW's `dCSWDataResidue` disagreement with the Transfer Event a PHASE
+/// FAULT?
+///
+/// `data_len` is the CBW's `dCBWDataTransferLength`, `data_moved` what the controller reported
+/// moving, `residue` the device's `dCSWDataResidue` and `bstatus` its `bCSWStatus`.
+///
+/// Two independent witnesses of one quantity: if they disagree on a command the device says it
+/// PASSED, one of the two state machines is a phase out, and that is the condition this driver
+/// refuses to call success. If the device says the command FAILED, they are not two witnesses of
+/// one quantity at all — the device moved nothing because it was declining, its residue bookkeeping
+/// on a declined command is advisory, and the real answer is in the sense data. A `false` here is
+/// never "the transfer was fine": it hands the caller the Failed CSW to read, which is exactly what
+/// `usblun_probe`, `bot_check_condition` and every other status-aware caller already do.
+///
+/// Pure over its arguments so the fixture can drive it with the bytes off the wire.
+pub fn bot_residue_phase_fault(data_len: u32, data_moved: u32, residue: u32, bstatus: u8) -> bool {
+    if data_len == 0 || bstatus != 0 {
+        return false;
+    }
+    let device_moved = data_len.saturating_sub(residue.min(data_len));
+    residue > data_len || device_moved != data_moved
+}
+
+/// BOTRESIDUE (SO49): does the residue disagree at all, whatever the CSW status? The WITNESS
+/// predicate — [`bot_residue_phase_fault`] is the VERDICT one. Split apart on purpose: a
+/// disagreement on a failed CSW is still printed, and a witness that could only fire where the
+/// fault fires would have deleted the evidence along with the false positive.
+pub fn bot_residue_disagrees(data_len: u32, data_moved: u32, residue: u32) -> bool {
+    if data_len == 0 {
+        return false;
+    }
+    let device_moved = data_len.saturating_sub(residue.min(data_len));
+    residue > data_len || device_moved != data_moved
 }

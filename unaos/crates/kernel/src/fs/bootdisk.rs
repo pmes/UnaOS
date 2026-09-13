@@ -213,6 +213,11 @@
 //!   byte — control bytes, `/`, NUL, `.` in the wrong place, anything ≥ 0x80 — becomes `_`. Trailing
 //!   spaces are trimmed; `.`, `..` and empty become `Untitled`. A path separator therefore cannot
 //!   reach the resolver, which is the actual attack this rule is against.
+//! * **A name made ENTIRELY of substitutions is refused** (SO49): if not one byte of the field
+//!   survived the whitelist, the field was not a name and `/volumes/________` would present our own
+//!   substitution character as if it were the volume's. Such a volume mounts as `Untitled` with
+//!   `label_raw=` on the witness, so the bytes and the reason are both on the wire. A label of
+//!   literal underscores is KEPT — `_` is in the FAT charset, nothing was substituted.
 //! * **A collision gets a numeric suffix** — `Untitled`, `Untitled 1`, `Untitled 2` — the macOS
 //!   shape, assigned in enumeration order.
 //! * **If ANY byte was altered**, the mount line carries `label_raw=<22 hex>`: a card whose label is
@@ -655,9 +660,13 @@ pub(crate) fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
     }
     let mut out = String::new();
     let mut altered = false;
+    // SO49 (A73): did ANY byte of the surviving field come off the medium unchanged? A name in which
+    // every character is one WE substituted is not the volume's name — see the refusal below.
+    let mut kept_any = false;
     for &b in raw[..end].iter() {
         if label_byte_ok(b) {
             out.push(b as char);
+            kept_any = true;
         } else {
             out.push('_');
             altered = true;
@@ -668,12 +677,26 @@ pub(crate) fn sanitize_label(raw: &[u8; 11]) -> (String, bool) {
     // Neither is an alteration: they are honest unnamed volumes, and `label_raw=` must stay a signal
     // about a SUSPICIOUS card rather than firing on every blank one.
     //
+    // SO49: AND THE REFUSAL — `!kept_any`. A field in which not one byte survived the whitelist has
+    // told us nothing about what the volume is called, and rendering it as a row of underscores
+    // presents a substitution as if it were a name. The Orin bench produced exactly that:
+    // `[vfs] volume mounted /volumes/________ … label_raw=0002000000010006000000 ::`, eleven bytes
+    // that were not a label at all but four other BPB fields read at the FAT16 offset on a FAT32
+    // volume (`fat::fat32_by_shape` is that defect's fix; this is the backstop for every other way a
+    // label can turn out to be bytes). The honest answer is the one an unnamed volume already gets —
+    // `Untitled` — and `altered` is true, so the mount line still carries `label_raw=` and the
+    // operator can read the bytes and see WHY the volume has no name. Refusing, and saying so, is
+    // the rule; inventing a name out of the substitution character is not.
+    //
     // `.` and `..` need NO case here, and that is a property of the whitelist rather than an
     // oversight: `.` is not in the FAT label character set and `label_byte_ok` does not admit it, so
-    // `..` sanitizes to `__` — a legal path component — long before any "is this name `..`" test
-    // could run. A guard for it would be a check that cannot fire. What keeps that true is asserted
-    // instead, on the live predicate, in `homesoil_selftest` leg 3.
-    if trimmed.is_empty() || trimmed == "NO NAME" {
+    // `..` is all-substituted and lands on the refusal above — a legal, honest `Untitled` — long
+    // before any "is this name `..`" test could run. A guard for it would be a check that cannot
+    // fire. What keeps that true is asserted instead, on the live predicate, in `homesoil_selftest`
+    // leg 3. Note what is NOT refused: a label of literal underscores. `_` is in the FAT charset, so
+    // it is KEPT, `kept_any` is true and `altered` is false — the card is named `__` and is mounted
+    // under that name. The refusal is about substitution, never about the character.
+    if trimmed.is_empty() || trimmed == "NO NAME" || !kept_any {
         return (String::from(UNTITLED), altered);
     }
     (String::from(trimmed), altered)
@@ -1555,7 +1578,15 @@ fn homesoil_selftest() {
     // The live form of the claim `sanitize_label` makes about `.`: it is out of the charset, so no
     // `.`/`..` special case is needed and none is written. If the whitelist ever admits `.`, this
     // fails here rather than in a path resolver.
-    let dot_excluded = !label_byte_ok(b'.') && !dots.0.contains('.') && dots.0 == "__";
+    // SO49: `..` is all-substituted, so it now lands on the REFUSAL rather than being rendered as
+    // `__`. The claim this leg makes about `.` is unchanged and is still asserted on the live
+    // predicate — `.` is out of the charset and cannot appear in a produced name; what changed is
+    // only what a name with nothing left of it is called. `kept` is the control that keeps the
+    // refusal honest: a label of LITERAL underscores survives the whitelist and keeps its name, so
+    // the refusal fires on substitution and not on the character.
+    let kept = sanitize_label(b"__         ");
+    let dot_excluded = !label_byte_ok(b'.') && !dots.0.contains('.') && dots.0 == UNTITLED
+        && kept.0 == "__" && !kept.1;
     let leg3 = named.0 == "UNAOS-PI"
         && !named.1
         && blank.0 == UNTITLED
@@ -1795,7 +1826,7 @@ pub fn unafsroot_selftest() {
     // USBREG (SO33): leg 7 rides the same boot-path entry point, for the same reason — see
     // [`usbreg_selftest`]. It carries its own latch, so calling it here and from
     // `homesoil_selftest` prints it exactly once.
-    usbreg_selftest(); #[cfg(feature = "sdwrite")] sdwrite_posture_selftest(); // SDWRITE (A60) leg 8: the posture/polarity matrix, latched like its siblings.
+    usbreg_selftest(); #[cfg(feature = "sdwrite")] sdwrite_posture_selftest(); so49_selftest(); // SDWRITE (A60) leg 8: the posture/polarity matrix, latched like its siblings. SO49 (A72/A73) leg 9 rides this same entry point and for the same reason — code before the comment, same-line append, nothing added below.
     // --- leg 6: UNAFSROOT — the root disk's LAYOUT RULE, driven with every answer it takes. -----
     // `bind_root` is the one place `/`, `/boot` and `/apps` are decided, and until this leg the
     // `present` answer had never executed anywhere (render12: `unafs=absent`, no card carried a
@@ -2105,5 +2136,102 @@ fn sdwrite_fixture(mt: &crate::fs::vfs::MountTable, src: BlockSource) {
         ":: SDWRITE: root={} wrote={} readback=match deleted=1 -> PASS ::",
         src.name(),
         wrote
+    );
+}
+
+/// SO49 leg 9 — **the second card in one reader, and the garbled volume label beside it.** The two
+/// predicates this arc added, driven with the numbers off the Orin bench wire that produced the
+/// defect, each with a control that must come out the other way.
+///
+/// Why a predicate leg and not a boot: there is NO QEMU machine that models the Jetson, and no
+/// machine in this fleet can present a multi-LUN card reader at all (QEMU `usb-storage` is
+/// single-LUN on both arches) or a sub-65525-cluster FAT32 volume on the boot path. What CAN be
+/// executed everywhere is the decision each defect turned on, so that is what is executed — the
+/// same shape USBREG's leg 7 took, and for the same reason.
+///
+/// Latched like its siblings, and called from [`unafsroot_selftest`], which is the boot-path entry
+/// point `test` and `test-arm` actually reach (`walk_and_witness` runs on neither: a headless QEMU
+/// boot never types a filesystem verb). A leg that only ran when an operator typed `ls` on metal
+/// would be a leg that shipped unexecuted.
+#[cfg(feature = "witness")]
+pub fn so49_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    use crate::drivers::xhci::{bot_residue_disagrees, bot_residue_phase_fault};
+
+    // --- 9a: the BOT residue verdict (A72). -----------------------------------------------------
+    // `(dCBWDataTransferLength, host moved, dCSWDataResidue, bCSWStatus)`.
+    //
+    // BENCH is the failing LUN-1 READ CAPACITY(10) verbatim: dtl=8, the controller moved 0, and the
+    // CSW `55 53 42 53 07 00 00 00 00 00 00 00 01` carries residue 0 and status 01 (Failed). It
+    // must DISAGREE — the numbers really do disagree and the witness must still say so — and it
+    // must NOT be a phase fault.
+    //
+    // PASSED is THE CONTROL, and it is the whole change under a microscope: the same four numbers
+    // with `bCSWStatus = 0`. It must still be a fault. If gating on the status had quietly disarmed
+    // the check, this is the leg that goes red.
+    let bench = (8u32, 0u32, 0u32, 1u8);
+    let passed = (8u32, 0u32, 0u32, 0u8);
+    // LUN 0's successful READ CAPACITY on the same reader: 8 bytes moved, residue 0. Agreement, so
+    // neither predicate fires — the corpus produces more than one outcome, which is what makes a
+    // green here a fact about the numbers rather than about the pattern.
+    let lun0 = (8u32, 8u32, 0u32, 0u8);
+    // The phase slip the check was built for: the host moved a full block, the device says it moved
+    // none. Two witnesses of one quantity, disagreeing, on a command the device says PASSED.
+    let slip = (512u32, 512u32, 512u32, 0u8);
+    // A device claiming more residue than the transfer was ever long enough to hold.
+    let over = (8u32, 8u32, 9u32, 0u8);
+    let f = |t: (u32, u32, u32, u8)| bot_residue_phase_fault(t.0, t.1, t.2, t.3);
+    let d = |t: (u32, u32, u32, u8)| bot_residue_disagrees(t.0, t.1, t.2);
+    let a = !f(bench) && d(bench) && f(passed) && !f(lun0) && !d(lun0) && f(slip) && f(over);
+
+    // --- 9b: the FAT type decision (A73). -------------------------------------------------------
+    // `(BPB_FATSz16, BPB_FATSz32, BPB_RootEntCnt)`. BENCH is MBR slot 1 of the Orin boot card as the
+    // wire reported it — `fatsz=256sec`, `rootdir@LBA2592 (0sec)`, 32440 clusters — a FAT32 volume
+    // small enough that the cluster-count rule alone called it FAT16 and read `BS_VolLab` at 0x2B.
+    // FAT16 is the control: a real FAT16 BPB has both a fixed root directory and a 16-bit FAT size,
+    // and must not be dragged into the new arm. BIG is an ordinary FAT32 volume, which the cluster
+    // count already classified correctly and which must keep that answer. ZEROS is a sector of
+    // zeros, which satisfies two thirds of the shape vacuously and must still be refused.
+    let bench_bpb = fat::fat32_by_shape(0, 256, 0);
+    let fat16_bpb = fat::fat32_by_shape(256, 0, 512);
+    let big_bpb = fat::fat32_by_shape(0, 4096, 0);
+    let zeros_bpb = fat::fat32_by_shape(0, 0, 0);
+    let b = bench_bpb && !fat16_bpb && big_bpb && !zeros_bpb;
+
+    // --- 9c: the label refusal (A73). -----------------------------------------------------------
+    // The eleven bytes the bench printed as `label_raw=0002000000010006000000`, which were never a
+    // label: the high byte of `BPB_FSVer`, then `BPB_RootClus`=2, `BPB_FSInfo`=1, `BPB_BkBootSec`=6
+    // and two bytes of `BPB_Reserved`, read at the FAT16 label offset on a FAT32 boot sector. Not
+    // one byte survives the whitelist, so there is nothing of a name left and the volume must mount
+    // as `Untitled` — never as `/volumes/________`, which would present our own substitution
+    // character as the card's name. `altered` must stay true so the witness still prints
+    // `label_raw=` and the operator can see the bytes and the reason.
+    const L_BENCH: [u8; 11] = [0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00];
+    let garbled = sanitize_label(&L_BENCH);
+    // The control the refusal must NOT swallow: a label of literal underscores is in the FAT
+    // charset, nothing is substituted, and the card keeps its name.
+    let underscores = sanitize_label(b"__         ");
+    // And a partly-survivable one still keeps what survived, rather than falling to the refusal.
+    let partial = sanitize_label(b"\x00\x00AB       ");
+    let c = garbled.0 == UNTITLED
+        && garbled.1
+        && underscores.0 == "__"
+        && !underscores.1
+        && partial.0 == "__AB"
+        && partial.1;
+
+    let leg9 = a && b && c;
+    serial_println!(
+        ":: SO49: residue bench_fault={} bench_disagrees={} passed_fault={} lun0_fault={} \
+         slip_fault={} over_fault={} | fat32shape bench={} fat16={} big={} zeros={} | \
+         label garbled={} altered={} underscores={} partial={} :: {} ::",
+        f(bench), d(bench), f(passed), f(lun0), f(slip), f(over),
+        bench_bpb, fat16_bpb, big_bpb, zeros_bpb,
+        garbled.0, garbled.1, underscores.0, partial.0,
+        if leg9 { "PASS" } else { "FAIL" }
     );
 }

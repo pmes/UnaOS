@@ -1450,6 +1450,83 @@ passed because the predicate broke would fail instead.
 
 ---
 
+### 5l. BOTRESIDUE — the CSW residue cross-check is a PASSED-CSW check (SO49, A72)
+
+USBREG made the registry able to hold every card in a reader. This is the defect UNDER it: on the
+Orin bench the census could not get an honest answer OUT of the second logical unit, so there was
+never a second card for the registry to hold.
+
+**The wire** (`capture/line-acm0/orin.log`, the two-LUN `Generic- USB3.0 CRW   -SD`):
+
+```
+:: USBLUN: get-max-lun slot=3 intf=0 result=ok raw=0x01 max_lun=1 — the device declares 2 logical unit(s) ::
+:: USBLUN: lun=0/1 inquiry="Generic-" "USB3.0 CRW   -SD" capacity=63404032x512 verdict=PRESENT reason=none ::
+:: BOT: dtl_vs_moved slot=3 dir=in dtl=8 moved=0 residue=8 cc=13 verdict=short-in-allowed ::
+:: BOT: residue_disagree slot=3 dir=in dtl=8 host_moved=0 dev_residue=0 dev_moved=8 bstatus=1 ::
+:: BOT: csw_bytes slot=3 why=residue-disagree tag_want=0x00000007 b=55 53 42 53 07 00 00 00 00 00 00 00 01 ::
+:: USBLUN: census-transfer slot=3 cdb0=0x25 err=TransferError(13) — one attempt, no recovery ladder, no surrender ::
+:: USBLUN: lun=1/1 inquiry="Generic-" "USB3.0 CRW   -SD" capacity=none verdict=FAILED reason=cap-bot:TransferError(13) ::
+:: USBLUN: census slot=3 max_lun=1 luns=2 present=1 first_present=0 ::
+```
+
+**What `TransferError(13)` actually is here.** It is NOT xHCI completion code 13. Completion code 13
+is Short Packet and this driver treats it as success (`mod.rs`, the `code != 1 && code != 13` gates
+in both the data and the status stage). The 13 on this wire is the SYNTHETIC value raised at the
+`residue-disagree` site of the CSW validator — `BotError::TransferError(13)`, the driver's own label
+for "host and device disagree about how much data moved". The completion code for this transaction
+was in fact 13/Short Packet, which is why `data_stalled` stayed false and the cross-check ran at all.
+
+**The CSW refutes the verdict.** `55 53 42 53` is `USBS`; the tag is 7 and matches; `dCSWDataResidue`
+is 0; `bCSWStatus` is `01` — Failed. Nothing is wrong with the pipe. The device declined READ
+CAPACITY(10), returned no data, and reported its residue on the declined command as 0 rather than as
+the full 8. Host moved 0, the device's field implies 8, and the cross-check called that a phase fault.
+
+**Why LUN 1 and not LUN 0 — and it is not about the LUN.** LUN 0 holds a card, so its READ CAPACITY
+PASSES: 8 bytes move, residue 0, host and device agree, the check is silent. LUN 1 is the unit that
+has to DECLINE, and the same check that agrees on every success disagrees on the honest failure.
+Ruled out by the wire itself: the CBW's LUN field is correct (the INQUIRY on LUN 1, same `bCBWLUN`,
+came back with the device's real vendor and product strings); there is no stall left uncleared
+(cc=13 is not a stall, and a data-phase stall takes the `recover_bulk_stall` arm and sets
+`data_stalled`, which SKIPS this check); no endpoint or toggle state is shared wrongly between units;
+and no Reset Recovery is owed because there was no transport fault to recover from. The four-slot
+`Generic USB SD Reader` on the same bench scores its three EMPTY slots `NO-MEDIUM
+reason=cap-sense:02/3a/00` through this identical code — because that reader reports the
+spec-conforming residue on a CHECK CONDITION and this one reports 0.
+
+The consequence is that `bot_transfer` never returned `Ok(Failed)`, so `usblun_probe`'s `Ok(_)` arm —
+the arm that fetches sense and decodes 02/3A into `NO-MEDIUM` — could not run. The census recorded a
+transport error where the device had handed it a SCSI answer to read.
+
+**The rule.** The cross-check exists for a defect stated in its own comment: a transaction that moved
+zero bytes and came back **`bStatus=0`** with a full residue was reported to the FAT layer as a clean
+success. That is a Passed-CSW defect entirely, so gating the FAULT on `bstatus == 0` removes the
+false positive and keeps every case the check was built to catch. On a non-Passed CSW the device is
+reporting a COMMAND failure, not a transport disagreement: no data was promised, the reason lives in
+the sense data the caller goes on to fetch, and `dCSWDataResidue` on a declined command is advisory
+in practice. The disagreement is still PRINTED, with a new `verdict=` field —
+`verdict=phase-fault` or `verdict=advisory-on-failed-csw` — because discarding it would be the other
+half of the same mistake. Nothing is lost; only the FAULT is withdrawn.
+
+Two pure predicates carry it, tail-appended to `drivers/xhci/mod.rs` so the one call site inside the
+CSW validator is folded rather than grown: `bot_residue_phase_fault(data_len, data_moved, residue,
+bstatus)` is the VERDICT and `bot_residue_disagrees(data_len, data_moved, residue)` is the WITNESS.
+They are split on purpose — a witness that could only fire where the fault fires would have deleted
+the evidence along with the false positive. General by construction: one rule over four numbers in
+the shared BOT status path, which knows nothing about LUNs, about how many a device declares, or
+about which board is running.
+
+**The expected wire after this.** LUN 1's READ CAPACITY returns `Ok(Failed)`, `usblun_probe` fetches
+sense, and the unit is scored by what the device actually says — `NO-MEDIUM reason=cap-sense:02/3a/00`
+for an empty slot, or `FAILED reason=cap-sense:<k>/<a>/<q>` with a named SCSI reason — never a
+fabricated transport error. A card in that slot makes it `PRESENT`, and USBREG's
+`publish_extra_luns` then gives it its own `xHCI: Disk` line and registry entry.
+
+**Proven** in `fs::bootdisk::so49_selftest` (HOMESOIL leg 9), on the predicates, with the bench's own
+four numbers as the case that must pass and — as the control that keeps the original defect closed —
+the identical four numbers with `bCSWStatus = 0`, which must still be a fault.
+
+---
+
 ---
 
 ## 6. Enumeration robustness (metal-informed)
