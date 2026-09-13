@@ -824,7 +824,7 @@ impl Model {
         // out no tenant titles, which is exactly what a Mac shows for an app with no menus of its
         // own — and is what `render9` should have shown while `console` and `quarry` held focus.
         m.menu_owner = if super::winmenu::has_tree(m.cap_owner) { m.cap_owner } else { wm::WIN_NONE };
-        m.clock = clock_hhmm();
+        m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
 
@@ -1308,7 +1308,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     if let Some(c) = m.clock {
         let cw = CLOCK_GLYPHS * CELL_W;
         if w > cw + strip::PAD {
-            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); #[cfg(feature = "sntp6")] barclock_note(Some((w - strip::PAD - cw, ty0, cw, CELL_H))); // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
         }
     }
 }
@@ -1699,3 +1699,83 @@ pub fn selftest() {
 // fixtures — and this module unchanged. If the protocol cannot be proven working without a bar
 // drawing it, it was not renderer-agnostic.
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// SNTP-NET6 — the bar's CLOCK WITNESS. Appended at the FILE TAIL, so not one `panic::Location`
+// above it moves and the knob-off image is byte-identical (LAWS §5, byte identity is measured).
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// WHY THIS EXISTS AT ALL. The bar has drawn a clock in its upper right since it was written, and on
+// this arch nobody has ever seen it, because nothing on the board ever anchored the civil clock —
+// `clock::try_unix_now()` was `None` on every pass of every boot, so the honest branch at
+// `clock_hhmm` fired every time and the bar drew nothing. SNTP-NET6 makes the OTHER branch reachable
+// on aarch64 for the first time, and a branch nothing can observe is a branch nobody can score: the
+// existing `clock={set|unsynced}` term lives on the `:: MENUBAR:` census line, which is reached only
+// from the x86 `dock::selftest`. This module's own comments at :400 and :938 state the invariant that
+// an aarch64 image contains NO `:: MENUBAR:` string at all, and that invariant is verified against
+// the built artifact. So on the Orin we were blind, and adding a second `:: MENUBAR:` string would
+// have paid for sight by breaking the thing that made the x86 leg checkable.
+//
+// Hence a NEW, BOUNDED family: `:: BARCLOCK:`. Two states, each reported AT MOST ONCE per boot, so
+// the ceiling is two lines for the life of the machine. That bound is the whole design — `compose_row`
+// runs once per row of every composite, and a per-pass line here is SO30 exactly, the defect that ate
+// 36% of a boot's wire. The latch below, not the call sites, is what enforces it.
+//
+// THE HONESTY RULE IS ASSERTED, NOT ASSUMED. The bar must draw NO clock while unsynced AND the title
+// must keep its width. The second half is a STATIC fact and is asserted as one: `TITLE_X0` and
+// `TITLE_GLYPHS` are `const`s that do not mention the clock, so no clock state can move the caption —
+// the `const _` below says so in a form the compiler checks on every build, which is stronger than a
+// runtime probe that only covers the states a given boot happened to reach. The first half is
+// asserted at runtime by `net_sntp_client::fixture()` leg 0x20 (anchored => `try_unix_now` is `Some`,
+// cleared => `None`), which is the exact predicate `clock_hhmm` reads.
+
+/// The bar's clock states, latched. Bit 0 = `unsynced` reported, bit 1 = `set` reported. Relaxed is
+/// sufficient: the only thing ordered against this is whether a line has already been printed, and a
+/// doubled line under an improbable race is a cosmetic cost, never a wrong fact.
+#[cfg(feature = "sntp6")]
+static BARCLOCK_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The title's geometry does not mention the clock, so the clock's state cannot move the caption.
+/// Compile-time, because that is what the claim actually is.
+#[cfg(feature = "sntp6")]
+const _: () = {
+    // The caption starts at a constant that does not mention the clock, and it is allowed the whole
+    // stored title either way — so no clock state can move or shorten it.
+    assert!(TITLE_GLYPHS <= wm::MAX_TITLE);
+    assert!(TITLE_X0 > 0);
+    // And the clock's slot is RESERVED in the width floor whether or not a clock is drawn, which is
+    // the mechanism that keeps the above true: an unsynced bar does not hand the title that space.
+    assert!(FLOOR_W >= (CLOCK_GLYPHS + 1) * CELL_W);
+};
+
+/// Report the bar's clock state ONCE per state per boot. `Some((x, y, w, h))` is the rect the clock
+/// was just drawn into (panel-relative, the bar sits at `y = 0`); `None` is the unsynced state, in
+/// which nothing was drawn.
+///
+/// Called from two folded sites — the model (`None`) and the painter (`Some`) — and from nowhere
+/// else. Takes no lock: it reads the already-computed state its caller holds, so it cannot spin
+/// inside a composite, which is the rule `clock::try_unix_now` exists to honour.
+#[cfg(feature = "sntp6")]
+fn barclock_note(rect: Option<(usize, usize, usize, usize)>) {
+    use core::sync::atomic::Ordering as O;
+    let bit = if rect.is_some() { 0b10 } else { 0b01 };
+    if BARCLOCK_SEEN.fetch_or(bit, O::Relaxed) & bit != 0 {
+        return; // this state has already been said aloud this boot
+    }
+    match rect {
+        Some((x, y, w, h)) => {
+            let mut iso = [0u8; 24];
+            let n = crate::clock::try_unix_now().map(|s| crate::clock::render_iso8601(s, &mut iso));
+            serial_println!(
+                ":: BARCLOCK: clock=set rect={}x{}+{}+{} glyphs={} iso={} title_glyphs={} face={} — the bar drew a clock for the first time this boot ::",
+                w, h, x, y, CLOCK_GLYPHS,
+                match n { Some(k) => core::str::from_utf8(&iso[..k]).unwrap_or("????"), None => "(contended)" },
+                TITLE_GLYPHS, BAR_FONT_NAME
+            );
+        }
+        None => serial_println!(
+            ":: BARCLOCK: clock=unsynced rect=none glyphs=0 title_glyphs={} — no civil anchor this boot, so the bar draws NO clock and the title keeps its width ::",
+            TITLE_GLYPHS
+        ),
+    }
+}

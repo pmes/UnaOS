@@ -2072,6 +2072,35 @@ fi
 # `net6`, so `./arroyo knoboff net4` compares a knob-off image that contains neither — exit 0 on both
 # arches, control fired.
 [ -n "${UNAOS_NET6:-}" ] && _feats="${_feats}net6,"
+# SNTP-NET6 (orin-0912b): UNAOS_SNTP6=1 arms the INTERNET TIME CLIENT over the NET6 socket surface —
+# `crates/kernel/src/net_sntp_client.rs` — and the menu bar's bounded clock-transition witness.
+# Appends `net6` beside itself, exactly as the NIC knobs do, so the Orin flight line stays one knob
+# longer and never needs a second one remembered; the Cargo feature itself is STANDALONE (`sntp6 = []`)
+# so KERNEL_CFG_MATRIX keeps both polarities (LAWS §5, orin 20 — read the polarity, not the leg count).
+#
+# The client is NIC-AGNOSTIC BY CONSTRUCTION and that is the point of the arc: on x86 the sole caller of
+# `smolnet::witness_tick_sntp` is a statement inside `drivers/e1000.rs`, so changing the NIC lost the
+# clock, and that is why this board never knew what time it was. `net_sntp_client::service_tick()` names
+# no driver, no board and no register — it talks only to `net_phy::net6`'s public surface — and it is
+# latched, guarded on `net6::ipv4()`/`gateway()` and bounded at MAX_ATTEMPTS=3 addresses, so it is safe
+# to call from ANY periodic service path and cannot become the per-pass flood SO30 records.
+#
+#   runtime (virt, the only runtime proof off the bench — QEMU models no Tegra234):
+#     UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VNET=1 UNAOS_SNTP6=1 ./arroyo test-arm 60
+#   metal:
+#     UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1 UNAOS_SNTP6=1 ./arroyo esp-jetson
+#
+# Witnesses on the wire — `:: NET6: [sntp6] attempt N/3 server=… source={lease-resolver|dns-pool|gateway}
+# -> <iso> stratum=N (civil clock anchored) ::` | `-> no reply within budget ::`, then one
+# `:: NET6: [sntp6] sync COMPLETE anchored={yes|no} … ::`; and the bar's own family
+# `:: BARCLOCK: clock=set …` / `clock=unsynced …`, latched to at most one line per state per boot.
+# `:: BARCLOCK:` is a NEW family on purpose: menubar.rs:400/:938 assert that an aarch64 image contains
+# no `:: MENUBAR:` string at all, and that invariant is not being spent on a clock witness.
+#
+# Default OFF => the client module is never lexed, both menubar statements and the `tste` leg vanish, and
+# every image is byte-identical to baseline (`./arroyo knoboff net6 <baseline>`). The ARMED polarity is
+# type-checked by the `arm-virt-sntp6` leg of KERNEL_CFG_MATRIX, not by this mapping.
+[ -n "${UNAOS_SNTP6:-}" ] && _feats="${_feats}sntp6,net6,"
 # PI-GENET: UNAOS_GENET=1 arms the BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) driver +
 # smoltcp bind — the Pi's FIRST network path (arch/aarch64/genet.rs). DTB-resolves the GENET register
 # base, poison-honest probes SYS_REV_CTRL to classify whether the build models GENET, brings up UMAC +
@@ -4595,6 +4624,23 @@ KERNEL_CFG_MATRIX=(
   # PRECONDITION, inherited from the `virt_el0` leg above: compiles `arch/aarch64/syscall.rs`, which
   # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
   "arm-virt-net6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,vnet,net6"
+  # SNTP-NET6 (orin-0912b) — the ARMED polarity of `sntp6`, and the ONE leg that compiles the time
+  # client and the menu bar's clock witness TOGETHER. It is the row above plus `sntp6` plus the desk
+  # terms `arm-desk-noel0` already proves are board-free (`desktop_firmware,livecon,quarry`), and every
+  # one of those four is load-bearing:
+  #
+  #   * `net6` + `sntp6` is the whole conjunction `lib.rs`'s `pub mod net_sntp_client` is gated on, so
+  #     without this leg the client module is lexed by nothing in the matrix;
+  #   * `desktop_firmware` is what puts `video::menubar` in the build on aarch64, so it is what
+  #     type-checks the two folded `:: BARCLOCK:` statements and the tail witness behind them;
+  #   * `witness` is NOT what gates the fixture — `net_sntp_client::fixture()` is reachable from the
+  #     `tste` verb in any build that has the client, which is deliberate: the Orin's proof of the
+  #     parser + anchor path must not need a battery-only knob an operator at the bench cannot type.
+  #
+  # NOT `tegra`, for the reason the row above is not: the client is BOARD-FREE, and if it ever stops
+  # compiling without a board term this leg says so before any image is cut. The metal ADAPTER half is
+  # already covered by `arm-tegra-net6`, which compiles the same shared surface under `rtl8168`.
+  "arm-virt-sntp6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,vnet,net6,desktop_firmware,livecon,quarry,sntp6"
   # VIRTPREEMPT (orin 17) — THE PREEMPTIVE TWIN OF THE LEG ABOVE, and not redundant with it. `virt_tick`
   # is the ONLY configuration in the tree where the `exceptions.rs` `irq_bank!`/`irq_unbank!` runtime
   # `CurrentEL` arm is selected WITHOUT `tegra`, so it is the only leg that type-checks that arm against a

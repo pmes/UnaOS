@@ -45,8 +45,8 @@ pub mod smolnet;
 // SNTP-X86: the shared, arch-neutral RFC 4330 SNTP reply parser + request builder. The x86 smolnet
 // SNTP client (`smolnet::sntp_*`) renders civil time through it; the pi/genet PI-NET-16 client migrates
 // onto it in a later fold. Pure no_std/no-alloc parser (all `pub`, so no dead-code warning where a given
-// arch has no consumer yet). See net_sntp.rs.
-pub mod net_sntp;
+// arch has no consumer yet — CORRECTED by SNTP-NET6: aarch64 HAS a consumer now, declared on the next line).
+pub mod net_sntp; #[cfg(all(feature = "sntp6", feature = "net6", target_arch = "aarch64"))] pub mod net_sntp_client; // SNTP-NET6 (UNAOS_SNTP6=1): the aarch64 time CLIENT over the shared NET6 socket surface — the one wire that was missing on this board. Arch-neutral in content and NIC-AGNOSTIC by construction (it names no driver, no board, no register); the cfg matches `net_phy::net6`'s own, because that surface is where `open`/`bind`/`sendto`/`recvfrom` live. DEFAULT OFF and LINE-NEUTRAL — a cfg'd-out `pub mod` is never lexed and this statement adds no source line, so every knob-off image stays byte-identical (`./arroyo knoboff net6`). See net_sntp_client.rs.
 
 // SOCK-8: the shared, arch-neutral DNS A-record query builder + response parser. The x86 smolnet resolver
 // (`smolnet::resolve`) renders name lookups through it; the pi/genet PI-NET-14 client migrates onto it in a
