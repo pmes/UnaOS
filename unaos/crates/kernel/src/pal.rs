@@ -298,7 +298,7 @@ pub mod cursor {
     /// when this constant is `false` (the back-buffer sprite model — aarch64 / the Pi in-kernel
     /// path); under the front-buffer model (x86) `video::cursor`'s own save-under owns the trail
     /// and a back-buffer erase does active harm.**
-    pub(crate) const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64");
+    pub(crate) const SPRITE_OWNS_PAINT: bool = cfg!(target_arch = "x86_64") || cfg!(feature = "desktop_firmware"); // PTRLOST/SO46 — `desktop_firmware` is the knob that compiles the FURNITURE subtraction into `video::screen::present_background` (the strips and the open dropdown join the window boxes in `occ`, screen.rs `ptrown_pass`), and over furniture `video::wm::composite_inner`'s `hit` set — window TABLE rows only — never plans the compositor arrow, so the back-buffer arrow was subtracted away with NOTHING taking its place and the wire read `[cursor12] … -> nohit` with no pointer on the glass. Wherever that subtraction is compiled the COMPOSITOR sprite owns the paint, which also makes every pointer report repaint the arrow (`repaint_on_move`) instead of one desktop present in a hundred. Enforced at compile time by `video::screen::PTR_OWNER_INVARIANT`. Line-neutral by construction: this arc adds no line to this file.
 
     // CURSOR-HIDE (metal verdict, 2026-07-18): the cursor auto-hides after ~1.5 s without pointer
     // input and reappears instantly on the next report (`move_rel`/`set_abs` stamp the activity
