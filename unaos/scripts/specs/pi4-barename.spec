@@ -47,7 +47,10 @@
 # honest answer — a typist that had nothing to type at is not a launch regression.
 
 # --- 1. THE BARE NAME LAUNCHES ---------------------------------------------------------
-# `shell.rs:5225`. Every field is pinned rather than presence-checked, because each one is a
+# `shell.rs:7111` (the `:: BAREXEC: {} (typed '{}') — loaded … left RUNNING ::` emitter; WIREHYG
+# 2026-09-13 re-verified this and the four citations below — ALL FIVE had drifted onto unrelated
+# code, so each now carries the token that makes the site re-findable when the line moves again).
+# Every field is pinned rather than presence-checked, because each one is a
 # different claim and they fail separately:
 #   /apps/VUG.ELF  — the ABSOLUTE path, i.e. probe 2 of `exec_resolve` (the program-source
 #                    root) fired. Typed from `/`, cwd-relative resolution CANNOT find this
@@ -70,22 +73,31 @@ FORBID :: \[midden\] cmd="vug" -> Host verb=
 FORBID :: \[midden\] cmd="vug" -> TerminalError
 
 # --- 2. THE NEGATIVE CONTROL -----------------------------------------------------------
-# `shell.rs:2900`. A word that is neither a verb nor a program on either volume still gets a
+# `shell.rs:4832` (`:: [midden] cmd="{}" -> {} len={} ::`). A word that is neither a verb nor a
+# program on either volume still gets a
 # terminal refusal from the core. This is what stops witness 1 from being satisfiable by a
 # build that launches something for every word typed; `len=` is pinned non-zero because a
 # core that produced NOTHING prints `len=0` rather than a plausible number (that property is
-# the witness's own documented design, shell.rs:2895).
+# the witness's own documented design, shell.rs:4826-4828).
+# ⚠ THE VERDICT WORD IS NOT THIS FILE'S TO ASSERT: `TerminalError` is the `{}` in that format,
+# filled at runtime by `Message::kind()` in ANOTHER CRATE (`libs/sys/midden_core/src/lib.rs:99`).
+# The bytes `-> TerminalError` therefore exist on the WIRE and NOWHERE in `.rodata`, so this row
+# is sound here and would read 0 in an artifact certification; and the FORBID at the `vug` block
+# above stops being ABLE to fire the day that enum arm is renamed — a check that cannot fire is
+# an absent one (LAWS §5). Re-key both on `kind()`'s current word when it changes.
 REQUIRE :: \[midden\] cmd="nosuchprogram" -> TerminalError len=[1-9][0-9]* ::
 
 # --- 3. THE LEDGER SEES THE DETACHED CHILD ---------------------------------------------
-# `shell.rs:4908`, the BGRUN-1 sweep. AT LEAST ONE tracked job, not "some number of jobs":
+# `shell.rs:6773` (`:: BGRUN: jobs — {} tracked job(s) after the sweep ::`), the BGRUN-1 sweep.
+# AT LEAST ONE tracked job, not "some number of jobs":
 # `[1-9]` is the whole gate. Step 1 said "left RUNNING"; if the child had been reaped, or
 # never adopted into the job table by `adopt_bg_job`, this line would read 0 and step 1's
 # claim would be about a print statement rather than about the system.
 REQUIRE :: BGRUN: jobs — [1-9][0-9]* tracked job\(s\) after the sweep ::
 
-# The launch must not have been killed for a full job table on the way in (shell.rs:5217) —
-# that path also prints a BAREXEC line, and it is a pass-shaped failure of exactly this gate.
+# The launch must not have been killed for a full job table on the way in (`shell.rs:7103`) —
+# that path also prints a BAREXEC line (`shell.rs:7103`), and it is a pass-shaped failure of
+# exactly this gate.
 FORBID :: BAREXEC: .* — job table full, pid=[0-9]+ killed
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────

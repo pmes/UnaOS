@@ -342,6 +342,20 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   `FAIL ::`, `PANIC`) into every spec, so a passing path never emits them; a gate that protects rules
   that never fire on a real wire is theatre; a rename batch must keep witness tags and move path
   literals, and the new path is a design question.
+- **A scorer keys on a token UNIQUE to the verdict it scores, never on a fragment another emitter
+  can reach** (orin 2026-09-13, WIREHYG/A83, off SO47). `-> NO REPLY ::` was ARP's failure; ARP's
+  wording changed and the fragment did not disappear, it CHANGED VERBS — `ping` still emits those
+  exact bytes, composing `" -> {} ::"` against `"NO REPLY"` (`net_phy.rs:1360`, `:1365`). Nothing
+  about that looks wrong: the count on the wire is unchanged and the string is still reachable, so
+  a scorer built to catch a failing ARP goes quietly green on exactly that failure, while an
+  ARTIFACT scorer on the same fragment reads 0 (a runtime composition is never in `.rodata`) and
+  reds a healthy build. **A string that CHANGES MEANING is more dangerous than one that
+  disappears**, and the wire token and the artifact token are different objects that must be named
+  separately. Enforcer: `docs/dev/evidence/orin28/scorer-token-uniqueness.sh` —
+  `--verb <verb> '<token>'` maps a token to every kernel print site that can emit it, composition
+  through a `{}` hole included, and exits 1 when the emitter set names a different verb, more than
+  one verb, or none; `--selftest` carries its three controls and its go-red is
+  `--verb arp '-> NO REPLY ::'`.
 - **Cite the declaration site, not the symbol** (rmbp 16 2026-09-08): a check leg is not the image
   verb, a library crate is not the kernel module, the legible instrument is not the sound one.
 - **A defect that reappears each layer down belongs at the bottom layer;** ship the layer's fix
