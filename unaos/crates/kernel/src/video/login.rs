@@ -469,6 +469,59 @@ fn submit() {
 // fixture (`loginst`) — drives the same consume_key the routes call, headless
 // ---------------------------------------------------------------------------
 
+/// SO43 — **the IGNITION leg: the screen comes up because the DESKTOP exists, and for no other
+/// reason.** The leg that would have caught SO43 before five flights did.
+///
+/// It drives [`crate::fs::users::screen_open_at_ignition`] — the seam every ignition site now calls —
+/// with the tuples the two arches actually present, and asserts the CONSEQUENCE ([`is_open`]), never
+/// the seam's own return:
+///
+///  1. **`(desktop_up = false, console_routed = true)`** — a machine with a routed console and no
+///     desktop. The screen must stay DOWN. This is the arm that keeps the new rule from being "always
+///     open": a check whose corpus can only produce one outcome is not a check (LAWS §5).
+///  2. **`(desktop_up = true, console_routed = false)`** — **THE ORIN'S OWN TUPLE**, read off the
+///     wire rather than imagined (`docs/dev/evidence/orin28/render14-boot1-desktop-menubar.log`,
+///     `awk 'index($0,"[deskcascade]")'`):
+///     `[deskcascade] -> CASCADED windows=2 bar=1 owns_pixels=1 route=ROUTED activate=false`
+///     — `bar=1` is `desktop_up`, `activate=false` is `console_routed`. The screen MUST open.
+///
+/// Arm 2 is the go-red: put `console_routed` back into the rule inside `screen_open_at_ignition`
+/// (`if desktop_up` -> `if desktop_up && console_routed`) and this leg reads
+/// `tegra_opened=false -> FAIL —`, which is a `mbench` DEFAULT_FORBID and reds the run. That is the
+/// pre-fix kernel, reproduced and refused, on the ladder — no tegra hardware in the loop, because the
+/// seam is arch-neutral by construction and the board only supplies the tuple.
+///
+/// Headless throughout and side-effect free: the once-latch, the `HEADLESS` flag and the form state
+/// are saved and put back, so the real ignition later in the boot is the one that counts.
+#[cfg(feature = "loginst")]
+fn ignition_leg() -> bool {
+    let was_headless = HEADLESS.swap(true, Ordering::Relaxed);
+    let was_once = OPENED_ONCE.swap(false, Ordering::Relaxed);
+    FORM.lock().state = State::Closed;
+
+    // 1 — a routed console is not a desktop.
+    users::screen_open_at_ignition(false, true);
+    let no_desktop_held = !is_open();
+
+    // 2 — THE ORIN: the desktop exists and `activate()` returned false.
+    users::screen_open_at_ignition(true, false);
+    let tegra_opened = is_open();
+
+    take_down();
+    FORM.lock().state = State::Closed;
+    OPENED_ONCE.store(was_once, Ordering::Relaxed);
+    HEADLESS.store(was_headless, Ordering::Relaxed);
+
+    let ok = no_desktop_held && tegra_opened;
+    serial_println!(
+        ":: LOGIN-IGNITION: no_desktop_held={} tegra_opened={} tuple=desktop_up:true,console_routed:false (render14 `bar=1 … activate=false`) -> {} ::",
+        no_desktop_held,
+        tegra_opened,
+        if ok { "PASS" } else { "FAIL —" }
+    );
+    ok
+}
+
 /// LOGINCLOSE — **the CLOSE leg, and it is the one claim in this file that CANNOT be made headless.**
 ///
 /// "The login screen has no close box and no pointer route" is a statement about a `wm` ROW: every
@@ -580,6 +633,40 @@ fn close_leg() -> (&'static str, bool) {
     } else {
         "REACHABLE"
     };
+    // SO44 — **AND WHAT DOES A PRESS AT THE CENTRE OF THIS ROW ACTUALLY DO?** LOGINCLOSE asked "can
+    // the pointer CLOSE this row" and never asked this one, and the two answers are not the same
+    // answer: a press that reaches nothing does not stop, it falls to whatever is UNDERNEATH, and the
+    // row under a centred login screen is the desktop's own console/shell window. Both arch routers
+    // then RAISE and FOCUS that row (`wc_click_route_at` on x86, `wc_click_route` on aarch64, each
+    // after `hit_test` names an id), which puts it above the screen — Peter, render14: *"the login
+    // window appeared over the top of the gui and when i click it it went away."*
+    //
+    // READ-ONLY and no verdict: this is the MEASUREMENT SO44's row cites, not its fix. `hit_test` is a
+    // pure read over the window table; nothing is pressed, raised or focused by this line. The fix is
+    // MODALITY at the shared furniture router (`video/strip.rs`'s `press_route`, the one seam both
+    // arch routers ask ahead of every window arm) and that file is outside this executor's list, so
+    // the exact change is reported and not made. `MODAL` is the reading once it lands; `FALLS-THROUGH`
+    // is today's, and it names the row that takes the press instead.
+    let (cxp, cyp) = (
+        info.x.saturating_add(info.w.saturating_mul(info.scale) / 2) as i32,
+        info.y.saturating_add(info.h.saturating_mul(info.scale) / 2) as i32,
+    );
+    let beneath = wm::hit_test(cxp, cyp);
+    serial_println!(
+        "[login] press-probe win={} centre=({},{}) hit={} verdict={} (SO44: a press inside the screen's rectangle must belong to the screen; today it belongs to the row beneath it, which both routers then raise above the screen)",
+        win,
+        cxp,
+        cyp,
+        match beneath {
+            Some((w, _, _)) => w,
+            None => wm::WIN_NONE,
+        },
+        match beneath {
+            Some((w, _, _)) if w == win => "MODAL",
+            Some(_) => "FALLS-THROUGH",
+            None => "NOBODY",
+        }
+    );
     // 4 — the belt. `wm::close` at the screen's own row is what every close route ends in, and it is
     // what runs `winid_holders_clear` on the `"login"` holder.
     wm::close(win);
@@ -611,6 +698,11 @@ fn close_leg() -> (&'static str, bool) {
 /// **Log Out row** in the SHARD tree, resolves it through the menu's own pure `item_at`, and fires it.
 #[cfg(feature = "loginst")]
 pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -> bool) -> bool {
+    // SO43 — the IGNITION leg goes FIRST OF ALL: it is headless, it drives the ignition seam rather
+    // than the form, and it saves and restores the once-latch, so it must run before anything else
+    // has touched either. Its own `:: LOGIN-IGNITION:` line carries its verdict; it is folded into
+    // `ok` below as well, because a screen that never ignites makes every leg under it moot.
+    let ignition_ok = ignition_leg();
     // LOGINCLOSE — FIRST, because it is the only leg that needs a real window and the rest of the
     // fixture must run on the headless form the ladder expects. It leaves the screen down and the
     // console resumed, which is the state `open` below assumes.
@@ -662,10 +754,10 @@ pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -
     // And the belt is required exactly where it could run: a harness that had a row must have seen the
     // stranded screen put back by the next key (`reopened`); one that had none has nothing to show.
     let heal_ok = close_route == "no-window" || reopened;
-    let ok = esc_kept && wrong_kept && opened && passes_through && logout_ok && back && second && close_box_refused && heal_ok;
+    let ok = esc_kept && wrong_kept && opened && passes_through && logout_ok && back && second && close_box_refused && heal_ok && ignition_ok;
     serial_println!(
-        ":: LOGIN-SCREEN: window=no esc_kept={} wrong_kept={} opened={} passes_through={} logout={} back_after_logout={} second_login={} logins={} close_box_refused={} close_route={} reopened={} heals={} -> {} ::",
-        esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), close_box_refused, close_route, reopened, HEALS.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL —" }
+        ":: LOGIN-SCREEN: window=no esc_kept={} wrong_kept={} opened={} passes_through={} logout={} back_after_logout={} second_login={} logins={} close_box_refused={} close_route={} reopened={} heals={} ignition={} -> {} ::",
+        esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), close_box_refused, close_route, reopened, HEALS.load(Ordering::Relaxed), ignition_ok, if ok { "PASS" } else { "FAIL —" }
     );
     ok
 }

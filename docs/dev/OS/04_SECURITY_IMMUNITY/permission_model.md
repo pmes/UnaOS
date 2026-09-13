@@ -122,6 +122,28 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   of screen state back at the next key offer should anything close the row by another road. Residual,
   LEDGER SO36: the screen owns the KEYBOARD and its own row only — the dock and the menu bar still
   answer the pointer before a session exists.
+* **The IGNITION, and the one rule it follows (SO43, LOGINBOOT 2026-09-13):** the screen comes up
+  because **the DESKTOP EXISTS**, never because a console route was installed. M3 wrote two of its four
+  ignition sites as `if activate() { … }`, and `desktop_firmware::activate`'s return is
+  `fbcon::console_is_routed()` — a fact about where the console's glyphs land. On a board whose panel
+  reads 0 at the first call that is `false` on a boot whose desktop came up perfectly, so the Orin
+  printed `[deskcascade] -> CASCADED windows=2 bar=1 owns_pixels=1 route=ROUTED activate=false` and
+  drew no screen, five flights running, while the x86 ladder stayed green because there `activate()`
+  is true. Every site now calls one named seam, `fs::users::screen_open_at_ignition(desktop_up,
+  console_routed)`, which takes BOTH facts, prints both (`[login] ignition desktop_up=… console_routed=…
+  -> OPEN|HELD`) and decides on the first; `desktop_up` is the caller's READBACK of the one
+  unconditional step of its own bring-up, the menu bar. Asserted every witness boot by the
+  `LOGIN-IGNITION` leg, which drives the Orin's own tuple (`desktop_up=true console_routed=false`) and
+  reds the moment the rule consults the second term again.
+* **Residual, LEDGER SO44 — a press on the screen is not the screen's.** A login screen is MODAL: while
+  it is up a press inside its rectangle belongs to it and a press outside belongs to nobody. Neither is
+  true yet. The row's owner band is what makes it unclosable (above), and the same band makes
+  `wm::hit_test` skip it, so a press at the screen's own centre names the row BENEATH it — measured on
+  the ladder by the `[login] press-probe` line — and both arch routers then raise and focus that row,
+  which puts it above the screen. The fix is one line at the ONE shared furniture router both routers
+  ask ahead of every window arm (`video/strip.rs`'s `press_route`), swallowing every press while the
+  screen is up; that file is outside LOGINBOOT's list, so the change is reported and not made. It
+  closes SO36's furniture half by the same statement.
 * **Log Out (M4):** a row in the CRYSTAL menu (`crystal::Verb::LogOut`, R21 — menus belong in the menu
   bar), at the foot of the SHARD tree behind its own separator, knob-on only. The pick drops the session
   principal (`fs::users::logout`) and puts the login screen back up, where a second login opens a NEW
