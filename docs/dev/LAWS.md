@@ -302,6 +302,45 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   builder-path artifact; `./arroyo check` skips baremetal, so `kernel8-test` is the Pi gate after
   arch or asm changes; a video gate carries `UNAOS_WC=1` and is verified reachable, not merely
   compiled. A certification names a control string that exists only in the build under test.
+- **A TRUNCATED RUN IS NEVER A PASS** (orin, 2026-09-13; LEDGER S8's truncation half). The same tree
+  and the same `./arroyo test` gave rc=1 idle and rc=0 loaded — the loaded run ran out of wall before
+  `[dmgovlp]` — because `scan_serial_faults` is NEGATIVE-ONLY and cannot tell a clean capture from a
+  short one, so the gate was greenest when the box was busiest. A verb that judges a capture must
+  know the LAST line its ladder prints and REFUSE (non-zero, named reason) when the capture ends
+  before it; truncation only ever removes a SUFFIX, so a terminal marker cannot be truncated into
+  looking present, while a COUNT or a non-empty log can. Enforcer: `ladder_tail_check` in
+  `unaos/arroyo` (LADDER-TAIL), exit 5 = no verdict, with a census line naming the furthest rung
+  reached; go-red is a short wall, go-green a sufficient one, both on the same tree.
+- **THE BANNER AND THE ARTIFACT MUST AGREE, and an unarmed family certifies nothing** (orin,
+  2026-09-13). `⚡ kernel features:` states what cargo was handed; only `LC_ALL=C grep -a -o -F` on
+  the BUILT ELF states what is in the image. A DONE gate that says "build `UNAOS_TEGRA=1`, certify
+  `:: NET6:`" passes on a build with no `net6` because the family is CORRECTLY absent. Enforcer:
+  `banner_artifact_check` in `unaos/arroyo` (BANNER-ARTIFACT), run on every kernel ELF from a
+  DECLARED feature→family map with a present- and an absent-CONTROL; ARMED-and-missing is a hard red,
+  unmapped features are NAMED not skipped, and unarmed-but-present is a warning because Cargo, not
+  `arroyo`'s string, is the enumerator of what a build enabled (`ga10bprobe5a` pulls in
+  `ga10bprobe4a`; a red there would be wrong-strict).
+- **A FEATURE GATE KEYS ON THE BUILD TARGET, NEVER ON ONE SPELLING OF ITS NAME** (orin, 2026-09-13;
+  the fix is 2e48d721). `arroyo:1147`'s `[ "$1" = "esp-jetson" ]` gated the GA10B ignition on one of
+  the SIX spellings the dispatcher accepts, so five built a different feature set under a banner
+  naming the rung they were not building — one power cycle spent on a card that boots and prints
+  nothing. Enforcer: `unaos/scripts/verb-alias-closure.sh`, wired into `./arroyo check`; it parses
+  the dispatcher's alias groups and reds on any `$1`-keyed guard naming a subset, exit 2 = no
+  verdict. Go-red proven on the pre-fix file at `2e48d721^`.
+- **A FIXTURE MUST LIVE ON AN ENTRY POINT THE GATE'S OWN BOOT EXECUTES** (orin, 2026-09-13; found by
+  executor LUN2 declining a file its brief named). A leg added to an interactive-only entry point
+  compiles, ships in the image, carries a perfectly good go-red — and is run by neither
+  `./arroyo test` nor `test-arm`, with the dead diff indistinguishable from the live one. PROVE IT
+  BY THE VERDICT IN THE CAPTURE, never by the string in the image: `crates/kernel/src/selftest.rs`'s
+  `run()` is the `tste` SHELL suite (sole caller `shell.rs:5727`), and `:: TSTE: suite start ::` has
+  0 hits in a healthy 2,089-line capture that nevertheless carries 23 `:: TSTE:` lines, every one a
+  BOOT-PATH fixture in `shell.rs` borrowing the same shape (only `selftest.rs` and `shell.rs` print
+  that token at all — 6 sites and 20). Enforcer:
+  `unaos/scripts/fixture-reachable.sh`, wired into `./arroyo check`; it freezes that entry point's
+  13-leg roster (a leg there is accounted for, not forbidden — the `k8-reach.registry` shape) and
+  reds by name on a fourteenth, exit 2 = no verdict. The universal form — every `-> PASS` in the ELF
+  must appear in some capture — is deliberately NOT built: knob-, arch- and skip-gated fixtures are
+  absent from healthy captures by design, so it would be wrong-strict.
 - **Byte identity is measured, never argued** (orin 1 2026-08-19): compare the loadable image
   (`objcopy -O binary`), never `.elf` or anything embedding `SRC.TGZ`; a baseline is a per-tree chain
   naming its recipe and HEAD (`kernel8-test` auto-arms `UNAOS_WITNESS`; `genet.rs` embeds the git

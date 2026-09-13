@@ -2498,6 +2498,155 @@ gate_x86_rodata_no_code() {
 # path** — a TSC read and three atomics per ring-drain attempt. If a debug leg is ever added here,
 # every `if cfg!` diagnostic block goes back to `#[cfg]` in the same commit, or the leg carries its
 # own note saying which ones were audited and why they are affordable.
+
+# ── BANNER-ARTIFACT: THE BANNER AND THE ARTIFACT MUST AGREE ────────────────────────────────────
+# A BUILD BANNER IS NOT EVIDENCE A FEATURE IS IN THE IMAGE. `⚡ kernel features: …` above states what
+# was handed to cargo; the only thing that states what is in the image is `LC_ALL=C grep -a -o -F` on
+# the BUILT ELF (LAWS §5, "An instrument's presence is proven in the artifact, never in the diff, the
+# check or the banner"). The two were separated by a reader's diligence and by nothing else, and that
+# is how both of 2026-09-13's certification defects got as far as they did:
+#   * A LEG THAT CERTIFIED A FAMILY THE BUILD CANNOT COMPILE. A DONE gate said build with
+#     `UNAOS_TEGRA=1` and certify `:: NET6:` on the artifact. MEASURED at f164b6fd: that build's
+#     aarch64 effective list is `ehcihid,tegra,bsptick,bsprun,tegrasmp,apsrun,sdwrite,sdmmc` — no
+#     `net6` — and `:: NET6:` reads 0 on the ELF. The family is CORRECTLY ABSENT, the leg passed, and
+#     it proved nothing. An absence is evidence only if the producing path was compiled.
+#   * A FEATURE NAMED ON THE BANNER AND MISSING FROM THE CARD, which is the same disagreement running
+#     the other way and is what puts a dead image on a power cycle.
+# So the agreement is now ASSERTED at build time, on the artifact, in both directions, for every
+# feature that HAS a declared family — and an unarmed row is not skipped, it is REPORTED as
+# absent-by-construction, which is precisely the sentence the NET6 leg needed to read about itself.
+#
+# THE MAP IS DECLARED, AND ITS SCOPE IS STATED RATHER THAN IMPLIED. Not every cargo feature has a
+# greppable family: `wc`, `tegra`, `bsptick` and their kind gate CODE whose witnesses are named after
+# the SUBSYSTEM, not the feature, and `sdwrite` is a feature name that appears as a string in NO build
+# at all (the correction folded into 2e48d721 — it reads 0 on a known-good card, so grepping the
+# FEATURE NAME is a bad control; its family is `:: TEGRA-SD: WRITE admitted`). A map that guessed
+# would be worse than no map. So the rows below are the ones MEASURED both ways, and every other
+# feature on the banner is NAMED in one line as unmapped — reported, never silently skipped. Growing
+# this table is a per-feature, per-measurement job; `crates/kernel/Cargo.toml` already carries a
+# "Witness famil…" prose line on 18 of its features (`grep -c 'Witness famil'`, counted before the
+# claim) and those lines are the queue — one measurement each, not a transcription.
+#
+# THE CONTROLS ARE TWO-SIDED, on every run, because a family reading 0 has to be a fact about the
+# BUILD and not about the grep (LAWS §5: "is a zero a fact about the data or about the pattern?").
+# `UNAOS_BUILD_STAMP` is placed in `.text` by `fs/bootdisk.rs` on every kernel this script builds and
+# MUST read non-zero; `NOTATOKEN-UNAOS` exists in no build and MUST read zero. If either control
+# misbehaves the run gets NO verdict rather than a green, because the instrument is what broke.
+#
+# WHAT THIS DOES NOT COVER, said out loud: `kernel8()` builds from its own curated `$K8_FEATS` and
+# prints its own banner, and is not wired here — the Pi image is the next row of this arc, not a
+# silent gap. The x86 banner names `smolnet`/`kbdwit`/`deadman` that `arm_features` strips from every
+# aarch64 compile, which is why this check reads the ARCH-EFFECTIVE list its caller hands it and never
+# the banner string.
+#
+# A ROW IS SCOPED TO AN ARCH, and that column was paid for by the first real run of this check. The
+# x86 default feature list carries `sdwrite` (`witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite`)
+# while `:: TEGRA-SD: WRITE admitted` is printed from `arch/aarch64`, so an unscoped row reddened a
+# perfectly honest `./arroyo test` build on its first invocation. A FEATURE BEING ENABLED DOES NOT
+# MEAN ITS FAMILY IS COMPILED ON THIS TARGET; the arch is part of the declaration, and a row out of
+# scope is REPORTED as out of scope, never silently dropped. `any` means the family is arch-neutral.
+# The four rows below are aarch64-scoped because that is where they were measured; the x86 half of
+# `net6` is UNMEASURED and is deliberately not claimed here.
+#
+# A ROW'S FEATURE FIELD IS A CONJUNCTION (`a+b+c`), and that was paid for too — by the third real
+# run, `UNAOS_QEMU_FULL=1 ./arroyo test-arm`. The aarch64 VIRT build arms `sdwrite`
+# (`witness,ehcihid,sdwrite`) but `:: TEGRA-SD: WRITE admitted` sits under
+# `#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc", feature = "sdwrite"))]`
+# (`drivers/block.rs:2518`), so a single-feature row reddened an honest `test-arm` (rc=6). ONE
+# FEATURE IS RARELY THE WHOLE GATE: the row must name every feature the `cfg` names, and the check
+# calls a row ARMED only when ALL of them are on the effective list. The FIRST member is the row's
+# subject for the unmapped report; the co-requisites keep their own place in that list, because
+# `tegra` and `sdmmc` have no family of their own and pretending otherwise would hide two holes.
+#
+# Fields: <cargo-feature[+cofeature…]> <SPACE> <aarch64|x86_64|any> <SPACE> <witness family, to EOL>
+BANNER_ARTIFACT_MAP='
+ga10bprobe5a aarch64 [ga10bprobe5a]
+ga10bprobe5 aarch64 [ga10bfw]
+net6 aarch64 :: NET6:
+sdwrite+tegra+sdmmc aarch64 :: TEGRA-SD: WRITE admitted
+'
+
+# Assert banner↔artifact agreement. 0 = agreed, 6 = disagreement or a broken control.
+#   $1 = built ELF   $2 = the EFFECTIVE feature list for THAT artifact (comma-separated)   $3 = label
+banner_artifact_check() {
+    local elf="$1" feats=",${2//[[:space:]]/}," lbl="${3:-artifact}" rc=0 nmap=0 noscope=0 unmapped="" f arch fam n
+    [ -f "$elf" ] || { echo -e "${COLOR_RED}✖ banner↔artifact [${lbl}]: ${elf} is not there to read — NO verdict.${COLOR_RESET}"; return 6; }
+    # CONTROLS FIRST: if the instrument is broken every count below is meaningless, so nothing else
+    # is even printed. A present-control and an absent-control, because one of each is what makes a
+    # zero readable (a `grep` that matches nothing and a `grep` that matches everything both look
+    # like a clean gate from one side only).
+    local cpos cneg
+    cpos=$(LC_ALL=C grep -a -o -F -- 'UNAOS_BUILD_STAMP' "$elf" | wc -l)
+    cneg=$(LC_ALL=C grep -a -o -F -- 'NOTATOKEN-UNAOS' "$elf" | wc -l)
+    if [ "$cpos" -eq 0 ] || [ "$cneg" -ne 0 ]; then
+        echo -e "${COLOR_RED}✖ banner↔artifact [${lbl}]: THE INSTRUMENT IS BROKEN, not the build — present-control UNAOS_BUILD_STAMP=${cpos} (want >0), absent-control NOTATOKEN-UNAOS=${cneg} (want 0). Every family count from this ELF is unreadable; NO verdict.${COLOR_RESET}"
+        return 6
+    fi
+    echo -e "${COLOR_YELLOW}⚡ banner↔artifact [${lbl}]: certifying on the BUILT ELF (${elf##*/}, $(wc -c < "$elf" | tr -d ' ') B); controls UNAOS_BUILD_STAMP=${cpos} NOTATOKEN-UNAOS=${cneg}.${COLOR_RESET}"
+    while read -r f arch fam; do
+        [ -n "$f" ] || continue
+        if [ "$arch" != any ] && [ "$arch" != "$lbl" ]; then noscope=$((noscope + 1)); continue; fi
+        nmap=$((nmap + 1))
+        n=$(LC_ALL=C grep -a -o -F -- "$fam" "$elf" | wc -l)
+        # ARMED iff EVERY member of the conjunction is on the effective list.
+        local _m _armed=1
+        for _m in ${f//+/ }; do case "$feats" in *",$_m,"*) ;; *) _armed="" ;; esac; done
+        case "$_armed" in
+          1)
+            if [ "$n" -gt 0 ]; then
+                echo -e "    ${COLOR_GREEN}ARMED   ${f} -> '${fam}' ${n} hit(s) — in the image.${COLOR_RESET}"
+            else
+                echo -e "    ${COLOR_RED}✖ ARMED ${f} -> '${fam}' 0 hits — THE BANNER NAMES A FEATURE THE ARTIFACT DOES NOT CARRY. A card cut from this boots, prints no ${f} line and looks like a clean flight.${COLOR_RESET}"
+                rc=6
+            fi ;;
+          *)
+            if [ "$n" -eq 0 ]; then
+                echo -e "    UNARMED ${f} -> '${fam}' 0 hits — ABSENT BY CONSTRUCTION. Certifying this family on THIS artifact proves nothing (the NET6 leg's error)."
+            else
+                # A WARNING AND NOT A RED, and the asymmetry is deliberate. THE ENUMERATOR OF WHAT IS
+                # ENABLED IS CARGO, NOT THIS STRING: `arroyo` appends knob NAMES and lets Cargo resolve
+                # the `a = ["b"]` implications (the same reason `virt_tick` is listed separately in
+                # BLOBATOMIC's case above), so a family can be legitimately IN the image while its
+                # feature is not on the list. MEASURED on this arc, first armed run:
+                # `UNAOS_GA10B_PROBE5=1 UNAOS_TEGRA=1 ./arroyo esp-jetson` lists
+                # `…,ga10bprobe5,ga10bprobe5a,…` and Cargo additionally enables `ga10bprobe4a`
+                # through `ga10bprobe5a = ["ga10bprobe5", "ga10bprobe4a"]` — so a `ga10bprobe4a` row
+                # would red on a perfectly correct build. Reddening here would be WRONG-STRICT, which
+                # LAWS §5 ranks below wrong-lenient, and a gate that reds an honest build is deleted
+                # within the week. The other direction (ARMED and MISSING) has no such escape and stays
+                # a hard red. This line is how the first version of the map above was caught naming
+                # `ga10bfw` — which is a WITNESS FAMILY and not a cargo feature at all; the feature
+                # that compiles it is `ga10bprobe5`.
+                echo -e "${COLOR_YELLOW}    ⚠ UNARMED ${f} -> '${fam}' ${n} hit(s) — in the image although the feature list does not name it. Either a Cargo IMPLICATION enabled it, or this map row names the wrong feature. Not a verdict either way — fix the row or record the implication.${COLOR_RESET}"
+            fi ;;
+        esac
+    done <<EOF
+$(printf '%s\n' "$BANNER_ARTIFACT_MAP" | awk 'NF')
+EOF
+    # UNMAPPED IS REPORTED, NEVER IGNORED — the whole point of a declared map is that its holes are
+    # visible. One line, names listed, so the count is checkable against the banner by eye.
+    # `while read` over a newline split, not `IFS=,` word splitting: an `unset IFS` inside a function
+    # that declared it `local` drops the local and restores the GLOBAL one, which is a trap worth not
+    # setting for a diagnostic line.
+    while read -r f; do
+        [ -n "$f" ] || continue
+        if ! printf '%s\n' "$BANNER_ARTIFACT_MAP" | awk -v f="$f" -v a="$lbl" 'NF { split($1, P, "+"); if (P[1] == f && ($2 == "any" || $2 == a)) found = 1 } END{exit !found}'; then
+            unmapped="${unmapped}${unmapped:+,}$f"
+        fi
+    done <<EOF
+$(printf '%s' "${2//[[:space:]]/}" | tr ',' '\n')
+EOF
+    # `if`, not `[ … ] && …`: under `set -e` a bare `test && cmd` whose test FAILS is a failed command
+    # at statement level and aborts the script (the same trap the k8_script guard below documents).
+    if [ -n "$unmapped" ]; then
+        echo -e "${COLOR_YELLOW}    ⚠ ${nmap} row(s) checked, ${noscope} out of scope for ${lbl}; these features carry NO declared witness family for this arch and were NOT checked: ${unmapped}${COLOR_RESET}"
+    fi
+    if [ "$nmap" -eq 0 ]; then
+        echo -e "${COLOR_YELLOW}    ⚠ NO declared row applies to ${lbl} — this artifact's features were NOT certified against the map (${noscope} row(s) are scoped to another arch). Stated, not skipped: the ${lbl} half of the map is owed.${COLOR_RESET}"
+    fi
+    return $rc
+}
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -2506,6 +2655,10 @@ build_kernel_x86_64() {
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
     gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel"
+    # BANNER-ARTIFACT: beside the other post-build artifact gate, on the ELF cargo just wrote, with
+    # the list THIS compile was handed (x86 keeps the full $KERNEL_FEATURES — the `arm_features`
+    # strip is aarch64-only).
+    banner_artifact_check "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel" "${KERNEL_FEATURES#--features }" x86_64
     echo -e "${COLOR_GREEN}✅ x86_64 Kernel Built.${COLOR_RESET}"
 }
 
@@ -2700,6 +2853,10 @@ build_kernel_aarch64() {
       --target ../../aarch64-unaos.json \
       $NIGHTLY_FLAGS $_af
     cd "$WORKSPACE_DIR"
+    # BANNER-ARTIFACT: `$_af`, not $KERNEL_FEATURES and not the banner — this is the ONLY list that
+    # describes the aarch64 artifact, because `arm_features` above strips smolnet/kbdwit/deadman out
+    # of every aarch64 compile while the banner still names them.
+    banner_artifact_check "${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel" "${_af#--features }" aarch64
     echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
 }
 
@@ -2848,6 +3005,113 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
     awk -v p="$FAULT_PATTERNS" -v lbl="$lbl" '
         $0 ~ p { n++; if (n <= 20) printf("  ✖ %s:%d: %s\n", lbl, FNR, $0) }
         END { if (n > 20) printf("  ✖ … and %d more matching line(s)\n", n - 20); exit (n ? 1 : 0) }
+    ' "$logf"
+}
+
+# ── LADDER-TAIL: A TRUNCATED RUN IS NEVER A PASS ───────────────────────────────────────────────
+# WHY THIS EXISTS, measured 2026-09-13 and caught by accident. The SAME TREE and the SAME command
+# gave `./arroyo test` rc=1 on an idle box and rc=0 under load: the idle boot reached `[dmgovlp]`
+# and the loaded one ran out of wall before it. `scan_serial_faults` above is NEGATIVE-ONLY — it
+# says "no fault text in the bytes I was given" and has no notion of the run having FINISHED — so a
+# capture that stops mid-ladder is indistinguishable from a clean one, and the verdict of every gate
+# built on this verb becomes a function of how many executors happen to share the box. That is the
+# worst failure a gate can have: it is green exactly when the machine is busiest, which is exactly
+# when work is being landed. (LEDGER S8 named `test`/`test-arm` as negative-only; this is its
+# truncation half. See also LAWS §5 "A check that cannot fire is an absent one".)
+#
+# WHAT IS ASSERTED, and it is deliberately ONE thing: the capture CONTAINS THE LAST LINE THE VERB'S
+# DEMO LADDER PRINTS. Not that the ladder passed (that is `scan_serial_faults`' job and mbench's),
+# not that the machine idled afterwards — only that the wire got to the end of the ladder. A clean
+# scan over a capture that stops at rung 7 of 10 proves the seven that ran were clean and NOTHING
+# about the three that did not; this turns that into an exit status instead of a reader's duty.
+#
+# WHY A TERMINAL MARKER CANNOT ITSELF BE TRUNCATED INTO LOOKING COMPLETE — the question this check
+# has to answer about itself, and the reason it is a marker and not a count:
+#   * TRUNCATION ONLY EVER REMOVES A SUFFIX of the wire. It cannot add a line, and it cannot reorder
+#     one. So for any marker printed strictly AFTER every rung, a truncated capture necessarily
+#     lacks it, and a capture that HAS it necessarily contains every byte the ladder emitted before
+#     it. The property is monotone in the capture, which a COUNT is not: a healthy `test 90` capture
+#     is 2,089 lines carrying 506 `:: ` verdicts (counted, not estimated), and a chattier fixture —
+#     or a flood like SO47's per-pass `[wc-d]`, 46,161 lines on one Orin boot — reaches any
+#     threshold you pick long before the ladder ends, so a count is satisfiable by a truncated run.
+#     "The log is non-empty" is the degenerate case of the same error and is what we had.
+#   * THE MARKER IS THE LADDER'S OWN, NOT AN INVENTED ONE. `pulsew_launcher` is the last launcher in
+#     `u8x_launcher`'s chain that prints on EVERY path (arch/x86_64/syscall.rs:19445 — past its
+#     one-shot guard every branch emits exactly one `:: PULSE-W:` line, including all four skips),
+#     and the only launchers chained after it are the three `smolnet`-gated ones ending in
+#     `zeolite_launcher` (:21293). Nothing else in the tree prints either token, so the marker
+#     cannot fire early.
+#   * IT IS AN ALTERNATION, ON PURPOSE, AND THAT CAN ONLY MAKE IT MORE LENIENT. `:: zeolite:` prints
+#     strictly AFTER `:: PULSE-W:`, so accepting either widens the check by exactly the window
+#     between two adjacent lines while keeping every rung before PULSE-W covered. It exists because
+#     `serial::_print` takes the UART with `try_lock` and DROPS the line on contention (see the
+#     SERIAL SETTLE note at arch/x86_64/syscall.rs:17410, where that cost the WINX-1 verdict about
+#     one run in three before a settle was added) — and a check that reds an honest run is deleted
+#     within the week. Wrong-lenient beats wrong-strict here (LAWS §5, pi 7).
+#
+# THE CENSUS IS THE CONTROL PROBE, and it is not the verdict. A green run must report EVERY declared
+# rung present (`census N/N`), so a renamed or deleted family shows up as a number in the log rather
+# than as a silently weaker gate — "is a zero a fact about the data or about the pattern?" answered
+# on every single run. On a RED the census names the FURTHEST rung the capture did reach, which is
+# the whole diagnosis: "truncated after DMG-REFUSE, before PULSE-W" tells an operator to add wall;
+# "not one declared rung present" tells them the census itself is stale. The rungs are listed in the
+# order `u8x_launcher` (arch/x86_64/syscall.rs:21389) chains them, which is the order their last
+# lines appear in a healthy capture — measured on f164b6fd at lines 1102 / 1105 / 1186 / 1887 /
+# 1905 / 1923 / 1957 / 1958 / 1959 / 1979 of a 2089-line log.
+#
+# NOT DECLARED IS NOT SKIPPED. A verb with no row here prints a loud UNDECLARED line and the run is
+# left at whatever verdict its other checks reached — it must never read as "completeness verified".
+# `test-arm` is that case today and is owed: the aarch64 virt boot's `:: CAPSTONE COMPLETE` is
+# printed by `capstone_body` (arch/aarch64/sched.rs:8333) and is the obvious candidate, but that
+# line is scoped by `pi4-regression.spec`/`jetson-sync1.spec` to captures those specs cover, and
+# declaring it for `test-arm` without measuring the virt boot's own tail would be asserting a marker
+# this verb does not own. Measured and declared in its own commit, not guessed at in this one.
+#
+# THE PRECONDITION IS STRUCTURAL, NOT ASSUMED: the ladder is `witness`-reached, and `test` cannot be
+# run without it — the case at :49 does `export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"` for exactly the
+# battery verbs and the derivation at :206 arms on `-n`, so even `UNAOS_WITNESS=0 ./arroyo test`
+# compiles the fixtures. No guard is written for that case, because a guard that cannot fire is an
+# absent one (LAWS §5) and writing one here would only make the next reader think it can.
+LADDER_TAIL_test=':: PULSE-W:|:: zeolite:'
+LADDER_CENSUS_test=':: U8x:|:: U9x:|:: WINX-1:|:: WINX-2:|:: WINX-3:|:: WINX-7:|:: DMG-REFUSE:|:: WINX-8:|:: PULSE-W:|:: zeolite:'
+
+# Assert a capture reached its verb's declared ladder tail. 0 = complete, 5 = truncated / no verdict,
+# 3 = nothing declared for this verb (reported, never silently green). awk with `index()`, never
+# `grep`: the tokens carry brackets and the serial logs carry control bytes (LAWS §5 Logs).
+ladder_tail_check() { # $1 = log file, $2 = verb label (the LADDER_TAIL_<label> suffix)
+    local logf="$1" lbl="${2:-test}" key term census
+    key="${lbl//-/_}"   # `test-arm` is not a shell identifier; the table is keyed on the underscored form
+    eval "term=\"\${LADDER_TAIL_${key}:-}\"; census=\"\${LADDER_CENSUS_${key}:-}\""
+    if [ -z "$term" ]; then
+        echo -e "${COLOR_YELLOW}⚡ ladder: no terminal marker is DECLARED for '${lbl}' — this run's COMPLETENESS was not checked (only its fault scan was). Not a pass for truncation; see LADDER-TAIL in this file.${COLOR_RESET}"
+        return 3
+    fi
+    [ -f "$logf" ] || { echo -e "${COLOR_RED}✖ ladder: ${logf} is not there to read — no completeness verdict.${COLOR_RESET}"; return 5; }
+    awk -v term="$term" -v census="$census" -v lbl="$lbl" '
+        BEGIN { nt = split(term, T, "|"); nc = split(census, C, "|"); far = 0; hit = 0; hitln = 0 }
+        {
+            for (i = 1; i <= nc; i++) if (index($0, C[i])) { if (!seen[i]) { seen[i] = 1; nseen++ } ; if (i > far) far = i }
+            if (!hit) for (i = 1; i <= nt; i++) if (index($0, T[i])) { hit = 1; hitln = FNR; hitt = T[i] }
+        }
+        END {
+            if (hit) {
+                printf("⚡ ladder [%s]: reached its declared tail \"%s\" at line %d of %d — the capture is COMPLETE (census %d/%d rungs present).\n", lbl, hitt, hitln, FNR, nseen + 0, nc)
+                if (nseen < nc) {
+                    printf("  ⚠ ladder [%s]: %d declared rung(s) MISSING from a capture that reached the tail — the census is stale or a family was renamed. Verdict stands; fix the census.\n", lbl, nc - nseen)
+                    for (i = 1; i <= nc; i++) if (!seen[i]) printf("      missing: %s\n", C[i])
+                }
+                exit 0
+            }
+            printf("✖ %s: THE CAPTURE IS TRUNCATED — the ladder never reached its declared tail.\n", lbl)
+            printf("    declared tail : %s\n", term)
+            if (far > 0) printf("    furthest rung : %s  (census %d/%d, capture is %d line(s))\n", C[far], nseen + 0, nc, FNR)
+            else         printf("    furthest rung : NONE — not one of the %d declared rungs appears in these %d line(s). Two readings, in order of how often each is true: the wall ended BEFORE the ladder started (the common case — `./arroyo test 12` on this box ended at 1091 lines with no rung on the wire, where a healthy `test 90` capture carries the first rung at line 1102), or the census names families this build no longer prints. Check the wall first, then the census.\n", nc, FNR)
+            printf("    This run carries NO VERDICT: a clean fault scan over a capture that stops mid-ladder\n")
+            printf("    proves only that the fixtures which DID run were clean. Exit 5.\n")
+            printf("    Give it more wall (./arroyo %s <secs>) or run it on a quieter box — this verdict is\n", lbl)
+            printf("    LOAD-DEPENDENT and that is exactly what it exists to stop being silent about.\n")
+            exit 5
+        }
     ' "$logf"
 }
 
@@ -3089,6 +3353,14 @@ test_aarch64() {
         echo -e "${COLOR_RED}❌ aarch64 test FAILED — the serial log carries fault text (lines above). Log at ${logf}${COLOR_RESET}"
         return 1
     fi
+    # LADDER-TAIL: wired here and NOT exempted, so the day a terminal marker is DECLARED for the
+    # aarch64 virt boot this leg gets the truncation verdict by adding one table row and nothing
+    # else. Until then it prints the UNDECLARED line (rc 3) — reported, never silently green.
+    local ltrc=0; ladder_tail_check "$logf" "test-arm" || ltrc=$?
+    if [ "$ltrc" -eq 5 ]; then
+        echo -e "${COLOR_RED}❌ aarch64 test carries NO VERDICT — the capture is TRUNCATED (lines above): not a pass, not a regression. Log at ${logf}${COLOR_RESET}"
+        return 5
+    fi
     echo -e "${COLOR_GREEN}✅ aarch64 test complete. Log at ${logf}${COLOR_RESET}"
 }
 
@@ -3163,6 +3435,14 @@ test_x86_64() {
     if ! scan_serial_faults "$SERIAL_LOG" "serial.log"; then
         echo -e "${COLOR_RED}❌ x86_64 test FAILED — the serial log carries fault text (lines above). Log at ${SERIAL_LOG}${COLOR_RESET}"
         return 1
+    fi
+    # LADDER-TAIL: the fault scan above is NEGATIVE-ONLY, so it is clean on a capture that stopped
+    # halfway. Order is deliberate — a fault found is a FACT about the bytes that exist and outranks
+    # truncation (it stays rc=1); truncation is the absence of bytes and is rc=5, NO VERDICT.
+    local ltrc=0; ladder_tail_check "$SERIAL_LOG" "test" || ltrc=$?
+    if [ "$ltrc" -eq 5 ]; then
+        echo -e "${COLOR_RED}❌ x86_64 test carries NO VERDICT — the capture is TRUNCATED (lines above): not a pass, not a regression. Log at ${SERIAL_LOG}${COLOR_RESET}"
+        return 5
     fi
     echo -e "${COLOR_GREEN}✅ Test run complete. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
 }
@@ -5569,6 +5849,41 @@ check_both() {
         return 1
     fi
 
+    # GATE-VERBALIAS (this arc, 2026-09-13): a $1-keyed guard must name the WHOLE alias group the
+    # dispatcher accepts, or one build silently becomes two feature sets. `arroyo:1147` was that
+    # defect — a single string equality against one of the six spellings that reach the jetson build,
+    # which dropped `ga10bprobe5a` (the ignition itself) on five of them while still printing a banner
+    # naming the rung. Found by certifying the artifact, fixed by hand at 2e48d721, and detected by no
+    # instrument until this one. The script reds on the PRE-FIX file and passes on this one, both
+    # measured; exit 2 is NO VERDICT (no dispatcher, no groups, or no guard to examine) and is never a
+    # pass. See scripts/verb-alias-closure.sh for why the trailing-comment strip is load-bearing.
+    local _varc=0
+    "$WORKSPACE_DIR/scripts/verb-alias-closure.sh" "$WORKSPACE_DIR/arroyo" || _varc=$?
+    if [ "$_varc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ verb alias closure (no \$1-keyed guard names a subset of a verb's spellings)${COLOR_RESET}"
+    else
+        [ "$_varc" -eq 2 ] && echo -e "${COLOR_RED}❌ verb-alias gate gave NO VERDICT — it did not run to a verdict, which is not a pass${COLOR_RESET}"
+        _nrc=1
+    fi
+
+    # GATE-DEADFIXTURE (this arc, 2026-09-13, the fourth instance of the day's family and the worst):
+    # a fixture added to an INTERACTIVE-ONLY entry point compiles, ships, carries a go-red, and is
+    # executed by NEITHER `./arroyo test` NOR `test-arm` — and the diff of a dead fixture is
+    # indistinguishable from the diff of a live one. `selftest.rs::run` is that entry point (sole
+    # caller: shell.rs's `tste` verb); MEASURED, `:: TSTE: suite start ::` has 0 hits in a healthy
+    # 2,089-line `test 90` capture while 23 `:: TSTE:` lines from OTHER boot-path fixtures do appear,
+    # which is the trap. The gate holds that roster frozen and names any addition. Exit 2 (the entry
+    # point renamed away) is NO VERDICT and is never a pass. See scripts/fixture-reachable.sh for why
+    # the universal form ("every -> PASS in the ELF must appear in some capture") is unshippable.
+    local _dfrc=0
+    "$WORKSPACE_DIR/scripts/fixture-reachable.sh" "$WORKSPACE_DIR/.." || _dfrc=$?
+    if [ "$_dfrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ fixture reachability (no leg added to an entry point a headless boot never runs)${COLOR_RESET}"
+    else
+        [ "$_dfrc" -eq 2 ] && echo -e "${COLOR_RED}❌ dead-fixture gate gave NO VERDICT — it did not run to a verdict, which is not a pass${COLOR_RESET}"
+        _nrc=1
+    fi
+
     if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
         echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"
     else
@@ -5653,7 +5968,7 @@ check_both() {
         return 1
     fi
     if [ "$_nrc" -ne 0 ]; then
-        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene or k8 reachability (see above)${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — knob hygiene, k8 reachability, verb-alias closure or fixture reachability (see above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_rrc" -ne 0 ]; then
