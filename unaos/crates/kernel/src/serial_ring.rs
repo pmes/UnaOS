@@ -1688,14 +1688,14 @@ pub fn mirror_service() {
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first
     // statement, aarch64 via the BSP main loop and `pump_usb_into_gui` on baremetal). Placed AFTER the
     // verdict so the fixture's own traffic cannot move the tap tallies that verdict snapshots.
-    draincap_selftest();
+    #[cfg(feature = "witness")] draincap_selftest();
     // SERWIT-1B PARITY — the shared contended-producer policy, exercised on whichever arch is
     // running. Same one-shot call site and same contract as the two fixtures above it.
-    backpressure_selftest();
+    #[cfg(feature = "witness")] backpressure_selftest();
     // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
     // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
     // a fixture that leaves the ring as it found it should not do so before one that reads it.
-    pwrdrain_selftest();
+    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. ⚠ LINE-NEUTRAL append; the body is a FILE-TAIL append, so no `panic::Location` in this file moves.
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -1802,27 +1802,63 @@ fn mirror_verdict_once() {
 // whole in one pass: `paid = 4352`, `drained_capped = 64`. Both the byte clause (4352 > 260) and the
 // cap-took-effect clause (64 < 64 is false) fire. Quoted in the commit.
 
+// ── WITNESS-GATING (trunk queue §5, 2026-09-12, SERDRAIN) — an instrument costs UART, so it rides ──
+// ── the knob every other fixture in this tree rides                                              ──
+//
+// `draincap_selftest`, `backpressure_selftest` and `pwrdrain_selftest` each fill the LIVE ring to
+// [`SLOTS`] once per boot, and none of them was gated on anything. `mirror_service` runs on every
+// image, so a witness-FREE flight image — the polarity every media command ships (`docs/dev/LAWS.md`
+// §5, orin 20) — paid for three instruments it carried no other witness for. SO30 is this same defect
+// one layer up: one `[wc-d]` line spent ~36 % of a boot's whole UART budget. MEASURED, at 115200 8N1
+// = 11 520 B/s = 86.8 us/B, from the x86 witness capture (`awk` over `target/serial.log`):
+//
+//     draincap    64 x 68 B fill = 4 352 B  + 310 B verdict
+//     bpress      64 x 66 B fill = 4 224 B  +  68 B probe + 374 B verdict
+//     pwrdrain    64 x 68 B fill = 4 352 B  +  46 B `ring drained` witness + 417 B verdict
+//     ------------------------------------------------------------------------------------
+//     14 143 B per boot = 1.228 s of wire, on an image with no witness to spend it on
+//
+// All three are now `#[cfg(feature = "witness")]` — on the function AND on the `mirror_service` call
+// site — and so is everything that exists only to serve them: [`DRAINCAP_PAD`], `DRAINCAP_LINE_B`,
+// `DRAINCAP_BOUND_B`, `BPRESS_PROBE`, `draincap_wire` and the three one-shot `…_DONE` statics.
+// `s5drain_selftest` was born gated.
+//
+// WHAT IS NOT GATED, and must not be. The `const _: () = assert!(…)` truth tables —
+// `drain_may_continue`'s five rows, `defer_policy`'s six, [`PWRDRAIN_LINE_LEN`]'s two and
+// `S5DRAIN_LINE_LEN`'s two — stay in EVERY build of BOTH arches. They emit not one byte of code, they
+// are the go-red that fires before anything boots, and a compile-time proof that only runs in the
+// configuration nobody ships is exactly the polarity trap LAWS §5 names. The transport itself is
+// untouched: [`power_drain`], [`drain_capped`], [`defer_contended`] and the ring are not instruments,
+// they are the wire — `power_drain`'s `ring drained` witness is the control that must SURVIVE this
+// gating, and a build where it went to zero too would be broken, not smaller.
+
 /// Exactly 68 bytes with its newline — SO29's measured witness-line width, so the fixture's arithmetic
 /// is the ledger's arithmetic and not a new one. `"[draincap] fill NN "` is 19 bytes, the pad is 48,
 /// the newline is 1.
+#[cfg(feature = "witness")]
 const DRAINCAP_PAD: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
 /// The filler line's width in bytes, including the newline. 19 + 48 + 1.
+#[cfg(feature = "witness")]
 const DRAINCAP_LINE_B: usize = 68;
 /// One capped drain's ceiling: the budget, plus the one line that may straddle it. See
 /// [`DRAIN_BYTE_BUDGET`]'s "the bound this actually gives".
+#[cfg(feature = "witness")]
 const DRAINCAP_BOUND_B: usize = DRAIN_BYTE_BUDGET + DRAINCAP_LINE_B;
 
+#[cfg(feature = "witness")]
 static DRAINCAP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The arch's raw, lock-free, bounded UART writer — the same primitive the panic path and the WEDGE
 /// breadcrumbs use. The fixture writes its drained lines through this rather than through `_print`,
 /// because `_print` would drain the ring itself and there would be nothing left to measure.
 #[inline]
+#[cfg(feature = "witness")]
 fn draincap_wire(s: &str) {
     crate::arch::serial::raw_write_str(s);
 }
 
 /// DRAINCAP, once per boot. Called from [`mirror_service`].
+#[cfg(feature = "witness")]
 fn draincap_selftest() {
     if DRAINCAP_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -1959,14 +1995,17 @@ fn draincap_selftest() {
 // aarch64's `_print` either calls [`defer_contended`] or does not compile. The fixture proves the
 // policy; the compiler proves the call.
 
+#[cfg(feature = "witness")]
 static BACKPRESSURE_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The probe line the fixture pushes through the contended path. 68 bytes with its newline, the same
 /// width [`DRAINCAP_PAD`] uses, so both fixtures speak SO29's arithmetic.
+#[cfg(feature = "witness")]
 const BPRESS_PROBE: &str =
     "[bpress] probe 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123\n";
 
 /// SERWIT-1B PARITY, once per boot. Called from [`mirror_service`].
+#[cfg(feature = "witness")]
 fn backpressure_selftest() {
     if BACKPRESSURE_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -2091,6 +2130,7 @@ fn backpressure_selftest() {
 // were handed to the port before the verb continues. The artifact half of the claim is
 // `LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf`.
 
+#[cfg(feature = "witness")]
 static PWRDRAIN_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Width of one fixture fill line, `"[pwrdrain] fill NN " + DRAINCAP_PAD + "\n"`: 19 + 48 + 1. Named
@@ -2107,6 +2147,7 @@ const _: () = assert!(
 );
 
 /// PWRDRAIN, once per boot. Called from [`mirror_service`].
+#[cfg(feature = "witness")]
 fn pwrdrain_selftest() {
     if PWRDRAIN_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -2180,6 +2221,146 @@ fn pwrdrain_selftest() {
     } else {
         serial_println!(
             ":: PWRDRAIN: FAIL — filled={} lines={} bytes={} want_bytes={} residue={} dropped={} ::",
+            filled,
+            lines,
+            bytes,
+            want_bytes,
+            residue,
+            lost
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// S5DRAIN — the x86 S5 PORT drains, not just the `power.rs` route into it
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Trunk queue §5 (2026-09-12, SERDRAIN); `docs/dev/LEDGER.md` SO31; the ⚠ SCOPE box this closes stood
+// in `power.rs:183-188` and in `serial_transport.md`'s "The power verbs drain first".
+//
+// ### What it exercises, and what makes it different from [`pwrdrain_selftest`]
+// PWRDRAIN proves [`power_drain`] itself: a full drain empties the ring and counts the bytes. It says
+// nothing about WHICH routes call it, and on x86 exactly one of the three did. This fixture proves the
+// other end of that sentence: it calls `arch::acpi_power::s5_ring_flush` — **the symbol
+// `acpi_power::poweroff`'s first statement calls**, `#[inline(never)]` so it is one call site and not
+// two inlined copies — and asserts that a ring filled to [`SLOTS`] is EMPTY when it returns.
+//
+// So the pair reads: PWRDRAIN says the policy is right, S5DRAIN says the x86 firmware port runs that
+// policy, and the one statement neither can execute is the PM1_CNT write itself — the same line
+// PWRDRAIN leaves out for the SMC, and for the same reason. A fixture that powered the machine off
+// would leave no verdict to read.
+//
+// x86-only, by the shape of the defect rather than by preference (ONE OS, `docs/dev/LAWS.md` §3): on
+// aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31 part 3;
+// there is no aarch64 caller that reaches a firmware power call without passing `power.rs`. The single
+// `crate::arch::` reference here is at the PORT, which is where arch code is allowed to be.
+//
+// ### The go-red, both at runtime, because `drain` and `drain_capped` share a signature
+//   * the realistic one — swap `s5_ring_flush`'s `power_drain(...)` for `drain_capped(draincap_wire)`:
+//     the 192 B budget stops it after 3 lines of 67 B (67, 134, 201; `drain_may_continue` is strictly
+//     `<`), the fixture reads `lines=3 residue=61` and prints `-> FAIL`, which `FAULT_PATTERNS` turns
+//     into a non-zero exit from `UNAOS_WC=1 ./arroyo test 90`;
+//   * the blunt one — delete the statement from `poweroff()`'s signature line and from
+//     `s5_ring_flush`: `lines=0 bytes=0 residue=64`, same `-> FAIL`.
+//
+// Note what the second go-red does NOT catch on its own, said rather than implied: deleting only the
+// fold on `poweroff()`'s signature line, and leaving `s5_ring_flush` intact, leaves this fixture green.
+// That gap is one line of reading (`acpi_power.rs`, `pub fn poweroff() -> ! {`), it is the same gap
+// PWRDRAIN names for the SMC, and it is the reason `s5_ring_flush` exists as a named symbol at all —
+// the regression that is actually plausible is someone changing the DRAIN, not deleting the call.
+
+/// Width of one S5DRAIN fill line, `"[s5drain] fill NN " + DRAINCAP_PAD + "\n"`: 18 + 48 + 1. One byte
+/// narrower than [`PWRDRAIN_LINE_LEN`] because the tag is one character shorter; named so the byte
+/// assertion is arithmetic the compiler checks rather than a magic number. UNGATED, like
+/// [`PWRDRAIN_LINE_LEN`]'s rows below it: a `const` assertion emits no code, and a compile-time
+/// go-red that only runs in the configuration nobody ships is the polarity trap LAWS §5 names.
+const S5DRAIN_LINE_LEN: usize = 18 + 48 + 1;
+
+const _: () = assert!(
+    S5DRAIN_LINE_LEN <= SLOT_LEN,
+    "a fixture fill line must not truncate, or the byte count it asserts on is not the one staged"
+);
+const _: () = assert!(
+    SLOTS * S5DRAIN_LINE_LEN > DRAIN_BYTE_BUDGET * 8,
+    "the fixture's ring must be many budgets wide, or capped and uncapped are indistinguishable"
+);
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static S5DRAIN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// S5DRAIN, once per boot, x86 only. Called from [`mirror_service`].
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn s5drain_selftest() {
+    if S5DRAIN_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        // SERWIT-1D's machine (the rMBP: no 16550, the console is the FTDI cable) stages nothing and
+        // drains nothing, so there is no staged line for an S5 to lose. The fold on `poweroff()`'s
+        // signature is still compiled, and the arithmetic above still ran at `./arroyo check`.
+        serial_println!(
+            ":: S5DRAIN: SKIP — no 16550 on this machine, so there is no staged line for the direct \
+             S5 route to lose (SERWIT-1D); the flush is compiled and its arithmetic asserted ::"
+        );
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    // Start from an empty ring AND a cleared loss-pending count, for [`pwrdrain_selftest`]'s reason:
+    // `drain` runs `report_losses`, whose marker would otherwise ride the measured drain and inflate
+    // its byte total.
+    drain(draincap_wire);
+
+    let mut filled = 0u64;
+    for i in 0..SLOTS {
+        if try_stage(format_args!("[s5drain] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            note_submitted();
+            filled += 1;
+        } else {
+            break;
+        }
+    }
+
+    // The measured call: the exact symbol `acpi_power::poweroff` runs before it touches the chipset.
+    let (lines, bytes) = crate::arch::acpi_power::s5_ring_flush();
+
+    // "Empty" is a claim about the ring, so ask the ring, not the counter.
+    let mut residue = 0u64;
+    drain(|s| {
+        residue += 1;
+        draincap_wire(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let want_bytes = filled as usize * S5DRAIN_LINE_LEN;
+    // `>=` on `lines`/`bytes` and strict on `residue`, for the reason PWRDRAIN states: this runs on a
+    // live kernel, a foreign line can be staged between the fill loop and the flush, and foreign
+    // traffic can only ADD to what a full drain emits. `residue == 0` is the claim itself.
+    let pass = filled >= SLOTS as u64 / 2
+        && lines >= filled
+        && bytes >= want_bytes
+        && residue == 0
+        && lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: S5DRAIN: the x86 S5 PORT drains, so the DIRECT route drains too — ring filled to {} \
+             line(s) / {} B ({}x DRAIN_BYTE_BUDGET={}), one `acpi_power::s5_ring_flush()` — the symbol \
+             `poweroff()`'s first statement calls, which `video/crystal.rs` Shut Down and \
+             `video/instgui.rs` reach WITHOUT `power.rs` — put every line on the wire (lines={} \
+             bytes={}) and left the ring EMPTY (residue={}), 0 dropped; same `power_drain` entry point \
+             and same `[pwrshutoff]` family as `power.rs`, so there is ONE drain policy -> PASS ::",
+            filled,
+            bytes,
+            bytes / DRAIN_BYTE_BUDGET,
+            DRAIN_BYTE_BUDGET,
+            lines,
+            bytes,
+            residue
+        );
+    } else {
+        serial_println!(
+            ":: S5DRAIN: FAIL — filled={} lines={} bytes={} want_bytes={} residue={} dropped={} ::",
             filled,
             lines,
             bytes,
