@@ -59,6 +59,23 @@ enum State {
 
 static STATE: spin::Mutex<State> = spin::Mutex::new(State::Closed);
 static WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
+/// QUITLEAK — **closes that ran [`close`]'s teardown.** A `Quit` that took a bare `wm::close(win)`
+/// leaves A29's WINID holder registry to clear [`WIN`], so every END-STATE question about the
+/// window answers exactly as a correct close would — and the console stays suspended for the rest
+/// of the boot. This counter is the discriminator, as `pulsewin::CLOSES` is for A30's pulse round.
+static CLOSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// QUITLEAK — **the last value THIS MODULE published to `fbcon::console_present_suspend`.**
+///
+/// Said precisely, because it is a mirror and not the flag: `fbcon`'s `CONSOLE_PRESENT_SUSPENDED`
+/// has no getter, and `video/fbcon.rs` is outside this arc's file list, so the fixture reads what
+/// this module pushed rather than what `fbcon` holds. That is enough to convict the defect it is
+/// aimed at and the reason is the defect's own shape: the stranding is that NOBODY CALLS the
+/// resume, so the mirror is still `true` — it cannot be faked green by a close that skipped the
+/// call, because the mirror is written on the same line as the call and by nothing else. What it
+/// does NOT cover is a third party storing into `fbcon`'s cell behind this module's back
+/// (`video/login.rs` is the only other caller in the tree, and only while its own screen is up).
+/// A one-line `fbcon::console_present_suspended()` getter would close that gap; it is reported.
+static SUSPEND_MIRROR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Which list row is selected (the device list is tiny; a u8 outlives it).
 static SEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -498,12 +515,24 @@ pub fn open() {
     // every line, but it stops presenting until we close. Without this, each boot message
     // repaints the console window AND (through wm's upward occlusion closure) this dialog —
     // ~24 ms of GOP writes per line, which reads as a hard flicker.
-    super::fbcon::console_present_suspend(true);
+    super::fbcon::console_present_suspend(true); SUSPEND_MIRROR.store(true, Ordering::Release); // QUITLEAK — the mirror moves on the same line as the call it mirrors, so the two can never drift apart by an edit that touches one of them.
     serial_println!("[wc-x] instgui open win={} box={}x{} at ({},{}) (console presents suspended)", id, ow, oh, ox, oy);
     repaint();
 }
 
-fn close() {
+/// QUITLEAK — **`pub`, and the visibility is the fix.** This dialog is the one window in the tree
+/// whose teardown includes RESUMING THE CONSOLE'S PRESENTS, so a `Quit` that reaped the row with a
+/// bare `wm::close(win)` left a desktop that never presents the console again — the same stranding
+/// class `video/login.rs`'s LOGINCLOSE heals, arriving by a different door. `winmenu`'s app-menu
+/// `Quit` arm therefore calls this for the window [`win`] names, and `wm::close` only for everything
+/// else. Safe to call when not open: the `WIN` swap is the guard, and the resume below is idempotent.
+///
+/// POLARITY, stated because the module is narrowly gated: `instgui` compiles only under
+/// `all(target_arch = "x86_64", feature = "wc", feature = "instgui")`, so making this `pub` widens
+/// nothing on aarch64, adds no name to the knob-off `kernel8.img` (which has neither `wc` nor this
+/// module) and adds no byte to either image `./arroyo knoboff wc` measures. The `winmenu` call site
+/// carries the same three-term `cfg`, not `wc` alone.
+pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id != wm::WIN_NONE {
         wm::close(id);
@@ -511,8 +540,31 @@ fn close() {
     *STATE.lock() = State::Closed;
     *PENDING.lock() = None;
     // The console gets the glass back and repaints everything it accumulated.
-    super::fbcon::console_present_suspend(false);
-    serial_println!("[wc-x] instgui closed — console presents resumed, booting on");
+    super::fbcon::console_present_suspend(false); SUSPEND_MIRROR.store(false, Ordering::Release); CLOSES.fetch_add(1, Ordering::Release); // QUITLEAK — the mirror on the same line as the call, and the counter that says this path ran: a bypassed `Quit` reaches neither, which is what `winmenu::appquit_selftest` scores.
+    serial_println!(
+        "[wc-x] instgui closed win={} — console presents resumed (suspended={}), booting on (closes={})",
+        id,
+        SUSPEND_MIRROR.load(Ordering::Acquire) as u32,
+        CLOSES.load(Ordering::Relaxed)
+    );
+}
+
+/// QUITLEAK — **the dialog's window id, or [`wm::WIN_NONE`].** `winmenu`'s `Quit` arm asks this
+/// whether the window it is about to reap is the installer's, the way it asks `pulsewin::win`.
+pub fn win() -> wm::WinId {
+    WIN.load(Ordering::Relaxed)
+}
+
+/// QUITLEAK — `(closes, presents_suspended_mirror)`. See [`CLOSES`] and [`SUSPEND_MIRROR`] for
+/// exactly what the second value is and is not. Read by `winmenu::appquit_selftest`.
+pub fn close_census() -> (u32, bool) {
+    (CLOSES.load(Ordering::Acquire), SUSPEND_MIRROR.load(Ordering::Acquire))
+}
+
+/// QUITLEAK — is the dialog up? The fixture asks before it does anything, so a boot that opened the
+/// installer gets it back exactly as it was found.
+pub fn is_open() -> bool {
+    *STATE.lock() != State::Closed
 }
 
 /// Main-loop hook, every frame: re-check the disk list (storage enumerates long after the
