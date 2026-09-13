@@ -115,7 +115,12 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   typed password never reaches the wire — and before the shell console; a successful login opens the
   session (and the home) and takes the screen down; Esc dismisses nothing here (R24: menus only). The
   routes reach it through `fs::users::screen_key` / `screen_open_once`, which are inert where no desktop
-  is built. Residual, LEDGER SO36: the screen owns the KEYBOARD only — the dock and the menu bar still
+  is built. **The screen is also closed TO the pointer (LOGINCLOSE):** its `wm` row is minted in the
+  shell/desktop owner band, which `wm::controls` gives no control cluster and `wm::hit_test` never
+  names, so no close box is drawn and no press can reach the row — measured every witness boot against
+  an armed control row (`close_route=refused`), with `login::heal_if_row_gone` putting the three pieces
+  of screen state back at the next key offer should anything close the row by another road. Residual,
+  LEDGER SO36: the screen owns the KEYBOARD and its own row only — the dock and the menu bar still
   answer the pointer before a session exists.
 * **Log Out (M4):** a row in the CRYSTAL menu (`crystal::Verb::LogOut`, R21 — menus belong in the menu
   bar), at the foot of the SHARD tree behind its own separator, knob-on only. The pick drops the session
