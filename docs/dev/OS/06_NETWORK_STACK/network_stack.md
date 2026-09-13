@@ -358,6 +358,10 @@ transaction id and parsed. A resolver that invented an address here would be the
 not one of its three legs, which is why 3/3 and an NXDOMAIN sit in the same capture without
 contradiction.
 
+⚠ **This capture is the 2026-09-12 merged tree and is kept as that record.** SO47 (§8.8) added two
+legs, so the current fixture prints `fixture: 5/5 legs passed -> PASS ::` and the block above is
+missing the `arp` and `dns-failpath` lines. §8.8 carries the current capture.
+
 Compile coverage of the ARMED polarity is two KERNEL_CFG_MATRIX legs, not one: `arm-virt-net6`
 (`virt_el0,vnet,net6` — the only leg that compiles the EL0 fixture launcher, and deliberately carries
 no board term, so the surface is proven board-free) and `arm-tegra-net6` (`tegra,net4,net5,net6` — the
@@ -371,6 +375,12 @@ of whichever a gate happened to build.
 * `NSOCK = 4` concurrent sockets, 1 KiB datagrams, 2 KiB stream rings — all BSS, no heap.
 * No `listen`/`accept` on aarch64 yet (x86's SOCK-6/7 server side); the client halves are here.
 * Live ICMP/ARP on the Orin's real link remains **attended-metal** (orin-ledger A59).
+* The NET6 neighbour table (§8.8) is 8 entries, TTL 120 s, learned only from ARP frames this boot. It
+  is not smoltcp's cache and does not feed it — smoltcp re-resolves per interface as it always did.
+* **OWED, and outside this arc's file list:** `dns` is still absent from midden_core's `HOST_VERBS`
+  (`libs/sys/midden_core/src/lib.rs:274-275`), so the verb is unreachable from the shell on every
+  build. One line: `("dns", Avail::Always),` in the `// network` group. Until it lands, the `dns`
+  witnesses of §8.8 are reachable only from `net6::fixture()`.
 
 ### 8.7 Re-gated on the `hw-jetson` merge (2026-09-12)
 
@@ -422,6 +432,12 @@ of one on a deduplicated constant cannot distinguish "all the verbs shipped" fro
 The two zero rows are the controls: ten tokens in the same invocation come back non-zero, so a zero
 is a fact about the artifact and not about the pattern.
 
+⚠ **`-> NO REPLY ::` reading 1 here is the 2026-09-12 ELF and MUST NOT be used as a checklist
+now.** SO47 (§8.8.2) replaced ARP's contiguous format string, so that fragment is 0 in the current
+artifact and a scorer keyed on it would red a healthy build — while still firing on the WIRE for a
+failing `ping`. Score `arp` on `NO REPLY (cache miss,` instead. `-> A ` likewise reads 0 now (the
+resolved verdict moved into the `DnsSay` renderer); its replacement discriminator is ` (server `.
+
 Three witness strings are **absent from this artifact, correctly**: `sock udp round-trip`,
 `sock tcp round-trip` and `el0 socket family over` all read 0. They belong to `net6::fixture()` and to
 `virt_el0_verdict`, which are `virt_el0`-gated; `esp-jetson` builds `tegra_el0` and builds witness-FREE
@@ -444,6 +460,204 @@ knobs themselves (`arroyo:1847`, `:1862`), and the run's own banner is the proof
 `net6` is in that set with no fourth knob on the line, and the certification above is of the artifact
 that set built. The standalone `UNAOS_NET6=1` knob still exists for the `virt` runtime gate, where no
 NIC knob would otherwise arm the surface.
+
+### 8.8 SO47 — `arp` and `dns` on render14, and the two separate defects in the two verbs
+
+Render14 boots 4 and 5 typed three verbs at the glass on one boot, over one interface, and got this:
+
+```
+:: NET6: ping 10.42.0.1 4/4 replies over rtl8168 peer 9c:69:d3:28:6e:f4 -> REPLY ::
+:: NET6: arp 10.42.0.1 -> NO REPLY ::
+:: [midden] cmd="dns google.com" -> TerminalError len=44 ::
+```
+
+Ping works **and learns the peer MAC**; `arp` then reports NO REPLY for that same address; `dns`
+produces no `:: NET6:` line at all. Neither defect is in the stack under the verbs — the stack carries
+ICMP both ways and resolves L2 for exactly the address `arp` says it cannot.
+
+**`arp`: the verb never had a neighbour table to read.** smoltcp 0.13.1 keeps its neighbour cache as a
+private field of `InterfaceInner` (`neighbor_cache`, `src/iface/interface/mod.rs:134`) and publishes no
+reader — `NeighborCache::lookup` is `pub(crate)` — so a verb cannot ask smoltcp what it already
+resolved. Every NET6 verb therefore built a THROWAWAY `Interface` with an EMPTY cache, and `arp`'s only
+source of truth was one ARP reply captured inside its own 2 s budget. That is measurably fine on a clean
+wire and measurably not on this NIC: with the verb UNCHANGED, the `virt` leg prints
+`:: NET6: arp 10.0.2.2 -> is-at 52:55:0a:00:02:02 ::` right after a 4/4 ping, while on the Orin the
+inbound payload path drops frames outright — render14 boot4 scores six
+`[net5T] … verdict=NOWHERE — the payload never reached this DRAM at all` in twelve pops, several of them
+60-byte, i.e. ARP-reply-sized (A64). Ping survives that because it needs one of four echo replies; `arp`
+needed one specific frame and threw away the answer the machine had already learned.
+
+The two candidate shapes the brief ranked ahead of this one are **refuted by measurement**, not by
+argument: the verb does not wait on a queue nothing feeds (it polls the NIC ring directly and the same
+loop resolves on `virt`), and its budget is not short (ping's first reply on that boot took 524 ms
+against the same `VERB_BUDGET_MS = 2000`, and boot4's `[gui] app-enter t=118s` / `app-exit t=120s`
+shows `arp` burning the full two seconds). A third reading has to be refused too: the absence of
+`[net4F]`/`[net5T]` lines during the `arp` window is NOT evidence of a dead wire — both witnesses are
+capped (8 and 12 pops on that boot) and were exhausted during the ping (LAWS §5, an absence is evidence
+only if the producing path could run).
+
+The fix is a NET6-owned neighbour table (`net_phy.rs`, `mod net6`): every ARP frame any phy in the
+module receives is learned — **both opcodes**, since a request carries the sender's IP and MAC in the
+same fields a reply does — the persistent stack's phy now carries a `Learn` observer so the table stays
+warm between verbs, and `arp` reads the table first and probes only on a miss. Table-first is also what
+`arp <ip>` means everywhere else (R26): it is the neighbour table, not a ping. The witness names its
+source and the entry's age, so a cached answer can never be read as a fresh round trip:
+
+```
+:: NET6: arp 10.42.0.1 -> is-at 9c:69:d3:28:6e:f4 via=cache age_ms=19312 ::
+:: NET6: arp 10.42.0.1 -> is-at 9c:69:d3:28:6e:f4 via=wire  age_ms=0 ::
+:: NET6: arp 10.42.0.1 -> NO REPLY (cache miss, wire probe 2001 ms, learned=3) ::
+```
+
+` -> is-at ` is held byte-for-byte (A59's go-red shape and the artifact certification both count that
+fragment). `learned=` on the failure line is a control: `0` says the learn path never ran at all, which
+is a different defect from "this one address is unknown", and the wire must be able to tell them apart.
+
+**`dns`: the verb is never reached, and could not have said so.** `len=44` is exactly
+`"Unknown command. Type 'help' for assistance."` — the `Plan::Say(TerminalError)` fallthrough at
+`libs/sys/midden_core/src/lib.rs:512`. Since MIDDEN-M1 there is ONE command table and it is
+midden_core's `HOST_VERBS`; its `// network` group registers `ifconfig`, `ping`, `arp`, `nc`, `curl`
+(`lib.rs:274-275`) and **not `dns`**. The `"dns" => net6_shell_dns(…)` arm at `shell.rs:5594` has
+therefore never been reachable on any build, which is why a bare `dns` with no arguments returns the
+same 44-byte error as `dns google.com`. **The one-line fix lives outside this arc's file list and is
+reported, not made:** add `("dns", Avail::Always),` to that `// network` group.
+
+What this arc lands instead is the half that made the boot unreadable. The verb already printed on
+every path, but by ten separate `serial_println!` calls that a future arm could silently skip, and
+three of them did not name the resolver. `dns` is now split into a printing-free `dns_lookup` returning
+a `DnsVerdict`, and **one** emission point every arm reaches — so "witnesses every path, naming the
+resolver and the reason" is a property of the shape rather than of a reviewer noticing. `BIND FAILED`
+is split out of `SEND FAILED`, which previously conflated two different failures under
+"socket unusable". A `DNS_WITNESS` counter is bumped at that one point, and the `virt` fixture asserts
+it moves by **exactly one** across a lookup that returns no address.
+
+**Proof, on `virt`, through the identical shared code** (`UNAOS_QEMU_FULL=1 UNAOS_GICV3=1
+UNAOS_VIRT_EL0=1 UNAOS_VNET=1 UNAOS_NET6=1 ./arroyo test-arm 60`, rc=0). The fixture is now five legs;
+legs 4 and 5 are this arc's:
+
+```
+:: NET6: ping 10.0.2.2 4/4 replies over virtio-net peer 52:55:0a:00:02:02 -> REPLY ::
+:: NET6: arp 10.0.2.2 -> is-at 52:55:0a:00:02:02 via=cache age_ms=2 ::
+:: NET6: fixture arp: answered from the neighbour table the ping filled -> PASS ::
+:: NET6: dns a..b -> BAD NAME (unencodable) (server 10.0.2.3) ::
+:: NET6: fixture dns-failpath: witnesses=1 on a path that returned no address, resolver named -> PASS ::
+:: NET6: dns una.os -> SERVER ERROR rcode=3 (server 10.0.2.3) ::
+:: NET6: fixture: 5/5 legs passed -> PASS ::
+```
+
+`a..b` carries an empty label, which `net_dns::build_query` refuses (`net_dns.rs:86`), so leg 5 takes
+the BAD NAME arm deterministically on every platform.
+
+**Both legs were made to fail by mutation** (LAWS §5 — a check that cannot fire is an absent one). One
+run with `neigh_learn` commented out of `snoop_arp` AND the `DNS_WITNESS` bump commented out of the
+emission point returned rc=1 with:
+
+```
+:: NET6: arp 10.0.2.2 -> is-at 52:55:0a:00:02:02 via=wire age_ms=0 ::
+:: NET6: fixture arp -> FAIL — resolved, but the table was EMPTY after a 4/4 ping: the learn path did not run ::
+:: NET6: fixture dns-failpath -> FAIL — the failing lookup emitted 0 witnesses, not 1 ::
+:: NET6: fixture: 3/5 legs passed -> FAIL ::
+```
+
+The `via=wire` line in that capture is the control that matters: with the learn path dead the verb
+still resolves off the wire, so leg 4 is measuring the TABLE and not merely whether `arp` answered.
+
+#### 8.8.1 `dns` is a verb now — and why `Avail::Always`, not `Avail::Aarch64`
+
+`("dns", Avail::Always)` joins the `// network` group in `libs/sys/midden_core/src/lib.rs`. The
+alternative was `Avail::Aarch64`, whose comment reserves it for exactly this case ("a verb whose ring
+arm genuinely does not compile off aarch64"). It is the wrong answer, and not as a matter of taste:
+
+* **A gate in that same file already forbids it.** `no_verb_is_pinned_to_a_platform_without_a_capability`
+  (`lib.rs:969-976`) asserts `!matches!(a, Avail::Aarch64)` over every member of `HOST_VERBS`, so the
+  variant is empty BY TEST, not by convention. Measured rather than read: registering `dns` there
+  failed **2 of 16** tests — `lib.rs:972` and `lib.rs:940`, "``dns`` must be a verb on
+  `Facts { aarch64: false, .. }`". The enum's invitation and the enum's gate disagree; the gate wins,
+  and that contradiction is now written at the variant so the next reader does not re-litigate it.
+* **It would not have been narrower.** The arm is `all(net6, aarch64)`; `Aarch64` is `aarch64`. On an
+  aarch64 build with `net6` off the word is a verb with no arm under BOTH spellings, so both reach the
+  drift net. The only half `Aarch64` changes is x86 — and there it does not make the verb absent, it
+  makes it indistinguishable from a typo: `facts.exec` is true on x86, `resolve_exec("dns")` finds no
+  `DNS.ELF`, and the shell answers with **the very 44-byte `TerminalError` this fix exists to delete**.
+* **R26 clause 3 ruled this case already.** `burst` and `simmer` were `Avail::Aarch64` "for no hardware
+  reason" and were moved to `Always`, the ring arm left to refuse honestly and by name. `dns` has no
+  hardware reason either: a resolver is not a device, x86 already resolves through `smolnet::resolve`,
+  and the missing x86 `dns` verb is an UNWRITTEN ARM, not an absent capability.
+
+**Exact was considered and is out of reach from one file.** `Facts` carries no `net6` fact; an
+`Avail::Net6` + `Facts::net6` needs a PRODUCER in `midden_facts()` (`shell.rs`) to set it, and added
+without one the field is false everywhere and the verb registers nowhere — strictly worse than today.
+One field, one variant and one line for whoever holds both files; overkill for any smaller reason than
+closing the drift named next.
+
+**The knob-off image MOVES, and the direction is the point.** `./arroyo knoboff net6 09ddb1c4`
+is **exit 1 — MOVED on both arches**, and that is correct rather than tolerated: the registration is
+deliberately NOT `net6`-gated, because ONE OS means the word exists on every build and the ring arm
+decides the answer. The move is isolated by measurement, not by argument. Two runs, two baselines:
+
+| baseline | x86 knob-off | arm knob-off | delta to current |
+|---|---|---|---|
+| `09ddb1c4` (track tip, no arc) | 1 529 300 | 1 595 624 | x86 **+128**, arm **+64** |
+| `557afe47` (the arc tip, all net6 code present) | 1 529 300 | 1 595 624 | x86 **+128**, arm **+64** |
+
+The two baselines' knob-off images are **byte-identical** — `sha256` x86
+`1b4764b522136ed7f5587c5ed9634d5c0e46f20fb80c48348f4e3f7dc9ac8729`, arm
+`7cca34b5a17bbf7f35345b5fd251b4ff8c2e979d672605055072819d361ba103` — so the whole NET6 arc
+contributes **zero** to the knob-off image (`knoboff net6 b8f5ded9` at `557afe47` said the same thing
+directly, exit 0 with the control fired), and so does the track's own movement (`arroyo` + docs). The
+entire +128/+64 is one `(&str, Avail)` row plus a 3-byte string plus `.rodata` alignment: data, not
+code, and growth by exactly one table entry.
+
+⚠ **What this costs, and it is owed in `shell.rs`.** `shell.rs:6103-6122` documents the `other =>`
+drift net as unreachable by construction — "that set is empty today, because every `Avail` in
+`HOST_VERBS` mirrors the `#[cfg]` on its arm below exactly". With `dns` registered that is no longer
+true: on a build without `all(net6, aarch64)` the word reaches the net and prints `dns: not available
+on this build (the verb exists; this kernel does not carry it)`. The BEHAVIOUR is right — that is R26
+clause 3's honest refusal, arriving through the net instead of a dedicated arm — but the COMMENT now
+overstates and must be corrected in the same fold.
+
+#### 8.8.2 The retired wire strings, and the one that is not retired at all
+
+Swept `LC_ALL=C grep -rn -a -F` over the whole repo (excluding `.git`/`target`) plus `unaos/scripts/`,
+`unaos/scripts/specs/*.spec` and `~/unaos-bench/tools/`.
+
+**No EXECUTABLE scorer is keyed on either string** — zero hits in any `.spec`, in `mbench.py`, in
+`foreman`, or in the bench tools. Every hit is prose. (One apparent hit,
+`unaos/scripts/specs/pi4-regression.spec:1868`, is a substring false positive: the word is
+*mis-**at**tributes*, which contains `is-at`. Worth knowing — bare `is-at` is not a safe token, which
+is why the certification above greps the SPACED ` -> is-at `.)
+
+The prose that would mis-score, each with its file:line:
+
+| where | what it says | status |
+|---|---|---|
+| `docs/dev/OS/orin-ledger.md:90` (A59's status cell) | the next-flight go-red: "`arp 10.42.0.1` -> `:: NET6: arp 10.42.0.1 -> is-at <router mac> ::`", and "A `-> NO REPLY ::` … on the gateway with `link UP` is the next question" | **STALE — outside this arc's file list, reported not edited.** The arp line now carries ` via=… age_ms=…` after the MAC, and arp's failure line is `-> NO REPLY (cache miss, …)`. |
+| `unaos/arroyo:2054` (the `net6` knob's own doc block) | "`:: NET6: arp <ip> -> is-at <mac> ::`, `:: NET6: dns <host> -> A a.b.c.d ::`" | **STALE — `arroyo` is a gate file outside this arc's list, reported not edited.** Missing `via=`/`age_ms=`, and `dns` now always carries the `(server …)` suffix. |
+| `network_stack.md:423` (§8.7's certification table) | `-> NO REPLY ::  1` | historical record of the 2026-09-12 ELF; annotated in place at §8.7. |
+
+⚠ **The finding that matters most: `-> NO REPLY ::` is NOT retired from the wire.** It left `.rodata`
+only because ARP's old format string was one contiguous literal and is now
+`-> NO REPLY (cache miss, wire probe {} ms, learned={}) ::`. **PING still emits the exact bytes** — its
+summary formats `" -> {} ::"` against `if received > 0 { "REPLY" } else { "NO REPLY" }`
+(`net_phy.rs:1365`), which is also why the fragment was never in `.rodata` for ping in the first place.
+Measured, not reasoned — a temporary fixture ping at an address slirp does not host:
+
+```
+:: NET6: ping 10.0.2.99 0/1 replies over virtio-net peer ----------------- -> NO REPLY ::
+:: NET6: arp 10.0.2.2 -> is-at 52:55:0a:00:02:02 via=cache age_ms=2002 ::
+```
+
+`LC_ALL=C grep -a -o -F -e '-> NO REPLY ::' target/serial-arm.log | wc -l` = **1** on that capture.
+
+So the hazard is worse than "the string is gone", and it cuts both ways:
+
+* a **wire** scorer for `-> NO REPLY ::` still fires — but now only for PING, never for `arp`. One
+  written to catch a failing ARP goes quietly green on exactly the failure it was built for.
+* an **artifact** scorer for the same fragment now reads **0**, and would red a build that is fine.
+
+A fragment that survives in one channel and dies in the other is the worst version of this class,
+because the scorer keeps producing plausible output. **Score `arp`'s failure on
+`NO REPLY (cache miss,`** — a token no other verb can reach.
 
 ---
 
