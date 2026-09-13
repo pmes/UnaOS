@@ -930,6 +930,97 @@ green. That is one line of reading, it is the same gap PWRDRAIN names for the SM
 that is actually plausible is someone changing the drain rather than deleting the call — which is the
 whole reason `s5_ring_flush` is a named symbol instead of an open-coded `power_drain`.
 
+## WITNESS-GATING — the three ring fixtures are instruments, and instruments cost UART
+
+Trunk queue §5 (2026-09-12, SERDRAIN). `draincap_selftest`, `backpressure_selftest` and
+`pwrdrain_selftest` each fill the live ring to `SLOTS` once per boot from `mirror_service`, and none
+of them was gated on anything. `mirror_service` runs on every image that reaches it, so a
+witness-FREE flight image — the polarity every media command ships (`docs/dev/LAWS.md` §5, orin 20) —
+paid for three instruments it carried no other witness for. SO30 is this same defect one layer up:
+one witness line spent ~36 % of a boot's whole UART budget.
+
+The cost, measured with `awk` over the x86 witness capture at 115200 8N1 = 11 520 B/s = 86.8 µs/B:
+
+| fixture | on the wire | bytes |
+| --- | --- | --- |
+| `draincap_selftest` | 64 x 68 B fill + 310 B verdict | 4 662 |
+| `backpressure_selftest` | 64 x 66 B fill + 68 B probe + 374 B verdict | 4 666 |
+| `pwrdrain_selftest` | 64 x 68 B fill + 46 B `ring drained` + 417 B verdict | 4 815 |
+| | **per boot** | **14 143 B = 1.228 s of wire** |
+
+(The fills alone are 12 928 B, which is the figure the queue row carries.)
+
+All three are now `#[cfg(feature = "witness")]`, on the function **and** on the `mirror_service` call
+site, the way every other fixture in this tree is gated — and so is everything that exists only to
+serve them (`DRAINCAP_PAD`, `DRAINCAP_LINE_B`, `DRAINCAP_BOUND_B`, `BPRESS_PROBE`, `draincap_wire`,
+the three one-shot `…_DONE` statics). `s5drain_selftest` was born gated.
+
+**What is NOT gated, and must not be.** The `const _: () = assert!(…)` truth tables —
+`drain_may_continue`'s five rows, `defer_policy`'s six, `PWRDRAIN_LINE_LEN`'s two and
+`S5DRAIN_LINE_LEN`'s two — stay in every build of both arches. They emit not one byte of code, they
+are the go-red that fires before anything boots, and a compile-time proof that only runs in the
+configuration nobody ships is the polarity trap `docs/dev/LAWS.md` §5 names. The transport itself is
+untouched: `power_drain`, `drain_capped`, `defer_contended` and the ring are not instruments, they
+are the wire.
+
+### Proven in the artifact, and the artifact is not the one the finding named
+
+`LC_ALL=C grep -a -o -F` on the built images, never on the diff. `ring drained` is the control — it
+is `power_drain`'s own witness, transport and not fixture, and it must SURVIVE the gating; a run
+where it went to zero as well would be a broken build, not a saving.
+
+| image (before → after) | `[draincap] fill` | `[bpress] fill` | `[pwrdrain] fill` | `ring drained` | `sink contended` |
+| --- | --- | --- | --- | --- | --- |
+| `esp-x86` (`ehcihid,kbdwit,sdhcblk,smolnet,sdwrite`) | 1 → **0** | 1 → **0** | 1 → **0** | 2 → 1 | 1 → 1 |
+| `kernel8` (`baremetal,skip_xhci`) | 1 → **0** | 1 → **0** | 1 → **0** | 2 → 1 | 1 → 1 |
+| `esp-jetson` (`…,tegra,bsptick,bsprun,tegrasmp,apsrun,…`) | **0 → 0** | **0 → 0** | **0 → 0** | 1 → 1 | **0 → 0** |
+
+`ring drained` goes 2 → 1 rather than 2 → 2 because one of the two hits was never the witness: it was
+the PWRDRAIN *verdict* string, which quotes the witness back at the reader. The surviving hit is
+`power_drain`'s own format string — the transport's, and the one that had to stay. `sink contended` is
+SERWIT-2's `[mirror]` announcement, law rather than knob, untouched on both images where
+`mirror_service` is reachable at all.
+
+**The saving that is real is the one on the WIRE: 14 143 B per boot, 1.228 s at 115200 8N1.** The
+image-size half is reported with a caveat, because on aarch64 the flat image is not a code-size
+measurement:
+
+| loadable image (`objcopy -O binary`, never the `.elf`) | before | after | delta |
+| --- | --- | --- | --- |
+| x86 default knob-off (`esp-x86`'s own knob line) | 1 571 164 | 1 529 300 | **−41 864** |
+| `kernel8.img` (Pi 4 bare-metal) | 1 448 252 | 1 315 080 | **−133 172** |
+| aarch64-`virt` knob-off | 1 483 102 | 1 595 624 | +112 522 |
+| `esp-jetson` | 1 572 056 | 1 692 504 | +120 448 |
+
+> ⚠ The two aarch64 rows GREW while the code shrank, and that is a LINK-LAYOUT artefact, not a
+> regression. The aarch64 flat image spans VMA 0 upward, so it contains `.rela.dyn` (≈115 kB) and
+> `.rodata` before `.text`, and `.text`'s start address is padded to a coarse boundary above them —
+> measured at `0x5c000` in one build of this pair and `0x64000` in the other, a 32 KiB jump for a
+> few-kB code delta. So an aarch64 flat size moves in quanta and cannot be read as bytes of code.
+> `kernel8.img` does not have that problem (fixed load address, no `.rela.dyn`) and is the aarch64
+> number to quote. This is the same trap `docs/dev/LAWS.md` §5 names one step further in: byte
+> identity is a yes/no question about the image, and a size DELTA is a different question that the
+> same artifact cannot always answer.
+
+> ⚠ **The `esp-jetson` row is a finding, not a pass.** The queue row expected `> 0` there and
+> measured `0` — on the tree *before* this gating. The three fixtures never reached the Jetson image
+> at all, and neither does SERWIT-2's `[mirror]` announcement or its one-shot verdict: on aarch64 the
+> only non-`baremetal` `mirror_service` call site is the shared BSP main loop (`main.rs:1779`), and
+> the Jetson's `bsprun` scheduler handoff (`sched::run_bsp(0)`, `main.rs:1494`) diverges before that
+> loop is ever entered, so the whole chain is eliminated. The evidence is two-sided: none of
+> `[draincap] fill`, `[bpress] fill`, `[pwrdrain] fill`, `bounded by BYTES`, `BACK-PRESSURES`,
+> `drains the WHOLE ring` or `sink contended` appears in `target/aarch64_esp/kernel.elf`, while the
+> controls `ring drained`, `staging ring full` and `:: ` (499 hits) do; and the symbol table carries
+> the `DRAINCAP_DONE` / `PWRDRAIN_DONE` / `BACKPRESSURE_DONE` / `MIRROR_VERDICT_DONE` `.bss` statics
+> with **no function symbol** for `mirror_service`, any `…_selftest`, or `mirror_verdict_once`. That
+> is `LEDGER.md` SO41 and it is a reachability defect in `main.rs`, which this arc's brief does not
+> name — reported, not made.
+
+So the saving is real on every image that can reach `mirror_service` and has no witness to spend on
+it — `esp-x86` and `kernel8` measured above, and `esp-arm` / `vm-image` by the same construction —
+and on the Jetson the honest statement is that there was nothing to save because there was nothing
+running.
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,

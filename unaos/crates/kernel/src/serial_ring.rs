@@ -1688,14 +1688,14 @@ pub fn mirror_service() {
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first
     // statement, aarch64 via the BSP main loop and `pump_usb_into_gui` on baremetal). Placed AFTER the
     // verdict so the fixture's own traffic cannot move the tap tallies that verdict snapshots.
-    draincap_selftest();
+    #[cfg(feature = "witness")] draincap_selftest();
     // SERWIT-1B PARITY — the shared contended-producer policy, exercised on whichever arch is
     // running. Same one-shot call site and same contract as the two fixtures above it.
-    backpressure_selftest();
+    #[cfg(feature = "witness")] backpressure_selftest();
     // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
     // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
     // a fixture that leaves the ring as it found it should not do so before one that reads it.
-    pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. ⚠ LINE-NEUTRAL append; the body is a FILE-TAIL append, so no `panic::Location` in this file moves.
+    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. ⚠ LINE-NEUTRAL append; the body is a FILE-TAIL append, so no `panic::Location` in this file moves.
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -1802,27 +1802,63 @@ fn mirror_verdict_once() {
 // whole in one pass: `paid = 4352`, `drained_capped = 64`. Both the byte clause (4352 > 260) and the
 // cap-took-effect clause (64 < 64 is false) fire. Quoted in the commit.
 
+// ── WITNESS-GATING (trunk queue §5, 2026-09-12, SERDRAIN) — an instrument costs UART, so it rides ──
+// ── the knob every other fixture in this tree rides                                              ──
+//
+// `draincap_selftest`, `backpressure_selftest` and `pwrdrain_selftest` each fill the LIVE ring to
+// [`SLOTS`] once per boot, and none of them was gated on anything. `mirror_service` runs on every
+// image, so a witness-FREE flight image — the polarity every media command ships (`docs/dev/LAWS.md`
+// §5, orin 20) — paid for three instruments it carried no other witness for. SO30 is this same defect
+// one layer up: one `[wc-d]` line spent ~36 % of a boot's whole UART budget. MEASURED, at 115200 8N1
+// = 11 520 B/s = 86.8 us/B, from the x86 witness capture (`awk` over `target/serial.log`):
+//
+//     draincap    64 x 68 B fill = 4 352 B  + 310 B verdict
+//     bpress      64 x 66 B fill = 4 224 B  +  68 B probe + 374 B verdict
+//     pwrdrain    64 x 68 B fill = 4 352 B  +  46 B `ring drained` witness + 417 B verdict
+//     ------------------------------------------------------------------------------------
+//     14 143 B per boot = 1.228 s of wire, on an image with no witness to spend it on
+//
+// All three are now `#[cfg(feature = "witness")]` — on the function AND on the `mirror_service` call
+// site — and so is everything that exists only to serve them: [`DRAINCAP_PAD`], `DRAINCAP_LINE_B`,
+// `DRAINCAP_BOUND_B`, `BPRESS_PROBE`, `draincap_wire` and the three one-shot `…_DONE` statics.
+// `s5drain_selftest` was born gated.
+//
+// WHAT IS NOT GATED, and must not be. The `const _: () = assert!(…)` truth tables —
+// `drain_may_continue`'s five rows, `defer_policy`'s six, [`PWRDRAIN_LINE_LEN`]'s two and
+// `S5DRAIN_LINE_LEN`'s two — stay in EVERY build of BOTH arches. They emit not one byte of code, they
+// are the go-red that fires before anything boots, and a compile-time proof that only runs in the
+// configuration nobody ships is exactly the polarity trap LAWS §5 names. The transport itself is
+// untouched: [`power_drain`], [`drain_capped`], [`defer_contended`] and the ring are not instruments,
+// they are the wire — `power_drain`'s `ring drained` witness is the control that must SURVIVE this
+// gating, and a build where it went to zero too would be broken, not smaller.
+
 /// Exactly 68 bytes with its newline — SO29's measured witness-line width, so the fixture's arithmetic
 /// is the ledger's arithmetic and not a new one. `"[draincap] fill NN "` is 19 bytes, the pad is 48,
 /// the newline is 1.
+#[cfg(feature = "witness")]
 const DRAINCAP_PAD: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
 /// The filler line's width in bytes, including the newline. 19 + 48 + 1.
+#[cfg(feature = "witness")]
 const DRAINCAP_LINE_B: usize = 68;
 /// One capped drain's ceiling: the budget, plus the one line that may straddle it. See
 /// [`DRAIN_BYTE_BUDGET`]'s "the bound this actually gives".
+#[cfg(feature = "witness")]
 const DRAINCAP_BOUND_B: usize = DRAIN_BYTE_BUDGET + DRAINCAP_LINE_B;
 
+#[cfg(feature = "witness")]
 static DRAINCAP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The arch's raw, lock-free, bounded UART writer — the same primitive the panic path and the WEDGE
 /// breadcrumbs use. The fixture writes its drained lines through this rather than through `_print`,
 /// because `_print` would drain the ring itself and there would be nothing left to measure.
 #[inline]
+#[cfg(feature = "witness")]
 fn draincap_wire(s: &str) {
     crate::arch::serial::raw_write_str(s);
 }
 
 /// DRAINCAP, once per boot. Called from [`mirror_service`].
+#[cfg(feature = "witness")]
 fn draincap_selftest() {
     if DRAINCAP_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -1959,14 +1995,17 @@ fn draincap_selftest() {
 // aarch64's `_print` either calls [`defer_contended`] or does not compile. The fixture proves the
 // policy; the compiler proves the call.
 
+#[cfg(feature = "witness")]
 static BACKPRESSURE_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The probe line the fixture pushes through the contended path. 68 bytes with its newline, the same
 /// width [`DRAINCAP_PAD`] uses, so both fixtures speak SO29's arithmetic.
+#[cfg(feature = "witness")]
 const BPRESS_PROBE: &str =
     "[bpress] probe 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123\n";
 
 /// SERWIT-1B PARITY, once per boot. Called from [`mirror_service`].
+#[cfg(feature = "witness")]
 fn backpressure_selftest() {
     if BACKPRESSURE_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -2091,6 +2130,7 @@ fn backpressure_selftest() {
 // were handed to the port before the verb continues. The artifact half of the claim is
 // `LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf`.
 
+#[cfg(feature = "witness")]
 static PWRDRAIN_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Width of one fixture fill line, `"[pwrdrain] fill NN " + DRAINCAP_PAD + "\n"`: 19 + 48 + 1. Named
@@ -2107,6 +2147,7 @@ const _: () = assert!(
 );
 
 /// PWRDRAIN, once per boot. Called from [`mirror_service`].
+#[cfg(feature = "witness")]
 fn pwrdrain_selftest() {
     if PWRDRAIN_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -2230,16 +2271,15 @@ fn pwrdrain_selftest() {
 
 /// Width of one S5DRAIN fill line, `"[s5drain] fill NN " + DRAINCAP_PAD + "\n"`: 18 + 48 + 1. One byte
 /// narrower than [`PWRDRAIN_LINE_LEN`] because the tag is one character shorter; named so the byte
-/// assertion is arithmetic the compiler checks rather than a magic number.
-#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+/// assertion is arithmetic the compiler checks rather than a magic number. UNGATED, like
+/// [`PWRDRAIN_LINE_LEN`]'s rows below it: a `const` assertion emits no code, and a compile-time
+/// go-red that only runs in the configuration nobody ships is the polarity trap LAWS §5 names.
 const S5DRAIN_LINE_LEN: usize = 18 + 48 + 1;
 
-#[cfg(all(target_arch = "x86_64", feature = "witness"))]
 const _: () = assert!(
     S5DRAIN_LINE_LEN <= SLOT_LEN,
     "a fixture fill line must not truncate, or the byte count it asserts on is not the one staged"
 );
-#[cfg(all(target_arch = "x86_64", feature = "witness"))]
 const _: () = assert!(
     SLOTS * S5DRAIN_LINE_LEN > DRAIN_BYTE_BUDGET * 8,
     "the fixture's ring must be many budgets wide, or capped and uncapped are indistinguishable"
