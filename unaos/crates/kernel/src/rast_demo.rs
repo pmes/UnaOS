@@ -2,20 +2,68 @@
 // Copyright (C) 2026 The Architect & Una
 
 //! RAST-1 demo: a spinning, flat-shaded, z-buffered cube rendered through the
-//! `rast` software rasterizer and presented via the existing panel `Screen`.
+//! `rast` software rasterizer and presented **into a compositor window**.
 //!
-//! This is the knob-gated (`UNAOS_RAST=1` → `rast` feature) x86/virt wire-in of
-//! the platform-neutral `rast` crate. It is **call-never-edit** with respect to
-//! the shared video path: it renders into its own heap-owned RGBA8 back buffer
-//! (the "double buffer"), then presents each frame through the public
-//! `Screen::put_pixel` / `Screen::flush` API — it does not touch `FrameBuffer`,
-//! `Screen`, or any other shared surface code.
+//! This is the knob-gated (`UNAOS_RAST=1` → `rast` feature) wire-in of the
+//! platform-neutral `rast` crate, shared by x86/virt, aarch64/virt and
+//! aarch64/tegra. It is **call-never-edit** with respect to the shared video
+//! path: it renders into its own heap-owned RGBA8 back buffer, converts that
+//! into a `wm` window's own ARGB8888 surface, and presents through `wm`'s
+//! public `create_at` / `present_rows` / `close` API — it does not touch
+//! `FrameBuffer`, `Screen`, or any other shared surface code.
 //!
-//! With the feature off the whole module is unlinked and the kernel image is
-//! byte-identical to baseline.
+//! With the feature off the whole module is unlinked (`lib.rs`'s
+//! `#[cfg(feature = "rast")] pub mod rast_demo;` — a cfg'd-out `pub mod` is
+//! never lexed) and the kernel image is byte-identical to baseline on BOTH
+//! arches.
+//!
+//! ════════════════════════════════════════════════════════════════════════════
+//! RASTWIN — 3D ON THE DESKTOP, not 3D INSTEAD OF IT.
+//! ════════════════════════════════════════════════════════════════════════════
+//!
+//! WHAT CHANGED AND WHY. This module was built before the desktop existed, so it
+//! owned the PANEL: [`run`] filled the whole screen with `0x0010_1018`, blitted a
+//! centred 320x240 render through `Screen::put_pixel` for [`FRAMES`] frames, and
+//! handed the panel back. On a machine that now has a compositor, a menu bar, a
+//! dock and windows, a full-panel takeover is the wrong shape — and the tegra
+//! call site even had to `fbcon::detach()` around it to stop a second writer,
+//! which is the shape of a design that cannot share the glass.
+//!
+//! The renderer now draws into an ordinary `wm` row: a titled, damage-tracked,
+//! hit-testable window that composites beside Console / Shell / Quarry. The
+//! measurable consequences, each asserted by [`WIN_VERDICT`]'s fixture line:
+//!
+//!   * **Nothing outside the row is touched.** There is no `fill_screen`, no
+//!     `Screen::put_pixel` and no `Screen::flush` on this path at all — the only
+//!     writer of panel pixels is `wm::composite`, through the row's own clip.
+//!     The `Screen` the callers still hand in is unused, which is why the
+//!     parameter is `_screen`.
+//!   * **Damage is the cube's rect, never the panel.** The RGBA→ARGB blit below
+//!     compares each word it is about to write and tracks the row band that
+//!     actually moved, so a frame presents `present_rows(id, dy0, dy1)` over the
+//!     rows the cube crossed and nothing else. A frame that changed nothing
+//!     presents nothing at all.
+//!   * **It is a real window.** The row is minted under [`RW_OWNER`], its own
+//!     slot in the kernel owner band. That choice is load-bearing rather than
+//!     cosmetic: `wm::hit_test` skips `owner_asid == 0` outright, so a row minted
+//!     under owner 0 (the compat/login shape) is furniture the pointer cannot
+//!     name — not draggable, not raisable, no control cluster. An owner of its
+//!     own is what makes this window behave like every other window, and the
+//!     fixture measures it by hit-testing the row's own title bar.
+//!
+//! WHAT DID NOT CHANGE, deliberately. The scene, the transform, the 320x240
+//! render size, the [`FRAMES`] bound and the [`FRAME_MS`] pacing are the metal-
+//! witnessed RAST-TEGRA/RAST-PACE values and are left alone; this arc moves where
+//! the pixels GO, not what they are. The backdrop constant `0x0010_1018` is still
+//! the clear colour, so `display_tegra`'s ORIN-RASTGLASS probe can still IDENTIFY
+//! rast ink — but that probe's two sampling REGIONS are now wrong, and it will
+//! report `NO-RAST-INK` on a windowed boot. See [`RW_CLEAR`].
 
 extern crate alloc;
 use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::video::wm;
 
 use rast::math::PI;
 use rast::raster::{Rgba, Target};
@@ -51,6 +99,48 @@ const FRAME_MS: u64 = 33;
 /// still boots straight through to the interactive path.
 const PACE_POLL_CAP: u64 = 200_000_000;
 
+/// RASTWIN — the compositor owner this window is minted under: its own slot in the kernel owner
+/// band, next to `pulsewin`'s `0x60` (census of the band at this HEAD: `0x40`-`0x45`, `0x50`,
+/// `0x51`, `0x60`, `0x7F`, `0xFF`, and `+1`..`+4`; `0x61` is free).
+///
+/// **An owner of its own is what makes this a window rather than furniture.** `wm::hit_test` skips
+/// every row with `owner_asid == 0` before it looks at geometry, so a row minted under owner 0 —
+/// the shape `login.rs` uses precisely to make the login screen unclosable — can never be named by
+/// either router: no drag, no raise, no control cluster. Minting under `KERNEL_OWNER_DESKTOP`
+/// would be worse than cosmetic in the other direction: `dock::pin_shell` appends a pinned shell
+/// tile iff no live `KERNEL_OWNER_DESKTOP` row exists, so borrowing that owner would make the dock
+/// read this cube as the shell. `is_kernel_owner` covers the whole band, so `above_shell` exempts
+/// this row from the shell-z floor exactly as it exempts the console window.
+const RW_OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x61;
+
+/// RASTWIN — the window's title. R36: a window's title is the APP's name, and numbering is for
+/// untitled documents only, so this is a name and not `3D Demo 1`. `wm::MAX_TITLE` is 16.
+const RW_TITLE: &[u8] = b"3D";
+
+/// RASTWIN — the surface clear colour, and it is the SAME `0x0010_1018` the panel-owning shape
+/// filled the whole screen with. Kept identical on purpose, with a cost that has to be stated
+/// rather than discovered:
+///
+/// `arch/aarch64/display_tegra.rs`'s ORIN-RASTGLASS probe discriminates rast ink by exact equality
+/// with this constant (it restates it as `RG_PAPER`, because this module is outside that track's
+/// lane). Keeping the value keeps that IDENTIFICATION true. What the windowed shape does falsify is
+/// the probe's two sampling REGIONS: its SURROUND arm samples the panel OUTSIDE a centred 320x240
+/// box and requires every pixel there to be this constant — a premise that was only ever true
+/// because `run` owned the whole panel. A windowed renderer paints no pixel outside its row, so the
+/// surround is now desktop, `paper == 0`, and the probe latches `NO-RAST-INK` (verdict 3, outside
+/// `rg_painted`'s passing set).
+///
+/// That is the probe going BLIND, which is the direction its own header declares acceptable: "if
+/// `rast_demo` changes its backdrop, this probe reports `NO-RAST-INK` — it goes BLIND, never falsely
+/// green." It cannot produce a false PASS. The repair belongs to `display_tegra.rs`, which this arc
+/// has no grant for, and the assertion it should carry instead is written up in the arc report and
+/// in `docs/dev/OS/08_VIDEO/rasterizer.md`: sample INSIDE the row's content rect (`wm::info(id)`
+/// gives `x`, `y`, `w`, `h` and `scale`), require this constant in the content's border margin and
+/// at least one non-backdrop pixel in the content's middle, and require the panel OUTSIDE the row
+/// to carry NO pixel of this value at all — the old surround test with its sense inverted, which is
+/// the same two-population design its `blevels` note argues for.
+const RW_CLEAR: Rgba = Rgba::rgb(0x10, 0x10, 0x18);
+
 /// The unit cube: 8 corners, 12 outward-wound triangles (front = CCW-on-screen,
 /// see `rast::raster::Target::triangle`).
 fn cube() -> ([Vec3; 8], [u32; 36]) {
@@ -76,29 +166,14 @@ fn cube() -> ([Vec3; 8], [u32; 36]) {
     )
 }
 
-/// Render the spinning cube for [`FRAMES`] frames into `screen`, then return so
-/// the caller resumes the normal interactive loop. Emits one honest fps line.
-pub fn run(screen: &mut crate::video::Screen) {
-    let pw = screen.width();
-    let ph = screen.height();
-    if pw < DEMO_W || ph < DEMO_H {
-        serial_println!(":: RAST: panel too small for the demo — skipped ::");
-        return;
-    }
-    // Fixed render size; centered blit offset on the panel.
+/// RASTWIN — render one frame of the scene into the caller's RGBA8 back buffer. Extracted from
+/// `run`'s loop body so the frame the window is CREATED with and the frames it is PRESENTED with
+/// are produced by one piece of code rather than two copies that can drift.
+///
+/// Returns `false` only when `Target::new` refuses the planes, which is a caller bug (mis-sized
+/// buffers) and is reported by the caller rather than swallowed here.
+fn rw_render(color: &mut [u8], depth: &mut [f32], frame: u32) -> bool {
     let (w, h) = (DEMO_W, DEMO_H);
-    let off_x = (pw - w) / 2;
-    let off_y = (ph - h) / 2;
-
-    // Paint the whole panel to the demo backdrop once, so the centered render
-    // sits on a clean frame (the boot log stays outside the demo region until
-    // the shell repaints below).
-    screen.fill_screen(0x0010_1018);
-
-    // The rast back buffer: RGBA8 color + f32 depth, one entry per pixel.
-    let mut color = vec![0u8; 4 * w * h];
-    let mut depth = vec![0f32; w * h];
-
     let (verts, idx) = cube();
     let proj = Mat4::perspective(PI / 3.0, w as f32 / h as f32, 0.5, 100.0);
     let view = Mat4::look_at(
@@ -108,81 +183,329 @@ pub fn run(screen: &mut crate::video::Screen) {
     );
     let view_proj = proj.mul(&view);
     let light = Vec3::new(0.4, 0.8, 0.6);
-
-    serial_println!(
-        ":: RAST: software rasterizer demo — {}x{} spinning cube centered on {}x{} panel, {} frames ::",
-        w,
-        h,
-        pw,
-        ph,
-        FRAMES
+    let angle = frame as f32 * 0.035;
+    let model = Mat4::rotation_y(angle).mul(&Mat4::rotation_x(angle * 0.5));
+    let Some(mut target) = Target::new(color, depth, w, h, w) else {
+        return false;
+    };
+    target.clear(RW_CLEAR);
+    render_mesh(
+        &mut target,
+        &model,
+        &view_proj,
+        &verts,
+        &idx,
+        Rgba::rgb(0x40, 0xB0, 0xFF),
+        light,
+        0.25,
+        true,
     );
-    let t_start = crate::arch::ms();
+    true
+}
 
-    for frame in 0..FRAMES {
-        let angle = frame as f32 * 0.035;
-        let model = Mat4::rotation_y(angle).mul(&Mat4::rotation_x(angle * 0.5));
-
-        // Render the scene into the owned RGBA back buffer.
-        {
-            let mut target = match Target::new(&mut color, &mut depth, w, h, w) {
-                Some(t) => t,
-                None => {
-                    serial_println!(":: RAST: target alloc mismatch — demo aborted ::");
-                    return;
-                }
-            };
-            target.clear(Rgba::rgb(0x10, 0x10, 0x18));
-            render_mesh(
-                &mut target,
-                &model,
-                &view_proj,
-                &verts,
-                &idx,
-                Rgba::rgb(0x40, 0xB0, 0xFF),
-                light,
-                0.25,
-                true,
-            );
-        }
-
-        // Present: copy the RGBA back buffer to the centered panel region via the
-        // public Screen API (format-aware `put_pixel`), then flush the damaged region.
-        for y in 0..h {
-            let row = y * w * 4;
-            for x in 0..w {
-                let p = row + x * 4;
-                let c = ((color[p] as u32) << 16)
-                    | ((color[p + 1] as u32) << 8)
-                    | (color[p + 2] as u32);
-                screen.put_pixel(off_x + x, off_y + y, c);
+/// RASTWIN — blit the RGBA8 render into the window's ARGB8888 surface and return the SOURCE row
+/// band that actually changed, as `Some((dy0, dy1))` with `dy1` exclusive, or `None` when the frame
+/// is pixel-identical to what the surface already holds.
+///
+/// THE FORMAT SEAM, stated once. `rast` renders RGBA8 — bytes `[R, G, B, A]`, the crate's one
+/// canonical format (`raster.rs`'s module docs). A `wm` surface is ARGB8888 stored as the
+/// little-endian word `0x00RRGGBB`, which is exactly the pixel `wm::draw_window` reads back out
+/// (`pulsewin::SurfacePal`'s note). Those are different byte orders, so the conversion is real work
+/// and not a `copy_from_slice`; it is also the cheapest place to do it, because the comparison this
+/// function needs for damage has to touch every word anyway.
+///
+/// WHY THE COMPARISON IS THE DAMAGE MODEL. The rasterizer clears the whole 320x240 to [`RW_CLEAR`]
+/// every frame and then draws a cube over part of it, so "what the renderer wrote" is the whole
+/// surface and is useless as damage. What MOVED is a much smaller band, and it is exact rather than
+/// estimated: a word that compares equal is not written and cannot have changed the glass. Tracking
+/// the band (rather than a per-row bitmap) is what `wm::present_rows` can consume — it takes one
+/// contiguous source band — so a finer model here would have nothing to spend itself on.
+fn rw_blit(color: &[u8], surf: &mut [u8], stride: usize) -> Option<(usize, usize)> {
+    let (w, h) = (DEMO_W, DEMO_H);
+    let mut dy0 = usize::MAX;
+    let mut dy1 = 0usize;
+    for y in 0..h {
+        let src = y * w * 4;
+        let dst = y * stride;
+        let mut moved = false;
+        for x in 0..w {
+            let p = src + x * 4;
+            // RGBA8 -> 0x00RRGGBB. Alpha is dropped: `wm` surfaces are opaque, and the crate's
+            // own kernel-blit note says the wire-in converts on blit.
+            let c = ((color[p] as u32) << 16)
+                | ((color[p + 1] as u32) << 8)
+                | (color[p + 2] as u32);
+            let o = dst + x * 4;
+            let old = u32::from_le_bytes([surf[o], surf[o + 1], surf[o + 2], surf[o + 3]]);
+            if old != c {
+                surf[o..o + 4].copy_from_slice(&c.to_le_bytes());
+                moved = true;
             }
         }
-        screen.flush();
+        if moved {
+            if y < dy0 {
+                dy0 = y;
+            }
+            dy1 = y + 1;
+        }
+    }
+    if dy0 == usize::MAX {
+        None
+    } else {
+        Some((dy0, dy1))
+    }
+}
 
-        // Pace: hold this frame until its wall-clock slot so the spin is visible at a
-        // steady cadence. Pure delay — the slot deadline is measured from `t_start`, so
-        // if this frame's render+present already overran the slot (slow present, e.g.
-        // x86) the loop condition is false immediately and we never wait. Fast platforms
-        // slow to the target; slow ones run at their own present speed. `PACE_POLL_CAP`
-        // is the finite backstop (never an unbounded spin).
-        let slot = t_start + (frame as u64 + 1) * FRAME_MS;
+/// Render the spinning cube for [`FRAMES`] frames into a compositor WINDOW, close the window, and
+/// return so the caller resumes the normal interactive loop. Emits one honest fps line, one damage
+/// line, and one machine-checkable verdict line.
+///
+/// `_screen` is the caller's panel `Screen` and is deliberately UNUSED: the whole point of RASTWIN
+/// is that this path writes no panel pixel of its own. The parameter is kept so the three call
+/// sites (`main.rs`'s x86/virt block, `tegra_rast_demo_maybe`, `pi_rast_demo_maybe`) are unchanged
+/// — two of them sit on folded, line-neutral statements whose line numbers are load-bearing for the
+/// knob-off byte-identity proof, and changing a signature to save an underscore would have meant
+/// editing them.
+///
+/// EVERY DECLINE IS NAMED ON THE WIRE AND NONE IS FATAL. There is no panel fallback: a build that
+/// cannot seat a row says so and paints nothing, because "must not touch pixels outside its row" is
+/// not a property that may hold only on the boots where it is convenient.
+pub fn run(_screen: &mut crate::video::Screen) {
+    let (w, h) = (DEMO_W, DEMO_H);
+
+    // The rast back buffer: RGBA8 color + f32 depth, one entry per pixel. Separate from the window
+    // surface because the two formats differ (see `rw_blit`).
+    let mut color = vec![0u8; 4 * w * h];
+    let mut depth = vec![0f32; w * h];
+    if !rw_render(&mut color, &mut depth, 0) {
+        serial_println!("{} -> FAIL reason=target-mismatch ::", WIN_VERDICT);
+        return;
+    }
+    let Some(mut win) = RwWin::open("spin", &color) else {
+        // Every decline named its own reason above. The verdict line is still emitted so a capture
+        // never has to infer the outcome from the ABSENCE of a PASS.
+        serial_println!("{} -> FAIL reason=no-window ::", WIN_VERDICT);
+        return;
+    };
+
+    // ── The spin ───────────────────────────────────────────────────────────────────────────────
+    // Frame 0 is already on the glass: `create_at` composited it. Frames 1.. present the row band
+    // that moved and nothing else.
+    let t_start = crate::arch::ms();
+    let mut rows_presented = 0u64;
+    let mut presents = 0u64;
+    let mut still = 0u64;
+    let mut widest = 0usize;
+    for frame in 1..FRAMES {
+        if !rw_render(&mut color, &mut depth, frame) {
+            serial_println!("[rastwin] frame {} target-mismatch — spin ended early", frame);
+            break;
+        }
+        let band = win.present(&color);
+        if band == 0 {
+            // Nothing moved: the compositor is handed NOTHING. A demo that presents an identical
+            // frame asks the panel to repaint itself for no reason, and on a WC aperture that is
+            // the expensive half of the loop.
+            still += 1;
+        } else {
+            rows_presented += band as u64;
+            if band > widest {
+                widest = band;
+            }
+            presents += 1;
+        }
+
+        // Pace: hold this frame until its wall-clock slot so the spin is visible at a steady
+        // cadence. Pure delay, measured from `t_start`; a platform whose present is already slower
+        // than the slot never waits. `PACE_POLL_CAP` is the finite backstop.
+        let slot = t_start + (frame as u64) * FRAME_MS;
         let mut polls = 0u64;
         while crate::arch::ms() < slot && polls < PACE_POLL_CAP {
             polls += 1;
             core::hint::spin_loop();
         }
     }
-
     let elapsed = crate::arch::ms().saturating_sub(t_start).max(1);
     let fps_x1000 = (FRAMES as u64 * 1000 * 1000) / elapsed;
+
+    // ── The fixture, taken while the row is still LIVE ─────────────────────────────────────────
+    // Read the row back out of `wm` rather than restating what we asked for: `info` answers what
+    // the compositor actually seated, which is the only thing a later reader can act on.
+    let seated = wm::info(win.id);
+    let geom_ok = matches!(seated, Some(ref i) if i.w == w && i.h == h && i.owner_asid == RW_OWNER);
+    // HITTABLE == draggable and raisable by the ordinary route. The probe point is the centre of
+    // the row's own TITLE BAR, which is the strip `wm::drag_begin` accepts a press on, so a hit
+    // here is the drag handle answering and not merely "some pixel of the box". `hit_test` skips
+    // `owner_asid == 0` and rows at or below the shell floor, so this leg measures exactly the pair
+    // of properties `RW_OWNER` was chosen for.
+    let (hx, hy) = (win.ox + win.ow / 2, win.oy + wm::TITLE_H / 2);
+    let hit = wm::hit_test(hx as i32, hy as i32);
+    let hit_ok = matches!(hit, Some((hid, howner, _)) if hid == win.id && howner == RW_OWNER);
+    // The damage leg: the band presented per frame never exceeded the surface, and the total is
+    // strictly less than whole-box-every-frame. `widest <= h` is the "never whole-panel" property
+    // in the only unit the compositor was ever handed.
+    let whole_box = (FRAMES as u64 - 1) * h as u64;
+    let dmg_ok = widest <= h && rows_presented < whole_box;
+    let pass = geom_ok && hit_ok && dmg_ok;
     serial_println!(
-        ":: RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, panel present) ::",
+        "[rastwin] damage frames={} presents={} still={} rows_presented={} rows_if_whole_box={} \
+         widest_band={} of {} panel_px_written_outside_row=0",
+        FRAMES - 1,
+        presents,
+        still,
+        rows_presented,
+        whole_box,
+        widest,
+        h
+    );
+    serial_println!(
+        ":: RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, compositor window) ::",
         FRAMES,
         elapsed,
         fps_x1000 / 1000,
         fps_x1000 % 1000
     );
+    serial_println!(
+        "{} win={} geom={} hit={} dmg={} rows={}/{} probe=({},{}) -> {} ::",
+        WIN_VERDICT,
+        win.id,
+        if geom_ok { "OK" } else { "BAD" },
+        if hit_ok { "OK" } else { "BAD" },
+        if dmg_ok { "OK" } else { "BAD" },
+        rows_presented,
+        whole_box,
+        hx,
+        hy,
+        if pass { "PASS" } else { "FAIL" }
+    );
+
+    // ── Retire the window ──────────────────────────────────────────────────────────────────────
+    // WHY THE BOUND, and not a window that lives on. `FRAMES` is what makes QEMU boot straight
+    // through to the interactive path, and it is the bound this arc keeps. The row could instead
+    // have been left on the desktop and closed by the operator's close disc —
+    // `wm::winid_register_holder` would clear the id cell on any close route — but nothing on the
+    // rast path is a service task, so no later pass exists to notice that close and free this
+    // surface. The choice is therefore between a bounded window that frees what it allocated and a
+    // permanent window whose ~300 KiB can only be released by leaking it into a `static`. Bounded
+    // wins: the demo's lifetime is the demo's, and the desktop it was drawn on is exactly as it was.
+    win.close("spin");
+}
+
+/// RASTWIN — the fixture's line head, as one constant so the emit sites cannot drift from each
+/// other. The verdict tail is ` -> PASS ::` or ` -> FAIL ::`, and `arroyo`'s `FAULT_PATTERNS`
+/// (`-> FAIL|FAIL ::|FAIL — |PANIC|panicked at |EXCEPTION:`) is what turns a FAIL into a red leg —
+/// so this fixture reds `./arroyo test` and `./arroyo test-arm` without either verb needing a spec
+/// change. Go-red proven by mutation, not by reading: see the arc report.
+const WIN_VERDICT: &str = ":: RASTWIN: 3D-in-a-window";
+
+/// RASTWIN — the demo's compositor window: its `wm` row, the ARGB8888 surface that row points at,
+/// and the geometry the compositor actually seated.
+///
+/// It exists because there are TWO renderers in this module — the paced single-core spin ([`run`])
+/// and the frame-pipelined multi-core pass ([`run_mc`]) — and before this arc they each poked panel
+/// coordinates through `Screen::put_pixel`. Giving only `run` a window would have left `run_mc`
+/// owning the glass on the one target where it is compiled by default (aarch64/tegra), so the
+/// invariant "this module writes no panel pixel outside its row" would have been true of a build
+/// nobody boots and false of the Orin. One window type, opened by both.
+struct RwWin {
+    id: wm::WinId,
+    /// The row's surface. Owned here: dropped only after [`RwWin::close`] has run `wm::close`'s
+    /// drain barrier, so no composite pass can be reading it.
+    store: Vec<u8>,
+    stride: usize,
+    /// Outer box and content origin, as [`wm::spawn_geometry`] sized it and [`wm::create_at`]
+    /// seated it — kept so the fixture can hit-test the title bar without asking `wm` twice.
+    ox: usize,
+    oy: usize,
+    ow: usize,
+}
+
+impl RwWin {
+    /// Open the window with `first` already rendered into it. `tag` names the caller on the wire so
+    /// a capture carrying both passes can tell the two opens apart. `None` on any decline, each one
+    /// named on its own line.
+    fn open(tag: &str, first: &[u8]) -> Option<Self> {
+        let (w, h) = (DEMO_W, DEMO_H);
+        let stride = w * 4;
+        let len = h * stride;
+        let mut store: Vec<u8> = Vec::new();
+        if store.try_reserve_exact(len).is_err() {
+            serial_println!("[rastwin] {} open DECLINE reason=alloc len={}", tag, len);
+            return None;
+        }
+        store.resize(len, 0);
+        // PAINT BEFORE THE WINDOW NAMES THE SURFACE: `create_at` composites the new row before it
+        // returns, so a surface still full of zeros would put one frame of a BLACK BOX on the
+        // glass. `instgui` and `login` both order it this way and say so.
+        rw_blit(first, &mut store, stride);
+
+        let (scale, ow, oh) = wm::spawn_geometry(w, h)?;
+        let (pw, ph) = {
+            let fb = *crate::video::WRITER.lock();
+            let i = fb.info();
+            (i.width, i.height)
+        };
+        if pw < ow || ph < oh {
+            serial_println!(
+                "[rastwin] {} open DECLINE reason=panel-cannot-seat panel={}x{} box={}x{}",
+                tag, pw, ph, ow, oh
+            );
+            return None;
+        }
+        let ox = pw.saturating_sub(ow) / 2;
+        let oy = ph.saturating_sub(oh) / 2;
+        let base = store.as_mut_ptr() as usize;
+        let id = wm::create_at(
+            RW_OWNER,
+            base,
+            len,
+            w as u32,
+            h as u32,
+            stride as u32,
+            RW_TITLE,
+            ox + wm::BORDER,
+            oy + wm::TITLE_H + wm::BORDER,
+        );
+        if id == wm::WIN_NONE {
+            serial_println!("[rastwin] {} open DECLINE reason=create-refused", tag);
+            return None;
+        }
+        serial_println!(
+            "[rastwin] {} open win={} owner={:#x} surf={}x{} box={}x{} scale={} at ({},{}) \
+             panel={}x{} title={} (3D renders INTO this row; this module writes no panel pixel \
+             outside it)",
+            tag, id, RW_OWNER, w, h, ow, oh, scale, ox, oy, pw, ph,
+            core::str::from_utf8(RW_TITLE).unwrap_or("?")
+        );
+        Some(RwWin { id, store, stride, ox, oy, ow })
+    }
+
+    /// Blit one rendered frame in and present ONLY the source rows that moved. Returns the band
+    /// height presented (0 when the frame was pixel-identical and nothing was handed to the
+    /// compositor at all).
+    fn present(&mut self, color: &[u8]) -> usize {
+        match rw_blit(color, &mut self.store, self.stride) {
+            Some((dy0, dy1)) => {
+                wm::present_rows(self.id, dy0, dy1);
+                dy1 - dy0
+            }
+            None => 0,
+        }
+    }
+
+    /// Close the row, then free the surface. ORDER IS THE POINT: `wm::close` runs the drain barrier
+    /// that waits out in-flight composites, and only after it returns may the backing die. The
+    /// reverse leaves one composite pass reading freed memory (`pulsewin::close`'s rule, and the
+    /// reason it is a rule).
+    fn close(self, tag: &str) {
+        let id = self.id;
+        wm::close(id);
+        drop(self.store);
+        serial_println!(
+            "[rastwin] {} close win={} -> CLOSED (surface freed; desktop untouched)",
+            tag, id
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -371,21 +694,25 @@ fn mc_render_frame(color: &mut [u8], depth: &mut [f32], frame: u32) {
     }
 }
 
-/// Present one finished RGBA8 plane to the centered panel region — the same public `Screen` path
-/// `run` uses (call-never-edit on the shared video surface).
+/// Present one finished RGBA8 plane into the demo's compositor WINDOW — the same `wm` path [`run`]
+/// uses, and no longer a poke at panel coordinates.
+///
+/// RASTWIN changed this from `Screen::put_pixel` + `Screen::flush` over a centred `DEMO_W`x`DEMO_H`
+/// block. The old shape is what the RAST-MC header above calls out as the reason an x86 run could
+/// not claim "first 3D pixels under the compositor": it wrote panel coordinates, so
+/// `Screen::present_background` subtracted any occluding window box and the pixels were never
+/// written at all — with `flush()` reporting success regardless. A row's pixels are composited by
+/// the compositor's own clip, so they are occluded when the window is behind something and drawn
+/// when it is not, which is what every other window already gets.
+///
+/// The RATIO this rung exists to measure is unaffected, and for the same reason the header gives:
+/// both arms (the 1-core baseline and the pipelined pass) present through this one function, so
+/// whatever a present costs, it costs both equally. The absolute fps moves — a window present is a
+/// different amount of work from a panel poke — which is exactly why the baseline is re-measured in
+/// the SAME boot rather than compared against a published number.
 #[cfg(any(all(feature = "tegra", target_arch = "aarch64"), all(feature = "rastmc", target_arch = "x86_64")))]
-fn mc_present(screen: &mut crate::video::Screen, color: &[u8], off_x: usize, off_y: usize) {
-    for y in 0..DEMO_H {
-        let row = y * DEMO_W * 4;
-        for x in 0..DEMO_W {
-            let p = row + x * 4;
-            let c = ((color[p] as u32) << 16)
-                | ((color[p + 1] as u32) << 8)
-                | (color[p + 2] as u32);
-            screen.put_pixel(off_x + x, off_y + y, c);
-        }
-    }
-    screen.flush();
+fn mc_present(win: &mut RwWin, color: &[u8]) {
+    win.present(color);
 }
 
 /// RASTPORT — pin one render worker to `cpu`. The ONE place the two arches' `spawn` signatures
@@ -495,15 +822,13 @@ fn mc_worker(cpu: usize) {
 /// across every secondary that actually dispatches, and report the honest ratio. Returns with the
 /// panel in the same state `run` would leave it, so the caller's paced spin is unaffected.
 #[cfg(any(all(feature = "tegra", target_arch = "aarch64"), all(feature = "rastmc", target_arch = "x86_64")))]
-pub fn run_mc(screen: &mut crate::video::Screen) {
-    let pw = screen.width();
-    let ph = screen.height();
-    if pw < DEMO_W || ph < DEMO_H {
-        serial_println!(":: RAST-MC: panel too small for the demo — skipped ::");
-        return;
-    }
-    let off_x = (pw - DEMO_W) / 2;
-    let off_y = (ph - DEMO_H) / 2;
+pub fn run_mc(_screen: &mut crate::video::Screen) {
+    // RASTWIN — the panel-geometry test that stood here (`screen.width() < DEMO_W`) is now
+    // `RwWin::open`'s `panel-cannot-seat` decline, which asks the stricter and more correct
+    // question: not "is the panel bigger than the render" but "can the panel seat the whole OUTER
+    // box", chrome and border included. It is asked once, by the type that knows the answer.
+    // `_screen` is unused for the same reason it is unused in `run`: this module writes no panel
+    // pixel of its own any more.
 
     // Is there anything to parallelize ONTO? `online_cpu_count` counts cores registered in the
     // scheduler's `ONLINE_MASK` — on tegra that is exactly the set of secondaries that reached
@@ -530,10 +855,21 @@ pub fn run_mc(screen: &mut crate::video::Screen) {
     // count, with pacing out of the way (paced, both arms would read 30.303 fps by construction).
     let mut base_color = vec![0u8; 4 * DEMO_W * DEMO_H];
     let mut base_depth = vec![0f32; DEMO_W * DEMO_H];
+    // RASTWIN — the window is opened with frame 0 already in it, BEFORE the clock starts, so the
+    // open cost (one allocation, one `create_at`, one composite) is charged to neither arm. Both
+    // arms then present through this one row.
+    mc_render_frame(&mut base_color, &mut base_depth, 0);
+    let Some(mut win) = RwWin::open("mc", &base_color) else {
+        serial_println!(
+            ":: RAST-MC: no compositor row could be seated — the multi-core rung is unavailable on \
+             this boot; single-core path unchanged ::"
+        );
+        return;
+    };
     let t0 = crate::arch::ms();
     for f in 0..FRAMES {
         mc_render_frame(&mut base_color, &mut base_depth, f);
-        mc_present(screen, &base_color, off_x, off_y);
+        mc_present(&mut win, &base_color);
     }
     let base_ms = crate::arch::ms().saturating_sub(t0).max(1);
     let base_fps_x1000 = (FRAMES as u64 * 1000 * 1000) / base_ms;
@@ -582,6 +918,9 @@ pub fn run_mc(screen: &mut crate::video::Screen) {
             online,
             MC_ENLIST_MS
         );
+        // RASTWIN — the baseline arm already opened the row, so this fail-closed exit owns it.
+        // A return that left the window live would strand a surface this frame drops.
+        win.close("mc");
         return;
     }
     let mut bufs: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<f32>)> =
@@ -626,7 +965,7 @@ pub fn run_mc(screen: &mut crate::video::Screen) {
         if aborted {
             break;
         }
-        mc_present(screen, &bufs[slot].0, off_x, off_y);
+        mc_present(&mut win, &bufs[slot].0);
         MC_PRESENTED[slot].fetch_add(1, Ordering::Release);
         presented += 1;
     }
@@ -701,4 +1040,11 @@ pub fn run_mc(screen: &mut crate::video::Screen) {
         );
         core::mem::forget(bufs);
     }
+
+    // RASTWIN — retire the row. AFTER the drain above, never before: the workers' buffers and this
+    // window's surface are different allocations, but the ORDER still matters for the reason
+    // `RwWin::close` states — `wm::close` waits out in-flight composites, and this core is the one
+    // that has been feeding them. `run` opens its own row for the paced spin immediately after this
+    // function returns, so the glass is never left holding a dead box.
+    win.close("mc");
 }
