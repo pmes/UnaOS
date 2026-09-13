@@ -1129,7 +1129,14 @@ fi
 #                             (`5` is rung 4e's value, UNAOS_GA10B_PROBE4=5 — the same delta, the same digit)
 #   UNAOS_GA10B_PROBE5=2   -> + `ga10bprobe5a` + `ga10bprobe5b` — 5a RAW, then rung 5b's read-only PMU oracles
 #   UNAOS_GA10B_PROBE5=7   -> + `ga10bprobe5a` + `ga10bprobe5e` + `ga10bprobe5b` — 5a shifted, then 5b
-#   UNAOS_GA10B_PROBE5=<n>d (1d|5d|2d|7d) -> the same set + `ga10bprobe5d` — the ignition DEFERRED to the
+#   UNAOS_GA10B_PROBE5=3   -> + `ga10bprobe5a` + `ga10bprobe5s` — RUNG 5a with the SECOND TRIPLE
+#                             (`safety-scheduler.{text,data,manifest}`) in place of `acr-gsp`: ONE delta
+#                             from the flown render15-5a, the PAYLOAD (ledger A72)
+#   UNAOS_GA10B_PROBE5=4   -> + `ga10bprobe5a` + `ga10bprobe5m` — RUNG 5a with the §4.1.2 MAPPING
+#                             SWAPPED (fmccode<-…data…, fmcdata<-…text…, manifest unmoved): the other
+#                             ONE delta, the MAPPING (ledger A73). 3 and 4 NEVER combine — the BCR lock
+#                             makes a boot ONE ignition, so a two-delta arm could not attribute a FAIL
+#   UNAOS_GA10B_PROBE5=<n>d (1d|5d|2d|7d|3d|4d) -> the same set + `ga10bprobe5d` — the ignition DEFERRED to the
 #                             shutdown path (rung 4d's shape): the loader still runs at boot, the desktop
 #                             comes up, Shut Down ignites (needs the power::psci_call hook, see Cargo.toml)
 #   any other value        -> the loader alone: an unexpected value never buys an ignition (the PROBE3/4 shape)
@@ -1140,13 +1147,14 @@ fi
 # 5a implies 4a, so rung 4a's own census also runs at post-heap-init and RETURNS; 5a re-proves it inside.
 # Default OFF => modules + call sites vanish, no panic Location moves, knob-off images byte-identical.
 # ARMED polarities type-checked by the `arm-ga10bprobe5` (virt, witness), `arm-tegra-ga10bprobe5a`,
-# `arm-tegra-ga10bprobe5e`, `arm-tegra-ga10bprobe5b` and `arm-tegra-ga10bprobe5d` legs of KERNEL_CFG_MATRIX.
+# `arm-tegra-ga10bprobe5e`, `arm-tegra-ga10bprobe5b`, `arm-tegra-ga10bprobe5d`, `arm-tegra-ga10bprobe5s`
+# and `arm-tegra-ga10bprobe5m` legs of KERNEL_CFG_MATRIX.
 # Witness families: `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`, `[ga10bprobe5d]`. Fly WITHOUT
 # UNAOS_GA10B_PROBE1/2/3/4. The ORIN-SELFUP line of `tegra_early_stop` is the 5a call's seam (main.rs).
 [ -n "${UNAOS_GA10B_PROBE5:-}" ] && _feats="${_feats}ga10bprobe5,"
 _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_jetson_img|jetson-img) _p5_metal=1 ;; esac; [ -n "${UNAOS_TEGRA:-}" ] && _p5_metal=1   # GA10B-PROBE5 METAL GATE. ⚠ WAS `[ "${1:-}" = "esp-jetson" ]`, a single string equality against ONE of the SIX verb spellings the dispatcher accepts (`esp-jetson|esp_jetson|jetson` at :9026 and `esp-jetson-img|esp_jetson_img|jetson-img` at :9029, whose `esp_jetson_img()` is nothing but a call to `esp_jetson`). So five of six spellings silently DROPPED `ga10bprobe5a` — the ignition itself — while still setting `ga10bprobe5`, and the build printed a feature banner that named the rung it was not building. MEASURED 2026-09-13 staging rung 5a: `esp-jetson` built `ga10bprobe5,ga10bprobe5a`, the `esp-jetson-img` step that follows it in the same chain rebuilt `ga10bprobe5` alone and OVERWROTE kernel.elf, and `LC_ALL=C grep -a -o -F` on the artifact found `ga10b` 0 against the 4f card's 79. A card cut from that boots, prints no rung, and looks like a clean flight — one power cycle spent on nothing. Enumerate the aliases the way the UNAOS_WITNESS gate at :49 already does; a feature gate keys on the BUILD TARGET, never on one spelling of its name. PROBE4 carries no such guard, which is why the render15-4f card was sound.
-[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; 2|2d) _feats="${_feats}ga10bprobe5a,ga10bprobe5b," ;; 7|7d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e,ga10bprobe5b," ;; esac
-[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1d|5d|2d|7d) _feats="${_feats}ga10bprobe5d," ;; esac
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; 2|2d) _feats="${_feats}ga10bprobe5a,ga10bprobe5b," ;; 7|7d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e,ga10bprobe5b," ;; 3|3d) _feats="${_feats}ga10bprobe5a,ga10bprobe5s," ;; 4|4d) _feats="${_feats}ga10bprobe5a,ga10bprobe5m," ;; esac
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1d|5d|2d|7d|3d|4d) _feats="${_feats}ga10bprobe5d," ;; esac
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -3032,23 +3040,32 @@ test_aarch64() {
     # this script builds carrying `GA10B/` — three SYNTHETIC files with the vendor triple's NAMES and SIZES
     # (`yes <line> | head -c <size>`: our bytes, never a vendor byte; their sha256s are the `witness` table
     # in `ga10b_fw.rs`) — and `GA10BBAD/`, the same three with ONE byte of the data section flipped. The
-    # kernel's fixture must LOAD the first and REFUSE reason=digest the second. mkfs.vfat + mcopy (the
-    # tools make-fat-img.sh's Linux backend already requires); 64 MiB, 512-byte clusters, label UNAOS.
+    # kernel's fixture must LOAD the first and REFUSE reason=digest the second. `GA10BSS/` + `GA10BSSBAD/`
+    # are the same pair for the SECOND TRIPLE (`safety-scheduler`, ledger A72), so the fixture is four
+    # passes. mkfs.vfat + mcopy (the tools make-fat-img.sh's Linux backend already requires); 64 MiB,
+    # 512-byte clusters, label UNAOS.
     if [ -n "${UNAOS_GA10B_PROBE5:-}" ]; then
         local fx="${WORKSPACE_DIR}/target/ga10b5-fixture" fximg="${WORKSPACE_DIR}/target/ga10b5-fixture.img" _t
         for _t in mkfs.vfat mcopy; do command -v "$_t" >/dev/null 2>&1 || { echo -e "${COLOR_RED}test-arm: GA10B-PROBE5 fixture needs '$_t' (dosfstools + mtools)${COLOR_RESET}"; return 2; }; done
-        rm -rf "$fx" "$fximg"; mkdir -p "$fx/GA10B" "$fx/GA10BBAD"
+        rm -rf "$fx" "$fximg"; mkdir -p "$fx/GA10B" "$fx/GA10BBAD" "$fx/GA10BSS" "$fx/GA10BSSBAD"
         yes 'UNAOS GA10B5 SYNTHETIC text section (not a vendor byte)'     | head -c 28672 > "$fx/GA10B/acr-gsp.text.encrypt.bin.prod"
         yes 'UNAOS GA10B5 SYNTHETIC data section (not a vendor byte)'     | head -c 9472  > "$fx/GA10B/acr-gsp.data.encrypt.bin.prod"
         yes 'UNAOS GA10B5 SYNTHETIC manifest section (not a vendor byte)' | head -c 2048  > "$fx/GA10B/acr-gsp.manifest.encrypt.bin.out.bin.prod"
         cp "$fx/GA10B/"* "$fx/GA10BBAD/"
         printf 'X' | dd of="$fx/GA10BBAD/acr-gsp.data.encrypt.bin.prod" bs=1 seek=100 conv=notrunc status=none
+        # The SECOND TRIPLE (ledger A72): the same three bodies at `safety-scheduler`'s NAMES and SIZES, so
+        # the table `UNAOS_GA10B_PROBE5=3` swaps in is loaded and digest-refused on QEMU before any card.
+        yes 'UNAOS GA10B5 SYNTHETIC text section (not a vendor byte)'     | head -c 15104 > "$fx/GA10BSS/safety-scheduler.text.encrypt.bin.prod"
+        yes 'UNAOS GA10B5 SYNTHETIC data section (not a vendor byte)'     | head -c 3072  > "$fx/GA10BSS/safety-scheduler.data.encrypt.bin.prod"
+        yes 'UNAOS GA10B5 SYNTHETIC manifest section (not a vendor byte)' | head -c 2048  > "$fx/GA10BSS/safety-scheduler.manifest.encrypt.bin.out.bin.prod"
+        cp "$fx/GA10BSS/"* "$fx/GA10BSSBAD/"
+        printf 'X' | dd of="$fx/GA10BSSBAD/safety-scheduler.data.encrypt.bin.prod" bs=1 seek=100 conv=notrunc status=none
         truncate -s $((64 * 1024 * 1024)) "$fximg"
         mkfs.vfat -F 32 -s 1 -n UNAOS "$fximg" >/dev/null
-        mcopy -s -b -o -Q -i "$fximg" "$fx/GA10B" "$fx/GA10BBAD" "::/"
+        mcopy -s -b -o -Q -i "$fximg" "$fx/GA10B" "$fx/GA10BBAD" "$fx/GA10BSS" "$fx/GA10BSSBAD" "::/"
         STICK_IMG="$fximg"
-        echo -e "${COLOR_YELLOW}⚡ GA10B-PROBE5 fixture stick: ${fximg} (GA10B/ + GA10BBAD/, synthetic triple, sha256s below)${COLOR_RESET}"
-        (cd "$fx" && sha256sum GA10B/* GA10BBAD/*)
+        echo -e "${COLOR_YELLOW}⚡ GA10B-PROBE5 fixture stick: ${fximg} (GA10B/ + GA10BBAD/ + GA10BSS/ + GA10BSSBAD/, two synthetic triples, sha256s below)${COLOR_RESET}"
+        (cd "$fx" && sha256sum GA10B/* GA10BBAD/* GA10BSS/* GA10BSSBAD/*)
     fi
 
     local logf="${WORKSPACE_DIR}/target/serial-arm.log"
@@ -4424,6 +4441,16 @@ KERNEL_CFG_MATRIX=(
   # GA10B-PROBE5D armed (same arc) — the `=1d` polarity: 5a's loader at boot, the ignition armed for the
   # shutdown path (`ga10bprobe5_deferred_run`, statics, the DTB + window re-verify). IMPLIES `ga10bprobe5a`.
   "arm-tegra-ga10bprobe5d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5d"
+  # GA10B-PROBE5S armed (orin-0912b, 2026-09-13; ledger A72) — the `=3` polarity: rung 5a with the SECOND
+  # TRIPLE (`safety-scheduler`) as the payload. IMPLIES `ga10bprobe5a`. This leg is what proves the arm is
+  # COMPILED and not merely knobbed: `ga10bprobe5s` selects a different `Expect` table, so a build that
+  # type-checks here cannot be the acr-gsp rung wearing a new label.
+  "arm-tegra-ga10bprobe5s ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5s"
+  # GA10B-PROBE5M armed (same arc; ledger A73) — the `=4` polarity: rung 5a with the §4.1.2 mapping
+  # SWAPPED (`MAP = [1,0,2]`). IMPLIES `ga10bprobe5a`. The `const fn inv` that derives `FILE_ROLE` from
+  # `MAP` is evaluated at compile time in BOTH polarities, so a mapping that does not invert is a build
+  # error here rather than a mislabelled line on the wire.
+  "arm-tegra-ga10bprobe5m ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5m"
 
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of

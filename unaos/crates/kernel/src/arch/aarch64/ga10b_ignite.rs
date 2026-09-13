@@ -39,8 +39,14 @@
 //! metal-proven by rung 3b — the same provenance rung 4c states for the same list.
 //!
 //! WHAT IT NEVER DOES (brief §5.5): no copy, blit, triangle or pixel; no WPR / MC GSC / carveout register;
-//! no PMU ignition, no FECS/GPCCS, no second triple; nothing decrypts, inspects, patches or renames a
-//! vendor byte. It spends the power cycle by design and does not claim the board is left as found.
+//! no PMU ignition, no FECS/GPCCS; nothing decrypts, inspects, patches or renames a vendor byte. It spends
+//! the power cycle by design and does not claim the board is left as found.
+//!
+//! THE TWO ONE-DELTA ARMS (ledger A72/A73), each the flown render15-5a rung with EXACTLY ONE value changed,
+//! because the BCR lock makes a boot ONE ignition and a boot that varies two things attributes nothing:
+//!   `=3` `ga10bprobe5s` — the PAYLOAD: the `safety-scheduler` triple in place of `acr-gsp`, same mapping.
+//!   `=4` `ga10bprobe5m` — the MAPPING (§4.1.2): `fmccode <- …data…`, `fmcdata <- …text…`, same payload.
+//! Both print `triple=` and `map=` on the ARMED banner, on every placement line and on the verdict.
 //!
 //! WITNESS FAMILY `[ga10bprobe5a]` — 15 bytes bracketed; `LC_ALL=C grep -a -o -F` certifies the artifact.
 
@@ -48,9 +54,70 @@ use super::ga10b_probe::{
     bcr_write_verify, clk, finish4, pg_state, r32, resolve_gpu_node, settle_ms, unreadable_reason, w32_4,
     BCR_ADDR_REGS,
 };
-use super::ga10b_fw::{self, Outcome, Placed, ACR_GSP, ROLE};
+use super::ga10b_fw::{self, Outcome, Placed, ROLE};
 
 const FAM: &str = "ga10bprobe5a";
+
+// ── The two ONE-DELTA arms of rung 5a (ledger A72/A73; rung-5 brief §4.1.2 + §8) ───────────────────────
+// render15-5a flew `acr-gsp` under the §4.1.2 mapping and the ROM answered 0x00000002. Each arm below
+// changes EXACTLY ONE thing from that flight, so a FAIL attributes: `ga10bprobe5s` changes the PAYLOAD
+// (the second triple), `ga10bprobe5m` changes the MAPPING (which file goes to which register). They are
+// never combined by the knob — one boot, one delta — because the BCR's lock makes a boot ONE ignition.
+
+/// The triple this build loads and ignites. Default `acr-gsp` (the flown payload); `ga10bprobe5s` swaps
+/// in `safety-scheduler`, the second FMC-shaped triple in the same vendor directory (A61, brief §4.1.2
+/// fact 3). Nothing else about the rung changes: same window, same placements arithmetic, same writes.
+#[cfg(not(feature = "ga10bprobe5s"))]
+const TRIPLE: &[ga10b_fw::Expect; 3] = &ga10b_fw::ACR_GSP;
+#[cfg(feature = "ga10bprobe5s")]
+const TRIPLE: &[ga10b_fw::Expect; 3] = &ga10b_fw::SAFETY_SCHED;
+#[cfg(not(feature = "ga10bprobe5s"))]
+const TRIPLE_NAME: &str = "acr-gsp";
+#[cfg(feature = "ga10bprobe5s")]
+const TRIPLE_NAME: &str = "safety-scheduler";
+/// The directory the three files are read from — `GA10B/` for either triple (both live in the same
+/// staged directory on the card; the FILES differ, the path does not).
+const IMAGE_DIR: &str = "/boot/GA10B";
+
+/// THE §4.1.2 MAPPING, as data. `MAP[r]` is the index of the FILE bound to BCR register role `r`
+/// (`ROLE[r]`): canonical `[0,1,2]` is text→fmccode, data→fmcdata, manifest→pkcparam — the inference
+/// render15-5a flew. `ga10bprobe5m` is the ONLY alternative worth a boot: `[1,0,2]`, text and data
+/// exchanged. The manifest is not permuted — it is 2,048 B in BOTH vendor triples, the size of a PKC
+/// signature blob and of nothing else here, so `pkcparam <- …manifest…` is the one leg of the mapping
+/// that is not a guess.
+#[cfg(not(feature = "ga10bprobe5m"))]
+const MAP: [usize; 3] = [0, 1, 2];
+#[cfg(feature = "ga10bprobe5m")]
+const MAP: [usize; 3] = [1, 0, 2];
+#[cfg(not(feature = "ga10bprobe5m"))]
+const MAP_NAME: &str = "canonical";
+#[cfg(feature = "ga10bprobe5m")]
+const MAP_NAME: &str = "swapped";
+/// `FILE_ROLE[i]` — the register FILE `i` was written to, the inverse of `MAP`. Used wherever a line is
+/// per-FILE (the loader's `role=`, the window scans) so no label ever names a register the file did not go
+/// to. `MAP` is its own inverse for both values above, but this is derived, never assumed.
+const FILE_ROLE: [&str; 3] = [ROLE[inv(0)], ROLE[inv(1)], ROLE[inv(2)]];
+const fn inv(file: usize) -> usize {
+    if MAP[0] == file {
+        0
+    } else if MAP[1] == file {
+        1
+    } else {
+        2
+    }
+}
+
+/// The knob value this build answers to, for the wire — `3` and `4` take precedence because they are
+/// their own one-delta arms and never combine with the others.
+fn knob_digit() -> &'static str {
+    if cfg!(feature = "ga10bprobe5s") {
+        "3"
+    } else if cfg!(feature = "ga10bprobe5m") {
+        "4"
+    } else {
+        KNOB_DIGIT
+    }
+}
 
 // ── Facts (ga10b-probe-rung1.facts.md §(b); the same numbers rung 3/4 read on this die) ────────────────
 const GSP_FALCON_BASE: u64 = 0x0011_0000;
@@ -140,14 +207,14 @@ fn enc(pa: u64) -> (u32, u32) {
 
 /// The six address VALUES for the three placements, in BCR_ADDR_REGS order (fmccode lo/hi, fmcdata lo/hi,
 /// pkcparam lo/hi), and the raw address behind each (for the announce).
+/// `MAP` decides WHICH placed section each register pair gets (§4.1.2): `placed[MAP[r]]` is the file bound
+/// to `ROLE[r]`, so the mapping arm is a permutation of the six values and of nothing else.
 fn addr_values(placed: &[Placed; 3]) -> ([u32; 6], [u64; 6]) {
-    let (fcl, fch) = enc(placed[0].pa);
-    let (fdl, fdh) = enc(placed[1].pa);
-    let (pkl, pkh) = enc(placed[2].pa);
-    (
-        [fcl, fch, fdl, fdh, pkl, pkh],
-        [placed[0].pa, placed[0].pa, placed[1].pa, placed[1].pa, placed[2].pa, placed[2].pa],
-    )
+    let (c, d, p) = (placed[MAP[0]].pa, placed[MAP[1]].pa, placed[MAP[2]].pa);
+    let (fcl, fch) = enc(c);
+    let (fdl, fdh) = enc(d);
+    let (pkl, pkh) = enc(p);
+    ([fcl, fch, fdl, fdh, pkl, pkh], [c, c, d, d, p, p])
 }
 
 /// An announced address write + readback carrying the RAW address and the encoding beside the value
@@ -348,7 +415,7 @@ const KNOB_SUFFIX: &str = "d";
 /// RETURNS on every zero-MMIO refusal; an ignition path ends in SYSTEM_OFF.
 #[allow(unreachable_code)]
 pub fn ga10bprobe5_run(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
-    serial_println!("[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5={}{}) — the VENDOR IGNITION: rung 4b's seven writes with ONLY THE PAYLOAD changed. Order: zero-MMIO phase (window, pattern, the three vendor files read from /boot/GA10B/ through the VFS, sized, placed 256-aligned, digested in the window — any refusal RETURNS with zero MMIO) -> rung 4a's bracket and BCR census re-proven -> rung 4c's pre-ignition census -> addresses at the three placements (form={} shift={}) -> bcr_dmacfg noncoherent|lock (SPENDS THE POWER CYCLE) -> bcr_ctrl 0x111 -> priscv_cpuctl startcpu -> bounded br_retcode poll -> the oracles -> verdict -> SYSTEM_OFF. Verdict vocabulary: ACR-ACCEPTED | BROM-VERDICT-FAIL code=<retcode> | BROM-VERDICT-PASS-UNWITNESSED code=<retcode> | BROM-NOVERDICT | IGNITION-SKIPPED reason=<bcr-not-allheld|bcr-addr-refused> | BCR-CTRL-REFUSED | REFUSED reason=<image-absent|image-size|image-digest|image-window|image-unaligned|no-dma-window|no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable>. F21 warning: a fabric RAS from a real image whose DMA reach we do not bound may need a manual power cut", KNOB_DIGIT, KNOB_SUFFIX, ADDR_FORM, ADDR_SHIFT);
+    serial_println!("[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5={}{}) triple={} map={} — the VENDOR IGNITION: rung 4b's seven writes with ONLY THE PAYLOAD changed. ONE DELTA FROM render15-5a: triple=acr-gsp map=canonical is the flown configuration; triple=safety-scheduler is the SECOND TRIPLE arm (A72) and map=swapped is the MAPPING arm (A73, fmccode<-…data…, fmcdata<-…text…). The BCR lock makes a boot ONE ignition, so the two arms never share a power cycle. Order: zero-MMIO phase (window, pattern, the three vendor files read from /boot/GA10B/ through the VFS, sized, placed 256-aligned, digested in the window — any refusal RETURNS with zero MMIO) -> rung 4a's bracket and BCR census re-proven -> rung 4c's pre-ignition census -> addresses at the three placements (form={} shift={}) -> bcr_dmacfg noncoherent|lock (SPENDS THE POWER CYCLE) -> bcr_ctrl 0x111 -> priscv_cpuctl startcpu -> bounded br_retcode poll -> the oracles -> verdict -> SYSTEM_OFF. Verdict vocabulary: ACR-ACCEPTED | BROM-VERDICT-FAIL code=<retcode> | BROM-VERDICT-PASS-UNWITNESSED code=<retcode> | BROM-NOVERDICT | IGNITION-SKIPPED reason=<bcr-not-allheld|bcr-addr-refused> | BCR-CTRL-REFUSED | REFUSED reason=<image-absent|image-size|image-digest|image-window|image-unaligned|no-dma-window|no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable>. F21 warning: a fabric RAS from a real image whose DMA reach we do not bound may need a manual power cut", knob_digit(), KNOB_SUFFIX, TRIPLE_NAME, MAP_NAME, ADDR_FORM, ADDR_SHIFT);
     serial_println!("[ga10bprobe5a] addr_encoding={} shift={} from={} (P5x: rung 4e, UNAOS_GA10B_PROBE4=5, is the flight that settles the encoding; until its verdict is in docs/dev/evidence/ this build carries the form its knob value named and says so here)", ADDR_FORM, ADDR_SHIFT, if ADDR_SHIFT == 8 { "unflown(4e; rung-5 brief §1.2 Hopper MIT source)" } else { "flown(4b raw; A51/A55)" });
     let Some(ld) = phase0_load() else { return; };
     #[cfg(feature = "ga10bprobe5d")]
@@ -381,9 +448,9 @@ fn phase0_load() -> Option<Loaded5> {
     }
     serial_println!("[ga10bprobe5a] dmabuf_pa={:#010x} dmabuf_size={:#x} dmabuf_pattern={:#010x} filled {} KiB, dsb sy (this kernel's OWN block, Normal-NC, below 4 GiB; the unwritten tail stays the pattern)", wb, ws, DMABUF_PATTERN, ws >> 10);
     let mt = crate::shell::vfs_mount_table();
-    let placed = match ga10b_fw::load(&mt, "/boot/GA10B", &ACR_GSP, wb, ws) {
+    let placed = match ga10b_fw::load(&mt, IMAGE_DIR, TRIPLE, &FILE_ROLE, wb, ws) {
         Outcome::Loaded { placed, total, window, end } => {
-            serial_println!("[ga10bprobe5a] image loaded: total={} window={:#x}..{:#x} image_sections=3 image_digests_ok=3", total, window, end);
+            serial_println!("[ga10bprobe5a] image loaded: triple={} map={} total={} window={:#x}..{:#x} image_sections=3 image_digests_ok=3", TRIPLE_NAME, MAP_NAME, total, window, end);
             placed
         }
         Outcome::Refused { reason, name } => {
@@ -394,9 +461,12 @@ fn phase0_load() -> Option<Loaded5> {
     // P7 — the placements, one line per section, with the register value each becomes.
     let (vals, _raws) = addr_values(&placed);
     let mut unaligned = false;
-    for i in 0..3 {
-        let p = &placed[i];
-        serial_println!("[ga10bprobe5a] section={} file={} size={} off={:#x} pa={:#010x} reg_lo={:#010x} reg_hi={:#010x} form={} aligned256={}", ROLE[i], ACR_GSP[i].name, p.size, p.off, p.pa, vals[2 * i], vals[2 * i + 1], ADDR_FORM, (p.pa & 0xff == 0) as u32);
+    // One line per BCR REGISTER (not per file): which file this register was pointed at, where it sits and
+    // what the register value becomes. Under `map=swapped` the file column is what moves, and it is visible.
+    for r in 0..3 {
+        let f = MAP[r];
+        let p = &placed[f];
+        serial_println!("[ga10bprobe5a] section={} file={} triple={} map={} size={} off={:#x} pa={:#010x} reg_lo={:#010x} reg_hi={:#010x} form={} aligned256={}", ROLE[r], TRIPLE[f].name, TRIPLE_NAME, MAP_NAME, p.size, p.off, p.pa, vals[2 * r], vals[2 * r + 1], ADDR_FORM, (p.pa & 0xff == 0) as u32);
         if p.pa & 0xff != 0 { unaligned = true; }
     }
     if unaligned {
@@ -414,7 +484,7 @@ fn ignite(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     let (vals, raws) = addr_values(&placed);
     let pre_words = [words4(placed[0].pa), words4(placed[1].pa), words4(placed[2].pa)];
     for i in 0..3 {
-        serial_println!("[ga10bprobe5a] pre-ignition dmabuf {} @{:#x} = {:#010x} {:#010x} {:#010x} {:#010x} (first 4 words of the placed section, CPU side)", ROLE[i], placed[i].pa, pre_words[i][0], pre_words[i][1], pre_words[i][2], pre_words[i][3]);
+        serial_println!("[ga10bprobe5a] pre-ignition dmabuf {} @{:#x} = {:#010x} {:#010x} {:#010x} {:#010x} (first 4 words of the placed section, CPU side)", FILE_ROLE[i], placed[i].pa, pre_words[i][0], pre_words[i][1], pre_words[i][2], pre_words[i][3]);
     }
 
     // ── 1. P0 — the bracket (rung 4a's, in this family) ───────────────────────────────────────────────
@@ -728,12 +798,12 @@ fn ignite(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     let mut sections_intact = 0u32;
     for i in 0..3 {
         let p = &placed[i];
-        serial_println!("[ga10bprobe5a] about-to-read post-ignition dmabuf {} pa={:#x} size={} (a CPU read of this kernel's OWN Normal-NC window — DRAM the descriptor pointed at, not a GPU register) — if this is the LAST line, THAT read was fatal", ROLE[i], p.pa, p.size);
+        serial_println!("[ga10bprobe5a] about-to-read post-ignition dmabuf {} pa={:#x} size={} (a CPU read of this kernel's OWN Normal-NC window — DRAM the descriptor pointed at, not a GPU register) — if this is the LAST line, THAT read was fatal", FILE_ROLE[i], p.pa, p.size);
         let w = words4(p.pa);
         let d = digest_at(p);
-        let intact = d == ACR_GSP[i].sha;
+        let intact = d == TRIPLE[i].sha;
         if intact { sections_intact += 1; }
-        serial_println!("[ga10bprobe5a] post-ignition dmabuf {} @{:#x} = {:#010x} {:#010x} {:#010x} {:#010x} words_changed_first4={} sha256_intact={} (pre: {:#010x} {:#010x} {:#010x} {:#010x})", ROLE[i], p.pa, w[0], w[1], w[2], w[3], (0..4).filter(|k| w[*k] != pre_words[i][*k]).count(), intact as u32, pre_words[i][0], pre_words[i][1], pre_words[i][2], pre_words[i][3]);
+        serial_println!("[ga10bprobe5a] post-ignition dmabuf {} @{:#x} = {:#010x} {:#010x} {:#010x} {:#010x} words_changed_first4={} sha256_intact={} (pre: {:#010x} {:#010x} {:#010x} {:#010x})", FILE_ROLE[i], p.pa, w[0], w[1], w[2], w[3], (0..4).filter(|k| w[*k] != pre_words[i][*k]).count(), intact as u32, pre_words[i][0], pre_words[i][1], pre_words[i][2], pre_words[i][3]);
     }
     // The tail beyond the image must still be the pattern.
     let tail_lo = placed[2].pa + ((placed[2].size as u64 + 255) & !255);
@@ -760,10 +830,10 @@ fn ignite(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     } else {
         "BROM-NOVERDICT"
     };
-    serial_println!("[ga10bprobe5a] verdict br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} halted={} oracles_agree={} form={} shift={} image_sections=3 image_digests_ok=3 -> {} code={:#010x}", retcode, result, samples, BR_POLL_SAMPLES, lock_latched, lockdown, v1r, halted, oracles_agree, ADDR_FORM, ADDR_SHIFT, verdict, retcode);
+    serial_println!("[ga10bprobe5a] verdict br_retcode={:#010x} br_result={:#x} samples={}/{} lock_latched={} post_lockdown={} v1_readable={} halted={} oracles_agree={} form={} shift={} triple={} map={} image_sections=3 image_digests_ok=3 -> {} code={:#010x}", retcode, result, samples, BR_POLL_SAMPLES, lock_latched, lockdown, v1r, halted, oracles_agree, ADDR_FORM, ADDR_SHIFT, TRIPLE_NAME, MAP_NAME, verdict, retcode);
     match verdict {
         "ACR-ACCEPTED" => serial_println!("[ga10bprobe5a] THE ROM ACCEPTED NVIDIA'S IMAGE: a GPU-side observable moved that no unsigned payload ever moved (lockdown={}, v1_readable={}). The signature wall is behind the ladder; what runs now is the ACR/FMC, and rung 5b's oracles (if armed) say what it did next", lockdown, v1r),
-        "BROM-VERDICT-FAIL" => serial_println!("[ga10bprobe5a] F19: a real signed image, digests verified in the window, addresses form={}, and the ROM still says FAIL. Do not iterate images this session: record the identity, then decide between the other address form, the second triple (safety-scheduler) and the mapping inference (§4.1.2) — one boot each", ADDR_FORM),
+        "BROM-VERDICT-FAIL" => serial_println!("[ga10bprobe5a] F19: a real signed image (triple={} map={}), digests verified in the window, addresses form={}, and the ROM still says FAIL. Do not iterate images this session: record the identity. The OTHER ADDRESS FORM is not a candidate — rung 4e measured raw and pa>>8 IDENTICAL. What is left is the arm this build is NOT: triple=safety-scheduler (UNAOS_GA10B_PROBE5=3) and map=swapped (=4), ONE BOOT EACH — and if both also FAIL the door is not opening by this route and the ladder reports rather than iterates", TRIPLE_NAME, MAP_NAME, ADDR_FORM),
         "BROM-VERDICT-PASS-UNWITNESSED" => serial_println!("[ga10bprobe5a] F20: the code says PASS and neither oracle moved — a measurement error until re-flown from a cold boot; build nothing on it this session"),
         _ => serial_println!("[ga10bprobe5a] no verdict in {} samples: halted={} — halted=1 means the core never started or halted again; halted=0 means it is RUNNING and the poll was short (F5)", BR_POLL_SAMPLES, halted),
     }
@@ -827,7 +897,7 @@ fn arm_deferred5(ld: &Loaded5, dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
         DEF5_PA[i].store(ld.placed[i].pa, Ordering::Relaxed);
     }
     DEF5_ARMED.store(true, Ordering::SeqCst);
-    serial_println!("[ga10bprobe5d] DEFERRED ARM (UNAOS_GA10B_PROBE5={}d): the image is IN the window (dmabuf_pa={:#010x} fmccode={:#x} fmcdata={:#x} pkcparam={:#x}, digests verified, nothing spent) and rung 5a's ignition is ARMED for the shutdown path — the boot continues into the desktop. It runs when a PSCI SYSTEM_OFF is requested (shell shutdown/off, crystal Shut Down) IF power::psci_call carries the ga10bprobe5d hook; the DTB checksum ({:#010x}) and the three sections are re-verified first. F5d-0: a plain SYSTEM_OFF with no [ga10bprobe5d] DEFERRED RUN line means the hook is not folded", KNOB_DIGIT, ld.wb, ld.placed[0].pa, ld.placed[1].pa, ld.placed[2].pa, sum);
+    serial_println!("[ga10bprobe5d] DEFERRED ARM (UNAOS_GA10B_PROBE5={}d): the image is IN the window (triple={} map={} dmabuf_pa={:#010x} fmccode={:#x} fmcdata={:#x} pkcparam={:#x}, digests verified, nothing spent) and rung 5a's ignition is ARMED for the shutdown path — the boot continues into the desktop. It runs when a PSCI SYSTEM_OFF is requested (shell shutdown/off, crystal Shut Down) IF power::psci_call carries the ga10bprobe5d hook; the DTB checksum ({:#010x}) and the three sections are re-verified first. F5d-0: a plain SYSTEM_OFF with no [ga10bprobe5d] DEFERRED RUN line means the hook is not folded", knob_digit(), TRIPLE_NAME, MAP_NAME, ld.wb, ld.placed[MAP[0]].pa, ld.placed[MAP[1]].pa, ld.placed[MAP[2]].pa, sum);
 }
 
 /// The deferred run. Called by `power::psci_call` on every PSCI SYSTEM_OFF request (once the hook is
@@ -859,11 +929,11 @@ pub fn ga10bprobe5_deferred_run() {
     let mut intact = 0u32;
     for i in 0..3 {
         let pa = DEF5_PA[i].load(Ordering::Relaxed);
-        placed[i] = Placed { off: pa.wrapping_sub(wb), pa, size: ACR_GSP[i].size };
+        placed[i] = Placed { off: pa.wrapping_sub(wb), pa, size: TRIPLE[i].size };
         let d = digest_at(&placed[i]);
-        let ok = d == ACR_GSP[i].sha;
+        let ok = d == TRIPLE[i].sha;
         if ok { intact += 1; }
-        serial_println!("[ga10bprobe5d] window re-verify section={} pa={:#010x} size={} sha256={} (a CPU read of this kernel's OWN window, not a register)", ROLE[i], pa, placed[i].size, if ok { "match" } else { "MISMATCH" });
+        serial_println!("[ga10bprobe5d] window re-verify section={} pa={:#010x} size={} sha256={} (a CPU read of this kernel's OWN window, not a register)", FILE_ROLE[i], pa, placed[i].size, if ok { "match" } else { "MISMATCH" });
     }
     if intact != 3 || wb == 0 || ws == 0 {
         serial_println!("[ga10bprobe5d] -> REFUSED reason=image-digest-at-shutdown intact={}/3 window={:#x}..{:#x} — something wrote the window during the session (or it was never seated); zero MMIO; falling through to SYSTEM_OFF", intact, wb, wb + ws);

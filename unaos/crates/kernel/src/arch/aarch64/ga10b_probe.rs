@@ -1642,6 +1642,16 @@ fn rung4b(base: u64, f2: u64, dmabuf_pa: u64, allheld: bool, ctrl_baseline: u32)
     let a = f2 + PRISCV_CPUCTL_OFF;
     serial_println!("[ga10bprobe4b] about-to-WRITE priscv_cpuctl reg={:#x} val={:#010x} (startcpu_true) — THE IGNITION. if this is the LAST line, THAT WRITE was fatal and the boot ended inside it", a, PRISCV_CPUCTL_STARTCPU);
     ignite_w32(a, PRISCV_CPUCTL_STARTCPU);
+    // ANNOUNCE-BEFORE-WRITE, CLOSED (orin-0912b 2026-09-13, ledger A74). This write — the IGNITION, the
+    // most important write in the ladder — was the ONE announce in the rung-4 family with NO result line,
+    // so `write_announces == write_results` could never balance on a 4a/4b/4e/4f capture; the scorer's own
+    // unbounded `wrote=0x` counter was picking up an unrelated `:: tegra: JB6` line and the two errors
+    // cancelled, which is why three flown captures read 23/23 and only the 37-write 5a capture showed it.
+    // Rung 5a already prints this line (`ga10b_ignite.rs`; flown on render15-5a reading `0x00000080`), so
+    // the read is metal-proven on this die rather than new. STARTCPU is write-only: the readback is the
+    // immediate POST-state, not a readback, and the line says so.
+    let c0 = r32(a);
+    serial_println!("[ga10bprobe4b] priscv_cpuctl @{:#x} wrote={:#010x} read={:#010x} (STARTCPU is write-only: the read is the immediate post-state, not a readback)", PRISCV_CPUCTL_OFF, PRISCV_CPUCTL_STARTCPU, c0);
     // B5 — the bounded poll, every sample printed with its index.
     let rc = f2 + PRISCV_BR_RETCODE_OFF;
     let mut retcode: u32 = 0;

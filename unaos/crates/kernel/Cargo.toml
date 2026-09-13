@@ -2406,6 +2406,29 @@ ga10bprobe5b = ["ga10bprobe5a"]
 # `arm-tegra-ga10bprobe5d` leg. Witness family: `[ga10bprobe5d]`.
 ga10bprobe5d = ["ga10bprobe5a"]
 
+# GA10B-PROBE5S (`UNAOS_GA10B_PROBE5=3`, `3d` deferred): RUNG 5a, THE SECOND TRIPLE — ledger A72, rung-5
+# brief §4.1.2 fact 3 and §8. render15-5a proved the ROM refuses NVIDIA's own genuine, digest-verified
+# `acr-gsp` triple with the same `br_retcode=0x00000002` it returns to our blob-free image, so the payload
+# is not what it is rejecting; `safety-scheduler.{text,data,manifest}` is the OTHER FMC-shaped triple in
+# the same r36.4.3 directory, named by A61 and tried by nobody (R19: named, not ruled out). IMPLIES
+# `ga10bprobe5a`; changes ONE thing — the `Expect` table (`ga10b_fw::SAFETY_SCHED`, 15,104 + 3,072 + 2,048
+# B, `window_need` 0x4f00) — and tags the banner, every placement line and the verdict
+# `triple=safety-scheduler`. NEVER combined with `ga10bprobe5m` by the knob: the BCR lock makes a boot ONE
+# ignition, so an arm that varied two things could not attribute its own FAIL. Default OFF. ARMED polarity
+# type-checked by the `arm-tegra-ga10bprobe5s` leg. Witness family: `[ga10bprobe5a]` (a tag, not a family).
+ga10bprobe5s = ["ga10bprobe5a"]
+
+# GA10B-PROBE5M (`UNAOS_GA10B_PROBE5=4`, `4d` deferred): RUNG 5a, THE MAPPING ARM — ledger A73, rung-5
+# brief §4.1.2. That `…text…`/`…data…`/`…manifest…` map onto `fmccode`/`fmcdata`/`pkcparam` IN THAT ORDER
+# is the load-bearing INFERENCE of the whole rung-5 design and nothing on this die has confirmed it. This
+# arm flies its only alternative: `MAP = [1,0,2]`, i.e. `fmccode <- …data…` and `fmcdata <- …text…`. The
+# manifest leg is NOT permuted — 2,048 B in both vendor triples is the size of a PKC signature blob and of
+# nothing else in the directory, so `pkcparam <- …manifest…` is the one leg that is not a guess. IMPLIES
+# `ga10bprobe5a`; changes ONE thing (which placement each BCR register pair is pointed at) and tags every
+# line `map=swapped`. NEVER combined with `ga10bprobe5s` by the knob, for the same one-delta reason.
+# Default OFF. ARMED polarity type-checked by the `arm-tegra-ga10bprobe5m` leg. Witness: `[ga10bprobe5a]`.
+ga10bprobe5m = ["ga10bprobe5a"]
+
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +
 # per-file SHA-256 verify -> stage-beside + read-back verify -> ordered flip (matched-pair rule:

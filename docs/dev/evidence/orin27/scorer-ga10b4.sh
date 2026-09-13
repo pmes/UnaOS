@@ -29,16 +29,39 @@
 # (exit 1), not NO VERDICT: the two flown rung-4 captures are the leg's standing control and must score red.
 # The selftest gains the 5a cases (expected wire -> 0; FAIL verdict, LOADED missing, a truncated
 # about-to-WRITE -> 1; the real 4a+4b capture -> 1). The STOP check now reads all three families.
+# orin-0912b (2026-09-13, ledger A74): THE ANNOUNCE/RESULT COUNTERS WERE MISCOUNTING, on both sides.
+#   (1) `write_announces` / `read_announces` / `write_results` matched the WHOLE capture, not the GA10B
+#       families, and every full Orin boot carries one `:: tegra: JB6 - CSB page-sel 0x9c: ... wrote=0x1234
+#       ...` line from XUSB bring-up. It inflated `write_results` by exactly 1 in ALL FOUR flown captures.
+#   (2) rung 4b's IGNITION write (`priscv_cpuctl` startcpu) printed an announce and NO result line — the
+#       one unanswered announce in the family, and the single most important write in the ladder.
+#   The two cancelled: render13-boot2, render14-boot3 and render15-4f all read a false 23/23, and the
+#   defect only surfaced on the 37-write 5a capture as 37 against 38. Both sides are fixed — the counters
+#   are bound to the families (`famcnt`), and `ga10b_probe.rs` now prints the 4b result line the way rung
+#   5a always did — and the bare total is backed by a PAIRING WALK that NAMES the unpaired announce. The
+#   selftest gains four cases from real files (p1-p4, 31 in all): the pre-fix capture reds and names
+#   `priscv_cpuctl`; the post-fix wire is green; a second foreign `wrote=0x` does not move it; a deleted
+#   in-family result reds and names its register.
 set -u
 if [ "${1:-}" = "--selftest" ]; then
   REAL="${2:-}"; SCR="${3:-$HOME/unaos-bench/scratch/orin27/ga10b4c-logs/scorer-selftest}"
   [ -s "$REAL" ] || { echo "NO VERDICT: --selftest needs the real 4a+4b capture"; exit 2; }
   mkdir -p "$SCR"; export LC_ALL=C
   ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  # ── REALF: the real capture as a POST-FIX build prints it (orin-0912b 2026-09-13, ledger A74) ────────
+  # The three flown rung-4 captures were taken by a build whose 4b ignition write printed an announce and
+  # NO result line. That emitter is fixed (`ga10b_probe.rs`, the `priscv_cpuctl` readback rung 5a already
+  # printed on metal as `read=0x00000080`), so every DERIVED fixture below — which stands for "what this
+  # build would print" — is built from REALF, not from REAL. REAL itself stays, un-fixed, as the standing
+  # RED control for the pairing walk: a capture with an unanswered announce must not score green.
+  REALF="$SCR/real-postfix.log"
+  awk '{ print
+         if (index($0,"[ga10bprobe4b] about-to-WRITE priscv_cpuctl "))
+           print "[ga10bprobe4b] priscv_cpuctl @0x388 wrote=0x00000001 read=0x00000080 (STARTCPU is write-only: the read is the immediate post-state, not a readback)" }' "$REAL" > "$REALF"
   # The expected 4c wire (brief §10 shape), one line per announce/result pair, spliced BEFORE the
   # [pwrshutoff] lines of the real capture so the SYSTEM_OFF stays last — exactly where 4c prints on metal.
   W="$SCR/expected-4c.log"
-  awk 'index($0,"[pwrshutoff]")==0' "$REAL" > "$W"
+  awk 'index($0,"[pwrshutoff]")==0' "$REALF" > "$W"
   {
     echo "[ga10bprobe4c] pass 1 — PRE-ignition census of 30 registers (after 4a's restore, before 4b; read-only)"
     echo "[ga10bprobe4c] about-to-read pre-ignition fuse_opt_sec_debug_en reg=0x17821040 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it"
@@ -61,7 +84,7 @@ if [ "${1:-}" = "--selftest" ]; then
     echo "[ga10bprobe4c] post-ignition dmabuf-scan @0x80200000 = words_changed=0/524288 first_changed_off=none -> DMABUF-UNTOUCHED"
     echo "[ga10bprobe4c] rung 4c complete: reads_announced=6 reads_answered=6 (zero writes) -> CENSUS-COMPLETE"
   } >> "$W"
-  awk 'index($0,"[pwrshutoff]")' "$REAL" >> "$W"
+  awk 'index($0,"[pwrshutoff]")' "$REALF" >> "$W"
   # Mutations: (m1) an announced read with no result line; (m2) the SYSTEM_OFF never reached; (m3) the
   # capture truncated at a 4c announce (F1 hang); (m4) the CENSUS-COMPLETE line missing.
   awk 'index($0,"[ga10bprobe4c] post-ignition gsp_falcon_cpuctl_v1 @0x110100")==0' "$W" > "$SCR/m1-no-result.log"
@@ -98,7 +121,7 @@ if [ "${1:-}" = "--selftest" ]; then
       print L
     }' "$2"
   }
-  mk4e "[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — fixture wire: the flown =2 capture with the six BCR DMA addresses re-encoded pa >> 8 and the 4a/4b summary lines tagged shift=8" "$REAL" > "$E4E"
+  mk4e "[ga10bprobe4e] rung 4e ARMED (UNAOS_GA10B_PROBE4=5) — fixture wire: the flown =2 capture with the six BCR DMA addresses re-encoded pa >> 8 and the 4a/4b summary lines tagged shift=8" "$REALF" > "$E4E"
   awk -v BAN="[ga10bprobe4f] rung 4f ARMED (UNAOS_GA10B_PROBE4=6) — fixture wire: the flown =2 capture with bcr_ctrl written 0x00000011 and the 4a/4b summary lines tagged brfetch=false" '
     BEGIN{ ban=0 }
     {
@@ -109,7 +132,7 @@ if [ "${1:-}" = "--selftest" ]; then
       if (index(L,"[ga10bprobe4a]") && index(L,"-> BCR-ALLHELD")) sub(/ lock_after=/, " brfetch=false lock_after=", L)
       if (index(L,"[ga10bprobe4b]") && index(L,"v1_readable=") && index(L,"samples=")) sub(/ -> /, " brfetch=false -> ", L)
       print L
-    }' "$REAL" > "$E4F"
+    }' "$REALF" > "$E4F"
   # (m5) the 4e wire with the 4b verdict's tag removed — the arm is not on the summary line;
   # (m6) the 4e wire with ONE written value off by one — the tag is there and the ARITHMETIC is wrong,
   #      which is the case a tag-only leg would pass and this one must not;
@@ -133,8 +156,8 @@ if [ "${1:-}" = "--selftest" ]; then
   # before the rung (it is what triggered it) and the SMC line to the very end (the OFF the rung
   # interrupted, taken after it returns). That ordering — route, rung, OFF — is the whole difference
   # between a `=7` wire and a `=5` one.
-  PWVERB="$(awk 'index($0,"[pwrshutoff]") && index($0,"via SMC")==0 { print; exit }' "$REAL")"
-  PWSMC="$(awk 'index($0,"[pwrshutoff]") && index($0,"via SMC") { print; exit }' "$REAL")"
+  PWVERB="$(awk 'index($0,"[pwrshutoff]") && index($0,"via SMC")==0 { print; exit }' "$REALF")"
+  PWSMC="$(awk 'index($0,"[pwrshutoff]") && index($0,"via SMC") { print; exit }' "$REALF")"
   awk -v ARM="[ga10bprobe4d] DEFERRED ARM (UNAOS_GA10B_PROBE4=4): rungs 4a+4b+4c are ARMED for the shutdown path and do NOT run now — the boot continues into the desktop (fixture wire: the =7 value arms this same deferral with rung 4e's encoding)" \
       -v VERB="$PWVERB" -v SMC="$PWSMC" \
       -v RUN="[ga10bprobe4d] DEFERRED RUN — triggered by a PSCI SYSTEM_OFF request reaching power::psci_call (the shutdown verb; the [pwrshutoff] or [crystal] line above names the route). Running 4a -> 4b -> 4c NOW, then the SYSTEM_OFF this interrupted" '
@@ -178,7 +201,7 @@ if [ "${1:-}" = "--selftest" ]; then
   # The expected 5a wire (rung-5 brief §5 as built): the loader's LOADED, the two address forms' announce shape,
   # one matched WRITE announce/result pair, the verdict; spliced before [pwrshutoff] like the 4c wire.
   W5="$SCR/expected-5a.log"
-  awk 'index($0,"[pwrshutoff]")==0' "$REAL" > "$W5"
+  awk 'index($0,"[pwrshutoff]")==0' "$REALF" > "$W5"
   {
     echo "[ga10bfw] file=acr-gsp.text.encrypt.bin.prod bytes=28672 sha=match pa=0x80200000 off=0x0 role=fmccode got=ceeae9ec72ef80f24c70473f9fff02588d1ab56a30d18b688469c331370ce12a"
     echo "[ga10bfw] -> LOADED total=40192 window=0x80200000..0x80209d00 sections=3 digests_ok=3 fmccode_off=0x0 fmcdata_off=0x7000 pkcparam_off=0x9500"
@@ -188,7 +211,7 @@ if [ "${1:-}" = "--selftest" ]; then
     echo "[ga10bprobe5a] post-ignition hwcfg2 lockdown=0 (raw=0x00000000) -> POSTLOCK-DROPPED"
     echo "[ga10bprobe5a] verdict br_retcode=0x00000003 br_result=0x3 samples=2/16 lock_latched=1 post_lockdown=0 v1_readable=1 halted=0 form=raw shift=0 image_sections=3 image_digests_ok=3 -> ACR-ACCEPTED code=0x00000003"
   } >> "$W5"
-  awk 'index($0,"[pwrshutoff]")' "$REAL" >> "$W5"
+  awk 'index($0,"[pwrshutoff]")' "$REALF" >> "$W5"
   # Mutations: (m5) the ROM says FAIL; (m6) the loader never LOADED; (m7) the capture truncated at a 5a WRITE announce.
   sed 's/-> ACR-ACCEPTED code=0x00000003/-> BROM-VERDICT-FAIL code=0x00000002/' "$W5" > "$SCR/m5-verdict-fail.log"
   awk 'index($0,"[ga10bfw] -> LOADED")==0' "$W5" > "$SCR/m6-no-loaded.log"
@@ -199,15 +222,56 @@ if [ "${1:-}" = "--selftest" ]; then
   run5 m5-verdict-fail "$SCR/m5-verdict-fail.log" 1
   run5 m6-no-loaded "$SCR/m6-no-loaded.log" 1
   run5 m7-hang "$SCR/m7-hang.log" 1
+  # ── ANNOUNCE-BEFORE-WRITE, the counter's own go-red proof (ledger A74) ─────────────────────────────
+  # (p1) the REAL pre-fix capture scored as 4b: the 4b ignition write is announced and never answered, so
+  #      the pairing walk must RED it and name `priscv_cpuctl`. This is the case the OLD scorer scored
+  #      GREEN, because an unrelated `:: tegra: JB6 ... wrote=0x1234` line made 23 == 23.
+  # (p2) the same capture with the emitter fixed scores 4b GREEN — the fix is what closes it, measured.
+  # (p3) REALF with a SECOND foreign `wrote=0x` line appended is still GREEN: the family bound holds, and
+  #      a leg that counted it would go red here.
+  # (p4) REALF with one in-family result line deleted is RED and names that register — the walk is not a
+  #      difference of totals, it is a position.
+  awk '{ print } END{ print ":: tegra: JB6 - CSB page-sel 0x9c: pre=0x00000000 wrote=0xdead rb=0x0000dead STICKS=true ::" }' "$REALF" > "$SCR/p3-foreign-wrote.log"
+  awk 'index($0,"[ga10bprobe4b] priscv_bcr_ctrl @0x668 wrote=")==0' "$REALF" > "$SCR/p4-lost-result.log"
+  run p1-prefix-unpaired "$REAL" 4b 1
+  run p2-postfix-paired "$REALF" 4b 0
+  run p3-foreign-wrote "$SCR/p3-foreign-wrote.log" 4b 0
+  run p4-lost-result "$SCR/p4-lost-result.log" 4b 1
+  grep -q 'unpaired_announces=1 first=priscv_cpuctl' "$SCR/p1-prefix-unpaired.out" || { echo "p1 did not NAME priscv_cpuctl as the unpaired announce MISMATCH"; bad=1; }
+  grep -q 'unpaired_announces=1 first=priscv_bcr_ctrl' "$SCR/p4-lost-result.out" || { echo "p4 did not NAME priscv_bcr_ctrl as the unpaired announce MISMATCH"; bad=1; }
   echo "fixtures: $SCR"; [ $bad = 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAIL"; exit $bad
 fi
 LOG="${1:-}"; RUNG="${2:-4a}"
 [ -s "$LOG" ] || { echo "NO VERDICT: no log"; exit 2; }
 export LC_ALL=C
 cnt() { awk -v p="$1" 'index($0,p){n++} END{print n+0}' "$LOG"; }
+# IN-FAMILY count (orin-0912b 2026-09-13, ledger A74). The counters below were UNBOUNDED: `cnt " wrote=0x"`
+# matched EVERY line of the capture, and a full Orin boot carries `:: tegra: JB6 - CSB page-sel 0x9c:
+# pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::` from the XUSB bring-up, which is nobody's GA10B
+# write. That one foreign line is present in ALL FOUR flown captures and inflated `write_results` by 1 in
+# each. It cancelled an OPPOSITE defect in the rung-4 emitter (4b's ignition write printed an announce and
+# NO result line), so `render13-boot2`, `render14-boot3` and `render15-4f` all read a false 23/23 and only
+# the 37-write 5a capture showed the imbalance as 37/38. The bound is the one row B/C already state for the
+# arm names and the announce tokens, applied to the counters: a GA10B counter counts GA10B lines.
+famcnt() { awk -v p="$1" 'index($0,"[ga10bprobe4")==0 && index($0,"[ga10bprobe5")==0 && index($0,"[ga10bfw]")==0 { next } index($0,p){n++} END{print n+0}' "$LOG"; }
+foreigncnt() { awk -v p="$1" 'index($0,"[ga10bprobe4")||index($0,"[ga10bprobe5")||index($0,"[ga10bfw]") { next } index($0,p){n++} END{print n+0}' "$LOG"; }
+# THE PAIRING WALK, which is what the count was always a proxy for: in family order, every `about-to-WRITE`
+# announce must be answered by a ` wrote=0x` result before the next announce of any kind. It NAMES the
+# unpaired announce instead of printing a difference of two integers, so a hole in the ladder's only
+# forensic instrument reads as the register it happened at.
+unpaired() { awk '
+  index($0,"[ga10bprobe4")==0 && index($0,"[ga10bprobe5")==0 && index($0,"[ga10bfw]")==0 { next }
+  index($0,"about-to-WRITE "){ if (pend!="") { n++; if (n==1) first=pend } ; pend=$0; next }
+  index($0," wrote=0x"){ if (pend!="") pend=""; next }
+  index($0,"about-to-read "){ if (pend!="") { n++; if (n==1) first=pend; pend="" } ; next }
+  END{ if (pend!="") { n++; if (n==1) first=pend }
+       if (n+0==0) print "0 -"; else { sub(/^.*about-to-WRITE /,"",first); sub(/ .*$/,"",first); print n+0 " " first } }' "$LOG"; }
 last_announce() { awk 'index($0,"[ga10bprobe4")||index($0,"[ga10bprobe5")||index($0,"[ga10bfw]"){l=$0} END{ if (index(l,"about-to-WRITE ")||index(l,"about-to-read ")) print "RED last [ga10bprobe4*|5*|fw] line is an announce (F1 hang): " substr(l,1,160); else print "ok" }' "$LOG"; }
-wa=$(cnt "about-to-WRITE "); ra=$(cnt "about-to-read "); wr=$(cnt " wrote=0x")
-echo "write_announces=$wa read_announces=$ra write_results=$wr"
+wa=$(famcnt "about-to-WRITE "); ra=$(famcnt "about-to-read "); wr=$(famcnt " wrote=0x")
+fwa=$(foreigncnt "about-to-WRITE "); fwr=$(foreigncnt " wrote=0x")
+up="$(unpaired)"; upn="${up%% *}"; upname="${up#* }"
+echo "write_announces=$wa read_announces=$ra write_results=$wr (in-family; outside the GA10B families: announces=$fwa wrote=$fwr, counted by neither)"
+echo "PAIR-CHECK: unpaired_announces=$upn first=$upname (every about-to-WRITE must be answered by a wrote=0x before the next announce)"
 stop=$(last_announce); echo "STOP-CHECK: $stop"
 red=0
 case "$RUNG" in
@@ -321,15 +385,20 @@ case "$RUNG" in
     vl=$(awk 'index($0,"[ga10bprobe5a] verdict ") && index($0," -> "){n++} END{print n+0}' "$LOG")
     acc=$(awk 'index($0,"[ga10bprobe5a] verdict ") && index($0,"-> ACR-ACCEPTED"){n++} END{print n+0}' "$LOG")
     form=$(awk 'index($0,"[ga10bprobe5a] verdict ") && match($0,/form=[a-z0-9]+ shift=[0-9]+/){print substr($0,RSTART,RLENGTH); exit}' "$LOG")
+    # WHICH ARM flew, reported and never required: `triple=` and `map=` are printed by every 5a build from
+    # ledger A72/A73 on, and a capture from before them carries neither — so this says what it sees and
+    # scores nothing on it. A rung-5 FAIL is only attributable if the capture names its own two deltas.
+    tm=$(awk 'index($0,"[ga10bprobe5a] verdict ") && match($0,/triple=[a-z-]+ map=[a-z]+/){print substr($0,RSTART,RLENGTH); exit}' "$LOG")
     off=$(cnt "PSCI SYSTEM_OFF (0x84000008) via SMC")
-    echo "5a verdict lines = $vl (must be exactly 1); ACR-ACCEPTED = $acc (must be 1); ${form:-form=? shift=?}; SYSTEM_OFF lines = $off (must be >= 1)"
+    echo "5a verdict lines = $vl (must be exactly 1); ACR-ACCEPTED = $acc (must be 1); ${form:-form=? shift=?}; ${tm:-triple=? map=? (a capture from before ledger A72/A73)}; SYSTEM_OFF lines = $off (must be >= 1)"
     [ "$loaded" = 1 ] || { echo "RED the loader did not print LOADED exactly once (the image is not in the window: nothing was ignited)"; red=1; }
     [ "$vl" = 1 ] || { echo "RED no single [ga10bprobe5a] verdict line (5a not armed, refused before the ignition, or hung)"; red=1; }
     [ "$acc" = 1 ] || { echo "RED the verdict is not ACR-ACCEPTED (a FAIL/NOVERDICT is a recorded result, not the rung's PASS; R19: failed under these conditions)"; red=1; }
     [ "$off" -ge 1 ] || { echo "RED the flight did not reach PSCI SYSTEM_OFF"; red=1; } ;;
   *) echo "NO VERDICT: rung must be 4a, 4b, 4c, 4e, 4f or 5a"; exit 2 ;;
 esac
-[ "$wa" = "$wr" ] || { echo "RED write_announces != write_results"; red=1; }
+[ "$wa" = "$wr" ] || { echo "RED write_announces != write_results (in-family counts; see PAIR-CHECK for which announce)"; red=1; }
+[ "$upn" = 0 ] || { echo "RED an announced write has no result line: $upname — announce-before-write is the only thing that says WHICH write killed a boot, and this capture cannot say it"; red=1; }
 [ "$stop" = ok ] || red=1
 [ $red = 0 ] && echo "PASS $RUNG" || echo "FAIL $RUNG"
 exit $red
