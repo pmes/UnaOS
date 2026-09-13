@@ -1800,7 +1800,7 @@ impl Screen {
         // pixels it has to re-save are the ones THIS set would have let through and the sprite then
         // withheld; handing it the widened slice would subtract the sprite from its own question and
         // absorb nothing. Same array, third slice, on `occ_win`'s precedent one paragraph down.
-        let occ_desk = &occ[..nocc];
+        let occ_desk = &occ[..nocc]; ptrown_pass(occ_desk, nwin, self.info.width, self.info.height); // PTRLOST/SO46 RE-PLACED — PTRLOST/SO46 — the pointer-OWNERSHIP probe rides the finished occluder set, which is the one place in the kernel where the window boxes and the furniture boxes are both in hand and already split: `occ[..nwin]` are the window rows, `occ[nwin..]` the strips plus the open dropdown. That split IS the question — the two arrow sprites divide on it — so the probe is taken here rather than re-deriving either set. Folded onto this statement so the default (knob-off) build keeps its `panic::Location` numbering.
         // SHELLDESK REVIEW — **the WINDOW PREFIX, and it is a separate slice on purpose.**
         //
         // `occ` is now windows-then-furniture, but WC-I's two witness calls below are about the WINDOW
@@ -2487,3 +2487,259 @@ pub fn present_owed() -> bool {
         None => true,
     }
 }
+
+// =================================================================================================
+// PTRLOST / SO46 — WHO OWNS THE POINTER'S PIXELS, WHERE THE POINTER IS ACTUALLY STANDING
+// =================================================================================================
+//
+// PETER, render14: *"went to open quarry the machine froze for a minute and when it came back the
+// mouse cursor was gone"*, twice, both times ending in a reboot. The wire's reading of that state is
+// `[cursor12] offer … nohit=3143 planned=0` and then `nohit=7465 planned=0`, `nohit=6889 planned=0`
+// — three consecutive five-second windows in which the sprite was ON the panel, every composite pass
+// found no window row under it, and not one overlay was planned — while `[cursor] restore` put the
+// arrow at (765,1156), (1036,1167), (1195,1154), i.e. inside `[strip] rollup tenant=dock …
+// rect=768x52+576+1136`, and `[flick2] down_max` climbed 1ms -> 374ms -> 634ms -> 1883ms.
+//
+// `nohit`'s definition site says exactly what it is (`video/wm.rs`, `CUR12_NOHIT`):
+//
+//     "the sprite was on the panel, but no live window above the shell met its box. The pointer is
+//      over the desktop; nothing to compose through, and WC-I's whole point."
+//
+// and its rollup doc reads it as benign — *"the operator simply was not pointing at a window. Not a
+// defect; check the sitting, not the code."* THAT READING IS TRUE FOR THE BACKDROP AND FALSE FOR
+// FURNITURE, and the difference is this file's.
+//
+// THE ROW SET IS NOT WHAT CHANGED. `[wc-fv] focus raise … shell_z=0` on every raise of that boot, so
+// `wm::above_shell` excluded nothing; `[wcn] rollup … wins=7` throughout. What changed when apps were
+// opened is WHERE THE POINTER HAD TO BE: a pinned app is launched from its dock tile (R49), so
+// opening one puts the arrow inside the dock strip — and the dock is not a window table row.
+//
+// THE TWO SPRITES, AND THE REGION NEITHER OF THEM COVERS. On a board where
+// `pal::cursor::SPRITE_OWNS_PAINT` is false there are two arrows (SO5, `arch/aarch64/display_tegra.rs`
+// `sprite_size_witness`, measured live on the render14 wire as `compositor=9x9 backbuffer=18x18
+// same=0`): `video::cursor`'s FRONT-buffer sprite, and `pal::cursor`'s BACK-buffer one. Which of them
+// reaches the glass is decided HERE, by `present_background`'s occluder subtraction:
+//
+//   * over the BACKDROP nothing is subtracted, so the back-buffer arrow lands — and `hit` is false,
+//     so the compositor plans nothing. One arrow, and the wire says `nohit`. Correct.
+//   * over a WINDOW the box is subtracted, the back-buffer arrow never lands — and `hit` is TRUE, so
+//     the compositor arrow is composed through. One arrow. Correct.
+//   * over FURNITURE — the dock, the menu bar, an open dropdown — the box IS subtracted (SHELLDESK
+//     and MENUFIT appended those rects to `occ` above), so the back-buffer arrow never lands; and
+//     `hit` is FALSE, because `composite_inner` builds it from window TABLE rows alone and the
+//     furniture arm that could raise it sets `reserved_hit` AFTER the `hit |= reserved_hit` fold, so
+//     no strip can ever make the pass plan. NEITHER ARROW REACHES THE GLASS.
+//
+// That third region is the road, it is a DIFFERENT road from SO27's shell re-mint (`shell-remint` is
+// 0 across this whole wire — APPPIN's fix held), and it is reached by opening apps because the dock
+// is where you press to open one.
+//
+// THE FIX is one predicate, in `pal.rs`: the knob that compiles the furniture subtraction is the knob
+// that must hand the arrow to the compositor sprite. [`PTR_OWNER_INVARIANT`] states that as a
+// compile-time obligation so the two can never drift apart again, and the probe below states it on
+// the wire, per region, for a bench reader.
+
+/// PTRLOST/SO46 — does THIS build subtract furniture from the desktop present?
+///
+/// The same cfg the `(nocc, nwin)` arms above are written on, named once so the invariant and the
+/// probe cannot be gated on a paraphrase of it.
+pub(crate) const FURNITURE_SUBTRACTED: bool = cfg!(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+));
+
+/// PTRLOST/SO46 — **a build that subtracts furniture must give the arrow to the COMPOSITOR sprite.**
+///
+/// The back-buffer sprite is published by a desktop present and is therefore subject to that
+/// present's occluder set; the compositor sprite is not. So the moment a surface is added to the
+/// subtraction, the back-buffer model loses the pointer over that surface unless something else
+/// paints it there — and for furniture nothing does (`wm::composite_inner`'s `hit` is window rows
+/// only). Asserted rather than documented: the `const _` below is a hard compile error on any build
+/// that reintroduces the pairing, which is the go-red this arc is gated by.
+pub(crate) const PTR_OWNER_INVARIANT: bool =
+    !FURNITURE_SUBTRACTED || crate::pal::cursor::SPRITE_OWNS_PAINT;
+const _: () = assert!(
+    PTR_OWNER_INVARIANT,
+    "PTRLOST/SO46: this build subtracts the furniture strips from the desktop present but leaves the \
+     arrow to pal::cursor's BACK-buffer sprite, so the pointer has no painter over the dock, the menu \
+     bar or an open dropdown. Give the paint to video::cursor (pal::cursor::SPRITE_OWNS_PAINT)."
+);
+
+/// PTRLOST/SO46 — is `(x, y)` inside occluder box `b`? Half-open on the right and bottom, the same
+/// convention `next_visible_span` walks with.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn ptr_in(b: (usize, usize, usize, usize), x: usize, y: usize) -> bool {
+    x >= b.0 && x < b.0 + b.2 && y >= b.1 && y < b.1 + b.3
+}
+
+/// PTRLOST/SO46 — the last region/paint state the probe printed, or [`PTROWN_NONE`] for "never".
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static PTROWN_STATE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(PTROWN_NONE);
+/// PTRLOST/SO46 — "no state recorded yet". Outside the three-bit range a real state can take, so a
+/// first pass whose state happens to be `0` still prints.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+const PTROWN_NONE: u32 = u32::MAX;
+/// PTRLOST/SO46 — edges printed so far, capped at [`PTROWN_LOG_MAX`].
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static PTROWN_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// PTRLOST/SO46 — the print cap. SO30 is the defect this number exists to avoid: a per-pass line on
+/// the present path ate 36% of a boot's wire. Twelve is enough to show every region several times
+/// over and is spent within the first seconds of pointer motion.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+const PTROWN_LOG_MAX: u32 = 12;
+/// PTRLOST/SO46 — has the one-shot fixture run? Latched on the first present.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+static PTROWN_TESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// PTRLOST/SO46 — **the probe, and it answers the two questions a `nohit` cannot be read without.**
+///
+/// `row=` is *"does a WINDOW box cover the pointer"* and `composited=` is *"is the compositor sprite
+/// actually on the glass right now"* ([`super::cursor::live_box_relaxed`], a lock-free mirror). The
+/// pair separates the two states a lost pointer can be in and that `[cursor12] -> nohit` merges:
+///
+///   * `row=no  composited=…` — **the sprite has no row.** Nothing to compose through; whether that
+///     is benign depends entirely on `furniture=`, which is the term this arc added.
+///   * `row=yes composited=0` — **the sprite has a row and is not being composited.** A different
+///     defect, and one no previous line could distinguish from the first.
+///
+/// `-> LOST` is the state this arc closes: a region that IS subtracted while the arrow still belongs
+/// to the back-buffer sprite and the compositor has none on the glass. [`PTR_OWNER_INVARIANT`] makes
+/// that terminal unreachable at compile time on every build that compiles this function, so a capture
+/// carrying it is a build whose invariant was defeated.
+///
+/// EDGE-LATCHED AND CAPPED, per SO30: one line per state TRANSITION, at most [`PTROWN_LOG_MAX`] of
+/// them for the life of the boot. On a pass with no transition the cost is a `visible()` check, one
+/// `pos()` (a masked lock and arithmetic), at most `DESK_OCC_MAX` box tests and one relaxed swap.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn ptrown_pass(occ: &[(usize, usize, usize, usize)], nwin: usize, pw: usize, ph: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !PTROWN_TESTED.swap(true, Relaxed) {
+        ptrlost_selftest();
+    }
+    if pw == 0 || ph == 0 || !crate::pal::cursor::visible() {
+        return;
+    }
+    let (x, y) = crate::pal::cursor::pos(pw as i32, ph as i32);
+    if x < 0 || y < 0 {
+        return;
+    }
+    let (x, y) = (x as usize, y as usize);
+    // The window PREFIX and the furniture TAIL, exactly as the caller assembled them. `nwin` is
+    // clamped rather than trusted: a future arm that grows the array without growing the prefix would
+    // otherwise index past the slice, and a probe may never be the thing that panics a present.
+    let nwin = nwin.min(occ.len());
+    let row = occ[..nwin].iter().any(|b| ptr_in(*b, x, y));
+    let furn = occ[nwin..].iter().any(|b| ptr_in(*b, x, y));
+    let comp = super::cursor::live_box_relaxed().is_some();
+    let state = (row as u32) | ((furn as u32) << 1) | ((comp as u32) << 2);
+    if PTROWN_STATE.swap(state, Relaxed) == state {
+        return;
+    }
+    if PTROWN_LOGGED.fetch_add(1, Relaxed) >= PTROWN_LOG_MAX {
+        return;
+    }
+    let why = if (row || furn) && !crate::pal::cursor::SPRITE_OWNS_PAINT && !comp {
+        "LOST"
+    } else if row {
+        "window"
+    } else if furn {
+        "furniture"
+    } else {
+        "backdrop"
+    };
+    serial_println!(
+        "[ptrown] at=({},{}) panel={}x{} row={} furniture={} subtracted={} paint={} composited={} n={}/{} -> {} (SO46 — the desktop present subtracts windows AND furniture; only the compositor sprite can paint over either, so `subtracted=1 paint=backbuffer` is the lost pointer)",
+        x,
+        y,
+        pw,
+        ph,
+        row as u8,
+        furn as u8,
+        (row || furn) as u8,
+        if crate::pal::cursor::SPRITE_OWNS_PAINT { "compositor" } else { "backbuffer" },
+        comp as u8,
+        PTROWN_LOGGED.load(Relaxed).min(PTROWN_LOG_MAX),
+        PTROWN_LOG_MAX,
+        why
+    );
+}
+
+/// PTRLOST/SO46 — the one-shot fixture, run from the first desktop present of the boot.
+///
+/// It scores two things a reader cannot check by eye. First the CLASSIFIER: a window box, a furniture
+/// box and a clear point, fed to the same `ptr_in` walk [`ptrown_pass`] uses, so a wire that reads
+/// `furniture=0` is known to be able to read `1`. Second the INVARIANT, evaluated on THIS build:
+/// `lost_reachable=0` says the region the desktop present subtracts always has a painter.
+///
+/// GOES RED BY MUTATION: reverting `pal::cursor::SPRITE_OWNS_PAINT` to `cfg!(target_arch =
+/// "x86_64")` makes `lost_reachable=1` on every `aarch64 + desktop_firmware` build — and the
+/// `const _` assertion above turns that into a compile error first, which is why this fixture is the
+/// SECOND line of the gate and `./arroyo check` is the first.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn ptrlost_selftest() {
+    let occ = [(100usize, 100usize, 200usize, 200usize), (0usize, 0usize, 1920usize, 34usize)];
+    let nwin = 1usize;
+    let probe = |x: usize, y: usize| -> (bool, bool) {
+        (
+            occ[..nwin].iter().any(|b| ptr_in(*b, x, y)),
+            occ[nwin..].iter().any(|b| ptr_in(*b, x, y)),
+        )
+    };
+    let w = probe(150, 150);
+    let f = probe(10, 10);
+    let d = probe(900, 900);
+    let lost_reachable = FURNITURE_SUBTRACTED && !crate::pal::cursor::SPRITE_OWNS_PAINT;
+    let ok = w == (true, false)
+        && f == (false, true)
+        && d == (false, false)
+        && !lost_reachable
+        && PTR_OWNER_INVARIANT;
+    serial_println!(
+        ":: PTRLOST: window={}:{} furniture={}:{} backdrop={}:{} furn_subtracted={} sprite_owns_paint={} lost_reachable={} :: {} ::",
+        w.0 as u8,
+        w.1 as u8,
+        f.0 as u8,
+        f.1 as u8,
+        d.0 as u8,
+        d.1 as u8,
+        FURNITURE_SUBTRACTED as u8,
+        crate::pal::cursor::SPRITE_OWNS_PAINT as u8,
+        lost_reachable as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// PTRLOST/SO46 — the no-op twin. A build with no furniture subtraction has nothing to probe, and
+/// the call folded onto the `occ` slice above must cost it nothing.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn ptrown_pass(_occ: &[(usize, usize, usize, usize)], _nwin: usize, _pw: usize, _ph: usize) {}
