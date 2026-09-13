@@ -844,11 +844,91 @@ LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf | wc -l
 
 is the artifact proof — the presence of an instrument is proven in the artifact, never in the diff.
 
-> ⚠ **SCOPE, stated rather than implied.** On x86 this covers the `power::shutdown` route only.
-> `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` **directly**
-> and still reach S5 with the ring unflushed. The one-line fix belongs at the top of `poweroff()`
-> itself, in `arch/x86_64/acpi_power.rs` — a file this arc's brief does not name, so it is reported and
-> not made. `acpi_power::reboot` already drains (since LOCKFIX) and now carries the witness too.
+> ⚠ **SCOPE, as it stood.** On x86 SO31 covered the `power::shutdown` route only. `video/crystal.rs`'s
+> Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` **directly** and reached S5 with
+> the ring unflushed. That box is **closed by S5DRAIN below** (trunk queue §5, 2026-09-12);
+> `acpi_power::reboot` already drained (since LOCKFIX) and carries the witness too.
+
+## S5DRAIN — the drain belongs at the PORT, not at each route into it
+
+Trunk queue §5 (2026-09-12, SERDRAIN's finding). SO31 part 3 put the flush in `power.rs`, once per
+verb. On aarch64 that is complete: every route to an SMC — the shell's `power::shutdown`, the
+desktop's `power::crystal_shutdown` — passes through that file. On **x86 it was half a fix**, and the
+missing half was the half an operator uses.
+
+`grep -rn 'acpi_power::poweroff' unaos/crates/kernel/src/` finds three call sites:
+
+| call site | route | before S5DRAIN |
+| --- | --- | --- |
+| `power.rs:190` | shell `power::shutdown` | drained (SO31 part 3) |
+| `video/crystal.rs:686` | the desktop's **Shut Down** menu item | **undrained** |
+| `video/instgui.rs:578` | the installer's halt | **undrained** |
+
+A desktop Shut Down is the press most likely to land while the compositor is printing, which is
+exactly when the ring is deepest — so the two routes that bypassed `power.rs` were the two whose
+evidence was worth most. What died with the power was everything `_print` had deferred, the verb's own
+`:: SHARD-MENU: crystal_pick verb=ShutDown ::` announce included.
+
+### The fix
+
+One statement, at the top of `poweroff()` — the single point every x86 S5 route passes through —
+calling the **same** `serial_ring::power_drain(tag)` entry point on the **same** `[pwrshutoff]` witness
+family `power.rs` uses. Not a second copy of the policy: a second spelling is how two divergent
+policies happen, and this document exists because the transport once had two contracts wearing one
+name (see *SERWIT-1B PARITY* above).
+
+It is the **first** statement because `poweroff()`'s `discover()` failure arm prints and then parks in
+`hlt_loop`, and a park is a context with no next print just as S5 is. **No caller is exempt**, and
+that is checked rather than assumed: all three end in S5 or in `hlt_loop`, both terminal. The
+`power.rs` route now drains twice — its own verb-order count on the wire, then `lines=0` at the port —
+which is the shape the reboot ladder has had since SO31 and reads as an empty ring, not as a failure.
+
+The statement is folded **line-neutral onto `poweroff()`'s signature line**: `gas_space_name`,
+`table_checksum_ok`, `discover_reset`, `reset_settle`, `raw_witness`, `reset_report` and `reboot` all
+sit below it in that file, and a new source line would move every `panic::Location` record in them
+(`docs/dev/LEDGER.md` P7). Its body, `s5_ring_flush()`, is a file-tail append.
+
+### The fixture
+
+`serial_ring::s5drain_selftest`, one-shot on `mirror_service`, `witness`-gated and
+`target_arch = "x86_64"`-gated — the defect is x86's, because on aarch64 the desktop's Shut Down is
+`power::crystal_shutdown` and there is no caller that reaches a firmware power call without passing
+`power.rs`.
+
+It exists because PWRDRAIN cannot cover this. PWRDRAIN proves the *policy* — a full drain empties the
+ring and counts the bytes — and says nothing about which routes call it. S5DRAIN proves the other half
+of the sentence: it calls `arch::acpi_power::s5_ring_flush`, **the symbol `poweroff()`'s first
+statement calls**, `#[inline(never)]` so it is one call site and not two inlined copies, and asserts
+the ring is empty when it returns.
+
+```
+ring filled to SLOTS x S5DRAIN_LINE_LEN = 64 x 67 B = 4 288 B
+acpi_power::s5_ring_flush()  ->  lines = 64, bytes = 4 288        (22x DRAIN_BYTE_BUDGET)
+a following drain            ->  residue = 0
+:: S5DRAIN: … -> PASS ::
+```
+
+`S5DRAIN_LINE_LEN = 18 + 48 + 1 = 67` B: `"[s5drain] fill NN "` is 18 bytes, `DRAINCAP_PAD` is 48, the
+newline is 1 — one byte narrower than `PWRDRAIN_LINE_LEN` only because the tag is one character
+shorter. Two `const _: () = assert!(…)` rows pin it: the line must not truncate against `SLOT_LEN`,
+and the filled ring must be more than eight budgets wide or capped and uncapped are
+indistinguishable. The `lines`/`bytes` comparisons are `>=` and `residue == 0` is strict, for
+PWRDRAIN's reason: foreign traffic on a live kernel can only ADD to what a full drain emits.
+
+**The go-red**, both at runtime, because `drain` and `drain_capped` share a signature and no type can
+separate them:
+
+* the realistic one — swap `s5_ring_flush`'s `power_drain(...)` for `drain_capped(...)`: the 192 B
+  budget stops it after 3 lines of 67 B (67, 134, 201; `drain_may_continue` is strictly `<`), the
+  fixture reads `lines=3 residue=61` and prints `-> FAIL`, which `FAULT_PATTERNS` turns into a
+  non-zero exit from `UNAOS_WC=1 ./arroyo test 90`;
+* the blunt one — delete the `power_drain(...)` call: `lines=0 bytes=0 residue=64`, same `-> FAIL`.
+
+**What it does not prove, stated rather than implied:** that `poweroff()`'s *first statement* is that
+call. Deleting the fold on the signature line and leaving `s5_ring_flush` intact leaves this fixture
+green. That is one line of reading, it is the same gap PWRDRAIN names for the SMC, and the regression
+that is actually plausible is someone changing the drain rather than deleting the call — which is the
+whole reason `s5_ring_flush` is a named symbol instead of an open-coded `power_drain`.
 
 ## aarch64
 

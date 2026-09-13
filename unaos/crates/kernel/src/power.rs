@@ -180,12 +180,12 @@ fn platform_reboot() -> ! {
 #[cfg(target_arch = "x86_64")]
 fn platform_shutdown() -> ! {
     serial_println!("[pwrshutoff] x86 mechanism: ACPI S5 (acpi_power::poweroff)");
-    // PWRDRAIN: x86's S5 path does NOT share the reboot ladder's drain — `acpi_power::poweroff` masks
-    // interrupts and writes PM1_CNT with whatever is still staged. It shares this ring, so it owes the
-    // same flush. ⚠ SCOPE: this covers the shell/`power::shutdown` route only. `video/crystal.rs`'s
-    // Shut Down and `video/instgui.rs` call `acpi_power::poweroff()` DIRECTLY and still bypass it; the
-    // one-line fix belongs at the top of `poweroff()` itself, in `arch/x86_64/acpi_power.rs`, which
-    // this arc's brief does not name. Reported, not made.
+    // PWRDRAIN: x86's S5 path used not to share the reboot ladder's drain — `acpi_power::poweroff`
+    // masks interrupts and writes PM1_CNT with whatever is still staged. S5DRAIN (trunk queue §5,
+    // 2026-09-12) closes the ⚠ SCOPE box that stood here: the flush is now the FIRST statement of
+    // `poweroff()` itself, so `video/crystal.rs`'s Shut Down and `video/instgui.rs`, which call it
+    // DIRECTLY, drain too. This call stays and is not redundant — it puts the count on the wire in
+    // THIS verb's announce order, and the flush at the port then finds the ring empty (`lines=0`).
     crate::serial_ring::power_drain("pwrshutoff");
     crate::arch::acpi_power::poweroff();
 }
