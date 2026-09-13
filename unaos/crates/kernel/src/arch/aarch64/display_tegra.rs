@@ -4714,14 +4714,46 @@ pub fn sup_present_census(tick: u64) {
 /// ORIN-RASTGLASS — `rast_demo`'s backdrop, restated (rast_demo.rs:96). See the ⚠ note above.
 #[cfg(feature = "rast")]
 const RG_PAPER: u32 = 0x0010_1018;
-/// ORIN-RASTGLASS — `rast_demo`'s fixed render size, restated (rast_demo.rs:34-35). The blit is
-/// centred, `off = (panel - demo) / 2` (rast_demo.rs:89-90), and `run` SKIPS entirely when the panel
-/// is smaller than this — which is one of the never-painted histories this probe must be able to
-/// report, so the same numbers have to be here to locate the box at all.
+/// ORIN-RASTGLASS — **A67: the restated geometry is GONE, and that is the repair.**
+///
+/// These two constants used to be `rast_demo`'s render size copied by hand (`320` x `240`), with the
+/// box located by re-deriving its centred offset. That was the only option while `run` owned the
+/// panel and chose its own box. It is now wrong twice over: the renderer draws into a `wm` row whose
+/// origin the TILER picks, and the compositor applies an integer upscale (`place_scale`) that makes
+/// the on-panel content `w*scale` x `h*scale` — on the 1920x1200 bench panel, 640x480 for a 320x240
+/// surface. A probe sampling a centred 320x240 would have read a quarter of the window, off-centre,
+/// and scored the rest of it foreign.
+///
+/// The geometry is therefore ASKED FOR, not restated: `rast_demo::rastwin_seat()` publishes what
+/// `wm::info` actually seated (content rect and outer box, both already scaled). The drift risk the
+/// old note accepted is gone with it — there is no second copy of the numbers to drift.
+///
+/// What is still restated is the BACKDROP CONSTANT alone ([`RG_PAPER`]), and only because it remains
+/// a private constant of a shared kernel-core file. Its failure direction is unchanged and is the
+/// one this rung will accept: a changed backdrop makes this probe report `NO-RAST-INK`, never a
+/// false `CUBE-ON-GLASS`.
+///
+/// ── WHAT THE TWO POPULATIONS ARE NOW ───────────────────────────────────────────────────────────
+/// The `blevels` lesson still governs: two populations, opposite expectations, both required. A67
+/// keeps the shape and moves both regions, and INVERTS the outer one.
+///
+///   * **MARGIN** — a band just inside the row's CONTENT rect. `rast_demo` clears the whole surface
+///     to [`RG_PAPER`] every frame and the cube never reaches the content edge (measured: the widest
+///     damaged band is 146 of 240 source rows, so at least 47 rows of clear survive top and bottom),
+///     so this is the region the clear owns outright. Must be backdrop.
+///   * **MIDDLE** — the centre of the content rect. Must contain at least one NON-backdrop pixel,
+///     i.e. the cube actually drew. Without this arm a margin-only test would report ink on a boot
+///     where the clear landed and the rasteriser drew nothing — the same false-PASS class `blevels`
+///     closed.
+///   * **OUTSIDE** — full-width strips above and below the row's OUTER box, chosen because each is
+///     one contiguous rectangle wholly outside the row by construction (no rect subtraction to get
+///     wrong). **The expectation is INVERTED from the old SURROUND arm: there must be NO backdrop
+///     pixel here at all.** This is the strongest claim the rung can now make and the one the
+///     windowed renderer earns: "the renderer touched nothing outside its row" stops being a code
+///     reading and becomes a property measured from the glass. Its failure is its own verdict,
+///     `RAST-LEAKED-OUTSIDE`, never folded into a neighbour.
 #[cfg(feature = "rast")]
-const RG_DEMO_W: usize = 320;
-#[cfg(feature = "rast")]
-const RG_DEMO_H: usize = 240;
+const RG_MARGIN: usize = 6;
 /// ORIN-RASTGLASS — the sampling grid, per region: `RG_BANDS` evenly spaced rows, `RG_RUNS`
 /// contiguous runs of `RG_RUN` pixels on each. 8*4*32 = 1024 samples per region, the same budget
 /// `orin_glass_probe` settled on.
@@ -4785,13 +4817,17 @@ const RG_LATE_MAX: u32 = 24;
 /// the census reads it, and an index that names a slot in this array cannot be a string that names
 /// nothing.
 #[cfg(feature = "rast")]
-const RG_VERDICTS: [&str; 6] = [
-    "CUBE-ON-GLASS",     // 0 — surround is all backdrop AND the box carries the cube's ink
-    "RAST-FILL-NO-CUBE", // 1 — the fill landed, the rasteriser drew nothing into the box
-    "RAST-PARTIAL",      // 2 — surround is part backdrop, part foreign: a partial repaint
-    "NO-RAST-INK",       // 3 — not one backdrop pixel in the surround
-    "UNREADABLE",        // 4 — read_pixel returned None everywhere (no panel / unmapped)
-    "BUDGET",            // 5 — the sample was suppressed; NEVER in the passing set
+const RG_VERDICTS: [&str; 8] = [
+    "CUBE-ON-GLASS",       // 0 — the row's margin is backdrop AND its middle carries the cube's ink
+    "RAST-FILL-NO-CUBE",   // 1 — the clear landed, the rasteriser drew nothing into the middle
+    "RAST-PARTIAL",        // 2 — the row's margin is part backdrop, part foreign: a partial repaint
+    "NO-RAST-INK",         // 3 — not one backdrop pixel in the row's margin
+    "UNREADABLE",          // 4 — read_pixel returned None everywhere (no panel / unmapped)
+    "BUDGET",              // 5 — the sample was suppressed; NEVER in the passing set
+    "RAST-LEAKED-OUTSIDE", // 6 — A67: backdrop ink found OUTSIDE the row. The windowed invariant is
+    // broken — the renderer wrote glass it does not own. NEVER in the passing set.
+    "RAST-NO-WINDOW", // 7 — A67: no seat was published, so the probe cannot locate the row at all.
+                      // "I could not look", never "I looked and saw nothing". NEVER passing.
 ];
 
 /// ORIN-RASTGLASS — the passing set, the single adjudicator, listed explicitly. `orin_glass_probe`'s
@@ -4878,40 +4914,61 @@ pub fn orin_rast_glass(phase: &str) -> u8 {
     }
     let i = fb.info();
     let (pw, ph) = (i.width, i.height);
-    if pw < RG_DEMO_W || ph < RG_DEMO_H {
-        // The panel is smaller than the render, which is exactly the arm `rast_demo::run` takes when
-        // it prints "panel too small" and returns WITHOUT painting. There is no box to sample and no
-        // paint to look for; say so rather than reporting an empty surround as a repaint.
-        serial_println!("[orinrast] phase={} panel={}x{} demo={}x{} -> NO-RAST-INK reason=panel-too-small (rast_demo::run skips below this geometry and paints nothing at all — never-painted, not overwritten)", phase, pw, ph, RG_DEMO_W, RG_DEMO_H);
-        return 3;
-    }
-    let (bx, by) = ((pw - RG_DEMO_W) / 2, (ph - RG_DEMO_H) / 2);
-    // SURROUND: the full-width strip ABOVE the render box. It is entirely owned by `fill_screen` and
-    // the cube can never reach it, so it is the cleanest available witness for the backdrop — and it
-    // is one contiguous rectangle, which keeps the sampler simple enough to audit. (A panel exactly
-    // 240 rows tall has no strip; `rg_sample` returns `(0,0,0)` for a zero-height region and the
-    // `read == 0` arm below reports UNREADABLE rather than inventing a verdict.)
-    let (s_read, s_paper, s_foreign) = rg_sample(&fb, 0, 0, pw, by);
-    let (b_read, b_paper, b_foreign) = rg_sample(&fb, bx, by, RG_DEMO_W, RG_DEMO_H);
-    // DERIVED, never asserted. Order matters: UNREADABLE outranks everything (an unread panel makes
-    // no claim), then the surround decides whether RAST's fill is on the glass, and only inside the
-    // "fill is intact" arm does the box get to say whether the cube drew. Reversing those two would
-    // let a box full of foreign console pixels satisfy the "the cube drew" test.
-    let v: u8 = if s_read == 0 && b_read == 0 {
+    // A67 — ASK where the row is; never guess. `None` means `rast_demo` never seated a window in
+    // this boot (it declined, and named its reason on its own `[rastwin] … DECLINE reason=` line),
+    // so this probe has no rect to sample. It says exactly that. Reporting an unlocatable row as
+    // "no ink" would convert "I could not look" into "I looked and saw nothing", which is the one
+    // direction this rung has always refused.
+    let Some(s) = crate::rast_demo::rastwin_seat() else {
+        serial_println!("[orinrast] phase={} panel={}x{} -> RAST-NO-WINDOW reason=no-seat-published (rast_demo seated no wm row this boot and named its own decline; there is no rect to sample). Unlocatable is not unpainted — this must never adjudicate as painted", phase, pw, ph);
+        return 7;
+    };
+    // A margin band inside the content rect, and the middle of it. Both are clamped to the content,
+    // so a row smaller than twice the margin degenerates to a zero-size region — which `rg_sample`
+    // answers `(0,0,0)` for, and the `read == 0` arm below reports UNREADABLE rather than inventing
+    // a verdict from an empty population.
+    let m = RG_MARGIN.min(s.cw / 4).min(s.ch / 4);
+    let (m_read, m_paper, m_foreign) = rg_sample(&fb, s.cx, s.cy, s.cw, m);
+    let (i_read, i_paper, i_foreign) = rg_sample(
+        &fb,
+        s.cx + m,
+        s.cy + m,
+        s.cw.saturating_sub(2 * m),
+        s.ch.saturating_sub(2 * m),
+    );
+    // OUTSIDE: the full-width strips above and below the OUTER box. Each is wholly outside the row
+    // by construction, so no rect subtraction can get this wrong. Their expectation is INVERTED —
+    // zero backdrop pixels — which is the windowed invariant measured from the glass.
+    let above_h = s.oy.min(ph);
+    let below_y = (s.oy + s.oh).min(ph);
+    let (a_read, a_paper, _a_foreign) = rg_sample(&fb, 0, 0, pw, above_h);
+    let (o_read, o_paper, _o_foreign) = rg_sample(&fb, 0, below_y, pw, ph.saturating_sub(below_y));
+    let (out_read, out_paper) = (a_read + o_read, a_paper + o_paper);
+    // DERIVED, never asserted. Order matters and is stated: UNREADABLE outranks everything (an
+    // unread panel makes no claim); then the LEAK, because ink where the renderer does not own the
+    // glass is a defect regardless of how good the row itself looks — scoring the row first would
+    // let a leaking build report CUBE-ON-GLASS; then the margin decides whether RAST's clear is on
+    // the glass; and only inside the "clear is intact" arm does the middle get to say whether the
+    // cube drew. That last ordering is the original's and is kept for the original's reason: a
+    // middle full of foreign console pixels must not satisfy the "the cube drew" test.
+    let v: u8 = if m_read == 0 && i_read == 0 {
         4 // UNREADABLE
-    } else if s_paper == 0 {
+    } else if out_paper != 0 {
+        6 // RAST-LEAKED-OUTSIDE
+    } else if m_paper == 0 {
         3 // NO-RAST-INK
-    } else if s_foreign != 0 {
+    } else if m_foreign != 0 {
         2 // RAST-PARTIAL
-    } else if b_foreign == 0 {
+    } else if i_foreign == 0 {
         1 // RAST-FILL-NO-CUBE
     } else {
         0 // CUBE-ON-GLASS
     };
     serial_println!(
-        "[orinrast] phase={} panel={}x{} box={}x{} at ({},{}) paper={:#010x} surround read={} paper={} foreign={} box read={} paper={} foreign={} painted={} -> {}",
-        phase, pw, ph, RG_DEMO_W, RG_DEMO_H, bx, by, RG_PAPER,
-        s_read, s_paper, s_foreign, b_read, b_paper, b_foreign,
+        "[orinrast] phase={} panel={}x{} content={}x{} at ({},{}) outer={}x{} at ({},{}) margin={} paper={:#010x} margin read={} paper={} foreign={} middle read={} paper={} foreign={} outside read={} paper={} painted={} -> {}",
+        phase, pw, ph, s.cw, s.ch, s.cx, s.cy, s.ow, s.oh, s.ox, s.oy, m, RG_PAPER,
+        m_read, m_paper, m_foreign, i_read, i_paper, i_foreign,
+        out_read, out_paper,
         rg_painted(v) as u8, RG_VERDICTS[v as usize]
     );
     v
@@ -4924,6 +4981,15 @@ pub fn orin_rast_glass(phase: &str) -> u8 {
 #[cfg(feature = "rast")]
 pub fn orin_rast_glass_post() {
     use core::sync::atomic::Ordering;
+    // A67 — ONE-SHOT, and the latch is what makes it so. This is now called from
+    // `rast_demo::run`, on the last composited frame (see the note at that call site: it is the only
+    // instant at which "did the blit reach the scan-out" has an answer). `run_mc` runs BEFORE `run`
+    // on the terminus line and opens a window of its own, so without this guard a future caller
+    // added to either pass would silently overwrite the good sample with one taken over a vacated
+    // box. First writer wins; a second call costs one relaxed load and prints nothing.
+    if RG_POST.load(Ordering::Acquire) != u8::MAX {
+        return;
+    }
     let v = orin_rast_glass("post");
     RG_POST.store(v, Ordering::Release);
 }
@@ -4984,6 +5050,10 @@ pub fn orin_rast_census(tick: u64) {
     } else {
         orin_rast_glass(if owns { "late-console" } else { "late" })
     };
+    // A67 — is a row still composited? The BOUNDED window closes itself after `FRAMES`, and that
+    // ending is the design working, not a repaint. Read once, here, so the ladder and the
+    // terminality test below agree about it.
+    let live = crate::rast_demo::rastwin_live();
     let verdict = if post == u8::MAX {
         "RAST-UNRUN"
     } else if !rg_painted(post) {
@@ -4992,6 +5062,19 @@ pub fn orin_rast_census(tick: u64) {
         "RAST-LATE-BUDGET"
     } else if late == 4 {
         "RAST-LATE-UNREADABLE"
+    } else if late == 6 {
+        // A67 — the LEAK outranks the survival question, and it is the one arm that still has teeth
+        // after the window closes: backdrop ink outside the row means the renderer wrote glass it
+        // does not own, whether or not the row is still up.
+        "RAST-LEAKED-OUTSIDE"
+    } else if !live {
+        // A67 — the window is gone because it FINISHED. `post` already established that the blit
+        // reached the scan-out, and the leak arm above has just established that nothing of RAST's
+        // is on the glass outside the row. There is nothing left to survive, so the correct reading
+        // is "ran and ended", NOT "something repainted it". Scoring this as OVERWRITTEN would have
+        // fired on every healthy boot of a bounded demo — the instrument failure this whole rung is
+        // built to avoid.
+        "RAST-WINDOW-CLOSED"
     } else if rg_painted(late) {
         "RAST-PAINTED-SURVIVED"
     } else if owns {
@@ -4999,17 +5082,20 @@ pub fn orin_rast_census(tick: u64) {
     } else {
         "RAST-PAINTED-OVERWRITTEN"
     };
-    // The ONE non-terminal state is "still on the glass, console not yet in possession" — the only
-    // reading a later sample can still change. Everything else is settled: RAST never painted, the
-    // cube is already gone, the console has taken over, or the budget is spent.
-    if !(rg_painted(post) && !owns && rg_painted(late)) {
+    // The ONE non-terminal state is "still on the glass, row still LIVE, console not yet in
+    // possession" — the only reading a later sample can still change. Everything else is settled:
+    // RAST never painted, the window has closed, ink leaked outside it, the cube is already gone,
+    // the console has taken over, or the budget is spent. `live` is new to this test (A67) and is
+    // what stops a closed bounded window from being re-sampled for the rest of the boot.
+    if !(rg_painted(post) && live && !owns && rg_painted(late)) {
         RG_DONE.store(true, Ordering::Release);
     }
     serial_println!(
-        "[orinrast] census seq={} t={} post={} late={} console-owns={} conwin={} pidesk={} final={} -> {}",
+        "[orinrast] census seq={} t={} post={} late={} row-live={} console-owns={} conwin={} pidesk={} final={} -> {}",
         seq, tick,
         if post == u8::MAX { "UNRUN" } else { RG_VERDICTS[post as usize] },
         RG_VERDICTS[late as usize],
+        live as u8,
         owns as u8,
         cfg!(feature = "orinconwin") as u8,
         cfg!(feature = "desktop_firmware") as u8,

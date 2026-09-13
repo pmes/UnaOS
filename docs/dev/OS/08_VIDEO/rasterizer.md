@@ -355,31 +355,46 @@ What changed, each item measured on `UNAOS_QEMU_FULL=1 UNAOS_WC=1 UNAOS_RAST=1
   on the same host: a window present writes cached RAM and lets the compositor move
   only the damaged band, where the old path pushed every pixel through `put_pixel`.
 
-**Bounded, and why.** `FRAMES` is what makes QEMU boot straight through to the
-interactive path, and it is kept. The row could instead have been left on the desktop
-and closed by the operator's close disc (`wm::winid_register_holder` clears the id
-cell on any close route), but nothing on the rast path is a service task, so no later
-pass would exist to notice that close and free the ~300 KiB surface. A bounded window
-that frees what it allocated was chosen over a permanent one whose backing could only
-be released by leaking it into a `static`.
+**What is bounded is the SPIN, not the window.** `FRAMES` is what makes QEMU boot straight
+through to the interactive path and it is unchanged. When it runs out the row is PARKED: it
+stays on the desktop with its last frame, draggable and raisable, and closable by the
+ordinary route — `RW_WIN` is registered with `wm::winid_register_holder`, so a close disc, a
+Quit or `wc_close_furniture` clears the cell through `wm::close` exactly as for any other
+furniture row. A window that erases itself three seconds after it opens is a demo; one that
+stays is an app. The cost is ~300 KiB retained for the boot, held by a module-owned cell
+(`pulsewin`'s `STORE` shape), and the surface deliberately outlives the row on an operator
+close — the safe direction, since the unsafe one is freeing a surface a live row still points
+at. On tegra the two passes SHARE the row: `run_mc` opens and parks it and `run` takes it back
+out, so a boot has one 3D window rather than two in sequence.
 
-**⚠ ORIN-RASTGLASS's premise is now false, and it is not this arc's to repair.**
-`arch/aarch64/display_tegra.rs:4648-4714` discriminates rast ink by exact equality
-with the backdrop constant `0x0010_1018`. That constant is **unchanged**, so the
-probe's *identification* still works. What the windowed shape falsifies is its two
-sampling **regions**: the SURROUND arm samples the panel *outside* a centred 320×240
-box and requires every pixel there to be the backdrop — a premise that held only
-because `run` owned the whole panel. A windowed renderer paints no pixel outside its
-row, so the surround is desktop, `paper == 0`, and the probe latches `NO-RAST-INK`
-(verdict 3, outside `rg_painted`'s passing set). That is the probe going **blind**,
-which is the direction its own header declares acceptable — "it goes BLIND, never
-falsely green" — and it cannot produce a false PASS. **What it should assert
-instead:** take the row's rect from `wm::info(id)` (`x`, `y`, `w`, `h`, `scale`);
-require the backdrop constant in the content's border margin and at least one
-non-backdrop pixel in the content's middle (the same two-population design its
-`blevels` note argues for, moved inside the window); and require the panel *outside*
-the row to carry **no** pixel of that value at all — the old surround test with its
-sense inverted, which is now the stronger claim of the two.
+**ORIN-RASTGLASS was repaired in the follow-up commit (A67).** The probe used to locate
+RAST's ink by restating this module's constants — a centred 320×240 box — and to require the
+backdrop constant *outside* it. A windowed renderer falsified both regions, and for one commit
+the probe was blind. It now works the other way round:
+
+- **It asks where the row is.** `rast_demo::rastwin_seat()` publishes what `wm::info` actually
+  seated — content rect and outer box, already multiplied by the compositor's integer `scale`.
+  That multiply is what no restatement could have got right: on a 1920×1200 panel a 320×240
+  surface composites at 640×480 while `info.w`/`info.h` still read 320×240. The restated
+  `RG_DEMO_W`/`RG_DEMO_H` constants are deleted.
+- **Three populations, the outer one inverted.** MARGIN (inside the content rect, owned by the
+  clear) must be the backdrop; MIDDLE must carry at least one non-backdrop pixel, so "the cube
+  drew" stays a separate claim from "the clear landed"; OUTSIDE (full-width strips above and
+  below the outer box, each one contiguous rectangle so no rect subtraction can be got wrong)
+  must carry **zero** backdrop pixels. That last is the old surround test with its sense
+  reversed, and it is the stronger claim: *the renderer touched nothing outside its row*
+  becomes a property measured from the glass rather than read off the code.
+- **Blind before falsely green, made explicit.** `RAST-NO-WINDOW` is reported when no seat was
+  ever published, and `RAST-LEAKED-OUTSIDE` when backdrop ink is found outside the row —
+  ordered above the row's own arms, because ink on glass the renderer does not own is a defect
+  however good the row looks. Neither is in the passing set.
+- **The `post` sample moved to where the question has an answer** — inside `run`, on the last
+  composited frame, latched one-shot — because fired from the terminus line (after `run`
+  returns) it would read the desktop and report `NO-RAST-INK` on every healthy boot.
+- **A bounded spin ending is not a repaint.** `rastwin_live()` separates "a row is composited
+  now" from "a row was seated and here is where", and the census gained `RAST-WINDOW-CLOSED`
+  so an operator close is not scored as an overwrite. The rung stays bounded and latched:
+  `RG_DONE`, `RG_CENSUS_PERIOD` and `RG_LATE_MAX` are unchanged.
 
 **The `fbcon::detach()` at `main.rs:7138` stays, and the reason is precise.** The
 windowed renderer removes *rast's own* second-writer problem — it no longer owns the

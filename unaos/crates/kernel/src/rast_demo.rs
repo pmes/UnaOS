@@ -117,6 +117,109 @@ const RW_OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x61;
 /// untitled documents only, so this is a name and not `3D Demo 1`. `wm::MAX_TITLE` is 16.
 const RW_TITLE: &[u8] = b"3D";
 
+/// RASTWIN — **where the row was SEATED, in panel pixels**, published for ORIN-RASTGLASS (A67).
+///
+/// The probe in `arch/aarch64/display_tegra.rs` used to locate RAST's ink by RESTATING this
+/// module's private constants — a centred `DEMO_W` x `DEMO_H` box — because it had no other way to
+/// know where to look. That worked only while `run` owned the panel and painted a box it computed
+/// itself. A windowed renderer does not choose its own geometry: the compositor does, including an
+/// integer upscale the demo never sees until it asks. So the geometry is PUBLISHED rather than
+/// guessed, and it comes from [`wm::info`] — what the compositor actually seated — never from what
+/// this module requested.
+#[derive(Clone, Copy)]
+pub struct RastwinSeat {
+    /// Content rect on the panel: origin, and the SOURCE dimensions already multiplied by `scale`.
+    pub cx: usize,
+    pub cy: usize,
+    pub cw: usize,
+    pub ch: usize,
+    /// Outer box (content plus chrome: title bar above, border all round).
+    pub ox: usize,
+    pub oy: usize,
+    pub ow: usize,
+    pub oh: usize,
+}
+
+/// RASTWIN — the published seat, as plain atomics so a reader needs no lock. That matters to the one
+/// reader there is: ORIN-RASTGLASS samples the panel with the `WRITER` guard already dropped and is
+/// forbidden to take `wm`'s table lock (ORIN-WM1's acyclic `WRITER` -> `TABLE` rule), so a snapshot
+/// it can read with eight relaxed loads is the only shape that fits. It also answers AFTER the row
+/// has closed, which `wm::info(id)` cannot: the census's `late` sample runs seconds later, when the
+/// window is long gone, and "is there ink outside the rect the window occupied" is still a perfectly
+/// good question then — after the close it is the ONLY one still worth asking.
+static RW_SEAT: [core::sync::atomic::AtomicUsize; 8] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 8];
+/// RASTWIN — whether [`RW_SEAT`] has ever been published. Separate from the values because a seat at
+/// the panel origin is legal and `(0,0,0,0,…)` must not be mistaken for "never opened": the probe's
+/// whole discipline is that it says what it could not determine rather than guessing.
+static RW_SEAT_VALID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// RASTWIN — whether a row is composited RIGHT NOW, as opposed to [`RW_SEAT_VALID`]'s "a row was
+/// seated at some point and here is where".
+///
+/// The two facts are genuinely different and ORIN-RASTGLASS needs both. Its `post` sample runs while
+/// the row is live and asks "did the blit reach the scan-out". Its `late` census sample runs seconds
+/// later, by which time this demo's BOUNDED window has closed itself and the compositor has
+/// repainted the desktop over the vacated box. Without this flag the census would read that healthy,
+/// specified ending as `RAST-PAINTED-OVERWRITTEN` on every good boot — a verdict that fires on a
+/// working machine and a broken one alike, which is the exact instrument failure this rung exists to
+/// avoid.
+static RW_SEAT_LIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// RASTWIN — is a 3D row composited right now? See [`RW_SEAT_LIVE`] for why this is not the same
+/// question as [`rastwin_seat`] returning `Some`.
+pub fn rastwin_live() -> bool {
+    RW_SEAT_LIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// RASTWIN — the published seat, or `None` if this module has never seated a row in this boot.
+///
+/// `None` is a REPORTABLE STATE, not an error: it means `run`/`run_mc` declined before creating a
+/// window (headless, alloc refused, panel cannot seat the box), each of which names itself on its
+/// own `[rastwin] … DECLINE reason=` line. A probe that read `None` as "no ink found" would be
+/// converting "I could not look" into "I looked and saw nothing".
+pub fn rastwin_seat() -> Option<RastwinSeat> {
+    use core::sync::atomic::Ordering;
+    if !RW_SEAT_VALID.load(Ordering::Acquire) {
+        return None;
+    }
+    let v = |i: usize| RW_SEAT[i].load(Ordering::Relaxed);
+    Some(RastwinSeat {
+        cx: v(0), cy: v(1), cw: v(2), ch: v(3),
+        ox: v(4), oy: v(5), ow: v(6), oh: v(7),
+    })
+}
+
+/// RASTWIN — publish the seat from what `wm` actually seated. Called once per open, after
+/// `create_at` has returned a live id, so `info` answers about a row that exists.
+///
+/// The `scale` multiply is the part that could not have been guessed: `wm::place_scale` picks an
+/// integer upscale from the panel's geometry (`pw / 2 / w`, the usable height, and a legibility
+/// cap), so on the 1920x1200 bench panel a 320x240 surface is composited at 640x480 while the
+/// SOURCE dimensions `info` reports stay 320x240. A probe sampling `info.w` x `info.h` would have
+/// read a quarter of the window and called the rest of it foreign.
+fn rw_publish_seat(id: wm::WinId) {
+    use core::sync::atomic::Ordering;
+    let Some(i) = wm::info(id) else {
+        // The row went away between `create_at` and here. Leave the seat unpublished rather than
+        // storing a rect nothing stands behind.
+        return;
+    };
+    let (cw, ch) = (i.w.saturating_mul(i.scale), i.h.saturating_mul(i.scale));
+    let ox = i.x.saturating_sub(wm::BORDER);
+    let oy = i.y.saturating_sub(wm::TITLE_H + wm::BORDER);
+    let ow = cw.saturating_add(2 * wm::BORDER);
+    let oh = ch.saturating_add(wm::TITLE_H + 2 * wm::BORDER);
+    for (slot, val) in [i.x, i.y, cw, ch, ox, oy, ow, oh].iter().enumerate() {
+        RW_SEAT[slot].store(*val, Ordering::Relaxed);
+    }
+    // Release LAST: a reader that sees the flag sees all eight values (paired with the Acquire in
+    // `rastwin_seat`).
+    RW_SEAT_VALID.store(true, Ordering::Release);
+    RW_SEAT_LIVE.store(true, Ordering::Release);
+}
+
 /// RASTWIN — the surface clear colour, and it is the SAME `0x0010_1018` the panel-owning shape
 /// filled the whole screen with. Kept identical on purpose, with a cost that has to be stated
 /// rather than discovered:
@@ -281,7 +384,7 @@ pub fn run(_screen: &mut crate::video::Screen) {
         serial_println!("{} -> FAIL reason=target-mismatch ::", WIN_VERDICT);
         return;
     }
-    let Some(mut win) = RwWin::open("spin", &color) else {
+    let Some(mut win) = rw_take_or_open("spin", &color) else {
         // Every decline named its own reason above. The verdict line is still emitted so a capture
         // never has to infer the outcome from the ABSENCE of a PASS.
         serial_println!("{} -> FAIL reason=no-window ::", WIN_VERDICT);
@@ -379,16 +482,27 @@ pub fn run(_screen: &mut crate::video::Screen) {
         if pass { "PASS" } else { "FAIL" }
     );
 
-    // ── Retire the window ──────────────────────────────────────────────────────────────────────
-    // WHY THE BOUND, and not a window that lives on. `FRAMES` is what makes QEMU boot straight
-    // through to the interactive path, and it is the bound this arc keeps. The row could instead
-    // have been left on the desktop and closed by the operator's close disc —
-    // `wm::winid_register_holder` would clear the id cell on any close route — but nothing on the
-    // rast path is a service task, so no later pass exists to notice that close and free this
-    // surface. The choice is therefore between a bounded window that frees what it allocated and a
-    // permanent window whose ~300 KiB can only be released by leaking it into a `static`. Bounded
-    // wins: the demo's lifetime is the demo's, and the desktop it was drawn on is exactly as it was.
-    win.close("spin");
+    // ── Park the window ────────────────────────────────────────────────────────────────────────
+    // WHAT IS BOUNDED IS THE SPIN, NOT THE WINDOW. `FRAMES` is what makes QEMU boot straight through
+    // to the interactive path and it is untouched; when it runs out the row stays on the desktop
+    // with its last frame, draggable, raisable and closable by the ordinary route. The first shape
+    // of this arc tore the row down here; it no longer does, because a window that erases itself
+    // three seconds after it opens is a demo and one that stays is an app — the brief's own
+    // preferred option. Parking costs ~300 KiB retained for the boot. See `RwWin::park`, including
+    // the note on a causal claim about `wm::close` that the evidence did NOT support.
+    //
+    // A67 — ORIN-RASTGLASS's `post` read-back is taken HERE, on the last composited frame, and NOT
+    // at the terminus line where it used to sit. THAT MOVE IS THE WHOLE REPAIR: `post` asks "did the
+    // blit reach the scan-out at all", and the only instant at which that question has an answer is
+    // while the row is composited and carrying the cube. At the terminus — after `run` returns — the
+    // answer would be whatever the desktop looks like there, which is an instrument that says the
+    // same thing on a working machine and a broken one. It is taken before the park rather than
+    // after only so that nothing at all can come between the sample and the last presented frame.
+    // The call is arch-gated on the one panel that HAS a read-back probe, and `main.rs:7141`'s
+    // now-duplicate call is removed in the same commit, so the sample is taken exactly once.
+    #[cfg(all(feature = "tegra", target_arch = "aarch64"))]
+    crate::arch::display_tegra::orin_rast_glass_post();
+    win.park("spin");
 }
 
 /// RASTWIN — the fixture's line head, as one constant so the emit sites cannot drift from each
@@ -470,12 +584,21 @@ impl RwWin {
             serial_println!("[rastwin] {} open DECLINE reason=create-refused", tag);
             return None;
         }
+        // A67 — publish the SEATED geometry before the first witness line, so a capture that carries
+        // an `[orinrast]` verdict always carries the open line that explains where it looked.
+        rw_publish_seat(id);
+        // The row is PARKED on the desktop when the spin ends rather than closed (see `park`), so it
+        // outlives this function and an operator can close it. Register the cell so `wm::close` on
+        // ANY route clears it and this module never hands back a re-issued id.
+        RW_WIN.store(id, core::sync::atomic::Ordering::Release);
+        wm::winid_register_holder(&RW_WIN, "rastwin");
         serial_println!(
             "[rastwin] {} open win={} owner={:#x} surf={}x{} box={}x{} scale={} at ({},{}) \
-             panel={}x{} title={} (3D renders INTO this row; this module writes no panel pixel \
-             outside it)",
+             panel={}x{} title={} seat={:?} (3D renders INTO this row; this module writes no panel \
+             pixel outside it)",
             tag, id, RW_OWNER, w, h, ow, oh, scale, ox, oy, pw, ph,
-            core::str::from_utf8(RW_TITLE).unwrap_or("?")
+            core::str::from_utf8(RW_TITLE).unwrap_or("?"),
+            rastwin_seat().map(|s| (s.cx, s.cy, s.cw, s.ch))
         );
         Some(RwWin { id, store, stride, ox, oy, ow })
     }
@@ -493,19 +616,77 @@ impl RwWin {
         }
     }
 
-    /// Close the row, then free the surface. ORDER IS THE POINT: `wm::close` runs the drain barrier
-    /// that waits out in-flight composites, and only after it returns may the backing die. The
-    /// reverse leaves one composite pass reading freed memory (`pulsewin::close`'s rule, and the
-    /// reason it is a rule).
-    fn close(self, tag: &str) {
+    /// **Park the window on the desktop instead of tearing it down.**
+    ///
+    /// THIS REPLACED A `wm::close(id)` + `drop(store)`, on design grounds: a 3D window that erases
+    /// itself three seconds after it opens is a demo, and a window that stays is an app. The brief's
+    /// own preferred option was "closable by the ordinary route", and that is what parking buys —
+    /// the row stays on the desktop beside Console / Shell / Quarry with its last frame, draggable
+    /// and raisable, and the operator closes it when they are done with it.
+    ///
+    /// ⚠ A CAUSAL CLAIM WAS ALMOST MADE HERE AND IS NOT SUPPORTED — recorded so nobody re-derives
+    /// it. This change was first made because `wm::dmgovlp_selftest` failed (`drag_evt=0 … -> FAIL`)
+    /// on a run that closed the row and passed (`drag_evt=5 … -> PASS`) on a run that did not. A
+    /// wider census killed that reading: `dmgovlp` also produced BOTH outcomes with `rast` OFF, on
+    /// builds where this module is not linked at all and the image is byte-identical to baseline.
+    /// The fixture is load-sensitive on this box, so it cannot convict or acquit anything here.
+    /// See orin-ledger A68 for the six-run table. **Parking stands on the design argument above and
+    /// on nothing else.**
+    ///
+    /// WHAT PARKING COSTS, stated rather than discovered: the ~300 KiB surface is retained for the
+    /// life of the boot, held by [`RW_KEEP`]. That is not a leak — it is a module-owned allocation
+    /// with a live owner, exactly `pulsewin`'s `STORE` shape — and it buys the behaviour this window
+    /// should have had anyway: the cube stays ON the desktop beside Console / Shell / Quarry,
+    /// draggable and raisable, instead of vanishing three seconds after it appears. The [`FRAMES`]
+    /// bound is untouched, so QEMU still boots straight through; what ends is the SPIN, not the
+    /// window.
+    ///
+    /// The row stays closable by the ordinary route: [`RW_WIN`] is registered with
+    /// `wm::winid_register_holder`, so a close disc, a Quit or `wc_close_furniture` clears the cell
+    /// through `wm::close` exactly as for every other furniture row. The surface then outlives the
+    /// row, which is the SAFE direction — the unsafe one is freeing a surface a live row still
+    /// points at, which is the rule `pulsewin::close` exists to state.
+    fn park(self, tag: &str) {
         let id = self.id;
-        wm::close(id);
-        drop(self.store);
         serial_println!(
-            "[rastwin] {} close win={} -> CLOSED (surface freed; desktop untouched)",
+            "[rastwin] {} park win={} -> ON-DESKTOP (spin ended, window stays; surface retained, \
+             closable by the ordinary route)",
             tag, id
         );
+        *RW_KEEP.lock() = Some(self);
     }
+}
+
+/// RASTWIN — the parked window, owned for the life of the boot. See [`RwWin::park`].
+///
+/// It is also how the two renderers SHARE one row: on tegra `run_mc` runs first, opens the window
+/// and parks it; `run` then takes it back out and keeps spinning in the same row rather than
+/// minting a second one. One 3D window per boot, not two in sequence.
+static RW_KEEP: spin::Mutex<Option<RwWin>> = spin::Mutex::new(None);
+
+/// RASTWIN — the parked row's id, registered with `wm::winid_register_holder` so ANY close route
+/// (the title-bar close disc, a Quit, `wc_close_furniture`) clears it through `wm::close`, and this
+/// module can never hand back an id the table has re-issued.
+static RW_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(wm::WIN_NONE);
+
+/// RASTWIN — reuse the parked window if there is one, else open a fresh one.
+///
+/// `first` is blitted only on a fresh open: a parked row already carries the last frame the previous
+/// pass presented, so re-blitting would be a whole-surface write that the damage comparison then
+/// correctly reports as zero rows moved — work for nothing.
+fn rw_take_or_open(tag: &str, first: &[u8]) -> Option<RwWin> {
+    if let Some(w) = RW_KEEP.lock().take() {
+        if wm::info(w.id).is_some() {
+            serial_println!("[rastwin] {} reuse win={} (parked by an earlier pass)", tag, w.id);
+            RW_SEAT_LIVE.store(true, core::sync::atomic::Ordering::Release);
+            return Some(w);
+        }
+        // The operator closed it between the two passes. Drop the orphaned surface — the row it
+        // backed is already gone, so nothing can be reading it — and mint a fresh window.
+        serial_println!("[rastwin] {} parked win={} was closed by the operator — re-minting", tag, w.id);
+        drop(w.store);
+    }
+    RwWin::open(tag, first)
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -859,7 +1040,7 @@ pub fn run_mc(_screen: &mut crate::video::Screen) {
     // open cost (one allocation, one `create_at`, one composite) is charged to neither arm. Both
     // arms then present through this one row.
     mc_render_frame(&mut base_color, &mut base_depth, 0);
-    let Some(mut win) = RwWin::open("mc", &base_color) else {
+    let Some(mut win) = rw_take_or_open("mc", &base_color) else {
         serial_println!(
             ":: RAST-MC: no compositor row could be seated — the multi-core rung is unavailable on \
              this boot; single-core path unchanged ::"
@@ -920,7 +1101,7 @@ pub fn run_mc(_screen: &mut crate::video::Screen) {
         );
         // RASTWIN — the baseline arm already opened the row, so this fail-closed exit owns it.
         // A return that left the window live would strand a surface this frame drops.
-        win.close("mc");
+        win.park("mc");
         return;
     }
     let mut bufs: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::vec::Vec<f32>)> =
@@ -1046,5 +1227,5 @@ pub fn run_mc(_screen: &mut crate::video::Screen) {
     // `RwWin::close` states — `wm::close` waits out in-flight composites, and this core is the one
     // that has been feeding them. `run` opens its own row for the paced spin immediately after this
     // function returns, so the glass is never left holding a dead box.
-    win.close("mc");
+    win.park("mc");
 }
