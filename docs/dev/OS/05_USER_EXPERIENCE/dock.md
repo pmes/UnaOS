@@ -92,11 +92,32 @@ reopens it immediately"*). Two separate defects produced that: the disarm sat be
 render pass on another core could mint into the gap; and the app-menu **Quit** arm called bare
 `wm::close(win)` and never reached `pulsewin::close()` at all. Both are fixed — the disarm is now the
 first statement of `pulsewin::close()`, and `winmenu`'s `Quit` arm runs the owning module's close first
-(`pulsewin::win() == win && pulsewin::close()`) and falls through to `wm::close` for every other window,
-so the disc and the menu are ONE path.
+and falls through to `wm::close` for every other window, so the disc and the menu are ONE path.
 
 So the contract reads: **the red disc, the app menu's Quit and `wc_close_furniture` all end in
 `wm::close`, and for a window whose module owns state they reach it THROUGH that module's `close()`.**
+
+Since QUITLEAK the arm is that contract for **every** such app, not for the pulse instrument alone:
+
+```rust
+let closed = (pulsewin::win() == win && pulsewin::close())
+    || quarry_quit(win)      // quarry::live::win() == win  ->  quarry::live::close()
+    || instgui_quit(win)     // instgui::win()      == win  ->  instgui::close()
+    || wm::close(win);
+```
+
+`quarry_quit` and `instgui_quit` are tail-appended owner arms in `video/winmenu.rs`, and they are
+functions rather than two more folded sub-expressions for one reason: each carries a **narrower `cfg`**
+than the `Quit` arm's. Quarry's implementation sits behind `feature = "quarry"` on top of the furniture
+family, the installer behind `all(target_arch = "x86_64", feature = "wc", feature = "instgui")`, and a
+folded sub-expression cannot carry a `cfg` of its own without becoming a second statement — which that
+arm may not have, because `winmenu.rs` is a bare `pub mod` compiled into the knob-off image, where an
+added line moves every `panic::Location` below it (PARITY.md §5.3). Each arm has a `not(...)` twin
+returning `false`, so a build without the feature takes exactly the `wm::close` it always took, and the
+arms themselves are gated on the furniture family, so the knob-off image compiles none of them.
+
+**The interface an app owes is exactly that pair: a public `win()` and a public `close()` that is safe
+to call when it is not open.** A new app with state outside the window table joins by adding an arm.
 
 It is gated rather than asserted. `winmenu::pulsequit_selftest` (tail of `video/winmenu.rs`, reached from
 `winmenu::selftest`, itself reached from `crystal::selftest`) drives both gestures through the real press
@@ -105,12 +126,59 @@ itself — the disarm happened before the swap, the close ended with no window a
 surface was actually freed — plus the module's own close counter, which a bypassed Quit cannot advance.
 Its verdict is one line, `:: PULSEQUIT: pulsewin_open=2 close=2 close_final=2 dock_rearm=2 … :: PASS ::`.
 
-**Two windows still take the bare path, and they are named here rather than left to be re-derived:**
-`quarry` (`quarry::close()` drops `MODEL` and clears `SURF`) and `instgui` (`instgui::close()` also calls
-`fbcon::console_present_suspend(false)`). Neither has an `ARMED` latch, so neither REOPENS — that is why
-the same Quit on a Quarry window looked correct on render8 — but each leaks its own teardown when the
-quit arrives from the app menu, and `instgui`'s leaves the console's presents suspended. Closing that
-needs a public `win()`/`close()` pair on both modules; until then this paragraph is the record.
+**The two windows that still took the bare path are QUARRY and INSTGUI, and QUITLEAK closed both.**
+`quarry::live::close()` drops `MODEL` and clears `SURF`; `instgui::close()` also calls
+`fbcon::console_present_suspend(false)`. Neither module has an `ARMED` latch, so neither REOPENS — which
+is exactly why the same Quit on a Quarry window *looked* correct on render8, and why the defect survived
+a flight that was watching for it. The window did stay closed. Nothing was released.
+
+* **Quarry — a LEAK.** The bypass reaps the row with the model still allocated and the panel-sized
+  surface still published (1920×1200×4 on the bench panel).
+* **Instgui — a STRANDING, and the serious one.** The dialog suspends the console's presents while it
+  is modal over the glass; its `close()` is what resumes them. Quit it from the app menu on the
+  pre-QUITLEAK tree and the dialog goes away with the suspension still set — a desktop that never
+  presents the console again for the rest of the boot, with nothing on the glass to explain it. That is
+  the same stranding class `video/login.rs` was healed for in fold `6fee8b3a` (LOGINCLOSE: `WIN`,
+  `FORM.state` and the suspension move together or the machine is dead), arriving by a different door.
+
+> ⚠ **The installer's app-menu door does not exist yet, and QUITLEAK's own fixture is what measured
+> that.** `instgui` mints its row `wm::create_at(0, …)` — owner `0` — and `wm::dock_addressable` is
+> `r.used && !r.compat && r.owner_asid != 0`. So `wm::dock_scan` never emits the row, `menubar`'s
+> caption reduction never names it, and the bar lays out no app box for it: `bar_named=false` with
+> the window live and on the glass (`[wc-a] create win=1 asid=0x0 … z=58` against `[wc-fv] focus
+> shell z=57 hidden=0 exempt=0`). The arm above is therefore the right contract and is **UNGATED**
+> until that window becomes dock-addressable — which is a design question (should a modal installer
+> dialog carry an app menu and a dock tile at all?), not a bug to patch in passing. **The door that
+> IS open on this tree is the close disc:** `wc_close_furniture` (`arch/x86_64/syscall.rs`) is a bare
+> `wm::close(win)` for every furniture row and `instgui` has no `press_route` of its own to intercept
+> it, so the stranding is reachable there. Both are recorded, neither is fixed here.
+
+**The gate is `winmenu::appquit_selftest`**, a sibling of `pulsequit_selftest` at the same file's tail
+and reached from the same folded statement at the foot of `winmenu::selftest`. A sibling rather than two
+more rounds inside `pulsequit_selftest`, because these legs carry `cfg`s that fixture's body does not:
+folding them in would run `cfg` blocks through the middle of A30's verdict and let a SKIP in one app
+muddy the pulse line. Each round focuses the app's own window, composites (which is what publishes the
+bar's app box), presses the app box through `strip::press_route` and then the `Quit` row at
+`item_top(APP_MENU_DEFAULT, 2)` — the same two presses `selftest`'s leg 5 uses — and then asks what only
+the app's own teardown can answer:
+
+```text
+:: APPQUIT: app=quarry  win=1 bar_named=true menu_down=true quit_routed=true row_gone=true owner_close=true model_freed=1 surf_released=1 seal=3 was_open=false panel=1280x800 :: PASS ::
+:: APPQUIT: app=instgui win=1 bar_named=false NOT-REACHABLE reason=owner0-is-not-dock-addressable … z=58 shell_z=57 boxes=0 susp_at_open=true teardown_resumes=true … :: SKIP ::
+```
+
+`row_gone=` is reported and is **not** what convicts: A29's holder registry clears the module's own
+`WIN` cell from inside `wm::close`, so every end-state question answers identically on the broken tree.
+What the bypass cannot reach is the module's close COUNTER (`owner_close=`), the two bits
+`quarry::live::close` re-reads after its own teardown (`model_freed=`, `surf_released=`), and the
+installer's record of its last suspend call (`resumed=`). `susp_at_open=` is printed beside `resumed=`
+so the resume cannot pass vacuously: a resume never preceded by a suspension proves nothing.
+
+`quarry` and `instgui` are separately armed features, so on a bare `UNAOS_WC=1` boot each round prints a
+SKIP that names the missing knob — a leg that cannot fire is never left looking like one that passed.
+The instgui round keeps SKIPping with both knobs armed, for the reachability reason boxed above, and
+its SKIP line carries the `z=`/`shell_z=` pair so that claim is falsifiable from the capture rather
+than taken on trust.
 
 ## 4. The wire — one grammar, both apps, all three bodies
 
