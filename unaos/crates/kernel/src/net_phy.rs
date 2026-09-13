@@ -1038,7 +1038,7 @@ pub mod net6 {
                 P6
             ),
         }
-        ok
+        #[cfg(feature = "sntp6")] crate::net_sntp_client::service_tick(); ok // SNTP-NET6 DRIVE SEAM — the statement ORINTIME (ad549988) recorded as OWED and could not land, because net_phy.rs was held by executor NETVERB that same session; this fold holds both. Folded ONTO the return line, never a new one: a new statement here shifts every `panic::Location` below it in this file (LEDGER P7 / LAWS §5). This is the surface's own service path, ABOVE every device adapter — the deliberate refusal of the x86 shape, where the client hangs off `drivers/e1000.rs`'s service tick so changing the NIC loses the clock. Idempotent and free before the network exists: the client is LATCHED (one attempt sequence per boot), an operator's existing anchor stands it down rather than being overwritten, and it returns with no line, no packet and no latch until `ipv4()` and `gateway()` both answer.
     }
 
     /// The address + prefix the persistent interface carries, or `None` before `init`.

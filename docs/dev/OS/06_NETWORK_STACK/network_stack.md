@@ -709,6 +709,181 @@ which exits 1 with `WRONG-VERB(want arp) … verbs=ping`.
 
 ---
 
+## 9. SNTP-NET6 — UnaOS knows what time it is on the Jetson (orin-0912b, ledger A69)
+
+### 9.1 The gap, and why it was a gap and not a build-from-scratch
+
+Every piece of internet time sync was already in this tree, and none of them were joined on this
+board:
+
+| piece | where | state before this arc |
+|---|---|---|
+| RFC 4330 parser + request builder | `crates/kernel/src/net_sntp.rs` | shared, arch-neutral, hostile-input hardened, 126 lines |
+| civil wall clock (`set_anchor`/`unix_now`/`render_iso8601`) | `crates/kernel/src/clock.rs` | shared, both arches (CLOCK-1) |
+| FAT mtimes derived from that clock | `clock.rs::fat_stamp` | shared (CLOCK-3) — a synced board stamps real times for free |
+| a clock face in the menu bar's upper right | `video/menubar.rs` (layout table :49-50, `CLOCK_GLYPHS` :193) | drawn since it was written; refuses to draw until the clock is anchored |
+| an SNTP **client** | x86 `smolnet::sntp_sync_once`; Pi `arch/aarch64/genet.rs` | **none on the Jetson** |
+
+`lib.rs:48` said in as many words that the parser had no aarch64 consumer yet, and that was true
+until NET6 landed a smoltcp socket surface on the tegra rtl8168. The missing thing was one wire.
+
+**Why it was missing is the interesting part, and it is a design finding, not an accident.** On x86
+the ONLY caller of `smolnet::witness_tick_sntp` is a statement inside the Intel NIC driver
+(`drivers/e1000.rs:1219`), guarded `target_arch = "x86_64"`. The time client was hung off a
+particular NIC's service tick, so changing the NIC lost the clock — and the Jetson's NIC is an
+rtl8168. The Pi's client has the same shape one layer over (in `genet.rs` itself).
+
+### 9.2 What landed
+
+`crates/kernel/src/net_sntp_client.rs` (`sntp6` / `UNAOS_SNTP6=1`, default OFF) — the client, and
+NOTHING but the client. It duplicates no wire format (`crate::net_sntp` stays the single security
+surface) and no calendar (`crate::clock::render_iso8601` stays the single renderer). It names no
+NIC, no board, no arch register: it talks only to the public `net_phy::net6` surface
+(`open`/`bind`/`sendto`/`recvfrom`/`close`/`gateway`/`resolver`/`dns`), which routes through the
+`NicOps` adapter that `virtio_net.rs` registers on QEMU `virt` and `rtl8168_tegra.rs` registers on
+Orin metal. Same bytes on both, and on whatever NIC registers next.
+
+**`service_tick()` is the drive seam, and it is deliberately NOT a NIC's service tick.** It is
+latched (one attempt sequence per boot), it stands down when the clock is already anchored (an
+operator's `date -s` beats the network), and it returns silently — no line, no packet, no latch —
+until `net6::ipv4()` and `net6::gateway()` both answer, so calling it before the network exists is
+free and correct. It is therefore safe to call from ANY periodic, NIC-agnostic path.
+
+**Server selection**, in order, first address that ANSWERS wins, deduplicated by address, hard cap
+`MAX_ATTEMPTS = 3`:
+
+1. the DHCP-leased resolver (`net6::resolver()`) — source word `lease-resolver`;
+2. `pool.ntp.org` via `net6::dns()` — source word `dns-pool`;
+3. the default gateway (`net6::gateway()`) — source word `gateway`.
+
+⚠ **Step 2 is expected to fail on Orin metal today (SO47)**, which is why step 3 is not a nicety:
+on the next Orin boot the gateway is the path this actually takes, and the witness line names which
+source produced the address so a capture never has to guess.
+
+**The bound is structural.** A source that names no address costs no line and no packet; a source
+that names an address already tried costs neither. One line per attempt, one summary line — four
+lines is the ceiling for a boot. A retry loop that prints per packet is SO30, the defect that ate
+36% of a boot's wire, and the ladder's length being a `const` is what makes "this cannot flood"
+a claim about the code rather than about the author's intentions. `no reply` is a COMPLETE and
+honest outcome: the clock stays unsynced, the bar draws no clock, nothing fabricates a time.
+
+**Three measured departures from `smolnet::sntp_sync_once`**, which this is otherwise modelled on:
+
+1. a typed `Why` per failure, so the witness distinguishes a silent LAN from a Kiss-o'-Death from a
+   malformed datagram. The x86 client collapses all of them to `None` and reports every one of them
+   on the wire as "no reply";
+2. a **peer check** — the reply must come from `server:123` or it is dropped unparsed. The x86
+   client discards `recvfrom`'s source tuple, so a well-formed reply from a machine nobody asked
+   would set the machine's clock;
+3. `net6::open(u64::MAX, false)`, the kernel-borrow owner convention `net6::dns` already uses
+   (`net_phy.rs:1340`), rather than smolnet's own persistent-set owner, which does not exist here.
+
+**No panic path on a 48-byte datagram.** The client performs exactly one slice index of its own,
+`&buf[..n]`, and `net6::recvfrom` clamps `n` to `out.len()` (`net_phy.rs:1558`), so the slice cannot
+panic by the callee's construction. Everything past it is `net_sntp::parse`.
+
+### 9.3 The bar's clock, and the witness that proves it lights up
+
+The clock face was never missing — nothing on this board ever anchored the clock, so
+`clock::try_unix_now()` was `None` on every pass of every boot and the honesty rule at
+`menubar.rs:131-137` fired every time. §9.2 makes the OTHER branch reachable on aarch64 for the
+first time.
+
+Scoring it needed a new instrument, because the existing `clock={set|unsynced}` term rides the
+`:: MENUBAR:` census line, which is reached only from the x86 `dock::selftest` — and `menubar.rs`
+:400 and :938 state, and verify against the built artifact, that **an aarch64 image contains no
+`:: MENUBAR:` string at all**. Adding a second one would have bought sight by breaking the thing
+that makes the x86 leg checkable.
+
+So: a NEW family, `:: BARCLOCK:`, two states, **each latched to at most one line per boot** (the
+ceiling for the life of the machine is two lines). `compose_row` runs once per row of every
+composite; the latch, not the call sites, is what keeps this out of SO30 territory. The two call
+sites are LINE-NEUTRAL folds — the `unsynced` half from the model (the painter's clock branch never
+runs when there is nothing to draw, which is exactly the state that half exists to say aloud), the
+`set` half from the painter, which is the only place that knows the drawn rect.
+
+The honesty rule is **asserted, not assumed**, in both halves it has:
+
+* *the bar draws no clock while unsynced* — runtime, `net_sntp_client::fixture()` leg `0x20`:
+  anchored ⇒ `try_unix_now()` is `Some`, cleared ⇒ `None`, which is the exact predicate
+  `clock_hhmm` reads;
+* *the title keeps its width* — **compile time**, the `const _` block at the tail of `menubar.rs`:
+  `TITLE_X0` and `TITLE_GLYPHS` are constants that do not mention the clock, and `FLOOR_W` reserves
+  the clock's slot whether or not a clock is drawn. A static claim checked on every build beats a
+  runtime probe that only covers the states a given boot happened to reach.
+
+### 9.4 The deterministic fixture
+
+`net_sntp_client::fixture()` follows `smolnet::sntp_x86_gate`'s shape on purpose — canned datagrams,
+no NIC, no network, asserted outcome by outcome, and it **cleans up the anchor it plants**
+(`b3408a24` is the commit that had to teach the x86 fixture that; a fixture that leaves a canned
+July-22 anchor installed dates every FAT write and degrades every `logts` prefix for the rest of the
+boot). The restore reads `unix_now()` rather than `raw_anchor()`, so an operator's wall time comes
+back at its CURRENT value instead of jumping back to the instant they seeded it.
+
+`w` bits: `0x01` well-formed ⇒ exact Unix second + ISO · `0x02` short rejected · `0x04` stratum 0
+surfaces as KoD · `0x08` LI=3 alarm rejected · `0x10` a canned reply ANCHORS `crate::clock` and the
+deterministic anchor renders `2026-07-22T15:30:45Z` · `0x20` the bar's honesty rule, both
+directions. PASS is `w == 0x3f`.
+
+It is reachable from the `tste` verb (`selftest.rs`, one LINE-NEUTRAL fold), and deliberately NOT
+behind the `witness` battery feature: the Orin's proof of the parser and anchor path must not need a
+knob an operator standing at the bench cannot type.
+
+### 9.5 The wire shape a synced boot shows
+
+```
+:: NET6: [sntp6] attempt 1/3 server=192.168.1.1:123 source=lease-resolver -> 2026-09-13T21:04:07Z stratum=2 (civil clock anchored) ::
+:: NET6: [sntp6] sync COMPLETE anchored=yes source=lease-resolver server=192.168.1.1 iso=2026-09-13T21:04:07Z stratum=2 attempts=1/3 ::
+:: BARCLOCK: clock=set rect=40x20+736+7 glyphs=5 iso=2026-09-13T21:04:07Z title_glyphs=32 face=chrome20-bold — the bar drew a clock for the first time this boot ::
+```
+
+and an unanswered one:
+
+```
+:: NET6: [sntp6] attempt 1/3 server=192.168.1.1:123 source=lease-resolver -> no reply within budget ::
+:: NET6: dns pool.ntp.org -> NO ANSWER within budget (server 192.168.1.1) ::
+:: NET6: [sntp6] sync COMPLETE anchored=no attempts=1/3 — clock stays unsynced, the bar draws no clock (honest: nothing on this LAN answered :123) ::
+:: BARCLOCK: clock=unsynced rect=none glyphs=0 title_glyphs=32 — no civil anchor this boot, so the bar draws NO clock and the title keeps its width ::
+```
+
+Neither line carries a `FAULT_PATTERNS` token (`-> FAIL`, `FAIL ::`, `FAIL — `, `PANIC`): a LAN with
+no NTP responder is a complete outcome and must not redden a healthy gate.
+
+### 9.6 ⚠ OWED — the drive seam is not wired, and this is the ONE thing this arc could not do
+
+`service_tick()` exists, is bounded, guarded and latched, and is called from `tste`. **No periodic
+boot path calls it**, because every candidate call site is in a file this arc was not permitted to
+edit:
+
+| candidate seam | file:line | why it was not taken |
+|---|---|---|
+| NET6's own bring-up tail | `net_phy.rs` `net6::init()` :1010 | owned by executor NETVERB this session (SO47) |
+| the virt adapter's bring-up | `arch/aarch64/virtio_net.rs:642` `net6_start` | a NIC driver — the exact coupling this arc exists to remove |
+| the metal adapter's bring-up | `arch/aarch64/rtl8168_tegra.rs:5732` `net6_start` | same |
+| the arch-neutral boot terminus | `main.rs:2742` (tegra) / `:389` (virt) | outside the brief's file list, and `main.rs` carries a hard `panic::Location` byte-identity constraint |
+
+The recommended landing is **one statement, NIC-agnostic, in `net_phy.rs`**, at the tail of
+`net6::init()` — the surface's own service path, above every adapter:
+
+```rust
+#[cfg(feature = "sntp6")] crate::net_sntp_client::service_tick();
+```
+
+folded onto `init()`'s existing `ok` return line (code before the comment). It is idempotent, costs
+one relaxed atomic when the stack is not up, and puts the clock on the SURFACE rather than on a
+device — which is the whole point. Until it lands, the Orin's clock is reached by typing `tste`.
+
+### 9.7 The unification that should follow — ONE client, three drivers
+
+This arc's client is the **fourth** SNTP path in the tree (x86 `smolnet`, Pi `genet`, the shared
+parser, and this). The honest end state is one client with three device adapters under it, and
+nothing in `net6` is intrinsically arch-specific — it is smoltcp behind a `NicOps` function-pointer
+struct. See ledger A69's queued follow-up for the file:line cost of bringing x86's e1000 onto the
+net6 surface and retiring the other two clients.
+
+---
+
 ## See also
 - [`docs/dev/OS/`](../) — other kernel subsystem documentation.
 - `unaos/crates/net/` — the implementation.
