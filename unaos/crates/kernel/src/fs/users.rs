@@ -749,6 +749,54 @@ pub fn screen_open_once() {
     crate::video::crystal::login::open_once();
 }
 
+/// SO43 — **THE IGNITION PREDICATE, and the whole of what SO43 was.** The desktop boots to the login
+/// screen iff the DESKTOP EXISTS; the console's glyph ROUTE is read, reported, and deliberately not
+/// consulted.
+///
+/// ## The defect this function is the shape of
+///
+/// LOGIN M3 put the open at four ignition sites, and two of them wrote the gate as
+/// `if activate() { … }`. That return value is `fbcon::console_is_routed()` — a statement about where
+/// the CONSOLE's glyphs land, not about whether a desktop came up — and on a board whose panel reads
+/// 0 at the first call it is `false` on a boot whose desktop came up perfectly. The Orin printed
+/// exactly that, every flight
+/// (`docs/dev/evidence/orin28/render14-boot1-desktop-menubar.log`, `awk 'index($0,"[deskcascade]")'`):
+///
+/// ```text
+/// [deskcascade] -> CASCADED windows=2 bar=1 owns_pixels=1 route=ROUTED activate=false
+/// ```
+///
+/// `bar=1` — the desktop exists. `activate=false` — the gate said no. So the first thing anyone sees
+/// on this machine was gated on a flag that is false exactly where it matters, and the x86 ladder
+/// never caught it because there `activate()` is true.
+///
+/// ## Why BOTH facts are arguments
+///
+/// `console_routed` is taken, printed and thrown away on purpose. LAWS §5: *"say what the check
+/// measures and what the decision needs; if those are different sentences, the gap is the error"* —
+/// this seam is handed both sentences so the gap is a line on the wire and a leg in the fixture
+/// (`video/login.rs`'s IGNITION leg drives the Orin's own tuple, `desktop_up=true
+/// console_routed=false`, and reds the instant the rule consults the second term again). A seam that
+/// silently took one argument could not be told from the defect it replaces.
+///
+/// `desktop_up` is the CALLER's readback of the one unconditional step of its own bring-up — the menu
+/// bar — never a local it inferred from control flow, which is the same discipline
+/// `desktop_firmware::activate` applies to `console_is_routed` itself.
+///
+/// Idempotent: the screen keeps its own once-latch, so a second ignition site on the same boot is a
+/// swap and a return.
+pub fn screen_open_at_ignition(desktop_up: bool, console_routed: bool) {
+    serial_println!(
+        "[login] ignition desktop_up={} console_routed={} -> {} (SO43: the screen is gated on the DESKTOP EXISTING, never on the console route — `activate()` returns `console_is_routed()` and reads false on a board whose desktop is fully up)",
+        desktop_up,
+        console_routed,
+        if desktop_up { "OPEN" } else { "HELD" }
+    );
+    if desktop_up {
+        screen_open_once();
+    }
+}
+
 // =========================================================================================
 // SERVICE + FIXTURE
 // =========================================================================================
