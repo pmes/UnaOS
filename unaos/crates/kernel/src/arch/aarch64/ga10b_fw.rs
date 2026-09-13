@@ -25,7 +25,8 @@
 //! and sizes (our own bytes, their own digests, in the `witness`-gated table below — never a vendor
 //! byte) in `GA10B/`, and a twin `GA10BBAD/` with one byte of the data section flipped: the first pass
 //! must print `-> LOADED`, the second `-> REFUSED reason=digest` (the go-red proof, from a file, every
-//! run).
+//! run). `GA10BSS/` + `GA10BSSBAD/` are the SAME two passes over the SECOND TRIPLE (`SAFETY_SCHED`), so
+//! the table the `ga10bprobe5s` flight swaps in is exercised on QEMU before it is written to a card.
 //!
 //! WITNESS FAMILY `[ga10bfw]` — 9 bytes bracketed, over the 8-byte LLVM immediate-encode floor, so
 //! `LC_ALL=C grep -a -o -F '[ga10bfw]' kernel.elf` certifies the armed artifact (LAWS §5).
@@ -86,6 +87,31 @@ pub const ACR_GSP: [Expect; 3] = [
     },
 ];
 
+/// The SECOND TRIPLE — `safety-scheduler.{text,data,manifest}`, the other FMC-shaped triple in the same
+/// r36.4.3 `ga10b` directory (rung-5 brief §4.1.2 fact 3; ledger A61 named it and nobody had tried it).
+/// Same three-part shape, same `…encrypt…` opacity, same `text`/`data`/`manifest` stems, so the §4.1.2
+/// mapping applies to it UNCHANGED. Names, sizes and SHA-256 measured on the bench from the SAME package
+/// (`nvidia-l4t-firmware_36.4.3-20250107174145_arm64.deb`, MANIFEST beside the staged files, re-verified
+/// with `sha256sum` 2026-09-13): 15,104 + 3,072 + 2,048 = 20,224 B, every section already a multiple of
+/// 256, so `window_need` = 0x4f00 and the 2 MiB rung-4 window holds it a hundred times over.
+pub const SAFETY_SCHED: [Expect; 3] = [
+    Expect {
+        name: "safety-scheduler.text.encrypt.bin.prod",
+        size: 15_104,
+        sha: hx("fbfa3772379ceab967823f8bd1c416fb954f5c6ab1c09f346058a397093400cf"),
+    },
+    Expect {
+        name: "safety-scheduler.data.encrypt.bin.prod",
+        size: 3_072,
+        sha: hx("8f317c7c15f77254d1a9ae7263d5b2861fce90b43d72571ffa89b245213fc723"),
+    },
+    Expect {
+        name: "safety-scheduler.manifest.encrypt.bin.out.bin.prod",
+        size: 2_048,
+        sha: hx("5847ba43abfe615b3f7fa76701f9b1a087315b17f61119c1c6a5e25124be5fcb"),
+    },
+];
+
 /// The SYNTHETIC triple the QEMU fixture loads — same names, same sizes, OUR bytes: each file is the
 /// line `UNAOS GA10B5 SYNTHETIC <role> section (not a vendor byte)` repeated to the vendor file's size
 /// (`arroyo test_aarch64` generates them with `yes | head -c`). Their digests were taken once with
@@ -105,6 +131,29 @@ pub const SYNTH: [Expect; 3] = [
     },
     Expect {
         name: "acr-gsp.manifest.encrypt.bin.out.bin.prod",
+        size: 2_048,
+        sha: hx("7d0107d83740ac717a28b310db3b0084edc557d68ecfe549377a2e8507b6a393"),
+    },
+];
+
+/// The SYNTHETIC SECOND triple — `safety-scheduler`'s NAMES and SIZES, the same three `yes <line>` bodies
+/// (`arroyo test_aarch64` writes them to `GA10BSS/`, and `GA10BSSBAD/` flips byte 100 of the data section).
+/// The manifest digest equals `SYNTH`'s because both are 2,048 bytes of the same line — a fact, not a
+/// collision to hide: the two tables are told apart by the text and data sections, whose sizes differ.
+#[cfg(feature = "witness")]
+pub const SYNTH_SS: [Expect; 3] = [
+    Expect {
+        name: "safety-scheduler.text.encrypt.bin.prod",
+        size: 15_104,
+        sha: hx("29291130ac3599c38a4ad8fb29868a6c0fa04c4b0516ca4caaee2208b2b1b0f1"),
+    },
+    Expect {
+        name: "safety-scheduler.data.encrypt.bin.prod",
+        size: 3_072,
+        sha: hx("15589d664ae7ae72fda9fdb748ad1cea4012711721abeecaab9ce739f05cc61f"),
+    },
+    Expect {
+        name: "safety-scheduler.manifest.encrypt.bin.out.bin.prod",
         size: 2_048,
         sha: hx("7d0107d83740ac717a28b310db3b0084edc557d68ecfe549377a2e8507b6a393"),
     },
@@ -171,14 +220,17 @@ fn err_name(e: &crate::fs::vfs::VfsError) -> &'static str {
 /// this kernel can dereference (the rung-4 Normal-NC window is identity-mapped on the Orin; the fixture
 /// hands a heap buffer). Prints the vocabulary lines, P8, one line per file, and exactly one `->` line.
 /// Touches no GPU register.
-pub fn load(mt: &crate::fs::vfs::MountTable, dir: &str, expect: &[Expect; 3], window: u64, window_size: u64) -> Outcome {
+/// `roles[i]` is the BCR register file `i` is bound for — `ROLE` itself under the §4.1.2 mapping, and the
+/// permuted array under the mapping arm (`ga10bprobe5m`), so a `role=` on the wire never labels a section
+/// with a register it was not written to.
+pub fn load(mt: &crate::fs::vfs::MountTable, dir: &str, expect: &[Expect; 3], roles: &[&str; 3], window: u64, window_size: u64) -> Outcome {
     let need = window_need(expect);
     serial_println!(
         "[ga10bfw] loader — dir={} window={:#x}..{:#x} (three ordinary files read through the VFS, sized and sha256-verified, placed 256-byte-aligned; ZERO MMIO on every path; vocabulary: LOADED | REFUSED reason=<absent|size|digest|window>)",
         dir, window, window + window_size
     );
     for (i, e) in expect.iter().enumerate() {
-        serial_println!("[ga10bfw] expect role={} file={}/{} bytes={} sha256={}", ROLE[i], dir, e.name, e.size, Hex64::of(&e.sha).as_str());
+        serial_println!("[ga10bfw] expect role={} file={}/{} bytes={} sha256={}", roles[i], dir, e.name, e.size, Hex64::of(&e.sha).as_str());
     }
     // P8 — the fit, computed on the boot and printed BEFORE any read.
     serial_println!("[ga10bfw] window_need={:#x} window_have={:#x}", need, window_size);
@@ -240,7 +292,7 @@ pub fn load(mt: &crate::fs::vfs::MountTable, dir: &str, expect: &[Expect; 3], wi
         let ok = got == e.sha;
         serial_println!(
             "[ga10bfw] file={} bytes={} sha={} pa={:#x} off={:#x} role={} got={}",
-            e.name, buf.len(), if ok { "match" } else { "MISMATCH" }, pa, off, ROLE[i], Hex64::of(&got).as_str()
+            e.name, buf.len(), if ok { "match" } else { "MISMATCH" }, pa, off, roles[i], Hex64::of(&got).as_str()
         );
         if !ok {
             serial_println!("[ga10bfw] -> REFUSED reason=digest name={} (the bytes in the window are not the ledger row's file — a media fault or a staging miss, never a GPU result)", e.name);
@@ -296,12 +348,18 @@ pub fn fixture_service() {
     let base = ((backing.as_mut_ptr() as usize) + 255) & !255;
     let good = alloc::format!("{}/GA10B", root);
     let bad = alloc::format!("{}/GA10BBAD", root);
-    let p1 = matches!(load(&mt, &good, &SYNTH, base as u64, WIN as u64), Outcome::Loaded { total: 0x9d00, .. });
-    let p2 = matches!(load(&mt, &bad, &SYNTH, base as u64, WIN as u64), Outcome::Refused { reason: "digest", name: "acr-gsp.data.encrypt.bin.prod" });
+    let good_ss = alloc::format!("{}/GA10BSS", root);
+    let bad_ss = alloc::format!("{}/GA10BSSBAD", root);
+    let p1 = matches!(load(&mt, &good, &SYNTH, &ROLE, base as u64, WIN as u64), Outcome::Loaded { total: 0x9d00, .. });
+    let p2 = matches!(load(&mt, &bad, &SYNTH, &ROLE, base as u64, WIN as u64), Outcome::Refused { reason: "digest", name: "acr-gsp.data.encrypt.bin.prod" });
+    // The SECOND triple, same two passes: the table is the only thing that changes, which is exactly what
+    // the `ga10bprobe5s` flight changes, so the loader half of that rung is proven here from a file.
+    let p3 = matches!(load(&mt, &good_ss, &SYNTH_SS, &ROLE, base as u64, WIN as u64), Outcome::Loaded { total: 0x4f00, .. });
+    let p4 = matches!(load(&mt, &bad_ss, &SYNTH_SS, &ROLE, base as u64, WIN as u64), Outcome::Refused { reason: "digest", name: "safety-scheduler.data.encrypt.bin.prod" });
     drop(backing);
-    if p1 && p2 {
-        serial_println!("[ga10bfw] fixture: pass1(GA10B)=LOADED pass2(GA10BBAD)=REFUSED-digest -> PASS ::");
+    if p1 && p2 && p3 && p4 {
+        serial_println!("[ga10bfw] fixture: pass1(GA10B)=LOADED pass2(GA10BBAD)=REFUSED-digest pass3(GA10BSS)=LOADED pass4(GA10BSSBAD)=REFUSED-digest -> PASS ::");
     } else {
-        serial_println!("[ga10bfw] fixture: pass1(GA10B)={} pass2(GA10BBAD)={} -> FAIL — see the loader lines above", if p1 { "LOADED" } else { "NOT-LOADED" }, if p2 { "REFUSED-digest" } else { "NOT-REFUSED-digest" });
+        serial_println!("[ga10bfw] fixture: pass1(GA10B)={} pass2(GA10BBAD)={} pass3(GA10BSS)={} pass4(GA10BSSBAD)={} -> FAIL — see the loader lines above", if p1 { "LOADED" } else { "NOT-LOADED" }, if p2 { "REFUSED-digest" } else { "NOT-REFUSED-digest" }, if p3 { "LOADED" } else { "NOT-LOADED" }, if p4 { "REFUSED-digest" } else { "NOT-REFUSED-digest" });
     }
 }
