@@ -335,6 +335,35 @@ pub fn is_open() -> bool {
     FORM.lock().state == State::Open
 }
 
+/// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
+///
+/// `true` while the screen is up, for every `(x, y)` on the panel. Reached from
+/// `fs::users::screen_press`, which `video::strip::press_route` asks FIRST — ahead of the window menu,
+/// the crystal and the dock, and therefore ahead of every window arm in both routers. See
+/// [`crate::fs::users::screen_press`] for the derivation; what belongs HERE is why the coordinates are
+/// taken and then not used:
+///
+///  * **Inside the rectangle** the press must not reach the row beneath. The screen's row is minted under
+///    [`OWNER`] (the shell/desktop band), which `wm::hit_test` never names, so a press on the screen's own
+///    pixels resolves to whatever is BEHIND it and the router raises that — Peter's *"i click it and it
+///    went away"*. Nothing in this module can make the row hit-test without also giving it a close box
+///    (LOGINCLOSE's measured defect), so the press is stopped at the router instead.
+///  * **Outside the rectangle** the press must not reach the DOCK, the crystal or a window menu (SO36):
+///    the Mac model is that the login screen owns the whole glass, and a tile that launches a program with
+///    no session open launches it under NO principal.
+///
+/// So the honest signature is a predicate over the screen's state, and the coordinates are taken only so
+/// that a screen which one day grows a live region (a "switch user" affordance, say) narrows this in place
+/// rather than through a new seam. There is no press this function may decline while the screen is up.
+///
+/// It does NOT swallow keys — [`consume_key`] is that seam, unchanged — and it does not ACT: nothing is
+/// raised, focused, launched or closed by a `true` here. The router consumes the press and drops its
+/// release, the grammar every furniture arm already follows.
+pub fn press_swallow(x: i32, y: i32) -> bool {
+    let _ = (x, y);
+    is_open()
+}
+
 /// LOGINCLOSE — **the three pieces of the screen's state move together, or the machine is dead.**
 ///
 /// `WIN`, `FORM.state` and `fbcon`'s console-present suspension are set by [`open`] and cleared by

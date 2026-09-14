@@ -7449,7 +7449,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     // is only the raise/focus, which a right-click arguably should not have had.
     if mask & 0x01 != 0 {
         // PRESS.
-        CLICK_PRESSES.fetch_add(1, Ordering::Relaxed);
+        CLICK_PRESSES.fetch_add(1, Ordering::Relaxed); #[cfg(feature = "login")] if crate::fs::users::screen_press(x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // SO36/SO44 — THE SESSION GATE, and it goes ahead of the crystal, the dock and every window arm below. This arch's router keeps its OWN furniture arms (the CLICK-BAND re-split) instead of calling `video::strip::press_route`, so the aarch64 fold in that function does NOT cover this file and the statement is repeated here rather than assumed. Consumed with the target set to DROP, the grammar every furniture arm below already follows. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
         // CRYSTAL — **judged FIRST, ahead of the dock and every window arm.** The SHARD menu, when
         // open, is a modal dropdown composited on top of everything, so its press must be tested
         // before any layer beneath it; when closed, the only points it claims lie in the bar's
@@ -23788,8 +23788,12 @@ pub fn session_login(id: u32, name: &[u8]) -> bool {
 }
 
 /// LOGIN M1: close the session. Idempotent.
+///
+/// SO37: the epoch is bumped FIRST, so no instant exists in which the session is already gone while the
+/// epoch still names it. See the SO37 block below for what the epoch is and why it is not in the record.
 #[cfg(feature = "login")]
 pub fn session_logout() {
+    SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
     SESSION_USER.store(0, Ordering::Release);
     crate::arch::without_interrupts(|| { SESSION_NAME.lock().1 = 0; });
 }
@@ -23812,10 +23816,13 @@ pub fn session_name(out: &mut [u8]) -> Option<usize> {
 }
 
 /// LOGIN M1: stamp `slot` with the session user at load (0 with no session — the pre-LOGIN behaviour).
+/// SO37: the epoch goes on with it, from the same two loader returns, so a slot can never carry a user
+/// without the session that gave it.
 #[cfg(feature = "login")]
 fn slot_user_stamp(slot: usize) {
     if slot <= crate::arch::memory::USER_SLOTS {
         SLOT_USER[slot].store(SESSION_USER.load(Ordering::Acquire), Ordering::Release);
+        SLOT_EPOCH[slot].store(SESSION_EPOCH.load(Ordering::Acquire), Ordering::Release);
     }
 }
 
@@ -23824,25 +23831,85 @@ fn slot_user_stamp(slot: usize) {
 fn slot_user_clear(slot: usize) {
     if slot <= crate::arch::memory::USER_SLOTS {
         SLOT_USER[slot].store(0, Ordering::Release);
+        SLOT_EPOCH[slot].store(0, Ordering::Release);
     }
 }
 
 /// LOGIN M1: record the creating slot's user on the owner row (0 = none), beside `owned_set_owner`.
+/// SO37: through [`slot_user_live`], so a program of a CLOSED session that creates a file does not write
+/// the logged-out user's name onto it — it creates anonymously, exactly as it opens anonymously.
 #[cfg(feature = "login")]
 fn owned_user_stamp(nameid: usize, slot: usize) {
     if nameid < N_U10_NAMES && slot <= crate::arch::memory::USER_SLOTS {
-        OWNED_USER[nameid].store(SLOT_USER[slot].load(Ordering::Acquire), Ordering::Release);
+        OWNED_USER[nameid].store(slot_user_live(slot), Ordering::Release);
     }
 }
 
 /// LOGIN M1: by-user admission — the caller's slot carries the same NON-ZERO user as the row's creator.
+/// SO37: the caller's user is read through [`slot_user_live`], so a stamp from a CLOSED session is 0 and
+/// the `u != 0` guard this function has always had refuses it. No new deny branch, no new cost on the
+/// admit path: this whole function is only reached on a live-incarnation DENY.
 #[cfg(feature = "login")]
 fn owned_user_ok(nameid: usize, slot: usize) -> bool {
     if nameid >= N_U10_NAMES || slot > crate::arch::memory::USER_SLOTS {
         return false;
     }
-    let u = SLOT_USER[slot].load(Ordering::Acquire);
+    let u = slot_user_live(slot);
     u != 0 && u == OWNED_USER[nameid].load(Ordering::Acquire)
+}
+
+// -----------------------------------------------------------------------------------------------------
+// SO37 — THE SESSION EPOCH, x86 twin. The ABI answer, and why this arch pays even less for it.
+// -----------------------------------------------------------------------------------------------------
+//
+// The aarch64 file carries the full derivation (`arch/aarch64/syscall.rs`, the SO37 block): NOTHING in
+// `PrincipalRecord` changes size or meaning, because that record is the DURABLE identity — serialised
+// into `UNAFS.ATR` rows, projected to the native `owner` string by the K4 codec — and an epoch inside it
+// would make `user:<name>` a per-session identity, so a user's own files would stop opening after a
+// relogin. The epoch qualifies the STAMP, never the IDENTITY, and lives in a runtime-only side table.
+//
+// x86 has no `PrincipalRecord` at all (U6x keys the ACL by `(slot, gen)` and carries the user as its
+// users-table ID), so there is nothing here that could have been widened in the first place: the twin is
+// `SLOT_EPOCH` beside `SLOT_USER`, written by the same `slot_user_stamp`, cleared by the same
+// `slot_user_clear`, read by the one accessor `slot_user_live`. `OWNED_USER` — the row's CREATOR user —
+// is deliberately NOT epoch-tagged: the file's ownership is durable and survives the logout, which is the
+// whole point of a home directory.
+//
+// COST: `owned_user_ok` and `owned_user_stamp` are the only readers, and `owned_user_ok` runs ONLY on a
+// live-incarnation DENY in `sys_open`'s two ACL sites — the path that was about to return -EACCES. So the
+// added cost on the ADMIT path is exactly ZERO, and on the deny path one atomic load and one compare.
+// No allocation, no lock, no fallible call, no panic path.
+//
+// EPOCH 0 IS NEVER LIVE: `SESSION_EPOCH` starts at 1, `SLOT_EPOCH` at 0, so an unstamped or torn-down
+// slot fails the comparison instead of passing it.
+
+/// SO37: the LIVE session's epoch (starts at 1; 0 is the never-stamped slot value). Bumped by every
+/// [`session_logout`].
+#[cfg(feature = "login")]
+static SESSION_EPOCH: AtomicU32 = AtomicU32::new(1);
+
+/// SO37: the epoch each slot's user stamp was taken in (0 = never stamped, which never matches).
+#[cfg(feature = "login")]
+static SLOT_EPOCH: [AtomicU32; crate::arch::memory::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+
+/// SO37: the LIVE epoch as a NUMBER, for the wire — never a decision. Read by `fs::users::logout`, so
+/// every Log Out names the epoch it just opened and a boot's session boundaries are countable on serial.
+#[cfg(feature = "login")]
+pub fn session_epoch() -> u32 {
+    SESSION_EPOCH.load(Ordering::Acquire)
+}
+
+/// SO37: `slot`'s user id IF its stamp is from the LIVE session; 0 (anonymous — the pre-login world)
+/// when the session it was stamped in has closed.
+#[cfg(feature = "login")]
+fn slot_user_live(slot: usize) -> u32 {
+    if slot > crate::arch::memory::USER_SLOTS
+        || SLOT_EPOCH[slot].load(Ordering::Acquire) != SESSION_EPOCH.load(Ordering::Acquire)
+    {
+        return 0;
+    }
+    SLOT_USER[slot].load(Ordering::Acquire)
 }
 
 /// LOGIN M2 fixture (`loginst`): the x86 HOME ACL PROOF on the real ACL tables. x86 has no path open
@@ -23861,6 +23928,12 @@ pub fn home_acl_fixture(user_id: u32) -> bool {
     SLOT_USER[A].store(user_id, Ordering::Release);
     SLOT_USER[B].store(user_id, Ordering::Release);
     SLOT_USER[C].store(0, Ordering::Release);
+    // SO37: these three slots are hand-stamped rather than launched, so the epoch a real load would have
+    // given them is written beside the user — A and B in the LIVE session, C anonymous. Without this the
+    // M2 leg would go red on the epoch gate for an arrangement reason, not a security one.
+    SLOT_EPOCH[A].store(SESSION_EPOCH.load(Ordering::Acquire), Ordering::Release);
+    SLOT_EPOCH[B].store(SESSION_EPOCH.load(Ordering::Acquire), Ordering::Release);
+    SLOT_EPOCH[C].store(0, Ordering::Release);
     let ga = SLOT_GEN[A].load(Ordering::Acquire);
     let gb = SLOT_GEN[B].load(Ordering::Acquire);
     let gc = SLOT_GEN[C].load(Ordering::Acquire);
@@ -23873,11 +23946,74 @@ pub fn home_acl_fixture(user_id: u32) -> bool {
     owned_clear(nameid);
     OWNED_USER[nameid].store(0, Ordering::Release);
     for s in [A, B, C] {
-        SLOT_USER[s].store(0, Ordering::Release);
+        slot_user_clear(s); // SO37 — clears the epoch with the user, the teardown path's own function.
     }
     serial_println!(
         "[users] home-acl name={} user={} owner_ok={} same_user_live_refused={} same_user_admitted={} anon_refused={}",
         U6GX_NAME, user_id, owner_ok, b_live_refused, b_user_ok, c_refused
     );
     user_id != 0 && owner_ok && b_live_refused && b_user_ok && c_refused
+}
+
+/// SO37 fixture (`loginst`), x86 twin — **THE SESSION EPOCH, PROVED BY REFUSAL.** The aarch64 twin
+/// carries the full argument; this is the same five legs on this arch's by-USER admission, with no disk
+/// I/O (SO20's static name table), on the real ACL rows and the real `session_logout`/`session_login`:
+///
+///  * `A_OWN`, a slot of session 1, creates the name PRIVATE and stamps the row with its user.
+///  * `A_STALE`, a SECOND slot of session 1, is admitted BY USER while the session is open — the control
+///    that makes every refusal below mean something.
+///  * Log Out: refused with no session open.
+///  * The SAME user logs back in — identical users-table id, so only the epoch separates the sessions —
+///    and `A_STALE` is still refused, reading as user 0 (anonymous), not merely denied.
+///  * `A_FRESH`, stamped in session 2, is admitted. The user's file survives the logout; the stranded
+///    stamp does not.
+///
+/// Leaves session 2 open (the caller's `logout()` closes it), row cleared, all three stamps cleared.
+#[cfg(feature = "loginst")]
+pub fn session_epoch_fixture(user_id: u32, name: &[u8]) -> bool {
+    const A_OWN: usize = crate::arch::memory::USER_SLOTS - 2;
+    const A_STALE: usize = crate::arch::memory::USER_SLOTS - 1;
+    const A_FRESH: usize = crate::arch::memory::USER_SLOTS;
+    let Some(nameid) = u10_name_id(U6GX_NAME) else { return false };
+    let nameid = nameid as usize;
+    let epoch_open = SESSION_EPOCH.load(Ordering::Acquire);
+    slot_user_stamp(A_OWN);
+    slot_user_stamp(A_STALE);
+    slot_user_clear(A_FRESH);
+    let ga = SLOT_GEN[A_OWN].load(Ordering::Acquire);
+    owned_set_owner(nameid, A_OWN, ga);
+    owned_user_stamp(nameid, A_OWN);
+    let owned = owned_is_owner(nameid, A_OWN, ga);
+    let row_user = OWNED_USER[nameid].load(Ordering::Acquire);
+    let same_session_ok = owned_user_ok(nameid, A_STALE);
+    session_logout();
+    let refused_while_closed = !owned_user_ok(nameid, A_STALE);
+    let relogin = session_login(user_id, name);
+    let epoch_after = SESSION_EPOCH.load(Ordering::Acquire);
+    let stale_refused = !owned_user_ok(nameid, A_STALE);
+    let stale_user = slot_user_live(A_STALE);
+    slot_user_stamp(A_FRESH);
+    let fresh_ok = owned_user_ok(nameid, A_FRESH);
+    owned_clear(nameid);
+    OWNED_USER[nameid].store(0, Ordering::Release);
+    for s in [A_OWN, A_STALE, A_FRESH] {
+        slot_user_clear(s);
+    }
+    let ok = user_id != 0
+        && owned
+        && row_user == user_id
+        && same_session_ok
+        && refused_while_closed
+        && relogin
+        && stale_refused
+        && stale_user == 0
+        && fresh_ok
+        && epoch_after > epoch_open;
+    serial_println!(
+        ":: LOGIN-EPOCH: name={} user={} owned={} row_user={} same_session_ok={} refused_while_closed={} relogin={} stale_refused={} stale_user={} fresh_ok={} epoch={}->{} -> {} ::",
+        U6GX_NAME, user_id, owned, row_user, same_session_ok, refused_while_closed, relogin,
+        stale_refused, stale_user, fresh_ok, epoch_open, epoch_after,
+        if ok { "PASS" } else { "FAIL —" }
+    );
+    ok
 }

@@ -17100,7 +17100,7 @@ fn slot_ppid_clear(asid: u64) {
         return;
     }
     let _irq = IrqGuard::mask_save();
-    SLOT_PPID.lock()[asid as usize] = PrincipalRecord::NONE;
+    SLOT_PPID.lock()[asid as usize] = PrincipalRecord::NONE; #[cfg(feature = "login")] slot_epoch_clear(asid); // SO37 — the epoch goes with the stamp it qualifies. Not load-bearing (a NONE kind already declines the filter and a re-stamp writes a fresh epoch), but a side table that can outlive its record is the shape a later reader gets wrong. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// M2.3: the stamped persistent principal of an ARBITRARY address-space slot (NONE = anonymous / out of
@@ -17112,7 +17112,7 @@ fn slot_ppid_of(asid: u64) -> PrincipalRecord {
         return PrincipalRecord::NONE;
     }
     let _irq = IrqGuard::mask_save();
-    SLOT_PPID.lock()[asid as usize]
+    let p = SLOT_PPID.lock()[asid as usize]; session_epoch_filter(asid, p) // SO37 — the stamp is QUALIFIED by the session EPOCH it was taken in: a slot stamped in a session that has since CLOSED reads ANONYMOUS from here down, so SYS_OPEN's by-name branch, the O_CREAT owner persist and the grantee capture all see NONE. Knob-off this is the identity function and the read is the bare table entry. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// M2: the CALLER's stamped persistent principal (NONE = anonymous/public-only). Captured at O_CREAT (persist
@@ -24526,8 +24526,14 @@ pub fn session_login(_id: u32, name: &[u8]) -> bool {
 }
 
 /// LOGIN M1: close the session. Idempotent.
+///
+/// SO37: the epoch is bumped FIRST, so there is no instant in which `SESSION` is already NONE while the
+/// epoch still names the session that just ended. Idempotency is unchanged in the sense that matters —
+/// a second `logout()` closes nothing and refuses nothing new — but it is NOT a no-op: each call burns an
+/// epoch, which costs nothing and keeps the counter monotone.
 #[cfg(feature = "login")]
 pub fn session_logout() {
+    SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
     let _irq = IrqGuard::mask_save();
     *SESSION.lock() = PrincipalRecord::NONE;
 }
@@ -24555,7 +24561,107 @@ fn session_restamp(asid: u64) {
     let p = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
     if p.kind == PRIN_USER {
         slot_ppid_stamp(asid, p);
+        slot_epoch_stamp(asid); // SO37 — the stamp and the epoch it was taken in move TOGETHER, from the one mint path, so no slot can carry a user principal without the session that gave it.
     }
+}
+
+// -----------------------------------------------------------------------------------------------------
+// SO37 — THE SESSION EPOCH. What Log Out does to what the session started.
+// -----------------------------------------------------------------------------------------------------
+//
+// THE DEFECT (LEDGER SO37, `permission_model.md` §5): "programs already running keep their stamp — the
+// boundary is the LAUNCH, not the clock". Every ACL row was exactly what the launch wrote, so nothing was
+// broken; a DIMENSION was missing. After Log Out a still-running program stamped `user:una` still
+// satisfied `owned_access_ok`'s by-name branch against every file `user:una` owns, and the next user
+// shared the glass with it.
+//
+// THE ABI ANSWER, STATED BEFORE THE CHANGE (SO37 called this "an ABI change"):
+//
+//   * NOTHING IN `PrincipalRecord` CHANGES SIZE OR MEANING. Not one byte. It stays `kind: u8`,
+//     `len: u8`, `value: [u8; PRIN_VALUE_LEN=30]` — 32 bytes on the wire and on the disk.
+//   * WHO ELSE READS THAT RECORD, and why it could not carry the epoch:
+//       - `PrincipalRecord::write`/`read` serialise it into the 256-byte `UNAFS.ATR` row
+//         (`atr_serialize_row`/`atr_parse_row`) as the file's DURABLE owner, and into every `AtrGrant`
+//         (36 bytes). A field added here is an on-disk FORMAT BUMP that orphans every persisted row.
+//       - `principal_native_string`/`principal_from_native` (the K4 codec) project it to the native
+//         `owner` / `grants:<grantee>` attribute STRINGS a unafs volume will store. `user:<name>` is
+//         that string verbatim.
+//       - `owned_set_owner` / `owned_grant` / `owned_access_ok` compare it by VALUE equality.
+//     So an epoch INSIDE the record would not just be a format bump — it would make `user:una` a
+//     PER-SESSION identity, and a user's own files would stop opening after a relogin. That destroys
+//     the property `/home/<name>` exists for. The epoch belongs to the STAMP (this slot's claim to be
+//     speaking as the user right now), never to the IDENTITY (who the user is, durably).
+//   * AND THERE IS NO ROOM ANYWAY: `value` is a HARD 30 bytes, fully consumed by `PRIN_IMAGE_SHA256`
+//     (`image_sha256` copies `digest[..30]`, `len = 30`), and `user_principal` already bounds a name at
+//     `5 + 24 = 29`. Widening is the format bump the `image_sha256` doc-comment already refused once.
+//
+// THE SHAPE TAKEN: a RUNTIME-ONLY side table beside `SLOT_PPID`, never serialised, never projected,
+// never on the wire as an owner. `SESSION_EPOCH` is the live session's number; `SLOT_EPOCH[asid]` is the
+// number that was live when that slot was stamped. `slot_ppid_of` — the ONE reader every consumer goes
+// through (`current_principal` at SYS_OPEN/O_CREAT, the grantee capture at `sys_fgrant`) — returns NONE
+// for a `PRIN_USER` stamp whose epoch is not the live one. A closed session's program is therefore
+// ANONYMOUS, which is the pre-login world: it may still hold what its own live `(asid, gen)` incarnation
+// owns, and it reaches nothing by the user's name.
+//
+// COST, because SYS_OPEN is a hot path and NO PANIC PATH is added: for every caller that is not stamped
+// with a user principal — the whole fixture battery, every program on a boot with no session — the added
+// cost is ONE `cmp` on `p.kind`, a byte already in a register from the table read, inside a lock that was
+// already taken. For a user-stamped caller it is two more relaxed-ordering atomic loads. There is no
+// allocation, no new lock, no fallible call and no branch that can panic.
+//
+// EPOCH 0 IS NEVER LIVE: `SESSION_EPOCH` starts at 1 and `SLOT_EPOCH` at 0, so a slot that was never
+// epoch-stamped fails the comparison rather than passing it. Fail-closed by construction, not by a check.
+
+/// SO37: the LIVE session's epoch. Starts at 1 (0 is the never-stamped slot value) and increments on every
+/// [`session_logout`]. `u32`: at one logout per second that is 136 years, and a wrap would have to land on
+/// the exact value a slot stranded that many sessions ago still carries.
+#[cfg(feature = "login")]
+static SESSION_EPOCH: AtomicU32 = AtomicU32::new(1);
+
+/// SO37: the epoch each slot's principal stamp was taken in (0 = never stamped, which never matches).
+#[cfg(feature = "login")]
+static SLOT_EPOCH: [AtomicU32; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicU32::new(0) }; super::uslots::USER_SLOTS + 1];
+
+/// SO37: record the live epoch on `asid`, beside [`slot_ppid_stamp`]. Called ONLY from [`session_restamp`],
+/// the sole path that can put a `PRIN_USER` record into `SLOT_PPID`.
+#[cfg(feature = "login")]
+fn slot_epoch_stamp(asid: u64) {
+    let i = asid as usize;
+    if i < SLOT_EPOCH.len() {
+        SLOT_EPOCH[i].store(SESSION_EPOCH.load(Ordering::Acquire), Ordering::Release);
+    }
+}
+
+/// SO37: the gate itself — qualify a slot's stamped principal with the epoch it was stamped in. A
+/// non-user principal is returned UNTOUCHED (a program's `prog:`/`sha256:` identity has nothing to do
+/// with any session), which is why a boot with no session is byte-for-byte the pre-SO37 behaviour.
+#[cfg(feature = "login")]
+fn session_epoch_filter(asid: u64, p: PrincipalRecord) -> PrincipalRecord {
+    if p.kind != PRIN_USER {
+        return p;
+    }
+    let i = asid as usize;
+    if i < SLOT_EPOCH.len() && SLOT_EPOCH[i].load(Ordering::Acquire) == SESSION_EPOCH.load(Ordering::Acquire) {
+        return p;
+    }
+    PrincipalRecord::NONE
+}
+
+/// SO37: drop `asid`'s epoch, beside [`slot_ppid_clear`].
+#[cfg(feature = "login")]
+fn slot_epoch_clear(asid: u64) {
+    let i = asid as usize;
+    if i < SLOT_EPOCH.len() {
+        SLOT_EPOCH[i].store(0, Ordering::Release);
+    }
+}
+
+/// SO37: the LIVE epoch as a NUMBER, for the wire — never a decision. Read by `fs::users::logout`, so
+/// every Log Out names the epoch it just opened and a boot's session boundaries are countable on serial.
+#[cfg(feature = "login")]
+pub fn session_epoch() -> u32 {
+    SESSION_EPOCH.load(Ordering::Acquire)
 }
 
 /// LOGIN M1: the K4 codec's forward arm for `PRIN_USER` — the value IS the canonical string (like `prog:`).
@@ -24697,4 +24803,111 @@ pub fn home_acl_fixture(path: &str) -> bool {
         path, created, owned, anon_refused, owner_ok, same_user_ok, deleted, p_user.kind
     );
     created && owned && anon_refused && owner_ok && same_user_ok && p_user.kind == PRIN_USER
+}
+
+/// SO37, knob-off: the identity function. `slot_ppid_of`'s fold calls this on every read, so with the
+/// `login` knob off the call inlines away and the read is the bare table entry it always was — which is
+/// what `./arroyo knoboff login` measures. (The `net6_el0_witness` idiom, one file-tail append above.)
+#[cfg(not(feature = "login"))]
+#[inline(always)]
+fn session_epoch_filter(_asid: u64, p: PrincipalRecord) -> PrincipalRecord {
+    p
+}
+
+/// SO37 fixture (`loginst`) — **THE SESSION EPOCH, PROVED BY REFUSAL.** The gate is not that a fresh
+/// stamp is accepted; any always-true gate does that. The gate is that a stamp from a CLOSED session is
+/// REFUSED, and that it was ADMITTED one statement earlier under the same arrangement — so the refusal
+/// is caused by the Log Out and by nothing the fixture arranged.
+///
+/// Runs with session 1 OPEN (the caller is logged in as `name`, id `id`), on the real ACL tables, the
+/// real path resolver and the REAL `session_logout`/`session_login` entry points — the K3 idiom, scratch
+/// ASIDs, no EL0 blob:
+///
+///  * `A_OWN` is a program launched in session 1; it creates `path` PRIVATE, owned by `user:<name>`.
+///  * `A_STALE` is a SECOND program of session 1 — the still-running program SO37 is about. It reaches
+///    the file BY NAME while the session is open (`same_session_ok`), which is the M2 behaviour and the
+///    control that makes the rest meaningful.
+///  * Log Out. `A_STALE` is refused with no session open at all (`refused_while_closed`).
+///  * The SAME user logs straight back in. This is the harshest case in the whole design: the principal
+///    STRING is byte-identical, `user:<name>` against `user:<name>`, so nothing but the epoch can tell
+///    the two sessions apart. `A_STALE` is still refused (`stale_refused`) and now reads ANONYMOUS
+///    (`stale_kind=0`) — not merely denied at the ACL, stripped of the name at the stamp.
+///  * `A_FRESH`, launched in session 2, opens the same file (`fresh_ok`). The user's files survive the
+///    logout; only the stranded stamp does not. Without this leg a constant-deny would score green.
+///
+/// Leaves session 2 open (the caller's own `logout()` closes it), the row cleared, the file deleted and
+/// all three stamps cleared.
+#[cfg(feature = "loginst")]
+pub fn session_epoch_fixture(path: &str, id: u32, name: &[u8]) -> bool {
+    const A_OWN: u64 = 6;
+    const A_STALE: u64 = 7;
+    const A_FRESH: u64 = 8;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(e) => {
+            serial_println!("[users] epoch: el0-fat mount refused ({:?})", e);
+            return false;
+        }
+    };
+    slot_ppid_clear(A_OWN);
+    slot_ppid_clear(A_STALE);
+    slot_ppid_clear(A_FRESH);
+    let epoch_open = session_epoch();
+    session_restamp(A_OWN);
+    session_restamp(A_STALE);
+    let p_own = slot_ppid_of(A_OWN);
+    let p_stale_live = slot_ppid_of(A_STALE);
+    let mut created = false;
+    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+        Ok(t) => t,
+        Err(e) => {
+            serial_println!("[users] epoch: open_locate({}) -> errno {}", path, e);
+            slot_ppid_clear(A_OWN);
+            slot_ppid_clear(A_STALE);
+            return false;
+        }
+    };
+    let g_own = ASID_GEN[A_OWN as usize].load(Ordering::Acquire);
+    let g_stale = ASID_GEN[A_STALE as usize].load(Ordering::Acquire);
+    let g_fresh = ASID_GEN[A_FRESH as usize].load(Ordering::Acquire);
+    let owned = owned_set_owner(lba, off as u32, A_OWN, g_own, p_own);
+    // BEFORE — the second slot of the SAME session reaches the file by name. SO37's world, and the
+    // control: if this is false the refusals below prove nothing and the leg must go red.
+    let same_session_ok = owned_access_ok(lba, off as u32, A_STALE, g_stale, CAP_READ, p_stale_live);
+    // THE CLOSE, through the real entry point Log Out calls.
+    session_logout();
+    let refused_while_closed =
+        !owned_access_ok(lba, off as u32, A_STALE, g_stale, CAP_READ, slot_ppid_of(A_STALE));
+    // AND THE SAME USER BACK IN — identical principal string, different session.
+    let relogin = session_login(id, name);
+    let epoch_after = session_epoch();
+    let p_stale_after = slot_ppid_of(A_STALE);
+    let stale_refused = !owned_access_ok(lba, off as u32, A_STALE, g_stale, CAP_READ, p_stale_after);
+    // NOT A CONSTANT-DENY: a program launched in the NEW session opens the same file.
+    session_restamp(A_FRESH);
+    let p_fresh = slot_ppid_of(A_FRESH);
+    let fresh_ok = owned_access_ok(lba, off as u32, A_FRESH, g_fresh, CAP_READ, p_fresh);
+    owned_clear(lba, off as u32);
+    let deleted = fs.delete_located(lba, off, de.first_cluster()).is_ok();
+    slot_ppid_clear(A_OWN);
+    slot_ppid_clear(A_STALE);
+    slot_ppid_clear(A_FRESH);
+    let ok = created
+        && owned
+        && same_session_ok
+        && refused_while_closed
+        && relogin
+        && stale_refused
+        && p_stale_after.kind == PRIN_NONE
+        && fresh_ok
+        && p_fresh.kind == PRIN_USER
+        && epoch_after > epoch_open
+        && deleted;
+    serial_println!(
+        ":: LOGIN-EPOCH: path={} created={} owned={} same_session_ok={} refused_while_closed={} relogin={} stale_refused={} stale_kind={} fresh_ok={} fresh_kind={} epoch={}->{} deleted={} -> {} ::",
+        path, created, owned, same_session_ok, refused_while_closed, relogin, stale_refused,
+        p_stale_after.kind, fresh_ok, p_fresh.kind, epoch_open, epoch_after, deleted,
+        if ok { "PASS" } else { "FAIL —" }
+    );
+    ok
 }
