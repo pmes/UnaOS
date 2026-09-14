@@ -454,7 +454,7 @@ pub fn run(console: &mut Console, pal: &mut TargetPal) {
 
     report(&mut pager, console, pal, &mut tally, "sched.introspection", test_sched_introspection());
     report(&mut pager, console, pal, &mut tally, "heap.roundtrip", test_heap_roundtrip());
-    report(&mut pager, console, pal, &mut tally, "video.geometry", test_video_geometry());
+    report(&mut pager, console, pal, &mut tally, "video.geometry", test_video_geometry()); report(&mut pager, console, pal, &mut tally, "video.font.aa", test_font_aa()); // FONTAA (SO48) — SAME-LINE append, deliberately: a new statement on its own line here shifts every `panic::Location` below it in this file and moves the knob-off image (LAWS §5, "cfg does not protect byte identity"). The fixture body is at this file's TAIL, where an append shifts nothing. The call goes BEFORE the `//`, or it compiles nothing and this gate stays green while measuring an absent fixture (LEDGER P7).
     // VWIT: the damage-tracked `Screen` present path (format decode, damage-limited blit, no-op
     // flush, clip safety) — the on-screen renderer `video.geometry` cannot reach. Logic lives in
     // `video/witness.rs`; here we only map its Result into the tste table.
@@ -978,4 +978,171 @@ fn poll_until_done() -> bool {
         sched::yield_now();
     }
     SYNC_DONE.load(Ordering::Acquire)
+}
+
+// =================================================================================================
+// FONTAA (SO48) — the anti-aliased face's blit, against the 1-bit blit it replaces
+// =================================================================================================
+
+/// FONTAA (SO48) — **prove the shared surface blit paints GRADED coverage, and prove in the same
+/// breath that the face it replaces cannot.**
+///
+/// ### What it measures, and why that is the right question
+///
+/// "Blocky" is not a size complaint and it is not a scale complaint. It is a complaint about
+/// COVERAGE: a 1-bit glyph table has two ink states, so every edge is a step, and replicating each
+/// set bit into a `ts`x`ts` square makes the step `ts` pixels tall while adding no information.
+/// Magnification is the amplifier, not the cause — which is exactly why this fixture asks about the
+/// number of DISTINCT pixel values a rendered string produces and not about any pixel count.
+/// [`video::font::draw_text`](crate::video::font::draw_text) blends Noto's own 8-bit alpha, so a
+/// rendered string carries intermediate values; the `font8x8` path cannot produce one at any scale.
+///
+/// ### ⚠ WHERE THIS RUNS, AND WHERE IT DOES NOT — measured, not assumed
+///
+/// This is a LIVE fixture, so it runs when an operator types `tste` and **not** during
+/// `./arroyo test`. That is not a guess about the harness: on the battery capture this arc gated
+/// on, `LC_ALL=C grep -a -c -F ":: TSTE: suite start"` is 0, and so is the count for
+/// `video.geometry` — the live fixture that has sat one statement above this one for arcs. The
+/// `:: TSTE:` lines a battery capture DOES carry are boot-sequenced fixtures printing that tag
+/// directly from `shell.rs`, never this suite.
+///
+/// So the leg that can be settled without executing a blend — *is the shipped atlas 8-bit alpha or
+/// 1-bit?* — is ALSO asserted at compile time, in `video/font.rs`'s tail, where every build of
+/// either arch runs it and `./arroyo check` is the gate. This function is the runtime half: it is
+/// the one that exercises the actual blit, and it is the one a bench operator can fire. Putting
+/// it on the boot wire is one `verdict("video.font.aa", …)` line in `shell.rs`'s boot-fixture
+/// block, which was outside this arc's file list and is reported rather than written.
+///
+/// ### The control probe, and why it is not decoration
+///
+/// A "text has more than two colours" assertion is worthless on its own: it passes identically for
+/// a correct blit, for a blit that smeared the whole buffer, and for a buffer nobody cleared. So
+/// leg 3 renders the SAME string through the 1-bit path this arc removes and REQUIRES it to come
+/// out at exactly two values. That control must hit for the fixture to mean anything — if a future
+/// change made the discriminator blind, leg 3 goes red first and says so, instead of leg 2 going
+/// quietly green forever (LAWS §5, "a check that cannot fire is an absent one").
+///
+/// ### The legs
+///
+/// 1. **advance** — the pen lands at `n * Face::cell_w()`: the FACE's advance, not `8 * scale`.
+/// 2. **graded** — every pixel is the background, the ink, or strictly between, and at least one is
+///    strictly between. Endpoint exactness is part of it: `alpha == 0` and `alpha == 255` must stay
+///    bit-exact or the pixel-equality instruments elsewhere in the tree lose their witness.
+/// 3. **control** — the 1-bit block-replicated render of the same string yields EXACTLY two values.
+/// 4. **containment** — a glyph that does not fit whole inside the clip box draws nothing and does
+///    not advance the pen, the all-or-nothing rule every hand-written helper had.
+fn test_font_aa() -> Outcome {
+    use crate::video::font::{self, Face};
+
+    const SW: usize = 96;
+    const SH: usize = 48;
+    const BG: u32 = 0x0000_0000;
+    const INK: u32 = 0x00FF_FFFF;
+    const S: &[u8] = b"Ago";
+
+    // ⚠ `black_box` ON THE STRING, and NOT on the face. Both halves of that were measured.
+    //
+    // WHY ANY BARRIER. Every input here is a constant, so on the first cut LLVM folded leg 1's
+    // advance identity and the metrics guard at COMPILE time and deleted both branches — certified
+    // by their absence from the built ELF (`LC_ALL=C grep -a -o -F "advance: pen"` = 0 on both
+    // arches, against 1 for the three legs whose outcome depends on atlas bytes it cannot fold).
+    // That is a pass of a kind, but it is the optimizer's proof about one constant call, not a
+    // runtime check — "a check that cannot fire is an absent one" (LAWS §5), applied to this
+    // fixture's own legs. An opaque `s` is enough to restore them: `pen`, `s.len() * cw` and the
+    // guard all become values no compile-time reasoning reaches.
+    //
+    // ⚠ WHY NOT THE FACE — 96 KiB IN EVERY MINIMAL IMAGE, MEASURED AND NOT ARGUED. The first cut
+    // also wrote `black_box(Face::Body)`, and `./arroyo knoboff wc f164b6fd` priced it: the wc-OFF
+    // loadable image grew **+87,482 bytes on aarch64 and +121,652 on x86**, and the aarch64 wc-OFF
+    // image came out the same size as the wc-ON one. The cause is `font::glyph`'s four-arm match on
+    // `face`: with a CONSTANT face it folds to the two `Face::Body` atlases and the linker strips
+    // the `Chrome` pair, which in a wc-off build nothing else references. An OPAQUE face keeps all
+    // four arms live, so the Size20 regular+bold pair — priced at 98,040 B from the crate's own
+    // geometry (95 glyphs x 20 rows x 9 px, plus the row-slice tables) — lands in a build that
+    // never draws a title bar. **The general rule this buys, and it is now written down: a `Face`
+    // must reach `glyph` as a compile-time constant at every call site, or the image pays for both
+    // rasters.** Every real call site already does; a fixture is the one place that can get it
+    // wrong, and this one did for one build.
+    let face = Face::Body;
+    let s: &[u8] = core::hint::black_box(S);
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    if cw == 0 || ch == 0 || s.len() * cw > SW || ch > SH {
+        return Outcome::Fail(format!("face metrics unusable: cell={}x{}", cw, ch));
+    }
+
+    // 1 — the advance is the face's own.
+    let mut aa = alloc::vec![BG; SW * SH];
+    let pen = font::draw_text(&mut aa, SW, SW, SH, 0, 0, s, INK, false, face);
+    if pen != s.len() * cw {
+        return Outcome::Fail(format!("advance: pen={} want={} (cell_w={})", pen, s.len() * cw, cw));
+    }
+
+    // 2 — graded coverage, endpoints bit-exact.
+    let mut between = 0usize;
+    let mut foreign = 0usize;
+    for &p in aa.iter() {
+        if p == BG || p == INK {
+            continue;
+        }
+        // Grey only: the ink is white over black, so any blended pixel has three equal channels
+        // strictly inside the endpoints. Anything else means the blend went somewhere it should not.
+        let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+        if r == g && g == b && r > 0 && r < 0xFF {
+            between += 1;
+        } else {
+            foreign += 1;
+        }
+    }
+    if foreign != 0 {
+        return Outcome::Fail(format!("blend produced {} non-grey pixels over a mono ramp", foreign));
+    }
+    if between == 0 {
+        return Outcome::Fail(format!(
+            "no graded coverage: \"{}\" rendered with only the two endpoint values — this is the 1-bit face",
+            core::str::from_utf8(s).unwrap_or("?")
+        ));
+    }
+
+    // 3 — THE CONTROL, which must hit: the 1-bit path cannot produce a graded pixel.
+    let mut bits = alloc::vec![BG; SW * SH];
+    let ts = 2usize; // the replication factor `login`/`quarry`/`instgui` all used
+    for (c, &b) in s.iter().enumerate() {
+        let bitmap = font8x8::legacy::BASIC_LEGACY[b.min(127) as usize];
+        for (ry, rowbits) in bitmap.iter().enumerate() {
+            for rx in 0..8 {
+                if rowbits & (1 << rx) == 0 {
+                    continue;
+                }
+                for dy in 0..ts {
+                    for dx in 0..ts {
+                        let (x, y) = (c * 8 * ts + rx * ts + dx, ry * ts + dy);
+                        if x < SW && y < SH {
+                            bits[y * SW + x] = INK;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let graded_1bit = bits.iter().filter(|&&p| p != BG && p != INK).count();
+    if graded_1bit != 0 {
+        return Outcome::Fail(format!(
+            "control did not hold: the 1-bit render produced {} graded pixels, so leg 2 proves nothing",
+            graded_1bit
+        ));
+    }
+
+    // 4 — containment: a glyph one pixel short of fitting draws nothing and does not advance.
+    let mut tight = alloc::vec![BG; SW * SH];
+    let pen0 = font::draw_text(&mut tight, SW, cw - 1, SH, 0, 0, s, INK, false, face);
+    if pen0 != 0 || tight.iter().any(|&p| p != BG) {
+        return Outcome::Fail(format!(
+            "containment: clip_w={} drew {} pixels and advanced to {}",
+            cw - 1,
+            tight.iter().filter(|&&p| p != BG).count(),
+            pen0
+        ));
+    }
+
+    Outcome::Pass
 }

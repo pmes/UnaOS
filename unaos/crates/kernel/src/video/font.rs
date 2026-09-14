@@ -328,3 +328,155 @@ pub fn draw_glyph_fb(
         }
     }
 }
+
+/// FONTSURF (SO48) — blend an ASCII byte string into a cached-RAM **SURFACE** at `(x, y)`, the
+/// rectangular counterpart of [`draw_row`], and the seam the app surfaces have been missing.
+///
+/// ## Why this exists, stated as the gap it closes
+///
+/// The module doc's "never had a seam" list — `pal::draw_text`, `video::quarry`'s panes,
+/// `instgui`'s dialogs, and `video::login`'s form — is not a list of surfaces that CHOSE the 1-bit
+/// face. It is a list of surfaces whose painter is a rectangle, not a scanline: each owns a
+/// `&mut [u32]` of `stride`-pitch cached RAM and writes `px[(y + ry) * stride + x + rx]`. The two
+/// blits this module shipped both had the wrong shape for that — [`draw_row`] takes ONE scanline of
+/// a strip's scratch row, and [`draw_glyph_fb`] writes a [`FrameBuffer`] against a computed
+/// background. So every one of those surfaces kept `font8x8`, replicated each set bit into a
+/// `ts`x`ts` block of flat ink, and the boundary stayed a "gap, not a fold" for want of ten lines.
+///
+/// This is those ten lines. The destination is READ (it is cached RAM by the caller's contract —
+/// never a panel mapping, the GR15 sin), so the blend composites correctly over whatever the
+/// surface already holds: a selection highlight, a content fill, a bevel.
+///
+/// ## Contract, matching the helpers it replaces
+///
+/// `stride` is the surface pitch in `u32`s; `clip_w`/`clip_h` are the surface's own extents. A
+/// glyph that does not fit WHOLE inside the clip box ENDS the string — the same all-or-nothing
+/// rule `quarry::text`, `instgui::text` and `login::text` each wrote by hand, so no caller changes
+/// its truncation behaviour by adopting this. Returns the pen x after the last glyph drawn.
+///
+/// ## Metrics, and the one thing a caller must re-read
+///
+/// The advance becomes the FACE's (`face.cell_w()`), not `8 * ts`. A 1-bit 8x8 cell doubled is
+/// square — 16 wide for 16 tall — where a 16 px mono face is 7 wide, because that is the width
+/// Noto's own side bearings give it. So a converted caller's VERTICAL rhythm is unchanged when it
+/// was built on a 16 px cell ([`CELL_H`] is 16), and its HORIZONTAL arithmetic must move from the
+/// old cell to [`Face::cell_w`]. Callers that used one `CELL` constant for both axes have to split
+/// it; that split is the whole cost of the conversion.
+///
+/// ## What it costs the image: NOTHING in rodata
+///
+/// No new atlas. Both rasters and both weights are already `static` above and already reachable
+/// from [`glyph`], which `fbcon` calls on every build of either arch — so a surface adopting this
+/// face adds its call site and not one byte of glyph data.
+#[inline]
+pub fn draw_text(
+    px: &mut [u32],
+    stride: usize,
+    clip_w: usize,
+    clip_h: usize,
+    x: usize,
+    y: usize,
+    s: &[u8],
+    ink: u32,
+    bold: bool,
+    face: Face,
+) -> usize {
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let mut cx = x;
+    for &b in s {
+        // All-or-nothing, and checked BEFORE the first pixel: a partially drawn glyph at the clip
+        // edge is the one artefact the hand-written helpers all took care to avoid.
+        if cx + cw > clip_w || y + ch > clip_h {
+            break;
+        }
+        for (ry, row) in glyph(b, bold, face).iter().enumerate() {
+            let base = (y + ry) * stride;
+            for (rx, &a) in row.iter().enumerate() {
+                if a == 0 {
+                    continue;
+                }
+                let i = base + cx + rx;
+                // The clip test above already bounds this; the length test is the containment
+                // guarantee a caller passing a short slice or a lying stride still gets.
+                if i < px.len() {
+                    px[i] = blend(px[i], ink, a);
+                }
+            }
+        }
+        cx += cw;
+    }
+    cx
+}
+
+/// FONTAA (SO48) — **the COMPILE-TIME half of the anti-aliasing gate, and the reason it is here
+/// rather than only in `selftest.rs`.**
+///
+/// The runtime fixture (`selftest.rs`'s `video.font.aa`) lives in `tste`'s LIVE section, and that
+/// section is reached only when an operator types `tste`: it is NOT executed by `./arroyo test`,
+/// measured rather than assumed — `LC_ALL=C grep -a -c -F ":: TSTE: suite start"` on a battery
+/// capture is 0, and so is the count for `video.geometry`, the live fixture that has sat beside it
+/// for arcs. A gate that only a bench operator can fire is not a gate the battery holds, so the one
+/// leg that can be settled without a blend runs HERE, in every build of either arch, and goes red
+/// in `./arroyo check`.
+///
+/// WHAT IT ASSERTS. "Blocky" is a statement about COVERAGE, not about size: a 1-bit table has two
+/// ink states, so an edge is a step at any magnification, and block-replicating it multiplies the
+/// tread without adding information. An 8-bit alpha face is the opposite claim about the same
+/// bytes. So the check is: does the shipped atlas carry PARTIAL coverage?
+///
+/// ⚠ A RULE THIS ARC PAID FOR, PARKED HERE BECAUSE THE TAIL IS WHERE AN APPEND SHIFTS NOTHING (it
+/// belongs on [`glyph`], and a doc comment there would move every `panic::Location` below it in this
+/// file). **Pass `face` to [`glyph`] as a COMPILE-TIME CONSTANT, or the image pays for both
+/// rasters.** `glyph`'s four-arm match is what lets the linker strip the atlas pair a given build
+/// never uses: with a constant `face` it folds to two statics, and in a build with no chrome — no
+/// menu bar, no captions, no dock — the `Size20` pair is then unreferenced and gone. Hand it a value
+/// the optimizer cannot see through and all four arms stay live. The price is measured, not
+/// estimated: making ONE fixture's face opaque grew the knob-off loadable image by **87,482 bytes on
+/// aarch64 and 121,652 on x86** (`./arroyo knoboff wc f164b6fd`, 2026-09-13), against the `Size20`
+/// regular+bold pair's 98,040 B priced from the crate's own geometry (95 glyphs x 20 rows x 9 px,
+/// plus the row-slice tables). Every call site in the tree passes a `const` today — `crystal.rs:178`,
+/// `menubar.rs:167`, `dock.rs:344`, `winmenu.rs:657`, `fbcon.rs:168` — and this note exists so the
+/// next one does too.
+///
+/// THE CONTROL. `has_zero` is required for the same reason every gate here carries one — a scan
+/// that found a single class of byte would report `has_mid` from a buffer it never really read, and
+/// would report it in the same words a true pass uses. Requiring both classes means the scan
+/// demonstrably distinguished them. Deliberately NOT required: a fully-opaque byte. Whether any
+/// glyph in a given raster reaches 255 is a fact about Noto's hinting at that size, not about
+/// whether the face is anti-aliased, and asserting it would make this gate go red on a font update
+/// for a reason that is not the one it is about.
+const _: () = {
+    const fn coverage(size: RasterHeight) -> (bool, bool) {
+        let t = table(FontWeight::Regular, size);
+        let (mut has_zero, mut has_mid) = (false, false);
+        let mut i = 0;
+        while i < GLYPHS {
+            let rows = t[i];
+            let mut y = 0;
+            while y < rows.len() {
+                let row = rows[y];
+                let mut x = 0;
+                while x < row.len() {
+                    let a = row[x];
+                    if a == 0 {
+                        has_zero = true;
+                    } else if a != 255 {
+                        has_mid = true;
+                    }
+                    x += 1;
+                }
+                y += 1;
+            }
+            i += 1;
+        }
+        (has_zero, has_mid)
+    }
+
+    let (body_zero, body_mid) = coverage(SIZE);
+    assert!(body_zero, "FONTAA control: the body atlas scan saw no empty pixel — it read nothing");
+    assert!(body_mid, "FONTAA: the body atlas has no partial coverage — this is a 1-bit face");
+
+    let (chrome_zero, chrome_mid) = coverage(CHROME_SIZE);
+    assert!(chrome_zero, "FONTAA control: the chrome atlas scan saw no empty pixel — it read nothing");
+    assert!(chrome_mid, "FONTAA: the chrome atlas has no partial coverage — this is a 1-bit face");
+};

@@ -23,6 +23,7 @@
 //! console keeps working the moment the installer closes (Esc from the chooser).
 
 use crate::drivers::block;
+use super::font;
 use super::theme;
 use super::wm;
 
@@ -30,9 +31,28 @@ use super::wm;
 const W: usize = 520;
 const H: usize = 396;
 
-/// Text scale over the raw font8x8 cell: 2 → 16 px glyphs, 30 cols × comfortable rows.
-const TS: usize = 2;
-const CELL: usize = 8 * TS;
+/// FONTSURF (SO48) — **the dialog's face, and the metric split that came with it.**
+///
+/// WAS: `TS = 2`, `CELL = 8 * TS` — the raw `font8x8` cell block-replicated 2x into 16 px glyphs,
+/// one square 16x16 cell serving as BOTH the advance and the row height. That is the 1-bit face
+/// `video::font`'s module doc lists as a gap rather than a fold, and at 2x every set bit is a 2x2
+/// square of flat ink: the staircase is the glyph, magnified. The compositor may then magnify the
+/// whole surface again on a dense panel ([`wm`]'s integer upscale), which multiplies the block, not
+/// the detail.
+///
+/// NOW: the shared anti-aliased face at [`font::Face::Body`], through [`font::draw_text`].
+///
+/// The two constants are SPLIT because the square cell was an artefact of the 1-bit table and not a
+/// metric anyone chose: a 16 px mono face is 7 px wide, which is the advance Noto's own side
+/// bearings give it. [`CELL_H`] is [`font::CELL_H`] = 16, **the same 16 the old `CELL` was**, so
+/// every vertical position in this module's layout is unchanged to the pixel; [`CELL_W`] is the
+/// face's advance and is the only axis that moves. Lines are therefore narrower and the hand-broken
+/// copy below keeps its breaks — a line that fitted at 16 px per character cannot fail to fit at 7.
+const CELL_W: usize = font::CELL_W;
+const CELL_H: usize = font::CELL_H;
+/// The face this dialog draws with. `Body` and not `Chrome`: the installer's surface is a block of
+/// prose sized by how much of it must fit, not a piece of furniture sized by the theme's bar.
+const FACE: font::Face = font::Face::Body;
 
 #[repr(align(64))]
 struct Surf([u32; W * H]);
@@ -198,22 +218,16 @@ fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
     }
 }
 
+/// FONTSURF (SO48) — the dialog's text, on the shared anti-aliased face.
+///
+/// The `\n` break is kept and applied HERE rather than being handed to [`font::draw_text`]: the
+/// shared blit is deliberately face-and-clip only, with no opinion about control bytes, and this
+/// module is the only caller in the tree that treats a newline as an end-of-string. Everything
+/// after it — the advance, the all-or-nothing clip at `W`, the pen — is the shared blit's, so this
+/// surface and any other that adopts the seam truncate identically.
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
-    let mut cx = x;
-    for &ch in s {
-        if ch == b'\n' || cx + CELL > W {
-            break;
-        }
-        let bitmap = font8x8::legacy::BASIC_LEGACY[ch.min(127) as usize];
-        for (ry, rowbits) in bitmap.iter().enumerate() {
-            for rx in 0..8 {
-                if rowbits & (1 << rx) != 0 {
-                    fill(px, cx + rx * TS, y + ry * TS, TS, TS, fg);
-                }
-            }
-        }
-        cx += CELL;
-    }
+    let n = s.iter().position(|&c| c == b'\n').unwrap_or(s.len());
+    font::draw_text(px, W, W, H, x, y, &s[..n], fg, false, FACE);
 }
 
 /// Format a byte count as whole gibibytes/mebibytes into `buf`, returning the slice.
@@ -240,8 +254,8 @@ fn button(px: &mut [u32], x: usize, y: usize, w: usize, label: &[u8], primary: b
     let h = theme::BUTTON_HEIGHT + 6;
     fill(px, x, y, w, h, if primary { theme::BUTTON_FACE } else { theme::CHROME_FACE });
     bevel(px, x, y, w, h, true);
-    let tx = x + (w.saturating_sub(label.len() * CELL)) / 2;
-    text(px, tx, y + (h - CELL) / 2, label, theme::BUTTON_TEXT);
+    let tx = x + (w.saturating_sub(label.len() * CELL_W)) / 2;
+    text(px, tx, y + (h - CELL_H) / 2, label, theme::BUTTON_TEXT);
     if primary {
         rect(px, x - 2, y - 2, w + 4, h + 4, theme::ACCENT);
     }
@@ -287,22 +301,22 @@ fn repaint() {
                 // compositor activates), so "none yet" is the normal opening state — say so,
                 // and keep re-checking (`service`) rather than freezing the first answer.
                 text(px, lx, 84, b"No disks yet - waiting for USB", theme::CONTENT_TEXT);
-                text(px, lx, 84 + CELL + 6, b"enumeration. Attach a disk and", theme::TITLE_TEXT_INACTIVE);
-                text(px, lx, 84 + 2 * (CELL + 6), b"it appears here by itself.", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, 84 + CELL_H + 6, b"enumeration. Attach a disk and", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, 84 + 2 * (CELL_H + 6), b"it appears here by itself.", theme::TITLE_TEXT_INACTIVE);
             }
             let mut boot_rows = 0usize;
             for i in 0..n {
                 let row = devs[i].unwrap();
                 let d = row.info;
-                let ry = 84 + i * (CELL + 22);
+                let ry = 84 + i * (CELL_H + 22);
                 // INSTALL-SELF: a marked row never carries the selection highlight — selection cannot
                 // land on it (see `step_selectable`), so painting one would be a lie about what Enter
                 // would do.
                 let selected = i == sel && !row.boot;
                 let row_bg = if selected { theme::SCROLL_THUMB } else { theme::CONTENT_FILL };
-                fill(px, lx, ry - 4, W - 2 * lx, CELL + 12, row_bg);
+                fill(px, lx, ry - 4, W - 2 * lx, CELL_H + 12, row_bg);
                 if selected {
-                    rect(px, lx, ry - 4, W - 2 * lx, CELL + 12, theme::ACCENT);
+                    rect(px, lx, ry - 4, W - 2 * lx, CELL_H + 12, theme::ACCENT);
                 }
                 let mut line = [b' '; 40];
                 line[..4].copy_from_slice(b"slot");
@@ -325,25 +339,25 @@ fn repaint() {
                 if row.boot {
                     boot_rows += 1;
                 }
-                text(px, lx + 8, ry, &line[..(W - 2 * lx - 16) / CELL], fg);
+                text(px, lx + 8, ry, &line[..(W - 2 * lx - 16) / CELL_W], fg);
             }
             let selectable = first_selectable(&devs, n).is_some();
             // INSTALL-SELF: say WHY a listed disk cannot be chosen. A greyed row with no explanation
             // is the kind of thing an operator works around by rebooting into something less careful.
             if boot_rows > 0 {
-                let ry = 84 + n * (CELL + 22) + 4;
+                let ry = 84 + n * (CELL_H + 22) + 4;
                 text(px, lx, ry, b"BOOT = the disk this system", theme::TITLE_TEXT_INACTIVE);
-                text(px, lx, ry + CELL + 4, b"booted from. Not installable.", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, ry + CELL_H + 4, b"booted from. Not installable.", theme::TITLE_TEXT_INACTIVE);
             }
             if n > 0 && !selectable {
-                let ry = 84 + n * (CELL + 22) + 2 * (CELL + 4) + 8;
+                let ry = 84 + n * (CELL_H + 22) + 2 * (CELL_H + 4) + 8;
                 text(px, lx, ry, b"Attach another disk to", theme::CONTENT_TEXT);
-                text(px, lx, ry + CELL + 4, b"install onto.", theme::CONTENT_TEXT);
+                text(px, lx, ry + CELL_H + 4, b"install onto.", theme::CONTENT_TEXT);
             }
             // Exits are ALWAYS on screen: an installer that can only go forward is a trap.
             text(px, lx, H - 100, b"w/s select   Enter continue", theme::TITLE_TEXT_INACTIVE);
-            text(px, lx, H - 100 + CELL + 4, b"Esc boot this live system", theme::TITLE_TEXT_INACTIVE);
-            text(px, lx, H - 100 + 2 * (CELL + 4), b"q  halt the machine", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, H - 100 + CELL_H + 4, b"Esc boot this live system", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, H - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::TITLE_TEXT_INACTIVE);
             if n > 0 && selectable {
                 button(px, W - 190, H - 52, 160, b"Continue", true);
             }
@@ -368,10 +382,10 @@ fn repaint() {
             match bound {
                 Some((_, d)) => {
                     text(px, lx + 14, 72, b"THIS ERASES EVERYTHING", theme::CONTENT_TEXT);
-                    text(px, lx + 14, 72 + CELL + 6, b"on the disk named below:", theme::CONTENT_TEXT);
+                    text(px, lx + 14, 72 + CELL_H + 6, b"on the disk named below:", theme::CONTENT_TEXT);
                     // Product is the operator-legible name; vendor + slot + size are what let them
                     // tell two similar sticks apart on a bench where both are plugged in.
-                    text(px, lx + 14, 72 + 2 * (CELL + 6), &d.product, theme::CONTENT_TEXT);
+                    text(px, lx + 14, 72 + 2 * (CELL_H + 6), &d.product, theme::CONTENT_TEXT);
                     let mut line = [b' '; 26];
                     line[..8].copy_from_slice(&d.vendor);
                     line[9..13].copy_from_slice(b"slot");
@@ -380,7 +394,7 @@ fn repaint() {
                     let s = fmt_size(&mut sz, d.num_blocks * d.block_size as u64);
                     let tail = 26 - s.len();
                     line[tail..].copy_from_slice(s);
-                    text(px, lx + 14, 72 + 3 * (CELL + 6), &line, theme::CONTENT_TEXT);
+                    text(px, lx + 14, 72 + 3 * (CELL_H + 6), &line, theme::CONTENT_TEXT);
                 }
                 None => {
                     // The chosen disk left between the chooser and this frame (a disconnect retracts
@@ -388,13 +402,13 @@ fn repaint() {
                     // engine would refuse anyway, but an installer must not offer a go it knows is
                     // dead, and it must never quietly re-aim at a disk still in the list.
                     text(px, lx + 14, 72, b"The disk you chose is no", theme::CONTENT_TEXT);
-                    text(px, lx + 14, 72 + CELL + 6, b"longer attached.", theme::CONTENT_TEXT);
-                    text(px, lx + 14, 72 + 2 * (CELL + 6), b"Nothing has been written.", theme::CONTENT_TEXT);
-                    text(px, lx + 14, 72 + 3 * (CELL + 6), b"Esc back, then choose again.", theme::TITLE_TEXT_INACTIVE);
+                    text(px, lx + 14, 72 + CELL_H + 6, b"longer attached.", theme::CONTENT_TEXT);
+                    text(px, lx + 14, 72 + 2 * (CELL_H + 6), b"Nothing has been written.", theme::CONTENT_TEXT);
+                    text(px, lx + 14, 72 + 3 * (CELL_H + 6), b"Esc back, then choose again.", theme::TITLE_TEXT_INACTIVE);
                 }
             }
             text(px, lx, 200, b"The engine refuses non-blank", theme::TITLE_TEXT_INACTIVE);
-            text(px, lx, 200 + CELL + 4, b"targets (blank-check guard).", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, 200 + CELL_H + 4, b"targets (blank-check guard).", theme::TITLE_TEXT_INACTIVE);
             if bound.is_some() {
                 text(px, lx, H - 92, b"Enter install    Esc back", theme::TITLE_TEXT_INACTIVE);
                 button(px, W - 190, H - 52, 160, b"Install", true);
@@ -407,7 +421,7 @@ fn repaint() {
             text(px, lx, 20, b"Installing...", theme::CONTENT_TEXT);
             fill(px, lx, 42, W - 2 * lx, 2, theme::FRAME_LINE);
             text(px, lx, 84, b"GPT + FAT32 + payload + verify", theme::CONTENT_TEXT);
-            text(px, lx, 84 + CELL + 6, b"Progress on the console window.", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, 84 + CELL_H + 6, b"Progress on the console window.", theme::TITLE_TEXT_INACTIVE);
             // Indeterminate bar: the engine is synchronous; this frame shows
             // during the run because we present before calling it.
             fill(px, lx, 150, W - 2 * lx, 22, theme::SCROLL_TRACK);
@@ -419,13 +433,13 @@ fn repaint() {
             fill(px, lx, 42, W - 2 * lx, 2, theme::FRAME_LINE);
             if ok {
                 text(px, lx, 84, b"GPT written, ESP formatted,", theme::CONTENT_TEXT);
-                text(px, lx, 84 + CELL + 6, b"payload verified extent-by-", theme::CONTENT_TEXT);
-                text(px, lx, 84 + 2 * (CELL + 6), b"extent. See console verdicts.", theme::CONTENT_TEXT);
+                text(px, lx, 84 + CELL_H + 6, b"payload verified extent-by-", theme::CONTENT_TEXT);
+                text(px, lx, 84 + 2 * (CELL_H + 6), b"extent. See console verdicts.", theme::CONTENT_TEXT);
             } else {
                 text(px, lx, 84, b"The engine declined - most", theme::CONTENT_TEXT);
-                text(px, lx, 84 + CELL + 6, b"often the blank-check guard", theme::CONTENT_TEXT);
-                text(px, lx, 84 + 2 * (CELL + 6), b"(target not blank). Console", theme::CONTENT_TEXT);
-                text(px, lx, 84 + 3 * (CELL + 6), b"has the exact refusal.", theme::CONTENT_TEXT);
+                text(px, lx, 84 + CELL_H + 6, b"often the blank-check guard", theme::CONTENT_TEXT);
+                text(px, lx, 84 + 2 * (CELL_H + 6), b"(target not blank). Console", theme::CONTENT_TEXT);
+                text(px, lx, 84 + 3 * (CELL_H + 6), b"has the exact refusal.", theme::CONTENT_TEXT);
             }
             text(px, lx, H - 92, b"Esc close", theme::TITLE_TEXT_INACTIVE);
             button(px, W - 190, H - 52, 160, b"Close", true);
@@ -438,10 +452,10 @@ fn repaint() {
             text(px, lx, 20, b"Target disk is gone", theme::CONTENT_TEXT);
             fill(px, lx, 42, W - 2 * lx, 2, theme::FRAME_LINE);
             text(px, lx, 84, b"The disk you selected was not", theme::CONTENT_TEXT);
-            text(px, lx, 84 + CELL + 6, b"attached when the install was", theme::CONTENT_TEXT);
-            text(px, lx, 84 + 2 * (CELL + 6), b"about to begin. NOTHING was", theme::CONTENT_TEXT);
-            text(px, lx, 84 + 3 * (CELL + 6), b"written - not to it, and not", theme::CONTENT_TEXT);
-            text(px, lx, 84 + 4 * (CELL + 6), b"to any other disk.", theme::CONTENT_TEXT);
+            text(px, lx, 84 + CELL_H + 6, b"attached when the install was", theme::CONTENT_TEXT);
+            text(px, lx, 84 + 2 * (CELL_H + 6), b"about to begin. NOTHING was", theme::CONTENT_TEXT);
+            text(px, lx, 84 + 3 * (CELL_H + 6), b"written - not to it, and not", theme::CONTENT_TEXT);
+            text(px, lx, 84 + 4 * (CELL_H + 6), b"to any other disk.", theme::CONTENT_TEXT);
             text(px, lx, H - 92, b"Enter choose again   Esc close", theme::TITLE_TEXT_INACTIVE);
             button(px, W - 190, H - 52, 160, b"Choose", true);
         }
