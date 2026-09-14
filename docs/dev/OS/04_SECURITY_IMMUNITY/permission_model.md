@@ -99,8 +99,32 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   carries the users-table id per slot (`SLOT_USER`) because its ACL has no principal string. The
   enforcement is the existing `SYS_OPEN` owner/grants check: a file created in a session is owned
   by `user:<name>`; a later open by that user (any program, any slot, after reboot on aarch64 via
-  the by-name branch) is admitted; any other principal is the existing `-EACCES`. Programs already
-  running when the session closes keep their stamp — the boundary is the launch, not the clock.
+  the by-name branch) is admitted; any other principal is the existing `-EACCES`. **The boundary is
+  the SESSION, not the
+  launch (SO37, corrected here — this sentence used to read "Programs already running when the session
+  closes keep their stamp — the boundary is the launch, not the clock").** A program's stamp is still
+  taken once, at load, and never changes; what changed is that the stamp is QUALIFIED by a SESSION EPOCH
+  — a `u32` beside the per-slot principal, written with it at the one mint path (`session_restamp` /
+  `slot_user_stamp`) and incremented by every `logout`. `slot_ppid_of` — the ONE reader that `SYS_OPEN`'s
+  by-name branch, the `O_CREAT` owner persist and the grantee capture all go through — returns NONE for a
+  `user:` stamp whose epoch is not the live one, so a program of a CLOSED session is ANONYMOUS: it opens
+  nothing the user owns and creates nothing in the user's name, even if the same user logs straight back
+  in (the principal string is identical; only the epoch separates the two sessions). x86's twin is
+  `SLOT_EPOCH` beside `SLOT_USER`, read by `slot_user_live`, which `owned_user_ok` and `owned_user_stamp`
+  consult.
+  **NOT AN ABI CHANGE, and SO37 expected one.** Nothing in `PrincipalRecord` changes size or meaning: it
+  is 32 bytes, `kind`/`len`/`value[30]`, serialised into `UNAFS.ATR` rows and projected to the native
+  `owner` / `grants:<grantee>` strings by the K4 codec. An epoch INSIDE the record would be an on-disk
+  format bump AND would make `user:<name>` a per-session identity — a user's own files would stop opening
+  after a relogin, which is the property `/home/<name>` exists for. The epoch qualifies the STAMP (this
+  slot's claim to be speaking as the user right now), never the IDENTITY (who the user is, durably), so
+  it lives in a runtime-only side table that is never serialised and never on the wire as an owner. And
+  there was no room anyway: `value` is a hard 30 bytes, fully consumed by `PRIN_IMAGE_SHA256`.
+  Cost, stated because `SYS_OPEN` is a hot path: for a caller that is not user-stamped — the whole
+  fixture battery, every program on a boot with no session — ONE `cmp` on a byte already in a register,
+  inside a lock that was already taken; for a user-stamped caller, two more atomic loads. No allocation,
+  no new lock, no fallible call, NO PANIC PATH. Epoch 0 is never live (`SESSION_EPOCH` starts at 1,
+  `SLOT_EPOCH` at 0), so an unstamped slot fails the comparison rather than passing it.
 * **`/home/<name>` (M2):** created on the EL0 FAT volume at the user's first login (`HOME/<NAME>`, an
   8.3 leaf, so a user name is 1-8 bytes). The directory carries no owner (FAT has none; LEDGER SO35);
   the files a session's programs create inside are owned by `user:<name>` through the SYS_OPEN rows,
@@ -119,9 +143,22 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   shell/desktop owner band, which `wm::controls` gives no control cluster and `wm::hit_test` never
   names, so no close box is drawn and no press can reach the row — measured every witness boot against
   an armed control row (`close_route=refused`), with `login::heal_if_row_gone` putting the three pieces
-  of screen state back at the next key offer should anything close the row by another road. Residual,
-  LEDGER SO36: the screen owns the KEYBOARD and its own row only — the dock and the menu bar still
-  answer the pointer before a session exists.
+  of screen state back at the next key offer should anything close the row by another road. **And
+  the screen is MODAL TO THE POINTER (SO36 + SO44), which is ONE statement and not two.** While it is
+  up, `fs::users::screen_press` answers `true` for EVERY press on the panel — inside its rectangle and
+  outside it alike — and it is asked FIRST in `video::strip::press_route`, ahead of the window menu, the
+  crystal and the dock, and therefore ahead of every window arm in the aarch64 router; the x86 router
+  keeps its OWN furniture arms (the CLICK-BAND re-split) and never calls `press_route`, so the same
+  statement is repeated at the head of its press edge rather than assumed. That closes BOTH halves. A
+  press INSIDE the rectangle no longer falls THROUGH the screen onto the row beneath and raises it
+  (SO44 — Peter: *"the login window appeared over the top of the gui and when i click it it went away"*;
+  the screen's `owner_asid = 0` band is never named by `wm::hit_test`, so a press on its own pixels
+  resolved to whatever was behind). A press OUTSIDE it no longer reaches a dock tile, the crystal or a
+  window menu, so no program can be launched under NO principal before a session exists (SO36). The
+  rejected alternative is named so it is not reintroduced: special-casing `owner_asid == 0` in
+  `wm::hit_test` would hand the screen a control cluster and a close box back — LOGINCLOSE's measured
+  defect — and would gate only the points inside the rectangle. Modality is a property of the ROUTER, not
+  of the row.
 * **The IGNITION, and the one rule it follows (SO43, LOGINBOOT 2026-09-13):** the screen comes up
   because **the DESKTOP EXISTS**, never because a console route was installed. M3 wrote two of its four
   ignition sites as `if activate() { … }`, and `desktop_firmware::activate`'s return is
@@ -135,22 +172,17 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   unconditional step of its own bring-up, the menu bar. Asserted every witness boot by the
   `LOGIN-IGNITION` leg, which drives the Orin's own tuple (`desktop_up=true console_routed=false`) and
   reds the moment the rule consults the second term again.
-* **Residual, LEDGER SO44 — a press on the screen is not the screen's.** A login screen is MODAL: while
-  it is up a press inside its rectangle belongs to it and a press outside belongs to nobody. Neither is
-  true yet. The row's owner band is what makes it unclosable (above), and the same band makes
-  `wm::hit_test` skip it, so a press at the screen's own centre names the row BENEATH it — measured on
-  the ladder by the `[login] press-probe` line — and both arch routers then raise and focus that row,
-  which puts it above the screen. The fix is one line at the ONE shared furniture router both routers
-  ask ahead of every window arm (`video/strip.rs`'s `press_route`), swallowing every press while the
-  screen is up; that file is outside LOGINBOOT's list, so the change is reported and not made. It
-  closes SO36's furniture half by the same statement.
 * **Log Out (M4):** a row in the CRYSTAL menu (`crystal::Verb::LogOut`, R21 — menus belong in the menu
   bar), at the foot of the SHARD tree behind its own separator, knob-on only. The pick drops the session
   principal (`fs::users::logout`) and puts the login screen back up, where a second login opens a NEW
   session under the same or another principal — each with its own `/home/<name>`. What Log Out does NOT
-  do is stop the programs the session already launched: they keep the stamp they were launched with
-  (the boundary is the launch, not the clock — the bullet above), so an owned file stays reachable to a
-  process the logged-out user started. LEDGER SO37. The row is proven ROW -> VERB -> ACTION through the
+  do is QUIT the programs the session already launched: they keep running and keep the stamp they were
+  launched with. That stamp is now DEAD — SO37 is CLOSED: the pick burns the session epoch, so every slot
+  stamped in the closed session reads ANONYMOUS from `slot_ppid_of` down and an owned file is NO LONGER
+  reachable to a process the logged-out user started (see the session bullet above). What stays reachable
+  to it is only what its own live `(asid, gen)` incarnation owns, which is the pre-login world. LEDGER
+  SO37 fixed; a real quit-all through the dock's launch registry (R49's `PinnedApp` list) is the Mac
+  behaviour and is a separate arc. The row is proven ROW -> VERB -> ACTION through the
   menu's own pure resolver (`crystal::logout_row_fire`, fixture `loginst`), and its placement on the
   real panel by `crystal::selftest` leg 3, which walks every row of the tree.
 * **Status (M1, `exec-orin-login`):** record store, session principal on both arches, `login`/

@@ -626,8 +626,40 @@ fn home_acl_proof(name: &[u8]) -> &'static str {
     }
 }
 
-/// Log out: close the session. Programs already running keep the principal they were stamped
-/// with (a stamp is per slot, taken at load); new launches are anonymous again.
+/// SO37 fixture: **the session epoch, proved by refusal**, where the syscall layer exists (the same
+/// dispatch [`home_acl_proof`] uses and for the same reason — an image with no EL0 regime can launch no
+/// program, so there is no stamp to strand and the leg is `"unlinked"`, not a pass). Called with the
+/// session OPEN; the arch fixture closes it, re-opens it as the SAME user and leaves session 2 running,
+/// which [`login_fixture`]'s own `logout()` then closes.
+#[cfg(feature = "loginst")]
+fn epoch_proof(name: &[u8]) -> &'static str {
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))]
+    {
+        let mut p = [0u8; 32];
+        p[..5].copy_from_slice(b"HOME/");
+        p[5..5 + name.len()].copy_from_slice(name);
+        let tail = b"/EPOCH.TXT";
+        p[5 + name.len()..5 + name.len() + tail.len()].copy_from_slice(tail);
+        let path = core::str::from_utf8(&p[..5 + name.len() + tail.len()]).unwrap_or("HOME/X/EPOCH.TXT");
+        let id = id_of(name).unwrap_or(0);
+        return if crate::arch::syscall::session_epoch_fixture(path, id, name) { "ok" } else { "FAIL" };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let id = id_of(name).unwrap_or(0);
+        return if crate::arch::syscall::session_epoch_fixture(id, name) { "ok" } else { "FAIL" };
+    }
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0"))))]
+    {
+        let _ = name;
+        "unlinked"
+    }
+}
+
+/// Log out: close the session (SO37: and BURN THE EPOCH — see `arch::syscall::session_logout`). The
+/// programs the session launched keep the principal they were stamped with at load, and that stamp now
+/// reads ANONYMOUS from `slot_ppid_of` down, so it opens nothing the user owns and creates nothing in the
+/// user's name. What it keeps is what its own live `(asid, gen)` incarnation owns — the pre-login world.
 pub fn logout() {
     arch_session_logout();
     {
@@ -635,7 +667,12 @@ pub fn logout() {
         s.1 = 0;
         s.2 = 0;
     }
-    serial_println!("[users] logout");
+    // SO37 ON THE WIRE. The epoch printed is the one now LIVE, i.e. the one that has just been opened by
+    // this logout — so `epoch=N` says "every stamp carrying N-1 or older is refused from here on", and a
+    // boot's session boundaries are countable on serial with no fixture armed. This is the ONE string SO37
+    // adds to a shipping (`login`, no `loginst`) image; the enforcement itself is pure control flow and
+    // deliberately prints nothing on the SYS_OPEN path, which is hot.
+    serial_println!("[users] logout epoch={} (SO37: stamps from the closed session are refused)", arch_session_epoch());
 }
 
 /// The logged-in user's name, copied into `out`; `None` when no session is open.
@@ -674,6 +711,17 @@ fn arch_session_login(id: u32, name: &[u8]) -> bool {
 fn arch_session_logout() {
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     crate::arch::syscall::session_logout();
+}
+
+/// SO37: the LIVE session epoch where the syscall layer exists (see [`arch_session_login`]); `0` on an
+/// image with no EL0 regime, where no program can be launched and so no stamp can be stranded.
+fn arch_session_epoch() -> u32 {
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+    {
+        return crate::arch::syscall::session_epoch();
+    }
+    #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
+    0
 }
 
 /// Does this image carry the session principal (see [`arch_session_login`])? On the witness line.
@@ -738,6 +786,47 @@ pub fn screen_key(c: u8) -> bool {
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         let _ = c;
+        false
+    }
+}
+
+/// SO36 + SO44 — **THE PRESS TWIN OF [`screen_key`], and the whole of the input gate.**
+///
+/// `true` = the press is the SCREEN's and no window arm may run. It answers `true` for EVERY press while
+/// the screen is up — inside its rectangle and outside it alike — which is the sentence the whole fix is:
+///
+///  * **SO44 (Peter, on the glass): *"the login window appeared over the top of the gui and when i click
+///    it it went away"*.** The screen's `wm` row is minted in the shell/desktop owner band (`login::OWNER`
+///    = 0), which `wm::hit_test` never names — LOGINCLOSE measured that and read it as "no press can
+///    reach the row", which was true and was the wrong consequence. A press that hits NOTHING does not
+///    close the window; it lands on whatever is BENEATH, which both routers then raise and focus, and the
+///    screen is left behind the desktop it no longer covers. LOGINBOOT measured the miss at the screen's
+///    own centre: `[login] press-probe win=1 centre=(640,331) hit=0 verdict=NOBODY`.
+///  * **SO36 (the furniture half): before a login the dock's tiles, the crystal and the window menu still
+///    answer the pointer,** so a program could be launched under no principal from the login screen.
+///
+/// ONE statement closes both, because both are the same defect: the screen is a WINDOW THAT HAPPENS TO BE
+/// ON TOP where it needed to be a MODAL BARRIER. Asked FIRST in `video::strip::press_route` — ahead of
+/// winmenu, crystal and dock, and therefore ahead of every window arm in both routers — the barrier is
+/// what the router consults before it consults anything else, and nothing below it runs at all: no tile
+/// launches, no menu opens, no window is raised, nothing takes focus.
+///
+/// **The alternative was considered and REJECTED** (LOGINBOOT, and this executor agrees): special-casing
+/// `owner_asid == 0` in `wm::hit_test` so the screen's row names itself. That hands the screen a control
+/// cluster and a close box back — the exact defect LOGINCLOSE measured and belted — and it would gate only
+/// the points inside the rectangle, leaving every press outside it to the dock. Modality is a property of
+/// the ROUTER, not of the row.
+///
+/// Same gate as [`screen_key`] (x86 `wc`, aarch64 `desktop_firmware`): `false` where no desktop is built,
+/// so a router compiled without a screen is the pre-SO36 router.
+pub fn screen_press(x: i32, y: i32) -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        return crate::video::crystal::login::press_swallow(x, y);
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let _ = (x, y);
         false
     }
 }
@@ -829,6 +918,8 @@ pub fn service() {
             #[cfg(feature = "loginst")]
             login_fixture();
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+            crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
+            #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire); // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it.
         }
         Err(e) => {
@@ -886,22 +977,27 @@ pub fn login_fixture() {
     let principal_ok = matches!(whoami(&mut nb), Some(n) if &nb[..n] == NAME);
     let home = match ensure_home(NAME) { Ok(v) => v, Err(_) => "FAIL" };
     let acl = home_acl_proof(NAME);
+    // SO37 — runs HERE, with the session open, because the whole claim is about what a Log Out does to a
+    // stamp taken before it. It leaves a NEW session open under the same name; the `logout()` below
+    // closes it, so `none_after` reads exactly as it did before this leg existed.
+    let epoch = epoch_proof(NAME);
     logout();
     let none_after = whoami(&mut nb).is_none();
-    let all = verify_ok && wrong_refused && wrong_login_refused && none_before && login_ok && principal_ok && none_after && home != "FAIL" && acl != "FAIL";
+    let all = verify_ok && wrong_refused && wrong_login_refused && none_before && login_ok && principal_ok && none_after && home != "FAIL" && acl != "FAIL" && epoch != "FAIL";
     if all {
         serial_println!(
-            ":: LOGIN: users+session create={} verify=ok wrong=refused login=ok principal=user:una linked={} home={} acl={} logout=ok users={} volume={} -> PASS ::",
+            ":: LOGIN: users+session create={} verify=ok wrong=refused login=ok principal=user:una linked={} home={} acl={} epoch={} logout=ok users={} volume={} -> PASS ::",
             create,
             principal_linked(),
             home,
             acl,
+            epoch,
             count(),
             vol
         );
     } else {
         serial_println!(
-            ":: LOGIN: users+session -> FAIL — create={} verify={} wrong_refused={} wrong_login_refused={} none_before={} login={} principal={} none_after={} home={} acl={} volume={} ::",
+            ":: LOGIN: users+session -> FAIL — create={} verify={} wrong_refused={} wrong_login_refused={} none_before={} login={} principal={} none_after={} home={} acl={} epoch={} volume={} ::",
             create,
             verify_ok,
             wrong_refused,
@@ -912,6 +1008,7 @@ pub fn login_fixture() {
             none_after,
             home,
             acl,
+            epoch,
             vol
         );
     }

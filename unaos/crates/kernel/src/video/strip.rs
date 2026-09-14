@@ -777,7 +777,7 @@ pub fn compose_all() -> bool {
 /// this order plus those two declines, and it is what `menubar::open_dropdown_rect` reads.
 #[inline]
 pub fn press_route(x: i32, y: i32) -> bool {
-    super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y)
+    #[cfg(feature = "login")] if crate::fs::users::screen_press(x, y) { return true; } super::winmenu::press_at(x, y) || super::crystal::press_at(x, y) || super::dock::press_at(x, y) // SO36/SO44 — THE SESSION GATE, a NEW FIRST TERM ahead of the three furniture arms and therefore ahead of every window arm in both routers. Written as a short-circuiting `if` rather than a fourth `||` operand for one reason: `#[cfg]` cannot gate an operand of `||`, and the whole session model must vanish knob-off (`./arroyo knoboff login`). The semantics are the OR-chain's exactly — first term true, nothing below it is evaluated. ⚠ LINE-NEUTRAL fold, statement BEFORE the line's first `//` (LEDGER P7).
 }
 
 /// **The KEY seam: every furniture surface's `<Esc>` arm.** The twin of [`press_route`], extracted for
@@ -1559,4 +1559,110 @@ pub fn vacate_selftest() {
         if super::desktop_scene_owns_backdrop() { "yes" } else { "no" },
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ---------------------------------------------------------------------------
+// SO36 / SO44 — THE INPUT GATE, PROVED BOTH WAYS
+// ---------------------------------------------------------------------------
+
+/// The surface the fixture's stand-in row names. 64x64 is a window, not a pixel: the press points are
+/// taken from `wm::info` so the size only has to be big enough to hit-test. `loginst` only.
+#[cfg(feature = "loginst")]
+static mut PRESS_SURF: [u32; 64 * 64] = [0; 64 * 64];
+
+/// SO36 + SO44 fixture (`loginst`) — **a press with NO SESSION must not reach the window behind the
+/// login screen, and the proof has to show that it otherwise WOULD.**
+///
+/// A gate that answers "consumed" for every press is indistinguishable from a router that is simply
+/// broken, so this leg measures the same point twice, in the two states, against a REAL `wm` row:
+///
+///  1. **A window is genuinely behind.** A stand-in row is minted in the ordinary app band (`owner 1` —
+///     the `slot + 1` bias every app on the glass carries, and the same control `login::close_leg`
+///     mints), at the panel's own centre so no strip owns its pixels. `wm::hit_test` at its content
+///     origin must NAME it (`behind_named`): without that there is no window to protect and the rest of
+///     the leg is vacuous.
+///  2. **SCREEN DOWN — the control that must fire.** [`press_route`] at that point must answer `false`,
+///     which is the router going on to its window arm: the press reaches the row. If this reads `true`
+///     the gate is a constant and the leg goes RED rather than green.
+///  3. **SCREEN UP — the same point, and a point nowhere near it.** [`press_route`] must answer `true`
+///     at the row's origin (SO44: the press that used to fall THROUGH the screen onto the window behind)
+///     and `true` at `(0, 0)` — the FITTS-CORNER cell the crystal claims, the strongest outside-the-
+///     rectangle point there is, because it is the one pixel the furniture would certainly have taken
+///     (SO36: no tile, no menu, no launch with no session open).
+///  4. **And the window is still there.** `wm::hit_test` at the same point still names the row, so the
+///     `true` above is the GATE refusing to route it, not the row having gone away.
+///
+/// Then the screen is taken down the way a person takes it down — the credentials typed into the form —
+/// and the session it opens is closed again, so the boot continues in the state the fixture found.
+#[cfg(feature = "loginst")]
+pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
+    use super::crystal::login;
+    use super::wm;
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 256 || ph < 256 {
+        serial_println!(":: LOGIN-PRESS: panel={}x{} -> SKIP — no panel to mint a row on ::", pw, ph);
+        return true;
+    }
+    let ctrl = wm::create_at(
+        1,
+        core::ptr::addr_of_mut!(PRESS_SURF) as usize,
+        64 * 64 * 4,
+        64,
+        64,
+        64 * 4,
+        b"behind",
+        pw / 2,
+        ph / 2,
+    );
+    let Some(info) = wm::info(ctrl) else {
+        serial_println!(":: LOGIN-PRESS: no stand-in row (create refused) -> SKIP ::");
+        return true;
+    };
+    let (px, py) = ((info.x + 4) as i32, (info.y + 4) as i32);
+    let behind_named = matches!(wm::hit_test(px, py), Some((w, _, _)) if w == ctrl);
+    // 2 — SCREEN DOWN. The control: this point is NOT furniture, so the router falls through to its
+    // window arm and the row behind takes the press.
+    let down_swallowed = crate::fs::users::screen_press(px, py);
+    let down_routed = press_route(px, py);
+    // 3 — SCREEN UP.
+    login::reopen_after_logout();
+    let up = login::is_open();
+    let up_at_window = press_route(px, py);
+    let up_at_corner = press_route(0, 0);
+    let still_named = matches!(wm::hit_test(px, py), Some((w, _, _)) if w == ctrl);
+    // Down again, through the form, exactly as a person does it.
+    for &b in name {
+        let _ = login::consume_key(b);
+    }
+    let _ = login::consume_key(b'\t');
+    for &b in password {
+        let _ = login::consume_key(b);
+    }
+    let _ = login::consume_key(b'\n');
+    let logged_in = !login::is_open();
+    let after_login = press_route(px, py);
+    crate::fs::users::logout();
+    if ctrl != wm::WIN_NONE {
+        wm::close(ctrl);
+    }
+    let ok = behind_named
+        && !down_swallowed
+        && !down_routed
+        && up
+        && up_at_window
+        && up_at_corner
+        && still_named
+        && logged_in
+        && !after_login;
+    serial_println!(
+        ":: LOGIN-PRESS: win={} at=({},{}) behind_named={} screen_down_routed={} screen_up={} up_at_window={} up_at_corner={} still_named={} logged_in={} after_login_routed={} -> {} ::",
+        ctrl, px, py, behind_named, down_routed, up, up_at_window, up_at_corner, still_named,
+        logged_in, after_login,
+        if ok { "PASS" } else { "FAIL —" }
+    );
+    ok
 }
