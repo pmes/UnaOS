@@ -445,7 +445,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // the boot where a scheduled core exists — and NOT down in the panel-service block it used to live
         // in. Its own doc comment states the invariant it depends on ("Spawned at BOOT ... so it already
         // exists before any orphan is queued"), and the old site did not honour it: the panel block runs
-        // AFTER `pi_rast_demo_maybe()`, while the whole EL0 fixture cascade — U11-reap included — is
+        // AFTER `rast_demo_maybe()`, while the whole EL0 fixture cascade — U11-reap included — is
         // already running on the APs. A teardown-orphaned chain queued by that fixture therefore waited on
         // a service that did not exist yet, and U11-reap's bounded CHECKPOINT-3 poll passed only when the
         // raster demo happened to finish inside it: 4.5 s of demo (PASS, by half a second) vs 9.5 s with
@@ -1409,7 +1409,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             inwedge_selftest(); // INWEDGE: prove the input router refuses a held panel lock instead of wedging the input core on it
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
-            if !desktop_firmware_activate_maybe() { unaos_kernel::video::fbcon::detach(); } pi_rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `desktop_firmware_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); pi_rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
+            if !desktop_firmware_activate_maybe() { unaos_kernel::video::fbcon::detach(); } rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `desktop_firmware_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
             // M5c: on metal, route + enable the PL011 RX interrupt (SPI 153) to the input core so the
             // input task is woken by the UART instead of polling. GICD config stays BSP-only (this is
             // global distributor state). A backstop task also periodically wakes the input service so
@@ -1607,7 +1607,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // RAST-1/RAST-TEGRA (x86/virt + aarch64/virt, `rast` knob): run the software-rasterizer cube demo
     // through the panel `Screen` (call-never-edit), then hand the panel back. QEMU-witnessable path —
     // GICv2 virt + ramfb reaches here (Orin panel is wired in `tegra_early_stop`). Byte-identical off.
-    #[cfg(all(feature = "rast", any(target_arch = "x86_64", all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))))] // `pi`/`tegra` are AARCH64 BOARD SELECTORS and may only subtract on aarch64. This is the virt/x86 arm of three; `tegra_rast_demo_maybe` and `pi_rast_demo_maybe` are the others and BOTH carry `target_arch = "aarch64"` — this one did not, which was the defect: a build that set `pi` on x86 silently lost the demo AND kept the inline loop the `not(rast)` arm above hands off for, strictly worse than either branch. Folded onto this line to stay line-neutral (panic `Location` records embed line numbers; PARITY §5.3).
+    #[cfg(all(feature = "rast", any(target_arch = "x86_64", all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra")))))] // `pi`/`tegra` are AARCH64 BOARD SELECTORS and may only subtract on aarch64. This is the virt/x86 arm of three; `rast_demo_maybe` and `rast_demo_maybe` are the others and BOTH carry `target_arch = "aarch64"` — this one did not, which was the defect: a build that set `pi` on x86 silently lost the demo AND kept the inline loop the `not(rast)` arm above hands off for, strictly worse than either branch. Folded onto this line to stay line-neutral (panic `Location` records embed line numbers; PARITY §5.3).
     {
         unaos_kernel::video::fbcon::detach();
         #[cfg(feature = "rastmc")] unaos_kernel::rast_demo::run_mc(&mut screen); unaos_kernel::rast_demo::run(&mut screen); // RASTPORT: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content — the same ordering the Orin call site uses, for the same reason. On the SAME SOURCE LINE as the `run` call it rides, so the wire-in adds ZERO source lines ahead of any panic Location (the PI-V3D-1 byte-identity convention); with `rastmc` off this folds to the bare `run(&mut screen);` RAST-1 has always had. NOTE this whole block is reached ONLY because `rast` compiles the SCHED-X86 handoff out (the `not(feature = "rast")` gate above) — with the handoff live, `run_bsp` diverges and nothing here runs. Deliberately gated identically to the sibling call (`not(pi)`, `not(tegra)`) so the REDSORT `pi`-leak fix covers BOTH call sites when it lands, rather than one.
@@ -2739,7 +2739,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // `el0-hello` task, and an unstamped mask would refuse it (see sched.rs `EL1_CORE_MASK`).
     unaos_kernel::arch::percpu::init(0); unaos_kernel::arch::sched::mark_el1_core();
     unaos_kernel::arch::exceptions::install();
-    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); #[cfg(feature = "orinfurn")] tegra_desk_furn(); #[cfg(feature = "deskcascade")] tegra_desk_cascade(); #[cfg(feature = "orinrender")] tegra_render_arm(); tegra_rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + DESKCASCADE, the NORMAL desktop — `desktop_firmware::activate()`'s whole cascade behind ONE knob (no-op unless UNAOS_DESKCASCADE=1; DESKCASCADE tail block — after every partial seam and AHEAD of `tegra_render_arm`, so the pass presents what it built; bracketed by the `[u7stk] boot-core:pre/post-cascade` probes §5.2 asked for) + ORIN-DESKFURN, the menu bar + SHARD menu (no-op unless UNAOS_ORINFURN=1; DESKFURN tail block — LAST of the rungs on purpose, so every earlier rung's probe still reads a panel with no bar on it and its captures stay comparable to boot7f/7g/7h; and still AHEAD of `boot_ok_disarm`, so the boot watchdog covers the composite it drives) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
+    unaos_kernel::arch::timer::el1_oneshot_proof(); #[cfg(feature = "bsptick")] unaos_kernel::arch::timer::el1_bsptick_start(); tegra_el0_start_maybe(); #[cfg(feature = "tegradesk")] tegra_desk_arm(); #[cfg(feature = "orinconwin")] unaos_kernel::arch::display_tegra::orin_conwin(); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_arm(); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_arm(); #[cfg(feature = "orinfurn")] tegra_desk_furn(); #[cfg(feature = "deskcascade")] tegra_desk_cascade(); #[cfg(feature = "orinrender")] tegra_render_arm(); rast_demo_maybe(); #[cfg(feature = "orinwdt")] unaos_kernel::arch::wdt_tegra::boot_ok_disarm(); #[cfg(not(feature = "bsprun"))] unaos_kernel::arch::sched::run_capstone_boot_core(0); #[cfg(feature = "bsprun")] unaos_kernel::arch::sched::run_bsp_tegra(0); // IRQEL-RT EL1 one-shot proof (first: one interrupt taken AT EL1 through the runtime-banked __vec_irq, then self-disarms — see timer.rs tail) + ORIN-BSPTICK periodic EL1 tick (no-op unless UNAOS_BSPTICK=1; arms right where the one-shot self-disarmed and leaves IRQs unmasked across the terminus — timer.rs tail) + ORINDESK RUNG 2 desktop seam (no-op unless UNAOS_TEGRADESK=1; DESKSEAM tail block) + DESKCASCADE, the NORMAL desktop — `desktop_firmware::activate()`'s whole cascade behind ONE knob (no-op unless UNAOS_DESKCASCADE=1; DESKCASCADE tail block — after every partial seam and AHEAD of `tegra_render_arm`, so the pass presents what it built; bracketed by the `[u7stk] boot-core:pre/post-cascade` probes §5.2 asked for) + ORIN-DESKFURN, the menu bar + SHARD menu (no-op unless UNAOS_ORINFURN=1; DESKFURN tail block — LAST of the rungs on purpose, so every earlier rung's probe still reads a panel with no bar on it and its captures stay comparable to boot7f/7g/7h; and still AHEAD of `boot_ok_disarm`, so the boot watchdog covers the composite it drives) + RAST-TEGRA demo (no-op unless UNAOS_RAST=1), all on the same line as the terminus so the wire-ins add ZERO source lines before any panic Location — the tegra knob-off byte-identity constraint (PI-V3D-1 bisect-proven). The terminus itself is knob-selected (ORIN-BSPRUN, Candidate B arc 2): default = the cooperative `run_capstone_boot_core(0)` drive loop, UNAOS_BSPRUN=1 = `run_bsp_tegra(0)` (sched.rs tail — SCHED_ACTIVE + mark_online(0) + the preemptive `run()` loop; requires/implies bsptick, arroyo folds it in). Helpers defined at file tail / sched.rs tail / timer.rs tail. Helpers defined at file tail / timer.rs tail.
 }
 
 /// Handle one keyboard byte against the console: printable ASCII extends the input line, backspace
@@ -7114,39 +7114,6 @@ fn panic(info: &PanicInfo) -> ! {
     unaos_kernel::arch::hlt_loop();
 }
 
-// ── RAST-TEGRA ──────────────────────────────────────────────────────────────────────────────────
-// The Orin-panel wire-in of the `rast` software rasterizer. Called from the tail of `tegra_early_stop`
-// (post-drop, at EL1, right before `run_capstone_boot_core`) so the spinning cube draws through the
-// JD1-inherited scanout as the last panel content of the boot. Kept HERE at the file tail — and called
-// on the SAME source line as the terminus above — so the whole wire-in adds zero source lines ahead of
-// any panic `Location` literal: the tegra knob-off kernel is byte-identical to baseline (the panic-line
-// byte-identity constraint, PI-V3D-1 bisect-proven). Same `Screen` present path RAST-1 proved on x86,
-// call-never-edit on the shared surface. Panel comes off `video::WRITER` (seeded by JD1 in
-// `tegra_early_stop`, mapped into BOTH translation tables so it is reachable post-drop at EL1); the
-// back buffer and depth buffer come off the live 48 MiB heap. `crate::arch::ms()` reads CNTVCT on the
-// timerless post-drop core (the VUGFIX tegra fallback), so the honest fps line still ticks.
-#[cfg(all(feature = "tegra", feature = "rast", target_arch = "aarch64"))]
-fn tegra_rast_demo_maybe() {
-    let front_fb = *unaos_kernel::video::WRITER.lock();
-    // Headless boot (no JD1 scanout → WRITER never seeded): nothing to draw on, stay silent-ish.
-    if front_fb.info().width == 0 {
-        serial_println!(":: RAST: tegra headless (no JD1 scanout) — cube demo skipped ::");
-        return;
-    }
-    // Detach fbcon's serial mirror first so a CAPSTONE straggler line can't paint over the demo
-    // frames (serial output is unaffected). Mirrors the x86/virt wire-in and the JD2 phase-2 takeover.
-    if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } // ORIN-CONWIN rung 4 — THE SAME GUARD ITS TWIN AT `jd2_console_pump`'s phase-2 line already carries, and it was missing here. THE DEFECT IT REMOVES: on the terminus line `orin_conwin` runs BEFORE `tegra_rast_demo_maybe`, so every image carrying both (all five orinconwin legs carry `rast`) installed the console-window route, printed `[orinconwin] … live=LIVE`, and then reached THIS statement and detached anyway — `GUI_ACTIVE` set, `fbcon::_print` returning at its first test, and the "LIVE" console window receiving no further glyph for the rest of the boot. The guard is the same one and for the same reason: `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the PANEL — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the single-writer guarantee the detach exists for is already true of the mirror path. ⚠ WHAT THE GUARD COSTS HERE, and it is NOT identical to the phase-2 site's cost, so it is stated rather than inherited: this site's stated purpose is "a straggler can't paint over the DEMO FRAMES", and a routed console still reaches glass through `wm`'s paced, damage-limited composite. So a straggler line printed while the cube spins can now composite over it INSIDE the console window's rect, and because `orin_rast_console_owns()` is not latched until phase 2 the census would score that `RAST-PAINTED-OVERWRITTEN`. That is a true reading of a real second writer, not a false one — the conwin+rast image genuinely has two panel owners — and it is the same trade the phase-2 line already took when it chose a live console over a frozen one. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof. Knob-off `tegra_conwin_live` is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been.
-    serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
-    let mut screen = unaos_kernel::video::Screen::new(front_fb);
-    unaos_kernel::rast_demo::run_mc(&mut screen); unaos_kernel::rast_demo::run(&mut screen); drop(screen); unaos_kernel::arch::display_tegra::orin_rast_glass_post(); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above. ORIN-RASTGLASS: the `post` glass read-back, fired the instant `run` returns — nothing is dispatched on this core in between, so it is the ONE sample that can establish whether the blit reached the scan-out at all (`late`, from the pump sweep, then says whether it survived). `drop(screen)` first so the double buffer's own `flush` has certainly landed before the panel is read back; also releases the back buffer to the heap ahead of ~2048 volatile VRAM reads. Same-line per the convention above.
-}
-
-// Knob-off / non-rast tegra build: the wire-in compiles to nothing. `#[inline(always)]` on an empty
-// body means the call above emits zero instructions, so the tegra image stays byte-identical.
-#[cfg(all(feature = "tegra", not(feature = "rast"), target_arch = "aarch64"))]
-#[inline(always)]
-fn tegra_rast_demo_maybe() {}
-
 // ── JETSON-EL0 (M1b): the Orin's first EL0 round trip ───────────────────────────────────────────────
 //
 // Bring the user address space up, load the `USER_BLOB` hello program into it, seal the code page W^X,
@@ -7227,64 +7194,109 @@ fn tegra_darkwin_witness(boot_info: &BootInfo) {
     );
 }
 
-// ── PI-RAST ─────────────────────────────────────────────────────────────────────────────────────
-// The Pi 4 / BCM2711 panel wire-in of the `rast` software rasterizer — the Pi's first 3D pixels.
-// RAST-TEGRA is the precedent this follows: an aarch64 board with an INHERITED scanout. There is no
-// mode-set and no scanout reprogramming here either. The panel is whatever the VideoCore firmware
-// already gave us through the mailbox `init_framebuffer` (`video::WRITER`), and geometry is read
-// LIVE off that surface — never hardcoded. The bench Pi is 1920x1200 and QEMU raspi4b is 640x480;
-// both are just `screen.width()/height()` to this code, and `rast_demo::run` centers its fixed
-// 320x240 render on whatever it finds (and skips honestly if the panel is smaller than that).
+// ── RAST-DEMO ────────────────────────────────────────────────────────────────────────────────────
+// ONE FUNCTION for the `rast` software-rasterizer panel wire-in on both aarch64 boards (GATE-FAMILY /
+// ONEOS, R16). This was two functions with two board names — `tegra_rast_demo_maybe` and
+// `pi_rast_demo_maybe` — whose cfgs are already mutually exclusive (`arch/aarch64/serial.rs` makes
+// `pi` + `tegra` a hard `compile_error!`), so the twin that a build compiles was never in doubt: only
+// the NAME was split. The names are gone; the two boards' fragments sit behind the SAME cfgs they
+// already carried, INSIDE this body, and NEITHER BOARD'S BEHAVIOUR CHANGES — same statements, same
+// order, same witness strings — 1:1 by census against 27716175 (the orin14 NEUTRAL-TABLE audit named
+// this merge and the name `rast_demo_maybe` for it: "the two are cfg-exclusive twins ... can merge
+// them under one name with the cfg inside").
 //
-// WHERE IT RIDES, and why that point and not the terminus. On aarch64/baremetal the boot core reaches
-// the GUI handoff block, detaches fbcon, spawns the `input` + `render` service tasks onto two APs and
-// then joins the scheduler (`run_bsp`). The demo is called on the DETACH LINE — after the panel is up
-// and fbcon has stopped mirroring serial onto it, and BEFORE any service task exists. So:
-//   * it cannot race bring-up (the mailbox framebuffer, the heap and the timer are all long up), and
-//   * it cannot fight the compositor (`render_service` is the panel's sole painter, and it has not
-//     been spawned yet — unlike the Orin, whose terminus IS the scheduler entry).
-// The demo's own `Screen` (a full-panel back buffer, ~9 MiB at 1920x1200) is scoped to this call and
-// DROPPED before those spawns, so the render task's identical shadow never coexists with it on the
-// 48 MiB metal heap. `rast_demo::run` is bounded (90 paced frames), so boot always reaches the shell;
-// `render_service` repaints the console over the cube the moment it starts.
+// WHAT IS SHARED, and it is the whole reason the merge is worth the shift: the panel handle off
+// `video::WRITER`, the headless refusal, the `Screen` construction and the paced `rast_demo::run`
+// present loop. `Screen` is the shared surface RAST-1 proved on x86 and neither board edits it —
+// call-never-edit. Geometry is read LIVE off whatever scanout the firmware already gave us and is
+// never hardcoded (the bench Pi is 1920x1200, QEMU raspi4b 640x480, the Orin panel whatever JD1
+// inherited); `rast_demo::run` centers its fixed 320x240 render on what it finds and skips honestly
+// when the panel is smaller.
 //
-// CALL-NEVER-EDIT on the shared surface: this touches only the public `Screen` API through
-// `rast_demo::run`, exactly as x86/virt and tegra do. It does not touch the compositor, `pal`,
-// `pal::cursor::SPRITE_OWNS_PAINT` (which stays false on aarch64), or anything in the V3D tree.
-// The helper lives HERE at the file tail and is CALLED on an existing source line, so the whole
-// wire-in adds zero source lines ahead of any panic `Location` literal — the constraint that keeps
-// the knob-off kernel8.img byte-identical to baseline.
-#[cfg(all(feature = "pi", feature = "pirast", target_arch = "aarch64"))]
-fn pi_rast_demo_maybe() {
+// WHAT IS PER-BOARD, under its existing cfg:
+//   * tegra — the headless test is width-only (JD1 either seeded a scanout or it did not), the
+//     ORIN-CONWIN rung-4 guarded `fbcon::detach()`, the `:: RAST: tegra` witnesses, the RAST-MC
+//     multi-core rung ahead of the paced pass, and the ORIN-RASTGLASS `post` glass read-back.
+//   * pi — the headless test also rejects a zero HEIGHT, the `:: PI-RAST:` witnesses (including the
+//     live firmware geometry), and the honest wall-clock fps line over the whole wire-in.
+//
+// WHERE EACH BOARD CALLS IT, unchanged by this merge. On tegra: the tail of `tegra_early_stop`
+// (post-drop, at EL1, right before `run_capstone_boot_core`), so the spinning cube is the last panel
+// content of the boot; the panel comes off `video::WRITER` as JD1 seeded it, mapped into BOTH
+// translation tables so it is reachable post-drop at EL1, and `crate::arch::ms()` reads CNTVCT on that
+// timerless core (the VUGFIX tegra fallback). On pi: the aarch64/baremetal GUI-handoff DETACH LINE —
+// after the mailbox panel and the heap and the timer are all long up, and BEFORE any service task
+// exists, so it can neither race bring-up nor fight the compositor (`render_service` is the panel's
+// sole painter and has not been spawned yet, and it repaints the console over the cube the moment it
+// starts). The demo's own `Screen` (a full-panel back buffer, ~9 MiB at 1920x1200) is scoped to this
+// call and dropped before those spawns, so the render task's identical shadow never coexists with it
+// on the 48 MiB metal heap. `rast_demo::run` is bounded (90 paced frames), so boot always reaches the
+// shell.
+//
+// STILL AT THE FILE TAIL, and still CALLED ON AN EXISTING SOURCE LINE at both sites, for the reason
+// both halves of this block used to state separately: panic `Location` records embed file AND LINE,
+// so a wire-in that adds source lines ahead of them moves the knob-off image (PI-V3D-1, bisect-proven
+// on kernel8.img). The merge itself is a one-time line-count change confined to this tail (+15 lines in
+// `main.rs`, `wc -l` 9789 → 9804), so the knob-off image is expected to MOVE by the `Location` lines
+// below it and by nothing else. That delta is MEASURED with `./arroyo knoboff`, never asserted.
+#[cfg(all(target_arch = "aarch64", any(all(feature = "tegra", feature = "rast"), all(feature = "pi", feature = "pirast"))))]
+fn rast_demo_maybe() {
     // `FrameBuffer` is `Copy` — take a handle and release the WRITER lock immediately, the same way
     // `render_service` does a few dozen lines below.
     let front_fb = *unaos_kernel::video::WRITER.lock();
-    // Headless / no firmware framebuffer: nothing to draw on. Say so and return — never guess a size.
-    if front_fb.info().width == 0 || front_fb.info().height == 0 {
+    // Headless: nothing to draw on. Each board keeps ITS OWN test and ITS OWN witness, verbatim — the
+    // pi arm rejects a zero HEIGHT as well because the mailbox can hand back a half-formed surface,
+    // and neither board ever guesses a size.
+    #[cfg(feature = "tegra")]
+    let headless = front_fb.info().width == 0;
+    #[cfg(feature = "pi")]
+    let headless = front_fb.info().width == 0 || front_fb.info().height == 0;
+    if headless {
+        #[cfg(feature = "tegra")]
+        serial_println!(":: RAST: tegra headless (no JD1 scanout) — cube demo skipped ::");
+        #[cfg(feature = "pi")]
         serial_println!(":: PI-RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::");
         return;
     }
+    // Detach fbcon's serial mirror first so a CAPSTONE straggler line can't paint over the demo
+    // frames (serial output is unaffected). Mirrors the x86/virt wire-in and the JD2 phase-2 takeover.
+    // TEGRA ONLY: the pi site's caller already guards and rides its own `fbcon::detach()` on the
+    // GUI-handoff line (CONSWIN-PI), so a second detach here would be the unguarded twin this same
+    // guard was added to remove.
+    #[cfg(feature = "tegra")]
+    if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } // ORIN-CONWIN rung 4 — THE SAME GUARD ITS TWIN AT `jd2_console_pump`'s phase-2 line already carries, and it was missing here. THE DEFECT IT REMOVES: on the terminus line `orin_conwin` runs BEFORE `rast_demo_maybe`, so every image carrying both (all five orinconwin legs carry `rast`) installed the console-window route, printed `[orinconwin] … live=LIVE`, and then reached THIS statement and detached anyway — `GUI_ACTIVE` set, `fbcon::_print` returning at its first test, and the "LIVE" console window receiving no further glyph for the rest of the boot. The guard is the same one and for the same reason: `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the PANEL — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the single-writer guarantee the detach exists for is already true of the mirror path. ⚠ WHAT THE GUARD COSTS HERE, and it is NOT identical to the phase-2 site's cost, so it is stated rather than inherited: this site's stated purpose is "a straggler can't paint over the DEMO FRAMES", and a routed console still reaches glass through `wm`'s paced, damage-limited composite. So a straggler line printed while the cube spins can now composite over it INSIDE the console window's rect, and because `orin_rast_console_owns()` is not latched until phase 2 the census would score that `RAST-PAINTED-OVERWRITTEN`. That is a true reading of a real second writer, not a false one — the conwin+rast image genuinely has two panel owners — and it is the same trade the phase-2 line already took when it chose a live console over a frozen one. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof. Knob-off `tegra_conwin_live` is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been.
+    #[cfg(feature = "tegra")]
+    serial_println!(":: RAST: tegra — first 3D pixels on the Orin panel (inherited scanout) ::");
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
+    #[cfg(feature = "pi")]
     serial_println!(
         ":: PI-RAST: BCM2711 mailbox panel {}x{} (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::",
         screen.width(),
         screen.height()
     );
+    #[cfg(feature = "pi")]
     let t0 = unaos_kernel::arch::ms();
+    #[cfg(feature = "tegra")]
+    unaos_kernel::rast_demo::run_mc(&mut screen); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above. ORIN-RASTGLASS: the `post` glass read-back, fired the instant `run` returns — nothing is dispatched on this core in between, so it is the ONE sample that can establish whether the blit reached the scan-out at all (`late`, from the pump sweep, then says whether it survived). `drop(screen)` first so the double buffer's own `flush` has certainly landed before the panel is read back; also releases the back buffer to the heap ahead of ~2048 volatile VRAM reads. Same-line per the convention above.
     unaos_kernel::rast_demo::run(&mut screen);
-    // Honest fps for the WHOLE Pi wire-in: measured wall clock across `Screen` construction, the
-    // render/present loop and its pacing — a strictly wider span than the `:: RAST:` line the shared
-    // demo prints for the loop alone, so the two are expected to differ slightly and both are real.
-    // `PI_RAST_FRAMES` mirrors `rast_demo::FRAMES` (see the constant's own note on keeping it true).
-    let elapsed = unaos_kernel::arch::ms().saturating_sub(t0).max(1);
-    let fps_x1000 = (PI_RAST_FRAMES as u64 * 1000 * 1000) / elapsed;
-    serial_println!(
-        ":: PI-RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, BCM2711 mailbox-fb present) ::",
-        PI_RAST_FRAMES,
-        elapsed,
-        fps_x1000 / 1000,
-        fps_x1000 % 1000
-    );
+    #[cfg(feature = "tegra")]
+    { drop(screen); unaos_kernel::arch::display_tegra::orin_rast_glass_post(); }
+    #[cfg(feature = "pi")]
+    {
+        // Honest fps for the WHOLE pi wire-in: measured wall clock across `Screen` construction, the
+        // render/present loop and its pacing — a strictly wider span than the `:: RAST:` line the
+        // shared demo prints for the loop alone, so the two are expected to differ slightly and both
+        // are real. `PI_RAST_FRAMES` mirrors `rast_demo::FRAMES` (see the constant's own note).
+        let elapsed = unaos_kernel::arch::ms().saturating_sub(t0).max(1);
+        let fps_x1000 = (PI_RAST_FRAMES as u64 * 1000 * 1000) / elapsed;
+        serial_println!(
+            ":: PI-RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, BCM2711 mailbox-fb present) ::",
+            PI_RAST_FRAMES,
+            elapsed,
+            fps_x1000 / 1000,
+            fps_x1000 % 1000
+        );
+    }
 }
 
 /// Frame count of the shared `rast_demo` loop, mirrored here so the PI-RAST fps line can report a
@@ -7295,12 +7307,15 @@ fn pi_rast_demo_maybe() {
 #[cfg(all(feature = "pi", feature = "pirast", target_arch = "aarch64"))]
 const PI_RAST_FRAMES: u32 = 90;
 
-// Knob-off pi build (the default, and every `./arroyo kernel8` that does not set UNAOS_PIRAST=1):
-// the wire-in compiles to nothing. `#[inline(always)]` on an empty body means the call on the detach
-// line emits zero instructions, so kernel8.img stays byte-identical to baseline.
-#[cfg(all(feature = "pi", not(feature = "pirast"), target_arch = "aarch64"))]
+// Knob-off build on either board (the default, and every `./arroyo kernel8` that does not set
+// UNAOS_PIRAST=1 / every jetson image that does not set UNAOS_RAST=1): the wire-in compiles to
+// nothing. `#[inline(always)]` on an empty body means the call on the caller's existing line emits
+// zero instructions, so both boards' images stay byte-identical to their knob-off baseline. ONE
+// declaration for both boards, exactly as the armed body above is one — the arms are cfg-exclusive,
+// never duplicate.
+#[cfg(all(target_arch = "aarch64", any(all(feature = "tegra", not(feature = "rast")), all(feature = "pi", not(feature = "pirast")))))]
 #[inline(always)]
-fn pi_rast_demo_maybe() {}
+fn rast_demo_maybe() {}
 
 // ── CONSWIN-PI / MENUBAR-PI ─────────────────────────────────────────────────────────────────────
 // The Pi's DESKTOP-READY wire-in. Called from the aarch64/baremetal GUI handoff, on the SAME source
@@ -7997,7 +8012,7 @@ fn tegra_desk_arm() -> bool {
 /// `fbcon::console_is_routed` is gated `all(target_arch = "aarch64", feature = "desktop_firmware")` and does not
 /// exist there. That is an E0425 this arc's first check actually produced, not a hypothetical. Every
 /// tegra helper at this file's tail carries the same term for the same reason (`jd2_console_pump`,
-/// `tegra_rast_demo_maybe`, `tegra_desk_arm`, `tegra_el0_start_maybe`). The KNOB still does the
+/// `rast_demo_maybe`, `tegra_desk_arm`, `tegra_el0_start_maybe`). The KNOB still does the
 /// gating; the arch term only stops a `tegra`-flavoured x86 leg from compiling an aarch64 call.
 #[cfg(all(feature = "tegra", feature = "orinconwin", target_arch = "aarch64"))]
 #[inline(always)]
@@ -8362,7 +8377,7 @@ fn jd2_supstate_presenter(_arg: usize) {
 // PI-V3D-1 and is bisect-proven: panic `Location` records embed line numbers, so a line inserted
 // ahead of them moves the loadable image even with every knob off.
 //
-// WHERE ON THE LINE. LAST of the rungs — after `orin_ladder_arm`, before `tegra_rast_demo_maybe` —
+// WHERE ON THE LINE. LAST of the rungs — after `orin_ladder_arm`, before `rast_demo_maybe` —
 // for two reasons. (1) Every earlier rung's probe (`[orinwm1]`, `[orinchrome]`, `[orinconwin]`,
 // `[orintenant]`, `[oringlass]`, `[orindock]`) then still reads a panel with no bar on it, so an
 // armed capture stays directly comparable to boot7f/7g/7h. (2) It is still AHEAD of
