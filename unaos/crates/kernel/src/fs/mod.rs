@@ -104,3 +104,52 @@ pub fn perf_op<T>(_op: &str, _path: &str, f: impl FnOnce() -> T) -> T {
 /// knob-off `fs/mod.rs` line numbering above is untouched.
 #[cfg(feature = "login")]
 pub mod users;
+
+/// NSGEN (LEDGER SR3): **the VFS NAMESPACE GENERATION — one arch-neutral counter that every
+/// listing-changing mutation the mount table performs advances exactly once.**
+///
+/// SR3's defect was that Quarry's cache-invalidation stamp was `block::usb_publish_gen()` and
+/// NOTHING ELSE, so the only event that could invalidate a cached directory listing was a USB
+/// mass-storage arrival. A `mkdir`, an `rmdir` (RMDIR/SO18 shipped the capability the same week), an
+/// `rm`, an `mv` or a write that changes a file's size left the cache serving a listing that no
+/// longer matched the volume, on every board, until somebody plugged a stick in.
+///
+/// **Why the counter lives HERE and not in a driver.** The event Quarry needs to hear about is a
+/// NAMESPACE event, not a BLOCK event: "a name appeared, vanished or changed size under some mount".
+/// `drivers/block.rs` cannot see one — it never learns that `create_dir` ran. The one place every
+/// namespace mutation on every board passes through is [`vfs::MountTable`]'s write half, which is
+/// arch-neutral and backend-neutral by construction, so the bump sits there (through [`ns_bump`])
+/// and the counter sits beside it in `fs/`. A consumer that wants BOTH facts adds the two monotone
+/// numbers — which is exactly what `video/quarry/live.rs`'s `volume_gen()` now does on aarch64, so
+/// the USB half SR3's row credits is preserved rather than replaced.
+///
+/// Monotone and never reset: a consumer compares it with the value it last saw and cares only that
+/// it MOVED. `Release` on the bump / `Acquire` on the read so a reader that sees the new generation
+/// also sees the mutation's own stores; no lock, so it is safe to ask on an input band (SR3's
+/// invariant) and costs one relaxed-class atomic per cache access.
+pub static NS_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// NSGEN: read the namespace generation. See [`NS_GEN`].
+#[inline]
+pub fn ns_gen() -> u64 {
+    NS_GEN.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// NSGEN: advance [`NS_GEN`] iff the mutation SUCCEEDED, and hand the result straight back.
+///
+/// A `Result`-shaped wrapper rather than a bare `bump()` statement for two reasons, both of them
+/// about the seam it is used at. (1) It makes every call site in `fs/vfs.rs` a LINE-NEUTRAL edit —
+/// the dispatch line that was already there is wrapped in place, no source line is added, and no
+/// `panic::Location` recorded below it in that 2.6k-line file moves (the rule `perf_op` above is
+/// written to and the reason `fatperf`'s two call sites have the shape they do). (2) A REFUSED
+/// mutation must not advance the generation: `mkdir` onto an existing name, a write to a read-only
+/// volume or a cross-volume `mv` change no listing anywhere, and a counter that moved for them would
+/// make every consumer's cache churn on exactly the operations that changed nothing. The fixture
+/// asserts both polarities (`video/quarry/live.rs`'s `stamp_selftest`).
+#[inline]
+pub fn ns_bump<T, E>(r: Result<T, E>) -> Result<T, E> {
+    if r.is_ok() {
+        NS_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+    r
+}

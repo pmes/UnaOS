@@ -559,22 +559,22 @@ impl MountTable {
 
     pub fn create(&self, path: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.create(rel, kind, principal)
+        crate::fs::ns_bump(b.create(rel, kind, principal)) // NSGEN (SR3) — a new name IS a listing change; bump on success only. ⚠ FOLDED onto the dispatch line that was already here rather than added below it: this file is lexed into the knob-off `kernel8.img` and panic `Location`s embed line numbers (`fs/mod.rs::perf_op`'s rule).
     }
 
     pub fn write(&self, path: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.write(rel, offset, data, principal)
+        crate::fs::ns_bump(b.write(rel, offset, data, principal)) // NSGEN (SR3) — a write that grows a file changes the SIZE a listing prints (`DirEnt::size`), so it is a listing change; same line-neutral fold.
     }
 
     pub fn truncate(&self, path: &str, size: u64, principal: &str) -> Result<(), VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.truncate(rel, size, principal)
+        crate::fs::ns_bump(b.truncate(rel, size, principal)) // NSGEN (SR3) — same fact as `write`, stated by the verb that only ever changes the size; same line-neutral fold.
     }
 
     pub fn unlink(&self, path: &str, principal: &str) -> Result<(), VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.unlink(rel, principal)
+        crate::fs::ns_bump(b.unlink(rel, principal)) // NSGEN (SR3) — a name that vanished is the case a stale cache reports as PRESENT, which is the worse direction; same line-neutral fold.
     }
 
     // --- VFSROUTE (orin 17): the resolve-then-dispatch surface the shell verbs ask ---
@@ -705,7 +705,7 @@ impl MountTable {
         // invariant that produced this defect, now load-bearing in one more place.
         bf.authorize_write(relf, principal)?;
         bt.authorize_write(&receiving_dir(relt), principal)?;
-        b.rename(rf, rt, principal)
+        crate::fs::ns_bump(b.rename(rf, rt, principal)) // NSGEN (SR3) — one bump for a mutation that changes TWO listings (both ends are on one volume by the refusal above, and a consumer only cares that the generation moved); same line-neutral fold.
     }
 
     /// Do `from` and `to` land on the SAME volume? The question `mv` asks before it decides between
@@ -740,7 +740,7 @@ impl MountTable {
 
     pub fn remove_dir(&self, path: &str, principal: &str) -> Result<(), VfsError> {
         let (b, rel) = self.resolve(path)?;
-        b.remove_dir(rel, principal)
+        crate::fs::ns_bump(b.remove_dir(rel, principal)) // NSGEN (SR3) — RMDIR (SO18) is the capability that made this seam reachable at all, and SR3's row names it as the mutation Quarry could not see; same line-neutral fold.
     }
 
     pub fn remove_attr(&self, path: &str, key: &str, principal: &str) -> Result<(), VfsError> {
@@ -2646,4 +2646,183 @@ pub fn rmdir_unafs_witness() {
             emptied, denied, survived_denial, removed, gone_live, gone_remount
         );
     }
+}
+
+// ===================== NSGEN (LEDGER SR3) — the namespace-generation fixture's volume ==============
+//
+// WHY A MOCK VOLUME AND NOT THE BOOT DISK, stated here because it is the one judgement call in the
+// SR3 fix and a later reader will ask.
+//
+// What SR3's fixture has to prove is a property of THE SEAM: that `MountTable`'s write half advances
+// `fs::NS_GEN` once per successful listing-changing mutation and never for a refusal, and that
+// Quarry's `volume_gen()` reads that counter. The backend underneath is not part of the claim — the
+// bump is in `MountTable`, above the dispatch, so every backend inherits it identically.
+//
+// Driving the LIVE FAT volume on the x86 gate instead would add a new row to `fs/fat.rs`'s
+// "X86 FAT-MUTATOR ROSTER": x86 has no in-`fat.rs` mutation lock (`with_fat_lock` is an
+// `#[inline(always)]` passthrough there) and consistency is held caller-side by that roster, which
+// `FatBackend`'s own VFSX86 note makes an explicit precondition for any new x86 consumer of this
+// write surface — "must either submit through the storage-service task or run in program order on
+// the BSP main loop ahead of the launchers, and must add itself to that roster". The x86 witness
+// site this fixture is chained from (`crystal::selftest`'s tail, off `winx_launcher`) is on the
+// launcher task beside roster rows 4/5, so the row would be writable — but writing it is an edit to
+// `fs/fat.rs`, which SR3's brief does not name, and a battery-time mutation of the very FAT image
+// the same run reads `STAT.ELF` / `VUG.ELF` / `PULSE.ELF` off of is not a free experiment.
+//
+// So the fixture drives the seam over an in-RAM volume: zero I/O, zero roster exposure, identical on
+// both arches, and the go-red (delete one `ns_bump` in `MountTable`) reds it exactly.
+//
+// `witness`-gated, and appended at the FILE TAIL so nothing below it can move a `panic::Location`.
+
+/// NSGEN: a tiny MUTABLE in-RAM volume — the read-only [`MockBackend`] above with a write surface.
+/// Names and kinds only; `write` moves a recorded size so the `DirEnt::size` half of a listing
+/// change has a witness too.
+#[cfg(feature = "witness")]
+#[doc(hidden)]
+pub struct NsMockBackend {
+    name: String,
+    /// `(volume-relative path, kind, size)`. The root is implicit and is never an entry.
+    nodes: spin::Mutex<Vec<(String, NodeKind, u64)>>,
+}
+
+#[cfg(feature = "witness")]
+#[doc(hidden)]
+impl NsMockBackend {
+    fn new(name: &str) -> Self {
+        Self { name: name.to_string(), nodes: spin::Mutex::new(Vec::new()) }
+    }
+    /// The parent directory of `rel`, volume-relative; `""` for a name directly under the root.
+    fn parent_of(rel: &str) -> String {
+        match rel.rfind('/') {
+            Some(0) | None => String::new(),
+            Some(i) => rel[..i].to_string(),
+        }
+    }
+    fn is_root(rel: &str) -> bool {
+        rel.is_empty() || rel == "/"
+    }
+}
+
+#[cfg(feature = "witness")]
+#[doc(hidden)]
+impl VfsBackend for NsMockBackend {
+    fn volume_name(&self) -> &str {
+        &self.name
+    }
+    fn volume_id(&self) -> Option<u64> {
+        None // Same answer, and the same reason, as `MockBackend::volume_id`: this volume is this object.
+    }
+    fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
+        let want = if Self::is_root(rel) { String::new() } else { rel.to_string() };
+        let n = self.nodes.lock();
+        if !want.is_empty() && !n.iter().any(|(p, k, _)| *p == want && *k == NodeKind::Dir) {
+            return Err(if n.iter().any(|(p, _, _)| *p == want) {
+                VfsError::NotADirectory
+            } else {
+                VfsError::NoSuchPath
+            });
+        }
+        Ok(n
+            .iter()
+            .filter(|(p, _, _)| Self::parent_of(p) == want)
+            .map(|(p, k, s)| DirEnt {
+                name: p.rsplit('/').next().unwrap_or(p).to_string(),
+                kind: *k,
+                size: *s,
+                mtime: None,
+            })
+            .collect())
+    }
+    fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
+        if Self::is_root(rel) {
+            return Ok(Stat { kind: NodeKind::Dir, size: 0 });
+        }
+        self.nodes
+            .lock()
+            .iter()
+            .find(|(p, _, _)| p == rel)
+            .map(|(_, k, s)| Stat { kind: *k, size: *s })
+            .ok_or(VfsError::NoSuchPath)
+    }
+    fn read(&self, rel: &str, _offset: u64, _len: usize) -> Result<Vec<u8>, VfsError> {
+        match self.stat(rel)?.kind {
+            NodeKind::Dir => Err(VfsError::IsADirectory),
+            NodeKind::File => Ok(Vec::new()),
+        }
+    }
+    fn authorize_read(&self, _rel: &str, _principal: &str) -> Result<(), VfsError> {
+        Ok(())
+    }
+    /// Volume-level, kernel-only — the FAT posture, so the fixture's DENIED leg is the same refusal
+    /// a real foreign volume makes rather than one invented here.
+    fn authorize_write(&self, _rel: &str, principal: &str) -> Result<(), VfsError> {
+        if principal == KERNEL_PRINCIPAL { Ok(()) } else { Err(VfsError::Denied) }
+    }
+    fn write_veto(&self) -> Option<&'static str> {
+        None
+    }
+    fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
+        self.authorize_write(rel, principal)?;
+        if Self::is_root(rel) {
+            return Err(VfsError::Backend("exists"));
+        }
+        let parent = Self::parent_of(rel);
+        let mut n = self.nodes.lock();
+        if n.iter().any(|(p, _, _)| p == rel) {
+            return Err(VfsError::Backend("exists"));
+        }
+        if !parent.is_empty() && !n.iter().any(|(p, k, _)| *p == parent && *k == NodeKind::Dir) {
+            return Err(VfsError::NoSuchPath);
+        }
+        n.push((rel.to_string(), kind, 0));
+        Ok(Stat { kind, size: 0 })
+    }
+    fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
+        self.authorize_write(rel, principal)?;
+        let mut n = self.nodes.lock();
+        let e = n.iter_mut().find(|(p, _, _)| p == rel).ok_or(VfsError::NoSuchPath)?;
+        if e.1 == NodeKind::Dir {
+            return Err(VfsError::IsADirectory);
+        }
+        e.2 = e.2.max(offset + data.len() as u64);
+        Ok(data.len())
+    }
+    fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        self.authorize_write(rel, principal)?;
+        let mut n = self.nodes.lock();
+        let i = n.iter().position(|(p, _, _)| p == rel).ok_or(VfsError::NoSuchPath)?;
+        if n[i].1 == NodeKind::Dir {
+            return Err(VfsError::IsADirectory);
+        }
+        n.remove(i);
+        Ok(())
+    }
+    fn remove_dir(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        self.authorize_write(rel, principal)?;
+        if Self::is_root(rel) {
+            return Err(VfsError::IsADirectory);
+        }
+        let mut n = self.nodes.lock();
+        let i = n.iter().position(|(p, _, _)| p == rel).ok_or(VfsError::NoSuchPath)?;
+        if n[i].1 != NodeKind::Dir {
+            return Err(VfsError::NotADirectory);
+        }
+        if n.iter().any(|(p, _, _)| Self::parent_of(p) == rel) {
+            return Err(VfsError::Backend("not-empty"));
+        }
+        n.remove(i);
+        Ok(())
+    }
+}
+
+/// NSGEN: the fixture's mount table — one writable in-RAM volume at the bare root, so
+/// `MountTable::create`/`write`/`unlink`/`remove_dir`/`rename` are reached through the SAME
+/// functions `shell::fs_mkdir` / `fs_rmdir` / `fs_rm` / `fs_mv` call (`fs_mkdir` is literally
+/// `mt.create(&path, NodeKind::Dir, SHELL_PRINCIPAL)` and `SHELL_PRINCIPAL` IS [`KERNEL_PRINCIPAL`]).
+/// Built fresh per call; it owns nothing outside its own allocation.
+#[cfg(feature = "witness")]
+pub fn nsgen_mock_table() -> MountTable {
+    let mut mt = MountTable::new();
+    mt.mount("/", Box::new(NsMockBackend::new("nsgen")));
+    mt
 }
