@@ -8967,6 +8967,110 @@ and **nothing** about the link: the test artifact carries zero `bt-c1`, zero `bt
 `bt-l0` strings, because the test path arms neither knob. This section's exits can only be read off
 a bench boot with `UNAOS_BTDIR=1`, the speaker in pairing mode, and the peer in the room.
 
+## 35. XHCIHUB — hubs configure their status-change endpoint, and hub-attached devices have a name (LEDGER S1 / S2, 2026-09-15)
+
+Two defects, one hub, and they were found by the same audit (`docs/dev/evidence/orin13/RENDER2-AUDIT.md`
+N2 and N3). Both live in `drivers/xhci/mod.rs`; both are shared-driver, every-board fixes with no knob.
+
+### 35.1 S1 — the Max ESIT Payload was written into the wrong field, and it was 65536x too large
+
+`configure_hub_interrupt_ep` built the hub's interrupt-IN Status Change Endpoint context like this:
+
+    ep.add(0).write_volatile((enc_interval << 16) | ((mps as u32) << 24));
+    ...
+    ep.add(4).write_volatile(mps as u32);
+
+Endpoint Context DW0 bits 31:24 are **Max ESIT Payload Hi** (xHCI 1.2 Table 6-9, SS6.2.3.8) — the high
+half of a 32-bit byte count — and DW4 splits into **Average TRB Length** (15:0) and **Max ESIT Payload
+Lo** (31:16). So the driver put the packet size into the HIGH half and left the low half zero: a hub
+with `mps` 1 or 2 asked the controller for `mps << 16` = 65536 or 131072 bytes **per service
+interval**, and never stated the payload it actually needs.
+
+That single misplaced shift accounts for both completion codes the Orin devkit prints on every boot:
+
+| hub | root port | code | why |
+|---|---|---|---|
+| Realtek 0bda:5489, High Speed | 6 | **8 = Bandwidth Error** | 65536 bytes/ESIT cannot fit an HS periodic budget of ~3 KB per microframe (SS4.14.2) |
+| Realtek 0bda:0489, SuperSpeed | 1 | **17 = Parameter Error** | a SS endpoint's Max ESIT Payload may not exceed `mps x (MaxBurst+1) x (Mult+1)` = 2; 131072 is not a supported value (SS4.6.6, SS6.2.3.8) |
+
+The fix states the payload where the payload goes, and leaves DW0 carrying Interval alone:
+
+    ep.add(0).write_volatile(enc_interval << 16);
+    ...
+    ep.add(4).write_volatile((mps as u32) | ((mps as u32) << 16));
+
+For a hub's status-change endpoint the Max ESIT Payload is exactly `mps`: it bursts once, has Mult 0
+at every speed, and its payload is the `(nbr_ports + 1 + 7) / 8`-byte change bitmap that
+`hub_change_bitmap_len` already sizes. Average TRB Length keeps its old value — it was already
+correct, and SS6.2.3.6 only requires it to be non-zero. Writing 0 into Max ESIT Payload Hi is also the
+only always-legal value: SS6.2.3.8 makes that field RsvdZ whenever `HCCPARAMS2.LEC = 0`, and this
+driver never reads LEC.
+
+`enc_interval` itself was **not** the defect. S1's ledger row guessed "interval/ESIT math"; it is the
+ESIT half, and the interval encoding (`bInterval - 1` for HS/SS, `floor(log2(bInterval)) + 3` for
+LS/FS) was already right for both speeds and is unchanged.
+
+**The sibling this arc did NOT touch, and it is a standing item.** `configure_hid_endpoints` writes
+the identical `(mps << 24)` into DW0 at both its keyboard and its pointer endpoint, and the identical
+bare `mps` into DW4. It has never been convicted because every HID device this driver has configured
+is LS/FS behind a Transaction Translator, and the xHC does not police a TT's periodic budget — the
+split-transaction budget is the hub's — so the bad value is accepted and ignored. Fixing it changes
+root-port HID behaviour and belongs to its own arc with its own measurement.
+
+### 35.2 S2 — a hub-downstream device had no name, and the retry ledger paid for it
+
+`slots[].vid` / `slots[].pid` were written from exactly one place: the intercepted device-descriptor
+event on the ROOT enumeration path. `enumerate_downstream` decoded vid/pid into locals for its own
+`HUB downstream slot N device class=...` line and then dropped them, so every later reader of the slot
+saw zeros — `:: MOUSE-1: ... vid:pid=0000:0000` printed one line under an enumeration line naming the
+same device, on QEMU (`0627:0001`) and on the Orin bench (`1c4f:0034`) alike.
+
+It was ledgered as cosmetic and it is not. `bot_ident` builds `BotDevIdent` from those fields, and its
+"an unnamed device is charged nothing" guard turned the **entire** BOT retry ledger off for R24 boot6's
+hub-downstream SD reader: no account, no verdict, 84 pump TIMEOUTs at the full uncut budget, and
+`BOT: PARKED` never printed. The fix is one store in `enumerate_downstream`, after the bounded retry
+loop has already proved the descriptor read good, so a zero there can only mean a device that
+genuinely reports zeros. The ledger KEY is untouched — `same_place` still compares root port + route
+string only, exactly as R24 requires; this fills in the descriptive half that was always meant to be
+filled in.
+
+### 35.3 The fixture, and what QEMU proves
+
+`UNAOS_XHCIHUB=1` is a **builder knob** (`builder/src/main.rs`, beside the `usb-kbd` block): no
+`arroyo` line, no kernel feature, no `k8-reach.registry` row, because it changes only QEMU's command
+line. It **moves** the xHCI `usb-tablet` behind a `usb-hub` on root port 4 rather than adding a second
+pointer — two pointers would leave which one QMP reaches to QEMU's routing, the same reasoning as the
+"one keyboard, never two" rule in the XHCIKBD block. QEMU's only hub model is full speed, so the
+pointer trains FS behind a TT: the same shape as the Orin bench's pointer behind its Realtek hubs. The
+keyboard is not moved and keeps its EHCI bus, so `[hidkeys]` measures what it always measured. With
+the knob unset not one QEMU argument changes.
+
+The score, printed once by `service_hid_setproto`, behind `witness`:
+
+    :: XHCIHUB: hub slot=<s> ports=<n> statchg=CONFIGURED|FAILED(<cc>) ep_mps=<m> ival=<i> esit=<e>
+       esithi=<h> avgtrb=<a> downstream=<k> anon=<z> ptr slot=<p> vid:pid=<vvvv:pppp> evts=<n> -> PASS|FAIL ::
+
+PASS iff `statchg == CONFIGURED && esit == ep_mps && esithi == 0 && anon == 0` and the hub-downstream
+pointer's stored vid:pid is non-zero.
+
+**S1 does not reproduce on QEMU, measured rather than assumed.** The baseline run at `2051470a` with
+the hub attached printed `xHCI: HUB slot 2 status-change endpoint configured (ep 0x81 mps 2 dci 3);
+hot-plug armed.` QEMU's xHCI model validates neither the periodic bandwidth budget nor Max ESIT
+Payload, so it accepts the 131072-bytes-per-interval request the old code made, and the two Orin
+completion codes have no QEMU analogue. That is why the witness reports the endpoint context **dwords
+the driver submitted** — re-read out of the input context after the command, so they are the bytes the
+controller was handed and not a recomputation. On QEMU the go-red for S1 is `esit`/`esithi` reverting
+to `0` / `mps`, which is the defect itself on the wire; the completion-code clause stays armed for the
+Orin bench, where it is the clause that fires. **S1 is fixed-unflown: QEMU proves the submitted context
+is now spec-shaped, only the Orin can prove the xHC accepts it.** S2 reproduces on QEMU exactly as the
+Orin prints it, and its go-red is the `0000:0000` coming back.
+
+`evts` is **reported, not scored.** Scoring "the downstream pointer delivers events" needs pointer
+injection over QMP, and `scripts/qmp_type.py` is key-only (qcodes through `send-key` /
+`input-send-event`; no `abs`, `rel` or `btn`). That clause wants a pointer mode in that script plus an
+`arroyo` typist block, and is owed. With nothing moving the QEMU tablet, `evts=0` is honest, and
+scoring on it would be a gate that fires on every input.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).

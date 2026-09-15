@@ -1477,14 +1477,14 @@ static BOT_PARK_QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// including one the rescue ladder's own port cycle causes — reproduces both exactly.
 ///
 /// VID:PID is carried, printed and refreshed, but it is deliberately NOT part of the key, and R24
-/// boot6 is why. This driver records `slots[].vid/pid` from ONE place: the intercepted
-/// device-descriptor event on the root enumeration path. A HUB-DOWNSTREAM device never reaches it —
-/// boot6's whole capture contains exactly one `>>> VENDOR ID` banner, for the 2109:3431 hub itself,
-/// and none for the wedged 'Generic USB SD Reader' hanging off it. With VID:PID in the key,
-/// `bot_ident`'s "an unnamed device is charged nothing" guard turned the ENTIRE ledger off for that
-/// reader: no account, no cycles, no dead-ring streak, no ladder count, no verdict — 84 pump
-/// TIMEOUTs, every one at the full uncut budget, and `BOT: PARKED` never printed. The account must
-/// be keyed on what the driver can always observe, not on what it happens to have parsed.
+/// boot6 is why. `slots[].vid/pid` USED to be recorded from ONE place — the intercepted
+/// device-descriptor event on the root enumeration path — which a HUB-DOWNSTREAM device never
+/// reaches: boot6's whole capture contains exactly one `>>> VENDOR ID` banner, for the 2109:3431
+/// hub itself, and none for the wedged 'Generic USB SD Reader' hanging off it. With VID:PID in the
+/// key, `bot_ident`'s "an unnamed device is charged nothing" guard turned the ENTIRE ledger off for
+/// that reader: no account, no verdict — 84 pump TIMEOUTs at the full uncut budget, `BOT: PARKED`
+/// never printed. XHCIHUB (S2) closed that gap — `enumerate_downstream` now stores what it decodes —
+/// but the KEY stays port+route: what the driver can always observe, not what it happens to parse.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BotDevIdent {
     pub port: u8,
@@ -4523,7 +4523,7 @@ impl XhciController {
                                         // shifts; fires ONLY when a pointer enumerated (silent on
                                         // aarch64 / no-mouse / SKIP_XHCI, which never reach here).
                                         {
-                                            let s = &self.slots[slot_id as usize];
+                                            let s = &self.slots[slot_id as usize]; #[cfg(feature = "witness")] xhcihub_pointer(slot_id as u8, s.parent_hub_slot, s.vid, s.pid); // XHCIHUB (S2) — the pointer identity the scorer verdicts on, read from the SAME `slots[]` fields the MOUSE-1 line below prints, so the witness cannot pass while MOUSE-1 still says 0000:0000. `parent_hub_slot != 0` is what makes it hub-downstream; a root-port pointer is ignored here and the fixture's root-port invariant is untouched. ⚠ FOLDED onto the existing borrow.
                                             serial_println!(
                                                 ":: MOUSE-1: HID pointer detected vid:pid={:04x}:{:04x} proto={} {} ep={:#04x} mps={} interval={} == witness ::",
                                                 s.vid, s.pid,
@@ -11078,7 +11078,7 @@ impl XhciController {
         // off the wire without a source tree. Four clauses, any one of which closes an account —
         // stated with their bounds so a capture's numbers can be compared to them directly.
         serial_println!(
-            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no means hub-downstream (no VID:PID banner) and is normal. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after {} ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::",
+            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no used to mean hub-downstream (no VID:PID banner) and be normal; XHCIHUB (S2) stores the downstream identity, so named=no is now a real anomaly. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after {} ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::",
             BOT_PARK_SURRENDER_MAX, BOT_PARK_LADDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
             BOT_PARK_DEAD_STREAK, BOT_PARK_DEAD_DIV, BOT_PARK_REPROBE_MS);
         for e in self.bot_park.iter().filter(|e| e.used) {
@@ -13822,7 +13822,7 @@ impl XhciController {
         // PIUSB-39 F1: drain any halted HID interrupt-IN endpoints first — they are dead until
         // un-halted, and the recovery is synchronous like everything else in this hook. Hooked
         // here so no caller outside the driver changes.
-        self.service_hid_halts(); self.service_hid_leds(); // HIDLEDDEFER — push any lock-LED bitmap a completion toggled since the last pass (the SET_REPORT that used to run inside the completion branch). Same safe polled context as the halts drain. ⚠ FOLDED.
+        self.service_hid_halts(); self.service_hid_leds(); #[cfg(feature = "witness")] self.xhcihub_score(); // XHCIHUB — the scorer's only hook. This pass runs every main loop in the same safe polled context, which is what the fixture needs: the hub facts are recorded during bring-up but the downstream pointer's report count is not final until the device has had time to speak, so the score waits for the first report or for XHCIHUB_SETTLE_MS, whichever comes first, and prints exactly once. A no-op on every boot with no hub. ⚠ FOLDED. // HIDLEDDEFER — push any lock-LED bitmap a completion toggled since the last pass (the SET_REPORT that used to run inside the completion branch). Same safe polled context as the halts drain. ⚠ FOLDED.
         while let Some(slot) = self.hid_setproto_pending.pop() {
             // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
             // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
@@ -14392,12 +14392,12 @@ impl XhciController {
             slot_ctx.add(0).write_volatile((old_dw0 & !(0x1F << 27)) | ((dci as u32) << 27));
             // Endpoint context: Interrupt IN (EP Type 7), CErr 3.
             let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
-            ep.add(0).write_volatile((enc_interval << 16) | ((mps as u32) << 24));
+            ep.add(0).write_volatile(enc_interval << 16); // XHCIHUB (rmbp 2026-09-15, LEDGER S1) — DW0 IS INTERVAL (bits 23:16) AND NOTHING ELSE. It used to carry `| ((mps as u32) << 24)`, and bits 31:24 of an Endpoint Context DW0 are **Max ESIT Payload Hi** (xHCI 1.2 Table 6-9, §6.2.3.8) — the HIGH half of a 32-bit byte count, not a second copy of the packet size. So a hub whose status-change endpoint has mps 1 or 2 asked the xHC for `mps << 16` = 65536 or 131072 bytes PER SERVICE INTERVAL: the payload it actually needs, multiplied by 65536. That one misplaced shift is the whole of S1, and it explains BOTH completion codes the Orin bench prints (RENDER2-AUDIT N2): the HS hub on root port 6 gets code 8 = **Bandwidth Error**, because 65536 bytes/ESIT cannot fit a High-Speed periodic budget of ~3 KB per microframe; the SS hub on root port 1 gets code 17 = **Parameter Error**, because a SuperSpeed endpoint's Max ESIT Payload may not exceed mps x (Max Burst+1) x (Mult+1) = 2, and 131072 is not a supported value (§4.6.6, §6.2.3.8). It also explains why the SAME arithmetic in `configure_hid_endpoints` has never been convicted: every HID device this driver has configured is LS/FS behind a Transaction Translator, and the xHC does not police a TT's periodic budget (the split-transaction budget is the hub's), so the bad value is accepted and ignored there — that sibling is REPORTED, not touched by this arc, because changing it changes root-port HID behaviour. `enc_interval` itself was already right for both speeds and is unchanged: S1's row guessed "interval/ESIT math", and it is the ESIT half. Also RsvdZ-correct now — §6.2.3.8 makes Max ESIT Payload Hi RsvdZ whenever HCCPARAMS2.LEC = 0, and this driver never reads LEC, so 0 is the only always-legal value to write there, and it is also the right one (a hub's Max ESIT Payload never approaches 65536). ⚠ FOLDED onto this line, never a line of its own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
             ep.add(1).write_volatile((7 << 3) | (3 << 1) | ((mps as u32) << 16));
             ep.add(2).write_volatile((phys as u32) | 1);
             ep.add(3).write_volatile((phys >> 32) as u32);
             x200_witness(self.op_base, &alloc::format!("slot{} hub-int TRdeq", hub_slot), phys);
-            ep.add(4).write_volatile(mps as u32);
+            ep.add(4).write_volatile((mps as u32) | ((mps as u32) << 16)); // XHCIHUB (S1) — DW4 is TWO fields: **Average TRB Length** (bits 15:0) and **Max ESIT Payload Lo** (bits 31:16), xHCI 1.2 Table 6-9. It used to write `mps` alone, which set a correct Average TRB Length and left Max ESIT Payload Lo ZERO — so the payload the endpoint really needs was never stated in the field that states it, and everything the xHC read came from the misplaced high byte in DW0 above. Max ESIT Payload for an interrupt endpoint = wMaxPacketSize x (bMaxBurst+1) x (Mult+1); a hub's status-change endpoint bursts once and has Mult 0 at every speed (its payload is the `(nbr_ports+1+7)/8`-byte change bitmap `hub_change_bitmap_len` sizes, 1 or 2 bytes), so the product is exactly `mps` and both halves of this word are `mps`. Average TRB Length keeps its old value on purpose: it was already correct, and §6.2.3.6 only requires it to be non-zero. ⚠ FOLDED onto this line — same reason as DW0's note.
         }
         let trb = Trb {
             parameter: input_ctx_virt as u64,
@@ -14407,14 +14407,14 @@ impl XhciController {
         match self.run_command_sync(trb) {
             Ok((1, _)) => {
                 self.slots[hub_slot as usize].hub_int_ep = ep_addr;
-                self.slots[hub_slot as usize].hub_int_mps = mps;
+                self.slots[hub_slot as usize].hub_int_mps = mps; #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, 1); // XHCIHUB — record the SUCCESS arm's facts for the scorer at the tail of this file. The dwords are re-read out of the input context we just submitted rather than recomputed, so the witness reports the bytes the xHC was actually handed. ⚠ FOLDED.
                 serial_println!(
                     "xHCI: HUB slot {} status-change endpoint configured (ep {:#04x} mps {} dci {}); hot-plug armed.",
                     hub_slot, ep_addr, mps, dci);
                 self.queue_hub_change_read(hub_slot);
             }
-            Ok((c, _)) => serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint code {}", hub_slot, c),
-            Err(_) => serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint timed out", hub_slot),
+            Ok((c, _)) => { #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, c); serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint code {}", hub_slot, c) } // XHCIHUB — the REJECT arm: `c` is the completion code the scorer prints as `statchg=FAILED(<cc>)` (17 = Parameter Error, 8 = Bandwidth Error on the Orin bench). ⚠ FOLDED — the arm stays one line.
+            Err(_) => { #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, 0); serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint timed out", hub_slot) } // XHCIHUB — cc 0 is not a real xHCI completion code (0 = Invalid), so the scorer prints `FAILED(0)` for a TIMEOUT and it cannot be confused with a code the controller returned. ⚠ FOLDED.
         }
     }
 
@@ -15017,7 +15017,7 @@ impl XhciController {
         let (class, vid, pid) = unsafe {
             let p = buf as *const u8;
             (*p.add(4), (*p.add(8) as u16) | ((*p.add(9) as u16) << 8), (*p.add(10) as u16) | ((*p.add(11) as u16) << 8))
-        };
+        }; self.slots[slot_id as usize].vid = vid; self.slots[slot_id as usize].pid = pid; #[cfg(feature = "witness")] xhcihub_downstream(slot_id, vid, pid); // XHCIHUB (rmbp 2026-09-15, LEDGER S2) — **STORE the identity, do not merely print it.** Until this line `slots[].vid/.pid` were written from exactly ONE place, the root-port path's intercepted device-descriptor event (`>>> VENDOR ID` in the enumeration dispatch), and a hub-downstream device never reaches it: this function decoded vid/pid into LOCALS for the line below and dropped them. Every later reader of the slot therefore saw zeros — `:: MOUSE-1: … vid:pid=0000:0000` for a pointer whose enumeration line one row above names `vid=0627 pid=0001` (QEMU, measured at 2051470a) or `vid=1c4f pid=0034` (Orin bench, RENDER2-AUDIT N3), and the `no driver for device class` line reads the same fields. It is NOT cosmetic-only: `bot_ident` builds `BotDevIdent` from these fields, and its `anonymous()` guard — "a device this driver cannot name is charged nothing" — turned the ENTIRE retry ledger off for R24 boot6's hub-downstream SD reader (84 pump TIMEOUTs at the full uncut budget, `BOT: PARKED` never printed; see `BotDevIdent`'s type doc in this file, whose "from ONE place" sentence this line retires). The KEY is untouched: `same_place` still compares port+route only, exactly as R24 requires — this populates the descriptive half that was always meant to be filled in. Stored AFTER the bounded retry loop above has proved the descriptor read good (got 18 of 18, bLength >= 18, type 0x01, and NOT vid==0 && pid==0), so a zero here can only mean a device that genuinely reports zeros, never a short or early read. ⚠ FOLDED onto the closing brace — no line added; this file is compiled into the Pi's kernel8.img.
         serial_println!("xHCI: HUB downstream slot {} device class={:#x} vid={:04x} pid={:04x} (route {:#x} tier {})",
             slot_id, class, vid, pid, route_string, depth);
 
@@ -16309,5 +16309,165 @@ impl XhciController {
             if port != 0 && (self.read_portsc(port) & 1) == 0 { continue; }
             self.set_hid_leds(i as u8, intf);
         }
+    }
+}
+
+// XHCIHUB (rmbp 2026-09-15, LEDGER S1 + S2; trunk QUEUE §2) — the hub fixture's scorer. TAIL APPEND,
+// below every pre-existing line of this file, so nothing above moves and the only `panic::Location`
+// records that shift are the ones inside these functions (LAWS §5 byte identity; this file is
+// compiled into the Pi's kernel8.img). The FIXES themselves are ungated and folded onto existing
+// lines — `ep.add(0)`/`ep.add(4)` in `configure_hub_interrupt_ep` for S1, the `vid`/`pid` store in
+// `enumerate_downstream` for S2. Everything here is `witness` only.
+//
+// THE FIXTURE: `UNAOS_XHCIHUB=1` (a BUILDER knob, `builder/src/main.rs` beside the `usb-kbd` block —
+// no `arroyo` line, no kernel feature, no `k8-reach.registry` row, because it changes only QEMU's
+// command line) MOVES the xHCI `usb-tablet` behind a `usb-hub` on root port 4. QEMU's only hub model
+// is FULL SPEED, so the pointer trains FS behind a TT — the same shape as the Orin bench's
+// 1c4f:0034 behind its Realtek hubs, and the shape both defects live on.
+//
+// THE SCORE, printed once:
+//   :: XHCIHUB: hub slot=<s> ports=<n> statchg=CONFIGURED|FAILED(<cc>) ep_mps=<m> ival=<i>
+//      esit=<e> esithi=<h> avgtrb=<a> downstream=<k> anon=<z> ptr slot=<p> vid:pid=<vvvv:pppp>
+//      evts=<n> -> PASS|FAIL ::
+// PASS iff  statchg == CONFIGURED  &&  esit == ep_mps  &&  esithi == 0  &&  anon == 0  &&  the
+// hub-downstream pointer's stored vid:pid is non-zero.
+//
+// ⛔ WHAT THIS LEG PROVES AND WHAT IT CANNOT — measured at 2051470a, not assumed, and it decides
+// how S1 may be cited. **S1 DOES NOT REPRODUCE ON QEMU.** The baseline run with the hub attached
+// printed `xHCI: HUB slot 2 status-change endpoint configured (ep 0x81 mps 2 dci 3); hot-plug armed.`
+// — QEMU's xHCI model validates neither the periodic bandwidth budget nor Max ESIT Payload, so it
+// accepts the 131072-bytes-per-interval request the old code made and the two Orin completion codes
+// (17 / 8) have no QEMU analogue. That is why this witness reports the ENDPOINT CONTEXT DWORDS the
+// driver submitted (`esit`, `esithi`, `avgtrb`, re-read out of the input context AFTER the command,
+// so they are the bytes the controller was handed and not a recomputation) instead of resting on the
+// completion code alone: on QEMU the go-red for S1 is `esit`/`esithi` reverting to 0 / mps, which is
+// the DEFECT ITSELF on the wire, and the completion-code clause stays armed for the Orin bench where
+// it is the thing that fires. S1 is therefore fixed-unflown: QEMU proves the submitted context is
+// now spec-shaped, only the Orin can prove the xHC accepts it. **S2 DOES reproduce on QEMU**, exactly
+// as the Orin prints it — baseline `:: MOUSE-1: … vid:pid=0000:0000` one line under
+// `xHCI: HUB downstream slot 3 device class=0x0 vid=0627 pid=0001`.
+//
+// ⚠ `evts` IS REPORTED, NOT SCORED, and this is a gap with a name. The brief's third PASS clause was
+// "the downstream pointer delivers events", which needs pointer injection over QMP; `scripts/qmp_type.py`
+// is KEY-ONLY (`send-key`/`input-send-event` over qcodes, no `abs`/`rel`/`btn`), so that clause needs
+// that script to grow a pointer mode plus an `arroyo` typist block — neither file is in this brief's
+// FILES list, so it is REPORTED rather than taken. `evts` is the downstream pointer's own
+// `mouse_report_count`; with nothing moving the QEMU tablet it is legitimately 0, and scoring on it
+// would be a gate that fires on every input, which LAWS §5 calls a constant.
+#[cfg(feature = "witness")] pub static XHCIHUB_SLOT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_PORTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_CC: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_EPDW0: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_EPDW4: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_EPMPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_DOWN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_ANON: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_PTR_SLOT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_PTR_ID: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_ARMED_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static XHCIHUB_SCORED: AtomicU64 = AtomicU64::new(0);
+/// How long the scorer waits for the hub-downstream pointer to speak before printing anyway. A
+/// deadline and not a condition, so the line is printed on EVERY hub boot: a fixture that prints
+/// nothing when the device is silent would make "no XHCIHUB line" ambiguous between "no hub" and
+/// "the pointer never reported", and LAWS §5 wants an absence to be evidence only if the producing
+/// path ran.
+#[cfg(feature = "witness")] pub const XHCIHUB_SETTLE_MS: u64 = 8000;
+
+/// XHCIHUB — cycles per second for the settle deadline. Same fold `xhcikbd_hz` makes, and copied for
+/// the same reason: `now_cycles()` is arch-neutral but its rate is not, and the tick source that
+/// knows the rate lives behind a different gate on each arch.
+#[cfg(feature = "witness")]
+fn xhcihub_hz() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")]
+    let hz = crate::arch::timer::cntfrq();
+    if hz == 0 { 1_250_000_000 } else { hz }
+}
+
+/// XHCIHUB — called from BOTH arms of the status-change Configure-Endpoint match (and the timeout
+/// arm, with `cc` 0). Re-reads the endpoint context out of the input context that was just
+/// submitted, so `esit`/`esithi`/`avgtrb` on the wire are the bytes the xHC was handed. First hub
+/// wins: a board with two hubs scores the one that came up first, and the second is still visible on
+/// the enumeration lines — one witness line per boot keeps the fixture's verdict single-valued.
+#[cfg(feature = "witness")]
+fn xhcihub_statchg(input_ctx_virt: usize, dci: u32, hub_slot: u8, ports: u8, mps: u16, cc: u8) {
+    if XHCIHUB_SLOT.load(Ordering::Relaxed) != 0 { return; }
+    let (dw0, dw4) = unsafe {
+        let ep = (input_ctx_virt as *const u32).add((1 + dci as usize) * CTX_WORDS);
+        (core::ptr::read_volatile(ep.add(0)), core::ptr::read_volatile(ep.add(4)))
+    };
+    XHCIHUB_EPDW0.store(dw0 as u64, Ordering::Relaxed);
+    XHCIHUB_EPDW4.store(dw4 as u64, Ordering::Relaxed);
+    XHCIHUB_EPMPS.store(mps as u64, Ordering::Relaxed);
+    XHCIHUB_PORTS.store(ports as u64, Ordering::Relaxed);
+    XHCIHUB_CC.store(cc as u64, Ordering::Relaxed);
+    XHCIHUB_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
+    XHCIHUB_SLOT.store(hub_slot as u64, Ordering::Relaxed);
+}
+
+/// XHCIHUB (S2) — one call per hub-downstream device whose descriptor read came back good. `anon`
+/// counts the ones that still name themselves 0000:0000; the retry loop above the call site has
+/// already rejected short and zeroed reads, so a hit here is a device that genuinely reports zeros,
+/// which is the only case the verdict should tolerate being told about rather than passing over.
+#[cfg(feature = "witness")]
+fn xhcihub_downstream(slot_id: u8, vid: u16, pid: u16) {
+    XHCIHUB_DOWN.fetch_add(1, Ordering::Relaxed);
+    if vid == 0 && pid == 0 {
+        XHCIHUB_ANON.fetch_add(1, Ordering::Relaxed);
+        serial_println!("xHCI: XHCIHUB: downstream slot {} still anonymous (vid:pid=0000:0000)", slot_id);
+    }
+}
+
+/// XHCIHUB (S2) — the hub-downstream pointer's identity, read from the same `slots[]` fields the
+/// `MOUSE-1` line prints, at the same instant. A root-port pointer (`parent_hub_slot == 0`) is not
+/// this fixture's subject and is ignored.
+#[cfg(feature = "witness")]
+fn xhcihub_pointer(slot_id: u8, parent_hub_slot: u8, vid: u16, pid: u16) {
+    if parent_hub_slot == 0 { return; }
+    XHCIHUB_PTR_SLOT.store(slot_id as u64, Ordering::Relaxed);
+    XHCIHUB_PTR_ID.store(((vid as u64) << 16) | (pid as u64), Ordering::Relaxed);
+}
+
+#[cfg(feature = "witness")]
+impl XhciController {
+    /// XHCIHUB — the scorer, hooked on `service_hid_setproto`. Silent until a hub has run its
+    /// status-change Configure-Endpoint; then prints once, as soon as the downstream pointer has
+    /// delivered a report or `XHCIHUB_SETTLE_MS` has passed, whichever comes first.
+    fn xhcihub_score(&mut self) {
+        let hub = XHCIHUB_SLOT.load(Ordering::Relaxed);
+        if hub == 0 || XHCIHUB_SCORED.load(Ordering::Relaxed) != 0 { return; }
+        let ptr_slot = XHCIHUB_PTR_SLOT.load(Ordering::Relaxed) as usize;
+        let evts = if ptr_slot != 0 && ptr_slot < self.slots.len() {
+            self.slots[ptr_slot].mouse_report_count as u64
+        } else { 0 };
+        let waited = crate::arch::now_cycles().wrapping_sub(XHCIHUB_ARMED_AT.load(Ordering::Relaxed));
+        let budget = XHCIHUB_SETTLE_MS.saturating_mul(xhcihub_hz()) / 1000;
+        if evts == 0 && waited < budget { return; }
+        if XHCIHUB_SCORED.swap(1, Ordering::Relaxed) != 0 { return; }
+        let cc = XHCIHUB_CC.load(Ordering::Relaxed);
+        let dw0 = XHCIHUB_EPDW0.load(Ordering::Relaxed);
+        let dw4 = XHCIHUB_EPDW4.load(Ordering::Relaxed);
+        let mps = XHCIHUB_EPMPS.load(Ordering::Relaxed);
+        // xHCI 1.2 Table 6-9: DW0 bits 23:16 Interval, bits 31:24 Max ESIT Payload Hi; DW4 bits 15:0
+        // Average TRB Length, bits 31:16 Max ESIT Payload Lo. `esit` is the full 32-bit value the two
+        // halves encode, which is the number the xHC budgets against.
+        let ival = (dw0 >> 16) & 0xFF;
+        let esithi = (dw0 >> 24) & 0xFF;
+        let avgtrb = dw4 & 0xFFFF;
+        let esit = ((esithi << 16) | ((dw4 >> 16) & 0xFFFF)) as u64;
+        let id = XHCIHUB_PTR_ID.load(Ordering::Relaxed);
+        let anon = XHCIHUB_ANON.load(Ordering::Relaxed);
+        let down = XHCIHUB_DOWN.load(Ordering::Relaxed);
+        let ptr_named = ptr_slot != 0 && id != 0;
+        let pass = cc == 1 && esit == mps && esithi == 0 && anon == 0 && ptr_named;
+        serial_println!(
+            ":: XHCIHUB: hub slot={} ports={} statchg={} ep_mps={} ival={} esit={} esithi={} avgtrb={} downstream={} anon={} ptr slot={} vid:pid={:04x}:{:04x} evts={} -> {} ::",
+            hub, XHCIHUB_PORTS.load(Ordering::Relaxed),
+            if cc == 1 { alloc::format!("CONFIGURED") } else { alloc::format!("FAILED({})", cc) },
+            mps, ival, esit, esithi, avgtrb, down, anon, ptr_slot,
+            (id >> 16) & 0xFFFF, id & 0xFFFF, evts,
+            if pass { "PASS" } else { "FAIL" }
+        );
     }
 }
