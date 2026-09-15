@@ -20,6 +20,7 @@ focus queue (`docs/dev/evidence/pi11/FOCUS-QUEUE.md`, 2830 lines — a SUMMARY A
 · render-class boot on the bench Pi: the 46 owed commits have never executed on metal (DRAG-ADMIT, DRAGWIDE, CHROMEBAND, REDZONE, FATGROW, STACKPOOL, V3D rungs)
 
 ## PI'S OWN FILES — QEMU raspi4b gates them
+· NEW 2026-09-12: the Pi card image is formatted by the same `make-pi-img.sh` line FATCLUST changed (`-s 1`); on dosfstools 4.2 the Pi's 55 MiB FAT already got 1 sector/cluster (110,874 clusters) so the geometry is unchanged here, but no Pi flight has run on a FATCLUST-built image and the GPU boot ROM's view of 512-byte clusters is unverified — flash one and boot it before trusting it (trunk queue §5 has the guard objections).
 · PI1  `drivers/emmc2.rs` header claims NO writes; `drivers/block.rs` routes SD writes to it (doc lie, one edit + a test that reads the header)
 · PI2  the registry-full FORBID for `pi4-regression.spec` — one line, precondition measured, unwritten
 · PI4  `/volumes` and `/usb` documented-and-ungated on pi — a REQUIRE naming the `/usb` write posture
