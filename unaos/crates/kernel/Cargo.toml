@@ -167,6 +167,25 @@ unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 # gate that matters here — QEMU has no Ivy Bridge IGD and proves nothing about any rung).
 # See ~/unaos-bench/scratch/gr25/GEN7-3D-draft.md §5 rungs R0/R1.
 gen7 = ["intel-ivb"]
+# GEN7-3D R8: the framebuffer-geometry BCS blit (`UNAOS_IVB3D_R8=1`, mapped in `arroyo` and
+# `builder/src/main.rs` — all three legs, per the knob-wiring law). A SUB-KNOB of `gen7`, and the
+# implication is declared rather than left to the operator: every byte R8 gates lives inside
+# `drivers/gpu/gen7.rs`, which only exists under `gen7`, so `gen7r8` without `gen7` would be a knob
+# that compiles nothing while reading as armed.
+#
+# R8 is the rung after R7's verified BCS blit. It repeats R7's `XY_SRC_COPY_BLT` at the PANEL'S OWN
+# GEOMETRY — a 64x64x32bpp rectangle at the top-RIGHT corner of a framebuffer-pitch destination
+# surface spanning many GGTT pages — into CPU-readable scratch, never into the scanout: the panel is
+# the Kepler's on this machine (`SHUTOUT-REGISTER.md` §5, G4), so a gen7 blit into the live
+# framebuffer would prove nothing visible and would be a write into another device's VRAM aperture.
+# See `docs/dev/OS/08_VIDEO/gen7.md` §2.8.
+#
+# RUNG DEPENDENCY (R19): R8 executes only on a boot whose R7 verdict is `r7-blit-verified`; on any
+# other boot it prints `r8-gated-on-r7` and writes nothing.
+#
+# DEFAULT OFF => R8's module and its one call site at the tail of `blit()` vanish and no
+# `:: gen7: r8` token exists in the image (`LC_ALL=C grep -a -o -F`-verifiable).
+gen7r8 = ["gen7"]
 # GMUX-IGD: arm the display-mux switch to the INTEGRATED GPU (`UNAOS_GMUX_IGD=1`, already mapped in
 # `arroyo` and `builder/src/main.rs` since ce5c6f49 — this entry is the third leg those two assumed
 # existed). x86_64-only, and only reachable on an `unaos_ivb` build that printed PROTOCOL PROVEN.

@@ -882,6 +882,19 @@ fi
 # anything else. Kept in sync with builder/src/main.rs — a knob armed here but missing
 # there ships the feature DISABLED on MEDIA while the banner claims it is on.
 [ -n "${UNAOS_IVB3D:-}" ] && _feats="${_feats}gen7,"
+# GEN7-3D R8: UNAOS_IVB3D_R8=1 arms the FRAMEBUFFER-GEOMETRY BCS blit — the rung after R7's
+# metal-verified 16x16 blit (drivers/gpu/gen7.rs, mod r8). It writes, and ONLY on a boot whose R7
+# verdict is `r7-blit-verified`: one forcewake request register at a time, the four BCS ring
+# registers, the GGTT slots of its own proven-unowned window, and the one GTT-flush register —
+# every one captured, restored and re-read on every exit path. It does NOT write the panel: the
+# destination is CPU-readable scratch carrying the framebuffer's PITCH, because the panel belongs to
+# the Kepler on this machine (SHUTOUT-REGISTER.md §5, G4), so a gen7 blit into the live scanout
+# would prove nothing visible and would be a write into another device's VRAM aperture. Media is
+# NOT single-use. `gen7r8` implies `gen7` in Cargo.toml; BOTH are named here so the
+# `⚡ kernel features:` banner and the shipped artifact agree (the BANNERCERT lesson). Kept in sync
+# with builder/src/main.rs — a knob armed here but missing there ships the rung DISABLED on MEDIA
+# while the banner claims it is on.
+[ -n "${UNAOS_IVB3D_R8:-}" ] && _feats="${_feats}gen7,gen7r8,"
 # GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the INTEGRATED GPU with an unwind-stack
 # restore on the same call stack — no dwell, no timer (drivers/gpu/igpu.rs; round 13 removed the
 # timed auto-revert). ⛔ SINGLE-USE TEST MEDIA — the knob is baked into the image and
@@ -2438,6 +2451,16 @@ arm_features() {
     # too, which makes this paragraph true as written and demotes the strip back to what every other
     # entry here is: fingerprint hygiene, not a load-bearing dependency.
     f="${f//,gen7,/,}"
+    # GEN7-3D R8 (GEN7NEXT) rides the same strip, for the same reason and by the same mechanism: R8
+    # is `mod r8` INSIDE `drivers/gpu/gen7.rs`, which carries the file-level `#![cfg(target_arch =
+    # "x86_64")]` above, and its one call site is at the tail of that file's `blit()` — so `gen7r8`
+    # emits not one byte of aarch64 CODE. Without this line arming `UNAOS_IVB3D_R8` would shift every
+    # aarch64 media hash for zero observable change, AND would defeat the `gen7` strip on the line
+    # above: `gen7r8 = ["gen7"]`, so cargo would resolve `gen7` back ON from the surviving name. That
+    # second consequence is why this strip is a REQUIREMENT of the one above it, not a second nicety;
+    # the two are order-independent (the patterns cannot overlap — `,gen7,` needs a comma where
+    # `,gen7r8,` has an `r`) but neither works alone.
+    f="${f//,gen7r8,/,}"
     # PCIH / NOASPM rides the same strip, for the same reason: every noaspm-gated byte lives in
     # the x86_64-only half of drivers/gpu/pcihealth.rs, so the feature emits not one byte of
     # aarch64 CODE — but an enabled feature is hashed into cargo's -Cmetadata fingerprint, so
@@ -3872,7 +3895,7 @@ KERNEL_CFG_MATRIX=(
   # `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

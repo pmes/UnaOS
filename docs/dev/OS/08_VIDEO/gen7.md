@@ -64,7 +64,7 @@ are off-limits and are not a source for anything in this ladder.
 
 ---
 
-## 2. Ladder state, R1 through R7
+## 2. Ladder state, R1 through R8
 
 > **The metal record for every rung is [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) §4
 > (R19 / ledger B10), and where this document and that register disagree, the register's
@@ -78,12 +78,13 @@ are off-limits and are not a source for anything in this ladder.
 | Rung | Name | Writes | Metal verdict |
 | --- | --- | --- | --- |
 | R1 | `recon` | none | GT block dark; `GTFIFOCTL` the only structured read |
-| R2 | `wake` | 3 GT power-management regs, all reversed | `gt-still-dark` — **scored on an instrument since proved blind; a re-score is owed** (§2.2) |
+| R2 | `wake` | 3 GT power-management regs, all reversed | `r2-unscorable-until-behavioural-witness battery=gt-still-dark` — GEN7R2, 2026-09-15: the battery reading is kept verbatim, the VERDICT now names the epistemic state (§2.2) |
 | R3 | `forcewake` | 1 forcewake request reg per candidate, released in-rung | acquires fly; flight 4 read `gt-live-already by=none` with no ack decoded, and the battery that scored "does not open" is the instrument §2.2 records as blind — SHUTOUT-REGISTER §4 carries the reading |
 | R4 / R4b | `claim` | ≤3 GGTT PTEs, all restored | GGTT PTE round-trip **proven** |
 | R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — **failed under *no hold in force*, and R6 re-opened it by changing that one condition** (§2.5) |
 | R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | **`r6-sentinel-hit by=mt … attempts=1/3`** — flight 4, both boots |
 | R7 | `blit` | as R6 on the **BCS**, 3 GGTT PTEs + 4 BCS ring regs | **`r7-blit-verified … best_dst_match=256/256`, `dst_crc==src_crc`** — flight 4, both boots |
+| R8 | `fb_blit` | as R7, **at the panel's pitch**: `1 + 4 + ceil((64+1)·pitch/4096)` GGTT PTEs (128 on the bench panel) + 4 BCS ring regs + 1 GTT-flush reg, all restored | **pending metal.** Verdicts: `r8-fb-blit-verified` (the win) · `r8-fb-blit-verified-spill` · `r8-fb-blit-verified-head-stuck` · `r8-fb-blit-full-sentinel-miss` · `r8-fb-blit-partial` · `r8-sentinel-miss` · `r8-head-stuck`/`-partial` · `r8-enable-void-under-every-hold` · `r8-seed-collision` · `r8-ring-would-not-disable` · `r8-ring-drain-timeout` · the refusals `r8-gated-on-r7`, `r8-gated-on-wake`, `r8-refused-no-bar0`, `r8-refused-bpp-not-32`, `r8-refused-pitch-too-wide`, `r8-refused-panel-too-small`, `r8-refused-surface-too-large`, `r8-refused-bar0-too-small`, `r8-range-owned-refused`, `r8-fill-hypothesis-refuted`, `r8-alloc-failed`, `r8-virt-unmapped`, `r8-phys-above-4g`, `r8-pte-indistinct`, `r8-entry-drifted`, `r8-claim-write-void` (§2.8) |
 
 ### 2.1 R1 — `recon` (read-only)
 
@@ -120,10 +121,42 @@ scored on is not a liveness witness on this part.** The same flight-4 boots that
 `gt-still-dark` also read `battery_moved=0/17` on R6 and R7 — through a *verified* 1 KiB
 engine-side DMA (§2.7). A rung that takes "the battery moved" as its wake proof scores a
 demonstrably working boot dead, which is what happened here. `gt-still-dark` therefore records
-**"the battery did not move"**, not "the GT is dark", and R2 is owed a re-score against a
-behavioural witness — a ring arm, a sentinel — with the transition-test ack R3 onward already
-uses. Conditions and the queue row: `SHUTOUT-REGISTER.md` §4 (R2), `docs/dev/OS/rmbp-queue.md`
-GEN7R2.
+**"the battery did not move"**, not "the GT is dark".
+
+#### GEN7R2 — the re-score, decided 2026-09-15
+
+The queue row offered two ways to make this rung honest: score it through a behavioural witness,
+or mark the verdict `unscorable-until-<battery>` on the wire. **The second was taken, and the
+reason is structural rather than a deferral.** A behavioural witness — a ring arm, a sentinel —
+needs two inputs R2 does not have at its call site: a GGTT window *proven unowned* (R4b) and a
+*held* forcewake acquire (R6's discipline). R2 runs before R3 has returned a `GtWake` at all and
+before R4 has read the GGTT. There is nothing to arm and nowhere to arm it. Moving the experiment
+to where those inputs exist is not a change to R2; it is R6 and R7, which **have already run it**:
+`r6-sentinel-hit` and `r7-blit-verified` are the behavioural answer to R2's question, on this
+ladder, on this part, on flight 4.
+
+So what R2 owed the wire was a label, and it now prints one:
+
+```
+:: gen7: r2 verdict=r2-unscorable-until-behavioural-witness battery=gt-still-dark
+         instrument=battery17 instrument_blind=1
+         blind_cite=flight4-2026-08-28-both-boots-battery_moved=0/17-through-a-verified-1KiB-engine-DMA
+         trans_all=0/17 trans_untouched=0/14 struct=0 varies=0 poll_ack=1 poll_iters=0
+         rung=R2 wrote=3 reparked=1 ::
+```
+
+Three properties of that line are deliberate. **`battery=` keeps the old token verbatim**, so every
+flight-4-era capture and every `awk` written against it still compares field-for-field — the same
+discipline GMUX-2 used when it left `why=pre-switch-not-accepted` unchanged and added a new
+discriminating field beside it. **`instrument_blind=` is on the wire as a datum**, not implied by
+the verdict string. And **the blindness reaches the NEGATIVE arm only**: a register that was dark
+and came back structured, or that varies across a read-twice, *moved*, and nothing about a blind
+instrument can manufacture that — so `gt-woke` is still a verdict and is still the STOP-HERE arm.
+Collapsing both arms would have been the mirror of the original error.
+
+The `next=` line now points the reader at the rungs that answer the question instead of at a
+re-run of the same blind battery. Conditions and the queue row: `SHUTOUT-REGISTER.md` §4 (R2),
+`docs/dev/OS/rmbp-queue.md` GEN7R2.
 
 ### 2.3 R3 — `forcewake`
 
@@ -318,9 +351,49 @@ not fire either. The result on the wire is `reclaim=leaked pages=3 bytes=12288
 reason=no-invalidation-evidence` on R7, and the same refusal on R5 and R6:
 **r5 (2) + r6 (2) + r7 (3) = 7 pages / 28 672 B per armed boot, bounded and one-shot.** The
 invariant behaved exactly as written. What flight 4 made unreachable is the *expectation* of
-`reclaim=freed` carried in the falsifiers below — see §2.7's watch line 1, and the queued
-decision `GEN7TLB` in `docs/dev/OS/rmbp-queue.md`: pin an alternative GGTT-invalidation
-witness, or promote the bounded leak to documented-accepted and delete the expectation.
+`reclaim=freed` carried in the falsifiers below.
+
+#### GEN7TLB — the reclaim decision, 2026-09-15: HOLD
+
+The queue row offered three moves: pin an alternative GGTT-invalidation witness, free the pages
+under R7's idle proof, or promote the bounded leak to documented-accepted. **The decision is to
+hold, and `reclaim=freed` is removed from the falsifier.**
+
+*Why not an alternative witness.* There is none to pin. Intel's IVB PRM names exactly one
+invalidation mechanism (Vol1 Part3 §1.2.21, "write any value to MMIO address 0x101008") and gives
+it no name, no format and no read decode. On this part it reads `0` before and after the write, and
+§2.6 above states why that is undecidable rather than negative: a self-clearing flush register and a
+non-decoding offset are indistinguishable here.
+
+*Why not the idle proof.* This is the tempting one and it is wrong. `engine_quiesced` is
+`RING_CTL & 1 == 0` **and** `HEAD == TAIL` — two statements about the **command streamer** and about
+the transfer it was handed. A GGTT translation is cached in the **system agent's** TLB. An idle
+engine does not evict one; nothing in the architecture says it does, and we have no reading that
+says it does either. Substituting idle for invalidation would be scoring a different question than
+the one the free needs — LAWS §5's error shape, stated in its own words: *"say what the check
+measures and what the decision needs; if those are different sentences, the gap is the error."* It
+would also hollow out §2.6's own invariant: "an unpinned register is never the sole reason a page
+goes back to the heap" would become "a register we did not even read is".
+
+*What is accepted.* **r5 (2) + r6 (2) + r7 (3) = 7 pages / 28 672 B per ARMED boot**, plus R8's
+`1 + 4 + dst_pages` (128 pages / 524 288 B on the bench panel) when `gen7r8` is armed too. One-shot,
+bounded, on a 256 MiB x86 heap, behind a diagnostic knob that never reaches shipping media. That is
+0.011 % of the heap for the gen7-only line and 0.21 % with R8. The cost is real and it is the
+cheaper of the two failures available: a 16 KiB DMA into re-issued kernel heap is not.
+
+*What changed on the wire.* Until this arc a healthy armed flight and a drain timeout both printed
+`reclaim=leaked`, and only `reason=` told them apart — a decision and an alarm wearing the same
+word. The state is now three-valued in R6, R7 and R8:
+
+| `reclaim=` | Meaning |
+| --- | --- |
+| `freed` | a reclaim leg fired (`never-fetched` or `flush-verdict`); the pages are back on the heap. |
+| `held` | **DECIDED RETENTION.** Every write restored, the engine quiesced, and no GGTT invalidation witness exists on this part. This is the EXPECTED state of a healthy armed flight, and it is what flight 4 would have printed. |
+| `leaked` | **SAFETY REFUSAL.** The reversal did not verify — a ring that would not disable, a drain that timed out, a smear. Something is wrong, and it must not read the same as the healthy case. |
+
+`reason=` is deliberately unchanged (`no-invalidation-evidence` on the held path), so flight-4-era
+captures still compare field-for-field. The queue row `GEN7TLB` closes on this decision; the falsifier
+in §2.7's watch line 1 is corrected to match.
 
 #### Cycle bounds
 
@@ -399,7 +472,7 @@ only in `cyc=7112`. `dst_crc == src_crc` on both boots, so the bytes-not-DWords 
 at the end of this section is metal-proven.
 
 **Correction to this section's premise, and it was a misreading of our own code.** `write_ok()`
-is not a launch gate and never was: it is `GtWake::write_ok()` (`gen7.rs:1351`), which returns
+is not a launch gate and never was: it is `GtWake::write_ok()` (`gen7.rs:1388`), which returns
 true for `GtWake::Woke | GtWake::LiveAlready` — R3's wake verdict, nothing else. There is no
 seat-held switch behind it to open. On flight 4 R3 returned `gt-live-already`, so every rung
 printed `write_ok=1` on its own `begin` line — `r5 begin … write_ok=1`, `r6 begin … write_ok=1`,
@@ -568,7 +641,11 @@ boots.** Three things silicon had to confirm that no host gate can, and what it 
    boot, in `drain_iters=0 drain_cyc=28` of a 20 M-cycle allowance. But `reclaim=freed` did not
    appear and **cannot**: the flush register is silent on this part and the engine did fetch, so
    neither reclaim leg can fire (§2.6). This expectation is the one part of the falsifier that
-   was wrong about the machine rather than about the rung — GEN7TLB's decision.
+   was wrong about the machine rather than about the rung.
+   ⚠ **CORRECTED by GEN7TLB, 2026-09-15 (§2.6).** `reclaim=freed` is struck from this expectation
+   and replaced: on a healthy boot expect `all_ring_idle=1 engine_quiesced=1` and **`reclaim=held
+   reason=no-invalidation-evidence`**. `reclaim=leaked` is now reserved for the safety refusals, so
+   it reappearing on an otherwise-clean run IS a finding again instead of the normal case.
 2. **The flush framing.** If R7 returns `r7-head-stuck` or `r7-sentinel-miss` where R6 — same
    hold, same ring, one command — returned `r6-sentinel-hit`, the delta is the `MI_FLUSH_DW`
    block mis-framing the store that follows it, **not** the 2D block. The encoding is now
@@ -590,6 +667,134 @@ earlier, read `fw-req-decodes-no-ack fw_evidence=real`). The hold works — the 
 hold-across-the-arm discipline plus behavioural witnesses is the only currency this part
 honours. `SHUTOUT-REGISTER.md` §4 (R3) records the conditions.
 
+### 2.8 R8 — `fb_blit` (the same blit at the panel's own geometry)
+
+Knob: `UNAOS_IVB3D_R8=1` → features `gen7,gen7r8`. **Default OFF**; `gen7r8 = ["gen7"]`, and the
+rung is `mod r8` inside `gen7.rs` with its single call site at the tail of `blit()`. Status:
+**pending metal.**
+
+R7 proved the BCS parses `XY_SRC_COPY_BLT` and moves pixels on this part. It proved it in the
+smallest possible case, and that case was degenerate in four ways at once: a **16×16** rectangle,
+at destination origin **(0,0)**, across a **64-byte pitch**, inside a **single GGTT page** whose
+source was one page too. None of those is what a compositor asks a blitter for, and each is a real
+failure mode this part could still have. R8 is the identical command with all four removed:
+
+| Degeneracy R7 left | What R8 exercises | What a failure would mean |
+| --- | --- | --- |
+| pitch = 64 B | the panel's own pitch (`stride × bpp`; 7 680 B at 1920×1200) | the pitch-unit question §2.7 settled *by reading* — at 16×16-in-one-page a wrong unit still lands inside the page, so the read was never tested |
+| origin (0,0) | the **top-right** corner, `X1 = width − 64` | DW2/DW3's X/Y fields were exercised only at zero; an **inclusive** X2 spills into the next row's first pixel, which is the §2.7 residual |
+| one destination page | ~120 pages, one PTE each | the engine's per-page GGTT walk — the premise of a GGTT, and untested until now |
+| one source page | 4 pages at a 256-byte source pitch | the same, on the read side |
+
+**It does not touch the panel, and that is a finding rather than a caution.**
+`SHUTOUT-REGISTER.md` §5 G4 is `proven`: `SW_DISPLAY=0x03 (DISCRETE)`, `SW_DDC=0x02 (DISCRETE)`,
+stable at Boot **and** at Kernel — the Kepler dGPU owns the panel at every observed instant on this
+machine — and G7, the gmux switch to IGD, is `never-run`. A gen7 blit aimed at the live scanout
+would therefore be two bad things at once: it would prove nothing visible, because nothing the IGD
+writes is being scanned out; and it would be a write into **another device's VRAM aperture**, which
+is the class of act this ladder's safety argument is built on never doing. So R8's destination is a
+CPU-readable heap surface **carrying the panel's geometry**, the visible copy is deferred to the
+rung after a gmux switch persists (queue rows `GMUX-2`, `A7`), and this paragraph is the reason,
+written down before the flight rather than after it.
+
+#### The three witnesses
+
+| Witness | Column | What it proves |
+| --- | --- | --- |
+| **copy** | `rect_match=N/4096` | the CS parsed the command and moved the rectangle's pixels |
+| **geometry** | `spill=N` | dwords **outside** the rectangle that no longer carry their seed |
+| **retire** | `sentinel_hit` | `MI_STORE_DATA_IMM` took effect, from the slack row |
+
+`spill` is the witness R7 could not have had: at 16×16 into a 4 KiB page there was nowhere for a
+mis-pitched or edge-inclusive blit to land that the rung was looking at. Here there is, and it is
+counted — which is why the classification puts `copy_full && spill > 0` **ahead** of the sentinel
+and the head. A full copy that also painted somewhere else is a geometry finding and must never be
+reported as a clean win because the store happened to retire.
+
+Reading a non-zero `spill` is arithmetic, and the two answers are far apart:
+
+- `spill ≈ pitch/4` dwords (1 920 on the bench panel) — one whole extra **row** moved: a pitch-unit
+  error, the §2.7 note coming true.
+- `spill ≈ R8_RECT_H` dwords (64 — one per row) — one extra **column**: `X2` is **inclusive**. That
+  answers the §2.7 residual the PRM does not state, and it answers it in our own surface, which is
+  why the destination carries **one slack row past the rectangle**: an inclusive edge lands inside
+  the allocation and is counted instead of running off the end.
+
+#### The pre-blit control
+
+A match count is worthless unless it started at zero, so every attempt runs the full scan **before**
+the arm and prints `preblit rect_match=0/4096 spill=0 seed_ok=1`. The two seed generators are
+different multiplicative hashes; if they ever collide the control says so and
+`r8-seed-collision` **dominates the copy verdict** — an instrument that did not start clean cannot
+report a transition. That is R2's lesson (§2.2) applied prospectively instead of retroactively.
+
+#### What R8 inherits unchanged, and what it must not do
+
+- **The wake discipline is R6's**: one `fw_acquire` per candidate over `R6_CANDS` in the same order,
+  **held across the arm, submit, drain, disable and restore**, released last.
+- ⚠ **R8 MUST NOT GATE ON A FORCEWAKE ACK DECODE** (`SHUTOUT-REGISTER.md` §4, R3). R7 read
+  `fw_evidence=blind classification=fw-no-decode` on the same line as a verified 1 KiB engine DMA.
+  R8 arms under each hold regardless of `acked()`, exactly as R6 and R7 do, and every arm of its
+  verdict rests on behaviour.
+- **The teardown gate is R7's, reused and not copied**: `r7_engine_quiesced`, `r7_reversal_clean`
+  and `r7_reclaim`, the three `const fn`s between the `R7-TEARDOWN-GATE-BEGIN`/`-END` markers. The
+  go-red harness of §3.1 therefore proves R8's gate as well as R7's, and there is no second copy to
+  drift.
+- **Every window PTE is read before any is written.** R4–R7 read three slots and two neighbours;
+  R8's window is `1 + 4 + dst_pages` wide (128 on the bench panel) and **every** slot is censused,
+  because "no rung writes a GGTT entry it did not first prove unowned" is a claim about each entry
+  and a sampled proof would be a weaker, different claim.
+- **Every write captured, restored and re-read**: the forcewake request register, the four BCS ring
+  registers (restored only once the ring is confirmed disabled, §1.1.11.2 p.76), every slot of the
+  window plus both bracketing neighbours, and the one GTT-flush register. **No display register is
+  touched at all**, and the framebuffer is never written.
+
+#### The rung dependency, and where it is wired
+
+R8 runs **only** on a boot whose R7 verdict is `r7-blit-verified` (R19: "every ladder rung names the
+earlier rungs it needs open"). On any other boot it prints `r8-gated-on-r7` and writes nothing,
+because a boot on which the blitter did not blit cannot distinguish "R8's geometry is wrong" from
+"the engine did not run today".
+
+That dependency is wired by calling R8 **from the tail of `blit()`** rather than from `igpu::init`,
+for two reasons that are both invariants. The verdict is a local of `blit()`: handing it out through
+the call site would mean changing `blit`'s signature and `igpu.rs`, and would let a future caller
+pass a verdict R7 never reached. And the call is the last statement in the file's last function, so
+with `gen7r8` off there is nothing below it to shift and no `panic::Location` line moves.
+
+#### Refusals — stated, never trimmed
+
+`r8-refused-bpp-not-32` · `r8-refused-pitch-too-wide` (BR13's pitch field is 16 bits; a wider panel
+needs an encoding this rung does not carry, so it is refused rather than truncated) ·
+`r8-refused-panel-too-small` (which also refuses `stride < width`, a malformed surface description
+rather than a small one) · `r8-refused-surface-too-large` (ceiling `R8_DST_MAX_BYTES` = 1 MiB; the
+bench panel asks for 123 destination pages). **A rung that silently shrinks its own experiment
+reports a verdict about a different experiment**, so each of these parks and says so.
+
+#### The metal falsifier, stated before the boot
+
+**With a wake held and R7 verified on the same boot: `ctl_readback==0x1`, `head_moved=1`,
+`rect_match=4096/4096`, `spill=0`, `sentinel_hit=1`, `settled=1`** → `r8-fb-blit-verified`.
+
+Three named alternatives and what each would mean:
+
+1. **`r8-fb-blit-verified-spill`** — the engine works and the geometry does not. Read `spill`
+   against `pitch/4` and against `R8_RECT_H` per the arithmetic above; the fix is a **field**, never
+   an opcode, and §2.7's pin table is not re-opened by it.
+2. **`r8-fb-blit-partial` with `col=exec` short and `col=drain` full** — we looked too early, and
+   `EXEC_BUDGET_CYC` needs raising for a 16 KiB transfer (R7 moved 1 KiB in 7 396 cycles of a 50 M
+   allowance; 16× the bytes is still three orders of magnitude inside it, so this would itself be a
+   finding). **Both short on a drained ring** is a short DMA or a GGTT page that did not translate —
+   read the `claim` line's `ptes_landed` first.
+3. **`r8-enable-void-under-every-hold` after R7 latched on the same boot** — the engine register
+   domain is demonstrably writable this boot, so the delta is R8's own ring programming. Diff the
+   two ring images DW0–DW7; do not re-open the forcewake question.
+
+Expected on a healthy armed boot and **not** a defect: `battery_moved=0/17` (§2.2's blind
+instrument, kept on the wire precisely so a reader sees it stay at zero while the engine works),
+`fw_evidence=blind` (§2.7's residual), and `reclaim=held reason=no-invalidation-evidence` (§2.6's
+GEN7TLB decision).
+
 ---
 
 ## 3. Verification
@@ -602,6 +807,12 @@ witness is reachable. The honest gates are:
    `UNAOS_WC=1 UNAOS_IVB=1 UNAOS_IVB3D=1 ./arroyo check` with `gen7` in the feature banner.
    A knob-gated change type-checked only knob-off is **not** gated: the armed run is required,
    and the banner must actually read `...,intel-ivb,unaos_ivb,gen7`.
+   **R8's armed polarity is a named leg, not an inference** (GEN7NEXT, 2026-09-15): `gen7r8` is the
+   last entry of `arroyo`'s `x86-all` row, which already carries `gen7`, so every `./arroyo check`
+   compiles `gen7 + gen7r8` ON. Proven by mutation rather than by reading — a deliberate type error
+   planted inside `mod r8` reds the armed leg (`rc=101`, `error[E0308]` naming the line) and leaves
+   the `gen7`-only leg green (`rc=0`), which is also the proof that the module is genuinely absent
+   when the sub-knob is off.
 2. The x86-fat knob-off battery, proving the disarmed image is unchanged.
 3. **`LC_ALL=C grep -a -o -F` on the armed `esp-x86` artifact (never `strings` — LAWS §5, counts moved 320→322)**, proving every verdict token is present in
    the shipped ELF — not merely compiled behind a `cfg`.
@@ -616,7 +827,9 @@ compile-time constant and rustc proves the branch dead. That is the `RING_BUFFER
 bits[31:29] invariant being discharged **at compile time** — stronger than a runtime check,
 not absent. If the ring slot is ever made non-constant, the branch and its token return.
 
-R7 carries the same exception for `r7-ring-addr-illegal`, for the same reason.
+R7 carries the same exception for `r7-ring-addr-illegal`, and R8 for `r8-ring-addr-illegal`, for
+the same reason: `R8_BASE_SLOT` is a constant, so rustc proves the branch dead. If that slot is ever
+made non-constant, the branch and its token return.
 
 ### 3.1 The R7 teardown-gate go-red
 
@@ -668,8 +881,27 @@ All six R7 constants pinned in §2.7 were exercised on silicon and none was cont
 What the ladder hands its successor is engineering, not physics, and R7 says it in its own
 words on the wire:
 `r7 next=DONE-the-BCS-copies-pixels-under-a-held-wake-wire-bring_up_blt_ring-to-the-held-wake-and-fix-blitter_copy_rect-DW0-client-field`
-(boot 1, L1566). Three decisions are queued in `docs/dev/OS/rmbp-queue.md` §GPU LADDERS, each
-with its conditions in `SHUTOUT-REGISTER.md` §4: **GEN7R8** (the production blitter, which must
-not gate on a forcewake ack decode), **GEN7TLB** (the `reclaim=freed` expectation, structurally
-unreachable as coded), and **GEN7R2** (re-score R2 against a behavioural witness, its 17-register
-battery having been proved blind by the very boots that passed).
+(boot 1, L1566).
+
+**All three queued decisions are taken, 2026-09-15 (GEN7NEXT).**
+
+- **GEN7R8 — built, pending metal (§2.8).** The rung is `fb_blit`, behind `UNAOS_IVB3D_R8`, and it
+  is R7's command at the panel's own geometry: a 64×64×32bpp rectangle at the **top-right corner**
+  of a **framebuffer-pitch**, **multi-page** GGTT surface, with a third witness — `spill`, the bytes
+  outside the rectangle — that R7's single-page destination could not carry. It blits into
+  CPU-readable scratch and **not** into the scanout, because G4 proves the Kepler owns the panel;
+  the visible copy is the rung after the gmux switch persists, and the reasoning is written down in
+  §2.8 rather than assumed. It does not gate on a forcewake ack decode, as §4/R3 requires.
+- **GEN7TLB — decided: HOLD (§2.6).** `reclaim=freed` is struck from the falsifier. An idle engine
+  is a statement about the command streamer, not about a system-agent TLB entry, so it may not stand
+  in for an invalidation witness; the bounded retention is documented-accepted and now prints as
+  `reclaim=held`, distinct from the safety refusal `reclaim=leaked`.
+- **GEN7R2 — decided: unscorable, and it says so (§2.2).** The behavioural witness the row asked for
+  needs a proven-unowned GGTT window and a held wake, neither of which exists at R2's call site —
+  and the experiment has already been run where they do, by R6 and R7. R2 prints
+  `r2-unscorable-until-behavioural-witness` with the old `gt-still-dark` reading kept verbatim in
+  `battery=`.
+
+**What is owed is a boot.** Nothing above is a fact about silicon until the rMBP flies it; each
+verdict string and its falsifier are stated here first, which is the only order in which a flight can
+settle anything.
