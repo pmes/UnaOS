@@ -427,6 +427,23 @@ fn main() {
     // NEGATIVE RESULT about the hardware. Kept in sync with arroyo; `./arroyo check`'s KNOB→BUILDER
     // WIRING CHECK goes red if this line is dropped.
     if std::env::var("UNAOS_BEAM").is_ok() { feats.push("beam"); }
+    // SHUTRESTORE (rmbp, 2026-09-15): the SEVEN restored R19 rungs — the refuted Kepler ladder steps
+    // whose CODE had been deleted and is now back behind a knob apiece (RULINGS R19;
+    // docs/dev/OS/08_VIDEO/SHUTOUT-REGISTER.md §7). THIS list is what reaches the kernel binary for
+    // MEDIA builds, and the failure mode for a probe rung is the nastiest one in this file's
+    // collection, the same one BEAMX86 names above: a rung armed in arroyo alone would print NO
+    // witness token on the wire, and an ABSENT token is indistinguishable from a rung that ran and
+    // found nothing — so the flight would read as a NEGATIVE RESULT ABOUT THE HARDWARE rather than
+    // as a build that never carried the code (the s42/INSTGUI and rastmc failure, with a worse
+    // ending). All seven DEFAULT OFF => unlinked and media unchanged. Kept in sync with arroyo;
+    // `./arroyo check`'s KNOB→BUILDER WIRING CHECK goes red if any of these lines is dropped.
+    if std::env::var("UNAOS_KEPLER_USERD_SNOOP").is_ok() { feats.push("nvidia-kepler-userdsnoop"); }
+    if std::env::var("UNAOS_KEPLER_PFIFO_FLUSH").is_ok() { feats.push("nvidia-kepler-pfifoflush"); }
+    if std::env::var("UNAOS_KEPLER_CTRL_ADDR").is_ok() { feats.push("nvidia-kepler-ctrladdr"); }
+    if std::env::var("UNAOS_KEPLER_REPOINT").is_ok() { feats.push("nvidia-kepler-repoint"); }
+    if std::env::var("UNAOS_KEPLER_LATCH_ARM").is_ok() { feats.push("nvidia-kepler-latcharm"); }
+    if std::env::var("UNAOS_KEPLER_PITCH_LADDER").is_ok() { feats.push("nvidia-kepler-pitchladder"); }
+    if std::env::var("UNAOS_KEPLER_GOP_OVERLAP").is_ok() { feats.push("nvidia-kepler-gopoverlap"); }
     // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/desktop_uefi.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
