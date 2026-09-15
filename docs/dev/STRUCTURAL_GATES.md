@@ -299,6 +299,133 @@ a RULINGS row with status `pending` → red; a `superseded` ruling naming no R-i
 cross-reference. There is no allowlist. Agreed rmbp 11 ↔ orin 13, 2026-09-05;
 the LAWS §Ledgers paragraph cites this gate only now that it exists.
 
+### SECOND CUT — 2026-09-15, LEDGERGATES (LEDGER SR13, SR11, SR12 + LAWS §3 Queues)
+
+Three defects **of the gate itself**, and the queue files it was owed. Each fix
+carries the mutation that proves it can fail; all mutations were executed and
+reverted, and `git status` was clean afterwards.
+
+**1. The strict trigger is decided from CONTENT, not from a ref name (SR13).**
+The trigger armed on `_branch == TRUNK` where `_branch` is `git rev-parse
+--abbrev-ref HEAD` — which returns the literal string `HEAD` in *any* detached
+checkout, **including one sitting at trunk's own sha**. That is the exact shape
+every executor and every peer-gating seat works in: orin 25 gated a landing four
+times from a detached worktree, got the deferring posture every time, and only
+saw the strict verdict after exporting the variable by hand — the remembered
+step the trigger exists to replace. Strict now arms when HEAD's sha is contained
+in the trunk ref (`git merge-base --is-ancestor HEAD main`, then `origin/main`),
+or by `UNAOS_LEDGER_STRICT=1`, and **every run prints the posture**:
+`strict=by-env` · `by-ancestry` · `off`, each with its reason. The DIRECTION is
+the whole safety argument and it is written out in the script:
+head-contained-in-trunk arms; trunk-contained-in-head — a post-fold track tip,
+SR13's own `a51a0396` counter-example — does **not**, so the false-red the
+"zero rows of that prefix" discriminator was turned down for cannot return. It
+is wider than equality by exactly one case, a checkout of an older trunk commit,
+which was trunk content and wants strict. An unresolvable `UNAOS_LEDGER_TRUNK`
+is now *printed* as the reason strict is off, so the rename door is loud rather
+than silent. **Go-red, two throwaway detached worktrees:** at trunk's sha
+`strict=by-ancestry` rc=0 (the pre-fix script printed no posture at all); at a
+track sha `strict=off` rc=0; `UNAOS_LEDGER_STRICT=1` from that same track
+worktree `strict=by-env`; `UNAOS_LEDGER_STRICT=0` at trunk's sha suppresses;
+`UNAOS_LEDGER_TRUNK=nosuchref` prints the unresolvable-trunk reason.
+
+**2. One general escape for quoted material, at the output boundary (SR11).**
+SR11 names three instances of this gate's notation colliding with its subject and
+predicts a fourth; two already had an input-side special case, and the row's own
+verdict is that the fix is *one general escape*, not a third. It is placed where
+it cannot be forgotten — **every line the gate emits** passes through it. Two
+collisions, both measured rather than reasoned: (i) the harness fault-scan family
+(`arroyo`'s `FAULT_PATTERNS`: `-> FAIL`, `FAIL ::`, `FAIL —`, `PANIC`, `panicked
+at`, `EXCEPTION:`), which the gate could emit by *quoting a ledger cell*, so a
+ledger-check log concatenated into a run log or pasted into a row is scored as a
+kernel fault; (ii) the markdown cell delimiter — the gate printed the status enum
+pipe-separated, so its own findings could not be pasted into a ledger cell
+without shifting that row's columns, which is B63 pointing the other way. The
+escape is declared and visible (`⟨q:P·ANIC⟩`, `¦`), never silent mangling, and
+its use is COUNTED and reported on the last line of either verdict. The
+diagnostics also now separate the enum and the owner set with `·` and name the
+delimiter **by name** rather than by glyph. **Go-red / control, one injected row
+(`| S999 | … | peter PANIC | — | standing -> FAIL :: PANIC | … |`), same tree:**
+pre-fix script → 2 output lines matching `FAULT_PATTERNS` and 1 carrying a pipe;
+post-fix script → **0 and 0**, with the finding still readable and still red
+(rc=1 both). What this does **not** fix: the authoring side. A raw pipe inside a
+cell is still refused (B63 stands, B24 still registered).
+
+**3. A deferral must be keepable (SR12).** A cross-ref could defer forever with
+nobody owing it and nothing expiring it — SO6 deferred on every run, on every
+seat, for four days, and the row existed on no ref and had never been written. A
+deferring row must now name an OWNER (a track: `rmbp` · `orin` · `pi` · `trunk`;
+the `owner` column counts) and an EXPIRY (a date, a commit sha this repo
+resolves, or a blocking id written `blocked on <ID>` / `until <ID>` /
+`expiry=…`); a deferral missing either is RED **naming the missing half**.
+Grandfathering is the `FIELDCOUNT_REG` mechanism — printed every run, must reach
+zero, stale entries red — and `DEFERRAL_REG` is **empty**, which is a
+measurement: this tree carries zero deferrals in either posture. **Go-red:** a
+row carrying `→ SO99` with no owner and no expiry → rc=1 naming both halves; the
+same ref with `owner rmbp, expiry 2026-10-01, blocked on SO99` → DEFERRED,
+printed, rc=0. The peer-resolution half SR12 also proposed is implemented, but
+for the queue citations below, where it splits waiting from never.
+
+**4. The four queue files (LAWS §3 Queues, R45).** LAWS said "warning only until
+`ledger-check.sh` learns the queue files"; it now names this gate. Two checks,
+deliberately only two — a queue is an ORDER, not a tracker, so it has no status
+enum, no owner column and no field count to assert, and importing the ledger
+contract wholesale would red honest rows in three seats' files.
+
+* **(a) No conflict marker**, in the queues **and** the ledgers **and**
+  RULINGS.md (9 files in this tree; the count is printed in the census). The gate
+  passed rc=0 on a `LEDGER.md` carrying three markers a fold had committed
+  (hw-jetson `4465eb20`, fixed `7006857f`) because markers sit outside any table
+  row. **Go-red:** one marker shape per file in one run (`<<<<<<< HEAD` in
+  `QUEUE.md`, a bare `=======` in `LEDGER.md`, `>>>>>>> exec-probe` in
+  `orin-ledger.md`) → rc=1, each named with file, line and marker text; reverted
+  → rc=0.
+* **(b) Every ledger id a queue row cites exists.** The queue's own header says
+  "Every row cites its ledger id"; nothing checked it. **The pattern was measured
+  before it was chosen, and the measurement removed a prefix:** the proposed
+  `(S|SO|SP|SR|A|B|E)[0-9]+` matches 592 tokens / 186 distinct over the four
+  files, and `E` matched **only** `error[E0080]` — rustc's diagnostic code, cited
+  twice as go-red evidence — while the three real `E` ids are cited by no queue
+  row at all. Two false findings, zero true ones, so `E` was dropped; the
+  surviving population is **590 citations, 185 distinct**. The id set is the
+  union of every ledger file in the tree (table rows *and* P-bullets), because
+  `A` is orin's arch prefix and `B` is rmbp's and the trunk queue cites both.
+  **Three verdicts, which is SR12's split applied where it is affordable:**
+  resolves here → OK; resolves on one of the nine enumerated heads →
+  DEFERRED-KEEPABLE, printed with the ref that carries it (5 of these on trunk
+  today — the jetson rows `QUEUE.md` §5 itself labels "NOT YET LANDED"; reding
+  those would red the trunk for saying something true); resolves **nowhere** →
+  RED. **Go-red:** `· B9999 …` appended to `QUEUE.md` → rc=1, "a citation to
+  nothing"; `· B70 …` (a real row) → rc=0.
+
+**The grandfather list, and what arming this found.** `docs/dev/OS/orin-queue.md`
+cites **35 ledger ids that exist in no ledger file on any head** — measured over
+all nine refs, orin's own `hw-jetson` included, so these are rows that were never
+written, not cross-branch artefacts; 202 of that file's 373 citations point at
+them. That is SO6's shape at scale. They are REGISTERED in `QUEUECITE_REG`
+rather than red, for the reason this gate's own ABSENCE note already records
+paying once: a gate that reds another seat's file on the day it ships is worse
+than the defect. The registration is **falsifiable in both directions that
+matter** — it is printed every run as a collapsed census line (35 ids with their
+occurrence counts, not 202 lines: LAWS §5's "22 names on every run trains the eye
+to skip the region"), it must reach zero, and it goes **RED** the moment one of
+the ids starts resolving, locally or on a peer head. **Go-red:** appending
+`- **A66** — go-red probe row` to `orin-ledger.md` → rc=1, "stale queue-citation
+registration … resolves in this tree's ledgers now".
+**IDLE IS NOT STALE, and the first cut got this wrong:** an unmatched
+registration was red-lined the way `FIELDCOUNT_REG` does, and a detached
+worktree at trunk's own sha then went RED 33 times — because `main`'s copy of
+`orin-queue.md` simply predates those citations. Queue files differ by branch, so
+"matched nothing here" is a fact about which commit is checked out. Idle entries
+are counted in the census instead.
+
+**Census.** Every run, green or red, prints the strict posture with its reason,
+then one CENSUS line: queue files scanned, files in the conflict-marker scan,
+queue citations and distinct ids, deferred-keepable and grandfathered counts,
+cross-ref deferrals and their grandfathered count. SR13's lesson in one line —
+the only seat who ever saw strict armed was the one seat for whom the trigger
+was not broken.
+
 ---
 
 ## KNOBLEG — the knob→leg coverage check can now fail
