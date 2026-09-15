@@ -798,6 +798,13 @@ ring says so, and a capture with no `ring drained` line at all says the machine 
 The Pi arms get the drain too. They do not power anything off — they print an honest refusal and park
 in `hlt_loop` — and a park is likewise a context with no next print.
 
+> **On the 2012 rMBP this drain is the first of TWO buffers, and only the first.** `power_drain` ends
+> in `serial::_print`, whose x86 sinks are the 16550 at 0x3F8 — a port that laptop does not have — and
+> the FTDI MIRROR RING, which reaches the cable only when the xHCI device-service pass runs. So on
+> that machine the flush above moved every staged line one buffer closer to a human and no further,
+> and the reboot ladder still died in the ring. *RBTDRAIN*, at the end of this document, is the last
+> leg.
+
 ### The fixture
 
 `serial_ring::pwrdrain_selftest`, one-shot on `mirror_service`, so it runs on both arches at the same
@@ -1125,3 +1132,151 @@ Witnesses on the wire: `:: FTDIRX: first byte rx=<n> byte=… ::` once, and
 `note_ftdi_pump` already uses — so a session of typing costs O(log n) lines for n bytes, which is
 what makes a rollup safe on a console whose own output shares the cable. It does not promise a final
 total: the last line is the last power-of-two milestone (a 10-byte session ends at `rx=8`).
+
+## RBTDRAIN — the reboot ladder was flushed into a ring the reset then killed
+
+`docs/dev/OS/rmbp-ledger.md` A3. On the 2012 rMBP the `reboot` verb **worked** — it resets the
+machine, FADT `RESET_REG` at 0xcf9 ← 0x6 — and **not one of its witnesses ever reached a human.**
+
+Follow a line from `power::reboot` to the cable and the reason is structural, not a bug in any one
+function:
+
+| stage | where it lands | on a machine with a 16550 | on the rMBP |
+| --- | --- | --- | --- |
+| `serial_println!` | `serial_ring`, maybe deferred | fine | fine |
+| `power_drain("pwrreboot")` (SO31) | `serial::_print`'s x86 sinks | **out the port** | 16550 absent; into the FTDI mirror ring |
+| `acpi_power::reboot`'s `raw_witness` | `raw_write_str` = the 16550 at 0x3F8 | **out the port** | **written into a port that is not there** |
+| the mirror ring | `drivers/xhci/ftdi.rs` `RING`, 256 KiB | n/a | reaches the wire only on the next `service_ftdi` |
+| the reset | `out 0xcf9, 6` | — | lands microseconds later; **there is no next pass** |
+
+PWRDRAIN (SO31) and S5DRAIN (SO39) fixed the *staging* half of exactly this problem, and both are
+correct. What they could not know is that on this laptop `_print` is not the wire: it is a second
+buffer, and the thing that empties it is the xHCI device-service pass — the one context a power verb
+has just guaranteed will never run again.
+
+### The fix — a synchronous, bounded flush, called at the PORT and at the verb
+
+`drivers::xhci::ftdi_flush_sync(budget_cycles) -> (bytes, transfers, exhausted)`. Ungated, arch-neutral,
+and a no-op that touches no controller state where `ftdi::is_live()` is false — which is every board
+that has a real UART. It pumps `XhciController::drain_ftdi` in a loop until the mirror ring is empty
+or the budget is spent.
+
+**It never blocks, and three separate bounds hold that:**
+
+* **The controller is CLAIMED, never locked.** `xhci::claim()` is the WEDGE-8 loan — a masked O(1)
+  take that answers `Busy` rather than waiting. That is the LOCKFIX discipline: the only correct
+  answer to a held lock on a path that cannot wait is to decline it. `NotReady` (no controller at
+  all) returns at once.
+* **A `Busy` claim is retried only inside the same budget.** The retry exists because the verb is
+  typed at the shell while `x86_usb_pump` holds the loan on another core — microseconds of ordinary
+  overlap, not a wedge — and a single try would lose the tail to a race. A pass that never gives the
+  loan back costs this call its budget and never the machine: the loop's exit is the clock, not the
+  lock.
+* **Each pump is bounded twice over.** `drain_ftdi` spends at most one PTBURST slice (4 ms) per call,
+  and each of its bulk-OUT transfers waits at most one `hw_wait_budget()`, after which the sink is
+  turned off permanently rather than retried.
+
+`drain_ftdi` gained a return value for this and nothing else: **true when it left nothing further to
+push** (ring empty, or the sink is unusable), **false on its one PTBURST slice-yield exit**. A service
+pass may ignore that distinction — its next pass is 4 ms away — but a caller pumping the function in a
+loop cannot. The flag already existed in the body as `ring_emptied`; this only lets a caller read it.
+
+### Two call sites, and neither is redundant
+
+```
+power::reboot                     [pwrreboot] reboot verb invoked …            -> _print -> mirror ring
+power::platform_reboot            [pwrreboot] x86 mechanism: FADT RESET_REG …  -> _print -> mirror ring
+  power_drain("pwrreboot")        [pwrreboot] ring drained lines=N bytes=M     -> raw_write_str: 16550 ONLY
+  ftdi_flush_witness("pwrreboot") …pumps the mirror ring out the cable…
+                                  [pwrreboot] ftdi flushed bytes=B transfers=T exhausted=0
+                                                                               -> _print -> mirror ring
+acpi_power::reboot                ftdi_flush_sync(...)  <- FIRST STATEMENT: carries the line above out
+  interrupts::disable()
+  … the FADT ladder …               raw_witness(…)      -> raw_write_str: 16550 ONLY
+```
+
+Measured on the QEMU fixture, the cable's last three lines are the three marked `mirror ring`, in that
+order, and the two marked `16550 ONLY` are on `serial.log` and **not** on the cable. On the rMBP there
+is no 16550 at all, so those two are simply gone — which for the FADT ladder's `raw_witness` lines is
+ledger A3 restated (`reset_report` already prints those facts at boot, BOOTFADT, flown F7), and for
+`ring drained` is a **residual gap this fixture found and RBTDRAIN does not close**: `power_drain`
+writes both the drained lines *and* its own tally through `arch::serial::raw_write_str`, never through
+`_print`, so on this laptop PWRDRAIN empties the staging ring into a port that does not exist. A line
+DEFERRED under contention is therefore consumed there before the FTDI flush can ever see it. What
+RBTDRAIN does carry is everything `_print` reached the mirror ring with — which is every line on a
+quiet path, and the verbs' own announces on any path. Closing the rest means giving `power_drain` a
+sink that is `_print`'s SET and not one arch port — a change to the shared `serial_ring.rs`, carried
+as a `· NEW` row in trunk `docs/dev/QUEUE.md` §5 rather than taken here. It is not rMBP-only in
+principle: any board whose console is not the arch's raw port has it.
+
+**Why the witness is printed after the flush it reports and before the flush that carries it.** Print
+first and the counts do not exist yet — a line claiming a flush it has not performed is the precise
+lie this arc removes. Flush first and print after, and the line itself is left in the ring when the
+reset lands. So the verb and the port compose: `power.rs` flushes and then writes its tally into the
+ring, and `acpi_power::reboot`'s first statement — the same call — is what puts that tally on the
+wire. The port copy is the one **no caller can skip**, which is S5DRAIN's argument at `poweroff()`
+repeated at `reboot()`; the verb copy is the one that **reports**, in the verb's own announce order.
+
+**It is the first statement of `reboot()` for a second, independent reason:** the next line disables
+interrupts, and the FTDI TX pump awaits completions through `crate::hlt()`. A `hlt` with `IF` clear
+and no timer never wakes, so a flush placed after the mask would hang the very verb it makes honest.
+The statement is folded **line-neutral onto `reboot()`'s signature**, exactly as `s5_ring_flush` is on
+`poweroff()`'s, because `s5_ring_flush` sits below it in that file (`docs/dev/LEDGER.md` P7).
+
+**`exhausted` is a real outcome and is printed as one.** It is `1` when the budget ran out — or the
+loan never came back inside it — with bytes still in the ring: *the tail did not all reach the wire.*
+A flush that reported success it had not achieved would be worse than no flush at all, because the
+reader would stop looking for the missing lines.
+
+### Ungated, on purpose
+
+The mechanism carries no knob. It is transport correctness — `docs/dev/LAWS.md`'s *the wire may not
+lose lines* — and it has the same standing as `power_drain` and `s5_ring_flush`, which are likewise
+ungated. A witness that exists only under a knob is not the witness a bench sitting in front of an
+unknobbed flight image needs. The cost to a boot that has no FTDI console is one relaxed atomic load.
+
+`ftdi_flush_sync` is placed **above** the `ftdirx` tail block in `drivers/xhci/mod.rs` and not below
+it: that block is `#[cfg]`-erased knob-off and is appended past the last statement in the file so
+nothing under it can move. Ungated source added *below* it would sit at a different line with the knob
+on than with it off, moving its own `panic::Location` records between the two images. Above it, these
+lines are at the same place in both and the tail block still has nothing beneath it.
+
+### The fixture
+
+No new knob, and no kernel fixture code — the verb IS the fixture. One QEMU run with the emulated
+FT232 (`UNAOS_USBSERIAL=1`) and the RX console (`UNAOS_FTDIRX=1` + `UNAOS_FTDIRX_INJECT=<socket>`):
+`scripts/ftdi_inject.py` types `reboot\n` at the cable and the cable-side capture is then asserted to
+END with the ladder's last witnesses.
+
+`scripts/ftdi_inject.py` gained one additive flag, `--wait-for-text`, for a reason worth stating:
+console-up is the right moment to type for an RX gate, and the wrong one for a gate whose verb ENDS
+THE RUN. `reboot` at console-up resets the machine long before the boot reaches the `COMPLETE` marker
+`./arroyo test` scores, and the harness would call that run TRUNCATED — correctly, and for a reason
+that has nothing to do with what the fixture measures. The flag names a second string to wait for in
+the same log, so the fixture says *once the boot has finished, type this*. `-no-reboot` goes on via
+`UNAOS_QEMU_EXTRA` (the x86 builder's QEMU line does not carry it; the aarch64 ones do), so the reset
+EXITS QEMU instead of restarting it and the capture's tail is the reboot ladder rather than a second
+boot.
+
+The go-red is the call, not a mutation of it: delete `ftdi_flush_witness` from `platform_reboot` and
+the flush from `reboot()`'s signature line, and the same run's capture ends mid-desktop — no
+`ring drained`, no `ftdi flushed`, nothing. That is the defect this section describes, reproduced on
+demand.
+
+### The S5 port gets the same fold, for S5DRAIN's own reason
+
+`poweroff()`'s signature line now reads `s5_ring_flush(); ftdi_flush_sync(…)` — the staging drain
+S5DRAIN put there, then the mirror drain, in that order so S5DRAIN's "first statement" property is
+unmoved. Both run before the `discover()` failure arm's `hlt_loop` park and before the
+`interrupts::disable()` deeper in the body, which the FTDI pump requires.
+
+It is at the PORT and not only at the verb because that is S5DRAIN's argument one buffer further
+along. `power::shutdown` flushes in its own announce order, but `video/crystal.rs`'s **Shut Down**
+and `video/instgui.rs` call `acpi_power::poweroff` **directly**, and before this fold those two
+routes — the desktop press most likely to land while the compositor is printing — reached S5 with the
+mirror ring unflushed altogether. It also carries `platform_shutdown`'s own
+`[pwrshutoff] ftdi flushed …` tally, which is written into the ring one call earlier and would
+otherwise have nothing left to take it out.
+
+So both x86 power ports now drain both buffers, and the table at the top of this section has no row
+left where a route reaches firmware with the cable's tail unsent.

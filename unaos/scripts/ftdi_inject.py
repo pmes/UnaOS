@@ -33,7 +33,38 @@
 #
 # Usage:
 #   scripts/ftdi_inject.py <socket> --text 'help\n' [--after SECS] [--wait-for-log PATH]
-#                                   [--hold SECS] [--capture PATH] [--timeout SECS] [--gap MS]
+#                                   [--wait-for-text TEXT] [--hold SECS] [--capture PATH]
+#                                   [--timeout SECS] [--gap MS]
+#
+# THE EXACT ENV, both halves, because neither works alone (run them from `unaos/`, injector FIRST —
+# it retries the connect while the kernel builds, and the connect is what plugs the FT232 in):
+#
+#   SOCK=<abs path>/ftdi0.sock
+#   python3 scripts/ftdi_inject.py "$SOCK" \
+#       --wait-for-log "$PWD/target/serial.log" --text 'help\n' \
+#       --hold 90 --timeout 2400 --capture <abs path>/cable.log &
+#   UNAOS_USBSERIAL=1 UNAOS_FTDIRX=1 UNAOS_FTDIRX_INJECT="$SOCK" \
+#   UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 90
+#
+#   UNAOS_USBSERIAL=1     attaches the emulated FT232 at all (a BUILDER knob, not a kernel feature)
+#   UNAOS_FTDIRX=1        compiles the RX half — without it the cable is write-only and nothing types
+#   UNAOS_FTDIRX_INJECT=  swaps the file chardev for the listening socket this script connects to;
+#                         NOTE it REPLACES target/ftdi.log, so --capture is the cable's only record
+#
+# RBTDRAIN (rmbp-ledger A3) adds `--wait-for-text` and two more env terms, for a verb that ENDS THE
+# RUN (`reboot`). Same two commands, with:
+#
+#       --wait-for-text ':: zeolite: metrics' --text 'reboot\n'
+#   ... UNAOS_QEMU_EXTRA="-no-reboot" ./arroyo test 90
+#
+#   --wait-for-text       hold off until the boot has reached the COMPLETE marker of
+#                         scripts/specs/x86-test.spec. Typing `reboot` at console-up instead resets
+#                         the machine long before that marker, and `./arroyo test` then reports
+#                         TRUNCATED — correctly, and for a reason unrelated to what is being measured.
+#   UNAOS_QEMU_EXTRA=-no-reboot   the x86 builder's QEMU line does NOT carry -no-reboot (the two
+#                         aarch64 lines in `arroyo` do), so without this the reset RESTARTS the guest
+#                         and the capture's tail is a second boot instead of the reboot ladder. With
+#                         it, the reset EXITS QEMU and the last bytes on the cable are the ladder.
 #
 # Exit status: 0 = every byte written; 1 = the socket never accepted a connection, or the console-up
 # witness never appeared, within the timeout. The gate reads this, so it must never be 0 on a no-op.
@@ -84,16 +115,20 @@ def reader_thread(s: socket.socket, capture_path: str, stop: threading.Event) ->
         return
 
 
-def wait_for_witness(path: str, deadline: float) -> bool:
+def wait_for_text(path: str, needle: str, deadline: float) -> bool:
     while time.time() < deadline:
         try:
             with open(path, "rb") as fh:
-                if CONSOLE_UP.encode() in fh.read():
+                if needle.encode() in fh.read():
                     return True
         except FileNotFoundError:
             pass
         time.sleep(0.25)
     return False
+
+
+def wait_for_witness(path: str, deadline: float) -> bool:
+    return wait_for_text(path, CONSOLE_UP, deadline)
 
 
 def main() -> int:
@@ -105,6 +140,16 @@ def main() -> int:
                     help="extra settle time AFTER the console-up witness, in seconds")
     ap.add_argument("--wait-for-log", default=None,
                     help="serial log to poll for '%s'; omit to skip the wait" % CONSOLE_UP)
+    # RBTDRAIN (rmbp-ledger A3): console-up is the earliest moment the cable can carry anything, and
+    # for an RX gate that is also the right moment to type. A gate whose typed verb ENDS THE RUN needs
+    # a later one: `reboot` at console-up resets the machine long before the boot reaches the COMPLETE
+    # marker `./arroyo test` scores, and the harness would call that a TRUNCATED run — correctly, and
+    # for a reason that has nothing to do with what the fixture was measuring. This flag names a second
+    # string to wait for in the SAME log, polled after the console-up witness, so the fixture can say
+    # "once the boot has finished, type this". Additive: unset, the script behaves byte-for-byte as before.
+    ap.add_argument("--wait-for-text", default=None,
+                    help="after the console-up witness, also wait for this literal text in "
+                         "--wait-for-log (e.g. the spec's COMPLETE marker) before sending")
     ap.add_argument("--hold", type=float, default=0.0,
                     help="seconds to keep the socket open after sending (a close hot-unplugs the "
                          "emulated device, so hold past the end of the run)")
@@ -142,6 +187,19 @@ def main() -> int:
             s.close()
             return 1
         log("console is up")
+    if args.wait_for_text:
+        if not args.wait_for_log:
+            log("FAIL: --wait-for-text needs --wait-for-log to name the log to poll")
+            stop.set()
+            s.close()
+            return 1
+        log(f"waiting for {args.wait_for_text!r} in {args.wait_for_log}")
+        if not wait_for_text(args.wait_for_log, args.wait_for_text, deadline):
+            log("FAIL: that text never appeared — nothing injected")
+            stop.set()
+            s.close()
+            return 1
+        log("text seen")
     if args.after > 0:
         time.sleep(args.after)
 

@@ -36,7 +36,16 @@
 // and emits `[<family>] ring drained lines=N bytes=M`. The reason is the one property the transport
 // cannot give here: a contended line is DEFERRED, and a deferred line is safe only while a next print
 // exists. A power verb is the context where there is none, so the ring dies with the power and the
-// verb's own announce can die with it. See `serial_ring::power_drain` and
+// verb's own announce can die with it.
+//
+// RBTDRAIN (rmbp-ledger A3, same doc section): PWRDRAIN is only the FIRST of TWO buffers on the 2012
+// rMBP. `power_drain` ends in `serial::_print`, whose x86 sinks are the 16550 at 0x3F8 — which this
+// laptop does not have — and the FTDI MIRROR RING, and that ring reaches the cable only when the xHCI
+// device-service pass runs. A power verb is a context with no next pass, so on the rMBP the staged
+// lines arrived one buffer short of a human and the whole reboot ladder died there. Every x86 verb
+// below therefore follows its `power_drain` with [`ftdi_flush_witness`] — a bounded, non-blocking,
+// synchronous pump of that ring — and says on the wire how much left and whether any was left behind.
+// See `serial_ring::power_drain` and
 // `docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §"The power verbs drain first".
 //
 // Witness families: `[pwrreboot]` / `[pwrshutoff]` (tokens > 8 bytes by construction —
@@ -171,7 +180,46 @@ fn platform_reboot() -> ! {
     // witness, so a capture could not tell a flushed ring from a ring that was never reached. The
     // count goes on the wire here; the second drain downstream then finds the ring empty.
     crate::serial_ring::power_drain("pwrreboot");
+    // RBTDRAIN (rmbp-ledger A3): the drain above ends in `serial::_print`, and on THIS laptop
+    // `_print`'s x86 sinks are a 16550 that does not exist and the FTDI MIRROR RING. So everything
+    // flushed a line ago is now one buffer from the cable and no closer to a human: the ring reaches
+    // the wire only when the xHCI device-service pass runs, and past this point there is no next
+    // pass. Push it out synchronously, here, while interrupts are still on and the event ring can
+    // still be pumped (`acpi_power::reboot` masks them as its second statement, and a masked
+    // `hlt()` inside the TX pump would never wake).
+    ftdi_flush_witness("pwrreboot");
     crate::arch::acpi_power::reboot();
+}
+
+/// RBTDRAIN — flush the FTDI mirror ring and put the result on the wire, for one power verb.
+///
+/// ### The witness is printed AFTER the flush it reports and BEFORE the one that carries it
+///
+/// The obvious placement — print, then flush — cannot work: `bytes=`, `transfers=` and `exhausted=`
+/// do not exist until the pump has run, and a witness that reported a flush it had not yet performed
+/// would be exactly the lie this arc exists to remove. The obvious alternative — flush, then print —
+/// leaves the line itself unflushed, sitting in the mirror ring when the reset lands.
+///
+/// So the two power verbs and their platform PORTS compose, and the composition is the mechanism:
+/// this call flushes the verb's announce and `power_drain`'s tally, then prints its own line into the
+/// ring; `acpi_power::reboot`'s FIRST STATEMENT is the same flush again, and THAT is what carries
+/// this line to the cable. The port's copy is the one no caller can skip (S5DRAIN put
+/// `s5_ring_flush` at `poweroff()`'s port for that reason and this follows it); this copy is the one
+/// that reports, in the verb's own announce order. Neither is redundant, and the second finds only
+/// what the first wrote.
+///
+/// `hw_wait_budget()` is the span, the same one every bounded hardware wait in the tree uses: ~1.1 s
+/// on the rMBP's 2.3 GHz Ivy Bridge, ~2.5 s under TCG. The ring at a reboot holds the tail of a log
+/// the service pass has been draining all along — hundreds of bytes, microseconds of cable — so the
+/// budget binds only when something is already wrong, which is the case it exists for.
+#[cfg(target_arch = "x86_64")]
+fn ftdi_flush_witness(tag: &str) {
+    let (bytes, transfers, exhausted) =
+        crate::drivers::xhci::ftdi_flush_sync(crate::arch::hw_wait_budget());
+    serial_println!(
+        "[{}] ftdi flushed bytes={} transfers={} exhausted={}",
+        tag, bytes, transfers, if exhausted { 1 } else { 0 }
+    );
 }
 
 /// x86_64 shutdown: REAL — ACPI S5 through the existing `acpi_power::poweroff` (the
@@ -187,6 +235,20 @@ fn platform_shutdown() -> ! {
     // DIRECTLY, drain too. This call stays and is not redundant — it puts the count on the wire in
     // THIS verb's announce order, and the flush at the port then finds the ring empty (`lines=0`).
     crate::serial_ring::power_drain("pwrshutoff");
+    // RBTDRAIN: the same last leg as the reboot twin above, and needed for the same reason — the
+    // staging drain hands the lines to the FTDI mirror ring, and S5 kills the machine before the
+    // device-service pass can carry them out the cable. So this call is what puts the two announces
+    // above and `ring drained lines=N bytes=M` ON THE CABLE, which on this laptop is the whole of
+    // what an operator sees.
+    //
+    // The `[pwrshutoff] ftdi flushed …` line this prints goes INTO the ring like any other, and what
+    // takes it back out is `acpi_power::poweroff`'s own FTDI flush, folded onto that function's
+    // signature line beside `s5_ring_flush` — the S5 twin of the fold on `acpi_power::reboot`. The
+    // two compose exactly as the reboot pair does: this call reports in the verb's announce order,
+    // the PORT's call is the one no caller can skip, and it is what carries this tally to the cable.
+    // That fold is also why `video/crystal.rs`'s Shut Down and `video/instgui.rs` — which call
+    // `poweroff` DIRECTLY, bypassing this function entirely — now reach the cable at all.
+    ftdi_flush_witness("pwrshutoff");
     crate::arch::acpi_power::poweroff();
 }
 
