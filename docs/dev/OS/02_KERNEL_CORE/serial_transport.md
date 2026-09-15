@@ -576,6 +576,451 @@ Finally: **the archive offers no before/after on a pre-2026-07-21 state.** The e
 marker); every other copy is from 2026-08-02 or later. Any question of the form "what did this line read
 before the regression landed?" cannot be answered from this channel.
 
+## DRAINCAP — one drain has a BYTE budget, because the UART charges in bytes
+
+This section is SO29's, and SO29 is the one finding in this file that was measured on the GLASS rather
+than on the wire. Peter, render13: *"mousing/dragging not smooth"*.
+
+### The defect
+
+The holder of the UART drains the staging ring **before** writing its own line. That ordering is
+correct and stays (see *Ordering* above). What was wrong is that the drain was bounded by SLOT COUNT
+only — `guard > SLOTS` in `drain_into` — and a slot count is not a cost.
+
+The cost is bytes, because the consumer moves one byte at a time. 115200 8N1 is ten bits per byte:
+
+```
+    11 520 B/s  ->  86.8 us per byte
+    64 slots x 68 B (the measured width of a witness line) = 4 352 B  ->  377.8 ms
+```
+
+377.8 ms of **IRQ-masked, UART-locked, inline** work, charged to whichever core happened to print
+next. On render13 boot 1 that core was the compositing core, and the drag-stall band reads
+
+```
+    [comp2] rollup pass_us≈1835 max_us=375061..617554      (121 spike rollups of 166)
+```
+
+`375 061 us` is 4 321 bytes and `617 554 us` is 7 114 bytes: the whole spike band is one ring-drain
+wide, to 0.7 %. The compositor was not slow. It was paying for the wire. Four other suspects were
+excluded arithmetically first — see `docs/dev/LEDGER.md` SO29 and commit `0fc32a4c`.
+
+### The fix, and why it is a byte budget and not a smaller ring
+
+`DRAIN_BYTE_BUDGET = 192` bytes, in `serial_ring.rs`, applied by `drain_capped` — the spelling both
+arches' `_print` now use.
+
+**Why bytes.** Shrinking `SLOTS` would trade the stall for loss, and SERWIT-1B already settled that
+depth is not load-bearing for correctness (scratch B: ring cut to 4, still `dropped=0`). It would not
+bound the cost anyway: one 1536-byte line costs more than twenty 68-byte ones, so a slot bound says
+nothing about time. The budget is the honest unit.
+
+**Why 192.** One frame of UART at the cadence the compositor is trying to hold: a 60 Hz frame is
+16.667 ms, and 11 520 B/s x 0.016667 s = **192.0 B**. That is the *whole* frame, so it is a ceiling
+and not a target — a pass that spends its entire frame on the wire has composited nothing.
+
+> ⚠ The SO29 row's parenthetical *"~16 ms = ~1,900 bytes"* is an arithmetic slip: 1 900 B at
+> 86.8 us/B is 164.9 ms, ten frames, not one. 192 B is the figure the row's own rate produces. Both
+> numbers are stated here so the next reader does not have to re-derive which is right.
+
+**The bound it actually gives.** The loop emits while `bytes_so_far < DRAIN_BYTE_BUDGET`, so the last
+line taken may straddle the budget: one drain pays at most `budget - 1 + <widest line drained>`. It
+has to be that way round. A drain that refused to start a line it could not finish inside the budget
+would never emit a line wider than the budget at all, and `SLOT_LEN` is 1536 — the widest evidence
+lines in the tree would sit in the ring forever. **At least one line always leaves.** In render13's
+shape that is `192 + 68 = 260 B = 22.6 ms` against `377.8 ms`: a **16.7x** cut, and what is left is a
+property of the line width rather than of the ring depth.
+
+### Nothing is lost by capping
+
+The remainder stays in the ring, in order, and rides the next print — and the ring is drained on
+every print, by every core, so "next" is soon and is conditional on nothing. **A capped drain changes
+WHEN a staged line reaches the wire, never WHETHER.** That is the SERWIT-1 law restated, not an
+exception to it, and it is checked two independent ways:
+
+* the DRAINCAP fixture accounts for every line its fill staged across the capped drain plus the next
+  one, with `DROPPED` unmoved;
+* SERWIT-1's conservation law is the outside check — a byte cap that lost a line would break
+  `SUBMITTED == EMITTED + DECLINED + DROPPED + in_flight()` and turn that verdict red on its own.
+
+**Only the two `_print` hot paths take the cap.** The panic path and the power verbs call the uncapped
+`drain`, and must: a dying machine owes its reader every staged byte and there is no next print to
+ride. `arch/x86_64/acpi_power.rs`'s reboot ladder likewise keeps the uncapped spelling it already had.
+
+### The fixture and its go-red
+
+`serial_ring::draincap_selftest`, one-shot, riding `mirror_service` — the same call site the SERWIT-2
+verdict uses, for the same stated reason (IRQs unmasked, no locks held, not a print context) and
+reached on **both** arches. It empties the ring, fills it with 68-byte lines, takes one capped drain
+and one uncapped drain, and asserts: bounded, capped, and lossless.
+
+```
+:: DRAINCAP: one drain is bounded by BYTES — staged 64 x 68 B, the capped drain paid 204 B in 3
+   line(s) (budget 192 B, ceiling 260 B = budget + one line), the remaining 61 line(s) / 4148 B rode
+   the next drain, 0 lost. Uncapped this ring is 4352 B = 377753 us of IRQ-masked UART at 86.8 us/B
+   (SO29) -> PASS ::
+```
+
+Go-red: give `drain_capped` a `usize::MAX` budget and the fill drains whole in one pass —
+`capped_paid=4352B (ceiling 260B) capped_lines=64` — and both the byte clause and the
+cap-took-effect clause fire.
+
+**Every PASS clause is one-sided on purpose.** The fixture uses the LIVE ring, because the live ring
+is the thing under test; a private `LineRing` would test a copy of the code. The price is that another
+core can win the UART between the two drains and take lines the fixture staged. So interference can
+only make the measured byte count *smaller* and the capped line count *fewer* — it can hide a
+regression on an unlucky run, and can never invent one. That direction is deliberate: a gate that can
+false-fail gets deleted the week it flakes.
+
+The budget predicate itself is `const`-evaluable, so its go-red rows are pinned in the build like
+SERWIT-1's law — five `const _: () = assert!(…)` rows, both arches, every `./arroyo check`, emitting
+not one byte of code. The first row is the load-bearing one: *an empty drain must always take its
+first line, whatever its width.*
+
+## SERWIT-1B PARITY — the backpressure was x86-only, and aarch64 dropped on the first turn
+
+SERWIT-1B (above) installed the bounded, progress-bearing retry that stopped a full ring from being
+terminal. It was installed in **x86's `_print` only**. `arch/aarch64/serial.rs`'s `_print` called
+`serial_ring::stage`, which tried the ring once and, on a full ring, wrote the line off on the spot.
+
+That asymmetry is visible on the wire, and it went unread for weeks because the accounting was
+*correct*. render13 boot 1, on the Orin:
+
+```
+    [serial] dropped 5331 lines in 192 events          — counted, announced, law balanced
+    stall count: 0                                     — the mechanism that would have saved them
+```
+
+Five thousand three hundred and thirty-one lines that the other arch would have kept. Nothing lied;
+the transport simply had two different contracts wearing one name, which is the failure this whole
+document exists to close. (The producer that filled the ring is a separate finding, SO30, and is
+fixed — but a transport is not allowed to depend on its producers being polite.)
+
+### One policy, and the old spelling is deleted
+
+Both arches' `_print` now call `serial_ring::defer_contended`, and behind it sits one pure decision:
+
+```rust
+pub const fn defer_policy(staged: bool, spins: u32, limit: u32) -> Defer {
+    if staged { Defer::Staged } else if spins >= limit { Defer::Lost } else { Defer::Retry }
+}
+```
+
+`Staged` / `Retry` / `Lost` are the three outcomes, and the distinction between the first two *is* the
+law: **a deferred line is not a lost one.** `stage()` is **deleted**, not deprecated. The go-red for
+"an arch regresses to drop-instantly" must not be a reviewer noticing — it is the compiler refusing to
+resolve the name. There is one spelling of the contended path left in the tree, so aarch64's `_print`
+either calls it or does not compile.
+
+Six `const _: () = assert!(…)` rows pin the policy in the build, both arches, every `./arroyo check`.
+Row 2 is the defect, stated as an assertion: *a full ring on the first turn must back-pressure, never
+drop.*
+
+### The fixture
+
+`serial_ring::backpressure_selftest`, one-shot on `mirror_service`, fills the ring and takes three
+turns of the real `defer_contended` with one capped drain in the middle — the drain standing in for
+SERWIT-1B's *it waits by working*, where the stalled producer wins the UART and becomes the consumer:
+
+```
+    turn 1   ring full, bound not reached   ->  Retry   (spins 1)
+    turn 2   ring full, bound not reached   ->  Retry   (spins 2)
+    [one capped drain: room appears]
+    turn 3   room                           ->  Staged
+```
+
+```
+:: SERWIT-1B: the contended producer BACK-PRESSURES, it does not drop — ring filled to 64 line(s),
+   2 turns on a full ring returned Retry (spins=2 of 1000000), one capped drain freed 3 slot(s), the
+   next turn DEFERRED the line intact, 65 line(s) out, 0 dropped. One policy (`defer_policy`) on both
+   arches; `stage()` is deleted, so drop-instantly cannot be written -> PASS ::
+```
+
+**The `Lost` leg is not exercised at runtime, on purpose.** Firing it would leave `DROPPED` non-zero
+and `[serial] dropped 1 lines` on the wire of a *healthy* boot, and this tree has already lost a real
+`[wc-d]` verdict and a two-week panel regression to readers trained by a permanently-noisy instrument
+(`docs/dev/LAWS.md` §5). The `Lost` rows are the compiler's.
+
+Two go-reds, failing at different stages:
+
+* **compile** — flip the `Retry` arm to `Defer::Lost`: truth-table row 2 refuses to compile and
+  `./arroyo check` reds on both arches before anything boots;
+* **runtime** — add `note_dropped()` to `defer_contended`'s `Retry` arm (a retried line counted as a
+  lost one). It compiles; the fixture reads `dropped=2` and prints `-> FAIL`, which `FAULT_PATTERNS`
+  (`FAIL — `) turns into a non-zero exit from `./arroyo test-arm`.
+
+## The power verbs drain first — a deferred line needs a NEXT print, and a power verb has none
+
+Trunk queue §1 (f); `LEDGER.md` SO31. Every guarantee in this document rests on one sentence: *a
+contended line is deferred, and the next holder of the UART emits it.* That sentence has a
+precondition nobody had written down — **there has to be a next holder.**
+
+`power.rs`'s verbs announce through `_print` and then hand the machine to the firmware:
+
+| verb | mechanism |
+| --- | --- |
+| `platform_shutdown` / `crystal_shutdown` (aarch64, non-Pi) | PSCI `SYSTEM_OFF` via `smc #0` |
+| `platform_reboot` / `crystal_restart` (aarch64, non-Pi) | PSCI `SYSTEM_RESET` via `smc #0` |
+| `platform_shutdown` (x86) | ACPI S5, `acpi_power::poweroff` |
+| `platform_reboot` (x86) | FADT RESET_REG ladder, `acpi_power::reboot` |
+| both (Pi 4) | honest witness, then `hlt_loop` |
+
+The announce is the line most likely to be staged — a desktop Shut Down press happens with the
+compositor printing — and the firmware call is microseconds behind it. On a flooded ring (render13
+boot 1 was dropping 5 331 lines) everything still staged when `SYSTEM_OFF` lands dies with the power,
+**including the verb's own witness**, and the operator who pressed the button is left with a dark
+board and a capture that never says the verb ran.
+
+### The fix
+
+One uncapped full drain through the arch's raw lock-free writer, immediately before the firmware call,
+then a witness. `serial_ring::power_drain(tag) -> (lines, bytes)`:
+
+```
+[pwrshutoff] ring drained lines=61 bytes=4148
+```
+
+Three properties, each load-bearing:
+
+* **Uncapped.** `DRAIN_BYTE_BUDGET` (192 B) exists so a *composite pass* cannot be stretched by the
+  wire. A machine that is powering off has no frame to protect and no next print to defer to; it owes
+  its reader every staged byte. Same reason the panic path keeps the uncapped `drain`.
+* **Bounded anyway.** `drain_into`'s slot guard bounds the loop at `SLOTS` + 1 iterations, so "every
+  staged line" is a finite statement, and `raw_write_str`'s TX-ready poll is itself bounded — a machine
+  whose UART never drains degrades rather than hanging the shutdown.
+* **Raw, not `serial_println!`.** The witness must not be able to take the very branch it reports on.
+  `raw_write_str` acquires nothing (it is the WEDGE-2 / panic primitive), so the bytes are on the wire
+  before the next instruction, which at these call sites is the SMC.
+
+`lines=0` and a missing line are different facts, which is the point of printing the count: an empty
+ring says so, and a capture with no `ring drained` line at all says the machine died before this point.
+
+The Pi arms get the drain too. They do not power anything off — they print an honest refusal and park
+in `hlt_loop` — and a park is likewise a context with no next print.
+
+### The fixture
+
+`serial_ring::pwrdrain_selftest`, one-shot on `mirror_service`, so it runs on both arches at the same
+call site as DRAINCAP's and SERWIT-1B's. It runs everything a power verb runs **except the SMC** —
+which is the one line of a shutdown a fixture may not execute, since the next instruction would take
+the machine and leave no verdict to read:
+
+```
+ring filled to SLOTS x PWRDRAIN_LINE_LEN = 64 x 68 B = 4 352 B     (SO29's whole ring)
+power_drain("pwrshutoff")  ->  lines = 64, bytes = 4 352           (22x DRAIN_BYTE_BUDGET)
+a following drain          ->  residue = 0
+:: PWRDRAIN: … -> PASS ::
+```
+
+4 352 B is 22x the byte budget on purpose: the gap between *uncapped* and *capped* has to be wide
+enough that the fixture cannot pass by accident on a tree where the two spellings were swapped. The
+`lines` and `bytes` comparisons are `>=` and `residue == 0` is strict — a live kernel can stage a
+foreign line between the fill loop and the drain, and foreign traffic can only ADD to what a full
+drain emits, never subtract, so `>=` is the direction the property actually points.
+
+**Go-red, both at runtime**, because `drain` and `drain_capped` share a signature and no type can
+separate them:
+
+* the realistic one — swap `power_drain`'s `drain(...)` for `drain_capped(...)`: the budget stops it
+  after 3 lines of 68 B (68, 136, 204; `drain_may_continue` is strictly `<`), the fixture reads
+  `lines=3 residue=61` and prints `-> FAIL`, and `FAULT_PATTERNS` turns that into a non-zero
+  `./arroyo test-arm`;
+* the blunt one — delete the `drain(...)` call: `lines=0 bytes=0 residue=64`, same `-> FAIL`.
+
+What the fixture does **not** prove, stated rather than implied: that the firmware call is reached,
+that `raw_write_str` outruns the SMC on real silicon, or that the Jetson's UART has flushed its own
+FIFO when power drops. None of those is observable from inside the machine. It proves the ring is
+empty and the bytes were handed to the port before the verb continues.
+
+### Certification
+
+The witness tokens are `[pwrreboot]` / `[pwrshutoff]`, `power.rs`'s own families: subsystem-named,
+never board-named, and 11+ bytes with their brackets, so LLVM cannot immediate-encode them out of
+`.rodata`. `UNAOS_TEGRA=1 ./arroyo esp-jetson` followed by
+
+```
+LC_ALL=C grep -a -o -F 'ring drained' target/aarch64_esp/kernel.elf | wc -l
+```
+
+is the artifact proof — the presence of an instrument is proven in the artifact, never in the diff.
+
+> ⚠ **SCOPE, as it stood.** On x86 SO31 covered the `power::shutdown` route only. `video/crystal.rs`'s
+> Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` **directly** and reached S5 with
+> the ring unflushed. That box is **closed by S5DRAIN below** (trunk queue §5, 2026-09-12);
+> `acpi_power::reboot` already drained (since LOCKFIX) and carries the witness too.
+
+## S5DRAIN — the drain belongs at the PORT, not at each route into it
+
+Trunk queue §5 (2026-09-12, SERDRAIN's finding). SO31 part 3 put the flush in `power.rs`, once per
+verb. On aarch64 that is complete: every route to an SMC — the shell's `power::shutdown`, the
+desktop's `power::crystal_shutdown` — passes through that file. On **x86 it was half a fix**, and the
+missing half was the half an operator uses.
+
+`grep -rn 'acpi_power::poweroff' unaos/crates/kernel/src/` finds three call sites:
+
+| call site | route | before S5DRAIN |
+| --- | --- | --- |
+| `power.rs:190` | shell `power::shutdown` | drained (SO31 part 3) |
+| `video/crystal.rs:686` | the desktop's **Shut Down** menu item | **undrained** |
+| `video/instgui.rs:578` | the installer's halt | **undrained** |
+
+A desktop Shut Down is the press most likely to land while the compositor is printing, which is
+exactly when the ring is deepest — so the two routes that bypassed `power.rs` were the two whose
+evidence was worth most. What died with the power was everything `_print` had deferred, the verb's own
+`:: SHARD-MENU: crystal_pick verb=ShutDown ::` announce included.
+
+### The fix
+
+One statement, at the top of `poweroff()` — the single point every x86 S5 route passes through —
+calling the **same** `serial_ring::power_drain(tag)` entry point on the **same** `[pwrshutoff]` witness
+family `power.rs` uses. Not a second copy of the policy: a second spelling is how two divergent
+policies happen, and this document exists because the transport once had two contracts wearing one
+name (see *SERWIT-1B PARITY* above).
+
+It is the **first** statement because `poweroff()`'s `discover()` failure arm prints and then parks in
+`hlt_loop`, and a park is a context with no next print just as S5 is. **No caller is exempt**, and
+that is checked rather than assumed: all three end in S5 or in `hlt_loop`, both terminal. The
+`power.rs` route now drains twice — its own verb-order count on the wire, then `lines=0` at the port —
+which is the shape the reboot ladder has had since SO31 and reads as an empty ring, not as a failure.
+
+The statement is folded **line-neutral onto `poweroff()`'s signature line**: `gas_space_name`,
+`table_checksum_ok`, `discover_reset`, `reset_settle`, `raw_witness`, `reset_report` and `reboot` all
+sit below it in that file, and a new source line would move every `panic::Location` record in them
+(`docs/dev/LEDGER.md` P7). Its body, `s5_ring_flush()`, is a file-tail append.
+
+### The fixture
+
+`serial_ring::s5drain_selftest`, one-shot on `mirror_service`, `witness`-gated and
+`target_arch = "x86_64"`-gated — the defect is x86's, because on aarch64 the desktop's Shut Down is
+`power::crystal_shutdown` and there is no caller that reaches a firmware power call without passing
+`power.rs`.
+
+It exists because PWRDRAIN cannot cover this. PWRDRAIN proves the *policy* — a full drain empties the
+ring and counts the bytes — and says nothing about which routes call it. S5DRAIN proves the other half
+of the sentence: it calls `arch::acpi_power::s5_ring_flush`, **the symbol `poweroff()`'s first
+statement calls**, `#[inline(never)]` so it is one call site and not two inlined copies, and asserts
+the ring is empty when it returns.
+
+```
+ring filled to SLOTS x S5DRAIN_LINE_LEN = 64 x 67 B = 4 288 B
+acpi_power::s5_ring_flush()  ->  lines = 64, bytes = 4 288        (22x DRAIN_BYTE_BUDGET)
+a following drain            ->  residue = 0
+:: S5DRAIN: … -> PASS ::
+```
+
+`S5DRAIN_LINE_LEN = 18 + 48 + 1 = 67` B: `"[s5drain] fill NN "` is 18 bytes, `DRAINCAP_PAD` is 48, the
+newline is 1 — one byte narrower than `PWRDRAIN_LINE_LEN` only because the tag is one character
+shorter. Two `const _: () = assert!(…)` rows pin it: the line must not truncate against `SLOT_LEN`,
+and the filled ring must be more than eight budgets wide or capped and uncapped are
+indistinguishable. The `lines`/`bytes` comparisons are `>=` and `residue == 0` is strict, for
+PWRDRAIN's reason: foreign traffic on a live kernel can only ADD to what a full drain emits.
+
+**The go-red**, both at runtime, because `drain` and `drain_capped` share a signature and no type can
+separate them:
+
+* the realistic one — swap `s5_ring_flush`'s `power_drain(...)` for `drain_capped(...)`: the 192 B
+  budget stops it after 3 lines of 67 B (67, 134, 201; `drain_may_continue` is strictly `<`), the
+  fixture reads `lines=3 residue=61` and prints `-> FAIL`, which `FAULT_PATTERNS` turns into a
+  non-zero exit from `UNAOS_WC=1 ./arroyo test 90`;
+* the blunt one — delete the `power_drain(...)` call: `lines=0 bytes=0 residue=64`, same `-> FAIL`.
+
+**What it does not prove, stated rather than implied:** that `poweroff()`'s *first statement* is that
+call. Deleting the fold on the signature line and leaving `s5_ring_flush` intact leaves this fixture
+green. That is one line of reading, it is the same gap PWRDRAIN names for the SMC, and the regression
+that is actually plausible is someone changing the drain rather than deleting the call — which is the
+whole reason `s5_ring_flush` is a named symbol instead of an open-coded `power_drain`.
+
+## WITNESS-GATING — the three ring fixtures are instruments, and instruments cost UART
+
+Trunk queue §5 (2026-09-12, SERDRAIN). `draincap_selftest`, `backpressure_selftest` and
+`pwrdrain_selftest` each fill the live ring to `SLOTS` once per boot from `mirror_service`, and none
+of them was gated on anything. `mirror_service` runs on every image that reaches it, so a
+witness-FREE flight image — the polarity every media command ships (`docs/dev/LAWS.md` §5, orin 20) —
+paid for three instruments it carried no other witness for. SO30 is this same defect one layer up:
+one witness line spent ~36 % of a boot's whole UART budget.
+
+The cost, measured with `awk` over the x86 witness capture at 115200 8N1 = 11 520 B/s = 86.8 µs/B:
+
+| fixture | on the wire | bytes |
+| --- | --- | --- |
+| `draincap_selftest` | 64 x 68 B fill + 310 B verdict | 4 662 |
+| `backpressure_selftest` | 64 x 66 B fill + 68 B probe + 374 B verdict | 4 666 |
+| `pwrdrain_selftest` | 64 x 68 B fill + 46 B `ring drained` + 417 B verdict | 4 815 |
+| | **per boot** | **14 143 B = 1.228 s of wire** |
+
+(The fills alone are 12 928 B, which is the figure the queue row carries.)
+
+All three are now `#[cfg(feature = "witness")]`, on the function **and** on the `mirror_service` call
+site, the way every other fixture in this tree is gated — and so is everything that exists only to
+serve them (`DRAINCAP_PAD`, `DRAINCAP_LINE_B`, `DRAINCAP_BOUND_B`, `BPRESS_PROBE`, `draincap_wire`,
+the three one-shot `…_DONE` statics). `s5drain_selftest` was born gated.
+
+**What is NOT gated, and must not be.** The `const _: () = assert!(…)` truth tables —
+`drain_may_continue`'s five rows, `defer_policy`'s six, `PWRDRAIN_LINE_LEN`'s two and
+`S5DRAIN_LINE_LEN`'s two — stay in every build of both arches. They emit not one byte of code, they
+are the go-red that fires before anything boots, and a compile-time proof that only runs in the
+configuration nobody ships is the polarity trap `docs/dev/LAWS.md` §5 names. The transport itself is
+untouched: `power_drain`, `drain_capped`, `defer_contended` and the ring are not instruments, they
+are the wire.
+
+### Proven in the artifact, and the artifact is not the one the finding named
+
+`LC_ALL=C grep -a -o -F` on the built images, never on the diff. `ring drained` is the control — it
+is `power_drain`'s own witness, transport and not fixture, and it must SURVIVE the gating; a run
+where it went to zero as well would be a broken build, not a saving.
+
+| image (before → after) | `[draincap] fill` | `[bpress] fill` | `[pwrdrain] fill` | `ring drained` | `sink contended` |
+| --- | --- | --- | --- | --- | --- |
+| `esp-x86` (`ehcihid,kbdwit,sdhcblk,smolnet,sdwrite`) | 1 → **0** | 1 → **0** | 1 → **0** | 2 → 1 | 1 → 1 |
+| `kernel8` (`baremetal,skip_xhci`) | 1 → **0** | 1 → **0** | 1 → **0** | 2 → 1 | 1 → 1 |
+| `esp-jetson` (`…,tegra,bsptick,bsprun,tegrasmp,apsrun,…`) | **0 → 0** | **0 → 0** | **0 → 0** | 1 → 1 | **0 → 0** |
+
+`ring drained` goes 2 → 1 rather than 2 → 2 because one of the two hits was never the witness: it was
+the PWRDRAIN *verdict* string, which quotes the witness back at the reader. The surviving hit is
+`power_drain`'s own format string — the transport's, and the one that had to stay. `sink contended` is
+SERWIT-2's `[mirror]` announcement, law rather than knob, untouched on both images where
+`mirror_service` is reachable at all.
+
+**The saving that is real is the one on the WIRE: 14 143 B per boot, 1.228 s at 115200 8N1.** The
+image-size half is reported with a caveat, because on aarch64 the flat image is not a code-size
+measurement:
+
+| loadable image (`objcopy -O binary`, never the `.elf`) | before | after | delta |
+| --- | --- | --- | --- |
+| x86 default knob-off (`esp-x86`'s own knob line) | 1 571 164 | 1 529 300 | **−41 864** |
+| `kernel8.img` (Pi 4 bare-metal) | 1 448 252 | 1 315 080 | **−133 172** |
+| aarch64-`virt` knob-off | 1 483 102 | 1 595 624 | +112 522 |
+| `esp-jetson` | 1 572 056 | 1 692 504 | +120 448 |
+
+> ⚠ The two aarch64 rows GREW while the code shrank, and that is a LINK-LAYOUT artefact, not a
+> regression. The aarch64 flat image spans VMA 0 upward, so it contains `.rela.dyn` (≈115 kB) and
+> `.rodata` before `.text`, and `.text`'s start address is padded to a coarse boundary above them —
+> measured at `0x5c000` in one build of this pair and `0x64000` in the other, a 32 KiB jump for a
+> few-kB code delta. So an aarch64 flat size moves in quanta and cannot be read as bytes of code.
+> `kernel8.img` does not have that problem (fixed load address, no `.rela.dyn`) and is the aarch64
+> number to quote. This is the same trap `docs/dev/LAWS.md` §5 names one step further in: byte
+> identity is a yes/no question about the image, and a size DELTA is a different question that the
+> same artifact cannot always answer.
+
+> ⚠ **The `esp-jetson` row is a finding, not a pass.** The queue row expected `> 0` there and
+> measured `0` — on the tree *before* this gating. The three fixtures never reached the Jetson image
+> at all, and neither does SERWIT-2's `[mirror]` announcement or its one-shot verdict: on aarch64 the
+> only non-`baremetal` `mirror_service` call site is the shared BSP main loop (`main.rs:1779`), and
+> the Jetson's `bsprun` scheduler handoff (`sched::run_bsp(0)`, `main.rs:1494`) diverges before that
+> loop is ever entered, so the whole chain is eliminated. The evidence is two-sided: none of
+> `[draincap] fill`, `[bpress] fill`, `[pwrdrain] fill`, `bounded by BYTES`, `BACK-PRESSURES`,
+> `drains the WHOLE ring` or `sink contended` appears in `target/aarch64_esp/kernel.elf`, while the
+> controls `ring drained`, `staging ring full` and `:: ` (499 hits) do; and the symbol table carries
+> the `DRAINCAP_DONE` / `PWRDRAIN_DONE` / `BACKPRESSURE_DONE` / `MIRROR_VERDICT_DONE` `.bss` statics
+> with **no function symbol** for `mirror_service`, any `…_selftest`, or `mirror_verdict_once`. That
+> is `LEDGER.md` SO41 and it is a reachability defect in `main.rs`, which this arc's brief does not
+> name — reported, not made.
+
+So the saving is real on every image that can reach `mirror_service` and has no witness to spend on
+it — `esp-x86` and `kernel8` measured above, and `esp-arm` / `vm-image` by the same construction —
+and on the Jetson the honest statement is that there was nothing to save because there was nothing
+running.
+
 ## aarch64
 
 The PL011/Tegra path did **not** share the drop defect: its `_print` used a blocking `SERIAL_PORT.lock()`,

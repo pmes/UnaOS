@@ -6884,6 +6884,127 @@ evidence: the tegra `sdmmc_arm` binary contains **zero** `ORIN-SDMMC-3` / `mb: C
 multi-block SD path is part of the attended Orin sitting (QEMU models no Tegra234 SDMMC). Landing:
 `review/unaos-orin-sdmmc3-LANDING.md`.
 
+#### ORIN-SDMMC-4 / SDARG — the card ARGUMENT is built checked, and a sector the card cannot express is REFUSED (ledger A57)
+
+**The defect.** Every data command in `sdmmc_tegra.rs` — CMD17, CMD18, CMD24, CMD25 — carries one 32-bit
+argument whose UNITS depend on the card: sectors on a block-addressed (SDHC/SDXC) card, **bytes** on a
+byte-addressed (SDSC) one. **Six** sites built it. Four built it as `(lba * 512) as u32`, which does not fail
+when the byte offset leaves 32 bits — it **wraps**. LBA 8,388,608 is exactly 4 GiB; times 512 that is 2^32,
+and `as u32` makes it **0**. The controller is then handed sector 0: a read returns the boot sector as if it
+were the sector asked for, and a write overwrites the boot sector, with no error at any layer. The sites were
+`read_block_at` (CMD17, `sdmmc_arm`), `write_block_at` (CMD24, `sdmmc_arm`), `read_blocks_at` (CMD18,
+`install_target`) and `write_blocks_at` (CMD25, `install_target`). The other two — `read_block_ro` (the unarmed
+CMD17 the block layer consumes) and `write_block_probe` (CMD24, the `sdmmcwrite` gap-#3 probe at the file
+tail) — already did it **checked**: the correct shape was present in the same file, twice, and had simply not
+been propagated. Two identical correct copies is the same defect one step earlier, since a seventh caller
+would have had three shapes to copy from.
+
+**The fix.** One definition: `sd_block_arg(block_addressing, lba) -> Option<u32>`, at FILE scope beside the
+CSD decode and for the same reason (`mod metal` is `tegra`-gated; this is not, so QEMU can execute it). It is
+`read_block_ro`'s expression verbatim — `lba > u32::MAX` refuses the block-addressed arm, `lba.checked_mul(512)`
+with a `<= u32::MAX` bound refuses the byte-addressed one — and **all six** sites now call it (the probe's
+own refusal string is unchanged, so its wire shape does not move). **A refusal is
+never silent:** each site prints its own `REFUSED — not addressable on this card (A57)` line naming the
+command and the LBA, so an operator sees a stop rather than wrong data. The counted forms (CMD18/CMD25)
+address the FIRST sector of the run, so a refusal at the head refuses the whole run.
+
+**The fixture, and why it runs on `virt`.** `sd_block_arg_selftest` (`witness`-gated, `:: SDARG: … ::`, one
+uncounted line, no MMIO / allocation / card) is the sibling of `csd_capacity_selftest` and runs from the same
+two places: the `not(tegra)` census witness (QEMU virt) and the metal census, so an armed metal boot certifies
+its addressing arithmetic **before** the first CMD17 rather than after a wrong sector comes back. Two positive
+vectors are each the LAST value their arm can express (`byte-last` LBA 8,388,607 ⇒ `0xffff_fe00`; `blk-last`
+LBA 4,294,967,295 ⇒ `0xffff_ffff`), because an off-by-one at the ceiling is precisely this defect class. Four
+negative controls carry the fixture: 4 GiB byte-addressed, one past it, a `u64` that overflows the multiply
+outright, and 2^32 block-addressed — without them a builder that returned a number for every input would pass.
+The wrap is **shown**, not merely refused: `wrapto=0x00000000` is what the old expression would have handed
+the controller for the 4 GiB case, computed in the fixture with an explicit `wrapping_mul`, so the number on
+the wire is the defect itself rather than a claim about it. Wire shape:
+
+```
+:: SDARG: byte-last=0xfffffe00 blk-last=0xffffffff refused=4/4 wrapto=0x00000000 -> PASS ::
+```
+
+**Scope, said plainly.** QEMU models no Tegra234 SDHCI, so nothing else in this file is runtime-testable off
+metal; the ARGUMENT MATH is, and that is the whole of what `UNAOS_SDMMC=1 UNAOS_GICV3=1 ./arroyo test-arm`
+proves here. Go-red is by mutation of the production builder (restore the wrapping expression → `refused`
+drops → `-> FAIL`, which mbench's `DEFAULT_FORBIDS` reds). No flown boot has executed the wrapping branch —
+the bench's SS32G is SDHC and the SD02G is 2 GB, both under the ceiling — so this is a code-read fix and the
+row is ticked as such, never as flown.
+
+#### ORIN-SDMMC-5 / SDWRITE — the block layer ADMITS an ordinary write to the card (`sdwrite`, DEFAULT ON; ledger A60)
+
+**What was there before, and why it was not a stub.** `drivers/block.rs::write_block_tegra_sd` returned
+`BlockError::NotReady` **unconditionally, in every cfg**, with a one-shot witness naming the reason: the card's
+only writer was the `sdmmc_arm` paranoia ladder (ORIN-SDMMC-2) and the `install_target` flow above it, each of
+which stashes, writes, verifies and restores under its own gates, and publishing the card as a readable block
+backend must not become a fourth door past them. That refusal was correct for what it guarded. What it also
+did was make a writable `/` on a slot-booted Orin impossible — R51's "home folder" and LOGIN M2 both need one.
+
+**Where the veto actually lived, which is the finding ledger A60 was opened for.** `fs/fat.rs`'s
+`BlockSource::TegraSd` write-veto arm and `fs/bootdisk.rs`'s `rw=` witness both *reported* that refusal; neither
+was it. Lifting the `fat.rs` arm alone — the shape the first SDWRITE brief asked for — would have printed
+`[vfs] root mount / = native unafs volume source=tegra-sd rw=yes` over a path that could not write one byte,
+and broken `write_veto`'s own stated contract ("a `None` cannot admit a write the block layer would refuse").
+The chain, entry point to medium: `fs/vfs.rs` `NativeBackend` → `fs::unafs::with_unafs` → `UnaFS` →
+`BlockAdapter` → `SdSectorDevice::write_sector` → `unafs::handle_write` → `block::write_block_tegra_sd`.
+
+**The lift.** One feature, `sdwrite`, **DEFAULT ON** (`unaos/arroyo` composes it; `UNAOS_NOSDWRITE=1` removes
+it), and five sites, each the same answer forwarded rather than restated:
+
+| site | knob ON | knob OFF |
+| --- | --- | --- |
+| `block::write_block_tegra_sd` / `write_blocks_tegra_sd` | route to `tegra_sd_write_through` / `…_blocks_through` | the pre-A60 refusal, verbatim |
+| `block::register_tegra_sd` publish line | `… sectors (read-write — the block layer admits ordinary writes; SDWRITE)` | `… sectors (read-only)` |
+| `fat::BlockSource::TegraSd::write_veto` | forwards `block::tegra_sd_writes_admitted()` | `Some(TEGRA_SD_VETO)` |
+| `vfs::NativeBackend::write_veto` | forwards `block::native_mount_write_veto()` | `None` |
+| `bootdisk::bind_root` native arm | `native_root_mount` samples the BACKEND it mounts | samples `BlockSource::write_veto()` |
+
+**The primitive.** `metal::tegra_sd_write_block_512` → `write_block_rw`, the **unarmed twin of
+`read_block_ro`**: polled single-block CMD24, host→card, the same bounded waits and W1C discipline as the read,
+plus the DAT0 busy wait a read does not need (the card holds DAT0 low while it programs, and a read-back that
+raced it would return the OLD block). It is appended at the END of `mod metal` and exported on the
+line-neutral `:360` line, so no `core::panic::Location` in the file moves. It is deliberately **not**
+`write_block_at` un-gated: that function lives inside the `sdmmc_arm` region and editing the armed ladder for
+an unarmed consumer is what that section's law forbids. The duplication is the price of leaving the ladder
+alone, and it is named rather than hidden — as the read side already says for `read_block_ro`. Both go through
+`sd_block_arg` (ORIN-SDMMC-4), so a sector the card cannot express is refused, never wrapped.
+
+**What this does NOT open.** The ladder and the installer keep their gates and their scratch-and-restore
+discipline; this path writes only the sector a **filesystem** named, which is the layer that decided,
+journaled and authorized it. Nothing about the Pi's FRGUARD `default_writable` posture changes, and `sdwrite`
+is not in `kernel8()`'s `K8_FEATS`.
+
+**Testable without the controller, and only that far.** No QEMU machine models the Tegra234 SDHCI, so neither
+the CMD24 nor the card is reachable off metal — but the REPORT is, and the report is what A60 was about. Leg 8
+(`fs::bootdisk::sdwrite_posture_selftest`, `witness` + `sdwrite`) runs on `virt` and on x86 and asserts three
+things: the `rw=` mapping driven both ways, that the FAT-layer veto and the block-layer posture agree for
+**every** source in `fat::ALL_SOURCES`, and — on a build that has the card handle — that the `TegraSd` arm
+matches `cfg!(feature = "sdwrite")` in both directions. Wire shape:
+
+```
+:: SDWRITE-POSTURE: posture=on map=yes/no sources global=rw usb=rw usb1=rw usb2=rw usb3=rw card=absent (no QEMU machine models Tegra SDHCI — this leg tests the REPORT, never the medium) :: PASS ::
+```
+
+**The metal fixture** (`UNAOS_SDWRITE=1` → the `sdwritefx` feature, DEFAULT OFF, a separate feature because
+`sdwrite` itself is default-on and a knob that armed it would arm nothing). On the root `fs::bootdisk::bind`
+has just bound it creates `/SDWRITE.TXT`, writes one 512-byte stamped block, reads it back, deletes it, and
+confirms it no longer resolves:
+
+```
+:: SDWRITE: root=tegra-sd wrote=1 readback=match deleted=1 -> PASS ::
+```
+
+A failure names the step (`step=create|write|readback|delete|veto`). **Card safety:** the fixture names exactly
+one path and never touches `/boot`, `/apps` or any other file; it addresses no LBA itself. The only other bytes
+that change on the medium are the filesystem metadata a create-plus-delete of one file necessarily rewrites.
+Any write outside that is a defect in this code, not a fact about the card.
+
+**Byte identity.** Every edit outside the two tail sections is line-for-line in place, so the knob-off images
+do not move: `./arroyo knoboff sdwrite <baseline>` is the measurement, and the OFF polarity is type-checked by
+every pre-existing `arm-tegra-*` leg while the SHIPPED (ON) polarity is type-checked by
+`arm-tegra-sdwrite` (witness-free, the `esp-jetson` set), `arm-tegra-sdwritefx` and `arm-virt-sdwrite`.
+
+
 ## AARCH64-VNET — virtio-net-mmio driver + smoltcp bind on QEMU `virt` (`UNAOS_VNET`, knob-gated)
 
 **Purpose: a pre-metal, QEMU-testable proof of the aarch64 smoltcp seam that ORIN-NET-4 built.** NET-4's

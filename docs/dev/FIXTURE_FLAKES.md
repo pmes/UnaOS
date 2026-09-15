@@ -326,6 +326,35 @@ sibling QEMU count at the time; whether an idle-host re-run is clean; and
 `max_ms` is an outlier, the starvation reading is confirmed without a new
 experiment.
 
+**Seen, second time:** 2026-09-12, LOGIN M4 re-gate (orin-0912b), 1 of 3
+`UNAOS_WC=1` runs, host load 2.41 with 2 sibling QEMUs on 20 cores and six
+executors building. The failing verdict:
+
+```
+[dmgovlp] verdict passes=12/12 drained=12/12 cur=12/12 drag_evt=0 drag_px=0 adopt=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+```
+
+**This sighting confirms the starvation reading on the terms §1c set.** The
+two green re-runs on the same tree carry `drag_evt=5 drag_px=38590 adopt=25
+max_ms=3`; the failing run carries `drag_evt=0 drag_px=0 adopt=0 max_ms=0`.
+`max_ms` is the outlier §1c asked for — and `drag_evt=0` says more than
+starvation of the stretch windows alone: the synthetic drag got **no pass at
+all**, so nothing could have adopted. Every other counter is green because
+those tallies do not depend on a pass landing inside a window. An idle-host
+re-run was clean twice.
+
+A third sighting the same day, same cause, different arc: SDWRITE2's gate 4
+(`UNAOS_QEMU_FULL=1 UNAOS_WC=1 ./arroyo test`) reported the same
+`adopt_stretch=0/4 max_ms=0` line on its first attempt and `adopt_stretch=4/4
+max_ms=2` when re-run alone. Six executors were on the box.
+
+**Still WATCH, and now with a shape worth fixing:** a fixture whose verdict
+cannot distinguish "the stimulus never ran" from "the stimulus ran and the
+assert failed" will keep costing a re-run to read. The cheap fix is for the
+drag leg to REFUSE (a distinct verdict word, not FAIL) when `drag_evt=0` —
+it did not measure what it claims to measure. Owner: the next x86 compositor
+arc.
+
 **Disposition — WATCH.** Do not clear a gate on this line without an
 idle-host re-run (both benches' standing rule: no single-run red convicts),
 and do not let a clean re-run bury the sighting — bank it here.

@@ -686,6 +686,29 @@ btdir = ["btc"]
 # DEFAULT OFF => `fs/holocron.rs`, `drivers/ehci/btbond.rs` and every call site vanish, and both
 # arches are byte-identical to a build without the knob. Kept in sync with arroyo.
 holocron = []
+# LOGIN (RULINGS R51, 2026-09-12: "keep working on multi-user so i can login, get a home folder and all").
+# UNAOS_LOGIN=1 arms the human-user line: `fs/users.rs` (the `USERS.DAT` record store at the root of
+# the root volume — name, salted SHA-256 credential, home path — and the `login`/`logout` session),
+# the SESSION PRINCIPAL in both `arch/*/syscall.rs` (a program launched while a session is open is
+# stamped `user:<name>` — the SAME per-slot principal the loader stamps and the SAME SYS_OPEN
+# owner/grants check enforces; no parallel identity), the `login`/`logout` shell arms, and the M1
+# fixture (`:: LOGIN: users+session … -> PASS ::`) on the storage-ready passes. Arch-neutral seam:
+# NOT stripped by `arm_features`, for the reason `holocron` is not (real aarch64 code; stripping
+# would disarm the knob, not preserve identity). DEFAULT OFF => `fs/users.rs` is not compiled, every
+# call site is a `#[cfg]`-erased statement folded onto an existing line (LINE-NEUTRAL, panic
+# `Location` untouched), and both arches are byte-identical (`./arroyo knoboff login`). Kept in sync
+# with arroyo and builder/src/main.rs. Forwards `midden_core/login` so the two host-verb rows exist
+# only knob-on (M2: the rows were the whole knob-off movement, 64 B arm / 128 B x86).
+login = ["midden_core/login"]
+# LOGIN SELFTESTS: UNAOS_LOGINST=1 arms the LOGIN fixtures — the M1 users+session proof (which CREATES a
+# user `una` with a KNOWN password in `USERS.DAT`, a BOOT-TIME WRITE of the boot medium), the M2 home
+# proof (`HOME/UNA` + a private file created and deleted) and the M3 screen proof (the login screen driven
+# by keys). Its own knob and NOT part of `login`, by the rule that gives `hcronst` a knob apart from
+# `holocron` and `prtscrst` its own: a boot that did not ask to WRITE its boot medium must be incapable
+# of doing so, and a shipping `login` boot must never carry a fixture credential (a known password on
+# the card IS a plaintext credential on disk). Implies `login`. DEFAULT OFF => the fixtures and their
+# call sites vanish.
+loginst = ["login"]
 # BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
 # `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
 # `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates
@@ -1139,6 +1162,38 @@ install_target = ["sdmmc_arm"]
 # the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
 sdmmcwrite = ["sdmmc"]
 
+# SDWRITE (A60, 2026-09-12): LIFT THE TegraSd WRITE VETO — the block layer admits an ORDINARY file
+# mutation to the Orin microSD, so a slot-booted Orin can have a writable `/` (R51 "home folder",
+# LOGIN M2). DEFAULT ON — `unaos/arroyo` composes it into every build and `UNAOS_NOSDWRITE=1` takes it
+# back out — because the shipped configuration is the one that has to be right, and a writable root
+# that only exists behind a knob is a root nobody boots. What it turns on: `drivers/block.rs`'s
+# `write_block_tegra_sd` / `write_blocks_tegra_sd` route to the driver's UNARMED CMD24 primitive
+# (`sdmmc_tegra::tegra_sd_write_block_512`, the twin of `read_block_ro`, appended at the end of
+# `mod metal`) instead of refusing; `register_tegra_sd`'s publish line says `read-write`;
+# `fs/fat.rs`'s `BlockSource::TegraSd` veto forwards `block::tegra_sd_writes_admitted()` instead of a
+# flat refusal; `fs/vfs.rs`'s `NativeBackend::write_veto` FORWARDS `block::native_mount_write_veto()`
+# instead of asserting `None`; and `fs/bootdisk.rs`'s native root samples the BACKEND it mounts for
+# `rw=`. It does NOT touch the armed `sdmmc_arm` ladder, the `install_target` flow, the Pi's FRGUARD
+# `default_writable` posture, or any x86 arm. Knob OFF => every one of those sites is the pre-A60
+# source verbatim, every edit above them is line-for-line in place, and the knob-off images are
+# byte-identical (`./arroyo knoboff sdwrite <baseline>`). The OFF polarity is type-checked by every
+# pre-existing `arm-tegra-*` leg; the SHIPPED (ON) polarity by `arm-tegra-sdwrite` and
+# `arm-tegra-sdwritefx` of KERNEL_CFG_MATRIX. Witness families: `:: TEGRA-SD: WRITE admitted` and
+# `:: SDWRITE-POSTURE:` (leg 8, `witness`). Kept in sync with arroyo.
+sdwrite = []
+# SDWRITE FIXTURE (`UNAOS_SDWRITE=1`): the METAL proof, and it is a separate feature from the veto
+# lift on purpose — `sdwrite` is DEFAULT ON, so a knob that armed it would arm nothing and the
+# artifact census "`:: SDWRITE:` present with the knob, absent without it" could not be run. At boot,
+# on the root `fs::bootdisk::bind` just bound, it creates `/SDWRITE.TXT`, writes one 512-byte stamped
+# block, reads it back, deletes it, and prints
+# `:: SDWRITE: root=<source> wrote=1 readback=match deleted=1 -> PASS ::` (a FAIL names the step).
+# It writes exactly that ONE path and nothing else. Implies `sdwrite` (there is no point proving a
+# write the build refuses) and `sdmmc` (without the card's block backend the fixture would prove the
+# write on some other volume and say PASS, which is the trap this implication closes). DEFAULT OFF =>
+# the call site and the function do not exist. NOT witness-gated: it is an explicitly armed
+# experiment, so it speaks on the boot that armed it. Kept in sync with arroyo.
+sdwritefx = ["sdwrite", "sdmmc"]
+
 # SDHC-4a (x86): the `UNAOS_SDW=1` write ARM for the 2012 rMBP's BUILT-IN PCIe SD reader
 # (drivers/sdhc.rs). Milestones 1-3 wrote only the CONTROLLER — the card was untouched end to end and
 # `arch/x86_64/pci.rs` calls the probe "the read-only SDHC census". This arm compiles in ONE primitive,
@@ -1271,6 +1326,27 @@ bcmaS1 = ["bcmarecon"]
 # vanish and the smoltcp dep is not pulled, byte-identical to baseline. Run with
 # `UNAOS_VNET=1 UNAOS_GICV3=1 ./arroyo test-arm`. See arch_arm64.md §AARCH64-VNET.
 vnet = ["dep:smoltcp"]
+
+# NET6 (ROADMAP §1b SOCK-7): the SHARED aarch64 socket surface over whichever NIC is up — one
+# persistent smoltcp `Interface` + `SocketSet`, the shell verbs `ping`/`arp`/`dns`, and the EL0 socket
+# syscall family (`SYS_SOCKET` 40 .. `SYS_SOCK_RECV` 46) on aarch64. ONE OS: the surface is written
+# once (the tail module of `net_phy.rs`) and every arch-specific byte is the DEVICE ADAPTER — a driver
+# registers a `net6::NicOps` and is done. `virtio_net.rs` registers it on QEMU `virt` (where the whole
+# thing is RUNTIME-proven, `./arroyo test-arm`) and `rtl8168_tegra.rs` on Orin metal.
+#
+# It is NOT `smolnet` widened: `smolnet` is the x86 DEFAULT stack, so new lines in it would move the
+# shipped x86 image's `panic::Location`s, and `arm_features()` strips `smolnet` from every aarch64
+# cargo invocation to hold the aarch64 media byte-identity contract. `net6` is the aarch64 name, and
+# it is DEFAULT OFF — every item is `all(feature = "net6", target_arch = "aarch64")` and every one of
+# them is at a file TAIL or folded onto an existing line, so knob-off both arches are byte-identical.
+#
+# Armed BY the NIC knobs (`arroyo`: UNAOS_NET4 / UNAOS_NET5 / UNAOS_VNET each append `net6`), so a
+# board that has a NIC gets the surface over it; `UNAOS_NET6=1` also arms it standalone — without an
+# adapter no driver ever registers
+# and every entry point reports "no NIC adapter registered" honestly rather than faulting. Pulls the
+# smoltcp dep (the same optional dep net4/vnet/genet use). The ARMED polarity is type-checked by the
+# `arm-virt-net6` and `arm-tegra-net6` legs of KERNEL_CFG_MATRIX, never by the knob map in `arroyo`.
+net6 = ["dep:smoltcp"]
 
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
@@ -2232,6 +2308,103 @@ ga10bprobe4c = ["ga10bprobe4b"]
 # OFF; the power.rs call is appended to an existing line (knob-off byte-identical). ARMED polarity
 # type-checked by the `arm-tegra-ga10bprobe4d` leg. Witness family: `[ga10bprobe4d]`.
 ga10bprobe4d = ["ga10bprobe4c"]
+
+# GA10B-PROBE4E (`UNAOS_GA10B_PROBE4=5`): RUNG 4e — the SHIFT arm. IMPLIES `ga10bprobe4b`, and is
+# otherwise the flown `=2` rung unchanged: same six BCR DMA address registers, same `bcr_dmacfg`, same
+# `bcr_ctrl` = 0x111, same ignition, same bounded poll, same SYSTEM_OFF on every path. The ONE delta is
+# the ENCODING of the six addresses: they are written `pa >> 8` (lo = the low 32 bits of `pa >> 8`, hi =
+# the rest) instead of raw. NVIDIA's published MIT Hopper GSP-FMC bootstrap writes them that way — the
+# register holds the physical address in 256-byte units — so if GA10B's boot ROM shares the encoding, the
+# flown ignitions pointed it about 512 GiB above DRAM and never reached the signature wall (rung-5 brief
+# §1.2, §2.3 cause 5, §2.6; rung-4 brief §12). Adds ZERO write classes and ZERO registers. Every address
+# announce carries BOTH the raw physical address and the shifted value written; the 4a and 4b verdict
+# lines carry `shift=8` so a capture says which arm flew. Default OFF; every site is folded onto an
+# existing line or lives in the file's LAST block, so `=1`/`=2`/`=3`/`=4` images do not move. ARMED
+# polarity compiled by the `UNAOS_GA10B_PROBE4=5 ./arroyo esp-jetson` build of the DONE gate. Witness
+# family: `[ga10bprobe4e]`.
+ga10bprobe4e = ["ga10bprobe4b"]
+
+# GA10B-PROBE4F (`UNAOS_GA10B_PROBE4=6`): RUNG 4f — the BRFETCH arm. IMPLIES `ga10bprobe4b`, and is the
+# flown `=2` rung unchanged but for ONE VALUE: `bcr_ctrl` is written 0x011 instead of 0x111. The MIT
+# GA102 `dev_riscv_pri.h` decomposes that register exactly — BRFETCH bit 8, CORE_SELECT bit 4, VALID
+# bit 0 — so 0x111 is BRFETCH TRUE + RISCV + VALID and 0x011 is the ACKED SEQ's alternate `set_bcr`
+# value, BRFETCH FALSE, a door named in the rung-5 brief §2.2 and taken by nobody (§6 Q5). Same
+# register, same address class, no new write: only the bit pattern differs. The 4a and 4b verdict lines
+# carry `brfetch=false`. Default OFF, same line-neutral discipline as 4e. ARMED polarity compiled by the
+# `UNAOS_GA10B_PROBE4=6 ./arroyo esp-jetson` build of the DONE gate. Witness family: `[ga10bprobe4f]`.
+ga10bprobe4f = ["ga10bprobe4b"]
+# GA10B-PROBE5 (`UNAOS_GA10B_PROBE5=<any non-empty>`): the FIRMWARE LOADER for rung 5a of the GA10B ladder —
+# `arch/aarch64/ga10b_fw.rs`. Design: docs/dev/OS/08_VIDEO/GA10B-RUNG5-BRIEF.md §5 (P6/P7/P8, §5.2.1,
+# §5.6, §5.7); ledger A63. Reads NVIDIA's `acr-gsp` triple as THREE ORDINARY FILES from the boot volume's
+# `GA10B/` directory through the VFS (`MountTable::stat`/`read` over `fs::fat`, VFAT long names, PI-FS-3),
+# verifies each file's size and sha256 against compiled-in constants (A61: digests are facts, not the
+# blob — no vendor byte is in the tree, R52), and places the three sections 256-byte-aligned in a window
+# the CALLER hands it (text at +0, data next, manifest next), digesting what LANDED. ZERO MMIO by
+# construction — the module has no register, no BAR0 pointer, no write primitive — so every refusal
+# (`-> REFUSED reason=<absent|size|digest|window> name=<f>`) is a zero-MMIO refusal. Implies NOTHING (not
+# `tegra`): the loader is arch-neutral data handling, and the QEMU-virt fixture (`UNAOS_GA10B_PROBE5=1
+# ./arroyo test-arm`, `witness` on) runs it from `kernel_main`'s storage-ready loop against a FAT image
+# arroyo builds with three SYNTHETIC files of the vendor's names and sizes (`GA10B/`, must LOAD) and a
+# one-byte-flipped twin (`GA10BBAD/`, must REFUSE reason=digest) — the go-red proof from a file, every
+# run. Default OFF => module + the two folded call sites vanish, knob-off images byte-identical. ARMED
+# polarities type-checked by the `arm-ga10bprobe5` (virt, witness) and `arm-tegra-ga10bprobe5a` legs of
+# KERNEL_CFG_MATRIX. Witness family: `[ga10bfw]`.
+ga10bprobe5 = []
+
+# GA10B-PROBE5A (`UNAOS_GA10B_PROBE5=1`, on a tegra build): RUNG 5a — the VENDOR IGNITION.
+# `arch/aarch64/ga10b_ignite.rs::ga10bprobe5_run`, one folded call on the ORIN-SELFUP line of
+# `tegra_early_stop` (AFTER the SD census AND the JB2b USB window: the loader reads `/boot/GA10B/` through the
+# VFS, and `/boot` binds over the disk this kernel was found on — slot card or reader card — only once both
+# are published; rung 4's post-heap-init line has no block backend at all). IMPLIES `ga10bprobe5` (the
+# loader) and `ga10bprobe4a` (rung 4a's helpers, constants, the seated 2 MiB Normal-NC window and rung 4a
+# itself, which runs first at post-heap-init and RETURNS — P5 "rung 4a re-run to BCR-ALLHELD this boot" is
+# then re-proven a second time INSIDE this rung, in its own family, before the lock). The rung: zero-MMIO
+# phase (window, pattern fill, the three reads, sizes, digests, placements — any refusal RETURNS with zero
+# MMIO and the boot continues), then rung 4a's bracket and BCR census re-proven, then rung 4b's SEVEN
+# writes with ONLY THE PAYLOAD changed (brief §5.2: BCR addresses at the three placements, `bcr_dmacfg` =
+# noncoherent|lock — SPENDS THE POWER CYCLE — `bcr_ctrl` = 0x111, `priscv_cpuctl` = startcpu), the
+# bounded `br_retcode` poll, then rung 4c's read-only oracles (the br_retcode series, priv-lockdown, the
+# v1 mirror, POSTBCR, MAPDIFF over the 30-register census, the DMA window re-digested and first-words-
+# sampled per section, MAILBOX0 read back with its meaning decided in code), the verdict (`ACR-ACCEPTED` |
+# `BROM-VERDICT-FAIL code=` | `BROM-VERDICT-PASS-UNWITNESSED code=` | `BROM-NOVERDICT` | `REFUSED
+# reason=`), and SYSTEM_OFF on every path past the lock. Address encoding: RAW (the flown 4b form) unless
+# `ga10bprobe5e` is also on. Its own write helper (`ignite5_w32`) is compiled by this feature alone; no
+# other configuration compiles it. Default OFF. ARMED polarity type-checked by the `arm-tegra-ga10bprobe5a`
+# leg. Witness family: `[ga10bprobe5a]`.
+ga10bprobe5a = ["ga10bprobe5", "ga10bprobe4a"]
+
+# GA10B-PROBE5E (`UNAOS_GA10B_PROBE5=5`): rung 5a with the SIX BCR DMA addresses written `pa >> 8`
+# (256-byte units, the encoding NVIDIA's published MIT Hopper GSP-FMC bootstrap uses — rung-5 brief §1.2),
+# the value rung 4e (`UNAOS_GA10B_PROBE4=5`, A62) flies to settle. IMPLIES `ga10bprobe5a`; changes ONE
+# constant (`ADDR_SHIFT` 0 -> 8) and tags every address announce and the verdict line `shift=8`. Both
+# forms exist so 5a can fly whichever 4e proved; when 4e's verdict is on the wire the unproven form is
+# retired. Default OFF. ARMED polarity type-checked by the `arm-tegra-ga10bprobe5e` leg. Witness family:
+# `[ga10bprobe5a]` (a tag, not a new family).
+ga10bprobe5e = ["ga10bprobe5a"]
+
+# GA10B-PROBE5B (`UNAOS_GA10B_PROBE5=2`, `=7` with the shift): RUNG 5b — the ACR->PMU handshake, READ-ONLY
+# oracles first (docs/dev/OS/08_VIDEO/GA10B-RUNG6-BRIEF.md §3; ledger A65). Runs ONLY after rung 5a's
+# `ACR-ACCEPTED`: samples the GSP mailboxes (the FMC's status/error channel), the PMU falcon (v1 base
+# 0x10a000, PUBLIC-RECALLED from the MIT `dev_pwr_pri.h`, NOT in the ACKED facts file — every read announced,
+# every value printed raw) and the PMU falcon2 cpuctl rung 3 already read on this die, over a bounded
+# series, and prints `PMU-RUNNING | PMU-HALTED | PMU-UNREADABLE | PMU-NOT-ATTEMPTED reason=`. Adds ZERO
+# write classes. IMPLIES `ga10bprobe5a`. Default OFF. ARMED polarity type-checked by the
+# `arm-tegra-ga10bprobe5b` leg. Witness family: `[ga10bprobe5b]`.
+ga10bprobe5b = ["ga10bprobe5a"]
+
+# GA10B-PROBE5D (`UNAOS_GA10B_PROBE5=<n>d` — `1d`, `5d`, `2d`, `7d`): the DEFERRED arm of rung 5a, rung 4d's
+# shape (Peter 2026-09-12: the desktop first, the GPU probe LAST). IMPLIES `ga10bprobe5a`. Phase 0 (the
+# loader) still runs at BOOT — the files are in the window and digest-verified before the desktop, and a
+# refusal there arms nothing — then `ga10bprobe5_run` stashes the placements + the DTB coordinates and
+# checksum and RETURNS; `ga10b_ignite::ga10bprobe5_deferred_run()` (no arguments) on a PSCI SYSTEM_OFF
+# request consumes the arm, masks DAIF, re-verifies the DTB checksum AND re-digests the three placed
+# sections in the window (no VFS read on the shutdown path), re-derives the BPMP channel and runs the
+# ignition exactly as at boot, ending in its SYSTEM_OFF; a refusal prints why and falls through to the OFF
+# it interrupted. THE HOOK in `power::psci_call` (the one-statement append beside the `ga10bprobe4d` call)
+# is OUTSIDE this arc's file list and is reported, not made; until it is folded a `d` build arms, says so,
+# and the boot ends in a plain SYSTEM_OFF. Default OFF. ARMED polarity type-checked by the
+# `arm-tegra-ga10bprobe5d` leg. Witness family: `[ga10bprobe5d]`.
+ga10bprobe5d = ["ga10bprobe5a"]
 
 # ORIN-SELFUP (`UNAOS_SELFUP=1`): the SELF-UPDATE core — the OS writes its own boot files. Gates
 # `arch/aarch64/selfup_tegra.rs` (staged whole-ESP payload UPDATE.PAK/UPDATE.SHA -> whole-payload +

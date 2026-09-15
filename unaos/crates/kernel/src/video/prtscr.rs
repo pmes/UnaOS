@@ -81,8 +81,8 @@
 //! Which rung won, and WHICH DISK it landed on, is on the wire: `:: PRTSCR-VOL: … -> MOUNTED ::`
 //! per mount, `:: PRTSCR-VOL: rung=none rung1=… rung2=… -> NO TARGET ::` when both decline, and
 //! `source=`/`serial=` on every verdict that follows. See the PRTSCR-VOL block at this file's TAIL
-//! for why the pair (handle, `BS_VolID`) and not the handle alone: `USB_BLOCK_DEVICE` is ONE slot
-//! that every stick arrival overwrites, so `usb` names a socket, not a disk.
+//! for why the pair (handle, `BS_VolID`) and not the handle alone: since USBREG the `usb` handle is
+//! REGISTRY ENTRY 0 (`USB_DISKS[0]`) — a socket a retraction empties and the next arrival refills.
 //!
 //! ## One capture at a time, and the wire names every state (PRTSCR2)
 //!
@@ -168,7 +168,7 @@
 //!
 //! **What happened before this section existed** (the honest one-sentence answer, and it is not "it
 //! faults"): nothing dangled and nothing paniced — `drivers/block.rs`'s USB-UNPLUG retraction clears
-//! `USB_BLOCK_DEVICE`, every block entry point re-reads the registry through `info()` / `usb_info()`
+//! its USBREG entry, every block entry point re-reads the registry through `info()` / `usb_info()`
 //! on EVERY call and geometry-bounds the LBA against that fresh snapshot, so the next `write_grow`
 //! failed honestly with `BlockError::NotReady` and PRTSCR reported it as the GENERIC
 //! `Refusal::Fat("write", …)` line, which names a FAT errno and never names the disconnection.
@@ -176,7 +176,7 @@
 //! Two things were wrong with that. The refusal was unreadable — an operator who pulled a stick got
 //! a `write failed -EIO` and had to infer the cause — and, worse, the honest failure is only
 //! guaranteed while the handle stays EMPTY. A retract followed by a replug (or a different stick on
-//! a recycled xHCI slot) refills `USB_BLOCK_DEVICE` with a DIFFERENT disk, and the by-value `FatFs`
+//! a recycled xHCI slot) refills that USBREG entry with a DIFFERENT disk, and the by-value `FatFs`
 //! this job parked between slices still holds the old volume's LBAs. The next `write_grow` would
 //! then be geometry-bounds-checked against the new disk and pass — a write through a stale handle,
 //! onto a stranger's filesystem. That is the case slicing creates and the one this refuses.
@@ -1165,9 +1165,9 @@ pub fn selftest_once() {
 //
 // **The gap this closes.** `mount_capture_target` above picks the capture target by two rungs, and
 // until this block the wire never said which one won or what it landed on. That is fatal to the one
-// experiment the ladder exists for: `drivers/block.rs`'s `USB_BLOCK_DEVICE` is ONE
-// `Option<BlockDeviceInfo>` that every `publish_usb_geometry` OVERWRITES, so with two USB disks
-// attached rung 2 mounts whichever enumerated LAST — and the verdict line
+// experiment the ladder exists for: before USBREG (SO33) `drivers/block.rs`'s `USB_BLOCK_DEVICE` was
+// ONE `Option<BlockDeviceInfo>` that every `publish_usb_geometry` OVERWROTE, so with two USB disks
+// attached rung 2 mounted whichever enumerated LAST — and the verdict line
 // `:: PRTSCR: SCREEN0.PNG 1920x1200 6912345 bytes -> OK ::` named no device at all. A FRIEND-DIFF
 // positive control (a friend's stick attached AND the root refusing writes) could therefore produce
 // a green capture that nobody could attribute to a disk. An experiment whose result cannot be read

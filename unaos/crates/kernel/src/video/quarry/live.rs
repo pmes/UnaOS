@@ -140,6 +140,29 @@ const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_O
 /// The live window id, or [`wm::WIN_NONE`].
 static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 
+/// QUITLEAK — **closes that went through THIS module's [`close`]**, and the shape of the last one.
+///
+/// A29's WINID holder registry clears [`WIN`] from inside `wm::close`, so a `Quit` that took a bare
+/// `wm::close(win)` leaves [`is_open`] answering `false` and `wm::info` answering `None` — the END
+/// STATE of a correct close, reached without this module's teardown ever running. The counter is
+/// what separates them: a bypass cannot reach the line that ticks it, so a `Quit` that leaves
+/// [`CLOSES`] where it was did not take this module's close at all. That is the same discriminator
+/// `pulsewin::CLOSES` gives A30's pulse round, and it is here for the same reason.
+static CLOSES: AtomicU32 = AtomicU32::new(0);
+
+/// QUITLEAK — the last close's seal, RE-READ after the whole teardown rather than asserted:
+///
+/// * bit 0 `model_freed` — [`MODEL`] is `None`, so the `String`s and `Vec`s the tree and the list
+///   own are dropped.
+/// * bit 1 `surf_released` — [`SURF`] is empty, so the panel-sized surface is no longer published.
+///
+/// `3` is the only passing value, and it is only MEANINGFUL beside [`CLOSES`]: a `Quit` that took
+/// the bare `wm::close` never reaches this store, so the value a fixture then reads is STALE, not a
+/// measurement of that close. The fixture therefore requires the counter to have advanced and the
+/// seal to read `3`; on the bypass tree it gets `owner_close=false seal=0` — a window gone from the
+/// table with the model still allocated and the panel-sized surface still published.
+static LAST_SEAL: AtomicU32 = AtomicU32::new(0);
+
 // ── Bounds ──────────────────────────────────────────────────────────────────────────────────────
 //
 // Every model in this module is capped, because both of its inputs are attacker-shaped in the sense
@@ -1231,6 +1254,16 @@ fn launch(path: &str) -> String {
             // WINTITLE — a double-click launch names its windows exactly as `bg` does; the file
             // manager knows the path, so the window it opens carries the program's name rather than
             // the window seam's generated label. See `wm::app_name_arm`.
+            //
+            // WINTITLE-LATE — and this arm is RETROACTIVE, which is what makes it correct here at
+            // all. `spawn_user_image_bg` has already made the task runnable when it returns
+            // (`sched::spawn_user_slot` with `CPU_AUTO` — another core), so the child reaches
+            // `SYS_WIN_CREATE` before this line as often as not: render13 boot 1 sent six launches
+            // down this exact seam and only two of the six windows came out named
+            // (`docs/dev/evidence/orin27/render13-boot1-comp.log`). `app_name_arm` therefore also
+            // re-titles the windows this owner has ALREADY opened, so the launcher is not made to
+            // win a race it has no way to win from out here. Arming inside the arch spawn would
+            // narrow that window, never close it, and it is `arch/*/syscall.rs`.
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path);
             JOBS.lock().push(Job { pid, asid, name: String::from(path) });
             serial_println!(
@@ -1679,6 +1712,20 @@ pub fn is_open() -> bool {
     WIN.load(Ordering::Relaxed) != wm::WIN_NONE
 }
 
+/// QUITLEAK — **Quarry's window id, or [`wm::WIN_NONE`].** The one read another module needs, and
+/// the same accessor `pulsewin::win` is: `winmenu`'s app-menu `Quit` arm asks it whether the window
+/// it is about to reap is THIS module's, and routes to [`close`] when it is. `is_open` cannot answer
+/// that question — it says a window exists, not which one — so the arm needs this and not that.
+pub fn win() -> wm::WinId {
+    WIN.load(Ordering::Relaxed)
+}
+
+/// QUITLEAK — `(closes, last_seal)`: the count of closes that ran [`close`]'s teardown, and the
+/// [`LAST_SEAL`] bits that close latched about itself. Read by `winmenu::appquit_selftest`.
+pub fn close_census() -> (u32, u32) {
+    (CLOSES.load(Ordering::Acquire), LAST_SEAL.load(Ordering::Acquire))
+}
+
 /// Is Quarry's window live **and on the glass**?
 ///
 /// `wm` expresses "minimised" as a POSITION: the row's `z` drops below `SHELL_Z`, it stops
@@ -1905,7 +1952,11 @@ fn census(when: &str) {
     }
 }
 
-/// Close Quarry and release its surface. Safe to call when not open.
+/// Close Quarry and release its surface. Safe to call when not open — and that contract is now
+/// load-bearing rather than incidental: since QUITLEAK the app menu's `Quit` arm calls this for the
+/// window it owns, and `winmenu` has no lock of ours and no way to serialise against a close the
+/// dock or the close disc took a moment earlier. The `WIN` swap below is the whole guard: exactly
+/// one caller can observe a live id, and every other one returns having done nothing.
 pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id == wm::WIN_NONE {
@@ -1916,7 +1967,22 @@ pub fn close() {
     wm::close(id);
     *MODEL.lock() = None;
     SURF.lock().clear();
-    serial_println!("[quarry] closed win={} paints={}", id, PAINTS.load(Ordering::Relaxed));
+    // QUITLEAK — latch the SHAPE of this close where a fixture can read it, and count the close. Both
+    // cells are RE-READ here, after the teardown, rather than set to a constant because the source
+    // above says so: `model_freed`/`surf_released` are the two pieces of heap state `wm::close`
+    // provably cannot touch (A29's holder registry clears an id cell), so they are the bits that
+    // convict a bypassed `Quit`, and `CLOSES` is the counter that says this path ran at all.
+    let seal = (MODEL.lock().is_none() as u32) | ((SURF.lock().is_empty() as u32) << 1);
+    LAST_SEAL.store(seal, Ordering::Release);
+    CLOSES.fetch_add(1, Ordering::Release);
+    serial_println!(
+        "[quarry] closed win={} paints={} model_freed={} surf_released={} closes={}",
+        id,
+        PAINTS.load(Ordering::Relaxed),
+        seal & 1,
+        (seal >> 1) & 1,
+        CLOSES.load(Ordering::Relaxed)
+    );
 }
 
 // ── Input ───────────────────────────────────────────────────────────────────────────────────────

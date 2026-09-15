@@ -569,6 +569,22 @@ _feats=""
 # sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled
 # while the banner claims it is on (s42/INSTGUI, WXN-M3b).
 [ -n "${UNAOS_HCRONST:-}" ] && _feats="${_feats}hcronst,"
+# LOGIN (RULINGS R51): UNAOS_LOGIN=1 arms the human-user line — `fs/users.rs` (the `/USERS.DAT`
+# record store: name, salted SHA-256 credential, home path; `login`/`logout`), the SESSION PRINCIPAL
+# in both `arch/*/syscall.rs` (a program launched in a session is stamped `user:<name>` into the SAME
+# per-slot principal the loader stamps; the SAME SYS_OPEN owner/grants check enforces it), the shell
+# arms, and the M1 fixture `:: LOGIN: users+session … -> PASS ::` on the storage-ready passes. NOT
+# stripped by `arm_features`, for the reason `holocron` is not. Default OFF => module and every call
+# site vanish, both arches byte-identical (`./arroyo knoboff login`). NOTE: builder/src/main.rs
+# carries NO `UNAOS_LOGIN` mapping (outside the LOGIN executor's files) — until it does, `./arroyo
+# test` (x86, built by the builder) cannot compile the knob; `test-arm` builds from this map and can.
+[ -n "${UNAOS_LOGIN:-}" ] && _feats="${_feats}login,"
+# LOGIN SELFTESTS: UNAOS_LOGINST=1 arms the LOGIN fixtures (M1 users+session — a BOOT-TIME WRITE: user
+# `una` with a known password lands in USERS.DAT; M2 home + a private file; M3 the screen driven by
+# keys). Its own knob, NOT part of UNAOS_LOGIN, by the UNAOS_HCRONST/UNAOS_PRTSCRST rule: a boot that did
+# not ask to WRITE its boot medium must be incapable of it, and a shipping login boot never carries a
+# fixture credential. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_LOGINST:-}" ] && _feats="${_feats}loginst,"
 # PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — one real capture
 # to SCREEN<n>.PNG at the volume root, then a read-back of what landed on the medium. Its own knob,
 # and NOT part of any other, by the rule stated for UNAOS_HCRONST above: a boot that did not ask to
@@ -1060,6 +1076,25 @@ fi
 #   UNAOS_GA10B_PROBE4=4  -> + `ga10bprobe4d`  — 4a+4b+4c DEFERRED to the shutdown path: the boot runs
 #                            the FULL desktop, and the rung fires when a PSCI SYSTEM_OFF is requested
 #                            (shell `shutdown`/`off`, crystal Shut Down), then the OFF (Peter 2026-09-12)
+#   UNAOS_GA10B_PROBE4=5  -> `ga10bprobe4a` + `4b` + `ga10bprobe4e` — RUNG 4e, the SHIFT arm: the flown
+#                            `=2` rung with ONE delta, the six BCR DMA addresses written `pa >> 8`
+#                            (256-byte units, the MIT Hopper encoding); SYSTEM_OFF as `=2` (brief §12)
+#   UNAOS_GA10B_PROBE4=6  -> `ga10bprobe4a` + `4b` + `ga10bprobe4f` — RUNG 4f, the BRFETCH arm: the flown
+#                            `=2` rung with ONE delta, `bcr_ctrl` written 0x011 (BRFETCH FALSE) instead
+#                            of 0x111; SYSTEM_OFF as `=2` (brief §12). NEITHER arm adds a write class, a
+#                            register or an address class, and NEITHER carries rung 4c: `=5`/`=6` are the
+#                            `=2` wire plus one tag (`shift=8` / `brfetch=false`) on the verdict lines.
+#   UNAOS_GA10B_PROBE4=7  -> `ga10bprobe4a` + `4b` + `4c` + `ga10bprobe4d` + `ga10bprobe4e` — RUNG 4e
+#                            DEFERRED to the shutdown path: `=4`'s deferral around `=5`'s body, so ONE
+#                            glass boot runs the FULL desktop and ENDS in the GPU test on Shut Down,
+#                            with the six BCR DMA addresses written `pa >> 8` and 4c's census carried.
+#                            It is `=4`'s feature set plus `ga10bprobe4e` and NOT a third code path:
+#                            `ga10bprobe4_run` is what defers, `ga10bprobe4_body` is what it defers,
+#                            and `ga10bprobe4e` re-encodes the body. The immediate `=5` arm STAYS —
+#                            `=7` does not replace it (brief §12.8). Boot prints `[ga10bprobe4d]
+#                            DEFERRED ARM` (which names `=4`, being `=4`'s own line byte for byte) and
+#                            then `[ga10bprobe4e] rung 4e DEFERRED (UNAOS_GA10B_PROBE4=7)`, which is
+#                            the correction a reader keys on.
 # Any other non-empty value arms 4a alone: an unexpected value never buys an ignition (the PROBE3
 # shape, verbatim). `arch/aarch64/ga10b_probe.rs::ga10bprobe4_run`, an appended statement in
 # `tegra_early_stop`'s BPMP block between rung 3's call and rung 1's. A FOURTH sibling of the probe
@@ -1067,12 +1102,51 @@ fi
 # `UNAOS_GA10B_PROBE4=2 ./arroyo esp-jetson` both arm it. Fly it WITHOUT UNAOS_GA10B_PROBE1/2/3.
 # Default OFF => tail + call site vanish, no panic Location moves, knob-off images byte-identical.
 # ARMED polarities type-checked by the `arm-tegra-ga10bprobe4a` / `arm-tegra-ga10bprobe4b` /
-# `arm-tegra-ga10bprobe4c` / `arm-tegra-ga10bprobe4d` legs of KERNEL_CFG_MATRIX. Witness families:
-# `[ga10bprobe4a]`, `[ga10bprobe4b]`, `[ga10bprobe4c]`, `[ga10bprobe4d]`.
+# `arm-tegra-ga10bprobe4c` / `arm-tegra-ga10bprobe4d` / `arm-tegra-ga10bprobe4e` /
+# `arm-tegra-ga10bprobe4f` legs of KERNEL_CFG_MATRIX — the last two are REQUIRED, not optional: this
+# gate's own knob→leg coverage check reds on a declared feature with aarch64-qualified `#[cfg]` sites
+# that no leg names. `=7` needs NO seventh leg: it declares no new feature, so that gate has nothing new
+# to cover, and its 4d+4e COMBINATION is type-checked by its own `esp-jetson` build (brief §12.8).
+# Witness families: `[ga10bprobe4a]`, `[ga10bprobe4b]`, `[ga10bprobe4c]`,
+# `[ga10bprobe4d]`, `[ga10bprobe4e]`, `[ga10bprobe4f]`.
 [ -n "${UNAOS_GA10B_PROBE4:-}" ] && _feats="${_feats}ga10bprobe4a,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "2" ] && _feats="${_feats}ga10bprobe4b,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "3" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,"
 [ "${UNAOS_GA10B_PROBE4:-}" = "4" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,ga10bprobe4d,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "5" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4e,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "6" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4f,"
+[ "${UNAOS_GA10B_PROBE4:-}" = "7" ] && _feats="${_feats}ga10bprobe4b,ga10bprobe4c,ga10bprobe4d,ga10bprobe4e,"
+# GA10B-PROBE5 (GA10BPROBE5): ONE env knob driving the rung-5 line of the GA10B ladder (brief:
+# docs/dev/OS/08_VIDEO/GA10B-RUNG5-BRIEF.md §5 as built; RUNG6 brief for 5b; ledger A63/A65).
+#   any non-empty value    -> feature `ga10bprobe5`   — the firmware LOADER (`arch/aarch64/ga10b_fw.rs`):
+#                             the acr-gsp triple read from `GA10B/` on the boot volume through the VFS,
+#                             sized + sha256-verified against compiled-in digests, placed 256-aligned.
+#                             Arch-neutral, implies nothing; on `test-arm` (witness) it runs the QEMU
+#                             FIXTURE against a synthetic FAT image this script builds (see test_aarch64).
+#   ON A TEGRA BUILD (UNAOS_TEGRA=1, or the esp-jetson verb, which forces tegra) the value selects the rung:
+#   UNAOS_GA10B_PROBE5=1   -> + `ga10bprobe5a`                  — RUNG 5a: the VENDOR IGNITION, addresses RAW
+#   UNAOS_GA10B_PROBE5=5   -> + `ga10bprobe5a` + `ga10bprobe5e` — rung 5a with the addresses `pa >> 8`
+#                             (`5` is rung 4e's value, UNAOS_GA10B_PROBE4=5 — the same delta, the same digit)
+#   UNAOS_GA10B_PROBE5=2   -> + `ga10bprobe5a` + `ga10bprobe5b` — 5a RAW, then rung 5b's read-only PMU oracles
+#   UNAOS_GA10B_PROBE5=7   -> + `ga10bprobe5a` + `ga10bprobe5e` + `ga10bprobe5b` — 5a shifted, then 5b
+#   UNAOS_GA10B_PROBE5=<n>d (1d|5d|2d|7d) -> the same set + `ga10bprobe5d` — the ignition DEFERRED to the
+#                             shutdown path (rung 4d's shape): the loader still runs at boot, the desktop
+#                             comes up, Shut Down ignites (needs the power::psci_call hook, see Cargo.toml)
+#   any other value        -> the loader alone: an unexpected value never buys an ignition (the PROBE3/4 shape)
+# WHY the tegra condition: `ga10bprobe5a` implies `tegra` (through `ga10bprobe4a`), and a `tegra` kernel
+# diverges into `tegra_early_stop` at boot — on QEMU virt that is a dead boot, so `UNAOS_GA10B_PROBE5=1
+# ./arroyo test-arm` must arm the LOADER ONLY. `ga10bprobe5a` runs from ONE folded call on the
+# `sdmmc_census` line of `tegra_early_stop` (after the card is published — the loader reads /boot/GA10B/).
+# 5a implies 4a, so rung 4a's own census also runs at post-heap-init and RETURNS; 5a re-proves it inside.
+# Default OFF => modules + call sites vanish, no panic Location moves, knob-off images byte-identical.
+# ARMED polarities type-checked by the `arm-ga10bprobe5` (virt, witness), `arm-tegra-ga10bprobe5a`,
+# `arm-tegra-ga10bprobe5e`, `arm-tegra-ga10bprobe5b` and `arm-tegra-ga10bprobe5d` legs of KERNEL_CFG_MATRIX.
+# Witness families: `[ga10bfw]`, `[ga10bprobe5a]`, `[ga10bprobe5b]`, `[ga10bprobe5d]`. Fly WITHOUT
+# UNAOS_GA10B_PROBE1/2/3/4. The ORIN-SELFUP line of `tegra_early_stop` is the 5a call's seam (main.rs).
+[ -n "${UNAOS_GA10B_PROBE5:-}" ] && _feats="${_feats}ga10bprobe5,"
+_p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_jetson_img|jetson-img) _p5_metal=1 ;; esac; [ -n "${UNAOS_TEGRA:-}" ] && _p5_metal=1   # GA10B-PROBE5 METAL GATE. ⚠ WAS `[ "${1:-}" = "esp-jetson" ]`, a single string equality against ONE of the SIX verb spellings the dispatcher accepts (`esp-jetson|esp_jetson|jetson` at :9026 and `esp-jetson-img|esp_jetson_img|jetson-img` at :9029, whose `esp_jetson_img()` is nothing but a call to `esp_jetson`). So five of six spellings silently DROPPED `ga10bprobe5a` — the ignition itself — while still setting `ga10bprobe5`, and the build printed a feature banner that named the rung it was not building. MEASURED 2026-09-13 staging rung 5a: `esp-jetson` built `ga10bprobe5,ga10bprobe5a`, the `esp-jetson-img` step that follows it in the same chain rebuilt `ga10bprobe5` alone and OVERWROTE kernel.elf, and `LC_ALL=C grep -a -o -F` on the artifact found `ga10b` 0 against the 4f card's 79. A card cut from that boots, prints no rung, and looks like a clean flight — one power cycle spent on nothing. Enumerate the aliases the way the UNAOS_WITNESS gate at :49 already does; a feature gate keys on the BUILD TARGET, never on one spelling of its name. PROBE4 carries no such guard, which is why the render15-4f card was sound.
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1|1d) _feats="${_feats}ga10bprobe5a," ;; 5|5d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e," ;; 2|2d) _feats="${_feats}ga10bprobe5a,ga10bprobe5b," ;; 7|7d) _feats="${_feats}ga10bprobe5a,ga10bprobe5e,ga10bprobe5b," ;; esac
+[ -n "$_p5_metal" ] && case "${UNAOS_GA10B_PROBE5:-}" in 1d|5d|2d|7d) _feats="${_feats}ga10bprobe5d," ;; esac
 # ORIN-CLICK (rung 3): UNAOS_ORINCLICK=1 wires the Orin console pump's pointer BUTTON edge into the
 # WINDOW LAYER. `jd2_console_pump`'s `Event::Button` arm has logged the press and dropped it since JD20
 # ("no UI action wired yet"); this knob appends a call to `arch/aarch64/syscall.rs::wc_click_route` —
@@ -1844,7 +1918,7 @@ fi
 # net4-standalone virt build only prints one honest witness line; the metal build combines
 # UNAOS_TEGRA=1. Default OFF => module + call sites vanish, smoltcp not pulled, byte-identical to
 # baseline. See arch_arm64.md §ORIN-NET-4 and scripts/orin-net4-bench.md.
-[ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,"
+[ -n "${UNAOS_NET4:-}" ] && _feats="${_feats}net4,pcie3,pcie2,net6,"
 # ORIN-NET-5: UNAOS_NET5=1 arms the RING RE-FETCH PROBE on top of the net4 driver — one knob, one boot,
 # one question (arch/aarch64/rtl8168_tegra.rs § NET-5). AFTER `CR = RxEnb|TxEnb` it re-points RX
 # descriptors 1..31 at a tagged SHADOW block in the same Normal-NC window (slot 0 kept as the control),
@@ -1859,7 +1933,7 @@ fi
 # every field, site and string vanishes and the image is byte-identical to a net4 build. The ARMED
 # polarity is type-checked by the `arm-tegra-tcurx` leg of KERNEL_CFG_MATRIX, never by this mapping.
 # Design: docs/dev/evidence/orin16/NET5.md. UNFLOWN — flies on net5.
-[ -n "${UNAOS_NET5:-}" ] && _feats="${_feats}net5,net4,pcie3,pcie2,"
+[ -n "${UNAOS_NET5:-}" ] && _feats="${_feats}net5,net4,pcie3,pcie2,net6,"
 # ORIN-SDMMC-1: UNAOS_SDMMC=1 arms the Tegra234 microSD-slot SDMMC controller READ-ONLY recon — the
 # installer line's first rung (arch/aarch64/sdmmc_tegra.rs). Resolves the controller from the live DTB
 # (compatible/name match, no hardcoded base; the enabled removable instance = the microSD slot), maps
@@ -1890,6 +1964,41 @@ fi
 # the read census. UNAOS_SDMMC=1 WITHOUT this is byte-identical to the ORIN-SDMMC-1 recon. See
 # arch_arm64.md §ORIN-SDMMC and scripts/orin-sdmmc1-bench.md.
 [ -n "${UNAOS_SDMMC_ARM:-}" ] && _feats="${_feats}sdmmc_arm,sdmmc,"
+# SDWRITE (A60, 2026-09-12) — the Orin card's ORDINARY-WRITE posture, and it is DEFAULT ON.
+#
+# WHAT IT LIFTS. Before A60 `drivers/block.rs`'s `write_block_tegra_sd` returned `NotReady`
+# UNCONDITIONALLY, in every cfg — so `fs/fat.rs`'s `BlockSource::TegraSd` veto and `fs/bootdisk.rs`'s
+# `rw=` witness were reporting a refusal decided two layers below them, and a slot-booted Orin could
+# not have a writable `/` at all. `sdwrite` routes those two entry points to the driver's UNARMED
+# CMD24 primitive instead. It does NOT open a second door past the `sdmmc_arm` paranoia ladder or the
+# `install_target` flow: those keep their own gates and their own scratch-and-restore discipline, and
+# this path writes only the sector a FILESYSTEM named, which is the layer that decided and authorized
+# it. See `docs/dev/OS/01_BOOT_HAL/arch_arm64.md` §ORIN-SDMMC / SDWRITE.
+#
+# WHY DEFAULT ON, spelled out because the default polarity is the whole safety argument. The shipped
+# configuration is the one that has to be right (LAWS §5, orin 20: "for a knob whose OFF state is the
+# shipped state, coverage of the ON state is coverage of a build nobody boots") — a writable root that
+# exists only behind a knob is a root nobody boots, and the veto it lifts guards nothing the
+# filesystem's own authorization does not already guard. `UNAOS_NOSDWRITE=1` takes it back out and the
+# build is the pre-A60 refusal, verbatim and byte-identical (`./arroyo knoboff sdwrite <baseline>`).
+# Negative-knob spelling per UNAOS_NOTEGRASMP / UNAOS_NOSDHCBLK / UNAOS_NOKBDWIT above.
+#
+# NOT stripped by `arm_features`: `sdwrite` emits REAL aarch64 code (`fs/vfs.rs`'s `NativeBackend`
+# write-veto forward is `target_arch = "aarch64"`-gated and reaches every aarch64 build, virt
+# included), so stripping it would change behaviour and not merely a fingerprint. It is NOT in
+# `kernel8()`'s curated `K8_FEATS` either: it is the microSD-through-SDHCI posture, the Pi's card
+# rides emmc2 through the global slot, and the Pi's FRGUARD `default_writable` posture is untouched
+# by this arc by construction.
+[ -z "${UNAOS_NOSDWRITE:-}" ] && _feats="${_feats}sdwrite,"
+# SDWRITE FIXTURE: UNAOS_SDWRITE=1 arms the metal proof — `sdwritefx`, a SEPARATE feature, because
+# `sdwrite` above is default ON and a knob that armed it would arm nothing. On the root
+# `fs::bootdisk::bind` just bound it creates `/SDWRITE.TXT`, writes one 512-byte stamped block, reads
+# it back, deletes it, and prints `:: SDWRITE: root=<source> wrote=1 readback=match deleted=1 -> PASS
+# ::` (a FAIL names the step). It writes that ONE path and nothing else on the card. Implies `sdwrite`
+# and `sdmmc` in Cargo.toml, both named here too so the `⚡ kernel features:` banner is the truth about
+# the build. For a card boot combine with UNAOS_TEGRA=1. The ARMED polarity is type-checked by the
+# `arm-tegra-sdwritefx` leg of KERNEL_CFG_MATRIX, never by this mapping.
+[ -n "${UNAOS_SDWRITE:-}" ] && _feats="${_feats}sdwritefx,sdwrite,sdmmc,"
 # ORIN-INSTALL-1: UNAOS_INSTALL_TARGET_SD=1 is the THIRD (destructive-confirmation) gate on top of the
 # double-arm above — it compiles in the first real installer flow (an InstallTarget over the rung-2 armed
 # SD write path driving the install:: engine's GPT + FAT32 + sha extent-verify onto the SEATED microSD;
@@ -1921,7 +2030,48 @@ fi
 # it runs on the plain virt GICv3 path (UNAOS_VNET=1 UNAOS_GICV3=1 test-arm). The knob ALSO adds the
 # `-netdev user -device virtio-net-device` QEMU args below (VNET_ARG); knob-off leaves BOTH the feature
 # and the QEMU invocation byte-identical to baseline. See arch_arm64.md §AARCH64-VNET.
-[ -n "${UNAOS_VNET:-}" ] && _feats="${_feats}vnet,"
+[ -n "${UNAOS_VNET:-}" ] && _feats="${_feats}vnet,net6,"
+# NET6 (ROADMAP §1b SOCK-7): UNAOS_NET6=1 arms the SHARED aarch64 socket surface — one persistent
+# smoltcp `Interface` + `SocketSet` over whichever NIC registered, the shell verbs `ping`/`arp`/`dns`,
+# and the EL0 socket syscall family (`SYS_SOCKET` 40 .. `SYS_SOCK_RECV` 46) on aarch64. The code is
+# written ONCE (the tail module of `crates/kernel/src/net_phy.rs`) and every arch-specific byte is a
+# DEVICE ADAPTER: `virtio_net.rs` registers one on QEMU `virt`, `rtl8168_tegra.rs` one on Orin metal.
+#
+# It is a STANDALONE knob that pairs with a NIC knob — it implies neither `vnet` nor `net4`, because
+# the two are different boards' devices and implying either would arm a driver the caller did not ask
+# for. With no adapter registered every entry point says so honestly and does no MMIO.
+#
+#   runtime  (the ONLY runtime proof this family can have off the bench — QEMU models no Tegra234):
+#     UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_VNET=1 UNAOS_NET6=1 ./arroyo test-arm 60
+#   metal:
+#     UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1 UNAOS_NET6=1 ./arroyo esp-jetson
+#
+# Default OFF => the `net_phy` tail module, the seven syscall arms, the three shell-verb bodies and the
+# EL0 fixture blob all vanish, and EVERY call site is a LINE-NEUTRAL fold onto an existing line or a
+# file-tail item — so no `panic::Location` moves and the knob-off images are byte-identical
+# (`./arroyo knoboff net6`, and `knoboff net4` measures the same claim from the other side).
+# Witnesses on the wire: `:: NET6: stack UP over …`, `:: NET6: ping <ip> seq=N rtt_ms=… -> REPLY ::`,
+# `:: NET6: arp <ip> -> is-at <mac> ::`, `:: NET6: dns <host> -> A a.b.c.d ::`,
+# `:: NET6: sock udp round-trip … -> PASS ::`, `:: NET6: sock tcp round-trip … -> PASS ::`,
+# `:: NET6: el0 socket family over <nic> — socket=true bind=true … -> PASS ::`.
+# See docs/dev/OS/06_NETWORK_STACK/network_stack.md §NET6.
+#
+# NET6 RIDES THE NIC KNOBS, and that is deliberate: `UNAOS_NET4=1` (or `UNAOS_NET5=1`, or
+# `UNAOS_VNET=1`) appends `net6` on its own line above, so arming a NIC arms the surface over it and
+# the Orin flight line stays `UNAOS_TEGRA=1 UNAOS_NET4=1 UNAOS_NET5=1` with no fourth knob to
+# remember. `UNAOS_NET6=1` below still arms it standalone (the surface compiles with no adapter and
+# says so honestly), which is what the `arm-virt-net6` leg uses.
+#
+# It is NOT a Cargo implication (`net4 = [..., "net6"]`) for a reason worth keeping: KERNEL_CFG_MATRIX
+# passes feature strings STRAIGHT to cargo and never through this map, so the existing `arm-tegra*`
+# rows keep compiling net4 with net6 OFF while the two `*-net6` rows compile it ON. A Cargo
+# implication would delete that second polarity from every leg in the file — the exact shape of the
+# default-quiet-knob hole LAWS §5 names (orin 20: "read the polarity, not the leg count").
+#
+# Byte identity is unaffected and MEASURED from the other side: with no NIC knob set there is no
+# `net6`, so `./arroyo knoboff net4` compares a knob-off image that contains neither — exit 0 on both
+# arches, control fired.
+[ -n "${UNAOS_NET6:-}" ] && _feats="${_feats}net6,"
 # PI-GENET: UNAOS_GENET=1 arms the BCM2711 on-board Gigabit Ethernet (Broadcom GENET v5) driver +
 # smoltcp bind — the Pi's FIRST network path (arch/aarch64/genet.rs). DTB-resolves the GENET register
 # base, poison-honest probes SYS_REV_CTRL to classify whether the build models GENET, brings up UMAC +
@@ -2878,6 +3028,29 @@ test_aarch64() {
     local secs="${1:-20}"
     prepare_aarch64
 
+    # GA10B-PROBE5 fixture (orin-0912b): with the knob set, the usb-storage stick is a FAT32 superfloppy
+    # this script builds carrying `GA10B/` — three SYNTHETIC files with the vendor triple's NAMES and SIZES
+    # (`yes <line> | head -c <size>`: our bytes, never a vendor byte; their sha256s are the `witness` table
+    # in `ga10b_fw.rs`) — and `GA10BBAD/`, the same three with ONE byte of the data section flipped. The
+    # kernel's fixture must LOAD the first and REFUSE reason=digest the second. mkfs.vfat + mcopy (the
+    # tools make-fat-img.sh's Linux backend already requires); 64 MiB, 512-byte clusters, label UNAOS.
+    if [ -n "${UNAOS_GA10B_PROBE5:-}" ]; then
+        local fx="${WORKSPACE_DIR}/target/ga10b5-fixture" fximg="${WORKSPACE_DIR}/target/ga10b5-fixture.img" _t
+        for _t in mkfs.vfat mcopy; do command -v "$_t" >/dev/null 2>&1 || { echo -e "${COLOR_RED}test-arm: GA10B-PROBE5 fixture needs '$_t' (dosfstools + mtools)${COLOR_RESET}"; return 2; }; done
+        rm -rf "$fx" "$fximg"; mkdir -p "$fx/GA10B" "$fx/GA10BBAD"
+        yes 'UNAOS GA10B5 SYNTHETIC text section (not a vendor byte)'     | head -c 28672 > "$fx/GA10B/acr-gsp.text.encrypt.bin.prod"
+        yes 'UNAOS GA10B5 SYNTHETIC data section (not a vendor byte)'     | head -c 9472  > "$fx/GA10B/acr-gsp.data.encrypt.bin.prod"
+        yes 'UNAOS GA10B5 SYNTHETIC manifest section (not a vendor byte)' | head -c 2048  > "$fx/GA10B/acr-gsp.manifest.encrypt.bin.out.bin.prod"
+        cp "$fx/GA10B/"* "$fx/GA10BBAD/"
+        printf 'X' | dd of="$fx/GA10BBAD/acr-gsp.data.encrypt.bin.prod" bs=1 seek=100 conv=notrunc status=none
+        truncate -s $((64 * 1024 * 1024)) "$fximg"
+        mkfs.vfat -F 32 -s 1 -n UNAOS "$fximg" >/dev/null
+        mcopy -s -b -o -Q -i "$fximg" "$fx/GA10B" "$fx/GA10BBAD" "::/"
+        STICK_IMG="$fximg"
+        echo -e "${COLOR_YELLOW}⚡ GA10B-PROBE5 fixture stick: ${fximg} (GA10B/ + GA10BBAD/, synthetic triple, sha256s below)${COLOR_RESET}"
+        (cd "$fx" && sha256sum GA10B/* GA10BBAD/*)
+    fi
+
     local logf="${WORKSPACE_DIR}/target/serial-arm.log"
     rm -f "$logf"
     echo -e "${COLOR_CYAN}⚡ Headless aarch64 test (${secs}s). Serial -> ${logf}${COLOR_RESET}"
@@ -3324,7 +3497,7 @@ KERNEL_CFG_MATRIX=(
   # WIRING CHECK below.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -3340,7 +3513,7 @@ KERNEL_CFG_MATRIX=(
   # not have caught an aarch64 regression in the very file the "do not strip" decision exists to
   # protect. It is a type-check leg, so it shifts no Pi or Jetson MEDIA: `arm_features` (which media
   # builds go through) is untouched, and `kernel8` builds from its own curated K8_FEATS.
-  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg"
+  "arm-pi      ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst"
   # aarch64 board leg 2 — Jetson Orin Nano (Tegra234), plus the board-neutral aarch64 features that
   # would otherwise ride nothing: ORIN-SMP (tegrasmp/smpprobe), the four XCARVE levers, ORIN-NET-1..4
   # (pcieprobe/pcie2/pcie3/net4), the SDMMC → armed-write → install_target ladder, and AARCH64-VNET
@@ -3410,6 +3583,13 @@ KERNEL_CFG_MATRIX=(
   # pairwise guarantee is unaffected either way: it is a property of the mask construction, not of
   # which features are in the set.
   "arm-tegra-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0"
+  # NET6 on the METAL adapter — the `rtl8168_tegra.rs` half of the shared socket surface (its `NicOps`
+  # static, `net6_mac`, `net6_start` and the lease-owner witness), which the `arm-virt-net6` leg above
+  # does not compile because that driver is `net4`-gated. Both adapters must type-check against the one
+  # shared surface or the ONE OS claim is only true of whichever one a gate happened to build; this row
+  # and that one are the two halves of that claim. `net5` rides along so the armed ring re-fetch probe
+  # is compiled beside it (the combination an Orin bench flight actually carries).
+  "arm-tegra-net6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,net5,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,net6"
   # ORIN-EL1AP armed (baton orin-8 item 1) — the arm-tegra-el0 row verbatim + `orinel1ap`, the literal
   # precedent one leg above (the feature implies `tegrasmp` + `tegra_el0` -> `tegra`; every site is
   # under `src/arch/aarch64/`, so it is aarch64-only in effect and inherits onto the x86 mix legs as
@@ -3749,7 +3929,7 @@ KERNEL_CFG_MATRIX=(
   # widest tegra desk cross, so the armed key path is type-checked against every desk knob it flies
   # with. Universe side effect: NONE — `holocron` is named on `x86-all`, so it was never "aarch64-only"
   # and `x86_cfg_universe` is unchanged.
-  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron"
+  "arm-tegra-render ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron,login,loginst"
 
   # ORIN-SELFUP armed (appended 2026-08-25) — `selfup` gates `arch/aarch64/selfup_tegra.rs` (the
   # self-update core) and its one appended call site in `tegra_early_stop`. Without a leg the ARMED
@@ -4212,6 +4392,39 @@ KERNEL_CFG_MATRIX=(
   # no disarmed asymmetry. Board legs +2; gate +2 — read the live counts from `./arroyo check`.
   "arm-tegra-ga10bprobe4d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4d"
 
+  # GA10B-PROBE4E / GA10B-PROBE4F armed (orin-0912b, 2026-09-12, ledger A62) — the `=5` and `=6` flight
+  # polarities: rung 4e writes the six BCR DMA addresses `pa >> 8`, rung 4f writes `bcr_ctrl` 0x011
+  # (BRFETCH FALSE). Both IMPLY `ga10bprobe4b` and neither carries `ga10bprobe4c`, which is exactly the
+  # `=2` shape plus one arm — so these two legs are what type-check the arms' own sites, and the FLOWN
+  # `arm-tegra-ga10bprobe4b` leg above still type-checks the not-4e/not-4f side of every cfg-selected
+  # statement they introduce. THESE LEGS ARE NOT OPTIONAL and the brief that ordered the arms did not
+  # foresee them: `check`'s own KNOB→LEG COVERAGE gate reds on any declared feature with aarch64-qualified
+  # `#[cfg]` sites that no leg names, because the manufactured `x86-mix-N` legs would compile them GREEN
+  # AND VACUOUS. Measured, not assumed — without these two rows that gate printed
+  # `❌ knob→leg coverage: ga10bprobe4e ga10bprobe4f` and `check` exited 1.
+  "arm-tegra-ga10bprobe4e ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4e"
+
+  "arm-tegra-ga10bprobe4f ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe4f"
+  # GA10B-PROBE5 armed (orin-0912b, 2026-09-12; ledger A63) — `ga10bprobe5` gates `arch/aarch64/ga10b_fw.rs`
+  # (the rung-5 firmware LOADER, arch-neutral) and the folded fixture call in `kernel_main`'s storage-ready
+  # loop, which is `witness`-gated. The VIRT polarity: the `UNAOS_GA10B_PROBE5=1 ./arroyo test-arm` build
+  # (witness + the loader, NO tegra) — the leg that type-checks the QEMU fixture without a tegra image.
+  "arm-ga10bprobe5 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,ga10bprobe5"
+  # GA10B-PROBE5A armed (same arc) — `ga10bprobe5a` gates `arch/aarch64/ga10b_ignite.rs` (rung 5a, the
+  # vendor ignition) and its folded call on the ORIN-SELFUP line of `tegra_early_stop`; IMPLIES
+  # `ga10bprobe5` and `ga10bprobe4a`. The `UNAOS_TEGRA=1 UNAOS_GA10B_PROBE5=1` flight polarity, with every
+  # `ga10bprobe5e`/`ga10bprobe5b`/`ga10bprobe5d` item cfg-erased (the raw-address, immediate, no-5b trap a
+  # wider leg would hide). The `arm-tegra` list + the feature, the ga10bprobe4a leg's shape.
+  "arm-tegra-ga10bprobe5a ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5a"
+  # GA10B-PROBE5E armed (same arc) — the `=5` polarity: rung 5a with `ADDR_SHIFT = 8`. IMPLIES `ga10bprobe5a`.
+  "arm-tegra-ga10bprobe5e ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5e"
+  # GA10B-PROBE5B armed (same arc; ledger A65) — the `=2` polarity: 5a then rung 5b's read-only PMU oracles.
+  # IMPLIES `ga10bprobe5a`.
+  "arm-tegra-ga10bprobe5b ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5b"
+  # GA10B-PROBE5D armed (same arc) — the `=1d` polarity: 5a's loader at boot, the ignition armed for the
+  # shutdown path (`ga10bprobe5_deferred_run`, statics, the DTB + window re-verify). IMPLIES `ga10bprobe5a`.
+  "arm-tegra-ga10bprobe5d ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,ga10bprobe5d"
+
 
   # ORIN-LADDER armed (appended 2026-08-25) — `orinladder` gates the tail block of
   # `arch/aarch64/display_tegra.rs` (`orin_glass_probe` / `orin_ladder_arm` / `orin_ladder_census`
@@ -4366,7 +4579,22 @@ KERNEL_CFG_MATRIX=(
   #
   # UNIVERSE SIDE EFFECT: `virt_el0` is named by this arm-* leg and by no x86 leg, so
   # `x86_cfg_universe` drops it exactly as it drops `tegra_el0`. Board legs +1.
-  "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0"
+  "arm-virt-el0 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,login,loginst"
+  # NET6 (SOCK-7) — the ARMED polarity of the shared aarch64 socket surface, and the ONLY leg that
+  # compiles it. It carries `vnet` + `net6` + `virt_el0` together because that triple is exactly what
+  # the runtime gate runs and because each term reaches code the others do not: `vnet` supplies the
+  # device adapter (`virtio_net.rs`'s `NicOps` + the `net6_start` call), `net6` the whole `net_phy`
+  # tail module and the seven `syscall.rs` socket arms, and `virt_el0` the EL0 fixture launcher folded
+  # into `virt_el0_verdict` — which is `#[cfg(all(net6, virt_el0))]` and therefore compiled by NO other
+  # leg in this matrix. Without this row the armed polarity of all three would be type-checked by
+  # nothing, which is the `default-quiet knob` hole LAWS §5 names.
+  #
+  # NOT `tegra`: the point is that the socket surface is BOARD-FREE. If it ever stops compiling without
+  # a board term, this leg says so before any image is cut.
+  #
+  # PRECONDITION, inherited from the `virt_el0` leg above: compiles `arch/aarch64/syscall.rs`, which
+  # `include_bytes!`s `target/user_blob.bin`. `ensure_user_blob` (see check_both) supplies it.
+  "arm-virt-net6 ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,virt_el0,vnet,net6"
   # VIRTPREEMPT (orin 17) — THE PREEMPTIVE TWIN OF THE LEG ABOVE, and not redundant with it. `virt_tick`
   # is the ONLY configuration in the tree where the `exceptions.rs` `irq_bank!`/`irq_unbank!` runtime
   # `CurrentEL` arm is selected WITHOUT `tegra`, so it is the only leg that type-checks that arm against a
@@ -4620,6 +4848,38 @@ KERNEL_CFG_MATRIX=(
   # items) and the derived mix-leg count is unchanged. Board legs +1; gate +1. `./arroyo check` prints
   # the live board/mix counts every run — read them there, not here.
   "arm-tegra-sdmmcwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdmmcwrite"
+  # ── SDWRITE (appended 2026-09-12, A60) — three rows, and the FIRST of them is the point ────────
+  #
+  # THE POLARITY THAT SHIPS IS ON. `sdwrite` is DEFAULT-ON in the knob map above, so LAWS §5's
+  # default-quiet rule (orin 20) runs the usual way round here: the OFF polarity is what every
+  # pre-existing `arm-tegra-*` leg already compiles — none of them names `sdwrite`, so all of them
+  # type-check the pre-A60 refusal — and it is the ON polarity, the one a card actually boots, that
+  # was named by nothing. Hence `arm-tegra-sdwrite`, and it carries NO `witness` on purpose: that is
+  # the exact set `esp-jetson` builds (the boot/media commands leave `witness` off), which is the
+  # image that goes on the card.
+  #
+  # `arm-tegra-sdwritefx` adds the armed fixture and `witness` together, because the fixture
+  # (`fs::bootdisk::sdwrite_fixture`, `sdwritefx`) and leg 8 (`sdwrite_posture_selftest`,
+  # `witness`+`sdwrite`) are two different gates on the same seam and a leg that compiles one says
+  # nothing about the other. It is also the only leg that type-checks `sdwritefx`'s Cargo implication
+  # chain (`sdwritefx` ⇒ `sdwrite` + `sdmmc`) with the board features present.
+  #
+  # `arm-virt-sdwrite` is the one that would be easiest to leave out and is the one the knoboff
+  # control depends on: `fs/vfs.rs`'s `NativeBackend` is `target_arch = "aarch64"`-gated and NOT
+  # tegra-gated, so the write-veto FORWARD this arc adds compiles on generic aarch64 — and leg 8's
+  # `not(tegra)` half (`card=absent`) exists only there. Without this row the virt configuration
+  # `./arroyo test-arm` actually runs would be type-checked by no leg of this gate.
+  #
+  # UNIVERSE SIDE EFFECT: none. `sdwrite`/`sdwritefx` are named by arm-* legs only and by no x86-*
+  # leg, so `x86_cfg_universe` classes them aarch64-only and subtracts them exactly as it does
+  # `tegra`; the derived mix-leg count is unchanged. Board legs +3. Read the live counts off
+  # `./arroyo check`, which prints them every run. NOT named on an x86 leg deliberately: that would
+  # put `sdwrite` under the KNOB→BUILDER WIRING CHECK and demand a `builder/src/main.rs` entry for a
+  # feature whose every site is aarch64. The x86 half of leg 8 is compiled and EXECUTED by
+  # `./arroyo test`, which arms `witness` and carries `sdwrite` by default.
+  "arm-tegra-sdwrite ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite"
+  "arm-tegra-sdwritefx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite,sdwritefx"
+  "arm-virt-sdwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,sdwrite"
   # ── WITNESSGAP (appended 2026-09-07, orin 20) — the WITNESS-FREE polarity, which is the polarity
   # every piece of BOOT MEDIA actually ships ──────────────────────────────────────────────────────
   #
@@ -7454,6 +7714,18 @@ kernel8() {
     # coordinate with orin 0's UnaFS layout — the baton forbids building on FAT twice).
     # OFF => fs/fatperf.rs is not compiled, both fs/mod.rs shims inline to nothing, and kernel8.img
     # is byte-identical to baseline (the call sites are line-neutral edits to fat.rs/vfs.rs).
+    # LOGIN (RULINGS R51): UNAOS_LOGIN=1 adds the `login` feature — the human-user record store,
+    # the session principal, the shell arms and the M1 fixture (see the knob's block near the top of
+    # this file). OFF => fs/users.rs is not compiled, every call site is a `#[cfg]`-erased statement
+    # folded onto an existing line, and kernel8.img is byte-identical to baseline.
+    if [ -n "${UNAOS_LOGIN:-}" ]; then
+        K8_FEATS="${K8_FEATS},login"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOGIN: human users — /USERS.DAT record store, login/logout session principal (user:<name>), /home/<user> at first login${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_LOGINST:-}" ]; then
+        K8_FEATS="${K8_FEATS},loginst"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOGINST: the LOGIN fixtures (BOOT-TIME WRITE: user una with a known password in USERS.DAT; home; screen)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"
         echo -e "${COLOR_YELLOW}  • UNAOS_FATPERF: the FAT/VFS cost instrument ([fatperf] op=list|read path= sectors= us= — measurement only, no behaviour change)${COLOR_RESET}"
@@ -8273,11 +8545,52 @@ battery() {
 # to prevent. So the refusal says so at the point of use. For `baremetal`-gated features the pi ack IS
 # the instrument, and it is not something to route around.
 #
+# A MERGE HEAD GETS NO DEFAULT BASELINE — IT GETS A REFUSAL (SO34's sibling, the NET6 finding,
+# measured 2026-09-12). The default baseline is `HEAD~1`, which is `HEAD^1`, the FIRST parent. On a
+# merge commit that is not "the tree before this change": it is whichever branch was merged INTO, and
+# which of the two parents carries the tree-without-the-arc depends on the merge DIRECTION — and both
+# directions are sanctioned here (LAWS §3: trunk INTO track at an arc boundary, arc INTO trunk with
+# `--no-ff` at a landing). On a trunk-into-track merge the tree without the arc is parent 2; on an
+# arc-into-trunk landing it is parent 1. The tool cannot tell them apart: the parent shas carry no
+# direction, and guessing gets exactly one of the two cases right while answering the other one
+# confidently and wrongly. Measured on exec-orin-net6: the HEAD~1 default gave `1` with 1,210,312 x86
+# bytes differing — a true statement about the whole track's work and the wrong question about the
+# arc's knob — and the second parent gave `0` with the control fired. So when HEAD has two or more
+# parents and no baseline was NAMED, knoboff REFUSES with exit 2 and prints both parents with the
+# exact command to re-run. That is the conservative half of the choice for a reason: a `1` reads as
+# "your knob moved the image" and sends an executor hunting a line shift that is not there, while a
+# `2` is never a pass and cannot be mistaken for green (memory `a-check-that-cannot-fire`: an
+# instrument with no power over the question must SAY so, not answer anyway). An explicitly named
+# baseline is honoured on a merge HEAD exactly as anywhere else, and the no-argument form is
+# untouched for the ordinary single-parent case, which is every non-merge run.
+#
+# ONE DIRECTORY PER RUN IS THE INVARIANT; ONE DIRECTORY PER BENCH WAS THE BUG (SO34, measured
+# 2026-09-12). "Both builds run in the SAME directory" is about the THREE builds of ONE invocation —
+# it was implemented as one hardcoded path for every caller on the box, so two executors running at
+# once shared a worktree, a CARGO_TARGET_DIR and one set of `flat-*.bin` names, and each could
+# objcopy the other's kernel.elf or compare the other's baseline image. Six executors ran knoboff
+# between 211452Z and 212300Z that day; one got `1` "x86 image MOVED, SIZE changed" for an
+# aarch64-only delta and `0` when re-run alone, and LOGIN M1 got a NO VERDICT whose armed build had
+# failed on a sibling executor's patch. A gate that can report MOVED because of somebody else's build
+# teaches its readers to re-run until green, which is the opposite of what a gate is for. So the
+# scratch is split in two:
+#   * `caller-<basename>-<hash of the caller's repo path>/` — the throwaway worktree and the cargo
+#     target dir, KEYED ON THE CALLER'S WORKTREE. Two executors are two paths and can never collide;
+#     the same executor's later runs land on the same key, so the incremental cache survives, which
+#     is why this is keyed on the caller rather than on the pid. The path is still constant across
+#     the three builds of a run, so the "no path delta" invariant is intact.
+#   * `run-<stamp>-<pid>/` inside it — the log, the working patch and the six flat images. Removed on
+#     a clean PASS and KEPT on any other outcome, with its path printed, so the images that failed can
+#     be inspected.
+# Same key twice at once (one executor running two knoboffs from one worktree) is the remaining
+# collision and it is held by an `flock` on the caller directory: the second caller WAITS and says so
+# on the wire. Never a silent share — that is the whole finding.
+#
 # EXIT STATUS is the deliverable — the brief says "run it and quote the result":
 #   0  knob-off images identical to baseline on every arch checked, control fired
 #   1  the knob-off image MOVED (the answer the brief is trying to prevent)
-#   2  no verdict — undeclared feature, dirty env, untracked sources, build failure, or a control
-#      that did not fire. A 2 is never a pass.
+#   2  no verdict — undeclared feature, dirty env, untracked sources, a MERGE HEAD with no baseline
+#      named, build failure, or a control that did not fire. A 2 is never a pass.
 _knoboff_arm_csv() {
     local _save="$KERNEL_FEATURES" _out
     KERNEL_FEATURES="${1:+--features $1}"
@@ -8316,7 +8629,10 @@ knoboff() {
     if [ -z "$feat" ]; then
         echo -e "${COLOR_RED}usage: ./arroyo knoboff <feature> [baseline-ref]${COLOR_RESET}"
         echo "       <feature>      a cargo feature declared in crates/kernel/Cargo.toml [features]"
-        echo "       [baseline-ref] default: HEAD when the tree is dirty, HEAD~1 when it is clean"
+        echo "       [baseline-ref] default: HEAD when the tree is dirty, HEAD~1 when it is clean."
+        echo "                      A MERGE HEAD has no default — HEAD~1 is the first parent, which is"
+        echo "                      the wrong tree half the time — so it is refused (exit 2) and the"
+        echo "                      refusal prints both parents and the command to re-run."
         return 2
     fi
 
@@ -8371,7 +8687,41 @@ knoboff() {
     local head_sha; head_sha="$(cd "$REPO" && git rev-parse HEAD)"
     local dirty=0; ( cd "$REPO" && git diff --quiet HEAD -- ) || dirty=1
     if [ -z "$baseline" ]; then
-        if [ "$dirty" -eq 1 ]; then baseline="$head_sha"; else baseline="${head_sha}~1"; fi
+        if [ "$dirty" -eq 1 ]; then
+            baseline="$head_sha"
+        else
+            # MERGE HEAD: no default. `HEAD~1` is `HEAD^1`, the branch that was merged INTO, and which
+            # parent holds the tree-without-the-arc depends on a merge direction the shas do not
+            # record (see the MERGE HEAD paragraph in this verb's header). Refuse, name both parents,
+            # and hand over the two commands — exit 2, which is never a pass.
+            local _parents _np
+            _parents="$(cd "$REPO" && git rev-parse "${head_sha}^@" 2>/dev/null || true)"
+            _np="$(printf '%s\n' "$_parents" | grep -c '^[0-9a-f]\{40\}$' || true)"
+            if [ "${_np:-0}" -ge 2 ]; then
+                local _i=0 _p _p1="" _p2=""
+                echo -e "${COLOR_RED}knoboff: NO VERDICT — HEAD is a MERGE commit ($_np parents), so there is no single${COLOR_RESET}"
+                echo -e "${COLOR_RED}         'the tree before this change' for knoboff to default to.${COLOR_RESET}"
+                echo -e "         HEAD      ${head_sha}  $(cd "$REPO" && git log --format=%s -1 "$head_sha" | cut -c1-58)"
+                for _p in $_parents; do
+                    _i=$((_i + 1))
+                    case "$_i" in 1) _p1="$_p" ;; 2) _p2="$_p" ;; esac
+                    echo -e "         parent $_i  ${_p}  $(cd "$REPO" && git log --format=%s -1 "$_p" | cut -c1-58)"
+                done
+                echo -e "         parent 1 is what \`HEAD~1\` means — the branch you merged INTO, which on an"
+                echo -e "         executor's 'merge the track in and re-gate' still CONTAINS your arc. Comparing"
+                echo -e "         against it measures every commit of the track you just merged, not your knob."
+                echo -e "         Which parent is the tree WITHOUT your change depends on the merge direction, and"
+                echo -e "         knoboff will not guess (both directions are sanctioned — LAWS §3). Name it:"
+                echo -e "         ${COLOR_YELLOW}./arroyo knoboff $feat ${_p2}${COLOR_RESET}   # you merged the track/trunk IN (executor)"
+                echo -e "         ${COLOR_YELLOW}./arroyo knoboff $feat ${_p1}${COLOR_RESET}   # you merged your arc INTO trunk (landing)"
+                echo -e "         Measured 2026-09-12 on exec-orin-net6: the HEAD~1 default returned 1 with"
+                echo -e "         1,210,312 x86 bytes differing; the second parent returned 0 with the control"
+                echo -e "         fired. A refusal is the conservative answer — a 1 sends you hunting a line"
+                echo -e "         shift that is not there, and exit 2 can never be read as green."
+                return 2
+            fi
+            baseline="${head_sha}~1"
+        fi
     fi
     local base_sha
     if ! base_sha="$(cd "$REPO" && git rev-parse --verify "${baseline}^{commit}" 2>/dev/null)"; then
@@ -8422,20 +8772,57 @@ knoboff() {
         *",${feat},"*) echo -e "${COLOR_YELLOW}⚠ '${feat}' is ON by default: this run measures REMOVING it, not adding it.${COLOR_RESET}" ;;
     esac
 
-    local SCR="${HOME}/unaos-bench/scratch/knoboff"
+    # (5b) SCRATCH — PER CALLER, never one directory per bench (SO34; see this verb's header). The
+    # key is a digest of the CALLER'S worktree path, so two executors on one box are two keys and
+    # cannot touch each other's tree, target dir or flat images, while the same executor's later runs
+    # reuse the cache. Inside it, one directory PER INVOCATION holds this run's log, patch and images.
+    local SCR_ROOT="${HOME}/unaos-bench/scratch/knoboff"
+    local _ckey; _ckey="$(printf '%s' "$REPO" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print substr($1,1,12)}')"
+    local SCR="$SCR_ROOT/caller-$(basename "$REPO")-$_ckey"
     local TREE="$SCR/knoboff-tree" TGT="$SCR/target"
     local STAMP; STAMP="$(date -u +%Y%m%d-%H%M%SZ)"
-    local LOG="$SCR/build-$STAMP.log"
-    local PATCHF="$SCR/worktree-$STAMP.patch"
-    mkdir -p "$SCR" "$TGT"
+    local RUN="$SCR/run-$STAMP-$$"
+    local LOG="$RUN/build.log"
+    local PATCHF="$RUN/worktree.patch"
+    mkdir -p "$SCR" "$TGT" "$RUN"
     : > "$LOG"
+
+    # (5c) LOCK. Two invocations with the SAME key — one executor running two knoboffs out of one
+    # worktree — are the only remaining way to share a tree, and they WAIT for each other and say so
+    # rather than interleaving silently. The fd is released by `_knoboff_bye` and, failing that, when
+    # this process exits.
+    local _lockfd=""
+    local LOCKF="$SCR/knoboff.lock"
+    : >> "$LOCKF"
+    exec {_lockfd}>"$LOCKF"
+    if ! flock -n "$_lockfd" 2>/dev/null; then
+        echo -e "${COLOR_YELLOW}⏳ knoboff: another run holds $SCR — WAITING for it (not sharing it).${COLOR_RESET}"
+        flock "$_lockfd"
+        echo -e "${COLOR_YELLOW}   lock acquired; this run has the directory to itself.${COLOR_RESET}"
+    fi
+
+    # Release the lock and dispose of this run's directory. $1 = the verdict about to be returned:
+    # a clean PASS takes its images with it, anything else leaves them where they can be looked at.
+    _knoboff_bye() {
+        if [ -n "${_lockfd:-}" ]; then eval "exec ${_lockfd}>&-"; _lockfd=""; fi
+        if [ "${1:-2}" -eq 0 ]; then
+            rm -rf "$RUN"
+            echo -e "   run directory removed (clean pass); build cache kept at $SCR"
+        else
+            echo -e "   ${COLOR_YELLOW}run directory KEPT for inspection: $RUN${COLOR_RESET}"
+            echo -e "   (flat-{base,cur,armed}-{x86,arm}.bin · worktree.patch · build.log)"
+        fi
+        return 0
+    }
 
     echo -e "${COLOR_PURPLE}══ knoboff: $feat ══${COLOR_RESET}"
     echo -e "   baseline   ${base_sha}  $(cd "$REPO" && git log --format=%s -1 "$base_sha" | cut -c1-64)"
     echo -e "   current    ${head_sha}$([ "$dirty" -eq 1 ] && echo ' + uncommitted diff')"
     echo -e "   knob-off   x86: [${off_csv:-<none>}]   arm: [${off_arm:-<none>}]"
     echo -e "   knob-on    x86: [${on_csv}]   arm: [${on_arm:-<none>}]"
-    echo -e "   tree       $TREE   (both builds run HERE — one directory, no path delta)"
+    echo -e "   tree       $TREE   (all three builds of THIS run go HERE — one directory, no path delta)"
+    echo -e "   caller     $REPO   (the key above: no other executor's run shares this directory)"
+    echo -e "   run        $RUN"
     echo -e "   log        $LOG"
 
     ( cd "$REPO" && git diff HEAD ) > "$PATCHF"
@@ -8445,7 +8832,7 @@ knoboff() {
         ( cd "$REPO" && git worktree prune ) >/dev/null 2>&1 || true
         if ! ( cd "$REPO" && git worktree add --detach "$TREE" "$base_sha" ) >>"$LOG" 2>&1; then
             echo -e "${COLOR_RED}knoboff: NO VERDICT — could not create the throwaway worktree; see $LOG${COLOR_RESET}"
-            return 2
+            _knoboff_bye 2; return 2
         fi
     fi
 
@@ -8471,19 +8858,19 @@ knoboff() {
     }
 
     local rc_base_x rc_base_a rc_cur_x rc_cur_a rc_on_x rc_on_a
-    local F_BX="$SCR/flat-base-x86.bin"  F_BA="$SCR/flat-base-arm.bin"
-    local F_CX="$SCR/flat-cur-x86.bin"   F_CA="$SCR/flat-cur-arm.bin"
-    local F_OX="$SCR/flat-armed-x86.bin" F_OA="$SCR/flat-armed-arm.bin"
+    local F_BX="$RUN/flat-base-x86.bin"  F_BA="$RUN/flat-base-arm.bin"
+    local F_CX="$RUN/flat-cur-x86.bin"   F_CA="$RUN/flat-cur-arm.bin"
+    local F_OX="$RUN/flat-armed-x86.bin" F_OA="$RUN/flat-armed-arm.bin"
 
     echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF...${COLOR_RESET}"
     if ! _knoboff_checkout "$base_sha" ""; then
-        echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; return 2; fi
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
     rc_base_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_BX" "$LOG" || rc_base_x=$?
     rc_base_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_BA" "$LOG" || rc_base_a=$?
 
     echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF...${COLOR_RESET}"
     if ! _knoboff_checkout "$head_sha" "$PATCHF"; then
-        echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; return 2; fi
+        echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
     rc_cur_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_CX" "$LOG" || rc_cur_x=$?
     rc_cur_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_CA" "$LOG" || rc_cur_a=$?
 
@@ -8494,7 +8881,7 @@ knoboff() {
     if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — a knob-OFF build failed (x86 base:$rc_base_x arm base:$rc_base_a x86 cur:$rc_cur_x arm cur:$rc_cur_a).${COLOR_RESET}"
         echo -e "         tail of $LOG:"; tail -20 "$LOG" | sed 's/^/         /'
-        return 2
+        _knoboff_bye 2; return 2
     fi
 
     # (7) CONTROL. Armed must differ from off on at least one arch. An x86-only feature legitimately
@@ -8528,7 +8915,7 @@ knoboff() {
             echo -e "         control to get a verdict out of it; the control is the only reason the refusal is"
             echo -e "         trustworthy in every OTHER case. (pi 7, SP2's neighbour, 2026-09-06.)"
         fi
-        return 2
+        _knoboff_bye 2; return 2
     fi
 
     # (8) VERDICT.
@@ -8571,7 +8958,7 @@ knoboff() {
         echo -e "${COLOR_RED}         panic::Location below it. Append onto an existing line (before its first //) or${COLOR_RESET}"
         echo -e "${COLOR_RED}         put the statement inside an existing cfg region. EXECUTOR-BRIEF §5.${COLOR_RESET}"
     fi
-    echo -e "   flat images kept in $SCR (flat-{base,cur,armed}-{x86,arm}.bin); patch $PATCHF"
+    _knoboff_bye "$rc"
     return $rc
 }
 

@@ -34,7 +34,7 @@ pub mod fs;
 // net4 (RTL8168), aarch64 vnet (virtio-net). Lives at the crate root (NOT under a `net` module: the
 // extern crate `net` would be shadowed). Gated on any net feature => vanishes with its smoltcp dep when
 // all are off. See net_phy.rs / unaos/docs/dev/OS/08_NET/networking.md.
-#[cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet"))]
+#[cfg(any(feature = "net4", feature = "vnet", feature = "smolnet", feature = "genet", feature = "net6"))] // NET6 joins the gate (LINE-NEUTRAL edit of the existing attribute): the shared aarch64 socket surface is a TAIL module of net_phy.rs.
 pub mod net_phy;
 
 // SOCK-1: the smoltcp Device adapter over the e1000e. x86-only + feature-gated so aarch64 and
@@ -105,7 +105,7 @@ pub mod install;
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
-    feature = "holocron", feature = "selfup", feature = "facet" // ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved.
+    feature = "holocron", feature = "selfup", feature = "facet", feature = "login", feature = "ga10bprobe5" // LOGIN: fs/users.rs CRC-32s its store and SHA-256s the credential. ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved. GA10B-PROBE5 (orin-0912b): the rung-5 firmware loader digests each vendor section IN the DMA window with this Sha256 — one more term on the same line, no line moved.
 ))]
 pub mod hash;
 

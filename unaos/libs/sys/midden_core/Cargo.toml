@@ -21,3 +21,7 @@ description = "Midden core: the ring-neutral shell interpreter — one command t
 [features]
 default = ["std"]
 std = []
+# LOGIN (RULINGS R51): the `login` / `logout` host verbs exist where the human-user line is built —
+# forwarded by the kernel's `login` feature (`login = ["midden_core/login"]`), so a knob-off image
+# carries the pre-LOGIN table byte for byte (`./arroyo knoboff login`). Default OFF.
+login = []

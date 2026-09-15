@@ -506,6 +506,16 @@ pub fn publish_app(owner: wm::WinId, items: &'static [MenuItem]) -> bool {
 /// INSIDE `strip::compose_all`, so an owner change clears menu STATE through [`dismiss_state`] on
 /// PANEL V-1's rule, exactly as [`set_bar_owner`] does, and [`compose`] discharges the erase later
 /// in the same pass.
+///
+/// WINTITLE-LATE — the witness now also says **WHY the bar is showing that name**, as
+/// `from=declared|program|document|unnamed` ([`wm::TitleSource`]). Without it the line cannot
+/// distinguish the two states render13 put side by side: `name=Application` is what an EL0 window
+/// reads when no launcher name reached it (`from=unnamed`) and the fix is that a launched program
+/// reads `name=VUG from=program` — and "Application" is, by construction, also a perfectly legal
+/// DECLARED name, so the caption alone can never convict. The source is read through
+/// [`wm::title_source_of`], which is a relaxed atomic load and NOT a table acquisition: this
+/// function's "no lock, no composite" contract above is unchanged, and it is load-bearing, because
+/// this runs inside `strip::compose_all`.
 pub fn set_app_window(id: wm::WinId, name: &[u8]) {
     let n = name.len().min(wm::MAX_TITLE);
     let (mut lo, mut hi) = (0u64, 0u64);
@@ -531,9 +541,10 @@ pub fn set_app_window(id: wm::WinId, name: &[u8]) {
     if id != wm::WIN_NONE {
         let (buf, len) = app_name();
         serial_println!(
-            "[winmenu] app-menu owner={} name={} kind={}",
+            "[winmenu] app-menu owner={} name={} {} kind={}",
             id,
             core::str::from_utf8(&buf[..len]).unwrap_or("?"),
+            wm::title_source_of(id).as_from_str(), // WINTITLE-LATE — the field name rides INSIDE the literal (`from=program`), so `LC_ALL=C grep -a -o -F 'from=program'` certifies the shape on the artifact; a `from={}` split leaves nothing longer than five bytes to grep for. See `wm::TitleSource::as_from_str`.
             if app_menu_is_custom(id) { "custom" } else { "default" }
         );
     }
@@ -1414,7 +1425,7 @@ pub fn key_escape(ev: crate::pal::Event) -> bool {
 fn app_pick(win: wm::WinId, id: u32) {
     match id {
         APP_ITEM_QUIT => {
-            clear(win); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let closed = (crate::video::pulsewin::win() == win && crate::video::pulsewin::close()) || wm::close(win); // A30FIX — see this fn's header. The OWNING MODULE's close runs first when this is its window: `pulsewin::close()` disarms the latch BEFORE it swaps the id, then does the same `winmenu::clear` + `wm::close` + surface teardown the red disc does, so Quit and the disc are now ONE path emitting one witness pair. `||` short-circuits, so `wm::close` is not called twice; a non-pulse window (and every window on a desktop that never armed the instrument, where `win()` is `WIN_NONE` and no real id can equal it) takes the right-hand side exactly as before.
+            clear(win); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let closed = (crate::video::pulsewin::win() == win && crate::video::pulsewin::close()) || quarry_quit(win) || instgui_quit(win) || wm::close(win); // QUITLEAK — the A30FIX shape, now applied to EVERY app that owns state outside the window table, not just the pulse instrument. `quarry_quit`/`instgui_quit` are this file's tail-appended owner arms (see them for why they are functions rather than two more folded sub-expressions: each carries a NARROWER `cfg` than this line's, `quarry` needs `feature = "quarry"` on top of the furniture family and `instgui` needs `all(x86_64, wc, instgui)`, and a folded sub-expression cannot carry a `cfg` of its own without becoming a second line). Order is pulse, quarry, instgui, bare — the modules are disjoint owners, so the order is only a search, and `||` short-circuits so exactly one close runs and `wm::close` is never called twice. A30FIX — see this fn's header. The OWNING MODULE's close runs first when this is its window: `pulsewin::close()` disarms the latch BEFORE it swaps the id, then does the same `winmenu::clear` + `wm::close` + surface teardown the red disc does, so Quit and the disc are now ONE path emitting one witness pair. `||` short-circuits, so `wm::close` is not called twice; a non-pulse window (and every window on a desktop that never armed the instrument, where `win()` is `WIN_NONE` and no real id can equal it) takes the right-hand side exactly as before.
             #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] let closed = wm::close(win); // A30FIX — the KNOB-OFF twin, and the reason the arm above is a whole `let` rather than a folded sub-expression. The gate is `video/mod.rs`'s own predicate on `pub mod pulsewin`; `winmenu.rs` is a bare `pub mod` and IS compiled into the knob-off `kernel8.img`, where that module does not exist. This line is token-for-token the statement that stood here before the arc, so the knob-off image gets not one changed byte — not an inference about what LLVM folds. ⚠ Both arms are FOLDED onto lines that already existed: knob-off line numbers are load-bearing (panic `Location`) — PARITY.md §5.3.
             serial_println!("[winmenu] app-menu quit win={} closed={}", win, closed);
         }
@@ -1708,8 +1719,8 @@ pub fn rollup(scope: &str) {
 /// uses to reach `menubar::selftest`: the x86 battery calls one furniture fixture and the family
 /// chains, so a new surface does not need a line in a file another lane owns.
 ///
-/// Five legs, each able to red on its own. It mints its own window, so nothing the operator's boot
-/// put on the panel is at risk, and it closes that window itself if `Quit` did not.
+/// Six legs, each able to red on its own. It mints its own windows, so nothing the operator's boot
+/// put on the panel is at risk, and it closes them itself if `Quit` did not.
 ///
 /// 1. **every window has an app menu** (SO3) — a window that has published NOTHING lays out a title
 ///    box carrying its own name. This is the ruling's whole claim, and it is the leg that reds if
@@ -1727,6 +1738,12 @@ pub fn rollup(scope: &str) {
 ///    `wm::info` answers `None` and `[wc-a] close win=` is on the wire beside `[winmenu] pick …
 ///    label=Quit -> close win=`. A `Quit` that dismissed the menu and did nothing else would pass
 ///    legs 1-4 and red here.
+/// 6. **the bar names a LAUNCHED PROGRAM, and the wire says where the name came from** (R36,
+///    WINTITLE-LATE) — legs 1-5 all run on a kernel window that declared itself, so none of them can
+///    see the EL0 case. This one mints an EL0-band window over the arch seam's generated label,
+///    arms the launcher name AFTER it exists (the order the metal produces), and requires the bar to
+///    read `VUG` with `[winmenu] app-menu … from=program` beside it. RED on this arc's base, where
+///    the caption stays `Application` — which render13 boot 1 put on four of six launched windows.
 #[cfg(feature = "witness")]
 pub fn selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -1826,20 +1843,66 @@ pub fn selftest() {
     if wm::info(win).is_some() {
         wm::close(win);
     }
+
+    // Leg 6 — **APPNAME (WINTITLE-LATE): the bar names a LAUNCHED PROGRAM, and says so.**
+    //
+    // Legs 1-5 run on a KERNEL-owned window that declared itself `gate`, so every one of them is a
+    // `from=declared` story. The case render13 convicted is the other one: an EL0 tenant whose
+    // window was minted from the arch seam's generated label (`el0 win N`) and whose name arrives
+    // from the launcher — LATE, because `spawn_user_image_bg` makes the task runnable before it
+    // returns. So this leg drives the LOSING order on purpose (create, THEN arm) and requires the
+    // BAR to end up reading `VUG`, through the same focus-then-composite path leg 1 uses rather
+    // than a forced `set_app_window` (see leg 1's note for why a forced value proves nothing).
+    //
+    // It is a measurement and not a tautology: `unnamed_first` asserts the window really did take
+    // the unnamed clause before the arm landed. On this arc's base the caption stays `Application`
+    // and the line says `from=unnamed`.
+    //
+    // An EL0-BAND owner, outside the kernel reserve, because `mint_title`'s app clauses are what is
+    // under test — asserted against `KERNEL_OWNER_BASE` rather than assumed.
+    const PROG_OWNER: u64 = 0xA9F1;
+    const _: () = assert!(PROG_OWNER < wm::KERNEL_OWNER_BASE);
+    let wprog = wm::create(
+        PROG_OWNER,
+        SURF.as_ptr() as usize,
+        core::mem::size_of_val(&SURF),
+        FIX_W as u32,
+        FIX_W as u32,
+        FIX_STRIDE as u32,
+        b"el0 win 3",
+    );
+    let leg_prog = wprog != wm::WIN_NONE && {
+        let unnamed_first = wm::title_source_of(wprog) == wm::TitleSource::Unnamed;
+        let armed_late = wm::app_name_arm(PROG_OWNER, "/apps/VUG.ELF");
+        wm::focus_changed(PROG_OWNER);
+        wm::composite();
+        let s2 = bar_boxes(pw, ph);
+        let v = unnamed_first
+            && armed_late
+            && s2.app
+            && s2.app_owner == wprog
+            && s2.label_of(0) == b"VUG"
+            && APP_OWNER.load(Ordering::Relaxed) == wprog
+            && wm::title_source_of(wprog) == wm::TitleSource::Program;
+        wm::close(wprog);
+        wm::app_name_forget(PROG_OWNER);
+        v
+    };
+
     dismiss("selftest");
     wm::focus_changed(saved_focus);
     menubar::set_enabled(saved_bar);
 
     let (rx, ry, rw, rh) = r.map(|(x, y, w, h)| (x, y, w, h)).unwrap_or((0, 0, 0, 0));
-    let ok = leg_box && leg_open && leg_geom && leg_esc && leg_quit;
+    let ok = leg_box && leg_open && leg_geom && leg_esc && leg_quit && leg_prog;
     serial_println!(
         ":: WINMENU: win={} name=gate box={}x{}+{} title-x={} drop={}x{}+{}+{} font={} panel={}x{} \
-         app_box={} routed_open={} geometry={} escape={} quit_closes={} :: {} ::",
+         app_box={} routed_open={} geometry={} escape={} quit_closes={} app_name_late={} :: {} ::",
         win, s.w[0], bh, s.x[0], s.text_x(0), rw, rh, rx, ry, menubar::BAR_FONT_NAME, pw, ph,
-        leg_box, leg_open, leg_geom, leg_esc, leg_quit,
+        leg_box, leg_open, leg_geom, leg_esc, leg_quit, leg_prog,
         if ok { "PASS" } else { "FAIL" }
     );
-    rollup("selftest");
+    rollup("selftest"); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { pulsequit_selftest(); appquit_selftest(); } // QUITLEAK — `appquit_selftest` is the SIBLING of the fixture beside it, not an extension of it, and the reason is `cfg` polarity: `pulsequit_selftest`'s body may name `pulsewin` unconditionally under this line's gate, while the quarry legs need `feature = "quarry"` and the instgui legs need `all(x86_64, wc, instgui)` on top of it — folding them in would put `cfg` blocks through the middle of A30's verdict and let a SKIP in one app muddy the pulse line. Two fixtures, two verdict lines, one app named per leg. It runs AFTER the pulse fixture for the pulse fixture's own reason: that one takes a window the BOOT owns down and puts the latch back, and nothing may inherit its panel mid-flight. ⚠ The two calls are FOLDED into a block on the line that already existed: `winmenu.rs` is a bare `pub mod` and IS lexed into the knob-off image — PARITY.md §5.3. PULSEQUIT (A30) — the pulse window's close gate, at this fixture's tail and for this fixture's own reason: `crystal::selftest` calls ONE furniture fixture and the family chains, so A30's gate needs no line in `arch/x86_64/syscall.rs`. LAST, because it is the only leg here that touches a window the BOOT owns — it takes a standing pulse window down, arms the latch twice and puts both back — so no leg above may inherit its panel. ⚠ FOLDED onto this line rather than added below it: `winmenu.rs` is a bare `pub mod` and IS lexed into the knob-off image — PARITY.md §5.3. The fixture BODY is tail-appended past the compile-time asserts, where nothing below it can move.
 }
 
 // ---------------------------------------------------------------------------
@@ -1873,3 +1936,585 @@ const _: () = {
     // SO3 — `Quit` and `About` must be distinguishable, or `app_pick` cannot route.
     assert!(APP_ITEM_QUIT != APP_ITEM_ABOUT);
 };
+
+// ---------------------------------------------------------------------------
+// PULSEQUIT — A30's gate (TAIL-APPENDED: nothing above this line moved)
+// ---------------------------------------------------------------------------
+
+/// PULSEQUIT fixture — **A30: closing the pulse window CLOSES it, by EITHER gesture.**
+///
+/// Peter, render7: *"closing pulse reopens it immediately"*; render8 then resolved that complaint
+/// into TWO defects, and `a84464fe` fixed both — the `ARMED` disarm moved to the head of
+/// [`super::pulsewin::close`] (cause 1, the close-box race), and this file's `Quit` arm routed
+/// through that same close instead of a bare [`wm::close`] (cause 2, the bypass). **Neither fix had
+/// a gate.** The only instrument either one ever had was a bench flight, so the fold could be
+/// re-proved only by another sitting on the Orin — which is exactly the class of fix that comes
+/// back. This is the QEMU gate the fold went in without.
+///
+/// ## Where it lives and why
+///
+/// Appended at the TAIL of `winmenu.rs`, reached by one folded statement at the foot of
+/// [`selftest`], which is itself reached from `crystal::selftest`'s tail — `dock::selftest` ->
+/// `menubar::selftest` is the same arrangement, and the reason for it is the same: **a new surface
+/// does not need a line in a file another lane owns.** The A30 fix spans `pulsewin.rs` and this
+/// file, and so does its gate; the x86 witness ladder in `arch/x86_64/syscall.rs` is not touched.
+///
+/// ## The rounds, and what each one can actually falsify
+///
+/// **THE LATCH IS ARMED FIRST, and that is not a convenience.** `disarm_before_swap` is a constant
+/// `1` on any close that entered with the latch already clear, so a fixture that closes an unarmed
+/// window is scoring a check that cannot fire. [`super::pulsewin::arm`] is therefore called before
+/// every round — and its STICKY half is saved and handed back at the end
+/// ([`super::pulsewin::ever_armed_restore`]), because a gate may not change the desktop it measures.
+///
+/// **`remint_live=` — WHAT THE RENDER PASS CAN AND CANNOT PROVE ON THIS BOOT, said on the wire
+/// instead of assumed.** The window is minted by asking for it the way the desktop does: `arm()`,
+/// then one [`super::pulsewin::service`] pass. On the Orin that pass mints, and the service passes
+/// after each close are then a real falsification of A30 — the pre-fix tree re-opened the window on
+/// exactly such a pass, five lines later on the render8 wire. **On the x86 `wc` boot it does not
+/// mint, and the fixture says so rather than passing quietly**: `service`'s open arm needs
+/// `ui_status::loads` to report a live instrument, `ui_status::tick` is the only thing that arms
+/// that, and it never runs on this path — measured, `[pstrip]` appears zero times in a
+/// `UNAOS_WC=1 ./arroyo test` capture. There the fixture mints with [`super::pulsewin::open`]
+/// directly, prints `remint_live=false`, and the service legs are inert while every leg that
+/// DECIDES the verdict — the seal bits and the close counter below — stays falsifiable. No window
+/// at all (no panel, or `create` declined) is `SKIP`.
+///
+/// **ROUND 1 — the close disc**, pressed at the centre of the rect the compositor actually drew
+/// ([`wm::close_box_rect`], which exists for this), through [`super::pulsewin::press_route`] — the
+/// seam the arch click routers call, not `close()` directly. Then ONE service pass, which on the
+/// pre-fix tree is the pass that re-opened the window five lines later on the render8 wire.
+///
+/// **ROUND 2 — the app-menu `Quit`**, driven the way [`selftest`]'s leg 5 drives it: a routed press
+/// on the bar's app box, then a routed press on the `Quit` row, both through
+/// [`super::strip::press_route`]. Then one service pass.
+///
+/// ## The three bits that make the ORDER falsifiable, not just the end state
+///
+/// An end-state test — "after `close()` returns, the latch is clear" — passes on A30's ORIGINAL
+/// tree, where the disarm sat one statement below `wm::close`. That tree is the one render8
+/// convicted. So each round also scores `seal`, the three bits
+/// [`super::pulsewin::close_census`] returns from the close itself:
+///
+/// | bit | name                  | reds when                                                      |
+/// |-----|-----------------------|----------------------------------------------------------------|
+/// |  0  | `disarm_before_swap`  | the disarm is anywhere below the `WIN` swap (A30 cause 1's position) |
+/// |  1  | `sealed`              | the close ended with a window or a latch still standing          |
+/// |  2  | `surf_freed`          | `SURF` survived — the id cell was cleared by A29's holder registry from inside `wm::close` and this module's teardown never ran (A30 cause 2's exact signature) |
+///
+/// `seal=7` is the only passing value. Round 2 additionally requires the close COUNTER to have
+/// advanced: a `Quit` that took the bare `wm::close(win)` never reaches `pulsewin::close`, so the
+/// counter stands still and the bit-2 value it would have written is stale.
+///
+/// ## The wire
+///
+/// One line, in A30's own flight vocabulary so a QEMU verdict and a render-flight verdict read the
+/// same: `pulsewin_open=` mints charged to this fixture, `close=` closes taken, `close_final=`
+/// closes that were still closed after a render pass, `dock_rearm=` deliberate re-arms. The passing
+/// shape is `pulsewin_open=2 close=2 close_final=2 dock_rearm=2`, and `pulsewin_open` above 2 is
+/// A30 itself — one window opened N times, which is how `A18 cascade: pulsewin_open=8` read for a
+/// single window on render8.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+pub fn pulsequit_selftest() {
+    use super::pulsewin;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = panel();
+    if pw == 0 || ph == 0 {
+        serial_println!(":: PULSEQUIT: no panel :: SKIP ::");
+        return;
+    }
+    let saved_bar = menubar::enabled();
+    let saved_focus = wm::focus_asid();
+    let saved_sticky = pulsewin::ever_armed();
+    menubar::set_enabled(true);
+    // Start from a known state. If the boot left a pulse window standing it is taken down through
+    // the module's own close, so every count below is charged to this fixture and to nothing else.
+    if pulsewin::is_open() {
+        pulsewin::close();
+    }
+    let (opens0, closes0, _) = pulsewin::close_census();
+
+    // --- MINT, and MEASURE whether the render pass can mint on this boot --------------------
+    pulsewin::arm();
+    pulsewin::service();
+    let remint_live = pulsewin::is_open();
+    if !remint_live {
+        // `service`'s open arm declined (see the header's `remint_live=` note). Mint directly so
+        // the two gestures still have a real window to be delivered to, and let the verdict line
+        // carry the fact that the service legs below are inert on this board.
+        pulsewin::open();
+    }
+    if !pulsewin::is_open() {
+        // No window by EITHER route: no panel of a usable size, or `wm::create_at` declined. That
+        // is a fixture that could not set up, not a close that failed. `close()` here is the
+        // DISARM rather than a teardown, so the latch this fixture set does not outlive it.
+        pulsewin::close();
+        pulsewin::ever_armed_restore(saved_sticky);
+        menubar::set_enabled(saved_bar);
+        wm::focus_changed(saved_focus);
+        serial_println!(
+            ":: PULSEQUIT: no pulse window — neither service() nor open() minted one on this panel, so there is no close to gate :: SKIP ::"
+        );
+        return;
+    }
+
+    // --- ROUND 1: THE CLOSE DISC (A30 cause 1) ---------------------------------------------
+    let w1 = pulsewin::win();
+    wm::focus_changed(pulsewin::OWNER);
+    wm::composite();
+    let (r1_routed, r1_seal, r1_closes) = match wm::close_box_rect(w1) {
+        Some((cx, cy, d)) => {
+            let hit = pulsewin::press_route((cx + d / 2) as i32, (cy + d / 2) as i32);
+            let (_, c, s) = pulsewin::close_census();
+            (hit, s, c)
+        }
+        // No control cluster on the row is a fixture that could not deliver the gesture, not a
+        // defect in the close — named, and it reds, because on this gate's own panel every kernel
+        // row is drawn with a close disc.
+        None => (false, 0, closes0),
+    };
+    pulsewin::service();
+    let r1_final = !pulsewin::is_open() && !pulsewin::armed() && wm::info(w1).is_none();
+    let r1 = r1_routed && r1_final && r1_seal == 7 && r1_closes == closes0 + 1;
+
+    // --- ROUND 2: THE APP-MENU QUIT (A30 cause 2) ------------------------------------------
+    pulsewin::arm();
+    pulsewin::service();
+    if !pulsewin::is_open() {
+        pulsewin::open();
+    }
+    let w2 = pulsewin::win();
+    wm::focus_changed(pulsewin::OWNER);
+    wm::composite();
+    let s = bar_boxes(pw, ph);
+    let (_bx, by, _bw, bh) = s.bar;
+    let bar_named = w2 != wm::WIN_NONE && s.app && s.app_owner == w2 && s.n >= 1;
+    let menu_down = bar_named
+        && strip::press_route((s.x[0] + s.w[0] / 2) as i32, (by + bh / 2) as i32)
+        && is_open()
+        && OPEN_APP.load(Ordering::Relaxed)
+        && OPEN_OWNER.load(Ordering::Relaxed) == w2;
+    let (r2_routed, r2_seal, r2_closes) = match (menu_down, open_rect(pw, ph)) {
+        (true, Some((mx, my, mw, _mh))) => {
+            // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
+            // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
+            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H / 2;
+            let hit = strip::press_route((mx + mw / 2) as i32, qy as i32);
+            let (_, c, sl) = pulsewin::close_census();
+            (hit, sl, c)
+        }
+        _ => (false, 0, r1_closes),
+    };
+    pulsewin::service();
+    let r2_final = !pulsewin::is_open() && !pulsewin::armed() && wm::info(w2).is_none();
+    // THE BYPASS TEST. A bare `wm::close(win)` reaps the row and A29's holder registry clears
+    // `pulsewin::WIN` from inside it, so `is_open()` answers false and `wm::info` answers `None`
+    // on the broken tree too — for one pass. What the bypass CANNOT do is reach this module's
+    // close, so the counter is the discriminator and the latch is the consequence.
+    let r2_owned = r2_closes == closes0 + 2;
+    let r2 = r2_routed && r2_final && r2_owned && r2_seal == 7;
+
+    // Restore. No fixture leaves a window on the operator's desktop, and this one armed the latch
+    // twice, so the latch goes back the way it was found even if a leg red left a window standing.
+    if pulsewin::is_open() {
+        pulsewin::close();
+    }
+    dismiss("pulsequit");
+    wm::focus_changed(saved_focus);
+    menubar::set_enabled(saved_bar);
+    pulsewin::ever_armed_restore(saved_sticky);
+
+    let (opens, closes, _) = pulsewin::close_census();
+    let ok = r1 && r2;
+    serial_println!(
+        ":: PULSEQUIT: pulsewin_open={} close={} close_final={} dock_rearm={} remint_live={} \
+         close_box_routed={} close_box_seal={} close_box_final={} \
+         quit_bar_named={} quit_menu_down={} quit_routed={} quit_seal={} quit_owner_close={} quit_final={} \
+         win1={} win2={} panel={}x{} :: {} ::",
+        opens.wrapping_sub(opens0),
+        closes.wrapping_sub(closes0),
+        (r1_final as u32) + (r2_final as u32),
+        2,
+        remint_live,
+        r1_routed, r1_seal, r1_final,
+        bar_named, menu_down, r2_routed, r2_seal, r2_owned, r2_final,
+        w1, w2, pw, ph,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    pulsewin::rollup("pulsequit");
+}
+
+// ---------------------------------------------------------------------------
+// QUITLEAK — the OWNER ARMS of the app-menu `Quit`, and their gate
+// (TAIL-APPENDED: nothing above this line moved)
+// ---------------------------------------------------------------------------
+//
+// A30 established the shape on one window: a `Quit` for a window whose MODULE keeps state outside
+// the window table must run that module's own `close()`, because `wm::close` cannot. A29's WINID
+// holder registry clears an ID CELL; it cannot free a `Vec`, drop a model or resume a suspended
+// present. PULSEQUIT then measured that two more windows still took the bare `wm::close(win)`:
+//
+//   * QUARRY   — `quarry::live::close()` drops `MODEL` and clears `SURF`. The bypass leaks both.
+//   * INSTGUI  — `instgui::close()` also calls `fbcon::console_present_suspend(false)`. The bypass
+//                leaves THE CONSOLE PRESENTS SUSPENDED, on a desktop with no dialog left to explain
+//                it. That is the LOGINCLOSE stranding class (`video/login.rs`, fold `6fee8b3a`)
+//                arriving through a different door, and it is the serious one: it does not leak a
+//                buffer, it takes the console away for the rest of the boot.
+//
+// NEITHER REOPENS. Neither module has an `ARMED` latch, which is why render8's control — the same
+// app-menu `Quit` on the Quarry window — read clean: the window did stay closed. What it could not
+// see is that nothing was released. So this is a LEAK and a STRANDING, not a reopen, and the
+// instrument has to be the module's own close COUNTER plus what that close re-reads about itself.
+//
+// WHY THESE ARE FUNCTIONS and not two more sub-expressions folded into the `Quit` arm: each carries
+// a NARROWER `cfg` than that line's. `quarry`'s implementation is behind `feature = "quarry"` on top
+// of the furniture family (`video/quarry.rs` is the knob seam; `live` exists only with the feature),
+// and `instgui` is `all(target_arch = "x86_64", feature = "wc", feature = "instgui")`. A folded
+// sub-expression cannot carry a `cfg` of its own without becoming a second statement, and the `Quit`
+// arm is LINE-NEUTRAL — `winmenu.rs` is a bare `pub mod` and is compiled into the knob-off image, so
+// a line added there moves every `panic::Location` below it (PARITY.md §5.3). Appended here instead,
+// past the compile-time asserts and past PULSEQUIT's body, where nothing can move — and gated on the
+// furniture family, so the knob-off build lexes these lines and compiles none of them.
+
+/// QUITLEAK — the QUARRY arm. `true` when this was Quarry's window and Quarry's own close ran it.
+#[cfg(all(
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ),
+    feature = "quarry"
+))]
+fn quarry_quit(win: wm::WinId) -> bool {
+    // `live::win()` rather than the `video::quarry` seam, deliberately: the seam re-exports `close`
+    // in both polarities but has no `win`, and adding one there would edit a file this arc was not
+    // given. Under this `cfg` the implementation module is public and nameable, so nothing is owed.
+    crate::video::quarry::live::win() == win && {
+        crate::video::quarry::live::close();
+        true
+    }
+}
+
+/// QUITLEAK — the QUARRY arm with the file manager not compiled in. There is no Quarry window, so
+/// the answer is `false` and the `Quit` falls through to `wm::close` exactly as it did before.
+#[cfg(all(
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ),
+    not(feature = "quarry")
+))]
+#[inline(always)]
+fn quarry_quit(_win: wm::WinId) -> bool {
+    false
+}
+
+/// QUITLEAK — the INSTGUI arm. `true` when this was the installer dialog and its own close ran it,
+/// which is the call that hands the console back its presents.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+fn instgui_quit(win: wm::WinId) -> bool {
+    crate::video::instgui::win() == win && {
+        crate::video::instgui::close();
+        true
+    }
+}
+
+/// QUITLEAK — the INSTGUI arm with the installer not compiled in (every aarch64 build, and every
+/// x86 build without `UNAOS_INSTGUI=1`).
+#[cfg(all(
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ),
+    not(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))
+))]
+#[inline(always)]
+fn instgui_quit(_win: wm::WinId) -> bool {
+    false
+}
+
+/// QUITLEAK fixture — **an app-menu `Quit` runs THAT APP's teardown, for every app.**
+///
+/// The sibling of [`pulsequit_selftest`], not an extension of it: that fixture's body may name
+/// `pulsewin` under the furniture family's `cfg` alone, while these legs need `feature = "quarry"`
+/// and `all(x86_64, wc, instgui)` on top of it. Folding them in would run `cfg` blocks through the
+/// middle of A30's verdict line and let a SKIP in one app muddy the pulse verdict. Two fixtures,
+/// two verdict lines, and each leg names the app it is about.
+///
+/// ## What each round drives, and through which seams
+///
+/// The same two presses [`selftest`]'s leg 5 and [`pulsequit_selftest`]'s round 2 use, and for the
+/// same reason — a fixture that called `app_pick` directly would be testing a function, not a
+/// gesture: focus the app's own window and composite (which is what publishes the bar's app box,
+/// through `menubar::compose` -> [`set_app_window`]), press the APP BOX through
+/// [`strip::press_route`], then press the `Quit` ROW at `item_top(APP_MENU_DEFAULT, 2)` through the
+/// same router. Everything after that is the real chain: [`press_at`] -> [`app_pick`] -> the owner
+/// arm.
+///
+/// ## What the verdict can falsify, which is the whole point
+///
+/// **Every END-STATE question answers identically on the broken tree.** A bare `wm::close(win)`
+/// reaps the row, and A29's holder registry clears the module's own `WIN` cell from inside it — so
+/// `win()` reads `WIN_NONE` and `wm::info` reads `None` either way. `row_gone=` is therefore
+/// reported and is NOT what convicts. What convicts is what the bypass cannot reach:
+///
+/// * `owner_close=` — the module's close COUNTER advanced by exactly one. A `Quit` that never
+///   entered the module's `close()` leaves it where it was.
+/// * quarry `model_freed=` / `surf_released=` — re-read by `quarry::live::close` after its own
+///   teardown. They mean something ONLY beside `owner_close=`, and the verdict requires the pair: a
+///   close that never ran never wrote them, so what a bypassed round reads is STALE rather than a
+///   measurement of that close. The bypass tree reads `owner_close=false seal=0` — a window gone
+///   from the table with the model still allocated and the panel-sized surface still published.
+/// * instgui `resumed=` — the module's mirror of its last `fbcon::console_present_suspend` call is
+///   back to `false`. On the bypass it is still `true`, which is a desktop that no longer presents
+///   the console. `susp_at_open=` is printed beside it so a green `resumed=` cannot be the vacuous
+///   kind: if the dialog never suspended in the first place, the resume proves nothing and the leg
+///   reds instead of passing quietly.
+///
+/// ## SKIP is never silent, and one SKIP here is a FINDING
+///
+/// `quarry` and `instgui` are separately armed features. On a `UNAOS_WC=1 ./arroyo test` boot with
+/// neither, both rounds print a SKIP that NAMES the missing knob — a leg that cannot fire must never
+/// be indistinguishable from one that passed. The run that gates this arc arms both.
+///
+/// **With both armed, QUARRY passes and INSTGUI still SKIPs, and the reason is a defect this fixture
+/// found rather than a knob**: the installer dialog is minted `wm::create_at(0, …)` and
+/// `wm::dock_addressable` refuses `owner_asid == 0`, so the bar can never give that window an app
+/// box and the app-menu `Quit` cannot reach it at all. The arm is still the right contract — and is
+/// UNGATED until that window becomes dock-addressable. See [`instgui_round`], which measures the
+/// unreachability on the wire instead of asserting it.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+pub fn appquit_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = panel();
+    if pw == 0 || ph == 0 {
+        serial_println!(":: APPQUIT: no panel :: SKIP ::");
+        return;
+    }
+    let saved_bar = menubar::enabled();
+    let saved_focus = wm::focus_asid();
+    menubar::set_enabled(true);
+    quarry_round(pw, ph);
+    instgui_round(pw, ph);
+    // No fixture leaves a dropdown down or the bar in a state it did not find it in.
+    dismiss("appquit");
+    menubar::set_enabled(saved_bar);
+    wm::focus_changed(saved_focus);
+}
+
+/// QUITLEAK — focus `owner`, composite (which is what publishes the bar's app box, through
+/// `menubar::compose` -> [`set_app_window`]), and report the snapshot plus whether the bar NAMES `w`.
+///
+/// Split out of the delivery because "the bar names this window" is itself a finding for one of the
+/// two apps: see [`instgui_round`].
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn focus_and_bar(pw: usize, ph: usize, owner: u64, w: wm::WinId) -> (BarSnapshot, bool) {
+    wm::focus_changed(owner);
+    wm::composite();
+    let s = bar_boxes(pw, ph);
+    let named = w != wm::WIN_NONE && s.app && s.app_owner == w && s.n >= 1;
+    (s, named)
+}
+
+/// QUITLEAK — the two presses, given a bar that already names `w`. Returns `(menu_down, routed)`.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    )
+))]
+fn deliver_quit(pw: usize, ph: usize, s: &BarSnapshot, w: wm::WinId, bar_named: bool) -> (bool, bool) {
+    let (_bx, by, _bw, bh) = s.bar;
+    let menu_down = bar_named
+        && strip::press_route((s.x[0] + s.w[0] / 2) as i32, (by + bh / 2) as i32)
+        && is_open()
+        && OPEN_APP.load(Ordering::Relaxed)
+        && OPEN_OWNER.load(Ordering::Relaxed) == w;
+    let routed = match (menu_down, open_rect(pw, ph)) {
+        (true, Some((mx, my, mw, _mh))) => {
+            // `Quit` is `APP_MENU_DEFAULT`'s index 2, its vertical middle, taken from the same
+            // `item_top`/`ITEM_H` the painter and the hit-test use — leg 5's idiom.
+            let qy = my + item_top(APP_MENU_DEFAULT, 2) + ITEM_H / 2;
+            strip::press_route((mx + mw / 2) as i32, qy as i32)
+        }
+        _ => false,
+    };
+    (menu_down, routed)
+}
+
+/// QUITLEAK round — QUARRY. The app-menu `Quit` must drop `MODEL` and release `SURF`.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ),
+    feature = "quarry"
+))]
+fn quarry_round(pw: usize, ph: usize) {
+    use crate::video::quarry::live as q;
+    // A fixture may not change the desktop it measures: if the boot put Quarry on the glass it goes
+    // back on the glass at the end, and if it did not, the window this fixture minted is gone.
+    let was_open = q::is_open();
+    if !was_open {
+        q::open();
+    }
+    let w = q::win();
+    if w == wm::WIN_NONE {
+        serial_println!(":: APPQUIT: app=quarry no window — open() declined on this panel :: SKIP ::");
+        return;
+    }
+    let (c0, _) = q::close_census();
+    let (s, bar_named) = focus_and_bar(pw, ph, q::OWNER, w);
+    let (menu_down, routed) = deliver_quit(pw, ph, &s, w, bar_named);
+    let (c1, seal) = q::close_census();
+    let row_gone = q::win() == wm::WIN_NONE && wm::info(w).is_none();
+    let owner_close = c1 == c0 + 1;
+    let ok = bar_named && menu_down && routed && row_gone && owner_close && seal == 3;
+    serial_println!(
+        ":: APPQUIT: app=quarry win={} bar_named={} menu_down={} quit_routed={} row_gone={} \
+         owner_close={} model_freed={} surf_released={} seal={} was_open={} panel={}x{} :: {} ::",
+        w, bar_named, menu_down, routed, row_gone,
+        owner_close, seal & 1, (seal >> 1) & 1, seal, was_open, pw, ph,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    if was_open {
+        q::open();
+    }
+}
+
+/// QUITLEAK round — QUARRY, knob off. Named, so a green run is not read as a leg that ran.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ),
+    not(feature = "quarry")
+))]
+fn quarry_round(_pw: usize, _ph: usize) {
+    serial_println!(":: APPQUIT: app=quarry not compiled (UNAOS_QUARRY unset) — no window to quit :: SKIP ::");
+}
+
+/// QUITLEAK round — INSTGUI, **the stranding, and the REACHABILITY finding this round measured.**
+///
+/// The intent was A30's, applied to the installer: its `close()` is the only teardown in the tree
+/// that RESUMES THE CONSOLE'S PRESENTS, so a `Quit` that reaped the row with a bare `wm::close`
+/// would leave a desktop that never presents the console again. `winmenu`'s `Quit` arm now routes to
+/// [`crate::video::instgui::close`], which is the right contract either way.
+///
+/// **But the app menu cannot reach this window at all, and this round is what measured it.** The
+/// dialog mints with `wm::create_at(0, …)` — owner `0` — and `wm::dock_addressable` is
+/// `r.used && !r.compat && r.owner_asid != 0`. So `wm::dock_scan` never emits the row,
+/// `menubar::Model::read`'s caption reduction never sees it, `winmenu::APP_OWNER` is never set to it,
+/// and `bar_boxes` lays out no app box for it. Measured on `UNAOS_QEMU_FULL=1 UNAOS_WC=1
+/// UNAOS_QUARRY=1 UNAOS_INSTGUI=1 ./arroyo test`: the window is live and ON THE GLASS
+/// (`[wc-a] create win=1 asid=0x0 … z=58` against `[wc-fv] focus shell z=57 hidden=0 exempt=0`) and
+/// the bar still names nothing — `bar_named=false`.
+///
+/// So this leg is a **SKIP that names its own reason**, never a silent pass and never a FAIL for a
+/// gesture the product does not offer. It prints the z it measured beside the shell floor, so the
+/// claim "the row was live, the bar simply cannot name it" is falsifiable from the wire; and it goes
+/// live by itself the day that window becomes dock-addressable. What it still measures, because the
+/// fixture must put back the dialog it opened, is that `close()`'s own teardown DOES resume the
+/// presents (`teardown_resumes=`) — the property the routing would deliver, proven on the module.
+///
+/// The door that IS open on this tree is the CLOSE DISC: `wc_close_furniture`
+/// (`arch/x86_64/syscall.rs`) is a bare `wm::close(win)` for every furniture row and `instgui` has no
+/// `press_route` of its own to intercept it. That file is outside this arc's list — reported, not
+/// touched.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+fn instgui_round(pw: usize, ph: usize) {
+    use crate::video::instgui as ig;
+    let was_open = ig::is_open();
+    if !was_open {
+        ig::open();
+    }
+    let w = ig::win();
+    if w == wm::WIN_NONE {
+        serial_println!(":: APPQUIT: app=instgui no window — open() declined on this panel :: SKIP ::");
+        return;
+    }
+    let (c0, susp_at_open) = ig::close_census();
+    // Owner 0 is the focus the caption reduction would need — and is also exactly what
+    // `dock_addressable` refuses. Both facts are measured below rather than argued.
+    let (s, bar_named) = focus_and_bar(pw, ph, 0, w);
+    if !bar_named {
+        let z = wm::info(w).map(|i| i.z).unwrap_or(0);
+        // Put the dialog back the way it was found. When this fixture opened it, that means closing
+        // it — and NOT closing it would leave the console's presents suspended for the rest of the
+        // boot, which is the very stranding this round is about. The close is also the measurement:
+        // the teardown must turn the suspension back off.
+        let teardown_resumes = if !was_open {
+            ig::close();
+            let (c1, susp_after) = ig::close_census();
+            c1 == c0 + 1 && !susp_after
+        } else {
+            false
+        };
+        serial_println!(
+            ":: APPQUIT: app=instgui win={} bar_named=false NOT-REACHABLE \
+             reason=owner0-is-not-dock-addressable (wm::create_at(0,…) vs wm::dock_addressable's \
+             owner_asid!=0, so dock_scan never emits the row and the bar has no app box) \
+             z={} shell_z={} boxes={} susp_at_open={} teardown_resumes={} was_open={} panel={}x{} :: SKIP ::",
+            w, z, wm::shell_z(), s.n, susp_at_open, teardown_resumes, was_open, pw, ph
+        );
+        return;
+    }
+    let (menu_down, routed) = deliver_quit(pw, ph, &s, w, bar_named);
+    let (c1, susp_after) = ig::close_census();
+    let row_gone = ig::win() == wm::WIN_NONE && wm::info(w).is_none();
+    let owner_close = c1 == c0 + 1;
+    // `susp_at_open` in the conjunction is what keeps `resumed` from being vacuous: a resume that
+    // was never preceded by a suspension proves nothing about the defect this leg exists for.
+    let resumed = !susp_after;
+    let ok = menu_down && routed && row_gone && owner_close && susp_at_open && resumed;
+    serial_println!(
+        ":: APPQUIT: app=instgui win={} bar_named=true menu_down={} quit_routed={} row_gone={} \
+         owner_close={} susp_at_open={} resumed={} was_open={} panel={}x{} :: {} ::",
+        w, menu_down, routed, row_gone,
+        owner_close, susp_at_open, resumed, was_open, pw, ph,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    if was_open {
+        ig::open();
+    }
+}
+
+/// QUITLEAK round — INSTGUI, knob off (every aarch64 build, and every x86 build without
+/// `UNAOS_INSTGUI=1`). Named, so a green run is not read as a leg that ran.
+#[cfg(all(
+    feature = "witness",
+    any(
+        all(target_arch = "x86_64", feature = "wc"),
+        all(target_arch = "aarch64", feature = "desktop_firmware")
+    ),
+    not(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))
+))]
+fn instgui_round(_pw: usize, _ph: usize) {
+    serial_println!(":: APPQUIT: app=instgui not compiled (x86_64 + UNAOS_WC + UNAOS_INSTGUI) — no dialog to quit :: SKIP ::");
+}

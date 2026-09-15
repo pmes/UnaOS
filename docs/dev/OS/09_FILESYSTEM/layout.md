@@ -121,6 +121,39 @@ flat-image arm: the first 4096 bytes of `KERNEL8.IMG` are the first 4096 bytes o
 kernel. An Orin whose card carries only the FAT ESP gets `/`, `/boot` and `/apps` over that one
 volume, which is the outcome §1.2's knob produced, reached without naming the board.
 
+### 1.5 The WRITE POSTURE on each of those mounts (`rw=`) — SDWRITE, A60, 2026-09-12
+
+Every mount the binder makes announces `rw=`, and the rule is one sentence: **`rw=` is sampled from
+the thing being mounted, and it says `yes` only when the BLOCK LAYER admits the write.** Not from a
+second derivation, not from the `BlockSource` when a `NativeBackend` is what gets bound.
+
+| mount | posture read from |
+|---|---|
+| `/volumes/<NAME>` | `!FatBackend::read_only()` on the very backend handed to `mt.mount` |
+| `/boot`, and `/` when it is the FAT volume | the same, on that mount's own backend |
+| `/` when it is the NATIVE volume | `NativeBackend::write_veto()`, which forwards `block::native_mount_write_veto()` — the block layer's answer for the handle the shared unafs mount is riding |
+
+The native row is the one that changed. It used to read `BlockSource::write_veto()` — a question
+about a different object — while `NativeBackend::write_veto` itself returned a flat `None`, i.e. "this
+volume is always writable", a claim no layer had checked. On the Orin that produced the only outcome
+that actually mattered: the block layer refused **every** write to the microSD in every cfg
+(`write_block_tegra_sd`), so a native root on the card could not be written and `rw=` was reporting a
+refusal decided two layers below it.
+
+`sdwrite` (DEFAULT ON, `UNAOS_NOSDWRITE=1` to opt out) lifts that refusal — see
+`docs/dev/OS/01_BOOT_HAL/arch_arm64.md` §ORIN-SDMMC-5 / SDWRITE for the mechanism and the card-safety
+statement — and the posture plumbing above is what keeps the wire honest in BOTH polarities:
+
+```
+[vfs] root mount / = native unafs volume source=tegra-sd rw=yes ::     # sdwrite ON  (shipped)
+[vfs] root mount / = native unafs volume source=tegra-sd rw=no  ::     # UNAOS_NOSDWRITE=1
+```
+
+Leg 8 (`fs::bootdisk::sdwrite_posture_selftest`, `witness`) drives the mapping both ways and asserts
+that the FAT-layer veto and the block-layer posture agree for every source in `fat::ALL_SOURCES`, so
+the two views of one answer cannot drift apart again. It runs on QEMU `virt` and on x86; no QEMU
+machine models the Tegra SDHCI, so it tests the REPORT and never the medium.
+
 ## 2. The namespace this arc establishes
 
 ```
@@ -128,6 +161,8 @@ volume, which is the outcome §1.2's knob produced, reached without naming the b
 /boot      → the volume this machine booted from
 /apps      → the programs on that volume   (= /boot's APPS/ directory)
 /usb       → the hot-plugged FAT stick, when it enumerates
+/home      → the users' home directories on the EL0 FAT volume (LOGIN M2, 2026-09-12): `HOME/<NAME>`
+             is created at that user's FIRST LOGIN, never laid out empty
 ```
 
 **`/boot`, not `/fat`.** Peter's ruling: `/fat` names a *filesystem*, which is an implementation
@@ -233,11 +268,26 @@ that is not a change to make under a boot deadline. The defaulted accessors abov
 
 ---
 
+### 2.4 `/home` — from the day a user exists (LOGIN M2)
+
+RULINGS R51 ("login, get a home folder and all"). `HOME/` at the root of the EL0 FAT volume — the
+volume `SYS_OPEN` names files on, so a user's programs can reach their files — and `HOME/<NAME>` inside
+it, created by `fs::users::ensure_home` at that user's first login (`[users] home=/home/<name> created
+volume=el0-fat`) and idempotent after (`exists`). Nothing is created for a user who has never logged
+in, and `HOME/` itself appears with the first one. User names are 8.3 leaves (1-8 bytes, `[a-z0-9_-]`,
+first a letter) because the directory is. FAT carries no owner attribute: the DIRECTORY has no ACL row
+(LEDGER SO35); the FILES a program creates inside it are owned by `user:<name>` through the SYS_OPEN
+owner/grants rows like any private create, and the knob-on aarch64 `sys_open` walks a `/`-separated
+path (`HOME/UNA/NOTES.TXT`) to reach them — the first step on SO20 (x86 still opens its static root
+table). On a Pi whose `/` is native UnaFS the home still lives on the FAT boot volume for the same
+reason (EL0 opens FAT); the native, owner-attributed home moves with the native-EL0 namespace.
+
 ## 3. Nothing empty was created
 
-Peter's ruling: lay out only what exists. There is **no** `/etc`, `/home`, `/tmp`, `/var`,
+Peter's ruling: lay out only what exists. There is **no** `/etc`, `/tmp`, `/var`,
 `/bin`, `/lib`, `/dev` or `/proc` — not as directories, not as mount points, not as reserved
-prefixes. Every one of those would be a promise about a subsystem that does not exist yet, and an
+prefixes. (`/home` joined the namespace on 2026-09-12 under the same rule: it exists only once a user
+does, §2.4.) Every one of those would be a promise about a subsystem that does not exist yet, and an
 empty directory in a listing is a question the operator cannot answer.
 
 `/apps` is created because programs exist and were already being staged somewhere; `/boot` is a
@@ -401,8 +451,9 @@ the verdict.
 A board with no `/apps` mount, or one whose medium has no `APPS/` directory (a card staged before
 this layout), **skips with a stated line** rather than failing — the honest answer, and the reason
 `./arroyo test` on the default pattern image does not red. `layout.mv` skips the same way when a
-board binds only one of the two prefixes, reports them as different volumes, or vetoes writes (the
-Orin's read-only card).
+board binds only one of the two prefixes, reports them as different volumes, or vetoes writes (before
+SDWRITE, §1.5, that was the Orin's read-only card; with `sdwrite` on, the card admits the write and
+the skip is reached only by a genuine veto).
 
 ---
 

@@ -144,7 +144,7 @@
 //!
 //! `drivers::block::publish_usb_geometry`'s `#[cfg(not(all(target_arch = "aarch64", feature =
 //! "baremetal")))]` variant — the one the tegra build compiles — stores the SAME `BlockDeviceInfo`
-//! into BOTH `BLOCK_DEVICE` (read as [`BlockSource::Default`]) and `USB_BLOCK_DEVICE` (read as
+//! into BOTH `BLOCK_DEVICE` (read as [`BlockSource::Default`]) and USB registry entry 0 (read as
 //! [`BlockSource::Usb`]). So on the Orin one card is reachable under two source names, and a walk
 //! that keyed on the source would count it as two disks and mount it beside itself.
 //!
@@ -163,6 +163,18 @@
 //! slot, and two live devices never share one — and a clone cannot forge it.
 //! `drivers::block::BlockDeviceId` is deliberately not the key: its first field is `handle`, which
 //! is precisely what differs between the two names for the one card.
+//!
+//! **USBREG (SO33) adds the second half of the key, and it is the half a content check cannot have.**
+//! Two cards in ONE multi-slot card reader are one xHCI slot and two SCSI LOGICAL UNITS, so their
+//! registry records carry the SAME `slot_id`; if the two cards are also the same size,
+//! [`crate::fs::fat::same_device`] answers `true` and this walk would merge two real disks — B98's
+//! defect arriving by a second road. The LUN is what separates them and
+//! `drivers::block::USB_DISKS` is where the LUN lives, so each disk carries the registry INDEX its
+//! source names ([`crate::fs::fat::source_unit`]) and [`admit`] asks `same_device` only of pairs
+//! whose indices agree. Two entries of the registry are two devices by the enumerator's own
+//! bookkeeping. `None` (a source that is not a USB registry entry — the Pi's microSD in the global,
+//! an `Sdhc` card) proves nothing and falls through to `same_device` alone, so every pre-USBREG
+//! answer on every board is unchanged. There is still exactly ONE same-device predicate.
 //!
 //! Two sources are ONE disk — walked once, mounted once, `aliased=usb->global` on the wire — only
 //! when that predicate PROVES it. Equal content WITHOUT the proof (two clones; or two zero-slot
@@ -425,6 +437,16 @@ pub struct Disk {
     /// sources. This disk was admitted and walked ANYWAY; the field exists so the witness can say
     /// `aliased=ambiguous:<other>?<this>` instead of the walk silently losing one of them.
     pub ambiguous: Vec<&'static str>,
+    /// USBREG (SO33): which USB block-registry entry this disk's source names, or `None` for a
+    /// source that is not a USB registry entry ([`crate::fs::fat::source_unit`]).
+    ///
+    /// It is the second half of the dedupe, and the half `same_device` structurally cannot supply.
+    /// Two cards in ONE multi-slot reader are one xHCI slot and two LOGICAL UNITS, so their
+    /// `BlockDeviceInfo` records carry the SAME `slot_id` — and if the two cards are the same size,
+    /// `same_device` answers `true` and the walk merges two real disks into one, which is A48/B98's
+    /// defect with a different cause. The LUN is what separates them, the registry is where the LUN
+    /// lives, and the registry INDEX is that fact in one byte. See [`admit`].
+    pub unit: Option<u8>,
 }
 
 /// Why the walk bound nothing. Spelled exactly as the `reason=` field prints it.
@@ -541,6 +563,19 @@ fn disk_census() -> String {
         out.push_str(name);
         out.push('=');
         out.push_str(state);
+    }
+    // USBREG (SO33): the EXTRA USB registry entries, appended — never interleaved. The four fields
+    // above keep their exact spelling and order, so every capture and every doc that greps
+    // `global=` / `usb=` / `sdhc=` / `tegra-sd=` reads the same line it always did; a machine with
+    // one USB disk (every x86 bench, every Pi bench, every QEMU leg) renders the string unchanged,
+    // because there is nothing to append. A two-card reader adds ` usb1=present`, which is the
+    // difference this arc exists to make visible.
+    for ix in 1..crate::drivers::block::MAX_USB_DISKS {
+        if crate::drivers::block::usb_disk_present(ix) {
+            out.push(' ');
+            out.push_str(BlockSource::UsbN(ix as u8).name());
+            out.push_str("=present");
+        }
     }
     out
 }
@@ -681,6 +716,7 @@ fn admit(
     id: DiskId,
     dev: Option<BlockDeviceInfo>,
     label: [u8; 11],
+    unit: Option<u8>,
 ) -> bool {
     let mut twins: Vec<&'static str> = Vec::new();
     for d in disks.iter_mut() {
@@ -688,12 +724,24 @@ fn admit(
             continue;
         }
         let proven = match (d.dev.as_ref(), dev.as_ref()) {
-            (Some(a), Some(b)) => fat::same_device(a, b),
+            (Some(a), Some(b)) => fat::same_device(a, b) && units_agree(d.unit, unit),
             _ => false,
         };
         if proven {
             d.aliases.push(src.name());
             return false;
+        }
+        // USBREG (SO33): a pair the REGISTRY separates is not AMBIGUOUS — it is two disks we can
+        // name. `ambiguous` means "equal content and the enumerator proved nothing either way": two
+        // clones, or two `slot_id: 0` sources. Two cards in one reader are the opposite case — the
+        // registry's `(slot, LUN)` key is a positive statement that they are different devices — so
+        // recording ambiguity here would put the literal token `ambiguous` on the `[vfs] root …`
+        // witness for a pair nothing is uncertain about, and any check keyed on `aliased=` would
+        // fire on a healthy two-card boot. Caught by leg 7 on its first run, not by reading:
+        // `aliased=ambiguous:usb?usb1` with `same_device=true merged_when_same_unit=true`, which
+        // reddened `./arroyo test` (rc=1, `serial.log:74`) exactly as a FAIL should.
+        if !units_agree(d.unit, unit) {
+            continue;
         }
         twins.push(d.source.name());
     }
@@ -705,8 +753,36 @@ fn admit(
         hits: Vec::new(),
         aliases: Vec::new(),
         ambiguous: twins,
+        unit,
     });
     true
+}
+
+/// USBREG (SO33): may these two sources be ONE disk, as far as the USB block registry is concerned?
+///
+/// This is NOT a second same-device predicate and it must not become one — [`fat::same_device`] is
+/// the ONE test for "are these two registry records the same physical device", and it keeps that job.
+/// This narrows which PAIRS that test is even asked about, and it does it with a fact `same_device`
+/// cannot see: two entries of the USB registry are, by the registry's own key, two different
+/// `(slot, LUN)` pairs — two cards in one multi-slot reader, which share an xHCI slot and can share a
+/// size. `same_device` compares `(slot_id, num_blocks)`, so on two same-size cards in one reader it
+/// answers `true`, and without this guard the walk would merge them: one real card mounted, the other
+/// gone from `/volumes`, and a witness claiming an alias that does not exist. That is exactly
+/// orin-ledger A48 / rmbp-ledger B98 arriving by a second road.
+///
+/// `None` on either side means "not a USB registry entry", which proves nothing either way, so the
+/// pair falls through to `same_device` alone and every pre-USBREG answer is unchanged:
+///  * **x86 / tegra, one card** — `Default` resolves to unit 0 (it holds the primary USB disk) and
+///    `Usb` is unit 0: equal, `same_device` decides, `aliased=usb->global` as before.
+///  * **Pi** — `Default` is the microSD, so `None`; `same_device`'s `slot_id != 0` guard answers
+///    `false` first, as it always did.
+///  * **two cards in one reader** — units 0 and 1: refused here, both admitted, both walked, both
+///    mounted, no ambiguity claimed (they are not ambiguous; they are two disks and we know it).
+fn units_agree(a: Option<u8>, b: Option<u8>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
 }
 
 /// HOMESOIL: render the `aliased=` field of the `[vfs] root …` witness. Pure over the disk list —
@@ -792,7 +868,13 @@ fn walk_and_witness() -> Survey {
     let mut any_disk = false;
     let mut cap_hit = false;
 
-    for src in fat::ALL_SOURCES {
+    // USBREG (SO33): the LIVE source list. `ALL_SOURCES` is the compiled-in source KINDS and cannot
+    // name a second card in a reader — the registry index is a runtime fact — so a walk over it
+    // could only ever find one USB disk however many the machine has. `fat::live_sources` is that
+    // same list with the USB rung expanded over the block registry's occupied entries, in the same
+    // order, so a one-disk machine walks exactly the list it walked before.
+    for src in fat::live_sources() {
+        let src = &src;
         if fat::source_present(*src) {
             any_disk = true;
         }
@@ -811,7 +893,7 @@ fn walk_and_witness() -> Survey {
         // Admitted even when its root directory turns out to be unreadable below: it HAS a FAT
         // volume (the mount succeeded), so it is a disk this machine has, and home soil is a fact
         // about the disk, not about what could be walked on it.
-        if !admit(&mut disks, *src, id, dev, label) {
+        if !admit(&mut disks, *src, id, dev, label, fat::source_unit(*src)) {
             continue;
         }
         unafs.push(unafs_present(*src));
@@ -1220,7 +1302,7 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     }
 
     let Some(found) = s.root else { return };
-    bind_root(mt, found.source, unafs_state(found.source), announce);
+    bind_root(mt, found.source, unafs_state(found.source), announce); #[cfg(feature = "sdwritefx")] sdwrite_fixture(mt, found.source); // SDWRITE (A60): the metal fixture, armed by UNAOS_SDWRITE=1, on the root this call just bound.
 }
 
 /// UNAFSROOT (orin 24): the ROOT DISK's three mounts, as a function of ONE fact — the
@@ -1274,7 +1356,7 @@ pub(crate) fn bind_root(
         false
     };
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "sdwrite")))] // SDWRITE (A60): knob-off keeps this arm verbatim; the twin that samples the BACKEND is folded onto the closing line below.
     if native_root {
         mt.mount("/", alloc::boxed::Box::new(crate::fs::vfs::NativeBackend::new("native")));
         if announce {
@@ -1287,7 +1369,7 @@ pub(crate) fn bind_root(
                 if src.write_veto().is_none() { "yes" } else { "no" }
             );
         }
-    }
+    } #[cfg(all(target_arch = "aarch64", feature = "sdwrite"))] if native_root { native_root_mount(mt, src, announce); } // SDWRITE (A60), second finding: the native arm samples the backend it MOUNTS, not the BlockSource. See `native_root_mount` at the file tail.
     if !native_root {
         let be = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
         let rw = !be.read_only();
@@ -1380,6 +1462,10 @@ fn homesoil_selftest() {
         DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 },
         Some(synth_dev(3, 100)),
         *b"UNAOS-BOOT ",
+        // USBREG: the units are SUPPLIED here, never read off the live registry — these disks are
+        // synthetic and the machine running the fixture has its own. The global is not a USB disk in
+        // this leg (two independent devices, different slots), so it names no registry entry.
+        None,
     );
     assert_admit(
         &mut ds,
@@ -1387,6 +1473,7 @@ fn homesoil_selftest() {
         DiskId { num_blocks: 200, vol_id: 0xbbbb_0002 },
         Some(synth_dev(4, 200)),
         L_SPARE,
+        Some(0),
     );
     ds[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
     ds[1].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
@@ -1408,14 +1495,17 @@ fn homesoil_selftest() {
 
     // --- leg 2: ONE device under TWO source names — walked once, mounted once. ------------------
     // This is the Orin's real shape: `publish_usb_geometry`'s non-baremetal variant stores one
-    // `BlockDeviceInfo` into both `BLOCK_DEVICE` and `USB_BLOCK_DEVICE` — one record, so one LIVE
+    // `BlockDeviceInfo` into both `BLOCK_DEVICE` and USB registry entry 0 — one record, so one LIVE
     // slot on both sides. CLONEALIAS: that live slot is now what earns the dedupe; equal content
     // alone no longer does, which is exactly what leg 5 below shows.
     let same = DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 };
     let one_card = synth_dev(7, 100);
     let mut ad: Vec<Disk> = Vec::new();
-    let first = admit(&mut ad, BlockSource::Default, same, Some(one_card), L_SPARE);
-    let second = admit(&mut ad, BlockSource::Usb, same, Some(one_card), L_SPARE);
+    // USBREG: ONE card, so BOTH names resolve to the SAME registry entry — unit 0 on both sides,
+    // which is what `fat::source_unit` answers on a live x86/tegra boot with the primary USB disk in
+    // the global slot. Equal units let `same_device` decide, and it proves the alias.
+    let first = admit(&mut ad, BlockSource::Default, same, Some(one_card), L_SPARE, Some(0));
+    let second = admit(&mut ad, BlockSource::Usb, same, Some(one_card), L_SPARE, Some(0));
     ad[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
     let (aroot, aothers) = plan(&ad, &[false]);
     let leg2 = first
@@ -1533,8 +1623,8 @@ fn homesoil_selftest() {
     // devices never share one) -> BOTH admitted, and the wire says `ambiguous:global?usb`.
     let clone_id = DiskId { num_blocks: 100, vol_id: 0xaaaa_0001 };
     let mut cl: Vec<Disk> = Vec::new();
-    let c_first = admit(&mut cl, BlockSource::Default, clone_id, Some(synth_dev(7, 100)), L_SPARE);
-    let c_second = admit(&mut cl, BlockSource::Usb, clone_id, Some(synth_dev(9, 100)), L_SPARE);
+    let c_first = admit(&mut cl, BlockSource::Default, clone_id, Some(synth_dev(7, 100)), L_SPARE, None);
+    let c_second = admit(&mut cl, BlockSource::Usb, clone_id, Some(synth_dev(9, 100)), L_SPARE, Some(0));
     let neg = c_first
         && c_second
         && cl.len() == 2
@@ -1547,8 +1637,8 @@ fn homesoil_selftest() {
     // and two such sources are never PROVEN one device — the `slot_id != 0` clause refuses first,
     // ahead of any comparison (pi 7's caveat, now a guard).
     let mut z: Vec<Disk> = Vec::new();
-    let z_first = admit(&mut z, BlockSource::Default, clone_id, Some(synth_dev(0, 100)), L_SPARE);
-    let z_second = admit(&mut z, BlockSource::Usb, clone_id, Some(synth_dev(0, 100)), L_SPARE);
+    let z_first = admit(&mut z, BlockSource::Default, clone_id, Some(synth_dev(0, 100)), L_SPARE, None);
+    let z_second = admit(&mut z, BlockSource::Usb, clone_id, Some(synth_dev(0, 100)), L_SPARE, Some(0));
     let zero = z_first && z_second && z.len() == 2 && aliased_field(&z) == "ambiguous:global?usb";
     // POSITIVE CONTROL on the predicate itself, so a `same_device` that answered `false` to
     // everything could not make the two clauses above pass vacuously.
@@ -1574,6 +1664,119 @@ fn homesoil_selftest() {
     unafsroot_selftest();
 }
 
+/// USBREG (SO33): HOMESOIL leg 7 as its OWN entry point, for exactly the reason leg 6 has one.
+///
+/// `homesoil_selftest` runs from [`walk_and_witness`], and the QEMU boots that host the fixtures
+/// (`test`, `test-arm`) never reach a filesystem verb — orin 26 measured it: `[vfs]` 0 lines,
+/// `HOMESOIL` 0 lines on both captures. A leg that only runs when an operator types `ls` on metal is
+/// a leg that ships unexecuted, and the two-disk path is the LAST thing in this arc that should ship
+/// that way, because no machine in this fleet can present the hardware it is about. So the boot path
+/// calls this through [`unafsroot_selftest`], which `main.rs` invokes on the one heap-up line x86,
+/// virt and the Pi all pass through; `homesoil_selftest` reaches it by the same call, and the latch
+/// makes the second arrival a no-op.
+#[cfg(feature = "witness")]
+fn usbreg_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // --- leg 7: USBREG — TWO USB DISKS IN ONE READER. ------------------------------------------
+    // The leg this arc owes, and the one no machine in this fleet can present: a multi-slot card
+    // reader is ONE xHCI device whose card slots are LOGICAL UNITS, so two cards share a slot id and
+    // differ only by LUN — which the block registry keys on and `BlockDeviceInfo` does not carry.
+    // QEMU's `usb-storage` is single-LUN on both arches, so without this the whole two-disk path
+    // would ship reasoned-about and unexecuted. Driven at the real `admit`/`plan` call, on the real
+    // code path, with synthetic disks, exactly as legs 1, 2 and 5 are.
+    //
+    // The disks are deliberately made INDISTINGUISHABLE BY CONTENT AND BY SLOT: same `num_blocks`,
+    // same `BS_VolID`, same synthetic `slot_id` — which is the honest model of two same-size cards
+    // in one reader, and the case where `fat::same_device` answers TRUE. That is the point. Without
+    // `units_agree` the walk merges them and one real card disappears from `/volumes`; the leg's
+    // NEGATIVE CONTROL below re-runs the identical setup with equal units and asserts that it DOES
+    // merge, so a `units_agree` that answered `false` to everything could not pass this vacuously.
+    //
+    // ROOT BY CONTENT, unchanged: the hit is put on the SECOND disk only, and the leg asserts that
+    // root is the second disk — first-found among the disks that carry this kernel, never
+    // first-enumerated, never the unit the driver happened to publish first.
+    const L_CARD_A: [u8; 11] = *b"UNAOS-BOOT ";
+    const L_CARD_B: [u8; 11] = *b"UNAOS-DATA ";
+    let reader = synth_dev(5, 100);
+    let twin_id = DiskId { num_blocks: 100, vol_id: 0xcccc_0003 };
+    let mut two: Vec<Disk> = Vec::new();
+    let u0 = admit(&mut two, BlockSource::Usb, twin_id, Some(reader), L_CARD_A, Some(0));
+    let u1 = admit(&mut two, BlockSource::UsbN(1), twin_id, Some(reader), L_CARD_B, Some(1));
+    // FIRST, with NO kernel on either card: BOTH are home soil, and each gets its OWN
+    // `/volumes/<LABEL>` point from its own label. This is the shape the arc owes on the wire — two
+    // cards in one reader, two mounts, distinct points — and it is asserted before any root exists,
+    // so it cannot be satisfied by the root-binding path instead.
+    let (nroot, nothers) = plan(&two, &[false, false]);
+    // THEN the kernel on the SECOND card. Root is chosen by CONTENT, so it must be disk 1 — not
+    // disk 0, which enumerated first and is the unit the driver published first.
+    two[1].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 0 });
+    let (troot, tothers) = plan(&two, &[false, false]);
+    // The positive control: the SAME content, the SAME slot, the SAME unit — one card under two
+    // names — must still collapse to one disk. Two entries of the registry are two devices; two
+    // names for one entry are one device; and this pair of assertions is what separates them.
+    let mut one: Vec<Disk> = Vec::new();
+    let m0 = admit(&mut one, BlockSource::Usb, twin_id, Some(reader), L_CARD_A, Some(0));
+    let m1 = admit(&mut one, BlockSource::Default, twin_id, Some(reader), L_CARD_A, Some(0));
+    let leg7 = u0
+        && u1
+        && two.len() == 2
+        // No root: both cards mounted under /volumes, at DISTINCT points, from their own labels.
+        && nroot.is_none()
+        && nothers.len() == 2
+        && nothers[0].point == "/volumes/UNAOS-BOOT"
+        && nothers[1].point == "/volumes/UNAOS-DATA"
+        && nothers[0].point != nothers[1].point
+        && nothers[0].source.name() == "usb"
+        && nothers[1].source.name() == "usb1"
+        && !nothers[0].altered
+        && !nothers[1].altered
+        // NOT aliased and NOT ambiguous: these are two disks and the registry knows it.
+        && two[0].aliases.is_empty()
+        && two[1].aliases.is_empty()
+        && two[1].ambiguous.is_empty()
+        && aliased_field(&two) == "-"
+        && troot == Some(1)
+        // The other disk is home soil at its OWN label, and the two points are DISTINCT.
+        && tothers.len() == 1
+        && tothers[0].point == "/volumes/UNAOS-BOOT"
+        && tothers[0].source.name() == "usb"
+        && two[1].source.name() == "usb1"
+        // Same content, same slot, EQUAL units -> one disk, and the wire says so.
+        && m0
+        && !m1
+        && one.len() == 1
+        && aliased_field(&one) == "global->usb"
+        // And the predicate that separates the two cases, asked directly in both directions.
+        && !units_agree(Some(0), Some(1))
+        && units_agree(Some(1), Some(1))
+        && units_agree(None, Some(1))
+        // ...while `same_device` itself still says TRUE for this pair, which is precisely why the
+        // unit guard has to exist. If this clause ever reads false the leg is passing for the wrong
+        // reason and the assertion above it proves nothing.
+        && fat::same_device(&reader, &reader);
+    serial_println!(
+        ":: HOMESOIL: usbreg disks={} noroot_points={}+{} root_ix={:?} others={} point={} \
+         sources={}+{} aliased={} merged_when_same_unit={} same_device={} :: {} ::",
+        two.len(),
+        if nothers.is_empty() { "-" } else { nothers[0].point.as_str() },
+        if nothers.len() > 1 { nothers[1].point.as_str() } else { "-" },
+        troot,
+        tothers.len(),
+        if tothers.is_empty() { "-" } else { tothers[0].point.as_str() },
+        two[0].source.name(),
+        if two.len() > 1 { two[1].source.name() } else { "-" },
+        aliased_field(&two),
+        one.len() == 1,
+        fat::same_device(&reader, &reader),
+        if leg7 { "PASS" } else { "FAIL" }
+    );
+
+}
+
 /// UNAFSROOT (orin 26): HOMESOIL leg 6 as its own entry point, because the QEMU boots that host the
 /// fixtures (`test`, `test-arm`) never reach a filesystem verb, so nothing under
 /// [`walk_and_witness`] executes there — measured on this arc's own captures: `[vfs]` 0 lines,
@@ -1589,6 +1792,10 @@ pub fn unafsroot_selftest() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
+    // USBREG (SO33): leg 7 rides the same boot-path entry point, for the same reason — see
+    // [`usbreg_selftest`]. It carries its own latch, so calling it here and from
+    // `homesoil_selftest` prints it exactly once.
+    usbreg_selftest(); #[cfg(feature = "sdwrite")] sdwrite_posture_selftest(); // SDWRITE (A60) leg 8: the posture/polarity matrix, latched like its siblings.
     // --- leg 6: UNAFSROOT — the root disk's LAYOUT RULE, driven with every answer it takes. -----
     // `bind_root` is the one place `/`, `/boot` and `/apps` are decided, and until this leg the
     // `present` answer had never executed anywhere (render12: `unafs=absent`, no card carried a
@@ -1677,8 +1884,226 @@ fn assert_admit(
     id: DiskId,
     dev: Option<BlockDeviceInfo>,
     label: [u8; 11],
+    unit: Option<u8>,
 ) {
-    if !admit(disks, src, id, dev, label) {
+    if !admit(disks, src, id, dev, label, unit) {
         serial_println!(":: HOMESOIL: setup source={} aliased unexpectedly :: FAIL ::", src.name());
     }
+}
+
+// ===================== SDWRITE (A60, 2026-09-12) — the root's write POSTURE on the wire =====================
+//
+// APPENDED AT THE FILE TAIL so no `core::panic::Location` in this file moves; every edit above is
+// line-for-line in place. See `drivers/block.rs`'s SDWRITE section for the posture itself.
+
+/// SDWRITE: the `rw=` WORD, from a veto. One mapping, used by the native root's announce and driven
+/// BOTH WAYS by leg 8 — so inverting it is a red fixture and not a quiet lie on the wire.
+#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+fn native_root_rw_word(veto: Option<&'static str>) -> &'static str {
+    if veto.is_none() { "yes" } else { "no" }
+}
+
+/// SDWRITE (A60, second finding): bind `/` to the native volume and announce it with a posture
+/// sampled from THE BACKEND BEING MOUNTED.
+///
+/// The pre-A60 arm mounted a `NativeBackend` and then printed `rw=` from `BlockSource::write_veto()`
+/// — a question about a different object. That is the same defect `HOMESOIL` had already fixed for
+/// `/volumes/` and `/boot` ("ONE sample, from the backend being mounted — not a second derivation of
+/// the posture"), left standing on the one mount where it mattered most. Here the sample comes off
+/// the very backend handed to `mt.mount`, and `NativeBackend::write_veto` forwards the block layer's
+/// answer for the handle the shared unafs mount is riding — so `rw=yes` on `/` is a statement about
+/// the disk, not a hope about it.
+#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+fn native_root_mount(mt: &mut crate::fs::vfs::MountTable, src: BlockSource, announce: bool) {
+    use crate::fs::vfs::VfsBackend;
+    let be = crate::fs::vfs::NativeBackend::new("native");
+    let rw = native_root_rw_word(be.write_veto());
+    mt.mount("/", alloc::boxed::Box::new(be));
+    if announce {
+        // The discriminating words stay LITERALS in the format string — the `/volumes/` lesson: an
+        // artifact census (`LC_ALL=C grep -a -o -F`) must be able to find the sentence it certifies.
+        serial_println!(
+            "[vfs] root mount / = native unafs volume source={} rw={} ::",
+            src.name(),
+            rw
+        );
+    }
+}
+
+/// SDWRITE leg 8 — THE POSTURE/POLARITY MATRIX, and it runs on QEMU `virt`.
+///
+/// WHAT IT CAN AND CANNOT PROVE, said first. **No QEMU machine models the Tegra234 SDHCI** — `arroyo`
+/// launches `q35`, `raspi4b` and generic `virt`, and zero tegra machines — so nothing here issues a
+/// CMD24 or touches a card. What IS testable without the controller is the thing A60 was opened
+/// about: the REPORT. The pre-A60 tree could print `rw=yes` over a path that could not write one
+/// byte, because the veto was decided in `drivers/block.rs` and re-stated in `fs/fat.rs`, and two
+/// statements of one answer drift. This leg asserts they are one answer.
+///
+/// Three claims, each driven rather than read:
+///  1. **The mapping, both ways.** `native_root_rw_word(None) == "yes"` and `…(Some(_)) == "no"` —
+///     the same function the native root's announce uses. Invert it and this reds.
+///  2. **One answer per source.** For EVERY source in `fat::ALL_SOURCES`, the FAT layer's
+///     `BlockSource::write_veto()` and the block layer's `handle_write_veto(handle_of(src))` agree on
+///     whether a write is admitted. A second policy in either layer reds this the moment it differs —
+///     which is exactly the drift the `TegraSd` arm was (a veto that only ECHOED one two layers down).
+///  3. **The polarity that SHIPS.** `posture=` is `cfg!(feature = "sdwrite")`, printed so a capture
+///     says which build it came from; and on a build that HAS the card handle, `TegraSd`'s veto is
+///     asserted to match it in both directions. On a build without `tegra`+`sdmmc` the field reads
+///     `card=absent` — the leg says what it did not test instead of passing quietly.
+#[cfg(all(feature = "witness", feature = "sdwrite"))]
+pub fn sdwrite_posture_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let posture = cfg!(feature = "sdwrite");
+
+    // (1) the mapping, driven both ways.
+    #[cfg(target_arch = "aarch64")]
+    let map_ok = native_root_rw_word(None) == "yes" && native_root_rw_word(Some("refused")) == "no";
+    // `NativeBackend` and its announce are aarch64-only, so on x86 there is no mapping to drive and
+    // the leg says so rather than asserting a function that does not exist.
+    #[cfg(not(target_arch = "aarch64"))]
+    let map_ok = true;
+    #[cfg(target_arch = "aarch64")]
+    const MAP_FIELD: &str = "yes/no";
+    #[cfg(not(target_arch = "aarch64"))]
+    const MAP_FIELD: &str = "n/a(x86)";
+
+    // (2) one answer per source — the FAT view and the block view, compared for every source.
+    let mut agree = true;
+    let mut census = String::new();
+    for src in fat::ALL_SOURCES {
+        let fat_admits = src.write_veto().is_none();
+        let blk_admits =
+            crate::drivers::block::handle_write_veto(fat::handle_of(*src)).is_none();
+        if fat_admits != blk_admits {
+            agree = false;
+        }
+        if !census.is_empty() {
+            census.push(' ');
+        }
+        census.push_str(src.name());
+        census.push('=');
+        census.push_str(if fat_admits { "rw" } else { "ro" });
+        if fat_admits != blk_admits {
+            census.push_str("!DISAGREES");
+        }
+    }
+
+    // (3) the polarity that ships, on a build that has the card handle.
+    #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
+    let (card_field, card_ok) = (
+        if crate::fs::fat::BlockSource::TegraSd.write_veto().is_none() { "admits" } else { "refuses" },
+        crate::fs::fat::BlockSource::TegraSd.write_veto().is_none() == posture
+            && crate::drivers::block::tegra_sd_writes_admitted() == posture,
+    );
+    #[cfg(not(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc")))]
+    let (card_field, card_ok) = ("absent", true);
+
+    let leg8 = map_ok && agree && card_ok;
+    serial_println!(
+        ":: SDWRITE-POSTURE: posture={} map={} sources {} card={} (no QEMU machine models Tegra SDHCI — this leg tests the REPORT, never the medium) :: {} ::",
+        if posture { "on" } else { "off" },
+        MAP_FIELD,
+        census,
+        card_field,
+        if leg8 { "PASS" } else { "FAIL" }
+    );
+}
+
+/// SDWRITE — THE METAL FIXTURE (`UNAOS_SDWRITE=1` → the `sdwritefx` feature).
+///
+/// One file, one block, four steps, on the root this boot actually bound: create `/SDWRITE.TXT`,
+/// write one 512-byte stamped block into it, read it back, delete it. The verdict line is
+/// `:: SDWRITE: root=<source> wrote=1 readback=match deleted=1 -> PASS ::`; a FAIL names the STEP
+/// that refused, because "it failed" about a four-step sequence is not a diagnosis.
+///
+/// **CARD SAFETY, stated because this is the first code in this OS that writes an operator's card
+/// outside the armed ladder.** The fixture names exactly ONE path, `/SDWRITE.TXT`, at the root of
+/// the mounted volume, and it creates it, writes it, reads it and unlinks it. It never opens, moves,
+/// truncates or deletes anything else, it never touches `/boot` or `/apps`, it never addresses an
+/// LBA itself, and every sector it does reach is one the filesystem chose for that file. The only
+/// other bytes that change on the medium are the filesystem metadata a create-plus-delete of one
+/// file necessarily rewrites (the FAT/directory entry, or UnaFS's journal and CoW root) — that is
+/// inherent to creating a file at all, and it is the whole of the delta. Any write outside that is a
+/// DEFECT, and the boot that shows one is evidence against this code, not against the card.
+///
+/// It is DEFAULT OFF and it is not witness-gated: it is an explicitly armed experiment, so it prints
+/// on the boot that armed it and does not exist on any other.
+#[cfg(feature = "sdwritefx")]
+fn sdwrite_fixture(mt: &crate::fs::vfs::MountTable, src: BlockSource) {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    const PATH: &str = "/SDWRITE.TXT";
+    const N: usize = 512;
+    // A stamped block: position-varying, so a short or shifted read-back cannot match by accident.
+    let mut want: Vec<u8> = Vec::with_capacity(N);
+    for i in 0..N {
+        want.push((i as u8).wrapping_mul(31) ^ 0x5a);
+    }
+    let fail = |step: &str, why: &str| {
+        serial_println!(
+            ":: SDWRITE: root={} step={} why={} -> FAIL ::",
+            src.name(),
+            step,
+            why
+        );
+    };
+    // The posture the root reports, read back from the mount table so the fixture and the wire agree.
+    let veto = match mt.write_veto(PATH) {
+        Ok(v) => v,
+        Err(_) => {
+            fail("veto", "no backend resolves the root");
+            return;
+        }
+    };
+    if let Some(why) = veto {
+        fail("veto", why);
+        return;
+    }
+    if mt.create(PATH, NodeKind::File, KERNEL_PRINCIPAL).is_err() {
+        fail("create", "the root refused to create SDWRITE.TXT");
+        return;
+    }
+    let wrote = match mt.write(PATH, 0, &want, KERNEL_PRINCIPAL) {
+        Ok(n) if n == N => 1u32,
+        Ok(_) => {
+            fail("write", "short write");
+            let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+            return;
+        }
+        Err(_) => {
+            fail("write", "the write was refused");
+            let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let back = match mt.read(PATH, 0, N) {
+        Ok(b) => b,
+        Err(_) => {
+            fail("readback", "the read-back was refused");
+            let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+            return;
+        }
+    };
+    let matched = back.len() == N && back.as_slice() == want.as_slice();
+    if !matched {
+        fail("readback", "the bytes that came back are not the bytes that went down");
+        let _ = mt.unlink(PATH, KERNEL_PRINCIPAL);
+        return;
+    }
+    if mt.unlink(PATH, KERNEL_PRINCIPAL).is_err() {
+        fail("delete", "SDWRITE.TXT could not be removed — IT IS STILL ON THE CARD");
+        return;
+    }
+    if mt.stat(PATH).is_ok() {
+        fail("delete", "SDWRITE.TXT still resolves after unlink");
+        return;
+    }
+    serial_println!(
+        ":: SDWRITE: root={} wrote={} readback=match deleted=1 -> PASS ::",
+        src.name(),
+        wrote
+    );
 }

@@ -1799,10 +1799,10 @@ impl VfsBackend for NativeBackend {
 
     // --- VFSROUTE (orin 17) ---------------------------------------------------------------
 
-    /// The native volume is journaled and read-write since K4 — there is no block-layer veto on it
-    /// (the ONE coherent mount is the write path itself), so it accepts mutation.
+    /// The native volume is journaled and read-write since K4 — but WHETHER A WRITE REACHES THE MEDIUM
+    /// is the block layer’s answer, not this backend’s, so SDWRITE (A60) forwards it instead of asserting.
     fn write_veto(&self) -> Option<&'static str> {
-        None
+        #[cfg(feature = "sdwrite")] { crate::drivers::block::native_mount_write_veto() } #[cfg(not(feature = "sdwrite"))] { None }
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {

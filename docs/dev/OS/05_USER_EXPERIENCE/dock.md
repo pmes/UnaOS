@@ -1,0 +1,242 @@
+# DOCK — the taskbar strip and the pinned-app model
+
+Status: **APPPIN landed on `exec-orin27-conreopen`** (orin 27, 2026-09-12), unflown. Module:
+`unaos/crates/kernel/src/video/dock.rs`. Knobs: the dock exists on `UNAOS_WC=1` (x86) and on every
+`desktop_firmware` aarch64 desktop (`UNAOS_PIDESK`, `UNAOS_DESKCASCADE`, `UNAOS_ORINRENDER`).
+
+Peter's rulings, verbatim in `docs/dev/RULINGS.md`:
+
+- R49 (2026-09-12): *"console should be an app that is pinned to the taskbar not this mystery thing
+  that appears"* · *"same with shell"*.
+- R50 (2026-09-12): *"quarry is our finder."* (and, the day Quarry was named, quarry.md:10: *"pinned to
+  the left side of the taskbar/dock so it opens like Mac's Finder"*).
+- Q10 (2026-08-09): the dock is a Mac-like window switcher; *"if looks a little off we will change it"*.
+
+---
+
+## 1. What a tile is
+
+The strip is a **window switcher**: one tile per live window, kernel-owned rows included, and a press
+raises and un-hides the window it names (`wm::focus_changed` + `wm::raise_one`, keyed by `(id, gen)`
+so a stale tile raises nothing rather than the wrong thing — DOCKID). It carries no app grid.
+
+Three tiles are **pinned apps** and are always on the strip, in the macOS order:
+
+| tile | owner band | position | when the app has a window | when it has none |
+|---|---|---|---|---|
+| `quarry` | `quarry::OWNER` | leftmost (the Finder, R50) | the live row | a pin; press opens (`quarry::request_open`) |
+| `console` | `wm::KERNEL_OWNER_CONSOLE` | where its row sat, left of the shell | the live row | a pin; press **launches** |
+| `shell` | `wm::KERNEL_OWNER_DESKTOP` | the permanent tail | the live row | a pin; press **launches** |
+
+A pin is a synthetic `DockEntry` with a sentinel id (`SHELL_PIN_ID`, `CONSOLE_PIN_ID`,
+`QUARRY_PIN_ID`, one below the other from `u32::MAX`; the pulse instrument's `PULSE_PIN_ID` is the
+same shape and is unchanged by this arc). The pip is lit for a live row and takes the minimised ink
+for a pin. Painter (`compose`), router (`press_at`), occlusion registry (`strip_rect`), `wm::dock_tiles`
+and `selftest` all build the model through the same chain, and `pins_applied` is the one pure fold the
+two count-only readers use — so no reader can disagree about the tile count.
+
+## 2. Launch
+
+A press on a pin **posts a launch** for the app the pin names (`dock::PinnedApp::{Console, Shell}`,
+`take_launch`). The post is a bit per app — a queue of one, carrying no window id, no generation and no
+"was open" — because the router runs in the input band and may neither allocate a surface nor take a
+blocking panel lock (LOCKFIX `7847ceea`); Quarry's tile defers the same way.
+
+The body that **owns the app's instance** drains the post on its next pass and mints a fresh window
+through the **same function its own boot bring-up used**:
+
+| app | body | mint seam | what is fresh |
+|---|---|---|---|
+| console | every render body, via `console_launch_service` (arch-neutral, in `dock.rs`) | `fbcon::panel_console_window_open` | surface, row (id, gen), glyph route; the cell store (the app's document) is repainted |
+| shell (x86) | `x86_render_service`, inline at the tail of its event drain | `open_shell_window` + `Screen::direct` | store, `Screen`, `TargetPal`, `Console`, row |
+| shell (Pi) | `render_service`'s mint arm, opened by `shellwin_service_rearm` | `open_shell_window` | the same tuple, rebound by the arm |
+| shell (cascaded scene) | the console pump, on its drain line | `tegra_shell_window_open(pw, ph)` | `TegraShellWin` (store + `Screen`), its `TargetPal`, the pump's `Console` |
+
+An instance that is already live when the post is drained (the scan-to-press race) is **raised**, never
+doubled — one live instance per pinned app. A console mint that declines for a transient reason (an
+`FBCON.try_lock()` lost to the glyph painter) is retried for 32 passes before the decline is reported
+with its count; `fbcon` names the reason on its own `[wc-x] console-window DECLINE` line each time.
+
+The x86 launch arm is deliberately not gated on the desktop takeover: the tile exists wherever a dock
+composites, and the QEMU witness gate drives the arm with no takeover at all (§5).
+
+## 3. Quit
+
+Closing a pinned app's window — the red disc, the app menu's **Quit**, `wc_close_furniture` — is a
+**quit**. All three go through `wm::close`, which frees the row and, through the WINID holder registry,
+clears every registered id cell (`fbcon::CONSOLE_WIN`, `SHELLWIN_ROW`). The owning body notices the row
+gone on its next pass and tears the instance down:
+
+- x86: frees the surface store, drops the `Console` (and everything typed into it), rebinds an empty
+  `Screen`/`TargetPal`, publishes the slot-0 key sink as unbound. The generation recorded at the mint
+  is the recycled-slot fence.
+- cascaded scene: drops the `TargetPal`, then the `TegraShellWin` (the store is freed then and there).
+  A keystroke arriving while the scene is up and no shell instance is live is **dropped** — before this
+  arc it painted the pump's console over the desktop (the render4 SCREEN0 defect).
+- Pi: clears the stale id and parks the mint arm shut; the old store is freed when the next launch
+  rebinds the tuple (a teardown at the quit itself needs the mint arm's locals — pi's fold to take).
+- console: the route is dropped; the cell store survives (the app's data outlives its window).
+
+The tile stays: the pin appears in the same slot on the next composite, because no live row carries the
+owner. Nothing remembers that a window existed.
+
+### 3.1 The exception a window's OWN `close()` makes — and it is an exception by measurement (A30)
+
+"All three go through `wm::close`" is the rule and it is not the whole contract. A window whose owning
+module keeps state of its own outside the window table needs that module's `close()` to run, and
+`wm::close` cannot call it: the holder registry clears an **id cell**, it cannot free a `Vec`, drop a
+model or resume a suspended present. The pulse instrument is the case that was measured. Its `ARMED`
+latch means *"the desktop wants this window"*, so a quit that left the latch set was not a quit at all —
+the next render pass re-minted the window, which is orin-ledger **A30** (Peter, render7: *"closing pulse
+reopens it immediately"*). Two separate defects produced that: the disarm sat below the `WIN` swap, so a
+render pass on another core could mint into the gap; and the app-menu **Quit** arm called bare
+`wm::close(win)` and never reached `pulsewin::close()` at all. Both are fixed — the disarm is now the
+first statement of `pulsewin::close()`, and `winmenu`'s `Quit` arm runs the owning module's close first
+and falls through to `wm::close` for every other window, so the disc and the menu are ONE path.
+
+So the contract reads: **the red disc, the app menu's Quit and `wc_close_furniture` all end in
+`wm::close`, and for a window whose module owns state they reach it THROUGH that module's `close()`.**
+
+Since QUITLEAK the arm is that contract for **every** such app, not for the pulse instrument alone:
+
+```rust
+let closed = (pulsewin::win() == win && pulsewin::close())
+    || quarry_quit(win)      // quarry::live::win() == win  ->  quarry::live::close()
+    || instgui_quit(win)     // instgui::win()      == win  ->  instgui::close()
+    || wm::close(win);
+```
+
+`quarry_quit` and `instgui_quit` are tail-appended owner arms in `video/winmenu.rs`, and they are
+functions rather than two more folded sub-expressions for one reason: each carries a **narrower `cfg`**
+than the `Quit` arm's. Quarry's implementation sits behind `feature = "quarry"` on top of the furniture
+family, the installer behind `all(target_arch = "x86_64", feature = "wc", feature = "instgui")`, and a
+folded sub-expression cannot carry a `cfg` of its own without becoming a second statement — which that
+arm may not have, because `winmenu.rs` is a bare `pub mod` compiled into the knob-off image, where an
+added line moves every `panic::Location` below it (PARITY.md §5.3). Each arm has a `not(...)` twin
+returning `false`, so a build without the feature takes exactly the `wm::close` it always took, and the
+arms themselves are gated on the furniture family, so the knob-off image compiles none of them.
+
+**The interface an app owes is exactly that pair: a public `win()` and a public `close()` that is safe
+to call when it is not open.** A new app with state outside the window table joins by adding an arm.
+
+It is gated rather than asserted. `winmenu::pulsequit_selftest` (tail of `video/winmenu.rs`, reached from
+`winmenu::selftest`, itself reached from `crystal::selftest`) drives both gestures through the real press
+seams on a `UNAOS_WC=1 ./arroyo test` boot and scores each close by three bits the close latches about
+itself — the disarm happened before the swap, the close ended with no window and no latch, and the
+surface was actually freed — plus the module's own close counter, which a bypassed Quit cannot advance.
+Its verdict is one line, `:: PULSEQUIT: pulsewin_open=2 close=2 close_final=2 dock_rearm=2 … :: PASS ::`.
+
+**The two windows that still took the bare path are QUARRY and INSTGUI, and QUITLEAK closed both.**
+`quarry::live::close()` drops `MODEL` and clears `SURF`; `instgui::close()` also calls
+`fbcon::console_present_suspend(false)`. Neither module has an `ARMED` latch, so neither REOPENS — which
+is exactly why the same Quit on a Quarry window *looked* correct on render8, and why the defect survived
+a flight that was watching for it. The window did stay closed. Nothing was released.
+
+* **Quarry — a LEAK.** The bypass reaps the row with the model still allocated and the panel-sized
+  surface still published (1920×1200×4 on the bench panel).
+* **Instgui — a STRANDING, and the serious one.** The dialog suspends the console's presents while it
+  is modal over the glass; its `close()` is what resumes them. Quit it from the app menu on the
+  pre-QUITLEAK tree and the dialog goes away with the suspension still set — a desktop that never
+  presents the console again for the rest of the boot, with nothing on the glass to explain it. That is
+  the same stranding class `video/login.rs` was healed for in fold `6fee8b3a` (LOGINCLOSE: `WIN`,
+  `FORM.state` and the suspension move together or the machine is dead), arriving by a different door.
+
+> ⚠ **The installer's app-menu door does not exist yet, and QUITLEAK's own fixture is what measured
+> that.** `instgui` mints its row `wm::create_at(0, …)` — owner `0` — and `wm::dock_addressable` is
+> `r.used && !r.compat && r.owner_asid != 0`. So `wm::dock_scan` never emits the row, `menubar`'s
+> caption reduction never names it, and the bar lays out no app box for it: `bar_named=false` with
+> the window live and on the glass (`[wc-a] create win=1 asid=0x0 … z=58` against `[wc-fv] focus
+> shell z=57 hidden=0 exempt=0`). The arm above is therefore the right contract and is **UNGATED**
+> until that window becomes dock-addressable — which is a design question (should a modal installer
+> dialog carry an app menu and a dock tile at all?), not a bug to patch in passing. **The door that
+> IS open on this tree is the close disc:** `wc_close_furniture` (`arch/x86_64/syscall.rs`) is a bare
+> `wm::close(win)` for every furniture row and `instgui` has no `press_route` of its own to intercept
+> it, so the stranding is reachable there. Both are recorded, neither is fixed here.
+
+**The gate is `winmenu::appquit_selftest`**, a sibling of `pulsequit_selftest` at the same file's tail
+and reached from the same folded statement at the foot of `winmenu::selftest`. A sibling rather than two
+more rounds inside `pulsequit_selftest`, because these legs carry `cfg`s that fixture's body does not:
+folding them in would run `cfg` blocks through the middle of A30's verdict and let a SKIP in one app
+muddy the pulse line. Each round focuses the app's own window, composites (which is what publishes the
+bar's app box), presses the app box through `strip::press_route` and then the `Quit` row at
+`item_top(APP_MENU_DEFAULT, 2)` — the same two presses `selftest`'s leg 5 uses — and then asks what only
+the app's own teardown can answer:
+
+```text
+:: APPQUIT: app=quarry  win=1 bar_named=true menu_down=true quit_routed=true row_gone=true owner_close=true model_freed=1 surf_released=1 seal=3 was_open=false panel=1280x800 :: PASS ::
+:: APPQUIT: app=instgui win=1 bar_named=false NOT-REACHABLE reason=owner0-is-not-dock-addressable … z=58 shell_z=57 boxes=0 susp_at_open=true teardown_resumes=true … :: SKIP ::
+```
+
+`row_gone=` is reported and is **not** what convicts: A29's holder registry clears the module's own
+`WIN` cell from inside `wm::close`, so every end-state question answers identically on the broken tree.
+What the bypass cannot reach is the module's close COUNTER (`owner_close=`), the two bits
+`quarry::live::close` re-reads after its own teardown (`model_freed=`, `surf_released=`), and the
+installer's record of its last suspend call (`resumed=`). `susp_at_open=` is printed beside `resumed=`
+so the resume cannot pass vacuously: a resume never preceded by a suspension proves nothing.
+
+`quarry` and `instgui` are separately armed features, so on a bare `UNAOS_WC=1` boot each round prints a
+SKIP that names the missing knob — a leg that cannot fire is never left looking like one that passed.
+The instgui round keeps SKIPping with both knobs armed, for the reachability reason boxed above, and
+its SKIP line carries the `z=`/`shell_z=` pair so that claim is falsifiable from the capture rather
+than taken on trust.
+
+## 4. The wire — one grammar, both apps, all three bodies
+
+```text
+[dock] press at (1077,1165) tile=3/5 app=shell -> launch
+[dock] launch app=shell by=console-pump win=4 gen=3 tries=1 -> LAUNCHED
+[wm-act] close-furniture win=4 owner=0xffffff02 closed=true route-dropped=false (…)
+[dock] quit app=shell by=console-pump win=4 gen=3 -> TORN-DOWN
+[dock] press at (1077,1165) tile=3/5 app=shell -> launch
+[dock] launch app=shell by=console-pump win=4 gen=4 tries=1 -> LAUNCHED
+[dock] press at (974,1157) tile=2/5 app=console -> launch
+[dock] launch app=console by=orin_render_service win=1 gen=5 tries=1 -> LAUNCHED
+[dock] launch app=console by=orin_render_service win=1 gen=5 tries=0 -> RAISED      (already live)
+[dock] launch app=console by=orin_render_service win=0 gen=0 tries=32 -> DECLINE   (fbcon declined 32 passes)
+```
+
+`by=` names the pass that drained the post (`x86_render_service`, `render_service`,
+`orin_render_service`, `console-pump`). The boot's own shell mint prints the same `LAUNCHED` line, so a
+capture reads a boot as the first launch. The router's `band=dock` outcome words are `launch-shell` /
+`launch-console` (`raise` and `background` are unchanged).
+
+## 5. The fixture — `dock::apppin_selftest` (x86, `UNAOS_WC=1 ./arroyo test`, ladder tail)
+
+Every leg drives the shipping seams: the press is `press_at` at the shell pin's own tile centre; the
+launch is drained by the real `x86_render_service` on its own core and pass (the fixture only waits, up
+to 4 s per step, on the launch/quit counters); the quit is `wm::close`; the teardown is the body's own.
+
+```text
+:: APPPIN: press1=launch-shell launch1=3:2 quit1=torn-down tile=kept press2=launch-shell launch2=3:3 fresh=true sprite planned=6 nohit=0 cleanup=quit :: PASS ::
+```
+
+`fresh` requires `(id, gen)` to differ between the two launches. The sprite leg parks the real pointer
+at the relaunched window's centre (dmgovlp's `set_abs` idiom), presents the window six times and reads
+`wm::cursor12_offer_counts`: the offer must have been **planned** at least once and `nohit` must not
+have moved — the LOST POINTER of render13 boot 1 (`sprite_us=1`, `-> nohit` after the old re-mint)
+stated as a gate. The fixture closes what it opened and waits for the quit, so the ladder ends on the
+table it started with. Go-red: skipping the mint in the x86 launch arm reads
+`launch1=0:0 quit1=no-teardown tile=lost … :: FAIL ::`.
+
+## 6. What was retired (deleted, not `cfg`'d off)
+
+`SHELL_REOPEN` / `take_shell_reopen`, `CONSOLE_REOPEN` / `take_console_reopen`, `CONSOLE_WINDOWED`,
+`console_reopen_service`, `console_reopen_drain`, `orin_shell_reopen_drain`, `pi_shell_reopen_drain`,
+`tegra_shell_note`, `tegra_shell_live_id`, both `tegra_shell_remint` copies and the SO10 recipe cells
+(`TEGRA_SHELL_BASE/LEN/W/H/STRIDE/X/Y`); the `shell=pin -> reopen requested` and
+`console-reopen … -> REOPEN` grammars; the `shell-reopen` / `console-reopen` outcome words. Ledger:
+SO1, SO10, SO13, SO17 are ticked `dropped` by design under SO27; the drains S4 and SR6 counted are gone.
+
+Left in place, as a STOP for the seat: `wm::shell_remint` (WCSER-REMINT) is the wedge-rescue's adoption
+of a corpse row after a render-core death — not a dock route. Retiring it makes the rescue
+close-and-recreate against the F4 drain barrier that dead cores can never settle (flight 3: 21 s, then
+ABANDONED). The brief listed it; this arc did not take it.
+
+## 7. Invariants
+
+- ONE OS (R16): subsystem names only (`shellwin_*`, `console_launch_drain`, `[dock] launch app=`);
+  no `target_arch` gate was added; the launch path is the app's own boot mint on every board.
+- One live instance per pinned app; a launch that finds one live raises it.
+- The pin tile and the live row never coexist for one owner (`pin_*_wanted` tests presence).
+- Knob-off byte identity: every `main.rs` / `syscall.rs` edit is a same-line fold; the retired
+  `main.rs` region is followed only by an empty knob-off twin; measured by `./arroyo knoboff wc`.

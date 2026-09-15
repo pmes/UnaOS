@@ -357,7 +357,7 @@ unsafe fn enter_acpi_mode(s5: &S5) -> bool {
 /// The witness line is emitted *before* the register write precisely because a successful soft-off
 /// kills the machine part-way through the next line; seeing the `:: ACPI: S5 poweroff ... ::`
 /// marker as the last thing on the serial capture is the proof that this path executed.
-pub fn poweroff() -> ! {
+pub fn poweroff() -> ! { s5_ring_flush(); // S5DRAIN (trunk queue §5, 2026-09-12; LEDGER SO31) — THE DIRECT S5 ROUTE DRAINS TOO. `power::shutdown` flushes the staging ring before it calls here (SO31 part 3), but `video/crystal.rs`'s Shut Down and `video/instgui.rs` call this function DIRECTLY, so on those two routes S5 landed with the ring unflushed and every line still staged — the operator's evidence that the verb ran — died with the power. The flush belongs at the ONE place every x86 S5 route passes through, so the tree has one drain policy and not two. It is the FIRST statement because the `discover()` failure arm below prints and then parks in `hlt_loop`, which is likewise a context with no next print. Idempotent by construction: the `power::shutdown` route's own `power_drain` leaves the ring empty, so this call finds `lines=0` and says so, exactly as the reboot ladder's second drain already does (power.rs:170). ⚠ LINE-NEUTRAL fold onto the signature — `gas_space_name`, `table_checksum_ok`, `discover_reset`, `reset_settle`, `raw_witness`, `reset_report` and `reboot` all sit BELOW this line in this file, and one new source line would move every `panic::Location` record in them (LEDGER P7). The statement is first and the comment last, so nothing is commented out. Body: FILE-TAIL append.
     let s5 = match discover() {
         Ok(s5) => s5,
         Err(why) => {
@@ -622,4 +622,52 @@ pub fn reboot() -> ! {
         "[pwrreboot] no reboot mechanism took on this platform (x86: FADT RESET_REG and the 8042 pulse both returned) — parking in hlt"
     ));
     crate::hlt_loop();
+}
+
+// =================================================================================================
+// S5DRAIN — the x86 S5 port flushes the staging ring, whichever route reached it
+// =================================================================================================
+//
+// Trunk queue §5 (2026-09-12, SERDRAIN's finding); `docs/dev/LEDGER.md` SO31; the ⚠ SCOPE box this
+// closes stood in `power.rs` and in `serial_transport.md`'s "The power verbs drain first" section.
+//
+// ### The defect
+// SO31 part 3 gave every `power.rs` verb an uncapped full drain immediately before the firmware call,
+// because a deferred line needs a NEXT print and a power verb has none. On x86 that covered
+// `power::shutdown` — and only that. `video/crystal.rs:686` (the desktop's Shut Down) and
+// `video/instgui.rs:578` call `acpi_power::poweroff()` DIRECTLY, bypassing `power.rs` entirely, and
+// reached S5 with whatever `_print` had deferred still sitting in the ring. A desktop Shut Down is
+// the press most likely to happen while the compositor is printing, which is exactly when the ring is
+// deepest, so the two routes an OPERATOR uses were the two that lost their evidence.
+//
+// ### The fix
+// The flush moves to the port instead of being repeated per caller: one statement at the top of
+// `poweroff()` (its signature line, folded line-neutral), calling the SAME
+// `serial_ring::power_drain(tag)` entry point on the SAME `[pwrshutoff]` witness family that
+// `power.rs` uses. One drain policy, one tag, one thing to read in a capture — a second spelling here
+// is how two divergent policies happen.
+//
+// ### Every caller drains, and that is checked rather than assumed
+// `grep -rn 'acpi_power::poweroff' unaos/crates/kernel/src/` finds exactly three call sites:
+// `power.rs:190` (already drained upstream — this call then reports `lines=0`), `video/crystal.rs:686`
+// and `video/instgui.rs:578`. **None of them must skip the drain**: all three end in S5 or, when
+// `discover()` refuses, in `hlt_loop`, and both are terminal — there is no next print on either. So
+// the flush is unconditional and there is no exempt caller to gate for.
+//
+// ### Why a named function and not the `power_drain` call open-coded here
+// So the fixture can exercise THE CALL SITE rather than a copy of it. `s5drain_selftest`
+// (`serial_ring.rs`, `witness`-gated) calls this same symbol, so a future edit that swaps this drain
+// for the capped spelling — the realistic regression, since `drain` and `drain_capped` share a
+// signature and no type can separate them — reds the x86 witness ladder instead of being caught, or
+// not caught, by a reader.
+
+/// The whole of `poweroff()`'s pre-firmware work: flush the staging ring, uncapped, through the
+/// arch's raw lock-free writer, and witness what was flushed. Returns `power_drain`'s `(lines, bytes)`
+/// so the fixture can assert on numbers rather than on the shape of a string.
+///
+/// `#[inline(never)]`: this is the call site under test, and a call site that has been inlined away
+/// into two copies is not one call site.
+#[inline(never)]
+pub(crate) fn s5_ring_flush() -> (u64, usize) {
+    crate::serial_ring::power_drain("pwrshutoff")
 }

@@ -203,7 +203,13 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   `docs/CODEX.md` and `MEMORIA.md`; re-verify line numbers when touching prose around them (a
   drifted citation defeats the one check a reader runs). Vessels in `vessels/`, CLI in `tools/`.
 - **Licence:** GPL-3.0-or-later. GPLv2-only code is never copied in; per-file SPDX decides; hardware
-  facts are always usable; proprietary blobs never.
+  facts are always usable; proprietary blobs never — with ONE carve-out (R52, Peter 2026-09-12): a
+  vendor firmware image (the GA10B GSP/boot firmware set) may be STAGED UNMODIFIED on the board's
+  boot media beside the vendor's licence agreement and loaded by the kernel as data from that
+  volume. It is never linked into any UnaOS artifact, never embedded, never committed to the
+  repository, and never modified; the flight's ledger row names each file, its size, its sha256
+  and the licence it ships under. Enforcer: no binary firmware under `unaos/` (a `git ls-files`
+  census in ledger-check.sh, owed); the ledger row's file list.
 
 ## 4. Executors
 
@@ -239,7 +245,10 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   census yourself or name it as the executor's. Absence of signal is not "still running": inspect
   before reporting agent status.
 - **Approval:** new lines, lanes, campaigns and design verdicts need Peter's go, asked the moment
-  they arise. The natural next arc within an approved direction spawns by default. In a metal tight
+  they arise. The natural next arc within an approved direction spawns by default. **On the GPU
+  line (R53, Peter 2026-09-12) the session never stops to ask: it builds the next rung and the one
+  after, and halts only where a download or a metal boot is needed — those are Peter's.**
+  Enforcer: R53. In a metal tight
   loop the loop is the approval (fixes, instruments, next rungs); destructive boots and new lanes
   need a fresh go. Direction sketched in conversation is captured as ideas for his review, never
   operationalised into sessions or briefs he did not ask for (Peter 2026-08-25). Budget discipline:
