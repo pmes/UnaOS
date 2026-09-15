@@ -940,3 +940,138 @@ fn bw_sample(ecam: u64, cap: u16, aer: u16, lnksta: u16, devsta: u16, secsta: u1
         cor
     );
 }
+
+// ── SECSTA2 — the SECOND sticky clear, once enumeration is complete ─────────────────────────────
+//
+// The rung above BAR1WEDGE's arm-time clear, named by that rung's own residual note (the block
+// above, and `PCIE-RP-RECOVERY.md` §11): the at-arm clear narrows the window in which something
+// other than the wedge can latch the root port's sticky status bits, but it does not close it,
+// because `census` runs INSIDE `pci::init` and bus enumeration continues after it returns.
+//
+// WHICH ENUMERATION, THOUGH — AND THE ANSWER IS NOT THE ONE THAT WAS WRITTEN DOWN. Both that note
+// and §11 name "the EHCI driver's own `0..=255` walk" as the remaining contributor. Reading the
+// call order refutes it: `drivers::ehci::init` (its walk at `drivers/ehci/mod.rs:17468`) is called
+// from `arch/x86_64/pci.rs:838`, and the Kepler dispatch that reaches `census` — and therefore
+// `bw_arm`'s clear — is at `arch/x86_64/pci.rs:1016`. EHCI walks the bus BEFORE the at-arm clear,
+// so whatever it latched is already inside the `secsta=` the at-arm line prints as its "before"
+// value and is already wiped by that clear. The walks that genuinely follow it are the three in
+// the tail of the same function:
+//
+//   * `sdhc::probe` → `PciScanner::storage_inventory` — `drivers/pci.rs:84`, buses 0..=255;
+//   * `ahci::probe` — `drivers/ahci.rs:286`, buses 0..=255 (knob `UNAOS_AHCI`, default OFF);
+//   * `init_network` → `PciScanner::find_device` — `drivers/pci.rs:141`, buses 0..=255, and the
+//     LAST enumeration walk `pci::init` performs.
+//
+// So the honest call site is the tail of `pci::init` itself, not `drivers/ehci` — see the call
+// statement there for the rest of the reasoning, including why it sits after the GPACE report.
+//
+// WHAT `relatch=` BUYS, AND IT IS THE POINT OF THE RUNG. It is the set of RW1C bits that were set
+// AGAIN between the at-arm clear and the end of enumeration — i.e. the bits ENUMERATION ITSELF
+// sets on this machine, measured rather than assumed. `relatch=secsta:2000` says a bus walk does
+// latch Received Master Abort here, which is exactly the mechanism §1.3 says makes W7's
+// `secsta=2000` at the wedge unfalsifiable — and it makes the post-enum baseline mandatory rather
+// than tidy. `relatch=secsta:0000` says no walk below this bridge master-aborts at all, and a
+// `d_secsta=2000` at the first stall then has nothing left to blame but the wedge.
+//
+// THE WRITE PATH IS THE AT-ARM ONE, UNCHANGED, AND IT NEEDS NO MAPPING RE-VERIFIED. `bw_arm`'s
+// clear is CF8/CFC (`arch::pci::write_config_16`) — port I/O into the legacy 256-byte config
+// region, not a store through the ECAM window — so there is no `map_mmio_window` writability to
+// re-establish at this later point and no `clear=SKIPPED(unmapped)` branch to take: both registers
+// written here (`0x1E`, and `cap + 0x12` with `cap` already bounded by `cap_fits(cap,
+// PCIE_CAP_SPAN)`) are CF8-reachable by construction. PCIH-NOCF8's refusal is about the ~1 kHz
+// tripwire band on a non-BSP core; this runs on the BSP inside `pci::init`, the same sequential
+// boot phase `census` reads config space in and `bw_arm` already WRITES it in, and before the main
+// loop hands another core a config writer (`wifi::service`, `main.rs:1261`).
+//
+// WHAT THIS DOES NOT RE-BASELINE, stated rather than left for a reader to trip over: Device Status.
+// The brief for this rung names SECSTA and LNKSTA, and `BW_DEVSTA0` is deliberately left holding
+// its at-arm value, so `d_devsta` on the `wedge-sample` line still deltas against `pci::init`'s
+// Kepler dispatch while `d_secsta`/`d_lnksta` delta against the end of enumeration. Nothing
+// observed needs the third: `devsta=0000` on every boot that has ever been captured, at boot and at
+// the wedge. Closing it is two lines here (read `cap + 0x0A`, clear `DEVSTA_W1C`, store it) and is
+// left to the seat rather than taken silently.
+//
+// RESIDUAL, in the same voice the block above uses: `wifi::service` (`wifi/bus.rs:125`, buses
+// 0..=255, knob `UNAOS_WIFI`) sweeps config space from the main loop, i.e. AFTER this clear, on
+// every boot that arms it. On such a boot the window is "after the first wifi census" rather than
+// "after enumeration", and a `d_secsta` reading has that one named alternative left. No A1 flight
+// row asks for the knob (`grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md`
+// = 0/0), and any given boot settles it from its own `⚡ kernel features:` banner.
+
+/// Bytes of the legacy type-1 header this rung reads and writes: Secondary Status is 16-bit at
+/// `0x1E`, so `0x20` is the span. Below [`LEGACY_CFG_LEN`] by construction — named so the claim is
+/// arithmetic rather than a reader's memory of the header layout.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub const SECSTA_END: u16 = 0x20;
+
+/// BAR1WEDGE, POST-ENUMERATION half. Called ONCE, from the tail of `arch::x86_64::pci::init`, after
+/// the last bus walk of the boot. Re-reads the root port's Secondary Status and Link Status, prints
+/// what enumeration re-latched since the at-arm clear, clears the RW1C bits a second time, and
+/// makes the read-back the baseline `bw_sample`'s `d_secsta`/`d_lnksta` delta against.
+///
+/// Guarded on `PCIH_READY`, which is set only at the end of [`census`] — so on a machine with no
+/// GK107 (QEMU q35, every non-kepler boot) this returns without reading or writing anything, and
+/// the post-enum line is honestly absent rather than printed against a root port nobody resolved.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub fn sticky_clear_post_enum() {
+    if !PCIH_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let bdf = RP_BDF.load(Ordering::Relaxed);
+    let (rb, rs, rf) = ((bdf >> 8) as u8, ((bdf >> 3) & 0x1F) as u8, (bdf & 0x7) as u8);
+    let cap = RP_PCIE_CAP.load(Ordering::Relaxed) as u8;
+    if cap == 0 {
+        return; // invariant: census returns before arming when `find_cap` gave it nothing
+    }
+    // The same two preconditions `bw_arm` asserts, restated locally: this function forms `cap +
+    // 0x12` and `0x1E`, and both must lie inside the 256-byte region CF8 can reach.
+    debug_assert!(cap_fits(cap, PCIE_CAP_SPAN), "pcih: post-enum cap out of region");
+    debug_assert!(SECSTA_END <= LEGACY_CFG_LEN, "pcih: post-enum secsta off region");
+
+    let (secsta, lnksta) = unsafe {
+        (
+            crate::arch::pci::read_config_16(rb, rs, rf, 0x1E),
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x12),
+        )
+    };
+    // The at-arm baseline, read BEFORE it is overwritten: `relatch` is what is set now that the
+    // post-clear reading did not carry. Masked to the RW1C bits so a read-only field that legally
+    // changed during enumeration (negotiated width, current speed) can never be reported as a latch.
+    let at_arm_ss = BW_SECSTA0.load(Ordering::Relaxed) as u16;
+    let at_arm_ls = BW_LNKSTA0.load(Ordering::Relaxed) as u16;
+    let relatch_ss = secsta & SECSTA_W1C & !at_arm_ss;
+    let relatch_ls = lnksta & LNKSTA_W1C & !at_arm_ls;
+
+    // Same discipline as the at-arm clear: write ONLY the RW1C bits observed SET, and do not write
+    // a register with nothing latched.
+    let ss_w1c = secsta & SECSTA_W1C;
+    let ls_w1c = lnksta & LNKSTA_W1C;
+    unsafe {
+        if ls_w1c != 0 {
+            crate::arch::pci::write_config_16(rb, rs, rf, cap + 0x12, ls_w1c);
+        }
+        if ss_w1c != 0 {
+            crate::arch::pci::write_config_16(rb, rs, rf, 0x1E, ss_w1c);
+        }
+    }
+    // Read back rather than assume — a latch that does not clear is itself a finding, and the
+    // baseline must be what the hardware says.
+    let (secsta1, lnksta1) = unsafe {
+        (
+            crate::arch::pci::read_config_16(rb, rs, rf, 0x1E),
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x12),
+        )
+    };
+    serial_println!(
+        "[pcih] bar1wedge sticky-cleared post-enum rp={}:{}.{} secsta={:04x}->{:04x} \
+         lnksta={:04x}->{:04x} relatch=secsta:{:04x} lnksta:{:04x} at-arm=secsta:{:04x} \
+         lnksta:{:04x} (w1c written {:04x}/{:04x}) — relatch is what ENUMERATION set after the \
+         at-arm clear; wedge-sample d_secsta/d_lnksta now delta against THIS baseline, d_devsta \
+         still against at-arm",
+        rb, rs, rf, secsta, secsta1, lnksta, lnksta1, relatch_ss, relatch_ls, at_arm_ss, at_arm_ls,
+        ss_w1c, ls_w1c
+    );
+
+    BW_SECSTA0.store(secsta1 as u32, Ordering::Relaxed);
+    BW_LNKSTA0.store(lnksta1 as u32, Ordering::Relaxed);
+}
