@@ -178,6 +178,17 @@ stage_contents() {
     head -c 64 /dev/zero | tr '\000' '\245' > "${S}/S8W.BIN"
     echo "    added S8W.BIN (64 bytes of 0xA5) for the STOR-1 S8 dynamic-write witness"
 
+    # AHCIBOOT (rmbp-ledger B89, second rung): the marker file the SATA chain fixture reads back.
+    # 4096 bytes — EIGHT whole sectors — so the read goes through the FAT layer's COUNTED run path
+    # (`fat::read_sectors` -> `block::read_blocks_ahci_port`) and not only the single-sector arm a
+    # short file would touch. The content is GENERATED from one rule, `byte[i] = 'A' + (i % 26)`,
+    # which `fs::bootdisk::ahciboot_expect` reproduces in the kernel: nothing is stored on both
+    # sides, so the two cannot drift, and a read that returns zeros fails on byte 0. Planted on
+    # every layout, because the marker costs one cluster and a fixture that exists only on the GPT
+    # image is one `arroyo` flag away from silently not being there.
+    python3 -c "import sys; sys.stdout.buffer.write(bytes((65+(i%26)) for i in range(4096)))" > "${S}/AHCIBOOT.TXT"
+    echo "    added AHCIBOOT.TXT (4096 bytes, byte i = 'A'+(i%26)) for the AHCIBOOT SATA-chain witness"
+
     # SINKHOLE-1/ZEOLITE-2 (zeolite): the DNS resolver's blocklist, in real hosts-file format — the format
     # actual sinkhole lists ship in (Steven Black hosts, AdAway, etc.): an IP redirect target (0.0.0.0 or
     # 127.0.0.1) followed by whitespace and the domain, with '#'/';' comments and blank lines tolerated. The

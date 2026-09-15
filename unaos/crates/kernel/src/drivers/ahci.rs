@@ -913,5 +913,5 @@ pub fn probe() {
     serial_println!(
         "[ahci] done: implemented-ports={} published={} (READ-ONLY arc — no WRITE opcode is compiled into this image)",
         seen, next_ix
-    );
+    ); #[cfg(feature = "witness")] crate::fs::bootdisk::ahciboot_selftest(); // AHCIBOOT (B89 second rung): the wire fixture, folded onto this line so knob-off byte identity is untouched. It runs HERE because this is the last statement of the one enumeration pass — registry populated, every HBA and port lock released, heap up — and because on x86 nothing else on a headless boot runs after it: `shell::vfs_mount_table`'s `bootdisk::bind` arm is `target_arch = "aarch64"`. Default-quiet (`witness`), like `homesoil_selftest`.
 }

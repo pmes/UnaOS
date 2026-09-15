@@ -205,7 +205,7 @@ impl InstallTarget for BlockTarget {
                 // `TegraSd` target (`from_parts` is only ever called with `Global`/`Usb`), and the
                 // Orin card's install flow is `sdmmc_tegra`'s own armed ladder, not this engine.
                 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-                block::BlockHandle::TegraSd => Err(block::BlockError::NotReady),
+                block::BlockHandle::TegraSd => Err(block::BlockError::NotReady), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => Err(block::BlockError::NotReady), // AHCIBOOT: the installer can NEVER select a SATA disk. rmbp-ledger B91 — on the bench rMBP the internal SSD carries a live Catalina, and B91 requires the stranger guard before any path that could name her disk. Nothing constructs an `Ahci` target (`from_parts` is only ever called with `Global`/`Usb`, and the chooser lists only those two handles); this arm makes the refusal a property of the match rather than of who happens to call it.
             }
             .map_err(map_blk)?;
             if n < chunk.len() {
@@ -229,7 +229,7 @@ impl InstallTarget for BlockTarget {
                 // down as well (`write_block_tegra_sd` never writes in any cfg); refusing here too
                 // keeps the unreachable arm explicit rather than accidental.
                 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-                block::BlockHandle::TegraSd => Err(block::BlockError::NotReady),
+                block::BlockHandle::TegraSd => Err(block::BlockError::NotReady), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => Err(block::BlockError::NotReady), // AHCIBOOT: see `read_sectors` — and a medium-destroying write is the last place to let an unreachable arm fall through. The block layer refuses one layer down too (`write_block_ahci` never writes in any cfg, and the image compiles no ATA write opcode), so this is the second of two refusals, not the only one.
             }
             .map_err(map_blk)?;
         }

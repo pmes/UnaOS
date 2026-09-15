@@ -521,7 +521,7 @@ pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
         // read path, not a program-loading precedence (see the census note on `source_census`). Mapped
         // for totality, exactly as `Usb` is, and it means the same thing: this arm cannot be reached.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => None,
+        BlockHandle::TegraSd => None, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => None, // AHCIBOOT: `program_source` never returns a SATA handle (this arc publishes no program-source rung for it), so this arm is mapped for totality and cannot be reached.
     }
 }
 
@@ -624,7 +624,7 @@ pub enum BlockHandle {
     /// `sdmmc_arm` ladder in `sdmmc_tegra.rs`; [`write_block_tegra_sd`] exists so the dispatch below
     /// is total and fails CLOSED, not so that anything writes.
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-    TegraSd,
+    TegraSd, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 },
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -684,7 +684,7 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => tegra_sd_info(),
+        BlockHandle::TegraSd => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -2272,7 +2272,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         // is censused once on its own terms and can neither suppress nor be suppressed by the boot
         // stick's census. Disjoint from bit 4 by construction: no build carries both handles.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => 8,
+        BlockHandle::TegraSd => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -2284,7 +2284,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => "tegra-sd",
+        BlockHandle::TegraSd => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -2405,7 +2405,7 @@ impl PartitionRange {
             // gate every other handle goes through — no second addressing path, no absolute LBA
             // computed by a caller.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => read_block_tegra_sd(abs, buf),
+            BlockHandle::TegraSd => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf),
         }
     }
 
@@ -2424,7 +2424,7 @@ impl PartitionRange {
             // one-shot witness + `NotReady`), so the variant cannot become a fourth door past the
             // armed `sdmmc_arm` ladder — a range that carries the card is readable and nothing more.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => write_block_tegra_sd(abs, buf),
+            BlockHandle::TegraSd => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
         }
     }
 
@@ -2438,7 +2438,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => read_blocks_tegra_sd(abs, buf),
+            BlockHandle::TegraSd => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf),
         }
     }
 
@@ -2452,7 +2452,7 @@ impl PartitionRange {
             BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
             // TEGRA-SDBLK: refuses, as the single-sector twin above does and for the same reason.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => write_blocks_tegra_sd(abs, buf),
+            BlockHandle::TegraSd => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
         }
     }
 
@@ -2467,7 +2467,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => sdhc_info(),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => tegra_sd_info(),
+            BlockHandle::TegraSd => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;
@@ -2616,7 +2616,7 @@ pub fn handle_write_veto(handle: BlockHandle) -> Option<&'static str> {
             } else {
                 Some(NATIVE_TEGRA_SD_VETO)
             }
-        }
+        } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => Some(NATIVE_AHCI_VETO), // AHCIBOOT: a flat NO with no exception to carve — `write_block_ahci` refuses in every cfg and the image compiles no ATA write opcode. A forward to that standing answer, not a second policy.
     }
 }
 
@@ -2827,3 +2827,86 @@ pub fn write_block_ahci(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
     }
     Err(BlockError::NotReady)
 }
+
+// ══════════ AHCIBOOT (rmbp-ledger B89, second rung) — the SATA disks as BLOCK HANDLES ════════════
+//
+// AHCI's first rung published the SATA disks into the registry above and stopped there, because
+// `BlockHandle` is matched EXHAUSTIVELY outside this file and one of the files that matches it is
+// `install/`, which B91 forbade that arc to touch. The stranger guard's ordering constraint is
+// satisfied a different way here: the handle arrives and the installer's two arms REFUSE it by
+// construction (`install/mod.rs`), so the internal SSD gains a READ path and no write path at all.
+//
+// ### The key is the PORT, and the port comes from the enumerator
+//
+// `BlockHandle::Ahci { port }` carries the HBA port — the same key `AhciDisk` is published under
+// and the same key `drivers::ahci`'s `PI` mask handed us. It is NOT the registry index: an index is
+// an address into an array this file owns, and a handle that travelled through `BlockDeviceId`,
+// `PartitionRange` and `fs::fat::BlockSource` and came back meaning a different row would be the
+// identity-from-bytes defect (rmbp 17) in a new spelling. The port is a fact about the wire.
+// `fs::fat::BlockSource::Ahci(port)` carries the SAME number, so `handle_of` / `source_of` is a
+// lossless bijection in both directions and neither enum can name a disk the other cannot.
+//
+// The `_port` entry points below are therefore the whole seam: they resolve port -> registry index
+// once, through [`ahci_ix_of_port`], and then call the `_ix` entry points the first rung landed.
+// One resolution site, so a stale port answers `NotReady` rather than reading a neighbour's disk.
+//
+// ### The write twins refuse, and the refusal is not a policy
+//
+// `write_block_ahci_port` / `write_blocks_ahci_port` forward to [`write_block_ahci`], which refuses
+// unconditionally with a one-shot witness. `drivers/ahci.rs` still compiles exactly two ATA opcodes
+// (IDENTIFY DEVICE 0xEC and READ DMA EXT 0x25), so there is no ladder for a write to descend even
+// if something above asked for one. Read-only stays a property of the image.
+
+/// AHCIBOOT: the HBA port the registry entry at `ix` was published under, if that entry is live.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_port_at(ix: usize) -> Option<u8> {
+    ahci_disk(ix).map(|d| d.port)
+}
+
+/// AHCIBOOT: which registry index holds the disk on HBA `port`? `None` when no port answers.
+///
+/// The ONE place a port becomes an index. Everything below goes through it, so "the disk on port 5"
+/// means the same row to a `PartitionRange`, to a `BlockSource` and to a `BlockDeviceId`.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_ix_of_port(port: u8) -> Option<usize> {
+    AHCI_DISKS.lock().iter().position(|e| matches!(e, Some(d) if d.port == port))
+}
+
+/// AHCIBOOT: geometry of the SATA disk on HBA `port`.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_info_port(port: u8) -> Option<BlockDeviceInfo> {
+    ahci_info_ix(ahci_ix_of_port(port)?)
+}
+
+/// AHCIBOOT: read one block from the SATA disk on HBA `port`. `NotReady` when no port answers —
+/// never a read of whichever disk happens to occupy that index now.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn read_block_ahci_port(port: u8, lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    read_block_ahci_ix(ahci_ix_of_port(port).ok_or(BlockError::NotReady)?, lba, buf)
+}
+
+/// AHCIBOOT: the counted twin of [`read_block_ahci_port`].
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn read_blocks_ahci_port(port: u8, lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    read_blocks_ahci_ix(ahci_ix_of_port(port).ok_or(BlockError::NotReady)?, lba, buf)
+}
+
+/// AHCIBOOT: every write to a SATA disk is refused. Forwards to [`write_block_ahci`] rather than
+/// returning a local `Err` so there is exactly ONE place in the tree that decides this answer and
+/// exactly one witness that names it.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn write_block_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    write_block_ahci(lba, buf)
+}
+
+/// AHCIBOOT: the counted twin of [`write_block_ahci_port`] — refuses before touching the medium.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn write_blocks_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    write_block_ahci(lba, buf)
+}
+
+/// AHCIBOOT: the SATA root's standing write refusal, as [`handle_write_veto`] reports it.
+#[cfg(all(feature = "sdwrite", target_arch = "x86_64", feature = "ahci"))]
+const NATIVE_AHCI_VETO: &str = "the volume rides an internal SATA disk and the block layer refuses \
+                                every write to it — this image compiles no ATA write opcode at all \
+                                (AHCI / AHCIBOOT)";
