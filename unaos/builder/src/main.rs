@@ -505,6 +505,18 @@ fn main() {
     // endpoint-hang discriminator. DEFAULT OFF => feature unlinked => byte-identical media.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_NOASPM").is_ok() { feats.push("noaspm"); }
+    // BAR1WEDGE: UNAOS_BAR1WEDGE=1 arms the FIRST-STALL register block at the tail of
+    // drivers/gpu/pcihealth.rs — the falsifier that makes the never-flown UC arm (UNAOS_BAR1EXP=uc)
+    // scorable. Root port only: a boot baseline + the completion-timeout decode, an arm-time W1C
+    // clear of the three sticky latches, and one read-only `[pcih] wedge-sample` line per tripwire
+    // crossing. THIS list is what reaches the kernel binary for MEDIA builds, and this knob's ENTIRE
+    // product is witness lines — so a knob wired into arroyo alone would put `bar1wedge` in the
+    // banner and not one `:: BAR1WEDGE:` string in the image, and the flight would read as a
+    // negative result about the hardware rather than as a build that never carried the instrument
+    // (BEAMX86's failure mode above, verbatim). Kept in sync with arroyo; `./arroyo check`'s
+    // KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF => feature unlinked
+    // => byte-identical media.
+    if std::env::var("UNAOS_BAR1WEDGE").is_ok() { feats.push("bar1wedge"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

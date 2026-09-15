@@ -289,14 +289,18 @@ nothing guards it across boots, so every boot from that stick switches the mux a
 
 Knobs: `UNAOS_NOASPM` (`noaspm`) arms the ASPM clear; the census and the wedge sampler ride **every**
 kepler boot regardless. `UNAOS_BAR1EXP=uc` (`bar1exp-uc`) arms the PHASE31ROOT UC-retype arm.
+`UNAOS_BAR1WEDGE` (`bar1wedge`) arms the FIRST-STALL register block — P6 below, the falsifier P5
+needs to be scorable. The full wedge-theory ladder behind these rungs, and the field-by-field decode
+of every register named in this section, are `PCIE-RP-RECOVERY.md` §11.
 
 | rung | knob | witness token (file:line, n) | last metal verdict | failed under | depends on | status |
 | --- | --- | --- | --- | --- | --- | --- |
 | P1 boot link census | — (unconditional) | `[pcih] rp-boot bdf=` (`pcihealth.rs:438`, n=1) | every kepler boot | — | — | **proven** |
 | P2 ECAM trust guard | — | `[pcih] ecam-mismatch` (`pcihealth.rs:283`, n=1) | — | — | P1 | **open** (a guard; it fires or it does not) |
 | P3 ASPM kill switch | `UNAOS_NOASPM` | `[pcih] aspm cleared rp ` (`pcihealth.rs:456`, n=1) | boot 11: `aspm cleared rp 0043->0040 ep 0043->0040` — **the clear took, and the machine wedged anyway at 118 s**. Flight 4 repeated it: ASPM cleared at init, three strikes regardless | **ASPM L0s/L1 is off the table as the cause of the BAR1 wedge (ledger A1)** — under these conditions: WC-typed BAR1 aperture (PAT PA4), sustained compositor paint bursts, Kepler FIFO and CE engines present *and* (rmbp-5 boot 17) equally absent. The **clear itself is proven to work**; only its curative hypothesis is shut out | P1 | **shut-out as a cure; proven as a mechanism** |
-| P4 wedge sampler | — (arms when the root port has a verified ECAM page) | `[pcih] rp-at-wedge lnksta=` (`pcihealth.rs:578`, n=2) | boot 11 and every flight-4 strike: `rp-at-wedge lnksta=d081 devsta=0000 secsta=2000 aer=n` | **link training is exonerated**: boot 9 read `lnksta=d881` with the Link Training bit SET, boot 11 `d081` with it CLEAR — same wedge either way. The link is clean at the wedge, with no AER | P1 | **proven** (the instrument); the link-fault hypothesis is **shut out** |
-| P5 BAR1 UC retype (PHASE31ROOT) | `UNAOS_BAR1EXP=uc` | `:: x86 bar1exp: UC arm ARMED` (`arch/x86_64/memory.rs:3729`, n=1 over `unaos/crates/kernel/src`) | **never flown.** Flight 5 deliberately did not arm it: *"UC is ~6.8x slower and would corrupt the power numbers"* | — | P3, P4 (the discriminator only means something with ASPM already excluded) | **never-run** — the M1-vs-{M2,M3} discriminator for the store-buffer-backpressure reading |
+| P4 wedge sampler | — (arms when the root port has a verified ECAM page) | `[pcih] rp-at-wedge lnksta=` (`pcihealth.rs:584`, n=2) | boot 11 and every flight-4 strike: `rp-at-wedge lnksta=d081 devsta=0000 secsta=2000 aer=n` | **link training is exonerated**: boot 9 read `lnksta=d881` with the Link Training bit SET, boot 11 `d081` with it CLEAR — same wedge either way. The link is clean at the wedge, with no AER | P1 | **proven** (the instrument); the link-fault hypothesis is **shut out — with the caveat P6's decode found**: LNKSTA[15:14] are RW1C latches this kernel had never cleared and BOTH are set in `d081`, so "clean link" was read off a field that was partly reporting the whole boot. `PCIE-RP-RECOVERY.md` §11.2 |
+| P5 BAR1 UC retype (PHASE31ROOT) | `UNAOS_BAR1EXP=uc` | `:: x86 bar1exp: UC arm ARMED` (`arch/x86_64/memory.rs:3729`, n=1 over `unaos/crates/kernel/src`) | **never flown.** Flight 5 deliberately did not arm it: *"UC is ~6.8x slower and would corrupt the power numbers"* | — | P3, P4 (the discriminator only means something with ASPM already excluded), **and now P6 — the flight needs both knobs or it is unscorable** | **never-run** — the M1-vs-{M2,M3} discriminator for the store-buffer-backpressure reading |
+| P6 BAR1WEDGE first-stall block | `UNAOS_BAR1WEDGE` | `:: BAR1WEDGE: rung=first-stall` (`pcihealth.rs:787`, n=1) · `[pcih] wedge-sample n=` (`pcihealth.rs:906`, n=1) · `[pcih] bar1wedge sticky-cleared` (`pcihealth.rs:866`, n=1) · `[pcih] bar1wedge cto rp` (`pcihealth.rs:812`, n=2 — the armed and the UNREADABLE arm) | **never flown** — landed this arc, default OFF | — | P1 (the census resolves the root port and the ECAM page), P4 (it rides the same tripwire crossing) | **never-run** — the instrument that makes P5 scorable: it prints LNKCTL (which P4 reads and discards), the completion-timeout configuration (never read by anything, ever), and the deltas against an arm-time W1C clear of the three sticky latches |
 
 **What would change the verdict**
 
@@ -307,6 +311,17 @@ kepler boot regardless. `UNAOS_BAR1EXP=uc` (`bar1exp-uc`) arms the PHASE31ROOT U
 - **P5** — fly it on a boot whose success criterion is **wedge/no-wedge**, not throughput. The
   6.8x slowdown that disqualified it from flight 5's power measurement is irrelevant to the
   question it answers. This is the single named, coded, never-flown experiment for ledger A1.
+  **⚠ AND IT NEEDS P6 ON THE SAME LINE, which is why P6 exists.** A UC boot on its own yields one
+  bit, and the 6.8x slowdown explains a quiet boot as readily as the theory does; the pair
+  `UNAOS_BAR1EXP=uc UNAOS_BAR1WEDGE=1` is the experiment, and a WC boot with `UNAOS_BAR1WEDGE=1`
+  alone is its control. Score card: `PCIE-RP-RECOVERY.md` §11.3.
+- **P6** — it has never flown, so every cell above is a prediction. Three of its outcomes end an
+  argument on their own, without P5: `dis=1` in the `cto` line convicts the completion-timeout
+  theory (`PCIE-RP-RECOVERY.md` §11.1 W6) and takes §3.2's sacrificial probe off the table;
+  `d_secsta=0000` at `n=1` kills the master-abort reading three boots have leaned on (W7); and
+  `d_lnksta` carrying bits [15:14] RE-OPENS P4's shut-out as bandwidth renegotiation under burst,
+  a claim nothing has ever tested separately. R19's shape exactly: the rung that re-opens an
+  earlier failure is a rung, not a retraction.
 
 ---
 
