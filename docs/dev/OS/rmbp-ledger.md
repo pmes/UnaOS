@@ -24,7 +24,7 @@ Status enum (GATE-LEDGER): **open** · **fixed-unflown** · **flown** · **lande
 | A4 | Unattended reboots into UnaOS impossible: firmware boots macOS unless ⌥ is held at power-up | rmbp | rmbp | open — not kernel work; the card must become the default startup volume (macOS `bless`/Startup Disk); Peter's call on his laptop | `docs/dev/RULINGS.md` R3; F6 | — |
 | A5 | Shell window tears under storm: `[wc-h] win=2 torn=111 banded=13085` while the eight vug windows sit at torn 3–10; `[wcser] declined_pct=51 -> SERIAL`, `[wc-w] amp=1.28x -> WIDENED` | rmbp | rmbp | open — measured, not judged (Peter saw "vug tearing"; the counter says the shell) | F6 boot 1 | — |
 | A6 | `[clickroute] route … kernel=true desktop=false nofab=true -> FAIL` deterministic on metal, green in QEMU | rmbp | rmbp | open — bracket question (new-with-arc or pre-existing?) | flight 4/5 playbooks (MANIFEST lines 635–636) | — |
-| A7 | GMUX switch to the iGPU does not persist (switches and restores on one call stack) | rmbp | rmbp | open — `GMUX_SWITCH_EXTERNAL=0x01` is the blocker | B11 P6 | — |
+| A7 | GMUX switch to the iGPU does not persist (switches and restores on one call stack) | rmbp | rmbp | open — `GMUX_SWITCH_EXTERNAL=0x01` is the blocker | docs/dev/evidence/rmbp-0915/GMUX-1-PRESWITCH.md (GMUX-1: flight 5 read it back; 0x40 is the write-target port, the three status ports all read accepted) | — |
 | A8 | BT inquiry deafness is boot-scoped (deaf boot 1, hears boot 2); SSP→A2DP `DISCOVER` unanswered | rmbp | rmbp | open | flight 4/5 (MANIFEST lines 635–636) | — |
 | A9 | Serial console is TX-only (FTDI bulk IN 0x81 never driven) — no typing over the wire, no self-driving loop | rmbp | rmbp | open — ranked first transport for DEV-LOOP (~11.5 KB/s) | B11 DEV-LOOP | — |
 
