@@ -6018,6 +6018,26 @@ check_both() {
         _rrc=1
     fi
 
+    # GATE-FC2 (rmbp, 2026-09-15): LEDGER S5's CLASS — the knob discipline in this tree is stated on
+    # CALL SITES, and the DECLARATION is the half nobody checks. `pub mod foo;` with no cfg compiles
+    # `foo.rs` into every image — statics linked, panic::Location lines counted — even when every path
+    # that can reach it sits behind a `target_arch` or a `feature`. S3's complaint about
+    # `flight_recorder` is that shape, and `scripts/fc2-check.sh` measures it across all 162
+    # declarations instead of across the three somebody happened to notice. A finding that carries a
+    # ruling this gate may not overturn lives in `scripts/fc2.registry` with its measurement. Controls
+    # run before any verdict: a synthetic fixture with two known instances that MUST both be reported
+    # — one written in the FOLDED form this gate itself prescribes, because the scanner went blind to
+    # exactly that shape once during the build — plus three facts about this tree the parser has to
+    # rediscover (cfg_if arm inheritance, file-cfg inheritance, comment stripping). A control failure
+    # exits 2, and a gate that gave no verdict is NOT a pass.
+    local _f2rc=0
+    "$WORKSPACE_DIR/scripts/fc2-check.sh" || _f2rc=$?
+    if [ "$_f2rc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ fc2 (no module declared wider than every path that can reach it)${COLOR_RESET}"
+    else
+        [ "$_f2rc" -eq 2 ] && echo -e "${COLOR_RED}❌ fc2 gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
+    fi
+
     if [ "$_urc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
         return 1
@@ -6060,6 +6080,10 @@ check_both() {
     fi
     if [ "$_lrc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a ledger row is unverifiable (see GATE-LEDGER above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_f2rc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a module is declared wider than every path that can reach it (see GATE-FC2 above)${COLOR_RESET}"
         return 1
     fi
 }

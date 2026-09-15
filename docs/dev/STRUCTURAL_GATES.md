@@ -631,6 +631,112 @@ control and should be argued for.
 
 ---
 
+## GATE-FC2 — a module may not be declared wider than every path that can reach it
+
+**Invariant.** For every non-inline `mod` / `pub mod` declaration reachable from
+the two crate roots (`crates/kernel/src/lib.rs` for `unaos_kernel`,
+`crates/kernel/src/main.rs` for the binary): if the module is referenced at all,
+and EVERY reference site sits under some cfg predicate the declaration does not
+already carry, the declaration is the wider one and the gate reds. Exceptions are
+registered, with their measurement, in `unaos/scripts/fc2.registry`.
+
+**Why a gate.** This tree states its knob discipline on CALL SITES — the site is
+`#[cfg]`-gated, the arm degrades to a shim, knob-off is byte-identical — and the
+DECLARATION is the half nothing checked. `pub mod foo;` with no cfg compiles
+`foo.rs` into every image, statics linked and `panic::Location` lines counted,
+even when every path that can reach it is behind `target_arch` or a `feature`.
+LEDGER S5 asked for the check by name after three instances were found by eye
+(`flight_recorder`, `dock`, `pulsewin`); S3 is the same complaint about
+`flight_recorder` specifically, and S21 called it "the fourth confirmed instance".
+Found by eye is the problem: all three named instances were ALREADY gated at
+`d6b3c9a7` — `flight_recorder` since `77c61e3a`, its own landing commit — while
+the rows still read ARMED, and the tree meanwhile held four instances no row
+named. A gate measures all 162 declarations on every `check`; a reader measures
+the three they remember.
+
+**Mechanism.** `unaos/scripts/fc2-check.sh`. It walks the module tree from both
+crate roots, resolving `<name>.rs`, `<name>/mod.rs`, `#[path]` and inline-module
+directories, and gives every FILE the conjunction of the declaration cfgs above
+it — which is how a site in `arch/x86_64/serial.rs` is known to be x86 with no cfg
+of its own. It then resolves every `::`-path and every (brace-expanded) `use` in
+the tree to an absolute module path and credits it as a reference, carrying the
+union of its file's inherited cfg and the innermost enclosing `#[cfg]`s on its
+line. Four things in this tree make the naive form wrong, and each cost a false
+finding before it was handled:
+
+  * **Comments.** 21 of the 27 raw `flight_recorder` hits are prose. Stripped
+    first, exactly as GATE-KNOB must.
+  * **`cfg_if!` arms.** `arch/mod.rs` declares `x86_64` and `aarch64` in the two
+    arms of one `cfg_if!`. Handled generically, the second arm UNIONS with the
+    first and every file under `arch/aarch64/` inherits `target_arch = "x86_64"`
+    as well — which reported `net_sntp` as x86-only on the strength of sites in
+    `arch/aarch64/genet.rs`.
+  * **Glob re-exports.** That same file does `pub use aarch64::*;`, so the tree
+    spells the Orin's drivers `arch::xusb_tegra`, never `arch::aarch64::xusb_tegra`.
+    Unrewritten, that module reads as 3 consumers instead of 20.
+  * **Cargo feature implication.** `facet = ["quarry"]`, `gen7 = ["intel-ivb"]`,
+    `nvidia-kepler-ce = ["nvidia-kepler"]`, `piinstall_confirm → piinstall`: four
+    declarations that already carry their consumers' atom, spelled through Cargo
+    rather than through the cfg. Atom sets are closed under `[features]` on both
+    sides. Note the asymmetry this exposes, which the gate then relies on:
+    implication carries FEATURES, never `target_arch`, which is why `install::pi`
+    needed an arch term even though `piinstall ⇒ baremetal ⇒ pi`.
+
+Every remaining approximation biases toward SILENCE and the script's header says
+so: `any(...)` contributes only the atoms common to all its arms, a site reachable
+only through a cfg'd caller in another file reads as ungated, and an inline module
+is censused but never a finding.
+
+**Control.** Two, and they run before any verdict. (1) The FIXTURE, because this
+gate's failure mode is a quiet zero: the analyser runs over a synthetic crate
+carrying two deliberate instances — `ctrl_fc2`, a bare unconditional declaration,
+and `ctrl_fold`, a declaration with a non-cfg attribute FOLDED onto its line —
+plus one deliberate non-instance, `ctrl_ok`, already gated. It must report exactly
+`{ctrl_fc2, ctrl_fold}`. `ctrl_fold` is in the fixture because the scanner WAS
+blind to that shape: anchored at `pub mod`, it stopped seeing a module the moment
+the gate's own prescribed fix was applied, and folding a cfg onto `splash` took the
+census from 162 declarations to 161 in silence. **The control is proven by
+mutation, not by argument:** restoring that `pub mod`-anchored regex in a copy of
+the script and running it against this tree exits **2**, printing
+`The analyser reported: ['ctrl_fc2']` and `A zero here would read as a clean tree.
+It is a broken gate.` (2) Three TREE PROBES the parser
+must rediscover: `arch::x86_64` carries `target_arch = "x86_64"` from its `cfg_if!`
+arm; some `flight_recorder` reference under `arch/x86_64/` carries an INHERITED x86
+cfg; and `flight_recorder` has NO reference in `fs/fat.rs`, which names it six
+times in prose. Plus `facet = ["quarry"]` must be readable out of `Cargo.toml`, and
+at least one glob re-export must be found. Any control failure exits **2** — no
+verdict — and `check` prints that a gate which gave no verdict is not a pass.
+
+**Goes red when** a declaration is wider than the intersection of its references'
+cfgs and the module is not in the registry (exit 1), or a control fails (exit 2).
+
+**GO-RED proof, recorded in this gate's landing commit:** reverting the arch term
+on `install/mod.rs:51` — `all(target_arch = "aarch64", feature = "piinstall_confirm")`
+back to `feature = "piinstall_confirm"` — takes the probe from rc=0 to rc=1 naming
+`install::clone` with its four sites in `install/pi.rs`, and `./arroyo check` from
+rc=0 to rc=1 through this gate's own failure line; restoring the term returns both
+to green. That mutation is also the update recipe, run backwards.
+
+**What it found on its first run** (at `d6b3c9a7`; census 162 declarations / 162
+referenced / 4 findings): none of the three instances the ledger rows name — all
+three were already gated — and four the rows did not. Two were fixed on their
+declaration lines in the landing commit (`install::pi`, then `install::clone`,
+which the first fix exposed by giving `install/pi.rs` an inherited arch cfg); three
+are registered (`splash`, `rtpi`, `video::desktop_firmware`), each because the
+declaration carries a written ruling this gate is not entitled to overturn.
+
+**Legitimate update.** Narrow the declaration to the union of its references'
+cfgs, **on one line** — `#[cfg(...)] pub mod x;`, or edit an existing attribute
+line in place — so no `panic::Location` below it moves: LAWS §5 names a cfg'd-out
+`pub mod` DECLARATION as the one exception (the file is never lexed) and the
+module root as not. Or register the module in `unaos/scripts/fc2.registry` with
+the measurement behind it. The registry is not an allowlist to grow: its header
+says it must reach zero, and a row is legitimate only while the declaration
+carries a deliberate written decision about what the module's absence means. "It
+builds fine" is not a reason; the gate already knows it builds.
+
+---
+
 **Landed but not yet sectioned here:** GATE-ROOTS (`scripts/check-roots.sh`, every
 binary target is a named root of `check`) and GATE-APPEND (`scripts/append-position.sh`,
 LEDGER P7's trailing-comment trap) are both wired into `check_both` and green; their
