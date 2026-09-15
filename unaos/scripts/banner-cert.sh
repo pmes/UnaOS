@@ -185,7 +185,7 @@ TABLE
 # UNREGISTERED MISSING still reds, which is the point; this list is short on purpose, and a row
 # here is a debt with a name on it, not an exemption.
 #
-# IT IS EMPTY, AND IT HAS BEEN OCCUPIED ONCE. On this gate's first armed run (2026-09-15,
+# THE FIRST OCCUPANT. On this gate's first armed run (2026-09-15,
 # `esp-x86`, flight-7 knob line) `sdwrite` was a MISSING: arroyo named it on the banner of every
 # verb and `builder/src/main.rs`, which is what compiles the kernel the media boots, had no entry
 # for it. It was registered here for exactly as long as it took to get the ruling — arroyo is
@@ -194,14 +194,20 @@ TABLE
 # the same arc. The cert then read 28/28 with `SDWRITE-POSTURE` hits>0, and the row came out. That
 # round trip is the whole intended lifetime of a row here: register, fix, delete.
 #
-# IT IS OCCUPIED AGAIN, BY THE FIRST ARMED AARCH64 RUN (2026-09-15, BANNERCERT2, `./arroyo esp-arm`
-# with no knobs at all — the most default build this tree has). One row, `ehcihid`, and it is the
-# same CLASS as sdwrite seen from the other arch: a feature that is DEFAULT-ON in arroyo, named on
+# IT HAS NOW BEEN OCCUPIED TWICE, AND IS EMPTY AGAIN. The second row was `ehcihid`, entered by this
+# gate's first armed AARCH64 run (2026-09-15, BANNERCERT2, `./arroyo esp-arm` with no knobs at all —
+# the most default build this tree has) and removed in the commit that fixed it, one arc later. It
+# was the same CLASS as `sdwrite` seen from the other arch: DEFAULT-ON in arroyo (`:337`), named on
 # the banner of every aarch64 media build, and structurally incapable of putting one byte in an
-# aarch64 artifact. The fix is one line and it is NOT in this gate's reach — see the row.
+# aarch64 artifact (`drivers/mod.rs:9` gates the module on `target_arch = "x86_64"`). Measured: the
+# row's token 0 hits AND `LC_ALL=C grep -a -o -F 'EHCI-HID'` 0. `arm_features` stripped its TWIN
+# `kbdwit` and not the driver it instruments; it now strips both (`arroyo:2219`). The executor
+# registered it rather than taking the line, because unlike its twenty siblings this strip re-hashes
+# every aarch64 media image once — and got the ruling (Peter, 2026-09-15): the recorded card shas are
+# history in MANIFEST files, not a contract; a lie in the banner is. Register, fix, delete — twice
+# now, and the table is empty both times it mattered.
 bc_registered() {
 cat <<'REGISTERED'
-ehcihid|arroyo names `ehcihid` on EVERY aarch64 banner and no aarch64 artifact can carry it. `drivers/mod.rs:9` gates the whole module `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so on aarch64 the feature emits nothing: measured on this arc's `esp-arm` ELF, the row token has 0 hits AND `LC_ALL=C grep -a -o -F 'EHCI-HID'` has 0 — not a rotted token, an absent feature. WHY IT REACHES THE BANNER: `arroyo:337` appends it default-on (`[ -z "${UNAOS_NOEHCIHID:-}" ]`), and `arm_features` (arroyo:2206) — which strips TWENTY x86-only names from the aarch64 cargo line so aarch64 media stay byte-identical — strips its own TWIN `kbdwit` at :2218 and does NOT strip `ehcihid`. THE FIX IS ONE LINE, `f="${f//,ehcihid,/,}"` beside the kbdwit strip, and it is deliberately NOT taken here because it is not free: removing a name from the cargo feature set shifts `-Cmetadata`, so it re-hashes EVERY aarch64 media image once — a one-time sha256 break on the Pi and Orin flight cards that the boards' seats must call, exactly as each of the other twenty strips was called when it landed. OWNER: the aarch64 seats (orin + pi), one line in `arm_features`; until then this row keeps the lie named, counted and un-green instead of red-lining every aarch64 media build for a defect no aarch64 executor introduced.
 REGISTERED
 }
 

@@ -558,7 +558,7 @@ its siblings and the cert reads 28/28. This is the argument for a standing gate
 rather than for a remembered grep: three occurrences, two found by hand years
 apart, the third found on the first run of the thing that looks every time.
 
-**Registered divergences, and the ONE row open today.** A feature the banner names
+**Registered divergences, and why the table is empty again.** A feature the banner names
 that the artifact provably does not carry, whose fix is owned elsewhere, can be
 entered in `bc_registered` with the whole finding, the exact fix and an owner. Such
 a row prints
@@ -571,22 +571,29 @@ long as it took to get the ruling above, then came out in the commit that fixed
 it — that round trip is the whole intended lifetime of a row: register, fix,
 delete.
 
-ONE ROW IS OPEN, and it is the same class seen from the other arch. BANNERCERT2's
-first armed aarch64 run — `./arroyo esp-arm` with NO knobs, the most default build
-this tree has — found that **every aarch64 banner names `ehcihid` and no aarch64
-artifact can carry one byte of it**. `drivers/mod.rs:9` gates the whole module
-`#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`; `arroyo:337` appends
-the feature default-on; and `arm_features`, which strips twenty x86-only names
-from the aarch64 cargo line precisely so aarch64 media stay byte-identical, strips
-its own TWIN `kbdwit` at `:2218` and not `ehcihid`. Measured: the row token 0 hits
-AND `LC_ALL=C grep -a -o -F 'EHCI-HID'` 0 — an absent feature, not a rotted token.
-The fix is one line, `f="${f//,ehcihid,/,}"` beside the kbdwit strip, and it is NOT
-free: removing a name from the cargo feature set shifts `-Cmetadata`, so it
-re-hashes every aarch64 media image once, breaking every recorded Pi and Orin card
-sha. That is the boards' seats' call — exactly as each of the other twenty strips
-was a call when it landed — so the row keeps the lie named, counted and un-green
-rather than red-lining every aarch64 build for a defect no aarch64 executor
-introduced. Owner: the orin and pi seats; rows are in both board queues.
+THE SECOND OCCUPANT, and it made the same round trip inside two commits.
+BANNERCERT2's first armed aarch64 run — `./arroyo esp-arm` with NO knobs, the most
+default build this tree has — found that **every aarch64 banner named `ehcihid`
+and no aarch64 artifact could carry one byte of it**. `drivers/mod.rs:9` gates the
+whole module `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`;
+`arroyo:337` appends the feature default-on; and `arm_features`, which strips
+x86-only names from the aarch64 cargo line precisely so aarch64 media stay
+byte-identical, stripped its own TWIN `kbdwit` and not the driver that twin
+instruments. Measured: the row token 0 hits AND
+`LC_ALL=C grep -a -o -F 'EHCI-HID'` 0 — an absent feature, not a rotted token.
+
+It was REGISTERED rather than fixed on the spot for one reason, and the reason is
+worth keeping because it is the only case where a strip is not free: every one of
+`arm_features`' other strips was added while its feature was OFF by default, so
+nothing observable moved. `ehcihid` is default-ON, so removing the name shifts
+cargo's `-Cmetadata` for the DEFAULT aarch64 build and re-hashes every Pi and Orin
+card cut after it. The executor put the finding, the exact one-line fix and the
+owner in the registry and asked. **The ruling (Peter, 2026-09-15): the recorded
+card shas are history in MANIFEST files, not a contract; a lie in the banner is.**
+`arm_features` gained `f="${f//,ehcihid,/,}"` beside the kbdwit strip, the
+registry row came out in the same commit, and the emitted CODE is unchanged — the
+module was never in an aarch64 image to begin with. Two occupants, two round
+trips, an empty table after each: register, fix, delete.
 
 **Control.** Three separate ways a zero is kept distinguishable from a rotted
 pattern. (1) The OFF side: five features the flight line does not arm carry

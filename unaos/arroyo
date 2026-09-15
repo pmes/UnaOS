@@ -2216,6 +2216,25 @@ arm_features() {
     # every aarch64 media hash between a default build and a `UNAOS_NOKBDWIT=1` one for zero
     # observable change. Stripped => aarch64 media are byte-identical either way.
     f="${f//,kbdwit,/,}"
+    # EHCIHID — THE DRIVER ITSELF, and it took a gate to notice it was missing from this list
+    # (BANNERCERT2, 2026-09-15). `kbdwit` above is the INSTRUMENT bolted to `drivers/ehci`; the
+    # module it instruments is gated `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]` at
+    # `drivers/mod.rs:9`, so the DRIVER emits not one byte of aarch64 code either — and it is
+    # DEFAULT-ON (`arroyo:337`, `[ -z "${UNAOS_NOEHCIHID:-}" ]`). The twin was stripped and the
+    # thing it instruments was not, so every aarch64 media banner in this tree's history named
+    # `ehcihid` over an artifact that provably had none of it: `./arroyo esp-arm` with NO knobs —
+    # the most default build here — measured the feature's certifying string at 0 hits AND
+    # `LC_ALL=C grep -a -o -F 'EHCI-HID' kernel.elf` at 0. Found by `scripts/banner-cert.sh` on the
+    # ARTIFACT, on the first armed aarch64 run, exactly as `sdwrite` was found on the first armed
+    # x86 one. Ruling (Peter, 2026-09-15, on the executor's STOP): the recorded card shas are
+    # history in MANIFEST files, not a contract; a lie in the banner is. So: stripped.
+    # ⚠ THIS ONE COSTS A HASH, unlike its siblings above. Each of those was added while its feature
+    # was off by default, so nothing observable moved. `ehcihid` is default-ON, so removing the name
+    # changes cargo's `-Cmetadata` for the DEFAULT aarch64 build, and every Pi and Orin card cut
+    # after this commit has a different kernel sha256 than the staged MANIFESTs record. That is the
+    # one-time, expected, ruled-on cost — not a regression. The emitted CODE is unchanged, which is
+    # the invariant that matters: the module was never in an aarch64 image to begin with.
+    f="${f//,ehcihid,/,}"
     # DEADMAN rides the same strip, for the same reason: the real instrument is
     # `all(feature = "deadman", target_arch = "x86_64")`-gated and every counter, the emit and both
     # `wm` samplers live inside it, so `deadman` emits not one byte of aarch64 CODE — the aarch64
