@@ -250,6 +250,18 @@ fn main() {
     // nothing on its buses. Config reads only, no BAR sizing, bounded sweep. Default OFF =>
     // function + call site unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_PCICENSUS").is_ok() { feats.push("pcicensus"); }
+    // AHCI (rmbp-ledger B89, first rung): UNAOS_AHCI=1 arms drivers/ahci.rs — the READ-ONLY SATA host
+    // controller driver. THIS list is what reaches the kernel binary for MEDIA builds: the builder
+    // re-derives the x86 feature set from env, so a knob wired into arroyo alone ships the driver
+    // DISABLED while the `⚡ kernel features:` banner claims it is on (the s42/INSTGUI and WXN-M3b
+    // failure). This arc is as exposed to that bug as the PCI census was and in the same direction:
+    // a driver that silently did not run prints no `:: AHCI: ... ::` witness, which is byte-for-byte
+    // what a machine with no SATA controller in it looks like on the wire — a different finding, and
+    // on the rMBP the WRONG one, since the census has named the controller on every capture.
+    // READ-ONLY: the driver compiles exactly IDENTIFY DEVICE (0xEC) and READ DMA EXT (0x25), no ATA
+    // write opcode, and `install/` is never told the handle exists (B91 — Catalina lives on that SSD).
+    // Default OFF => module unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_AHCI").is_ok() { feats.push("ahci"); }
     // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
     // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
     // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
@@ -974,6 +986,22 @@ fn main() {
     } else {
         cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
            .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1");
+    }
+    // AHCI (B89) fixture: UNAOS_AHCI_DISK=<path> attaches a SECOND SATA disk to q35's built-in ICH9
+    // AHCI controller, which QEMU exposes as the `ide.N` buses. The ESP already sits on `ide.0`
+    // (`ide-hd,drive=esp,bootindex=0` above), so this lands on `ide.1` — an explicit bus, not the
+    // first-free default, so the ESP's port assignment cannot move under it and the boot is
+    // unaffected. No `bootindex`: OVMF must keep booting the ESP exactly as it does today, and a
+    // fixture disk that could win the boot order would change what every other leg measures.
+    // UNSET => not one argument is added and a default run's QEMU command line is byte-identical to
+    // what it was before this arc, which is the property that lets this knob exist at all.
+    // The fixture the DONE gate uses is `builder/fat-gpt.img` (`scripts/make-fat-img.sh gpt`): a
+    // GPT-partitioned FAT32 disk, so the driver's sector-0 witness reads `kind=GPT` off a real
+    // protective MBR rather than off a synthetic one.
+    if let Ok(ahci_disk) = std::env::var("UNAOS_AHCI_DISK") {
+        cmd.arg("-drive").arg(format!("if=none,id=sata0,format=raw,file={}", ahci_disk))
+           .arg("-device").arg("ide-hd,drive=sata0,bus=ide.1");
+        println!("   UNAOS_AHCI_DISK: second SATA disk on ide.1 ({}) — AHCI driver target (ESP keeps ide.0 and bootindex=0)", ahci_disk);
     }
     // EHCI-3 harness: by default (EHCI-4 M1 driver on) the keyboard rides the EHCI bus (QEMU's usb-kbd is
     // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the

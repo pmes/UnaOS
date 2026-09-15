@@ -2089,6 +2089,28 @@ fi
 # `genet` (Cargo feature). Runs at the top of `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`.
 # Pair with UNAOS_PI=1 on the kernel8-test battery: `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
 [ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
+# AHCI (rmbp-ledger B89, first rung): UNAOS_AHCI=1 arms drivers/ahci.rs — the SATA host controller
+# driver, READ-ONLY. The rMBP has told us at every boot that it has both of the disks Peter wants
+# (`bdf 0:31.2 8086:1e03 class=01 sub=06 progif=01 (sata)` on every PCI census we have ever taken)
+# and the OS binds to neither, because there is no SATA driver: the loader can already boot from an
+# internal FAT partition and the kernel then cannot find its root. This arc enumerates implemented
+# ports, IDENTIFYs the disks, reads sectors, and publishes them in `drivers/block.rs`'s AHCI registry.
+# READ-ONLY is a property of the image, not a policy: the driver compiles exactly two ATA opcodes,
+# IDENTIFY DEVICE (0xEC) and READ DMA EXT (0x25), so an armed build carries no path that could mutate
+# a sector — and `install/` is never told the handle exists (rmbp-ledger B91: the internal SSD carries
+# a live Catalina install). Witnesses: `:: AHCI: port=<p> model="<m>" sectors=<n> lba48=<b> ::`,
+# `:: AHCI: port=<p> sector0 sig=<hex> kind=MBR|GPT|none ::`, and a `-> PASS`/`-> FAIL` selfcheck that
+# is printed ONLY for a port that reached IDENTIFY, so its silence means "no SATA disk answered" and
+# never "the check passed". Pair with UNAOS_AHCI_DISK=<img> on a QEMU leg to attach a second SATA
+# disk to q35's built-in ICH9 AHCI (default runs are untouched when the knob is unset):
+#   UNAOS_AHCI=1 UNAOS_AHCI_DISK=builder/fat-gpt.img UNAOS_QEMU_FULL=1 ./arroyo test 90
+# Default OFF => the module is not lexed, the block-layer arms compile to nothing, and the pci.rs call
+# site is a LINE-NEUTRAL `#[cfg]`-erased append, so no panic `Location` moves. x86_64 only; aarch64
+# media byte-identical (stripped by arm_features below, like sdw/sdhcblk/pcicensus).
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this driver
+# a silent no-op is indistinguishable on the wire from a machine with no SATA controller in it.
+[ -n "${UNAOS_AHCI:-}" ] && _feats="${_feats}ahci,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
@@ -2246,6 +2268,13 @@ arm_features() {
     # fingerprint, so leaving it in (or its implied `bcmarecon`, already stripped above) would shift
     # every aarch64 media hash for zero observable change.
     f="${f//,bcmaS1,/,}"
+    # AHCI (B89) rides the same strip, for the same reason and by the same mechanism: the module is
+    # declared `#[cfg(all(target_arch = "x86_64", feature = "ahci"))]` and is reached only from
+    # `arch/x86_64/pci.rs`, so `ahci` emits not one byte of aarch64 CODE — but an enabled feature is
+    # hashed into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every aarch64 media
+    # hash between a default build and a `UNAOS_AHCI=1` one for zero observable change. Stripped =>
+    # the x86 track can arm a SATA driver without touching the Pi or Jetson media at all.
+    f="${f//,ahci,/,}"
     # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
     # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
     # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
@@ -3597,7 +3626,7 @@ KERNEL_CFG_MATRIX=(
   # WIRING CHECK below.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,ahci"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
