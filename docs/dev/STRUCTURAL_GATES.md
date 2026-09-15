@@ -416,6 +416,72 @@ harness: missing log → rc=1 with the two-line reason; a clean capture → rc=0
 capture carrying `-> FAIL` → rc=1, both unchanged, so the pattern list itself did
 not move.
 
+**Second control — a WEDGE, not a wall (LADDERTAIL, rmbp seat, 2026-09-15).** The
+mutation above moves the CLOCK, so on its own it proves only that the marker
+notices a wall running out. The capture this gate was really written against is a
+DEADLOCKED FIXTURE — `docs/dev/QUEUE.md` §5's LOCKFIX row, where a non-reentrant
+spin `Mutex` in `click_pointer_pos` wedged the battery task and took `LOCKFIX-B1`
+and `APPPIN` off the wire while the run still printed `✅ Test run complete` and
+returned **0**. It returned 0 because that tree PREDATED this gate; its own log
+says `⚡ test: no completion signal declared for this verb`. Replayed at
+`31c7e5cb` against the UNCHANGED spec, that same capture is refused:
+
+| capture | `--settled` | `mbench --replay` |
+|---|---|---|
+| `lockfix-logs/serial-GORED.log` (wedged) | `status=truncated stopped_at=1652` **rc=3** | `✂️ TRUNCATED` **rc=3** |
+| `UNAOS_WC=1` full wall, 2148 lines | `status=complete complete_at=1980` **rc=0** | `✅ PASS` **rc=0** |
+| default boot, full wall, 1531 lines | `status=complete complete_at=1370` **rc=0** | `✅ PASS` **rc=0** |
+
+A wedge and a short wall are ONE failure to this marker, so **the LOCKFIX row's
+owed fix is already delivered by this gate** — no new directive was needed.
+
+**Why the coverage reaches the whole ladder, as a number rather than a claim.**
+The marker is emitted AFTER the ladder's last verdict on BOTH configurations —
+measured at `31c7e5cb`: default, last verdict `:: SOCK-4: … :: PASS ::` @1351 vs
+marker @1370; `UNAOS_WC=1`, @1969 vs @1980. The ladder and zeolite are one task's
+output in that order, so no wall reaches the marker while cutting a fixture, and
+any cut — clock or wedge — loses the marker too. This is also why `APPPIN`, the
+declared last leg of `witness_battery` and the obvious candidate for a tail
+assertion, is the wrong line to assert: present @1887 under `UNAOS_WC=1`, ABSENT
+from the default boot.
+
+**A REQUIRE in `x86-test.spec` WAS measurably inert, and is not any more — FIXED
+(LADDERTAIL, second commit).** `qemu_await.py`'s `settled()` answered on
+`matcher.markers()` alone and never called `Matcher.complete()`, so REQUIRE and
+COUNT could not reach `./arroyo test`'s verdict: a positive witness added to this
+spec would have sat in the file looking load-bearing while being incapable of
+reddening anything — LAWS §5's "a check that cannot fire is an absent one", made
+worse by the function's own docstring promising the opposite predicate. `settled()`
+now gates on `matcher.complete()`, so both of `qemu_await.py`'s modes score the
+same three things and TWO MODES, ONE PREDICATE is true of the code as well as of
+the header.
+
+**GO-RED for that fix, replay-only (no QEMU), recorded here.** One unsatisfiable
+`REQUIRE :: NOSUCHFIXTURE-ZZZ: … :: PASS ::` appended to a COPY of the spec, asked
+of the SAME healthy `UNAOS_WC=1` capture; plus the unchanged spec over that capture
+and over the wedged one, which must not move:
+
+| probe | before | after |
+|---|---|---|
+| bogus REQUIRE, healthy capture | `status=complete complete_at=1980` rc=**0** | `status=truncated reason=short-witnesses:1 stopped_at=2148` rc=**3** |
+| unchanged spec, healthy capture | `status=complete complete_at=1980` rc=0 | `status=complete complete_at=1980` rc=**0** |
+| unchanged spec, wedged capture | `status=truncated stopped_at=1652` rc=3 | `status=truncated stopped_at=1652` rc=**3** |
+
+The two refusals stay DISTINGUISHABLE, which is the point of the new field: a hole
+in the ladder reports `reason=short-witnesses:<n>` and names the short patterns on
+stderr, a short wall reports only `stopped_at`. **Blast radius is nil today and
+that was checked rather than assumed:** `x86_test_completion` (`arroyo:3194`) is the
+only `--settled` caller in the tree and `x86-test.spec` is the only spec it passes
+— 0 REQUIRE/COUNT — so every current verdict is byte-identical; `mbench.py
+--self-test` 35/35. The fix is NOT what closes the LOCKFIX row (the ordering above
+already did); it removes the trap waiting for the next seat that reaches for a tail
+witness.
+
+**And not every tail witness is assertable even then.** `[ptrdead] backlog` is a
+known Class-3 flake under host load (`docs/dev/FIXTURE_FLAKES.md`): asserting it
+would convert a loaded-box flake into a TRUNCATED verdict, re-importing the
+inconclusiveness this gate exists to remove.
+
 **Legitimate update.** When the boot grows a fixture after zeolite, the marker
 becomes EARLY rather than wrong — it stops covering the new tail and never
 false-reds. Move it in the commit that adds the fixture, re-measure the default
