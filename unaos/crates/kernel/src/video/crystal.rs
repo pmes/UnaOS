@@ -867,11 +867,11 @@ pub fn compose() -> bool {
 
     let t0 = crate::arch::now_cycles();
     let (pw, ph) = {
-        let fb = *super::WRITER.lock();
-        if !fb.is_ready() {
+        // LOCKFIX B1 — WAS `let fb = *super::WRITER.lock();` plus a separate `is_ready` arm; the third of the three `compose` twins (`dock`, `menubar`, here) and identical in every term. The crystal's dropdown is composed from the PRESENT TAIL with interrupts MASKED, and WEDGE-8 forbids a blocking acquire from a context that cannot be preempted. `panel_snapshot` is LOCKFIX's PAINT-path door — it BLOCKS when interrupts are enabled, so nothing about the uncontended path or the fixture path moves — and `.filter(is_ready)` folds the readiness arm into the same `else` so a held panel declines the way an unready surface always has. The menu is not lost by a decline: the slot still holds what it owes and the next composite retries, which is the contract the erase arm thirty lines above states in its own words. No counter, no new print: LAWS §1(e). ⚠ LINE-NEUTRAL: 5 lines out, 5 in.
+        let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) else {
             LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
             return false;
-        }
+        };
         (fb.width(), fb.height())
     };
     let rect = menu_rect(pw, ph);

@@ -6355,13 +6355,13 @@ pub fn click_stats() -> (u64, u64) {
 /// the shared cursor state every other pointer consumer reads (the same state the compositor draws),
 /// clamped by the live panel geometry.
 ///
-/// Locks: the framebuffer info lock, then the cursor position lock, and both are released before
-/// `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order.
+/// Locks: the framebuffer info read is LOCKFIX's masked NON-BLOCKING door (a blocking take here is INWEDGE's boot-8 wedge, on this exact band — rmbp-ledger B1), then the cursor position lock, and both
+/// are released before `wm::hit_test` takes the window TABLE lock. No nesting, so no new lock order.
 fn click_pointer_pos() -> (i32, i32) {
-    let (w, h) = {
-        let info = crate::video::WRITER.lock().info();
-        (info.width as i32, info.height as i32)
-    };
+    // LOCKFIX/INWEDGE B1 — the input band's ONE panel door (`video::panel_info_nonblocking`): masked, non-blocking, COUNTED. Refused ⇒ (0, 0), the clamp an unset framebuffer has always given this function.
+    // WAS `WRITER.lock().info()`, a BLOCKING acquire on the preemptible input band — INWEDGE's boot-8 wedge, reachable from `wc_click_route` (its `Event::Button` arm) and `wc_drag_motion`: once per button edge and once per drag pass. The aarch64 twin (`arch/aarch64/syscall.rs::click_pointer_pos`) has read it through this door since LOCKFIX, and `video/mod.rs`'s own door comment already NAMED this function as one of its three callers — so the x86 half was that comment's one false sentence, and this is what makes it true. ⚠ LINE-NEUTRAL: 5 body lines out, 5 in, so no panic `Location` below this point moves.
+    let (w, h) = crate::video::panel_info_nonblocking()
+        .map_or((0, 0), |i| (i.width as i32, i.height as i32));
     crate::pal::cursor::pos(w, h)
 }
 
@@ -17503,7 +17503,7 @@ fn winx_launcher(demo_cpu: usize) {
     // for the same reason. Putting the two adjacent means one stretch of the boot owns that
     // discard instead of two, and no fixture between them can lose an event to it.
     #[cfg(feature = "witness")]
-    ptrdead_selftest();
+    { ptrdead_selftest(); lockfix_b1_selftest(); } // LOCKFIX-B1 — the input band's panel read driven across a HELD `WRITER` (rmbp-ledger B1). A BLOCK under the line above's `cfg`, so no line is added and no panic `Location` below moves — `apppin_selftest`'s fold at this ladder's tail is the pattern. Shares `ptrdead`'s cfg exactly and wants no more: it needs neither `wc` nor a window, only `WRITER` and `click_pointer_pos`, both compiled in every x86 build. PLACED HERE for the same reason `ptrdead` is the least disruptive fixture in the ladder — this one mints no row, touches no window table, moves no pointer and posts no event; it takes one lock, releases it, and reads a counter. The only ordering it needs is "after the pointer position is set", which every fixture above it has already done, and which is why its `(x,y)` is an OBSERVATION rather than an assertion (see the function's own note).
     #[cfg(all(feature = "witness", feature = "wc"))]
     wmdirect_selftest();
     // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
@@ -23880,4 +23880,87 @@ pub fn home_acl_fixture(user_id: u32) -> bool {
         U6GX_NAME, user_id, owner_ok, b_live_refused, b_user_ok, c_refused
     );
     user_id != 0 && owner_ok && b_live_refused && b_user_ok && c_refused
+}
+
+/// LOCKFIX-B1 — **the x86 proof that this arch's ONE input-band panel read DECLINES a held `WRITER`
+/// instead of blocking on it.** Appended at the file TAIL, deliberately: a `#[cfg]`'d block inserted
+/// anywhere above renumbers every `core::panic::Location` below it and moves the knob-off image
+/// (LAWS §5, "byte identity is measured, never argued"). Nothing follows this function.
+///
+/// THE GAP IT FILLS. `main.rs`'s `inwedge_selftest` is the aarch64 twin of this leg and is
+/// `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`, so it has never run on x86 at all —
+/// and what it drives is the ROUTER's geometry hints (`pal_width_hint`), not this. The x86 battery had
+/// no leg anywhere that took `WRITER` and then drove the input band across it, which is how
+/// `click_pointer_pos` kept a blocking acquire through the whole of LOCKFIX while `video/mod.rs`'s
+/// own door comment listed it as one of the door's three callers (rmbp-ledger B1).
+///
+/// WHY IT IS A REAL GATE AND NOT A TAUTOLOGY, which is the whole design. At the base sha this leg does
+/// not FAIL, it HANGS: `click_pointer_pos` was `crate::video::WRITER.lock().info()`, a blocking acquire
+/// of a non-reentrant spin `Mutex` that this very function is holding, on one core. That hang IS the
+/// boot-8 wedge, reproduced deterministically on a QEMU that can deliver no HID at all — the metal
+/// capture needed a pointer report and a timer tick to line up; this needs neither. The BOUND is the
+/// run's own wall and a truncated run is not a pass (`docs/dev/QUEUE.md` §5), so the hang scores RED.
+///
+/// WHAT IS ASSERTED, and what is only OBSERVED. Asserted: (1) the held half REFUSED — our call went
+/// through the counted door (`video::panel_census`) and came back as a refusal rather than a completed
+/// read; (2) the released half RECOVERED — with nothing held, the same call completes a read. (2) is
+/// the control, and without it a `click_pointer_pos` hard-wired to refuse, or one that had stopped
+/// touching the panel altogether, would pass the held half while measuring nothing. `RELEASED_TRIES`
+/// is `inwedge_selftest`'s bound and is there for its reason: a secondary core holding `WRITER` for
+/// its own present makes one non-blocking read refuse, which is a race against the live APs rather
+/// than a statement about this kernel.
+///
+/// OBSERVED, not asserted: the returned coordinates. `pal::cursor::pos(0, 0)` is
+/// `*POS.lock().get_or_insert((0, 0))` — it clamps to `(0, 0)` only while the pointer position is
+/// still UNSET, and by the time this battery runs earlier fixtures have set it. Asserting `(0, 0)`
+/// here would be a leg that passes on boot order rather than on behaviour, and the refusal counter
+/// says the thing the coordinates were being used to insinuate, directly.
+///
+/// `>=` on the refusal delta tolerates an AP refusing alongside us. It cannot excuse a read of OURS
+/// that succeeded: our call was made with this core holding the lock, so a completed read of it is
+/// arithmetically impossible, and a `click_pointer_pos` that took no lock at all would leave the
+/// delta at zero and convict.
+#[cfg(feature = "witness")]
+fn lockfix_b1_selftest() {
+    /// LOCKFIX-B1 — released-half attempts, `inwedge_selftest`'s bound and its reasoning.
+    const RELEASED_TRIES: u32 = 64;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (read0, refused0) = crate::video::panel_census();
+    // THE HELD HALF — the input band's own read, driven with this core holding the very lock it
+    // reads. At the base sha control does not return from this block.
+    let (hx, hy) = {
+        let _held = crate::video::WRITER.lock();
+        click_pointer_pos()
+    };
+    let (read1, refused1) = crate::video::panel_census();
+    // The real geometry, taken unmasked and holding nothing — the one acquire in this leg where
+    // waiting is legal, and the statement of what the released half must be able to reach.
+    let real_w = crate::video::WRITER.lock().info().width as i32;
+    // THE RELEASED HALF — the control. Same call, nothing held; a completed read must appear.
+    let mut read2 = read0;
+    let mut tries = 0;
+    while tries < RELEASED_TRIES {
+        tries += 1;
+        let _ = click_pointer_pos();
+        read2 = crate::video::panel_census().0;
+        if read2 > read0 {
+            break;
+        }
+    }
+    let declined = refused1 >= refused0 + 1;
+    let recovered = read2 > read0;
+    serial_println!(
+        ":: LOCKFIX-B1: click_pointer_pos across a held WRITER — held: refused+{} read+{} at=({},{}) | released: read+{} tries={} real_w={} :: {} ::",
+        refused1 - refused0,
+        read1 - read0,
+        hx,
+        hy,
+        read2 - read0,
+        tries,
+        real_w,
+        if declined && recovered { "PASS" } else { "FAIL" }
+    );
 }
