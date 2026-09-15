@@ -1203,13 +1203,133 @@ fn main() {
             }
         }
         let mut child = cmd.spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(secs));
+        // FASTTEST: this used to be a bare `thread::sleep(secs)` — the blind wall LAWS §5 removed
+        // from every OTHER QEMU verb ("QEMU verbs exit at COMPLETION + GRACE, not at a wall") and
+        // the one this verb kept, because `arroyo` hands the pid to this builder and never holds
+        // it. `qemu_test_wall` is that rule arriving here: it ends the run when the capture shows
+        // the run FINISHED, and sleeps out the rest of `secs` in every other case.
+        qemu_test_wall(&workspace_dir, &log_path, secs);
         let _ = child.kill();
         let _ = child.wait();
     } else {
         cmd.arg("-serial").arg("stdio");
         let mut child = cmd.spawn().unwrap();
         child.wait().unwrap();
+    }
+}
+
+// ===================== FASTTEST — the test-mode wall ends at COMPLETION + GRACE ==============
+//
+// WHY THIS LIVES IN THE BUILDER AND NOT IN `arroyo`. Every other QEMU verb waits through
+// `arroyo`'s `qemu_wait_or_complete`, which can shorten a run because it OWNS the QEMU process.
+// `./arroyo test` does not: it runs `cargo run` here, this program spawns QEMU, and the pid never
+// leaves this function. So the verb sat out a blind `thread::sleep(secs)` — LEDGER SR7's owed
+// half — while TESTTRUNC gave the same capture a completion SOURCE (`scripts/specs/x86-test.spec`)
+// and used it only for a VERDICT. A source and a shortening are two different items; this is the
+// second one, and the wait is plumbed through the process that holds the pid.
+//
+// THE PREDICATE IS NOT REIMPLEMENTED HERE, and that is the whole point of shelling out. The
+// marker is read by `scripts/qemu_await.py` through `mbench`'s own `Matcher.complete()` over the
+// spec `arroyo` names — the same program, the same predicate and the same `AWAIT` line the other
+// verbs stop on. A matcher written a second time in Rust could disagree with the replay about
+// what "the run finished" means, and a gate that disagrees with its own verdict authority is
+// worse than a slow gate. (The alternative shape — `arroyo` spawning QEMU itself so
+// `qemu_wait_or_complete` could hold the pid — moves the entire QEMU command line, the ESP
+// staging and the knob plumbing out of this file; it is a rewrite of the run path, not a wait,
+// and it would leave two spellings of the same command line to drift apart.)
+//
+// EVERY NON-`complete` OUTCOME PAYS THE FULL WALL, counted from BEFORE the waiter started, which
+// is LAWS §5 in as many words ("a verb with no declared completion source pays the full wall, and
+// every non-completing outcome pays it too"). `nosignal` returns in ~0 s and a naive fast-path
+// would turn a 120 s gate into a 0 s one — the exact bug helper-unit H5 caught in the shell twin.
+// `UNAOS_QEMU_FULL=1` keeps the whole wall with no waiter at all.
+//
+// THE `AWAIT` LINE IS WRITTEN BESIDE THE LOG at `<log>.await`, because `arroyo` derives the
+// `<log>.run` sidecar's `mode=` / `completion_at=` from it and cannot see this child's stdout
+// through `cargo run`'s. It is REMOVED by the first statement below — before this wall can write
+// anything and long before `arroyo` reads it — so a stale line from a previous run can never be
+// read as this run's: an absent file means "the fast path did not report", which `arroyo` renders
+// as `mode=full`. The stamp is never a verdict; `arroyo` re-reads the capture itself for that.
+fn qemu_test_wall(workspace_dir: &std::path::Path, log_path: &str, secs: u64) {
+    let t0 = std::time::Instant::now();
+    let stamp = std::path::PathBuf::from(format!("{log_path}.await"));
+    let _ = std::fs::remove_file(&stamp);
+
+    // Pay whatever is left of `secs` since `t0`. Saturating: a waiter that came back AFTER the
+    // cap (a loaded box, a slow interpreter) owes nothing, it must not wrap into a second wall.
+    let pay_the_rest = |why: &str| {
+        let left = std::time::Duration::from_secs(secs).saturating_sub(t0.elapsed());
+        println!("   [test mode] {why} — paying the rest of the {secs}s wall ({:.1}s).", left.as_secs_f64());
+        std::thread::sleep(left);
+    };
+
+    if std::env::var("UNAOS_QEMU_FULL").ok().as_deref() == Some("1") {
+        pay_the_rest("UNAOS_QEMU_FULL=1, the DONE-gate form");
+        return;
+    }
+    // The spec path reaches us on the same channel as the wall seconds: `arroyo` exports it beside
+    // UNAOS_TEST_SECS. Unset (a direct `cargo run`, or a verb that declares no source) is not an
+    // error — it is the full wall, stated.
+    let spec = std::env::var("UNAOS_TEST_SPEC").unwrap_or_default();
+    if spec.is_empty() || !std::path::Path::new(&spec).is_file() {
+        pay_the_rest("no completion spec declared for this run");
+        return;
+    }
+    // Default 20 s, the same number as `arroyo`'s QEMU_GRACE_DEFAULT — which is the value `arroyo`
+    // actually passes; this literal only covers a direct `cargo run`.
+    let grace: f64 = std::env::var("UNAOS_QEMU_GRACE").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(20.0);
+    let awaiter = workspace_dir.join("scripts/qemu_await.py");
+
+    println!("   [test mode] awaiting completion: {} (cap {secs}s, grace {grace:.0}s)", spec);
+    let out = Command::new("python3")
+        .arg(&awaiter)
+        .arg("--log").arg(log_path)
+        .arg("--spec").arg(&spec)
+        .arg("--cap").arg(secs.to_string())
+        .arg("--grace").arg(format!("{grace}"))
+        .arg("--label").arg("test")
+        .current_dir(workspace_dir)
+        // stderr INHERITED: the waiter's human line ("run complete at +Ns — holding grace") is
+        // the reader's only live sign that the run is ending early. Only stdout is captured.
+        .stderr(Stdio::inherit())
+        .output();
+
+    let line = match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines().find(|l| l.starts_with("AWAIT ")).map(|l| l.to_string()),
+        Err(e) => {
+            eprintln!("   [test mode] ✖ cannot run {}: {e}", awaiter.display());
+            None
+        }
+    };
+    let line = match line {
+        Some(l) => l,
+        None => {
+            // THE OUTCOME THAT MUST NOT BE SILENT: a broken waiter that fell through to the kill
+            // would turn this gate into a 0 s one and judge whatever fragment of a boot was on
+            // disk. Degrade to TODAY's behaviour — the full wall — and say why.
+            eprintln!("   [test mode] ✖ the completion waiter produced no AWAIT line — the fast path is BROKEN, not merely unlucky; fix scripts/qemu_await.py.");
+            pay_the_rest("the completion waiter gave no verdict");
+            return;
+        }
+    };
+    println!("   [test mode] {line}");
+    let _ = std::fs::write(&stamp, format!("{line}\n"));
+    let status = line.split_whitespace()
+        .filter_map(|f| f.split_once('='))
+        .find(|(k, _)| *k == "status")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    match status.as_str() {
+        // The fast exit was EARNED: the capture contains the end of the run and the grace window
+        // has already been held with every FORBID live. QEMU dies on return.
+        "complete" => println!("   [test mode] run complete + {grace:.0}s grace at {:.1}s of a {secs}s cap — ending the run.", t0.elapsed().as_secs_f64()),
+        // `cap` means the waiter already sat out the whole wall; the sleep below is ~0 and is left
+        // in rather than special-cased, so there is exactly one place the wall is paid.
+        "cap" => pay_the_rest("no completion inside the cap"),
+        "nosignal" => pay_the_rest("the named spec declares no COMPLETE marker"),
+        other => pay_the_rest(&format!("unexpected waiter status '{other}'")),
     }
 }
 
