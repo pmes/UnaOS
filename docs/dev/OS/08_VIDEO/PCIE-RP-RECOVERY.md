@@ -172,6 +172,16 @@ Caveat the line cannot fix alone: `census` runs inside `pci::init`, so enumerati
 later can still set the latch afterwards. A zero there narrows the window; it does not close it.
 Closing it needs a second sample taken after enumeration is complete.
 
+**Landed since (SECSTA2, §11.4):** that second sample exists, as a second W1C clear at the tail of
+`pci::init` — and building it corrected the sentence above about *which* enumeration was left.
+This section, and §11.1's W7 row, named "the EHCI driver's own `0..=255` walk". `ehci::init` is
+called from `arch/x86_64/pci.rs:838` and the Kepler dispatch that reaches `census` from
+`arch/x86_64/pci.rs:1016`: **EHCI walks the bus BEFORE the at-arm clear, and is already wiped by
+it.** The walks that actually follow it are `sdhc::probe` → `storage_inventory`
+(`drivers/pci.rs:84`), `ahci::probe` (`drivers/ahci.rs:286`, knob-gated) and `init_network` →
+`find_device` (`drivers/pci.rs:141`) — all in the tail of the same function, which is where the
+second clear goes.
+
 ---
 
 ## 2. The finding that reorders everything: the takeover programs no display state
@@ -592,6 +602,7 @@ actually lost during boot 11.
 |---|---|---|---|
 | 0 | `rp-boot` baseline for `secsta`/`bridgectl` | none (read) | **landed with this document** |
 | 1 | W1C the secondary-status latch at arm time, so every later sample is a delta | low | **landed, WIDENED, and knob-gated: BAR1WEDGE (§11). It clears THREE latches, not one — secondary status was the only one anybody had noticed** |
+| 1b | **SECSTA2** — a SECOND W1C clear once enumeration is complete, so the first-stall deltas are measured against the end of the bus walks and not against `pci::init`'s Kepler dispatch; it also prints `relatch=`, which bits enumeration ITSELF sets, measured rather than assumed (§11.4) | low — the at-arm clear's own write path, one shot, on the BSP | **landed, behind the same `UNAOS_BAR1WEDGE` knob (§11.4; shut-out register §6 P7)**. Rung 1 |
 | 2 | **Condemn-and-survive**: `COMP_SEALED` + PANEL CONDEMNED + the loud serial block | low, no PCIe write | §5 |
 | 3 | A recovery task immune by construction (§4) — never enters `wm`, never sends on a channel | low | rung 2 |
 | 4 | Sacrificial endpoint probe → a real classifier (§3.2) | medium — may lose a core, by design | rung 3 |
@@ -633,7 +644,7 @@ ever "ruled out"), and the register facts a boot has to carry for the next rung 
 | W4 | **WC store-buffer / posted-write backpressure**: the CPU's write-combining buffers drain into a host interface that stops accepting them, and the core dies holding the store | `UNAOS_BAR1EXP=uc` (register §6 P5), scored by `UNAOS_BAR1WEDGE=1` | **NEVER FLOWN.** Flight 5 declined to arm it: *"UC is ~6.8x slower and would corrupt the power numbers"* | — | W1 (ASPM excluded), W2, W3 | **never-run — the ranked next rung.** UC retypes the aperture so the write path is strongly ordered and unbuffered; a wedge under UC exonerates memory type, a wedge-free UC boot convicts the WC drain |
 | W5 | PCIe credit exhaustion / the GPU's own BAR1 window path (M2/M3 of `phase31-root.md`) | — | — | — | W4 (it is what W4's UC arm discriminates *against*) | **never-run** |
 | W6 | the root port's completion timeout never fires, so a core stalled on the aperture can never be released at all | `UNAOS_BAR1WEDGE` prints the configuration; nothing yet exercises it | never flown — the value has never been READ, let alone tested | — | — | **never-run.** This is the number §3.2's sacrificial probe and §8.2's "is the core freed?" both rest on, and it is a boot-time constant that cost nothing to print and had never been printed |
-| W7 | `secsta` bit 13 (Received Master Abort) is the wedge's signature — the endpoint stopped answering | — | boots 8, 9 and 11 all read `secsta=2000` at the wedge | **UNFALSIFIABLE AS READ** (§1.3): a W1C latch this kernel never cleared, and ordinary bus enumeration sets it. `[pcih] rp-boot` (landed with this document) narrowed it to "before or after `pci::init`"; BAR1WEDGE's arm-time clear narrows it to "after `pci::init`". The EHCI driver's own `0..=255` walk is the named remaining contributor | — | **open** |
+| W7 | `secsta` bit 13 (Received Master Abort) is the wedge's signature — the endpoint stopped answering | — | boots 8, 9 and 11 all read `secsta=2000` at the wedge | **UNFALSIFIABLE AS READ** (§1.3): a W1C latch this kernel never cleared, and ordinary bus enumeration sets it. `[pcih] rp-boot` (landed with this document) narrowed it to "before or after `pci::init`"; BAR1WEDGE's arm-time clear narrows it to "after `pci::init`". The EHCI driver's own `0..=255` walk is the named remaining contributor | — | **open — and narrowed again by SECSTA2 (§11.4), which also CORRECTED the named contributor: `ehci::init` (`arch/x86_64/pci.rs:838`) runs BEFORE the at-arm clear (`arch/x86_64/pci.rs:1016`), so the EHCI walk was never the residual. The second clear now runs after the last walk of `pci::init`, and its `relatch=` field measures what enumeration itself latches instead of leaving it as a hypothesis** |
 
 **What would change a verdict**
 
@@ -648,6 +659,14 @@ ever "ruled out"), and the register facts a boot has to carry for the next rung 
   (with it, §3.1's table has no entries left and §3.2's sacrificial probe becomes the only route to a
   classifier); or `d_secsta=2000`, and the latch moved after `pci::init` — still not proof it moved
   at the wedge, because of the EHCI walk, but a much smaller window than the one boot 11 had.
+  **Amended by SECSTA2 (§11.4):** the EHCI walk is not the alternative — it precedes the at-arm
+  clear. With the post-enum clear in, `d_secsta=2000` at `n=1` means the latch moved after EVERY bus
+  walk of `pci::init`, and the only named alternative left is a `wifi`-armed boot's own census from
+  the main loop (`wifi/bus.rs:125`) — a knob no A1 flight row asks for (`grep -c UNAOS_WIFI
+  docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md` = 0/0), and one any boot settles from its own
+  `⚡ kernel features:` banner. The same boot also
+  prints `relatch=`, which says whether a bus walk on this machine latches bit 13 at all — the
+  premise the whole "enumeration residue" reading rests on, never once measured.
 
 ### 11.2 The registers BAR1WEDGE prints, field by field
 
@@ -775,6 +794,13 @@ At kepler init, three lines:
 [pcih] bar1wedge sticky-cleared at-arm lnksta d081->1081 devsta 0000->0000 secsta 2000->0000 (w1c written c000/0000/2000) — EHCI's later bus walk can still re-latch secsta; this narrows the window, it does not close it
 ```
 
+Then ONE more line — **not at kepler init**, but later in the same `pci::init`, after its last bus
+walk (SECSTA2, §11.4):
+
+```
+[pcih] bar1wedge sticky-cleared post-enum rp=0:1.0 secsta=....->0000 lnksta=....->.... relatch=secsta:.... lnksta:.... at-arm=secsta:0000 lnksta:1081 (w1c written ..../....) — relatch is what ENUMERATION set after the at-arm clear; wedge-sample d_secsta/d_lnksta now delta against THIS baseline, d_devsta still against at-arm
+```
+
 Then, at every `[wcser] PASS OVERDUE … == tripwire ::` crossing, beside the unchanged
 `[pcih] rp-at-wedge` line:
 
@@ -792,6 +818,11 @@ Read `n=1` — that is the first stall, the sample this rung exists for. Read it
 | `lnkdis=1` at any crossing | STOP EVERYTHING. The link was disabled by software, and the only software that writes LNKCTL is this kernel — PCIH-NOCF8's stolen-store hazard would be realised, not theoretical |
 | `d_lnksta=c000` (or either bit alone) at `n=1` | the link renegotiated bandwidth **during this boot**, after `pci::init`. W2 re-opens as "bandwidth renegotiation under burst" — a claim never separately tested, and not the "link training error" W2 was shut out on |
 | `d_lnksta=0000` across every crossing | W2's shut-out is confirmed on an instrument that can finally tell the instant from the boot |
+| `relatch=secsta:2000` on the `sticky-cleared post-enum` line | **enumeration on this machine DOES latch Received Master Abort** — the premise §1.3 argued from, measured for the first time. The `secsta=2000` of boots 8/9/11 is then fully explained without the wedge, and W7's reading dies on evidence rather than on an argument about what bus walks generally do. It also makes the post-enum baseline load-bearing rather than tidy: `d_secsta` at `n=1` is now the only master-abort reading worth quoting |
+| `relatch=secsta:0000` | no bus walk below this bridge master-aborted at all this boot, so `secsta` was NOT being set by enumeration after the at-arm clear. A `d_secsta=2000` at `n=1` then has one named alternative left (a `wifi`-armed boot's own census, `wifi/bus.rs:125` — a knob no A1 flight row asks for, `grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md` = 0/0, and one the boot's own `⚡ kernel features:` banner settles) and otherwise points at the wedge |
+| `relatch=lnksta:c000` (or either bit alone) | the link renegotiated bandwidth DURING ENUMERATION — before any compositor paint. Whatever `d_lnksta` then reads at `n=1` is about the burst and not about boot-time link churn, which is the confound that made `d081` unreadable in the first place |
+| the `sticky-cleared post-enum` line is ABSENT on a boot whose `:: BAR1WEDGE:` line is present | the call site did not run. It is guarded on `PCIH_READY` and sits at the tail of `pci::init`, so its absence with the arm line present means `pci::init` did not reach its end — a boot that died in the GPU/SDHC/NIC tail, which is itself the finding |
+| `secsta=....->2000` (the after value nonzero) | a latch that did not clear. The write is a plain RW1C to a bridge status register, so a sticky `1` in the read-back is a hardware fact worth its own rung, and every later `d_secsta` on that boot is measured against a nonzero baseline (the line prints it, so nothing is silently wrong) |
 | `d_secsta=0000` at `n=1` | W7 DEAD: nothing master-aborted below the bridge after `pci::init`, so the `secsta=2000` of boots 8/9/11 was enumeration residue. §3.1's classifier table is then EMPTY and §3.2's sacrificial probe is the only remaining route to one |
 | `d_secsta=2000` at `n=1` | the latch moved after `pci::init`. Not yet proof it moved at the wedge — the EHCI bus walk is the named alternative — but the window is now minutes rather than the whole boot, and the next rung (a second clear once enumeration completes) closes it |
 | `dis=1` in the `cto` line | W6 CONVICTED without a flight of its own: completion timeouts are disabled on this port, §3.2's prober is guaranteed to be lost rather than "probably" surviving, and §8.2's argument that an SBR frees the seized core loses its mechanism |
@@ -803,3 +834,78 @@ Read `n=1` — that is the first stall, the sample this rung exists for. Read it
 `:: x86 bar1exp: UC arm ARMED` PRESENT on the UC leg (they are alternatives at the same site); the
 reverse on the WC control leg. `[pcih] rp-boot` and `[pcih] rp-at-wedge` must be present on BOTH
 legs and unchanged in shape — this rung adds lines and clears latches, it removes nothing.
+
+### 11.4 SECSTA2 — the second clear, and the walk that was named wrongly
+
+**Status: IMPLEMENTED behind the SAME knob (`UNAOS_BAR1WEDGE=1`, no new knob), DEFAULT OFF, never
+flown.** Shut-out register §6 rung **P7**. Code: `drivers/gpu/pcihealth.rs`'s
+`sticky_clear_post_enum`, called from ONE site at the tail of `arch/x86_64/pci::init`.
+
+§11's BAR1WEDGE block closed with a residual in its own words: *"`census` runs inside `pci::init`,
+and the EHCI driver's own `0..=255` bus walk happens LATER, so a master abort it provokes can
+re-latch secondary status after this clear … Closing it needs a second clear once enumeration is
+complete — a second call site, in another file."* Building that clear found the residual was real
+and its attribution was not.
+
+**The EHCI walk is not later.** `crate::drivers::ehci::init()` — whose walk is
+`drivers/ehci/mod.rs:17468` — is called from `arch/x86_64/pci.rs:838`. The Kepler dispatch that
+reaches `pcihealth::census`, and so `bw_arm`'s at-arm clear, is at `arch/x86_64/pci.rs:1016`. EHCI
+enumerates **before** the at-arm clear; anything it latched is inside the `secsta=` that line prints
+as its "before" value and is wiped by the write that follows. The enumeration that genuinely
+survives the at-arm clear is the tail of the same function:
+
+| walk | site | buses | runs |
+| --- | --- | --- | --- |
+| `sdhc::probe` → `PciScanner::storage_inventory` | `drivers/pci.rs:84` | 0..=255 | unconditionally |
+| `ahci::probe` | `drivers/ahci.rs:286` | 0..=255 | `UNAOS_AHCI=1` only |
+| `init_network` → `PciScanner::find_device` | `drivers/pci.rs:141` | 0..=255 | unconditionally — **the last walk `pci::init` performs** |
+
+So the second call site is not in `drivers/ehci` at all: it is the boot's "all buses enumerated"
+point, the tail of `pci::init`, after the GPACE report block (before it, the call would land inside
+`span` and inflate `resid`, making a knob-ON boot's pacing row disagree with every baseline taken
+without the knob). It is a **line-neutral append** to that block's closing brace, the same shape and
+for the same reason as the AHCI hook three statements above it: a cfg'd-OFF block still shifts
+`panic::Location` line numbers below it, and knob-off x86 image byte-identity is this rung's stated
+invariant.
+
+**What it does.** Re-read Secondary Status (`0x1E`) and Link Status (`cap + 0x12`) on the root port;
+compute `relatch` = the RW1C bits set now that the at-arm read-back did not carry; write the
+observed-set RW1C bits back (never a bit that was not read as set, never a register with nothing
+latched, never a control register); read back; print; and store the read-back as the baseline
+`bw_sample`'s `d_secsta`/`d_lnksta` delta against. The at-arm values stay on the wire in the same
+line, so nothing is lost by overwriting the statics.
+
+**`relatch=` is the finding.** Everything §1.3 argues rests on a premise nobody had measured: that
+ordinary bus enumeration sets bit 13 on THIS bridge. `relatch=secsta:2000` measures it true;
+`relatch=secsta:0000` measures it false, and a `d_secsta=2000` at the first stall then has almost
+nothing left to blame but the wedge. Either way W7 stops being an argument about what bus walks
+generally do. Score card: the four `relatch`/`post-enum` rows in §11.3.
+
+**Three properties held, and one deliberately not.**
+
+* **No new knob.** Everything is behind the existing `bar1wedge` feature; the arroyo map, the
+  builder read and the `k8-reach.registry` row are untouched.
+* **Every write is a W1C to a STATUS register** — `0x1E` and `cap + 0x12`, both inside the legacy
+  256-byte config region, both bounded by the predicates `bw_arm` already asserts.
+* **Nothing on the input band or in an ISR.** One shot, on the BSP, inside `pci::init` — the same
+  sequential boot phase `census` reads config space in and `bw_arm` already writes it in. The write
+  path is CF8/CFC, exactly the at-arm one, so PCIH-NOCF8's refusal (which is about the ~1 kHz
+  non-BSP tripwire band) is untouched and there is no ECAM mapping whose writability would have to
+  be re-verified at this later point.
+* **NOT re-baselined: Device Status.** `BW_DEVSTA0` still holds its at-arm value, so `d_devsta` on
+  the `wedge-sample` line deltas against the Kepler dispatch while `d_secsta`/`d_lnksta` delta
+  against the end of enumeration. The line says so, in those words. Nothing observed needs the
+  third — `devsta=0000` at boot and at the wedge on every capture there has ever been — and closing
+  it is two lines in `sticky_clear_post_enum`, left to a seat rather than taken silently.
+
+**Residual, in the same voice.** `wifi::service` (`wifi/bus.rs:125`, buses 0..=255, knob
+`UNAOS_WIFI`) sweeps config space from the main loop, i.e. after this clear, on every boot that arms
+it. No A1 flight row asks for that knob (`grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md
+docs/dev/OS/rmbp-ledger.md` = 0/0) and any boot settles it from its own `⚡ kernel features:`
+banner; on one that did carry it, the window would be "after the first wifi census" and `d_secsta`
+would have that one alternative left.
+
+**q35 says nothing about this rung.** `sticky_clear_post_enum` is guarded on `PCIH_READY`, which is
+set only at the end of `pcihealth::census`, which runs only from `kepler::init`. QEMU q35 has no
+GK107, so `census` never runs, `PCIH_READY` stays false, and the post-enum line is honestly absent.
+There is no QEMU fixture for this rung; it is scored on metal, on the A1 flight, or not at all.
