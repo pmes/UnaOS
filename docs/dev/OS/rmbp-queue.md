@@ -10,9 +10,10 @@ Created 2026-09-12T00:35Z (2026-09-11 local; dates here are UTC) by orin 27 (all
 repo" — this file is the queue those two sentences asked for; the 16 baton items were not read (R37),
 their three named subjects are rows here or in the trunk queue.
 
-## STATE — 2026-09-12T01:0xZ
-✓ origin/hw-rmbp 73d9d361; local hw-rmbp = this commit, clean. `git rev-list --left-right --count main...hw-rmbp` with main at 50d35cbf: main +3 (the 084b79ac merge, R45-R48, QUEUE.md) / rmbp +10 (docs: SR13, P14, the landing report, this file and its correction). Lands first.
-✓ Open A/B rows in rmbp-ledger at 73d9d361 = 93, by `git show HEAD:docs/dev/OS/rmbp-ledger.md | awk -F'|' '/^\|/ && NF>=8 {id=$2;s=$6;gsub(/^[ *]+|[ *]+$/,"",id);gsub(/^[ *]+|[ *]+$/,"",s); if (tolower(s) ~ /^open/ && id ~ /^[AB][0-9]/) c++} END {print c+0}'` (the landing review's command; the seat's first figure, 88, came from a narrower filter stated without its command — SR12's class, corrected here).
+## STATE — 2026-09-15T18:3xZ (rmbp focus session)
+✓ hw-rmbp 160176d2 = main bd17f887 + hw-jetson fd440602 + hw-pi4 e6e71c9f, all folded here on Peter's order ("sync with both leaving main"); code is hw-jetson's exactly (`git diff --stat hw-jetson hw-rmbp` = QUEUE.md + pi-queue.md only). One conflict, QUEUE.md §5, by union; ledger-check rc=0. UNPUSHED: 00d32fc3, 5c4aad2d, 160176d2 (+ the executor branches below at close). main untouched.
+✓ Bench: rMBP on the bench, NOT booted, FTDI on /dev/ttyUSB0 held by line-butler pid 10585 → `~/unaos-bench/capture/line-usb0/raw.log` (first bytes of the next boot land there). A new-to-us 29 GB SD in the reader (`/dev/mmcblk0p1`, vfat, NO label; Peter: contents disposable) — it becomes the UNAOS-X86 card at the card step. No flight image built yet (Peter: no compile before development).
+✓ Executors cut from 160176d2 this session (branches `exec-rmbp-*`, worktrees `~/unaos-bench/scratch/rmbp-0915/<name>`): FTDIRX (A9, the x86 half of S29), XHCIKBD (B45 + B44/A41, the key task), TESTTRUNC (trunk §5 truncated-run row + B95 + S8), BEAMX86 (A5). Fold gate, esp-x86 LAST, stage, card, playbook, mark, waker — after the fold.
 · x86 legs (R39): `test`, `test-fat`, the ELF-off-FAT legs, the x86 usb-write witness — rmbp's.
 
 ## METAL — needs the rMBP on the bench
