@@ -13422,24 +13422,39 @@ impl XhciController {
     /// latency. The darkness itself is unaffected by the order either way: the endpoint is re-armed
     /// once per pass wherever in the pass that happens, so it is the pass PERIOD that sets the dark
     /// window — which is precisely what this bound shortens.
-    fn drain_ftdi(&mut self) {
+    ///
+    /// ### RBTDRAIN — the return value, and why the slice needed one
+    ///
+    /// Returns **true when this call left nothing further for another call to push**: the ring came
+    /// up empty, or the sink is unusable (not live, no slot, no staging buffer, no bulk-OUT endpoint,
+    /// or a transfer failed and [`Self::disable_ftdi_tx`] turned the console off for good). It
+    /// returns **false on exactly one path — the PTBURST slice yield** — i.e. "bytes remain and I
+    /// stopped because my 4 ms were up".
+    ///
+    /// The device-service pass ignores the value, and rightly: for a pass "drained" and "yielded"
+    /// are the same instruction, because the next pass is four milliseconds away. [`ftdi_flush_sync`]
+    /// cannot ignore it — it runs where there IS no next pass, and pumping this function in a loop
+    /// requires knowing which of the two exits it took. The flag already existed inside the body
+    /// (`ring_emptied`, the PTBURST honesty gate on the `-> PASS` announce); this only lets a caller
+    /// read it.
+    fn drain_ftdi(&mut self) -> bool {
         if !ftdi::is_live() {
-            return;
+            return true;
         }
         let slot = self.ftdi_slot;
         if slot == 0 {
-            return;
+            return true;
         }
         let (out_ep, data_phys) = {
             let s = &self.slots[slot as usize];
             let dp = match s.scsi_data_buffer {
                 Some(p) => p as u64,
-                None => return,
+                None => return true,
             };
             (s.bulk_out_ep, dp)
         };
         if out_ep == 0 {
-            return;
+            return true;
         }
         let out_dci = (out_ep & 0x0F) * 2;
 
@@ -13477,11 +13492,11 @@ impl XhciController {
                 Ok(1) | Ok(13) => self.ftdi_tx_total += n as u64,
                 Ok(_) => {
                     self.disable_ftdi_tx("bad completion code");
-                    return;
+                    return true;
                 }
                 Err(()) => {
                     self.disable_ftdi_tx("timeout");
-                    return;
+                    return true;
                 }
             }
             // PTBURST — the slice, checked AFTER the transfer rather than before it, so this loop
@@ -13499,7 +13514,7 @@ impl XhciController {
         // `-> PASS (64 boot bytes replayed)` in the middle of a 65 kB replay, turning the gate's
         // conservation line into a number that means nothing.
         if !ring_emptied {
-            return;
+            return false;
         }
         // First clean empty of the backlog: announce the mirror is live. The PASS line itself enters
         // the ring and rides the NEXT drain — that is expected, and is the gate's proof the sink stays
@@ -13511,6 +13526,7 @@ impl XhciController {
                 self.ftdi_tx_total
             );
         }
+        true
     }
 
     /// Turn the FTDI TX sink off permanently and log it exactly once.
@@ -15849,6 +15865,107 @@ impl XhciController {
             xdbg!("xHCI: Keyboard Read Queued.");
         }
     }
+}
+
+// ── RBTDRAIN (rmbp-ledger A3) — the console's tail must reach the cable BEFORE the reset ──────────
+//
+// THE BUG THIS CLOSES. On the 2012 rMBP `reboot` really resets the machine (FADT RESET_REG 0xcf9 <- 6)
+// and NONE of the ladder's witnesses ever reached a human. The ladder prints through `raw_write_str`,
+// which on x86 is the 16550 at 0x3F8 — a port this laptop does not have — and the machine's ACTUAL
+// console is the FTDI cable on this controller. Lines bound for the cable do not go out a port: they
+// go into `ftdi::RING`, a 256 KiB mirror, and that ring only reaches the wire when the device-service
+// pass next runs `service_ftdi` -> `drain_ftdi`. The reset lands microseconds after the announce, and
+// there is no next pass. So the ring — and the whole reboot ladder inside it — died with the power.
+//
+// PWRDRAIN (SO31) and S5DRAIN (SO39) already fixed the STAGING half of this: every power verb flushes
+// `serial_ring`'s staging ring before it hands the machine to the firmware. That flush ends in
+// `serial::_print`, whose x86 sinks are the absent 16550 and this mirror ring — so on the rMBP it
+// moved the lines one buffer closer to the cable and no further. This function is the last leg.
+//
+// WHY IT IS UNGATED. It is transport correctness, not a fixture: LAWS' "the wire may not lose lines"
+// is the whole of it, and a witness that only exists under a knob is not the witness a bench sitting
+// on an unknobbed flight image needs. Same standing as `s5_ring_flush` and `power_drain`, which are
+// likewise ungated. It costs a non-rMBP boot one relaxed atomic load (`ftdi::is_live()` is false, and
+// the function returns before it touches the controller at all).
+//
+// PLACED ABOVE THE FTDIRX TAIL BLOCK ON PURPOSE. That block is `#[cfg]`-erased knob-off and is
+// appended past the last statement in the file precisely so nothing below it can move (LEDGER P7).
+// Ungated source ADDED BELOW it would be at a different line with the knob on than with it off, which
+// would move this function's own `panic::Location` records between the two images. Above it, these
+// lines are at the same place in both, and the tail block still has nothing under it.
+
+/// RBTDRAIN — push the FTDI mirror ring out the cable **now**, synchronously, from a caller that is
+/// about to end the machine. Returns `(bytes, transfers, exhausted)`.
+///
+/// `budget_cycles` is a `now_cycles()` (rdtsc / CNTVCT) span, normally `arch::hw_wait_budget()`.
+/// `exhausted` is `true` when the budget ran out, or the controller could not be claimed inside it,
+/// with bytes still in the ring — i.e. **the tail did NOT all reach the wire**. It is a real outcome
+/// and it is printed as one: a flush that reports success it did not achieve is worse than no flush,
+/// because the reader would stop looking for the missing lines.
+///
+/// ### It never blocks, and that is a hard requirement, not a preference
+///
+/// A reboot that hangs on a lock is a machine the operator must now power-cycle — strictly worse than
+/// a reboot that loses its last log lines. Three separate bounds hold:
+///
+///   * **The controller is CLAIMED, never locked.** `claim()` is the WEDGE-8 loan: a masked O(1)
+///     take that answers `Busy` instead of waiting (the LOCKFIX discipline — the only correct answer
+///     to a held lock on a path that cannot wait is to decline it). `NotReady` — no controller at all
+///     — returns immediately; there is nothing to flush and no reason to spend the budget finding out.
+///   * **A `Busy` claim is RETRIED only inside the same budget.** The retry is there because the
+///     verb is typed at the shell while `x86_usb_pump` holds the loan on another core, which is a
+///     microseconds-long overlap and not a wedge; a single try would lose the tail to an ordinary
+///     race. A wedged pass that never returns the loan costs this call its budget and not the
+///     machine — the loop's exit is the clock, not the lock.
+///   * **Each pump is bounded twice over.** `drain_ftdi` spends at most one PTBURST slice (4 ms) per
+///     call and each of its transfers waits at most one `hw_wait_budget()`, after which the sink is
+///     turned off permanently rather than retried. So the loop below cannot outlive its budget by
+///     more than one transfer's wait even if every transfer times out.
+///
+/// ### Arch-neutral by construction, and a no-op where there is no cable
+///
+/// `drivers::xhci` is not arch-gated and neither is this. aarch64 has no FTDI console today (the Orin
+/// and the Pi have real UARTs, which the staging-ring flush already reaches), so `ftdi::is_live()` is
+/// false there and this returns `(0, 0, false)` — `exhausted` FALSE, because an empty ring is not a
+/// lost tail. The day an aarch64 board carries the cable, the same call is already correct.
+pub fn ftdi_flush_sync(budget_cycles: u64) -> (u64, u64, bool) {
+    // Nothing is staged for a cable that does not exist. Checked before the claim so a board with no
+    // FTDI console never disturbs the loan at all.
+    if !ftdi::is_live() {
+        return (0, 0, false);
+    }
+    let t0 = crate::arch::now_cycles();
+    let tx0 = FTDI_PUMP_COUNT.load(Ordering::Relaxed);
+    let mut loan = loop {
+        match claim() {
+            Ok(l) => break l,
+            // No controller was ever installed: there is no ring to drain and no tail to lose.
+            Err(XhciClaimError::NotReady) => return (0, 0, false),
+            Err(XhciClaimError::Busy) => {
+                if crate::arch::now_cycles().wrapping_sub(t0) >= budget_cycles {
+                    // The loan never came back. Say nothing on the wire (there is no wire to say it
+                    // on — that is the whole problem) and let the caller reset: `exhausted`.
+                    return (0, 0, true);
+                }
+                core::hint::spin_loop();
+            }
+        }
+    };
+    let bytes0 = loan.ftdi_tx_total;
+    // Pump until the mirror is empty or the budget is spent. `drain_ftdi` returns true on the
+    // ring-empty exit and false only on its PTBURST slice yield, so this loop is the service pass's
+    // 4 ms slices run back to back with nothing else between them.
+    let exhausted = loop {
+        if loan.drain_ftdi() {
+            break false;
+        }
+        if crate::arch::now_cycles().wrapping_sub(t0) >= budget_cycles {
+            break true;
+        }
+    };
+    let bytes = loan.ftdi_tx_total.wrapping_sub(bytes0);
+    let transfers = FTDI_PUMP_COUNT.load(Ordering::Relaxed).wrapping_sub(tx0);
+    (bytes, transfers, exhausted)
 }
 
 // ── FTDIRX (rmbp A9 / LEDGER S29, x86 half) — the controller half of the FTDI RX console ──────────
