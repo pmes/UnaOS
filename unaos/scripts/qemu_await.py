@@ -46,11 +46,7 @@ TWO MODES, ONE PREDICATE
 The default mode above TAILS a log a live QEMU is still writing, and its product is a
 STOPPING DECISION. `--settled` asks the same `complete()` predicate of a capture that is
 already over, and its product is a FACT ABOUT THE RUN: did it reach its end-of-run
-marker? That second mode exists because `./arroyo test` does not own its QEMU — the wall
-lives in `builder/src/main.rs`, which spawns, sleeps and kills — so there is nothing left
-for a tail to shorten, while the question a tail answers is precisely the one that verb's
-verdict was missing. See `settled()` for its output and exits. Neither mode decides a
-verdict, and neither invents a marker.
+marker? `--settled` exists because the STOPPING DECISION and the VERDICT are different questions — the tail (now run from `builder/src/main.rs`'s `qemu_test_wall`, FASTTEST 2026-09-15) decides when to stop reading, and `--settled` asks the finished capture whether the end of the run is in it, which is the only reading a pass may rest on.
 
 OUTPUT (one line, on stdout):
     AWAIT status=<complete|cap|nosignal> complete_at=<s|-> forbid_hits=<n> wall=<s>
