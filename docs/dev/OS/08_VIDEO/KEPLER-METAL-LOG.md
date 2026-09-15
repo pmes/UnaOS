@@ -3,6 +3,11 @@
 Hard-won silicon facts from the fox-metal sitting series. Trust these over any
 QEMU behavior. Newest sitting first.
 
+> **Every rung's standing status — `open` / `shut-out` / `never-run` / `proven`, with the
+> conditions each failure happened under and the rung it depends on being open — is compiled once
+> in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
+> per-sitting narrative; the register is the verdict table.**
+
 ## Sitting #43 (GR25 Boot A, capture `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`) — two ladder gates answered, and CE-LADDER armed
 
 Design of record for the copy-engine work: `~/unaos-bench/scratch/gr24/CE-LADDER-draft.md`
