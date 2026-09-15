@@ -1192,12 +1192,19 @@ pub unsafe fn gmux_igd_switch() {
     // Will be captured dynamically based on live pre-image
     let mut pre_ddc: Option<u32> = None;
     let mut pre_disp: Option<u32> = None;
-    // The EXTERNAL pre-image, split: `pre_ext` is the SWITCH_EXTERNAL target register (what the
-    // unwind writes back), `pre_ext_status` is the READ_EXTERNAL status register (what the MATCH
-    // verdict compares). Both are validated against the same two-constant set before either is
-    // trusted — see the pre-switch gate.
+    // The EXTERNAL pre-image, split: `pre_ext` is the SWITCH_EXTERNAL target register (0x40) and
+    // `pre_ext_status` is the READ_EXTERNAL status register (0x41). GMUX-2: only the STATUS half is
+    // a state read, so only the STATUS half is gated and only the STATUS half is compared by the
+    // MATCH verdict. `pre_ext` is captured to be PRINTED — the value a write-target port returns on
+    // a Kepler-owned boot is a metal fact worth a witness — and is never written back.
     let mut pre_ext: Option<u32> = None;
     let mut pre_ext_status: Option<u32> = None;
+    // GMUX-2 restore policy for SWITCH_EXTERNAL (0x40), decided by `ext_restore_target` from the
+    // 0x41 STATUS read: `Some(v)` means the status→write encoding map is known and cited for that
+    // value and the unwind pushes `v`; `None` means SKIPPED — the pre-switch read of 0x40 is not a
+    // state, so there is nothing this code may honestly write back there. `None` is also the value
+    // when the gate refused and the unwind never carried an EXTERNAL entry at all.
+    let mut ext_restore: Option<u8> = None;
     let mut mux_touched = false;
 
     let mut execute_harness = || -> Result<(), (&'static str, u32)> {
@@ -1211,43 +1218,50 @@ pub unsafe fn gmux_igd_switch() {
         let p_ext = gmux_index_read(GMUX_SWITCH_EXTERNAL);
         let disp = gmux_index_read(GMUX_READ_DISPLAY);
         let ext = gmux_index_read(GMUX_READ_EXTERNAL);
-        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} SW_DISP=0x{:02X} SW_EXT=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} sw_ext_state={} ext_state={} ::",
-            p_ddc, p_disp, p_ext, disp, ext, ext_state_name(p_ext), ext_state_name(ext));
+        // GMUX-2: the census reads BOTH halves of the EXTERNAL pair and prints both. `SW_EXT` is
+        // the write-target port 0x40; `SW_EXT_ST` is the status port 0x41 — the same register the
+        // pre-existing `EXT=` field carries, repeated under the name that says which port it is,
+        // because `EXT=` alone never told a reader that `SW_EXT`'s pair-mate was already on the
+        // wire. Every pre-existing field keeps its name, its value and its order: flight 5's
+        // capture and the register's G6 row both key on this line. `sw_ext_state=` likewise stays
+        // verbatim — it is `ext_state_name` applied to the write-target port, which is exactly the
+        // category error this commit removes from the GATE, kept only so old and new captures
+        // compare field for field. `gate=` is the verdict that now decides.
+        let gate = gmux_preswitch_decode(p_ddc, disp, ext);
+        serial_println!(":: igpu-dpy: pre-switch state DDC=0x{:02X} SW_DISP=0x{:02X} SW_EXT=0x{:02X} SW_EXT_ST=0x{:02X} DISP=0x{:02X} EXT=0x{:02X} sw_ext_state={} ext_state={} gate={} ::",
+            p_ddc, p_disp, p_ext, ext, disp, ext, ext_state_name(p_ext), ext_state_name(ext), gate.token());
 
-        // THE GATE VALIDATES AGAINST A SET OF NAMED CONSTANTS, AND THE UNWIND RESTORES THE MEMBER
-        // IT VALIDATED. The two halves are one property and must be read together.
+        // THE GATE SCORES STATE READS ONLY, AND THE UNWIND RESTORES ONLY WHAT IT READ AS STATE.
+        // The two halves are one property and must be read together. See `gmux_preswitch_decode`
+        // and `ext_restore_target` at the foot of this file for the register-level reasoning and
+        // the port-pair citations; the decode is a pure function and is pinned by `const _` there.
         //
-        // DDC: strict DIS — every pre-switch capture reads DDC=0x02, so there is no second
-        // legitimate member to admit. READ_DISPLAY (`disp`): strict DIS — every recorded
-        // DISP=0x03 is THIS register. SWITCH_DISPLAY (`p_disp`) is printed but NOT gated (review
-        // condition): the earlier strict term conflated it with READ_DISPLAY — SWITCH_DISPLAY has
-        // never been captured on this machine — and it is not a restore value either (the unwind
-        // writes the constant DIS), so gating on it protected nothing and added one more way for
-        // the flight to refuse without answering.
+        // What flight 5 cost, in one line: the term that refused was `SW_EXT` — the read of the
+        // WRITE-TARGET port 0x40 — scored against the STATUS encodings. 0x40 is not a state read,
+        // so `0x01` was never a mux state to begin with, and `gmux_preswitch_decode` cannot repeat
+        // the error because 0x40 IS NOT ONE OF ITS ARGUMENTS.
         //
-        // EXTERNAL: DIS *or* `GMUX_EXTERNAL_KEPLER_OWNED` (0x21). 0x21 is the Boot AK metal NORM —
-        // what this machine actually reads when the firmware leaves the port Kepler-owned — which
-        // is exactly why round 11 relaxed this gate. Demanding DIS here would make the flight
-        // REFUSE on the only machine it was written for. Both EXTERNAL registers are relaxed: the
-        // recorded 0x21 was observed on READ_EXTERNAL, and SWITCH_EXTERNAL has never been captured
-        // on a Kepler-owned boot, so neither may be assumed DIS.
-        //
-        // THE SENTINEL CANNOT PASS. A timed-out `gmux_index_read` returns 0xFFFFFFFF, which is
-        // neither `GMUX_EXTERNAL_DIS` nor `GMUX_EXTERNAL_KEPLER_OWNED` (nor DDC/DISPLAY's DIS), so
-        // every read is refused before anything is stored, and `as u8` never gets the chance to
-        // truncate it to 0xFF and write a dark panel into the display mux. What the safety property
-        // forbids is pushing an UNVALIDATED live read; a value proven equal to one of two named
-        // 8-bit constants is not an unvalidated read.
-        let ext_ok = |v: u32| v == GMUX_EXTERNAL_DIS as u32 || v == GMUX_EXTERNAL_KEPLER_OWNED as u32;
-        if p_ddc != GMUX_DDC_DIS as u32 || disp != GMUX_DISPLAY_DIS as u32
-            || !ext_ok(p_ext) || !ext_ok(ext) {
-            // Buffer the REFUSED print; the outer error handler will print it
+        // SWITCH_DISPLAY (`p_disp`) stays printed and ungated for the reason the review condition
+        // already gave: it is a write-target port too, it has never been captured on this machine,
+        // and it is not a restore value (the unwind writes the constant DIS).
+        if !gate.accepted() {
+            // Buffer the REFUSED print; the outer error handler will print it. The `why` token is
+            // unchanged — the register's G6 row and every existing capture key on
+            // `pre-switch-not-accepted` — and the discrimination the operator needs (WHICH port,
+            // and REFUSE versus UNREADABLE) is on the witness line above as `gate=`. UNREADABLE is
+            // a refusal, not a pass: a port that did not answer has not said the mux is safe to
+            // move.
             return Err(("pre-switch-not-accepted", 0));
         }
         pre_ddc = Some(p_ddc);
         pre_disp = Some(p_disp);
         pre_ext = Some(p_ext);
         pre_ext_status = Some(ext);
+        ext_restore = ext_restore_target(ext);
+        if ext_restore.is_none() {
+            serial_println!(":: igpu-dpy: restore ext=SKIPPED (write-target port, no state read) SW_EXT=0x{:02X} SW_EXT_ST=0x{:02X} ext_state={} ::",
+                p_ext, ext, ext_state_name(ext));
+        }
 
         rung_name = "census";
         let ggc = crate::arch::pci::read_config_32(0, 0, 0, 0x50);
@@ -1283,10 +1297,14 @@ pub unsafe fn gmux_igd_switch() {
         // Push order EXTERNAL, DISPLAY, DDC so the LIFO unwind restores DDC, DISPLAY, EXTERNAL —
         // the SAME order as the forward writes (review condition: an earlier comment called this
         // "the reverse", which is false — upstream apple-gmux uses DDC→DISPLAY→EXTERNAL in both
-        // directions, and so does this). EXTERNAL is restored to `p_ext`, the pre-image the gate
-        // above validated against the two-constant set; DDC and DISPLAY are restored to DIS — for
-        // DDC the only value its gate admits, for DISPLAY the constant upstream restores.
-        unwind.push_gmux(GMUX_SWITCH_EXTERNAL, p_ext as u8);
+        // directions, and so does this). GMUX-2: EXTERNAL is pushed ONLY when `ext_restore_target`
+        // mapped the 0x41 STATUS read back to a named write encoding; otherwise no EXTERNAL entry
+        // exists at all and the SKIPPED line above says so. It is NEVER restored from the 0x40
+        // read — that is a write-target port, `0x01` there is not a state, and pushing it would be
+        // the silent state change the EXTERNAL doc-comment forbids. DDC and DISPLAY are restored
+        // to DIS — for DDC the only value its gate admits, for DISPLAY the constant upstream
+        // restores.
+        if let Some(v) = ext_restore { unwind.push_gmux(GMUX_SWITCH_EXTERNAL, v); }
         unwind.push_gmux(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_DIS);
         unwind.push_gmux(GMUX_SWITCH_DDC, GMUX_DDC_DIS);
 
@@ -1303,10 +1321,14 @@ pub unsafe fn gmux_igd_switch() {
         // Push order EXTERNAL, DISPLAY, DDC so the LIFO unwind restores DDC, DISPLAY, EXTERNAL —
         // the SAME order as the forward writes (review condition: an earlier comment called this
         // "the reverse", which is false — upstream apple-gmux uses DDC→DISPLAY→EXTERNAL in both
-        // directions, and so does this). EXTERNAL is restored to `p_ext`, the pre-image the gate
-        // above validated against the two-constant set; DDC and DISPLAY are restored to DIS — for
-        // DDC the only value its gate admits, for DISPLAY the constant upstream restores.
-        unwind.push_gmux(GMUX_SWITCH_EXTERNAL, p_ext as u8);
+        // directions, and so does this). GMUX-2: EXTERNAL is pushed ONLY when `ext_restore_target`
+        // mapped the 0x41 STATUS read back to a named write encoding; otherwise no EXTERNAL entry
+        // exists at all and the SKIPPED line above says so. It is NEVER restored from the 0x40
+        // read — that is a write-target port, `0x01` there is not a state, and pushing it would be
+        // the silent state change the EXTERNAL doc-comment forbids. DDC and DISPLAY are restored
+        // to DIS — for DDC the only value its gate admits, for DISPLAY the constant upstream
+        // restores.
+        if let Some(v) = ext_restore { unwind.push_gmux(GMUX_SWITCH_EXTERNAL, v); }
         unwind.push_gmux(GMUX_SWITCH_DISPLAY, GMUX_DISPLAY_DIS);
         unwind.push_gmux(GMUX_SWITCH_DDC, GMUX_DDC_DIS);
 
@@ -1472,9 +1494,17 @@ pub unsafe fn gmux_igd_switch() {
             // SWITCH_EXTERNAL read-backs are printed as TBV but do not vote: a write-side port
             // that does not echo would otherwise flip a correct restore to FAILED, and the
             // RUNBOOK's FAILED row tells the operator to power-cycle a healthy machine.
+            //
+            // GMUX-2: EXTERNAL's status port votes only when EXTERNAL was actually restored. When
+            // `ext_restore` is None the unwind deliberately did not write 0x40, so 0x40 is still
+            // carrying the forward `GMUX_EXTERNAL_IGD` and 0x41 has no reason to have come back to
+            // its pre-image — scoring it would report FAILED for a flight that did exactly what
+            // this commit told it to do, and would send the operator to power-cycle a healthy
+            // machine for the second time. The skipped restore is not hidden: it is printed on its
+            // own `restore ext=SKIPPED` line at the gate and named again below.
             let verdict = if post_ddc == intent_ddc
                 && post_disp_status == GMUX_DISPLAY_DIS as u32
-                && post_ext_status == intent_ext_status
+                && (ext_restore.is_none() || post_ext_status == intent_ext_status)
                 && revert_ok {
                 "MATCH"
             } else {
@@ -1482,8 +1512,12 @@ pub unsafe fn gmux_igd_switch() {
             };
 
             serial_println!(":: igpu: [GMUX] revert read-back: DDC=0x{:02X} SWITCH_DISP=0x{:02X} READ_DISP=0x{:02X} SWITCH_EXT=0x{:02X} READ_EXT=0x{:02X} (TBV) ::", post_ddc, post_disp_target, post_disp_status, post_ext_target, post_ext_status);
-            serial_println!(":: igpu: [GMUX] EXTERNAL restored to {} (SWITCH_EXT 0x{:02X}->0x{:02X}, READ_EXT 0x{:02X}->0x{:02X}) — the validated pre-image, not a blanket DIS ::",
-                ext_state_name(intent_ext), intent_ext, post_ext_target, intent_ext_status, post_ext_status);
+            match ext_restore {
+                Some(v) => serial_println!(":: igpu: [GMUX] EXTERNAL restore=0x{:02X} from the READ_EXT(0x41) state {} (SWITCH_EXT 0x{:02X}->0x{:02X}, READ_EXT 0x{:02X}->0x{:02X}) — mapped from the status read, never from the write-target port ::",
+                    v, ext_state_name(intent_ext_status), intent_ext, post_ext_target, intent_ext_status, post_ext_status),
+                None => serial_println!(":: igpu: [GMUX] EXTERNAL restore=SKIPPED (write-target port, no state read) — SWITCH_EXT(0x40) 0x{:02X}->0x{:02X} was NOT written back and does not vote; READ_EXT(0x41) 0x{:02X}->0x{:02X} state {}->{} ::",
+                    intent_ext, post_ext_target, intent_ext_status, post_ext_status, ext_state_name(intent_ext_status), ext_state_name(post_ext_status)),
+            }
             verdict
         } else {
             "UNTOUCHED"
@@ -1495,3 +1529,202 @@ pub unsafe fn gmux_igd_switch() {
     serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} pending={} gmux={} why={} elapsed_ms={} ::",
         highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// GMUX-2 — THE PRE-SWITCH GATE'S DECODE, AS A PURE FUNCTION OVER THE STATE READS
+//
+// Placed at the FOOT of the file on purpose. Everything below the gmux harness is nothing, so
+// appending here moves no line number in this file, and `panic::Location` in the knob-OFF build
+// cannot shift under a `gmux_igd` change (QUEUE B94). Every item carries the same
+// `all(target_arch = "x86_64", feature = "gmux_igd")` cfg as the rest of the ladder, so with the
+// knob off this whole block compiles to nothing at all.
+//
+// THE PORT PAIRS, read off this file's own constants block at :244-300 and the port map comment
+// at :238-243 (upstream `drivers/platform/x86/apple-gmux.c`, port-I/O backend):
+//
+//   * DISPLAY  0x10/0x11 — `GMUX_SWITCH_DISPLAY` (target, :254) / `GMUX_READ_DISPLAY` (status,
+//     :256). THE FILE ALREADY TREATS THIS PAIR AS TARGET/STATUS: the gate scores `GMUX_READ_DISPLAY`
+//     and the unwind writes `GMUX_SWITCH_DISPLAY`, and the review condition that ungated
+//     SWITCH_DISPLAY said so in as many words.
+//   * EXTERNAL 0x40/0x41 — `GMUX_SWITCH_EXTERNAL` (target, :291) / `GMUX_READ_EXTERNAL` (status,
+//     :258). THE PAIR IS COMPLETE IN THE FILE, AND ONLY THE VERDICT WAS WRONG: until this commit
+//     the gate scored BOTH halves against the STATUS encodings
+//     `{GMUX_EXTERNAL_DIS 0x03, GMUX_EXTERNAL_KEPLER_OWNED 0x21}`. The POST-switch read-back in
+//     this same function had already been relaxed on this very reasoning, one step later — "write-side
+//     switch ports that do not echo their value would fail this comparison on a switch that
+//     WORKED" — and the two were never reconciled. Flight 5 (2026-08-28) is the bill:
+//     `SW_EXT=0x01` on the write-target port refused the switch at `gmux=UNTOUCHED elapsed_ms=1`
+//     while DDC=0x02, DISP=0x03 and EXT=0x21 — every register that REPORTS mux state — each read
+//     its accepted value. See docs/dev/evidence/rmbp-0915/GMUX-1-PRESWITCH.md §3-§5.
+//   * DDC      0x28 ONLY — `GMUX_SWITCH_DDC` (:252). THERE IS NO 0x29 CONSTANT IN THIS FILE, and
+//     that is not an omission: DDC is the one port whose ECHO is metal-proven on this machine, and
+//     it is the only read-back allowed to abort the flight at the switch rung. DDC is therefore
+//     scored on 0x28 BY MEASUREMENT, not by the pair convention — the single exception, and the
+//     reason this decode takes DDC's own port rather than a status twin it does not have.
+//
+// A ZERO-COMPARE IS NEVER A VERDICT. `gmux_index_read` returns 0xFFFFFFFF on timeout, and a gmux
+// that is dead, not ready, or answering a wrong index returns 0x00 or 0xFF. None of those is a mux
+// state, and folding them into "not accepted" would let a boot that learned NOTHING look like a
+// boot that learned the mux was in the wrong place. They decode to UNREADABLE, are printed as
+// such on the pre-switch witness line, and refuse.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// The pre-switch gate's verdict. `Accept` is the only variant that may touch a mux.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+#[derive(Clone, Copy)]
+enum PreSwitchGate {
+    Accept,
+    UnreadableDdc,
+    UnreadableDisp,
+    UnreadableExt,
+    RefuseDdc,
+    RefuseDisp,
+    RefuseExt,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+impl PreSwitchGate {
+    /// The `gate=` field on the pre-switch witness line: the verdict AND the port that produced
+    /// it, so a capture never needs the source to say which read decided.
+    const fn token(self) -> &'static str {
+        match self {
+            PreSwitchGate::Accept => "ACCEPT",
+            PreSwitchGate::UnreadableDdc => "UNREADABLE:ddc@0x28",
+            PreSwitchGate::UnreadableDisp => "UNREADABLE:read_display@0x11",
+            PreSwitchGate::UnreadableExt => "UNREADABLE:read_external@0x41",
+            PreSwitchGate::RefuseDdc => "REFUSE:ddc@0x28",
+            PreSwitchGate::RefuseDisp => "REFUSE:read_display@0x11",
+            PreSwitchGate::RefuseExt => "REFUSE:read_external@0x41",
+        }
+    }
+
+    const fn accepted(self) -> bool {
+        matches!(self, PreSwitchGate::Accept)
+    }
+
+    /// A stable small code, so the `const _` pins below can assert on the exact variant.
+    const fn code(self) -> u8 {
+        match self {
+            PreSwitchGate::Accept => 0,
+            PreSwitchGate::UnreadableDdc => 1,
+            PreSwitchGate::UnreadableDisp => 2,
+            PreSwitchGate::UnreadableExt => 3,
+            PreSwitchGate::RefuseDdc => 4,
+            PreSwitchGate::RefuseDisp => 5,
+            PreSwitchGate::RefuseExt => 6,
+        }
+    }
+}
+
+/// Not a mux state: the `gmux_index_read` timeout sentinel and the two all-bits answers a gmux
+/// gives when it is dead, not ready, or was handed an index it does not implement.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const fn gmux_unreadable(v: u32) -> bool {
+    v == 0x00 || v == 0xFF || v == 0xFFFF_FFFF
+}
+
+/// THE GATE'S DECODE. Pure, total, and — the whole point of GMUX-2 — structurally unable to score
+/// a write-target port, because `GMUX_SWITCH_EXTERNAL` (0x40) and `GMUX_SWITCH_DISPLAY` (0x10) are
+/// not parameters. The three arguments are the three reads that report mux STATE on this machine:
+/// DDC's proven echo at 0x28, `GMUX_READ_DISPLAY` 0x11, and `GMUX_READ_EXTERNAL` 0x41.
+///
+/// Order matters for the witness, not for the result: UNREADABLE is tested before REFUSE on every
+/// port so that a dead gmux is never reported as a mux in an unexpected place.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const fn gmux_preswitch_decode(ddc: u32, disp_status: u32, ext_status: u32) -> PreSwitchGate {
+    if gmux_unreadable(ddc) {
+        return PreSwitchGate::UnreadableDdc;
+    }
+    if gmux_unreadable(disp_status) {
+        return PreSwitchGate::UnreadableDisp;
+    }
+    if gmux_unreadable(ext_status) {
+        return PreSwitchGate::UnreadableExt;
+    }
+    // DDC: strict DIS — every pre-switch capture reads 0x02 and there is no second legitimate
+    // member to admit. READ_DISPLAY: strict DIS — every recorded DISP=0x03 is THIS register.
+    if ddc != GMUX_DDC_DIS as u32 {
+        return PreSwitchGate::RefuseDdc;
+    }
+    if disp_status != GMUX_DISPLAY_DIS as u32 {
+        return PreSwitchGate::RefuseDisp;
+    }
+    // READ_EXTERNAL: DIS *or* `GMUX_EXTERNAL_KEPLER_OWNED` (0x21). 0x21 is the Boot AK metal NORM —
+    // what this machine reads when the firmware leaves the port Kepler-owned — which is why round
+    // 11 relaxed this term. Demanding DIS would refuse on the only machine the flight was written
+    // for.
+    if ext_status != GMUX_EXTERNAL_DIS as u32 && ext_status != GMUX_EXTERNAL_KEPLER_OWNED as u32 {
+        return PreSwitchGate::RefuseExt;
+    }
+    PreSwitchGate::Accept
+}
+
+/// THE RESTORE HALF. Given the ACCEPTED `GMUX_READ_EXTERNAL` (0x41) STATE read, what — if
+/// anything — may honestly be written back to `GMUX_SWITCH_EXTERNAL` (0x40) on the unwind?
+///
+/// * `GMUX_EXTERNAL_DIS` (0x03) → `Some(GMUX_EXTERNAL_DIS)`. This is the ONE value whose
+///   status→write map is known and cited: the port map comment at :238-243 gives EXTERNAL the
+///   DISPLAY write encoding (`_IGD 0x2 / _DIS 0x3`), and 0x03 is the same named constant on both
+///   sides. Writing it back is a restore, not a guess.
+/// * `GMUX_EXTERNAL_KEPLER_OWNED` (0x21) → `None`. 0x21 is a STATUS encoding only. Nothing in this
+///   file, and nothing in upstream apple-gmux as this file quotes it, names a value you WRITE to
+///   0x40 to put the port back to Kepler-owned. An uncertain map is not a map, so the unwind
+///   writes nothing there and says `restore ext=SKIPPED` on the wire. This is the branch the 2012
+///   rMBP takes: flight 5 read `EXT=0x21`.
+/// * anything else → `None`, unreachable in practice because the gate already refused it.
+///
+/// The old code wrote the 0x40 READ back to 0x40. On flight 5 that read was `0x01` — a value no
+/// encoding in this file names — and it would have gone into the external display mux on EVERY
+/// exit path, including the self-test's immediate `unwind.execute()`. That is the silent state
+/// change the `GMUX_EXTERNAL_KEPLER_OWNED` doc-comment at :265-273 forbids, and it is why
+/// deleting the gate term alone was never the fix.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const fn ext_restore_target(ext_status: u32) -> Option<u8> {
+    if ext_status == GMUX_EXTERNAL_DIS as u32 {
+        Some(GMUX_EXTERNAL_DIS)
+    } else {
+        None
+    }
+}
+
+// THE PINS. `cargo test` never runs on this `no_std` kernel crate — `./arroyo check` is the gate
+// and `#[cfg(test)]` code is invisible to it, which is exactly why the `mod tests` at the foot of
+// `kepler.rs` was deleted rather than repaired ("a test that cannot run is a comment that lies
+// about being a test", kepler.rs:3906-3918). `const _` blocks ARE evaluated by the gate, so the
+// decode's behaviour is pinned here, where a wrong answer is a BUILD FAILURE on both arches'
+// gmux_igd legs rather than a test nobody runs.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const _: () = {
+    // FLIGHT 5's OWN CENSUS, byte for byte (GMUX-1-PRESWITCH.md §3): DDC=0x02, DISP=0x03,
+    // EXT=0x21. This is the vector that refused. It must ACCEPT.
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0x21).code() == 0);
+    // And it accepts REGARDLESS of what the write-target port 0x40 read, because 0x40 is not an
+    // argument — the `0x01` that stopped flight 5 has nowhere to enter this decision.
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0x21).accepted());
+    // The other accepted EXTERNAL member: a DIS-owned external port.
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0x03).code() == 0);
+
+    // UNREADABLE beats REFUSE on every port. A zero-compare is never a verdict.
+    assert!(gmux_preswitch_decode(0x00, 0x03, 0x21).code() == 1);
+    assert!(gmux_preswitch_decode(0x02, 0xFF, 0x21).code() == 2);
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0x00).code() == 3);
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0xFF).code() == 3);
+    // The gmux timeout sentinel, on each port in turn.
+    assert!(gmux_preswitch_decode(0xFFFF_FFFF, 0x03, 0x21).code() == 1);
+    assert!(gmux_preswitch_decode(0x02, 0xFFFF_FFFF, 0x21).code() == 2);
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0xFFFF_FFFF).code() == 3);
+    // ...and NONE of them is an Accept.
+    assert!(!gmux_preswitch_decode(0x02, 0x03, 0x00).accepted());
+    assert!(!gmux_preswitch_decode(0x02, 0x03, 0xFFFF_FFFF).accepted());
+
+    // The gate is still honest about real states it was not written for.
+    assert!(gmux_preswitch_decode(0x01, 0x03, 0x21).code() == 4); // DDC routed to the iGPU
+    assert!(gmux_preswitch_decode(0x02, 0x02, 0x21).code() == 5); // panel already IGD
+    assert!(gmux_preswitch_decode(0x02, 0x03, 0x02).code() == 6); // EXTERNAL already IGD
+
+    // The restore map: exactly one member is certain, and it is not the one this machine reads.
+    assert!(matches!(ext_restore_target(0x03), Some(GMUX_EXTERNAL_DIS)));
+    assert!(ext_restore_target(0x21).is_none()); // the 2012 rMBP's branch: SKIPPED
+    assert!(ext_restore_target(0x01).is_none()); // flight 5's 0x40 read, had it ever been offered
+    assert!(ext_restore_target(0xFFFF_FFFF).is_none());
+};
